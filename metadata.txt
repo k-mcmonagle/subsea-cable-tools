@@ -1,0 +1,26 @@
+[general]
+name=Subsea Cable Tools
+qgisMinimumVersion=3.0
+description=Tools to support working with subsea cable data in QGIS.
+version=1.0.0
+author=Kieran McMonagle
+email=kieran.mcmonagle@globalmarine.group
+
+about=Subsea Cable Tools is a QGIS Processing Plugin developed to support working with subsea cable data in QGIS.
+
+tracker=https://github.com/k-mcmonagle/subsea-cable-tools/issues
+repository=https://github.com/k-mcmonagle/subsea-cable-tools
+
+hasProcessingProvider=yes
+
+# changelog
+changelog=Version 1.0.0 (2025-04-05): Initial public release.
+
+tags=subsea, cable, telecoms, mapping, gis, qgis, lrs, kp, offshore, engineering, bathymetry, 
+
+homepage=https://github.com/k-mcmonagle/subsea-cable-tools
+category=Vector
+icon=icon.png
+experimental=False
+deprecated=False
+server=False

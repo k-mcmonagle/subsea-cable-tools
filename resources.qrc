@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/plugins/subsea_cable_tools" >
+        <file>icon.png</file>
+    </qresource>
+</RCC>
