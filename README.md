@@ -2,6 +2,7 @@
 
 **Subsea Cable Tools** is a QGIS Plugin created to support working with subsea telecom and power cable data in QGIS.
 
+
 ---
 
 ## 🚀 Features
@@ -15,3 +16,5 @@ Accessible via the QGIS Processing Toolbox under **Subsea Cable Tools**:
 
 ### 🗺️ Map Tool
 - **KP Mouse Tool** – Interactive tool that provides closest KP and DCC of the mouse pointer dynamically.
+
+It's a new tool and not extensively tested yet, so apologies if you encounter issues or find the documentation lacking. I'll continue to test and improve the tools.
