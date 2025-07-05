@@ -443,3 +443,39 @@ class ImportBathyMdbAlgorithm(QgsProcessingAlgorithm):
 
     def createInstance(self):
         return ImportBathyMdbAlgorithm()
+
+    def shortHelpString(self):
+        return self.tr("""<h3>Import Bathy MDB (Experimental)</h3>
+<p><b><font color="red">Warning:</font> This tool is experimental and may not work with all GeoMedia-formatted MDB files. Use with caution.</b></p>
+<p>This tool attempts to import feature tables from a Microsoft Access Database (.mdb) file, typically created by Intergraph GeoMedia, into QGIS as new memory layers.</p>
+
+<h4>How it Works</h4>
+<p>The tool connects to the MDB file and looks for a `GFeatures` table to identify the feature classes within the database. For each feature class found, it reads the geometry from a binary (BLOB) field and creates a corresponding QGIS layer.</p>
+<p>It automatically adds two fields to each new layer:
+<ul>
+  <li><b>depth:</b> The average Z-value of the feature's vertices, if available.</li>
+  <li><b>source:</b> The filename of the source MDB file for traceability.</li>
+</ul>
+</p>
+
+<h4>Prerequisites</h4>
+<p>This tool requires the <b>Microsoft Access Database Engine</b> (or a compatible ODBC driver) to be installed on your system. Without it, QGIS cannot connect to the MDB file. This generally means the tool will only function on a Windows operating system.</p>
+
+<h4>Input Parameters</h4>
+<ul>
+  <li><b>Input MDB File:</b> The GeoMedia MDB file you want to import.</li>
+  <li><b>Coordinate System:</b> You <b>must</b> manually select the Coordinate Reference System (CRS) of the data in the MDB file. The tool cannot automatically detect it. Providing the wrong CRS will result in misplaced data.</li>
+</ul>
+
+<h4>Outputs</h4>
+<ul>
+  <li><b>Imported Layers:</b> The tool will create a new memory layer for each feature table successfully imported from the MDB. These layers are added directly to your QGIS project.</li>
+</ul>
+
+<h4>Known Limitations & Troubleshooting</h4>
+<ul>
+  <li><b>BLOB Format:</b> The tool is designed to parse a specific binary format for geometry. If your MDB uses a different format, the import will fail.</li>
+  <li><b>Metadata Tables:</b> It relies on specific system tables like `GFeatures`, `FieldLookup`, and `AttributeProperties`. If these are missing or have an unexpected structure, the tool will not work.</li>
+  <li><b>Errors:</b> If a table fails to import, a message will be shown in the Log Messages Panel. Check the log for details about ODBC errors or parsing failures.</li>
+</ul>
+""")

@@ -2,7 +2,7 @@
 name=Subsea Cable Tools
 qgisMinimumVersion=3.0
 description=Tools to support working with subsea cable data in QGIS.
-version=1.0.0
+version=1.1.0
 author=Kieran McMonagle
 email=kieran.mcmonagle@globalmarine.group
 
@@ -14,8 +14,7 @@ repository=https://github.com/k-mcmonagle/subsea-cable-tools
 hasProcessingProvider=yes
 
 # changelog
-changelog=Version 1.0.0 (2025-04-05): Initial public release.
-
+changelog=Version 1.1.0 (2025-07-05): Enhanced KP Mouse Tool with persistent tooltip, improved usability, and continuous KP calculation. Added new tools for placing KP points. Improved KP Range Highlighter tools. Fixed several bugs, including QGIS API compatibility issues and nearest KP calculation.
 tags=subsea, cable, telecoms, mapping, gis, qgis, lrs, kp, offshore, engineering, bathymetry, 
 
 homepage=https://github.com/k-mcmonagle/subsea-cable-tools

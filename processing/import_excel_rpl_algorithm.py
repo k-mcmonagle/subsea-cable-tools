@@ -134,6 +134,50 @@ class ImportExcelRPLAlgorithm(QgsProcessingAlgorithm):
     def groupId(self):
         return 'rpl_import'
 
+    def shortHelpString(self):
+        return self.tr("""
+<h3>Import Excel RPL</h3>
+<p>This tool imports a cable Route Position List (RPL) from a Microsoft Excel file (.xlsx) into QGIS. It creates two new layers: a <b>point layer</b> for positions (e.g., Start of Cable, End of Cable, Repeater) and a <b>line layer</b> representing the cable segments connecting these points.</p>
+
+<h4>How it Works</h4>
+<p>The tool reads the specified sheet in the Excel file row by row, interpreting alternating rows as point and line data.
+<ul>
+  <li>The first data row (specified by 'Data Start Row') is treated as a <b>Point</b>.</li>
+  <li>The second row is treated as a <b>Line</b> (connecting the first and second points).</li>
+  <li>The third row is another <b>Point</b>.</li>
+  <li>The fourth row is another <b>Line</b> (connecting the second and third points), and so on.</li>
+</ul>
+This pattern continues until the 'Data End Row' is reached or the end of the sheet.
+</p>
+
+<h4>Input Parameters</h4>
+<ul>
+  <li><b>Select Excel RPL File:</b> The Excel file (.xlsx) containing the RPL.</li>
+  <li><b>Sheet Name:</b> The exact name of the worksheet with the RPL data.</li>
+  <li><b>Data Start Row:</b> The row number where the RPL data begins.</li>
+  <li><b>Data End Row:</b> (Optional) The last row of data to import. If set to 0, it reads to the end of the sheet.</li>
+  <li><b>Column IDs:</b> You must provide the Excel column letters (e.g., A, B, AA) for each required data field.
+    <ul>
+      <li><b>Mandatory for Geometry:</b> The tool requires columns for Latitude and Longitude, split into Degrees, Minutes, and Hemisphere (e.g., LatDeg, LatMin, LatHemi). Without these, points cannot be created.</li>
+      <li><b>Other Fields:</b> All other fields are optional. If a column letter is not provided for an optional field (or set to '0'), it will be skipped.</li>
+    </ul>
+  </li>
+</ul>
+
+<h4>Outputs</h4>
+<ol>
+  <li><b>RPL Points:</b> A point layer with features for each point row in the RPL. The layer's CRS will be WGS 84 (EPSG:4326).</li>
+  <li><b>RPL Lines:</b> A line layer with features for each line segment connecting two consecutive points. The layer's CRS will also be WGS 84 (EPSG:4326).</li>
+</ol>
+
+<h4>Notes</h4>
+<ul>
+  <li>The tool expects latitude and longitude in Degrees, Decimal Minutes, and Hemisphere format. It converts these to Decimal Degrees automatically.</li>
+  <li>If a row that should define a point has invalid coordinate data, it will be skipped, and a warning will be shown in the Log Messages Panel. This may affect the creation of subsequent line features.</li>
+  <li>The 'SourceFile' attribute is automatically added to both output layers to maintain traceability to the original Excel file.</li>
+</ul>
+""")
+
     def initAlgorithm(self, config=None):
         # 1) Excel File
         self.addParameter(

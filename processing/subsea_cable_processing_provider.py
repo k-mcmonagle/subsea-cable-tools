@@ -11,6 +11,9 @@ from .kp_range_csv_algorithm import KPRangeCSVAlgorithm
 from .import_excel_rpl_algorithm import ImportExcelRPLAlgorithm
 from .nearest_kp_algorithm import NearestKPAlgorithm
 from .import_bathy_mdb_algorithm import ImportBathyMdbAlgorithm
+from .place_kp_points_algorithm import PlaceKpPointsAlgorithm
+from .place_kp_points_from_csv_algorithm import PlaceKpPointsFromCsvAlgorithm
+from .place_single_kp_point_algorithm import PlaceSingleKpPointAlgorithm
 
 
 class SubseaCableProcessingProvider(QgsProcessingProvider):
@@ -29,7 +32,9 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
         self.addAlgorithm(ImportExcelRPLAlgorithm())
         self.addAlgorithm(NearestKPAlgorithm())
         self.addAlgorithm(ImportBathyMdbAlgorithm())
-
+        self.addAlgorithm(PlaceKpPointsAlgorithm())
+        self.addAlgorithm(PlaceKpPointsFromCsvAlgorithm())
+        self.addAlgorithm(PlaceSingleKpPointAlgorithm())
 
     def id(self):
         """
