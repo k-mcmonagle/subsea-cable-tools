@@ -13,7 +13,10 @@ from .nearest_kp_algorithm import NearestKPAlgorithm
 from .import_bathy_mdb_algorithm import ImportBathyMdbAlgorithm
 from .place_kp_points_algorithm import PlaceKpPointsAlgorithm
 from .place_kp_points_from_csv_algorithm import PlaceKpPointsFromCsvAlgorithm
+
 from .place_single_kp_point_algorithm import PlaceSingleKpPointAlgorithm
+from .create_mbes_raster_from_xyz_algorithm import CreateMBESRasterFromXYZAlgorithm
+from .merge_mbes_rasters_algorithm import MergeMBESRastersAlgorithm
 
 
 class SubseaCableProcessingProvider(QgsProcessingProvider):
@@ -27,6 +30,7 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
         pass
 
     def loadAlgorithms(self):
+        print('Loading Subsea Cable Tools algorithms...')
         self.addAlgorithm(KPRangeHighlighterAlgorithm())
         self.addAlgorithm(KPRangeCSVAlgorithm())
         self.addAlgorithm(ImportExcelRPLAlgorithm())
@@ -35,6 +39,10 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
         self.addAlgorithm(PlaceKpPointsAlgorithm())
         self.addAlgorithm(PlaceKpPointsFromCsvAlgorithm())
         self.addAlgorithm(PlaceSingleKpPointAlgorithm())
+        print('Registering CreateMBESRasterFromXYZAlgorithm...')
+        self.addAlgorithm(CreateMBESRasterFromXYZAlgorithm())
+        print('Registering MergeMBESRastersAlgorithm...')
+        self.addAlgorithm(MergeMBESRastersAlgorithm())
 
     def id(self):
         """

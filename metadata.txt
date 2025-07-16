@@ -1,8 +1,8 @@
 [general]
 name=Subsea Cable Tools
 qgisMinimumVersion=3.0
-description=Tools to support working with subsea cable data in QGIS.
-version=1.1.0
+description=Tools to support working with subsea cable data in QGIS, including a new KP Data Plotter for visualizing KP-based data from tables against reference lines.
+version=1.2.0
 author=Kieran McMonagle
 email=kieran.mcmonagle@globalmarine.group
 
@@ -14,7 +14,7 @@ repository=https://github.com/k-mcmonagle/subsea-cable-tools
 hasProcessingProvider=yes
 
 # changelog
-changelog=Version 1.1.0 (2025-07-05): Enhanced KP Mouse Tool with persistent tooltip, improved usability, and continuous KP calculation. Added new tools for placing KP points. Improved KP Range Highlighter tools. Fixed several bugs, including QGIS API compatibility issues and nearest KP calculation.
+changelog=Version 1.2.0 (2025-07-13): Added new "KP Data Plotter" dockable tool for plotting KP-based data from table layers against a reference line, with interactive crosshair, map marker, y-axis reversal, and tooltips. Added new "Merge MBES Rasters" tool for mosaicking multiple MBES raster layers, preserving depth (Z) values and ensuring NoData areas are transparent. Added new "Create Raster from XYZ" tool for converting large XYZ (Easting, Northing, Depth) files to raster using a robust VRT-based method, with support for direct rasterization and IDW interpolation. KP Range Highlighter output now only includes start_kp, end_kp, and (if provided) custom_label fields. Added length_km field to output. custom_label only included if provided. Bug fix for attribute type conversion errors. "Import Excel RPL" tool now includes an optional 'Chart No' field and saves user-defined column mappings between sessions to improve usability when importing multiple files of the same format.
 tags=subsea, cable, telecoms, mapping, gis, qgis, lrs, kp, offshore, engineering, bathymetry, 
 
 homepage=https://github.com/k-mcmonagle/subsea-cable-tools

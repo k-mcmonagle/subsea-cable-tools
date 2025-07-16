@@ -7,7 +7,7 @@ A QGIS plugin with tools for working with subsea cables.
 
 import os.path
 
-from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication
+from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, Qt
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction
 
@@ -19,8 +19,11 @@ from .resources import *
 from .subsea_cable_tools_dialog import SubseaCableToolsDialog
 # Import the KP Mouse Tool (map tool integration)
 from .maptools.kp_mouse_maptool import KPMouseTool
+
 # Import the processing provider
 from .processing.subsea_cable_processing_provider import SubseaCableProcessingProvider
+# Import the KP Plotter Dock Widget
+from .kp_plotter_dockwidget import KpPlotterDockWidget
 
 
 class SubseaCableTools:
@@ -47,11 +50,16 @@ class SubseaCableTools:
         self.menu = self.tr(u'&Subsea Cable Tools')
         self.first_start = None
 
+
         # Initialize the KP Mouse Tool (map tool integration)
         self.kp_mouse_tool = KPMouseTool(self.iface)
 
         # Initialize the processing provider
         self.kpProvider = SubseaCableProcessingProvider()
+
+        # KP Plotter Dock Widget
+        self.plotter_dock = None
+        self.plotter_action = None
 
     def tr(self, message):
         """Return the translation for a string."""
@@ -76,14 +84,14 @@ class SubseaCableTools:
         # Initialize the KP Mouse Tool’s UI elements
         self.kp_mouse_tool.initGui()
 
-        # Add the main plugin action (e.g. to open a dialog)
-        # icon_path = ':/plugins/subsea_cable_tools/icon.png'
-        # self.add_action(
-        #     icon_path,
-        #     text=self.tr(u'Subsea Cable Tools'),
-        #     callback=self.run,
-        #     parent=self.iface.mainWindow()
-        # )
+
+        # Add action for the KP Plotter (text only, no icon)
+        from qgis.PyQt.QtGui import QIcon
+        self.plotter_action = QAction("KP Plot", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
+        self.plotter_action.triggered.connect(self.show_plotter)
+        self.iface.addToolBarIcon(self.plotter_action)
+        self.iface.addPluginToMenu(self.menu, self.plotter_action)
+        self.actions.append(self.plotter_action)
 
         self.first_start = True
 
@@ -95,9 +103,21 @@ class SubseaCableTools:
         # Unload the map tool UI
         self.kp_mouse_tool.unload()
 
+
+        if self.plotter_dock:
+            self.iface.removeDockWidget(self.plotter_dock)
+            self.plotter_dock.deleteLater()
+            self.plotter_dock = None
+
         for action in self.actions:
             self.iface.removePluginMenu(self.tr(u'&Subsea Cable Tools'), action)
             self.iface.removeToolBarIcon(action)
+    def show_plotter(self):
+        """Show the KP Data Plotter dock widget."""
+        if not self.plotter_dock:
+            self.plotter_dock = KpPlotterDockWidget(self.iface)
+            self.iface.addDockWidget(Qt.RightDockWidgetArea, self.plotter_dock)
+        self.plotter_dock.show()
 
     def run(self):
         """Run method (e.g. open a dialog)."""

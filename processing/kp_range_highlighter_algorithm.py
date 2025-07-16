@@ -81,12 +81,14 @@ class KPRangeHighlighterAlgorithm(QgsProcessingAlgorithm):
         end_kp = self.parameterAsDouble(parameters, self.END_KP, context)
         custom_label = self.parameterAsString(parameters, self.CUSTOM_LABEL, context)
 
-        # Create new fields for the output layer
-        fields = source.fields()
+        # Only create new fields for the output layer (do not copy source fields)
+        fields = QgsFields()
         fields.append(QgsField('start_kp', QVariant.Double))
         fields.append(QgsField('end_kp', QVariant.Double))
-        fields.append(QgsField('source_layer', QVariant.String))
-        fields.append(QgsField('custom_label', QVariant.String))
+        fields.append(QgsField('length_km', QVariant.Double))
+        include_custom_label = bool(custom_label and custom_label.strip())
+        if include_custom_label:
+            fields.append(QgsField('custom_label', QVariant.String))
 
         (sink, dest_id) = self.parameterAsSink(parameters, self.OUTPUT,
                                                context, fields, source.wkbType(), source.sourceCrs())
@@ -160,15 +162,12 @@ class KPRangeHighlighterAlgorithm(QgsProcessingAlgorithm):
         if segment:
             new_feature = QgsFeature(fields)
             new_feature.setGeometry(QgsGeometry.fromPolyline(segment))
-            # Since we've dissolved, we can't get attributes from a single original feature
-            # We'll just populate the fields we've added.
-            new_feature.setAttributes([
-                None, # Or some other default for original fields
-                start_kp,
-                end_kp,
-                source.sourceName(),
-                custom_label
-            ])
+            # Set start_kp, end_kp, length_km, and custom_label if provided
+            length_km = end_kp - start_kp
+            attrs = [start_kp, end_kp, length_km]
+            if include_custom_label:
+                attrs.append(custom_label)
+            new_feature.setAttributes(attrs)
             sink.addFeature(new_feature, QgsFeatureSink.FastInsert)
 
         feedback.setProgress(100)

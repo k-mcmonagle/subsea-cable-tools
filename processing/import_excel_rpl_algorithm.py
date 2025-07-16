@@ -26,7 +26,7 @@ lib_dir = os.path.join(plugin_dir, 'lib')
 if lib_dir not in sys.path:
     sys.path.insert(0, lib_dir)
 
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication, QVariant, QSettings
 from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
@@ -108,6 +108,7 @@ class ImportExcelRPLAlgorithm(QgsProcessingAlgorithm):
     COL_TARGETBURIALDEPTH = 'COL_TARGETBURIALDEPTH'
     COL_BURIALDEPTH       = 'COL_BURIALDEPTH'
     COL_REMARKS           = 'COL_REMARKS'
+    COL_CHARTNO           = 'COL_CHARTNO'
     COL_TERRWATER         = 'COL_TERRWATER'
     COL_EEZ               = 'COL_EEZ'
 
@@ -179,6 +180,29 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
 """)
 
     def initAlgorithm(self, config=None):
+        # --- Read settings ---
+        settings = QSettings()
+        
+        # Define default column mappings
+        default_mappings = {
+            self.COL_POSNO: "A", self.COL_EVENT: "B", self.COL_LATDEG: "C",
+            self.COL_LATMIN: "D", self.COL_LATHEMI: "E", self.COL_LONDEG: "F",
+            self.COL_LONMIN: "G", self.COL_LONHEMI: "H", self.COL_BEARING: "I",
+            self.COL_DISTBETWEENPOS: "J", self.COL_DISTCUMUL: "K", self.COL_SLACK: "L",
+            self.COL_CABLEDISTBETWEEN: "M", self.COL_CABLEDISTCUM: "N",
+            self.COL_CABLECODE: "O", self.COL_FIBERPAIR: "P", self.COL_CABLETYPE: "Q",
+            self.COL_APPROXDEPTH: "T", self.COL_LAYDIRECTION: "U",
+            self.COL_LAYVESSEL: "V", self.COL_PROTECTIONMETHOD: "W",
+            self.COL_DATEINSTALLED: "X", self.COL_TARGETBURIALDEPTH: "Y",
+            self.COL_BURIALDEPTH: "0", self.COL_REMARKS: "Z", self.COL_CHARTNO: "0",
+            self.COL_TERRWATER: "AA", self.COL_EEZ: "AB"
+        }
+
+        # Load saved mappings or use defaults
+        saved_mappings = {}
+        for key, default_val in default_mappings.items():
+            saved_mappings[key] = settings.value(f"SubseaCableTools/ImportExcelRPL/{key}", default_val)
+
         # 1) Excel File
         self.addParameter(
             QgsProcessingParameterFile(
@@ -228,56 +252,56 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
             QgsProcessingParameterString(
                 self.COL_POSNO,
                 self.tr('PosNo'),
-                defaultValue="A"
+                defaultValue=saved_mappings[self.COL_POSNO]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_EVENT,
                 self.tr('Event'),
-                defaultValue="B"
+                defaultValue=saved_mappings[self.COL_EVENT]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_LATDEG,
                 self.tr('LatDeg'),
-                defaultValue="C"
+                defaultValue=saved_mappings[self.COL_LATDEG]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_LATMIN,
                 self.tr('LatMin'),
-                defaultValue="D"
+                defaultValue=saved_mappings[self.COL_LATMIN]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_LATHEMI,
                 self.tr('LatHemi'),
-                defaultValue="E"
+                defaultValue=saved_mappings[self.COL_LATHEMI]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_LONDEG,
                 self.tr('LonDeg'),
-                defaultValue="F"
+                defaultValue=saved_mappings[self.COL_LONDEG]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_LONMIN,
                 self.tr('LonMin'),
-                defaultValue="G"
+                defaultValue=saved_mappings[self.COL_LONMIN]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_LONHEMI,
                 self.tr('LonHemi'),
-                defaultValue="H"
+                defaultValue=saved_mappings[self.COL_LONHEMI]
             )
         )
 
@@ -286,133 +310,140 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
             QgsProcessingParameterString(
                 self.COL_BEARING,
                 self.tr('Bearing'),
-                defaultValue="I"
+                defaultValue=saved_mappings[self.COL_BEARING]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_DISTBETWEENPOS,
                 self.tr('DistBetweenPos'),
-                defaultValue="J"
+                defaultValue=saved_mappings[self.COL_DISTBETWEENPOS]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_DISTCUMUL,
                 self.tr('DistCumulative'),
-                defaultValue="K"
+                defaultValue=saved_mappings[self.COL_DISTCUMUL]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_SLACK,
                 self.tr('Slack'),
-                defaultValue="L"
+                defaultValue=saved_mappings[self.COL_SLACK]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_CABLEDISTBETWEEN,
                 self.tr('CableDistBetweenPos'),
-                defaultValue="M"
+                defaultValue=saved_mappings[self.COL_CABLEDISTBETWEEN]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_CABLEDISTCUM,
                 self.tr('CableDistCumulative'),
-                defaultValue="N"
+                defaultValue=saved_mappings[self.COL_CABLEDISTCUM]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_CABLECODE,
                 self.tr('CableCode'),
-                defaultValue="O"
+                defaultValue=saved_mappings[self.COL_CABLECODE]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_FIBERPAIR,
                 self.tr('FiberPair'),
-                defaultValue="P"
+                defaultValue=saved_mappings[self.COL_FIBERPAIR]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_CABLETYPE,
                 self.tr('CableType'),
-                defaultValue="Q"
+                defaultValue=saved_mappings[self.COL_CABLETYPE]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_APPROXDEPTH,
                 self.tr('ApproxDepth'),
-                defaultValue="T"
+                defaultValue=saved_mappings[self.COL_APPROXDEPTH]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_LAYDIRECTION,
                 self.tr('LayDirection'),
-                defaultValue="U"
+                defaultValue=saved_mappings[self.COL_LAYDIRECTION]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_LAYVESSEL,
                 self.tr('LayVessel'),
-                defaultValue="V"
+                defaultValue=saved_mappings[self.COL_LAYVESSEL]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_PROTECTIONMETHOD,
                 self.tr('ProtectionMethod'),
-                defaultValue="W"
+                defaultValue=saved_mappings[self.COL_PROTECTIONMETHOD]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_DATEINSTALLED,
                 self.tr('DateInstalled'),
-                defaultValue="X"
+                defaultValue=saved_mappings[self.COL_DATEINSTALLED]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_TARGETBURIALDEPTH,
                 self.tr('TargetBurialDepth'),
-                defaultValue="Y"
+                defaultValue=saved_mappings[self.COL_TARGETBURIALDEPTH]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_BURIALDEPTH,
                 self.tr('BurialDepth'),
-                defaultValue="0"
+                defaultValue=saved_mappings[self.COL_BURIALDEPTH]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_REMARKS,
                 self.tr('Remarks'),
-                defaultValue="Z"
+                defaultValue=saved_mappings[self.COL_REMARKS]
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterString(
+                self.COL_CHARTNO,
+                self.tr('Chart No'),
+                defaultValue=saved_mappings[self.COL_CHARTNO]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_TERRWATER,
                 self.tr('TerritorialWater'),
-                defaultValue="AA"
+                defaultValue=saved_mappings[self.COL_TERRWATER]
             )
         )
         self.addParameter(
             QgsProcessingParameterString(
                 self.COL_EEZ,
                 self.tr('EEZ'),
-                defaultValue="AB"
+                defaultValue=saved_mappings[self.COL_EEZ]
             )
         )
 
@@ -436,6 +467,23 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
         sheet_name = self.parameterAsString(parameters, self.INPUT_SHEET, context)
         start_row  = self.parameterAsInt(parameters, self.INPUT_STARTROW, context)
         end_row    = self.parameterAsInt(parameters, self.INPUT_ENDROW, context)
+
+        # --- Save settings ---
+        settings = QSettings()
+        param_keys = [
+            self.COL_POSNO, self.COL_EVENT, self.COL_LATDEG, self.COL_LATMIN,
+            self.COL_LATHEMI, self.COL_LONDEG, self.COL_LONMIN, self.COL_LONHEMI,
+            self.COL_BEARING, self.COL_DISTBETWEENPOS, self.COL_DISTCUMUL,
+            self.COL_SLACK, self.COL_CABLEDISTBETWEEN, self.COL_CABLEDISTCUM,
+            self.COL_CABLECODE, self.COL_FIBERPAIR, self.COL_CABLETYPE,
+            self.COL_APPROXDEPTH, self.COL_LAYDIRECTION, self.COL_LAYVESSEL,
+            self.COL_PROTECTIONMETHOD, self.COL_DATEINSTALLED,
+            self.COL_TARGETBURIALDEPTH, self.COL_BURIALDEPTH, self.COL_REMARKS,
+            self.COL_CHARTNO, self.COL_TERRWATER, self.COL_EEZ
+        ]
+        for key in param_keys:
+            value = self.parameterAsString(parameters, key, context)
+            settings.setValue(f"SubseaCableTools/ImportExcelRPL/{key}", value)
 
         # Extract file name for traceability
         source_file_name = os.path.basename(excel_file)
@@ -467,6 +515,7 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
         p_col_targetburialdepth= col_letter_to_index(self.parameterAsString(parameters, self.COL_TARGETBURIALDEPTH, context))
         p_col_burialdepth      = col_letter_to_index(self.parameterAsString(parameters, self.COL_BURIALDEPTH, context))
         p_col_remarks          = col_letter_to_index(self.parameterAsString(parameters, self.COL_REMARKS, context))
+        p_col_chartno          = col_letter_to_index(self.parameterAsString(parameters, self.COL_CHARTNO, context))
         p_col_terrwater        = col_letter_to_index(self.parameterAsString(parameters, self.COL_TERRWATER, context))
         p_col_eez              = col_letter_to_index(self.parameterAsString(parameters, self.COL_EEZ, context))
 
@@ -493,6 +542,7 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
         point_fields.append(QgsField("CableDistCumulative", QVariant.Double))
         point_fields.append(QgsField("ApproxDepth", QVariant.Double))
         point_fields.append(QgsField("Remarks", QVariant.String))
+        point_fields.append(QgsField("ChartNo", QVariant.Int))
         point_fields.append(QgsField("Latitude", QVariant.Double))
         point_fields.append(QgsField("Longitude", QVariant.Double))
         point_fields.append(QgsField("SourceFile", QVariant.String))
@@ -518,7 +568,8 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
         line_fields.append(QgsField("EEZ", QVariant.String))
         line_fields.append(QgsField("SourceFile", QVariant.String))
 
-        # Create sinks
+        # --- Sinks for output layers ---
+        # Get sinks for the two output layers
         (point_sink, point_sink_id) = self.parameterAsSink(
             parameters,
             self.OUTPUT_POINTS,
@@ -619,6 +670,15 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
                 if p_col_remarks > 0:
                     val = ws.cell(row=row_idx, column=p_col_remarks).value
                     remarks_str = str(val) if val else ""
+                
+                chart_no = 0  # Default value
+                if p_col_chartno > 0:
+                    val = ws.cell(row=row_idx, column=p_col_chartno).value
+                    try:
+                        chart_no = int(val) if val is not None else 0
+                    except (ValueError, TypeError):
+                        chart_no = 0 # Keep default if conversion fails
+
                 point_list.append({
                     "PosNo": pos_no,
                     "Event": event_str,
@@ -627,7 +687,8 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
                     "DistCumulative": dist_cumul,
                     "CableDistCumulative": cable_dist_cumul,
                     "ApproxDepth": approx_depth,
-                    "Remarks": remarks_str
+                    "Remarks": remarks_str,
+                    "ChartNo": chart_no
                 })
             else:
                 # Line row
@@ -690,6 +751,7 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
             feat.setAttribute("CableDistCumulative", pt["CableDistCumulative"])
             feat.setAttribute("ApproxDepth", pt["ApproxDepth"])
             feat.setAttribute("Remarks", pt["Remarks"])
+            feat.setAttribute("ChartNo", pt.get("ChartNo", 0))
             feat.setAttribute("Latitude", pt["Lat"])
             feat.setAttribute("Longitude", pt["Lon"])
             feat.setAttribute("SourceFile", source_file_name)
