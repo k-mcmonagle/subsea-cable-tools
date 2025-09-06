@@ -9,14 +9,18 @@ from qgis.core import QgsProcessingProvider
 from .kp_range_highlighter_algorithm import KPRangeHighlighterAlgorithm
 from .kp_range_csv_algorithm import KPRangeCSVAlgorithm
 from .import_excel_rpl_algorithm import ImportExcelRPLAlgorithm
+from .import_cable_lay_algorithm import ImportCableLayAlgorithm
+
 from .nearest_kp_algorithm import NearestKPAlgorithm
 from .import_bathy_mdb_algorithm import ImportBathyMdbAlgorithm
 from .place_kp_points_algorithm import PlaceKpPointsAlgorithm
 from .place_kp_points_from_csv_algorithm import PlaceKpPointsFromCsvAlgorithm
-
 from .place_single_kp_point_algorithm import PlaceSingleKpPointAlgorithm
 from .create_mbes_raster_from_xyz_algorithm import CreateMBESRasterFromXYZAlgorithm
 from .merge_mbes_rasters_algorithm import MergeMBESRastersAlgorithm
+
+from .import_ship_outline_algorithm import ImportShipOutlineAlgorithm
+from .place_ship_outlines_algorithm import PlaceShipOutlinesAlgorithm
 
 
 class SubseaCableProcessingProvider(QgsProcessingProvider):
@@ -43,6 +47,12 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
         self.addAlgorithm(CreateMBESRasterFromXYZAlgorithm())
         print('Registering MergeMBESRastersAlgorithm...')
         self.addAlgorithm(MergeMBESRastersAlgorithm())
+        print('Registering ImportCableLayAlgorithm...')
+        self.addAlgorithm(ImportCableLayAlgorithm())
+        print('Registering ImportShipOutlineAlgorithm...')
+        self.addAlgorithm(ImportShipOutlineAlgorithm())
+        print('Registering PlaceShipOutlinesAlgorithm...')
+        self.addAlgorithm(PlaceShipOutlinesAlgorithm())
 
     def id(self):
         """

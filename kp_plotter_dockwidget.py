@@ -1,7 +1,13 @@
-from qgis.PyQt.QtWidgets import QDockWidget, QVBoxLayout, QWidget, QComboBox, QLabel, QListWidget, QPushButton, QListWidgetItem, QAbstractItemView, QTabWidget, QHBoxLayout, QCheckBox
+from qgis.PyQt.QtWidgets import QDockWidget, QVBoxLayout, QWidget, QComboBox, QLabel, QListWidget, QPushButton, QListWidgetItem, QAbstractItemView, QTabWidget, QHBoxLayout, QCheckBox, QGroupBox, QRadioButton, QButtonGroup
 from qgis.PyQt.QtCore import Qt
 from qgis.core import QgsProject, QgsVectorLayer, QgsMapLayerProxyModel, QgsWkbTypes, QgsGeometry, QgsPointXY, QgsWkbTypes, QgsDistanceArea, QgsCoordinateTransform
 from qgis.gui import QgsVertexMarker
+try:  # Safe sip import for deleted checks
+    import sip  # type: ignore
+    _sip_isdeleted = sip.isdeleted
+except Exception:  # pragma: no cover
+    def _sip_isdeleted(_obj):
+        return False
 # Matplotlib imports
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -57,6 +63,7 @@ class KpPlotterDockWidget(QDockWidget):
         self.data_fields_list = QListWidget()
         self.data_fields_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.left_col_layout.addWidget(self.data_fields_list)
+        self.data_fields_list.itemSelectionChanged.connect(self.update_axis_assignment_ui)
         self.plot_button = QPushButton("Plot Data")
         self.left_col_layout.addWidget(self.plot_button)
         self.plot_button.clicked.connect(self.plot_data)
@@ -64,14 +71,24 @@ class KpPlotterDockWidget(QDockWidget):
         # Right column: Settings
         self.right_col_widget = QWidget()
         self.right_col_layout = QVBoxLayout(self.right_col_widget)
-        self.reverse_y_checkbox = QCheckBox("Reverse Y Axis")
+        self.reverse_y_checkbox = QCheckBox("Reverse Primary Y Axis")
         self.right_col_layout.addWidget(self.reverse_y_checkbox)
+        self.reverse_y_secondary_checkbox = QCheckBox("Reverse Secondary Y Axis")
+        self.right_col_layout.addWidget(self.reverse_y_secondary_checkbox)
         self.reverse_kp_checkbox = QCheckBox("Reverse KP")
         self.reverse_kp_checkbox.setChecked(False)
         self.right_col_layout.addWidget(self.reverse_kp_checkbox)
         self.tooltip_checkbox = QCheckBox("Show Value Tooltips")
         self.tooltip_checkbox.setChecked(True)
         self.right_col_layout.addWidget(self.tooltip_checkbox)
+
+        # Axis assignment section
+        self.axis_group = QGroupBox("Axis Assignment")
+        self.axis_layout = QVBoxLayout(self.axis_group)
+        self.axis_layout.addWidget(QLabel("Assign selected fields to axes:"))
+        self.axis_widgets = {}  # Store radio button groups for each field
+        self.right_col_layout.addWidget(self.axis_group)
+
         self.right_col_layout.addStretch(1)
 
         self.setup_layout.addWidget(self.left_col_widget)
@@ -101,6 +118,7 @@ class KpPlotterDockWidget(QDockWidget):
             "    <li>Select a <b>Reference Line Layer</b> (must be a line geometry layer).</li>"
             "    <li>Select a <b>Data Table Layer</b> (table or vector layer with KP and data fields).</li>"
             "    <li>Choose the <b>KP Field</b> and one or more <b>Data Fields</b> to plot.</li>"
+            "    <li>Assign selected data fields to <b>Primary</b> or <b>Secondary</b> Y axes as needed.</li>"
             "    <li>Click <b>Plot Data</b> to generate the chart and enable map/chart interactivity.</li>"
             "  </ol>"
             "</li>"
@@ -108,7 +126,8 @@ class KpPlotterDockWidget(QDockWidget):
             "  <ul>"
             "    <li>Hover over the plot to see a crosshair and map marker at the nearest KP.</li>"
             "    <li>Right-click the plot to zoom the map to the selected KP location.</li>"
-            "    <li>Enable/disable value tooltips and reverse the Y axis using the checkboxes.</li>"
+            "    <li>Enable/disable value tooltips and assign data fields to primary or secondary Y axes.</li>"
+            "    <li>Reverse the primary and secondary Y axes independently using the checkboxes.</li>"
             "  </ul>"
             "</li>"
             "<li><b>Tips & Notes:</b>"
@@ -151,6 +170,13 @@ class KpPlotterDockWidget(QDockWidget):
         except Exception:
             pass  # Fallback if iface.mainWindow() is not available
 
+    def __del__(self):
+        """Destructor to ensure cleanup on object deletion."""
+        try:
+            self.cleanup_matplotlib_resources_on_close()
+        except Exception:
+            pass  # Ignore any errors during destruction
+
     def populate_layer_combos(self):
         """
         Populate the line and table layer combo boxes with current project layers.
@@ -184,8 +210,15 @@ class KpPlotterDockWidget(QDockWidget):
         data_fields = [item.text() for item in self.data_fields_list.selectedItems()]
         self.settings.setValue("KpPlotter/data_fields", data_fields)
         self.settings.setValue("KpPlotter/reverse_y", self.reverse_y_checkbox.isChecked())
+        self.settings.setValue("KpPlotter/reverse_y_secondary", self.reverse_y_secondary_checkbox.isChecked())
         self.settings.setValue("KpPlotter/reverse_kp", self.reverse_kp_checkbox.isChecked())
         self.settings.setValue("KpPlotter/show_tooltips", self.tooltip_checkbox.isChecked())
+
+        # Save axis assignments
+        axis_assignments = {}
+        for field in data_fields:
+            axis_assignments[field] = self.get_axis_assignment(field)
+        self.settings.setValue("KpPlotter/axis_assignments", axis_assignments)
 
     def restore_user_settings(self, layer_only=False):
         """Restore user selections from QSettings. If layer_only, only restore layer combos."""
@@ -235,10 +268,15 @@ class KpPlotterDockWidget(QDockWidget):
         # Restore checkboxes
         reverse_y = self.settings.value("KpPlotter/reverse_y", False, type=bool)
         self.reverse_y_checkbox.setChecked(reverse_y)
+        reverse_y_secondary = self.settings.value("KpPlotter/reverse_y_secondary", False, type=bool)
+        self.reverse_y_secondary_checkbox.setChecked(reverse_y_secondary)
         reverse_kp = self.settings.value("KpPlotter/reverse_kp", False, type=bool)
         self.reverse_kp_checkbox.setChecked(reverse_kp)
         show_tooltips = self.settings.value("KpPlotter/show_tooltips", True, type=bool)
         self.tooltip_checkbox.setChecked(show_tooltips)
+
+        # Restore axis assignments (will be called after field selection is restored)
+        self.restore_axis_assignments()
 
     def update_field_lists(self):
         """
@@ -260,12 +298,103 @@ class KpPlotterDockWidget(QDockWidget):
             item = QListWidgetItem(field.name())
             self.data_fields_list.addItem(item)
 
+        # Update axis assignment UI when fields change
+        self.update_axis_assignment_ui()
+
+    def update_axis_assignment_ui(self):
+        """Update the axis assignment UI based on selected fields."""
+        # Clear existing axis widgets
+        for widget in self.axis_widgets.values():
+            if widget['group_box']:
+                self.axis_layout.removeWidget(widget['group_box'])
+                widget['group_box'].setParent(None)
+        self.axis_widgets.clear()
+
+        # Get selected fields
+        selected_fields = [item.text() for item in self.data_fields_list.selectedItems()]
+
+        # Create axis assignment widgets for each selected field
+        for field in selected_fields:
+            group_box = QGroupBox(field)
+            h_layout = QHBoxLayout(group_box)
+
+            primary_radio = QRadioButton("Primary")
+            secondary_radio = QRadioButton("Secondary")
+            primary_radio.setChecked(True)  # Default to primary
+
+            button_group = QButtonGroup(group_box)
+            button_group.addButton(primary_radio, 1)
+            button_group.addButton(secondary_radio, 2)
+
+            h_layout.addWidget(primary_radio)
+            h_layout.addWidget(secondary_radio)
+            h_layout.addStretch()
+
+            self.axis_layout.addWidget(group_box)
+
+            self.axis_widgets[field] = {
+                'group_box': group_box,
+                'primary_radio': primary_radio,
+                'secondary_radio': secondary_radio,
+                'button_group': button_group
+            }
+
+        # Restore previous assignments if available
+        self.restore_axis_assignments()
+
+    def get_axis_assignment(self, field):
+        """Get the axis assignment for a field."""
+        if field in self.axis_widgets:
+            if self.axis_widgets[field]['primary_radio'].isChecked():
+                return 'primary'
+            else:
+                return 'secondary'
+        return 'primary'  # Default
+
+    def set_axis_assignment(self, field, axis):
+        """Set the axis assignment for a field."""
+        if field in self.axis_widgets:
+            if axis == 'primary':
+                self.axis_widgets[field]['primary_radio'].setChecked(True)
+            elif axis == 'secondary':
+                self.axis_widgets[field]['secondary_radio'].setChecked(True)
+
+    def restore_axis_assignments(self):
+        """Restore axis assignments from settings."""
+        axis_assignments = self.settings.value("KpPlotter/axis_assignments", {})
+        if isinstance(axis_assignments, str):
+            import ast
+            try:
+                axis_assignments = ast.literal_eval(axis_assignments)
+            except:
+                axis_assignments = {}
+
+        for field, axis in axis_assignments.items():
+            self.set_axis_assignment(field, axis)
+
 
     def plot_data(self):
         """
         Plot the selected KP-based data on the chart.
         Uses merged line geometry and interpolation logic matching the Place KP Points tool for consistency.
         """
+        # Ensure figure, canvas, and toolbar are initialized (in case they were cleaned up)
+        if self.figure is None or self.canvas is None or self.toolbar is None:
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+            from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+            self.figure = Figure(figsize=(8, 5))
+            self.canvas = FigureCanvas(self.figure)
+            self.toolbar = NavigationToolbar(self.canvas, self)
+            # Remove old widgets if present
+            for i in reversed(range(self.plot_layout.count())):
+                widget = self.plot_layout.itemAt(i).widget()
+                if widget is not None:
+                    self.plot_layout.removeWidget(widget)
+                    widget.setParent(None)
+            self.plot_layout.addWidget(self.toolbar)
+            self.plot_layout.addWidget(self.canvas)
+
         # Clear previous plot
         self.cleanup_plot_and_marker()
         ax = self.figure.add_subplot(111)
@@ -348,18 +477,50 @@ class KpPlotterDockWidget(QDockWidget):
         if self.reverse_kp_checkbox.isChecked():
             zipped = list(reversed(zipped))
         self.kp_sorted = [row[0] for row in zipped]  # Store for snapping
-        for idx, field in enumerate(data_fields):
-            y_sorted = [row[idx+1] for row in zipped]
-            ax.plot(self.kp_sorted, y_sorted, label=field)
+
+        # Separate fields by axis assignment
+        primary_fields = [field for field in data_fields if self.get_axis_assignment(field) == 'primary']
+        secondary_fields = [field for field in data_fields if self.get_axis_assignment(field) == 'secondary']
+
+        # Define color cycles for primary and secondary axes
+        primary_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+        secondary_colors = ['#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5', '#c49c94', '#f7b6d2', '#c7c7c7', '#dbdb8d', '#9edae5']
+
+        # Plot primary axis data
+        for idx, field in enumerate(primary_fields):
+            y_sorted = [row[data_fields.index(field)+1] for row in zipped]
+            color = primary_colors[idx % len(primary_colors)]
+            ax.plot(self.kp_sorted, y_sorted, label=field, color=color)
+
+        # Plot secondary axis data if any
+        if secondary_fields:
+            ax2 = ax.twinx()
+            for idx, field in enumerate(secondary_fields):
+                y_sorted = [row[data_fields.index(field)+1] for row in zipped]
+                color = secondary_colors[idx % len(secondary_colors)]
+                ax2.plot(self.kp_sorted, y_sorted, label=field, color=color)
+            ax2.set_ylabel("Secondary Axis Value")
+        else:
+            ax2 = None
 
         self.vertical_line = ax.axvline(x=self.kp_sorted[0], color='k', linestyle='--', lw=1)
 
         ax.set_xlabel("KP")
-        ax.set_ylabel("Value")
-        ax.legend()
+        ax.set_ylabel("Primary Axis Value")
+
+        # Create combined legend
+        lines1, labels1 = ax.get_legend_handles_labels()
+        if ax2:
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax.legend(lines1 + lines2, labels1 + labels2, loc='best')
+        else:
+            ax.legend()
+
         ax.grid(True)
         if self.reverse_y_checkbox.isChecked():
             ax.invert_yaxis()
+        if ax2 and self.reverse_y_secondary_checkbox.isChecked():
+            ax2.invert_yaxis()
         try:
             self.figure.tight_layout()
         except Exception:
@@ -373,12 +534,20 @@ class KpPlotterDockWidget(QDockWidget):
             self.disable_tooltips()
 
     def enable_tooltips(self):
+        if not hasattr(self, 'canvas') or not self.canvas:
+            return
         if not hasattr(self, '_tooltip_cid') or self._tooltip_cid is None:
-            self._tooltip_cid = self.canvas.mpl_connect('motion_notify_event', self.show_tooltip)
+            try:
+                self._tooltip_cid = self.canvas.mpl_connect('motion_notify_event', self.show_tooltip)
+            except Exception:
+                pass
 
     def disable_tooltips(self):
         if hasattr(self, '_tooltip_cid') and self._tooltip_cid is not None:
-            self.canvas.mpl_disconnect(self._tooltip_cid)
+            try:
+                self.canvas.mpl_disconnect(self._tooltip_cid)
+            except Exception:
+                pass
             self._tooltip_cid = None
 
     def show_tooltip(self, event):
@@ -387,8 +556,14 @@ class KpPlotterDockWidget(QDockWidget):
             self.canvas.setToolTip("")
             return
         ax = event.inaxes
-        # Gather all lines and their data
+        # Gather all lines from both axes
         lines = ax.get_lines()
+
+        # Also check for twin axis
+        ax2 = getattr(ax, '_twinx', None)
+        if ax2:
+            lines.extend(ax2.get_lines())
+
         if not lines:
             self.canvas.setToolTip("")
             return
@@ -435,19 +610,34 @@ class KpPlotterDockWidget(QDockWidget):
 
     def connect_canvas_events(self):
         """Connect mouse motion events to the canvas."""
-        if not self.canvas_cid:
-            self.canvas_cid = self.canvas.mpl_connect('motion_notify_event', self.on_mouse_move)
+        if not hasattr(self, 'canvas') or not self.canvas:
+            return
+            
+        if not hasattr(self, 'canvas_cid') or not self.canvas_cid:
+            try:
+                self.canvas_cid = self.canvas.mpl_connect('motion_notify_event', self.on_mouse_move)
+            except Exception:
+                pass
         # Connect right-click event for zooming map canvas to KP
         if not hasattr(self, '_right_click_cid') or self._right_click_cid is None:
-            self._right_click_cid = self.canvas.mpl_connect('button_press_event', self.on_canvas_right_click)
+            try:
+                self._right_click_cid = self.canvas.mpl_connect('button_press_event', self.on_canvas_right_click)
+            except Exception:
+                pass
 
     def disconnect_canvas_events(self):
         """Disconnect mouse motion events."""
-        if self.canvas_cid:
-            self.canvas.mpl_disconnect(self.canvas_cid)
+        if hasattr(self, 'canvas_cid') and self.canvas_cid:
+            try:
+                self.canvas.mpl_disconnect(self.canvas_cid)
+            except Exception:
+                pass
             self.canvas_cid = None
         if hasattr(self, '_right_click_cid') and self._right_click_cid is not None:
-            self.canvas.mpl_disconnect(self._right_click_cid)
+            try:
+                self.canvas.mpl_disconnect(self._right_click_cid)
+            except Exception:
+                pass
             self._right_click_cid = None
     def on_canvas_right_click(self, event):
         """Handle right-click on the plot: zoom map canvas to the corresponding KP point on the line."""
@@ -587,39 +777,52 @@ class KpPlotterDockWidget(QDockWidget):
         self.iface.mapCanvas().refresh()
 
     def cleanup_plot_and_marker(self):
-        """Clear the plot, disconnect events, and robustly remove all markers."""
-        self.disconnect_canvas_events()
+        """Clear plot and safely release marker without forcing scene removals.
 
-        # Remove the tracked marker if present
+        Direct scene.removeItem() on QgsVertexMarker (a QGraphicsItem managed by canvas) during
+        QGIS shutdown or plugin unload can cause double-deletion if the canvas is simultaneously
+        tearing down its scene. Instead: hide + deleteLater(). Avoid scanning/removing all
+        vertex markers globally (risk of interfering with other tools).
+        """
+        self.disconnect_canvas_events()
+        self.disable_tooltips()
+
         if self.marker:
             try:
-                self.iface.mapCanvas().scene().removeItem(self.marker)
-            except Exception:
-                pass
-            self.marker = None
-            self.iface.mapCanvas().refresh()
-
-        # Robust: Remove any stray QgsVertexMarker from the scene
-        scene = self.iface.mapCanvas().scene()
-        items_to_remove = []
-        for item in scene.items():
-            # QgsVertexMarker has setCenter and setIconType methods
-            if hasattr(item, 'setCenter') and hasattr(item, 'setIconType'):
-                items_to_remove.append(item)
-        for item in items_to_remove:
+                if not _sip_isdeleted(self.marker):
+                    try:
+                        self.marker.hide()
+                    except Exception:
+                        pass
+                    try:
+                        self.marker.deleteLater()
+                    except Exception:
+                        pass
+            finally:
+                self.marker = None
             try:
-                scene.removeItem(item)
+                self.iface.mapCanvas().refresh()
             except Exception:
                 pass
-        if items_to_remove:
-            self.iface.mapCanvas().refresh()
 
-        self.figure.clear()
+        # Clear matplotlib figure (kept alive until full close cleanup)
+        if getattr(self, 'figure', None):
+            try:
+                self.figure.clear()
+            except Exception:
+                pass
+
+        # Reset internal state containers
         self.vertical_line = None
         self.features_geoms = []
         self.segment_lengths = []
         self.line_length = 0
-        self.canvas.draw()
+
+        if getattr(self, 'canvas', None):
+            try:
+                self.canvas.draw()
+            except Exception:
+                pass
 
     def showEvent(self, event):
         """
@@ -632,9 +835,36 @@ class KpPlotterDockWidget(QDockWidget):
         """Handle the widget being closed."""
         self.save_user_settings()
         self.cleanup_plot_and_marker()
+        # Only do full matplotlib cleanup when actually closing
+        self.cleanup_matplotlib_resources_on_close()
         # Safely disconnect the signal
         try:
             self.iface.projectRead.disconnect(self.populate_layer_combos)
         except TypeError:
             pass  # Signal was not connected
         super().closeEvent(event)
+
+    def cleanup_matplotlib_resources_on_close(self):
+        """Clean up matplotlib resources completely when closing the widget."""
+        # Disconnect all matplotlib event callbacks
+        self.disable_tooltips()
+        self.disconnect_canvas_events()
+        
+        # Clear the figure and close it properly
+        if hasattr(self, 'figure') and self.figure:
+            self.figure.clear()
+            try:
+                # Close the figure to free memory
+                import matplotlib.pyplot as plt
+                plt.close(self.figure)
+            except Exception:
+                pass
+        
+        # Reset references only when actually closing
+        self.figure = None
+        self.canvas = None
+        self.toolbar = None
+        self.vertical_line = None
+
+        # Reset only the vertical line reference, keep figure and canvas intact
+        self.vertical_line = None

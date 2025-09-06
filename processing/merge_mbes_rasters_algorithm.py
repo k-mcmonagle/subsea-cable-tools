@@ -1,4 +1,7 @@
 from qgis.PyQt.QtCore import QCoreApplication
+import os
+import tempfile
+import uuid
 from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
@@ -52,11 +55,11 @@ class MergeMBESRastersAlgorithm(QgsProcessingAlgorithm):
         output_raster_path = self.parameterAsOutputLayer(parameters, self.OUTPUT, context)
         compress = self.parameterAsBool(parameters, self.COMPRESS, context)
 
-        # If compression is enabled, create to a temp file first, then compress to final output
-        import tempfile
+    # If compression is enabled, create to a temp file first, then compress to final output
         temp_output = None
         if compress:
-            temp_output = os.path.join(tempfile.gettempdir(), next(tempfile._get_candidate_names()) + '.tif')
+            # Generate a unique temp filename without creating the file (avoid overwrite issues)
+            temp_output = os.path.join(tempfile.gettempdir(), f"mbes_merge_{uuid.uuid4().hex}.tif")
             final_output = output_raster_path
             output_raster_path = temp_output
         else:

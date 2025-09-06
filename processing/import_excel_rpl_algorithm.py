@@ -42,7 +42,8 @@ from qgis.core import (
     QgsPointXY,
     QgsGeometry,
     QgsWkbTypes,
-    QgsCoordinateReferenceSystem
+    QgsCoordinateReferenceSystem,
+    QgsProcessingLayerPostProcessorInterface
 )
 
 # Make sure openpyxl is installed
@@ -468,6 +469,9 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
         start_row  = self.parameterAsInt(parameters, self.INPUT_STARTROW, context)
         end_row    = self.parameterAsInt(parameters, self.INPUT_ENDROW, context)
 
+        # Store filename (without extension) for dynamic layer naming
+        filename = os.path.splitext(os.path.basename(excel_file))[0]
+
         # --- Save settings ---
         settings = QSettings()
         param_keys = [
@@ -519,8 +523,16 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
         p_col_terrwater        = col_letter_to_index(self.parameterAsString(parameters, self.COL_TERRWATER, context))
         p_col_eez              = col_letter_to_index(self.parameterAsString(parameters, self.COL_EEZ, context))
 
-        # Open workbook
-        wb = load_workbook(excel_file, data_only=True)
+        # Prepare storage for point and line rows
+        # Open workbook with robust error handling
+        try:
+            wb = load_workbook(excel_file, data_only=True)
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            raise QgsProcessingException(
+                f"Failed to open Excel file '{excel_file}'. This may be due to file corruption, unsupported format, or a library issue.\nError: {e}\nTraceback:\n{tb}"
+            )
         if sheet_name not in wb.sheetnames:
             raise QgsProcessingException(
                 f"Sheet '{sheet_name}' not found in {excel_file}. Available sheets: {wb.sheetnames}"
@@ -623,49 +635,79 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
             if str(hemi_val).strip().upper().startswith('W'):
                 lon = -lon
             return lon
-
-        # Prepare storage for point and line rows
+        
+        # Initialize processing variables
+        processed = 0
+        row_count = effective_max_row - start_row + 1
         point_list = []
         line_list = []
-
-        feedback.pushInfo(f"Reading rows {start_row} to {effective_max_row}")
-        row_count = effective_max_row - start_row + 1 if effective_max_row >= start_row else 0
-        processed = 0
-
+        
         # Alternate: even-indexed rows = Points, odd-indexed = Lines.
+        consecutive_invalid_rows = 0
+        max_consecutive_invalid = 3  # Stop after 3 consecutive invalid rows
+        
         for row_idx in range(start_row, effective_max_row + 1):
             if feedback.isCanceled():
                 break
             processed += 1
             feedback.setProgress(int(100 * processed / row_count))
             offset = row_idx - start_row
+            
+            # Check if this appears to be end of RPL data
             if offset % 2 == 0:
-                # Point row
+                # Point row - check if coordinates are valid
                 lat_dd = parse_lat(row_idx)
                 lon_dd = parse_lon(row_idx)
                 if lat_dd is None or lon_dd is None:
-                    feedback.pushWarning(f"Skipping row {row_idx}: Invalid lat/lon")
+                    consecutive_invalid_rows += 1
+                    feedback.pushWarning(f"Row {row_idx}: Invalid lat/lon coordinates")
+                    
+                    # If we've hit multiple consecutive invalid coordinate rows, 
+                    # this likely indicates end of RPL data
+                    if consecutive_invalid_rows >= max_consecutive_invalid:
+                        feedback.pushInfo(f"Detected end of RPL data at row {row_idx} (consecutive invalid coordinates). Processing stopped.")
+                        break
                     continue
+                else:
+                    # Valid coordinates found, reset counter
+                    consecutive_invalid_rows = 0
                 pos_no = -1
                 if p_col_posno > 0:
                     val = ws.cell(row=row_idx, column=p_col_posno).value
-                    pos_no = val if val is not None else -1
+                    try:
+                        pos_no = int(val) if val is not None else -1
+                    except (ValueError, TypeError):
+                        pos_no = -1
+                        
                 event_str = ""
                 if p_col_event > 0:
                     val = ws.cell(row=row_idx, column=p_col_event).value
                     event_str = str(val) if val else ""
+                    
                 dist_cumul = None
                 if p_col_distcumul > 0:
                     val = ws.cell(row=row_idx, column=p_col_distcumul).value
-                    dist_cumul = float(val) if val is not None else None
+                    try:
+                        dist_cumul = float(val) if val is not None else None
+                    except (ValueError, TypeError):
+                        dist_cumul = None
+                        
                 cable_dist_cumul = None
                 if p_col_cabledistcum > 0:
                     val = ws.cell(row=row_idx, column=p_col_cabledistcum).value
-                    cable_dist_cumul = float(val) if val is not None else None
+                    try:
+                        cable_dist_cumul = float(val) if val is not None else None
+                    except (ValueError, TypeError):
+                        cable_dist_cumul = None
+                        
                 approx_depth = None
                 if p_col_approxdepth > 0:
                     val = ws.cell(row=row_idx, column=p_col_approxdepth).value
-                    approx_depth = float(val) if val is not None else None
+                    try:
+                        approx_depth = float(val) if val is not None else None
+                    except (ValueError, TypeError):
+                        approx_depth = None
+                        
                 remarks_str = ""
                 if p_col_remarks > 0:
                     val = ws.cell(row=row_idx, column=p_col_remarks).value
@@ -691,54 +733,103 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
                     "ChartNo": chart_no
                 })
             else:
-                # Line row
-                line_attrs = {}
-                if p_col_bearing > 0:
-                    val = ws.cell(row=row_idx, column=p_col_bearing).value
-                    line_attrs["Bearing"] = float(val) if val is not None else None
-                if p_col_distbetweenpos > 0:
-                    val = ws.cell(row=row_idx, column=p_col_distbetweenpos).value
-                    line_attrs["DistBetweenPos"] = float(val) if val is not None else None
-                if p_col_slack > 0:
-                    val = ws.cell(row=row_idx, column=p_col_slack).value
-                    line_attrs["Slack"] = float(val) if val is not None else None
-                if p_col_cabledistbetween > 0:
-                    val = ws.cell(row=row_idx, column=p_col_cabledistbetween).value
-                    line_attrs["CableDistBetweenPos"] = float(val) if val is not None else None
-                if p_col_cablecode > 0:
-                    val = ws.cell(row=row_idx, column=p_col_cablecode).value
-                    line_attrs["CableCode"] = str(val) if val else ""
-                if p_col_fiberpair > 0:
-                    val = ws.cell(row=row_idx, column=p_col_fiberpair).value
-                    line_attrs["FiberPair"] = str(val) if val else ""
-                if p_col_cabletype > 0:
-                    val = ws.cell(row=row_idx, column=p_col_cabletype).value
-                    line_attrs["CableType"] = str(val) if val else ""
-                if p_col_laydirection > 0:
-                    val = ws.cell(row=row_idx, column=p_col_laydirection).value
-                    line_attrs["LayDirection"] = str(val) if val else ""
-                if p_col_layvessel > 0:
-                    val = ws.cell(row=row_idx, column=p_col_layvessel).value
-                    line_attrs["LayVessel"] = str(val) if val else ""
-                if p_col_protectionmethod > 0:
-                    val = ws.cell(row=row_idx, column=p_col_protectionmethod).value
-                    line_attrs["ProtectionMethod"] = str(val) if val else ""
-                if p_col_dateinstalled > 0:
-                    val = ws.cell(row=row_idx, column=p_col_dateinstalled).value
-                    line_attrs["DateInstalled"] = str(val) if val else ""
-                if p_col_targetburialdepth > 0:
-                    val = ws.cell(row=row_idx, column=p_col_targetburialdepth).value
-                    line_attrs["TargetBurialDepth"] = float(val) if val is not None else None
-                if p_col_burialdepth > 0:
-                    val = ws.cell(row=row_idx, column=p_col_burialdepth).value
-                    line_attrs["BurialDepth"] = float(val) if val is not None else None
-                if p_col_terrwater > 0:
-                    val = ws.cell(row=row_idx, column=p_col_terrwater).value
-                    line_attrs["TerritorialWater"] = str(val) if val else ""
-                if p_col_eez > 0:
-                    val = ws.cell(row=row_idx, column=p_col_eez).value
-                    line_attrs["EEZ"] = str(val) if val else ""
-                line_list.append(line_attrs)
+                # Line row - wrap in try-catch to handle conversion errors
+                try:
+                    line_attrs = {}
+                    conversion_failed = False
+                    
+                    if p_col_bearing > 0:
+                        val = ws.cell(row=row_idx, column=p_col_bearing).value
+                        if val is not None:
+                            try:
+                                line_attrs["Bearing"] = float(val)
+                            except (ValueError, TypeError):
+                                # If we can't convert bearing to float, this might indicate end of RPL data
+                                feedback.pushWarning(f"Row {row_idx}: Could not convert bearing '{val}' to number - possible end of RPL data")
+                                conversion_failed = True
+                        else:
+                            line_attrs["Bearing"] = None
+                    
+                    if conversion_failed:
+                        consecutive_invalid_rows += 1
+                        if consecutive_invalid_rows >= max_consecutive_invalid:
+                            feedback.pushInfo(f"Detected end of RPL data at row {row_idx} (conversion errors). Processing stopped.")
+                            break
+                        continue
+                    else:
+                        consecutive_invalid_rows = 0
+                    
+                    if p_col_distbetweenpos > 0:
+                        val = ws.cell(row=row_idx, column=p_col_distbetweenpos).value
+                        try:
+                            line_attrs["DistBetweenPos"] = float(val) if val is not None else None
+                        except (ValueError, TypeError):
+                            line_attrs["DistBetweenPos"] = None
+                    
+                    if p_col_slack > 0:
+                        val = ws.cell(row=row_idx, column=p_col_slack).value
+                        try:
+                            line_attrs["Slack"] = float(val) if val is not None else None
+                        except (ValueError, TypeError):
+                            line_attrs["Slack"] = None
+                    
+                    if p_col_cabledistbetween > 0:
+                        val = ws.cell(row=row_idx, column=p_col_cabledistbetween).value
+                        try:
+                            line_attrs["CableDistBetweenPos"] = float(val) if val is not None else None
+                        except (ValueError, TypeError):
+                            line_attrs["CableDistBetweenPos"] = None
+                    
+                    if p_col_cablecode > 0:
+                        val = ws.cell(row=row_idx, column=p_col_cablecode).value
+                        line_attrs["CableCode"] = str(val) if val else ""
+                    if p_col_fiberpair > 0:
+                        val = ws.cell(row=row_idx, column=p_col_fiberpair).value
+                        line_attrs["FiberPair"] = str(val) if val else ""
+                    if p_col_cabletype > 0:
+                        val = ws.cell(row=row_idx, column=p_col_cabletype).value
+                        line_attrs["CableType"] = str(val) if val else ""
+                    if p_col_laydirection > 0:
+                        val = ws.cell(row=row_idx, column=p_col_laydirection).value
+                        line_attrs["LayDirection"] = str(val) if val else ""
+                    if p_col_layvessel > 0:
+                        val = ws.cell(row=row_idx, column=p_col_layvessel).value
+                        line_attrs["LayVessel"] = str(val) if val else ""
+                    if p_col_protectionmethod > 0:
+                        val = ws.cell(row=row_idx, column=p_col_protectionmethod).value
+                        line_attrs["ProtectionMethod"] = str(val) if val else ""
+                    if p_col_dateinstalled > 0:
+                        val = ws.cell(row=row_idx, column=p_col_dateinstalled).value
+                        line_attrs["DateInstalled"] = str(val) if val else ""
+                    if p_col_targetburialdepth > 0:
+                        val = ws.cell(row=row_idx, column=p_col_targetburialdepth).value
+                        try:
+                            line_attrs["TargetBurialDepth"] = float(val) if val is not None else None
+                        except (ValueError, TypeError):
+                            line_attrs["TargetBurialDepth"] = None
+                    if p_col_burialdepth > 0:
+                        val = ws.cell(row=row_idx, column=p_col_burialdepth).value
+                        try:
+                            line_attrs["BurialDepth"] = float(val) if val is not None else None
+                        except (ValueError, TypeError):
+                            line_attrs["BurialDepth"] = None
+                    if p_col_terrwater > 0:
+                        val = ws.cell(row=row_idx, column=p_col_terrwater).value
+                        line_attrs["TerritorialWater"] = str(val) if val else ""
+                    if p_col_eez > 0:
+                        val = ws.cell(row=row_idx, column=p_col_eez).value
+                        line_attrs["EEZ"] = str(val) if val else ""
+                    
+                    line_list.append(line_attrs)
+                    
+                except Exception as e:
+                    # If any unexpected error occurs during line processing, 
+                    # this might indicate end of RPL data
+                    feedback.pushWarning(f"Row {row_idx}: Error processing line data - {str(e)}")
+                    consecutive_invalid_rows += 1
+                    if consecutive_invalid_rows >= max_consecutive_invalid:
+                        feedback.pushInfo(f"Detected end of RPL data at row {row_idx} (processing errors). Processing stopped.")
+                        break
 
         # Create point features
         for pt in point_list:
@@ -787,7 +878,28 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
             feat_line.setAttribute("SourceFile", source_file_name)
             line_sink.addFeature(feat_line, QgsFeatureSink.FastInsert)
 
+        # Provide summary information
+        feedback.pushInfo(f"RPL import completed successfully:")
+        feedback.pushInfo(f"- Points processed: {len(point_list)}")
+        feedback.pushInfo(f"- Lines processed: {len(line_list)}")
+        feedback.pushInfo(f"- Last row processed: {start_row + processed - 1}")
+
+        # Set up dynamic renaming using post-processor, keeping references via self
+        self.point_renamer = Renamer(f"{filename}_Points")
+        context.layerToLoadOnCompletionDetails(point_sink_id).setPostProcessor(self.point_renamer)
+
+        self.line_renamer = Renamer(f"{filename}_Lines")
+        context.layerToLoadOnCompletionDetails(line_sink_id).setPostProcessor(self.line_renamer)
+
         return {
             self.OUTPUT_POINTS: point_sink_id,
             self.OUTPUT_LINES: line_sink_id
         }
+
+class Renamer(QgsProcessingLayerPostProcessorInterface):
+    def __init__(self, layer_name):
+        self.name = layer_name
+        super().__init__()
+
+    def postProcessLayer(self, layer, context, feedback):
+        layer.setName(self.name)
