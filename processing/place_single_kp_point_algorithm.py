@@ -87,7 +87,12 @@ class PlaceSingleKpPointAlgorithm(QgsProcessingAlgorithm):
 
         distance_calculator = QgsDistanceArea()
         distance_calculator.setSourceCrs(line_layer.sourceCrs(), context.transformContext())
-        distance_calculator.setEllipsoid(context.project().ellipsoid())
+        ellipsoid = context.project().ellipsoid()
+        if not ellipsoid:
+            ellipsoid = 'WGS84'
+        distance_calculator.setEllipsoid(ellipsoid)
+        if hasattr(distance_calculator, "setEllipsoidalMode"):
+            distance_calculator.setEllipsoidalMode(True)
 
         total_length_m = distance_calculator.measureLength(merged_geometry)
         if total_length_m == 0:
@@ -174,6 +179,8 @@ This tool places a single point at a specified Kilometer Point (KP) along a line
 1.  **Input Line Layer:** Choose the line layer on which you want to place the KP point. The tool will treat all lines in this layer as a single, continuous route.
 2.  **KP Value (Kilometers):** Enter the exact KP value where you want the point to be placed.
 3.  **Run:** Execute the tool. The output will be a new point layer containing the single point.
+
+**Note:** KP calculations are based on geodetic distances using the WGS84 ellipsoid.
 """)
 
     def name(self):

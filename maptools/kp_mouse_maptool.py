@@ -36,26 +36,27 @@ class KPMouseMapTool(QgsMapTool):
       - The distance (in the selected unit) and chainage (KP).
     Also allows copying the current data via a right-click.
     """
-    def __init__(self, canvas, layer, iface, measurementUnit="m", showReverseKP=False):
+    def __init__(self, canvas, layer, iface, measurementUnit="m", showReverseKP=False, useCartesian=False):
         super().__init__(canvas)
         self.canvas = canvas
         self.iface = iface
         self.layer = layer
         self.measurementUnit = measurementUnit
         self.showReverseKP = showReverseKP
+        self.useCartesian = useCartesian
 
         # Distance / chainage preparation
         self.distanceArea = QgsDistanceArea()
         project_crs = self.canvas.mapSettings().destinationCrs()
         self.distanceArea.setSourceCrs(project_crs, QgsProject.instance().transformContext())
-        ellipsoid = QgsProject.instance().ellipsoid()
-        if ellipsoid:
+        if self.useCartesian:
+            if hasattr(self.distanceArea, "setEllipsoidalMode"):
+                self.distanceArea.setEllipsoidalMode(False)
+        else:
+            ellipsoid = QgsProject.instance().ellipsoid() or 'WGS84'
             self.distanceArea.setEllipsoid(ellipsoid)
             if hasattr(self.distanceArea, "setEllipsoidalMode"):
                 self.distanceArea.setEllipsoidalMode(True)
-        else:
-            if hasattr(self.distanceArea, "setEllipsoidalMode"):
-                self.distanceArea.setEllipsoidalMode(False)
 
         # Cache line geometries
         self.features_geoms = []
@@ -995,7 +996,7 @@ class KPRangeRingDialog(QDialog):
 
 class KPConfigDialog(QDialog):
     """A dialog for configuring the KP Mouse Tool settings."""
-    def __init__(self, parent=None, current_layer=None, current_unit="km", show_reverse_kp=False):
+    def __init__(self, parent=None, current_layer=None, current_unit="km", show_reverse_kp=False, current_use_cartesian=False):
         super().__init__(parent)
         self.setWindowTitle("Configure KP Mouse Tool")
         layout = QVBoxLayout(self)
@@ -1023,6 +1024,16 @@ class KPConfigDialog(QDialog):
         self.reverse_kp_checkbox = QCheckBox("Show Reverse KP")
         self.reverse_kp_checkbox.setChecked(show_reverse_kp)
         layout.addWidget(self.reverse_kp_checkbox)
+
+        # Cartesian checkbox
+        self.cartesian_checkbox = QCheckBox("Use Cartesian distances (planar, in CRS units)")
+        self.cartesian_checkbox.setChecked(current_use_cartesian)
+        layout.addWidget(self.cartesian_checkbox)
+
+        # Note about calculations
+        self.note_label = QLabel("Note: KP calculations are based on geodetic distances using the WGS84 ellipsoid.")
+        self.note_label.setWordWrap(True)
+        layout.addWidget(self.note_label)
 
         # Buttons
         self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -1086,12 +1097,19 @@ class KPConfigDialog(QDialog):
         
         self.metrics_text.setText(f"Length: {length_km:.2f} km\nAC Count: {total_vertices}")
 
+        # Enable Cartesian checkbox only if layer CRS is projected
+        is_projected = not layer.crs().isGeographic()
+        self.cartesian_checkbox.setEnabled(is_projected)
+        if not is_projected:
+            self.cartesian_checkbox.setChecked(False)
+
     def get_settings(self):
         layer_id = self.layer_combo.currentData()
         layer = QgsProject.instance().mapLayer(layer_id) if layer_id else None
         unit = self.unit_combo.currentText()
         show_reverse_kp = self.reverse_kp_checkbox.isChecked()
-        return layer, unit, show_reverse_kp
+        use_cartesian = self.cartesian_checkbox.isChecked()
+        return layer, unit, show_reverse_kp, use_cartesian
 
 
 class KPMouseTool:
@@ -1105,6 +1123,7 @@ class KPMouseTool:
         self.referenceLayer = None
         self.measurementUnit = "km"
         self.showReverseKP = False
+        self.useCartesian = False
         self.toolButton = None
         self.toolButtonAction = None
         self.actionConfig = None
@@ -1260,7 +1279,7 @@ class KPMouseTool:
                 return
 
             self.mapTool = KPMouseMapTool(
-                self.iface.mapCanvas(), self.referenceLayer, self.iface, self.measurementUnit, self.showReverseKP
+                self.iface.mapCanvas(), self.referenceLayer, self.iface, self.measurementUnit, self.showReverseKP, self.useCartesian
             )
             self.iface.mapCanvas().setMapTool(self.mapTool)
         else:
@@ -1274,13 +1293,14 @@ class KPMouseTool:
 
     def show_config_dialog(self):
         """Show the configuration dialog."""
-        dialog = KPConfigDialog(self.iface.mainWindow(), self.referenceLayer, self.measurementUnit, self.showReverseKP)
+        dialog = KPConfigDialog(self.iface.mainWindow(), self.referenceLayer, self.measurementUnit, self.showReverseKP, self.useCartesian)
         if dialog.exec_():
-            layer, unit, show_reverse_kp = dialog.get_settings()
+            layer, unit, show_reverse_kp, use_cartesian = dialog.get_settings()
             if layer:
                 self.referenceLayer = layer
                 self.measurementUnit = unit
                 self.showReverseKP = show_reverse_kp
+                self.useCartesian = use_cartesian
                 self.save_settings()
                 self.iface.messageBar().pushMessage(
                     "Success", f"KP Mouse Tool configured with layer '{layer.name()}'", level=Qgis.Success

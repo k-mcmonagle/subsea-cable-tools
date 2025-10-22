@@ -169,6 +169,9 @@ class DepthProfileDockWidget(QDockWidget):
         self.invert_depth_axis_chk = QCheckBox("Invert Depth Axis")
         self.invert_depth_axis_chk.setChecked(True)
         checkboxes_row.addWidget(self.invert_depth_axis_chk)
+        self.invert_slope_chk = QCheckBox("Invert Slope")
+        self.invert_slope_chk.setChecked(bool(self.settings.value("DepthProfile/invert_slope", True, type=bool)))
+        checkboxes_row.addWidget(self.invert_slope_chk)
         self.show_tooltips_chk = QCheckBox("Tooltips")
         self.show_tooltips_chk.setChecked(True)
         checkboxes_row.addWidget(self.show_tooltips_chk)
@@ -597,6 +600,7 @@ class DepthProfileDockWidget(QDockWidget):
         # Persist basic settings
         self.settings.setValue("DepthProfile/interval_m", self.interval_spin.value())
         self.settings.setValue("DepthProfile/reverse_kp", self.reverse_kp_chk.isChecked())
+        self.settings.setValue("DepthProfile/invert_slope", self.invert_slope_chk.isChecked())
         if not dual:
             self.settings.setValue("DepthProfile/variable", self.variable_combo.currentText())
         self.settings.setValue("DepthProfile/dual_plot", dual)
@@ -899,6 +903,8 @@ class DepthProfileDockWidget(QDockWidget):
                 self.slope_deg.append(None); self.slope_pct.append(None); continue
             horiz_m = d_km * 1000.0
             vertical = v2 - v1
+            if self.invert_slope_chk.isChecked():
+                vertical = -vertical
             slope_rad = math.atan2(vertical, horiz_m) if horiz_m > 0 else 0.0
             self.slope_deg.append(math.degrees(slope_rad))
             self.slope_pct.append(100.0 * vertical / horiz_m if horiz_m > 0 else 0.0)

@@ -26,6 +26,7 @@ from .processing.subsea_cable_processing_provider import SubseaCableProcessingPr
 
 from .kp_plotter_dockwidget import KpPlotterDockWidget
 from .depth_profile_dockwidget import DepthProfileDockWidget
+from .live_data_dockwidget import LiveDataDockWidget
 # Import the Catenary Calculator Dialog
 from .catenary_calculator_dialog import CatenaryCalculatorDialog
 from .maptools.transit_measure_tool import TransitMeasureTool
@@ -73,6 +74,8 @@ class SubseaCableTools:
         self.catenary_calculator_dialog = None
         self.depth_profile_dock = None
         self.depth_profile_action = None
+        self.live_data_dock = None
+        self.live_data_action = None
         self.transit_measure_action = None
         self.transit_measure_tool = None
 
@@ -118,6 +121,19 @@ class SubseaCableTools:
         self.iface.addToolBarIcon(self.depth_profile_action)
         self.iface.addPluginToMenu(self.menu, self.depth_profile_action)
         self.actions.append(self.depth_profile_action)
+
+        # Live Data Tool action
+        live_data_icon_path = os.path.join(self.plugin_dir, 'live_data_icon.png')
+        if os.path.exists(live_data_icon_path):
+            live_data_icon = QIcon(live_data_icon_path)
+        else:
+            # Fallback to plugin resource icon
+            live_data_icon = QIcon(":/plugins/subsea_cable_tools/icon.png")
+        self.live_data_action = QAction(live_data_icon, "Live Data", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
+        self.live_data_action.triggered.connect(self.show_live_data)
+        self.iface.addToolBarIcon(self.live_data_action)
+        self.iface.addPluginToMenu(self.menu, self.live_data_action)
+        self.actions.append(self.live_data_action)
 
         # Add action for Catenary Calculator (unchanged)
         icon_path = os.path.join(self.plugin_dir, 'catenary_icon.png')
@@ -212,33 +228,17 @@ class SubseaCableTools:
                 pass
             self.depth_profile_dock = None
 
-
-        # Remove catenary calculator action
-        if hasattr(self, 'catenary_action') and self.catenary_action:
+        # Clean up live data dock
+        if hasattr(self, 'live_data_dock') and self.live_data_dock:
             try:
-                self.iface.removeToolBarIcon(self.catenary_action)
+                self.iface.removeDockWidget(self.live_data_dock)
             except Exception:
                 pass
             try:
-                self.iface.removePluginMenu(self.menu, self.catenary_action)
+                self.live_data_dock.deleteLater()
             except Exception:
                 pass
-            self.catenary_action = None
-        if hasattr(self, 'catenary_calculator_dialog'):
-            self.catenary_calculator_dialog = None
-
-        # Remove transit measure action
-        if hasattr(self, 'transit_measure_action') and self.transit_measure_action:
-            try:
-                self.iface.removeToolBarIcon(self.transit_measure_action)
-            except Exception:
-                pass
-            try:
-                self.iface.removePluginMenu(self.menu, self.transit_measure_action)
-            except Exception:
-                pass
-            self.transit_measure_action = None
-        self.transit_measure_tool = None
+            self.live_data_dock = None
 
         # Remove actions from menu and toolbar
         if hasattr(self, 'actions'):
@@ -276,6 +276,18 @@ class SubseaCableTools:
                 pass
             self.depth_profile_action = None
 
+        # Remove live data action
+        if hasattr(self, 'live_data_action') and self.live_data_action:
+            try:
+                self.iface.removeToolBarIcon(self.live_data_action)
+            except Exception:
+                pass
+            try:
+                self.iface.removePluginMenu(self.menu, self.live_data_action)
+            except Exception:
+                pass
+            self.live_data_action = None
+
         # Remove dialog reference
         if hasattr(self, 'dlg'):
             self.dlg = None
@@ -303,6 +315,13 @@ class SubseaCableTools:
             self.depth_profile_dock = DepthProfileDockWidget(self.iface)
             self.iface.addDockWidget(Qt.RightDockWidgetArea, self.depth_profile_dock)
         self.depth_profile_dock.show()
+
+    def show_live_data(self):
+        """Show the Live Data dock widget."""
+        if not self.live_data_dock:
+            self.live_data_dock = LiveDataDockWidget(self.iface)
+            self.iface.addDockWidget(Qt.RightDockWidgetArea, self.live_data_dock)
+        self.live_data_dock.show()
 
     def run(self):
         """Run method (e.g. open a dialog)."""

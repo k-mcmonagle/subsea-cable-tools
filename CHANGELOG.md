@@ -1,12 +1,16 @@
 # Changelog
-## [1.3.0] - 2025-09-06
-### Added
-
 
 All notable changes to the Subsea Cable Tools QGIS plugin will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [1.4.0] - 2025-10-10
+### Added
+- **Plot Line Segments from Table:** New processing algorithm under "Other Tools" to create line segments from a table layer with start and end latitude/longitude columns. Optionally creates a point layer for the endpoints. All original attributes are preserved with a source_table field added.
+
+### Fixed
+- Added option to invert slope angle/percentage calculation in Depth Profile tool, with default not inverted.
 
 ## [1.3.0] - 2025-09-06
 
