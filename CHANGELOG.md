@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.4.0] - 2025-10-10
 ### Added
 - **Plot Line Segments from Table:** New processing algorithm under "Other Tools" to create line segments from a table layer with start and end latitude/longitude columns. Optionally creates a point layer for the endpoints. All original attributes are preserved with a source_table field added.
+- **RPL Route Comparison:** New processing algorithm to compare design vs as-laid RPL routes, calculating position offsets including radial, along-track, and cross-track distances.
+- **Translate KP Between RPLs (Points):** New processing algorithm to translate KP values from one RPL reference to another, creating corresponding points on the target RPL.
+
+### Changed
+- **KP Mouse Map Tool:** Improved to calculate KP based on geodetic measurements by default, with option for Cartesian calculations when the layer uses a projected CRS.
 
 ### Fixed
 - Added option to invert slope angle/percentage calculation in Depth Profile tool, with default not inverted.
