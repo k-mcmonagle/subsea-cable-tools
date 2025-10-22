@@ -22,6 +22,7 @@ from .merge_mbes_rasters_algorithm import MergeMBESRastersAlgorithm
 from .import_ship_outline_algorithm import ImportShipOutlineAlgorithm
 from .place_ship_outlines_algorithm import PlaceShipOutlinesAlgorithm
 from .plot_line_segments_from_table_algorithm import PlotLineSegmentsFromTableAlgorithm
+from .translate_kp_from_rpl_to_rpl_algorithm import TranslateKPFromRPLToRPLAlgorithm
 
 
 class SubseaCableProcessingProvider(QgsProcessingProvider):
@@ -56,6 +57,8 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
         self.addAlgorithm(PlaceShipOutlinesAlgorithm())
         print('Registering PlotLineSegmentsFromTableAlgorithm...')
         self.addAlgorithm(PlotLineSegmentsFromTableAlgorithm())
+        print('Registering TranslateKPFromRPLToRPLAlgorithm...')
+        self.addAlgorithm(TranslateKPFromRPLToRPLAlgorithm())
 
     def id(self):
         """
