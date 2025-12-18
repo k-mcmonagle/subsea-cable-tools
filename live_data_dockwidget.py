@@ -29,6 +29,10 @@ class LiveDataWorker(QThread):
         self.running = True
         self.headers = []
 
+    def get_persist(self):
+        """Return the persist setting for this worker."""
+        return self.persist
+
     def run(self):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -190,6 +194,8 @@ class LiveDataDockWidget(QDockWidget):
 
     def disconnect_server(self):
         if self.worker:
+            # Disconnect signals before stopping to prevent data_received callbacks
+            self.worker.data_received.disconnect(self.on_data_received)
             self.worker.stop()
             self.worker = None
         self.connected = False
@@ -217,11 +223,11 @@ class LiveDataDockWidget(QDockWidget):
 
     def on_data_received(self, data_dict):
         print(f"Received data: {data_dict}")
-        if not self.layer:
+        if not self.layer or not self.worker:
             return
 
-        # Clear if not persisting
-        if not self.persist_chk.isChecked():
+        # Clear if not persisting (use worker's persist setting, not checkbox)
+        if not self.worker.get_persist():
             self.layer.dataProvider().truncate()
 
         # Add feature
@@ -248,6 +254,8 @@ class LiveDataDockWidget(QDockWidget):
                 feat.setAttributes([data_dict.get(h, '') for h in self.headers])
             self.layer.dataProvider().addFeature(feat)
             self.layer.updateExtents()
+            # Trigger layer repaint and canvas refresh
+            self.layer.triggerRepaint()
             self.iface.mapCanvas().refresh()
             print("Feature added successfully")
         except (ValueError, KeyError) as e:

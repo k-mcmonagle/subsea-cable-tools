@@ -1,1 +1,2 @@
 openpyxl
+pyqtgraph>=0.12.0

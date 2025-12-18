@@ -17,6 +17,7 @@ __copyright__ = '(C) 2024 by Kieran McMonagle'
 
 import os
 import sys
+import math
 plugin_dir = os.path.dirname(__file__)
 lib_dir = os.path.join(plugin_dir, 'lib')
 if lib_dir not in sys.path:
@@ -53,6 +54,7 @@ class RPLRouteComparisonAlgorithm(QgsProcessingAlgorithm):
     # Parameter identifiers
     DESIGN_POINTS = 'DESIGN_POINTS'
     DESIGN_EVENTS_FIELD = 'DESIGN_EVENTS_FIELD'
+    DESIGN_KP_FIELD = 'DESIGN_KP_FIELD'
     DESIGN_LINES = 'DESIGN_LINES'
     
     ASLAID_POINTS = 'ASLAID_POINTS'
@@ -89,12 +91,23 @@ and calculating position offsets.</p>
 <ol>
   <li>Takes design and as-laid RPL point layers with corresponding event identifiers</li>
   <li>Matches events between the two layers (exact string matching)</li>
-  <li>For each matched event pair, calculates:
+  <li>For each matched event pair, calculates three offset measurements:
     <ul>
-      <li><b>Along-track offset:</b> Distance along the design route line from the design event 
-          to the perpendicular projection of the as-laid event</li>
-      <li><b>Cross-track offset (DCC):</b> Perpendicular distance from as-laid event to design route</li>
-      <li><b>Radial distance:</b> Direct distance between design and as-laid event positions</li>
+      <li><b>Along-track offset:</b> Signed distance along the design route from design event to 
+          the perpendicular projection of the as-laid event
+        <ul>
+          <li><b>Positive (+):</b> As-laid event is ahead (further along route direction) than design</li>
+          <li><b>Negative (-):</b> As-laid event is behind (earlier along route direction) than design</li>
+        </ul>
+      </li>
+      <li><b>Cross-track offset (DCC):</b> Signed perpendicular distance from as-laid event to design route
+        <ul>
+          <li><b>Positive (+):</b> As-laid event is to Starboard (right) of design route when traveling forward</li>
+          <li><b>Negative (-):</b> As-laid event is to Port (left) of design route when traveling forward</li>
+        </ul>
+      </li>
+      <li><b>Radial distance:</b> Direct line distance between design and as-laid event positions (unsigned)</li>
+      <li><b>Bearing:</b> Compass bearing from design to as-laid event (0-360°, 0=North)</li>
     </ul>
   </li>
   <li>Outputs a line layer with lines connecting corresponding events and offset attributes</li>
@@ -104,6 +117,7 @@ and calculating position offsets.</p>
 <ul>
   <li><b>Design RPL Points:</b> Point layer from design RPL (e.g., repeater events)</li>
   <li><b>Design Events Field:</b> Field containing event identifiers in design points</li>
+  <li><b>Design KP/Distance Field (Optional):</b> Field containing cumulative distance or KP values (e.g., DistCumulative) for ordering results. If provided, this value will be included in the output layer.</li>
   <li><b>Design RPL Lines:</b> Line layer from design RPL (route path)</li>
   <li><b>As-Laid RPL Points:</b> Point layer from as-laid RPL</li>
   <li><b>As-Laid Events Field:</b> Field containing event identifiers in as-laid points</li>
@@ -112,13 +126,21 @@ and calculating position offsets.</p>
 
 <h4>Output</h4>
 <p><b>Comparison Result:</b> A line layer with one line per matched event pair. Each line connects 
-the design point to the as-laid point and includes attributes for:
+the design point to the as-laid point and includes the following attributes:
 <ul>
-  <li>Design event name</li>
-  <li>As-laid event name</li>
-  <li>Along-track offset (meters)</li>
-  <li>Cross-track offset / DCC (meters)</li>
-  <li>Radial distance (meters)</li>
+  <li><b>design_layer:</b> Name of design points layer</li>
+  <li><b>aslaid_layer:</b> Name of as-laid points layer</li>
+  <li><b>design_event:</b> Design event name</li>
+  <li><b>aslaid_event:</b> As-laid event name</li>
+  <li><b>design_kp:</b> Design KP/cumulative distance value (if KP field provided)</li>
+  <li><b>along_track_m:</b> Signed along-track offset (+ ahead, - behind)</li>
+  <li><b>cross_track_m:</b> Signed cross-track offset (+ starboard, - port)</li>
+  <li><b>radial_distance_m:</b> Direct distance between event positions</li>
+  <li><b>bearing_deg:</b> Compass bearing from design to as-laid (0-360°)</li>
+  <li><b>design_depth:</b> Design event depth (if available)</li>
+  <li><b>aslaid_depth:</b> As-laid event depth (if available)</li>
+  <li><b>prev_ac_distance_m:</b> Distance in meters to the previous alter course (bearing change) along the route</li>
+  <li><b>next_ac_distance_m:</b> Distance in meters to the next alter course (bearing change) along the route</li>
 </ul>
 """)
 
@@ -137,6 +159,15 @@ the design point to the as-laid point and includes attributes for:
                 self.tr('Design Events Field'),
                 parentLayerParameterName=self.DESIGN_POINTS,
                 type=QgsProcessingParameterField.String
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterField(
+                self.DESIGN_KP_FIELD,
+                self.tr('Design KP/Distance Field (Optional)'),
+                parentLayerParameterName=self.DESIGN_POINTS,
+                type=QgsProcessingParameterField.Numeric,
+                optional=True
             )
         )
         self.addParameter(
@@ -189,6 +220,9 @@ the design point to the as-laid point and includes attributes for:
         design_events_field = self.parameterAsString(
             parameters, self.DESIGN_EVENTS_FIELD, context
         )
+        design_kp_field = self.parameterAsString(
+            parameters, self.DESIGN_KP_FIELD, context
+        )
         design_lines_layer = self.parameterAsVectorLayer(
             parameters, self.DESIGN_LINES, context
         )
@@ -216,6 +250,15 @@ the design point to the as-laid point and includes attributes for:
         # Get field indices
         design_event_idx = design_points_layer.fields().lookupField(design_events_field)
         aslaid_event_idx = aslaid_points_layer.fields().lookupField(aslaid_events_field)
+        design_kp_idx = -1
+        
+        # Handle optional KP field
+        if design_kp_field:
+            design_kp_idx = design_points_layer.fields().lookupField(design_kp_field)
+            if design_kp_idx < 0:
+                feedback.pushWarning(
+                    self.tr(f'Design KP field "{design_kp_field}" not found, will skip KP values')
+                )
         
         if design_event_idx < 0:
             raise QgsProcessingException(
@@ -235,10 +278,15 @@ the design point to the as-laid point and includes attributes for:
         output_fields.append(QgsField('aslaid_layer', QVariant.String))
         output_fields.append(QgsField('design_event', QVariant.String))
         output_fields.append(QgsField('aslaid_event', QVariant.String))
+        output_fields.append(QgsField('design_kp', QVariant.Double))
         output_fields.append(QgsField('along_track_m', QVariant.Double))
         output_fields.append(QgsField('cross_track_m', QVariant.Double))
         output_fields.append(QgsField('radial_distance_m', QVariant.Double))
         output_fields.append(QgsField('bearing_deg', QVariant.Double))
+        output_fields.append(QgsField('design_depth', QVariant.Double))
+        output_fields.append(QgsField('aslaid_depth', QVariant.Double))
+        output_fields.append(QgsField('prev_ac_distance_m', QVariant.Double))
+        output_fields.append(QgsField('next_ac_distance_m', QVariant.Double))
         
         # Create output sink
         (sink, dest_id) = self.parameterAsSink(
@@ -292,6 +340,11 @@ the design point to the as-laid point and includes attributes for:
             distance_calc.setEllipsoid(ellipsoid)
             feedback.pushInfo(f'Using ellipsoid: {ellipsoid}')
         
+        # Step 2.5: Extract alter course KPs from design route
+        feedback.pushInfo('Extracting alter courses from design route...')
+        ac_kps = self._extract_ac_kps(comparator, design_lines_layer, distance_calc, feedback)
+        feedback.pushInfo(f'Detected {len(ac_kps)} alter courses in design route')
+        
         total = len(matches)
         for idx, match in enumerate(matches):
             if feedback.isCanceled():
@@ -308,6 +361,15 @@ the design point to the as-laid point and includes attributes for:
             design_point_xy = QgsPointXY(design_point.x(), design_point.y())
             aslaid_point_xy = QgsPointXY(aslaid_point.x(), aslaid_point.y())
             
+            # Calculate KP for design point
+            design_kp = comparator.calculate_kp_to_point(design_point_xy, source=True)
+            
+            # Calculate AC proximities (exclude ACs at the same KP as the design point)
+            prev_ac_kp = max((k for k in ac_kps if k < design_kp), default=None)
+            next_ac_kp = min((k for k in ac_kps if k > design_kp), default=None)
+            prev_ac_distance = (design_kp - prev_ac_kp) * 1000 if prev_ac_kp is not None else None
+            next_ac_distance = (next_ac_kp - design_kp) * 1000 if next_ac_kp is not None else None
+            
             # Calculate offsets
             offsets = self._calculate_offsets(
                 design_point_xy, aslaid_point_xy,
@@ -323,10 +385,19 @@ the design point to the as-laid point and includes attributes for:
             output_feature['aslaid_layer'] = aslaid_points_layer.name()
             output_feature['design_event'] = design_event_name
             output_feature['aslaid_event'] = aslaid_event_name
+            
+            # Add design KP if field was provided
+            if design_kp_idx >= 0:
+                output_feature['design_kp'] = design_feature[design_kp_idx]
+            
             output_feature['along_track_m'] = offsets['along_track']
             output_feature['cross_track_m'] = offsets['cross_track']
             output_feature['radial_distance_m'] = offsets['radial_distance']
             output_feature['bearing_deg'] = offsets['bearing']
+            output_feature['design_depth'] = design_feature['ApproxDepth'] if 'ApproxDepth' in [f.name() for f in design_feature.fields()] else None
+            output_feature['aslaid_depth'] = aslaid_feature['ApproxDepth'] if 'ApproxDepth' in [f.name() for f in aslaid_feature.fields()] else None
+            output_feature['prev_ac_distance_m'] = prev_ac_distance
+            output_feature['next_ac_distance_m'] = next_ac_distance
             
             sink.addFeature(output_feature, QgsFeatureSink.FastInsert)
             
@@ -509,7 +580,7 @@ the design point to the as-laid point and includes attributes for:
             design_point, aslaid_point, design_lines, distance_calc
         )
         
-        # Bearing: compass bearing from design point to as-laid point (0-360 degrees)
+        # Bearing: compass bearing from design point to aslaid point (0-360 degrees)
         bearing = self._calculate_bearing(design_point, aslaid_point)
         
         return {
@@ -521,10 +592,18 @@ the design point to the as-laid point and includes attributes for:
 
     def _calculate_dcc(self, point, line_layer, distance_calc):
         """
-        Calculate Distance Cross Course (DCC) - perpendicular distance 
+        Calculate Distance Cross Course (DCC) - signed perpendicular distance 
         from a point to a line layer. Returns distance in meters.
+        
+        Sign convention:
+        - Positive: point is to starboard (right) of the design route direction
+        - Negative: point is to port (left) of the design route direction
+        
+        Uses cross product of route direction and point offset vector to determine sign.
         """
         min_distance = float('inf')
+        nearest_pt_on_line = None
+        nearest_segment = None  # Store segment for bearing calculation
         
         for feature in line_layer.getFeatures():
             geom = feature.geometry()
@@ -537,16 +616,136 @@ the design point to the as-laid point and includes attributes for:
             
             if not nearest_geom.isEmpty():
                 nearest_pt = nearest_geom.asPoint()
+                nearest_pt_xy = QgsPointXY(nearest_pt.x(), nearest_pt.y())
                 # Use distance calculator to get distance in meters
                 distance = self._measure_distance(
                     point,
-                    QgsPointXY(nearest_pt.x(), nearest_pt.y()),
+                    nearest_pt_xy,
                     distance_calc
                 )
                 if distance < min_distance:
                     min_distance = distance
+                    nearest_pt_on_line = nearest_pt_xy
+                    nearest_segment = geom
         
-        return min_distance if min_distance != float('inf') else 0.0
+        if nearest_pt_on_line is None:
+            return 0.0
+        
+        # Get unsigned distance
+        unsigned_distance = min_distance if min_distance != float('inf') else 0.0
+        
+        # Determine sign using cross product
+        sign = self._get_cross_track_sign(
+            point, nearest_pt_on_line, nearest_segment, distance_calc
+        )
+        
+        return unsigned_distance * sign
+
+    def _get_cross_track_sign(self, point, nearest_pt_on_line, line_segment, distance_calc):
+        """
+        Determine the sign of cross-track offset using cross product.
+        
+        Args:
+            point: QgsPointXY - the point being measured from
+            nearest_pt_on_line: QgsPointXY - nearest point on the line
+            line_segment: QgsGeometry - the line segment geometry
+            distance_calc: QgsDistanceArea - distance calculator
+        
+        Returns: +1 for starboard (right), -1 for port (left)
+        
+        Algorithm:
+        1. Find the line direction vector at the nearest point
+        2. Calculate offset vector from nearest point to the measured point
+        3. Cross product sign determines left/right orientation
+        """
+        # Get line direction at nearest point
+        line_direction = self._get_line_direction_at_point(
+            nearest_pt_on_line, line_segment, distance_calc
+        )
+        
+        if line_direction is None:
+            return 1  # Default to starboard if we can't determine
+        
+        # Vector from line to point (offset vector)
+        offset_vector = (
+            point.x() - nearest_pt_on_line.x(),
+            point.y() - nearest_pt_on_line.y()
+        )
+        
+        # 2D cross product: line_dir × offset_vec
+        # Positive result: offset is to the right (starboard) of line direction
+        # Negative result: offset is to the left (port) of line direction
+        cross_product = (line_direction[0] * offset_vector[1] - 
+                        line_direction[1] * offset_vector[0])
+        
+        return 1.0 if cross_product >= 0 else -1.0
+
+    def _get_line_direction_at_point(self, point_on_line, line_segment, distance_calc):
+        """
+        Get the direction vector of the line at a given point.
+        
+        Args:
+            point_on_line: QgsPointXY - a point on the line
+            line_segment: QgsGeometry - the line segment
+            distance_calc: QgsDistanceArea - distance calculator
+        
+        Returns: (dx, dy) unit direction vector, or None if line cannot be determined
+        """
+        # Extract line vertices
+        if line_segment.isMultipart():
+            parts = line_segment.asMultiPolyline()
+            if not parts:
+                return None
+            vertices = parts[0]
+        else:
+            vertices = line_segment.asPolyline()
+            if not vertices:
+                return None
+        
+        if len(vertices) < 2:
+            return None
+        
+        # Find which segment contains point_on_line
+        # or find the closest segment and use its direction
+        min_dist_to_segment = float('inf')
+        segment_v1 = None
+        segment_v2 = None
+        
+        for i in range(len(vertices) - 1):
+            v1 = vertices[i]
+            v2 = vertices[i + 1]
+            v1_xy = QgsPointXY(v1.x(), v1.y())
+            v2_xy = QgsPointXY(v2.x(), v2.y())
+            
+            # Distance from point_on_line to segment
+            segment_line = QgsLineString([v1, v2])
+            segment_geom = QgsGeometry(segment_line)
+            point_geom = QgsGeometry.fromPointXY(point_on_line)
+            nearest = segment_geom.nearestPoint(point_geom)
+            
+            if not nearest.isEmpty():
+                nearest_xy = QgsPointXY(nearest.asPoint().x(), nearest.asPoint().y())
+                dist = self._measure_distance(point_on_line, nearest_xy, distance_calc)
+                
+                if dist < min_dist_to_segment:
+                    min_dist_to_segment = dist
+                    segment_v1 = v1_xy
+                    segment_v2 = v2_xy
+        
+        if segment_v1 is None or segment_v2 is None:
+            return None
+        
+        # Calculate direction vector
+        dx = segment_v2.x() - segment_v1.x()
+        dy = segment_v2.y() - segment_v1.y()
+        
+        # Normalize to unit vector
+        import math
+        magnitude = math.sqrt(dx * dx + dy * dy)
+        if magnitude < 1e-10:
+            return None
+        
+        return (dx / magnitude, dy / magnitude)
 
     def _calculate_along_track(self, design_point, aslaid_point, 
                               line_layer, distance_calc):
@@ -600,7 +799,7 @@ the design point to the as-laid point and includes attributes for:
         
         Args:
             design_point: QgsPointXY - design event location
-            aslaid_point: QgsPointXY - as-laid event location
+            aslaid_point: QgsPointXY - aslaid event location
             line_layer: QgsVectorLayer - design route line layer
             distance_calc: QgsDistanceArea - distance calculator
         
@@ -832,4 +1031,79 @@ the design point to the as-laid point and includes attributes for:
                     nearest_point = QgsPointXY(nearest_pt.x(), nearest_pt.y())
         
         return nearest_point
+    
+    def _extract_ac_kps(self, comparator, lines_layer, distance_calc, feedback):
+        """
+        Extract alter course (AC) KP values from the design route.
+        ACs are points where the bearing changes significantly.
+        
+        Args:
+            comparator: RPLComparator instance
+            lines_layer: Design lines layer
+            distance_calc: QgsDistanceArea for bearing calculations
+            feedback: For debug output
+        
+        Returns:
+            List of KP values (in km) for alter courses, sorted
+        """
+        ac_kps = set()  # Use set to avoid duplicates
+        
+        # Collect all points from all line geometries in order
+        all_points = []
+        for geom in comparator.source_geoms:
+            if geom.isMultipart():
+                parts = geom.asMultiPolyline()
+            else:
+                parts = [geom.asPolyline()]
+            for part in parts:
+                all_points.extend(part)
+        
+        feedback.pushInfo(f'Collected {len(comparator.source_geoms)} line geometries from design route')
+        
+        # Sort geometries by KP of their starting point
+        geom_list = []
+        for geom in comparator.source_geoms:
+            if geom.isEmpty():
+                continue
+            first_point = geom.vertexAt(0)
+            kp = comparator.calculate_kp_to_point(QgsPointXY(first_point.x(), first_point.y()), source=True)
+            geom_list.append((kp, geom))
+        
+        geom_list.sort(key=lambda x: x[0])  # Sort by start KP
+        
+        feedback.pushInfo(f'Sorted {len(geom_list)} geometries by start KP')
+        
+        # Check bearing changes between consecutive segments
+        for i in range(len(geom_list) - 1):
+            kp1, geom1 = geom_list[i]
+            kp2, geom2 = geom_list[i+1]
+            
+            # Get bearing of first segment
+            polyline1 = geom1.asPolyline()
+            p1 = polyline1[0]
+            p2 = polyline1[-1]
+            bearing1 = distance_calc.bearing(QgsPointXY(p1), QgsPointXY(p2))
+            
+            # Get bearing of second segment
+            polyline2 = geom2.asPolyline()
+            p3 = polyline2[0]
+            p4 = polyline2[-1]
+            bearing2 = distance_calc.bearing(QgsPointXY(p3), QgsPointXY(p4))
+            
+            # Junction point KP (use end of first segment)
+            junction_kp = comparator.calculate_kp_to_point(QgsPointXY(p2.x(), p2.y()), source=True)
+            
+            # Calculate bearing difference
+            bearing_diff = abs(bearing1 - bearing2)
+            bearing_diff = min(bearing_diff, 2 * math.pi - bearing_diff)
+            
+            # Debug: show first few
+            if i < 3:
+                feedback.pushInfo(f'Segment {i}: bearing1={math.degrees(bearing1):.1f}°, bearing2={math.degrees(bearing2):.1f}°, diff={math.degrees(bearing_diff):.3f}°')
+            
+            # Check for significant bearing change (more than 2 degrees)
+            if bearing_diff > 0.0349:
+                ac_kps.add(junction_kp)
+        
+        return sorted(list(ac_kps))
 

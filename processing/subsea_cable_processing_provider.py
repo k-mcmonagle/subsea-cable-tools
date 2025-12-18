@@ -24,6 +24,7 @@ from .place_ship_outlines_algorithm import PlaceShipOutlinesAlgorithm
 from .plot_line_segments_from_table_algorithm import PlotLineSegmentsFromTableAlgorithm
 from .translate_kp_from_rpl_to_rpl_algorithm import TranslateKPFromRPLToRPLAlgorithm
 from .rpl_route_comparison_algorithm import RPLRouteComparisonAlgorithm
+from .seabed_length_algorithm import SeabedLengthAlgorithm
 
 
 class SubseaCableProcessingProvider(QgsProcessingProvider):
@@ -62,6 +63,8 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
         self.addAlgorithm(TranslateKPFromRPLToRPLAlgorithm())
         print('Registering RPLRouteComparisonAlgorithm...')
         self.addAlgorithm(RPLRouteComparisonAlgorithm())
+        print('Registering SeabedLengthAlgorithm...')
+        self.addAlgorithm(SeabedLengthAlgorithm())
 
     def id(self):
         """

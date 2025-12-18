@@ -16,7 +16,7 @@ from qgis.PyQt.QtWidgets import (QAction, QMessageBox, QToolTip,
                                  QToolButton, QMenu, QCheckBox, QLineEdit, QHBoxLayout)
 from qgis.core import (QgsWkbTypes, QgsGeometry, QgsProject, QgsDistanceArea,
                        QgsPointXY, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
-                       Qgis, QgsVectorLayer, QgsField, QgsFeature)
+                       Qgis, QgsVectorLayer, QgsField, QgsFeature, QgsRaster, QgsSpatialIndex)
 from qgis.gui import QgsMapTool, QgsRubberBand, QgsVertexMarker
 import math
 try:  # sip is available in QGIS Python env; guard for static analysis
@@ -36,7 +36,7 @@ class KPMouseMapTool(QgsMapTool):
       - The distance (in the selected unit) and chainage (KP).
     Also allows copying the current data via a right-click.
     """
-    def __init__(self, canvas, layer, iface, measurementUnit="m", showReverseKP=False, useCartesian=False):
+    def __init__(self, canvas, layer, iface, measurementUnit="m", showReverseKP=False, useCartesian=False, showDepth=False, depthLayer=None, depthField=""):
         super().__init__(canvas)
         self.canvas = canvas
         self.iface = iface
@@ -44,6 +44,9 @@ class KPMouseMapTool(QgsMapTool):
         self.measurementUnit = measurementUnit
         self.showReverseKP = showReverseKP
         self.useCartesian = useCartesian
+        self.showDepth = showDepth
+        self.depthLayer = depthLayer
+        self.depthField = depthField
 
         # Distance / chainage preparation
         self.distanceArea = QgsDistanceArea()
@@ -375,6 +378,11 @@ class KPMouseMapTool(QgsMapTool):
                 act_place_ring = menu.addAction("Place Range Ring")
             else:
                 act_place_ring = None
+            # Add depth sampling option if depth layer is configured
+            if self.showDepth and self.depthLayer is not None:
+                act_sample_depth = menu.addAction("Sample Depth at Point")
+            else:
+                act_sample_depth = None
             # Optional: keep original copy behaviour
             if self.last_mouse_point is not None and self.last_chainage is not None:
                 act_copy = menu.addAction("Copy KP Info to Clipboard")
@@ -392,6 +400,8 @@ class KPMouseMapTool(QgsMapTool):
                 self._place_point(target_point, snapped_to_kp=True)
             elif act_place_ring and chosen == act_place_ring:
                 self._place_range_ring()
+            elif act_sample_depth and chosen == act_sample_depth:
+                self._sample_and_display_depth(click_point)
             elif act_copy and chosen == act_copy:
                 self._copy_kp_to_clipboard()
 
@@ -815,6 +825,112 @@ class KPMouseMapTool(QgsMapTool):
         except Exception:
             pass
 
+    def _sample_depth_at_point(self, point: QgsPointXY):
+        """Sample depth at the given point from the configured depth layer.
+        
+        Returns depth value as float, or None if not available or outside extent.
+        Supports both raster (MBES) and vector (contour) layers.
+        """
+        if not self.showDepth or not self.depthLayer:
+            return None
+        
+        try:
+            # Transform point to depth layer CRS if necessary
+            project_crs = self.canvas.mapSettings().destinationCrs()
+            depth_crs = self.depthLayer.crs()
+            transformed_point = point
+            if project_crs != depth_crs:
+                transform = QgsCoordinateTransform(project_crs, depth_crs, QgsProject.instance())
+                transformed_point = transform.transform(point)
+            
+            # Check if transformed point is within layer extent
+            extent = self.depthLayer.extent()
+            if not extent.contains(transformed_point):
+                return None
+            
+            if self.depthLayer.type() == self.depthLayer.RasterLayer:
+                # For raster layers, use data provider's identify method
+                provider = self.depthLayer.dataProvider()
+                if provider is None:
+                    print(f"DEBUG: No data provider for raster layer")
+                    return None
+                
+                # identify() returns a dictionary {band_number: value}
+                identify_result = provider.identify(transformed_point, QgsRaster.IdentifyFormatValue)
+                
+                # Handle both dictionary and QgsRasterIdentifyResult formats
+                if hasattr(identify_result, 'results'):
+                    # Newer QGIS versions return QgsRasterIdentifyResult object
+                    values = identify_result.results()
+                else:
+                    # Older versions return dictionary directly
+                    values = identify_result
+                
+                if values:
+                    # Get band 1 (first band) value
+                    for band_num in sorted(values.keys()):
+                        val = values[band_num]
+                        if val is not None and not math.isnan(val):
+                            return float(val)
+            elif self.depthLayer.type() == self.depthLayer.VectorLayer and self.depthLayer.geometryType() == QgsWkbTypes.LineGeometry:
+                # For contour layers, find nearest feature by iterating through all features
+                # (since this is on-demand sampling, performance isn't critical)
+                if not self.depthField:
+                    return None
+                
+                # Find field index
+                field_idx = self.depthLayer.fields().lookupField(self.depthField)
+                if field_idx == -1:
+                    return None
+                
+                # Find nearest feature by distance
+                min_distance = float('inf')
+                nearest_depth = None
+                
+                for feature in self.depthLayer.getFeatures():
+                    geom = feature.geometry()
+                    if geom and not geom.isEmpty():
+                        # Calculate distance from point to geometry
+                        distance = geom.distance(QgsGeometry.fromPointXY(transformed_point))
+                        if distance < min_distance:
+                            min_distance = distance
+                            attr_value = feature.attribute(field_idx)
+                            if attr_value is not None:
+                                try:
+                                    nearest_depth = float(attr_value)
+                                except (ValueError, TypeError):
+                                    pass
+                
+                if nearest_depth is not None:
+                    return nearest_depth
+        except Exception as e:
+            # Reset spatial index on error to allow rebuild
+            pass
+        return None
+
+    def _sample_and_display_depth(self, point: QgsPointXY):
+        """Sample depth at given point and display result in a message."""
+        if not self.showDepth or self.depthLayer is None:
+            msg = "Depth sampling is not configured. Please configure a depth layer in the KP Mouse Tool settings."
+            self.iface.mainWindow().statusBar().showMessage(msg, 4000)
+            self.iface.messageBar().pushMessage("Info", msg, level=Qgis.Warning, duration=5)
+            return
+            
+        try:
+            depth = self._sample_depth_at_point(point)
+            if depth is not None:
+                msg = f"Depth at point: {depth:.2f} m"
+                self.iface.mainWindow().statusBar().showMessage(msg, 4000)
+                self.iface.messageBar().pushMessage("Depth", msg, level=Qgis.Info, duration=5)
+                QToolTip.showText(QCursor.pos(), msg, self.canvas)
+            else:
+                msg = "No depth value available at this location (outside layer extent?)"
+                self.iface.mainWindow().statusBar().showMessage(msg, 4000)
+                self.iface.messageBar().pushMessage("Info", msg, level=Qgis.Warning, duration=5)
+        except Exception as e:
+            msg = f"Error sampling depth: {e}"
+            self.iface.messageBar().pushMessage("Error", msg, level=Qgis.Critical, duration=4)
+
     def deactivate(self):
         self.mouse_stop_timer.stop()
         self.persistent_tooltip_timer.stop()
@@ -996,7 +1112,7 @@ class KPRangeRingDialog(QDialog):
 
 class KPConfigDialog(QDialog):
     """A dialog for configuring the KP Mouse Tool settings."""
-    def __init__(self, parent=None, current_layer=None, current_unit="km", show_reverse_kp=False, current_use_cartesian=False):
+    def __init__(self, parent=None, current_layer=None, current_unit="km", show_reverse_kp=False, current_use_cartesian=False, show_depth=False, depth_layer=None, depth_field=""):
         super().__init__(parent)
         self.setWindowTitle("Configure KP Mouse Tool")
         layout = QVBoxLayout(self)
@@ -1030,6 +1146,21 @@ class KPConfigDialog(QDialog):
         self.cartesian_checkbox.setChecked(current_use_cartesian)
         layout.addWidget(self.cartesian_checkbox)
 
+        # Depth options
+        self.depth_checkbox = QCheckBox("Show depth sample option on right click")
+        self.depth_checkbox.setChecked(show_depth)
+        layout.addWidget(self.depth_checkbox)
+
+        self.depth_layer_label = QLabel("Select Depth Layer (Raster or Contour):")
+        self.depth_layer_combo = QComboBox()
+        layout.addWidget(self.depth_layer_label)
+        layout.addWidget(self.depth_layer_combo)
+
+        self.depth_field_label = QLabel("Depth Field Name (for Contour layers):")
+        self.depth_field_combo = QComboBox()
+        layout.addWidget(self.depth_field_label)
+        layout.addWidget(self.depth_field_combo)
+
         # Note about calculations
         self.note_label = QLabel("Note: KP calculations are based on geodetic distances using the WGS84 ellipsoid.")
         self.note_label.setWordWrap(True)
@@ -1049,6 +1180,16 @@ class KPConfigDialog(QDialog):
         for layer in self.line_layers:
             self.layer_combo.addItem(layer.name(), layer.id())
 
+        # Depth layers: raster and vector line layers
+        self.depth_layers = [
+            l for l in QgsProject.instance().mapLayers().values()
+            if (l.type() == l.RasterLayer) or (l.type() == l.VectorLayer and l.geometryType() == QgsWkbTypes.LineGeometry)
+        ]
+        
+        self.depth_layer_combo.addItem("None", None)
+        for layer in self.depth_layers:
+            self.depth_layer_combo.addItem(layer.name(), layer.id())
+
         if current_layer:
             idx = self.layer_combo.findData(current_layer.id())
             if idx != -1:
@@ -1059,8 +1200,21 @@ class KPConfigDialog(QDialog):
             if idx != -1:
                 self.unit_combo.setCurrentIndex(idx)
 
+        if depth_layer:
+            idx = self.depth_layer_combo.findData(depth_layer.id())
+            if idx != -1:
+                self.depth_layer_combo.setCurrentIndex(idx)
+
         self.layer_combo.currentIndexChanged.connect(self.update_metrics)
+        self.depth_checkbox.toggled.connect(self.update_depth_ui)
+        self.depth_layer_combo.currentIndexChanged.connect(self.update_depth_ui)
         self.update_metrics()
+        self.update_depth_ui()
+
+        if depth_field:
+            idx = self.depth_field_combo.findText(depth_field)
+            if idx != -1:
+                self.depth_field_combo.setCurrentIndex(idx)
 
     def update_metrics(self):
         layer_id = self.layer_combo.currentData()
@@ -1103,13 +1257,47 @@ class KPConfigDialog(QDialog):
         if not is_projected:
             self.cartesian_checkbox.setChecked(False)
 
+    def update_depth_ui(self):
+        """Update the depth UI elements based on checkbox and layer selection."""
+        enabled = self.depth_checkbox.isChecked()
+        self.depth_layer_label.setEnabled(enabled)
+        self.depth_layer_combo.setEnabled(enabled)
+        self.depth_field_label.setEnabled(enabled)
+        self.depth_field_combo.setEnabled(enabled)
+        
+        if enabled:
+            layer_id = self.depth_layer_combo.currentData()
+            if layer_id:
+                layer = QgsProject.instance().mapLayer(layer_id)
+                if layer and layer.type() == layer.VectorLayer:
+                    # Populate field combo with numeric fields
+                    self.depth_field_combo.clear()
+                    fields = layer.fields()
+                    for field in fields:
+                        if field.type() in [QVariant.Int, QVariant.Double, QVariant.LongLong]:
+                            self.depth_field_combo.addItem(field.name())
+                    self.depth_field_label.setEnabled(True)
+                    self.depth_field_combo.setEnabled(True)
+                else:
+                    self.depth_field_combo.clear()
+                    self.depth_field_label.setEnabled(False)
+                    self.depth_field_combo.setEnabled(False)
+            else:
+                self.depth_field_combo.clear()
+                self.depth_field_label.setEnabled(False)
+                self.depth_field_combo.setEnabled(False)
+
     def get_settings(self):
         layer_id = self.layer_combo.currentData()
         layer = QgsProject.instance().mapLayer(layer_id) if layer_id else None
         unit = self.unit_combo.currentText()
         show_reverse_kp = self.reverse_kp_checkbox.isChecked()
         use_cartesian = self.cartesian_checkbox.isChecked()
-        return layer, unit, show_reverse_kp, use_cartesian
+        show_depth = self.depth_checkbox.isChecked()
+        depth_layer_id = self.depth_layer_combo.currentData()
+        depth_layer = QgsProject.instance().mapLayer(depth_layer_id) if depth_layer_id else None
+        depth_field = self.depth_field_combo.currentText().strip()
+        return layer, unit, show_reverse_kp, use_cartesian, show_depth, depth_layer, depth_field
 
 
 class KPMouseTool:
@@ -1124,6 +1312,9 @@ class KPMouseTool:
         self.measurementUnit = "km"
         self.showReverseKP = False
         self.useCartesian = False
+        self.showDepth = False
+        self.depthLayer = None
+        self.depthField = ""
         self.toolButton = None
         self.toolButtonAction = None
         self.actionConfig = None
@@ -1279,7 +1470,7 @@ class KPMouseTool:
                 return
 
             self.mapTool = KPMouseMapTool(
-                self.iface.mapCanvas(), self.referenceLayer, self.iface, self.measurementUnit, self.showReverseKP, self.useCartesian
+                self.iface.mapCanvas(), self.referenceLayer, self.iface, self.measurementUnit, self.showReverseKP, self.useCartesian, self.showDepth, self.depthLayer, self.depthField
             )
             self.iface.mapCanvas().setMapTool(self.mapTool)
         else:
@@ -1293,14 +1484,17 @@ class KPMouseTool:
 
     def show_config_dialog(self):
         """Show the configuration dialog."""
-        dialog = KPConfigDialog(self.iface.mainWindow(), self.referenceLayer, self.measurementUnit, self.showReverseKP, self.useCartesian)
+        dialog = KPConfigDialog(self.iface.mainWindow(), self.referenceLayer, self.measurementUnit, self.showReverseKP, self.useCartesian, self.showDepth, self.depthLayer, self.depthField)
         if dialog.exec_():
-            layer, unit, show_reverse_kp, use_cartesian = dialog.get_settings()
+            layer, unit, show_reverse_kp, use_cartesian, show_depth, depth_layer, depth_field = dialog.get_settings()
             if layer:
                 self.referenceLayer = layer
                 self.measurementUnit = unit
                 self.showReverseKP = show_reverse_kp
                 self.useCartesian = use_cartesian
+                self.showDepth = show_depth
+                self.depthLayer = depth_layer
+                self.depthField = depth_field
                 self.save_settings()
                 self.iface.messageBar().pushMessage(
                     "Success", f"KP Mouse Tool configured with layer '{layer.name()}'", level=Qgis.Success
@@ -1321,6 +1515,12 @@ class KPMouseTool:
             settings.remove("referenceLayerId")
         settings.setValue("measurementUnit", self.measurementUnit)
         settings.setValue("showReverseKP", self.showReverseKP)
+        settings.setValue("showDepth", self.showDepth)
+        if self.depthLayer:
+            settings.setValue("depthLayerId", self.depthLayer.id())
+        else:
+            settings.remove("depthLayerId")
+        settings.setValue("depthField", self.depthField)
 
     def load_settings(self):
         """Load settings from QSettings."""
@@ -1330,3 +1530,8 @@ class KPMouseTool:
             self.referenceLayer = QgsProject.instance().mapLayer(layer_id)
         self.measurementUnit = settings.value("measurementUnit", "km")
         self.showReverseKP = settings.value("showReverseKP", False, type=bool)
+        self.showDepth = settings.value("showDepth", False, type=bool)
+        depth_layer_id = settings.value("depthLayerId")
+        if depth_layer_id:
+            self.depthLayer = QgsProject.instance().mapLayer(depth_layer_id)
+        self.depthField = settings.value("depthField", "")

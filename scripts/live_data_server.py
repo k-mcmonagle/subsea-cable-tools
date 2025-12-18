@@ -1,25 +1,6 @@
 #!/usr/bin/env python3
 """
-Live Data Server for Subse            try:
-                # Send headers
-                headers_line = ','.join(headers) + '\n'
-                client_socket.send(headers_line.encode('utf-8'))
-                print(f"Sent headers: {headers_line.strip()}")
-                time.sleep(0.1)  # Small delay to ensure headers are sent before data
-                
-                # Then send data
-                index = 0
-                while True:
-                    if index >= len(data):
-                        index = 0  # Loop back to beginning
-
-                    # Send the current record
-                    message = data[index] + '\n'
-                    client_socket.send(message.encode('utf-8'))
-                    print(f"Sent record {index + 1}/{len(data)}: {message.strip()}")
-
-                    index += 1
-                    time.sleep(1)  # Wait 1 secondn Testing
+Live Data Server for Subsea Cable Tools
 
 This script reads data from a CSV file and serves it over a TCP socket,
 sending one record per second. It loops back to the beginning when reaching the end.
@@ -35,6 +16,7 @@ import time
 import csv
 import sys
 import os
+import io
 
 # Path to the sample CSV file
 CSV_PATH = r"C:\Users\McMonaglek\OneDrive - Global Marine Systems Limited\Documents\PROJECTS\QGIS Live Ship Data Trial\SampleData\EMCS_S013_Lay_Data_cable_lay.csv"
@@ -53,7 +35,11 @@ def load_csv_data(csv_path):
         headers = next(reader)
         data = []
         for row in reader:
-            data.append(','.join(row))
+            # Use StringIO to properly serialize the row as CSV
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(row)
+            data.append(output.getvalue().rstrip('\r\n'))
     return headers, data
 
 def start_server(headers, data):
@@ -74,7 +60,10 @@ def start_server(headers, data):
 
             try:
                 # Send headers first
-                headers_line = ','.join(headers) + '\n'
+                output = io.StringIO()
+                writer = csv.writer(output)
+                writer.writerow(headers)
+                headers_line = output.getvalue().rstrip('\r\n') + '\n'
                 client_socket.send(headers_line.encode('utf-8'))
                 print(f"Sent headers: {headers_line.strip()}")
 

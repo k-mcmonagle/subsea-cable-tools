@@ -78,6 +78,7 @@ class TransitMeasureTool(QgsMapTool):
         self.canvas.setCursor(Qt.CrossCursor)
         if self.dialog is None:
             self.dialog = TransitMeasureDialog(self.iface, self)
+        # Always show dialog when tool is activated
         self.dialog.show()
         self.dialog.raise_()
         self.dialog.activateWindow()
@@ -93,9 +94,15 @@ class TransitMeasureTool(QgsMapTool):
         self.remove_vertex_marker()
         self.selected_waypoint_idx = None
         self.is_dragging = False
+        # Clean up when tool is deactivated (switched away)
         if self.dialog:
-            self.dialog.clear_waypoint_highlight()
-            self.dialog.close()
+            try:
+                self.dialog._cleanup_rubber_bands()
+                self.dialog.close()
+                self.dialog.deleteLater()
+            except Exception:
+                pass
+            self.dialog = None
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key_Escape,):
@@ -103,8 +110,17 @@ class TransitMeasureTool(QgsMapTool):
                 self.dialog.finish_path()
 
     def canvasPressEvent(self, event):
+        # Safety check: if dialog doesn't exist, can't process events
         if not self.dialog:
             return
+        
+        # If dialog is hidden, show it on any click
+        if not self.dialog.isVisible():
+            self.dialog.show()
+            self.dialog.raise_()
+            self.dialog.activateWindow()
+            return
+        
         pt = self._snappoint(event.originalPixelPoint())
         
         # Check if clicking on existing waypoint
@@ -143,6 +159,10 @@ class TransitMeasureTool(QgsMapTool):
 
     def canvasMoveEvent(self, event):
         if not self.dialog:
+            return
+        
+        # If dialog is hidden, don't process move events
+        if not self.dialog.isVisible():
             return
         
         # Check if hovering over a waypoint
@@ -946,15 +966,48 @@ class TransitMeasureDialog(QDialog):
         self.save_layer()
         self.create_waypoints_layer()
 
-    def closeEvent(self, evt):
+    def _cleanup_rubber_bands(self):
+        """Clean up all rubber band objects and clear drawing from map."""
         try:
-            self.point_rb.reset(QgsWkbTypes.PointGeometry)
-            self.line_rb.reset(QgsWkbTypes.LineGeometry)
-            self.temp_rb.reset(QgsWkbTypes.LineGeometry)
-            self.clear_waypoint_highlight()
+            if hasattr(self, 'point_rb') and self.point_rb is not None:
+                self.point_rb.reset(QgsWkbTypes.PointGeometry)
         except Exception:
             pass
-        super().closeEvent(evt)
+        try:
+            if hasattr(self, 'line_rb') and self.line_rb is not None:
+                self.line_rb.reset(QgsWkbTypes.LineGeometry)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'temp_rb') and self.temp_rb is not None:
+                self.temp_rb.reset(QgsWkbTypes.LineGeometry)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'highlight_rb') and self.highlight_rb is not None:
+                self.highlight_rb.reset(QgsWkbTypes.PointGeometry)
+        except Exception:
+            pass
+
+    def closeEvent(self, evt):
+        """Handle dialog close event - hides dialog and clears drawing without destroying it."""
+        try:
+            self._cleanup_rubber_bands()
+        except Exception:
+            pass
+        
+        # Hide the dialog but don't destroy it - it can be shown again
+        if evt is not None:
+            evt.accept()  # Allow the window to close (hide)
+
+    def reject(self):
+        """Handle dialog rejection (X button) - same as close."""
+        try:
+            self._cleanup_rubber_bands()
+        except Exception:
+            pass
+        
+        super().reject()
 
     def _time_unit(self):
         return TIME_UNITS[self.time_unit_combo.currentIndex()][1]

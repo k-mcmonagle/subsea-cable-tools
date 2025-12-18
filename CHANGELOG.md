@@ -7,15 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.4.0] - 2025-10-10
 ### Added
+- **Live Data Tool:** New dockable tool for receiving and plotting real-time ship position data from a TCP server. Basic tool for now but would like to add live trend graphs and possibly use QGIS as client screens onboard.
 - **Plot Line Segments from Table:** New processing algorithm under "Other Tools" to create line segments from a table layer with start and end latitude/longitude columns. Optionally creates a point layer for the endpoints. All original attributes are preserved with a source_table field added.
 - **RPL Route Comparison:** New processing algorithm to compare design vs as-laid RPL routes, calculating position offsets including radial, along-track, and cross-track distances.
 - **Translate KP Between RPLs (Points):** New processing algorithm to translate KP values from one RPL reference to another, creating corresponding points on the target RPL.
 
 ### Changed
-- **KP Mouse Map Tool:** Improved to calculate KP based on geodetic measurements by default, with option for Cartesian calculations when the layer uses a projected CRS.
+- **KP Mouse Map Tool:** Improved to calculate KP based on geodetic measurements by default, with option for Cartesian calculations when the layer uses a projected CRS. Also added option to sample depth value at the mouse position from a raster or contour layer using right click.
+- **Depth Profile tool:** Improved raster/contour inputs and performance for long routes.
+  - Contours: second contour layer is now optional (works with 1 or 2 contour layers).
+  - Rasters: supports selecting multiple raster layers; overlapping rasters prefer higher resolution first and missing coverage remains null with warnings.
+  - Added Refresh control and live sample/probe estimate readout.
+  - Added optional adaptive raster sampling (step derived from raster resolution along the route).
 
 ### Fixed
 - Added option to invert slope angle/percentage calculation in Depth Profile tool, with default not inverted.
+- Fixed some cleanup issues with the transit measure tool.
 
 ## [1.3.0] - 2025-09-06
 
