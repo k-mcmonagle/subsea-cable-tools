@@ -5,15 +5,17 @@ KPMouseMapTool
 Integrated into the Subsea Cable Tools plugin.
 This tool displays the closest point on a selected line to the mouse pointer,
 draws a dashed line connecting them, and shows distance and KP (chainage) data.
-Right-clicking copies the distance, KP (DCC) and lat/long of the mouse position to the clipboard.
+Right-clicking can copy KP info to the clipboard (configurable in tool settings).
 """
+
+from typing import Optional, Tuple
 
 from qgis.PyQt.QtCore import Qt, QSettings, QTimer, QVariant
 from qgis.PyQt.QtGui import QIcon, QColor, QCursor
 from qgis.PyQt.QtWidgets import (QAction, QMessageBox, QToolTip,
                                  QApplication, QDialog, QVBoxLayout,
                                  QComboBox, QLabel, QDialogButtonBox,
-                                 QToolButton, QMenu, QCheckBox, QLineEdit, QHBoxLayout)
+                                 QToolButton, QMenu, QCheckBox, QLineEdit, QHBoxLayout, QPushButton)
 from qgis.core import (QgsWkbTypes, QgsGeometry, QgsProject, QgsDistanceArea,
                        QgsPointXY, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
                        Qgis, QgsVectorLayer, QgsField, QgsFeature, QgsRaster, QgsSpatialIndex)
@@ -36,7 +38,23 @@ class KPMouseMapTool(QgsMapTool):
       - The distance (in the selected unit) and chainage (KP).
     Also allows copying the current data via a right-click.
     """
-    def __init__(self, canvas, layer, iface, measurementUnit="m", showReverseKP=False, useCartesian=False, showDepth=False, depthLayer=None, depthField=""):
+    def __init__(
+        self,
+        canvas,
+        layer,
+        iface,
+        measurementUnit="m",
+        showReverseKP=False,
+        useCartesian=False,
+        showDepth=False,
+        depthLayer=None,
+        depthField="",
+        copyIncludeRKP=False,
+        copyIncludeDCC=False,
+        copyIncludeLatLon=False,
+        copyLatLonFormat="DD",
+        copyLatLonStyle="LABELLED",
+    ):
         super().__init__(canvas)
         self.canvas = canvas
         self.iface = iface
@@ -47,6 +65,13 @@ class KPMouseMapTool(QgsMapTool):
         self.showDepth = showDepth
         self.depthLayer = depthLayer
         self.depthField = depthField
+
+        # Right-click copy behaviour (KP is always included)
+        self.copyIncludeRKP = bool(copyIncludeRKP)
+        self.copyIncludeDCC = bool(copyIncludeDCC)
+        self.copyIncludeLatLon = bool(copyIncludeLatLon)
+        self.copyLatLonFormat = (copyLatLonFormat or "DD").upper()
+        self.copyLatLonStyle = (copyLatLonStyle or "LABELLED").upper()
 
         # Distance / chainage preparation
         self.distanceArea = QgsDistanceArea()
@@ -389,6 +414,12 @@ class KPMouseMapTool(QgsMapTool):
             else:
                 act_copy = None
 
+            # Go to KP...
+            if self.features_geoms and self.total_length_meters and self.total_length_meters > 0:
+                act_goto_kp = menu.addAction("Go to KP...")
+            else:
+                act_goto_kp = None
+
             chosen = menu.exec_(QCursor.pos())
             if not chosen:
                 return
@@ -402,32 +433,229 @@ class KPMouseMapTool(QgsMapTool):
                 self._place_range_ring()
             elif act_sample_depth and chosen == act_sample_depth:
                 self._sample_and_display_depth(click_point)
+            elif act_goto_kp and chosen == act_goto_kp:
+                self._show_go_to_kp_dialog()
             elif act_copy and chosen == act_copy:
                 self._copy_kp_to_clipboard()
 
+    def _show_go_to_kp_dialog(self):
+        """Open the Go to KP dialog and pan canvas to the entered KP."""
+        try:
+            if not self.features_geoms or not self.total_length_meters or self.total_length_meters <= 0:
+                self.iface.messageBar().pushMessage(
+                    "Info",
+                    "Go to KP is available after configuring a reference line.",
+                    level=Qgis.Info,
+                    duration=3,
+                )
+                return
+
+            min_kp = 0.0
+            max_kp = float(self.total_length_meters) / 1000.0
+            initial = None
+            if self.last_chainage is not None:
+                try:
+                    initial = float(self.last_chainage)
+                except Exception:
+                    initial = None
+
+            dialog = GoToKPDialog(self.iface.mainWindow(), min_kp, max_kp, initial_kp_km=initial)
+            if not dialog.exec_():
+                return
+
+            kp_km = dialog.chosen_kp_km()
+            if kp_km is None:
+                return
+
+            target_point = self._point_at_kp_km(float(kp_km))
+            if target_point is None:
+                QMessageBox.warning(
+                    self.iface.mainWindow(),
+                    "Go to KP",
+                    "Could not compute a point at that KP on the configured reference line.",
+                )
+                return
+
+            self.canvas.setCenter(target_point)
+            self.canvas.refresh()
+        except Exception as e:
+            try:
+                self.iface.messageBar().pushMessage("Error", f"Go to KP failed: {e}", level=Qgis.Critical, duration=4)
+            except Exception:
+                pass
+
+    def _point_at_kp_km(self, kp_km: float) -> Optional[QgsPointXY]:
+        """Return the point on the cached reference line at the provided KP (km)."""
+        try:
+            target_m = float(kp_km) * 1000.0
+        except Exception:
+            return None
+
+        if target_m < 0:
+            return None
+
+        cumulative = 0.0
+        last_point = None
+
+        for geom in self.features_geoms:
+            if geom is None or geom.isEmpty():
+                continue
+
+            try:
+                if geom.isMultipart():
+                    parts = list(geom.asMultiPolyline())
+                else:
+                    parts = [geom.asPolyline()]
+            except Exception:
+                continue
+
+            for part in parts:
+                if not part or len(part) < 2:
+                    continue
+
+                for i in range(len(part) - 1):
+                    p1 = part[i]
+                    p2 = part[i + 1]
+                    try:
+                        seg_len = float(self.distanceArea.measureLine(p1, p2))
+                    except Exception:
+                        continue
+                    if seg_len <= 0:
+                        continue
+
+                    next_cum = cumulative + seg_len
+                    last_point = QgsPointXY(p2)
+
+                    if next_cum >= target_m:
+                        ratio = (target_m - cumulative) / seg_len
+                        x = float(p1.x()) + ratio * (float(p2.x()) - float(p1.x()))
+                        y = float(p1.y()) + ratio * (float(p2.y()) - float(p1.y()))
+                        return QgsPointXY(x, y)
+
+                    cumulative = next_cum
+
+        return last_point
+
     def _copy_kp_to_clipboard(self):
-        """Preserve original copy-to-clipboard behaviour as a callable."""
-        if self.last_mouse_point is None or self.last_distance is None or self.last_chainage is None:
+        """Copy KP info to clipboard using user-configured content."""
+        if self.last_mouse_point is None or self.last_chainage is None:
             return
         try:
-            source_crs = self.canvas.mapSettings().destinationCrs()
-            dest_crs = QgsCoordinateReferenceSystem("EPSG:4326")
-            transform = QgsCoordinateTransform(source_crs, dest_crs, QgsProject.instance())
-            wgs84_point = transform.transform(self.last_mouse_point)
-            lat = wgs84_point.y()
-            lon = wgs84_point.x()
-            clipboard_text = f"KP: {self.last_chainage:.3f}\n"
-            if self.last_reverse_chainage is not None:
-                clipboard_text += f"rKP: {self.last_reverse_chainage:.3f}\n"
-            clipboard_text += (f"DCC: {self.last_distance:.2f} {self.measurementUnit}\n"
-                               f"Lat: {lat:.6f}, Lon: {lon:.6f}")
+            parts = []
+            parts.append(f"KP {self.last_chainage:.3f}")
+
+            # rKP (compute even if showReverseKP isn't enabled)
+            if self.copyIncludeRKP and self.total_length_meters and self.last_chainage is not None:
+                rkp_val = self.last_reverse_chainage
+                if rkp_val is None:
+                    rkp_val = (self.total_length_meters / 1000.0) - float(self.last_chainage)
+                parts.append(f"rKP {float(rkp_val):.3f}")
+
+            # DCC
+            if self.copyIncludeDCC and self.last_distance is not None:
+                parts.append(f"DCC {self.last_distance:.2f} {self.measurementUnit}")
+
+            # Lat/Lon
+            if self.copyIncludeLatLon:
+                source_crs = self.canvas.mapSettings().destinationCrs()
+                dest_crs = QgsCoordinateReferenceSystem("EPSG:4326")
+                transform = QgsCoordinateTransform(source_crs, dest_crs, QgsProject.instance())
+                wgs84_point = transform.transform(self.last_mouse_point)
+                lat = float(wgs84_point.y())
+                lon = float(wgs84_point.x())
+                parts.append(self._format_lat_lon(lat, lon, self.copyLatLonFormat, self.copyLatLonStyle))
+
+            clipboard_text = "\n".join(parts)
             QApplication.clipboard().setText(clipboard_text)
-            feedback = "KP, DCC and Lat/Long copied to clipboard"
+
+            extras = self.copyIncludeRKP or self.copyIncludeDCC or self.copyIncludeLatLon
+            feedback = "KP info copied to clipboard" if extras else "KP copied to clipboard"
             QToolTip.showText(QCursor.pos(), feedback, self.canvas)
             self.iface.mainWindow().statusBar().showMessage(feedback, 2000)
             self.iface.messageBar().pushMessage("Info", feedback, level=Qgis.Info, duration=2)
         except Exception as e:
             self.iface.messageBar().pushMessage("Error", f"Copy failed: {e}", level=Qgis.Critical, duration=4)
+
+    def _format_lat_lon(self, lat: float, lon: float, fmt: str, style: str) -> str:
+        fmt = (fmt or "DD").upper()
+        style = (style or "LABELLED").upper()
+
+        if fmt == "DDM":
+            lat_s = self._format_ddm(lat, is_lat=True)
+            lon_s = self._format_ddm(lon, is_lat=False)
+            return self._format_lat_lon_pair(lat_s, lon_s, style)
+
+        if fmt == "DMS":
+            lat_s = self._format_dms(lat, is_lat=True)
+            lon_s = self._format_dms(lon, is_lat=False)
+            return self._format_lat_lon_pair(lat_s, lon_s, style)
+
+        if fmt in ("DD_HEM", "DDH", "DD_HEMISPHERE"):
+            lat_s = self._format_dd_hem(lat, is_lat=True)
+            lon_s = self._format_dd_hem(lon, is_lat=False)
+            return self._format_lat_lon_pair(lat_s, lon_s, style)
+
+        # Default: decimal degrees (signed)
+        lat_s = f"{lat:.6f}"
+        lon_s = f"{lon:.6f}"
+        return self._format_lat_lon_pair(lat_s, lon_s, style)
+
+    def _format_lat_lon_pair(self, lat_s: str, lon_s: str, style: str) -> str:
+        style = (style or "LABELLED").upper()
+        if style == "SPACE":
+            return f"{lat_s} {lon_s}"
+        if style == "COMMA":
+            return f"{lat_s}, {lon_s}"
+        # Default: labelled
+        return f"Lat {lat_s}, Lon {lon_s}"
+
+    def _format_dd_hem(self, value: float, is_lat: bool) -> str:
+        """Decimal degrees with hemisphere suffix (N/S/E/W) instead of signed +/-."""
+        hemi = "N" if is_lat else "E"
+        if value < 0:
+            hemi = "S" if is_lat else "W"
+        v = abs(float(value))
+        return f"{v:.6f}{hemi}"
+
+    def _format_ddm(self, value: float, is_lat: bool) -> str:
+        """Degrees + decimal minutes, with hemisphere suffix (N/S/E/W)."""
+        hemi = "N" if is_lat else "E"
+        if value < 0:
+            hemi = "S" if is_lat else "W"
+        v = abs(float(value))
+        deg = int(v)
+        minutes = (v - deg) * 60.0
+        # Round to 3 decimals of minutes, with carry
+        minutes = round(minutes, 3)
+        if minutes >= 60.0:
+            deg += 1
+            minutes = 0.0
+
+        if is_lat:
+            return f"{deg:02d}°{minutes:06.3f}'{hemi}"
+        return f"{deg:03d}°{minutes:06.3f}'{hemi}"
+
+    def _format_dms(self, value: float, is_lat: bool) -> str:
+        """Degrees + minutes + seconds, with hemisphere suffix (N/S/E/W)."""
+        hemi = "N" if is_lat else "E"
+        if value < 0:
+            hemi = "S" if is_lat else "W"
+        v = abs(float(value))
+        deg = int(v)
+        minutes_full = (v - deg) * 60.0
+        minute = int(minutes_full)
+        seconds = (minutes_full - minute) * 60.0
+        seconds = round(seconds, 2)
+        if seconds >= 60.0:
+            minute += 1
+            seconds = 0.0
+        if minute >= 60:
+            deg += 1
+            minute = 0
+
+        if is_lat:
+            return f"{deg:02d}°{minute:02d}'{seconds:05.2f}\"{hemi}"
+        return f"{deg:03d}°{minute:02d}'{seconds:05.2f}\"{hemi}"
 
     # --- Point placement & layer helpers (moved from dialog) ---
     def _ensure_points_layer(self):
@@ -1112,7 +1340,22 @@ class KPRangeRingDialog(QDialog):
 
 class KPConfigDialog(QDialog):
     """A dialog for configuring the KP Mouse Tool settings."""
-    def __init__(self, parent=None, current_layer=None, current_unit="km", show_reverse_kp=False, current_use_cartesian=False, show_depth=False, depth_layer=None, depth_field=""):
+    def __init__(
+        self,
+        parent=None,
+        current_layer=None,
+        current_unit="km",
+        show_reverse_kp=False,
+        current_use_cartesian=False,
+        show_depth=False,
+        depth_layer=None,
+        depth_field="",
+        copy_include_rkp=False,
+        copy_include_dcc=False,
+        copy_include_latlon=False,
+        copy_latlon_format="DD",
+        copy_latlon_style="LABELLED",
+    ):
         super().__init__(parent)
         self.setWindowTitle("Configure KP Mouse Tool")
         layout = QVBoxLayout(self)
@@ -1161,6 +1404,43 @@ class KPConfigDialog(QDialog):
         layout.addWidget(self.depth_field_label)
         layout.addWidget(self.depth_field_combo)
 
+        # Copy-to-clipboard options
+        self.copy_label = QLabel("Right-click copy contents:")
+        layout.addWidget(self.copy_label)
+
+        self.copy_kp_label = QLabel("- KP is always included (formatted as: 'KP 123.456')")
+        self.copy_kp_label.setWordWrap(True)
+        layout.addWidget(self.copy_kp_label)
+
+        self.copy_rkp_checkbox = QCheckBox("Include Reverse KP (rKP)")
+        self.copy_rkp_checkbox.setChecked(bool(copy_include_rkp))
+        layout.addWidget(self.copy_rkp_checkbox)
+
+        self.copy_dcc_checkbox = QCheckBox("Include DCC")
+        self.copy_dcc_checkbox.setChecked(bool(copy_include_dcc))
+        layout.addWidget(self.copy_dcc_checkbox)
+
+        self.copy_latlon_checkbox = QCheckBox("Include Lat/Lon")
+        self.copy_latlon_checkbox.setChecked(bool(copy_include_latlon))
+        layout.addWidget(self.copy_latlon_checkbox)
+
+        self.copy_latlon_format_label = QLabel("Lat/Lon format:")
+        self.copy_latlon_format_combo = QComboBox()
+        self.copy_latlon_format_combo.addItem("DD (decimal degrees)", "DD")
+        self.copy_latlon_format_combo.addItem("DD (decimal degrees + N/S/E/W)", "DD_HEM")
+        self.copy_latlon_format_combo.addItem("DDM (degrees decimal minutes)", "DDM")
+        self.copy_latlon_format_combo.addItem("DMS (degrees minutes seconds)", "DMS")
+        layout.addWidget(self.copy_latlon_format_label)
+        layout.addWidget(self.copy_latlon_format_combo)
+
+        self.copy_latlon_style_label = QLabel("Lat/Lon output style:")
+        self.copy_latlon_style_combo = QComboBox()
+        self.copy_latlon_style_combo.addItem("Labelled (Lat …, Lon …)", "LABELLED")
+        self.copy_latlon_style_combo.addItem("Paste-friendly (lat, lon)", "COMMA")
+        self.copy_latlon_style_combo.addItem("Paste-friendly (lat lon)", "SPACE")
+        layout.addWidget(self.copy_latlon_style_label)
+        layout.addWidget(self.copy_latlon_style_combo)
+
         # Note about calculations
         self.note_label = QLabel("Note: KP calculations are based on geodetic distances using the WGS84 ellipsoid.")
         self.note_label.setWordWrap(True)
@@ -1208,8 +1488,21 @@ class KPConfigDialog(QDialog):
         self.layer_combo.currentIndexChanged.connect(self.update_metrics)
         self.depth_checkbox.toggled.connect(self.update_depth_ui)
         self.depth_layer_combo.currentIndexChanged.connect(self.update_depth_ui)
+        self.copy_latlon_checkbox.toggled.connect(self.update_copy_ui)
         self.update_metrics()
         self.update_depth_ui()
+        self.update_copy_ui()
+
+        # Restore Lat/Lon format selection
+        if copy_latlon_format:
+            idx = self.copy_latlon_format_combo.findData(str(copy_latlon_format).upper())
+            if idx != -1:
+                self.copy_latlon_format_combo.setCurrentIndex(idx)
+
+        if copy_latlon_style:
+            idx = self.copy_latlon_style_combo.findData(str(copy_latlon_style).upper())
+            if idx != -1:
+                self.copy_latlon_style_combo.setCurrentIndex(idx)
 
         if depth_field:
             idx = self.depth_field_combo.findText(depth_field)
@@ -1287,6 +1580,13 @@ class KPConfigDialog(QDialog):
                 self.depth_field_label.setEnabled(False)
                 self.depth_field_combo.setEnabled(False)
 
+    def update_copy_ui(self):
+        enabled = self.copy_latlon_checkbox.isChecked()
+        self.copy_latlon_format_label.setEnabled(enabled)
+        self.copy_latlon_format_combo.setEnabled(enabled)
+        self.copy_latlon_style_label.setEnabled(enabled)
+        self.copy_latlon_style_combo.setEnabled(enabled)
+
     def get_settings(self):
         layer_id = self.layer_combo.currentData()
         layer = QgsProject.instance().mapLayer(layer_id) if layer_id else None
@@ -1297,7 +1597,116 @@ class KPConfigDialog(QDialog):
         depth_layer_id = self.depth_layer_combo.currentData()
         depth_layer = QgsProject.instance().mapLayer(depth_layer_id) if depth_layer_id else None
         depth_field = self.depth_field_combo.currentText().strip()
-        return layer, unit, show_reverse_kp, use_cartesian, show_depth, depth_layer, depth_field
+        copy_include_rkp = self.copy_rkp_checkbox.isChecked()
+        copy_include_dcc = self.copy_dcc_checkbox.isChecked()
+        copy_include_latlon = self.copy_latlon_checkbox.isChecked()
+        copy_latlon_format = self.copy_latlon_format_combo.currentData() or "DD"
+        copy_latlon_style = self.copy_latlon_style_combo.currentData() or "LABELLED"
+        return (
+            layer,
+            unit,
+            show_reverse_kp,
+            use_cartesian,
+            show_depth,
+            depth_layer,
+            depth_field,
+            copy_include_rkp,
+            copy_include_dcc,
+            copy_include_latlon,
+            copy_latlon_format,
+            copy_latlon_style,
+        )
+
+
+class GoToKPDialog(QDialog):
+    """Small dialog to enter a KP (km) and pan the map to that location."""
+
+    def __init__(
+        self,
+        parent,
+        min_kp_km: float,
+        max_kp_km: float,
+        initial_kp_km: Optional[float] = None,
+    ):
+        super().__init__(parent)
+        self._min_kp_km = float(min_kp_km)
+        self._max_kp_km = float(max_kp_km)
+
+        self.setWindowTitle("Go to KP")
+        self.setModal(True)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+
+        layout = QVBoxLayout(self)
+
+        self.kp_label = QLabel("KP (km):")
+        self.kp_input = QLineEdit(self)
+        self.kp_input.setPlaceholderText("e.g. 12.345")
+        if initial_kp_km is not None:
+            try:
+                self.kp_input.setText(f"{float(initial_kp_km):.3f}")
+            except Exception:
+                pass
+
+        kp_row = QHBoxLayout()
+        kp_row.addWidget(self.kp_label)
+        kp_row.addWidget(self.kp_input)
+        layout.addLayout(kp_row)
+
+        self.range_label = QLabel(
+            f"Available KP range: {self._min_kp_km:.3f} to {self._max_kp_km:.3f} km"
+        )
+        layout.addWidget(self.range_label)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+        self.go_button = QPushButton("Go to")
+        self.buttons.addButton(self.go_button, QDialogButtonBox.AcceptRole)
+        self.buttons.rejected.connect(self.reject)
+        self.go_button.clicked.connect(self._on_go)
+        layout.addWidget(self.buttons)
+
+        self._chosen_kp_km = None  # type: Optional[float]
+
+        self.kp_input.returnPressed.connect(self.go_button.click)
+
+        self.setFixedWidth(360)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        parent = self.parentWidget()
+        if parent is not None:
+            parent_center = parent.frameGeometry().center()
+            frame = self.frameGeometry()
+            frame.moveCenter(parent_center)
+            self.move(frame.topLeft())
+        else:
+            screen = QApplication.primaryScreen()
+            if screen is not None:
+                screen_center = screen.availableGeometry().center()
+                frame = self.frameGeometry()
+                frame.moveCenter(screen_center)
+                self.move(frame.topLeft())
+
+    def _on_go(self):
+        raw = (self.kp_input.text() or "").strip()
+        try:
+            value = float(raw)
+        except Exception:
+            QMessageBox.warning(self, "Go to KP", "Please enter a valid numeric KP value.")
+            return
+
+        if value < self._min_kp_km or value > self._max_kp_km:
+            QMessageBox.warning(
+                self,
+                "Go to KP",
+                f"KP must be between {self._min_kp_km:.3f} and {self._max_kp_km:.3f} km.",
+            )
+            return
+
+        self._chosen_kp_km = float(value)
+        self.accept()
+
+    def chosen_kp_km(self) -> Optional[float]:
+        return self._chosen_kp_km
 
 
 class KPMouseTool:
@@ -1315,9 +1724,16 @@ class KPMouseTool:
         self.showDepth = False
         self.depthLayer = None
         self.depthField = ""
+        # Right-click copy settings (KP is always included)
+        self.copyIncludeRKP = False
+        self.copyIncludeDCC = False
+        self.copyIncludeLatLon = False
+        self.copyLatLonFormat = "DD"
+        self.copyLatLonStyle = "LABELLED"
         self.toolButton = None
         self.toolButtonAction = None
         self.actionConfig = None
+        self.actionGoToKP = None
         self.load_settings()
 
     def initGui(self):
@@ -1345,9 +1761,20 @@ class KPMouseTool:
         self.actionConfig.triggered.connect(self.show_config_dialog)
         menu.addAction(self.actionConfig)
 
+        self.actionGoToKP = QAction("Go to KP...", self.iface.mainWindow())
+        self.actionGoToKP.triggered.connect(self.show_go_to_kp_dialog)
+        menu.addAction(self.actionGoToKP)
+
         self.toolButton.setMenu(menu)
 
         self.toolButtonAction = self.iface.addToolBarWidget(self.toolButton)
+        self._update_go_to_kp_enabled()
+
+        try:
+            QgsProject.instance().layersRemoved.connect(self._on_layers_removed)
+        except Exception:
+            pass
+
         self.iface.addPluginToMenu("&Subsea Cable Tools", self.actionConfig)
 
     def unload(self):
@@ -1372,12 +1799,16 @@ class KPMouseTool:
             except Exception:
                 pass
             self.toolButtonAction = None
+
         if hasattr(self, 'actionConfig') and self.actionConfig:
             try:
                 self.iface.removePluginMenu("&Subsea Cable Tools", self.actionConfig)
             except Exception:
                 pass
             self.actionConfig = None
+
+        # Go to KP is a menu action under the tool button.
+        self.actionGoToKP = None
 
         # Disconnect signals
         if hasattr(self, 'toolButton') and self.toolButton:
@@ -1386,6 +1817,11 @@ class KPMouseTool:
             except Exception:
                 pass
             self.toolButton = None
+
+        try:
+            QgsProject.instance().layersRemoved.disconnect(self._on_layers_removed)
+        except Exception:
+            pass
 
         # Clean up references
         self.referenceLayer = None
@@ -1451,6 +1887,8 @@ class KPMouseTool:
                     self.toolButton.setChecked(False)
                     return
 
+                    self._update_go_to_kp_enabled()
+
             # Verify the layer is still in the project
             if self.referenceLayer.id() not in [l.id() for l in QgsProject.instance().mapLayers().values()]:
                 self.iface.messageBar().pushMessage(
@@ -1470,7 +1908,20 @@ class KPMouseTool:
                 return
 
             self.mapTool = KPMouseMapTool(
-                self.iface.mapCanvas(), self.referenceLayer, self.iface, self.measurementUnit, self.showReverseKP, self.useCartesian, self.showDepth, self.depthLayer, self.depthField
+                self.iface.mapCanvas(),
+                self.referenceLayer,
+                self.iface,
+                self.measurementUnit,
+                self.showReverseKP,
+                self.useCartesian,
+                self.showDepth,
+                self.depthLayer,
+                self.depthField,
+                self.copyIncludeRKP,
+                self.copyIncludeDCC,
+                self.copyIncludeLatLon,
+                self.copyLatLonFormat,
+                self.copyLatLonStyle,
             )
             self.iface.mapCanvas().setMapTool(self.mapTool)
         else:
@@ -1482,11 +1933,40 @@ class KPMouseTool:
                 self.mapTool.cleanup_resources()
                 self.mapTool = None
 
+            self._update_go_to_kp_enabled()
+
     def show_config_dialog(self):
         """Show the configuration dialog."""
-        dialog = KPConfigDialog(self.iface.mainWindow(), self.referenceLayer, self.measurementUnit, self.showReverseKP, self.useCartesian, self.showDepth, self.depthLayer, self.depthField)
+        dialog = KPConfigDialog(
+            self.iface.mainWindow(),
+            self.referenceLayer,
+            self.measurementUnit,
+            self.showReverseKP,
+            self.useCartesian,
+            self.showDepth,
+            self.depthLayer,
+            self.depthField,
+            self.copyIncludeRKP,
+            self.copyIncludeDCC,
+            self.copyIncludeLatLon,
+            self.copyLatLonFormat,
+            self.copyLatLonStyle,
+        )
         if dialog.exec_():
-            layer, unit, show_reverse_kp, use_cartesian, show_depth, depth_layer, depth_field = dialog.get_settings()
+            (
+                layer,
+                unit,
+                show_reverse_kp,
+                use_cartesian,
+                show_depth,
+                depth_layer,
+                depth_field,
+                copy_include_rkp,
+                copy_include_dcc,
+                copy_include_latlon,
+                copy_latlon_format,
+                copy_latlon_style,
+            ) = dialog.get_settings()
             if layer:
                 self.referenceLayer = layer
                 self.measurementUnit = unit
@@ -1495,16 +1975,207 @@ class KPMouseTool:
                 self.showDepth = show_depth
                 self.depthLayer = depth_layer
                 self.depthField = depth_field
+                self.copyIncludeRKP = bool(copy_include_rkp)
+                self.copyIncludeDCC = bool(copy_include_dcc)
+                self.copyIncludeLatLon = bool(copy_include_latlon)
+                self.copyLatLonFormat = str(copy_latlon_format or "DD").upper()
+                self.copyLatLonStyle = str(copy_latlon_style or "LABELLED").upper()
                 self.save_settings()
                 self.iface.messageBar().pushMessage(
                     "Success", f"KP Mouse Tool configured with layer '{layer.name()}'", level=Qgis.Success
                 )
                 if self.toolButton.isChecked():
                     self.toggle_tool(True)  # Re-enable with new settings
+                self._update_go_to_kp_enabled()
             else:
                 self.iface.messageBar().pushMessage(
                     "Warning", "No valid reference layer selected.", level=Qgis.Warning
                 )
+                self._update_go_to_kp_enabled()
+
+    def _on_layers_removed(self, layer_ids):
+        if not layer_ids:
+            return
+        if self.referenceLayer and self.referenceLayer.id() in set(layer_ids):
+            self.referenceLayer = None
+        self._update_go_to_kp_enabled()
+
+    def _reference_layer_ready(self) -> bool:
+        layer = self.referenceLayer
+        if layer is None:
+            return False
+        if not isinstance(layer, QgsVectorLayer) or not layer.isValid():
+            return False
+        if layer.geometryType() != QgsWkbTypes.LineGeometry:
+            return False
+        try:
+            if layer.featureCount() <= 0:
+                return False
+        except Exception:
+            # If featureCount isn't available for some providers, fall back to iterator check
+            try:
+                next(layer.getFeatures())
+            except StopIteration:
+                return False
+            except Exception:
+                return False
+        return True
+
+    def _update_go_to_kp_enabled(self):
+        if self.actionGoToKP is None:
+            return
+        self.actionGoToKP.setEnabled(self._reference_layer_ready())
+
+    def _make_distance_area(self) -> QgsDistanceArea:
+        distance = QgsDistanceArea()
+        project_crs = self.iface.mapCanvas().mapSettings().destinationCrs()
+        distance.setSourceCrs(project_crs, QgsProject.instance().transformContext())
+        if self.useCartesian:
+            if hasattr(distance, "setEllipsoidalMode"):
+                distance.setEllipsoidalMode(False)
+        else:
+            ellipsoid = QgsProject.instance().ellipsoid() or "WGS84"
+            distance.setEllipsoid(ellipsoid)
+            if hasattr(distance, "setEllipsoidalMode"):
+                distance.setEllipsoidalMode(True)
+        return distance
+
+    def _iter_reference_geometries_project_crs(self):
+        """Yield reference layer geometries transformed to project CRS."""
+        layer = self.referenceLayer
+        if layer is None:
+            return
+
+        project_crs = self.iface.mapCanvas().mapSettings().destinationCrs()
+        layer_crs = layer.crs()
+        transform = None
+        if layer_crs != project_crs:
+            transform = QgsCoordinateTransform(layer_crs, project_crs, QgsProject.instance())
+
+        for feature in layer.getFeatures():
+            geom = QgsGeometry(feature.geometry())
+            if geom is None or geom.isEmpty():
+                continue
+            if transform is not None:
+                try:
+                    geom.transform(transform)
+                except Exception:
+                    continue
+            yield geom
+
+    def _reference_kp_range(self) -> Optional[Tuple[float, float]]:
+        if not self._reference_layer_ready():
+            return None
+
+        distance = self._make_distance_area()
+        total_m = 0.0
+        for geom in self._iter_reference_geometries_project_crs():
+            try:
+                total_m += float(distance.measureLength(geom))
+            except Exception:
+                continue
+
+        total_km = max(0.0, total_m / 1000.0)
+        return (0.0, total_km)
+
+    def _point_at_kp_km(self, kp_km: float) -> Optional[QgsPointXY]:
+        """Return the point on the reference line at the provided KP (km)."""
+        if not self._reference_layer_ready():
+            return None
+
+        distance = self._make_distance_area()
+        target_m = float(kp_km) * 1000.0
+        if target_m < 0:
+            return None
+
+        cumulative = 0.0
+        last_point = None
+
+        for geom in self._iter_reference_geometries_project_crs():
+            parts = []
+            try:
+                if geom.isMultipart():
+                    parts = list(geom.asMultiPolyline())
+                else:
+                    parts = [geom.asPolyline()]
+            except Exception:
+                continue
+
+            for part in parts:
+                if not part or len(part) < 2:
+                    continue
+
+                for i in range(len(part) - 1):
+                    p1 = part[i]
+                    p2 = part[i + 1]
+                    try:
+                        seg_len = float(distance.measureLine(p1, p2))
+                    except Exception:
+                        continue
+                    if seg_len <= 0:
+                        continue
+
+                    next_cum = cumulative + seg_len
+                    last_point = QgsPointXY(p2)
+
+                    if next_cum >= target_m:
+                        ratio = (target_m - cumulative) / seg_len
+                        x = float(p1.x()) + ratio * (float(p2.x()) - float(p1.x()))
+                        y = float(p1.y()) + ratio * (float(p2.y()) - float(p1.y()))
+                        return QgsPointXY(x, y)
+
+                    cumulative = next_cum
+
+        return last_point
+
+    def show_go_to_kp_dialog(self):
+        if not self._reference_layer_ready():
+            self.iface.messageBar().pushMessage(
+                "Info",
+                "Go to KP is available after configuring a reference line layer.",
+                level=Qgis.Info,
+                duration=3,
+            )
+            self._update_go_to_kp_enabled()
+            return
+
+        kp_range = self._reference_kp_range()
+        if kp_range is None:
+            self.iface.messageBar().pushMessage(
+                "Warning",
+                "Reference layer is not ready. Please reconfigure.",
+                level=Qgis.Warning,
+                duration=3,
+            )
+            self._update_go_to_kp_enabled()
+            return
+
+        min_kp, max_kp = kp_range
+        initial = None
+        if self.mapTool is not None and getattr(self.mapTool, "last_chainage", None) is not None:
+            try:
+                initial = float(self.mapTool.last_chainage)
+            except Exception:
+                initial = None
+
+        dialog = GoToKPDialog(self.iface.mainWindow(), min_kp, max_kp, initial_kp_km=initial)
+        if dialog.exec_():
+            kp_km = dialog.chosen_kp_km()
+            if kp_km is None:
+                return
+
+            point = self._point_at_kp_km(float(kp_km))
+            if point is None:
+                QMessageBox.warning(
+                    self.iface.mainWindow(),
+                    "Go to KP",
+                    "Could not compute a point at that KP on the configured reference line.",
+                )
+                return
+
+            canvas = self.iface.mapCanvas()
+            canvas.setCenter(point)
+            canvas.refresh()
 
     def save_settings(self):
         """Save settings to QSettings."""
@@ -1516,6 +2187,11 @@ class KPMouseTool:
         settings.setValue("measurementUnit", self.measurementUnit)
         settings.setValue("showReverseKP", self.showReverseKP)
         settings.setValue("showDepth", self.showDepth)
+        settings.setValue("copyIncludeRKP", self.copyIncludeRKP)
+        settings.setValue("copyIncludeDCC", self.copyIncludeDCC)
+        settings.setValue("copyIncludeLatLon", self.copyIncludeLatLon)
+        settings.setValue("copyLatLonFormat", self.copyLatLonFormat)
+        settings.setValue("copyLatLonStyle", self.copyLatLonStyle)
         if self.depthLayer:
             settings.setValue("depthLayerId", self.depthLayer.id())
         else:
@@ -1531,6 +2207,12 @@ class KPMouseTool:
         self.measurementUnit = settings.value("measurementUnit", "km")
         self.showReverseKP = settings.value("showReverseKP", False, type=bool)
         self.showDepth = settings.value("showDepth", False, type=bool)
+        # New clipboard settings (default: only KP)
+        self.copyIncludeRKP = settings.value("copyIncludeRKP", False, type=bool)
+        self.copyIncludeDCC = settings.value("copyIncludeDCC", False, type=bool)
+        self.copyIncludeLatLon = settings.value("copyIncludeLatLon", False, type=bool)
+        self.copyLatLonFormat = str(settings.value("copyLatLonFormat", "DD") or "DD").upper()
+        self.copyLatLonStyle = str(settings.value("copyLatLonStyle", "LABELLED") or "LABELLED").upper()
         depth_layer_id = settings.value("depthLayerId")
         if depth_layer_id:
             self.depthLayer = QgsProject.instance().mapLayer(depth_layer_id)

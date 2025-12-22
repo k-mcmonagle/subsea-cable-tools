@@ -23,6 +23,8 @@ from qgis.core import (QgsProcessing,
                        QgsWkbTypes,
                        QgsDistanceArea)
 
+from ..kp_range_utils import extract_line_segment, measure_total_length_m
+
 class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
     INPUT_LAYER = 'INPUT_LAYER'
     INPUT_LINE = 'INPUT_LINE'
@@ -108,15 +110,7 @@ class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
         distance_calculator.setEllipsoid(context.project().ellipsoid())
 
         # Pre-calculate the total length of the line
-        total_length = 0
-        if not combined_geom.isEmpty():
-            if combined_geom.isMultipart():
-                parts = combined_geom.asMultiPolyline()
-            else:
-                parts = [combined_geom.asPolyline()]
-            for part in parts:
-                for i in range(len(part) - 1):
-                    total_length += distance_calculator.measureLine(part[i], part[i+1])
+        total_length = float(measure_total_length_m(combined_geom, distance_calculator))
         feedback.pushInfo(f"Total length of dissolved input line: {total_length} meters")
 
         input_features = list(input_layer.getFeatures())
@@ -136,11 +130,11 @@ class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
                 feedback.reportError(f"KP range {start_kp}-{end_kp} exceeds total line length of {total_length/1000:.2f} km. Skipping.")
                 continue
             
-            segment = self.extractLineSegment(combined_geom, start_kp, end_kp, distance_calculator, feedback)
-            
-            if segment:
+            seg_geom = extract_line_segment(combined_geom, start_kp, end_kp, distance_calculator)
+
+            if seg_geom and not seg_geom.isEmpty():
                 feat = QgsFeature(fields)
-                feat.setGeometry(QgsGeometry.fromPolyline(segment))
+                feat.setGeometry(seg_geom)
                 attributes = [start_kp, end_kp]
                 for field_name in additional_fields:
                     attributes.append(feature[field_name])
@@ -152,52 +146,6 @@ class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
                 feedback.reportError(f"Could not extract line segment for KP range {start_kp}-{end_kp}. Skipping.")
             feedback.setProgress(int((current + 1) / total_rows * 100))
         return {self.OUTPUT: dest_id}
-
-    def extractLineSegment(self, line_geometry, start_kp, end_kp, distance_calculator, feedback):
-        start_kp_m = start_kp * 1000
-        end_kp_m = end_kp * 1000
-
-        if line_geometry.isMultipart():
-            parts = line_geometry.asMultiPolyline()
-        else:
-            parts = [line_geometry.asPolyline()]
-
-        segment = []
-        cumulative_length = 0.0
-        start_found = False
-
-        for part in parts:
-            for i in range(len(part) - 1):
-                point1 = part[i]
-                point2 = part[i + 1]
-                segment_length = distance_calculator.measureLine(point1, point2)
-                next_cumulative_length = cumulative_length + segment_length
-
-                if not start_found and next_cumulative_length >= start_kp_m:
-                    ratio = (start_kp_m - cumulative_length) / segment_length
-                    start_point = QgsPoint(
-                        point1.x() + ratio * (point2.x() - point1.x()),
-                        point1.y() + ratio * (point2.y() - point1.y())
-                    )
-                    segment.append(start_point)
-                    start_found = True
-
-                if start_found:
-                    if next_cumulative_length <= end_kp_m:
-                        segment.append(QgsPoint(point2))
-                    else:
-                        ratio = (end_kp_m - cumulative_length) / segment_length
-                        end_point = QgsPoint(
-                            point1.x() + ratio * (point2.x() - point1.x()),
-                            point1.y() + ratio * (point2.y() - point1.y())
-                        )
-                        segment.append(end_point)
-                        return segment
-                
-                cumulative_length = next_cumulative_length
-                if cumulative_length >= end_kp_m:
-                    return segment
-        return segment if segment else None
 
     def shortHelpString(self):
         return self.tr("""

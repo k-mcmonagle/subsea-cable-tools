@@ -34,6 +34,7 @@ from .live_data.live_data_control_dialog import LiveDataControlDialog
 # Import the Catenary Calculator Dialog
 from .catenary_calculator_dialog import CatenaryCalculatorDialog
 from .maptools.transit_measure_tool import TransitMeasureTool
+from .sld_dockwidget import StraightLineDiagramDockWidget
 
 
 class SubseaCableTools:
@@ -86,6 +87,8 @@ class SubseaCableTools:
         self.live_data_action = None
         self.transit_measure_action = None
         self.transit_measure_tool = None
+        self.sld_dock = None
+        self.sld_action = None
 
     def tr(self, message):
         """Return the translation for a string."""
@@ -164,6 +167,14 @@ class SubseaCableTools:
         self.iface.addPluginToMenu(self.menu, self.transit_measure_action)
         self.actions.append(self.transit_measure_action)
 
+        # Straight Line Diagram (SLD) Tool action (uses plugin icon)
+        sld_icon = QIcon(":/plugins/subsea_cable_tools/icon.png")
+        self.sld_action = QAction(sld_icon, "SLD", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
+        self.sld_action.triggered.connect(self.show_sld)
+        self.iface.addToolBarIcon(self.sld_action)
+        self.iface.addPluginToMenu(self.menu, self.sld_action)
+        self.actions.append(self.sld_action)
+
     def show_catenary_calculator(self):
         if self.catenary_calculator_dialog is None:
             self.catenary_calculator_dialog = CatenaryCalculatorDialog(self.iface.mainWindow())
@@ -235,6 +246,28 @@ class SubseaCableTools:
             except Exception:
                 pass
             self.depth_profile_dock = None
+
+        # Clean up SLD dock
+        if hasattr(self, 'sld_dock') and self.sld_dock:
+            try:
+                if hasattr(self.sld_dock, 'cleanup_plot_and_marker'):
+                    self.sld_dock.cleanup_plot_and_marker()
+            except Exception:
+                pass
+            try:
+                if hasattr(self.sld_dock, 'cleanup_matplotlib_resources_on_close'):
+                    self.sld_dock.cleanup_matplotlib_resources_on_close()
+            except Exception:
+                pass
+            try:
+                self.iface.removeDockWidget(self.sld_dock)
+            except Exception:
+                pass
+            try:
+                self.sld_dock.deleteLater()
+            except Exception:
+                pass
+            self.sld_dock = None
 
         # Clean up live data manager dialog
         if hasattr(self, 'live_data_manager_dialog') and self.live_data_manager_dialog:
@@ -553,6 +586,13 @@ class SubseaCableTools:
         self.live_data_manager_dialog.show()
         self.live_data_manager_dialog.raise_()
         self.live_data_manager_dialog.activateWindow()
+
+    def show_sld(self):
+        """Show the Straight Line Diagram dock widget."""
+        if not self.sld_dock:
+            self.sld_dock = StraightLineDiagramDockWidget(self.iface)
+            self.iface.addDockWidget(Qt.RightDockWidgetArea, self.sld_dock)
+        self.sld_dock.show()
     
     def on_connect_requested(self, host: str, port: int):
         """Handle Connect button from control dialog."""
@@ -638,3 +678,9 @@ class SubseaCableTools:
         if self.transit_measure_tool is None:
             self.transit_measure_tool = TransitMeasureTool(self.iface)
         self.iface.mapCanvas().setMapTool(self.transit_measure_tool)
+        # If the tool is already active, QGIS may not call QgsMapTool.activate() again.
+        # Always ensure the dialog is shown when the toolbar/menu action is triggered.
+        try:
+            self.transit_measure_tool.show_dialog()
+        except Exception:
+            pass

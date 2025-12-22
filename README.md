@@ -23,6 +23,22 @@ Accessible via the QGIS Processing Toolbox under **Subsea Cable Tools**:
 ### 🗺️ Map & Dockable Tools
 - **KP Mouse Tool** – An interactive tool that provides the closest KP and DCC of the mouse pointer dynamically. Features a persistent tooltip, improved usability, and continuous KP calculation.
 - **KP Data Plotter** – New dockable tool for plotting KP-based data from table layers against a reference line, with interactive crosshair, map marker, support for multiple data fields, y-axis reversal, and tooltips.
+- **Straight Line Diagram (SLD)** – Dockable SLD plot for an RPL line + events layer with a synced map marker.
+- **SLD KP Ranges (NEW)** – Use a table layer of KP ranges as the single source of truth and visualise the same ranges on the SLD and on the map at the same time.
+
+#### SLD KP Ranges quick start
+1. Open the **Straight Line Diagram** dock.
+2. Select an **RPL Line Layer**.
+3. (Optional) Select an **RPL Points (Events) Layer** to show event ticks.
+4. Create or choose a **KP Ranges (Table) Layer**:
+	- Click **New ranges table** to create an editable in-memory ranges table, or
+	- Select an existing editable table layer (GeoPackage/SQLite recommended; CSV tables are typically not editable).
+5. Ensure your table has (or map fields to) **Start**, **End**, and **Ref line**.
+	- Ref line is used for traceability; ranges are filtered to the currently selected RPL line.
+6. Click **Ranges** to add/edit/delete ranges.
+7. Click **Draw SLD**.
+8. Toggle **Show ranges on map** to generate a derived line layer: **SLD KP Ranges (derived)**.
+9. Use **Save map ranges...** to export the derived layer (e.g. to GeoPackage).
 
 ---
 

@@ -76,10 +76,10 @@ class RPLRouteComparisonAlgorithm(QgsProcessingAlgorithm):
         return self.tr('Compare Design vs As-Laid Routes')
 
     def group(self):
-        return self.tr('RPL Comparison')
+        return self.tr('RPL Tools')
 
     def groupId(self):
-        return 'rpl_comparison'
+        return 'rpl_tools'
 
     def shortHelpString(self):
         return self.tr("""

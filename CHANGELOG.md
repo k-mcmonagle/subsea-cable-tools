@@ -9,20 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Live Data Tool:** New dockable tool for receiving and plotting real-time ship position data from a TCP server. Basic tool for now but would like to add live trend graphs and possibly use QGIS as client screens onboard.
 - **Plot Line Segments from Table:** New processing algorithm under "Other Tools" to create line segments from a table layer with start and end latitude/longitude columns. Optionally creates a point layer for the endpoints. All original attributes are preserved with a source_table field added.
+- **Extract A/C Points from RPL:** New processing algorithm to extract Alter Course points from an RPL line (including multi-feature routes), outputting KP, turn angle, and optional threshold/bin fields for easy symbology.
 - **RPL Route Comparison:** New processing algorithm to compare design vs as-laid RPL routes, calculating position offsets including radial, along-track, and cross-track distances.
 - **Translate KP Between RPLs (Points):** New processing algorithm to translate KP values from one RPL reference to another, creating corresponding points on the target RPL.
+- **Identify RPL Crossing Points:** New processing algorithm to find crossing points between an RPL line layer and one or more asset line layers. Outputs KP, lat/lon, relative crossing angle, and crossed asset attributes. Also supports optional buffer polygons around the crossed asset near each crossing.
+- **Identify RPL Area Listing.** New processing algorithm that takes input of an RPL line layer, and one or more polygon layers (e.g. seabed features, or hazard areas), and outputs a line layer traced over the RPL line with breaks at the edges of the polygon layer features. The polygon feature attributes are picked up by the new line layer and start and end KP are also included.
+- **Merge KP Range Tables:** New Processing tool under "KP Ranges" to combine two KP-range tables with mismatched intervals.
+  - Supports canonical segmentation (non-overlapping KP intervals), summarise (Table B values into Table A ranges with min/max/avg or aggregated single value), and a simple lookup mode (copy one field with overlap resolution rules).
+  - Includes overlap handling options (first/most-specific/min/max/mean/weighted-mean/error), optional full-coverage checks, and remembers last-used parameters between runs.
+- **Identify Hazards in Lay Corridor.** New XXXXXXXXXXXXXXXXXX 
 
 ### Changed
-- **KP Mouse Map Tool:** Improved to calculate KP based on geodetic measurements by default, with option for Cartesian calculations when the layer uses a projected CRS. Also added option to sample depth value at the mouse position from a raster or contour layer using right click.
+- **KP Mouse Map Tool:** Improved to calculate KP based on geodetic measurements by default, with option for Cartesian calculations when the layer uses a projected CRS. Also added option to sample depth value at the mouse position from a raster or contour layer using right click. Also added option to configure the copy to clipboard function. Also added a "Go to KP..." option in the dropdown
 - **Depth Profile tool:** Improved raster/contour inputs and performance for long routes.
   - Contours: second contour layer is now optional (works with 1 or 2 contour layers).
   - Rasters: supports selecting multiple raster layers; overlapping rasters prefer higher resolution first and missing coverage remains null with warnings.
   - Added Refresh control and live sample/probe estimate readout.
   - Added optional adaptive raster sampling (step derived from raster resolution along the route).
+- **Transit Measure Tool:** Added a Quick Buffer tool to apply a buffer to the route.
+- **Processing Toolbox Grouping:** Made some changes to the grouping to try to make it more intuitive.
 
 ### Fixed
 - Added option to invert slope angle/percentage calculation in Depth Profile tool, with default not inverted.
 - Fixed some cleanup issues with the transit measure tool.
+- Fixed an issue with the Nearest KP tool not working well with RPLs that have multisegment splits.
 
 ## [1.3.0] - 2025-09-06
 

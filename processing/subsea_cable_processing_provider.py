@@ -8,6 +8,7 @@ This provider loads processing algorithms for Subsea Cable Tools.
 from qgis.core import QgsProcessingProvider
 from .kp_range_highlighter_algorithm import KPRangeHighlighterAlgorithm
 from .kp_range_csv_algorithm import KPRangeCSVAlgorithm
+from .kp_range_merge_tables_algorithm import KPRangeMergeTablesAlgorithm
 from .import_excel_rpl_algorithm import ImportExcelRPLAlgorithm
 from .import_cable_lay_algorithm import ImportCableLayAlgorithm
 
@@ -25,6 +26,11 @@ from .plot_line_segments_from_table_algorithm import PlotLineSegmentsFromTableAl
 from .translate_kp_from_rpl_to_rpl_algorithm import TranslateKPFromRPLToRPLAlgorithm
 from .rpl_route_comparison_algorithm import RPLRouteComparisonAlgorithm
 from .seabed_length_algorithm import SeabedLengthAlgorithm
+from .extract_ac_points_algorithm import ExtractACPointsAlgorithm
+from .identify_rpl_crossing_points_algorithm import IdentifyRPLCrossingPointsAlgorithm
+from .dynamic_buffer_lay_corridor_algorithm import DynamicBufferLayCorridorAlgorithm
+from .identify_rpl_area_listing_algorithm import IdentifyRPLAreaListingAlgorithm
+from .identify_rpl_lay_corridor_proximity_listing_algorithm import IdentifyRPLLayCorridorProximityListingAlgorithm
 
 
 class SubseaCableProcessingProvider(QgsProcessingProvider):
@@ -41,6 +47,7 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
         print('Loading Subsea Cable Tools algorithms...')
         self.addAlgorithm(KPRangeHighlighterAlgorithm())
         self.addAlgorithm(KPRangeCSVAlgorithm())
+        self.addAlgorithm(KPRangeMergeTablesAlgorithm())
         self.addAlgorithm(ImportExcelRPLAlgorithm())
         self.addAlgorithm(NearestKPAlgorithm())
         self.addAlgorithm(ImportBathyMdbAlgorithm())
@@ -65,6 +72,17 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
         self.addAlgorithm(RPLRouteComparisonAlgorithm())
         print('Registering SeabedLengthAlgorithm...')
         self.addAlgorithm(SeabedLengthAlgorithm())
+        print('Registering DynamicBufferLayCorridorAlgorithm...')
+        self.addAlgorithm(DynamicBufferLayCorridorAlgorithm())
+        print('Registering ExtractACPointsAlgorithm...')
+        self.addAlgorithm(ExtractACPointsAlgorithm())
+        print('Registering IdentifyRPLCrossingPointsAlgorithm...')
+        self.addAlgorithm(IdentifyRPLCrossingPointsAlgorithm())
+        print('Registering IdentifyRPLAreaListingAlgorithm...')
+        self.addAlgorithm(IdentifyRPLAreaListingAlgorithm())
+        print('Registering IdentifyRPLLayCorridorProximityListingAlgorithm...')
+        self.addAlgorithm(IdentifyRPLLayCorridorProximityListingAlgorithm())
+
 
     def id(self):
         """

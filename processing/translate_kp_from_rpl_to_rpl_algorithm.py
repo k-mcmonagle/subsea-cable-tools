@@ -205,10 +205,10 @@ class TranslateKPFromRPLToRPLAlgorithm(QgsProcessingAlgorithm):
         return self.tr('Translate KP Between RPLs (Points)')
 
     def group(self):
-        return self.tr('RPL Comparison')
+        return self.tr('RPL Tools')
 
     def groupId(self):
-        return 'rpl_comparison'
+        return 'rpl_tools'
 
     def shortHelpString(self):
         return self.tr("""

@@ -578,10 +578,10 @@ This tool calculates the seabed (3D) length of RPL routes by sampling bathymetry
         return self.tr('Calculate Seabed Length')
 
     def group(self):
-        return self.tr('Other Tools')
+        return self.tr('RPL Tools')
 
     def groupId(self):
-        return 'other_tools'
+        return 'rpl_tools'
 
     def tr(self, string):
         return QCoreApplication.translate('SeabedLengthAlgorithm', string)

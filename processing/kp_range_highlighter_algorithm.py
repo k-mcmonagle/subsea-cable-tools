@@ -20,6 +20,8 @@ from qgis.core import (QgsProcessing,
                        QgsField,
                        QgsFields)
 
+from ..kp_range_utils import extract_line_segment
+
 class KPRangeHighlighterAlgorithm(QgsProcessingAlgorithm):
     """
     This algorithm highlights sections of an RPL line based on user-defined
@@ -114,54 +116,10 @@ class KPRangeHighlighterAlgorithm(QgsProcessingAlgorithm):
         start_kp_m = start_kp * 1000
         end_kp_m = end_kp * 1000
 
-        total_length = 0.0
-        segment = []
-        start_found = False
-        end_found = False
-
-        for part in line_parts:
-            for i in range(len(part) - 1):
-                point1 = part[i]
-                point2 = part[i + 1]
-
-                segment_length = distance_calculator.measureLine(point1, point2)
-                next_total_length = total_length + segment_length
-
-                if not start_found and next_total_length >= start_kp_m:
-                    # Interpolate start point
-                    ratio = (start_kp_m - total_length) / segment_length
-                    start_point = QgsPoint(
-                        point1.x() + ratio * (point2.x() - point1.x()),
-                        point1.y() + ratio * (point2.y() - point1.y())
-                    )
-                    segment.append(start_point)
-                    start_found = True
-
-                if start_found and not end_found:
-                    if next_total_length <= end_kp_m:
-                        segment.append(QgsPoint(point2))
-                    else:
-                        # Interpolate end point
-                        ratio = (end_kp_m - total_length) / segment_length
-                        end_point = QgsPoint(
-                            point1.x() + ratio * (point2.x() - point1.x()),
-                            point1.y() + ratio * (point2.y() - point1.y())
-                        )
-                        segment.append(end_point)
-                        end_found = True
-                        break
-
-                total_length = next_total_length
-
-                if end_found:
-                    break
-
-            if end_found:
-                break
-
-        if segment:
+        seg_geom = extract_line_segment(combined_geom, start_kp, end_kp, distance_calculator)
+        if seg_geom and not seg_geom.isEmpty():
             new_feature = QgsFeature(fields)
-            new_feature.setGeometry(QgsGeometry.fromPolyline(segment))
+            new_feature.setGeometry(seg_geom)
             # Set start_kp, end_kp, length_km, and custom_label if provided
             length_km = end_kp - start_kp
             attrs = [start_kp, end_kp, length_km]

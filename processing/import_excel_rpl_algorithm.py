@@ -130,11 +130,11 @@ class ImportExcelRPLAlgorithm(QgsProcessingAlgorithm):
         return self.tr('Import Excel RPL')
 
     def group(self):
-        # Place this algorithm in its own group called "RPL Import"
-        return self.tr('RPL Import')
+        # Place this algorithm in the "RPL Tools" group
+        return self.tr('RPL Tools')
 
     def groupId(self):
-        return 'rpl_import'
+        return 'rpl_tools'
 
     def shortHelpString(self):
         return self.tr("""

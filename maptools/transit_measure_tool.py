@@ -22,14 +22,15 @@ from qgis.PyQt.QtCore import Qt, QCoreApplication, QVariant
 from qgis.PyQt.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QDoubleSpinBox, QLineEdit, QTableWidget, QTableWidgetItem, QMessageBox,
-    QFileDialog, QTabWidget, QWidget
+    QFileDialog, QTabWidget, QWidget, QCheckBox, QFormLayout, QSpinBox
 )
 from qgis.PyQt.QtGui import QColor
 
 from qgis.core import (
     QgsProject, QgsPointXY, QgsDistanceArea, QgsWkbTypes,
     QgsGeometry, QgsVectorLayer, QgsFeature, QgsFields,
-    QgsField, QgsUnitTypes, Qgis
+    QgsField, QgsUnitTypes, Qgis, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
+    QgsFillSymbol, QgsSingleSymbolRenderer
 )
 from qgis.gui import QgsMapTool, QgsVertexMarker, QgsRubberBand
 
@@ -89,6 +90,14 @@ class TransitMeasureTool(QgsMapTool):
             self.dialog.continue_btn.setEnabled(False)
         # Reset active status for new drawing session
         self.dialog.active = True
+
+    def show_dialog(self):
+        """Show/raise the dialog even if this map tool is already active."""
+        if self.dialog is None:
+            self.dialog = TransitMeasureDialog(self.iface, self)
+        self.dialog.show()
+        self.dialog.raise_()
+        self.dialog.activateWindow()
 
     def deactivate(self):
         self.remove_vertex_marker()
@@ -273,6 +282,8 @@ class TransitMeasureDialog(QDialog):
         self.temp_rb.setColor(QColor(255, 170, 0))
         self.temp_rb.setWidth(2)
 
+        self.buffer_rb: Optional[QgsRubberBand] = None
+
         self._build_ui()
         self._refresh_unit_labels()
 
@@ -332,6 +343,51 @@ class TransitMeasureDialog(QDialog):
         self.waypoints_table.setSortingEnabled(False)
         waypoints_layout.addWidget(self.waypoints_table)
         self.tab_widget.addTab(self.waypoints_tab, tr("Waypoints"))
+
+        # Quick Buffer Tab
+        self.buffer_tab = QWidget()
+        buffer_layout = QVBoxLayout(self.buffer_tab)
+        buffer_form = QFormLayout()
+        self.buffer_enable_chk = QCheckBox(tr("Show buffer preview"))
+        self.buffer_enable_chk.setChecked(False)
+        self.buffer_enable_chk.toggled.connect(self._on_buffer_settings_changed)
+        buffer_form.addRow(self.buffer_enable_chk)
+
+        self.buffer_dist_m_spin = QDoubleSpinBox()
+        self.buffer_dist_m_spin.setDecimals(2)
+        self.buffer_dist_m_spin.setMinimum(0.0)
+        self.buffer_dist_m_spin.setMaximum(1_000_000.0)
+        self.buffer_dist_m_spin.setSingleStep(1.0)
+        self.buffer_dist_m_spin.setValue(50.0)
+        self.buffer_dist_m_spin.valueChanged.connect(self._on_buffer_settings_changed)
+        buffer_form.addRow(tr("Distance (m):"), self.buffer_dist_m_spin)
+
+        self.buffer_segments_spin = QSpinBox()
+        self.buffer_segments_spin.setMinimum(4)
+        self.buffer_segments_spin.setMaximum(64)
+        self.buffer_segments_spin.setSingleStep(1)
+        self.buffer_segments_spin.setValue(16)
+        self.buffer_segments_spin.valueChanged.connect(self._on_buffer_settings_changed)
+        buffer_form.addRow(tr("Segments:"), self.buffer_segments_spin)
+
+        self.buffer_cap_combo = QComboBox()
+        self.buffer_cap_combo.addItem(tr("Round"), QgsGeometry.CapRound)
+        self.buffer_cap_combo.addItem(tr("Flat"), QgsGeometry.CapFlat)
+        self.buffer_cap_combo.addItem(tr("Square"), QgsGeometry.CapSquare)
+        self.buffer_cap_combo.currentIndexChanged.connect(self._on_buffer_settings_changed)
+        buffer_form.addRow(tr("End cap:"), self.buffer_cap_combo)
+
+        self.buffer_join_combo = QComboBox()
+        self.buffer_join_combo.addItem(tr("Round"), QgsGeometry.JoinStyleRound)
+        self.buffer_join_combo.addItem(tr("Miter"), QgsGeometry.JoinStyleMiter)
+        self.buffer_join_combo.addItem(tr("Bevel"), QgsGeometry.JoinStyleBevel)
+        self.buffer_join_combo.currentIndexChanged.connect(self._on_buffer_settings_changed)
+        buffer_form.addRow(tr("Join style:"), self.buffer_join_combo)
+
+        buffer_layout.addLayout(buffer_form)
+        buffer_layout.addStretch()
+        self.tab_widget.addTab(self.buffer_tab, tr("Quick Buffer"))
+
         layout.addWidget(self.tab_widget)
         totals_row = QHBoxLayout()
         totals_row.addWidget(QLabel(tr("Total Distance:")))
@@ -393,6 +449,7 @@ class TransitMeasureDialog(QDialog):
         self.create_layer_btn.setEnabled(True)
         self.export_csv_btn.setEnabled(True)
         self._update_totals()
+        self._update_buffer_preview(include_motion=False)
         # Append waypoint for the last point
         last_idx = len(self.points) - 1
         bearing_next = h1 if last_idx > 0 else None
@@ -411,6 +468,7 @@ class TransitMeasureDialog(QDialog):
         self._update_motion_row(dist_m, h1, h2)
         self._update_temp_line(p1, pt, dist_m)
         self._update_totals()
+        self._update_buffer_preview(include_motion=True, motion_pt=pt)
 
     def highlight_waypoint(self, idx: int):
         """Highlight the waypoint at the given index."""
@@ -477,6 +535,7 @@ class TransitMeasureDialog(QDialog):
         
         # Update line rubber bands
         self._update_line_rubber_bands()
+        self._update_buffer_preview(include_motion=False)
 
     def delete_waypoint(self, idx: int):
         """Delete a waypoint and recalculate segments."""
@@ -508,6 +567,7 @@ class TransitMeasureDialog(QDialog):
         
         # Clear any highlight
         self.clear_waypoint_highlight()
+        self._update_buffer_preview(include_motion=False)
 
     def _recalculate_segments(self):
         """Recalculate all distances and headings based on current points."""
@@ -564,6 +624,7 @@ class TransitMeasureDialog(QDialog):
         self.status_label.setStyleSheet("font-style: italic; color: #666;")
         self.continue_btn.setEnabled(True)
         self._update_totals()
+        self._update_buffer_preview(include_motion=False)
 
     def continue_drawing(self):
         """Resume drawing mode to add more waypoints."""
@@ -576,6 +637,7 @@ class TransitMeasureDialog(QDialog):
         self.motion_distance_m = 0.0
         self.motion_heading_fwd = None
         self.motion_heading_rev = None
+        self._update_buffer_preview(include_motion=False)
 
     def new_path(self):
         self.points = []
@@ -592,6 +654,7 @@ class TransitMeasureDialog(QDialog):
         self.point_rb.reset(QgsWkbTypes.PointGeometry)
         self.line_rb.reset(QgsWkbTypes.LineGeometry)
         self.temp_rb.reset(QgsWkbTypes.LineGeometry)
+        self._reset_buffer_rb()
         self.clear_waypoint_highlight()
         self.create_layer_btn.setEnabled(False)
         self.export_csv_btn.setEnabled(False)
@@ -965,6 +1028,51 @@ class TransitMeasureDialog(QDialog):
         """Create both the transit measurement layer and waypoints layer."""
         self.save_layer()
         self.create_waypoints_layer()
+        self.create_buffer_layer_if_enabled()
+
+    def create_buffer_layer_if_enabled(self):
+        """Create a polygon buffer layer if the Quick Buffer preview is enabled."""
+        if not self._buffer_preview_enabled():
+            return
+        if len(self.points) < 2:
+            return
+
+        buffer_geom = self._compute_buffer_geometry_for_points(self.points)
+        if buffer_geom is None or buffer_geom.isEmpty():
+            return
+
+        proj = QgsProject.instance()
+        layer = QgsVectorLayer(f"Polygon?crs={proj.crs().authid()}", tr("Quick Buffer"), "memory")
+        fields = QgsFields()
+        fields.append(QgsField("buffer_m", QVariant.Double))
+        fields.append(QgsField("segments", QVariant.Int))
+        fields.append(QgsField("cap", QVariant.String))
+        fields.append(QgsField("join", QVariant.String))
+        layer.dataProvider().addAttributes(fields)
+        layer.updateFields()
+
+        feat = QgsFeature(layer.fields())
+        feat.setAttribute("buffer_m", float(self.buffer_dist_m_spin.value()))
+        feat.setAttribute("segments", int(self.buffer_segments_spin.value()))
+        feat.setAttribute("cap", str(self.buffer_cap_combo.currentText()))
+        feat.setAttribute("join", str(self.buffer_join_combo.currentText()))
+        feat.setGeometry(buffer_geom)
+        layer.dataProvider().addFeature(feat)
+        layer.updateExtents()
+
+        # Style: outline like preview; keep fill transparent to avoid obscuring map.
+        stroke = QColor(255, 170, 0)
+        fill = QColor(255, 170, 0)
+        fill.setAlpha(0)  # outline-only by default
+        symbol = QgsFillSymbol.createSimple({
+            'color': f"{fill.red()},{fill.green()},{fill.blue()},{fill.alpha()}",
+            'outline_color': f"{stroke.red()},{stroke.green()},{stroke.blue()},{stroke.alpha()}",
+            'outline_width': '0.6'
+        })
+        layer.setRenderer(QgsSingleSymbolRenderer(symbol))
+
+        QgsProject.instance().addMapLayer(layer)
+        self.iface.messageBar().pushMessage("", tr("Quick buffer layer added."), level=Qgis.Info, duration=4)
 
     def _cleanup_rubber_bands(self):
         """Clean up all rubber band objects and clear drawing from map."""
@@ -989,16 +1097,157 @@ class TransitMeasureDialog(QDialog):
         except Exception:
             pass
 
+        try:
+            self._reset_buffer_rb()
+        except Exception:
+            pass
+
+    def _ensure_buffer_rb(self) -> QgsRubberBand:
+        if self.buffer_rb is None:
+            rb = QgsRubberBand(self.canvas, QgsWkbTypes.PolygonGeometry)
+            stroke = QColor(255, 170, 0)
+            fill = QColor(255, 170, 0)
+            fill.setAlpha(40)
+            rb.setColor(stroke)
+            if hasattr(rb, 'setFillColor'):
+                rb.setFillColor(fill)
+            rb.setWidth(1)
+            self.buffer_rb = rb
+        return self.buffer_rb
+
+    def _reset_buffer_rb(self):
+        if self.buffer_rb is not None:
+            self.buffer_rb.reset(QgsWkbTypes.PolygonGeometry)
+
+    def _on_buffer_settings_changed(self, *args):
+        enabled = getattr(self, 'buffer_enable_chk', None)
+        if enabled is not None and not self.buffer_enable_chk.isChecked():
+            self._reset_buffer_rb()
+            return
+        self._update_buffer_preview(include_motion=False)
+
+    def _buffer_preview_enabled(self) -> bool:
+        return hasattr(self, 'buffer_enable_chk') and self.buffer_enable_chk.isChecked()
+
+    def _polyline_for_current_state(self, include_motion: bool, motion_pt: Optional[QgsPointXY]) -> Optional[QgsGeometry]:
+        if not self.points or len(self.points) < 2:
+            return None
+        pts: List[QgsPointXY] = list(self.points)
+        if include_motion and motion_pt is not None and (not pts or motion_pt != pts[-1]):
+            pts = pts + [motion_pt]
+        if len(pts) < 2:
+            return None
+        return QgsGeometry.fromPolylineXY(pts)
+
+    def _points_for_current_state(self, include_motion: bool, motion_pt: Optional[QgsPointXY]) -> List[QgsPointXY]:
+        pts: List[QgsPointXY] = list(self.points)
+        if include_motion and motion_pt is not None and pts and motion_pt != pts[-1]:
+            pts.append(motion_pt)
+        return pts
+
+    def _compute_buffer_geometry_for_points(self, pts: List[QgsPointXY]) -> Optional[QgsGeometry]:
+        """Compute a buffer polygon geometry (in project CRS) from a list of points."""
+        if pts is None or len(pts) < 2:
+            return None
+
+        dist_m = float(self.buffer_dist_m_spin.value()) if hasattr(self, 'buffer_dist_m_spin') else 0.0
+        if dist_m <= 0:
+            return None
+
+        geom = QgsGeometry.fromPolylineXY(pts)
+        if geom is None or geom.isEmpty():
+            return None
+
+        proj = QgsProject.instance()
+        src_crs = proj.crs()
+        if self._is_project_units_meters(src_crs):
+            target_crs = src_crs
+        else:
+            target_crs = self._utm_crs_for_geom(geom)
+
+        if target_crs is None or not target_crs.isValid():
+            return None
+
+        try:
+            if target_crs.authid() != src_crs.authid():
+                to_target = QgsCoordinateTransform(src_crs, target_crs, proj.transformContext())
+                geom_target = QgsGeometry(geom)
+                geom_target.transform(to_target)
+            else:
+                geom_target = geom
+
+            segments = int(self.buffer_segments_spin.value()) if hasattr(self, 'buffer_segments_spin') else 16
+            cap = self.buffer_cap_combo.currentData() if hasattr(self, 'buffer_cap_combo') else QgsGeometry.CapRound
+            join = self.buffer_join_combo.currentData() if hasattr(self, 'buffer_join_combo') else QgsGeometry.JoinStyleRound
+            buf = geom_target.buffer(dist_m, segments, cap, join, 2.0)
+            if buf is None or buf.isEmpty():
+                return None
+
+            if target_crs.authid() != src_crs.authid():
+                to_src = QgsCoordinateTransform(target_crs, src_crs, proj.transformContext())
+                buf.transform(to_src)
+
+            return buf
+        except Exception:
+            return None
+
+    def _is_project_units_meters(self, crs: QgsCoordinateReferenceSystem) -> bool:
+        try:
+            return crs.isValid() and crs.mapUnits() == QgsUnitTypes.DistanceMeters
+        except Exception:
+            return False
+
+    def _utm_crs_for_geom(self, geom: QgsGeometry) -> Optional[QgsCoordinateReferenceSystem]:
+        try:
+            wgs84 = QgsCoordinateReferenceSystem('EPSG:4326')
+            proj = QgsProject.instance()
+            src = proj.crs()
+            if not (src and src.isValid()):
+                return None
+            centroid = geom.centroid().asPoint()
+            tx = QgsCoordinateTransform(src, wgs84, proj.transformContext())
+            ll = tx.transform(centroid)
+            lon = ll.x(); lat = ll.y()
+            if lat < -80.0 or lat > 84.0:
+                return QgsCoordinateReferenceSystem('EPSG:3857')
+            zone = int(math.floor((lon + 180.0) / 6.0) + 1)
+            zone = max(1, min(60, zone))
+            epsg = (32600 + zone) if lat >= 0 else (32700 + zone)
+            return QgsCoordinateReferenceSystem(f'EPSG:{epsg}')
+        except Exception:
+            return None
+
+    def _update_buffer_preview(self, include_motion: bool, motion_pt: Optional[QgsPointXY] = None):
+        if not self._buffer_preview_enabled():
+            return
+        if len(self.points) < 2:
+            self._reset_buffer_rb()
+            return
+
+        try:
+            pts = self._points_for_current_state(include_motion, motion_pt)
+            poly = self._compute_buffer_geometry_for_points(pts)
+            if poly is None or poly.isEmpty():
+                self._reset_buffer_rb()
+                return
+
+            rb = self._ensure_buffer_rb()
+            rb.setToGeometry(poly, None)
+        except Exception:
+            self._reset_buffer_rb()
+
     def closeEvent(self, evt):
-        """Handle dialog close event - hides dialog and clears drawing without destroying it."""
+        """Handle dialog close event - hide dialog and clear drawing without destroying it."""
         try:
             self._cleanup_rubber_bands()
         except Exception:
             pass
-        
-        # Hide the dialog but don't destroy it - it can be shown again
+
+        # Important: ignore the close so the dialog instance stays reusable.
+        # (Toolbar action can then re-show it reliably.)
+        self.hide()
         if evt is not None:
-            evt.accept()  # Allow the window to close (hide)
+            evt.ignore()
 
     def reject(self):
         """Handle dialog rejection (X button) - same as close."""
@@ -1006,8 +1255,8 @@ class TransitMeasureDialog(QDialog):
             self._cleanup_rubber_bands()
         except Exception:
             pass
-        
-        super().reject()
+
+        self.hide()
 
     def _time_unit(self):
         return TIME_UNITS[self.time_unit_combo.currentIndex()][1]

@@ -20,8 +20,13 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas, NavigationToolbar2QT as NavigationToolbar
 
 # Simple sip deletion check fallback
-def _sip_isdeleted(obj):  # pragma: no cover
-    return False
+try:  # sip is available in QGIS Python env; guard for static analysis
+    import sip  # type: ignore
+
+    _sip_isdeleted = sip.isdeleted
+except Exception:  # pragma: no cover
+    def _sip_isdeleted(_obj):
+        return False
 
 
 class DepthProfileDockWidget(QDockWidget):
@@ -31,6 +36,8 @@ class DepthProfileDockWidget(QDockWidget):
         self.setObjectName("DepthProfileDockWidget")
         self.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea | Qt.BottomDockWidgetArea)
         self.settings = QSettings()
+        self._closing = False
+        self._project_signals_connected = False
         # Internal runtime state
         self.line_parts = []
         self.line_length = 0.0
@@ -383,7 +390,26 @@ class DepthProfileDockWidget(QDockWidget):
         self.populate_layer_combos(); self.update_enable_states()
         self.update_sample_estimate()
         # Project/layer signals: use a debounced scheduler so rapid batch adds only trigger one refresh
-        self.iface.projectRead.connect(self.populate_layer_combos)
+        self._connect_project_signals()
+        # Dock placement (only once)
+        try:
+            main_win = self.iface.mainWindow(); main_win.removeDockWidget(self); main_win.addDockWidget(Qt.BottomDockWidgetArea, self)
+        except Exception:
+            pass
+
+        # When dock becomes visible, refresh layer lists (helps when layers are added while dock is open)
+        try:
+            self.visibilityChanged.connect(lambda vis: self.schedule_layer_combo_refresh(delay_ms=0) if vis else None)
+        except Exception:
+            pass
+
+    def _connect_project_signals(self):
+        if self._project_signals_connected:
+            return
+        try:
+            self.iface.projectRead.connect(self.populate_layer_combos)
+        except Exception:
+            pass
         proj = QgsProject.instance()
         try:
             proj.layerWasAdded.connect(self.on_layer_event)
@@ -401,20 +427,54 @@ class DepthProfileDockWidget(QDockWidget):
             proj.layersRemoved.connect(self.on_layer_event)
         except Exception:
             pass
-        # Dock placement (only once)
-        try:
-            main_win = self.iface.mainWindow(); main_win.removeDockWidget(self); main_win.addDockWidget(Qt.BottomDockWidgetArea, self)
-        except Exception:
-            pass
+        self._project_signals_connected = True
 
-        # When dock becomes visible, refresh layer lists (helps when layers are added while dock is open)
+    def _disconnect_project_signals(self):
+        if not self._project_signals_connected:
+            return
         try:
-            self.visibilityChanged.connect(lambda vis: self.schedule_layer_combo_refresh(delay_ms=0) if vis else None)
+            self.iface.projectRead.disconnect(self.populate_layer_combos)
         except Exception:
             pass
+        try:
+            QgsProject.instance().layerWasAdded.disconnect(self.on_layer_event)
+        except Exception:
+            pass
+        try:
+            QgsProject.instance().layersRemoved.disconnect(self.on_layer_event)
+        except Exception:
+            pass
+        try:
+            QgsProject.instance().layersAdded.disconnect(self.on_layers_added)
+        except Exception:
+            pass
+        try:
+            QgsProject.instance().layerRemoved.disconnect(self.on_layer_event)
+        except Exception:
+            pass
+        self._project_signals_connected = False
+
+    def showEvent(self, event):
+        # When a dock is closed and later shown again, make sure it can refresh safely.
+        self._closing = False
+        self._connect_project_signals()
+        try:
+            self.schedule_layer_combo_refresh(delay_ms=0)
+        except Exception:
+            pass
+        super().showEvent(event)
 
     # ---------------------- UI population ----------------------
     def populate_layer_combos(self):
+        # Guard against late calls after close (e.g., debounced QTimer callbacks)
+        try:
+            if getattr(self, '_closing', False):
+                return
+            if getattr(self, 'line_layer_combo', None) is None or _sip_isdeleted(self.line_layer_combo):
+                return
+        except Exception:
+            return
+
         prev_line = self.line_layer_combo.currentData()
         prev_rasters = set(self._get_selected_raster_layer_ids())
         prev_contour = self.contour_layer_combo.currentData()
@@ -494,6 +554,15 @@ class DepthProfileDockWidget(QDockWidget):
             self.depth_field_combo2.setEnabled(False)
 
     def update_enable_states(self):
+        # Guard against late calls after close (signals/timers)
+        try:
+            if getattr(self, '_closing', False):
+                return
+            if getattr(self, 'use_drawn_chk', None) is None or _sip_isdeleted(self.use_drawn_chk):
+                return
+        except Exception:
+            return
+
         raster_mode = self.source_type_combo.currentText() == "Raster"
         self.raster_layer_list.setEnabled(raster_mode)
         self.interval_spin.setEnabled(raster_mode)
@@ -686,6 +755,14 @@ class DepthProfileDockWidget(QDockWidget):
         self._pending_layer_refresh = True
         def _do():
             try:
+                # Widget may have been closed/deleted before the timer fires
+                try:
+                    if getattr(self, '_closing', False):
+                        return
+                    if getattr(self, 'line_layer_combo', None) is None or _sip_isdeleted(self.line_layer_combo):
+                        return
+                except Exception:
+                    return
                 self.populate_layer_combos()
             finally:
                 self._pending_layer_refresh = False
@@ -2322,6 +2399,11 @@ class DepthProfileDockWidget(QDockWidget):
         self.iface.messageBar().pushMessage("Depth Profile", "Temporary line cleared", level=0, duration=2)
 
     def closeEvent(self, event):  # noqa
+        self._closing = True
+        try:
+            self._pending_layer_refresh = False
+        except Exception:
+            pass
         self.clear_plot()
         # ensure temp line rubber removed
         try:
@@ -2335,26 +2417,7 @@ class DepthProfileDockWidget(QDockWidget):
         except Exception:
             pass
         self.temp_line_rubber = None
-        try:
-            self.iface.projectRead.disconnect(self.populate_layer_combos)
-        except Exception:
-            pass
-        try:
-            QgsProject.instance().layerWasAdded.disconnect(self.on_layer_event)
-        except Exception:
-            pass
-        try:
-            QgsProject.instance().layersRemoved.disconnect(self.on_layer_event)
-        except Exception:
-            pass
-        try:
-            QgsProject.instance().layersAdded.disconnect(self.on_layers_added)
-        except Exception:
-            pass
-        try:
-            QgsProject.instance().layerRemoved.disconnect(self.on_layer_event)
-        except Exception:
-            pass
+        self._disconnect_project_signals()
         super().closeEvent(event)
 
     def cleanup_matplotlib_resources_on_close(self):
