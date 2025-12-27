@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.4.0] - 2025-10-10
 ### Added
 - **Live Data Tool:** New dockable tool for receiving and plotting real-time ship position data from a TCP server. Basic tool for now but would like to add live trend graphs and possibly use QGIS as client screens onboard.
+- **Catenary Calculator v2 (Experimental):** Added an updated/alternative catenary calculator dialog (v2). Experimental for now and still in testing.
 - **Plot Line Segments from Table:** New processing algorithm under "Other Tools" to create line segments from a table layer with start and end latitude/longitude columns. Optionally creates a point layer for the endpoints. All original attributes are preserved with a source_table field added.
 - **Extract A/C Points from RPL:** New processing algorithm to extract Alter Course points from an RPL line (including multi-feature routes), outputting KP, turn angle, and optional threshold/bin fields for easy symbology.
 - **RPL Route Comparison:** New processing algorithm to compare design vs as-laid RPL routes, calculating position offsets including radial, along-track, and cross-track distances.
@@ -17,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Merge KP Range Tables:** New Processing tool under "KP Ranges" to combine two KP-range tables with mismatched intervals.
   - Supports canonical segmentation (non-overlapping KP intervals), summarise (Table B values into Table A ranges with min/max/avg or aggregated single value), and a simple lookup mode (copy one field with overlap resolution rules).
   - Includes overlap handling options (first/most-specific/min/max/mean/weighted-mean/error), optional full-coverage checks, and remembers last-used parameters between runs.
+- **KP Range Depth + Slope Summary:** New Processing tool under "KP Ranges" to sample bathymetry along KP-range line features and append summary fields.
+  - Supports Raster(s) (prefers highest resolution where rasters overlap) or 1–2 Contour layers (minor/major) with selectable depth fields.
+  - Outputs depth min/max/avg, along-route slope min/max/avg, and cross-track (side slope) min/max/avg.
+  - Includes optional adaptive raster sampling (step derived from raster resolution along the route) and optional directional extremes (up/down, port/stbd).
 - **Identify Hazards in Lay Corridor.** New XXXXXXXXXXXXXXXXXX 
 
 ### Changed

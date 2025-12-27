@@ -33,6 +33,7 @@ from .live_data.live_data_table_dockwidget import LiveDataTableDockWidget
 from .live_data.live_data_control_dialog import LiveDataControlDialog
 # Import the Catenary Calculator Dialog
 from .catenary_calculator_dialog import CatenaryCalculatorDialog
+from .catenary_calculator_v2_dialog import CatenaryCalculatorV2Dialog
 from .maptools.transit_measure_tool import TransitMeasureTool
 from .sld_dockwidget import StraightLineDiagramDockWidget
 
@@ -77,6 +78,8 @@ class SubseaCableTools:
         self.plotter_action = None
         self.catenary_action = None
         self.catenary_calculator_dialog = None
+        self.catenary_v2_action = None
+        self.catenary_calculator_v2_dialog = None
         self.depth_profile_dock = None
         self.depth_profile_action = None
         self.live_data_manager_dialog = None
@@ -154,6 +157,16 @@ class SubseaCableTools:
         self.iface.addPluginToMenu(self.menu, self.catenary_action)
         self.actions.append(self.catenary_action)
 
+        # Add action for Catenary Calculator V2
+        icon_v2_path = os.path.join(self.plugin_dir, 'catenary_v2_icon.png')
+        if not os.path.exists(icon_v2_path):
+            icon_v2_path = os.path.join(self.plugin_dir, 'catenary_icon.png') # Fallback
+        self.catenary_v2_action = QAction(QIcon(icon_v2_path), "Catenary Calculator V2", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
+        self.catenary_v2_action.triggered.connect(self.show_catenary_calculator_v2)
+        self.iface.addToolBarIcon(self.catenary_v2_action)
+        self.iface.addPluginToMenu(self.menu, self.catenary_v2_action)
+        self.actions.append(self.catenary_v2_action)
+
         # Transit Measure Tool action
         transit_icon_path = os.path.join(self.plugin_dir, 'transit_measure_icon.png')
         if os.path.exists(transit_icon_path):
@@ -181,6 +194,15 @@ class SubseaCableTools:
         self.catenary_calculator_dialog.show()
         self.catenary_calculator_dialog.raise_()
         self.catenary_calculator_dialog.activateWindow()
+
+        self.first_start = True
+
+    def show_catenary_calculator_v2(self):
+        if self.catenary_calculator_v2_dialog is None:
+            self.catenary_calculator_v2_dialog = CatenaryCalculatorV2Dialog(self.iface.mainWindow())
+        self.catenary_calculator_v2_dialog.show()
+        self.catenary_calculator_v2_dialog.raise_()
+        self.catenary_calculator_v2_dialog.activateWindow()
 
         self.first_start = True
 
@@ -422,6 +444,12 @@ class SubseaCableTools:
         # Remove dialog reference
         if hasattr(self, 'dlg'):
             self.dlg = None
+
+        if hasattr(self, 'catenary_calculator_dialog'):
+            self.catenary_calculator_dialog = None
+
+        if hasattr(self, 'catenary_calculator_v2_dialog'):
+            self.catenary_calculator_v2_dialog = None
 
         # Remove menu reference
         if hasattr(self, 'menu'):

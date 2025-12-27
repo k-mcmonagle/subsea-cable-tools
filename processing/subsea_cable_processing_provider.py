@@ -31,6 +31,7 @@ from .identify_rpl_crossing_points_algorithm import IdentifyRPLCrossingPointsAlg
 from .dynamic_buffer_lay_corridor_algorithm import DynamicBufferLayCorridorAlgorithm
 from .identify_rpl_area_listing_algorithm import IdentifyRPLAreaListingAlgorithm
 from .identify_rpl_lay_corridor_proximity_listing_algorithm import IdentifyRPLLayCorridorProximityListingAlgorithm
+from .kp_range_depth_slope_summary_algorithm import KPRangeDepthSlopeSummaryAlgorithm
 
 
 class SubseaCableProcessingProvider(QgsProcessingProvider):
@@ -48,6 +49,7 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
         self.addAlgorithm(KPRangeHighlighterAlgorithm())
         self.addAlgorithm(KPRangeCSVAlgorithm())
         self.addAlgorithm(KPRangeMergeTablesAlgorithm())
+        self.addAlgorithm(KPRangeDepthSlopeSummaryAlgorithm())
         self.addAlgorithm(ImportExcelRPLAlgorithm())
         self.addAlgorithm(NearestKPAlgorithm())
         self.addAlgorithm(ImportBathyMdbAlgorithm())

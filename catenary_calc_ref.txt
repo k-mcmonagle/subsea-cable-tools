@@ -1,0 +1,1162 @@
+Journal of
+Marine Science 
+and Engineering
+Article
+AnAnalysis Tool for the Installation of Submarine
+Cables in an S-Lay Configuration Including “In and
+Out of Water” Cable Segments
+Vasileios A. Mamatsopoulos 1,2, Constantine Michailides 1,* and Efstathios E. Theotokoglou 3
+1
+2
+3
+*
+Department of Civil Engineering and Geomatics, Cyprus University of Technology, Limassol 3036, Cyprus;
+va.mamatsopoulos@edu.cut.ac.cy
+C.D.C. Construction Company, Athens TX 75752, Greece
+Department of Mechanics, National Technical University of Athens, Athens GR 15773, Greece;
+stathis@central.ntua.gr
+Correspondence: c.michailides@cut.ac.cy; Tel.: +357-2500-2396
+Received: 30 November 2019; Accepted: 14 January 2020; Published: 16 January 2020
+Abstract: Today, the offshore oil and gas and wind power industry is a heavily regulated segment,
+and current standards have established restrictions which yield a very limited weather window for
+submarine cable installations due to experience with cable failure in bad weather. There are two main
+limiting factors in current practice during cable installation of an S-lay configuration: the design
+criterion for the minimum allowable radius of curvature in the touch down point and the avoidance of
+axial compression in the touch down zone. Accurate assessment of the cable integrity during offshore
+installation has drawn great attention and is related to the existing available analysis and design
+tools. The main purpose of this paper is to develop and propose a quick and easy custom-made
+analysis tool, which is able to export similar results as sophisticated finite element analysis software.
+The developed tool utilizes analytical equations of a catenary-type submarine structure extended to
+account for varying cross-sections with different weights and/or stiffnesses, as is the real practice. A
+comparative study is presented in this paper to evaluate the significance for the modeling of the “out
+of water” cable segment required for accurate safety factor quantification during a laying operation.
+The efficiency and accuracy of the proposed tool are proven through a validation study comparing
+the results and the computational effort and time with commercial finite element analysis software.
+The analysis error in the case of not modeling the “out of water” cable part is significant, especially in
+shallow water areas, which proves the importance of using the proposed analysis tool.
+Keywords: submarine cable; S-lay cable installation analysis; touch down point (TDP); minimum
+bending radius (MBR); bottom tension; catenary theory
+1. Introduction
+A submarine cable is a crucial connection between onshore/offshore topside facilities and/or
+equipment located on the seabed. The cable normally consists of both a dynamic and a static part
+during the installation period. The static part is laid by the cable lay vessel (CLV) and is located on the
+seabed under stable environmental conditions, while the dynamic part hangs freely from the onboard
+vessel’s equipment (tensioner and overboard chutes). The dynamic part is subjected to loading due to
+vessel motions and environmental loads. The touch down zone (TDZ), which is the zone where the
+cable first hits the seabed, is critical with respect to failure of the cable during installation. This region
+maybeexposed to severe curvature and axial compression, which may result in local buckling inside
+the cross-section that causes the cross-section to be unstable in torsion, global loop formation, or a
+combination of those that may finally result in capacity failure [1]. The current practice is to avoid
+J. Mar. Sci. Eng. 2020, 8, 48; doi:10.3390/jmse8010048
+www.mdpi.com/journal/jmse
+J. Mar. Sci. Eng. 2020, 8, x FOR PEER REVIEW 
+2 of 18
+2 of 18 
+J. Mar. Sci. Eng. 2020, 8, 48
+the occurrence of compression at the TDZ to eliminate any possibility of cable failure. Although it is
+not always clear how much submarine composite cables can be compressed before their integrity is
+compromised, cable manufacturers are often reluctant to allow significant cable compression. However,
+in local buckling inside the cross-section that causes the cross-section to be unstable in torsion, global 
+loop formation, or a combination of those that may finally result in capacity failure [1]. The current 
+practice is to avoid the occurrence of compression at the TDZ to eliminate any possibility of cable 
+failure. Although it is not always clear how much submarine composite cables can be compressed 
+before their integrity is compromised, cable manufacturers are often reluctant to allow significant 
+cable compression. However, this restricts the weather window for the laying operation since the 
+dynamic responses of the CLV, especially the motions along the cable axis (surging of the CLV), 
+significantly affect the axial force applied to the cable during installation. The limited weather 
+window results in high installation costs. It is therefore of great interest to investigate various 
+installation scenarios and propose an efficient analysis tool for cable installers in order to accurately 
+analyze/monitor the cable laying operation with the aim of eliminating the CLV idle time. 
+this restricts the weather window for the laying operation since the dynamic responses of the CLV,
+especially the motions along the cable axis (surging of the CLV), significantly affect the axial force
+applied to the cable during installation. The limited weather window results in high installation costs.
+It is therefore of great interest to investigate various installation scenarios and propose an efficient
+analysis tool for cable installers in order to accurately analyze/monitor the cable laying operation with
+the aim of eliminating the CLV idle time.
+Offshore cable installation is a complex task [2]. In the planning phase, an installation analysis
+needs to be performed, which considers factors such as the cable properties, route characteristics,
+available installation equipment, and capacities of the cable installer [3]. Figure 1 shows some of the
+most influential parameters in an installation operation [4]. The departure angle is the complimentary
+angle of the cable exit angle at the overboard chute of the CLV (departure angle = 90 deg-exit angle).
+Offshore cable installation is a complex task [2]. In the planning phase, an installation analysis 
+needs to be performed, which considers factors such as the cable properties, route characteristics, 
+available installation equipment, and capacities of the cable installer [3]. Figure 1 shows some of the 
+most influential parameters in an installation operation [4]. The departure angle is the complimentary 
+angle of the cable exit angle at the overboard chute of the CLV (departure angle = 90 deg-exit angle). 
+Top tension is the tension applied to the cable using the onboard caterpillar or wheel tensioner 
+machine. Layback is the horizontal distance between the cable exit point from the CLV and the touch 
+down point (TDP) on the seabed. The bend radius at the TDP is the actual cable radius of curvature, 
+which is one of the most critical design parameters for cable integrity. Bottom tension is the residual 
+tension at the TDP, representing another critical parameter for the cable lifetime. 
+Top tension is the tension applied to the cable using the onboard caterpillar or wheel tensioner machine.
+Layback is the horizontal distance between the cable exit point from the CLV and the touch down point
+(TDP) on the seabed. The bend radius at the TDP is the actual cable radius of curvature, which is one
+of the most critical design parameters for cable integrity. Bottom tension is the residual tension at the
+TDP, representing another critical parameter for the cable lifetime.
+Figure 1. Demonstration of the most influential parameters during a cable laying process.
+Figure 1. Demonstration of the most influential parameters during a cable laying process. 
+In some cases, local conditions will require the vessel to ground near the landfall location.
+The limited water depth requires careful management of the cable catenary as a short catenary leaves
+little room for error and can easily compromise the cable integrity. Furthermore, the limited water
+depth requires a better accuracy for the cable catenary profile analysis since the part of the cable in
+the air is a significant proportion of the whole suspended length of the cable and cannot be omitted
+In some cases, local conditions will require the vessel to ground near the landfall location. The 
+limited water depth requires careful management of the cable catenary as a short catenary leaves 
+little room for error and can easily compromise the cable integrity. Furthermore, the limited water 
+depth requires a better accuracy for the cable catenary profile analysis since the part of the cable in 
+the air is a significant proportion of the whole suspended length of the cable and cannot be omitted 
+from the installation analysis. In shallow-water areas, modeling of the “out of water” cable segment 
+is significant for accurate safety factor quantification during a laying operation. In the present paper, 
+the proposed analysis tool is able to provide an accurate assessment of the cable integrity, even in 
+shallow-water areas, using an iterative procedure for modeling of the “out of water” cable segment. 
+from the installation analysis. In shallow-water areas, modeling of the “out of water” cable segment is
+significant for accurate safety factor quantification during a laying operation. In the present paper,
+the proposed analysis tool is able to provide an accurate assessment of the cable integrity, even in
+shallow-water areas, using an iterative procedure for modeling of the “out of water” cable segment.
+2. Scope of this Study
+2. Scope of this Study  
+Cable handling and monitoring are important during the cable laying process as the cable can
+be damaged if the minimum bending radius, actual strain, or other limits are not respected during
+installation. Typically, during laying from the landfall site towards offshore, the water depth will
+Cable handling and monitoring are important during the cable laying process as the cable can 
+be damaged if the minimum bending radius, actual strain, or other limits are not respected during 
+installation. Typically, during laying from the landfall site towards offshore, the water depth will 
+increase along the route and whilst the cable catenary becomes easier to manage, tension in the cable 
+becomes more important. Due to the fact that conventional installers of power cables do not have the 
+increase along the route and whilst the cable catenary becomes easier to manage, tension in the cable
+becomes more important. Due to the fact that conventional installers of power cables do not have
+the means to accurately estimate the cable tension on the seabed, they operate with very high safety
+J. Mar. Sci. Eng. 2020, 8, x FOR PEER REVIEW 
+3 of 18
+J. Mar. Sci. Eng. 2020, 8, 48
+3 of 18 
+factors. Consequently, power cables are usually installed with tensions that are much higher than the
+required values. Cable suspensions occur more often than desired as a result due to the restrained
+tension created by the friction between the seabed and cable. Between high spots on the seabed, the soil
+friction acts as a support, both horizontally and vertically, and the segment of the cable maintains
+a residual tension, creating a catenary suspension. As shown in Figure 2, at these seafloor contact
+means to accurately estimate the cable tension on the seabed, they operate with very high safety 
+factors. Consequently, power cables are usually installed with tensions that are much higher than the 
+required values. Cable suspensions occur more often than desired as a result due to the restrained 
+tension created by the friction between the seabed and cable. Between high spots on the seabed, the 
+soil friction acts as a support, both horizontally and vertically, and the segment of the cable maintains 
+a residual tension, creating a catenary suspension. As shown in Figure 2, at these seafloor contact 
+points, large reaction forces (local supports) and small bending radii are common, thereby reducing 
+the lifetime of the cable due to increased wearing and chafing. In order to maximize the lifetime of 
+the cable, the power cable installers must be equipped with an analysis tool to accurately predict the 
+bottom tension in order to lay the cable with low values of bottom tension to avoid cable suspensions, 
+but at the same time, they must maintain a small amount of tension at the touchdown to prevent 
+cable damage. 
+points, large reaction forces (local supports) and small bending radii are common, thereby reducing
+the lifetime of the cable due to increased wearing and chafing. In order to maximize the lifetime of
+the cable, the power cable installers must be equipped with an analysis tool to accurately predict the
+bottom tension in order to lay the cable with low values of bottom tension to avoid cable suspensions,
+but at the same time, they must maintain a small amount of tension at the touchdown to prevent
+cable damage.
+Figure 2. High or reduced bottom tension during a cable laying operation.
+Figure 2. High or reduced bottom tension during a cable laying operation. 
+As it can be realized, accurate prediction of the bottom tension during the S-lay installation of a
+submarine cable is of great interest to marine civil engineering research since this parameter is very
+crucial for both the installation and operation of the cable lifetime. Based on different assumptions,
+numerous theories have been developed for the static and dynamic response of a submarine cable
+during a laying operation. Among these, Zajac [5] first developed a steady-state theory, in which
+the cable was modeled as a straight line and excluded the effect of transient motions. Later on,
+Yoshizawa and Yabuta [6] presented an analytical method for the tension analysis of cables, without
+considering the tangential drag forces. Wang et al. [7] presented linear and nonlinear methods
+separately to build up a dynamic model. Vaz and Patel [8] developed a model for prediction of the
+As it can be realized, accurate prediction of the bottom tension during the S-lay installation of a 
+submarine cable is of great interest to marine civil engineering research since this parameter is very 
+crucial for both the installation and operation of the cable lifetime. Based on different assumptions, 
+numerous theories have been developed for the static and dynamic response of a submarine cable 
+during a laying operation. Among these, Zajac [5] first developed a steady-state theory, in which the 
+cable was modeled as a straight line and excluded the effect of transient motions. Later on, Yoshizawa 
+and Yabuta [6] presented an analytical method for the tension analysis of cables, without considering 
+the tangential drag forces. Wang et al. [7] presented linear and nonlinear methods separately to build 
+up a dynamic model. Vaz and Patel [8] developed a model for prediction of the transient behavior of 
+a cable when the cable ship changes speed during towing operations. Following their previous work, 
+Vaz et al. [9] presented a formulation and numerical solution for the 3D transient behavior of a cable 
+during laying operations. Extending from [9], Vaz and Patel [10] developed the formulation and 
+solution of governing equations used to analyze the 3D behavior of cables subjected to arbitrary 
+sheared currents. Similarly, Wang et al. [11] presented an efficient numerical schemes-boundary 
+condition transformed into a set of nonlinear governing equations with initial values. The vertical 
+movement of the cable ship caused by wave-induced vessel motion adds a non-ignorable tension 
+force at the laying cable. Prpic J. and Nabergoj R. [12,13] presented a two-dimensional model of cable 
+dynamics accounting for the effects of head sea conditions. Yang N. et al. [14] presented a semi
+transient behavior of a cable when the cable ship changes speed during towing operations. Following
+their previous work, Vaz et al. [9] presented a formulation and numerical solution for the 3D transient
+behavior of a cable during laying operations. Extending from [9], Vaz and Patel [10] developed
+the formulation and solution of governing equations used to analyze the 3D behavior of cables
+subjected to arbitrary sheared currents. Similarly, Wang et al. [11] presented an efficient numerical
+schemes-boundaryconditiontransformedintoasetofnonlineargoverningequationswithinitialvalues.
+The vertical movement of the cable ship caused by wave-induced vessel motion adds a non-ignorable
+tension force at the laying cable. Prpic J. and Nabergoj R. [12,13] presented a two-dimensional model
+of cable dynamics accounting for the effects of head sea conditions. Yang N. et al. [14] presented a
+J. Mar. Sci. Eng. 2020, 8, 48
+4 of 18
+semi-analytical approximation for a two-dimensional tension analysis of a submarine cable during
+laying operations, obtaining a set of differential equations to simulate the problem. In summary,
+all the aforementioned models have completely ignored the influence of the “out of water” cable
+segment, which significantly affects the cable configuration during laying operations, especially in
+shallow-water areas. The catenary theory model, both in static [15] and dynamic [16] conditions, was
+adopted and extended in [17] to support the analytical equations of the proposed analysis method
+using an additional iterative procedure to combine the submerged catenary configuration and the
+catenary curve created by the ‘out of water” cable part at the sea surface. In [17], the results of the
+method for laying a composite submarine cable at an intermediate water depth were compared with
+relevant results exported by the commercial Finite Element Analysis (FEA) software RSTAB [18] and
+were found to be in very good agreement.
+In thepresentpaper, aninnovativeandefficientanalysismethodisvalidatedinvariousinstallation
+scenarios and an analysis tool (developed from scratch) is proposed for cable installers for the accurate
+prediction of crucial installation parameters (minimum bending radius and bottom tension at the TDP)
+and the cable configuration during laying operations, including the “out of water” cable part. Reliable
+andcommercial FEAsoftwareisutilized to validate the accuracy and efficiency of the new analysis tool.
+Furthermore, the importance of modeling the “out of water” part of the cable between the overboard
+vessel’s chute and the sea surface is investigated. The analysis error in the case of not modeling the
+“out of water” cable part is significant, especially in shallow-water areas, due to the fact that the part
+of the cable in air is a non-ignorable proportion of the whole suspended length of the cable. It is
+proven that when ignoring the modeling of the “out of water” cable segment, the cable integrity can
+be jeopardized during laying activities. The proposed analysis tool is an innovation for cable laying
+operations because it can provide quick and accurate results as sophisticated and time-consuming FEA
+software. The tool allows cable installers to conduct real-time monitoring and re-adjustment of the
+constant tension activator onboard the CLV to avoid laying the cable with an excess of residual tension
+on the sea-bottom. In addition, the tool is able to accurately quantify the actual safety factor and
+predict the correct S-lay configuration during laying, even in shallow-water areas, using an iterative
+procedure for the combination of two catenary profiles with different properties (in and out of water
+cable segments).
+3. Description of the Proposed Analysis Tool
+TheproposedanalysistoolforthelayingofasubmarinecableinanS-layconfigurationisdescribed
+here. Details about the mathematical model, analysis assumptions, loads, boundaries, and cable
+properties are presented.
+The composite submarine cable that is used in the present study consists of the following:
+1.
+2.
+3.
+4.
+5.
+6.
+7.
+8.
+3 nos 18/30(36) kV Power Cores, 500 mm2 Tinned Copper (Class 2) conductors;
+2 nos Fiber Optic Cables, 48 nos Single Mode Fibers;
+Extruded Shaped Fillers;
+Binder tape;
+Anti-Teredo copper tape;
+Polypropylene bedding yarns;
+One-layer galvanized steel wire armor;
+Polypropylene yarns serving (2 nos layers with bitumen).
+The submarine cable is simulated using the mechanical parameters provided by the cable
+manufacturer Prysmian Group [19], which are presented in Table 1 and are used and must be respected
+at all times during cable handling in any possible operation.
+J. Mar. Sci. Eng. 2020, 8, 48
+5 of 18
+Table 1. Cable mechanical properties.
+Parameter
+Unit of Measure
+Value
+Outer diameter
+Approximate weight (in air)
+Approximate weight (in water)
+Maxstraight pulling tension
+Maxsidewall pressure
+Flexural stiffness [19]
+Minimumallowable bending radius
+mm
+kg/m
+kg/m
+kN
+kN/m
+Nm2
+m
+144
+37
+23
+176
+40
+10,000
+2.2
+Thedevelopedcustom-madetoolforthecableanalysisduringinstallationinanS-layconfiguration
+consists of one main component, which is (a) the cable, and three boundaries: (a) the seabed, (b) the sea
+surface, and (c) the CLV. The developed tool utilizes analytical equations of a catenary-type structure.
+The catenary method is probably the most successful attempt to find an approximate solution to the
+shape of aslender beamlifted at oneendfromahorizontalplane. Themethodwasoriginallysuggested
+to find the configuration and stresses in a pipeline with negligible stiffness suspended between the
+sea floor and an inclined ramp that is free to rotate and hence give a moment-free upper end of the
+pipeline. These boundary conditions are identical to the ideal conditions for a catenary composite
+submarine cable with an S-lay configuration, which means that the method should be well-suited to
+analyze this type of structure. The method is limited to analyzing a uniform beam loaded by its own
+weight only. Varying cross-sections, buoys, or current forces can therefore not be considered. However,
+the proposed tool has extended the original method to account for varying cross-sections with different
+weights, as is the real practice when a non-ignorable length of cable is out of the water between the
+overboard chute and the sea level during a laying operation in a shallow water area.
+The stiffened catenary method was originally suggested by Plunkett [20] and later applied by
+Dixon andRutledge[21] to findtheconfiguration andstresses in a pipeline with non-ignorable stiffness
+suspended between the sea floor and an inclined ramp, as frequently applied for pipe laying. The idea
+of the stiffened catenary solution is that the bending stiffness causes secondary effects in boundary
+regions only, and that the deviation from the simple catenary solution can be found as a rapidly
+converging series expansion. For a cable laying analysis problem, it has been proven that the stiffness
+of the cable can be ignored in order to minimize the computational effort, without losing the accuracy
+of the results.
+Therefore, in this paper, the extended catenary method is developed and proposed in order to
+build up the cable catenary configuration. As described above, the catenary theory model [15,16] has
+been adopted and extended to support the proposed tool analytical equations using an additional
+iterative procedure to combine the submerged catenary configuration and the catenary curve created
+by the “out of water” cable part at the sea surface. The reference configuration is assumed to be a
+straight linear elastic beam with a length equal to the cable’s initial length (elongation due to tension is
+ignored). In this analysis, the cable self-weight load (different weight in and out of water, see Table 1) is
+imposed and the tension load “T_tensioner” is applied in a horizontal direction through the caterpillar
+tensioner (just before the overboard chute of the CLV) to induce necessary tension in the cable, as
+illustrated in Figure 3. By inducing prescribed translation at the connection node, the cable, along
+with the vessel, is pulled up above the sea surface. This yields the establishment of the catenary
+configuration. In this analysis, there is no axial stiffness of the cable present and no sliding along the
+seabed can occur. Therefore, there is a fixed support on the seabed and a sliding horizontal support on
+the CLV. The sea surface is the boundary of the different cross-section properties.
+6 of 18
+J. Mar. Sci. Eng. 2020, 8, 48
+J. Mar. Sci. Eng. 2020, 8, x FOR PEER REVIEW 
+J. Mar. Sci. Eng. 2020, 8, x FOR PEER REVIEW 
+6 of 18 
+6 of 18 
+Figure 3. Symbols and notations used for the description of the proposed analysis tool.
+Figure 3. Symbols and notations used for the description of the proposed analysis tool. 
+Figure 3. Symbols and notations used for the description of the proposed analysis tool. 
+The input parameters required by the proposed analysis tool are listed below and presented in
+Figure 4:
+The input parameters required by the proposed analysis tool are listed below and presented in 
+Figure 4: 
+The input parameters required by the proposed analysis tool are listed below and presented in 
+Figure 4: 
+• Waterdepth,D;
+• Water depth, D; 
+• Water depth, D; 
+• Distancebetween the sea level and the overboard chute at the CLV, c;
+• Distance between the sea level and the overboard chute at the CLV, c; 
+• Distance between the sea level and the overboard chute at the CLV, c; 
+• Bottomtensionat the TDP, H;
+• Bottom tension at the TDP, H; 
+• Bottom tension at the TDP, H; 
+• Cable weight in water, q1 (Table 1); 
+• Cableweightinwater, q1 (Table 1);
+• Cable weight in water, q1 (Table 1); 
+• Cable weight in air, q2 (Table 1). 
+• Cableweightinair, q2 (Table 1).
+• Cable weight in air, q2 (Table 1). 
+Figure 4. Symbols used for the mathematical formulation.
+Figure 4. Symbols used for the mathematical formulation. 
+Figure 4. Symbols used for the mathematical formulation. 
+The basic theory underlying the behavior of catenary lines is utilized. However, an extension of
+the basic theory is proposed through an iterative procedure to combine the two catenary-type curves
+consisting of the two different cross-section properties for each cable segment, which are (a) submerged
+and (b) out of water. This procedure can be further developed to combine three or more segments of
+different cross-sections in order to analyze various cases studies of the oil and gas and wind power
+industry, like the installation of umbilicals, pipelines, anchor lines, etc. Connection between the two or
+The basic theory underlying the behavior of catenary lines is utilized. However, an extension of 
+the basic theory is proposed through an iterative procedure to combine the two catenary-type curves 
+consisting of the two different cross-section properties for each cable segment, which are (a) 
+submerged and (b) out of water. This procedure can be further developed to combine three or more 
+segments of different cross-sections in order to analyze various cases studies of the oil and gas and 
+wind power industry, like the installation of umbilicals, pipelines, anchor lines, etc. Connection 
+between the two or more different curves is achieved through the determination of a dummy 
+equilibrium node where the vertical component of the internal force V’ is equal at both curves. The 
+position of this dummy node for our study is at the sea surface elevation, as illustrated in Figure 4. 
+The horizontal component of the internal force H along the cable configuration is constant and equal 
+to the bottom tension at the TDP, as governed by the equilibrium equation on the X axis. Therefore, 
+equilibrium on the Y axis using the vertical component V’ accurately determines the dummy 
+equilibrium node. 
+more different curves is achieved through the determination of a dummy equilibrium node where the
+The basic theory underlying the behavior of catenary lines is utilized. However, an extension of 
+the basic theory is proposed through an iterative procedure to combine the two catenary-type curves 
+consisting of the two different cross-section properties for each cable segment, which are (a) 
+submerged and (b) out of water. This procedure can be further developed to combine three or more 
+segments of different cross-sections in order to analyze various cases studies of the oil and gas and 
+wind power industry, like the installation of umbilicals, pipelines, anchor lines, etc. Connection 
+between the two or more different curves is achieved through the determination of a dummy 
+equilibrium node where the vertical component of the internal force V’ is equal at both curves. The 
+position of this dummy node for our study is at the sea surface elevation, as illustrated in Figure 4. 
+The horizontal component of the internal force H along the cable configuration is constant and equal 
+to the bottom tension at the TDP, as governed by the equilibrium equation on the X axis. Therefore, 
+equilibrium on the Y axis using the vertical component V’ accurately determines the dummy 
+equilibrium node. 
+vertical component of the internal force V’ is equal at both curves. The position of this dummy node
+for our study is at the sea surface elevation, as illustrated in Figure 4. The horizontal component of the
+internal force H along the cable configuration is constant and equal to the bottom tension at the TDP,
+J. Mar. Sci. Eng. 2020, 8, 48
+7 of 18
+as governed by the equilibrium equation on the X axis. Therefore, equilibrium on the Y axis using the
+vertical component V’ accurately determines the dummy equilibrium node.
+The following equations present the parameters defining the catenary shape, while Figure 4
+illustrates how the parameters relate to the cable configuration. The step-by-step iterative procedure is
+presented hereafter.
+3.1. STEP 1: Determination of the Submerged Catenary Curve
+For y =y1=Dandq=q1,x1isdetermined using Equation (1):
+x = H
+q arccosh y∗q
+H +1 .
+For x =x1, S1 and V’ are determined using Equations (2) and (3):
+S = H
+q sinh q∗x
+H ,
+V =H∗sinh q∗x
+H ,
+(1)
+(2)
+(3)
+where S is the length along the curved cable configuration and V is the vertical component of the
+internal force.
+Therefore, at the end of this step, the V’ of the dummy equilibrium node has been calculated and
+this is followed by the next step with multiple iterations.
+3.2. STEP 2: Iterative Procedure to Define the “Correct” Catenary Curve in Air Which Can Be Combined with
+the Submerged One
+For the first iteration, we set y = y2 = D and q = q2, and then x2 is determined using Equation (1)
+andV2usingEquation(3). TheiterativeprocedurewillcontinueuntilV2isequaltoV’.Theconvergence
+threshold for the termination of the iterative procedure is set at 0.001 kN. Therefore, at the end of this
+step, the x2 value is determined.
+3.3. STEP 3: Determination of Various Parameters for the Catenary Curve in Air
+For y2=y2+c,x2 isdetermined using Equation (1).
+For x =x2,Visdetermined using Equation (3’).
+V
+H =sinh q∗x
+tanθ = V
+H ,
+H =sinh q∗x
+H ,
+where θ is the exit angle of the cable from the overboard chute on the CLV (Figure 3).
+The exit angle θ is equal to [90 deg-departure angle] (Figure 1).
+3.4. STEP 4: Determination of the Combined Catenary Curve Configuration (In and out of Water)
+For x =x2andq=q2,S2,1 is determined using Equation (2).
+For x =x2 andq=q2,S2isdetermined using Equation (2).
+S2,2 = S2−S2,1,
+S =S1+S2,2,
+a/2 = x1+(x2−x2),
+(3’)
+(4)
+(5)
+(6)
+(7)
+J.Mar.Sci.Eng.2020,8,48 8of18
+whereα/2representsthelayback,whichishorizontaldistancebetweentheTDPontheseabedandthe
+exitpointontheoverboardchuteontheCLV.
+Inordertoplotthecombinedcatenarycurve,thefollowingequationsareusedindependentlyfor
+eachdifferentpart(a)submergedand(b)inairofthecombinedcatenarycurve.
+y=H
+q coshq∗x
+H −1 . (8)
+Foreachpoint,thefollowingequationsarevalidanddeterminethetangentialinternalforceT:
+T= H2+V2, (9.1)
+T=H+q∗y. (9.2)
+ThehorizontaltensionloadT_tensioner(Figure3)ispracticallyappliedtothecablethrough
+theconstanttensionactivator(usuallyawheelorcaterpillartensioner).Thecableispassedthrough
+thetensionerandafterthat,itfollowsinarollerwaybeforereachingtheoverboardchute.Contact
+betweenthecableandoverboardchutecreatesafrictionforcewhichiscalculatedusingthefollowing
+formula(Capstanequation[22]):
+Tout=Tin∗eβ∗µ, (10)
+whereβistheβ=θangle(equaltotheexitangleinradians)betweenthevectorsofTinandToutandµ
+isthefrictioncoefficientbetweenthecableandoverboardchute.
+Forourcase,wesetthefollowingnotations:
+Tinisthetensionappliedbytheconstanttensionactivatorand
+Tout isthetangentialinternalforceattheexitpointofthecableattheoverboardchuteontheCLV.
+y=sinh q∗x
+H , (11.1)
+y=tan(ϕ), (11.2)
+ϕ=arctan(y), (11.3)
+whereϕisthetangentanglebetweentwoconsecutivenodes.
+Theproposedanalysistoolhastheabilitytosplitthetotallengthofthecableandgenerateasmany
+nodesastheuserdesires.Thedeterminationoftheminimumradiusofcurvatureismoreaccurate
+astherearesomanynodesthatthetotal lengthofthecableissplit. Theuserisabletoperforma
+sensitivityanalysisinordertodeterminethelimitwhenthecomputationaltimevs.Theaccuracyis
+thedesiredone.
+y = q
+H∗cosh q∗x
+H , (12)
+R=
+1+y2 3
+2
+y , (13.1)
+R=
+1+sinh q∗x
+H
+2 3
+2
+q
+H∗cosh q∗x
+H
+, (13.2)
+whereRistheradiusofcurvaturebetweentwoconsecutivenodes.
+Theactualsafetyfactor(SF)duringasubmarinecablelayingoperationisgivenbythefollowing
+Equation(14).Thesafetyfactoristheratiooftheminimumactualradiusofcurvaturebetweentwo
+consecutivenodesalongtheS-curveconfiguration,asperEquation(13.2),totheminimumallowable
+J. Mar. Sci. Eng. 2020, 8, 48
+9 of 18
+bending radius recommended bythecable manufacturer (Table 1). Usually, the actual minimum radius
+of curvature is located at the TDZ area, where the cable touches the seabed.
+SF =
+minR (Equation (13.2))
+minimumallowable bending radius (Table 1) .
+J. Mar. Sci. Eng. 2020, 8, x FOR PEER REVIEW 
+(14)
+The basic assumptions regarding the components and the boundary conditions of the proposed
+model are as follows:
+9 of 18 
+• Noflexuralandaxialstiffness is taken into consideration for the composite cable modeling;
+• TheCLVis modeled as a fixed vertical support using the overboard chute. It also applies a
+• The CLV is modeled as a fixed vertical support using the overboard chute. It also applies a 
+horizontal tensile force to the cable through the constant tension activator. Friction between 
+the overboard chute and cable is numerically modeled using Equation (10); 
+horizontal tensile force to the cable through the constant tension activator. Friction between the
+overboard chute and cable is numerically modeled using Equation (10);
+• The sea surface is taken into consideration through the different weight of the cable (in and 
+out of the water); 
+• Theseasurface is taken into consideration through the different weight of the cable (in and out of
+the water);
+• The seabed is analyzed as a fixed support in all translational degrees of freedom. Seabed
+• The seabed is analyzed as a fixed support in all translational degrees of freedom. Seabed 
+support is implemented at the TDP (X = 0, Y = 0, in Figure 4). No cable–soil interaction is 
+taken into consideration. 
+support is implemented at the TDP (X = 0, Y = 0, in Figure 4). No cable–soil interaction is taken
+into consideration.
+4. Validation of the Proposed Analysis Tool 
+4. Validation of the Proposed Analysis Tool
+Validation of the proposed analysis and design tool is presented in this section. For this reason,
+Validation of the proposed analysis and design tool is presented in this section. For this reason, 
+the case of an installation of a composite submarine cable using a CLV at a 93 m water depth has been 
+selected for analysis using two different numerical methods: 
+the case of an installation of a composite submarine cable using a CLV at a 93 m water depth has been
+selected for analysis using two different numerical methods:
+• The custom-made analysis and design tool that utilizes analytical equations of a catenary
+type structure (presented above in Section 3), and 
+• Thecustom-madeanalysis and design tool that utilizes analytical equations of a catenary-type
+structure (presented above in Section 3), and
+• An FEA model utilizing the structural analysis commercially available software RSTAB [18]. 
+• AnFEAmodelutilizingthe structural analysis commercially available software RSTAB [18].
+The installation model developed with the 3D FEA structural software RSTAB [18] consists of the
+same components and boundaries as the relevant proposed analysis tool. A non-linear static analysis
+is initially conducted to build up the catenary configuration. The most general way to find the static
+condition for a flexible composite submarine cable during S-lay configuration is to define a stress-free
+The installation model developed with the 3D FEA structural software RSTAB [18] consists of 
+the same components and boundaries as the relevant proposed analysis tool. A non-linear static 
+analysis is initially conducted to build up the catenary configuration. The most general way to find 
+the static condition for a flexible composite submarine cable during S-lay configuration is to define a 
+stress-free condition and introduce load contributions. Load types will normally consist of volume 
+forces (weight and buoyancy), prescribed displacements at nodes with given boundary conditions, 
+friction forces between the cable and sea bottom, etc. The initial (stress-free) condition cannot have 
+any curvature and will hence be significantly different from the static shape. Figure 5 illustrates how 
+one end of the cable must be moved down to the sea bottom, while the other must be moved to the 
+overboard chute of the CLV. 
+condition and introduce load contributions. Load types will normally consist of volume forces (weight
+and buoyancy), prescribed displacements at nodes with given boundary conditions, friction forces
+between the cable and sea bottom, etc. The initial (stress-free) condition cannot have any curvature
+and will hence be significantly different from the static shape. Figure 5 illustrates how one end of the
+cable must be moved down to the sea bottom, while the other must be moved to the overboard chute
+of the CLV.
+Figure 5. Initial (stress-free) and static condition of a submarine cable in S-lay configuration.
+Figure 5. Initial (stress-free) and static condition of a submarine cable in S-lay configuration. 
+The number of load increments within a load group might be high—often in the order of 100.
+This is particularly the case for the prescribed displacements. Note that equilibrium must be obtained
+The number of load increments within a load group might be high—often in the order of 100. 
+This is particularly the case for the prescribed displacements. Note that equilibrium must be obtained 
+for each load increment, which might be difficult at some intermediate end positions between initial 
+and final positions, especially when the number of load increments is low. The reference 
+configuration of the cable in the stress-free condition (Figure 5) is assumed to be a straight linear 
+elastic beam with a length equal to the cable’s initial length (part of the cable under the analysis 
+process that the user is able to define). All the supports of the cable beam elements in the stress-free 
+J. Mar. Sci. Eng. 2020, 8, 48
+10 of 18
+for each load increment, which might be difficult at some intermediate end positions between initial
+and final positions, especially when the number of load increments is low. The reference configuration
+of the cable in the stress-free condition (Figure 5) is assumed to be a straight linear elastic beam with a
+length equal to the cable’s initial length (part of the cable under the analysis process that the user is
+able to define). All the supports of the cable beam elements in the stress-free condition are modeled
+as diagram-type non-linear springs, active in tension and compression loads, which can accurately
+apply the actual boundaries of the model. In the non-linear static analysis, the cable self-weight load,
+different for the segments of cable in and out of the water, is imposed and a tension load T is applied in
+J. Mar. Sci. Eng. 2020, 8, x FOR PEER REVIEW 
+the horizontal direction through the caterpillar tensioner just before the overboard chute at the CLV.
+10 of 18 
+This yields the establishment of a catenary configuration. Non-linear spring supports are utilized to
+model the cable–soil interaction at the TDZ on the seabed and any possible free-span scenario in the
+case of an uneven bottom profile that can be inserted using the relevant diagrams for non-linear spring
+supports. Non-linear spring supports are utilized for the modeling of the overboard chute and the
+spring supports are utilized to model the cable–soil interaction at the TDZ on the seabed and any 
+possible free-span scenario in the case of an uneven bottom profile that can be inserted using the 
+relevant diagrams for non-linear spring supports. Non-linear spring supports are utilized for the 
+modeling of the overboard chute and the roller supports right after the tensioner onboard the CLV 
+(Figure 3), in order to apply friction between the cable and the handling accessories, as done in the 
+proposed analysis tool using Equation (10).  
+roller supports right after the tensioner onboard the CLV (Figure 3), in order to apply friction between
+the cable and the handling accessories, as done in the proposed analysis tool using Equation (10).
+The input parameters required by the FEA software RSTAB are as follows:
+The input parameters required by the FEA software RSTAB are as follows: 
+• Thewaterdepth,D(Figure 3);
+• The water depth, D (Figure 3); 
+• Distancefromthe sea level of the overboard chute at the CLV, c;
+• Distance from the sea level of the overboard chute at the CLV, c; 
+• Geometryoftheoverboard chute onboard the CLV (Figures 6 and 7);
+• Geometry of the overboard chute onboard the CLV (Figures 6 and 7); 
+• Bottomtensionat the TDP, H;
+• Bottom tension at the TDP, H; 
+• Cableweightinwater, q1;
+• Cable weight in water, q1; 
+• Cableweightinair, q2;
+• Cable weight in air, q2; 
+• Non-linear diagrams (reaction force N/deflection mm) for the cable–soil interaction in two
+directions (X, Y);
+• Non-linear diagrams (reaction force N/deflection mm) for the cable–soil interaction in two 
+directions (X, Y); 
+• Compositecableflexural stiffness, EI (Table 1);
+• Composite cable flexural stiffness, EI (Table 1); 
+• Compositecableaxial stiffness, EA (Table 1).
+• Composite cable axial stiffness, EA (Table 1). 
+Figure 6. Geometry of the overboard chute dimensions in mm.
+Figure 6. Geometry of the overboard chute dimensions in mm. 
+Each cable element has been modeled as a beam element which is an elastic 3D element with
+constant axial strain and torsion consisting of two nodes. Each element includes six degrees of freedom
+per node. The element has a circular cross-section with a constant radius along its length. A linear
+material model is used with properties for elastic cable elements since the target of all the analysis
+steps is to keep the cable in an elastic safe limit (not a failure analysis problem). The software uses the
+full Newton-Raphson large deformation analysis procedure, in which the stiffness matrix is updated at
+every equilibrium iteration. The maximum number of iterations per load increment is set at 600 and the
+Each cable element has been modeled as a beam element which is an elastic 3D element with 
+constant axial strain and torsion consisting of two nodes. Each element includes six degrees of 
+freedom per node. The element has a circular cross-section with a constant radius along its length. A 
+linear material model is used with properties for elastic cable elements since the target of all the 
+analysis steps is to keep the cable in an elastic safe limit (not a failure analysis problem). The software 
+uses the full Newton-Raphson large deformation analysis procedure, in which the stiffness matrix is 
+updated at every equilibrium iteration. The maximum number of iterations per load increment is set 
+at 600 and the number of load increments at 700. Many attempts have been conducted with less load 
+increments and a lower maximum number of iterations; however, due to the large deformations 
+required to achieve the static condition starting from the initial stress-free condition (Figure 5), all of 
+them terminated due to convergence inability at intermediate steps. Shear deformations are also 
+taken into consideration. Cross-section and material properties are modified accordingly to 
+correspond to an equivalent section with mechanical parameters provided by the cable manufacturer 
+(Table 1).  
+number of load increments at 700. Many attempts have been conducted with less load increments and
+a lower maximumnumberof iterations; however, due to the large deformations required to achieve
+the static condition starting from the initial stress-free condition (Figure 5), all of them terminated due
+to convergence inability at intermediate steps. Shear deformations are also taken into consideration.
+Cross-section and material properties are modified accordingly to correspond to an equivalent section
+with mechanical parameters provided by the cable manufacturer (Table 1).
+11 of 18
+J. Mar. Sci. Eng. 2020, 8, 48
+J. Mar. Sci. Eng. 2020, 8, x FOR PEER REVIEW 
+Figure 7. 3D model of the cable lay vessel (CLV) that is used as a reference for the analysis.
+Figure 7. 3D model of the cable lay vessel (CLV) that is used as a reference for the analysis. 
+11 of 18 
+The soil properties are defined by the cable–soil non-linear interaction spring supports model.
+This model allows for user-defined friction coefficients in different directions. The soil resistance is
+The soil properties are defined by the cable–soil non-linear interaction spring supports model. 
+This model allows for user-defined friction coefficients in different directions. The soil resistance is 
+defined in three directions: vertically, laterally, and axially. 
+defined in three directions: vertically, laterally, and axially.
+The Coulomb friction coefficients presented in Table 2 are used to represent the soil conditions. 
+The Coulomb friction coefficients presented in Table 2 are used to represent the soil conditions,
+whereµx =0.4(conservativevalueofthefrictioncoefficientalongthecableaxis)andµy =0.8(thelateral
+degree of freedom will be ignored).
+Table 2. Typical soil stiffness and friction coefficient. 
+Seabed Type Direction Stiffness (kN/m2) Friction Coefficient 
+Table 2. Typical soil stiffness and friction coefficient.
+Sand
+ Axial 
+100 to 250 
+0.4–0.6 
+Seabed Type
+Sand 
+Direction
+Lateral 
+Stiffness (kN/m2)
+50 to 100 
+Friction Coefficient
+0.8 
+Sand
+Sand
+Axial
+ Vertical 
+200 to 10,000 
+100 to 250- 
+0.4–0.6
+Sand
+Sand
+Lateral
+Vertical
+50 to 100
+200 to 10,000
+0.8
+where μx = 0.4 (conservative value of the friction coefficient along the cable axis) and μy = 0.8 (the 
+lateral degree of freedom will be ignored). 
+The vertical resistance of all model nodes (except the ones onboard the CLV) is expressed as a
+non-linear spring, which starts to be active at Y = −D (depth) and afterwards follows soil vertical
+The vertical resistance of all model nodes (except the ones onboard the CLV) is expressed as a 
+non-linear spring, which starts to be active at Y = −D (depth) and afterwards follows soil vertical 
+resistance behavior, as indicated in Table 2. 
+resistance behavior, as indicated in Table 2.
+The basic assumptions regarding the components and the boundary conditions of the FEA model
+in RSTAB software are as follows:
+The basic assumptions regarding the components and the boundary conditions of the FEA 
+model in RSTAB software are as follows: 
+• Flexural stiffness is taken into consideration for the composite cable modeling (Table 1); 
+• Flexuralstiffness is taken into consideration for the composite cable modeling (Table 1);
+• TheCLVismodeledasanon-linearvertical support. A vertical reaction is applied when the cable
+touches the configuration of the overboard chute (Figure 6). The CLV also applies a horizontal
+• The CLV is modeled as a non-linear vertical support. A vertical reaction is applied when the 
+cable touches the configuration of the overboard chute (Figure 6). The CLV also applies a 
+horizontal tensile force to the cable through the constant tension activator. Friction between 
+the overboard chute and cable is modeled using non-linear spring supports, as per Equation 
+(10);  
+tensile force to the cable through the constant tension activator. Friction between the overboard
+chute and cable is modeled using non-linear spring supports, as per Equation (10);
+• Theseasurfaceis taken into consideration through the different weights of the cable segments in
+and out of the water;
+• The sea surface is taken into consideration through the different weights of the cable 
+segments in and out of the water; 
+• Theseabedisanalyzed as non-linear vertical and horizontal support. A full cable–soil interaction
+is taken into consideration.
+• The seabed is analyzed as non-linear vertical and horizontal support. A full cable–soil 
+interaction is taken into consideration. 
+A comparative study of the two methods (proposed analysis tool vs. FEA model in RSTAB) has 
+been conducted and is presented below to allow for an effective validation of the innovative analysis 
+tool for the submarine cable laying installation. Three different cases are analyzed using the two 
+models, as described above in Sections 3 and 4, respectively. Each case corresponds to a different 
+bottom tension at the TDP. The bottom tension is a very crucial parameter for the safe installation of 
+a submarine cable, both in shallow and deep waters. A different bottom tension at the TDP means 
+J. Mar. Sci. Eng. 2020, 8, 48
+12 of 18
+Acomparative study of the two methods (proposed analysis tool vs. FEA model in RSTAB) has
+been conducted and is presented below to allow for an effective validation of the innovative analysis
+tool for the submarine cable laying installation. Three different cases are analyzed using the two
+models, as described above in Sections 3 and 4, respectively. Each case corresponds to a different
+bottom tension at the TDP. The bottom tension is a very crucial parameter for the safe installation of
+a submarine cable, both in shallow and deep waters. A different bottom tension at the TDP means
+that the whole configuration of the S-curve has been changed and thus the following parameters are
+affected:
+• Minimumbendingradius(MBR);
+• Exitanglefromthe overboard chute (θ, angles);
+• Catenarylength;
+• Layback,whichisthe position of the TDP;
+• Horizontal,vertical,andtangentialresultantforceattheoverboardchute(H,V,andT,respectively).
+Different values of bottom tension mean different equipment onboard the CLV (capacity-wise) for
+the cable installer, a different configuration of the submarine cable during laying, a different minimum
+bending radius at the TDP, and thus a different safety factor during the laying process.
+MBR is the minimum radius of curvature along the S-curve configuration. In most cases, in
+typical S-lay operations, the MBR is spotted at the TDZ, just before the cable touches the sea bottom.
+The MBRisacrucial parameter for the integrity of the cable because it is an alternative way to measure
+the bending stresses and easily compare those with the recommended limits provided by the cable
+manufacturer (Table 1).
+Three cases with bottom tension values of H1 = 1200 kg, H2 = 2000 kg, and H3 = 4000 kg and a
+water depth of 93 m were analyzed using the analytical proposed analysis tool. The most important
+parameters for the installation process were exported by the analysis tool and are presented in Table 3.
+Table 3. Results obtained using the proposed analysis tool.
+Water Depth = 93 m
+Bottom
+Tension H (kg)
+Layback
+Distance (m)
+Catenary
+Length (m)
+Exit Angle
+θ(degs)
+Min. Bending
+Radius (m)
+TTensioner
+Constant Tension
+Adjustment (kg)
+1200
+2000
+4000
+89.029
+119.717
+175.462
+139.002
+161.306
+206.797
+69.714
+62.008
+50.293
+52.173
+86.956
+173.914
+895
+1664
+3429
+It is easily understandable that as the bottom tension value increases, adjustment on the constant
+tension activator onboard the CLV should be increased in order to achieve the desired bottom tension.
+Furthermore, as the bottom tension value increases, the layback distance (Figure 3, presented as “a/2”)
+and the catenary length (Figure 3, presented as “S”) increase as well, since the TDP is drawn away
+from the CLV. The exit angle (Figure 3) is decreased and the cable exit from the overboard chute
+becomes smoother at each step of bottom tension increase. Last but not least, as the bottom tension
+increases, the actual minimum bending radius is increased as well, which means that the safety margin
+for the integrity of the cable during the laying process is increased. It should be remembered that a
+high bottom tension (higher than the required one) may create free spans along an uneven sea floor.
+Exported S-lay configurations for different bottom tension values using the proposed analysis tool are
+illustrated in Figure 8.
+J.Mar.Sci.Eng.2020,8,48 13of18
+J. Mar. Sci. Eng. 2020, 8, x FOR PEER REVIEW 13 of 18 
+ 
+ 
+Figure 8. Exported S-lay configurations for different bottom tension values obtained using the 
+proposed analysis tool. 
+The same cases were inserted in the 3D FEA structural software RSTAB using the parameters as 
+described above in Section 4. The most important parameters for the installation process were 
+exported by the software and tabulated below (Table 4), in order to compare them with those 
+exported by the proposed analysis tool. Exported S-lay configurations for different bottom tension 
+values using the FEA structural software RSTAB are illustrated in Figure 9. 
+Table 4. Results obtained using the 3D FEA structural software RSTAB. 
+Water Depth = 93 m 
+Bottom 
+Tension H 
+(kg) 
+Layback 
+Distance 
+(m) 
+Catenary 
+Length (m) 
+Exit 
+Angle θ 
+(degs) 
+Min. 
+Bending 
+Radius (m) 
+T_Tensioner Constant 
+Tension Adjustment 
+(kg) 
+1200 92.70 141.62 67.815 56.10 895 
+2000 125.20 165.90 60.10 93.00 1664 
+4000 183.90 214.60 48.40 185.30 3429 -100-90-80-70-60-50-40-30-20-10
+0
+10
+0 20 40 60 80 100 120 140 160 180 200
+Water Depth (m)
+Layback length(m)
+S-Lay configuration, H1=1200kg S-Lay configuration, H2=2000kg
+S-Lay configuration, H3=4000kg
+Figure8.ExportedS-layconfigurationsfordifferentbottomtensionvaluesobtainedusingtheproposed
+analysistool.
+Thesamecaseswereinsertedinthe3DFEAstructuralsoftwareRSTABusingtheparametersas
+describedaboveinSection4.Themostimportantparametersfortheinstallationprocesswereexported
+bythesoftwareandtabulatedbelow(Table4),inordertocomparethemwiththoseexportedbythe
+proposedanalysistool.ExportedS-layconfigurationsfordifferentbottomtensionvaluesusingthe
+FEAstructuralsoftwareRSTABareillustratedinFigure9.
+Table4.Resultsobtainedusingthe3DFEAstructuralsoftwareRSTAB.
+WaterDepth=93m
+Bottom
+TensionH(kg)
+Layback
+Distance(m)
+Catenary
+Length(m)
+ExitAngle
+θ(degs)
+Min.Bending
+Radius(m)
+T_Tensioner
+ConstantTension
+Adjustment(kg)
+1200 92.70 141.62 67.815 56.10 895
+2000 125.20 165.90 60.10 93.00 1664
+4000 183.90 214.60 48.40 185.30 3429
+Asitcanberealized,comparingtherelevantresults(Tables3and4)betweenthetwodifferent
+numericalmethods,thedifferenceforallthecriticalparametersislessthan6.5%. Ingeneral,theflexural
+stiffnessofthecablecanbeignored,significantlyimprovingthecomputationaleffortwithoutsensibly
+demotingtheaccuracyoftheresults.Theplottedcableconfigurationsexportedbybothnumerical
+methodsareillustratedforvisualcomparisoninFigure10.
+Thecomparativestudypresentedaboveprovesthattheproposedanalyticaltoolforthecable
+layinganalysisprovidesreliableandsaferesults,similartothoseobtainedwithsophisticatedand
+time-consuming3DFEAcommerciallyavailablesoftware.Thedivergencebetweentheresultsofthe
+twomethodsislogicalsincetheflexuralstiffnessofthecompositecablewasconsiderednegligiblefor
+theproposedanalyticaltool.Therefore,moreS-curvesareexportedbytheFEAsoftware,evenwitha
+biggerMBR.Insummary,theproposedtoolcanbeconsideredfullyreliableforcablelayinganalysis
+anddesignactivitiesusingmuchlesscomputationaleffortandallowingthecableinstallerstoconduct
+areal-timeanalysisandmonitoringofthelayingprocess.
+14 of 18
+J. Mar. Sci. Eng. 2020, 8, 48
+J. Mar. Sci. Eng. 2020, 8, x FOR PEER REVIEW 
+14 of 18 
+S-Lay configuration FEA model, H1=1200 kg S-Lay configuration FEA model, H2=2000 kg
+S-Lay configuration FEA model, H3=4000 kg
+10
+0-20
+Water Depth (m)-10-20-30-40-50-60-70-80-90
+0
+20
+40
+60
+80
+100
+120
+140
+160
+180-100
+Layback length(m)
+200
+Figure 9. Exported S-lay configurations for different bottom tension values obtained using the FEA
+structural software RSTAB.
+J. Mar. Sci. Eng. 2020, 8, x FOR PEER REVIEW 
+Figure 9. Exported S-lay configurations for different bottom tension values obtained using the FEA 
+structural software RSTAB. 
+S-Lay configuration, H1=1200kg S-Lay configuration, H2=2000kg
+15 of 18 
+S-Lay configuration, H3=4000kg S-Lay configuration FEA model, H1=1200kg-20
+S-Lay configuration FEA model, H2=2000kg S-Lay configuration FEA model, H3=4000kg
+10
+0-10-20-30
+0
+20
+40
+60
+As it can be realized, comparing the relevant results (Tables 3 and 4) between the two different 
+numerical methods, the difference for all the critical parameters is less than 6.5%. In general, the 
+flexural stiffness of the cable can be ignored, significantly improving the computational effort without 
+sensibly demoting the accuracy of the results. The plotted cable configurations exported by both 
+numerical methods are illustrated for visual comparison in Figure 10. 
+The comparative study presented above proves that the proposed analytical tool for the cable 
+laying analysis provides reliable and safe results, similar to those obtained with sophisticated and 
+time-consuming 3D FEA commercially available software. The divergence between the results of the 
+two methods is logical since the flexural stiffness of the composite cable was considered negligible 
+for the proposed analytical tool. Therefore, more S-curves are exported by the FEA software, even 
+with a bigger MBR. In summary, the proposed tool can be considered fully reliable for cable laying 
+analysis and design activities using much less computational effort and allowing the cable installers 
+to conduct a real-time analysis and monitoring of the laying process. 
+80
+Water Depth (m)-40-50-60-70-80-90
+100
+120
+140
+160
+180-100
+Layback length(m)
+Figure 10. Exported S-lay configurations for different bottom tension values using both the proposed 
+analysis tool and the FEA software. 
+Figure 10. Exported S-lay configurations for different bottom tension values using both the proposed
+analysis tool and the FEA software.
+5. Significance of the Modeling of the “Out of Water” Cable Segment 
+200
+The influence of the inclusion of the “out of water” cable segment in the mathematical modeling 
+has been investigated, especially for shallow-water applications, and the results are presented below. 
+Two different scenarios have been analyzed and the relevant results have been compared to 
+J.Mar.Sci.Eng.2020,8,48 15of18
+5.SignificanceoftheModelingofthe“OutofWater”CableSegment
+Theinfluenceoftheinclusionofthe“outofwater”cablesegmentinthemathematicalmodeling
+hasbeeninvestigated,especiallyforshallow-waterapplications,andtheresultsarepresentedbelow.
+Twodifferentscenarioshavebeenanalyzedandtherelevantresultshavebeencomparedto
+evaluatetheinfluenceformodelingofthe“outofwater”cablesegment:
+• ScenarioNo1:Modelingofbothcablesegments,assuming“submerged”representsthepart
+betweenthetouchdownpointandtheseasurfaceand“inair”representsthepartbetweenthe
+seasurfaceandthelastpointtouchingtheoverboardchuteonthecablelayvessel,and
+• ScenarioNo2:Modelingofbothcablesegmentswiththesameweight.Commonweightsforboth
+segmentshavebeenchosenfortheweightinwater.
+Bothoftheabovedescribedscenarioshavebeenanalyzedassumingdifferentwaterdepthvalues
+startingfroma3mwaterdepthandendingata15mwaterdepth. Furthermore,asthebottom
+tensioninput,asetofthreedifferentrunswereconducted,assumingthevaluesof1200/2000/4000kg
+(Tables5–7). Specificbottomtensionvalueswerechosenforthecomparativestudybecausethese
+arethecommonconstanttensionactivator(tensioner)availablecapacitiesinthecableindustryfora
+submarinecableinstallationuptoa200mwaterdepth.
+Table5.Comparativestudyofvariousinstallationscenariosusingtheproposedanalysistool:Scenario
+No1vs.ScenarioNo2assumingbottomtension=1200kg.
+BottomTension=1200kg
+Water
+Depth
+(m)
+LaybackDistance(m) CatenaryLength(m) ExitAngle(deg) MBR(m)
+Scen
+1
+Scen
+2
+Differ
+(%)
+Scen
+1
+Scen
+2
+Differ
+(%)
+Scen
+1 Scen Differ
+(%)
+Scen
+1
+Scen
+2
+Differ
+(%)
+3 24.73 25.39 2.66 25.81 26.40 2.30 30.39 26.84 11.67 36.27 52.17 43.85
+5 28.64 29.05 1.44 30.22 30.58 1.19 33.39 30.37 9.02 38.95 52.17 33.95
+7 31.98 32.27 0.91 34.12 34.36 0.72 35.99 33.37 7.28 41.72 52.17 25.06
+9 34.94 35.16 0.63 37.70 37.88 0.48 38.30 35.98 6.06 44.59 52.17 17.01
+11 37.62 37.80 0.46 41.05 41.19 0.34 40.37 38.29 5.16 47.55 52.17 9.71
+13 40.09 40.24 0.36 44.24 44.35 0.25 42.25 40.36 4.46 50.61 52.17 3.10
+15 42.39 42.51 0.28 47.29 47.38 0.19 43.96 42.24 3.90 52.17 52.17 0.00
+Table6.Comparativestudyofvariousinstallationscenariosusingtheproposedanalysistool:Scenario
+No1vs.ScenarioNo2assumingbottomtension=2000kg.
+BottomTension=2000kg
+Water
+Depth
+(m)
+LaybackDistance(m) CatenaryLength(m) ExitAngle(deg) MBR(m)
+Scen
+1
+Scen
+2
+Differ
+(%)
+Scen
+1
+Scen
+2
+Differ
+(%)
+Scen
+1
+Scen
+2
+Differ
+(%)
+Scen
+1
+Scen
+2
+Differ
+(%)
+3 32.06 32.90 2.62 32.90 33.69 2.40 24.11 21.18 12.14 57.85 86.96 50.32
+5 37.17 37.70 1.42 38.41 38.89 1.26 24.62 24.10 9.49 60.45 86.96 43.84
+7 41.55 41.92 0.89 43.23 43.56 0.77 28.84 26.61 7.73 63.11 86.96 37.79
+9 45.44 45.72 0.62 47.61 47.86 0.52 30.83 28.83 6.49 65.82 86.96 32.11
+11 48.99 49.21 0.45 51.69 51.88 0.37 32.64 30.82 5.58 68.60 86.96 26.76
+13 52.26 52.44 0.35 55.53 55.68 0.28 34.30 32.63 4.86 71.42 86.96 21.75
+15 55.32 55.47 0.27 59.18 59.31 0.21 35.83 34.30 4.29 74.30 86.96 17.03
+J.Mar.Sci.Eng.2020,8,48 16of18
+Table7.Comparativestudyofvariousinstallationscenariosusingtheproposedanalysistool:Scenario
+No1vs.ScenarioNo2assumingbottomtension=4000kg.
+BottomTension=4000kg
+Water
+Depth
+(m)
+LaybackDistance(m) CatenaryLength(m) ExitAngle(deg) MBR(m)
+Scen
+1
+Scen
+2
+Differ
+(%)
+Scen
+1
+Scen
+2
+Differ
+(%)
+Scen
+1
+Scen
+2
+Differ
+(%)
+Scen
+1
+Scen
+2
+Differ
+(%)
+3 45.49 46.67 2.60 46.09 47.23 2.48 17.37 15.19 12.52 111.87 173.91 55.46
+5 52.78 53.52 1.40 53.66 54.37 1.32 19.26 17.36 9.87 114.42 173.91 52.00
+7 59.05 59.56 0.88 60.25 60.74 0.81 20.95 19.25 8.10 116.99 173.91 48.66
+9 64.64 65.03 0.60 66.19 66.56 0.55 22.49 20.94 6.87 119.59 173.91 45.43
+11 69.74 70.05 0.44 71.67 71.96 0.40 23.90 22.48 5.95 122.22 173.91 42.29
+13 74.47 74.72 0.34 76.81 77.04 0.30 25.21 23.89 5.22 124.87 173.91 39.27
+15 78.89 79.10 0.26 81.67 81.85 0.23 26.43 25.21 4.65 127.55 173.91 36.35
+Summarizingthecomparativestudyabove,thelaybackdistanceandthecatenarylengtharenot
+significantlyinfluencedbythemodelingofthe“outofwater”cablesegment.Contrarytothis,thecable
+exitangleandMBRaredrasticallyaffectedbythemodelingofthe“outofwater”cablesegment,
+especiallyinshallowwaters. Regardingthecableexitangleparameter, themaximumcalculated
+variationbetweenthetwoscenariosis12.52%andispresentinshallowwaters(waterdepth=3m).
+RegardingtheMBRparameter,themaximumcalculatedvariationbetweenthetwoscenariosis55.46%
+andissimilarlypresentinshallowwaters(waterdepth=3m).
+6.Conclusions
+Themainpurposeofthisstudywastoproposeaneffectiveanalysisanddesigntoolforcablelaying
+operations.Thevalidationstudypresentedaboveprovesthattheproposedcustom-madetoolprovides
+reliableandsaferesults,eveninshallow-waterareas,similartosophisticatedandtime-consuming
+commerciallyavailableFEAsoftware. Thedifferencesbetweentheresultsofthetwomethodsare
+reasonable.Therefore,moreS-curvesareexportedbytheFEAsoftware,evenwithabiggerminimum
+bendingradius.
+Inaddition,asperthestudyconductedregardingtheinfluenceofthemodelingofthe“outof
+water”cablesegment,guidanceforallcableinstallersshouldbeprovidedtotakeintoconsiderationthe
+segmentofcablebetweentheseasurfaceandoverboardchuteassumingthecorrectweight.According
+totheresultspresented,theanalysiserrorinthecaseofnotmodelingthe“outofwater”cablepart
+withthecorrectweightforthecalculationoftheminimumbendingradius,especiallyinshallow-water
+areas,isnotacceptableandmayjeopardizetheintegrityofthesubmarinecable.Thecablesegment
+“outofwater”shouldbemodeledforanaccuratepredictionoftheminimumbendingradius(actual
+bendingradiusofcurvature)inshallow-waterareas,wherethecablelayingoperationisriskierand
+moreelegant. Theanalysiserrorforthecalculationoftheminimumbendingradius,aspresented
+above,isnotacceptable(55.46%difference)andthemodelingofthe“outofwater”partisamustfora
+safecablelayingoperationsinswallow-waterareas.
+TheanalysisofvariousinstallationscenariosforasubmarinecablelayingoperationinanS-lay
+configurationunderdifferentbottomtensionvaluesandvaryingwaterdepthsusingtheproposed
+analysistoolisunderimplementationandtheresultswillbepresentedinfutureworkasguidance
+forallcableinstallers. Thedynamicmovementofthecableandtheinfluenceofthecabletension
+duethemovementofthecablelayingvesselaretwokeyproblemstobesolvedduringthecable
+layingoperationsimulation.Bothofthemareunderimplementationtobeaddedfortheextension
+ofbothnumericaltoolspresentedinthisstudyandtoevaluatewhetheritisimportantthattheyare
+modeledandwhichcasescanbeignored,withoutlosingtheresults’accuracy,inordertominimizethe
+computationaleffort.
+J. Mar. Sci. Eng. 2020, 8, 48
+17 of 18
+Author Contributions: Conceptualization, V.A.M., C.M. and E.E.T.; methodology, V.A.M., C.M. and E.E.T.;
+software, V.A.M., C.M. and E.E.T.; validation and formal analysis, V.A.M., C.M. and E.E.T.; investigation, V.A.M.,
+C.M. andE.E.T.; writing—original draft preparation, V.A.M., C.M. and E.E.T.; writing—review and editing, V.A.M.,
+C.M. and E.E.T. All authors have read and agreed to the published version of the manuscript.
+Funding: This research received no external funding.
+Acknowledgments: The authors declare no administrative and technical support or donation in king.
+Conflicts of Interest: The authors declare no conflict of interest.
+References
+1.
+2.
+3.
+4.
+5.
+6.
+7.
+8.
+9.
+Opgard, M.F. Torsion Instability of Dynamic Cables during Installation. Master’s Thesis, NTNU, Trondheim,
+Norway, 2017.
+Offshore Wind Programme Board. Overview of the Offshore Transmission Cable Installation Process in the UK;
+Offshore Wind Programme Board: London, UK, 2015.
+Worzyk, T. Submarine Power Cables: Design, Installation, Damages and Repair, Environmental Aspects; Springer:
+Dordrecht, the Netherlands, 2009.
+DNV. Subsea Power Cables in Shallow Water Renewable Energy Applications; Det Norske Veritas: Oslo, Norway,
+2014.
+Zajac, E. Dynamics and kinematics of the laying and recovery of submarine cable. Bell Syst. Tech. J. 1957, 36,
+1129–1207. [CrossRef]
+Yoshizawa, N.; Yabuta, T. Study on submarine cable tension during laying. IEEE J. Ocean. Eng. 1983, 8,
+293–299. [CrossRef]
+Wang, Y.; Bian, X.; Zhang, X.; Xie, W. A study on the influence of cable tension on the movement of cable
+laying ship. Oceans 2010, 2010, 1–8.
+Vaz, M.; Patel, M. Transient behavior of towed marine cables in two dimensions. Appl. Ocean Res. 1995, 17,
+143–153. [CrossRef]
+Vaz, M.; Witz, J.; Patel, M. Three dimensional transient analysis of the installation of marine cables. Acta Mech.
+1997, 124, 1–26. [CrossRef]
+10. Vaz, M.; Patel, M. Three-dimensional behavior of elastic marine cables in sheared currents. Appl. Ocean Res.
+2000, 22, 45–53. [CrossRef]
+11. Wang,F.; Huang, G.; Deng, D. Steady state analysis of towed marine cables. J. Shanghai Jiaotong Univ. (Sci.)
+2008, 13, 239–244. [CrossRef]
+12. Prpic,J.; Nabergoj, R. Dynamic tension of marine cables during laying operations in irregular waves. Int. Ship
+Built. Prog. 2001, 48, 149–167.
+13. Prpic, J.; Nabergoj, R. Nonlinear dynamics of an elastic cable during laying operations in rough sea.
+Appl. Ocean Res. 2005, 27, 255–264. [CrossRef]
+14. Yang, N.; Jeng, D.-S.; Zhou, X.L. Tension analysis of submarine cables during laying operations. Open Civ.
+Eng. J. 2013, 7, 282–291. [CrossRef]
+15. Greco, L.; Impollonia, N.; Cuomo, M. A procedure for the static analysis of cable structures following elastic
+catenary theory. Int. J. Solids Struct. 2014, 51, 1521–1533. [CrossRef]
+16. Thai, H.-T.; Kim, S.-E. Nonlinear static and dynamic analysis of cable structures. Finite Elem. Anal. Des. 2011,
+47, 237–246. [CrossRef]
+17. Mamatsopoulos, A.V.; Michailides, C.; Theotokoglou, E.E. An efficient analysis for composite submarine
+cable design during installation in an S-lay configuration. In Proceedings of the 12th HSTAM International
+Congress on Mechanics, MS12, Mechanics of Advanced Materials and Structures, Thessaloniki, Greece,
+22–25 September 2019.
+18. RSTAB. Program Description. Version April 2013. Dlubal Engineering Software. Available online:
+https://www.dlubal.com/ (accessed on 14 November 2019).
+19. Maioli, P. Bending Stiffness of Submarine Cables; Prysmian, S.p.A: Milan, Italy, 2015.
+20. Plunkett, R. Static bending stresses in catenary drill strings. J. Eng. Ind. 1967, 89, 31–36. [CrossRef]
+J. Mar. Sci. Eng. 2020, 8, 48
+18 of 18
+21. Dixon, D.; Rutledge, D. Stiffened catenary calculation in pipeline laying problem. J. Eng. Ind. 1968, 90B,
+153–1960. [CrossRef]
+22. Stephen, W. The mechanics of friction in rope rescue. In Proceedings of the International Technical Rescue
+Symposium, Fort Collins, CO, USA, 5–7 November 1999.
+©2020bythe authors. Licensee MDPI, Basel, Switzerland. This article is an open access
+article distributed under the terms and conditions of the Creative Commons Attribution
+(CC BY) license (http://creativecommons.org/licenses/by/4.0/).
