@@ -8,7 +8,10 @@ Handles Point, LineString, Polygon, and MultiPoint geometries (2D and 3D).
 
 import os
 import struct
-import pyodbc
+try:
+    import pyodbc
+except Exception:  # pragma: no cover
+    pyodbc = None
 from qgis.PyQt.QtCore import QCoreApplication, QVariant
 from qgis.core import (QgsProcessing,
                        QgsProcessingAlgorithm,
@@ -111,6 +114,12 @@ def create_wkt(geom_type, vertices):
 
 def get_feature_tables(mdb_file, feedback):
     """Retrieves feature tables and their geometry fields, handling variations in GFeatures."""
+    if pyodbc is None:
+        feedback.reportError(
+            "pyodbc is required to read MDB files but could not be imported. "
+            "Install pyodbc (and the Microsoft Access Database Engine / ODBC driver) for your QGIS Python environment."
+        )
+        return {}
     feature_tables = {}
     conn_str = r"Driver={Microsoft Access Driver (*.mdb, *.accdb)};DBQ=" + mdb_file + ";"
     try:
@@ -159,11 +168,11 @@ def get_feature_tables(mdb_file, feedback):
                 table_name, geom_field, geometry_type = row
                 feature_tables[table_name] = (geom_field, geometry_type)
 
-    except pyodbc.Error as ex:
-        sqlstate = ex.args[0]
-        feedback.reportError(f"ODBC error: {sqlstate} - {ex}")
-        return {}
     except Exception as e:
+        if pyodbc is not None and isinstance(e, pyodbc.Error):
+            sqlstate = e.args[0] if getattr(e, 'args', None) else ''
+            feedback.reportError(f"ODBC error: {sqlstate} - {e}")
+            return {}
         feedback.reportError(f"Error getting feature tables: {e}")
         return {}
 
@@ -172,6 +181,12 @@ def get_feature_tables(mdb_file, feedback):
 
 def get_attribute_fields(mdb_file, table_name, feedback):
     """Gets attribute fields and types, handling reserved words and case."""
+    if pyodbc is None:
+        feedback.reportError(
+            "pyodbc is required to read MDB files but could not be imported. "
+            "Install pyodbc (and the Microsoft Access Database Engine / ODBC driver) for your QGIS Python environment."
+        )
+        return {}
     attribute_fields = {}
     conn_str = r"Driver={Microsoft Access Driver (*.mdb, *.accdb)};DBQ=" + mdb_file + ";"
     try:
@@ -236,11 +251,11 @@ def get_attribute_fields(mdb_file, table_name, feedback):
                 field_type_str = get_field_type_string(field_type)
                 attribute_fields[field_name] = field_type_str
 
-    except pyodbc.Error as ex:
-        sqlstate = ex.args[0]
-        feedback.reportError(f"ODBC error: {sqlstate} - {ex}")
-        return {}
     except Exception as e:
+        if pyodbc is not None and isinstance(e, pyodbc.Error):
+            sqlstate = e.args[0] if getattr(e, 'args', None) else ''
+            feedback.reportError(f"ODBC error: {sqlstate} - {e}")
+            return {}
         feedback.reportError(f"Error getting attribute fields for {table_name}: {e}")
         return {}
 
@@ -261,6 +276,11 @@ def get_field_type_string(field_type_code):
 
 def import_table_as_memory_layer(mdb_file, table_name, geom_field_name, geometry_type_code, import_crs, feedback):
     """Imports a single feature table as a memory layer."""
+    if pyodbc is None:
+        return None, (
+            "pyodbc is required to read MDB files but could not be imported. "
+            "Install pyodbc (and the Microsoft Access Database Engine / ODBC driver) for your QGIS Python environment."
+        )
     conn_str = r"Driver={Microsoft Access Driver (*.mdb, *.accdb)};DBQ=" + mdb_file + ";"
     try:
         with pyodbc.connect(conn_str) as conn:
@@ -367,11 +387,11 @@ def import_table_as_memory_layer(mdb_file, table_name, geom_field_name, geometry
             mem_layer.updateExtents()
             return mem_layer, None
 
-    except pyodbc.Error as ex:
-        sqlstate = ex.args[0]
-        feedback.reportError(f"ODBC error: {sqlstate} - {ex}")
-        return None, str(ex)
     except Exception as e:
+        if pyodbc is not None and isinstance(e, pyodbc.Error):
+            sqlstate = e.args[0] if getattr(e, 'args', None) else ''
+            feedback.reportError(f"ODBC error: {sqlstate} - {e}")
+            return None, str(e)
         feedback.reportError(f"Error processing table {table_name}: {e}")
         return None, str(e)
 
@@ -396,6 +416,11 @@ class ImportBathyMdbAlgorithm(QgsProcessingAlgorithm):
         self.addOutput(QgsProcessingOutputMultipleLayers(self.OUTPUT_LAYERS, self.tr('Imported Layers')))
 
     def processAlgorithm(self, parameters, context, feedback):
+        if pyodbc is None:
+            raise QgsProcessingException(
+                "pyodbc is required to read MDB files but could not be imported. "
+                "Install pyodbc (and the Microsoft Access Database Engine / ODBC driver) for your QGIS Python environment."
+            )
         mdb_file = self.parameterAsFile(parameters, self.INPUT_MDB, context)
         target_crs = self.parameterAsCrs(parameters, self.TARGET_CRS, context)
         if not mdb_file or not os.path.exists(mdb_file):
