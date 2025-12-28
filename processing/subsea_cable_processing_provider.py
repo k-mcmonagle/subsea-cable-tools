@@ -5,36 +5,10 @@ SubseaCableProcessingProvider
 This provider loads processing algorithms for Subsea Cable Tools.
 """
 
-from qgis.core import QgsProcessingProvider
-from .kp_range_highlighter_algorithm import KPRangeHighlighterAlgorithm
-from .kp_range_csv_algorithm import KPRangeCSVAlgorithm
-from .kp_range_merge_tables_algorithm import KPRangeMergeTablesAlgorithm
-from .kp_range_group_adjacent_algorithm import KPRangeGroupAdjacentAlgorithm
-from .import_excel_rpl_algorithm import ImportExcelRPLAlgorithm
-from .import_cable_lay_algorithm import ImportCableLayAlgorithm
+import importlib
+import traceback
 
-from .nearest_kp_algorithm import NearestKPAlgorithm
-from .import_bathy_mdb_algorithm import ImportBathyMdbAlgorithm
-from .place_kp_points_algorithm import PlaceKpPointsAlgorithm
-from .place_kp_points_from_csv_algorithm import PlaceKpPointsFromCsvAlgorithm
-from .place_single_kp_point_algorithm import PlaceSingleKpPointAlgorithm
-from .add_depth_to_point_layer_algorithm import AddDepthToPointLayerAlgorithm
-from .create_mbes_raster_from_xyz_algorithm import CreateMBESRasterFromXYZAlgorithm
-from .merge_mbes_rasters_algorithm import MergeMBESRastersAlgorithm
-
-from .import_ship_outline_algorithm import ImportShipOutlineAlgorithm
-from .place_ship_outlines_algorithm import PlaceShipOutlinesAlgorithm
-from .plot_line_segments_from_table_algorithm import PlotLineSegmentsFromTableAlgorithm
-from .translate_kp_from_rpl_to_rpl_algorithm import TranslateKPFromRPLToRPLAlgorithm
-from .rpl_route_comparison_algorithm import RPLRouteComparisonAlgorithm
-from .seabed_length_algorithm import SeabedLengthAlgorithm
-from .extract_ac_points_algorithm import ExtractACPointsAlgorithm
-from .identify_rpl_crossing_points_algorithm import IdentifyRPLCrossingPointsAlgorithm
-from .dynamic_buffer_lay_corridor_algorithm import DynamicBufferLayCorridorAlgorithm
-from .identify_rpl_area_listing_algorithm import IdentifyRPLAreaListingAlgorithm
-from .identify_rpl_lay_corridor_proximity_listing_algorithm import IdentifyRPLLayCorridorProximityListingAlgorithm
-from .kp_range_depth_slope_summary_algorithm import KPRangeDepthSlopeSummaryAlgorithm
-from .export_kp_section_chartlets_algorithm import ExportKPSectionChartletsAlgorithm
+from qgis.core import QgsProcessingProvider, QgsMessageLog, Qgis
 
 
 class SubseaCableProcessingProvider(QgsProcessingProvider):
@@ -48,50 +22,47 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
         pass
 
     def loadAlgorithms(self):
-        print('Loading Subsea Cable Tools algorithms...')
-        self.addAlgorithm(KPRangeHighlighterAlgorithm())
-        self.addAlgorithm(KPRangeCSVAlgorithm())
-        self.addAlgorithm(KPRangeMergeTablesAlgorithm())
-        self.addAlgorithm(KPRangeGroupAdjacentAlgorithm())
-        self.addAlgorithm(KPRangeDepthSlopeSummaryAlgorithm())
-        self.addAlgorithm(ImportExcelRPLAlgorithm())
-        self.addAlgorithm(NearestKPAlgorithm())
-        self.addAlgorithm(ImportBathyMdbAlgorithm())
-        self.addAlgorithm(PlaceKpPointsAlgorithm())
-        self.addAlgorithm(PlaceKpPointsFromCsvAlgorithm())
-        self.addAlgorithm(PlaceSingleKpPointAlgorithm())
-        self.addAlgorithm(AddDepthToPointLayerAlgorithm())
-        print('Registering CreateMBESRasterFromXYZAlgorithm...')
-        self.addAlgorithm(CreateMBESRasterFromXYZAlgorithm())
-        print('Registering MergeMBESRastersAlgorithm...')
-        self.addAlgorithm(MergeMBESRastersAlgorithm())
-        print('Registering ImportCableLayAlgorithm...')
-        self.addAlgorithm(ImportCableLayAlgorithm())
-        print('Registering ImportShipOutlineAlgorithm...')
-        self.addAlgorithm(ImportShipOutlineAlgorithm())
-        print('Registering PlaceShipOutlinesAlgorithm...')
-        self.addAlgorithm(PlaceShipOutlinesAlgorithm())
-        print('Registering PlotLineSegmentsFromTableAlgorithm...')
-        self.addAlgorithm(PlotLineSegmentsFromTableAlgorithm())
-        print('Registering TranslateKPFromRPLToRPLAlgorithm...')
-        self.addAlgorithm(TranslateKPFromRPLToRPLAlgorithm())
-        print('Registering RPLRouteComparisonAlgorithm...')
-        self.addAlgorithm(RPLRouteComparisonAlgorithm())
-        print('Registering SeabedLengthAlgorithm...')
-        self.addAlgorithm(SeabedLengthAlgorithm())
-        print('Registering DynamicBufferLayCorridorAlgorithm...')
-        self.addAlgorithm(DynamicBufferLayCorridorAlgorithm())
-        print('Registering ExtractACPointsAlgorithm...')
-        self.addAlgorithm(ExtractACPointsAlgorithm())
-        print('Registering IdentifyRPLCrossingPointsAlgorithm...')
-        self.addAlgorithm(IdentifyRPLCrossingPointsAlgorithm())
-        print('Registering IdentifyRPLAreaListingAlgorithm...')
-        self.addAlgorithm(IdentifyRPLAreaListingAlgorithm())
-        print('Registering IdentifyRPLLayCorridorProximityListingAlgorithm...')
-        self.addAlgorithm(IdentifyRPLLayCorridorProximityListingAlgorithm())
+        def safe_add(module_name: str, class_name: str) -> None:
+            try:
+                module = importlib.import_module(f'.{module_name}', package=__package__)
+                algorithm_class = getattr(module, class_name)
+                self.addAlgorithm(algorithm_class())
+            except Exception:
+                QgsMessageLog.logMessage(
+                    f'Failed to register algorithm {class_name} from {module_name}.\n{traceback.format_exc()}',
+                    'Subsea Cable Tools',
+                    Qgis.Warning,
+                )
 
-        print('Registering ExportKPSectionChartletsAlgorithm...')
-        self.addAlgorithm(ExportKPSectionChartletsAlgorithm())
+        QgsMessageLog.logMessage('Loading Subsea Cable Tools algorithms...', 'Subsea Cable Tools', Qgis.Info)
+
+        safe_add('kp_range_highlighter_algorithm', 'KPRangeHighlighterAlgorithm')
+        safe_add('kp_range_csv_algorithm', 'KPRangeCSVAlgorithm')
+        safe_add('kp_range_merge_tables_algorithm', 'KPRangeMergeTablesAlgorithm')
+        safe_add('kp_range_group_adjacent_algorithm', 'KPRangeGroupAdjacentAlgorithm')
+        safe_add('kp_range_depth_slope_summary_algorithm', 'KPRangeDepthSlopeSummaryAlgorithm')
+        safe_add('import_excel_rpl_algorithm', 'ImportExcelRPLAlgorithm')
+        safe_add('nearest_kp_algorithm', 'NearestKPAlgorithm')
+        safe_add('import_bathy_mdb_algorithm', 'ImportBathyMdbAlgorithm')
+        safe_add('place_kp_points_algorithm', 'PlaceKpPointsAlgorithm')
+        safe_add('place_kp_points_from_csv_algorithm', 'PlaceKpPointsFromCsvAlgorithm')
+        safe_add('place_single_kp_point_algorithm', 'PlaceSingleKpPointAlgorithm')
+        safe_add('add_depth_to_point_layer_algorithm', 'AddDepthToPointLayerAlgorithm')
+        safe_add('create_mbes_raster_from_xyz_algorithm', 'CreateMBESRasterFromXYZAlgorithm')
+        safe_add('merge_mbes_rasters_algorithm', 'MergeMBESRastersAlgorithm')
+        safe_add('import_cable_lay_algorithm', 'ImportCableLayAlgorithm')
+        safe_add('import_ship_outline_algorithm', 'ImportShipOutlineAlgorithm')
+        safe_add('place_ship_outlines_algorithm', 'PlaceShipOutlinesAlgorithm')
+        safe_add('plot_line_segments_from_table_algorithm', 'PlotLineSegmentsFromTableAlgorithm')
+        safe_add('translate_kp_from_rpl_to_rpl_algorithm', 'TranslateKPFromRPLToRPLAlgorithm')
+        safe_add('rpl_route_comparison_algorithm', 'RPLRouteComparisonAlgorithm')
+        safe_add('seabed_length_algorithm', 'SeabedLengthAlgorithm')
+        safe_add('dynamic_buffer_lay_corridor_algorithm', 'DynamicBufferLayCorridorAlgorithm')
+        safe_add('extract_ac_points_algorithm', 'ExtractACPointsAlgorithm')
+        safe_add('identify_rpl_crossing_points_algorithm', 'IdentifyRPLCrossingPointsAlgorithm')
+        safe_add('identify_rpl_area_listing_algorithm', 'IdentifyRPLAreaListingAlgorithm')
+        safe_add('identify_rpl_lay_corridor_proximity_listing_algorithm', 'IdentifyRPLLayCorridorProximityListingAlgorithm')
+        safe_add('export_kp_section_chartlets_algorithm', 'ExportKPSectionChartletsAlgorithm')
 
 
     def id(self):
