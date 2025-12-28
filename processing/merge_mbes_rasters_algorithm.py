@@ -3,6 +3,7 @@ import os
 import tempfile
 import uuid
 from qgis.core import (
+    QgsApplication,
     QgsProcessing,
     QgsProcessingAlgorithm,
     QgsProcessingParameterMultipleLayers,
@@ -48,6 +49,18 @@ class MergeMBESRastersAlgorithm(QgsProcessingAlgorithm):
         )
 
     def processAlgorithm(self, parameters, context, feedback):
+        def alg_available(algorithm_id: str) -> bool:
+            try:
+                return QgsApplication.processingRegistry().algorithmById(algorithm_id) is not None
+            except Exception:
+                return False
+
+        if not alg_available('gdal:merge'):
+            raise QgsProcessingException(
+                "Required Processing algorithm 'gdal:merge' is not available. "
+                'This usually means the GDAL Processing provider is not installed or not enabled.'
+            )
+
         raster_layers = self.parameterAsLayerList(parameters, self.INPUTS, context)
         if not raster_layers or len(raster_layers) < 2:
             raise QgsProcessingException('Please select at least two raster layers to merge.')
@@ -111,6 +124,11 @@ class MergeMBESRastersAlgorithm(QgsProcessingAlgorithm):
         # If compression is enabled, use gdal:translate to compress to final output
         if compress:
             feedback.pushInfo('Applying LZW compression using gdal:translate...')
+            if not alg_available('gdal:translate'):
+                raise QgsProcessingException(
+                    "Compression requested but Processing algorithm 'gdal:translate' is not available. "
+                    'Enable the GDAL Processing provider or disable compression.'
+                )
             translate_params = {
                 'INPUT': output_raster_path,
                 'OUTPUT': final_output,

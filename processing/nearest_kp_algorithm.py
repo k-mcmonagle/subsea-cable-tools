@@ -31,7 +31,7 @@ from qgis.core import (
     QgsFields,
     QgsVectorLayer
 )
-from PyQt5.QtCore import QVariant
+from qgis.PyQt.QtCore import QVariant
 import math
 
 

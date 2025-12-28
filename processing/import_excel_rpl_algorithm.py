@@ -21,9 +21,9 @@ __revision__ = '$Format:%H$'
 
 import os
 import sys
-plugin_dir = os.path.dirname(__file__)
+plugin_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 lib_dir = os.path.join(plugin_dir, 'lib')
-if lib_dir not in sys.path:
+if os.path.isdir(lib_dir) and lib_dir not in sys.path:
     sys.path.insert(0, lib_dir)
 
 from qgis.PyQt.QtCore import QCoreApplication, QVariant, QSettings
@@ -46,8 +46,11 @@ from qgis.core import (
     QgsProcessingLayerPostProcessorInterface
 )
 
-# Make sure openpyxl is installed
-from openpyxl import load_workbook
+try:
+    # openpyxl is bundled under plugin lib/ but may also be available in QGIS python
+    from openpyxl import load_workbook
+except Exception:
+    load_workbook = None
 
 def col_letter_to_index(letter):
     """
@@ -525,6 +528,11 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
 
         # Prepare storage for point and line rows
         # Open workbook with robust error handling
+        if load_workbook is None:
+            raise QgsProcessingException(
+                'openpyxl is required to read Excel files but could not be imported. '
+                "If you're running this from the plugin, ensure the plugin's lib/ folder is present and not blocked by antivirus."
+            )
         try:
             wb = load_workbook(excel_file, data_only=True)
         except Exception as e:

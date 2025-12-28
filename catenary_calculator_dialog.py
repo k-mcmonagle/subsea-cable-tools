@@ -5,17 +5,30 @@ Catenary Calculator Dialog for Subsea Cable Tools QGIS Plugin
 This dialog provides a catenary calculator for subsea cables, including plotting and export features.
 No extra dependencies required beyond QGIS (PyQt5, matplotlib, shapely for DXF export).
 """
-from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox, QPushButton, QTextEdit, QWidget, QFormLayout, QSizePolicy, QFileDialog, QDoubleSpinBox)
-from PyQt5.QtCore import Qt, QSettings
+from qgis.PyQt.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox, QPushButton, QTextEdit, QWidget, QFormLayout, QSizePolicy, QFileDialog, QDoubleSpinBox)
+from qgis.PyQt.QtCore import Qt, QSettings
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-import numpy as np
+try:
+    import numpy as np
+except Exception:  # pragma: no cover
+    np = None
 import math
 import io
 
 class CatenaryCalculatorDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
+        if np is None:
+            from qgis.PyQt.QtWidgets import QMessageBox
+            QMessageBox.critical(
+                self,
+                'Missing dependency',
+                'NumPy is required for the catenary calculator but could not be imported. '
+                'Please install/enable NumPy for your QGIS Python environment.'
+            )
+            self.setEnabled(False)
+            return
         self.setWindowTitle("Subsea Cable Catenary Calculator")
         # Increased window size for better usability
         self.resize(1400, 900)
@@ -375,7 +388,7 @@ class CatenaryCalculatorDialog(QDialog):
         except ImportError:
             self.results.setHtml('<span style="color:red;">Shapely is required for DXF export (should be available in QGIS).</span>')
             return
-        from PyQt5.QtWidgets import QFileDialog
+        from qgis.PyQt.QtWidgets import QFileDialog
         path, _ = QFileDialog.getSaveFileName(self, "Save DXF", "catenary.dxf", "DXF Files (*.dxf)")
         if not path:
             return

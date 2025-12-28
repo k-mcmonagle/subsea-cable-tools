@@ -27,14 +27,14 @@ from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 from typing import TYPE_CHECKING
 
-from PyQt5.QtWidgets import (
+from qgis.PyQt.QtWidgets import (
     QAbstractItemView,
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
     QTextEdit, QWidget, QFormLayout, QSizePolicy, QFileDialog, QDoubleSpinBox,
     QTabWidget, QTableWidget, QTableWidgetItem, QMessageBox, QHeaderView
     , QCheckBox
 )
-from PyQt5.QtCore import Qt, QSettings
+from qgis.PyQt.QtCore import Qt, QSettings
 from matplotlib.figure import Figure
 from matplotlib.collections import LineCollection
 
@@ -47,7 +47,10 @@ else:
     except Exception:  # pragma: no cover
         from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 
-import numpy as np
+try:
+    import numpy as np
+except Exception:  # pragma: no cover
+    np = None
 import math
 import json
 
@@ -767,6 +770,15 @@ class CatenarySystemCalculator:
 class CatenaryCalculatorV2Dialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
+        if np is None:
+            QMessageBox.critical(
+                self,
+                'Missing dependency',
+                'NumPy is required for the catenary calculator but could not be imported. '
+                'Please install/enable NumPy for your QGIS Python environment.'
+            )
+            self.setEnabled(False)
+            return
         self.setWindowTitle("Subsea Cable Catenary Calculator (Upgraded)")
         self.resize(1500, 920)
         self.setMinimumWidth(1250)
