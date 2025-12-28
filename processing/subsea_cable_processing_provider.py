@@ -9,6 +9,7 @@ from qgis.core import QgsProcessingProvider
 from .kp_range_highlighter_algorithm import KPRangeHighlighterAlgorithm
 from .kp_range_csv_algorithm import KPRangeCSVAlgorithm
 from .kp_range_merge_tables_algorithm import KPRangeMergeTablesAlgorithm
+from .kp_range_group_adjacent_algorithm import KPRangeGroupAdjacentAlgorithm
 from .import_excel_rpl_algorithm import ImportExcelRPLAlgorithm
 from .import_cable_lay_algorithm import ImportCableLayAlgorithm
 
@@ -17,6 +18,7 @@ from .import_bathy_mdb_algorithm import ImportBathyMdbAlgorithm
 from .place_kp_points_algorithm import PlaceKpPointsAlgorithm
 from .place_kp_points_from_csv_algorithm import PlaceKpPointsFromCsvAlgorithm
 from .place_single_kp_point_algorithm import PlaceSingleKpPointAlgorithm
+from .add_depth_to_point_layer_algorithm import AddDepthToPointLayerAlgorithm
 from .create_mbes_raster_from_xyz_algorithm import CreateMBESRasterFromXYZAlgorithm
 from .merge_mbes_rasters_algorithm import MergeMBESRastersAlgorithm
 
@@ -32,6 +34,7 @@ from .dynamic_buffer_lay_corridor_algorithm import DynamicBufferLayCorridorAlgor
 from .identify_rpl_area_listing_algorithm import IdentifyRPLAreaListingAlgorithm
 from .identify_rpl_lay_corridor_proximity_listing_algorithm import IdentifyRPLLayCorridorProximityListingAlgorithm
 from .kp_range_depth_slope_summary_algorithm import KPRangeDepthSlopeSummaryAlgorithm
+from .export_kp_section_chartlets_algorithm import ExportKPSectionChartletsAlgorithm
 
 
 class SubseaCableProcessingProvider(QgsProcessingProvider):
@@ -49,6 +52,7 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
         self.addAlgorithm(KPRangeHighlighterAlgorithm())
         self.addAlgorithm(KPRangeCSVAlgorithm())
         self.addAlgorithm(KPRangeMergeTablesAlgorithm())
+        self.addAlgorithm(KPRangeGroupAdjacentAlgorithm())
         self.addAlgorithm(KPRangeDepthSlopeSummaryAlgorithm())
         self.addAlgorithm(ImportExcelRPLAlgorithm())
         self.addAlgorithm(NearestKPAlgorithm())
@@ -56,6 +60,7 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
         self.addAlgorithm(PlaceKpPointsAlgorithm())
         self.addAlgorithm(PlaceKpPointsFromCsvAlgorithm())
         self.addAlgorithm(PlaceSingleKpPointAlgorithm())
+        self.addAlgorithm(AddDepthToPointLayerAlgorithm())
         print('Registering CreateMBESRasterFromXYZAlgorithm...')
         self.addAlgorithm(CreateMBESRasterFromXYZAlgorithm())
         print('Registering MergeMBESRastersAlgorithm...')
@@ -84,6 +89,9 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
         self.addAlgorithm(IdentifyRPLAreaListingAlgorithm())
         print('Registering IdentifyRPLLayCorridorProximityListingAlgorithm...')
         self.addAlgorithm(IdentifyRPLLayCorridorProximityListingAlgorithm())
+
+        print('Registering ExportKPSectionChartletsAlgorithm...')
+        self.addAlgorithm(ExportKPSectionChartletsAlgorithm())
 
 
     def id(self):

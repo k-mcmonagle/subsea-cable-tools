@@ -1,9 +1,21 @@
-# place_kp_points_from_csv_algorithm.py
-# -*- coding: utf-8 -*-
+"""PlaceKpPointsFromCsvAlgorithm
+
+Places points along a route based on KP values.
+
+KP inputs can come from:
+- a table layer (e.g. a loaded CSV with no geometry), or
+- a pasted text block (e.g. copied from Excel; typically tab-separated).
+
+For pasted text, the first column is interpreted as KP (km). Any additional
+columns are carried through to the output as text fields.
 """
-PlaceKpPointsFromCsvAlgorithm
-This tool places KP points along a route from a CSV file.
-"""
+
+from __future__ import annotations
+
+import csv
+import io
+import re
+from typing import List, Optional, Tuple
 
 from qgis.PyQt.QtCore import QCoreApplication, QVariant
 from qgis.core import (QgsProcessing,
@@ -12,6 +24,7 @@ from qgis.core import (QgsProcessing,
                        QgsProcessingParameterFeatureSource,
                        QgsProcessingParameterFeatureSink,
                        QgsProcessingParameterField,
+                       QgsProcessingParameterString,
                        QgsFeature,
                        QgsGeometry,
                        QgsPointXY,
@@ -25,14 +38,142 @@ class PlaceKpPointsFromCsvAlgorithm(QgsProcessingAlgorithm):
     INPUT_TABLE = 'INPUT_TABLE'
     INPUT_LINE = 'INPUT_LINE'
     KP_FIELD = 'KP_FIELD'
+    PASTED_KPS = 'PASTED_KPS'
     OUTPUT = 'OUTPUT'
+
+    _DEFAULT_COL_PREFIX = 'col_'
+
+    @staticmethod
+    def _safe_field_name(name: str, used: set) -> str:
+        name = (name or '').strip()
+        if not name:
+            name = 'col'
+        name = name.lower()
+        name = re.sub(r"\s+", "_", name)
+        name = re.sub(r"[^a-z0-9_]+", "", name)
+        if not name:
+            name = 'col'
+
+        base = name
+        i = 2
+        while name in used:
+            name = f"{base}_{i}"
+            i += 1
+        used.add(name)
+        return name
+
+    @staticmethod
+    def _parse_kp(value) -> Optional[float]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+
+        text = text.replace("\u00a0", " ").strip()
+        if "," in text and "." not in text:
+            text = text.replace(",", ".")
+        elif "," in text and "." in text:
+            text = text.replace(",", "")
+
+        cleaned = re.sub(r"[^0-9+\-\.]+", "", text)
+        if cleaned in {"", ".", "+", "-"}:
+            return None
+        try:
+            return float(cleaned)
+        except Exception:
+            return None
+
+    @classmethod
+    def _parse_pasted_kps(cls, raw_text: str) -> Tuple[List[str], List[Tuple[float, List[str]]]]:
+        """Parse pasted rows into (extra_column_names, rows).
+
+        Returns:
+            extra_column_names: list of names for columns 2..N
+            rows: list of tuples (kp_value, extras)
+        """
+
+        if raw_text is None:
+            return ([], [])
+        text = str(raw_text).strip()
+        if not text:
+            return ([], [])
+
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        lines = [ln for ln in text.split("\n") if ln.strip()]
+        if not lines:
+            return ([], [])
+
+        sample = "\n".join(lines[:10])
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=["\t", ",", ";", "|"])
+        except Exception:
+            dialect = csv.excel_tab
+
+        reader = csv.reader(io.StringIO(text), dialect=dialect)
+        parsed_rows: List[List[str]] = []
+        for row in reader:
+            if not row:
+                continue
+            trimmed = [str(c).strip() for c in row]
+            if not any(trimmed):
+                continue
+            parsed_rows.append(trimmed)
+
+        if not parsed_rows:
+            return ([], [])
+
+        header = None
+        first = parsed_rows[0]
+        first_kp = first[0] if len(first) > 0 else ""
+        if cls._parse_kp(first_kp) is None:
+            header = first
+            data_rows = parsed_rows[1:]
+        else:
+            data_rows = parsed_rows
+
+        max_cols = max(len(r) for r in ([header] if header else []) + data_rows) if data_rows else (len(header) if header else 1)
+        max_cols = max(max_cols, 1)
+        extra_count = max(0, max_cols - 1)
+
+        used_names = set()
+        extra_names: List[str] = []
+        for idx in range(extra_count):
+            if header and len(header) >= (idx + 2) and header[idx + 1].strip():
+                candidate = header[idx + 1]
+            else:
+                candidate = f"{cls._DEFAULT_COL_PREFIX}{idx + 2}"
+            extra_names.append(cls._safe_field_name(candidate, used_names))
+
+        rows: List[Tuple[float, List[str]]] = []
+        for r in data_rows:
+            if len(r) < 1:
+                continue
+            kp = cls._parse_kp(r[0])
+            if kp is None:
+                continue
+            extras: List[str] = []
+            for idx in range(extra_count):
+                extras.append(r[idx + 1] if len(r) >= (idx + 2) else "")
+            rows.append((float(kp), extras))
+
+        return (extra_names, rows)
 
     def initAlgorithm(self, config=None):
         self.addParameter(
             QgsProcessingParameterFeatureSource(
                 self.INPUT_TABLE,
                 self.tr('Input Table of KPs'),
-                [QgsProcessing.TypeVector]
+                [QgsProcessing.TypeVector],
+                optional=True
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterString(
+                self.PASTED_KPS,
+                self.tr('Paste KP points (Excel/CSV text)'),
+                multiLine=True,
+                optional=True
             )
         )
         self.addParameter(
@@ -47,7 +188,8 @@ class PlaceKpPointsFromCsvAlgorithm(QgsProcessingAlgorithm):
                 self.KP_FIELD,
                 self.tr('KP Field'),
                 parentLayerParameterName=self.INPUT_TABLE,
-                type=QgsProcessingParameterField.Numeric
+                type=QgsProcessingParameterField.Numeric,
+                optional=True
             )
         )
         self.addParameter(
@@ -58,20 +200,44 @@ class PlaceKpPointsFromCsvAlgorithm(QgsProcessingAlgorithm):
         )
 
     def processAlgorithm(self, parameters, context, feedback):
-        input_table = self.parameterAsSource(parameters, self.INPUT_TABLE, context)
         line_layer = self.parameterAsSource(parameters, self.INPUT_LINE, context)
-        kp_field = self.parameterAsString(parameters, self.KP_FIELD, context)
 
-        if input_table is None:
-            raise QgsProcessingException(self.invalidSourceError(parameters, self.INPUT_TABLE))
+        pasted_text = self.parameterAsString(parameters, self.PASTED_KPS, context)
+        use_pasted = bool(pasted_text and pasted_text.strip())
+
+        input_table = None
+        kp_field = None
+        extra_names: List[str] = []
+        pasted_rows: List[Tuple[float, List[str]]] = []
+
+        if use_pasted:
+            extra_names, pasted_rows = self._parse_pasted_kps(pasted_text)
+            if not pasted_rows:
+                feedback.reportError('No valid KP rows parsed from pasted text.')
+        else:
+            input_table = self.parameterAsSource(parameters, self.INPUT_TABLE, context)
+            kp_field = self.parameterAsString(parameters, self.KP_FIELD, context)
+            if input_table is None:
+                raise QgsProcessingException('Provide either an input table of KPs or pasted KP points text.')
+            if not kp_field:
+                raise QgsProcessingException('KP Field is required when using an input table layer.')
+
         if line_layer is None:
             raise QgsProcessingException(self.invalidSourceError(parameters, self.INPUT_LINE))
 
-        # Create fields for the output layer, copying from the input table
-        source_fields = input_table.fields()
+        # Create fields for the output layer
         output_fields = QgsFields()
-        for field in source_fields:
-            output_fields.append(field)
+        source_fields = None
+        if use_pasted:
+            # For pasted values, we only have extras as strings
+            for name in extra_names:
+                output_fields.append(QgsField(name, QVariant.String))
+        else:
+            # Copy all fields from the input table
+            source_fields = input_table.fields()
+            for field in source_fields:
+                output_fields.append(field)
+
         output_fields.append(QgsField('source_line', QVariant.String))
         output_fields.append(QgsField('kp_value', QVariant.Double))
 
@@ -104,75 +270,124 @@ class PlaceKpPointsFromCsvAlgorithm(QgsProcessingAlgorithm):
 
         line_parts = merged_geometry.asMultiPolyline() if merged_geometry.isMultipart() else [merged_geometry.asPolyline()]
 
-        input_features = list(input_table.getFeatures())
-        total_rows = len(input_features)
-        points_placed = 0
 
-        for current, feature in enumerate(input_features):
-            if feedback.isCanceled():
-                break
-            
-            try:
-                kp_val = float(feature[kp_field])
-            except (ValueError, KeyError):
-                feedback.reportError(f"Invalid KP value in row {current + 1}. Skipping.")
-                continue
-
-            kp_dist_m = kp_val * 1000
+        def _place_point_at_kp(kp_val: float) -> Optional[QgsGeometry]:
+            kp_dist_m = kp_val * 1000.0
             if kp_dist_m > total_length_m:
-                feedback.reportError(f"KP value {kp_val} is beyond the line's total length of {total_length_m/1000:.3f} km. Skipping.")
-                continue
+                return None
 
             cumulative_length = 0.0
-            point_found = False
             for part in line_parts:
                 for i in range(len(part) - 1):
-                    p1, p2 = part[i], part[i+1]
-                    segment_length = distance_calculator.measureLine(p1, p2)
-                    
+                    p1, p2 = part[i], part[i + 1]
+                    segment_length = float(distance_calculator.measureLine(p1, p2))
+                    if segment_length <= 0:
+                        continue
+
                     if cumulative_length + segment_length >= kp_dist_m:
                         dist_into_segment = kp_dist_m - cumulative_length
-                        ratio = dist_into_segment / segment_length if segment_length > 0 else 0
-                        
+                        ratio = dist_into_segment / segment_length
                         x = p1.x() + ratio * (p2.x() - p1.x())
                         y = p1.y() + ratio * (p2.y() - p1.y())
-                        point_geom = QgsGeometry.fromPointXY(QgsPointXY(x, y))
-                        
-                        out_feat = QgsFeature(output_fields)
-                        out_feat.setGeometry(point_geom)
-                        
-                        # Copy attributes from source feature
-                        for i in range(len(source_fields)):
-                            out_feat.setAttribute(i, feature.attribute(source_fields.at(i).name()))
-                        
-                        out_feat.setAttribute('source_line', line_layer.sourceName())
-                        out_feat.setAttribute('kp_value', kp_val)
-                        
-                        sink.addFeature(out_feat, QgsFeatureSink.FastInsert)
-                        points_placed += 1
-                        point_found = True
-                        break
-                    
+                        return QgsGeometry.fromPointXY(QgsPointXY(x, y))
+
                     cumulative_length += segment_length
-                if point_found:
+            return None
+
+        points_placed = 0
+        if use_pasted:
+            total_rows = len(pasted_rows)
+            for current, (kp_val, extras) in enumerate(pasted_rows):
+                if feedback.isCanceled():
                     break
-            
-            feedback.setProgress(int((current + 1) / total_rows * 100))
+
+                point_geom = _place_point_at_kp(kp_val)
+                if point_geom is None:
+                    feedback.reportError(
+                        f"KP value {kp_val} is beyond the line's total length of {total_length_m/1000:.3f} km, or could not be placed. Skipping."
+                    )
+                    continue
+
+                out_feat = QgsFeature(output_fields)
+                out_feat.setGeometry(point_geom)
+
+                # extras first (as defined by output_fields)
+                for idx, val in enumerate(extras):
+                    out_feat.setAttribute(idx, val)
+
+                out_feat.setAttribute('source_line', line_layer.sourceName())
+                out_feat.setAttribute('kp_value', kp_val)
+
+                sink.addFeature(out_feat, QgsFeatureSink.FastInsert)
+                points_placed += 1
+
+                feedback.setProgress(int((current + 1) / max(total_rows, 1) * 100))
+        else:
+            input_features = list(input_table.getFeatures())
+            total_rows = len(input_features)
+
+            for current, feature in enumerate(input_features):
+                if feedback.isCanceled():
+                    break
+
+                try:
+                    kp_val = float(feature[kp_field])
+                except (ValueError, KeyError, TypeError):
+                    feedback.reportError(f"Invalid KP value in row {current + 1}. Skipping.")
+                    continue
+
+                point_geom = _place_point_at_kp(kp_val)
+                if point_geom is None:
+                    feedback.reportError(
+                        f"KP value {kp_val} is beyond the line's total length of {total_length_m/1000:.3f} km, or could not be placed. Skipping."
+                    )
+                    continue
+
+                out_feat = QgsFeature(output_fields)
+                out_feat.setGeometry(point_geom)
+
+                # Copy attributes from source feature
+                for i in range(len(source_fields)):
+                    out_feat.setAttribute(i, feature.attribute(source_fields.at(i).name()))
+
+                out_feat.setAttribute('source_line', line_layer.sourceName())
+                out_feat.setAttribute('kp_value', kp_val)
+
+                sink.addFeature(out_feat, QgsFeatureSink.FastInsert)
+                points_placed += 1
+
+                feedback.setProgress(int((current + 1) / max(total_rows, 1) * 100))
 
         feedback.pushInfo(self.tr(f"Placed {points_placed} points."))
         return {self.OUTPUT: dest_id}
 
     def shortHelpString(self):
         return self.tr("""
-This tool places points along a line layer based on KP values from a table (e.g., a CSV file). All columns from the input table will be included in the output layer.
+This tool places points along a line layer based on KP values.
+
+You can provide KPs either:
+
+1) From a table layer (like a loaded CSV with no geometry), OR
+2) By pasting rows directly from Excel/CSV into the 'Paste KP points' box.
+
+For pasted text, the first column is interpreted as KP (in km). Any other columns are carried through to the output as text fields.
 
 **Instructions:**
 
-1.  **Load your CSV:** First, load your CSV file into QGIS. Go to "Layer" -> "Add Layer" -> "Add Delimited Text Layer...". In the dialog, select your file and choose "No geometry (attribute only table)".
-2.  **Input Table of KPs:** Select the newly loaded table layer from the 'Input Table of KPs' dropdown.
-3.  **Input Line Layer:** Choose the line layer on which you want to place the KP points. The tool will treat all lines in this layer as a single, continuous route.
-4.  **KP Field:** From the dropdown, select the column in your input table that contains the Kilometer Point (KP) values.
-5.  **Run:** Execute the tool. The output will be a new point layer with points placed at the specified KPs. All other columns from your input table will be copied to the output layer.
+**Option A: Table layer**
+
+1.  **Load your CSV:** Load your CSV into QGIS ("Add Delimited Text Layer..." -> "No geometry").
+2.  **Input Table of KPs:** Select the table layer.
+3.  **KP Field:** Select the numeric KP column.
+4.  **Input Line Layer:** Choose the line layer route.
+5.  **Run**
+
+**Option B: Paste from Excel**
+
+1.  Copy one or more columns from Excel (KP, then any extra columns).
+2.  Paste into 'Paste KP points (Excel/CSV text)'.
+3.  Select the line layer route.
+4.  Run.
 """)
 
     def name(self):

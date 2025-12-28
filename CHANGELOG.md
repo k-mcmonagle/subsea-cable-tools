@@ -18,11 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Merge KP Range Tables:** New Processing tool under "KP Ranges" to combine two KP-range tables with mismatched intervals.
   - Supports canonical segmentation (non-overlapping KP intervals), summarise (Table B values into Table A ranges with min/max/avg or aggregated single value), and a simple lookup mode (copy one field with overlap resolution rules).
   - Includes overlap handling options (first/most-specific/min/max/mean/weighted-mean/error), optional full-coverage checks, and remembers last-used parameters between runs.
+- **Group Adjacent KP Ranges by Field:** New processing tool under "KP Ranges" that merges consecutive KP intervals sharing the same attribute value, keeping one feature per run and optionally nulling conflicting other fields.
 - **KP Range Depth + Slope Summary:** New Processing tool under "KP Ranges" to sample bathymetry along KP-range line features and append summary fields.
   - Supports Raster(s) (prefers highest resolution where rasters overlap) or 1–2 Contour layers (minor/major) with selectable depth fields.
   - Outputs depth min/max/avg, along-route slope min/max/avg, and cross-track (side slope) min/max/avg.
   - Includes optional adaptive raster sampling (step derived from raster resolution along the route) and optional directional extremes (up/down, port/stbd).
-- **Identify Hazards in Lay Corridor.** New XXXXXXXXXXXXXXXXXX 
+- **Identify Hazards in Lay Corridor:** Processing tool that compares point, line, and polygon layers against a lay corridor polygon and RPL reference, exporting point/line/area proximity listings with KP/DCC, lat/lon, and JSON-encoded source attributes for every encroaching feature.
+- **Export Chartlets Based on KP Range List:** Processing tool that walks through each KP range/segment (table or geometry) and creates a per-section map PNG, either using segment geometries directly or extracting the KP span from an RPL line, with configurable extra buffers, exported layers, and layout elements.
 
 ### Changed
 - **KP Mouse Map Tool:** Improved to calculate KP based on geodetic measurements by default, with option for Cartesian calculations when the layer uses a projected CRS. Also added option to sample depth value at the mouse position from a raster or contour layer using right click. Also added option to configure the copy to clipboard function. Also added a "Go to KP..." option in the dropdown
