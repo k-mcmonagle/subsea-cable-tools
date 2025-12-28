@@ -1,5 +1,6 @@
 from qgis.PyQt.QtCore import QCoreApplication, QVariant
 from qgis.core import (
+    QgsApplication,
     QgsProcessing,
     QgsProcessingAlgorithm,
     QgsProcessingParameterFile,
@@ -22,7 +23,10 @@ from qgis.core import (
     QgsRasterLayer
 )
 from qgis import processing
-import numpy as np
+try:
+    import numpy as np
+except Exception:  # pragma: no cover
+    np = None
 import os
 
 class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
@@ -111,6 +115,18 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
 
     def processAlgorithm(self, parameters, context, feedback):
         """Main processing logic for the algorithm."""
+        if np is None:
+            raise QgsProcessingException(
+                'NumPy is required for this tool but could not be imported. '
+                'Please install/enable NumPy for your QGIS Python environment.'
+            )
+
+        def alg_available(algorithm_id: str) -> bool:
+            try:
+                return QgsApplication.processingRegistry().algorithmById(algorithm_id) is not None
+            except Exception:
+                return False
+
         # --- 1. Get Parameters ---
         # Accept comma-separated list for multiple files, or a single file
         xyz_path_raw = self.parameterAsFile(parameters, self.INPUT_XYZ, context)
@@ -248,6 +264,11 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
             
             if method_index == 0:  # Direct Rasterization
                 feedback.pushInfo('Using direct rasterization method (gdal:rasterize)...')
+                if not alg_available('gdal:rasterize'):
+                    raise QgsProcessingException(
+                        "Required Processing algorithm 'gdal:rasterize' is not available. "
+                        'This usually means the GDAL Processing provider is not installed or not enabled.'
+                    )
                 rasterize_params = {
                     'INPUT': gdal_input,
                     'FIELD': 'z', # The Z field defined in our VRT
@@ -263,27 +284,13 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
 
             else:  # IDW Interpolation
                 feedback.pushInfo('Using interpolation method (gdal:grididw)...')
-                gdal_params = {
-                    'INPUT': gdal_input,
-                    'Z_FIELD': 'z', # The Z field defined in our VRT
-                    'POWER': 2.0,
-                    'SMOOTHING': 0.0,
-                    'RADIUS': max_distance,
-                    'MAX_POINTS': 12,
-                    'MIN_POINTS': 1,
-                    'NODATA': -9999.0,
-                    'DATA_TYPE': 5, # Float32
-                    'OUTPUT': output_raster_path,
-                    'EXTRA': f'-txe {extent.xMinimum()} {extent.xMaximum()} -tye {extent.yMinimum()} {extent.yMaximum()} -outsize {width} {height}'
-                }
-                try:
-                    result = processing.run('gdal:grididw', gdal_params, context=context, feedback=feedback)
-                except QgsProcessingException as e:
-                    feedback.pushWarning(f'gdal:grididw failed: {e}. Falling back to native:idwinterpolation.')
-                    # For the native QGIS algorithm, we load the VRT as a proper layer first
+                if not alg_available('gdal:grididw'):
+                    feedback.pushWarning(
+                        "Processing algorithm 'gdal:grididw' is not available. Falling back to native:idwinterpolation."
+                    )
                     point_layer = QgsVectorLayer(vrt_path, "points_for_idw", "ogr")
-                    # Construct INTERPOLATION_DATA string: layer_id::~::field_index::~::use_z::~::type (0 for points)
-                    # Since z is field, find index
+                    if not point_layer.isValid():
+                        raise QgsProcessingException('Failed to load temporary VRT as a vector layer for IDW fallback.')
                     field_index = point_layer.fields().indexFromName('z')
                     interp_data = f"{point_layer.id()}::~::{field_index}::~::0::~::0"
                     idw_params = {
@@ -294,6 +301,40 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
                         'OUTPUT': output_raster_path
                     }
                     result = processing.run('native:idwinterpolation', idw_params, context=context, feedback=feedback)
+                else:
+                    gdal_params = {
+                        'INPUT': gdal_input,
+                        'Z_FIELD': 'z', # The Z field defined in our VRT
+                        'POWER': 2.0,
+                        'SMOOTHING': 0.0,
+                        'RADIUS': max_distance,
+                        'MAX_POINTS': 12,
+                        'MIN_POINTS': 1,
+                        'NODATA': -9999.0,
+                        'DATA_TYPE': 5, # Float32
+                        'OUTPUT': output_raster_path,
+                        'EXTRA': f'-txe {extent.xMinimum()} {extent.xMaximum()} -tye {extent.yMinimum()} {extent.yMaximum()} -outsize {width} {height}'
+                    }
+                    try:
+                        result = processing.run('gdal:grididw', gdal_params, context=context, feedback=feedback)
+                    except QgsProcessingException as e:
+                        feedback.pushWarning(f'gdal:grididw failed: {e}. Falling back to native:idwinterpolation.')
+                        # For the native QGIS algorithm, we load the VRT as a proper layer first
+                        point_layer = QgsVectorLayer(vrt_path, "points_for_idw", "ogr")
+                        if not point_layer.isValid():
+                            raise QgsProcessingException('Failed to load temporary VRT as a vector layer for IDW fallback.')
+                        # Construct INTERPOLATION_DATA string: layer_id::~::field_index::~::use_z::~::type (0 for points)
+                        # Since z is field, find index
+                        field_index = point_layer.fields().indexFromName('z')
+                        interp_data = f"{point_layer.id()}::~::{field_index}::~::0::~::0"
+                        idw_params = {
+                            'INTERPOLATION_DATA': interp_data,
+                            'DISTANCE_COEFFICIENT': 2.0,
+                            'EXTENT': extent,
+                            'PIXEL_SIZE': grid_size,
+                            'OUTPUT': output_raster_path
+                        }
+                        result = processing.run('native:idwinterpolation', idw_params, context=context, feedback=feedback)
 
             if not result or not result.get('OUTPUT'):
                 raise QgsProcessingException(f'Raster creation failed for {os.path.basename(xyz_path)}. Check the processing log for more details.')
@@ -301,6 +342,11 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
             # If compression is enabled, use gdal:translate to compress to final output
             if compress:
                 feedback.pushInfo('Applying LZW compression using gdal:translate...')
+                if not alg_available('gdal:translate'):
+                    raise QgsProcessingException(
+                        "Compression requested but Processing algorithm 'gdal:translate' is not available. "
+                        'Enable the GDAL Processing provider or disable compression.'
+                    )
                 translate_params = {
                     'INPUT': output_raster_path,
                     'OUTPUT': final_output,
