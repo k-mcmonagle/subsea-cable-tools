@@ -17,12 +17,12 @@ import csv
 import sys
 import os
 import io
-
-# Path to the sample CSV file
-CSV_PATH = r"C:\Users\McMonaglek\OneDrive - Global Marine Systems Limited\Documents\PROJECTS\QGIS Live Ship Data Trial\SampleData\EMCS_S013_Lay_Data_cable_lay.csv"
+import argparse
 
 HOST = 'localhost'
 PORT = 12345
+
+DEFAULT_CSV_PATH = os.path.join(os.path.dirname(__file__), 'sample.csv')
 
 def load_csv_data(csv_path):
     """Load headers and all rows from CSV file."""
@@ -92,5 +92,18 @@ def start_server(headers, data):
         server_socket.close()
 
 if __name__ == "__main__":
-    headers, data = load_csv_data(CSV_PATH)
+    parser = argparse.ArgumentParser(
+        description="Serve CSV rows over TCP for Subsea Cable Tools Live Data testing."
+    )
+    parser.add_argument(
+        "--csv",
+        dest="csv_path",
+        default=DEFAULT_CSV_PATH,
+        help=(
+            "Path to CSV file to serve. Defaults to 'sample.csv' in this script folder."
+        ),
+    )
+    args = parser.parse_args()
+
+    headers, data = load_csv_data(args.csv_path)
     start_server(headers, data)

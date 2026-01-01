@@ -25,6 +25,30 @@ Accessible via the QGIS Processing Toolbox under **Subsea Cable Tools**:
 - **KP Data Plotter** – New dockable tool for plotting KP-based data from table layers against a reference line, with interactive crosshair, map marker, support for multiple data fields, y-axis reversal, and tooltips.
 - **Straight Line Diagram (SLD)** – Dockable SLD plot for an RPL line + events layer with a synced map marker.
 - **SLD KP Ranges (NEW)** – Use a table layer of KP ranges as the single source of truth and visualise the same ranges on the SLD and on the map at the same time.
+- **Live Data Tool** – Dockable tool for receiving and displaying real-time data (map point + cards/plots/tables) from incoming text strings.
+
+#### Live Data Tool quick start
+
+1. Open **Live Data**.
+2. In **Live Data Control → Connection**, set Host/Port and choose a **Message Format**.
+3. Set **Latitude Field** / **Longitude Field** to match the parsed field names.
+4. Click **Connect** (TCP) or use **Mock/Test** to replay a table layer as live data.
+
+#### Message Formats
+
+The Live Data Tool is **string-first**: it receives raw lines (typically from TCP) and parses each line into fields.
+
+Supported formats:
+
+- `csv_header`: First non-empty line is a CSV header row, subsequent lines are records
+- `csv_fixed`: Records are CSV with a fixed, user-defined column list
+- `kv`: Key/value pairs (e.g. `Lat_dd=...,Lon_dd=...,Heading=...`)
+- `json`: One JSON object per line
+- `regex`: Regex with named capture groups (advanced)
+
+#### Mock/Test (no external server required)
+
+Use **Live Data Control → Mock/Test** to replay an existing table layer already loaded in your QGIS project. This runs through the same parsing pipeline as TCP, and is intended to replace the old “CSV over TCP” test server script for most workflows.
 
 #### SLD KP Ranges quick start
 1. Open the **Straight Line Diagram** dock.

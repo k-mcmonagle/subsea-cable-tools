@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.4.0] - 2025-10-10
 ### Added
 - **Live Data Tool:** New dockable tool for receiving and plotting real-time ship position data from a TCP server. Basic tool for now but would like to add live trend graphs and possibly use QGIS as client screens onboard.
-- **Catenary Calculator v2 (Experimental):** Added an updated/alternative catenary calculator dialog (v2). Experimental for now and still in testing.
+- **Catenary Calculator v2 (Experimental):** Added an updated/alternative catenary calculator dialog (v2). Can model multi-segment and bodies within a cable assembly. Experimental for now and still in testing.
 - **Plot Line Segments from Table:** New processing algorithm under "Other Tools" to create line segments from a table layer with start and end latitude/longitude columns. Optionally creates a point layer for the endpoints. All original attributes are preserved with a source_table field added.
 - **Extract A/C Points from RPL:** New processing algorithm to extract Alter Course points from an RPL line (including multi-feature routes), outputting KP, turn angle, and optional threshold/bin fields for easy symbology.
 - **RPL Route Comparison:** New processing algorithm to compare design vs as-laid RPL routes, calculating position offsets including radial, along-track, and cross-track distances.
@@ -35,11 +35,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added optional adaptive raster sampling (step derived from raster resolution along the route).
 - **Transit Measure Tool:** Added a Quick Buffer tool to apply a buffer to the route.
 - **Processing Toolbox Grouping:** Made some changes to the grouping to try to make it more intuitive.
+- **QGIS Compatibility Baseline:** Updated declared minimum QGIS version to 3.22.
+- **Qt Imports:** Standardised plugin-owned Qt imports to `qgis.PyQt` for improved cross-install compatibility.
+- **Optional Plotting Dependencies:** Plotting-heavy dock widgets (e.g. matplotlib-dependent) are now imported lazily so the plugin can still load if optional deps are missing.
 
 ### Fixed
 - Added option to invert slope angle/percentage calculation in Depth Profile tool, with default not inverted.
 - Fixed some cleanup issues with the transit measure tool.
 - Fixed an issue with the Nearest KP tool not working well with RPLs that have multisegment splits.
+- **Processing Provider Robustness:** Provider now registers algorithms defensively so a single tool import failure won't hide the whole toolbox.
+- **MBES Raster (XYZ) Robustness:** Added GDAL algorithm availability checks and fallback logic for IDW interpolation.
+- **MBES Raster (XYZ) Bugfix:** Fixed an indentation error in the IDW branch which could prevent the tool from running.
+- **MDB Import Robustness:** Made the MDB import tool resilient to missing `pyodbc` (fails at runtime with a clear message instead of breaking provider load).
+- **Plotting Dependency Reliability:** Vendored `pyqtgraph` under `lib/` to avoid requiring users to install it separately.
 
 ## [1.3.0] - 2025-09-06
 

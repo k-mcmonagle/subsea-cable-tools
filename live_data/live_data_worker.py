@@ -1,13 +1,22 @@
-"""
-Live Data Worker
+"""Live Data Worker
 
 Threading worker that receives data from a TCP socket and emits signals.
-Handles CSV parsing and header extraction.
+
+The worker is **string-first**: it receives raw lines and then parses them via
+`live_data.message_parser` using a user-configurable message format.
 """
 
 from qgis.PyQt.QtCore import QThread, pyqtSignal
+
 import socket
-import csv
+from typing import Optional
+
+from .message_parser import (
+    MessageFormatConfig,
+    ParserState,
+    parse_line,
+    MessageParseError,
+)
 
 
 class LiveDataWorker(QThread):
@@ -26,7 +35,16 @@ class LiveDataWorker(QThread):
     headers_received = pyqtSignal(list)
     raw_data_received = pyqtSignal(str)
 
-    def __init__(self, host: str, port: int, lat_field: str, lon_field: str, persist: bool):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        lat_field: str,
+        lon_field: str,
+        persist: bool,
+        parser_config: Optional[MessageFormatConfig] = None,
+        encoding: str = "utf-8",
+    ):
         """
         Initialize the live data worker.
         
@@ -44,7 +62,11 @@ class LiveDataWorker(QThread):
         self.lon_field = lon_field
         self.persist = persist
         self.running = True
-        self.headers = []
+
+        self._parser_config = parser_config or MessageFormatConfig()
+        self._parser_state = ParserState()
+        self._encoding = encoding or "utf-8"
+        self._last_error: Optional[str] = None
 
     def get_persist(self) -> bool:
         """Return the persist setting for this worker."""
@@ -62,48 +84,41 @@ class LiveDataWorker(QThread):
             self.status_changed.emit("Connected")
             buffer = ""
 
-            # Receive headers first
-            while '\n' not in buffer and self.running:
-                try:
-                    data = sock.recv(1024)
-                    if not data:
-                        print(f"DEBUG: No data received from server (headers)")
-                        break
-                    buffer += data.decode('utf-8')
-                except socket.timeout:
-                    print(f"DEBUG: Socket timeout while waiting for headers")
-                    break
-            
-            if '\n' in buffer:
-                header_line, buffer = buffer.split('\n', 1)
-                header_reader = csv.reader([header_line])
-                self.headers = list(header_reader)[0]
-                print(f"DEBUG: Headers received: {self.headers}")
-                self.headers_received.emit(self.headers)
-            else:
-                print(f"DEBUG: No headers received - buffer was: {buffer}")
-                self.status_changed.emit("Error: No headers received")
-                return
-
-            # Then receive data
+            # Receive and process line-delimited messages.
+            # We don't assume a header line exists; the parser config defines the behavior.
             while self.running:
                 try:
                     data = sock.recv(1024)
                     if not data:
                         print(f"DEBUG: Connection closed by server")
                         break
-                    buffer += data.decode('utf-8')
+                    buffer += data.decode(self._encoding, errors="replace")
                     lines = buffer.split('\n')
                     buffer = lines[-1]  # Keep incomplete line
                     for line in lines[:-1]:
-                        if line.strip():
-                            self.raw_data_received.emit(line)
-                            # Parse CSV line
-                            reader = csv.reader([line])
-                            row = next(reader)
-                            data_dict = dict(zip(self.headers, row))
-                            print(f"Parsed line: {line}, row: {row}, data_dict: {data_dict}")
-                            self.data_received.emit(data_dict)
+                        line = (line or "").rstrip("\r")
+                        if not line.strip():
+                            continue
+
+                        self.raw_data_received.emit(line)
+
+                        try:
+                            values, new_headers = parse_line(line, self._parser_config, self._parser_state)
+                            if new_headers is not None:
+                                self.headers_received.emit(new_headers)
+                            if values is not None:
+                                self.data_received.emit(values)
+                            self._last_error = None
+                        except MessageParseError as e:
+                            msg = str(e)
+                            if msg != self._last_error:
+                                self.status_changed.emit(f"Parse error: {msg}")
+                                self._last_error = msg
+                        except Exception as e:
+                            msg = str(e)
+                            if msg != self._last_error:
+                                self.status_changed.emit(f"Error: {msg}")
+                                self._last_error = msg
                 except socket.timeout:
                     print(f"DEBUG: Socket timeout while waiting for data")
                     break

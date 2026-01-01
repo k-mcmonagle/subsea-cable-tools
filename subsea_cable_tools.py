@@ -22,20 +22,10 @@ from .maptools.kp_mouse_maptool import KPMouseTool
 
 # Import the processing provider
 from .processing.subsea_cable_processing_provider import SubseaCableProcessingProvider
-# Import the KP Plotter Dock Widget
 
-from .kp_plotter_dockwidget import KpPlotterDockWidget
-from .depth_profile_dockwidget import DepthProfileDockWidget
-from .live_data.live_data_dockwidget import LiveDataDockWidget
-from .live_data.live_data_cards_dockwidget import LiveDataCardsDockWidget
-from .live_data.live_data_plots_dockwidget import LiveDataPlotsDockWidget
-from .live_data.live_data_table_dockwidget import LiveDataTableDockWidget
-from .live_data.live_data_control_dialog import LiveDataControlDialog
-# Import the Catenary Calculator Dialog
-from .catenary_calculator_dialog import CatenaryCalculatorDialog
-from .catenary_calculator_v2_dialog import CatenaryCalculatorV2Dialog
-from .maptools.transit_measure_tool import TransitMeasureTool
-from .sld_dockwidget import StraightLineDiagramDockWidget
+# NOTE: Some dock widgets depend on optional 3rd-party Python packages (e.g. matplotlib).
+# To avoid plugin-load failures on systems missing those deps, we import them lazily
+# inside the action handlers (show_* methods) and provide a clear error if unavailable.
 
 
 class SubseaCableTools:
@@ -92,6 +82,8 @@ class SubseaCableTools:
         self.transit_measure_tool = None
         self.sld_dock = None
         self.sld_action = None
+        self.rpl_manager_dock = None
+        self.rpl_manager_action = None
 
     def tr(self, message):
         """Return the translation for a string."""
@@ -180,16 +172,32 @@ class SubseaCableTools:
         self.iface.addPluginToMenu(self.menu, self.transit_measure_action)
         self.actions.append(self.transit_measure_action)
 
-        # Straight Line Diagram (SLD) Tool action (uses plugin icon)
-        sld_icon = QIcon(":/plugins/subsea_cable_tools/icon.png")
-        self.sld_action = QAction(sld_icon, "SLD", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
-        self.sld_action.triggered.connect(self.show_sld)
-        self.iface.addToolBarIcon(self.sld_action)
-        self.iface.addPluginToMenu(self.menu, self.sld_action)
-        self.actions.append(self.sld_action)
+        # NOTE: The legacy standalone SLD dock is no longer exposed as a separate tool.
+        # The SLD UI is embedded inside the RPL Manager.
+
+        # RPL Manager Tool action (uses plugin icon)
+        rpl_icon = QIcon(":/plugins/subsea_cable_tools/icon.png")
+        self.rpl_manager_action = QAction(rpl_icon, "RPL Manager", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
+        self.rpl_manager_action.triggered.connect(self.show_rpl_manager)
+        self.iface.addToolBarIcon(self.rpl_manager_action)
+        self.iface.addPluginToMenu(self.menu, self.rpl_manager_action)
+        self.actions.append(self.rpl_manager_action)
 
     def show_catenary_calculator(self):
         if self.catenary_calculator_dialog is None:
+            try:
+                from .catenary_calculator_dialog import CatenaryCalculatorDialog
+            except Exception as e:
+                from qgis.PyQt.QtWidgets import QMessageBox
+
+                QMessageBox.critical(
+                    self.iface.mainWindow(),
+                    "Subsea Cable Tools",
+                    "Catenary Calculator could not be opened.\n\n"
+                    f"Details: {e}",
+                )
+                return
+
             self.catenary_calculator_dialog = CatenaryCalculatorDialog(self.iface.mainWindow())
         self.catenary_calculator_dialog.show()
         self.catenary_calculator_dialog.raise_()
@@ -199,6 +207,19 @@ class SubseaCableTools:
 
     def show_catenary_calculator_v2(self):
         if self.catenary_calculator_v2_dialog is None:
+            try:
+                from .catenary_calculator_v2_dialog import CatenaryCalculatorV2Dialog
+            except Exception as e:
+                from qgis.PyQt.QtWidgets import QMessageBox
+
+                QMessageBox.critical(
+                    self.iface.mainWindow(),
+                    "Subsea Cable Tools",
+                    "Catenary Calculator V2 could not be opened.\n\n"
+                    f"Details: {e}",
+                )
+                return
+
             self.catenary_calculator_v2_dialog = CatenaryCalculatorV2Dialog(self.iface.mainWindow())
         self.catenary_calculator_v2_dialog.show()
         self.catenary_calculator_v2_dialog.raise_()
@@ -290,6 +311,18 @@ class SubseaCableTools:
             except Exception:
                 pass
             self.sld_dock = None
+
+        # Clean up RPL Manager dock
+        if hasattr(self, 'rpl_manager_dock') and self.rpl_manager_dock:
+            try:
+                self.iface.removeDockWidget(self.rpl_manager_dock)
+            except Exception:
+                pass
+            try:
+                self.rpl_manager_dock.deleteLater()
+            except Exception:
+                pass
+            self.rpl_manager_dock = None
 
         # Clean up live data manager dialog
         if hasattr(self, 'live_data_manager_dialog') and self.live_data_manager_dialog:
@@ -464,6 +497,19 @@ class SubseaCableTools:
     def show_plotter(self):
         """Show the KP Data Plotter dock widget."""
         if not self.plotter_dock:
+            try:
+                from .kp_plotter_dockwidget import KpPlotterDockWidget
+            except Exception as e:
+                from qgis.PyQt.QtWidgets import QMessageBox
+
+                QMessageBox.critical(
+                    self.iface.mainWindow(),
+                    "Subsea Cable Tools",
+                    "KP Plot could not be opened. This tool requires optional plotting dependencies (e.g. matplotlib).\n\n"
+                    f"Details: {e}",
+                )
+                return
+
             self.plotter_dock = KpPlotterDockWidget(self.iface)
             self.iface.addDockWidget(Qt.RightDockWidgetArea, self.plotter_dock)
         self.plotter_dock.show()
@@ -471,12 +517,42 @@ class SubseaCableTools:
     def show_depth_profile(self):
         """Show the Depth Profile dock widget."""
         if not self.depth_profile_dock:
+            try:
+                from .depth_profile_dockwidget import DepthProfileDockWidget
+            except Exception as e:
+                from qgis.PyQt.QtWidgets import QMessageBox
+
+                QMessageBox.critical(
+                    self.iface.mainWindow(),
+                    "Subsea Cable Tools",
+                    "Depth Profile could not be opened. This tool requires optional plotting dependencies (e.g. matplotlib).\n\n"
+                    f"Details: {e}",
+                )
+                return
+
             self.depth_profile_dock = DepthProfileDockWidget(self.iface)
             self.iface.addDockWidget(Qt.RightDockWidgetArea, self.depth_profile_dock)
         self.depth_profile_dock.show()
 
     def show_live_data(self):
         """Show the Live Data manager dialog which controls all sub-widgets."""
+
+        try:
+            from .live_data.live_data_dockwidget import LiveDataDockWidget
+            from .live_data.live_data_cards_dockwidget import LiveDataCardsDockWidget
+            from .live_data.live_data_plots_dockwidget import LiveDataPlotsDockWidget
+            from .live_data.live_data_table_dockwidget import LiveDataTableDockWidget
+            from .live_data.live_data_control_dialog import LiveDataControlDialog
+        except Exception as e:
+            from qgis.PyQt.QtWidgets import QMessageBox
+
+            QMessageBox.critical(
+                self.iface.mainWindow(),
+                "Subsea Cable Tools",
+                "Live Data could not be opened. This tool requires optional plotting dependencies (e.g. matplotlib).\n\n"
+                f"Details: {e}",
+            )
+            return
         
         # Create all dock widgets on first call (lazy initialization)
         if not self.live_data_dock:
@@ -595,12 +671,19 @@ class SubseaCableTools:
             
             # Overlays config
             self.live_data_manager_dialog.overlays_config_changed.connect(
-                self.live_data_dock.set_overlays_config
+                self.on_overlays_config_changed
             )
             
             # Connection control - wire dialog buttons to dock widget
             self.live_data_manager_dialog.connect_requested.connect(self.on_connect_requested)
             self.live_data_manager_dialog.disconnect_requested.connect(self.on_disconnect_requested)
+
+            # Mock/testing
+            self.live_data_manager_dialog.mock_start_requested.connect(self.on_mock_start_requested)
+            self.live_data_manager_dialog.mock_stop_requested.connect(self.on_mock_stop_requested)
+
+            # Active slot selection
+            self.live_data_manager_dialog.active_slot_changed.connect(self.on_active_slot_changed)
             
             # Wire dock widget signals to dialog for status updates
             self.live_data_dock.connected_state_changed.connect(
@@ -616,25 +699,80 @@ class SubseaCableTools:
         self.live_data_manager_dialog.activateWindow()
 
     def show_sld(self):
-        """Show the Straight Line Diagram dock widget."""
-        if not self.sld_dock:
-            self.sld_dock = StraightLineDiagramDockWidget(self.iface)
-            self.iface.addDockWidget(Qt.RightDockWidgetArea, self.sld_dock)
-        self.sld_dock.show()
+        """Legacy entry point: route to the embedded SLD within RPL Manager."""
+        self.show_rpl_manager()
+        try:
+            # Select the embedded SLD tab if present.
+            dock = self.rpl_manager_dock
+            if dock and hasattr(dock, "tab_widget"):
+                for i in range(dock.tab_widget.count()):
+                    if (dock.tab_widget.tabText(i) or "").strip().endswith("SLD"):
+                        dock.tab_widget.setCurrentIndex(i)
+                        break
+        except Exception:
+            pass
+
+    def show_rpl_manager(self):
+        """Show the RPL Manager dock widget."""
+        if not self.rpl_manager_dock:
+            try:
+                from .rpl_manager import RplManagerDockWidget
+            except Exception as e:
+                from qgis.PyQt.QtWidgets import QMessageBox
+
+                QMessageBox.critical(
+                    self.iface.mainWindow(),
+                    "Subsea Cable Tools",
+                    "RPL Manager could not be opened.\n\n"
+                    f"Details: {e}",
+                )
+                return
+
+            self.rpl_manager_dock = RplManagerDockWidget(self.iface)
+            self.iface.addDockWidget(Qt.RightDockWidgetArea, self.rpl_manager_dock)
+        self.rpl_manager_dock.show()
     
-    def on_connect_requested(self, host: str, port: int):
+    def on_connect_requested(self, config: dict):
         """Handle Connect button from control dialog."""
-        print(f"DEBUG: on_connect_requested - host={host}, port={port}")
-        if self.live_data_dock:
-            self.live_data_dock.host_edit.setText(host)
-            self.live_data_dock.port_edit.setText(str(port))
-            self.live_data_dock.connect_server()
+        if not self.live_data_dock:
+            return
+
+        self.live_data_dock.connect_slot(config)
     
-    def on_disconnect_requested(self):
+    def on_disconnect_requested(self, config: dict):
         """Handle Disconnect button from control dialog."""
         print(f"DEBUG: on_disconnect_requested")
-        if self.live_data_dock:
-            self.live_data_dock.disconnect_server()
+        if not self.live_data_dock:
+            return
+        slot_id = (config or {}).get("slot_id")
+        if slot_id:
+            self.live_data_dock.disconnect_slot(str(slot_id))
+
+    def on_mock_start_requested(self, config: dict):
+        """Start mock playback using dock widget backend."""
+        if not self.live_data_dock:
+            return
+
+        self.live_data_dock.start_mock_slot(config)
+
+    def on_mock_stop_requested(self, config: dict):
+        if not self.live_data_dock:
+            return
+        slot_id = (config or {}).get("slot_id")
+        if slot_id:
+            self.live_data_dock.disconnect_slot(str(slot_id))
+
+    def on_overlays_config_changed(self, payload: dict):
+        if not self.live_data_dock:
+            return
+        slot_id = (payload or {}).get("slot_id")
+        configs = (payload or {}).get("configs")
+        if slot_id:
+            self.live_data_dock.set_overlays_config_for_slot(str(slot_id), configs)
+
+    def on_active_slot_changed(self, slot_id: str):
+        if self.live_data_dock and slot_id:
+            self.live_data_dock.set_active_slot(str(slot_id))
     
     def on_live_data_connection_changed(self, connected: bool):
         """Update control dialog with connection status."""
@@ -704,6 +842,19 @@ class SubseaCableTools:
 
     def activate_transit_measure_tool(self):
         if self.transit_measure_tool is None:
+            try:
+                from .maptools.transit_measure_tool import TransitMeasureTool
+            except Exception as e:
+                from qgis.PyQt.QtWidgets import QMessageBox
+
+                QMessageBox.critical(
+                    self.iface.mainWindow(),
+                    "Subsea Cable Tools",
+                    "Transit Measure could not be activated.\n\n"
+                    f"Details: {e}",
+                )
+                return
+
             self.transit_measure_tool = TransitMeasureTool(self.iface)
         self.iface.mapCanvas().setMapTool(self.transit_measure_tool)
         # If the tool is already active, QGIS may not call QgsMapTool.activate() again.

@@ -63,6 +63,7 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
         safe_add('identify_rpl_area_listing_algorithm', 'IdentifyRPLAreaListingAlgorithm')
         safe_add('identify_rpl_lay_corridor_proximity_listing_algorithm', 'IdentifyRPLLayCorridorProximityListingAlgorithm')
         safe_add('export_kp_section_chartlets_algorithm', 'ExportKPSectionChartletsAlgorithm')
+        safe_add('convert_imported_rpl_to_managed_gpkg_algorithm', 'ConvertImportedRplToManagedGpkgAlgorithm')
 
 
     def id(self):

@@ -23,6 +23,8 @@ Plot convention:
 - Depth = -y (so seabed is +depth, above sea is negative depth)
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 from typing import TYPE_CHECKING
@@ -32,9 +34,10 @@ from qgis.PyQt.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
     QTextEdit, QWidget, QFormLayout, QSizePolicy, QFileDialog, QDoubleSpinBox,
     QTabWidget, QTableWidget, QTableWidgetItem, QMessageBox, QHeaderView
-    , QCheckBox
+    , QCheckBox, QColorDialog
 )
-from qgis.PyQt.QtCore import Qt, QSettings
+from qgis.PyQt.QtCore import Qt, QSettings, QTimer
+from qgis.PyQt.QtGui import QColor
 from matplotlib.figure import Figure
 from matplotlib.collections import LineCollection
 
@@ -70,6 +73,7 @@ class AssemblyItem:
     q_water_npm: float  # absolute weight (N/m) for segments
     q_air_npm: float
     point_load_kN: float  # bodies: +ve = weight down, -ve = buoyancy up
+    color_hex: str = ""  # optional per-segment colour (e.g. "#RRGGBB")
 
 @dataclass
 class Component:
@@ -321,55 +325,163 @@ class CatenarySystemCalculator:
                 )
             ds_eff = S_free_m / n_steps
 
+            # Build a unified list of split events along free-span (s from TDP upward).
+            # We split at:
+            #  - point loads (apply instantaneous delta-V)
+            #  - assembly segment boundaries (q changes)
+            #  - legacy component boundaries (q changes)
+            # Sea-level changes are handled separately inside integrate_with_sea_split.
+            split_events: List[Tuple[float, float]] = []  # (s_event, point_load_N_at_event)
+
+            # 1) Point loads
+            if assembly:
+                d_cursor = 0.0
+                for it in assembly:
+                    if it.kind == "segment":
+                        d_cursor += max(0.0, it.length_m)
+                        continue
+                    if it.kind != "body":
+                        continue
+                    if abs(it.point_load_kN) < 1e-12:
+                        continue
+
+                    d_body = d_cursor
+                    if d_body < L_chute_contact:
+                        continue
+                    if d_body > (L_chute_contact + S_free_m):
+                        continue
+
+                    s_body = S_free_m - (d_body - L_chute_contact)
+                    if 0.0 < s_body < S_free_m:
+                        split_events.append((float(s_body), float(it.point_load_kN) * 1000.0))
+            else:
+                for c in comps:
+                    if not c.is_point:
+                        continue
+                    sp = float(c.position_m)
+                    if 0.0 < sp < S_free_m:
+                        split_events.append((sp, float(c.point_load_kN) * 1000.0))
+
+            # 2) Assembly segment boundaries (q changes)
+            if assembly:
+                d_cursor = 0.0
+                for it in assembly:
+                    if it.kind != "segment":
+                        continue
+                    d_cursor += max(0.0, it.length_m)
+                    # boundary at this cumulative distance from chute top
+                    d_b = d_cursor
+                    if d_b <= L_chute_contact:
+                        continue
+                    if d_b >= (L_chute_contact + S_free_m):
+                        continue
+                    s_b = S_free_m - (d_b - L_chute_contact)
+                    if 0.0 < s_b < S_free_m:
+                        split_events.append((float(s_b), 0.0))
+
+            # 3) Legacy component boundaries (q changes)
+            if not assembly and comps:
+                for c in comps:
+                    if c.length_m <= 0:
+                        continue
+                    s0 = float(c.position_m)
+                    s1 = float(c.position_m + c.length_m)
+                    if 0.0 < s0 < S_free_m:
+                        split_events.append((s0, 0.0))
+                    if 0.0 < s1 < S_free_m:
+                        split_events.append((s1, 0.0))
+
+            # Merge events at same/similar s
+            if split_events:
+                split_events.sort(key=lambda t: t[0])
+                merged: List[Tuple[float, float]] = []
+                tol_s = max(1e-9, 0.25 * ds_eff)
+                cur_s, cur_load = split_events[0]
+                for se, ld in split_events[1:]:
+                    if abs(se - cur_s) <= tol_s:
+                        cur_load += ld
+                    else:
+                        merged.append((cur_s, cur_load))
+                        cur_s, cur_load = se, ld
+                merged.append((cur_s, cur_load))
+                split_events = merged
+
+            ev_idx = 0
+
             for _ in range(n_steps):
                 s_prev = s
 
                 def do_substep(ds_local: float, y_for_medium: float, s_local_end: float):
                     nonlocal V, x, y
-                    V = self._apply_point_loads(s_prev, s_local_end, V, S_free_m, L_chute_contact, assembly, comps)
                     q = self._q_effective(y_for_medium, s_local_end, S_free_m, L_chute_contact, assembly, comps)
+                    if ds_local <= 0:
+                        return
+
+                    # Midpoint (RK2) in arc-length: improves accuracy vs explicit Euler.
+                    V_mid = V + 0.5 * q * ds_local
+                    T_mid = math.sqrt(H_N * H_N + V_mid * V_mid)
+                    if T_mid <= 0:
+                        raise ValueError("Non-physical tension encountered during integration.")
+                    x += (H_N / T_mid) * ds_local
+                    y += (V_mid / T_mid) * ds_local
                     V = V + q * ds_local
 
-                    T = math.sqrt(H_N * H_N + V * V)
-                    if T <= 0:
-                        raise ValueError("Non-physical tension encountered.")
-                    x += (H_N / T) * ds_local
-                    y += (V / T) * ds_local
+                def integrate_with_sea_split(s_target: float):
+                    """Integrate from current s to s_target, splitting once at y=0 if crossed."""
+                    nonlocal s, x, y, V, sea_cross_s
+                    ds_local = s_target - s
+                    if ds_local <= 0:
+                        s = s_target
+                        return
+
+                    y_before = y
+                    V_before = V
+                    x_before = x
+
+                    do_substep(ds_local, y_before, s_target)
+                    y_after = y
+
+                    if sea_cross_s is None and ((y_before < 0 <= y_after) or (y_before > 0 >= y_after)):
+                        # rollback and split
+                        y = y_before
+                        V = V_before
+                        x = x_before
+
+                        if abs(y_after - y_before) < 1e-12:
+                            frac = 0.5
+                        else:
+                            frac = (0.0 - y_before) / (y_after - y_before)
+                            frac = float(max(0.0, min(1.0, frac)))
+
+                        ds1 = ds_local * frac
+                        ds2 = ds_local - ds1
+                        s_mid = s + ds1
+
+                        if ds1 > 0:
+                            do_substep(ds1, y_before, s_mid)
+                        sea_cross_s = s_mid
+
+                        y_eps = 1e-9 if y_before < 0 else -1e-9
+                        if ds2 > 0:
+                            do_substep(ds2, y_eps, s_target)
+
+                    s = s_target
 
                 s_full = s + ds_eff
 
-                y_before = y
-                V_before = V
-                x_before = x
+                # Advance through any point-load events in (s, s_full], applying them exactly at event s.
+                while ev_idx < len(split_events) and split_events[ev_idx][0] <= s + 1e-12:
+                    ev_idx += 1
 
-                do_substep(ds_eff, y_before, s_full)
-                y_after = y
+                while ev_idx < len(split_events) and (s < split_events[ev_idx][0] <= s_full):
+                    s_event, load_N = split_events[ev_idx]
+                    integrate_with_sea_split(float(s_event))
+                    # Apply point-load (if any) exactly at this location.
+                    if abs(load_N) > 1e-12:
+                        V += float(load_N)
+                    ev_idx += 1
 
-                if sea_cross_s is None and ((y_before < 0 <= y_after) or (y_before > 0 >= y_after)):
-                    # rollback
-                    y = y_before
-                    V = V_before
-                    x = x_before
-
-                    if abs(y_after - y_before) < 1e-12:
-                        frac = 0.5
-                    else:
-                        frac = (0.0 - y_before) / (y_after - y_before)
-                        frac = float(max(0.0, min(1.0, frac)))
-
-                    ds1 = ds_eff * frac
-                    ds2 = ds_eff - ds1
-                    s_mid = s + ds1
-
-                    if ds1 > 0:
-                        do_substep(ds1, y_before, s_mid)
-                    sea_cross_s = s_mid
-
-                    y_eps = 1e-9 if y_before < 0 else -1e-9
-                    if ds2 > 0:
-                        do_substep(ds2, y_eps, s_full)
-
-                s = s_full
+                integrate_with_sea_split(s_full)
 
                 s_list.append(s)
                 x_list.append(x)
@@ -411,89 +523,8 @@ class CatenarySystemCalculator:
 
         return x_end, y_end, V_end, theta_end, top_T, s_arr, x_arr, y_arr
 
-        # Start at touchdown (TDP)
-        s = 0.0
-        x = 0.0
-        y = -D
-        V = 0.0
-
-        s_list = [0.0]
-        x_list = [x]
-        y_list = [y]
-
-        # Track sea surface crossing
-        sea_cross_s = None
-
-        # Steps
-        n_steps = max(1, int(math.ceil(S_free_m / ds)))
-        ds_eff = S_free_m / n_steps  # ensure we end exactly at S_free_m
-
-        for i in range(n_steps):
-            s_prev = s
-            # Attempt a full step; if it crosses sea surface, split the step at y=0.
-            def do_substep(ds_local: float, y_for_medium: float, s_local_end: float):
-                nonlocal V, x, y
-                # Apply any point loads that occur within (s_prev, s_local_end]
-                V = self._apply_point_loads(s_prev, s_local_end, V, S_free_m, L_chute_contact, assembly, comps)
-                q = self._q_effective(y_for_medium, s_local_end, S_free_m, L_chute_contact, assembly, comps)
-                V = V + q * ds_local
-
-                T = math.sqrt(H_N * H_N + V * V)
-                if T <= 0:
-                    raise ValueError("Non-physical tension encountered.")
-                x += (H_N / T) * ds_local
-                y += (V / T) * ds_local
-
-            s_full = s + ds_eff
-
-            # Predict crossing using a provisional substep
-            y_before = y
-            V_before = V
-            x_before = x
-
-            do_substep(ds_eff, y_before, s_full)
-            y_after = y
-
-            # If we crossed sea level, redo the step in two parts
-            if sea_cross_s is None and ((y_before < 0 <= y_after) or (y_before > 0 >= y_after)):
-                # rollback
-                y = y_before
-                V = V_before
-                x = x_before
-
-                # Use linear interpolation fraction
-                if abs(y_after - y_before) < 1e-12:
-                    frac = 0.5
-                else:
-                    frac = (0.0 - y_before) / (y_after - y_before)
-                    frac = float(max(0.0, min(1.0, frac)))
-
-                ds1 = ds_eff * frac
-                ds2 = ds_eff - ds1
-                s_mid = s + ds1
-
-                if ds1 > 0:
-                    do_substep(ds1, y_before, s_mid)
-                sea_cross_s = s_mid
-
-                # second part uses medium on the other side
-                y_eps = 1e-9 if y_before < 0 else -1e-9
-                if ds2 > 0:
-                    do_substep(ds2, y_eps, s_full)
-
-            s = s_full
-
-            s_list.append(s)
-            x_list.append(x)
-            y_list.append(y)
-
-        # End quantities
-        theta = math.atan2(V, H_N)  # from horizontal
-        top_T = math.sqrt(H_N * H_N + V * V)
-
-        self.s_sea_surface = sea_cross_s
-
-        return x, y, V, theta, top_T, np.array(s_list), np.array(x_list), np.array(y_list)
+        # Note: a previous inline integrator implementation used to live here.
+        # It was duplicated and unreachable (after return). It has been removed for clarity.
 
     # --- Root-finding helpers
 
@@ -504,24 +535,44 @@ class CatenarySystemCalculator:
         """
         a = max(1e-12, x0 - step)
         b = x0 + step
-        fa = func(a)
-        fb = func(b)
+
+        last_eval_err: Optional[Exception] = None
+
+        def safe_eval(x: float) -> float:
+            nonlocal last_eval_err
+            try:
+                last_eval_err = None
+                return float(func(x))
+            except Exception as e:
+                last_eval_err = e
+                return float("nan")
+
+        fa = safe_eval(a)
+        fb = safe_eval(b)
 
         for _ in range(max_expand):
             if fa == 0:
                 return a, a
             if fb == 0:
                 return b, b
-            if fa * fb < 0:
+            if (not math.isnan(fa)) and (not math.isnan(fb)) and fa * fb < 0:
                 return a, b
             # Expand
             step *= 1.6
             a = max(1e-12, x0 - step)
             b = x0 + step
-            fa = func(a)
-            fb = func(b)
+            fa = safe_eval(a)
+            fb = safe_eval(b)
 
-        raise ValueError("Could not bracket a root for the chosen input values.")
+        if last_eval_err is not None:
+            raise ValueError(
+                "Could not bracket a root because the function failed to evaluate in the search range. "
+                f"Last evaluation error: {last_eval_err}"
+            )
+        raise ValueError(
+            "Could not bracket a root for the chosen input values. "
+            f"Tried x in roughly [{a:.3g}, {b:.3g}] around x0={x0:.3g}; f(a)={fa:.3g}, f(b)={fb:.3g}."
+        )
 
     @staticmethod
     def _bisect(func, a: float, b: float, tol: float = 1e-6, max_iter: int = 120) -> float:
@@ -586,8 +637,16 @@ class CatenarySystemCalculator:
                 self.cfg["chute_contact_len_m"] = Lc
                 return y_end - y_dep
 
-            a, b = self._bracket_root(fS, x0=S_guess, step=max(5.0, 0.2 * S_guess))
-            return self._bisect(fS, a, b, tol=1e-4)
+            try:
+                a, b = self._bracket_root(fS, x0=S_guess, step=max(5.0, 0.2 * S_guess))
+                return self._bisect(fS, a, b, tol=1e-4)
+            except Exception as e:
+                raise ValueError(
+                    "Failed to find a free-span length S_free that reaches the chute departure height. "
+                    f"This usually means the configuration is infeasible or the solver could not bracket a solution. "
+                    f"Try increasing ds (coarser integration), reducing extreme point loads, or checking weights/units. "
+                    f"(H={H/1000.0:.3f} kN, initial S_guess={S_guess:.3f} m)\n\nDetails: {e}"
+                )
 
         # Mode 1: Catenary Length (total suspended length S is input). Solve H for y_target.
         if mode == "Catenary Length":
@@ -600,8 +659,15 @@ class CatenarySystemCalculator:
                 return (S_free + Lc) - S_total_in
 
             H0 = max(1.0, self.cfg.get("H_guess_N", 50_000.0))
-            a, b = self._bracket_root(fH_total_len, x0=H0, step=max(5_000.0, 0.2 * H0))
-            H = self._bisect(fH_total_len, a, b, tol=1e-3)
+            try:
+                a, b = self._bracket_root(fH_total_len, x0=H0, step=max(5_000.0, 0.2 * H0))
+                H = self._bisect(fH_total_len, a, b, tol=1e-3)
+            except Exception as e:
+                raise ValueError(
+                    "Failed to solve for Bottom Tension (H) that matches the requested total suspended length. "
+                    "This can happen if the required length is incompatible with the geometry/weights or if bracketing fails. "
+                    f"(Requested S={S_total_in:.3f} m, initial H_guess={H0/1000.0:.3f} kN)\n\nDetails: {e}"
+                )
             S_free = solve_S_free_for_H(H)
             x_end, y_end, V_end, theta_end, T_top, s_arr, x_arr, y_arr = self.integrate(H, S_free, ds)
             Lc, _ = chute_contact_from_theta(theta_end)
@@ -633,8 +699,16 @@ class CatenarySystemCalculator:
                 return layback_top - layback_top_target
 
             H0 = max(1.0, self.cfg.get("H_guess_N", 50_000.0))
-            a, b = self._bracket_root(fH_layback_top, x0=H0, step=max(5_000.0, 0.25 * H0))
-            H = self._bisect(fH_layback_top, a, b, tol=1e-3)
+            try:
+                a, b = self._bracket_root(fH_layback_top, x0=H0, step=max(5_000.0, 0.25 * H0))
+                H = self._bisect(fH_layback_top, a, b, tol=1e-3)
+            except Exception as e:
+                raise ValueError(
+                    "Failed to solve for Bottom Tension (H) that matches the requested layback. "
+                    "This can happen if the layback target is not achievable for the given geometry/weights, "
+                    "or if bracketing fails due to non-monotonic behavior (strong buoyancy/point loads). "
+                    f"(Requested layback={layback_top_target:.3f} m, initial H_guess={H0/1000.0:.3f} kN)\n\nDetails: {e}"
+                )
             S_free = solve_S_free_for_H(H)
             x_end, y_end, V_end, theta_end, T_top, s_arr, x_arr, y_arr = self.integrate(H, S_free, ds)
             Lc, _ = chute_contact_from_theta(theta_end)
@@ -662,8 +736,16 @@ class CatenarySystemCalculator:
                 return theta_end - theta_target_rad
 
             H0 = max(1.0, self.cfg.get("H_guess_N", 50_000.0))
-            a, b = self._bracket_root(fH_exit_angle, x0=H0, step=max(5_000.0, 0.25 * H0))
-            H = self._bisect(fH_exit_angle, a, b, tol=1e-6)
+            try:
+                a, b = self._bracket_root(fH_exit_angle, x0=H0, step=max(5_000.0, 0.25 * H0))
+                H = self._bisect(fH_exit_angle, a, b, tol=1e-6)
+            except Exception as e:
+                raise ValueError(
+                    "Failed to solve for H that matches the requested exit angle. "
+                    "This usually means the target angle is not achievable for the given geometry/weights, "
+                    "or that strong point loads/buoyancy make the relationship non-monotonic. "
+                    f"(Requested exit angle={math.degrees(theta_target_rad):.3f}° from horizontal, initial H_guess={H0/1000.0:.3f} kN)\n\nDetails: {e}"
+                )
             # final solve for free span
             def fS_final(S_free):
                 _, y_end, _, _, _, _, _, _ = self.integrate(H, S_free, ds)
@@ -688,8 +770,15 @@ class CatenarySystemCalculator:
                 return T_top - T_top_target_N
 
             H0 = max(1.0, min(T_top_target_N * 0.9, self.cfg.get("H_guess_N", 50_000.0)))
-            a, b = self._bracket_root(fH_top_tension, x0=H0, step=max(5_000.0, 0.25 * H0))
-            H = self._bisect(fH_top_tension, a, b, tol=5.0)
+            try:
+                a, b = self._bracket_root(fH_top_tension, x0=H0, step=max(5_000.0, 0.25 * H0))
+                H = self._bisect(fH_top_tension, a, b, tol=5.0)
+            except Exception as e:
+                raise ValueError(
+                    "Failed to solve for H that matches the requested top tension. "
+                    "This can happen if the requested top tension is outside the achievable range for the given geometry/weights. "
+                    f"(Requested top tension={T_top_target_N/1000.0:.3f} kN, initial H_guess={H0/1000.0:.3f} kN)\n\nDetails: {e}"
+                )
             S_free = solve_S_free_for_H(H)
             x_end, y_end, V_end, theta_end, T_top, s_arr, x_arr, y_arr = self.integrate(H, S_free, ds)
             Lc, _ = chute_contact_from_theta(theta_end)
@@ -768,6 +857,27 @@ class CatenarySystemCalculator:
 # ---------------------------
 
 class CatenaryCalculatorV2Dialog(QDialog):
+    ASM_COL_TYPE = 0
+    ASM_COL_NAME = 1
+    ASM_COL_LENGTH = 2
+    ASM_COL_Q_WATER = 3
+    ASM_COL_Q_AIR = 4
+    ASM_COL_BODY_LOAD = 5
+    ASM_COL_COLOR = 6
+
+    _DEFAULT_SEGMENT_COLORS = [
+        "#1f77b4",  # tab:blue
+        "#ff7f0e",  # tab:orange
+        "#2ca02c",  # tab:green
+        "#d62728",  # tab:red
+        "#9467bd",  # tab:purple
+        "#8c564b",  # tab:brown
+        "#e377c2",  # tab:pink
+        "#7f7f7f",  # tab:gray
+        "#bcbd22",  # tab:olive
+        "#17becf",  # tab:cyan
+    ]
+
     def __init__(self, parent=None):
         super().__init__(parent)
         if np is None:
@@ -789,10 +899,20 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self._prev_angle_ref = 0
         self._last_calc: Optional[CatenarySystemCalculator] = None
 
+        # Debounce heavy recalculations while editing.
+        self._update_timer = QTimer(self)
+        self._update_timer.setSingleShot(True)
+        self._update_timer.timeout.connect(self.update_plot)
+
         self.init_ui()
         self.restore_user_settings()
         self.update_input_fields()
         self.update_plot()
+
+    def schedule_update_plot(self):
+        """Debounced wrapper around `update_plot` for high-frequency UI signals."""
+        # 150ms feels responsive but avoids dozens of solves while typing.
+        self._update_timer.start(150)
 
     def closeEvent(self, a0):
         self.save_user_settings()
@@ -912,8 +1032,8 @@ class CatenaryCalculatorV2Dialog(QDialog):
         if col_widths_json is not None:
             try:
                 col_widths = json.loads(str(col_widths_json))
-                if isinstance(col_widths, list) and len(col_widths) == self.assembly_table.columnCount():
-                    for i, w in enumerate(col_widths):
+                if isinstance(col_widths, list):
+                    for i, w in enumerate(col_widths[: self.assembly_table.columnCount()]):
                         try:
                             self.assembly_table.setColumnWidth(i, int(w))
                         except Exception:
@@ -946,6 +1066,10 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.chute_radius.setRange(0, 1e4)
         self.chute_radius.setDecimals(2)
         self.chute_radius.setValue(0.0)
+        self.chute_radius.setToolTip(
+            "Chute radius used for geometry AND for optional chute-contact coupling. "
+            "Set to 0 to ignore chute contact (free-span goes to the chute top point)."
+        )
 
         self.ds_step = QDoubleSpinBox()
         self.ds_step.setRange(0.05, 10.0)
@@ -1009,7 +1133,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
         # Assembly (ordered from chute top down)
         self.assembly_tabs = QTabWidget()
 
-        self.assembly_table = QTableWidget(0, 6)
+        self.assembly_table = QTableWidget(0, 7)
         self.assembly_table.setHorizontalHeaderLabels([
             "Type",
             "Name",
@@ -1017,6 +1141,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             "q water (N/m)",
             "q air (N/m)",
             "Body load (kN)",
+            "Colour",
         ])
         self.assembly_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.assembly_table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -1065,7 +1190,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
         input_layout.addRow(QLabel("<b>Geometry</b>"))
         input_layout.addRow("Water Depth D (m):", self.water_depth)
         input_layout.addRow("Chute Exit Height c above WL (m):", self.chute_exit_height)
-        input_layout.addRow("Chute Radius R (m) (render only):", self.chute_radius)
+        input_layout.addRow("Chute Radius R (m):", self.chute_radius)
         input_layout.addRow("Integration step ds (m):", self.ds_step)
 
         input_layout.addRow(QLabel("<b>Cable Weight</b>"))
@@ -1153,24 +1278,25 @@ class CatenaryCalculatorV2Dialog(QDialog):
             self.bottom_tension, self.top_tension, self.exit_angle,
             self.catenary_length, self.layback
         ]:
-            w.valueChanged.connect(self.update_plot)
+            w.valueChanged.connect(self.schedule_update_plot)
 
-        self.weight_unit.currentIndexChanged.connect(self.update_plot)
+        self.weight_unit.currentIndexChanged.connect(self.schedule_update_plot)
         self.input_parameter.currentIndexChanged.connect(self.update_input_fields)
-        self.input_parameter.currentIndexChanged.connect(self.update_plot)
+        self.input_parameter.currentIndexChanged.connect(self.schedule_update_plot)
         self.angle_reference.currentIndexChanged.connect(self.on_angle_reference_changed)
-        self.components_text.textChanged.connect(self.update_plot)
-        self.assembly_tabs.currentChanged.connect(self.update_plot)
-        self.assembly_table.cellChanged.connect(self.update_plot)
+        self.components_text.textChanged.connect(self.schedule_update_plot)
+        self.assembly_tabs.currentChanged.connect(self.schedule_update_plot)
+        self.assembly_table.cellChanged.connect(self._on_assembly_table_cell_changed)
+        self.assembly_table.cellDoubleClicked.connect(self._on_assembly_table_cell_double_clicked)
         self.asm_add_seg_btn.clicked.connect(self._on_asm_add_segment)
         self.asm_add_body_btn.clicked.connect(self._on_asm_add_body)
         self.asm_del_btn.clicked.connect(self._on_asm_delete)
         self.asm_up_btn.clicked.connect(self._on_asm_move_up)
         self.asm_down_btn.clicked.connect(self._on_asm_move_down)
 
-        self.show_full_assembly_seabed.toggled.connect(self.update_plot)
+        self.show_full_assembly_seabed.toggled.connect(self.schedule_update_plot)
 
-        self.show_legend.toggled.connect(self.update_plot)
+        self.show_legend.toggled.connect(self.schedule_update_plot)
 
         self.export_svg_btn.clicked.connect(self.export_svg)
         self.export_dxf_btn.clicked.connect(self.export_dxf)
@@ -1286,7 +1412,21 @@ class CatenaryCalculatorV2Dialog(QDialog):
             elif mode == "Exit Angle":
                 cfg["exit_angle_from_h_deg"] = exit_angle_from_h
             elif mode == "Catenary Length":
-                cfg["S_input_m"] = float(self.catenary_length.value())
+                S_in = float(self.catenary_length.value())
+                # Hard lower bound: with positive weights the shortest suspended length is essentially
+                # a vertical hang from TDP to the lowest possible departure height, plus any chute contact.
+                # For the chute quarter-circle: at theta=pi/2 => Lc=R*pi/2 and y_dep=c-R.
+                # If c<R, the lowest departure is below sea level; vertical distance is then just D.
+                if R > 0:
+                    S_min = D + max(c - R, 0.0) + (math.pi / 2.0) * R
+                else:
+                    S_min = D + c
+                if S_in < S_min - 1e-6:
+                    raise ValueError(
+                        f"Total suspended length S={S_in:.3f} m is too short for the geometry. "
+                        f"Minimum feasible S is about {S_min:.3f} m (given D={D:.3f} m, c={c:.3f} m, R={R:.3f} m)."
+                    )
+                cfg["S_input_m"] = S_in
             elif mode == "Layback":
                 cfg["layback_input_m"] = float(self.layback.value())
             else:
@@ -1322,7 +1462,11 @@ class CatenaryCalculatorV2Dialog(QDialog):
             self._plot(calc)
 
         except Exception as e:
-            self.results.setHtml(f'<span style="color:red;">Error: {str(e)}</span>')
+            # Keep errors readable in the results pane.
+            msg = str(e)
+            msg = msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            msg = msg.replace("\n", "<br>")
+            self.results.setHtml(f'<span style="color:red;"><b>Error</b><br>{msg}</span>')
             self.figure.clear()
             self.canvas.draw()
 
@@ -1362,7 +1506,8 @@ class CatenaryCalculatorV2Dialog(QDialog):
     def _display_results(self, calc: CatenarySystemCalculator):
         D = self.water_depth.value()
         c = self.chute_exit_height.value()
-        flop_forward = (calc.S_total - calc.layback) if (calc.S_total and calc.layback) else None
+        flop_forward = (calc.S_total - calc.layback) if (calc.S_total is not None and calc.layback is not None) else None
+        flop_forward_txt = f"{flop_forward:.3f} m" if flop_forward is not None else "n/a"
         angle_from_vertical = 90.0 - (calc.exit_angle_deg_from_h or 0.0)
 
         assembly: List[AssemblyItem] = calc.cfg.get("assembly", [])
@@ -1402,7 +1547,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             f"Exit Angle: {calc.exit_angle_deg_from_h:.3f}° from horizontal / {angle_from_vertical:.3f}° from vertical<br>"
             f"Total Suspended Length (TDP→chute): {calc.S_total:.3f} m<br>"
             f"Layback (TDP→chute): {calc.layback:.3f} m<br>"
-            f"Flop Forward (S - layback): {flop_forward:.3f} m<br>"
+            f"Flop Forward (S - layback): {flop_forward_txt}<br>"
             f"Sea surface crossing at s ≈ {sea_txt}<br>"
             f"Minimum Radius of Curvature (incl chute): {calc.min_radius_m:.3f} m<br>"
             f"Assembly length: {asm_txt}<br>"
@@ -1427,7 +1572,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
         D = self.water_depth.value()
         c = self.chute_exit_height.value()
         R = self.chute_radius.value()
-        layback = calc.layback or float(x[-1])
+        layback = float(calc.layback) if calc.layback is not None else float(x[-1])
 
         # Cable (color by assembly segment if available)
         assembly: List[AssemblyItem] = calc.cfg.get("assembly", [])
@@ -1437,7 +1582,9 @@ class CatenaryCalculatorV2Dialog(QDialog):
             Lc = float(getattr(calc, "chute_contact_len_m", 0.0))
 
             # Determine segment index for each midpoint between points
-            seg_lengths = [max(0.0, it.length_m) for it in assembly if it.kind == "segment"]
+            seg_items = [it for it in assembly if it.kind == "segment"]
+            seg_lengths = [max(0.0, it.length_m) for it in seg_items]
+            seg_colors = [self._normalize_color_hex(getattr(it, "color_hex", "")) for it in seg_items]
             seg_starts: List[float] = []
             cursor = 0.0
             for L in seg_lengths:
@@ -1462,16 +1609,22 @@ class CatenaryCalculatorV2Dialog(QDialog):
             d_mid = Lc + (S_free - s_mid)
             idxs = [segment_index_for_d(float(d)) for d in d_mid]
 
+            # Prefer user-selected colours from the assembly table (per segment).
+            # If not provided, fall back to tab10.
             try:
                 import matplotlib.pyplot as plt  # local import to avoid global pyplot dependency
                 cmap = plt.get_cmap("tab10")
             except Exception:
                 cmap = None
 
-            if cmap is not None:
-                colors = [cmap(i % 10) for i in idxs]
-            else:
-                colors = [(0.1, 0.3, 0.8, 1.0) for _ in idxs]
+            colors: List[Any] = []
+            for i in idxs:
+                if 0 <= int(i) < len(seg_colors) and seg_colors[int(i)]:
+                    colors.append(seg_colors[int(i)])
+                elif cmap is not None:
+                    colors.append(cmap(int(i) % 10))
+                else:
+                    colors.append("#1f77b4")
 
             lc = LineCollection(segs, colors=colors, linewidths=2)
             ax.add_collection(lc)
@@ -1566,7 +1719,9 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 seabed_y = ys
 
                 # Color seabed line by segment, using d_from_top = S_total + distance_from_tdp_on_seabed
-                seg_lengths = [max(0.0, it.length_m) for it in assembly if it.kind == "segment"]
+                seg_items2 = [it for it in assembly if it.kind == "segment"]
+                seg_lengths = [max(0.0, it.length_m) for it in seg_items2]
+                seg_colors2 = [self._normalize_color_hex(getattr(it, "color_hex", "")) for it in seg_items2]
 
                 def segment_index_for_d(d_from_top: float) -> int:
                     if not seg_lengths:
@@ -1587,9 +1742,17 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 try:
                     import matplotlib.pyplot as plt
                     cmap2 = plt.get_cmap("tab10")
-                    colors2 = [cmap2(i % 10) for i in idxs2]
                 except Exception:
-                    colors2 = [(0.2, 0.2, 0.2, 1.0) for _ in idxs2]
+                    cmap2 = None
+
+                colors2: List[Any] = []
+                for i in idxs2:
+                    if 0 <= int(i) < len(seg_colors2) and seg_colors2[int(i)]:
+                        colors2.append(seg_colors2[int(i)])
+                    elif cmap2 is not None:
+                        colors2.append(cmap2(int(i) % 10))
+                    else:
+                        colors2.append("#7f7f7f")
 
                 lc2 = LineCollection(segs2, colors=colors2, linewidths=2, alpha=0.9)
                 ax.add_collection(lc2)
@@ -1974,13 +2137,15 @@ class CatenaryCalculatorV2Dialog(QDialog):
     def _assembly_from_table(self) -> List[AssemblyItem]:
         items: List[AssemblyItem] = []
         for r in range(self.assembly_table.rowCount()):
-            kind_raw = self._table_get_str(self.assembly_table, r, 0, default="segment").lower()
+            kind_raw = self._table_get_str(self.assembly_table, r, self.ASM_COL_TYPE, default="segment").lower()
             kind = "segment" if kind_raw.startswith("seg") else "body"
-            name = self._table_get_str(self.assembly_table, r, 1, default=("Segment" if kind == "segment" else "Body"))
-            length = self._table_get_float(self.assembly_table, r, 2, 0.0)
-            q_w = self._table_get_float(self.assembly_table, r, 3, 0.0)
-            q_a = self._table_get_float(self.assembly_table, r, 4, 0.0)
-            p_kN = self._table_get_float(self.assembly_table, r, 5, 0.0)
+            name = self._table_get_str(self.assembly_table, r, self.ASM_COL_NAME, default=("Segment" if kind == "segment" else "Body"))
+            length = self._table_get_float(self.assembly_table, r, self.ASM_COL_LENGTH, 0.0)
+            q_w = self._table_get_float(self.assembly_table, r, self.ASM_COL_Q_WATER, 0.0)
+            q_a = self._table_get_float(self.assembly_table, r, self.ASM_COL_Q_AIR, 0.0)
+            p_kN = self._table_get_float(self.assembly_table, r, self.ASM_COL_BODY_LOAD, 0.0)
+            color_hex = self._table_get_str(self.assembly_table, r, self.ASM_COL_COLOR, default="")
+            color_hex = self._normalize_color_hex(color_hex)
 
             if kind == "segment":
                 if length <= 0:
@@ -1988,9 +2153,9 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 if q_w <= 0 or q_a <= 0:
                     # allow blank to mean "use global" by keeping 0s
                     pass
-                items.append(AssemblyItem(kind=kind, name=name, length_m=length, q_water_npm=q_w, q_air_npm=q_a, point_load_kN=0.0))
+                items.append(AssemblyItem(kind=kind, name=name, length_m=length, q_water_npm=q_w, q_air_npm=q_a, point_load_kN=0.0, color_hex=color_hex))
             else:
-                items.append(AssemblyItem(kind=kind, name=name, length_m=0.0, q_water_npm=0.0, q_air_npm=0.0, point_load_kN=p_kN))
+                items.append(AssemblyItem(kind=kind, name=name, length_m=0.0, q_water_npm=0.0, q_air_npm=0.0, point_load_kN=p_kN, color_hex=""))
 
         return items
 
@@ -2009,6 +2174,8 @@ class CatenaryCalculatorV2Dialog(QDialog):
             ]
             for col, val in defaults:
                 self.assembly_table.setItem(r, col, QTableWidgetItem(str(val)))
+
+            self._set_assembly_color_cell(r, self._next_default_segment_color_hex())
             self.assembly_table.setCurrentCell(r, 1)
         finally:
             self.assembly_table.blockSignals(False)
@@ -2029,6 +2196,8 @@ class CatenaryCalculatorV2Dialog(QDialog):
             ]
             for col, val in defaults:
                 self.assembly_table.setItem(r, col, QTableWidgetItem(str(val)))
+
+            self._set_assembly_color_cell(r, "", enabled=False)
             self.assembly_table.setCurrentCell(r, 1)
         finally:
             self.assembly_table.blockSignals(False)
@@ -2099,8 +2268,106 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 self.assembly_table.insertRow(r)
                 for c in range(min(len(row), self.assembly_table.columnCount())):
                     self.assembly_table.setItem(r, c, QTableWidgetItem(str(row[c])))
+
+                # Ensure colour cell exists / has reasonable defaults for older saved tables.
+                self._ensure_assembly_color_cell(r)
         finally:
             self.assembly_table.blockSignals(False)
+
+    def _normalize_color_hex(self, value: str) -> str:
+        s = (value or "").strip()
+        if not s:
+            return ""
+        if not s.startswith("#"):
+            s = "#" + s
+        if len(s) != 7:
+            return ""
+        try:
+            _ = int(s[1:], 16)
+        except Exception:
+            return ""
+        return s.lower()
+
+    def _is_assembly_row_segment(self, row: int) -> bool:
+        kind_raw = self._table_get_str(self.assembly_table, row, self.ASM_COL_TYPE, default="segment").lower()
+        return kind_raw.startswith("seg")
+
+    def _next_default_segment_color_hex(self) -> str:
+        # Choose based on the count of existing segment rows (not total rows).
+        seg_count = 0
+        for r in range(self.assembly_table.rowCount()):
+            if self._is_assembly_row_segment(r):
+                seg_count += 1
+        return self._DEFAULT_SEGMENT_COLORS[seg_count % len(self._DEFAULT_SEGMENT_COLORS)]
+
+    def _set_assembly_color_cell(self, row: int, color_hex: str, enabled: bool = True):
+        # Show hex + a background swatch. Disable editing; colour is set via dialog.
+        item = self.assembly_table.item(row, self.ASM_COL_COLOR)
+        if item is None:
+            item = QTableWidgetItem("")
+            self.assembly_table.setItem(row, self.ASM_COL_COLOR, item)
+
+        color_hex = self._normalize_color_hex(color_hex)
+        item.setText(color_hex)
+        item.setToolTip("Double-click to pick a colour" if enabled else "(Colour applies to segment rows only)")
+
+        flags = item.flags()
+        flags = flags & ~Qt.ItemIsEditable
+        if enabled:
+            flags = flags | Qt.ItemIsEnabled
+        else:
+            flags = flags & ~Qt.ItemIsEnabled
+        item.setFlags(flags)
+
+        if enabled and color_hex:
+            try:
+                qcol = QColor(color_hex)
+                item.setBackground(qcol)
+            except Exception:
+                pass
+        else:
+            item.setBackground(QColor())
+
+    def _ensure_assembly_color_cell(self, row: int):
+        # Ensure the colour cell exists and is enabled only for segment rows.
+        is_seg = self._is_assembly_row_segment(row)
+        current = self._table_get_str(self.assembly_table, row, self.ASM_COL_COLOR, default="")
+        current = self._normalize_color_hex(current)
+        if is_seg and not current:
+            current = self._next_default_segment_color_hex()
+        self._set_assembly_color_cell(row, current, enabled=is_seg)
+
+    def _on_assembly_table_cell_changed(self, row: int, col: int):
+        # Keep the colour column consistent when users change the Type cell.
+        if col == self.ASM_COL_TYPE:
+            self.assembly_table.blockSignals(True)
+            try:
+                self._ensure_assembly_color_cell(row)
+            finally:
+                self.assembly_table.blockSignals(False)
+        self.schedule_update_plot()
+
+    def _on_assembly_table_cell_double_clicked(self, row: int, col: int):
+        if col != self.ASM_COL_COLOR:
+            return
+        if row < 0 or row >= self.assembly_table.rowCount():
+            return
+        if not self._is_assembly_row_segment(row):
+            return
+
+        current = self._table_get_str(self.assembly_table, row, self.ASM_COL_COLOR, default="")
+        current = self._normalize_color_hex(current)
+        initial = QColor(current) if current else QColor("#1f77b4")
+        chosen = QColorDialog.getColor(initial, self, "Select segment colour")
+        if not chosen.isValid():
+            return
+
+        self.assembly_table.blockSignals(True)
+        try:
+            self._set_assembly_color_cell(row, chosen.name(), enabled=True)
+        finally:
+            self.assembly_table.blockSignals(False)
+        self.update_plot()
 
 
     def _dxf_sanitize_layer(self, name: str) -> str:
