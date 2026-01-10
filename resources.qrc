@@ -1,5 +1,13 @@
 <RCC>
     <qresource prefix="/plugins/subsea_cable_tools" >
         <file>icon.png</file>
+        <file>catenary_icon.png</file>
+        <file>catenary_icon_v2.png</file>
+        <file>rpl_manager_icon.png</file>
+        <file>depth_profile_icon.png</file>
+        <file>kp_mouse_tool_icon.png</file>
+        <file>kp_plot_icon.png</file>
+        <file>live_data_icon.png</file>
+        <file>transit_measure_icon.png</file>
     </qresource>
 </RCC>

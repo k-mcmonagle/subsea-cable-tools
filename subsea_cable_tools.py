@@ -150,7 +150,7 @@ class SubseaCableTools:
         self.actions.append(self.catenary_action)
 
         # Add action for Catenary Calculator V2
-        icon_v2_path = os.path.join(self.plugin_dir, 'catenary_v2_icon.png')
+        icon_v2_path = os.path.join(self.plugin_dir, 'catenary_icon_v2.png')
         if not os.path.exists(icon_v2_path):
             icon_v2_path = os.path.join(self.plugin_dir, 'catenary_icon.png') # Fallback
         self.catenary_v2_action = QAction(QIcon(icon_v2_path), "Catenary Calculator V2", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
@@ -175,8 +175,13 @@ class SubseaCableTools:
         # NOTE: The legacy standalone SLD dock is no longer exposed as a separate tool.
         # The SLD UI is embedded inside the RPL Manager.
 
-        # RPL Manager Tool action (uses plugin icon)
-        rpl_icon = QIcon(":/plugins/subsea_cable_tools/icon.png")
+        # RPL Manager Tool action
+        rpl_icon_path = os.path.join(self.plugin_dir, 'rpl_manager_icon.png')
+        if os.path.exists(rpl_icon_path):
+            rpl_icon = QIcon(rpl_icon_path)
+        else:
+            # Fallback to plugin resource icon
+            rpl_icon = QIcon(":/plugins/subsea_cable_tools/icon.png")
         self.rpl_manager_action = QAction(rpl_icon, "RPL Manager", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
         self.rpl_manager_action.triggered.connect(self.show_rpl_manager)
         self.iface.addToolBarIcon(self.rpl_manager_action)
@@ -223,6 +228,7 @@ class SubseaCableTools:
             self.catenary_calculator_v2_dialog = CatenaryCalculatorV2Dialog(self.iface.mainWindow())
         self.catenary_calculator_v2_dialog.show()
         self.catenary_calculator_v2_dialog.raise_()
+        self.catenary_calculator_v2_dialog.activateWindow()
         self.catenary_calculator_v2_dialog.activateWindow()
 
         self.first_start = True
