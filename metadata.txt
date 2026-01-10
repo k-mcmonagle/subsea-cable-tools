@@ -2,7 +2,7 @@
 name=Subsea Cable Tools
 qgisMinimumVersion=3.22
 description=Tools to support working with subsea cable data in QGIS.
-version=1.4.0
+version=1.4.1
 author=Kieran McMonagle
 email=kieran.mcmonagle@globalmarine.group
 
