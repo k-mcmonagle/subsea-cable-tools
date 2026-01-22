@@ -89,7 +89,7 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
                 self.MODE,
                 self.tr('Buffer mode'),
                 options=[self.tr('Fixed buffer'), self.tr('Depth-based rules')],
-                defaultValue=1,
+                defaultValue=0,
             )
         )
 

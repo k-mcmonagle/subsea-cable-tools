@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **RPL Manager (BETA):** New comprehensive tool for managing cable route lifecycle, including structured GeoPackage storage for RPLs, assembly configuration, and integrated Straight Line Diagram (SLD) viewing.
 - **Convert RPL to Managed GeoPackage:** New processing algorithm to import legacy RPL formats into the new managed structure.
+- **Extract Lines Intersecting Polygons:** New processing algorithm under "Other Tools" to combine intersecting features from multiple line layers into a single output, with optional clip-to-polygon and CRS-safe processing.
+
+### Changed
+- **Identify RPL Lay Corridor Proximity Listing:** Added optional trim/clip-to-corridor for line/polygon listings (KP/DCC computed on clipped geometry) and made point/line/polygon inputs and outputs more flexible (runs with any provided geometry types and only produces corresponding outputs).
 
 ## [1.4.0] - 2025-10-10
 ### Added

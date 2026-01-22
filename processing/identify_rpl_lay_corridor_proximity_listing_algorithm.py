@@ -45,6 +45,7 @@ from qgis.core import (
     QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingLayerPostProcessorInterface,
+    QgsProcessingParameterBoolean,
     QgsProcessingParameterFeatureSink,
     QgsProcessingParameterFeatureSource,
     QgsProcessingParameterMultipleLayers,
@@ -100,6 +101,8 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
     INPUT_LINES = 'INPUT_LINES'
     INPUT_AREAS = 'INPUT_AREAS'
 
+    TRIM_TO_CORRIDOR = 'TRIM_TO_CORRIDOR'
+
     OUTPUT = 'OUTPUT'  # points (kept for backwards compatibility)
     OUTPUT_LINES = 'OUTPUT_LINES'
     OUTPUT_AREAS = 'OUTPUT_AREAS'
@@ -126,6 +129,7 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
                 self.INPUT_POINTS,
                 self.tr('Input point layer(s)'),
                 layerType=QgsProcessing.TypeVectorPoint,
+                optional=True,
             )
         )
 
@@ -148,9 +152,18 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
         )
 
         self.addParameter(
+            QgsProcessingParameterBoolean(
+                self.TRIM_TO_CORRIDOR,
+                self.tr('Trim (clip) output geometries to the Lay Corridor'),
+                defaultValue=True,
+            )
+        )
+
+        self.addParameter(
             QgsProcessingParameterFeatureSink(
                 self.OUTPUT,
                 self.tr('Output point proximity listing'),
+                optional=True,
             )
         )
 
@@ -182,6 +195,8 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
 
         area_layers = self.parameterAsLayerList(parameters, self.INPUT_AREAS, context) or []
         area_layers = [lyr for lyr in area_layers if isinstance(lyr, QgsVectorLayer)]
+
+        trim_to_corridor = self.parameterAsBoolean(parameters, self.TRIM_TO_CORRIDOR, context)
 
         if rpl_layer is None:
             raise QgsProcessingException(self.invalidSourceError(parameters, self.INPUT_RPL))
@@ -254,35 +269,42 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
         out_fields.append(QgsField(rpl_dcc_field, QVariant.Double))
         out_fields.append(QgsField(rpl_ref_field, QVariant.String, '', 254, 0))
 
-        (point_sink, point_dest_id) = self.parameterAsSink(
-            parameters,
-            self.OUTPUT,
-            context,
-            out_fields,
-            QgsWkbTypes.Point,
-            out_crs,
-        )
+        # Only create outputs for input types actually provided.
+        point_sink = None
+        point_dest_id = None
+        if point_layers:
+            (point_sink, point_dest_id) = self.parameterAsSink(
+                parameters,
+                self.OUTPUT,
+                context,
+                out_fields,
+                QgsWkbTypes.Point,
+                out_crs,
+            )
 
-        if point_sink is None:
-            raise QgsProcessingException(self.invalidSinkError(parameters, self.OUTPUT))
+        line_sink = None
+        line_dest_id = None
+        if line_layers:
+            (line_sink, line_dest_id) = self.parameterAsSink(
+                parameters,
+                self.OUTPUT_LINES,
+                context,
+                out_fields,
+                QgsWkbTypes.MultiLineString,
+                out_crs,
+            )
 
-        (line_sink, line_dest_id) = self.parameterAsSink(
-            parameters,
-            self.OUTPUT_LINES,
-            context,
-            out_fields,
-            QgsWkbTypes.MultiLineString,
-            out_crs,
-        )
-
-        (area_sink, area_dest_id) = self.parameterAsSink(
-            parameters,
-            self.OUTPUT_AREAS,
-            context,
-            out_fields,
-            QgsWkbTypes.MultiPolygon,
-            out_crs,
-        )
+        area_sink = None
+        area_dest_id = None
+        if area_layers:
+            (area_sink, area_dest_id) = self.parameterAsSink(
+                parameters,
+                self.OUTPUT_AREAS,
+                context,
+                out_fields,
+                QgsWkbTypes.MultiPolygon,
+                out_crs,
+            )
 
         # Coordinate transform for lat/lon output (from output CRS)
         wgs84 = QgsCoordinateReferenceSystem('EPSG:4326')
@@ -304,6 +326,26 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
 
         if not corridor_geoms:
             feedback.pushInfo(self.tr('Lay Corridor has no polygon geometry; output will be empty.'))
+
+        # Union corridor polygons in output CRS for optional clipping.
+        try:
+            corridor_union = (
+                QgsGeometry.unaryUnion(list(corridor_geoms.values()))
+                if len(corridor_geoms) > 1
+                else (next(iter(corridor_geoms.values())) if corridor_geoms else QgsGeometry())
+            )
+        except Exception:
+            corridor_union = next(iter(corridor_geoms.values())) if corridor_geoms else QgsGeometry()
+
+        # Transform from output CRS to RPL CRS for KP/DCC on clipped geometries.
+        try:
+            out_to_rpl = (
+                None
+                if out_crs == rpl_crs
+                else QgsCoordinateTransform(out_crs, rpl_crs, context.transformContext())
+            )
+        except Exception:
+            out_to_rpl = None if out_crs == rpl_crs else QgsCoordinateTransform(out_crs, rpl_crs, QgsProject.instance())
 
         # KP/DCC calculator on RPL (in RPL CRS)
         try:
@@ -469,14 +511,47 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
                     if not _corridor_intersects(geom_out):
                         continue
 
-                    # Transform geometry to RPL CRS for KP/DCC
-                    geom_rpl = QgsGeometry(src_geom)
-                    if to_rpl is not None:
-                        try:
-                            geom_rpl.transform(to_rpl)
-                        except Exception:
-                            skipped += 1
+                    # Optional trim (clip) to corridor polygons (lines + polygons only)
+                    geom_out_for_output = geom_out
+                    if trim_to_corridor and label in ('line', 'polygon'):
+                        if corridor_union is not None and not corridor_union.isEmpty():
+                            try:
+                                geom_out_for_output = geom_out_for_output.intersection(corridor_union)
+                            except Exception:
+                                skipped += 1
+                                continue
+
+                        if geom_out_for_output is None or geom_out_for_output.isEmpty():
                             continue
+
+                        # Ensure output geometry type is appropriate for the sink.
+                        try:
+                            target_type = QgsWkbTypes.LineGeometry if label == 'line' else QgsWkbTypes.PolygonGeometry
+                            if QgsWkbTypes.geometryType(geom_out_for_output.wkbType()) != target_type:
+                                geom_out_for_output = geom_out_for_output.convertToType(target_type, False)
+                        except Exception:
+                            pass
+
+                        if geom_out_for_output is None or geom_out_for_output.isEmpty():
+                            continue
+
+                    # Geometry for KP/DCC (use clipped geometry when trimming is enabled)
+                    if trim_to_corridor and label in ('line', 'polygon'):
+                        geom_rpl = QgsGeometry(geom_out_for_output)
+                        if out_to_rpl is not None:
+                            try:
+                                geom_rpl.transform(out_to_rpl)
+                            except Exception:
+                                skipped += 1
+                                continue
+                    else:
+                        geom_rpl = QgsGeometry(src_geom)
+                        if to_rpl is not None:
+                            try:
+                                geom_rpl.transform(to_rpl)
+                            except Exception:
+                                skipped += 1
+                                continue
 
                     # Use nearest point on feature to RPL for KP/DCC; fallback to representative point
                     kp_pt_rpl = _nearest_point_for_kp_dcc(geom_rpl) or _representative_point_xy(geom_rpl)
@@ -484,7 +559,7 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
                         skipped += 1
                         continue
 
-                    rep_pt_out = _representative_point_xy(geom_out)
+                    rep_pt_out = _representative_point_xy(geom_out_for_output)
 
                     try:
                         kp_km = comparator.calculate_kp_to_point(kp_pt_rpl, source=True)
@@ -511,7 +586,7 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
                     attrs_json = _attrs_json_for_feature(lyr, feat)
 
                     out_feat = QgsFeature(out_fields)
-                    out_feat.setGeometry(geom_out)
+                    out_feat.setGeometry(geom_out_for_output)
 
                     attrs = [None] * out_fields.count()
                     attrs[idx_src_layer] = lyr.name()
@@ -568,8 +643,9 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
 
         # Dynamic output naming based on the corridor layer name
         corridor_name = corridor_layer.name()
-        self.renamer_points = Renamer(f"{corridor_name}_Point_Prox_Listing")
-        context.layerToLoadOnCompletionDetails(point_dest_id).setPostProcessor(self.renamer_points)
+        if point_dest_id:
+            self.renamer_points = Renamer(f"{corridor_name}_Point_Prox_Listing")
+            context.layerToLoadOnCompletionDetails(point_dest_id).setPostProcessor(self.renamer_points)
 
         if line_dest_id:
             self.renamer_lines = Renamer(f"{corridor_name}_Line_Prox_Listing")
@@ -605,9 +681,10 @@ Creates listing layers containing all provided point/line/polygon features which
 **Inputs**
 - RPL Line Layer: reference route used to compute KP and DCC.
 - Lay Corridor Layer: polygon bounds (typically created by the Dynamic Buffer tool).
-- Point Layer(s): one or more point layers to test.
+- Point Layer(s): optional point layer(s) to test.
 - Line Layer(s): optional line layer(s) to test.
 - Polygon Layer(s): optional polygon layer(s) to test.
+- Trim (clip): if enabled, output LINE and POLYGON geometries are clipped to the Lay Corridor and KP/DCC is computed on the clipped geometry.
 
 **Output fields**
 - source_layer: name of the source layer the feature came from
@@ -621,6 +698,10 @@ Creates listing layers containing all provided point/line/polygon features which
 **CRS handling**
 - Inputs may use different CRSs. Features are reprojected on-the-fly for corridor intersection tests (Lay Corridor CRS) and for KP/DCC calculations (RPL CRS).
 - If an input layer has no valid CRS assigned, the algorithm will assume it matches the Lay Corridor CRS and will emit a warning.
+
+**Outputs**
+- Only outputs corresponding to provided input types are produced (e.g., if only line inputs are provided, only the line listing is created).
+- If an output is left unset, that listing is skipped.
 
 Outputs are automatically named using the Lay Corridor layer name with suffixes:
 - _Point_Prox_Listing

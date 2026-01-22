@@ -62,6 +62,7 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
         safe_add('identify_rpl_crossing_points_algorithm', 'IdentifyRPLCrossingPointsAlgorithm')
         safe_add('identify_rpl_area_listing_algorithm', 'IdentifyRPLAreaListingAlgorithm')
         safe_add('identify_rpl_lay_corridor_proximity_listing_algorithm', 'IdentifyRPLLayCorridorProximityListingAlgorithm')
+        safe_add('extract_lines_intersecting_polygons_algorithm', 'ExtractLinesIntersectingPolygonsAlgorithm')
         safe_add('export_kp_section_chartlets_algorithm', 'ExportKPSectionChartletsAlgorithm')
         safe_add('convert_imported_rpl_to_managed_gpkg_algorithm', 'ConvertImportedRplToManagedGpkgAlgorithm')
 

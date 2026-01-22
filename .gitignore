@@ -89,3 +89,6 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Dev/maintenance scripts (not shipped with QGIS plugin release)
+scripts/
