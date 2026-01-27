@@ -84,6 +84,8 @@ class SubseaCableTools:
         self.sld_action = None
         self.rpl_manager_dock = None
         self.rpl_manager_action = None
+        self.cable_manager_dock = None
+        self.cable_manager_action = None
 
     def tr(self, message):
         """Return the translation for a string."""
@@ -107,6 +109,33 @@ class SubseaCableTools:
 
         # Initialize the KP Mouse Tool’s UI elements
         self.kp_mouse_tool.initGui()
+
+        # Cable Manager Tool action
+        cable_manager_icon_path = os.path.join(self.plugin_dir, 'cable_manager_icon.png')
+        if os.path.exists(cable_manager_icon_path):
+            cable_manager_icon = QIcon(cable_manager_icon_path)
+        else:
+            # Fallback to plugin resource icon
+            cable_manager_icon = QIcon(":/plugins/subsea_cable_tools/icon.png")
+        self.cable_manager_action = QAction(cable_manager_icon, "Cable Manager", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
+        self.cable_manager_action.triggered.connect(self.show_cable_manager)
+        self.iface.addToolBarIcon(self.cable_manager_action)
+        self.iface.addPluginToMenu(self.menu, self.cable_manager_action)
+        self.actions.append(self.cable_manager_action)
+
+        # RPL Manager Tool action
+        rpl_icon_path = os.path.join(self.plugin_dir, 'rpl_manager_icon.png')
+        if os.path.exists(rpl_icon_path):
+            rpl_icon = QIcon(rpl_icon_path)
+        else:
+            # Fallback to plugin resource icon
+            rpl_icon = QIcon(":/plugins/subsea_cable_tools/icon.png")
+        self.rpl_manager_action = QAction(rpl_icon, "RPL Manager", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
+        self.rpl_manager_action.triggered.connect(self.show_rpl_manager)
+        self.iface.addToolBarIcon(self.rpl_manager_action)
+        self.iface.addPluginToMenu(self.menu, self.rpl_manager_action)
+        self.actions.append(self.rpl_manager_action)
+
         # Add action for the KP Plotter (with icon)
         plot_icon_path = os.path.join(self.plugin_dir, 'kp_plot_icon.png')
         self.plotter_action = QAction(QIcon(plot_icon_path), "KP Plot", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
@@ -129,17 +158,7 @@ class SubseaCableTools:
         self.actions.append(self.depth_profile_action)
 
         # Live Data Tool action
-        live_data_icon_path = os.path.join(self.plugin_dir, 'live_data_icon.png')
-        if os.path.exists(live_data_icon_path):
-            live_data_icon = QIcon(live_data_icon_path)
-        else:
-            # Fallback to plugin resource icon
-            live_data_icon = QIcon(":/plugins/subsea_cable_tools/icon.png")
-        self.live_data_action = QAction(live_data_icon, "Live Data", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
-        self.live_data_action.triggered.connect(self.show_live_data)
-        self.iface.addToolBarIcon(self.live_data_action)
-        self.iface.addPluginToMenu(self.menu, self.live_data_action)
-        self.actions.append(self.live_data_action)
+        # (moved to end of toolbar order)
 
         # Add action for Catenary Calculator (unchanged)
         icon_path = os.path.join(self.plugin_dir, 'catenary_icon.png')
@@ -175,18 +194,18 @@ class SubseaCableTools:
         # NOTE: The legacy standalone SLD dock is no longer exposed as a separate tool.
         # The SLD UI is embedded inside the RPL Manager.
 
-        # RPL Manager Tool action
-        rpl_icon_path = os.path.join(self.plugin_dir, 'rpl_manager_icon.png')
-        if os.path.exists(rpl_icon_path):
-            rpl_icon = QIcon(rpl_icon_path)
+        # Live Data Tool action (placed last in toolbar order)
+        live_data_icon_path = os.path.join(self.plugin_dir, 'live_data_icon.png')
+        if os.path.exists(live_data_icon_path):
+            live_data_icon = QIcon(live_data_icon_path)
         else:
             # Fallback to plugin resource icon
-            rpl_icon = QIcon(":/plugins/subsea_cable_tools/icon.png")
-        self.rpl_manager_action = QAction(rpl_icon, "RPL Manager", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
-        self.rpl_manager_action.triggered.connect(self.show_rpl_manager)
-        self.iface.addToolBarIcon(self.rpl_manager_action)
-        self.iface.addPluginToMenu(self.menu, self.rpl_manager_action)
-        self.actions.append(self.rpl_manager_action)
+            live_data_icon = QIcon(":/plugins/subsea_cable_tools/icon.png")
+        self.live_data_action = QAction(live_data_icon, "Live Data", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
+        self.live_data_action.triggered.connect(self.show_live_data)
+        self.iface.addToolBarIcon(self.live_data_action)
+        self.iface.addPluginToMenu(self.menu, self.live_data_action)
+        self.actions.append(self.live_data_action)
 
     def show_catenary_calculator(self):
         if self.catenary_calculator_dialog is None:
@@ -329,6 +348,18 @@ class SubseaCableTools:
             except Exception:
                 pass
             self.rpl_manager_dock = None
+
+        # Clean up Cable Manager dock
+        if hasattr(self, 'cable_manager_dock') and self.cable_manager_dock:
+            try:
+                self.iface.removeDockWidget(self.cable_manager_dock)
+            except Exception:
+                pass
+            try:
+                self.cable_manager_dock.deleteLater()
+            except Exception:
+                pass
+            self.cable_manager_dock = None
 
         # Clean up live data manager dialog
         if hasattr(self, 'live_data_manager_dialog') and self.live_data_manager_dialog:
@@ -479,6 +510,18 @@ class SubseaCableTools:
             except Exception:
                 pass
             self.live_data_action = None
+
+        # Remove cable manager action
+        if hasattr(self, 'cable_manager_action') and self.cable_manager_action:
+            try:
+                self.iface.removeToolBarIcon(self.cable_manager_action)
+            except Exception:
+                pass
+            try:
+                self.iface.removePluginMenu(self.menu, self.cable_manager_action)
+            except Exception:
+                pass
+            self.cable_manager_action = None
 
         # Remove dialog reference
         if hasattr(self, 'dlg'):
@@ -717,6 +760,26 @@ class SubseaCableTools:
                         break
         except Exception:
             pass
+
+    def show_cable_manager(self):
+        """Show the Cable Manager dock widget (placeholder)."""
+        if not self.cable_manager_dock:
+            try:
+                from .cable_manager.cable_manager_dockwidget import CableManagerDockWidget
+            except Exception as e:
+                from qgis.PyQt.QtWidgets import QMessageBox
+
+                QMessageBox.critical(
+                    self.iface.mainWindow(),
+                    "Subsea Cable Tools",
+                    "Cable Manager could not be opened.\n\n"
+                    f"Details: {e}",
+                )
+                return
+
+            self.cable_manager_dock = CableManagerDockWidget(self.iface)
+            self.iface.addDockWidget(Qt.RightDockWidgetArea, self.cable_manager_dock)
+        self.cable_manager_dock.show()
 
     def show_rpl_manager(self):
         """Show the RPL Manager dock widget."""

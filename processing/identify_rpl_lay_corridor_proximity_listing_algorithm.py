@@ -2,8 +2,9 @@
 # -*- coding: utf-8 -*-
 """IdentifyRPLLayCorridorProximityListingAlgorithm
 
-Creates listing layers containing all input features which intersect/encroach
-an input Lay Corridor (polygon) layer.
+Creates listing layers containing all input features which intersect either:
+- an input Lay Corridor (polygon) layer, or
+- the input RPL line itself (if no Lay Corridor is provided).
 
 Produces up to three listings (depending on which inputs are provided):
 - Point proximity listing
@@ -17,8 +18,8 @@ Each output includes:
 - KP (km) and DCC (m) to the input RPL line (via existing RPLComparator logic)
 - Reference to the input RPL layer name
 
-Output layers are automatically named using the Lay Corridor layer name with
-suffixes:
+Output layers are automatically named using the Lay Corridor layer name (if provided)
+or the RPL layer name (if no corridor is provided), with suffixes:
 - _Point_Prox_Listing
 - _Line_Prox_Listing
 - _Area_Prox_Listing
@@ -119,8 +120,9 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterFeatureSource(
                 self.INPUT_LAY_CORRIDOR,
-                self.tr('Input Lay Corridor layer (polygon)'),
+                self.tr('Input Lay Corridor layer (polygon, optional)'),
                 [QgsProcessing.TypeVectorPolygon],
+                optional=True,
             )
         )
 
@@ -200,15 +202,14 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
 
         if rpl_layer is None:
             raise QgsProcessingException(self.invalidSourceError(parameters, self.INPUT_RPL))
-        if corridor_layer is None:
-            raise QgsProcessingException(self.invalidSourceError(parameters, self.INPUT_LAY_CORRIDOR))
+        use_corridor = corridor_layer is not None
         if not point_layers and not line_layers and not area_layers:
             raise QgsProcessingException(self.tr('Please provide at least one point, line, or polygon layer.'))
 
         # Basic geometry type validation
         if QgsWkbTypes.geometryType(rpl_layer.wkbType()) != QgsWkbTypes.LineGeometry:
             raise QgsProcessingException(self.tr('Input RPL layer must be a line layer.'))
-        if QgsWkbTypes.geometryType(corridor_layer.wkbType()) != QgsWkbTypes.PolygonGeometry:
+        if use_corridor and QgsWkbTypes.geometryType(corridor_layer.wkbType()) != QgsWkbTypes.PolygonGeometry:
             raise QgsProcessingException(self.tr('Input Lay Corridor layer must be a polygon layer.'))
         for lyr in point_layers:
             if QgsWkbTypes.geometryType(lyr.wkbType()) != QgsWkbTypes.PointGeometry:
@@ -224,12 +225,13 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
 
         # CRS handling:
         # - Use the Lay Corridor CRS for corridor intersection tests and output geometry.
+        # - If no corridor is provided, use the RPL CRS for both intersection tests and output.
         # - Use the RPL CRS for KP/DCC calculations.
-        out_crs = corridor_layer.sourceCrs()
+        out_crs = corridor_layer.sourceCrs() if use_corridor else rpl_layer.sourceCrs()
         rpl_crs = rpl_layer.sourceCrs()
 
         if not out_crs.isValid():
-            raise QgsProcessingException(self.tr('Lay Corridor layer has an invalid/unknown CRS.'))
+            raise QgsProcessingException(self.tr('Output CRS is invalid/unknown.'))
         if not rpl_crs.isValid():
             raise QgsProcessingException(self.tr('RPL layer has an invalid/unknown CRS.'))
 
@@ -314,28 +316,30 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
             # Fallback: try project-based transform context
             to_wgs84 = QgsCoordinateTransform(out_crs, wgs84, QgsProject.instance())
 
-        # Spatial index for corridor polygons
         corridor_index = QgsSpatialIndex()
         corridor_geoms: Dict[int, QgsGeometry] = {}
-        for feat in corridor_layer.getFeatures(QgsFeatureRequest().setSubsetOfAttributes([])):
-            geom = feat.geometry()
-            if geom is None or geom.isEmpty():
-                continue
-            corridor_index.addFeature(feat)
-            corridor_geoms[int(feat.id())] = QgsGeometry(geom)
+        corridor_union = QgsGeometry()
+        if use_corridor:
+            # Spatial index for corridor polygons
+            for feat in corridor_layer.getFeatures(QgsFeatureRequest().setSubsetOfAttributes([])):
+                geom = feat.geometry()
+                if geom is None or geom.isEmpty():
+                    continue
+                corridor_index.addFeature(feat)
+                corridor_geoms[int(feat.id())] = QgsGeometry(geom)
 
-        if not corridor_geoms:
-            feedback.pushInfo(self.tr('Lay Corridor has no polygon geometry; output will be empty.'))
+            if not corridor_geoms:
+                feedback.pushInfo(self.tr('Lay Corridor has no polygon geometry; output will be empty.'))
 
-        # Union corridor polygons in output CRS for optional clipping.
-        try:
-            corridor_union = (
-                QgsGeometry.unaryUnion(list(corridor_geoms.values()))
-                if len(corridor_geoms) > 1
-                else (next(iter(corridor_geoms.values())) if corridor_geoms else QgsGeometry())
-            )
-        except Exception:
-            corridor_union = next(iter(corridor_geoms.values())) if corridor_geoms else QgsGeometry()
+            # Union corridor polygons in output CRS for optional clipping.
+            try:
+                corridor_union = (
+                    QgsGeometry.unaryUnion(list(corridor_geoms.values()))
+                    if len(corridor_geoms) > 1
+                    else (next(iter(corridor_geoms.values())) if corridor_geoms else QgsGeometry())
+                )
+            except Exception:
+                corridor_union = next(iter(corridor_geoms.values())) if corridor_geoms else QgsGeometry()
 
         # Transform from output CRS to RPL CRS for KP/DCC on clipped geometries.
         try:
@@ -433,16 +437,32 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
                 return None
             return None
 
-        def _corridor_intersects(feature_geom: QgsGeometry) -> bool:
+        def _filter_intersects(feature_geom: QgsGeometry) -> bool:
             if feature_geom is None or feature_geom.isEmpty():
                 return False
-            for cand_fid in corridor_index.intersects(feature_geom.boundingBox()):
-                poly = corridor_geoms.get(int(cand_fid))
-                if poly is None or poly.isEmpty():
-                    continue
-                if poly.intersects(feature_geom):
-                    return True
-            return False
+
+            if use_corridor:
+                for cand_fid in corridor_index.intersects(feature_geom.boundingBox()):
+                    poly = corridor_geoms.get(int(cand_fid))
+                    if poly is None or poly.isEmpty():
+                        continue
+                    if poly.intersects(feature_geom):
+                        return True
+                return False
+
+            if rpl_union is None or rpl_union.isEmpty():
+                return False
+
+            try:
+                if not rpl_union.boundingBox().intersects(feature_geom.boundingBox()):
+                    return False
+            except Exception:
+                pass
+
+            try:
+                return rpl_union.intersects(feature_geom)
+            except Exception:
+                return False
 
         def _attrs_json_for_feature(src_layer: QgsVectorLayer, feature: QgsFeature) -> Optional[str]:
             try:
@@ -508,12 +528,12 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
                             skipped += 1
                             continue
 
-                    if not _corridor_intersects(geom_out):
+                    if not _filter_intersects(geom_out):
                         continue
 
                     # Optional trim (clip) to corridor polygons (lines + polygons only)
                     geom_out_for_output = geom_out
-                    if trim_to_corridor and label in ('line', 'polygon'):
+                    if use_corridor and trim_to_corridor and label in ('line', 'polygon'):
                         if corridor_union is not None and not corridor_union.isEmpty():
                             try:
                                 geom_out_for_output = geom_out_for_output.intersection(corridor_union)
@@ -536,7 +556,7 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
                             continue
 
                     # Geometry for KP/DCC (use clipped geometry when trimming is enabled)
-                    if trim_to_corridor and label in ('line', 'polygon'):
+                    if use_corridor and trim_to_corridor and label in ('line', 'polygon'):
                         geom_rpl = QgsGeometry(geom_out_for_output)
                         if out_to_rpl is not None:
                             try:
@@ -633,16 +653,24 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
         area_stats = _write_listing(area_layers, area_sink, 'polygon')
         _tick_progress(sum(int(lyr.featureCount() or 0) for lyr in area_layers))
 
-        feedback.pushInfo(self.tr(f"Wrote {point_stats['written']} point(s) intersecting the lay corridor."))
-        feedback.pushInfo(self.tr(f"Wrote {line_stats['written']} line(s) intersecting the lay corridor."))
-        feedback.pushInfo(self.tr(f"Wrote {area_stats['written']} polygon(s) intersecting the lay corridor."))
+        if use_corridor:
+            feedback.pushInfo(self.tr(f"Wrote {point_stats['written']} point(s) intersecting the lay corridor."))
+            feedback.pushInfo(self.tr(f"Wrote {line_stats['written']} line(s) intersecting the lay corridor."))
+            feedback.pushInfo(self.tr(f"Wrote {area_stats['written']} polygon(s) intersecting the lay corridor."))
+        else:
+            feedback.pushInfo(self.tr(f"Wrote {point_stats['written']} point(s) intersecting the RPL."))
+            feedback.pushInfo(self.tr(f"Wrote {line_stats['written']} line(s) intersecting the RPL."))
+            feedback.pushInfo(self.tr(f"Wrote {area_stats['written']} polygon(s) intersecting the RPL."))
 
         skipped = point_stats['skipped'] + line_stats['skipped'] + area_stats['skipped']
         if skipped:
             feedback.pushInfo(self.tr(f'Skipped {skipped} feature(s) due to invalid geometry or errors.'))
 
         # Dynamic output naming based on the corridor layer name
-        corridor_name = corridor_layer.name()
+        if not use_corridor and trim_to_corridor:
+            feedback.pushInfo(self.tr('Trim to corridor is enabled but no Lay Corridor was provided; trimming skipped.'))
+
+        corridor_name = corridor_layer.name() if use_corridor else rpl_layer.name()
         if point_dest_id:
             self.renamer_points = Renamer(f"{corridor_name}_Point_Prox_Listing")
             context.layerToLoadOnCompletionDetails(point_dest_id).setPostProcessor(self.renamer_points)
@@ -665,7 +693,7 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
         return 'identify_rpl_lay_corridor_proximity_listing'
 
     def displayName(self):
-        return self.tr('Identify RPL Lay Corridor Proximity Listing')
+        return self.tr('Identify Features Intersecting RPL')
 
     def group(self):
         return self.tr('RPL Tools')
@@ -676,15 +704,15 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
     def shortHelpString(self):
         return self.tr(
             """
-Creates listing layers containing all provided point/line/polygon features which intersect (encroach) an input Lay Corridor polygon layer.
+Creates listing layers containing all provided point/line/polygon features which intersect either an input Lay Corridor polygon layer, or the input RPL line if no Lay Corridor is provided.
 
 **Inputs**
 - RPL Line Layer: reference route used to compute KP and DCC.
-- Lay Corridor Layer: polygon bounds (typically created by the Dynamic Buffer tool).
+- Lay Corridor Layer (optional): polygon bounds (typically created by the Dynamic Buffer tool). If not provided, intersection tests are performed against the RPL line itself.
 - Point Layer(s): optional point layer(s) to test.
 - Line Layer(s): optional line layer(s) to test.
 - Polygon Layer(s): optional polygon layer(s) to test.
-- Trim (clip): if enabled, output LINE and POLYGON geometries are clipped to the Lay Corridor and KP/DCC is computed on the clipped geometry.
+- Trim (clip): if enabled, output LINE and POLYGON geometries are clipped to the Lay Corridor and KP/DCC is computed on the clipped geometry. (Ignored if no corridor is provided.)
 
 **Output fields**
 - source_layer: name of the source layer the feature came from
@@ -696,14 +724,14 @@ Creates listing layers containing all provided point/line/polygon features which
 - rpl_ref: RPL layer name
 
 **CRS handling**
-- Inputs may use different CRSs. Features are reprojected on-the-fly for corridor intersection tests (Lay Corridor CRS) and for KP/DCC calculations (RPL CRS).
+- Inputs may use different CRSs. Features are reprojected on-the-fly for intersection tests (Lay Corridor CRS if provided, otherwise RPL CRS) and for KP/DCC calculations (RPL CRS).
 - If an input layer has no valid CRS assigned, the algorithm will assume it matches the Lay Corridor CRS and will emit a warning.
 
 **Outputs**
 - Only outputs corresponding to provided input types are produced (e.g., if only line inputs are provided, only the line listing is created).
 - If an output is left unset, that listing is skipped.
 
-Outputs are automatically named using the Lay Corridor layer name with suffixes:
+Outputs are automatically named using the Lay Corridor layer name (if provided) or the RPL layer name (if no corridor is provided) with suffixes:
 - _Point_Prox_Listing
 - _Line_Prox_Listing
 - _Area_Prox_Listing
