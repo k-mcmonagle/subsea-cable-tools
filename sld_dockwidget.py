@@ -2273,6 +2273,10 @@ class _KPRangeDockWidget(QDockWidget):
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSortingEnabled(True)
+        try:
+            self.table.doubleClicked.connect(self._on_double_clicked)
+        except Exception:
+            pass
         layout.addWidget(self.table, 1)
 
         self.model = QStandardItemModel(0, 6, self)
@@ -2283,6 +2287,64 @@ class _KPRangeDockWidget(QDockWidget):
         self.edit_btn.clicked.connect(self._edit)
         self.dup_btn.clicked.connect(self._duplicate)
         self.del_btn.clicked.connect(self._delete)
+
+    @staticmethod
+    def _try_float(v):
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            try:
+                return float(v)
+            except Exception:
+                return None
+        try:
+            s = str(v).strip().replace(",", "")
+            return float(s) if s else None
+        except Exception:
+            return None
+
+    def _on_double_clicked(self, index):
+        """Center map / sync crosshair for a selected KP range row."""
+
+        if not index or not index.isValid():
+            return
+
+        try:
+            start_txt = self.model.item(index.row(), 0).text()
+            end_txt = self.model.item(index.row(), 1).text()
+        except Exception:
+            return
+
+        s = self._try_float(start_txt)
+        e = self._try_float(end_txt)
+        if s is None or e is None:
+            return
+        if s > e:
+            s, e = e, s
+
+        mid = (float(s) + float(e)) / 2.0
+
+        # Prefer centering on the range segment's bbox center when geometry is available.
+        map_pt = None
+        try:
+            owner = self._owner
+            if owner and owner.merged_geometry is not None and owner.line_length_m and owner.distance_area:
+                seg = extract_line_segment(owner.merged_geometry, float(s), float(e), owner.distance_area)
+                if seg and not seg.isEmpty():
+                    try:
+                        map_pt = seg.boundingBox().center()
+                    except Exception:
+                        map_pt = None
+        except Exception:
+            map_pt = None
+
+        try:
+            self._owner._on_event_activated(mid, map_pt)
+        except Exception:
+            try:
+                self._owner._zoom_map_to_kp(mid)
+            except Exception:
+                pass
 
     def closeEvent(self, event):
         try:

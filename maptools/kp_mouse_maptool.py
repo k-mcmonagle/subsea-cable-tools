@@ -77,6 +77,20 @@ class KPMouseMapTool(QgsMapTool):
         self.distanceArea = QgsDistanceArea()
         project_crs = self.canvas.mapSettings().destinationCrs()
         self.distanceArea.setSourceCrs(project_crs, QgsProject.instance().transformContext())
+        # Guard: planar/cartesian measurements in a geographic CRS would return degrees.
+        # We disable cartesian here to prevent silently wrong results (the config dialog
+        # also disables the option when the project CRS is geographic).
+        if self.useCartesian and project_crs.isGeographic():
+            self.useCartesian = False
+            try:
+                self.iface.messageBar().pushMessage(
+                    "KP Mouse Tool",
+                    "Cartesian distance requires a projected project CRS; falling back to ellipsoidal.",
+                    level=Qgis.Warning,
+                    duration=5,
+                )
+            except Exception:
+                pass
         if self.useCartesian:
             if hasattr(self.distanceArea, "setEllipsoidalMode"):
                 self.distanceArea.setEllipsoidalMode(False)
@@ -165,18 +179,19 @@ class KPMouseMapTool(QgsMapTool):
             self.total_length_meters = 0
             return
 
-        # Set up ellipsoidal distance measurements.
+        # Set up distance measurements (ellipsoidal or planar).
         self.distanceArea = QgsDistanceArea()
         project_crs = self.canvas.mapSettings().destinationCrs()
         self.distanceArea.setSourceCrs(project_crs, QgsProject.instance().transformContext())
-        ellipsoid = QgsProject.instance().ellipsoid()
-        if ellipsoid:
+        if self.useCartesian:
+            # Planar/cartesian in project CRS (units depend on CRS).
+            if hasattr(self.distanceArea, "setEllipsoidalMode"):
+                self.distanceArea.setEllipsoidalMode(False)
+        else:
+            ellipsoid = QgsProject.instance().ellipsoid() or "WGS84"
             self.distanceArea.setEllipsoid(ellipsoid)
             if hasattr(self.distanceArea, "setEllipsoidalMode"):
                 self.distanceArea.setEllipsoidalMode(True)
-        else:
-            if hasattr(self.distanceArea, "setEllipsoidalMode"):
-                self.distanceArea.setEllipsoidalMode(False)
 
         # Cache geometries and their lengths in project CRS
         self.features_geoms = []
@@ -1385,7 +1400,7 @@ class KPConfigDialog(QDialog):
         layout.addWidget(self.reverse_kp_checkbox)
 
         # Cartesian checkbox
-        self.cartesian_checkbox = QCheckBox("Use Cartesian distances (planar, in CRS units)")
+        self.cartesian_checkbox = QCheckBox("Use Cartesian distances (planar, in project CRS units)")
         self.cartesian_checkbox.setChecked(current_use_cartesian)
         layout.addWidget(self.cartesian_checkbox)
 
@@ -1442,7 +1457,10 @@ class KPConfigDialog(QDialog):
         layout.addWidget(self.copy_latlon_style_combo)
 
         # Note about calculations
-        self.note_label = QLabel("Note: KP calculations are based on geodetic distances using the WGS84 ellipsoid.")
+        self.note_label = QLabel(
+            "Note: Ellipsoidal uses the project's ellipsoid (fallback WGS84). "
+            "Cartesian uses planar distances in the project CRS (requires a projected CRS)."
+        )
         self.note_label.setWordWrap(True)
         layout.addWidget(self.note_label)
 
@@ -1524,28 +1542,72 @@ class KPConfigDialog(QDialog):
         if num_features == 0:
             self.metrics_text.setText("Layer has no features.")
             return
-        
-        total_length = 0
+
+        project_crs = QgsProject.instance().crs()
+        transform_context = QgsProject.instance().transformContext()
+        layer_crs = layer.crs()
+        transform = None
+        if layer_crs != project_crs:
+            try:
+                transform = QgsCoordinateTransform(layer_crs, project_crs, QgsProject.instance())
+            except Exception:
+                transform = None
+
+        total_length_ell_m = 0.0
+        total_length_planar_m = 0.0
         total_vertices = 0
-        d = QgsDistanceArea()
-        d.setEllipsoid(QgsProject.instance().ellipsoid())
+
+        d_ell = QgsDistanceArea()
+        d_ell.setSourceCrs(project_crs, transform_context)
+        d_ell.setEllipsoid(QgsProject.instance().ellipsoid() or "WGS84")
+        if hasattr(d_ell, "setEllipsoidalMode"):
+            d_ell.setEllipsoidalMode(True)
+
+        d_planar = QgsDistanceArea()
+        d_planar.setSourceCrs(project_crs, transform_context)
+        if hasattr(d_planar, "setEllipsoidalMode"):
+            d_planar.setEllipsoidalMode(False)
+
+        planar_ok = not project_crs.isGeographic()
 
         for feature in layer.getFeatures():
-            geom = feature.geometry()
-            if geom:
-                total_length += d.measureLength(geom)
+            geom = QgsGeometry(feature.geometry())
+            if geom and not geom.isEmpty():
+                if transform is not None:
+                    try:
+                        geom.transform(transform)
+                    except Exception:
+                        continue
+
+                try:
+                    total_length_ell_m += float(d_ell.measureLength(geom))
+                except Exception:
+                    pass
+                if planar_ok:
+                    try:
+                        total_length_planar_m += float(d_planar.measureLength(geom))
+                    except Exception:
+                        pass
+
                 if geom.isMultipart():
                     for part in geom.asMultiPolyline():
                         total_vertices += len(part)
                 else:
                     total_vertices += len(geom.asPolyline())
 
-        length_km = total_length / 1000
-        
-        self.metrics_text.setText(f"Length: {length_km:.2f} km\nAC Count: {total_vertices}")
+        length_ell_km = total_length_ell_m / 1000.0
+        if planar_ok:
+            length_planar_km = total_length_planar_m / 1000.0
+            planar_line = f"Length (cartesian): {length_planar_km:.3f} km"
+        else:
+            planar_line = "Length (cartesian): n/a (project CRS is geographic)"
 
-        # Enable Cartesian checkbox only if layer CRS is projected
-        is_projected = not layer.crs().isGeographic()
+        self.metrics_text.setText(
+            f"Length (ellipsoidal): {length_ell_km:.3f} km\n{planar_line}\nAC Count: {total_vertices}"
+        )
+
+        # Enable Cartesian checkbox only if the project CRS is projected
+        is_projected = not project_crs.isGeographic()
         self.cartesian_checkbox.setEnabled(is_projected)
         if not is_projected:
             self.cartesian_checkbox.setChecked(False)
@@ -1736,6 +1798,44 @@ class KPMouseTool:
         self.actionGoToKP = None
         self.load_settings()
 
+    def _safe_layer_id(self, layer) -> Optional[str]:
+        """Return a layer id if the layer wrapper is still valid, else None."""
+        if layer is None:
+            return None
+        try:
+            if _sip_isdeleted(layer):
+                return None
+        except Exception:
+            # If sip is missing or the wrapper check fails, fall back to try/except below.
+            pass
+        try:
+            return layer.id()
+        except Exception:
+            return None
+
+    def _get_reference_layer(self) -> Optional[QgsVectorLayer]:
+        """Return the current reference layer if it's still alive and in the project."""
+        layer = self.referenceLayer
+        layer_id = self._safe_layer_id(layer)
+        if not layer_id:
+            self.referenceLayer = None
+            return None
+
+        try:
+            project_layer = QgsProject.instance().mapLayer(layer_id)
+        except Exception:
+            project_layer = None
+
+        if project_layer is None:
+            self.referenceLayer = None
+            return None
+
+        # Keep our cached reference pointing at the live project instance.
+        self.referenceLayer = project_layer
+        if isinstance(project_layer, QgsVectorLayer):
+            return project_layer
+        return None
+
     def initGui(self):
         """Initialize the UI elements for the KP Mouse Tool."""
         import os
@@ -1878,28 +1978,22 @@ class KPMouseTool:
     def toggle_tool(self, checked):
         """Handle the toggling of the map tool."""
         if checked:
-            if not self.referenceLayer:
+            layer = self._get_reference_layer()
+            if not layer:
                 self.iface.messageBar().pushMessage(
                     "Info", "KP Mouse Tool: Please configure a reference layer.", level=Qgis.Info
                 )
                 self.show_config_dialog()
-                if not self.referenceLayer:
+                layer = self._get_reference_layer()
+                if not layer:
                     self.toolButton.setChecked(False)
                     return
 
-                    self._update_go_to_kp_enabled()
-
-            # Verify the layer is still in the project
-            if self.referenceLayer.id() not in [l.id() for l in QgsProject.instance().mapLayers().values()]:
-                self.iface.messageBar().pushMessage(
-                    "Warning", "KP Mouse Tool: Reference layer not found. Please reconfigure.", level=Qgis.Warning
-                )
-                self.referenceLayer = None
-                self.toolButton.setChecked(False)
-                self.show_config_dialog()
-                return
-
-            features = list(self.referenceLayer.getFeatures())
+            # Verify features exist (guard against deleted wrappers/provider errors)
+            try:
+                features = list(layer.getFeatures())
+            except Exception:
+                features = []
             if not features:
                 QMessageBox.information(
                     self.iface.mainWindow(), "KP Mouse Tool", "No features found in the reference layer!"
@@ -1909,7 +2003,7 @@ class KPMouseTool:
 
             self.mapTool = KPMouseMapTool(
                 self.iface.mapCanvas(),
-                self.referenceLayer,
+                layer,
                 self.iface,
                 self.measurementUnit,
                 self.showReverseKP,
@@ -1939,7 +2033,7 @@ class KPMouseTool:
         """Show the configuration dialog."""
         dialog = KPConfigDialog(
             self.iface.mainWindow(),
-            self.referenceLayer,
+            self._get_reference_layer(),
             self.measurementUnit,
             self.showReverseKP,
             self.useCartesian,
@@ -1996,17 +2090,34 @@ class KPMouseTool:
     def _on_layers_removed(self, layer_ids):
         if not layer_ids:
             return
-        if self.referenceLayer and self.referenceLayer.id() in set(layer_ids):
+        layer = self.referenceLayer
+        try:
+            layer_id = self._safe_layer_id(layer)
+            if layer_id and layer_id in set(layer_ids):
+                self.referenceLayer = None
+        except Exception:
+            # If the wrapper has already been deleted, clear our cached reference.
             self.referenceLayer = None
         self._update_go_to_kp_enabled()
 
     def _reference_layer_ready(self) -> bool:
-        layer = self.referenceLayer
+        layer = self._get_reference_layer()
         if layer is None:
             return False
-        if not isinstance(layer, QgsVectorLayer) or not layer.isValid():
+        try:
+            if not layer.isValid():
+                return False
+        except RuntimeError:
+            # wrapped C/C++ object deleted
+            self.referenceLayer = None
             return False
-        if layer.geometryType() != QgsWkbTypes.LineGeometry:
+        except Exception:
+            return False
+
+        try:
+            if layer.geometryType() != QgsWkbTypes.LineGeometry:
+                return False
+        except Exception:
             return False
         try:
             if layer.featureCount() <= 0:
@@ -2024,7 +2135,11 @@ class KPMouseTool:
     def _update_go_to_kp_enabled(self):
         if self.actionGoToKP is None:
             return
-        self.actionGoToKP.setEnabled(self._reference_layer_ready())
+        try:
+            self.actionGoToKP.setEnabled(self._reference_layer_ready())
+        except Exception:
+            # If something unexpected happens during layer checks, fail closed.
+            self.actionGoToKP.setEnabled(False)
 
     def _make_distance_area(self) -> QgsDistanceArea:
         distance = QgsDistanceArea()
@@ -2042,7 +2157,7 @@ class KPMouseTool:
 
     def _iter_reference_geometries_project_crs(self):
         """Yield reference layer geometries transformed to project CRS."""
-        layer = self.referenceLayer
+        layer = self._get_reference_layer()
         if layer is None:
             return
 
@@ -2180,20 +2295,23 @@ class KPMouseTool:
     def save_settings(self):
         """Save settings to QSettings."""
         settings = QSettings("SubseaCableTools", "KPMouseTool")
-        if self.referenceLayer:
-            settings.setValue("referenceLayerId", self.referenceLayer.id())
+        ref_id = self._safe_layer_id(self.referenceLayer)
+        if ref_id:
+            settings.setValue("referenceLayerId", ref_id)
         else:
             settings.remove("referenceLayerId")
         settings.setValue("measurementUnit", self.measurementUnit)
         settings.setValue("showReverseKP", self.showReverseKP)
+        settings.setValue("useCartesian", self.useCartesian)
         settings.setValue("showDepth", self.showDepth)
         settings.setValue("copyIncludeRKP", self.copyIncludeRKP)
         settings.setValue("copyIncludeDCC", self.copyIncludeDCC)
         settings.setValue("copyIncludeLatLon", self.copyIncludeLatLon)
         settings.setValue("copyLatLonFormat", self.copyLatLonFormat)
         settings.setValue("copyLatLonStyle", self.copyLatLonStyle)
-        if self.depthLayer:
-            settings.setValue("depthLayerId", self.depthLayer.id())
+        depth_id = self._safe_layer_id(self.depthLayer)
+        if depth_id:
+            settings.setValue("depthLayerId", depth_id)
         else:
             settings.remove("depthLayerId")
         settings.setValue("depthField", self.depthField)
@@ -2206,6 +2324,7 @@ class KPMouseTool:
             self.referenceLayer = QgsProject.instance().mapLayer(layer_id)
         self.measurementUnit = settings.value("measurementUnit", "km")
         self.showReverseKP = settings.value("showReverseKP", False, type=bool)
+        self.useCartesian = settings.value("useCartesian", False, type=bool)
         self.showDepth = settings.value("showDepth", False, type=bool)
         # New clipboard settings (default: only KP)
         self.copyIncludeRKP = settings.value("copyIncludeRKP", False, type=bool)

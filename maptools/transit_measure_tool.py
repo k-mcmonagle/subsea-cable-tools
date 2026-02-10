@@ -12,7 +12,6 @@ plus totals. User can change distance & speed units on the fly and save the
 measurement as a memory layer with attributes including distance, duration & s
 """
 from __future__ import annotations
-from __future__ import annotations
 
 import csv
 import math
@@ -431,7 +430,7 @@ class TransitMeasureDialog(QDialog):
         self.points.append(pt)
         self.point_rb.addPoint(pt, True)
         if len(self.points) == 1:
-            self._append_waypoint_row(1, pt, None, None, 0)
+            self._repopulate_waypoints()
             self.export_csv_btn.setEnabled(True)  # Enable export for waypoints
             self._update_totals()
             return
@@ -450,12 +449,7 @@ class TransitMeasureDialog(QDialog):
         self.export_csv_btn.setEnabled(True)
         self._update_totals()
         self._update_buffer_preview(include_motion=False)
-        # Append waypoint for the last point
-        last_idx = len(self.points) - 1
-        bearing_next = h1 if last_idx > 0 else None
-        dist_next = dist_m if last_idx > 0 else None
-        cum_m = sum(self.distances_m[:last_idx]) if last_idx > 0 else 0
-        self._append_waypoint_row(last_idx + 1, self.points[-1], dist_next, bearing_next, cum_m)
+        self._repopulate_waypoints()
 
     def update_motion(self, pt: QgsPointXY):
         if not self.points:
@@ -613,6 +607,7 @@ class TransitMeasureDialog(QDialog):
     def finish_path(self):
         if not self.points:
             return
+        self.active = False
         self.temp_rb.reset(QgsWkbTypes.LineGeometry)
         self.motion_distance_m = 0.0
         self.motion_heading_fwd = None
@@ -707,6 +702,33 @@ class TransitMeasureDialog(QDialog):
             return None
         return meters / v
 
+    def _speed_knots(self) -> Optional[float]:
+        v_mps = self._speed_mps()
+        if v_mps <= 0:
+            return None
+        # 1 knot = 0.514444 m/s
+        return v_mps / 0.514444
+
+    def _meters_to_nm(self, meters: float) -> float:
+        # 1 nautical mile = 1852 meters
+        return meters / 1852.0
+
+    def _label_full_transit(self, total_m: float) -> str:
+        total_nm = self._meters_to_nm(total_m)
+        speed_kn = self._speed_knots()
+        if speed_kn is None or speed_kn <= 0:
+            return f"{total_nm:.2f} nm"
+        total_days = (total_m / self._speed_mps()) / 86400.0
+        return f"{total_nm:.2f} nm at avg {speed_kn:.2f} knots = {total_days:.2f} d"
+
+    def _label_segment(self, seg_m: float) -> str:
+        seg_nm = self._meters_to_nm(seg_m)
+        speed_kn = self._speed_knots()
+        if speed_kn is None or speed_kn <= 0:
+            return f"{seg_nm:.2f} nm"
+        seg_days = (seg_m / self._speed_mps()) / 86400.0
+        return f"{seg_nm:.2f} nm at {speed_kn:.2f} knots = {seg_days:.2f} d"
+
     def _append_row(self, dist_m: float, h1: float, h2: float):
         row = self.table.rowCount()
         self.table.insertRow(row)
@@ -751,7 +773,7 @@ class TransitMeasureDialog(QDialog):
             QTableWidgetItem(f"{h1:.2f}"),
             QTableWidgetItem(f"{h2:.2f}"),
             QTableWidgetItem(self._format_distance(dist_m)),
-            QTableWidgetItem(self._format_duration(self._segment_duration_s(dist_m))),
+            QTableWidgetItem(self._format_duration(self._segment_duration_s(dist_m), self._time_unit())),
             QTableWidgetItem(self._format_duration(self._cumulative_time_for_index(motion_row, include_motion=True), self._time_unit()))
         ]
         for col, it in enumerate(items):
@@ -762,16 +784,6 @@ class TransitMeasureDialog(QDialog):
         motion_row = len(self.distances_m)
         if self.table.rowCount() > motion_row:
             self.table.removeRow(motion_row)
-
-    def _repopulate_waypoints(self):
-        self.waypoints_table.setRowCount(0)
-        cum_m = 0.0
-        for idx, pt in enumerate(self.points):
-            dist_next = self.distances_m[idx] if idx < len(self.distances_m) else None
-            bearing_next = self.headings_fwd[idx] if idx < len(self.headings_fwd) else None
-            self._append_waypoint_row(idx + 1, pt, dist_next, bearing_next, cum_m)
-            if idx < len(self.distances_m):
-                cum_m += self.distances_m[idx]
 
     def _repopulate_distances(self):
         for i, dist_m in enumerate(self.distances_m):
@@ -873,6 +885,14 @@ class TransitMeasureDialog(QDialog):
         fields.append(QgsField("head_from", QVariant.Double))
         fields.append(QgsField("cum_dist", QVariant.Double))
         fields.append(QgsField("cum_time_hr", QVariant.Double))
+        # Label-friendly summary fields (nautical defaults)
+        fields.append(QgsField("label_seg", QVariant.String))
+        fields.append(QgsField("label_full", QVariant.String))
+        fields.append(QgsField("seg_nm", QVariant.Double))
+        fields.append(QgsField("seg_days", QVariant.Double))
+        fields.append(QgsField("total_nm", QVariant.Double))
+        fields.append(QgsField("total_days", QVariant.Double))
+        fields.append(QgsField("speed_kn", QVariant.Double))
         layer.dataProvider().addAttributes(fields)
         layer.updateFields()
         factor = self._distance_factor()
@@ -880,6 +900,11 @@ class TransitMeasureDialog(QDialog):
         speed_val = self.speed_spin.value()
         speed_unit = SPEED_UNITS[self.speed_unit_combo.currentIndex()][0]
         speed_mps = self._speed_mps()
+        total_m = float(sum(self.distances_m))
+        total_nm = self._meters_to_nm(total_m)
+        total_days = (total_m / speed_mps) / 86400.0 if speed_mps > 0 else None
+        speed_kn = self._speed_knots()
+        label_full = self._label_full_transit(total_m)
         cum_m = 0.0
         cum_t_s = 0.0
         for idx, dist_m in enumerate(self.distances_m):
@@ -901,6 +926,13 @@ class TransitMeasureDialog(QDialog):
             feat.setAttribute("head_from", self.headings_rev[idx])
             feat.setAttribute("cum_dist", cum_m / factor)
             feat.setAttribute("cum_time_hr", (cum_t_s / 3600.0) if speed_mps > 0 else None)
+            feat.setAttribute("label_seg", self._label_segment(dist_m))
+            feat.setAttribute("label_full", label_full)
+            feat.setAttribute("seg_nm", self._meters_to_nm(dist_m))
+            feat.setAttribute("seg_days", (dist_m / speed_mps) / 86400.0 if speed_mps > 0 else None)
+            feat.setAttribute("total_nm", total_nm)
+            feat.setAttribute("total_days", total_days)
+            feat.setAttribute("speed_kn", speed_kn)
             feat.setGeometry(QgsGeometry.fromPolylineXY(geom_pts))
             layer.dataProvider().addFeature(feat)
         layer.updateExtents()

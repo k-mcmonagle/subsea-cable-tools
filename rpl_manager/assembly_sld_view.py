@@ -9,6 +9,7 @@ from qgis.PyQt.QtWidgets import (
     QGraphicsLineItem,
     QGraphicsPathItem,
     QGraphicsPolygonItem,
+    QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsTextItem,
     QGraphicsView,
@@ -122,6 +123,86 @@ class _AssemblySldView(QWidget):
     @staticmethod
     def _poly(points: List[tuple[float, float]]) -> QPolygonF:
         return QPolygonF([QPointF(float(x), float(y)) for (x, y) in points])
+
+    @staticmethod
+    def _polyline_midpoint(points: List[tuple[float, float]]) -> tuple[float, float]:
+        """Return the point half-way along a polyline.
+
+        This is better than picking the middle vertex when the polyline has
+        wrap corners; it keeps labels visually centered on the segment.
+        """
+
+        if not points:
+            return (0.0, 0.0)
+        if len(points) == 1:
+            return (float(points[0][0]), float(points[0][1]))
+
+        # Total length
+        seg_lens: List[float] = []
+        total = 0.0
+        for (x1, y1), (x2, y2) in zip(points[:-1], points[1:]):
+            dx = float(x2) - float(x1)
+            dy = float(y2) - float(y1)
+            L = (dx * dx + dy * dy) ** 0.5
+            seg_lens.append(L)
+            total += L
+
+        if total <= 0.0:
+            return (float(points[0][0]), float(points[0][1]))
+
+        half = total / 2.0
+        acc = 0.0
+        for idx, L in enumerate(seg_lens):
+            if acc + L >= half and L > 0.0:
+                t = (half - acc) / L
+                x1, y1 = points[idx]
+                x2, y2 = points[idx + 1]
+                return (float(x1) + (float(x2) - float(x1)) * t, float(y1) + (float(y2) - float(y1)) * t)
+            acc += L
+
+        return (float(points[-1][0]), float(points[-1][1]))
+
+    @staticmethod
+    def _polyline_midpoint_and_dir(points: List[tuple[float, float]]) -> tuple[float, float, float, float]:
+        """Return (x, y, dx, dy) at the polyline half-length.
+
+        dx/dy are the direction of the segment containing the midpoint.
+        """
+
+        if not points:
+            return (0.0, 0.0, 1.0, 0.0)
+        if len(points) == 1:
+            return (float(points[0][0]), float(points[0][1]), 1.0, 0.0)
+
+        seg_lens: List[float] = []
+        total = 0.0
+        for (x1, y1), (x2, y2) in zip(points[:-1], points[1:]):
+            dx = float(x2) - float(x1)
+            dy = float(y2) - float(y1)
+            L = (dx * dx + dy * dy) ** 0.5
+            seg_lens.append(L)
+            total += L
+
+        if total <= 0.0:
+            return (float(points[0][0]), float(points[0][1]), 1.0, 0.0)
+
+        half = total / 2.0
+        acc = 0.0
+        for idx, L in enumerate(seg_lens):
+            x1, y1 = points[idx]
+            x2, y2 = points[idx + 1]
+            dx = float(x2) - float(x1)
+            dy = float(y2) - float(y1)
+            if acc + L >= half and L > 0.0:
+                t = (half - acc) / L
+                return (float(x1) + dx * t, float(y1) + dy * t, dx, dy)
+            acc += L
+
+        x1, y1 = points[-2]
+        x2, y2 = points[-1]
+        dx = float(x2) - float(x1)
+        dy = float(y2) - float(y1)
+        return (float(points[-1][0]), float(points[-1][1]), dx, dy)
 
     def set_rows(self, rows: List[Dict[str, object]]):
         self._rows = list(rows or [])
@@ -259,28 +340,70 @@ class _AssemblySldView(QWidget):
             item.setPen(pen_line)
             self._scene.addItem(item)
 
-            mid_idx = max(0, (len(pts) - 1) // 2)
-            mid = pts[mid_idx]
-            label = ""
+            mid_x, mid_y, dir_x, dir_y = self._polyline_midpoint_and_dir(list(pts))
+
+            # In wrapped mode the midpoint may land on a vertical segment (wrap corner).
+            # To avoid overlapping the line/nodes, place labels above/below for mostly
+            # horizontal segments, or left/right for mostly vertical segments.
             clen = e.get("cable_len_km")
             ctype = str(e.get("cable_type") or "").strip()
-            if ctype or clen is not None:
-                parts = []
-                if ctype:
-                    parts.append(ctype)
-                if clen is not None:
-                    parts.append(self._fmt_km(float(clen)))
-                label = "\n".join(parts)
 
-            if label:
-                t = QGraphicsTextItem(label)
+            label_gap = 4.0
+            label_pad = 2.0
+
+            def add_label(text: str, center_x: float, center_y: float):
+                if not text:
+                    return
+                t = QGraphicsTextItem(text)
                 t.setFont(font)
                 t.setDefaultTextColor(Qt.darkBlue)
-                t.setPos(QPointF(mid[0] + 6.0, mid[1] - 16.0))
+                br = t.boundingRect()
+
+                # Background box (improves legibility when labels cross other lines)
+                bg_rect = QGraphicsRectItem(0, 0, br.width() + 2 * label_pad, br.height() + 2 * label_pad)
+                bg_rect.setPen(QPen(Qt.NoPen))
+                bg_rect.setBrush(QBrush(Qt.white))
+
+                x0 = center_x - br.width() / 2.0
+                y0 = center_y - br.height() / 2.0
+                t.setPos(QPointF(x0, y0))
+                bg_rect.setPos(QPointF(x0 - label_pad, y0 - label_pad))
+
+                # Keep labels on top of lines/nodes
+                bg_rect.setZValue(5)
+                t.setZValue(6)
+                self._scene.addItem(bg_rect)
                 self._scene.addItem(t)
 
+            is_horizontal = abs(float(dir_x)) >= abs(float(dir_y))
+
+            if ctype:
+                # For horizontal segments, keep type above; for vertical, keep it left.
+                tmp = QGraphicsTextItem(ctype)
+                tmp.setFont(font)
+                br = tmp.boundingRect()
+                if is_horizontal:
+                    cy = mid_y - (br.height() / 2.0 + label_gap)
+                    add_label(ctype, mid_x, cy)
+                else:
+                    cx = mid_x - (br.width() / 2.0 + label_gap)
+                    add_label(ctype, cx, mid_y)
+
+            if clen is not None:
+                len_txt = self._fmt_km(self._try_float(clen))
+                if len_txt:
+                    tmp = QGraphicsTextItem(len_txt)
+                    tmp.setFont(font)
+                    br = tmp.boundingRect()
+                    if is_horizontal:
+                        cy = mid_y + (br.height() / 2.0 + label_gap)
+                        add_label(len_txt, mid_x, cy)
+                    else:
+                        cx = mid_x + (br.width() / 2.0 + label_gap)
+                        add_label(len_txt, cx, mid_y)
+
         # Draw nodes
-        r = 20.0
+        r = 16.0
         for i, n in enumerate(nodes):
             x, y = node_pts[i]
             kind = self._body_kind(str(n.get("label") or ""))
@@ -294,7 +417,8 @@ class _AssemblySldView(QWidget):
                 t = QGraphicsTextItem(label)
                 t.setFont(font)
                 t.setDefaultTextColor(Qt.black)
-                t.setPos(QPointF(x - r, y + r + 6.0))
+                br = t.boundingRect()
+                t.setPos(QPointF(x - br.width() / 2.0, y + r + 6.0))
                 self._scene.addItem(t)
 
         try:

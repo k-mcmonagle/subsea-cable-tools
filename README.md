@@ -20,12 +20,23 @@ Accessible via the QGIS Processing Toolbox under **Subsea Cable Tools**:
 - **Merge MBES Rasters** – Merge multiple MBES raster layers into a single raster, preserving depth (Z) values and ensuring NoData areas are transparent.
 - **Create Raster from XYZ** – Convert large XYZ (Easting, Northing, Depth) files to raster using a robust VRT-based method, with support for direct rasterization and IDW interpolation.
 
+### 📦 Dependencies (end users)
+
+- This plugin vendors key Python libraries under `lib/` (e.g. `openpyxl`, `pyqtgraph`) so users do **not** need to install pip packages for typical workflows.
+- **MDB Import:** requires Windows + a working Microsoft Access ODBC driver (Microsoft Access Database Engine) and `pyodbc` available to the QGIS Python environment.
+
 ### 🗺️ Map & Dockable Tools
-- **KP Mouse Tool** – An interactive tool that provides the closest KP and DCC of the mouse pointer dynamically. Features a persistent tooltip, improved usability, and continuous KP calculation.
+- **KP Mouse Tool** – An interactive tool that provides the closest KP and DCC of the mouse pointer dynamically. Supports **Ellipsoidal** (project ellipsoid; fallback WGS84) and **Cartesian** (planar, in project CRS units) distance modes; the configuration dialog shows both total route lengths (to **0.001 km**, ~1 m) when possible.
 - **KP Data Plotter** – New dockable tool for plotting KP-based data from table layers against a reference line, with interactive crosshair, map marker, support for multiple data fields, y-axis reversal, and tooltips.
 - **Straight Line Diagram (SLD)** – Dockable SLD plot for an RPL line + events layer with a synced map marker.
 - **SLD KP Ranges (NEW)** – Use a table layer of KP ranges as the single source of truth and visualise the same ranges on the SLD and on the map at the same time.
 - **Live Data Tool** – Dockable tool for receiving and displaying real-time data (map point + cards/plots/tables) from incoming text strings.
+
+#### Distance / KP measurement notes
+
+- Most tools use QGIS' built-in `QgsDistanceArea` with the **project ellipsoid** (fallback **WGS84**) for **ellipsoidal/geodesic** distances.
+- **Cartesian/planar** measurements are only meaningful in a **projected** CRS. If the project CRS is geographic (degrees), cartesian values are disabled/marked as not available.
+- Where a layer CRS differs from the project CRS, tools may transform geometries to the project CRS before measuring (the KP Mouse Tool does this). Some existing tools currently assume the project CRS and selected layer CRS match.
 
 #### Live Data Tool quick start
 

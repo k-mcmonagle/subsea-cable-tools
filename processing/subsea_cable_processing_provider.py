@@ -38,6 +38,7 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
 
         safe_add('kp_range_highlighter_algorithm', 'KPRangeHighlighterAlgorithm')
         safe_add('kp_range_csv_algorithm', 'KPRangeCSVAlgorithm')
+        safe_add('kp_range_extract_rule_based_algorithm', 'ExtractKPRangesRuleBasedAlgorithm')
         safe_add('kp_range_merge_tables_algorithm', 'KPRangeMergeTablesAlgorithm')
         safe_add('kp_range_group_adjacent_algorithm', 'KPRangeGroupAdjacentAlgorithm')
         safe_add('kp_range_depth_slope_summary_algorithm', 'KPRangeDepthSlopeSummaryAlgorithm')

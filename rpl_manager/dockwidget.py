@@ -4,8 +4,13 @@ import os
 import uuid
 from typing import Dict, List, Optional, Tuple
 
-from qgis.PyQt.QtCore import Qt, QPointF, QVariant
-from qgis.PyQt.QtGui import QBrush, QFont, QPainter, QPainterPath, QPen, QPolygonF
+try:
+    import sip  # type: ignore
+except Exception:  # pragma: no cover
+    sip = None
+
+from qgis.PyQt.QtCore import Qt, QPointF, QVariant, QSettings, QTimer
+from qgis.PyQt.QtGui import QBrush, QColor, QFont, QPainter, QPainterPath, QPen, QPolygonF
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -16,6 +21,8 @@ from qgis.PyQt.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QGraphicsEllipseItem,
@@ -34,15 +41,20 @@ from qgis.PyQt.QtWidgets import (
 
 from qgis.core import (
     Qgis,
+    QgsCoordinateTransform,
     QgsFeature,
+    QgsFeatureRequest,
     QgsField,
     QgsFields,
+    QgsGeometry,
     QgsMapLayer,
     QgsProject,
     QgsVectorFileWriter,
     QgsVectorLayer,
     QgsWkbTypes,
 )
+
+from qgis.gui import QgsRubberBand, QgsVertexMarker
 
 from .assembly_sld_view import _AssemblySldView
 
@@ -67,6 +79,13 @@ class RplManagerDockWidget(QDockWidget):
         self.setObjectName("RplManagerDockWidget")
         self.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea | Qt.BottomDockWidgetArea)
 
+        self._settings = QSettings("subsea_cable_tools", "RplManager")
+        self._project_signals_hooked: bool = False
+        self._project_refresh_timer = QTimer(self)
+        self._project_refresh_timer.setSingleShot(True)
+        self._project_refresh_timer.setInterval(300)
+        self._project_refresh_timer.timeout.connect(self._refresh_available_managed_rpls)
+
         self._managed_nodes_layer_id: Optional[str] = None
         self._managed_segs_layer_id: Optional[str] = None
 
@@ -75,6 +94,10 @@ class RplManagerDockWidget(QDockWidget):
         self._assembly_layer_id: Optional[str] = None
 
         self._updating_assembly_table: bool = False
+
+        # Map highlight helpers for the RPL Table tab.
+        self._rpl_table_marker: Optional[QgsVertexMarker] = None
+        self._rpl_table_rubber: Optional[QgsRubberBand] = None
 
         self.tab_widget = QTabWidget()
         self.setWidget(self.tab_widget)
@@ -88,6 +111,25 @@ class RplManagerDockWidget(QDockWidget):
 
         self.populate_layer_combos()
 
+        # Keep the managed list up to date as layers come/go.
+        try:
+            self._hook_project_signals()
+        except Exception:
+            pass
+
+        # Ensure signals are disconnected on teardown (prevents callbacks into deleted Qt objects).
+        try:
+            self.destroyed.connect(self._unhook_project_signals)
+        except Exception:
+            pass
+
+        # Populate list and restore the previously active managed RPL (if possible).
+        try:
+            self._refresh_available_managed_rpls()
+            self._restore_active_managed_rpl()
+        except Exception:
+            pass
+
     # -----------------
     # Tabs
     # -----------------
@@ -97,49 +139,59 @@ class RplManagerDockWidget(QDockWidget):
         layout = QVBoxLayout(tab)
 
         # -----------------
-        # 1) Use an existing managed GeoPackage
+        # Managed RPL selection (clean/simple)
         # -----------------
-        use_box = QGroupBox("Use existing managed GeoPackage")
-        use_layout = QVBoxLayout(use_box)
-        use_form = QFormLayout()
-        use_layout.addLayout(use_form)
+        managed_box = QGroupBox("Managed RPL")
+        managed_layout = QVBoxLayout(managed_box)
 
-        self.use_gpkg_edit = QLineEdit()
-        self.use_gpkg_edit.setPlaceholderText("Select an existing managed .gpkg")
-        use_gpkg_row = QHBoxLayout()
-        use_gpkg_row.addWidget(self.use_gpkg_edit, 1)
-        self.use_gpkg_browse_btn = QPushButton("Browse…")
-        self.use_gpkg_browse_btn.clicked.connect(self._browse_use_gpkg)
-        use_gpkg_row.addWidget(self.use_gpkg_browse_btn)
-        use_gpkg_widget = QWidget()
-        use_gpkg_widget.setLayout(use_gpkg_row)
-        use_form.addRow(QLabel("Managed GeoPackage:"), use_gpkg_widget)
+        managed_help = QLabel(
+            "Pick an available Managed RPL to work with.\n"
+            "The list is detected from the current QGIS project and recent GeoPackages."
+        )
+        managed_help.setWordWrap(True)
+        managed_layout.addWidget(managed_help)
 
-        self.use_prefix_combo = QComboBox()
-        self.use_prefix_combo.currentIndexChanged.connect(self._on_use_prefix_changed)
-        use_form.addRow(QLabel("RPL prefix:"), self.use_prefix_combo)
+        self.managed_rpl_list = QListWidget()
+        self.managed_rpl_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.managed_rpl_list.itemSelectionChanged.connect(self._on_managed_rpl_selection_changed)
+        self.managed_rpl_list.itemDoubleClicked.connect(lambda _it: self._activate_selected_managed_rpl())
+        managed_layout.addWidget(self.managed_rpl_list, 1)
 
-        self.use_status_label = QLabel("Select a .gpkg to detect managed tables.")
-        self.use_status_label.setWordWrap(True)
-        use_layout.addWidget(self.use_status_label)
+        btn_row = QHBoxLayout()
+        self.managed_browse_btn = QPushButton("Add GeoPackage…")
+        self.managed_browse_btn.setToolTip("Browse to a managed RPL GeoPackage (.gpkg) and add it to the list")
+        self.managed_browse_btn.clicked.connect(self._browse_add_managed_gpkg)
+        btn_row.addWidget(self.managed_browse_btn)
 
-        use_btn_row = QHBoxLayout()
-        self.use_refresh_btn = QPushButton("Re-scan GeoPackage")
-        self.use_refresh_btn.clicked.connect(self._scan_selected_gpkg)
-        use_btn_row.addWidget(self.use_refresh_btn)
+        self.managed_refresh_btn = QPushButton("Refresh")
+        self.managed_refresh_btn.clicked.connect(self._refresh_available_managed_rpls)
+        btn_row.addWidget(self.managed_refresh_btn)
 
-        self.use_load_btn = QPushButton("Use this GeoPackage")
-        self.use_load_btn.setToolTip("Loads the managed nodes/segments/assembly tables from this GeoPackage")
-        self.use_load_btn.clicked.connect(self._use_selected_gpkg)
-        use_btn_row.addWidget(self.use_load_btn)
-        use_layout.addLayout(use_btn_row)
+        btn_row.addStretch(1)
 
-        layout.addWidget(use_box)
+        self.managed_activate_btn = QPushButton("Set Active")
+        self.managed_activate_btn.setEnabled(False)
+        self.managed_activate_btn.clicked.connect(self._activate_selected_managed_rpl)
+        btn_row.addWidget(self.managed_activate_btn)
+
+        managed_layout.addLayout(btn_row)
+
+        self.managed_stats_label = QLabel("")
+        self.managed_stats_label.setWordWrap(True)
+        managed_layout.addWidget(self.managed_stats_label)
+
+        layout.addWidget(managed_box)
 
         # -----------------
         # 2) Create a managed GeoPackage from selected layers
         # -----------------
-        create_box = QGroupBox("Create managed GeoPackage from layers")
+        self.show_create_btn = QPushButton("Create new managed RPL…")
+        self.show_create_btn.setToolTip("Show/hide the create-from-layers section")
+        self.show_create_btn.clicked.connect(self._toggle_create_section)
+        layout.addWidget(self.show_create_btn)
+
+        create_box = QGroupBox("Create managed RPL from layers")
+        self.create_box = create_box
         create_layout = QVBoxLayout(create_box)
         create_form = QFormLayout()
         create_layout.addLayout(create_form)
@@ -179,6 +231,7 @@ class RplManagerDockWidget(QDockWidget):
         create_layout.addLayout(create_btn_row)
 
         layout.addWidget(create_box)
+        create_box.setVisible(False)
 
         # Internals (we still use these combos as internal state, but we don't require the user
         # to select them when working from a GeoPackage)
@@ -192,7 +245,12 @@ class RplManagerDockWidget(QDockWidget):
         self.managed_segs_combo.currentIndexChanged.connect(self._on_managed_selection_changed)
         managed_row.addWidget(QLabel("Segments:"))
         managed_row.addWidget(self.managed_segs_combo, 1)
-        layout.addLayout(managed_row)
+
+        # Internal state/debug selectors: hide by default to reduce confusion.
+        managed_row_widget = QWidget()
+        managed_row_widget.setLayout(managed_row)
+        managed_row_widget.setVisible(False)
+        layout.addWidget(managed_row_widget)
 
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
@@ -208,9 +266,321 @@ class RplManagerDockWidget(QDockWidget):
         self.rpl_table = QTableWidget()
         self.rpl_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.rpl_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        try:
+            self.rpl_table.setToolTip("Tip: single-click a row to highlight it; double-click to pan the map to it")
+        except Exception:
+            pass
+        try:
+            self.rpl_table.cellDoubleClicked.connect(self._on_rpl_table_cell_double_clicked)
+        except Exception:
+            pass
+        try:
+            self.rpl_table.itemSelectionChanged.connect(self._on_rpl_table_selection_changed)
+        except Exception:
+            pass
         layout.addWidget(self.rpl_table)
 
         self.tab_widget.addTab(tab, "2) RPL Table")
+
+    def _qt_isdeleted(self, obj) -> bool:
+        try:
+            return bool(sip is not None and hasattr(sip, "isdeleted") and sip.isdeleted(obj))
+        except Exception:
+            return False
+
+    def _clear_rpl_table_highlight(self):
+        marker = getattr(self, "_rpl_table_marker", None)
+        if marker is not None:
+            try:
+                if not self._qt_isdeleted(marker):
+                    try:
+                        marker.hide()
+                    except Exception:
+                        pass
+                    try:
+                        marker.deleteLater()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            self._rpl_table_marker = None
+
+        rubber = getattr(self, "_rpl_table_rubber", None)
+        if rubber is not None:
+            try:
+                if not self._qt_isdeleted(rubber):
+                    try:
+                        rubber.hide()
+                    except Exception:
+                        pass
+                    try:
+                        rubber.reset(QgsWkbTypes.LineGeometry)
+                    except Exception:
+                        pass
+                    try:
+                        rubber.deleteLater()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            self._rpl_table_rubber = None
+
+        def _highlight_features_on_canvas(self, layer: QgsVectorLayer, features: List[QgsFeature]):
+            """Best-effort highlight of one or more features on the map canvas.
+
+            Uses the same marker/rubberband as the RPL table to keep behavior consistent.
+            """
+
+            if not features:
+                return
+
+            canvas = self.iface.mapCanvas() if self.iface and hasattr(self.iface, "mapCanvas") else None
+            if canvas is None:
+                return
+
+            # Find first non-empty geometry for point fallback.
+            first_geom = None
+            for f in features:
+                try:
+                    g = f.geometry() if f is not None else None
+                except Exception:
+                    g = None
+                if g is not None and not g.isEmpty():
+                    first_geom = g
+                    break
+            if first_geom is None:
+                return
+
+            self._clear_rpl_table_highlight()
+
+            try:
+                if layer.geometryType() == QgsWkbTypes.PointGeometry:
+                    marker = QgsVertexMarker(canvas)
+                    marker.setColor(QColor(255, 215, 0))  # gold
+                    marker.setIconType(QgsVertexMarker.ICON_CROSS)
+                    marker.setIconSize(14)
+                    marker.setPenWidth(3)
+
+                    pt = first_geom.asPoint() if first_geom.isMultipart() is False else first_geom.asMultiPoint()[0]
+                    try:
+                        dest_crs = canvas.mapSettings().destinationCrs()
+                        if layer.crs() != dest_crs:
+                            tr = QgsCoordinateTransform(layer.crs(), dest_crs, QgsProject.instance())
+                            pt = tr.transform(pt)
+                    except Exception:
+                        pass
+
+                    marker.setCenter(pt)
+                    try:
+                        canvas.scene().addItem(marker)
+                    except Exception:
+                        pass
+                    self._rpl_table_marker = marker
+                    canvas.refresh()
+                    return
+
+                rubber = QgsRubberBand(canvas, QgsWkbTypes.LineGeometry)
+                rubber.setColor(QColor(255, 215, 0))
+                rubber.setWidth(4)
+                rubber.setLineStyle(Qt.SolidLine)
+                added_any = False
+                for f in features:
+                    try:
+                        geom = f.geometry() if f is not None else None
+                        if geom is None or geom.isEmpty():
+                            continue
+                        # addGeometry works for multi-part and avoids needing to union
+                        try:
+                            rubber.addGeometry(geom, layer)
+                        except Exception:
+                            rubber.addGeometry(QgsGeometry(geom), layer)
+                        added_any = True
+                    except Exception:
+                        continue
+                if not added_any:
+                    return
+                try:
+                    rubber.show()
+                except Exception:
+                    pass
+                self._rpl_table_rubber = rubber
+                canvas.refresh()
+            except Exception:
+                pass
+
+        def _pan_canvas_to_geometry(self, layer: QgsVectorLayer, geom: QgsGeometry):
+            canvas = self.iface.mapCanvas() if self.iface and hasattr(self.iface, "mapCanvas") else None
+            if canvas is None:
+                return
+            if geom is None or geom.isEmpty():
+                return
+            try:
+                center = geom.boundingBox().center()
+                try:
+                    dest_crs = canvas.mapSettings().destinationCrs()
+                    if layer.crs() != dest_crs:
+                        tr = QgsCoordinateTransform(layer.crs(), dest_crs, QgsProject.instance())
+                        center = tr.transform(center)
+                except Exception:
+                    pass
+                canvas.setCenter(center)
+                canvas.refresh()
+            except Exception:
+                pass
+
+    def _rpl_table_row_target(self, row: int) -> Optional[Dict[str, object]]:
+        try:
+            if row < 0:
+                return None
+            item0 = self.rpl_table.item(row, 0)
+            if item0 is None:
+                return None
+            meta = item0.data(Qt.UserRole)
+            return meta if isinstance(meta, dict) else None
+        except Exception:
+            return None
+
+    def _highlight_feature_on_canvas(self, layer: QgsVectorLayer, feature: QgsFeature):
+        canvas = self.iface.mapCanvas() if self.iface and hasattr(self.iface, "mapCanvas") else None
+        if canvas is None:
+            return
+
+        geom = feature.geometry() if feature is not None else None
+        if geom is None or geom.isEmpty():
+            return
+
+        self._clear_rpl_table_highlight()
+
+        try:
+            if layer.geometryType() == QgsWkbTypes.PointGeometry:
+                marker = QgsVertexMarker(canvas)
+                marker.setColor(QColor(255, 215, 0))  # gold
+                marker.setIconType(QgsVertexMarker.ICON_CROSS)
+                marker.setIconSize(14)
+                marker.setPenWidth(3)
+
+                pt = geom.asPoint() if geom.isMultipart() is False else geom.asMultiPoint()[0]
+                try:
+                    dest_crs = canvas.mapSettings().destinationCrs()
+                    if layer.crs() != dest_crs:
+                        tr = QgsCoordinateTransform(layer.crs(), dest_crs, QgsProject.instance())
+                        pt = tr.transform(pt)
+                except Exception:
+                    pass
+
+                marker.setCenter(pt)
+                try:
+                    canvas.scene().addItem(marker)
+                except Exception:
+                    pass
+                self._rpl_table_marker = marker
+                canvas.refresh()
+                return
+
+            rubber = QgsRubberBand(canvas, QgsWkbTypes.LineGeometry)
+            rubber.setColor(QColor(255, 215, 0))
+            rubber.setWidth(4)
+            rubber.setLineStyle(Qt.SolidLine)
+            try:
+                rubber.setToGeometry(QgsGeometry(geom), layer)
+            except Exception:
+                # Best effort fallback: try direct geometry
+                try:
+                    rubber.setToGeometry(geom, layer)
+                except Exception:
+                    return
+            try:
+                rubber.show()
+            except Exception:
+                pass
+            self._rpl_table_rubber = rubber
+            canvas.refresh()
+        except Exception:
+            # Never break the UI for a highlight failure.
+            pass
+
+    def _pan_canvas_to_feature(self, layer: QgsVectorLayer, feature: QgsFeature):
+        canvas = self.iface.mapCanvas() if self.iface and hasattr(self.iface, "mapCanvas") else None
+        if canvas is None:
+            return
+        try:
+            geom = feature.geometry()
+            if geom is None or geom.isEmpty():
+                return
+            center = geom.boundingBox().center()
+            try:
+                dest_crs = canvas.mapSettings().destinationCrs()
+                if layer.crs() != dest_crs:
+                    tr = QgsCoordinateTransform(layer.crs(), dest_crs, QgsProject.instance())
+                    center = tr.transform(center)
+            except Exception:
+                pass
+            canvas.setCenter(center)
+            canvas.refresh()
+        except Exception:
+            pass
+
+    def _on_rpl_table_selection_changed(self):
+        try:
+            row = self.rpl_table.currentRow()
+        except Exception:
+            return
+        meta = self._rpl_table_row_target(row)
+        if not meta:
+            self._clear_rpl_table_highlight()
+            return
+
+        layer_id = str(meta.get("layer_id") or "")
+        fid = meta.get("fid")
+        if not layer_id:
+            return
+        try:
+            fid_int = int(fid)
+        except Exception:
+            return
+
+        layer = QgsProject.instance().mapLayer(layer_id)
+        if not isinstance(layer, QgsVectorLayer) or not layer.isValid():
+            return
+
+        try:
+            req = QgsFeatureRequest().setFilterFid(fid_int)
+            feat = next(layer.getFeatures(req), None)
+        except Exception:
+            feat = None
+        if feat is None:
+            return
+        self._highlight_feature_on_canvas(layer, feat)
+
+    def _on_rpl_table_cell_double_clicked(self, row: int, _column: int):
+        meta = self._rpl_table_row_target(row)
+        if not meta:
+            return
+
+        layer_id = str(meta.get("layer_id") or "")
+        fid = meta.get("fid")
+        if not layer_id:
+            return
+        try:
+            fid_int = int(fid)
+        except Exception:
+            return
+
+        layer = QgsProject.instance().mapLayer(layer_id)
+        if not isinstance(layer, QgsVectorLayer) or not layer.isValid():
+            return
+
+        try:
+            req = QgsFeatureRequest().setFilterFid(fid_int)
+            feat = next(layer.getFeatures(req), None)
+        except Exception:
+            feat = None
+        if feat is None:
+            return
+
+        # Keep highlight in sync and pan the map to the selected row feature.
+        self._highlight_feature_on_canvas(layer, feat)
+        self._pan_canvas_to_feature(layer, feat)
 
     def _build_cable_assembly_tab(self):
         tab = QWidget()
@@ -256,6 +626,18 @@ class RplManagerDockWidget(QDockWidget):
         self.cable_table = QTableWidget()
         self.cable_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.cable_table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
+        try:
+            self.cable_table.setToolTip("Tip: single-click a row to highlight it; double-click to pan the map to it")
+        except Exception:
+            pass
+        try:
+            self.cable_table.cellDoubleClicked.connect(self._on_cable_table_cell_double_clicked)
+        except Exception:
+            pass
+        try:
+            self.cable_table.itemSelectionChanged.connect(self._on_cable_table_selection_changed)
+        except Exception:
+            pass
         layout.addWidget(self.cable_table)
 
         # Keep the SLD tab in sync with assembly edits.
@@ -265,6 +647,203 @@ class RplManagerDockWidget(QDockWidget):
             pass
 
         self.tab_widget.addTab(tab, "3) Cable Assembly")
+
+    def _cable_table_row_value(self, row: int, col_name: str) -> str:
+        if row < 0:
+            return ""
+        name_norm = (col_name or "").strip().lower()
+        if not name_norm:
+            return ""
+        try:
+            for c in range(self.cable_table.columnCount()):
+                hi = self.cable_table.horizontalHeaderItem(c)
+                if hi is None:
+                    continue
+                if (hi.text() or "").strip().lower() == name_norm:
+                    it = self.cable_table.item(row, c)
+                    return (it.text() or "").strip() if it else ""
+        except Exception:
+            return ""
+        return ""
+
+    def _managed_node_feature_by_node_id(self, node_id: str) -> Optional[QgsFeature]:
+        nodes, _segs = self._managed_layers()
+        if not nodes or not isinstance(nodes, QgsVectorLayer) or not nodes.isValid():
+            return None
+        nid = (node_id or "").strip()
+        if not nid:
+            return None
+        idx = nodes.fields().lookupField("node_id")
+        if idx < 0:
+            return None
+        try:
+            for f in nodes.getFeatures():
+                try:
+                    if str(f[idx]) == nid:
+                        return f
+                except Exception:
+                    continue
+        except Exception:
+            return None
+        return None
+
+    def _managed_segment_features_for_span(self, from_node_id: str, to_node_id: str) -> List[QgsFeature]:
+        """Return managed segment features whose seq spans from_node_id..to_node_id.
+
+        This mirrors the span logic used in `_autobuild_assembly_from_rpl`.
+        """
+
+        nodes, segs = self._managed_layers()
+        if not nodes or not segs:
+            return []
+        if not isinstance(nodes, QgsVectorLayer) or not isinstance(segs, QgsVectorLayer):
+            return []
+        if not nodes.isValid() or not segs.isValid():
+            return []
+
+        a_id = (from_node_id or "").strip()
+        b_id = (to_node_id or "").strip()
+        if not a_id or not b_id:
+            return []
+
+        n_seq_idx = nodes.fields().lookupField("seq")
+        n_id_idx = nodes.fields().lookupField("node_id")
+        if n_id_idx < 0:
+            return []
+
+        def safe_int(v):
+            try:
+                return int(v)
+            except Exception:
+                return 10**18
+
+        node_feats = list(nodes.getFeatures())
+        node_feats.sort(key=lambda f: safe_int(f[n_seq_idx]) if n_seq_idx >= 0 else int(f.id()))
+
+        node_seq_by_id: Dict[str, int] = {}
+        for idx, f in enumerate(node_feats):
+            try:
+                nid = f[n_id_idx]
+            except Exception:
+                nid = None
+            if nid in (None, ""):
+                continue
+            nid_s = str(nid)
+            seq_val = None
+            if n_seq_idx >= 0:
+                try:
+                    seq_val = int(f[n_seq_idx])
+                except Exception:
+                    seq_val = None
+            if seq_val is None:
+                seq_val = idx + 1
+            node_seq_by_id[nid_s] = seq_val
+
+        a = node_seq_by_id.get(a_id)
+        b = node_seq_by_id.get(b_id)
+        if a is None or b is None:
+            return []
+
+        lo = min(a, b)
+        hi = max(a, b)
+
+        s_seq_idx = segs.fields().lookupField("seq")
+        seg_feats = list(segs.getFeatures())
+
+        def safe_seq(f):
+            if s_seq_idx >= 0:
+                try:
+                    return int(f[s_seq_idx])
+                except Exception:
+                    return 10**18
+            return int(f.id())
+
+        seg_feats.sort(key=safe_seq)
+
+        out: List[QgsFeature] = []
+        for sf in seg_feats:
+            sseq = safe_seq(sf)
+            if sseq < lo:
+                continue
+            if sseq > hi - 1:
+                break
+            out.append(sf)
+        return out
+
+    def _on_cable_table_selection_changed(self):
+        if getattr(self, "_updating_assembly_table", False):
+            return
+        try:
+            row = self.cable_table.currentRow()
+        except Exception:
+            return
+        if row < 0:
+            self._clear_rpl_table_highlight()
+            return
+
+        rt = self._cable_table_row_value(row, "row_type").upper()
+        if rt == "BODY":
+            node_id = self._cable_table_row_value(row, "node_id")
+            feat = self._managed_node_feature_by_node_id(node_id)
+            nodes, _segs = self._managed_layers()
+            if feat is not None and nodes is not None:
+                self._highlight_features_on_canvas(nodes, [feat])
+            return
+
+        if rt == "SEGMENT":
+            from_nid = self._cable_table_row_value(row, "from_node_id")
+            to_nid = self._cable_table_row_value(row, "to_node_id")
+            feats = self._managed_segment_features_for_span(from_nid, to_nid)
+            _nodes, segs = self._managed_layers()
+            if feats and segs is not None:
+                self._highlight_features_on_canvas(segs, feats)
+            return
+
+        # Unknown row type
+        self._clear_rpl_table_highlight()
+
+    def _on_cable_table_cell_double_clicked(self, row: int, _column: int):
+        if getattr(self, "_updating_assembly_table", False):
+            return
+
+        rt = self._cable_table_row_value(row, "row_type").upper()
+        if rt == "BODY":
+            node_id = self._cable_table_row_value(row, "node_id")
+            feat = self._managed_node_feature_by_node_id(node_id)
+            nodes, _segs = self._managed_layers()
+            if feat is None or nodes is None:
+                return
+            self._highlight_features_on_canvas(nodes, [feat])
+            self._pan_canvas_to_feature(nodes, feat)
+            return
+
+        if rt == "SEGMENT":
+            from_nid = self._cable_table_row_value(row, "from_node_id")
+            to_nid = self._cable_table_row_value(row, "to_node_id")
+            feats = self._managed_segment_features_for_span(from_nid, to_nid)
+            _nodes, segs = self._managed_layers()
+            if not feats or segs is None:
+                return
+            self._highlight_features_on_canvas(segs, feats)
+            # Pan to combined geometry center
+            try:
+                geoms = [f.geometry() for f in feats if f is not None and f.geometry() is not None and not f.geometry().isEmpty()]
+                if not geoms:
+                    return
+                bbox = geoms[0].boundingBox()
+                for g in geoms[1:]:
+                    try:
+                        bbox.combineExtentWith(g.boundingBox())
+                    except Exception:
+                        pass
+                self._pan_canvas_to_geometry(segs, QgsGeometry.fromRect(bbox))
+            except Exception:
+                # fallback: pan to first feature
+                try:
+                    self._pan_canvas_to_feature(segs, feats[0])
+                except Exception:
+                    pass
+            return
 
     def _build_assembly_sld_tab(self):
         tab = QWidget()
@@ -479,11 +1058,416 @@ class RplManagerDockWidget(QDockWidget):
 
         self._update_status()
 
-        # Keep managed GeoPackage detection fresh (if the Use-GPKG UI is present)
+        # Also refresh the managed list so it reflects newly loaded/removed layers.
+        self._schedule_project_refresh()
+
+    # -----------------
+    # Setup tab: Managed RPL list
+    # -----------------
+
+    def _toggle_create_section(self):
+        box = getattr(self, "create_box", None)
+        if box is None:
+            return
         try:
-            if hasattr(self, "use_gpkg_edit"):
-                if (self.use_gpkg_edit.text() or "").strip():
-                    self._scan_selected_gpkg()
+            if sip is not None and hasattr(sip, "isdeleted") and sip.isdeleted(box):
+                return
+            box.setVisible(not box.isVisible())
+        except RuntimeError:
+            # Qt widget may already be deleted during plugin reload/teardown.
+            return
+        except Exception:
+            pass
+
+    def _hook_project_signals(self):
+        proj = QgsProject.instance()
+        if self._project_signals_hooked:
+            return
+        try:
+            proj.layersAdded.connect(self._on_project_layers_added)
+            proj.layersRemoved.connect(self._on_project_layers_removed)
+            self._project_signals_hooked = True
+        except Exception:
+            # Best-effort; if connection fails, keep app stable.
+            self._project_signals_hooked = False
+
+    def _unhook_project_signals(self, *_args):
+        """Disconnect project-level signals.
+
+        This is critical when the dockwidget is closed/reloaded: QGIS project signals
+        can otherwise call back into Python closures that reference deleted Qt objects.
+        """
+
+        if not getattr(self, "_project_signals_hooked", False):
+            return
+        try:
+            proj = QgsProject.instance()
+            try:
+                proj.layersAdded.disconnect(self._on_project_layers_added)
+            except Exception:
+                pass
+            try:
+                proj.layersRemoved.disconnect(self._on_project_layers_removed)
+            except Exception:
+                pass
+        finally:
+            self._project_signals_hooked = False
+
+    def closeEvent(self, event):
+        try:
+            self._unhook_project_signals()
+        except Exception:
+            pass
+        try:
+            self._clear_rpl_table_highlight()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+    def _schedule_project_refresh(self):
+        try:
+            t = getattr(self, "_project_refresh_timer", None)
+            if t is None:
+                return
+            if sip is not None and hasattr(sip, "isdeleted") and sip.isdeleted(t):
+                return
+            self._project_refresh_timer.start()
+        except RuntimeError:
+            # Timer may already be deleted during teardown.
+            pass
+        except Exception:
+            pass
+
+    def _on_project_layers_added(self, *_layers):
+        self._schedule_project_refresh()
+
+    def _on_project_layers_removed(self, *_layer_ids):
+        self._schedule_project_refresh()
+
+    def _get_recent_gpkgs(self) -> List[str]:
+        v = self._settings.value("recent_gpkgs")
+        if isinstance(v, (list, tuple)):
+            return [str(x).strip() for x in v if str(x).strip()]
+        if isinstance(v, str):
+            return [s.strip() for s in v.split("|") if s.strip()]
+        return []
+
+    def _set_recent_gpkgs(self, paths: List[str]):
+        cleaned: List[str] = []
+        seen = set()
+        for p in paths:
+            s = (p or "").strip()
+            if not s:
+                continue
+            n = self._normalize_path(s)
+            if n in seen:
+                continue
+            seen.add(n)
+            cleaned.append(s)
+        # Keep it short
+        cleaned = cleaned[:10]
+        try:
+            self._settings.setValue("recent_gpkgs", cleaned)
+        except Exception:
+            # Fallback to string join
+            try:
+                self._settings.setValue("recent_gpkgs", "|".join(cleaned))
+            except Exception:
+                pass
+
+    def _remember_recent_gpkg(self, gpkg: str):
+        if not gpkg:
+            return
+        rec = [gpkg] + self._get_recent_gpkgs()
+        self._set_recent_gpkgs(rec)
+
+    def _save_active_managed_rpl(self, gpkg: str, prefix: str):
+        try:
+            self._settings.setValue("active_gpkg_path", (gpkg or "").strip())
+            self._settings.setValue("active_prefix", (prefix or "").strip())
+        except Exception:
+            pass
+
+    def _restore_active_managed_rpl(self):
+        gpkg = str(self._settings.value("active_gpkg_path") or "").strip()
+        prefix = str(self._settings.value("active_prefix") or "").strip()
+        if not gpkg or not prefix:
+            return
+        if not os.path.exists(gpkg):
+            return
+        # Do not spam UI: activate quietly.
+        self._activate_managed_rpl(gpkg, prefix, silent=True)
+
+    def _detect_managed_rpls_in_project(self) -> Dict[Tuple[str, str], Dict[str, object]]:
+        """Return mapping (gpkg_path, prefix) -> metadata for managed RPL sets loaded in the project."""
+
+        out: Dict[Tuple[str, str], Dict[str, object]] = {}
+        for lyr in QgsProject.instance().mapLayers().values():
+            if not isinstance(lyr, QgsVectorLayer) or not lyr.isValid():
+                continue
+
+            name = (lyr.name() or "").strip()
+            src_path, _src_layer = self._parse_ogr_source(lyr.source() or "")
+            if not src_path or not str(src_path).lower().endswith(".gpkg"):
+                continue
+
+            fields = set(f.name() for f in lyr.fields())
+
+            if lyr.geometryType() == QgsWkbTypes.PointGeometry and name.endswith("_nodes") and {"node_id", "seq"}.issubset(fields):
+                prefix = name[: -len("_nodes")]
+                key = (src_path, prefix)
+                out.setdefault(key, {"gpkg": src_path, "prefix": prefix})
+                out[key]["nodes_layer_id"] = lyr.id()
+
+            if lyr.geometryType() == QgsWkbTypes.LineGeometry and name.endswith("_segments") and {"seg_id", "from_node_id", "to_node_id"}.issubset(fields):
+                prefix = name[: -len("_segments")]
+                key = (src_path, prefix)
+                out.setdefault(key, {"gpkg": src_path, "prefix": prefix})
+                out[key]["segs_layer_id"] = lyr.id()
+
+            if lyr.wkbType() == QgsWkbTypes.NoGeometry and name.endswith("_assembly") and {"row_type", "seq", "assembly_row_id"}.issubset(fields):
+                prefix = name[: -len("_assembly")]
+                key = (src_path, prefix)
+                out.setdefault(key, {"gpkg": src_path, "prefix": prefix})
+                out[key]["assembly_layer_id"] = lyr.id()
+
+        # keep only valid sets (nodes+segments)
+        valid: Dict[Tuple[str, str], Dict[str, object]] = {}
+        for k, meta in out.items():
+            if meta.get("nodes_layer_id") and meta.get("segs_layer_id"):
+                valid[k] = meta
+        return valid
+
+    def _detect_valid_prefixes_in_gpkg(self, gpkg: str) -> Dict[str, Dict[str, bool]]:
+        names = self._list_gpkg_layer_names(gpkg)
+        prefixes = self._detect_managed_prefixes(names)
+        return {p: meta for p, meta in prefixes.items() if meta.get("nodes") and meta.get("segments")}
+
+    def _refresh_available_managed_rpls(self):
+        if not hasattr(self, "managed_rpl_list"):
+            return
+
+        # Remember selection if possible
+        prev_key = None
+        try:
+            it = self.managed_rpl_list.currentItem()
+            if isinstance(it, QListWidgetItem):
+                prev_key = it.data(Qt.UserRole)
+        except Exception:
+            prev_key = None
+
+        self.managed_rpl_list.blockSignals(True)
+        self.managed_rpl_list.clear()
+
+        project_sets = self._detect_managed_rpls_in_project()
+
+        # Include active + recent gpkg even if not currently loaded
+        active_gpkg = str(self._settings.value("active_gpkg_path") or "").strip()
+        recents = self._get_recent_gpkgs()
+        candidates = []
+        if active_gpkg:
+            candidates.append(active_gpkg)
+        candidates.extend(recents)
+
+        # Create a lookup of existing keys for de-dupe
+        seen = set((self._normalize_path(g), p) for (g, p) in project_sets.keys())
+
+        # Add loaded project sets first
+        for (_gpkg, _prefix), meta in sorted(project_sets.items(), key=lambda kv: (os.path.basename(kv[0][0]).lower(), kv[0][1].lower())):
+            gpkg = str(meta.get("gpkg") or "")
+            prefix = str(meta.get("prefix") or "")
+            disp = f"{os.path.basename(gpkg)} :: {prefix}"
+            item = QListWidgetItem(disp)
+            item.setData(Qt.UserRole, {"gpkg": gpkg, "prefix": prefix})
+            self.managed_rpl_list.addItem(item)
+
+        # Add valid managed sets from recent gpkg files (not necessarily loaded)
+        for gpkg in candidates:
+            if not gpkg or not os.path.exists(gpkg):
+                continue
+            try:
+                valids = self._detect_valid_prefixes_in_gpkg(gpkg)
+            except Exception:
+                continue
+            for prefix in sorted(valids.keys()):
+                key_n = (self._normalize_path(gpkg), prefix)
+                if key_n in seen:
+                    continue
+                seen.add(key_n)
+                disp = f"{os.path.basename(gpkg)} :: {prefix}"
+                item = QListWidgetItem(disp)
+                item.setData(Qt.UserRole, {"gpkg": gpkg, "prefix": prefix})
+                self.managed_rpl_list.addItem(item)
+
+        self.managed_rpl_list.blockSignals(False)
+
+        # Restore selection
+        if prev_key is not None:
+            try:
+                for i in range(self.managed_rpl_list.count()):
+                    it = self.managed_rpl_list.item(i)
+                    if it and it.data(Qt.UserRole) == prev_key:
+                        self.managed_rpl_list.setCurrentRow(i)
+                        break
+            except Exception:
+                pass
+
+        self._on_managed_rpl_selection_changed()
+
+    def _on_managed_rpl_selection_changed(self):
+        it = self.managed_rpl_list.currentItem() if hasattr(self, "managed_rpl_list") else None
+        if not isinstance(it, QListWidgetItem):
+            try:
+                self.managed_activate_btn.setEnabled(False)
+                self.managed_stats_label.setText("")
+            except Exception:
+                pass
+            return
+
+        ref = it.data(Qt.UserRole) or {}
+        gpkg = str(ref.get("gpkg") or "")
+        prefix = str(ref.get("prefix") or "")
+        self.managed_activate_btn.setEnabled(bool(gpkg and prefix))
+
+        # Stats: if loaded, use layer counts; otherwise show path/prefix.
+        nodes = self._find_loaded_gpkg_layer(gpkg, f"{prefix}_nodes")
+        segs = self._find_loaded_gpkg_layer(gpkg, f"{prefix}_segments")
+        assembly = self._find_loaded_gpkg_layer(gpkg, f"{prefix}_assembly")
+        try:
+            if nodes and segs:
+                n = nodes.featureCount()
+                s = segs.featureCount()
+                a = assembly.featureCount() if assembly and assembly.isValid() else 0
+                self.managed_stats_label.setText(
+                    f"GeoPackage: {gpkg}\nPrefix: {prefix}\nFeatures: nodes={n}, segments={s}, assembly={a if assembly else 'n/a'}"
+                )
+            else:
+                self.managed_stats_label.setText(f"GeoPackage: {gpkg}\nPrefix: {prefix}\n(Managed layers not currently loaded in the project)")
+        except Exception:
+            self.managed_stats_label.setText(f"GeoPackage: {gpkg}\nPrefix: {prefix}")
+
+    def _browse_add_managed_gpkg(self):
+        gpkg, _ = QFileDialog.getOpenFileName(self, "Select Managed RPL GeoPackage", "", "GeoPackage (*.gpkg)")
+        if not gpkg:
+            return
+
+        if not os.path.exists(gpkg):
+            QMessageBox.warning(self, "RPL Manager", "Selected GeoPackage does not exist.")
+            return
+
+        valids = self._detect_valid_prefixes_in_gpkg(gpkg)
+        if not valids:
+            QMessageBox.warning(
+                self,
+                "RPL Manager",
+                "This GeoPackage does not look like a managed RPL.\n\nExpected tables like '<prefix>_nodes' and '<prefix>_segments'.",
+            )
+            return
+
+        self._remember_recent_gpkg(gpkg)
+        self._refresh_available_managed_rpls()
+
+        # Auto-select + activate the first valid prefix.
+        chosen_prefix = sorted(valids.keys())[0]
+        # Prefer any prefix with assembly present.
+        for p, meta in valids.items():
+            if meta.get("assembly"):
+                chosen_prefix = p
+                break
+
+        # Select in list
+        try:
+            for i in range(self.managed_rpl_list.count()):
+                it = self.managed_rpl_list.item(i)
+                ref = it.data(Qt.UserRole) if it else None
+                if isinstance(ref, dict) and self._normalize_path(str(ref.get("gpkg") or "")) == self._normalize_path(gpkg) and str(ref.get("prefix") or "") == chosen_prefix:
+                    self.managed_rpl_list.setCurrentRow(i)
+                    break
+        except Exception:
+            pass
+
+        self._activate_managed_rpl(gpkg, chosen_prefix, silent=False)
+
+    def _activate_selected_managed_rpl(self):
+        it = self.managed_rpl_list.currentItem() if hasattr(self, "managed_rpl_list") else None
+        if not isinstance(it, QListWidgetItem):
+            return
+        ref = it.data(Qt.UserRole) or {}
+        gpkg = str(ref.get("gpkg") or "")
+        prefix = str(ref.get("prefix") or "")
+        if not gpkg or not prefix:
+            return
+        self._activate_managed_rpl(gpkg, prefix, silent=False)
+
+    def _activate_managed_rpl(self, gpkg: str, prefix: str, silent: bool = False):
+        gpkg = (gpkg or "").strip()
+        prefix = (prefix or "").strip()
+        if not gpkg or not prefix:
+            return
+        if not os.path.exists(gpkg):
+            if not silent:
+                QMessageBox.warning(self, "RPL Manager", "Managed GeoPackage path is missing.")
+            return
+
+        # Validate prefix before loading
+        try:
+            valids = self._detect_valid_prefixes_in_gpkg(gpkg)
+            if prefix not in valids:
+                if not silent:
+                    QMessageBox.warning(self, "RPL Manager", "Selected managed RPL is no longer valid (missing nodes/segments tables).")
+                return
+        except Exception:
+            if not silent:
+                QMessageBox.warning(self, "RPL Manager", "Could not read GeoPackage to validate managed tables.")
+            return
+
+        group_name = (self.group_edit.text() or "Managed RPL").strip() if hasattr(self, "group_edit") else "Managed RPL"
+        nodes_layer = self._load_or_get_gpkg_layer(gpkg, f"{prefix}_nodes", group_name)
+        segs_layer = self._load_or_get_gpkg_layer(gpkg, f"{prefix}_segments", group_name)
+        assembly_layer = self._load_or_get_gpkg_layer(gpkg, f"{prefix}_assembly", group_name)
+
+        if not nodes_layer or not segs_layer:
+            if not silent:
+                QMessageBox.warning(self, "RPL Manager", "Could not load managed nodes/segments layers from this GeoPackage.")
+            return
+
+        self._gpkg_path = gpkg
+        self._prefix = prefix
+        self._managed_nodes_layer_id = nodes_layer.id()
+        self._managed_segs_layer_id = segs_layer.id()
+        self._assembly_layer_id = assembly_layer.id() if assembly_layer else None
+
+        # Persist active selection
+        self._remember_recent_gpkg(gpkg)
+        self._save_active_managed_rpl(gpkg, prefix)
+
+        # Refresh dependent UI
+        self.populate_layer_combos()
+        self._refresh_rpl_table_view()
+        self._load_or_init_assembly_table()
+
+        # Provide a simple status line
+        try:
+            n_count = nodes_layer.featureCount()
+            s_count = segs_layer.featureCount()
+            a_count = assembly_layer.featureCount() if assembly_layer and assembly_layer.isValid() else 0
+            self.status_label.setText(
+                f"Active Managed RPL: {os.path.basename(gpkg)} :: {prefix}  (nodes={n_count}, segments={s_count}, assembly={a_count if assembly_layer else 'n/a'})"
+            )
+        except Exception:
+            self.status_label.setText(f"Active Managed RPL: {os.path.basename(gpkg)} :: {prefix}")
+
+        if not silent:
+            self.iface.messageBar().pushMessage(
+                "RPL Manager",
+                f"Active Managed RPL set to '{prefix}'",
+                level=Qgis.Success,
+                duration=3,
+            )
+
+        # Update list stats
+        try:
+            self._refresh_available_managed_rpls()
         except Exception:
             pass
 
@@ -526,139 +1510,6 @@ class RplManagerDockWidget(QDockWidget):
                 path += ".gpkg"
             self.output_gpkg_edit.setText(path)
             self._gpkg_path = path
-
-    def _browse_use_gpkg(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Managed GeoPackage", "", "GeoPackage (*.gpkg)")
-        if path:
-            self.use_gpkg_edit.setText(path)
-            self.output_gpkg_edit.setText(path)
-            self._gpkg_path = path
-            self._scan_selected_gpkg()
-
-    def _on_use_prefix_changed(self):
-        prefix = self.use_prefix_combo.currentData()
-        if prefix:
-            self._prefix = str(prefix)
-            self._update_status()
-
-    def _scan_selected_gpkg(self):
-        if not hasattr(self, "use_gpkg_edit"):
-            return
-        gpkg = (self.use_gpkg_edit.text() or "").strip()
-        if not gpkg:
-            return
-
-        self._gpkg_path = gpkg
-        layer_names = self._list_gpkg_layer_names(gpkg)
-        if not layer_names:
-            self.use_status_label.setText("No layers detected in this GeoPackage (or could not read it).")
-            self.use_prefix_combo.clear()
-            return
-
-        prefixes = self._detect_managed_prefixes(layer_names)
-        if not prefixes:
-            self.use_status_label.setText(
-                "GeoPackage loaded, but no managed RPL tables found.\n"
-                "Expected layers like '<prefix>_nodes' and '<prefix>_segments'.\n"
-                "Use the 'Create managed GeoPackage from layers' section below."
-            )
-            self.use_prefix_combo.clear()
-            return
-
-        current_prefix = self._prefix
-        valid_prefixes = sorted(prefixes.keys())
-
-        self.use_prefix_combo.blockSignals(True)
-        self.use_prefix_combo.clear()
-        for p in valid_prefixes:
-            meta = prefixes[p]
-            suffix = []
-            suffix.append("nodes" if meta.get("nodes") else "missing nodes")
-            suffix.append("segments" if meta.get("segments") else "missing segments")
-            suffix.append("assembly" if meta.get("assembly") else "no assembly")
-            self.use_prefix_combo.addItem(f"{p} ({', '.join(suffix)})", p)
-
-        # Select a reasonable default
-        chosen = None
-        if current_prefix and current_prefix in prefixes:
-            chosen = current_prefix
-        else:
-            for p in valid_prefixes:
-                if prefixes[p].get("nodes") and prefixes[p].get("segments"):
-                    chosen = p
-                    break
-            if chosen is None:
-                chosen = valid_prefixes[0]
-
-        self._prefix = chosen
-        self.use_prefix_combo.setCurrentIndex(valid_prefixes.index(chosen))
-        self.use_prefix_combo.blockSignals(False)
-
-        meta = prefixes.get(self._prefix) or {}
-        msg = [f"Detected {len(layer_names)} table(s) in GeoPackage."]
-        msg.append(f"Selected prefix: {self._prefix}")
-        msg.append(
-            f"Tables present: nodes={'YES' if meta.get('nodes') else 'NO'}, "
-            f"segments={'YES' if meta.get('segments') else 'NO'}, "
-            f"assembly={'YES' if meta.get('assembly') else 'NO'}"
-        )
-        if not (meta.get("nodes") and meta.get("segments")):
-            msg.append("This prefix is not a valid managed RPL (missing nodes/segments).")
-        self.use_status_label.setText("\n".join(msg))
-
-    def _use_selected_gpkg(self):
-        gpkg = (self.use_gpkg_edit.text() or "").strip()
-        if not gpkg:
-            return
-        prefix = self.use_prefix_combo.currentData() or self._prefix
-        if not prefix:
-            QMessageBox.warning(self, "RPL Manager", "Select a prefix to use.")
-            return
-
-        self._gpkg_path = gpkg
-        self._prefix = str(prefix)
-        self.output_gpkg_edit.setText(gpkg)
-
-        group_name = (self.group_edit.text() or "Managed RPL").strip()
-        nodes_layer = self._load_or_get_gpkg_layer(gpkg, f"{self._prefix}_nodes", group_name)
-        segs_layer = self._load_or_get_gpkg_layer(gpkg, f"{self._prefix}_segments", group_name)
-        assembly_layer = self._load_or_get_gpkg_layer(gpkg, f"{self._prefix}_assembly", group_name)
-
-        if not nodes_layer or not segs_layer:
-            QMessageBox.warning(
-                self,
-                "RPL Manager",
-                "Could not load managed nodes/segments from this GeoPackage/prefix.\n"
-                "If this is not a managed RPL GeoPackage, use the Create section below.",
-            )
-            return
-
-        self._managed_nodes_layer_id = nodes_layer.id()
-        self._managed_segs_layer_id = segs_layer.id()
-        self._assembly_layer_id = assembly_layer.id() if assembly_layer else None
-
-        # Refresh UI state. Do not rely on combo-box signals (they may not fire depending on timing).
-        self.populate_layer_combos()
-        self._refresh_rpl_table_view()
-        self._load_or_init_assembly_table()
-
-        # Quick sanity counts to help users spot prefix mismatches / empty outputs.
-        try:
-            n_count = nodes_layer.featureCount()
-            s_count = segs_layer.featureCount()
-            a_count = assembly_layer.featureCount() if assembly_layer and assembly_layer.isValid() else 0
-            self.status_label.setText(
-                f"Using managed GeoPackage prefix '{self._prefix}'. "
-                f"Features: nodes={n_count}, segments={s_count}, assembly={a_count if assembly_layer else 'n/a'}"
-            )
-        except Exception:
-            pass
-        self.iface.messageBar().pushMessage(
-            "RPL Manager",
-            f"Using managed GeoPackage prefix '{self._prefix}'.",
-            level=Qgis.Success,
-            duration=3,
-        )
 
     @staticmethod
     def _normalize_path(p: str) -> str:
@@ -870,13 +1721,15 @@ class RplManagerDockWidget(QDockWidget):
 
             self._managed_nodes_layer_id = nodes_id
             self._managed_segs_layer_id = segs_id
+            self.populate_layer_combos()
+
+            # Make the newly created managed RPL available + active.
             try:
-                if hasattr(self, "use_gpkg_edit"):
-                    self.use_gpkg_edit.setText(out_gpkg)
-                    self._scan_selected_gpkg()
+                self._remember_recent_gpkg(out_gpkg)
+                self._refresh_available_managed_rpls()
+                self._activate_managed_rpl(out_gpkg, self._prefix, silent=True)
             except Exception:
                 pass
-            self.populate_layer_combos()
 
             # Ensure/refresh assembly table after conversion
             self._load_or_init_assembly_table()
@@ -924,8 +1777,8 @@ class RplManagerDockWidget(QDockWidget):
         nodes, segs = self._managed_layers()
         if not nodes or not segs:
             self.status_label.setText(
-                "Select a managed GeoPackage + prefix (Use existing), or create one (Create section).\n"
-                "Then click 'Use this GeoPackage' to load nodes/segments."
+                "Select a Managed RPL above (or create a new one).\n"
+                "Once active, the other tabs will populate automatically."
             )
             return
 
@@ -944,6 +1797,10 @@ class RplManagerDockWidget(QDockWidget):
         if not nodes or not segs:
             self.rpl_table.setRowCount(0)
             self.rpl_table.setColumnCount(0)
+            try:
+                self._clear_rpl_table_highlight()
+            except Exception:
+                pass
             return
 
         # Pull features ordered by seq
@@ -978,6 +1835,7 @@ class RplManagerDockWidget(QDockWidget):
         ]
 
         rows: List[Dict[str, object]] = []
+        row_targets: List[Optional[Dict[str, object]]] = []
         for i, n in enumerate(node_feats):
             rows.append({
                 "RowType": "POINT",
@@ -992,6 +1850,7 @@ class RplManagerDockWidget(QDockWidget):
                 "CableType": None,
                 "CableCode": None,
             })
+            row_targets.append({"row_type": "POINT", "layer_id": nodes.id(), "fid": int(n.id())})
             if i < len(seg_feats):
                 s = seg_feats[i]
                 rows.append({
@@ -1007,6 +1866,7 @@ class RplManagerDockWidget(QDockWidget):
                     "CableType": s["CableType"] if segs.fields().lookupField("CableType") >= 0 else None,
                     "CableCode": s["CableCode"] if segs.fields().lookupField("CableCode") >= 0 else None,
                 })
+                row_targets.append({"row_type": "LINE", "layer_id": segs.id(), "fid": int(s.id())})
 
         self.rpl_table.setColumnCount(len(columns))
         self.rpl_table.setHorizontalHeaderLabels(columns)
@@ -1016,6 +1876,11 @@ class RplManagerDockWidget(QDockWidget):
             for c, col in enumerate(columns):
                 v = row.get(col)
                 item = QTableWidgetItem("" if v is None else str(v))
+                if c == 0:
+                    try:
+                        item.setData(Qt.UserRole, row_targets[r] if r < len(row_targets) else None)
+                    except Exception:
+                        pass
                 self.rpl_table.setItem(r, c, item)
 
         self.rpl_table.resizeColumnsToContents()

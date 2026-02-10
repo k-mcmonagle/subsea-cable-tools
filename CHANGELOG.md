@@ -5,15 +5,24 @@ All notable changes to the Subsea Cable Tools QGIS plugin will be documented in 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.2] - 2026-01-30
+### Added
+- **Extract KP Ranges (Rule Based):** New processing algorithm under "KP Ranges" to generate KP range listings (and optional segment geometries) by categorising an RPL line layer by a chosen attribute field (similar to QGIS categorized symbology).
+
+### Changed
+- **Identify RPL Lay Corridor Proximity Listing:** Added optional trim/clip-to-corridor for line/polygon listings (KP/DCC computed on clipped geometry) and made point/line/polygon inputs and outputs more flexible (runs with any provided geometry types and only produces corresponding outputs). NOW called: **Identify Features Intersecting RPL:** The Lay Corridor input is now optional. If omitted, the tool intersects against the RPL line itself, still supporting independent point/line/polygon outputs and optional corridor trimming when a corridor is provided.
+- **KP Mouse Tool:** Added ellipsoidal vs cartesian (planar) distance mode option, now remembers the setting, and shows total route length for both methods (to 0.001 km) in the configuration metrics. Improved robustness when the reference layer is removed/reloaded (prevents deleted-layer errors).
+
+### Fixed
+- **Import Bathy from MDB:** Reworked MDB import execution to run ODBC reads in a subprocess to prevent silent QGIS crashes. Also improved GeoMedia `GFeatures` metadata parsing and added automatic handling for ambiguous/mixed geometry tables.
+- **Import Bathy from MDB:** Now loads Polygon and Point layers by default alongside LineString layers. Previously only LineString (contour) layers were imported and other geometry types were silently dropped. This allows seabed feature data (e.g. sediment classification polygons, point features) to be imported from GeoMedia MDB files. Each geometry type is output as a separate layer to avoid conflicts.
+
 ## [1.4.1] - 2026-01-10
 ### Added
 - **RPL Manager (BETA):** New comprehensive tool for managing cable route lifecycle, including structured GeoPackage storage for RPLs, assembly configuration, and integrated Straight Line Diagram (SLD) viewing.
 - **Cable Manager (BETA):** New tool for managing cable assembly data.
 - **Convert RPL to Managed GeoPackage:** New processing algorithm to import legacy RPL formats into the new managed structure.
 - **Extract Lines Intersecting Polygons:** New processing algorithm under "Other Tools" to combine intersecting features from multiple line layers into a single output, with optional clip-to-polygon and CRS-safe processing.
-
-### Changed
-- **Identify RPL Lay Corridor Proximity Listing:** Added optional trim/clip-to-corridor for line/polygon listings (KP/DCC computed on clipped geometry) and made point/line/polygon inputs and outputs more flexible (runs with any provided geometry types and only produces corresponding outputs). NOW called: **Identify Features Intersecting RPL:** The Lay Corridor input is now optional. If omitted, the tool intersects against the RPL line itself, still supporting independent point/line/polygon outputs and optional corridor trimming when a corridor is provided.
 
 ## [1.4.0] - 2025-10-10
 ### Added

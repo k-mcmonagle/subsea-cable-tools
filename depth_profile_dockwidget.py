@@ -1,7 +1,7 @@
 from qgis.PyQt.QtWidgets import (
     QDockWidget, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
     QSpinBox, QCheckBox, QFileDialog, QTabWidget, QFormLayout, QSizePolicy, QProgressDialog,
-    QListWidget, QListWidgetItem, QDoubleSpinBox
+    QListWidget, QListWidgetItem, QDoubleSpinBox, QInputDialog
 )
 from qgis.PyQt.QtCore import Qt, QSettings, QTimer
 from qgis.PyQt.QtWidgets import QApplication
@@ -327,12 +327,13 @@ class DepthProfileDockWidget(QDockWidget):
             "    <li>Option to draw a temporary route line directly on the map.</li>"
             "    <li>Dual plot mode for depth and slope together.</li>"
             "    <li>Interactive plot with map marker and crosshair synced to KP.</li>"
-            "    <li>Export profile to DXF for CAD/GIS use.</li>"
+            "    <li>Export profile to DXF for CAD/GIS use (units selectable; optional KP marker ticks + labels; optional events from a point layer using a KP field).</li>"
             "  </ul>"
             "</li>"
             "<li><b>Tips & Notes:</b>"
             "  <ul>"
             "    <li>Ensure all layers use the same CRS as the project for correct marker placement.</li>"
+            "    <li>KP (chainage) is computed using QGIS project measurement settings (ellipsoid). If you need grid/projection distance, set your project ellipsoid appropriately.</li>"
             "    <li>Sampling interval and max samples affect performance and detail.</li>"
             "    <li>For large datasets, plotting may take a few seconds.</li>"
             "    <li>Selections and settings are remembered between sessions.</li>"
@@ -2430,17 +2431,289 @@ class DepthProfileDockWidget(QDockWidget):
 
         Strategy:
         - Only proceed if a profile has been generated (kp_values & depth_values populated).
-        - Convert KP (km) -> metres -> millimetres (engineering drawing scale) like catenary tool.
-    - Depth values exported with sea level at Y=0 and depths negative (e.g. 10 m depth -> y = -10000 mm).
+        - Export X as KP (distance along route) and Y as depth.
+        - Depth values exported with sea level at Y=0 and depths negative (e.g. 10 m depth -> y = -10 m).
         - Handle None gaps by splitting into multiple polylines.
         - Write a minimal DXF (POLYLINE + VERTEX records) in layer 0.
+
+        Notes:
+        - DXF coordinates are unitless unless a header is provided. This exporter writes $INSUNITS
+          so CAD programs can interpret the intended units.
+        - KP is derived from QGIS distance measurement settings (Project ellipsoid). If your
+          "KP" in other systems is based on grid/projection distance, ensure your project
+          measurement settings match.
         """
         if not self.kp_values or not self.depth_values:
             self.iface.messageBar().pushMessage("Depth Profile", "No profile data to export. Generate first.", level=1, duration=4)
             return
+
+        # Choose DXF units (persisted). Default to metres to match common CAD workflows.
+        units_default = str(self.settings.value("DepthProfile/dxf_units", "Meters"))
+        units_items = ["Meters", "Millimeters"]
+        try:
+            default_index = units_items.index(units_default) if units_default in units_items else 0
+        except Exception:
+            default_index = 0
+        units_choice, ok = QInputDialog.getItem(
+            self,
+            "Export DXF",
+            "DXF units (X=KP, Y=Depth):",
+            units_items,
+            default_index,
+            False,
+        )
+        if not ok:
+            return
+        units_choice = str(units_choice)
+        self.settings.setValue("DepthProfile/dxf_units", units_choice)
+
+        # Optional KP markers
+        add_markers_default = bool(self.settings.value("DepthProfile/dxf_kp_markers", True, type=bool))
+        add_markers, ok = QInputDialog.getItem(
+            self,
+            "Export DXF",
+            "Add KP markers + labels?",
+            ["Yes", "No"],
+            0 if add_markers_default else 1,
+            False,
+        )
+        if not ok:
+            return
+        add_markers = (str(add_markers) == "Yes")
+        self.settings.setValue("DepthProfile/dxf_kp_markers", bool(add_markers))
+
+        marker_interval_km = None
+        marker_height_m = None
+        label_offset_m = None
+        text_height_m = None
+        if add_markers:
+            marker_interval_km, ok = QInputDialog.getDouble(
+                self,
+                "Export DXF",
+                "KP marker interval (km):",
+                float(self.settings.value("DepthProfile/dxf_kp_marker_interval_km", 1.0)),
+                0.001,
+                100000.0,
+                3,
+            )
+            if not ok:
+                return
+            marker_height_m, ok = QInputDialog.getDouble(
+                self,
+                "Export DXF",
+                "KP marker height above Y=0 (m):",
+                float(self.settings.value("DepthProfile/dxf_kp_marker_height_m", 100.0)),
+                1.0,
+                100000.0,
+                1,
+            )
+            if not ok:
+                return
+            label_offset_m, ok = QInputDialog.getDouble(
+                self,
+                "Export DXF",
+                "Label offset above marker (m):",
+                float(self.settings.value("DepthProfile/dxf_kp_label_offset_m", 10.0)),
+                0.0,
+                100000.0,
+                1,
+            )
+            if not ok:
+                return
+            text_height_m, ok = QInputDialog.getDouble(
+                self,
+                "Export DXF",
+                "Label text height (m):",
+                float(self.settings.value("DepthProfile/dxf_kp_text_height_m", 10.0)),
+                0.1,
+                100000.0,
+                1,
+            )
+            if not ok:
+                return
+            self.settings.setValue("DepthProfile/dxf_kp_marker_interval_km", float(marker_interval_km))
+            self.settings.setValue("DepthProfile/dxf_kp_marker_height_m", float(marker_height_m))
+            self.settings.setValue("DepthProfile/dxf_kp_label_offset_m", float(label_offset_m))
+            self.settings.setValue("DepthProfile/dxf_kp_text_height_m", float(text_height_m))
+
+        # Optional events layer export (points with KP + label)
+        add_events_default = bool(self.settings.value("DepthProfile/dxf_events", False, type=bool))
+        add_events, ok = QInputDialog.getItem(
+            self,
+            "Export DXF",
+            "Add events from a point layer?",
+            ["Yes", "No"],
+            0 if add_events_default else 1,
+            False,
+        )
+        if not ok:
+            return
+        add_events = (str(add_events) == "Yes")
+        self.settings.setValue("DepthProfile/dxf_events", bool(add_events))
+
+        event_layer = None
+        event_kp_field = None
+        event_label_field = None
+        event_kp_units = None
+        event_marker_height_m = None
+        event_label_offset_m = None
+        event_text_height_m = None
+
+        if add_events:
+            # Choose a point layer
+            point_layers = []
+            try:
+                for lyr in QgsProject.instance().mapLayers().values():
+                    if isinstance(lyr, QgsVectorLayer) and lyr.geometryType() == QgsWkbTypes.PointGeometry:
+                        point_layers.append(lyr)
+            except Exception:
+                point_layers = []
+
+            if not point_layers:
+                self.iface.messageBar().pushMessage("Depth Profile", "No point layers found in project for events export.", level=1, duration=5)
+                add_events = False
+            else:
+                # Make names unique-ish for selection
+                items = [f"{lyr.name()} [{lyr.id()[-8:]}]" for lyr in point_layers]
+                last_layer_id = str(self.settings.value("DepthProfile/dxf_events_layer_id", ""))
+                default_index = 0
+                if last_layer_id:
+                    for i, lyr in enumerate(point_layers):
+                        if lyr.id() == last_layer_id:
+                            default_index = i
+                            break
+                chosen, ok = QInputDialog.getItem(
+                    self,
+                    "Export DXF",
+                    "Events point layer:",
+                    items,
+                    default_index,
+                    False,
+                )
+                if not ok:
+                    return
+                chosen = str(chosen)
+                chosen_idx = 0
+                try:
+                    chosen_idx = items.index(chosen)
+                except Exception:
+                    chosen_idx = 0
+                event_layer = point_layers[chosen_idx]
+                self.settings.setValue("DepthProfile/dxf_events_layer_id", str(event_layer.id()))
+
+                # Choose KP and label fields
+                field_names = [f.name() for f in event_layer.fields()]
+                if not field_names:
+                    self.iface.messageBar().pushMessage("Depth Profile", "Selected events layer has no fields.", level=1, duration=5)
+                    add_events = False
+                else:
+                    kp_default = str(self.settings.value("DepthProfile/dxf_events_kp_field", field_names[0] if field_names else ""))
+                    kp_idx = field_names.index(kp_default) if kp_default in field_names else 0
+                    event_kp_field, ok = QInputDialog.getItem(
+                        self,
+                        "Export DXF",
+                        "Events KP field (distance along route):",
+                        field_names,
+                        kp_idx,
+                        False,
+                    )
+                    if not ok:
+                        return
+                    event_kp_field = str(event_kp_field)
+                    self.settings.setValue("DepthProfile/dxf_events_kp_field", event_kp_field)
+
+                    label_options = ["(no label)", "<KP>"] + field_names
+                    label_default = str(self.settings.value("DepthProfile/dxf_events_label_field", "<KP>"))
+                    label_idx = label_options.index(label_default) if label_default in label_options else 1
+                    event_label_field, ok = QInputDialog.getItem(
+                        self,
+                        "Export DXF",
+                        "Events label field:",
+                        label_options,
+                        label_idx,
+                        False,
+                    )
+                    if not ok:
+                        return
+                    event_label_field = str(event_label_field)
+                    self.settings.setValue("DepthProfile/dxf_events_label_field", event_label_field)
+
+                    # KP units
+                    kp_units_options = ["Auto", "Kilometers", "Meters"]
+                    units_default = str(self.settings.value("DepthProfile/dxf_events_kp_units", "Auto"))
+                    units_idx = kp_units_options.index(units_default) if units_default in kp_units_options else 0
+                    event_kp_units, ok = QInputDialog.getItem(
+                        self,
+                        "Export DXF",
+                        "Events KP units:",
+                        kp_units_options,
+                        units_idx,
+                        False,
+                    )
+                    if not ok:
+                        return
+                    event_kp_units = str(event_kp_units)
+                    self.settings.setValue("DepthProfile/dxf_events_kp_units", event_kp_units)
+
+                    # Styling: if KP markers were enabled, reuse their styling by default.
+                    default_height = float(marker_height_m) if (add_markers and marker_height_m is not None) else float(self.settings.value("DepthProfile/dxf_events_marker_height_m", 50.0))
+                    default_offset = float(label_offset_m) if (add_markers and label_offset_m is not None) else float(self.settings.value("DepthProfile/dxf_events_label_offset_m", 10.0))
+                    default_text_h = float(text_height_m) if (add_markers and text_height_m is not None) else float(self.settings.value("DepthProfile/dxf_events_text_height_m", 5.0))
+
+                    event_marker_height_m, ok = QInputDialog.getDouble(
+                        self,
+                        "Export DXF",
+                        "Event marker height above Y=0 (m):",
+                        default_height,
+                        1.0,
+                        100000.0,
+                        1,
+                    )
+                    if not ok:
+                        return
+                    event_label_offset_m, ok = QInputDialog.getDouble(
+                        self,
+                        "Export DXF",
+                        "Event label offset above marker (m):",
+                        default_offset,
+                        0.0,
+                        100000.0,
+                        1,
+                    )
+                    if not ok:
+                        return
+                    event_text_height_m, ok = QInputDialog.getDouble(
+                        self,
+                        "Export DXF",
+                        "Event label text height (m):",
+                        default_text_h,
+                        0.1,
+                        100000.0,
+                        1,
+                    )
+                    if not ok:
+                        return
+                    self.settings.setValue("DepthProfile/dxf_events_marker_height_m", float(event_marker_height_m))
+                    self.settings.setValue("DepthProfile/dxf_events_label_offset_m", float(event_label_offset_m))
+                    self.settings.setValue("DepthProfile/dxf_events_text_height_m", float(event_text_height_m))
+
         path, _ = QFileDialog.getSaveFileName(self, "Save DXF", "depth_profile.dxf", "DXF Files (*.dxf)")
         if not path:
             return
+
+        # Unit scaling and DXF header units.
+        # AutoCAD INSUNITS: 4=millimeters, 6=meters
+        if units_choice == "Millimeters":
+            x_scale = 1_000_000.0  # KP (km) -> mm
+            y_scale = 1_000.0      # depth (m) -> mm
+            insunits = 4
+            units_hint = "mm"
+        else:
+            x_scale = 1_000.0      # KP (km) -> m
+            y_scale = 1.0          # depth (m) -> m
+            insunits = 6
+            units_hint = "m"
+
         # Build segments (skip None values)
         segments = []
         current_x = []
@@ -2451,16 +2724,161 @@ class DepthProfileDockWidget(QDockWidget):
                     segments.append((current_x, current_y))
                     current_x, current_y = [], []
                 continue
-            current_x.append(kp * 1000.0 * 1000.0)  # km -> m -> mm
-            # Depth positive down in data -> make negative for DXF so seabed below 0
-            current_y.append(-depth * 1000.0)        # m -> mm (negated)
+            # X: KP (km) -> selected units
+            current_x.append(float(kp) * float(x_scale))
+            # Y: depth positive-down in data -> negative in CAD so seabed below 0
+            current_y.append(-float(depth) * float(y_scale))
         if current_x:
             segments.append((current_x, current_y))
         if not segments:
             self.iface.messageBar().pushMessage("Depth Profile", "All depth values are null; nothing to export.", level=1, duration=4)
             return
+
+        def _dxf_line_entity(x1, y1, x2, y2, layer="0"):
+            return [
+                '0','LINE',
+                '8',str(layer),
+                '10',f'{float(x1)}','20',f'{float(y1)}','30','0.0',
+                '11',f'{float(x2)}','21',f'{float(y2)}','31','0.0',
+            ]
+
+        def _dxf_text_entity(x, y, text, height, layer="0"):
+            safe_text = str(text).replace('\n', ' ').replace('\r', ' ')
+            return [
+                '0','TEXT',
+                '8',str(layer),
+                '10',f'{float(x)}','20',f'{float(y)}','30','0.0',
+                '40',f'{float(height)}',
+                '1',safe_text,
+            ]
+
+        def _safe_float(v):
+            if v is None:
+                return None
+            try:
+                if isinstance(v, str):
+                    s = v.strip()
+                    if not s:
+                        return None
+                    # Common cleanup (e.g. "KP 12.345")
+                    s = s.replace('KP', '').replace('kp', '').replace('Km', '').replace('KM', '').replace('km', '')
+                    s = s.replace(':', ' ').replace(',', ' ')
+                    # Keep the first token that looks numeric
+                    parts = [p for p in s.split() if p]
+                    if parts:
+                        s = parts[0]
+                    return float(s)
+                return float(v)
+            except Exception:
+                return None
+
         # Compose DXF content
-        dxf_parts = ['0','SECTION','2','ENTITIES']
+        dxf_parts = [
+            '0','SECTION','2','HEADER',
+            '9','$MEASUREMENT','70','1',
+            '9','$INSUNITS','70',str(int(insunits)),
+            '0','ENDSEC',
+            '0','SECTION','2','ENTITIES'
+        ]
+
+        # KP markers + labels (optional)
+        if add_markers and marker_interval_km and marker_interval_km > 0:
+            try:
+                max_kp_km = max(float(k) for k in self.kp_values if k is not None)
+            except Exception:
+                max_kp_km = None
+            if max_kp_km is not None and max_kp_km >= 0:
+                interval_km = float(marker_interval_km)
+                h_u = float(marker_height_m) * float(y_scale)
+                label_off_u = float(label_offset_m) * float(y_scale)
+                text_h_u = float(text_height_m) * float(y_scale)
+                kp = 0.0
+                # Add a small epsilon to include the end marker if it falls exactly on interval.
+                while kp <= (max_kp_km + 1e-9):
+                    x = kp * float(x_scale)
+                    dxf_parts.extend(_dxf_line_entity(x, 0.0, x, h_u, layer="KP_MARK"))
+                    dxf_parts.extend(_dxf_text_entity(x, h_u + label_off_u, f"KP {kp:.3f}", height=text_h_u, layer="KP_TEXT"))
+                    kp += interval_km
+
+        # Events markers + labels (optional)
+        if add_events and event_layer is not None and event_kp_field and event_kp_units:
+            # Collect numeric KP values for auto-units detection
+            raw_vals = []
+            try:
+                for feat in event_layer.getFeatures():
+                    raw = feat[event_kp_field]
+                    fv = _safe_float(raw)
+                    if fv is not None and not math.isnan(fv):
+                        raw_vals.append(float(fv))
+            except Exception:
+                raw_vals = []
+
+            kp_mode = str(event_kp_units)
+            if kp_mode == "Auto":
+                # Heuristic: if KP values look like meters (similar magnitude to route length in meters), treat as meters.
+                # Otherwise treat as kilometers.
+                if raw_vals and self.line_length and self.line_length > 0:
+                    try:
+                        raw_vals_sorted = sorted(raw_vals)
+                        median = raw_vals_sorted[len(raw_vals_sorted) // 2]
+                    except Exception:
+                        median = None
+                    if median is not None:
+                        # If median is large (>1000) and not tiny relative to route length, assume meters.
+                        if median > max(1000.0, float(self.line_length) / 50.0):
+                            kp_mode = "Meters"
+                        else:
+                            kp_mode = "Kilometers"
+                else:
+                    kp_mode = "Kilometers"
+
+            def _kp_to_km(v):
+                if v is None:
+                    return None
+                if kp_mode == "Meters":
+                    return float(v) / 1000.0
+                return float(v)
+
+            h_u = float(event_marker_height_m) * float(y_scale) if event_marker_height_m is not None else (50.0 * float(y_scale))
+            label_off_u = float(event_label_offset_m) * float(y_scale) if event_label_offset_m is not None else (10.0 * float(y_scale))
+            text_h_u = float(event_text_height_m) * float(y_scale) if event_text_height_m is not None else (5.0 * float(y_scale))
+
+            max_profile_kp_km = None
+            try:
+                max_profile_kp_km = max(float(k) for k in self.kp_values if k is not None)
+            except Exception:
+                max_profile_kp_km = None
+
+            try:
+                for feat in event_layer.getFeatures():
+                    kp_raw = _safe_float(feat[event_kp_field])
+                    if kp_raw is None or math.isnan(kp_raw):
+                        continue
+                    kp_km = _kp_to_km(kp_raw)
+                    if kp_km is None:
+                        continue
+                    # Skip events outside profile range
+                    if max_profile_kp_km is not None and (kp_km < -1e-9 or kp_km > (max_profile_kp_km + 1e-9)):
+                        continue
+                    x = float(kp_km) * float(x_scale)
+                    dxf_parts.extend(_dxf_line_entity(x, 0.0, x, h_u, layer="EVENT_MARK"))
+
+                    label = ""
+                    if event_label_field == "(no label)":
+                        label = ""
+                    elif event_label_field == "<KP>":
+                        label = f"KP {float(kp_km):.3f}"
+                    else:
+                        try:
+                            label = str(feat[event_label_field])
+                        except Exception:
+                            label = ""
+
+                    if label:
+                        dxf_parts.extend(_dxf_text_entity(x, h_u + label_off_u, label, height=text_h_u, layer="EVENT_TEXT"))
+            except Exception:
+                pass
+
         for sx, sy in segments:
             dxf_parts.extend(['0','POLYLINE','8','0','66','1','70','0'])
             for xi, yi in zip(sx, sy):
@@ -2471,7 +2889,12 @@ class DepthProfileDockWidget(QDockWidget):
         try:
             with open(path, 'w', encoding='utf-8') as f:
                 f.write(dxf_text)
-            self.iface.messageBar().pushMessage("Depth Profile", f"DXF exported: {path}", level=0, duration=5)
+            self.iface.messageBar().pushMessage(
+                "Depth Profile",
+                f"DXF exported ({units_hint}): {path} | X-axis: 1 km = {x_scale:.0f} {units_hint}",
+                level=0,
+                duration=7,
+            )
         except Exception as e:
             self.iface.messageBar().pushMessage("Depth Profile", f"Failed to write DXF: {e}", level=2, duration=6)
 
