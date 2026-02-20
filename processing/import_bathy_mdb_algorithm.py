@@ -33,6 +33,7 @@ from qgis.core import (
     QgsProcessingException,
     QgsCoordinateReferenceSystem,
     QgsProcessingContext,
+    QgsWkbTypes,
 )
 
 
@@ -523,6 +524,49 @@ def is_closed(vertices, tol=1e-6):
     return abs(x0 - xn) <= tol and abs(y0 - yn) <= tol
 
 
+def _memory_uri_for_layer(source_layer, import_crs):
+    """Build a memory provider URI matching the source layer geometry as closely as practical."""
+    wkb_name = QgsWkbTypes.displayString(source_layer.wkbType())
+    if not wkb_name or wkb_name == "Unknown":
+        geom_type = source_layer.geometryType()
+        if geom_type == QgsWkbTypes.PointGeometry:
+            wkb_name = "Point"
+        elif geom_type == QgsWkbTypes.LineGeometry:
+            wkb_name = "LineString"
+        elif geom_type == QgsWkbTypes.PolygonGeometry:
+            wkb_name = "Polygon"
+        else:
+            wkb_name = "None"
+
+    if wkb_name == "None":
+        return "None"
+
+    return f"{wkb_name}?crs={import_crs.authid()}"
+
+
+def _clone_to_memory_layer(source_layer, layer_name, import_crs, feedback):
+    """Copy an OGR/temp layer into a true in-memory scratch layer."""
+    mem_uri = _memory_uri_for_layer(source_layer, import_crs)
+    mem_layer = QgsVectorLayer(mem_uri, layer_name, "memory")
+    if not mem_layer.isValid():
+        feedback.reportError(f"Could not create memory layer for {layer_name}")
+        return None
+
+    dp = mem_layer.dataProvider()
+    dp.addAttributes(list(source_layer.fields()))
+    mem_layer.updateFields()
+
+    features = [f for f in source_layer.getFeatures()]
+    if features:
+        dp.addFeatures(features)
+    mem_layer.updateExtents()
+
+    if import_crs and import_crs.isValid():
+        mem_layer.setCrs(import_crs)
+
+    return mem_layer
+
+
 class ImportBathyMdbAlgorithm(QgsProcessingAlgorithm):
     INPUT_MDB = 'INPUT_MDB'
     TARGET_CRS = 'TARGET_CRS'
@@ -695,17 +739,19 @@ class ImportBathyMdbAlgorithm(QgsProcessingAlgorithm):
                             continue
                         if not path or not os.path.exists(path):
                             continue
-                        layer_name = f"{table_name} ({geom_type_name})"
-                        layer = QgsVectorLayer(path, layer_name, 'ogr')
-                        if not layer.isValid():
+                        layer_name = table_name
+                        src_layer = QgsVectorLayer(path, layer_name, 'ogr')
+                        if not src_layer.isValid():
                             feedback.reportError(f'Skipping {layer_name}: output layer invalid')
                             continue
-                        layer.setCrs(import_crs)
+                        layer = _clone_to_memory_layer(src_layer, layer_name, import_crs, feedback)
+                        if layer is None:
+                            continue
 
                         context.temporaryLayerStore().addMapLayer(layer)
                         details = QgsProcessingContext.LayerDetails(layer_name, context.project())
                         context.addLayerToLoadOnCompletion(layer.id(), details)
-                        output_layers[layer_name] = layer.id()
+                        output_layers[f"{table_name}::{geom_type_name}"] = layer.id()
                 else:
                     # Non-split mode: expect a single GeoJSON at out_base + '.geojson'
                     out_geojson = out_base + '.geojson'
@@ -713,11 +759,13 @@ class ImportBathyMdbAlgorithm(QgsProcessingAlgorithm):
                         feedback.reportError(f'Skipping table {table_name}: worker produced no output file')
                         continue
 
-                    layer = QgsVectorLayer(out_geojson, table_name, 'ogr')
-                    if not layer.isValid():
+                    src_layer = QgsVectorLayer(out_geojson, table_name, 'ogr')
+                    if not src_layer.isValid():
                         feedback.reportError(f'Skipping table {table_name}: output layer invalid')
                         continue
-                    layer.setCrs(import_crs)
+                    layer = _clone_to_memory_layer(src_layer, table_name, import_crs, feedback)
+                    if layer is None:
+                        continue
 
                     context.temporaryLayerStore().addMapLayer(layer)
                     details = QgsProcessingContext.LayerDetails(table_name, context.project())

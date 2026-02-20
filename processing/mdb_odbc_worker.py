@@ -194,13 +194,22 @@ def _coerce_json_value(v):
         return None
 
 
-def _infer_geom_type(vertices):
+def _infer_geom_type(vertices, geometry_type_code=None):
     if not vertices:
         return None
+
+    # Respect explicit geometry metadata when available.
+    if geometry_type_code == 1:
+        return "LineString"
+    if geometry_type_code == 2:
+        return "Polygon"
+    if geometry_type_code == 3:
+        return "Point"
+
+    # Ambiguous GeoMedia type codes (e.g. 10) are prone to treating closed
+    # contour lines as polygons. Prefer line output to avoid false polygons.
     if len(vertices) == 1:
         return "Point"
-    if is_closed(vertices) and len(vertices) >= 4:
-        return "Polygon"
     return "LineString"
 
 
@@ -238,7 +247,7 @@ def export_table_to_geojson(mdb_path, table_name, geom_field_name, geometry_type
                 if not vertices:
                     raise RuntimeError(f"Failed to parse geometry for first row in table {table_name}")
                 # IMPORTANT: default ambiguous geometry to LineString rather than MultiPoint.
-                layer_type = _infer_geom_type(vertices)
+                layer_type = _infer_geom_type(vertices, geometry_type_code=geometry_type_code)
 
                 # Reset cursor by re-executing
                 cur.execute(sql)
@@ -295,7 +304,7 @@ def export_table_to_geojson(mdb_path, table_name, geom_field_name, geometry_type
 
                 this_type = layer_type
                 if split:
-                    this_type = _infer_geom_type(vertices)
+                    this_type = _infer_geom_type(vertices, geometry_type_code=geometry_type_code)
                     if not this_type or this_type not in files:
                         skipped_invalid += 1
                         continue

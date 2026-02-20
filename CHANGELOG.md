@@ -15,7 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Import Bathy from MDB:** Reworked MDB import execution to run ODBC reads in a subprocess to prevent silent QGIS crashes. Also improved GeoMedia `GFeatures` metadata parsing and added automatic handling for ambiguous/mixed geometry tables.
-- **Import Bathy from MDB:** Now loads Polygon and Point layers by default alongside LineString layers. Previously only LineString (contour) layers were imported and other geometry types were silently dropped. This allows seabed feature data (e.g. sediment classification polygons, point features) to be imported from GeoMedia MDB files. Each geometry type is output as a separate layer to avoid conflicts.
+Now loads Polygon and Point layers by default alongside LineString layers. Previously only LineString (contour) layers were imported and other geometry types were silently dropped. This allows seabed feature data (e.g. sediment classification polygons, point features) to be imported from GeoMedia MDB files. Each geometry type is output as a separate layer to avoid conflicts.
+Also fixed ambiguous closed contour features (rings/closed lines) being misclassified as polygons in mixed/ambiguous geometry tables, and changed imported outputs to load as scratch (memory) layers rather than temp-file-backed layers so users can save them to a chosen location via normal QGIS workflows. Removed geometry suffixes from display layer names (e.g. `(LineString)`, `(Polygon)`) to keep layer panel names clean.
 
 ## [1.4.1] - 2026-01-10
 ### Added
