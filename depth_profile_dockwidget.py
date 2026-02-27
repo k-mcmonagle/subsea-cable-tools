@@ -268,10 +268,17 @@ class DepthProfileDockWidget(QDockWidget):
         self.reverse_kp_chk = QCheckBox("Reverse KP")
         self.reverse_kp_chk.setChecked(bool(self.settings.value("DepthProfile/reverse_kp", False, type=bool)))
         checkboxes_row.addWidget(self.reverse_kp_chk)
+        invert_kp_default = bool(self.settings.value("DepthProfile/reverse_x_axis", False, type=bool))
+        self.invert_kp_axis_chk = QCheckBox("Invert KP Axis")
+        self.invert_kp_axis_chk.setChecked(bool(self.settings.value("DepthProfile/invert_kp_axis", invert_kp_default, type=bool)))
+        checkboxes_row.addWidget(self.invert_kp_axis_chk)
         self.invert_depth_axis_chk = QCheckBox("Invert Depth Axis")
         self.invert_depth_axis_chk.setChecked(True)
         checkboxes_row.addWidget(self.invert_depth_axis_chk)
-        self.invert_slope_chk = QCheckBox("Invert Slope")
+        self.invert_slope_axis_chk = QCheckBox("Invert Slope Axis")
+        self.invert_slope_axis_chk.setChecked(bool(self.settings.value("DepthProfile/invert_slope_axis", False, type=bool)))
+        checkboxes_row.addWidget(self.invert_slope_axis_chk)
+        self.invert_slope_chk = QCheckBox("Invert Slope Sign")
         self.invert_slope_chk.setChecked(bool(self.settings.value("DepthProfile/invert_slope", True, type=bool)))
         checkboxes_row.addWidget(self.invert_slope_chk)
         self.show_tooltips_chk = QCheckBox("Tooltips")
@@ -334,6 +341,7 @@ class DepthProfileDockWidget(QDockWidget):
             "  <ul>"
             "    <li>Ensure all layers use the same CRS as the project for correct marker placement.</li>"
             "    <li>KP (chainage) is computed using QGIS project measurement settings (ellipsoid). If you need grid/projection distance, set your project ellipsoid appropriately.</li>"
+            "    <li><b>Reverse KP</b> re-numbers KP along the route, while <b>Invert KP Axis</b> only flips the displayed X-axis direction.</li>"
             "    <li>Sampling interval and max samples affect performance and detail.</li>"
             "    <li>For large datasets, plotting may take a few seconds.</li>"
             "    <li>Selections and settings are remembered between sessions.</li>"
@@ -859,6 +867,8 @@ class DepthProfileDockWidget(QDockWidget):
             ax_depth.set_ylabel("Depth (m)")
             if self.invert_depth_axis_chk.isChecked():
                 ax_depth.invert_yaxis()
+            if self.invert_kp_axis_chk.isChecked():
+                ax_depth.invert_xaxis()
             ax_depth.grid(True); ax_depth.legend(loc='upper right')
             slope_unit = self.slope_unit_combo.currentText() if hasattr(self, 'slope_unit_combo') else 'Slope (deg)'
             if 'deg' in slope_unit:
@@ -882,6 +892,8 @@ class DepthProfileDockWidget(QDockWidget):
                 except Exception:
                     pass
             ax_slope.set_ylabel(slope_label); ax_slope.set_xlabel("KP (km)")
+            if self.invert_slope_axis_chk.isChecked():
+                ax_slope.invert_yaxis()
             ax_slope.grid(True); ax_slope.legend(loc='upper right')
             # Add length summary (plan vs seabed) to top plot
             try:
@@ -915,6 +927,10 @@ class DepthProfileDockWidget(QDockWidget):
         if not x_vals or not y_vals:
             ax.set_title("No profile data generated"); self.canvas.draw(); return
         ax.plot(x_vals, y_vals, label=var)
+        if self.invert_kp_axis_chk.isChecked():
+            ax.invert_xaxis()
+        if ("Slope" in var) and self.invert_slope_axis_chk.isChecked():
+            ax.invert_yaxis()
         # Optional side slope overlay when plotting slope
         if getattr(self, 'side_slope_chk', None) and self.side_slope_chk.isChecked() and getattr(self, 'side_slope_plot_chk', None) and self.side_slope_plot_chk.isChecked():
             try:
@@ -995,6 +1011,9 @@ class DepthProfileDockWidget(QDockWidget):
         # Persist basic settings
         self.settings.setValue("DepthProfile/interval_m", self.interval_spin.value())
         self.settings.setValue("DepthProfile/reverse_kp", self.reverse_kp_chk.isChecked())
+        self.settings.setValue("DepthProfile/invert_kp_axis", self.invert_kp_axis_chk.isChecked())
+        self.settings.setValue("DepthProfile/reverse_x_axis", self.invert_kp_axis_chk.isChecked())
+        self.settings.setValue("DepthProfile/invert_slope_axis", self.invert_slope_axis_chk.isChecked())
         self.settings.setValue("DepthProfile/invert_slope", self.invert_slope_chk.isChecked())
         if not dual:
             self.settings.setValue("DepthProfile/variable", self.variable_combo.currentText())

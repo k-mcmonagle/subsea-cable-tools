@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **Identify RPL Lay Corridor Proximity Listing:** Added optional trim/clip-to-corridor for line/polygon listings (KP/DCC computed on clipped geometry) and made point/line/polygon inputs and outputs more flexible (runs with any provided geometry types and only produces corresponding outputs). NOW called: **Identify Features Intersecting RPL:** The Lay Corridor input is now optional. If omitted, the tool intersects against the RPL line itself, still supporting independent point/line/polygon outputs and optional corridor trimming when a corridor is provided.
 - **KP Mouse Tool:** Added ellipsoidal vs cartesian (planar) distance mode option, now remembers the setting, and shows total route length for both methods (to 0.001 km) in the configuration metrics. Improved robustness when the reference layer is removed/reloaded (prevents deleted-layer errors).
+- **Depth Profile tool:** Added an **Invert KP Axis** option to flip the displayed KP axis direction without re-numbering plotted KP values, and added an **Invert Slope Axis** option for slope plots. Also clarified slope control naming by renaming **Invert Slope** to **Invert Slope Sign**.
 
 ### Fixed
 - **Import Bathy from MDB:** Reworked MDB import execution to run ODBC reads in a subprocess to prevent silent QGIS crashes. Also improved GeoMedia `GFeatures` metadata parsing and added automatic handling for ambiguous/mixed geometry tables.
