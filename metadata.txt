@@ -2,7 +2,7 @@
 name=Subsea Cable Tools
 qgisMinimumVersion=3.22
 description=Tools to support working with subsea cable data in QGIS.
-version=1.4.1
+version=1.5.0
 author=Kieran McMonagle
 email=kieran.mcmonagle@globalmarine.group
 
@@ -14,7 +14,7 @@ repository=https://github.com/k-mcmonagle/subsea-cable-tools
 hasProcessingProvider=yes
 
 # changelog
-changelog=Version 1.3.0 (2025-09-06): Added several new tools and fixed some issues with dependancies.
+changelog=Version 1.5.0 (2026-04-26): Many new processing tools and tool improvements (Extract KP Ranges Rule Based, Identify Features Intersecting RPL, RPL Route Comparison, Translate KP Between RPLs, Identify RPL Crossing Points, Identify RPL Area Listing, Merge/Group KP Range tables, KP Range Depth + Slope Summary, Identify Hazards in Lay Corridor, Export Chartlets, Plot Line Segments from Table, Extract A/C Points, Extract Lines Intersecting Polygons), Catenary Calculator V2, ellipsoidal/cartesian KP Mouse Tool, Depth Profile improvements, more flexible MDB import. Some in-development tools from unreleased internal builds have been withdrawn pending further work.
 tags=subsea, cable, telecoms, mapping, gis, qgis, lrs, kp, offshore, engineering, bathymetry, 
 
 homepage=https://github.com/k-mcmonagle/subsea-cable-tools

@@ -27,10 +27,10 @@ Accessible via the QGIS Processing Toolbox under **Subsea Cable Tools**:
 
 ### 🗺️ Map & Dockable Tools
 - **KP Mouse Tool** – An interactive tool that provides the closest KP and DCC of the mouse pointer dynamically. Supports **Ellipsoidal** (project ellipsoid; fallback WGS84) and **Cartesian** (planar, in project CRS units) distance modes; the configuration dialog shows both total route lengths (to **0.001 km**, ~1 m) when possible.
-- **KP Data Plotter** – New dockable tool for plotting KP-based data from table layers against a reference line, with interactive crosshair, map marker, support for multiple data fields, y-axis reversal, and tooltips.
-- **Straight Line Diagram (SLD)** – Dockable SLD plot for an RPL line + events layer with a synced map marker.
-- **SLD KP Ranges (NEW)** – Use a table layer of KP ranges as the single source of truth and visualise the same ranges on the SLD and on the map at the same time.
-- **Live Data Tool** – Dockable tool for receiving and displaying real-time data (map point + cards/plots/tables) from incoming text strings.
+- **KP Data Plotter** – Dockable tool for plotting KP-based data from table layers against a reference line, with interactive crosshair, map marker, support for multiple data fields, y-axis reversal, and tooltips.
+- **Depth Profile** – Dockable profile tool to plot depth or slope from MBES raster(s) or contour layer(s) along either a selected route line layer or a user-drawn temporary line. Supports invert KP / slope axis options and adaptive raster sampling.
+- **Catenary Calculator** and **Catenary Calculator V2 (Experimental)** – Dialog tools for subsea cable catenary calculations; V2 supports multi-segment cable assemblies and bodies.
+- **Transit Measure Tool** – Interactive map tool for measuring cumulative geodesic distances along user-drawn paths, with transit duration calculations and an optional Quick Buffer.
 
 #### Distance / KP measurement notes
 
@@ -38,42 +38,27 @@ Accessible via the QGIS Processing Toolbox under **Subsea Cable Tools**:
 - **Cartesian/planar** measurements are only meaningful in a **projected** CRS. If the project CRS is geographic (degrees), cartesian values are disabled/marked as not available.
 - Where a layer CRS differs from the project CRS, tools may transform geometries to the project CRS before measuring (the KP Mouse Tool does this). Some existing tools currently assume the project CRS and selected layer CRS match.
 
-#### Live Data Tool quick start
+---
 
-1. Open **Live Data**.
-2. In **Live Data Control → Connection**, set Host/Port and choose a **Message Format**.
-3. Set **Latitude Field** / **Longitude Field** to match the parsed field names.
-4. Click **Connect** (TCP) or use **Mock/Test** to replay a table layer as live data.
+## ✨ Version 1.5.0
 
-#### Message Formats
+**Released: 2026-04-26**
 
-The Live Data Tool is **string-first**: it receives raw lines (typically from TCP) and parses each line into fields.
+This is the first published release since 1.3.0 and consolidates a large body of internal 1.4.x development.
 
-Supported formats:
+### Highlights
+- Many new processing algorithms, including **Extract KP Ranges (Rule Based)**, **Identify Features Intersecting RPL**, **RPL Route Comparison**, **Translate KP Between RPLs**, **Identify RPL Crossing Points**, **Identify RPL Area Listing**, **Merge / Group KP Range Tables**, **KP Range Depth + Slope Summary**, **Identify Hazards in Lay Corridor**, **Export Chartlets**, **Plot Line Segments from Table**, **Extract A/C Points** and **Extract Lines Intersecting Polygons**.
+- **Catenary Calculator V2 (Experimental)** – multi-segment cable assemblies and bodies.
+- **KP Mouse Tool** now supports ellipsoidal vs cartesian distance modes (remembered between sessions), right-click depth sampling, configurable copy-to-clipboard, and a **Go to KP…** action.
+- **Depth Profile** improvements: invert KP / slope axes, multiple raster support with resolution-based preference, refresh control, and adaptive sampling.
+- **Import Bathy from MDB** rework: subprocess ODBC reads (no more silent crashes), better GeoMedia metadata parsing, scratch-layer outputs, and Polygon/Point layers loaded alongside LineString.
+- **Transit Measure Tool** Quick Buffer.
+- Updated minimum QGIS version to **3.22**, lazy-imported plotting deps, and a more robust processing-provider registration so a single bad algorithm can't hide the rest.
 
-- `csv_header`: First non-empty line is a CSV header row, subsequent lines are records
-- `csv_fixed`: Records are CSV with a fixed, user-defined column list
-- `kv`: Key/value pairs (e.g. `Lat_dd=...,Lon_dd=...,Heading=...`)
-- `json`: One JSON object per line
-- `regex`: Regex with named capture groups (advanced)
+### Withdrawn from this release
+A few in-development tools that appeared in unreleased internal builds are **not included** in 1.5.0 and are being held back for further work. They may return in a future version.
 
-#### Mock/Test (no external server required)
-
-Use **Live Data Control → Mock/Test** to replay an existing table layer already loaded in your QGIS project. This runs through the same parsing pipeline as TCP, and is intended to replace the old “CSV over TCP” test server script for most workflows.
-
-#### SLD KP Ranges quick start
-1. Open the **Straight Line Diagram** dock.
-2. Select an **RPL Line Layer**.
-3. (Optional) Select an **RPL Points (Events) Layer** to show event ticks.
-4. Create or choose a **KP Ranges (Table) Layer**:
-	- Click **New ranges table** to create an editable in-memory ranges table, or
-	- Select an existing editable table layer (GeoPackage/SQLite recommended; CSV tables are typically not editable).
-5. Ensure your table has (or map fields to) **Start**, **End**, and **Ref line**.
-	- Ref line is used for traceability; ranges are filtered to the currently selected RPL line.
-6. Click **Ranges** to add/edit/delete ranges.
-7. Click **Draw SLD**.
-8. Toggle **Show ranges on map** to generate a derived line layer: **SLD KP Ranges (derived)**.
-9. Use **Save map ranges...** to export the derived layer (e.g. to GeoPackage).
+See [CHANGELOG.md](CHANGELOG.md) for the full list of changes.
 
 ---
 

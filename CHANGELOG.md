@@ -5,70 +5,48 @@ All notable changes to the Subsea Cable Tools QGIS plugin will be documented in 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.4.2] - 2026-01-30
+## [1.5.0] - 2026-04-26
+
+This is the first published release since 1.3.0 and consolidates all stable improvements from internal 1.4.x development. Several experimental BETA tools that shipped in internal 1.4.x builds have been **temporarily withdrawn** pending further development; their source remains available on the `develop` branch on GitHub.
+
 ### Added
 - **Extract KP Ranges (Rule Based):** New processing algorithm under "KP Ranges" to generate KP range listings (and optional segment geometries) by categorising an RPL line layer by a chosen attribute field (similar to QGIS categorized symbology).
-
-### Changed
-- **Identify RPL Lay Corridor Proximity Listing:** Added optional trim/clip-to-corridor for line/polygon listings (KP/DCC computed on clipped geometry) and made point/line/polygon inputs and outputs more flexible (runs with any provided geometry types and only produces corresponding outputs). NOW called: **Identify Features Intersecting RPL:** The Lay Corridor input is now optional. If omitted, the tool intersects against the RPL line itself, still supporting independent point/line/polygon outputs and optional corridor trimming when a corridor is provided.
-- **KP Mouse Tool:** Added ellipsoidal vs cartesian (planar) distance mode option, now remembers the setting, and shows total route length for both methods (to 0.001 km) in the configuration metrics. Improved robustness when the reference layer is removed/reloaded (prevents deleted-layer errors).
-- **Depth Profile tool:** Added an **Invert KP Axis** option to flip the displayed KP axis direction without re-numbering plotted KP values, and added an **Invert Slope Axis** option for slope plots. Also clarified slope control naming by renaming **Invert Slope** to **Invert Slope Sign**.
-
-### Fixed
-- **Import Bathy from MDB:** Reworked MDB import execution to run ODBC reads in a subprocess to prevent silent QGIS crashes. Also improved GeoMedia `GFeatures` metadata parsing and added automatic handling for ambiguous/mixed geometry tables.
-Now loads Polygon and Point layers by default alongside LineString layers. Previously only LineString (contour) layers were imported and other geometry types were silently dropped. This allows seabed feature data (e.g. sediment classification polygons, point features) to be imported from GeoMedia MDB files. Each geometry type is output as a separate layer to avoid conflicts.
-Also fixed ambiguous closed contour features (rings/closed lines) being misclassified as polygons in mixed/ambiguous geometry tables, and changed imported outputs to load as scratch (memory) layers rather than temp-file-backed layers so users can save them to a chosen location via normal QGIS workflows. Removed geometry suffixes from display layer names (e.g. `(LineString)`, `(Polygon)`) to keep layer panel names clean.
-
-## [1.4.1] - 2026-01-10
-### Added
-- **RPL Manager (BETA):** New comprehensive tool for managing cable route lifecycle, including structured GeoPackage storage for RPLs, assembly configuration, and integrated Straight Line Diagram (SLD) viewing.
-- **Cable Manager (BETA):** New tool for managing cable assembly data.
-- **Convert RPL to Managed GeoPackage:** New processing algorithm to import legacy RPL formats into the new managed structure.
-- **Extract Lines Intersecting Polygons:** New processing algorithm under "Other Tools" to combine intersecting features from multiple line layers into a single output, with optional clip-to-polygon and CRS-safe processing.
-
-## [1.4.0] - 2025-10-10
-### Added
-- **Live Data Tool:** New dockable tool for receiving and plotting real-time ship position data from a TCP server. Basic tool for now but would like to add live trend graphs and possibly use QGIS as client screens onboard.
-- **Catenary Calculator v2 (Experimental):** Added an updated/alternative catenary calculator dialog (v2). Can model multi-segment and bodies within a cable assembly. Experimental for now and still in testing.
-- **Plot Line Segments from Table:** New processing algorithm under "Other Tools" to create line segments from a table layer with start and end latitude/longitude columns. Optionally creates a point layer for the endpoints. All original attributes are preserved with a source_table field added.
-- **Extract A/C Points from RPL:** New processing algorithm to extract Alter Course points from an RPL line (including multi-feature routes), outputting KP, turn angle, and optional threshold/bin fields for easy symbology.
+- **Identify Features Intersecting RPL** (formerly *Identify RPL Lay Corridor Proximity Listing*): Generic tool that intersects point/line/polygon layers against an RPL line, with optional Lay Corridor input for trimming/clipping. Runs with any provided geometry types and only produces the corresponding outputs.
+- **Plot Line Segments from Table:** New processing algorithm under "Other Tools" to create line segments from a table layer with start and end latitude/longitude columns. Optionally creates a point layer for the endpoints.
+- **Extract A/C Points from RPL:** New processing algorithm to extract Alter Course points from an RPL line (including multi-feature routes), outputting KP, turn angle, and optional threshold/bin fields.
 - **RPL Route Comparison:** New processing algorithm to compare design vs as-laid RPL routes, calculating position offsets including radial, along-track, and cross-track distances.
 - **Translate KP Between RPLs (Points):** New processing algorithm to translate KP values from one RPL reference to another, creating corresponding points on the target RPL.
-- **Identify RPL Crossing Points:** New processing algorithm to find crossing points between an RPL line layer and one or more asset line layers. Outputs KP, lat/lon, relative crossing angle, and crossed asset attributes. Also supports optional buffer polygons around the crossed asset near each crossing.
-- **Identify RPL Area Listing.** New processing algorithm that takes input of an RPL line layer, and one or more polygon layers (e.g. seabed features, or hazard areas), and outputs a line layer traced over the RPL line with breaks at the edges of the polygon layer features. The polygon feature attributes are picked up by the new line layer and start and end KP are also included.
-- **Merge KP Range Tables:** New Processing tool under "KP Ranges" to combine two KP-range tables with mismatched intervals.
-  - Supports canonical segmentation (non-overlapping KP intervals), summarise (Table B values into Table A ranges with min/max/avg or aggregated single value), and a simple lookup mode (copy one field with overlap resolution rules).
-  - Includes overlap handling options (first/most-specific/min/max/mean/weighted-mean/error), optional full-coverage checks, and remembers last-used parameters between runs.
-- **Group Adjacent KP Ranges by Field:** New processing tool under "KP Ranges" that merges consecutive KP intervals sharing the same attribute value, keeping one feature per run and optionally nulling conflicting other fields.
-- **KP Range Depth + Slope Summary:** New Processing tool under "KP Ranges" to sample bathymetry along KP-range line features and append summary fields.
-  - Supports Raster(s) (prefers highest resolution where rasters overlap) or 1–2 Contour layers (minor/major) with selectable depth fields.
-  - Outputs depth min/max/avg, along-route slope min/max/avg, and cross-track (side slope) min/max/avg.
-  - Includes optional adaptive raster sampling (step derived from raster resolution along the route) and optional directional extremes (up/down, port/stbd).
-- **Identify Hazards in Lay Corridor:** Processing tool that compares point, line, and polygon layers against a lay corridor polygon and RPL reference, exporting point/line/area proximity listings with KP/DCC, lat/lon, and JSON-encoded source attributes for every encroaching feature.
-- **Export Chartlets Based on KP Range List:** Processing tool that walks through each KP range/segment (table or geometry) and creates a per-section map PNG, either using segment geometries directly or extracting the KP span from an RPL line, with configurable extra buffers, exported layers, and layout elements.
+- **Identify RPL Crossing Points:** New processing algorithm to find crossing points between an RPL line layer and one or more asset line layers. Outputs KP, lat/lon, relative crossing angle, and crossed asset attributes; supports optional buffer polygons around the crossed asset near each crossing.
+- **Identify RPL Area Listing:** New processing algorithm that takes an RPL line layer and one or more polygon layers (e.g. seabed features, hazard areas), and outputs a line layer traced over the RPL with breaks at polygon edges. Polygon attributes are picked up by the new line layer and start/end KP are included.
+- **Merge KP Range Tables:** New tool under "KP Ranges" to combine two KP-range tables with mismatched intervals. Supports canonical segmentation (non-overlapping KP intervals), summarise (Table B values into Table A ranges), and a simple lookup mode. Includes overlap handling options and remembers last-used parameters.
+- **Group Adjacent KP Ranges by Field:** New tool under "KP Ranges" that merges consecutive KP intervals sharing the same attribute value, keeping one feature per run and optionally nulling conflicting other fields.
+- **KP Range Depth + Slope Summary:** New tool under "KP Ranges" to sample bathymetry along KP-range line features and append depth/slope summary fields. Supports raster(s) (prefers highest resolution where rasters overlap) or 1–2 contour layers.
+- **Identify Hazards in Lay Corridor:** Processing tool that compares point/line/polygon layers against a lay corridor polygon and RPL reference, exporting proximity listings with KP/DCC, lat/lon, and JSON-encoded source attributes.
+- **Export Chartlets Based on KP Range List:** Processing tool that walks through each KP range and creates a per-section map PNG, either using segment geometries directly or extracting the KP span from an RPL line.
+- **Extract Lines Intersecting Polygons:** New tool under "Other Tools" to combine intersecting features from multiple line layers into a single output, with optional clip-to-polygon and CRS-safe processing.
+- **Catenary Calculator V2 (Experimental):** Updated catenary calculator dialog that can model multi-segment cable assemblies and bodies.
 
 ### Changed
-- **KP Mouse Map Tool:** Improved to calculate KP based on geodetic measurements by default, with option for Cartesian calculations when the layer uses a projected CRS. Also added option to sample depth value at the mouse position from a raster or contour layer using right click. Also added option to configure the copy to clipboard function. Also added a "Go to KP..." option in the dropdown
-- **Depth Profile tool:** Improved raster/contour inputs and performance for long routes.
-  - Contours: second contour layer is now optional (works with 1 or 2 contour layers).
-  - Rasters: supports selecting multiple raster layers; overlapping rasters prefer higher resolution first and missing coverage remains null with warnings.
-  - Added Refresh control and live sample/probe estimate readout.
-  - Added optional adaptive raster sampling (step derived from raster resolution along the route).
+- **KP Mouse Tool:** Calculates KP based on geodetic measurements by default with an option for Cartesian calculations when the layer uses a projected CRS. Now remembers the setting between sessions, shows total route length for both methods (to 0.001 km) in the configuration metrics, and is more robust when the reference layer is removed/reloaded. Right-click samples a depth value at the mouse position from a raster or contour layer; the copy-to-clipboard format is now configurable, and a "Go to KP..." option has been added.
+- **Depth Profile tool:** Added an **Invert KP Axis** option to flip the KP axis without renumbering plotted values, plus an **Invert Slope Axis** option for slope plots, and renamed **Invert Slope** to **Invert Slope Sign** for clarity. Improved raster/contour inputs and performance for long routes — the second contour layer is now optional, multiple raster layers are supported (overlapping rasters prefer higher resolution; missing coverage stays null with warnings), Refresh control + live sample/probe estimate readout, and optional adaptive raster sampling derived from raster resolution.
 - **Transit Measure Tool:** Added a Quick Buffer tool to apply a buffer to the route.
-- **Processing Toolbox Grouping:** Made some changes to the grouping to try to make it more intuitive.
+- **Import Bathy from MDB:** Reworked execution to run ODBC reads in a subprocess to prevent silent QGIS crashes. Improved GeoMedia `GFeatures` metadata parsing, added automatic handling for ambiguous/mixed geometry tables, and fixed closed-line features being misclassified as polygons. Now loads Polygon and Point layers by default alongside LineString layers, and outputs scratch (memory) layers so users can save them via normal QGIS workflows.
+- **Processing Toolbox Grouping:** Refined groupings to be more intuitive.
 - **QGIS Compatibility Baseline:** Updated declared minimum QGIS version to 3.22.
 - **Qt Imports:** Standardised plugin-owned Qt imports to `qgis.PyQt` for improved cross-install compatibility.
 - **Optional Plotting Dependencies:** Plotting-heavy dock widgets (e.g. matplotlib-dependent) are now imported lazily so the plugin can still load if optional deps are missing.
 
 ### Fixed
-- Added option to invert slope angle/percentage calculation in Depth Profile tool, with default not inverted.
-- Fixed some cleanup issues with the transit measure tool.
-- Fixed an issue with the Nearest KP tool not working well with RPLs that have multisegment splits.
 - **Processing Provider Robustness:** Provider now registers algorithms defensively so a single tool import failure won't hide the whole toolbox.
-- **MBES Raster (XYZ) Robustness:** Added GDAL algorithm availability checks and fallback logic for IDW interpolation.
-- **MBES Raster (XYZ) Bugfix:** Fixed an indentation error in the IDW branch which could prevent the tool from running.
+- **MBES Raster (XYZ):** Added GDAL algorithm availability checks and fallback logic for IDW interpolation; fixed an indentation error in the IDW branch which could prevent the tool from running.
 - **MDB Import Robustness:** Made the MDB import tool resilient to missing `pyodbc` (fails at runtime with a clear message instead of breaking provider load).
 - **Plotting Dependency Reliability:** Vendored `pyqtgraph` under `lib/` to avoid requiring users to install it separately.
+- **Depth Profile:** Added option to invert slope angle/percentage calculation (default not inverted).
+- **Transit Measure:** Fixed cleanup issues.
+- **Nearest KP:** Fixed an issue with multi-segment RPL splits.
+
+### Removed
+- Several in-development tools that appeared in unreleased internal builds have been withdrawn from this release pending further work. They may return in a future version.
 
 ## [1.3.0] - 2025-09-06
 
