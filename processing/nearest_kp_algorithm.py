@@ -80,7 +80,7 @@ class NearestKPAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterFeatureSource(
                 self.INPUT_PATHS,
-                self.tr('Input Paths Layer'),
+                self.tr('Reference Line Layer'),
                 [QgsProcessing.TypeVectorLine]
             )
         )

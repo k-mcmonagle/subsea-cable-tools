@@ -112,7 +112,7 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterFeatureSource(
                 self.INPUT_RPL,
-                self.tr('Input RPL line layer'),
+                self.tr('Reference Line Layer'),
                 [QgsProcessing.TypeVectorLine],
             )
         )

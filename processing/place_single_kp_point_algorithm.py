@@ -101,7 +101,7 @@ class PlaceSingleKpPointAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterFeatureSource(
                 self.INPUT_LINE,
-                self.tr('Input Line Layer'),
+                self.tr('Reference Line Layer'),
                 [QgsProcessing.TypeVectorLine]
             )
         )

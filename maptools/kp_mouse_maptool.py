@@ -875,32 +875,53 @@ class KPMouseMapTool(QgsMapTool):
             # Create line geometry
             line_geom = QgsGeometry.fromPolylineXY([self.range_bearing_origin, self.last_mouse_point])
 
-            # Create circle geometry (same logic as rubber band)
-            segments = 120
+            # Create circle geometry: build a true geodesic ring on the spheroid
+            # and transform back to the project CRS, so the saved polygon matches
+            # what the rubber band shows and isn't distorted by projection scale.
+            segments = 180
             project_crs = self.canvas.mapSettings().destinationCrs()
             if range_distance_m <= 0:
                 return
 
-            if project_crs.isGeographic():
-                lat_rad = math.radians(self.range_bearing_origin.y())
-                deg_per_m_lat = 1.0 / 111320.0
-                deg_per_m_lon = 1.0 / (111320.0 * max(math.cos(lat_rad), 1e-6))
-                radius_x = range_distance_m * deg_per_m_lon
-                radius_y = range_distance_m * deg_per_m_lat
-                pts = []
-                for i in range(segments + 1):
-                    ang = 2 * math.pi * i / segments
-                    x = self.range_bearing_origin.x() + radius_x * math.sin(ang)
-                    y = self.range_bearing_origin.y() + radius_y * math.cos(ang)
-                    pts.append(QgsPointXY(x, y))
-            else:
-                radius = range_distance_m
-                pts = []
-                for i in range(segments + 1):
-                    ang = 2 * math.pi * i / segments
-                    x = self.range_bearing_origin.x() + radius * math.sin(ang)
-                    y = self.range_bearing_origin.y() + radius * math.cos(ang)
-                    pts.append(QgsPointXY(x, y))
+            pts = []
+            geodesic_ok = False
+            if hasattr(self.distanceArea, "computeSpheroidProject"):
+                try:
+                    if project_crs != dest_crs:
+                        from_wgs84 = QgsCoordinateTransform(dest_crs, project_crs, QgsProject.instance())
+                    else:
+                        from_wgs84 = None
+                    for i in range(segments + 1):
+                        azimuth_rad = 2.0 * math.pi * i / segments
+                        dest_ll = self.distanceArea.computeSpheroidProject(
+                            origin_ll, range_distance_m, azimuth_rad
+                        )
+                        pts.append(from_wgs84.transform(dest_ll) if from_wgs84 else dest_ll)
+                    geodesic_ok = True
+                except Exception:
+                    pts = []
+                    geodesic_ok = False
+
+            if not geodesic_ok:
+                # Fallback planar approximation (kept for resilience).
+                if project_crs.isGeographic():
+                    lat_rad = math.radians(self.range_bearing_origin.y())
+                    deg_per_m_lat = 1.0 / 111320.0
+                    deg_per_m_lon = 1.0 / (111320.0 * max(math.cos(lat_rad), 1e-6))
+                    radius_x = range_distance_m * deg_per_m_lon
+                    radius_y = range_distance_m * deg_per_m_lat
+                    for i in range(segments + 1):
+                        ang = 2 * math.pi * i / segments
+                        x = self.range_bearing_origin.x() + radius_x * math.sin(ang)
+                        y = self.range_bearing_origin.y() + radius_y * math.cos(ang)
+                        pts.append(QgsPointXY(x, y))
+                else:
+                    radius = range_distance_m
+                    for i in range(segments + 1):
+                        ang = 2 * math.pi * i / segments
+                        x = self.range_bearing_origin.x() + radius * math.sin(ang)
+                        y = self.range_bearing_origin.y() + radius * math.cos(ang)
+                        pts.append(QgsPointXY(x, y))
 
             circle_geom = QgsGeometry.fromPolygonXY([pts])
 
@@ -1032,30 +1053,79 @@ class KPMouseMapTool(QgsMapTool):
             self.rangeBearingCircle.reset(QgsWkbTypes.PolygonGeometry)
             if range_meters <= 0:
                 return
-            segments = 120
+
             project_crs = self.canvas.mapSettings().destinationCrs()
+            wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
+
+            # Build the ring as a true geodesic circle on the spheroid, then
+            # transform each sample back to the project CRS for rendering.
+            # This is correct for any project CRS (Web Mercator, UTM, geographic,
+            # non-metre projected CRSes, …) — the previous Euclidean / flat-Earth
+            # approximation drifted off the cursor whenever the projection scale
+            # factor at the origin differed from 1 (e.g. Web Mercator at high
+            # latitudes), or when map units were not metres.
+            try:
+                if project_crs != wgs84:
+                    to_wgs84 = QgsCoordinateTransform(project_crs, wgs84, QgsProject.instance())
+                    from_wgs84 = QgsCoordinateTransform(wgs84, project_crs, QgsProject.instance())
+                    origin_ll = to_wgs84.transform(self.range_bearing_origin)
+                else:
+                    to_wgs84 = None
+                    from_wgs84 = None
+                    origin_ll = self.range_bearing_origin
+            except Exception:
+                to_wgs84 = None
+                from_wgs84 = None
+                origin_ll = None
+
+            geodesic_ok = False
+            if origin_ll is not None and hasattr(self.distanceArea, "computeSpheroidProject"):
+                try:
+                    segments = 180
+                    pts = []
+                    for i in range(segments + 1):
+                        azimuth_rad = 2.0 * math.pi * i / segments
+                        # computeSpheroidProject expects (lon/lat in degrees, distance m, azimuth rad)
+                        dest_ll = self.distanceArea.computeSpheroidProject(
+                            origin_ll, range_meters, azimuth_rad
+                        )
+                        if from_wgs84 is not None:
+                            dest = from_wgs84.transform(dest_ll)
+                        else:
+                            dest = dest_ll
+                        pts.append(dest)
+                    for p in pts:
+                        self.rangeBearingCircle.addPoint(p)
+                    geodesic_ok = True
+                except Exception:
+                    geodesic_ok = False
+                    self.rangeBearingCircle.reset(QgsWkbTypes.PolygonGeometry)
+
+            if geodesic_ok:
+                return
+
+            # Fallback (used only if the geodesic path failed): the previous
+            # planar approximation. Kept so the ring still draws *something*
+            # instead of disappearing on exotic CRSes.
+            segments = 120
             if project_crs.isGeographic():
                 lat_rad = math.radians(self.range_bearing_origin.y())
                 deg_per_m_lat = 1.0 / 111320.0
                 deg_per_m_lon = 1.0 / (111320.0 * max(math.cos(lat_rad), 1e-6))
                 radius_x = range_meters * deg_per_m_lon
                 radius_y = range_meters * deg_per_m_lat
-                pts = []
                 for i in range(segments + 1):
                     ang = 2 * math.pi * i / segments
                     x = self.range_bearing_origin.x() + radius_x * math.sin(ang)
                     y = self.range_bearing_origin.y() + radius_y * math.cos(ang)
-                    pts.append(QgsPointXY(x, y))
+                    self.rangeBearingCircle.addPoint(QgsPointXY(x, y))
             else:
                 radius = range_meters
-                pts = []
                 for i in range(segments + 1):
                     ang = 2 * math.pi * i / segments
                     x = self.range_bearing_origin.x() + radius * math.sin(ang)
                     y = self.range_bearing_origin.y() + radius * math.cos(ang)
-                    pts.append(QgsPointXY(x, y))
-            for p in pts:
-                self.rangeBearingCircle.addPoint(p)
+                    self.rangeBearingCircle.addPoint(QgsPointXY(x, y))
         except Exception:
             pass
 

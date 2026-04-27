@@ -45,7 +45,7 @@ class KPRangeHighlighterAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterFeatureSource(
                 self.INPUT,
-                self.tr('Input RPL Line Layer'),
+                self.tr('Reference Line Layer'),
                 [QgsProcessing.TypeVectorLine]
             )
         )

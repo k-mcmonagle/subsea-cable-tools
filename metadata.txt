@@ -20,6 +20,8 @@ changelog=Version 1.5.1:
   - KP Plotter now measures KP in the line-layer CRS and reprojects the on-map marker; reference and route layers no longer need matching CRSes.
   - Find Nearest KP and Place KP Points (raster sampling) now auto-reproject mismatched inputs with a feedback warning instead of refusing to run.
   - Translate KP Between RPLs: clearer same-CRS error message that names both layers' CRSes.
+  - KP Mouse Tool: range ring is now drawn as a true geodesic circle so its edge sits on the cursor regardless of the project CRS scale factor (fixes drift in Web Mercator etc.).
+  - Reference-line input labels standardised to "Reference Line Layer" across processing algorithms (parameter IDs unchanged).
   - Catenary Calculator (v1) marked as Legacy; planned for removal in 1.6.
   - Documentation refresh (README + CHANGELOG) covering CRS/distance methodology.
 

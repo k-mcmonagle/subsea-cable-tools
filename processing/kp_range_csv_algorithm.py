@@ -213,7 +213,7 @@ class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterFeatureSource(
                 self.INPUT_LINE,
-                self.tr('Input RPL Line Layer'),
+                self.tr('Reference Line Layer'),
                 [QgsProcessing.TypeVectorLine]
             )
         )

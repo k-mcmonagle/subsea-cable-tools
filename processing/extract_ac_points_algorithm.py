@@ -39,7 +39,7 @@ class ExtractACPointsAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterFeatureSource(
                 self.INPUT_RPL,
-                self.tr('Input RPL Line Layer'),
+                self.tr('Reference Line Layer'),
                 [QgsProcessing.TypeVectorLine]
             )
         )

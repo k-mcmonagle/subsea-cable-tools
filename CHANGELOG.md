@@ -19,9 +19,11 @@ Maintenance and consistency release focused on distance/KP measurement and CRS h
 - **Place KP Points Along Route** (`processing/place_kp_points_algorithm.py`): when a depth raster is provided in a different CRS, sample points are now reprojected to the raster CRS instead of the algorithm refusing to run.
 - **Translate KP Between RPLs** (`processing/translate_kp_from_rpl_to_rpl_algorithm.py`): same-CRS requirement is retained (semantically, both layers must share the same reference frame), but the error message now names both layers' CRSes and recommends reprojecting one of them.
 - **Catenary Calculator (v1):** menu label now appended with " (Legacy)"; planned for removal in 1.6 in favour of Catenary Calculator V2.
+- **Reference-line input labels standardised** to "Reference Line Layer" across the KP-emitting and RPL processing algorithms (parameter IDs unchanged, so saved Processing models and scripts keep working).
 - **Documentation:** README updated with a "Distance & CRS methodology" section.
 
 ### Fixed
+- **KP Mouse Tool — range ring alignment:** the dashed range ring rendered around the click origin now sits exactly on the cursor's reported geodesic range. The ring is built as a true geodesic circle on the spheroid (sampled with `QgsDistanceArea.computeSpheroidProject` and transformed back to the project CRS), instead of an Euclidean / flat-Earth approximation. Previously the ring drifted off the cursor whenever the project CRS had a non-unity scale factor at that location (e.g. Web Mercator at high latitudes) or used non-metre map units. The same fix applies to the saved "Place Range Ring" polygon feature.
 - **Empty-ellipsoid silent fallback:** several tools previously called `setEllipsoid(project.ellipsoid())` with no fallback. When the project ellipsoid was unset this silently disabled ellipsoidal mode, returning planar units (in degrees on a geographic CRS — wrong KPs). All call sites now go through `make_distance_area`, which applies a `WGS84` fallback when the project ellipsoid is empty.
 - **Place KP Points from CSV:** fixed a `NameError` (`source` undefined) introduced during the helper migration; the algorithm now builds its distance calculator from the input line layer.
 - **Depth Profile dock widget:** removed a duplicated initialisation block that re-initialised four `segment_*` lists during `__init__`.
