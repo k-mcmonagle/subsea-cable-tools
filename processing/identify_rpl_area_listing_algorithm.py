@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from ..kp_range_utils import make_distance_area
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
@@ -301,9 +302,9 @@ class IdentifyRPLAreaListingAlgorithm(QgsProcessingAlgorithm):
 
         rpl_crs = rpl_source.sourceCrs()
 
-        distance_calculator = QgsDistanceArea()
-        distance_calculator.setSourceCrs(rpl_crs, context.transformContext())
-        distance_calculator.setEllipsoid(context.project().ellipsoid())
+        distance_calculator = make_distance_area(
+            rpl_crs, context.transformContext(), project=context.project()
+        )
 
         rpl_infos: List[_RplGeomInfo] = []
         cumulative_base_m = 0.0

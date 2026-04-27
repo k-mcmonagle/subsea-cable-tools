@@ -33,7 +33,13 @@ from qgis.core import (QgsProcessing,
                        QgsWkbTypes,
                        QgsDistanceArea)
 
-from ..kp_range_utils import extract_line_segment, measure_total_length_m
+from ..kp_range_utils import (
+    extract_line_segment,
+    make_distance_area,
+    measure_total_length_m,
+    add_distance_mode_parameter,
+    read_distance_mode,
+)
 
 class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
     INPUT_LAYER = 'INPUT_LAYER'
@@ -236,6 +242,8 @@ class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
+        add_distance_mode_parameter(self)
+
     def processAlgorithm(self, parameters, context, feedback):
         source = self.parameterAsSource(parameters, self.INPUT_LINE, context)
         pasted_text = self.parameterAsString(parameters, self.PASTED_RANGES, context)
@@ -301,9 +309,14 @@ class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
             feedback.pushInfo("Input line layer is empty or invalid.")
             return {self.OUTPUT: dest_id}
 
-        distance_calculator = QgsDistanceArea()
-        distance_calculator.setSourceCrs(source.sourceCrs(), context.transformContext())
-        distance_calculator.setEllipsoid(context.project().ellipsoid())
+        distance_mode = read_distance_mode(self, parameters, context)
+        try:
+            distance_calculator = make_distance_area(
+                source.sourceCrs(), context.transformContext(),
+                mode=distance_mode, project=context.project(),
+            )
+        except ValueError as exc:
+            raise QgsProcessingException(str(exc))
 
         # Pre-calculate the total length of the line
         total_length = float(measure_total_length_m(combined_geom, distance_calculator))

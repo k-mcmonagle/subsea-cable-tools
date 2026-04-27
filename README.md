@@ -32,11 +32,13 @@ Accessible via the QGIS Processing Toolbox under **Subsea Cable Tools**:
 - **Catenary Calculator** and **Catenary Calculator V2 (Experimental)** – Dialog tools for subsea cable catenary calculations; V2 supports multi-segment cable assemblies and bodies.
 - **Transit Measure Tool** – Interactive map tool for measuring cumulative geodesic distances along user-drawn paths, with transit duration calculations and an optional Quick Buffer.
 
-#### Distance / KP measurement notes
+#### Distance & CRS methodology
 
-- Most tools use QGIS' built-in `QgsDistanceArea` with the **project ellipsoid** (fallback **WGS84**) for **ellipsoidal/geodesic** distances.
-- **Cartesian/planar** measurements are only meaningful in a **projected** CRS. If the project CRS is geographic (degrees), cartesian values are disabled/marked as not available.
-- Where a layer CRS differs from the project CRS, tools may transform geometries to the project CRS before measuring (the KP Mouse Tool does this). Some existing tools currently assume the project CRS and selected layer CRS match.
+- **Ellipsoidal (default).** All distance/KP measurements go through a single shared `QgsDistanceArea` helper that uses the **project ellipsoid** and falls back to **WGS84** when the project ellipsoid is unset. This guarantees consistent geodesic measurements across every tool.
+- **Cartesian (opt-in).** KP-emitting processing algorithms expose a **Distance mode** parameter (Ellipsoidal / Cartesian). Cartesian is planar and only meaningful in a **projected** CRS; the algorithms refuse Cartesian on a geographic CRS with a clear error.
+- **Layer-CRS measurement.** Tools measure in the **layer's own CRS** rather than the project CRS, avoiding silent unit confusion when a project happens to be configured in a different CRS than the route.
+- **Auto-reprojection.** When tool inputs use mismatched CRSes (e.g. KP Plotter line vs. project, Find Nearest KP points vs. paths, Place KP Points sample raster), the plugin reprojects the inputs internally and emits a feedback note. Matching CRSes are still recommended for best display performance.
+- **Strict same-CRS where it matters.** "Translate KP Between RPLs" still requires both layers to share a CRS — silently reprojecting could mask user error in that workflow. The error message names both CRSes.
 
 ---
 

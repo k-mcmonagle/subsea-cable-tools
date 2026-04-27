@@ -7,9 +7,15 @@ This tool extracts Alter Course (A/C) points from an RPL line layer.
 
 import math
 from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from ..kp_range_utils import (
+    make_distance_area,
+    add_distance_mode_parameter,
+    read_distance_mode,
+)
 from qgis.core import (QgsProcessing,
                        QgsFeatureSink,
                        QgsProcessingAlgorithm,
+                       QgsProcessingException,
                        QgsProcessingParameterFeatureSource,
                        QgsProcessingParameterNumber,
                        QgsProcessingParameterString,
@@ -64,6 +70,8 @@ class ExtractACPointsAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
+        add_distance_mode_parameter(self)
+
     @staticmethod
     def _parse_bin_edges(text: str):
         if not text:
@@ -110,9 +118,14 @@ class ExtractACPointsAlgorithm(QgsProcessingAlgorithm):
         (sink, dest_id) = self.parameterAsSink(parameters, self.OUTPUT,
                                                context, fields, QgsWkbTypes.Point, source.sourceCrs())
 
-        distance_calculator = QgsDistanceArea()
-        distance_calculator.setSourceCrs(source.sourceCrs(), context.transformContext())
-        distance_calculator.setEllipsoid(context.project().ellipsoid())
+        distance_mode = read_distance_mode(self, parameters, context)
+        try:
+            distance_calculator = make_distance_area(
+                source.sourceCrs(), context.transformContext(),
+                mode=distance_mode, project=context.project(),
+            )
+        except ValueError as exc:
+            raise QgsProcessingException(str(exc))
 
         # Collect all geometries and merge them into continuous lines
         # This is crucial if the input layer consists of many separate segments

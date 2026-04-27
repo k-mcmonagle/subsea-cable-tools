@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import List, Optional, Sequence, Tuple
 
 from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from ..kp_range_utils import make_distance_area
 from qgis.core import (
     QgsCoordinateTransform,
     QgsCoordinateReferenceSystem,
@@ -328,9 +329,9 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
         to_source = QgsCoordinateTransform(working_crs, source_crs, QgsProject.instance()) if working_crs != source_crs else None
 
         # Distance calculator in working CRS
-        distance_area = QgsDistanceArea()
-        distance_area.setSourceCrs(working_crs, context.transformContext())
-        distance_area.setEllipsoid(context.project().ellipsoid())
+        distance_area = make_distance_area(
+            working_crs, context.transformContext(), project=context.project()
+        )
 
         # Output fields: keep input fields + a few diagnostics (non-breaking)
         fields = QgsFields(source.fields())
@@ -786,9 +787,9 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
                 # Distance computation in meters if layer CRS is geographic
                 dist_area = None
                 if lyr.crs().isGeographic():
-                    dist_area = QgsDistanceArea()
-                    dist_area.setSourceCrs(lyr.crs(), context.transformContext())
-                    dist_area.setEllipsoid(context.project().ellipsoid())
+                    dist_area = make_distance_area(
+                        lyr.crs(), context.transformContext(), project=context.project()
+                    )
 
                 for feat in feat_iter:
                     g = feat.geometry()

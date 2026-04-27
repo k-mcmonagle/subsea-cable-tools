@@ -2,6 +2,7 @@ from qgis.PyQt.QtWidgets import QDockWidget, QVBoxLayout, QWidget, QComboBox, QL
 from qgis.PyQt.QtCore import Qt
 from qgis.core import QgsProject, QgsVectorLayer, QgsMapLayerProxyModel, QgsWkbTypes, QgsGeometry, QgsPointXY, QgsWkbTypes, QgsDistanceArea, QgsCoordinateTransform
 from qgis.gui import QgsVertexMarker
+from .kp_range_utils import make_distance_area
 try:  # Safe sip import for deleted checks
     import sip  # type: ignore
     _sip_isdeleted = sip.isdeleted
@@ -132,7 +133,7 @@ class KpPlotterDockWidget(QDockWidget):
             "</li>"
             "<li><b>Tips & Notes:</b>"
             "  <ul>"
-            "    <li><b>CRS Requirement:</b> The <b>project CRS</b> and <b>reference line layer CRS</b> must match for correct marker placement. Reproject layers if needed.</li>"
+            "    <li><b>CRS Handling:</b> The reference line layer and the project may use different CRSes; the marker is reprojected automatically. For best display performance, matching CRSes are still recommended.</li>"
             "    <li>All KP values are assumed to be in kilometers. The tool interpolates positions along the reference line using KP values.</li>"
             "    <li>If the plot or marker does not appear as expected, check that your data table contains valid numeric KP and data values.</li>"
             "    <li>Selections and settings are remembered between sessions for convenience.</li>"
@@ -141,7 +142,7 @@ class KpPlotterDockWidget(QDockWidget):
             "<li><b>Troubleshooting:</b>"
             "  <ul>"
             "    <li>If no data appears, ensure you have selected valid layers and fields, and that your table contains data for the chosen KP and data fields.</li>"
-            "    <li>If the marker is misaligned, verify that all layers use the same CRS as the project.</li>"
+            "    <li>If the marker is misaligned, check that the reference line geometry is valid and that no layer has a manually overridden CRS.</li>"
             "    <li>For large datasets, plotting may take a few seconds.</li>"
             "  </ul>"
             "</li>"
@@ -376,7 +377,11 @@ class KpPlotterDockWidget(QDockWidget):
     def plot_data(self):
         """
         Plot the selected KP-based data on the chart.
-        Uses merged line geometry and interpolation logic matching the Place KP Points tool for consistency.
+
+        Distances and interpolation are computed in the **line layer's CRS**
+        (matching the Place KP Points processing algorithm). The interpolated
+        marker is reprojected to the project CRS only when displayed on the map
+        canvas, so the reference line and the project may use different CRSes.
         """
         # Ensure figure, canvas, and toolbar are initialized (in case they were cleaned up)
         if self.figure is None or self.canvas is None or self.toolbar is None:
@@ -419,10 +424,20 @@ class KpPlotterDockWidget(QDockWidget):
             self.canvas.draw()
             return
 
-        # Set up distance area
-        project_crs = QgsProject.instance().crs()
-        self.distance_area.setSourceCrs(project_crs, QgsProject.instance().transformContext())
-        self.distance_area.setEllipsoid(QgsProject.instance().ellipsoid())
+        # Set up distance area in the *line layer* CRS so geometry walking and
+        # length measurements are consistent. The interpolated marker is
+        # transformed to project CRS at display time (see update_map_marker).
+        project = QgsProject.instance()
+        self.line_crs = line_layer.sourceCrs()
+        self.distance_area = make_distance_area(
+            self.line_crs, project.transformContext(), project=project
+        )
+        try:
+            self.line_to_project_xform = QgsCoordinateTransform(
+                self.line_crs, project.crs(), project
+            )
+        except Exception:
+            self.line_to_project_xform = None
 
         # --- Merge all line features into a single geometry (like Place KP Points tool) ---
         line_features = [f for f in line_layer.getFeatures()]
@@ -660,6 +675,14 @@ class KpPlotterDockWidget(QDockWidget):
         if point_geom is None or point_geom.isEmpty():
             return
         point = point_geom.asPoint()
+        # Reproject the interpolated point (in line layer CRS) to project CRS
+        # before centring the map canvas.
+        xform = getattr(self, 'line_to_project_xform', None)
+        if xform is not None:
+            try:
+                point = xform.transform(point)
+            except Exception:
+                pass
         # Zoom map canvas to this point
         canvas = self.iface.mapCanvas()
         canvas.setCenter(point)
@@ -773,7 +796,16 @@ class KpPlotterDockWidget(QDockWidget):
                 self.iface.mapCanvas().refresh()
             return
 
-        self.marker.setCenter(point_on_line.asPoint())
+        marker_point = point_on_line.asPoint()
+        # Reproject from line layer CRS to project CRS so the marker lands
+        # correctly even when the layers use different CRSes.
+        xform = getattr(self, 'line_to_project_xform', None)
+        if xform is not None:
+            try:
+                marker_point = xform.transform(marker_point)
+            except Exception:
+                pass
+        self.marker.setCenter(marker_point)
         self.iface.mapCanvas().refresh()
 
     def cleanup_plot_and_marker(self):

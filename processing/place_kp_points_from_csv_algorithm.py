@@ -18,6 +18,11 @@ import re
 from typing import List, Optional, Tuple
 
 from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from ..kp_range_utils import (
+    make_distance_area,
+    add_distance_mode_parameter,
+    read_distance_mode,
+)
 from qgis.core import (QgsProcessing,
                        QgsFeatureSink,
                        QgsProcessingAlgorithm,
@@ -199,6 +204,8 @@ class PlaceKpPointsFromCsvAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
+        add_distance_mode_parameter(self)
+
     def processAlgorithm(self, parameters, context, feedback):
         line_layer = self.parameterAsSource(parameters, self.INPUT_LINE, context)
 
@@ -260,9 +267,14 @@ class PlaceKpPointsFromCsvAlgorithm(QgsProcessingAlgorithm):
         if merged_geometry.isEmpty():
             raise QgsProcessingException(self.tr("Geometry is empty after merging features."))
 
-        distance_calculator = QgsDistanceArea()
-        distance_calculator.setSourceCrs(line_layer.sourceCrs(), context.transformContext())
-        distance_calculator.setEllipsoid(context.project().ellipsoid())
+        distance_mode = read_distance_mode(self, parameters, context)
+        try:
+            distance_calculator = make_distance_area(
+                line_layer.sourceCrs(), context.transformContext(),
+                mode=distance_mode, project=context.project(),
+            )
+        except ValueError as exc:
+            raise QgsProcessingException(str(exc))
 
         total_length_m = distance_calculator.measureLength(merged_geometry)
         if total_length_m == 0:

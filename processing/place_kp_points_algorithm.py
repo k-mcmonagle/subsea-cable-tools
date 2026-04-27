@@ -6,6 +6,7 @@ from qgis.core import (
     QgsProcessingParameterBoolean,
     QgsProcessingParameterFeatureSink,
     QgsProcessing,
+    QgsCoordinateTransform,
     QgsFeature,
     QgsField,
     QgsFields,
@@ -17,6 +18,11 @@ from qgis.core import (
     QgsDistanceArea
 )
 from qgis.PyQt.QtCore import QVariant, QCoreApplication
+from ..kp_range_utils import (
+    make_distance_area,
+    add_distance_mode_parameter,
+    read_distance_mode,
+)
 
 class PlaceKpPointsAlgorithm(QgsProcessingAlgorithm):
     """
@@ -89,6 +95,8 @@ class PlaceKpPointsAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
+        add_distance_mode_parameter(self)
+
     def processAlgorithm(self, parameters, context, feedback):
         line_layer = self.parameterAsSource(parameters, self.INPUT_LINE, context)
         if line_layer is None:
@@ -96,8 +104,14 @@ class PlaceKpPointsAlgorithm(QgsProcessingAlgorithm):
 
         raster_layer = self.parameterAsRasterLayer(parameters, self.INPUT_RASTER, context)
 
+        line_to_raster_xform = None
         if raster_layer and line_layer.sourceCrs() != raster_layer.crs():
-            raise QgsProcessingException(self.tr("Input line layer and raster layer must have the same CRS."))
+            feedback.pushInfo(self.tr(
+                "Line layer and raster layer use different CRSes; sample points will be reprojected to the raster CRS."
+            ))
+            line_to_raster_xform = QgsCoordinateTransform(
+                line_layer.sourceCrs(), raster_layer.crs(), context.project()
+            )
 
         intervals_to_process = []
         if self.parameterAsBoolean(parameters, self.INTERVAL_1KM, context):
@@ -155,9 +169,14 @@ class PlaceKpPointsAlgorithm(QgsProcessingAlgorithm):
             feedback.pushInfo(self.tr("Geometry is empty after merging features."))
             return {self.OUTPUT: None}
 
-        distance_calculator = QgsDistanceArea()
-        distance_calculator.setSourceCrs(line_layer.sourceCrs(), context.transformContext())
-        distance_calculator.setEllipsoid(context.project().ellipsoid())
+        distance_mode = read_distance_mode(self, parameters, context)
+        try:
+            distance_calculator = make_distance_area(
+                line_layer.sourceCrs(), context.transformContext(),
+                mode=distance_mode, project=context.project(),
+            )
+        except ValueError as exc:
+            raise QgsProcessingException(str(exc))
 
         total_length = distance_calculator.measureLength(merged_geometry)
         total_length_km = round(total_length / 1000, 3)
@@ -174,12 +193,22 @@ class PlaceKpPointsAlgorithm(QgsProcessingAlgorithm):
         label = 'KP 0'
         attributes = [source_line_name, label, 0.0, total_length_km, 0.0]
         if raster_sampler:
-            depth_value, res = raster_sampler.sample(start_point, 1)
-            if res:
-                attributes.append(float(depth_value))
-            else:
+            sample_point = start_point
+            if line_to_raster_xform is not None:
+                try:
+                    sample_point = line_to_raster_xform.transform(start_point)
+                except Exception:
+                    sample_point = None
+            if sample_point is None:
                 attributes.append(None)
                 null_depth_count += 1
+            else:
+                depth_value, res = raster_sampler.sample(sample_point, 1)
+                if res:
+                    attributes.append(float(depth_value))
+                else:
+                    attributes.append(None)
+                    null_depth_count += 1
         feat.setAttributes(attributes)
         sink.addFeature(feat, QgsFeatureSink.FastInsert)
         points_placed = 1
@@ -213,12 +242,21 @@ class PlaceKpPointsAlgorithm(QgsProcessingAlgorithm):
                         attributes = [source_line_name, label, kp_val, reverse_kp, interval_km]
                         if raster_sampler:
                             point_xy = QgsPointXY(x, y)
-                            depth_value, res = raster_sampler.sample(point_xy, 1)
-                            if res:
-                                attributes.append(float(depth_value))
-                            else:
+                            if line_to_raster_xform is not None:
+                                try:
+                                    point_xy = line_to_raster_xform.transform(point_xy)
+                                except Exception:
+                                    point_xy = None
+                            if point_xy is None:
                                 attributes.append(None)
                                 null_depth_count += 1
+                            else:
+                                depth_value, res = raster_sampler.sample(point_xy, 1)
+                                if res:
+                                    attributes.append(float(depth_value))
+                                else:
+                                    attributes.append(None)
+                                    null_depth_count += 1
                         feat.setAttributes(attributes)
                         sink.addFeature(feat, QgsFeatureSink.FastInsert)
                         points_placed += 1

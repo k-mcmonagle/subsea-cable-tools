@@ -24,6 +24,7 @@ if lib_dir not in sys.path:
     sys.path.insert(0, lib_dir)
 
 from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from ..kp_range_utils import make_distance_area
 from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
@@ -258,9 +259,9 @@ class SeabedLengthAlgorithm(QgsProcessingAlgorithm):
                 continue
 
             # Calculate plan length
-            distance_area = QgsDistanceArea()
-            distance_area.setSourceCrs(line_layer.sourceCrs(), context.transformContext())
-            distance_area.setEllipsoid(context.project().ellipsoid())
+            distance_area = make_distance_area(
+                line_layer.sourceCrs(), context.transformContext(), project=context.project()
+            )
             plan_length = distance_area.measureLength(merged_geom)
 
             # Calculate seabed length
@@ -333,9 +334,9 @@ class SeabedLengthAlgorithm(QgsProcessingAlgorithm):
 
     def _calculate_seabed_length(self, geom, raster_layer, contour_layer, bathy_type, interval_m, line_crs, context, depth_field):
         """Calculate seabed length by sampling depths along the geometry."""
-        distance_area = QgsDistanceArea()
-        distance_area.setSourceCrs(line_crs, context.transformContext())
-        distance_area.setEllipsoid(context.project().ellipsoid())
+        distance_area = make_distance_area(
+            line_crs, context.transformContext(), project=context.project()
+        )
         total_length = distance_area.measureLength(geom)
         sampled_points = []
 

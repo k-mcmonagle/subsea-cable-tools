@@ -105,10 +105,18 @@ class TranslateKPFromRPLToRPLAlgorithm(QgsProcessingAlgorithm):
         if target_points is None:
             raise QgsProcessingException(self.invalidSourceError(parameters, self.INPUT_TARGET_POINTS))
 
-        # Check CRS match
+        # Check CRS match. This algorithm semantically aligns two reference frames
+        # (target points already projected onto the source RPL); reprojecting silently
+        # could mask a user error, so the same-CRS requirement is enforced.
         if target_points.sourceCrs() != source_line.sourceCrs():
             raise QgsProcessingException(
-                self.tr('CRS Mismatch: Target Points and Source Line must use the same CRS.')
+                self.tr(
+                    'CRS Mismatch: Target Points ({tp_crs}) and Source Line ({sl_crs}) must use the same CRS. '
+                    'Reproject one of the layers (e.g. via "Reproject layer") and re-run.'
+                ).format(
+                    tp_crs=target_points.sourceCrs().authid() or target_points.sourceCrs().description(),
+                    sl_crs=source_line.sourceCrs().authid() or source_line.sourceCrs().description(),
+                )
             )
 
         # Build output fields based on target point layer and add three new fields

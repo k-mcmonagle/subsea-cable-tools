@@ -6,6 +6,11 @@ This tool places a single KP point along a route.
 """
 
 from qgis.PyQt.QtCore import QCoreApplication, QVariant, QSettings
+from ..kp_range_utils import (
+    make_distance_area,
+    add_distance_mode_parameter,
+    read_distance_mode,
+)
 from qgis.core import (QgsProcessing,
                        QgsFeatureSink,
                        QgsProcessingAlgorithm,
@@ -184,6 +189,8 @@ class PlaceSingleKpPointAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
+        add_distance_mode_parameter(self)
+
     def processAlgorithm(self, parameters, context, feedback):
         line_layer = self.parameterAsSource(parameters, self.INPUT_LINE, context)
         kp_val = self.parameterAsDouble(parameters, self.KP_VALUE, context)
@@ -334,15 +341,16 @@ class PlaceSingleKpPointAlgorithm(QgsProcessingAlgorithm):
         if merged_project.isEmpty():
             raise QgsProcessingException(self.tr("Geometry became empty after transforming to project CRS."))
 
-        # KP distance is measured geodesically (ellipsoidal), matching the KP mouse tool.
-        distance_calculator = QgsDistanceArea()
-        distance_calculator.setSourceCrs(project_crs, context.transformContext())
-        ellipsoid = context.project().ellipsoid()
-        if not ellipsoid:
-            ellipsoid = 'WGS84'
-        distance_calculator.setEllipsoid(ellipsoid)
-        if hasattr(distance_calculator, "setEllipsoidalMode"):
-            distance_calculator.setEllipsoidalMode(True)
+        # KP distance is measured geodesically (ellipsoidal) by default, matching the KP mouse tool.
+        # User may opt for cartesian when the project CRS is projected.
+        distance_mode = read_distance_mode(self, parameters, context)
+        try:
+            distance_calculator = make_distance_area(
+                project_crs, context.transformContext(),
+                mode=distance_mode, project=context.project(),
+            )
+        except ValueError as exc:
+            raise QgsProcessingException(str(exc))
 
         total_length_m = float(distance_calculator.measureLength(merged_project))
         if total_length_m <= 0.0:

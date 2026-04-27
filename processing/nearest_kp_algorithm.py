@@ -14,6 +14,11 @@ NearestKP identifies the nearest KP on specified paths for each point feature in
 """
 
 from qgis.PyQt.QtCore import QCoreApplication
+from ..kp_range_utils import (
+    make_distance_area,
+    add_distance_mode_parameter,
+    read_distance_mode,
+)
 from qgis.core import (
     QgsProcessing,
     QgsFeatureSink,
@@ -21,6 +26,7 @@ from qgis.core import (
     QgsProcessingParameterFeatureSource,
     QgsProcessingParameterFeatureSink,
     QgsProcessingParameterBoolean,
+    QgsCoordinateTransform,
     QgsFeature,
     QgsGeometry,
     QgsPointXY,
@@ -113,6 +119,8 @@ class NearestKPAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
+        add_distance_mode_parameter(self)
+
     def processAlgorithm(self, parameters, context, feedback):
         """
         Execute the algorithm.
@@ -129,20 +137,23 @@ class NearestKPAlgorithm(QgsProcessingAlgorithm):
 
         paths_source = paths_layer
 
-        # Check if both layers have the same CRS
+        # If the input layers use different CRSes, reproject the input points
+        # to the paths CRS before measuring (instead of rejecting outright).
+        # Output point features remain in the input points CRS.
         points_crs = points_source.sourceCrs()
         paths_crs = paths_source.sourceCrs()
-
+        points_to_paths_xform = None
         if points_crs != paths_crs:
-            raise QgsProcessingException(
+            feedback.pushInfo(
                 self.tr(
-                    'CRS Mismatch: The input Points layer has CRS "{points_crs}", '
-                    'while the input Paths layer has CRS "{paths_crs}". Please ensure both layers use the same CRS.'
+                    'CRS mismatch: input Points layer is "{points_crs}" and Paths layer is "{paths_crs}". '
+                    'Input points will be reprojected to the Paths CRS for measurement.'
                 ).format(
-                    points_crs=points_crs.authid(),
-                    paths_crs=paths_crs.authid()
+                    points_crs=points_crs.authid() or points_crs.description(),
+                    paths_crs=paths_crs.authid() or paths_crs.description(),
                 )
             )
+            points_to_paths_xform = QgsCoordinateTransform(points_crs, paths_crs, context.project())
 
         # Get the name of the input paths layer for kp_ref
         paths_layer_name = paths_layer.name()
@@ -182,12 +193,16 @@ class NearestKPAlgorithm(QgsProcessingAlgorithm):
         if lines_sink is None:
             raise QgsProcessingException(self.invalidSinkError(parameters, self.OUTPUT_LINES))
 
-        # Initialize QgsDistanceArea for accurate distance measurements
-        # Keep behavior consistent with other plugin tools (fallback to WGS84 if project ellipsoid is unset).
-        distance_calculator = QgsDistanceArea()
-        distance_calculator.setSourceCrs(points_source.sourceCrs(), context.transformContext())
-        ellipsoid = QgsProject.instance().ellipsoid() or 'WGS84'
-        distance_calculator.setEllipsoid(ellipsoid)
+        # Initialize QgsDistanceArea for accurate distance measurements (paths CRS).
+        # Helper handles the WGS84 fallback when the project ellipsoid is unset.
+        distance_mode = read_distance_mode(self, parameters, context)
+        try:
+            distance_calculator = make_distance_area(
+                paths_source.sourceCrs(), context.transformContext(),
+                mode=distance_mode, project=context.project(),
+            )
+        except ValueError as exc:
+            raise QgsProcessingException(str(exc))
 
         # Cache path features/geometries once (avoids re-iterating provider for every point)
         # and compute cumulative offsets so KP is relative to the whole input RPL layer
@@ -218,7 +233,21 @@ class NearestKPAlgorithm(QgsProcessingAlgorithm):
             if point_geom.isEmpty():
                 continue  # Skip empty geometries
 
-            point_xy = point_geom.asPoint()
+            # Geometry used for measurement (in paths CRS); the original
+            # point_geom is preserved for the output point feature.
+            measure_point_geom = QgsGeometry(point_geom)
+            if points_to_paths_xform is not None:
+                try:
+                    measure_point_geom.transform(points_to_paths_xform)
+                except Exception:
+                    feedback.pushWarning(
+                        self.tr('Failed to reproject point id={fid} to Paths CRS; skipping.').format(
+                            fid=point_feature.id()
+                        )
+                    )
+                    continue
+
+            point_xy = measure_point_geom.asPoint()
             
             nearest_dist = float('inf')
             nearest_dist_signed = None

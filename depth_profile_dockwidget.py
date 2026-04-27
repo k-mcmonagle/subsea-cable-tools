@@ -11,6 +11,7 @@ from qgis.core import (
 )
 from qgis.gui import QgsVertexMarker, QgsRubberBand
 from .maptools.temp_line_maptool import TempLineMapTool  # new temporary line drawing tool
+from .kp_range_utils import make_distance_area
 
 # Added standard library & third-party imports
 import math
@@ -72,10 +73,6 @@ class DepthProfileDockWidget(QDockWidget):
         self.segment_cross_span_m = []
         self.segment_seabed_length = []
         self.segment_euclidean_length = []
-        self.segment_lat_from = []
-        self.segment_lon_from = []
-        self.segment_lat_to = []
-        self.segment_lon_to = []
         self.segment_lat_from = []
         self.segment_lon_from = []
         self.segment_lat_to = []
@@ -657,9 +654,9 @@ class DepthProfileDockWidget(QDockWidget):
         # Drawn route
         try:
             if self.use_drawn_chk.isChecked() and self.temp_drawn_points and len(self.temp_drawn_points) >= 2:
-                da = QgsDistanceArea()
-                da.setSourceCrs(project.crs(), project.transformContext())
-                da.setEllipsoid(project.ellipsoid())
+                da = make_distance_area(
+                    project.crs(), project.transformContext(), project=project
+                )
                 length = 0.0
                 for a, b in zip(self.temp_drawn_points[:-1], self.temp_drawn_points[1:]):
                     length += float(da.measureLine(a, b))
@@ -673,9 +670,9 @@ class DepthProfileDockWidget(QDockWidget):
             line_layer = QgsProject.instance().mapLayer(layer_id) if layer_id else None
             if not line_layer or not isinstance(line_layer, QgsVectorLayer) or line_layer.geometryType() != QgsWkbTypes.LineGeometry:
                 return None
-            da = QgsDistanceArea()
-            da.setSourceCrs(line_layer.sourceCrs(), project.transformContext())
-            da.setEllipsoid(project.ellipsoid())
+            da = make_distance_area(
+                line_layer.sourceCrs(), project.transformContext(), project=project
+            )
             total = 0.0
             req = QgsFeatureRequest()
             try:
@@ -805,8 +802,9 @@ class DepthProfileDockWidget(QDockWidget):
             if len(self.temp_drawn_points) < 2:
                 ax.set_title("Drawn line must have at least 2 points"); self.canvas.draw(); return
             self.line_parts = [self.temp_drawn_points]
-            self.distance_area.setSourceCrs(project.crs(), project.transformContext())
-            self.distance_area.setEllipsoid(project.ellipsoid())
+            self.distance_area = make_distance_area(
+                project.crs(), project.transformContext(), project=project
+            )
             length = 0.0
             for a, b in zip(self.temp_drawn_points[:-1], self.temp_drawn_points[1:]):
                 length += self.distance_area.measureLine(a, b)
@@ -826,8 +824,9 @@ class DepthProfileDockWidget(QDockWidget):
             if merged.isEmpty():
                 ax.set_title("Merged route geometry empty"); self.canvas.draw(); return
             self.line_parts = merged.asMultiPolyline() if merged.isMultipart() else [merged.asPolyline()]
-            self.distance_area.setSourceCrs(line_layer.sourceCrs(), project.transformContext())
-            self.distance_area.setEllipsoid(project.ellipsoid())
+            self.distance_area = make_distance_area(
+                line_layer.sourceCrs(), project.transformContext(), project=project
+            )
             self.line_length = self.distance_area.measureLength(merged)
             self.current_line_crs = line_layer.sourceCrs()
             if self.line_length <= 0:
@@ -1288,9 +1287,9 @@ class DepthProfileDockWidget(QDockWidget):
                 if rupx > 0 and rupy > 0:
                     if raster_crs.isGeographic():
                         # Convert degrees to meters at raster center using ellipsoidal measurement.
-                        da = QgsDistanceArea()
-                        da.setSourceCrs(raster_crs, QgsProject.instance().transformContext())
-                        da.setEllipsoid(QgsProject.instance().ellipsoid())
+                        da = make_distance_area(
+                            raster_crs, QgsProject.instance().transformContext()
+                        )
                         c = raster_layer.extent().center()
                         p0 = QgsPointXY(c.x(), c.y())
                         px = QgsPointXY(c.x() + rupx, c.y())

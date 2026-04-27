@@ -14,6 +14,7 @@ import re
 from typing import List, Optional, Sequence, Tuple
 
 from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from ..kp_range_utils import make_distance_area
 from qgis.core import (
     QgsCoordinateTransform,
     QgsDistanceArea,
@@ -215,9 +216,9 @@ class AddDepthToPointLayerAlgorithm(QgsProcessingAlgorithm):
 
             dist_area = None
             if lyr.crs().isGeographic():
-                dist_area = QgsDistanceArea()
-                dist_area.setSourceCrs(lyr.crs(), context.transformContext())
-                dist_area.setEllipsoid(context.project().ellipsoid())
+                dist_area = make_distance_area(
+                    lyr.crs(), context.transformContext(), project=context.project()
+                )
 
             for feat in feat_iter:
                 g = feat.geometry()

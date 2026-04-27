@@ -47,7 +47,7 @@ from qgis.core import (
     QgsLayoutExporter,
 )
 
-from ..kp_range_utils import extract_line_segment, measure_total_length_m
+from ..kp_range_utils import extract_line_segment, make_distance_area, measure_total_length_m
 
 
 def _safe_filename(value: str) -> str:
@@ -414,9 +414,9 @@ Output:
             if rpl_geom is None:
                 raise QgsProcessingException(self.tr('Reference RPL line layer has no valid geometry.'))
 
-            distance_calculator = QgsDistanceArea()
-            distance_calculator.setSourceCrs(rpl_source.sourceCrs(), context.transformContext())
-            distance_calculator.setEllipsoid(context.project().ellipsoid())
+            distance_calculator = make_distance_area(
+                rpl_source.sourceCrs(), context.transformContext(), project=context.project()
+            )
             total_length_m = float(measure_total_length_m(rpl_geom, distance_calculator))
             total_length_km = total_length_m / 1000.0
 

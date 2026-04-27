@@ -44,7 +44,13 @@ from qgis.core import (
     QgsWkbTypes,
 )
 
-from ..kp_range_utils import extract_line_segment, measure_total_length_m
+from ..kp_range_utils import (
+    extract_line_segment,
+    make_distance_area,
+    measure_total_length_m,
+    add_distance_mode_parameter,
+    read_distance_mode,
+)
 
 
 @dataclass
@@ -141,6 +147,8 @@ class ExtractKPRangesRuleBasedAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
+        add_distance_mode_parameter(self)
+
     # --------------------------- Core ---------------------------
 
     def processAlgorithm(self, parameters, context, feedback):
@@ -161,9 +169,14 @@ class ExtractKPRangesRuleBasedAlgorithm(QgsProcessingAlgorithm):
 
         line_crs = rpl_source.sourceCrs()
 
-        distance_area = QgsDistanceArea()
-        distance_area.setSourceCrs(line_crs, context.transformContext())
-        distance_area.setEllipsoid(context.project().ellipsoid())
+        distance_mode = read_distance_mode(self, parameters, context)
+        try:
+            distance_area = make_distance_area(
+                line_crs, context.transformContext(),
+                mode=distance_mode, project=context.project(),
+            )
+        except ValueError as exc:
+            raise QgsProcessingException(str(exc))
 
         route_parts, per_feature_parts = self._collect_route_parts(rpl_source, feedback)
         if not route_parts:

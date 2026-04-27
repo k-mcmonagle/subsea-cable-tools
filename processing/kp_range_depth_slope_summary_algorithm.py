@@ -9,6 +9,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import math
 
 from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from ..kp_range_utils import make_distance_area
 from qgis.core import (
     QgsCoordinateTransform,
     QgsDistanceArea,
@@ -320,9 +321,9 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
         if sink is None:
             raise QgsProcessingException(self.invalidSinkError(parameters, self.OUTPUT))
 
-        distance_area = QgsDistanceArea()
-        distance_area.setSourceCrs(line_crs, context.transformContext())
-        distance_area.setEllipsoid(context.project().ellipsoid())
+        distance_area = make_distance_area(
+            line_crs, context.transformContext(), project=context.project()
+        )
 
         features = list(source.getFeatures())
         total = len(features)
@@ -527,9 +528,9 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
                 rupy = abs(float(raster_layer.rasterUnitsPerPixelY()))
                 if rupx > 0 and rupy > 0:
                     if raster_crs.isGeographic():
-                        da = QgsDistanceArea()
-                        da.setSourceCrs(raster_crs, context.transformContext())
-                        da.setEllipsoid(context.project().ellipsoid())
+                        da = make_distance_area(
+                            raster_crs, context.transformContext(), project=context.project()
+                        )
                         c = raster_layer.extent().center()
                         p0 = QgsPointXY(c.x(), c.y())
                         px = QgsPointXY(c.x() + rupx, c.y())

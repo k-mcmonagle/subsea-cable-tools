@@ -5,6 +5,27 @@ All notable changes to the Subsea Cable Tools QGIS plugin will be documented in 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.1] - Unreleased
+
+Maintenance and consistency release focused on distance/KP measurement and CRS handling. No new tools and (by design) no behaviour change for existing workflows when defaults are kept.
+
+### Added
+- **Distance mode option** on KP-emitting processing algorithms (Place KP Points Along Route, Place KP Points from CSV, Place Single KP Point, Find Nearest KP, KP Range CSV, KP Range Highlighter, Extract KP Ranges Rule Based, Extract A/C Points): choose **Ellipsoidal (geodesic, recommended)** — the existing default — or **Cartesian (planar, projected CRS only)**. Cartesian mode is rejected (with a clear error) when the input CRS is geographic.
+- **Shared `make_distance_area` helper** in `kp_range_utils.py` so every tool builds its `QgsDistanceArea` the same way and falls back to WGS84 when the project ellipsoid is unset.
+
+### Changed
+- **KP Data Plotter:** measurements are now performed in the line-layer CRS; the on-map marker is reprojected to the project CRS at display time. Reference and route layers no longer need to share a CRS for correct KPs (matching CRSes still recommended for best display performance).
+- **Find Nearest KP** (`processing/nearest_kp_algorithm.py`): mismatched Points/Paths CRSes are now reprojected automatically with a feedback warning instead of being rejected outright. Distances are computed in the Paths-layer CRS.
+- **Place KP Points Along Route** (`processing/place_kp_points_algorithm.py`): when a depth raster is provided in a different CRS, sample points are now reprojected to the raster CRS instead of the algorithm refusing to run.
+- **Translate KP Between RPLs** (`processing/translate_kp_from_rpl_to_rpl_algorithm.py`): same-CRS requirement is retained (semantically, both layers must share the same reference frame), but the error message now names both layers' CRSes and recommends reprojecting one of them.
+- **Catenary Calculator (v1):** menu label now appended with " (Legacy)"; planned for removal in 1.6 in favour of Catenary Calculator V2.
+- **Documentation:** README updated with a "Distance & CRS methodology" section.
+
+### Fixed
+- **Empty-ellipsoid silent fallback:** several tools previously called `setEllipsoid(project.ellipsoid())` with no fallback. When the project ellipsoid was unset this silently disabled ellipsoidal mode, returning planar units (in degrees on a geographic CRS — wrong KPs). All call sites now go through `make_distance_area`, which applies a `WGS84` fallback when the project ellipsoid is empty.
+- **Place KP Points from CSV:** fixed a `NameError` (`source` undefined) introduced during the helper migration; the algorithm now builds its distance calculator from the input line layer.
+- **Depth Profile dock widget:** removed a duplicated initialisation block that re-initialised four `segment_*` lists during `__init__`.
+
 ## [1.5.0] - 2026-04-26
 
 This is the first published release since 1.3.0 and consolidates all stable improvements from internal 1.4.x development. Several experimental BETA tools that shipped in internal 1.4.x builds have been **temporarily withdrawn** pending further development; their source remains available on the `develop` branch on GitHub.

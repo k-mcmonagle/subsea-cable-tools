@@ -9,6 +9,7 @@ from qgis.PyQt.QtCore import QCoreApplication, QVariant
 from qgis.core import (QgsProcessing,
                        QgsFeatureSink,
                        QgsProcessingAlgorithm,
+                       QgsProcessingException,
                        QgsProcessingParameterFeatureSource,
                        QgsProcessingParameterFeatureSink,
                        QgsProcessingParameterNumber,
@@ -20,7 +21,12 @@ from qgis.core import (QgsProcessing,
                        QgsField,
                        QgsFields)
 
-from ..kp_range_utils import extract_line_segment
+from ..kp_range_utils import (
+    extract_line_segment,
+    make_distance_area,
+    add_distance_mode_parameter,
+    read_distance_mode,
+)
 
 class KPRangeHighlighterAlgorithm(QgsProcessingAlgorithm):
     """
@@ -77,6 +83,8 @@ class KPRangeHighlighterAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
+        add_distance_mode_parameter(self)
+
     def processAlgorithm(self, parameters, context, feedback):
         source = self.parameterAsSource(parameters, self.INPUT, context)
         start_kp = self.parameterAsDouble(parameters, self.START_KP, context)
@@ -108,9 +116,14 @@ class KPRangeHighlighterAlgorithm(QgsProcessingAlgorithm):
         else:
             line_parts = combined_geom.asMultiPolyline()
 
-        distance_calculator = QgsDistanceArea()
-        distance_calculator.setSourceCrs(source.sourceCrs(), context.transformContext())
-        distance_calculator.setEllipsoid(context.project().ellipsoid())
+        distance_mode = read_distance_mode(self, parameters, context)
+        try:
+            distance_calculator = make_distance_area(
+                source.sourceCrs(), context.transformContext(),
+                mode=distance_mode, project=context.project(),
+            )
+        except ValueError as exc:
+            raise QgsProcessingException(str(exc))
 
         # Convert KP to meters
         start_kp_m = start_kp * 1000

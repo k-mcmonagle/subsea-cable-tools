@@ -119,9 +119,10 @@ class SubseaCableTools:
         self.iface.addPluginToMenu(self.menu, self.depth_profile_action)
         self.actions.append(self.depth_profile_action)
 
-        # Add action for Catenary Calculator (unchanged)
+        # Add action for Catenary Calculator (legacy v1; planned for removal in 1.6 in favour of V2).
         icon_path = os.path.join(self.plugin_dir, 'catenary_icon.png')
-        self.catenary_action = QAction(QIcon(icon_path), "Catenary Calculator", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
+        self.catenary_action = QAction(QIcon(icon_path), "Catenary Calculator (Legacy)", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
+        self.catenary_action.setToolTip("Legacy Catenary Calculator. Planned for removal in 1.6; use Catenary Calculator V2.")
         self.catenary_action.triggered.connect(self.show_catenary_calculator)
         self.iface.addToolBarIcon(self.catenary_action)
         self.iface.addPluginToMenu(self.menu, self.catenary_action)
