@@ -23,6 +23,9 @@ changelog=Version 1.5.1:
   - KP Mouse Tool: range ring is now drawn as a true geodesic circle so its edge sits on the cursor regardless of the project CRS scale factor (fixes drift in Web Mercator etc.).
   - Reference-line input labels standardised to "Reference Line Layer" across processing algorithms (parameter IDs unchanged).
   - Catenary Calculator (v1) marked as Legacy; planned for removal in 1.6.
+  - Renamed "Import Bathy MDB" to "Import MDB" (it already imports any GeoMedia feature class, not just bathymetry); algorithm id unchanged so saved models still work.
+  - QGIS 4.0 / Qt6 readiness: matplotlib backend, sip and resources.py imports use the qgis.PyQt shim; deprecated FlagAdvanced replaced; metadata declares supportsQt6=True.
+  - Bug fixes: removed duplicate activateWindow() in Catenary Calculator V2; KP Plotter no longer offers line layers in the Data Table combo; Import Excel RPL warns on invalid column-letter inputs instead of silently skipping; removed risky __del__ destructor from KP Plotter dock widget.
   - Documentation refresh (README + CHANGELOG) covering CRS/distance methodology.
 
 Version 1.5.0 (2026-04-26): Many new processing tools and tool improvements (Extract KP Ranges Rule Based, Identify Features Intersecting RPL, RPL Route Comparison, Translate KP Between RPLs, Identify RPL Crossing Points, Identify RPL Area Listing, Merge/Group KP Range tables, KP Range Depth + Slope Summary, Identify Hazards in Lay Corridor, Export Chartlets, Plot Line Segments from Table, Extract A/C Points, Extract Lines Intersecting Polygons), Catenary Calculator V2, ellipsoidal/cartesian KP Mouse Tool, Depth Profile improvements, more flexible MDB import. Some in-development tools from unreleased internal builds have been withdrawn pending further work.
@@ -34,3 +37,4 @@ icon=icon.png
 experimental=False
 deprecated=False
 server=False
+supportsQt6=True

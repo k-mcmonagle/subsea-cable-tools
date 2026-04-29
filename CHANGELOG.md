@@ -20,6 +20,8 @@ Maintenance and consistency release focused on distance/KP measurement and CRS h
 - **Translate KP Between RPLs** (`processing/translate_kp_from_rpl_to_rpl_algorithm.py`): same-CRS requirement is retained (semantically, both layers must share the same reference frame), but the error message now names both layers' CRSes and recommends reprojecting one of them.
 - **Catenary Calculator (v1):** menu label now appended with " (Legacy)"; planned for removal in 1.6 in favour of Catenary Calculator V2.
 - **Reference-line input labels standardised** to "Reference Line Layer" across the KP-emitting and RPL processing algorithms (parameter IDs unchanged, so saved Processing models and scripts keep working).
+- **Import Bathy MDB → Import MDB:** renamed the user-facing label and refreshed help text to reflect that the tool already imports any GeoMedia MDB feature class (Point/LineString/Polygon/MultiPoint), not just bathymetry. Algorithm id (`import_bathy_mdb`) is unchanged so saved Processing models and scripts keep working.
+- **QGIS 4.0 / Qt6 readiness:** matplotlib backend imports (`backend_qt5agg` → `backend_qtagg` fallback) in Depth Profile, KP Data Plotter and Catenary Calculator; `import sip` switched to `from qgis.PyQt import sip` in the dock widgets and KP Mouse Tool; `resources.py` now uses the `qgis.PyQt` shim; deprecated `QgsProcessingParameterString.FlagAdvanced` replaced with `Qgis.ProcessingParameterFlag.Advanced` (with fallback). Plugin metadata now declares `supportsQt6=True`.
 - **Documentation:** README updated with a "Distance & CRS methodology" section.
 
 ### Fixed
@@ -27,6 +29,10 @@ Maintenance and consistency release focused on distance/KP measurement and CRS h
 - **Empty-ellipsoid silent fallback:** several tools previously called `setEllipsoid(project.ellipsoid())` with no fallback. When the project ellipsoid was unset this silently disabled ellipsoidal mode, returning planar units (in degrees on a geographic CRS — wrong KPs). All call sites now go through `make_distance_area`, which applies a `WGS84` fallback when the project ellipsoid is empty.
 - **Place KP Points from CSV:** fixed a `NameError` (`source` undefined) introduced during the helper migration; the algorithm now builds its distance calculator from the input line layer.
 - **Depth Profile dock widget:** removed a duplicated initialisation block that re-initialised four `segment_*` lists during `__init__`.
+- **Catenary Calculator V2:** removed a duplicate `activateWindow()` call left over from copy-paste.
+- **Import Excel RPL:** invalid column-letter inputs (e.g. typos like "AA1" or "ZZZZ") now raise a feedback warning instead of silently being treated as an empty/skipped column. Also replaced the deprecated `QgsProcessingParameterString.FlagAdvanced` reference for QGIS 4.x compatibility.
+- **KP Data Plotter:** non-spatial table layers are now the only layers offered in the Data Table combo (a stray `elif` branch was also adding line layers, which was rarely the intent). Removed unused `QgsMapLayerProxyModel` import and a duplicate `QgsWkbTypes` import.
+- **Dock widgets stability:** removed the `__del__` destructor on the KP Data Plotter dock widget (cleanup already runs from `closeEvent`). Python destructors during interpreter shutdown were the root cause of the access-violation crash fixed in 1.3.0; this removes the last remaining footgun ahead of the Qt6 migration.
 
 ## [1.5.0] - 2026-04-26
 

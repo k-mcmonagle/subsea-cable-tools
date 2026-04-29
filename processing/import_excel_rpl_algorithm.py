@@ -68,6 +68,15 @@ def col_letter_to_index(letter):
         result = result * 26 + (ord(char) - ord('A') + 1)
     return result
 
+def is_valid_col_letter(letter):
+    """Return True if the string is empty/"0" (meaning 'skip column') or a valid Excel column letter."""
+    if letter is None:
+        return True
+    s = letter.strip()
+    if s == "" or s == "0":
+        return True
+    return all('A' <= ch <= 'Z' for ch in s.upper())
+
 class ImportExcelRPLAlgorithm(QgsProcessingAlgorithm):
     """
     A QGIS Processing Algorithm that:
@@ -248,7 +257,14 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
             defaultValue="",
             optional=True
         )
-        info_param.setFlags(info_param.flags() | QgsProcessingParameterString.FlagAdvanced)
+        # Use the modern Qgis.ProcessingParameterFlag.Advanced when available (QGIS 3.36+/4.x);
+        # fall back to the deprecated alias on older builds.
+        try:
+            from qgis.core import Qgis
+            _advanced_flag = Qgis.ProcessingParameterFlag.Advanced
+        except Exception:
+            _advanced_flag = QgsProcessingParameterString.FlagAdvanced
+        info_param.setFlags(info_param.flags() | _advanced_flag)
         self.addParameter(info_param)
 
         # -- Mandatory columns for Points --
@@ -494,6 +510,16 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
 
         # Extract file name for traceability
         source_file_name = os.path.basename(excel_file)
+
+        # Validate any user-supplied column letters; warn on typos (non-letter input)
+        # so the user isn't silently given an empty column.
+        for key in param_keys:
+            val = self.parameterAsString(parameters, key, context)
+            if not is_valid_col_letter(val):
+                feedback.pushWarning(
+                    f"Column letter for '{key}' is not a valid Excel column ('{val}'). "
+                    "Treating as empty/skip. Use letters A-Z (or AA, AB, ...), or leave blank/0 to skip."
+                )
 
         # Convert column letters to numeric indexes
         p_col_posno   = col_letter_to_index(self.parameterAsString(parameters, self.COL_POSNO, context))

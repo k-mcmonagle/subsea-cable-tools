@@ -171,8 +171,6 @@ class SubseaCableTools:
         self.catenary_calculator_dialog.raise_()
         self.catenary_calculator_dialog.activateWindow()
 
-        self.first_start = True
-
     def show_catenary_calculator_v2(self):
         if self.catenary_calculator_v2_dialog is None:
             try:
@@ -192,9 +190,6 @@ class SubseaCableTools:
         self.catenary_calculator_v2_dialog.show()
         self.catenary_calculator_v2_dialog.raise_()
         self.catenary_calculator_v2_dialog.activateWindow()
-        self.catenary_calculator_v2_dialog.activateWindow()
-
-        self.first_start = True
 
     def unload(self):
         """Remove the plugin menu items and icons from QGIS GUI and clean up all resources."""

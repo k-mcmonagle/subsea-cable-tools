@@ -3,12 +3,10 @@
 These are intentionally light-weight and meant to be run from the QGIS Python
 console (so the QGIS API is available). There is no CI integration.
 
-Usage (from the QGIS Python console):
-
-    from subsea_cable_tools.tests import test_distance_round_trip
-    test_distance_round_trip.run_all()
-
-Each check prints PASS / FAIL and returns a list of failures.
+The plugin folder name contains hyphens (``subsea-cable-tools``) which Python
+cannot import directly. See ``test_kp_geo_utils`` for a paste-ready runner
+snippet that registers the plugin under the importable alias
+``subsea_cable_tools`` before importing this module.
 """
 
 from __future__ import annotations

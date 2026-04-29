@@ -18,16 +18,23 @@ import math
 import bisect
 import numpy as np
 from matplotlib.figure import Figure
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas, NavigationToolbar2QT as NavigationToolbar
+try:
+    # QGIS 3.x typically ships matplotlib with the Qt5 backend
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas, NavigationToolbar2QT as NavigationToolbar
+except Exception:  # pragma: no cover - QGIS 4.x / Qt6
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas, NavigationToolbar2QT as NavigationToolbar
 
 # Simple sip deletion check fallback
 try:  # sip is available in QGIS Python env; guard for static analysis
-    import sip  # type: ignore
-
+    from qgis.PyQt import sip  # type: ignore
     _sip_isdeleted = sip.isdeleted
 except Exception:  # pragma: no cover
-    def _sip_isdeleted(_obj):
-        return False
+    try:
+        import sip  # type: ignore
+        _sip_isdeleted = sip.isdeleted
+    except Exception:
+        def _sip_isdeleted(_obj):
+            return False
 
 
 class DepthProfileDockWidget(QDockWidget):

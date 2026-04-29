@@ -2,9 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 ImportBathyMdbAlgorithm: Imports GeoMedia MDB feature tables into QGIS.
-Relies on user-provided CRS. Adds 'depth' and 'source' attributes.
-Handles Point, LineString, Polygon, and MultiPoint geometries (2D and 3D).
-By default loads LineString (contour lines) and Polygon (seabed features) layers.
+Despite the historical "Bathy" name, this tool imports any GeoMedia MDB feature
+class (Point, LineString, Polygon, MultiPoint, 2D and 3D), not just bathymetric
+data. It relies on a user-provided CRS and adds 'depth' and 'source' attributes.
+The algorithm id (`import_bathy_mdb`) is kept for backwards compatibility with
+saved Processing models; the user-facing display name is "Import MDB".
 """
 
 import os
@@ -816,7 +818,7 @@ class ImportBathyMdbAlgorithm(QgsProcessingAlgorithm):
         return 'import_bathy_mdb'
 
     def displayName(self):
-        return self.tr('Import Bathy MDB')
+        return self.tr('Import MDB')
 
     def group(self):
         return self.tr('MDB Tools')
@@ -831,16 +833,16 @@ class ImportBathyMdbAlgorithm(QgsProcessingAlgorithm):
         return ImportBathyMdbAlgorithm()
 
     def shortHelpString(self):
-        return self.tr("""<h3>Import Bathy MDB (Experimental)</h3>
+        return self.tr("""<h3>Import MDB (Experimental)</h3>
 <p><b><font color="red">Warning:</font> This tool is experimental and may not work with all GeoMedia-formatted MDB files. Use with caution.</b></p>
-<p>This tool attempts to import feature tables from a Microsoft Access Database (.mdb) file, typically created by Intergraph GeoMedia, into QGIS as new memory layers.</p>
+<p>This tool imports feature tables from a Microsoft Access Database (.mdb) file, typically created by Intergraph GeoMedia, into QGIS as new memory layers. It is not limited to bathymetry &ndash; any GeoMedia feature class (contours, seabed classifications, survey points, infrastructure polygons, etc.) can be loaded.</p>
 
 <h4>How it Works</h4>
 <p>The tool connects to the MDB file and looks for a <code>GFeatures</code> table to identify the feature classes within the database. For each feature class found, it reads the geometry from a binary (BLOB) field and creates a corresponding QGIS layer.</p>
-<p>By default, the tool imports <b>LineString</b> layers (e.g. bathymetric contour lines), <b>Polygon</b> layers (e.g. seabed feature classifications, sediment type areas), and <b>Point</b> layers. Each geometry type is loaded as a separate layer so they never conflict. MultiPoint geometries can be included by setting the <code>SUBSEA_MDB_LOAD_ALL_GEOMS=1</code> environment variable.</p>
+<p>By default, the tool imports <b>LineString</b> layers (e.g. bathymetric contour lines, cable routes), <b>Polygon</b> layers (e.g. seabed feature classifications, sediment type areas, restricted areas), and <b>Point</b> layers (e.g. survey points, fixes, assets). Each geometry type is loaded as a separate layer so they never conflict. MultiPoint geometries can be included by setting the <code>SUBSEA_MDB_LOAD_ALL_GEOMS=1</code> environment variable.</p>
 <p>It automatically adds two fields to each new layer:
 <ul>
-  <li><b>depth:</b> The average Z-value of the feature's vertices, if available.</li>
+  <li><b>depth:</b> The average Z-value of the feature's vertices, if available (useful for bathymetric data; will be empty/zero for non-3D features).</li>
   <li><b>source:</b> The filename of the source MDB file for traceability.</li>
 </ul>
 </p>

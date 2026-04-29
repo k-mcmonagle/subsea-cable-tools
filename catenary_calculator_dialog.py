@@ -7,7 +7,10 @@ No extra dependencies required beyond QGIS (PyQt5, matplotlib, shapely for DXF e
 """
 from qgis.PyQt.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox, QPushButton, QTextEdit, QWidget, QFormLayout, QSizePolicy, QFileDialog, QDoubleSpinBox)
 from qgis.PyQt.QtCore import Qt, QSettings
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+try:
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+except Exception:  # pragma: no cover - QGIS 4.x / Qt6
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 try:
     import numpy as np

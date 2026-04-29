@@ -1,18 +1,27 @@
 from qgis.PyQt.QtWidgets import QDockWidget, QVBoxLayout, QWidget, QComboBox, QLabel, QListWidget, QPushButton, QListWidgetItem, QAbstractItemView, QTabWidget, QHBoxLayout, QCheckBox, QGroupBox, QRadioButton, QButtonGroup
 from qgis.PyQt.QtCore import Qt
-from qgis.core import QgsProject, QgsVectorLayer, QgsMapLayerProxyModel, QgsWkbTypes, QgsGeometry, QgsPointXY, QgsWkbTypes, QgsDistanceArea, QgsCoordinateTransform
+from qgis.core import QgsProject, QgsVectorLayer, QgsWkbTypes, QgsGeometry, QgsPointXY, QgsDistanceArea, QgsCoordinateTransform
 from qgis.gui import QgsVertexMarker
 from .kp_range_utils import make_distance_area
 try:  # Safe sip import for deleted checks
-    import sip  # type: ignore
+    from qgis.PyQt import sip  # type: ignore
     _sip_isdeleted = sip.isdeleted
 except Exception:  # pragma: no cover
-    def _sip_isdeleted(_obj):
-        return False
+    try:
+        import sip  # type: ignore
+        _sip_isdeleted = sip.isdeleted
+    except Exception:
+        def _sip_isdeleted(_obj):
+            return False
 # Matplotlib imports
 
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+try:
+    # QGIS 3.x typically ships matplotlib with the Qt5 backend
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+except Exception:  # pragma: no cover - QGIS 4.x / Qt6
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 import numpy as np
 
@@ -171,13 +180,6 @@ class KpPlotterDockWidget(QDockWidget):
         except Exception:
             pass  # Fallback if iface.mainWindow() is not available
 
-    def __del__(self):
-        """Destructor to ensure cleanup on object deletion."""
-        try:
-            self.cleanup_matplotlib_resources_on_close()
-        except Exception:
-            pass  # Ignore any errors during destruction
-
     def populate_layer_combos(self):
         """
         Populate the line and table layer combo boxes with current project layers.
@@ -190,13 +192,10 @@ class KpPlotterDockWidget(QDockWidget):
                 # Reference line: only line geometry
                 if layer.geometryType() == QgsWkbTypes.LineGeometry:
                     self.line_layer_combo.addItem(layer.name(), layer.id())
-                # Table: non-spatial (no geometry) or any vector layer
+                # Table: only non-spatial / no-geometry layers (line layers are
+                # excluded here to keep the Data Table combo focused).
                 is_table = (not layer.isSpatial()) or (layer.geometryType() == QgsWkbTypes.NullGeometry)
                 if is_table and layer.id() not in table_ids:
-                    self.table_layer_combo.addItem(layer.name(), layer.id())
-                    table_ids.add(layer.id())
-                # Optionally, also allow all vector layers (for flexibility, but avoid duplicates)
-                elif layer.id() not in table_ids:
                     self.table_layer_combo.addItem(layer.name(), layer.id())
                     table_ids.add(layer.id())
         self.update_field_lists()

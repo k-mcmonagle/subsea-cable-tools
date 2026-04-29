@@ -22,12 +22,16 @@ from qgis.core import (QgsWkbTypes, QgsGeometry, QgsProject, QgsDistanceArea,
 from qgis.gui import QgsMapTool, QgsRubberBand, QgsVertexMarker
 import math
 try:  # sip is available in QGIS Python env; guard for static analysis
-    import sip  # type: ignore
+    from qgis.PyQt import sip  # type: ignore
     _sip_isdeleted = sip.isdeleted
 except Exception:  # pragma: no cover
-    sip = None
-    def _sip_isdeleted(obj):
-        return False
+    try:
+        import sip  # type: ignore
+        _sip_isdeleted = sip.isdeleted
+    except Exception:
+        sip = None
+        def _sip_isdeleted(obj):
+            return False
 
 
 class KPMouseMapTool(QgsMapTool):
@@ -1348,9 +1352,6 @@ class KPMouseMapTool(QgsMapTool):
                 self.iface.mainWindow().statusBar().showMessage("Range/Bearing cleared (ESC).", 2000)
         except Exception:
             pass
-
-    def __del__(self):
-        pass
 
 class KPPointDialog(QDialog):
     """Dialog to confirm/edit attributes for a placed KP point."""
