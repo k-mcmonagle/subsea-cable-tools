@@ -324,7 +324,7 @@ class SubseaCableTools:
                 return
 
             self.plotter_dock = KpPlotterDockWidget(self.iface)
-            self.iface.addDockWidget(Qt.RightDockWidgetArea, self.plotter_dock)
+            self.iface.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.plotter_dock)
         self.plotter_dock.show()
 
     def show_depth_profile(self):
@@ -344,7 +344,7 @@ class SubseaCableTools:
                 return
 
             self.depth_profile_dock = DepthProfileDockWidget(self.iface)
-            self.iface.addDockWidget(Qt.RightDockWidgetArea, self.depth_profile_dock)
+            self.iface.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.depth_profile_dock)
         self.depth_profile_dock.show()
 
     def activate_transit_measure_tool(self):

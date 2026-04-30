@@ -15,22 +15,12 @@ hasProcessingProvider=yes
 
 # changelog
 changelog=Version 1.5.1:
-  - Centralised distance/KP measurement via a single helper so all tools consistently use the project ellipsoid (with a WGS84 fallback when unset). Every QgsDistanceArea in the plugin now flows through this helper.
-  - KP-emitting processing algorithms gained an Ellipsoidal / Cartesian distance-mode option (default Ellipsoidal; no behaviour change).
-  - KP Plotter now measures KP in the line-layer CRS and reprojects the on-map marker; reference and route layers no longer need matching CRSes.
-  - Find Nearest KP and Place KP Points (raster sampling) now auto-reproject mismatched inputs with a feedback warning instead of refusing to run.
-  - Translate KP Between RPLs: clearer same-CRS error message that names both layers' CRSes.
-  - KP Mouse Tool: range ring is now drawn as a true geodesic circle so its edge sits on the cursor regardless of the project CRS scale factor (fixes drift in Web Mercator etc.). Cartesian-mode distance area is now well-defined on QGIS >= 3.30. Three remaining .exec_() dialog calls replaced with .exec() for Qt6.
-  - Fixed: RPL Route Comparison was missed by the centralisation pass and silently fell back to planar distances when the project ellipsoid was unset.
-  - Fixed: bare except: clauses in Calculate Seabed Length narrowed; Dynamic Buffer (Lay Corridor) group label corrected ("Other tools" -> "Other Tools") so it no longer creates a duplicate toolbox group.
-  - Reference-line input labels standardised to "Reference Line Layer" across processing algorithms (parameter IDs unchanged).
-  - Catenary Calculator (v1) marked as Legacy; planned for removal in 1.6.
-  - Renamed "Import Bathy MDB" to "Import MDB" (it already imports any GeoMedia feature class, not just bathymetry); algorithm id unchanged so saved models still work.
-  - QGIS 4.0 / Qt6 readiness: matplotlib backend, sip and resources.py imports use the qgis.PyQt shim; deprecated FlagAdvanced replaced; metadata declares supportsQt6=True.
-  - Removed: unused subsea_cable_tools_dialog.py / .ui and the dead run() method on the main plugin class.
-  - Internal: processing provider now grouped + sorted alphabetically; lib/ only added to sys.path when the host environment is missing a vendored library.
-
-Version 1.5.0 (2026-04-26): Many new processing tools and tool improvements (Extract KP Ranges Rule Based, Identify Features Intersecting RPL, RPL Route Comparison, Translate KP Between RPLs, Identify RPL Crossing Points, Identify RPL Area Listing, Merge/Group KP Range tables, KP Range Depth + Slope Summary, Identify Hazards in Lay Corridor, Export Chartlets, Plot Line Segments from Table, Extract A/C Points, Extract Lines Intersecting Polygons), Catenary Calculator V2, ellipsoidal/cartesian KP Mouse Tool, Depth Profile improvements, more flexible MDB import. Some in-development tools from unreleased internal builds have been withdrawn pending further work.
+  - Distance/KP measurement consolidated through a single helper that uses the project ellipsoid (with a WGS84 fallback when unset). Adds an Ellipsoidal/Cartesian distance-mode option to KP-emitting algorithms (default Ellipsoidal; no behaviour change).
+  - Geodesic interpolation: point_at_kp / extract_line_segment now follow the great circle on geographic CRSes instead of linearly interpolating in lon/lat. KP Mouse Tool range ring drawn as a true geodesic circle.
+  - CRS handling: KP Plotter, Find Nearest KP and Place KP Points (raster sampling) auto-reproject mismatched inputs with feedback warnings; Translate KP Between RPLs gives a clearer same-CRS error.
+  - QGIS 4.0 / Qt6 readiness: PyQt shim used throughout, scoped Qt enum names across all UI code, supportsQt6=True declared.
+  - Various fixes: RPL Route Comparison ellipsoid fallback, narrowed bare except clauses, Dynamic Buffer group label, dock-widget cleanup. Catenary Calculator v1 marked Legacy. Import Bathy MDB renamed to Import MDB.
+  - See CHANGELOG.md for the full list.
 tags=subsea, cable, telecoms, mapping, gis, qgis, lrs, kp, offshore, engineering, bathymetry, 
 
 homepage=https://github.com/k-mcmonagle/subsea-cable-tools

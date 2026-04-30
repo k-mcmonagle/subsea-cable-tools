@@ -33,7 +33,11 @@ class KpPlotterDockWidget(QDockWidget):
         super().__init__("KP Data Plotter", parent)
         self.iface = iface
         self.setObjectName("KpPlotterDockWidget")
-        self.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea | Qt.BottomDockWidgetArea)
+        self.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea
+            | Qt.DockWidgetArea.RightDockWidgetArea
+            | Qt.DockWidgetArea.BottomDockWidgetArea
+        )
 
         # QSettings for persistence
         from qgis.PyQt.QtCore import QSettings
@@ -163,7 +167,7 @@ class KpPlotterDockWidget(QDockWidget):
             "</ul>"
         )
         self.help_label = QLabel()
-        self.help_label.setTextFormat(Qt.RichText)
+        self.help_label.setTextFormat(Qt.TextFormat.RichText)
         self.help_label.setWordWrap(True)
         self.help_label.setText(help_text)
         self.help_layout.addWidget(self.help_label)
@@ -181,7 +185,7 @@ class KpPlotterDockWidget(QDockWidget):
             main_win = self.iface.mainWindow()
             # Remove from all dock areas first to avoid duplicate docking
             main_win.removeDockWidget(self)
-            main_win.addDockWidget(Qt.BottomDockWidgetArea, self)
+            main_win.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self)
         except Exception:
             pass  # Fallback if iface.mainWindow() is not available
 
@@ -371,7 +375,7 @@ class KpPlotterDockWidget(QDockWidget):
             import ast
             try:
                 axis_assignments = ast.literal_eval(axis_assignments)
-            except:
+            except (ValueError, SyntaxError):
                 axis_assignments = {}
 
         for field, axis in axis_assignments.items():
@@ -784,7 +788,7 @@ class KpPlotterDockWidget(QDockWidget):
         # Create marker on first valid move and add it to the scene
         if not self.marker:
             self.marker = QgsVertexMarker(self.iface.mapCanvas())
-            self.marker.setColor(Qt.red)
+            self.marker.setColor(Qt.GlobalColor.red)
             self.marker.setIconSize(12)
             self.marker.setIconType(QgsVertexMarker.ICON_CROSS)
             self.marker.setPenWidth(3)

@@ -42,7 +42,11 @@ class DepthProfileDockWidget(QDockWidget):
         super().__init__("Depth Profile", parent)
         self.iface = iface
         self.setObjectName("DepthProfileDockWidget")
-        self.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea | Qt.BottomDockWidgetArea)
+        self.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea
+            | Qt.DockWidgetArea.RightDockWidgetArea
+            | Qt.DockWidgetArea.BottomDockWidgetArea
+        )
         self.settings = QSettings()
         self._closing = False
         self._project_signals_connected = False
@@ -365,7 +369,7 @@ class DepthProfileDockWidget(QDockWidget):
             "</ul>"
         )
         help_label = QLabel()
-        help_label.setTextFormat(Qt.RichText)
+        help_label.setTextFormat(Qt.TextFormat.RichText)
         help_label.setWordWrap(True)
         help_label.setText(help_text)
         help_layout.addWidget(help_label)
@@ -411,7 +415,7 @@ class DepthProfileDockWidget(QDockWidget):
         self._connect_project_signals()
         # Dock placement (only once)
         try:
-            main_win = self.iface.mainWindow(); main_win.removeDockWidget(self); main_win.addDockWidget(Qt.BottomDockWidgetArea, self)
+            main_win = self.iface.mainWindow(); main_win.removeDockWidget(self); main_win.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self)
         except Exception:
             pass
 
@@ -514,9 +518,9 @@ class DepthProfileDockWidget(QDockWidget):
                     self.line_layer_combo.addItem(layer.name(), layer.id())
                 if isinstance(layer, QgsRasterLayer):
                     item = QListWidgetItem(layer.name())
-                    item.setData(Qt.UserRole, layer.id())
-                    item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                    item.setCheckState(Qt.Checked if layer.id() in prev_rasters else Qt.Unchecked)
+                    item.setData(Qt.ItemDataRole.UserRole, layer.id())
+                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    item.setCheckState(Qt.CheckState.Checked if layer.id() in prev_rasters else Qt.CheckState.Unchecked)
                     self.raster_layer_list.addItem(item)
                 if isinstance(layer, QgsVectorLayer) and layer.geometryType() == QgsWkbTypes.LineGeometry:
                     self.contour_layer_combo.addItem(layer.name(), layer.id())
@@ -534,7 +538,7 @@ class DepthProfileDockWidget(QDockWidget):
         # If nothing selected, default to first raster (previous behavior: single selection)
         if not self._get_selected_raster_layer_ids() and self.raster_layer_list.count() > 0:
             try:
-                self.raster_layer_list.item(0).setCheckState(Qt.Checked)
+                self.raster_layer_list.item(0).setCheckState(Qt.CheckState.Checked)
             except Exception:
                 pass
         if prev_contour:
@@ -1247,8 +1251,8 @@ class DepthProfileDockWidget(QDockWidget):
         try:
             for i in range(self.raster_layer_list.count()):
                 item = self.raster_layer_list.item(i)
-                if item and item.checkState() == Qt.Checked:
-                    layer_id = item.data(Qt.UserRole)
+                if item and item.checkState() == Qt.CheckState.Checked:
+                    layer_id = item.data(Qt.ItemDataRole.UserRole)
                     if layer_id:
                         ids.append(layer_id)
         except Exception:
@@ -1720,7 +1724,7 @@ class DepthProfileDockWidget(QDockWidget):
         self.side_cross_span_m = [None] * n
 
         progress = QProgressDialog("Computing side slope…", "Cancel", 0, n, self)
-        progress.setWindowModality(Qt.WindowModal)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(200)
         progress.setValue(0)
 
@@ -2296,7 +2300,7 @@ class DepthProfileDockWidget(QDockWidget):
             return
         if not self.marker:
             self.marker = QgsVertexMarker(self.iface.mapCanvas())
-            self.marker.setColor(Qt.blue)
+            self.marker.setColor(Qt.GlobalColor.blue)
             self.marker.setIconSize(10)
             self.marker.setIconType(QgsVertexMarker.ICON_CROSS)
             self.marker.setPenWidth(2)
@@ -2391,11 +2395,11 @@ class DepthProfileDockWidget(QDockWidget):
                 else:
                     # QgsRubberBand already imported at top
                     self.temp_line_rubber = QgsRubberBand(self.iface.mapCanvas(), QgsWkbTypes.LineGeometry)
-                    self.temp_line_rubber.setColor(Qt.yellow)
+                    self.temp_line_rubber.setColor(Qt.GlobalColor.yellow)
                     self.temp_line_rubber.setWidth(2)
                 if self.temp_line_rubber is None:
                     self.temp_line_rubber = QgsRubberBand(self.iface.mapCanvas(), QgsWkbTypes.LineGeometry)
-                    self.temp_line_rubber.setColor(Qt.yellow)
+                    self.temp_line_rubber.setColor(Qt.GlobalColor.yellow)
                     self.temp_line_rubber.setWidth(2)
                 for pt in points:
                     try: self.temp_line_rubber.addPoint(pt)

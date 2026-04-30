@@ -66,16 +66,16 @@ class TransitMeasureTool(QgsMapTool):
         self.canvas = iface.mapCanvas()
         self.dialog: Optional[TransitMeasureDialog] = None
         self.vertex_marker: Optional[QgsVertexMarker] = None
-        self.snap_color = QColor(Qt.magenta)
+        self.snap_color = QColor(Qt.GlobalColor.magenta)
         
         # Editing mode properties
         self.selected_waypoint_idx = None
         self.is_dragging = False
-        self.edit_cursor = Qt.OpenHandCursor
-        self.drag_cursor = Qt.ClosedHandCursor
+        self.edit_cursor = Qt.CursorShape.OpenHandCursor
+        self.drag_cursor = Qt.CursorShape.ClosedHandCursor
 
     def activate(self):  # noqa: D401
-        self.canvas.setCursor(Qt.CrossCursor)
+        self.canvas.setCursor(Qt.CursorShape.CrossCursor)
         if self.dialog is None:
             self.dialog = TransitMeasureDialog(self.iface, self)
         # Always show dialog when tool is activated
@@ -113,7 +113,7 @@ class TransitMeasureTool(QgsMapTool):
             self.dialog = None
 
     def keyPressEvent(self, event):
-        if event.key() in (Qt.Key_Escape,):
+        if event.key() in (Qt.Key.Key_Escape,):
             if self.dialog and self.dialog.is_active():
                 self.dialog.finish_path()
 
@@ -135,7 +135,7 @@ class TransitMeasureTool(QgsMapTool):
         if self.dialog.points:
             waypoint_idx = self._get_waypoint_at_position(pt)
             if waypoint_idx is not None:
-                if event.button() == Qt.RightButton:
+                if event.button() == Qt.MouseButton.RightButton:
                     # Right-click on waypoint: delete it
                     self.dialog.delete_waypoint(waypoint_idx)
                     return
@@ -147,7 +147,7 @@ class TransitMeasureTool(QgsMapTool):
                     self.dialog.highlight_waypoint(waypoint_idx)
                     return
         
-        if event.button() == Qt.RightButton:
+        if event.button() == Qt.MouseButton.RightButton:
             if self.dialog.is_active():
                 self.dialog.finish_path()
             return
@@ -186,7 +186,7 @@ class TransitMeasureTool(QgsMapTool):
             else:
                 if self.selected_waypoint_idx is not None:
                     self.selected_waypoint_idx = None
-                    self.canvas.setCursor(Qt.CrossCursor)
+                    self.canvas.setCursor(Qt.CursorShape.CrossCursor)
                     self.dialog.clear_waypoint_highlight()
         
         # Handle dragging
@@ -738,7 +738,7 @@ class TransitMeasureDialog(QDialog):
             QTableWidgetItem(self._format_duration(self._cumulative_time_for_index(row), self._time_unit()))
         ]
         for col, it in enumerate(items):
-            it.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+            it.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
             self.table.setItem(row, col, it)
 
     def _append_waypoint_row(self, wp_id: int, pt: QgsPointXY, dist_to_next: Optional[float], bearing_to_next: Optional[float], cum_m: float = None):
@@ -760,7 +760,7 @@ class TransitMeasureDialog(QDialog):
             QTableWidgetItem(self._format_duration(cum_t_s, unit) if speed_mps > 0 else "-")
         ]
         for col, it in enumerate(items):
-            it.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+            it.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
             self.waypoints_table.setItem(row, col, it)
 
     def _update_motion_row(self, dist_m: float, h1: float, h2: float):
@@ -775,7 +775,7 @@ class TransitMeasureDialog(QDialog):
             QTableWidgetItem(self._format_duration(self._cumulative_time_for_index(motion_row, include_motion=True), self._time_unit()))
         ]
         for col, it in enumerate(items):
-            it.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+            it.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
             self.table.setItem(motion_row, col, it)
 
     def _truncate_motion_row(self):

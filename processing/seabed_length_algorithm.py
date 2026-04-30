@@ -333,7 +333,13 @@ class SeabedLengthAlgorithm(QgsProcessingAlgorithm):
         return {self.OUTPUT: dest_id}
 
     def _calculate_seabed_length(self, geom, raster_layer, contour_layer, bathy_type, interval_m, line_crs, context, depth_field):
-        """Calculate seabed length by sampling depths along the geometry."""
+        """Calculate seabed length by sampling depths along the geometry.
+
+        Plan distances come from ``QgsDistanceArea`` configured for ellipsoidal
+        measurement, so they are metres regardless of the line CRS units. The
+        3D length is then ``sqrt(plan_m^2 + dz_m^2)``, which assumes ``z`` is
+        also in metres (the standard for bathymetry rasters / contours).
+        """
         distance_area = make_distance_area(
             line_crs, context.transformContext(), project=context.project()
         )

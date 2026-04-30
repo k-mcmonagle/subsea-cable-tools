@@ -25,12 +25,12 @@ class TempLineMapTool(QgsMapTool):
         self._rubber = QgsRubberBand(self.canvas, QgsWkbTypes.LineGeometry)
         self._rubber.setColor(self._color)
         self._rubber.setWidth(2)
-        self._rubber.setLineStyle(Qt.SolidLine)
+        self._rubber.setLineStyle(Qt.PenStyle.SolidLine)
 
         self._points = []  # committed vertices
         self._active = True
         self._has_preview = False  # indicates a provisional trailing vertex following mouse
-        self.setCursor(Qt.CrossCursor)
+        self.setCursor(Qt.CursorShape.CrossCursor)
         # Initial guidance message (single, longer duration)
         try:
             self.iface.messageBar().pushMessage(
@@ -43,7 +43,7 @@ class TempLineMapTool(QgsMapTool):
 
     # ---------------- Event handlers ---------------- #
     def keyPressEvent(self, event):  # noqa
-        if event.key() == Qt.Key_Escape:
+        if event.key() == Qt.Key.Key_Escape:
             self.cancel()
 
     def canvasPressEvent(self, event):  # noqa
@@ -53,9 +53,9 @@ class TempLineMapTool(QgsMapTool):
             self._rubber = QgsRubberBand(self.canvas, QgsWkbTypes.LineGeometry)
             self._rubber.setColor(self._color)
             self._rubber.setWidth(2)
-            self._rubber.setLineStyle(Qt.SolidLine)
+            self._rubber.setLineStyle(Qt.PenStyle.SolidLine)
 
-        if event.button() == Qt.LeftButton:
+        if event.button() == Qt.MouseButton.LeftButton:
             map_pt = self.toMapCoordinates(event.pos())
             if self._has_preview:
                 # Commit the preview point and create a fresh preview vertex
@@ -71,7 +71,7 @@ class TempLineMapTool(QgsMapTool):
                 except Exception:
                     pass
             # No per-point feedback; only initial message
-        elif event.button() == Qt.RightButton:
+        elif event.button() == Qt.MouseButton.RightButton:
             if len(self._points) >= 2:
                 self.finish()
             else:

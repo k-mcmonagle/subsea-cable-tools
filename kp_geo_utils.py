@@ -137,6 +137,48 @@ def measure_total_length_m(
     return float(total)
 
 
+def _interpolate_on_segment(
+    p1, p2, distance: QgsDistanceArea, target_dist_m: float, seg_len_m: float
+) -> QgsPointXY:
+    """Return the point at ``target_dist_m`` along the segment ``p1 -> p2``.
+
+    On geographic CRSes the point is forward-projected on the spheroid using
+    ``QgsDistanceArea.computeSpheroidProject`` (so the result lies on the
+    geodesic, matching the ``measureLine`` distance). On projected CRSes the
+    fast linear interpolation is used, which is exact in the segment's own
+    plane.
+
+    Falls back to linear interpolation if anything goes wrong.
+    """
+
+    src_crs = None
+    try:
+        src_crs = distance.sourceCrs()
+    except Exception:
+        src_crs = None
+
+    if (
+        src_crs is not None
+        and src_crs.isGeographic()
+        and hasattr(distance, "computeSpheroidProject")
+        and hasattr(distance, "bearing")
+        and seg_len_m > 0
+    ):
+        try:
+            p1_xy = QgsPointXY(p1)
+            p2_xy = QgsPointXY(p2)
+            az = float(distance.bearing(p1_xy, p2_xy))
+            pt = distance.computeSpheroidProject(p1_xy, float(target_dist_m), az)
+            return QgsPointXY(pt)
+        except Exception:
+            pass
+
+    ratio = (target_dist_m / seg_len_m) if seg_len_m > 0 else 0.0
+    x = float(p1.x()) + ratio * (float(p2.x()) - float(p1.x()))
+    y = float(p1.y()) + ratio * (float(p2.y()) - float(p1.y()))
+    return QgsPointXY(x, y)
+
+
 # ---------------------------------------------------------------------------
 # KP ↔ point primitives
 # ---------------------------------------------------------------------------
@@ -206,10 +248,9 @@ def point_at_kp(
                 last_point = QgsPointXY(p2)
 
                 if target_m <= next_cum:
-                    ratio = (target_m - cumulative) / seg_len
-                    x = float(p1.x()) + ratio * (float(p2.x()) - float(p1.x()))
-                    y = float(p1.y()) + ratio * (float(p2.y()) - float(p1.y()))
-                    return QgsPointXY(x, y)
+                    return _interpolate_on_segment(
+                        p1, p2, distance, target_m - cumulative, seg_len
+                    )
 
                 cumulative = next_cum
 
@@ -284,6 +325,13 @@ def _kp_along_geometry_m(
     ``snapped`` is assumed to lie on (or very near) ``geom``. Picks the segment
     whose perpendicular projection of ``snapped`` is closest, then sums prior
     segment lengths plus the partial length to the projection.
+
+    The per-segment projection is computed in planar coordinates of the
+    geometry's CRS. When ``snapped`` is the output of
+    ``QgsGeometry.nearestPoint`` (also planar in the geometry CRS) this is
+    consistent. The partial length is then scaled by the ellipsoidal
+    ``measureLine`` length, which is accurate in the small for short segments
+    even on geographic CRSes.
     """
 
     cumulative = 0.0
@@ -380,26 +428,26 @@ def extract_line_segment(
             next_cum = cumulative + seg_len
 
             if not started and next_cum >= start_m:
-                ratio = (start_m - cumulative) / seg_len
-                x = p1.x() + ratio * (p2.x() - p1.x())
-                y = p1.y() + ratio * (p2.y() - p1.y())
+                interp = _interpolate_on_segment(
+                    p1, p2, distance, start_m - cumulative, seg_len
+                )
                 try:
-                    segment_points.append(p1.__class__(x, y))
+                    segment_points.append(p1.__class__(interp.x(), interp.y()))
                 except Exception:
-                    segment_points.append(type(p1)(x, y))
+                    segment_points.append(type(p1)(interp.x(), interp.y()))
                 started = True
 
             if started:
                 if next_cum <= end_m:
                     segment_points.append(p2)
                 else:
-                    ratio = (end_m - cumulative) / seg_len
-                    x = p1.x() + ratio * (p2.x() - p1.x())
-                    y = p1.y() + ratio * (p2.y() - p1.y())
+                    interp = _interpolate_on_segment(
+                        p1, p2, distance, end_m - cumulative, seg_len
+                    )
                     try:
-                        segment_points.append(p1.__class__(x, y))
+                        segment_points.append(p1.__class__(interp.x(), interp.y()))
                     except Exception:
-                        segment_points.append(type(p1)(x, y))
+                        segment_points.append(type(p1)(interp.x(), interp.y()))
                     try:
                         return QgsGeometry.fromPolyline(segment_points)
                     except Exception:

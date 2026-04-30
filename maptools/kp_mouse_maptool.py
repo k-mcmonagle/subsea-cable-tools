@@ -125,7 +125,7 @@ class KPMouseMapTool(QgsMapTool):
         self.rubberBand = QgsRubberBand(self.canvas, QgsWkbTypes.LineGeometry)
         self.rubberBand.setColor(QColor(255, 0, 0))
         self.rubberBand.setWidth(2)
-        self.rubberBand.setLineStyle(Qt.DashLine)
+        self.rubberBand.setLineStyle(Qt.PenStyle.DashLine)
 
         self.closestPointMarker = QgsVertexMarker(self.canvas)
         self.closestPointMarker.setColor(QColor(0, 255, 0))
@@ -150,7 +150,7 @@ class KPMouseMapTool(QgsMapTool):
         self.persistent_tooltip_timer.timeout.connect(self.show_persistent_tooltip)
 
         # Cursor
-        self.canvas.setCursor(Qt.CrossCursor)
+        self.canvas.setCursor(Qt.CursorShape.CrossCursor)
 
         # Range/Bearing resources
         self.range_bearing_origin = None
@@ -388,7 +388,7 @@ class KPMouseMapTool(QgsMapTool):
 
     def canvasPressEvent(self, event):
         # Left click toggles range/bearing measurement: start -> stop -> start ...
-        if event.button() == Qt.LeftButton:
+        if event.button() == Qt.MouseButton.LeftButton:
             if self.range_bearing_origin is None:
                 # Start measurement
                 map_pt = self.toMapCoordinates(event.pos())
@@ -408,7 +408,7 @@ class KPMouseMapTool(QgsMapTool):
             return
 
         # Right click now opens context menu with placement options
-        if event.button() == Qt.RightButton:
+        if event.button() == Qt.MouseButton.RightButton:
             click_point = self.toMapCoordinates(event.pos())
             menu = QMenu(self.canvas)
 
@@ -1342,7 +1342,7 @@ class KPMouseMapTool(QgsMapTool):
 
     def keyPressEvent(self, event):  # type: ignore
         try:
-            if event.key() == Qt.Key_Escape and self.range_bearing_origin is not None:
+            if event.key() == Qt.Key.Key_Escape and self.range_bearing_origin is not None:
                 self.range_bearing_origin = None
                 self.rangeBearingOriginMarker.hide()
                 self._clear_range_bearing_graphics()
@@ -1625,18 +1625,13 @@ class KPConfigDialog(QDialog):
         total_length_planar_m = 0.0
         total_vertices = 0
 
-        d_ell = QgsDistanceArea()
-        d_ell.setSourceCrs(project_crs, transform_context)
-        d_ell.setEllipsoid(QgsProject.instance().ellipsoid() or "WGS84")
-        if hasattr(d_ell, "setEllipsoidalMode"):
-            d_ell.setEllipsoidalMode(True)
-
-        d_planar = QgsDistanceArea()
-        d_planar.setSourceCrs(project_crs, transform_context)
-        if hasattr(d_planar, "setEllipsoidalMode"):
-            d_planar.setEllipsoidalMode(False)
-
+        d_ell = make_distance_area(project_crs, transform_context, mode="ellipsoidal")
         planar_ok = not project_crs.isGeographic()
+        d_planar = (
+            make_distance_area(project_crs, transform_context, mode="cartesian")
+            if planar_ok
+            else None
+        )
 
         for feature in layer.getFeatures():
             geom = QgsGeometry(feature.geometry())

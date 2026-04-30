@@ -367,6 +367,48 @@ def test_rplcomparator_ellipsoid_fallback() -> bool:
         project.setEllipsoid(saved_ellipsoid)
 
 
+def test_geodesic_interpolation_long_geographic_segment() -> bool:
+    """On a long east-west geographic segment, ``point_at_kp`` must return a
+    point on the geodesic — not a planar lon/lat midpoint. The geodesic
+    between (-30, 60) and (30, 60) bows northward and has its midpoint near
+    (0, 62.6); the old planar code returned exactly (0, 60).
+    """
+
+    geom = _line("LINESTRING(-30 60, 30 60)")
+    da = _da_geog()
+    total_km = measure_total_length_m(geom, da) / 1000.0
+    mid = point_at_kp(geom, total_km / 2.0, da)
+    if mid is None:
+        return _result("geodesic interpolation on long geographic segment", False, "None")
+
+    geodesic_north = mid.y() - 60.0
+    ok = abs(mid.x()) < 1e-3 and geodesic_north > 1.0
+    return _result(
+        "geodesic interpolation on long geographic segment",
+        ok,
+        f"mid=({mid.x():.6f}, {mid.y():.6f}) geodesic_north_of_60={geodesic_north:.3f}deg",
+    )
+
+
+def test_geodesic_interpolation_projected_unchanged() -> bool:
+    """On a projected metre CRS, interpolation must remain exact-planar."""
+
+    # 1000 m east-west line in EPSG:32631 (UTM 31N, metres).
+    geom = QgsGeometry.fromWkt("LINESTRING(500000 4649776, 501000 4649776)")
+    da = _da_proj(32631)
+    pt = point_at_kp(geom, 0.5, da)
+    ok = (
+        pt is not None
+        and abs(pt.x() - 500500.0) < 1e-6
+        and abs(pt.y() - 4649776.0) < 1e-6
+    )
+    return _result(
+        "projected-CRS planar interpolation unchanged",
+        ok,
+        f"pt={pt and (pt.x(), pt.y())}",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -388,6 +430,8 @@ def run_all() -> List[bool]:
         test_extract_line_segment_out_of_range(),
         test_routeframe_total_length_and_extract(),
         test_rplcomparator_ellipsoid_fallback(),
+        test_geodesic_interpolation_long_geographic_segment(),
+        test_geodesic_interpolation_projected_unchanged(),
     ]
     print("")
     print(f"{sum(results)}/{len(results)} passed")

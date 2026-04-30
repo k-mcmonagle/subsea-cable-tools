@@ -2312,11 +2312,11 @@ class CatenaryCalculatorV2Dialog(QDialog):
         item.setToolTip("Double-click to pick a colour" if enabled else "(Colour applies to segment rows only)")
 
         flags = item.flags()
-        flags = flags & ~Qt.ItemIsEditable
+        flags = flags & ~Qt.ItemFlag.ItemIsEditable
         if enabled:
-            flags = flags | Qt.ItemIsEnabled
+            flags = flags | Qt.ItemFlag.ItemIsEnabled
         else:
-            flags = flags & ~Qt.ItemIsEnabled
+            flags = flags & ~Qt.ItemFlag.ItemIsEnabled
         item.setFlags(flags)
 
         if enabled and color_hex:

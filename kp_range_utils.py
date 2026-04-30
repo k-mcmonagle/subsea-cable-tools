@@ -123,7 +123,7 @@ def read_distance_mode(
 # ---------------------------------------------------------------------------
 
 from .kp_geo_utils import (  # noqa: E402,F401
-    iter_line_parts as _as_parts,
+    iter_line_parts,
     measure_total_length_m,
     extract_line_segment,
 )
