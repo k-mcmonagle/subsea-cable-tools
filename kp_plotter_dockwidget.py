@@ -45,7 +45,12 @@ class KpPlotterDockWidget(QDockWidget):
         self.features_geoms = []  # Store the geometries of the reference line features
         self.segment_lengths = [] # Store the lengths of the reference line segments
         self.line_length = 0 # Store the total length of the reference line
-        self.distance_area = QgsDistanceArea() # For measurements
+        # Placeholder distance area; reassigned via make_distance_area against the
+        # active reference-line CRS once a layer is loaded.
+        _project = QgsProject.instance()
+        self.distance_area = make_distance_area(
+            _project.crs(), _project.transformContext(), project=_project
+        )
 
         # Main widget and tab layout
         self.tab_widget = QTabWidget()

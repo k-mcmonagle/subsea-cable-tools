@@ -40,10 +40,10 @@ from qgis.core import (
     QgsPoint,
     QgsPointXY,
     QgsWkbTypes,
-    QgsDistanceArea,
 )
 
 from .rpl_comparison_utils import RPLComparator
+from ..kp_range_utils import make_distance_area
 
 
 class RPLRouteComparisonAlgorithm(QgsProcessingAlgorithm):
@@ -331,14 +331,15 @@ the design point to the as-laid point and includes the following attributes:
         
         # Step 3: Calculate offsets for each match
         feedback.pushInfo('Calculating offsets for matched events...')
-        distance_calc = QgsDistanceArea()
-        distance_calc.setSourceCrs(crs, context.transformContext())
-        
-        # Get ellipsoid from project or use default WGS84
-        ellipsoid = context.project().ellipsoid() if context.project() else 'WGS84'
-        if ellipsoid:
-            distance_calc.setEllipsoid(ellipsoid)
-            feedback.pushInfo(f'Using ellipsoid: {ellipsoid}')
+        # Use the shared helper so the WGS84 fallback is applied when the
+        # project ellipsoid is unset (matches every other KP-emitting tool).
+        try:
+            distance_calc = make_distance_area(
+                crs, context.transformContext(), project=context.project()
+            )
+        except ValueError as exc:
+            raise QgsProcessingException(str(exc))
+        feedback.pushInfo(f'Using ellipsoid: {distance_calc.ellipsoid()}')
         
         # Step 2.5: Extract alter course KPs from design route
         feedback.pushInfo('Extracting alter courses from design route...')

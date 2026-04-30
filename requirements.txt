@@ -1,2 +1,6 @@
+# These libraries are vendored under ./lib/ and added to sys.path at plugin
+# load time, so end users do not need to install anything. This file is kept
+# only for development / CI environments that want to install matching versions
+# (e.g. for running the tests outside of QGIS).
 openpyxl
 pyqtgraph>=0.12.0

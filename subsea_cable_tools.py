@@ -15,8 +15,6 @@ from qgis.core import QgsApplication
 
 # Load Qt resources
 from .resources import *
-# Import your plugin’s main dialog (if you have one)
-from .subsea_cable_tools_dialog import SubseaCableToolsDialog
 # Import the KP Mouse Tool (map tool integration)
 from .maptools.kp_mouse_maptool import KPMouseTool
 
@@ -57,7 +55,6 @@ class SubseaCableTools:
         # Core state
         self.actions = []
         self.menu = self.tr(u'&Subsea Cable Tools')
-        self.first_start = None
 
         # Components
         self.kp_mouse_tool = KPMouseTool(self.iface)
@@ -349,17 +346,6 @@ class SubseaCableTools:
             self.depth_profile_dock = DepthProfileDockWidget(self.iface)
             self.iface.addDockWidget(Qt.RightDockWidgetArea, self.depth_profile_dock)
         self.depth_profile_dock.show()
-
-    def run(self):
-        """Run method (e.g. open a dialog)."""
-        if self.first_start:
-            self.first_start = False
-            self.dlg = SubseaCableToolsDialog()
-        self.dlg.show()
-        result = self.dlg.exec_()
-        if result:
-            # Add additional functionality here if needed.
-            pass
 
     def activate_transit_measure_tool(self):
         if self.transit_measure_tool is None:

@@ -908,7 +908,7 @@ Missing depth handling:
         return self.tr('Dynamic Buffer (Lay Corridor)')
 
     def group(self):
-        return self.tr('Other tools')
+        return self.tr('Other Tools')
 
     def groupId(self):
         return 'other_tools'

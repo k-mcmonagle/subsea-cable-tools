@@ -1,12 +1,18 @@
 # -*- coding: utf-8 -*-
 
-# Ensure bundled libraries in 'lib/' are available for import
+# Make bundled libraries in 'lib/' importable, but only for modules that aren't
+# already available in the host QGIS Python environment. This avoids polluting
+# the global import path when QGIS already ships a compatible version.
 import os
 import sys
-plugin_dir = os.path.dirname(__file__)
-lib_dir = os.path.join(plugin_dir, 'lib')
-if lib_dir not in sys.path:
-    sys.path.insert(0, lib_dir)
+import importlib.util
+
+_plugin_dir = os.path.dirname(__file__)
+_lib_dir = os.path.join(_plugin_dir, 'lib')
+_VENDORED_MODULES = ('openpyxl', 'pyqtgraph', 'et_xmlfile')
+if os.path.isdir(_lib_dir) and _lib_dir not in sys.path:
+    if any(importlib.util.find_spec(name) is None for name in _VENDORED_MODULES):
+        sys.path.insert(0, _lib_dir)
 
 # noinspection PyPep8Naming
 def classFactory(iface):  # pylint: disable=invalid-name

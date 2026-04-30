@@ -197,7 +197,7 @@ class SeabedLengthAlgorithm(QgsProcessingAlgorithm):
         if do_sensitivity:
             try:
                 sensitivity_intervals = [int(x.strip()) for x in sensitivity_intervals_str.split(',')]
-            except:
+            except (ValueError, AttributeError):
                 sensitivity_intervals = [1, 5, 10, 25, 50, 100]
 
         # Prepare output fields (always include all possible fields)
@@ -525,7 +525,7 @@ class SeabedLengthAlgorithm(QgsProcessingAlgorithm):
                 transform = QgsCoordinateTransform(line_crs, raster_layer.crs(), QgsProject.instance())
                 try:
                     sample_point = transform.transform(point)
-                except:
+                except Exception:
                     return None
 
             # Sample raster

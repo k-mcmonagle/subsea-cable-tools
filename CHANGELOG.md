@@ -14,6 +14,11 @@ Maintenance and consistency release focused on distance/KP measurement and CRS h
 - **Shared `make_distance_area` helper** in `kp_range_utils.py` so every tool builds its `QgsDistanceArea` the same way and falls back to WGS84 when the project ellipsoid is unset.
 
 ### Changed
+- **Centralised distance/KP measurement:** every `QgsDistanceArea` in the plugin (KP Mouse Tool, Transit Measure Tool, KP Data Plotter, Depth Profile, RPL Route Comparison, all KP-emitting processing algorithms) now flows through `make_distance_area`. Removes several duplicated builder blocks and guarantees the WGS84 fallback is applied.
+- **Processing provider** (`subsea_cable_processing_provider.py`): algorithms are grouped by toolbox group and sorted alphabetically within each group, for easier maintenance and PR diffs.
+- **Vendored libraries:** `lib/` is only added to `sys.path` when at least one of `openpyxl` / `pyqtgraph` / `et_xmlfile` is missing from the host environment, avoiding global path pollution when QGIS already ships a compatible version.
+
+### Changed
 - **KP Data Plotter:** measurements are now performed in the line-layer CRS; the on-map marker is reprojected to the project CRS at display time. Reference and route layers no longer need to share a CRS for correct KPs (matching CRSes still recommended for best display performance).
 - **Find Nearest KP** (`processing/nearest_kp_algorithm.py`): mismatched Points/Paths CRSes are now reprojected automatically with a feedback warning instead of being rejected outright. Distances are computed in the Paths-layer CRS.
 - **Place KP Points Along Route** (`processing/place_kp_points_algorithm.py`): when a depth raster is provided in a different CRS, sample points are now reprojected to the raster CRS instead of the algorithm refusing to run.
@@ -25,6 +30,12 @@ Maintenance and consistency release focused on distance/KP measurement and CRS h
 - **Documentation:** README updated with a "Distance & CRS methodology" section.
 
 ### Fixed
+- **RPL Route Comparison:** distance calculator now goes through `make_distance_area`. Previously it called `setEllipsoid(project.ellipsoid())` directly with no fallback, so an unset project ellipsoid silently disabled ellipsoidal mode and produced planar/degree distances on geographic CRSes.
+- **Calculate Seabed Length:** narrowed two bare `except:` clauses (which would have swallowed `KeyboardInterrupt` / `SystemExit`).
+- **Dynamic Buffer (Lay Corridor):** group label corrected from `"Other tools"` to `"Other Tools"` so the algorithm joins the rest of the Other Tools group instead of creating a duplicate.
+- **Plugin entry points:** removed an unused `run()` method on the main plugin class along with its dead `SubseaCableToolsDialog` import and `.ui` file (the dialog was never wired to any action and `run()` would have raised `AttributeError` if invoked).
+- **KP Mouse Tool (Qt6):** replaced three remaining `.exec_()` dialog calls with `.exec()` for PyQt6 compatibility.
+- **KP Mouse Tool / cartesian mode:** previously, on QGIS ≥ 3.30 (where `setEllipsoidalMode()` is gone) selecting cartesian mode left the distance area in an undefined state. Building via the shared helper now correctly leaves the ellipsoid unset for planar measurements.
 - **KP Mouse Tool — range ring alignment:** the dashed range ring rendered around the click origin now sits exactly on the cursor's reported geodesic range. The ring is built as a true geodesic circle on the spheroid (sampled with `QgsDistanceArea.computeSpheroidProject` and transformed back to the project CRS), instead of an Euclidean / flat-Earth approximation. Previously the ring drifted off the cursor whenever the project CRS had a non-unity scale factor at that location (e.g. Web Mercator at high latitudes) or used non-metre map units. The same fix applies to the saved "Place Range Ring" polygon feature.
 - **Empty-ellipsoid silent fallback:** several tools previously called `setEllipsoid(project.ellipsoid())` with no fallback. When the project ellipsoid was unset this silently disabled ellipsoidal mode, returning planar units (in degrees on a geographic CRS — wrong KPs). All call sites now go through `make_distance_area`, which applies a `WGS84` fallback when the project ellipsoid is empty.
 - **Place KP Points from CSV:** fixed a `NameError` (`source` undefined) introduced during the helper migration; the algorithm now builds its distance calculator from the input line layer.

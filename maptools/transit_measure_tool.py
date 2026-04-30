@@ -263,13 +263,11 @@ class TransitMeasureDialog(QDialog):
         self.original_point_color = QColor(255, 170, 0)
         self.highlight_color = QColor(255, 0, 0)
 
-        self.da = QgsDistanceArea()
+        from ..kp_range_utils import make_distance_area
         proj = QgsProject.instance()
-        self.da.setSourceCrs(proj.crs(), proj.transformContext())
-        ellipsoid_id = proj.ellipsoid() or 'WGS84'
-        self.da.setEllipsoid(ellipsoid_id)
-        if hasattr(self.da, "setEllipsoidalMode"):
-            self.da.setEllipsoidalMode(True)
+        self.da = make_distance_area(
+            proj.crs(), proj.transformContext(), project=proj
+        )
 
         self.point_rb = QgsRubberBand(self.canvas, QgsWkbTypes.PointGeometry)
         self.point_rb.setColor(QColor(255, 170, 0))

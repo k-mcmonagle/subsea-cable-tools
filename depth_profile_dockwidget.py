@@ -49,7 +49,12 @@ class DepthProfileDockWidget(QDockWidget):
         # Internal runtime state
         self.line_parts = []
         self.line_length = 0.0
-        self.distance_area = QgsDistanceArea()
+        # Placeholder distance area; reassigned via make_distance_area against the
+        # active reference-line CRS once a route is loaded.
+        _project = QgsProject.instance()
+        self.distance_area = make_distance_area(
+            _project.crs(), _project.transformContext(), project=_project
+        )
         self.marker = None
         self.vertical_line = None
         self.vertical_line2 = None  # for dual plot

@@ -36,35 +36,50 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
 
         QgsMessageLog.logMessage('Loading Subsea Cable Tools algorithms...', 'Subsea Cable Tools', Qgis.Info)
 
-        safe_add('kp_range_highlighter_algorithm', 'KPRangeHighlighterAlgorithm')
+        # Algorithms are listed by toolbox group, then alphabetically by class
+        # name within each group. Adding a new algorithm? Slot it into the right
+        # group block to keep diffs small.
+
+        # --- KP Ranges ---
         safe_add('kp_range_csv_algorithm', 'KPRangeCSVAlgorithm')
-        safe_add('kp_range_extract_rule_based_algorithm', 'ExtractKPRangesRuleBasedAlgorithm')
-        safe_add('kp_range_merge_tables_algorithm', 'KPRangeMergeTablesAlgorithm')
-        safe_add('kp_range_group_adjacent_algorithm', 'KPRangeGroupAdjacentAlgorithm')
         safe_add('kp_range_depth_slope_summary_algorithm', 'KPRangeDepthSlopeSummaryAlgorithm')
-        safe_add('import_excel_rpl_algorithm', 'ImportExcelRPLAlgorithm')
+        safe_add('kp_range_extract_rule_based_algorithm', 'ExtractKPRangesRuleBasedAlgorithm')
+        safe_add('kp_range_group_adjacent_algorithm', 'KPRangeGroupAdjacentAlgorithm')
+        safe_add('kp_range_highlighter_algorithm', 'KPRangeHighlighterAlgorithm')
+        safe_add('kp_range_merge_tables_algorithm', 'KPRangeMergeTablesAlgorithm')
+
+        # --- KP Points ---
+        safe_add('add_depth_to_point_layer_algorithm', 'AddDepthToPointLayerAlgorithm')
         safe_add('nearest_kp_algorithm', 'NearestKPAlgorithm')
-        safe_add('import_bathy_mdb_algorithm', 'ImportBathyMdbAlgorithm')
         safe_add('place_kp_points_algorithm', 'PlaceKpPointsAlgorithm')
         safe_add('place_kp_points_from_csv_algorithm', 'PlaceKpPointsFromCsvAlgorithm')
         safe_add('place_single_kp_point_algorithm', 'PlaceSingleKpPointAlgorithm')
-        safe_add('add_depth_to_point_layer_algorithm', 'AddDepthToPointLayerAlgorithm')
+
+        # --- RPL Tools ---
+        safe_add('extract_ac_points_algorithm', 'ExtractACPointsAlgorithm')
+        safe_add('identify_rpl_area_listing_algorithm', 'IdentifyRPLAreaListingAlgorithm')
+        safe_add('identify_rpl_crossing_points_algorithm', 'IdentifyRPLCrossingPointsAlgorithm')
+        safe_add('identify_rpl_lay_corridor_proximity_listing_algorithm', 'IdentifyRPLLayCorridorProximityListingAlgorithm')
+        safe_add('import_excel_rpl_algorithm', 'ImportExcelRPLAlgorithm')
+        safe_add('rpl_route_comparison_algorithm', 'RPLRouteComparisonAlgorithm')
+        safe_add('seabed_length_algorithm', 'SeabedLengthAlgorithm')
+        safe_add('translate_kp_from_rpl_to_rpl_algorithm', 'TranslateKPFromRPLToRPLAlgorithm')
+
+        # --- MDB Tools ---
+        safe_add('import_bathy_mdb_algorithm', 'ImportBathyMdbAlgorithm')
+
+        # --- MBES Tools ---
         safe_add('create_mbes_raster_from_xyz_algorithm', 'CreateMBESRasterFromXYZAlgorithm')
         safe_add('merge_mbes_rasters_algorithm', 'MergeMBESRastersAlgorithm')
+
+        # --- Other Tools ---
+        safe_add('dynamic_buffer_lay_corridor_algorithm', 'DynamicBufferLayCorridorAlgorithm')
+        safe_add('export_kp_section_chartlets_algorithm', 'ExportKPSectionChartletsAlgorithm')
+        safe_add('extract_lines_intersecting_polygons_algorithm', 'ExtractLinesIntersectingPolygonsAlgorithm')
         safe_add('import_cable_lay_algorithm', 'ImportCableLayAlgorithm')
         safe_add('import_ship_outline_algorithm', 'ImportShipOutlineAlgorithm')
         safe_add('place_ship_outlines_algorithm', 'PlaceShipOutlinesAlgorithm')
         safe_add('plot_line_segments_from_table_algorithm', 'PlotLineSegmentsFromTableAlgorithm')
-        safe_add('translate_kp_from_rpl_to_rpl_algorithm', 'TranslateKPFromRPLToRPLAlgorithm')
-        safe_add('rpl_route_comparison_algorithm', 'RPLRouteComparisonAlgorithm')
-        safe_add('seabed_length_algorithm', 'SeabedLengthAlgorithm')
-        safe_add('dynamic_buffer_lay_corridor_algorithm', 'DynamicBufferLayCorridorAlgorithm')
-        safe_add('extract_ac_points_algorithm', 'ExtractACPointsAlgorithm')
-        safe_add('identify_rpl_crossing_points_algorithm', 'IdentifyRPLCrossingPointsAlgorithm')
-        safe_add('identify_rpl_area_listing_algorithm', 'IdentifyRPLAreaListingAlgorithm')
-        safe_add('identify_rpl_lay_corridor_proximity_listing_algorithm', 'IdentifyRPLLayCorridorProximityListingAlgorithm')
-        safe_add('extract_lines_intersecting_polygons_algorithm', 'ExtractLinesIntersectingPolygonsAlgorithm')
-        safe_add('export_kp_section_chartlets_algorithm', 'ExportKPSectionChartletsAlgorithm')
 
 
     def id(self):

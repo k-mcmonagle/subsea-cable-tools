@@ -21,6 +21,8 @@ from qgis.core import (QgsWkbTypes, QgsGeometry, QgsProject, QgsDistanceArea,
                        Qgis, QgsVectorLayer, QgsField, QgsFeature, QgsRaster, QgsSpatialIndex)
 from qgis.gui import QgsMapTool, QgsRubberBand, QgsVertexMarker
 import math
+
+from ..kp_range_utils import make_distance_area
 try:  # sip is available in QGIS Python env; guard for static analysis
     from qgis.PyQt import sip  # type: ignore
     _sip_isdeleted = sip.isdeleted
@@ -77,10 +79,9 @@ class KPMouseMapTool(QgsMapTool):
         self.copyLatLonFormat = (copyLatLonFormat or "DD").upper()
         self.copyLatLonStyle = (copyLatLonStyle or "LABELLED").upper()
 
-        # Distance / chainage preparation
-        self.distanceArea = QgsDistanceArea()
+        # Distance / chainage preparation. Geometries are transformed into the
+        # project CRS below, so we build the distance area against the project CRS.
         project_crs = self.canvas.mapSettings().destinationCrs()
-        self.distanceArea.setSourceCrs(project_crs, QgsProject.instance().transformContext())
         # Guard: planar/cartesian measurements in a geographic CRS would return degrees.
         # We disable cartesian here to prevent silently wrong results (the config dialog
         # also disables the option when the project CRS is geographic).
@@ -95,14 +96,11 @@ class KPMouseMapTool(QgsMapTool):
                 )
             except Exception:
                 pass
-        if self.useCartesian:
-            if hasattr(self.distanceArea, "setEllipsoidalMode"):
-                self.distanceArea.setEllipsoidalMode(False)
-        else:
-            ellipsoid = QgsProject.instance().ellipsoid() or 'WGS84'
-            self.distanceArea.setEllipsoid(ellipsoid)
-            if hasattr(self.distanceArea, "setEllipsoidalMode"):
-                self.distanceArea.setEllipsoidalMode(True)
+        self.distanceArea = make_distance_area(
+            project_crs,
+            QgsProject.instance().transformContext(),
+            mode="cartesian" if self.useCartesian else "ellipsoidal",
+        )
 
         # Cache line geometries
         self.features_geoms = []
@@ -184,18 +182,17 @@ class KPMouseMapTool(QgsMapTool):
             return
 
         # Set up distance measurements (ellipsoidal or planar).
-        self.distanceArea = QgsDistanceArea()
         project_crs = self.canvas.mapSettings().destinationCrs()
-        self.distanceArea.setSourceCrs(project_crs, QgsProject.instance().transformContext())
-        if self.useCartesian:
-            # Planar/cartesian in project CRS (units depend on CRS).
-            if hasattr(self.distanceArea, "setEllipsoidalMode"):
-                self.distanceArea.setEllipsoidalMode(False)
-        else:
-            ellipsoid = QgsProject.instance().ellipsoid() or "WGS84"
-            self.distanceArea.setEllipsoid(ellipsoid)
-            if hasattr(self.distanceArea, "setEllipsoidalMode"):
-                self.distanceArea.setEllipsoidalMode(True)
+        if self.useCartesian and project_crs.isGeographic():
+            # Defensive: cartesian on a geographic CRS yields degrees. Fall back
+            # silently here (the constructor / config dialog will have already
+            # surfaced this to the user the first time).
+            self.useCartesian = False
+        self.distanceArea = make_distance_area(
+            project_crs,
+            QgsProject.instance().transformContext(),
+            mode="cartesian" if self.useCartesian else "ellipsoidal",
+        )
 
         # Cache geometries and their lengths in project CRS
         self.features_geoms = []
@@ -479,7 +476,7 @@ class KPMouseMapTool(QgsMapTool):
                     initial = None
 
             dialog = GoToKPDialog(self.iface.mainWindow(), min_kp, max_kp, initial_kp_km=initial)
-            if not dialog.exec_():
+            if not dialog.exec():
                 return
 
             kp_km = dialog.chosen_kp_km()
@@ -753,7 +750,7 @@ class KPMouseMapTool(QgsMapTool):
 
             dlg = KPPointDialog(self.iface.mainWindow(), kp=kp_val, rkp=rkp_val, dcc=dcc_val,
                                  ref_line=self.layer.name() if self.layer else "", comment="")
-            if dlg.exec_() != QDialog.Accepted:
+            if dlg.exec() != QDialog.Accepted:
                 return
             comment_text = dlg.get_comment()
 
@@ -943,7 +940,7 @@ class KPMouseMapTool(QgsMapTool):
                                    bearing=bearing_deg, 
                                    range_unit=self.measurementUnit,
                                    ref_line=self.layer.name() if self.layer else "")
-            if dlg.exec_() != QDialog.Accepted:
+            if dlg.exec() != QDialog.Accepted:
                 return
             comment_text = dlg.get_comment()
 
@@ -2213,18 +2210,13 @@ class KPMouseTool:
             self.actionGoToKP.setEnabled(False)
 
     def _make_distance_area(self) -> QgsDistanceArea:
-        distance = QgsDistanceArea()
         project_crs = self.iface.mapCanvas().mapSettings().destinationCrs()
-        distance.setSourceCrs(project_crs, QgsProject.instance().transformContext())
-        if self.useCartesian:
-            if hasattr(distance, "setEllipsoidalMode"):
-                distance.setEllipsoidalMode(False)
-        else:
-            ellipsoid = QgsProject.instance().ellipsoid() or "WGS84"
-            distance.setEllipsoid(ellipsoid)
-            if hasattr(distance, "setEllipsoidalMode"):
-                distance.setEllipsoidalMode(True)
-        return distance
+        use_cartesian = self.useCartesian and not project_crs.isGeographic()
+        return make_distance_area(
+            project_crs,
+            QgsProject.instance().transformContext(),
+            mode="cartesian" if use_cartesian else "ellipsoidal",
+        )
 
     def _iter_reference_geometries_project_crs(self):
         """Yield reference layer geometries transformed to project CRS."""
