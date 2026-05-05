@@ -20,7 +20,7 @@ from qgis.core import (QgsWkbTypes, QgsGeometry, QgsProject, QgsDistanceArea,
                        QgsPointXY, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
                        Qgis, QgsVectorLayer, QgsField, QgsFeature, QgsRaster, QgsSpatialIndex)
 from qgis.gui import QgsMapTool, QgsRubberBand, QgsVertexMarker
-from ..qgis_compat import QAction, DIALOG_ACCEPTED, qt_exec, DISTANCE_METERS, FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_LONG_LONG, FIELD_TYPE_STRING, GEOMETRY_LINE, GEOMETRY_POINT, GEOMETRY_POLYGON, LAYER_RASTER, LAYER_VECTOR, MESSAGE_CRITICAL, MESSAGE_INFO, MESSAGE_SUCCESS, MESSAGE_WARNING
+from ..qgis_compat import QAction, DIALOG_ACCEPTED, qt_exec, DISTANCE_METERS, FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_LONG_LONG, FIELD_TYPE_STRING, GEOMETRY_LINE, GEOMETRY_POINT, GEOMETRY_POLYGON, LAYER_RASTER, LAYER_VECTOR, MESSAGE_CRITICAL, MESSAGE_INFO, MESSAGE_SUCCESS, MESSAGE_WARNING, TOOLBUTTON_POPUP_MODE_MENU_BUTTON
 import math
 
 from ..kp_range_utils import make_distance_area
@@ -1918,7 +1918,7 @@ class KPMouseTool:
         self.toolButton.setCheckable(True)
         self.toolButton.toggled.connect(self.toggle_tool)
         self.toolButton.setToolTip("Enable/Disable KP Mouse Tool")
-        self.toolButton.setPopupMode(QToolButton.MenuButtonPopup)
+        self.toolButton.setPopupMode(TOOLBUTTON_POPUP_MODE_MENU_BUTTON)
 
         menu = QMenu(self.toolButton)
         self.actionConfig = QAction("Configure...", self.iface.mainWindow())

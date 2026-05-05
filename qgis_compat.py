@@ -2,7 +2,7 @@
 """Compatibility aliases for QGIS 3/Qt5 and QGIS 4/Qt6."""
 
 from qgis.PyQt.QtCore import QMetaType
-from qgis.PyQt.QtWidgets import QAbstractItemView, QDialog, QSizePolicy
+from qgis.PyQt.QtWidgets import QAbstractItemView, QDialog, QSizePolicy, QToolButton
 
 try:
     from qgis.PyQt.QtCore import QVariant
@@ -64,6 +64,12 @@ SIZE_POLICY_EXPANDING = _scoped_member(QSizePolicy, "Policy", "Expanding")
 
 SELECTION_MODE_EXTENDED = _scoped_member(QAbstractItemView, "SelectionMode", "ExtendedSelection")
 SELECTION_MODE_SINGLE = _scoped_member(QAbstractItemView, "SelectionMode", "SingleSelection")
+
+TOOLBUTTON_POPUP_MODE_MENU_BUTTON = _scoped_member(
+    QToolButton,
+    "ToolButtonPopupMode",
+    "MenuButtonPopup",
+)
 
 MESSAGE_INFO = _scoped_member(Qgis, "MessageLevel", "Info")
 MESSAGE_WARNING = _scoped_member(Qgis, "MessageLevel", "Warning")
