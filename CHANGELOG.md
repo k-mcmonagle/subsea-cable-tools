@@ -49,6 +49,9 @@ Maintenance and consistency release focused on distance/KP measurement and CRS h
 - **Import Excel RPL:** invalid column-letter inputs (e.g. typos like "AA1" or "ZZZZ") now raise a feedback warning instead of silently being treated as an empty/skipped column. Also replaced the deprecated `QgsProcessingParameterString.FlagAdvanced` reference for QGIS 4.x compatibility.
 - **KP Data Plotter:** non-spatial table layers are now the only layers offered in the Data Table combo (a stray `elif` branch was also adding line layers, which was rarely the intent). Removed unused `QgsMapLayerProxyModel` import and a duplicate `QgsWkbTypes` import.
 - **Dock widgets stability:** removed the `__del__` destructor on the KP Data Plotter dock widget (cleanup already runs from `closeEvent`). Python destructors during interpreter shutdown were the root cause of the access-violation crash fixed in 1.3.0; this removes the last remaining footgun ahead of the Qt6 migration.
+- **KP Mouse Tool (Qt6) — dialog buttons:** `QDialogButtonBox` button constants (`Ok`, `Cancel`, etc.) are now accessed through the compatibility layer; PyQt6 moved these under `StandardButton` scope, causing `AttributeError` when opening the KP Config dialog on QGIS 4.
+- **KP Mouse Tool (Qt6) — event position:** `QgsMapMouseEvent.globalPos()` does not exist in QGIS 4 / PyQt6; replaced with a compatibility helper that returns `event.globalPos()` on QGIS 3 or falls back to `QCursor.pos()` on QGIS 4. Fixes tooltip positioning on mouse move.
+- **KP Mouse Tool — point placement visibility:** added immediate canvas refresh after placing a point or range ring, so the new feature appears instantly without requiring a manual pan or zoom. Previously the feature was added to the layer but the canvas wasn't redrawn.
 
 ## [1.5.0] - 2026-04-26
 

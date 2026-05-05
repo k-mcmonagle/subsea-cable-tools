@@ -20,7 +20,7 @@ from qgis.core import (QgsWkbTypes, QgsGeometry, QgsProject, QgsDistanceArea,
                        QgsPointXY, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
                        Qgis, QgsVectorLayer, QgsField, QgsFeature, QgsRaster, QgsSpatialIndex)
 from qgis.gui import QgsMapTool, QgsRubberBand, QgsVertexMarker
-from ..qgis_compat import QAction, DIALOG_ACCEPTED, qt_exec, DISTANCE_METERS, FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_LONG_LONG, FIELD_TYPE_STRING, GEOMETRY_LINE, GEOMETRY_POINT, GEOMETRY_POLYGON, LAYER_RASTER, LAYER_VECTOR, MESSAGE_CRITICAL, MESSAGE_INFO, MESSAGE_SUCCESS, MESSAGE_WARNING, TOOLBUTTON_POPUP_MODE_MENU_BUTTON
+from ..qgis_compat import QAction, DIALOG_ACCEPTED, qt_exec, DISTANCE_METERS, FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_LONG_LONG, FIELD_TYPE_STRING, GEOMETRY_LINE, GEOMETRY_POINT, GEOMETRY_POLYGON, LAYER_RASTER, LAYER_VECTOR, MESSAGE_CRITICAL, MESSAGE_INFO, MESSAGE_SUCCESS, MESSAGE_WARNING, TOOLBUTTON_POPUP_MODE_MENU_BUTTON, BUTTON_BOX_OK, BUTTON_BOX_CANCEL, BUTTON_BOX_CLOSE, BUTTON_BOX_ACCEPT_ROLE, get_event_global_pos
 import math
 
 from ..kp_range_utils import make_distance_area
@@ -353,7 +353,7 @@ class KPMouseMapTool(QgsMapTool):
         
         # Store the message and position for the timers.
         self.last_message = message
-        self.last_global_pos = event.globalPos()
+        self.last_global_pos = get_event_global_pos(event)
 
         # Append range & bearing info if origin set
         if self.range_bearing_origin is not None:
@@ -772,6 +772,7 @@ class KPMouseMapTool(QgsMapTool):
             pr.addFeatures([feat])
             layer.updateExtents()
             self.iface.layerTreeView().refreshLayerSymbology(layer.id())
+            self.canvas.refresh()
             msg = "Point placed at nearest KP" if snapped_to_kp else "Point placed"
             self.iface.mainWindow().statusBar().showMessage(msg, 3000)
             self.iface.messageBar().pushMessage("Success", msg, level=MESSAGE_SUCCESS, duration=2)
@@ -992,6 +993,7 @@ class KPMouseMapTool(QgsMapTool):
 
             self.iface.layerTreeView().refreshLayerSymbology(line_layer.id())
             self.iface.layerTreeView().refreshLayerSymbology(circle_layer.id())
+            self.canvas.refresh()
 
             msg = f"Range ring placed: {display_range:.2f} {self.measurementUnit} at {bearing_text}"
             self.iface.mainWindow().statusBar().showMessage(msg, 3000)
@@ -1376,7 +1378,7 @@ class KPPointDialog(QDialog):
         self.edit_ref = add_row("Ref Line", ref_line)
         self.edit_comment = add_row("Comment", comment, editable=True)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons = QDialogButtonBox(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -1413,7 +1415,7 @@ class KPRangeRingDialog(QDialog):
         self.edit_ref = add_row("Ref Line", ref_line)
         self.edit_comment = add_row("Comment", comment, editable=True)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons = QDialogButtonBox(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -1534,7 +1536,7 @@ class KPConfigDialog(QDialog):
         layout.addWidget(self.note_label)
 
         # Buttons
-        self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.button_box = QDialogButtonBox(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
         layout.addWidget(self.button_box)
@@ -1783,9 +1785,9 @@ class GoToKPDialog(QDialog):
         )
         layout.addWidget(self.range_label)
 
-        self.buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+        self.buttons = QDialogButtonBox(BUTTON_BOX_CANCEL)
         self.go_button = QPushButton("Go to")
-        self.buttons.addButton(self.go_button, QDialogButtonBox.AcceptRole)
+        self.buttons.addButton(self.go_button, BUTTON_BOX_ACCEPT_ROLE)
         self.buttons.rejected.connect(self.reject)
         self.go_button.clicked.connect(self._on_go)
         layout.addWidget(self.buttons)

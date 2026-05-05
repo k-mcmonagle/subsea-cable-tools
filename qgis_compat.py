@@ -2,7 +2,8 @@
 """Compatibility aliases for QGIS 3/Qt5 and QGIS 4/Qt6."""
 
 from qgis.PyQt.QtCore import QMetaType
-from qgis.PyQt.QtWidgets import QAbstractItemView, QDialog, QSizePolicy, QToolButton
+from qgis.PyQt.QtGui import QCursor
+from qgis.PyQt.QtWidgets import QAbstractItemView, QDialog, QSizePolicy, QToolButton, QDialogButtonBox
 
 try:
     from qgis.PyQt.QtCore import QVariant
@@ -112,3 +113,36 @@ FIELD_TYPE_DOUBLE = _field_type("Double", "Double")
 FIELD_TYPE_INT = _field_type("Int", "Int")
 FIELD_TYPE_LONG_LONG = _field_type("LongLong", "LongLong")
 FIELD_TYPE_BOOL = _field_type("Bool", "Bool")
+
+# QDialogButtonBox button constants - PyQt6 moved these under StandardButton scope
+BUTTON_BOX_OK = _scoped_member(QDialogButtonBox, "StandardButton", "Ok")
+BUTTON_BOX_CANCEL = _scoped_member(QDialogButtonBox, "StandardButton", "Cancel")
+BUTTON_BOX_CLOSE = _scoped_member(QDialogButtonBox, "StandardButton", "Close")
+BUTTON_BOX_HELP = _scoped_member(QDialogButtonBox, "StandardButton", "Help")
+BUTTON_BOX_YES = _scoped_member(QDialogButtonBox, "StandardButton", "Yes")
+BUTTON_BOX_NO = _scoped_member(QDialogButtonBox, "StandardButton", "No")
+BUTTON_BOX_SAVE = _scoped_member(QDialogButtonBox, "StandardButton", "Save")
+BUTTON_BOX_DISCARD = _scoped_member(QDialogButtonBox, "StandardButton", "Discard")
+
+# QDialogButtonBox button roles
+BUTTON_BOX_ACCEPT_ROLE = _scoped_member(QDialogButtonBox, "ButtonRole", "AcceptRole")
+
+
+def get_event_global_pos(event):
+    """
+    Get global screen position from a QGIS map mouse event.
+    
+    In QGIS 3 (Qt5), QgsMapMouseEvent has globalPos().
+    In QGIS 4 (Qt6), QgsMapMouseEvent does not have globalPos(), so we use QCursor.pos().
+    
+    Args:
+        event: QgsMapMouseEvent object
+    
+    Returns:
+        QPoint with global screen coordinates
+    """
+    if hasattr(event, 'globalPos'):
+        return event.globalPos()
+    else:
+        # Fallback for QGIS 4 - use current cursor position
+        return QCursor.pos()
