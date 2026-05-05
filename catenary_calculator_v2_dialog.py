@@ -39,6 +39,7 @@ from qgis.PyQt.QtWidgets import (
 from qgis.PyQt.QtCore import Qt, QSettings, QTimer
 from qgis.PyQt.QtGui import QColor
 from matplotlib.figure import Figure
+from .qgis_compat import SELECTION_MODE_SINGLE, SIZE_POLICY_EXPANDING
 from matplotlib.collections import LineCollection
 
 if TYPE_CHECKING:  # keep Pylance happy
@@ -1144,7 +1145,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             "Colour",
         ])
         self.assembly_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.assembly_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.assembly_table.setSelectionMode(SELECTION_MODE_SINGLE)
         self.assembly_table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked | QAbstractItemView.EditKeyPressed)
         header = self.assembly_table.horizontalHeader()
         if header is not None:
@@ -1254,7 +1255,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
         self.figure = Figure(figsize=(6, 5))
         self.canvas = FigureCanvas(self.figure)
-        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas.setSizePolicy(SIZE_POLICY_EXPANDING, SIZE_POLICY_EXPANDING)
         output_layout.addWidget(self.canvas, stretch=1)
 
         btns = QHBoxLayout()

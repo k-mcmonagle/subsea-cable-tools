@@ -37,7 +37,8 @@ from qgis.core import (
     QgsFields,
     QgsVectorLayer
 )
-from qgis.PyQt.QtCore import QVariant
+from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_STRING
+
 import math
 
 
@@ -558,10 +559,10 @@ class NearestKPAlgorithm(QgsProcessingAlgorithm):
             QgsFields: The new fields for the output points layer.
         """
         fields = QgsFields(input_fields)  # Correctly duplicate QgsFields
-        fields.append(QgsField('path_id', QVariant.Int))
-        fields.append(QgsField('distance_to_path_m', QVariant.Double))
-        fields.append(QgsField('kp_km', QVariant.Double))
-        fields.append(QgsField('kp_ref', QVariant.String))  # Added kp_ref
+        fields.append(QgsField('path_id', FIELD_TYPE_INT))
+        fields.append(QgsField('distance_to_path_m', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('kp_km', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('kp_ref', FIELD_TYPE_STRING))  # Added kp_ref
         return fields
 
     def _createLineOutputFields(self):
@@ -572,11 +573,11 @@ class NearestKPAlgorithm(QgsProcessingAlgorithm):
             QgsFields: The fields for the output lines layer.
         """
         fields = QgsFields()
-        fields.append(QgsField('point_id', QVariant.Int))
-        fields.append(QgsField('path_id', QVariant.Int))
-        fields.append(QgsField('distance_to_path_m', QVariant.Double))
-        fields.append(QgsField('kp_km', QVariant.Double))
-        fields.append(QgsField('kp_ref', QVariant.String))  # Added kp_ref
+        fields.append(QgsField('point_id', FIELD_TYPE_INT))
+        fields.append(QgsField('path_id', FIELD_TYPE_INT))
+        fields.append(QgsField('distance_to_path_m', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('kp_km', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('kp_ref', FIELD_TYPE_STRING))  # Added kp_ref
         return fields
 
     def _createPointOnLineFields(self, input_fields):
@@ -590,10 +591,10 @@ class NearestKPAlgorithm(QgsProcessingAlgorithm):
             QgsFields: The new fields for the Point on Line layer.
         """
         fields = QgsFields(input_fields)  # Duplicate input fields
-        fields.append(QgsField('kp_ref', QVariant.String))               # Add kp_ref
-        fields.append(QgsField('range_to_target_m', QVariant.Double))     # Add range_to_target
-        fields.append(QgsField('bearing_to_target_deg', QVariant.Double)) # Add bearing_to_target
-        fields.append(QgsField('kp_km', QVariant.Double))                 # Add kp_km
+        fields.append(QgsField('kp_ref', FIELD_TYPE_STRING))               # Add kp_ref
+        fields.append(QgsField('range_to_target_m', FIELD_TYPE_DOUBLE))     # Add range_to_target
+        fields.append(QgsField('bearing_to_target_deg', FIELD_TYPE_DOUBLE)) # Add bearing_to_target
+        fields.append(QgsField('kp_km', FIELD_TYPE_DOUBLE))                 # Add kp_km
         return fields
 
     def name(self):

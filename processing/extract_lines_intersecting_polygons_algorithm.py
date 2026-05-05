@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Set, Tuple
 
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
@@ -44,6 +44,7 @@ from qgis.core import (
     QgsVectorLayer,
     QgsWkbTypes,
 )
+from ..qgis_compat import FIELD_TYPE_LONG_LONG, FIELD_TYPE_STRING, GEOMETRY_LINE, GEOMETRY_POLYGON
 
 
 def _safe_field_base_name(name: str) -> str:
@@ -130,11 +131,11 @@ class ExtractLinesIntersectingPolygonsAlgorithm(QgsProcessingAlgorithm):
         if not line_layers:
             raise QgsProcessingException(self.tr('Please provide one or more input line layers.'))
 
-        if QgsWkbTypes.geometryType(polygon_layer.wkbType()) != QgsWkbTypes.PolygonGeometry:
+        if QgsWkbTypes.geometryType(polygon_layer.wkbType()) != GEOMETRY_POLYGON:
             raise QgsProcessingException(self.tr('Input polygon layer must be a polygon layer.'))
 
         for lyr in line_layers:
-            if QgsWkbTypes.geometryType(lyr.wkbType()) != QgsWkbTypes.LineGeometry:
+            if QgsWkbTypes.geometryType(lyr.wkbType()) != GEOMETRY_LINE:
                 raise QgsProcessingException(self.tr(f"Layer '{lyr.name()}' is not a line layer."))
 
         # Choose a working CRS for intersection/clipping.
@@ -226,9 +227,9 @@ class ExtractLinesIntersectingPolygonsAlgorithm(QgsProcessingAlgorithm):
         src_layer_id_field = _unique_field_name(existing_names, 'src_layer_id')
         src_fid_field = _unique_field_name(existing_names, 'src_fid')
 
-        out_fields.append(QgsField(src_layer_name_field, QVariant.String, '', 254, 0))
-        out_fields.append(QgsField(src_layer_id_field, QVariant.String, '', 254, 0))
-        out_fields.append(QgsField(src_fid_field, QVariant.LongLong))
+        out_fields.append(QgsField(src_layer_name_field, FIELD_TYPE_STRING, '', 254, 0))
+        out_fields.append(QgsField(src_layer_id_field, FIELD_TYPE_STRING, '', 254, 0))
+        out_fields.append(QgsField(src_fid_field, FIELD_TYPE_LONG_LONG))
 
         (sink, dest_id) = self.parameterAsSink(
             parameters,
@@ -322,9 +323,9 @@ class ExtractLinesIntersectingPolygonsAlgorithm(QgsProcessingAlgorithm):
 
                 # Ensure output geometry is line-like
                 try:
-                    if QgsWkbTypes.geometryType(geom_work.wkbType()) != QgsWkbTypes.LineGeometry:
+                    if QgsWkbTypes.geometryType(geom_work.wkbType()) != GEOMETRY_LINE:
                         # Intersection can yield GeometryCollection; try to extract line part.
-                        geom_work = geom_work.convertToType(QgsWkbTypes.LineGeometry, False)
+                        geom_work = geom_work.convertToType(GEOMETRY_LINE, False)
                 except Exception:
                     pass
 

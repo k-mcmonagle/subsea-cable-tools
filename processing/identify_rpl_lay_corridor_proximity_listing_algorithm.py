@@ -31,7 +31,7 @@ import json
 
 from typing import Any, Dict, List, Optional, Set
 
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
@@ -55,6 +55,7 @@ from qgis.core import (
     QgsVectorLayer,
     QgsWkbTypes,
 )
+from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_STRING, GEOMETRY_LINE, GEOMETRY_POINT, GEOMETRY_POLYGON
 
 from .rpl_comparison_utils import RPLComparator
 
@@ -207,20 +208,20 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException(self.tr('Please provide at least one point, line, or polygon layer.'))
 
         # Basic geometry type validation
-        if QgsWkbTypes.geometryType(rpl_layer.wkbType()) != QgsWkbTypes.LineGeometry:
+        if QgsWkbTypes.geometryType(rpl_layer.wkbType()) != GEOMETRY_LINE:
             raise QgsProcessingException(self.tr('Input RPL layer must be a line layer.'))
-        if use_corridor and QgsWkbTypes.geometryType(corridor_layer.wkbType()) != QgsWkbTypes.PolygonGeometry:
+        if use_corridor and QgsWkbTypes.geometryType(corridor_layer.wkbType()) != GEOMETRY_POLYGON:
             raise QgsProcessingException(self.tr('Input Lay Corridor layer must be a polygon layer.'))
         for lyr in point_layers:
-            if QgsWkbTypes.geometryType(lyr.wkbType()) != QgsWkbTypes.PointGeometry:
+            if QgsWkbTypes.geometryType(lyr.wkbType()) != GEOMETRY_POINT:
                 raise QgsProcessingException(self.tr(f"Layer '{lyr.name()}' is not a point layer."))
 
         for lyr in line_layers:
-            if QgsWkbTypes.geometryType(lyr.wkbType()) != QgsWkbTypes.LineGeometry:
+            if QgsWkbTypes.geometryType(lyr.wkbType()) != GEOMETRY_LINE:
                 raise QgsProcessingException(self.tr(f"Layer '{lyr.name()}' is not a line layer."))
 
         for lyr in area_layers:
-            if QgsWkbTypes.geometryType(lyr.wkbType()) != QgsWkbTypes.PolygonGeometry:
+            if QgsWkbTypes.geometryType(lyr.wkbType()) != GEOMETRY_POLYGON:
                 raise QgsProcessingException(self.tr(f"Layer '{lyr.name()}' is not a polygon layer."))
 
         # CRS handling:
@@ -261,15 +262,15 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
         rpl_dcc_field = _unique_field_name(existing_names, 'rpl_dcc')
         rpl_ref_field = _unique_field_name(existing_names, 'rpl_ref')
 
-        out_fields.append(QgsField(src_layer_name_field, QVariant.String, '', 254, 0))
-        out_fields.append(QgsField(src_fid_field, QVariant.Int))
+        out_fields.append(QgsField(src_layer_name_field, FIELD_TYPE_STRING, '', 254, 0))
+        out_fields.append(QgsField(src_fid_field, FIELD_TYPE_INT))
         # Prefer a generous length (works well in GPKG/Memory). Shapefile will truncate to 254.
-        out_fields.append(QgsField(src_attrs_field, QVariant.String, '', 10000, 0))
-        out_fields.append(QgsField(lat_field, QVariant.Double))
-        out_fields.append(QgsField(lon_field, QVariant.Double))
-        out_fields.append(QgsField(rpl_kp_field, QVariant.Double))
-        out_fields.append(QgsField(rpl_dcc_field, QVariant.Double))
-        out_fields.append(QgsField(rpl_ref_field, QVariant.String, '', 254, 0))
+        out_fields.append(QgsField(src_attrs_field, FIELD_TYPE_STRING, '', 10000, 0))
+        out_fields.append(QgsField(lat_field, FIELD_TYPE_DOUBLE))
+        out_fields.append(QgsField(lon_field, FIELD_TYPE_DOUBLE))
+        out_fields.append(QgsField(rpl_kp_field, FIELD_TYPE_DOUBLE))
+        out_fields.append(QgsField(rpl_dcc_field, FIELD_TYPE_DOUBLE))
+        out_fields.append(QgsField(rpl_ref_field, FIELD_TYPE_STRING, '', 254, 0))
 
         # Only create outputs for input types actually provided.
         point_sink = None
@@ -391,7 +392,7 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
             if feature_geom is None or feature_geom.isEmpty():
                 return None
             try:
-                if QgsWkbTypes.geometryType(feature_geom.wkbType()) == QgsWkbTypes.PointGeometry:
+                if QgsWkbTypes.geometryType(feature_geom.wkbType()) == GEOMETRY_POINT:
                     return QgsPointXY(feature_geom.asPoint())
             except Exception:
                 pass
@@ -546,7 +547,7 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
 
                         # Ensure output geometry type is appropriate for the sink.
                         try:
-                            target_type = QgsWkbTypes.LineGeometry if label == 'line' else QgsWkbTypes.PolygonGeometry
+                            target_type = GEOMETRY_LINE if label == 'line' else GEOMETRY_POLYGON
                             if QgsWkbTypes.geometryType(geom_out_for_output.wkbType()) != target_type:
                                 geom_out_for_output = geom_out_for_output.convertToType(target_type, False)
                         except Exception:

@@ -30,6 +30,7 @@ from qgis.core import (
     QgsPointXY,
     QgsWkbTypes,
 )
+from ..qgis_compat import GEOMETRY_POINT
 
 from ..kp_geo_utils import RouteFrame
 from ..kp_range_utils import make_distance_area
@@ -223,7 +224,7 @@ class RPLComparator:
 
         for feature in source_point_layer.getFeatures():
             point_geom = feature.geometry()
-            if point_geom.isEmpty() or point_geom.type() != QgsWkbTypes.PointGeometry:
+            if point_geom.isEmpty() or point_geom.type() != GEOMETRY_POINT:
                 continue
 
             point_xy = point_geom.asPoint()

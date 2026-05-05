@@ -9,6 +9,7 @@ from qgis.core import (
     QgsProject, QgsVectorLayer, QgsRasterLayer, QgsWkbTypes, QgsGeometry, QgsPointXY,
     QgsDistanceArea, QgsFeatureRequest, QgsCoordinateTransform, QgsSpatialIndex, QgsFeature
 )
+from .qgis_compat import SIZE_POLICY_EXPANDING, GEOMETRY_POINT, GEOMETRY_LINE
 from qgis.gui import QgsVertexMarker, QgsRubberBand
 from .maptools.temp_line_maptool import TempLineMapTool  # new temporary line drawing tool
 from .kp_range_utils import make_distance_area
@@ -319,7 +320,7 @@ class DepthProfileDockWidget(QDockWidget):
         self.tab_widget.addTab(self.profile_tab, "Depth Profile")
         # Matplotlib area
         self.figure = Figure(figsize=(6, 4)); self.canvas = FigureCanvas(self.figure)
-        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas.setSizePolicy(SIZE_POLICY_EXPANDING, SIZE_POLICY_EXPANDING)
         self.toolbar = NavigationToolbar(self.canvas, self)
         profile_layout.addWidget(self.toolbar); profile_layout.addWidget(self.canvas, 1)
         # --- Help Tab ---
@@ -514,7 +515,7 @@ class DepthProfileDockWidget(QDockWidget):
             # Contour layer 2 is optional
             self.contour_layer_combo2.addItem("(None)", None)
             for layer in QgsProject.instance().mapLayers().values():
-                if isinstance(layer, QgsVectorLayer) and layer.geometryType() == QgsWkbTypes.LineGeometry:
+                if isinstance(layer, QgsVectorLayer) and layer.geometryType() == GEOMETRY_LINE:
                     self.line_layer_combo.addItem(layer.name(), layer.id())
                 if isinstance(layer, QgsRasterLayer):
                     item = QListWidgetItem(layer.name())
@@ -522,7 +523,7 @@ class DepthProfileDockWidget(QDockWidget):
                     item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                     item.setCheckState(Qt.CheckState.Checked if layer.id() in prev_rasters else Qt.CheckState.Unchecked)
                     self.raster_layer_list.addItem(item)
-                if isinstance(layer, QgsVectorLayer) and layer.geometryType() == QgsWkbTypes.LineGeometry:
+                if isinstance(layer, QgsVectorLayer) and layer.geometryType() == GEOMETRY_LINE:
                     self.contour_layer_combo.addItem(layer.name(), layer.id())
                     self.contour_layer_combo2.addItem(layer.name(), layer.id())
         finally:
@@ -684,7 +685,7 @@ class DepthProfileDockWidget(QDockWidget):
         try:
             layer_id = self.line_layer_combo.currentData()
             line_layer = QgsProject.instance().mapLayer(layer_id) if layer_id else None
-            if not line_layer or not isinstance(line_layer, QgsVectorLayer) or line_layer.geometryType() != QgsWkbTypes.LineGeometry:
+            if not line_layer or not isinstance(line_layer, QgsVectorLayer) or line_layer.geometryType() != GEOMETRY_LINE:
                 return None
             da = make_distance_area(
                 line_layer.sourceCrs(), project.transformContext(), project=project
@@ -831,7 +832,7 @@ class DepthProfileDockWidget(QDockWidget):
         else:
             line_layer_id = self.line_layer_combo.currentData()
             line_layer = QgsProject.instance().mapLayer(line_layer_id) if line_layer_id else None
-            if not line_layer or not isinstance(line_layer, QgsVectorLayer) or line_layer.geometryType() != QgsWkbTypes.LineGeometry:
+            if not line_layer or not isinstance(line_layer, QgsVectorLayer) or line_layer.geometryType() != GEOMETRY_LINE:
                 ax.set_title("Select a valid route line layer or draw a line"); self.canvas.draw(); return
             feats = list(line_layer.getFeatures())
             if not feats:
@@ -1473,24 +1474,24 @@ class DepthProfileDockWidget(QDockWidget):
                     continue
                 points = []
                 if inter.isMultipart():
-                    if inter.type() == QgsWkbTypes.LineGeometry:
+                    if inter.type() == GEOMETRY_LINE:
                         for part in inter.asMultiPolyline():
                             points.extend(part)
                     else:
                         for g in inter.asGeometryCollection():
                             if g.isEmpty():
                                 continue
-                            if g.type() == QgsWkbTypes.LineGeometry:
+                            if g.type() == GEOMETRY_LINE:
                                 for part in g.asMultiPolyline() if g.isMultipart() else [g.asPolyline()]:
                                     points.extend(part)
-                            elif g.type() == QgsWkbTypes.PointGeometry:
+                            elif g.type() == GEOMETRY_POINT:
                                 pts = g.asMultiPoint() if g.isMultipart() else [g.asPoint()]
                                 points.extend(pts)
                 else:
-                    if inter.type() == QgsWkbTypes.LineGeometry:
+                    if inter.type() == GEOMETRY_LINE:
                         for part in inter.asMultiPolyline() if inter.isMultipart() else [inter.asPolyline()]:
                             points.extend(part)
-                    elif inter.type() == QgsWkbTypes.PointGeometry:
+                    elif inter.type() == GEOMETRY_POINT:
                         pts = inter.asMultiPoint() if inter.isMultipart() else [inter.asPoint()]
                         points.extend(pts)
                 for p in points:
@@ -2125,9 +2126,9 @@ class DepthProfileDockWidget(QDockWidget):
 
             points = []
             try:
-                if inter.type() == QgsWkbTypes.PointGeometry:
+                if inter.type() == GEOMETRY_POINT:
                     points = inter.asMultiPoint() if inter.isMultipart() else [inter.asPoint()]
-                elif inter.type() == QgsWkbTypes.LineGeometry:
+                elif inter.type() == GEOMETRY_LINE:
                     # Overlap: use vertices (rare). This can still help build a fit.
                     if inter.isMultipart():
                         for part in inter.asMultiPolyline():
@@ -2385,7 +2386,7 @@ class DepthProfileDockWidget(QDockWidget):
             try:
                 if self.temp_line_rubber:
                     # Fully dispose of previous rubber band to avoid lingering graphics
-                    try: self.temp_line_rubber.reset(QgsWkbTypes.LineGeometry)
+                    try: self.temp_line_rubber.reset(GEOMETRY_LINE)
                     except Exception: pass
                     try: self.temp_line_rubber.hide()
                     except Exception: pass
@@ -2394,11 +2395,11 @@ class DepthProfileDockWidget(QDockWidget):
                     self.temp_line_rubber = None
                 else:
                     # QgsRubberBand already imported at top
-                    self.temp_line_rubber = QgsRubberBand(self.iface.mapCanvas(), QgsWkbTypes.LineGeometry)
+                    self.temp_line_rubber = QgsRubberBand(self.iface.mapCanvas(), GEOMETRY_LINE)
                     self.temp_line_rubber.setColor(Qt.GlobalColor.yellow)
                     self.temp_line_rubber.setWidth(2)
                 if self.temp_line_rubber is None:
-                    self.temp_line_rubber = QgsRubberBand(self.iface.mapCanvas(), QgsWkbTypes.LineGeometry)
+                    self.temp_line_rubber = QgsRubberBand(self.iface.mapCanvas(), GEOMETRY_LINE)
                     self.temp_line_rubber.setColor(Qt.GlobalColor.yellow)
                     self.temp_line_rubber.setWidth(2)
                 for pt in points:
@@ -2422,7 +2423,7 @@ class DepthProfileDockWidget(QDockWidget):
         # remove persistent rubber band
         try:
             if self.temp_line_rubber:
-                try: self.temp_line_rubber.reset(QgsWkbTypes.LineGeometry)
+                try: self.temp_line_rubber.reset(GEOMETRY_LINE)
                 except Exception: pass
                 try: self.temp_line_rubber.hide()
                 except Exception: pass
@@ -2443,7 +2444,7 @@ class DepthProfileDockWidget(QDockWidget):
         # ensure temp line rubber removed
         try:
             if self.temp_line_rubber:
-                try: self.temp_line_rubber.reset(QgsWkbTypes.LineGeometry)
+                try: self.temp_line_rubber.reset(GEOMETRY_LINE)
                 except Exception: pass
                 try: self.temp_line_rubber.hide()
                 except Exception: pass
@@ -2598,7 +2599,7 @@ class DepthProfileDockWidget(QDockWidget):
             point_layers = []
             try:
                 for lyr in QgsProject.instance().mapLayers().values():
-                    if isinstance(lyr, QgsVectorLayer) and lyr.geometryType() == QgsWkbTypes.PointGeometry:
+                    if isinstance(lyr, QgsVectorLayer) and lyr.geometryType() == GEOMETRY_POINT:
                         point_layers.append(lyr)
             except Exception:
                 point_layers = []

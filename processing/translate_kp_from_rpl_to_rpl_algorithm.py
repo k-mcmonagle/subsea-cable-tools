@@ -24,7 +24,7 @@ lib_dir = os.path.join(plugin_dir, 'lib')
 if lib_dir not in sys.path:
     sys.path.insert(0, lib_dir)
 
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessing,
     QgsFeatureSink,
@@ -41,6 +41,7 @@ from qgis.core import (
     QgsWkbTypes,
     QgsProject
 )
+from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, GEOMETRY_POINT
 
 from .rpl_comparison_utils import RPLComparator
 
@@ -125,9 +126,9 @@ class TranslateKPFromRPLToRPLAlgorithm(QgsProcessingAlgorithm):
             output_fields.append(field)
 
         # Add new design route fields
-        output_fields.append(QgsField('design_route_kp', QVariant.Double))
-        output_fields.append(QgsField('design_route_dcc', QVariant.Double))
-        output_fields.append(QgsField('design_route_ref', QVariant.String))
+        output_fields.append(QgsField('design_route_kp', FIELD_TYPE_DOUBLE))
+        output_fields.append(QgsField('design_route_dcc', FIELD_TYPE_DOUBLE))
+        output_fields.append(QgsField('design_route_ref', FIELD_TYPE_STRING))
 
         # Create output sink
         (sink, dest_id) = self.parameterAsSink(
@@ -161,7 +162,7 @@ class TranslateKPFromRPLToRPLAlgorithm(QgsProcessingAlgorithm):
                 break
 
             point_geom = tgt_feature.geometry()
-            if point_geom.isEmpty() or point_geom.type() != QgsWkbTypes.PointGeometry:
+            if point_geom.isEmpty() or point_geom.type() != GEOMETRY_POINT:
                 features_skipped += 1
                 continue
 

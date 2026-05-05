@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 from typing import List, Optional, Sequence, Tuple
 
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication
 from ..kp_range_utils import make_distance_area
 from qgis.core import (
     QgsCoordinateTransform,
@@ -41,6 +41,7 @@ from qgis.core import (
     QgsVectorLayer,
     QgsWkbTypes,
 )
+from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE, PROCESSING_NUMBER_INTEGER
 
 
 class AddDepthToPointLayerAlgorithm(QgsProcessingAlgorithm):
@@ -290,7 +291,7 @@ class AddDepthToPointLayerAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.RASTER_BAND,
                 self.tr('Raster band'),
-                type=QgsProcessingParameterNumber.Integer,
+                type=PROCESSING_NUMBER_INTEGER,
                 minValue=1,
                 defaultValue=1,
             )
@@ -309,7 +310,7 @@ class AddDepthToPointLayerAlgorithm(QgsProcessingAlgorithm):
                 self.CONTOUR_DEPTH_FIELD_1,
                 self.tr('Depth field (contour layer 1)'),
                 parentLayerParameterName=self.CONTOUR_LAYER_1,
-                type=QgsProcessingParameterField.Numeric,
+                type=PROCESSING_FIELD_NUMERIC,
                 optional=True,
             )
         )
@@ -327,7 +328,7 @@ class AddDepthToPointLayerAlgorithm(QgsProcessingAlgorithm):
                 self.CONTOUR_DEPTH_FIELD_2,
                 self.tr('Depth field (contour layer 2)'),
                 parentLayerParameterName=self.CONTOUR_LAYER_2,
-                type=QgsProcessingParameterField.Numeric,
+                type=PROCESSING_FIELD_NUMERIC,
                 optional=True,
             )
         )
@@ -336,7 +337,7 @@ class AddDepthToPointLayerAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.CONTOUR_SEARCH_RADIUS_M,
                 self.tr('Contour search radius (m, 0 = unlimited)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 minValue=0.0,
                 defaultValue=0.0,
             )
@@ -417,15 +418,15 @@ class AddDepthToPointLayerAlgorithm(QgsProcessingAlgorithm):
 
         # Output fields: copy input + depth fields
         out_fields = QgsFields(source.fields())
-        out_fields.append(QgsField('depth', QVariant.Double))
-        out_fields.append(QgsField('depth_source', QVariant.String))
-        out_fields.append(QgsField('depth_contour_dist_m', QVariant.Double))
+        out_fields.append(QgsField('depth', FIELD_TYPE_DOUBLE))
+        out_fields.append(QgsField('depth_source', FIELD_TYPE_STRING))
+        out_fields.append(QgsField('depth_contour_dist_m', FIELD_TYPE_DOUBLE))
 
         raster_field_map: List[Tuple[str, Tuple[QgsRasterLayer, Optional[QgsCoordinateTransform]]]] = []
         if output_mode == 1 and raster_samplers:
             for raster, transform in raster_samplers:
                 fld = self._safe_field_name(f"depth_{raster.name()}", used_field_names)
-                out_fields.append(QgsField(fld, QVariant.Double))
+                out_fields.append(QgsField(fld, FIELD_TYPE_DOUBLE))
                 raster_field_map.append((fld, (raster, transform)))
 
         (sink, dest_id) = self.parameterAsSink(

@@ -17,7 +17,7 @@ import csv
 import math
 from typing import List, Optional
 
-from qgis.PyQt.QtCore import Qt, QCoreApplication, QVariant
+from qgis.PyQt.QtCore import Qt, QCoreApplication
 from qgis.PyQt.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QDoubleSpinBox, QLineEdit, QTableWidget, QTableWidgetItem, QMessageBox,
@@ -31,6 +31,7 @@ from qgis.core import (
     QgsField, QgsUnitTypes, Qgis, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
     QgsFillSymbol, QgsSingleSymbolRenderer
 )
+from ..qgis_compat import DISTANCE_METERS, FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_STRING, GEOMETRY_LINE, GEOMETRY_POINT, GEOMETRY_POLYGON, MESSAGE_INFO
 from qgis.gui import QgsMapTool, QgsVertexMarker, QgsRubberBand
 
 
@@ -269,13 +270,13 @@ class TransitMeasureDialog(QDialog):
             proj.crs(), proj.transformContext(), project=proj
         )
 
-        self.point_rb = QgsRubberBand(self.canvas, QgsWkbTypes.PointGeometry)
+        self.point_rb = QgsRubberBand(self.canvas, GEOMETRY_POINT)
         self.point_rb.setColor(QColor(255, 170, 0))
         self.point_rb.setIconSize(8)
-        self.line_rb = QgsRubberBand(self.canvas, QgsWkbTypes.LineGeometry)
+        self.line_rb = QgsRubberBand(self.canvas, GEOMETRY_LINE)
         self.line_rb.setColor(QColor(255, 170, 0))
         self.line_rb.setWidth(2)
-        self.temp_rb = QgsRubberBand(self.canvas, QgsWkbTypes.LineGeometry)
+        self.temp_rb = QgsRubberBand(self.canvas, GEOMETRY_LINE)
         self.temp_rb.setColor(QColor(255, 170, 0))
         self.temp_rb.setWidth(2)
 
@@ -470,12 +471,12 @@ class TransitMeasureDialog(QDialog):
         self.highlighted_waypoint_idx = idx
         # Create a separate rubber band for the highlighted point
         if not hasattr(self, 'highlight_rb'):
-            self.highlight_rb = QgsRubberBand(self.canvas, QgsWkbTypes.PointGeometry)
+            self.highlight_rb = QgsRubberBand(self.canvas, GEOMETRY_POINT)
             self.highlight_rb.setColor(self.highlight_color)
             self.highlight_rb.setIconSize(10)
         
         if idx < len(self.points):
-            self.highlight_rb.reset(QgsWkbTypes.PointGeometry)
+            self.highlight_rb.reset(GEOMETRY_POINT)
             self.highlight_rb.addPoint(self.points[idx], True)
             self.status_label.setText(tr("Editing waypoint {} - drag to move, click elsewhere to finish.").format(idx + 1))
             self.status_label.setStyleSheet("font-weight: bold; color: #0066cc;")
@@ -483,7 +484,7 @@ class TransitMeasureDialog(QDialog):
     def clear_waypoint_highlight(self):
         """Clear the waypoint highlight."""
         if hasattr(self, 'highlight_rb'):
-            self.highlight_rb.reset(QgsWkbTypes.PointGeometry)
+            self.highlight_rb.reset(GEOMETRY_POINT)
         self.highlighted_waypoint_idx = None
         if self.points:
             self.status_label.setText(tr("Hover over waypoints to edit or click to add more points."))
@@ -504,7 +505,7 @@ class TransitMeasureDialog(QDialog):
         self.points[idx] = new_pt
         
         # Update the point rubber band
-        self.point_rb.reset(QgsWkbTypes.PointGeometry)
+        self.point_rb.reset(GEOMETRY_POINT)
         for pt in self.points:
             self.point_rb.addPoint(pt, True)
         
@@ -541,7 +542,7 @@ class TransitMeasureDialog(QDialog):
         self._recalculate_segments()
         
         # Update rubber bands
-        self.point_rb.reset(QgsWkbTypes.PointGeometry)
+        self.point_rb.reset(GEOMETRY_POINT)
         for pt in self.points:
             self.point_rb.addPoint(pt, True)
         
@@ -594,7 +595,7 @@ class TransitMeasureDialog(QDialog):
 
     def _update_line_rubber_bands(self):
         """Update the line rubber bands to reflect current segments."""
-        self.line_rb.reset(QgsWkbTypes.LineGeometry)
+        self.line_rb.reset(GEOMETRY_LINE)
         for i in range(len(self.points) - 1):
             p1 = self.points[i]
             p2 = self.points[i + 1]
@@ -606,7 +607,7 @@ class TransitMeasureDialog(QDialog):
         if not self.points:
             return
         self.active = False
-        self.temp_rb.reset(QgsWkbTypes.LineGeometry)
+        self.temp_rb.reset(GEOMETRY_LINE)
         self.motion_distance_m = 0.0
         self.motion_heading_fwd = None
         self.motion_heading_rev = None
@@ -644,9 +645,9 @@ class TransitMeasureDialog(QDialog):
         self.finished = False
         self.table.setRowCount(0)
         self.waypoints_table.setRowCount(0)
-        self.point_rb.reset(QgsWkbTypes.PointGeometry)
-        self.line_rb.reset(QgsWkbTypes.LineGeometry)
-        self.temp_rb.reset(QgsWkbTypes.LineGeometry)
+        self.point_rb.reset(GEOMETRY_POINT)
+        self.line_rb.reset(GEOMETRY_LINE)
+        self.temp_rb.reset(GEOMETRY_LINE)
         self._reset_buffer_rb()
         self.clear_waypoint_highlight()
         self.create_layer_btn.setEnabled(False)
@@ -873,24 +874,24 @@ class TransitMeasureDialog(QDialog):
         proj = QgsProject.instance()
         layer = QgsVectorLayer(f"LineString?crs={proj.crs().authid()}", tr("Transit Measurement"), "memory")
         fields = QgsFields()
-        fields.append(QgsField("segment_id", QVariant.Int))
-        fields.append(QgsField("dist", QVariant.Double))
-        fields.append(QgsField("dist_unit", QVariant.String))
-        fields.append(QgsField("duration_hr", QVariant.Double))
-        fields.append(QgsField("speed_val", QVariant.Double))
-        fields.append(QgsField("speed_unit", QVariant.String))
-        fields.append(QgsField("head_to", QVariant.Double))
-        fields.append(QgsField("head_from", QVariant.Double))
-        fields.append(QgsField("cum_dist", QVariant.Double))
-        fields.append(QgsField("cum_time_hr", QVariant.Double))
+        fields.append(QgsField("segment_id", FIELD_TYPE_INT))
+        fields.append(QgsField("dist", FIELD_TYPE_DOUBLE))
+        fields.append(QgsField("dist_unit", FIELD_TYPE_STRING))
+        fields.append(QgsField("duration_hr", FIELD_TYPE_DOUBLE))
+        fields.append(QgsField("speed_val", FIELD_TYPE_DOUBLE))
+        fields.append(QgsField("speed_unit", FIELD_TYPE_STRING))
+        fields.append(QgsField("head_to", FIELD_TYPE_DOUBLE))
+        fields.append(QgsField("head_from", FIELD_TYPE_DOUBLE))
+        fields.append(QgsField("cum_dist", FIELD_TYPE_DOUBLE))
+        fields.append(QgsField("cum_time_hr", FIELD_TYPE_DOUBLE))
         # Label-friendly summary fields (nautical defaults)
-        fields.append(QgsField("label_seg", QVariant.String))
-        fields.append(QgsField("label_full", QVariant.String))
-        fields.append(QgsField("seg_nm", QVariant.Double))
-        fields.append(QgsField("seg_days", QVariant.Double))
-        fields.append(QgsField("total_nm", QVariant.Double))
-        fields.append(QgsField("total_days", QVariant.Double))
-        fields.append(QgsField("speed_kn", QVariant.Double))
+        fields.append(QgsField("label_seg", FIELD_TYPE_STRING))
+        fields.append(QgsField("label_full", FIELD_TYPE_STRING))
+        fields.append(QgsField("seg_nm", FIELD_TYPE_DOUBLE))
+        fields.append(QgsField("seg_days", FIELD_TYPE_DOUBLE))
+        fields.append(QgsField("total_nm", FIELD_TYPE_DOUBLE))
+        fields.append(QgsField("total_days", FIELD_TYPE_DOUBLE))
+        fields.append(QgsField("speed_kn", FIELD_TYPE_DOUBLE))
         layer.dataProvider().addAttributes(fields)
         layer.updateFields()
         factor = self._distance_factor()
@@ -935,7 +936,7 @@ class TransitMeasureDialog(QDialog):
             layer.dataProvider().addFeature(feat)
         layer.updateExtents()
         QgsProject.instance().addMapLayer(layer)
-        self.iface.messageBar().pushMessage("", tr("Transit measurement layer added."), level=Qgis.Info, duration=4)
+        self.iface.messageBar().pushMessage("", tr("Transit measurement layer added."), level=MESSAGE_INFO, duration=4)
 
     def export_csv(self):
         if len(self.points) == 0:
@@ -1009,15 +1010,15 @@ class TransitMeasureDialog(QDialog):
         proj = QgsProject.instance()
         layer = QgsVectorLayer(f"Point?crs={proj.crs().authid()}", tr("Transit Waypoints"), "memory")
         fields = QgsFields()
-        fields.append(QgsField("wp_id", QVariant.Int))
-        fields.append(QgsField("latitude", QVariant.Double))
-        fields.append(QgsField("longitude", QVariant.Double))
-        fields.append(QgsField("bearing_to_next", QVariant.Double))
-        fields.append(QgsField("dist_to_next", QVariant.Double))
-        fields.append(QgsField("dist_unit", QVariant.String))
-        fields.append(QgsField("cum_dist", QVariant.Double))
-        fields.append(QgsField("est_time_to_next", QVariant.String))
-        fields.append(QgsField("cum_time", QVariant.String))
+        fields.append(QgsField("wp_id", FIELD_TYPE_INT))
+        fields.append(QgsField("latitude", FIELD_TYPE_DOUBLE))
+        fields.append(QgsField("longitude", FIELD_TYPE_DOUBLE))
+        fields.append(QgsField("bearing_to_next", FIELD_TYPE_DOUBLE))
+        fields.append(QgsField("dist_to_next", FIELD_TYPE_DOUBLE))
+        fields.append(QgsField("dist_unit", FIELD_TYPE_STRING))
+        fields.append(QgsField("cum_dist", FIELD_TYPE_DOUBLE))
+        fields.append(QgsField("est_time_to_next", FIELD_TYPE_STRING))
+        fields.append(QgsField("cum_time", FIELD_TYPE_STRING))
         layer.dataProvider().addAttributes(fields)
         layer.updateFields()
         factor = self._distance_factor()
@@ -1052,7 +1053,7 @@ class TransitMeasureDialog(QDialog):
             layer.dataProvider().addFeature(feat)
         layer.updateExtents()
         QgsProject.instance().addMapLayer(layer)
-        self.iface.messageBar().pushMessage("", tr("Waypoints layer added."), level=Qgis.Info, duration=4)
+        self.iface.messageBar().pushMessage("", tr("Waypoints layer added."), level=MESSAGE_INFO, duration=4)
 
     def create_layers(self):
         """Create both the transit measurement layer and waypoints layer."""
@@ -1074,10 +1075,10 @@ class TransitMeasureDialog(QDialog):
         proj = QgsProject.instance()
         layer = QgsVectorLayer(f"Polygon?crs={proj.crs().authid()}", tr("Quick Buffer"), "memory")
         fields = QgsFields()
-        fields.append(QgsField("buffer_m", QVariant.Double))
-        fields.append(QgsField("segments", QVariant.Int))
-        fields.append(QgsField("cap", QVariant.String))
-        fields.append(QgsField("join", QVariant.String))
+        fields.append(QgsField("buffer_m", FIELD_TYPE_DOUBLE))
+        fields.append(QgsField("segments", FIELD_TYPE_INT))
+        fields.append(QgsField("cap", FIELD_TYPE_STRING))
+        fields.append(QgsField("join", FIELD_TYPE_STRING))
         layer.dataProvider().addAttributes(fields)
         layer.updateFields()
 
@@ -1102,28 +1103,28 @@ class TransitMeasureDialog(QDialog):
         layer.setRenderer(QgsSingleSymbolRenderer(symbol))
 
         QgsProject.instance().addMapLayer(layer)
-        self.iface.messageBar().pushMessage("", tr("Quick buffer layer added."), level=Qgis.Info, duration=4)
+        self.iface.messageBar().pushMessage("", tr("Quick buffer layer added."), level=MESSAGE_INFO, duration=4)
 
     def _cleanup_rubber_bands(self):
         """Clean up all rubber band objects and clear drawing from map."""
         try:
             if hasattr(self, 'point_rb') and self.point_rb is not None:
-                self.point_rb.reset(QgsWkbTypes.PointGeometry)
+                self.point_rb.reset(GEOMETRY_POINT)
         except Exception:
             pass
         try:
             if hasattr(self, 'line_rb') and self.line_rb is not None:
-                self.line_rb.reset(QgsWkbTypes.LineGeometry)
+                self.line_rb.reset(GEOMETRY_LINE)
         except Exception:
             pass
         try:
             if hasattr(self, 'temp_rb') and self.temp_rb is not None:
-                self.temp_rb.reset(QgsWkbTypes.LineGeometry)
+                self.temp_rb.reset(GEOMETRY_LINE)
         except Exception:
             pass
         try:
             if hasattr(self, 'highlight_rb') and self.highlight_rb is not None:
-                self.highlight_rb.reset(QgsWkbTypes.PointGeometry)
+                self.highlight_rb.reset(GEOMETRY_POINT)
         except Exception:
             pass
 
@@ -1134,7 +1135,7 @@ class TransitMeasureDialog(QDialog):
 
     def _ensure_buffer_rb(self) -> QgsRubberBand:
         if self.buffer_rb is None:
-            rb = QgsRubberBand(self.canvas, QgsWkbTypes.PolygonGeometry)
+            rb = QgsRubberBand(self.canvas, GEOMETRY_POLYGON)
             stroke = QColor(255, 170, 0)
             fill = QColor(255, 170, 0)
             fill.setAlpha(40)
@@ -1147,7 +1148,7 @@ class TransitMeasureDialog(QDialog):
 
     def _reset_buffer_rb(self):
         if self.buffer_rb is not None:
-            self.buffer_rb.reset(QgsWkbTypes.PolygonGeometry)
+            self.buffer_rb.reset(GEOMETRY_POLYGON)
 
     def _on_buffer_settings_changed(self, *args):
         enabled = getattr(self, 'buffer_enable_chk', None)
@@ -1223,7 +1224,7 @@ class TransitMeasureDialog(QDialog):
 
     def _is_project_units_meters(self, crs: QgsCoordinateReferenceSystem) -> bool:
         try:
-            return crs.isValid() and crs.mapUnits() == QgsUnitTypes.DistanceMeters
+            return crs.isValid() and crs.mapUnits() == DISTANCE_METERS
         except Exception:
             return False
 

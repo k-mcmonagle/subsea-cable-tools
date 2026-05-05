@@ -8,7 +8,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import math
 
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication
 from ..kp_range_utils import make_distance_area
 from qgis.core import (
     QgsCoordinateTransform,
@@ -39,6 +39,7 @@ from qgis.core import (
     QgsVectorLayer,
     QgsWkbTypes,
 )
+from ..qgis_compat import FIELD_TYPE_DOUBLE, GEOMETRY_LINE, GEOMETRY_POINT, PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE
 
 
 @dataclass(frozen=True)
@@ -135,7 +136,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
                 self.CONTOUR_DEPTH_FIELD_1,
                 self.tr('Depth field 1'),
                 parentLayerParameterName=self.CONTOUR_LAYER_1,
-                type=QgsProcessingParameterField.Numeric,
+                type=PROCESSING_FIELD_NUMERIC,
                 optional=True,
             )
         )
@@ -153,7 +154,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
                 self.CONTOUR_DEPTH_FIELD_2,
                 self.tr('Depth field 2'),
                 parentLayerParameterName=self.CONTOUR_LAYER_2,
-                type=QgsProcessingParameterField.Numeric,
+                type=PROCESSING_FIELD_NUMERIC,
                 optional=True,
             )
         )
@@ -170,7 +171,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.SAMPLE_INTERVAL_M,
                 self.tr('Sampling interval along KP range (m)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 minValue=0.1,
                 defaultValue=50.0,
             )
@@ -188,7 +189,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.ADAPTIVE_INTERVAL_FACTOR,
                 self.tr('Adaptive factor (Raster only)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 minValue=0.25,
                 maxValue=10.0,
                 defaultValue=1.0,
@@ -199,7 +200,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.SIDE_SLOPE_SEARCH_M,
                 self.tr('Side slope cross-search (m) (half-width)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 minValue=1.0,
                 defaultValue=200.0,
             )
@@ -291,24 +292,24 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
 
         # Output fields: copy inputs, then append stats (ensure uniqueness)
         out_fields = QgsFields(source.fields())
-        out_fields.append(QgsField(self._unique_field_name(out_fields, 'depth_min'), QVariant.Double))
-        out_fields.append(QgsField(self._unique_field_name(out_fields, 'depth_max'), QVariant.Double))
-        out_fields.append(QgsField(self._unique_field_name(out_fields, 'depth_avg'), QVariant.Double))
-        out_fields.append(QgsField(self._unique_field_name(out_fields, 'slope_min_deg'), QVariant.Double))
-        out_fields.append(QgsField(self._unique_field_name(out_fields, 'slope_max_deg'), QVariant.Double))
-        out_fields.append(QgsField(self._unique_field_name(out_fields, 'slope_avg_deg'), QVariant.Double))
-        out_fields.append(QgsField(self._unique_field_name(out_fields, 'side_min_deg'), QVariant.Double))
-        out_fields.append(QgsField(self._unique_field_name(out_fields, 'side_max_deg'), QVariant.Double))
-        out_fields.append(QgsField(self._unique_field_name(out_fields, 'side_avg_deg'), QVariant.Double))
+        out_fields.append(QgsField(self._unique_field_name(out_fields, 'depth_min'), FIELD_TYPE_DOUBLE))
+        out_fields.append(QgsField(self._unique_field_name(out_fields, 'depth_max'), FIELD_TYPE_DOUBLE))
+        out_fields.append(QgsField(self._unique_field_name(out_fields, 'depth_avg'), FIELD_TYPE_DOUBLE))
+        out_fields.append(QgsField(self._unique_field_name(out_fields, 'slope_min_deg'), FIELD_TYPE_DOUBLE))
+        out_fields.append(QgsField(self._unique_field_name(out_fields, 'slope_max_deg'), FIELD_TYPE_DOUBLE))
+        out_fields.append(QgsField(self._unique_field_name(out_fields, 'slope_avg_deg'), FIELD_TYPE_DOUBLE))
+        out_fields.append(QgsField(self._unique_field_name(out_fields, 'side_min_deg'), FIELD_TYPE_DOUBLE))
+        out_fields.append(QgsField(self._unique_field_name(out_fields, 'side_max_deg'), FIELD_TYPE_DOUBLE))
+        out_fields.append(QgsField(self._unique_field_name(out_fields, 'side_avg_deg'), FIELD_TYPE_DOUBLE))
 
         # Optional directional extremes
         # Along-route slope: +ve = up-slope; -ve = down-slope
         # Side-slope: +ve = down to stbd; -ve = down to port
         if include_dir:
-            out_fields.append(QgsField(self._unique_field_name(out_fields, 'slope_up_max_deg'), QVariant.Double))
-            out_fields.append(QgsField(self._unique_field_name(out_fields, 'slope_down_min_deg'), QVariant.Double))
-            out_fields.append(QgsField(self._unique_field_name(out_fields, 'side_stbd_max_deg'), QVariant.Double))
-            out_fields.append(QgsField(self._unique_field_name(out_fields, 'side_port_min_deg'), QVariant.Double))
+            out_fields.append(QgsField(self._unique_field_name(out_fields, 'slope_up_max_deg'), FIELD_TYPE_DOUBLE))
+            out_fields.append(QgsField(self._unique_field_name(out_fields, 'slope_down_min_deg'), FIELD_TYPE_DOUBLE))
+            out_fields.append(QgsField(self._unique_field_name(out_fields, 'side_stbd_max_deg'), FIELD_TYPE_DOUBLE))
+            out_fields.append(QgsField(self._unique_field_name(out_fields, 'side_port_min_deg'), FIELD_TYPE_DOUBLE))
 
         (sink, dest_id) = self.parameterAsSink(
             parameters,
@@ -793,9 +794,9 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
 
                 pts: List[QgsPointXY] = []
                 try:
-                    if inter.type() == QgsWkbTypes.PointGeometry:
+                    if inter.type() == GEOMETRY_POINT:
                         pts = [QgsPointXY(p) for p in (inter.asMultiPoint() if inter.isMultipart() else [inter.asPoint()])]
-                    elif inter.type() == QgsWkbTypes.LineGeometry:
+                    elif inter.type() == GEOMETRY_LINE:
                         if inter.isMultipart():
                             for pl in inter.asMultiPolyline():
                                 pts.extend(QgsPointXY(p) for p in pl)
@@ -1039,10 +1040,10 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
 
             points: List[QgsPointXY] = []
             try:
-                if inter.type() == QgsWkbTypes.PointGeometry:
+                if inter.type() == GEOMETRY_POINT:
                     pts = inter.asMultiPoint() if inter.isMultipart() else [inter.asPoint()]
                     points = [QgsPointXY(p) for p in pts]
-                elif inter.type() == QgsWkbTypes.LineGeometry:
+                elif inter.type() == GEOMETRY_LINE:
                     if inter.isMultipart():
                         for pl in inter.asMultiPolyline():
                             points.extend(QgsPointXY(p) for p in pl)

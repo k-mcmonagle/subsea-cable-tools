@@ -6,7 +6,7 @@ This tool extracts Alter Course (A/C) points from an RPL line layer.
 """
 
 import math
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication
 from ..kp_range_utils import (
     make_distance_area,
     add_distance_mode_parameter,
@@ -28,6 +28,7 @@ from qgis.core import (QgsProcessing,
                        QgsWkbTypes,
                        QgsDistanceArea,
                        QgsProcessingLayerPostProcessorInterface)
+from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, GEOMETRY_LINE, PROCESSING_NUMBER_DOUBLE
 
 class ExtractACPointsAlgorithm(QgsProcessingAlgorithm):
     INPUT_RPL = 'INPUT_RPL'
@@ -48,7 +49,7 @@ class ExtractACPointsAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.MIN_AC_DEG,
                 self.tr('Minimum absolute A/C to output (degrees)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 defaultValue=0.0,
                 minValue=0.0
             )
@@ -109,11 +110,11 @@ class ExtractACPointsAlgorithm(QgsProcessingAlgorithm):
             bin_edges = []
 
         fields = QgsFields()
-        fields.append(QgsField('kp', QVariant.Double))
-        fields.append(QgsField('alter_course', QVariant.Double))
-        fields.append(QgsField('turn_abs', QVariant.Double))
-        fields.append(QgsField('turn_bin', QVariant.String))
-        fields.append(QgsField('source_layer', QVariant.String))
+        fields.append(QgsField('kp', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('alter_course', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('turn_abs', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('turn_bin', FIELD_TYPE_STRING))
+        fields.append(QgsField('source_layer', FIELD_TYPE_STRING))
         
         (sink, dest_id) = self.parameterAsSink(parameters, self.OUTPUT,
                                                context, fields, QgsWkbTypes.Point, source.sourceCrs())
@@ -141,9 +142,9 @@ class ExtractACPointsAlgorithm(QgsProcessingAlgorithm):
             combined_geom = QgsGeometry.collectGeometry(geometries)
 
         # Ensure we have a line geometry before attempting line-merge.
-        if combined_geom and combined_geom.type() != QgsWkbTypes.LineGeometry:
+        if combined_geom and combined_geom.type() != GEOMETRY_LINE:
             try:
-                combined_geom = combined_geom.convertToType(QgsWkbTypes.LineGeometry, True)
+                combined_geom = combined_geom.convertToType(GEOMETRY_LINE, True)
             except Exception:
                 pass
 

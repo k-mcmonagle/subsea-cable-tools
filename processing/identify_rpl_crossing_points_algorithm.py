@@ -18,7 +18,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication
 from ..kp_range_utils import make_distance_area
 from qgis.core import (
     QgsCoordinateReferenceSystem,
@@ -44,6 +44,7 @@ from qgis.core import (
     QgsSpatialIndex,
     QgsWkbTypes,
 )
+from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_LONG_LONG, FIELD_TYPE_STRING, GEOMETRY_POINT, PROCESSING_NUMBER_DOUBLE
 
 
 @dataclass(frozen=True)
@@ -241,7 +242,7 @@ def _asset_field_definitions(asset_layers) -> Tuple[List[Tuple[str, str]], List[
     for src_name in sorted(chosen.keys(), key=lambda s: (s or '').lower()):
         out_name = _unique_field_name(seen_out_names, f"asset_{src_name}")
         if src_name in conflicts:
-            out_fields.append(QgsField(out_name, QVariant.String))
+            out_fields.append(QgsField(out_name, FIELD_TYPE_STRING))
         else:
             f = chosen[src_name]
             out_fields.append(QgsField(out_name, f.type(), f.typeName(), f.length(), f.precision()))
@@ -416,7 +417,7 @@ def _extract_points(geom: QgsGeometry) -> List[QgsPointXY]:
         return []
 
     gtype = QgsWkbTypes.geometryType(geom.wkbType())
-    if gtype == QgsWkbTypes.PointGeometry:
+    if gtype == GEOMETRY_POINT:
         if QgsWkbTypes.isMultiType(geom.wkbType()):
             try:
                 return [QgsPointXY(p) for p in geom.asMultiPoint()]
@@ -478,7 +479,7 @@ class IdentifyRPLCrossingPointsAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.BUFFER_HALF_LEN_M,
                 self.tr('Buffer segment half-length along asset (m) (optional)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 defaultValue=0.0,
                 minValue=0.0,
             )
@@ -488,7 +489,7 @@ class IdentifyRPLCrossingPointsAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.BUFFER_DIST_M,
                 self.tr('Buffer distance (m) (optional)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 defaultValue=0.0,
                 minValue=0.0,
             )
@@ -544,14 +545,14 @@ class IdentifyRPLCrossingPointsAlgorithm(QgsProcessingAlgorithm):
 
         # Output fields
         fields = QgsFields()
-        fields.append(QgsField('rpl_layer', QVariant.String))
-        fields.append(QgsField('asset_layer', QVariant.String))
-        fields.append(QgsField('rpl_fid', QVariant.LongLong))
-        fields.append(QgsField('asset_fid', QVariant.LongLong))
-        fields.append(QgsField('kp', QVariant.Double))
-        fields.append(QgsField('lat', QVariant.Double))
-        fields.append(QgsField('lon', QVariant.Double))
-        fields.append(QgsField('cross_ang', QVariant.Double))
+        fields.append(QgsField('rpl_layer', FIELD_TYPE_STRING))
+        fields.append(QgsField('asset_layer', FIELD_TYPE_STRING))
+        fields.append(QgsField('rpl_fid', FIELD_TYPE_LONG_LONG))
+        fields.append(QgsField('asset_fid', FIELD_TYPE_LONG_LONG))
+        fields.append(QgsField('kp', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('lat', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('lon', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('cross_ang', FIELD_TYPE_DOUBLE))
         for f in asset_attr_fields:
             fields.append(f)
 
@@ -580,14 +581,14 @@ class IdentifyRPLCrossingPointsAlgorithm(QgsProcessingAlgorithm):
         buffer_fields = None
         if buffer_dist_m > 0.0:
             buffer_fields = QgsFields()
-            buffer_fields.append(QgsField('rpl_layer', QVariant.String))
-            buffer_fields.append(QgsField('asset_layer', QVariant.String))
-            buffer_fields.append(QgsField('rpl_fid', QVariant.LongLong))
-            buffer_fields.append(QgsField('asset_fid', QVariant.LongLong))
-            buffer_fields.append(QgsField('kp', QVariant.Double))
-            buffer_fields.append(QgsField('cross_ang', QVariant.Double))
-            buffer_fields.append(QgsField('half_len_m', QVariant.Double))
-            buffer_fields.append(QgsField('buf_dist_m', QVariant.Double))
+            buffer_fields.append(QgsField('rpl_layer', FIELD_TYPE_STRING))
+            buffer_fields.append(QgsField('asset_layer', FIELD_TYPE_STRING))
+            buffer_fields.append(QgsField('rpl_fid', FIELD_TYPE_LONG_LONG))
+            buffer_fields.append(QgsField('asset_fid', FIELD_TYPE_LONG_LONG))
+            buffer_fields.append(QgsField('kp', FIELD_TYPE_DOUBLE))
+            buffer_fields.append(QgsField('cross_ang', FIELD_TYPE_DOUBLE))
+            buffer_fields.append(QgsField('half_len_m', FIELD_TYPE_DOUBLE))
+            buffer_fields.append(QgsField('buf_dist_m', FIELD_TYPE_DOUBLE))
             for f in asset_attr_fields:
                 buffer_fields.append(f)
 
@@ -706,7 +707,7 @@ class IdentifyRPLCrossingPointsAlgorithm(QgsProcessingAlgorithm):
                                 v = None
                             # If a field type conflict was detected, it was created as string.
                             try:
-                                if fields.field(out_name).type() == QVariant.String and v is not None:
+                                if fields.field(out_name).type() == FIELD_TYPE_STRING and v is not None:
                                     v = str(v)
                             except Exception:
                                 pass

@@ -46,6 +46,7 @@ from qgis.core import (
     QgsLayoutSize,
     QgsLayoutExporter,
 )
+from ..qgis_compat import PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE, PROCESSING_NUMBER_INTEGER
 
 from ..kp_range_utils import extract_line_segment, make_distance_area, measure_total_length_m
 
@@ -167,7 +168,7 @@ Output:
                 self.START_KP_FIELD,
                 self.tr('Start KP field (used with Reference RPL line)'),
                 parentLayerParameterName=self.RANGES,
-                type=QgsProcessingParameterField.Numeric,
+                type=PROCESSING_FIELD_NUMERIC,
                 optional=True
             )
         )
@@ -176,7 +177,7 @@ Output:
                 self.END_KP_FIELD,
                 self.tr('End KP field (used with Reference RPL line)'),
                 parentLayerParameterName=self.RANGES,
-                type=QgsProcessingParameterField.Numeric,
+                type=PROCESSING_FIELD_NUMERIC,
                 optional=True
             )
         )
@@ -184,7 +185,7 @@ Output:
             QgsProcessingParameterNumber(
                 self.EXTRA_ALONG_KM,
                 self.tr('Extra distance along route (km)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 defaultValue=0.0,
                 minValue=0.0
             )
@@ -230,7 +231,7 @@ Output:
             QgsProcessingParameterNumber(
                 self.IMAGE_WIDTH,
                 self.tr('Image width (px)'),
-                type=QgsProcessingParameterNumber.Integer,
+                type=PROCESSING_NUMBER_INTEGER,
                 defaultValue=1200,
                 minValue=64
             )
@@ -239,7 +240,7 @@ Output:
             QgsProcessingParameterNumber(
                 self.IMAGE_HEIGHT,
                 self.tr('Image height (px)'),
-                type=QgsProcessingParameterNumber.Integer,
+                type=PROCESSING_NUMBER_INTEGER,
                 defaultValue=800,
                 minValue=64
             )

@@ -26,7 +26,7 @@ lib_dir = os.path.join(plugin_dir, 'lib')
 if os.path.isdir(lib_dir) and lib_dir not in sys.path:
     sys.path.insert(0, lib_dir)
 
-from qgis.PyQt.QtCore import QCoreApplication, QVariant, QSettings
+from qgis.PyQt.QtCore import QCoreApplication, QSettings
 from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
@@ -45,6 +45,7 @@ from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsProcessingLayerPostProcessorInterface
 )
+from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_STRING, PROCESSING_NUMBER_INTEGER
 
 try:
     # openpyxl is bundled under plugin lib/ but may also be available in QGIS python
@@ -236,7 +237,7 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
             QgsProcessingParameterNumber(
                 self.INPUT_STARTROW,
                 self.tr('Data Start Row'),
-                type=QgsProcessingParameterNumber.Integer,
+                type=PROCESSING_NUMBER_INTEGER,
                 defaultValue=7
             )
         )
@@ -245,7 +246,7 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
             QgsProcessingParameterNumber(
                 self.INPUT_ENDROW,
                 self.tr('Data End Row (0 for no limit)'),
-                type=QgsProcessingParameterNumber.Integer,
+                type=PROCESSING_NUMBER_INTEGER,
                 defaultValue=0,
                 optional=True
             )
@@ -582,37 +583,37 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
 
         # Define fields for Points
         point_fields = QgsFields()
-        point_fields.append(QgsField("PosNo", QVariant.Int))
-        point_fields.append(QgsField("Event", QVariant.String))
-        point_fields.append(QgsField("DistCumulative", QVariant.Double))
-        point_fields.append(QgsField("CableDistCumulative", QVariant.Double))
-        point_fields.append(QgsField("ApproxDepth", QVariant.Double))
-        point_fields.append(QgsField("Remarks", QVariant.String))
-        point_fields.append(QgsField("ChartNo", QVariant.Int))
-        point_fields.append(QgsField("Latitude", QVariant.Double))
-        point_fields.append(QgsField("Longitude", QVariant.Double))
-        point_fields.append(QgsField("SourceFile", QVariant.String))
+        point_fields.append(QgsField("PosNo", FIELD_TYPE_INT))
+        point_fields.append(QgsField("Event", FIELD_TYPE_STRING))
+        point_fields.append(QgsField("DistCumulative", FIELD_TYPE_DOUBLE))
+        point_fields.append(QgsField("CableDistCumulative", FIELD_TYPE_DOUBLE))
+        point_fields.append(QgsField("ApproxDepth", FIELD_TYPE_DOUBLE))
+        point_fields.append(QgsField("Remarks", FIELD_TYPE_STRING))
+        point_fields.append(QgsField("ChartNo", FIELD_TYPE_INT))
+        point_fields.append(QgsField("Latitude", FIELD_TYPE_DOUBLE))
+        point_fields.append(QgsField("Longitude", FIELD_TYPE_DOUBLE))
+        point_fields.append(QgsField("SourceFile", FIELD_TYPE_STRING))
 
         # Define fields for Lines
         line_fields = QgsFields()
-        line_fields.append(QgsField("FromPos", QVariant.Int))
-        line_fields.append(QgsField("ToPos", QVariant.Int))
-        line_fields.append(QgsField("Bearing", QVariant.Double))
-        line_fields.append(QgsField("DistBetweenPos", QVariant.Double))
-        line_fields.append(QgsField("Slack", QVariant.Double))
-        line_fields.append(QgsField("CableDistBetweenPos", QVariant.Double))
-        line_fields.append(QgsField("CableCode", QVariant.String))
-        line_fields.append(QgsField("FiberPair", QVariant.String))
-        line_fields.append(QgsField("CableType", QVariant.String))
-        line_fields.append(QgsField("LayDirection", QVariant.String))
-        line_fields.append(QgsField("LayVessel", QVariant.String))
-        line_fields.append(QgsField("ProtectionMethod", QVariant.String))
-        line_fields.append(QgsField("DateInstalled", QVariant.String))
-        line_fields.append(QgsField("TargetBurialDepth", QVariant.Double))
-        line_fields.append(QgsField("BurialDepth", QVariant.Double))
-        line_fields.append(QgsField("TerritorialWater", QVariant.String))
-        line_fields.append(QgsField("EEZ", QVariant.String))
-        line_fields.append(QgsField("SourceFile", QVariant.String))
+        line_fields.append(QgsField("FromPos", FIELD_TYPE_INT))
+        line_fields.append(QgsField("ToPos", FIELD_TYPE_INT))
+        line_fields.append(QgsField("Bearing", FIELD_TYPE_DOUBLE))
+        line_fields.append(QgsField("DistBetweenPos", FIELD_TYPE_DOUBLE))
+        line_fields.append(QgsField("Slack", FIELD_TYPE_DOUBLE))
+        line_fields.append(QgsField("CableDistBetweenPos", FIELD_TYPE_DOUBLE))
+        line_fields.append(QgsField("CableCode", FIELD_TYPE_STRING))
+        line_fields.append(QgsField("FiberPair", FIELD_TYPE_STRING))
+        line_fields.append(QgsField("CableType", FIELD_TYPE_STRING))
+        line_fields.append(QgsField("LayDirection", FIELD_TYPE_STRING))
+        line_fields.append(QgsField("LayVessel", FIELD_TYPE_STRING))
+        line_fields.append(QgsField("ProtectionMethod", FIELD_TYPE_STRING))
+        line_fields.append(QgsField("DateInstalled", FIELD_TYPE_STRING))
+        line_fields.append(QgsField("TargetBurialDepth", FIELD_TYPE_DOUBLE))
+        line_fields.append(QgsField("BurialDepth", FIELD_TYPE_DOUBLE))
+        line_fields.append(QgsField("TerritorialWater", FIELD_TYPE_STRING))
+        line_fields.append(QgsField("EEZ", FIELD_TYPE_STRING))
+        line_fields.append(QgsField("SourceFile", FIELD_TYPE_STRING))
 
         # --- Sinks for output layers ---
         # Get sinks for the two output layers

@@ -5,7 +5,7 @@ ImportShipOutlineAlgorithm
 Import a ship outline from a DXF file, with user-defined scale, rotation, and CRP offset.
 """
 
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
@@ -26,6 +26,7 @@ from qgis.core import (
     QgsPointXY,
     QgsProcessingLayerPostProcessorInterface
 )
+from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, GEOMETRY_LINE, PROCESSING_NUMBER_DOUBLE
 import os
 
 class Renamer(QgsProcessingLayerPostProcessorInterface):
@@ -109,7 +110,7 @@ This tool imports a ship outline from a DXF file and creates a polygon or polyli
             QgsProcessingParameterNumber(
                 self.SCALE,
                 self.tr('DXF Drawing Scale (e.g. 0.001 for mm to m, 1 for m)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 defaultValue=1.0
             )
         )
@@ -117,7 +118,7 @@ This tool imports a ship outline from a DXF file and creates a polygon or polyli
             QgsProcessingParameterNumber(
                 self.ROTATION,
                 self.tr('Default Rotation (degrees, 0 = North/up)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 defaultValue=0.0
             )
         )
@@ -125,7 +126,7 @@ This tool imports a ship outline from a DXF file and creates a polygon or polyli
             QgsProcessingParameterNumber(
                 self.CRP_OFFSET_X,
                 self.tr('CRP Offset X (drawing units)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 defaultValue=0.0
             )
         )
@@ -133,7 +134,7 @@ This tool imports a ship outline from a DXF file and creates a polygon or polyli
             QgsProcessingParameterNumber(
                 self.CRP_OFFSET_Y,
                 self.tr('CRP Offset Y (drawing units)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 defaultValue=0.0
             )
         )
@@ -174,12 +175,12 @@ This tool imports a ship outline from a DXF file and creates a polygon or polyli
 
         # Prepare output fields
         fields = QgsFields()
-        fields.append(QgsField('source_file', QVariant.String))
-        fields.append(QgsField('import_scale', QVariant.Double))
-        fields.append(QgsField('import_rotation_deg', QVariant.Double))
-        fields.append(QgsField('import_crp_offset_x', QVariant.Double))
-        fields.append(QgsField('import_crp_offset_y', QVariant.Double))
-        fields.append(QgsField('import_output_crs', QVariant.String))
+        fields.append(QgsField('source_file', FIELD_TYPE_STRING))
+        fields.append(QgsField('import_scale', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('import_rotation_deg', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('import_crp_offset_x', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('import_crp_offset_y', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('import_output_crs', FIELD_TYPE_STRING))
 
         (sink, dest_id) = self.parameterAsSink(
             parameters,
@@ -240,18 +241,18 @@ This tool imports a ship outline from a DXF file and creates a polygon or polyli
             return QgsGeometry.fromPointXY(QgsPointXY(x_rot, y_rot))
         if geom.isMultipart():
             parts = []
-            for part in geom.asMultiPolyline() if geom.type() == QgsWkbTypes.LineGeometry else geom.asMultiPolygon():
+            for part in geom.asMultiPolyline() if geom.type() == GEOMETRY_LINE else geom.asMultiPolygon():
                 new_part = []
                 for ring in part:
                     new_ring = [transform_point(QgsPointXY(pt[0], pt[1])).asPoint() for pt in ring]
                     new_part.append(new_ring)
                 parts.append(new_part)
-            if geom.type() == QgsWkbTypes.LineGeometry:
+            if geom.type() == GEOMETRY_LINE:
                 return QgsGeometry.fromMultiPolylineXY(parts)
             else:
                 return QgsGeometry.fromMultiPolygonXY(parts)
         else:
-            if geom.type() == QgsWkbTypes.LineGeometry:
+            if geom.type() == GEOMETRY_LINE:
                 line = geom.asPolyline()
                 new_line = [transform_point(QgsPointXY(pt[0], pt[1])).asPoint() for pt in line]
                 return QgsGeometry.fromPolylineXY(new_line)

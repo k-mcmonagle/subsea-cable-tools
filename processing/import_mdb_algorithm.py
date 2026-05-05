@@ -1,12 +1,10 @@
-# import_bathy_mdb_algorithm.py
+# import_mdb_algorithm.py
 # -*- coding: utf-8 -*-
 """
-ImportBathyMdbAlgorithm: Imports GeoMedia MDB feature tables into QGIS.
-Despite the historical "Bathy" name, this tool imports any GeoMedia MDB feature
-class (Point, LineString, Polygon, MultiPoint, 2D and 3D), not just bathymetric
-data. It relies on a user-provided CRS and adds 'depth' and 'source' attributes.
-The algorithm id (`import_bathy_mdb`) is kept for backwards compatibility with
-saved Processing models; the user-facing display name is "Import MDB".
+ImportMdbAlgorithm: Imports GeoMedia MDB feature tables into QGIS.
+This tool imports any GeoMedia MDB feature class (Point, LineString, Polygon,
+MultiPoint, 2D and 3D), not just bathymetric data. It relies on a user-provided
+CRS and adds 'depth' and 'source' attributes.
 """
 
 import os
@@ -21,7 +19,7 @@ try:
     import pyodbc
 except Exception:  # pragma: no cover
     pyodbc = None
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
@@ -37,6 +35,7 @@ from qgis.core import (
     QgsProcessingContext,
     QgsWkbTypes,
 )
+from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_STRING, GEOMETRY_LINE, GEOMETRY_POINT, GEOMETRY_POLYGON
 
 
 ACCESS_ODBC_DRIVER_NAME = "Microsoft Access Driver (*.mdb, *.accdb)"
@@ -405,14 +404,14 @@ def import_table_as_memory_layer(mdb_file, table_name, geom_field_name, geometry
             for field_name in attribute_field_names:
                 field_type = attribute_fields.get(field_name)
                 if field_type == "INTEGER":
-                    fields.append(QgsField(field_name, QVariant.Int))
+                    fields.append(QgsField(field_name, FIELD_TYPE_INT))
                 elif field_type == "DOUBLE":
-                    fields.append(QgsField(field_name, QVariant.Double))
+                    fields.append(QgsField(field_name, FIELD_TYPE_DOUBLE))
                 else:
-                    fields.append(QgsField(field_name, QVariant.String))
+                    fields.append(QgsField(field_name, FIELD_TYPE_STRING))
             # Add extra fields.
-            fields.append(QgsField("depth", QVariant.Double))
-            fields.append(QgsField("source", QVariant.String))
+            fields.append(QgsField("depth", FIELD_TYPE_DOUBLE))
+            fields.append(QgsField("source", FIELD_TYPE_STRING))
             dp.addAttributes(fields)
             mem_layer.updateFields()
 
@@ -476,9 +475,9 @@ def import_table_as_memory_layer(mdb_file, table_name, geom_field_name, geometry
                     value = row_dict.get(field_name)
                     field_def = mem_layer.fields().field(field_name)
                     try:
-                        if field_def.type() == QVariant.Int:
+                        if field_def.type() == FIELD_TYPE_INT:
                             attr_values.append(int(value) if value is not None else None)
-                        elif field_def.type() == QVariant.Double:
+                        elif field_def.type() == FIELD_TYPE_DOUBLE:
                             attr_values.append(float(value) if value is not None else None)
                         else:
                             attr_values.append(str(value) if value is not None else "")
@@ -531,11 +530,11 @@ def _memory_uri_for_layer(source_layer, import_crs):
     wkb_name = QgsWkbTypes.displayString(source_layer.wkbType())
     if not wkb_name or wkb_name == "Unknown":
         geom_type = source_layer.geometryType()
-        if geom_type == QgsWkbTypes.PointGeometry:
+        if geom_type == GEOMETRY_POINT:
             wkb_name = "Point"
-        elif geom_type == QgsWkbTypes.LineGeometry:
+        elif geom_type == GEOMETRY_LINE:
             wkb_name = "LineString"
-        elif geom_type == QgsWkbTypes.PolygonGeometry:
+        elif geom_type == GEOMETRY_POLYGON:
             wkb_name = "Polygon"
         else:
             wkb_name = "None"
@@ -569,7 +568,7 @@ def _clone_to_memory_layer(source_layer, layer_name, import_crs, feedback):
     return mem_layer
 
 
-class ImportBathyMdbAlgorithm(QgsProcessingAlgorithm):
+class ImportMdbAlgorithm(QgsProcessingAlgorithm):
     INPUT_MDB = 'INPUT_MDB'
     TARGET_CRS = 'TARGET_CRS'
     OUTPUT_LAYERS = 'OUTPUT_LAYERS'
@@ -815,7 +814,7 @@ class ImportBathyMdbAlgorithm(QgsProcessingAlgorithm):
         return {self.OUTPUT_LAYERS: output_layers}
 
     def name(self):
-        return 'import_bathy_mdb'
+        return 'import_mdb'
 
     def displayName(self):
         return self.tr('Import MDB')
@@ -830,7 +829,7 @@ class ImportBathyMdbAlgorithm(QgsProcessingAlgorithm):
         return QCoreApplication.translate('Processing', string)
 
     def createInstance(self):
-        return ImportBathyMdbAlgorithm()
+        return ImportMdbAlgorithm()
 
     def shortHelpString(self):
         return self.tr("""<h3>Import MDB (Experimental)</h3>

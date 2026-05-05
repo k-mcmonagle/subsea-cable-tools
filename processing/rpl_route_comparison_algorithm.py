@@ -23,7 +23,7 @@ lib_dir = os.path.join(plugin_dir, 'lib')
 if lib_dir not in sys.path:
     sys.path.insert(0, lib_dir)
 
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
@@ -41,6 +41,7 @@ from qgis.core import (
     QgsPointXY,
     QgsWkbTypes,
 )
+from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_FIELD_NUMERIC
 
 from .rpl_comparison_utils import RPLComparator
 from ..kp_range_utils import make_distance_area
@@ -166,7 +167,7 @@ the design point to the as-laid point and includes the following attributes:
                 self.DESIGN_KP_FIELD,
                 self.tr('Design KP/Distance Field (Optional)'),
                 parentLayerParameterName=self.DESIGN_POINTS,
-                type=QgsProcessingParameterField.Numeric,
+                type=PROCESSING_FIELD_NUMERIC,
                 optional=True
             )
         )
@@ -274,19 +275,19 @@ the design point to the as-laid point and includes the following attributes:
         
         # Create output fields
         output_fields = QgsFields()
-        output_fields.append(QgsField('design_layer', QVariant.String))
-        output_fields.append(QgsField('aslaid_layer', QVariant.String))
-        output_fields.append(QgsField('design_event', QVariant.String))
-        output_fields.append(QgsField('aslaid_event', QVariant.String))
-        output_fields.append(QgsField('design_kp', QVariant.Double))
-        output_fields.append(QgsField('along_track_m', QVariant.Double))
-        output_fields.append(QgsField('cross_track_m', QVariant.Double))
-        output_fields.append(QgsField('radial_distance_m', QVariant.Double))
-        output_fields.append(QgsField('bearing_deg', QVariant.Double))
-        output_fields.append(QgsField('design_depth', QVariant.Double))
-        output_fields.append(QgsField('aslaid_depth', QVariant.Double))
-        output_fields.append(QgsField('prev_ac_distance_m', QVariant.Double))
-        output_fields.append(QgsField('next_ac_distance_m', QVariant.Double))
+        output_fields.append(QgsField('design_layer', FIELD_TYPE_STRING))
+        output_fields.append(QgsField('aslaid_layer', FIELD_TYPE_STRING))
+        output_fields.append(QgsField('design_event', FIELD_TYPE_STRING))
+        output_fields.append(QgsField('aslaid_event', FIELD_TYPE_STRING))
+        output_fields.append(QgsField('design_kp', FIELD_TYPE_DOUBLE))
+        output_fields.append(QgsField('along_track_m', FIELD_TYPE_DOUBLE))
+        output_fields.append(QgsField('cross_track_m', FIELD_TYPE_DOUBLE))
+        output_fields.append(QgsField('radial_distance_m', FIELD_TYPE_DOUBLE))
+        output_fields.append(QgsField('bearing_deg', FIELD_TYPE_DOUBLE))
+        output_fields.append(QgsField('design_depth', FIELD_TYPE_DOUBLE))
+        output_fields.append(QgsField('aslaid_depth', FIELD_TYPE_DOUBLE))
+        output_fields.append(QgsField('prev_ac_distance_m', FIELD_TYPE_DOUBLE))
+        output_fields.append(QgsField('next_ac_distance_m', FIELD_TYPE_DOUBLE))
         
         # Create output sink
         (sink, dest_id) = self.parameterAsSink(

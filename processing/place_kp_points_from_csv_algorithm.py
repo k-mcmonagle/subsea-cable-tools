@@ -17,7 +17,7 @@ import io
 import re
 from typing import List, Optional, Tuple
 
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication
 from ..kp_range_utils import (
     make_distance_area,
     add_distance_mode_parameter,
@@ -38,6 +38,7 @@ from qgis.core import (QgsProcessing,
                        QgsWkbTypes,
                        QgsDistanceArea,
                        QgsProcessingException)
+from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_FIELD_NUMERIC
 
 class PlaceKpPointsFromCsvAlgorithm(QgsProcessingAlgorithm):
     INPUT_TABLE = 'INPUT_TABLE'
@@ -193,7 +194,7 @@ class PlaceKpPointsFromCsvAlgorithm(QgsProcessingAlgorithm):
                 self.KP_FIELD,
                 self.tr('KP Field'),
                 parentLayerParameterName=self.INPUT_TABLE,
-                type=QgsProcessingParameterField.Numeric,
+                type=PROCESSING_FIELD_NUMERIC,
                 optional=True
             )
         )
@@ -238,15 +239,15 @@ class PlaceKpPointsFromCsvAlgorithm(QgsProcessingAlgorithm):
         if use_pasted:
             # For pasted values, we only have extras as strings
             for name in extra_names:
-                output_fields.append(QgsField(name, QVariant.String))
+                output_fields.append(QgsField(name, FIELD_TYPE_STRING))
         else:
             # Copy all fields from the input table
             source_fields = input_table.fields()
             for field in source_fields:
                 output_fields.append(field)
 
-        output_fields.append(QgsField('source_line', QVariant.String))
-        output_fields.append(QgsField('kp_value', QVariant.Double))
+        output_fields.append(QgsField('source_line', FIELD_TYPE_STRING))
+        output_fields.append(QgsField('kp_value', FIELD_TYPE_DOUBLE))
 
 
         (sink, dest_id) = self.parameterAsSink(

@@ -5,7 +5,7 @@ KPRangeHighlighterAlgorithm
 This tool highlights KP ranges along a path.
 """
 
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (QgsProcessing,
                        QgsFeatureSink,
                        QgsProcessingAlgorithm,
@@ -20,6 +20,7 @@ from qgis.core import (QgsProcessing,
                        QgsDistanceArea,
                        QgsField,
                        QgsFields)
+from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_NUMBER_DOUBLE
 
 from ..kp_range_utils import (
     extract_line_segment,
@@ -54,7 +55,7 @@ class KPRangeHighlighterAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.START_KP,
                 self.tr('Start KP'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 defaultValue=0.0
             )
         )
@@ -63,7 +64,7 @@ class KPRangeHighlighterAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.END_KP,
                 self.tr('End KP'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 defaultValue=1.0
             )
         )
@@ -93,12 +94,12 @@ class KPRangeHighlighterAlgorithm(QgsProcessingAlgorithm):
 
         # Only create new fields for the output layer (do not copy source fields)
         fields = QgsFields()
-        fields.append(QgsField('start_kp', QVariant.Double))
-        fields.append(QgsField('end_kp', QVariant.Double))
-        fields.append(QgsField('length_km', QVariant.Double))
+        fields.append(QgsField('start_kp', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('end_kp', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('length_km', FIELD_TYPE_DOUBLE))
         include_custom_label = bool(custom_label and custom_label.strip())
         if include_custom_label:
-            fields.append(QgsField('custom_label', QVariant.String))
+            fields.append(QgsField('custom_label', FIELD_TYPE_STRING))
 
         (sink, dest_id) = self.parameterAsSink(parameters, self.OUTPUT,
                                                context, fields, source.wkbType(), source.sourceCrs())

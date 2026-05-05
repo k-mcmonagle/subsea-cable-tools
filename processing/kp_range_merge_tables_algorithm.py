@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from heapq import heappop, heappush
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsFeature,
     QgsFeatureSink,
@@ -41,6 +41,7 @@ from qgis.core import (
     QgsSettings,
     QgsWkbTypes,
 )
+from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, PROCESSING_FIELD_ANY, PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE
 
 
 @dataclass(frozen=True)
@@ -182,7 +183,7 @@ class KPRangeMergeTablesAlgorithm(QgsProcessingAlgorithm):
                 self.A_START_FIELD,
                 self.tr('Table A: Start KP field'),
                 parentLayerParameterName=self.INPUT_A,
-                type=QgsProcessingParameterField.Numeric,
+                type=PROCESSING_FIELD_NUMERIC,
                 defaultValue=get_f(self.A_START_FIELD, ''),
             )
         )
@@ -191,7 +192,7 @@ class KPRangeMergeTablesAlgorithm(QgsProcessingAlgorithm):
                 self.A_END_FIELD,
                 self.tr('Table A: End KP field'),
                 parentLayerParameterName=self.INPUT_A,
-                type=QgsProcessingParameterField.Numeric,
+                type=PROCESSING_FIELD_NUMERIC,
                 defaultValue=get_f(self.A_END_FIELD, ''),
             )
         )
@@ -208,7 +209,7 @@ class KPRangeMergeTablesAlgorithm(QgsProcessingAlgorithm):
                 self.B_START_FIELD,
                 self.tr('Table B: Start KP field'),
                 parentLayerParameterName=self.INPUT_B,
-                type=QgsProcessingParameterField.Numeric,
+                type=PROCESSING_FIELD_NUMERIC,
                 defaultValue=get_f(self.B_START_FIELD, ''),
             )
         )
@@ -217,7 +218,7 @@ class KPRangeMergeTablesAlgorithm(QgsProcessingAlgorithm):
                 self.B_END_FIELD,
                 self.tr('Table B: End KP field'),
                 parentLayerParameterName=self.INPUT_B,
-                type=QgsProcessingParameterField.Numeric,
+                type=PROCESSING_FIELD_NUMERIC,
                 defaultValue=get_f(self.B_END_FIELD, ''),
             )
         )
@@ -227,7 +228,7 @@ class KPRangeMergeTablesAlgorithm(QgsProcessingAlgorithm):
                 self.B_VALUE_FROM_FIELD,
                 self.tr('Table B: Value-from field (e.g. depth_from)'),
                 parentLayerParameterName=self.INPUT_B,
-                type=QgsProcessingParameterField.Numeric,
+                type=PROCESSING_FIELD_NUMERIC,
                 optional=True,
                 defaultValue=get_f(self.B_VALUE_FROM_FIELD, ''),
             )
@@ -237,7 +238,7 @@ class KPRangeMergeTablesAlgorithm(QgsProcessingAlgorithm):
                 self.B_VALUE_TO_FIELD,
                 self.tr('Table B: Value-to field (e.g. depth_to)'),
                 parentLayerParameterName=self.INPUT_B,
-                type=QgsProcessingParameterField.Numeric,
+                type=PROCESSING_FIELD_NUMERIC,
                 optional=True,
                 defaultValue=get_f(self.B_VALUE_TO_FIELD, ''),
             )
@@ -248,7 +249,7 @@ class KPRangeMergeTablesAlgorithm(QgsProcessingAlgorithm):
                 self.B_SINGLE_VALUE_FIELD,
                 self.tr('Table B: Single value field (e.g. slope angle)'),
                 parentLayerParameterName=self.INPUT_B,
-                type=QgsProcessingParameterField.Numeric,
+                type=PROCESSING_FIELD_NUMERIC,
                 optional=True,
                 defaultValue=get_f(self.B_SINGLE_VALUE_FIELD, ''),
             )
@@ -289,7 +290,7 @@ class KPRangeMergeTablesAlgorithm(QgsProcessingAlgorithm):
                 self.LOOKUP_B_FIELD,
                 self.tr('In lookup mode: Table B field to copy'),
                 parentLayerParameterName=self.INPUT_B,
-                type=QgsProcessingParameterField.Any,
+                type=PROCESSING_FIELD_ANY,
                 optional=True,
                 defaultValue=get_f(self.LOOKUP_B_FIELD, ''),
             )
@@ -390,7 +391,7 @@ class KPRangeMergeTablesAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.TOLERANCE,
                 self.tr('KP tolerance'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 defaultValue=get_d(self.TOLERANCE, 1e-9),
                 minValue=0.0,
             )
@@ -484,8 +485,8 @@ class KPRangeMergeTablesAlgorithm(QgsProcessingAlgorithm):
                 raise QgsProcessingException(self.tr('In lookup mode, you must choose the Table B field to copy.'))
 
             fields = QgsFields()
-            fields.append(QgsField('kp_from', QVariant.Double))
-            fields.append(QgsField('kp_to', QVariant.Double))
+            fields.append(QgsField('kp_from', FIELD_TYPE_DOUBLE))
+            fields.append(QgsField('kp_to', FIELD_TYPE_DOUBLE))
 
             used = set(['kp_from', 'kp_to'])
             for n in a_extra_fields:
@@ -500,10 +501,10 @@ class KPRangeMergeTablesAlgorithm(QgsProcessingAlgorithm):
             b_f = src_b.fields().field(lookup_b_field)
             if numeric_required:
                 # For mean/min/max we emit a Double to avoid integer truncation
-                fields.append(QgsField(out_lookup_name, QVariant.Double))
+                fields.append(QgsField(out_lookup_name, FIELD_TYPE_DOUBLE))
             else:
                 fields.append(QgsField(out_lookup_name, b_f.type(), b_f.typeName(), b_f.length(), b_f.precision()))
-            fields.append(QgsField('b_match_count', QVariant.Int))
+            fields.append(QgsField('b_match_count', FIELD_TYPE_INT))
 
             (sink, dest_id) = self.parameterAsSink(
                 parameters,
@@ -605,8 +606,8 @@ class KPRangeMergeTablesAlgorithm(QgsProcessingAlgorithm):
                 )
 
             fields = QgsFields()
-            fields.append(QgsField('kp_from', QVariant.Double))
-            fields.append(QgsField('kp_to', QVariant.Double))
+            fields.append(QgsField('kp_from', FIELD_TYPE_DOUBLE))
+            fields.append(QgsField('kp_to', FIELD_TYPE_DOUBLE))
 
             # Keep A fields as-is (exclude KP fields)
             used = set(['kp_from', 'kp_to'])
@@ -618,15 +619,15 @@ class KPRangeMergeTablesAlgorithm(QgsProcessingAlgorithm):
                 fields.append(QgsField(out_name, f.type(), f.typeName(), f.length(), f.precision()))
 
             if has_pair:
-                fields.append(QgsField('b_value_min', QVariant.Double))
-                fields.append(QgsField('b_value_max', QVariant.Double))
-                fields.append(QgsField('b_value_avg', QVariant.Double))
+                fields.append(QgsField('b_value_min', FIELD_TYPE_DOUBLE))
+                fields.append(QgsField('b_value_max', FIELD_TYPE_DOUBLE))
+                fields.append(QgsField('b_value_avg', FIELD_TYPE_DOUBLE))
             else:
-                fields.append(QgsField('b_value', QVariant.Double))
+                fields.append(QgsField('b_value', FIELD_TYPE_DOUBLE))
 
             if add_coverage_fields:
-                fields.append(QgsField('b_overlap_count', QVariant.Int))
-                fields.append(QgsField('b_coverage_ratio', QVariant.Double))
+                fields.append(QgsField('b_overlap_count', FIELD_TYPE_INT))
+                fields.append(QgsField('b_coverage_ratio', FIELD_TYPE_DOUBLE))
 
             (sink, dest_id) = self.parameterAsSink(
                 parameters,
@@ -796,8 +797,8 @@ class KPRangeMergeTablesAlgorithm(QgsProcessingAlgorithm):
         # Output mode 0: canonical merge of both tables
         # Build output fields
         fields = QgsFields()
-        fields.append(QgsField('kp_from', QVariant.Double))
-        fields.append(QgsField('kp_to', QVariant.Double))
+        fields.append(QgsField('kp_from', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('kp_to', FIELD_TYPE_DOUBLE))
 
         output_a_names, output_b_names = self._build_output_field_names(
             a_extra_fields,

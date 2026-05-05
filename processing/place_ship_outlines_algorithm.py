@@ -5,7 +5,7 @@ PlaceShipOutlinesAlgorithm
 Place a ship outline geometry at each point in a point layer, rotated to a heading field.
 """
 
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
@@ -25,6 +25,7 @@ from qgis.core import (
     QgsProject,
     QgsPointXY
 )
+from ..qgis_compat import GEOMETRY_LINE, PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE, PROCESSING_NUMBER_INTEGER
 import os
 
 class PlaceShipOutlinesAlgorithm(QgsProcessingAlgorithm):
@@ -99,14 +100,14 @@ This tool places a ship outline geometry at each point in a point layer, with op
                 self.HEADING_FIELD,
                 self.tr('Heading Field (degrees, 0 = North, clockwise)'),
                 parentLayerParameterName=self.POINTS,
-                type=QgsProcessingParameterField.Numeric
+                type=PROCESSING_FIELD_NUMERIC
             )
         )
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.CRP_OFFSET_X,
                 self.tr('Additional CRP Offset X (output units)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 defaultValue=0.0
             )
         )
@@ -114,7 +115,7 @@ This tool places a ship outline geometry at each point in a point layer, with op
             QgsProcessingParameterNumber(
                 self.CRP_OFFSET_Y,
                 self.tr('Additional CRP Offset Y (output units)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 defaultValue=0.0
             )
         )
@@ -122,7 +123,7 @@ This tool places a ship outline geometry at each point in a point layer, with op
             QgsProcessingParameterNumber(
                 self.ROTATION_OFFSET,
                 self.tr('Rotation Offset (degrees)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 defaultValue=0.0
             )
         )
@@ -130,7 +131,7 @@ This tool places a ship outline geometry at each point in a point layer, with op
             QgsProcessingParameterNumber(
                 self.POINT_INTERVAL,
                 self.tr('Point Interval (place outline every Nth point; 1 = all)'),
-                type=QgsProcessingParameterNumber.Integer,
+                type=PROCESSING_NUMBER_INTEGER,
                 defaultValue=1,
                 minValue=1
             )
@@ -237,7 +238,7 @@ This tool places a ship outline geometry at each point in a point layer, with op
             y_rot = x * sin(rotation) + y * cos(rotation)
             return QgsPointXY(center_pt.x() + x_rot, center_pt.y() + y_rot)
         if geom.isMultipart():
-            if geom.type() == QgsWkbTypes.LineGeometry:
+            if geom.type() == GEOMETRY_LINE:
                 parts = []
                 for part in geom.asMultiPolyline():
                     new_part = [[transform_point(QgsPointXY(pt[0], pt[1])) for pt in ring] for ring in [part]]
@@ -253,7 +254,7 @@ This tool places a ship outline geometry at each point in a point layer, with op
                     parts.append(new_part)
                 return QgsGeometry.fromMultiPolygonXY(parts)
         else:
-            if geom.type() == QgsWkbTypes.LineGeometry:
+            if geom.type() == GEOMETRY_LINE:
                 line = geom.asPolyline()
                 new_line = [transform_point(QgsPointXY(pt[0], pt[1])) for pt in line]
                 return QgsGeometry.fromPolylineXY(new_line)

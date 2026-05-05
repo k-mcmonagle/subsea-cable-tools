@@ -49,6 +49,7 @@ from qgis.core import (
     QgsSettings,
     QgsWkbTypes,
 )
+from ..qgis_compat import PROCESSING_FIELD_ANY, PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE
 
 
 @dataclass
@@ -95,7 +96,7 @@ class KPRangeGroupAdjacentAlgorithm(QgsProcessingAlgorithm):
                 self.START_FIELD,
                 self.tr('Start KP field'),
                 parentLayerParameterName=self.INPUT,
-                type=QgsProcessingParameterField.Numeric,
+                type=PROCESSING_FIELD_NUMERIC,
                 defaultValue=get_f(self.START_FIELD, ''),
             )
         )
@@ -104,7 +105,7 @@ class KPRangeGroupAdjacentAlgorithm(QgsProcessingAlgorithm):
                 self.END_FIELD,
                 self.tr('End KP field'),
                 parentLayerParameterName=self.INPUT,
-                type=QgsProcessingParameterField.Numeric,
+                type=PROCESSING_FIELD_NUMERIC,
                 defaultValue=get_f(self.END_FIELD, ''),
             )
         )
@@ -113,7 +114,7 @@ class KPRangeGroupAdjacentAlgorithm(QgsProcessingAlgorithm):
                 self.GROUP_FIELD,
                 self.tr('Group by field (merge adjacent ranges with same value)'),
                 parentLayerParameterName=self.INPUT,
-                type=QgsProcessingParameterField.Any,
+                type=PROCESSING_FIELD_ANY,
                 defaultValue=get_f(self.GROUP_FIELD, ''),
             )
         )
@@ -136,7 +137,7 @@ class KPRangeGroupAdjacentAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.TOLERANCE,
                 self.tr('Adjacency tolerance (km)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 minValue=0.0,
                 defaultValue=get_d(self.TOLERANCE, 0.0),
             )

@@ -17,7 +17,7 @@ import io
 import re
 from typing import List, Optional, Sequence, Tuple
 
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (QgsProcessing,
                        QgsFeatureSink,
                        QgsProcessingException,
@@ -32,6 +32,7 @@ from qgis.core import (QgsProcessing,
                        QgsField,
                        QgsWkbTypes,
                        QgsDistanceArea)
+from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_FIELD_NUMERIC
 
 from ..kp_range_utils import (
     extract_line_segment,
@@ -222,7 +223,7 @@ class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
                 self.START_KP_FIELD,
                 self.tr('Start KP Field'),
                 parentLayerParameterName=self.INPUT_LAYER,
-                type=QgsProcessingParameterField.Numeric,
+                type=PROCESSING_FIELD_NUMERIC,
                 optional=True
             )
         )
@@ -231,7 +232,7 @@ class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
                 self.END_KP_FIELD,
                 self.tr('End KP Field'),
                 parentLayerParameterName=self.INPUT_LAYER,
-                type=QgsProcessingParameterField.Numeric,
+                type=PROCESSING_FIELD_NUMERIC,
                 optional=True
             )
         )
@@ -274,20 +275,20 @@ class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
 
         # Create fields for the output layer
         fields = QgsFields()
-        fields.append(QgsField('start_kp', QVariant.Double))
-        fields.append(QgsField('end_kp', QVariant.Double))
+        fields.append(QgsField('start_kp', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('end_kp', FIELD_TYPE_DOUBLE))
 
         if use_pasted:
             for name in extra_names:
-                fields.append(QgsField(name, QVariant.String))
+                fields.append(QgsField(name, FIELD_TYPE_STRING))
         else:
             for field_name in additional_fields:
                 # Get the field from the input layer to preserve its type
                 input_field = input_layer.fields().field(field_name)
                 fields.append(input_field)
 
-        fields.append(QgsField('source_table', QVariant.String))
-        fields.append(QgsField('source_line', QVariant.String))
+        fields.append(QgsField('source_table', FIELD_TYPE_STRING))
+        fields.append(QgsField('source_line', FIELD_TYPE_STRING))
 
         (sink, dest_id) = self.parameterAsSink(
             parameters,

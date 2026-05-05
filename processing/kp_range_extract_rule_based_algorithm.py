@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsDistanceArea,
     QgsFeature,
@@ -43,6 +43,7 @@ from qgis.core import (
     QgsProcessingParameterNumber,
     QgsWkbTypes,
 )
+from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_FIELD_ANY, PROCESSING_NUMBER_DOUBLE
 
 from ..kp_range_utils import (
     extract_line_segment,
@@ -93,7 +94,7 @@ class ExtractKPRangesRuleBasedAlgorithm(QgsProcessingAlgorithm):
                 self.CATEGORY_FIELD,
                 self.tr('Categorize by field'),
                 parentLayerParameterName=self.INPUT_RPL,
-                type=QgsProcessingParameterField.Any,
+                type=PROCESSING_FIELD_ANY,
             )
         )
 
@@ -109,7 +110,7 @@ class ExtractKPRangesRuleBasedAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.ADJ_TOL_KM,
                 self.tr('Adjacency tolerance (km)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 minValue=0.0,
                 defaultValue=0.0,
             )
@@ -118,7 +119,7 @@ class ExtractKPRangesRuleBasedAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.MIN_RANGE_KM,
                 self.tr('Minimum output range length (km) (0 = keep all)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 minValue=0.0,
                 defaultValue=0.0,
             )
@@ -192,10 +193,10 @@ class ExtractKPRangesRuleBasedAlgorithm(QgsProcessingAlgorithm):
 
         # Output fields (canonical; keep stable for downstream tools)
         out_fields = QgsFields()
-        out_fields.append(QgsField(self._FIELD_START_KP, QVariant.Double))
-        out_fields.append(QgsField(self._FIELD_END_KP, QVariant.Double))
-        out_fields.append(QgsField(self._FIELD_CLASS_FIELD, QVariant.String, '', 254, 0))
-        out_fields.append(QgsField(self._FIELD_CLASS_VALUE, QVariant.String, '', 254, 0))
+        out_fields.append(QgsField(self._FIELD_START_KP, FIELD_TYPE_DOUBLE))
+        out_fields.append(QgsField(self._FIELD_END_KP, FIELD_TYPE_DOUBLE))
+        out_fields.append(QgsField(self._FIELD_CLASS_FIELD, FIELD_TYPE_STRING, '', 254, 0))
+        out_fields.append(QgsField(self._FIELD_CLASS_VALUE, FIELD_TYPE_STRING, '', 254, 0))
 
         ranges_sink, ranges_dest_id = self.parameterAsSink(
             parameters,

@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication
 from ..kp_range_utils import make_distance_area
 from qgis.core import (
     QgsCoordinateReferenceSystem,
@@ -44,6 +44,7 @@ from qgis.core import (
     QgsSpatialIndex,
     QgsWkbTypes,
 )
+from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_LONG_LONG, FIELD_TYPE_STRING, GEOMETRY_LINE
 
 
 @dataclass(frozen=True)
@@ -122,7 +123,7 @@ def _extract_lines(geom: QgsGeometry) -> List[QgsGeometry]:
 
     gtype = QgsWkbTypes.geometryType(geom.wkbType())
 
-    if gtype == QgsWkbTypes.LineGeometry:
+    if gtype == GEOMETRY_LINE:
         if QgsWkbTypes.isMultiType(geom.wkbType()):
             try:
                 return [QgsGeometry.fromPolylineXY(part) for part in geom.asMultiPolyline() if len(part) >= 2]
@@ -218,12 +219,12 @@ def _polygon_field_definitions(polygon_layers) -> Tuple[List[Tuple[str, str]], L
         out_name = _unique_field_name(seen_out_names, f"area_{src_name}")
         if src_name in conflicts:
             # Use a generous fixed length to avoid provider failures (e.g., Shapefile).
-            out_fields.append(QgsField(out_name, QVariant.String, '', 254, 0))
+            out_fields.append(QgsField(out_name, FIELD_TYPE_STRING, '', 254, 0))
         else:
             f = chosen[src_name]
             # Many providers enforce hard string lengths. If the source field is short but values exceed it
             # (common for derived/edited fields), writing can fail. Prefer a safe length.
-            if f.type() == QVariant.String:
+            if f.type() == FIELD_TYPE_STRING:
                 out_fields.append(QgsField(out_name, f.type(), f.typeName(), max(int(f.length() or 0), 254), int(f.precision() or 0)))
             else:
                 out_fields.append(QgsField(out_name, f.type(), f.typeName(), f.length(), f.precision()))
@@ -325,17 +326,17 @@ class IdentifyRPLAreaListingAlgorithm(QgsProcessingAlgorithm):
         area_attr_mapping, area_attr_fields = _polygon_field_definitions(polygon_layers)
 
         fields = QgsFields()
-        fields.append(QgsField('rpl_layer', QVariant.String, '', 254, 0))
-        fields.append(QgsField('area_layer', QVariant.String, '', 254, 0))
-        fields.append(QgsField('rpl_fid', QVariant.LongLong))
-        fields.append(QgsField('area_fid', QVariant.LongLong))
+        fields.append(QgsField('rpl_layer', FIELD_TYPE_STRING, '', 254, 0))
+        fields.append(QgsField('area_layer', FIELD_TYPE_STRING, '', 254, 0))
+        fields.append(QgsField('rpl_fid', FIELD_TYPE_LONG_LONG))
+        fields.append(QgsField('area_fid', FIELD_TYPE_LONG_LONG))
         # Keep KPs consistently at 3 decimal places.
-        fields.append(QgsField('start_kp', QVariant.Double, '', 20, 3))
-        fields.append(QgsField('end_kp', QVariant.Double, '', 20, 3))
-        fields.append(QgsField('start_lat', QVariant.Double))
-        fields.append(QgsField('start_lon', QVariant.Double))
-        fields.append(QgsField('end_lat', QVariant.Double))
-        fields.append(QgsField('end_lon', QVariant.Double))
+        fields.append(QgsField('start_kp', FIELD_TYPE_DOUBLE, '', 20, 3))
+        fields.append(QgsField('end_kp', FIELD_TYPE_DOUBLE, '', 20, 3))
+        fields.append(QgsField('start_lat', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('start_lon', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('end_lat', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('end_lon', FIELD_TYPE_DOUBLE))
         for f in area_attr_fields:
             fields.append(f)
 
@@ -428,7 +429,7 @@ class IdentifyRPLAreaListingAlgorithm(QgsProcessingAlgorithm):
                         except Exception:
                             v = None
                         try:
-                            if fields.field(out_name).type() == QVariant.String and v is not None:
+                            if fields.field(out_name).type() == FIELD_TYPE_STRING and v is not None:
                                 v = str(v)
                                 max_len = int(fields.field(out_name).length() or 0)
                                 if max_len > 0 and len(v) > max_len:

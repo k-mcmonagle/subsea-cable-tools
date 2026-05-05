@@ -9,9 +9,10 @@ import os.path
 
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, Qt
 from qgis.PyQt.QtGui import QIcon
-from qgis.PyQt.QtWidgets import QAction
 
 from qgis.core import QgsApplication
+
+from .qgis_compat import QAction
 
 # Load Qt resources
 from .resources import *

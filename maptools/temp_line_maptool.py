@@ -2,6 +2,7 @@ from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QColor
 from qgis.gui import QgsMapTool, QgsRubberBand
 from qgis.core import QgsWkbTypes, QgsPointXY
+from ..qgis_compat import GEOMETRY_LINE
 
 
 class TempLineMapTool(QgsMapTool):
@@ -22,7 +23,7 @@ class TempLineMapTool(QgsMapTool):
         self._canceled_cb = canceled_callback
         self._color = color
 
-        self._rubber = QgsRubberBand(self.canvas, QgsWkbTypes.LineGeometry)
+        self._rubber = QgsRubberBand(self.canvas, GEOMETRY_LINE)
         self._rubber.setColor(self._color)
         self._rubber.setWidth(2)
         self._rubber.setLineStyle(Qt.PenStyle.SolidLine)
@@ -50,7 +51,7 @@ class TempLineMapTool(QgsMapTool):
         if not self._active:
             return
         if self._rubber is None:
-            self._rubber = QgsRubberBand(self.canvas, QgsWkbTypes.LineGeometry)
+            self._rubber = QgsRubberBand(self.canvas, GEOMETRY_LINE)
             self._rubber.setColor(self._color)
             self._rubber.setWidth(2)
             self._rubber.setLineStyle(Qt.PenStyle.SolidLine)
@@ -153,7 +154,7 @@ class TempLineMapTool(QgsMapTool):
         try:
             if self._rubber:
                 try:
-                    self._rubber.reset(QgsWkbTypes.LineGeometry)
+                    self._rubber.reset(GEOMETRY_LINE)
                 except Exception:
                     pass
                 try:

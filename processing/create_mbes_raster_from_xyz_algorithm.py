@@ -1,4 +1,4 @@
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsApplication,
     QgsProcessing,
@@ -22,6 +22,7 @@ from qgis.core import (
     QgsProcessingUtils,
     QgsRasterLayer
 )
+from ..qgis_compat import PROCESSING_NUMBER_DOUBLE
 from qgis import processing
 try:
     import numpy as np
@@ -71,7 +72,7 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.GRID_SIZE,
                 self.tr('Grid Size (0 = auto-detect per file)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 defaultValue=0.0,
                 minValue=0.0
             )
@@ -80,7 +81,7 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.MAX_DISTANCE,
                 self.tr('Maximum Interpolation Distance (0 = auto)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 defaultValue=0.0,
                 minValue=0.0,
                 optional=True

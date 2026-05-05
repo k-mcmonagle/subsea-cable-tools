@@ -2,7 +2,7 @@
 
 **Subsea Cable Tools** is a QGIS plugin for working with subsea telecom and power cable data: route position lists (RPLs), KP-based queries, bathymetry, lay corridors, and related survey/engineering tasks.
 
-Targets QGIS 3.22 or newer; the 1.5.x line is QGIS 4.0 / Qt6 ready (`supportsQt6=True`).
+Targets QGIS 3.22 or newer and declares compatibility through QGIS 4.x (`qgisMaximumVersion=4.99`). See [docs/qgis_compatibility_test_plan.md](docs/qgis_compatibility_test_plan.md) for the validation checklist before publishing a release.
 
 ---
 
@@ -15,7 +15,7 @@ Available in the Processing Toolbox under **Subsea Cable Tools**, grouped into:
 - **Route handling** â€“ Import Excel RPL, Import Cable Lay, Import / Place Ship Outlines, Plot Line Segments from Table, Translate KP Between RPLs, RPL Route Comparison.
 - **KP & ranges** â€“ Place KP Points (along route, from CSV, single), Find Nearest KP, KP Range CSV / Highlighter / Merge / Group, Extract KP Ranges (Rule Based), Extract A/C Points, KP Range Depth + Slope Summary.
 - **RPL listings & crossings** â€“ Identify RPL Crossing Points, Identify RPL Area Listing, Identify Features Intersecting RPL, Dynamic Buffer (Lay Corridor), Extract Lines Intersecting Polygons, Export KP Section Chartlets.
-- **Bathymetry** â€“ Import MDB (formerly Import Bathy MDB), Add Depth to Point Layer, Create Raster from XYZ, Merge MBES Rasters, Calculate Seabed Length.
+- **Bathymetry** â€“ Import MDB (`import_mdb`, formerly Import Bathy MDB), Add Depth to Point Layer, Create Raster from XYZ, Merge MBES Rasters, Calculate Seabed Length.
 
 ### Map & dockable tools
 

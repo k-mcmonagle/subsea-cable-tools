@@ -12,6 +12,7 @@ try:
 except Exception:  # pragma: no cover - QGIS 4.x / Qt6
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+from .qgis_compat import SIZE_POLICY_EXPANDING
 try:
     import numpy as np
 except Exception:  # pragma: no cover
@@ -164,7 +165,7 @@ class CatenaryCalculatorDialog(QDialog):
         output_layout.addWidget(self.results)
         self.figure = Figure(figsize=(5, 4))
         self.canvas = FigureCanvas(self.figure)
-        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas.setSizePolicy(SIZE_POLICY_EXPANDING, SIZE_POLICY_EXPANDING)
         output_layout.addWidget(self.canvas, stretch=1)
         button_layout = QHBoxLayout()
         self.export_svg_btn = QPushButton("Export SVG")

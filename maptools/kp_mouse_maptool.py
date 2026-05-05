@@ -10,9 +10,9 @@ Right-clicking can copy KP info to the clipboard (configurable in tool settings)
 
 from typing import Optional, Tuple
 
-from qgis.PyQt.QtCore import Qt, QSettings, QTimer, QVariant
+from qgis.PyQt.QtCore import Qt, QSettings, QTimer
 from qgis.PyQt.QtGui import QIcon, QColor, QCursor
-from qgis.PyQt.QtWidgets import (QAction, QMessageBox, QToolTip,
+from qgis.PyQt.QtWidgets import (QMessageBox, QToolTip,
                                  QApplication, QDialog, QVBoxLayout,
                                  QComboBox, QLabel, QDialogButtonBox,
                                  QToolButton, QMenu, QCheckBox, QLineEdit, QHBoxLayout, QPushButton)
@@ -20,6 +20,7 @@ from qgis.core import (QgsWkbTypes, QgsGeometry, QgsProject, QgsDistanceArea,
                        QgsPointXY, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
                        Qgis, QgsVectorLayer, QgsField, QgsFeature, QgsRaster, QgsSpatialIndex)
 from qgis.gui import QgsMapTool, QgsRubberBand, QgsVertexMarker
+from ..qgis_compat import QAction, DIALOG_ACCEPTED, qt_exec, DISTANCE_METERS, FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_LONG_LONG, FIELD_TYPE_STRING, GEOMETRY_LINE, GEOMETRY_POINT, GEOMETRY_POLYGON, LAYER_RASTER, LAYER_VECTOR, MESSAGE_CRITICAL, MESSAGE_INFO, MESSAGE_SUCCESS, MESSAGE_WARNING
 import math
 
 from ..kp_range_utils import make_distance_area
@@ -91,7 +92,7 @@ class KPMouseMapTool(QgsMapTool):
                 self.iface.messageBar().pushMessage(
                     "KP Mouse Tool",
                     "Cartesian distance requires a projected project CRS; falling back to ellipsoidal.",
-                    level=Qgis.Warning,
+                    level=MESSAGE_WARNING,
                     duration=5,
                 )
             except Exception:
@@ -122,7 +123,7 @@ class KPMouseMapTool(QgsMapTool):
         self.total_length_meters = total_length
 
         # Visual helpers
-        self.rubberBand = QgsRubberBand(self.canvas, QgsWkbTypes.LineGeometry)
+        self.rubberBand = QgsRubberBand(self.canvas, GEOMETRY_LINE)
         self.rubberBand.setColor(QColor(255, 0, 0))
         self.rubberBand.setWidth(2)
         self.rubberBand.setLineStyle(Qt.PenStyle.DashLine)
@@ -154,10 +155,10 @@ class KPMouseMapTool(QgsMapTool):
 
         # Range/Bearing resources
         self.range_bearing_origin = None
-        self.rangeBearingLine = QgsRubberBand(self.canvas, QgsWkbTypes.LineGeometry)
+        self.rangeBearingLine = QgsRubberBand(self.canvas, GEOMETRY_LINE)
         self.rangeBearingLine.setColor(QColor(0, 170, 255))
         self.rangeBearingLine.setWidth(2)
-        self.rangeBearingCircle = QgsRubberBand(self.canvas, QgsWkbTypes.PolygonGeometry)
+        self.rangeBearingCircle = QgsRubberBand(self.canvas, GEOMETRY_POLYGON)
         self.rangeBearingCircle.setColor(QColor(0, 170, 255, 60))
         self.rangeBearingCircle.setFillColor(QColor(0, 170, 255, 40))
         self.rangeBearingCircle.setWidth(1)
@@ -263,7 +264,7 @@ class KPMouseMapTool(QgsMapTool):
             return
 
         # Update the rubber band and marker.
-        self.rubberBand.reset(QgsWkbTypes.LineGeometry)
+        self.rubberBand.reset(GEOMETRY_LINE)
         self.rubberBand.addPoint(mousePoint)
         self.rubberBand.addPoint(closest_point_on_line)
         self.closestPointMarker.setCenter(closest_point_on_line)
@@ -436,7 +437,7 @@ class KPMouseMapTool(QgsMapTool):
             else:
                 act_goto_kp = None
 
-            chosen = menu.exec_(QCursor.pos())
+            chosen = qt_exec(menu, QCursor.pos())
             if not chosen:
                 return
 
@@ -461,7 +462,7 @@ class KPMouseMapTool(QgsMapTool):
                 self.iface.messageBar().pushMessage(
                     "Info",
                     "Go to KP is available after configuring a reference line.",
-                    level=Qgis.Info,
+                    level=MESSAGE_INFO,
                     duration=3,
                 )
                 return
@@ -496,7 +497,7 @@ class KPMouseMapTool(QgsMapTool):
             self.canvas.refresh()
         except Exception as e:
             try:
-                self.iface.messageBar().pushMessage("Error", f"Go to KP failed: {e}", level=Qgis.Critical, duration=4)
+                self.iface.messageBar().pushMessage("Error", f"Go to KP failed: {e}", level=MESSAGE_CRITICAL, duration=4)
             except Exception:
                 pass
 
@@ -588,9 +589,9 @@ class KPMouseMapTool(QgsMapTool):
             feedback = "KP info copied to clipboard" if extras else "KP copied to clipboard"
             QToolTip.showText(QCursor.pos(), feedback, self.canvas)
             self.iface.mainWindow().statusBar().showMessage(feedback, 2000)
-            self.iface.messageBar().pushMessage("Info", feedback, level=Qgis.Info, duration=2)
+            self.iface.messageBar().pushMessage("Info", feedback, level=MESSAGE_INFO, duration=2)
         except Exception as e:
-            self.iface.messageBar().pushMessage("Error", f"Copy failed: {e}", level=Qgis.Critical, duration=4)
+            self.iface.messageBar().pushMessage("Error", f"Copy failed: {e}", level=MESSAGE_CRITICAL, duration=4)
 
     def _format_lat_lon(self, lat: float, lon: float, fmt: str, style: str) -> str:
         fmt = (fmt or "DD").upper()
@@ -682,14 +683,14 @@ class KPMouseMapTool(QgsMapTool):
         project = QgsProject.instance()
         layer_name = "KP Points"
         for lyr in project.mapLayers().values():
-            if lyr.name() == layer_name and lyr.type() == lyr.VectorLayer and lyr.geometryType() == QgsWkbTypes.PointGeometry:
+            if lyr.name() == layer_name and lyr.type() == LAYER_VECTOR and lyr.geometryType() == GEOMETRY_POINT:
                 provider = lyr.dataProvider()
                 existing = {f.name().lower() for f in lyr.fields()}
                 new_fields = []
                 if 'ref_line' not in existing:
-                    new_fields.append(QgsField("ref_line", QVariant.String))
+                    new_fields.append(QgsField("ref_line", FIELD_TYPE_STRING))
                 if 'comment' not in existing:
-                    new_fields.append(QgsField("comment", QVariant.String))
+                    new_fields.append(QgsField("comment", FIELD_TYPE_STRING))
                 if new_fields:
                     provider.addAttributes(new_fields)
                     lyr.updateFields()
@@ -698,14 +699,14 @@ class KPMouseMapTool(QgsMapTool):
         layer = QgsVectorLayer(f"Point?crs={crs.authid()}", layer_name, "memory")
         pr = layer.dataProvider()
         pr.addAttributes([
-            QgsField("name", QVariant.String),
-            QgsField("kp", QVariant.Double),
-            QgsField("rkp", QVariant.Double),
-            QgsField("dcc", QVariant.Double),
-            QgsField("lat", QVariant.Double),
-            QgsField("lon", QVariant.Double),
-            QgsField("ref_line", QVariant.String),
-            QgsField("comment", QVariant.String),
+            QgsField("name", FIELD_TYPE_STRING),
+            QgsField("kp", FIELD_TYPE_DOUBLE),
+            QgsField("rkp", FIELD_TYPE_DOUBLE),
+            QgsField("dcc", FIELD_TYPE_DOUBLE),
+            QgsField("lat", FIELD_TYPE_DOUBLE),
+            QgsField("lon", FIELD_TYPE_DOUBLE),
+            QgsField("ref_line", FIELD_TYPE_STRING),
+            QgsField("comment", FIELD_TYPE_STRING),
         ])
         layer.updateFields()
         project.addMapLayer(layer)
@@ -750,7 +751,7 @@ class KPMouseMapTool(QgsMapTool):
 
             dlg = KPPointDialog(self.iface.mainWindow(), kp=kp_val, rkp=rkp_val, dcc=dcc_val,
                                  ref_line=self.layer.name() if self.layer else "", comment="")
-            if dlg.exec() != QDialog.Accepted:
+            if qt_exec(dlg) != DIALOG_ACCEPTED:
                 return
             comment_text = dlg.get_comment()
 
@@ -773,9 +774,9 @@ class KPMouseMapTool(QgsMapTool):
             self.iface.layerTreeView().refreshLayerSymbology(layer.id())
             msg = "Point placed at nearest KP" if snapped_to_kp else "Point placed"
             self.iface.mainWindow().statusBar().showMessage(msg, 3000)
-            self.iface.messageBar().pushMessage("Success", msg, level=Qgis.Success, duration=2)
+            self.iface.messageBar().pushMessage("Success", msg, level=MESSAGE_SUCCESS, duration=2)
         except Exception as e:
-            self.iface.messageBar().pushMessage("Error", f"Failed to place point: {e}", level=Qgis.Critical, duration=4)
+            self.iface.messageBar().pushMessage("Error", f"Failed to place point: {e}", level=MESSAGE_CRITICAL, duration=4)
 
     def _ensure_lines_layer(self):
         """Ensure there is a memory line layer to receive placed lines.
@@ -787,14 +788,14 @@ class KPMouseMapTool(QgsMapTool):
         project = QgsProject.instance()
         layer_name = "KP Range Lines"
         for lyr in project.mapLayers().values():
-            if lyr.name() == layer_name and lyr.type() == lyr.VectorLayer and lyr.geometryType() == QgsWkbTypes.LineGeometry:
+            if lyr.name() == layer_name and lyr.type() == LAYER_VECTOR and lyr.geometryType() == GEOMETRY_LINE:
                 provider = lyr.dataProvider()
                 existing = {f.name().lower() for f in lyr.fields()}
                 new_fields = []
                 if 'ref_line' not in existing:
-                    new_fields.append(QgsField("ref_line", QVariant.String))
+                    new_fields.append(QgsField("ref_line", FIELD_TYPE_STRING))
                 if 'comment' not in existing:
-                    new_fields.append(QgsField("comment", QVariant.String))
+                    new_fields.append(QgsField("comment", FIELD_TYPE_STRING))
                 if new_fields:
                     provider.addAttributes(new_fields)
                     lyr.updateFields()
@@ -803,16 +804,16 @@ class KPMouseMapTool(QgsMapTool):
         layer = QgsVectorLayer(f"LineString?crs={crs.authid()}", layer_name, "memory")
         pr = layer.dataProvider()
         pr.addAttributes([
-            QgsField("name", QVariant.String),
-            QgsField("range", QVariant.Double),
-            QgsField("bearing", QVariant.Double),
-            QgsField("range_unit", QVariant.String),
-            QgsField("origin_lat", QVariant.Double),
-            QgsField("origin_lon", QVariant.Double),
-            QgsField("target_lat", QVariant.Double),
-            QgsField("target_lon", QVariant.Double),
-            QgsField("ref_line", QVariant.String),
-            QgsField("comment", QVariant.String),
+            QgsField("name", FIELD_TYPE_STRING),
+            QgsField("range", FIELD_TYPE_DOUBLE),
+            QgsField("bearing", FIELD_TYPE_DOUBLE),
+            QgsField("range_unit", FIELD_TYPE_STRING),
+            QgsField("origin_lat", FIELD_TYPE_DOUBLE),
+            QgsField("origin_lon", FIELD_TYPE_DOUBLE),
+            QgsField("target_lat", FIELD_TYPE_DOUBLE),
+            QgsField("target_lon", FIELD_TYPE_DOUBLE),
+            QgsField("ref_line", FIELD_TYPE_STRING),
+            QgsField("comment", FIELD_TYPE_STRING),
         ])
         layer.updateFields()
         project.addMapLayer(layer)
@@ -827,14 +828,14 @@ class KPMouseMapTool(QgsMapTool):
         project = QgsProject.instance()
         layer_name = "KP Range Rings"
         for lyr in project.mapLayers().values():
-            if lyr.name() == layer_name and lyr.type() == lyr.VectorLayer and lyr.geometryType() == QgsWkbTypes.PolygonGeometry:
+            if lyr.name() == layer_name and lyr.type() == LAYER_VECTOR and lyr.geometryType() == GEOMETRY_POLYGON:
                 provider = lyr.dataProvider()
                 existing = {f.name().lower() for f in lyr.fields()}
                 new_fields = []
                 if 'ref_line' not in existing:
-                    new_fields.append(QgsField("ref_line", QVariant.String))
+                    new_fields.append(QgsField("ref_line", FIELD_TYPE_STRING))
                 if 'comment' not in existing:
-                    new_fields.append(QgsField("comment", QVariant.String))
+                    new_fields.append(QgsField("comment", FIELD_TYPE_STRING))
                 if new_fields:
                     provider.addAttributes(new_fields)
                     lyr.updateFields()
@@ -843,13 +844,13 @@ class KPMouseMapTool(QgsMapTool):
         layer = QgsVectorLayer(f"Polygon?crs={crs.authid()}", layer_name, "memory")
         pr = layer.dataProvider()
         pr.addAttributes([
-            QgsField("name", QVariant.String),
-            QgsField("radius", QVariant.Double),
-            QgsField("radius_unit", QVariant.String),
-            QgsField("center_lat", QVariant.Double),
-            QgsField("center_lon", QVariant.Double),
-            QgsField("ref_line", QVariant.String),
-            QgsField("comment", QVariant.String),
+            QgsField("name", FIELD_TYPE_STRING),
+            QgsField("radius", FIELD_TYPE_DOUBLE),
+            QgsField("radius_unit", FIELD_TYPE_STRING),
+            QgsField("center_lat", FIELD_TYPE_DOUBLE),
+            QgsField("center_lon", FIELD_TYPE_DOUBLE),
+            QgsField("ref_line", FIELD_TYPE_STRING),
+            QgsField("comment", FIELD_TYPE_STRING),
         ])
         layer.updateFields()
         project.addMapLayer(layer)
@@ -940,7 +941,7 @@ class KPMouseMapTool(QgsMapTool):
                                    bearing=bearing_deg, 
                                    range_unit=self.measurementUnit,
                                    ref_line=self.layer.name() if self.layer else "")
-            if dlg.exec() != QDialog.Accepted:
+            if qt_exec(dlg) != DIALOG_ACCEPTED:
                 return
             comment_text = dlg.get_comment()
 
@@ -994,10 +995,10 @@ class KPMouseMapTool(QgsMapTool):
 
             msg = f"Range ring placed: {display_range:.2f} {self.measurementUnit} at {bearing_text}"
             self.iface.mainWindow().statusBar().showMessage(msg, 3000)
-            self.iface.messageBar().pushMessage("Success", msg, level=Qgis.Success, duration=3)
+            self.iface.messageBar().pushMessage("Success", msg, level=MESSAGE_SUCCESS, duration=3)
 
         except Exception as e:
-            self.iface.messageBar().pushMessage("Error", f"Failed to place range ring: {e}", level=Qgis.Critical, duration=4)
+            self.iface.messageBar().pushMessage("Error", f"Failed to place range ring: {e}", level=MESSAGE_CRITICAL, duration=4)
 
     # --- Range/Bearing helper functionality (moved from dialog) ---
     def _convert_distance(self, distance_meters: float) -> float:
@@ -1045,13 +1046,13 @@ class KPMouseMapTool(QgsMapTool):
 
     def _update_range_bearing_graphics(self, mousePoint: QgsPointXY, range_meters: float):
         try:
-            self.rangeBearingLine.reset(QgsWkbTypes.LineGeometry)
+            self.rangeBearingLine.reset(GEOMETRY_LINE)
             self.rangeBearingLine.addPoint(self.range_bearing_origin)
             self.rangeBearingLine.addPoint(mousePoint)
         except Exception:
             pass
         try:
-            self.rangeBearingCircle.reset(QgsWkbTypes.PolygonGeometry)
+            self.rangeBearingCircle.reset(GEOMETRY_POLYGON)
             if range_meters <= 0:
                 return
 
@@ -1100,7 +1101,7 @@ class KPMouseMapTool(QgsMapTool):
                     geodesic_ok = True
                 except Exception:
                     geodesic_ok = False
-                    self.rangeBearingCircle.reset(QgsWkbTypes.PolygonGeometry)
+                    self.rangeBearingCircle.reset(GEOMETRY_POLYGON)
 
             if geodesic_ok:
                 return
@@ -1133,9 +1134,9 @@ class KPMouseMapTool(QgsMapTool):
     def _clear_range_bearing_graphics(self):
         try:
             if self.rangeBearingLine:
-                self.rangeBearingLine.reset(QgsWkbTypes.LineGeometry)
+                self.rangeBearingLine.reset(GEOMETRY_LINE)
             if self.rangeBearingCircle:
-                self.rangeBearingCircle.reset(QgsWkbTypes.PolygonGeometry)
+                self.rangeBearingCircle.reset(GEOMETRY_POLYGON)
         except Exception:
             pass
 
@@ -1162,7 +1163,7 @@ class KPMouseMapTool(QgsMapTool):
             if not extent.contains(transformed_point):
                 return None
             
-            if self.depthLayer.type() == self.depthLayer.RasterLayer:
+            if self.depthLayer.type() == LAYER_RASTER:
                 # For raster layers, use data provider's identify method
                 provider = self.depthLayer.dataProvider()
                 if provider is None:
@@ -1186,7 +1187,7 @@ class KPMouseMapTool(QgsMapTool):
                         val = values[band_num]
                         if val is not None and not math.isnan(val):
                             return float(val)
-            elif self.depthLayer.type() == self.depthLayer.VectorLayer and self.depthLayer.geometryType() == QgsWkbTypes.LineGeometry:
+            elif self.depthLayer.type() == LAYER_VECTOR and self.depthLayer.geometryType() == GEOMETRY_LINE:
                 # For contour layers, find nearest feature by iterating through all features
                 # (since this is on-demand sampling, performance isn't critical)
                 if not self.depthField:
@@ -1227,7 +1228,7 @@ class KPMouseMapTool(QgsMapTool):
         if not self.showDepth or self.depthLayer is None:
             msg = "Depth sampling is not configured. Please configure a depth layer in the KP Mouse Tool settings."
             self.iface.mainWindow().statusBar().showMessage(msg, 4000)
-            self.iface.messageBar().pushMessage("Info", msg, level=Qgis.Warning, duration=5)
+            self.iface.messageBar().pushMessage("Info", msg, level=MESSAGE_WARNING, duration=5)
             return
             
         try:
@@ -1235,22 +1236,22 @@ class KPMouseMapTool(QgsMapTool):
             if depth is not None:
                 msg = f"Depth at point: {depth:.2f} m"
                 self.iface.mainWindow().statusBar().showMessage(msg, 4000)
-                self.iface.messageBar().pushMessage("Depth", msg, level=Qgis.Info, duration=5)
+                self.iface.messageBar().pushMessage("Depth", msg, level=MESSAGE_INFO, duration=5)
                 QToolTip.showText(QCursor.pos(), msg, self.canvas)
             else:
                 msg = "No depth value available at this location (outside layer extent?)"
                 self.iface.mainWindow().statusBar().showMessage(msg, 4000)
-                self.iface.messageBar().pushMessage("Info", msg, level=Qgis.Warning, duration=5)
+                self.iface.messageBar().pushMessage("Info", msg, level=MESSAGE_WARNING, duration=5)
         except Exception as e:
             msg = f"Error sampling depth: {e}"
-            self.iface.messageBar().pushMessage("Error", msg, level=Qgis.Critical, duration=4)
+            self.iface.messageBar().pushMessage("Error", msg, level=MESSAGE_CRITICAL, duration=4)
 
     def deactivate(self):
         self.mouse_stop_timer.stop()
         self.persistent_tooltip_timer.stop()
         QToolTip.hideText()
         if self.rubberBand:
-            self.rubberBand.reset(QgsWkbTypes.LineGeometry)
+            self.rubberBand.reset(GEOMETRY_LINE)
         if self.closestPointMarker:
             self.closestPointMarker.hide()
         self._clear_range_bearing_graphics()
@@ -1288,7 +1289,7 @@ class KPMouseMapTool(QgsMapTool):
                     except Exception:
                         pass
                     try:
-                        self.rubberBand.reset(QgsWkbTypes.LineGeometry)
+                        self.rubberBand.reset(GEOMETRY_LINE)
                     except Exception:
                         pass
                     try:
@@ -1318,7 +1319,7 @@ class KPMouseMapTool(QgsMapTool):
         try:
             if hasattr(self, 'rangeBearingLine') and self.rangeBearingLine:
                 self.rangeBearingLine.hide()
-                self.rangeBearingLine.reset(QgsWkbTypes.LineGeometry)
+                self.rangeBearingLine.reset(GEOMETRY_LINE)
                 self.rangeBearingLine.deleteLater()
         except Exception:
             pass
@@ -1326,7 +1327,7 @@ class KPMouseMapTool(QgsMapTool):
         try:
             if hasattr(self, 'rangeBearingCircle') and self.rangeBearingCircle:
                 self.rangeBearingCircle.hide()
-                self.rangeBearingCircle.reset(QgsWkbTypes.PolygonGeometry)
+                self.rangeBearingCircle.reset(GEOMETRY_POLYGON)
                 self.rangeBearingCircle.deleteLater()
         except Exception:
             pass
@@ -1540,7 +1541,7 @@ class KPConfigDialog(QDialog):
 
         self.line_layers = [
             l for l in QgsProject.instance().mapLayers().values()
-            if l.type() == l.VectorLayer and l.geometryType() == QgsWkbTypes.LineGeometry
+            if l.type() == LAYER_VECTOR and l.geometryType() == GEOMETRY_LINE
         ]
         
         for layer in self.line_layers:
@@ -1549,7 +1550,7 @@ class KPConfigDialog(QDialog):
         # Depth layers: raster and vector line layers
         self.depth_layers = [
             l for l in QgsProject.instance().mapLayers().values()
-            if (l.type() == l.RasterLayer) or (l.type() == l.VectorLayer and l.geometryType() == QgsWkbTypes.LineGeometry)
+            if (l.type() == LAYER_RASTER) or (l.type() == LAYER_VECTOR and l.geometryType() == GEOMETRY_LINE)
         ]
         
         self.depth_layer_combo.addItem("None", None)
@@ -1687,12 +1688,12 @@ class KPConfigDialog(QDialog):
             layer_id = self.depth_layer_combo.currentData()
             if layer_id:
                 layer = QgsProject.instance().mapLayer(layer_id)
-                if layer and layer.type() == layer.VectorLayer:
+                if layer and layer.type() == LAYER_VECTOR:
                     # Populate field combo with numeric fields
                     self.depth_field_combo.clear()
                     fields = layer.fields()
                     for field in fields:
-                        if field.type() in [QVariant.Int, QVariant.Double, QVariant.LongLong]:
+                        if field.type() in [FIELD_TYPE_INT, FIELD_TYPE_DOUBLE, FIELD_TYPE_LONG_LONG]:
                             self.depth_field_combo.addItem(field.name())
                     self.depth_field_label.setEnabled(True)
                     self.depth_field_combo.setEnabled(True)
@@ -2014,7 +2015,7 @@ class KPMouseTool:
         # Clean up rubber band
         if hasattr(self, 'rubberBand') and self.rubberBand:
             try:
-                self.rubberBand.reset(QgsWkbTypes.LineGeometry)
+                self.rubberBand.reset(GEOMETRY_LINE)
                 scene = self.canvas.scene()
                 if scene and self.rubberBand in scene.items():
                     scene.removeItem(self.rubberBand)
@@ -2044,7 +2045,7 @@ class KPMouseTool:
             layer = self._get_reference_layer()
             if not layer:
                 self.iface.messageBar().pushMessage(
-                    "Info", "KP Mouse Tool: Please configure a reference layer.", level=Qgis.Info
+                    "Info", "KP Mouse Tool: Please configure a reference layer.", level=MESSAGE_INFO
                 )
                 self.show_config_dialog()
                 layer = self._get_reference_layer()
@@ -2109,7 +2110,7 @@ class KPMouseTool:
             self.copyLatLonFormat,
             self.copyLatLonStyle,
         )
-        if dialog.exec_():
+        if qt_exec(dialog):
             (
                 layer,
                 unit,
@@ -2139,14 +2140,14 @@ class KPMouseTool:
                 self.copyLatLonStyle = str(copy_latlon_style or "LABELLED").upper()
                 self.save_settings()
                 self.iface.messageBar().pushMessage(
-                    "Success", f"KP Mouse Tool configured with layer '{layer.name()}'", level=Qgis.Success
+                    "Success", f"KP Mouse Tool configured with layer '{layer.name()}'", level=MESSAGE_SUCCESS
                 )
                 if self.toolButton.isChecked():
                     self.toggle_tool(True)  # Re-enable with new settings
                 self._update_go_to_kp_enabled()
             else:
                 self.iface.messageBar().pushMessage(
-                    "Warning", "No valid reference layer selected.", level=Qgis.Warning
+                    "Warning", "No valid reference layer selected.", level=MESSAGE_WARNING
                 )
                 self._update_go_to_kp_enabled()
 
@@ -2178,7 +2179,7 @@ class KPMouseTool:
             return False
 
         try:
-            if layer.geometryType() != QgsWkbTypes.LineGeometry:
+            if layer.geometryType() != GEOMETRY_LINE:
                 return False
         except Exception:
             return False
@@ -2306,7 +2307,7 @@ class KPMouseTool:
             self.iface.messageBar().pushMessage(
                 "Info",
                 "Go to KP is available after configuring a reference line layer.",
-                level=Qgis.Info,
+                level=MESSAGE_INFO,
                 duration=3,
             )
             self._update_go_to_kp_enabled()
@@ -2317,7 +2318,7 @@ class KPMouseTool:
             self.iface.messageBar().pushMessage(
                 "Warning",
                 "Reference layer is not ready. Please reconfigure.",
-                level=Qgis.Warning,
+                level=MESSAGE_WARNING,
                 duration=3,
             )
             self._update_go_to_kp_enabled()
@@ -2332,7 +2333,7 @@ class KPMouseTool:
                 initial = None
 
         dialog = GoToKPDialog(self.iface.mainWindow(), min_kp, max_kp, initial_kp_km=initial)
-        if dialog.exec_():
+        if qt_exec(dialog):
             kp_km = dialog.chosen_kp_km()
             if kp_km is None:
                 return

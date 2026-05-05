@@ -17,7 +17,8 @@ from qgis.core import (
     QgsFeatureSink,
     QgsDistanceArea
 )
-from qgis.PyQt.QtCore import QVariant, QCoreApplication
+from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_NUMBER_DOUBLE
+from qgis.PyQt.QtCore import QCoreApplication
 from ..kp_range_utils import (
     make_distance_area,
     add_distance_mode_parameter,
@@ -81,7 +82,7 @@ class PlaceKpPointsAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.INTERVAL_CUSTOM,
                 self.tr('Custom Interval (Kilometers)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 defaultValue=None,
                 optional=True,
                 minValue=0.001
@@ -140,13 +141,13 @@ class PlaceKpPointsAlgorithm(QgsProcessingAlgorithm):
             raster_sampler = provider
 
         fields = QgsFields()
-        fields.append(QgsField("source_line", QVariant.String))
-        fields.append(QgsField("label", QVariant.String))
-        fields.append(QgsField("kp", QVariant.Double))
-        fields.append(QgsField("reverse_kp", QVariant.Double))
-        fields.append(QgsField("interval_km", QVariant.Double))
+        fields.append(QgsField("source_line", FIELD_TYPE_STRING))
+        fields.append(QgsField("label", FIELD_TYPE_STRING))
+        fields.append(QgsField("kp", FIELD_TYPE_DOUBLE))
+        fields.append(QgsField("reverse_kp", FIELD_TYPE_DOUBLE))
+        fields.append(QgsField("interval_km", FIELD_TYPE_DOUBLE))
         if raster_sampler:
-            fields.append(QgsField("depth", QVariant.Double))
+            fields.append(QgsField("depth", FIELD_TYPE_DOUBLE))
 
         (sink, dest_id) = self.parameterAsSink(
             parameters, self.OUTPUT, context, fields, QgsWkbTypes.Point, line_layer.sourceCrs()

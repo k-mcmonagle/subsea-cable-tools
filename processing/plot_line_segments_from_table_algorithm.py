@@ -5,7 +5,7 @@ PlotLineSegmentsFromTableAlgorithm
 This tool plots line segments from a table layer with start and end lat/lon columns.
 """
 
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
@@ -25,6 +25,7 @@ from qgis.core import (
     QgsFeatureSink,
     QgsProcessingContext
 )
+from ..qgis_compat import FIELD_TYPE_STRING, PROCESSING_FIELD_NUMERIC
 
 class PlotLineSegmentsFromTableAlgorithm(QgsProcessingAlgorithm):
     INPUT_TABLE = 'INPUT_TABLE'
@@ -49,7 +50,7 @@ class PlotLineSegmentsFromTableAlgorithm(QgsProcessingAlgorithm):
                 self.START_LAT_FIELD,
                 self.tr('Start Latitude Field'),
                 parentLayerParameterName=self.INPUT_TABLE,
-                type=QgsProcessingParameterField.Numeric
+                type=PROCESSING_FIELD_NUMERIC
             )
         )
         self.addParameter(
@@ -57,7 +58,7 @@ class PlotLineSegmentsFromTableAlgorithm(QgsProcessingAlgorithm):
                 self.START_LON_FIELD,
                 self.tr('Start Longitude Field'),
                 parentLayerParameterName=self.INPUT_TABLE,
-                type=QgsProcessingParameterField.Numeric
+                type=PROCESSING_FIELD_NUMERIC
             )
         )
         self.addParameter(
@@ -65,7 +66,7 @@ class PlotLineSegmentsFromTableAlgorithm(QgsProcessingAlgorithm):
                 self.END_LAT_FIELD,
                 self.tr('End Latitude Field'),
                 parentLayerParameterName=self.INPUT_TABLE,
-                type=QgsProcessingParameterField.Numeric
+                type=PROCESSING_FIELD_NUMERIC
             )
         )
         self.addParameter(
@@ -73,7 +74,7 @@ class PlotLineSegmentsFromTableAlgorithm(QgsProcessingAlgorithm):
                 self.END_LON_FIELD,
                 self.tr('End Longitude Field'),
                 parentLayerParameterName=self.INPUT_TABLE,
-                type=QgsProcessingParameterField.Numeric
+                type=PROCESSING_FIELD_NUMERIC
             )
         )
         self.addParameter(
@@ -110,7 +111,7 @@ class PlotLineSegmentsFromTableAlgorithm(QgsProcessingAlgorithm):
 
         # Prepare output fields: copy all from input plus source_table
         output_fields = QgsFields(table_layer.fields())
-        output_fields.append(QgsField('source_table', QVariant.String))
+        output_fields.append(QgsField('source_table', FIELD_TYPE_STRING))
 
         # Assume WGS84 for lat/lon
         wgs84_crs = QgsCoordinateReferenceSystem('EPSG:4326')
@@ -136,8 +137,8 @@ class PlotLineSegmentsFromTableAlgorithm(QgsProcessingAlgorithm):
         point_fields = None
         if create_point_layer:
             point_fields = QgsFields(table_layer.fields())
-            point_fields.append(QgsField('source_table', QVariant.String))
-            point_fields.append(QgsField('point_type', QVariant.String))
+            point_fields.append(QgsField('source_table', FIELD_TYPE_STRING))
+            point_fields.append(QgsField('point_type', FIELD_TYPE_STRING))
             (point_sink, point_dest_id) = self.parameterAsSink(
                 parameters, self.OUTPUT_POINT_LAYER, context, point_fields, QgsWkbTypes.Point, wgs84_crs
             )

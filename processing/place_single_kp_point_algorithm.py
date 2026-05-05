@@ -5,7 +5,7 @@ PlaceSingleKpPointAlgorithm
 This tool places a single KP point along a route.
 """
 
-from qgis.PyQt.QtCore import QCoreApplication, QVariant, QSettings
+from qgis.PyQt.QtCore import QCoreApplication, QSettings
 from ..kp_range_utils import (
     make_distance_area,
     add_distance_mode_parameter,
@@ -29,6 +29,7 @@ from qgis.core import (QgsProcessing,
                        QgsProcessingException,
                        QgsCoordinateReferenceSystem,
                        QgsCoordinateTransform)
+from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, GEOMETRY_LINE, PROCESSING_NUMBER_DOUBLE
 
 
 def _make_local_aeqd_crs(lat: float, lon: float) -> QgsCoordinateReferenceSystem:
@@ -109,7 +110,7 @@ class PlaceSingleKpPointAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.KP_VALUE,
                 self.tr('KP Value (Kilometers)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 minValue=0.0,
                 defaultValue=last_kp_val
             )
@@ -119,7 +120,7 @@ class PlaceSingleKpPointAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.DCC_VALUE,
                 self.tr('Distance Cross Course (DCC)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 defaultValue=last_dcc_val
             )
         )
@@ -159,7 +160,7 @@ class PlaceSingleKpPointAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.DCC_LINE_EXTEND,
                 self.tr('DCC Line Extension Length (same units as DCC)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 minValue=0.0,
                 defaultValue=last_dcc_line_extend
             )
@@ -237,16 +238,16 @@ class PlaceSingleKpPointAlgorithm(QgsProcessingAlgorithm):
         project_to_src = QgsCoordinateTransform(project_crs, source_crs, context.project())
 
         output_fields = QgsFields()
-        output_fields.append(QgsField('source_line', QVariant.String))
-        output_fields.append(QgsField('kp_value', QVariant.Double))
-        output_fields.append(QgsField('dcc_value', QVariant.Double))
-        output_fields.append(QgsField('dcc_unit', QVariant.String))
-        output_fields.append(QgsField('dcc_m', QVariant.Double))
-        output_fields.append(QgsField('range_to_line_m', QVariant.Double))
-        output_fields.append(QgsField('bearing_to_line_deg', QVariant.Double))
-        output_fields.append(QgsField('bearing_from_line_deg', QVariant.Double))
-        output_fields.append(QgsField('latitude', QVariant.Double))
-        output_fields.append(QgsField('longitude', QVariant.Double))
+        output_fields.append(QgsField('source_line', FIELD_TYPE_STRING))
+        output_fields.append(QgsField('kp_value', FIELD_TYPE_DOUBLE))
+        output_fields.append(QgsField('dcc_value', FIELD_TYPE_DOUBLE))
+        output_fields.append(QgsField('dcc_unit', FIELD_TYPE_STRING))
+        output_fields.append(QgsField('dcc_m', FIELD_TYPE_DOUBLE))
+        output_fields.append(QgsField('range_to_line_m', FIELD_TYPE_DOUBLE))
+        output_fields.append(QgsField('bearing_to_line_deg', FIELD_TYPE_DOUBLE))
+        output_fields.append(QgsField('bearing_from_line_deg', FIELD_TYPE_DOUBLE))
+        output_fields.append(QgsField('latitude', FIELD_TYPE_DOUBLE))
+        output_fields.append(QgsField('longitude', FIELD_TYPE_DOUBLE))
 
         (sink, dest_id) = self.parameterAsSink(
             parameters, self.OUTPUT, context, output_fields, QgsWkbTypes.Point, line_layer.sourceCrs()
@@ -275,18 +276,18 @@ class PlaceSingleKpPointAlgorithm(QgsProcessingAlgorithm):
         dcc_line_fields = None
         if add_dcc_line:
             dcc_line_fields = QgsFields()
-            dcc_line_fields.append(QgsField('source_line', QVariant.String))
-            dcc_line_fields.append(QgsField('kp_value', QVariant.Double))
-            dcc_line_fields.append(QgsField('dcc_value', QVariant.Double))
-            dcc_line_fields.append(QgsField('dcc_unit', QVariant.String))
-            dcc_line_fields.append(QgsField('dcc_m', QVariant.Double))
-            dcc_line_fields.append(QgsField('range_to_line_m', QVariant.Double))
-            dcc_line_fields.append(QgsField('bearing_to_line_deg', QVariant.Double))
-            dcc_line_fields.append(QgsField('bearing_from_line_deg', QVariant.Double))
-            dcc_line_fields.append(QgsField('start_lat', QVariant.Double))
-            dcc_line_fields.append(QgsField('start_lon', QVariant.Double))
-            dcc_line_fields.append(QgsField('end_lat', QVariant.Double))
-            dcc_line_fields.append(QgsField('end_lon', QVariant.Double))
+            dcc_line_fields.append(QgsField('source_line', FIELD_TYPE_STRING))
+            dcc_line_fields.append(QgsField('kp_value', FIELD_TYPE_DOUBLE))
+            dcc_line_fields.append(QgsField('dcc_value', FIELD_TYPE_DOUBLE))
+            dcc_line_fields.append(QgsField('dcc_unit', FIELD_TYPE_STRING))
+            dcc_line_fields.append(QgsField('dcc_m', FIELD_TYPE_DOUBLE))
+            dcc_line_fields.append(QgsField('range_to_line_m', FIELD_TYPE_DOUBLE))
+            dcc_line_fields.append(QgsField('bearing_to_line_deg', FIELD_TYPE_DOUBLE))
+            dcc_line_fields.append(QgsField('bearing_from_line_deg', FIELD_TYPE_DOUBLE))
+            dcc_line_fields.append(QgsField('start_lat', FIELD_TYPE_DOUBLE))
+            dcc_line_fields.append(QgsField('start_lon', FIELD_TYPE_DOUBLE))
+            dcc_line_fields.append(QgsField('end_lat', FIELD_TYPE_DOUBLE))
+            dcc_line_fields.append(QgsField('end_lon', FIELD_TYPE_DOUBLE))
 
             (dcc_line_sink, dcc_line_dest_id) = self.parameterAsSink(
                 parameters,
@@ -313,9 +314,9 @@ class PlaceSingleKpPointAlgorithm(QgsProcessingAlgorithm):
         except Exception:
             combined_geom = QgsGeometry.collectGeometry(geometries)
 
-        if combined_geom and combined_geom.type() != QgsWkbTypes.LineGeometry:
+        if combined_geom and combined_geom.type() != GEOMETRY_LINE:
             try:
-                combined_geom = combined_geom.convertToType(QgsWkbTypes.LineGeometry, True)
+                combined_geom = combined_geom.convertToType(GEOMETRY_LINE, True)
             except Exception:
                 pass
 

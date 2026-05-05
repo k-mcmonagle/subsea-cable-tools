@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Sequence, Tuple
 
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication
 from ..kp_range_utils import make_distance_area
 from qgis.core import (
     QgsCoordinateTransform,
@@ -36,6 +36,7 @@ from qgis.core import (
     QgsVectorLayer,
     QgsWkbTypes,
 )
+from ..qgis_compat import FIELD_TYPE_DOUBLE, GEOMETRY_LINE, GEOMETRY_POLYGON, PROCESSING_NUMBER_DOUBLE
 
 
 class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
@@ -98,7 +99,7 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.FIXED_BUFFER_M,
                 self.tr('Fixed buffer distance (m) (Fixed buffer mode only)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 minValue=0.0,
                 defaultValue=30.0,
             )
@@ -162,7 +163,7 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.CONTOUR_SEARCH_RADIUS_M,
                 self.tr('Contour search radius (m)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 minValue=0.0,
                 defaultValue=500.0,
             )
@@ -172,7 +173,7 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.SAMPLE_INTERVAL_M,
                 self.tr('Sampling interval along route (m)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 minValue=0.1,
                 defaultValue=50.0,
             )
@@ -190,7 +191,7 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.MISSING_DEPTH_BUFFER_M,
                 self.tr('Buffer distance used when depth is missing (m)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 minValue=0.0,
                 defaultValue=30.0,
             )
@@ -201,7 +202,7 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.THRESH_25,
                 self.tr('Rule threshold A (m) e.g. 25'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 minValue=0.0,
                 defaultValue=25.0,
             )
@@ -210,7 +211,7 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.THRESH_100,
                 self.tr('Rule threshold B (m) e.g. 100'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 minValue=0.0,
                 defaultValue=100.0,
             )
@@ -219,7 +220,7 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.THRESH_1000,
                 self.tr('Rule threshold C (m) e.g. 1000'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 minValue=0.0,
                 defaultValue=1000.0,
             )
@@ -229,7 +230,7 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.BUF_LT_25,
                 self.tr('Buffer when depth < A (m)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 minValue=0.0,
                 defaultValue=5.0,
             )
@@ -238,7 +239,7 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.BUF_LT_100,
                 self.tr('Buffer when A ≤ depth < B (m)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 minValue=0.0,
                 defaultValue=10.0,
             )
@@ -247,7 +248,7 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.BUF_LT_1000,
                 self.tr('Buffer when B ≤ depth < C (m)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 minValue=0.0,
                 defaultValue=30.0,
             )
@@ -256,7 +257,7 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.BUF_GE_1000,
                 self.tr('Buffer when depth ≥ C (m)'),
-                type=QgsProcessingParameterNumber.Double,
+                type=PROCESSING_NUMBER_DOUBLE,
                 minValue=0.0,
                 defaultValue=100.0,
             )
@@ -335,9 +336,9 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
 
         # Output fields: keep input fields + a few diagnostics (non-breaking)
         fields = QgsFields(source.fields())
-        fields.append(QgsField('buf_min_m', QVariant.Double))
-        fields.append(QgsField('buf_max_m', QVariant.Double))
-        fields.append(QgsField('depth_ok_pct', QVariant.Double))
+        fields.append(QgsField('buf_min_m', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('buf_max_m', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('depth_ok_pct', FIELD_TYPE_DOUBLE))
 
         (sink, dest_id) = self.parameterAsSink(
             parameters,
@@ -371,7 +372,7 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
             if not geom or geom.isEmpty():
                 continue
 
-            if geom.type() != QgsWkbTypes.LineGeometry:
+            if geom.type() != GEOMETRY_LINE:
                 continue
 
             geom_work = QgsGeometry(geom)
@@ -530,9 +531,9 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
             return QgsGeometry.fromMultiPolygonXY([geom.asPolygon()])
         if geom.wkbType() == QgsWkbTypes.MultiPolygon:
             return geom
-        if geom.type() == QgsWkbTypes.PolygonGeometry:
+        if geom.type() == GEOMETRY_POLYGON:
             # Could be GeometryCollection; try to extract polygon parts
-            parts = [g for g in geom.constParts() if g and QgsGeometry(g).type() == QgsWkbTypes.PolygonGeometry]
+            parts = [g for g in geom.constParts() if g and QgsGeometry(g).type() == GEOMETRY_POLYGON]
             if parts:
                 polys = []
                 for p in parts:

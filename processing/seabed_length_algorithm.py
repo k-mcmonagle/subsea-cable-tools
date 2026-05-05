@@ -23,7 +23,7 @@ lib_dir = os.path.join(plugin_dir, 'lib')
 if lib_dir not in sys.path:
     sys.path.insert(0, lib_dir)
 
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication
 from ..kp_range_utils import make_distance_area
 from qgis.core import (
     QgsProcessing,
@@ -53,6 +53,7 @@ from qgis.core import (
     QgsRasterLayer,
     QgsVectorLayer,
 )
+from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_STRING, PROCESSING_NUMBER_INTEGER
 
 import math
 
@@ -122,7 +123,7 @@ class SeabedLengthAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.SAMPLING_INTERVAL,
                 self.tr('Sampling Interval (m) - used for Raster bathymetry'),
-                type=QgsProcessingParameterNumber.Integer,
+                type=PROCESSING_NUMBER_INTEGER,
                 minValue=1,
                 maxValue=1000,
                 defaultValue=10
@@ -157,7 +158,7 @@ class SeabedLengthAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.KP_INTERVAL,
                 self.tr('KP Interval (km)'),
-                type=QgsProcessingParameterNumber.Integer,
+                type=PROCESSING_NUMBER_INTEGER,
                 minValue=1,
                 maxValue=100,
                 defaultValue=10
@@ -202,18 +203,18 @@ class SeabedLengthAlgorithm(QgsProcessingAlgorithm):
 
         # Prepare output fields (always include all possible fields)
         fields = QgsFields()
-        fields.append(QgsField('route_id', QVariant.String))
-        fields.append(QgsField('plan_length_m', QVariant.Double))
-        fields.append(QgsField('seabed_length_m', QVariant.Double))
-        fields.append(QgsField('elongation_ratio', QVariant.Double))
-        fields.append(QgsField('sampling_interval_m', QVariant.Int))
+        fields.append(QgsField('route_id', FIELD_TYPE_STRING))
+        fields.append(QgsField('plan_length_m', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('seabed_length_m', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('elongation_ratio', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('sampling_interval_m', FIELD_TYPE_INT))
         if do_sensitivity:
-            fields.append(QgsField('sensitivity_results', QVariant.String))
+            fields.append(QgsField('sensitivity_results', FIELD_TYPE_STRING))
         if output_intervals:
-            fields.append(QgsField('kp_start', QVariant.Double))
-            fields.append(QgsField('kp_end', QVariant.Double))
-            fields.append(QgsField('segment_length_m', QVariant.Double))
-            fields.append(QgsField('seabed_segment_length_m', QVariant.Double))
+            fields.append(QgsField('kp_start', FIELD_TYPE_DOUBLE))
+            fields.append(QgsField('kp_end', FIELD_TYPE_DOUBLE))
+            fields.append(QgsField('segment_length_m', FIELD_TYPE_DOUBLE))
+            fields.append(QgsField('seabed_segment_length_m', FIELD_TYPE_DOUBLE))
             # elongation_ratio already added
 
         (sink, dest_id) = self.parameterAsSink(parameters, self.OUTPUT, context, fields, QgsWkbTypes.NoGeometry, line_layer.crs())
@@ -228,13 +229,13 @@ class SeabedLengthAlgorithm(QgsProcessingAlgorithm):
 
         # Prepare output fields
         fields = QgsFields()
-        fields.append(QgsField('route_id', QVariant.String))
-        fields.append(QgsField('plan_length_m', QVariant.Double))
-        fields.append(QgsField('seabed_length_m', QVariant.Double))
-        fields.append(QgsField('elongation_ratio', QVariant.Double))
-        fields.append(QgsField('sampling_interval_m', QVariant.Int))
+        fields.append(QgsField('route_id', FIELD_TYPE_STRING))
+        fields.append(QgsField('plan_length_m', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('seabed_length_m', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('elongation_ratio', FIELD_TYPE_DOUBLE))
+        fields.append(QgsField('sampling_interval_m', FIELD_TYPE_INT))
         if do_sensitivity:
-            fields.append(QgsField('sensitivity_results', QVariant.String))
+            fields.append(QgsField('sensitivity_results', FIELD_TYPE_STRING))
 
         (sink, dest_id) = self.parameterAsSink(parameters, self.OUTPUT, context, fields, QgsWkbTypes.NoGeometry, line_layer.crs())
 

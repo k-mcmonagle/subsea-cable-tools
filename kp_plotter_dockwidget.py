@@ -1,6 +1,7 @@
 from qgis.PyQt.QtWidgets import QDockWidget, QVBoxLayout, QWidget, QComboBox, QLabel, QListWidget, QPushButton, QListWidgetItem, QAbstractItemView, QTabWidget, QHBoxLayout, QCheckBox, QGroupBox, QRadioButton, QButtonGroup
 from qgis.PyQt.QtCore import Qt
 from qgis.core import QgsProject, QgsVectorLayer, QgsWkbTypes, QgsGeometry, QgsPointXY, QgsDistanceArea, QgsCoordinateTransform
+from .qgis_compat import SELECTION_MODE_EXTENDED, GEOMETRY_LINE, GEOMETRY_NULL
 from qgis.gui import QgsVertexMarker
 from .kp_range_utils import make_distance_area
 try:  # Safe sip import for deleted checks
@@ -80,7 +81,7 @@ class KpPlotterDockWidget(QDockWidget):
         self.left_col_layout.addWidget(self.kp_field_combo)
         self.left_col_layout.addWidget(QLabel("Data Fields (select one or more):"))
         self.data_fields_list = QListWidget()
-        self.data_fields_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.data_fields_list.setSelectionMode(SELECTION_MODE_EXTENDED)
         self.left_col_layout.addWidget(self.data_fields_list)
         self.data_fields_list.itemSelectionChanged.connect(self.update_axis_assignment_ui)
         self.plot_button = QPushButton("Plot Data")
@@ -199,11 +200,11 @@ class KpPlotterDockWidget(QDockWidget):
         for layer in QgsProject.instance().mapLayers().values():
             if isinstance(layer, QgsVectorLayer):
                 # Reference line: only line geometry
-                if layer.geometryType() == QgsWkbTypes.LineGeometry:
+                if layer.geometryType() == GEOMETRY_LINE:
                     self.line_layer_combo.addItem(layer.name(), layer.id())
                 # Table: only non-spatial / no-geometry layers (line layers are
                 # excluded here to keep the Data Table combo focused).
-                is_table = (not layer.isSpatial()) or (layer.geometryType() == QgsWkbTypes.NullGeometry)
+                is_table = (not layer.isSpatial()) or (layer.geometryType() == GEOMETRY_NULL)
                 if is_table and layer.id() not in table_ids:
                     self.table_layer_combo.addItem(layer.name(), layer.id())
                     table_ids.add(layer.id())
@@ -427,7 +428,7 @@ class KpPlotterDockWidget(QDockWidget):
         self.save_user_settings()
 
         line_layer = QgsProject.instance().mapLayer(line_layer_id)
-        if not line_layer or not isinstance(line_layer, QgsVectorLayer) or line_layer.geometryType() != QgsWkbTypes.LineGeometry:
+        if not line_layer or not isinstance(line_layer, QgsVectorLayer) or line_layer.geometryType() != GEOMETRY_LINE:
             ax.set_title("Invalid reference line layer.")
             self.canvas.draw()
             return

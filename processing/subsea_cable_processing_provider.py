@@ -9,6 +9,7 @@ import importlib
 import traceback
 
 from qgis.core import QgsProcessingProvider, QgsMessageLog, Qgis
+from ..qgis_compat import MESSAGE_INFO, MESSAGE_WARNING
 
 
 class SubseaCableProcessingProvider(QgsProcessingProvider):
@@ -31,10 +32,10 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
                 QgsMessageLog.logMessage(
                     f'Failed to register algorithm {class_name} from {module_name}.\n{traceback.format_exc()}',
                     'Subsea Cable Tools',
-                    Qgis.Warning,
+                    MESSAGE_WARNING,
                 )
 
-        QgsMessageLog.logMessage('Loading Subsea Cable Tools algorithms...', 'Subsea Cable Tools', Qgis.Info)
+        QgsMessageLog.logMessage('Loading Subsea Cable Tools algorithms...', 'Subsea Cable Tools', MESSAGE_INFO)
 
         # Algorithms are listed by toolbox group, then alphabetically by class
         # name within each group. Adding a new algorithm? Slot it into the right
@@ -66,7 +67,7 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
         safe_add('translate_kp_from_rpl_to_rpl_algorithm', 'TranslateKPFromRPLToRPLAlgorithm')
 
         # --- MDB Tools ---
-        safe_add('import_bathy_mdb_algorithm', 'ImportBathyMdbAlgorithm')
+        safe_add('import_mdb_algorithm', 'ImportMdbAlgorithm')
 
         # --- MBES Tools ---
         safe_add('create_mbes_raster_from_xyz_algorithm', 'CreateMBESRasterFromXYZAlgorithm')

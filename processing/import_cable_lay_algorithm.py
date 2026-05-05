@@ -5,7 +5,7 @@ ImportCableLayAlgorithm
 Import cable lay CSV data to QGIS as a point layer
 """
 
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
@@ -21,6 +21,7 @@ from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsProcessingLayerPostProcessorInterface
 )
+from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_LONG_LONG, FIELD_TYPE_STRING, PROCESSING_NUMBER_INTEGER
 import csv
 import os
 
@@ -138,7 +139,7 @@ class ImportCableLayAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.DOWNSAMPLE,
                 self.tr('Downsample Factor (load every Nth record, 1 = all)'),
-                type=QgsProcessingParameterNumber.Integer,
+                type=PROCESSING_NUMBER_INTEGER,
                 defaultValue=1,
                 minValue=1
             )
@@ -284,11 +285,11 @@ class ImportCableLayAlgorithm(QgsProcessingAlgorithm):
                 t = infer_type(col)
                 col_types[col] = t
                 if t == 'int':
-                    fields.append(QgsField(col, QVariant.LongLong))
+                    fields.append(QgsField(col, FIELD_TYPE_LONG_LONG))
                 elif t == 'float':
-                    fields.append(QgsField(col, QVariant.Double))
+                    fields.append(QgsField(col, FIELD_TYPE_DOUBLE))
                 else:
-                    fields.append(QgsField(col, QVariant.String))
+                    fields.append(QgsField(col, FIELD_TYPE_STRING))
         
         # Provide feedback on detected field types
         type_summary = []
@@ -310,9 +311,9 @@ class ImportCableLayAlgorithm(QgsProcessingAlgorithm):
         for extra in extra_fields:
             if extra not in csv_cols:
                 if extra in ['Lat_dd', 'Lon_dd']:
-                    fields.append(QgsField(extra, QVariant.Double))
+                    fields.append(QgsField(extra, FIELD_TYPE_DOUBLE))
                 else:
-                    fields.append(QgsField(extra, QVariant.String))
+                    fields.append(QgsField(extra, FIELD_TYPE_STRING))
 
         (sink, dest_id) = self.parameterAsSink(
             parameters,
