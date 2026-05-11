@@ -3,13 +3,13 @@
 Catenary Calculator Dialog for Subsea Cable Tools QGIS Plugin
 
 Upgraded version:
-- Models a full suspended system from TDP (touchdown at seabed) up to the chute exit:
+- Models a full cable system from TDP (touchdown at seabed) up to the chute top reference:
   * Submerged + in-air cable (different weights in each medium)
   * Optional components (bodies like repeaters / joints) as:
       - short heavy sections (delta distributed weight over a length)
       - or point loads (vertical lump load, causes a kink)
-  * Optional quarter-circle "chute" geometry (rendered) with radius and exit height above waterline
-- No extra dependencies beyond what ships with QGIS (PyQt5, matplotlib, numpy).
+    * Optional quarter-circle "chute" geometry (rendered) with radius and top height above waterline
+- Plotting uses the bundled pyqtgraph package so QGIS does not need to ship matplotlib.
 
 Coordinate convention (internal):
 - Sea level: y = 0
@@ -17,7 +17,8 @@ Coordinate convention (internal):
 - Below sea: y < 0
 - Seabed at y = -water_depth
 - TDP starts at (x=0, y=-water_depth)
-- Chute exit ends at (x=layback, y=+chute_exit_height)
+- Chute top reference is at (x=layback, y=+chute_exit_height)
+- With a chute radius, the free span ends at the tangent/contact point on the chute arc.
 
 Plot convention:
 - Depth = -y (so seabed is +depth, above sea is negative depth)
@@ -27,29 +28,30 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
-from typing import TYPE_CHECKING
 
 from qgis.PyQt.QtWidgets import (
-    QAbstractItemView,
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
+    QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
     QTextEdit, QWidget, QFormLayout, QSizePolicy, QFileDialog, QDoubleSpinBox,
-    QTabWidget, QTableWidget, QTableWidgetItem, QMessageBox, QHeaderView
+    QScrollArea, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem, QMessageBox
     , QCheckBox, QColorDialog
 )
 from qgis.PyQt.QtCore import Qt, QSettings, QTimer
 from qgis.PyQt.QtGui import QColor
-from matplotlib.figure import Figure
-from .qgis_compat import SELECTION_MODE_SINGLE, SIZE_POLICY_EXPANDING
-from matplotlib.collections import LineCollection
-
-if TYPE_CHECKING:  # keep Pylance happy
-    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-else:
-    try:
-        # QGIS typically ships Qt5Agg
-        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-    except Exception:  # pragma: no cover
-        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from .qgis_compat import (
+    EDIT_TRIGGER_DOUBLE_CLICKED,
+    EDIT_TRIGGER_EDIT_KEY_PRESSED,
+    EDIT_TRIGGER_SELECTED_CLICKED,
+    HEADER_RESIZE_MODE_INTERACTIVE,
+    SELECTION_BEHAVIOR_SELECT_ROWS,
+    SELECTION_MODE_SINGLE,
+    SIZE_POLICY_EXPANDING,
+)
+from .catenary_plot_widget import (
+    CatenaryLineCollection as LineCollection,
+    CatenaryPlotCanvas as FigureCanvas,
+    CatenaryPlotFigure as Figure,
+    get_tab10_color,
+)
 
 try:
     import numpy as np
@@ -82,8 +84,8 @@ class Component:
     A component that modifies the cable system over a section, or at a point.
 
     Interpretation:
-    - s_from_tdp_m: distance along the suspended cable measured from the TDP upward (m).
-      (TDP = 0m, chute exit = total_suspended_length)
+        - s_from_tdp_m: distance along the free-span cable measured from the TDP upward (m).
+            (TDP = 0m, chute contact = free_span_length)
     - length_m:
         * if > 0: apply distributed delta weights over [s, s+length]
         * if = 0: it's a point event (usually point_load_kN)
@@ -300,7 +302,7 @@ class CatenarySystemCalculator:
 
         # If we are using Assembly mapping, the chute contact length matters to convert
         # between s (from TDP) and d (from chute top). But the contact length itself depends
-        # on the exit angle (theta_end). Do a tiny fixed-point iteration so the mapping is
+        # on the tangent angle (theta_end). Do a tiny fixed-point iteration so the mapping is
         # self-consistent.
         R = float(self.cfg.get("chute_radius_m", 0.0))
 
@@ -649,7 +651,7 @@ class CatenarySystemCalculator:
                     f"(H={H/1000.0:.3f} kN, initial S_guess={S_guess:.3f} m)\n\nDetails: {e}"
                 )
 
-        # Mode 1: Catenary Length (total suspended length S is input). Solve H for y_target.
+        # Mode 1: Catenary Length (total cable length S is input). Solve H for y_target.
         if mode == "Catenary Length":
             S_total_in = self.cfg["S_input_m"]
 
@@ -665,7 +667,7 @@ class CatenarySystemCalculator:
                 H = self._bisect(fH_total_len, a, b, tol=1e-3)
             except Exception as e:
                 raise ValueError(
-                    "Failed to solve for Bottom Tension (H) that matches the requested total suspended length. "
+                    "Failed to solve for Bottom Tension (H) that matches the requested total cable length. "
                     "This can happen if the required length is incompatible with the geometry/weights or if bracketing fails. "
                     f"(Requested S={S_total_in:.3f} m, initial H_guess={H0/1000.0:.3f} kN)\n\nDetails: {e}"
                 )
@@ -715,11 +717,11 @@ class CatenarySystemCalculator:
             Lc, _ = chute_contact_from_theta(theta_end)
             S = S_free + Lc
 
-        # Mode 4: Exit Angle at chute exit is input (from horizontal). Solve H such that angle matches.
-        elif mode == "Exit Angle":
+        # Mode 4: Tangent angle at chute contact is input (from horizontal). Solve H such that angle matches.
+        elif mode in ("Tangent Angle", "Exit Angle"):
             theta_target_rad = math.radians(self.cfg["exit_angle_from_h_deg"])
             if not (0 < theta_target_rad < math.radians(89.9)):
-                raise ValueError("Exit angle must be between 0 and 90 degrees (exclusive).")
+                raise ValueError("Tangent angle must be between 0 and 90 degrees (exclusive).")
 
             Lc_target, y_dep_target = chute_contact_from_theta(theta_target_rad)
 
@@ -742,10 +744,10 @@ class CatenarySystemCalculator:
                 H = self._bisect(fH_exit_angle, a, b, tol=1e-6)
             except Exception as e:
                 raise ValueError(
-                    "Failed to solve for H that matches the requested exit angle. "
+                    "Failed to solve for H that matches the requested tangent angle. "
                     "This usually means the target angle is not achievable for the given geometry/weights, "
                     "or that strong point loads/buoyancy make the relationship non-monotonic. "
-                    f"(Requested exit angle={math.degrees(theta_target_rad):.3f}° from horizontal, initial H_guess={H0/1000.0:.3f} kN)\n\nDetails: {e}"
+                    f"(Requested tangent angle={math.degrees(theta_target_rad):.3f}° from horizontal, initial H_guess={H0/1000.0:.3f} kN)\n\nDetails: {e}"
                 )
             # final solve for free span
             def fS_final(S_free):
@@ -759,11 +761,11 @@ class CatenarySystemCalculator:
             x_end, y_end, V_end, theta_end, T_top, s_arr, x_arr, y_arr = self.integrate(H, S_free, ds)
             S = S_free + Lc_target
 
-        # Mode 5: Top Tension at chute exit is input. Solve H such that top tension matches.
-        elif mode == "Top Tension":
+        # Mode 5: Tension at chute contact is input. Solve H such that contact tension matches.
+        elif mode in ("Contact Tension", "Top Tension"):
             T_top_target_N = self.cfg["Ttop_input_N"]
             if T_top_target_N <= 0:
-                raise ValueError("Top tension must be > 0.")
+                raise ValueError("Contact tension must be > 0.")
 
             def fH_top_tension(H):
                 S_free = solve_S_free_for_H(H)
@@ -776,9 +778,9 @@ class CatenarySystemCalculator:
                 H = self._bisect(fH_top_tension, a, b, tol=5.0)
             except Exception as e:
                 raise ValueError(
-                    "Failed to solve for H that matches the requested top tension. "
-                    "This can happen if the requested top tension is outside the achievable range for the given geometry/weights. "
-                    f"(Requested top tension={T_top_target_N/1000.0:.3f} kN, initial H_guess={H0/1000.0:.3f} kN)\n\nDetails: {e}"
+                    "Failed to solve for H that matches the requested contact tension. "
+                    "This can happen if the requested contact tension is outside the achievable range for the given geometry/weights. "
+                    f"(Requested contact tension={T_top_target_N/1000.0:.3f} kN, initial H_guess={H0/1000.0:.3f} kN)\n\nDetails: {e}"
                 )
             S_free = solve_S_free_for_H(H)
             x_end, y_end, V_end, theta_end, T_top, s_arr, x_arr, y_arr = self.integrate(H, S_free, ds)
@@ -878,6 +880,8 @@ class CatenaryCalculatorV2Dialog(QDialog):
         "#bcbd22",  # tab:olive
         "#17becf",  # tab:cyan
     ]
+    _DEFAULT_Q_WATER_NPM = 22.0
+    _DEFAULT_Q_AIR_NPM = 28.0
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -890,34 +894,60 @@ class CatenaryCalculatorV2Dialog(QDialog):
             )
             self.setEnabled(False)
             return
-        self.setWindowTitle("Subsea Cable Catenary Calculator (Upgraded)")
-        self.resize(1500, 920)
-        self.setMinimumWidth(1250)
-        self.setMinimumHeight(820)
+        self.setWindowTitle("Subsea Cable Catenary Calculator V2")
+        self._fit_initial_size_to_screen()
 
         self.settings = QSettings("subsea_cable_tools", "CatenaryCalculatorUpgraded")
 
         self._prev_angle_ref = 0
         self._last_calc: Optional[CatenarySystemCalculator] = None
+        self._initializing = True
+        self._fallback_q_water_npm = self._DEFAULT_Q_WATER_NPM
+        self._fallback_q_air_npm = self._DEFAULT_Q_AIR_NPM
+        self._syncing_assembly_json = False
 
         # Debounce heavy recalculations while editing.
         self._update_timer = QTimer(self)
         self._update_timer.setSingleShot(True)
         self._update_timer.timeout.connect(self.update_plot)
 
+        self._assembly_json_timer = QTimer(self)
+        self._assembly_json_timer.setSingleShot(True)
+        self._assembly_json_timer.timeout.connect(self._apply_assembly_json_text)
+
         self.init_ui()
         self.restore_user_settings()
         self.update_input_fields()
-        self.update_plot()
+        self._initializing = False
+        self.results.setHtml("Ready. Preparing plot...")
+        QTimer.singleShot(0, self.update_plot)
 
     def schedule_update_plot(self):
         """Debounced wrapper around `update_plot` for high-frequency UI signals."""
+        if getattr(self, "_initializing", False):
+            return
         # 150ms feels responsive but avoids dozens of solves while typing.
         self._update_timer.start(150)
 
     def closeEvent(self, a0):
         self.save_user_settings()
         super().closeEvent(a0)
+
+    def _fit_initial_size_to_screen(self):
+        min_w = 760
+        min_h = 540
+        width = 1180
+        height = 760
+        try:
+            screen = self.screen() or QApplication.primaryScreen()
+            available = screen.availableGeometry() if screen is not None else None
+            if available is not None:
+                width = min(width, max(min_w, int(available.width() * 0.92)))
+                height = min(height, max(min_h, int(available.height() * 0.88)))
+        except Exception:
+            pass
+        self.setMinimumSize(min_w, min_h)
+        self.resize(width, height)
 
     # ---- Persistent settings
 
@@ -927,9 +957,9 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.settings.setValue("chute_radius", self.chute_radius.value())
         self.settings.setValue("ds_step", self.ds_step.value())
 
-        self.settings.setValue("weight_water", self.weight_water.value())
-        self.settings.setValue("weight_air", self.weight_air.value())
-        self.settings.setValue("weight_unit", self.weight_unit.currentIndex())
+        self.settings.setValue("weight_water", self._fallback_q_water_npm)
+        self.settings.setValue("weight_air", self._fallback_q_air_npm)
+        self.settings.setValue("weight_unit", 0)
 
         self.settings.setValue("input_parameter", self.input_parameter.currentIndex())
         self.settings.setValue("bottom_tension", self.bottom_tension.value())
@@ -939,7 +969,6 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.settings.setValue("catenary_length", self.catenary_length.value())
         self.settings.setValue("layback", self.layback.value())
 
-        self.settings.setValue("components_text", self.components_text.toPlainText())
         self.settings.setValue("assembly_input_tab", self.assembly_tabs.currentIndex())
         self.settings.setValue("assembly_table_json", self._assembly_table_to_json())
         self.settings.setValue("show_full_assembly_seabed", bool(self.show_full_assembly_seabed.isChecked()))
@@ -978,12 +1007,19 @@ class CatenaryCalculatorV2Dialog(QDialog):
         if (v := _get_float("ds_step")) is not None:
             self.ds_step.setValue(v)
 
+        weight_unit_idx = _get_int("weight_unit", 0)
+        weight_units = ["N/m", "kg/m", "lbf/ft"]
+        weight_unit = weight_units[weight_unit_idx] if 0 <= int(weight_unit_idx or 0) < len(weight_units) else "N/m"
         if (v := _get_float("weight_water")) is not None:
-            self.weight_water.setValue(v)
+            try:
+                self._fallback_q_water_npm = CatenarySystemCalculator._unit_to_npm(v, weight_unit)
+            except Exception:
+                pass
         if (v := _get_float("weight_air")) is not None:
-            self.weight_air.setValue(v)
-        if (v := _get_int("weight_unit")) is not None:
-            self.weight_unit.setCurrentIndex(v)
+            try:
+                self._fallback_q_air_npm = CatenarySystemCalculator._unit_to_npm(v, weight_unit)
+            except Exception:
+                pass
 
         if (v := _get_int("input_parameter")) is not None:
             self.input_parameter.setCurrentIndex(v)
@@ -1000,10 +1036,6 @@ class CatenaryCalculatorV2Dialog(QDialog):
         if (v := _get_float("layback")) is not None:
             self.layback.setValue(v)
 
-        txt = self.settings.value("components_text")
-        if txt is not None:
-            self.components_text.setPlainText(str(txt))
-
         tab_idx = self.settings.value("assembly_input_tab")
         if tab_idx is not None:
             try:
@@ -1014,6 +1046,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
         table_json = self.settings.value("assembly_table_json")
         if table_json is not None:
             self._assembly_table_from_json(str(table_json))
+        self._sync_json_from_table()
 
         v = self.settings.value("show_full_assembly_seabed")
         if v is not None:
@@ -1046,11 +1079,21 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
     def init_ui(self):
         main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+
+        horizontal_orientation = getattr(getattr(Qt, "Orientation", Qt), "Horizontal")
+        self.main_splitter = QSplitter(horizontal_orientation)
 
         # Left: Inputs
         input_widget = QWidget()
         input_layout = QFormLayout(input_widget)
-        input_widget.setMinimumWidth(360)
+        input_widget.setMinimumWidth(300)
+
+        input_scroll = QScrollArea()
+        input_scroll.setWidgetResizable(True)
+        input_scroll.setMinimumWidth(300)
+        input_scroll.setMaximumWidth(540)
+        input_scroll.setWidget(input_widget)
 
         # Geometry
         self.water_depth = QDoubleSpinBox()
@@ -1062,6 +1105,10 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.chute_exit_height.setRange(0, 1e5)
         self.chute_exit_height.setDecimals(2)
         self.chute_exit_height.setValue(0.0)  # height above sea level
+        self.chute_exit_height.setToolTip(
+            "Height above waterline of the top reference point of the chute. "
+            "With a chute radius, the free-span cable contacts the chute lower on the arc."
+        )
 
         self.chute_radius = QDoubleSpinBox()
         self.chute_radius.setRange(0, 1e4)
@@ -1078,28 +1125,14 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.ds_step.setSingleStep(0.1)
         self.ds_step.setValue(0.5)
 
-        # Weights
-        self.weight_water = QDoubleSpinBox()
-        self.weight_water.setRange(0, 1e6)
-        self.weight_water.setDecimals(4)
-        self.weight_water.setValue(22.0)
-
-        self.weight_air = QDoubleSpinBox()
-        self.weight_air.setRange(0, 1e6)
-        self.weight_air.setDecimals(4)
-        self.weight_air.setValue(28.0)
-
-        self.weight_unit = QComboBox()
-        self.weight_unit.addItems(["N/m", "kg/m", "lbf/ft"])
-
         # Solve mode
         self.input_parameter = QComboBox()
         self.input_parameter.addItems([
             "Bottom Tension",      # H is input (kN)
-            "Top Tension",         # top T is input (kN)
-            "Exit Angle",          # at chute exit
-            "Catenary Length",     # total suspended length (m) from TDP to chute exit
-            "Layback"              # horizontal distance from TDP to chute exit (m)
+            "Contact Tension",     # contact T is input (kN)
+            "Tangent Angle",       # tangent angle at chute contact
+            "Catenary Length",     # total cable length (m) from TDP to chute top via chute arc
+            "Layback"              # horizontal distance from TDP to chute top
         ])
 
         # Inputs depending on mode
@@ -1112,6 +1145,9 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.top_tension.setRange(0, 1e6)
         self.top_tension.setDecimals(3)
         self.top_tension.setValue(80.0)
+        self.top_tension.setToolTip(
+            "Tension at the free-span/chute contact point. The chute arc is drawn geometrically; chute friction is not modeled."
+        )
 
         self.exit_angle = QDoubleSpinBox()
         self.exit_angle.setRange(0.01, 89.99)
@@ -1144,14 +1180,16 @@ class CatenaryCalculatorV2Dialog(QDialog):
             "Body load (kN)",
             "Colour",
         ])
-        self.assembly_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.assembly_table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
         self.assembly_table.setSelectionMode(SELECTION_MODE_SINGLE)
-        self.assembly_table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked | QAbstractItemView.EditKeyPressed)
+        self.assembly_table.setEditTriggers(
+            EDIT_TRIGGER_DOUBLE_CLICKED | EDIT_TRIGGER_SELECTED_CLICKED | EDIT_TRIGGER_EDIT_KEY_PRESSED
+        )
         header = self.assembly_table.horizontalHeader()
         if header is not None:
-            header.setSectionResizeMode(QHeaderView.Interactive)
+            header.setSectionResizeMode(HEADER_RESIZE_MODE_INTERACTIVE)
             header.setStretchLastSection(True)
-        self.assembly_table.setMinimumHeight(190)
+        self.assembly_table.setMinimumHeight(150)
 
         a_btn_row = QHBoxLayout()
         self.asm_add_seg_btn = QPushButton("Add Segment")
@@ -1172,52 +1210,38 @@ class CatenaryCalculatorV2Dialog(QDialog):
         asm_tab_layout.addLayout(a_btn_row)
         self.assembly_tabs.addTab(asm_tab, "Assembly")
 
-        # Legacy text editor (kept for power users / backwards compatibility)
-        self.components_text = QTextEdit()
-        self.components_text.setMinimumHeight(140)
-        self.components_text.setPlaceholderText(
-            "# Components (optional):\n"
-            "# name, s_from_TDP_m, length_m, delta_q_water(N/m), delta_q_air(N/m), point_load_kN\n"
-            "# Examples:\n"
-            "# Repeater, 80, 4, 200, 200, 0\n"
-            "# JointHousing, 120, 0, 0, 0, 15\n"
+        self.assembly_json_text = QTextEdit()
+        self.assembly_json_text.setAcceptRichText(False)
+        self.assembly_json_text.setMinimumHeight(120)
+        self.assembly_json_text.setPlaceholderText(
+            "[\n"
+            "  {\"type\": \"segment\", \"name\": \"Cable\", \"length_m\": 1000, \"q_water_npm\": 22, \"q_air_npm\": 28, \"color\": \"#1f77b4\"}\n"
+            "]"
         )
-        text_tab = QWidget()
-        text_tab_layout = QVBoxLayout(text_tab)
-        text_tab_layout.addWidget(self.components_text)
-        self.assembly_tabs.addTab(text_tab, "Legacy Text")
+        json_tab = QWidget()
+        json_tab_layout = QVBoxLayout(json_tab)
+        json_tab_layout.addWidget(self.assembly_json_text)
+        self.assembly_tabs.addTab(json_tab, "JSON")
 
         # Layout entries
         input_layout.addRow(QLabel("<b>Geometry</b>"))
         input_layout.addRow("Water Depth D (m):", self.water_depth)
-        input_layout.addRow("Chute Exit Height c above WL (m):", self.chute_exit_height)
+        input_layout.addRow("Chute Top Height c above WL (m):", self.chute_exit_height)
         input_layout.addRow("Chute Radius R (m):", self.chute_radius)
         input_layout.addRow("Integration step ds (m):", self.ds_step)
-
-        input_layout.addRow(QLabel("<b>Cable Weight</b>"))
-        w_layout = QHBoxLayout()
-        w_layout.addWidget(self.weight_water)
-        w_layout.addWidget(QLabel("in water"))
-        input_layout.addRow("Weight:", w_layout)
-
-        a_layout = QHBoxLayout()
-        a_layout.addWidget(self.weight_air)
-        a_layout.addWidget(QLabel("in air"))
-        a_layout.addWidget(self.weight_unit)
-        input_layout.addRow("", a_layout)
 
         input_layout.addRow(QLabel("<b>Solve Mode</b>"))
         input_layout.addRow("Select Input Parameter:", self.input_parameter)
         input_layout.addRow("Bottom Tension H (kN):", self.bottom_tension)
-        input_layout.addRow("Top Tension (kN):", self.top_tension)
+        input_layout.addRow("Tension at Contact (kN):", self.top_tension)
 
         ang_layout = QHBoxLayout()
         ang_layout.addWidget(self.exit_angle)
         ang_layout.addWidget(self.angle_reference)
-        input_layout.addRow("Exit Angle at Chute:", ang_layout)
+        input_layout.addRow("Tangent Angle at Chute:", ang_layout)
 
-        input_layout.addRow("Total Suspended Length S (m):", self.catenary_length)
-        input_layout.addRow("Layback to Chute (m):", self.layback)
+        input_layout.addRow("Total Cable Length S (m):", self.catenary_length)
+        input_layout.addRow("Layback to Chute Top (m):", self.layback)
 
         input_layout.addRow(QLabel("<b>Cable Assembly</b>"))
         input_layout.addRow(self.assembly_tabs)
@@ -1231,17 +1255,15 @@ class CatenaryCalculatorV2Dialog(QDialog):
         note = QLabel(
             "<i>"
             "Notes:<br>"
-            "• The system is solved as a suspended cable from TDP (seabed touchdown) to the chute exit point.<br>"
+            "• The system is solved as a suspended cable from TDP (seabed touchdown) to the chute contact point, then along the chute arc to the chute top reference point.<br>"
             "• Submerged vs in-air is determined automatically when the curve crosses sea level (y=0).<br>"
             "• Assembly is defined from the chute top down (Segment rows set q; Body rows add lumped load/buoyancy).<br>"
             "• Point loads create a mathematical kink (angle discontinuity). Prefer short sections if you care about curvature/MBR.<br>"
-            "• Chute contact is modeled by enforcing the free-span tangent to match the chute arc tangent; contact length depends on exit angle."
+            "• Chute contact is modeled by enforcing the free-span tangent to match the chute arc tangent; contact length depends on tangent angle."
             "</i>"
         )
         note.setWordWrap(True)
         input_layout.addRow(note)
-
-        main_layout.addWidget(input_widget)
 
         # Right: Outputs + plot
         output_widget = QWidget()
@@ -1250,7 +1272,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
         output_layout.addWidget(QLabel("<b>Results</b>"))
         self.results = QTextEdit()
         self.results.setReadOnly(True)
-        self.results.setMinimumHeight(240)
+        self.results.setMinimumHeight(130)
         output_layout.addWidget(self.results)
 
         self.figure = Figure(figsize=(6, 5))
@@ -1270,23 +1292,25 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.show_legend.setToolTip("Show/hide the plot legend. Keeping it hidden avoids covering the plot.")
         output_layout.addWidget(self.show_legend)
 
-        main_layout.addWidget(output_widget, stretch=1)
+        self.main_splitter.addWidget(input_scroll)
+        self.main_splitter.addWidget(output_widget)
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setSizes([380, 800])
+        main_layout.addWidget(self.main_splitter)
 
         # signals
         for w in [
             self.water_depth, self.chute_exit_height, self.chute_radius, self.ds_step,
-            self.weight_water, self.weight_air,
             self.bottom_tension, self.top_tension, self.exit_angle,
             self.catenary_length, self.layback
         ]:
             w.valueChanged.connect(self.schedule_update_plot)
 
-        self.weight_unit.currentIndexChanged.connect(self.schedule_update_plot)
         self.input_parameter.currentIndexChanged.connect(self.update_input_fields)
         self.input_parameter.currentIndexChanged.connect(self.schedule_update_plot)
         self.angle_reference.currentIndexChanged.connect(self.on_angle_reference_changed)
-        self.components_text.textChanged.connect(self.schedule_update_plot)
-        self.assembly_tabs.currentChanged.connect(self.schedule_update_plot)
+        self.assembly_json_text.textChanged.connect(self._on_assembly_json_text_changed)
         self.assembly_table.cellChanged.connect(self._on_assembly_table_cell_changed)
         self.assembly_table.cellDoubleClicked.connect(self._on_assembly_table_cell_double_clicked)
         self.asm_add_seg_btn.clicked.connect(self._on_asm_add_segment)
@@ -1333,9 +1357,9 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
         if mode == "Bottom Tension":
             self.bottom_tension.setDisabled(False)
-        elif mode == "Top Tension":
+        elif mode in ("Contact Tension", "Top Tension"):
             self.top_tension.setDisabled(False)
-        elif mode == "Exit Angle":
+        elif mode in ("Tangent Angle", "Exit Angle"):
             self.exit_angle.setDisabled(False)
         elif mode == "Catenary Length":
             self.catenary_length.setDisabled(False)
@@ -1354,7 +1378,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
             c = float(self.chute_exit_height.value())
             if c < 0:
-                raise ValueError("Chute exit height must be >= 0.")
+                raise ValueError("Chute top height must be >= 0.")
 
             R = float(self.chute_radius.value())
             if R < 0:
@@ -1364,12 +1388,11 @@ class CatenaryCalculatorV2Dialog(QDialog):
             if ds <= 0:
                 raise ValueError("Integration step must be > 0.")
 
-            unit = self.weight_unit.currentText()
-            q_w = CatenarySystemCalculator._unit_to_npm(float(self.weight_water.value()), unit)
-            q_a = CatenarySystemCalculator._unit_to_npm(float(self.weight_air.value()), unit)
+            q_w = float(self._fallback_q_water_npm)
+            q_a = float(self._fallback_q_air_npm)
 
             if q_w <= 0 or q_a <= 0:
-                raise ValueError("Cable weights must be > 0.")
+                raise ValueError("Internal fallback cable weights must be > 0.")
 
             mode = self.input_parameter.currentText()
 
@@ -1379,13 +1402,8 @@ class CatenaryCalculatorV2Dialog(QDialog):
             else:
                 exit_angle_from_h = 90.0 - float(self.exit_angle.value())
 
-            assembly: List[AssemblyItem] = []
+            assembly = self._assembly_from_table()
             comps: List[Component] = []
-            if self.assembly_tabs.currentIndex() == 0:
-                assembly = self._assembly_from_table()
-            else:
-                # legacy: still supported but treated as delta-q modifiers
-                comps = _parse_components(self.components_text.toPlainText())
 
             cfg = {
                 "water_depth_m": D,
@@ -1408,9 +1426,9 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
             if mode == "Bottom Tension":
                 cfg["H_input_N"] = float(self.bottom_tension.value()) * 1000.0
-            elif mode == "Top Tension":
+            elif mode in ("Contact Tension", "Top Tension"):
                 cfg["Ttop_input_N"] = float(self.top_tension.value()) * 1000.0
-            elif mode == "Exit Angle":
+            elif mode in ("Tangent Angle", "Exit Angle"):
                 cfg["exit_angle_from_h_deg"] = exit_angle_from_h
             elif mode == "Catenary Length":
                 S_in = float(self.catenary_length.value())
@@ -1424,7 +1442,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
                     S_min = D + c
                 if S_in < S_min - 1e-6:
                     raise ValueError(
-                        f"Total suspended length S={S_in:.3f} m is too short for the geometry. "
+                        f"Total cable length S={S_in:.3f} m is too short for the geometry. "
                         f"Minimum feasible S is about {S_min:.3f} m (given D={D:.3f} m, c={c:.3f} m, R={R:.3f} m)."
                     )
                 cfg["S_input_m"] = S_in
@@ -1480,7 +1498,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             self.bottom_tension.setValue(calc.bottom_tension_kN)
             self.bottom_tension.blockSignals(False)
 
-        if mode != "Top Tension" and calc.top_tension_kN is not None:
+        if mode not in ("Contact Tension", "Top Tension") and calc.top_tension_kN is not None:
             self.top_tension.blockSignals(True)
             self.top_tension.setValue(calc.top_tension_kN)
             self.top_tension.blockSignals(False)
@@ -1495,7 +1513,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             self.layback.setValue(calc.layback)
             self.layback.blockSignals(False)
 
-        # Exit angle always updated to computed, respecting current reference display
+        # Tangent angle always updated to computed, respecting current reference display.
         if calc.exit_angle_deg_from_h is not None:
             self.exit_angle.blockSignals(True)
             if self.angle_reference.currentText() == "from horizontal":
@@ -1516,21 +1534,29 @@ class CatenaryCalculatorV2Dialog(QDialog):
         warn_lines: List[str] = []
         if assembly and calc.S_total is not None:
             # S_total includes chute-contact + free-span. Assembly segments are defined from chute top down.
-            # If assembly is shorter than S_total, remaining length uses the global cable weights.
+            # If assembly is shorter than S_total, remaining length uses internal fallback weights.
             if calc.S_total > asm_seg_total + 1e-6:
                 warn_lines.append(
-                    f"Assembly segments total ({asm_seg_total:.2f} m) is shorter than suspended length ({calc.S_total:.2f} m). "
-                    "Remaining length uses the global cable weight values."
+                    f"Assembly segments total ({asm_seg_total:.2f} m) is shorter than modeled cable length ({calc.S_total:.2f} m). "
+                    "Remaining length uses the internal fallback cable weight values."
                 )
             # If assembly is much longer than S_total, some defined items are not in the suspended span.
             if asm_seg_total > calc.S_total + 1e-6:
                 warn_lines.append(
-                    f"Assembly segments total ({asm_seg_total:.2f} m) exceeds suspended length ({calc.S_total:.2f} m). "
+                    f"Assembly segments total ({asm_seg_total:.2f} m) exceeds modeled cable length ({calc.S_total:.2f} m). "
                     "Lower assembly items may be on seabed (not in the suspended span) and bodies there will not affect the catenary."
                 )
 
         sea_s = calc.s_sea_surface
         sea_txt = f"{sea_s:.2f} m" if sea_s is not None else "n/a"
+
+        contact_txt = "n/a"
+        if calc.x is not None and calc.y is not None and len(calc.x) and len(calc.y):
+            contact_txt = f"x={float(calc.x[-1]):.3f} m, height={float(calc.y[-1]):.3f} m above WL"
+
+        chute_contact_txt = "n/a"
+        if float(self.chute_radius.value()) > 0:
+            chute_contact_txt = f"{float(getattr(calc, 'chute_contact_len_m', 0.0)):.3f} m"
 
         asm_txt = "n/a"
         if assembly:
@@ -1542,13 +1568,15 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
         txt = (
             f"Water Depth D: {D:.2f} m<br>"
-            f"Chute Exit Height c: {c:.2f} m above WL<br><br>"
+            f"Chute Top Height c: {c:.2f} m above WL<br><br>"
             f"Bottom Tension (H): {calc.bottom_tension_kN:.3f} kN<br>"
-            f"Top Tension: {calc.top_tension_kN:.3f} kN<br>"
-            f"Exit Angle: {calc.exit_angle_deg_from_h:.3f}° from horizontal / {angle_from_vertical:.3f}° from vertical<br>"
-            f"Total Suspended Length (TDP→chute): {calc.S_total:.3f} m<br>"
-            f"Layback (TDP→chute): {calc.layback:.3f} m<br>"
+            f"Tension at Contact: {calc.top_tension_kN:.3f} kN<br>"
+            f"Tangent Angle at Contact: {calc.exit_angle_deg_from_h:.3f}° from horizontal / {angle_from_vertical:.3f}° from vertical<br>"
+            f"Total Cable Length (TDP→chute top): {calc.S_total:.3f} m<br>"
+            f"Layback (TDP→chute top): {calc.layback:.3f} m<br>"
             f"Flop Forward (S - layback): {flop_forward_txt}<br>"
+            f"Chute contact/tangent point: {contact_txt}<br>"
+            f"Cable on chute arc: {chute_contact_txt}<br>"
             f"Sea surface crossing at s ≈ {sea_txt}<br>"
             f"Minimum Radius of Curvature (incl chute): {calc.min_radius_m:.3f} m<br>"
             f"Assembly length: {asm_txt}<br>"
@@ -1556,7 +1584,25 @@ class CatenaryCalculatorV2Dialog(QDialog):
         )
         self.results.setHtml(txt)
 
+    def _capture_plot_view(self) -> Optional[Tuple[float, float, float, float]]:
+        try:
+            axes = self.figure.get_axes()
+            if not axes:
+                return None
+            ax = axes[0]
+            x0, x1 = ax.get_xlim()
+            y0, y1 = ax.get_ylim()
+            values = (float(x0), float(x1), float(y0), float(y1))
+            if any(not math.isfinite(v) for v in values):
+                return None
+            if abs(values[1] - values[0]) < 1e-9 or abs(values[3] - values[2]) < 1e-9:
+                return None
+            return values
+        except Exception:
+            return None
+
     def _plot(self, calc: CatenarySystemCalculator):
+        previous_view = self._capture_plot_view()
         self.figure.clear()
         ax = self.figure.add_subplot(111)
 
@@ -1612,20 +1658,12 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
             # Prefer user-selected colours from the assembly table (per segment).
             # If not provided, fall back to tab10.
-            try:
-                import matplotlib.pyplot as plt  # local import to avoid global pyplot dependency
-                cmap = plt.get_cmap("tab10")
-            except Exception:
-                cmap = None
-
             colors: List[Any] = []
             for i in idxs:
                 if 0 <= int(i) < len(seg_colors) and seg_colors[int(i)]:
                     colors.append(seg_colors[int(i)])
-                elif cmap is not None:
-                    colors.append(cmap(int(i) % 10))
                 else:
-                    colors.append("#1f77b4")
+                    colors.append(get_tab10_color(int(i)))
 
             lc = LineCollection(segs, colors=colors, linewidths=2)
             ax.add_collection(lc)
@@ -1638,13 +1676,17 @@ class CatenaryCalculatorV2Dialog(QDialog):
         ax.axhline(0, linewidth=2, label="Sea Level")
         ax.axhline(D, linewidth=2, label="Seabed")
 
-        # Mark chute top point
-        ax.scatter([layback], [-c], s=40, label="Chute Top")
+        marker_size = 16
 
-        # Departure point is the last free-span point
+        # Mark key endpoints without overpowering the catenary line.
+        ax.scatter([float(x[0])], [float(depth[0])], s=marker_size, color="black", label="Touchdown point")
+        ax.scatter([layback], [-c], s=marker_size, color="black", label="Chute top reference")
+
+        # With no radius, the free-span endpoint is the chute top.
         x_dep = float(x[-1])
         y_dep = float(y[-1])
-        ax.scatter([x_dep], [-y_dep], s=30, label="Departure (free-span)")
+        if R <= 0:
+            ax.scatter([x_dep], [-y_dep], s=marker_size, color="black", label="Cable endpoint")
 
         # Body markers (if any) positioned along free-span by s interpolation
         if assembly and calc.s is not None and calc.x is not None and calc.y is not None:
@@ -1663,7 +1705,11 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
             body_points = []
             for d_body in body_ds:
-                if d_body < Lc:
+                if R > 0 and d_body < Lc:
+                    phi = (math.pi / 2.0) + (float(d_body) / R)
+                    xb = layback + R * math.cos(phi)
+                    yb = c - R + R * math.sin(phi)
+                    body_points.append((xb, -yb))
                     continue
                 if d_body > (Lc + S_free):
                     continue
@@ -1677,7 +1723,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 bx, bd = zip(*body_points)
                 ax.scatter(list(bx), list(bd), marker="D", s=36, color="black", label="Body")
 
-        # Render chute as a full continuous-radius quarter circle, and optionally highlight the contact portion
+        # Render chute as a filled upper-left quadrant, then draw the cable arc from contact to top.
         chute_x = None
         chute_y = None
         seabed_x = None
@@ -1696,18 +1742,65 @@ class CatenaryCalculatorV2Dialog(QDialog):
             phis_full = np.linspace(phi0, phi_full, 160)
             chute_x = center_x + R * np.cos(phis_full)
             chute_y = center_y + R * np.sin(phis_full)
-            ax.plot(chute_x, -chute_y, linewidth=2, label="Chute (¼-circle)")
 
-            # Highlight the portion assumed in contact (top -> departure tangent)
+            body_x = np.concatenate(([center_x], chute_x, [center_x]))
+            body_y = np.concatenate(([center_y], chute_y, [center_y]))
+            ax.fill(
+                body_x,
+                -body_y,
+                facecolor="#c8ccd2",
+                edgecolor="#6b7280",
+                linewidth=1,
+                alpha=0.65,
+                zorder=-10,
+            )
+            ax.plot(chute_x, -chute_y, color="#6b7280", linewidth=1.5, label="Chute body")
+            ax.plot([center_x, x_top], [-center_y, -y_top], color="#6b7280", linewidth=1)
+            ax.plot([center_x, center_x - R], [-center_y, -center_y], color="#6b7280", linewidth=1)
+
+            # Draw the cable section that is assumed to be in contact with the chute (top -> tangent point).
             phi1 = math.pi / 2.0 + theta_end
-            phis_contact = np.linspace(phi0, phi1, 80)
+            phis_contact = np.linspace(phi0, phi1, 90)
             contact_x = center_x + R * np.cos(phis_contact)
             contact_y = center_y + R * np.sin(phis_contact)
-            ax.plot(contact_x, -contact_y, linewidth=3, label="Chute contact")
+
+            if assembly and len(contact_x) >= 2:
+                seg_items_arc = [it for it in assembly if it.kind == "segment"]
+                seg_lengths_arc = [max(0.0, it.length_m) for it in seg_items_arc]
+                seg_colors_arc = [self._normalize_color_hex(getattr(it, "color_hex", "")) for it in seg_items_arc]
+
+                def segment_index_for_chute_d(d_from_top: float) -> int:
+                    if not seg_lengths_arc:
+                        return 0
+                    cursor2 = 0.0
+                    for idx, L in enumerate(seg_lengths_arc):
+                        if cursor2 <= d_from_top <= (cursor2 + L):
+                            return idx
+                        cursor2 += L
+                    return max(0, len(seg_lengths_arc) - 1)
+
+                pts_arc = np.column_stack([contact_x, -contact_y])
+                segs_arc = [pts_arc[i : i + 2] for i in range(len(pts_arc) - 1)]
+                d_vals = np.linspace(0.0, float(getattr(calc, "chute_contact_len_m", 0.0)), len(contact_x))
+                d_mid = 0.5 * (d_vals[:-1] + d_vals[1:])
+                idxs_arc = [segment_index_for_chute_d(float(d)) for d in d_mid]
+                colors_arc: List[Any] = []
+                for i in idxs_arc:
+                    if 0 <= int(i) < len(seg_colors_arc) and seg_colors_arc[int(i)]:
+                        colors_arc.append(seg_colors_arc[int(i)])
+                    else:
+                        colors_arc.append(get_tab10_color(int(i)))
+                ax.add_collection(LineCollection(segs_arc, colors=colors_arc, linewidths=3))
+                ax.plot([], [], color=colors_arc[0] if colors_arc else "k", linewidth=3, label="Cable on chute")
+            else:
+                ax.plot(contact_x, -contact_y, color="#ff7f0e", linewidth=3, label="Cable on chute")
+
+            x_contact = center_x + R * math.cos(phi1)
+            y_contact = center_y + R * math.sin(phi1)
+            ax.scatter([x_contact], [-y_contact], s=marker_size, color="black", label="Chute contact/tangent")
 
         # Optional: draw full assembly laid out on seabed beyond TDP
 
-        # Optional: draw full assembly laid out on seabed beyond TDP
         if self.show_full_assembly_seabed.isChecked() and assembly and calc.S_total is not None:
             asm_seg_total = sum(max(0.0, it.length_m) for it in assembly if it.kind == "segment")
             seabed_len = max(0.0, asm_seg_total - float(calc.S_total))
@@ -1740,20 +1833,12 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 d_mid = float(calc.S_total) + (-x_mid)
                 idxs2 = [segment_index_for_d(float(d)) for d in d_mid]
 
-                try:
-                    import matplotlib.pyplot as plt
-                    cmap2 = plt.get_cmap("tab10")
-                except Exception:
-                    cmap2 = None
-
                 colors2: List[Any] = []
                 for i in idxs2:
                     if 0 <= int(i) < len(seg_colors2) and seg_colors2[int(i)]:
                         colors2.append(seg_colors2[int(i)])
-                    elif cmap2 is not None:
-                        colors2.append(cmap2(int(i) % 10))
                     else:
-                        colors2.append("#7f7f7f")
+                        colors2.append(get_tab10_color(int(i)))
 
                 lc2 = LineCollection(segs2, colors=colors2, linewidths=2, alpha=0.9)
                 ax.add_collection(lc2)
@@ -1804,8 +1889,16 @@ class CatenaryCalculatorV2Dialog(QDialog):
         pad_x = max(1.0, 0.05 * (x_max - x_min))
         pad_y = max(1.0, 0.05 * (y_max - y_min))
 
-        ax.set_xlim(x_min - pad_x, x_max + pad_x)
-        ax.set_ylim(y_min - pad_y, y_max + pad_y)
+        full_xlim = (x_min - pad_x, x_max + pad_x)
+        full_ylim = (y_min - pad_y, y_max + pad_y)
+
+        if previous_view is not None:
+            old_x0, old_x1, old_y0, old_y1 = previous_view
+            ax.set_xlim(old_x0, old_x1)
+            ax.set_ylim(old_y0, old_y1)
+        else:
+            ax.set_xlim(full_xlim[0], full_xlim[1])
+            ax.set_ylim(full_ylim[0], full_ylim[1])
 
         # Critical: enforce true proportions so the chute radius looks correct.
         # This will often "zoom out" visually when depth span dwarfs horizontal span.
@@ -2169,8 +2262,8 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 (0, "Segment"),
                 (1, "Cable"),
                 (2, 10.0),
-                (3, float(self.weight_water.value()) if self.weight_unit.currentText() == "N/m" else 0.0),
-                (4, float(self.weight_air.value()) if self.weight_unit.currentText() == "N/m" else 0.0),
+                (3, self._fallback_q_water_npm),
+                (4, self._fallback_q_air_npm),
                 (5, 0.0),
             ]
             for col, val in defaults:
@@ -2180,6 +2273,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             self.assembly_table.setCurrentCell(r, 1)
         finally:
             self.assembly_table.blockSignals(False)
+        self._sync_json_from_table()
         self.update_plot()
 
     def _on_asm_add_body(self):
@@ -2202,6 +2296,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             self.assembly_table.setCurrentCell(r, 1)
         finally:
             self.assembly_table.blockSignals(False)
+        self._sync_json_from_table()
         self.update_plot()
 
     def _on_asm_delete(self):
@@ -2209,6 +2304,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
         if r < 0:
             return
         self.assembly_table.removeRow(r)
+        self._sync_json_from_table()
         self.update_plot()
 
     def _asm_swap_rows(self, r1: int, r2: int):
@@ -2232,6 +2328,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             return
         self._asm_swap_rows(r, r - 1)
         self.assembly_table.setCurrentCell(r - 1, 1)
+        self._sync_json_from_table()
         self.update_plot()
 
     def _on_asm_move_down(self):
@@ -2240,30 +2337,55 @@ class CatenaryCalculatorV2Dialog(QDialog):
             return
         self._asm_swap_rows(r, r + 1)
         self.assembly_table.setCurrentCell(r + 1, 1)
+        self._sync_json_from_table()
         self.update_plot()
 
     def _assembly_table_to_json(self) -> str:
-        data: List[List[str]] = []
-        for r in range(self.assembly_table.rowCount()):
-            row_vals: List[str] = []
-            for c in range(self.assembly_table.columnCount()):
-                it = self.assembly_table.item(r, c)
-                row_vals.append("") if it is None else row_vals.append(str(it.text()))
-            data.append(row_vals)
-        return json.dumps(data)
+        return json.dumps(self._assembly_table_to_json_data(), indent=2)
 
-    def _assembly_table_from_json(self, raw: str):
+    def _assembly_table_to_json_data(self) -> List[dict]:
+        data: List[dict] = []
+        for r in range(self.assembly_table.rowCount()):
+            kind = "segment" if self._is_assembly_row_segment(r) else "body"
+            name = self._table_get_str(self.assembly_table, r, self.ASM_COL_NAME, default=("Cable" if kind == "segment" else "Body"))
+            if kind == "segment":
+                entry = {
+                    "type": "segment",
+                    "name": name,
+                    "length_m": self._table_get_float(self.assembly_table, r, self.ASM_COL_LENGTH, 0.0),
+                    "q_water_npm": self._table_get_float(self.assembly_table, r, self.ASM_COL_Q_WATER, 0.0),
+                    "q_air_npm": self._table_get_float(self.assembly_table, r, self.ASM_COL_Q_AIR, 0.0),
+                }
+                color_hex = self._normalize_color_hex(self._table_get_str(self.assembly_table, r, self.ASM_COL_COLOR, default=""))
+                if color_hex:
+                    entry["color"] = color_hex
+            else:
+                entry = {
+                    "type": "body",
+                    "name": name,
+                    "point_load_kN": self._table_get_float(self.assembly_table, r, self.ASM_COL_BODY_LOAD, 0.0),
+                }
+            data.append(entry)
+        return data
+
+    def _assembly_table_from_json(self, raw: str) -> bool:
         try:
-            data = json.loads(raw)
+            data = json.loads(raw or "[]")
+            if isinstance(data, dict):
+                data = data.get("assembly", [])
             if not isinstance(data, list):
-                return
+                return False
         except Exception:
-            return
+            return False
         self.assembly_table.blockSignals(True)
         try:
             self.assembly_table.setRowCount(0)
-            for row in data:
-                if not isinstance(row, list):
+            for row_data in data:
+                if isinstance(row_data, dict):
+                    row = self._assembly_json_entry_to_row(row_data)
+                elif isinstance(row_data, list):
+                    row = [str(v) for v in row_data]
+                else:
                     continue
                 r = self.assembly_table.rowCount()
                 self.assembly_table.insertRow(r)
@@ -2274,6 +2396,85 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 self._ensure_assembly_color_cell(r)
         finally:
             self.assembly_table.blockSignals(False)
+        return True
+
+    def _assembly_json_entry_to_row(self, entry: dict) -> List[str]:
+        kind_raw = str(entry.get("type", entry.get("kind", "segment"))).strip().lower()
+        is_body = kind_raw.startswith("body")
+        name = str(entry.get("name", "Body" if is_body else "Cable"))
+
+        def number_text(*keys: str, default: float = 0.0) -> str:
+            for key in keys:
+                if key in entry:
+                    try:
+                        return f"{float(entry.get(key)):.12g}"
+                    except Exception:
+                        return f"{float(default):.12g}"
+            return f"{float(default):.12g}"
+
+        if is_body:
+            return [
+                "Body",
+                name,
+                "0",
+                "0",
+                "0",
+                number_text("point_load_kN", "load_kN", default=0.0),
+                "",
+            ]
+
+        color_hex = self._normalize_color_hex(str(entry.get("color", entry.get("color_hex", ""))))
+        return [
+            "Segment",
+            name,
+            number_text("length_m", "length", default=0.0),
+            number_text("q_water_npm", "q_water", "weight_water_npm", default=self._fallback_q_water_npm),
+            number_text("q_air_npm", "q_air", "weight_air_npm", default=self._fallback_q_air_npm),
+            "0",
+            color_hex,
+        ]
+
+    def _sync_json_from_table(self):
+        if not hasattr(self, "assembly_json_text"):
+            return
+        if getattr(self, "_syncing_assembly_json", False):
+            return
+        self._syncing_assembly_json = True
+        try:
+            self.assembly_json_text.blockSignals(True)
+            self.assembly_json_text.setPlainText(self._assembly_table_to_json())
+            self.assembly_json_text.blockSignals(False)
+            self.assembly_json_text.setStyleSheet("")
+            self.assembly_json_text.setToolTip("Assembly JSON is synced with the table.")
+        finally:
+            self._syncing_assembly_json = False
+
+    def _on_assembly_json_text_changed(self):
+        if getattr(self, "_syncing_assembly_json", False):
+            return
+        if getattr(self, "_initializing", False):
+            return
+        self._assembly_json_timer.start(350)
+
+    def _apply_assembly_json_text(self):
+        if getattr(self, "_syncing_assembly_json", False):
+            return
+        raw = self.assembly_json_text.toPlainText().strip()
+        self._syncing_assembly_json = True
+        try:
+            ok = self._assembly_table_from_json(raw or "[]")
+        finally:
+            self._syncing_assembly_json = False
+
+        if not ok:
+            self.assembly_json_text.setStyleSheet("border: 1px solid #c0392b;")
+            self.assembly_json_text.setToolTip("JSON is not valid yet; the table has not been updated.")
+            return
+
+        self.assembly_json_text.setStyleSheet("")
+        self.assembly_json_text.setToolTip("Assembly JSON is synced with the table.")
+        self._sync_json_from_table()
+        self.schedule_update_plot()
 
     def _normalize_color_hex(self, value: str) -> str:
         s = (value or "").strip()
@@ -2346,6 +2547,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 self._ensure_assembly_color_cell(row)
             finally:
                 self.assembly_table.blockSignals(False)
+        self._sync_json_from_table()
         self.schedule_update_plot()
 
     def _on_assembly_table_cell_double_clicked(self, row: int, col: int):
@@ -2368,6 +2570,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             self._set_assembly_color_cell(row, chosen.name(), enabled=True)
         finally:
             self.assembly_table.blockSignals(False)
+        self._sync_json_from_table()
         self.update_plot()
 
 
