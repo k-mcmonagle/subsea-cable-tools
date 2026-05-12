@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import math
+import importlib
+import os
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pyqtgraph as pg
-from pyqtgraph.exporters.SVGExporter import SVGExporter
+from qgis.PyQt import QtCore, QtGui, QtSvg
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QPainterPath
 from qgis.PyQt.QtWidgets import QFileDialog, QGraphicsPathItem, QHBoxLayout, QPushButton, QVBoxLayout, QWidget
@@ -15,6 +17,8 @@ from qgis.PyQt.QtWidgets import QFileDialog, QGraphicsPathItem, QHBoxLayout, QPu
 
 _PEN_STYLE = getattr(Qt, "PenStyle", Qt)
 _MOUSE_BUTTON = getattr(Qt, "MouseButton", Qt)
+__SUBSEA_PLOT_WIDGET_PATCH_VERSION__ = 4
+_REQUIRED_SVG_EXPORTER_PATCH_VERSION = 4
 
 
 _TAB10_COLORS = [
@@ -90,6 +94,27 @@ def _values(values: Iterable[Any]) -> List[float]:
         except Exception:
             out.append(math.nan)
     return out
+
+
+def _svg_exporter_class():
+    module = importlib.import_module("pyqtgraph.exporters.SVGExporter")
+    module_path = os.path.normcase(os.path.abspath(getattr(module, "__file__", "")))
+    bundled_lib = os.path.normcase(os.path.abspath(os.path.join(os.path.dirname(__file__), "lib")))
+    patch_version = int(getattr(module, "__SUBSEA_SVG_EXPORTER_PATCH_VERSION__", 0) or 0)
+    if module_path.startswith(bundled_lib) and patch_version < _REQUIRED_SVG_EXPORTER_PATCH_VERSION:
+        module = importlib.reload(module)
+    try:
+        exporter_base = importlib.import_module("pyqtgraph.exporters.Exporter").Exporter
+        svg_class = module.SVGExporter
+        svg_name = getattr(svg_class, "Name", "")
+        exporter_base.Exporters = [
+            exp for exp in exporter_base.Exporters
+            if getattr(exp, "__name__", "") != "SVGExporter" and getattr(exp, "Name", "") != svg_name
+        ]
+        exporter_base.Exporters.append(svg_class)
+    except Exception:
+        pass
+    return module.SVGExporter
 
 
 class LineCollection:
@@ -310,13 +335,61 @@ class PyQtGraphCanvas(QWidget):
     def export_svg(self, path: str):
         if not self.figure.axes:
             return
-        exporter = SVGExporter(self.figure.axes[0].plot_item)
-        exporter.export(path)
+        try:
+            exporter = _svg_exporter_class()(self.figure.axes[0].plot_item)
+            exporter.export(path)
+        except Exception as first_error:
+            try:
+                self._export_svg_with_qt(path)
+            except Exception as fallback_error:
+                raise RuntimeError(
+                    f"SVG export failed with pyqtgraph ({first_error}) and Qt fallback ({fallback_error})."
+                )
 
-    def export_svg_dialog(self):
+    def _export_svg_with_qt(self, path: str):
+        if not self.figure.axes:
+            return
+        widget = self.figure.axes[0].plot_widget
+        size = widget.size()
+        if not size.isValid() or size.width() <= 0 or size.height() <= 0:
+            size = QtCore.QSize(1200, 800)
+
+        generator = QtSvg.QSvgGenerator()
+        generator.setFileName(path)
+        generator.setSize(size)
+        generator.setViewBox(QtCore.QRect(0, 0, int(size.width()), int(size.height())))
+        try:
+            screen = QtGui.QGuiApplication.primaryScreen()
+            if screen is not None:
+                generator.setResolution(int(screen.logicalDotsPerInchX()))
+        except Exception:
+            pass
+
+        painter = QtGui.QPainter()
+        if not painter.begin(generator):
+            raise RuntimeError("Could not start Qt SVG painter.")
+        try:
+            painter.fillRect(QtCore.QRect(0, 0, int(size.width()), int(size.height())), QtGui.QColor("white"))
+            widget.render(painter)
+        finally:
+            painter.end()
+
+    def show_export_dialog(self):
+        if not self.figure.axes:
+            return
+        _svg_exporter_class()
+        axis = self.figure.axes[0]
+        scene = axis.plot_widget.scene()
+        scene.contextMenuItem = axis.plot_item
+        if hasattr(scene, "showExportDialog"):
+            scene.showExportDialog()
+            return
         path, _ = QFileDialog.getSaveFileName(self, "Save SVG", "plot.svg", "SVG Files (*.svg)")
         if path:
             self.export_svg(path)
+
+    def export_svg_dialog(self):
+        self.show_export_dialog()
 
     def auto_range_all(self):
         for axis in self.figure.axes:
@@ -330,12 +403,12 @@ class PyQtGraphNavigationToolbar(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.reset_btn = QPushButton("Reset View")
-        self.export_btn = QPushButton("Export SVG")
+        self.export_btn = QPushButton("Export Plot...")
         layout.addWidget(self.reset_btn)
         layout.addWidget(self.export_btn)
         layout.addStretch(1)
         self.reset_btn.clicked.connect(self.canvas.auto_range_all)
-        self.export_btn.clicked.connect(self.canvas.export_svg_dialog)
+        self.export_btn.clicked.connect(self.canvas.show_export_dialog)
 
 
 class PyQtGraphAxis:

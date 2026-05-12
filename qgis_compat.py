@@ -3,7 +3,7 @@
 
 from qgis.PyQt.QtCore import QMetaType
 from qgis.PyQt.QtGui import QCursor
-from qgis.PyQt.QtWidgets import QAbstractItemView, QDialog, QSizePolicy, QToolButton, QDialogButtonBox
+from qgis.PyQt.QtWidgets import QAbstractItemView, QDialog, QHeaderView, QSizePolicy, QToolButton, QDialogButtonBox
 
 try:
     from qgis.PyQt.QtCore import QVariant
@@ -65,6 +65,12 @@ SIZE_POLICY_EXPANDING = _scoped_member(QSizePolicy, "Policy", "Expanding")
 
 SELECTION_MODE_EXTENDED = _scoped_member(QAbstractItemView, "SelectionMode", "ExtendedSelection")
 SELECTION_MODE_SINGLE = _scoped_member(QAbstractItemView, "SelectionMode", "SingleSelection")
+SELECTION_BEHAVIOR_SELECT_ROWS = _scoped_member(QAbstractItemView, "SelectionBehavior", "SelectRows")
+EDIT_TRIGGER_DOUBLE_CLICKED = _scoped_member(QAbstractItemView, "EditTrigger", "DoubleClicked")
+EDIT_TRIGGER_SELECTED_CLICKED = _scoped_member(QAbstractItemView, "EditTrigger", "SelectedClicked")
+EDIT_TRIGGER_EDIT_KEY_PRESSED = _scoped_member(QAbstractItemView, "EditTrigger", "EditKeyPressed")
+
+HEADER_RESIZE_MODE_INTERACTIVE = _scoped_member(QHeaderView, "ResizeMode", "Interactive")
 
 TOOLBUTTON_POPUP_MODE_MENU_BUTTON = _scoped_member(
     QToolButton,

@@ -1,4 +1,4 @@
-from qgis.PyQt.QtWidgets import QDockWidget, QVBoxLayout, QWidget, QComboBox, QLabel, QListWidget, QPushButton, QListWidgetItem, QAbstractItemView, QTabWidget, QHBoxLayout, QCheckBox, QGroupBox, QRadioButton, QButtonGroup
+from qgis.PyQt.QtWidgets import QDockWidget, QVBoxLayout, QWidget, QComboBox, QLabel, QListWidget, QPushButton, QListWidgetItem, QTabWidget, QHBoxLayout, QCheckBox, QGroupBox, QRadioButton, QButtonGroup
 from qgis.PyQt.QtCore import Qt
 from qgis.core import QgsProject, QgsVectorLayer, QgsWkbTypes, QgsGeometry, QgsPointXY, QgsDistanceArea, QgsCoordinateTransform
 from .qgis_compat import SELECTION_MODE_EXTENDED, GEOMETRY_LINE, GEOMETRY_NULL
@@ -14,16 +14,7 @@ except Exception:  # pragma: no cover
     except Exception:
         def _sip_isdeleted(_obj):
             return False
-# Matplotlib imports
-
-try:
-    # QGIS 3.x typically ships matplotlib with the Qt5 backend
-    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-    from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
-except Exception:  # pragma: no cover - QGIS 4.x / Qt6
-    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-    from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
-from matplotlib.figure import Figure
+from .plot_widget import Figure, FigureCanvas, NavigationToolbar
 import numpy as np
 
 class KpPlotterDockWidget(QDockWidget):
@@ -119,7 +110,7 @@ class KpPlotterDockWidget(QDockWidget):
         self.plot_layout = QVBoxLayout(self.plot_tab)
         self.tab_widget.addTab(self.plot_tab, "Plot")
 
-        # Matplotlib canvas (maximized in plot tab)
+        # Pyqtgraph canvas (maximized in plot tab)
         self.figure = Figure(figsize=(8, 5))
         self.canvas = FigureCanvas(self.figure)
         self.toolbar = NavigationToolbar(self.canvas, self)
@@ -394,9 +385,6 @@ class KpPlotterDockWidget(QDockWidget):
         """
         # Ensure figure, canvas, and toolbar are initialized (in case they were cleaned up)
         if self.figure is None or self.canvas is None or self.toolbar is None:
-            from matplotlib.figure import Figure
-            from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-            from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
             self.figure = Figure(figsize=(8, 5))
             self.canvas = FigureCanvas(self.figure)
             self.toolbar = NavigationToolbar(self.canvas, self)
@@ -846,7 +834,7 @@ class KpPlotterDockWidget(QDockWidget):
             except Exception:
                 pass
 
-        # Clear matplotlib figure (kept alive until full close cleanup)
+        # Clear plot figure (kept alive until full close cleanup)
         if getattr(self, 'figure', None):
             try:
                 self.figure.clear()
@@ -876,7 +864,7 @@ class KpPlotterDockWidget(QDockWidget):
         """Handle the widget being closed."""
         self.save_user_settings()
         self.cleanup_plot_and_marker()
-        # Only do full matplotlib cleanup when actually closing
+        # Only do full plot cleanup when actually closing
         self.cleanup_matplotlib_resources_on_close()
         # Safely disconnect the signal
         try:
@@ -886,20 +874,13 @@ class KpPlotterDockWidget(QDockWidget):
         super().closeEvent(event)
 
     def cleanup_matplotlib_resources_on_close(self):
-        """Clean up matplotlib resources completely when closing the widget."""
-        # Disconnect all matplotlib event callbacks
+        """Clean up plot resources completely when closing the widget."""
         self.disable_tooltips()
         self.disconnect_canvas_events()
         
-        # Clear the figure and close it properly
+        # Clear the figure and drop widget references.
         if hasattr(self, 'figure') and self.figure:
             self.figure.clear()
-            try:
-                # Close the figure to free memory
-                import matplotlib.pyplot as plt
-                plt.close(self.figure)
-            except Exception:
-                pass
         
         # Reset references only when actually closing
         self.figure = None

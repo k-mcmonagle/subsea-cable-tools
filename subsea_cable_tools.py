@@ -22,9 +22,8 @@ from .maptools.kp_mouse_maptool import KPMouseTool
 # Import the processing provider
 from .processing.subsea_cable_processing_provider import SubseaCableProcessingProvider
 
-# NOTE: Some dock widgets depend on optional 3rd-party Python packages (e.g. matplotlib).
-# To avoid plugin-load failures on systems missing those deps, we import them lazily
-# inside the action handlers (show_* methods) and provide a clear error if unavailable.
+# NOTE: Larger dock widgets are imported lazily so plugin startup remains robust
+# if an optional or vendored plotting dependency fails to load.
 
 
 class SubseaCableTools:
@@ -152,7 +151,7 @@ class SubseaCableTools:
     def show_catenary_calculator(self):
         if self.catenary_calculator_dialog is None:
             try:
-                from .catenary_calculator_dialog import CatenaryCalculatorDialog
+                from .catenary.catenary_calculator_dialog import CatenaryCalculatorDialog
             except Exception as e:
                 from qgis.PyQt.QtWidgets import QMessageBox
 
@@ -172,7 +171,7 @@ class SubseaCableTools:
     def show_catenary_calculator_v2(self):
         if self.catenary_calculator_v2_dialog is None:
             try:
-                from .catenary_calculator_v2_dialog import CatenaryCalculatorV2Dialog
+                from .catenary.catenary_calculator_v2_dialog import CatenaryCalculatorV2Dialog
             except Exception as e:
                 from qgis.PyQt.QtWidgets import QMessageBox
 
@@ -319,7 +318,7 @@ class SubseaCableTools:
                 QMessageBox.critical(
                     self.iface.mainWindow(),
                     "Subsea Cable Tools",
-                    "KP Plot could not be opened. This tool requires optional plotting dependencies (e.g. matplotlib).\n\n"
+                    "KP Plot could not be opened. This tool requires the bundled pyqtgraph plotting backend.\n\n"
                     f"Details: {e}",
                 )
                 return
@@ -339,7 +338,7 @@ class SubseaCableTools:
                 QMessageBox.critical(
                     self.iface.mainWindow(),
                     "Subsea Cable Tools",
-                    "Depth Profile could not be opened. This tool requires optional plotting dependencies (e.g. matplotlib).\n\n"
+                    "Depth Profile could not be opened. This tool requires the bundled pyqtgraph plotting backend.\n\n"
                     f"Details: {e}",
                 )
                 return

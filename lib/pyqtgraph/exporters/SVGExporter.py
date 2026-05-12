@@ -14,6 +14,192 @@ from .Exporter import Exporter
 
 translate = QtCore.QCoreApplication.translate
 
+__SUBSEA_SVG_EXPORTER_PATCH_VERSION__ = 4
+
+_svgCommandChars = set('MmZzLlHhVvCcSsQqTtAa')
+_svgPathToken = re.compile(
+    r'[MmZzLlHhVvCcSsQqTtAa]|[-+]?(?:nan|inf|(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?)',
+    re.IGNORECASE,
+)
+_svgNumber = re.compile(
+    r'[-+]?(?:nan|inf|(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?)',
+    re.IGNORECASE,
+)
+
+
+def _svgFmt(value):
+    return '{:.12g}'.format(float(value))
+
+
+def _isSvgCommand(token):
+    return len(token) == 1 and token in _svgCommandChars
+
+
+def _transformSvgPoint(tr, x, y):
+    coords = fn.transformCoordinates(tr, np.array([[float(x), float(y)]]), transpose=True)
+    return float(coords[0, 0]), float(coords[0, 1])
+
+
+def _transformSvgPoints(points, tr):
+    values = [float(v) for v in _svgNumber.findall(points)]
+    if len(values) < 2:
+        return points
+    if len(values) % 2:
+        values = values[:-1]
+    coords = np.array(list(zip(values[0::2], values[1::2])))
+    coords = fn.transformCoordinates(tr, coords, transpose=True)
+    return ' '.join([','.join([_svgFmt(a) for a in c]) for c in coords])
+
+
+def _transformSvgPath(path, tr):
+    tokens = _svgPathToken.findall(path)
+    if not tokens:
+        return path
+
+    paramCounts = {
+        'a': 7,
+        'c': 6,
+        'h': 1,
+        'l': 2,
+        'm': 2,
+        'q': 4,
+        's': 4,
+        't': 2,
+        'v': 1,
+    }
+    out = []
+    i = 0
+    cmd = None
+    current = np.array([0.0, 0.0])
+    subpathStart = np.array([0.0, 0.0])
+
+    def transformedPoint(x, y):
+        return _transformSvgPoint(tr, x, y)
+
+    while i < len(tokens):
+        token = tokens[i]
+        if _isSvgCommand(token):
+            cmd = token
+            i += 1
+            if cmd in 'Zz':
+                out.append('Z')
+                current = subpathStart.copy()
+                continue
+
+        if cmd is None:
+            out.append(token)
+            i += 1
+            continue
+
+        lower = cmd.lower()
+        count = paramCounts.get(lower)
+        if count is None:
+            out.append(cmd)
+            cmd = None
+            continue
+        if i + count > len(tokens) or any(_isSvgCommand(tokens[i + j]) for j in range(count)):
+            i += 1
+            continue
+
+        try:
+            vals = [float(tokens[i + j]) for j in range(count)]
+        except ValueError:
+            out.extend(tokens[i:i + count])
+            i += count
+            continue
+
+        rel = cmd.islower()
+
+        if lower == 'm':
+            pt = np.array([vals[0], vals[1]])
+            if rel:
+                pt = current + pt
+            tx, ty = transformedPoint(pt[0], pt[1])
+            out.append('M{},{}'.format(_svgFmt(tx), _svgFmt(ty)))
+            current = pt
+            subpathStart = pt.copy()
+            cmd = 'l' if rel else 'L'
+
+        elif lower in ('l', 't'):
+            pt = np.array([vals[0], vals[1]])
+            if rel:
+                pt = current + pt
+            tx, ty = transformedPoint(pt[0], pt[1])
+            out.append('{}{},{}'.format(cmd.upper(), _svgFmt(tx), _svgFmt(ty)))
+            current = pt
+
+        elif lower == 'h':
+            pt = np.array([vals[0], current[1]])
+            if rel:
+                pt[0] = current[0] + vals[0]
+            tx, ty = transformedPoint(pt[0], pt[1])
+            out.append('L{},{}'.format(_svgFmt(tx), _svgFmt(ty)))
+            current = pt
+
+        elif lower == 'v':
+            pt = np.array([current[0], vals[0]])
+            if rel:
+                pt[1] = current[1] + vals[0]
+            tx, ty = transformedPoint(pt[0], pt[1])
+            out.append('L{},{}'.format(_svgFmt(tx), _svgFmt(ty)))
+            current = pt
+
+        elif lower == 'c':
+            pts = [np.array(vals[j:j + 2]) for j in (0, 2, 4)]
+            if rel:
+                pts = [current + pt for pt in pts]
+            tpts = [transformedPoint(pt[0], pt[1]) for pt in pts]
+            out.append('C{},{} {},{} {},{}'.format(
+                _svgFmt(tpts[0][0]), _svgFmt(tpts[0][1]),
+                _svgFmt(tpts[1][0]), _svgFmt(tpts[1][1]),
+                _svgFmt(tpts[2][0]), _svgFmt(tpts[2][1]),
+            ))
+            current = pts[-1]
+
+        elif lower in ('q', 's'):
+            pts = [np.array(vals[j:j + 2]) for j in (0, 2)]
+            if rel:
+                pts = [current + pt for pt in pts]
+            tpts = [transformedPoint(pt[0], pt[1]) for pt in pts]
+            out.append('{}{},{} {},{}'.format(
+                cmd.upper(),
+                _svgFmt(tpts[0][0]), _svgFmt(tpts[0][1]),
+                _svgFmt(tpts[1][0]), _svgFmt(tpts[1][1]),
+            ))
+            current = pts[-1]
+
+        elif lower == 'a':
+            pt = np.array([vals[5], vals[6]])
+            if rel:
+                pt = current + pt
+            tx, ty = transformedPoint(pt[0], pt[1])
+            out.append('A{} {} {} {} {} {},{}'.format(
+                _svgFmt(vals[0]), _svgFmt(vals[1]), _svgFmt(vals[2]),
+                _svgFmt(vals[3]), _svgFmt(vals[4]), _svgFmt(tx), _svgFmt(ty),
+            ))
+            current = pt
+
+        i += count
+
+    return ' '.join(out)
+
+
+def _itemUsesDefaultPaint(item):
+    try:
+        for cls in item.__class__.mro():
+            class_dict = getattr(cls, '__dict__', {})
+            if 'paint' not in class_dict:
+                continue
+            clsName = getattr(cls, '__name__', '')
+            if clsName in ('QGraphicsItem', 'QGraphicsObject', 'QGraphicsWidget'):
+                return True
+            qtBaseClass = class_dict.get('_qtBaseClass')
+            qtBaseName = getattr(qtBaseClass, '__name__', '') if qtBaseClass is not None else ''
+            return qtBaseName in ('QGraphicsItem', 'QGraphicsObject', 'QGraphicsWidget')
+    except Exception:
+        return False
+    return True
+
 class SVGExporter(Exporter):
     Name = "Scalable Vector Graphics (SVG)"
     allowCopy=True
@@ -211,7 +397,7 @@ def _generateItemSvg(item, nodes=None, root=None, options=None):
         xmlStr = "<g>\n</g>\n"
         doc = xml.parseString(xmlStr)
         childs = [i for i in item.items() if i.parentItem() is None]
-    elif item.__class__.paint == QtWidgets.QGraphicsItem.paint:
+    elif _itemUsesDefaultPaint(item):
         xmlStr = "<g>\n</g>\n"
         doc = xml.parseString(xmlStr)
         childs = item.childItems()
@@ -398,29 +584,18 @@ def correctCoordinates(node, defs, item, options):
         for ch in grp.childNodes:
             if not isinstance(ch, xml.Element):
                 continue
-            if ch.tagName == 'polyline':
+            if ch.tagName in ('polyline', 'polygon'):
                 removeTransform = True
-                coords = np.array([[float(a) for a in c.split(',')] for c in ch.getAttribute('points').strip().split(' ')])
-                coords = fn.transformCoordinates(tr, coords, transpose=True)
-                ch.setAttribute('points', ' '.join([','.join([str(a) for a in c]) for c in coords]))
+                ch.setAttribute('points', _transformSvgPoints(ch.getAttribute('points'), tr))
             elif ch.tagName == 'path':
                 removeTransform = True
-                newCoords = ''
                 oldCoords = ch.getAttribute('d').strip()
                 if oldCoords == '':
                     continue
-                for c in oldCoords.split(' '):
-                    x,y = c.split(',')
-                    if x[0].isalpha():
-                        t = x[0]
-                        x = x[1:]
-                    else:
-                        t = ''
-                    nc = fn.transformCoordinates(tr, np.array([[float(x),float(y)]]), transpose=True)
-                    newCoords += t+str(nc[0,0])+','+str(nc[0,1])+' '
+                newCoords = _transformSvgPath(oldCoords, tr)
                 # If coords start with L instead of M, then the entire path will not be rendered.
                 # (This can happen if the first point had nan values in it--Qt will skip it on export)
-                if newCoords[0] != 'M':
+                if newCoords and newCoords[0] != 'M':
                     newCoords = f'M{newCoords[1:]}'
                 ch.setAttribute('d', newCoords)
             elif ch.tagName == 'text':

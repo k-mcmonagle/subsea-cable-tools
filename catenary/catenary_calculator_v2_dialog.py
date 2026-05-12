@@ -22,6 +22,7 @@ Coordinate convention (internal):
 
 Plot convention:
 - Depth = -y (so seabed is +depth, above sea is negative depth)
+- Horizontal distance can be rendered/exported from either the TDP or the chute top reference.
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.PyQt.QtCore import Qt, QSettings, QTimer
 from qgis.PyQt.QtGui import QColor
-from .qgis_compat import (
+from ..qgis_compat import (
     EDIT_TRIGGER_DOUBLE_CLICKED,
     EDIT_TRIGGER_EDIT_KEY_PRESSED,
     EDIT_TRIGGER_SELECTED_CLICKED,
@@ -905,6 +906,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self._fallback_q_water_npm = self._DEFAULT_Q_WATER_NPM
         self._fallback_q_air_npm = self._DEFAULT_Q_AIR_NPM
         self._syncing_assembly_json = False
+        self._last_plot_x_reference = None
 
         # Debounce heavy recalculations while editing.
         self._update_timer = QTimer(self)
@@ -973,6 +975,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.settings.setValue("assembly_table_json", self._assembly_table_to_json())
         self.settings.setValue("show_full_assembly_seabed", bool(self.show_full_assembly_seabed.isChecked()))
         self.settings.setValue("show_legend", bool(self.show_legend.isChecked()))
+        self.settings.setValue("x_axis_reference", self.x_axis_reference.currentIndex())
         try:
             col_widths = [int(self.assembly_table.columnWidth(i)) for i in range(self.assembly_table.columnCount())]
             self.settings.setValue("assembly_table_col_widths", json.dumps(col_widths))
@@ -1035,6 +1038,12 @@ class CatenaryCalculatorV2Dialog(QDialog):
             self.catenary_length.setValue(v)
         if (v := _get_float("layback")) is not None:
             self.layback.setValue(v)
+
+        if (v := _get_int("x_axis_reference")) is not None:
+            try:
+                self.x_axis_reference.setCurrentIndex(max(0, min(1, int(v))))
+            except Exception:
+                pass
 
         tab_idx = self.settings.value("assembly_input_tab")
         if tab_idx is not None:
@@ -1167,6 +1176,12 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.layback.setDecimals(3)
         self.layback.setValue(150.0)
 
+        self.x_axis_reference = QComboBox()
+        self.x_axis_reference.addItems(["Touchdown point (TDP)", "Chute top position"])
+        self.x_axis_reference.setToolTip(
+            "Controls only the rendered/exported horizontal coordinate origin. Calculations remain referenced to the TDP."
+        )
+
         # Assembly (ordered from chute top down)
         self.assembly_tabs = QTabWidget()
 
@@ -1246,6 +1261,9 @@ class CatenaryCalculatorV2Dialog(QDialog):
         input_layout.addRow(QLabel("<b>Cable Assembly</b>"))
         input_layout.addRow(self.assembly_tabs)
 
+        input_layout.addRow(QLabel("<b>Display</b>"))
+        input_layout.addRow("X-axis zero:", self.x_axis_reference)
+
         self.show_full_assembly_seabed = QCheckBox("Show full assembly on seabed")
         self.show_full_assembly_seabed.setToolTip(
             "Extends the plot x-axis and draws any remaining assembly length beyond the suspended span as a straight line on the seabed."
@@ -1281,7 +1299,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
         output_layout.addWidget(self.canvas, stretch=1)
 
         btns = QHBoxLayout()
-        self.export_svg_btn = QPushButton("Export SVG")
+        self.export_svg_btn = QPushButton("Export Plot...")
         self.export_dxf_btn = QPushButton("Export DXF")
         btns.addWidget(self.export_svg_btn)
         btns.addWidget(self.export_dxf_btn)
@@ -1319,6 +1337,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.asm_up_btn.clicked.connect(self._on_asm_move_up)
         self.asm_down_btn.clicked.connect(self._on_asm_move_down)
 
+        self.x_axis_reference.currentIndexChanged.connect(self.schedule_update_plot)
         self.show_full_assembly_seabed.toggled.connect(self.schedule_update_plot)
 
         self.show_legend.toggled.connect(self.schedule_update_plot)
@@ -1601,8 +1620,27 @@ class CatenaryCalculatorV2Dialog(QDialog):
         except Exception:
             return None
 
+    def _x_axis_reference_key(self) -> str:
+        try:
+            return "chute_top" if self.x_axis_reference.currentIndex() == 1 else "tdp"
+        except Exception:
+            return "tdp"
+
+    def _x_axis_origin_offset(self, calc: CatenarySystemCalculator) -> float:
+        if self._x_axis_reference_key() == "chute_top" and calc.layback is not None:
+            return float(calc.layback)
+        return 0.0
+
+    def _x_axis_label(self) -> str:
+        if self._x_axis_reference_key() == "chute_top":
+            return "Horizontal Distance from Chute Top (m)"
+        return "Horizontal Distance from TDP (m)"
+
     def _plot(self, calc: CatenarySystemCalculator):
+        plot_x_reference = self._x_axis_reference_key()
         previous_view = self._capture_plot_view()
+        if getattr(self, "_last_plot_x_reference", None) != plot_x_reference:
+            previous_view = None
         self.figure.clear()
         ax = self.figure.add_subplot(111)
 
@@ -1610,7 +1648,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             self.canvas.draw()
             return
 
-        x = calc.x
+        x_internal = calc.x
         y = calc.y
 
         # Convert to depth for plotting (depth positive down)
@@ -1619,7 +1657,10 @@ class CatenaryCalculatorV2Dialog(QDialog):
         D = self.water_depth.value()
         c = self.chute_exit_height.value()
         R = self.chute_radius.value()
-        layback = float(calc.layback) if calc.layback is not None else float(x[-1])
+        layback = float(calc.layback) if calc.layback is not None else float(x_internal[-1])
+        x_origin_offset = self._x_axis_origin_offset(calc)
+        x = x_internal - x_origin_offset
+        layback_plot = layback - x_origin_offset
 
         # Cable (color by assembly segment if available)
         assembly: List[AssemblyItem] = calc.cfg.get("assembly", [])
@@ -1680,7 +1721,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
         # Mark key endpoints without overpowering the catenary line.
         ax.scatter([float(x[0])], [float(depth[0])], s=marker_size, color="black", label="Touchdown point")
-        ax.scatter([layback], [-c], s=marker_size, color="black", label="Chute top reference")
+        ax.scatter([layback_plot], [-c], s=marker_size, color="black", label="Chute top reference")
 
         # With no radius, the free-span endpoint is the chute top.
         x_dep = float(x[-1])
@@ -1707,7 +1748,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             for d_body in body_ds:
                 if R > 0 and d_body < Lc:
                     phi = (math.pi / 2.0) + (float(d_body) / R)
-                    xb = layback + R * math.cos(phi)
+                    xb = layback_plot + R * math.cos(phi)
                     yb = c - R + R * math.sin(phi)
                     body_points.append((xb, -yb))
                     continue
@@ -1715,7 +1756,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
                     continue
                 s_body = S_free - (d_body - Lc)
                 # Interpolate x,y at s_body
-                xb = float(np.interp(s_body, s, calc.x))
+                xb = float(np.interp(s_body, s, calc.x)) - x_origin_offset
                 yb = float(np.interp(s_body, s, calc.y))
                 body_points.append((xb, -yb))
 
@@ -1732,7 +1773,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             theta_end = math.radians(calc.exit_angle_deg_from_h or 0.0)
             theta_end = max(0.0, min(math.pi / 2.0, theta_end))
 
-            x_top = layback
+            x_top = layback_plot
             y_top = c
             center_x = x_top
             center_y = y_top - R
@@ -1807,7 +1848,8 @@ class CatenaryCalculatorV2Dialog(QDialog):
             if seabed_len > 1e-6:
                 # Build a polyline from x=0 at TDP to negative x away from vessel
                 n_pts = max(2, int(min(600, max(2, seabed_len / max(ds_step := float(self.ds_step.value()), 0.25)))))
-                xs = np.linspace(0.0, -seabed_len, n_pts)
+                xs_physical = np.linspace(0.0, -seabed_len, n_pts)
+                xs = xs_physical - x_origin_offset
                 ys = np.full_like(xs, D)
                 seabed_x = xs
                 seabed_y = ys
@@ -1829,7 +1871,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
                 pts2 = np.column_stack([xs, ys])
                 segs2 = [pts2[i : i + 2] for i in range(len(pts2) - 1)]
-                x_mid = 0.5 * (xs[:-1] + xs[1:])
+                x_mid = 0.5 * (xs_physical[:-1] + xs_physical[1:])
                 d_mid = float(calc.S_total) + (-x_mid)
                 idxs2 = [segment_index_for_d(float(d)) for d in d_mid]
 
@@ -1856,20 +1898,21 @@ class CatenaryCalculatorV2Dialog(QDialog):
                     d_body = d_cursor
                     if d_body <= float(calc.S_total):
                         continue
-                    x_body = -(d_body - float(calc.S_total))
-                    if x_body < -seabed_len - 1e-6:
+                    x_body_physical = -(d_body - float(calc.S_total))
+                    if x_body_physical < -seabed_len - 1e-6:
                         continue
+                    x_body = x_body_physical - x_origin_offset
                     seabed_body_points.append((x_body, D))
 
                 if seabed_body_points:
                     bx, by = zip(*seabed_body_points)
                     ax.scatter(list(bx), list(by), marker="D", s=36, facecolors="none", edgecolors="black", label="Body (seabed)")
 
-        ax.set_xlabel("Horizontal Distance (m)")
+        ax.set_xlabel(self._x_axis_label())
         ax.set_ylabel("Depth (m)")
         ax.set_title("Cable Catenary")
         # Bounds: compute from all drawn geometry so equal-aspect plots still show everything.
-        x_candidates: List[float] = [float(np.min(x)), float(np.max(x)), 0.0, float(layback)]
+        x_candidates: List[float] = [float(np.min(x)), float(np.max(x)), float(x[0]), float(layback_plot), 0.0]
         y_candidates: List[float] = [float(np.min(depth)), float(np.max(depth)), 0.0, float(D), float(-c)]
 
         if isinstance(chute_x, np.ndarray) and isinstance(chute_y, np.ndarray) and chute_x.size and chute_y.size:
@@ -1909,15 +1952,14 @@ class CatenaryCalculatorV2Dialog(QDialog):
         if self.show_legend.isChecked():
             ax.legend(fontsize="small")
 
+        self._last_plot_x_reference = plot_x_reference
         self.figure.tight_layout()
         self.canvas.draw()
 
     # ---- Export
 
     def export_svg(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save SVG", "catenary_plot.svg", "SVG Files (*.svg)")
-        if path:
-            self.figure.savefig(path, format="svg")
+        self.canvas.show_export_dialog()
 
     def export_dxf(self):
         path, _ = QFileDialog.getSaveFileName(self, "Save DXF", "catenary.dxf", "DXF Files (*.dxf)")
@@ -1935,6 +1977,9 @@ class CatenaryCalculatorV2Dialog(QDialog):
         c = float(self.chute_exit_height.value())
         R = float(self.chute_radius.value())
         layback = float(calc.layback) if calc.layback is not None else float(calc.x[-1])
+        x_origin_offset = self._x_axis_origin_offset(calc)
+        x_export = calc.x - x_origin_offset
+        layback_export = layback - x_origin_offset
 
         # Scale-dependent defaults for label sizes/offsets (mm)
         x_span_mm = float((np.max(calc.x) - np.min(calc.x)) * 1000.0)
@@ -1995,7 +2040,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 curr = idxs[0] if idxs else 0
                 for i, idx in enumerate(idxs):
                     if idx != curr:
-                        xs = (calc.x[run_start : i + 1] * 1000.0).tolist()
+                        xs = (x_export[run_start : i + 1] * 1000.0).tolist()
                         ys = (calc.y[run_start : i + 1] * 1000.0).tolist()
                         layer = seg_layer(curr)
                         entities.append(self._dxf_polyline_entity(xs, ys, layer=layer))
@@ -2006,7 +2051,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
                 # last run
                 if idxs:
-                    xs = (calc.x[run_start:] * 1000.0).tolist()
+                    xs = (x_export[run_start:] * 1000.0).tolist()
                     ys = (calc.y[run_start:] * 1000.0).tolist()
                     layer = seg_layer(curr)
                     entities.append(self._dxf_polyline_entity(xs, ys, layer=layer))
@@ -2015,7 +2060,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
             # 2) Export chute geometry (full quadrant) and cable-on-chute (contact arc) split by segment.
             if R > 0 and calc.exit_angle_deg_from_h is not None:
-                x_top = layback
+                x_top = layback_export
                 y_top = c
                 center_x = x_top
                 center_y = y_top - R
@@ -2067,11 +2112,12 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 seabed_len = max(0.0, asm_seg_total - float(calc.S_total))
                 if seabed_len > 1e-6:
                     n_pts = max(2, int(min(800, max(2, seabed_len / max(float(self.ds_step.value()), 0.25)))))
-                    xs = np.linspace(0.0, -seabed_len, n_pts)
+                    xs_physical = np.linspace(0.0, -seabed_len, n_pts)
+                    xs = xs_physical - x_origin_offset
                     ys = np.full_like(xs, -D)
 
                     # split by segment index using d_from_top = S_total + distance from TDP on seabed
-                    x_mid = 0.5 * (xs[:-1] + xs[1:])
+                    x_mid = 0.5 * (xs_physical[:-1] + xs_physical[1:])
                     d_mid3 = float(calc.S_total) + (-x_mid)
                     idxs3 = [segment_index_for_d(float(d)) for d in d_mid3]
                     run_start = 0
@@ -2127,7 +2173,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
                     continue
 
                 layer = self._dxf_sanitize_layer(f"BODY_{it.name}")
-                xb = x_body_m * 1000.0
+                xb = (x_body_m - x_origin_offset) * 1000.0
                 yb = y_body_m * 1000.0
 
                 # Visible body marker geometry (small square) + point
@@ -2143,13 +2189,13 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
         else:
             # No assembly: export a single cable polyline on a single layer.
-            x_mm = (calc.x * 1000.0).tolist()
+            x_mm = (x_export * 1000.0).tolist()
             y_mm = (calc.y * 1000.0).tolist()
             entities.append(self._dxf_polyline_entity(x_mm, y_mm, layer=self._dxf_sanitize_layer("CABLE")))
 
             # Chute geometry and contact arc (optional)
             if R > 0 and calc.layback is not None and calc.exit_angle_deg_from_h is not None:
-                x_top = layback
+                x_top = layback_export
                 y_top = c
                 center_x = x_top
                 center_y = y_top - R
@@ -2176,17 +2222,17 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
         # Reference lines: sea level and seabed
         # Use an x-span that covers all likely exported geometry (cable + chute + optional seabed).
-        x_min_m = float(np.min(calc.x))
-        x_max_m = float(np.max(calc.x))
+        x_min_m = float(np.min(x_export))
+        x_max_m = float(np.max(x_export))
         if R > 0:
-            x_min_m = min(x_min_m, layback - R)
-            x_max_m = max(x_max_m, layback)
+            x_min_m = min(x_min_m, layback_export - R)
+            x_max_m = max(x_max_m, layback_export)
         if assembly and calc.S_total is not None:
             seg_items2 = [it for it in assembly if it.kind == "segment"]
             asm_seg_total = sum(max(0.0, it.length_m) for it in seg_items2)
             seabed_len = max(0.0, asm_seg_total - float(calc.S_total))
             if seabed_len > 1e-6:
-                x_min_m = min(x_min_m, -seabed_len)
+                x_min_m = min(x_min_m, -seabed_len - x_origin_offset)
 
         pad_m = max(5.0, 0.05 * max(1.0, x_max_m - x_min_m))
         x0 = (x_min_m - pad_m) * 1000.0

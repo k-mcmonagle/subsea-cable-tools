@@ -18,12 +18,7 @@ from .kp_range_utils import make_distance_area
 import math
 import bisect
 import numpy as np
-from matplotlib.figure import Figure
-try:
-    # QGIS 3.x typically ships matplotlib with the Qt5 backend
-    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas, NavigationToolbar2QT as NavigationToolbar
-except Exception:  # pragma: no cover - QGIS 4.x / Qt6
-    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas, NavigationToolbar2QT as NavigationToolbar
+from .plot_widget import Figure, FigureCanvas, NavigationToolbar
 
 # Simple sip deletion check fallback
 try:  # sip is available in QGIS Python env; guard for static analysis
@@ -318,7 +313,7 @@ class DepthProfileDockWidget(QDockWidget):
         self.profile_tab = QWidget()
         profile_layout = QVBoxLayout(self.profile_tab)
         self.tab_widget.addTab(self.profile_tab, "Depth Profile")
-        # Matplotlib area
+        # Plot area
         self.figure = Figure(figsize=(6, 4)); self.canvas = FigureCanvas(self.figure)
         self.canvas.setSizePolicy(SIZE_POLICY_EXPANDING, SIZE_POLICY_EXPANDING)
         self.toolbar = NavigationToolbar(self.canvas, self)

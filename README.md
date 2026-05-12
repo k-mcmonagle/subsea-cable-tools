@@ -34,7 +34,7 @@ Available in the Processing Toolbox under **Subsea Cable Tools**, grouped into:
 
 ### Dependencies
 
-The plugin vendors `openpyxl`, `pyqtgraph` and `et_xmlfile` under `lib/`, added to `sys.path` only when missing from the host QGIS Python. End users do not need to install pip packages for typical workflows.
+The plugin vendors `openpyxl`, `pyqtgraph` and `et_xmlfile` under `lib/`, added to `sys.path` only when missing from the host QGIS Python. End users do not need to install pip packages for typical workflows; plugin plotting tools use the vendored `pyqtgraph` backend.
 
 The MDB import additionally requires Windows + the Microsoft Access Database Engine ODBC driver and `pyodbc` available to the QGIS Python.
 

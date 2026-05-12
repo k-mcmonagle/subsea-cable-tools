@@ -3,16 +3,12 @@
 Catenary Calculator Dialog for Subsea Cable Tools QGIS Plugin
 
 This dialog provides a catenary calculator for subsea cables, including plotting and export features.
-No extra dependencies required beyond QGIS (PyQt5, matplotlib, shapely for DXF export).
+Plotting uses the bundled pyqtgraph package so the dialog does not depend on matplotlib being installed in QGIS.
 """
 from qgis.PyQt.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox, QPushButton, QTextEdit, QWidget, QFormLayout, QSizePolicy, QFileDialog, QDoubleSpinBox)
 from qgis.PyQt.QtCore import Qt, QSettings
-try:
-    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-except Exception:  # pragma: no cover - QGIS 4.x / Qt6
-    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
-from .qgis_compat import SIZE_POLICY_EXPANDING
+from .catenary_plot_widget import CatenaryPlotCanvas as FigureCanvas, CatenaryPlotFigure as Figure
+from ..qgis_compat import SIZE_POLICY_EXPANDING
 try:
     import numpy as np
 except Exception:  # pragma: no cover
@@ -168,7 +164,7 @@ class CatenaryCalculatorDialog(QDialog):
         self.canvas.setSizePolicy(SIZE_POLICY_EXPANDING, SIZE_POLICY_EXPANDING)
         output_layout.addWidget(self.canvas, stretch=1)
         button_layout = QHBoxLayout()
-        self.export_svg_btn = QPushButton("Export SVG")
+        self.export_svg_btn = QPushButton("Export Plot...")
         self.export_dxf_btn = QPushButton("Export DXF")
         button_layout.addWidget(self.export_svg_btn)
         button_layout.addWidget(self.export_dxf_btn)
@@ -382,9 +378,7 @@ class CatenaryCalculatorDialog(QDialog):
         self.canvas.draw()
 
     def export_svg(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save SVG", "catenary_plot.svg", "SVG Files (*.svg)")
-        if path:
-            self.figure.savefig(path, format='svg')
+        self.canvas.show_export_dialog()
 
     def export_dxf(self):
         try:
