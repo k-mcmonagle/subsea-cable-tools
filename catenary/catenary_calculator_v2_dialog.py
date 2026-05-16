@@ -1089,11 +1089,11 @@ class CatenaryCalculatorV2Dialog(QDialog):
         # Left: Inputs
         input_widget = QWidget()
         input_layout = QFormLayout(input_widget)
-        input_widget.setMinimumWidth(300)
+        input_widget.setMinimumWidth(420)
 
         input_scroll = QScrollArea()
         input_scroll.setWidgetResizable(True)
-        input_scroll.setMinimumWidth(300)
+        input_scroll.setMinimumWidth(420)
         input_scroll.setMaximumWidth(540)
         input_scroll.setWidget(input_widget)
 
@@ -1158,6 +1158,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
         self.angle_reference = QComboBox()
         self.angle_reference.addItems(["from horizontal", "from vertical"])
+        self.angle_reference.setMinimumContentsLength(16)
 
         self.catenary_length = QDoubleSpinBox()
         self.catenary_length.setRange(0, 1e7)
@@ -1249,7 +1250,6 @@ class CatenaryCalculatorV2Dialog(QDialog):
         input_layout.addRow("Water Depth (m):", self.water_depth)
         input_layout.addRow("Chute Top Height above Waterline (m):", self.chute_exit_height)
         input_layout.addRow("Chute Radius (m):", self.chute_radius)
-        input_layout.addRow("Integration Step (m):", self.ds_step)
 
         input_layout.addRow(QLabel("<b>Solve Mode</b>"))
         input_layout.addRow("Select Input Parameter:", self.input_parameter)
@@ -1259,10 +1259,13 @@ class CatenaryCalculatorV2Dialog(QDialog):
         ang_layout = QHBoxLayout()
         ang_layout.addWidget(self.exit_angle)
         ang_layout.addWidget(self.angle_reference)
+        ang_layout.setStretch(0, 1)
+        ang_layout.setStretch(1, 1)
         input_layout.addRow("Tangent Angle at Chute:", ang_layout)
 
         input_layout.addRow("Total Cable Length (m):", self.catenary_length)
         input_layout.addRow("Layback to Chute Top (m):", self.layback)
+        input_layout.addRow("Integration Step (m):", self.ds_step)
 
         input_layout.addRow(QLabel("<b>Cable Assembly</b>"))
         input_layout.addRow(self.assembly_tabs)
@@ -1318,9 +1321,11 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
         self.main_splitter.addWidget(input_scroll)
         self.main_splitter.addWidget(output_widget)
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setCollapsible(0, False)
         self.main_splitter.setStretchFactor(0, 0)
         self.main_splitter.setStretchFactor(1, 1)
-        self.main_splitter.setSizes([380, 800])
+        self.main_splitter.setSizes([460, 800])
         main_layout.addWidget(self.main_splitter)
 
         # signals
