@@ -27,7 +27,6 @@ Plot convention:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
 from qgis.PyQt.QtWidgets import (
@@ -46,12 +45,19 @@ from ..qgis_compat import (
     SELECTION_BEHAVIOR_SELECT_ROWS,
     SELECTION_MODE_SINGLE,
     SIZE_POLICY_EXPANDING,
+    qt_exec,
 )
 from .catenary_plot_widget import (
     CatenaryLineCollection as LineCollection,
     CatenaryPlotCanvas as FigureCanvas,
     CatenaryPlotFigure as Figure,
     get_tab10_color,
+)
+from .catenary_solver import (
+    AssemblyItem,
+    CatenarySystemCalculator,
+    Component,
+    _parse_components,
 )
 
 try:
@@ -60,800 +66,7 @@ except Exception:  # pragma: no cover
     np = None
 import math
 import json
-
-
-# ---------------------------
-# Models / parsing helpers
-# ---------------------------
-
-
-@dataclass
-class AssemblyItem:
-    """Ordered from chute top down along the cable."""
-
-    kind: str  # 'segment' or 'body'
-    name: str
-    length_m: float  # segment length (body typically 0)
-    q_water_npm: float  # absolute weight (N/m) for segments
-    q_air_npm: float
-    point_load_kN: float  # bodies: +ve = weight down, -ve = buoyancy up
-    color_hex: str = ""  # optional display colour for segment line / body marker (e.g. "#RRGGBB")
-
-@dataclass
-class Component:
-    """
-    A component that modifies the cable system over a section, or at a point.
-
-    Interpretation:
-        - s_from_tdp_m: distance along the free-span cable measured from the TDP upward (m).
-            (TDP = 0m, chute contact = free_span_length)
-    - length_m:
-        * if > 0: apply distributed delta weights over [s, s+length]
-        * if = 0: it's a point event (usually point_load_kN)
-    - delta_q_water_npm / delta_q_air_npm:
-        * additional distributed weight N/m applied in that section, on top of the base cable weight.
-    - point_load_kN:
-        * applied once when passing the point (adds to vertical component V), causes a slope kink.
-          This is useful for “lumped” weights, but note MBR at a kink is not physically meaningful.
-          Prefer short sections if you want curvature to remain realistic.
-    """
-    name: str
-    position_m: float
-    length_m: float
-    delta_q_water_npm: float
-    delta_q_air_npm: float
-    point_load_kN: float
-    reference: str = "tdp"  # legacy only
-
-    @property
-    def is_point(self) -> bool:
-        return abs(self.length_m) < 1e-9 and abs(self.point_load_kN) > 1e-12
-
-
-def _parse_components(text: str) -> List[Component]:
-    """
-    Parse multiline component definitions.
-    Format per line (comma or tab separated):
-        name, s_from_tdp_m, length_m, delta_q_water(N/m), delta_q_air(N/m), point_load_kN
-
-    Examples:
-        Repeater, 80, 4, 200, 200, 0
-        JointHousing, 120, 0, 0, 0, 15
-
-    Notes:
-    - Blank lines and lines starting with # are ignored.
-    - Missing optional fields default to 0.
-    """
-    comps: List[Component] = []
-    for raw in (text or "").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = [p.strip() for p in line.replace("\t", ",").split(",")]
-        # Pad to 6 fields
-        while len(parts) < 6:
-            parts.append("0")
-        name = parts[0] if parts[0] else "Component"
-        try:
-            s = float(parts[1])
-            L = float(parts[2])
-            dq_w = float(parts[3])
-            dq_a = float(parts[4])
-            p_kN = float(parts[5])
-        except Exception:
-            # Skip malformed lines
-            continue
-
-        comps.append(Component(
-            name=name,
-            position_m=s,
-            length_m=L,
-            delta_q_water_npm=dq_w,
-            delta_q_air_npm=dq_a,
-            point_load_kN=p_kN,
-            reference="tdp",
-        ))
-    # Sort by position (in its native reference)
-    comps.sort(key=lambda c: c.position_m)
-    return comps
-
-
-# ---------------------------
-# Calculator (physics + solver)
-# ---------------------------
-
-class CatenarySystemCalculator:
-    """
-    Numerical integration of a suspended cable with:
-    - constant horizontal tension component H (N)
-    - vertical component V changes with distributed weight (q) and point loads
-    - medium (water/air) chosen by current y sign (y<0 => water)
-    - optional components modifying q, and point loads
-
-    We integrate along arc length s from TDP upward:
-      start: s=0, x=0, y=-D, V=0
-      end:   s=S, x=layback, y=+c
-    """
-
-    def __init__(self, config: dict):
-        self.cfg = config
-
-        # outputs (set after solve)
-        self.H_N: Optional[float] = None
-        self.S_total: Optional[float] = None
-        self.layback: Optional[float] = None
-        self.exit_angle_deg_from_h: Optional[float] = None
-        self.top_tension_kN: Optional[float] = None
-        self.bottom_tension_kN: Optional[float] = None
-        self.min_radius_m: Optional[float] = None
-
-        # sampled shape
-        self.x: Optional[np.ndarray] = None
-        self.y: Optional[np.ndarray] = None
-        self.s: Optional[np.ndarray] = None
-
-        # key points
-        self.s_sea_surface: Optional[float] = None
-        self.chute_contact_len_m: float = float(self.cfg.get("chute_contact_len_m", 0.0))
-        self.free_span_len_m: Optional[float] = None
-
-    # --- Utility conversions
-
-    @staticmethod
-    def _unit_to_npm(value: float, unit: str) -> float:
-        """
-        Convert input weight to N/m:
-        - N/m => N/m
-        - kg/m => kg/m * g
-        - lbf/ft => convert to N/m
-        """
-        if unit == "N/m":
-            return value
-        if unit == "kg/m":
-            return value * 9.80665
-        if unit == "lbf/ft":
-            # 1 lbf = 4.448221615 N, 1 ft = 0.3048 m
-            return value * 4.448221615 / 0.3048
-        raise ValueError("Unknown unit")
-
-    # --- Core: integrate for a given (H, S)
-
-    def _q_effective(self, y: float, s_from_tdp: float, S_free: float, L_chute_contact: float, assembly: List[AssemblyItem], comps: List[Component]) -> float:
-        """
-        Effective distributed weight q (N/m) at a given position along the cable.
-        Base q depends on medium (water vs air) and components add delta q if within their length range.
-        """
-        # If an Assembly is defined, it provides absolute q by segment.
-        # Otherwise fall back to global q + legacy component deltas.
-        if assembly:
-            # Map current point on free span to distance from chute top.
-            # d_from_top = L_chute_contact + (S_free - s_from_tdp)
-            d_from_top = L_chute_contact + (S_free - s_from_tdp)
-            q_seg = None
-            d_cursor = 0.0
-            for it in assembly:
-                if it.kind != "segment":
-                    continue
-                d0 = d_cursor
-                d1 = d_cursor + max(0.0, it.length_m)
-                if d0 <= d_from_top <= d1:
-                    q_seg = it.q_water_npm if y < 0 else it.q_air_npm
-                    break
-                d_cursor = d1
-
-            if q_seg is None or q_seg <= 0:
-                q_seg = self.cfg["q_water_npm"] if y < 0 else self.cfg["q_air_npm"]
-            return max(float(q_seg), 1e-9)
-
-        base_q = self.cfg["q_water_npm"] if y < 0 else self.cfg["q_air_npm"]
-        q = base_q
-        for c in comps:
-            if c.length_m <= 0:
-                continue
-            s0 = c.position_m
-            s1 = c.position_m + c.length_m
-            if s0 <= s_from_tdp <= s1:
-                q += c.delta_q_water_npm if y < 0 else c.delta_q_air_npm
-        return max(q, 1e-9)
-
-    def _apply_point_loads(self, s_prev: float, s_new: float, V: float, S_free: float, L_chute_contact: float, assembly: List[AssemblyItem], comps: List[Component]) -> float:
-        """
-        Apply point loads when the integration passes them.
-        (Adds to V, in Newtons)
-        """
-        if assembly:
-            # bodies positioned by cumulative segment length from chute top
-            d_cursor = 0.0
-            for it in assembly:
-                if it.kind == "segment":
-                    d_cursor += max(0.0, it.length_m)
-                    continue
-                if it.kind != "body":
-                    continue
-
-                d_body = d_cursor
-                if d_body < L_chute_contact:
-                    # body on the chute-contact portion (not part of free span)
-                    continue
-                if d_body > (L_chute_contact + S_free):
-                    continue
-
-                s_body = S_free - (d_body - L_chute_contact)
-                if s_prev < s_body <= s_new:
-                    V += it.point_load_kN * 1000.0
-            return V
-
-        for c in comps:
-            if not c.is_point:
-                continue
-            sp = c.position_m
-            if s_prev < sp <= s_new:
-                V += c.point_load_kN * 1000.0
-        return V
-
-    def integrate(self, H_N: float, S_free_m: float, ds: float) -> Tuple[float, float, float, float, float, np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Integrate from TDP to the top over total arc length S_m.
-        Returns:
-            x_end, y_end, V_end, theta_end_rad, top_tension_N, s_arr, x_arr, y_arr
-        """
-        D = self.cfg["water_depth_m"]
-        comps = self.cfg.get("components", [])
-        assembly = self.cfg.get("assembly", [])
-
-        # If we are using Assembly mapping, the chute contact length matters to convert
-        # between s (from TDP) and d (from chute top). But the contact length itself depends
-        # on the tangent angle (theta_end). Do a tiny fixed-point iteration so the mapping is
-        # self-consistent.
-        R = float(self.cfg.get("chute_radius_m", 0.0))
-
-        def integrate_once(L_chute_contact: float):
-            # Start at touchdown (TDP)
-            s = 0.0
-            x = 0.0
-            y = -D
-            V = 0.0
-
-            s_list = [0.0]
-            x_list = [x]
-            y_list = [y]
-            sea_cross_s = None
-
-            n_steps = max(1, int(math.ceil(S_free_m / ds)))
-            max_steps = int(self.cfg.get("max_integration_steps", 25000))
-            if n_steps > max_steps:
-                raise ValueError(
-                    f"Integration would require {n_steps} steps (S_free={S_free_m:.2f} m, ds={ds:.3f} m), "
-                    f"which is too slow for interactive use. Increase ds or use a smaller length/height. "
-                    f"(Max allowed steps: {max_steps})"
-                )
-            ds_eff = S_free_m / n_steps
-
-            # Build a unified list of split events along free-span (s from TDP upward).
-            # We split at:
-            #  - point loads (apply instantaneous delta-V)
-            #  - assembly segment boundaries (q changes)
-            #  - legacy component boundaries (q changes)
-            # Sea-level changes are handled separately inside integrate_with_sea_split.
-            split_events: List[Tuple[float, float]] = []  # (s_event, point_load_N_at_event)
-
-            # 1) Point loads
-            if assembly:
-                d_cursor = 0.0
-                for it in assembly:
-                    if it.kind == "segment":
-                        d_cursor += max(0.0, it.length_m)
-                        continue
-                    if it.kind != "body":
-                        continue
-                    if abs(it.point_load_kN) < 1e-12:
-                        continue
-
-                    d_body = d_cursor
-                    if d_body < L_chute_contact:
-                        continue
-                    if d_body > (L_chute_contact + S_free_m):
-                        continue
-
-                    s_body = S_free_m - (d_body - L_chute_contact)
-                    if 0.0 < s_body < S_free_m:
-                        split_events.append((float(s_body), float(it.point_load_kN) * 1000.0))
-            else:
-                for c in comps:
-                    if not c.is_point:
-                        continue
-                    sp = float(c.position_m)
-                    if 0.0 < sp < S_free_m:
-                        split_events.append((sp, float(c.point_load_kN) * 1000.0))
-
-            # 2) Assembly segment boundaries (q changes)
-            if assembly:
-                d_cursor = 0.0
-                for it in assembly:
-                    if it.kind != "segment":
-                        continue
-                    d_cursor += max(0.0, it.length_m)
-                    # boundary at this cumulative distance from chute top
-                    d_b = d_cursor
-                    if d_b <= L_chute_contact:
-                        continue
-                    if d_b >= (L_chute_contact + S_free_m):
-                        continue
-                    s_b = S_free_m - (d_b - L_chute_contact)
-                    if 0.0 < s_b < S_free_m:
-                        split_events.append((float(s_b), 0.0))
-
-            # 3) Legacy component boundaries (q changes)
-            if not assembly and comps:
-                for c in comps:
-                    if c.length_m <= 0:
-                        continue
-                    s0 = float(c.position_m)
-                    s1 = float(c.position_m + c.length_m)
-                    if 0.0 < s0 < S_free_m:
-                        split_events.append((s0, 0.0))
-                    if 0.0 < s1 < S_free_m:
-                        split_events.append((s1, 0.0))
-
-            # Merge events at same/similar s
-            if split_events:
-                split_events.sort(key=lambda t: t[0])
-                merged: List[Tuple[float, float]] = []
-                tol_s = max(1e-9, 0.25 * ds_eff)
-                cur_s, cur_load = split_events[0]
-                for se, ld in split_events[1:]:
-                    if abs(se - cur_s) <= tol_s:
-                        cur_load += ld
-                    else:
-                        merged.append((cur_s, cur_load))
-                        cur_s, cur_load = se, ld
-                merged.append((cur_s, cur_load))
-                split_events = merged
-
-            ev_idx = 0
-
-            for _ in range(n_steps):
-                s_prev = s
-
-                def do_substep(ds_local: float, y_for_medium: float, s_local_end: float):
-                    nonlocal V, x, y
-                    q = self._q_effective(y_for_medium, s_local_end, S_free_m, L_chute_contact, assembly, comps)
-                    if ds_local <= 0:
-                        return
-
-                    # Midpoint (RK2) in arc-length: improves accuracy vs explicit Euler.
-                    V_mid = V + 0.5 * q * ds_local
-                    T_mid = math.sqrt(H_N * H_N + V_mid * V_mid)
-                    if T_mid <= 0:
-                        raise ValueError("Non-physical tension encountered during integration.")
-                    x += (H_N / T_mid) * ds_local
-                    y += (V_mid / T_mid) * ds_local
-                    V = V + q * ds_local
-
-                def integrate_with_sea_split(s_target: float):
-                    """Integrate from current s to s_target, splitting once at y=0 if crossed."""
-                    nonlocal s, x, y, V, sea_cross_s
-                    ds_local = s_target - s
-                    if ds_local <= 0:
-                        s = s_target
-                        return
-
-                    y_before = y
-                    V_before = V
-                    x_before = x
-
-                    do_substep(ds_local, y_before, s_target)
-                    y_after = y
-
-                    if sea_cross_s is None and ((y_before < 0 <= y_after) or (y_before > 0 >= y_after)):
-                        # rollback and split
-                        y = y_before
-                        V = V_before
-                        x = x_before
-
-                        if abs(y_after - y_before) < 1e-12:
-                            frac = 0.5
-                        else:
-                            frac = (0.0 - y_before) / (y_after - y_before)
-                            frac = float(max(0.0, min(1.0, frac)))
-
-                        ds1 = ds_local * frac
-                        ds2 = ds_local - ds1
-                        s_mid = s + ds1
-
-                        if ds1 > 0:
-                            do_substep(ds1, y_before, s_mid)
-                        sea_cross_s = s_mid
-
-                        y_eps = 1e-9 if y_before < 0 else -1e-9
-                        if ds2 > 0:
-                            do_substep(ds2, y_eps, s_target)
-
-                    s = s_target
-
-                s_full = s + ds_eff
-
-                # Advance through any point-load events in (s, s_full], applying them exactly at event s.
-                while ev_idx < len(split_events) and split_events[ev_idx][0] <= s + 1e-12:
-                    ev_idx += 1
-
-                while ev_idx < len(split_events) and (s < split_events[ev_idx][0] <= s_full):
-                    s_event, load_N = split_events[ev_idx]
-                    integrate_with_sea_split(float(s_event))
-                    # Apply point-load (if any) exactly at this location.
-                    if abs(load_N) > 1e-12:
-                        V += float(load_N)
-                    ev_idx += 1
-
-                integrate_with_sea_split(s_full)
-
-                s_list.append(s)
-                x_list.append(x)
-                y_list.append(y)
-
-            theta = math.atan2(V, H_N)
-            top_T = math.sqrt(H_N * H_N + V * V)
-
-            return (
-                x,
-                y,
-                V,
-                theta,
-                top_T,
-                np.array(s_list),
-                np.array(x_list),
-                np.array(y_list),
-                sea_cross_s,
-            )
-
-        L_guess = float(self.cfg.get("chute_contact_len_m", 0.0))
-        result = integrate_once(L_guess)
-
-        if assembly and R > 0:
-            for _ in range(6):
-                x_end, y_end, V_end, theta_end, top_T, s_arr, x_arr, y_arr, sea_cross_s = result
-                L_new = float(R * max(0.0, min(math.pi / 2.0, theta_end)))
-                if abs(L_new - L_guess) < 1e-3:
-                    L_guess = L_new
-                    break
-                L_guess = 0.6 * L_guess + 0.4 * L_new
-                result = integrate_once(L_guess)
-
-        x_end, y_end, V_end, theta_end, top_T, s_arr, x_arr, y_arr, sea_cross_s = result
-
-        self.s_sea_surface = sea_cross_s
-        self.chute_contact_len_m = float(L_guess)
-        self.free_span_len_m = float(S_free_m)
-
-        return x_end, y_end, V_end, theta_end, top_T, s_arr, x_arr, y_arr
-
-        # Note: a previous inline integrator implementation used to live here.
-        # It was duplicated and unreachable (after return). It has been removed for clarity.
-
-    # --- Root-finding helpers
-
-    @staticmethod
-    def _bracket_root(func, x0: float, step: float, max_expand: int = 60) -> Tuple[float, float]:
-        """
-        Expand a bracket around x0 until func(a) and func(b) have opposite signs.
-        """
-        a = max(1e-12, x0 - step)
-        b = x0 + step
-
-        last_eval_err: Optional[Exception] = None
-
-        def safe_eval(x: float) -> float:
-            nonlocal last_eval_err
-            try:
-                last_eval_err = None
-                return float(func(x))
-            except Exception as e:
-                last_eval_err = e
-                return float("nan")
-
-        fa = safe_eval(a)
-        fb = safe_eval(b)
-
-        for _ in range(max_expand):
-            if fa == 0:
-                return a, a
-            if fb == 0:
-                return b, b
-            if (not math.isnan(fa)) and (not math.isnan(fb)) and fa * fb < 0:
-                return a, b
-            # Expand
-            step *= 1.6
-            a = max(1e-12, x0 - step)
-            b = x0 + step
-            fa = safe_eval(a)
-            fb = safe_eval(b)
-
-        if last_eval_err is not None:
-            raise ValueError(
-                "Could not bracket a root because the function failed to evaluate in the search range. "
-                f"Last evaluation error: {last_eval_err}"
-            )
-        raise ValueError(
-            "Could not bracket a root for the chosen input values. "
-            f"Tried x in roughly [{a:.3g}, {b:.3g}] around x0={x0:.3g}; f(a)={fa:.3g}, f(b)={fb:.3g}."
-        )
-
-    @staticmethod
-    def _bisect(func, a: float, b: float, tol: float = 1e-6, max_iter: int = 120) -> float:
-        fa = func(a)
-        fb = func(b)
-        if abs(fa) < tol:
-            return a
-        if abs(fb) < tol:
-            return b
-        if fa * fb > 0:
-            raise ValueError("Root not bracketed.")
-
-        lo, hi = a, b
-        flo, fhi = fa, fb
-        for _ in range(max_iter):
-            mid = 0.5 * (lo + hi)
-            fm = func(mid)
-            if abs(fm) < tol or abs(hi - lo) < tol:
-                return mid
-            if flo * fm < 0:
-                hi, fhi = mid, fm
-            else:
-                lo, flo = mid, fm
-        return 0.5 * (lo + hi)
-
-    # --- Solve modes
-
-    def solve(self):
-        """
-        Main entry point.
-        Sets outputs + shape arrays.
-        """
-        D = self.cfg["water_depth_m"]
-        c_top = self.cfg["chute_exit_height_m"]
-        ds = self.cfg["ds_m"]
-        mode = self.cfg["input_mode"]
-
-        R = float(self.cfg.get("chute_radius_m", 0.0))
-
-        # Chute-contact coupling: free-span leaves the chute where its tangent matches chute tangent.
-        # Use theta_end (from horizontal, 0..pi/2) to compute:
-        # contact length along chute: L = R * theta
-        # departure point height: y_dep = c_top - R + R*cos(theta)
-        def chute_contact_from_theta(theta_rad: float) -> Tuple[float, float]:
-            if R <= 0:
-                return 0.0, c_top
-            theta_rad = float(max(0.0, min(math.pi / 2.0, theta_rad)))
-            Lc = R * theta_rad
-            y_dep = c_top - R + R * math.cos(theta_rad)
-            return Lc, y_dep
-
-        # Inner solver: given H, find free-span S that hits the chute-dependent departure height.
-        def solve_S_free_for_H(H):
-            # Minimum possible free-span length is straight vertical to the lowest possible departure.
-            y_dep_min = c_top - R if R > 0 else c_top
-            S_min = max(1e-3, D + max(y_dep_min, 0.0) + 1e-6)
-            S_guess = max(self.cfg.get("S_guess_m", S_min * 1.5), S_min * 1.2)
-
-            def fS(S_free: float) -> float:
-                x_end, y_end, _, theta_end, _, _, _, _ = self.integrate(H, S_free, ds)
-                Lc, y_dep = chute_contact_from_theta(theta_end)
-                self.cfg["chute_contact_len_m"] = Lc
-                return y_end - y_dep
-
-            try:
-                a, b = self._bracket_root(fS, x0=S_guess, step=max(5.0, 0.2 * S_guess))
-                return self._bisect(fS, a, b, tol=1e-4)
-            except Exception as e:
-                raise ValueError(
-                    "Failed to find a free-span length S_free that reaches the chute departure height. "
-                    f"This usually means the configuration is infeasible or the solver could not bracket a solution. "
-                    f"Try increasing ds (coarser integration), reducing extreme point loads, or checking weights/units. "
-                    f"(H={H/1000.0:.3f} kN, initial S_guess={S_guess:.3f} m)\n\nDetails: {e}"
-                )
-
-        # Mode 1: Catenary Length (total cable length S is input). Solve H for y_target.
-        if mode == "Catenary Length":
-            S_total_in = self.cfg["S_input_m"]
-
-            def fH_total_len(H):
-                S_free = solve_S_free_for_H(H)
-                x_end, y_end, _, theta_end, _, _, _, _ = self.integrate(H, S_free, ds)
-                Lc, _ = chute_contact_from_theta(theta_end)
-                return (S_free + Lc) - S_total_in
-
-            H0 = max(1.0, self.cfg.get("H_guess_N", 50_000.0))
-            try:
-                a, b = self._bracket_root(fH_total_len, x0=H0, step=max(5_000.0, 0.2 * H0))
-                H = self._bisect(fH_total_len, a, b, tol=1e-3)
-            except Exception as e:
-                raise ValueError(
-                    "Failed to solve for Bottom Tension (H) that matches the requested total cable length. "
-                    "This can happen if the required length is incompatible with the geometry/weights or if bracketing fails. "
-                    f"(Requested S={S_total_in:.3f} m, initial H_guess={H0/1000.0:.3f} kN)\n\nDetails: {e}"
-                )
-            S_free = solve_S_free_for_H(H)
-            x_end, y_end, V_end, theta_end, T_top, s_arr, x_arr, y_arr = self.integrate(H, S_free, ds)
-            Lc, _ = chute_contact_from_theta(theta_end)
-            S = S_free + Lc
-
-        # Mode 2: Bottom Tension (horizontal component H is input). Solve S for y_target.
-        elif mode == "Bottom Tension":
-            H = self.cfg["H_input_N"]
-            if H <= 0:
-                raise ValueError("Bottom tension must be > 0.")
-            S_free = solve_S_free_for_H(H)
-            x_end, y_end, V_end, theta_end, T_top, s_arr, x_arr, y_arr = self.integrate(H, S_free, ds)
-            Lc, _ = chute_contact_from_theta(theta_end)
-            S = S_free + Lc
-
-        # Mode 3: Layback is input: solve H such that (with S chosen to hit y_target) x_end matches.
-        elif mode == "Layback":
-            layback_top_target = self.cfg["layback_input_m"]
-            if layback_top_target <= 0:
-                raise ValueError("Layback must be > 0.")
-
-            def fH_layback_top(H):
-                S_free = solve_S_free_for_H(H)
-                x_end, y_end, _, theta_end, _, _, _, _ = self.integrate(H, S_free, ds)
-                if R > 0:
-                    layback_top = x_end + R * math.sin(theta_end)
-                else:
-                    layback_top = x_end
-                return layback_top - layback_top_target
-
-            H0 = max(1.0, self.cfg.get("H_guess_N", 50_000.0))
-            try:
-                a, b = self._bracket_root(fH_layback_top, x0=H0, step=max(5_000.0, 0.25 * H0))
-                H = self._bisect(fH_layback_top, a, b, tol=1e-3)
-            except Exception as e:
-                raise ValueError(
-                    "Failed to solve for Bottom Tension (H) that matches the requested layback. "
-                    "This can happen if the layback target is not achievable for the given geometry/weights, "
-                    "or if bracketing fails due to non-monotonic behavior (strong buoyancy/point loads). "
-                    f"(Requested layback={layback_top_target:.3f} m, initial H_guess={H0/1000.0:.3f} kN)\n\nDetails: {e}"
-                )
-            S_free = solve_S_free_for_H(H)
-            x_end, y_end, V_end, theta_end, T_top, s_arr, x_arr, y_arr = self.integrate(H, S_free, ds)
-            Lc, _ = chute_contact_from_theta(theta_end)
-            S = S_free + Lc
-
-        # Mode 4: Tangent angle at chute contact is input (from horizontal). Solve H such that angle matches.
-        elif mode in ("Tangent Angle", "Exit Angle"):
-            theta_target_rad = math.radians(self.cfg["exit_angle_from_h_deg"])
-            if not (0 < theta_target_rad < math.radians(89.9)):
-                raise ValueError("Tangent angle must be between 0 and 90 degrees (exclusive).")
-
-            Lc_target, y_dep_target = chute_contact_from_theta(theta_target_rad)
-
-            def fH_exit_angle(H):
-                # Solve free span to the fixed y_dep_target then match angle
-                def fS(S_free):
-                    _, y_end, _, _, _, _, _, _ = self.integrate(H, S_free, ds)
-                    return y_end - y_dep_target
-
-                S_min = max(1e-3, D + max(y_dep_target, 0.0) + 1e-6)
-                S_guess = max(self.cfg.get("S_guess_m", S_min * 1.5), S_min * 1.2)
-                aS, bS = self._bracket_root(fS, x0=S_guess, step=max(5.0, 0.2 * S_guess))
-                S_free = self._bisect(fS, aS, bS, tol=1e-4)
-                _, _, V_end, theta_end, _, _, _, _ = self.integrate(H, S_free, ds)
-                return theta_end - theta_target_rad
-
-            H0 = max(1.0, self.cfg.get("H_guess_N", 50_000.0))
-            try:
-                a, b = self._bracket_root(fH_exit_angle, x0=H0, step=max(5_000.0, 0.25 * H0))
-                H = self._bisect(fH_exit_angle, a, b, tol=1e-6)
-            except Exception as e:
-                raise ValueError(
-                    "Failed to solve for H that matches the requested tangent angle. "
-                    "This usually means the target angle is not achievable for the given geometry/weights, "
-                    "or that strong point loads/buoyancy make the relationship non-monotonic. "
-                    f"(Requested tangent angle={math.degrees(theta_target_rad):.3f}° from horizontal, initial H_guess={H0/1000.0:.3f} kN)\n\nDetails: {e}"
-                )
-            # final solve for free span
-            def fS_final(S_free):
-                _, y_end, _, _, _, _, _, _ = self.integrate(H, S_free, ds)
-                return y_end - y_dep_target
-            S_min = max(1e-3, D + max(y_dep_target, 0.0) + 1e-6)
-            S_guess = max(self.cfg.get("S_guess_m", S_min * 1.5), S_min * 1.2)
-            aS, bS = self._bracket_root(fS_final, x0=S_guess, step=max(5.0, 0.2 * S_guess))
-            S_free = self._bisect(fS_final, aS, bS, tol=1e-4)
-            self.cfg["chute_contact_len_m"] = Lc_target
-            x_end, y_end, V_end, theta_end, T_top, s_arr, x_arr, y_arr = self.integrate(H, S_free, ds)
-            S = S_free + Lc_target
-
-        # Mode 5: Tension at chute contact is input. Solve H such that contact tension matches.
-        elif mode in ("Contact Tension", "Top Tension"):
-            T_top_target_N = self.cfg["Ttop_input_N"]
-            if T_top_target_N <= 0:
-                raise ValueError("Contact tension must be > 0.")
-
-            def fH_top_tension(H):
-                S_free = solve_S_free_for_H(H)
-                _, _, _, _, T_top, _, _, _ = self.integrate(H, S_free, ds)
-                return T_top - T_top_target_N
-
-            H0 = max(1.0, min(T_top_target_N * 0.9, self.cfg.get("H_guess_N", 50_000.0)))
-            try:
-                a, b = self._bracket_root(fH_top_tension, x0=H0, step=max(5_000.0, 0.25 * H0))
-                H = self._bisect(fH_top_tension, a, b, tol=5.0)
-            except Exception as e:
-                raise ValueError(
-                    "Failed to solve for H that matches the requested contact tension. "
-                    "This can happen if the requested contact tension is outside the achievable range for the given geometry/weights. "
-                    f"(Requested contact tension={T_top_target_N/1000.0:.3f} kN, initial H_guess={H0/1000.0:.3f} kN)\n\nDetails: {e}"
-                )
-            S_free = solve_S_free_for_H(H)
-            x_end, y_end, V_end, theta_end, T_top, s_arr, x_arr, y_arr = self.integrate(H, S_free, ds)
-            Lc, _ = chute_contact_from_theta(theta_end)
-            S = S_free + Lc
-
-        else:
-            raise ValueError("Invalid solve mode.")
-
-        # Final integration already performed in each branch where needed.
-        # For any branch that didn't set arrays, compute now.
-        if "s_arr" not in locals():
-            # Backward compatibility: no chute coupling
-            x_end, y_end, V_end, theta_end, T_top, s_arr, x_arr, y_arr = self.integrate(H, S, ds)
-
-        # Validate final y: handled implicitly by the root-finding conditions.
-
-        # Save outputs
-        self.H_N = H
-        self.S_total = S
-        if R > 0:
-            self.layback = x_end + R * math.sin(theta_end)  # layback to chute top
-        else:
-            self.layback = x_end
-        self.exit_angle_deg_from_h = math.degrees(theta_end)
-        self.top_tension_kN = T_top / 1000.0
-        self.bottom_tension_kN = H / 1000.0
-
-        self.s = s_arr
-        self.x = x_arr
-        self.y = y_arr
-
-        self.min_radius_m = self._compute_min_radius()
-
-    def _compute_min_radius(self) -> float:
-        """
-        Compute minimum radius of curvature.
-        - Uses numerical curvature on the catenary polyline (excluding the chute arc).
-        - Includes chute radius as a candidate minimum.
-        - For point loads (kinks), curvature spikes are not physically meaningful; we clip extreme spikes.
-        """
-        if self.x is None or self.y is None:
-            return float("inf")
-
-        # Numerical curvature kappa = |x'y'' - y'x''| / (x'^2 + y'^2)^(3/2)
-        x = self.x
-        y = self.y
-
-        dx = np.gradient(x)
-        dy = np.gradient(y)
-        ddx = np.gradient(dx)
-        ddy = np.gradient(dy)
-
-        denom = np.power(dx * dx + dy * dy, 1.5)
-        denom = np.where(denom < 1e-12, 1e-12, denom)
-
-        kappa = np.abs(dx * ddy - dy * ddx) / denom
-
-        # Clip unreal spikes (point-load kinks etc.)
-        # Keep "real" curvature but don't let a single kink dominate.
-        kappa_clip = np.clip(kappa, 0, np.percentile(kappa, 99.5))
-
-        max_kappa = float(np.max(kappa_clip))
-        if max_kappa <= 1e-12:
-            R_cat = float("inf")
-        else:
-            R_cat = 1.0 / max_kappa
-
-        R_chute = self.cfg["chute_radius_m"]
-        if R_chute > 0:
-            return float(min(R_cat, R_chute))
-        return float(R_cat)
+from html import escape
 
 
 # ---------------------------
@@ -915,6 +128,12 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self._fallback_q_air_npm = self._DEFAULT_Q_AIR_NPM
         self._syncing_assembly_json = False
         self._last_plot_x_reference = None
+        self._crosshair_cid = None
+        self._plot_click_cid = None
+        self._crosshair_vline = None
+        self._crosshair_hline = None
+        self._hover_cache = {}
+        self._last_hover_signature = None
 
         # Debounce heavy recalculations while editing.
         self._update_timer = QTimer(self)
@@ -983,7 +202,11 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.settings.setValue("assembly_table_json", self._assembly_table_to_json())
         self.settings.setValue("show_full_assembly_seabed", bool(self.show_full_assembly_seabed.isChecked()))
         self.settings.setValue("show_legend", bool(self.show_legend.isChecked()))
+        self.settings.setValue("show_plot_labels", bool(self.show_plot_labels.isChecked()))
+        self.settings.setValue("show_crosshair_values", bool(self.show_crosshair_values.isChecked()))
         self.settings.setValue("x_axis_reference", self.x_axis_reference.currentIndex())
+        self.settings.setValue("cable_count_top", self.cable_count_top.value())
+        self.settings.setValue("cable_count_direction", self.cable_count_direction.currentIndex())
         self.settings.remove("assembly_table_col_widths")
 
     def restore_user_settings(self):
@@ -1072,6 +295,29 @@ class CatenaryCalculatorV2Dialog(QDialog):
         if v is not None:
             try:
                 self.show_legend.setChecked(str(v).lower() in ("1", "true", "yes"))
+            except Exception:
+                pass
+
+        v = self.settings.value("show_plot_labels")
+        if v is not None:
+            try:
+                self.show_plot_labels.setChecked(str(v).lower() in ("1", "true", "yes"))
+            except Exception:
+                pass
+
+        v = self.settings.value("show_crosshair_values")
+        if v is not None:
+            try:
+                self.show_crosshair_values.setChecked(str(v).lower() in ("1", "true", "yes"))
+            except Exception:
+                pass
+
+        if (v := _get_float("cable_count_top")) is not None:
+            self.cable_count_top.setValue(v)
+
+        if (v := _get_int("cable_count_direction")) is not None:
+            try:
+                self.cable_count_direction.setCurrentIndex(max(0, min(1, int(v))))
             except Exception:
                 pass
 
@@ -1279,6 +525,31 @@ class CatenaryCalculatorV2Dialog(QDialog):
         )
         input_layout.addRow("", self.show_full_assembly_seabed)
 
+        self.show_plot_labels = QCheckBox("Show segment/body labels")
+        self.show_plot_labels.setChecked(False)
+        self.show_plot_labels.setToolTip("Label assembly segments and bodies on the plot.")
+        input_layout.addRow("", self.show_plot_labels)
+
+        self.show_crosshair_values = QCheckBox("Show crosshair values")
+        self.show_crosshair_values.setChecked(False)
+        self.show_crosshair_values.setToolTip("Show cursor coordinates and nearest cable values while hovering over the plot.")
+        input_layout.addRow("", self.show_crosshair_values)
+
+        input_layout.addRow(QLabel("<b>Cable Count</b>"))
+        self.cable_count_top = QDoubleSpinBox()
+        self.cable_count_top.setRange(-1e9, 1e9)
+        self.cable_count_top.setDecimals(1)
+        self.cable_count_top.setSingleStep(1.0)
+        self.cable_count_top.setSuffix(" m")
+        self.cable_count_top.setValue(0.0)
+        self.cable_count_top.setToolTip("Cable count at the chute top reference point.")
+
+        self.cable_count_direction = QComboBox()
+        self.cable_count_direction.addItems(["Increases away from chute", "Decreases away from chute"])
+        self.cable_count_direction.setToolTip("Controls whether cable count grows or reduces as distance increases away from the chute top.")
+        input_layout.addRow("Count at chute top:", self.cable_count_top)
+        input_layout.addRow("Count direction:", self.cable_count_direction)
+
         note = QLabel(
             "<i>"
             "Notes:<br>"
@@ -1296,7 +567,14 @@ class CatenaryCalculatorV2Dialog(QDialog):
         output_widget = QWidget()
         output_layout = QVBoxLayout(output_widget)
 
-        output_layout.addWidget(QLabel("<b>Results</b>"))
+        results_header = QHBoxLayout()
+        results_header.addWidget(QLabel("<b>Results</b>"))
+        results_header.addStretch(1)
+        self.solver_diagnostics_btn = QPushButton("Solver diagnostics...")
+        self.solver_diagnostics_btn.setEnabled(False)
+        self.solver_diagnostics_btn.setToolTip("Open numerical residuals and convergence checks for the current result.")
+        results_header.addWidget(self.solver_diagnostics_btn)
+        output_layout.addLayout(results_header)
         self.results = QTextEdit()
         self.results.setReadOnly(True)
         self.results.setMinimumHeight(130)
@@ -1306,6 +584,11 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.canvas = FigureCanvas(self.figure)
         self.canvas.setSizePolicy(SIZE_POLICY_EXPANDING, SIZE_POLICY_EXPANDING)
         output_layout.addWidget(self.canvas, stretch=1)
+
+        self.hover_readout = QLabel("")
+        self.hover_readout.setWordWrap(True)
+        self.hover_readout.setVisible(False)
+        output_layout.addWidget(self.hover_readout)
 
         btns = QHBoxLayout()
         self.export_svg_btn = QPushButton("Export Plot...")
@@ -1350,11 +633,17 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
         self.x_axis_reference.currentIndexChanged.connect(self.schedule_update_plot)
         self.show_full_assembly_seabed.toggled.connect(self.schedule_update_plot)
+        self.show_plot_labels.toggled.connect(self.schedule_update_plot)
+        self.show_crosshair_values.toggled.connect(self._on_crosshair_toggled)
+        self.cable_count_top.valueChanged.connect(self.schedule_update_plot)
+        self.cable_count_direction.currentIndexChanged.connect(self.schedule_update_plot)
 
         self.show_legend.toggled.connect(self.schedule_update_plot)
 
         self.export_svg_btn.clicked.connect(self.export_svg)
         self.export_dxf_btn.clicked.connect(self.export_dxf)
+        self.solver_diagnostics_btn.clicked.connect(self.show_solver_diagnostics)
+        self._plot_click_cid = self.canvas.mpl_connect("button_press_event", self._on_plot_click)
 
     def showEvent(self, a0):
         self._prev_angle_ref = self.angle_reference.currentIndex()
@@ -1494,12 +783,17 @@ class CatenaryCalculatorV2Dialog(QDialog):
         if not cfg:
             self.figure.clear()
             self.canvas.draw()
+            self._last_calc = None
+            self._hover_cache = {}
+            self._hide_crosshair()
+            self.solver_diagnostics_btn.setEnabled(False)
             return
 
         try:
             calc = CatenarySystemCalculator(cfg)
             calc.solve()
             self._last_calc = calc
+            self.solver_diagnostics_btn.setEnabled(True)
 
             # Update displayed "calculated" fields (soft sync)
             self._sync_calculated_fields(calc)
@@ -1518,6 +812,10 @@ class CatenaryCalculatorV2Dialog(QDialog):
             self.results.setHtml(f'<span style="color:red;"><b>Error</b><br>{msg}</span>')
             self.figure.clear()
             self.canvas.draw()
+            self._last_calc = None
+            self._hover_cache = {}
+            self._hide_crosshair()
+            self.solver_diagnostics_btn.setEnabled(False)
 
     def _sync_calculated_fields(self, calc: CatenarySystemCalculator):
         # Don't fight the user's chosen input; only overwrite the others
@@ -1594,7 +892,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
         warn_txt = ""
         if warn_lines:
-            warn_txt = "<br><br><b>Warnings</b><br>" + "<br>".join(f"• {w}" for w in warn_lines)
+            warn_txt = "<br><br><b>Warnings</b><br>" + "<br>".join(f"• {escape(str(w))}" for w in warn_lines)
 
         txt = (
             f"Water Depth: {D:.1f} m<br>"
@@ -1613,6 +911,89 @@ class CatenaryCalculatorV2Dialog(QDialog):
             f"{warn_txt}"
         )
         self.results.setHtml(txt)
+
+    @staticmethod
+    def _format_diag_value(value: Optional[float], units: str = "") -> str:
+        if value is None:
+            return "N/A"
+        try:
+            numeric = float(value)
+        except Exception:
+            return "N/A"
+        if not math.isfinite(numeric):
+            return "N/A"
+        suffix = f" {escape(units)}" if units else ""
+        return f"{numeric:.4g}{suffix}"
+
+    def show_solver_diagnostics(self):
+        calc = self._last_calc
+        diagnostics = getattr(calc, "diagnostics", None) if calc is not None else None
+        if calc is None or diagnostics is None:
+            QMessageBox.information(self, "Solver diagnostics", "No solved catenary result is available yet.")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Solver diagnostics")
+        dialog.resize(620, 520)
+
+        layout = QVBoxLayout(dialog)
+        body = QTextEdit()
+        body.setReadOnly(True)
+        body.setHtml(self._solver_diagnostics_html(calc))
+        layout.addWidget(body)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+
+        qt_exec(dialog)
+
+    def _solver_diagnostics_html(self, calc: CatenarySystemCalculator) -> str:
+        diagnostics = calc.diagnostics
+
+        chute_iteration_txt = "N/A"
+        if getattr(diagnostics, "chute_contact_iterations", 0):
+            chute_iteration_txt = (
+                f"{diagnostics.chute_contact_iterations} iteration(s), "
+                f"residual {self._format_diag_value(diagnostics.chute_contact_residual_m, 'm')}"
+            )
+
+        warning_rows = ""
+        warnings = getattr(diagnostics, "warnings", []) or []
+        if warnings:
+            warning_rows = "".join(f"<li>{escape(str(warning))}</li>" for warning in warnings)
+        else:
+            warning_rows = "<li>No solver-specific warnings for this result.</li>"
+
+        return (
+            "<h2>Solver diagnostics</h2>"
+            "<p>These values are for checking numerical quality of the current catenary result. "
+            "They do not certify the model for every installation case; they help identify whether this solve is behaving consistently under the current static 2D assumptions.</p>"
+            "<h3>How to read this</h3>"
+            "<p>Residuals close to zero mean the solved curve is matching the selected input and chute boundary. "
+            "The half-step replay repeats the same solved state with half the integration step; smaller deltas mean the result is less sensitive to step size. "
+            "If the deltas are large, reduce Integration Step and treat the result as screening until validated externally.</p>"
+            "<h3>Current solve</h3>"
+            "<table cellspacing='4' cellpadding='2'>"
+            f"<tr><td><b>Solve mode</b></td><td>{escape(str(diagnostics.input_mode))}</td></tr>"
+            f"<tr><td><b>Integration step</b></td><td>requested {self._format_diag_value(diagnostics.ds_requested_m, 'm')}; "
+            f"effective {self._format_diag_value(diagnostics.ds_effective_m, 'm')} over {diagnostics.integration_steps} steps</td></tr>"
+            f"<tr><td><b>Free-span length</b></td><td>{self._format_diag_value(diagnostics.free_span_length_m, 'm')}</td></tr>"
+            f"<tr><td><b>Chute contact length</b></td><td>{self._format_diag_value(diagnostics.chute_contact_length_m, 'm')}</td></tr>"
+            f"<tr><td><b>Boundary height residual</b></td><td>{self._format_diag_value(diagnostics.boundary_residual_m, 'm')}</td></tr>"
+            f"<tr><td><b>{escape(str(diagnostics.input_residual_label))}</b></td>"
+            f"<td>{self._format_diag_value(diagnostics.input_residual, diagnostics.input_residual_units)}</td></tr>"
+            f"<tr><td><b>Chute contact iteration</b></td><td>{chute_iteration_txt}</td></tr>"
+            f"<tr><td><b>Half-step position delta</b></td><td>{self._format_diag_value(diagnostics.refinement_position_delta_m, 'm')}</td></tr>"
+            f"<tr><td><b>Half-step angle delta</b></td><td>{self._format_diag_value(diagnostics.refinement_angle_delta_deg, 'deg')}</td></tr>"
+            f"<tr><td><b>Half-step tension delta</b></td><td>{self._format_diag_value(diagnostics.refinement_top_tension_delta_kN, 'kN')}</td></tr>"
+            "</table>"
+            "<h3>Warnings and interpretation</h3>"
+            f"<ul>{warning_rows}</ul>"
+        )
 
     def _capture_plot_view(self) -> Optional[Tuple[float, float, float, float]]:
         try:
@@ -1647,6 +1028,437 @@ class CatenaryCalculatorV2Dialog(QDialog):
             return "Horizontal Distance from Chute Top (m)"
         return "Horizontal Distance from TDP (m)"
 
+    def _cable_count_sign(self) -> float:
+        try:
+            return -1.0 if self.cable_count_direction.currentIndex() == 1 else 1.0
+        except Exception:
+            return 1.0
+
+    def _cable_count_at_distance_from_top(self, distance_from_top_m: float) -> float:
+        return float(self.cable_count_top.value()) + self._cable_count_sign() * float(distance_from_top_m)
+
+    def _format_cable_count(self, distance_from_top_m: Optional[float]) -> str:
+        if distance_from_top_m is None:
+            return "N/A"
+        return f"{self._cable_count_at_distance_from_top(distance_from_top_m):.1f} m"
+
+    @staticmethod
+    def _segment_at_distance_from_top(assembly: List[AssemblyItem], distance_from_top_m: float) -> Optional[AssemblyItem]:
+        cursor = 0.0
+        last_segment = None
+        for item in assembly:
+            if item.kind != "segment":
+                continue
+            start = cursor
+            end = cursor + max(0.0, item.length_m)
+            if start <= distance_from_top_m <= end:
+                return item
+            if distance_from_top_m >= end:
+                last_segment = item
+            cursor = end
+        return last_segment
+
+    @staticmethod
+    def _local_tension_kN(calc: CatenarySystemCalculator, s_from_tdp_m: Optional[float]) -> Optional[float]:
+        if s_from_tdp_m is None or calc.s is None or calc.tension_kN is None:
+            return None
+        if len(calc.s) == 0 or len(calc.tension_kN) != len(calc.s):
+            return None
+        try:
+            s_value = max(float(calc.s[0]), min(float(calc.s[-1]), float(s_from_tdp_m)))
+            return float(np.interp(s_value, calc.s, calc.tension_kN))
+        except Exception:
+            return None
+
+    def _on_crosshair_toggled(self):
+        self._sync_crosshair_connection()
+        if not self.show_crosshair_values.isChecked():
+            self._hide_crosshair()
+            self.canvas.setToolTip("")
+        self.schedule_update_plot()
+
+    def _sync_crosshair_connection(self):
+        if self.show_crosshair_values.isChecked():
+            if self._crosshair_cid is None:
+                self._crosshair_cid = self.canvas.mpl_connect("motion_notify_event", self._on_plot_mouse_move)
+        elif self._crosshair_cid is not None:
+            try:
+                self.canvas.mpl_disconnect(self._crosshair_cid)
+            except Exception:
+                pass
+            self._crosshair_cid = None
+
+    def _hide_crosshair(self):
+        for line in (self._crosshair_vline, self._crosshair_hline):
+            try:
+                if line is not None:
+                    line.set_visible(False)
+            except Exception:
+                pass
+        if hasattr(self, "hover_readout"):
+            self.hover_readout.setText("")
+            self.hover_readout.setVisible(False)
+        self._last_hover_signature = None
+        self.canvas.draw_idle()
+
+    def _axis_spans_for_hover(self) -> Tuple[float, float]:
+        axes = self.figure.get_axes()
+        if not axes:
+            return 1.0, 1.0
+        try:
+            x0, x1 = axes[0].get_xlim()
+            y0, y1 = axes[0].get_ylim()
+            return max(abs(x1 - x0), 1e-9), max(abs(y1 - y0), 1e-9)
+        except Exception:
+            return 1.0, 1.0
+
+    def _nearest_body_hit(self, x_value: float, depth_value: float) -> Optional[dict]:
+        body_points = self._hover_cache.get("body_points") or []
+        if not body_points:
+            return None
+        x_span, y_span = self._axis_spans_for_hover()
+        best_body = None
+        best_distance = float("inf")
+        for body in body_points:
+            try:
+                distance = ((float(body["x"]) - x_value) / x_span) ** 2 + ((float(body["depth"]) - depth_value) / y_span) ** 2
+            except Exception:
+                continue
+            if distance < best_distance:
+                best_distance = distance
+                best_body = body
+        if best_body is not None and best_distance <= 0.0025:
+            return best_body
+        return None
+
+    def _body_detail_lines(self, body: dict, compact: bool = False) -> List[str]:
+        tension = body.get("tension_kN")
+        tension_txt = f"{float(tension):.2f} kN" if tension is not None else "N/A"
+        load = float(body.get("point_load_kN", 0.0) or 0.0)
+        load_note = "downward" if load >= 0 else "buoyant/upward"
+        lines = [
+            f"Body: {body.get('name', 'Body')}",
+            f"Position: {body.get('position', 'N/A')}",
+            f"Cable count: {body.get('cable_count', 'N/A')}",
+            f"Tension: {tension_txt}",
+        ]
+        if not compact:
+            lines.extend([
+                f"Distance from chute top: {float(body.get('distance_from_top_m', 0.0)):.2f} m",
+                f"s from TDP: {body.get('s_from_tdp_txt', 'N/A')}",
+            ])
+        segment_name = body.get("segment_name")
+        if segment_name:
+            lines.append(f"Segment: {segment_name}")
+            if not compact:
+                lines.append(f"Segment weights: {body.get('segment_weight_txt', 'N/A')}")
+        lines.append(f"Point load: {abs(load):.2f} kN {load_note}")
+        return lines
+
+    def _show_body_details(self, body: dict):
+        QMessageBox.information(self, "Body details", "\n".join(self._body_detail_lines(body, compact=False)))
+
+    def _on_plot_click(self, event):
+        if event.inaxes is None or event.xdata is None or event.ydata is None:
+            return
+        try:
+            if event.button not in (None, 1):
+                return
+            body = self._nearest_body_hit(float(event.xdata), float(event.ydata))
+            if body is not None:
+                self._show_body_details(body)
+        except Exception:
+            return
+
+    def _on_plot_mouse_move(self, event):
+        if not self.show_crosshair_values.isChecked() or event.inaxes is None:
+            self._hide_crosshair()
+            self.canvas.setToolTip("")
+            return
+        if event.xdata is None or event.ydata is None:
+            self._hide_crosshair()
+            self.canvas.setToolTip("")
+            return
+        axes = self.figure.get_axes()
+        if not axes or event.inaxes is not axes[0]:
+            self._hide_crosshair()
+            self.canvas.setToolTip("")
+            return
+
+        try:
+            x_value = float(event.xdata)
+            y_value = float(event.ydata)
+        except Exception:
+            self._hide_crosshair()
+            self.canvas.setToolTip("")
+            return
+
+        if self._crosshair_vline is not None:
+            self._crosshair_vline.set_xdata([x_value, x_value])
+            self._crosshair_vline.set_visible(True)
+        if self._crosshair_hline is not None:
+            self._crosshair_hline.set_ydata([y_value, y_value])
+            self._crosshair_hline.set_visible(True)
+
+        tooltip_text, signature = self._hover_tooltip_text(x_value, y_value)
+        if signature != self._last_hover_signature:
+            self._last_hover_signature = signature
+            self.canvas.setToolTip(tooltip_text)
+            self.hover_readout.setText(" | ".join(line for line in tooltip_text.splitlines() if line))
+            self.hover_readout.setVisible(True)
+        self.canvas.draw_idle()
+
+    def _hover_tooltip_text(self, x_value: float, depth_value: float) -> Tuple[str, Tuple[Any, ...]]:
+        lines = [
+            f"X: {x_value:.2f} m",
+            f"Depth: {depth_value:.2f} m",
+            f"Height above waterline: {-depth_value:.2f} m",
+        ]
+
+        body = self._nearest_body_hit(x_value, depth_value)
+        if body is not None:
+            body_lines = self._body_detail_lines(body, compact=True)
+            return "\n".join(body_lines), ("body", body.get("name"), round(float(body.get("distance_from_top_m", 0.0)), 2))
+
+        curve_x = self._hover_cache.get("curve_x")
+        curve_depth = self._hover_cache.get("curve_depth")
+        curve_s = self._hover_cache.get("curve_s")
+        curve_tension = self._hover_cache.get("curve_tension_kN")
+        if curve_x is None or curve_depth is None or curve_s is None or len(curve_x) == 0:
+            return "\n".join(lines), ("free", round(x_value, 2), round(depth_value, 2))
+
+        try:
+            x_span, y_span = self._axis_spans_for_hover()
+            distances = ((curve_x - x_value) / x_span) ** 2 + ((curve_depth - depth_value) / y_span) ** 2
+            idx = int(np.argmin(distances))
+            if float(distances[idx]) <= 0.0064:
+                distance_from_top = self._hover_cache.get("chute_contact_len_m", 0.0) + self._hover_cache.get("free_span_length_m", 0.0) - float(curve_s[idx])
+                tension_txt = "N/A"
+                if curve_tension is not None and len(curve_tension) == len(curve_s):
+                    tension_txt = f"{float(curve_tension[idx]):.2f} kN"
+                lines.extend([
+                    "",
+                    "Nearest cable point:",
+                    f"s from TDP: {float(curve_s[idx]):.2f} m",
+                    f"Distance from chute top: {distance_from_top:.2f} m",
+                    f"Cable count: {self._format_cable_count(distance_from_top)}",
+                    f"Cable depth: {float(curve_depth[idx]):.2f} m",
+                    f"Tension: {tension_txt}",
+                ])
+                return "\n".join(lines), ("cable", int(idx), round(x_value, 1), round(depth_value, 1))
+        except Exception:
+            pass
+        return "\n".join(lines), ("free", round(x_value, 2), round(depth_value, 2))
+
+    def _build_hover_cache(
+        self,
+        calc: CatenarySystemCalculator,
+        assembly: List[AssemblyItem],
+        x_origin_offset: float,
+        layback_plot: float,
+        D: float,
+        c: float,
+        R: float,
+    ):
+        self._hover_cache = {}
+        self._last_hover_signature = None
+        if calc.x is None or calc.y is None or calc.s is None:
+            return
+
+        S_free = float(calc.s[-1]) if len(calc.s) else 0.0
+        Lc = float(getattr(calc, "chute_contact_len_m", 0.0))
+        body_points: List[dict] = []
+        cursor = 0.0
+        previous_segment: Optional[AssemblyItem] = None
+
+        for item in assembly:
+            if item.kind == "segment":
+                previous_segment = item
+                cursor += max(0.0, item.length_m)
+                continue
+            if item.kind != "body":
+                continue
+
+            distance_from_top = float(cursor)
+            x_body = None
+            depth_body = None
+            s_body = None
+            position = "outside modeled span"
+            tension_kN = None
+
+            if R > 0 and distance_from_top < Lc:
+                phi = (math.pi / 2.0) + (distance_from_top / R)
+                x_body = layback_plot + R * math.cos(phi)
+                y_body = c - R + R * math.sin(phi)
+                depth_body = -y_body
+                position = "on chute arc"
+                tension_kN = calc.top_tension_kN
+            elif distance_from_top <= Lc + S_free:
+                s_body = S_free - (distance_from_top - Lc)
+                x_body = float(np.interp(s_body, calc.s, calc.x)) - x_origin_offset
+                y_body = float(np.interp(s_body, calc.s, calc.y))
+                depth_body = -y_body
+                position = "free span"
+                tension_kN = self._local_tension_kN(calc, s_body)
+            elif self.show_full_assembly_seabed.isChecked() and calc.S_total is not None and distance_from_top > float(calc.S_total):
+                x_body = -(distance_from_top - float(calc.S_total)) - x_origin_offset
+                depth_body = D
+                position = "on seabed"
+
+            if x_body is None or depth_body is None:
+                continue
+
+            segment = previous_segment or self._segment_at_distance_from_top(assembly, distance_from_top)
+            segment_weight_txt = "N/A"
+            segment_name = ""
+            if segment is not None:
+                segment_name = segment.name
+                segment_weight_txt = f"water {float(segment.q_water_npm):.2f} N/m, air {float(segment.q_air_npm):.2f} N/m"
+
+            body_points.append({
+                "name": item.name or "Body",
+                "x": float(x_body),
+                "depth": float(depth_body),
+                "position": position,
+                "distance_from_top_m": distance_from_top,
+                "cable_count": self._format_cable_count(distance_from_top),
+                "s_from_tdp_m": s_body,
+                "s_from_tdp_txt": f"{float(s_body):.2f} m" if s_body is not None else "N/A",
+                "tension_kN": tension_kN,
+                "point_load_kN": float(item.point_load_kN),
+                "segment_name": segment_name,
+                "segment_weight_txt": segment_weight_txt,
+            })
+
+        self._hover_cache = {
+            "curve_x": np.array(calc.x - x_origin_offset, dtype=float),
+            "curve_depth": np.array(-calc.y, dtype=float),
+            "curve_s": np.array(calc.s, dtype=float),
+            "curve_tension_kN": np.array(calc.tension_kN, dtype=float) if calc.tension_kN is not None else None,
+            "body_points": body_points,
+            "free_span_length_m": S_free,
+            "chute_contact_len_m": Lc,
+        }
+
+    def _add_plot_labels(
+        self,
+        ax,
+        calc: CatenarySystemCalculator,
+        assembly: List[AssemblyItem],
+        x_origin_offset: float,
+        layback_plot: float,
+        D: float,
+        c: float,
+        R: float,
+    ):
+        if not self.show_plot_labels.isChecked() or calc.s is None or calc.x is None or calc.y is None:
+            return
+
+        S_free = float(calc.s[-1])
+        Lc = float(getattr(calc, "chute_contact_len_m", 0.0))
+        plot_x = np.array(calc.x - x_origin_offset, dtype=float)
+        plot_depth = np.array(-calc.y, dtype=float)
+        x_span = max(1.0, float(np.max(plot_x) - np.min(plot_x))) if len(plot_x) else 1.0
+        y_span = max(1.0, float(np.max(plot_depth) - np.min(plot_depth)), float(D), abs(float(c)) + float(R))
+        label_offset = max(0.75, 0.018 * max(x_span, y_span))
+        label_count = 0
+        max_labels = 80
+
+        def add_label(
+            x_value: float,
+            depth_value: float,
+            label: str,
+            color: str = "#111827",
+            ha: str = "center",
+            va: str = "bottom",
+        ):
+            nonlocal label_count
+            if label_count >= max_labels or not label:
+                return
+            ax.text(
+                x_value,
+                depth_value,
+                label,
+                color=color or "#111827",
+                fontsize=8,
+                ha=ha,
+                va=va,
+                background=True,
+            )
+            label_count += 1
+
+        tdp_x = -x_origin_offset
+        tdp_count = self._format_cable_count(calc.S_total if calc.S_total is not None else Lc + S_free)
+        add_label(tdp_x + label_offset, float(D) - label_offset, f"TDP\nCC {tdp_count}", "#111827", ha="left", va="bottom")
+        add_label(layback_plot, -float(c) - label_offset, f"Top of chute\nCC {self._format_cable_count(0.0)}", "#111827", ha="center", va="bottom")
+
+        def curve_label_position(s_label: float, offset_multiplier: float) -> Tuple[float, float]:
+            x_base = float(np.interp(s_label, calc.s, plot_x))
+            depth_base = float(np.interp(s_label, calc.s, plot_depth))
+            idx = int(np.searchsorted(calc.s, s_label))
+            idx0 = max(0, idx - 2)
+            idx1 = min(len(calc.s) - 1, idx + 2)
+            dx = float(plot_x[idx1] - plot_x[idx0])
+            dy = float(plot_depth[idx1] - plot_depth[idx0])
+            mag = math.hypot(dx, dy)
+            if mag <= 1e-12:
+                return x_base, depth_base - label_offset * offset_multiplier
+            normal_x = -dy / mag
+            normal_y = dx / mag
+            if normal_y > 0:
+                normal_x = -normal_x
+                normal_y = -normal_y
+            return x_base + normal_x * label_offset * offset_multiplier, depth_base + normal_y * label_offset * offset_multiplier
+
+        body_offsets = [
+            (0.0, -1.4),
+            (1.3, -1.1),
+            (-1.3, -1.1),
+            (0.0, 1.2),
+            (1.2, 1.0),
+            (-1.2, 1.0),
+        ]
+
+        cursor = 0.0
+        body_index = 0
+        for item in assembly:
+            if item.kind == "segment":
+                length = max(0.0, item.length_m)
+                d0 = cursor
+                d1 = cursor + length
+                overlap0 = max(d0, Lc)
+                overlap1 = min(d1, Lc + S_free)
+                if overlap1 > overlap0 + 1e-6:
+                    d_label = 0.5 * (overlap0 + overlap1)
+                    s_label = S_free - (d_label - Lc)
+                    offset_multiplier = 1.0 + 0.28 * (label_count % 3)
+                    x_label, depth_label = curve_label_position(s_label, offset_multiplier)
+                    add_label(x_label, depth_label, item.name, self._normalize_color_hex(getattr(item, "color_hex", "")) or "#111827")
+                cursor = d1
+                continue
+
+            if item.kind != "body":
+                continue
+
+            body_color = self._normalize_color_hex(getattr(item, "color_hex", "")) or "#111827"
+            d_body = cursor
+            offset_x, offset_y = body_offsets[body_index % len(body_offsets)]
+            body_index += 1
+            if R > 0 and d_body < Lc:
+                phi = (math.pi / 2.0) + (float(d_body) / R)
+                xb = layback_plot + R * math.cos(phi)
+                yb = c - R + R * math.sin(phi)
+                add_label(xb + offset_x * label_offset, -yb + offset_y * label_offset, item.name, body_color)
+            elif d_body <= Lc + S_free:
+                s_body = S_free - (d_body - Lc)
+                xb = float(np.interp(s_body, calc.s, calc.x)) - x_origin_offset
+                yb = float(np.interp(s_body, calc.s, calc.y))
+                add_label(xb + offset_x * label_offset, -yb + offset_y * label_offset, item.name, body_color)
+            elif self.show_full_assembly_seabed.isChecked() and calc.S_total is not None:
+                x_body_physical = -(d_body - float(calc.S_total))
+                xb = x_body_physical - x_origin_offset
+                add_label(xb + offset_x * label_offset, D + offset_y * label_offset, item.name, body_color)
+
     def _plot(self, calc: CatenarySystemCalculator):
         plot_x_reference = self._x_axis_reference_key()
         previous_view = self._capture_plot_view()
@@ -1656,6 +1468,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
         ax = self.figure.add_subplot(111)
 
         if calc.x is None or calc.y is None:
+            self._hover_cache = {}
             self.canvas.draw()
             return
 
@@ -1923,6 +1736,24 @@ class CatenaryCalculatorV2Dialog(QDialog):
                         label = "Body (seabed)" if i == 0 else None
                         ax.scatter([bx], [by], marker="D", s=36, facecolors="none", edgecolors=body_color, label=label)
 
+                end_x = -seabed_len - x_origin_offset
+                ax.scatter([end_x], [D], marker="s", s=36, color="#111827", label="End of cable")
+                if self.show_plot_labels.isChecked():
+                    label_offset = max(0.75, 0.018 * max(abs(float(seabed_len)), float(D), 1.0))
+                    ax.text(
+                        end_x,
+                        D - label_offset,
+                        f"End of cable\nCC {self._format_cable_count(asm_seg_total)}",
+                        color="#111827",
+                        fontsize=8,
+                        ha="center",
+                        va="bottom",
+                        background=True,
+                    )
+
+        self._build_hover_cache(calc, assembly, x_origin_offset, layback_plot, D, c, R)
+        self._add_plot_labels(ax, calc, assembly, x_origin_offset, layback_plot, D, c, R)
+
         ax.set_xlabel(self._x_axis_label())
         ax.set_ylabel("Depth (m)")
         ax.set_title("Cable Catenary")
@@ -1963,6 +1794,17 @@ class CatenaryCalculatorV2Dialog(QDialog):
         ax.set_aspect("equal", adjustable="box")
         ax.invert_yaxis()  # conventional: depth downwards
         ax.grid(True, alpha=0.25)
+
+        self._crosshair_vline = None
+        self._crosshair_hline = None
+        self._sync_crosshair_connection()
+        if self.show_crosshair_values.isChecked():
+            self._crosshair_vline = ax.axvline(0.0, color="#111827", linestyle="--", linewidth=0.8)
+            self._crosshair_hline = ax.axhline(0.0, color="#111827", linestyle="--", linewidth=0.8)
+            self._crosshair_vline.set_visible(False)
+            self._crosshair_hline.set_visible(False)
+        else:
+            self.canvas.setToolTip("")
 
         if self.show_legend.isChecked():
             ax.legend(fontsize="small")

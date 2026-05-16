@@ -5,7 +5,7 @@ import importlib
 
 from .. import plot_widget as _plot_widget
 
-if int(getattr(_plot_widget, "__SUBSEA_PLOT_WIDGET_PATCH_VERSION__", 0) or 0) < 4:
+if int(getattr(_plot_widget, "__SUBSEA_PLOT_WIDGET_PATCH_VERSION__", 0) or 0) < 6:
     _plot_widget = importlib.reload(_plot_widget)
 
 CatenaryPlotCanvas = _plot_widget.FigureCanvas

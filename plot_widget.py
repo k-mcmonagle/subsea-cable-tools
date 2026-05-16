@@ -17,7 +17,7 @@ from qgis.PyQt.QtWidgets import QFileDialog, QGraphicsPathItem, QHBoxLayout, QPu
 
 _PEN_STYLE = getattr(Qt, "PenStyle", Qt)
 _MOUSE_BUTTON = getattr(Qt, "MouseButton", Qt)
-__SUBSEA_PLOT_WIDGET_PATCH_VERSION__ = 4
+__SUBSEA_PLOT_WIDGET_PATCH_VERSION__ = 6
 _REQUIRED_SVG_EXPORTER_PATCH_VERSION = 4
 
 
@@ -535,6 +535,34 @@ class PyQtGraphAxis:
         line = PyQtGraphLine(item, list(x_values), list(y_values), label=label)
         if label:
             self._legend_items.append(line)
+        return item
+
+    def text(self, x: float, y: float, s: str, *args, **kwargs):
+        color = kwargs.pop("color", "#111827")
+        fontsize = kwargs.pop("fontsize", kwargs.pop("size", 9))
+        ha = str(kwargs.pop("ha", kwargs.pop("horizontalalignment", "center"))).lower()
+        va = str(kwargs.pop("va", kwargs.pop("verticalalignment", "center"))).lower()
+        angle = float(kwargs.pop("rotation", 0.0) or 0.0)
+        background = bool(kwargs.pop("background", False))
+
+        anchor_x = {"left": 0.0, "center": 0.5, "right": 1.0}.get(ha, 0.5)
+        anchor_y = {"top": 0.0, "center": 0.5, "bottom": 1.0, "baseline": 1.0}.get(va, 0.5)
+        text_kwargs = {}
+        if background:
+            text_kwargs["fill"] = pg.mkBrush(255, 255, 255, 220)
+            text_kwargs["border"] = pg.mkPen(pg.mkColor(209, 213, 219), width=1)
+        try:
+            item = pg.TextItem(str(s), color=_as_plot_color(color, "#111827"), anchor=(anchor_x, anchor_y), angle=angle, **text_kwargs)
+        except TypeError:
+            item = pg.TextItem(str(s), color=_as_plot_color(color, "#111827"), anchor=(anchor_x, anchor_y), angle=angle)
+        try:
+            font = QtGui.QFont()
+            font.setPointSizeF(float(fontsize))
+            item.setFont(font)
+        except Exception:
+            pass
+        item.setPos(float(x), float(y))
+        self._add_item(item)
         return item
 
     def fill(self, x_values, y_values, *args, **kwargs):
