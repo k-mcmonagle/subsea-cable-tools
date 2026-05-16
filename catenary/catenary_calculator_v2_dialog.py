@@ -207,6 +207,8 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.settings.setValue("x_axis_reference", self.x_axis_reference.currentIndex())
         self.settings.setValue("cable_count_top", self.cable_count_top.value())
         self.settings.setValue("cable_count_direction", self.cable_count_direction.currentIndex())
+        self.settings.setValue("kp_top", self.kp_top.value())
+        self.settings.setValue("kp_direction", self.kp_direction.currentIndex())
         self.settings.remove("assembly_table_col_widths")
 
     def restore_user_settings(self):
@@ -321,6 +323,15 @@ class CatenaryCalculatorV2Dialog(QDialog):
             except Exception:
                 pass
 
+        if (v := _get_float("kp_top")) is not None:
+            self.kp_top.setValue(v)
+
+        if (v := _get_int("kp_direction")) is not None:
+            try:
+                self.kp_direction.setCurrentIndex(max(0, min(1, int(v))))
+            except Exception:
+                pass
+
         self.assembly_table.resizeColumnsToContents()
 
     # ---- UI init
@@ -364,7 +375,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.chute_radius.setValue(0.0)
         self.chute_radius.setToolTip(
             "Chute radius used for geometry AND for optional chute-contact coupling. "
-            "Set to 0 to ignore chute contact (free-span goes to the chute top point)."
+            "Set to 0 to ignore chute contact (free-span goes to the Top of Chute point)."
         )
 
         self.ds_step = QDoubleSpinBox()
@@ -417,7 +428,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.layback.setValue(150.0)
 
         self.x_axis_reference = QComboBox()
-        self.x_axis_reference.addItems(["Touchdown point", "Chute top position"])
+        self.x_axis_reference.addItems(["Touchdown point", "Top of Chute position"])
         self.x_axis_reference.setToolTip(
             "Controls only the rendered/exported horizontal coordinate origin. Calculations remain referenced to the TDP."
         )
@@ -473,7 +484,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
         asm_tab = QWidget()
         asm_tab_layout = QVBoxLayout(asm_tab)
-        asm_tab_layout.addWidget(QLabel("Assembly is ordered from the chute top down along the cable."))
+        asm_tab_layout.addWidget(QLabel("Assembly is ordered from the Top of Chute down along the cable."))
         asm_tab_layout.addWidget(self.assembly_table)
         asm_tab_layout.addLayout(a_btn_row)
         self.assembly_tabs.addTab(asm_tab, "Assembly")
@@ -542,20 +553,39 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.cable_count_top.setSingleStep(1.0)
         self.cable_count_top.setSuffix(" m")
         self.cable_count_top.setValue(0.0)
-        self.cable_count_top.setToolTip("Cable count at the chute top reference point.")
+        self.cable_count_top.setToolTip("Cable count at the Top of Chute reference point.")
 
         self.cable_count_direction = QComboBox()
-        self.cable_count_direction.addItems(["Increases away from chute", "Decreases away from chute"])
-        self.cable_count_direction.setToolTip("Controls whether cable count grows or reduces as distance increases away from the chute top.")
-        input_layout.addRow("Count at chute top:", self.cable_count_top)
+        self.cable_count_direction.addItems(["Increases outboard from chute", "Increases inboard toward vessel"])
+        self.cable_count_direction.setToolTip(
+            "Outboard is from the chute toward the deployed cable/TDP; inboard is toward the vessel."
+        )
+        input_layout.addRow("Count at Top of Chute:", self.cable_count_top)
         input_layout.addRow("Count direction:", self.cable_count_direction)
+
+        input_layout.addRow(QLabel("<b>Route KP Reference</b>"))
+        self.kp_top = QDoubleSpinBox()
+        self.kp_top.setRange(-1e9, 1e9)
+        self.kp_top.setDecimals(3)
+        self.kp_top.setSingleStep(0.001)
+        self.kp_top.setSuffix(" km")
+        self.kp_top.setValue(0.0)
+        self.kp_top.setToolTip("Route KP at the Top of Chute reference point.")
+
+        self.kp_direction = QComboBox()
+        self.kp_direction.addItems(["Increases outboard from chute", "Increases inboard toward vessel"])
+        self.kp_direction.setToolTip(
+            "KP is calculated from horizontal distance. Outboard is from the chute toward the TDP/seabed."
+        )
+        input_layout.addRow("KP at Top of Chute:", self.kp_top)
+        input_layout.addRow("KP direction:", self.kp_direction)
 
         note = QLabel(
             "<i>"
             "Notes:<br>"
-            "• The system is solved as a suspended cable from TDP (seabed touchdown) to the chute contact point, then along the chute arc to the chute top reference point.<br>"
+            "• The system is solved as a suspended cable from TDP (seabed touchdown) to the chute contact point, then along the chute arc to the Top of Chute reference point.<br>"
             "• Submerged vs in-air is determined automatically when the curve crosses sea level (y=0).<br>"
-            "• Assembly is defined from the chute top down (Segment rows set distributed weight; Body rows add lumped load/buoyancy).<br>"
+            "• Assembly is defined from the Top of Chute down (Segment rows set distributed weight; Body rows add lumped load/buoyancy).<br>"
             "• Point loads create a mathematical kink (angle discontinuity). Prefer short sections if you care about curvature/MBR.<br>"
             "• Chute contact is modeled by enforcing the free-span tangent to match the chute arc tangent; contact length depends on tangent angle."
             "</i>"
@@ -586,8 +616,18 @@ class CatenaryCalculatorV2Dialog(QDialog):
         output_layout.addWidget(self.canvas, stretch=1)
 
         self.hover_readout = QLabel("")
-        self.hover_readout.setWordWrap(True)
-        self.hover_readout.setVisible(False)
+        self.hover_readout.setWordWrap(False)
+        hover_height = max(28, int(self.hover_readout.fontMetrics().lineSpacing() * 2 + 8))
+        self.hover_readout.setMinimumHeight(hover_height)
+        self.hover_readout.setMaximumHeight(hover_height)
+        try:
+            fixed_policy = getattr(QSizePolicy, "Fixed", None)
+            if fixed_policy is None:
+                fixed_policy = getattr(getattr(QSizePolicy, "Policy", QSizePolicy), "Fixed")
+            self.hover_readout.setSizePolicy(SIZE_POLICY_EXPANDING, fixed_policy)
+        except Exception:
+            pass
+        self.hover_readout.setVisible(True)
         output_layout.addWidget(self.hover_readout)
 
         btns = QHBoxLayout()
@@ -637,6 +677,8 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.show_crosshair_values.toggled.connect(self._on_crosshair_toggled)
         self.cable_count_top.valueChanged.connect(self.schedule_update_plot)
         self.cable_count_direction.currentIndexChanged.connect(self.schedule_update_plot)
+        self.kp_top.valueChanged.connect(self.schedule_update_plot)
+        self.kp_direction.currentIndexChanged.connect(self.schedule_update_plot)
 
         self.show_legend.toggled.connect(self.schedule_update_plot)
 
@@ -697,7 +739,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
             c = float(self.chute_exit_height.value())
             if c < 0:
-                raise ValueError("Chute top height must be >= 0.")
+                raise ValueError("Top of Chute height must be >= 0.")
 
             R = float(self.chute_radius.value())
             if R < 0:
@@ -762,7 +804,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 if S_in < S_min - 1e-6:
                     raise ValueError(
                         f"Total cable length ({S_in:.1f} m) is too short for the geometry. "
-                        f"Minimum feasible length is about {S_min:.1f} m (given water depth={D:.1f} m, chute top height={c:.1f} m, chute radius={R:.1f} m)."
+                        f"Minimum feasible length is about {S_min:.1f} m (given water depth={D:.1f} m, Top of Chute height={c:.1f} m, chute radius={R:.1f} m)."
                     )
                 cfg["S_input_m"] = S_in
             elif mode == "Layback":
@@ -900,8 +942,10 @@ class CatenaryCalculatorV2Dialog(QDialog):
             f"Bottom Tension: {calc.bottom_tension_kN:.1f} kN<br>"
             f"Tension at Contact: {calc.top_tension_kN:.1f} kN<br>"
             f"Tangent Angle at Contact: {calc.exit_angle_deg_from_h:.1f}° from horizontal / {angle_from_vertical:.1f}° from vertical<br>"
-            f"Total Cable Length (Touchdown to Chute Top): {calc.S_total:.1f} m<br>"
-            f"Layback (Touchdown to Chute Top): {calc.layback:.1f} m<br>"
+            f"Total Cable Length (Touchdown to Top of Chute): {calc.S_total:.1f} m<br>"
+            f"Layback (Touchdown to Top of Chute): {calc.layback:.1f} m<br>"
+            f"Top of Chute KP: {self._format_kp(0.0)}<br>"
+            f"TDP KP: {self._format_kp(calc.layback)}<br>"
             f"Flop Forward (Length - Layback): {flop_forward_txt}<br>"
             f"Chute contact/tangent point: {contact_txt}<br>"
             f"Cable on chute arc: {chute_contact_txt}<br>"
@@ -1025,14 +1069,18 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
     def _x_axis_label(self) -> str:
         if self._x_axis_reference_key() == "chute_top":
-            return "Horizontal Distance from Chute Top (m)"
+            return "Horizontal Distance from Top of Chute (m)"
         return "Horizontal Distance from TDP (m)"
 
-    def _cable_count_sign(self) -> float:
+    @staticmethod
+    def _direction_sign(combo: QComboBox) -> float:
         try:
-            return -1.0 if self.cable_count_direction.currentIndex() == 1 else 1.0
+            return -1.0 if combo.currentIndex() == 1 else 1.0
         except Exception:
             return 1.0
+
+    def _cable_count_sign(self) -> float:
+        return self._direction_sign(self.cable_count_direction)
 
     def _cable_count_at_distance_from_top(self, distance_from_top_m: float) -> float:
         return float(self.cable_count_top.value()) + self._cable_count_sign() * float(distance_from_top_m)
@@ -1041,6 +1089,40 @@ class CatenaryCalculatorV2Dialog(QDialog):
         if distance_from_top_m is None:
             return "N/A"
         return f"{self._cable_count_at_distance_from_top(distance_from_top_m):.1f} m"
+
+    def _kp_sign(self) -> float:
+        return self._direction_sign(self.kp_direction)
+
+    def _kp_at_horizontal_from_top(self, horizontal_from_top_m: float) -> float:
+        return float(self.kp_top.value()) + self._kp_sign() * (float(horizontal_from_top_m) / 1000.0)
+
+    def _format_kp(self, horizontal_from_top_m: Optional[float]) -> str:
+        if horizontal_from_top_m is None:
+            return "N/A"
+        try:
+            return f"{self._kp_at_horizontal_from_top(horizontal_from_top_m):.3f}"
+        except Exception:
+            return "N/A"
+
+    def _horizontal_from_top_for_plot_x(self, plot_x_m: float) -> Optional[float]:
+        layback_plot = self._hover_cache.get("layback_plot_m")
+        if layback_plot is None:
+            return None
+        try:
+            return float(layback_plot) - float(plot_x_m)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _hover_readout_text(tooltip_text: str) -> str:
+        lines = [line.strip() for line in str(tooltip_text or "").splitlines() if line.strip()]
+        if not lines:
+            return ""
+        if len(lines) == 1:
+            return lines[0]
+        first_line = " | ".join(lines[:2])
+        second_line = " | ".join(lines[2:6])
+        return f"{first_line}\n{second_line}" if second_line else first_line
 
     @staticmethod
     def _segment_at_distance_from_top(assembly: List[AssemblyItem], distance_from_top_m: float) -> Optional[AssemblyItem]:
@@ -1097,7 +1179,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 pass
         if hasattr(self, "hover_readout"):
             self.hover_readout.setText("")
-            self.hover_readout.setVisible(False)
+            self.hover_readout.setVisible(True)
         self._last_hover_signature = None
         self.canvas.draw_idle()
 
@@ -1136,15 +1218,19 @@ class CatenaryCalculatorV2Dialog(QDialog):
         tension_txt = f"{float(tension):.2f} kN" if tension is not None else "N/A"
         load = float(body.get("point_load_kN", 0.0) or 0.0)
         load_note = "downward" if load >= 0 else "buoyant/upward"
+        horizontal_from_top = body.get("horizontal_from_top_m")
+        horizontal_txt = f"{float(horizontal_from_top):.2f} m" if horizontal_from_top is not None else "N/A"
         lines = [
             f"Body: {body.get('name', 'Body')}",
             f"Position: {body.get('position', 'N/A')}",
+            f"KP: {body.get('kp', 'N/A')}",
             f"Cable count: {body.get('cable_count', 'N/A')}",
             f"Tension: {tension_txt}",
         ]
         if not compact:
             lines.extend([
-                f"Distance from chute top: {float(body.get('distance_from_top_m', 0.0)):.2f} m",
+                f"Distance from Top of Chute: {float(body.get('distance_from_top_m', 0.0)):.2f} m",
+                f"Horizontal from Top of Chute: {horizontal_txt}",
                 f"s from TDP: {body.get('s_from_tdp_txt', 'N/A')}",
             ])
         segment_name = body.get("segment_name")
@@ -1204,13 +1290,15 @@ class CatenaryCalculatorV2Dialog(QDialog):
         if signature != self._last_hover_signature:
             self._last_hover_signature = signature
             self.canvas.setToolTip(tooltip_text)
-            self.hover_readout.setText(" | ".join(line for line in tooltip_text.splitlines() if line))
+            self.hover_readout.setText(self._hover_readout_text(tooltip_text))
             self.hover_readout.setVisible(True)
         self.canvas.draw_idle()
 
     def _hover_tooltip_text(self, x_value: float, depth_value: float) -> Tuple[str, Tuple[Any, ...]]:
+        cursor_horizontal_from_top = self._horizontal_from_top_for_plot_x(x_value)
         lines = [
             f"X: {x_value:.2f} m",
+            f"KP: {self._format_kp(cursor_horizontal_from_top)}",
             f"Depth: {depth_value:.2f} m",
             f"Height above waterline: {-depth_value:.2f} m",
         ]
@@ -1224,6 +1312,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
         curve_depth = self._hover_cache.get("curve_depth")
         curve_s = self._hover_cache.get("curve_s")
         curve_tension = self._hover_cache.get("curve_tension_kN")
+        curve_horizontal = self._hover_cache.get("curve_horizontal_from_top_m")
         if curve_x is None or curve_depth is None or curve_s is None or len(curve_x) == 0:
             return "\n".join(lines), ("free", round(x_value, 2), round(depth_value, 2))
 
@@ -1233,15 +1322,23 @@ class CatenaryCalculatorV2Dialog(QDialog):
             idx = int(np.argmin(distances))
             if float(distances[idx]) <= 0.0064:
                 distance_from_top = self._hover_cache.get("chute_contact_len_m", 0.0) + self._hover_cache.get("free_span_length_m", 0.0) - float(curve_s[idx])
+                horizontal_from_top = None
+                if curve_horizontal is not None and len(curve_horizontal) == len(curve_s):
+                    horizontal_from_top = float(curve_horizontal[idx])
                 tension_txt = "N/A"
                 if curve_tension is not None and len(curve_tension) == len(curve_s):
                     tension_txt = f"{float(curve_tension[idx]):.2f} kN"
+                segment = self._segment_at_distance_from_top(self._hover_cache.get("assembly", []), distance_from_top)
+                segment_name = getattr(segment, "name", "") if segment is not None else ""
                 lines.extend([
                     "",
                     "Nearest cable point:",
                     f"s from TDP: {float(curve_s[idx]):.2f} m",
-                    f"Distance from chute top: {distance_from_top:.2f} m",
+                    f"Distance from Top of Chute: {distance_from_top:.2f} m",
+                    f"Horizontal from Top of Chute: {horizontal_from_top:.2f} m" if horizontal_from_top is not None else "Horizontal from Top of Chute: N/A",
+                    f"KP: {self._format_kp(horizontal_from_top)}",
                     f"Cable count: {self._format_cable_count(distance_from_top)}",
+                    f"Segment: {segment_name}" if segment_name else "Segment: N/A",
                     f"Cable depth: {float(curve_depth[idx]):.2f} m",
                     f"Tension: {tension_txt}",
                 ])
@@ -1308,6 +1405,13 @@ class CatenaryCalculatorV2Dialog(QDialog):
             if x_body is None or depth_body is None:
                 continue
 
+            horizontal_from_top = None
+            if calc.layback is not None:
+                try:
+                    horizontal_from_top = float(calc.layback) - (float(x_body) + float(x_origin_offset))
+                except Exception:
+                    horizontal_from_top = None
+
             segment = previous_segment or self._segment_at_distance_from_top(assembly, distance_from_top)
             segment_weight_txt = "N/A"
             segment_name = ""
@@ -1321,6 +1425,8 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 "depth": float(depth_body),
                 "position": position,
                 "distance_from_top_m": distance_from_top,
+                "horizontal_from_top_m": horizontal_from_top,
+                "kp": self._format_kp(horizontal_from_top),
                 "cable_count": self._format_cable_count(distance_from_top),
                 "s_from_tdp_m": s_body,
                 "s_from_tdp_txt": f"{float(s_body):.2f} m" if s_body is not None else "N/A",
@@ -1330,12 +1436,22 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 "segment_weight_txt": segment_weight_txt,
             })
 
+        layback_plot = None
+        if calc.layback is not None:
+            try:
+                layback_plot = float(calc.layback) - float(x_origin_offset)
+            except Exception:
+                layback_plot = None
+
         self._hover_cache = {
             "curve_x": np.array(calc.x - x_origin_offset, dtype=float),
             "curve_depth": np.array(-calc.y, dtype=float),
             "curve_s": np.array(calc.s, dtype=float),
             "curve_tension_kN": np.array(calc.tension_kN, dtype=float) if calc.tension_kN is not None else None,
+            "curve_horizontal_from_top_m": float(calc.layback) - np.array(calc.x, dtype=float) if calc.layback is not None else None,
             "body_points": body_points,
+            "assembly": assembly,
+            "layback_plot_m": layback_plot,
             "free_span_length_m": S_free,
             "chute_contact_len_m": Lc,
         }
@@ -1388,9 +1504,10 @@ class CatenaryCalculatorV2Dialog(QDialog):
             label_count += 1
 
         tdp_x = -x_origin_offset
+        tdp_horizontal = float(calc.layback) if calc.layback is not None else None
         tdp_count = self._format_cable_count(calc.S_total if calc.S_total is not None else Lc + S_free)
-        add_label(tdp_x + label_offset, float(D) - label_offset, f"TDP\nCC {tdp_count}", "#111827", ha="left", va="bottom")
-        add_label(layback_plot, -float(c) - label_offset, f"Top of chute\nCC {self._format_cable_count(0.0)}", "#111827", ha="center", va="bottom")
+        add_label(tdp_x + label_offset, float(D) - label_offset, f"TDP\nCC {tdp_count}\nKP {self._format_kp(tdp_horizontal)}", "#111827", ha="left", va="bottom")
+        add_label(layback_plot, -float(c) - label_offset, f"Top of Chute\nCC {self._format_cable_count(0.0)}\nKP {self._format_kp(0.0)}", "#111827", ha="center", va="bottom")
 
         def curve_label_position(s_label: float, offset_multiplier: float) -> Tuple[float, float]:
             x_base = float(np.interp(s_label, calc.s, plot_x))
@@ -1545,7 +1662,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
         # Mark key endpoints without overpowering the catenary line.
         ax.scatter([float(x[0])], [float(depth[0])], s=marker_size, color="black", label="Touchdown point")
-        ax.scatter([layback_plot], [-c], s=marker_size, color="black", label="Chute top reference")
+        ax.scatter([layback_plot], [-c], s=marker_size, color="black", label="Top of Chute reference")
 
         # With no radius, the free-span endpoint is the chute top.
         x_dep = float(x[-1])
@@ -1740,10 +1857,11 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 ax.scatter([end_x], [D], marker="s", s=36, color="#111827", label="End of cable")
                 if self.show_plot_labels.isChecked():
                     label_offset = max(0.75, 0.018 * max(abs(float(seabed_len)), float(D), 1.0))
+                    end_horizontal_from_top = float(layback) + float(seabed_len)
                     ax.text(
                         end_x,
                         D - label_offset,
-                        f"End of cable\nCC {self._format_cable_count(asm_seg_total)}",
+                        f"End of cable\nCC {self._format_cable_count(asm_seg_total)}\nKP {self._format_kp(end_horizontal_from_top)}",
                         color="#111827",
                         fontsize=8,
                         ha="center",
