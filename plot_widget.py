@@ -622,6 +622,9 @@ class PyQtGraphAxis:
                 continue
             item = handle.item if hasattr(handle, "item") else handle
             try:
+                if not hasattr(item, "opts"):
+                    pen = getattr(item, "pen", None)
+                    item = pg.PlotDataItem([], [], pen=pen)
                 self._legend.addItem(item, str(label))
             except Exception:
                 pass

@@ -77,7 +77,7 @@ class AssemblyItem:
     q_water_npm: float  # absolute weight (N/m) for segments
     q_air_npm: float
     point_load_kN: float  # bodies: +ve = weight down, -ve = buoyancy up
-    color_hex: str = ""  # optional per-segment colour (e.g. "#RRGGBB")
+    color_hex: str = ""  # optional display colour for segment line / body marker (e.g. "#RRGGBB")
 
 @dataclass
 class Component:
@@ -881,6 +881,14 @@ class CatenaryCalculatorV2Dialog(QDialog):
         "#bcbd22",  # tab:olive
         "#17becf",  # tab:cyan
     ]
+    _DEFAULT_BODY_COLORS = [
+        "#000000",
+        "#d62728",
+        "#9467bd",
+        "#2ca02c",
+        "#8c564b",
+        "#1f77b4",
+    ]
     _DEFAULT_Q_WATER_NPM = 22.0
     _DEFAULT_Q_AIR_NPM = 28.0
 
@@ -976,11 +984,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.settings.setValue("show_full_assembly_seabed", bool(self.show_full_assembly_seabed.isChecked()))
         self.settings.setValue("show_legend", bool(self.show_legend.isChecked()))
         self.settings.setValue("x_axis_reference", self.x_axis_reference.currentIndex())
-        try:
-            col_widths = [int(self.assembly_table.columnWidth(i)) for i in range(self.assembly_table.columnCount())]
-            self.settings.setValue("assembly_table_col_widths", json.dumps(col_widths))
-        except Exception:
-            pass
+        self.settings.remove("assembly_table_col_widths")
 
     def restore_user_settings(self):
         def _get_float(key, default=None):
@@ -1071,18 +1075,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             except Exception:
                 pass
 
-        col_widths_json = self.settings.value("assembly_table_col_widths")
-        if col_widths_json is not None:
-            try:
-                col_widths = json.loads(str(col_widths_json))
-                if isinstance(col_widths, list):
-                    for i, w in enumerate(col_widths[: self.assembly_table.columnCount()]):
-                        try:
-                            self.assembly_table.setColumnWidth(i, int(w))
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+        self.assembly_table.resizeColumnsToContents()
 
     # ---- UI init
 
@@ -1112,7 +1105,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
         self.chute_exit_height = QDoubleSpinBox()
         self.chute_exit_height.setRange(0, 1e5)
-        self.chute_exit_height.setDecimals(2)
+        self.chute_exit_height.setDecimals(1)
         self.chute_exit_height.setValue(0.0)  # height above sea level
         self.chute_exit_height.setToolTip(
             "Height above waterline of the top reference point of the chute. "
@@ -1121,7 +1114,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
         self.chute_radius = QDoubleSpinBox()
         self.chute_radius.setRange(0, 1e4)
-        self.chute_radius.setDecimals(2)
+        self.chute_radius.setDecimals(1)
         self.chute_radius.setValue(0.0)
         self.chute_radius.setToolTip(
             "Chute radius used for geometry AND for optional chute-contact coupling. "
@@ -1130,7 +1123,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
         self.ds_step = QDoubleSpinBox()
         self.ds_step.setRange(0.05, 10.0)
-        self.ds_step.setDecimals(2)
+        self.ds_step.setDecimals(1)
         self.ds_step.setSingleStep(0.1)
         self.ds_step.setValue(0.5)
 
@@ -1147,12 +1140,12 @@ class CatenaryCalculatorV2Dialog(QDialog):
         # Inputs depending on mode
         self.bottom_tension = QDoubleSpinBox()
         self.bottom_tension.setRange(0, 1e6)
-        self.bottom_tension.setDecimals(3)
+        self.bottom_tension.setDecimals(1)
         self.bottom_tension.setValue(50.0)
 
         self.top_tension = QDoubleSpinBox()
         self.top_tension.setRange(0, 1e6)
-        self.top_tension.setDecimals(3)
+        self.top_tension.setDecimals(1)
         self.top_tension.setValue(80.0)
         self.top_tension.setToolTip(
             "Tension at the free-span/chute contact point. The chute arc is drawn geometrically; chute friction is not modeled."
@@ -1160,7 +1153,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
         self.exit_angle = QDoubleSpinBox()
         self.exit_angle.setRange(0.01, 89.99)
-        self.exit_angle.setDecimals(3)
+        self.exit_angle.setDecimals(1)
         self.exit_angle.setValue(25.0)
 
         self.angle_reference = QComboBox()
@@ -1168,16 +1161,16 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
         self.catenary_length = QDoubleSpinBox()
         self.catenary_length.setRange(0, 1e7)
-        self.catenary_length.setDecimals(3)
+        self.catenary_length.setDecimals(1)
         self.catenary_length.setValue(230.0)
 
         self.layback = QDoubleSpinBox()
         self.layback.setRange(0, 1e7)
-        self.layback.setDecimals(3)
+        self.layback.setDecimals(1)
         self.layback.setValue(150.0)
 
         self.x_axis_reference = QComboBox()
-        self.x_axis_reference.addItems(["Touchdown point (TDP)", "Chute top position"])
+        self.x_axis_reference.addItems(["Touchdown point", "Chute top position"])
         self.x_axis_reference.setToolTip(
             "Controls only the rendered/exported horizontal coordinate origin. Calculations remain referenced to the TDP."
         )
@@ -1190,11 +1183,24 @@ class CatenaryCalculatorV2Dialog(QDialog):
             "Type",
             "Name",
             "Length (m)",
-            "q water (N/m)",
-            "q air (N/m)",
-            "Body load (kN)",
-            "Colour",
+            "Weight in Water (N/m)",
+            "Weight in Air (N/m)",
+            "Point Load (kN)",
+            "Color",
         ])
+        header_tooltips = [
+            "Segment or Body.",
+            "Display name for this item.",
+            "Used for Segment rows only.",
+            "Used for Segment rows only (submerged section).",
+            "Used for Segment rows only (in-air section).",
+            "Used for Body rows only (+downward, -buoyant/upward).",
+            "Optional display colour for segment lines and body markers.",
+        ]
+        for i, tip in enumerate(header_tooltips):
+            item = self.assembly_table.horizontalHeaderItem(i)
+            if item is not None:
+                item.setToolTip(tip)
         self.assembly_table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
         self.assembly_table.setSelectionMode(SELECTION_MODE_SINGLE)
         self.assembly_table.setEditTriggers(
@@ -1203,7 +1209,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
         header = self.assembly_table.horizontalHeader()
         if header is not None:
             header.setSectionResizeMode(HEADER_RESIZE_MODE_INTERACTIVE)
-            header.setStretchLastSection(True)
+            header.setStretchLastSection(False)
         self.assembly_table.setMinimumHeight(150)
 
         a_btn_row = QHBoxLayout()
@@ -1240,14 +1246,14 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
         # Layout entries
         input_layout.addRow(QLabel("<b>Geometry</b>"))
-        input_layout.addRow("Water Depth D (m):", self.water_depth)
-        input_layout.addRow("Chute Top Height c above WL (m):", self.chute_exit_height)
-        input_layout.addRow("Chute Radius R (m):", self.chute_radius)
-        input_layout.addRow("Integration step ds (m):", self.ds_step)
+        input_layout.addRow("Water Depth (m):", self.water_depth)
+        input_layout.addRow("Chute Top Height above Waterline (m):", self.chute_exit_height)
+        input_layout.addRow("Chute Radius (m):", self.chute_radius)
+        input_layout.addRow("Integration Step (m):", self.ds_step)
 
         input_layout.addRow(QLabel("<b>Solve Mode</b>"))
         input_layout.addRow("Select Input Parameter:", self.input_parameter)
-        input_layout.addRow("Bottom Tension H (kN):", self.bottom_tension)
+        input_layout.addRow("Bottom Tension (kN):", self.bottom_tension)
         input_layout.addRow("Tension at Contact (kN):", self.top_tension)
 
         ang_layout = QHBoxLayout()
@@ -1255,7 +1261,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
         ang_layout.addWidget(self.angle_reference)
         input_layout.addRow("Tangent Angle at Chute:", ang_layout)
 
-        input_layout.addRow("Total Cable Length S (m):", self.catenary_length)
+        input_layout.addRow("Total Cable Length (m):", self.catenary_length)
         input_layout.addRow("Layback to Chute Top (m):", self.layback)
 
         input_layout.addRow(QLabel("<b>Cable Assembly</b>"))
@@ -1275,7 +1281,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             "Notes:<br>"
             "• The system is solved as a suspended cable from TDP (seabed touchdown) to the chute contact point, then along the chute arc to the chute top reference point.<br>"
             "• Submerged vs in-air is determined automatically when the curve crosses sea level (y=0).<br>"
-            "• Assembly is defined from the chute top down (Segment rows set q; Body rows add lumped load/buoyancy).<br>"
+            "• Assembly is defined from the chute top down (Segment rows set distributed weight; Body rows add lumped load/buoyancy).<br>"
             "• Point loads create a mathematical kink (angle discontinuity). Prefer short sections if you care about curvature/MBR.<br>"
             "• Chute contact is modeled by enforcing the free-span tangent to match the chute arc tangent; contact length depends on tangent angle."
             "</i>"
@@ -1461,8 +1467,8 @@ class CatenaryCalculatorV2Dialog(QDialog):
                     S_min = D + c
                 if S_in < S_min - 1e-6:
                     raise ValueError(
-                        f"Total cable length S={S_in:.3f} m is too short for the geometry. "
-                        f"Minimum feasible S is about {S_min:.3f} m (given D={D:.3f} m, c={c:.3f} m, R={R:.3f} m)."
+                        f"Total cable length ({S_in:.1f} m) is too short for the geometry. "
+                        f"Minimum feasible length is about {S_min:.1f} m (given water depth={D:.1f} m, chute top height={c:.1f} m, chute radius={R:.1f} m)."
                     )
                 cfg["S_input_m"] = S_in
             elif mode == "Layback":
@@ -1545,7 +1551,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
         D = self.water_depth.value()
         c = self.chute_exit_height.value()
         flop_forward = (calc.S_total - calc.layback) if (calc.S_total is not None and calc.layback is not None) else None
-        flop_forward_txt = f"{flop_forward:.3f} m" if flop_forward is not None else "n/a"
+        flop_forward_txt = f"{flop_forward:.1f} m" if flop_forward is not None else "N/A"
         angle_from_vertical = 90.0 - (calc.exit_angle_deg_from_h or 0.0)
 
         assembly: List[AssemblyItem] = calc.cfg.get("assembly", [])
@@ -1556,48 +1562,48 @@ class CatenaryCalculatorV2Dialog(QDialog):
             # If assembly is shorter than S_total, remaining length uses internal fallback weights.
             if calc.S_total > asm_seg_total + 1e-6:
                 warn_lines.append(
-                    f"Assembly segments total ({asm_seg_total:.2f} m) is shorter than modeled cable length ({calc.S_total:.2f} m). "
+                    f"Assembly segments total ({asm_seg_total:.1f} m) is shorter than modeled cable length ({calc.S_total:.1f} m). "
                     "Remaining length uses the internal fallback cable weight values."
                 )
             # If assembly is much longer than S_total, some defined items are not in the suspended span.
             if asm_seg_total > calc.S_total + 1e-6:
                 warn_lines.append(
-                    f"Assembly segments total ({asm_seg_total:.2f} m) exceeds modeled cable length ({calc.S_total:.2f} m). "
+                    f"Assembly segments total ({asm_seg_total:.1f} m) exceeds modeled cable length ({calc.S_total:.1f} m). "
                     "Lower assembly items may be on seabed (not in the suspended span) and bodies there will not affect the catenary."
                 )
 
         sea_s = calc.s_sea_surface
-        sea_txt = f"{sea_s:.2f} m" if sea_s is not None else "n/a"
+        sea_txt = f"{sea_s:.1f} m" if sea_s is not None else "N/A"
 
-        contact_txt = "n/a"
+        contact_txt = "N/A"
         if calc.x is not None and calc.y is not None and len(calc.x) and len(calc.y):
-            contact_txt = f"x={float(calc.x[-1]):.3f} m, height={float(calc.y[-1]):.3f} m above WL"
+            contact_txt = f"x={float(calc.x[-1]):.1f} m, height={float(calc.y[-1]):.1f} m above waterline"
 
-        chute_contact_txt = "n/a"
+        chute_contact_txt = "N/A"
         if float(self.chute_radius.value()) > 0:
-            chute_contact_txt = f"{float(getattr(calc, 'chute_contact_len_m', 0.0)):.3f} m"
+            chute_contact_txt = f"{float(getattr(calc, 'chute_contact_len_m', 0.0)):.1f} m"
 
-        asm_txt = "n/a"
+        asm_txt = "N/A"
         if assembly:
-            asm_txt = f"{asm_seg_total:.2f} m (segments only)"
+            asm_txt = f"{asm_seg_total:.1f} m (segments only)"
 
         warn_txt = ""
         if warn_lines:
             warn_txt = "<br><br><b>Warnings</b><br>" + "<br>".join(f"• {w}" for w in warn_lines)
 
         txt = (
-            f"Water Depth D: {D:.2f} m<br>"
-            f"Chute Top Height c: {c:.2f} m above WL<br><br>"
-            f"Bottom Tension (H): {calc.bottom_tension_kN:.3f} kN<br>"
-            f"Tension at Contact: {calc.top_tension_kN:.3f} kN<br>"
-            f"Tangent Angle at Contact: {calc.exit_angle_deg_from_h:.3f}° from horizontal / {angle_from_vertical:.3f}° from vertical<br>"
-            f"Total Cable Length (TDP→chute top): {calc.S_total:.3f} m<br>"
-            f"Layback (TDP→chute top): {calc.layback:.3f} m<br>"
-            f"Flop Forward (S - layback): {flop_forward_txt}<br>"
+            f"Water Depth: {D:.1f} m<br>"
+            f"Chute Top Height: {c:.1f} m above waterline<br><br>"
+            f"Bottom Tension: {calc.bottom_tension_kN:.1f} kN<br>"
+            f"Tension at Contact: {calc.top_tension_kN:.1f} kN<br>"
+            f"Tangent Angle at Contact: {calc.exit_angle_deg_from_h:.1f}° from horizontal / {angle_from_vertical:.1f}° from vertical<br>"
+            f"Total Cable Length (Touchdown to Chute Top): {calc.S_total:.1f} m<br>"
+            f"Layback (Touchdown to Chute Top): {calc.layback:.1f} m<br>"
+            f"Flop Forward (Length - Layback): {flop_forward_txt}<br>"
             f"Chute contact/tangent point: {contact_txt}<br>"
             f"Cable on chute arc: {chute_contact_txt}<br>"
-            f"Sea surface crossing at s ≈ {sea_txt}<br>"
-            f"Minimum Radius of Curvature (incl chute): {calc.min_radius_m:.3f} m<br>"
+            f"Sea Surface Crossing Distance Along Cable: {sea_txt}<br>"
+            f"Minimum Radius of Curvature (including chute): {calc.min_radius_m:.1f} m<br>"
             f"Assembly length: {asm_txt}<br>"
             f"{warn_txt}"
         )
@@ -1737,20 +1743,21 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
             # Bodies placed after cumulative segment length from top
             d_cursor = 0.0
-            body_ds: List[float] = []
+            body_entries: List[Tuple[float, str]] = []
             for it in assembly:
                 if it.kind == "segment":
                     d_cursor += max(0.0, it.length_m)
                 elif it.kind == "body":
-                    body_ds.append(d_cursor)
+                    color_hex = self._normalize_color_hex(getattr(it, "color_hex", "")) or "#000000"
+                    body_entries.append((d_cursor, color_hex))
 
-            body_points = []
-            for d_body in body_ds:
+            body_points: List[Tuple[float, float, str]] = []
+            for d_body, body_color in body_entries:
                 if R > 0 and d_body < Lc:
                     phi = (math.pi / 2.0) + (float(d_body) / R)
                     xb = layback_plot + R * math.cos(phi)
                     yb = c - R + R * math.sin(phi)
-                    body_points.append((xb, -yb))
+                    body_points.append((xb, -yb, body_color))
                     continue
                 if d_body > (Lc + S_free):
                     continue
@@ -1758,11 +1765,12 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 # Interpolate x,y at s_body
                 xb = float(np.interp(s_body, s, calc.x)) - x_origin_offset
                 yb = float(np.interp(s_body, s, calc.y))
-                body_points.append((xb, -yb))
+                body_points.append((xb, -yb, body_color))
 
             if body_points:
-                bx, bd = zip(*body_points)
-                ax.scatter(list(bx), list(bd), marker="D", s=36, color="black", label="Body")
+                for i, (xb, bd, body_color) in enumerate(body_points):
+                    label = "Body" if i == 0 else None
+                    ax.scatter([xb], [bd], marker="D", s=36, facecolors="none", edgecolors=body_color, label=label)
 
         # Render chute as a filled upper-left quadrant, then draw the cable arc from contact to top.
         chute_x = None
@@ -1888,13 +1896,14 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
                 # Bodies that are on seabed
                 d_cursor = 0.0
-                seabed_body_points = []
+                seabed_body_points: List[Tuple[float, float, str]] = []
                 for it in assembly:
                     if it.kind == "segment":
                         d_cursor += max(0.0, it.length_m)
                         continue
                     if it.kind != "body":
                         continue
+                    body_color = self._normalize_color_hex(getattr(it, "color_hex", "")) or "#000000"
                     d_body = d_cursor
                     if d_body <= float(calc.S_total):
                         continue
@@ -1902,11 +1911,12 @@ class CatenaryCalculatorV2Dialog(QDialog):
                     if x_body_physical < -seabed_len - 1e-6:
                         continue
                     x_body = x_body_physical - x_origin_offset
-                    seabed_body_points.append((x_body, D))
+                    seabed_body_points.append((x_body, D, body_color))
 
                 if seabed_body_points:
-                    bx, by = zip(*seabed_body_points)
-                    ax.scatter(list(bx), list(by), marker="D", s=36, facecolors="none", edgecolors="black", label="Body (seabed)")
+                    for i, (bx, by, body_color) in enumerate(seabed_body_points):
+                        label = "Body (seabed)" if i == 0 else None
+                        ax.scatter([bx], [by], marker="D", s=36, facecolors="none", edgecolors=body_color, label=label)
 
         ax.set_xlabel(self._x_axis_label())
         ax.set_ylabel("Depth (m)")
@@ -2295,7 +2305,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
                     pass
                 items.append(AssemblyItem(kind=kind, name=name, length_m=length, q_water_npm=q_w, q_air_npm=q_a, point_load_kN=0.0, color_hex=color_hex))
             else:
-                items.append(AssemblyItem(kind=kind, name=name, length_m=0.0, q_water_npm=0.0, q_air_npm=0.0, point_load_kN=p_kN, color_hex=""))
+                items.append(AssemblyItem(kind=kind, name=name, length_m=0.0, q_water_npm=0.0, q_air_npm=0.0, point_load_kN=p_kN, color_hex=color_hex))
 
         return items
 
@@ -2310,12 +2320,12 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 (2, 10.0),
                 (3, self._fallback_q_water_npm),
                 (4, self._fallback_q_air_npm),
-                (5, 0.0),
+                (5, ""),
             ]
             for col, val in defaults:
                 self.assembly_table.setItem(r, col, QTableWidgetItem(str(val)))
 
-            self._set_assembly_color_cell(r, self._next_default_segment_color_hex())
+            self._ensure_assembly_color_cell(r)
             self.assembly_table.setCurrentCell(r, 1)
         finally:
             self.assembly_table.blockSignals(False)
@@ -2330,15 +2340,15 @@ class CatenaryCalculatorV2Dialog(QDialog):
             defaults: List[Tuple[int, Any]] = [
                 (0, "Body"),
                 (1, "Body"),
-                (2, 0.0),
-                (3, 0.0),
-                (4, 0.0),
+                (2, ""),
+                (3, ""),
+                (4, ""),
                 (5, 5.0),
             ]
             for col, val in defaults:
                 self.assembly_table.setItem(r, col, QTableWidgetItem(str(val)))
 
-            self._set_assembly_color_cell(r, "", enabled=False)
+            self._ensure_assembly_color_cell(r)
             self.assembly_table.setCurrentCell(r, 1)
         finally:
             self.assembly_table.blockSignals(False)
@@ -2411,6 +2421,9 @@ class CatenaryCalculatorV2Dialog(QDialog):
                     "name": name,
                     "point_load_kN": self._table_get_float(self.assembly_table, r, self.ASM_COL_BODY_LOAD, 0.0),
                 }
+                color_hex = self._normalize_color_hex(self._table_get_str(self.assembly_table, r, self.ASM_COL_COLOR, default=""))
+                if color_hex:
+                    entry["color"] = color_hex
             data.append(entry)
         return data
 
@@ -2458,25 +2471,26 @@ class CatenaryCalculatorV2Dialog(QDialog):
                         return f"{float(default):.12g}"
             return f"{float(default):.12g}"
 
+        color_hex = self._normalize_color_hex(str(entry.get("color", entry.get("color_hex", ""))))
+
         if is_body:
             return [
                 "Body",
                 name,
-                "0",
-                "0",
-                "0",
-                number_text("point_load_kN", "load_kN", default=0.0),
                 "",
+                "",
+                "",
+                number_text("point_load_kN", "load_kN", default=0.0),
+                color_hex,
             ]
 
-        color_hex = self._normalize_color_hex(str(entry.get("color", entry.get("color_hex", ""))))
         return [
             "Segment",
             name,
             number_text("length_m", "length", default=0.0),
             number_text("q_water_npm", "q_water", "weight_water_npm", default=self._fallback_q_water_npm),
             number_text("q_air_npm", "q_air", "weight_air_npm", default=self._fallback_q_air_npm),
-            "0",
+            "",
             color_hex,
         ]
 
@@ -2548,8 +2562,15 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 seg_count += 1
         return self._DEFAULT_SEGMENT_COLORS[seg_count % len(self._DEFAULT_SEGMENT_COLORS)]
 
-    def _set_assembly_color_cell(self, row: int, color_hex: str, enabled: bool = True):
-        # Show hex + a background swatch. Disable editing; colour is set via dialog.
+    def _next_default_body_color_hex(self) -> str:
+        body_count = 0
+        for r in range(self.assembly_table.rowCount()):
+            if not self._is_assembly_row_segment(r):
+                body_count += 1
+        return self._DEFAULT_BODY_COLORS[body_count % len(self._DEFAULT_BODY_COLORS)]
+
+    def _set_assembly_color_cell(self, row: int, color_hex: str):
+        # Colour applies to both segment lines and body markers. Keep the cell visually plain.
         item = self.assembly_table.item(row, self.ASM_COL_COLOR)
         if item is None:
             item = QTableWidgetItem("")
@@ -2557,33 +2578,29 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
         color_hex = self._normalize_color_hex(color_hex)
         item.setText(color_hex)
-        item.setToolTip("Double-click to pick a colour" if enabled else "(Colour applies to segment rows only)")
+        item.setToolTip("Double-click to pick a colour")
 
         flags = item.flags()
+        flags = flags | Qt.ItemFlag.ItemIsEnabled
         flags = flags & ~Qt.ItemFlag.ItemIsEditable
-        if enabled:
-            flags = flags | Qt.ItemFlag.ItemIsEnabled
-        else:
-            flags = flags & ~Qt.ItemFlag.ItemIsEnabled
         item.setFlags(flags)
-
-        if enabled and color_hex:
-            try:
-                qcol = QColor(color_hex)
-                item.setBackground(qcol)
-            except Exception:
-                pass
-        else:
-            item.setBackground(QColor())
+        role_enum = getattr(Qt, "ItemDataRole", Qt)
+        item.setData(getattr(role_enum, "BackgroundRole"), None)
+        item.setData(getattr(role_enum, "ForegroundRole"), None)
 
     def _ensure_assembly_color_cell(self, row: int):
-        # Ensure the colour cell exists and is enabled only for segment rows.
+        # Ensure the colour cell exists with a sensible default for row type.
         is_seg = self._is_assembly_row_segment(row)
+        type_item = self.assembly_table.item(row, self.ASM_COL_TYPE)
+        if type_item is not None:
+            normalized_type = "Segment" if is_seg else "Body"
+            if type_item.text().strip() != normalized_type:
+                type_item.setText(normalized_type)
         current = self._table_get_str(self.assembly_table, row, self.ASM_COL_COLOR, default="")
         current = self._normalize_color_hex(current)
-        if is_seg and not current:
-            current = self._next_default_segment_color_hex()
-        self._set_assembly_color_cell(row, current, enabled=is_seg)
+        if not current:
+            current = self._next_default_segment_color_hex() if is_seg else self._next_default_body_color_hex()
+        self._set_assembly_color_cell(row, current)
 
     def _on_assembly_table_cell_changed(self, row: int, col: int):
         # Keep the colour column consistent when users change the Type cell.
@@ -2601,19 +2618,17 @@ class CatenaryCalculatorV2Dialog(QDialog):
             return
         if row < 0 or row >= self.assembly_table.rowCount():
             return
-        if not self._is_assembly_row_segment(row):
-            return
 
         current = self._table_get_str(self.assembly_table, row, self.ASM_COL_COLOR, default="")
         current = self._normalize_color_hex(current)
         initial = QColor(current) if current else QColor("#1f77b4")
-        chosen = QColorDialog.getColor(initial, self, "Select segment colour")
+        chosen = QColorDialog.getColor(initial, self, "Select assembly item colour")
         if not chosen.isValid():
             return
 
         self.assembly_table.blockSignals(True)
         try:
-            self._set_assembly_color_cell(row, chosen.name(), enabled=True)
+            self._set_assembly_color_cell(row, chosen.name())
         finally:
             self.assembly_table.blockSignals(False)
         self._sync_json_from_table()
