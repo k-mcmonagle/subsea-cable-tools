@@ -32,8 +32,8 @@ from typing import Any, List, Optional, Tuple
 from qgis.PyQt.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
     QTextEdit, QWidget, QFormLayout, QSizePolicy, QFileDialog, QDoubleSpinBox,
-    QScrollArea, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem, QMessageBox
-    , QCheckBox, QColorDialog
+    QScrollArea, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem, QMessageBox,
+    QToolButton, QCheckBox, QColorDialog
 )
 from qgis.PyQt.QtCore import Qt, QSettings, QTimer
 from qgis.PyQt.QtGui import QColor
@@ -179,10 +179,18 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.setMinimumSize(min_w, min_h)
         self.resize(width, height)
 
-    def _create_collapsible_section(self, title: str, settings_key: str) -> Tuple[QPushButton, QWidget, QFormLayout]:
-        button = QPushButton()
+    def _create_collapsible_section(self, title: str, settings_key: str) -> Tuple[QToolButton, QWidget, QFormLayout]:
+        button = QToolButton()
         button.setCheckable(True)
         button.setToolTip(f"Show/hide {title} options.")
+        button.setAutoRaise(True)
+        try:
+            button.setToolButtonStyle(getattr(getattr(Qt, "ToolButtonStyle", Qt), "ToolButtonTextBesideIcon"))
+        except Exception:
+            pass
+        button.setStyleSheet(
+            "QToolButton { border: none; font-weight: bold; text-align: left; padding: 2px 0px; }"
+        )
 
         container = QWidget()
         layout = QFormLayout(container)
@@ -201,7 +209,12 @@ class CatenaryCalculatorV2Dialog(QDialog):
         try:
             button.blockSignals(True)
             button.setChecked(bool(expanded))
-            button.setText(("[-] " if expanded else "[+] ") + title)
+            button.setText(title)
+            arrow_name = "DownArrow" if expanded else "RightArrow"
+            try:
+                button.setArrowType(getattr(getattr(Qt, "ArrowType", Qt), arrow_name))
+            except Exception:
+                pass
         finally:
             button.blockSignals(False)
         container.setVisible(bool(expanded))
