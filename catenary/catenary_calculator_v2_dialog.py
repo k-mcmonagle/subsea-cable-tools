@@ -134,6 +134,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self._crosshair_hline = None
         self._hover_cache = {}
         self._last_hover_signature = None
+        self._collapsible_sections = {}
 
         # Debounce heavy recalculations while editing.
         self._update_timer = QTimer(self)
@@ -178,6 +179,42 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.setMinimumSize(min_w, min_h)
         self.resize(width, height)
 
+    def _create_collapsible_section(self, title: str, settings_key: str) -> Tuple[QPushButton, QWidget, QFormLayout]:
+        button = QPushButton()
+        button.setCheckable(True)
+        button.setToolTip(f"Show/hide {title} options.")
+
+        container = QWidget()
+        layout = QFormLayout(container)
+        layout.setContentsMargins(16, 0, 0, 0)
+
+        self._collapsible_sections[settings_key] = (button, container, title)
+        button.toggled.connect(lambda checked, key=settings_key: self._set_collapsible_section_expanded(key, checked))
+        self._set_collapsible_section_expanded(settings_key, False)
+        return button, container, layout
+
+    def _set_collapsible_section_expanded(self, settings_key: str, expanded: bool):
+        section = self._collapsible_sections.get(settings_key)
+        if section is None:
+            return
+        button, container, title = section
+        try:
+            button.blockSignals(True)
+            button.setChecked(bool(expanded))
+            button.setText(("[-] " if expanded else "[+] ") + title)
+        finally:
+            button.blockSignals(False)
+        container.setVisible(bool(expanded))
+
+    @staticmethod
+    def _settings_bool(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return bool(default)
+        try:
+            return str(value).lower() in ("1", "true", "yes")
+        except Exception:
+            return bool(default)
+
     # ---- Persistent settings
 
     def save_user_settings(self):
@@ -204,11 +241,15 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.settings.setValue("show_legend", bool(self.show_legend.isChecked()))
         self.settings.setValue("show_plot_labels", bool(self.show_plot_labels.isChecked()))
         self.settings.setValue("show_crosshair_values", bool(self.show_crosshair_values.isChecked()))
+        self.settings.setValue("show_kp_axis", bool(self.show_kp_axis.isChecked()))
         self.settings.setValue("x_axis_reference", self.x_axis_reference.currentIndex())
         self.settings.setValue("cable_count_top", self.cable_count_top.value())
         self.settings.setValue("cable_count_direction", self.cable_count_direction.currentIndex())
         self.settings.setValue("kp_top", self.kp_top.value())
         self.settings.setValue("kp_direction", self.kp_direction.currentIndex())
+        for settings_key, section in self._collapsible_sections.items():
+            button = section[0]
+            self.settings.setValue(settings_key, bool(button.isChecked()))
         self.settings.remove("assembly_table_col_widths")
 
     def restore_user_settings(self):
@@ -310,7 +351,14 @@ class CatenaryCalculatorV2Dialog(QDialog):
         v = self.settings.value("show_crosshair_values")
         if v is not None:
             try:
-                self.show_crosshair_values.setChecked(str(v).lower() in ("1", "true", "yes"))
+                self.show_crosshair_values.setChecked(self._settings_bool(v))
+            except Exception:
+                pass
+
+        v = self.settings.value("show_kp_axis")
+        if v is not None:
+            try:
+                self.show_kp_axis.setChecked(self._settings_bool(v))
             except Exception:
                 pass
 
@@ -331,6 +379,9 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 self.kp_direction.setCurrentIndex(max(0, min(1, int(v))))
             except Exception:
                 pass
+
+        for settings_key in self._collapsible_sections:
+            self._set_collapsible_section_expanded(settings_key, self._settings_bool(self.settings.value(settings_key), False))
 
         self.assembly_table.resizeColumnsToContents()
 
@@ -527,26 +578,35 @@ class CatenaryCalculatorV2Dialog(QDialog):
         input_layout.addRow(QLabel("<b>Cable Assembly</b>"))
         input_layout.addRow(self.assembly_tabs)
 
-        input_layout.addRow(QLabel("<b>Display</b>"))
-        input_layout.addRow("X-axis zero:", self.x_axis_reference)
+        display_header, display_widget, display_layout = self._create_collapsible_section("Display", "section_display_expanded")
+        input_layout.addRow(display_header)
+        input_layout.addRow(display_widget)
+        display_layout.addRow("X-axis zero:", self.x_axis_reference)
 
         self.show_full_assembly_seabed = QCheckBox("Show full assembly on seabed")
         self.show_full_assembly_seabed.setToolTip(
             "Extends the plot x-axis and draws any remaining assembly length beyond the suspended span as a straight line on the seabed."
         )
-        input_layout.addRow("", self.show_full_assembly_seabed)
+        display_layout.addRow("", self.show_full_assembly_seabed)
 
         self.show_plot_labels = QCheckBox("Show segment/body labels")
         self.show_plot_labels.setChecked(False)
         self.show_plot_labels.setToolTip("Label assembly segments and bodies on the plot.")
-        input_layout.addRow("", self.show_plot_labels)
+        display_layout.addRow("", self.show_plot_labels)
 
         self.show_crosshair_values = QCheckBox("Show crosshair values")
         self.show_crosshair_values.setChecked(False)
         self.show_crosshair_values.setToolTip("Show cursor coordinates and nearest cable values while hovering over the plot.")
-        input_layout.addRow("", self.show_crosshair_values)
+        display_layout.addRow("", self.show_crosshair_values)
 
-        input_layout.addRow(QLabel("<b>Cable Count</b>"))
+        self.show_kp_axis = QCheckBox("Show KP x-axis")
+        self.show_kp_axis.setChecked(False)
+        self.show_kp_axis.setToolTip("Show a second x-axis below the plot using the Route KP Reference settings.")
+        display_layout.addRow("", self.show_kp_axis)
+
+        count_header, count_widget, count_layout = self._create_collapsible_section("Cable Count", "section_count_expanded")
+        input_layout.addRow(count_header)
+        input_layout.addRow(count_widget)
         self.cable_count_top = QDoubleSpinBox()
         self.cable_count_top.setRange(-1e9, 1e9)
         self.cable_count_top.setDecimals(1)
@@ -560,10 +620,12 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.cable_count_direction.setToolTip(
             "Outboard is from the chute toward the deployed cable/TDP; inboard is toward the vessel."
         )
-        input_layout.addRow("Count at Top of Chute:", self.cable_count_top)
-        input_layout.addRow("Count direction:", self.cable_count_direction)
+        count_layout.addRow("Count at Top of Chute:", self.cable_count_top)
+        count_layout.addRow("Count direction:", self.cable_count_direction)
 
-        input_layout.addRow(QLabel("<b>Route KP Reference</b>"))
+        kp_header, kp_widget, kp_layout = self._create_collapsible_section("Route KP Reference", "section_kp_expanded")
+        input_layout.addRow(kp_header)
+        input_layout.addRow(kp_widget)
         self.kp_top = QDoubleSpinBox()
         self.kp_top.setRange(-1e9, 1e9)
         self.kp_top.setDecimals(3)
@@ -577,8 +639,8 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.kp_direction.setToolTip(
             "KP is calculated from horizontal distance. Outboard is from the chute toward the TDP/seabed."
         )
-        input_layout.addRow("KP at Top of Chute:", self.kp_top)
-        input_layout.addRow("KP direction:", self.kp_direction)
+        kp_layout.addRow("KP at Top of Chute:", self.kp_top)
+        kp_layout.addRow("KP direction:", self.kp_direction)
 
         note = QLabel(
             "<i>"
@@ -675,6 +737,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.show_full_assembly_seabed.toggled.connect(self.schedule_update_plot)
         self.show_plot_labels.toggled.connect(self.schedule_update_plot)
         self.show_crosshair_values.toggled.connect(self._on_crosshair_toggled)
+        self.show_kp_axis.toggled.connect(self.schedule_update_plot)
         self.cable_count_top.valueChanged.connect(self.schedule_update_plot)
         self.cable_count_direction.currentIndexChanged.connect(self.schedule_update_plot)
         self.kp_top.valueChanged.connect(self.schedule_update_plot)
@@ -1912,6 +1975,9 @@ class CatenaryCalculatorV2Dialog(QDialog):
         ax.set_aspect("equal", adjustable="box")
         ax.invert_yaxis()  # conventional: depth downwards
         ax.grid(True, alpha=0.25)
+
+        if self.show_kp_axis.isChecked() and hasattr(ax, "set_secondary_xaxis"):
+            ax.set_secondary_xaxis("KP", lambda plot_x, top_x=layback_plot: self._format_kp(float(top_x) - float(plot_x)))
 
         self._crosshair_vline = None
         self._crosshair_hline = None

@@ -17,7 +17,7 @@ from qgis.PyQt.QtWidgets import QFileDialog, QGraphicsPathItem, QHBoxLayout, QPu
 
 _PEN_STYLE = getattr(Qt, "PenStyle", Qt)
 _MOUSE_BUTTON = getattr(Qt, "MouseButton", Qt)
-__SUBSEA_PLOT_WIDGET_PATCH_VERSION__ = 6
+__SUBSEA_PLOT_WIDGET_PATCH_VERSION__ = 7
 _REQUIRED_SVG_EXPORTER_PATCH_VERSION = 4
 
 
@@ -411,6 +411,29 @@ class PyQtGraphNavigationToolbar(QWidget):
         self.export_btn.clicked.connect(self.canvas.show_export_dialog)
 
 
+class _SecondaryXAxisItem(pg.AxisItem):
+    def __init__(self, formatter: Callable[[float], str], *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._formatter = formatter
+
+    def set_formatter(self, formatter: Callable[[float], str]):
+        self._formatter = formatter
+        try:
+            self.picture = None
+            self.update()
+        except Exception:
+            pass
+
+    def tickStrings(self, values, scale, spacing):
+        labels: List[str] = []
+        for value in values:
+            try:
+                labels.append(str(self._formatter(float(value))))
+            except Exception:
+                labels.append("")
+        return labels
+
+
 class PyQtGraphAxis:
     def __init__(self, canvas: PyQtGraphCanvas, plot_widget: pg.PlotWidget, index: int, view_box: Optional[pg.ViewBox] = None, is_twin: bool = False, parent_axis: Optional["PyQtGraphAxis"] = None):
         self.canvas = canvas
@@ -424,6 +447,7 @@ class PyQtGraphAxis:
         self._legend_items: List[PyQtGraphLine] = []
         self._legend = None
         self._twinx: Optional[PyQtGraphAxis] = None
+        self._secondary_xaxis: Optional[_SecondaryXAxisItem] = None
         self._default_color_index = 0
         self._shared_x_axes: List[PyQtGraphAxis] = []
 
@@ -659,6 +683,24 @@ class PyQtGraphAxis:
 
     def set_xlabel(self, label: str):
         self.plot_item.setLabel("bottom", label)
+
+    def set_secondary_xaxis(self, label: str, formatter: Callable[[float], str]):
+        if self._secondary_xaxis is None:
+            axis = _SecondaryXAxisItem(formatter, orientation="bottom")
+            try:
+                axis.setHeight(34)
+            except Exception:
+                pass
+            try:
+                axis.setStyle(showValues=True)
+            except Exception:
+                pass
+            self.plot_item.layout.addItem(axis, 4, 1)
+            axis.linkToView(self.plot_item.vb)
+            self._secondary_xaxis = axis
+        self._secondary_xaxis.set_formatter(formatter)
+        self._secondary_xaxis.setLabel(label)
+        self._secondary_xaxis.show()
 
     def set_ylabel(self, label: str):
         axis_name = "right" if self.is_twin else "left"
