@@ -70,6 +70,10 @@ class SolverDiagnostics:
     refinement_position_delta_m: Optional[float] = None
     refinement_angle_delta_deg: Optional[float] = None
     refinement_top_tension_delta_kN: Optional[float] = None
+    tdp_iterations: int = 0
+    tdp_x_world_m: float = 0.0
+    tdp_depth_m: float = 0.0
+    tdp_slope_deg: float = 0.0
     warnings: List[str] = field(default_factory=list)
 
 
@@ -115,6 +119,163 @@ def parse_components(text: str) -> List[Component]:
 _parse_components = parse_components
 
 
+# ---------------------------------------------------------------------------
+# Seabed profile abstraction
+# ---------------------------------------------------------------------------
+#
+# Frame convention for all SeabedProfile implementations:
+#   x_world   = horizontal distance from the chute (top-of-chute is at x_world=0)
+#               measured positive in the direction the cable lays out (toward
+#               and beyond the TDP).
+#   depth_at(x_world)   -> water depth (positive, metres) at that x_world.
+#   slope_at(x_world)   -> seabed local tangent angle in radians, measured
+#                          from horizontal, positive when moving *toward* the
+#                          chute the bed rises (i.e. depth decreases toward
+#                          chute, which is the typical "bed deepens away from
+#                          chute" case). With this sign, V(0)/H = tan(alpha)
+#                          and a typical cable-lay (deeper away from chute)
+#                          gives V(0) > 0 so the cable departs the TDP angled
+#                          upward toward the chute.
+#
+# Mathematically: tan(slope_at(x_world)) = d(depth)/d(x_world) at x_world,
+# because going toward the chute is the -x_world direction and the bed
+# elevation y_bed = -depth, so dy_bed/d(toward_chute) = d(depth)/d(x_world).
+
+
+@dataclass
+class FlatSeabed:
+    """Constant-depth seabed (preserves legacy behaviour exactly)."""
+
+    depth_m: float
+
+    def depth_at(self, x_world: float) -> float:
+        return float(self.depth_m)
+
+    def slope_at(self, x_world: float) -> float:
+        return 0.0
+
+    def to_dict(self) -> dict:
+        return {"mode": "flat", "depth_m": float(self.depth_m)}
+
+
+@dataclass
+class PlanarSlopeSeabed:
+    """Constant-slope seabed.
+
+    Parameters
+    ----------
+    depth_at_chute_m : float
+        Water depth at x_world = 0 (directly below the chute), in metres.
+    slope_deg : float
+        Slope angle in degrees, positive = bed deepens away from chute
+        (i.e. cable departs the TDP angled upward toward the chute).
+    """
+
+    depth_at_chute_m: float
+    slope_deg: float
+
+    def depth_at(self, x_world: float) -> float:
+        return float(self.depth_at_chute_m) + math.tan(math.radians(self.slope_deg)) * float(x_world)
+
+    def slope_at(self, x_world: float) -> float:
+        return math.radians(float(self.slope_deg))
+
+    def to_dict(self) -> dict:
+        return {
+            "mode": "sloped",
+            "depth_at_chute_m": float(self.depth_at_chute_m),
+            "slope_deg": float(self.slope_deg),
+        }
+
+
+@dataclass
+class PolylineSeabed:
+    """Piecewise-linear seabed profile defined by (x_world, depth) samples.
+
+    Samples must be sorted by x_world strictly increasing. Outside the sampled
+    range, depth and slope are held constant at the nearest endpoint value
+    (and slope is zero outside).
+    """
+
+    x_world_m: List[float]
+    depth_m: List[float]
+    slope_smoothing_m: float = 5.0
+
+    def __post_init__(self):
+        if len(self.x_world_m) != len(self.depth_m):
+            raise ValueError("PolylineSeabed: x_world_m and depth_m must have the same length.")
+        if len(self.x_world_m) < 2:
+            raise ValueError("PolylineSeabed: at least two samples are required.")
+        xs = list(self.x_world_m)
+        ds = list(self.depth_m)
+        for i in range(1, len(xs)):
+            if xs[i] <= xs[i - 1]:
+                raise ValueError("PolylineSeabed: x_world_m must be strictly increasing.")
+        self.x_world_m = [float(v) for v in xs]
+        self.depth_m = [float(v) for v in ds]
+
+    def depth_at(self, x_world: float) -> float:
+        xs = self.x_world_m
+        ds = self.depth_m
+        x = float(x_world)
+        if x <= xs[0]:
+            return ds[0]
+        if x >= xs[-1]:
+            return ds[-1]
+        # Linear interpolation.
+        lo = 0
+        hi = len(xs) - 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if xs[mid] <= x:
+                lo = mid
+            else:
+                hi = mid
+        t = (x - xs[lo]) / (xs[hi] - xs[lo])
+        return ds[lo] * (1.0 - t) + ds[hi] * t
+
+    def slope_at(self, x_world: float) -> float:
+        # Centred-difference over ±max(slope_smoothing_m, 2*local segment).
+        x = float(x_world)
+        xs = self.x_world_m
+        if x <= xs[0] or x >= xs[-1]:
+            return 0.0
+        # Local segment width for adaptive smoothing.
+        lo = 0
+        hi = len(xs) - 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if xs[mid] <= x:
+                lo = mid
+            else:
+                hi = mid
+        local_width = xs[hi] - xs[lo]
+        h = max(float(self.slope_smoothing_m), 2.0 * local_width)
+        x_left = max(xs[0], x - h)
+        x_right = min(xs[-1], x + h)
+        if x_right <= x_left:
+            return 0.0
+        d_depth = self.depth_at(x_right) - self.depth_at(x_left)
+        d_x = x_right - x_left
+        return math.atan2(d_depth, d_x)
+
+    def to_dict(self) -> dict:
+        return {
+            "mode": "polyline",
+            "x_world_m": list(self.x_world_m),
+            "depth_m": list(self.depth_m),
+            "slope_smoothing_m": float(self.slope_smoothing_m),
+        }
+
+
+def _resolve_seabed(cfg: dict):
+    """Return the SeabedProfile from cfg, falling back to FlatSeabed(water_depth_m)."""
+    seabed = cfg.get("seabed")
+    if seabed is not None and hasattr(seabed, "depth_at") and hasattr(seabed, "slope_at"):
+        return seabed
+    return FlatSeabed(float(cfg["water_depth_m"]))
+
+
 class CatenarySystemCalculator:
     """
     Numerical integration of a suspended cable with:
@@ -129,6 +290,7 @@ class CatenarySystemCalculator:
             raise ImportError("NumPy is required for the catenary solver.")
 
         self.cfg = config
+        self.seabed = _resolve_seabed(config)
 
         self.H_N: Optional[float] = None
         self.S_total: Optional[float] = None
@@ -143,6 +305,15 @@ class CatenarySystemCalculator:
         self.s: Optional[np.ndarray] = None
         self.vertical_force_N: Optional[np.ndarray] = None
         self.tension_kN: Optional[np.ndarray] = None
+        self.x_world: Optional[np.ndarray] = None
+
+        # Seabed/TDP state. _tdp_x_world is the world-frame horizontal distance
+        # from the chute to the TDP (positive). For FlatSeabed this is just an
+        # internal bookkeeping value and does not affect the physics.
+        self._tdp_x_world: float = 0.0
+        self.tdp_x_world: Optional[float] = None
+        self.tdp_depth_m: Optional[float] = None
+        self.tdp_slope_deg: Optional[float] = None
 
         self.s_sea_surface: Optional[float] = None
         self.chute_contact_len_m: float = float(self.cfg.get("chute_contact_len_m", 0.0))
@@ -238,7 +409,9 @@ class CatenarySystemCalculator:
         return V
 
     def integrate(self, H_N: float, S_free_m: float, ds: float) -> Tuple[float, float, float, float, float, np.ndarray, np.ndarray, np.ndarray]:
-        D = self.cfg["water_depth_m"]
+        D = float(self.seabed.depth_at(self._tdp_x_world))
+        alpha_tdp = float(self.seabed.slope_at(self._tdp_x_world))
+        V_init = H_N * math.tan(alpha_tdp)
         comps = self.cfg.get("components", [])
         assembly = self.cfg.get("assembly", [])
         R = float(self.cfg.get("chute_radius_m", 0.0))
@@ -247,7 +420,7 @@ class CatenarySystemCalculator:
             s = 0.0
             x = 0.0
             y = -D
-            V = 0.0
+            V = V_init
 
             s_list = [0.0]
             x_list = [x]
@@ -527,7 +700,128 @@ class CatenarySystemCalculator:
         return 0.5 * (lo + hi)
 
     def solve(self):
-        D = self.cfg["water_depth_m"]
+        """Outer driver. Wraps ``_solve_once`` in a TDP-position fixed-point
+        iteration so that a sloped or profiled seabed converges to a TDP
+        location consistent with the cable layback. For a flat seabed the
+        iteration converges in a single pass (depth and slope are independent
+        of x_world). For sloped beds, Aitken's Δ²-acceleration is applied to
+        the linearly-convergent Picard sequence to reach an engineering
+        tolerance in 2–4 iterations.
+        """
+        max_tdp_iters = int(self.cfg.get("max_tdp_iters", 8))
+        # Engineering tolerance on TDP horizontal position: this drives the
+        # depth-at-TDP lookup, so 10 cm is much tighter than is needed for any
+        # downstream output (depth changes by tan(α)·tol; bottom tension
+        # changes by H/cos(α) which is independent of D for a planar slope).
+        tdp_tol_m = max(0.10, float(self.cfg.get("ds_m", 1.0)))
+
+        # If caller hasn't seeded a TDP x-guess, fall back to S_guess as a rough
+        # proxy for the typical layback magnitude. For flat seabed this value
+        # doesn't influence the result.
+        if self._tdp_x_world == 0.0:
+            self._tdp_x_world = float(self.cfg.get("S_guess_m", 0.0))
+
+        is_flat = isinstance(self.seabed, FlatSeabed)
+
+        # "Bottom Tension" input semantics: the user types the actual cable
+        # tension at the touchdown point, T_TDP. The horizontal force component
+        # used internally is H = T_TDP · cos(α_TDP). For a flat seabed
+        # cos α = 1 so H == T_TDP exactly (back-compatible). For a sloped or
+        # profiled seabed α depends on the TDP world-x, so we rescale H from
+        # the user's T_TDP input inside each Picard step using the local slope
+        # at the current TDP guess.
+        mode = self.cfg.get("input_mode", "")
+        t_bottom_input_N: Optional[float] = None
+        if mode == "Bottom Tension":
+            t_bottom_input_N = float(self.cfg.get("H_input_N", 0.0))
+
+        def _apply_bottom_tension_scaling(x_world: float) -> None:
+            if t_bottom_input_N is None:
+                return
+            alpha = float(self.seabed.slope_at(float(x_world)))
+            self.cfg["H_input_N"] = float(t_bottom_input_N) * math.cos(alpha)
+
+        def picard_step(x_in: float) -> float:
+            self._tdp_x_world = x_in
+            _apply_bottom_tension_scaling(x_in)
+            self._solve_once()
+            return float(self.layback if self.layback is not None else 0.0)
+
+        tdp_iters_used = 1
+        if is_flat:
+            # Depth and slope are x-independent: one solve is exact.
+            _apply_bottom_tension_scaling(self._tdp_x_world)
+            self._solve_once()
+        else:
+            x0 = self._tdp_x_world
+            x_converged = x0
+            for tdp_iter in range(max_tdp_iters):
+                tdp_iters_used = tdp_iter + 1
+                x1 = picard_step(x0)
+                if abs(x1 - x0) <= tdp_tol_m:
+                    x_converged = x1
+                    break
+
+                x2 = picard_step(x1)
+                denom = x2 - 2.0 * x1 + x0
+                if abs(denom) < 1e-12:
+                    x_converged = x2
+                    if abs(x2 - x1) <= tdp_tol_m:
+                        break
+                    x0 = x2
+                    continue
+
+                x_aitken = x0 - (x1 - x0) ** 2 / denom
+                if abs(x_aitken - x2) <= tdp_tol_m:
+                    x_converged = x_aitken
+                    break
+                x0 = x_aitken
+            # Lock in converged x with a final re-solve so stored state matches.
+            if abs(self._tdp_x_world - x_converged) > 1e-9:
+                self._tdp_x_world = x_converged
+                _apply_bottom_tension_scaling(x_converged)
+                self._solve_once()
+
+        # Restore the user's T_TDP input in cfg (we scaled it internally to H).
+        if t_bottom_input_N is not None:
+            self.cfg["H_input_N"] = float(t_bottom_input_N)
+
+        # Final TDP-related outputs.
+        alpha_final = float(self.seabed.slope_at(self._tdp_x_world))
+        self.tdp_x_world = float(self._tdp_x_world)
+        self.tdp_depth_m = float(self.seabed.depth_at(self._tdp_x_world))
+        self.tdp_slope_deg = math.degrees(alpha_final)
+        # Bottom tension at TDP is T = H/cos(alpha). For flat bed (alpha=0)
+        # this collapses to H/1000 → backwards-compatible.
+        if self.H_N is not None:
+            self.bottom_tension_kN = float(self.H_N) / math.cos(alpha_final) / 1000.0
+        # World-frame x array for plotting/exports: chute is at x_world=0,
+        # TDP at x_world=tdp_x_world; cable internal x increases toward chute.
+        if self.x is not None:
+            self.x_world = self._tdp_x_world - self.x
+
+        # Record TDP fixed-point and sliding-stability info in diagnostics.
+        if self.diagnostics is not None:
+            self.diagnostics.tdp_iterations = int(tdp_iters_used)
+            self.diagnostics.tdp_x_world_m = float(self._tdp_x_world)
+            self.diagnostics.tdp_depth_m = float(self.tdp_depth_m)
+            self.diagnostics.tdp_slope_deg = float(self.tdp_slope_deg)
+            tan_alpha = abs(math.tan(alpha_final))
+            if tan_alpha > 0.4:
+                self.diagnostics.warnings.append(
+                    f"Seabed slope at TDP is {self.tdp_slope_deg:.1f}° "
+                    f"(|tan α|={tan_alpha:.2f}); friction coefficient must exceed this for "
+                    f"the cable to rest stably — sliding is likely on most soils."
+                )
+            elif tan_alpha > 0.2:
+                self.diagnostics.warnings.append(
+                    f"Seabed slope at TDP is {self.tdp_slope_deg:.1f}° "
+                    f"(|tan α|={tan_alpha:.2f}); check that seabed friction is sufficient to "
+                    f"prevent cable sliding."
+                )
+
+    def _solve_once(self):
+        D = float(self.seabed.depth_at(self._tdp_x_world))
         c_top = self.cfg["chute_exit_height_m"]
         ds = self.cfg["ds_m"]
         mode = self.cfg["input_mode"]

@@ -25,6 +25,9 @@ spec.loader.exec_module(solver_module)
 AssemblyItem = solver_module.AssemblyItem
 CatenarySystemCalculator = solver_module.CatenarySystemCalculator
 parse_components = solver_module.parse_components
+FlatSeabed = solver_module.FlatSeabed
+PlanarSlopeSeabed = solver_module.PlanarSlopeSeabed
+PolylineSeabed = solver_module.PolylineSeabed
 
 
 def _base_config(**overrides):
@@ -228,6 +231,169 @@ def test_parse_components_sorts_and_skips_malformed_lines():
     _assert_close("distributed length", comps[1].length_m, 2.0, 1e-12)
 
 
+def test_flat_seabed_object_matches_water_depth_scalar():
+    """Passing FlatSeabed(D) in cfg must be identical to the legacy scalar."""
+    cfg_scalar = _base_config()
+    cfg_object = _base_config(seabed=FlatSeabed(_base_config()["water_depth_m"]))
+    a = CatenarySystemCalculator(cfg_scalar)
+    a.solve()
+    b = CatenarySystemCalculator(cfg_object)
+    b.solve()
+    _assert_close("H_N", b.H_N, a.H_N, 1e-9)
+    _assert_close("layback", b.layback, a.layback, 1e-9)
+    _assert_close("S_total", b.S_total, a.S_total, 1e-9)
+    _assert_close("top tension", b.top_tension_kN, a.top_tension_kN, 1e-9)
+
+
+def test_planar_zero_slope_matches_flat():
+    """PlanarSlopeSeabed(D, 0) must reproduce flat-seabed results exactly."""
+    D = 100.0
+    cfg_flat = _base_config(water_depth_m=D)
+    cfg_slope = _base_config(seabed=PlanarSlopeSeabed(D, 0.0))
+    a = CatenarySystemCalculator(cfg_flat)
+    a.solve()
+    b = CatenarySystemCalculator(cfg_slope)
+    b.solve()
+    _assert_close("layback", b.layback, a.layback, 1e-6)
+    _assert_close("top tension", b.top_tension_kN, a.top_tension_kN, 1e-6)
+    _assert_close("bottom tension", b.bottom_tension_kN, a.bottom_tension_kN, 1e-6)
+    _assert_close("tdp slope deg", b.tdp_slope_deg, 0.0, 1e-12)
+
+
+def test_planar_slope_tdp_tangency_and_bottom_tension():
+    """At the TDP, V/H must equal tan(alpha) and bottom tension = H/cos(alpha)."""
+    for slope_deg in (5.0, 10.0, 20.0):
+        seabed = PlanarSlopeSeabed(depth_at_chute_m=100.0, slope_deg=slope_deg)
+        cfg = _base_config(
+            seabed=seabed,
+            input_mode="Bottom Tension",
+            H_input_N=50_000.0,
+            H_guess_N=50_000.0,
+            S_guess_m=900.0,
+        )
+        calc = CatenarySystemCalculator(cfg)
+        calc.solve()
+
+        # vertical_force_N is recorded from TDP outward; index 0 is V(0).
+        assert calc.vertical_force_N is not None
+        V0 = float(calc.vertical_force_N[0])
+        tan_alpha_expected = math.tan(math.radians(slope_deg))
+        _assert_close(
+            f"V(0)/H slope={slope_deg}",
+            V0 / calc.H_N,
+            tan_alpha_expected,
+            1e-9,
+        )
+        T_tdp_expected = calc.H_N / math.cos(math.radians(slope_deg)) / 1000.0
+        _assert_close(
+            f"bottom tension slope={slope_deg}",
+            calc.bottom_tension_kN,
+            T_tdp_expected,
+            1e-6,
+        )
+        _assert_close(
+            f"tdp slope reported slope={slope_deg}",
+            calc.tdp_slope_deg,
+            slope_deg,
+            1e-9,
+        )
+
+
+def test_polyline_planar_equivalence():
+    """A polyline sampled from a planar slope must reproduce the planar result."""
+    D0 = 100.0
+    slope_deg = 8.0
+    xs = [0.0, 100.0, 200.0, 400.0, 800.0, 1600.0]
+    tan_a = math.tan(math.radians(slope_deg))
+    ds_samples = [D0 + tan_a * x for x in xs]
+
+    cfg_plane = _base_config(
+        seabed=PlanarSlopeSeabed(D0, slope_deg),
+        S_guess_m=900.0,
+    )
+    cfg_poly = _base_config(
+        seabed=PolylineSeabed(xs, ds_samples, slope_smoothing_m=1.0),
+        S_guess_m=900.0,
+    )
+    a = CatenarySystemCalculator(cfg_plane)
+    a.solve()
+    b = CatenarySystemCalculator(cfg_poly)
+    b.solve()
+    _assert_close("polyline vs plane layback", b.layback, a.layback, 0.05)
+    _assert_close("polyline vs plane bottom T", b.bottom_tension_kN, a.bottom_tension_kN, 0.01)
+    _assert_close("polyline vs plane S_total", b.S_total, a.S_total, 0.1)
+
+
+def test_tdp_fixed_point_converges_quickly():
+    """For modest slopes across all solve modes, TDP fixed-point should be cheap."""
+    seabed = PlanarSlopeSeabed(depth_at_chute_m=100.0, slope_deg=10.0)
+    base = CatenarySystemCalculator(
+        _base_config(seabed=seabed, S_guess_m=900.0)
+    )
+    base.solve()
+    cases = [
+        ("Bottom Tension", {"H_input_N": base.H_N}),
+        ("Contact Tension", {"Ttop_input_N": base.top_tension_kN * 1000.0}),
+        ("Tangent Angle", {"exit_angle_from_h_deg": base.exit_angle_deg_from_h}),
+        ("Catenary Length", {"S_input_m": base.S_total}),
+        ("Layback", {"layback_input_m": base.layback}),
+    ]
+    for mode, extra in cases:
+        cfg = _base_config(
+            input_mode=mode,
+            seabed=PlanarSlopeSeabed(depth_at_chute_m=100.0, slope_deg=10.0),
+            H_guess_N=base.H_N,
+            S_guess_m=base.S_total,
+            **extra,
+        )
+        calc = CatenarySystemCalculator(cfg)
+        calc.solve()
+        assert calc.diagnostics.tdp_iterations <= 6, (
+            f"mode={mode} took {calc.diagnostics.tdp_iterations} TDP iters"
+        )
+
+
+def test_steep_slope_emits_sliding_warning():
+    seabed = PlanarSlopeSeabed(depth_at_chute_m=100.0, slope_deg=25.0)
+    cfg = _base_config(seabed=seabed, S_guess_m=900.0)
+    calc = CatenarySystemCalculator(cfg)
+    calc.solve()
+    assert any("sliding" in w.lower() for w in calc.diagnostics.warnings), (
+        f"Expected a sliding-stability warning; got: {calc.diagnostics.warnings}"
+    )
+
+
+def test_bottom_tension_input_is_actual_tension_at_tdp_on_slope():
+    """User-facing Bottom Tension input must equal the reported tension at TDP,
+    regardless of seabed slope (H is back-solved as T_TDP·cos α internally)."""
+    T_input_kN = 50.0
+    for slope_deg in (0.0, 10.0, 25.0):
+        seabed = PlanarSlopeSeabed(depth_at_chute_m=100.0, slope_deg=slope_deg)
+        cfg = _base_config(
+            seabed=seabed,
+            input_mode="Bottom Tension",
+            H_input_N=T_input_kN * 1000.0,  # treated as T_TDP
+            H_guess_N=T_input_kN * 1000.0,
+            S_guess_m=900.0,
+        )
+        calc = CatenarySystemCalculator(cfg)
+        calc.solve()
+        _assert_close(
+            f"bottom tension out == in, slope={slope_deg}",
+            calc.bottom_tension_kN,
+            T_input_kN,
+            1e-6,
+        )
+        # And internally H = T·cos α.
+        expected_H_N = T_input_kN * 1000.0 * math.cos(math.radians(slope_deg))
+        _assert_close(
+            f"internal H = T·cos α, slope={slope_deg}",
+            float(calc.H_N),
+            expected_H_N,
+            1e-6,
+        )
+
+
 def run_all() -> List[str]:
     failures: List[str] = []
     tests: List[Callable[[], None]] = [
@@ -241,6 +407,13 @@ def run_all() -> List[str]:
         test_invalid_bottom_tension_is_rejected,
         test_diagnostics_warn_for_point_load_kink,
         test_parse_components_sorts_and_skips_malformed_lines,
+        test_flat_seabed_object_matches_water_depth_scalar,
+        test_planar_zero_slope_matches_flat,
+        test_planar_slope_tdp_tangency_and_bottom_tension,
+        test_polyline_planar_equivalence,
+        test_tdp_fixed_point_converges_quickly,
+        test_steep_slope_emits_sliding_warning,
+        test_bottom_tension_input_is_actual_tension_at_tdp_on_slope,
     ]
     for test in tests:
         try:

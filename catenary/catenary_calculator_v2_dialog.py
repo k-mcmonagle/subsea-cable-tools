@@ -57,6 +57,9 @@ from .catenary_solver import (
     AssemblyItem,
     CatenarySystemCalculator,
     Component,
+    FlatSeabed,
+    PlanarSlopeSeabed,
+    PolylineSeabed,
     _parse_components,
 )
 
@@ -236,6 +239,14 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.settings.setValue("chute_radius", self.chute_radius.value())
         self.settings.setValue("ds_step", self.ds_step.value())
 
+        # Seabed config
+        try:
+            self.settings.setValue("seabed_mode", self.seabed_mode.currentIndex())
+            self.settings.setValue("seabed_slope_deg", self.seabed_slope_deg.value())
+            self.settings.setValue("seabed_profile_json", json.dumps(self._seabed_profile_rows()))
+        except Exception:
+            pass
+
         self.settings.setValue("weight_water", self._fallback_q_water_npm)
         self.settings.setValue("weight_air", self._fallback_q_air_npm)
         self.settings.setValue("weight_unit", 0)
@@ -292,6 +303,44 @@ class CatenaryCalculatorV2Dialog(QDialog):
             self.chute_radius.setValue(v)
         if (v := _get_float("ds_step")) is not None:
             self.ds_step.setValue(v)
+
+        # Seabed config restore
+        if (v := _get_int("seabed_mode")) is not None:
+            try:
+                self.seabed_mode.setCurrentIndex(max(0, min(2, int(v))))
+            except Exception:
+                pass
+        if (v := _get_float("seabed_slope_deg")) is not None:
+            try:
+                self.seabed_slope_deg.setValue(float(v))
+            except Exception:
+                pass
+        sb_profile_json = self.settings.value("seabed_profile_json")
+        if sb_profile_json:
+            try:
+                rows = json.loads(str(sb_profile_json))
+                self.seabed_profile_table.blockSignals(True)
+                self.seabed_profile_table.setRowCount(0)
+                for row in rows:
+                    try:
+                        x, d = float(row[0]), float(row[1])
+                    except Exception:
+                        continue
+                    r = self.seabed_profile_table.rowCount()
+                    self.seabed_profile_table.insertRow(r)
+                    self.seabed_profile_table.setItem(r, 0, QTableWidgetItem(f"{x:g}"))
+                    self.seabed_profile_table.setItem(r, 1, QTableWidgetItem(f"{d:g}"))
+            except Exception:
+                pass
+            finally:
+                try:
+                    self.seabed_profile_table.blockSignals(False)
+                except Exception:
+                    pass
+        try:
+            self._on_seabed_mode_changed()
+        except Exception:
+            pass
 
         weight_unit_idx = _get_int("weight_unit", 0)
         weight_units = ["N/m", "kg/m", "lbf/ft"]
@@ -423,6 +472,51 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.water_depth.setRange(0, 1e6)
         self.water_depth.setDecimals(1)
         self.water_depth.setValue(100.0)
+        self.water_depth.setToolTip(
+            "Flat-seabed depth, or — when a sloped/profile seabed is selected — the depth "
+            "directly below the chute (x = 0)."
+        )
+
+        # Seabed profile controls
+        self.seabed_mode = QComboBox()
+        self.seabed_mode.addItems(["Flat", "Sloped", "Profile"])
+        self.seabed_mode.setToolTip(
+            "Flat: constant depth (legacy behaviour).\n"
+            "Sloped: constant slope; depth at chute and slope angle (positive = bed deepens away from chute).\n"
+            "Profile: arbitrary (distance-from-chute, depth) polyline."
+        )
+
+        self.seabed_slope_deg = QDoubleSpinBox()
+        self.seabed_slope_deg.setRange(-45.0, 45.0)
+        self.seabed_slope_deg.setDecimals(2)
+        self.seabed_slope_deg.setSingleStep(0.5)
+        self.seabed_slope_deg.setValue(0.0)
+        self.seabed_slope_deg.setToolTip(
+            "Global seabed slope, in degrees. Positive = bed deepens away from the chute "
+            "(cable departs the TDP angled upward toward the chute). The depth value above is "
+            "taken at the chute (x = 0)."
+        )
+
+        self.seabed_profile_table = QTableWidget(0, 2)
+        self.seabed_profile_table.setHorizontalHeaderLabels([
+            "Distance from chute (m)",
+            "Depth (m)",
+        ])
+        self.seabed_profile_table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
+        self.seabed_profile_table.setSelectionMode(SELECTION_MODE_SINGLE)
+        self.seabed_profile_table.setEditTriggers(
+            EDIT_TRIGGER_DOUBLE_CLICKED | EDIT_TRIGGER_SELECTED_CLICKED | EDIT_TRIGGER_EDIT_KEY_PRESSED
+        )
+        sb_hdr = self.seabed_profile_table.horizontalHeader()
+        if sb_hdr is not None:
+            sb_hdr.setSectionResizeMode(HEADER_RESIZE_MODE_INTERACTIVE)
+            sb_hdr.setStretchLastSection(True)
+        self.seabed_profile_table.setMinimumHeight(120)
+
+        self.seabed_profile_add_btn = QPushButton("Add row")
+        self.seabed_profile_del_btn = QPushButton("Delete row")
+        self.seabed_profile_paste_btn = QPushButton("Paste CSV…")
+        self.seabed_profile_load_btn = QPushButton("Load CSV…")
 
         self.chute_exit_height = QDoubleSpinBox()
         self.chute_exit_height.setRange(0, 1e5)
@@ -463,13 +557,19 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.bottom_tension.setRange(0, 1e6)
         self.bottom_tension.setDecimals(1)
         self.bottom_tension.setValue(50.0)
+        self.bottom_tension.setToolTip(
+            "Cable tension at the touchdown point (TDP). For a flat seabed this equals the "
+            "horizontal tension component H. For a sloped seabed the solver back-calculates "
+            "H = T_bottom · cos(α_TDP) so the reported tension at TDP always matches this input."
+        )
 
         self.top_tension = QDoubleSpinBox()
         self.top_tension.setRange(0, 1e6)
         self.top_tension.setDecimals(1)
         self.top_tension.setValue(80.0)
         self.top_tension.setToolTip(
-            "Tension at the free-span/chute contact point. The chute arc is drawn geometrically; chute friction is not modeled."
+            "Cable tension at the chute contact point (where the free span meets the chute arc). "
+            "The chute arc is drawn geometrically; chute friction is not modeled."
         )
 
         self.exit_angle = QDoubleSpinBox()
@@ -566,31 +666,66 @@ class CatenaryCalculatorV2Dialog(QDialog):
         json_tab_layout.addWidget(self.assembly_json_text)
         self.assembly_tabs.addTab(json_tab, "JSON")
 
-        # Layout entries
-        input_layout.addRow(QLabel("<b>Geometry</b>"))
-        input_layout.addRow("Water Depth (m):", self.water_depth)
-        input_layout.addRow("Chute Top Height above Waterline (m):", self.chute_exit_height)
-        input_layout.addRow("Chute Radius (m):", self.chute_radius)
+        # Layout entries — all top-level sections are collapsible.
 
-        input_layout.addRow(QLabel("<b>Solve Mode</b>"))
-        input_layout.addRow("Select Input Parameter:", self.input_parameter)
-        input_layout.addRow("Bottom Tension (kN):", self.bottom_tension)
-        input_layout.addRow("Tension at Contact (kN):", self.top_tension)
+        # --- Geometry (includes Seabed) ---
+        geom_header, geom_widget, geom_layout = self._create_collapsible_section(
+            "Geometry", "section_geometry_expanded"
+        )
+        input_layout.addRow(geom_header)
+        input_layout.addRow(geom_widget)
+        geom_layout.addRow("Water Depth (m):", self.water_depth)
+        geom_layout.addRow("Chute Top Height above Waterline (m):", self.chute_exit_height)
+        geom_layout.addRow("Chute Radius (m):", self.chute_radius)
+        geom_layout.addRow("Seabed mode:", self.seabed_mode)
+        self._seabed_slope_label = QLabel("Slope (deg):")
+        geom_layout.addRow(self._seabed_slope_label, self.seabed_slope_deg)
+
+        self._seabed_profile_container = QWidget()
+        seabed_profile_layout = QVBoxLayout(self._seabed_profile_container)
+        seabed_profile_layout.setContentsMargins(0, 0, 0, 0)
+        seabed_profile_layout.addWidget(QLabel(
+            "Distance is measured from the chute (positive away from chute, toward TDP)."
+        ))
+        seabed_profile_layout.addWidget(self.seabed_profile_table)
+        sb_btn_row = QHBoxLayout()
+        sb_btn_row.addWidget(self.seabed_profile_add_btn)
+        sb_btn_row.addWidget(self.seabed_profile_del_btn)
+        sb_btn_row.addWidget(self.seabed_profile_paste_btn)
+        sb_btn_row.addWidget(self.seabed_profile_load_btn)
+        seabed_profile_layout.addLayout(sb_btn_row)
+        geom_layout.addRow(self._seabed_profile_container)
+
+        # --- Assembly ---
+        asm_header, asm_widget, asm_layout = self._create_collapsible_section(
+            "Assembly", "section_assembly_expanded"
+        )
+        input_layout.addRow(asm_header)
+        input_layout.addRow(asm_widget)
+        asm_layout.addRow(self.assembly_tabs)
+
+        # --- Solve Mode ---
+        solve_header, solve_widget, solve_layout = self._create_collapsible_section(
+            "Solve Mode", "section_solve_expanded"
+        )
+        input_layout.addRow(solve_header)
+        input_layout.addRow(solve_widget)
+        solve_layout.addRow("Select Input Parameter:", self.input_parameter)
+        solve_layout.addRow("Bottom Tension (kN):", self.bottom_tension)
+        solve_layout.addRow("Tension at Chute Contact (kN):", self.top_tension)
 
         ang_layout = QHBoxLayout()
         ang_layout.addWidget(self.exit_angle)
         ang_layout.addWidget(self.angle_reference)
         ang_layout.setStretch(0, 1)
         ang_layout.setStretch(1, 1)
-        input_layout.addRow("Tangent Angle at Chute:", ang_layout)
+        solve_layout.addRow("Tangent Angle at Chute:", ang_layout)
 
-        input_layout.addRow("Total Cable Length (m):", self.catenary_length)
-        input_layout.addRow("Layback to Chute Top (m):", self.layback)
-        input_layout.addRow("Integration Step (m):", self.ds_step)
+        solve_layout.addRow("Total Cable Length (m):", self.catenary_length)
+        solve_layout.addRow("Layback to Chute Top (m):", self.layback)
+        solve_layout.addRow("Integration Step (m):", self.ds_step)
 
-        input_layout.addRow(QLabel("<b>Cable Assembly</b>"))
-        input_layout.addRow(self.assembly_tabs)
-
+        # --- Display ---
         display_header, display_widget, display_layout = self._create_collapsible_section("Display", "section_display_expanded")
         input_layout.addRow(display_header)
         input_layout.addRow(display_widget)
@@ -617,7 +752,8 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.show_kp_axis.setToolTip("Show a second x-axis below the plot using the Route KP Reference settings.")
         display_layout.addRow("", self.show_kp_axis)
 
-        count_header, count_widget, count_layout = self._create_collapsible_section("Cable Count", "section_count_expanded")
+        # --- Counter Reference (was Cable Count) ---
+        count_header, count_widget, count_layout = self._create_collapsible_section("Counter Reference", "section_count_expanded")
         input_layout.addRow(count_header)
         input_layout.addRow(count_widget)
         self.cable_count_top = QDoubleSpinBox()
@@ -626,15 +762,15 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.cable_count_top.setSingleStep(1.0)
         self.cable_count_top.setSuffix(" m")
         self.cable_count_top.setValue(0.0)
-        self.cable_count_top.setToolTip("Cable count at the Top of Chute reference point.")
+        self.cable_count_top.setToolTip("Counter reading at the Top of Chute reference point.")
 
         self.cable_count_direction = QComboBox()
         self.cable_count_direction.addItems(["Increases outboard from chute", "Increases inboard toward vessel"])
         self.cable_count_direction.setToolTip(
             "Outboard is from the chute toward the deployed cable/TDP; inboard is toward the vessel."
         )
-        count_layout.addRow("Count at Top of Chute:", self.cable_count_top)
-        count_layout.addRow("Count direction:", self.cable_count_direction)
+        count_layout.addRow("Counter at Top of Chute:", self.cable_count_top)
+        count_layout.addRow("Counter direction:", self.cable_count_direction)
 
         kp_header, kp_widget, kp_layout = self._create_collapsible_section("Route KP Reference", "section_kp_expanded")
         input_layout.addRow(kp_header)
@@ -730,9 +866,18 @@ class CatenaryCalculatorV2Dialog(QDialog):
         for w in [
             self.water_depth, self.chute_exit_height, self.chute_radius, self.ds_step,
             self.bottom_tension, self.top_tension, self.exit_angle,
-            self.catenary_length, self.layback
+            self.catenary_length, self.layback,
+            self.seabed_slope_deg,
         ]:
             w.valueChanged.connect(self.schedule_update_plot)
+
+        self.seabed_mode.currentIndexChanged.connect(self._on_seabed_mode_changed)
+        self.seabed_profile_table.cellChanged.connect(self.schedule_update_plot)
+        self.seabed_profile_add_btn.clicked.connect(self._on_seabed_profile_add_row)
+        self.seabed_profile_del_btn.clicked.connect(self._on_seabed_profile_delete_row)
+        self.seabed_profile_paste_btn.clicked.connect(self._on_seabed_profile_paste_csv)
+        self.seabed_profile_load_btn.clicked.connect(self._on_seabed_profile_load_csv)
+        self._on_seabed_mode_changed()
 
         self.input_parameter.currentIndexChanged.connect(self.update_input_fields)
         self.input_parameter.currentIndexChanged.connect(self.schedule_update_plot)
@@ -861,6 +1006,15 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 "S_guess_m": max(D + c + 1.0, self.catenary_length.value())
             }
 
+            seabed = self._build_seabed_profile(D)
+            cfg["seabed"] = seabed
+            # Use central/representative depth for back-compat consumers; the solver
+            # will read `cfg["seabed"]` when present.
+            try:
+                cfg["water_depth_m"] = float(seabed.depth_at(0.0))
+            except Exception:
+                pass
+
             if mode == "Bottom Tension":
                 cfg["H_input_N"] = float(self.bottom_tension.value()) * 1000.0
             elif mode in ("Contact Tension", "Top Tension"):
@@ -975,6 +1129,22 @@ class CatenaryCalculatorV2Dialog(QDialog):
         flop_forward_txt = f"{flop_forward:.1f} m" if flop_forward is not None else "N/A"
         angle_from_vertical = 90.0 - (calc.exit_angle_deg_from_h or 0.0)
 
+        # Seabed mode and TDP-local geometry (only meaningful when non-flat).
+        sb_mode = self._current_seabed_mode()
+        tdp_depth = getattr(calc, "tdp_depth_m", None)
+        tdp_slope = getattr(calc, "tdp_slope_deg", None)
+        tdp_x_world = getattr(calc, "tdp_x_world", None)
+        seabed_line = f"Seabed mode: {escape(sb_mode)}"
+        if sb_mode != "Flat":
+            try:
+                seabed_line += (
+                    f" — TDP depth {float(tdp_depth):.2f} m, "
+                    f"TDP slope {float(tdp_slope):+.2f}°, "
+                    f"TDP at {float(tdp_x_world):.2f} m from chute"
+                )
+            except Exception:
+                pass
+
         assembly: List[AssemblyItem] = calc.cfg.get("assembly", [])
         asm_seg_total = sum(max(0.0, it.length_m) for it in assembly if it.kind == "segment") if assembly else 0.0
         warn_lines: List[str] = []
@@ -1014,10 +1184,11 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
         txt = (
             f"Water Depth: {D:.1f} m<br>"
+            f"{seabed_line}<br>"
             f"Chute Top Height: {c:.1f} m above waterline<br><br>"
             f"Bottom Tension: {calc.bottom_tension_kN:.1f} kN<br>"
-            f"Tension at Contact: {calc.top_tension_kN:.1f} kN<br>"
-            f"Tangent Angle at Contact: {calc.exit_angle_deg_from_h:.1f}° from horizontal / {angle_from_vertical:.1f}° from vertical<br>"
+            f"Tension at Chute Contact: {calc.top_tension_kN:.1f} kN<br>"
+            f"Tangent Angle at Chute Contact: {calc.exit_angle_deg_from_h:.1f}° from horizontal / {angle_from_vertical:.1f}° from vertical<br>"
             f"Total Cable Length (Touchdown to Top of Chute): {calc.S_total:.1f} m<br>"
             f"Layback (Touchdown to Top of Chute): {calc.layback:.1f} m<br>"
             f"Top of Chute KP: {self._format_kp(0.0)}<br>"
@@ -1107,6 +1278,10 @@ class CatenaryCalculatorV2Dialog(QDialog):
             f"<tr><td><b>{escape(str(diagnostics.input_residual_label))}</b></td>"
             f"<td>{self._format_diag_value(diagnostics.input_residual, diagnostics.input_residual_units)}</td></tr>"
             f"<tr><td><b>Chute contact iteration</b></td><td>{chute_iteration_txt}</td></tr>"
+            f"<tr><td><b>TDP fixed-point iterations</b></td><td>{int(getattr(diagnostics, 'tdp_iterations', 0))}</td></tr>"
+            f"<tr><td><b>TDP position (world, from chute)</b></td><td>{self._format_diag_value(getattr(diagnostics, 'tdp_x_world_m', 0.0), 'm')}</td></tr>"
+            f"<tr><td><b>TDP depth</b></td><td>{self._format_diag_value(getattr(diagnostics, 'tdp_depth_m', 0.0), 'm')}</td></tr>"
+            f"<tr><td><b>TDP slope</b></td><td>{self._format_diag_value(getattr(diagnostics, 'tdp_slope_deg', 0.0), 'deg')}</td></tr>"
             f"<tr><td><b>Half-step position delta</b></td><td>{self._format_diag_value(diagnostics.refinement_position_delta_m, 'm')}</td></tr>"
             f"<tr><td><b>Half-step angle delta</b></td><td>{self._format_diag_value(diagnostics.refinement_angle_delta_deg, 'deg')}</td></tr>"
             f"<tr><td><b>Half-step tension delta</b></td><td>{self._format_diag_value(diagnostics.refinement_top_tension_delta_kN, 'kN')}</td></tr>"
@@ -1142,6 +1317,179 @@ class CatenaryCalculatorV2Dialog(QDialog):
         if self._x_axis_reference_key() == "chute_top" and calc.layback is not None:
             return float(calc.layback)
         return 0.0
+
+    # ---- Seabed helpers
+
+    def _current_seabed_mode(self) -> str:
+        try:
+            return self.seabed_mode.currentText()
+        except Exception:
+            return "Flat"
+
+    def _on_seabed_mode_changed(self) -> None:
+        mode = self._current_seabed_mode()
+        is_sloped = (mode == "Sloped")
+        is_profile = (mode == "Profile")
+        try:
+            self._seabed_slope_label.setVisible(is_sloped)
+            self.seabed_slope_deg.setVisible(is_sloped)
+            self._seabed_profile_container.setVisible(is_profile)
+        except Exception:
+            pass
+        self.schedule_update_plot()
+
+    def _seabed_profile_rows(self) -> List[Tuple[float, float]]:
+        rows: List[Tuple[float, float]] = []
+        try:
+            n = self.seabed_profile_table.rowCount()
+        except Exception:
+            n = 0
+        for r in range(n):
+            try:
+                x_item = self.seabed_profile_table.item(r, 0)
+                d_item = self.seabed_profile_table.item(r, 1)
+                if x_item is None or d_item is None:
+                    continue
+                xs = str(x_item.text()).strip()
+                ds = str(d_item.text()).strip()
+                if not xs or not ds:
+                    continue
+                rows.append((float(xs), float(ds)))
+            except Exception:
+                continue
+        rows.sort(key=lambda t: t[0])
+        return rows
+
+    def _build_seabed_profile(self, default_depth: float):
+        """Construct a SeabedProfile instance from the current dialog state."""
+        mode = self._current_seabed_mode()
+        if mode == "Sloped":
+            return PlanarSlopeSeabed(
+                depth_at_chute_m=float(default_depth),
+                slope_deg=float(self.seabed_slope_deg.value()),
+            )
+        if mode == "Profile":
+            rows = self._seabed_profile_rows()
+            if len(rows) >= 2:
+                xs = [float(r[0]) for r in rows]
+                ds = [float(r[1]) for r in rows]
+                return PolylineSeabed(x_world_m=xs, depth_m=ds)
+            # Insufficient profile data → silently fall back to flat at default depth.
+        return FlatSeabed(float(default_depth))
+
+    def _on_seabed_profile_add_row(self) -> None:
+        try:
+            self.seabed_profile_table.blockSignals(True)
+            n = self.seabed_profile_table.rowCount()
+            self.seabed_profile_table.insertRow(n)
+            self.seabed_profile_table.setItem(n, 0, QTableWidgetItem(""))
+            self.seabed_profile_table.setItem(n, 1, QTableWidgetItem(""))
+        finally:
+            self.seabed_profile_table.blockSignals(False)
+        self.schedule_update_plot()
+
+    def _on_seabed_profile_delete_row(self) -> None:
+        try:
+            sel = self.seabed_profile_table.selectionModel()
+            if sel is None:
+                return
+            rows = sorted({idx.row() for idx in sel.selectedRows()}, reverse=True)
+            if not rows:
+                cur = self.seabed_profile_table.currentRow()
+                if cur >= 0:
+                    rows = [cur]
+            self.seabed_profile_table.blockSignals(True)
+            for r in rows:
+                self.seabed_profile_table.removeRow(r)
+        finally:
+            self.seabed_profile_table.blockSignals(False)
+        self.schedule_update_plot()
+
+    def _load_seabed_csv_text(self, text: str) -> int:
+        """Parse a 2-column CSV/TSV blob, replace the seabed profile table. Returns row count."""
+        if not text:
+            return 0
+        rows: List[Tuple[float, float]] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            for sep in ("\t", ",", ";"):
+                if sep in line:
+                    parts = [p.strip() for p in line.split(sep)]
+                    break
+            else:
+                parts = line.split()
+            if len(parts) < 2:
+                continue
+            try:
+                rows.append((float(parts[0]), float(parts[1])))
+            except Exception:
+                continue
+        try:
+            self.seabed_profile_table.blockSignals(True)
+            self.seabed_profile_table.setRowCount(0)
+            for x, d in rows:
+                r = self.seabed_profile_table.rowCount()
+                self.seabed_profile_table.insertRow(r)
+                self.seabed_profile_table.setItem(r, 0, QTableWidgetItem(f"{x:g}"))
+                self.seabed_profile_table.setItem(r, 1, QTableWidgetItem(f"{d:g}"))
+        finally:
+            self.seabed_profile_table.blockSignals(False)
+        self.schedule_update_plot()
+        return len(rows)
+
+    def _on_seabed_profile_paste_csv(self) -> None:
+        try:
+            cb = QApplication.clipboard()
+            text = cb.text() if cb is not None else ""
+        except Exception:
+            text = ""
+        n = self._load_seabed_csv_text(text)
+        QMessageBox.information(self, "Paste seabed CSV", f"Loaded {n} row(s) from clipboard.")
+
+    def _on_seabed_profile_load_csv(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Load seabed profile CSV", "", "CSV / text (*.csv *.txt);;All files (*)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+        except Exception as exc:
+            QMessageBox.warning(self, "Load seabed CSV", f"Could not read file:\n{exc}")
+            return
+        n = self._load_seabed_csv_text(text)
+        QMessageBox.information(self, "Load seabed CSV", f"Loaded {n} row(s) from\n{path}")
+
+    def _seabed_world_from_plot_x(self, calc: CatenarySystemCalculator, plot_x: float) -> float:
+        """Map a plot-x value to the world (chute=0) frame used by SeabedProfile.depth_at."""
+        if self._x_axis_reference_key() == "chute_top":
+            return float(-plot_x)
+        # TDP-reference plot: TDP at plot_x=0 ↔ world=layback; chute at plot_x=-layback ↔ world=0.
+        layback = float(calc.layback) if calc.layback is not None else 0.0
+        return float(layback - plot_x)
+
+    def _seabed_depth_at_plot_x(self, calc: CatenarySystemCalculator, plot_x: float) -> float:
+        seabed = getattr(calc, "seabed", None)
+        if seabed is None or not hasattr(seabed, "depth_at"):
+            return float(self.water_depth.value())
+        return float(seabed.depth_at(self._seabed_world_from_plot_x(calc, plot_x)))
+
+    def _seabed_polyline_in_plot_coords(
+        self, calc: CatenarySystemCalculator, x_min: float, x_max: float, n_samples: int = 240
+    ) -> Tuple[Any, Any]:
+        """Sample the seabed across a plot-x range. Returns (xs, depths) numpy arrays."""
+        if np is None:
+            return ([x_min, x_max], [float(self.water_depth.value())] * 2)
+        if x_max <= x_min:
+            x_max = x_min + 1.0
+        xs = np.linspace(x_min, x_max, max(2, int(n_samples)))
+        seabed = getattr(calc, "seabed", None)
+        if seabed is None or not hasattr(seabed, "depth_at"):
+            depths = np.full_like(xs, float(self.water_depth.value()))
+        else:
+            depths = np.array([float(seabed.depth_at(self._seabed_world_from_plot_x(calc, float(x)))) for x in xs])
+        return xs, depths
 
     def _x_axis_label(self) -> str:
         if self._x_axis_reference_key() == "chute_top":
@@ -1475,7 +1823,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 tension_kN = self._local_tension_kN(calc, s_body)
             elif self.show_full_assembly_seabed.isChecked() and calc.S_total is not None and distance_from_top > float(calc.S_total):
                 x_body = -(distance_from_top - float(calc.S_total)) - x_origin_offset
-                depth_body = D
+                depth_body = self._seabed_depth_at_plot_x(calc, x_body)
                 position = "on seabed"
 
             if x_body is None or depth_body is None:
@@ -1650,7 +1998,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             elif self.show_full_assembly_seabed.isChecked() and calc.S_total is not None:
                 x_body_physical = -(d_body - float(calc.S_total))
                 xb = x_body_physical - x_origin_offset
-                add_label(xb + offset_x * label_offset, D + offset_y * label_offset, item.name, body_color)
+                add_label(xb + offset_x * label_offset, self._seabed_depth_at_plot_x(calc, xb) + offset_y * label_offset, item.name, body_color)
 
     def _plot(self, calc: CatenarySystemCalculator):
         plot_x_reference = self._x_axis_reference_key()
@@ -1732,7 +2080,18 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
         # Sea level and seabed
         ax.axhline(0, linewidth=2, label="Sea Level")
-        ax.axhline(D, linewidth=2, label="Seabed")
+
+        # Sample the seabed across the horizontal extent of the plot so sloped/
+        # profile seabeds are rendered as a polyline rather than a single line.
+        sb_x_min = float(min(float(np.min(x)), float(x[0]), float(layback_plot), 0.0))
+        sb_x_max = float(max(float(np.max(x)), float(x[0]), float(layback_plot), 0.0))
+        if sb_x_max <= sb_x_min:
+            sb_x_max = sb_x_min + 1.0
+        sb_pad = max(1.0, 0.05 * (sb_x_max - sb_x_min))
+        seabed_plot_xs, seabed_plot_depths = self._seabed_polyline_in_plot_coords(
+            calc, sb_x_min - sb_pad, sb_x_max + sb_pad, n_samples=240
+        )
+        ax.plot(seabed_plot_xs, seabed_plot_depths, linewidth=2, label="Seabed")
 
         marker_size = 16
 
@@ -1869,7 +2228,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 n_pts = max(2, int(min(600, max(2, seabed_len / max(ds_step := float(self.ds_step.value()), 0.25)))))
                 xs_physical = np.linspace(0.0, -seabed_len, n_pts)
                 xs = xs_physical - x_origin_offset
-                ys = np.full_like(xs, D)
+                ys = np.array([self._seabed_depth_at_plot_x(calc, float(xp)) for xp in xs])
                 seabed_x = xs
                 seabed_y = ys
 
@@ -1922,7 +2281,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
                     if x_body_physical < -seabed_len - 1e-6:
                         continue
                     x_body = x_body_physical - x_origin_offset
-                    seabed_body_points.append((x_body, D, body_color))
+                    seabed_body_points.append((x_body, self._seabed_depth_at_plot_x(calc, x_body), body_color))
 
                 if seabed_body_points:
                     for i, (bx, by, body_color) in enumerate(seabed_body_points):
@@ -1930,13 +2289,14 @@ class CatenaryCalculatorV2Dialog(QDialog):
                         ax.scatter([bx], [by], marker="D", s=36, facecolors="none", edgecolors=body_color, label=label)
 
                 end_x = -seabed_len - x_origin_offset
-                ax.scatter([end_x], [D], marker="s", s=36, color="#111827", label="End of cable")
+                ax.scatter([end_x], [self._seabed_depth_at_plot_x(calc, end_x)], marker="s", s=36, color="#111827", label="End of cable")
                 if self.show_plot_labels.isChecked():
                     label_offset = max(0.75, 0.018 * max(abs(float(seabed_len)), float(D), 1.0))
                     end_horizontal_from_top = float(layback) + float(seabed_len)
+                    end_depth = self._seabed_depth_at_plot_x(calc, end_x)
                     ax.text(
                         end_x,
-                        D - label_offset,
+                        end_depth - label_offset,
                         f"End of cable\nCC {self._format_cable_count(asm_seg_total)}\nKP {self._format_kp(end_horizontal_from_top)}",
                         color="#111827",
                         fontsize=8,
@@ -2299,10 +2659,34 @@ class CatenaryCalculatorV2Dialog(QDialog):
         entities.append(self._dxf_line_entity(x0, 0.0, x1, 0.0, layer=sea_layer))
         entities.append(self._dxf_text_entity(x1, 0.0 + text_off, "Sea level (y=0)", height=text_h, layer=sea_layer))
 
-        # Seabed at y=-D (internal coordinates)
-        y_seabed = (-D) * 1000.0
-        entities.append(self._dxf_line_entity(x0, y_seabed, x1, y_seabed, layer=seabed_layer))
-        entities.append(self._dxf_text_entity(x1, y_seabed + text_off, f"Seabed (y=-{D:.3f} m)", height=text_h, layer=seabed_layer))
+        # Seabed: sample the SeabedProfile along the export x-range as a polyline.
+        seabed_obj = getattr(calc, "seabed", None)
+        n_sb = 240
+        xs_sb_m = np.linspace(x_min_m - pad_m, x_max_m + pad_m, n_sb)
+        if seabed_obj is not None and hasattr(seabed_obj, "depth_at"):
+            depths_sb = np.array([
+                float(seabed_obj.depth_at(self._seabed_world_from_plot_x(calc, float(xp))))
+                for xp in xs_sb_m
+            ])
+        else:
+            depths_sb = np.full_like(xs_sb_m, float(D))
+        xs_sb_mm = (xs_sb_m * 1000.0).tolist()
+        ys_sb_mm = ((-depths_sb) * 1000.0).tolist()
+        entities.append(self._dxf_polyline_entity(xs_sb_mm, ys_sb_mm, layer=seabed_layer))
+        # Label near right edge using the local depth at that x.
+        try:
+            right_depth = float(depths_sb[-1])
+        except Exception:
+            right_depth = float(D)
+        entities.append(
+            self._dxf_text_entity(
+                xs_sb_mm[-1],
+                (-right_depth) * 1000.0 + text_off,
+                f"Seabed (depth ≈ {right_depth:.3f} m)",
+                height=text_h,
+                layer=seabed_layer,
+            )
+        )
 
         dxf = self._dxf_build(entities)
         with open(path, "w") as f:
