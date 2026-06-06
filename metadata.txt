@@ -16,13 +16,14 @@ hasProcessingProvider=yes
 
 # changelog
 changelog=Version 1.5.1:
+  - Catenary Calculator V2: added sloped / profiled seabed support (tangent touchdown on a depth profile), convergence and seabed-penetration reporting, distributed buoyancy, and a fuller seabed plot. Bottom Tension input is now the actual tension at the touchdown (T_TDP), identical to before on a flat seabed.
   - Distance/KP measurement consolidated through a single helper that uses the project ellipsoid (with a WGS84 fallback when unset). Adds an Ellipsoidal/Cartesian distance-mode option to KP-emitting algorithms (default Ellipsoidal; no behaviour change).
   - Geodesic interpolation: point_at_kp / extract_line_segment now follow the great circle on geographic CRSes instead of linearly interpolating in lon/lat. KP Mouse Tool range ring drawn as a true geodesic circle.
   - CRS handling: KP Plotter, Find Nearest KP and Place KP Points (raster sampling) auto-reproject mismatched inputs with feedback warnings; Translate KP Between RPLs gives a clearer same-CRS error.
   - QGIS 4.0 / Qt6 compatibility: PyQt shim used throughout, compatibility aliases added for Qt/QGIS enum changes, qgisMaximumVersion=4.99 declared. Catenary calculators, KP Plotter and Depth Profile now use vendored pyqtgraph instead of requiring matplotlib.
   - Various fixes: RPL Route Comparison ellipsoid fallback, narrowed bare except clauses, Dynamic Buffer group label, dock-widget cleanup. Catenary Calculator v1 marked Legacy. Import Bathy MDB renamed to Import MDB (`import_mdb` algorithm id).
   - See CHANGELOG.md for the full list.
-tags=subsea, cable, telecoms, mapping, gis, qgis, lrs, kp, offshore, engineering, bathymetry, 
+tags=subsea, cable, telecoms, mapping, gis, qgis, lrs, kp, offshore, engineering, bathymetry
 
 homepage=https://github.com/k-mcmonagle/subsea-cable-tools
 category=Vector

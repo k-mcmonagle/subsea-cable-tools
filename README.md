@@ -2,7 +2,7 @@
 
 **Subsea Cable Tools** is a QGIS plugin for working with subsea telecom and power cable data: route position lists (RPLs), KP-based queries, bathymetry, lay corridors, and related survey/engineering tasks.
 
-Targets QGIS 3.22 or newer and declares compatibility through QGIS 4.x (`qgisMaximumVersion=4.99`). See [docs/qgis_compatibility_test_plan.md](docs/qgis_compatibility_test_plan.md) for the validation checklist before publishing a release.
+Targets QGIS 3.22 or newer and declares compatibility through QGIS 4.x (`qgisMaximumVersion=4.99`).
 
 ---
 

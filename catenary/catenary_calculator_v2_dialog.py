@@ -1182,7 +1182,38 @@ class CatenaryCalculatorV2Dialog(QDialog):
         if warn_lines:
             warn_txt = "<br><br><b>Warnings</b><br>" + "<br>".join(f"• {escape(str(w))}" for w in warn_lines)
 
+        # Convergence / seabed-interaction status banner. This surfaces silent
+        # solver problems (non-converged boundary/input residuals) and seabed
+        # penetration directly in the results pane rather than hiding them in
+        # the diagnostics dialog.
+        banner_txt = ""
+        diag = getattr(calc, "diagnostics", None)
+        if diag is not None:
+            converged = bool(getattr(diag, "converged", True))
+            penetrates = bool(getattr(diag, "seabed_penetration", False))
+            min_clear = getattr(diag, "min_seabed_clearance_m", None)
+            if not converged:
+                banner_txt += (
+                    '<div style="background:#7a1f1f;color:#fff;padding:6px;border-radius:4px;">'
+                    '<b>⚠ Solver did not fully converge.</b> The plotted shape may not satisfy the '
+                    'boundary/input conditions — treat results as indicative only. See solver diagnostics.'
+                    "</div>"
+                )
+            if penetrates:
+                pen_max = float(getattr(diag, "seabed_penetration_max_m", 0.0) or 0.0)
+                banner_txt += (
+                    '<div style="background:#7a1f1f;color:#fff;padding:6px;border-radius:4px;margin-top:4px;">'
+                    f"<b>⚠ Cable passes through the seabed</b> by up to {pen_max:.2f} m within the free span. "
+                    "The cable would physically rest on this seabed high spot (a multi-span contact the static "
+                    "single-span model cannot represent). Increase tension, reduce slope severity, or refine the "
+                    "seabed profile. The affected region is marked in red on the plot."
+                    "</div>"
+                )
+            if banner_txt:
+                banner_txt += "<br>"
+
         txt = (
+            f"{banner_txt}"
             f"Water Depth: {D:.1f} m<br>"
             f"{seabed_line}<br>"
             f"Chute Top Height: {c:.1f} m above waterline<br><br>"
@@ -1198,6 +1229,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             f"Cable on chute arc: {chute_contact_txt}<br>"
             f"Sea Surface Crossing Distance Along Cable: {sea_txt}<br>"
             f"Minimum Radius of Curvature (including chute): {calc.min_radius_m:.1f} m<br>"
+            f"Min seabed clearance (free span): {self._format_diag_value(min_clear, 'm') if diag is not None else 'N/A'}<br>"
             f"Assembly length: {asm_txt}<br>"
             f"{warn_txt}"
         )
@@ -1259,6 +1291,29 @@ class CatenaryCalculatorV2Dialog(QDialog):
         else:
             warning_rows = "<li>No solver-specific warnings for this result.</li>"
 
+        converged = bool(getattr(diagnostics, "converged", True))
+        boundary_ok = bool(getattr(diagnostics, "boundary_residual_ok", True))
+        input_ok = bool(getattr(diagnostics, "input_residual_ok", True))
+
+        def _ok_label(flag: bool) -> str:
+            colour = "#2e7d32" if flag else "#c62828"
+            text = "OK" if flag else "OUT OF TOLERANCE"
+            return f'<span style="color:{colour};"><b>{text}</b></span>'
+
+        convergence_txt = _ok_label(converged) if converged else (
+            f'{_ok_label(converged)} '
+            f'(boundary {_ok_label(boundary_ok)}, input {_ok_label(input_ok)})'
+        )
+
+        penetrates = bool(getattr(diagnostics, "seabed_penetration", False))
+        if penetrates:
+            seabed_txt = (
+                f'<span style="color:#c62828;"><b>Cable passes through seabed</b></span> '
+                f'(up to {self._format_diag_value(getattr(diagnostics, "seabed_penetration_max_m", 0.0), "m")})'
+            )
+        else:
+            seabed_txt = '<span style="color:#2e7d32;">Clear of seabed</span>'
+
         return (
             "<h2>Solver diagnostics</h2>"
             "<p>These values are for checking numerical quality of the current catenary result. "
@@ -1270,6 +1325,9 @@ class CatenaryCalculatorV2Dialog(QDialog):
             "<h3>Current solve</h3>"
             "<table cellspacing='4' cellpadding='2'>"
             f"<tr><td><b>Solve mode</b></td><td>{escape(str(diagnostics.input_mode))}</td></tr>"
+            f"<tr><td><b>Convergence</b></td><td>{convergence_txt}</td></tr>"
+            f"<tr><td><b>Seabed interaction</b></td><td>{seabed_txt}</td></tr>"
+            f"<tr><td><b>Min seabed clearance (free span)</b></td><td>{self._format_diag_value(getattr(diagnostics, 'min_seabed_clearance_m', None), 'm')}</td></tr>"
             f"<tr><td><b>Integration step</b></td><td>requested {self._format_diag_value(diagnostics.ds_requested_m, 'm')}; "
             f"effective {self._format_diag_value(diagnostics.ds_effective_m, 'm')} over {diagnostics.integration_steps} steps</td></tr>"
             f"<tr><td><b>Free-span length</b></td><td>{self._format_diag_value(diagnostics.free_span_length_m, 'm')}</td></tr>"
@@ -1465,9 +1523,26 @@ class CatenaryCalculatorV2Dialog(QDialog):
         """Map a plot-x value to the world (chute=0) frame used by SeabedProfile.depth_at."""
         if self._x_axis_reference_key() == "chute_top":
             return float(-plot_x)
-        # TDP-reference plot: TDP at plot_x=0 ↔ world=layback; chute at plot_x=-layback ↔ world=0.
-        layback = float(calc.layback) if calc.layback is not None else 0.0
-        return float(layback - plot_x)
+        # TDP-reference plot: the cable's world frame is x_world = tdp_x_world - x
+        # and the plot uses plot_x = x (internal), so world = tdp_x_world - plot_x.
+        # Anchor on tdp_x_world (the actual world frame origin used by the solver)
+        # rather than layback so the seabed, touchdown and cable stay registered.
+        tdp_x_world = getattr(calc, "tdp_x_world", None)
+        if tdp_x_world is None:
+            tdp_x_world = float(calc.layback) if calc.layback is not None else 0.0
+        return float(float(tdp_x_world) - plot_x)
+
+    def _plot_x_from_seabed_world(self, calc: CatenarySystemCalculator, world_x: float) -> Optional[float]:
+        """Inverse of ``_seabed_world_from_plot_x``: map a seabed world-x to plot-x."""
+        try:
+            if self._x_axis_reference_key() == "chute_top":
+                return float(-world_x)
+            tdp_x_world = getattr(calc, "tdp_x_world", None)
+            if tdp_x_world is None:
+                tdp_x_world = float(calc.layback) if calc.layback is not None else 0.0
+            return float(float(tdp_x_world) - float(world_x))
+        except Exception:
+            return None
 
     def _seabed_depth_at_plot_x(self, calc: CatenarySystemCalculator, plot_x: float) -> float:
         seabed = getattr(calc, "seabed", None)
@@ -2085,6 +2160,22 @@ class CatenaryCalculatorV2Dialog(QDialog):
         # profile seabeds are rendered as a polyline rather than a single line.
         sb_x_min = float(min(float(np.min(x)), float(x[0]), float(layback_plot), 0.0))
         sb_x_max = float(max(float(np.max(x)), float(x[0]), float(layback_plot), 0.0))
+
+        # Extend the sampled range to cover the full defined seabed profile, so
+        # the available bathymetry is shown even where it lies beyond the cable
+        # (e.g. profile points deeper than the touchdown or behind the chute).
+        seabed_obj = getattr(calc, "seabed", None)
+        profile_world_xs = getattr(seabed_obj, "x_world_m", None)
+        if profile_world_xs:
+            # Map profile world-x extent into plot-x: plot_x = world(plot_x) inverse.
+            prof_plot_xs = [
+                self._plot_x_from_seabed_world(calc, float(wx)) for wx in profile_world_xs
+            ]
+            prof_plot_xs = [px for px in prof_plot_xs if px is not None]
+            if prof_plot_xs:
+                sb_x_min = min(sb_x_min, float(min(prof_plot_xs)))
+                sb_x_max = max(sb_x_max, float(max(prof_plot_xs)))
+
         if sb_x_max <= sb_x_min:
             sb_x_max = sb_x_min + 1.0
         sb_pad = max(1.0, 0.05 * (sb_x_max - sb_x_min))
@@ -2092,6 +2183,27 @@ class CatenaryCalculatorV2Dialog(QDialog):
             calc, sb_x_min - sb_pad, sb_x_max + sb_pad, n_samples=240
         )
         ax.plot(seabed_plot_xs, seabed_plot_depths, linewidth=2, label="Seabed")
+
+        # Highlight any free-span region where the cable dips below the seabed.
+        # ``seabed_clearance_m`` is aligned with calc.x / calc.y; negative values
+        # mean the cable is below the bed (a physical violation the static model
+        # cannot resolve).
+        clearance = getattr(calc, "seabed_clearance_m", None)
+        if clearance is not None:
+            try:
+                clr = np.asarray(clearance, dtype=float)
+                pen_mask = clr < 0.0
+                if np.any(pen_mask):
+                    ax.scatter(
+                        x[pen_mask],
+                        depth[pen_mask],
+                        s=18,
+                        color="#d32f2f",
+                        zorder=6,
+                        label="Cable below seabed",
+                    )
+            except Exception:
+                pass
 
         marker_size = 16
 

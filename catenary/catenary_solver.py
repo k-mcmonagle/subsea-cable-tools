@@ -74,6 +74,21 @@ class SolverDiagnostics:
     tdp_x_world_m: float = 0.0
     tdp_depth_m: float = 0.0
     tdp_slope_deg: float = 0.0
+    # Solution-quality flags. ``converged`` is the headline status the UI can
+    # surface directly: it is True only when the solved curve actually matches
+    # the selected input and the chute boundary within engineering tolerance.
+    converged: bool = True
+    boundary_residual_ok: bool = True
+    input_residual_ok: bool = True
+    boundary_residual_tol_m: float = 0.0
+    input_residual_tol: float = 0.0
+    # Free-span interaction with the seabed ahead of / around the TDP.
+    min_seabed_clearance_m: Optional[float] = None
+    seabed_penetration: bool = False
+    seabed_penetration_max_m: float = 0.0
+    # Touchdown-advance (penetration resolution) bookkeeping.
+    touchdown_advance_iterations: int = 0
+    touchdown_advanced_m: float = 0.0
     warnings: List[str] = field(default_factory=list)
 
 
@@ -322,6 +337,15 @@ class CatenarySystemCalculator:
         self._last_chute_contact_iterations: int = 0
         self._last_chute_contact_residual_m: float = 0.0
 
+        # Free-span seabed clearance (computed after a solve). ``seabed_clearance_m``
+        # is aligned with ``self.x``/``self.y`` (clearance = seabed_depth + y, i.e.
+        # positive when the cable is above the bed). Negative => penetration.
+        self.seabed_clearance_m: Optional[np.ndarray] = None
+        self.min_seabed_clearance_m: Optional[float] = None
+        self.seabed_penetration: bool = False
+        self._touchdown_advance_iterations: int = 0
+        self._touchdown_advanced_m: float = 0.0
+
     @staticmethod
     def _unit_to_npm(value: float, unit: str) -> float:
         if unit == "N/m":
@@ -357,6 +381,9 @@ class CatenarySystemCalculator:
 
             if q_seg is None or q_seg <= 0:
                 q_seg = self.cfg["q_water_npm"] if y < 0 else self.cfg["q_air_npm"]
+            # An assembly segment's own weight is expected to be positive; a
+            # non-positive value here means "unspecified", so keep the small
+            # positive floor to avoid a zero-weight straight segment.
             return max(float(q_seg), 1e-9)
 
         base_q = self.cfg["q_water_npm"] if y < 0 else self.cfg["q_air_npm"]
@@ -368,7 +395,13 @@ class CatenarySystemCalculator:
             s1 = c.position_m + c.length_m
             if s0 <= s_from_tdp <= s1:
                 q += c.delta_q_water_npm if y < 0 else c.delta_q_air_npm
-        return max(q, 1e-9)
+        # Allow a net-negative (buoyant) effective weight so distributed
+        # buoyancy modules bend the cable upward. The integrator guards against
+        # zero/negative tension separately, so we only avoid an exact zero that
+        # would make a perfectly straight, force-free segment.
+        if abs(q) < 1e-9:
+            q = 1e-9 if base_q >= 0 else -1e-9
+        return q
 
     def _apply_point_loads(
         self,
@@ -747,16 +780,17 @@ class CatenarySystemCalculator:
             self._solve_once()
             return float(self.layback if self.layback is not None else 0.0)
 
-        tdp_iters_used = 1
-        if is_flat:
-            # Depth and slope are x-independent: one solve is exact.
-            _apply_bottom_tension_scaling(self._tdp_x_world)
-            self._solve_once()
-        else:
+        def run_tdp_consistent_solve() -> int:
+            if is_flat:
+                # Depth and slope are x-independent: one solve is exact.
+                _apply_bottom_tension_scaling(self._tdp_x_world)
+                self._solve_once()
+                return 1
             x0 = self._tdp_x_world
             x_converged = x0
+            iters = 1
             for tdp_iter in range(max_tdp_iters):
-                tdp_iters_used = tdp_iter + 1
+                iters = tdp_iter + 1
                 x1 = picard_step(x0)
                 if abs(x1 - x0) <= tdp_tol_m:
                     x_converged = x1
@@ -781,6 +815,23 @@ class CatenarySystemCalculator:
                 self._tdp_x_world = x_converged
                 _apply_bottom_tension_scaling(x_converged)
                 self._solve_once()
+            return iters
+
+        tdp_iters_used = run_tdp_consistent_solve()
+
+        # ---- Seabed penetration detection --------------------------------
+        # On a profiled (polyline) seabed the self-consistent free span can dip
+        # below a high spot that sits between the touchdown and the chute.
+        # Physically the cable cannot pass through the bed; the real cable would
+        # rest on that high spot, which is a multi-span contact problem outside
+        # the scope of this single-span static solver. We therefore keep the
+        # self-consistent solution (touchdown world-x == layback, so the chute
+        # stays at world-x = 0) and *report* any penetration rather than
+        # relocating the touchdown — relocating it would violate the chute
+        # boundary condition and produce an inconsistent geometry. Flat and
+        # planar beds are never penetrated by a tangentially-departing catenary.
+        self._touchdown_advance_iterations = 0
+        self._touchdown_advanced_m = 0.0
 
         # Restore the user's T_TDP input in cfg (we scaled it internally to H).
         if t_bottom_input_N is not None:
@@ -800,12 +851,33 @@ class CatenarySystemCalculator:
         if self.x is not None:
             self.x_world = self._tdp_x_world - self.x
 
+        # Final free-span seabed clearance for the locked-in solution.
+        min_clear, penetrates, _ = self._compute_seabed_clearance()
+
         # Record TDP fixed-point and sliding-stability info in diagnostics.
         if self.diagnostics is not None:
             self.diagnostics.tdp_iterations = int(tdp_iters_used)
             self.diagnostics.tdp_x_world_m = float(self._tdp_x_world)
             self.diagnostics.tdp_depth_m = float(self.tdp_depth_m)
             self.diagnostics.tdp_slope_deg = float(self.tdp_slope_deg)
+            self.diagnostics.touchdown_advance_iterations = int(self._touchdown_advance_iterations)
+            self.diagnostics.touchdown_advanced_m = float(self._touchdown_advanced_m)
+            self.diagnostics.min_seabed_clearance_m = (
+                float(min_clear) if min_clear is not None else None
+            )
+            self.diagnostics.seabed_penetration = bool(penetrates)
+            self.diagnostics.seabed_penetration_max_m = (
+                float(-min_clear) if (min_clear is not None and min_clear < 0.0) else 0.0
+            )
+
+            if penetrates:
+                self.diagnostics.warnings.append(
+                    f"Cable passes through the seabed by up to {(-min_clear):.2f} m within the free span. "
+                    f"The cable would physically rest on this high spot (a multi-span contact this single-span "
+                    f"static model cannot represent); increase tension, reduce slope severity, or refine the "
+                    f"seabed profile. The affected region is highlighted on the plot."
+                )
+
             tan_alpha = abs(math.tan(alpha_final))
             if tan_alpha > 0.4:
                 self.diagnostics.warnings.append(
@@ -1079,6 +1151,31 @@ class CatenarySystemCalculator:
         if refinement_warning:
             warnings.append(refinement_warning)
 
+        # ---- Solution-quality (convergence) evaluation -------------------
+        # The root finders return a best-effort value even when they cannot hit
+        # tolerance, which previously let a non-converged solve render silently
+        # (free-span end not meeting the chute boundary => a visible "gap"). We
+        # judge convergence from the *actual* residuals of the solved curve, so
+        # the verdict is independent of the internal root-finder state.
+        boundary_tol_m = max(0.05, 5.0 * float(ds_effective_m)) if math.isfinite(ds_effective_m) else 0.05
+        input_tol = self._input_residual_tolerance(input_residual_units)
+        boundary_residual_ok = abs(float(boundary_residual_m)) <= boundary_tol_m
+        input_residual_ok = abs(float(input_residual)) <= input_tol
+        converged = bool(boundary_residual_ok and input_residual_ok)
+
+        if not boundary_residual_ok:
+            warnings.append(
+                f"Free-span endpoint does not meet the chute boundary "
+                f"(height residual {boundary_residual_m:+.3f} m > tolerance {boundary_tol_m:.3f} m). "
+                "The plotted curve will not connect cleanly to the chute; treat this result as not converged."
+            )
+        if not input_residual_ok:
+            unit_txt = f" {input_residual_units}" if input_residual_units else ""
+            warnings.append(
+                f"{input_residual_label} is {input_residual:+.4g}{unit_txt}, larger than the "
+                f"convergence tolerance {input_tol:.4g}{unit_txt}; the solver did not match the requested input."
+            )
+
         return SolverDiagnostics(
             input_mode=input_mode,
             ds_requested_m=float(ds_requested_m),
@@ -1095,8 +1192,25 @@ class CatenarySystemCalculator:
             refinement_position_delta_m=refinement_position_delta_m,
             refinement_angle_delta_deg=refinement_angle_delta_deg,
             refinement_top_tension_delta_kN=refinement_top_tension_delta_kN,
+            converged=converged,
+            boundary_residual_ok=boundary_residual_ok,
+            input_residual_ok=input_residual_ok,
+            boundary_residual_tol_m=float(boundary_tol_m),
+            input_residual_tol=float(input_tol),
             warnings=warnings,
         )
+
+    @staticmethod
+    def _input_residual_tolerance(units: str) -> float:
+        """Engineering tolerance used to judge whether the requested input was met."""
+        if units == "m":
+            return 0.5
+        if units == "kN":
+            return 0.5
+        if units == "deg":
+            return 0.25
+        # Unitless / unknown: use a permissive default.
+        return 1.0
 
     def _estimate_refinement_delta(
         self,
@@ -1162,6 +1276,61 @@ class CatenarySystemCalculator:
             )
 
         return warnings
+
+    def _compute_seabed_clearance(self) -> Tuple[Optional[float], bool, Optional[float]]:
+        """Evaluate the vertical gap between the cable and the seabed along the
+        free span and store it on ``self.seabed_clearance_m``.
+
+        Returns ``(min_clearance_m, penetrates, world_x_at_min)`` where a
+        positive clearance means the cable is above the bed. The touchdown
+        point sits on the bed by construction (clearance ~ 0), so only a
+        clearly-negative excursion beyond a small tolerance counts as a
+        penetration. The reported ``world_x_at_min`` is the world-frame x of
+        the deepest penetration, used to migrate the touchdown.
+        """
+        if self.x is None or self.y is None:
+            self.seabed_clearance_m = None
+            self.min_seabed_clearance_m = None
+            self.seabed_penetration = False
+            return None, False, None
+
+        # World x for each sample: chute at x_world=0, TDP at tdp_x_world.
+        x_world = self._tdp_x_world - self.x
+        try:
+            bed_depth = np.array(
+                [float(self.seabed.depth_at(float(xw))) for xw in x_world],
+                dtype=float,
+            )
+        except Exception:
+            self.seabed_clearance_m = None
+            self.min_seabed_clearance_m = None
+            self.seabed_penetration = False
+            return None, False, None
+
+        # clearance = bed_depth + y (y is negative below sea level; bed_depth is
+        # a positive depth). At the TDP y = -bed_depth -> clearance = 0.
+        clearance = bed_depth + np.asarray(self.y, dtype=float)
+        self.seabed_clearance_m = clearance
+
+        # Only the submerged free span matters; points at/above sea level sit on
+        # the chute side and are never "below the bed" in a meaningful sense.
+        ds = float(self.cfg.get("ds_m", 1.0))
+        pen_tol = max(0.15, 2.0 * ds)
+        submerged = np.asarray(self.y, dtype=float) < -1e-6
+        if not np.any(submerged):
+            min_clear = float(np.min(clearance))
+            self.min_seabed_clearance_m = min_clear
+            self.seabed_penetration = False
+            return min_clear, False, None
+
+        clr_sub = np.where(submerged, clearance, np.inf)
+        idx = int(np.argmin(clr_sub))
+        min_clear = float(clr_sub[idx])
+        self.min_seabed_clearance_m = min_clear
+        penetrates = bool(min_clear < -pen_tol)
+        self.seabed_penetration = penetrates
+        world_x_at_min = float(x_world[idx]) if penetrates else None
+        return min_clear, penetrates, world_x_at_min
 
     def _compute_min_radius(self) -> float:
         if self.x is None or self.y is None:

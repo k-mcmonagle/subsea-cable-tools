@@ -394,6 +394,70 @@ def test_bottom_tension_input_is_actual_tension_at_tdp_on_slope():
         )
 
 
+def test_buoyant_component_allows_negative_effective_weight():
+    """A distributed-buoyancy component whose magnitude exceeds the base weight
+    must yield a net-negative effective weight (the cable bows upward), rather
+    than being clamped to a tiny positive floor."""
+    base_q = 10.0
+    # delta_q_water = -15 -> net q = -5 N/m inside the component span.
+    comps = parse_components("Buoy, 50, 20, -15, -15, 0")
+    cfg = _base_config(water_depth_m=50.0, q_water_npm=base_q, q_air_npm=base_q, components=comps)
+    calc = CatenarySystemCalculator(cfg)
+    # Sample inside the buoyant span (s_from_tdp=55) and submerged (y<0).
+    q_inside = calc._q_effective(
+        y=-10.0, s_from_tdp=55.0, S_free=100.0, L_chute_contact=0.0,
+        assembly=[], comps=comps,
+    )
+    assert q_inside < 0.0, f"expected buoyant net-negative q, got {q_inside}"
+    # Outside the span the base weight applies unchanged.
+    q_outside = calc._q_effective(
+        y=-10.0, s_from_tdp=5.0, S_free=100.0, L_chute_contact=0.0,
+        assembly=[], comps=comps,
+    )
+    _assert_close("base weight outside span", q_outside, base_q, 1e-12)
+
+
+def test_clean_flat_solve_reports_converged_and_no_penetration():
+    """A normal flat-seabed solve should report convergence, no seabed
+    penetration, and zero touchdown migration."""
+    cfg = _base_config(seabed=FlatSeabed(100.0), S_guess_m=700.0, ds_m=1.0)
+    calc = CatenarySystemCalculator(cfg)
+    calc.solve()
+    d = calc.diagnostics
+    assert d.converged, f"expected converged solve; warnings={d.warnings}"
+    assert d.boundary_residual_ok and d.input_residual_ok
+    assert not d.seabed_penetration, "flat seabed should never be penetrated"
+    assert d.touchdown_advance_iterations == 0
+    assert d.min_seabed_clearance_m is not None
+    assert d.min_seabed_clearance_m >= -0.5
+
+
+def test_seabed_high_spot_is_detected_as_penetration():
+    """When a shallow ridge sits between the chute and the nominal touchdown,
+    the self-consistent single-span solution dips through the crest. The solver
+    keeps the consistent geometry (touchdown world-x == layback, chute fixed at
+    world-x 0) and *reports* the penetration rather than relocating the
+    touchdown, which would violate the chute boundary condition."""
+    xs = [0.0, 100.0, 250.0, 400.0, 700.0, 2000.0]
+    dep = [120.0, 120.0, 40.0, 120.0, 150.0, 300.0]  # ridge crest (40 m) at x=250
+    seabed = PolylineSeabed(xs, dep, slope_smoothing_m=5.0)
+    cfg = _base_config(seabed=seabed, S_guess_m=700.0, ds_m=1.0)
+    calc = CatenarySystemCalculator(cfg)
+    calc.solve()
+    d = calc.diagnostics
+    # Touchdown is never relocated: the world frame stays self-consistent.
+    assert d.touchdown_advance_iterations == 0
+    assert d.touchdown_advanced_m == 0.0
+    assert calc.tdp_x_world is not None and calc.layback is not None
+    assert abs(float(calc.tdp_x_world) - float(calc.layback)) < 3.0, (
+        f"tdp_x_world={calc.tdp_x_world} should equal layback={calc.layback}"
+    )
+    # The ridge crest is shallower than the free span, so penetration is detected.
+    assert d.seabed_penetration, "expected seabed penetration to be detected"
+    assert d.min_seabed_clearance_m is not None and d.min_seabed_clearance_m < 0.0
+    assert d.seabed_penetration_max_m > 0.0
+
+
 def run_all() -> List[str]:
     failures: List[str] = []
     tests: List[Callable[[], None]] = [
@@ -414,6 +478,9 @@ def run_all() -> List[str]:
         test_tdp_fixed_point_converges_quickly,
         test_steep_slope_emits_sliding_warning,
         test_bottom_tension_input_is_actual_tension_at_tdp_on_slope,
+        test_buoyant_component_allows_negative_effective_weight,
+        test_clean_flat_solve_reports_converged_and_no_penetration,
+        test_seabed_high_spot_is_detected_as_penetration,
     ]
     for test in tests:
         try:
