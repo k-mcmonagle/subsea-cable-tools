@@ -9,7 +9,7 @@ import importlib.util
 
 _plugin_dir = os.path.dirname(__file__)
 _lib_dir = os.path.join(_plugin_dir, 'lib')
-_VENDORED_MODULES = ('openpyxl', 'pyqtgraph', 'et_xmlfile')
+_VENDORED_MODULES = ('openpyxl', 'pyqtgraph', 'et_xmlfile', 'OpenGL')
 if os.path.isdir(_lib_dir) and _lib_dir not in sys.path:
     if any(importlib.util.find_spec(name) is None for name in _VENDORED_MODULES):
         sys.path.insert(0, _lib_dir)

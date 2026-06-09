@@ -34,6 +34,8 @@ from qgis.PyQt.QtWidgets import (
     QWidget,
 )
 
+from ..qgis_compat import SIZE_POLICY_EXPANDING
+
 try:
     import numpy as np
 except Exception:  # pragma: no cover
@@ -82,6 +84,7 @@ class Catenary3DBetaDialog(QDialog):
         self._gl_items = []
         self._last_rows: List[Tuple[str, float, float, float, float, float]] = []
         self._last_body_result = None
+        self._last_penetration = False
 
         self._init_ui()
         self._update_gl_available_state()
@@ -148,7 +151,7 @@ class Catenary3DBetaDialog(QDialog):
 
         display_group = QWidget()
         display_layout = QFormLayout(display_group)
-        self.seabed_depth = self._spin(100.0, 0.0, 1e6, 1, 10.0, " m")
+        self.seabed_depth = self._spin(110.0, 0.0, 1e6, 1, 10.0, " m")
         self.show_seabed_grid = QCheckBox("Show seabed grid")
         self.show_seabed_grid.setChecked(True)
         self.show_sea_surface_grid = QCheckBox("Show sea-surface grid")
@@ -174,9 +177,12 @@ class Catenary3DBetaDialog(QDialog):
         input_layout.addLayout(button_row_2)
 
         note = QLabel(
-            "<i>3D controls: left-drag rotates, wheel zooms, and right/middle drag pans "
-            "in pyqtgraph's OpenGL view. If the view area is replaced by a dependency warning, "
-            "install/enable PyOpenGL in the QGIS Python environment.</i>"
+            "<i>Cable segments drawn in <b style='color:#d11;'>red</b> lie below the seabed plane. "
+            "A single free-span catenary carries no seabed support, so where it dips below the seabed the "
+            "span must be split at a touchdown/seabed support before its tensions or MBR can be trusted.<br>"
+            "3D controls: left-drag rotates, wheel zooms, and right/middle drag pans in pyqtgraph's OpenGL "
+            "view. If the view area is replaced by a dependency warning, install/enable PyOpenGL in the QGIS "
+            "Python environment.</i>"
         )
         note.setWordWrap(True)
         input_layout.addWidget(note)
@@ -191,7 +197,7 @@ class Catenary3DBetaDialog(QDialog):
         viewer_layout.setContentsMargins(0, 0, 0, 0)
         if gl is not None:
             self.gl_view = gl.GLViewWidget()
-            self.gl_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            self.gl_view.setSizePolicy(SIZE_POLICY_EXPANDING, SIZE_POLICY_EXPANDING)
             viewer_layout.addWidget(self.gl_view)
         else:
             self.gl_view = None
@@ -230,7 +236,7 @@ class Catenary3DBetaDialog(QDialog):
 
         self.single_start_x = self._spin(0.0, suffix=" m")
         self.single_start_y = self._spin(0.0, suffix=" m")
-        self.single_start_z = self._spin(-100.0, suffix=" m")
+        self.single_start_z = self._spin(-80.0, suffix=" m")
         self.single_end_x = self._spin(150.0, suffix=" m")
         self.single_end_y = self._spin(0.0, suffix=" m")
         self.single_end_z = self._spin(5.0, suffix=" m")
@@ -274,13 +280,13 @@ class Catenary3DBetaDialog(QDialog):
         self.port_x = self._spin(-45.0, suffix=" m")
         self.port_y = self._spin(85.0, suffix=" m")
         self.port_z = self._spin(-100.0, suffix=" m")
-        self.port_len = self._spin(125.0, 0.001, 1e7, 2, 1.0, " m")
+        self.port_len = self._spin(90.0, 0.001, 1e7, 2, 1.0, " m")
         self.port_q = self._spin(22.0, 0.001, 1e6, 3, 1.0, " N/m")
 
         self.stbd_x = self._spin(45.0, suffix=" m")
         self.stbd_y = self._spin(85.0, suffix=" m")
         self.stbd_z = self._spin(-100.0, suffix=" m")
-        self.stbd_len = self._spin(125.0, 0.001, 1e7, 2, 1.0, " m")
+        self.stbd_len = self._spin(90.0, 0.001, 1e7, 2, 1.0, " m")
         self.stbd_q = self._spin(22.0, 0.001, 1e6, 3, 1.0, " N/m")
 
         form.addRow(QLabel("<b>Body initial guess / load</b>"))
@@ -438,18 +444,31 @@ class Catenary3DBetaDialog(QDialog):
         self._clear_gl()
         self._last_rows = []
 
+        seabed_z = -float(self.seabed_depth.value())
+        any_penetration = False
+
         all_points: List[Point3D] = []
         for span_index, sol in enumerate(spans):
             all_points.extend(sol.points)
-            pos = np.array([p.as_tuple() for p in sol.points], dtype=float)
             colour = self._span_colour(span_index)
-            self._add_gl_item(gl.GLLinePlotItem(pos=pos, color=colour, width=2.0))
+            above_runs, below_runs = self._seabed_split(sol.points, seabed_z)
+            for run in above_runs:
+                if len(run) >= 2:
+                    self._add_gl_item(gl.GLLinePlotItem(pos=run, color=colour, width=2.0))
+            for run in below_runs:
+                if len(run) >= 2:
+                    any_penetration = True
+                    self._add_gl_item(
+                        gl.GLLinePlotItem(pos=run, color=(1.0, 0.18, 0.18, 1.0), width=3.5)
+                    )
 
             for s_val, p, tension in zip(sol.s_m, sol.points, sol.tension_N):
                 self._last_rows.append((sol.name, float(s_val), p.x, p.y, p.z, float(tension) / 1000.0))
 
             self._add_marker(sol.start, size=7, colour=(0.85, 0.85, 0.85, 1.0))
             self._add_marker(sol.end, size=8, colour=colour)
+
+        self._last_penetration = any_penetration
 
         if body_point is not None:
             all_points.append(body_point)
@@ -470,7 +489,9 @@ class Catenary3DBetaDialog(QDialog):
         if self.show_sea_surface_grid.isChecked():
             self._add_grid(z=0.0, size=max(50.0, extent * 1.3), spacing=max(10.0, extent / 8.0))
         if self.show_seabed_grid.isChecked():
-            self._add_grid(z=-float(self.seabed_depth.value()), size=max(50.0, extent * 1.3), spacing=max(10.0, extent / 8.0))
+            grid_size = max(50.0, extent * 1.3)
+            self._add_grid(z=seabed_z, size=grid_size, spacing=max(10.0, extent / 8.0))
+            self._add_seabed_plane(seabed_z, size=grid_size, cx=x_mid, cy=y_mid)
 
         self.reset_view()
 
@@ -518,6 +539,66 @@ class Catenary3DBetaDialog(QDialog):
         except Exception:
             pass
         self._add_gl_item(grid)
+
+    def _seabed_split(self, points, seabed_z):
+        """Split a cable polyline into above- and below-seabed runs.
+
+        Crossing points are interpolated so each run meets the seabed exactly,
+        which lets the below-seabed portion be highlighted distinctly.
+        """
+        runs_above: List["np.ndarray"] = []
+        runs_below: List["np.ndarray"] = []
+        if np is None:
+            return runs_above, runs_below
+        cur: List[Tuple[float, float, float]] = []
+        cur_below: Optional[bool] = None
+        prev: Optional[Point3D] = None
+        for p in points:
+            below = p.z < seabed_z
+            if prev is not None and below != cur_below:
+                dz = p.z - prev.z
+                t = (seabed_z - prev.z) / dz if abs(dz) > 1e-12 else 0.0
+                cross = (
+                    prev.x + t * (p.x - prev.x),
+                    prev.y + t * (p.y - prev.y),
+                    seabed_z,
+                )
+                cur.append(cross)
+                (runs_below if cur_below else runs_above).append(np.array(cur, dtype=float))
+                cur = [cross]
+            cur.append((p.x, p.y, p.z))
+            cur_below = below
+            prev = p
+        if cur:
+            (runs_below if cur_below else runs_above).append(np.array(cur, dtype=float))
+        return runs_above, runs_below
+
+    def _add_seabed_plane(self, z: float, size: float, cx: float, cy: float) -> None:
+        if gl is None or np is None:
+            return
+        h = float(size) / 2.0
+        verts = np.array(
+            [
+                [cx - h, cy - h, z],
+                [cx + h, cy - h, z],
+                [cx + h, cy + h, z],
+                [cx - h, cy + h, z],
+            ],
+            dtype=float,
+        )
+        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=int)
+        try:
+            mesh = gl.MeshData(vertexes=verts, faces=faces)
+            item = gl.GLMeshItem(
+                meshdata=mesh,
+                color=(0.55, 0.42, 0.28, 0.35),
+                smooth=False,
+                drawEdges=False,
+                glOptions="translucent",
+            )
+            self._add_gl_item(item)
+        except Exception:
+            pass
 
     def _add_axes(self, x_mid: float, y_mid: float, z_mid: float, extent: float) -> None:
         if gl is None or np is None:
