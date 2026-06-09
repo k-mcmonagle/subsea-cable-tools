@@ -8,6 +8,7 @@ Plotting uses the bundled pyqtgraph package so the dialog does not depend on mat
 from qgis.PyQt.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox, QPushButton, QTextEdit, QWidget, QFormLayout, QSizePolicy, QFileDialog, QDoubleSpinBox)
 from qgis.PyQt.QtCore import Qt, QSettings
 from .catenary_plot_widget import CatenaryPlotCanvas as FigureCanvas, CatenaryPlotFigure as Figure
+from .simple_catenary import CatenaryCalculator
 from ..qgis_compat import SIZE_POLICY_EXPANDING
 try:
     import numpy as np
@@ -410,108 +411,5 @@ class CatenaryCalculatorDialog(QDialog):
         dxf += '0\nSEQEND\n0\nENDSEC\n0\nEOF\n'
         return dxf
 
-class CatenaryCalculator:
-    def __init__(self, config):
-        self.config = config
-        self.bottomTension = None
-        self.topTension = None
-        self.exitAngle = None
-        self.catenaryLength = None
-        self.xDeck = None
-
-    def calculate(self):
-        q = self.config['weightInWater']
-        totalHeight = self.config['waterDepth']
-        param = self.config['inputParameter']
-        if param == 'Bottom Tension':
-            H = self.config['bottomTension'] * 1000
-            self._from_bottom_tension(H, q, totalHeight)
-        elif param == 'Top Tension':
-            Ts = self.config['topTension'] * 1000
-            self._from_top_tension(Ts, q, totalHeight)
-        elif param == 'Exit Angle':
-            angleRad = math.radians(self.config['exitAngle'])
-            self._from_exit_angle(angleRad, q, totalHeight)
-        elif param == 'Catenary Length':
-            L = self.config['catenaryLength']
-            self._from_catenary_length(L, q, totalHeight)
-        elif param == 'Layback':
-            xDeck = self.config['layback']
-            self._from_layback(xDeck, q, totalHeight)
-        else:
-            raise ValueError('Invalid input parameter')
-
-    def _from_bottom_tension(self, H, q, totalHeight):
-        self.xDeck = (H / q) * math.acosh((q * totalHeight / H) + 1)
-        self.catenaryLength = (H / q) * math.sinh(q * self.xDeck / H)
-        self.exitAngle = math.degrees(math.atan((q * self.catenaryLength) / H))
-        self.topTension = math.sqrt(H ** 2 + (q * self.catenaryLength) ** 2) / 1000
-        self.bottomTension = H / 1000
-
-    def _from_top_tension(self, Ts_N, q, totalHeight):
-        def to_solve(H):
-            xDeck = (H / q) * math.acosh((q * totalHeight / H) + 1)
-            s = (H / q) * math.sinh(q * xDeck / H)
-            return H ** 2 + (q * s) ** 2 - Ts_N ** 2
-        H = self._find_root_bisection(to_solve, 1e-3, Ts_N)
-        self._from_bottom_tension(H, q, totalHeight)
-
-    def _from_exit_angle(self, angleRad, q, totalHeight):
-        cosTheta = math.cos(angleRad)
-        if cosTheta >= 1.0:
-            raise ValueError('Exit angle must be > 0 degrees')
-        if cosTheta <= 0.0:
-            raise ValueError('Exit angle must be < 90 degrees')
-        H = (q * totalHeight * cosTheta) / (1 - cosTheta)
-        self._from_bottom_tension(H, q, totalHeight)
-
-    def _from_catenary_length(self, S, q, totalHeight):
-        if S <= totalHeight:
-            raise ValueError('Catenary length must be > water depth')
-        def xDeck_func(H):
-            return (H / q) * math.acosh((q * totalHeight / H) + 1)
-        def to_solve(H):
-            xDeck = xDeck_func(H)
-            return (H / q) * math.sinh(q * xDeck / H) - S
-        H = self._find_root_bisection(to_solve, 1e-3, q * S)
-        self._from_bottom_tension(H, q, totalHeight)
-
-    def _from_layback(self, xDeck, q, totalHeight):
-        def to_solve(H):
-            return (H / q) * math.acosh((q * totalHeight / H) + 1) - xDeck
-        H = self._find_root_bisection(to_solve, 1e-3, q * totalHeight * 100)
-        self._from_bottom_tension(H, q, totalHeight)
-
-    def _find_root_bisection(self, func, lower, upper, tol=1e-7, max_iter=100):
-        a, b = lower, upper
-        fa, fb = func(a), func(b)
-        if fa * fb > 0:
-            raise ValueError('Function does not change sign over interval')
-        for _ in range(max_iter):
-            c = (a + b) / 2
-            fc = func(c)
-            if abs(fc) < tol or (b - a) / 2 < tol:
-                return c
-            if fa * fc < 0:
-                b, fb = c, fc
-            else:
-                a, fa = c, fc
-        raise ValueError('Root finding did not converge')
-
-    def get_catenary_shape(self, num_points=100):
-        H = self.bottomTension * 1000
-        q = self.config['weightInWater']
-        x = np.linspace(0, self.xDeck, num_points + 1)
-        y = (H / q) * (np.cosh((q * x) / H) - 1)
-        return x, y
-
-    def calculate_minimum_radius(self, x, y):
-        dx = np.gradient(x)
-        dy = np.gradient(y)
-        ddx = np.gradient(dx)
-        ddy = np.gradient(dy)
-        curvature = np.abs(dx * ddy - dy * ddx) / np.power(dx * dx + dy * dy, 1.5)
-        max_curv = np.max(curvature)
-        if max_curv == 0:
-            return float('inf')
-        return 1 / max_curv
+# CatenaryCalculator moved to .simple_catenary (pure calculation core, no Qt).
+# Re-exported here for backwards compatibility with any external imports.

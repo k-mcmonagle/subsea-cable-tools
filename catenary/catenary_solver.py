@@ -86,6 +86,13 @@ class SolverDiagnostics:
     min_seabed_clearance_m: Optional[float] = None
     seabed_penetration: bool = False
     seabed_penetration_max_m: float = 0.0
+    # Unphysical surface piercing (buoyant bight lifted above sea level away
+    # from the chute). The single-span model cannot represent a floating
+    # section; these fields report the violation.
+    surface_piercing: bool = False
+    surface_piercing_span_m: float = 0.0
+    surface_piercing_max_height_m: float = 0.0
+    redundant_buoyancy_kN: float = 0.0
     # Touchdown-advance (penetration resolution) bookkeeping.
     touchdown_advance_iterations: int = 0
     touchdown_advanced_m: float = 0.0
@@ -346,6 +353,15 @@ class CatenarySystemCalculator:
         self._touchdown_advance_iterations: int = 0
         self._touchdown_advanced_m: float = 0.0
 
+        # Surface-piercing state (computed after a solve). The mask is aligned
+        # with ``self.s``/``self.y`` and is True where the cable is above sea
+        # level *other than* the final contiguous run up to the chute.
+        self.surface_piercing_mask: Optional[np.ndarray] = None
+        self.surface_piercing: bool = False
+        self.surface_piercing_span_m: float = 0.0
+        self.surface_piercing_max_height_m: float = 0.0
+        self.redundant_buoyancy_kN: float = 0.0
+
     @staticmethod
     def _unit_to_npm(value: float, unit: str) -> float:
         if unit == "N/m":
@@ -379,12 +395,19 @@ class CatenarySystemCalculator:
                     break
                 d_cursor = d1
 
-            if q_seg is None or q_seg <= 0:
+            if q_seg is None or q_seg == 0:
+                # Blank/zero means "unspecified" -> inherit the fallback cable
+                # weight (back-compatible; a diagnostics warning names these
+                # segments). A *negative* weight is honoured as net buoyancy:
+                # the segment bows the cable upward, matching the behaviour of
+                # negative point loads and legacy distributed components.
                 q_seg = self.cfg["q_water_npm"] if y < 0 else self.cfg["q_air_npm"]
-            # An assembly segment's own weight is expected to be positive; a
-            # non-positive value here means "unspecified", so keep the small
-            # positive floor to avoid a zero-weight straight segment.
-            return max(float(q_seg), 1e-9)
+            q_seg = float(q_seg)
+            # Avoid an exact zero (perfectly straight, force-free segment)
+            # without destroying the sign of buoyant segments.
+            if abs(q_seg) < 1e-9:
+                q_seg = 1e-9
+            return q_seg
 
         base_q = self.cfg["q_water_npm"] if y < 0 else self.cfg["q_air_npm"]
         q = base_q
@@ -403,43 +426,10 @@ class CatenarySystemCalculator:
             q = 1e-9 if base_q >= 0 else -1e-9
         return q
 
-    def _apply_point_loads(
-        self,
-        s_prev: float,
-        s_new: float,
-        V: float,
-        S_free: float,
-        L_chute_contact: float,
-        assembly: List[AssemblyItem],
-        comps: List[Component],
-    ) -> float:
-        if assembly:
-            d_cursor = 0.0
-            for it in assembly:
-                if it.kind == "segment":
-                    d_cursor += max(0.0, it.length_m)
-                    continue
-                if it.kind != "body":
-                    continue
-
-                d_body = d_cursor
-                if d_body < L_chute_contact:
-                    continue
-                if d_body > (L_chute_contact + S_free):
-                    continue
-
-                s_body = S_free - (d_body - L_chute_contact)
-                if s_prev < s_body <= s_new:
-                    V += it.point_load_kN * 1000.0
-            return V
-
-        for c in comps:
-            if not c.is_point:
-                continue
-            sp = c.position_m
-            if s_prev < sp <= s_new:
-                V += c.point_load_kN * 1000.0
-        return V
+    # NOTE: point loads are applied inside ``integrate`` via ``split_events``
+    # (the integrator stops exactly at each load position and adds the load to
+    # V). There is intentionally no separate point-load helper — a second
+    # implementation of load placement would risk drifting from the integrator.
 
     def integrate(self, H_N: float, S_free_m: float, ds: float) -> Tuple[float, float, float, float, float, np.ndarray, np.ndarray, np.ndarray]:
         D = float(self.seabed.depth_at(self._tdp_x_world))
@@ -817,7 +807,14 @@ class CatenarySystemCalculator:
                 self._solve_once()
             return iters
 
-        tdp_iters_used = run_tdp_consistent_solve()
+        try:
+            tdp_iters_used = run_tdp_consistent_solve()
+        finally:
+            # Restore the user's T_TDP input even when the solve raises —
+            # otherwise an infeasible configuration would leave the scaled
+            # H = T·cos(α) in cfg and silently change the next solve's input.
+            if t_bottom_input_N is not None:
+                self.cfg["H_input_N"] = float(t_bottom_input_N)
 
         # ---- Seabed penetration detection --------------------------------
         # On a profiled (polyline) seabed the self-consistent free span can dip
@@ -832,10 +829,6 @@ class CatenarySystemCalculator:
         # planar beds are never penetrated by a tangentially-departing catenary.
         self._touchdown_advance_iterations = 0
         self._touchdown_advanced_m = 0.0
-
-        # Restore the user's T_TDP input in cfg (we scaled it internally to H).
-        if t_bottom_input_N is not None:
-            self.cfg["H_input_N"] = float(t_bottom_input_N)
 
         # Final TDP-related outputs.
         alpha_final = float(self.seabed.slope_at(self._tdp_x_world))
@@ -854,6 +847,9 @@ class CatenarySystemCalculator:
         # Final free-span seabed clearance for the locked-in solution.
         min_clear, penetrates, _ = self._compute_seabed_clearance()
 
+        # Surface-piercing (floating bight) detection for the final solution.
+        self._compute_surface_piercing()
+
         # Record TDP fixed-point and sliding-stability info in diagnostics.
         if self.diagnostics is not None:
             self.diagnostics.tdp_iterations = int(tdp_iters_used)
@@ -869,6 +865,21 @@ class CatenarySystemCalculator:
             self.diagnostics.seabed_penetration_max_m = (
                 float(-min_clear) if (min_clear is not None and min_clear < 0.0) else 0.0
             )
+
+            self.diagnostics.surface_piercing = bool(self.surface_piercing)
+            self.diagnostics.surface_piercing_span_m = float(self.surface_piercing_span_m)
+            self.diagnostics.surface_piercing_max_height_m = float(self.surface_piercing_max_height_m)
+            self.diagnostics.redundant_buoyancy_kN = float(self.redundant_buoyancy_kN)
+            if self.surface_piercing:
+                self.diagnostics.warnings.append(
+                    f"Buoyant section rises above sea level over ~{self.surface_piercing_span_m:.1f} m "
+                    f"(up to {self.surface_piercing_max_height_m:.2f} m above the surface). Physically this "
+                    f"section would float at the surface; estimated redundant (excess) buoyancy is "
+                    f"~{self.redundant_buoyancy_kN:.2f} kN. Tensions and geometry in and beyond the floating "
+                    f"region are NOT physical — reduce buoyancy by about this amount, or treat the system as "
+                    f"a surface-floating arrangement outside this model's scope. The plotted cable is "
+                    f"clamped at the surface over the affected region."
+                )
 
             if penetrates:
                 self.diagnostics.warnings.append(
@@ -1228,6 +1239,12 @@ class CatenarySystemCalculator:
         refined_cfg = dict(self.cfg)
         refined_cfg["chute_contact_len_m"] = float(self.chute_contact_len_m)
         refined_calc = CatenarySystemCalculator(refined_cfg)
+        # Seed the converged TDP world-x so the refined integration samples the
+        # seabed at the same location. Without this, sloped/profiled seabeds
+        # started the half-step check from depth_at(0) (the chute) instead of
+        # depth_at(TDP), reporting a spurious position delta equal to the
+        # depth difference (e.g. ~116 m at 10° slope) on converged solves.
+        refined_calc._tdp_x_world = float(self._tdp_x_world)
         try:
             refined_x, refined_y, _, refined_theta, refined_top_tension, _, _, _ = refined_calc.integrate(
                 H_N,
@@ -1251,6 +1268,53 @@ class CatenarySystemCalculator:
 
         if not assembly:
             warnings.append("No assembly segments are defined; the solver is using internal fallback cable weights.")
+        else:
+            # An assembly segment with non-positive weight means "unspecified" and
+            # silently inherits the fallback cable weight (see _q_effective). Make
+            # that substitution visible when the segment overlaps the free span,
+            # so a user who intended e.g. a neutrally-buoyant section is not
+            # misled. (Net-buoyant sections are only supported via the legacy
+            # distributed components, not assembly segments.)
+            span_lo = self.chute_contact_len_m
+            span_hi = self.chute_contact_len_m + free_span_length_m
+            d_cursor = 0.0
+            flagged: List[str] = []
+            buoyant: List[str] = []
+            air_buoyant: List[str] = []
+            for item in assembly:
+                if item.kind != "segment":
+                    continue
+                d0 = d_cursor
+                d1 = d_cursor + max(0.0, item.length_m)
+                d_cursor = d1
+                if d1 <= span_lo or d0 >= span_hi:
+                    continue
+                if item.q_water_npm == 0 or item.q_air_npm == 0:
+                    flagged.append(item.name or "Segment")
+                if item.q_water_npm < 0:
+                    buoyant.append(item.name or "Segment")
+                if item.q_air_npm < 0:
+                    air_buoyant.append(item.name or "Segment")
+            if flagged:
+                warnings.append(
+                    "Assembly segment(s) with blank/zero weight inside the free span are using "
+                    f"the fallback cable weight instead: {', '.join(flagged)}. Enter explicit "
+                    "weights if this is not intended (enter a negative weight for a net-buoyant "
+                    "segment, or a small value like 0.01 N/m for a neutrally-buoyant one)."
+                )
+            if buoyant:
+                warnings.append(
+                    f"Net-buoyant segment(s) in the free span: {', '.join(buoyant)}. "
+                    "The static model treats buoyancy as a constant distributed upward force; "
+                    "check the surface-piercing and convergence flags, as strongly buoyant "
+                    "systems can have multiple equilibria."
+                )
+            if air_buoyant:
+                warnings.append(
+                    f"Segment(s) with negative in-air weight: {', '.join(air_buoyant)}. "
+                    "A buoyancy module out of the water weighs its dry weight (positive); "
+                    "a negative in-air weight is non-physical and is being integrated as entered."
+                )
 
         point_load_in_span = False
         if assembly:
@@ -1286,7 +1350,8 @@ class CatenarySystemCalculator:
         point sits on the bed by construction (clearance ~ 0), so only a
         clearly-negative excursion beyond a small tolerance counts as a
         penetration. The reported ``world_x_at_min`` is the world-frame x of
-        the deepest penetration, used to migrate the touchdown.
+        the deepest penetration (reported to the caller for plotting; the
+        touchdown itself is never relocated — see ``solve``).
         """
         if self.x is None or self.y is None:
             self.seabed_clearance_m = None
@@ -1331,6 +1396,100 @@ class CatenarySystemCalculator:
         self.seabed_penetration = penetrates
         world_x_at_min = float(x_world[idx]) if penetrates else None
         return min_clear, penetrates, world_x_at_min
+
+    def _compute_surface_piercing(self) -> None:
+        """Detect the cable rising above sea level anywhere other than the
+        final contiguous run up to the chute.
+
+        A cable hanging off the chute legitimately leaves the water near the
+        vessel, so above-surface samples in the final run ending at the chute
+        are allowed. Any *other* above-surface region is a buoyant bight the
+        static single-span model lifted clear of the water — physically that
+        section would float at the surface, with part of its buoyancy unused
+        ("redundant"). We report the violation and estimate the redundant
+        buoyancy as the integral of the net upward distributed force plus any
+        upward point loads over the piercing region.
+        """
+        self.surface_piercing_mask = None
+        self.surface_piercing = False
+        self.surface_piercing_span_m = 0.0
+        self.surface_piercing_max_height_m = 0.0
+        self.redundant_buoyancy_kN = 0.0
+
+        if self.y is None or self.s is None or len(self.y) < 2:
+            return
+
+        y = np.asarray(self.y, dtype=float)
+        s = np.asarray(self.s, dtype=float)
+        tol = 1e-3  # metres above the surface counted as "above"
+        above = y > tol
+        if not np.any(above):
+            return
+
+        # Exempt the final contiguous run that ends at the chute sample.
+        allowed = np.zeros_like(above)
+        if above[-1]:
+            i = len(above) - 1
+            while i >= 0 and above[i]:
+                allowed[i] = True
+                i -= 1
+        piercing = above & ~allowed
+        self.surface_piercing_mask = piercing
+        if not np.any(piercing):
+            return
+
+        self.surface_piercing = True
+        self.surface_piercing_max_height_m = float(np.max(y[piercing]))
+
+        # Arc length of the piercing region and redundant buoyancy estimate.
+        S_free = float(self.free_span_len_m or (s[-1] if len(s) else 0.0))
+        Lc = float(self.chute_contact_len_m or 0.0)
+        assembly = self.cfg.get("assembly", [])
+        comps = self.cfg.get("components", [])
+
+        span_m = 0.0
+        redundant_N = 0.0
+        for i in range(1, len(s)):
+            if not (piercing[i] or piercing[i - 1]):
+                continue
+            ds_i = float(s[i] - s[i - 1])
+            span_m += ds_i
+            s_mid = 0.5 * float(s[i] + s[i - 1])
+            # Floating cable sits essentially at the waterline, mostly
+            # submerged -> use the in-water weight (y < 0) for the estimate.
+            q = self._q_effective(-1e-6, s_mid, S_free, Lc, assembly, comps)
+            if q < 0.0:
+                redundant_N += -q * ds_i
+
+        # Upward point loads inside the piercing region.
+        def _point_loads_in_region():
+            events = []
+            if assembly:
+                d_cursor = 0.0
+                for it in assembly:
+                    if it.kind == "segment":
+                        d_cursor += max(0.0, it.length_m)
+                        continue
+                    if it.kind != "body":
+                        continue
+                    if Lc <= d_cursor <= (Lc + S_free):
+                        events.append((S_free - (d_cursor - Lc), it.point_load_kN))
+            else:
+                for c in comps:
+                    if c.is_point:
+                        events.append((float(c.position_m), float(c.point_load_kN)))
+            return events
+
+        for s_pt, load_kN in _point_loads_in_region():
+            if load_kN >= 0:
+                continue
+            idx = int(np.searchsorted(s, s_pt))
+            idx = max(0, min(len(piercing) - 1, idx))
+            if piercing[idx]:
+                redundant_N += -load_kN * 1000.0
+
+        self.surface_piercing_span_m = float(span_m)
+        self.redundant_buoyancy_kN = float(redundant_N / 1000.0)
 
     def _compute_min_radius(self) -> float:
         if self.x is None or self.y is None:

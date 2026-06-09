@@ -131,6 +131,9 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self._fallback_q_air_npm = self._DEFAULT_Q_AIR_NPM
         self._syncing_assembly_json = False
         self._last_plot_x_reference = None
+        # Last multi-span drape result, as (calc, DrapeResult); cleared on
+        # every new single-span solve so the overlay never goes stale.
+        self._last_drape = None
         self._crosshair_cid = None
         self._plot_click_cid = None
         self._crosshair_vline = None
@@ -791,6 +794,78 @@ class CatenaryCalculatorV2Dialog(QDialog):
         kp_layout.addRow("KP at Top of Chute:", self.kp_top)
         kp_layout.addRow("KP direction:", self.kp_direction)
 
+        # --- Multi-Span Drape Check & Query ---
+        drape_header, drape_widget, drape_layout = self._create_collapsible_section(
+            "Drape Check && Query", "section_drape_expanded"
+        )
+        input_layout.addRow(drape_header)
+        input_layout.addRow(drape_widget)
+
+        self.drape_mu = QDoubleSpinBox()
+        self.drape_mu.setRange(0.0, 1.5)
+        self.drape_mu.setDecimals(2)
+        self.drape_mu.setSingleStep(0.05)
+        self.drape_mu.setValue(0.3)
+        self.drape_mu.setToolTip(
+            "Coulomb friction coefficient cable/seabed. Typical: 0.2–0.4 sand/clay, "
+            "0.4–0.6 rock. Friction equilibria are lay-history dependent — treat as bounds."
+        )
+        drape_layout.addRow("Seabed friction μ:", self.drape_mu)
+
+        self.drape_extra_len = QDoubleSpinBox()
+        self.drape_extra_len.setRange(10.0, 100000.0)
+        self.drape_extra_len.setDecimals(0)
+        self.drape_extra_len.setValue(200.0)
+        self.drape_extra_len.setSuffix(" m")
+        self.drape_extra_len.setToolTip(
+            "Additional cable length lying on the bed beyond the single-span touchdown, "
+            "included in the drape model."
+        )
+        drape_layout.addRow("On-bed length beyond TDP:", self.drape_extra_len)
+
+        self.drape_anchor_mode = QComboBox()
+        self.drape_anchor_mode.addItems(["Anchored at far end", "Free end (requires friction)"])
+        self.drape_anchor_mode.setToolTip(
+            "Anchored: the far end is fixed on the bed (cable continues / is held). "
+            "Free: the cable simply ends; only valid with friction > 0."
+        )
+        drape_layout.addRow("End condition:", self.drape_anchor_mode)
+
+        self.run_drape_btn = QPushButton("Run Drape Check")
+        self.run_drape_btn.setToolTip(
+            "Solve the full multi-span static drape over the seabed profile "
+            "(lumped-node relaxation; handles contact on high spots, free spans, friction). "
+            "Takes a few seconds."
+        )
+        drape_layout.addRow(self.run_drape_btn)
+
+        self.drape_report = QTextEdit()
+        self.drape_report.setReadOnly(True)
+        self.drape_report.setMaximumHeight(170)
+        self.drape_report.setPlaceholderText(
+            "Run the drape check to report free spans, contact regions and tensions."
+        )
+        drape_layout.addRow(self.drape_report)
+
+        query_row = QHBoxLayout()
+        self.query_s = QDoubleSpinBox()
+        self.query_s.setRange(0.0, 1e6)
+        self.query_s.setDecimals(1)
+        self.query_s.setSuffix(" m")
+        self.query_s.setToolTip(
+            "Arc length along the cable measured from the chute departure point "
+            "(top of the free span)."
+        )
+        self.query_btn = QPushButton("Query")
+        query_row.addWidget(self.query_s)
+        query_row.addWidget(self.query_btn)
+        drape_layout.addRow("Query at s from chute:", query_row)
+
+        self.query_result = QLabel("")
+        self.query_result.setWordWrap(True)
+        self.query_result.setTextFormat(Qt.TextFormat.RichText)
+        drape_layout.addRow(self.query_result)
+
         note = QLabel(
             "<i>"
             "Notes:<br>"
@@ -887,6 +962,8 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.assembly_table.cellDoubleClicked.connect(self._on_assembly_table_cell_double_clicked)
         self.asm_add_seg_btn.clicked.connect(self._on_asm_add_segment)
         self.asm_add_body_btn.clicked.connect(self._on_asm_add_body)
+        self.run_drape_btn.clicked.connect(self._on_run_drape_check)
+        self.query_btn.clicked.connect(self._on_query_point)
         self.asm_del_btn.clicked.connect(self._on_asm_delete)
         self.asm_up_btn.clicked.connect(self._on_asm_move_up)
         self.asm_down_btn.clicked.connect(self._on_asm_move_down)
@@ -1065,6 +1142,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             calc = CatenarySystemCalculator(cfg)
             calc.solve()
             self._last_calc = calc
+            self._last_drape = None  # invalidate any previous drape overlay
             self.solver_diagnostics_btn.setEnabled(True)
 
             # Update displayed "calculated" fields (soft sync)
@@ -1209,6 +1287,17 @@ class CatenaryCalculatorV2Dialog(QDialog):
                     "seabed profile. The affected region is marked in red on the plot."
                     "</div>"
                 )
+            if bool(getattr(diag, "surface_piercing", False)):
+                red_kN = float(getattr(diag, "redundant_buoyancy_kN", 0.0) or 0.0)
+                span_m = float(getattr(diag, "surface_piercing_span_m", 0.0) or 0.0)
+                banner_txt += (
+                    '<div style="background:#8a5a00;color:#fff;padding:6px;border-radius:4px;margin-top:4px;">'
+                    f"<b>⚠ Buoyant section reaches the sea surface</b> over ~{span_m:.1f} m. Physically this "
+                    f"section floats at the surface; estimated <b>redundant buoyancy ≈ {red_kN:.2f} kN</b>. "
+                    "Tensions/geometry in and beyond the floating region are not physical. The plotted cable "
+                    "is clamped at the surface (orange) over the affected region."
+                    "</div>"
+                )
             if banner_txt:
                 banner_txt += "<br>"
 
@@ -1314,6 +1403,15 @@ class CatenaryCalculatorV2Dialog(QDialog):
         else:
             seabed_txt = '<span style="color:#2e7d32;">Clear of seabed</span>'
 
+        if bool(getattr(diagnostics, "surface_piercing", False)):
+            surface_txt = (
+                '<span style="color:#b26a00;"><b>Floating section detected</b> over '
+                f"~{float(getattr(diagnostics, 'surface_piercing_span_m', 0.0) or 0.0):.1f} m; "
+                f"redundant buoyancy ≈ {float(getattr(diagnostics, 'redundant_buoyancy_kN', 0.0) or 0.0):.2f} kN</span>"
+            )
+        else:
+            surface_txt = '<span style="color:#2e7d32;">None</span>'
+
         return (
             "<h2>Solver diagnostics</h2>"
             "<p>These values are for checking numerical quality of the current catenary result. "
@@ -1328,6 +1426,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             f"<tr><td><b>Convergence</b></td><td>{convergence_txt}</td></tr>"
             f"<tr><td><b>Seabed interaction</b></td><td>{seabed_txt}</td></tr>"
             f"<tr><td><b>Min seabed clearance (free span)</b></td><td>{self._format_diag_value(getattr(diagnostics, 'min_seabed_clearance_m', None), 'm')}</td></tr>"
+            f"<tr><td><b>Surface piercing</b></td><td>{surface_txt}</td></tr>"
             f"<tr><td><b>Integration step</b></td><td>requested {self._format_diag_value(diagnostics.ds_requested_m, 'm')}; "
             f"effective {self._format_diag_value(diagnostics.ds_effective_m, 'm')} over {diagnostics.integration_steps} steps</td></tr>"
             f"<tr><td><b>Free-span length</b></td><td>{self._format_diag_value(diagnostics.free_span_length_m, 'm')}</td></tr>"
@@ -1432,8 +1531,276 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 xs = [float(r[0]) for r in rows]
                 ds = [float(r[1]) for r in rows]
                 return PolylineSeabed(x_world_m=xs, depth_m=ds)
-            # Insufficient profile data → silently fall back to flat at default depth.
+            # Refuse to compute with a seabed other than what the UI claims:
+            # silently falling back to a flat bed here could mask a profile
+            # that failed to load and produce misleading results.
+            raise ValueError(
+                "Seabed mode is 'Profile' but fewer than two valid profile rows are "
+                "defined. Add at least two (distance from chute [m], depth [m]) rows, "
+                "or switch Seabed mode back to 'Flat'."
+            )
         return FlatSeabed(float(default_depth))
+
+    # ---- Multi-span drape check & query
+
+    def _drape_q_water_array(self, calc: CatenarySystemCalculator, n_seg: int, total_len: float) -> "np.ndarray":
+        """Per-segment submerged weight (N/m) ordered from the chute departure
+        point downward, mirroring the single-span solver's assembly mapping
+        (blank/zero -> fallback weight; negative honoured as buoyancy)."""
+        Lc = float(getattr(calc, "chute_contact_len_m", 0.0) or 0.0)
+        S_free = float(calc.free_span_len_m or total_len)
+        assembly: List[AssemblyItem] = calc.cfg.get("assembly", []) or []
+        comps: List[Component] = calc.cfg.get("components", []) or []
+        q_fallback = float(calc.cfg.get("q_water_npm", 0.0))
+
+        seg_bounds: List[Tuple[float, float, float]] = []  # (d0, d1, q)
+        d_cursor = 0.0
+        for it in assembly:
+            if it.kind != "segment":
+                continue
+            d0, d1 = d_cursor, d_cursor + max(0.0, it.length_m)
+            seg_bounds.append((d0, d1, float(it.q_water_npm)))
+            d_cursor = d1
+
+        out = np.full(n_seg, q_fallback)
+        ds = total_len / n_seg
+        for i in range(n_seg):
+            s_top = (i + 0.5) * ds                  # arc from chute departure
+            d_from_top = Lc + s_top                 # assembly distance from chute top
+            q = None
+            for d0, d1, qv in seg_bounds:
+                if d0 <= d_from_top <= d1:
+                    q = qv
+                    break
+            if q is None or q == 0:
+                q = q_fallback
+            if not assembly and comps:
+                s_from_tdp = S_free - s_top         # negative on the bed tail
+                for c in comps:
+                    if c.length_m > 0 and c.position_m <= s_from_tdp <= c.position_m + c.length_m:
+                        q += float(c.delta_q_water_npm)
+            out[i] = q
+        return out
+
+    def _drape_point_loads(self, calc: CatenarySystemCalculator) -> List[Tuple[float, float]]:
+        """Point loads as (s_from_chute_departure_m, load_kN)."""
+        Lc = float(getattr(calc, "chute_contact_len_m", 0.0) or 0.0)
+        S_free = float(calc.free_span_len_m or 0.0)
+        loads: List[Tuple[float, float]] = []
+        assembly: List[AssemblyItem] = calc.cfg.get("assembly", []) or []
+        if assembly:
+            d_cursor = 0.0
+            for it in assembly:
+                if it.kind == "segment":
+                    d_cursor += max(0.0, it.length_m)
+                    continue
+                if it.kind != "body" or abs(it.point_load_kN) < 1e-12:
+                    continue
+                s_top = d_cursor - Lc
+                if s_top >= 0.0:
+                    loads.append((float(s_top), float(it.point_load_kN)))
+        else:
+            for c in calc.cfg.get("components", []) or []:
+                if c.is_point:
+                    s_top = S_free - float(c.position_m)
+                    if s_top >= 0.0:
+                        loads.append((float(s_top), float(c.point_load_kN)))
+        return loads
+
+    def _on_run_drape_check(self):
+        calc = self._last_calc
+        if calc is None or calc.x is None or calc.y is None:
+            self.drape_report.setHtml('<span style="color:red;">Solve the catenary first.</span>')
+            return
+        try:
+            from .drape_solver import solve_drape
+        except Exception as exc:
+            self.drape_report.setHtml(f'<span style="color:red;">Drape solver unavailable: {exc}</span>')
+            return
+
+        mu = float(self.drape_mu.value())
+        extra = float(self.drape_extra_len.value())
+        anchored = self.drape_anchor_mode.currentIndex() == 0
+        if not anchored and mu <= 0.0:
+            self.drape_report.setHtml(
+                '<span style="color:red;">A free end requires friction &gt; 0 '
+                "(a frictionless bed cannot hold bottom tension).</span>"
+            )
+            return
+
+        seabed = calc.seabed
+        tdp_x = float(calc.tdp_x_world or calc.layback or 0.0)
+        S_free = float(calc.free_span_len_m or 0.0)
+        total_len = S_free + extra
+
+        # Top end: chute departure point in world frame.
+        top_x_world = tdp_x - float(calc.x[-1])
+        top_y = float(calc.y[-1])
+
+        # Anchor on the bed beyond the single-span TDP.
+        try:
+            alpha = float(seabed.slope_at(tdp_x))
+        except Exception:
+            alpha = 0.0
+        anchor_x = tdp_x + extra * max(0.2, math.cos(alpha)) * 0.98
+        anchor = (anchor_x, -float(seabed.depth_at(anchor_x))) if anchored else None
+
+        # Warm start from the single-span solution plus a bed tail.
+        xw = tdp_x - np.asarray(calc.x, dtype=float)
+        init_x = xw[::-1].copy()
+        init_y = np.asarray(calc.y, dtype=float)[::-1].copy()
+        n_tail = max(8, int(extra / 10.0))
+        tail_x = np.linspace(tdp_x, anchor_x if anchored else tdp_x + extra, n_tail + 1)[1:]
+        tail_y = np.array([-float(seabed.depth_at(float(tx))) for tx in tail_x])
+        init_x = np.concatenate([init_x, tail_x])
+        init_y = np.concatenate([init_y, tail_y])
+
+        n_nodes = int(min(500, max(250, total_len / 2.0)))
+        t_scale = float((calc.top_tension_kN or 10.0) * 1000.0)
+
+        self.drape_report.setHtml("Running drape relaxation…")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            res = solve_drape(
+                seabed,
+                top_xy=(top_x_world, top_y),
+                cable_length_m=total_len,
+                q_water_npm=self._drape_q_water_array(calc, n_nodes, total_len),
+                q_air_npm=float(calc.cfg.get("q_air_npm", 0.0)),
+                point_loads=self._drape_point_loads(calc),
+                mu=mu,
+                bottom_anchor_xy=anchor,
+                n_nodes=n_nodes,
+                tension_scale_N=t_scale,
+                initial_shape=(init_x, init_y),
+            )
+        except Exception as exc:
+            self.drape_report.setHtml(f'<span style="color:red;">Drape check failed: {exc}</span>')
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        self._last_drape = (calc, res)
+        self._render_drape_report(res, mu, anchored)
+        try:
+            self._plot(calc)
+        except Exception:
+            pass
+
+    def _render_drape_report(self, res, mu: float, anchored: bool):
+        from html import escape as _esc
+
+        status = (
+            '<span style="color:#2e7d32;"><b>converged</b></span>'
+            if res.converged
+            else f'<span style="color:#c62828;"><b>NOT converged</b> (residual {res.residual_ratio:.1e})</span>'
+        )
+        rows = ""
+        for k, sp in enumerate(res.spans):
+            kind = "Hang (chute→1st contact)" if k == 0 and sp.s_start_m < 1e-6 else "Free span"
+            min_r = "∞" if (not math.isfinite(sp.min_radius_m) or sp.min_radius_m > 1e6) else f"{sp.min_radius_m:.0f}"
+            rows += (
+                f"<tr><td>{kind}</td><td>{sp.s_start_m:.0f}–{sp.s_end_m:.0f}</td>"
+                f"<td>{sp.length_m:.0f}</td><td>{sp.max_clearance_m:.1f}</td>"
+                f"<td>{min_r}</td><td>{sp.max_tension_kN:.1f}</td></tr>"
+            )
+        warn_html = "".join(f"<li>{_esc(str(w))}</li>" for w in res.warnings)
+        end_lbl = "Anchor tension" if anchored else "Free-end tension"
+        self.drape_report.setHtml(
+            f"<b>Drape check</b> — {status}; μ={mu:.2f}; "
+            f"max bed penetration {res.max_penetration_m * 1000:.0f} mm; {res.iterations} iterations.<br>"
+            f"Top tension {res.top_tension_kN:.1f} kN at {res.top_angle_deg:.1f}° below horizontal; "
+            f"{end_lbl} {res.end_tension_kN:.2f} kN.<br>"
+            "<table border='1' cellspacing='0' cellpadding='2'>"
+            "<tr><th>Region</th><th>s from chute (m)</th><th>Length (m)</th>"
+            "<th>Max clearance (m)</th><th>Min radius (m)</th><th>Max T (kN)</th></tr>"
+            f"{rows}</table>"
+            "<i>The drape check holds the chute departure point and total cable length fixed "
+            "and lets the cable rest on the seabed wherever it makes contact — tensions are "
+            "redistributed by the contact and will generally differ from the single-span "
+            "solve. Friction equilibria depend on lay history; treat them as indicative.</i>"
+            + (f"<ul>{warn_html}</ul>" if warn_html else "")
+        )
+
+    def _on_query_point(self):
+        s_q = float(self.query_s.value())
+        drape = self._last_drape
+        calc = self._last_calc
+        if drape is not None and drape[0] is calc:
+            _, res = drape
+            if s_q > float(res.s[-1]):
+                self.query_result.setText(
+                    f"<span style='color:red;'>s = {s_q:.1f} m is beyond the drape model "
+                    f"({res.s[-1]:.1f} m).</span>"
+                )
+                return
+            T = res.tension_at_s(s_q)
+            r = res.radius_at_s(s_q)
+            if r > 1e6:
+                r = float("inf")
+            xq = float(np.interp(s_q, res.s, res.x))
+            yq = float(np.interp(s_q, res.s, res.y))
+            clr = float(np.interp(s_q, res.s, res.clearance_m))
+            idx = int(np.argmin(np.abs(res.s - s_q)))
+            contact = bool(res.contact[idx])
+            r_txt = "∞" if not math.isfinite(r) else f"{r:.0f} m"
+            self.query_result.setText(
+                f"<b>Drape @ s={s_q:.1f} m from chute:</b> "
+                f"T = {T:.2f} kN; bend radius ≈ {r_txt}; depth = {-yq:.1f} m; "
+                f"seabed clearance = {clr:.2f} m; "
+                f"{'<b>on seabed</b>' if contact else 'suspended'} "
+                f"(world x = {xq:.1f} m from chute)."
+            )
+            return
+
+        if calc is None or calc.s is None:
+            self.query_result.setText("<span style='color:red;'>Solve the catenary first.</span>")
+            return
+        # Single-span solution: s measured from TDP internally.
+        S_free = float(calc.s[-1])
+        s_from_tdp = S_free - s_q
+        if s_from_tdp < 0.0 or s_q < 0.0:
+            self.query_result.setText(
+                f"<span style='color:red;'>s = {s_q:.1f} m is beyond the free span "
+                f"({S_free:.1f} m). Run the drape check to query the on-bed section.</span>"
+            )
+            return
+        T = float(np.interp(s_from_tdp, calc.s, calc.tension_kN))
+        yq = float(np.interp(s_from_tdp, calc.s, calc.y))
+        xq_int = float(np.interp(s_from_tdp, calc.s, calc.x))
+        clr_arr = getattr(calc, "seabed_clearance_m", None)
+        clr_txt = (
+            f"{float(np.interp(s_from_tdp, calc.s, clr_arr)):.2f} m"
+            if clr_arr is not None
+            else "n/a"
+        )
+        # Local bend radius from the curve samples.
+        idx = int(np.argmin(np.abs(np.asarray(calc.s) - s_from_tdp)))
+        r = self._three_point_radius_from_arrays(np.asarray(calc.x), np.asarray(calc.y), idx)
+        r_txt = "∞" if (not math.isfinite(r) or r > 1e6) else f"{r:.0f} m"
+        V = float(np.interp(s_from_tdp, calc.s, calc.vertical_force_N)) if calc.vertical_force_N is not None else 0.0
+        ang = math.degrees(math.atan2(V, float(calc.H_N or 1.0)))
+        self.query_result.setText(
+            f"<b>Catenary @ s={s_q:.1f} m from chute departure:</b> "
+            f"T = {T:.2f} kN; angle = {ang:.1f}° from horizontal; bend radius ≈ {r_txt}; "
+            f"depth = {-yq:.1f} m; seabed clearance = {clr_txt} "
+            f"(layback from chute = {float(calc.x[-1]) - xq_int:.1f} m)."
+        )
+
+    @staticmethod
+    def _three_point_radius_from_arrays(x: "np.ndarray", y: "np.ndarray", i: int) -> float:
+        if i <= 0 or i >= len(x) - 1:
+            return float("inf")
+        ax, ay = float(x[i - 1]), float(y[i - 1])
+        bx, by = float(x[i]), float(y[i])
+        cx, cy = float(x[i + 1]), float(y[i + 1])
+        a = math.hypot(bx - ax, by - ay)
+        b = math.hypot(cx - bx, cy - by)
+        c = math.hypot(cx - ax, cy - ay)
+        area2 = abs((bx - ax) * (cy - ay) - (by - ay) * (cx - ax))
+        if area2 < 1e-12:
+            return float("inf")
+        return float(a * b * c / (2.0 * area2))
 
     def _on_seabed_profile_add_row(self) -> None:
         try:
@@ -1942,9 +2309,15 @@ class CatenaryCalculatorV2Dialog(QDialog):
             except Exception:
                 layback_plot = None
 
+        # Keep the hover readout consistent with the surface-clamped display.
+        hover_depth = np.array(-calc.y, dtype=float)
+        _pm = getattr(calc, "surface_piercing_mask", None)
+        if _pm is not None and np.any(_pm):
+            hover_depth = np.where(np.asarray(_pm, dtype=bool), 0.0, hover_depth)
+
         self._hover_cache = {
             "curve_x": np.array(calc.x - x_origin_offset, dtype=float),
-            "curve_depth": np.array(-calc.y, dtype=float),
+            "curve_depth": hover_depth,
             "curve_s": np.array(calc.s, dtype=float),
             "curve_tension_kN": np.array(calc.tension_kN, dtype=float) if calc.tension_kN is not None else None,
             "curve_horizontal_from_top_m": float(calc.layback) - np.array(calc.x, dtype=float) if calc.layback is not None else None,
@@ -2094,6 +2467,18 @@ class CatenaryCalculatorV2Dialog(QDialog):
         # Convert to depth for plotting (depth positive down)
         depth = -y
 
+        # Clamp the *displayed* cable at the sea surface across any detected
+        # floating (surface-piercing) region. The underlying solution is not
+        # altered — it is flagged non-physical in the diagnostics — but a
+        # buoyant bight drawn arcing through the air would be misleading:
+        # physically that section floats at the surface.
+        pierce_mask = getattr(calc, "surface_piercing_mask", None)
+        if pierce_mask is not None and np.any(pierce_mask):
+            pierce_mask = np.asarray(pierce_mask, dtype=bool)
+            depth = np.where(pierce_mask, 0.0, depth)
+        else:
+            pierce_mask = None
+
         D = self.water_depth.value()
         c = self.chute_exit_height.value()
         R = self.chute_radius.value()
@@ -2152,6 +2537,38 @@ class CatenaryCalculatorV2Dialog(QDialog):
             ax.plot([], [], color=colors[0] if colors else "k", linewidth=2, label="Cable (by segment)")
         else:
             ax.plot(x, depth, label="Cable", linewidth=2)
+
+        # Multi-span drape overlay (if a drape check was run for this solve).
+        drape = getattr(self, "_last_drape", None)
+        if drape is not None and drape[0] is calc:
+            try:
+                _, dres = drape
+                tdp_x = float(calc.tdp_x_world or calc.layback or 0.0)
+                dx_plot = (tdp_x - np.asarray(dres.x, dtype=float)) - x_origin_offset
+                dd_plot = -np.asarray(dres.y, dtype=float)
+                ax.plot(
+                    dx_plot,
+                    dd_plot,
+                    linestyle="--",
+                    linewidth=2,
+                    color="#9c27b0",
+                    zorder=7,
+                    label="Drape check (multi-span)",
+                )
+            except Exception:
+                pass
+
+        # Mark the clamped floating region distinctly at the surface.
+        if pierce_mask is not None:
+            ax.plot(
+                x[pierce_mask],
+                np.zeros(int(np.sum(pierce_mask))),
+                linewidth=5,
+                alpha=0.6,
+                color="#ff9800",
+                zorder=5,
+                label="Floating at surface (excess buoyancy)",
+            )
 
         # Sea level and seabed
         ax.axhline(0, linewidth=2, label="Sea Level")
@@ -2247,6 +2664,11 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 # Interpolate x,y at s_body
                 xb = float(np.interp(s_body, s, calc.x)) - x_origin_offset
                 yb = float(np.interp(s_body, s, calc.y))
+                # Clamp bodies in a detected floating region to the surface,
+                # matching the clamped cable line.
+                if pierce_mask is not None:
+                    if float(np.interp(s_body, s, pierce_mask.astype(float))) > 0.5:
+                        yb = min(yb, 0.0)
                 body_points.append((xb, -yb, body_color))
 
             if body_points:

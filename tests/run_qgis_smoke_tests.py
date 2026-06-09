@@ -24,6 +24,27 @@ def _require_qgis() -> None:
         ) from exc
 
 
+_QGS_APP = None
+
+
+def _init_qgis() -> None:
+    """Initialise a headless QgsApplication when run standalone.
+
+    Without ``initQgis()`` the ellipsoid/CRS registry is empty, so
+    ``QgsDistanceArea.setEllipsoid('WGS84')`` silently fails and every
+    "ellipsoidal" measurement degrades to planar units. That made the
+    distance tests fail spuriously (and would mask real regressions).
+    Inside a running QGIS the application already exists; do nothing then.
+    """
+    global _QGS_APP
+    from qgis.core import QgsApplication
+
+    if QgsApplication.instance() is not None:
+        return
+    _QGS_APP = QgsApplication([], False)
+    _QGS_APP.initQgis()
+
+
 def _register_plugin_package() -> None:
     if PACKAGE_NAME in sys.modules:
         return
@@ -75,11 +96,16 @@ def _plugin_imports() -> bool:
 
 def main() -> int:
     _require_qgis()
+    _init_qgis()
     _register_plugin_package()
 
     checks = [
         ("distance round trip", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_distance_round_trip")),
         ("KP geo utilities", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_kp_geo_utils")),
+        ("catenary solver (V2)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_catenary_solver")),
+        ("simple catenary (V1)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_simple_catenary")),
+        ("drape solver (multi-span)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_drape_solver")),
+        ("seabed length algorithm", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_seabed_length")),
         ("processing provider", _provider_loads),
         ("main plugin import", _plugin_imports),
     ]

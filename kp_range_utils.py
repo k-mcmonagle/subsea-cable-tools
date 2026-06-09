@@ -66,8 +66,16 @@ def make_distance_area(
     if mode == "ellipsoidal":
         if project is None:
             project = QgsProject.instance()
-        ellipsoid = (project.ellipsoid() if project is not None else "") or "WGS84"
-        distance_area.setEllipsoid(ellipsoid)
+        ellipsoid = (project.ellipsoid() if project is not None else "") or ""
+        # QgsProject normalises an unset ellipsoid to the literal sentinel
+        # "NONE" (planar measurements). Honouring that here would silently
+        # return planar units — degrees on a geographic CRS, i.e. wrong KPs —
+        # so ellipsoidal mode falls back to WGS84 as documented. Planar
+        # measurement remains available via the explicit cartesian mode.
+        if not ellipsoid or ellipsoid.strip().upper() == "NONE":
+            ellipsoid = "WGS84"
+        if not distance_area.setEllipsoid(ellipsoid):
+            distance_area.setEllipsoid("WGS84")
     # In cartesian mode we deliberately leave the ellipsoid unset so
     # measurements stay planar in the source CRS units.
 

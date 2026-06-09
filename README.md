@@ -22,7 +22,7 @@ Available in the Processing Toolbox under **Subsea Cable Tools**, grouped into:
 - **KP Mouse Tool** â€“ live KP/DCC under the cursor; ellipsoidal or cartesian distance modes; geodesic range ring; "Go to KPâ€¦".
 - **KP Data Plotter** â€“ dockable plot of KP-based table data against a route, with crosshair, marker and per-field axis assignment.
 - **Depth Profile** â€“ dockable profile from MBES raster(s) or contours along a route or temporary line; depth/slope plots with adaptive sampling.
-- **Catenary Calculator** (legacy) and **Catenary Calculator V2** (multi-segment).
+- **Catenary Calculator** (legacy) and **Catenary Calculator V2** (multi-segment). Both are 2D static single-span models — see [catenary/MODEL_NOTES.md](catenary/MODEL_NOTES.md) for the precise assumptions, validity envelope, and what they must not be used for (no dynamics, current drag, 3D routing or multi-span contact).
 - **Transit Measure Tool** â€“ cumulative geodesic distance along a drawn path with transit-time output and an optional Quick Buffer.
 
 ### Distance & CRS methodology
@@ -37,6 +37,22 @@ Available in the Processing Toolbox under **Subsea Cable Tools**, grouped into:
 The plugin vendors `openpyxl`, `pyqtgraph` and `et_xmlfile` under `lib/`, added to `sys.path` only when missing from the host QGIS Python. End users do not need to install pip packages for typical workflows; plugin plotting tools use the vendored `pyqtgraph` backend.
 
 The MDB import additionally requires Windows + the Microsoft Access Database Engine ODBC driver and `pyodbc` available to the QGIS Python.
+
+---
+
+### Testing
+
+Run the full check suite (calculation cores, distance/KP utilities, an
+end-to-end seabed-length check, provider registration) from a QGIS Python:
+
+```
+"C:\...\OSGeo4W\bin\python-qgis.bat" tests\run_qgis_smoke_tests.py
+```
+
+The runner boots a headless `QgsApplication` when needed and works under both
+QGIS 3.22+ (Qt5) and QGIS 4.x (Qt6). The pure calculation suites
+(`tests/test_catenary_solver.py`, `tests/test_simple_catenary.py`) also run on
+any plain Python (NumPy required for the V2 solver).
 
 ---
 

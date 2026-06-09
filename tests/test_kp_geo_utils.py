@@ -391,21 +391,50 @@ def test_geodesic_interpolation_long_geographic_segment() -> bool:
 
 
 def test_geodesic_interpolation_projected_unchanged() -> bool:
-    """On a projected metre CRS, interpolation must remain exact-planar."""
+    """On a projected metre CRS, interpolation must stay in the segment's
+    plane (no spheroid forward-projection) and be KP-consistent.
+
+    With a *cartesian* distance area the planar midpoint is exact. With an
+    *ellipsoidal* distance area the point at KP 0.5 sits where the true
+    (ellipsoidal) along-track distance is 500 m — at the UTM central
+    meridian (scale factor 0.9996) that is planar x ≈ 500499.8, not 500500.
+    The KP-consistency invariant is measureLine(start, pt) == 500 m.
+    """
 
     # 1000 m east-west line in EPSG:32631 (UTM 31N, metres).
     geom = QgsGeometry.fromWkt("LINESTRING(500000 4649776, 501000 4649776)")
-    da = _da_proj(32631)
-    pt = point_at_kp(geom, 0.5, da)
-    ok = (
-        pt is not None
-        and abs(pt.x() - 500500.0) < 1e-6
-        and abs(pt.y() - 4649776.0) < 1e-6
+
+    # Cartesian: exact planar midpoint.
+    da_cart = make_distance_area(
+        QgsCoordinateReferenceSystem("EPSG:32631"),
+        QgsCoordinateTransformContext(),
+        mode="cartesian",
     )
+    pt_cart = point_at_kp(geom, 0.5, da_cart)
+    ok_cart = (
+        pt_cart is not None
+        and abs(pt_cart.x() - 500500.0) < 1e-6
+        and abs(pt_cart.y() - 4649776.0) < 1e-6
+    )
+
+    # Ellipsoidal: point stays on the segment and true distance to it is 500 m.
+    da_ell = _da_proj(32631)
+    pt_ell = point_at_kp(geom, 0.5, da_ell)
+    if pt_ell is None:
+        return _result("projected-CRS planar interpolation unchanged", False, "None")
+    dist_to_pt = float(da_ell.measureLine(QgsPointXY(500000, 4649776), pt_ell))
+    ok_ell = (
+        abs(pt_ell.y() - 4649776.0) < 1e-6
+        and abs(dist_to_pt - 500.0) < 0.05
+        and 500000.0 < pt_ell.x() < 501000.0
+    )
+
+    ok = ok_cart and ok_ell
     return _result(
         "projected-CRS planar interpolation unchanged",
         ok,
-        f"pt={pt and (pt.x(), pt.y())}",
+        f"cart={pt_cart and (pt_cart.x(), pt_cart.y())} "
+        f"ell={(pt_ell.x(), pt_ell.y())} ell_dist={dist_to_pt:.3f} m",
     )
 
 

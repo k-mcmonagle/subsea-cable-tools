@@ -25,6 +25,7 @@ if lib_dir not in sys.path:
 
 from qgis.PyQt.QtCore import QCoreApplication
 from ..kp_range_utils import make_distance_area
+from ..kp_geo_utils import extract_line_segment
 from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
@@ -227,18 +228,6 @@ class SeabedLengthAlgorithm(QgsProcessingAlgorithm):
                 routes[route_id] = []
             routes[route_id].append(feature)
 
-        # Prepare output fields
-        fields = QgsFields()
-        fields.append(QgsField('route_id', FIELD_TYPE_STRING))
-        fields.append(QgsField('plan_length_m', FIELD_TYPE_DOUBLE))
-        fields.append(QgsField('seabed_length_m', FIELD_TYPE_DOUBLE))
-        fields.append(QgsField('elongation_ratio', FIELD_TYPE_DOUBLE))
-        fields.append(QgsField('sampling_interval_m', FIELD_TYPE_INT))
-        if do_sensitivity:
-            fields.append(QgsField('sensitivity_results', FIELD_TYPE_STRING))
-
-        (sink, dest_id) = self.parameterAsSink(parameters, self.OUTPUT, context, fields, QgsWkbTypes.NoGeometry, line_layer.crs())
-
         total_routes = len(routes)
         for route_idx, (route_id, features) in enumerate(routes.items()):
             if feedback.isCanceled():
@@ -276,7 +265,8 @@ class SeabedLengthAlgorithm(QgsProcessingAlgorithm):
             valid_count = len(valid_depths)
             
             if valid_count == 0:
-                feedback.pushWarning(f"Route '{route_id}': No bathymetry coverage. Seabed length equals plan length.")
+                feedback.pushWarning(f"Route '{route_id}': No bathymetry coverage. Seabed length falls back to plan (2D) length.")
+                seabed_length = plan_length
             elif valid_count < total_samples:
                 coverage_ratio = valid_count / total_samples
                 feedback.pushWarning(f"Route '{route_id}': Partial bathymetry coverage ({coverage_ratio*100:.1f}% valid). Seabed length calculated only for covered segments.")
@@ -427,52 +417,18 @@ class SeabedLengthAlgorithm(QgsProcessingAlgorithm):
         return seabed_length, sampled_points
 
     def _extract_segment(self, geom, start_dist, end_dist, distance_area):
-        """Extract a segment of the geometry between start_dist and end_dist using straight line approximation."""
+        """Extract the route segment between two along-route distances (m).
+
+        Uses the shared linear-referencing primitive so the returned geometry
+        follows the actual route. The previous implementation joined the two
+        endpoints with a straight chord, which under-reported the segment plan
+        length and sampled bathymetry off-route on curved routes.
+        """
         if start_dist >= end_dist:
             return None
-        
-        # Get points at start and end distances
-        start_point = self._interpolate_point_along_line_geom(geom, start_dist, distance_area)
-        end_point = self._interpolate_point_along_line_geom(geom, end_dist, distance_area)
-        
-        if not start_point or not end_point:
-            return None
-        
-        # Create a line segment
-        return QgsGeometry.fromPolylineXY([start_point, end_point])
-
-    def _interpolate_point_along_line_geom(self, geom, distance, distance_area):
-        """Interpolate a point along the geometry at given distance."""
-        total_length = distance_area.measureLength(geom)
-        if distance > total_length:
-            return None
-        
-        # For simplicity, assume single linestring
-        line = geom.constGet()
-        if isinstance(line, QgsLineString):
-            points = [QgsPointXY(pt.x(), pt.y()) for pt in line.points()]
-        else:
-            # Handle multi-part geometries
-            points = []
-            for part in line:
-                points.extend([QgsPointXY(pt.x(), pt.y()) for pt in part.points()])
-        
-        cumulative_dist = 0.0
-        for i in range(len(points) - 1):
-            p0 = points[i]
-            p1 = points[i+1]
-            seg_dist = distance_area.measureLine(p0, p1)
-            
-            if cumulative_dist + seg_dist >= distance:
-                remaining = distance - cumulative_dist
-                ratio = remaining / seg_dist if seg_dist > 0 else 0
-                x = p0.x() + ratio * (p1.x() - p0.x())
-                y = p0.y() + ratio * (p1.y() - p0.y())
-                return QgsPointXY(x, y)
-            
-            cumulative_dist += seg_dist
-        
-        return points[-1] if points else None
+        return extract_line_segment(
+            geom, start_dist / 1000.0, end_dist / 1000.0, distance_area
+        )
 
     def _get_first_point(self, geom):
         """Get the first point of the geometry."""

@@ -458,6 +458,142 @@ def test_seabed_high_spot_is_detected_as_penetration():
     assert d.seabed_penetration_max_m > 0.0
 
 
+def test_zero_weight_assembly_segment_warns_about_fallback():
+    """An assembly segment with blank/zero weight silently inherits the
+    fallback cable weight; the diagnostics must surface that substitution."""
+    assembly = [
+        AssemblyItem("segment", "Unspecified", 500.0, 0.0, 0.0, 0.0),
+    ]
+    cfg = _base_config(assembly=assembly)
+    calc = CatenarySystemCalculator(cfg)
+    calc.solve()
+    assert any(
+        "fallback cable weight" in w and "Unspecified" in w
+        for w in calc.diagnostics.warnings
+    ), f"expected fallback-weight warning; got: {calc.diagnostics.warnings}"
+
+
+def test_buoyant_assembly_segment_reduces_vertical_force():
+    """A negative assembly-segment weight must act as distributed buoyancy.
+    Regression: q_seg <= 0 used to be silently replaced by the fallback cable
+    weight, so buoyant segments had no effect. V_end must equal the exact
+    signed integral of q over the span."""
+    assembly = [
+        AssemblyItem("segment", "Upper", 40.0, 10.0, 10.0, 0.0),
+        AssemblyItem("segment", "Buoy", 20.0, -6.0, -6.0, 0.0),
+        AssemblyItem("segment", "Lower", 1000.0, 10.0, 10.0, 0.0),
+    ]
+    cfg = _base_config(water_depth_m=20.0, q_water_npm=10.0, q_air_npm=10.0, assembly=assembly)
+    calc = CatenarySystemCalculator(cfg)
+    _, _, vertical_force, _, _, s_arr, _, _ = calc.integrate(H_N=10_000.0, S_free_m=100.0, ds=0.5)
+    # s from TDP: Lower occupies [0,40], Buoy [40,60], Upper [60,100].
+    expected = 40.0 * 10.0 + 20.0 * (-6.0) + 40.0 * 10.0
+    _assert_close("V_end with buoyant segment", vertical_force, expected, 1e-9)
+    # V must actually *decrease* across the buoyant arc.
+    assert calc.vertical_force_N is not None
+    v = calc.vertical_force_N
+    i40 = int(round(40.0 / 0.5))
+    i60 = int(round(60.0 / 0.5))
+    assert v[i60] < v[i40], f"V should fall across the buoyant arc: V(40)={v[i40]}, V(60)={v[i60]}"
+
+
+def test_buoyant_assembly_segment_full_solve_warns_and_converges():
+    """A full solve with a buoyant assembly segment must converge and emit the
+    net-buoyancy advisory."""
+    assembly = [
+        AssemblyItem("segment", "Top", 80.0, 22.0, 28.0, 0.0),
+        AssemblyItem("segment", "Buoy", 30.0, -10.0, 5.0, 0.0),
+        AssemblyItem("segment", "Main", 2000.0, 22.0, 28.0, 0.0),
+    ]
+    cfg = _base_config(assembly=assembly)
+    calc = CatenarySystemCalculator(cfg)
+    calc.solve()
+    assert calc.diagnostics.converged, f"warnings={calc.diagnostics.warnings}"
+    assert any("Net-buoyant" in w for w in calc.diagnostics.warnings)
+    # Zero/blank weights still inherit fallback and still warn.
+    assert not any("fallback cable weight" in w for w in calc.diagnostics.warnings)
+
+
+def test_surface_piercing_detected_with_redundant_buoyancy():
+    """A strongly buoyant arc near the surface lifts a bight above sea level
+    in the unconstrained static solution. The solver must flag it, exempt the
+    legitimate final run up to the chute, and estimate the redundant buoyancy
+    as ~|net upward q| x piercing arc length."""
+    comps = parse_components("Buoy, 100, 60, -80, -80, 0")
+    cfg = _base_config(
+        water_depth_m=30.0,
+        chute_exit_height_m=5.0,
+        ds_m=0.25,
+        q_water_npm=10.0,
+        q_air_npm=12.0,
+        components=comps,
+        H_input_N=1500.0,
+        H_guess_N=1500.0,
+        S_guess_m=150.0,
+    )
+    calc = CatenarySystemCalculator(cfg)
+    calc.solve()
+    d = calc.diagnostics
+    assert d.surface_piercing, "expected surface piercing to be detected"
+    assert d.surface_piercing_span_m > 1.0
+    assert d.surface_piercing_max_height_m > 0.0
+    # net upward q in the buoyant arc = 80 - 10 = 70 N/m.
+    expected_kN = 70.0 * d.surface_piercing_span_m / 1000.0
+    _assert_close("redundant buoyancy", d.redundant_buoyancy_kN, expected_kN, 0.15 * expected_kN)
+    assert any("float at the surface" in w for w in d.warnings)
+    # The mask must not flag the final run up to the chute (which is above water).
+    assert calc.surface_piercing_mask is not None
+    assert not calc.surface_piercing_mask[-1], "chute-side run must be exempt"
+
+
+def test_normal_solve_does_not_flag_surface_piercing():
+    """A standard catenary with the chute above water leaves the surface once
+    near the vessel; that run must NOT be flagged as piercing."""
+    cfg = _base_config(chute_exit_height_m=5.0)
+    calc = CatenarySystemCalculator(cfg)
+    calc.solve()
+    assert not calc.diagnostics.surface_piercing
+    assert calc.y[-1] > 0.0, "sanity: cable does end above the surface"
+
+
+def test_refinement_delta_is_small_on_sloped_seabed():
+    """Regression: the half-step refinement check must seed the converged TDP
+    world-x. Previously it started from x=0 (the chute), so on a sloped seabed
+    a fully converged solve reported a spurious position delta equal to the
+    depth difference between chute and TDP (~116 m at 10 deg)."""
+    seabed = PlanarSlopeSeabed(depth_at_chute_m=100.0, slope_deg=10.0)
+    cfg = _base_config(seabed=seabed, S_guess_m=900.0, ds_m=0.5)
+    calc = CatenarySystemCalculator(cfg)
+    calc.solve()
+    d = calc.diagnostics
+    assert d.refinement_position_delta_m is not None
+    assert d.refinement_position_delta_m < 0.05, (
+        f"refinement delta {d.refinement_position_delta_m:.3f} m is spuriously large"
+    )
+
+
+def test_failed_solve_restores_bottom_tension_input():
+    """Regression: an infeasible Bottom Tension solve on a sloped seabed must
+    not leave the internally-scaled H = T*cos(alpha) in cfg."""
+    seabed = PlanarSlopeSeabed(depth_at_chute_m=100.0, slope_deg=20.0)
+    T_in = 50_000.0
+    cfg = _base_config(
+        seabed=seabed,
+        H_input_N=T_in,
+        H_guess_N=T_in,
+        S_guess_m=900.0,
+        # Force failure: free span cannot reach an impossible chute height
+        # with a tiny step budget.
+        max_integration_steps=10,
+    )
+    calc = CatenarySystemCalculator(cfg)
+    try:
+        calc.solve()
+    except Exception:
+        pass
+    _assert_close("H_input_N restored after failure", cfg["H_input_N"], T_in, 1e-9)
+
+
 def run_all() -> List[str]:
     failures: List[str] = []
     tests: List[Callable[[], None]] = [
@@ -481,6 +617,13 @@ def run_all() -> List[str]:
         test_buoyant_component_allows_negative_effective_weight,
         test_clean_flat_solve_reports_converged_and_no_penetration,
         test_seabed_high_spot_is_detected_as_penetration,
+        test_zero_weight_assembly_segment_warns_about_fallback,
+        test_buoyant_assembly_segment_reduces_vertical_force,
+        test_buoyant_assembly_segment_full_solve_warns_and_converges,
+        test_surface_piercing_detected_with_redundant_buoyancy,
+        test_normal_solve_does_not_flag_surface_piercing,
+        test_refinement_delta_is_small_on_sloped_seabed,
+        test_failed_solve_restores_bottom_tension_input,
     ]
     for test in tests:
         try:

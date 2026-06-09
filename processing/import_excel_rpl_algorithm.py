@@ -646,10 +646,21 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
             try:
                 deg = abs(float(deg_val))
                 mins = abs(float(min_val))
-            except:
+            except (TypeError, ValueError):
+                return None
+            # Validate: minutes must be < 60, hemisphere must be N/S, and the
+            # result must be a physically possible latitude. Anything else is
+            # treated as an invalid row rather than imported as silent garbage
+            # (e.g. transposed lat/lon columns or an E/W hemisphere mapping).
+            hemi = str(hemi_val).strip().upper()
+            if not (hemi.startswith('N') or hemi.startswith('S')):
+                return None
+            if mins >= 60.0:
                 return None
             lat = deg + (mins / 60.0)
-            if str(hemi_val).strip().upper().startswith('S'):
+            if lat > 90.0:
+                return None
+            if hemi.startswith('S'):
                 lat = -lat
             return lat
 
@@ -664,10 +675,19 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
             try:
                 deg = abs(float(deg_val))
                 mins = abs(float(min_val))
-            except:
+            except (TypeError, ValueError):
+                return None
+            # Validate: minutes must be < 60, hemisphere must be E/W, and the
+            # result must be a physically possible longitude (see parse_lat).
+            hemi = str(hemi_val).strip().upper()
+            if not (hemi.startswith('E') or hemi.startswith('W')):
+                return None
+            if mins >= 60.0:
                 return None
             lon = deg + (mins / 60.0)
-            if str(hemi_val).strip().upper().startswith('W'):
+            if lon > 180.0:
+                return None
+            if hemi.startswith('W'):
                 lon = -lon
             return lon
         
