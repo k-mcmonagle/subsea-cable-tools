@@ -194,7 +194,7 @@ path = os.path.split(__file__)[0]
 # Dynamic imports are disabled. This causes too many problems.
 #importAll('graphicsItems', globals(), locals())
 #importAll('widgets', globals(), locals(),
-          #excludes=['MatplotlibWidget', 'RawImageWidget', 'RemoteGraphicsView'])
+          #excludes=['MatplotlibWidget', 'RawImageWidget'])
 
 ## Attempts to work around exit crashes:
 import atexit
@@ -280,7 +280,6 @@ from .widgets.PathButton import *
 from .widgets.PlotWidget import *
 from .widgets.ProgressDialog import *
 from .widgets.RawImageWidget import *
-from .widgets.RemoteGraphicsView import RemoteGraphicsView
 from .widgets.ScatterPlotWidget import *
 from .widgets.SpinBox import *
 from .widgets.TableWidget import *
@@ -414,40 +413,16 @@ show = image  ## for backward compatibility
 
 def dbg(*args, **kwds):
     """
-    Create a console window and begin watching for exceptions.
-
-    All arguments are passed to :func:`ConsoleWidget.__init__() <pyqtgraph.console.ConsoleWidget.__init__>`.
+    Console helpers are not bundled with the QGIS plugin runtime.
     """
-    mkQApp()
-    from . import console
-    c = console.ConsoleWidget(*args, **kwds)
-    c.catchAllExceptions()
-    c.show()
-    global consoles
-    try:
-        consoles.append(c)
-    except NameError:
-        consoles = [c]
-    return c
+    raise RuntimeError("pyqtgraph console helpers are not included in this plugin bundle.")
 
 
 def stack(*args, **kwds):
     """
-    Create a console window and show the current stack trace.
-
-    All arguments are passed to :func:`ConsoleWidget.__init__() <pyqtgraph.console.ConsoleWidget.__init__>`.
+    Console helpers are not bundled with the QGIS plugin runtime.
     """
-    mkQApp()
-    from . import console
-    c = console.ConsoleWidget(*args, **kwds)
-    c.setStack()
-    c.show()
-    global consoles
-    try:
-        consoles.append(c)
-    except NameError:
-        consoles = [c]
-    return c
+    raise RuntimeError("pyqtgraph console helpers are not included in this plugin bundle.")
 
 
 def setPalette(app, style):

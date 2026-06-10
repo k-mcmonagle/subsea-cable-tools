@@ -9,9 +9,9 @@ new methods for slicing and indexing the array based on this meta data.
 More info at http://www.scipy.org/Cookbook/MetaArray
 """
 
+import ast
 import copy
 import os
-import pickle
 import warnings
 
 import numpy as np
@@ -721,7 +721,7 @@ class MetaArray(object):
             if line == '':
                 break
             meta += line
-        ret = eval(meta)
+        ret = ast.literal_eval(meta)
         #print ret
         return ret
     
@@ -772,7 +772,7 @@ class MetaArray(object):
             if meta['type'] == 'object':
                 if mmap:
                     raise Exception('memmap not supported for arrays with dtype=object')
-                subarr = pickle.loads(fd.read())
+                raise ValueError('Refusing to load pickled object MetaArray data.')
             else:
                 if mmap:
                     subarr = np.memmap(fd, dtype=meta['type'], mode='r', shape=meta['shape'])
@@ -800,12 +800,12 @@ class MetaArray(object):
                     break
                     
                 ## evaluate line
-                inf = eval(line)
+                inf = ast.literal_eval(line)
                 
                 ## read data block
                 #print "read %d bytes as %s" % (inf['len'], meta['type'])
                 if meta['type'] == 'object':
-                    data = pickle.loads(fd.read(inf['len']))
+                    raise ValueError('Refusing to load pickled object MetaArray data.')
                 else:
                     data = np.frombuffer(fd.read(inf['len']), dtype=meta['type'])
                 
@@ -892,21 +892,7 @@ class MetaArray(object):
     def _readHDF5Remote(self, fileName):
         ## Used to read HDF5 files via remote process.
         ## This is needed in the case that HDF5 is not importable due to the use of python-dbg.
-        proc = getattr(MetaArray, '_hdf5Process', None)
-        
-        if proc == False:
-            raise Exception('remote read failed')
-        if proc is None:
-            from .. import multiprocess as mp
-
-            #print "new process"
-            proc = mp.Process(executable='/usr/bin/python')
-            proc.setProxyOptions(deferGetattr=True)
-            MetaArray._hdf5Process = proc
-            MetaArray._h5py_metaarray = proc._import('pyqtgraph.metaarray')
-        ma = MetaArray._h5py_metaarray.MetaArray(file=fileName)
-        self._data = ma.asarray()._getValue()
-        self._info = ma._info._getValue()
+        raise RuntimeError('Remote HDF5 loading is not included in this plugin bundle.')
 
     @staticmethod
     def mapHDF5Array(data, writable=False):
@@ -930,7 +916,7 @@ class MetaArray(object):
                 val = val.decode()
             if isinstance(val, str):  ## strings need to be re-evaluated to their original types
                 try:
-                    val = eval(val)
+                    val = ast.literal_eval(val)
                 except:
                     raise Exception('Can not evaluate string: "%s"' % val)
             data[k] = val
@@ -1166,7 +1152,7 @@ class MetaArray(object):
         if self.dtype != object:
             dataStr = self.view(np.ndarray).tostring()
         else:
-            dataStr = pickle.dumps(self.view(np.ndarray))
+            raise ValueError('Refusing to write pickled object MetaArray data.')
         #print self.size, len(dataStr), self.dtype
         if appendAxis is not None:
             frameInfo = {'len':len(dataStr), 'numFrames':self.shape[appendAxis]}

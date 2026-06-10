@@ -34,6 +34,37 @@ except Exception:
 ACCESS_ODBC_DRIVER_NAME = "Microsoft Access Driver (*.mdb, *.accdb)"
 
 
+def _odbc_braced_value(value):
+    return "{" + os.fspath(value).replace("}", "}}") + "}"
+
+
+def _access_connection_string(mdb_path):
+    return (
+        "Driver="
+        + _odbc_braced_value(ACCESS_ODBC_DRIVER_NAME)
+        + ";DBQ="
+        + _odbc_braced_value(mdb_path)
+        + ";"
+    )
+
+
+def _quote_access_identifier(identifier):
+    text = str(identifier)
+    if not text:
+        raise ValueError("Access identifier is empty")
+    if any(ch in text for ch in "[]"):
+        raise ValueError(f"Access identifier contains brackets: {text!r}")
+    if any(ord(ch) < 32 for ch in text):
+        raise ValueError(f"Access identifier contains control characters: {text!r}")
+    return "[" + text + "]"
+
+
+def _get_column_names(cursor, table_name):
+    sql = "SELECT * FROM " + _quote_access_identifier(table_name) + " WHERE 1=0"  # nosec B608
+    cursor.execute(sql)
+    return [desc[0] for desc in cursor.description]
+
+
 def parse_blob(blob):
     if blob is None:
         return None
@@ -106,7 +137,7 @@ def _require_pyodbc_and_driver():
 
 def _connect(mdb_path, timeout_seconds=10):
     _require_pyodbc_and_driver()
-    conn_str = rf"Driver={{{ACCESS_ODBC_DRIVER_NAME}}};DBQ={mdb_path};"
+    conn_str = _access_connection_string(mdb_path)
     return pyodbc.connect(conn_str, timeout=timeout_seconds)
 
 
@@ -125,8 +156,7 @@ def list_feature_tables(mdb_path):
         if not gfeatures_table:
             return out
 
-        cur.execute(f"SELECT * FROM [{gfeatures_table}] WHERE 1=0")
-        col_names = [desc[0] for desc in cur.description]
+        col_names = _get_column_names(cur, gfeatures_table)
         if not col_names:
             return out
 
@@ -149,10 +179,17 @@ def list_feature_tables(mdb_path):
             return out
 
         sql = (
-            f"SELECT [{feature_name_col}], [{geom_field_col}], [{geom_type_col}] "
-            f"FROM [{gfeatures_table}] "
-            f"WHERE [{geom_type_col}] <> 33"
-        )
+            "SELECT "
+            + ", ".join(
+                _quote_access_identifier(col)
+                for col in (feature_name_col, geom_field_col, geom_type_col)
+            )
+            + " FROM "
+            + _quote_access_identifier(gfeatures_table)
+            + " WHERE "
+            + _quote_access_identifier(geom_type_col)
+            + " <> 33"
+        )  # nosec B608
         cur.execute(sql)
         for row in cur.fetchall():
             table_name, geom_field, geometry_type = row
@@ -220,7 +257,13 @@ def export_table_to_geojson(mdb_path, table_name, geom_field_name, geometry_type
     """
     with _connect(mdb_path) as conn:
         cur = conn.cursor()
-        sql = f"SELECT * FROM [{table_name}] WHERE [{geom_field_name}] IS NOT NULL"
+        sql = (
+            "SELECT * FROM "
+            + _quote_access_identifier(table_name)
+            + " WHERE "
+            + _quote_access_identifier(geom_field_name)
+            + " IS NOT NULL"
+        )  # nosec B608
         cur.execute(sql)
         col_names = [desc[0] for desc in cur.description]
         if not col_names or geom_field_name not in col_names:

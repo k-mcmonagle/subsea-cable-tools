@@ -15,6 +15,7 @@ import json
 import tempfile
 import subprocess
 import sys
+import hashlib
 try:
     import pyodbc
 except Exception:  # pragma: no cover
@@ -39,6 +40,47 @@ from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_STRING, 
 
 
 ACCESS_ODBC_DRIVER_NAME = "Microsoft Access Driver (*.mdb, *.accdb)"
+
+
+def _odbc_braced_value(value):
+    """Return an ODBC connection string value enclosed in braces."""
+    return "{" + os.fspath(value).replace("}", "}}") + "}"
+
+
+def _access_connection_string(mdb_file):
+    return (
+        "Driver="
+        + _odbc_braced_value(ACCESS_ODBC_DRIVER_NAME)
+        + ";DBQ="
+        + _odbc_braced_value(mdb_file)
+        + ";"
+    )
+
+
+def _quote_access_identifier(identifier):
+    """Return a bracket-quoted Access identifier after rejecting unsafe names."""
+    text = str(identifier)
+    if not text:
+        raise ValueError("Access identifier is empty")
+    if any(ch in text for ch in "[]"):
+        raise ValueError(f"Access identifier contains brackets: {text!r}")
+    if any(ord(ch) < 32 for ch in text):
+        raise ValueError(f"Access identifier contains control characters: {text!r}")
+    return "[" + text + "]"
+
+
+def _get_column_names(cursor, table_name):
+    sql = "SELECT * FROM " + _quote_access_identifier(table_name) + " WHERE 1=0"  # nosec B608
+    cursor.execute(sql)
+    return [desc[0] for desc in cursor.description]
+
+
+def _safe_temp_stem(name):
+    text = str(name)
+    cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in text)
+    cleaned = cleaned.strip("._") or "table"
+    digest = hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:10]
+    return f"{cleaned[:80]}_{digest}"
 
 
 def _require_access_odbc_driver(feedback=None):
@@ -72,7 +114,7 @@ def _require_access_odbc_driver(feedback=None):
 def _test_mdb_connection(mdb_file, feedback=None, timeout_seconds=5):
     """Attempt a short ODBC connect. This catches missing drivers, bitness mismatches, and corrupt DB early."""
     _require_access_odbc_driver(feedback)
-    conn_str = rf"Driver={{{ACCESS_ODBC_DRIVER_NAME}}};DBQ={mdb_file};"
+    conn_str = _access_connection_string(mdb_file)
     try:
         conn = pyodbc.connect(conn_str, timeout=timeout_seconds)
         try:
@@ -186,7 +228,7 @@ def get_feature_tables(mdb_file, feedback):
         feedback.reportError(str(e))
         return {}
     feature_tables = {}
-    conn_str = rf"Driver={{{ACCESS_ODBC_DRIVER_NAME}}};DBQ={mdb_file};"
+    conn_str = _access_connection_string(mdb_file)
     try:
         with pyodbc.connect(conn_str) as conn:
             cursor = conn.cursor()
@@ -203,8 +245,7 @@ def get_feature_tables(mdb_file, feedback):
                 feedback.reportError("GFeatures table not found in MDB.")
                 return {}
 
-            cursor.execute(f"SELECT * FROM [{gfeatures_table}] WHERE 1=0")
-            col_names = [desc[0] for desc in cursor.description]
+            col_names = _get_column_names(cursor, gfeatures_table)
             feedback.pushInfo(f"Columns in {gfeatures_table}: {col_names}")
 
             # Prefer a named feature column; do not assume the first column is the feature name.
@@ -227,11 +268,18 @@ def get_feature_tables(mdb_file, feedback):
                 feedback.reportError("Required columns (PRIMARYGEOMETRYFIELDNAME, GEOMETRYTYPE) not found in GFeatures table.")
                 return {}
 
-            sql = f"""
-                SELECT [{feature_name_col}], [{geom_field_col}], [{geom_type_col}]
-                FROM [{gfeatures_table}]
-                WHERE [{geom_type_col}] <> 33
-            """
+            sql = (
+                "SELECT "
+                + ", ".join(
+                    _quote_access_identifier(col)
+                    for col in (feature_name_col, geom_field_col, geom_type_col)
+                )
+                + " FROM "
+                + _quote_access_identifier(gfeatures_table)
+                + " WHERE "
+                + _quote_access_identifier(geom_type_col)
+                + " <> 33"
+            )  # nosec B608
             feedback.pushInfo(f"Executing SQL: {sql}")
             cursor.execute(sql)
 
@@ -258,7 +306,7 @@ def get_attribute_fields(mdb_file, table_name, feedback):
         feedback.reportError(str(e))
         return {}
     attribute_fields = {}
-    conn_str = rf"Driver={{{ACCESS_ODBC_DRIVER_NAME}}};DBQ={mdb_file};"
+    conn_str = _access_connection_string(mdb_file)
     try:
         with pyodbc.connect(conn_str) as conn:
             cursor = conn.cursor()
@@ -277,11 +325,9 @@ def get_attribute_fields(mdb_file, table_name, feedback):
                 feedback.reportError("FieldLookup or AttributeProperties table not found.")
                 return {}
 
-            cursor.execute(f"SELECT * FROM [{fieldlookup_table}] WHERE 1=0")
-            fl_col_names = [desc[0] for desc in cursor.description]
+            fl_col_names = _get_column_names(cursor, fieldlookup_table)
             feedback.pushInfo(f"Columns in {fieldlookup_table}: {fl_col_names}")
-            cursor.execute(f"SELECT * FROM [{attributeprop_table}] WHERE 1=0")
-            ap_col_names = [desc[0] for desc in cursor.description]
+            ap_col_names = _get_column_names(cursor, attributeprop_table)
             feedback.pushInfo(f"Columns in {attributeprop_table}: {ap_col_names}")
 
             fieldname_col = None
@@ -307,12 +353,23 @@ def get_attribute_fields(mdb_file, table_name, feedback):
                 feedback.reportError("Required columns not found in metadata tables. Check column names in FieldLookup and AttributeProperties.")
                 return {}
 
-            sql = f"""
-                SELECT [fl].[{fieldname_col}], [ap].[{fieldtype_col}]
-                FROM [{fieldlookup_table}] fl
-                INNER JOIN [{attributeprop_table}] ap ON [fl].[{indid_col_fl}] = [ap].[{indid_col_ap}]
-                WHERE [fl].[{featurename_col}] = ?
-            """
+            sql = (
+                "SELECT fl."
+                + _quote_access_identifier(fieldname_col)
+                + ", ap."
+                + _quote_access_identifier(fieldtype_col)
+                + " FROM "
+                + _quote_access_identifier(fieldlookup_table)
+                + " AS fl INNER JOIN "
+                + _quote_access_identifier(attributeprop_table)
+                + " AS ap ON fl."
+                + _quote_access_identifier(indid_col_fl)
+                + " = ap."
+                + _quote_access_identifier(indid_col_ap)
+                + " WHERE fl."
+                + _quote_access_identifier(featurename_col)
+                + " = ?"
+            )  # nosec B608
             feedback.pushInfo(f"Executing SQL: {sql}")
             cursor.execute(sql, table_name)
 
@@ -351,11 +408,17 @@ def import_table_as_memory_layer(mdb_file, table_name, geom_field_name, geometry
     except QgsProcessingException as e:
         return None, str(e)
 
-    conn_str = rf"Driver={{{ACCESS_ODBC_DRIVER_NAME}}};DBQ={mdb_file};"
+    conn_str = _access_connection_string(mdb_file)
     try:
         with pyodbc.connect(conn_str) as conn:
             cursor = conn.cursor()
-            sql = f"SELECT * FROM [{table_name}] WHERE [{geom_field_name}] IS NOT NULL"
+            sql = (
+                "SELECT * FROM "
+                + _quote_access_identifier(table_name)
+                + " WHERE "
+                + _quote_access_identifier(geom_field_name)
+                + " IS NOT NULL"
+            )  # nosec B608
             feedback.pushInfo(f"Executing SQL: {sql}")
             cursor.execute(sql)
             col_names = [desc[0] for desc in cursor.description]
@@ -603,7 +666,7 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
         cmd = [python_exe, '-u', worker_path] + args
         feedback.pushInfo('Running MDB worker: ' + ' '.join(cmd))
         try:
-            completed = subprocess.run(
+            completed = subprocess.run(  # nosec B603,B607 - trusted worker path, no shell, args passed as a list.
                 cmd,
                 capture_output=True,
                 text=True,
@@ -704,7 +767,7 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
                 raise QgsProcessingException("No valid CRS provided. Set a Target CRS.")
 
             if isolate:
-                out_base = os.path.join(temp_dir, f'{table_name}')
+                out_base = os.path.join(temp_dir, _safe_temp_stem(table_name))
                 # Always split in the worker.
                 # Rationale: GeoMedia/Makai MDB metadata can mislabel geometry types; splitting is the most
                 # reliable way to prevent LineString features being imported as Points.
