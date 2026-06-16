@@ -4,6 +4,7 @@
 # (e.g. for running the tests outside of QGIS).
 openpyxl
 pyqtgraph>=0.12.0
+PyOpenGL
 # et_xmlfile is a runtime dependency of openpyxl >= 3.1 and is also vendored
 # under ./lib/ so the plugin works offline.
 et_xmlfile

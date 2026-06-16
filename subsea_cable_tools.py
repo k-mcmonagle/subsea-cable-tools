@@ -22,8 +22,8 @@ from .maptools.kp_mouse_maptool import KPMouseTool
 # Import the processing provider
 from .processing.subsea_cable_processing_provider import SubseaCableProcessingProvider
 
-# NOTE: Larger dock widgets are imported lazily so plugin startup remains robust
-# if an optional or vendored plotting dependency fails to load.
+# NOTE: Larger dock widgets and experimental dialogs are imported lazily so
+# plugin startup remains robust if an optional plotting dependency fails to load.
 
 
 class SubseaCableTools:
@@ -67,6 +67,8 @@ class SubseaCableTools:
         self.catenary_calculator_dialog = None
         self.catenary_v2_action = None
         self.catenary_calculator_v2_dialog = None
+        self.catenary_v2_3d_beta_action = None
+        self.catenary_3d_beta_dialog = None
         self.depth_profile_dock = None
         self.depth_profile_action = None
         self.transit_measure_action = None
@@ -128,12 +130,23 @@ class SubseaCableTools:
         # Add action for Catenary Calculator V2
         icon_v2_path = os.path.join(self.plugin_dir, 'catenary_icon_v2.png')
         if not os.path.exists(icon_v2_path):
-            icon_v2_path = os.path.join(self.plugin_dir, 'catenary_icon.png') # Fallback
+            icon_v2_path = os.path.join(self.plugin_dir, 'catenary_icon.png')  # Fallback
         self.catenary_v2_action = QAction(QIcon(icon_v2_path), "Catenary Calculator V2", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
         self.catenary_v2_action.triggered.connect(self.show_catenary_calculator_v2)
         self.iface.addToolBarIcon(self.catenary_v2_action)
         self.iface.addPluginToMenu(self.menu, self.catenary_v2_action)
         self.actions.append(self.catenary_v2_action)
+
+        # Add action for the experimental Catenary Calculator V2 3D Beta dialog.
+        self.catenary_v2_3d_beta_action = QAction(QIcon(icon_v2_path), "Catenary Calculator V2 3D Beta", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
+        self.catenary_v2_3d_beta_action.setToolTip(
+            "Experimental static 3D catenary / multi-span body viewer. "
+            "Requires pyqtgraph OpenGL / PyOpenGL for orbit, pan and zoom."
+        )
+        self.catenary_v2_3d_beta_action.triggered.connect(self.show_catenary_3d_beta)
+        self.iface.addToolBarIcon(self.catenary_v2_3d_beta_action)
+        self.iface.addPluginToMenu(self.menu, self.catenary_v2_3d_beta_action)
+        self.actions.append(self.catenary_v2_3d_beta_action)
 
         # Transit Measure Tool action
         transit_icon_path = os.path.join(self.plugin_dir, 'transit_measure_icon.png')
@@ -162,7 +175,6 @@ class SubseaCableTools:
                     f"Details: {e}",
                 )
                 return
-
             self.catenary_calculator_dialog = CatenaryCalculatorDialog(self.iface.mainWindow())
         self.catenary_calculator_dialog.show()
         self.catenary_calculator_dialog.raise_()
@@ -182,11 +194,29 @@ class SubseaCableTools:
                     f"Details: {e}",
                 )
                 return
-
             self.catenary_calculator_v2_dialog = CatenaryCalculatorV2Dialog(self.iface.mainWindow())
         self.catenary_calculator_v2_dialog.show()
         self.catenary_calculator_v2_dialog.raise_()
         self.catenary_calculator_v2_dialog.activateWindow()
+
+    def show_catenary_3d_beta(self):
+        if self.catenary_3d_beta_dialog is None:
+            try:
+                from .catenary.catenary_3d_beta_dialog import Catenary3DBetaDialog
+            except Exception as e:
+                from qgis.PyQt.QtWidgets import QMessageBox
+
+                QMessageBox.critical(
+                    self.iface.mainWindow(),
+                    "Subsea Cable Tools",
+                    "Catenary Calculator V2 3D Beta could not be opened.\n\n"
+                    f"Details: {e}",
+                )
+                return
+            self.catenary_3d_beta_dialog = Catenary3DBetaDialog(self.iface.mainWindow())
+        self.catenary_3d_beta_dialog.show()
+        self.catenary_3d_beta_dialog.raise_()
+        self.catenary_3d_beta_dialog.activateWindow()
 
     def unload(self):
         """Remove the plugin menu items and icons from QGIS GUI and clean up all resources."""
@@ -287,7 +317,7 @@ class SubseaCableTools:
                 pass
             self.depth_profile_action = None
 
-        # Remove dialog reference
+        # Remove dialog references
         if hasattr(self, 'dlg'):
             self.dlg = None
 
@@ -296,6 +326,9 @@ class SubseaCableTools:
 
         if hasattr(self, 'catenary_calculator_v2_dialog'):
             self.catenary_calculator_v2_dialog = None
+
+        if hasattr(self, 'catenary_3d_beta_dialog'):
+            self.catenary_3d_beta_dialog = None
 
         # Remove menu reference
         if hasattr(self, 'menu'):
@@ -307,6 +340,7 @@ class SubseaCableTools:
         # Remove translator
         if hasattr(self, 'translator'):
             self.translator = None
+
     def show_plotter(self):
         """Show the KP Data Plotter dock widget."""
         if not self.plotter_dock:
@@ -361,7 +395,6 @@ class SubseaCableTools:
                     f"Details: {e}",
                 )
                 return
-
             self.transit_measure_tool = TransitMeasureTool(self.iface)
         self.iface.mapCanvas().setMapTool(self.transit_measure_tool)
         # If the tool is already active, QGIS may not call QgsMapTool.activate() again.
