@@ -164,6 +164,133 @@ def test_anchor_beyond_cable_length_rejected():
     raise AssertionError("unreachable anchor must be rejected")
 
 
+def test_mu_array_matches_scalar():
+    """Per-segment friction arrays must be accepted; a uniform array must
+    reproduce the scalar-mu equilibrium, and a wrong length is rejected."""
+    xs = [0.0, 100.0, 250.0, 400.0, 700.0, 2000.0]
+    dep = [120.0, 120.0, 40.0, 120.0, 150.0, 300.0]
+    seabed = PolylineSeabed(xs, dep, slope_smoothing_m=5.0)
+    common = dict(
+        top_xy=(0.0, 0.0),
+        cable_length_m=900.0,
+        q_water_npm=22.0,
+        bottom_anchor_xy=(820.0, -float(seabed.depth_at(820.0))),
+        n_nodes=300,
+        tension_scale_N=60_000.0,
+    )
+    res_scalar = solve_drape(seabed, mu=0.5, **common)
+    res_array = solve_drape(seabed, mu=np.full(300, 0.5), **common)
+    assert res_scalar.converged and res_array.converged
+    _assert_close(
+        "anchor tension scalar vs array mu",
+        res_array.end_tension_kN,
+        res_scalar.end_tension_kN,
+        0.05,
+    )
+    try:
+        solve_drape(seabed, mu=np.full(299, 0.5), **common)
+    except ValueError as exc:
+        assert "length" in str(exc)
+    else:
+        raise AssertionError("mu array with wrong length must be rejected")
+
+
+def test_EI_array_matches_scalar_and_validates_length():
+    """Per-segment EI arrays must reproduce the scalar result when uniform,
+    and wrong-length arrays must be rejected before relaxation starts."""
+    res_scalar = solve_drape(
+        FlatSeabed(1000.0),
+        top_xy=(0.0, 0.0),
+        cable_length_m=100.0,
+        q_water_npm=22.0,
+        mu=0.0,
+        bottom_anchor_xy=(80.0, 0.0),
+        n_nodes=100,
+        tension_scale_N=5000.0,
+        EI_Nm2=2.0e5,
+    )
+    res_array = solve_drape(
+        FlatSeabed(1000.0),
+        top_xy=(0.0, 0.0),
+        cable_length_m=100.0,
+        q_water_npm=22.0,
+        mu=0.0,
+        bottom_anchor_xy=(80.0, 0.0),
+        n_nodes=100,
+        tension_scale_N=5000.0,
+        EI_Nm2=np.full(100, 2.0e5),
+    )
+    assert res_scalar.converged and res_array.converged
+    _assert_close("top tension scalar vs array EI", res_array.top_tension_kN, res_scalar.top_tension_kN, 0.05)
+    _assert_close("min radius scalar vs array EI", res_array.min_radius_m, res_scalar.min_radius_m, 0.5)
+
+    try:
+        solve_drape(
+            FlatSeabed(1000.0),
+            top_xy=(0.0, 0.0),
+            cable_length_m=100.0,
+            q_water_npm=22.0,
+            mu=0.0,
+            bottom_anchor_xy=(80.0, 0.0),
+            n_nodes=100,
+            tension_scale_N=5000.0,
+            EI_Nm2=np.full(99, 2.0e5),
+        )
+    except ValueError as exc:
+        assert "length" in str(exc)
+    else:
+        raise AssertionError("EI array with wrong length must be rejected")
+
+
+def test_bending_stiffness_telecom_matches_flexible():
+    """A typical telecom-cable EI (~1 kN.m2) has a sub-metre bending boundary
+    layer; the global lay shape and top tension must match the flexible
+    closed-form catenary, and the solver must report that the EI effect is
+    unresolved at this discretisation."""
+    q, D, H = 22.0, 100.0, 50_000.0
+    a = H / q
+    x_an = a * math.acosh(1.0 + D / a)
+    s_an = a * math.sinh(x_an / a)
+    T_top_an = math.sqrt(H * H + (q * s_an) ** 2)
+    res = solve_drape(
+        FlatSeabed(D),
+        top_xy=(0.0, 0.0),
+        cable_length_m=s_an + 300.0,
+        q_water_npm=q,
+        mu=0.0,
+        bottom_anchor_xy=(x_an + 300.0, -D),
+        n_nodes=400,
+        tension_scale_N=T_top_an,
+        EI_Nm2=1000.0,
+    )
+    assert res.converged, f"residual_ratio={res.residual_ratio:.2e}"
+    _assert_close("top tension with telecom EI", res.top_tension_kN, T_top_an / 1000.0, 0.015 * T_top_an / 1000.0)
+    assert any("boundary layer" in w for w in res.warnings)
+
+
+def test_bending_stiffness_stiff_cable_converges():
+    """A deliberately stiff cable (EI far above any telecom figure) must
+    still converge, stay within the kinematically admissible sag band, and
+    report a finite minimum bend radius."""
+    res = solve_drape(
+        FlatSeabed(1000.0),  # bed far below: pure suspended span
+        top_xy=(0.0, 0.0),
+        cable_length_m=100.0,
+        q_water_npm=22.0,
+        mu=0.0,
+        bottom_anchor_xy=(80.0, 0.0),
+        n_nodes=100,
+        tension_scale_N=5000.0,
+        EI_Nm2=2.0e5,
+    )
+    assert res.converged, f"residual_ratio={res.residual_ratio:.2e}"
+    sag = -float(np.min(res.y))
+    # Inextensible length 100 m over an 80 m chord: every admissible shape
+    # (circular arc 25.4 m ... catenary 26.6 m) sags within this band.
+    assert 24.0 < sag < 28.0, f"sag {sag:.2f} m outside kinematic band"
+    assert math.isfinite(res.min_radius_m) and res.min_radius_m > 10.0
+
+
 def test_query_helpers():
     """tension_at_s interpolates and radius_at_s is ~a = H/q at the touchdown
     region of a taut flat-bed catenary."""
@@ -198,6 +325,10 @@ def run_all() -> List[str]:
         test_friction_reduces_anchor_tension,
         test_free_end_frictionless_rejected,
         test_anchor_beyond_cable_length_rejected,
+        test_mu_array_matches_scalar,
+        test_EI_array_matches_scalar_and_validates_length,
+        test_bending_stiffness_telecom_matches_flexible,
+        test_bending_stiffness_stiff_cable_converges,
         test_query_helpers,
     ]
     for test in tests:

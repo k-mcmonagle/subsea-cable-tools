@@ -24,6 +24,16 @@ class AssemblyItem:
     q_air_npm: float
     point_load_kN: float
     color_hex: str = ""
+    # Coulomb friction coefficient cable/seabed for this segment, used by the
+    # multi-span drape model. ``None`` means "unspecified" -> the dialog's
+    # default friction applies. Ignored for body rows and by the single-span
+    # solver (which is frictionless).
+    friction_mu: Optional[float] = None
+    # Optional segment-specific bending stiffness and minimum bend radius.
+    # ``None`` means "inherit the dialog/global default" for backwards
+    # compatibility with saved assemblies and older positional constructors.
+    bending_stiffness_kNm2: Optional[float] = None
+    min_bend_radius_m: Optional[float] = None
 
 
 @dataclass
@@ -74,6 +84,12 @@ class SolverDiagnostics:
     tdp_x_world_m: float = 0.0
     tdp_depth_m: float = 0.0
     tdp_slope_deg: float = 0.0
+    # Self-consistency of the TDP fixed point: the assumed TDP world-x must
+    # equal the resulting layback, otherwise the depth sampled under the cable
+    # (and the world frame of everything downstream) is wrong.
+    tdp_consistency_residual_m: float = 0.0
+    tdp_consistent: bool = True
+    tdp_fallback_bisection: bool = False
     # Solution-quality flags. ``converged`` is the headline status the UI can
     # surface directly: it is True only when the solved curve actually matches
     # the selected input and the chute boundary within engineering tolerance.
@@ -764,20 +780,95 @@ class CatenarySystemCalculator:
             alpha = float(self.seabed.slope_at(float(x_world)))
             self.cfg["H_input_N"] = float(t_bottom_input_N) * math.cos(alpha)
 
+        # Every TDP evaluation is recorded as (assumed x, resulting layback) so
+        # the fallback machinery can see the landscape the iteration explored.
+        eval_history: List[Tuple[float, float]] = []
+
         def picard_step(x_in: float) -> float:
             self._tdp_x_world = x_in
             _apply_bottom_tension_scaling(x_in)
             self._solve_once()
-            return float(self.layback if self.layback is not None else 0.0)
+            gx = float(self.layback if self.layback is not None else 0.0)
+            eval_history.append((float(x_in), gx))
+            return gx
+
+        used_bisection_fallback = False
+
+        def _tdp_bisection_root() -> float:
+            """Robust fallback when the Picard/Aitken iteration fails: find the
+            *smallest* self-consistent TDP position (first tangential touchdown
+            coming from the chute — the physically-laid one) by scanning
+            f(x) = layback(x) - x for its first + -> - sign change and
+            bisecting. f is continuous, positive for small x (layback exceeds a
+            small assumed position) and negative for large x (layback is
+            bounded), so a bracket exists. Scan/bisection evaluations use a
+            coarsened integration step — the TDP tolerance is metres, far above
+            the discretisation error — and the caller re-solves at full
+            resolution afterwards."""
+            ds_full = float(self.cfg["ds_m"])
+            gs = [g for _, g in eval_history] or [float(self.cfg.get("S_guess_m", 100.0))]
+            g_lo, g_hi = min(gs), max(gs)
+            span = max(50.0, g_hi - g_lo)
+            x_lo = max(1.0, g_lo - 0.5 * span)
+            x_hi = g_hi + 0.5 * span
+            self.cfg["ds_m"] = max(ds_full, min(5.0, (x_hi + 1.0) / 400.0))
+            try:
+                def f(x: float) -> float:
+                    try:
+                        return picard_step(float(x)) - float(x)
+                    except Exception:
+                        return float("nan")
+
+                n_scan = 9
+                xs = [x_lo + (x_hi - x_lo) * i / (n_scan - 1) for i in range(n_scan)]
+                fs = [f(x) for x in xs]
+
+                bracket = None
+                for _attempt in range(3):
+                    last_valid: Optional[Tuple[float, float]] = None
+                    for x_i, f_i in zip(xs, fs):
+                        if math.isnan(f_i):
+                            continue
+                        if last_valid is not None and last_valid[1] > 0.0 >= f_i:
+                            bracket = (last_valid[0], x_i, last_valid[1], f_i)
+                            break
+                        last_valid = (x_i, f_i)
+                    if bracket is not None:
+                        break
+                    # No sign change yet: layback is bounded, so extend upward.
+                    x_ext = xs[-1] + span * (2.0 ** _attempt)
+                    xs.append(x_ext)
+                    fs.append(f(x_ext))
+
+                if bracket is None:
+                    # Give up gracefully: best (least-inconsistent) iterate.
+                    return min(eval_history, key=lambda t: abs(t[1] - t[0]))[0]
+
+                lo, hi, flo, _fhi = bracket
+                for _ in range(24):
+                    if (hi - lo) <= tdp_tol_m:
+                        break
+                    mid = 0.5 * (lo + hi)
+                    fm = f(mid)
+                    if math.isnan(fm):
+                        break
+                    if flo * fm <= 0.0:
+                        hi = mid
+                    else:
+                        lo, flo = mid, fm
+                return 0.5 * (lo + hi)
+            finally:
+                self.cfg["ds_m"] = ds_full
 
         def run_tdp_consistent_solve() -> int:
+            nonlocal used_bisection_fallback
             if is_flat:
                 # Depth and slope are x-independent: one solve is exact.
                 _apply_bottom_tension_scaling(self._tdp_x_world)
                 self._solve_once()
                 return 1
             x0 = self._tdp_x_world
-            x_converged = x0
+            x_converged: Optional[float] = None
             iters = 1
             for tdp_iter in range(max_tdp_iters):
                 iters = tdp_iter + 1
@@ -789,22 +880,44 @@ class CatenarySystemCalculator:
                 x2 = picard_step(x1)
                 denom = x2 - 2.0 * x1 + x0
                 if abs(denom) < 1e-12:
-                    x_converged = x2
                     if abs(x2 - x1) <= tdp_tol_m:
+                        x_converged = x2
                         break
                     x0 = x2
                     continue
 
                 x_aitken = x0 - (x1 - x0) ** 2 / denom
+                # Clamp the extrapolation into the observed landscape: on an
+                # undulating profile the map is non-contractive (|g'| > 1) and
+                # Aitken can fling the iterate far outside the region that
+                # contains any fixed point.
+                gs = [g for _, g in eval_history]
+                g_lo, g_hi = min(gs), max(gs)
+                pad = max(20.0, 0.5 * (g_hi - g_lo))
+                x_aitken = min(max(x_aitken, max(1.0, g_lo - pad)), g_hi + pad)
                 if abs(x_aitken - x2) <= tdp_tol_m:
                     x_converged = x_aitken
                     break
                 x0 = x_aitken
+
+            if x_converged is None:
+                # Picard/Aitken did not converge (typical on undulating
+                # profiles). Accept the best iterate if it is already
+                # self-consistent; otherwise fall back to a robust bracketed
+                # bisection. Never fall back to the initial guess — an
+                # unconverged TDP position silently corrupts the depth sampled
+                # under the cable and every downstream output.
+                best_x, best_g = min(eval_history, key=lambda t: abs(t[1] - t[0]))
+                if abs(best_g - best_x) <= tdp_tol_m:
+                    x_converged = best_x
+                else:
+                    x_converged = _tdp_bisection_root()
+                    used_bisection_fallback = True
+
             # Lock in converged x with a final re-solve so stored state matches.
-            if abs(self._tdp_x_world - x_converged) > 1e-9:
-                self._tdp_x_world = x_converged
-                _apply_bottom_tension_scaling(x_converged)
-                self._solve_once()
+            self._tdp_x_world = float(x_converged)
+            _apply_bottom_tension_scaling(self._tdp_x_world)
+            self._solve_once()
             return iters
 
         try:
@@ -850,12 +963,44 @@ class CatenarySystemCalculator:
         # Surface-piercing (floating bight) detection for the final solution.
         self._compute_surface_piercing()
 
+        # ---- TDP self-consistency check -----------------------------------
+        # The fixed point requires assumed-TDP-x == resulting layback. If the
+        # iteration (and its bisection fallback) could not achieve that, the
+        # depth/slope sampled at the "TDP" belong to the wrong location and
+        # the whole geometry is unreliable — flag it loudly.
+        if is_flat:
+            tdp_residual_m = 0.0
+        else:
+            tdp_residual_m = float((self.layback or 0.0) - self._tdp_x_world)
+        tdp_consistency_tol_m = max(0.5, 2.0 * tdp_tol_m)
+        tdp_consistent = abs(tdp_residual_m) <= tdp_consistency_tol_m
+
         # Record TDP fixed-point and sliding-stability info in diagnostics.
         if self.diagnostics is not None:
             self.diagnostics.tdp_iterations = int(tdp_iters_used)
             self.diagnostics.tdp_x_world_m = float(self._tdp_x_world)
             self.diagnostics.tdp_depth_m = float(self.tdp_depth_m)
             self.diagnostics.tdp_slope_deg = float(self.tdp_slope_deg)
+            self.diagnostics.tdp_consistency_residual_m = float(tdp_residual_m)
+            self.diagnostics.tdp_consistent = bool(tdp_consistent)
+            self.diagnostics.tdp_fallback_bisection = bool(used_bisection_fallback)
+            if used_bisection_fallback:
+                self.diagnostics.warnings.append(
+                    "Touchdown position required the robust bisection fallback (the fixed-point "
+                    "iteration did not contract — typical on undulating seabed profiles). The "
+                    "smallest self-consistent touchdown was selected; on wavy beds several "
+                    "tangential touchdown positions can exist, and the automatic seabed drape "
+                    "resolves the actual contact."
+                )
+            if not tdp_consistent:
+                self.diagnostics.converged = False
+                self.diagnostics.warnings.append(
+                    f"Touchdown position is not self-consistent: the solve assumed the TDP at "
+                    f"{self._tdp_x_world:.1f} m from the chute but produced a layback of "
+                    f"{float(self.layback or 0.0):.1f} m (residual {tdp_residual_m:+.1f} m). The seabed "
+                    "depth sampled under the cable does not correspond to the actual touchdown — treat "
+                    "this result as unreliable. Refine the seabed profile or adjust the inputs."
+                )
             self.diagnostics.touchdown_advance_iterations = int(self._touchdown_advance_iterations)
             self.diagnostics.touchdown_advanced_m = float(self._touchdown_advanced_m)
             self.diagnostics.min_seabed_clearance_m = (

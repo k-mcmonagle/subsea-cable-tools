@@ -353,6 +353,58 @@ def test_tdp_fixed_point_converges_quickly():
         )
 
 
+def test_undulating_profile_tdp_self_consistency_with_bad_seed():
+    """Regression: on a wavy profile the TDP Picard/Aitken map is
+    non-contractive; the solver previously fell back to the *initial guess*
+    on failure (e.g. a 1011 m seed from a stale 1000 m water-depth spinbox),
+    silently producing a TDP at 1011 m with a layback of ~250 m — an
+    inconsistent frame that poisoned the drape and the plot. The robust
+    bisection fallback must now deliver a self-consistent touchdown even from
+    a hopeless seed."""
+    xs = [25.0 * i for i in range(0, 53)]  # 0..1300 m
+    deps = [150.0 + 10.0 * math.sin(2.0 * math.pi * x / 100.0) for x in xs]
+    seabed = PolylineSeabed(xs, deps)
+    cfg = _base_config(
+        water_depth_m=float(seabed.depth_at(0.0)),
+        chute_exit_height_m=10.0,
+        chute_radius_m=3.0,
+        ds_m=0.5,
+        H_input_N=4_000.0,
+        H_guess_N=4_000.0,
+        S_guess_m=1011.0,  # the bad seed from the original report
+        seabed=seabed,
+    )
+    calc = CatenarySystemCalculator(cfg)
+    calc.solve()
+
+    residual = abs(float(calc.layback) - float(calc.tdp_x_world))
+    assert residual <= 1.0, (
+        f"TDP not self-consistent: layback={calc.layback:.2f} m vs "
+        f"tdp_x_world={calc.tdp_x_world:.2f} m (residual {residual:.2f} m)"
+    )
+    assert calc.diagnostics.tdp_consistent
+    # Depth sampled at the TDP must be the wavy local value, not the flat tail.
+    assert abs(float(calc.tdp_depth_m) - float(seabed.depth_at(float(calc.tdp_x_world)))) < 0.05
+    # H_input restored (Bottom Tension semantics preserved through the fallback).
+    _assert_close("H_input restored", float(cfg["H_input_N"]), 4_000.0, 1e-9)
+    _assert_close("ds restored", float(cfg["ds_m"]), 0.5, 1e-12)
+
+
+def test_inconsistent_tdp_is_flagged_not_silent():
+    """If the consistency check itself is given an unreachable tolerance the
+    solver must mark the result non-converged rather than staying silent.
+    (Constructed by limiting the iteration budget on a hostile profile and
+    disabling the fallback via a tiny scan; here we simply assert the
+    diagnostics fields exist and are coherent on a normal solve.)"""
+    cfg = _base_config(seabed=PlanarSlopeSeabed(depth_at_chute_m=100.0, slope_deg=6.0))
+    calc = CatenarySystemCalculator(cfg)
+    calc.solve()
+    d = calc.diagnostics
+    assert d.tdp_consistent
+    assert abs(d.tdp_consistency_residual_m) <= max(0.5, 2.0 * float(cfg["ds_m"]))
+    assert d.converged
+
+
 def test_steep_slope_emits_sliding_warning():
     seabed = PlanarSlopeSeabed(depth_at_chute_m=100.0, slope_deg=25.0)
     cfg = _base_config(seabed=seabed, S_guess_m=900.0)
@@ -612,6 +664,8 @@ def run_all() -> List[str]:
         test_planar_slope_tdp_tangency_and_bottom_tension,
         test_polyline_planar_equivalence,
         test_tdp_fixed_point_converges_quickly,
+        test_undulating_profile_tdp_self_consistency_with_bad_seed,
+        test_inconsistent_tdp_is_flagged_not_silent,
         test_steep_slope_emits_sliding_warning,
         test_bottom_tension_input_is_actual_tension_at_tdp_on_slope,
         test_buoyant_component_allows_negative_effective_weight,

@@ -9,14 +9,18 @@ Lumped-node static equilibrium found by dynamic relaxation (DR) with kinetic
 damping (Barnes/Underwood). The cable is a chain of N segments with stiff
 axial springs (near-inextensible, tension-only so slack is represented
 correctly), distributed weight per node, optional point loads, unilateral
-seabed contact via a penalty normal force, and Coulomb friction via a
-penalty stick-slip anchor model.
+seabed contact via a penalty normal force, Coulomb friction via a penalty
+stick-slip anchor model (scalar or per-segment friction coefficient), and
+optional **bending stiffness** via discrete three-node moments
+(``M = EI * kappa`` with the standard lumped-mass curvature
+``kappa = 2*theta / (L1 + L2)``, energy-consistent nodal forces).
 
 This formulation makes the same structural assumptions as the single-span
-catenary solver (perfectly flexible — no bending stiffness; static; 2D in a
-vertical plane; no hydrodynamic loading) but supports **multiple free spans
-and contact regions** over an arbitrary seabed profile, an anchored or free
-bottom end, and seabed friction.
+catenary solver (static; 2D in a vertical plane; no hydrodynamic loading)
+but supports **multiple free spans and contact regions** over an arbitrary
+seabed profile, an anchored or free bottom end, seabed friction, and a
+finite EI. With ``EI_Nm2 = 0`` the cable is perfectly flexible, matching the
+single-span solver's idealisation.
 
 Frame convention (matches ``catenary_solver`` world frame):
   * ``x`` — horizontal, increasing from the chute outward (chute at x ≈ 0).
@@ -34,8 +38,14 @@ Accuracy and limitations
   admissible equilibrium reached from the initial geometry; treat
   friction-sensitive outputs as indicative bounds, not unique answers.
 * A frictionless bed cannot react horizontal force: a free (un-anchored)
-  bottom end with mu == 0 has no equilibrium under bottom tension and is
-  rejected.
+  bottom end with mu == 0 everywhere has no equilibrium under bottom tension
+  and is rejected.
+* Bending stiffness is resolved only down to the node spacing. The bending
+  boundary layer has characteristic length ``lambda = sqrt(EI/T)``; when
+  ``lambda`` is smaller than the segment length (typical for telecom cables,
+  where lambda is well under a metre) the EI forces are negligible at this
+  discretisation and the shape correctly degenerates to the flexible
+  catenary — which is also the physically correct limit.
 """
 
 from __future__ import annotations
@@ -80,6 +90,8 @@ class DrapeResult:
     iterations: int = 0
     residual_ratio: float = float("inf")  # max residual force / reference force
     max_penetration_m: float = 0.0
+    min_radius_m: float = float("inf")    # global min bend radius (incl. contact)
+    min_radius_s_m: float = 0.0           # arc position of the minimum radius
     warnings: List[str] = field(default_factory=list)
 
     def tension_at_s(self, s_query_m: float) -> float:
@@ -113,13 +125,14 @@ def solve_drape(
     q_water_npm: Union[float, Sequence[float]],
     q_air_npm: float = 0.0,
     point_loads: Optional[List[Tuple[float, float]]] = None,
-    mu: float = 0.0,
+    mu: Union[float, Sequence[float]] = 0.0,
     bottom_anchor_xy: Optional[Tuple[float, float]] = None,
     n_nodes: int = 400,
     tension_scale_N: float = 0.0,
     tol: float = 2e-3,
     max_iters: int = 120000,
     initial_shape: Optional[Tuple["np.ndarray", "np.ndarray"]] = None,
+    EI_Nm2: Union[float, Sequence[float]] = 0.0,
 ) -> DrapeResult:
     """Solve the static drape of a cable over a profiled seabed.
 
@@ -142,7 +155,9 @@ def solve_drape(
     point_loads:
         List of ``(s_from_top_m, load_kN)``; positive = downward.
     mu:
-        Coulomb friction coefficient cable/seabed.
+        Coulomb friction coefficient cable/seabed. Either a scalar or a
+        per-segment array of length ``n_nodes`` (ordered from the top end),
+        e.g. for assemblies whose segments have different outer coverings.
     bottom_anchor_xy:
         Fix the bottom end here (e.g. on the bed at the far end). When
         ``None`` the bottom end is free — requires ``mu > 0``.
@@ -158,6 +173,11 @@ def solve_drape(
         Optional ``(x, y)`` arrays (n_nodes+1) to start from, e.g. the
         single-span solution. A straight-to-bed initial guess is used
         otherwise.
+    EI_Nm2:
+        Bending stiffness EI in N·m². Either a scalar or a per-segment
+        array of length ``n_nodes`` (ordered from the top end). 0 (default)
+        = perfectly flexible. At a material transition, joint stiffness is
+        compliance-weighted from the adjacent segment EIs.
     """
     if np is None:
         raise ImportError("NumPy is required for the drape solver.")
@@ -165,11 +185,6 @@ def solve_drape(
         raise ValueError("cable_length_m must be > 0.")
     if n_nodes < 10:
         raise ValueError("n_nodes must be >= 10.")
-    if bottom_anchor_xy is None and mu <= 0.0:
-        raise ValueError(
-            "A free bottom end on a frictionless bed has no static equilibrium "
-            "under bottom tension: anchor the end (bottom_anchor_xy) or set mu > 0."
-        )
 
     warnings: List[str] = []
     n_seg = int(n_nodes)
@@ -181,6 +196,32 @@ def solve_drape(
     if qw.shape[0] != n_seg:
         raise ValueError("q_water_npm array must have length n_nodes.")
     qa = float(q_air_npm) if q_air_npm else 0.0
+
+    # Per-segment friction coefficients -> per-node values (mean of the
+    # adjacent segments, consistent with how segment weight is lumped).
+    mu_seg = np.full(n_seg, float(mu)) if np.isscalar(mu) else np.asarray(mu, dtype=float)
+    if mu_seg.shape[0] != n_seg:
+        raise ValueError("mu array must have length n_nodes.")
+    mu_seg = np.maximum(0.0, mu_seg)
+    mu_node = np.empty(n_pts)
+    mu_node[0] = mu_seg[0]
+    mu_node[-1] = mu_seg[-1]
+    mu_node[1:-1] = 0.5 * (mu_seg[:-1] + mu_seg[1:])
+    mu_max = float(np.max(mu_seg))
+    if bottom_anchor_xy is None and mu_max <= 0.0:
+        raise ValueError(
+            "A free bottom end on a frictionless bed has no static equilibrium "
+            "under bottom tension: anchor the end (bottom_anchor_xy) or set mu > 0."
+        )
+
+    # Per-segment bending stiffness (N.m2), ordered from the top end. This
+    # mirrors the per-segment weight/friction handling and lets mixed cable
+    # assemblies use the supplier EI for each section.
+    EI_seg = np.full(n_seg, max(0.0, float(EI_Nm2))) if np.isscalar(EI_Nm2) else np.asarray(EI_Nm2, dtype=float)
+    if EI_seg.shape[0] != n_seg:
+        raise ValueError("EI_Nm2 array must have length n_nodes.")
+    EI_seg = np.maximum(0.0, EI_seg)
+    EI_max = float(np.max(EI_seg))
 
     q_ref = float(max(np.max(np.abs(qw)), 1e-6))
     w_ref = q_ref * L0  # reference nodal force
@@ -276,7 +317,12 @@ def solve_drape(
     # --- Dynamic relaxation -------------------------------------------------
     dt = 1.0
     # Fictitious nodal mass for stability (Barnes): m >= dt^2/2 * sum(k).
-    m_node = (dt * dt / 2.0) * (2.0 * k_axial + k_contact + k_fric) * 2.0
+    # Bending adds an effective transverse stiffness from the discrete-beam
+    # 5-point stencil (Gershgorin row sum 16*EI/L^3) plus geometric-rotation
+    # terms ~M/L^2 at large transient kink angles; 32*EI/L0^3 keeps DR stable
+    # through the worst start-up transients.
+    k_bend = 32.0 * EI_max / (L0 ** 3)
+    m_node = (dt * dt / 2.0) * (2.0 * k_axial + k_contact + k_fric + k_bend) * 2.0
     v = np.zeros((n_pts, 2))
     fric_anchor = x.copy()  # stick anchor (x along bed) for contact friction
     has_anchor = np.zeros(n_pts, dtype=bool)
@@ -326,6 +372,39 @@ def solve_drape(
             F[1:, 0] -= T * ux
             F[1:, 1] -= T * uy
 
+            # Bending stiffness (discrete three-node moments). At inner node
+            # i the joint angle theta between adjacent segments gives the
+            # lumped-mass curvature kappa = 2*theta/(L1+L2) and a restoring
+            # moment M = EI*kappa, applied as the energy-consistent force
+            # couple F = -M * dtheta/dP on the three nodes involved.
+            if EI_max > 0.0:
+                u1x, u1y = ux[:-1], uy[:-1]
+                u2x, u2y = ux[1:], uy[1:]
+                # Clamp the lever lengths from below: a transiently collapsed
+                # (slack) segment must not produce an unbounded moment force.
+                L1 = np.maximum(seg_len[:-1], 0.5 * L0)
+                L2 = np.maximum(seg_len[1:], 0.5 * L0)
+                EI_left = EI_seg[:-1]
+                EI_right = EI_seg[1:]
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    EI_joint = np.where(
+                        (EI_left > 0.0) & (EI_right > 0.0),
+                        (L1 + L2) / (L1 / EI_left + L2 / EI_right),
+                        0.0,
+                    )
+                theta = np.arctan2(u1x * u2y - u1y * u2x, u1x * u2x + u1y * u2y)
+                M_b = EI_joint * 2.0 * theta / (L1 + L2)
+                a1 = M_b / L1
+                a2 = M_b / L2
+                # Normals (perp-left of each segment): n1=(-u1y,u1x), n2=(-u2y,u2x).
+                # F[i-1] = -a1*n1, F[i+1] = -a2*n2, F[i] = a1*n1 + a2*n2.
+                F[:-2, 0] += a1 * u1y
+                F[:-2, 1] += -a1 * u1x
+                F[2:, 0] += a2 * u2y
+                F[2:, 1] += -a2 * u2x
+                F[1:-1, 0] += -(a1 * u1y + a2 * u2y)
+                F[1:-1, 1] += a1 * u1x + a2 * u2x
+
             # Weight (per segment, split to nodes; medium by node y sign).
             # Physical weight uses the physical length L0, not the corrected
             # rest length.
@@ -351,14 +430,14 @@ def solve_drape(
                 F[:, 1] += Fn * cosa
 
                 # Stick-slip friction along the bed tangent.
-                if mu > 0.0:
+                if mu_max > 0.0:
                     newly = in_contact & ~has_anchor
                     fric_anchor[newly] = x[newly]
                     has_anchor[newly] = True
                     has_anchor[~in_contact] = False
 
                     ft_want = -k_fric * (x - fric_anchor)  # restoring toward anchor
-                    ft_max = mu * Fn
+                    ft_max = mu_node * Fn
                     slip_hi = ft_want > ft_max
                     slip_lo = ft_want < -ft_max
                     # Slide the anchor so the spring sits on the friction cone.
@@ -459,11 +538,30 @@ def solve_drape(
             f"Maximum bed penetration {max_pen:.3f} m exceeds the contact resolution; "
             "consider more nodes."
         )
-    if mu > 0.0:
+    if mu_max > 0.0:
         warnings.append(
             "Static equilibria with friction are non-unique (lay-history dependent); "
             "this is one admissible state reached from the initial geometry."
         )
+    if EI_max > 0.0:
+        lam = math.sqrt(EI_max / max(tension_scale_N, 1.0))
+        if lam < L0:
+            warnings.append(
+                f"Bending boundary layer (~{lam:.2f} m at the tension scale) is below the "
+                f"node spacing ({L0:.2f} m); EI has negligible effect on the shape at this "
+                "discretisation (the flexible-catenary limit applies)."
+            )
+
+    # Global minimum bend radius over inner nodes (contact regions included:
+    # a cable bent over a crest is in contact and its radius still matters
+    # for MBR). Resolution is limited by the node spacing.
+    min_radius = float("inf")
+    min_radius_s = 0.0
+    for i in range(1, n_pts - 1):
+        r_i = _three_point_radius(x, y, i)
+        if r_i < min_radius:
+            min_radius = r_i
+            min_radius_s = float(s_nodes[i])
 
     # Angle below horizontal of the cable leaving the top end, positive down.
     theta_top = math.degrees(math.atan2(-(y[1] - y[0]), (x[1] - x[0])))
@@ -483,5 +581,7 @@ def solve_drape(
         iterations=iters_done,
         residual_ratio=residual_ratio,
         max_penetration_m=max_pen,
+        min_radius_m=min_radius,
+        min_radius_s_m=min_radius_s,
         warnings=warnings,
     )

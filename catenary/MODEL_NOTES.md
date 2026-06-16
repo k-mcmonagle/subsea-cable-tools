@@ -24,8 +24,9 @@ the vessel chute:
 
 * Force balance: constant horizontal component `H`; vertical component `V(s)`
   accumulates distributed weight (and, in V2, point loads).
-* Perfectly flexible cable: **no bending stiffness** (EI = 0) and **no axial
-  elasticity** (inextensible).
+* Perfectly flexible cable in the single-span solvers: **no bending
+  stiffness** (EI = 0) and **no axial elasticity** (inextensible). The V2
+  multi-span drape solver optionally models a finite EI (see below).
 * **No hydrodynamic loading**: no current drag, no vessel motion, no wave
   loading, no lay-speed effects. `H` is constant along the span only because
   fluid forces are neglected.
@@ -81,7 +82,14 @@ Numerical integration (midpoint scheme, step `ds`) of the same statics, adding:
   an exact integration split at the crossing.
 * **Sloped / profiled seabed**: planar slope or piecewise-linear depth
   profile; TDP boundary condition `V(0) = H·tan α_TDP`; the TDP horizontal
-  position is converged by an Aitken-accelerated fixed point. Bottom-tension
+  position is converged by an Aitken-accelerated fixed point, with a robust
+  bracketed-bisection fallback on `f(x) = layback(x) − x` for undulating
+  profiles where the fixed-point map is non-contractive (the *smallest*
+  self-consistent touchdown — the first coming from the chute — is selected;
+  on wavy beds several tangential touchdowns can exist and the automatic
+  drape resolves the actual contact). Every solve records a TDP
+  self-consistency residual (`layback − TDP x`) and an inconsistent result
+  is flagged non-converged rather than rendered silently. Bottom-tension
   input means the **actual tension at the TDP** (`H = T·cos α` internally).
 * **Solution-quality reporting**: convergence flags from actual residuals,
   half-step refinement deltas, free-span seabed clearance and penetration
@@ -92,10 +100,14 @@ Numerical integration (midpoint scheme, step `ds`) of the same statics, adding:
 On a profiled seabed, the single-span solution can pass *through* a high spot
 between the TDP and the chute. Physically the cable would rest on that high
 spot — a **multi-span contact problem the single-span solve cannot
-represent**. The solver keeps the self-consistent single-span geometry and
-**reports** the penetration (banner, plot highlight, diagnostics). Do not
-read tensions or layback from a solve flagged with penetration — run the
-**Drape Check** instead (below), which resolves the contact properly.
+represent**. The single-span solver keeps the self-consistent geometry and
+records the penetration in its diagnostics. In **Profile seabed mode the V2
+dialog resolves this automatically**: the multi-span drape (below) runs as
+part of every solve, rests the cable on the bathymetry, and the drape-resolved
+geometry is what is plotted/hovered/exported — the raw single-span curve
+through a high spot is never displayed. A penetration banner is shown only
+when the drape could not run (the failure reason is reported and the
+single-span solution is displayed instead).
 
 ### Surface-piercing semantics
 
@@ -112,51 +124,107 @@ figure, or treat the system as a surface-floating arrangement outside this
 model's scope. (A true free-surface flotation equilibrium solver is not
 implemented.)
 
-## Multi-span Drape Check — `drape_solver.py`
+## Multi-span seabed drape — `drape_solver.py` (automatic in Profile mode)
 
 A second, independent solver for the **full static drape of the cable over
-the seabed profile**, used from the V2 dialog's "Drape Check & Query"
-section. Method: lumped-node static equilibrium found by dynamic relaxation
-with kinetic damping —
+the seabed profile**. In the V2 dialog it **runs automatically as part of
+every solve when the seabed mode is "Profile"** and its result is the
+displayed/exported geometry; flat and planar-slope beds keep the exact
+tangential single-span solution (a drape adds nothing there). Method:
+lumped-node static equilibrium found by dynamic relaxation with kinetic
+damping —
 
 * the cable is a chain of ~250–500 segments with stiff tension-only axial
   springs, driven to the inextensible limit by outer rest-length correction
   (residual stretch < 0.002 %);
 * unilateral seabed contact via a penalty normal force on the bed polyline
-  (equilibrium penetration ≈ millimetres);
-* **Coulomb friction** (μ) via a stick-slip anchor model along the bed;
+  (equilibrium penetration ≈ millimetres; the *displayed* cable is clamped
+  onto the bed so it never renders inside the seabed);
+* **Coulomb friction** via a stick-slip anchor model along the bed. The
+  friction coefficient is **per assembly segment** ("Friction μ" column;
+  blank = default 0.3), so different cable types in one assembly can carry
+  different coefficients;
+* optional **bending stiffness EI** as energy-consistent discrete three-node
+  moments (`M = EI·κ`, lumped-mass curvature `κ = 2θ/(L1+L2)`); see the
+  bending section below;
 * boundary conditions: the chute departure point is held fixed (taken from
-  the last single-span solve); the bottom end is **anchored** at a chosen
-  point on the bed or **free** (free requires μ > 0 — a frictionless bed
-  cannot hold bottom tension, and the solver rejects that combination);
+  the single-span solve); the bottom end is **anchored** on the bed beyond
+  the "On-bed length beyond TDP" or **free** (free requires μ > 0 somewhere —
+  a frictionless bed cannot hold bottom tension, and the solver rejects that
+  combination). Both inputs live in the Geometry section and are shown only
+  in Profile mode;
 * per-segment weights and point loads are mapped from the assembly, including
   buoyant (negative-weight) sections.
 
-Validation (automated, `tests/test_drape_solver.py`): top tension within 1 %
-and touchdown position within 2.5 % of the closed-form catenary on a flat
-bed; frictionless flat bed transfers H unchanged to the anchor (2 %);
-multi-span drape over a ridge with no penetration; friction never increases
-the anchor-end tension; bend radius at the near-TDP region recovers a = H/q.
+The Results pane reports the hang from the ship and every free span (extent,
+length, max clearance, min bend radius, max tension) in a table, plus top/end
+tensions, contact status and max bed penetration.
 
-Drape-check caveats:
+Validation (automated, `tests/test_drape_solver.py` and
+`tests/test_catenary_v2_dialog.py`): top tension within 1 % and touchdown
+position within 2.5 % of the closed-form catenary on a flat bed; frictionless
+flat bed transfers H unchanged to the anchor (2 %); multi-span drape over a
+ridge with no penetration; friction never increases the anchor-end tension;
+per-segment friction arrays reproduce the scalar result; telecom-scale EI
+reproduces the flexible closed form; bend radius at the near-TDP region
+recovers a = H/q; the dialog's auto-drape rests the displayed cable on a
+ridge profile with no displayed penetration.
+
+Drape caveats:
 
 * The drape holds **total length and the chute departure point fixed**;
   tensions are redistributed by bed contact and will generally differ from
-  the single-span solve (that redistribution is the point of the check).
+  the single-span solve (that redistribution is the point of the model). The
+  headline solve-mode outputs (bottom tension, layback, etc.) remain
+  single-span values; the drape section reports the contact-resolved
+  tensions alongside them.
 * The chute arc itself is not part of the drape chain.
 * With friction, static equilibria are **non-unique** (lay-history
   dependent); the returned state is one admissible equilibrium reached from
   the single-span shape — treat friction-sensitive outputs as indicative.
 * Contact lift-off/touchdown points are resolved to ~one node spacing
   (≈ L/400).
-* Runtime is a few seconds; it runs on demand, not live.
+* Runtime is typically a couple of seconds per solve (warm-started from the
+  single-span shape); the dialog debounce is raised slightly in Profile mode.
 
-### Query system
+## Bending stiffness and minimum bend radius (V2)
 
-"Query at s from chute" reports tension, angle, bend radius, depth, seabed
-clearance and contact state at any arc position, from the drape result when
-one has been run (covering the on-bed section too), otherwise from the
-single-span solution.
+Solve Mode hosts default inputs: an *Include bending stiffness* toggle,
+*Bending Stiffness EI* (kN·m²; default 1.0, typical of telecom lightweight
+cable — armoured telecom / power cables are roughly 10–100, enter the
+supplier figure), and *Minimum Bend Radius* (m; default 2.0, typical telecom
+MBR under tension is 1.5–3 m; 0 disables the check). Assembly segment rows
+can override EI and MBR per segment; blank segment values inherit the Solve
+Mode defaults.
+
+What EI does and does not do, stated honestly:
+
+* The bending boundary layer has characteristic length `λ = √(EI/T)`. For a
+  telecom cable (EI ≈ 1 kN·m², T ≈ 20–50 kN) λ is **well under a metre**, so
+  EI has essentially no effect on the global lay shape — the flexible
+  catenary is the physically correct limit, and the solver reports λ and
+  warns when it is below the drape node spacing (i.e. the EI forces are
+  structurally negligible at that discretisation).
+* In the drape model EI matters where curvature concentrates: bends over
+  seabed crests and slack low-tension regions. It is integrated with
+  energy-consistent discrete moments, using compliance-weighted joint EI
+  where adjacent assembly segments differ, and validated against a flexible
+  reference and a stiff-rod kinematic bound.
+* At a point-load body the flexible model produces a curvature singularity
+  (R → 0). With EI the kink spreads over λ; the reported estimate is
+  `R ≈ √(EI·T)/P`, which is what the MBR check uses at bodies.
+
+The **MBR check** maps each modelled bend to the local assembly segment,
+compares chute contact segment-by-segment, and checks free-span / drape
+curvature plus the EI-based body-kink estimate against the governing local
+MBR. A red cable-integrity banner is raised when any local limit is violated.
+
+### Interactive query
+
+The crosshair hover ("Show crosshair values") reports, at the nearest cable
+point: tension, KP, counter, segment, depth, **seabed clearance, contact
+state (on seabed / suspended) and local bend radius** — covering the on-bed
+section of the drape as well as the suspended spans.
 
 ---
 
@@ -169,16 +237,16 @@ single-span solution.
 | Multi-segment cable + repeaters/bodies | **Supported (V2)** | Static point loads only; min-radius output is not meaningful at point-load kinks (warned). |
 | Discrete & distributed buoyancy | **Supported (V2)** | Negative point loads, negative legacy components, and negative assembly-segment weights all act as buoyancy. |
 | Surface-floating buoyant sections | **Partial (V2)** | Detected and flagged with a redundant-buoyancy estimate; the display clamps to the surface. No flotation equilibrium solver. |
-| Sloped / profiled seabed (single tangential TDP) | **Supported (V2)** | Penetration through high spots is detected and flagged; resolve it with the Drape Check. |
-| Multi-span / intermediate seabed contact | **Supported (V2 Drape Check)** | Static lumped-node contact solver; on-demand, a few seconds per run. |
-| Seabed friction | **Partial (V2 Drape Check)** | Coulomb stick-slip in the drape solver only; equilibria are lay-history dependent (non-unique). The single-span solve remains frictionless with advisory slope warnings. |
-| End anchoring | **Supported (V2 Drape Check)** | Anchored or free bottom end (free requires friction). |
-| Point queries (T, angle, radius, clearance) | **Supported (V2)** | "Query at s from chute"; uses the drape result when available. |
+| Sloped / profiled seabed (single tangential TDP) | **Supported (V2)** | Profile mode automatically resolves high-spot contact via the drape; flat/planar beds use the exact single span. |
+| Multi-span / intermediate seabed contact | **Supported (V2)** | Static lumped-node contact solver; runs automatically on every Profile-mode solve. |
+| Seabed friction | **Partial (V2 drape)** | Coulomb stick-slip, per assembly segment ("Friction μ" column, default 0.3); equilibria are lay-history dependent (non-unique). The single-span solve remains frictionless with advisory slope warnings. |
+| End anchoring | **Supported (V2 drape)** | Anchored or free bottom end (free requires friction); set in Geometry (Profile mode). |
+| Point queries (T, angle, radius, clearance, contact) | **Supported (V2)** | Crosshair hover over the plotted line; covers the on-bed drape section too. |
 | 3D route geometry (out-of-plane lay, route curvature) | **Not supported** | Plane model only. KP/route tools are separate and geodesic-aware, but the catenary itself is 2D. |
 | Current / hydrodynamic drag | **Not supported** | `H = const` assumption breaks under drag; results in strong currents will be wrong, especially exit angle and TDP position. |
 | Dynamic / transient lay simulation (vessel motion, pay-out rate, touchdown dynamics) | **Not supported** | Requires a time-domain FE/lumped-mass model — out of scope for this architecture. |
 | Buoy/mid-water arch systems, branching units as multi-leg systems | **Not supported** | Single span, single boundary at each end only. A branching unit can be approximated as a point load *only* if the other legs' tensions are known and resolved manually into a vertical force. |
-| Bending stiffness / minimum-bend-radius mechanics | **Not supported** | Curvature output is geometric only; near point loads and the TDP it is not a structural MBR check. |
+| Bending stiffness / minimum-bend-radius mechanics | **Partial (V2)** | Optional per-segment EI in the drape model (discrete moments with compliance-weighted segment transitions) plus a local per-segment MBR limit check covering chute, span/drape curvature and EI-smoothed body kinks. The single-span integrator itself remains flexible; for telecom-scale EI that is also the physically correct limit (λ = √(EI/T) ≪ 1 m). |
 | Axial elasticity / elongation | **Not supported** | Inextensible cable assumed; high-tension HV cable stretch is not modelled. |
 
 ---
@@ -197,5 +265,9 @@ single-span solution.
    host it.
 4. **3D static (route-plane decomposition)** (high effort): only worthwhile
    together with current modelling. Planned as a V3.
-5. **Dynamic lay simulation** (very high effort): not recommended as an
+5. **Branching-unit deployments (multi-leg systems)** (high effort): the
+   drape solver's chain/contact machinery can host a Y-topology (three chains
+   sharing a junction node), but boundary conditions and the UI need design
+   work. Planned as a V3 item alongside drag and 3D.
+6. **Dynamic lay simulation** (very high effort): not recommended as an
    extension of this code base; integrate with a dedicated tool instead.

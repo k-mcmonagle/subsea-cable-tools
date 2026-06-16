@@ -41,7 +41,9 @@ def _init_qgis() -> None:
 
     if QgsApplication.instance() is not None:
         return
-    _QGS_APP = QgsApplication([], False)
+    # GUI-enabled so widget-level tests (the V2 dialog) can construct widgets;
+    # nothing is ever shown and no event loop is started.
+    _QGS_APP = QgsApplication([], True)
     _QGS_APP.initQgis()
 
 
@@ -105,6 +107,7 @@ def main() -> int:
         ("catenary solver (V2)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_catenary_solver")),
         ("simple catenary (V1)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_simple_catenary")),
         ("drape solver (multi-span)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_drape_solver")),
+        ("catenary V2 dialog (auto-drape)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_catenary_v2_dialog")),
         ("seabed length algorithm", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_seabed_length")),
         ("processing provider", _provider_loads),
         ("main plugin import", _plugin_imports),
