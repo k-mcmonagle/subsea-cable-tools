@@ -3,7 +3,7 @@ name=Subsea Cable Tools
 qgisMinimumVersion=3.22
 qgisMaximumVersion=4.99
 description=Tools to support working with subsea cable data in QGIS.
-version=1.5.1
+version=1.6.0
 author=Kieran McMonagle
 email=kieran.mcmonagle@globalmarine.group
 
@@ -15,7 +15,12 @@ repository=https://github.com/k-mcmonagle/subsea-cable-tools
 hasProcessingProvider=yes
 
 # changelog
-changelog=Version 1.5.1:
+changelog=Version 1.6.0:
+  - New "Cable Lay Data Import" group of Processing algorithms for building a GeoPackage of cable lay data: Create Cable Lay GeoPackage (sets up all the empty canonical layers), plus importers for Cable Lay CSV, Event Log, Slack Log (lines), Body Log, 3D Model Solutions, As-Laid and Plough Data.
+  - GeoPackage-centric workflow: each importer accepts multiple files at once and writes to its fixed canonical layer (cable_lay, slack_logs, ...). The destination is either an existing layer picked from a dropdown (e.g. created by Create Cable Lay GeoPackage) or a GeoPackage file to create/append to. Layer names are prefixed with the GeoPackage file name (e.g. ProjectX_cable_lay) for clean grouping in the layer tree. Re-running grows that layer and removes duplicates on a per-type key, so data arriving daily/weekly builds up cleanly and re-importing a file is safe. A combined layer exports to CSV with QGIS's built-in Export.
+  - Shared, dependency-free parsing helpers (degrees/decimal-minutes to decimal degrees, day-count time to ISO timestamp, numeric type inference, merge/dedupe). No new third-party dependencies.
+  - See CHANGELOG.md for the full list.
+Version 1.5.1:
   - Catenary Calculator V2: added sloped / profiled seabed support (tangent touchdown on a depth profile), convergence and seabed-penetration reporting, distributed buoyancy, and a fuller seabed plot. Bottom Tension input is now the actual tension at the touchdown (T_TDP), identical to before on a flat seabed.
   - Distance/KP measurement consolidated through a single helper that uses the project ellipsoid (with a WGS84 fallback when unset). Adds an Ellipsoidal/Cartesian distance-mode option to KP-emitting algorithms (default Ellipsoidal; no behaviour change).
   - Geodesic interpolation: point_at_kp / extract_line_segment now follow the great circle on geographic CRSes instead of linearly interpolating in lon/lat. KP Mouse Tool range ring drawn as a true geodesic circle.

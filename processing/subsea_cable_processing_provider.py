@@ -66,6 +66,16 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
         safe_add('seabed_length_algorithm', 'SeabedLengthAlgorithm')
         safe_add('translate_kp_from_rpl_to_rpl_algorithm', 'TranslateKPFromRPLToRPLAlgorithm')
 
+        # --- Cable Lay Data Import ---
+        safe_add('create_cable_lay_geopackage_algorithm', 'CreateCableLayGeoPackageAlgorithm')
+        safe_add('import_cable_lay_algorithm', 'ImportCableLayAlgorithm')
+        safe_add('import_event_log_algorithm', 'ImportEventLogAlgorithm')
+        safe_add('import_slack_log_algorithm', 'ImportSlackLogAlgorithm')
+        safe_add('import_body_log_algorithm', 'ImportBodyLogAlgorithm')
+        safe_add('import_3d_model_solutions_algorithm', 'Import3DModelSolutionsAlgorithm')
+        safe_add('import_as_laid_algorithm', 'ImportAsLaidAlgorithm')
+        safe_add('import_plough_data_algorithm', 'ImportPloughDataAlgorithm')
+
         # --- MDB Tools ---
         safe_add('import_mdb_algorithm', 'ImportMdbAlgorithm')
 
@@ -77,7 +87,6 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
         safe_add('dynamic_buffer_lay_corridor_algorithm', 'DynamicBufferLayCorridorAlgorithm')
         safe_add('export_kp_section_chartlets_algorithm', 'ExportKPSectionChartletsAlgorithm')
         safe_add('extract_lines_intersecting_polygons_algorithm', 'ExtractLinesIntersectingPolygonsAlgorithm')
-        safe_add('import_cable_lay_algorithm', 'ImportCableLayAlgorithm')
         safe_add('import_ship_outline_algorithm', 'ImportShipOutlineAlgorithm')
         safe_add('place_ship_outlines_algorithm', 'PlaceShipOutlinesAlgorithm')
         safe_add('plot_line_segments_from_table_algorithm', 'PlotLineSegmentsFromTableAlgorithm')

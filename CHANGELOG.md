@@ -5,7 +5,19 @@ All notable changes to the Subsea Cable Tools QGIS plugin will be documented in 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.5.1] - Unreleased
+## [1.6.0] - 2026-06-22
+
+Adds a lightweight **Cable Lay Data Import** toolset for turning cable lay source files into GeoPackage layers, with no new third-party dependencies.
+
+### Added
+- **New "Cable Lay Data Import" Processing group** for building a single GeoPackage of cable lay data, with no new third-party dependencies. It contains a setup tool and seven importers:
+  - **Create Cable Lay GeoPackage** — writes a GeoPackage pre-populated with all the empty canonical layers (correct geometry type and CRS): `cable_lay`, `event_logs`, `slack_logs` (lines), `body_logs`, `model_solutions`, `as_laid`, `plough_data` (all WGS84 / EPSG:4326). Layer names are prefixed with the GeoPackage file name (e.g. `ProjectX_cable_lay`) so they group and identify cleanly in the layer tree. Safe to re-run: existing layers are left untouched and only missing ones are added.
+  - **Import Cable Lay Data (CSV)**, **Import Event Log**, **Import Slack Log** (LineString segments), **Import Body Log**, **Import 3D Model Solutions** (touchdown or ship position selectable), **Import As-Laid** and **Import Plough Data**. The existing cable-lay CSV importer was refactored onto the same base so all seven behave identically (it keeps its downsample and parse-time-toggle options).
+- **GeoPackage-centric, incremental workflow.** Every importer accepts **multiple files at once** (multi-select) and writes to its **fixed canonical layer**. The destination is either an **existing layer chosen from a dropdown** — typically one created by *Create Cable Lay GeoPackage* — or a **GeoPackage file** to create/append to (created if missing). When an already-loaded layer is targeted it is refreshed in place rather than duplicated. Layer names are prefixed with the GeoPackage file name (e.g. `ProjectX_slack_logs`) for clean grouping/identification in the layer tree. Re-running grows that same layer and removes duplicates on a per-type key (e.g. slack logs on file + KP1 + KP2; positions on timestamp + source file), so data that arrives daily or weekly builds up cleanly and re-importing a file is safe. Using canonical (prefixed) layer names avoids file-named scratch layers; a combined layer's attribute table can be exported to CSV with QGIS's built-in *Export → Save Features As*.
+- **Shared, dependency-free helpers** (`processing/cable_lay_parsers.py`, `processing/cable_lay_import_base.py`): degrees/decimal-minutes → decimal degrees (tolerant of `17 09.7399N` and `17 09.7399 N`), day-count time (`day,HH:MM:SS`) + project start date → ISO timestamp, numeric/text column-type inference, the merge/deduplicate machinery, and GeoPackage read/write that preserves other layers. Implemented with the Python standard library and PyQGIS only — no pandas/geopandas/shapely.
+- **Test coverage:** new `tests/test_cable_lay_importers.py` exercises the coordinate/time helpers, type inference and deduplication, and runs the setup tool plus the cable-lay, slack, body and plough importers end-to-end into a GeoPackage (including a multi-file merge and a re-run that de-duplicates). Registered in `tests/run_qgis_smoke_tests.py`.
+
+## [1.5.1] - 2026-06-19
 
 Maintenance and consistency release focused on distance/KP measurement and CRS handling, plus substantial enhancements to Catenary Calculator V2 (sloped / profiled seabed support, convergence and seabed-penetration reporting, and distributed buoyancy). Existing KP/measurement workflows are unchanged when defaults are kept; the one intentional behaviour change is that Catenary V2's *Bottom Tension* input is now the actual tension at the touchdown (`T_TDP`) rather than the horizontal force component (`H`) — identical on a flat seabed.
 
