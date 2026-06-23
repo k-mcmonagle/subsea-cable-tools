@@ -47,12 +47,18 @@ def _odbc_braced_value(value):
     return "{" + os.fspath(value).replace("}", "}}") + "}"
 
 
+def _normalize_mdb_path(mdb_file):
+    path = os.path.abspath(os.path.normpath(os.fspath(mdb_file).strip().strip('"')))
+    return path.replace("/", "\\")
+
+
 def _access_connection_string(mdb_file):
+    normalized = _normalize_mdb_path(mdb_file)
     return (
         "Driver="
         + _odbc_braced_value(ACCESS_ODBC_DRIVER_NAME)
         + ";DBQ="
-        + _odbc_braced_value(mdb_file)
+        + normalized
         + ";"
     )
 
@@ -114,7 +120,10 @@ def _require_access_odbc_driver(feedback=None):
 def _test_mdb_connection(mdb_file, feedback=None, timeout_seconds=5):
     """Attempt a short ODBC connect. This catches missing drivers, bitness mismatches, and corrupt DB early."""
     _require_access_odbc_driver(feedback)
-    conn_str = _access_connection_string(mdb_file)
+    normalized = _normalize_mdb_path(mdb_file)
+    if not os.path.isfile(normalized):
+        raise QgsProcessingException(f"MDB file not found: {normalized}")
+    conn_str = _access_connection_string(normalized)
     try:
         conn = pyodbc.connect(conn_str, timeout=timeout_seconds)
         try:

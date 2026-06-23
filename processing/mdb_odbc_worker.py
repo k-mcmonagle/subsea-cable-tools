@@ -38,12 +38,18 @@ def _odbc_braced_value(value):
     return "{" + os.fspath(value).replace("}", "}}") + "}"
 
 
+def _normalize_mdb_path(mdb_path):
+    path = os.path.abspath(os.path.normpath(os.fspath(mdb_path).strip().strip('"')))
+    return path.replace("/", "\\")
+
+
 def _access_connection_string(mdb_path):
+    normalized = _normalize_mdb_path(mdb_path)
     return (
         "Driver="
         + _odbc_braced_value(ACCESS_ODBC_DRIVER_NAME)
         + ";DBQ="
-        + _odbc_braced_value(mdb_path)
+        + normalized
         + ";"
     )
 
@@ -137,7 +143,10 @@ def _require_pyodbc_and_driver():
 
 def _connect(mdb_path, timeout_seconds=10):
     _require_pyodbc_and_driver()
-    conn_str = _access_connection_string(mdb_path)
+    normalized = _normalize_mdb_path(mdb_path)
+    if not os.path.isfile(normalized):
+        raise FileNotFoundError(f"MDB file does not exist: {normalized}")
+    conn_str = _access_connection_string(normalized)
     return pyodbc.connect(conn_str, timeout=timeout_seconds)
 
 
@@ -235,18 +244,22 @@ def _infer_geom_type(vertices, geometry_type_code=None):
     if not vertices:
         return None
 
-    # Respect explicit geometry metadata when available.
-    if geometry_type_code == 1:
-        return "LineString"
+    # Always trust actual shape first: a single coordinate is a point.
+    # This avoids misclassifying valid point tables.
+    if len(vertices) == 1:
+        return "Point"
+
+    # Preserve explicit polygon metadata for true polygon tables.
     if geometry_type_code == 2:
         return "Polygon"
-    if geometry_type_code == 3:
-        return "Point"
+
+    # GeoMedia metadata can mislabel bathy contour/track features as point-like
+    # classes (e.g. code 3). Any multi-vertex feature should be line output.
+    if geometry_type_code in {1, 3}:
+        return "LineString"
 
     # Ambiguous GeoMedia type codes (e.g. 10) are prone to treating closed
     # contour lines as polygons. Prefer line output to avoid false polygons.
-    if len(vertices) == 1:
-        return "Point"
     return "LineString"
 
 

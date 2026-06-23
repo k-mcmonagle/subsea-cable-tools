@@ -5,6 +5,17 @@ All notable changes to the Subsea Cable Tools QGIS plugin will be documented in 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.1] - 2026-06-23
+
+Non-breaking maintenance patch for **Import MDB** focused on Access ODBC connection reliability and geometry classification for bathy-style tables.
+
+### Fixed
+- **Import MDB (ODBC path handling):** normalises Windows MDB paths before connect and uses a driver-compatible `DBQ` connection string format, fixing `HY000 / -1044 Not a valid file name` failures seen on some Microsoft Access ODBC driver builds.
+- **Import MDB (geometry split inference):** in worker split mode, geometry classification now prioritises actual vertex shape so multi-vertex features are emitted as `LineString` (unless explicit polygon metadata applies) instead of being forced to `Point` by unreliable source metadata. This restores expected line outputs for bathy-style GeoMedia tables while preserving true point and polygon imports.
+
+### Added
+- **Regression tests:** added focused tests for MDB worker geometry inference across point/line/polygon/ambiguous metadata cases.
+
 ## [1.6.0] - 2026-06-22
 
 Adds a lightweight **Cable Lay Data Import** toolset for turning cable lay source files into GeoPackage layers, with no new third-party dependencies.
