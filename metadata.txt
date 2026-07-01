@@ -3,7 +3,7 @@ name=Subsea Cable Tools
 qgisMinimumVersion=3.22
 qgisMaximumVersion=4.99
 description=Tools to support working with subsea cable data in QGIS.
-version=1.6.1
+version=1.6.2
 author=Kieran McMonagle
 email=kieran.mcmonagle@globalmarine.group
 
@@ -15,7 +15,9 @@ repository=https://github.com/k-mcmonagle/subsea-cable-tools
 hasProcessingProvider=yes
 
 # changelog
-changelog=Version 1.6.1:
+changelog=Version 1.6.2:
+  - Security-scan compliance only, no functional change from 1.6.1: corrected the placement of Bandit "# nosec" suppressions on the dynamically-built Microsoft Access SQL (table/column identifiers are validated and bracket-quoted; row values use parameter placeholders) and annotated the vendored pyqtgraph SVG exporter's internal XML parsing, so the QGIS plugin repository's automated security scan passes.
+Version 1.6.1:
   - This is a large jump from the previously published version, adding many new tools, algorithms and features in one step. It is published as a work in progress — please sanity-check and double-check results against your own data and established methods, and do not rely on the output uncritically.
   - Import MDB (ODBC path handling): normalises Windows MDB paths before connect and uses a driver-compatible DBQ connection string, fixing "HY000 / -1044 Not a valid file name" failures seen on some Microsoft Access ODBC driver builds.
   - Import MDB (geometry inference): in worker split mode, multi-vertex features are now emitted as LineString based on actual vertex shape rather than being forced to Point by unreliable source metadata; true point and polygon imports are preserved.

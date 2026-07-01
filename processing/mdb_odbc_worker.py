@@ -66,7 +66,7 @@ def _quote_access_identifier(identifier):
 
 
 def _get_column_names(cursor, table_name):
-    sql = "SELECT * FROM " + _quote_access_identifier(table_name) + " WHERE 1=0"  # nosec B608
+    sql = "SELECT * FROM " + _quote_access_identifier(table_name) + " WHERE 1=0"  # nosec B608 identifier validated & bracket-quoted
     cursor.execute(sql)
     return [desc[0] for desc in cursor.description]
 
@@ -187,8 +187,11 @@ def list_feature_tables(mdb_path):
         if not geom_field_col or not geom_type_col:
             return out
 
+        # Identifiers are validated and bracket-quoted by
+        # _quote_access_identifier(); Access ODBC cannot parameterise
+        # identifiers, so they are safely interpolated.
         sql = (
-            "SELECT "
+            "SELECT "  # nosec B608
             + ", ".join(
                 _quote_access_identifier(col)
                 for col in (feature_name_col, geom_field_col, geom_type_col)
@@ -198,7 +201,7 @@ def list_feature_tables(mdb_path):
             + " WHERE "
             + _quote_access_identifier(geom_type_col)
             + " <> 33"
-        )  # nosec B608
+        )
         cur.execute(sql)
         for row in cur.fetchall():
             table_name, geom_field, geometry_type = row
@@ -271,12 +274,12 @@ def export_table_to_geojson(mdb_path, table_name, geom_field_name, geometry_type
     with _connect(mdb_path) as conn:
         cur = conn.cursor()
         sql = (
-            "SELECT * FROM "
+            "SELECT * FROM "  # nosec B608
             + _quote_access_identifier(table_name)
             + " WHERE "
             + _quote_access_identifier(geom_field_name)
             + " IS NOT NULL"
-        )  # nosec B608
+        )
         cur.execute(sql)
         col_names = [desc[0] for desc in cur.description]
         if not col_names or geom_field_name not in col_names:

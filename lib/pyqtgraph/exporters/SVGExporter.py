@@ -2,7 +2,7 @@ __all__ = ['SVGExporter']
 
 import contextlib
 import re
-import xml.dom.minidom as xml
+import xml.dom.minidom as xml  # nosec B408 - parses only internally-generated SVG, not untrusted input
 
 import numpy as np
 
@@ -395,11 +395,11 @@ def _generateItemSvg(item, nodes=None, root=None, options=None):
     ## Generate SVG text for just this item (exclude its children; we'll handle them later)
     if isinstance(item, QtWidgets.QGraphicsScene):
         xmlStr = "<g>\n</g>\n"
-        doc = xml.parseString(xmlStr)
+        doc = xml.parseString(xmlStr)  # nosec B318 - xmlStr is a literal constant
         childs = [i for i in item.items() if i.parentItem() is None]
     elif _itemUsesDefaultPaint(item):
         xmlStr = "<g>\n</g>\n"
-        doc = xml.parseString(xmlStr)
+        doc = xml.parseString(xmlStr)  # nosec B318 - xmlStr is a literal constant
         childs = item.childItems()
     else:
         childs = item.childItems()
@@ -443,7 +443,7 @@ def _generateItemSvg(item, nodes=None, root=None, options=None):
             ## this is taken care of in generateSvg instead.
             # if hasattr(item, 'setExportMode'):
             #     item.setExportMode(False)
-        doc = xml.parseString(arr.data())
+        doc = xml.parseString(arr.data())  # nosec B318 - SVG bytes generated internally by QSvgGenerator
 
     try:
         ## Get top-level group for this item

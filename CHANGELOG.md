@@ -5,6 +5,14 @@ All notable changes to the Subsea Cable Tools QGIS plugin will be documented in 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.2] - 2026-07-01
+
+Security-scan compliance patch only — **no functional change** from 1.6.1.
+
+### Security
+- Corrected the placement of Bandit `# nosec` suppressions on the dynamically-built Microsoft Access SQL in `processing/import_mdb_algorithm.py` and `processing/mdb_odbc_worker.py` so the QGIS plugin repository's automated Bandit scan recognises them. The queries were already safe: table/column identifiers are validated and bracket-quoted by `_quote_access_identifier()` (which rejects brackets and control characters), and row values are bound with `?` parameter placeholders. Access ODBC cannot parameterise identifiers, so they must be interpolated. The suppressions previously sat on the closing line of each multi-line statement, but Bandit attributes the finding to the first line, so they are now placed there.
+- Annotated the internal XML parsing in the vendored `lib/pyqtgraph/exporters/SVGExporter.py` (`# nosec B318` / `B408`): it parses only a literal constant and SVG bytes generated in-process by `QSvgGenerator`, never untrusted external input.
+
 ## [1.6.1] - 2026-06-23
 
 Non-breaking maintenance patch for **Import MDB** focused on Access ODBC connection reliability and geometry classification for bathy-style tables.

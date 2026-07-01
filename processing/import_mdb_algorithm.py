@@ -277,8 +277,11 @@ def get_feature_tables(mdb_file, feedback):
                 feedback.reportError("Required columns (PRIMARYGEOMETRYFIELDNAME, GEOMETRYTYPE) not found in GFeatures table.")
                 return {}
 
+            # Identifiers are validated and bracket-quoted by
+            # _quote_access_identifier(); values use ? placeholders. Access ODBC
+            # cannot parameterise identifiers, so they are safely interpolated.
             sql = (
-                "SELECT "
+                "SELECT "  # nosec B608
                 + ", ".join(
                     _quote_access_identifier(col)
                     for col in (feature_name_col, geom_field_col, geom_type_col)
@@ -288,7 +291,7 @@ def get_feature_tables(mdb_file, feedback):
                 + " WHERE "
                 + _quote_access_identifier(geom_type_col)
                 + " <> 33"
-            )  # nosec B608
+            )
             feedback.pushInfo(f"Executing SQL: {sql}")
             cursor.execute(sql)
 
@@ -363,7 +366,7 @@ def get_attribute_fields(mdb_file, table_name, feedback):
                 return {}
 
             sql = (
-                "SELECT fl."
+                "SELECT fl."  # nosec B608
                 + _quote_access_identifier(fieldname_col)
                 + ", ap."
                 + _quote_access_identifier(fieldtype_col)
@@ -378,7 +381,7 @@ def get_attribute_fields(mdb_file, table_name, feedback):
                 + " WHERE fl."
                 + _quote_access_identifier(featurename_col)
                 + " = ?"
-            )  # nosec B608
+            )
             feedback.pushInfo(f"Executing SQL: {sql}")
             cursor.execute(sql, table_name)
 
@@ -422,12 +425,12 @@ def import_table_as_memory_layer(mdb_file, table_name, geom_field_name, geometry
         with pyodbc.connect(conn_str) as conn:
             cursor = conn.cursor()
             sql = (
-                "SELECT * FROM "
+                "SELECT * FROM "  # nosec B608
                 + _quote_access_identifier(table_name)
                 + " WHERE "
                 + _quote_access_identifier(geom_field_name)
                 + " IS NOT NULL"
-            )  # nosec B608
+            )
             feedback.pushInfo(f"Executing SQL: {sql}")
             cursor.execute(sql)
             col_names = [desc[0] for desc in cursor.description]
