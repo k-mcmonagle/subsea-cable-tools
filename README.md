@@ -1,8 +1,12 @@
-﻿# Subsea Cable Tools
+# Subsea Cable Tools
 
 **Subsea Cable Tools** is a QGIS plugin for working with subsea telecom and power cable data: route position lists (RPLs), KP-based queries, bathymetry, lay corridors, and related survey/engineering tasks.
 
 Targets QGIS 3.22 or newer and declares compatibility through QGIS 4.x (`qgisMaximumVersion=4.99`).
+
+> **A note from the author (v1.6.1).** This release is a large jump from the previously published version — it introduces a substantial number of new tools, Processing algorithms and features in a single step. It is being published as a **work in progress**, so please treat it as such. As always, **do not rely on the output uncritically — sanity-check and double-check results** against your own data and established methods before using them for any operational or engineering decision.
+>
+> — Kieran McMonagle
 
 ---
 
@@ -12,18 +16,18 @@ Targets QGIS 3.22 or newer and declares compatibility through QGIS 4.x (`qgisMax
 
 Available in the Processing Toolbox under **Subsea Cable Tools**, grouped into:
 
-- **Route handling** â€“ Import Excel RPL, Import Cable Lay, Import / Place Ship Outlines, Plot Line Segments from Table, Translate KP Between RPLs, RPL Route Comparison.
-- **KP & ranges** â€“ Place KP Points (along route, from CSV, single), Find Nearest KP, KP Range CSV / Highlighter / Merge / Group, Extract KP Ranges (Rule Based), Extract A/C Points, KP Range Depth + Slope Summary.
-- **RPL listings & crossings** â€“ Identify RPL Crossing Points, Identify RPL Area Listing, Identify Features Intersecting RPL, Dynamic Buffer (Lay Corridor), Extract Lines Intersecting Polygons, Export KP Section Chartlets.
-- **Bathymetry** â€“ Import MDB (`import_mdb`, formerly Import Bathy MDB), Add Depth to Point Layer, Create Raster from XYZ, Merge MBES Rasters, Calculate Seabed Length.
+- **Route handling** – Import Excel RPL, Import Cable Lay, Import / Place Ship Outlines, Plot Line Segments from Table, Translate KP Between RPLs, RPL Route Comparison.
+- **KP & ranges** – Place KP Points (along route, from CSV, single), Find Nearest KP, KP Range CSV / Highlighter / Merge / Group, Extract KP Ranges (Rule Based), Extract A/C Points, KP Range Depth + Slope Summary.
+- **RPL listings & crossings** – Identify RPL Crossing Points, Identify RPL Area Listing, Identify Features Intersecting RPL, Dynamic Buffer (Lay Corridor), Extract Lines Intersecting Polygons, Export KP Section Chartlets.
+- **Bathymetry** – Import MDB (`import_mdb`, formerly Import Bathy MDB), Add Depth to Point Layer, Create Raster from XYZ, Merge MBES Rasters, Calculate Seabed Length.
 
 ### Map & dockable tools
 
-- **KP Mouse Tool** â€“ live KP/DCC under the cursor; ellipsoidal or cartesian distance modes; geodesic range ring; "Go to KPâ€¦".
-- **KP Data Plotter** â€“ dockable plot of KP-based table data against a route, with crosshair, marker and per-field axis assignment.
-- **Depth Profile** â€“ dockable profile from MBES raster(s) or contours along a route or temporary line; depth/slope plots with adaptive sampling.
+- **KP Mouse Tool** – live KP/DCC under the cursor; ellipsoidal or cartesian distance modes; geodesic range ring; "Go to KP…".
+- **KP Data Plotter** – dockable plot of KP-based table data against a route, with crosshair, marker and per-field axis assignment.
+- **Depth Profile** – dockable profile from MBES raster(s) or contours along a route or temporary line; depth/slope plots with adaptive sampling.
 - **Catenary Calculator** (legacy) and **Catenary Calculator V2** (multi-segment). Both are 2D static single-span models — see [catenary/MODEL_NOTES.md](catenary/MODEL_NOTES.md) for the precise assumptions, validity envelope, and what they must not be used for (no dynamics, current drag, 3D routing or multi-span contact).
-- **Transit Measure Tool** â€“ cumulative geodesic distance along a drawn path with transit-time output and an optional Quick Buffer.
+- **Transit Measure Tool** – cumulative geodesic distance along a drawn path with transit-time output and an optional Quick Buffer.
 
 ### Distance & CRS methodology
 
@@ -59,4 +63,3 @@ any plain Python (NumPy required for the V2 solver).
 See [CHANGELOG.md](CHANGELOG.md) for the full version history.
 
 Issues and suggestions are welcome on the [GitHub issue tracker](https://github.com/k-mcmonagle/subsea-cable-tools/issues).
-
