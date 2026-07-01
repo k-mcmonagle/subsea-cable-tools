@@ -3,7 +3,7 @@ name=Subsea Cable Tools
 qgisMinimumVersion=3.22
 qgisMaximumVersion=4.99
 description=Tools to support working with subsea cable data in QGIS.
-version=1.6.2
+version=1.6.3
 author=Kieran McMonagle
 email=kieran.mcmonagle@globalmarine.group
 
@@ -15,7 +15,10 @@ repository=https://github.com/k-mcmonagle/subsea-cable-tools
 hasProcessingProvider=yes
 
 # changelog
-changelog=Version 1.6.2:
+changelog=Version 1.6.3:
+  - Catenary Calculator V2 (UI only, no calculation changes): fixed the dialog layout on QGIS 3 / Qt5, where the left input panel was capped too narrow and the splitter could not be dragged right far enough to show all inputs — the assembly button row and longer field labels were clipped with no way to reveal them (QGIS 4 / Qt6 was unaffected). The panel now keeps a minimum width and shows a horizontal scrollbar instead of truncating content, and the dialog opens slightly larger with a wider default left share.
+  - Catenary Calculator V2: the Results text box and the plot are now separated by a vertical splitter, so the Results panel can be enlarged or shrunk (previously it was pinned near its minimum height). Both panes keep a minimum height so neither collapses.
+Version 1.6.2:
   - Security-scan compliance only, no functional change from 1.6.1: corrected the placement of Bandit "# nosec" suppressions on the dynamically-built Microsoft Access SQL (table/column identifiers are validated and bracket-quoted; row values use parameter placeholders) and annotated the vendored pyqtgraph SVG exporter's internal XML parsing, so the QGIS plugin repository's automated security scan passes.
 Version 1.6.1:
   - This is a large jump from the previously published version, adding many new tools, algorithms and features in one step. It is published as a work in progress — please sanity-check and double-check results against your own data and established methods, and do not rely on the output uncritically.

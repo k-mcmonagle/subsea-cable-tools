@@ -186,10 +186,10 @@ class CatenaryCalculatorV2Dialog(QDialog):
         super().closeEvent(a0)
 
     def _fit_initial_size_to_screen(self):
-        min_w = 760
-        min_h = 540
-        width = 1180
-        height = 760
+        min_w = 820
+        min_h = 560
+        width = 1240
+        height = 800
         try:
             screen = self.screen() or QApplication.primaryScreen()
             available = screen.availableGeometry() if screen is not None else None
@@ -514,12 +514,19 @@ class CatenaryCalculatorV2Dialog(QDialog):
         # Left: Inputs
         input_widget = QWidget()
         input_layout = QFormLayout(input_widget)
-        input_widget.setMinimumWidth(420)
+        # The widest content (the 5-button assembly row and the longest field
+        # labels) needs roughly this much room to render without clipping.
+        # QGIS 3/Qt5 lays these out wider than QGIS 4/Qt6, so keep the inner
+        # widget at least this wide and let a horizontal scrollbar appear if the
+        # panel is dragged narrower — rather than silently truncating content.
+        input_widget.setMinimumWidth(480)
 
         input_scroll = QScrollArea()
         input_scroll.setWidgetResizable(True)
-        input_scroll.setMinimumWidth(420)
-        input_scroll.setMaximumWidth(540)
+        input_scroll.setMinimumWidth(360)
+        # Deliberately no maximum width: the splitter must stay free to drag
+        # right so every input is reachable. A hard cap here (previously 540 px)
+        # stopped the divider before the widest content was visible on QGIS 3.
         input_scroll.setWidget(input_widget)
 
         # Geometry
@@ -949,15 +956,29 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.solver_diagnostics_btn.setToolTip("Open numerical residuals and convergence checks for the current result.")
         results_header.addWidget(self.solver_diagnostics_btn)
         output_layout.addLayout(results_header)
+        # A vertical splitter lets the user trade height between the Results
+        # text and the plot. Previously the results box was pinned near its
+        # minimum with no way to enlarge or shrink it. childrenCollapsible is
+        # off and each pane keeps a minimum height so neither can vanish.
+        vertical_orientation = getattr(getattr(Qt, "Orientation", Qt), "Vertical")
+        self.output_splitter = QSplitter(vertical_orientation)
+
         self.results = QTextEdit()
         self.results.setReadOnly(True)
-        self.results.setMinimumHeight(130)
-        output_layout.addWidget(self.results)
+        self.results.setMinimumHeight(70)
+        self.output_splitter.addWidget(self.results)
 
         self.figure = Figure(figsize=(6, 5))
         self.canvas = FigureCanvas(self.figure)
         self.canvas.setSizePolicy(SIZE_POLICY_EXPANDING, SIZE_POLICY_EXPANDING)
-        output_layout.addWidget(self.canvas, stretch=1)
+        self.canvas.setMinimumHeight(180)
+        self.output_splitter.addWidget(self.canvas)
+
+        self.output_splitter.setChildrenCollapsible(False)
+        self.output_splitter.setStretchFactor(0, 0)
+        self.output_splitter.setStretchFactor(1, 1)
+        self.output_splitter.setSizes([150, 480])
+        output_layout.addWidget(self.output_splitter, stretch=1)
 
         self.hover_readout = QLabel("")
         self.hover_readout.setWordWrap(False)
@@ -992,7 +1013,9 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self.main_splitter.setCollapsible(0, False)
         self.main_splitter.setStretchFactor(0, 0)
         self.main_splitter.setStretchFactor(1, 1)
-        self.main_splitter.setSizes([460, 800])
+        # Open with the left panel wide enough to show all inputs (incl. the
+        # assembly button row) without the user having to drag the divider.
+        self.main_splitter.setSizes([560, 620])
         main_layout.addWidget(self.main_splitter)
 
         # signals

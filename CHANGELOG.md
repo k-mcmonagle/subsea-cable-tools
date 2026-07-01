@@ -5,6 +5,14 @@ All notable changes to the Subsea Cable Tools QGIS plugin will be documented in 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.3] - 2026-07-01
+
+UI fix for the **Subsea Cable Catenary Calculator V2** dialog layout — **no calculation changes**.
+
+### Fixed
+- **Catenary Calculator V2 (QGIS 3 / Qt5) window layout:** removed the hard maximum width on the left input panel so the main splitter can be dragged fully to the right. On QGIS 3 the panel was capped at 540 px, which clipped the assembly button row and the longer field labels with no way to reveal them (QGIS 4 / Qt6 was unaffected). The inner panel now keeps a minimum width and shows a horizontal scrollbar instead of silently truncating content, and the dialog opens slightly larger with a wider default left share.
+- **Resizable Results panel:** the Results text box and the plot now sit in a vertical splitter, so the Results panel can be enlarged or shrunk (it was previously pinned near its minimum height). Both panes keep a minimum height so neither collapses.
+
 ## [1.6.2] - 2026-07-01
 
 Security-scan compliance patch only — **no functional change** from 1.6.1.
