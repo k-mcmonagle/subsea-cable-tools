@@ -96,3 +96,6 @@ scripts/
 # AI agent tool artifacts (not shipped with plugin)
 .agents/
 .codex/
+
+# ref folders
+ref/

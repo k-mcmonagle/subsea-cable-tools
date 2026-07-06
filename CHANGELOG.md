@@ -5,6 +5,27 @@ All notable changes to the Subsea Cable Tools QGIS plugin will be documented in 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-07-06
+
+**New tool: Cable Lay Simulator (3D), beta** — the next-generation catenary tool (V3), plus removal of the long-deprecated V1 calculator. Catenary Calculator V2 is unchanged.
+
+### Added
+- **Cable Lay Simulator (3D)** (`catenary/v3/`): interactive 3D viewport (software-rendered turntable camera — no OpenGL required, so it works over RDP/VMs), synchronized unrolled **Profile** and **Plan** views, hover readouts, timeline scrubber, and a results pane with convergence diagnostics and warnings. Three modes:
+  - **Static hang** — the V2 physics generalised to three dimensions: multi-segment assemblies (V2-compatible JSON with new diameter/Cd columns), point bodies, Coulomb stick-slip seabed friction and unilateral contact on real bathymetry (flat / planar slope / extruded profile / **grid sampled from a QGIS raster layer**), plus **current drag** (the `H = const` limitation of V2 is gone). Three configurations: a single cable span, a **held branching unit** (static equilibrium at a chosen BU hold depth, with trunk/leg tensions and achieved position) and a **held final bight** (static equilibrium at a chosen apex depth, with hook load and rope tension) — the holds share the geometry inputs and engine of the corresponding operation scenarios, so static checks and time-stepped lowerings are directly comparable.
+  - **Steady lay** — Zajac's stationary configuration solved in the vessel frame by RK4 integration of the 3D force-balance ODEs with Morison drag, material-transport correction and depth-varying current (cross-currents give the lateral touchdown offset). The results pane shows **closed-form quick answers** (hydrodynamic constant H, critical angle, straight-line layback, slope pay-out increments, free-span suspension speed limit, the `w·h` top-tension theorem) next to the numeric solve, so disagreement is itself a diagnostic. Capstan chute-friction machinery-tension readout.
+  - **Operation simulation** — quasi-static time stepping (warm-started equilibria with rate-dependent drag): **Branching-unit deployment** (Y-topology: trunk + two pre-laid legs sharing the BU junction node; per-leg tensions, BU descent and touchdown), **Final bight lay-down** (bight apex lowered on a rope from a stepping vessel; the rope auto-releases when the hook load drops below a threshold) and transient **Straight lay**.
+- Engine (`catenary/v3/engine/`, pure Python + NumPy, no Qt imports): 3D dynamic-relaxation solver generalising the V2 drape solver (multi-chain topologies with junctions, 3D bending moments, bathymetry surfaces, hydrodynamic drag, lumped body drag), steady-lay ODE integrator, timeline simulator and scenario builders.
+- Exports: per-node CSV, timeline summary CSV, true 3D DXF (cables as 3D polylines, seabed wireframe, markers, vessel), and **Send to map** (memory `LineStringZ` layers, georeferenced when the bathymetry was sampled from a project raster).
+- Documentation: `catenary/v3/V3_MODEL_NOTES.md` (assumptions, validation status and what the tool must **not** be used for), `catenary/V3_PLAN.md` (design) and `catenary/v3/REFERENCE_DIGEST.md` (equations and constants distilled from Zajac 1957, the JMSE 2020 papers and the other project references).
+- Automated validation (`tests/test_v3_solver3d.py`, `tests/test_v3_steady_lay.py`, `tests/test_v3_timeline.py`, wired into the QGIS smoke-test runner): closed-form catenary anchors, frame invariance, multi-span regression against the V2 drape solver, drag force balance, Zajac critical angle / top-tension theorem / cross-current behaviour, solve-mode round-trips, BU descent/touchdown and bight release/settle behaviour.
+
+### Removed
+- **Catenary Calculator (Legacy V1)** toolbar action and dialog (deprecated with a removal notice since 1.6). The closed-form core `catenary/simple_catenary.py` is retained as a validation oracle for the test suite. Use Catenary Calculator V2 (2D) or the new Cable Lay Simulator (3D).
+
+### Notes
+- The V3 engine is validated against closed forms, the V2 solver and physical invariants, but **not** against commercial lay-simulation software or field measurements — treat results as planning-grade estimates (beta), and review `V3_MODEL_NOTES.md` before operational use.
+- No new dependencies (NumPy, bundled pyqtgraph, Qt via qgis.PyQt).
+
 ## [1.6.3] - 2026-07-01
 
 UI fix for the **Subsea Cable Catenary Calculator V2** dialog layout — **no calculation changes**.

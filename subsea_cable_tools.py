@@ -63,10 +63,10 @@ class SubseaCableTools:
         # UI elements (dock widgets / actions)
         self.plotter_dock = None
         self.plotter_action = None
-        self.catenary_action = None
-        self.catenary_calculator_dialog = None
         self.catenary_v2_action = None
         self.catenary_calculator_v2_dialog = None
+        self.lay_simulator_action = None
+        self.lay_simulator_dialog = None
         self.depth_profile_dock = None
         self.depth_profile_action = None
         self.transit_measure_action = None
@@ -116,15 +116,6 @@ class SubseaCableTools:
         self.iface.addPluginToMenu(self.menu, self.depth_profile_action)
         self.actions.append(self.depth_profile_action)
 
-        # Add action for Catenary Calculator (legacy v1; planned for removal in 1.6 in favour of V2).
-        icon_path = os.path.join(self.plugin_dir, 'catenary_icon.png')
-        self.catenary_action = QAction(QIcon(icon_path), "Catenary Calculator (Legacy)", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
-        self.catenary_action.setToolTip("Legacy Catenary Calculator. Planned for removal in 1.6; use Catenary Calculator V2.")
-        self.catenary_action.triggered.connect(self.show_catenary_calculator)
-        self.iface.addToolBarIcon(self.catenary_action)
-        self.iface.addPluginToMenu(self.menu, self.catenary_action)
-        self.actions.append(self.catenary_action)
-
         # Add action for Catenary Calculator V2
         icon_v2_path = os.path.join(self.plugin_dir, 'catenary_icon_v2.png')
         if not os.path.exists(icon_v2_path):
@@ -134,6 +125,17 @@ class SubseaCableTools:
         self.iface.addToolBarIcon(self.catenary_v2_action)
         self.iface.addPluginToMenu(self.menu, self.catenary_v2_action)
         self.actions.append(self.catenary_v2_action)
+
+        # Add action for the Cable Lay Simulator (3D) — catenary V3
+        icon_v3_path = os.path.join(self.plugin_dir, 'lay_simulator_icon.png')
+        if not os.path.exists(icon_v3_path):
+            icon_v3_path = os.path.join(self.plugin_dir, 'catenary_icon_v2.png')  # Fallback
+        self.lay_simulator_action = QAction(QIcon(icon_v3_path), "Cable Lay Simulator (3D)", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
+        self.lay_simulator_action.setToolTip("Cable Lay Simulator (3D): static hang, steady lay with drag, and operation simulation (beta).")
+        self.lay_simulator_action.triggered.connect(self.show_lay_simulator)
+        self.iface.addToolBarIcon(self.lay_simulator_action)
+        self.iface.addPluginToMenu(self.menu, self.lay_simulator_action)
+        self.actions.append(self.lay_simulator_action)
 
         # Transit Measure Tool action
         transit_icon_path = os.path.join(self.plugin_dir, 'transit_measure_icon.png')
@@ -147,26 +149,6 @@ class SubseaCableTools:
         self.iface.addToolBarIcon(self.transit_measure_action)
         self.iface.addPluginToMenu(self.menu, self.transit_measure_action)
         self.actions.append(self.transit_measure_action)
-
-    def show_catenary_calculator(self):
-        if self.catenary_calculator_dialog is None:
-            try:
-                from .catenary.catenary_calculator_dialog import CatenaryCalculatorDialog
-            except Exception as e:
-                from qgis.PyQt.QtWidgets import QMessageBox
-
-                QMessageBox.critical(
-                    self.iface.mainWindow(),
-                    "Subsea Cable Tools",
-                    "Catenary Calculator could not be opened.\n\n"
-                    f"Details: {e}",
-                )
-                return
-
-            self.catenary_calculator_dialog = CatenaryCalculatorDialog(self.iface.mainWindow())
-        self.catenary_calculator_dialog.show()
-        self.catenary_calculator_dialog.raise_()
-        self.catenary_calculator_dialog.activateWindow()
 
     def show_catenary_calculator_v2(self):
         if self.catenary_calculator_v2_dialog is None:
@@ -187,6 +169,26 @@ class SubseaCableTools:
         self.catenary_calculator_v2_dialog.show()
         self.catenary_calculator_v2_dialog.raise_()
         self.catenary_calculator_v2_dialog.activateWindow()
+
+    def show_lay_simulator(self):
+        if self.lay_simulator_dialog is None:
+            try:
+                from .catenary.v3.ui.dialog import LaySimulatorDialog
+            except Exception as e:
+                from qgis.PyQt.QtWidgets import QMessageBox
+
+                QMessageBox.critical(
+                    self.iface.mainWindow(),
+                    "Subsea Cable Tools",
+                    "Cable Lay Simulator (3D) could not be opened.\n\n"
+                    f"Details: {e}",
+                )
+                return
+
+            self.lay_simulator_dialog = LaySimulatorDialog(self.iface.mainWindow(), iface=self.iface)
+        self.lay_simulator_dialog.show()
+        self.lay_simulator_dialog.raise_()
+        self.lay_simulator_dialog.activateWindow()
 
     def unload(self):
         """Remove the plugin menu items and icons from QGIS GUI and clean up all resources."""
@@ -291,11 +293,11 @@ class SubseaCableTools:
         if hasattr(self, 'dlg'):
             self.dlg = None
 
-        if hasattr(self, 'catenary_calculator_dialog'):
-            self.catenary_calculator_dialog = None
-
         if hasattr(self, 'catenary_calculator_v2_dialog'):
             self.catenary_calculator_v2_dialog = None
+
+        if hasattr(self, 'lay_simulator_dialog'):
+            self.lay_simulator_dialog = None
 
         # Remove menu reference
         if hasattr(self, 'menu'):

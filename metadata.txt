@@ -3,7 +3,7 @@ name=Subsea Cable Tools
 qgisMinimumVersion=3.22
 qgisMaximumVersion=4.99
 description=Tools to support working with subsea cable data in QGIS.
-version=1.6.3
+version=1.7.0
 author=Kieran McMonagle
 email=kieran.mcmonagle@globalmarine.group
 
@@ -15,7 +15,14 @@ repository=https://github.com/k-mcmonagle/subsea-cable-tools
 hasProcessingProvider=yes
 
 # changelog
-changelog=Version 1.6.3:
+changelog=Version 1.7.0:
+  - NEW: Cable Lay Simulator (3D), beta — the next-generation catenary tool (V3). Interactive 3D view (orbit/zoom/pan, software-rendered, works over RDP), synchronized Profile and Plan views, and three modes: Static hang (V2 physics generalised to 3D bathymetry with current drag; single span, held branching unit at a chosen depth, or held final bight at a chosen apex depth), Steady lay (ship speed + pay-out solved in the vessel frame with hydrodynamic drag, validated against Zajac 1957 closed forms shown live as "quick answers"), and Operation simulation (quasi-static time stepping with a timeline scrubber).
+  - Operation scenarios: Branching-unit deployment (trunk + two pre-laid legs joined at the BU, per-leg tensions and touchdown), Final bight lay-down (bight lowered from a stepping vessel on an auto-released rope), and transient Straight lay.
+  - Hydrodynamic drag throughout (Morison-type, per-segment diameter/Cd, depth-varying current profile), Coulomb seabed friction on 3D bathymetry (flat/slope/profile/QGIS raster sampling), V2-compatible assembly JSON with new hydro columns, chute capstan-friction readout, MBR checking, CSV/3D-DXF export and results-to-map memory layers.
+  - Engineering honesty: every mode documents assumptions and validation status in catenary/v3/V3_MODEL_NOTES.md; results panes carry convergence diagnostics and warnings. Validated against closed-form catenary, Zajac 1957 (critical angle, top-tension theorem, cross-current offsets), the V2 drape solver, and physical invariants (automated tests). NOT yet verified against commercial lay software or field data — treat as planning-grade.
+  - Removed the deprecated Catenary Calculator (Legacy V1) toolbar action (deprecation notice since 1.6). Catenary Calculator V2 is unchanged and remains the recommended 2D tool.
+  - No new dependencies: NumPy + bundled pyqtgraph + Qt only.
+Version 1.6.3:
   - Catenary Calculator V2 (UI only, no calculation changes): fixed the dialog layout on QGIS 3 / Qt5, where the left input panel was capped too narrow and the splitter could not be dragged right far enough to show all inputs — the assembly button row and longer field labels were clipped with no way to reveal them (QGIS 4 / Qt6 was unaffected). The panel now keeps a minimum width and shows a horizontal scrollbar instead of truncating content, and the dialog opens slightly larger with a wider default left share.
   - Catenary Calculator V2: the Results text box and the plot are now separated by a vertical splitter, so the Results panel can be enlarged or shrunk (previously it was pinned near its minimum height). Both panes keep a minimum height so neither collapses.
 Version 1.6.2:
