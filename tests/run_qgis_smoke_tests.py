@@ -11,7 +11,7 @@ from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 PACKAGE_NAME = "subsea_cable_tools"
-EXPECTED_ALGORITHM_COUNT = 36
+EXPECTED_ALGORITHM_COUNT = 37
 
 
 def _require_qgis() -> None:
@@ -113,6 +113,12 @@ def main() -> int:
         ("lay simulator timeline (V3)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_v3_timeline")),
         ("seabed length algorithm", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_seabed_length")),
         ("cable lay importers", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_cable_lay_importers")),
+        ("workbench store", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_workbench_store")),
+        ("workbench RPL engine", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_rpl_engine")),
+        ("workbench assembly + fit", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_fit")),
+        ("workbench topology + V3 adapter", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_workbench_adapter")),
+        ("workbench rules engine", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_rules_engine")),
+        ("workbench rules inputs + migrate", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_rules_inputs")),
         ("processing provider", _provider_loads),
         ("main plugin import", _plugin_imports),
     ]

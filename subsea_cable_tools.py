@@ -71,6 +71,8 @@ class SubseaCableTools:
         self.depth_profile_action = None
         self.transit_measure_action = None
         self.transit_measure_tool = None
+        self.workbench_dock = None
+        self.workbench_action = None
 
     def tr(self, message):
         """Return the translation for a string."""
@@ -136,6 +138,18 @@ class SubseaCableTools:
         self.iface.addToolBarIcon(self.lay_simulator_action)
         self.iface.addPluginToMenu(self.menu, self.lay_simulator_action)
         self.actions.append(self.lay_simulator_action)
+
+        # Cable Route Workbench (assemblies + RPLs + systems in one dock)
+        wb_icon = QIcon(":/plugins/subsea_cable_tools/icon.png")
+        wb_icon_path = os.path.join(self.plugin_dir, 'workbench_icon.png')
+        if os.path.exists(wb_icon_path):
+            wb_icon = QIcon(wb_icon_path)
+        self.workbench_action = QAction(wb_icon, "Cable Route Workbench", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
+        self.workbench_action.setToolTip("Cable Route Workbench: assemblies, RPLs, fits, and cable systems — with map editing and an SLD.")
+        self.workbench_action.triggered.connect(self.show_workbench)
+        self.iface.addToolBarIcon(self.workbench_action)
+        self.iface.addPluginToMenu(self.menu, self.workbench_action)
+        self.actions.append(self.workbench_action)
 
         # Transit Measure Tool action
         transit_icon_path = os.path.join(self.plugin_dir, 'transit_measure_icon.png')
@@ -253,6 +267,18 @@ class SubseaCableTools:
                 pass
             self.depth_profile_dock = None
 
+        # Clean up the Cable Route Workbench dock
+        if getattr(self, 'workbench_dock', None):
+            try:
+                self.iface.removeDockWidget(self.workbench_dock)
+            except Exception:
+                pass
+            try:
+                self.workbench_dock.deleteLater()
+            except Exception:
+                pass
+            self.workbench_dock = None
+
         # Remove actions from menu and toolbar
         if hasattr(self, 'actions'):
             for action in self.actions:
@@ -348,6 +374,27 @@ class SubseaCableTools:
             self.depth_profile_dock = DepthProfileDockWidget(self.iface)
             self.iface.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.depth_profile_dock)
         self.depth_profile_dock.show()
+
+    def show_workbench(self):
+        """Show the Cable Route Workbench dock."""
+        if not self.workbench_dock:
+            try:
+                from .workbench.workbench_dock import WorkbenchDock
+            except Exception as e:
+                from qgis.PyQt.QtWidgets import QMessageBox
+
+                QMessageBox.critical(
+                    self.iface.mainWindow(),
+                    "Subsea Cable Tools",
+                    "Cable Route Workbench could not be opened.\n\n"
+                    f"Details: {e}",
+                )
+                return
+
+            self.workbench_dock = WorkbenchDock(self.iface)
+            self.iface.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.workbench_dock)
+        self.workbench_dock.show()
+        self.workbench_dock.refresh_tree()
 
     def activate_transit_measure_tool(self):
         if self.transit_measure_tool is None:

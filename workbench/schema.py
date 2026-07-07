@@ -1,0 +1,407 @@
+# -*- coding: utf-8 -*-
+"""Cable Route Workbench GeoPackage schema.
+
+Declarative field specs for the workbench registry tables plus the per-RPL
+spatial layer schemas. Field specs are ``(name, type_str)`` tuples using the
+same type strings as processing/cable_lay_parsers.py (``str``/``float``/``int``).
+
+Table overview (all registry tables are geometryless GPKG layers):
+
+- wb_meta            key/value store (schema_version, created_utc)
+- wb_assembly        assembly headers (cable or rigging)
+- wb_assembly_item   ordered sections/bodies of an assembly
+- wb_rpl             RPL registry (points/lines layer names + settings)
+- wb_fit             assembly <-> RPL fit anchors
+- wb_event_rule      RPL event classification rules (body|geographic|installation)
+- wb_component       CRA-style topology: components (rpl|assembly|node)
+- wb_port            CRA-style topology: ports on components
+- wb_connection      CRA-style topology: undirected port-to-port edges
+- wb_system          named systems (membership derived from the port graph)
+
+Per-RPL spatial layers mirror the Import Excel RPL output schema verbatim,
+plus ``rpl_id`` and ``SeqNo`` bookkeeping columns. ``PosNo`` is a document
+identity and is never auto-renumbered; ordering lives in ``SeqNo``.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import time
+from typing import Dict, List, Tuple
+
+SCHEMA_VERSION = 2
+
+# Registry table names ------------------------------------------------------
+TABLE_META = "wb_meta"
+TABLE_ASSEMBLY = "wb_assembly"
+TABLE_ASSEMBLY_ITEM = "wb_assembly_item"
+TABLE_RPL = "wb_rpl"
+TABLE_FIT = "wb_fit"
+TABLE_EVENT_RULE = "wb_event_rule"
+TABLE_COMPONENT = "wb_component"
+TABLE_PORT = "wb_port"
+TABLE_CONNECTION = "wb_connection"
+TABLE_SYSTEM = "wb_system"
+# Route-suitability / burial-assessment rules engine (schema v2)
+TABLE_RULE_SET = "wb_rule_set"
+TABLE_RULE = "wb_rule"
+TABLE_ASSESSMENT = "wb_assessment"
+TABLE_ASSESSMENT_RANGE = "wb_assessment_range"
+
+FieldSpec = Tuple[str, str]
+
+META_FIELDS: List[FieldSpec] = [
+    ("key", "str"),
+    ("value", "str"),
+]
+
+ASSEMBLY_FIELDS: List[FieldSpec] = [
+    ("assembly_id", "str"),
+    ("name", "str"),
+    ("kind", "str"),          # cable | rigging
+    ("description", "str"),
+    ("source", "str"),        # manual | rpl_extract | catenary_json | excel
+    ("source_ref", "str"),
+    ("total_cable_len_m", "float"),
+    ("created_utc", "str"),
+    ("modified_utc", "str"),
+]
+
+# One table for both sections and bodies; ``kind`` discriminates and ``seq``
+# is the authoritative order. Matches the V2 catenary assembly columns plus
+# the V3 hydro columns so catenary JSON round-trips losslessly.
+ASSEMBLY_ITEM_FIELDS: List[FieldSpec] = [
+    ("item_id", "str"),
+    ("assembly_id", "str"),
+    ("seq", "int"),
+    ("kind", "str"),                  # section | body
+    ("name", "str"),
+    ("length_m", "float"),
+    ("cable_dist_start_m", "float"),  # derived cache
+    ("q_water_npm", "float"),
+    ("q_air_npm", "float"),
+    ("point_load_kN", "float"),
+    ("friction_mu", "float"),
+    ("bending_stiffness_kNm2", "float"),
+    ("min_bend_radius_m", "float"),
+    ("diameter_m", "float"),
+    ("cd_normal", "float"),
+    ("cd_tangential", "float"),
+    ("cable_type", "str"),
+    ("cable_code", "str"),
+    ("fiber_pair", "str"),
+    ("color_hex", "str"),
+    ("remarks", "str"),
+]
+
+RPL_FIELDS: List[FieldSpec] = [
+    ("rpl_id", "str"),
+    ("name", "str"),
+    ("kind", "str"),                 # planned | as_laid
+    ("points_layer", "str"),
+    ("lines_layer", "str"),
+    ("source_file", "str"),
+    ("slack_mode", "str"),           # hold_slack | hold_cable
+    ("depth_source_config", "str"),  # JSON
+    ("created_utc", "str"),
+    ("modified_utc", "str"),
+    ("notes", "str"),
+]
+
+FIT_FIELDS: List[FieldSpec] = [
+    ("fit_id", "str"),
+    ("assembly_id", "str"),
+    ("rpl_id", "str"),
+    ("anchor_kp_km", "float"),
+    ("anchor_cable_dist_m", "float"),
+    ("direction", "int"),  # +1 = assembly runs with increasing KP
+    ("params_json", "str"),
+    ("created_utc", "str"),
+]
+
+EVENT_RULE_FIELDS: List[FieldSpec] = [
+    ("rule_id", "str"),
+    ("pattern", "str"),    # regex matched case-insensitively against Event text
+    ("category", "str"),   # body | geographic | installation
+    ("body_type", "str"),  # joint | repeater | bu | ... (body rules only)
+    ("priority", "int"),   # lower number wins
+]
+
+COMPONENT_FIELDS: List[FieldSpec] = [
+    ("component_id", "str"),
+    ("kind", "str"),        # rpl | assembly | node
+    ("subject_id", "str"),  # wb_rpl.rpl_id / wb_assembly.assembly_id, NULL for nodes
+    ("name", "str"),
+    ("node_type", "str"),   # nodes only: bmh | bu | joint | other
+    ("lat", "float"),       # nodes only, optional
+    ("lon", "float"),
+    ("system_id", "str"),   # cached derived assignment
+]
+
+PORT_FIELDS: List[FieldSpec] = [
+    ("port_id", "str"),
+    ("component_id", "str"),
+    ("label", "str"),  # A/B for linear things; trunk_in|trunk_out|branch for a BU
+]
+
+CONNECTION_FIELDS: List[FieldSpec] = [
+    ("connection_id", "str"),
+    ("port_a_id", "str"),
+    ("port_b_id", "str"),
+]
+
+SYSTEM_FIELDS: List[FieldSpec] = [
+    ("system_id", "str"),
+    ("name", "str"),
+    ("notes", "str"),
+]
+
+# Rules engine (schema v2) --------------------------------------------------
+# A rule set is an ordered stack of rules (like Excel conditional formatting).
+# An assessment applies one rule set to one RPL and produces per-method
+# KP-range verdicts (allowed | risk | excluded) with provenance.
+
+RULE_SET_FIELDS: List[FieldSpec] = [
+    ("rule_set_id", "str"),
+    ("name", "str"),
+    ("description", "str"),
+    ("methods_json", "str"),   # JSON list, e.g. ["plough","jet","surface"]
+    ("created_utc", "str"),
+    ("modified_utc", "str"),
+]
+
+RULE_FIELDS: List[FieldSpec] = [
+    ("rule_id", "str"),
+    ("rule_set_id", "str"),
+    ("seq", "int"),            # evaluation order (top-to-bottom)
+    ("name", "str"),
+    ("enabled", "int"),        # 0/1
+    ("kind", "str"),           # threshold_profile | proximity | polygon_class | kp_range_table | manual
+    ("action", "str"),         # exclude | risk | allow
+    ("risk_level", "int"),     # 1..3 for action=risk, else 0
+    ("methods_json", "str"),   # JSON subset of the set's methods this rule applies to
+    ("config_json", "str"),    # kind-specific payload (+ optional scope_ranges)
+    ("notes", "str"),
+]
+
+ASSESSMENT_FIELDS: List[FieldSpec] = [
+    ("assessment_id", "str"),
+    ("rpl_id", "str"),
+    ("rule_set_id", "str"),
+    ("name", "str"),
+    ("sample_step_m", "float"),
+    ("min_range_km", "float"),
+    ("rules_snapshot_json", "str"),  # frozen rules at run time (reproducibility)
+    ("ranges_layer", "str"),         # spatial output layer name
+    ("status", "str"),               # "" | stale | current
+    ("run_utc", "str"),
+    ("created_utc", "str"),
+    ("modified_utc", "str"),
+]
+
+ASSESSMENT_RANGE_FIELDS: List[FieldSpec] = [
+    ("range_id", "str"),
+    ("assessment_id", "str"),
+    ("method", "str"),
+    ("start_kp", "float"),
+    ("end_kp", "float"),
+    ("status", "str"),          # allowed | risk | excluded
+    ("risk_level", "int"),      # resolved severity 0..4
+    ("fired_rules_json", "str"),
+    ("dominant_rule_id", "str"),
+    ("notes", "str"),
+]
+
+REGISTRY_TABLES: Dict[str, List[FieldSpec]] = {
+    TABLE_META: META_FIELDS,
+    TABLE_ASSEMBLY: ASSEMBLY_FIELDS,
+    TABLE_ASSEMBLY_ITEM: ASSEMBLY_ITEM_FIELDS,
+    TABLE_RPL: RPL_FIELDS,
+    TABLE_FIT: FIT_FIELDS,
+    TABLE_EVENT_RULE: EVENT_RULE_FIELDS,
+    TABLE_COMPONENT: COMPONENT_FIELDS,
+    TABLE_PORT: PORT_FIELDS,
+    TABLE_CONNECTION: CONNECTION_FIELDS,
+    TABLE_SYSTEM: SYSTEM_FIELDS,
+    TABLE_RULE_SET: RULE_SET_FIELDS,
+    TABLE_RULE: RULE_FIELDS,
+    TABLE_ASSESSMENT: ASSESSMENT_FIELDS,
+    TABLE_ASSESSMENT_RANGE: ASSESSMENT_RANGE_FIELDS,
+}
+
+# Primary key field per table (single-column keys).
+TABLE_KEYS: Dict[str, str] = {
+    TABLE_ASSEMBLY: "assembly_id",
+    TABLE_ASSEMBLY_ITEM: "item_id",
+    TABLE_RPL: "rpl_id",
+    TABLE_FIT: "fit_id",
+    TABLE_EVENT_RULE: "rule_id",
+    TABLE_COMPONENT: "component_id",
+    TABLE_PORT: "port_id",
+    TABLE_CONNECTION: "connection_id",
+    TABLE_SYSTEM: "system_id",
+    TABLE_RULE_SET: "rule_set_id",
+    TABLE_RULE: "rule_id",
+    TABLE_ASSESSMENT: "assessment_id",
+    TABLE_ASSESSMENT_RANGE: "range_id",
+}
+
+# Per-RPL spatial layers ----------------------------------------------------
+# Mirrors processing/import_excel_rpl_algorithm.py output plus bookkeeping.
+RPL_POINT_FIELDS: List[FieldSpec] = [
+    ("rpl_id", "str"),
+    ("SeqNo", "int"),
+    ("PosNo", "int"),
+    ("Event", "str"),
+    ("DistCumulative", "float"),
+    ("CableDistCumulative", "float"),
+    ("ApproxDepth", "float"),
+    ("Remarks", "str"),
+    ("ChartNo", "int"),
+    ("Latitude", "float"),
+    ("Longitude", "float"),
+    ("SourceFile", "str"),
+]
+
+RPL_LINE_FIELDS: List[FieldSpec] = [
+    ("rpl_id", "str"),
+    ("SeqNo", "int"),
+    ("FromPos", "int"),
+    ("ToPos", "int"),
+    ("Bearing", "float"),
+    ("DistBetweenPos", "float"),
+    ("Slack", "float"),
+    ("CableDistBetweenPos", "float"),
+    ("CableCode", "str"),
+    ("FiberPair", "str"),
+    ("CableType", "str"),
+    ("LayDirection", "str"),
+    ("LayVessel", "str"),
+    ("ProtectionMethod", "str"),
+    ("DateInstalled", "str"),
+    ("TargetBurialDepth", "float"),
+    ("BurialDepth", "float"),
+    ("TerritorialWater", "str"),
+    ("EEZ", "str"),
+    ("SourceFile", "str"),
+]
+
+# Event classification defaults ---------------------------------------------
+# (pattern, category, body_type, priority). Matched case-insensitively with
+# re.search against the point Event text; lowest priority number wins.
+# Unmatched events are treated as "installation" with a validation note —
+# never silently as a body.
+CATEGORY_BODY = "body"
+CATEGORY_GEOGRAPHIC = "geographic"
+CATEGORY_INSTALLATION = "installation"
+
+DEFAULT_EVENT_RULES: List[Tuple[str, str, str, int]] = [
+    (r"branching\s*unit|\bbu\b", CATEGORY_BODY, "bu", 10),
+    (r"repeater|\brptr\b", CATEGORY_BODY, "repeater", 20),
+    (r"joint|\bjt\b|bujb|\bjb\d|\bujb", CATEGORY_BODY, "joint", 30),
+    (r"\bbmh\b|beach\s*man\s*hole|beach\s*manhole", CATEGORY_BODY, "bmh", 40),
+    (r"crossing|\bxing\b", CATEGORY_GEOGRAPHIC, "", 50),
+    (r"\brbp\s*\d*\b|route\s*branch", CATEGORY_GEOGRAPHIC, "", 55),
+    (r"\bpldn\b|\bplup\b|plough|burial|\bdse\b|start\s+of|end\s+of|\bsol\b|\beol\b|slack\s*box",
+     CATEGORY_INSTALLATION, "", 60),
+    (r"\bacp?\s*\d*\b|alter\s*course", CATEGORY_GEOGRAPHIC, "", 70),
+    (r"\bwd\s*\d", CATEGORY_GEOGRAPHIC, "", 75),          # water depth marks (WD 1000)
+    (r"^\s*tr\b|transition", CATEGORY_INSTALLATION, "", 80),  # cable type transitions (Tr DAS/SA)
+]
+
+# Route-suitability defaults ------------------------------------------------
+# Rule actions and the severity lattice used by rules_engine.evaluate():
+#   allowed (0) < risk 1 < risk 2 < risk 3 < excluded (4)
+RULE_ACTION_EXCLUDE = "exclude"
+RULE_ACTION_RISK = "risk"
+RULE_ACTION_ALLOW = "allow"
+
+RULE_KIND_THRESHOLD = "threshold_profile"
+RULE_KIND_PROXIMITY = "proximity"
+RULE_KIND_POLYGON = "polygon_class"
+RULE_KIND_KP_TABLE = "kp_range_table"
+RULE_KIND_MANUAL = "manual"
+
+SEVERITY_ALLOWED = 0
+SEVERITY_EXCLUDED = 4
+
+STATUS_ALLOWED = "allowed"
+STATUS_RISK = "risk"
+STATUS_EXCLUDED = "excluded"
+
+DEFAULT_ASSESSMENT_METHODS: List[str] = ["plough", "jet", "surface"]
+
+# Seed rule-set template. Only kinds that need no project-specific layer are
+# seeded (depth/slope thresholds); the user adds proximity/soil/table rules.
+# Each entry: (name, kind, action, risk_level, methods, config_dict).
+DEFAULT_RULE_SET_NAME = "Burial Assessment"
+DEFAULT_RULES: List[Tuple[str, str, str, int, List[str], Dict]] = [
+    ("Water depth > 1500 m", RULE_KIND_THRESHOLD, RULE_ACTION_EXCLUDE, 0, ["plough"],
+     {"profile": "depth", "op": ">", "value": 1500.0, "value2": None, "abs": False}),
+    ("Water depth > 2000 m", RULE_KIND_THRESHOLD, RULE_ACTION_EXCLUDE, 0, ["jet"],
+     {"profile": "depth", "op": ">", "value": 2000.0, "value2": None, "abs": False}),
+    ("Seabed slope > 10 deg", RULE_KIND_THRESHOLD, RULE_ACTION_EXCLUDE, 0, ["plough", "jet"],
+     {"profile": "slope", "op": ">", "value": 10.0, "value2": None, "abs": True}),
+    ("Seabed slope 5-10 deg (caution)", RULE_KIND_THRESHOLD, RULE_ACTION_RISK, 2, ["plough", "jet"],
+     {"profile": "slope", "op": "between", "value": 5.0, "value2": 10.0, "abs": True}),
+]
+
+
+def sanitize_slug(name: str) -> str:
+    """Sanitise a human name into a safe GeoPackage table-name fragment."""
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", name or "").strip("_")
+    return slug or "unnamed"
+
+
+def rpl_points_layer_name(rpl_name: str) -> str:
+    return f"rpl_{sanitize_slug(rpl_name)}_points"
+
+
+def rpl_lines_layer_name(rpl_name: str) -> str:
+    return f"rpl_{sanitize_slug(rpl_name)}_lines"
+
+
+def fit_bodies_layer_name(fit_name: str) -> str:
+    return f"wb_fit_bodies_{sanitize_slug(fit_name)}"
+
+
+def fit_sections_layer_name(fit_name: str) -> str:
+    return f"wb_fit_sections_{sanitize_slug(fit_name)}"
+
+
+def assessment_ranges_layer_name(assessment_name: str) -> str:
+    return f"wb_assess_{sanitize_slug(assessment_name)}_ranges"
+
+
+def default_gpkg_path(project_path: str, project_title: str = "") -> str:
+    """Default workbench GeoPackage path beside the project file."""
+    if project_path:
+        folder = os.path.dirname(project_path)
+        stem = os.path.splitext(os.path.basename(project_path))[0]
+    else:
+        folder = os.getcwd()
+        stem = sanitize_slug(project_title) if project_title else "project"
+    return os.path.join(folder, f"{stem}_workbench.gpkg")
+
+
+def new_id() -> str:
+    """Generate a UUIDv7 string (time-ordered, per the CRA spec preference)."""
+    import random
+
+    unix_ms = int(time.time() * 1000)
+    rand_a = random.getrandbits(12)
+    rand_b = random.getrandbits(62)
+    value = (unix_ms & ((1 << 48) - 1)) << 80
+    value |= 0x7 << 76          # version 7
+    value |= rand_a << 64
+    value |= 0b10 << 62         # variant
+    value |= rand_b
+    hex_str = f"{value:032x}"
+    return f"{hex_str[0:8]}-{hex_str[8:12]}-{hex_str[12:16]}-{hex_str[16:20]}-{hex_str[20:32]}"
+
+
+def utc_now_iso() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

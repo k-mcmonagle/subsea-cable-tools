@@ -37,6 +37,7 @@ from qgis.core import (
     QgsWkbTypes,
 )
 from ..qgis_compat import FIELD_TYPE_DOUBLE, GEOMETRY_LINE, GEOMETRY_POLYGON, PROCESSING_NUMBER_DOUBLE
+from . import depth_sampling
 
 
 class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
@@ -676,18 +677,7 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
         rasters: Sequence[QgsRasterLayer],
         line_crs,
     ) -> List[Tuple[QgsRasterLayer, Optional[QgsCoordinateTransform]]]:
-        samplers: List[Tuple[QgsRasterLayer, Optional[QgsCoordinateTransform]]] = []
-        for r in rasters:
-            if not r:
-                continue
-            transform = None
-            if r.crs() != line_crs:
-                try:
-                    transform = QgsCoordinateTransform(line_crs, r.crs(), QgsProject.instance())
-                except Exception:
-                    transform = None
-            samplers.append((r, transform))
-        return samplers
+        return depth_sampling.build_raster_samplers(rasters, line_crs)
 
     @staticmethod
     def _build_contour_samplers(
@@ -695,20 +685,7 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
         depth_fields: Sequence[str],
         line_crs,
     ) -> List[Tuple[QgsVectorLayer, str, Optional[QgsCoordinateTransform]]]:
-        out: List[Tuple[QgsVectorLayer, str, Optional[QgsCoordinateTransform]]] = []
-        for i, lyr in enumerate(contour_layers):
-            if not lyr:
-                continue
-            depth_field = depth_fields[i] if i < len(depth_fields) else ''
-            # If user didn't pick a field, we'll fall back to the first field at runtime.
-            transform = None
-            if lyr.crs() != line_crs:
-                try:
-                    transform = QgsCoordinateTransform(line_crs, lyr.crs(), QgsProject.instance())
-                except Exception:
-                    transform = None
-            out.append((lyr, depth_field, transform))
-        return out
+        return depth_sampling.build_contour_samplers(contour_layers, depth_fields, line_crs)
 
     @staticmethod
     def _sample_depth(
@@ -720,118 +697,15 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
         context,
     ) -> Optional[float]:
         # depth_source_mode: 0=Auto, 1=Raster, 2=Contours
-        want_raster = depth_source_mode in (0, 1)
-        want_contours = depth_source_mode in (0, 2)
-        if depth_source_mode == 1:
-            want_contours = False
-        if depth_source_mode == 2:
-            want_raster = False
-
-        if want_raster and raster_samplers:
-            for raster, transform in raster_samplers:
-                sample_pt = point
-                if transform is not None:
-                    try:
-                        sample_pt = transform.transform(point)
-                    except Exception:
-                        continue
-                try:
-                    val, ok = raster.dataProvider().sample(sample_pt, 1)
-                except Exception:
-                    ok = False
-                    val = None
-                if ok and val is not None:
-                    try:
-                        return float(val)
-                    except Exception:
-                        continue
-
-        if want_contours and contour_samplers:
-            best_depth = None
-            best_dist = None
-            for lyr, depth_field, transform in contour_samplers:
-                if not lyr:
-                    continue
-
-                query_point = point
-                if transform is not None:
-                    try:
-                        query_point = transform.transform(point)
-                    except Exception:
-                        continue
-
-                pt_geom = QgsGeometry.fromPointXY(query_point)
-
-                # Cheap bbox filter using buffer radius if supplied
-                feat_iter = None
-                if contour_search_radius_m and contour_search_radius_m > 0:
-                    if lyr.crs().isGeographic():
-                        # Approx meters -> degrees (best-effort, avoids absurd bbox sizes)
-                        lat = query_point.y()
-                        deg_lat = contour_search_radius_m / 111320.0
-                        cos_lat = max(0.1, abs(__import__('math').cos(__import__('math').radians(lat))))
-                        deg_lon = contour_search_radius_m / (111320.0 * cos_lat)
-                        rect = pt_geom.boundingBox()
-                        rect.setXMinimum(rect.xMinimum() - deg_lon)
-                        rect.setXMaximum(rect.xMaximum() + deg_lon)
-                        rect.setYMinimum(rect.yMinimum() - deg_lat)
-                        rect.setYMaximum(rect.yMaximum() + deg_lat)
-                        request = QgsFeatureRequest().setFilterRect(rect)
-                        feat_iter = lyr.getFeatures(request)
-                    else:
-                        rect = pt_geom.buffer(contour_search_radius_m, 8).boundingBox()
-                        request = QgsFeatureRequest().setFilterRect(rect)
-                        feat_iter = lyr.getFeatures(request)
-                if feat_iter is None:
-                    feat_iter = lyr.getFeatures()
-
-                # Distance computation in meters if layer CRS is geographic
-                dist_area = None
-                if lyr.crs().isGeographic():
-                    dist_area = make_distance_area(
-                        lyr.crs(), context.transformContext(), project=context.project()
-                    )
-
-                for feat in feat_iter:
-                    g = feat.geometry()
-                    if not g or g.isEmpty():
-                        continue
-
-                    if dist_area is None:
-                        # Projected layer: geometry distance matches meters (or at least linear units)
-                        dist = g.distance(pt_geom)
-                        if contour_search_radius_m and contour_search_radius_m > 0 and dist > contour_search_radius_m:
-                            continue
-                    else:
-                        # Geographic layer: compute geodesic distance to closest point
-                        try:
-                            closest = g.closestPoint(pt_geom)
-                            closest_pt = closest.asPoint() if not closest.isEmpty() else None
-                            if closest_pt is None:
-                                continue
-                            dist = dist_area.measureLine(query_point, QgsPointXY(closest_pt))
-                        except Exception:
-                            continue
-                        if contour_search_radius_m and contour_search_radius_m > 0 and dist > contour_search_radius_m:
-                            continue
-
-                    if best_dist is None or dist < best_dist:
-                        # Extract depth
-                        if depth_field and depth_field in feat.fields().names():
-                            z = feat[depth_field]
-                        else:
-                            names = feat.fields().names()
-                            z = feat[names[0]] if names else None
-                        try:
-                            zf = float(z)
-                        except Exception:
-                            continue
-                        best_dist = dist
-                        best_depth = zf
-
-            return best_depth
-
-        return None
+        return depth_sampling.sample_depth(
+            point,
+            depth_source_mode,
+            raster_samplers,
+            contour_samplers,
+            contour_search_radius_m,
+            context.transformContext(),
+            project=context.project(),
+        )
 
     def shortHelpString(self):
         return self.tr(

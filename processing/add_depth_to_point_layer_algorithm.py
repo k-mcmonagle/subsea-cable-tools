@@ -42,6 +42,7 @@ from qgis.core import (
     QgsWkbTypes,
 )
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE, PROCESSING_NUMBER_INTEGER
+from . import depth_sampling
 
 
 class AddDepthToPointLayerAlgorithm(QgsProcessingAlgorithm):
@@ -86,18 +87,7 @@ class AddDepthToPointLayerAlgorithm(QgsProcessingAlgorithm):
         rasters: Sequence[QgsRasterLayer],
         points_crs,
     ) -> List[Tuple[QgsRasterLayer, Optional[QgsCoordinateTransform]]]:
-        samplers: List[Tuple[QgsRasterLayer, Optional[QgsCoordinateTransform]]] = []
-        for r in rasters:
-            if not r:
-                continue
-            transform = None
-            if r.crs() != points_crs:
-                try:
-                    transform = QgsCoordinateTransform(points_crs, r.crs(), QgsProject.instance())
-                except Exception:
-                    transform = None
-            samplers.append((r, transform))
-        return samplers
+        return depth_sampling.build_raster_samplers(rasters, points_crs)
 
     @staticmethod
     def _build_contour_samplers(
@@ -105,19 +95,7 @@ class AddDepthToPointLayerAlgorithm(QgsProcessingAlgorithm):
         depth_fields: Sequence[str],
         points_crs,
     ) -> List[Tuple[QgsVectorLayer, str, Optional[QgsCoordinateTransform]]]:
-        out: List[Tuple[QgsVectorLayer, str, Optional[QgsCoordinateTransform]]] = []
-        for i, lyr in enumerate(contour_layers):
-            if not lyr:
-                continue
-            depth_field = depth_fields[i] if i < len(depth_fields) else ''
-            transform = None
-            if lyr.crs() != points_crs:
-                try:
-                    transform = QgsCoordinateTransform(points_crs, lyr.crs(), QgsProject.instance())
-                except Exception:
-                    transform = None
-            out.append((lyr, depth_field, transform))
-        return out
+        return depth_sampling.build_contour_samplers(contour_layers, depth_fields, points_crs)
 
     @staticmethod
     def _sample_rasters(
@@ -126,42 +104,7 @@ class AddDepthToPointLayerAlgorithm(QgsProcessingAlgorithm):
         band: int,
     ) -> Tuple[Optional[float], Optional[str], List[Tuple[str, Optional[float]]]]:
         """Return (best_value, best_source_name, all_values)."""
-
-        best_val: Optional[float] = None
-        best_src: Optional[str] = None
-        all_vals: List[Tuple[str, Optional[float]]] = []
-
-        band = int(band) if band and int(band) > 0 else 1
-
-        for raster, transform in raster_samplers:
-            sample_pt = point
-            if transform is not None:
-                try:
-                    sample_pt = transform.transform(point)
-                except Exception:
-                    all_vals.append((raster.name(), None))
-                    continue
-
-            try:
-                val, ok = raster.dataProvider().sample(sample_pt, band)
-            except Exception:
-                ok = False
-                val = None
-
-            if ok and val is not None:
-                try:
-                    fval = float(val)
-                except Exception:
-                    fval = None
-            else:
-                fval = None
-
-            all_vals.append((raster.name(), fval))
-            if best_val is None and fval is not None:
-                best_val = fval
-                best_src = raster.name()
-
-        return best_val, best_src, all_vals
+        return depth_sampling.sample_rasters(point, raster_samplers, band)
 
     @staticmethod
     def _sample_contours(
@@ -171,95 +114,13 @@ class AddDepthToPointLayerAlgorithm(QgsProcessingAlgorithm):
         context,
     ) -> Tuple[Optional[float], Optional[str], Optional[float]]:
         """Return (best_depth, best_source_layer_name, best_distance_m)."""
-
-        best_depth = None
-        best_dist = None
-        best_src = None
-
-        for lyr, depth_field, transform in contour_samplers:
-            if not lyr:
-                continue
-
-            query_point = point
-            if transform is not None:
-                try:
-                    query_point = transform.transform(point)
-                except Exception:
-                    continue
-
-            pt_geom = QgsGeometry.fromPointXY(query_point)
-
-            # Filter candidates by bbox if a search radius is provided.
-            feat_iter = None
-            if search_radius_m and search_radius_m > 0:
-                if lyr.crs().isGeographic():
-                    # Approx meters -> degrees
-                    import math
-
-                    lat = query_point.y()
-                    deg_lat = search_radius_m / 111320.0
-                    cos_lat = max(0.1, abs(math.cos(math.radians(lat))))
-                    deg_lon = search_radius_m / (111320.0 * cos_lat)
-                    rect = pt_geom.boundingBox()
-                    rect.setXMinimum(rect.xMinimum() - deg_lon)
-                    rect.setXMaximum(rect.xMaximum() + deg_lon)
-                    rect.setYMinimum(rect.yMinimum() - deg_lat)
-                    rect.setYMaximum(rect.yMaximum() + deg_lat)
-                    request = QgsFeatureRequest().setFilterRect(rect)
-                    feat_iter = lyr.getFeatures(request)
-                else:
-                    rect = pt_geom.buffer(search_radius_m, 8).boundingBox()
-                    request = QgsFeatureRequest().setFilterRect(rect)
-                    feat_iter = lyr.getFeatures(request)
-
-            if feat_iter is None:
-                feat_iter = lyr.getFeatures()
-
-            dist_area = None
-            if lyr.crs().isGeographic():
-                dist_area = make_distance_area(
-                    lyr.crs(), context.transformContext(), project=context.project()
-                )
-
-            for feat in feat_iter:
-                g = feat.geometry()
-                if not g or g.isEmpty():
-                    continue
-
-                if dist_area is None:
-                    dist = float(g.distance(pt_geom))
-                else:
-                    try:
-                        closest = g.closestPoint(pt_geom)
-                        closest_pt = closest.asPoint() if not closest.isEmpty() else None
-                        if closest_pt is None:
-                            continue
-                        dist = float(dist_area.measureLine(query_point, QgsPointXY(closest_pt)))
-                    except Exception:
-                        continue
-
-                if search_radius_m and search_radius_m > 0 and dist > search_radius_m:
-                    continue
-
-                if best_dist is None or dist < best_dist:
-                    # Extract depth/elevation
-                    if depth_field and depth_field in feat.fields().names():
-                        z = feat[depth_field]
-                    else:
-                        names = feat.fields().names()
-                        z = feat[names[0]] if names else None
-                    if z is None:
-                        continue
-                    try:
-                        zf = float(z)
-                    except Exception:
-                        continue
-
-                    best_dist = dist
-                    best_depth = zf
-                    best_src = lyr.name()
-
-        return best_depth, best_src, best_dist
+        return depth_sampling.sample_contours(
+            point,
+            contour_samplers,
+            search_radius_m,
+            context.transformContext(),
+            project=context.project(),
+        )
 
     def initAlgorithm(self, config=None):
         self.addParameter(
