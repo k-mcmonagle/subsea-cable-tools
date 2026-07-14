@@ -229,12 +229,18 @@ def test_static_hold_bu_and_bight():
         bathy, asm, asm, DEFAULTS,
         bu_weight_kN=18.0, bu_cda_m2=1.5, leg_length_m=160.0,
         bu_start_depth_m=35.0, trunk_slack_pct=2.0, static_only=True,
-        target_ds_m=5.0,
+        target_ds_m=5.0, vessel_course_deg=137.0,
     )
     _assert(len(scn.steps) == 0, "static_only must produce no steps")
+    _assert(scn.vessel_heading_deg == 137.0,
+            "static hold must carry the ship course as the vessel heading")
     sim = tl.OperationSimulator(scn, bathy, _opts())
     snap = sim.settle()
     _assert(snap.converged, "BU hold must converge")
+    _assert(snap.vessel_heading_deg == 137.0,
+            "settled snapshot must keep the vessel heading")
+    _assert(all(np.all(np.isfinite(c.xyz)) for c in snap.chains),
+            "settled geometry must be finite")
     bu_z = snap.junction_xyz["BU"][2]
     _assert(-55.0 < bu_z < -20.0, f"BU should hold near 35 m depth (z = {bu_z:.1f})")
     trunk = snap.chain("trunk")

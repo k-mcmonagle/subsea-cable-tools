@@ -89,6 +89,7 @@ def bu_deployment(
     bu_cda_m2: float = 1.0,
     leg_length_m: float,
     leg_azimuths_deg: Tuple[float, float] = (150.0, 210.0),
+    vessel_course_deg: float = 0.0,
     ship_speed_mps: float = 0.5,
     payout_speed_mps: float = 0.4,
     duration_s: Optional[float] = None,
@@ -100,8 +101,8 @@ def bu_deployment(
     static_only: bool = False,
 ) -> Scenario:
     """Deploy a branching unit: the BU hangs from the trunk while its two
-    pre-laid legs run along the bed; the vessel steams ahead (+x) paying out
-    trunk until the BU lands.
+    pre-laid legs run along the bed; the vessel steams along
+    ``vessel_course_deg`` paying out trunk until the BU lands.
 
     Initial state: BU at ``bu_start_depth_m`` below the vessel (default just
     below the surface); legs laid out on the bed along ``leg_azimuths_deg``
@@ -165,7 +166,7 @@ def bu_deployment(
             duration_s = 1.4 * (depth0 - bu_start_depth_m + 10.0) / max(payout_speed_mps, 0.05)
         steps = [Step(
             duration_s=duration_s,
-            vessel_course_deg=0.0,
+            vessel_course_deg=vessel_course_deg,
             vessel_speed_mps=ship_speed_mps,
             payout_mps={"trunk": payout_speed_mps},
             label="lower BU and steam ahead",
@@ -174,6 +175,7 @@ def bu_deployment(
         chains=chains,
         junctions={"BU": junction},
         vessel_xy=(0.0, 0.0),
+        vessel_heading_deg=vessel_course_deg,
         steps=steps,
     )
 
@@ -282,6 +284,7 @@ def final_bight(
     return Scenario(
         chains={"cable": cable, "rope": rope},
         vessel_xy=mid_xy,
+        vessel_heading_deg=step_course_deg,
         steps=steps,
         auto_release_kN={} if static_only else {"rope": release_threshold_kN},
     )

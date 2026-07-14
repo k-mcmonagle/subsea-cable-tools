@@ -36,6 +36,7 @@ except Exception:  # pragma: no cover - standalone testing
     )
 
 from .results_panel import render_results_html
+from .scene import compass_to_math_deg
 from .solve_controller import RunOutput, SolveWorker, V3Config
 from .view3d import View3DWidget
 from .views2d import PlanView, ProfileView
@@ -83,10 +84,13 @@ class LaySimulatorDialog(QDialog):
         self._last_out: Optional[RunOutput] = None
         self._grid_bathy: Optional[dict] = None       # sampled raster grid cfg
         self._grid_origin: Optional[dict] = None      # map origin/crs for export
-
-        self._update_timer = QTimer(self)
-        self._update_timer.setSingleShot(True)
-        self._update_timer.timeout.connect(self._solve_now)
+        self._picked_centre: Optional[Tuple[float, float]] = None  # map-CRS local origin
+        self._origin_set: bool = False                # origin explicitly chosen
+        self._pick_tool = None                        # active PointSequenceTool
+        self._map_overlay = None                      # SimulatorMapOverlay
+        self._dirty = False                           # inputs changed since last solve
+        self._solve_origin = None                     # (origin, crs) captured at solve start
+        self._scene_origin = None                     # origin the shown scene was solved with
 
         self._build_ui()
         self._restore_settings()
@@ -111,11 +115,14 @@ class LaySimulatorDialog(QDialog):
         form = QVBoxLayout(left_holder)
         form.setContentsMargins(4, 4, 8, 4)
 
+        # Workflow order: what -> where -> environment -> ship -> cable ->
+        # scenario properties -> what to solve -> display.
         form.addWidget(self._section_mode())
+        form.addWidget(self._section_position())
         form.addWidget(self._section_environment())
+        form.addWidget(self._section_vessel())
         form.addWidget(self._section_assembly())
         form.addWidget(self._section_bu_bight())
-        form.addWidget(self._section_vessel())
         form.addWidget(self._section_solve())
         form.addWidget(self._section_operation())
         form.addWidget(self._section_display())
@@ -168,6 +175,24 @@ class LaySimulatorDialog(QDialog):
         self.scrub_widget.setLayout(scrub_row)
         self.scrub_widget.setVisible(False)
         bl.addWidget(self.scrub_widget)
+
+        # Explicit solve controls: results only update on request, with an
+        # indicator once any input differs from the last solved state.
+        solve_row = QHBoxLayout()
+        self.run_btn = QPushButton("Solve")
+        self.run_btn.clicked.connect(self._solve_clicked)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self._cancel_worker)
+        self.dirty_label = QLabel("")
+        self.dirty_label.setStyleSheet("color:#c07f00; font-weight:bold;")
+        self.op_progress = QProgressBar()
+        self.op_progress.setRange(0, 100)
+        solve_row.addWidget(self.run_btn)
+        solve_row.addWidget(self.cancel_btn)
+        solve_row.addWidget(self.dirty_label, 1)
+        solve_row.addWidget(self.op_progress, 1)
+        bl.addLayout(solve_row)
 
         self.results = QTextEdit()
         self.results.setReadOnly(True)
@@ -284,6 +309,24 @@ class LaySimulatorDialog(QDialog):
         self._registry.append((key, w))
         return w
 
+    def _coord_spin(self, key) -> QDoubleSpinBox:
+        """A wide-range map-coordinate spin box (project CRS easting/northing).
+
+        Not wired to ``_schedule`` on every keystroke — the origin is committed
+        on ``editingFinished`` via :meth:`_origin_boxes_changed`. Registered so
+        the last coordinates persist across sessions."""
+        w = QDoubleSpinBox()
+        w.setRange(-1.0e12, 1.0e12)
+        w.setDecimals(2)
+        w.setSingleStep(10.0)
+        w.setMinimumWidth(140)
+        try:
+            w.setGroupSeparatorShown(True)
+        except Exception:
+            pass
+        self._registry.append((key, w))
+        return w
+
     def _combo(self, key, entries) -> QComboBox:
         w = QComboBox()
         for data, label in entries:
@@ -302,11 +345,118 @@ class LaySimulatorDialog(QDialog):
     # ---- sections -----------------------------------------------------------
 
     def _section_mode(self):
-        box, lay = self._collapsible("Mode", "mode")
+        box, lay = self._collapsible("Scenario", "mode")
+        self.scenario_choice = self._combo("scenario_choice", [
+            ("single_static", "Single cable — static hang"),
+            ("single_steady", "Single cable — steady lay"),
+            ("bu_static", "Branching unit — static hold"),
+            ("fs_static", "Final splice (bight) — static hold"),
+            ("operation", "Operation simulation (beta)"),
+        ])
+        self.scenario_choice.currentIndexChanged.connect(self._apply_scenario_choice)
+        lay.addRow("Modelling", self.scenario_choice)
+        # Hidden holders retained for config plumbing + settings migration:
+        # the scenario choice above drives both.
         self.mode_combo = self._combo("mode", MODES)
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
-        lay.addRow("Tool mode", self.mode_combo)
+        self.mode_combo.setVisible(False)
+        self.static_config = self._combo("static_config", [
+            ("single", "Single cable span"),
+            ("bu", "Branching unit (held)"),
+            ("bight", "Final bight (held)"),
+        ])
+        self.static_config.currentIndexChanged.connect(self._update_config_visibility)
+        self.static_config.setVisible(False)
         return box
+
+    def _apply_scenario_choice(self, *args):
+        """Map the single scenario picker onto the internal mode/config."""
+        choice = self.scenario_choice.currentData() or "single_static"
+        mode = {"single_steady": "steady", "operation": "operation"}.get(choice, "static")
+        config = {"bu_static": "bu", "fs_static": "bight"}.get(choice, "single")
+        for combo, val in ((self.mode_combo, mode), (self.static_config, config)):
+            i = combo.findData(val)
+            if i >= 0 and i != combo.currentIndex():
+                combo.blockSignals(True)
+                combo.setCurrentIndex(i)
+                combo.blockSignals(False)
+        self._on_mode_changed()
+
+    def _section_position(self):
+        box, lay = self._collapsible("Position && heading", "position")
+
+        # Local origin: type project-CRS coordinates directly, or pick from
+        # the map. The two stay in sync; either sets the simulator's origin.
+        self.origin_x = self._coord_spin("origin_x")
+        self.origin_y = self._coord_spin("origin_y")
+        self.origin_x.editingFinished.connect(self._origin_boxes_changed)
+        self.origin_y.editingFinished.connect(self._origin_boxes_changed)
+        lay.addRow("Origin easting (X)", self.origin_x)
+        lay.addRow("Origin northing (Y)", self.origin_y)
+
+        pick_btn = QPushButton("Pick position on map...")
+        pick_btn.setToolTip("Click one point on the map to set the origin above.")
+        pick_btn.clicked.connect(self._pick_position_only)
+        lay.addRow(pick_btn)
+
+        self.setup_map_btn = QPushButton("Set up on map...")
+        self.setup_map_btn.setToolTip(
+            "Guided map picks: origin, then heading and leg/end bearings.")
+        self.setup_map_btn.clicked.connect(self._guided_setup)
+        lay.addRow(self.setup_map_btn)
+        self.origin_label = QLabel("")
+        self.origin_label.setWordWrap(True)
+        self.origin_label.setStyleSheet("color:#777; font-size: small;")
+        lay.addRow(self.origin_label)
+
+        self.lay_az = self._dspin("lay_az", 0.0, 360.0, 0.0, 5.0, 0, " degN")
+        self.lay_az.setToolTip("Ship course as a compass bearing (degrees clockwise from north).")
+        self._lay_az_label = QLabel("Ship course (lay azimuth)")
+        lay.addRow(self._lay_az_label, self.lay_az)
+
+        # BU leg leads (bearings from the setup position).
+        self.bu_leg1_az = self._dspin("bu_leg1_az", 0.0, 360.0, 150.0, 5.0, 0, " degN")
+        self.bu_leg2_az = self._dspin("bu_leg2_az", 0.0, 360.0, 210.0, 5.0, 0, " degN")
+        self._pos_bu_rows = [
+            (QLabel("Leg 1 lead bearing"), self.bu_leg1_az),
+            (QLabel("Leg 2 lead bearing"), self.bu_leg2_az),
+        ]
+        for lbl, w in self._pos_bu_rows:
+            lay.addRow(lbl, w)
+
+        # Final-splice laid ends (separation + axis define A and B about the
+        # origin, which sits on their midpoint).
+        self.fb_sep = self._dspin("fb_sep", 5.0, 10000.0, 120.0, 10.0, 0, " m")
+        self.fb_axis = self._dspin("fb_axis_degN", 0.0, 360.0, 90.0, 5.0, 0, " degN")
+        self.fb_axis.setToolTip("Compass bearing of the laid A -> B axis on the seabed.")
+        self._pos_fs_rows = [
+            (QLabel("Laid-end separation"), self.fb_sep),
+            (QLabel("Laid A -> B axis bearing"), self.fb_axis),
+        ]
+        for lbl, w in self._pos_fs_rows:
+            lay.addRow(lbl, w)
+        self._update_origin_label()
+        return box
+
+    def _update_origin_label(self):
+        if self._grid_origin:
+            crs = self._grid_origin["crs_authid"]
+            self.origin_label.setText(f"Origin CRS: {crs} — snapped to the raster sample centre.")
+        elif self._origin_set:
+            self.origin_label.setText("Origin set (project CRS). Edit above or re-pick from the map.")
+        else:
+            self.origin_label.setText(
+                "Origin not set — enter coordinates above or pick from the map; "
+                "until then exports use the visible canvas centre.")
+
+    def _guided_setup(self):
+        config = self._active_config()
+        if config == "bight":
+            self._pick_bight_ends()
+        elif config == "bu":
+            self._pick_bu_setup()
+        else:
+            self._pick_ship_position()
 
     def _section_environment(self):
         box, lay = self._collapsible("Environment", "env")
@@ -320,7 +470,7 @@ class LaySimulatorDialog(QDialog):
         lay.addRow("Water depth (at vessel)", self.depth_spin)
 
         self.slope_deg = self._dspin("slope_deg", -45.0, 45.0, 3.0, 0.5, 1, " deg")
-        self.slope_azimuth = self._dspin("slope_azimuth_deg", -360.0, 360.0, 0.0, 5.0, 0, " deg")
+        self.slope_azimuth = self._dspin("slope_azimuth_deg", 0.0, 360.0, 0.0, 5.0, 0, " degN")
         self._slope_rows = [
             (QLabel("Down-slope angle"), self.slope_deg),
             (QLabel("Down-slope azimuth"), self.slope_azimuth),
@@ -350,7 +500,11 @@ class LaySimulatorDialog(QDialog):
         self.raster_combo = QComboBox()
         self.raster_extent = self._dspin("raster_half_extent_m", 100.0, 100000.0, 2000.0, 100.0, 0, " m")
         self.raster_positive_down = self._check("raster_positive_down", "Raster stores positive-down depths", True)
-        self.raster_sample_btn = QPushButton("Sample raster around map centre")
+        self.raster_sample_btn = QPushButton("Sample raster around origin")
+        self.raster_sample_btn.setToolTip(
+            "Samples a depth grid centred on the local origin (set it with "
+            "'Set up on map' in Position & heading; falls back to the "
+            "visible map centre).")
         self.raster_sample_btn.clicked.connect(self._sample_raster)
         self.raster_status = QLabel("No grid sampled.")
         self._raster_rows = [
@@ -365,7 +519,7 @@ class LaySimulatorDialog(QDialog):
 
         # Current profile table.
         self.current_table = QTableWidget(0, 3)
-        self.current_table.setHorizontalHeaderLabels(["Depth (m)", "Speed (m/s)", "Direction (deg)"])
+        self.current_table.setHorizontalHeaderLabels(["Depth (m)", "Speed (m/s)", "Toward (degN)"])
         self._auto_size_table(self.current_table, min_rows=2, max_rows=6)
         self.current_table.cellChanged.connect(self._schedule)
         cur_btns = QHBoxLayout()
@@ -426,44 +580,70 @@ class LaySimulatorDialog(QDialog):
     def _section_vessel(self):
         box, lay = self._collapsible("Vessel && lay", "vessel")
         self.chute_h = self._dspin("chute_h", 0.0, 50.0, 5.0, 0.5, 1, " m")
-        self.lay_az = self._dspin("lay_az", -360.0, 360.0, 0.0, 5.0, 0, " deg")
+        self.chute_h.setToolTip(
+            "Height of the cable departure point (chute top) above the "
+            "waterline. Also used as the drawn hull freeboard in the 3D view."
+        )
         self.ship_speed = self._dspin("ship_speed_kn", 0.0, 12.0, 6.0, 0.25, 2, " kn")
         self.slack = self._dspin("slack_pct", -10.0, 30.0, 2.0, 0.5, 1, " %")
         self.chute_mu = self._dspin("chute_mu", 0.0, 1.0, 0.3, 0.05, 2)
         lay.addRow("Chute height above waterline", self.chute_h)
-        lay.addRow("Lay azimuth (ship course)", self.lay_az)
         self._ship_speed_label = QLabel("Ship speed")
         lay.addRow(self._ship_speed_label, self.ship_speed)
         self._slack_label = QLabel("Slack")
         lay.addRow(self._slack_label, self.slack)
         lay.addRow("Chute friction mu (capstan)", self.chute_mu)
+
+        # Parametric ship shape: hull around a CRP, chute offset from the
+        # CRP (the chute stays the solver's departure point; the hull is
+        # drawn geometry, extruded to the chute height above).
+        self.ship_len = self._dspin("ship_length_m", 5.0, 400.0, 60.0, 5.0, 0, " m")
+        self.ship_beam = self._dspin("ship_beam_m", 2.0, 80.0, 12.0, 1.0, 0, " m")
+        self.crp_fwd = self._dspin("crp_fwd_m", -200.0, 200.0, 0.0, 1.0, 1, " m")
+        self.crp_stbd = self._dspin("crp_stbd_m", -40.0, 40.0, 0.0, 0.5, 1, " m")
+        self.chute_fwd = self._dspin("chute_fwd_m", -200.0, 200.0, 0.0, 1.0, 1, " m")
+        self.chute_stbd = self._dspin("chute_stbd_m", -40.0, 40.0, 0.0, 0.5, 1, " m")
+        self.chute_radius = self._dspin("chute_radius_m", 0.0, 30.0, 0.0, 0.5, 1, " m")
+        self.chute_radius.setToolTip(
+            "Overboarding chute radius, drawn as a quarter arc at the "
+            "departure point (as in the 2D Catenary Calculator). Rendering "
+            "only — chute contact is not modelled in the 3D solver."
+        )
+        lay.addRow("Ship length", self.ship_len)
+        lay.addRow("Ship breadth", self.ship_beam)
+        lay.addRow("CRP forward of midship", self.crp_fwd)
+        lay.addRow("CRP starboard of centreline", self.crp_stbd)
+        lay.addRow("Chute forward of CRP", self.chute_fwd)
+        lay.addRow("Chute starboard of CRP", self.chute_stbd)
+        lay.addRow("Chute radius (drawn)", self.chute_radius)
+        note = QLabel("Negative 'forward' = aft, negative 'starboard' = port. "
+                      "With zero offsets the chute sits at the hull centre "
+                      "(previous behaviour).")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#777; font-size: small;")
+        lay.addRow(note)
         return box
 
     def _section_bu_bight(self):
-        """Physical geometry shared by the static-hold configurations and
-        the operation scenarios (BU or bight)."""
-        box, lay = self._collapsible("BU / bight geometry", "bu_bight")
+        """Physical properties shared by the static-hold configurations and
+        the operation scenarios (BU or bight); positions and bearings live
+        in the 'Position & heading' section."""
+        box, lay = self._collapsible("BU / splice properties", "bu_bight")
         # Branching-unit group.
         self.bu_weight = self._dspin("bu_weight_kN", 0.1, 500.0, 15.0, 1.0, 1, " kN")
         self.bu_cda = self._dspin("bu_cda", 0.0, 50.0, 1.5, 0.1, 2, " m2")
         self.bu_leg_len = self._dspin("bu_leg_len", 10.0, 20000.0, 300.0, 10.0, 0, " m")
-        self.bu_leg1_az = self._dspin("bu_leg1_az", -360.0, 360.0, 150.0, 5.0, 0, " deg")
-        self.bu_leg2_az = self._dspin("bu_leg2_az", -360.0, 360.0, 210.0, 5.0, 0, " deg")
         self._bu_geo_rows = [
             (QLabel("BU submerged weight"), self.bu_weight),
             (QLabel("BU drag area Cd*A"), self.bu_cda),
             (QLabel("Leg length (each)"), self.bu_leg_len),
-            (QLabel("Leg 1 azimuth"), self.bu_leg1_az),
-            (QLabel("Leg 2 azimuth"), self.bu_leg2_az),
         ]
         for lbl, w in self._bu_geo_rows:
             lay.addRow(lbl, w)
         # Final-bight group.
         self.fb_length = self._dspin("fb_length", 20.0, 20000.0, 300.0, 10.0, 0, " m")
-        self.fb_sep = self._dspin("fb_sep", 5.0, 10000.0, 120.0, 10.0, 0, " m")
         self._fb_geo_rows = [
             (QLabel("Bight length (joined loop)"), self.fb_length),
-            (QLabel("Laid-end separation"), self.fb_sep),
         ]
         for lbl, w in self._fb_geo_rows:
             lay.addRow(lbl, w)
@@ -471,16 +651,7 @@ class LaySimulatorDialog(QDialog):
         return box
 
     def _section_solve(self):
-        box, lay = self._collapsible("Solve mode (static / steady)", "solve")
-        self.static_config = self._combo("static_config", [
-            ("single", "Single cable span"),
-            ("bu", "Branching unit (held)"),
-            ("bight", "Final bight (held)"),
-        ])
-        self.static_config.currentIndexChanged.connect(self._update_config_visibility)
-        self._config_label = QLabel("Configuration (static)")
-        lay.addRow(self._config_label, self.static_config)
-
+        box, lay = self._collapsible("Solve", "solve")
         self.solve_mode = self._combo("solve_mode", SOLVE_MODES)
         self.solve_value = self._dspin("solve_value", -1e6, 1e6, 5.0, 1.0, 3)
         self.on_bed_tail = self._dspin("on_bed_tail", 10.0, 5000.0, 150.0, 10.0, 0, " m")
@@ -529,7 +700,7 @@ class LaySimulatorDialog(QDialog):
         fb = QWidget()
         fl = QFormLayout(fb)
         self.fb_payout = self._dspin("fb_payout", 0.01, 3.0, 0.3, 0.05, 2, " m/s")
-        self.fb_course = self._dspin("fb_course", -360.0, 360.0, 90.0, 5.0, 0, " deg")
+        self.fb_course = self._dspin("fb_course", 0.0, 360.0, 0.0, 5.0, 0, " degN")
         self.fb_ship_speed = self._dspin("fb_ship_speed_kn", 0.0, 3.0, 0.3, 0.05, 2, " kn")
         self.fb_release = self._dspin("fb_release_kN", 0.0, 100.0, 2.0, 0.5, 1, " kN")
         fl.addRow("Rope pay-out rate", self.fb_payout)
@@ -547,21 +718,6 @@ class LaySimulatorDialog(QDialog):
         self.op_stack.addWidget(slp)
 
         lay.addRow(self.op_stack)
-
-        run_row = QHBoxLayout()
-        self.run_btn = QPushButton("Run simulation")
-        self.run_btn.clicked.connect(self._run_operation)
-        self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.setEnabled(False)
-        self.cancel_btn.clicked.connect(self._cancel_worker)
-        self.op_progress = QProgressBar()
-        self.op_progress.setRange(0, 100)
-        run_row.addWidget(self.run_btn)
-        run_row.addWidget(self.cancel_btn)
-        run_row.addWidget(self.op_progress, 1)
-        holder = QWidget()
-        holder.setLayout(run_row)
-        lay.addRow(holder)
         self._operation_box = box
         return box
 
@@ -575,6 +731,18 @@ class LaySimulatorDialog(QDialog):
         )
         lay.addRow("Depth exaggeration", self.zex)
         lay.addRow("Cable colors", self.color_mode)
+        self.show_on_map = self._check(
+            "show_on_map", "Show result on map canvas (ship, cable plan, TDP)", False)
+        self.show_on_map.toggled.connect(self._refresh_map_overlay)
+        self.clear_map_btn = QPushButton("Clear map visuals")
+        self.clear_map_btn.clicked.connect(self._clear_map_overlay)
+        row = QWidget()
+        row_lay = QHBoxLayout(row)
+        row_lay.setContentsMargins(0, 0, 0, 0)
+        row_lay.addWidget(self.show_on_map)
+        row_lay.addWidget(self.clear_map_btn)
+        row_lay.addStretch(1)
+        lay.addRow(row)
         return box
 
     # ------------------------------------------------------------- tables
@@ -738,7 +906,7 @@ class LaySimulatorDialog(QDialog):
         depth = float(self.depth_spin.value())
         if mode == "slope":
             g = math.tan(math.radians(float(self.slope_deg.value())))
-            az = math.radians(float(self.slope_azimuth.value()))
+            az = math.radians(compass_to_math_deg(float(self.slope_azimuth.value())))
             return {"kind": "slope", "depth0_m": depth,
                     "gx": g * math.cos(az), "gy": g * math.sin(az)}
         if mode == "profile":
@@ -752,7 +920,7 @@ class LaySimulatorDialog(QDialog):
                 # Profile distances run along the cable trail direction
                 # (behind the vessel) — azimuth of the trail.
                 return {"kind": "profile", "points": pts,
-                        "azimuth_deg": float(self.lay_az.value()) + 180.0}
+                        "azimuth_deg": compass_to_math_deg(float(self.lay_az.value())) + 180.0}
             return {"kind": "flat", "depth_m": depth}
         if mode == "grid" and self._grid_bathy is not None:
             return self._grid_bathy
@@ -783,6 +951,13 @@ class LaySimulatorDialog(QDialog):
         cfg.default_mbr_m = float(self.def_mbr.value())
         cfg.chute_height_m = float(self.chute_h.value())
         cfg.lay_azimuth_deg = float(self.lay_az.value())
+        cfg.ship_length_m = float(self.ship_len.value())
+        cfg.ship_beam_m = float(self.ship_beam.value())
+        cfg.crp_fwd_m = float(self.crp_fwd.value())
+        cfg.crp_stbd_m = float(self.crp_stbd.value())
+        cfg.chute_fwd_m = float(self.chute_fwd.value())
+        cfg.chute_stbd_m = float(self.chute_stbd.value())
+        cfg.chute_radius_m = float(self.chute_radius.value())
         cfg.ship_speed_kn = float(self.ship_speed.value())
         cfg.slack_percent = float(self.slack.value())
         cfg.solve_mode = self.solve_mode.currentData()
@@ -813,6 +988,7 @@ class LaySimulatorDialog(QDialog):
             cfg.op = {
                 "bight_length_m": float(self.fb_length.value()),
                 "end_separation_m": float(self.fb_sep.value()),
+                "bight_axis_deg": float(self.fb_axis.value()),
                 "payout_mps": float(self.fb_payout.value()),
                 "step_course_deg": float(self.fb_course.value()),
                 "ship_speed_kn": float(self.fb_ship_speed.value()),
@@ -829,18 +1005,38 @@ class LaySimulatorDialog(QDialog):
     # ------------------------------------------------------------- solving
 
     def _schedule(self, *args):
+        """An input changed: flag the shown results as stale (explicit solve)."""
         if self._initializing:
             return
-        mode = self.mode_combo.currentData()
-        if mode == "operation":
-            return  # explicit run only
-        self._update_timer.start(400)
+        if self.sender() in (getattr(self, "zex", None),
+                             getattr(self, "color_mode", None),
+                             getattr(self, "show_on_map", None)):
+            return  # display-only options don't invalidate the solution
+        self._set_dirty(True)
+
+    def _set_dirty(self, dirty: bool):
+        self._dirty = bool(dirty)
+        if dirty:
+            verb = ("Run simulation" if self.mode_combo.currentData() == "operation"
+                    else "Solve")
+            self.dirty_label.setText(f"Inputs changed — click {verb} to update.")
+            self.run_btn.setStyleSheet("font-weight: bold;")
+        else:
+            self.dirty_label.setText("")
+            self.run_btn.setStyleSheet("")
+
+    def _solve_clicked(self):
+        if self.mode_combo.currentData() == "operation":
+            self._run_operation()
+        else:
+            self._solve_now()
 
     def _solve_now(self):
         if self._initializing:
             return
         cfg = self.build_config()
         if cfg.mode == "operation":
+            self._set_dirty(True)  # operations only run via the button
             return
         if self._worker is not None and self._worker.isRunning():
             self._pending = True
@@ -854,6 +1050,14 @@ class LaySimulatorDialog(QDialog):
         self._start_worker(self.build_config())
 
     def _start_worker(self, cfg: V3Config):
+        # Freeze the map placement alongside the config: the overlay must be
+        # drawn at the origin this solve used, not wherever a later pick
+        # moved it.
+        try:
+            self._solve_origin = self._origin_for_map()
+        except Exception:
+            self._solve_origin = None
+        self._set_dirty(False)
         self._worker = SolveWorker(cfg, self)
         self._worker.finishedWith.connect(self._on_solved)
         self._worker.progressed.connect(self._on_progress)
@@ -882,6 +1086,7 @@ class LaySimulatorDialog(QDialog):
                 self._pending = False
                 self._solve_now()
             return
+        self._scene_origin = self._solve_origin
 
         # Bathy lookup for the profile view's bed-under-cable line.
         try:
@@ -919,9 +1124,11 @@ class LaySimulatorDialog(QDialog):
         self._show_scene(scene, preserve=True)
 
     def _show_scene(self, scene, preserve=True):
+        self._last_scene = scene
         self.view3d.set_scene(scene, preserve_view=preserve)
         self.profile_view.update_scene(scene)
         self.plan_view.update_scene(scene)
+        self._refresh_map_overlay()
 
     def _on_hover(self, text: str):
         self.hover_label.setText(text or " ")
@@ -941,7 +1148,7 @@ class LaySimulatorDialog(QDialog):
     def _update_config_visibility(self, *args):
         mode = self.mode_combo.currentData()
         config = self._active_config()
-        # Shared BU / bight geometry section.
+        # Shared BU / splice properties section.
         gbtn, gbody = self._collapsibles["bu_bight"]
         show_geo = config in ("bu", "bight")
         gbtn.setVisible(show_geo)
@@ -952,10 +1159,38 @@ class LaySimulatorDialog(QDialog):
         for lbl, w in self._fb_geo_rows:
             lbl.setVisible(config == "bight")
             w.setVisible(config == "bight")
+        # Position & heading section: scenario-specific bearing rows and
+        # the guided setup button caption.
+        for lbl, w in self._pos_bu_rows:
+            lbl.setVisible(config == "bu")
+            w.setVisible(config == "bu")
+        for lbl, w in self._pos_fs_rows:
+            lbl.setVisible(config == "bight")
+            w.setVisible(config == "bight")
+        show_course = config != "bight"
+        self._lay_az_label.setVisible(show_course)
+        self.lay_az.setVisible(show_course)
+        if config == "bight":
+            self.setup_map_btn.setText("Set up on map:  end A, end B...")
+            self.setup_map_btn.setToolTip(
+                "Click laid end A, then laid end B on the map canvas. Sets "
+                "the separation and axis bearing, and centres the local "
+                "frame (and vessel) on the midpoint.")
+        elif config == "bu":
+            self.setup_map_btn.setText(
+                "Set up on map:  position, heading, leg 1, leg 2...")
+            self.setup_map_btn.setToolTip(
+                "Four clicks on the map canvas: 1) the BU setup position "
+                "(local origin), 2) a point in the steaming direction, "
+                "3) a point along leg 1's lead, 4) a point along leg 2's lead.")
+        else:
+            self.setup_map_btn.setText("Set up on map:  position, heading...")
+            self.setup_map_btn.setToolTip(
+                "Click the ship position on the map canvas, then a second "
+                "point in the steaming direction. Sets the local origin and "
+                "the ship course.")
         # Solve-section rows.
         is_static = mode == "static"
-        self._config_label.setVisible(is_static)
-        self.static_config.setVisible(is_static)
         single_solve = (mode == "steady") or (is_static and config == "single")
         for lbl, w in self._solve_rows:
             lbl.setVisible(single_solve)
@@ -971,6 +1206,11 @@ class LaySimulatorDialog(QDialog):
     def _on_mode_changed(self, *args):
         mode = self.mode_combo.currentData()
         is_op = mode == "operation"
+        self.run_btn.setText("Run simulation" if is_op else "Solve")
+        self.op_progress.setVisible(is_op)
+        self.cancel_btn.setVisible(is_op)
+        if self._dirty:
+            self._set_dirty(True)  # re-word the indicator for the new mode
         self._operation_box.setVisible(True)
         btn, body = self._collapsibles["operation"]
         btn.setVisible(is_op)
@@ -1028,7 +1268,9 @@ class LaySimulatorDialog(QDialog):
             from .qgis_adapters import sample_raster_bathymetry
 
             centre = (0.0, 0.0)
-            if self.iface is not None:
+            if self._picked_centre is not None:
+                centre = self._picked_centre
+            elif self.iface is not None:
                 c = self.iface.mapCanvas().center()
                 centre = (c.x(), c.y())
             app = None
@@ -1048,12 +1290,19 @@ class LaySimulatorDialog(QDialog):
                     app.restoreOverrideCursor()
             self._grid_origin = {"origin_map_xy": grid.pop("origin_map_xy"),
                                  "crs_authid": grid.pop("crs_authid")}
+            # Adopt the sampling centre as the explicit origin so the coordinate
+            # boxes show where the grid is anchored (even if it came from the
+            # canvas centre rather than an earlier pick).
+            self._picked_centre = (float(centre[0]), float(centre[1]))
+            self._origin_set = True
+            self._set_origin_boxes(centre)
             grid["kind"] = "grid"
             self._grid_bathy = grid
             d = np.asarray(grid["depths"], dtype=float)
             self.raster_status.setText(
                 f"Sampled {d.shape[1]}x{d.shape[0]} grid, depth {d.min():.0f}-{d.max():.0f} m."
             )
+            self._update_origin_label()
             self._schedule()
         except Exception as exc:
             QMessageBox.warning(self, "Sample raster", f"Sampling failed:\n{exc}")
@@ -1066,25 +1315,257 @@ class LaySimulatorDialog(QDialog):
         try:
             from .qgis_adapters import push_chains_to_map
 
-            origin = (0.0, 0.0)
-            crs = "EPSG:3857"
-            if self._grid_origin:
-                origin = self._grid_origin["origin_map_xy"]
-                crs = self._grid_origin["crs_authid"]
-            elif self.iface is not None:
-                try:
-                    from qgis.core import QgsProject
-
-                    crs = QgsProject.instance().crs().authid() or crs
-                    c = self.iface.mapCanvas().center()
-                    origin = (c.x(), c.y())
-                except Exception:
-                    pass
+            origin, crs = (self._scene_origin if self._scene_origin
+                           else self._origin_for_map())
             chains = [(p.name, np.asarray(p.xyz)) for p in out.scene.cables]
             push_chains_to_map("Lay simulator result", chains, origin, crs)
             QMessageBox.information(self, "Send to map", "Memory layer added to the project.")
         except Exception as exc:
             QMessageBox.warning(self, "Send to map", f"Export failed:\n{exc}")
+
+    def _origin_for_map(self) -> Tuple[Tuple[float, float], str]:
+        """Local-frame origin in map coordinates + CRS authid.
+
+        Preference: sampled-raster origin, then a picked centre, then the
+        visible canvas centre."""
+        origin = (0.0, 0.0)
+        crs = "EPSG:3857"
+        if self.iface is not None:
+            try:
+                from qgis.core import QgsProject
+
+                crs = QgsProject.instance().crs().authid() or crs
+            except Exception:
+                pass
+        if self._grid_origin:
+            return tuple(self._grid_origin["origin_map_xy"]), self._grid_origin["crs_authid"]
+        if self._picked_centre is not None:
+            return self._picked_centre, crs
+        if self.iface is not None:
+            try:
+                c = self.iface.mapCanvas().center()
+                origin = (c.x(), c.y())
+            except Exception:
+                pass
+        return origin, crs
+
+    # ------------------------------------------------- map picking / overlay
+
+    def _map_canvas(self):
+        try:
+            return self.iface.mapCanvas() if self.iface is not None else None
+        except Exception:
+            return None
+
+    def _start_pick(self, n_points: int, on_done, prompts=None):
+        """Hide the dialog, collect ``n_points`` canvas clicks, restore.
+
+        ``prompts`` (optional) is one short instruction per click, shown in
+        the QGIS message bar as the sequence advances."""
+        canvas = self._map_canvas()
+        if canvas is None:
+            QMessageBox.information(self, "Pick on map",
+                                    "Map picking needs the QGIS map canvas.")
+            return
+        try:
+            from .map_tools import PointSequenceTool
+        except Exception as exc:
+            QMessageBox.warning(self, "Pick on map", f"Map tools unavailable:\n{exc}")
+            return
+        if self._pick_tool is not None:
+            try:
+                self._pick_tool.cancel()
+            except Exception:
+                pass
+            self._pick_tool = None
+        self.showMinimized()
+
+        def prompt(i: int):
+            if prompts and i < len(prompts):
+                self._push_map_message(
+                    f"Click {i + 1}/{n_points}: {prompts[i]}  (right-click cancels)")
+
+        def done(points):
+            self._pick_tool = None
+            self._restore_after_pick()
+            try:
+                on_done(points)
+            except Exception as exc:
+                QMessageBox.warning(self, "Pick on map", f"Could not apply pick:\n{exc}")
+
+        def cancelled():
+            self._pick_tool = None
+            self._restore_after_pick()
+
+        prompt(0)
+        self._pick_tool = PointSequenceTool(canvas, n_points, done, cancelled,
+                                            on_progress=prompt)
+
+    def _push_map_message(self, text: str):
+        try:
+            self.iface.messageBar().pushMessage("Lay simulator", text, duration=6)
+        except Exception:
+            pass
+
+    def _restore_after_pick(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _set_local_origin(self, xy: Tuple[float, float], update_boxes: bool = True):
+        """Adopt a map point as the local frame origin (vessel / BU setup
+        position); resample the raster there when one is in use. ``update_boxes``
+        mirrors the coordinates into the origin spin boxes (skip it when the
+        boxes are the source of the change to avoid a feedback loop)."""
+        self._picked_centre = (float(xy[0]), float(xy[1]))
+        self._origin_set = True
+        if update_boxes:
+            self._set_origin_boxes(xy)
+        if self.bathy_mode.currentData() == "grid" and self.raster_combo.currentData():
+            self._sample_raster()
+        else:
+            self._grid_origin = None  # stale raster origin no longer applies
+            self._schedule()
+        self._update_origin_label()
+
+    def _set_origin_boxes(self, xy: Tuple[float, float]):
+        for w, v in ((self.origin_x, xy[0]), (self.origin_y, xy[1])):
+            w.blockSignals(True)
+            w.setValue(float(v))
+            w.blockSignals(False)
+
+    def _origin_boxes_changed(self):
+        """The user typed origin coordinates: adopt them as the origin."""
+        if self._initializing:
+            return
+        self._set_local_origin(
+            (float(self.origin_x.value()), float(self.origin_y.value())),
+            update_boxes=False)
+
+    def _pick_position_only(self):
+        """Single map click that sets just the origin (leaves headings)."""
+        def apply(pts):
+            self._set_local_origin(pts[0])
+
+        self._start_pick(1, apply, prompts=("position (local origin)",))
+
+    def _picks_to_local(self, pts):
+        """Picked map points -> local metric frame centred on the first
+        pick, so bearings/distances are true regardless of the project CRS
+        (geographic degrees, feet, ...). Falls back to planar map units if
+        the transform machinery is unavailable."""
+        try:
+            from .qgis_adapters import map_points_to_local
+
+            _origin, crs = self._origin_for_map()
+            return map_points_to_local(pts, pts[0], crs)
+        except Exception:
+            x0, y0 = pts[0]
+            return [(x - x0, y - y0) for x, y in pts]
+
+    def _pick_ship_position(self):
+        def apply(pts):
+            from .map_tools import bearing_deg
+
+            self._set_local_origin(pts[0])
+            if len(pts) > 1:
+                loc = self._picks_to_local(pts)
+                self.lay_az.setValue(bearing_deg(loc[0], loc[1]))
+
+        self._start_pick(2, apply, prompts=(
+            "ship position (local origin)",
+            "a point in the steaming direction",
+        ))
+
+    def _pick_bu_setup(self):
+        def apply(pts):
+            from .map_tools import bearing_deg
+
+            self._set_local_origin(pts[0])
+            loc = self._picks_to_local(pts)
+            self.lay_az.setValue(bearing_deg(loc[0], loc[1]))
+            self.bu_leg1_az.setValue(bearing_deg(loc[0], loc[2]))
+            self.bu_leg2_az.setValue(bearing_deg(loc[0], loc[3]))
+
+        self._start_pick(4, apply, prompts=(
+            "BU setup position (local origin)",
+            "a point in the steaming direction",
+            "a point along leg 1's lead",
+            "a point along leg 2's lead",
+        ))
+
+    def _pick_bight_ends(self):
+        def apply(pts):
+            from .map_tools import bearing_deg
+
+            loc = self._picks_to_local(pts)
+            (ax, ay), (bx, by) = loc[0], loc[1]
+            self.fb_sep.setValue(math.hypot(bx - ax, by - ay))
+            self.fb_axis.setValue(bearing_deg(loc[0], loc[1]))
+            # Origin on the midpoint, mapped back from the local frame.
+            try:
+                from .qgis_adapters import local_points_to_map
+
+                _origin, crs = self._origin_for_map()
+                mid = local_points_to_map(
+                    [((ax + bx) / 2.0, (ay + by) / 2.0)], pts[0], crs)[0]
+            except Exception:
+                mid = ((pts[0][0] + pts[1][0]) / 2.0, (pts[0][1] + pts[1][1]) / 2.0)
+            self._set_local_origin(mid)
+
+        self._start_pick(2, apply, prompts=(
+            "laid end A",
+            "laid end B",
+        ))
+
+    def _refresh_map_overlay(self, *_a):
+        canvas = self._map_canvas()
+        if canvas is None:
+            return
+        want = bool(getattr(self, "show_on_map", None) and self.show_on_map.isChecked())
+        scene = getattr(self, "_last_scene", None)
+        if not want or scene is None:
+            if self._map_overlay is not None:
+                self._map_overlay.clear()
+            return
+        try:
+            from .map_tools import SimulatorMapOverlay
+
+            if self._map_overlay is None:
+                self._map_overlay = SimulatorMapOverlay(canvas)
+            # Draw at the origin the scene was SOLVED with, so re-picking a
+            # new origin can't shift the overlay until the next solve.
+            origin, crs = (self._scene_origin if self._scene_origin
+                           else self._origin_for_map())
+            self._map_overlay.update(scene, origin, crs)
+        except Exception:
+            pass  # overlay is best-effort; never break the solve flow
+
+    def _clear_map_overlay(self):
+        if self._map_overlay is not None:
+            try:
+                self._map_overlay.clear()
+            except Exception:
+                pass
+        if getattr(self, "show_on_map", None) is not None and self.show_on_map.isChecked():
+            self.show_on_map.setChecked(False)
+
+    def _cleanup_map_artifacts(self):
+        if self._pick_tool is not None:
+            try:
+                self._pick_tool.cancel()
+            except Exception:
+                pass
+            self._pick_tool = None
+        if self._map_overlay is not None:
+            try:
+                self._map_overlay.clear()
+            except Exception:
+                pass
+
+    def reject(self):
+        self._cleanup_map_artifacts()
+        super().reject()
 
     # ------------------------------------------------------------- export
 
@@ -1174,6 +1655,30 @@ class LaySimulatorDialog(QDialog):
                 expanded = str(val) == "1"
                 btn.setChecked(expanded)
                 body.setVisible(expanded)
+        # Migrate pre-scenario-picker settings (mode + static config saved
+        # separately) onto the single scenario choice, then sync internals.
+        if self.settings.value("w_scenario_choice") is None:
+            mode = self.mode_combo.currentData()
+            if mode == "steady":
+                choice = "single_steady"
+            elif mode == "operation":
+                choice = "operation"
+            else:
+                choice = {"bu": "bu_static", "bight": "fs_static"}.get(
+                    self.static_config.currentData(), "single_static")
+            i = self.scenario_choice.findData(choice)
+            if i >= 0:
+                self.scenario_choice.blockSignals(True)
+                self.scenario_choice.setCurrentIndex(i)
+                self.scenario_choice.blockSignals(False)
+        self._apply_scenario_choice()
+        # Restore the explicit origin (the coordinate boxes were restored with
+        # the rest of the registry above).
+        if str(self.settings.value("origin_set")) in ("1", "true", "True"):
+            self._origin_set = True
+            self._picked_centre = (float(self.origin_x.value()),
+                                   float(self.origin_y.value()))
+        self._update_origin_label()
         self._on_bathy_mode()
         self._on_scenario_changed()
         try:
@@ -1197,6 +1702,7 @@ class LaySimulatorDialog(QDialog):
                     self.settings.setValue(f"w_{key}", w.text())
             except Exception:
                 pass
+        self.settings.setValue("origin_set", "1" if self._origin_set else "0")
         self.settings.setValue("assembly_json", json.dumps(self._assembly_json()))
         self.settings.setValue("current_json", json.dumps(self._current_cfg()))
         pts = []
@@ -1210,6 +1716,7 @@ class LaySimulatorDialog(QDialog):
     def closeEvent(self, event):  # noqa: N802 - Qt API
         self._save_settings()
         self._cancel_worker()
+        self._cleanup_map_artifacts()
         super().closeEvent(event)
 
 

@@ -340,6 +340,22 @@ def test_drag_force_balance_on_straight_tow():
     _assert_close(abs(Fy), f_expect, 0.08, "total drag reacted at ends")
 
 
+def test_divergence_returns_finite_state():
+    """A numerically-exploding start must never leak NaN geometry: the
+    solver rewinds to its last finite checkpoint and flags the failure
+    instead of grinding through max_iters emitting overflow warnings."""
+    sysm, bathy, chain, _ = build_single_hang(n_elems=60)
+    warm = np.array(sysm.X, dtype=float)
+    free = np.ones(len(warm), dtype=bool)
+    free[[int(chain.idx[0]), int(chain.idx[-1])]] = False
+    warm[free] *= 1e160  # guaranteed overflow on the first force pass
+    res = s3d.solve_system(sysm, bathy, warm_X=warm, max_iters=4000)
+    for c in res.chains:
+        assert np.all(np.isfinite(c.xyz)), "non-finite geometry leaked out"
+    assert not res.converged
+    assert any("diverged" in w for w in res.warnings), res.warnings
+
+
 # ---------------------------------------------------------------------------
 
 def _result(name: str, ok: bool, detail: str = ""):
@@ -356,6 +372,7 @@ def run_all():
         test_buoyant_span_bows_upward,
         test_uniform_current_deflects_hang_downstream,
         test_drag_force_balance_on_straight_tow,
+        test_divergence_returns_finite_state,
     ]
     for test in tests:
         try:

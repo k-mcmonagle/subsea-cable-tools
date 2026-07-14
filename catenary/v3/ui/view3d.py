@@ -23,11 +23,13 @@ import numpy as np
 try:
     from qgis.PyQt import QtCore, QtGui
     from qgis.PyQt.QtCore import Qt, pyqtSignal
-    from qgis.PyQt.QtWidgets import QWidget
+    from qgis.PyQt.QtWidgets import QToolButton, QWidget
 except Exception:  # pragma: no cover - standalone (non-QGIS) use
     from PyQt5 import QtCore, QtGui
     from PyQt5.QtCore import Qt, pyqtSignal
-    from PyQt5.QtWidgets import QWidget
+    from PyQt5.QtWidgets import QToolButton, QWidget
+
+from .scene import chute_arc_points, vessel_chute_xyz, vessel_crp_xy, vessel_footprint
 
 # Qt5/Qt6 enum holders (Qt6 scopes enums; Qt5 exposes them on Qt itself).
 _MOUSE_BUTTON = getattr(Qt, "MouseButton", Qt)
@@ -132,7 +134,10 @@ class _SceneCache:
         # Markers / vessel.
         self.marker_slice: Optional[slice] = None
         self.marker_info: List[Tuple[str, str, str, float]] = []   # kind, label, color, size
-        self.vessel_slice: Optional[slice] = None
+        self.vessel_slice: Optional[slice] = None        # waterline footprint
+        self.vessel_deck_slice: Optional[slice] = None   # deck footprint (extruded hull)
+        self.vessel_chute_slice: Optional[slice] = None  # chute point + CRP point
+        self.chute_arc_slice: Optional[slice] = None     # overboarding chute arc
         self.vessel_color = "#444444"
         self.vessel_label = ""
 
@@ -165,6 +170,8 @@ class View3DWidget(QWidget):
         self._mouse_pos: Optional[Tuple[float, float]] = None
         self._hover: Optional[Tuple[int, int]] = None
         self._hover_text = ""
+        self._orbit_pivot: Optional["np.ndarray"] = None   # exaggerated coords
+        self._build_nav_buttons()
         # Last-frame projection (for hover/pick) and derived caches.
         self._proj: Optional[Tuple["np.ndarray", ...]] = None
         self._bed_brush_cache: Optional[Tuple[float, List[QtGui.QBrush]]] = None
@@ -231,6 +238,81 @@ class View3DWidget(QWidget):
         self._has_view = True
         self.update()
 
+    # ------------------------------------------------------- view presets
+
+    def _build_nav_buttons(self) -> None:
+        self._nav_buttons: List[QToolButton] = []
+        for text, tip, cb in (
+            ("Fit", "Zoom to the extents of the model", self.fit_view),
+            ("Ship", "Zoom to the vessel", self.zoom_to_ship),
+            ("Plan", "Plan view (top down, north up)", self.view_plan),
+            ("Side", "Elevation view (across the ship heading)", self.view_side),
+            ("Bow", "Look aft from ahead of the ship", self.view_bow),
+            ("Stern", "Look forward from astern", self.view_stern),
+        ):
+            b = QToolButton(self)
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setAutoRaise(True)
+            b.setCursor(getattr(getattr(Qt, "CursorShape", Qt), "PointingHandCursor"))
+            b.setStyleSheet(
+                "QToolButton { background: rgba(18, 28, 40, 170); color: #dfe6ee;"
+                " border: 1px solid rgba(255, 255, 255, 55); border-radius: 3px;"
+                " padding: 2px 6px; font-size: 11px; }"
+                "QToolButton:hover { background: rgba(50, 70, 95, 200); }"
+            )
+            b.clicked.connect(cb)
+            b.show()
+            self._nav_buttons.append(b)
+        self._layout_nav_buttons()
+
+    def _layout_nav_buttons(self) -> None:
+        w = max((b.sizeHint().width() for b in self._nav_buttons), default=0)
+        y = 8
+        for b in self._nav_buttons:
+            b.resize(w, b.sizeHint().height())
+            b.move(self.width() - w - 8, y)
+            y += b.height() + 4
+
+    def _vessel_heading_deg(self) -> float:
+        v = getattr(self._scene, "vessel", None)
+        return float(getattr(v, "heading_deg", 0.0)) if v is not None else 0.0
+
+    def _set_orientation(self, yaw_deg: float, pitch_deg: float) -> None:
+        self._yaw = float(yaw_deg) % 360.0
+        self._pitch = min(max(float(pitch_deg), -89.0), 89.0)
+        self.update()
+
+    def view_plan(self) -> None:
+        """Top-down; +y (north) up the screen."""
+        self._set_orientation(90.0, -89.0)
+
+    def view_side(self) -> None:
+        """True elevation, looking across the ship heading (profile)."""
+        self._set_orientation(self._vessel_heading_deg() + 90.0, 0.0)
+
+    def view_bow(self) -> None:
+        self._set_orientation(self._vessel_heading_deg() + 180.0, -10.0)
+
+    def view_stern(self) -> None:
+        self._set_orientation(self._vessel_heading_deg(), -10.0)
+
+    def zoom_to_ship(self) -> None:
+        """Frame the vessel (keeps the current orbit orientation)."""
+        v = getattr(self._scene, "vessel", None)
+        if v is None:
+            return
+        foot = vessel_footprint(v)
+        cx, cy = float(foot[:, 0].mean()), float(foot[:, 1].mean())
+        wz = float(getattr(self._scene, "water_z", 0.0))
+        h = float(getattr(v, "height_m", 0.0)) or 4.0
+        r = float(np.max(np.hypot(foot[:, 0] - cx, foot[:, 1] - cy)))
+        r = max(r, h * self._zex, 1.0) * 1.25
+        self._target = np.array([cx, cy, wz + 0.5 * h])
+        self._distance = r / math.sin(math.radians(_FOV_DEG) * 0.5) * 1.15
+        self._has_view = True
+        self.update()
+
     def sizeHint(self) -> QtCore.QSize:
         return QtCore.QSize(640, 480)
 
@@ -286,7 +368,23 @@ class View3DWidget(QWidget):
 
         vessel = getattr(scene, "vessel", None)
         if vessel is not None and np.isfinite(np.asarray(vessel.xy, dtype=float)).all():
-            cache.vessel_slice = push(self._vessel_outline(vessel, float(getattr(scene, "water_z", 0.0))))
+            wz = float(getattr(scene, "water_z", 0.0))
+            foot = vessel_footprint(vessel)
+            base = np.column_stack([foot, np.full(len(foot), wz)])
+            cache.vessel_slice = push(base)
+            height = float(getattr(vessel, "height_m", 0.0))
+            if height > 0.0:
+                deck = base.copy()
+                deck[:, 2] = wz + height
+                cache.vessel_deck_slice = push(deck)
+                crp = vessel_crp_xy(vessel)
+                cache.vessel_chute_slice = push(np.array([
+                    vessel_chute_xyz(vessel, wz),
+                    (crp[0], crp[1], wz + height),
+                ]))
+                arc = chute_arc_points(vessel, wz)
+                if arc is not None:
+                    cache.chute_arc_slice = push(arc)
             cache.vessel_color = str(getattr(vessel, "color", "#444444"))
             cache.vessel_label = str(getattr(vessel, "label", ""))
 
@@ -408,41 +506,65 @@ class View3DWidget(QWidget):
             "width": max(float(getattr(path, "width", 2.0) or 2.0), 0.5),
         }
 
-    @staticmethod
-    def _vessel_outline(vessel: Any, water_z: float) -> "np.ndarray":
-        length = max(float(getattr(vessel, "length_m", 60.0)), 1.0)
-        beam = max(float(getattr(vessel, "beam_m", 12.0)), 0.5)
-        rel = np.array([
-            (length * 0.5, 0.0),
-            (length * 0.15, beam * 0.5),
-            (-length * 0.5, beam * 0.5),
-            (-length * 0.5, -beam * 0.5),
-            (length * 0.15, -beam * 0.5),
-        ])
-        h = math.radians(float(getattr(vessel, "heading_deg", 0.0)))
-        c, s = math.cos(h), math.sin(h)
-        rot = rel @ np.array([[c, s], [-s, c]])
-        cx, cy = float(vessel.xy[0]), float(vessel.xy[1])
-        out = np.empty((5, 3))
-        out[:, 0] = rot[:, 0] + cx
-        out[:, 1] = rot[:, 1] + cy
-        out[:, 2] = water_z
-        return out
-
     # ------------------------------------------------------------- camera
 
-    def _camera(self) -> Tuple["np.ndarray", "np.ndarray"]:
-        """Eye position (exaggerated space) and rotation rows (right, up, fwd)."""
-        p = math.radians(self._pitch)
-        yw = math.radians(self._yaw)
+    @staticmethod
+    def _rotation_rows(yaw_deg: float, pitch_deg: float) -> "np.ndarray":
+        """World->camera rotation rows (right, up, fwd) for a turntable."""
+        p = math.radians(pitch_deg)
+        yw = math.radians(yaw_deg)
         fwd = np.array([math.cos(p) * math.cos(yw), math.cos(p) * math.sin(yw), math.sin(p)])
-        tgt = np.array([self._target[0], self._target[1], self._target[2] * self._zex])
-        eye = tgt - fwd * self._distance
         right = np.cross(fwd, np.array([0.0, 0.0, 1.0]))
         norm = float(np.linalg.norm(right))
         right = right / norm if norm > 1e-9 else np.array([1.0, 0.0, 0.0])
         up = np.cross(right, fwd)
-        return eye, np.stack([right, up, fwd])
+        return np.stack([right, up, fwd])
+
+    def _camera(self) -> Tuple["np.ndarray", "np.ndarray"]:
+        """Eye position (exaggerated space) and rotation rows (right, up, fwd)."""
+        rot = self._rotation_rows(self._yaw, self._pitch)
+        tgt = np.array([self._target[0], self._target[1], self._target[2] * self._zex])
+        eye = tgt - rot[2] * self._distance
+        return eye, rot
+
+    def _pivot_under_cursor(self, mx: float, my: float) -> "np.ndarray":
+        """Orbit pivot in exaggerated space: the cable point under the
+        cursor when there is one, else the view ray's intersection with the
+        horizontal plane through the current target, else the target. This
+        keeps the point you grab pinned under the cursor while orbiting."""
+        eye, rot = self._camera()
+        tgt = np.array([self._target[0], self._target[1], self._target[2] * self._zex])
+        cache = self._cache
+        hit = self._pick(mx, my)
+        if hit is not None and cache is not None:
+            gi = cache.cable_slices[hit[0]].start + hit[1]
+            return cache.pts[gi] * np.array([1.0, 1.0, self._zex])
+        f = self._focal_px()
+        d_cam = np.array([(mx - self.width() * 0.5) / f,
+                          -(my - self.height() * 0.5) / f, 1.0])
+        d = rot.T @ d_cam
+        nrm = float(np.linalg.norm(d))
+        if nrm > 1e-9 and abs(d[2] / nrm) > 1e-6:
+            d = d / nrm
+            t = (tgt[2] - eye[2]) / d[2]
+            if 0.05 * self._distance < t < 20.0 * self._distance:
+                return eye + t * d
+        return tgt
+
+    def _orbit(self, dyaw_deg: float, dpitch_deg: float) -> None:
+        """Rotate the camera about the grabbed pivot, keeping the pivot
+        fixed in screen space (no fly-away when the target is off-model)."""
+        pivot = self._orbit_pivot
+        eye_old, rot_old = self._camera()
+        self._yaw = (self._yaw + dyaw_deg) % 360.0
+        self._pitch = min(max(self._pitch + dpitch_deg, -89.0), 89.0)
+        if pivot is None:
+            return
+        rot_new = self._rotation_rows(self._yaw, self._pitch)
+        cam_space = rot_old @ (pivot - eye_old)
+        eye_new = pivot - rot_new.T @ cam_space
+        tgt = eye_new + rot_new[2] * self._distance
+        self._target = np.array([tgt[0], tgt[1], tgt[2] / self._zex])
 
     def _focal_px(self) -> float:
         return (max(self.height(), 1) * 0.5) / math.tan(math.radians(_FOV_DEG) * 0.5)
@@ -716,14 +838,59 @@ class View3DWidget(QWidget):
         sl = cache.vessel_slice
         if not valid[sl].all():
             return
-        pts = [QtCore.QPointF(px[i], py[i]) for i in range(sl.start, sl.stop)]
+        base = [QtCore.QPointF(px[i], py[i]) for i in range(sl.start, sl.stop)]
         col = QtGui.QColor(cache.vessel_color)
-        painter.setPen(QtGui.QPen(QtGui.QColor(235, 240, 245), 1.4))
-        painter.setBrush(QtGui.QBrush(col))
-        painter.drawPolygon(QtGui.QPolygonF(pts))
+        outline = QtGui.QPen(QtGui.QColor(235, 240, 245), 1.4)
+
+        deck_sl = cache.vessel_deck_slice
+        if deck_sl is not None and valid[deck_sl].all():
+            deck = [QtCore.QPointF(px[i], py[i]) for i in range(deck_sl.start, deck_sl.stop)]
+            n = len(base)
+            side = QtGui.QColor(col).darker(135)
+            painter.setPen(QtGui.QPen(QtGui.QColor(235, 240, 245, 120), 0.8))
+            painter.setBrush(QtGui.QBrush(side))
+            for i in range(n):
+                j = (i + 1) % n
+                painter.drawPolygon(QtGui.QPolygonF([base[i], base[j], deck[j], deck[i]]))
+            painter.setPen(outline)
+            painter.setBrush(QtGui.QBrush(col))
+            painter.drawPolygon(QtGui.QPolygonF(deck))
+            label_pts = deck
+        else:
+            painter.setPen(outline)
+            painter.setBrush(QtGui.QBrush(col))
+            painter.drawPolygon(QtGui.QPolygonF(base))
+            label_pts = base
+
+        arc_sl = cache.chute_arc_slice
+        if arc_sl is not None and valid[arc_sl].all():
+            pen = QtGui.QPen(QtGui.QColor(255, 170, 60), 2.4)
+            pen.setCapStyle(_PEN_CAP.RoundCap)
+            painter.setPen(pen)
+            painter.setBrush(QtGui.QBrush())
+            arc = QtGui.QPolygonF([QtCore.QPointF(px[i], py[i])
+                                   for i in range(arc_sl.start, arc_sl.stop)])
+            painter.drawPolyline(arc)
+
+        ch_sl = cache.vessel_chute_slice
+        if ch_sl is not None and valid[ch_sl].all():
+            # Chute (departure point).
+            x, y = float(px[ch_sl.start]), float(py[ch_sl.start])
+            painter.setPen(QtGui.QPen(QtGui.QColor(20, 26, 36), 1.0))
+            painter.setBrush(QtGui.QBrush(QtGui.QColor(255, 170, 60)))
+            painter.drawEllipse(QtCore.QRectF(x - 4, y - 4, 8, 8))
+            self._halo_text(painter, x + 6, y - 4, "chute")
+            # CRP cross.
+            if ch_sl.stop - ch_sl.start > 1:
+                x, y = float(px[ch_sl.start + 1]), float(py[ch_sl.start + 1])
+                painter.setPen(QtGui.QPen(QtGui.QColor(120, 220, 255), 1.6))
+                painter.drawLine(QtCore.QPointF(x - 5, y), QtCore.QPointF(x + 5, y))
+                painter.drawLine(QtCore.QPointF(x, y - 5), QtCore.QPointF(x, y + 5))
+                self._halo_text(painter, x + 6, y + 10, "CRP")
+
         if cache.vessel_label:
-            cx = sum(p.x() for p in pts) / len(pts)
-            cy = min(p.y() for p in pts)
+            cx = sum(p.x() for p in label_pts) / len(label_pts)
+            cy = min(p.y() for p in label_pts)
             self._halo_text(painter, cx + 6, cy - 6, cache.vessel_label)
 
     def _draw_hover(self, painter: QtGui.QPainter) -> None:
@@ -825,6 +992,8 @@ class View3DWidget(QWidget):
         self._drag_last = (x, y)
         self._drag_total = 0.0
         self._drag_button = event.button()
+        self._orbit_pivot = (self._pivot_under_cursor(x, y)
+                             if self._drag_button == _MOUSE_BUTTON.LeftButton else None)
         event.accept()
 
     def mouseMoveEvent(self, event: Any) -> None:  # noqa: N802
@@ -836,8 +1005,7 @@ class View3DWidget(QWidget):
             self._drag_last = (x, y)
             self._drag_total += abs(dx) + abs(dy)
             if self._drag_button == _MOUSE_BUTTON.LeftButton:
-                self._yaw = (self._yaw - dx * 0.4) % 360.0
-                self._pitch = min(max(self._pitch + dy * 0.4, -89.0), 89.0)
+                self._orbit(-dx * 0.4, -dy * 0.4)
             elif self._drag_button in (_MOUSE_BUTTON.MiddleButton, _MOUSE_BUTTON.RightButton):
                 self._pan(dx, dy)
             self.update()
@@ -854,6 +1022,7 @@ class View3DWidget(QWidget):
                 self.pointPicked.emit(hit[0], hit[1])
         self._drag_button = None
         self._press_pos = None
+        self._orbit_pivot = None
         event.accept()
 
     def mouseDoubleClickEvent(self, event: Any) -> None:  # noqa: N802
@@ -861,6 +1030,7 @@ class View3DWidget(QWidget):
         self._pitch = _DEFAULT_PITCH_DEG
         self._press_pos = None
         self._drag_button = None
+        self._orbit_pivot = None
         self.fit_view()
         event.accept()
 
@@ -891,6 +1061,7 @@ class View3DWidget(QWidget):
 
     def resizeEvent(self, event: Any) -> None:  # noqa: N802
         self._proj = None
+        self._layout_nav_buttons()
         super().resizeEvent(event)
 
     # ------------------------------------------------------------- picking

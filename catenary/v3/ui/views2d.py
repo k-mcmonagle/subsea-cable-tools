@@ -154,20 +154,19 @@ class PlanView:
                 ax.scatter(xyz[on, 0], xyz[on, 1], s=6, color=color, alpha=0.4,
                            label="_nolegend_")
         for m in scene.markers:
+            if not np.all(np.isfinite(np.asarray(m.xyz[:2], dtype=float))):
+                continue
             ax.scatter([m.xyz[0]], [m.xyz[1]], s=30, color=m.color, label="_nolegend_")
             if m.label:
                 ax.text(m.xyz[0], m.xyz[1], " " + m.label, fontsize=8)
-        if scene.vessel is not None:
-            vx, vy = scene.vessel.xy
-            hd = math.radians(scene.vessel.heading_deg)
-            L, B = scene.vessel.length_m, scene.vessel.beam_m
-            pts = np.array([
-                [L * 0.5, 0.0], [L * 0.25, B * 0.5], [-L * 0.5, B * 0.5],
-                [-L * 0.5, -B * 0.5], [L * 0.25, -B * 0.5], [L * 0.5, 0.0],
-            ])
-            R = np.array([[math.cos(hd), -math.sin(hd)], [math.sin(hd), math.cos(hd)]])
-            pv = pts @ R.T + np.array([vx, vy])
+        if scene.vessel is not None and np.all(np.isfinite(np.asarray(scene.vessel.xy, dtype=float))):
+            from .scene import vessel_footprint
+
+            pv = vessel_footprint(scene.vessel)
+            pv = np.vstack([pv, pv[:1]])  # close the outline
             ax.plot(pv[:, 0], pv[:, 1], color="#444444", linewidth=1.5, label="_nolegend_")
+            ax.scatter([scene.vessel.xy[0]], [scene.vessel.xy[1]], s=18,
+                       color="#ffaa3c", label="_nolegend_", zorder=5)
         ax.set_xlabel("x (m)")
         ax.set_ylabel("y (m)")
         try:

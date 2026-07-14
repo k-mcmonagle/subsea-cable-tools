@@ -23,6 +23,71 @@ from typing import List, Sequence, Tuple
 import numpy as np
 
 
+def _local_metric_crs(origin_map_xy: Tuple[float, float], map_crs, ctx):
+    """A metric CRS matching the simulator's local frame: azimuthal
+    equidistant centred on the origin (x = metres east, y = metres north).
+    Valid anywhere on the planet, whatever the map CRS."""
+    from qgis.core import QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsPointXY
+
+    wgs = QgsCoordinateReferenceSystem("EPSG:4326")
+    ll = QgsCoordinateTransform(map_crs, wgs, ctx).transform(
+        QgsPointXY(float(origin_map_xy[0]), float(origin_map_xy[1])))
+    proj = (f"+proj=aeqd +lat_0={ll.y():.10f} +lon_0={ll.x():.10f} "
+            "+x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs")
+    crs = None
+    if hasattr(QgsCoordinateReferenceSystem, "fromProj"):
+        crs = QgsCoordinateReferenceSystem.fromProj(proj)
+    if crs is None or not crs.isValid():  # QGIS < 3.10.3 fallback
+        crs = QgsCoordinateReferenceSystem()
+        crs.createFromProj4(proj)
+    if not crs.isValid():
+        raise RuntimeError("Could not create the local metric (AEQD) CRS.")
+    return crs
+
+
+def local_frame_transforms(origin_map_xy: Tuple[float, float], crs_authid: str):
+    """(to_map, to_local) coordinate transforms between the local metric
+    frame and the CRS ``crs_authid``. All local -> map placement must go
+    through these — adding metres to map coordinates directly is wrong in
+    geographic or non-metre CRSs."""
+    from qgis.core import QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject
+
+    map_crs = QgsCoordinateReferenceSystem(crs_authid)
+    if not map_crs.isValid():
+        raise ValueError(f"Invalid CRS {crs_authid!r}.")
+    ctx = QgsProject.instance().transformContext()
+    local = _local_metric_crs(origin_map_xy, map_crs, ctx)
+    from qgis.core import QgsCoordinateTransform as _T
+
+    return _T(local, map_crs, ctx), _T(map_crs, local, ctx)
+
+
+def map_points_to_local(points, origin_map_xy: Tuple[float, float],
+                        crs_authid: str) -> List[Tuple[float, float]]:
+    """Map-CRS (x, y) points -> local metric frame (metres E/N of origin)."""
+    from qgis.core import QgsPointXY
+
+    _, to_local = local_frame_transforms(origin_map_xy, crs_authid)
+    out = []
+    for x, y in points:
+        p = to_local.transform(QgsPointXY(float(x), float(y)))
+        out.append((float(p.x()), float(p.y())))
+    return out
+
+
+def local_points_to_map(points, origin_map_xy: Tuple[float, float],
+                        crs_authid: str) -> List[Tuple[float, float]]:
+    """Local metric (x, y) points -> map CRS."""
+    from qgis.core import QgsPointXY
+
+    to_map, _ = local_frame_transforms(origin_map_xy, crs_authid)
+    out = []
+    for x, y in points:
+        p = to_map.transform(QgsPointXY(float(x), float(y)))
+        out.append((float(p.x()), float(p.y())))
+    return out
+
+
 def list_raster_layers() -> List[Tuple[str, str]]:
     """(layer id, display name) for every raster layer in the project."""
     from qgis.core import QgsProject, QgsRasterLayer
@@ -44,10 +109,11 @@ def sample_raster_bathymetry(
 ) -> dict:
     """Sample an ``n x n`` depth grid from a raster around a map-CRS centre.
 
-    Sampling points are laid out on a regular grid in the **project** map
-    CRS (which must be projected/metric) spanning ``+/- half_extent_m``
-    about ``center_map_xy``, then transformed to the raster layer's CRS
-    for the identify calls.
+    Sampling points are laid out on a regular metric grid in the local
+    AEQD frame centred on ``center_map_xy`` (given in the project CRS,
+    which may be geographic or projected in any unit), spanning
+    ``+/- half_extent_m``, then transformed to the raster layer's CRS for
+    the identify calls.
 
     Returns a dict with keys ``x0, y0, dx, dy, depths`` (2D list, positive
     down; row ``i`` at ``y0 + i*dy``, column ``j`` at ``x0 + j*dx``) in
@@ -74,10 +140,8 @@ def sample_raster_bathymetry(
 
     project = QgsProject.instance()
     project_crs = project.crs()
-    if not project_crs.isValid() or project_crs.isGeographic():
-        raise ValueError(
-            "project CRS must be projected (metres) for bathymetry sampling"
-        )
+    if not project_crs.isValid():
+        raise ValueError("The project has no valid CRS set.")
 
     layer = project.mapLayer(layer_id)
     if layer is None:
@@ -88,17 +152,17 @@ def sample_raster_bathymetry(
     if provider is None:
         raise RuntimeError(f"Raster layer {layer.name()!r} has no data provider.")
 
+    cx, cy = float(center_map_xy[0]), float(center_map_xy[1])
     try:
+        local_crs = _local_metric_crs((cx, cy), project_crs, project.transformContext())
         transform = QgsCoordinateTransform(
-            project_crs, layer.crs(), project.transformContext()
+            local_crs, layer.crs(), project.transformContext()
         )
     except Exception as exc:  # noqa: BLE001 - re-raise with context
         raise RuntimeError(
-            f"Could not build CRS transform {project_crs.authid()} -> "
+            f"Could not build the local-frame transform to "
             f"{layer.crs().authid()}: {exc}"
         ) from exc
-
-    cx, cy = float(center_map_xy[0]), float(center_map_xy[1])
     half = float(half_extent_m)
     n = int(n)
     step = 2.0 * half / (n - 1)
@@ -108,9 +172,8 @@ def sample_raster_bathymetry(
     depths = np.full((n, n), np.nan, dtype=float)
     for i, yl in enumerate(ys_local):
         for j, xl in enumerate(xs_local):
-            point = QgsPointXY(cx + float(xl), cy + float(yl))
             try:
-                point = transform.transform(point)
+                point = transform.transform(QgsPointXY(float(xl), float(yl)))
             except Exception:
                 continue  # outside transform validity -> leave as nodata
             result = provider.identify(point, QgsRaster.IdentifyFormatValue)
@@ -155,8 +218,9 @@ def push_chains_to_map(
 ):
     """Add local-frame chain polylines to the map as a LineStringZ layer.
 
-    ``chains`` is (chain name, (n, 3) local xyz) tuples; vertices become
-    ``(x + ox, y + oy, z)`` in the CRS ``crs_authid``. Returns the layer.
+    ``chains`` is (chain name, (n, 3) local xyz) tuples; the local metric
+    vertices are georeferenced through the AEQD frame centred on
+    ``origin_map_xy`` (so scale is correct in any CRS). Returns the layer.
     """
     from qgis.core import (
         QgsFeature,
@@ -178,7 +242,9 @@ def push_chains_to_map(
     provider.addAttributes([QgsField("name", QVariant.String)])
     layer.updateFields()
 
-    ox, oy = float(origin_map_xy[0]), float(origin_map_xy[1])
+    from qgis.core import QgsPointXY
+
+    to_map, _ = local_frame_transforms(origin_map_xy, crs_authid)
     features = []
     for chain_name, xyz in chains:
         pts_arr = np.asarray(xyz, dtype=float)
@@ -186,10 +252,10 @@ def push_chains_to_map(
             raise ValueError(
                 f"Chain {chain_name!r} must be an (n, 3) array with n >= 2."
             )
-        points = [
-            QgsPoint(float(x) + ox, float(y) + oy, float(z))
-            for x, y, z in pts_arr[:, :3]
-        ]
+        points = []
+        for x, y, z in pts_arr[:, :3]:
+            mp = to_map.transform(QgsPointXY(float(x), float(y)))
+            points.append(QgsPoint(mp.x(), mp.y(), float(z)))
         feature = QgsFeature(layer.fields())
         feature.setGeometry(QgsGeometry(QgsLineString(points)))
         feature["name"] = str(chain_name)
@@ -231,12 +297,15 @@ def push_markers_to_map(
     provider.addAttributes([QgsField("label", QVariant.String)])
     layer.updateFields()
 
-    ox, oy = float(origin_map_xy[0]), float(origin_map_xy[1])
+    from qgis.core import QgsPointXY
+
+    to_map, _ = local_frame_transforms(origin_map_xy, crs_authid)
     features = []
     for label, xyz in markers:
         x, y, z = (float(v) for v in xyz)
+        mp = to_map.transform(QgsPointXY(x, y))
         feature = QgsFeature(layer.fields())
-        feature.setGeometry(QgsGeometry(QgsPoint(x + ox, y + oy, z)))
+        feature.setGeometry(QgsGeometry(QgsPoint(mp.x(), mp.y(), z)))
         feature["label"] = str(label)
         features.append(feature)
 

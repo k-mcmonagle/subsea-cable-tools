@@ -237,6 +237,14 @@ def solve_system(
     iters_done = 0
     residual_ratio = float("inf")
     check_every = 200
+    # Divergence recovery: dynamic relaxation can blow up (overflow -> NaN)
+    # on stiff or badly-seeded systems. Checkpoint the last finite state and,
+    # on a blow-up, rewind to it with a heavier nodal mass (smaller effective
+    # step). Give up after a few rewinds and return the checkpoint.
+    X_ok = X.copy()
+    blowups = 0
+    max_blowups = 6
+    diverged = False
     converged = False
     T_seg_store: List["np.ndarray"] = [np.zeros(ch.n_elems) for ch in chains]
 
@@ -420,9 +428,29 @@ def solve_system(
 
             if (it + 1) % check_every == 0:
                 residual_ratio = float(np.max(np.abs(F[~fixed]))) / max(w_ref, 1e-9)
+                if not np.isfinite(residual_ratio) or not np.all(np.isfinite(X)):
+                    blowups += 1
+                    if blowups > max_blowups:
+                        diverged = True
+                        X = X_ok.copy()
+                        break
+                    X = X_ok.copy()
+                    v[:] = 0.0
+                    ke_prev = 0.0
+                    m_node *= 4.0
+                    residual_ratio = float("inf")
+                    continue
+                X_ok = X.copy()
                 if residual_ratio < tol:
                     converged = True
                     break
+
+        if diverged:
+            warnings.append(
+                "Solver diverged (numerical blow-up); returning the last "
+                "stable state — treat the result as approximate."
+            )
+            break
 
         # Outer rest-length correction toward the inextensible limit.
         max_corr = 0.0
@@ -434,6 +462,16 @@ def solve_system(
             L0_rest[ci] = ch.L0 / (1.0 + strain_now)
         if max_corr < 2e-5:
             break
+
+    if not np.all(np.isfinite(X)):
+        # Blow-up between residual checks right at the iteration cap.
+        X = X_ok.copy()
+        converged = False
+        if not diverged:
+            warnings.append(
+                "Solver diverged (numerical blow-up); returning the last "
+                "stable state — treat the result as approximate."
+            )
 
     # --- Post-processing ----------------------------------------------------
     if bathy is not None:

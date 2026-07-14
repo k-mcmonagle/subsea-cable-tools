@@ -56,14 +56,108 @@ class Marker:
 
 @dataclass
 class VesselGlyph:
-    """Simple vessel representation at the water surface."""
+    """Parametric vessel at the water surface.
+
+    ``xy`` is the plan position of the CABLE DEPARTURE POINT (chute) — the
+    engine's top attachment — not the hull centre. The hull is placed around
+    it via the CRP/chute offsets below, all in ship frame (x forward,
+    positive ``*_stbd_m`` to starboard). ``height_m`` extrudes the hull from
+    the waterline up to the deck (set it to the chute height so the drawn
+    freeboard matches the configured chute height); 0 keeps the legacy flat
+    outline.
+    """
 
     xy: Tuple[float, float]
-    heading_deg: float = 0.0        # 0 = +x, counter-clockwise positive
+    heading_deg: float = 0.0        # 0 = +x, counter-clockwise positive (math frame)
     length_m: float = 60.0
     beam_m: float = 12.0
+    height_m: float = 0.0           # waterline -> deck extrusion (chute height)
+    crp_fwd_m: float = 0.0          # CRP forward of midship
+    crp_stbd_m: float = 0.0         # CRP starboard of centreline
+    chute_fwd_m: float = 0.0        # chute forward of CRP
+    chute_stbd_m: float = 0.0       # chute starboard of CRP
+    chute_radius_m: float = 0.0     # overboarding chute radius (drawn only)
     label: str = "vessel"
     color: str = "#444444"
+
+
+def compass_to_math_deg(bearing_deg: float) -> float:
+    """Compass bearing (deg clockwise from north) -> math angle (deg CCW
+    from +x/east), for a local frame aligned with a projected map CRS."""
+    return 90.0 - float(bearing_deg)
+
+
+def math_to_compass_deg(math_deg: float) -> float:
+    """Inverse of :func:`compass_to_math_deg`, normalised to [0, 360)."""
+    return (90.0 - float(math_deg)) % 360.0
+
+
+def _vessel_rotation(vessel: "VesselGlyph"):
+    import math as _m
+
+    h = _m.radians(float(getattr(vessel, "heading_deg", 0.0)))
+    return _m.cos(h), _m.sin(h)
+
+
+def vessel_footprint(vessel: "VesselGlyph") -> "np.ndarray":
+    """(5, 2) waterline footprint in local/world plan coordinates.
+
+    Ship frame: x forward, y to port (so starboard offsets enter negated);
+    the polygon is anchored so the chute plan position lands on
+    ``vessel.xy``.
+    """
+    length = max(float(getattr(vessel, "length_m", 60.0)), 1.0)
+    beam = max(float(getattr(vessel, "beam_m", 12.0)), 0.5)
+    rel = np.array([
+        (length * 0.5, 0.0),
+        (length * 0.15, beam * 0.5),
+        (-length * 0.5, beam * 0.5),
+        (-length * 0.5, -beam * 0.5),
+        (length * 0.15, -beam * 0.5),
+    ])
+    # Chute position in ship frame relative to the hull centre.
+    cx_ship = float(getattr(vessel, "crp_fwd_m", 0.0)) + float(getattr(vessel, "chute_fwd_m", 0.0))
+    cy_ship = -(float(getattr(vessel, "crp_stbd_m", 0.0)) + float(getattr(vessel, "chute_stbd_m", 0.0)))
+    rel = rel - np.array([cx_ship, cy_ship])
+    c, s = _vessel_rotation(vessel)
+    rot = rel @ np.array([[c, s], [-s, c]])
+    return rot + np.asarray(vessel.xy, dtype=float)[:2]
+
+
+def vessel_crp_xy(vessel: "VesselGlyph") -> Tuple[float, float]:
+    """CRP plan position (world), derived back from the chute anchor."""
+    rel = np.array([-float(getattr(vessel, "chute_fwd_m", 0.0)),
+                    float(getattr(vessel, "chute_stbd_m", 0.0))])
+    c, s = _vessel_rotation(vessel)
+    out = rel @ np.array([[c, s], [-s, c]]) + np.asarray(vessel.xy, dtype=float)[:2]
+    return float(out[0]), float(out[1])
+
+
+def vessel_chute_xyz(vessel: "VesselGlyph", water_z: float = 0.0) -> Tuple[float, float, float]:
+    """Chute (cable departure) point at deck level."""
+    return (float(vessel.xy[0]), float(vessel.xy[1]),
+            float(water_z) + float(getattr(vessel, "height_m", 0.0)))
+
+
+def chute_arc_points(vessel: "VesselGlyph", water_z: float = 0.0, n: int = 12) -> Optional["np.ndarray"]:
+    """Quarter-circle overboarding-chute arc (drawn geometry only).
+
+    Starts at the chute top tangent to the deck, curving down on the aft
+    side — mirroring the V2 catenary calculator's chute rendering. Returns
+    (n, 3) points or None when no radius is set.
+    """
+    import math as _m
+
+    r = float(getattr(vessel, "chute_radius_m", 0.0))
+    if not (r > 0.0):
+        return None
+    c, s = _vessel_rotation(vessel)
+    aft = np.array([-c, -s, 0.0])
+    top = np.asarray(vessel_chute_xyz(vessel, water_z), dtype=float)
+    centre = top - np.array([0.0, 0.0, r])
+    th = np.linspace(0.0, _m.pi / 2.0, max(int(n), 2))
+    return centre[None, :] + r * (np.sin(th)[:, None] * aft[None, :]
+                                  + np.cos(th)[:, None] * np.array([0.0, 0.0, 1.0])[None, :])
 
 
 @dataclass

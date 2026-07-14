@@ -29,7 +29,9 @@ from ..engine import scenarios as scen
 from ..engine import solver3d as s3d
 from ..engine import steady_lay as sl
 from ..engine import timeline as tl
-from .scene import BedGrid, CablePath, Marker, SceneData, VesselGlyph
+from .scene import (
+    BedGrid, CablePath, Marker, SceneData, VesselGlyph, compass_to_math_deg,
+)
 
 KNOT = 0.514444
 
@@ -53,10 +55,20 @@ class V3Config:
     default_EI_kNm2: float = 0.0
     default_mbr_m: float = 0.0
     # Vessel / lay --------------------------------------------------------
+    # All bearings in the config are COMPASS degrees (clockwise from north);
+    # they are converted to the engine's math frame (0 = +x/east, CCW) here.
     chute_height_m: float = 5.0
     lay_azimuth_deg: float = 0.0             # ship course; cable trails behind
     ship_speed_kn: float = 6.0
     slack_percent: float = 2.0
+    # Parametric ship shape (drawn geometry; chute stays the engine anchor).
+    ship_length_m: float = 60.0
+    ship_beam_m: float = 12.0
+    crp_fwd_m: float = 0.0                   # CRP forward of midship
+    crp_stbd_m: float = 0.0                  # CRP starboard of centreline
+    chute_fwd_m: float = 0.0                 # chute forward of CRP
+    chute_stbd_m: float = 0.0                # chute starboard of CRP
+    chute_radius_m: float = 0.0              # overboarding chute radius (drawn)
     # Static & steady solve mode ------------------------------------------
     solve_mode: str = "bottom_tension"       # + top_tension/exit_angle/layback/suspended_length
     solve_value: float = 5.0                 # kN for tensions, deg, m
@@ -100,7 +112,7 @@ def build_bathymetry(cfg: V3Config):
 def build_current(cfg: V3Config) -> Optional[hyd.CurrentProfile]:
     layers = [
         hyd.CurrentLayer(float(l.get("depth_m", 0.0)), float(l.get("speed_mps", 0.0)),
-                         float(l.get("direction_deg", 0.0)))
+                         compass_to_math_deg(float(l.get("direction_deg", 0.0))))
         for l in cfg.current_layers
         if float(l.get("speed_mps", 0.0)) != 0.0
     ]
@@ -199,7 +211,7 @@ def run_static(cfg: V3Config, cancel: Optional[Callable[[], bool]] = None) -> Ru
     ode_in.payout_speed_mps = 0.0
     ode = sl.solve_steady_lay(ode_in, cfg.solve_mode, _solve_value_si(cfg))
 
-    az = math.radians(cfg.lay_azimuth_deg + 180.0)  # cable trails behind
+    az = math.radians(compass_to_math_deg(cfg.lay_azimuth_deg) + 180.0)  # cable trails behind
     ux, uy = math.cos(az), math.sin(az)
     layback = ode.layback_m
     tail = max(10.0, cfg.on_bed_tail_m)
@@ -281,7 +293,7 @@ def run_steady(cfg: V3Config, cancel: Optional[Callable[[], bool]] = None) -> Ru
     inp = _steady_input(cfg, depth0, V)
     res = sl.solve_steady_lay(inp, cfg.solve_mode, _solve_value_si(cfg))
 
-    az = math.radians(cfg.lay_azimuth_deg)
+    az = math.radians(compass_to_math_deg(cfg.lay_azimuth_deg))
     ca, sa = math.cos(az), math.sin(az)
     # ODE frame: TDP at origin, ship toward +x. Rotate/translate so the
     # vessel is at local (0, 0) with the cable trailing behind.
@@ -303,7 +315,7 @@ def run_steady(cfg: V3Config, cancel: Optional[Callable[[], bool]] = None) -> Ru
         color="#1f77b4",
     )]
     scene.markers = [Marker(tuple(xyz[0]), "TDP", "tdp")]
-    scene.vessel = VesselGlyph((0.0, 0.0), heading_deg=cfg.lay_azimuth_deg)
+    scene.vessel = _vessel_glyph(cfg, (0.0, 0.0), compass_to_math_deg(cfg.lay_azimuth_deg))
 
     H_c = res.hydrodynamic_constant_mps
     out = RunOutput(mode="steady", scene=scene)
@@ -351,9 +363,10 @@ def _build_scenario(cfg: V3Config, bathy, kind: str, *, static_only: bool = Fals
             bu_cda_m2=float(op.get("bu_cda_m2", 1.5)),
             leg_length_m=float(op.get("leg_length_m", 2.0 * bathy.depth_at(0.0, 0.0))),
             leg_azimuths_deg=(
-                float(op.get("leg1_azimuth_deg", 150.0)),
-                float(op.get("leg2_azimuth_deg", 210.0)),
+                compass_to_math_deg(float(op.get("leg1_azimuth_deg", 150.0))),
+                compass_to_math_deg(float(op.get("leg2_azimuth_deg", 210.0))),
             ),
+            vessel_course_deg=compass_to_math_deg(cfg.lay_azimuth_deg),
             ship_speed_mps=V,
             payout_speed_mps=float(op.get("payout_mps", 0.4)),
             duration_s=op.get("duration_s"),
@@ -365,11 +378,15 @@ def _build_scenario(cfg: V3Config, bathy, kind: str, *, static_only: bool = Fals
         )
     if kind == "final_bight":
         half = float(op.get("end_separation_m", 120.0)) / 2.0
+        # Laid ends run along the bight axis bearing (compass; default 90
+        # keeps the historic +x/east orientation).
+        axis = math.radians(compass_to_math_deg(float(op.get("bight_axis_deg", 90.0))))
+        ux, uy = math.cos(axis), math.sin(axis)
         return scen.final_bight(
             bathy, items, scen.default_rope_assembly(), defaults,
             bight_length_m=float(op.get("bight_length_m", 300.0)),
-            end_a_xy=(-half, 0.0), end_b_xy=(half, 0.0),
-            step_course_deg=float(op.get("step_course_deg", 90.0)),
+            end_a_xy=(-half * ux, -half * uy), end_b_xy=(half * ux, half * uy),
+            step_course_deg=compass_to_math_deg(float(op.get("step_course_deg", 90.0))),
             vessel_speed_mps=V,
             rope_payout_mps=float(op.get("payout_mps", 0.3)),
             duration_s=op.get("duration_s"),
@@ -401,7 +418,7 @@ def run_static_hold(cfg: V3Config) -> RunOutput:
 
     bed = _bed_grid_for_snapshots(cfg, bathy, [snap])
     title = "Static hold — branching unit" if cfg.static_config == "bu" else "Static hold — final bight"
-    scene = snapshot_scene(snap, bed, title=title)
+    scene = snapshot_scene(snap, bed, title=title, cfg=cfg)
     out = RunOutput(mode="static", scene=scene)
     out.warnings = list(snap.warnings)
     if not snap.converged:
@@ -456,7 +473,8 @@ def run_operation(cfg: V3Config, progress: Optional[Callable[[float, str], bool]
     bed = _bed_grid_for_snapshots(cfg, bathy, result.snapshots)
 
     def build_scene(i: int) -> SceneData:
-        return snapshot_scene(result.snapshots[i], bed, title=f"t = {result.snapshots[i].t_s:.0f} s")
+        return snapshot_scene(result.snapshots[i], bed,
+                              title=f"t = {result.snapshots[i].t_s:.0f} s", cfg=cfg)
 
     out.scene_builder = build_scene
     if result.snapshots:
@@ -480,6 +498,21 @@ def run_operation(cfg: V3Config, progress: Optional[Callable[[float, str], bool]
 # ---------------------------------------------------------------------------
 
 _CHAIN_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
+
+
+def _vessel_glyph(cfg: V3Config, xy, heading_math_deg: float) -> VesselGlyph:
+    return VesselGlyph(
+        xy=(float(xy[0]), float(xy[1])),
+        heading_deg=float(heading_math_deg),
+        length_m=cfg.ship_length_m,
+        beam_m=cfg.ship_beam_m,
+        height_m=cfg.chute_height_m,
+        crp_fwd_m=cfg.crp_fwd_m,
+        crp_stbd_m=cfg.crp_stbd_m,
+        chute_fwd_m=cfg.chute_fwd_m,
+        chute_stbd_m=cfg.chute_stbd_m,
+        chute_radius_m=cfg.chute_radius_m,
+    )
 
 
 def _bed_extent(xyz_list: List["np.ndarray"], margin: float = 0.25) -> Tuple[Tuple[float, float], Tuple[float, float]]:
@@ -533,11 +566,11 @@ def _result_scene(cfg: V3Config, bathy, res: s3d.SolveResult, vessel_xy=(0.0, 0.
         if np.any(c.contact):
             i_tdp = int(np.argmax(c.contact))
             scene.markers.append(Marker(tuple(c.xyz[i_tdp]), "TDP", "tdp"))
-    scene.vessel = VesselGlyph(tuple(vessel_xy), heading_deg=cfg.lay_azimuth_deg)
+    scene.vessel = _vessel_glyph(cfg, vessel_xy, compass_to_math_deg(cfg.lay_azimuth_deg))
     return scene
 
 
-def snapshot_scene(snap, bed: BedGrid, title: str = "") -> SceneData:
+def snapshot_scene(snap, bed: BedGrid, title: str = "", cfg: Optional[V3Config] = None) -> SceneData:
     scene = SceneData(title=title or (snap.label or ""))
     scene.bed = bed
     for k, c in enumerate(snap.chains):
@@ -551,7 +584,11 @@ def snapshot_scene(snap, bed: BedGrid, title: str = "") -> SceneData:
         ))
     for name, xyz in snap.junction_xyz.items():
         scene.markers.append(Marker(tuple(xyz), name, "junction"))
-    scene.vessel = VesselGlyph(tuple(snap.vessel_xy), heading_deg=snap.vessel_heading_deg)
+    # Timeline headings are already in the engine math frame.
+    if cfg is not None:
+        scene.vessel = _vessel_glyph(cfg, snap.vessel_xy, snap.vessel_heading_deg)
+    else:
+        scene.vessel = VesselGlyph(tuple(snap.vessel_xy), heading_deg=snap.vessel_heading_deg)
     return scene
 
 
@@ -634,12 +671,16 @@ class SolveWorker(QThread):
 
     def run(self):  # noqa: D102 - QThread entry point
         try:
-            if self.cfg.mode == "steady":
-                out = run_steady(self.cfg, cancel=lambda: self._cancel)
-            elif self.cfg.mode == "operation":
-                out = run_operation(self.cfg, progress=self._progress)
-            else:
-                out = run_static(self.cfg, cancel=lambda: self._cancel)
+            # The solver detects and recovers from numerical blow-ups itself
+            # (reporting them in the result's warnings), so the transient
+            # overflow/NaN FP warnings on the way there are just log noise.
+            with np.errstate(over="ignore", invalid="ignore"):
+                if self.cfg.mode == "steady":
+                    out = run_steady(self.cfg, cancel=lambda: self._cancel)
+                elif self.cfg.mode == "operation":
+                    out = run_operation(self.cfg, progress=self._progress)
+                else:
+                    out = run_static(self.cfg, cancel=lambda: self._cancel)
         except Exception as exc:  # surface, never crash the UI thread
             out = RunOutput(mode=self.cfg.mode, error=f"{exc}\n{traceback.format_exc(limit=6)}")
         self.finishedWith.emit(out)
