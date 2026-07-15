@@ -3,7 +3,7 @@
 
 from qgis.PyQt.QtCore import QMetaType
 from qgis.PyQt.QtGui import QCursor
-from qgis.PyQt.QtWidgets import QAbstractItemView, QDialog, QHeaderView, QSizePolicy, QToolButton, QDialogButtonBox
+from qgis.PyQt.QtWidgets import QAbstractItemView, QDialog, QHeaderView, QMessageBox, QSizePolicy, QToolButton, QDialogButtonBox
 
 try:
     from qgis.PyQt.QtCore import QVariant
@@ -71,6 +71,10 @@ EDIT_TRIGGER_SELECTED_CLICKED = _scoped_member(QAbstractItemView, "EditTrigger",
 EDIT_TRIGGER_EDIT_KEY_PRESSED = _scoped_member(QAbstractItemView, "EditTrigger", "EditKeyPressed")
 
 HEADER_RESIZE_MODE_INTERACTIVE = _scoped_member(QHeaderView, "ResizeMode", "Interactive")
+HEADER_RESIZE_MODE_STRETCH = _scoped_member(QHeaderView, "ResizeMode", "Stretch")
+
+MESSAGEBOX_YES = _scoped_member(QMessageBox, "StandardButton", "Yes")
+MESSAGEBOX_NO = _scoped_member(QMessageBox, "StandardButton", "No")
 
 TOOLBUTTON_POPUP_MODE_MENU_BUTTON = _scoped_member(
     QToolButton,

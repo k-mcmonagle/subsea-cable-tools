@@ -71,6 +71,8 @@ class SubseaCableTools:
         self.depth_profile_action = None
         self.transit_measure_action = None
         self.transit_measure_tool = None
+        self.explorer_action = None
+        self.explorer_window = None
 
     def tr(self, message):
         """Return the translation for a string."""
@@ -148,6 +150,14 @@ class SubseaCableTools:
         self.iface.addPluginToMenu(self.menu, self.transit_measure_action)
         self.actions.append(self.transit_measure_action)
 
+        # Cable Lay Data Explorer action (standalone analysis / QC window)
+        explorer_icon = QIcon(":/plugins/subsea_cable_tools/icon.png")
+        self.explorer_action = QAction(explorer_icon, "Cable Lay Data Explorer", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
+        self.explorer_action.triggered.connect(self.show_cable_lay_explorer)
+        self.iface.addToolBarIcon(self.explorer_action)
+        self.iface.addPluginToMenu(self.menu, self.explorer_action)
+        self.actions.append(self.explorer_action)
+
     def show_catenary_calculator(self):
         if self.catenary_calculator_dialog is None:
             try:
@@ -187,6 +197,28 @@ class SubseaCableTools:
         self.catenary_calculator_v2_dialog.show()
         self.catenary_calculator_v2_dialog.raise_()
         self.catenary_calculator_v2_dialog.activateWindow()
+
+    def show_cable_lay_explorer(self):
+        """Show the standalone Cable Lay Data Explorer window."""
+        if self.explorer_window is None:
+            try:
+                from .explorer import CableLayExplorerWindow
+            except Exception as e:
+                from qgis.PyQt.QtWidgets import QMessageBox
+
+                QMessageBox.critical(
+                    self.iface.mainWindow(),
+                    "Subsea Cable Tools",
+                    "Cable Lay Data Explorer could not be opened. This tool requires "
+                    "the bundled pyqtgraph plotting backend.\n\n"
+                    f"Details: {e}",
+                )
+                return
+
+            self.explorer_window = CableLayExplorerWindow(self.iface, self.iface.mainWindow())
+        self.explorer_window.show()
+        self.explorer_window.raise_()
+        self.explorer_window.activateWindow()
 
     def unload(self):
         """Remove the plugin menu items and icons from QGIS GUI and clean up all resources."""
@@ -250,6 +282,22 @@ class SubseaCableTools:
             except Exception:
                 pass
             self.depth_profile_dock = None
+
+        # Clean up the Cable Lay Data Explorer window
+        if hasattr(self, 'explorer_window') and self.explorer_window:
+            try:
+                self.explorer_window.shutdown()
+            except Exception:
+                pass
+            try:
+                self.explorer_window.close()
+            except Exception:
+                pass
+            try:
+                self.explorer_window.deleteLater()
+            except Exception:
+                pass
+            self.explorer_window = None
 
         # Remove actions from menu and toolbar
         if hasattr(self, 'actions'):

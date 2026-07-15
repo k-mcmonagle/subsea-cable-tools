@@ -11,7 +11,7 @@ from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 PACKAGE_NAME = "subsea_cable_tools"
-EXPECTED_ALGORITHM_COUNT = 36
+EXPECTED_ALGORITHM_COUNT = 37
 
 
 def _require_qgis() -> None:
@@ -110,6 +110,7 @@ def main() -> int:
         ("catenary V2 dialog (auto-drape)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_catenary_v2_dialog")),
         ("seabed length algorithm", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_seabed_length")),
         ("cable lay importers", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_cable_lay_importers")),
+        ("cable lay QC engine", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_laydata_qc")),
         ("processing provider", _provider_loads),
         ("main plugin import", _plugin_imports),
     ]
