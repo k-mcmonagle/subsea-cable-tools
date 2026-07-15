@@ -22,6 +22,7 @@ from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QHBoxLayout,
@@ -41,8 +42,14 @@ from qgis.PyQt.QtWidgets import (
 from . import assembly_model as am
 from . import schema
 from .assembly_model import Assembly, AssemblyItem
+from .readonly import make_readonly_banner
 from .selection_bus import selection_bus
-from .store import WorkbenchStore, default_project_gpkg_path, project_gpkg_path
+from .store import (
+    WorkbenchReadOnlyError,
+    WorkbenchStore,
+    default_project_gpkg_path,
+    project_gpkg_path,
+)
 
 ITEM_COLUMNS = [
     ("Kind", "kind"), ("Name", "name"), ("Length (m)", "length_m"),
@@ -54,6 +61,8 @@ ITEM_COLUMNS = [
     ("Colour", "color_hex"), ("Remarks", "remarks"),
 ]
 _FLOAT_COLS = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+_ENGINEERING_COLS = list(range(3, 12))
+_ENGINEERING_COLS_SETTING = "SubseaCableTools/workbench/assemblyEngineeringColumns"
 
 
 class AssemblyManagerPanel(QWidget):
@@ -74,8 +83,10 @@ class AssemblyManagerPanel(QWidget):
         self.settings = QSettings()
         self.store: Optional[WorkbenchStore] = None
         self.assembly: Optional[Assembly] = None
+        self._current_header: Optional[Dict] = None
         self._loading = False
         self._fit_row: Optional[Dict] = None  # active fit context for the KP axis
+        self._read_only = False
 
         self._build_ui()
         self._open_store()
@@ -142,19 +153,25 @@ class AssemblyManagerPanel(QWidget):
 
         table_container = QWidget()
         table_layout = QVBoxLayout(table_container)
+        self.readonly_banner = make_readonly_banner(table_container)
+        table_layout.addWidget(self.readonly_banner)
         toolbar = QHBoxLayout()
-        add_section_btn = QPushButton("Add section")
-        add_section_btn.clicked.connect(lambda: self._add_item(am.KIND_SECTION))
-        add_body_btn = QPushButton("Add body")
-        add_body_btn.clicked.connect(lambda: self._add_item(am.KIND_BODY))
-        remove_btn = QPushButton("Delete item")
-        remove_btn.clicked.connect(self._delete_item)
-        up_btn = QPushButton("Move up")
-        up_btn.clicked.connect(lambda: self._move_item(-1))
-        down_btn = QPushButton("Move down")
-        down_btn.clicked.connect(lambda: self._move_item(1))
-        for btn in (add_section_btn, add_body_btn, remove_btn, up_btn, down_btn):
+        self.add_section_btn = QPushButton("Add section")
+        self.add_section_btn.clicked.connect(lambda: self._add_item(am.KIND_SECTION))
+        self.add_body_btn = QPushButton("Add body")
+        self.add_body_btn.clicked.connect(lambda: self._add_item(am.KIND_BODY))
+        self.remove_item_btn = QPushButton("Delete item")
+        self.remove_item_btn.clicked.connect(self._delete_item)
+        self.move_up_btn = QPushButton("Move up")
+        self.move_up_btn.clicked.connect(lambda: self._move_item(-1))
+        self.move_down_btn = QPushButton("Move down")
+        self.move_down_btn.clicked.connect(lambda: self._move_item(1))
+        for btn in (self.add_section_btn, self.add_body_btn, self.remove_item_btn,
+                    self.move_up_btn, self.move_down_btn):
             toolbar.addWidget(btn)
+        self.engineering_cols_check = QCheckBox("Engineering columns")
+        self.engineering_cols_check.stateChanged.connect(self._on_engineering_columns_changed)
+        toolbar.addWidget(self.engineering_cols_check)
         self.summary_label = QLabel("")
         toolbar.addWidget(self.summary_label)
         toolbar.addStretch()
@@ -172,6 +189,16 @@ class AssemblyManagerPanel(QWidget):
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
+
+    def set_read_only(self, read_only: bool) -> None:
+        self._read_only = bool(read_only)
+        self.readonly_banner.setVisible(self._read_only)
+        for btn in (self.add_section_btn, self.add_body_btn, self.remove_item_btn,
+                    self.move_up_btn, self.move_down_btn):
+            btn.setEnabled(not self._read_only)
+
+    def _can_edit_current(self) -> bool:
+        return not self._read_only
 
     # --------------------------------------------------------------- store --
     def _open_store(self):
@@ -226,11 +253,15 @@ class AssemblyManagerPanel(QWidget):
     def _on_assembly_selected(self, current, _previous=None):
         if current is None:
             self.assembly = None
+            self._current_header = None
+            self.set_read_only(False)
             self._refresh_views()
             return
         assembly_id = current.data(Qt.ItemDataRole.UserRole)
         header, items = self.store.get_assembly(assembly_id)
+        self._current_header = header
         self.assembly = am.assembly_from_rows(header, items) if header else None
+        self.set_read_only(bool(header and header.get("status") == schema.STATUS_ISSUED))
         self._refresh_views()
         self._apply_kp_axis()
 
@@ -239,7 +270,12 @@ class AssemblyManagerPanel(QWidget):
             return
         self.store.ensure_created()
         header, items = am.assembly_to_rows(self.assembly)
-        self.store.save_assembly(header, items)
+        try:
+            self.store.save_assembly(header, items)
+        except WorkbenchReadOnlyError as exc:
+            self.iface.messageBar().pushWarning("Assembly read-only", str(exc))
+            return
+        self._current_header, _ = self.store.get_assembly(self.assembly.assembly_id)
         self.assembly_saved.emit(self.assembly.assembly_id)
         if library_changed:
             self.assemblies_changed.emit()
@@ -261,7 +297,7 @@ class AssemblyManagerPanel(QWidget):
                         else:
                             text = str(value)
                         cell = QTableWidgetItem(text)
-                        if attr == "kind":
+                        if self._read_only or attr == "kind":
                             cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
                         if attr == "color_hex" and value:
                             color = QColor(str(value))
@@ -278,10 +314,31 @@ class AssemblyManagerPanel(QWidget):
             self._loading = False
         if self.sld is not None:
             self.sld.set_assembly(self.assembly)
+        self._sync_engineering_columns()
+
+    def _engineering_columns_visible(self) -> bool:
+        value = self.settings.value(_ENGINEERING_COLS_SETTING, None)
+        if value is None:
+            return bool(self.assembly and self.assembly.kind == am.ASSEMBLY_KIND_RIGGING)
+        return str(value).lower() in ("1", "true", "yes")
+
+    def _sync_engineering_columns(self):
+        visible = self._engineering_columns_visible()
+        self.engineering_cols_check.blockSignals(True)
+        self.engineering_cols_check.setChecked(visible)
+        self.engineering_cols_check.blockSignals(False)
+        for col in _ENGINEERING_COLS:
+            self.items_table.setColumnHidden(col, not visible)
+
+    def _on_engineering_columns_changed(self):
+        visible = self.engineering_cols_check.isChecked()
+        self.settings.setValue(_ENGINEERING_COLS_SETTING, visible)
+        for col in _ENGINEERING_COLS:
+            self.items_table.setColumnHidden(col, not visible)
 
     # -------------------------------------------------------------- editing --
     def _on_item_changed(self, cell: QTableWidgetItem):
-        if self._loading or self.assembly is None:
+        if self._loading or self.assembly is None or not self._can_edit_current():
             return
         row, col = cell.row(), cell.column()
         if not (0 <= row < len(self.assembly.items)):
@@ -306,6 +363,8 @@ class AssemblyManagerPanel(QWidget):
         self._refresh_list_label()
 
     def _add_item(self, kind: str):
+        if not self._can_edit_current():
+            return
         if self.assembly is None:
             self._new_assembly()
             if self.assembly is None:
@@ -323,7 +382,7 @@ class AssemblyManagerPanel(QWidget):
         self.items_table.selectRow(insert_at)
 
     def _delete_item(self):
-        if self.assembly is None:
+        if self.assembly is None or not self._can_edit_current():
             return
         row = self.items_table.currentRow()
         if not (0 <= row < len(self.assembly.items)):
@@ -334,7 +393,7 @@ class AssemblyManagerPanel(QWidget):
         self._refresh_list_label()
 
     def _move_item(self, delta: int):
-        if self.assembly is None:
+        if self.assembly is None or not self._can_edit_current():
             return
         row = self.items_table.currentRow()
         target = row + delta
@@ -361,6 +420,8 @@ class AssemblyManagerPanel(QWidget):
         kind, ok = QInputDialog.getItem(self, "New assembly", "Kind:", kinds, 0, False)
         if not ok:
             return
+        self.set_read_only(False)
+        self._current_header = None
         self.assembly = Assembly(name=name.strip(), kind=kind)
         self._persist(library_changed=True)
         self.refresh_assembly_list()
@@ -374,6 +435,8 @@ class AssemblyManagerPanel(QWidget):
         copy.name = f"{self.assembly.name} (copy)"
         for item in copy.items:
             item.item_id = schema.new_id()
+        self.set_read_only(False)
+        self._current_header = None
         self.assembly = copy
         self._persist(library_changed=True)
         self.refresh_assembly_list()
@@ -387,8 +450,16 @@ class AssemblyManagerPanel(QWidget):
             f"Delete assembly '{self.assembly.name}' (and its fits)?")
         if answer != QMessageBox.StandardButton.Yes:
             return
+        if self._current_header and self._current_header.get("status") == schema.STATUS_ISSUED:
+            answer = QMessageBox.question(
+                self, "Delete issued assembly",
+                "This assembly is issued. Delete it anyway?")
+            if answer != QMessageBox.StandardButton.Yes:
+                return
         self.store.delete_assembly(self.assembly.assembly_id)
         self.assembly = None
+        self._current_header = None
+        self.set_read_only(False)
         self.refresh_assembly_list()
         self._refresh_views()
         self.assemblies_changed.emit()

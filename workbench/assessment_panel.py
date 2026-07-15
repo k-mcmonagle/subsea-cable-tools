@@ -108,11 +108,13 @@ class VerdictStrip(QWidget):
         self.setMinimumHeight(30)
         self._domain_km = 0.0
         self._spans: List = []
+        self._method_name = ""
         self.setToolTip("Combined suitability for the selected method. Click to locate on the map.")
 
-    def set_spans(self, domain_km: float, spans: List) -> None:
+    def set_spans(self, domain_km: float, spans: List, method_name: str = "") -> None:
         self._domain_km = domain_km
         self._spans = spans
+        self._method_name = method_name or ""
         self.update()
 
     def paintEvent(self, _event):
@@ -121,6 +123,15 @@ class VerdictStrip(QWidget):
         _paint_spans(painter, rect, self._domain_km, self._spans)
         painter.setPen(QPen(QColor(120, 120, 120)))
         painter.drawRect(rect)
+        painter.setPen(QPen(QColor(40, 40, 40)))
+        if self._method_name:
+            painter.drawText(rect.adjusted(6, 0, -6, 0),
+                             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                             self._method_name)
+        if self._domain_km > 0:
+            painter.drawText(rect.adjusted(6, 0, -6, 0),
+                             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                             f"0 - {self._domain_km:.1f} km")
 
     def mousePressEvent(self, event):
         if self._domain_km > 0 and self.width() > 0:
@@ -392,6 +403,13 @@ class AssessmentPanel(QWidget):
         self.name_label = QLabel("—")
         self.name_label.setStyleSheet("font-weight: bold;")
         header.addWidget(self.name_label)
+        self.status_chip = QLabel("not run")
+        self.status_chip.setStyleSheet("padding: 2px 6px; border: 1px solid #aaa; color: #555;")
+        header.addWidget(self.status_chip)
+        self.rpl_status_label = QLabel("RPL is issued")
+        self.rpl_status_label.setStyleSheet("color: #8a5a00;")
+        self.rpl_status_label.setVisible(False)
+        header.addWidget(self.rpl_status_label)
         header.addWidget(QLabel("Rule set:"))
         self.ruleset_combo = QComboBox()
         self.ruleset_combo.setMinimumWidth(160)
@@ -403,7 +421,7 @@ class AssessmentPanel(QWidget):
         self.step_spin.setValue(50.0)
         header.addWidget(self.step_spin)
         header.addStretch(1)
-        self.run_btn = QPushButton("Run")
+        self.run_btn = QPushButton("Run assessment")
         self.run_btn.clicked.connect(self._run)
         header.addWidget(self.run_btn)
         layout.addLayout(header)
@@ -415,6 +433,7 @@ class AssessmentPanel(QWidget):
         self.method_combo.currentTextChanged.connect(lambda _t: self._refresh_overview())
         method_row.addWidget(self.method_combo)
         self.summary_label = QLabel("")
+        self.summary_label.setTextFormat(Qt.TextFormat.RichText)
         method_row.addWidget(self.summary_label)
         method_row.addStretch(1)
         layout.addLayout(method_row)
@@ -463,7 +482,9 @@ class AssessmentPanel(QWidget):
         self.rule_table.setColumnWidth(1, 260)
         self.rule_table.setColumnWidth(3, 110)
         hheader = self.rule_table.horizontalHeader()
+        hheader.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         hheader.setSectionResizeMode(FIRE_COL, QHeaderView.ResizeMode.Stretch)
+        hheader.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         hheader.sectionResized.connect(lambda *a: self._align_overview())
         self.rule_table.itemChanged.connect(self._on_item_changed)
         self.rule_table.itemDoubleClicked.connect(lambda _i: self._edit_rule())
@@ -478,6 +499,7 @@ class AssessmentPanel(QWidget):
         self.results_table.setHorizontalHeaderLabels(
             ["Start KP", "End KP", "Status", "Risk", "Deciding rule"])
         self.results_table.verticalHeader().setVisible(False)
+        self.results_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.results_table.cellClicked.connect(self._on_result_clicked)
         rlayout.addWidget(self.results_table)
         layout.addWidget(self.results_box, 1)
@@ -523,10 +545,31 @@ class AssessmentPanel(QWidget):
     def _load(self, rpl_name: str):
         self._loading = True
         self.name_label.setText(f"{self.assessment.get('name')}  ·  RPL: {rpl_name}")
+        rpl = self.store.get_rpl(self.rpl_id) if self.store and self.rpl_id else None
+        self.rpl_status_label.setVisible(bool(rpl and rpl.get("status") == schema.STATUS_ISSUED))
         self.step_spin.setValue(float(self.assessment.get("sample_step_m") or 50.0))
+        self._refresh_status_chip()
         self._reload_rulesets_combo()
         self._loading = False
         self._load_rule_set(self.assessment.get("rule_set_id"))
+
+    def _refresh_status_chip(self):
+        status = (self.assessment or {}).get("status") or ""
+        run_utc = (self.assessment or {}).get("run_utc") or ""
+        if status == "current":
+            text = f"current - run {run_utc}" if run_utc else "current"
+            style = "background: #e8f5e9; color: #1b5e20; border: 1px solid #78a878;"
+            self.run_btn.setStyleSheet("")
+        elif status == "stale":
+            text = f"stale - RPL changed since {run_utc}" if run_utc else "stale"
+            style = "background: #fff3cd; color: #7a4f00; border: 1px solid #e0b84b;"
+            self.run_btn.setStyleSheet("background: #fff3cd;")
+        else:
+            text = "not run"
+            style = "background: #f0f0f0; color: #555; border: 1px solid #aaa;"
+            self.run_btn.setStyleSheet("")
+        self.status_chip.setText(text)
+        self.status_chip.setStyleSheet(f"padding: 2px 6px; {style}")
 
     def _reload_rulesets_combo(self):
         self.ruleset_combo.blockSignals(True)
@@ -580,7 +623,11 @@ class AssessmentPanel(QWidget):
             on.setCheckState(Qt.CheckState.Checked if int(rule.get("enabled") or 0) else Qt.CheckState.Unchecked)
             self.rule_table.setItem(row, 0, on)
 
-            summary = QTableWidgetItem(rule_summary(rule))
+            full_summary = rule_summary(rule)
+            summary = QTableWidgetItem(
+                f"{rule.get('name') or schema_kind_label(rule.get('kind'))}: {rule_condition(rule)}"
+            )
+            summary.setToolTip(full_summary)
             summary.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             self.rule_table.setItem(row, 1, summary)
 
@@ -719,6 +766,7 @@ class AssessmentPanel(QWidget):
             layer_name = assessment_output.write_assessment_ranges(
                 self.store, self.assessment, result, sampler.route, rule_names)
             self.assessment = self.store.get_assessment(self.assessment["assessment_id"]) or self.assessment
+            self._refresh_status_chip()
             self._load_output_layer(layer_name)
         except Exception as exc:
             self.status_label.setText(f"Ranges computed but layer write failed: {exc}")
@@ -755,12 +803,15 @@ class AssessmentPanel(QWidget):
             totals = summarise(self.result.per_method[method])
             total = max(domain_km, 1e-9)
             self.summary_label.setText(
-                f"Excluded {totals['excluded']:.1f} km ({100*totals['excluded']/total:.0f}%) · "
-                f"Risk {totals['risk']:.1f} km ({100*totals['risk']/total:.0f}%) · "
-                f"Allowed {totals['allowed']:.1f} km ({100*totals['allowed']/total:.0f}%)")
+                _legend_chip("#d62728", "Excluded", totals["excluded"], total)
+                + "  "
+                + _legend_chip("#ff8c00", "Risk", totals["risk"], total)
+                + "  "
+                + _legend_chip("#2ca02c", "Allowed", totals["allowed"], total)
+            )
         else:
             self.summary_label.setText("")
-        self.overview.set_spans(domain_km, spans)
+        self.overview.set_spans(domain_km, spans, method)
 
     def _refresh_results(self):
         method = self._current_method()
@@ -834,6 +885,7 @@ class AssessmentPanel(QWidget):
         self.result = result
         self._refresh_overview()
         self._refresh_results()
+        self._refresh_status_chip()
 
     def _select_output_feature(self, verdict, method: str):
         layer = self._output_layer()
@@ -918,7 +970,15 @@ def schema_kind_label(kind: Optional[str]) -> str:
     return _KIND_LABELS.get(kind or "", "Rule")
 
 
-def rule_summary(rule: Dict) -> str:
+def _legend_chip(color: str, label: str, km: float, total: float) -> str:
+    pct = 100.0 * km / max(total, 1e-9)
+    return (
+        f"<span style='color:{color}; font-weight:bold;'>&#9679;</span> "
+        f"{label} {km:.1f} km ({pct:.0f}%)"
+    )
+
+
+def rule_condition(rule: Dict) -> str:
     kind = rule.get("kind")
     config = _load_json(rule.get("config_json"), {})
     if kind == schema.RULE_KIND_THRESHOLD:
@@ -937,6 +997,12 @@ def rule_summary(rule: Dict) -> str:
         cond = f"{len(config.get('ranges', []))} manual range(s)"
     else:
         cond = "?"
+    return cond
+
+
+def rule_summary(rule: Dict) -> str:
+    config = _load_json(rule.get("config_json"), {})
+    cond = rule_condition(rule)
     action = rule.get("action")
     if action == schema.RULE_ACTION_RISK:
         action = f"risk {rule.get('risk_level')}"

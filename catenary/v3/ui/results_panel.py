@@ -24,10 +24,22 @@ def render_results_html(out) -> str:
     if out.error:
         if out.error == "cancelled":
             return "<i>Solve cancelled.</i>"
-        return (
-            "<div style='color:#b00020;'><b>Solve failed.</b><br>"
-            f"<pre style='white-space:pre-wrap;'>{html.escape(out.error)}</pre></div>"
-        )
+        parts = [
+            "<div style='color:#b00020;'><b>Solve failed:</b> "
+            f"{html.escape(out.error)}</div>",
+            "<div style='color:#8a6d3b; font-size:small;'>Check the inputs "
+            "(assembly lengths, depths, solve target) and try again. If the "
+            "problem persists, the details below help diagnose it.</div>",
+        ]
+        details = getattr(out, "error_details", "")
+        if details:
+            parts.append(
+                "<div style='color:#999; font-size:small; margin-top:6px;'>"
+                "Technical details:</div>"
+                "<pre style='white-space:pre-wrap; color:#999; font-size:small;'>"
+                f"{html.escape(details)}</pre>"
+            )
+        return "<br>".join(parts)
 
     mode_titles = {
         "static": "Static hang",
@@ -36,7 +48,9 @@ def render_results_html(out) -> str:
     }
     parts.append(f"<b>{mode_titles.get(out.mode, out.mode)}</b>")
 
-    severe = [w for w in out.warnings if "VIOLATED" in w or "failed" in w.lower()]
+    severe = [w for w in out.warnings
+              if "VIOLATED" in w or "failed" in w.lower()
+              or "diverged" in w.lower() or "did not reach tolerance" in w.lower()]
     normal = [w for w in out.warnings if w not in severe]
     if severe:
         parts.append(
@@ -59,8 +73,11 @@ def render_results_html(out) -> str:
         )
     parts.append(
         "<div style='margin-top:8px; color:#888; font-size:small;'>"
-        "Quasi-static engineering model — see V3 model notes for assumptions "
-        "and validation status. Verify against your own methods before "
-        "operational use.</div>"
+        "Quasi-static engineering model. Not modelled: cable torsion/twist "
+        "(loops, hockles), inertia/added mass, wave and dynamic loading, "
+        "elastic stretch (tensions are inextensible-limit values); current "
+        "is steady and horizontal; the seabed is rigid with Coulomb "
+        "friction (no suction/trenching). Verify against your own methods "
+        "before operational use.</div>"
     )
     return "<br>".join(parts)

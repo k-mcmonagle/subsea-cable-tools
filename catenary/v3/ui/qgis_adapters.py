@@ -22,6 +22,8 @@ from typing import List, Sequence, Tuple
 
 import numpy as np
 
+from ..engine.bathymetry import fill_nodata_nearest
+
 
 def _local_metric_crs(origin_map_xy: Tuple[float, float], map_crs, ctx):
     """A metric CRS matching the simulator's local frame: azimuthal
@@ -123,7 +125,13 @@ def sample_raster_bathymetry(
 
     If ``depths_positive_down`` is False the raster is treated as holding
     negative-down elevations and values are negated. Nodata / failed
-    samples are filled with the mean of the finite values.
+    samples are filled from the nearest valid cells; the returned dict
+    includes ``nodata_fraction`` (0..1) so callers can warn the user.
+
+    The raster is read as a single block covering the sample extent (one
+    provider call) rather than one ``identify()`` per node, so sampling
+    stays fast on large or networked rasters; a per-point identify loop is
+    the fallback if the block read fails.
     """
     from qgis.core import (
         QgsCoordinateTransform,
@@ -131,6 +139,7 @@ def sample_raster_bathymetry(
         QgsProject,
         QgsRaster,
         QgsRasterLayer,
+        QgsRectangle,
     )
 
     if n < 2:
@@ -169,35 +178,79 @@ def sample_raster_bathymetry(
     xs_local = np.linspace(-half, half, n)
     ys_local = np.linspace(-half, half, n)
 
-    depths = np.full((n, n), np.nan, dtype=float)
+    # Transform the sample lattice to the raster CRS once.
+    pts = np.full((n, n, 2), np.nan, dtype=float)
     for i, yl in enumerate(ys_local):
         for j, xl in enumerate(xs_local):
             try:
-                point = transform.transform(QgsPointXY(float(xl), float(yl)))
+                p = transform.transform(QgsPointXY(float(xl), float(yl)))
+                pts[i, j, 0] = p.x()
+                pts[i, j, 1] = p.y()
             except Exception:
                 continue  # outside transform validity -> leave as nodata
-            result = provider.identify(point, QgsRaster.IdentifyFormatValue)
-            if not result.isValid():
-                continue
-            value = result.results().get(band)
-            if value is None:
-                continue
-            try:
-                depths[i, j] = float(value)
-            except (TypeError, ValueError):
-                continue
+
+    depths = np.full((n, n), np.nan, dtype=float)
+    ok = np.isfinite(pts).all(axis=2)
+    block = None
+    if np.any(ok):
+        xmin = float(np.nanmin(pts[..., 0]))
+        xmax = float(np.nanmax(pts[..., 0]))
+        ymin = float(np.nanmin(pts[..., 1]))
+        ymax = float(np.nanmax(pts[..., 1]))
+        rect = QgsRectangle(xmin, ymin, xmax, ymax)
+        rect.grow(max(rect.width(), rect.height()) * 0.01 + 1e-9)
+        # Read finer than the sample lattice so nearest-pixel lookup is
+        # faithful, but bounded so one call stays cheap.
+        bw = bh = int(min(1024, max(64, 4 * n)))
+        try:
+            block = provider.block(band, rect, bw, bh)
+            if block is None or not block.isValid() or block.width() < 1:
+                block = None
+        except Exception:
+            block = None
+    if block is not None:
+        xres = rect.width() / block.width()
+        yres = rect.height() / block.height()
+        for i in range(n):
+            for j in range(n):
+                if not ok[i, j]:
+                    continue
+                col = int((pts[i, j, 0] - rect.xMinimum()) / xres)
+                row = int((rect.yMaximum() - pts[i, j, 1]) / yres)
+                col = min(max(col, 0), block.width() - 1)
+                row = min(max(row, 0), block.height() - 1)
+                if not block.isNoData(row, col):
+                    depths[i, j] = float(block.value(row, col))
+    else:
+        # Fallback: per-point identify (slow, but always available).
+        for i in range(n):
+            for j in range(n):
+                if not ok[i, j]:
+                    continue
+                point = QgsPointXY(float(pts[i, j, 0]), float(pts[i, j, 1]))
+                result = provider.identify(point, QgsRaster.IdentifyFormatValue)
+                if not result.isValid():
+                    continue
+                value = result.results().get(band)
+                if value is None:
+                    continue
+                try:
+                    depths[i, j] = float(value)
+                except (TypeError, ValueError):
+                    continue
 
     if not depths_positive_down:
         depths = -depths
 
-    finite = depths[np.isfinite(depths)]
-    if finite.size == 0:
+    finite_mask = np.isfinite(depths)
+    if not finite_mask.any():
         raise ValueError(
             f"No valid raster values sampled from {layer.name()!r} around "
             f"({cx:.1f}, {cy:.1f}) +/- {half:.0f} m — check the layer extent, "
             "band and CRS."
         )
-    depths = np.where(np.isfinite(depths), depths, float(finite.mean()))
+    nodata_fraction = float(np.mean(~finite_mask))
+    depths = fill_nodata_nearest(depths)
 
     return {
         "x0": -half,
@@ -205,6 +258,7 @@ def sample_raster_bathymetry(
         "dx": step,
         "dy": step,
         "depths": depths.tolist(),
+        "nodata_fraction": nodata_fraction,
         "origin_map_xy": (cx, cy),
         "crs_authid": project_crs.authid(),
     }

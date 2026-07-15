@@ -125,6 +125,11 @@ class SimOptions:
     max_iters: int = 40000
     settle_tol: float = 2e-3
     settle_max_iters: int = 120000
+    # Optional UI hooks, forwarded into every inner solve: ``cancel()``
+    # stops the relaxation early; ``solver_progress(iters, residual)``
+    # reports within-solve progress.
+    cancel: Optional[Callable[[], bool]] = None
+    solver_progress: Optional[Callable[[int, float], None]] = None
 
 
 @dataclass
@@ -264,6 +269,7 @@ class OperationSimulator:
             sysm, self.bathy,
             rho_water=self.opt.rho_water, current_at=self.opt.current_at,
             tol=self.opt.settle_tol, max_iters=self.opt.settle_max_iters,
+            cancel=self.opt.cancel, progress=self.opt.solver_progress,
         )
         self._absorb(res, jnode)
         return self._snapshot(res, jnode, label="settle")
@@ -336,6 +342,7 @@ class OperationSimulator:
             sysm, self.bathy,
             rho_water=self.opt.rho_water, current_at=self.opt.current_at,
             tol=self.opt.tol, max_iters=self.opt.max_iters,
+            cancel=self.opt.cancel,
         )
         if self.opt.rate_drag and dt > 0:
             v = self._estimate_velocities(sysm, res, prev_shapes, dt)
@@ -345,6 +352,7 @@ class OperationSimulator:
                     rho_water=self.opt.rho_water, current_at=self.opt.current_at,
                     node_velocity=v, tol=self.opt.tol, max_iters=self.opt.max_iters,
                     warm_X=res.X,
+                    cancel=self.opt.cancel,
                 )
         self._absorb(res, jnode)
         return self._snapshot(res, jnode, label=step.label)

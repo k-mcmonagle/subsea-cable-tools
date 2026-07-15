@@ -45,7 +45,9 @@ def write_assessment_ranges(store, assessment_row: Dict, result: AssessmentResul
     """
     rule_names = rule_names or {}
     assessment_id = assessment_row["assessment_id"]
-    layer_name = schema.assessment_ranges_layer_name(assessment_row.get("name") or assessment_id)
+    layer_name = schema.assessment_ranges_layer_name(
+        f"{assessment_row.get('name') or assessment_id}_{assessment_id[:8]}"
+    )
 
     spatial_rows: List[Dict] = []
     registry_rows: List[Dict] = []

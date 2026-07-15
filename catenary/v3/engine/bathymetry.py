@@ -139,6 +139,46 @@ class ProfileBathymetry(Bathymetry):
         return {"kind": "profile", "points": self.points, "azimuth_deg": self.azimuth_deg}
 
 
+def fill_nodata_nearest(depths: "np.ndarray") -> "np.ndarray":
+    """Fill non-finite cells by iteratively averaging finite neighbours.
+
+    Each pass fills every nodata cell that touches at least one finite cell
+    (4-neighbourhood) with the mean of those neighbours, growing inward from
+    the valid data. Equivalent in spirit to a nearest-valid fill but smooth
+    across the fill boundary. Falls back to 0.0 if nothing is finite.
+    """
+    d = np.asarray(depths, dtype=float).copy()
+    finite = np.isfinite(d)
+    if finite.all():
+        return d
+    if not finite.any():
+        return np.zeros_like(d)
+    ny, nx = d.shape
+    for _ in range(nx + ny):  # worst case: valid data in one corner
+        if finite.all():
+            break
+        acc = np.zeros_like(d)
+        cnt = np.zeros_like(d)
+        for (si, sj) in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            shifted = np.roll(np.where(finite, d, 0.0), (si, sj), axis=(0, 1))
+            sh_ok = np.roll(finite, (si, sj), axis=(0, 1))
+            # np.roll wraps; mask out the wrapped edge row/column.
+            if si == 1:
+                sh_ok[0, :] = False
+            elif si == -1:
+                sh_ok[-1, :] = False
+            if sj == 1:
+                sh_ok[:, 0] = False
+            elif sj == -1:
+                sh_ok[:, -1] = False
+            acc += np.where(sh_ok, shifted, 0.0)
+            cnt += sh_ok.astype(float)
+        grow = (~finite) & (cnt > 0)
+        d[grow] = acc[grow] / cnt[grow]
+        finite |= grow
+    return d
+
+
 class GridBathymetry(Bathymetry):
     """Regularly gridded depths with bilinear interpolation.
 
@@ -155,40 +195,56 @@ class GridBathymetry(Bathymetry):
         self.depths = np.asarray(depths, dtype=float)
         if self.depths.ndim != 2 or self.depths.shape[0] < 2 or self.depths.shape[1] < 2:
             raise ValueError("depths must be a 2D array of at least 2x2.")
+        self.nodata_fraction = 0.0
         if not np.all(np.isfinite(self.depths)):
-            # Fill nodata with the finite mean so the solver never sees NaN.
-            finite = self.depths[np.isfinite(self.depths)]
-            fill = float(finite.mean()) if finite.size else 0.0
-            self.depths = np.where(np.isfinite(self.depths), self.depths, fill)
+            # Fill nodata from the nearest valid cells (iterative neighbour
+            # averaging) so the solver never sees NaN and the fill follows
+            # the local seabed instead of a global flat plateau.
+            self.nodata_fraction = float(np.mean(~np.isfinite(self.depths)))
+            self.depths = fill_nodata_nearest(self.depths)
 
     def _local(self, x, y):
         fx = (np.asarray(x, dtype=float) - self.x0) / self.dx
         fy = (np.asarray(y, dtype=float) - self.y0) / self.dy
         ny, nx = self.depths.shape
+        # Non-finite positions (a diverging solver iterate) must not reach the
+        # int cast below — floor(NaN).astype(int) is INT_MIN, an IndexError.
+        # Map them to the grid origin; the solver's own finiteness check then
+        # rewinds the blow-up instead of the whole solve crashing.
+        fx = np.where(np.isfinite(fx), fx, 0.0)
+        fy = np.where(np.isfinite(fy), fy, 0.0)
         fx = np.clip(fx, 0.0, nx - 1.0 - 1e-9)
         fy = np.clip(fy, 0.0, ny - 1.0 - 1e-9)
         j = np.floor(fx).astype(int)
         i = np.floor(fy).astype(int)
         return i, j, fx - j, fy - i
 
-    def depth_at(self, x, y):
+    def _bilinear(self, x, y):
         i, j, tx, ty = self._local(x, y)
         d = self.depths
-        v = (
+        return (
             d[i, j] * (1 - tx) * (1 - ty)
             + d[i, j + 1] * tx * (1 - ty)
             + d[i + 1, j] * (1 - tx) * ty
             + d[i + 1, j + 1] * tx * ty
         )
+
+    def depth_at(self, x, y):
+        v = self._bilinear(x, y)
         if np.ndim(x) == 0 and np.ndim(y) == 0:
             return float(v)
         return v
 
     def grad_at(self, x, y):
-        i, j, tx, ty = self._local(x, y)
-        d = self.depths
-        gx = ((d[i, j + 1] - d[i, j]) * (1 - ty) + (d[i + 1, j + 1] - d[i + 1, j]) * ty) / self.dx
-        gy = ((d[i + 1, j] - d[i, j]) * (1 - tx) + (d[i + 1, j + 1] - d[i, j + 1]) * tx) / self.dy
+        # Central differences of the bilinear surface over half a cell. The
+        # analytic bilinear gradient is piecewise-constant and jumps at cell
+        # boundaries, which chatters the contact normal / friction tangent
+        # on coarse or rough grids; this smoothed form is continuous.
+        hx, hy = 0.5 * self.dx, 0.5 * self.dy
+        xa = np.asarray(x, dtype=float)
+        ya = np.asarray(y, dtype=float)
+        gx = (self._bilinear(xa + hx, ya) - self._bilinear(xa - hx, ya)) / (2.0 * hx)
+        gy = (self._bilinear(xa, ya + hy) - self._bilinear(xa, ya - hy)) / (2.0 * hy)
         if np.ndim(x) == 0 and np.ndim(y) == 0:
             return float(gx), float(gy)
         return gx, gy

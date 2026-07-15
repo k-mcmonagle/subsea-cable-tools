@@ -128,10 +128,11 @@ def test_migrate_framework() -> bool:
     # Simulate an older stamp and re-run: framework advances it back, backs up.
     store.write_meta("schema_version", "1")
     store.migrate()
-    ok = ok and store.read_meta().get("schema_version") == "2"
+    ok = ok and store.read_meta().get("schema_version") == str(schema.SCHEMA_VERSION)
     stem, ext = os.path.splitext(path)
     ok = ok and os.path.exists(f"{stem}.migrate_v1.bak{ext}")
-    return _result("migration framework v1->v2 + backup", ok)
+    ok = ok and os.path.exists(f"{stem}.migrate_v2.bak{ext}")
+    return _result("migration framework v1->v3 + backups", ok)
 
 
 def test_store_rule_crud() -> bool:

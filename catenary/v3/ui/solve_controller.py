@@ -98,7 +98,8 @@ class RunOutput:
     facts: Dict[str, str] = field(default_factory=dict)
     quick: Dict[str, str] = field(default_factory=dict)   # Zajac quick answers
     warnings: List[str] = field(default_factory=list)
-    error: str = ""
+    error: str = ""                                    # short, user-facing
+    error_details: str = ""                            # traceback, for the log
 
 
 # ---------------------------------------------------------------------------
@@ -200,11 +201,36 @@ def _solve_value_si(cfg: V3Config) -> float:
 # Runs
 # ---------------------------------------------------------------------------
 
-def run_static(cfg: V3Config, cancel: Optional[Callable[[], bool]] = None) -> RunOutput:
+def _solver_progress_adapter(progress) -> Optional[Callable[[int, float], None]]:
+    """Wrap the worker's ``(frac, label) -> bool`` progress callable into the
+    solver's ``(iterations, residual)`` hook. frac < 0 = indeterminate."""
+    if progress is None:
+        return None
+
+    def hook(iters: int, residual: float) -> None:
+        progress(-1.0, f"Relaxing — iteration {iters:,}, residual {residual:.1e}")
+
+    return hook
+
+
+def _multi_segment_notice(cfg: V3Config, out: RunOutput, context: str) -> None:
+    """Warn when a multi-part assembly meets a uniform-cable calculation."""
+    items = cs.parse_assembly(cfg.assembly)
+    n_seg = sum(1 for i in items if isinstance(i, cs.SegmentSpec) and i.length_m > 0)
+    n_body = sum(1 for i in items if not isinstance(i, cs.SegmentSpec))
+    if n_seg > 1 or n_body > 0:
+        out.warnings.append(
+            f"The assembly has {n_seg} segment(s) and {n_body} body/bodies, but "
+            f"{context} uses only the first segment's properties (uniform cable)."
+        )
+
+
+def run_static(cfg: V3Config, cancel: Optional[Callable[[], bool]] = None,
+               progress=None) -> RunOutput:
     """Static hang: single-cable span (ODE placement + 3D DR refinement) or
     a held BU / bight equilibrium when ``static_config`` says so."""
     if cfg.static_config in ("bu", "bight"):
-        return run_static_hold(cfg)
+        return run_static_hold(cfg, cancel=cancel, progress=progress)
     bathy = build_bathymetry(cfg)
     depth0 = float(bathy.depth_at(0.0, 0.0))
     ode_in = _steady_input(cfg, depth0, 0.0)
@@ -253,6 +279,7 @@ def run_static(cfg: V3Config, cancel: Optional[Callable[[], bool]] = None) -> Ru
         sysm, bathy, rho_water=cfg.rho_water,
         current_at=(current.velocity_at if current else None),
         tol=cfg.dr_tol,
+        cancel=cancel, progress=_solver_progress_adapter(progress),
     )
     if cancel and cancel():
         return RunOutput(mode="static", error="cancelled")
@@ -260,6 +287,10 @@ def run_static(cfg: V3Config, cancel: Optional[Callable[[], bool]] = None) -> Ru
     out = RunOutput(mode="static")
     out.scene = _result_scene(cfg, bathy, res, vessel_xy=(0.0, 0.0))
     out.warnings = list(res.warnings) + list(ode.warnings)
+    _multi_segment_notice(
+        cfg, out,
+        "the solve-target placement (the 3D refinement itself models the "
+        "full assembly; check the reported tensions against the target)")
     c = res.chains[0]
     if bool(np.any(chain.seg_id < 0)):
         out.warnings.append(
@@ -320,6 +351,7 @@ def run_steady(cfg: V3Config, cancel: Optional[Callable[[], bool]] = None) -> Ru
     H_c = res.hydrodynamic_constant_mps
     out = RunOutput(mode="steady", scene=scene)
     out.warnings = list(res.warnings)
+    _multi_segment_notice(cfg, out, "steady-lay mode")
     wrap = math.radians(cfg.chute_wrap_deg) if cfg.chute_wrap_deg > 0 else math.radians(abs(res.exit_angle_deg))
     out.facts = {
         "Ship speed": f"{cfg.ship_speed_kn:.2f} kn",
@@ -335,6 +367,12 @@ def run_steady(cfg: V3Config, cancel: Optional[Callable[[], bool]] = None) -> Ru
         "Min bend radius": _fmt_radius(res.min_radius_m, res.min_radius_s_m),
     }
     out.quick = _quick_facts(inp, H_c, V, depth0)
+    # Surface the mass/length feeding the transport (centrifugal) term —
+    # estimated from the weights when the assembly does not specify it.
+    seg = _representative_segment(build_assembly(cfg), build_defaults(cfg))
+    est = " (estimated from weights — set 'mass_kgpm' in the assembly to override)" \
+        if seg.mass_kgpm <= 0 else ""
+    out.quick["Cable mass per length (transport term)"] = f"{inp.rho_c_kgpm:.1f} kg/m{est}"
     return out
 
 
@@ -400,7 +438,8 @@ def _build_scenario(cfg: V3Config, bathy, kind: str, *, static_only: bool = Fals
     raise ValueError(f"Unknown scenario {kind!r}")
 
 
-def run_static_hold(cfg: V3Config) -> RunOutput:
+def run_static_hold(cfg: V3Config, cancel: Optional[Callable[[], bool]] = None,
+                    progress=None) -> RunOutput:
     """Static equilibrium of a held BU or bight state (no time stepping)."""
     bathy = build_bathymetry(cfg)
     kind = "bu_deployment" if cfg.static_config == "bu" else "final_bight"
@@ -413,8 +452,13 @@ def run_static_hold(cfg: V3Config) -> RunOutput:
     sim = tl.OperationSimulator(scn, bathy, tl.SimOptions(
         rho_water=cfg.rho_water,
         current_at=(current.velocity_at if current else None),
+        settle_tol=cfg.dr_tol,
+        cancel=cancel,
+        solver_progress=_solver_progress_adapter(progress),
     ))
     snap = sim.settle()
+    if cancel and cancel():
+        return RunOutput(mode="static", error="cancelled")
 
     bed = _bed_grid_for_snapshots(cfg, bathy, [snap])
     title = "Static hold — branching unit" if cfg.static_config == "bu" else "Static hold — final bight"
@@ -451,7 +495,8 @@ def run_static_hold(cfg: V3Config) -> RunOutput:
     return out
 
 
-def run_operation(cfg: V3Config, progress: Optional[Callable[[float, str], bool]] = None) -> RunOutput:
+def run_operation(cfg: V3Config, progress: Optional[Callable[[float, str], bool]] = None,
+                  cancel: Optional[Callable[[], bool]] = None) -> RunOutput:
     bathy = build_bathymetry(cfg)
     try:
         scn = _build_scenario(cfg, bathy, cfg.scenario)
@@ -463,6 +508,7 @@ def run_operation(cfg: V3Config, progress: Optional[Callable[[float, str], bool]
         rho_water=cfg.rho_water,
         current_at=(current.velocity_at if current else None),
         rate_drag=bool(cfg.op.get("rate_drag", True)),
+        cancel=cancel,
     ))
     result = sim.run(progress)
 
@@ -678,9 +724,13 @@ class SolveWorker(QThread):
                 if self.cfg.mode == "steady":
                     out = run_steady(self.cfg, cancel=lambda: self._cancel)
                 elif self.cfg.mode == "operation":
-                    out = run_operation(self.cfg, progress=self._progress)
+                    out = run_operation(self.cfg, progress=self._progress,
+                                        cancel=lambda: self._cancel)
                 else:
-                    out = run_static(self.cfg, cancel=lambda: self._cancel)
+                    out = run_static(self.cfg, cancel=lambda: self._cancel,
+                                     progress=self._progress)
         except Exception as exc:  # surface, never crash the UI thread
-            out = RunOutput(mode=self.cfg.mode, error=f"{exc}\n{traceback.format_exc(limit=6)}")
+            msg = str(exc).strip() or type(exc).__name__
+            out = RunOutput(mode=self.cfg.mode, error=msg,
+                            error_details=traceback.format_exc(limit=8))
         self.finishedWith.emit(out)

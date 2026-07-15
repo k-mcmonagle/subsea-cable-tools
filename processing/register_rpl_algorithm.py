@@ -9,14 +9,15 @@ Registers an imported RPL (a point layer + line layer pair, e.g. from
 - derives per-segment Slack from CableDistBetweenPos / DistBetweenPos where
   missing,
 - copies both layers into the workbench GeoPackage,
-- inserts the wb_rpl registry row and the RPL's topology component with
-  ports A and B,
+- creates/fetches the stable segment, inserts a new RPL revision row, and adds
+  the RPL's topology component with ports A and B,
 - optionally loads the new layers into a "Cable Route Workbench" group.
 """
 
 from __future__ import annotations
 
 import os
+import re
 from typing import Dict, List, Optional
 
 from qgis.PyQt.QtCore import QCoreApplication
@@ -72,11 +73,39 @@ def _int(value) -> Optional[int]:
         return None
 
 
+def _set_advanced_parameter(parameter) -> None:
+    """Hide compatibility-only parameters in the advanced section when QGIS supports it."""
+    try:
+        from qgis.core import Qgis
+        advanced_flag = Qgis.ProcessingParameterFlag.Advanced
+    except Exception:
+        advanced_flag = QgsProcessingParameterString.FlagAdvanced
+    try:
+        parameter.setFlags(parameter.flags() | advanced_flag)
+    except Exception:
+        pass
+
+
+def _revision_label_exists(revisions, rev_label: str) -> bool:
+    needle = (rev_label or "").strip().lower()
+    return any((row.get("rev_label") or "").strip().lower() == needle for row in revisions or [])
+
+
+def _split_trailing_rev_label(name: str):
+    match = re.match(r"^(?P<route>.+?)\s+(?P<label>rev\s*\d+)\s*$", name or "", re.IGNORECASE)
+    if not match:
+        return (name, "")
+    number = re.search(r"\d+", match.group("label"))
+    return (match.group("route").strip(), f"Rev {number.group(0)}" if number else match.group("label"))
+
+
 class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
     INPUT_POINTS = "INPUT_POINTS"
     INPUT_LINES = "INPUT_LINES"
     RPL_NAME = "RPL_NAME"
     RPL_KIND = "RPL_KIND"
+    ROUTE_NAME = "ROUTE_NAME"
+    REV_LABEL = "REV_LABEL"
     GPKG_PATH = "GPKG_PATH"
     LOAD_LAYERS = "LOAD_LAYERS"
 
@@ -86,10 +115,22 @@ class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterFeatureSource(
             self.INPUT_LINES, self.tr("RPL line layer"), [QgsProcessing.TypeVectorLine]))
         self.addParameter(QgsProcessingParameterString(
-            self.RPL_NAME, self.tr("RPL name"), defaultValue=""))
+            self.ROUTE_NAME, self.tr("Segment name (blank = point layer name)"),
+            defaultValue="", optional=True))
+        self.addParameter(QgsProcessingParameterString(
+            self.REV_LABEL, self.tr("RPL revision label (blank = next Rev N)"),
+            defaultValue="", optional=True))
         self.addParameter(QgsProcessingParameterEnum(
             self.RPL_KIND, self.tr("RPL kind"),
             options=[self.tr("Planned"), self.tr("As-laid")], defaultValue=0))
+        legacy_name = QgsProcessingParameterString(
+            self.RPL_NAME,
+            self.tr("Legacy/source RPL label (optional fallback)"),
+            defaultValue="",
+            optional=True,
+        )
+        _set_advanced_parameter(legacy_name)
+        self.addParameter(legacy_name)
         self.addParameter(QgsProcessingParameterFileDestination(
             self.GPKG_PATH, self.tr("Workbench GeoPackage (blank = project default)"),
             fileFilter="GeoPackage (*.gpkg)", optional=True, createByDefault=False))
@@ -201,10 +242,21 @@ class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
         if points_source is None or lines_source is None:
             raise QgsProcessingException(self.tr("Both point and line layers are required."))
 
-        name = (self.parameterAsString(parameters, self.RPL_NAME, context) or "").strip()
-        if not name:
-            name = points_source.sourceName() or "RPL"
+        source_name = points_source.sourceName() or ""
+        legacy_name = (self.parameterAsString(parameters, self.RPL_NAME, context) or "").strip()
         kind = ["planned", "as_laid"][self.parameterAsEnum(parameters, self.RPL_KIND, context)]
+        route_name = (self.parameterAsString(parameters, self.ROUTE_NAME, context) or "").strip()
+        explicit_route_name = bool(route_name)
+        if not route_name:
+            route_name = legacy_name or source_name or "Segment"
+        requested_rev_label = (
+            self.parameterAsString(parameters, self.REV_LABEL, context) or ""
+        ).strip()
+        if not explicit_route_name and not requested_rev_label:
+            route_base, parsed_rev_label = _split_trailing_rev_label(route_name)
+            if parsed_rev_label and route_base:
+                route_name = route_base
+                requested_rev_label = parsed_rev_label
 
         gpkg_path = (self.parameterAsString(parameters, self.GPKG_PATH, context) or "").strip()
         if not gpkg_path or gpkg_path.lower() in ("temporary_output", "temporary output"):
@@ -228,16 +280,42 @@ class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
         store = WorkbenchStore(gpkg_path, context.transformContext())
         store.migrate()
 
-        rpl_id = schema.new_id()
-        points_layer_name = schema.rpl_points_layer_name(name)
-        lines_layer_name = schema.rpl_lines_layer_name(name)
+        existing_route = next(
+            (r for r in store.list_routes()
+             if (r.get("name") or "").strip().lower() == route_name.lower()),
+            None,
+        )
+        supersedes_id = ""
+        if existing_route:
+            route_id = existing_route["route_id"]
+            revisions = store.revisions_of_route(route_id)
+            rev_label = requested_rev_label or schema.next_rev_label(revisions)
+            if _revision_label_exists(revisions, rev_label):
+                raise QgsProcessingException(
+                    self.tr(
+                        f"Segment '{route_name}' already has RPL revision '{rev_label}'. "
+                        "Use a new revision label or leave it blank for the next revision."
+                    )
+                )
+            latest = store.latest_revision(route_id)
+            supersedes_id = latest.get("rpl_id") if latest else ""
+        else:
+            route_id = store.create_route(route_name)
+            rev_label = requested_rev_label or "Rev 1"
 
-        # refuse to clobber another registered RPL's layers
+        rpl_id = schema.new_id()
+        registered_name = f"{route_name} {rev_label}".strip()
+        existing_layers = set()
         for row in store.list_rpls():
-            if row.get("points_layer") == points_layer_name:
-                raise QgsProcessingException(self.tr(
-                    f"An RPL named '{name}' is already registered in this workbench. "
-                    "Pick a different name."))
+            if row.get("points_layer"):
+                existing_layers.add(row.get("points_layer"))
+            if row.get("lines_layer"):
+                existing_layers.add(row.get("lines_layer"))
+        points_layer_name = schema.unique_layer_name(
+            existing_layers, schema.rpl_points_layer_name(registered_name))
+        existing_layers.add(points_layer_name)
+        lines_layer_name = schema.unique_layer_name(
+            existing_layers, schema.rpl_lines_layer_name(registered_name))
 
         source_file = ""
         if model.points and model.points[0].attrs.get("SourceFile"):
@@ -251,17 +329,22 @@ class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
 
         store.save_rpl({
             "rpl_id": rpl_id,
-            "name": name,
+            "name": registered_name,
             "kind": kind,
             "points_layer": points_layer_name,
             "lines_layer": lines_layer_name,
             "source_file": source_file,
             "slack_mode": "hold_cable" if kind == "as_laid" else "hold_slack",
             "depth_source_config": "",
+            "route_id": route_id,
+            "rev_label": rev_label,
+            "status": schema.STATUS_DRAFT,
+            "supersedes_id": supersedes_id,
+            "issued_utc": "",
             "notes": "",
         })
         store.save_component(
-            {"component_id": schema.new_id(), "kind": "rpl", "subject_id": rpl_id, "name": name},
+            {"component_id": schema.new_id(), "kind": "rpl", "subject_id": rpl_id, "name": registered_name},
             port_labels=["A", "B"],
         )
 
@@ -270,9 +353,10 @@ class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
         self._load_layers = self.parameterAsBool(parameters, self.LOAD_LAYERS, context)
 
         feedback.pushInfo(self.tr(
-            f"Registered RPL '{name}' ({len(model.points)} positions, "
+            f"Registered RPL revision '{registered_name}' ({len(model.points)} positions, "
             f"{len(model.segments)} segments) into {os.path.basename(gpkg_path)}."))
         return {"RPL_ID": rpl_id, "GPKG_PATH": gpkg_path,
+                "ROUTE_ID": route_id, "REV_LABEL": rev_label,
                 "POINTS_LAYER": points_layer_name, "LINES_LAYER": lines_layer_name}
 
     @staticmethod
@@ -320,7 +404,7 @@ class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
         return "register_rpl"
 
     def displayName(self):
-        return self.tr("Register RPL into Workbench")
+        return self.tr("Register RPL Revision into Workbench")
 
     def group(self):
         return self.tr("RPL Tools")
@@ -335,7 +419,10 @@ Registers an RPL point + line layer pair (for example the output of Import Excel
 
 - Validates that the layers pair up (n points = n segments + 1, FromPos/ToPos chain).
 - Derives per-segment Slack (%) from CableDistBetweenPos / DistBetweenPos where missing.
-- Copies both layers into the workbench GeoPackage (default: <project>_workbench.gpkg beside the project file) and records the RPL in the registry.
+- Uses Segment name as the stable segment identity and creates one RPL revision under it.
+- Uses the supplied RPL revision label, or the next available Rev N label when left blank.
+- Names the registered RPL revision as Segment + revision label, for example "S013 Rev 2".
+- Copies both layers into the workbench GeoPackage (default: <project>_workbench.gpkg beside the project file) and records the RPL revision in the registry.
 - Creates the RPL's system-topology component with ports A and B so it can later be connected to other RPLs via joints or branching units.
 
 Use the RPL Manager dock to browse, edit, and fit assemblies onto registered RPLs.

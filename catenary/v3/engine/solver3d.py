@@ -137,6 +137,8 @@ def solve_system(
     n_outer: int = 5,
     tension_scale_N: float = 0.0,
     warm_X: Optional["np.ndarray"] = None,
+    cancel: Optional[Callable[[], bool]] = None,
+    progress: Optional[Callable[[int, float], None]] = None,
 ) -> SolveResult:
     """Relax the system to static equilibrium.
 
@@ -157,6 +159,13 @@ def solve_system(
     node_velocity:
         (n_nodes, 3) physical cable velocities for rate-dependent drag in
         quasi-static stepping. ``None`` = stationary cable.
+    cancel:
+        Optional ``() -> bool`` polled at every residual check; when it
+        returns True the relaxation stops early and the current state is
+        returned (``converged=False``, with a warning appended).
+    progress:
+        Optional ``(iterations_done, residual_ratio) -> None`` called at
+        every residual check for UI feedback.
     """
     warnings: List[str] = []
     n_pts = system.n_nodes
@@ -210,17 +219,29 @@ def solve_system(
     if u_ref > 0.0:
         for ch in chains:
             drag_ref = max(drag_ref, 0.5 * rho_water * float(np.max(ch.cdn * ch.dia)) * u_ref * u_ref)
-    w_ref = max(q_ref * L0_min, drag_ref * L0_min, 1e-3 * pf_max, 1e-9)
+    # The tension-scale term keeps the relative residual meaningful for
+    # near-neutrally-buoyant cable, where weight and drag both vanish and a
+    # physically converged state would otherwise be flagged unconverged.
+    w_ref = max(q_ref * L0_min, drag_ref * L0_min, 1e-3 * pf_max,
+                2e-4 * tension_scale_N, 1e-9)
 
     EA = 500.0 * tension_scale_N
-    k_axial = EA / L0_min
     k_contact = (w_ref + 0.05 * tension_scale_N) / 0.005
     k_fric = k_contact
-    EI_max = max(float(np.max(ch.EI)) for ch in chains)
-    k_bend = 32.0 * EI_max / (L0_min ** 3)
 
     dt = 1.0
-    m_node = (dt * dt / 2.0) * (2.0 * k_axial + k_contact + k_fric + k_bend) * 2.0
+    # Per-node mass from the *local* stiffness sum (Barnes' DR stability
+    # rule). Sizing each node by its own adjacent axial/bending stiffness —
+    # rather than every node by the globally stiffest element — keeps the
+    # effective step usable when one short or high-EI element would
+    # otherwise slow the whole system to a crawl.
+    k_node = np.full(n_pts, k_contact + k_fric)
+    for ch in chains:
+        k_ax = EA / ch.L0
+        k_bend_e = 32.0 * ch.EI / (ch.L0 ** 3)
+        np.add.at(k_node, ch.idx[:-1], k_ax + k_bend_e)
+        np.add.at(k_node, ch.idx[1:], k_ax + k_bend_e)
+    m_node = (dt * dt / 2.0) * k_node * 2.0
 
     # --- Per-chain preallocation ------------------------------------------
     # Rest lengths per chain (mutated by the outer correction).
@@ -245,6 +266,7 @@ def solve_system(
     blowups = 0
     max_blowups = 6
     diverged = False
+    cancelled = False
     converged = False
     T_seg_store: List["np.ndarray"] = [np.zeros(ch.n_elems) for ch in chains]
 
@@ -418,7 +440,7 @@ def solve_system(
             F[fixed] = 0.0
 
             # Kinetic damping.
-            v += (F / m_node) * dt
+            v += (F / m_node[:, None]) * dt
             ke = float(np.sum(v * v))
             if ke < ke_prev:
                 v[:] = 0.0
@@ -441,8 +463,13 @@ def solve_system(
                     residual_ratio = float("inf")
                     continue
                 X_ok = X.copy()
+                if progress is not None:
+                    progress(iters_done, residual_ratio)
                 if residual_ratio < tol:
                     converged = True
+                    break
+                if cancel is not None and cancel():
+                    cancelled = True
                     break
 
         if diverged:
@@ -450,6 +477,9 @@ def solve_system(
                 "Solver diverged (numerical blow-up); returning the last "
                 "stable state — treat the result as approximate."
             )
+            break
+        if cancelled:
+            warnings.append("Solve cancelled before convergence.")
             break
 
         # Outer rest-length correction toward the inextensible limit.
@@ -479,7 +509,10 @@ def solve_system(
         clearance_all = X[:, 2] - bed_z
     else:
         clearance_all = np.full(n_pts, np.inf)
-    contact_tol = max(0.02, 2.0 * (w_ref + 0.05 * tension_scale_N) / k_contact)
+    # Geometric classification tolerance (2 cm, or 1% of the shortest
+    # element), decoupled from the contact-penalty stiffness so a soft
+    # penalty cannot relabel near-bed nodes as resting.
+    contact_tol = max(0.02, min(0.01 * L0_min, 0.25))
     contact_all = clearance_all < contact_tol
     max_pen = float(max(0.0, -np.min(clearance_all))) if np.all(np.isfinite(clearance_all)) else 0.0
 
@@ -545,7 +578,7 @@ def solve_system(
             )
         )
 
-    if not converged:
+    if not converged and not cancelled:
         warnings.append(
             f"Relaxation did not reach tolerance (residual ratio {residual_ratio:.2e} "
             f"> {tol:.0e} after {iters_done} iterations); treat the result as approximate."

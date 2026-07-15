@@ -179,7 +179,8 @@ def integrate_steady_lay(inp: SteadyLayInput) -> SteadyLayResult:
             r_list.append(r.copy())
             T_list.append(T)
     s_max = 30.0 * h + 2000.0
-    n_max = int(s_max / ds) + 10
+    n_max = int(s_max / ds) * 40 + 10  # headroom for adaptive refinement
+    theta_max = 0.03                   # max tangent rotation per step (rad)
 
     def deriv(r_c, t_c, T_c):
         f = _distributed_force(float(r_c[2]), t_c, inp, u_ship)
@@ -194,35 +195,40 @@ def integrate_steady_lay(inp: SteadyLayInput) -> SteadyLayResult:
     for _ in range(n_max):
         # RK4 on (r, T, t) with tangent renormalisation.
         k1r, k1T, k1t = deriv(r, t_hat, T)
-        r2 = r + 0.5 * ds * k1r
-        t2 = t_hat + 0.5 * ds * k1t
+        # Curvature-adaptive step: refine where the tangent turns fast
+        # (the chute/top region) so the reported minimum bend radius is
+        # actually resolved rather than smeared over a 2 m step.
+        kappa = float(np.linalg.norm(k1t))
+        h_s = ds if kappa * ds <= theta_max else max(0.05, theta_max / kappa)
+        r2 = r + 0.5 * h_s * k1r
+        t2 = t_hat + 0.5 * h_s * k1t
         t2 /= np.linalg.norm(t2)
-        T2 = T + 0.5 * ds * k1T
+        T2 = T + 0.5 * h_s * k1T
         k2r, k2T, k2t = deriv(r2, t2, T2)
-        r3 = r + 0.5 * ds * k2r
-        t3 = t_hat + 0.5 * ds * k2t
+        r3 = r + 0.5 * h_s * k2r
+        t3 = t_hat + 0.5 * h_s * k2t
         t3 /= np.linalg.norm(t3)
-        T3 = T + 0.5 * ds * k2T
+        T3 = T + 0.5 * h_s * k2T
         k3r, k3T, k3t = deriv(r3, t3, T3)
-        r4 = r + ds * k3r
-        t4 = t_hat + ds * k3t
+        r4 = r + h_s * k3r
+        t4 = t_hat + h_s * k3t
         t4 /= np.linalg.norm(t4)
-        T4 = T + ds * k3T
+        T4 = T + h_s * k3T
         k4r, k4T, k4t = deriv(r4, t4, T4)
 
-        r = r + (ds / 6.0) * (k1r + 2 * k2r + 2 * k3r + k4r)
-        T = T + (ds / 6.0) * (k1T + 2 * k2T + 2 * k3T + k4T)
-        t_hat = t_hat + (ds / 6.0) * (k1t + 2 * k2t + 2 * k3t + k4t)
+        r = r + (h_s / 6.0) * (k1r + 2 * k2r + 2 * k3r + k4r)
+        T = T + (h_s / 6.0) * (k1T + 2 * k2T + 2 * k3T + k4T)
+        t_hat = t_hat + (h_s / 6.0) * (k1t + 2 * k2t + 2 * k3t + k4t)
         t_hat /= np.linalg.norm(t_hat)
-        s += ds
+        s += h_s
 
         s_list.append(s)
         r_list.append(r.copy())
         T_list.append(T)
 
-        if r[2] >= z_stop:
+        if r[2] >= z_stop or s >= s_max:
             break
-    else:
+    if r[2] < z_stop:
         warnings.append(
             "Integration reached the arc-length cap before the chute height — "
             "check weights/drag inputs (buoyant or near-neutral cable?)."

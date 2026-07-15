@@ -51,7 +51,9 @@ from . import rpl_engine, schema
 from .depth_service import DepthService, DepthSourceConfig
 from .rpl_engine import RplModel, SlackMode
 from .rpl_layer_io import RplLayerSync
+from .readonly import make_readonly_banner
 from .store import (
+    WorkbenchReadOnlyError,
     WorkbenchStore,
     default_project_gpkg_path,
     project_gpkg_path,
@@ -103,6 +105,7 @@ class RplManagerPanel(QWidget):
         self._table_timer.timeout.connect(self._refresh_tables_from_preview)
         self._pending_preview: Optional[RplModel] = None
         self._loading_tables = False
+        self._read_only = False
 
         self.da = make_distance_area(WGS84, QgsProject.instance().transformContext())
 
@@ -132,8 +135,10 @@ class RplManagerPanel(QWidget):
         left_layout.addWidget(self.rpl_list)
 
         row1 = QHBoxLayout()
-        register_btn = QPushButton("Register…")
-        register_btn.setToolTip("Register an imported RPL point + line layer pair into the workbench")
+        register_btn = QPushButton("Register revision...")
+        register_btn.setToolTip(
+            "Register an imported RPL point + line layer pair as a segment revision"
+        )
         register_btn.clicked.connect(self._run_register_algorithm)
         refresh_btn = QPushButton("Refresh")
         refresh_btn.clicked.connect(self.refresh_rpl_list)
@@ -151,6 +156,9 @@ class RplManagerPanel(QWidget):
         # right: header + tables
         right = QWidget()
         right_layout = QVBoxLayout(right)
+
+        self.readonly_banner = make_readonly_banner(right)
+        right_layout.addWidget(self.readonly_banner)
 
         header = QHBoxLayout()
         header.addWidget(QLabel("Geometry edits preserve:"))
@@ -192,12 +200,12 @@ class RplManagerPanel(QWidget):
         zoom_btn = QPushButton("Zoom to")
         zoom_btn.clicked.connect(self._zoom_to_current)
         row3.addWidget(zoom_btn)
-        depth_btn = QPushButton("Depth sources…")
-        depth_btn.clicked.connect(self._edit_depth_sources)
-        row3.addWidget(depth_btn)
-        resample_btn = QPushButton("Resample all depths")
-        resample_btn.clicked.connect(self._resample_all_depths)
-        row3.addWidget(resample_btn)
+        self.depth_btn = QPushButton("Depth sources…")
+        self.depth_btn.clicked.connect(self._edit_depth_sources)
+        row3.addWidget(self.depth_btn)
+        self.resample_btn = QPushButton("Resample all depths")
+        self.resample_btn.clicked.connect(self._resample_all_depths)
+        row3.addWidget(self.resample_btn)
         create_asm_btn = QPushButton("Create assembly…")
         create_asm_btn.setToolTip("Extract an assembly from this RPL (event classification review + SLD preview)")
         create_asm_btn.clicked.connect(self._request_extract_assembly)
@@ -230,6 +238,21 @@ class RplManagerPanel(QWidget):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         self._update_edit_buttons()
+
+    def set_read_only(self, read_only: bool) -> None:
+        self._read_only = bool(read_only)
+        if self._read_only and self.edit_btn.isChecked():
+            self.edit_btn.setChecked(False)
+        self.readonly_banner.setVisible(self._read_only)
+        self.edit_btn.setEnabled(not self._read_only and self.model is not None)
+        self.slack_mode_combo.setEnabled(not self._read_only)
+        self.auto_depth_check.setEnabled(not self._read_only)
+        self.depth_btn.setEnabled(not self._read_only)
+        self.resample_btn.setEnabled(not self._read_only)
+        self._update_edit_buttons()
+
+    def _can_edit_current(self) -> bool:
+        return not self._read_only
 
     # ------------------------------------------------------------- store --
     def _open_store(self):
@@ -274,6 +297,7 @@ class RplManagerPanel(QWidget):
             self.current_rpl = None
             self.model = None
             self.sync = None
+            self.set_read_only(False)
             self._refresh_tables()
             return
         if self.sync is not None and self.sync.is_dirty():
@@ -298,8 +322,10 @@ class RplManagerPanel(QWidget):
         self.model = None
         self.sync = None
         if not self.current_rpl:
+            self.set_read_only(False)
             self._refresh_tables()
             return
+        self.set_read_only(self.current_rpl.get("status") == schema.STATUS_ISSUED)
 
         points_layer = self._find_or_load_layer(self.current_rpl.get("points_layer"))
         lines_layer = self._find_or_load_layer(self.current_rpl.get("lines_layer"))
@@ -318,7 +344,7 @@ class RplManagerPanel(QWidget):
 
         findings = rpl_engine.validate(self.model)
         self._set_status(
-            f"{len(self.model.points)} positions, {self.model.total_route_km():.3f} km route, "
+            f"{len(self.model.points)} positions, {self.model.total_route_km():.3f} km segment, "
             f"{self.model.total_cable_km():.3f} km cable"
             + (f" — {len(findings)} validation notes" if findings else "")
         )
@@ -365,7 +391,7 @@ class RplManagerPanel(QWidget):
                 ]
                 for col, text in enumerate(values):
                     item = QTableWidgetItem(text)
-                    if col not in (1,):  # only Event editable in the points table
+                    if self._read_only or col not in (1,):  # only Event editable in the points table
                         item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                     self.points_table.setItem(i, col, item)
 
@@ -384,7 +410,7 @@ class RplManagerPanel(QWidget):
                 ]
                 for col, text in enumerate(values):
                     item = QTableWidgetItem(text)
-                    if col != 4:  # only Slack editable
+                    if self._read_only or col != 4:  # only Slack editable
                         item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                     self.segments_table.setItem(i, col, item)
         finally:
@@ -396,7 +422,7 @@ class RplManagerPanel(QWidget):
             self._refresh_tables(self._pending_preview)
 
     def _on_segment_item_changed(self, item: QTableWidgetItem):
-        if self._loading_tables or self.model is None or item.column() != 4:
+        if self._loading_tables or self.model is None or item.column() != 4 or not self._can_edit_current():
             return
         try:
             slack = float(item.text())
@@ -414,7 +440,7 @@ class RplManagerPanel(QWidget):
         self._apply(changed)
 
     def _on_point_item_changed(self, item: QTableWidgetItem):
-        if self._loading_tables or self.model is None or item.column() != 1:
+        if self._loading_tables or self.model is None or item.column() != 1 or not self._can_edit_current():
             return
         idx = item.row()
         if not (0 <= idx < len(self.model.points)):
@@ -433,7 +459,7 @@ class RplManagerPanel(QWidget):
         return SlackMode.from_string(self.slack_mode_combo.currentData())
 
     def preview_move(self, idx: int, lat: float, lon: float):
-        if self.model is None:
+        if self.model is None or not self._can_edit_current():
             return
         if self._preview_model is None:
             self._preview_model = self.model.copy()
@@ -448,7 +474,7 @@ class RplManagerPanel(QWidget):
         self._refresh_tables()
 
     def commit_move(self, idx: int, lat: float, lon: float):
-        if self.model is None or self.sync is None:
+        if self.model is None or self.sync is None or not self._can_edit_current():
             return
         self._preview_model = None
         self._pending_preview = None
@@ -457,14 +483,14 @@ class RplManagerPanel(QWidget):
         self._apply(changed)
 
     def commit_insert(self, seg_idx: int, lat: float, lon: float):
-        if self.model is None or self.sync is None:
+        if self.model is None or self.sync is None or not self._can_edit_current():
             return
         changed = rpl_engine.insert_point(self.model, seg_idx, lat, lon, self.da, self.slack_mode())
         changed = changed.merge(self._auto_depth(seg_idx + 1))
         self._apply(changed)
 
     def commit_delete(self, idx: int):
-        if self.model is None or self.sync is None:
+        if self.model is None or self.sync is None or not self._can_edit_current():
             return
         try:
             changed = rpl_engine.delete_point(self.model, idx, self.da, self.slack_mode())
@@ -485,7 +511,7 @@ class RplManagerPanel(QWidget):
         return rpl_engine.apply_depths(self.model, service.sample, indices=[idx])
 
     def _apply(self, changed: rpl_engine.ChangeSet):
-        if self.sync is None or self.model is None:
+        if self.sync is None or self.model is None or not self._can_edit_current():
             return
         self.sync.apply(self.model, changed, changed.label)
         self._refresh_tables()
@@ -496,6 +522,10 @@ class RplManagerPanel(QWidget):
     # ------------------------------------------------------- edit session --
     def _toggle_edit_tool(self, on: bool):
         if on:
+            if not self._can_edit_current():
+                self._set_status("Issued RPL revisions are read-only.")
+                self.edit_btn.setChecked(False)
+                return
             if self.model is None:
                 self._set_status("Select an RPL first.")
                 self.edit_btn.setChecked(False)
@@ -516,7 +546,7 @@ class RplManagerPanel(QWidget):
         self._update_edit_buttons()
 
     def _undo(self):
-        if self.sync is None:
+        if self.sync is None or self._read_only:
             return
         self.sync.undo()
         self.model = self.sync.load_model()
@@ -525,7 +555,7 @@ class RplManagerPanel(QWidget):
             self.edit_tool.refresh_geometry()
 
     def _redo(self):
-        if self.sync is None:
+        if self.sync is None or self._read_only:
             return
         self.sync.redo()
         self.model = self.sync.load_model()
@@ -536,22 +566,28 @@ class RplManagerPanel(QWidget):
     def _save(self):
         if self.sync is None:
             return
+        if not self._can_edit_current():
+            self._set_status("Issued RPL revisions are read-only.")
+            return
         if self.sync.commit():
             self._set_status("Saved.")
             if self.current_rpl:
                 self.current_rpl["slack_mode"] = self.slack_mode().value
-                self.store.save_rpl(self.current_rpl)
-                # the route changed underneath any assessments of this RPL
-                self.store.mark_assessments_stale(self.current_rpl.get("rpl_id"))
-                refreshed = self._refresh_stored_fits()
-                if refreshed:
-                    self._set_status(f"Saved. {refreshed} fit layer set(s) refreshed.")
+                try:
+                    self.store.save_rpl(self.current_rpl)
+                    # the route changed underneath any assessments of this RPL
+                    self.store.mark_assessments_stale(self.current_rpl.get("rpl_id"))
+                    refreshed = self._refresh_stored_fits()
+                    if refreshed:
+                        self._set_status(f"Saved. {refreshed} fit layer set(s) refreshed.")
+                except WorkbenchReadOnlyError as exc:
+                    self.iface.messageBar().pushWarning("RPL read-only", str(exc))
         else:
             self._set_status("Save failed — see message log.")
         self.sync.begin_session()
 
     def _discard(self):
-        if self.sync is None:
+        if self.sync is None or self._read_only:
             return
         self.sync.rollback()
         self.model = self.sync.load_model()
@@ -563,7 +599,9 @@ class RplManagerPanel(QWidget):
     def _update_edit_buttons(self):
         has_sync = self.sync is not None
         for btn in (self.undo_btn, self.redo_btn, self.save_btn, self.discard_btn):
-            btn.setEnabled(has_sync)
+            btn.setEnabled(has_sync and not self._read_only)
+        if hasattr(self, "edit_btn"):
+            self.edit_btn.setEnabled(has_sync and not self._read_only)
 
     # ---------------------------------------------------------- utilities --
     def _set_status(self, text: str):
@@ -608,11 +646,14 @@ class RplManagerPanel(QWidget):
         self._refresh_tables()
         self.rpls_changed.emit()
 
-    def _run_register_algorithm(self):
+    def _run_register_algorithm(self, initial_parameters=None):
         try:
             import processing
 
-            processing.execAlgorithmDialog("subsea_cable_processing:register_rpl", {})
+            processing.execAlgorithmDialog(
+                "subsea_cable_processing:register_rpl",
+                dict(initial_parameters or {}),
+            )
             self.refresh_rpl_list()
             self.rpls_changed.emit()
         except Exception as exc:
@@ -626,7 +667,7 @@ class RplManagerPanel(QWidget):
             )
 
     def _resample_all_depths(self):
-        if self.model is None:
+        if self.model is None or not self._can_edit_current():
             return
         service = self._depth_service()
         if service is None or not service.is_available():
@@ -1113,11 +1154,18 @@ class RplManagerPanel(QWidget):
     def _edit_depth_sources(self):
         if not self.current_rpl or not self.store:
             return
+        if not self._can_edit_current():
+            self._set_status("Issued RPL revisions are read-only.")
+            return
         config = DepthSourceConfig(self.store.rpl_depth_config(self.current_rpl["rpl_id"]))
         dialog = DepthSourcesDialog(config, self)
         if dialog.exec_() == QDialog.DialogCode.Accepted:
             self.current_rpl["depth_source_config"] = json.dumps(dialog.result_config().to_dict())
-            self.store.save_rpl(self.current_rpl)
+            try:
+                self.store.save_rpl(self.current_rpl)
+            except WorkbenchReadOnlyError as exc:
+                self.iface.messageBar().pushWarning("RPL read-only", str(exc))
+                return
             self.auto_depth_check.setChecked(dialog.result_config().auto_resample)
             self._set_status("Depth sources updated.")
 

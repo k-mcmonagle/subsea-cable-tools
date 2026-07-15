@@ -16,23 +16,23 @@ import numpy as np
 
 try:
     from qgis.PyQt import QtCore, QtGui
-    from qgis.PyQt.QtCore import Qt, QSettings, QTimer
+    from qgis.PyQt.QtCore import Qt, QSettings
     from qgis.PyQt.QtWidgets import (
         QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
-        QHBoxLayout, QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton,
-        QScrollArea, QSlider, QSpinBox, QSplitter, QStackedWidget, QTabWidget,
-        QTableWidget, QTableWidgetItem, QTextEdit, QToolButton, QVBoxLayout,
-        QWidget,
+        QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QProgressBar,
+        QPushButton, QScrollArea, QSlider, QSpinBox, QSplitter, QStackedWidget,
+        QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QToolButton,
+        QVBoxLayout, QWidget,
     )
 except Exception:  # pragma: no cover - standalone testing
     from PyQt5 import QtCore, QtGui
-    from PyQt5.QtCore import Qt, QSettings, QTimer
+    from PyQt5.QtCore import Qt, QSettings
     from PyQt5.QtWidgets import (
         QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
-        QHBoxLayout, QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton,
-        QScrollArea, QSlider, QSpinBox, QSplitter, QStackedWidget, QTabWidget,
-        QTableWidget, QTableWidgetItem, QTextEdit, QToolButton, QVBoxLayout,
-        QWidget,
+        QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QProgressBar,
+        QPushButton, QScrollArea, QSlider, QSpinBox, QSplitter, QStackedWidget,
+        QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QToolButton,
+        QVBoxLayout, QWidget,
     )
 
 from .results_panel import render_results_html
@@ -63,11 +63,68 @@ COL_TYPE, COL_NAME, COL_LEN, COL_QW, COL_QA, COL_LOAD, COL_MU, COL_EI, COL_MBR, 
     COL_DIA, COL_CDN, COL_CDT, COL_COLOR = range(13)
 ASM_HEADERS = ["Type", "Name", "Length\n(m)", "Wt water\n(N/m)", "Wt air\n(N/m)",
                "Load\n(kN)", "Friction\nmu", "EI\n(kN.m2)", "MBR\n(m)",
-               "Dia\n(m)", "Cd\nnormal", "Cd\ntangential", "Color"]
+               "Dia (m) /\nCdA (m2)", "Cd\nnormal", "Cd\ntangential", "Color"]
+# Columns that only apply to one row type (greyed out on the other).
+_SEG_ONLY_COLS = (COL_LEN, COL_QW, COL_QA, COL_MU, COL_EI, COL_MBR, COL_CDN, COL_CDT)
+_BODY_ONLY_COLS = (COL_LOAD,)
+
+
+class _TableResizeGrip(QWidget):
+    """A thin drag handle placed below a table so the user can set the table's
+    height by dragging, instead of being locked to the auto-computed size."""
+
+    def __init__(self, table, min_h=60, parent=None):
+        super().__init__(parent)
+        self._table = table
+        self._min_h = min_h
+        self._press_y = None
+        self._start_h = 0
+        self.setFixedHeight(11)
+        self.setCursor(Qt.SizeVerCursor)
+        self.setToolTip("Drag to resize the table height")
+
+    def paintEvent(self, _e):
+        try:
+            p = QtGui.QPainter(self)
+            w = self.width()
+            cy = self.height() // 2
+            p.setPen(QtGui.QColor(150, 150, 150))
+            for dx in (-14, -5, 4, 13):
+                cx = w // 2 + dx
+                p.drawLine(cx, cy - 1, cx + 3, cy - 1)
+                p.drawLine(cx, cy + 1, cx + 3, cy + 1)
+            p.end()
+        except Exception:
+            pass
+
+    def mousePressEvent(self, e):
+        try:
+            self._press_y = e.globalY()
+        except Exception:
+            self._press_y = int(e.globalPosition().y())
+        self._start_h = self._table.height()
+
+    def mouseMoveEvent(self, e):
+        if self._press_y is None:
+            return
+        try:
+            gy = e.globalY()
+        except Exception:
+            gy = int(e.globalPosition().y())
+        new_h = max(self._min_h, self._start_h + (gy - self._press_y))
+        self._table._manual_height = True
+        self._table.setMinimumHeight(new_h)
+        self._table.setMaximumHeight(new_h)
+
+    def mouseReleaseEvent(self, _e):
+        self._press_y = None
 
 
 class LaySimulatorDialog(QDialog):
     """Cable Lay Simulator (3D) — beta."""
+
+    # Secondary sections start collapsed on first run (saved state wins).
+    _DEFAULT_COLLAPSED = {"ship_shape", "advanced", "display"}
 
     def __init__(self, parent=None, iface=None):
         super().__init__(parent)
@@ -93,10 +150,15 @@ class LaySimulatorDialog(QDialog):
         self._scene_origin = None                     # origin the shown scene was solved with
 
         self._build_ui()
+        self._capture_defaults()
         self._restore_settings()
         self._initializing = False
         self._on_mode_changed()
-        QTimer.singleShot(0, self._solve_now)
+        # No auto-solve on open: restored inputs can describe an expensive
+        # scenario, so wait for an explicit click.
+        self._set_dirty(True)
+        self.dirty_label.setText("Ready — review the inputs and click "
+                                 + self.run_btn.text() + ".")
         self.resize(1280, 820)
 
     # ------------------------------------------------------------------ UI
@@ -115,17 +177,26 @@ class LaySimulatorDialog(QDialog):
         form = QVBoxLayout(left_holder)
         form.setContentsMargins(4, 4, 8, 4)
 
-        # Workflow order: what -> where -> environment -> ship -> cable ->
-        # scenario properties -> what to solve -> display.
+        # Workflow order: what (scenario) -> where (position) -> environment
+        # -> cable -> vessel -> scenario properties -> what to solve /
+        # operation script, then secondary sections (drawing, advanced
+        # solver, display) collapsed by default.
         form.addWidget(self._section_mode())
         form.addWidget(self._section_position())
         form.addWidget(self._section_environment())
-        form.addWidget(self._section_vessel())
         form.addWidget(self._section_assembly())
+        form.addWidget(self._section_vessel())
         form.addWidget(self._section_bu_bight())
         form.addWidget(self._section_solve())
         form.addWidget(self._section_operation())
+        form.addWidget(self._section_ship_shape())
+        form.addWidget(self._section_advanced())
         form.addWidget(self._section_display())
+        reset_btn = QPushButton("Reset all inputs to defaults...")
+        reset_btn.setToolTip("Restore every input, table and section to its "
+                             "factory default (asks for confirmation).")
+        reset_btn.clicked.connect(self._reset_defaults)
+        form.addWidget(reset_btn)
         form.addStretch(1)
 
         scroll = QScrollArea()
@@ -260,25 +331,55 @@ class LaySimulatorDialog(QDialog):
         v.addWidget(btn)
         v.addWidget(body)
         self._collapsibles[key] = (btn, body)
+        if key in self._DEFAULT_COLLAPSED:
+            btn.setChecked(False)
+            body.setVisible(False)
         return box, lay
 
-    def _auto_size_table(self, table: QTableWidget, min_rows: int = 3, max_rows: int = 8):
+    def _auto_size_table(self, table: QTableWidget, min_rows: int = 3, max_rows: int = 8,
+                         stretch_last: bool = True):
         """Size a table to show its rows (between min_rows and max_rows) so
         several rows are visible at once; beyond max_rows it scrolls
-        internally, and the whole left panel scrolls anyway."""
+        internally, and the whole left panel scrolls anyway.
 
+        The auto-size only applies until the user drags the resize grip below
+        the table (which sets ``table._manual_height``); after that the height
+        is left to the user."""
+
+        table._manual_height = False
+
+        # Row height derived from the current font so text is never clipped,
+        # with a comfortable floor for readability.
         try:
-            table.verticalHeader().setMinimumSectionSize(22)
-            table.verticalHeader().setDefaultSectionSize(24)
+            fm = table.fontMetrics()
+            row_h = max(34, fm.height() + 14)
+        except Exception:
+            row_h = 34
+        try:
+            vh = table.verticalHeader()
+            vh.setMinimumSectionSize(row_h)
+            vh.setDefaultSectionSize(row_h)
+            vh.setSectionResizeMode(QHeaderView.Fixed)
+        except Exception:
+            pass
+
+        # Let the user drag column dividers; the last column fills the rest.
+        try:
+            hh = table.horizontalHeader()
+            hh.setSectionResizeMode(QHeaderView.Interactive)
+            hh.setStretchLastSection(stretch_last)
+            hh.setMinimumSectionSize(40)
         except Exception:
             pass
 
         def update(*_a):
+            if getattr(table, "_manual_height", False):
+                return
             rows = max(min_rows, min(max_rows, table.rowCount()))
             try:
-                rh = table.verticalHeader().defaultSectionSize() or 24
+                rh = table.verticalHeader().defaultSectionSize() or row_h
             except Exception:
-                rh = 24
+                rh = row_h
             try:
                 hh = table.horizontalHeader().sizeHint().height() or 24
             except Exception:
@@ -293,6 +394,40 @@ class LaySimulatorDialog(QDialog):
         except Exception:
             pass
         update()
+
+    def _add_table_grip(self, table: QTableWidget, layout):
+        """Add a draggable resize handle directly beneath ``table``."""
+        try:
+            layout.addWidget(_TableResizeGrip(table))
+        except Exception:
+            pass
+
+    def _fit_columns(self, table: QTableWidget, padding: int = 18,
+                     min_w: int = 44, max_w: int = 340):
+        """Size each column to fit the wider of its (possibly multi-line)
+        header text or its current content. Font-metrics based, so it scales
+        with the display DPI. Columns stay Interactive, so the user can drag
+        any divider afterwards to override."""
+        try:
+            fm = table.horizontalHeader().fontMetrics()
+        except Exception:
+            return
+        for c in range(table.columnCount()):
+            it = table.horizontalHeaderItem(c)
+            htext = it.text() if it is not None else ""
+            hw = 0
+            for line in (htext or "").split("\n"):
+                try:
+                    lw = fm.horizontalAdvance(line)
+                except Exception:
+                    lw = fm.width(line)
+                hw = max(hw, lw)
+            try:
+                cw = table.sizeHintForColumn(c)
+            except Exception:
+                cw = 0
+            w = max(min_w, min(max_w, max(hw, cw) + padding))
+            table.setColumnWidth(c, w)
 
     # ---- input widget helpers ---------------------------------------------
 
@@ -355,6 +490,10 @@ class LaySimulatorDialog(QDialog):
         ])
         self.scenario_choice.currentIndexChanged.connect(self._apply_scenario_choice)
         lay.addRow("Modelling", self.scenario_choice)
+        self.scenario_desc = QLabel("")
+        self.scenario_desc.setWordWrap(True)
+        self.scenario_desc.setStyleSheet("color:#777; font-size: small;")
+        lay.addRow(self.scenario_desc)
         # Hidden holders retained for config plumbing + settings migration:
         # the scenario choice above drives both.
         self.mode_combo = self._combo("mode", MODES)
@@ -369,9 +508,32 @@ class LaySimulatorDialog(QDialog):
         self.static_config.setVisible(False)
         return box
 
+    _SCENARIO_DESCS = {
+        "single_static": (
+            "Stationary vessel holding a single cable span to the seabed. "
+            "Set the solve target under 'What to solve'."),
+        "single_steady": (
+            "Constant-speed lay (ship frame): tension, layback and touchdown "
+            "for the ship speed and slack under 'Vessel & lay'. Uses the "
+            "first assembly segment as a uniform cable."),
+        "bu_static": (
+            "Branching unit held at depth from the vessel: trunk plus two "
+            "laid legs. Set leg bearings in 'Position & heading' and the "
+            "hold depth under 'What to solve'."),
+        "fs_static": (
+            "Final-splice bight held at depth on a lowering rope between "
+            "two laid ends. Set the laid ends in 'Position & heading' and "
+            "the apex depth under 'What to solve'."),
+        "operation": (
+            "Time-stepped quasi-static simulation of a scripted operation "
+            "(BU deployment, bight lay-down or straight lay). Configure it "
+            "under 'Operation scenario', then click Run simulation."),
+    }
+
     def _apply_scenario_choice(self, *args):
         """Map the single scenario picker onto the internal mode/config."""
         choice = self.scenario_choice.currentData() or "single_static"
+        self.scenario_desc.setText(self._SCENARIO_DESCS.get(choice, ""))
         mode = {"single_steady": "steady", "operation": "operation"}.get(choice, "static")
         config = {"bu_static": "bu", "fs_static": "bight"}.get(choice, "single")
         for combo, val in ((self.mode_combo, mode), (self.static_config, config)):
@@ -481,7 +643,8 @@ class LaySimulatorDialog(QDialog):
         self.profile_table = QTableWidget(0, 2)
         self.profile_table.setHorizontalHeaderLabels(["Distance from vessel (m)", "Depth (m)"])
         self._auto_size_table(self.profile_table, min_rows=3, max_rows=8)
-        self.profile_table.cellChanged.connect(self._schedule)
+        self._fit_columns(self.profile_table)
+        self.profile_table.cellChanged.connect(self._on_profile_cell_changed)
         prof_btns = QHBoxLayout()
         for text, cb in (("Add", self._profile_add), ("Delete", self._profile_del)):
             b = QPushButton(text)
@@ -492,6 +655,7 @@ class LaySimulatorDialog(QDialog):
         pv = QVBoxLayout(self._profile_rows_widget)
         pv.setContentsMargins(0, 0, 0, 0)
         pv.addWidget(self.profile_table)
+        self._add_table_grip(self.profile_table, pv)
         pv.addLayout(prof_btns)
         self._profile_label = QLabel("Profile")
         lay.addRow(self._profile_label, self._profile_rows_widget)
@@ -521,7 +685,8 @@ class LaySimulatorDialog(QDialog):
         self.current_table = QTableWidget(0, 3)
         self.current_table.setHorizontalHeaderLabels(["Depth (m)", "Speed (m/s)", "Toward (degN)"])
         self._auto_size_table(self.current_table, min_rows=2, max_rows=6)
-        self.current_table.cellChanged.connect(self._schedule)
+        self._fit_columns(self.current_table)
+        self.current_table.cellChanged.connect(self._on_current_cell_changed)
         cur_btns = QHBoxLayout()
         for text, cb in (("Add", self._current_add), ("Delete", self._current_del)):
             b = QPushButton(text)
@@ -532,6 +697,7 @@ class LaySimulatorDialog(QDialog):
         cv = QVBoxLayout(cur_holder)
         cv.setContentsMargins(0, 0, 0, 0)
         cv.addWidget(self.current_table)
+        self._add_table_grip(self.current_table, cv)
         cv.addLayout(cur_btns)
         lay.addRow("Current vs depth", cur_holder)
         return box
@@ -540,8 +706,17 @@ class LaySimulatorDialog(QDialog):
         box, lay = self._collapsible("Cable assembly", "assembly")
         self.asm_table = QTableWidget(0, len(ASM_HEADERS))
         self.asm_table.setHorizontalHeaderLabels(ASM_HEADERS)
-        self._auto_size_table(self.asm_table, min_rows=3, max_rows=8)
-        self.asm_table.cellChanged.connect(self._schedule)
+        try:
+            self.asm_table.horizontalHeaderItem(COL_DIA).setToolTip(
+                "Segment rows: outer diameter (m). Body rows: lumped drag "
+                "area Cd*A (m2).")
+            self.asm_table.horizontalHeaderItem(COL_LOAD).setToolTip(
+                "Body rows only: submerged point load (kN).")
+        except Exception:
+            pass
+        self._auto_size_table(self.asm_table, min_rows=3, max_rows=8, stretch_last=False)
+        self._fit_columns(self.asm_table)
+        self.asm_table.cellChanged.connect(self._on_asm_cell_changed)
         btns = QHBoxLayout()
         for text, cb in (("Add segment", self._asm_add_segment), ("Add body", self._asm_add_body),
                          ("Delete", self._asm_del), ("Up", lambda: self._asm_move(-1)),
@@ -553,6 +728,7 @@ class LaySimulatorDialog(QDialog):
         hv = QVBoxLayout(holder)
         hv.setContentsMargins(0, 0, 0, 0)
         hv.addWidget(self.asm_table)
+        self._add_table_grip(self.asm_table, hv)
         hv.addLayout(btns)
         lay.addRow(holder)
         note = QLabel("Ordered from the chute down. Blank = use the defaults below. "
@@ -562,12 +738,27 @@ class LaySimulatorDialog(QDialog):
         lay.addRow(note)
 
         self.def_qw = self._dspin("def_q_water", -5000.0, 50000.0, 200.0, 10.0, 1, " N/m")
+        self.def_qw.setToolTip("Submerged weight per metre. Negative = buoyant.")
         self.def_dia = self._dspin("def_dia", 0.0, 1.0, 0.035, 0.005, 3, " m")
         self.def_cdn = self._dspin("def_cdn", 0.0, 5.0, 1.2, 0.05, 2)
+        self.def_cdn.setToolTip(
+            "Normal (cross-flow) drag coefficient. Typical for bare cable: "
+            "1.0-1.3.")
         self.def_cdt = self._dspin("def_cdt", 0.0, 1.0, 0.01, 0.005, 3)
+        self.def_cdt.setToolTip(
+            "Tangential (skin) drag coefficient. Typical: 0.003-0.05.")
         self.def_mu = self._dspin("def_mu", 0.0, 3.0, 0.3, 0.05, 2)
+        self.def_mu.setToolTip(
+            "Cable-seabed Coulomb friction coefficient. Typical: 0.2-0.6 "
+            "(sand/clay); higher for rough rock.")
         self.def_ei = self._dspin("def_ei", 0.0, 10000.0, 0.0, 1.0, 1, " kN.m2")
+        self.def_ei.setToolTip(
+            "Bending stiffness. 0 = perfectly flexible (usual for long "
+            "spans); set for stiff products near the touchdown point.")
         self.def_mbr = self._dspin("def_mbr", 0.0, 100.0, 0.0, 0.5, 1, " m")
+        self.def_mbr.setToolTip(
+            "Minimum bend radius limit used for the violation check in the "
+            "results. 0 disables the check.")
         lay.addRow("Default weight in water", self.def_qw)
         lay.addRow("Default diameter", self.def_dia)
         lay.addRow("Default Cd (normal)", self.def_cdn)
@@ -585,18 +776,32 @@ class LaySimulatorDialog(QDialog):
             "waterline. Also used as the drawn hull freeboard in the 3D view."
         )
         self.ship_speed = self._dspin("ship_speed_kn", 0.0, 12.0, 6.0, 0.25, 2, " kn")
+        self.ship_speed.setToolTip(
+            "Lay speed over ground. Used by steady-lay and operation modes; "
+            "hidden for static solves (vessel stationary).")
         self.slack = self._dspin("slack_pct", -10.0, 30.0, 2.0, 0.5, 1, " %")
+        self.slack.setToolTip(
+            "Pay-out speed margin over ship speed: pay-out = ship speed x "
+            "(1 + slack). Positive slack lays extra cable on the bed; "
+            "typical values are 1-5 %.")
         self.chute_mu = self._dspin("chute_mu", 0.0, 1.0, 0.3, 0.05, 2)
+        self.chute_mu.setToolTip(
+            "Capstan friction coefficient over the chute: converts the "
+            "cable-side top tension into the machinery-side holdback "
+            "figure shown in the results.")
         lay.addRow("Chute height above waterline", self.chute_h)
         self._ship_speed_label = QLabel("Ship speed")
         lay.addRow(self._ship_speed_label, self.ship_speed)
         self._slack_label = QLabel("Slack")
         lay.addRow(self._slack_label, self.slack)
         lay.addRow("Chute friction mu (capstan)", self.chute_mu)
+        return box
 
-        # Parametric ship shape: hull around a CRP, chute offset from the
-        # CRP (the chute stays the solver's departure point; the hull is
-        # drawn geometry, extruded to the chute height above).
+    def _section_ship_shape(self):
+        """Parametric ship drawing: hull around a CRP, chute offset from the
+        CRP. The chute stays the solver's departure point; the hull is drawn
+        geometry only (3D view and map overlay)."""
+        box, lay = self._collapsible("Vessel drawing (display only)", "ship_shape")
         self.ship_len = self._dspin("ship_length_m", 5.0, 400.0, 60.0, 5.0, 0, " m")
         self.ship_beam = self._dspin("ship_beam_m", 2.0, 80.0, 12.0, 1.0, 0, " m")
         self.crp_fwd = self._dspin("crp_fwd_m", -200.0, 200.0, 0.0, 1.0, 1, " m")
@@ -616,12 +821,29 @@ class LaySimulatorDialog(QDialog):
         lay.addRow("Chute forward of CRP", self.chute_fwd)
         lay.addRow("Chute starboard of CRP", self.chute_stbd)
         lay.addRow("Chute radius (drawn)", self.chute_radius)
-        note = QLabel("Negative 'forward' = aft, negative 'starboard' = port. "
-                      "With zero offsets the chute sits at the hull centre "
-                      "(previous behaviour).")
+        note = QLabel("Drawn hull geometry for the 3D view and map overlay. "
+                      "Negative 'forward' = aft, negative 'starboard' = port. "
+                      "With zero offsets the chute sits at the hull centre.")
         note.setWordWrap(True)
         note.setStyleSheet("color:#777; font-size: small;")
         lay.addRow(note)
+        return box
+
+    def _section_advanced(self):
+        box, lay = self._collapsible("Advanced (solver)", "advanced")
+        self.adv_ds = self._dspin("target_ds_m", 0.5, 50.0, 5.0, 0.5, 1, " m")
+        self.adv_ds.setToolTip(
+            "Target element length for the 3D discretisation. Smaller = "
+            "finer touchdown/bend-radius resolution but slower solves.")
+        self.adv_tol = self._dspin("dr_tol", 0.0001, 0.05, 0.002, 0.0005, 4)
+        self.adv_tol.setToolTip(
+            "Relative force residual at which the relaxation is accepted. "
+            "Smaller = tighter equilibrium but longer solve times.")
+        self.adv_rho = self._dspin("rho_water", 950.0, 1100.0, 1025.0, 5.0, 0, " kg/m3")
+        self.adv_rho.setToolTip("Water density (1025 seawater, ~1000 fresh).")
+        lay.addRow("Mesh target element length", self.adv_ds)
+        lay.addRow("Convergence tolerance", self.adv_tol)
+        lay.addRow("Water density", self.adv_rho)
         return box
 
     def _section_bu_bight(self):
@@ -631,8 +853,15 @@ class LaySimulatorDialog(QDialog):
         box, lay = self._collapsible("BU / splice properties", "bu_bight")
         # Branching-unit group.
         self.bu_weight = self._dspin("bu_weight_kN", 0.1, 500.0, 15.0, 1.0, 1, " kN")
+        self.bu_weight.setToolTip("Submerged weight of the branching unit body.")
         self.bu_cda = self._dspin("bu_cda", 0.0, 50.0, 1.5, 0.1, 2, " m2")
+        self.bu_cda.setToolTip(
+            "Lumped drag area Cd x A of the BU body for current loading "
+            "(frontal area times its drag coefficient).")
         self.bu_leg_len = self._dspin("bu_leg_len", 10.0, 20000.0, 300.0, 10.0, 0, " m")
+        self.bu_leg_len.setToolTip(
+            "Deployed length of each pre-laid leg, measured from the BU "
+            "along its lead bearing.")
         self._bu_geo_rows = [
             (QLabel("BU submerged weight"), self.bu_weight),
             (QLabel("BU drag area Cd*A"), self.bu_cda),
@@ -650,11 +879,48 @@ class LaySimulatorDialog(QDialog):
         self._bu_bight_box = box
         return box
 
+    # Presentation of the "Value" spin box per solve-target mode:
+    # (suffix, lo, hi, step, decimals, tooltip).
+    _SOLVE_VALUE_SPECS = {
+        "bottom_tension": (" kN", 0.0, 1e5, 0.5, 2,
+                           "Residual tension in the cable at the touchdown point."),
+        "top_tension": (" kN", 0.0, 1e6, 1.0, 2,
+                        "Cable-side tension at the chute departure point."),
+        "exit_angle": (" deg", 0.0, 90.0, 1.0, 1,
+                       "Departure angle below horizontal at the chute."),
+        "layback": (" m", 0.0, 1e5, 10.0, 0,
+                    "Horizontal distance from the vessel to the touchdown point."),
+        "suspended_length": (" m", 0.0, 1e6, 10.0, 0,
+                             "Cable length in the water column (chute to touchdown)."),
+    }
+
+    def _update_solve_value_units(self, *args):
+        spec = self._SOLVE_VALUE_SPECS.get(self.solve_mode.currentData())
+        if not spec:
+            return
+        suffix, lo, hi, step, dec, tip = spec
+        w = self.solve_value
+        w.blockSignals(True)
+        w.setSuffix(suffix)
+        w.setRange(lo, hi)
+        w.setSingleStep(step)
+        w.setDecimals(dec)
+        w.blockSignals(False)
+        w.setToolTip(tip)
+
     def _section_solve(self):
-        box, lay = self._collapsible("Solve", "solve")
+        box, lay = self._collapsible("What to solve", "solve")
         self.solve_mode = self._combo("solve_mode", SOLVE_MODES)
+        self.solve_mode.setToolTip(
+            "Which quantity you specify; the solver finds the matching "
+            "configuration and reports all the others.")
         self.solve_value = self._dspin("solve_value", -1e6, 1e6, 5.0, 1.0, 3)
+        self.solve_mode.currentIndexChanged.connect(self._update_solve_value_units)
+        self._update_solve_value_units()
         self.on_bed_tail = self._dspin("on_bed_tail", 10.0, 5000.0, 150.0, 10.0, 0, " m")
+        self.on_bed_tail.setToolTip(
+            "Extra cable modelled lying on the bed beyond the touchdown "
+            "point (anchors the far end of the static solve).")
         self._solve_rows = [
             (QLabel("Input"), self.solve_mode),
             (QLabel("Value"), self.solve_value),
@@ -665,8 +931,17 @@ class LaySimulatorDialog(QDialog):
 
         # Static-hold inputs (BU / bight configurations).
         self.bu_depth = self._dspin("bu_depth_m", 1.0, 8000.0, 20.0, 5.0, 1, " m")
+        self.bu_depth.setToolTip(
+            "Depth below the surface at which the branching unit is held "
+            "from the vessel.")
         self.trunk_slack = self._dspin("trunk_slack_pct", 0.0, 50.0, 2.0, 0.5, 1, " %")
+        self.trunk_slack.setToolTip(
+            "Trunk length margin over the straight chute-to-BU distance; "
+            "more slack lets the trunk hang deeper.")
         self.apex_depth = self._dspin("apex_depth_m", 1.0, 8000.0, 10.0, 5.0, 1, " m")
+        self.apex_depth.setToolTip(
+            "Depth below the surface at which the bight apex is held on "
+            "the lowering rope.")
         self._bu_hold_rows = [
             (QLabel("BU hold depth below surface"), self.bu_depth),
             (QLabel("Trunk slack over hold distance"), self.trunk_slack),
@@ -724,6 +999,10 @@ class LaySimulatorDialog(QDialog):
     def _section_display(self):
         box, lay = self._collapsible("Display", "display")
         self.zex = self._dspin("z_exaggeration", 0.1, 200.0, 1.0, 0.5, 1, " x")
+        self.zex.setToolTip(
+            "Vertical exaggeration of the 3D view only. The Profile and "
+            "Plan tabs always plot true scale (see the true-scale profile "
+            "option below).")
         self.zex.valueChanged.connect(lambda v: self.view3d.set_z_exaggeration(float(v)))
         self.color_mode = self._combo("color_mode", [("segment", "Color by segment"), ("tension", "Color by tension")])
         self.color_mode.currentIndexChanged.connect(
@@ -731,6 +1010,14 @@ class LaySimulatorDialog(QDialog):
         )
         lay.addRow("Depth exaggeration", self.zex)
         lay.addRow("Cable colors", self.color_mode)
+        self.profile_true_scale = self._check(
+            "profile_true_scale", "True-scale profile (1:1 horizontal/vertical)", True)
+        self.profile_true_scale.setToolTip(
+            "Lock the Profile tab axes to a 1:1 scale so the side view shows "
+            "true geometry. Untick to let the profile stretch to fill the plot.")
+        self.profile_true_scale.toggled.connect(
+            lambda on: self.profile_view.set_equal_aspect(bool(on)))
+        lay.addRow(self.profile_true_scale)
         self.show_on_map = self._check(
             "show_on_map", "Show result on map canvas (ship, cable plan, TDP)", False)
         self.show_on_map.toggled.connect(self._refresh_map_overlay)
@@ -746,6 +1033,103 @@ class LaySimulatorDialog(QDialog):
         return box
 
     # ------------------------------------------------------------- tables
+
+    @staticmethod
+    def _mark_cell(table, r, c, bad: bool, tip: str = ""):
+        it = table.item(r, c)
+        if it is None:
+            return
+        it.setBackground(QtGui.QColor("#ffd6d6") if bad else QtGui.QBrush())
+        it.setToolTip(tip if bad else "")
+
+    def _validate_profile_table(self):
+        """Inline feedback: non-numeric cells and non-increasing distances."""
+        t = self.profile_table
+        t.blockSignals(True)
+        try:
+            prev = None
+            for r in range(t.rowCount()):
+                d = _of(t.item(r, 0))
+                z = _of(t.item(r, 1))
+                bad_d = d is None or (prev is not None and d <= prev)
+                self._mark_cell(t, r, 0, bad_d,
+                                "Distance must be a number and increase down the table.")
+                self._mark_cell(t, r, 1, z is None, "Depth must be a number.")
+                if d is not None:
+                    prev = d
+        finally:
+            t.blockSignals(False)
+
+    def _validate_current_table(self):
+        t = self.current_table
+        t.blockSignals(True)
+        try:
+            for r in range(t.rowCount()):
+                d = _of(t.item(r, 0))
+                s = _of(t.item(r, 1))
+                a = _of(t.item(r, 2))
+                self._mark_cell(t, r, 0, d is None or d < 0,
+                                "Depth must be a non-negative number.")
+                self._mark_cell(t, r, 1, s is None, "Speed must be a number (m/s).")
+                self._mark_cell(t, r, 2, a is not None and not (0.0 <= a <= 360.0),
+                                "Direction must be a compass bearing 0-360.")
+        finally:
+            t.blockSignals(False)
+
+    def _on_profile_cell_changed(self, *_a):
+        self._validate_profile_table()
+        self._schedule()
+
+    def _on_current_cell_changed(self, *_a):
+        self._validate_current_table()
+        self._schedule()
+
+    def _style_asm_row(self, r: int):
+        """Grey out cells that don't apply to the row's type and label the
+        dual-purpose Dia/CdA column."""
+        titem = self.asm_table.item(r, COL_TYPE)
+        is_body = bool(titem and titem.text().strip().lower().startswith("b"))
+        off_cols = _SEG_ONLY_COLS if is_body else _BODY_ONLY_COLS
+        on_cols = _BODY_ONLY_COLS if is_body else _SEG_ONLY_COLS
+        editable = getattr(Qt, "ItemFlag", Qt).ItemIsEditable
+        for cols, on in ((off_cols, False), (on_cols, True)):
+            for c in cols:
+                it = self.asm_table.item(r, c)
+                if it is None:
+                    it = QTableWidgetItem("")
+                    self.asm_table.setItem(r, c, it)
+                if on:
+                    it.setFlags(it.flags() | editable)
+                    it.setBackground(QtGui.QBrush())
+                    it.setToolTip("")
+                else:
+                    it.setFlags(it.flags() & ~editable)
+                    it.setBackground(QtGui.QColor("#e8e8e8"))
+                    it.setToolTip("Not used for %s rows."
+                                  % ("body" if is_body else "segment"))
+        dia = self.asm_table.item(r, COL_DIA)
+        if dia is None:
+            dia = QTableWidgetItem("")
+            self.asm_table.setItem(r, COL_DIA, dia)
+        dia.setToolTip("Body drag area Cd*A (m2)." if is_body
+                       else "Segment outer diameter (m).")
+
+    def _style_asm_rows(self):
+        self.asm_table.blockSignals(True)
+        try:
+            for r in range(self.asm_table.rowCount()):
+                self._style_asm_row(r)
+        finally:
+            self.asm_table.blockSignals(False)
+
+    def _on_asm_cell_changed(self, row: int, col: int):
+        if col == COL_TYPE:
+            self.asm_table.blockSignals(True)
+            try:
+                self._style_asm_row(row)
+            finally:
+                self.asm_table.blockSignals(False)
+        self._schedule()
 
     def _profile_add(self):
         r = self.profile_table.rowCount()
@@ -782,6 +1166,7 @@ class LaySimulatorDialog(QDialog):
         vals = ["Segment", f"Cable {r + 1}", "1000", "", "", "", "", "", "", "", "", "", ""]
         for c, v in enumerate(vals):
             self.asm_table.setItem(r, c, QTableWidgetItem(v))
+        self._style_asm_rows()
         self._schedule()
 
     def _asm_add_body(self):
@@ -790,6 +1175,7 @@ class LaySimulatorDialog(QDialog):
         vals = ["Body", f"Body {r + 1}", "", "", "", "5.0", "", "", "", "", "", "", ""]
         for c, v in enumerate(vals):
             self.asm_table.setItem(r, c, QTableWidgetItem(v))
+        self._style_asm_rows()
         self._schedule()
 
     def _asm_del(self):
@@ -897,6 +1283,8 @@ class LaySimulatorDialog(QDialog):
                 put(COL_CDT, entry.get("cd_tangential", ""))
             put(COL_COLOR, entry.get("color", ""))
         self.asm_table.blockSignals(False)
+        self._style_asm_rows()
+        self._fit_columns(self.asm_table)
         self._schedule()
 
     # ------------------------------------------------------------- config
@@ -964,6 +1352,9 @@ class LaySimulatorDialog(QDialog):
         cfg.solve_value = float(self.solve_value.value())
         cfg.on_bed_tail_m = float(self.on_bed_tail.value())
         cfg.chute_mu = float(self.chute_mu.value())
+        cfg.target_ds_m = float(self.adv_ds.value())
+        cfg.dr_tol = float(self.adv_tol.value())
+        cfg.rho_water = float(self.adv_rho.value())
         cfg.static_config = self.static_config.currentData() or "single"
         cfg.bu_depth_m = float(self.bu_depth.value())
         cfg.trunk_slack_pct = float(self.trunk_slack.value())
@@ -1010,7 +1401,8 @@ class LaySimulatorDialog(QDialog):
             return
         if self.sender() in (getattr(self, "zex", None),
                              getattr(self, "color_mode", None),
-                             getattr(self, "show_on_map", None)):
+                             getattr(self, "show_on_map", None),
+                             getattr(self, "profile_true_scale", None)):
             return  # display-only options don't invalidate the solution
         self._set_dirty(True)
 
@@ -1061,17 +1453,32 @@ class LaySimulatorDialog(QDialog):
         self._worker = SolveWorker(cfg, self)
         self._worker.finishedWith.connect(self._on_solved)
         self._worker.progressed.connect(self._on_progress)
-        self.cancel_btn.setEnabled(cfg.mode == "operation")
+        self.cancel_btn.setEnabled(True)
+        self.run_btn.setEnabled(False)
         if cfg.mode == "operation":
-            self.run_btn.setEnabled(False)
+            self.op_progress.setRange(0, 100)
+            self.op_progress.setValue(0)
+        else:
+            self.op_progress.setRange(0, 0)  # indeterminate while relaxing
         self.results.setHtml("<i>Solving...</i>")
         self._worker.start()
 
     def _cancel_worker(self):
         if self._worker is not None:
             self._worker.cancel()
+            self.dirty_label.setText("Cancelling...")
 
     def _on_progress(self, frac: float, label: str):
+        if frac < 0:
+            # Within-solve feedback (static/steady): indeterminate bar plus
+            # an iteration/residual readout.
+            if self.op_progress.maximum() != 0:
+                self.op_progress.setRange(0, 0)
+            if label:
+                self.dirty_label.setText(label)
+            return
+        if self.op_progress.maximum() == 0:
+            self.op_progress.setRange(0, 100)
         self.op_progress.setValue(int(frac * 100))
         if label:
             self.scrub_label.setText(label)
@@ -1079,6 +1486,13 @@ class LaySimulatorDialog(QDialog):
     def _on_solved(self, out: RunOutput):
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
+        if self.op_progress.maximum() == 0:
+            self.op_progress.setRange(0, 100)
+            self.op_progress.setValue(0)
+        if not self._dirty:
+            self.dirty_label.setText("")
+        if out.error == "cancelled":
+            self._set_dirty(True)
         self._last_out = out
         self.results.setHtml(render_results_html(out))
         if out.error:
@@ -1207,8 +1621,10 @@ class LaySimulatorDialog(QDialog):
         mode = self.mode_combo.currentData()
         is_op = mode == "operation"
         self.run_btn.setText("Run simulation" if is_op else "Solve")
-        self.op_progress.setVisible(is_op)
-        self.cancel_btn.setVisible(is_op)
+        # Cancel and progress apply to every mode (static relaxations can be
+        # long too); they are enabled/animated only while a worker runs.
+        self.op_progress.setVisible(True)
+        self.cancel_btn.setVisible(True)
         if self._dirty:
             self._set_dirty(True)  # re-word the indicator for the new mode
         self._operation_box.setVisible(True)
@@ -1299,9 +1715,20 @@ class LaySimulatorDialog(QDialog):
             grid["kind"] = "grid"
             self._grid_bathy = grid
             d = np.asarray(grid["depths"], dtype=float)
-            self.raster_status.setText(
-                f"Sampled {d.shape[1]}x{d.shape[0]} grid, depth {d.min():.0f}-{d.max():.0f} m."
-            )
+            nodata_pct = 100.0 * float(grid.get("nodata_fraction", 0.0))
+            status = (f"Sampled {d.shape[1]}x{d.shape[0]} grid, "
+                      f"depth {d.min():.0f}-{d.max():.0f} m.")
+            if nodata_pct >= 0.5:
+                status += f" {nodata_pct:.0f}% nodata (filled from neighbours)."
+            self.raster_status.setText(status)
+            self.raster_status.setStyleSheet(
+                "color:#c07f00; font-weight:bold;" if nodata_pct >= 20.0 else "")
+            if nodata_pct >= 20.0:
+                self._push_map_message(
+                    f"Warning: {nodata_pct:.0f}% of the sampled bathymetry "
+                    "window is nodata — the filled area may misplace the "
+                    "touchdown point. Consider a smaller extent or another "
+                    "raster.")
             self._update_origin_label()
             self._schedule()
         except Exception as exc:
@@ -1358,7 +1785,8 @@ class LaySimulatorDialog(QDialog):
             return None
 
     def _start_pick(self, n_points: int, on_done, prompts=None):
-        """Hide the dialog, collect ``n_points`` canvas clicks, restore.
+        """Fade the dialog behind QGIS, collect ``n_points`` canvas clicks,
+        then restore it (less disorienting than minimizing the window).
 
         ``prompts`` (optional) is one short instruction per click, shown in
         the QGIS message bar as the sequence advances."""
@@ -1378,7 +1806,13 @@ class LaySimulatorDialog(QDialog):
             except Exception:
                 pass
             self._pick_tool = None
-        self.showMinimized()
+        # Keep the window open but ghosted and behind QGIS so the canvas is
+        # clickable and the user keeps their bearings.
+        try:
+            self.setWindowOpacity(0.3)
+            self.lower()
+        except Exception:
+            self.showMinimized()
 
         def prompt(i: int):
             if prompts and i < len(prompts):
@@ -1408,7 +1842,12 @@ class LaySimulatorDialog(QDialog):
             pass
 
     def _restore_after_pick(self):
-        self.showNormal()
+        try:
+            self.setWindowOpacity(1.0)
+        except Exception:
+            pass
+        if self.isMinimized():
+            self.showNormal()
         self.raise_()
         self.activateWindow()
 
@@ -1602,6 +2041,67 @@ class LaySimulatorDialog(QDialog):
             QMessageBox.warning(self, "Export DXF", f"Export failed:\n{exc}")
 
     # ------------------------------------------------------------ settings
+
+    def _capture_defaults(self):
+        """Snapshot factory-default widget values (taken before the settings
+        restore) so 'Reset all inputs' works without a restart."""
+        snap: Dict[str, Any] = {}
+        for key, w in self._registry:
+            try:
+                if isinstance(w, (QDoubleSpinBox, QSpinBox)):
+                    snap[key] = w.value()
+                elif isinstance(w, QComboBox):
+                    snap[key] = w.currentIndex()
+                elif isinstance(w, QCheckBox):
+                    snap[key] = w.isChecked()
+                elif isinstance(w, QLineEdit):
+                    snap[key] = w.text()
+            except Exception:
+                pass
+        self._factory_defaults = snap
+
+    def _reset_defaults(self):
+        btn = QMessageBox.question(
+            self, "Reset inputs",
+            "Reset every input, table and saved value of the Cable Lay "
+            "Simulator to its factory default?")
+        if btn != QMessageBox.Yes:
+            return
+        self._initializing = True
+        try:
+            for key, w in self._registry:
+                if key not in self._factory_defaults:
+                    continue
+                val = self._factory_defaults[key]
+                try:
+                    if isinstance(w, (QDoubleSpinBox, QSpinBox)):
+                        w.setValue(val)
+                    elif isinstance(w, QComboBox):
+                        w.setCurrentIndex(int(val))
+                    elif isinstance(w, QCheckBox):
+                        w.setChecked(bool(val))
+                    elif isinstance(w, QLineEdit):
+                        w.setText(str(val))
+                except Exception:
+                    pass
+            self.profile_table.setRowCount(0)
+            self.current_table.setRowCount(0)
+            self.asm_table.setRowCount(0)
+            self._asm_add_segment()
+            self._grid_bathy = None
+            self._grid_origin = None
+            self._picked_centre = None
+            self._origin_set = False
+            self.raster_status.setText("No grid sampled.")
+            self.settings.clear()
+        finally:
+            self._initializing = False
+        self._apply_scenario_choice()
+        self._on_bathy_mode()
+        self._on_scenario_changed()
+        self._update_solve_value_units()
+        self._update_origin_label()
+        self._set_dirty(True)
 
     def _restore_settings(self):
         for key, w in self._registry:

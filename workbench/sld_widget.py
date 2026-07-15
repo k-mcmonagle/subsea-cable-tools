@@ -53,17 +53,24 @@ class KpAxisItem(pg.AxisItem):
     def __init__(self):
         super().__init__(orientation="top")
         self.mapping = None  # Callable[[cable_m], Optional[kp_km]]
+        self.setStyle(textFillLimits=[(0, 0.7)])
 
     def tickStrings(self, values, scale, spacing):
         if self.mapping is None:
             return ["" for _ in values]
         out = []
+        previous = None
         for value in values:
             try:
                 kp = self.mapping(value * 1000.0)
             except Exception:
                 kp = None
-            out.append("" if kp is None else f"{kp:.2f}")
+            label = "" if kp is None else f"{kp:.2f}"
+            if label and label == previous:
+                label = ""
+            if label:
+                previous = label
+            out.append(label)
         return out
 
 

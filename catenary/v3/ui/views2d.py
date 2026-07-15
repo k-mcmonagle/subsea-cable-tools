@@ -72,6 +72,8 @@ class ProfileView:
     def __init__(self, bathy_lookup=None):
         self.figure, self.canvas = make_canvas()
         self._bathy_lookup = bathy_lookup  # callable (x_arr, y_arr) -> depth_arr
+        self._equal_aspect = True
+        self._last_scene = None
 
     def widget(self):
         return self.canvas
@@ -79,7 +81,15 @@ class ProfileView:
     def set_bathy_lookup(self, fn):
         self._bathy_lookup = fn
 
+    def set_equal_aspect(self, on: bool) -> None:
+        on = bool(on)
+        if on == self._equal_aspect:
+            return
+        self._equal_aspect = on
+        self.update_scene(self._last_scene)
+
     def update_scene(self, scene) -> None:
+        self._last_scene = scene
         self.figure.clear()
         ax = self.figure.add_subplot(111)
         if scene is None or not scene.cables:
@@ -112,6 +122,10 @@ class ProfileView:
         ax.axhline(0.0, color="#7fb2d9", linewidth=1.0, linestyle=":")
         ax.set_xlabel("Distance along cable (m)")
         ax.set_ylabel("Elevation (m, 0 = sea surface)")
+        try:
+            ax.set_aspect("equal" if self._equal_aspect else "auto")
+        except Exception:
+            pass
         try:
             ax.legend()
         except Exception:

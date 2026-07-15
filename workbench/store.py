@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -31,10 +32,15 @@ from ..processing.cable_lay_parsers import (
     open_gpkg_layer,
     write_layer_to_gpkg,
 )
+from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_LONG_LONG
 from . import schema
 
 PROJECT_SCOPE = "SubseaCableTools"
 PROJECT_KEY_GPKG = "workbench_gpkg"
+
+
+class WorkbenchReadOnlyError(ValueError):
+    """Raised when code tries to mutate an issued workbench entity."""
 
 
 def project_gpkg_path(project: Optional[QgsProject] = None) -> Optional[str]:
@@ -162,6 +168,74 @@ class WorkbenchStore:
         rows.append({"key": key, "value": value})
         self._write_table_rows(schema.TABLE_META, schema.META_FIELDS, rows)
 
+    # -- routes ---------------------------------------------------------------
+    def list_routes(self) -> List[Dict]:
+        return sorted(self.read_table(schema.TABLE_ROUTE), key=lambda r: (r.get("name") or ""))
+
+    def get_route(self, route_id: str) -> Optional[Dict]:
+        return next(
+            (r for r in self.read_table(schema.TABLE_ROUTE) if r.get("route_id") == route_id),
+            None,
+        )
+
+    def create_route(self, name: str, system_id: str = "", description: str = "",
+                     notes: str = "") -> str:
+        now = schema.utc_now_iso()
+        route_id = schema.new_id()
+        self.upsert_rows(schema.TABLE_ROUTE, [{
+            "route_id": route_id,
+            "name": name,
+            "system_id": system_id or "",
+            "description": description or "",
+            "created_utc": now,
+            "modified_utc": now,
+            "notes": notes or "",
+        }])
+        return route_id
+
+    def save_route(self, row: Dict) -> None:
+        row = dict(row)
+        row.setdefault("route_id", schema.new_id())
+        row.setdefault("created_utc", schema.utc_now_iso())
+        row["modified_utc"] = schema.utc_now_iso()
+        self.upsert_rows(schema.TABLE_ROUTE, [row])
+
+    def delete_route(self, route_id: str) -> None:
+        if self.revisions_of_route(route_id):
+            raise ValueError("Cannot delete a route while it still has RPL revisions.")
+        self.delete_rows(schema.TABLE_ROUTE, [route_id])
+
+    def assign_route_to_system(self, route_id: str, system_id: str = "") -> None:
+        row = self.get_route(route_id)
+        if row is None:
+            raise ValueError("Route not found.")
+        row["system_id"] = system_id or ""
+        self.save_route(row)
+
+    def revisions_of_route(self, route_id: str) -> List[Dict]:
+        rows = [r for r in self.read_table(schema.TABLE_RPL) if r.get("route_id") == route_id]
+        rows.sort(key=lambda r: (r.get("created_utc") or "", r.get("name") or ""))
+        return rows
+
+    def latest_revision(self, route_id: str) -> Optional[Dict]:
+        revisions = self.revisions_of_route(route_id)
+        return revisions[-1] if revisions else None
+
+    def supersedes_chain(self, table: str, row_id: str) -> List[Dict]:
+        key = schema.TABLE_KEYS[table]
+        rows = {str(r.get(key)): r for r in self.read_table(table)}
+        chain: List[Dict] = []
+        seen = set()
+        cursor = str(row_id or "")
+        while cursor and cursor not in seen:
+            seen.add(cursor)
+            row = rows.get(cursor)
+            if row is None:
+                break
+            chain.append(row)
+            cursor = str(row.get("supersedes_id") or "")
+        return chain
+
     # -- assemblies -------------------------------------------------------------
     def list_assemblies(self) -> List[Dict]:
         return sorted(self.read_table(schema.TABLE_ASSEMBLY), key=lambda r: (r.get("name") or ""))
@@ -180,8 +254,17 @@ class WorkbenchStore:
     def save_assembly(self, header: Dict, items: Sequence[Dict]) -> None:
         """Upsert an assembly header and replace its items."""
         assembly_id = header["assembly_id"]
-        header = dict(header)
+        existing, _ = self.get_assembly(assembly_id)
+        if _is_issued(existing):
+            raise WorkbenchReadOnlyError("Issued assemblies are read-only. Create a new revision to edit.")
+        merged = dict(existing or {})
+        merged.update(dict(header))
+        header = merged
         header.setdefault("created_utc", schema.utc_now_iso())
+        header.setdefault("rev_label", schema.next_rev_label([]))
+        header.setdefault("status", schema.STATUS_DRAFT)
+        header.setdefault("supersedes_id", "")
+        header.setdefault("issued_utc", "")
         header["modified_utc"] = schema.utc_now_iso()
         self.upsert_rows(schema.TABLE_ASSEMBLY, [header])
         others = [
@@ -216,8 +299,19 @@ class WorkbenchStore:
         return next((r for r in self.read_table(schema.TABLE_RPL) if r.get("rpl_id") == rpl_id), None)
 
     def save_rpl(self, row: Dict) -> None:
-        row = dict(row)
+        existing = self.get_rpl(row.get("rpl_id") or "")
+        if _is_issued(existing):
+            raise WorkbenchReadOnlyError("Issued RPL revisions are read-only. Create a new revision to edit.")
+        merged = dict(existing or {})
+        merged.update(dict(row))
+        row = merged
         row.setdefault("created_utc", schema.utc_now_iso())
+        if not row.get("route_id"):
+            row["route_id"] = self.create_route(row.get("name") or "Route")
+        row.setdefault("rev_label", schema.next_rev_label([]))
+        row.setdefault("status", schema.STATUS_DRAFT)
+        row.setdefault("supersedes_id", "")
+        row.setdefault("issued_utc", "")
         row["modified_utc"] = schema.utc_now_iso()
         self.upsert_rows(schema.TABLE_RPL, [row])
 
@@ -244,6 +338,154 @@ class WorkbenchStore:
             return json.loads(row["depth_source_config"])
         except (ValueError, TypeError):
             return {}
+
+    def new_rpl_revision(self, rpl_id: str, rev_label: Optional[str] = None) -> str:
+        old = self.get_rpl(rpl_id)
+        if old is None:
+            raise ValueError("RPL not found.")
+        route_id = old.get("route_id")
+        if not route_id or self.get_route(route_id) is None:
+            route_id = self.create_route(old.get("name") or "Route")
+            old["route_id"] = route_id
+            self.write_table(schema.TABLE_RPL, [
+                old if r.get("rpl_id") == rpl_id else r
+                for r in self.read_table(schema.TABLE_RPL)
+            ])
+        route = self.get_route(route_id) or {"name": old.get("name") or "Route"}
+        if not rev_label:
+            rev_label = schema.next_rev_label(self.revisions_of_route(route_id))
+
+        new_id = schema.new_id()
+        new_name = f"{route.get('name') or old.get('name') or 'Route'} {rev_label}".strip()
+        existing_layers = _registered_layer_names(self.read_table(schema.TABLE_RPL))
+        points_layer = schema.unique_layer_name(
+            existing_layers, schema.rpl_points_layer_name(new_name))
+        existing_layers.add(points_layer)
+        lines_layer = schema.unique_layer_name(
+            existing_layers, schema.rpl_lines_layer_name(new_name))
+
+        self.copy_spatial_layer(old.get("points_layer") or "", points_layer, {"rpl_id": new_id})
+        self.copy_spatial_layer(old.get("lines_layer") or "", lines_layer, {"rpl_id": new_id})
+
+        now = schema.utc_now_iso()
+        new_row = dict(old)
+        new_row.update({
+            "rpl_id": new_id,
+            "name": new_name,
+            "route_id": route_id,
+            "rev_label": rev_label,
+            "status": schema.STATUS_DRAFT,
+            "supersedes_id": rpl_id,
+            "issued_utc": "",
+            "points_layer": points_layer,
+            "lines_layer": lines_layer,
+            "created_utc": now,
+            "modified_utc": now,
+        })
+        self.upsert_rows(schema.TABLE_RPL, [new_row])
+
+        fit_rows = []
+        for fit in self.list_fits(rpl_id=rpl_id):
+            copied = dict(fit)
+            copied["fit_id"] = schema.new_id()
+            copied["rpl_id"] = new_id
+            copied["created_utc"] = now
+            fit_rows.append(copied)
+        if fit_rows:
+            self.upsert_rows(schema.TABLE_FIT, fit_rows)
+
+        old_component = self.component_for_subject(rpl_id) or {}
+        self.save_component(
+            {
+                "component_id": schema.new_id(),
+                "kind": "rpl",
+                "subject_id": new_id,
+                "name": new_name,
+                "system_id": old_component.get("system_id") or "",
+            },
+            port_labels=["A", "B"],
+        )
+        return new_id
+
+    def new_assembly_revision(self, assembly_id: str, rev_label: Optional[str] = None) -> str:
+        header, items = self.get_assembly(assembly_id)
+        if header is None:
+            raise ValueError("Assembly not found.")
+        base_name = _strip_rev_label(header.get("name") or "Assembly")
+        if not rev_label:
+            related = [
+                a for a in self.list_assemblies()
+                if _strip_rev_label(a.get("name") or "") == base_name
+            ]
+            rev_label = schema.next_rev_label(related)
+        new_id = schema.new_id()
+        now = schema.utc_now_iso()
+        new_header = dict(header)
+        new_header.update({
+            "assembly_id": new_id,
+            "name": f"{base_name} {rev_label}".strip(),
+            "rev_label": rev_label,
+            "status": schema.STATUS_DRAFT,
+            "supersedes_id": assembly_id,
+            "issued_utc": "",
+            "created_utc": now,
+            "modified_utc": now,
+        })
+        new_items = []
+        for seq, item in enumerate(items):
+            copied = dict(item)
+            copied["item_id"] = schema.new_id()
+            copied["assembly_id"] = new_id
+            copied["seq"] = seq
+            new_items.append(copied)
+        self.save_assembly(new_header, new_items)
+        return new_id
+
+    def copy_spatial_layer(self, src: str, dst: str, overrides: Optional[Dict] = None) -> str:
+        layer = self.open_layer(src)
+        if layer is None:
+            raise ValueError(f"Layer '{src}' not found.")
+        overrides = overrides or {}
+        specs = _field_specs_from_layer(layer)
+        rows: List[Dict] = []
+        field_names = [field.name() for field in layer.fields() if field.name().lower() != "fid"]
+        for feature in layer.getFeatures():
+            row = {name: feature[name] for name in field_names}
+            row.update(overrides)
+            geom = feature.geometry()
+            row[WKT_KEY] = geom.asWkt() if geom is not None and not geom.isEmpty() else None
+            rows.append(_normalise_row(row))
+        self.write_spatial_layer(dst, specs, layer.wkbType(), rows)
+        return dst
+
+    def issue_rpl(self, rpl_id: str) -> None:
+        self._set_status(schema.TABLE_RPL, rpl_id, schema.STATUS_ISSUED)
+
+    def reopen_rpl(self, rpl_id: str) -> None:
+        self._set_status(schema.TABLE_RPL, rpl_id, schema.STATUS_DRAFT)
+
+    def issue_assembly(self, assembly_id: str) -> None:
+        self._set_status(schema.TABLE_ASSEMBLY, assembly_id, schema.STATUS_ISSUED)
+
+    def reopen_assembly(self, assembly_id: str) -> None:
+        self._set_status(schema.TABLE_ASSEMBLY, assembly_id, schema.STATUS_DRAFT)
+
+    def _set_status(self, table: str, row_id: str, status: str) -> None:
+        key = schema.TABLE_KEYS[table]
+        rows = self.read_table(table)
+        now = schema.utc_now_iso()
+        changed = False
+        for row in rows:
+            if row.get(key) == row_id:
+                row["status"] = status
+                row["issued_utc"] = now if status == schema.STATUS_ISSUED else ""
+                if "modified_utc" in row:
+                    row["modified_utc"] = now
+                changed = True
+                break
+        if not changed:
+            raise ValueError("Entity not found.")
+        self.write_table(table, rows)
 
     # -- fits ---------------------------------------------------------------------
     def list_fits(self, rpl_id: Optional[str] = None, assembly_id: Optional[str] = None) -> List[Dict]:
@@ -430,6 +672,34 @@ class WorkbenchStore:
     def list_systems(self) -> List[Dict]:
         return self.read_table(schema.TABLE_SYSTEM)
 
+    def create_system(self, name: str, notes: str = "") -> str:
+        system_id = schema.new_id()
+        self.upsert_rows(schema.TABLE_SYSTEM, [{
+            "system_id": system_id,
+            "name": name,
+            "notes": notes or "",
+        }])
+        return system_id
+
+    def save_system(self, row: Dict) -> None:
+        row = dict(row)
+        row.setdefault("system_id", schema.new_id())
+        self.upsert_rows(schema.TABLE_SYSTEM, [row])
+
+    def delete_system(self, system_id: str) -> None:
+        # wb_system is shared by the manual route grouping and the topology
+        # assignment cache. Clear manual route references; topology code may
+        # recreate derived rows later if the port graph still needs them.
+        routes = self.read_table(schema.TABLE_ROUTE)
+        changed = False
+        for route in routes:
+            if route.get("system_id") == system_id:
+                route["system_id"] = ""
+                changed = True
+        if changed:
+            self.write_table(schema.TABLE_ROUTE, routes)
+        self.delete_rows(schema.TABLE_SYSTEM, [system_id])
+
     def save_component(self, row: Dict, port_labels: Sequence[str] = ()) -> str:
         """Upsert a component; optionally create its ports if it has none."""
         row = dict(row)
@@ -585,10 +855,83 @@ def _migrate_1_to_2(store: "WorkbenchStore") -> None:
             store._write_table_rows(table, schema.REGISTRY_TABLES[table], [])
 
 
+def _migrate_2_to_3(store: "WorkbenchStore") -> None:
+    """v2 -> v3: route table plus lightweight RPL/assembly revision lineage."""
+    rpls = store.read_table(schema.TABLE_RPL)
+    routes: List[Dict] = []
+    now = schema.utc_now_iso()
+    for rpl in rpls:
+        route_id = rpl.get("route_id") or schema.new_id()
+        component = store.component_for_subject(rpl.get("rpl_id") or "")
+        route = {
+            "route_id": route_id,
+            "name": rpl.get("name") or "Route",
+            "system_id": (component or {}).get("system_id") or "",
+            "description": "",
+            "created_utc": rpl.get("created_utc") or now,
+            "modified_utc": rpl.get("modified_utc") or now,
+            "notes": "",
+        }
+        routes.append(route)
+        rpl["route_id"] = route_id
+        rpl["rev_label"] = rpl.get("rev_label") or "Rev 1"
+        rpl["status"] = rpl.get("status") or schema.STATUS_DRAFT
+        rpl["supersedes_id"] = rpl.get("supersedes_id") or ""
+        rpl["issued_utc"] = rpl.get("issued_utc") or ""
+
+    assemblies = store.read_table(schema.TABLE_ASSEMBLY)
+    for assembly in assemblies:
+        assembly["rev_label"] = assembly.get("rev_label") or "Rev 1"
+        assembly["status"] = assembly.get("status") or schema.STATUS_DRAFT
+        assembly["supersedes_id"] = assembly.get("supersedes_id") or ""
+        assembly["issued_utc"] = assembly.get("issued_utc") or ""
+
+    store.write_table(schema.TABLE_ROUTE, routes)
+    store.write_table(schema.TABLE_RPL, rpls)
+    store.write_table(schema.TABLE_ASSEMBLY, assemblies)
+
+
 # Maps a starting schema version to the function that upgrades it by one step.
 MIGRATIONS = {
     1: _migrate_1_to_2,
+    2: _migrate_2_to_3,
 }
+
+
+def _is_issued(row: Optional[Dict]) -> bool:
+    return bool(row and row.get("status") == schema.STATUS_ISSUED)
+
+
+def _registered_layer_names(rpl_rows: Sequence[Dict]) -> set:
+    names = set()
+    for row in rpl_rows:
+        if row.get("points_layer"):
+            names.add(row.get("points_layer"))
+        if row.get("lines_layer"):
+            names.add(row.get("lines_layer"))
+    return names
+
+
+def _strip_rev_label(name: str) -> str:
+    stripped = re.sub(r"\s+Rev\s+\d+\s*$", "", name or "", flags=re.IGNORECASE).strip()
+    return stripped or (name or "Assembly")
+
+
+def _field_specs_from_layer(layer: QgsVectorLayer) -> List[Tuple[str, str]]:
+    specs: List[Tuple[str, str]] = []
+    for field in layer.fields():
+        name = field.name()
+        if name.lower() == "fid":
+            continue
+        field_type = field.type()
+        if field_type == FIELD_TYPE_DOUBLE:
+            type_str = "float"
+        elif field_type in (FIELD_TYPE_INT, FIELD_TYPE_LONG_LONG):
+            type_str = "int"
+        else:
+            type_str = "str"
+        specs.append((name, type_str))
+    return specs
 
 
 def _finding(rule_id: str, severity: str, message: str, object_type: str, object_id: str) -> Dict:

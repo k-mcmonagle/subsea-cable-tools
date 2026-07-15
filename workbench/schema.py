@@ -10,6 +10,7 @@ Table overview (all registry tables are geometryless GPKG layers):
 - wb_meta            key/value store (schema_version, created_utc)
 - wb_assembly        assembly headers (cable or rigging)
 - wb_assembly_item   ordered sections/bodies of an assembly
+- wb_route           route identity grouping RPL revisions
 - wb_rpl             RPL registry (points/lines layer names + settings)
 - wb_fit             assembly <-> RPL fit anchors
 - wb_event_rule      RPL event classification rules (body|geographic|installation)
@@ -30,12 +31,13 @@ import re
 import time
 from typing import Dict, List, Tuple
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Registry table names ------------------------------------------------------
 TABLE_META = "wb_meta"
 TABLE_ASSEMBLY = "wb_assembly"
 TABLE_ASSEMBLY_ITEM = "wb_assembly_item"
+TABLE_ROUTE = "wb_route"
 TABLE_RPL = "wb_rpl"
 TABLE_FIT = "wb_fit"
 TABLE_EVENT_RULE = "wb_event_rule"
@@ -66,6 +68,10 @@ ASSEMBLY_FIELDS: List[FieldSpec] = [
     ("total_cable_len_m", "float"),
     ("created_utc", "str"),
     ("modified_utc", "str"),
+    ("rev_label", "str"),
+    ("status", "str"),
+    ("supersedes_id", "str"),
+    ("issued_utc", "str"),
 ]
 
 # One table for both sections and bodies; ``kind`` discriminates and ``seq``
@@ -95,6 +101,19 @@ ASSEMBLY_ITEM_FIELDS: List[FieldSpec] = [
     ("remarks", "str"),
 ]
 
+ROUTE_FIELDS: List[FieldSpec] = [
+    ("route_id", "str"),
+    ("name", "str"),
+    # Manual workbench grouping. wb_system is also populated by topology
+    # assignment for the Systems tab, so this is deliberately a lightweight
+    # reference rather than derived membership.
+    ("system_id", "str"),
+    ("description", "str"),
+    ("created_utc", "str"),
+    ("modified_utc", "str"),
+    ("notes", "str"),
+]
+
 RPL_FIELDS: List[FieldSpec] = [
     ("rpl_id", "str"),
     ("name", "str"),
@@ -107,6 +126,11 @@ RPL_FIELDS: List[FieldSpec] = [
     ("created_utc", "str"),
     ("modified_utc", "str"),
     ("notes", "str"),
+    ("route_id", "str"),
+    ("rev_label", "str"),
+    ("status", "str"),
+    ("supersedes_id", "str"),
+    ("issued_utc", "str"),
 ]
 
 FIT_FIELDS: List[FieldSpec] = [
@@ -217,6 +241,7 @@ REGISTRY_TABLES: Dict[str, List[FieldSpec]] = {
     TABLE_META: META_FIELDS,
     TABLE_ASSEMBLY: ASSEMBLY_FIELDS,
     TABLE_ASSEMBLY_ITEM: ASSEMBLY_ITEM_FIELDS,
+    TABLE_ROUTE: ROUTE_FIELDS,
     TABLE_RPL: RPL_FIELDS,
     TABLE_FIT: FIT_FIELDS,
     TABLE_EVENT_RULE: EVENT_RULE_FIELDS,
@@ -234,6 +259,7 @@ REGISTRY_TABLES: Dict[str, List[FieldSpec]] = {
 TABLE_KEYS: Dict[str, str] = {
     TABLE_ASSEMBLY: "assembly_id",
     TABLE_ASSEMBLY_ITEM: "item_id",
+    TABLE_ROUTE: "route_id",
     TABLE_RPL: "rpl_id",
     TABLE_FIT: "fit_id",
     TABLE_EVENT_RULE: "rule_id",
@@ -332,6 +358,9 @@ STATUS_EXCLUDED = "excluded"
 
 DEFAULT_ASSESSMENT_METHODS: List[str] = ["plough", "jet", "surface"]
 
+STATUS_DRAFT = "draft"
+STATUS_ISSUED = "issued"
+
 # Seed rule-set template. Only kinds that need no project-specific layer are
 # seeded (depth/slope thresholds); the user adds proximity/soil/table rules.
 # Each entry: (name, kind, action, risk_level, methods, config_dict).
@@ -372,6 +401,28 @@ def fit_sections_layer_name(fit_name: str) -> str:
 
 def assessment_ranges_layer_name(assessment_name: str) -> str:
     return f"wb_assess_{sanitize_slug(assessment_name)}_ranges"
+
+
+def next_rev_label(existing) -> str:
+    """Return the next friendly revision label from existing labels/rows."""
+    max_n = 0
+    for value in existing or []:
+        label = value.get("rev_label") if isinstance(value, dict) else value
+        match = re.search(r"\brev\s*(\d+)\b", str(label or ""), re.IGNORECASE)
+        if match:
+            max_n = max(max_n, int(match.group(1)))
+    return f"Rev {max_n + 1}"
+
+
+def unique_layer_name(existing, base: str) -> str:
+    """Return ``base`` unless it already exists, then append ``_2`` etc."""
+    existing_names = {str(name) for name in (existing or []) if name}
+    if base not in existing_names:
+        return base
+    index = 2
+    while f"{base}_{index}" in existing_names:
+        index += 1
+    return f"{base}_{index}"
 
 
 def default_gpkg_path(project_path: str, project_title: str = "") -> str:
