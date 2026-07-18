@@ -3,7 +3,7 @@
 
 from datetime import datetime, timedelta
 
-from ..planner.timeline_engine import TaskSpec, compute_schedule, position_at
+from ..planner.timeline_engine import TaskSpec, compute_fuel, compute_schedule, position_at
 
 
 def _result(name, ok, detail=""):
@@ -97,11 +97,46 @@ def test_position_fraction_reverse_and_hold():
     return _result("position fraction/reverse/clamp/hold", ok)
 
 
+def test_fuel_burn_bunker_and_warnings():
+    anchor = datetime(2026, 1, 1)
+    specs = [
+        TaskSpec("t", 0, "Transit out", "v", duration_hours=24, fuel_mode="transit"),
+        TaskSpec("l", 1, "Lay", "v", duration_hours=12, fuel_mode="dp",
+                 predecessor_task_id="t"),
+        TaskSpec("p", 2, "Port call", "v", duration_hours=24, fuel_mode="port",
+                 bunker_amount=100.0, predecessor_task_id="l"),
+        TaskSpec("x", 3, "Long DP", "v", duration_hours=240, fuel_mode="dp",
+                 predecessor_task_id="p"),
+        TaskSpec("n", 4, "Untracked", "v", duration_hours=6,
+                 predecessor_task_id="x"),
+    ]
+    resources = [{
+        "resource_id": "v", "fuel_unit": "t", "fuel_rate_transit": 24.0,
+        "fuel_rate_dp": 12.0, "fuel_rate_anchor": 4.0, "fuel_rate_port": 2.0,
+        "fuel_start": 40.0, "fuel_cost_per_unit": 500.0,
+    }]
+    result = compute_schedule(anchor, specs)
+    fuel = compute_fuel(result, {spec.task_id: spec for spec in specs}, resources)
+    lane = fuel.by_resource["v"]
+    ok = abs(fuel.by_task["t"].burn - 24.0) < 1e-9         # 24 h at 24 t/24 h
+    ok = ok and abs(fuel.by_task["l"].burn - 6.0) < 1e-9   # 12 h at 12 t/24 h
+    # ROB after port call: 40 - 24 - 6 - 2, then +100 bunkered at finish.
+    ok = ok and abs(fuel.by_task["p"].rob_end - 108.0) < 1e-9
+    ok = ok and abs(fuel.by_task["n"].burn) < 1e-9         # no fuel mode -> no burn
+    ok = ok and abs(lane.total_bunker - 100.0) < 1e-9
+    ok = ok and abs(lane.rob_end - (108.0 - 120.0)) < 1e-9
+    ok = ok and abs(lane.min_rob - -12.0) < 1e-9
+    ok = ok and len(lane.warnings) == 1 and "Long DP" in lane.warnings[0]
+    ok = ok and abs(lane.cost - (24 + 6 + 2 + 120) * 500.0) < 1e-9
+    return _result("fuel burn, bunkering, ROB warning, cost", ok)
+
+
 def run_all():
     return [
         test_duration_resolution(), test_dependencies_resources_and_lag(),
         test_resource_starts_cross_vessel_links_and_outline_summary(),
         test_cycle_fallback(), test_position_fraction_reverse_and_hold(),
+        test_fuel_burn_bunker_and_warnings(),
     ]
 
 

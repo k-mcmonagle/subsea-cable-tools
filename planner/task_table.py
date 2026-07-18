@@ -6,18 +6,22 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime
 
-from qgis.PyQt.QtCore import Qt, pyqtSignal
-from qgis.PyQt.QtGui import QBrush, QColor
+from qgis.PyQt.QtCore import QSettings, Qt, pyqtSignal
+from qgis.PyQt.QtGui import QBrush, QColor, QIcon, QPixmap
 from qgis.PyQt.QtWidgets import (
-    QComboBox, QPushButton, QTableWidget, QTableWidgetItem, QTableWidgetSelectionRange,
+    QComboBox, QMenu, QPushButton, QTableWidget, QTableWidgetItem,
+    QTableWidgetSelectionRange,
 )
 
 from ..qgis_compat import (
-    DRAG_DROP_MODE_INTERNAL_MOVE, DROP_ACTION_MOVE, ITEM_DATA_USER_ROLE,
+    CONTEXT_MENU_POLICY_CUSTOM,
+    DRAG_DROP_MODE_INTERNAL_MOVE, DROP_ACTION_IGNORE, DROP_ACTION_MOVE,
+    ITEM_DATA_USER_ROLE,
     ITEM_FLAG_EDITABLE, SELECTION_BEHAVIOR_SELECT_ROWS, SELECTION_MODE_EXTENDED,
+    qt_exec,
 )
 from . import schema
-from .timeline_engine import TaskSpec, compute_schedule
+from .timeline_engine import TaskSpec, compute_fuel, compute_schedule
 
 
 class TaskTableWidget(QTableWidget):
@@ -25,6 +29,7 @@ class TaskTableWidget(QTableWidget):
     scheduleChanged = pyqtSignal(object)
     linkRequested = pyqtSignal(str)
     taskSelected = pyqtSignal(str)
+    zoomRequested = pyqtSignal(str)
     historyStateChanged = pyqtSignal(bool, bool)
 
     COL_NUMBER = 0
@@ -37,12 +42,17 @@ class TaskTableWidget(QTableWidget):
     COL_DISTANCE = 7
     COL_SPEED = 8
     COL_DIRECTION = 9
-    COL_START = 10
-    COL_FINISH = 11
-    COL_NOTES = 12
+    COL_FUEL_MODE = 10
+    COL_BUNKER = 11
+    COL_START = 12
+    COL_FINISH = 13
+    COL_FUEL_USED = 14
+    COL_ROB = 15
+    COL_NOTES = 16
 
     HEADERS = ["#", "Task", "Description", "Resource", "Duration (h)", "Predecessor",
-               "Linked feature", "Distance (nm)", "Speed (kn)", "Dir", "Start", "Finish",
+               "Linked feature", "Distance (nm)", "Speed (kn)", "Dir", "Fuel", "Bunker",
+               "Start", "Finish", "Fuel used", "Fuel ROB",
                "Notes"]
 
     def __init__(self, resolver, parent=None):
@@ -55,12 +65,27 @@ class TaskTableWidget(QTableWidget):
             "using the project ellipsoid/CRS settings.")
         self.horizontalHeaderItem(self.COL_DISTANCE).setToolTip(
             "Read-only measured route distance in nautical miles (1 nm = 1,852 m).")
+        self.horizontalHeaderItem(self.COL_FUEL_MODE).setToolTip(
+            "Which of the assigned resource's fuel rates (per 24 h) this task burns: "
+            "Transit, DP, Anchor, or Port. '(none)' burns no fuel. Rates are set in "
+            "Resources….")
+        self.horizontalHeaderItem(self.COL_BUNKER).setToolTip(
+            "Fuel taken on during this task (e.g. bunkering at a port call), in the "
+            "resource's fuel unit. Credited to remaining fuel at the task finish.")
+        self.horizontalHeaderItem(self.COL_FUEL_USED).setToolTip(
+            "Read-only fuel burned by this task, in the resource's fuel unit. "
+            "Summary rows show the total for their group.")
+        self.horizontalHeaderItem(self.COL_ROB).setToolTip(
+            "Read-only fuel remaining on board at the task finish "
+            "(start fuel − burn + bunkers). Red when the plan runs out of fuel.")
         self.resolver = resolver
         self.rows = []
         self.resources = []
         self.collapsed_groups = set()
+        self._active_task_ids = set()
         self.anchor = datetime.now().replace(second=0, microsecond=0)
         self.schedule = compute_schedule(self.anchor, [])
+        self.fuel = compute_fuel(self.schedule, {}, [])
         self._muted = False
         self._undo_stack = []
         self._redo_stack = []
@@ -86,6 +111,28 @@ class TaskTableWidget(QTableWidget):
         self.setColumnWidth(self.COL_TASK, 160)
         self.setColumnWidth(self.COL_DESCRIPTION, 200)
         self.setColumnWidth(self.COL_FEATURE, 180)
+        header = self.horizontalHeader()
+        header.setSectionsMovable(True)
+        header.setContextMenuPolicy(CONTEXT_MENU_POLICY_CUSTOM)
+        header.customContextMenuRequested.connect(self._header_menu)
+        # Widths, order, and hidden columns persist per user; the key embeds the
+        # column count so stale layouts are ignored when columns change.
+        self._header_key = ("subsea_cable_tools/planner/task_table_header_%d"
+                            % len(self.HEADERS))
+        self._header_muted = False
+        self._user_layout = False
+        self._default_header_state = header.saveState()
+        saved_state = QSettings().value(self._header_key)
+        if saved_state is not None:
+            self._header_muted = True
+            try:
+                self._user_layout = bool(header.restoreState(saved_state))
+            except TypeError:
+                self._user_layout = False
+            finally:
+                self._header_muted = False
+        header.sectionResized.connect(self._header_changed)
+        header.sectionMoved.connect(self._header_changed)
 
     def set_plan(self, rows, resources, anchor):
         self.rows = [dict(row) for row in rows]
@@ -100,6 +147,8 @@ class TaskTableWidget(QTableWidget):
         self.collapsed_groups.clear()
         self.clear_history()
         self._rebuild()
+        if not self._user_layout:
+            self._auto_size_columns()
 
     def set_history_hooks(self, snapshot_provider=None, snapshot_restorer=None):
         """Add optional state hooks so the dock can include owned geometries."""
@@ -171,7 +220,8 @@ class TaskTableWidget(QTableWidget):
             "description": "", "is_phase": 0, "outline_level": 0,
             "resource_id": resource_id, "duration_mode": "manual",
             "duration_hours": 1.0, "predecessor_task_id": "", "lag_hours": 0.0,
-            "speed_knots": default_speed, "direction": "forward", "layer_id": "",
+            "speed_knots": default_speed, "direction": "forward",
+            "fuel_mode": "", "bunker_amount": None, "layer_id": "",
             "layer_source": "", "layer_name": "", "feature_id": "",
             "feature_label": "", "geom_kind": "", "linked_ref_json": "",
             "created_utc": now, "modified_utc": now, "notes": "",
@@ -218,6 +268,26 @@ class TaskTableWidget(QTableWidget):
         self._renumber()
         self._rebuild()
         self.selectRow(len(self.rows) - 1)
+        self._emit_change()
+
+    def insert_tasks(self, rows, at=None):
+        """Insert task rows at ``at`` (default: end), indented like their new siblings."""
+        if not rows:
+            return
+        self.checkpoint()
+        at = len(self.rows) if at is None else min(max(0, int(at)), len(self.rows))
+        prepared = []
+        for row in rows:
+            copied = dict(row)
+            copied["is_phase"] = 0
+            copied.setdefault("outline_level", 0)
+            prepared.append(copied)
+        self._rebase_outline(prepared, self.rows, at)
+        self.rows = self.rows[:at] + prepared + self.rows[at:]
+        self._normalise_outline()
+        self._renumber()
+        self._rebuild()
+        self._select_rows(range(at, at + len(prepared)))
         self._emit_change()
 
     def replace_tasks(self, rows, selected_row=0, record_history=True):
@@ -316,6 +386,10 @@ class TaskTableWidget(QTableWidget):
             target = len(self.rows)
         elif position.y() > self.visualRect(target_index).center().y():
             target += 1
+        # A drop just below a collapsed summary points between its hidden
+        # children; land after the whole hidden block instead of inside it.
+        while target < len(self.rows) and self.isRowHidden(target):
+            target += 1
         moving = [self.rows[index] for index in indices]
         moving_ids = {row.get("task_id") for row in moving}
         remaining = [row for row in self.rows if row.get("task_id") not in moving_ids]
@@ -325,13 +399,32 @@ class TaskTableWidget(QTableWidget):
             event.ignore()
             return
         self.checkpoint()
+        self._rebase_outline(moving, remaining, insert_at)
         self.rows = remaining[:insert_at] + moving + remaining[insert_at:]
         self._normalise_outline()
         self._renumber()
         self._rebuild()
         self._select_rows(range(insert_at, insert_at + len(moving)))
         self._emit_change()
-        event.acceptProposedAction()
+        # Accepting the proposed MoveAction would make QAbstractItemView's
+        # InternalMove cleanup remove the re-selected rows after this handler,
+        # so the dropped tasks vanished from the view. The move is already done
+        # above; report IgnoreAction so Qt performs no removal of its own.
+        event.setDropAction(DROP_ACTION_IGNORE)
+        event.accept()
+
+    @staticmethod
+    def _rebase_outline(moving, remaining, insert_at):
+        """Indent the dropped block to match the row it will sit above."""
+        if insert_at < len(remaining):
+            base = int(remaining[insert_at].get("outline_level") or 0)
+        elif remaining:
+            base = int(remaining[-1].get("outline_level") or 0)
+        else:
+            base = 0
+        shift = base - int(moving[0].get("outline_level") or 0)
+        for row in moving:
+            row["outline_level"] = max(0, int(row.get("outline_level") or 0) + shift)
 
     def _include_summary_descendants(self, indices):
         expanded = set(indices)
@@ -406,6 +499,8 @@ class TaskTableWidget(QTableWidget):
                 geom_kind="" if summary else row.get("geom_kind") or "",
                 route_length_m=route_length, is_phase=summary,
                 outline_level=int(row.get("outline_level") or 0),
+                fuel_mode="" if summary else row.get("fuel_mode") or "",
+                bunker_amount=0.0 if summary else _float(row.get("bunker_amount")),
             ))
         return specs
 
@@ -455,13 +550,23 @@ class TaskTableWidget(QTableWidget):
                     self._set_text(
                         row_index, self.COL_SPEED, _display_number(task.get("speed_knots")))
                 self._direction_combo(row_index, task, summary)
+                self._fuel_mode_combo(row_index, task, summary)
+                if summary:
+                    self._readonly_item(row_index, self.COL_BUNKER, "")
+                else:
+                    self._set_text(row_index, self.COL_BUNKER,
+                                   _display_number(task.get("bunker_amount")))
                 self._readonly_item(row_index, self.COL_START, "")
                 self._readonly_item(row_index, self.COL_FINISH, "")
+                self._readonly_item(row_index, self.COL_FUEL_USED, "")
+                self._readonly_item(row_index, self.COL_ROB, "")
                 self._set_text(row_index, self.COL_NOTES, task.get("notes"))
         finally:
             self._muted = False
         self._recompute()
         self._apply_collapsed_rows()
+        if self._active_task_ids:
+            self._apply_active_highlight()
 
     def _is_summary(self, row):
         if not (0 <= row < len(self.rows) - 1):
@@ -491,8 +596,57 @@ class TaskTableWidget(QTableWidget):
             marker = ""
         return prefix + marker + (task.get("name") or "")
 
+    def contextMenuEvent(self, event):
+        position = self.viewport().mapFromGlobal(event.globalPos())
+        row = self.rowAt(position.y())
+        if not (0 <= row < len(self.rows)):
+            return
+        if row not in self.selected_row_indices():
+            self.selectRow(row)
+        task = self.rows[row]
+        task_id = task.get("task_id") or ""
+        menu = QMenu(self)
+        zoom = menu.addAction("Zoom to task on map",
+                              lambda: self.zoomRequested.emit(task_id))
+        zoom.setEnabled(bool(task.get("feature_id")))
+        menu.addSeparator()
+        menu.addAction("Indent (make child)", lambda: self.indent_selected(1))
+        menu.addAction("Outdent (promote)", lambda: self.indent_selected(-1))
+        menu.addAction("Move up", lambda: self.move_selected(-1))
+        menu.addAction("Move down", lambda: self.move_selected(1))
+        menu.addSeparator()
+        menu.addAction("Delete selected", self.delete_selected)
+        qt_exec(menu, event.globalPos())
+
+    def set_active_tasks(self, task_ids):
+        """Tint the rows whose tasks are active at the playback time."""
+        wanted = {str(task_id) for task_id in (task_ids or ())}
+        if wanted == self._active_task_ids:
+            return
+        self._active_task_ids = wanted
+        self._apply_active_highlight()
+
+    def _apply_active_highlight(self):
+        highlight = QBrush(QColor(255, 214, 79, 90))
+        self._muted = True
+        try:
+            for row_index, row in enumerate(self.rows):
+                brush = (highlight if str(row.get("task_id")) in self._active_task_ids
+                         else QBrush())
+                for column in range(self.columnCount()):
+                    item = self.item(row_index, column)
+                    if item is not None:
+                        item.setBackground(brush)
+        finally:
+            self._muted = False
+
     def _cell_double_clicked(self, row, column):
-        if column != self.COL_TASK or not (0 <= row < len(self.rows)):
+        if not (0 <= row < len(self.rows)):
+            return
+        if column == self.COL_NUMBER:
+            self.zoomRequested.emit(self.rows[row].get("task_id") or "")
+            return
+        if column != self.COL_TASK:
             return
         task = self.rows[row]
         if not self._is_summary(row):
@@ -529,7 +683,9 @@ class TaskTableWidget(QTableWidget):
         combo = QComboBox()
         combo.addItem("(unassigned)", "")
         for resource in self.resources:
-            combo.addItem(resource.get("name") or "Resource", resource.get("resource_id") or "")
+            combo.addItem(_colour_icon(resource.get("color_hex")),
+                          resource.get("name") or "Resource",
+                          resource.get("resource_id") or "")
         index = combo.findData(task.get("resource_id") or "")
         combo.setCurrentIndex(max(0, index))
         combo.setEnabled(not summary)
@@ -581,6 +737,17 @@ class TaskTableWidget(QTableWidget):
             lambda _index, c=combo, tid=task_id: self._combo_changed(tid, "direction", c.currentData()))
         self.setCellWidget(row, self.COL_DIRECTION, combo)
 
+    def _fuel_mode_combo(self, row, task, summary=False):
+        combo = QComboBox()
+        for value, label in schema.FUEL_MODES:
+            combo.addItem(label, value)
+        combo.setCurrentIndex(max(0, combo.findData(task.get("fuel_mode") or "")))
+        combo.setEnabled(not summary)
+        task_id = task.get("task_id")
+        combo.currentIndexChanged.connect(
+            lambda _index, c=combo, tid=task_id: self._combo_changed(tid, "fuel_mode", c.currentData()))
+        self.setCellWidget(row, self.COL_FUEL_MODE, combo)
+
     def _combo_changed(self, task_id, field, value):
         if self._muted:
             return
@@ -599,13 +766,13 @@ class TaskTableWidget(QTableWidget):
         mapping = {
             self.COL_TASK: "name", self.COL_DESCRIPTION: "description",
             self.COL_DURATION: "duration_hours", self.COL_SPEED: "speed_knots",
-            self.COL_NOTES: "notes",
+            self.COL_BUNKER: "bunker_amount", self.COL_NOTES: "notes",
         }
         field = mapping.get(item.column())
         if field is None:
             return
         self.checkpoint()
-        if field in ("duration_hours", "speed_knots"):
+        if field in ("duration_hours", "speed_knots", "bunker_amount"):
             task[field] = _float(item.text(), None)
         elif field == "name":
             text = item.text().lstrip()
@@ -653,6 +820,13 @@ class TaskTableWidget(QTableWidget):
             for row in self.resources
         }
         self.schedule = compute_schedule(self.anchor, specs, resource_offsets)
+        specs_by_id = {spec.task_id: spec for spec in specs}
+        self.fuel = compute_fuel(self.schedule, specs_by_id, self.resources)
+        # Only lanes with a fuel profile in use get visible fuel figures.
+        fuel_tracked = {
+            resource_id for resource_id, summary in self.fuel.by_resource.items()
+            if summary.rob_start or summary.total_burn or summary.total_bunker
+        }
         by_id = {task.task_id: task for task in self.schedule.tasks}
         self._muted = True
         try:
@@ -700,9 +874,94 @@ class TaskTableWidget(QTableWidget):
                     self.item(row_index, self.COL_FINISH).setText(scheduled.finish.strftime("%d/%m/%Y %H:%M"))
                     if scheduled.warning:
                         duration_item.setToolTip(scheduled.warning)
+                self._update_fuel_cells(row_index, row, fuel_tracked)
         finally:
             self._muted = False
         self.scheduleChanged.emit(self.schedule)
+
+    def _auto_size_columns(self):
+        minimums = {self.COL_RESOURCE: 110, self.COL_PREDECESSOR: 130,
+                    self.COL_FEATURE: 150, self.COL_DIRECTION: 80,
+                    self.COL_FUEL_MODE: 80, self.COL_START: 110,
+                    self.COL_FINISH: 110}
+        self._header_muted = True
+        try:
+            self.resizeColumnsToContents()
+            for column in range(self.columnCount()):
+                width = max(minimums.get(column, 56),
+                            min(self.columnWidth(column), 320))
+                self.setColumnWidth(column, width)
+        finally:
+            self._header_muted = False
+
+    def _header_changed(self, *_args):
+        if self._header_muted:
+            return
+        self._user_layout = True
+        QSettings().setValue(self._header_key, self.horizontalHeader().saveState())
+
+    def _header_menu(self, pos):
+        menu = QMenu(self)
+        for column in range(len(self.HEADERS)):
+            if column in (self.COL_NUMBER, self.COL_TASK):
+                continue
+            action = menu.addAction(self.HEADERS[column])
+            action.setCheckable(True)
+            action.setChecked(not self.isColumnHidden(column))
+            action.toggled.connect(
+                lambda checked, c=column: self._set_column_visible(c, checked))
+        menu.addSeparator()
+        menu.addAction("Size columns to contents", self._size_columns_to_contents)
+        menu.addAction("Reset column layout", self._reset_header)
+        qt_exec(menu, self.horizontalHeader().mapToGlobal(pos))
+
+    def _set_column_visible(self, column, visible):
+        self.setColumnHidden(column, not visible)
+        self._header_changed()
+
+    def _size_columns_to_contents(self):
+        self._auto_size_columns()
+        self._header_changed()
+
+    def _reset_header(self):
+        header = self.horizontalHeader()
+        self._header_muted = True
+        try:
+            header.restoreState(self._default_header_state)
+            for column in range(self.columnCount()):
+                self.setColumnHidden(column, False)
+        finally:
+            self._header_muted = False
+        self._user_layout = False
+        QSettings().remove(self._header_key)
+        self._auto_size_columns()
+
+    def _update_fuel_cells(self, row_index, row, fuel_tracked):
+        fuel_item = self.item(row_index, self.COL_FUEL_USED)
+        rob_item = self.item(row_index, self.COL_ROB)
+        if fuel_item is None or rob_item is None:
+            return
+        fuel_item.setText("")
+        rob_item.setText("")
+        rob_item.setForeground(QBrush())
+        rob_item.setToolTip("")
+        if self._is_summary(row_index):
+            burn = sum(
+                self.fuel.by_task[self.rows[child].get("task_id")].burn
+                for child in self._include_summary_descendants([row_index])
+                if child != row_index and self.rows[child].get("task_id") in self.fuel.by_task)
+            if burn:
+                fuel_item.setText(_display_number(burn))
+            return
+        task_fuel = self.fuel.by_task.get(row.get("task_id"))
+        if task_fuel is None or (row.get("resource_id") or "") not in fuel_tracked:
+            return
+        fuel_item.setText(_display_number(task_fuel.burn) or "0")
+        rob_item.setText(_display_number(task_fuel.rob_end) or "0")
+        if task_fuel.rob_start - task_fuel.burn < -1e-9:
+            rob_item.setForeground(QBrush(QColor("#c62828")))
+            rob_item.setToolTip("The resource runs out of fuel during this task. "
+                                "Add a bunker earlier in the plan or raise the start fuel.")
 
     def _emit_change(self):
         self.tasksChanged.emit([dict(row) for row in self.rows])
@@ -722,3 +981,12 @@ def _display_number(value):
         return ("%.4f" % float(value)).rstrip("0").rstrip(".")
     except (TypeError, ValueError):
         return ""
+
+
+def _colour_icon(color_hex):
+    colour = QColor(str(color_hex or ""))
+    if not colour.isValid():
+        colour = QColor(schema.DEFAULT_RESOURCE_COLOR)
+    pixmap = QPixmap(12, 12)
+    pixmap.fill(colour)
+    return QIcon(pixmap)

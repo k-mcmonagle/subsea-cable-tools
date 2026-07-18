@@ -27,25 +27,28 @@ def _temp_store():
 def test_create_crud_and_meta():
     store = _temp_store()
     scenario_id = store.create_scenario("Cable lay", "2026-08-14T03:20")
-    resources = store.list_resources(scenario_id)
+    resources = store.list_resources()
     store.save_tasks(scenario_id, [{
         "task_id": schema.new_id(), "name": "Mobilise", "duration_mode": "manual",
         "duration_hours": 12.0, "resource_id": resources[0]["resource_id"],
     }])
     tasks = store.list_tasks(scenario_id)
-    ok = store.exists() and store.read_meta().get("schema_version") == "3"
+    ok = store.exists() and store.read_meta().get("schema_version") == "5"
     ok = ok and len(resources) == 1 and resources[0]["name"] == "Vessel 1"
     ok = ok and float(resources[0]["start_offset_hours"] or 0.0) == 0.0
+    ok = ok and resources[0]["fuel_unit"] == schema.DEFAULT_FUEL_UNIT
+    ok = ok and float(resources[0]["fuel_start"] or 0.0) == 0.0
     ok = ok and len(tasks) == 1 and tasks[0]["name"] == "Mobilise"
     store.delete_scenario(scenario_id)
-    ok = ok and not store.list_scenarios() and not store.list_resources(scenario_id)
+    # Tasks cascade with the scenario; project-level resources survive.
+    ok = ok and not store.list_scenarios() and len(store.list_resources()) == 1
     return _result("create/meta/scenario CRUD + cascade", ok)
 
 
 def test_duplicate_independence_and_remap():
     store = _temp_store()
     original_id = store.create_scenario("Original", "2026-01-01T00:00")
-    original_resource = store.list_resources(original_id)[0]
+    original_resource = store.list_resources()[0]
     first_id, second_id = schema.new_id(), schema.new_id()
     store.save_tasks(original_id, [
         {"task_id": first_id, "name": "A", "duration_mode": "manual",
@@ -63,10 +66,12 @@ def test_duplicate_independence_and_remap():
     original_tasks[0].update(reference)
     store.save_tasks(original_id, original_tasks)
     copied_id = store.duplicate_scenario(original_id, "Copy")
-    copied_resources = store.list_resources(copied_id)
+    copied_resources = store.list_resources()
     copied_tasks = store.list_tasks(copied_id)
     ok = store.get_scenario(copied_id)["duplicated_from_id"] == original_id
-    ok = ok and copied_resources[0]["resource_id"] != original_resource["resource_id"]
+    # Resources are shared, so duplication reuses them rather than copying.
+    ok = ok and len(copied_resources) == 1
+    ok = ok and copied_resources[0]["resource_id"] == original_resource["resource_id"]
     ok = ok and copied_tasks[0]["task_id"] != first_id
     ok = ok and copied_tasks[1]["predecessor_task_id"] == copied_tasks[0]["task_id"]
     ok = ok and copied_tasks[0]["resource_id"] == copied_resources[0]["resource_id"]
@@ -77,14 +82,14 @@ def test_duplicate_independence_and_remap():
     store.save_tasks(copied_id, copied_tasks)
     ok = ok and store.list_tasks(original_id)[0]["name"] == "A"
     store.migrate()
-    ok = ok and store.read_meta().get("schema_version") == "3"
+    ok = ok and store.read_meta().get("schema_version") == "5"
     return _result("duplicate remapping + independence + migrate no-op", ok)
 
 
 def test_v2_to_v3_phase_and_resource_migration():
     store = _temp_store()
     scenario_id = store.create_scenario("Legacy", "2026-01-01T00:00")
-    resource = store.list_resources(scenario_id)[0]
+    resource = store.list_resources()[0]
     task_id = schema.new_id()
     old_resource_specs = [
         spec for spec in schema.RESOURCE_FIELDS if spec[0] != "start_offset_hours"]
@@ -98,17 +103,84 @@ def test_v2_to_v3_phase_and_resource_migration():
     }])
     store.write_meta("schema_version", "2")
     store.migrate()
-    migrated_resource = store.list_resources(scenario_id)[0]
+    migrated_resource = store.list_resources()[0]
     migrated_task = store.list_tasks(scenario_id)[0]
-    ok = store.read_meta().get("schema_version") == "3"
+    ok = store.read_meta().get("schema_version") == "5"
     ok = ok and float(migrated_resource.get("start_offset_hours") or 0.0) == 0.0
     ok = ok and int(migrated_task.get("is_phase") or 0) == 0
     ok = ok and int(migrated_task.get("outline_level") or 0) == 0
     return _result("v2→v3 phase/resource migration", ok)
 
 
+FUEL_RESOURCE_FIELDS = ("fuel_unit", "fuel_rate_transit", "fuel_rate_dp",
+                        "fuel_rate_anchor", "fuel_rate_port", "fuel_start",
+                        "fuel_cost_per_unit")
+
+
+def test_v3_to_v4_fuel_migration():
+    store = _temp_store()
+    scenario_id = store.create_scenario("Legacy", "2026-01-01T00:00")
+    resource = store.list_resources()[0]
+    old_resource_specs = [spec for spec in schema.RESOURCE_FIELDS
+                          if spec[0] not in FUEL_RESOURCE_FIELDS]
+    old_task_specs = [spec for spec in schema.TASK_FIELDS
+                      if spec[0] not in ("fuel_mode", "bunker_amount")]
+    stripped = {key: value for key, value in resource.items()
+                if key not in FUEL_RESOURCE_FIELDS}
+    store._write_table_rows(schema.TABLE_RESOURCE, old_resource_specs, [stripped])
+    store._write_table_rows(schema.TABLE_TASK, old_task_specs, [{
+        "task_id": schema.new_id(), "scenario_id": scenario_id, "seq": 0,
+        "name": "Legacy task", "duration_mode": "manual", "duration_hours": 1.0,
+        "resource_id": resource["resource_id"],
+    }])
+    store.write_meta("schema_version", "3")
+    store.migrate()
+    migrated_resource = store.list_resources()[0]
+    migrated_task = store.list_tasks(scenario_id)[0]
+    ok = store.read_meta().get("schema_version") == "5"
+    ok = ok and migrated_resource.get("fuel_unit") == schema.DEFAULT_FUEL_UNIT
+    ok = ok and float(migrated_resource.get("fuel_rate_transit") or 0.0) == 0.0
+    ok = ok and float(migrated_resource.get("fuel_start") or 0.0) == 0.0
+    ok = ok and (migrated_task.get("fuel_mode") or "") == ""
+    ok = ok and float(migrated_task.get("bunker_amount") or 0.0) == 0.0
+    return _result("v3→v4 fuel profile migration", ok)
+
+
+def test_v4_to_v5_shared_resource_migration():
+    store = _temp_store()
+    scenario_a = store.create_scenario("A", "2026-01-01T00:00")
+    scenario_b = store.create_scenario("B", "2026-01-01T00:00")
+    shared = store.list_resources()[0]
+    twin_id = schema.new_id()
+    legacy_a = dict(shared)
+    legacy_a["scenario_id"] = scenario_a
+    twin = dict(shared)
+    twin.update({"resource_id": twin_id, "scenario_id": scenario_b})
+    store._write_table_rows(schema.TABLE_RESOURCE, schema.RESOURCE_FIELDS,
+                            [legacy_a, twin])
+    store.save_tasks(scenario_a, [{
+        "task_id": schema.new_id(), "name": "TA", "duration_mode": "manual",
+        "duration_hours": 1.0, "resource_id": shared["resource_id"]}])
+    store.save_tasks(scenario_b, [{
+        "task_id": schema.new_id(), "name": "TB", "duration_mode": "manual",
+        "duration_hours": 1.0, "resource_id": twin_id}])
+    store.write_meta("schema_version", "4")
+    store.migrate()
+    resources = store.list_resources()
+    ok = store.read_meta().get("schema_version") == "5"
+    ok = ok and len(resources) == 1
+    ok = ok and resources[0]["resource_id"] == shared["resource_id"]
+    ok = ok and (resources[0].get("scenario_id") or "") == ""
+    ok = ok and store.list_tasks(scenario_a)[0]["resource_id"] == shared["resource_id"]
+    ok = ok and store.list_tasks(scenario_b)[0]["resource_id"] == shared["resource_id"]
+    store.delete_scenario(scenario_b)
+    ok = ok and len(store.list_resources()) == 1
+    return _result("v4→v5 shared resources + duplicate merge + task remap", ok)
+
+
 def run_all():
     return [
         test_create_crud_and_meta(), test_duplicate_independence_and_remap(),
-        test_v2_to_v3_phase_and_resource_migration(),
+        test_v2_to_v3_phase_and_resource_migration(), test_v3_to_v4_fuel_migration(),
+        test_v4_to_v5_shared_resource_migration(),
     ]

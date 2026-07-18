@@ -36,6 +36,8 @@ class FeatureReferenceResolver:
             owned = self.store.get_task_geometry(_get(ref, "task_id"))
             if owned is not None:
                 layer, feature, kind = owned
+                if not feature.hasGeometry() or feature.geometry().isEmpty():
+                    return None
                 return ResolvedFeature(layer, feature, kind)
         layer_id = _get(ref, "layer_id")
         layer = self.project.mapLayer(layer_id) if layer_id else None
@@ -77,11 +79,16 @@ class FeatureReferenceResolver:
         if cached is not None:
             return cached
         distance = make_distance_area(target_crs, self.project.transformContext(), project=self.project)
-        frame = RouteFrame.from_source(
-            [resolved.feature.geometry()], distance, target_crs=target_crs,
-            source_crs=resolved.layer.crs(), project=self.project,
-            follow_stored_geometry=True,
-        )
+        try:
+            frame = RouteFrame.from_source(
+                [resolved.feature.geometry()], distance, target_crs=target_crs,
+                source_crs=resolved.layer.crs(), project=self.project,
+                follow_stored_geometry=True,
+            )
+        except Exception:
+            # Degenerate/edited geometry must degrade to "unmeasured", not
+            # raise out of a table-recompute slot.
+            return None
         self._route_cache[key] = frame
         return frame
 
@@ -94,7 +101,10 @@ class FeatureReferenceResolver:
         if resolved is None:
             return None
         if resolved.geom_kind == "point":
-            point = resolved.feature.geometry().asPoint()
+            try:
+                point = resolved.feature.geometry().asPoint()
+            except Exception:
+                return None
             if self.canvas and resolved.layer.crs() != self.canvas.mapSettings().destinationCrs():
                 from qgis.core import QgsCoordinateTransform, QgsPointXY
                 transform = QgsCoordinateTransform(

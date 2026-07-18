@@ -6,7 +6,9 @@ import os
 import tempfile
 from types import MethodType
 
-from qgis.PyQt.QtCore import QPoint
+from qgis.PyQt.QtCore import QPoint, Qt
+from qgis.PyQt.QtGui import QColor
+from qgis.PyQt.QtWidgets import QTableWidget
 from qgis.core import (
     QgsCoordinateReferenceSystem, QgsFeature, QgsGeometry, QgsPointXY, QgsProject,
     QgsRectangle, QgsVectorLayer,
@@ -263,7 +265,12 @@ def test_summary_outline_undo_redo_compact_rows_and_resource_configuration():
     ok = ok and [row["task_id"] for row in table.rows] == ["group", "a", "b"]
     table.redo()
     ok = ok and [row["task_id"] for row in table.rows] == ["group"]
-    ok = ok and table.verticalHeader().defaultSectionSize() == 24
+    # Display scaling can inflate the stored pixel size, so compare with a
+    # reference widget configured to the same compact height instead of == 24.
+    reference = QTableWidget()
+    reference.verticalHeader().setDefaultSectionSize(24)
+    ok = ok and (table.verticalHeader().defaultSectionSize()
+                 == reference.verticalHeader().defaultSectionSize())
 
     dialog = ResourceDialog(resources)
     saved = dialog.resources()[0]
@@ -280,7 +287,7 @@ def test_undo_redo_restores_owned_geometry():
     store = PlannerStore(os.path.join(folder, "planner.gpkg"))
     store.ensure_created()
     scenario_id = store.create_scenario("History", "2026-01-01T00:00")
-    resource = store.list_resources(scenario_id)[0]
+    resource = store.list_resources()[0]
     task = _task("route", 0, line=True)
     task["resource_id"] = resource["resource_id"]
     reference = store.set_task_geometry(
@@ -322,6 +329,23 @@ def test_undo_redo_restores_owned_geometry():
     return _result("undo/redo restores and removes Planner-owned geometry", ok)
 
 
+def test_zoom_signal_and_active_row_highlight():
+    table = TaskTableWidget(_Resolver())
+    rows = [_task("a", 0), _task("b", 1, "a")]
+    table.set_plan(rows, [{"resource_id": "v", "name": "V"}], datetime(2026, 1, 1))
+    fired = []
+    table.zoomRequested.connect(fired.append)
+    table._cell_double_clicked(1, table.COL_NUMBER)
+    ok = fired == ["b"]
+    no_brush = Qt.BrushStyle.NoBrush if hasattr(Qt, "BrushStyle") else Qt.NoBrush
+    table.set_active_tasks({"a"})
+    ok = ok and table.item(0, table.COL_TASK).background().color() == QColor(255, 214, 79, 90)
+    ok = ok and table.item(1, table.COL_TASK).background().style() == no_brush
+    table.set_active_tasks(set())
+    ok = ok and table.item(0, table.COL_TASK).background().style() == no_brush
+    return _result("zoom-to-task signal + active-row highlight", ok)
+
+
 def run_all():
     return [
         test_connected_merge_and_reverse(), test_sketch_session_completion_and_restore(),
@@ -332,4 +356,5 @@ def run_all():
         test_simulation_label_content_and_canvas_follow(),
         test_summary_outline_undo_redo_compact_rows_and_resource_configuration(),
         test_undo_redo_restores_owned_geometry(),
+        test_zoom_signal_and_active_row_highlight(),
     ]

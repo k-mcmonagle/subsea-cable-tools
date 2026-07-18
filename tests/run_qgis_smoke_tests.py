@@ -127,6 +127,7 @@ def main() -> int:
         ("planner feature references", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_planner_feature_ref")),
         ("planner RPL import", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_planner_rpl_import")),
         ("planner spatial task tools", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_planner_spatial_tasks")),
+        ("planner standard tasks", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_planner_standard_tasks")),
         ("processing provider", _provider_loads),
         ("main plugin import", _plugin_imports),
     ]

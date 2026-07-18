@@ -27,6 +27,8 @@ class TaskSpec:
     route_length_m: Optional[float] = None
     is_phase: bool = False
     outline_level: int = 0
+    fuel_mode: str = ""
+    bunker_amount: float = 0.0
 
 
 @dataclass
@@ -55,6 +57,41 @@ class ActiveState:
     fraction: float
     chainage_m: Optional[float]
     active: bool = True
+
+
+# Maps a task's fuel mode to the per-24 h rate field on its resource row.
+FUEL_RATE_FIELDS = {
+    "transit": "fuel_rate_transit", "dp": "fuel_rate_dp",
+    "anchor": "fuel_rate_anchor", "port": "fuel_rate_port",
+}
+
+
+@dataclass
+class TaskFuel:
+    task_id: str
+    burn: float = 0.0
+    bunker: float = 0.0
+    rob_start: float = 0.0
+    rob_end: float = 0.0
+
+
+@dataclass
+class ResourceFuel:
+    resource_id: str
+    unit: str = "t"
+    rob_start: float = 0.0
+    total_burn: float = 0.0
+    total_bunker: float = 0.0
+    rob_end: float = 0.0
+    min_rob: float = 0.0
+    cost: float = 0.0
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass
+class FuelResult:
+    by_task: Dict[str, TaskFuel] = field(default_factory=dict)
+    by_resource: Dict[str, ResourceFuel] = field(default_factory=dict)
 
 
 def _number(value, default=0.0):
@@ -175,6 +212,46 @@ def compute_schedule(anchor: datetime, tasks: Sequence[TaskSpec],
     result.span_start = min([anchor] + [item.start for item in result.tasks])
     result.span_end = max([anchor] + [item.finish for item in result.tasks])
     return result
+
+
+def compute_fuel(result: TimelineResult, specs_by_id: Dict[str, TaskSpec],
+                 resources: Sequence[Dict]) -> FuelResult:
+    """Track remaining-on-board fuel along each resource lane.
+
+    Each scheduled task burns its resource's per-24 h rate for the task's fuel
+    mode over the scheduled duration; a task's bunker amount is credited at the
+    task finish. Idle gaps between tasks burn nothing.
+    """
+    fuel = FuelResult()
+    rows_by_id = {str(row.get("resource_id") or ""): row for row in resources}
+    for resource_id, lane in result.by_resource.items():
+        resource = rows_by_id.get(str(resource_id or ""))
+        if resource is None:
+            continue
+        rob = _number(resource.get("fuel_start"))
+        summary = ResourceFuel(
+            resource_id=resource_id, unit=str(resource.get("fuel_unit") or "t"),
+            rob_start=rob, rob_end=rob, min_rob=rob)
+        for task in sorted(lane, key=lambda item: (item.start, item.row)):
+            spec = specs_by_id.get(task.task_id)
+            mode = (spec.fuel_mode or "") if spec is not None else ""
+            rate = _number(resource.get(FUEL_RATE_FIELDS.get(mode, ""), 0.0))
+            burn = max(0.0, rate) / 24.0 * max(0.0, _number(task.duration_hours))
+            bunker = max(0.0, _number(spec.bunker_amount)) if spec is not None else 0.0
+            rob_start = rob
+            rob = rob - burn + bunker
+            summary.min_rob = min(summary.min_rob, rob_start - burn)
+            summary.total_burn += burn
+            summary.total_bunker += bunker
+            fuel.by_task[task.task_id] = TaskFuel(task.task_id, burn, bunker, rob_start, rob)
+            if rob_start - burn < -1e-9 and rob_start >= -1e-9:
+                name = (spec.name if spec is not None else "") or task.task_id
+                summary.warnings.append("Fuel runs out during '%s' (%s)." % (
+                    name, task.start.strftime("%d/%m/%Y %H:%M")))
+        summary.rob_end = rob
+        summary.cost = summary.total_burn * max(0.0, _number(resource.get("fuel_cost_per_unit")))
+        fuel.by_resource[resource_id] = summary
+    return fuel
 
 
 def position_at(result: TimelineResult, specs_by_id: Dict[str, TaskSpec],

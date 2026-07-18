@@ -8,7 +8,7 @@ from typing import Dict, List, Tuple
 
 from ..workbench.schema import new_id, sanitize_slug, utc_now_iso
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 TABLE_META = "pow_meta"
 TABLE_SCENARIO = "pow_scenario"
@@ -28,10 +28,16 @@ SCENARIO_FIELDS: List[FieldSpec] = [
     ("modified_utc", "str"), ("notes", "str"),
 ]
 
+# Since v5 resources are project-level and shared by every scenario; the
+# scenario_id column is kept for file compatibility but written empty.
 RESOURCE_FIELDS: List[FieldSpec] = [
     ("resource_id", "str"), ("scenario_id", "str"), ("name", "str"),
     ("kind", "str"), ("color_hex", "str"), ("default_speed_kn", "float"),
-    ("start_offset_hours", "float"), ("seq", "int"), ("notes", "str"),
+    ("start_offset_hours", "float"), ("fuel_unit", "str"),
+    ("fuel_rate_transit", "float"), ("fuel_rate_dp", "float"),
+    ("fuel_rate_anchor", "float"), ("fuel_rate_port", "float"),
+    ("fuel_start", "float"), ("fuel_cost_per_unit", "float"),
+    ("seq", "int"), ("notes", "str"),
 ]
 
 TASK_FIELDS: List[FieldSpec] = [
@@ -40,7 +46,8 @@ TASK_FIELDS: List[FieldSpec] = [
     ("outline_level", "int"), ("resource_id", "str"),
     ("duration_mode", "str"), ("duration_hours", "float"),
     ("predecessor_task_id", "str"), ("lag_hours", "float"),
-    ("speed_knots", "float"), ("direction", "str"), ("layer_id", "str"),
+    ("speed_knots", "float"), ("direction", "str"),
+    ("fuel_mode", "str"), ("bunker_amount", "float"), ("layer_id", "str"),
     ("layer_source", "str"), ("layer_name", "str"), ("feature_id", "str"),
     ("feature_label", "str"), ("geom_kind", "str"),
     ("linked_ref_json", "str"), ("created_utc", "str"),
@@ -77,6 +84,11 @@ DEFAULT_RESOURCE_NAME = "Vessel 1"
 DEFAULT_RESOURCE_KIND = "vessel"
 DEFAULT_RESOURCE_COLOR = "#1f78b4"
 DEFAULT_SPEED_KN = 1.0
+DEFAULT_FUEL_UNIT = "t"
+
+# Per-24 h fuel rates a task can burn from its resource's profile.
+FUEL_MODES = (("", "(none)"), ("transit", "Transit"), ("dp", "DP"),
+              ("anchor", "Anchor"), ("port", "Port"))
 
 
 def default_gpkg_path(project_path: str, project_title: str = "") -> str:

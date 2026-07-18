@@ -141,20 +141,23 @@ class PlannerStore:
                         description: str = "", notes: str = "") -> str:
         now = schema.utc_now_iso()
         scenario_id = schema.new_id()
-        resource_id = schema.new_id()
         self.upsert_rows(schema.TABLE_SCENARIO, [{
             "scenario_id": scenario_id, "name": name or "Planning Scenario",
             "description": description or "", "start_datetime": start_datetime,
             "duplicated_from_id": "", "settings_json": "{}", "created_utc": now,
             "modified_utc": now, "notes": notes or "",
         }])
-        self.upsert_rows(schema.TABLE_RESOURCE, [{
-            "resource_id": resource_id, "scenario_id": scenario_id,
-            "name": schema.DEFAULT_RESOURCE_NAME, "kind": schema.DEFAULT_RESOURCE_KIND,
-            "color_hex": schema.DEFAULT_RESOURCE_COLOR,
-            "default_speed_kn": schema.DEFAULT_SPEED_KN, "start_offset_hours": 0.0,
-            "seq": 0, "notes": "",
-        }])
+        if not self.list_resources():
+            self.upsert_rows(schema.TABLE_RESOURCE, [{
+                "resource_id": schema.new_id(), "scenario_id": "",
+                "name": schema.DEFAULT_RESOURCE_NAME, "kind": schema.DEFAULT_RESOURCE_KIND,
+                "color_hex": schema.DEFAULT_RESOURCE_COLOR,
+                "default_speed_kn": schema.DEFAULT_SPEED_KN, "start_offset_hours": 0.0,
+                "fuel_unit": schema.DEFAULT_FUEL_UNIT, "fuel_rate_transit": 0.0,
+                "fuel_rate_dp": 0.0, "fuel_rate_anchor": 0.0, "fuel_rate_port": 0.0,
+                "fuel_start": 0.0, "fuel_cost_per_unit": 0.0,
+                "seq": 0, "notes": "",
+            }])
         return scenario_id
 
     def save_scenario(self, row: Dict) -> None:
@@ -165,33 +168,44 @@ class PlannerStore:
         self.upsert_rows(schema.TABLE_SCENARIO, [saved])
 
     def delete_scenario(self, scenario_id: str) -> None:
+        """Delete a scenario and its tasks; project-level resources survive."""
         task_ids = [row["task_id"] for row in self.list_tasks(scenario_id)]
-        resource_ids = [row["resource_id"] for row in self.list_resources(scenario_id)]
         if task_ids:
             self.delete_task_geometries(task_ids)
             self.delete_rows(schema.TABLE_TASK, task_ids)
-        if resource_ids:
-            self.delete_rows(schema.TABLE_RESOURCE, resource_ids)
         self.delete_rows(schema.TABLE_SCENARIO, [scenario_id])
 
-    def list_resources(self, scenario_id: str) -> List[Dict]:
-        rows = [row for row in self.read_table(schema.TABLE_RESOURCE)
-                if row.get("scenario_id") == scenario_id]
+    def list_resources(self) -> List[Dict]:
+        rows = self.read_table(schema.TABLE_RESOURCE)
         return sorted(rows, key=lambda row: (int(row.get("seq") or 0), row.get("name") or ""))
 
-    def save_resources(self, scenario_id: str, rows: Sequence[Dict]) -> None:
-        old_ids = [row["resource_id"] for row in self.list_resources(scenario_id)]
+    def save_resources(self, rows: Sequence[Dict]) -> None:
+        old_ids = [row["resource_id"] for row in self.list_resources()]
         if old_ids:
             self.delete_rows(schema.TABLE_RESOURCE, old_ids)
         saved = []
         for seq, row in enumerate(rows):
             item = dict(row)
             item.setdefault("resource_id", schema.new_id())
-            item["scenario_id"] = scenario_id
+            item["scenario_id"] = ""
             item["seq"] = seq
             saved.append(item)
         if saved:
             self.upsert_rows(schema.TABLE_RESOURCE, saved)
+
+    def remap_task_resources(self, valid_ids, default_id: str) -> bool:
+        """Point tasks in every scenario at a surviving resource."""
+        valid = {str(value) for value in valid_ids}
+        tasks = self.read_table(schema.TABLE_TASK)
+        changed = False
+        for task in tasks:
+            if str(task.get("resource_id") or "") not in valid:
+                task["resource_id"] = default_id
+                changed = True
+        if changed:
+            self._write_table_rows(schema.TABLE_TASK, schema.TASK_FIELDS, tasks)
+            self.sync_geometry_attributes(tasks)
+        return changed
 
     def list_tasks(self, scenario_id: str) -> List[Dict]:
         rows = [row for row in self.read_table(schema.TABLE_TASK)
@@ -229,22 +243,13 @@ class PlannerStore:
             "scenario_id": new_scenario_id, "name": new_name,
             "duplicated_from_id": scenario_id, "created_utc": now, "modified_utc": now,
         })
-        resource_map = {row["resource_id"]: schema.new_id()
-                        for row in self.list_resources(scenario_id)}
         task_map = {row["task_id"]: schema.new_id() for row in self.list_tasks(scenario_id)}
-        resources = []
-        for row in self.list_resources(scenario_id):
-            copied = dict(row)
-            copied.update({"resource_id": resource_map[row["resource_id"]],
-                           "scenario_id": new_scenario_id})
-            resources.append(copied)
         tasks = []
         original_tasks = self.list_tasks(scenario_id)
         for row in original_tasks:
             copied = dict(row)
             copied.update({
                 "task_id": task_map[row["task_id"]], "scenario_id": new_scenario_id,
-                "resource_id": resource_map.get(row.get("resource_id"), ""),
                 "predecessor_task_id": task_map.get(row.get("predecessor_task_id"), ""),
                 "created_utc": now, "modified_utc": now,
             })
@@ -263,8 +268,6 @@ class PlannerStore:
                 copied.update(reference)
             tasks.append(copied)
         self.upsert_rows(schema.TABLE_SCENARIO, [copied_scenario])
-        if resources:
-            self.upsert_rows(schema.TABLE_RESOURCE, resources)
         if tasks:
             self.upsert_rows(schema.TABLE_TASK, tasks)
         return new_scenario_id
@@ -410,23 +413,28 @@ class PlannerStore:
             if layer is None:
                 continue
             changes = {}
-            field_indices = {name: layer.fields().indexOf(name) for name in (
-                "scenario_id", "seq", "name", "resource_id", "speed_knots",
-                "duration_hours", "notes", "modified_utc")}
+            # Skip fields absent from the stored layer (older files) instead of
+            # issuing invalid -1 attribute indices to the provider.
+            field_indices = {name: index for name, index in (
+                (name, layer.fields().indexOf(name)) for name in (
+                    "scenario_id", "seq", "name", "resource_id", "speed_knots",
+                    "duration_hours", "notes", "modified_utc")) if index >= 0}
             for feature in layer.getFeatures():
                 task = by_id.get(str(feature["task_id"]))
                 if task is None:
                     continue
-                changes[feature.id()] = {
-                    field_indices["scenario_id"]: task.get("scenario_id") or "",
-                    field_indices["seq"]: int(task.get("seq") or 0),
-                    field_indices["name"]: task.get("name") or "Task",
-                    field_indices["resource_id"]: task.get("resource_id") or "",
-                    field_indices["speed_knots"]: task.get("speed_knots"),
-                    field_indices["duration_hours"]: task.get("duration_hours"),
-                    field_indices["notes"]: task.get("notes") or "",
-                    field_indices["modified_utc"]: now,
+                values = {
+                    "scenario_id": task.get("scenario_id") or "",
+                    "seq": int(task.get("seq") or 0),
+                    "name": task.get("name") or "Task",
+                    "resource_id": task.get("resource_id") or "",
+                    "speed_knots": task.get("speed_knots"),
+                    "duration_hours": task.get("duration_hours"),
+                    "notes": task.get("notes") or "",
+                    "modified_utc": now,
                 }
+                changes[feature.id()] = {
+                    index: values[name] for name, index in field_indices.items()}
             if changes:
                 if layer.isEditable():
                     for feature_id, attributes in changes.items():
@@ -470,4 +478,66 @@ def _migrate_2_to_3(store: PlannerStore) -> None:
     store._write_table_rows(schema.TABLE_TASK, schema.TASK_FIELDS, tasks)
 
 
-MIGRATIONS = {1: _migrate_1_to_2, 2: _migrate_2_to_3}
+def _migrate_3_to_4(store: PlannerStore) -> None:
+    """v3 -> v4: per-resource fuel profiles, per-task fuel modes and bunkering."""
+    resources = store.read_table(schema.TABLE_RESOURCE)
+    for resource in resources:
+        if not resource.get("fuel_unit"):
+            resource["fuel_unit"] = schema.DEFAULT_FUEL_UNIT
+        for name in ("fuel_rate_transit", "fuel_rate_dp", "fuel_rate_anchor",
+                     "fuel_rate_port", "fuel_start", "fuel_cost_per_unit"):
+            resource.setdefault(name, 0.0)
+    store._write_table_rows(schema.TABLE_RESOURCE, schema.RESOURCE_FIELDS, resources)
+    tasks = store.read_table(schema.TABLE_TASK)
+    for task in tasks:
+        task.setdefault("fuel_mode", "")
+        task.setdefault("bunker_amount", 0.0)
+    store._write_table_rows(schema.TABLE_TASK, schema.TASK_FIELDS, tasks)
+
+
+def _migrate_4_to_5(store: PlannerStore) -> None:
+    """v4 -> v5: resources become project-level and shared by all scenarios.
+
+    Identical per-scenario copies (the common case: each scenario's default
+    vessel) are merged into one row and tasks are remapped onto it. Rows that
+    differ in any schedule-affecting way are kept side by side so no scenario's
+    timing changes; users can tidy those in the Resources dialog.
+    """
+    def identity(row):
+        strings = tuple(str(row.get(key) or "") for key in
+                        ("name", "kind", "color_hex", "fuel_unit", "notes"))
+        numbers = tuple(float(row.get(key) or 0.0) for key in
+                        ("default_speed_kn", "start_offset_hours",
+                         "fuel_rate_transit", "fuel_rate_dp", "fuel_rate_anchor",
+                         "fuel_rate_port", "fuel_start", "fuel_cost_per_unit"))
+        return strings + numbers
+
+    kept, remap = [], {}
+    first_by_identity = {}
+    for row in store.list_resources():
+        key = identity(row)
+        survivor = first_by_identity.get(key)
+        if survivor is None:
+            copied = dict(row)
+            copied["scenario_id"] = ""
+            copied["seq"] = len(kept)
+            first_by_identity[key] = copied
+            kept.append(copied)
+            remap[str(row.get("resource_id"))] = str(copied.get("resource_id"))
+        else:
+            remap[str(row.get("resource_id"))] = str(survivor.get("resource_id"))
+    store._write_table_rows(schema.TABLE_RESOURCE, schema.RESOURCE_FIELDS, kept)
+    tasks = store.read_table(schema.TABLE_TASK)
+    changed = False
+    for task in tasks:
+        mapped = remap.get(str(task.get("resource_id") or ""))
+        if mapped is not None and mapped != str(task.get("resource_id") or ""):
+            task["resource_id"] = mapped
+            changed = True
+    if changed:
+        store._write_table_rows(schema.TABLE_TASK, schema.TASK_FIELDS, tasks)
+        store.sync_geometry_attributes(tasks)
+
+
+MIGRATIONS = {1: _migrate_1_to_2, 2: _migrate_2_to_3, 3: _migrate_3_to_4,
+              4: _migrate_4_to_5}

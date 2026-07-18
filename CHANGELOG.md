@@ -5,6 +5,34 @@ All notable changes to the Subsea Cable Tools QGIS plugin will be documented in 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — Planner fuel planning
+
+### Added
+
+- **Standard tasks library:** curate reusable task templates (name, description, duration, speed, fuel mode, bunker amount, notes) in a per-user library that follows the planner across projects. The Standard tasks… dialog inserts selected templates after the current row — inheriting that row's resource and indentation — as ordinary, fully editable tasks. Libraries can be exported to and imported from CSV (headers matched by name, values validated with warnings) for sharing within an organisation; a small cable-industry starter set is offered on first use.
+- **Planner fuel planning:** each resource can now carry a fuel profile — Transit, DP, Anchor, and Port burn rates (per 24 h), a start fuel (remaining-on-board), a fuel unit (t or m³), and an optional cost per unit — edited in the Resources… dialog. Each task selects which rate it burns via a new Fuel column, and a Bunker column credits fuel taken on (e.g. a bunkering port call) at the task finish. Read-only Fuel used and Fuel ROB columns track burn and remaining fuel through the schedule, with summary-row burn rollups; ROB turns red where the plan runs out of fuel. A Fuel report… button totals burn, bunkers, end/minimum ROB, cost, and run-dry warnings per resource. Planner GeoPackage schema v4 migrates existing files in place.
+
+### Added (map/table interaction)
+
+- **Zoom to task:** double-click a task's `#` cell, or right-click any row → "Zoom to task on map", to zoom/pan the canvas to the task's geometry (points recentre at the current scale) and flash it. The row context menu also offers indent/outdent, move up/down, and delete.
+- **Playback row highlight:** while the simulation is playing (or scrubbed off the start), the rows of tasks currently under way are tinted amber in step with the map markers.
+- **Totals row:** a live summary under the table shows task count, plan start → finish, total duration in hours and days, per-resource fuel burn (with a run-dry warning marker), and total fuel cost.
+- **Resource colour swatches** now appear in the task table's Resource dropdown, matching playback marker colours.
+
+### Robustness
+
+- Planner GeoPackage failures no longer raise unhandled errors mid-edit: plan saves, sketch/RPL geometry writes, and the initial open/migration report once via the message bar (or a dialog) and keep the table usable; edits retry on the next change. Attribute sync skips fields missing from older geometry layers, and degenerate or deleted linked geometry now degrades to the amber repair state instead of raising during schedule recompute.
+
+### Changed
+
+- **Project-level resources:** vessels/resources now belong to the project planner file rather than a single scenario — every scenario shares one resource list, duplicating a scenario reuses it, and deleting a scenario keeps it. Planner schema v5 migrates existing files by merging identical per-scenario copies (the common default-vessel case) and remapping tasks onto the survivor; per-scenario copies that differ in any schedule-affecting way are kept side by side so no timing changes silently.
+- **Task-table column usability:** columns default to content-based widths, can be drag-reordered, and a right-click on the header shows/hides non-essential columns (plus "Size columns to contents" and "Reset column layout"). Widths, order, and hidden columns persist per user; the Resources and Standard-tasks dialogs also size to contents and allow reordering.
+
+### Fixed
+
+- **Planner transport bar jitter:** the playback status text (task, timestamp, percentage) resized itself as it changed, pushing the timeline slider around. The slider and status now share leftover width by fixed stretch factors and the status label elides long text (full text in its tooltip), so the bar keeps its layout at any window size on both Qt5 (QGIS 3) and Qt6 (QGIS 4). Also fixed the mojibake "Labelsâ€¦" button caption.
+- **Planner drag-reorder made tasks disappear:** the task table performed its own row move on drop but still accepted Qt's InternalMove action, so Qt's post-drag cleanup deleted the re-selected rows from the view; dropped tasks vanished until the next rebuild. The drop is now fully handled by the planner and reported to Qt as ignored. Dropping just below a collapsed group also landed tasks invisibly inside the hidden children — drops now land after the collapsed block, and a dropped block re-indents to match its destination siblings so dragging can no longer create invisible nesting.
+
 ## [1.8.0] - 2026-07-15
 
 ### Added

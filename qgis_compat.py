@@ -109,6 +109,10 @@ DIALOG_ACCEPTED = _scoped_member(QDialog, "DialogCode", "Accepted")
 DIALOG_REJECTED = _scoped_member(QDialog, "DialogCode", "Rejected")
 
 SIZE_POLICY_EXPANDING = _scoped_member(QSizePolicy, "Policy", "Expanding")
+SIZE_POLICY_IGNORED = _scoped_member(QSizePolicy, "Policy", "Ignored")
+SIZE_POLICY_PREFERRED = _scoped_member(QSizePolicy, "Policy", "Preferred")
+TEXT_ELIDE_RIGHT = _scoped_member(Qt, "TextElideMode", "ElideRight")
+CONTEXT_MENU_POLICY_CUSTOM = _scoped_member(Qt, "ContextMenuPolicy", "CustomContextMenu")
 
 SELECTION_MODE_EXTENDED = _scoped_member(QAbstractItemView, "SelectionMode", "ExtendedSelection")
 SELECTION_MODE_SINGLE = _scoped_member(QAbstractItemView, "SelectionMode", "SingleSelection")
@@ -118,6 +122,7 @@ EDIT_TRIGGER_SELECTED_CLICKED = _scoped_member(QAbstractItemView, "EditTrigger",
 EDIT_TRIGGER_EDIT_KEY_PRESSED = _scoped_member(QAbstractItemView, "EditTrigger", "EditKeyPressed")
 DRAG_DROP_MODE_INTERNAL_MOVE = _scoped_member(QAbstractItemView, "DragDropMode", "InternalMove")
 DROP_ACTION_MOVE = _scoped_member(Qt, "DropAction", "MoveAction")
+DROP_ACTION_IGNORE = _scoped_member(Qt, "DropAction", "IgnoreAction")
 
 SNAPPING_MODE_ALL_LAYERS = _snapping_member("AllLayers", ("SnappingMode", "Mode"))
 SNAPPING_MODE_PER_LAYER = _snapping_member(

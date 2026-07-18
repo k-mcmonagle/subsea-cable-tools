@@ -33,6 +33,9 @@ class SimulationController(QObject):
             self.current_time = result.span_start
         self.timeChanged.emit(self.current_time)
 
+    def is_playing(self):
+        return self.timer.isActive()
+
     def set_speed(self, sim_seconds_per_real_second):
         self.sim_seconds_per_real_second = max(0.0, float(sim_seconds_per_real_second))
 
