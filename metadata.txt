@@ -3,7 +3,7 @@ name=Subsea Cable Tools
 qgisMinimumVersion=3.22
 qgisMaximumVersion=4.99
 description=Tools to support working with subsea cable data in QGIS.
-version=1.7.0
+version=1.8.0
 author=Kieran McMonagle
 email=kieran.mcmonagle@globalmarine.group
 
@@ -15,7 +15,18 @@ repository=https://github.com/k-mcmonagle/subsea-cable-tools
 hasProcessingProvider=yes
 
 # changelog
-changelog=Version 1.7.0:
+changelog=Version 1.8.0:
+  - NEW: Planner (beta) — dockable spatial scenario planning with ordered, map-linked tasks, resource lanes, predecessor/lag scheduling, and simulated vessel playback over route geometry.
+  - Multi-resource planning: independent vessel start offsets, cross-resource dependencies, selectable marker colours, and MS Project-style indented/collapsible summary groups.
+  - Undo/redo for task, outline, ordering, link, import, sketch, merge, and deletion changes, including Planner-owned geometry.
+  - Precise route/point sketching with optional point/vertex and line-segment snapping, WGS84 coordinate entry, and existing-route KP entry.
+  - Spatial planning UX: place points or draw snapping multi-vertex routes, create tasks per drawn leg/waypoint, see measured distance/speed in the task table, merge adjacent task routes, and retain independent planner-owned point/line layers in the project GeoPackage.
+  - Playback labels follow each resource marker by default, with user-selectable task, resource, progress, time, and speed/distance content.
+  - Geodesy fix: Planner distances remain ellipsoidal across geographic/projected CRSs while playback markers and progress bands now remain on the exact planned feature.
+  - RPL import: whole or partial KP range from Workbench/project layers, with per-segment or operational grouping and cable-type default lay speeds.
+  - Scenarios can be created, renamed, duplicated independently, and deleted; each has its own resources and persists in a separate per-project planner GeoPackage.
+  - Task plans copy directly to the MS Project Entry table as tab-delimited 24/7 elapsed-hour tasks. No new dependencies.
+Version 1.7.0:
   - NEW: Cable Lay Simulator (3D), beta — the next-generation catenary tool (V3). Interactive 3D view (orbit/zoom/pan, software-rendered, works over RDP), synchronized Profile and Plan views, and three modes: Static hang (V2 physics generalised to 3D bathymetry with current drag; single span, held branching unit at a chosen depth, or held final bight at a chosen apex depth), Steady lay (ship speed + pay-out solved in the vessel frame with hydrodynamic drag, validated against Zajac 1957 closed forms shown live as "quick answers"), and Operation simulation (quasi-static time stepping with a timeline scrubber).
   - Operation scenarios: Branching-unit deployment (trunk + two pre-laid legs joined at the BU, per-leg tensions and touchdown), Final bight lay-down (bight lowered from a stepping vessel on an auto-released rope), and transient Straight lay.
   - Hydrodynamic drag throughout (Morison-type, per-segment diameter/Cd, depth-varying current profile), Coulomb seabed friction on 3D bathymetry (flat/slope/profile/QGIS raster sampling), V2-compatible assembly JSON with new hydro columns, chute capstan-friction readout, MBR checking, CSV/3D-DXF export and results-to-map memory layers.

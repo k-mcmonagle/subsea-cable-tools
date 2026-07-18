@@ -121,6 +121,12 @@ def main() -> int:
         ("workbench topology + V3 adapter", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_workbench_adapter")),
         ("workbench rules engine", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_rules_engine")),
         ("workbench rules inputs + migrate", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_rules_inputs")),
+        ("planner timeline", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_planner_timeline")),
+        ("planner MS Project export", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_planner_msproject_export")),
+        ("planner store", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_planner_store")),
+        ("planner feature references", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_planner_feature_ref")),
+        ("planner RPL import", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_planner_rpl_import")),
+        ("planner spatial task tools", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_planner_spatial_tasks")),
         ("processing provider", _provider_loads),
         ("main plugin import", _plugin_imports),
     ]

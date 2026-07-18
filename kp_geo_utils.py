@@ -179,6 +179,23 @@ def _interpolate_on_segment(
     return QgsPointXY(x, y)
 
 
+def _interpolate_on_stored_segment(
+    p1, p2, target_dist_m: float, seg_len_m: float
+) -> QgsPointXY:
+    """Interpolate along the segment as stored/rendered in its current CRS.
+
+    The segment's total chainage may still be ellipsoidal; this function only
+    controls the visual path followed between its vertices. It is useful for
+    canvas playback, where replacing a geographic line edge with its spheroid
+    arc would visibly depart from the QGIS feature the user drew.
+    """
+    ratio = (target_dist_m / seg_len_m) if seg_len_m > 0 else 0.0
+    ratio = min(1.0, max(0.0, ratio))
+    x = float(p1.x()) + ratio * (float(p2.x()) - float(p1.x()))
+    y = float(p1.y()) + ratio * (float(p2.y()) - float(p1.y()))
+    return QgsPointXY(x, y)
+
+
 # ---------------------------------------------------------------------------
 # KP ↔ point primitives
 # ---------------------------------------------------------------------------
@@ -190,6 +207,7 @@ def point_at_kp(
     distance: QgsDistanceArea,
     *,
     clamp: bool = False,
+    follow_stored_geometry: bool = False,
 ) -> Optional[QgsPointXY]:
     """Return the point on the route at the given KP.
 
@@ -208,6 +226,11 @@ def point_at_kp(
         When ``True``, KPs outside ``[0, total_length_km]`` are clamped to the
         route start / end. When ``False`` (default), out-of-range returns
         ``None``.
+    follow_stored_geometry:
+        Keep interpolated points on each segment as stored in its CRS while
+        still using ``distance`` for segment chainage. The default follows
+        the spheroid arc for geographic CRSes, preserving the established KP
+        behaviour used by processing tools.
     """
 
     try:
@@ -248,9 +271,11 @@ def point_at_kp(
                 last_point = QgsPointXY(p2)
 
                 if target_m <= next_cum:
+                    if follow_stored_geometry:
+                        return _interpolate_on_stored_segment(
+                            p1, p2, target_m - cumulative, seg_len)
                     return _interpolate_on_segment(
-                        p1, p2, distance, target_m - cumulative, seg_len
-                    )
+                        p1, p2, distance, target_m - cumulative, seg_len)
 
                 cumulative = next_cum
 
@@ -379,6 +404,8 @@ def extract_line_segment(
     start_kp_km: float,
     end_kp_km: float,
     distance: QgsDistanceArea,
+    *,
+    follow_stored_geometry: bool = False,
 ) -> Optional[QgsGeometry]:
     """Extract a line segment between two KPs along a single (multi)polyline.
 
@@ -428,8 +455,12 @@ def extract_line_segment(
             next_cum = cumulative + seg_len
 
             if not started and next_cum >= start_m:
-                interp = _interpolate_on_segment(
-                    p1, p2, distance, start_m - cumulative, seg_len
+                interp = (
+                    _interpolate_on_stored_segment(
+                        p1, p2, start_m - cumulative, seg_len)
+                    if follow_stored_geometry else
+                    _interpolate_on_segment(
+                        p1, p2, distance, start_m - cumulative, seg_len)
                 )
                 try:
                     segment_points.append(p1.__class__(interp.x(), interp.y()))
@@ -441,8 +472,12 @@ def extract_line_segment(
                 if next_cum <= end_m:
                     segment_points.append(p2)
                 else:
-                    interp = _interpolate_on_segment(
-                        p1, p2, distance, end_m - cumulative, seg_len
+                    interp = (
+                        _interpolate_on_stored_segment(
+                            p1, p2, end_m - cumulative, seg_len)
+                        if follow_stored_geometry else
+                        _interpolate_on_segment(
+                            p1, p2, distance, end_m - cumulative, seg_len)
                     )
                     try:
                         segment_points.append(p1.__class__(interp.x(), interp.y()))
@@ -543,6 +578,7 @@ class RouteFrame:
         geoms: Sequence[QgsGeometry],
         feature_lengths_m: Sequence[float],
         distance: QgsDistanceArea,
+        follow_stored_geometry: bool = False,
     ) -> None:
         self._geoms: List[QgsGeometry] = list(geoms)
         self._feature_lengths_m: List[float] = list(feature_lengths_m)
@@ -554,6 +590,7 @@ class RouteFrame:
             running += float(length)
         self._total_m: float = running
         self._distance = distance
+        self._follow_stored_geometry = bool(follow_stored_geometry)
 
     # ----- builders -----
 
@@ -565,6 +602,7 @@ class RouteFrame:
         target_crs: Optional[QgsCoordinateReferenceSystem] = None,
         source_crs: Optional[QgsCoordinateReferenceSystem] = None,
         project: Optional[QgsProject] = None,
+        follow_stored_geometry: bool = False,
     ) -> "RouteFrame":
         """Build a ``RouteFrame`` from a feature source or iterable of geometries.
 
@@ -587,7 +625,7 @@ class RouteFrame:
             geoms = raw_geoms
 
         lengths = [measure_total_length_m(g, distance) for g in geoms]
-        return cls(geoms, lengths, distance)
+        return cls(geoms, lengths, distance, follow_stored_geometry)
 
     # ----- properties -----
 
@@ -610,7 +648,9 @@ class RouteFrame:
     # ----- queries -----
 
     def point_at_kp(self, kp_km: float, *, clamp: bool = False) -> Optional[QgsPointXY]:
-        return point_at_kp(self._geoms, kp_km, self._distance, clamp=clamp)
+        return point_at_kp(
+            self._geoms, kp_km, self._distance, clamp=clamp,
+            follow_stored_geometry=self._follow_stored_geometry)
 
     def kp_at_point(self, point_xy: QgsPointXY) -> KPHit:
         return kp_at_point(self._geoms, point_xy, self._distance)
@@ -642,7 +682,9 @@ class RouteFrame:
 
         # Single-feature fast path.
         if len(self._geoms) == 1:
-            return extract_line_segment(self._geoms[0], start_m / 1000.0, end_m / 1000.0, self._distance)
+            return extract_line_segment(
+                self._geoms[0], start_m / 1000.0, end_m / 1000.0, self._distance,
+                follow_stored_geometry=self._follow_stored_geometry)
 
         # Multi-feature: collect points across affected features.
         points: List = []
@@ -653,7 +695,9 @@ class RouteFrame:
                 continue
             local_start_km = max(0.0, start_m - f_start) / 1000.0
             local_end_km = min(self._feature_lengths_m[idx], end_m - f_start) / 1000.0
-            sub = extract_line_segment(geom, local_start_km, local_end_km, self._distance)
+            sub = extract_line_segment(
+                geom, local_start_km, local_end_km, self._distance,
+                follow_stored_geometry=self._follow_stored_geometry)
             if sub is None or sub.isEmpty():
                 continue
             for part in iter_line_parts(sub):

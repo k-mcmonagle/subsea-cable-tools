@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """Compatibility aliases for QGIS 3/Qt5 and QGIS 4/Qt6."""
 
-from qgis.PyQt.QtCore import QMetaType
+from qgis.PyQt.QtCore import QMetaType, Qt
 from qgis.PyQt.QtGui import QCursor
-from qgis.PyQt.QtWidgets import QAbstractItemView, QDialog, QHeaderView, QSizePolicy, QToolButton, QDialogButtonBox
+from qgis.PyQt.QtWidgets import (
+    QAbstractItemView, QDialog, QDialogButtonBox, QHeaderView, QMessageBox,
+    QSizePolicy, QToolButton,
+)
 
 try:
     from qgis.PyQt.QtCore import QVariant
@@ -18,9 +21,13 @@ except ImportError:  # pragma: no cover - QGIS 3 / Qt5
 from qgis.core import (
     Qgis,
     QgsMapLayer,
+    QgsMapLayerProxyModel,
     QgsProcessingParameterField,
     QgsProcessingParameterNumber,
+    QgsSnappingConfig,
+    QgsTolerance,
     QgsUnitTypes,
+    QgsVectorFileWriter,
     QgsWkbTypes,
 )
 
@@ -51,6 +58,46 @@ def _field_type(qmeta_member_name, qvariant_member_name):
     raise AttributeError(qmeta_member_name)
 
 
+def _layer_filter(member_name):
+    """QGIS 4 moved QgsMapLayerProxyModel filters to Qgis.LayerFilter."""
+    for scope_name in ("LayerFilter", "LayerFilters"):
+        scope = getattr(Qgis, scope_name, None)
+        if scope is not None and hasattr(scope, member_name):
+            return getattr(scope, member_name)
+    return _scoped_member(QgsMapLayerProxyModel, "Filter", member_name)
+
+
+def _wkb_type(member_name):
+    scope = getattr(Qgis, "WkbType", None)
+    if scope is not None and hasattr(scope, member_name):
+        return getattr(scope, member_name)
+    return _scoped_member(QgsWkbTypes, "Type", member_name)
+
+
+def _snapping_member(member_name, scope_names):
+    """Resolve snapping enums moved from legacy classes to Qgis in QGIS 4."""
+    for parent in (QgsSnappingConfig, QgsTolerance, Qgis):
+        for scope_name in scope_names:
+            scope = getattr(parent, scope_name, None)
+            if scope is not None and hasattr(scope, member_name):
+                return getattr(scope, member_name)
+        if hasattr(parent, member_name):
+            return getattr(parent, member_name)
+    raise AttributeError(member_name)
+
+
+def snapping_type_flags(*members):
+    """Build the QFlags wrapper required by setTypeFlag on QGIS 3."""
+    value = 0
+    for member in members:
+        value |= int(member)
+    for parent in (Qgis, QgsSnappingConfig):
+        wrapper = getattr(parent, "SnappingTypes", None)
+        if wrapper is not None:
+            return wrapper(value)
+    return value
+
+
 def qt_exec(obj, *args, **kwargs):
     exec_method = getattr(obj, "exec", None)
     if exec_method is None:
@@ -69,6 +116,18 @@ SELECTION_BEHAVIOR_SELECT_ROWS = _scoped_member(QAbstractItemView, "SelectionBeh
 EDIT_TRIGGER_DOUBLE_CLICKED = _scoped_member(QAbstractItemView, "EditTrigger", "DoubleClicked")
 EDIT_TRIGGER_SELECTED_CLICKED = _scoped_member(QAbstractItemView, "EditTrigger", "SelectedClicked")
 EDIT_TRIGGER_EDIT_KEY_PRESSED = _scoped_member(QAbstractItemView, "EditTrigger", "EditKeyPressed")
+DRAG_DROP_MODE_INTERNAL_MOVE = _scoped_member(QAbstractItemView, "DragDropMode", "InternalMove")
+DROP_ACTION_MOVE = _scoped_member(Qt, "DropAction", "MoveAction")
+
+SNAPPING_MODE_ALL_LAYERS = _snapping_member("AllLayers", ("SnappingMode", "Mode"))
+SNAPPING_MODE_PER_LAYER = _snapping_member(
+    "AdvancedConfiguration", ("SnappingMode", "Mode")) if (
+        hasattr(getattr(Qgis, "SnappingMode", object), "AdvancedConfiguration") or
+        hasattr(QgsSnappingConfig, "AdvancedConfiguration")
+    ) else _snapping_member("PerLayer", ("SnappingMode", "Mode"))
+SNAPPING_TYPE_VERTEX = _snapping_member("Vertex", ("SnappingType", "Type", "TypeFlag"))
+SNAPPING_TYPE_SEGMENT = _snapping_member("Segment", ("SnappingType", "Type", "TypeFlag"))
+SNAPPING_UNIT_PIXELS = _snapping_member("Pixels", ("MapToolUnit", "UnitType"))
 
 HEADER_RESIZE_MODE_INTERACTIVE = _scoped_member(QHeaderView, "ResizeMode", "Interactive")
 
@@ -87,6 +146,10 @@ GEOMETRY_POINT = _scoped_member(QgsWkbTypes, "GeometryType", "PointGeometry")
 GEOMETRY_LINE = _scoped_member(QgsWkbTypes, "GeometryType", "LineGeometry")
 GEOMETRY_POLYGON = _scoped_member(QgsWkbTypes, "GeometryType", "PolygonGeometry")
 GEOMETRY_NULL = _scoped_member(QgsWkbTypes, "GeometryType", "NullGeometry")
+
+WKB_POINT = _wkb_type("Point")
+WKB_LINESTRING = _wkb_type("LineString")
+WKB_NO_GEOMETRY = _wkb_type("NoGeometry")
 
 LAYER_VECTOR = _scoped_member(QgsMapLayer, "LayerType", "VectorLayer")
 LAYER_RASTER = _scoped_member(QgsMapLayer, "LayerType", "RasterLayer")
@@ -132,6 +195,30 @@ BUTTON_BOX_DISCARD = _scoped_member(QDialogButtonBox, "StandardButton", "Discard
 
 # QDialogButtonBox button roles
 BUTTON_BOX_ACCEPT_ROLE = _scoped_member(QDialogButtonBox, "ButtonRole", "AcceptRole")
+
+# Window flags used by floating planner docks.
+WINDOW_TYPE_WINDOW = _scoped_member(Qt, "WindowType", "Window")
+WINDOW_HINT_CUSTOMIZE = _scoped_member(Qt, "WindowType", "CustomizeWindowHint")
+WINDOW_HINT_TITLE = _scoped_member(Qt, "WindowType", "WindowTitleHint")
+WINDOW_HINT_MIN_MAX = _scoped_member(Qt, "WindowType", "WindowMinMaxButtonsHint")
+WINDOW_HINT_CLOSE = _scoped_member(Qt, "WindowType", "WindowCloseButtonHint")
+
+PEN_STYLE_DASH = _scoped_member(Qt, "PenStyle", "DashLine")
+ITEM_FLAG_EDITABLE = _scoped_member(Qt, "ItemFlag", "ItemIsEditable")
+ITEM_DATA_USER_ROLE = _scoped_member(Qt, "ItemDataRole", "UserRole")
+
+MAP_LAYER_FILTER_POINT = _layer_filter("PointLayer")
+MAP_LAYER_FILTER_LINE = _layer_filter("LineLayer")
+
+MESSAGE_BOX_YES = _scoped_member(QMessageBox, "StandardButton", "Yes")
+MESSAGE_BOX_NO = _scoped_member(QMessageBox, "StandardButton", "No")
+
+VECTOR_WRITER_OVERWRITE_LAYER = _scoped_member(
+    QgsVectorFileWriter, "ActionOnExistingFile", "CreateOrOverwriteLayer")
+VECTOR_WRITER_OVERWRITE_FILE = _scoped_member(
+    QgsVectorFileWriter, "ActionOnExistingFile", "CreateOrOverwriteFile")
+VECTOR_WRITER_NO_ERROR = _scoped_member(
+    QgsVectorFileWriter, "WriterError", "NoError")
 
 
 def get_event_global_pos(event):

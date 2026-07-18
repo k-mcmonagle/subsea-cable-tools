@@ -73,6 +73,8 @@ class SubseaCableTools:
         self.transit_measure_tool = None
         self.workbench_dock = None
         self.workbench_action = None
+        self.planner_dock = None
+        self.planner_action = None
 
     def tr(self, message):
         """Return the translation for a string."""
@@ -150,6 +152,18 @@ class SubseaCableTools:
         self.iface.addToolBarIcon(self.workbench_action)
         self.iface.addPluginToMenu(self.menu, self.workbench_action)
         self.actions.append(self.workbench_action)
+
+        # Spatial planning scenario editor and simulator
+        planner_icon = QIcon(":/plugins/subsea_cable_tools/icon.png")
+        self.planner_action = QAction(
+            planner_icon, "Planner",
+            self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
+        self.planner_action.setToolTip(
+            "Build map-linked work plans, simulate vessel progress, and copy tasks to MS Project.")
+        self.planner_action.triggered.connect(self.show_planner)
+        self.iface.addToolBarIcon(self.planner_action)
+        self.iface.addPluginToMenu(self.menu, self.planner_action)
+        self.actions.append(self.planner_action)
 
         # Transit Measure Tool action
         transit_icon_path = os.path.join(self.plugin_dir, 'transit_measure_icon.png')
@@ -279,6 +293,22 @@ class SubseaCableTools:
                 pass
             self.workbench_dock = None
 
+        # Clean up the Planner dock and its timer/map items.
+        if getattr(self, 'planner_dock', None):
+            try:
+                self.planner_dock.shutdown()
+            except Exception:
+                pass
+            try:
+                self.iface.removeDockWidget(self.planner_dock)
+            except Exception:
+                pass
+            try:
+                self.planner_dock.deleteLater()
+            except Exception:
+                pass
+            self.planner_dock = None
+
         # Remove actions from menu and toolbar
         if hasattr(self, 'actions'):
             for action in self.actions:
@@ -395,6 +425,23 @@ class SubseaCableTools:
             self.iface.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.workbench_dock)
         self.workbench_dock.show()
         self.workbench_dock.refresh_tree()
+
+    def show_planner(self):
+        """Show the spatial Planner dock."""
+        if not self.planner_dock:
+            try:
+                from .planner.planner_dock import PlannerDock
+            except Exception as e:
+                from qgis.PyQt.QtWidgets import QMessageBox
+
+                QMessageBox.critical(
+                    self.iface.mainWindow(), "Subsea Cable Tools",
+                    "Planner could not be opened.\n\nDetails: %s" % e)
+                return
+            self.planner_dock = PlannerDock(self.iface)
+            self.iface.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.planner_dock)
+        self.planner_dock.show()
+        self.planner_dock.refresh()
 
     def activate_transit_measure_tool(self):
         if self.transit_measure_tool is None:

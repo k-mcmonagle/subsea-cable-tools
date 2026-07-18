@@ -35,6 +35,15 @@ CHECKS = (
     ("processing field enum", re.compile(r"QgsProcessingParameterField\.(Numeric|Any)")),
 )
 
+REQUIRED_COMPAT_ALIASES = (
+    "WINDOW_TYPE_WINDOW", "WINDOW_HINT_CUSTOMIZE", "WINDOW_HINT_TITLE",
+    "WINDOW_HINT_MIN_MAX", "WINDOW_HINT_CLOSE",
+    "WKB_POINT", "WKB_LINESTRING", "WKB_NO_GEOMETRY",
+    "VECTOR_WRITER_OVERWRITE_LAYER", "VECTOR_WRITER_OVERWRITE_FILE",
+    "VECTOR_WRITER_NO_ERROR",
+    "DRAG_DROP_MODE_INTERNAL_MOVE", "DROP_ACTION_MOVE",
+)
+
 
 def iter_python_files() -> list[Path]:
     files: list[Path] = []
@@ -50,6 +59,10 @@ def iter_python_files() -> list[Path]:
 
 def main() -> int:
     failures: list[str] = []
+    compat_text = (ROOT / "qgis_compat.py").read_text(encoding="utf-8-sig")
+    for alias in REQUIRED_COMPAT_ALIASES:
+        if not re.search(rf"^\s*{alias}\s*=", compat_text, re.MULTILINE):
+            failures.append(f"qgis_compat.py: missing compatibility alias: {alias}")
     for path in iter_python_files():
         rel = path.relative_to(ROOT)
         for line_number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), start=1):

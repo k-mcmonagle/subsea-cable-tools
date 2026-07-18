@@ -5,6 +5,35 @@ All notable changes to the Subsea Cable Tools QGIS plugin will be documented in 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] - 2026-07-15
+
+### Added
+
+- **Planner (beta):** a dockable spatial planner for creating, renaming, duplicating, and deleting planning scenarios. Each scenario owns ordered tasks and resource lanes in a separate per-project `<project>_planner.gpkg` with a versioned schema.
+- **Map-linked task editor:** tasks can link to point or line features from any project vector layer. The table shows measured distance in nautical miles and speed where relevant. Line length and speed produce a live computed duration; editing duration instead recalculates speed. Measurements use the project ellipsoid in geographic or projected CRSes. Predecessor/lag links and resource availability produce start/finish times, while unresolved saved references remain visible for repair.
+- **Planner-owned spatial tasks:** the versioned schema includes `pow_task_point` and `pow_task_line` GeoPackage layers keyed to task/scenario IDs; schema v3 adds task outlines and resource start offsets. Their inspection attributes mirror task order, resource, speed, computed duration, and notes; geometry edits invalidate the route cache and recompute the schedule.
+- **Map sketching:** place a task point or draw a multi-vertex task route directly from the Linked Feature menu. A batch “Sketch tasks” workflow can create one whole-route task, one task per leg, and optional waypoint tasks with individual names and operation durations. A persistent control panel supports pause/continue, undo, clear, accept, and cancel; vertices remain draggable and can be removed with right-click.
+- **Task-list usability:** Ctrl/Shift multi-selection supports dependency-safe bulk deletion and block moves. Selected tasks can be moved with the toolbar controls or reordered by dragging rows.
+- **Groups and larger plans:** tasks can be indented/outdented in the familiar MS Project style. A row automatically becomes a bold summary when it has indented children and can be collapsed or expanded by double-clicking; its start, finish, and duration are derived from descendant operational tasks. Compact 24 px rows show more of long plans.
+- **Undo/redo:** task edits, grouping, ordering, links, route merges, imports, sketches, and deletions can be undone/redone, including restoration of Planner-owned point and line geometry.
+- **Precise sketching:** point and route sketch dialogs can independently snap to map points/vertices and line segments. Vertices can also be entered as exact WGS84 latitude/longitude or as a KP on an existing line task; RPL-derived tasks expose their source KP range.
+- **Multi-resource SIMOPS:** resources run on independent concurrent lanes, can have different availability offsets from the scenario anchor, and can be coordinated by cross-resource predecessor links. Resource colours are selected visually and drive playback marker colours.
+- **RPL import:** import a complete RPL or KP subset from the Cable Route Workbench or a project line layer. Preview one task per segment, one for the whole range, or consecutive groups by cable type/code, protection method, and lay vessel; assign cable-type lay speeds before committing independent geometry snapshots with source/KP provenance.
+- **Spatial task merge:** contiguous selected line tasks on the same resource can be merged into one planner-owned route; matching computed speeds remain computed, while mixed operations retain their summed scheduled duration.
+- **Spatial playback:** play/pause, task-boundary stepping, speed control, and timeline scrubbing animate resource markers along measured routes with completed/remaining styling. A default-on label follows each marker; users can show task name/number, resource, progress, clock, and speed/distance independently. Playback uses canvas items only and is cleaned up on close or plugin unload.
+- **MS Project clipboard export:** Entry-table TSV in Name, Duration, Start, Finish, Predecessors, Resource Names order, using 24/7 elapsed-hour durations.
+- Qt-free scheduling and export engines plus planner store coverage in the QGIS smoke runner. Floating planner docks request native minimise/maximise/close controls and expose a Re-dock context action.
+
+### Fixed
+
+- **Planner playback route divergence:** ellipsoidal measurement and generic geographic KP interpolation previously caused a vessel marker and its completed/remaining bands to follow the great-circle arc between sparse vertices instead of the QGIS line the user sketched. Planner playback now linear-references the stored/reprojected feature itself while retaining ellipsoidal segment lengths for distance, speed, and duration. Regression coverage includes 3,231 km high-latitude routes in EPSG:4326 and EPSG:3857, plus a 6,679 km WGS84 distance check.
+
+### Notes
+
+- No new dependencies; the planner uses Python stdlib and QGIS/Qt APIs already shipped with the plugin.
+- External feature links still rely on stable provider feature IDs and degrade to an amber repair state if unavailable. Drawn/imported planner geometry uses stable UUID keys and is duplicated independently with its scenario.
+- Completing a planner sketch restores ordinary prior map tools, but deliberately falls back to Pan when Transit Measure was previously active so its dialog is not unexpectedly reopened.
+
 ## [Unreleased] — Cable Route Workbench (beta)
 
 **New module: Cable Route Workbench** — assemblies, RPLs, and cable systems become first-class project entities backed by a per-project GeoPackage (`<project>_workbench.gpkg`), instead of loose point/line layers and JSON hidden in dialog settings.
