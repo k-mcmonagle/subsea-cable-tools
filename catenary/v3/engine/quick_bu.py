@@ -378,12 +378,16 @@ def leg_solution_frozen(p_top: "np.ndarray", path_pts: "np.ndarray",
     Touchdown rules (the essence of the friction model):
 
     * surplus over the tangent-catenary length lays new cable down;
-    * cable is picked back up only when *geometrically* forced (suspended
-      length shorter than the straight chord to the touchdown) — in the
-      regime between chord and tangent length the span simply tightens
-      into a non-tangent catenary with rising tension while friction holds
-      the touchdown in place. (A pure tangency rule would peel cable off
-      the bed catastrophically whenever the vessel moves away.)
+    * a deficit peels cable back off the bed until the span is tangent
+      again. Tangency at the touchdown is a *vertical* equilibrium
+      requirement — the bed can only push up, so a span meeting laid cable
+      at an angle would lift it regardless of friction. Friction acts in
+      plan only: it keeps the laid polyline frozen in place and sets the
+      bed tension decay; it does not hold the touchdown against peel.
+      (An earlier chord-based rule held the touchdown until the span went
+      straight — that rendered an unphysical kink at the TDP with a
+      tension spike whenever the vessel moved away, and trapped slack
+      states in a permanent near-vertical hang.)
     """
     p_top = np.asarray(p_top, dtype=float)
     pts = np.asarray(path_pts, dtype=float).reshape(-1, 3).copy()
@@ -397,10 +401,13 @@ def leg_solution_frozen(p_top: "np.ndarray", path_pts: "np.ndarray",
         chord = math.hypot(D, float(p_top[2] - tdp[2]))
         return D, h, H, s_tan, chord
 
-    # Walk the touchdown: lay down surplus; pick up only under geometric
-    # necessity (see docstring).
+    # Walk the touchdown: lay down surplus; peel a deficit back off the bed
+    # until the span is tangent again (see docstring). A peeled segment can
+    # overshoot tangency (path segments may be longer than ds); the surplus
+    # branch then lays the excess back in fine steps, so the walk settles
+    # inside the +/- 0.5*ds band around tangency.
     pooled = False
-    max_iter = int(abs(s_free) / max(ds, 0.1)) + len(pts) + 64
+    max_iter = int(abs(s_free) / max(ds, 0.1)) + 2 * len(pts) + 64
     for _ in range(max_iter):
         tdp = pts[-1]
         D, h, H, s_tan, chord = geom(tdp)
@@ -414,7 +421,7 @@ def leg_solution_frozen(p_top: "np.ndarray", path_pts: "np.ndarray",
             new = np.array([nx, ny, -float(bathy.depth_at(nx, ny))])
             s_free -= float(np.linalg.norm(new - tdp))
             pts = np.vstack([pts, new])
-        elif s_free < chord * (1.0 + 1e-6) and len(pts) > 1:
+        elif s_free < s_tan - 0.5 * ds and len(pts) > 1:
             s_free += float(np.linalg.norm(pts[-1] - pts[-2]))
             pts = pts[:-1]
         else:
@@ -449,11 +456,11 @@ def leg_solution_frozen(p_top: "np.ndarray", path_pts: "np.ndarray",
         e_td = e_td / nrm if nrm > 1e-9 else np.zeros(2)
         F_top = np.array([H * e_td[0], H * e_td[1], -w * s_susp])
     else:
-        # Slack pooling, or tight/taut non-tangent span between chord and
-        # tangency: a two-point catenary from the top to the (friction-held)
-        # touchdown carries the state; its lower-end tension is the residual
-        # bottom tension and its exact end force loads the top (this is what
-        # makes a tightening leg pull back on the BU / show rising tension).
+        # Slack pooling (no horizontal room for a tangent span), or the
+        # path is down to its anchor point with a deficit: a two-point
+        # catenary from the top to the touchdown carries the state; its
+        # lower-end tension is the residual bottom tension and its exact
+        # end force loads the top.
         cat = two_point_catenary(p_top, tdp, max(s_free, 0.05), w, n=n_susp)
         pts_s = cat["xyz"]                      # top -> TDP
         t_sus = cat["tension"]

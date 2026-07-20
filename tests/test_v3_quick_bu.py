@@ -191,6 +191,52 @@ def test_blank_segment_weight_uses_defaults():
         _assert("buoyant" in str(exc) or "non-sinking" in str(exc), str(exc))
 
 
+def test_frozen_lay_peels_to_tangency():
+    """When the top moves away without payout, the frozen-lay span must
+    peel cable off the bed and stay tangent at the touchdown — never render
+    a kinked non-tangent span with a tension spike (the old chord-based
+    pick-up rule held the TDP and produced exactly that)."""
+    depth = 80.0
+    bathy = bathy_mod.FlatBathymetry(depth)
+    w = 180.0
+
+    # Healthy tangent start: touchdown mid-way along a 400 m anchor run.
+    p_top = np.array([0.0, 0.0, -5.0])
+    L = 430.0
+    sol = qk.leg_solution(p_top, (-400.0, 0.0), bathy, L, w)
+    _assert(sol["tdp"] is not None, "init must touch down")
+    path = np.asarray(sol["xyz"])[np.asarray(sol["contact"], dtype=bool)][::-1].copy()
+
+    def depart_angle_deg(res):
+        xyz = np.asarray(res["xyz"])
+        i = int(np.argmax(np.asarray(res["contact"], dtype=bool)))
+        a = xyz[i - 1] - xyz[i]
+        return math.degrees(math.atan2(a[2], float(np.hypot(a[0], a[1]))))
+
+    # Vessel moves away with no payout: cable must lift off tangentially.
+    n0 = len(path)
+    for _ in range(2):
+        p_top = p_top + np.array([10.0, 0.0, 0.0])
+        res = qk.leg_solution_frozen(p_top, path, L, w, bathy, 0.3)
+        _assert(res["path_pts"] is not None, "must stay on the bed")
+        path = res["path_pts"]
+        ang = depart_angle_deg(res)
+        _assert(abs(ang) < 5.0,
+                f"span must stay tangent at the TDP (depart {ang:.1f} deg)")
+        _assert(res["H_bottom"] < 2.0 * w * depth * 10,
+                f"no tension spike at the TDP (H = {res['H_bottom']:.0f} N)")
+    _assert(len(path) < n0, "tightening must peel laid cable off the bed")
+
+    # Paying the length back out must re-lay and stay tangent too.
+    for _ in range(3):
+        L += 10.0
+        res = qk.leg_solution_frozen(p_top, path, L, w, bathy, 0.3)
+        path = res["path_pts"]
+        ang = depart_angle_deg(res)
+        _assert(abs(ang) < 5.0,
+                f"re-laying must stay tangent (depart {ang:.1f} deg)")
+
+
 def test_quick_deployment_runs_in_seconds_and_lands():
     h = 80.0
     bathy = bathy_mod.FlatBathymetry(h)
@@ -262,6 +308,7 @@ def run_all():
         test_leg_solution_closure_and_tangency,
         test_quick_matches_full_solver_static_hold,
         test_blank_segment_weight_uses_defaults,
+        test_frozen_lay_peels_to_tangency,
         test_quick_deployment_runs_in_seconds_and_lands,
         test_quick_full_two_sheave_deployment,
     ]
