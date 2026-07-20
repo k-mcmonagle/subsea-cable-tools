@@ -684,6 +684,21 @@ class PyQtGraphAxis:
     def set_xlabel(self, label: str):
         self.plot_item.setLabel("bottom", label)
 
+    def set_time_axis(self, enabled: bool = True, utc_offset: float = 0.0):
+        """Format the bottom axis as dates/times (values are epoch seconds).
+
+        ``utc_offset`` of 0 keeps the labels in UTC to match the naive epoch
+        seconds produced by the dataset (``datetime.utcfromtimestamp``).
+        """
+        try:
+            if enabled:
+                date_axis = pg.DateAxisItem(orientation="bottom", utcOffset=utc_offset)
+                self.plot_item.setAxisItems({"bottom": date_axis})
+            else:
+                self.plot_item.setAxisItems({"bottom": pg.AxisItem(orientation="bottom")})
+        except Exception:
+            pass
+
     def set_secondary_xaxis(self, label: str, formatter: Callable[[float], str]):
         if self._secondary_xaxis is None:
             axis = _SecondaryXAxisItem(formatter, orientation="bottom")

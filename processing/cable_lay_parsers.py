@@ -393,14 +393,23 @@ def gpkg_layer_uri(gpkg_path: str, layer_name: str) -> str:
     return f"{gpkg_path}|layername={layer_name}"
 
 
+def gpkg_stem(gpkg_path: str) -> str:
+    """Sanitised file stem used as the layer-name prefix and layer-group name.
+
+    e.g. ``ProjectX.gpkg`` -> ``ProjectX``. Non-alphanumeric characters are
+    collapsed to underscores so the result is a safe GeoPackage table name.
+    """
+    stem = os.path.splitext(os.path.basename(gpkg_path))[0]
+    return re.sub(r"[^A-Za-z0-9]+", "_", stem).strip("_")
+
+
 def prefixed_layer_name(gpkg_path: str, layer_type: str) -> str:
     """Physical layer name for a canonical type, prefixed with the file stem.
 
     e.g. ``ProjectX.gpkg`` + ``cable_lay`` -> ``ProjectX_cable_lay``. The stem is
     sanitised to alphanumerics/underscores so it is a safe GeoPackage table name.
     """
-    stem = os.path.splitext(os.path.basename(gpkg_path))[0]
-    stem = re.sub(r"[^A-Za-z0-9]+", "_", stem).strip("_")
+    stem = gpkg_stem(gpkg_path)
     return f"{stem}_{layer_type}" if stem else layer_type
 
 
@@ -507,3 +516,49 @@ CANONICAL_SCHEMAS = {
         ],
     ),
 }
+
+
+# ---------------------------------------------------------------------------
+# QC layers. ``qc_findings`` stores one point per QC result (symbolisable on the
+# map); ``qc_config`` is an attribute-only table holding the saved settings for
+# each check so a QC run is repeatable and travels with the project GeoPackage.
+# Written by the "Run Cable Lay QC" algorithm / the Data Explorer via the same
+# ``write_layer_to_gpkg`` path, so sibling layers are always preserved.
+# ---------------------------------------------------------------------------
+QC_FINDINGS_SPECS: List[Tuple[str, str]] = [
+    ("check_id", "str"), ("severity", "str"), ("message", "str"),
+    ("value", "float"), ("threshold", "float"),
+    ("time_start", "str"), ("time_end", "str"),
+    ("kp_start", "float"), ("kp_end", "float"),
+    ("source_file", "str"), ("src_layer", "str"),
+    ("feature_fid", "int"), ("n_records", "int"),
+    ("run_id", "str"), ("run_time", "str"),
+]
+
+QC_CONFIG_SPECS: List[Tuple[str, str]] = [
+    ("check_id", "str"), ("enabled", "int"),
+    ("params_json", "str"), ("updated", "str"),
+]
+
+QC_SCHEMAS = {
+    "qc_findings": (QgsWkbTypes.Point, QC_FINDINGS_SPECS),
+    "qc_config": (QgsWkbTypes.NoGeometry, QC_CONFIG_SPECS),
+}
+
+
+def ensure_qc_layers(gpkg_path: str, transform_context) -> List[str]:
+    """Create the ``qc_findings`` / ``qc_config`` layers if they are absent.
+
+    Safe to call on any existing cable-lay GeoPackage (older ones created before
+    the QC layers existed). Returns the physical names of any layers created.
+    """
+    created: List[str] = []
+    for layer_type, (wkb_type, specs) in QC_SCHEMAS.items():
+        layer_name = prefixed_layer_name(gpkg_path, layer_type)
+        if open_gpkg_layer(gpkg_path, layer_name) is not None:
+            continue
+        write_layer_to_gpkg(
+            gpkg_path, layer_name, fields_from_specs(specs), wkb_type, [], transform_context
+        )
+        created.append(layer_name)
+    return created
