@@ -36,6 +36,7 @@ from .scene import (
 )
 
 KNOT = 0.514444
+KMH = 1.0 / 3.6      # km/h -> m/s
 
 
 @dataclass
@@ -61,14 +62,15 @@ class V3Config:
     # they are converted to the engine's math frame (0 = +x/east, CCW) here.
     chute_height_m: float = 5.0
     lay_azimuth_deg: float = 0.0             # ship course; cable trails behind
-    ship_speed_kn: float = 6.0
+    ship_speed_mps: float = 11.1 * KMH       # SI; the UI edits km/h
     slack_percent: float = 2.0
     # Parametric ship shape (drawn geometry; chute stays the engine anchor).
-    ship_length_m: float = 60.0
-    ship_beam_m: float = 12.0
+    # Default vessel: 127 m x 27 m with the cable departing at the aft end.
+    ship_length_m: float = 127.0
+    ship_beam_m: float = 27.0
     crp_fwd_m: float = 0.0                   # CRP forward of midship
     crp_stbd_m: float = 0.0                  # CRP starboard of centreline
-    chute_fwd_m: float = 0.0                 # chute forward of CRP
+    chute_fwd_m: float = -63.5               # chute forward of CRP (aft end)
     chute_stbd_m: float = 0.0                # chute starboard of CRP
     chute_radius_m: float = 0.0              # overboarding chute radius (drawn)
     # Static & steady solve mode ------------------------------------------
@@ -86,7 +88,7 @@ class V3Config:
     scenario: str = "bu_deployment"          # straight_lay | bu_deployment | final_bight | bu_full
     op: dict = field(default_factory=dict)   # scenario-specific parameters
     # Two-sheave geometry (bu_full): offsets in the vessel frame.
-    sheave_fwd_m: float = 0.0
+    sheave_fwd_m: float = -63.5
     sheave_spacing_m: float = 12.0
     # Solver ----------------------------------------------------------------
     target_ds_m: float = 5.0
@@ -329,7 +331,7 @@ def run_static(cfg: V3Config, cancel: Optional[Callable[[], bool]] = None,
 def run_steady(cfg: V3Config, cancel: Optional[Callable[[], bool]] = None) -> RunOutput:
     bathy = build_bathymetry(cfg)
     depth0 = float(bathy.depth_at(0.0, 0.0))
-    V = cfg.ship_speed_kn * KNOT
+    V = cfg.ship_speed_mps
     inp = _steady_input(cfg, depth0, V)
     res = sl.solve_steady_lay(inp, cfg.solve_mode, _solve_value_si(cfg))
 
@@ -363,8 +365,8 @@ def run_steady(cfg: V3Config, cancel: Optional[Callable[[], bool]] = None) -> Ru
     _multi_segment_notice(cfg, out, "steady-lay mode")
     wrap = math.radians(cfg.chute_wrap_deg) if cfg.chute_wrap_deg > 0 else math.radians(abs(res.exit_angle_deg))
     out.facts = {
-        "Ship speed": f"{cfg.ship_speed_kn:.2f} kn",
-        "Pay-out": f"{cfg.ship_speed_kn * (1 + cfg.slack_percent / 100):.2f} kn ({cfg.slack_percent:.1f}% slack)",
+        "Ship speed": f"{cfg.ship_speed_mps / KMH:.2f} km/h",
+        "Pay-out": f"{cfg.ship_speed_mps * (1 + cfg.slack_percent / 100) / KMH:.2f} km/h ({cfg.slack_percent:.1f}% slack)",
         "Bottom tension": f"{res.T0_N / 1000.0:.2f} kN",
         "Top tension": f"{res.top_tension_N / 1000.0:.2f} kN",
         "Tension at machinery (capstan mu={:.2f})".format(cfg.chute_mu):
@@ -391,7 +393,7 @@ def _build_scenario(cfg: V3Config, bathy, kind: str, *, static_only: bool = Fals
     defaults = build_defaults(cfg)
     items = build_assembly(cfg)
     op = dict(cfg.op)
-    V = float(op.get("ship_speed_kn", cfg.ship_speed_kn)) * KNOT
+    V = float(op.get("ship_speed_mps", cfg.ship_speed_mps))
 
     if kind == "straight_lay":
         return scen.straight_lay(
@@ -401,6 +403,7 @@ def _build_scenario(cfg: V3Config, bathy, kind: str, *, static_only: bool = Fals
             duration_s=float(op.get("duration_s", 1800.0)),
             chute_height_m=cfg.chute_height_m,
             target_ds_m=cfg.target_ds_m,
+            course_deg=compass_to_math_deg(cfg.lay_azimuth_deg),
         )
     if kind == "bu_deployment":
         return scen.bu_deployment(
@@ -482,8 +485,11 @@ def _bu_full_kwargs(cfg: V3Config, op: dict) -> dict:
         vessel_heading_deg=compass_to_math_deg(cfg.lay_azimuth_deg),
         schedule=schedule,
         tail_length_m=float(op.get("tail_length_m", 90.0)),
+        tail_leg1_m=(float(op["tail_leg1_m"]) if op.get("tail_leg1_m") is not None else None),
+        tail_leg2_m=(float(op["tail_leg2_m"]) if op.get("tail_leg2_m") is not None else None),
+        tail_trunk_m=(float(op["tail_trunk_m"]) if op.get("tail_trunk_m") is not None else None),
         payout_mps=float(op.get("payout_mps", 0.4)),
-        lay_speed_mps=float(op.get("ship_speed_kn", cfg.ship_speed_kn)) * KNOT,
+        lay_speed_mps=float(op.get("ship_speed_mps", cfg.ship_speed_mps)),
         trunk_slack_pct=cfg.trunk_slack_pct,
         target_ds_m=cfg.target_ds_m,
     )
@@ -590,7 +596,7 @@ def run_static_hold(cfg: V3Config, cancel: Optional[Callable[[], bool]] = None,
 
     facts: Dict[str, str] = {}
     for c in snap.chains:
-        facts[f"{c.name}: top / end tension"] = f"{c.top_tension_kN:.2f} / {c.end_tension_kN:.2f} kN"
+        facts[f"{c.name}: top / TDP / end tension"] = _fmt_tensions(c)
         facts[f"{c.name}: min bend radius"] = _fmt_radius(c.min_radius_m, None)
     if cfg.static_config == "bu":
         xyz = snap.junction_xyz.get("BU")
@@ -613,6 +619,61 @@ def run_static_hold(cfg: V3Config, cancel: Optional[Callable[[], bool]] = None,
     out.facts = facts
     _mbr_check_snapshot(out, snap, build_assembly(cfg), build_defaults(cfg))
     return out
+
+
+def build_manual_controller(cfg: V3Config):
+    """Construct a :class:`manual.ManualBUController` over the quick analytic
+    backend for interactive driving. Returns ``(controller, bathy)``.
+
+    Uses the same scenario builder as the scripted operation run; the manual
+    controller extracts the deployment's discrete events (overboard BU / leg-2
+    transfer) from the scenario and then disarms the schedule. No balance
+    controller is attached — manual payout stays exactly as the operator
+    commands it."""
+    from ..engine.manual import ManualBUController
+    from ..engine.quick_bu import QuickOperationSimulator
+
+    if cfg.scenario not in ("bu_deployment", "bu_full"):
+        raise ValueError("Manual mode supports the BU deployment scenarios "
+                         "(choose 'BU deployment' or 'BU deployment — full').")
+    bathy = build_bathymetry(cfg)
+    scn = _build_scenario(cfg, bathy, cfg.scenario)
+    current = build_current(cfg)
+    opts = tl.SimOptions(
+        rho_water=cfg.rho_water,
+        current_at=(current.velocity_at if current else None),
+    )
+    sim = QuickOperationSimulator(scn, bathy, opts)
+    op = dict(cfg.op)
+    target = None
+    if cfg.scenario == "bu_full":
+        target = (float(op.get("target_x", 0.0)), float(op.get("target_y", 0.0)))
+    nominal = float(op.get("payout_mps", 0.4)) or 0.4
+    controller = ManualBUController(
+        sim, nominal_speed_mps=max(nominal, 0.1), target_xy=target)
+    return controller, bathy
+
+
+def manual_bed_grid(cfg: V3Config, bathy, snap, target_xy=None) -> BedGrid:
+    """Bed grid covering the manual scene (chains + vessel + target)."""
+    xyz_list = [c.xyz for c in snap.chains]
+    xyz_list.append(np.array([[snap.vessel_xy[0], snap.vessel_xy[1], 0.0]]))
+    if target_xy is not None:
+        xyz_list.append(np.array([[target_xy[0], target_xy[1], 0.0]]))
+    (x0, x1), (y0, y1) = _bed_extent(xyz_list)
+    gx, gy, Z = bathy_mod.sample_grid(bathy, (x0, x1), (y0, y1), n=70)
+    return BedGrid(x=gx, y=gy, z=Z)
+
+
+def manual_scene(snap, cfg: V3Config, bathy, bed: BedGrid,
+                 target_xy=None, title: str = "") -> SceneData:
+    """Render one manual snapshot, adding the BU landing target marker."""
+    scene = snapshot_scene(snap, bed, title=title, cfg=cfg)
+    if target_xy is not None:
+        tz = -float(bathy.depth_at(target_xy[0], target_xy[1]))
+        scene.markers.append(
+            Marker((float(target_xy[0]), float(target_xy[1]), tz), "Target", "target"))
+    return scene
 
 
 def run_operation(cfg: V3Config, progress: Optional[Callable[[float, str], bool]] = None,
@@ -658,8 +719,9 @@ def run_operation(cfg: V3Config, progress: Optional[Callable[[float, str], bool]
     out.warnings = list(result.warnings)
     if quality == "quick":
         out.warnings.append(
-            "Quick analytic model: closed-form catenaries, no seabed "
-            "friction, drag or lay history — confirm with the full solver.")
+            "Quick analytic model: closed-form catenaries with a frozen-lay "
+            "seabed (laid cable held in place; bed tension decays by "
+            "friction), no hydrodynamic drag — confirm with the full solver.")
     elif quality == "draft":
         out.warnings.append(
             "Draft quality: coarse mesh and loose tolerances — re-run at "
@@ -678,9 +740,7 @@ def run_operation(cfg: V3Config, progress: Optional[Callable[[float, str], bool]
         last = result.snapshots[-1]
         out.facts = {"Steps": str(len(result.snapshots)), "End time": f"{last.t_s:.0f} s"}
         for c in last.chains:
-            out.facts[f"{c.name}: top / end tension"] = (
-                f"{c.top_tension_kN:.2f} / {c.end_tension_kN:.2f} kN"
-            )
+            out.facts[f"{c.name}: top / TDP / end tension"] = _fmt_tensions(c)
             out.facts[f"{c.name}: min bend radius"] = _fmt_radius(c.min_radius_m, None)
         for name, xyz in last.junction_xyz.items():
             out.facts[f"{name} position"] = f"({xyz[0]:.1f}, {xyz[1]:.1f}, {xyz[2]:.1f}) m"
@@ -717,6 +777,33 @@ def _vessel_glyph(cfg: V3Config, xy, heading_math_deg: float) -> VesselGlyph:
         chute_fwd_m=cfg.chute_fwd_m,
         chute_stbd_m=cfg.chute_stbd_m,
         chute_radius_m=cfg.chute_radius_m,
+    )
+
+
+def _vessel_glyph_sheaves(cfg: V3Config, vessel_xy, heading_math_deg: float) -> VesselGlyph:
+    """Vessel glyph for the two-sheave (bu_full) scenes.
+
+    The glyph convention anchors the hull on the cable DEPARTURE point
+    (``VesselGlyph.xy``); for bu_full the engine's departure points are the
+    port/stbd sheaves at ``sheave_fwd_m`` from the vessel reference — not the
+    chute — so the anchor is placed on the sheave-pair centre and the hull is
+    offset by the sheave (not chute) lead. Without this the hull draws a full
+    ship-length away from the cable tops."""
+    h = math.radians(float(heading_math_deg))
+    ax = float(vessel_xy[0]) + cfg.sheave_fwd_m * math.cos(h)
+    ay = float(vessel_xy[1]) + cfg.sheave_fwd_m * math.sin(h)
+    return VesselGlyph(
+        xy=(ax, ay),
+        heading_deg=float(heading_math_deg),
+        length_m=cfg.ship_length_m,
+        beam_m=cfg.ship_beam_m,
+        height_m=cfg.chute_height_m,
+        crp_fwd_m=cfg.crp_fwd_m,
+        crp_stbd_m=cfg.crp_stbd_m,
+        chute_fwd_m=cfg.sheave_fwd_m,
+        chute_stbd_m=0.0,
+        chute_radius_m=0.0,          # no overboarding-chute arc at the sheaves
+        departure_label="sheaves",
     )
 
 
@@ -791,10 +878,37 @@ def snapshot_scene(snap, bed: BedGrid, title: str = "", cfg: Optional[V3Config] 
         scene.markers.append(Marker(tuple(xyz), name, "junction"))
     # Timeline headings are already in the engine math frame.
     if cfg is not None:
-        scene.vessel = _vessel_glyph(cfg, snap.vessel_xy, snap.vessel_heading_deg)
+        # Two-sheave scenes attach the cables at the sheaves, so the hull
+        # must be anchored there rather than on the chute.
+        if cfg.scenario == "bu_full" and cfg.mode in ("operation", "optimize"):
+            scene.vessel = _vessel_glyph_sheaves(cfg, snap.vessel_xy,
+                                                 snap.vessel_heading_deg)
+        else:
+            scene.vessel = _vessel_glyph(cfg, snap.vessel_xy, snap.vessel_heading_deg)
     else:
         scene.vessel = VesselGlyph(tuple(snap.vessel_xy), heading_deg=snap.vessel_heading_deg)
     return scene
+
+
+def tdp_tension_kN(chain_snapshot) -> Optional[float]:
+    """Tension at the touchdown point: the first bed-contact node from the
+    top. None when the chain has no bed contact (fully suspended)."""
+    try:
+        contact = np.asarray(chain_snapshot.contact, dtype=bool)
+        if not contact.any():
+            return None
+        i = int(np.argmax(contact))
+        t = np.asarray(chain_snapshot.tension_kN, dtype=float)
+        return float(t[min(i, len(t) - 1)])
+    except Exception:
+        return None
+
+
+def _fmt_tensions(c) -> str:
+    """'top / TDP / end' tension summary for one chain snapshot."""
+    tdp = tdp_tension_kN(c)
+    tdp_s = f"{tdp:.2f}" if tdp is not None else "—"
+    return f"{c.top_tension_kN:.2f} / {tdp_s} / {c.end_tension_kN:.2f} kN"
 
 
 def _fmt_radius(r: float, s_m: Optional[float]) -> str:
@@ -837,16 +951,16 @@ def _quick_facts(inp: sl.SteadyLayInput, H_c: float, V: float, depth: float) -> 
     """Zajac closed-form quick answers shown next to the numeric solve."""
     quick: Dict[str, str] = {}
     if H_c > 0:
-        quick["Hydrodynamic constant H"] = f"{H_c:.2f} m/s ({H_c / KNOT:.2f} kn)"
+        quick["Hydrodynamic constant H"] = f"{H_c:.2f} m/s ({H_c / KMH:.2f} km/h)"
         if V > 0:
             a = hyd.critical_angle_rad(H_c, V)
             quick["Critical angle (T0 = 0)"] = f"{math.degrees(a):.1f} deg"
             quick["Straight-line layback"] = f"{depth / math.tan(a):.0f} m"
         quick["Suspension-free speed on 10 deg upslope"] = (
-            f"{hyd.suspension_speed_limit_mps(H_c, math.radians(10.0)) / KNOT:.1f} kn"
+            f"{hyd.suspension_speed_limit_mps(H_c, math.radians(10.0)) / KMH:.1f} km/h"
         )
         quick["Pay-out increment for 10 deg downslope"] = (
-            f"{hyd.payout_increment_mps(H_c, math.radians(10.0)) / KNOT:+.2f} kn (any ship speed)"
+            f"{hyd.payout_increment_mps(H_c, math.radians(10.0)) / KMH:+.2f} km/h (any ship speed)"
         )
     quick["T_ship - T_bottom (w x h theorem)"] = f"{inp.q_water_npm * depth / 1000.0:.2f} kN"
     return quick

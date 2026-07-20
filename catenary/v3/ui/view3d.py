@@ -138,6 +138,7 @@ class _SceneCache:
         self.vessel_deck_slice: Optional[slice] = None   # deck footprint (extruded hull)
         self.vessel_chute_slice: Optional[slice] = None  # chute point + CRP point
         self.chute_arc_slice: Optional[slice] = None     # overboarding chute arc
+        self.departure_label: str = "chute"              # text at the departure anchor
         self.vessel_color = "#444444"
         self.vessel_label = ""
 
@@ -387,6 +388,7 @@ class View3DWidget(QWidget):
                     cache.chute_arc_slice = push(arc)
             cache.vessel_color = str(getattr(vessel, "color", "#444444"))
             cache.vessel_label = str(getattr(vessel, "label", ""))
+            cache.departure_label = str(getattr(vessel, "departure_label", "chute"))
 
         cache.pts = np.vstack(chunks) if chunks else np.zeros((0, 3), dtype=float)
         return cache
@@ -879,7 +881,8 @@ class View3DWidget(QWidget):
             painter.setPen(QtGui.QPen(QtGui.QColor(20, 26, 36), 1.0))
             painter.setBrush(QtGui.QBrush(QtGui.QColor(255, 170, 60)))
             painter.drawEllipse(QtCore.QRectF(x - 4, y - 4, 8, 8))
-            self._halo_text(painter, x + 6, y - 4, "chute")
+            self._halo_text(painter, x + 6, y - 4,
+                            getattr(cache, "departure_label", "chute"))
             # CRP cross.
             if ch_sl.stop - ch_sl.start > 1:
                 x, y = float(px[ch_sl.start + 1]), float(py[ch_sl.start + 1])

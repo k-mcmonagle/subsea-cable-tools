@@ -19,20 +19,20 @@ try:
     from qgis.PyQt.QtCore import Qt, QSettings
     from qgis.PyQt.QtWidgets import (
         QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
-        QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QProgressBar,
-        QPushButton, QScrollArea, QSlider, QSpinBox, QSplitter, QStackedWidget,
-        QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QToolButton,
-        QVBoxLayout, QWidget,
+        QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox,
+        QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
+        QSplitter, QStackedWidget, QTabWidget, QTableWidget, QTableWidgetItem,
+        QTextEdit, QToolButton, QVBoxLayout, QWidget,
     )
 except Exception:  # pragma: no cover - standalone testing
     from PyQt5 import QtCore, QtGui
     from PyQt5.QtCore import Qt, QSettings
     from PyQt5.QtWidgets import (
         QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
-        QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QProgressBar,
-        QPushButton, QScrollArea, QSlider, QSpinBox, QSplitter, QStackedWidget,
-        QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QToolButton,
-        QVBoxLayout, QWidget,
+        QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox,
+        QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
+        QSplitter, QStackedWidget, QTabWidget, QTableWidget, QTableWidgetItem,
+        QTextEdit, QToolButton, QVBoxLayout, QWidget,
     )
 
 from .results_panel import render_results_html
@@ -59,11 +59,23 @@ SCENARIOS = [
     ("straight_lay", "Straight lay (transient)"),
 ]
 
-# Schedule table columns (bu_full operation page).
-SCH_COL_LABEL, SCH_COL_EVENT, SCH_COL_DUR, SCH_COL_COURSE, SCH_COL_SPEED, \
-    SCH_COL_LEG1, SCH_COL_LEG2, SCH_COL_TRUNK = range(8)
-SCH_HEADERS = ["Phase", "Event", "Duration\n(s)", "Course\n(degN)",
-               "Speed\n(kn)", "Leg 1\n(m/s)", "Leg 2\n(m/s)", "Trunk\n(m/s)"]
+# Schedule table columns (bu_full operation page). Phases are planned by
+# ship position change (distance run from the jointing position); duration
+# is derived from distance/speed for moving phases and entered directly for
+# stationary ones (hold / transfer).
+SCH_COL_LABEL, SCH_COL_EVENT, SCH_COL_DIST, SCH_COL_DUR, SCH_COL_COURSE, \
+    SCH_COL_SPEED, SCH_COL_LEG1, SCH_COL_LEG2, SCH_COL_TRUNK = range(9)
+SCH_HEADERS = ["Phase", "Event", "Ship run\n(m)", "Duration\n(s)",
+               "Course\n(degN)", "Speed\n(km/h)", "Leg 1\n(km/h)",
+               "Leg 2\n(km/h)", "Trunk\n(km/h)"]
+
+# Manual driver step-log columns.
+MAN_LOG_HEADERS = ["#", "Action", "Ship run\n(m)", "Heading\n(degN)",
+                   "Leg 1\ncount", "Leg 2\ncount", "Trunk\ncount",
+                   "TDP kN\nL1 | L2", "Imbal\n(kN)",
+                   "BU depth\n(m)", "Target\nerr (m)"]
+
+KMH = 1.0 / 3.6      # km/h -> m/s
 
 # Assembly table columns.
 COL_TYPE, COL_NAME, COL_LEN, COL_QW, COL_QA, COL_LOAD, COL_MU, COL_EI, COL_MBR, \
@@ -155,6 +167,12 @@ class LaySimulatorDialog(QDialog):
         self._dirty = False                           # inputs changed since last solve
         self._solve_origin = None                     # (origin, crs) captured at solve start
         self._scene_origin = None                     # origin the shown scene was solved with
+        self._manual = None                           # ManualBUController (manual mode)
+        self._manual_bathy = None
+        self._manual_bed = None                       # BedGrid reused across manual steps
+        self._manual_target = None                    # target xy for the manual run
+        self._manual_snaps = []                       # snapshots for the time-series view
+        self._manual_last_snap = None                 # latest snapshot (tension readouts)
 
         self._build_ui()
         self._capture_defaults()
@@ -184,18 +202,18 @@ class LaySimulatorDialog(QDialog):
         form = QVBoxLayout(left_holder)
         form.setContentsMargins(4, 4, 8, 4)
 
-        # Workflow order: what (scenario) -> where (position) -> environment
-        # -> cable -> vessel -> scenario properties -> what to solve /
-        # operation script, then secondary sections (drawing, advanced
-        # solver, display) collapsed by default.
+        # Workflow order: what (scenario, then its operation script directly
+        # beneath) -> where (position) -> environment -> cable -> vessel ->
+        # scenario properties -> what to solve, then secondary sections
+        # (drawing, advanced solver, display) collapsed by default.
         form.addWidget(self._section_mode())
+        form.addWidget(self._section_operation())
         form.addWidget(self._section_position())
         form.addWidget(self._section_environment())
         form.addWidget(self._section_assembly())
         form.addWidget(self._section_vessel())
         form.addWidget(self._section_bu_bight())
         form.addWidget(self._section_solve())
-        form.addWidget(self._section_operation())
         form.addWidget(self._section_ship_shape())
         form.addWidget(self._section_advanced())
         form.addWidget(self._section_display())
@@ -642,6 +660,8 @@ class LaySimulatorDialog(QDialog):
         elif config == "bu":
             self._pick_bu_setup()
         else:
+            # single / bu_full: position + heading (bu_full's laid ends are
+            # typed coordinates on its operation page).
             self._pick_ship_position()
 
     def _section_environment(self):
@@ -799,10 +819,10 @@ class LaySimulatorDialog(QDialog):
             "Height of the cable departure point (chute top) above the "
             "waterline. Also used as the drawn hull freeboard in the 3D view."
         )
-        self.ship_speed = self._dspin("ship_speed_kn", 0.0, 12.0, 6.0, 0.25, 2, " kn")
+        self.ship_speed = self._dspin("ship_speed_kmh", 0.0, 25.0, 11.1, 0.5, 2, " km/h")
         self.ship_speed.setToolTip(
-            "Lay speed over ground. Used by steady-lay and operation modes; "
-            "hidden for static solves (vessel stationary).")
+            "Lay speed over ground (km/h). Used by steady-lay and operation "
+            "modes; hidden for static solves (vessel stationary).")
         self.slack = self._dspin("slack_pct", -10.0, 30.0, 2.0, 0.5, 1, " %")
         self.slack.setToolTip(
             "Pay-out speed margin over ship speed: pay-out = ship speed x "
@@ -818,7 +838,8 @@ class LaySimulatorDialog(QDialog):
         lay.addRow(self._ship_speed_label, self.ship_speed)
         self._slack_label = QLabel("Slack")
         lay.addRow(self._slack_label, self.slack)
-        lay.addRow("Chute friction mu (capstan)", self.chute_mu)
+        self._chute_mu_label = QLabel("Chute friction mu (capstan)")
+        lay.addRow(self._chute_mu_label, self.chute_mu)
         return box
 
     def _section_ship_shape(self):
@@ -826,11 +847,13 @@ class LaySimulatorDialog(QDialog):
         CRP. The chute stays the solver's departure point; the hull is drawn
         geometry only (3D view and map overlay)."""
         box, lay = self._collapsible("Vessel drawing && sheaves", "ship_shape")
-        self.ship_len = self._dspin("ship_length_m", 5.0, 400.0, 60.0, 5.0, 0, " m")
-        self.ship_beam = self._dspin("ship_beam_m", 2.0, 80.0, 12.0, 1.0, 0, " m")
+        # Default vessel: 127 m x 27 m, CRP at midship, cable departure
+        # (chute and the BU sheaves) at the aft end of the ship.
+        self.ship_len = self._dspin("ship_length_m", 5.0, 400.0, 127.0, 5.0, 0, " m")
+        self.ship_beam = self._dspin("ship_beam_m", 2.0, 80.0, 27.0, 1.0, 0, " m")
         self.crp_fwd = self._dspin("crp_fwd_m", -200.0, 200.0, 0.0, 1.0, 1, " m")
         self.crp_stbd = self._dspin("crp_stbd_m", -40.0, 40.0, 0.0, 0.5, 1, " m")
-        self.chute_fwd = self._dspin("chute_fwd_m", -200.0, 200.0, 0.0, 1.0, 1, " m")
+        self.chute_fwd = self._dspin("chute_fwd_m", -200.0, 200.0, -63.5, 1.0, 1, " m")
         self.chute_stbd = self._dspin("chute_stbd_m", -40.0, 40.0, 0.0, 0.5, 1, " m")
         self.chute_radius = self._dspin("chute_radius_m", 0.0, 30.0, 0.0, 0.5, 1, " m")
         self.chute_radius.setToolTip(
@@ -847,19 +870,24 @@ class LaySimulatorDialog(QDialog):
         lay.addRow("Chute radius (drawn)", self.chute_radius)
         # Sheave geometry — functional for the two-sheave BU deployment
         # scenario (port/stbd overboarding points rotate with the heading).
-        self.sheave_fwd = self._dspin("sheave_fwd_m", -200.0, 200.0, 0.0, 1.0, 1, " m")
+        self.sheave_fwd = self._dspin("sheave_fwd_m", -200.0, 200.0, -63.5, 1.0, 1, " m")
         self.sheave_fwd.setToolTip(
             "Fore/aft position of the port and starboard sheaves (used by "
             "the two-sheave BU deployment scenario).")
         self.sheave_spacing = self._dspin("sheave_spacing_m", 0.5, 60.0, 12.0, 0.5, 1, " m")
         self.sheave_spacing.setToolTip(
             "Athwartships distance between the port and starboard sheaves.")
-        lay.addRow("Sheaves forward of CRP", self.sheave_fwd)
-        lay.addRow("Port-stbd sheave spacing", self.sheave_spacing)
+        self._sheave_rows = [
+            (QLabel("Sheaves forward of CRP"), self.sheave_fwd),
+            (QLabel("Port-stbd sheave spacing"), self.sheave_spacing),
+        ]
+        for lbl, w in self._sheave_rows:
+            lay.addRow(lbl, w)
         note = QLabel("Hull geometry is drawn only, but the sheave offsets "
                       "are used by the two-sheave BU deployment. "
                       "Negative 'forward' = aft, negative 'starboard' = port. "
-                      "With zero offsets the chute sits at the hull centre.")
+                      "Defaults put the chute and sheaves at the aft end "
+                      "of the 127 m hull.")
         note.setWordWrap(True)
         note.setStyleSheet("color:#777; font-size: small;")
         lay.addRow(note)
@@ -898,12 +926,16 @@ class LaySimulatorDialog(QDialog):
         self.bu_leg_len.setToolTip(
             "Deployed length of each pre-laid leg, measured from the BU "
             "along its lead bearing.")
+        # Weight/CdA apply to both BU scenarios; the leg length only to the
+        # lowering-only one (bu_full derives leg lengths from the laid ends).
         self._bu_geo_rows = [
             (QLabel("BU submerged weight"), self.bu_weight),
             (QLabel("BU drag area Cd*A"), self.bu_cda),
+        ]
+        self._bu_leglen_row = [
             (QLabel("Leg length (each)"), self.bu_leg_len),
         ]
-        for lbl, w in self._bu_geo_rows:
+        for lbl, w in self._bu_geo_rows + self._bu_leglen_row:
             lay.addRow(lbl, w)
         # Final-bight group.
         self.fb_length = self._dspin("fb_length", 20.0, 20000.0, 300.0, 10.0, 0, " m")
@@ -960,9 +992,12 @@ class LaySimulatorDialog(QDialog):
         self._solve_rows = [
             (QLabel("Input"), self.solve_mode),
             (QLabel("Value"), self.solve_value),
-            (QLabel("On-bed tail beyond TDP (static)"), self.on_bed_tail),
         ]
-        for lbl, w in self._solve_rows:
+        # The on-bed tail is only read by the static single-span solve.
+        self._onbed_row = [
+            (QLabel("On-bed tail beyond TDP"), self.on_bed_tail),
+        ]
+        for lbl, w in self._solve_rows + self._onbed_row:
             lay.addRow(lbl, w)
 
         # Static-hold inputs (BU / bight configurations).
@@ -980,12 +1015,16 @@ class LaySimulatorDialog(QDialog):
             "the lowering rope.")
         self._bu_hold_rows = [
             (QLabel("BU hold depth below surface"), self.bu_depth),
+        ]
+        # Trunk slack feeds the trunk length in BOTH BU operation scenarios
+        # as well as the static hold, so it gets its own visibility row.
+        self._trunk_slack_row = [
             (QLabel("Trunk slack over hold distance"), self.trunk_slack),
         ]
         self._fb_hold_rows = [
             (QLabel("Bight apex hold depth"), self.apex_depth),
         ]
-        for lbl, w in self._bu_hold_rows + self._fb_hold_rows:
+        for lbl, w in self._bu_hold_rows + self._trunk_slack_row + self._fb_hold_rows:
             lay.addRow(lbl, w)
         self._solve_box = box
         return box
@@ -1015,8 +1054,8 @@ class LaySimulatorDialog(QDialog):
         # BU deployment page (physical geometry lives in "BU / bight geometry").
         bu = QWidget()
         bl = QFormLayout(bu)
-        self.bu_payout = self._dspin("bu_payout", 0.01, 3.0, 0.4, 0.05, 2, " m/s")
-        self.bu_ship_speed = self._dspin("bu_ship_speed_kn", 0.0, 4.0, 0.6, 0.1, 2, " kn")
+        self.bu_payout = self._dspin("bu_payout_kmh", 0.05, 10.0, 1.4, 0.1, 2, " km/h")
+        self.bu_ship_speed = self._dspin("bu_ship_speed_kmh", 0.0, 8.0, 1.1, 0.1, 2, " km/h")
         bl.addRow("Trunk pay-out rate", self.bu_payout)
         bl.addRow("Ship speed", self.bu_ship_speed)
         self.op_stack.addWidget(bu)
@@ -1027,9 +1066,9 @@ class LaySimulatorDialog(QDialog):
         # Final bight page.
         fb = QWidget()
         fl = QFormLayout(fb)
-        self.fb_payout = self._dspin("fb_payout", 0.01, 3.0, 0.3, 0.05, 2, " m/s")
+        self.fb_payout = self._dspin("fb_payout_kmh", 0.05, 10.0, 1.1, 0.1, 2, " km/h")
         self.fb_course = self._dspin("fb_course", 0.0, 360.0, 0.0, 5.0, 0, " degN")
-        self.fb_ship_speed = self._dspin("fb_ship_speed_kn", 0.0, 3.0, 0.3, 0.05, 2, " kn")
+        self.fb_ship_speed = self._dspin("fb_ship_speed_kmh", 0.0, 6.0, 0.6, 0.1, 2, " km/h")
         self.fb_release = self._dspin("fb_release_kN", 0.0, 100.0, 2.0, 0.5, 1, " kN")
         fl.addRow("Rope pay-out rate", self.fb_payout)
         fl.addRow("Vessel step course", self.fb_course)
@@ -1064,15 +1103,31 @@ class LaySimulatorDialog(QDialog):
         note.setStyleSheet("color:#777; font-size: small;")
         fl.addRow(note)
 
+        # Run mode: the scripted schedule (optimise + run) or the interactive
+        # manual driver (jog the vessel and pay out by hand on the quick model).
+        self.bf_run_mode = self._combo("bf_run_mode", [
+            ("scripted", "Scripted schedule"),
+            ("manual", "Manual (interactive)"),
+        ])
+        self.bf_run_mode.setToolTip(
+            "Scripted: build/optimise a phase schedule and run it.\n"
+            "Manual: set up the initial conditions, then drive the vessel and "
+            "pay out each lead by hand (quick model, instant) — record the "
+            "steps and send them to the schedule for a full-quality re-run.")
+        self.bf_run_mode.currentIndexChanged.connect(self._on_bf_run_mode)
+        fl.addRow("Run mode", self.bf_run_mode)
+
         def coord(key, val):
             return self._dspin(key, -1e6, 1e6, val, 10.0, 1, " m")
 
-        self.bf_end1_x = coord("bf_end1_x", -150.0)
-        self.bf_end1_y = coord("bf_end1_y", 200.0)
-        self.bf_end2_x = coord("bf_end2_x", -150.0)
-        self.bf_end2_y = coord("bf_end2_y", -200.0)
-        self.bf_target_x = coord("bf_target_x", 150.0)
-        self.bf_target_y = coord("bf_target_y", 0.0)
+        # Defaults are laid out for the default ship course of 000 degN:
+        # legs trail behind (south) to port/starboard, target ahead (north).
+        self.bf_end1_x = coord("bf_end1_x", -200.0)
+        self.bf_end1_y = coord("bf_end1_y", -150.0)
+        self.bf_end2_x = coord("bf_end2_x", 200.0)
+        self.bf_end2_y = coord("bf_end2_y", -150.0)
+        self.bf_target_x = coord("bf_target_x", 0.0)
+        self.bf_target_y = coord("bf_target_y", 150.0)
         self.bf_vessel_x = coord("bf_vessel_x", 0.0)
         self.bf_vessel_y = coord("bf_vessel_y", 0.0)
         self.bf_vessel_x.setToolTip(
@@ -1083,25 +1138,49 @@ class LaySimulatorDialog(QDialog):
         fl.addRow("Leg 2 laid end x / y", self._pair(self.bf_end2_x, self.bf_end2_y))
         fl.addRow("Target BU landing x / y", self._pair(self.bf_target_x, self.bf_target_y))
 
-        self.bf_tail = self._dspin("bf_tail_m", 5.0, 500.0, 90.0, 5.0, 0, " m")
-        self.bf_tail.setToolTip("BU tail length per leg (joint to BU body).")
-        self.bf_payout = self._dspin("bf_payout", 0.01, 3.0, 0.4, 0.05, 2, " m/s")
-        self.bf_ship_speed = self._dspin("bf_ship_speed_kn", 0.0, 4.0, 0.6, 0.1, 2, " kn")
+        self.bf_tail1 = self._dspin("bf_tail_leg1_m", 5.0, 2000.0, 90.0, 5.0, 0, " m")
+        self.bf_tail1.setToolTip("Leg 1 BU tail length (leg 1 joint to BU body).")
+        self.bf_tail2 = self._dspin("bf_tail_leg2_m", 5.0, 2000.0, 90.0, 5.0, 0, " m")
+        self.bf_tail2.setToolTip("Leg 2 BU tail length (leg 2 joint to BU body).")
+        self.bf_tail_trunk = self._dspin("bf_tail_trunk_m", 5.0, 2000.0, 90.0, 5.0, 0, " m")
+        self.bf_tail_trunk.setToolTip(
+            "Trunk BU tail length (BU body to the trunk joint). The lay-ahead "
+            "phase is sized so this tail passes overboard before the "
+            "schedule ends.")
+        self.bf_payout = self._dspin("bf_payout_kmh", 0.05, 10.0, 1.4, 0.1, 2, " km/h")
+        self.bf_ship_speed = self._dspin("bf_ship_speed_kmh", 0.0, 8.0, 1.1, 0.1, 2, " km/h")
         self.bf_balance = self._check(
             "bf_balance", "Auto-balance leg payout (tension controller)", True)
         self.bf_balance.setToolTip(
             "Continuously redistributes the scheduled leg payout so the two "
             "sheave tensions stay matched, like a winch operator would.")
-        fl.addRow("BU tail length (each leg)", self.bf_tail)
+        fl.addRow("BU tail length — leg 1", self.bf_tail1)
+        fl.addRow("BU tail length — leg 2", self.bf_tail2)
+        fl.addRow("BU tail length — trunk", self.bf_tail_trunk)
         fl.addRow("Nominal pay-out rate", self.bf_payout)
         fl.addRow("Lay-ahead ship speed", self.bf_ship_speed)
         fl.addRow(self.bf_balance)
 
+        # ---- Scripted-schedule area (hidden in manual mode) ----------------
+        scripted = QWidget()
+        sv = QVBoxLayout(scripted)
+        sv.setContentsMargins(0, 0, 0, 0)
         self.sched_table = QTableWidget(0, len(SCH_HEADERS))
         self.sched_table.setHorizontalHeaderLabels(SCH_HEADERS)
         self.sched_table.setMinimumHeight(150)
         self.sched_table.itemChanged.connect(self._schedule)
-        fl.addRow(self.sched_table)
+        try:
+            self.sched_table.horizontalHeaderItem(SCH_COL_DIST).setToolTip(
+                "Planned ship position change over the phase (the operator's "
+                "guide, counted from the jointing position). For a moving "
+                "phase this governs and the duration is derived from it; "
+                "leave blank (or speed = 0) to use the duration directly.")
+            self.sched_table.horizontalHeaderItem(SCH_COL_COURSE).setToolTip(
+                "Compass bearing for the phase. Blank = follow the ship "
+                "course from 'Position & heading' at run time.")
+        except Exception:
+            pass
+        sv.addWidget(self.sched_table)
 
         btns = QHBoxLayout()
         self.btn_optimize = QPushButton("Optimise schedule…")
@@ -1120,10 +1199,212 @@ class LaySimulatorDialog(QDialog):
         for b in (self.btn_optimize, btn_default, btn_clear):
             btns.addWidget(b)
         btns.addStretch(1)
-        holder = QWidget()
-        holder.setLayout(btns)
-        fl.addRow(holder)
+        btn_holder = QWidget()
+        btn_holder.setLayout(btns)
+        sv.addWidget(btn_holder)
+        self._bf_scripted_widget = scripted
+        fl.addRow(scripted)
+
+        # ---- Manual driver console (hidden in scripted mode) ---------------
+        self._manual_console = self._build_manual_console()
+        self._manual_console.setVisible(False)
+        fl.addRow(self._manual_console)
         return page
+
+    # ---- manual (interactive) driver console ------------------------------
+
+    def _build_manual_console(self) -> QWidget:
+        """Interactive jog console for the two-sheave BU deployment: drive the
+        vessel and pay out each lead by hand on the quick model, with a live
+        map/target, cable counts and a recordable step log."""
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setContentsMargins(0, 2, 0, 2)
+
+        intro = QLabel(
+            "Initialise from the set-up above, then jog the vessel and pay "
+            "out each lead. Every step re-solves instantly (quick model) and "
+            "updates the 3D / plan / map views. Record the steps and send "
+            "them to the schedule for a full-quality confirmation.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color:#777; font-size: small;")
+        v.addWidget(intro)
+
+        top = QHBoxLayout()
+        self.man_init_btn = QPushButton("Initialise / reset to start")
+        self.man_init_btn.setToolTip(
+            "Build the deployment from the set-up above and solve the initial "
+            "held state. Also resets a manual run to the start.")
+        self.man_init_btn.clicked.connect(self._manual_init)
+        top.addWidget(self.man_init_btn)
+        top.addStretch(1)
+        v.addLayout(top)
+
+        self.man_status = QLabel("Not initialised.")
+        self.man_status.setWordWrap(True)
+        self.man_status.setStyleSheet("font-weight:bold;")
+        v.addWidget(self.man_status)
+
+        # ---- Vessel jog pad + range/bearing --------------------------------
+        jog_box = QWidget()
+        jog = QFormLayout(jog_box)
+        self.man_step = self._dspin("man_step_m", 0.5, 500.0, 10.0, 1.0, 1, " m")
+        self.man_step.setToolTip("Distance moved per Fwd/Aft/Port/Stbd nudge.")
+        jog.addRow("Jog step", self.man_step)
+
+        pad = QWidget()
+        grid = QGridLayout(pad)
+        grid.setContentsMargins(0, 0, 0, 0)
+        self.man_fwd = QPushButton("▲ Fwd")
+        self.man_aft = QPushButton("▼ Aft")
+        self.man_port = QPushButton("◀ Port")
+        self.man_stbd = QPushButton("Stbd ▶")
+        self.man_fwd.clicked.connect(lambda: self._manual_jog(1.0, 0.0))
+        self.man_aft.clicked.connect(lambda: self._manual_jog(-1.0, 0.0))
+        self.man_port.clicked.connect(lambda: self._manual_jog(0.0, -1.0))
+        self.man_stbd.clicked.connect(lambda: self._manual_jog(0.0, 1.0))
+        grid.addWidget(self.man_fwd, 0, 1)
+        grid.addWidget(self.man_port, 1, 0)
+        grid.addWidget(self.man_stbd, 1, 2)
+        grid.addWidget(self.man_aft, 2, 1)
+        jog.addRow("Move (vessel frame)", pad)
+
+        rb = QHBoxLayout()
+        self.man_range = self._dspin("man_range_m", 0.0, 5000.0, 50.0, 5.0, 1, " m")
+        self.man_bearing = self._dspin("man_bearing_degN", 0.0, 360.0, 0.0, 5.0, 0, " degN")
+        self.man_move_btn = QPushButton("Move")
+        self.man_move_btn.clicked.connect(self._manual_move_rb)
+        rb.addWidget(self.man_range)
+        rb.addWidget(self.man_bearing)
+        rb.addWidget(self.man_move_btn)
+        rb_holder = QWidget()
+        rb_holder.setLayout(rb)
+        jog.addRow("Move (range / bearing)", rb_holder)
+
+        hd = QHBoxLayout()
+        self.man_heading_lbl = QLabel("—")
+        self.man_rot_step = self._dspin("man_rot_step_deg", 1.0, 90.0, 5.0, 1.0, 0, " deg")
+        rot_l = QPushButton("⟲ −")
+        rot_r = QPushButton("⟳ +")
+        self.man_heading_set = self._dspin("man_heading_set_degN", 0.0, 360.0, 0.0, 5.0, 0, " degN")
+        set_hd = QPushButton("Set")
+        rot_l.clicked.connect(lambda: self._manual_rotate(-1.0))
+        rot_r.clicked.connect(lambda: self._manual_rotate(1.0))
+        set_hd.clicked.connect(self._manual_set_heading)
+        for w in (self.man_heading_lbl, self.man_rot_step, rot_l, rot_r,
+                  self.man_heading_set, set_hd):
+            hd.addWidget(w)
+        hd_holder = QWidget()
+        hd_holder.setLayout(hd)
+        jog.addRow("Heading (degN)", hd_holder)
+        v.addWidget(jog_box)
+
+        # ---- Cable leads: payout / pickup + counts -------------------------
+        leads_box = QWidget()
+        lf = QFormLayout(leads_box)
+        self.man_payout_step = self._dspin("man_payout_step_m", 0.5, 500.0, 10.0, 1.0, 1, " m")
+        self.man_payout_step.setToolTip("Cable length paid out / hauled in per click.")
+        lf.addRow("Payout step", self.man_payout_step)
+        self._man_lead_rows = {}
+        for name, label in (("leg1", "Leg 1"), ("leg2", "Leg 2"), ("trunk", "Trunk")):
+            row = QHBoxLayout()
+            out_b = QPushButton("Pay out")
+            in_b = QPushButton("Pick up")
+            out_b.clicked.connect(lambda _c=False, n=name: self._manual_payout(n, 1.0))
+            in_b.clicked.connect(lambda _c=False, n=name: self._manual_payout(n, -1.0))
+            off = self._dspin(f"man_off_{name}", 0.0, 1e7, 0.0, 10.0, 1, " m")
+            off.setToolTip(f"{label} starting count (match the ship's roto "
+                           f"counter); live count = offset + cable deployed.")
+            off.valueChanged.connect(self._manual_refresh_counts)
+            count_lbl = QLabel("—")
+            for w in (out_b, in_b, QLabel("offset"), off, count_lbl):
+                row.addWidget(w)
+            row.addStretch(1)
+            holder = QWidget()
+            holder.setLayout(row)
+            lf.addRow(label, holder)
+            self._man_lead_rows[name] = {
+                "out": out_b, "in": in_b, "offset": off, "count": count_lbl,
+                "holder": holder, "label": label,
+            }
+        v.addWidget(leads_box)
+
+        # ---- Events + on-target -------------------------------------------
+        ev = QHBoxLayout()
+        self.man_transfer_btn = QPushButton("Transfer leg 2 → port")
+        self.man_overboard_btn = QPushButton("Overboard BU")
+        self.man_transfer_btn.clicked.connect(lambda: self._manual_event("transfer"))
+        self.man_overboard_btn.clicked.connect(lambda: self._manual_event("overboard_bu"))
+        ev.addWidget(self.man_transfer_btn)
+        ev.addWidget(self.man_overboard_btn)
+        ev.addStretch(1)
+        ev_holder = QWidget()
+        ev_holder.setLayout(ev)
+        v.addWidget(ev_holder)
+
+        self.man_target_lbl = QLabel("On target: —")
+        self.man_target_lbl.setStyleSheet("font-weight:bold; color:#1f6f1f;")
+        v.addWidget(self.man_target_lbl)
+
+        self.man_tension_lbl = QLabel("TDP tension: —")
+        self.man_tension_lbl.setToolTip(
+            "Residual bottom tension at each leg's touchdown point, and the "
+            "leg-to-leg imbalance — plan moves/payout to hold your target "
+            "TDP tension and keep the legs balanced.")
+        self.man_tension_lbl.setStyleSheet("font-weight:bold;")
+        v.addWidget(self.man_tension_lbl)
+
+        # ---- Step log ------------------------------------------------------
+        log_top = QHBoxLayout()
+        self.man_record = self._check("man_record", "Record steps", True)
+        log_top.addWidget(self.man_record)
+        log_top.addStretch(1)
+        log_top_holder = QWidget()
+        log_top_holder.setLayout(log_top)
+        v.addWidget(log_top_holder)
+
+        self.man_log = QTableWidget(0, len(MAN_LOG_HEADERS))
+        self.man_log.setHorizontalHeaderLabels(MAN_LOG_HEADERS)
+        # Compact, information-dense log: tight rows (the # column replaces
+        # the vertical header) and a generous default height with a drag
+        # grip below for manual resizing.
+        try:
+            fm = self.man_log.fontMetrics()
+            row_h = max(20, fm.height() + 6)
+            vh = self.man_log.verticalHeader()
+            vh.setVisible(False)
+            vh.setMinimumSectionSize(row_h)
+            vh.setDefaultSectionSize(row_h)
+        except Exception:
+            pass
+        self.man_log.setMinimumHeight(260)
+        try:
+            self.man_log.horizontalHeader().setStretchLastSection(True)
+        except Exception:
+            pass
+        self._fit_columns(self.man_log, padding=10, min_w=36)
+        v.addWidget(self.man_log)
+        self._add_table_grip(self.man_log, v)
+
+        actions = QHBoxLayout()
+        self.man_undo_btn = QPushButton("Undo step")
+        self.man_reset_btn = QPushButton("Reset")
+        self.man_sched_btn = QPushButton("Send steps to schedule")
+        self.man_sched_btn.setToolTip(
+            "Fold the recorded steps into the phase schedule and switch to "
+            "Scripted mode, so 'Run simulation' re-runs them at full quality.")
+        self.man_undo_btn.clicked.connect(self._manual_undo)
+        self.man_reset_btn.clicked.connect(self._manual_reset)
+        self.man_sched_btn.clicked.connect(self._manual_to_schedule)
+        for b in (self.man_undo_btn, self.man_reset_btn, self.man_sched_btn):
+            actions.addWidget(b)
+        actions.addStretch(1)
+        actions_holder = QWidget()
+        actions_holder.setLayout(actions)
+        v.addWidget(actions_holder)
+
+        self._manual_set_enabled(False)
+        return box
 
     def _pair(self, w1, w2) -> QWidget:
         holder = QWidget()
@@ -1132,6 +1413,337 @@ class LaySimulatorDialog(QDialog):
         h.addWidget(w1)
         h.addWidget(w2)
         return holder
+
+    # ---- manual driver handlers -------------------------------------------
+
+    def _on_bf_run_mode(self, *args):
+        """Toggle the scripted-schedule area vs the manual console."""
+        manual = (self.bf_run_mode.currentData() == "manual")
+        if hasattr(self, "_bf_scripted_widget"):
+            self._bf_scripted_widget.setVisible(not manual)
+        if hasattr(self, "_manual_console"):
+            self._manual_console.setVisible(manual)
+        self._schedule()
+
+    def _manual_set_enabled(self, on: bool):
+        """Enable/disable every driving control (off until initialised)."""
+        widgets = [
+            getattr(self, n, None) for n in (
+                "man_fwd", "man_aft", "man_port", "man_stbd", "man_move_btn",
+                "man_undo_btn", "man_reset_btn", "man_sched_btn",
+                "man_transfer_btn", "man_overboard_btn")
+        ]
+        for w in widgets:
+            if w is not None:
+                w.setEnabled(on)
+        for row in getattr(self, "_man_lead_rows", {}).values():
+            row["out"].setEnabled(on)
+            row["in"].setEnabled(on)
+
+    def _manual_init(self):
+        """Build the manual controller from the current set-up and settle."""
+        try:
+            from .solve_controller import build_manual_controller
+            cfg = self.build_config()
+            cfg.mode = "operation"
+            self._manual, self._manual_bathy = build_manual_controller(cfg)
+            snap = self._manual.settle()
+        except Exception as exc:
+            QMessageBox.warning(self, "Manual mode",
+                                f"Could not initialise manual mode:\n{exc}")
+            self._manual = None
+            self._manual_set_enabled(False)
+            self.man_status.setText("Not initialised.")
+            return
+        self._manual_target = self._manual.target_xy
+        # Freeze the map placement to the current origin so the overlay and
+        # target sit on the real map for the whole manual session.
+        try:
+            self._solve_origin = self._origin_for_map()
+            self._scene_origin = self._solve_origin
+        except Exception:
+            self._scene_origin = None
+        self._manual_bed = None
+        self._manual_snaps = []
+        self.man_log.setRowCount(0)
+        self._manual_set_enabled(True)
+        self._manual_after_apply(snap, "Initialise", record=False)
+        self._sync_manual_offsets()
+        self.man_status.setText("Initialised — drive the vessel and pay out "
+                                "each lead.")
+
+    def _sync_manual_offsets(self):
+        if self._manual is None:
+            return
+        for name, row in self._man_lead_rows.items():
+            self._manual.set_offset(name, float(row["offset"].value()))
+        self._manual_refresh_counts()
+
+    def _manual_guard(self) -> bool:
+        if self._manual is None:
+            QMessageBox.information(self, "Manual mode",
+                                    "Click 'Initialise' first.")
+            return False
+        return True
+
+    def _manual_jog(self, fwd_sign: float, stbd_sign: float):
+        if not self._manual_guard():
+            return
+        from ..engine.manual import ManualCommand
+        step = float(self.man_step.value())
+        labels = {(1.0, 0.0): "Fwd", (-1.0, 0.0): "Aft",
+                  (0.0, -1.0): "Port", (0.0, 1.0): "Stbd"}
+        lbl = f"{labels.get((fwd_sign, stbd_sign), 'Move')} {step:.0f} m"
+        cmd = ManualCommand(fwd_m=fwd_sign * step, stbd_m=stbd_sign * step, label=lbl)
+        self._manual_apply(cmd)
+
+    def _manual_move_rb(self):
+        if not self._manual_guard():
+            return
+        rng = float(self.man_range.value())
+        if rng <= 0:
+            return
+        bearing_math = compass_to_math_deg(float(self.man_bearing.value()))
+        cmd = self._manual.move_range_bearing(
+            rng, bearing_math,
+            label=f"Move {rng:.0f} m @ {self.man_bearing.value():.0f}degN")
+        self._manual_apply(cmd)
+
+    def _manual_rotate(self, sign: float):
+        if not self._manual_guard():
+            return
+        from ..engine.manual import ManualCommand
+        d = sign * float(self.man_rot_step.value())
+        # Compass +d clockwise = math -d.
+        new_math = self._manual.heading_deg() - d
+        cmd = ManualCommand(heading_set_deg=new_math,
+                            label=f"Rotate {d:+.0f}degN")
+        self._manual_apply(cmd)
+
+    def _manual_set_heading(self):
+        if not self._manual_guard():
+            return
+        from ..engine.manual import ManualCommand
+        new_math = compass_to_math_deg(float(self.man_heading_set.value()))
+        cmd = ManualCommand(heading_set_deg=new_math,
+                            label=f"Heading {self.man_heading_set.value():.0f}degN")
+        self._manual_apply(cmd)
+
+    def _manual_payout(self, name: str, sign: float):
+        if not self._manual_guard():
+            return
+        from ..engine.manual import ManualCommand
+        dl = sign * float(self.man_payout_step.value())
+        verb = "Pay out" if sign > 0 else "Pick up"
+        cmd = ManualCommand(payout_m={name: dl},
+                            label=f"{verb} {abs(dl):.0f} m {name}")
+        self._manual_apply(cmd)
+
+    def _manual_event(self, kind: str):
+        if not self._manual_guard():
+            return
+        from ..engine.manual import ManualCommand
+        if kind == "overboard_bu" and not self._manual.can_overboard:
+            QMessageBox.information(self, "Manual mode",
+                                    "The BU has already been overboarded.")
+            return
+        if kind == "transfer" and not self._manual.can_transfer:
+            QMessageBox.information(self, "Manual mode",
+                                    "Leg 2 has already been transferred.")
+            return
+        lbl = "Overboard BU" if kind == "overboard_bu" else "Transfer leg 2"
+        self._manual_apply(ManualCommand(event=kind, label=lbl))
+
+    def _manual_apply(self, cmd):
+        try:
+            snap = self._manual.apply(cmd)
+        except Exception as exc:
+            QMessageBox.warning(self, "Manual mode", f"Step failed:\n{exc}")
+            return
+        self._manual_after_apply(snap, cmd.label or "Step",
+                                 record=self.man_record.isChecked())
+
+    def _manual_undo(self):
+        if not self._manual_guard():
+            return
+        snap = self._manual.undo()
+        self._manual_snaps = []          # rebuilt below from history length
+        self._rebuild_manual_log()
+        self._manual_after_apply(snap, "Undo", record=False)
+
+    def _manual_reset(self):
+        if not self._manual_guard():
+            return
+        snap = self._manual.reset()
+        self._manual_snaps = []
+        self.man_log.setRowCount(0)
+        self._manual_after_apply(snap, "Reset", record=False)
+
+    def _manual_to_schedule(self):
+        if not self._manual_guard():
+            return
+        rows = self._manual.to_schedule()
+        if not rows:
+            QMessageBox.information(
+                self, "Manual mode",
+                "No moves recorded yet — jog the vessel / pay out first.")
+            return
+        self._schedule_to_table([r.to_dict() for r in rows])
+        i = self.bf_run_mode.findData("scripted")
+        if i >= 0:
+            self.bf_run_mode.setCurrentIndex(i)
+        self._set_dirty(True)
+        QMessageBox.information(
+            self, "Manual mode",
+            f"Sent {len(rows)} step(s) to the schedule. Switched to Scripted "
+            "mode — click 'Run simulation' for a full-quality confirmation.")
+
+    def _manual_after_apply(self, snap, action_label: str, record: bool = True):
+        """Render the snapshot on every view + map, refresh readouts, and
+        (optionally) append a step-log row."""
+        if snap is None:
+            return
+        self._manual_last_snap = snap
+        self._manual_snaps.append(snap)
+        try:
+            from .solve_controller import manual_bed_grid, manual_scene
+            if self._manual_bed is None:
+                self._manual_bed = manual_bed_grid(
+                    self.build_config(), self._manual_bathy, snap,
+                    self._manual_target)
+            scene = manual_scene(snap, self.build_config(), self._manual_bathy,
+                                 self._manual_bed, target_xy=self._manual_target,
+                                 title=f"Manual — {action_label}")
+            self._show_scene(scene, preserve=True)
+        except Exception:
+            pass
+        try:
+            self.timeseries_view.set_snapshots(self._manual_snaps)
+            self.timeseries_view.set_time(float(snap.t_s))
+        except Exception:
+            pass
+        self._manual_update_readouts()
+        self._manual_refresh_counts()
+        if record:
+            self._manual_log_row(action_label, snap)
+
+    def _manual_update_readouts(self):
+        if self._manual is None:
+            return
+        from .scene import math_to_compass_deg
+        hd = math_to_compass_deg(self._manual.heading_deg())
+        self.man_heading_lbl.setText(f"{hd:.0f}")
+        # Event button availability by phase.
+        self.man_transfer_btn.setEnabled(self._manual.can_transfer)
+        self.man_overboard_btn.setEnabled(self._manual.can_overboard)
+        active = set(self._manual.active_leads())
+        for name, row in self._man_lead_rows.items():
+            on = name in active
+            row["out"].setEnabled(on)
+            row["in"].setEnabled(on)
+        te = self._manual.target_error()
+        if te is None:
+            self.man_target_lbl.setText("On target: (no target set)")
+        else:
+            rng, brg_math = te
+            brg = math_to_compass_deg(brg_math)
+            ref = "BU" if self._manual.bu_xyz() is not None else "vessel"
+            self.man_target_lbl.setText(
+                f"On target: {rng:.1f} m @ {brg:.0f}degN from {ref} to target")
+        # Live TDP tensions + leg balance from the latest snapshot.
+        self.man_tension_lbl.setText(self._manual_tdp_text())
+
+    def _manual_lead_tension(self, name: str):
+        """(top_kN, tdp_kN or None) for a lead in the latest manual snapshot."""
+        snap = self._manual_last_snap
+        if snap is None:
+            return None
+        c = snap.chain(name)
+        if c is None:
+            return None
+        from .solve_controller import tdp_tension_kN
+        return float(c.top_tension_kN), tdp_tension_kN(c)
+
+    def _manual_tdp_text(self) -> str:
+        parts = []
+        tdps = {}
+        for name, label in (("leg1", "leg1"), ("leg2", "leg2"), ("trunk", "trunk")):
+            t = self._manual_lead_tension(name)
+            if t is None:
+                continue
+            _top, tdp = t
+            tdps[name] = tdp
+            parts.append(f"{label} {tdp:.2f} kN" if tdp is not None
+                         else f"{label} —")
+        if not parts:
+            return "TDP tension: —"
+        txt = "TDP tension: " + "  |  ".join(parts)
+        if tdps.get("leg1") is not None and tdps.get("leg2") is not None:
+            txt += f"   (leg imbal {abs(tdps['leg1'] - tdps['leg2']):.2f} kN)"
+        return txt
+
+    def _manual_refresh_counts(self):
+        if self._manual is None:
+            return
+        # Keep the controller's offsets in step with the spin boxes.
+        for name, row in self._man_lead_rows.items():
+            self._manual.set_offset(name, float(row["offset"].value()))
+            active = name in set(self._manual.active_leads())
+            if active:
+                count = self._manual.cable_count(name)
+                dep = self._manual.deployed_since_start(name)
+                txt = f"count {count:,.0f} m ({dep:+.0f} m)"
+                t = self._manual_lead_tension(name)
+                if t is not None:
+                    top, tdp = t
+                    txt += f" · top {top:.2f}"
+                    if tdp is not None:
+                        txt += f" / TDP {tdp:.2f}"
+                    txt += " kN"
+                row["count"].setText(txt)
+            else:
+                row["count"].setText("—")
+
+    def _manual_log_row(self, action_label: str, snap):
+        c = self._manual
+        r = self.man_log.rowCount()
+        self.man_log.insertRow(r)
+        from .scene import math_to_compass_deg
+        vx, vy = c.vessel_xy()
+        run = math.hypot(vx, vy)  # ship run from the jointing origin (0,0)
+        bu = c.bu_xyz()
+        te = c.target_error()
+        def counts(name):
+            return (f"{c.cable_count(name):,.0f}"
+                    if name in set(c.active_leads()) else "")
+
+        def tdp(name):
+            t = self._manual_lead_tension(name)
+            return t[1] if t is not None else None
+
+        t1, t2 = tdp("leg1"), tdp("leg2")
+        tdp_txt = " | ".join("—" if t is None else f"{t:.2f}" for t in (t1, t2))
+        imbal_txt = (f"{abs(t1 - t2):.2f}"
+                     if t1 is not None and t2 is not None else "")
+        vals = [
+            str(len(c.history)),
+            action_label,
+            f"{run:.0f}",
+            f"{math_to_compass_deg(c.heading_deg()):.0f}",
+            counts("leg1"), counts("leg2"), counts("trunk"),
+            tdp_txt, imbal_txt,
+            f"{-bu[2]:.1f}" if bu is not None else "",
+            f"{te[0]:.1f}" if te is not None else "",
+        ]
+        for col, val in enumerate(vals):
+            self.man_log.setItem(r, col, QTableWidgetItem(val))
+        self.man_log.scrollToBottom()
+
+    def _rebuild_manual_log(self):
+        """After an undo, drop the last log row (history shrank by one)."""
+        n = len(self._manual.history) if self._manual else 0
+        while self.man_log.rowCount() > n:
+            self.man_log.removeRow(self.man_log.rowCount() - 1)
 
     # ---- schedule table <-> PhaseRow dicts --------------------------------
 
@@ -1143,23 +1755,23 @@ class LaySimulatorDialog(QDialog):
             bathy = bathymetry_from_dict(self._bathy_cfg())
             rows = default_bu_schedule(
                 depth_m=float(bathy.depth_at(0.0, 0.0)),
-                tail_length_m=float(self.bf_tail.value()),
-                payout_mps=float(self.bf_payout.value()),
-                lay_speed_mps=float(self.bf_ship_speed.value()) * 0.514444,
-                course_deg=0.0,   # stored math-frame 0; column shows compass
+                tail_leg1_m=float(self.bf_tail1.value()),
+                tail_leg2_m=float(self.bf_tail2.value()),
+                tail_trunk_m=float(self.bf_tail_trunk.value()),
+                payout_mps=float(self.bf_payout.value()) * KMH,
+                lay_speed_mps=float(self.bf_ship_speed.value()) * KMH,
+                course_deg=None,   # blank = follow the ship course at run time
             )
         except Exception as exc:
             QMessageBox.warning(self, "Schedule", f"Could not build the "
                                 f"default schedule:\n{exc}")
             return
-        # Column shows the ship course as compass; engine rows are math-frame.
-        for r in rows:
-            r.course_deg = float(self.lay_az.value())
-        self._schedule_to_table([r.to_dict() for r in rows], course_is_compass=True)
+        self._schedule_to_table([r.to_dict() for r in rows])
 
-    def _schedule_to_table(self, rows: list, course_is_compass: bool = True):
-        """Fill the schedule table from PhaseRow dicts (course shown as a
-        compass bearing)."""
+    def _schedule_to_table(self, rows: list, course_is_compass: bool = False):
+        """Fill the schedule table from PhaseRow dicts. Engine rows carry
+        math-frame courses (or None = follow the ship course, shown blank);
+        the column always displays compass bearings."""
         from .scene import math_to_compass_deg
 
         t = self.sched_table
@@ -1169,19 +1781,29 @@ class LaySimulatorDialog(QDialog):
             for d in rows:
                 r = t.rowCount()
                 t.insertRow(r)
-                course = float(d.get("course_deg", 0.0))
-                if not course_is_compass:
-                    course = math_to_compass_deg(course)
+                course = d.get("course_deg", None)
+                if course is None:
+                    course_txt = ""
+                else:
+                    course = float(course)
+                    if not course_is_compass:
+                        course = math_to_compass_deg(course)
+                    course_txt = f"{course:.0f}"
                 pay = d.get("payout_mps") or {}
+                speed_mps = float(d.get("speed_mps", 0.0))
+                dist = float(d.get("distance_m", 0.0))
+                if dist <= 0.0 and speed_mps > 0.0:
+                    dist = speed_mps * float(d.get("duration_s", 0.0))
                 vals = [
                     str(d.get("label", "")),
                     str(d.get("event", "")),
+                    f"{dist:.0f}" if dist > 0.0 else "",
                     f"{float(d.get('duration_s', 0.0)):.0f}",
-                    f"{course:.0f}",
-                    f"{float(d.get('speed_mps', 0.0)) / 0.514444:.2f}",
-                    f"{float(pay.get('leg1', 0.0)):.2f}",
-                    f"{float(pay.get('leg2', 0.0)):.2f}",
-                    f"{float(pay.get('trunk', 0.0)):.2f}",
+                    course_txt,
+                    f"{speed_mps / KMH:.2f}",
+                    f"{float(pay.get('leg1', 0.0)) / KMH:.2f}",
+                    f"{float(pay.get('leg2', 0.0)) / KMH:.2f}",
+                    f"{float(pay.get('trunk', 0.0)) / KMH:.2f}",
                 ]
                 for c, v in enumerate(vals):
                     t.setItem(r, c, QTableWidgetItem(v))
@@ -1190,7 +1812,14 @@ class LaySimulatorDialog(QDialog):
             t.blockSignals(False)
 
     def _schedule_from_table(self) -> list:
-        """PhaseRow dicts from the table (course converted compass -> math)."""
+        """PhaseRow dicts from the table.
+
+        Courses convert compass -> math; a blank course cell stays ``None``
+        (= follow the ship course from 'Position & heading' at run time).
+        Speeds/payouts convert km/h -> m/s. For a moving phase the 'Ship
+        run' distance governs and the duration is derived from it; the
+        duration cell is used directly when the phase is stationary (or the
+        distance cell is blank)."""
         from .scene import compass_to_math_deg as c2m
 
         rows = []
@@ -1207,15 +1836,24 @@ class LaySimulatorDialog(QDialog):
             pay = {}
             for name, col in (("leg1", SCH_COL_LEG1), ("leg2", SCH_COL_LEG2),
                               ("trunk", SCH_COL_TRUNK)):
-                v = num(col, 0.0)
+                v = num(col, 0.0) * KMH
                 if v != 0.0:
                     pay[name] = v
+            speed_mps = num(SCH_COL_SPEED, 0.0) * KMH
+            dist = num(SCH_COL_DIST, 0.0)
+            if dist > 0.0 and speed_mps > 0.0:
+                duration = dist / speed_mps
+            else:
+                duration = num(SCH_COL_DUR, 0.0)
+                dist = speed_mps * duration
+            course_txt = txt(SCH_COL_COURSE)
             rows.append({
                 "label": txt(SCH_COL_LABEL),
                 "event": txt(SCH_COL_EVENT),
-                "duration_s": num(SCH_COL_DUR, 0.0),
-                "course_deg": c2m(num(SCH_COL_COURSE, 0.0)),
-                "speed_mps": num(SCH_COL_SPEED, 0.0) * 0.514444,
+                "duration_s": duration,
+                "distance_m": dist,
+                "course_deg": None if course_txt == "" else c2m(num(SCH_COL_COURSE, 0.0)),
+                "speed_mps": speed_mps,
                 "payout_mps": pay,
             })
         return [r for r in rows if r["duration_s"] > 0]
@@ -1570,7 +2208,7 @@ class LaySimulatorDialog(QDialog):
         cfg.chute_fwd_m = float(self.chute_fwd.value())
         cfg.chute_stbd_m = float(self.chute_stbd.value())
         cfg.chute_radius_m = float(self.chute_radius.value())
-        cfg.ship_speed_kn = float(self.ship_speed.value())
+        cfg.ship_speed_mps = float(self.ship_speed.value()) * KMH
         cfg.slack_percent = float(self.slack.value())
         cfg.solve_mode = self.solve_mode.currentData()
         cfg.solve_value = float(self.solve_value.value())
@@ -1604,9 +2242,11 @@ class LaySimulatorDialog(QDialog):
                 "vessel_y": float(self.bf_vessel_y.value()),
                 "target_x": float(self.bf_target_x.value()),
                 "target_y": float(self.bf_target_y.value()),
-                "tail_length_m": float(self.bf_tail.value()),
-                "payout_mps": float(self.bf_payout.value()),
-                "ship_speed_kn": float(self.bf_ship_speed.value()),
+                "tail_leg1_m": float(self.bf_tail1.value()),
+                "tail_leg2_m": float(self.bf_tail2.value()),
+                "tail_trunk_m": float(self.bf_tail_trunk.value()),
+                "payout_mps": float(self.bf_payout.value()) * KMH,
+                "ship_speed_mps": float(self.bf_ship_speed.value()) * KMH,
                 "balance": bool(self.bf_balance.isChecked()),
                 "limit_mbr_m": float(self.def_mbr.value()),
                 "schedule": self._schedule_from_table() or None,
@@ -1618,24 +2258,24 @@ class LaySimulatorDialog(QDialog):
                 "leg_length_m": float(self.bu_leg_len.value()),
                 "leg1_azimuth_deg": float(self.bu_leg1_az.value()),
                 "leg2_azimuth_deg": float(self.bu_leg2_az.value()),
-                "payout_mps": float(self.bu_payout.value()),
-                "ship_speed_kn": float(self.bu_ship_speed.value()),
+                "payout_mps": float(self.bu_payout.value()) * KMH,
+                "ship_speed_mps": float(self.bu_ship_speed.value()) * KMH,
             }
         elif kind == "bight":
             cfg.op = {
                 "bight_length_m": float(self.fb_length.value()),
                 "end_separation_m": float(self.fb_sep.value()),
                 "bight_axis_deg": float(self.fb_axis.value()),
-                "payout_mps": float(self.fb_payout.value()),
+                "payout_mps": float(self.fb_payout.value()) * KMH,
                 "step_course_deg": float(self.fb_course.value()),
-                "ship_speed_kn": float(self.fb_ship_speed.value()),
+                "ship_speed_mps": float(self.fb_ship_speed.value()) * KMH,
                 "release_threshold_kN": float(self.fb_release.value()),
             }
         else:
             cfg.op = {
                 "duration_s": float(self.sl_duration.value()),
                 "slack_percent": float(self.slack.value()),
-                "ship_speed_kn": float(self.ship_speed.value()),
+                "ship_speed_mps": float(self.ship_speed.value()) * KMH,
             }
         if cfg.mode == "operation":
             cfg.op["quality"] = self.op_quality.currentData() or "full"
@@ -1866,38 +2506,46 @@ class LaySimulatorDialog(QDialog):
     # ------------------------------------------------------------- modes
 
     def _active_config(self) -> str:
-        """'single' | 'bu' | 'bight' for the currently relevant geometry."""
+        """'single' | 'bu' | 'bu_full' | 'bight' for the currently relevant
+        geometry (bu_full = the two-sheave deployment, which takes laid-end
+        coordinates instead of lead bearings/lengths)."""
         mode = self.mode_combo.currentData()
         if mode == "operation":
-            return {"bu_deployment": "bu", "bu_full": "bu",
+            return {"bu_deployment": "bu", "bu_full": "bu_full",
                     "final_bight": "bight"}.get(
                 self.scenario_combo.currentData(), "single")
         if mode == "static":
             return self.static_config.currentData() or "single"
         return "single"
 
+    @staticmethod
+    def _show_rows(rows, visible: bool):
+        for lbl, w in rows:
+            lbl.setVisible(visible)
+            w.setVisible(visible)
+
     def _update_config_visibility(self, *args):
+        """Show only the settings the active mode actually consumes (per the
+        config-consumption audit of build_config -> solve_controller ->
+        engine builders)."""
         mode = self.mode_combo.currentData()
-        config = self._active_config()
+        config = self._active_config()   # single | bu | bu_full | bight
+        scenario = self.scenario_combo.currentData() if mode == "operation" else ""
+        is_static = mode == "static"
+        is_bu_any = config in ("bu", "bu_full")
+
         # Shared BU / splice properties section.
         gbtn, gbody = self._collapsibles["bu_bight"]
-        show_geo = config in ("bu", "bight")
+        show_geo = is_bu_any or config == "bight"
         gbtn.setVisible(show_geo)
         gbody.setVisible(show_geo and gbtn.isChecked())
-        for lbl, w in self._bu_geo_rows:
-            lbl.setVisible(config == "bu")
-            w.setVisible(config == "bu")
-        for lbl, w in self._fb_geo_rows:
-            lbl.setVisible(config == "bight")
-            w.setVisible(config == "bight")
+        self._show_rows(self._bu_geo_rows, is_bu_any)          # weight, CdA
+        self._show_rows(self._bu_leglen_row, config == "bu")   # bu_full derives it
+        self._show_rows(self._fb_geo_rows, config == "bight")
         # Position & heading section: scenario-specific bearing rows and
         # the guided setup button caption.
-        for lbl, w in self._pos_bu_rows:
-            lbl.setVisible(config == "bu")
-            w.setVisible(config == "bu")
-        for lbl, w in self._pos_fs_rows:
-            lbl.setVisible(config == "bight")
-            w.setVisible(config == "bight")
+        self._show_rows(self._pos_bu_rows, config == "bu")     # lead bearings
+        self._show_rows(self._pos_fs_rows, config == "bight")
         show_course = config != "bight"
         self._lay_az_label.setVisible(show_course)
         self.lay_az.setVisible(show_course)
@@ -1921,17 +2569,25 @@ class LaySimulatorDialog(QDialog):
                 "point in the steaming direction. Sets the local origin and "
                 "the ship course.")
         # Solve-section rows.
-        is_static = mode == "static"
         single_solve = (mode == "steady") or (is_static and config == "single")
-        for lbl, w in self._solve_rows:
-            lbl.setVisible(single_solve)
-            w.setVisible(single_solve)
-        for lbl, w in self._bu_hold_rows:
-            lbl.setVisible(is_static and config == "bu")
-            w.setVisible(is_static and config == "bu")
-        for lbl, w in self._fb_hold_rows:
-            lbl.setVisible(is_static and config == "bight")
-            w.setVisible(is_static and config == "bight")
+        self._show_rows(self._solve_rows, single_solve)
+        self._show_rows(self._onbed_row, is_static and config == "single")
+        self._show_rows(self._bu_hold_rows, is_static and config == "bu")
+        self._show_rows(self._trunk_slack_row, is_bu_any)
+        self._show_rows(self._fb_hold_rows, is_static and config == "bight")
+        # Vessel & lay: speed/slack drive the steady lay and the operation
+        # straight lay only (the BU / bight pages have their own speeds);
+        # the capstan figure is only computed for the single-span solves.
+        show_speed = (mode == "steady") or (scenario == "straight_lay")
+        self._ship_speed_label.setVisible(show_speed)
+        self.ship_speed.setVisible(show_speed)
+        self._slack_label.setVisible(show_speed)
+        self.slack.setVisible(show_speed)
+        show_capstan = (mode == "steady") or (is_static and config == "single")
+        self._chute_mu_label.setVisible(show_capstan)
+        self.chute_mu.setVisible(show_capstan)
+        # Vessel drawing: the sheave offsets only feed the two-sheave BU.
+        self._show_rows(self._sheave_rows, config == "bu_full")
         self._schedule()
 
     def _on_mode_changed(self, *args):
@@ -1951,10 +2607,8 @@ class LaySimulatorDialog(QDialog):
         sbtn, sbody = self._collapsibles["solve"]
         sbtn.setVisible(not is_op)
         sbody.setVisible((not is_op) and sbtn.isChecked())
-        self._ship_speed_label.setVisible(mode != "static")
-        self.ship_speed.setVisible(mode != "static")
-        self._slack_label.setVisible(mode != "static")
-        self.slack.setVisible(mode != "static")
+        # Ship speed / slack visibility is scenario-aware and handled in
+        # _update_config_visibility (called below).
         self.scrub_widget.setVisible(is_op and bool(self._last_out and self._last_out.snapshots))
         self._update_config_visibility()
 
@@ -1972,10 +2626,29 @@ class LaySimulatorDialog(QDialog):
             self._refresh_raster_layers()
         self._schedule()
 
+    def _sync_op_stack_height(self):
+        """Let the operation-scenario stack take only its CURRENT page's
+        height. A QStackedWidget's size hint is the max over all pages, so
+        the (tall) bu_full page would otherwise leave a large blank gap
+        under the short pages."""
+        cur = self.op_stack.currentWidget()
+        for i in range(self.op_stack.count()):
+            w = self.op_stack.widget(i)
+            if w is cur:
+                w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+            else:
+                w.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        if cur is not None:
+            cur.adjustSize()
+        self.op_stack.adjustSize()
+
     def _on_scenario_changed(self, *args):
         idx = {"bu_deployment": 0, "bu_full": 1, "final_bight": 2,
                "straight_lay": 3}.get(self.scenario_combo.currentData(), 0)
         self.op_stack.setCurrentIndex(idx)
+        self._sync_op_stack_height()
+        if hasattr(self, "bf_run_mode"):
+            self._on_bf_run_mode()
         self._update_config_visibility()
 
     # ------------------------------------------------------------- QGIS
@@ -2517,6 +3190,20 @@ class LaySimulatorDialog(QDialog):
                 expanded = str(val) == "1"
                 btn.setChecked(expanded)
                 body.setVisible(expanded)
+        # One-time migration to the 127 m aft-departure default vessel: only
+        # applied when the stored ship shape still matches the old factory
+        # defaults (i.e. the user never customised it).
+        if self.settings.value("ship_defaults_v2") is None:
+            old_default = (float(self.ship_len.value()) == 60.0
+                           and float(self.ship_beam.value()) == 12.0
+                           and float(self.chute_fwd.value()) == 0.0
+                           and float(self.sheave_fwd.value()) == 0.0)
+            if old_default:
+                self.ship_len.setValue(127.0)
+                self.ship_beam.setValue(27.0)
+                self.chute_fwd.setValue(-63.5)
+                self.sheave_fwd.setValue(-63.5)
+            # The flag is persisted by _save_settings alongside the values.
         # Migrate pre-scenario-picker settings (mode + static config saved
         # separately) onto the single scenario choice, then sync internals.
         if self.settings.value("w_scenario_choice") is None:
@@ -2565,6 +3252,7 @@ class LaySimulatorDialog(QDialog):
             except Exception:
                 pass
         self.settings.setValue("origin_set", "1" if self._origin_set else "0")
+        self.settings.setValue("ship_defaults_v2", "1")
         self.settings.setValue("assembly_json", json.dumps(self._assembly_json()))
         self.settings.setValue("current_json", json.dumps(self._current_cfg()))
         pts = []

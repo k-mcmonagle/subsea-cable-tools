@@ -53,18 +53,25 @@ def straight_lay(
     chute_height_m: float = 5.0,
     on_bed_tail_m: float = 200.0,
     target_ds_m: float = 5.0,
+    course_deg: float = 0.0,
 ) -> Scenario:
-    """A vessel steaming along +x paying out cable; the far end is anchored
-    on the bed behind the start position."""
+    """A vessel steaming along ``course_deg`` (math degrees; default +x)
+    paying out cable; the far end is anchored on the bed behind the start
+    position."""
     depth0 = float(bathy.depth_at(0.0, 0.0))
     if initial_suspended_m <= 0:
         initial_suspended_m = 1.35 * depth0 + chute_height_m
     L0 = initial_suspended_m + on_bed_tail_m
-    anchor = (-(initial_suspended_m * 0.35 + on_bed_tail_m), 0.0, _bed_z(bathy, -(initial_suspended_m * 0.35 + on_bed_tail_m), 0.0))
+    c = math.radians(float(course_deg))
+    ux, uy = math.cos(c), math.sin(c)
+    anchor_r = initial_suspended_m * 0.35 + on_bed_tail_m
+    anchor = (-anchor_r * ux, -anchor_r * uy,
+              _bed_z(bathy, -anchor_r * ux, -anchor_r * uy))
 
     # Seed: hanging catenary chute -> touchdown, then a tail to the anchor.
     chute = np.array([0.0, 0.0, chute_height_m])
-    tdp_guess = np.array([-0.55 * initial_suspended_m, 0.0, -depth0])
+    tdp_guess = np.array([-0.55 * initial_suspended_m * ux,
+                          -0.55 * initial_suspended_m * uy, -depth0])
     shape = np.vstack([
         catenary_seed(chute, tdp_guess, initial_suspended_m, 40),
         straight_shape(tdp_guess, np.asarray(anchor), 20)[1:],
@@ -80,10 +87,11 @@ def straight_lay(
         target_ds_m=target_ds_m,
     )
     payout = ship_speed_mps * (1.0 + slack_percent / 100.0)
-    steps = [Step(duration_s=duration_s, vessel_course_deg=0.0,
+    steps = [Step(duration_s=duration_s, vessel_course_deg=float(course_deg),
                   vessel_speed_mps=ship_speed_mps, payout_mps={"cable": payout},
                   label=f"lay at {ship_speed_mps:.2f} m/s, {slack_percent:.1f}% slack")]
-    return Scenario(chains={"cable": chain}, vessel_xy=(0.0, 0.0), steps=steps)
+    return Scenario(chains={"cable": chain}, vessel_xy=(0.0, 0.0),
+                    vessel_heading_deg=float(course_deg), steps=steps)
 
 
 # ---------------------------------------------------------------------------
@@ -319,34 +327,46 @@ class PhaseRow:
     across the phase) or ``"overboard_bu"`` (spawn the BU junction + trunk
     and re-top both legs onto it). Angles are engine math degrees
     (0 = +x, CCW positive); UI layers convert compass bearings.
+
+    ``distance_m`` is the planned ship position change over the phase
+    (the operator-facing measure, counted from the jointing position).
+    The engine steps on ``duration_s``; for a moving phase the two are
+    linked by ``duration_s = distance_m / speed_mps`` and the builders
+    keep both populated. ``course_deg`` may be ``None`` meaning "follow
+    the operation's lay course" — resolved by the consumer before the
+    row reaches the engine.
     """
 
     label: str
     duration_s: float
-    course_deg: float = 0.0
+    course_deg: Optional[float] = 0.0
     speed_mps: float = 0.0
     payout_mps: Dict[str, float] = field(default_factory=dict)
     event: str = ""
+    distance_m: float = 0.0
 
     def to_dict(self) -> dict:
         return {
             "label": self.label,
             "duration_s": float(self.duration_s),
-            "course_deg": float(self.course_deg),
+            "course_deg": None if self.course_deg is None else float(self.course_deg),
             "speed_mps": float(self.speed_mps),
             "payout_mps": {k: float(v) for k, v in self.payout_mps.items()},
             "event": self.event,
+            "distance_m": float(self.distance_m),
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "PhaseRow":
+        course = d.get("course_deg", 0.0)
         return cls(
             label=str(d.get("label", "")),
             duration_s=float(d.get("duration_s", 0.0)),
-            course_deg=float(d.get("course_deg", 0.0)),
+            course_deg=None if course is None else float(course),
             speed_mps=float(d.get("speed_mps", 0.0)),
             payout_mps={str(k): float(v) for k, v in (d.get("payout_mps") or {}).items()},
             event=str(d.get("event", "")),
+            distance_m=float(d.get("distance_m", 0.0)),
         )
 
 
@@ -369,22 +389,46 @@ def default_bu_schedule(
     *,
     depth_m: float,
     tail_length_m: float = 90.0,
+    tail_leg1_m: Optional[float] = None,
+    tail_leg2_m: Optional[float] = None,
+    tail_trunk_m: Optional[float] = None,
     payout_mps: float = 0.4,
     lay_speed_mps: float = 0.3,
-    course_deg: float = 0.0,
+    course_deg: Optional[float] = 0.0,
     transfer_duration_s: float = 120.0,
     joint_margin_m: float = 20.0,
     lay_on_margin_s: float = 300.0,
 ) -> List[PhaseRow]:
     """The nominal five-phase deployment script (leg names ``leg1``/``leg2``,
-    trunk ``trunk``)."""
-    t_joints = (tail_length_m + joint_margin_m) / max(payout_mps, 0.01)
-    t_lower = 1.5 * (depth_m + 5.0) / max(payout_mps, 0.01)
+    trunk ``trunk``).
+
+    Each BU tail can differ (``tail_leg1_m`` / ``tail_leg2_m`` /
+    ``tail_trunk_m``; all default to ``tail_length_m``): the joint pay-over
+    phase is timed by the longer leg tail with the shorter leg's rate scaled
+    so both joints go overboard together, and the lay-ahead phase is long
+    enough to pay the trunk tail (plus margin) over the sheave.
+    """
+    t1 = float(tail_leg1_m if tail_leg1_m is not None else tail_length_m)
+    t2 = float(tail_leg2_m if tail_leg2_m is not None else tail_length_m)
+    tt = float(tail_trunk_m if tail_trunk_m is not None else tail_length_m)
+    payout_mps = max(payout_mps, 0.01)
+    t_joints = (max(t1, t2) + joint_margin_m) / payout_mps
+    rate1 = (t1 + joint_margin_m) / t_joints
+    rate2 = (t2 + joint_margin_m) / t_joints
+    t_lower = 1.5 * (depth_m + 5.0) / payout_mps
+    trunk_lay_rate = lay_speed_mps * 1.02
+    t_lay_on = max(lay_on_margin_s,
+                   (tt + joint_margin_m) / max(trunk_lay_rate, 0.01))
+
+    def dist(speed: float, t: float) -> float:
+        return speed * t
+
     return [
         PhaseRow("Hold and balance legs", 60.0, course_deg, 0.0, {}),
         PhaseRow(
             "Pay joints overboard", t_joints, course_deg, 0.05,
-            {"leg1": payout_mps, "leg2": payout_mps},
+            {"leg1": rate1, "leg2": rate2},
+            distance_m=dist(0.05, t_joints),
         ),
         PhaseRow(
             "Transfer leg 2 to port sheave", transfer_duration_s, course_deg, 0.0,
@@ -393,10 +437,12 @@ def default_bu_schedule(
         PhaseRow(
             "Overboard BU and lower", t_lower, course_deg, lay_speed_mps,
             {"trunk": payout_mps}, event="overboard_bu",
+            distance_m=dist(lay_speed_mps, t_lower),
         ),
         PhaseRow(
-            "Lay ahead on trunk", lay_on_margin_s, course_deg, lay_speed_mps,
-            {"trunk": lay_speed_mps * 1.02},
+            "Lay ahead on trunk", t_lay_on, course_deg, lay_speed_mps,
+            {"trunk": trunk_lay_rate},
+            distance_m=dist(lay_speed_mps, t_lay_on),
         ),
     ]
 
@@ -419,6 +465,9 @@ def bu_full_deployment(
     vessel_heading_deg: float = 0.0,
     schedule: Optional[List[PhaseRow]] = None,
     tail_length_m: float = 90.0,
+    tail_leg1_m: Optional[float] = None,
+    tail_leg2_m: Optional[float] = None,
+    tail_trunk_m: Optional[float] = None,
     payout_mps: float = 0.4,
     lay_speed_mps: float = 0.3,
     bu_spawn_depth_m: float = 2.0,
@@ -473,7 +522,9 @@ def bu_full_deployment(
 
     depth0 = float(bathy.depth_at(*vessel_xy))
     rows = schedule if schedule is not None else default_bu_schedule(
-        depth_m=depth0, tail_length_m=tail_length_m, payout_mps=payout_mps,
+        depth_m=depth0, tail_length_m=tail_length_m,
+        tail_leg1_m=tail_leg1_m, tail_leg2_m=tail_leg2_m,
+        tail_trunk_m=tail_trunk_m, payout_mps=payout_mps,
         lay_speed_mps=lay_speed_mps, course_deg=vessel_heading_deg,
     )
 
@@ -511,9 +562,12 @@ def bu_full_deployment(
 
     steps: List[Step] = []
     for row in rows:
+        # A None course means "follow the operation's lay course".
+        course = (vessel_heading_deg if row.course_deg is None
+                  else float(row.course_deg))
         step = Step(
             duration_s=float(row.duration_s),
-            vessel_course_deg=float(row.course_deg),
+            vessel_course_deg=course,
             vessel_speed_mps=float(row.speed_mps),
             payout_mps=dict(row.payout_mps),
             label=row.label,

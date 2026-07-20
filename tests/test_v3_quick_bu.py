@@ -227,7 +227,11 @@ def test_quick_full_two_sheave_deployment():
     )
     opts = tl.SimOptions(max_move_m=8.0)
     opts.controller = ctl.TensionBalanceController("leg1", "leg2")
-    sim = qk.QuickOperationSimulator(scn, bathy, opts)
+    # lay_history=False: this test validates the scripting/controller
+    # integration against the idealised (frictionless) analytic backend,
+    # where the tight balance tolerance below is meaningful. Frozen-lay
+    # behaviour has dedicated tests in test_v3_manual.py.
+    sim = qk.QuickOperationSimulator(scn, bathy, opts, lay_history=False)
     t0 = time.perf_counter()
     res = sim.run()
     wall = time.perf_counter() - t0

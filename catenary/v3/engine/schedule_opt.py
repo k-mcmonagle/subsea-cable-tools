@@ -144,6 +144,9 @@ def optimize_bu_schedule(
             rows = default_bu_schedule(
                 depth_m=float(bathy.depth_at(*start_xy)),
                 tail_length_m=float(p.get("tail_length_m", 90.0)),
+                tail_leg1_m=p.get("tail_leg1_m"),
+                tail_leg2_m=p.get("tail_leg2_m"),
+                tail_trunk_m=p.get("tail_trunk_m"),
                 payout_mps=float(p.get("payout_mps", 0.4)),
                 lay_speed_mps=float(p.get("lay_speed_mps", 0.3)),
                 course_deg=float(p.get("vessel_heading_deg", 0.0)),

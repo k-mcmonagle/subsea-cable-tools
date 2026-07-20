@@ -78,6 +78,9 @@ class VesselGlyph:
     chute_stbd_m: float = 0.0       # chute starboard of CRP
     chute_radius_m: float = 0.0     # overboarding chute radius (drawn only)
     label: str = "vessel"
+    # Text shown at the departure anchor ("chute"; "sheaves" for the
+    # two-sheave BU scenes where xy is the sheave-pair centre).
+    departure_label: str = "chute"
     color: str = "#444444"
 
 

@@ -151,7 +151,12 @@ def timeline_csv_rows(snapshots: Sequence) -> Tuple[List[str], List[List]]:
 def schedule_csv_rows(snapshots: Sequence) -> Tuple[List[str], List[List]]:
     """Operational schedule sheet: one row per snapshot with the vessel
     state, the applied payout per line and the resulting tensions — the
-    table a lay crew can follow (and check against) during the deployment."""
+    table a lay crew can follow (and check against) during the deployment.
+
+    ``dist_from_start_m`` is the cumulative ship position change from the
+    first snapshot (the jointing position for a BU deployment) — the
+    operator-facing progress measure the schedule is planned against.
+    Speeds and payout rates are given in km/h."""
     chain_names: List[str] = []
     seen = set()
     for snap in snapshots:
@@ -160,30 +165,59 @@ def schedule_csv_rows(snapshots: Sequence) -> Tuple[List[str], List[List]]:
                 seen.add(c.name)
                 chain_names.append(c.name)
 
-    header = ["t_s", "phase", "vessel_x_m", "vessel_y_m", "heading_degN"]
+    header = ["dist_from_start_m", "t_s", "phase", "vessel_x_m", "vessel_y_m",
+              "heading_degN", "ship_speed_kmh"]
     for name in chain_names:
-        header.append(f"payout_{name}_mps")
+        header.append(f"payout_{name}_kmh")
     for name in chain_names:
         header.append(f"top_tension_{name}_kN")
+    for name in chain_names:
+        header.append(f"tdp_tension_{name}_kN")
     header += ["leg_imbalance_kN", "BU_x_m", "BU_y_m", "BU_z_m"]
+
+    def _tdp_kN(c) -> Any:
+        contact = np.asarray(getattr(c, "contact", []), dtype=bool)
+        if contact.size == 0 or not contact.any():
+            return ""
+        i = int(np.argmax(contact))
+        t = np.asarray(c.tension_kN, dtype=float)
+        return _num(t[min(i, t.size - 1)])
 
     def _math_to_compass(deg: float) -> float:
         return (90.0 - float(deg)) % 360.0
 
     rows: List[List] = []
+    dist = 0.0
+    prev_xy = None
+    prev_t = None
     for snap in snapshots:
         payout = getattr(snap, "payout_mps", {}) or {}
         by_name = {c.name: c for c in snap.chains}
+        x, y = float(snap.vessel_xy[0]), float(snap.vessel_xy[1])
+        step_d = 0.0
+        speed_kmh = 0.0
+        if prev_xy is not None:
+            step_d = math.hypot(x - prev_xy[0], y - prev_xy[1])
+            dt = float(snap.t_s) - prev_t
+            if dt > 0:
+                speed_kmh = 3.6 * step_d / dt
+        dist += step_d
+        prev_xy = (x, y)
+        prev_t = float(snap.t_s)
         row: List[Any] = [
-            _num(snap.t_s), getattr(snap, "label", ""),
-            _num(snap.vessel_xy[0]), _num(snap.vessel_xy[1]),
+            _num(dist, 1), _num(snap.t_s), getattr(snap, "label", ""),
+            _num(x), _num(y),
             _num(_math_to_compass(snap.vessel_heading_deg), 1),
+            _num(speed_kmh, 2),
         ]
         for name in chain_names:
-            row.append(_num(payout[name], 3) if name in payout else "")
+            row.append(_num(payout[name] * 3.6, 3) if name in payout else "")
         for name in chain_names:
             c = by_name.get(name)
             row.append(_num(c.top_tension_kN) if c is not None else "")
+        for name in chain_names:
+            c = by_name.get(name)
+            row.append(_tdp_kN(c) if c is not None else "")
         c1, c2 = by_name.get("leg1"), by_name.get("leg2")
         row.append(_num(c1.top_tension_kN - c2.top_tension_kN)
                    if c1 is not None and c2 is not None else "")

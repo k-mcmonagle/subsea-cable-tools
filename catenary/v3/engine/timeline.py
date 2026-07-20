@@ -174,6 +174,10 @@ class Step:
     events: List[Event] = field(default_factory=list)
     transfer: Optional[SheaveTransfer] = None
     label: str = ""
+    # When True the vessel translates without turning onto its course (a
+    # crab / lateral move); heading is left unchanged. Default False keeps
+    # the historic behaviour of steering onto the movement direction.
+    keep_heading: bool = False
 
 
 @dataclass
@@ -532,7 +536,7 @@ class OperationSimulator:
         vx = step.vessel_speed_mps * math.cos(c)
         vy = step.vessel_speed_mps * math.sin(c)
         self.sc.vessel_xy = (self.sc.vessel_xy[0] + vx * dt, self.sc.vessel_xy[1] + vy * dt)
-        if step.vessel_speed_mps > 0:
+        if step.vessel_speed_mps > 0 and not step.keep_heading:
             self.sc.vessel_heading_deg = step.vessel_course_deg
         # Pay out / haul in.
         self._applied_payout = {}

@@ -14,10 +14,14 @@ Model assumptions (vs the full solver):
 * Uniform line weight per chain (length-weighted mean of the assembly's
   submerged weight); in-line bodies/joints are ignored.
 * No hydrodynamic drag, no current, no rate effects.
-* No seabed friction: a leg's bed portion runs straight from its anchor
-  toward the touchdown, and touchdown is a tangency condition (residual
-  bottom tension equals the catenary's horizontal tension). Lay history is
-  not modelled.
+* Seabed friction enters as a **frozen-lay** approximation (default on):
+  cable on the bed keeps its as-laid polyline (friction is assumed ample to
+  hold it in plan position); only the suspended span re-solves each step,
+  laying down at / picking up from the touchdown point. Bed tension decays
+  from the touchdown as ``T(s) = max(0, H - mu*w*s)`` (display only — the
+  frozen geometry does not depend on it). With ``lay_history=False`` the
+  legacy behaviour returns: the bed portion runs straight from its anchor
+  toward the touchdown with no lay history.
 * The seabed under a suspended span is taken at the touchdown point only
   (real bathymetry supplies the depths, but a hump between TDP and anchor
   is not felt by the span).
@@ -91,6 +95,32 @@ def mean_weight_npm(chain: ChainState) -> float:
             "no hanging catenary. Use the Full or Draft model, or check "
             "the assembly weights.")
     return w
+
+
+def mean_friction_mu(chain: ChainState) -> float:
+    """Length-weighted mean seabed friction coefficient over the deployed
+    length (mirror of :func:`mean_weight_npm`; blank = chain defaults)."""
+    remaining = max(1.0, float(chain.length_m))
+    items = list(chain.assembly)
+    if chain.mapper_direction == "from_bottom":
+        items = items[::-1]
+    total_mu = 0.0
+    total_l = 0.0
+    for it in items:
+        length = float(getattr(it, "length_m", 0.0) or 0.0)
+        if length <= 0.0:
+            continue
+        mu = getattr(it, "friction_mu", None)
+        if mu is None:
+            mu = float(chain.defaults.mu)
+        take = min(length, remaining - total_l)
+        if take <= 0.0:
+            break
+        total_mu += float(mu) * take
+        total_l += take
+        if total_l >= remaining:
+            break
+    return total_mu / total_l if total_l > 0.0 else float(chain.defaults.mu)
 
 
 def _solve_beta(D: float, h: float) -> float:
@@ -317,6 +347,136 @@ def leg_solution(p_top: "np.ndarray", anchor_xy: Tuple[float, float],
 
 
 # ---------------------------------------------------------------------------
+# Frozen-lay history (seabed friction approximation)
+# ---------------------------------------------------------------------------
+
+def _path_length(pts: "np.ndarray") -> float:
+    if len(pts) < 2:
+        return 0.0
+    return float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
+
+
+def leg_solution_frozen(p_top: "np.ndarray", path_pts: "np.ndarray",
+                        L: float, w: float, bathy, mu: float,
+                        ds: float = 3.0, n_susp: int = 30) -> dict:
+    """A line hanging from ``p_top`` onto a FROZEN as-laid bed polyline.
+
+    ``path_pts`` is the laid path, anchor-first, ending at the current
+    touchdown. Friction is assumed ample to hold laid cable in plan
+    position, so only the touchdown end evolves: surplus suspended length
+    lays new points down (from the TDP toward the hang), a deficit picks
+    points back up. The suspended span is the tangent catenary from the
+    (possibly moved) TDP to ``p_top``; bed tension decays from the TDP as
+    ``max(0, H - mu*w*s)``.
+
+    Pure function: the (possibly grown/shrunk) path is returned as
+    ``path_pts`` in the result — the caller decides whether to commit it,
+    so equilibrium iterations (the BU Newton loop) stay side-effect free.
+    Returns the same keys as :func:`leg_solution` plus ``path_pts``;
+    ``path_pts`` is None when the line lifted fully off the bed.
+
+    Touchdown rules (the essence of the friction model):
+
+    * surplus over the tangent-catenary length lays new cable down;
+    * cable is picked back up only when *geometrically* forced (suspended
+      length shorter than the straight chord to the touchdown) — in the
+      regime between chord and tangent length the span simply tightens
+      into a non-tangent catenary with rising tension while friction holds
+      the touchdown in place. (A pure tangency rule would peel cable off
+      the bed catastrophically whenever the vessel moves away.)
+    """
+    p_top = np.asarray(p_top, dtype=float)
+    pts = np.asarray(path_pts, dtype=float).reshape(-1, 3).copy()
+    s_laid = _path_length(pts)
+    s_free = float(L) - s_laid
+
+    def geom(tdp):
+        D = float(np.hypot(p_top[0] - tdp[0], p_top[1] - tdp[1]))
+        h = max(0.05, float(p_top[2] - tdp[2]))
+        H, s_tan, _T = tangent_catenary(D, h, w)
+        chord = math.hypot(D, float(p_top[2] - tdp[2]))
+        return D, h, H, s_tan, chord
+
+    # Walk the touchdown: lay down surplus; pick up only under geometric
+    # necessity (see docstring).
+    pooled = False
+    max_iter = int(abs(s_free) / max(ds, 0.1)) + len(pts) + 64
+    for _ in range(max_iter):
+        tdp = pts[-1]
+        D, h, H, s_tan, chord = geom(tdp)
+        if s_free > s_tan + 0.5 * ds:
+            if D <= max(ds, 1e-6):
+                pooled = True     # no horizontal room: surplus hangs slack
+                break
+            u = (p_top[:2] - tdp[:2]) / D
+            step = min(ds, s_free - s_tan)
+            nx, ny = tdp[0] + u[0] * step, tdp[1] + u[1] * step
+            new = np.array([nx, ny, -float(bathy.depth_at(nx, ny))])
+            s_free -= float(np.linalg.norm(new - tdp))
+            pts = np.vstack([pts, new])
+        elif s_free < chord * (1.0 + 1e-6) and len(pts) > 1:
+            s_free += float(np.linalg.norm(pts[-1] - pts[-2]))
+            pts = pts[:-1]
+        else:
+            break
+
+    if len(pts) == 1 and s_free < geom(pts[0])[4] * (1.0 + 1e-6):
+        # Path exhausted and still taut: the whole line is suspended down to
+        # the anchor — same fallback as the frictionless model.
+        anchor = pts[0]
+        cat = two_point_catenary(p_top, anchor, float(L), w, n=n_susp)
+        contact = np.zeros(len(cat["xyz"]), dtype=bool)
+        contact[-1] = True
+        return {"F_top": cat["T0_vec"], "xyz": cat["xyz"],
+                "tension": cat["tension"], "contact": contact,
+                "tdp": None, "H_bottom": float(cat["tension"][-1]),
+                "path_pts": None}
+
+    tdp = pts[-1]
+    D, h, H, s_tan, chord = geom(tdp)
+    if not pooled and abs(s_free - s_tan) <= ds and D > 1e-6:
+        # At (or close enough to) tangency: classic tangent catenary.
+        a = H / w
+        xs = np.linspace(0.0, D, n_susp + 1)
+        zs = tdp[2] + a * (np.cosh(xs / a) - 1.0)
+        e = (p_top[:2] - tdp[:2]) / D
+        pts_s = np.column_stack([tdp[0] + e[0] * xs, tdp[1] + e[1] * xs, zs])[::-1]
+        t_sus = (H * np.sqrt(1.0 + np.sinh(xs / a) ** 2))[::-1]
+        pts_s[0] = p_top
+        s_susp = s_tan
+        e_td = tdp[:2] - p_top[:2]
+        nrm = float(np.hypot(e_td[0], e_td[1]))
+        e_td = e_td / nrm if nrm > 1e-9 else np.zeros(2)
+        F_top = np.array([H * e_td[0], H * e_td[1], -w * s_susp])
+    else:
+        # Slack pooling, or tight/taut non-tangent span between chord and
+        # tangency: a two-point catenary from the top to the (friction-held)
+        # touchdown carries the state; its lower-end tension is the residual
+        # bottom tension and its exact end force loads the top (this is what
+        # makes a tightening leg pull back on the BU / show rising tension).
+        cat = two_point_catenary(p_top, tdp, max(s_free, 0.05), w, n=n_susp)
+        pts_s = cat["xyz"]                      # top -> TDP
+        t_sus = cat["tension"]
+        H = float(t_sus[-1])
+        F_top = np.asarray(cat["T0_vec"], dtype=float)
+
+    # Bed run: the frozen path, TDP -> anchor, with friction decay.
+    bed = pts[::-1]
+    seg = np.linalg.norm(np.diff(bed, axis=0), axis=1)
+    s_bed = np.concatenate([[0.0], np.cumsum(seg)])
+    t_bed = np.maximum(0.0, H - mu * w * s_bed)
+
+    xyz = np.vstack([pts_s, bed[1:]])           # top -> TDP -> anchor
+    tension = np.concatenate([t_sus, t_bed[1:]])
+    contact = np.zeros(len(xyz), dtype=bool)
+    contact[len(pts_s) - 1:] = True
+
+    return {"F_top": F_top, "xyz": xyz, "tension": tension,
+            "contact": contact, "tdp": (float(tdp[0]), float(tdp[1]), float(tdp[2])),
+            "H_bottom": H, "path_pts": pts}
+
+
+# ---------------------------------------------------------------------------
 # Quick operation simulator
 # ---------------------------------------------------------------------------
 
@@ -331,9 +491,42 @@ class QuickOperationSimulator(OperationSimulator):
 
     JUNCTION = "BU"
 
-    def __init__(self, scenario, bathy, options=None):
+    def __init__(self, scenario, bathy, options=None, lay_history: bool = True):
         super().__init__(scenario, bathy, options)
         self._landed = False
+        # Frozen-lay history: per-chain as-laid bed polyline (anchor-first).
+        self.lay_history = bool(lay_history)
+        self._paths: Dict[str, "np.ndarray"] = {}
+
+    def reset_lay_history(self):
+        self._paths = {}
+
+    def _solve_leg(self, st: ChainState, top: "np.ndarray",
+                   anchor_xy: Tuple[float, float], n_susp: int = 30,
+                   n_bed: int = 16, commit: bool = False) -> dict:
+        """Solve one bed-contacting line, via the frozen as-laid path when
+        lay history is on and a path exists; falls back to (and, on commit,
+        initialises the path from) the frictionless closed form."""
+        w = mean_weight_npm(st)
+        if self.lay_history:
+            path = self._paths.get(st.name)
+            if path is not None and len(path) >= 1:
+                sol = leg_solution_frozen(top, path, st.length_m, w,
+                                          self.bathy, mean_friction_mu(st),
+                                          n_susp=n_susp)
+                if commit:
+                    if sol["path_pts"] is None:
+                        self._paths.pop(st.name, None)   # lifted clear off
+                    else:
+                        self._paths[st.name] = sol["path_pts"]
+                return sol
+        sol = leg_solution(top, anchor_xy, self.bathy, st.length_m, w,
+                           n_susp=n_susp, n_bed=n_bed)
+        if commit and self.lay_history and sol.get("tdp") is not None:
+            bed_pts = np.asarray(sol["xyz"])[np.asarray(sol["contact"], dtype=bool)]
+            if len(bed_pts) >= 1:
+                self._paths[st.name] = np.asarray(bed_pts[::-1], dtype=float)
+        return sol
 
     # -- equilibrium backend ------------------------------------------------
 
@@ -392,9 +585,8 @@ class QuickOperationSimulator(OperationSimulator):
             cat = two_point_catenary(p, top, st.length_m, w, n=8)
             F += cat["T0_vec"]
         for st in legs:
-            w = mean_weight_npm(st)
-            sol = leg_solution(p, st.bottom.xyz[:2], self.bathy, st.length_m, w,
-                               n_susp=8, n_bed=2)
+            sol = self._solve_leg(st, p, st.bottom.xyz[:2],
+                                  n_susp=8, n_bed=2, commit=False)
             F += sol["F_top"]
         return F
 
@@ -473,9 +665,9 @@ class QuickOperationSimulator(OperationSimulator):
                 top = self._chain_top_xyz(st)
                 w = mean_weight_npm(st)
                 if self._landed:
-                    # Trunk lays down toward the BU on the bed.
-                    sol = leg_solution(top, (p[0], p[1]), self.bathy,
-                                       st.length_m, w)
+                    # Trunk lays down toward the BU on the bed (its as-laid
+                    # path is anchored at the landed BU position).
+                    sol = self._solve_leg(st, top, (p[0], p[1]), commit=True)
                     chains.append(self._chain_snap(st, sol["xyz"], sol["tension"],
                                                    sol["contact"]))
                 else:
@@ -485,16 +677,12 @@ class QuickOperationSimulator(OperationSimulator):
                     chains.append(self._chain_snap(st, xyz, tension,
                                                    np.zeros(len(xyz), dtype=bool)))
             for st in legs:
-                w = mean_weight_npm(st)
-                sol = leg_solution(p, st.bottom.xyz[:2], self.bathy,
-                                   st.length_m, w)
+                sol = self._solve_leg(st, p, st.bottom.xyz[:2], commit=True)
                 chains.append(self._chain_snap(st, sol["xyz"], sol["tension"],
                                                sol["contact"]))
         for st in hung:
             top = self._chain_top_xyz(st)
-            w = mean_weight_npm(st)
-            sol = leg_solution(top, st.bottom.xyz[:2], self.bathy,
-                               st.length_m, w)
+            sol = self._solve_leg(st, top, st.bottom.xyz[:2], commit=True)
             chains.append(self._chain_snap(st, sol["xyz"], sol["tension"],
                                            sol["contact"]))
 
