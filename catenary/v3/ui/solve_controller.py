@@ -24,8 +24,10 @@ except Exception:  # pragma: no cover - standalone tests
 
 from ..engine import bathymetry as bathy_mod
 from ..engine import cable_system as cs
+from ..engine import control as ctl
 from ..engine import hydrodynamics as hyd
 from ..engine import scenarios as scen
+from ..engine import schedule_opt as sopt
 from ..engine import solver3d as s3d
 from ..engine import steady_lay as sl
 from ..engine import timeline as tl
@@ -40,7 +42,7 @@ KNOT = 0.514444
 class V3Config:
     """Everything the engine needs, as plain data (JSON-serialisable-ish)."""
 
-    mode: str = "static"                     # static | steady | operation
+    mode: str = "static"                     # static | steady | operation | optimize
     # Environment ---------------------------------------------------------
     bathymetry: dict = field(default_factory=lambda: {"kind": "flat", "depth_m": 100.0})
     current_layers: List[dict] = field(default_factory=list)  # depth/speed/dir
@@ -81,8 +83,11 @@ class V3Config:
     trunk_slack_pct: float = 2.0             # trunk length margin over chute-BU distance
     apex_depth_m: float = 10.0               # held bight-apex depth below surface
     # Operation scenario ----------------------------------------------------
-    scenario: str = "bu_deployment"          # straight_lay | bu_deployment | final_bight
+    scenario: str = "bu_deployment"          # straight_lay | bu_deployment | final_bight | bu_full
     op: dict = field(default_factory=dict)   # scenario-specific parameters
+    # Two-sheave geometry (bu_full): offsets in the vessel frame.
+    sheave_fwd_m: float = 0.0
+    sheave_spacing_m: float = 12.0
     # Solver ----------------------------------------------------------------
     target_ds_m: float = 5.0
     n_nodes_static: int = 300
@@ -100,6 +105,10 @@ class RunOutput:
     warnings: List[str] = field(default_factory=list)
     error: str = ""                                    # short, user-facing
     error_details: str = ""                            # traceback, for the log
+    # Optimised deployment schedule (mode="optimize"): PhaseRow dicts plus
+    # the translated set-up geometry for the dialog to adopt.
+    schedule: Optional[List[dict]] = None
+    optimized_setup: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +423,15 @@ def _build_scenario(cfg: V3Config, bathy, kind: str, *, static_only: bool = Fals
             trunk_slack_pct=cfg.trunk_slack_pct,
             static_only=static_only,
         )
+    if kind == "bu_full":
+        return scen.bu_full_deployment(
+            bathy,
+            cs.parse_assembly(op["leg1_assembly"]) if op.get("leg1_assembly") else items,
+            cs.parse_assembly(op["leg2_assembly"]) if op.get("leg2_assembly") else items,
+            cs.parse_assembly(op["trunk_assembly"]) if op.get("trunk_assembly") else items,
+            defaults,
+            **_bu_full_kwargs(cfg, op),
+        )
     if kind == "final_bight":
         half = float(op.get("end_separation_m", 120.0)) / 2.0
         # Laid ends run along the bight axis bearing (compass; default 90
@@ -436,6 +454,108 @@ def _build_scenario(cfg: V3Config, bathy, kind: str, *, static_only: bool = Fals
             static_only=static_only,
         )
     raise ValueError(f"Unknown scenario {kind!r}")
+
+
+def _bu_full_vessel_geom(cfg: V3Config) -> tl.VesselGeometry:
+    return scen.default_bu_vessel_geometry(
+        sheave_fwd_m=cfg.sheave_fwd_m,
+        sheave_height_m=cfg.chute_height_m,
+        sheave_spacing_m=cfg.sheave_spacing_m,
+    )
+
+
+def _bu_full_kwargs(cfg: V3Config, op: dict) -> dict:
+    """Shared keyword set for bu_full_deployment / the schedule optimiser.
+    Positions are local-frame metres; courses arrive as compass degrees."""
+    schedule = None
+    if op.get("schedule"):
+        schedule = [scen.PhaseRow.from_dict(d) for d in op["schedule"]]
+    return dict(
+        bu_weight_kN=float(op.get("bu_weight_kN", 15.0)),
+        bu_cda_m2=float(op.get("bu_cda_m2", 1.5)),
+        laid_end_1_xy=(float(op.get("laid_end_1_x", -100.0)), float(op.get("laid_end_1_y", 150.0))),
+        laid_end_2_xy=(float(op.get("laid_end_2_x", -100.0)), float(op.get("laid_end_2_y", -150.0))),
+        leg1_deployed_m=(float(op["leg1_deployed_m"]) if op.get("leg1_deployed_m") else None),
+        leg2_deployed_m=(float(op["leg2_deployed_m"]) if op.get("leg2_deployed_m") else None),
+        vessel_geom=_bu_full_vessel_geom(cfg),
+        vessel_xy=(float(op.get("vessel_x", 0.0)), float(op.get("vessel_y", 0.0))),
+        vessel_heading_deg=compass_to_math_deg(cfg.lay_azimuth_deg),
+        schedule=schedule,
+        tail_length_m=float(op.get("tail_length_m", 90.0)),
+        payout_mps=float(op.get("payout_mps", 0.4)),
+        lay_speed_mps=float(op.get("ship_speed_kn", cfg.ship_speed_kn)) * KNOT,
+        trunk_slack_pct=cfg.trunk_slack_pct,
+        target_ds_m=cfg.target_ds_m,
+    )
+
+
+def run_optimize(cfg: V3Config, progress: Optional[Callable[[float, str], bool]] = None,
+                 cancel: Optional[Callable[[], bool]] = None) -> RunOutput:
+    """Optimise the bu_full deployment set-up so the BU lands on target,
+    using preview-quality simulations; returns the schedule + translated
+    geometry for the dialog to adopt, plus the preview timeline."""
+    bathy = build_bathymetry(cfg)
+    op = dict(cfg.op)
+    defaults = build_defaults(cfg)
+    items = build_assembly(cfg)
+    kwargs = _bu_full_kwargs(cfg, op)
+    schedule = kwargs.pop("schedule")
+    target = (float(op.get("target_x", 0.0)), float(op.get("target_y", 0.0)))
+    params = dict(
+        leg1_assembly=cs.parse_assembly(op["leg1_assembly"]) if op.get("leg1_assembly") else items,
+        leg2_assembly=cs.parse_assembly(op["leg2_assembly"]) if op.get("leg2_assembly") else items,
+        trunk_assembly=cs.parse_assembly(op["trunk_assembly"]) if op.get("trunk_assembly") else items,
+        defaults=defaults,
+        **kwargs,
+    )
+    limits = sopt.DeploymentLimits(
+        max_tension_kN=float(op.get("limit_tension_kN", 0.0)),
+        min_bend_radius_m=float(op.get("limit_mbr_m", cfg.default_mbr_m)),
+        max_leg_imbalance_kN=float(op.get("limit_imbalance_kN", 0.0)),
+    )
+    current = build_current(cfg)
+    popts = tl.SimOptions.preview(
+        rho_water=cfg.rho_water,
+        current_at=(current.velocity_at if current else None),
+        cancel=cancel,
+    )
+    try:
+        res = sopt.optimize_bu_schedule(
+            bathy, params, target, schedule=schedule, limits=limits,
+            preview_options=popts, progress=progress,
+        )
+    except (ValueError, KeyError) as exc:
+        return RunOutput(mode="optimize", error=str(exc))
+    if cancel and cancel():
+        return RunOutput(mode="optimize", error="cancelled")
+
+    out = RunOutput(mode="optimize")
+    out.schedule = [r.to_dict() for r in res.schedule]
+    out.optimized_setup = {
+        "vessel_x": res.vessel_start_xy[0], "vessel_y": res.vessel_start_xy[1],
+        "laid_end_1_x": res.laid_end_1_xy[0], "laid_end_1_y": res.laid_end_1_xy[1],
+        "laid_end_2_x": res.laid_end_2_xy[0], "laid_end_2_y": res.laid_end_2_xy[1],
+    }
+    out.warnings = list(res.warnings)
+    out.facts = {
+        "Predicted BU landing": f"({res.predicted_landing_xy[0]:.1f}, {res.predicted_landing_xy[1]:.1f}) m",
+        "Landing error vs target": f"{res.landing_error_m:.1f} m",
+        "Optimised vessel start": f"({res.vessel_start_xy[0]:.1f}, {res.vessel_start_xy[1]:.1f}) m",
+        "Preview rounds": str(res.rounds),
+        "Note": "Preview quality — run the simulation for final numbers.",
+    }
+    if res.preview is not None and res.preview.snapshots:
+        out.snapshots = res.preview.snapshots
+        bed = _bed_grid_for_snapshots(cfg, bathy, res.preview.snapshots)
+
+        def build_scene(i: int) -> SceneData:
+            return snapshot_scene(res.preview.snapshots[i], bed,
+                                  title=f"preview t = {res.preview.snapshots[i].t_s:.0f} s",
+                                  cfg=cfg)
+
+        out.scene_builder = build_scene
+        out.scene = build_scene(len(res.preview.snapshots) - 1)
+    return out
 
 
 def run_static_hold(cfg: V3Config, cancel: Optional[Callable[[], bool]] = None,
@@ -504,16 +624,46 @@ def run_operation(cfg: V3Config, progress: Optional[Callable[[float, str], bool]
         return RunOutput(mode="operation", error=str(exc))
 
     current = build_current(cfg)
-    sim = tl.OperationSimulator(scn, bathy, tl.SimOptions(
-        rho_water=cfg.rho_water,
-        current_at=(current.velocity_at if current else None),
-        rate_drag=bool(cfg.op.get("rate_drag", True)),
-        cancel=cancel,
-    ))
+    quality = str(cfg.op.get("quality", "full"))
+    if quality == "draft":
+        opts = tl.SimOptions.preview(
+            rho_water=cfg.rho_water,
+            current_at=(current.velocity_at if current else None),
+            rate_drag=bool(cfg.op.get("rate_drag", True)),
+            cancel=cancel,
+        )
+    else:
+        opts = tl.SimOptions(
+            rho_water=cfg.rho_water,
+            current_at=(current.velocity_at if current else None),
+            rate_drag=bool(cfg.op.get("rate_drag", True)),
+            cancel=cancel,
+        )
+    if cfg.scenario == "bu_full" and bool(cfg.op.get("balance", True)):
+        opts.controller = ctl.TensionBalanceController("leg1", "leg2")
+    if quality == "quick":
+        if cfg.scenario not in ("bu_deployment", "bu_full"):
+            return RunOutput(
+                mode="operation",
+                error="The quick analytic model supports the BU scenarios "
+                      "only — choose Draft or Full for this scenario.")
+        from ..engine.quick_bu import QuickOperationSimulator
+
+        sim = QuickOperationSimulator(scn, bathy, opts)
+    else:
+        sim = tl.OperationSimulator(scn, bathy, opts)
     result = sim.run(progress)
 
     out = RunOutput(mode="operation", snapshots=result.snapshots)
     out.warnings = list(result.warnings)
+    if quality == "quick":
+        out.warnings.append(
+            "Quick analytic model: closed-form catenaries, no seabed "
+            "friction, drag or lay history — confirm with the full solver.")
+    elif quality == "draft":
+        out.warnings.append(
+            "Draft quality: coarse mesh and loose tolerances — re-run at "
+            "Full quality for final numbers.")
     if result.aborted:
         out.warnings.append("Simulation cancelled — snapshots up to the stop are shown.")
     bed = _bed_grid_for_snapshots(cfg, bathy, result.snapshots)
@@ -534,6 +684,15 @@ def run_operation(cfg: V3Config, progress: Optional[Callable[[float, str], bool]
             out.facts[f"{c.name}: min bend radius"] = _fmt_radius(c.min_radius_m, None)
         for name, xyz in last.junction_xyz.items():
             out.facts[f"{name} position"] = f"({xyz[0]:.1f}, {xyz[1]:.1f}, {xyz[2]:.1f}) m"
+        c1, c2 = last.chain("leg1"), last.chain("leg2")
+        if c1 is not None and c2 is not None:
+            imb = [abs(s.chain("leg1").top_tension_kN - s.chain("leg2").top_tension_kN)
+                   for s in result.snapshots
+                   if s.chain("leg1") is not None and s.chain("leg2") is not None]
+            if imb:
+                out.facts["Leg imbalance (final / peak)"] = (
+                    f"{imb[-1]:.2f} / {max(imb):.2f} kN"
+                )
         if not last.converged:
             out.warnings.append("Final step did not fully converge — treat as approximate.")
     return out
@@ -726,6 +885,9 @@ class SolveWorker(QThread):
                 elif self.cfg.mode == "operation":
                     out = run_operation(self.cfg, progress=self._progress,
                                         cancel=lambda: self._cancel)
+                elif self.cfg.mode == "optimize":
+                    out = run_optimize(self.cfg, progress=self._progress,
+                                       cancel=lambda: self._cancel)
                 else:
                     out = run_static(self.cfg, cancel=lambda: self._cancel,
                                      progress=self._progress)

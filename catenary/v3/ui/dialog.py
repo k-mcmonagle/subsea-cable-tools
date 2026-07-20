@@ -53,10 +53,17 @@ SOLVE_MODES = [
     ("suspended_length", "Suspended length (m)"),
 ]
 SCENARIOS = [
-    ("bu_deployment", "Branching-unit deployment"),
+    ("bu_deployment", "Branching-unit deployment (lowering only)"),
+    ("bu_full", "BU deployment — full (two-sheave)"),
     ("final_bight", "Final bight lay-down"),
     ("straight_lay", "Straight lay (transient)"),
 ]
+
+# Schedule table columns (bu_full operation page).
+SCH_COL_LABEL, SCH_COL_EVENT, SCH_COL_DUR, SCH_COL_COURSE, SCH_COL_SPEED, \
+    SCH_COL_LEG1, SCH_COL_LEG2, SCH_COL_TRUNK = range(8)
+SCH_HEADERS = ["Phase", "Event", "Duration\n(s)", "Course\n(degN)",
+               "Speed\n(kn)", "Leg 1\n(m/s)", "Leg 2\n(m/s)", "Trunk\n(m/s)"]
 
 # Assembly table columns.
 COL_TYPE, COL_NAME, COL_LEN, COL_QW, COL_QA, COL_LOAD, COL_MU, COL_EI, COL_MBR, \
@@ -220,6 +227,9 @@ class LaySimulatorDialog(QDialog):
         self.tabs.addTab(self.view3d, "3D")
         self.tabs.addTab(self.profile_view.widget(), "Profile")
         self.tabs.addTab(self.plan_view.widget(), "Plan")
+        from .timeseries_view import TimeSeriesView
+        self.timeseries_view = TimeSeriesView()
+        self.tabs.addTab(self.timeseries_view.widget(), "Time series")
 
         self.right_split = QSplitter(getattr(_ORIENT, "Vertical", 2))
         try:
@@ -239,7 +249,16 @@ class LaySimulatorDialog(QDialog):
         self.scrubber.setMinimum(0)
         self.scrubber.setMaximum(0)
         self.scrubber.valueChanged.connect(self._on_scrub)
+        self.play_btn = QToolButton()
+        self.play_btn.setText("▶")
+        self.play_btn.setCheckable(True)
+        self.play_btn.setToolTip("Play / pause the operation timeline.")
+        self.play_btn.toggled.connect(self._on_play_toggled)
+        self._play_timer = QtCore.QTimer(self)
+        self._play_timer.setInterval(120)
+        self._play_timer.timeout.connect(self._play_tick)
         scrub_row.addWidget(QLabel("Timeline:"))
+        scrub_row.addWidget(self.play_btn)
         scrub_row.addWidget(self.scrubber, 1)
         scrub_row.addWidget(self.scrub_label)
         self.scrub_widget = QWidget()
@@ -276,12 +295,17 @@ class LaySimulatorDialog(QDialog):
 
         btn_row = QHBoxLayout()
         self.btn_csv = QPushButton("Export CSV...")
+        self.btn_sched_csv = QPushButton("Export ops schedule...")
+        self.btn_sched_csv.setToolTip(
+            "Operation runs: time / vessel position / payout per line / "
+            "tensions as a CSV the lay crew can follow.")
         self.btn_dxf = QPushButton("Export DXF (3D)...")
         self.btn_map = QPushButton("Send to map")
         self.btn_csv.clicked.connect(self._export_csv)
+        self.btn_sched_csv.clicked.connect(self._export_schedule_csv)
         self.btn_dxf.clicked.connect(self._export_dxf)
         self.btn_map.clicked.connect(self._send_to_map)
-        for b in (self.btn_csv, self.btn_dxf, self.btn_map):
+        for b in (self.btn_csv, self.btn_sched_csv, self.btn_dxf, self.btn_map):
             btn_row.addWidget(b)
         btn_row.addStretch(1)
         bl.addLayout(btn_row)
@@ -801,7 +825,7 @@ class LaySimulatorDialog(QDialog):
         """Parametric ship drawing: hull around a CRP, chute offset from the
         CRP. The chute stays the solver's departure point; the hull is drawn
         geometry only (3D view and map overlay)."""
-        box, lay = self._collapsible("Vessel drawing (display only)", "ship_shape")
+        box, lay = self._collapsible("Vessel drawing && sheaves", "ship_shape")
         self.ship_len = self._dspin("ship_length_m", 5.0, 400.0, 60.0, 5.0, 0, " m")
         self.ship_beam = self._dspin("ship_beam_m", 2.0, 80.0, 12.0, 1.0, 0, " m")
         self.crp_fwd = self._dspin("crp_fwd_m", -200.0, 200.0, 0.0, 1.0, 1, " m")
@@ -821,7 +845,19 @@ class LaySimulatorDialog(QDialog):
         lay.addRow("Chute forward of CRP", self.chute_fwd)
         lay.addRow("Chute starboard of CRP", self.chute_stbd)
         lay.addRow("Chute radius (drawn)", self.chute_radius)
-        note = QLabel("Drawn hull geometry for the 3D view and map overlay. "
+        # Sheave geometry — functional for the two-sheave BU deployment
+        # scenario (port/stbd overboarding points rotate with the heading).
+        self.sheave_fwd = self._dspin("sheave_fwd_m", -200.0, 200.0, 0.0, 1.0, 1, " m")
+        self.sheave_fwd.setToolTip(
+            "Fore/aft position of the port and starboard sheaves (used by "
+            "the two-sheave BU deployment scenario).")
+        self.sheave_spacing = self._dspin("sheave_spacing_m", 0.5, 60.0, 12.0, 0.5, 1, " m")
+        self.sheave_spacing.setToolTip(
+            "Athwartships distance between the port and starboard sheaves.")
+        lay.addRow("Sheaves forward of CRP", self.sheave_fwd)
+        lay.addRow("Port-stbd sheave spacing", self.sheave_spacing)
+        note = QLabel("Hull geometry is drawn only, but the sheave offsets "
+                      "are used by the two-sheave BU deployment. "
                       "Negative 'forward' = aft, negative 'starboard' = port. "
                       "With zero offsets the chute sits at the hull centre.")
         note.setWordWrap(True)
@@ -960,6 +996,20 @@ class LaySimulatorDialog(QDialog):
         self.scenario_combo.currentIndexChanged.connect(self._on_scenario_changed)
         lay.addRow("Scenario", self.scenario_combo)
 
+        self.op_quality = self._combo("op_quality", [
+            ("full", "Full — accurate solver"),
+            ("draft", "Draft — accurate solver, coarse/fast"),
+            ("quick", "Quick — analytic catenary model (BU only)"),
+        ])
+        self.op_quality.setToolTip(
+            "Full: the dynamic-relaxation solver at normal settings.\n"
+            "Draft: the same solver with a coarser mesh, looser tolerance "
+            "and bigger steps (~5-10x faster) — for iterating.\n"
+            "Quick: closed-form tri-catenary equilibrium (no friction/drag/"
+            "lay history) — solves a whole BU deployment in about a second; "
+            "confirm with Full.")
+        lay.addRow("Model quality", self.op_quality)
+
         self.op_stack = QStackedWidget()
 
         # BU deployment page (physical geometry lives in "BU / bight geometry").
@@ -970,6 +1020,9 @@ class LaySimulatorDialog(QDialog):
         bl.addRow("Trunk pay-out rate", self.bu_payout)
         bl.addRow("Ship speed", self.bu_ship_speed)
         self.op_stack.addWidget(bu)
+
+        # Full two-sheave BU deployment page.
+        self.op_stack.addWidget(self._build_bu_full_page())
 
         # Final bight page.
         fb = QWidget()
@@ -995,6 +1048,177 @@ class LaySimulatorDialog(QDialog):
         lay.addRow(self.op_stack)
         self._operation_box = box
         return box
+
+    def _build_bu_full_page(self) -> QWidget:
+        """Operation page for the full two-sheave BU deployment: set-up
+        geometry, deployment parameters and the editable phase schedule."""
+        page = QWidget()
+        fl = QFormLayout(page)
+        note = QLabel(
+            "Both legs are pre-laid to their far ends; the vessel holds the "
+            "recovered ends over the port (leg 1) and starboard (leg 2) "
+            "sheaves at the jointing position. Positions below are local "
+            "metres from the origin. Set the sheave offsets under 'Vessel "
+            "drawing'.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#777; font-size: small;")
+        fl.addRow(note)
+
+        def coord(key, val):
+            return self._dspin(key, -1e6, 1e6, val, 10.0, 1, " m")
+
+        self.bf_end1_x = coord("bf_end1_x", -150.0)
+        self.bf_end1_y = coord("bf_end1_y", 200.0)
+        self.bf_end2_x = coord("bf_end2_x", -150.0)
+        self.bf_end2_y = coord("bf_end2_y", -200.0)
+        self.bf_target_x = coord("bf_target_x", 150.0)
+        self.bf_target_y = coord("bf_target_y", 0.0)
+        self.bf_vessel_x = coord("bf_vessel_x", 0.0)
+        self.bf_vessel_y = coord("bf_vessel_y", 0.0)
+        self.bf_vessel_x.setToolTip(
+            "Vessel jointing position in the local frame (the optimiser "
+            "adjusts this so the BU lands on target).")
+        fl.addRow("Vessel start (jointing) x / y", self._pair(self.bf_vessel_x, self.bf_vessel_y))
+        fl.addRow("Leg 1 laid end x / y", self._pair(self.bf_end1_x, self.bf_end1_y))
+        fl.addRow("Leg 2 laid end x / y", self._pair(self.bf_end2_x, self.bf_end2_y))
+        fl.addRow("Target BU landing x / y", self._pair(self.bf_target_x, self.bf_target_y))
+
+        self.bf_tail = self._dspin("bf_tail_m", 5.0, 500.0, 90.0, 5.0, 0, " m")
+        self.bf_tail.setToolTip("BU tail length per leg (joint to BU body).")
+        self.bf_payout = self._dspin("bf_payout", 0.01, 3.0, 0.4, 0.05, 2, " m/s")
+        self.bf_ship_speed = self._dspin("bf_ship_speed_kn", 0.0, 4.0, 0.6, 0.1, 2, " kn")
+        self.bf_balance = self._check(
+            "bf_balance", "Auto-balance leg payout (tension controller)", True)
+        self.bf_balance.setToolTip(
+            "Continuously redistributes the scheduled leg payout so the two "
+            "sheave tensions stay matched, like a winch operator would.")
+        fl.addRow("BU tail length (each leg)", self.bf_tail)
+        fl.addRow("Nominal pay-out rate", self.bf_payout)
+        fl.addRow("Lay-ahead ship speed", self.bf_ship_speed)
+        fl.addRow(self.bf_balance)
+
+        self.sched_table = QTableWidget(0, len(SCH_HEADERS))
+        self.sched_table.setHorizontalHeaderLabels(SCH_HEADERS)
+        self.sched_table.setMinimumHeight(150)
+        self.sched_table.itemChanged.connect(self._schedule)
+        fl.addRow(self.sched_table)
+
+        btns = QHBoxLayout()
+        self.btn_optimize = QPushButton("Optimise schedule…")
+        self.btn_optimize.setToolTip(
+            "Build (or refine) the phase schedule and shift the whole "
+            "set-up so the BU lands on the target, using fast preview "
+            "simulations. Then click Run simulation for full-quality "
+            "results.")
+        self.btn_optimize.clicked.connect(self._optimize_clicked)
+        btn_default = QPushButton("Default schedule")
+        btn_default.setToolTip("Rebuild the five-phase nominal schedule from "
+                               "the parameters above.")
+        btn_default.clicked.connect(self._sched_fill_default)
+        btn_clear = QPushButton("Clear")
+        btn_clear.clicked.connect(lambda: self.sched_table.setRowCount(0))
+        for b in (self.btn_optimize, btn_default, btn_clear):
+            btns.addWidget(b)
+        btns.addStretch(1)
+        holder = QWidget()
+        holder.setLayout(btns)
+        fl.addRow(holder)
+        return page
+
+    def _pair(self, w1, w2) -> QWidget:
+        holder = QWidget()
+        h = QHBoxLayout(holder)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.addWidget(w1)
+        h.addWidget(w2)
+        return holder
+
+    # ---- schedule table <-> PhaseRow dicts --------------------------------
+
+    def _sched_fill_default(self):
+        try:
+            from ..engine.bathymetry import bathymetry_from_dict
+            from ..engine.scenarios import default_bu_schedule
+
+            bathy = bathymetry_from_dict(self._bathy_cfg())
+            rows = default_bu_schedule(
+                depth_m=float(bathy.depth_at(0.0, 0.0)),
+                tail_length_m=float(self.bf_tail.value()),
+                payout_mps=float(self.bf_payout.value()),
+                lay_speed_mps=float(self.bf_ship_speed.value()) * 0.514444,
+                course_deg=0.0,   # stored math-frame 0; column shows compass
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Schedule", f"Could not build the "
+                                f"default schedule:\n{exc}")
+            return
+        # Column shows the ship course as compass; engine rows are math-frame.
+        for r in rows:
+            r.course_deg = float(self.lay_az.value())
+        self._schedule_to_table([r.to_dict() for r in rows], course_is_compass=True)
+
+    def _schedule_to_table(self, rows: list, course_is_compass: bool = True):
+        """Fill the schedule table from PhaseRow dicts (course shown as a
+        compass bearing)."""
+        from .scene import math_to_compass_deg
+
+        t = self.sched_table
+        t.blockSignals(True)
+        try:
+            t.setRowCount(0)
+            for d in rows:
+                r = t.rowCount()
+                t.insertRow(r)
+                course = float(d.get("course_deg", 0.0))
+                if not course_is_compass:
+                    course = math_to_compass_deg(course)
+                pay = d.get("payout_mps") or {}
+                vals = [
+                    str(d.get("label", "")),
+                    str(d.get("event", "")),
+                    f"{float(d.get('duration_s', 0.0)):.0f}",
+                    f"{course:.0f}",
+                    f"{float(d.get('speed_mps', 0.0)) / 0.514444:.2f}",
+                    f"{float(pay.get('leg1', 0.0)):.2f}",
+                    f"{float(pay.get('leg2', 0.0)):.2f}",
+                    f"{float(pay.get('trunk', 0.0)):.2f}",
+                ]
+                for c, v in enumerate(vals):
+                    t.setItem(r, c, QTableWidgetItem(v))
+            self._auto_size_table(t)
+        finally:
+            t.blockSignals(False)
+
+    def _schedule_from_table(self) -> list:
+        """PhaseRow dicts from the table (course converted compass -> math)."""
+        from .scene import compass_to_math_deg as c2m
+
+        rows = []
+        t = self.sched_table
+        for r in range(t.rowCount()):
+            def txt(c):
+                it = t.item(r, c)
+                return it.text().strip() if it is not None and it.text() else ""
+
+            def num(c, default=0.0):
+                v = _of(t.item(r, c))
+                return float(v) if v is not None else default
+
+            pay = {}
+            for name, col in (("leg1", SCH_COL_LEG1), ("leg2", SCH_COL_LEG2),
+                              ("trunk", SCH_COL_TRUNK)):
+                v = num(col, 0.0)
+                if v != 0.0:
+                    pay[name] = v
+            rows.append({
+                "label": txt(SCH_COL_LABEL),
+                "event": txt(SCH_COL_EVENT),
+                "duration_s": num(SCH_COL_DUR, 0.0),
+                "course_deg": c2m(num(SCH_COL_COURSE, 0.0)),
+                "speed_mps": num(SCH_COL_SPEED, 0.0) * 0.514444,
+                "payout_mps": pay,
+            })
+        return [r for r in rows if r["duration_s"] > 0]
 
     def _section_display(self):
         box, lay = self._collapsible("Display", "display")
@@ -1360,12 +1584,34 @@ class LaySimulatorDialog(QDialog):
         cfg.trunk_slack_pct = float(self.trunk_slack.value())
         cfg.apex_depth_m = float(self.apex_depth.value())
         cfg.scenario = self.scenario_combo.currentData()
+        cfg.sheave_fwd_m = float(self.sheave_fwd.value())
+        cfg.sheave_spacing_m = float(self.sheave_spacing.value())
         # The op dict carries the geometry for whichever configuration is
         # active — the static-hold path reads the same keys as the
         # operation scenarios.
         kind = self._active_config() if cfg.mode == "static" else {
-            "bu_deployment": "bu", "final_bight": "bight"}.get(cfg.scenario, "single")
-        if kind == "bu":
+            "bu_deployment": "bu", "bu_full": "bu_full",
+            "final_bight": "bight"}.get(cfg.scenario, "single")
+        if kind == "bu_full":
+            cfg.op = {
+                "bu_weight_kN": float(self.bu_weight.value()),
+                "bu_cda_m2": float(self.bu_cda.value()),
+                "laid_end_1_x": float(self.bf_end1_x.value()),
+                "laid_end_1_y": float(self.bf_end1_y.value()),
+                "laid_end_2_x": float(self.bf_end2_x.value()),
+                "laid_end_2_y": float(self.bf_end2_y.value()),
+                "vessel_x": float(self.bf_vessel_x.value()),
+                "vessel_y": float(self.bf_vessel_y.value()),
+                "target_x": float(self.bf_target_x.value()),
+                "target_y": float(self.bf_target_y.value()),
+                "tail_length_m": float(self.bf_tail.value()),
+                "payout_mps": float(self.bf_payout.value()),
+                "ship_speed_kn": float(self.bf_ship_speed.value()),
+                "balance": bool(self.bf_balance.isChecked()),
+                "limit_mbr_m": float(self.def_mbr.value()),
+                "schedule": self._schedule_from_table() or None,
+            }
+        elif kind == "bu":
             cfg.op = {
                 "bu_weight_kN": float(self.bu_weight.value()),
                 "bu_cda_m2": float(self.bu_cda.value()),
@@ -1391,6 +1637,8 @@ class LaySimulatorDialog(QDialog):
                 "slack_percent": float(self.slack.value()),
                 "ship_speed_kn": float(self.ship_speed.value()),
             }
+        if cfg.mode == "operation":
+            cfg.op["quality"] = self.op_quality.currentData() or "full"
         return cfg
 
     # ------------------------------------------------------------- solving
@@ -1441,6 +1689,21 @@ class LaySimulatorDialog(QDialog):
         self.op_progress.setValue(0)
         self._start_worker(self.build_config())
 
+    def _optimize_clicked(self):
+        """Run the deployment-schedule optimiser (bu_full scenario only)."""
+        if self._worker is not None and self._worker.isRunning():
+            return
+        cfg = self.build_config()
+        if cfg.scenario != "bu_full" or cfg.mode != "operation":
+            QMessageBox.information(
+                self, "Optimise schedule",
+                "Select the 'Operation simulation' scenario with 'BU "
+                "deployment — full (two-sheave)' to optimise a schedule.")
+            return
+        cfg.mode = "optimize"
+        self.op_progress.setValue(0)
+        self._start_worker(cfg)
+
     def _start_worker(self, cfg: V3Config):
         # Freeze the map placement alongside the config: the overlay must be
         # drawn at the origin this solve used, not wherever a later pick
@@ -1455,7 +1718,7 @@ class LaySimulatorDialog(QDialog):
         self._worker.progressed.connect(self._on_progress)
         self.cancel_btn.setEnabled(True)
         self.run_btn.setEnabled(False)
-        if cfg.mode == "operation":
+        if cfg.mode in ("operation", "optimize"):
             self.op_progress.setRange(0, 100)
             self.op_progress.setValue(0)
         else:
@@ -1511,7 +1774,31 @@ class LaySimulatorDialog(QDialog):
         except Exception:
             self.profile_view.set_bathy_lookup(None)
 
-        if out.mode == "operation" and out.snapshots:
+        if out.mode == "optimize":
+            # Adopt the optimised schedule + translated set-up so a
+            # subsequent "Run simulation" reproduces the preview at full
+            # quality.
+            if out.schedule:
+                self._schedule_to_table(out.schedule, course_is_compass=False)
+            setup = out.optimized_setup or {}
+            # Adopt the translated set-up verbatim (all in the same local
+            # frame over the same bathymetry, so a full-quality re-run
+            # reproduces the preview physics).
+            for key, spin in (
+                ("vessel_x", self.bf_vessel_x), ("vessel_y", self.bf_vessel_y),
+                ("laid_end_1_x", self.bf_end1_x), ("laid_end_1_y", self.bf_end1_y),
+                ("laid_end_2_x", self.bf_end2_x), ("laid_end_2_y", self.bf_end2_y),
+            ):
+                if key in setup:
+                    spin.blockSignals(True)
+                    spin.setValue(float(setup[key]))
+                    spin.blockSignals(False)
+            self._set_dirty(True)
+            self.dirty_label.setText(
+                "Schedule optimised (preview) — click Run simulation for "
+                "full-quality results.")
+
+        if out.mode in ("operation", "optimize") and out.snapshots:
             self.scrub_widget.setVisible(True)
             self.scrubber.blockSignals(True)
             self.scrubber.setMaximum(len(out.snapshots) - 1)
@@ -1520,9 +1807,12 @@ class LaySimulatorDialog(QDialog):
             self._show_scene(out.scene, preserve=False)
             self.op_progress.setValue(100)
             self.scrub_label.setText(f"t = {out.snapshots[-1].t_s:.0f} s")
+            self.timeseries_view.set_snapshots(out.snapshots)
+            self.timeseries_view.set_time(float(out.snapshots[-1].t_s))
         else:
             self.scrub_widget.setVisible(False)
             self._show_scene(out.scene, preserve=True)
+            self.timeseries_view.clear()
 
         if self._pending:
             self._pending = False
@@ -1534,8 +1824,34 @@ class LaySimulatorDialog(QDialog):
             return
         i = max(0, min(len(out.snapshots) - 1, int(i)))
         scene = out.scene_builder(i)
-        self.scrub_label.setText(f"t = {out.snapshots[i].t_s:.0f} s")
+        snap = out.snapshots[i]
+        label = f"t = {snap.t_s:.0f} s"
+        if getattr(snap, "label", ""):
+            label += f" — {snap.label}"
+        self.scrub_label.setText(label)
+        self.timeseries_view.set_time(float(snap.t_s))
         self._show_scene(scene, preserve=True)
+
+    def _on_play_toggled(self, on: bool):
+        if on:
+            out = self._last_out
+            if out is None or not out.snapshots:
+                self.play_btn.setChecked(False)
+                return
+            if self.scrubber.value() >= self.scrubber.maximum():
+                self.scrubber.setValue(0)
+            self.play_btn.setText("❚❚")
+            self._play_timer.start()
+        else:
+            self.play_btn.setText("▶")
+            self._play_timer.stop()
+
+    def _play_tick(self):
+        v = self.scrubber.value()
+        if v >= self.scrubber.maximum():
+            self.play_btn.setChecked(False)
+            return
+        self.scrubber.setValue(v + 1)
 
     def _show_scene(self, scene, preserve=True):
         self._last_scene = scene
@@ -1553,7 +1869,8 @@ class LaySimulatorDialog(QDialog):
         """'single' | 'bu' | 'bight' for the currently relevant geometry."""
         mode = self.mode_combo.currentData()
         if mode == "operation":
-            return {"bu_deployment": "bu", "final_bight": "bight"}.get(
+            return {"bu_deployment": "bu", "bu_full": "bu",
+                    "final_bight": "bight"}.get(
                 self.scenario_combo.currentData(), "single")
         if mode == "static":
             return self.static_config.currentData() or "single"
@@ -1656,8 +1973,8 @@ class LaySimulatorDialog(QDialog):
         self._schedule()
 
     def _on_scenario_changed(self, *args):
-        idx = {"bu_deployment": 0, "final_bight": 1, "straight_lay": 2}.get(
-            self.scenario_combo.currentData(), 0)
+        idx = {"bu_deployment": 0, "bu_full": 1, "final_bight": 2,
+               "straight_lay": 3}.get(self.scenario_combo.currentData(), 0)
         self.op_stack.setCurrentIndex(idx)
         self._update_config_visibility()
 
@@ -1740,13 +2057,29 @@ class LaySimulatorDialog(QDialog):
             QMessageBox.information(self, "Send to map", "Nothing to export yet.")
             return
         try:
-            from .qgis_adapters import push_chains_to_map
+            from .qgis_adapters import push_chains_to_map, push_markers_to_map
 
             origin, crs = (self._scene_origin if self._scene_origin
                            else self._origin_for_map())
             chains = [(p.name, np.asarray(p.xyz)) for p in out.scene.cables]
             push_chains_to_map("Lay simulator result", chains, origin, crs)
-            QMessageBox.information(self, "Send to map", "Memory layer added to the project.")
+            # Operation runs: add key deployment points (BU landing, laid
+            # ends, target) as a labelled point layer.
+            markers = []
+            if out.snapshots:
+                last = out.snapshots[-1]
+                for name, xyz in (last.junction_xyz or {}).items():
+                    markers.append((f"{name} final position", tuple(xyz)))
+                if self.scenario_combo.currentData() == "bu_full":
+                    markers.append(("Target BU landing",
+                                    (float(self.bf_target_x.value()),
+                                     float(self.bf_target_y.value()), 0.0)))
+            for m in out.scene.markers:
+                if m.label:
+                    markers.append((m.label, tuple(m.xyz)))
+            if markers:
+                push_markers_to_map("Lay simulator points", markers, origin, crs)
+            QMessageBox.information(self, "Send to map", "Memory layer(s) added to the project.")
         except Exception as exc:
             QMessageBox.warning(self, "Send to map", f"Export failed:\n{exc}")
 
@@ -2018,13 +2351,33 @@ class LaySimulatorDialog(QDialog):
         try:
             from . import exporters
 
-            if out.mode == "operation" and out.snapshots:
+            if out.snapshots:
                 header, rows = exporters.timeline_csv_rows(out.snapshots)
             else:
                 header, rows = _scene_csv(out.scene)
             exporters.write_csv(path, header, rows)
         except Exception as exc:
             QMessageBox.warning(self, "Export CSV", f"Export failed:\n{exc}")
+
+    def _export_schedule_csv(self):
+        out = self._last_out
+        if out is None or not out.snapshots:
+            QMessageBox.information(
+                self, "Export ops schedule",
+                "Run an operation simulation first — the schedule sheet is "
+                "built from its timeline.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export ops schedule", "deployment_schedule.csv", "CSV (*.csv)")
+        if not path:
+            return
+        try:
+            from . import exporters
+
+            header, rows = exporters.schedule_csv_rows(out.snapshots)
+            exporters.write_csv(path, header, rows)
+        except Exception as exc:
+            QMessageBox.warning(self, "Export ops schedule", f"Export failed:\n{exc}")
 
     def _export_dxf(self):
         out = self._last_out
@@ -2149,6 +2502,15 @@ class LaySimulatorDialog(QDialog):
                     self.profile_table.setItem(r, 1, QTableWidgetItem(str(z)))
             except Exception:
                 pass
+        raw = self.settings.value("schedule_json")
+        if raw:
+            try:
+                rows = json.loads(str(raw))
+                if rows:
+                    # Stored rows are engine-frame (math degrees).
+                    self._schedule_to_table(rows, course_is_compass=False)
+            except Exception:
+                pass
         for key, (btn, body) in self._collapsibles.items():
             val = self.settings.value(f"section_{key}")
             if val is not None:
@@ -2212,6 +2574,11 @@ class LaySimulatorDialog(QDialog):
             if d is not None and z is not None:
                 pts.append([d, z])
         self.settings.setValue("profile_json", json.dumps(pts))
+        try:
+            self.settings.setValue("schedule_json",
+                                   json.dumps(self._schedule_from_table()))
+        except Exception:
+            pass
 
     def closeEvent(self, event):  # noqa: N802 - Qt API
         self._save_settings()

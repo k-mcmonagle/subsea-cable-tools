@@ -19,7 +19,18 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from .cable_system import AssemblyItem, Defaults, sagged_shape, straight_shape, uniform_assembly
-from .timeline import Attachment, ChainState, JunctionState, Scenario, Step
+from .seeds import catenary_seed, hanging_leg_seed
+from .timeline import (
+    Attachment,
+    ChainState,
+    Event,
+    JunctionState,
+    Scenario,
+    SheaveSpec,
+    SheaveTransfer,
+    Step,
+    VesselGeometry,
+)
 
 
 def _bed_z(bathy, x: float, y: float) -> float:
@@ -51,11 +62,11 @@ def straight_lay(
     L0 = initial_suspended_m + on_bed_tail_m
     anchor = (-(initial_suspended_m * 0.35 + on_bed_tail_m), 0.0, _bed_z(bathy, -(initial_suspended_m * 0.35 + on_bed_tail_m), 0.0))
 
-    # Seed: chute down-ramp to the bed, then a tail back to the anchor.
+    # Seed: hanging catenary chute -> touchdown, then a tail to the anchor.
     chute = np.array([0.0, 0.0, chute_height_m])
     tdp_guess = np.array([-0.55 * initial_suspended_m, 0.0, -depth0])
     shape = np.vstack([
-        straight_shape(chute, tdp_guess, 40),
+        catenary_seed(chute, tdp_guess, initial_suspended_m, 40),
         straight_shape(tdp_guess, np.asarray(anchor), 20)[1:],
     ])
     chain = ChainState(
@@ -140,13 +151,10 @@ def bu_deployment(
         ux, uy = math.cos(a), math.sin(a)
         end = (leg_length_m * 0.92 * ux, leg_length_m * 0.92 * uy)
         end_xyz = (end[0], end[1], _bed_z(bathy, end[0], end[1]))
-        # Seed: from the BU position down to the bed, then along the azimuth.
-        drop = np.array([0.15 * leg_length_m * ux, 0.15 * leg_length_m * uy,
-                         _bed_z(bathy, 0.15 * leg_length_m * ux, 0.15 * leg_length_m * uy)])
-        shape = np.vstack([
-            straight_shape(np.asarray(bu_start), drop, 20),
-            straight_shape(drop, np.asarray(end_xyz), 40)[1:],
-        ])
+        # Seed: hanging catenary from the BU to a touchdown guess, then a
+        # bed-following tail along the azimuth (follows slopes and grids).
+        shape = hanging_leg_seed(bu_start, az, leg_length_m, bathy, 60)
+        shape[-1] = np.asarray(end_xyz)
         chains[f"leg{i}"] = ChainState(
             name=f"leg{i}",
             assembly=leg_assembly,
@@ -240,8 +248,8 @@ def final_bight(
     apex = np.array([mid_xy[0], mid_xy[1], -apex_depth])
     n_half = 40
     shape = np.vstack([
-        straight_shape(np.asarray(end_a), apex, n_half),
-        straight_shape(apex, np.asarray(end_b), n_half)[1:],
+        catenary_seed(np.asarray(end_a), apex, half_bight, n_half),
+        catenary_seed(apex, np.asarray(end_b), half_bight, n_half)[1:],
     ])
     cable = ChainState(
         name="cable",
@@ -295,4 +303,234 @@ def default_rope_assembly(length_hint_m: float = 3000.0) -> List[AssemblyItem]:
     return uniform_assembly(
         length_hint_m, 34.0, diameter_m=0.032, cd_normal=1.2,
         cd_tangential=0.008, mu=0.4, name="Lowering rope",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Full branching-unit deployment (two-sheave, on-deck jointing to laydown)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PhaseRow:
+    """One editable row of a deployment schedule.
+
+    ``event`` tags the topology change applied at the start of the phase:
+    ``""`` (none), ``"transfer"`` (move leg 2 to the other sheave, lerped
+    across the phase) or ``"overboard_bu"`` (spawn the BU junction + trunk
+    and re-top both legs onto it). Angles are engine math degrees
+    (0 = +x, CCW positive); UI layers convert compass bearings.
+    """
+
+    label: str
+    duration_s: float
+    course_deg: float = 0.0
+    speed_mps: float = 0.0
+    payout_mps: Dict[str, float] = field(default_factory=dict)
+    event: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "label": self.label,
+            "duration_s": float(self.duration_s),
+            "course_deg": float(self.course_deg),
+            "speed_mps": float(self.speed_mps),
+            "payout_mps": {k: float(v) for k, v in self.payout_mps.items()},
+            "event": self.event,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PhaseRow":
+        return cls(
+            label=str(d.get("label", "")),
+            duration_s=float(d.get("duration_s", 0.0)),
+            course_deg=float(d.get("course_deg", 0.0)),
+            speed_mps=float(d.get("speed_mps", 0.0)),
+            payout_mps={str(k): float(v) for k, v in (d.get("payout_mps") or {}).items()},
+            event=str(d.get("event", "")),
+        )
+
+
+def default_bu_vessel_geometry(
+    sheave_fwd_m: float = 0.0,
+    sheave_height_m: float = 5.0,
+    sheave_spacing_m: float = 12.0,
+) -> VesselGeometry:
+    """Port and starboard sheaves symmetric about the centreline, plus the
+    legacy ``main`` sheave on the centreline."""
+    half = 0.5 * abs(sheave_spacing_m)
+    return VesselGeometry(sheaves={
+        "main": SheaveSpec(fwd_m=sheave_fwd_m, stbd_m=0.0, height_m=sheave_height_m),
+        "port": SheaveSpec(fwd_m=sheave_fwd_m, stbd_m=-half, height_m=sheave_height_m),
+        "stbd": SheaveSpec(fwd_m=sheave_fwd_m, stbd_m=half, height_m=sheave_height_m),
+    })
+
+
+def default_bu_schedule(
+    *,
+    depth_m: float,
+    tail_length_m: float = 90.0,
+    payout_mps: float = 0.4,
+    lay_speed_mps: float = 0.3,
+    course_deg: float = 0.0,
+    transfer_duration_s: float = 120.0,
+    joint_margin_m: float = 20.0,
+    lay_on_margin_s: float = 300.0,
+) -> List[PhaseRow]:
+    """The nominal five-phase deployment script (leg names ``leg1``/``leg2``,
+    trunk ``trunk``)."""
+    t_joints = (tail_length_m + joint_margin_m) / max(payout_mps, 0.01)
+    t_lower = 1.5 * (depth_m + 5.0) / max(payout_mps, 0.01)
+    return [
+        PhaseRow("Hold and balance legs", 60.0, course_deg, 0.0, {}),
+        PhaseRow(
+            "Pay joints overboard", t_joints, course_deg, 0.05,
+            {"leg1": payout_mps, "leg2": payout_mps},
+        ),
+        PhaseRow(
+            "Transfer leg 2 to port sheave", transfer_duration_s, course_deg, 0.0,
+            {"leg1": 0.02, "leg2": 0.02}, event="transfer",
+        ),
+        PhaseRow(
+            "Overboard BU and lower", t_lower, course_deg, lay_speed_mps,
+            {"trunk": payout_mps}, event="overboard_bu",
+        ),
+        PhaseRow(
+            "Lay ahead on trunk", lay_on_margin_s, course_deg, lay_speed_mps,
+            {"trunk": lay_speed_mps * 1.02},
+        ),
+    ]
+
+
+def bu_full_deployment(
+    bathy,
+    leg1_assembly: List[AssemblyItem],
+    leg2_assembly: List[AssemblyItem],
+    trunk_assembly: List[AssemblyItem],
+    defaults: Defaults,
+    *,
+    bu_weight_kN: float,
+    bu_cda_m2: float = 1.0,
+    laid_end_1_xy: Tuple[float, float],
+    laid_end_2_xy: Tuple[float, float],
+    leg1_deployed_m: Optional[float] = None,
+    leg2_deployed_m: Optional[float] = None,
+    vessel_geom: Optional[VesselGeometry] = None,
+    vessel_xy: Tuple[float, float] = (0.0, 0.0),
+    vessel_heading_deg: float = 0.0,
+    schedule: Optional[List[PhaseRow]] = None,
+    tail_length_m: float = 90.0,
+    payout_mps: float = 0.4,
+    lay_speed_mps: float = 0.3,
+    bu_spawn_depth_m: float = 2.0,
+    trunk_slack_pct: float = 2.0,
+    target_ds_m: float = 5.0,
+) -> Scenario:
+    """The full BU deployment from the two-sheave jointing set-up.
+
+    Initial state: the two legs are pre-laid on the bed to their fixed far
+    ends (``laid_end_*_xy``), with their recovered ends held over the port
+    (leg 1) and starboard (leg 2) sheaves. The script (``schedule``, or the
+    :func:`default_bu_schedule`) then pays the joints overboard, transfers
+    leg 2 to the port sheave, overboards the BU (spawning the junction and
+    trunk), and lowers it to the bed while steaming ahead.
+
+    The scenario carries no balance controller — hang a
+    ``control.TensionBalanceController("leg1", "leg2")`` on
+    ``SimOptions.controller`` to keep the legs balanced during payout.
+    """
+    geom = vessel_geom or default_bu_vessel_geometry()
+    if "port" not in geom.sheaves or "stbd" not in geom.sheaves:
+        raise ValueError("vessel_geom must define 'port' and 'stbd' sheaves")
+
+    def sheave_xyz(name: str):
+        return np.asarray(
+            geom.sheave_xyz(vessel_xy, vessel_heading_deg, name), dtype=float)
+
+    chains: Dict[str, ChainState] = {}
+    for i, (asm, end_xy, dep) in enumerate(
+        ((leg1_assembly, laid_end_1_xy, leg1_deployed_m),
+         (leg2_assembly, laid_end_2_xy, leg2_deployed_m)), start=1,
+    ):
+        sheave = "port" if i == 1 else "stbd"
+        top = sheave_xyz(sheave)
+        end_xyz = (end_xy[0], end_xy[1], _bed_z(bathy, end_xy[0], end_xy[1]))
+        chord = float(np.linalg.norm(np.asarray(end_xyz) - top))
+        depth_here = float(bathy.depth_at(*end_xy))
+        length = float(dep) if dep is not None else 1.05 * chord + 0.2 * depth_here
+        az = math.degrees(math.atan2(end_xy[1] - top[1], end_xy[0] - top[0]))
+        shape = hanging_leg_seed(top, az, length, bathy, 60)
+        shape[-1] = np.asarray(end_xyz)
+        chains[f"leg{i}"] = ChainState(
+            name=f"leg{i}",
+            assembly=asm,
+            defaults=defaults,
+            length_m=length,
+            top=Attachment("sheave", sheave=sheave),
+            bottom=Attachment("fixed", xyz=end_xyz),
+            shape=shape,
+            target_ds_m=target_ds_m,
+        )
+
+    depth0 = float(bathy.depth_at(*vessel_xy))
+    rows = schedule if schedule is not None else default_bu_schedule(
+        depth_m=depth0, tail_length_m=tail_length_m, payout_mps=payout_mps,
+        lay_speed_mps=lay_speed_mps, course_deg=vessel_heading_deg,
+    )
+
+    # Trunk template, instantiated by the overboard event at the phase start
+    # (its start position depends on the vessel position at that moment).
+    sheave_h = geom.sheaves["port"].height_m
+    trunk_len0 = (sheave_h + bu_spawn_depth_m) * (1.0 + max(0.0, trunk_slack_pct) / 100.0)
+
+    def overboard_events() -> List[Event]:
+        trunk = ChainState(
+            name="trunk",
+            assembly=trunk_assembly,
+            defaults=defaults,
+            length_m=trunk_len0,
+            top=Attachment("sheave", sheave="port"),
+            bottom=Attachment("junction", junction="BU"),
+            shape=np.zeros((0, 3)),      # synthesised at apply time
+            target_ds_m=max(2.0, target_ds_m / 2.0),
+            min_elems=30,
+        )
+        return [
+            Event(
+                kind="add_junction",
+                junction=JunctionState("BU", (0.0, 0.0, 0.0),
+                                       load_kN=bu_weight_kN, cda_m2=bu_cda_m2),
+                at_sheave="port", depth_m=bu_spawn_depth_m,
+                label="BU overboarded",
+            ),
+            Event(kind="add_chain", chain_state=trunk),
+            Event(kind="set_top", chain="leg1",
+                  attachment=Attachment("junction", junction="BU")),
+            Event(kind="set_top", chain="leg2",
+                  attachment=Attachment("junction", junction="BU")),
+        ]
+
+    steps: List[Step] = []
+    for row in rows:
+        step = Step(
+            duration_s=float(row.duration_s),
+            vessel_course_deg=float(row.course_deg),
+            vessel_speed_mps=float(row.speed_mps),
+            payout_mps=dict(row.payout_mps),
+            label=row.label,
+        )
+        if row.event == "transfer":
+            step.transfer = SheaveTransfer("leg2", "stbd", "port")
+        elif row.event == "overboard_bu":
+            step.events = overboard_events()
+        elif row.event:
+            raise ValueError(f"Unknown schedule event {row.event!r}")
+        steps.append(step)
+
+    return Scenario(
+        chains=chains,
+        junctions={},
+        vessel_xy=vessel_xy,
+        vessel_heading_deg=vessel_heading_deg,
+        vessel_geom=geom,
+        steps=steps,
     )

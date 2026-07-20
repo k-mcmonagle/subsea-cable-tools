@@ -202,6 +202,22 @@ class GridBathymetry(Bathymetry):
             # the local seabed instead of a global flat plateau.
             self.nodata_fraction = float(np.mean(~np.isfinite(self.depths)))
             self.depths = fill_nodata_nearest(self.depths)
+        # Precomputed gradient tables. The half-cell central difference of
+        # the bilinear surface (the smoothing that stops contact-normal
+        # chatter) is itself piecewise bilinear with breakpoints at the grid
+        # nodes AND cell midpoints — so sampling it once on a half-step grid
+        # and bilinearly interpolating reproduces it EXACTLY, replacing four
+        # bilinear evaluations per query with one table lookup.
+        ny, nx = self.depths.shape
+        hx, hy = 0.5 * self.dx, 0.5 * self.dy
+        xs_half = self.x0 + hx * np.arange(2 * nx - 1)
+        ys_full = self.y0 + self.dy * np.arange(ny)
+        XX, YY = np.meshgrid(xs_half, ys_full)
+        self._gx = (self._bilinear(XX + hx, YY) - self._bilinear(XX - hx, YY)) / (2.0 * hx)
+        xs_full = self.x0 + self.dx * np.arange(nx)
+        ys_half = self.y0 + hy * np.arange(2 * ny - 1)
+        XX2, YY2 = np.meshgrid(xs_full, ys_half)
+        self._gy = (self._bilinear(XX2, YY2 + hy) - self._bilinear(XX2, YY2 - hy)) / (2.0 * hy)
 
     def _local(self, x, y):
         fx = (np.asarray(x, dtype=float) - self.x0) / self.dx
@@ -235,11 +251,56 @@ class GridBathymetry(Bathymetry):
             return float(v)
         return v
 
+    @staticmethod
+    def _interp_table(table, ox, oy, sx, sy, x, y):
+        """Clamped bilinear lookup into a precomputed table with its own
+        origin/spacing (mirrors ``_local`` + ``_bilinear``)."""
+        fx = (np.asarray(x, dtype=float) - ox) / sx
+        fy = (np.asarray(y, dtype=float) - oy) / sy
+        ny, nx = table.shape
+        fx = np.where(np.isfinite(fx), fx, 0.0)
+        fy = np.where(np.isfinite(fy), fy, 0.0)
+        fx = np.clip(fx, 0.0, nx - 1.0 - 1e-9)
+        fy = np.clip(fy, 0.0, ny - 1.0 - 1e-9)
+        j = np.floor(fx).astype(int)
+        i = np.floor(fy).astype(int)
+        tx = fx - j
+        ty = fy - i
+        return (
+            table[i, j] * (1 - tx) * (1 - ty)
+            + table[i, j + 1] * tx * (1 - ty)
+            + table[i + 1, j] * (1 - tx) * ty
+            + table[i + 1, j + 1] * tx * ty
+        )
+
     def grad_at(self, x, y):
-        # Central differences of the bilinear surface over half a cell. The
-        # analytic bilinear gradient is piecewise-constant and jumps at cell
-        # boundaries, which chatters the contact normal / friction tangent
-        # on coarse or rough grids; this smoothed form is continuous.
+        # Exact reproduction of the half-cell central difference of the
+        # bilinear surface (continuous — the analytic bilinear gradient is
+        # piecewise constant and jumps at cell boundaries, which chatters
+        # the contact normal / friction tangent) via the precomputed
+        # half-step tables: one table lookup instead of four bilinear
+        # surface evaluations per query.
+        gx = self._interp_table(self._gx, self.x0, self.y0, 0.5 * self.dx, self.dy, x, y)
+        gy = self._interp_table(self._gy, self.x0, self.y0, self.dx, 0.5 * self.dy, x, y)
+        # Depth is clamped flat outside the grid, so the gradient there is
+        # zero (matches the surface the solver actually contacts).
+        ny, nx = self.depths.shape
+        xa = np.asarray(x, dtype=float)
+        ya = np.asarray(y, dtype=float)
+        outside = (
+            (xa < self.x0) | (xa > self.x0 + (nx - 1) * self.dx)
+            | (ya < self.y0) | (ya > self.y0 + (ny - 1) * self.dy)
+        )
+        if np.any(outside):
+            gx = np.where(outside, 0.0, gx)
+            gy = np.where(outside, 0.0, gy)
+        if np.ndim(x) == 0 and np.ndim(y) == 0:
+            return float(gx), float(gy)
+        return gx, gy
+
+    def _grad_central_reference(self, x, y):
+        """Previous implementation (half-cell central differences of the
+        bilinear surface); kept as the reference for the equivalence test."""
         hx, hy = 0.5 * self.dx, 0.5 * self.dy
         xa = np.asarray(x, dtype=float)
         ya = np.asarray(y, dtype=float)

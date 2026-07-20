@@ -148,6 +148,52 @@ def timeline_csv_rows(snapshots: Sequence) -> Tuple[List[str], List[List]]:
     return header, rows
 
 
+def schedule_csv_rows(snapshots: Sequence) -> Tuple[List[str], List[List]]:
+    """Operational schedule sheet: one row per snapshot with the vessel
+    state, the applied payout per line and the resulting tensions — the
+    table a lay crew can follow (and check against) during the deployment."""
+    chain_names: List[str] = []
+    seen = set()
+    for snap in snapshots:
+        for c in snap.chains:
+            if c.name not in seen:
+                seen.add(c.name)
+                chain_names.append(c.name)
+
+    header = ["t_s", "phase", "vessel_x_m", "vessel_y_m", "heading_degN"]
+    for name in chain_names:
+        header.append(f"payout_{name}_mps")
+    for name in chain_names:
+        header.append(f"top_tension_{name}_kN")
+    header += ["leg_imbalance_kN", "BU_x_m", "BU_y_m", "BU_z_m"]
+
+    def _math_to_compass(deg: float) -> float:
+        return (90.0 - float(deg)) % 360.0
+
+    rows: List[List] = []
+    for snap in snapshots:
+        payout = getattr(snap, "payout_mps", {}) or {}
+        by_name = {c.name: c for c in snap.chains}
+        row: List[Any] = [
+            _num(snap.t_s), getattr(snap, "label", ""),
+            _num(snap.vessel_xy[0]), _num(snap.vessel_xy[1]),
+            _num(_math_to_compass(snap.vessel_heading_deg), 1),
+        ]
+        for name in chain_names:
+            row.append(_num(payout[name], 3) if name in payout else "")
+        for name in chain_names:
+            c = by_name.get(name)
+            row.append(_num(c.top_tension_kN) if c is not None else "")
+        c1, c2 = by_name.get("leg1"), by_name.get("leg2")
+        row.append(_num(c1.top_tension_kN - c2.top_tension_kN)
+                   if c1 is not None and c2 is not None else "")
+        bu = (getattr(snap, "junction_xyz", {}) or {}).get("BU")
+        row += ([_num(bu[0]), _num(bu[1]), _num(bu[2])] if bu is not None
+                else ["", "", ""])
+        rows.append(row)
+    return header, rows
+
+
 def write_csv(path: str, header: List[str], rows: List[List]) -> None:
     """Write header + rows to ``path`` as UTF-8 CSV."""
     with open(path, "w", encoding="utf-8", newline="") as fh:

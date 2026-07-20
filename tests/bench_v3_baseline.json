@@ -1,0 +1,185 @@
+{
+ "static_flat": {
+  "converged": true,
+  "chains": {
+   "cable": {
+    "top_tension_kN": 24.320155210244458,
+    "end_tension_kN": 0.0,
+    "max_tension_kN": 24.320155210244458,
+    "rms_z_m": 104.73102695089213,
+    "mean_x_m": -97.01051380860548,
+    "contact_frac": 0.6344086021505376,
+    "min_radius_m": 12.220780913876595,
+    "length_m": 367.0
+   }
+  }
+ },
+ "bu_hold_grid": {
+  "converged": true,
+  "chains": {
+   "trunk": {
+    "top_tension_kN": 48.574578929545204,
+    "end_tension_kN": 40.2341035913441,
+    "max_tension_kN": 48.574578929545204,
+    "rms_z_m": 22.254641582120957,
+    "mean_x_m": -3.4971467955150457,
+    "contact_frac": 0.0,
+    "min_radius_m": 1103.469655145798,
+    "length_m": 45.90000000000002
+   },
+   "leg1": {
+    "top_tension_kN": 10.564696359774658,
+    "end_tension_kN": 10.703082891663353,
+    "max_tension_kN": 11.782640109276578,
+    "rms_z_m": 79.2912857902494,
+    "mean_x_m": -83.1790497482462,
+    "contact_frac": 0.4444444444444444,
+    "min_radius_m": 11.312956222171017,
+    "length_m": 220.0
+   },
+   "leg2": {
+    "top_tension_kN": 11.602762270305874,
+    "end_tension_kN": 9.644507787171442,
+    "max_tension_kN": 11.602762270305874,
+    "rms_z_m": 82.07666439764448,
+    "mean_x_m": -84.26710692032589,
+    "contact_frac": 0.4,
+    "min_radius_m": 13.439850934987023,
+    "length_m": 220.0
+   }
+  },
+  "junction_BU": [
+   -7.2137278895978945,
+   -0.15989962603247945,
+   -40.327561845670076
+  ]
+ },
+ "bu_deployment_op": {
+  "n_snapshots": 16,
+  "aborted": false,
+  "first": {
+   "converged": false,
+   "chains": {
+    "trunk": {
+     "top_tension_kN": 571.1810839258395,
+     "end_tension_kN": 1241.8960396321102,
+     "max_tension_kN": 1241.8960396321102,
+     "rms_z_m": 2.6203231311471358,
+     "mean_x_m": -5.166518798170419,
+     "contact_frac": 0.0,
+     "min_radius_m": 1286.5768881992858,
+     "length_m": 13.260000000000003
+    },
+    "leg1": {
+     "top_tension_kN": 315.7526716672402,
+     "end_tension_kN": 336.9351588413564,
+     "max_tension_kN": 353.82331309794637,
+     "rms_z_m": 48.247468065902964,
+     "mean_x_m": -64.51851090345714,
+     "contact_frac": 0.03225806451612903,
+     "min_radius_m": 1872.0004070820942,
+     "length_m": 150.0
+    },
+    "leg2": {
+     "top_tension_kN": 315.7526716672249,
+     "end_tension_kN": 336.9351588414379,
+     "max_tension_kN": 353.8233130979565,
+     "rms_z_m": 48.24746806590295,
+     "mean_x_m": -64.51851090345714,
+     "contact_frac": 0.03225806451612903,
+     "min_radius_m": 1872.0004070826806,
+     "length_m": 150.0
+    }
+   },
+   "junction_BU": [
+    -10.345546479579703,
+    -4.4251804311905045e-15,
+    -3.3495278074369406
+   ]
+  },
+  "last": {
+   "converged": true,
+   "chains": {
+    "trunk": {
+     "top_tension_kN": 19.164440366790284,
+     "end_tension_kN": 4.922386718759889,
+     "max_tension_kN": 19.164440366790284,
+     "rms_z_m": 57.206541942550935,
+     "mean_x_m": 60.45437974212768,
+     "contact_frac": 0.20754716981132076,
+     "min_radius_m": 20.808012252646037,
+     "length_m": 128.06000000000003
+    },
+    "leg1": {
+     "top_tension_kN": 2.762186285698721,
+     "end_tension_kN": 3.9582592590072228,
+     "max_tension_kN": 4.187058662097242,
+     "rms_z_m": 80.00158357649754,
+     "mean_x_m": -53.8299991065809,
+     "contact_frac": 1.0,
+     "min_radius_m": 376.32449373483286,
+     "length_m": 150.0
+    },
+    "leg2": {
+     "top_tension_kN": 2.7607108348906486,
+     "end_tension_kN": 3.9555073413163844,
+     "max_tension_kN": 4.184826140381798,
+     "rms_z_m": 80.00158357636096,
+     "mean_x_m": -53.829656959161944,
+     "contact_frac": 1.0,
+     "min_radius_m": 382.74760133606014,
+     "length_m": 150.0
+    }
+   },
+   "junction_BU": [
+    13.512052682403326,
+    0.0001413778544531313,
+    -80.01870057066988
+   ]
+  }
+ },
+ "final_bight_op": {
+  "n_snapshots": 10,
+  "aborted": false,
+  "first": {
+   "converged": true,
+   "chains": {
+    "cable": {
+     "top_tension_kN": 0.0,
+     "end_tension_kN": 0.0,
+     "max_tension_kN": 6.428715926753737,
+     "rms_z_m": 36.2590255430917,
+     "mean_x_m": -0.0034333589621342586,
+     "contact_frac": 0.703125,
+     "min_radius_m": 0.24710443684586186,
+     "length_m": 250.00000000000034
+    },
+    "rope": {
+     "top_tension_kN": 13.862401602373417,
+     "end_tension_kN": 13.586534254925333,
+     "max_tension_kN": 13.862401602373417,
+     "rms_z_m": 2.8896366792475128,
+     "mean_x_m": 2.3612024598496864e-05,
+     "contact_frac": 0.0,
+     "min_radius_m": 1545928.6274741283,
+     "length_m": 9.000000000000002
+    }
+   }
+  },
+  "last": {
+   "converged": true,
+   "chains": {
+    "cable": {
+     "top_tension_kN": 0.0,
+     "end_tension_kN": 0.0,
+     "max_tension_kN": 0.0,
+     "rms_z_m": 40.00116716922415,
+     "mean_x_m": 5.400068646910228e-06,
+     "contact_frac": 1.0,
+     "min_radius_m": 4.116940457972765,
+     "length_m": 250.00000000000034
+    }
+   }
+  }
+ }
+}

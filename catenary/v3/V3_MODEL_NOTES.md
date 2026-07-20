@@ -164,12 +164,54 @@ Scenarios:
   attached end) falls below the threshold; the bight then settles on the
   bed. Validated: apex descent, auto-release, > 90 % of the bight in
   contact with low residual tension afterwards.
+* **BU deployment — full (two-sheave)** — the complete integration from
+  the jointing set-up: both pre-laid legs held over the **port and
+  starboard sheaves** (offsets rotate with the heading), joints paid
+  overboard, one leg **transferred** to the other sheave (its top is
+  walked between the sheave positions across the phase, so the solver
+  never sees a step change), the BU **overboarded** as a discrete event
+  (junction + trunk spawned, legs re-topped onto the junction), then
+  lowered and laid ahead. A proportional **tension-balance controller**
+  redistributes the scheduled leg payout each substep so the sheave
+  tensions stay matched (a secant trim on the deployed lengths provides
+  the initial balance), and a **schedule optimiser** places the whole
+  set-up so the BU lands on a target position using preview-quality runs
+  (translation of the operation; limits checked and reported as
+  warnings). The edited/optimised phase schedule is exportable as an
+  operational CSV (time / vessel position / payout per line / tensions).
+  Modelling caveats: the BU is a point body (no attitude/rotation), the
+  in-air weight during the splash transit is not modelled (the junction
+  spawns just below the surface at its submerged weight), and deck
+  handling is length bookkeeping only — legs enter the model at the
+  sheave. Validated: sheave-frame geometry, symmetric-hold balance,
+  monotonic descent and landing, per-chain length conservation against
+  the applied payout integral, controller effectiveness on a cross-slope
+  bed, optimiser landing accuracy on a sloping bed.
 
 No open-access reference covers BU deployment or final-bight procedure
 directly (see the digest); these simulations rest on the validated solver
 physics plus limiting-case checks. Zajac's Appendix E (bight held while
 the ship steams on) is the closest published analysis and matches the
 qualitative behaviour.
+
+### Model quality selector (operation runs)
+
+* **Full** — the dynamic-relaxation solver at normal settings (the
+  engineering answer).
+* **Draft** — the same solver with a coarser mesh, looser tolerance and
+  larger substeps (~5–10× faster); for iterating on a schedule.
+* **Quick (BU scenarios only)** — the analytic tri-catenary model
+  (`engine/quick_bu.py`): every suspended line is a closed-form planar
+  catenary (taut lines become stiff axial constraints; touchdown is a
+  tangency condition) and the BU position is the root of the three-line
+  force balance, so a whole deployment solves in under a second.
+  Assumptions dropped vs the full solver: seabed friction and lay
+  history, hydrodynamic drag/current, in-line bodies, multi-segment
+  weight variation (a length-weighted mean is used), and bed relief under
+  a suspended span (touchdown depth only). Validated against the full
+  solver on a held-BU case (position within metres, trunk tension within
+  ~10 %); always confirm a final schedule at Full quality. The quick
+  run's shapes seed a later full run, so confirming is fast.
 
 ## What is supported, partially supported, and not supported
 
@@ -182,6 +224,7 @@ qualitative behaviour.
 | Multi-segment assemblies + bodies | **Supported** | V2-compatible JSON, plus diameter/Cd columns. |
 | Seabed friction | **Supported** | Coulomb stick-slip, per segment; history-dependent by nature. |
 | Branching units (Y-topology) | **Supported (beta)** | Junction node + three chains; no BU attitude/rotation model (point body). |
+| Full two-sheave BU deployment | **Supported (beta)** | Phase schedule with transfer/overboard events, payout balance controller, landing-target optimiser; point-body BU, no splash-transit air weight. |
 | Final bight lay-down | **Supported (beta)** | Apex held by one lowering line; splice joint not structurally modelled. |
 | Bending stiffness / MBR | **Partial** | Same discrete-moment model and caveats as V2; MBR limit check with warning banner. |
 | Chute/capstan friction | **Partial** | Capstan factor applied to the reported machinery tension; the chute arc geometry itself is not modelled (V2 models the quarter-circle wrap in 2D). |
@@ -202,6 +245,16 @@ qualitative behaviour.
 * Node spacing (`target ds`) trades accuracy for speed; contact and
   touchdown positions resolve to about one node spacing. Operation-mode
   runtime is roughly seconds per simulated minute at default settings.
+* **Solver performance**: cold settles seed from analytic catenary /
+  bed-following shapes and run a coarse-mesh pre-pass before the full-
+  resolution solve; grid bathymetry gradients come from precomputed
+  half-step tables that reproduce the previous central-difference field
+  exactly. Because friction equilibria are lay-history dependent, the
+  analytic seeds select the branch closer to a gently-laid cable (lower
+  trapped residual bottom tension) — physics anchor tests (Zajac
+  top-tension theorem, catenary limits) pin the behaviour, and
+  `tests/bench_v3_solver.py --compare` gates every solver change against
+  a result fingerprint baseline.
 * The 2D V2 calculator remains the fast, mature tool for plane static
   problems (chute wrap geometry, surface-piercing buoyancy analysis,
   detailed multi-span drape reporting); V3 complements it with drag, 3D

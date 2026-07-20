@@ -257,7 +257,12 @@ def solve_system(
 
     iters_done = 0
     residual_ratio = float("inf")
-    check_every = 200
+    # Residual cadence: an early first check catches warm starts that are
+    # already converged; sparse checks (100) while far from tolerance, finer
+    # (50) once close, so at most ~49 iterations are wasted after convergence.
+    first_check = 50
+    check_far = 100
+    check_near = 50
     # Divergence recovery: dynamic relaxation can blow up (overflow -> NaN)
     # on stiff or badly-seeded systems. Checkpoint the last finite state and,
     # on a blow-up, rewind to it with a heavier nodal mass (smaller effective
@@ -281,16 +286,41 @@ def solve_system(
         else:
             scatter_plans.append(None)
 
+    # Loop-invariant per-chain quantities, hoisted out of the iteration loop.
+    inv = []
+    for ci, ch in enumerate(chains):
+        qa_eff = np.where(ch.qa != 0.0, ch.qa, ch.qw)
+        d = {
+            "w_sub": ch.qw * ch.L0,
+            "w_air": qa_eff * ch.L0,
+            "kdn": 0.5 * rho_water * ch.cdn * ch.dia,
+            "kdt": 0.5 * rho_water * ch.cdt * math.pi * ch.dia,
+            "L0_col": ch.L0[:, None],
+            "Floc": np.zeros((len(ch.idx), 3)),
+            "has_EI": float(np.max(ch.EI)) > 0.0 and len(ch.idx) >= 3,
+            "v_cab0": 0.5 * (v_node[ch.idx[:-1]] + v_node[ch.idx[1:]]),
+        }
+        if d["has_EI"]:
+            EIl = ch.EI[:-1]
+            EIr = ch.EI[1:]
+            d["EIl"] = EIl
+            d["EIr"] = EIr
+            d["ei_ok"] = (EIl > 0.0) & (EIr > 0.0)
+        inv.append(d)
+    free = ~fixed
+
     for outer in range(int(n_outer)):
         v[:] = 0.0
         ke_prev = 0.0
         converged = False
+        next_check = first_check
 
         for it in range(int(max_iters)):
             iters_done += 1
             F[:] = 0.0
 
             for ci, ch in enumerate(chains):
+                cinv = inv[ci]
                 idx = ch.idx
                 P = X[idx]
                 d = np.diff(P, axis=0)
@@ -301,7 +331,8 @@ def solve_system(
                 T = np.maximum(0.0, EA * strain)
                 T_seg_store[ci] = T
 
-                Floc = np.zeros((len(idx), 3))
+                Floc = cinv["Floc"]
+                Floc[:] = 0.0
                 Tu = T[:, None] * u
                 Floc[:-1] += Tu
                 Floc[1:] -= Tu
@@ -309,16 +340,16 @@ def solve_system(
                 # Bending: discrete three-node moments, 3D form. Joint angle
                 # theta between adjacent tangents; restoring moment in the
                 # plane of the two segments (axis = u1 x u2).
-                if float(np.max(ch.EI)) > 0.0 and len(idx) >= 3:
+                if cinv["has_EI"]:
                     u1 = u[:-1]
                     u2 = u[1:]
                     L1 = np.maximum(seg_len[:-1], 0.5 * ch.L0[:-1])
                     L2 = np.maximum(seg_len[1:], 0.5 * ch.L0[1:])
-                    EIl = ch.EI[:-1]
-                    EIr = ch.EI[1:]
+                    EIl = cinv["EIl"]
+                    EIr = cinv["EIr"]
                     with np.errstate(divide="ignore", invalid="ignore"):
                         EIj = np.where(
-                            (EIl > 0.0) & (EIr > 0.0),
+                            cinv["ei_ok"],
                             (L1 + L2) / (L1 / EIl + L2 / EIr),
                             0.0,
                         )
@@ -339,19 +370,17 @@ def solve_system(
 
                 # Weight per element by mid-depth medium; physical length L0.
                 z_mid = 0.5 * (P[:-1, 2] + P[1:, 2])
-                qa_eff = np.where(ch.qa != 0.0, ch.qa, ch.qw)
-                q_elem = np.where(z_mid < 0.0, ch.qw, qa_eff)
-                w_elem = q_elem * ch.L0
+                w_elem = np.where(z_mid < 0.0, cinv["w_sub"], cinv["w_air"])
                 Floc[:-1, 2] -= 0.5 * w_elem
                 Floc[1:, 2] -= 0.5 * w_elem
 
                 # Hydrodynamic drag per element (submerged elements only).
                 if has_flow:
-                    u_w = np.zeros((len(seg_len), 3))
                     if current_at is not None:
-                        u_w += current_at(z_mid)
-                    u_w += app_flow
-                    v_cab = 0.5 * (v_node[idx[:-1]] + v_node[idx[1:]])
+                        u_w = current_at(z_mid) + app_flow
+                    else:
+                        u_w = app_flow
+                    v_cab = cinv["v_cab0"]
                     if ch.transport_speed_mps:
                         # Material transport toward node 0 (bottom -> pay-out
                         # convention is set by callers via the sign).
@@ -362,10 +391,9 @@ def solve_system(
                     u_n = u_rel - u_t
                     un_mag = np.linalg.norm(u_n, axis=1)
                     subm = z_mid < 0.0
-                    dia = ch.dia
-                    f_n = (0.5 * rho_water * ch.cdn * dia * un_mag)[:, None] * u_n
-                    f_t = (0.5 * rho_water * ch.cdt * math.pi * dia * np.abs(ut_mag) * ut_mag)[:, None] * u
-                    f_drag = np.where(subm[:, None], (f_n + f_t) * ch.L0[:, None], 0.0)
+                    f_n = (cinv["kdn"] * un_mag)[:, None] * u_n
+                    f_t = (cinv["kdt"] * np.abs(ut_mag) * ut_mag)[:, None] * u
+                    f_drag = np.where(subm[:, None], (f_n + f_t) * cinv["L0_col"], 0.0)
                     Floc[:-1] += 0.5 * f_drag
                     Floc[1:] += 0.5 * f_drag
 
@@ -394,22 +422,24 @@ def solve_system(
                 Fd = 0.5 * rho_water * (cda[sel] * mag)[:, None] * u_rel
                 F[sel] += np.where(subm[:, None], Fd, 0.0)
 
-            # Seabed contact + friction.
+            # Seabed contact + friction. Gradients and the friction cone are
+            # evaluated only on the contact subset — non-contact rows were
+            # zero-multiplied before, so the math is unchanged.
             if bathy is not None:
                 bed_z = -np.asarray(bathy.depth_at(X[:, 0], X[:, 1]), dtype=float)
                 pen = bed_z - X[:, 2]
                 in_contact = pen > 0.0
-                if np.any(in_contact):
-                    gx, gy = bathy.grad_at(X[:, 0], X[:, 1])
-                    gx = np.asarray(gx, dtype=float)
-                    gy = np.asarray(gy, dtype=float)
+                sub = np.flatnonzero(in_contact)
+                if len(sub):
+                    gx, gy = bathy.grad_at(X[sub, 0], X[sub, 1])
+                    gx = np.atleast_1d(np.asarray(gx, dtype=float))
+                    gy = np.atleast_1d(np.asarray(gy, dtype=float))
                     inv_norm = 1.0 / np.sqrt(1.0 + gx * gx + gy * gy)
                     # Upward bed normal (for z = -D(x, y)): (gx, gy, 1)/|.|
-                    Fn_mag = k_contact * pen * inv_norm
-                    Fn_mag = np.where(in_contact, Fn_mag, 0.0)
-                    F[:, 0] += Fn_mag * gx * inv_norm
-                    F[:, 1] += Fn_mag * gy * inv_norm
-                    F[:, 2] += Fn_mag * inv_norm
+                    Fn_mag = k_contact * pen[sub] * inv_norm
+                    F[sub, 0] += Fn_mag * gx * inv_norm
+                    F[sub, 1] += Fn_mag * gy * inv_norm
+                    F[sub, 2] += Fn_mag * inv_norm
 
                     if mu_max > 0.0:
                         newly = in_contact & ~has_anchor
@@ -417,23 +447,22 @@ def solve_system(
                         has_anchor[newly] = True
                         has_anchor[~in_contact] = False
 
-                        dxy = X[:, :2] - fric_anchor
+                        dxy = X[sub, :2] - fric_anchor[sub]
                         ft_want = -k_fric * dxy
                         ft_mag = np.linalg.norm(ft_want, axis=1)
-                        ft_max = mu_node * Fn_mag
-                        over = (ft_mag > ft_max) & in_contact & (ft_mag > 1e-12)
+                        ft_max = mu_node[sub] * Fn_mag
+                        over = (ft_mag > ft_max) & (ft_mag > 1e-12)
                         if np.any(over):
                             # Slide the anchor onto the friction cone.
                             scale = ft_max[over] / ft_mag[over]
                             keep = ft_want[over] * scale[:, None]
-                            fric_anchor[over] = X[over, :2] + keep / k_fric
+                            fric_anchor[sub[over]] = X[sub[over], :2] + keep / k_fric
                             ft_want[over] = keep
-                        ft_want = np.where(in_contact[:, None], ft_want, 0.0)
                         # Apply along the local bed tangent (horizontal force
                         # plus consistent z so the force lies in the surface).
-                        F[:, 0] += ft_want[:, 0]
-                        F[:, 1] += ft_want[:, 1]
-                        F[:, 2] += -(gx * ft_want[:, 0] + gy * ft_want[:, 1])
+                        F[sub, 0] += ft_want[:, 0]
+                        F[sub, 1] += ft_want[:, 1]
+                        F[sub, 2] += -(gx * ft_want[:, 0] + gy * ft_want[:, 1])
                     else:
                         has_anchor[:] = False
 
@@ -448,8 +477,8 @@ def solve_system(
             ke_prev = ke
             X += v * dt
 
-            if (it + 1) % check_every == 0:
-                residual_ratio = float(np.max(np.abs(F[~fixed]))) / max(w_ref, 1e-9)
+            if (it + 1) >= next_check:
+                residual_ratio = float(np.max(np.abs(F[free]))) / max(w_ref, 1e-9)
                 if not np.isfinite(residual_ratio) or not np.all(np.isfinite(X)):
                     blowups += 1
                     if blowups > max_blowups:
@@ -461,6 +490,7 @@ def solve_system(
                     ke_prev = 0.0
                     m_node *= 4.0
                     residual_ratio = float("inf")
+                    next_check = (it + 1) + check_far
                     continue
                 X_ok = X.copy()
                 if progress is not None:
@@ -471,6 +501,7 @@ def solve_system(
                 if cancel is not None and cancel():
                     cancelled = True
                     break
+                next_check = (it + 1) + (check_near if residual_ratio < 10.0 * tol else check_far)
 
         if diverged:
             warnings.append(

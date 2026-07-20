@@ -34,6 +34,7 @@ from .cable_system import (
     Defaults,
     SystemBuilder,
     resample_polyline,
+    sagged_shape,
 )
 from .solver3d import SolveResult, solve_system
 
@@ -44,6 +45,8 @@ class Attachment:
 
     kind:
       * ``vessel`` — follows the vessel chute (fixed each step).
+      * ``sheave`` — follows the named sheave of the vessel geometry
+        (offsets rotate with the vessel heading).
       * ``fixed``  — fixed at ``xyz`` (anchor / laid end).
       * ``junction`` — ties to the named junction node.
       * ``chain_point`` — ties to the node of ``chain`` nearest arc position
@@ -57,6 +60,40 @@ class Attachment:
     chain: str = ""
     s_from_bottom_m: float = 0.0
     chute_height_m: float = 5.0     # for 'vessel'
+    sheave: str = ""                # for 'sheave'
+
+
+@dataclass
+class SheaveSpec:
+    """An overboarding point in the vessel frame: ``fwd_m`` along the
+    heading, ``stbd_m`` to starboard, ``height_m`` above the waterline."""
+
+    fwd_m: float = 0.0
+    stbd_m: float = 0.0
+    height_m: float = 5.0
+
+
+@dataclass
+class VesselGeometry:
+    """Named sheave positions. The default single sheave ``main`` at the
+    vessel reference point reproduces the legacy chute behaviour."""
+
+    sheaves: Dict[str, SheaveSpec] = field(
+        default_factory=lambda: {"main": SheaveSpec()})
+
+    def sheave_xyz(self, vessel_xy: Tuple[float, float], heading_deg: float,
+                   name: str) -> Tuple[float, float, float]:
+        try:
+            sp = self.sheaves[name]
+        except KeyError:
+            raise KeyError(
+                f"Unknown sheave {name!r}; defined: {sorted(self.sheaves)}")
+        h = math.radians(float(heading_deg))
+        ch_, sh_ = math.cos(h), math.sin(h)
+        # Math frame (CCW positive): starboard is clockwise of the heading.
+        x = vessel_xy[0] + sp.fwd_m * ch_ + sp.stbd_m * sh_
+        y = vessel_xy[1] + sp.fwd_m * sh_ - sp.stbd_m * ch_
+        return (x, y, sp.height_m)
 
 
 @dataclass
@@ -92,6 +129,40 @@ class JunctionState:
 
 
 @dataclass
+class Event:
+    """A discrete topology change applied at the start of a step.
+
+    kind:
+      * ``set_top`` — re-pin ``chain``'s top end to ``attachment``.
+      * ``add_junction`` — spawn ``junction``; when ``at_sheave`` is given
+        its position is resolved at apply time: horizontally under that
+        sheave at ``depth_m`` below the surface.
+      * ``add_chain`` — add ``chain_state``; an empty ``shape`` is
+        synthesised from its resolved end positions.
+      * ``release`` — drop ``chain`` from the system (cast off).
+    """
+
+    kind: str
+    chain: str = ""
+    attachment: Optional[Attachment] = None
+    junction: Optional[JunctionState] = None
+    chain_state: Optional["ChainState"] = None
+    at_sheave: str = ""
+    depth_m: float = 2.0
+    label: str = ""
+
+
+@dataclass
+class SheaveTransfer:
+    """Move a chain's top from one sheave to another, lerped across the
+    step's substeps so the solver never sees a beam-width jump."""
+
+    chain: str
+    from_sheave: str
+    to_sheave: str
+
+
+@dataclass
 class Step:
     """One scripted command interval."""
 
@@ -100,6 +171,8 @@ class Step:
     vessel_speed_mps: float = 0.0
     payout_mps: Dict[str, float] = field(default_factory=dict)
     release_chains: List[str] = field(default_factory=list)
+    events: List[Event] = field(default_factory=list)
+    transfer: Optional[SheaveTransfer] = None
     label: str = ""
 
 
@@ -109,6 +182,7 @@ class Scenario:
     junctions: Dict[str, JunctionState] = field(default_factory=dict)
     vessel_xy: Tuple[float, float] = (0.0, 0.0)
     vessel_heading_deg: float = 0.0
+    vessel_geom: VesselGeometry = field(default_factory=VesselGeometry)
     steps: List[Step] = field(default_factory=list)
     # Auto-release: drop these chains when their max tension falls below the
     # threshold (kN) — e.g. cast off a lowering rope once it goes slack.
@@ -121,15 +195,42 @@ class SimOptions:
     current_at: Optional[Callable[["np.ndarray"], "np.ndarray"]] = None
     max_move_m: float = 10.0            # substep displacement/payout cap
     rate_drag: bool = True              # inner velocity iteration
+    # Skip the rate-drag re-solve when the fastest node moves slower than
+    # this — quadratic drag at such speeds is far below the weight scale,
+    # so the second solve would reproduce the first.
+    rate_drag_min_v: float = 0.05
     tol: float = 3e-3
     max_iters: int = 40000
     settle_tol: float = 2e-3
     settle_max_iters: int = 120000
+    # Cold-start acceleration: settle first on a ~3x coarser mesh and use
+    # that equilibrium as the fine-mesh seed (identical converged physics —
+    # the final solve always runs at full resolution and tolerance).
+    coarse_settle: bool = True
+    # Global element-length multiplier applied at build time (>1 = coarser).
+    # Used by the coarse settle pass and by preview-quality runs.
+    mesh_scale: float = 1.0
+    # Optional payout controller (duck-typed, e.g. control.
+    # TensionBalanceController): ``rates(base_dict, last_snapshot) -> dict``
+    # called every substep to redistribute the step's payout rates.
+    controller: Optional[object] = None
     # Optional UI hooks, forwarded into every inner solve: ``cancel()``
     # stops the relaxation early; ``solver_progress(iters, residual)``
     # reports within-solve progress.
     cancel: Optional[Callable[[], bool]] = None
     solver_progress: Optional[Callable[[int, float], None]] = None
+
+    @classmethod
+    def preview(cls, **over) -> "SimOptions":
+        """Fast, coarse settings for schedule optimisation previews — NOT
+        for final results (coarser mesh, looser tolerances, bigger steps)."""
+        kw = dict(
+            max_move_m=20.0, tol=5e-3, max_iters=20000,
+            settle_tol=4e-3, settle_max_iters=60000,
+            rate_drag_min_v=0.15, mesh_scale=3.0,
+        )
+        kw.update(over)
+        return cls(**kw)
 
 
 @dataclass
@@ -157,6 +258,8 @@ class Snapshot:
     residual_ratio: float
     warnings: List[str] = field(default_factory=list)
     label: str = ""
+    # Payout rates actually applied this substep (post-controller), m/s.
+    payout_mps: Dict[str, float] = field(default_factory=dict)
 
     def chain(self, name: str) -> Optional[ChainSnapshot]:
         for c in self.chains:
@@ -181,6 +284,11 @@ class OperationSimulator:
         self.opt = options or SimOptions()
         self._released: set = set()
         self._t = 0.0
+        self._transfer: Optional[SheaveTransfer] = None
+        self._transfer_frac = 0.0
+        # Payout rates applied in the current substep (post-controller).
+        self._applied_payout: Dict[str, float] = {}
+        self._last_snap: Optional[Snapshot] = None
 
     # -- system assembly ----------------------------------------------------
 
@@ -201,6 +309,8 @@ class OperationSimulator:
         def end_node_for(att: Attachment, endpoint_xyz) -> Tuple[Optional[int], bool]:
             """(existing node id or None, fixed?)"""
             if att.kind == "vessel":
+                return None, True
+            if att.kind == "sheave":
                 return None, True
             if att.kind == "fixed":
                 return None, True
@@ -228,13 +338,17 @@ class OperationSimulator:
         )
         for st in ordered:
             n = st.n_elems()
+            if self.opt.mesh_scale > 1.0:
+                n = max(st.min_elems, int(math.ceil(n / self.opt.mesh_scale)))
             shape = resample_polyline(st.shape, n)
             # Pin endpoint coordinates to their attachments.
-            if st.top.kind == "vessel":
-                shape[0] = self._chute_xyz(st.top)
+            if st.top.kind in ("vessel", "sheave"):
+                shape[0] = self._top_xyz(st)
             elif st.top.kind == "fixed" and st.top.xyz is not None:
                 shape[0] = st.top.xyz
-            if st.bottom.kind == "fixed" and st.bottom.xyz is not None:
+            if st.bottom.kind == "sheave":
+                shape[-1] = self._sheave_xyz(st.bottom.sheave)
+            elif st.bottom.kind == "fixed" and st.bottom.xyz is not None:
                 shape[-1] = st.bottom.xyz
             mapper = AssemblyMapper(st.assembly, st.defaults, st.mapper_direction)
             start_id, top_fixed = end_node_for(st.top, shape[0])
@@ -260,10 +374,47 @@ class OperationSimulator:
         h = att.chute_height_m if att is not None else 5.0
         return np.array([self.sc.vessel_xy[0], self.sc.vessel_xy[1], h])
 
+    def _sheave_xyz(self, name: str) -> "np.ndarray":
+        return np.asarray(self.sc.vessel_geom.sheave_xyz(
+            self.sc.vessel_xy, self.sc.vessel_heading_deg, name), dtype=float)
+
+    def _top_xyz(self, st: ChainState) -> "np.ndarray":
+        """Resolved top position for a vessel/sheave-held chain, including
+        the in-progress sheave transfer lerp."""
+        if st.top.kind == "vessel":
+            return self._chute_xyz(st.top)
+        tr = self._transfer
+        if tr is not None and tr.chain == st.name:
+            a = self._sheave_xyz(tr.from_sheave)
+            b = self._sheave_xyz(tr.to_sheave)
+            f = min(1.0, max(0.0, self._transfer_frac))
+            return a + (b - a) * f
+        return self._sheave_xyz(st.top.sheave)
+
     # -- stepping -----------------------------------------------------------
 
     def settle(self) -> Snapshot:
-        """Solve the initial equilibrium (no motion, no rate drag)."""
+        """Solve the initial equilibrium (no motion, no rate drag).
+
+        With ``coarse_settle`` a first pass runs on a ~3x coarser mesh at a
+        relaxed tolerance; its equilibrium becomes the fine-mesh seed
+        (through ``_absorb`` -> ``ChainState.shape``). The returned snapshot
+        always comes from the full-resolution, full-tolerance solve.
+        """
+        if self.opt.coarse_settle and self.opt.mesh_scale == 1.0:
+            self.opt.mesh_scale = 3.0
+            try:
+                sysm, jnode = self._build()
+                res = solve_system(
+                    sysm, self.bathy,
+                    rho_water=self.opt.rho_water, current_at=self.opt.current_at,
+                    tol=3.0 * self.opt.settle_tol,
+                    max_iters=max(1000, self.opt.settle_max_iters // 3),
+                    cancel=self.opt.cancel, progress=self.opt.solver_progress,
+                )
+                self._absorb(res, jnode)
+            finally:
+                self.opt.mesh_scale = 1.0
         sysm, jnode = self._build()
         res = solve_system(
             sysm, self.bathy,
@@ -272,7 +423,9 @@ class OperationSimulator:
             cancel=self.opt.cancel, progress=self.opt.solver_progress,
         )
         self._absorb(res, jnode)
-        return self._snapshot(res, jnode, label="settle")
+        snap = self._snapshot(res, jnode, label="settle")
+        self._last_snap = snap
+        return snap
 
     def run(self, progress: Optional[Callable[[float, str], bool]] = None) -> SimResult:
         """Run the full script. ``progress(frac, label) -> continue?``."""
@@ -281,11 +434,14 @@ class OperationSimulator:
         total_t = sum(s.duration_s for s in self.sc.steps) or 1.0
         done_t = 0.0
         for step in self.sc.steps:
+            self._apply_events(step, out)
             for name in step.release_chains:
                 self._released.add(name)
+            self._transfer = step.transfer
             n_sub = self._substeps(step)
             dt = step.duration_s / n_sub
             for k in range(n_sub):
+                self._transfer_frac = (k + 1) / n_sub
                 snap = self._advance(step, dt)
                 out.snapshots.append(snap)
                 done_t += dt
@@ -309,7 +465,60 @@ class OperationSimulator:
                     if not progress(min(1.0, done_t / total_t), step.label or ""):
                         out.aborted = True
                         return out
+            if step.transfer is not None:
+                # Transfer complete: the chain now lives on the destination
+                # sheave (the lerp already walked its top there).
+                st = self.sc.chains.get(step.transfer.chain)
+                if st is not None:
+                    st.top = Attachment("sheave", sheave=step.transfer.to_sheave)
+                self._transfer = None
         return out
+
+    def _apply_events(self, step: Step, out: SimResult):
+        """Apply the step's discrete topology changes to the scenario."""
+        for ev in step.events:
+            if ev.kind == "release":
+                self._released.add(ev.chain)
+            elif ev.kind == "set_top":
+                if ev.attachment is None:
+                    raise ValueError("set_top event needs an attachment")
+                self.sc.chains[ev.chain].top = ev.attachment
+            elif ev.kind == "add_junction":
+                if ev.junction is None:
+                    raise ValueError("add_junction event needs a junction")
+                j = ev.junction
+                if ev.at_sheave:
+                    sx, sy, _sz = self.sc.vessel_geom.sheave_xyz(
+                        self.sc.vessel_xy, self.sc.vessel_heading_deg, ev.at_sheave)
+                    j = JunctionState(j.name, (sx, sy, -abs(ev.depth_m)),
+                                      load_kN=j.load_kN, cda_m2=j.cda_m2)
+                self.sc.junctions[j.name] = j
+            elif ev.kind == "add_chain":
+                if ev.chain_state is None:
+                    raise ValueError("add_chain event needs a chain_state")
+                st = ev.chain_state
+                if st.shape is None or len(st.shape) < 2:
+                    st.shape = sagged_shape(
+                        self._resolve_end_xyz(st.top),
+                        self._resolve_end_xyz(st.bottom),
+                        max(8, st.min_elems), slack_frac=0.02,
+                    )
+                self.sc.chains[st.name] = st
+            else:
+                raise ValueError(f"Unknown event kind {ev.kind!r}")
+            if ev.label:
+                out.warnings.append(f"t={self._t:.0f} s: {ev.label}")
+
+    def _resolve_end_xyz(self, att: Attachment) -> "np.ndarray":
+        if att.kind == "vessel":
+            return self._chute_xyz(att)
+        if att.kind == "sheave":
+            return self._sheave_xyz(att.sheave)
+        if att.kind == "junction":
+            return np.asarray(self.sc.junctions[att.junction].xyz, dtype=float)
+        if att.kind == "fixed" and att.xyz is not None:
+            return np.asarray(att.xyz, dtype=float)
+        raise ValueError(f"Cannot resolve a position for attachment kind {att.kind!r}")
 
     def _substeps(self, step: Step) -> int:
         move = step.vessel_speed_mps * step.duration_s
@@ -326,36 +535,54 @@ class OperationSimulator:
         if step.vessel_speed_mps > 0:
             self.sc.vessel_heading_deg = step.vessel_course_deg
         # Pay out / haul in.
-        for name, rate in step.payout_mps.items():
+        self._applied_payout = {}
+        for name, rate in self._payout_rates(step).items():
             if name in self._released or name not in self.sc.chains:
                 continue
             st = self.sc.chains[name]
             st.length_m = max(st.target_ds_m * 2.0, st.length_m + rate * dt)
+            self._applied_payout[name] = float(rate)
         self._t += dt
 
         prev_shapes = {
             n: (st.shape.copy(), st.length_m) for n, st in self.sc.chains.items()
             if n not in self._released
         }
+        return self._equilibrate(step, dt, prev_shapes)
+
+    def _equilibrate(self, step: Step, dt: float, prev_shapes) -> Snapshot:
+        """Solve the current scenario state to equilibrium and snapshot it.
+        Subclasses may substitute a different equilibrium backend (e.g. the
+        analytic quick model) while reusing all the stepping machinery."""
         sysm, jnode = self._build()
         res = solve_system(
             sysm, self.bathy,
             rho_water=self.opt.rho_water, current_at=self.opt.current_at,
             tol=self.opt.tol, max_iters=self.opt.max_iters,
-            cancel=self.opt.cancel,
+            cancel=self.opt.cancel, progress=self.opt.solver_progress,
         )
         if self.opt.rate_drag and dt > 0:
             v = self._estimate_velocities(sysm, res, prev_shapes, dt)
-            if v is not None:
+            if v is not None and float(np.max(np.linalg.norm(v, axis=1))) >= self.opt.rate_drag_min_v:
                 res = solve_system(
                     sysm, self.bathy,
                     rho_water=self.opt.rho_water, current_at=self.opt.current_at,
                     node_velocity=v, tol=self.opt.tol, max_iters=self.opt.max_iters,
                     warm_X=res.X,
-                    cancel=self.opt.cancel,
+                    cancel=self.opt.cancel, progress=self.opt.solver_progress,
                 )
         self._absorb(res, jnode)
-        return self._snapshot(res, jnode, label=step.label)
+        snap = self._snapshot(res, jnode, label=step.label)
+        self._last_snap = snap
+        return snap
+
+    def _payout_rates(self, step: Step) -> Dict[str, float]:
+        """Effective payout rates for this substep: the step's base rates,
+        optionally redistributed by the balance controller."""
+        ctrl = self.opt.controller
+        if ctrl is None:
+            return step.payout_mps
+        return ctrl.rates(step.payout_mps, self._last_snap)
 
     def _estimate_velocities(self, sysm: CableSystem, res: SolveResult,
                              prev_shapes: Dict[str, Tuple["np.ndarray", float]],
@@ -430,4 +657,5 @@ class OperationSimulator:
             residual_ratio=res.residual_ratio,
             warnings=list(res.warnings),
             label=label,
+            payout_mps=dict(self._applied_payout),
         )
