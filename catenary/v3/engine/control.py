@@ -18,6 +18,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Optional
 
+import numpy as np
+
 from .timeline import OperationSimulator, Snapshot
 
 
@@ -53,6 +55,72 @@ class TensionBalanceController:
         out = dict(base)
         out[self.chain_a] = half + skew
         out[self.chain_b] = half - skew
+        return out
+
+
+def tdp_tension_kN(snap: Optional[Snapshot], chain: str) -> Optional[float]:
+    """Touchdown tension of ``chain`` in a snapshot: the tension at its
+    first bed-contact node. None if the chain is absent or fully suspended."""
+    if snap is None:
+        return None
+    c = snap.chain(chain)
+    if c is None:
+        return None
+    contact = np.asarray(c.contact, dtype=bool)
+    if not contact.any():
+        return None
+    i = int(np.argmax(contact))
+    t = np.asarray(c.tension_kN, dtype=float)
+    return float(t[min(i, len(t) - 1)])
+
+
+@dataclass
+class BottomTensionController:
+    """Proportional payout trim holding a chain's touchdown tension.
+
+    Each substep the chain's payout rate is trimmed around the step's base
+    rate: touchdown tension above target pays out faster (slackening the
+    span), below target pays out slower (letting the span tighten). The trim
+    is limited to ``max_trim_frac`` of the base rate, so the controller can
+    modulate a scripted payout but never reverse or stop it. Idle until the
+    chain has bed contact (e.g. the trunk before the BU nears the bed).
+    """
+
+    chain: str
+    target_kN: float
+    gain_mps_per_kN: float = 0.02
+    max_trim_frac: float = 0.5
+
+    def rates(self, base: Dict[str, float], last: Optional[Snapshot]) -> Dict[str, float]:
+        if self.chain not in base:
+            return base
+        tdp = tdp_tension_kN(last, self.chain)
+        if tdp is None:
+            return base
+        rate = base[self.chain]
+        trim = self.gain_mps_per_kN * (tdp - float(self.target_kN))
+        lim = abs(self.max_trim_frac * rate)
+        trim = max(-lim, min(lim, trim))
+        out = dict(base)
+        out[self.chain] = rate + trim
+        return out
+
+
+@dataclass
+class CompositeController:
+    """Chain several payout controllers; each sees the previous one's rates.
+
+    Controllers acting on disjoint chains compose exactly (e.g. a leg
+    :class:`TensionBalanceController` plus a trunk
+    :class:`BottomTensionController`).
+    """
+
+    controllers: list
+
+    def rates(self, base: Dict[str, float], last: Optional[Snapshot]) -> Dict[str, float]:
+        out = base
+        for c in self.controllers:
+            out = c.rates(out, last)
         return out
 
 

@@ -277,6 +277,94 @@ def test_lay_history_pickup_shortens_path():
             f"{len(p1) if p1 is not None else 0})")
 
 
+def test_to_schedule_merges_simultaneous_phases():
+    """Alternating jog / payout clicks on the same course fold into ONE
+    combined move+payout phase (smooth replay); merge=False keeps the
+    one-command-per-phase behaviour."""
+    bathy = bathy_mod.FlatBathymetry(40.0)
+    c = _controller(bathy, heading=90.0)
+    for _ in range(4):
+        c.apply(man.ManualCommand(fwd_m=10.0, label="jog"))
+        c.apply(man.ManualCommand(payout_m={"leg1": 6.0}, label="pay leg1"))
+    merged = c.to_schedule()
+    raw = c.to_schedule(merge=False)
+    _assert(len(raw) == 8, f"unmerged should keep 8 rows ({len(raw)})")
+    _assert(len(merged) == 1, f"same-course run should fold to 1 row ({len(merged)})")
+    row = merged[0]
+    _assert(row.speed_mps > 0.0 and abs(row.distance_m - 40.0) < 1e-6,
+            f"merged row must move 40 m ({row.distance_m})")
+    total_pay = row.payout_mps.get("leg1", 0.0) * row.duration_s
+    _assert(abs(total_pay - 24.0) < 1e-6,
+            f"merged row must pay the full 24 m ({total_pay:.1f})")
+    # A sharp turn breaks the group; events always stand alone.
+    c2 = _controller(bathy, heading=90.0)
+    c2.apply(man.ManualCommand(fwd_m=10.0))
+    c2.apply(man.ManualCommand(stbd_m=10.0))       # 90 deg turn
+    c2.apply(man.ManualCommand(event="transfer", label="transfer"))
+    c2.apply(man.ManualCommand(fwd_m=10.0))
+    rows = c2.to_schedule()
+    _assert(len(rows) == 4, f"turn + event must not merge ({len(rows)} rows)")
+    _assert(rows[2].event == "transfer", "event row must survive on its own")
+
+
+def test_joint_material_tracking():
+    """Joints are fixed material points: each leg's joint starts at the
+    sheave and rides out with payout; hauling back in hides it again; the
+    trunk joint appears only once more than its BU tail is paid out."""
+    bathy = bathy_mod.FlatBathymetry(40.0)
+    c = _controller(bathy, heading=90.0)   # tail_length_m=60 in the helper
+    snap0 = c.sim._last_snap
+    j0 = snap0.chain("leg1").joint_xyz
+    _assert(j0 is not None, "leg joint must exist at run start (at the sheave)")
+    _assert(j0[2] > -1.0, f"joint starts at the sheave, not deep ({j0[2]:.1f} m)")
+    # Pay 30 m: the joint rides 30 m of cable outboard -> well below surface.
+    snap = c.apply(man.ManualCommand(payout_m={"leg1": 30.0}))
+    j1 = snap.chain("leg1").joint_xyz
+    _assert(j1 is not None and j1[2] < j0[2] - 5.0,
+            f"joint must ride down with payout ({j0[2]:.1f} -> {j1[2] if j1 else None})")
+    # Haul 60 m back in: the joint is inboard again -> hidden.
+    snap = c.apply(man.ManualCommand(payout_m={"leg1": -60.0}))
+    _assert(snap.chain("leg1").joint_xyz is None,
+            "hauled-in joint must disappear (inboard)")
+    # Trunk joint: hidden until more than the 60 m tail is out.
+    c.apply(man.ManualCommand(event="transfer"))
+    snap = c.apply(man.ManualCommand(event="overboard_bu"))
+    tr = snap.chain("trunk")
+    _assert(tr is not None and tr.joint_xyz is None,
+            "trunk joint must be inboard right after overboard")
+    snap = c.apply(man.ManualCommand(payout_m={"trunk": 80.0}))
+    tr = snap.chain("trunk")
+    _assert(tr is not None and tr.joint_xyz is not None,
+            "trunk joint must appear once its tail is paid out")
+
+
+def test_overboard_takes_leg_tails_over():
+    """Overboarding the BU without paying the joints over first must still
+    take the BU tails over the side: each leg grows to joint-reference +
+    tail, so the joints can never sit ON the BU."""
+    bathy = bathy_mod.FlatBathymetry(40.0)
+    c = _controller(bathy, heading=90.0)   # tail_length_m=60 in the helper
+    L0 = float(c.sim.sc.chains["leg1"].length_m)
+    c.apply(man.ManualCommand(event="transfer"))
+    snap = c.apply(man.ManualCommand(event="overboard_bu"))
+    L1 = float(c.sim.sc.chains["leg1"].length_m)
+    _assert(abs(L1 - (L0 + 60.0)) < 1e-6,
+            f"leg must grow by its 60 m tail at overboard ({L0:.1f} -> {L1:.1f})")
+    bu = snap.junction_xyz.get("BU")
+    j = snap.chain("leg1").joint_xyz
+    _assert(bu is not None and j is not None, "BU and joint must both exist")
+    d = math.dist(j, bu)
+    _assert(d > 5.0, f"joint must not sit on the BU (d = {d:.1f} m)")
+    # When the tails were already paid out, the event is a no-op.
+    c2 = _controller(bathy, heading=90.0)
+    c2.apply(man.ManualCommand(payout_m={"leg1": 80.0, "leg2": 80.0}))
+    L0b = float(c2.sim.sc.chains["leg1"].length_m)
+    c2.apply(man.ManualCommand(event="transfer"))
+    c2.apply(man.ManualCommand(event="overboard_bu"))
+    _assert(abs(float(c2.sim.sc.chains["leg1"].length_m) - L0b) < 1e-6,
+            "pre-paid tails must not grow the leg again")
+
+
 def test_tdp_tension_reported_and_consistent():
     """The touchdown tension in the snapshot (first contact node) matches
     the model's residual bottom tension H within tolerance."""
@@ -330,6 +418,9 @@ def run_all():
         test_to_schedule_reproduces_landing_in_full_solver,
         test_lay_history_freezes_bed_cable,
         test_lay_history_pickup_shortens_path,
+        test_to_schedule_merges_simultaneous_phases,
+        test_joint_material_tracking,
+        test_overboard_takes_leg_tails_over,
         test_tdp_tension_reported_and_consistent,
         test_straight_lay_follows_course,
     ]

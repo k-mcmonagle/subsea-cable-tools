@@ -26,18 +26,30 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .control import TensionBalanceController
+from .control import (
+    BottomTensionController,
+    CompositeController,
+    TensionBalanceController,
+    tdp_tension_kN,
+)
 from .scenarios import PhaseRow, bu_full_deployment, default_bu_schedule
 from .timeline import OperationSimulator, SimOptions, SimResult
 
 
 @dataclass
 class DeploymentLimits:
-    """Operational limits checked over the preview run (0 = don't check)."""
+    """Operational limits checked over the preview run (0 = don't check).
+
+    The bottom-tension band applies to the trunk's touchdown tension over
+    the snapshots where the trunk has bed contact (i.e. from touchdown /
+    BU landing onward).
+    """
 
     max_tension_kN: float = 0.0
     min_bend_radius_m: float = 0.0
     max_leg_imbalance_kN: float = 0.0
+    min_bottom_tension_kN: float = 0.0
+    max_bottom_tension_kN: float = 0.0
 
 
 @dataclass
@@ -66,6 +78,7 @@ def _check_limits(res: SimResult, limits: DeploymentLimits, warnings: List[str])
     t_max_chain = ""
     r_min = float("inf")
     imb_max = 0.0
+    tdp_lo, tdp_hi = float("inf"), float("-inf")
     for snap in res.snapshots:
         for c in snap.chains:
             if c.top_tension_kN > t_max:
@@ -74,6 +87,10 @@ def _check_limits(res: SimResult, limits: DeploymentLimits, warnings: List[str])
         c1, c2 = snap.chain("leg1"), snap.chain("leg2")
         if c1 is not None and c2 is not None:
             imb_max = max(imb_max, abs(c1.top_tension_kN - c2.top_tension_kN))
+        tdp = tdp_tension_kN(snap, "trunk")
+        if tdp is not None:
+            tdp_lo = min(tdp_lo, tdp)
+            tdp_hi = max(tdp_hi, tdp)
     if limits.max_tension_kN > 0 and t_max > limits.max_tension_kN:
         warnings.append(
             f"Peak top tension {t_max:.1f} kN on '{t_max_chain}' exceeds the "
@@ -89,6 +106,19 @@ def _check_limits(res: SimResult, limits: DeploymentLimits, warnings: List[str])
             f"Peak leg imbalance {imb_max:.2f} kN exceeds the "
             f"{limits.max_leg_imbalance_kN:.2f} kN tolerance."
         )
+    if tdp_hi >= tdp_lo:   # trunk touched down at some point
+        if limits.min_bottom_tension_kN > 0 and tdp_lo < limits.min_bottom_tension_kN:
+            warnings.append(
+                f"Trunk touchdown tension fell to {tdp_lo:.2f} kN, below the "
+                f"{limits.min_bottom_tension_kN:.2f} kN minimum (slack lay / "
+                "loop risk)."
+            )
+        if limits.max_bottom_tension_kN > 0 and tdp_hi > limits.max_bottom_tension_kN:
+            warnings.append(
+                f"Trunk touchdown tension peaked at {tdp_hi:.2f} kN, above the "
+                f"{limits.max_bottom_tension_kN:.2f} kN maximum (suspension / "
+                "span risk)."
+            )
     if any(not s.converged for s in res.snapshots):
         n_bad = sum(1 for s in res.snapshots if not s.converged)
         warnings.append(
@@ -105,6 +135,7 @@ def optimize_bu_schedule(
     schedule: Optional[List[PhaseRow]] = None,
     limits: Optional[DeploymentLimits] = None,
     balance: bool = True,
+    bottom_tension_target_kN: Optional[float] = None,
     tol_m: float = 10.0,
     max_rounds: int = 3,
     preview_options: Optional[SimOptions] = None,
@@ -120,6 +151,12 @@ def optimize_bu_schedule(
     translated geometry, the (possibly default) schedule and preview-run
     warnings; simulate the returned set-up at full quality for final
     numbers.
+
+    ``bottom_tension_target_kN`` hangs a trunk
+    :class:`control.BottomTensionController` on the preview alongside the
+    leg balance controller: the trunk payout is trimmed each substep to
+    hold that touchdown tension during the lay-ahead. Use the
+    ``min/max_bottom_tension_kN`` limits to have excursions reported.
     """
     limits = limits or DeploymentLimits()
     p = dict(params)
@@ -160,8 +197,17 @@ def optimize_bu_schedule(
             **p,
         )
         opts = preview_options or SimOptions.preview()
-        if balance and opts.controller is None:
-            opts.controller = TensionBalanceController("leg1", "leg2")
+        if opts.controller is None:
+            ctrls = []
+            if balance:
+                ctrls.append(TensionBalanceController("leg1", "leg2"))
+            if bottom_tension_target_kN is not None:
+                ctrls.append(BottomTensionController(
+                    "trunk", float(bottom_tension_target_kN)))
+            if len(ctrls) == 1:
+                opts.controller = ctrls[0]
+            elif ctrls:
+                opts.controller = CompositeController(ctrls)
         sub_progress = None
         if progress is not None:
             base = (rounds - 1) / float(max_rounds)

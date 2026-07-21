@@ -4,23 +4,36 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Dict, List, Optional
 
+from qgis.PyQt.QtCore import QSettings
 from qgis.PyQt.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QLabel,
-    QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
+    QHBoxLayout, QLabel, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QWidget,
 )
 from qgis.core import QgsGeometry, QgsProject
 
 from ..kp_geo_utils import RouteFrame
 from ..kp_range_utils import make_distance_area
 from ..qgis_compat import (
-    BUTTON_BOX_CANCEL, BUTTON_BOX_OK, GEOMETRY_LINE, GEOMETRY_POINT,
-    ITEM_FLAG_EDITABLE, LAYER_VECTOR,
+    BUTTON_BOX_CANCEL, BUTTON_BOX_OK, DIALOG_ACCEPTED, GEOMETRY_LINE, GEOMETRY_POINT,
+    ITEM_FLAG_EDITABLE, LAYER_VECTOR, qt_exec,
 )
 
 
 GROUP_FIELDS = ("CableType", "CableCode", "ProtectionMethod", "LayVessel")
+OPERATIONS = ("Lay", "PLGR", "Plough", "ROV", "Recover")
+RPL_RULES_SETTING = "subsea_cable_tools/planner/rpl_operation_rules"
+DEFAULT_OPERATION_RULES = [
+    {"match": "PLGR", "operation": "PLGR"},
+    {"match": "PLOUGH", "operation": "Plough"},
+    {"match": "ROV", "operation": "ROV"},
+    {"match": "JET", "operation": "ROV"},
+    {"match": "RECOVER", "operation": "Recover"},
+    {"match": "BURIAL", "operation": "Plough"},
+]
 
 
 @dataclass
@@ -52,6 +65,8 @@ class RplImportDialog(QDialog):
         self.sources = _discover_sources(planner_store)
         self.segments: List[SegmentDraft] = []
         self._loading = False
+        self._operation_overrides = {}
+        self.operation_rules = _load_operation_rules()
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -68,24 +83,39 @@ class RplImportDialog(QDialog):
         for resource in self.resources:
             self.resource_combo.addItem(resource.get("name") or "Resource",
                                         resource.get("resource_id") or "")
+        self.operation_combo = QComboBox()
+        for operation in OPERATIONS:
+            self.operation_combo.addItem(operation, operation)
+        rules_widget = QWidget()
+        rules_layout = QHBoxLayout(rules_widget)
+        rules_layout.setContentsMargins(0, 0, 0, 0)
+        self.use_rules = QCheckBox("Use saved ProtectionMethod rules")
+        rules_button = QPushButton("Edit rules…")
+        rules_button.clicked.connect(self._edit_operation_rules)
+        rules_layout.addWidget(self.use_rules)
+        rules_layout.addWidget(rules_button)
+        rules_layout.addStretch(1)
         form.addRow("Source:", self.source_combo)
         form.addRow("Start KP:", self.start_spin)
         form.addRow("End KP:", self.end_spin)
         form.addRow("Task grouping:", self.group_combo)
         form.addRow("Resource:", self.resource_combo)
+        form.addRow("Operation for all sections:", self.operation_combo)
+        form.addRow("Automatic mapping:", rules_widget)
         layout.addLayout(form)
 
         layout.addWidget(QLabel(
-            "Default lay speeds by cable type (0 kn creates a manual-duration task):"))
+            "Default task speeds by cable type (0 kn creates a manual-duration task):"))
         self.speed_table = QTableWidget(0, 2)
         self.speed_table.setHorizontalHeaderLabels(["Cable type", "Speed (kn)"])
         self.speed_table.setMaximumHeight(150)
         layout.addWidget(self.speed_table)
 
         layout.addWidget(QLabel("Import preview:"))
-        self.preview = QTableWidget(0, 6)
+        self.preview = QTableWidget(0, 7)
         self.preview.setHorizontalHeaderLabels(
-            ["Task", "Start KP", "End KP", "Cable type", "Length (km)", "Speed (kn)"])
+            ["Task", "Operation", "Start KP", "End KP", "Cable type",
+             "Length (km)", "Speed (kn)"])
         layout.addWidget(self.preview, 1)
         self.status = QLabel("")
         layout.addWidget(self.status)
@@ -99,11 +129,14 @@ class RplImportDialog(QDialog):
         self.end_spin.valueChanged.connect(self._refresh_preview)
         self.group_combo.currentIndexChanged.connect(self._refresh_preview)
         self.resource_combo.currentIndexChanged.connect(self._refresh_preview)
+        self.operation_combo.currentIndexChanged.connect(self._apply_operation_to_all)
+        self.use_rules.toggled.connect(self._rules_toggled)
         self.speed_table.itemChanged.connect(self._refresh_preview)
         self._source_changed()
 
     def _source_changed(self, _index=None):
         source = self.source_combo.currentData()
+        self._operation_overrides.clear()
         self.segments = _read_segments(source) if source is not None else []
         self._loading = True
         try:
@@ -200,10 +233,19 @@ class RplImportDialog(QDialog):
                     duration_hours = 1.0
             kp_start = group[0].kp_start
             kp_end = group[-1].kp_end
-            operation = _text(_attr_ci(group[0].attrs, "ProtectionMethod"))
-            label_bits = [bit for bit in (primary_type, operation) if bit and bit != "(unspecified)"]
-            task_name = "Lay %s KP %.3f–%.3f" % (
-                " / ".join(label_bits) if label_bits else "RPL section", kp_start, kp_end)
+            group_key = _group_key(group)
+            protection = _text(_attr_ci(group[0].attrs, "ProtectionMethod"))
+            default_operation = (
+                _rule_operation(protection, self.operation_rules)
+                if self.use_rules.isChecked() else
+                self.operation_combo.currentData() or "Lay")
+            operation = self._operation_overrides.get(
+                group_key, default_operation)
+            label_bits = [bit for bit in (primary_type, protection)
+                          if bit and bit != "(unspecified)"]
+            task_name = "%s %s KP %.3f–%.3f" % (
+                operation, " / ".join(label_bits) if label_bits else "RPL section",
+                kp_start, kp_end)
             drafts.append({
                 "name": task_name, "description": "Imported from %s" % source.label,
                 "resource_id": resource_id, "speed_knots": speed_knots,
@@ -215,12 +257,14 @@ class RplImportDialog(QDialog):
                     "rpl_id": source.rpl_id, "source_layer": source.line_layer.source(),
                     "source_feature_ids": [segment.feature_id for segment in group],
                     "kp_start": kp_start, "kp_end": kp_end,
+                    "operation": operation,
                     "group_fields": {field: _text(_attr_ci(group[0].attrs, field))
                                      for field in GROUP_FIELDS},
                 },
-                "notes": "Cable type: %s" % primary_type,
+                "notes": "Operation: %s; Cable type: %s" % (operation, primary_type),
                 "kp_start": kp_start, "kp_end": kp_end,
                 "cable_type": primary_type, "length_m": total_length,
+                "operation": operation, "group_key": group_key,
             })
         return drafts
 
@@ -235,9 +279,54 @@ class RplImportDialog(QDialog):
                 draft["cable_type"], "%.3f" % (draft["length_m"] / 1000.0),
                 _number_text(draft["speed_knots"]),
             )
-            for column, value in enumerate(values):
+            self.preview.setItem(row, 0, QTableWidgetItem(values[0]))
+            operation_combo = QComboBox()
+            for operation in OPERATIONS:
+                operation_combo.addItem(operation, operation)
+            operation_combo.setCurrentIndex(max(
+                0, operation_combo.findData(draft["operation"])))
+            operation_combo.currentIndexChanged.connect(
+                lambda _index, combo=operation_combo, key=draft["group_key"]:
+                self._operation_changed(key, combo.currentData()))
+            self.preview.setCellWidget(row, 1, operation_combo)
+            for column, value in enumerate(values[1:], start=2):
                 self.preview.setItem(row, column, QTableWidgetItem(value))
         self.status.setText("%d source segment(s) → %d task(s)" % (len(self.segments), len(drafts)))
+
+    def _apply_operation_to_all(self, *_args):
+        if self._loading:
+            return
+        operation = self.operation_combo.currentData() or "Lay"
+        for group in self._groups():
+            self._operation_overrides[_group_key(group)] = operation
+        self._refresh_preview()
+
+    def _operation_changed(self, group_key, operation):
+        if self._loading:
+            return
+        self._operation_overrides[group_key] = operation or "Lay"
+        # Avoid rebuilding the combo while handling its own signal; only the
+        # generated task name needs to change immediately.
+        for row, draft in enumerate(self._drafts()):
+            if draft["group_key"] == group_key and self.preview.item(row, 0) is not None:
+                self.preview.item(row, 0).setText(draft["name"])
+                break
+
+    def _rules_toggled(self, _checked):
+        if self._loading:
+            return
+        self._operation_overrides.clear()
+        self._refresh_preview()
+
+    def _edit_operation_rules(self):
+        dialog = RplOperationRulesDialog(self.operation_rules, self)
+        if qt_exec(dialog) != DIALOG_ACCEPTED:
+            return
+        self.operation_rules = dialog.rules()
+        QSettings().setValue(RPL_RULES_SETTING, json.dumps(self.operation_rules))
+        if self.use_rules.isChecked():
+            self._operation_overrides.clear()
+            self._refresh_preview()
 
     def _accept_if_valid(self):
         if self._drafts():
@@ -247,6 +336,63 @@ class RplImportDialog(QDialog):
 
     def task_drafts(self):
         return self._drafts()
+
+
+class RplOperationRulesDialog(QDialog):
+    def __init__(self, rules, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("RPL operation mapping rules")
+        self.resize(520, 360)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "Rules are matched in order against ProtectionMethod (case-insensitive). "
+            "Unmatched sections use Lay."))
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["ProtectionMethod contains", "Operation"])
+        layout.addWidget(self.table)
+        buttons = QHBoxLayout()
+        add = QPushButton("Add")
+        add.clicked.connect(lambda: self._add_rule({"match": "", "operation": "Lay"}))
+        remove = QPushButton("Remove")
+        remove.clicked.connect(lambda: self.table.removeRow(self.table.currentRow())
+                               if self.table.currentRow() >= 0 else None)
+        defaults = QPushButton("Restore defaults")
+        defaults.clicked.connect(self._restore_defaults)
+        buttons.addWidget(add)
+        buttons.addWidget(remove)
+        buttons.addWidget(defaults)
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
+        for rule in rules:
+            self._add_rule(rule)
+        box = QDialogButtonBox(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
+        box.accepted.connect(self.accept)
+        box.rejected.connect(self.reject)
+        layout.addWidget(box)
+
+    def _add_rule(self, rule):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(str(rule.get("match") or "")))
+        combo = QComboBox()
+        for operation in OPERATIONS:
+            combo.addItem(operation, operation)
+        combo.setCurrentIndex(max(0, combo.findData(rule.get("operation") or "Lay")))
+        self.table.setCellWidget(row, 1, combo)
+
+    def _restore_defaults(self):
+        self.table.setRowCount(0)
+        for rule in DEFAULT_OPERATION_RULES:
+            self._add_rule(rule)
+
+    def rules(self):
+        rows = []
+        for row in range(self.table.rowCount()):
+            match = self.table.item(row, 0).text().strip() if self.table.item(row, 0) else ""
+            combo = self.table.cellWidget(row, 1)
+            if match:
+                rows.append({"match": match, "operation": combo.currentData() or "Lay"})
+        return rows
 
 
 def _discover_sources(planner_store) -> List[RplSource]:
@@ -404,6 +550,11 @@ def _join_geometries(geometries):
     return QgsGeometry.fromPolylineXY(points) if len(points) >= 2 else None
 
 
+def _group_key(group):
+    """Stable key for operation overrides while the preview is edited."""
+    return tuple(segment.feature_id for segment in group)
+
+
 def _point_distance(a, b):
     return ((a.x() - b.x()) ** 2 + (a.y() - b.y()) ** 2) ** 0.5
 
@@ -457,3 +608,25 @@ def _text(value):
 
 def _number_text(value):
     return ("%.4f" % float(value or 0.0)).rstrip("0").rstrip(".") or "0"
+
+
+def _load_operation_rules():
+    raw = QSettings().value(RPL_RULES_SETTING, "")
+    if raw:
+        try:
+            rows = json.loads(str(raw))
+            if isinstance(rows, list):
+                return [dict(row) for row in rows if isinstance(row, dict)]
+        except (TypeError, ValueError):
+            pass
+    return [dict(row) for row in DEFAULT_OPERATION_RULES]
+
+
+def _rule_operation(protection_method, rules):
+    text = str(protection_method or "").upper()
+    for rule in rules:
+        match = str(rule.get("match") or "").strip().upper()
+        operation = str(rule.get("operation") or "Lay")
+        if match and match in text and operation in OPERATIONS:
+            return operation
+    return "Lay"

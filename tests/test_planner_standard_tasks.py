@@ -37,9 +37,11 @@ def _task(task_id, seq, level=0):
 def test_csv_round_trip_and_validation():
     templates = [
         {"name": "Lay", "description": "Surface lay", "duration_hours": 1.0,
-         "speed_knots": 1.5, "fuel_mode": "dp", "bunker_amount": None, "notes": "n1"},
+         "operation_type": "lay", "speed_knots": 1.5, "fuel_mode": "dp",
+         "bunker_amount": None, "notes": "n1"},
         {"name": "Bunker call", "description": "", "duration_hours": 24.0,
-         "speed_knots": None, "fuel_mode": "port", "bunker_amount": 250.0, "notes": ""},
+         "operation_type": "port", "speed_knots": None, "fuel_mode": "port",
+         "bunker_amount": 250.0, "notes": ""},
     ]
     text = standard_tasks.templates_to_csv_text(templates)
     parsed, warnings = standard_tasks.templates_from_csv_text(text)
@@ -76,13 +78,15 @@ def test_insert_into_plan():
                   "start_offset_hours": 0.0}]
     table.set_plan(rows, resources, datetime(2026, 1, 1))
     template = {"name": "PLGR", "description": "Grapnel run", "duration_hours": 12.0,
-                "speed_knots": 0.8, "fuel_mode": "dp", "bunker_amount": None,
+                "operation_type": "plgr", "speed_knots": 0.8,
+                "fuel_mode": "dp", "bunker_amount": None,
                 "notes": ""}
     task_row = standard_tasks.template_to_task_row(template, "v")
     table.insert_tasks([task_row], 2)
     ok = [row["name"] for row in table.rows] == ["GROUP", "A", "PLGR", "B"]
     ok = ok and table.rows[2]["outline_level"] == 1  # indented like new siblings
     ok = ok and table.rows[2]["fuel_mode"] == "dp"
+    ok = ok and table.rows[2]["operation_type"] == "plgr"
     ok = ok and table.rows[2]["resource_id"] == "v"
     ok = ok and table.rows[2]["duration_hours"] == 12.0
     ok = ok and table.rows[2]["duration_mode"] == "manual"

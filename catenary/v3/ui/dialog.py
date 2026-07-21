@@ -1154,12 +1154,21 @@ class LaySimulatorDialog(QDialog):
         self.bf_balance.setToolTip(
             "Continuously redistributes the scheduled leg payout so the two "
             "sheave tensions stay matched, like a winch operator would.")
+        self.bf_bottom_tension = self._dspin(
+            "bf_bottom_tension_kN", 0.0, 500.0, 0.0, 0.5, 1, " kN")
+        self.bf_bottom_tension.setToolTip(
+            "Target trunk touchdown (TDP) tension. When set, a controller "
+            "trims the scheduled trunk payout each step to hold this bottom "
+            "tension once the trunk has touched down — pays out faster when "
+            "the TDP tension is high, slower when it goes slack. 0 = off "
+            "(scheduled payout used as-is).")
         fl.addRow("BU tail length — leg 1", self.bf_tail1)
         fl.addRow("BU tail length — leg 2", self.bf_tail2)
         fl.addRow("BU tail length — trunk", self.bf_tail_trunk)
         fl.addRow("Nominal pay-out rate", self.bf_payout)
         fl.addRow("Lay-ahead ship speed", self.bf_ship_speed)
         fl.addRow(self.bf_balance)
+        fl.addRow("Target TDP tension (0 = off)", self.bf_bottom_tension)
 
         # ---- Scripted-schedule area (hidden in manual mode) ----------------
         scripted = QWidget()
@@ -1169,6 +1178,8 @@ class LaySimulatorDialog(QDialog):
         self.sched_table.setHorizontalHeaderLabels(SCH_HEADERS)
         self.sched_table.setMinimumHeight(150)
         self.sched_table.itemChanged.connect(self._schedule)
+        self.sched_table.itemChanged.connect(
+            lambda *_a: self._validate_schedule_table())
         try:
             self.sched_table.horizontalHeaderItem(SCH_COL_DIST).setToolTip(
                 "Planned ship position change over the phase (the operator's "
@@ -1533,6 +1544,13 @@ class LaySimulatorDialog(QDialog):
         if not self._manual_guard():
             return
         from ..engine.manual import ManualCommand
+        if name not in set(self._manual.payable_leads()):
+            QMessageBox.information(
+                self, "Manual mode",
+                f"'{name}' can no longer be paid out — its top end is on "
+                "the BU, not a winch. Only the trunk is payable after the "
+                "BU is overboarded.")
+            return
         dl = sign * float(self.man_payout_step.value())
         verb = "Pay out" if sign > 0 else "Pick up"
         cmd = ManualCommand(payout_m={name: dl},
@@ -1636,11 +1654,16 @@ class LaySimulatorDialog(QDialog):
         # Event button availability by phase.
         self.man_transfer_btn.setEnabled(self._manual.can_transfer)
         self.man_overboard_btn.setEnabled(self._manual.can_overboard)
-        active = set(self._manual.active_leads())
+        payable = set(self._manual.payable_leads())
         for name, row in self._man_lead_rows.items():
-            on = name in active
+            on = name in payable
             row["out"].setEnabled(on)
             row["in"].setEnabled(on)
+            if not on and name in self._man_lead_rows:
+                tip = ("No winch holds this lead any more (its top end is on "
+                       "the BU) — only the trunk can be paid out.")
+                row["out"].setToolTip(tip)
+                row["in"].setToolTip(tip)
         te = self._manual.target_error()
         if te is None:
             self.man_target_lbl.setText("On target: (no target set)")
@@ -1919,6 +1942,30 @@ class LaySimulatorDialog(QDialog):
                 self._mark_cell(t, r, 1, z is None, "Depth must be a number.")
                 if d is not None:
                     prev = d
+        finally:
+            t.blockSignals(False)
+
+    def _validate_schedule_table(self):
+        """Flag leg payout entered in phases from the overboard event on:
+        those legs hang from the BU (no winch), so the engine ignores the
+        payout."""
+        t = self.sched_table
+        t.blockSignals(True)
+        try:
+            overboarded = False
+            for r in range(t.rowCount()):
+                ev_item = t.item(r, SCH_COL_EVENT)
+                ev = ev_item.text().strip().lower() if ev_item else ""
+                if "overboard" in ev:
+                    overboarded = True
+                for col in (SCH_COL_LEG1, SCH_COL_LEG2):
+                    v = _of(t.item(r, col))
+                    bad = overboarded and v is not None and v != 0.0
+                    self._mark_cell(
+                        t, r, col, bad,
+                        "Ignored at run time: from the overboard phase on "
+                        "this leg hangs from the BU — no winch holds it. "
+                        "Only the trunk can be paid out.")
         finally:
             t.blockSignals(False)
 
@@ -2248,6 +2295,7 @@ class LaySimulatorDialog(QDialog):
                 "payout_mps": float(self.bf_payout.value()) * KMH,
                 "ship_speed_mps": float(self.bf_ship_speed.value()) * KMH,
                 "balance": bool(self.bf_balance.isChecked()),
+                "bottom_tension_target_kN": float(self.bf_bottom_tension.value()),
                 "limit_mbr_m": float(self.def_mbr.value()),
                 "schedule": self._schedule_from_table() or None,
             }

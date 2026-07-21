@@ -172,8 +172,18 @@ class ManualBUController:
         return self._transfer is not None and not self._transferred
 
     def active_leads(self) -> List[str]:
-        """Chains currently payable, in a stable order (trunk last)."""
+        """Chains still in the operation (count displays), stable order
+        (trunk last)."""
         names = [n for n in self.sim.sc.chains if n not in self.sim._released]
+        return sorted(names, key=lambda n: (n == "trunk", n))
+
+    def payable_leads(self) -> List[str]:
+        """Chains a winch can actually pay out / haul in: their top end is
+        still held on board. Once the BU is overboarded the legs are topped
+        on the junction — only the trunk remains payable."""
+        names = [n for n, st in self.sim.sc.chains.items()
+                 if n not in self.sim._released
+                 and st.top.kind in ("vessel", "sheave")]
         return sorted(names, key=lambda n: (n == "trunk", n))
 
     def cable_count(self, name: str) -> float:
@@ -321,7 +331,8 @@ class ManualBUController:
 
     # -- export -------------------------------------------------------------
 
-    def to_schedule(self) -> List["object"]:
+    def to_schedule(self, merge: bool = True,
+                    course_tol_deg: float = 25.0) -> List["object"]:
         """Fold the history into :class:`scenarios.PhaseRow`s so the scripted
         full-quality simulator reproduces the manual plan.
 
@@ -329,17 +340,56 @@ class ManualBUController:
         the course, so a pure crab is approximated as a short course leg);
         pure heading-set commands with no move/payout are dropped with the
         heading carried into the next moving phase. Payout metres become rates
-        over ``distance / nominal_speed`` (or a nominal hold time)."""
+        over ``distance / nominal_speed`` (or a nominal hold time).
+
+        With ``merge`` (default), consecutive event-free commands whose move
+        directions agree within ``course_tol_deg`` (payout-only commands
+        always agree) are folded into ONE phase that moves and pays out
+        simultaneously — replaying alternating jog / payout clicks as a
+        smooth combined lay rather than a jerky one-at-a-time script.
+        """
         from .scenarios import PhaseRow
 
-        rows: List[PhaseRow] = []
+        # One entry per effective command: (dx, dy, payout, event, label).
+        parts: List[tuple] = []
         for i, cmd in enumerate(self.history, start=1):
             dx, dy = self._world_disp(cmd)
             dist = math.hypot(dx, dy)
             payout = {k: float(v) for k, v in cmd.payout_m.items() if v != 0.0}
             if dist < 1e-9 and not payout and not cmd.event:
                 continue  # pure heading change: nothing for the scripted model
-            speed = self.nominal_speed_mps
+            parts.append((dx, dy, payout, cmd.event,
+                          cmd.label or f"Manual step {i}"))
+
+        # Group runs of mergeable commands. Event rows always stand alone.
+        groups: List[List[tuple]] = []
+        for p in parts:
+            dx, dy = p[0], p[1]
+            g = groups[-1] if groups else None
+            if merge and not p[3] and g is not None and not g[-1][3]:
+                gx = sum(q[0] for q in g)
+                gy = sum(q[1] for q in g)
+                turn = 0.0
+                if math.hypot(dx, dy) > 1e-9 and math.hypot(gx, gy) > 1e-9:
+                    turn = abs(math.degrees(
+                        math.atan2(gx * dy - gy * dx, gx * dx + gy * dy)))
+                if turn <= course_tol_deg:
+                    g.append(p)
+                    continue
+            groups.append([p])
+
+        rows: List[PhaseRow] = []
+        speed = self.nominal_speed_mps
+        for g in groups:
+            dx = sum(p[0] for p in g)
+            dy = sum(p[1] for p in g)
+            dist = math.hypot(dx, dy)
+            payout: Dict[str, float] = {}
+            for p in g:
+                for k, v in p[2].items():
+                    payout[k] = payout.get(k, 0.0) + v
+            payout = {k: v for k, v in payout.items() if v != 0.0}
+            label = g[0][4] if len(g) == 1 else f"{g[0][4]} (+{len(g) - 1} steps)"
             if dist > 1e-9:
                 duration = dist / speed
                 course = math.degrees(math.atan2(dy, dx))
@@ -351,12 +401,12 @@ class ManualBUController:
                 course = None
                 spd = 0.0
             rows.append(PhaseRow(
-                label=cmd.label or f"Manual step {i}",
+                label=label,
                 duration_s=duration,
                 course_deg=course,
                 speed_mps=spd,
                 payout_mps={k: v / duration for k, v in payout.items()},
-                event=cmd.event,
+                event=g[0][3],
                 distance_m=dist,
             ))
         return rows

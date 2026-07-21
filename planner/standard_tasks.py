@@ -15,32 +15,35 @@ from typing import Dict, List, Sequence, Tuple
 
 from . import schema
 
-TEMPLATE_FIELDS = ("name", "description", "duration_hours", "speed_knots",
+TEMPLATE_FIELDS = ("name", "description", "operation_type", "duration_hours", "speed_knots",
                    "fuel_mode", "bunker_amount", "notes")
 _NUMBER_FIELDS = ("duration_hours", "speed_knots", "bunker_amount")
 _VALID_FUEL_MODES = {value for value, _label in schema.FUEL_MODES}
 _FUEL_ALIASES = {label.lower(): value for value, label in schema.FUEL_MODES}
 _FUEL_ALIASES["none"] = ""
+_VALID_OPERATIONS = {value for value, _label in schema.OPERATION_TYPES}
+_OPERATION_ALIASES = {label.lower(): value for value, label in schema.OPERATION_TYPES}
 
 
 def default_templates() -> List[Dict]:
     """Starter library shown the first time the dialog opens."""
     rows = [
-        ("Mobilisation", "Crew change, loading, and departure preparations",
+        ("Mobilisation", "Crew change, loading, and departure preparations", "mobilise",
          24.0, None, "port", None),
-        ("Transit", "Transit to or between work sites", 24.0, 10.0, "transit", None),
-        ("PLGR", "Pre-lay grapnel run along the route", 24.0, 0.8, "dp", None),
-        ("Cable lay", "Surface lay along the route", 24.0, 1.5, "dp", None),
-        ("Post-lay burial", "ROV jet burial along the route", 24.0, 0.4, "dp", None),
-        ("Joint / splice", "Jointing operations on DP or at anchor", 36.0, None, "dp", None),
-        ("Port call (bunker)", "Alongside for stores and bunkering", 24.0, None, "port", None),
-        ("Demobilisation", "Offload and demobilise", 24.0, None, "port", None),
+        ("Transit", "Transit to or between work sites", "transit", 24.0, 10.0, "transit", None),
+        ("PLGR", "Pre-lay grapnel run along the route", "plgr", 24.0, 0.8, "dp", None),
+        ("Cable lay", "Surface lay along the route", "lay", 24.0, 1.5, "dp", None),
+        ("Post-lay burial", "ROV jet burial along the route", "rov", 24.0, 0.4, "dp", None),
+        ("Joint / splice", "Jointing operations on DP or at anchor", "other", 36.0, None, "dp", None),
+        ("Port call (bunker)", "Alongside for stores and bunkering", "port", 24.0, None, "port", None),
+        ("Demobilisation", "Offload and demobilise", "demobilise", 24.0, None, "port", None),
     ]
     return [{
-        "name": name, "description": description, "duration_hours": duration,
+        "name": name, "description": description, "operation_type": operation,
+        "duration_hours": duration,
         "speed_knots": speed, "fuel_mode": fuel_mode, "bunker_amount": bunker,
         "notes": "",
-    } for name, description, duration, speed, fuel_mode, bunker in rows]
+    } for name, description, operation, duration, speed, fuel_mode, bunker in rows]
 
 
 def templates_to_json(templates: Sequence[Dict]) -> str:
@@ -94,6 +97,15 @@ def templates_from_csv_text(text: str) -> Tuple[List[Dict], List[str]]:
             continue
         template = {"name": name, "description": cell("description"),
                     "notes": cell("notes")}
+        operation = cell("operation_type").lower()
+        resolved_operation = (operation if operation in _VALID_OPERATIONS
+                              else _OPERATION_ALIASES.get(operation))
+        if resolved_operation is None:
+            resolved_operation = ""
+            if operation:
+                warnings.append("Row %d: unknown operation type '%s'."
+                                % (line_number, cell("operation_type")))
+        template["operation_type"] = resolved_operation
         for field in _NUMBER_FIELDS:
             raw_value = cell(field)
             try:
@@ -121,16 +133,23 @@ def template_to_task_row(template: Dict, resource_id: str = "", seq: int = 0) ->
         "task_id": schema.new_id(), "seq": int(seq),
         "name": str(template.get("name") or "Standard task"),
         "description": str(template.get("description") or ""),
+        "operation_type": str(template.get("operation_type") or ""),
         "is_phase": 0, "outline_level": 0, "resource_id": resource_id or "",
         "duration_mode": "manual",
         "duration_hours": 1.0 if duration is None else max(0.0, duration),
-        "predecessor_task_id": "", "lag_hours": 0.0,
+        "predecessor_task_id": "", "dependency_type": "FS", "lag_hours": 0.0,
         "speed_knots": _number(template.get("speed_knots")),
-        "direction": "forward",
+        "direction": "forward", "location_mode": "feature",
+        "location_chainage_m": None, "constraint_type": "",
+        "constraint_datetime": "", "is_milestone": 0,
         "fuel_mode": str(template.get("fuel_mode") or ""),
         "bunker_amount": _number(template.get("bunker_amount")),
         "layer_id": "", "layer_source": "", "layer_name": "", "feature_id": "",
         "feature_label": "", "geom_kind": "", "linked_ref_json": "",
+        "progress_status": "not_started", "percent_complete": 0.0,
+        "actual_start_datetime": "", "actual_finish_datetime": "",
+        "remaining_duration_hours": None, "progress_notes": "",
+        "actual_log_json": "[]", "progress_updated_utc": "",
         "created_utc": now, "modified_utc": now,
         "notes": str(template.get("notes") or ""),
     }

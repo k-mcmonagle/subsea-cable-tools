@@ -259,6 +259,101 @@ def test_quick_deployment_runs_in_seconds_and_lands():
     _assert(all(s.converged for s in res.snapshots), "quick snapshots converge")
 
 
+def test_quick_no_bed_penetration():
+    """No rendered node may sit below the seabed — a slack trunk used to sag
+    through the bed just before the BU landed (two-point catenaries carry no
+    bed test; they are clamped for display)."""
+    h = 80.0
+    bathy = bathy_mod.FlatBathymetry(h)
+    asm = _telecom_assembly(3000.0)
+    scn = sc.bu_deployment(
+        bathy, asm, asm, DEFAULTS,
+        bu_weight_kN=15.0, bu_cda_m2=1.5, leg_length_m=150.0,
+        ship_speed_mps=0.3, payout_speed_mps=0.4, target_ds_m=5.0,
+    )
+    sim = qk.QuickOperationSimulator(scn, bathy, tl.SimOptions(max_move_m=8.0))
+    res = sim.run()
+    _assert(not res.aborted, "quick run aborted")
+    worst = 0.0
+    for s in res.snapshots:
+        for c in s.chains:
+            worst = max(worst, float(np.max(-h - c.xyz[:, 2])))
+    _assert(worst < 1e-6,
+            f"cable penetrates the bed by {worst:.3f} m in some snapshot")
+
+
+def test_bottom_tension_controller_trims_payout():
+    """The TDP tension controller pays out faster above target, slower
+    below, respects the trim cap, and idles without bed contact."""
+    ctl2 = M["control"]
+
+    class _Chain:
+        def __init__(self, tdp_kN, contact=True):
+            self.contact = np.array([False, contact, contact])
+            self.tension_kN = np.array([9.9, tdp_kN, tdp_kN])
+            self.top_tension_kN = 9.9    # for the composite balance stage
+
+    class _Snap:
+        def __init__(self, tdp_kN, contact=True):
+            self._c = _Chain(tdp_kN, contact)
+
+        def chain(self, name):
+            return self._c
+
+    c = ctl2.BottomTensionController("trunk", target_kN=2.0,
+                                     gain_mps_per_kN=0.1, max_trim_frac=0.5)
+    base = {"trunk": 0.4}
+    _assert(c.rates(base, _Snap(3.0))["trunk"] > 0.4,
+            "above target must pay out faster")
+    _assert(c.rates(base, _Snap(0.5))["trunk"] < 0.4,
+            "below target must pay out slower")
+    _assert(abs(c.rates(base, _Snap(100.0))["trunk"] - 0.6) < 1e-9,
+            "trim must cap at max_trim_frac of the base rate")
+    _assert(c.rates(base, _Snap(5.0, contact=False))["trunk"] == 0.4,
+            "no bed contact -> controller idles")
+    _assert(c.rates(base, None)["trunk"] == 0.4, "no snapshot -> idle")
+    _assert(c.rates({"leg1": 0.2}, _Snap(5.0)) == {"leg1": 0.2},
+            "chains not in the base rates are untouched")
+    # Composite: balance + bottom tension act on disjoint chains.
+    comp = ctl2.CompositeController([
+        ctl2.TensionBalanceController("leg1", "leg2"),
+        c,
+    ])
+    out = comp.rates({"leg1": 0.2, "leg2": 0.2, "trunk": 0.4}, _Snap(3.0))
+    _assert(out["trunk"] > 0.4, "composite must apply the trunk controller")
+
+
+def test_payout_ignored_once_topped_on_junction():
+    """Scheduled leg payout after the BU is overboarded must be ignored (no
+    winch holds a junction-topped chain) and warned about once."""
+    bathy = bathy_mod.FlatBathymetry(40.0)
+    asm = _telecom_assembly(3000.0)
+    rows = [
+        sc.PhaseRow("hold", 30.0, 0.0, 0.0, {}),
+        sc.PhaseRow("overboard and lower", 400.0, 0.0, 0.3,
+                    {"trunk": 0.5, "leg1": 0.2}, event="overboard_bu"),
+    ]
+    scn = sc.bu_full_deployment(
+        bathy, asm, asm, asm, DEFAULTS,
+        bu_weight_kN=15.0, bu_cda_m2=1.5,
+        laid_end_1_xy=(-60.0, 140.0), laid_end_2_xy=(-60.0, -140.0),
+        schedule=rows, tail_length_m=60.0, target_ds_m=6.0,
+    )
+    sim = qk.QuickOperationSimulator(scn, bathy, tl.SimOptions(max_move_m=8.0))
+    res = sim.run()
+    _assert(not res.aborted, "run aborted")
+    warns = [w for s in res.snapshots for w in s.warnings]
+    _assert(any("Payout for 'leg1' ignored" in w for w in warns),
+            f"expected an ignored-payout warning, got {warns}")
+    _assert(sum(1 for w in warns if "leg1" in w) == 1,
+            "warning must be raised once, not every substep")
+    after = [s for s in res.snapshots if "BU" in s.junction_xyz]
+    _assert(after and all("leg1" not in s.payout_mps for s in after),
+            "no leg payout may be applied after overboard")
+    _assert(any("trunk" in s.payout_mps for s in after),
+            "trunk payout must still run")
+
+
 def test_quick_full_two_sheave_deployment():
     """The quick backend drives the bu_full script (transfer + overboard
     events, balance controller) end to end."""
@@ -310,6 +405,9 @@ def run_all():
         test_blank_segment_weight_uses_defaults,
         test_frozen_lay_peels_to_tangency,
         test_quick_deployment_runs_in_seconds_and_lands,
+        test_quick_no_bed_penetration,
+        test_bottom_tension_controller_trims_payout,
+        test_payout_ignored_once_topped_on_junction,
         test_quick_full_two_sheave_deployment,
     ]
     for test in tests:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import json
 import tempfile
 
 from qgis.core import QgsCoordinateReferenceSystem, QgsGeometry
@@ -33,12 +34,13 @@ def test_create_crud_and_meta():
         "duration_hours": 12.0, "resource_id": resources[0]["resource_id"],
     }])
     tasks = store.list_tasks(scenario_id)
-    ok = store.exists() and store.read_meta().get("schema_version") == "5"
+    ok = store.exists() and store.read_meta().get("schema_version") == "6"
     ok = ok and len(resources) == 1 and resources[0]["name"] == "Vessel 1"
     ok = ok and float(resources[0]["start_offset_hours"] or 0.0) == 0.0
     ok = ok and resources[0]["fuel_unit"] == schema.DEFAULT_FUEL_UNIT
     ok = ok and float(resources[0]["fuel_start"] or 0.0) == 0.0
     ok = ok and len(tasks) == 1 and tasks[0]["name"] == "Mobilise"
+    ok = ok and (tasks[0].get("dependency_type") or "FS") == "FS"
     store.delete_scenario(scenario_id)
     # Tasks cascade with the scenario; project-level resources survive.
     ok = ok and not store.list_scenarios() and len(store.list_resources()) == 1
@@ -64,17 +66,31 @@ def test_duplicate_independence_and_remap():
         duration_hours=1.0, source_kind="test")
     original_tasks = store.list_tasks(original_id)
     original_tasks[0].update(reference)
+    original_tasks[0].update({
+        "progress_status": "completed", "percent_complete": 100.0,
+        "actual_log_json": '[{"note":"done"}]',
+    })
     store.save_tasks(original_id, original_tasks)
+    original_scenario = store.get_scenario(original_id)
+    original_scenario["settings_json"] = json.dumps({
+        "schedule_mode": "backward", "baseline": {"tasks": []},
+    })
+    store.save_scenario(original_scenario)
     copied_id = store.duplicate_scenario(original_id, "Copy")
     copied_resources = store.list_resources()
     copied_tasks = store.list_tasks(copied_id)
     ok = store.get_scenario(copied_id)["duplicated_from_id"] == original_id
+    copied_settings = json.loads(store.get_scenario(copied_id)["settings_json"])
+    ok = ok and copied_settings.get("schedule_mode") == "backward"
+    ok = ok and "baseline" not in copied_settings
     # Resources are shared, so duplication reuses them rather than copying.
     ok = ok and len(copied_resources) == 1
     ok = ok and copied_resources[0]["resource_id"] == original_resource["resource_id"]
     ok = ok and copied_tasks[0]["task_id"] != first_id
     ok = ok and copied_tasks[1]["predecessor_task_id"] == copied_tasks[0]["task_id"]
     ok = ok and copied_tasks[0]["resource_id"] == copied_resources[0]["resource_id"]
+    ok = ok and copied_tasks[0]["progress_status"] == "not_started"
+    ok = ok and float(copied_tasks[0]["percent_complete"] or 0.0) == 0.0
     copied_geometry = store.get_task_geometry(copied_tasks[0]["task_id"])
     ok = ok and copied_geometry is not None
     ok = ok and copied_tasks[0]["feature_id"] != reference["feature_id"]
@@ -82,7 +98,7 @@ def test_duplicate_independence_and_remap():
     store.save_tasks(copied_id, copied_tasks)
     ok = ok and store.list_tasks(original_id)[0]["name"] == "A"
     store.migrate()
-    ok = ok and store.read_meta().get("schema_version") == "5"
+    ok = ok and store.read_meta().get("schema_version") == "6"
     return _result("duplicate remapping + independence + migrate no-op", ok)
 
 
@@ -105,7 +121,7 @@ def test_v2_to_v3_phase_and_resource_migration():
     store.migrate()
     migrated_resource = store.list_resources()[0]
     migrated_task = store.list_tasks(scenario_id)[0]
-    ok = store.read_meta().get("schema_version") == "5"
+    ok = store.read_meta().get("schema_version") == "6"
     ok = ok and float(migrated_resource.get("start_offset_hours") or 0.0) == 0.0
     ok = ok and int(migrated_task.get("is_phase") or 0) == 0
     ok = ok and int(migrated_task.get("outline_level") or 0) == 0
@@ -137,7 +153,7 @@ def test_v3_to_v4_fuel_migration():
     store.migrate()
     migrated_resource = store.list_resources()[0]
     migrated_task = store.list_tasks(scenario_id)[0]
-    ok = store.read_meta().get("schema_version") == "5"
+    ok = store.read_meta().get("schema_version") == "6"
     ok = ok and migrated_resource.get("fuel_unit") == schema.DEFAULT_FUEL_UNIT
     ok = ok and float(migrated_resource.get("fuel_rate_transit") or 0.0) == 0.0
     ok = ok and float(migrated_resource.get("fuel_start") or 0.0) == 0.0
@@ -167,7 +183,7 @@ def test_v4_to_v5_shared_resource_migration():
     store.write_meta("schema_version", "4")
     store.migrate()
     resources = store.list_resources()
-    ok = store.read_meta().get("schema_version") == "5"
+    ok = store.read_meta().get("schema_version") == "6"
     ok = ok and len(resources) == 1
     ok = ok and resources[0]["resource_id"] == shared["resource_id"]
     ok = ok and (resources[0].get("scenario_id") or "") == ""
@@ -178,9 +194,37 @@ def test_v4_to_v5_shared_resource_migration():
     return _result("v4→v5 shared resources + duplicate merge + task remap", ok)
 
 
+def test_v5_to_v6_advanced_task_migration():
+    store = _temp_store()
+    scenario_id = store.create_scenario("Legacy", "2026-01-01T00:00")
+    resource = store.list_resources()[0]
+    advanced_fields = {
+        "operation_type", "dependency_type", "location_mode", "location_chainage_m",
+        "constraint_type", "constraint_datetime", "is_milestone", "progress_status",
+        "percent_complete", "actual_start_datetime", "actual_finish_datetime",
+        "remaining_duration_hours", "progress_notes", "actual_log_json",
+        "progress_updated_utc",
+    }
+    old_specs = [spec for spec in schema.TASK_FIELDS if spec[0] not in advanced_fields]
+    store._write_table_rows(schema.TABLE_TASK, old_specs, [{
+        "task_id": schema.new_id(), "scenario_id": scenario_id, "seq": 0,
+        "name": "Legacy", "duration_mode": "manual", "duration_hours": 1.0,
+        "resource_id": resource["resource_id"],
+    }])
+    store.write_meta("schema_version", "5")
+    store.migrate()
+    task = store.list_tasks(scenario_id)[0]
+    ok = store.read_meta().get("schema_version") == "6"
+    ok = ok and task.get("dependency_type") == "FS"
+    ok = ok and task.get("location_mode") == "feature"
+    ok = ok and task.get("progress_status") == "not_started"
+    ok = ok and float(task.get("percent_complete") or 0.0) == 0.0
+    return _result("v5→v6 advanced schedule/progress migration", ok)
+
+
 def run_all():
     return [
         test_create_crud_and_meta(), test_duplicate_independence_and_remap(),
         test_v2_to_v3_phase_and_resource_migration(), test_v3_to_v4_fuel_migration(),
-        test_v4_to_v5_shared_resource_migration(),
+        test_v4_to_v5_shared_resource_migration(), test_v5_to_v6_advanced_task_migration(),
     ]

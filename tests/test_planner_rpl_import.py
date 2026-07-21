@@ -10,7 +10,10 @@ from qgis.core import (
     QgsFeature, QgsField, QgsGeometry, QgsProject, QgsVectorLayer,
 )
 
-from ..planner.rpl_import import RplImportDialog, RplSource, _read_segments
+from ..planner.rpl_import import (
+    DEFAULT_OPERATION_RULES, RplImportDialog, RplSource, _read_segments,
+    _rule_operation,
+)
 from ..planner.store import PlannerStore
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_STRING
 
@@ -81,6 +84,14 @@ def test_dialog_grouping_range_and_speeds():
     drafts = dialog.task_drafts()
     ok = len(drafts) == 2  # consecutive LW pair, then DA section
     ok = ok and all(abs(draft["speed_knots"] - 1.2) < 1e-9 for draft in drafts)
+    ok = ok and all(draft["operation"] == "Lay" for draft in drafts)
+    dialog.operation_combo.setCurrentIndex(dialog.operation_combo.findData("Plough"))
+    ok = ok and all(draft["operation"] == "Plough" for draft in dialog.task_drafts())
+    first_operation = dialog.preview.cellWidget(0, 1)
+    first_operation.setCurrentIndex(first_operation.findData("ROV"))
+    overridden = dialog.task_drafts()
+    ok = ok and overridden[0]["operation"] == "ROV"
+    ok = ok and overridden[1]["operation"] == "Plough"
     dialog.group_combo.setCurrentIndex(dialog.group_combo.findData("segment"))
     ok = ok and len(dialog.task_drafts()) == 3
     dialog.start_spin.setValue(dialog.start_spin.minimum() + 0.002)
@@ -90,5 +101,13 @@ def test_dialog_grouping_range_and_speeds():
     return _result("RPL grouping + speed defaults + range clipping", ok)
 
 
+def test_saved_operation_rule_matching():
+    ok = _rule_operation("Post-lay ROV jet burial", DEFAULT_OPERATION_RULES) == "ROV"
+    ok = ok and _rule_operation("Plough burial", DEFAULT_OPERATION_RULES) == "Plough"
+    ok = ok and _rule_operation("Surface lay", DEFAULT_OPERATION_RULES) == "Lay"
+    return _result("ProtectionMethod operation rules", ok)
+
+
 def run_all():
-    return [test_workbench_kp_reading(), test_dialog_grouping_range_and_speeds()]
+    return [test_workbench_kp_reading(), test_dialog_grouping_range_and_speeds(),
+            test_saved_operation_rule_matching()]

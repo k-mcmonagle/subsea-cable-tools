@@ -112,6 +112,11 @@ class ChainState:
     max_elems: int = 800
     mapper_direction: str = "from_bottom"
     transport_speed_mps: float = 0.0
+    # A joint on the line as a MATERIAL coordinate: metres of cable from the
+    # bottom (far/laid) end. Fixed for the whole operation — paying out moves
+    # the joint outboard along the span, hauling in brings it back over the
+    # sheave. None = no joint to track.
+    joint_s_from_bottom_m: Optional[float] = None
 
     def n_elems(self) -> int:
         n = int(math.ceil(self.length_m / max(self.target_ds_m, 0.1)))
@@ -140,6 +145,12 @@ class Event:
       * ``add_chain`` — add ``chain_state``; an empty ``shape`` is
         synthesised from its resolved end positions.
       * ``release`` — drop ``chain`` from the system (cast off).
+      * ``min_length`` — grow ``chain`` to at least ``length_m`` (no-op if
+        already longer). Used when material that was on deck necessarily
+        goes overboard with an event — e.g. the BU tails: overboarding the
+        BU takes each leg's tail over the side whether or not it was paid
+        out first. The label is reported only when length is actually
+        added.
     """
 
     kind: str
@@ -149,6 +160,7 @@ class Event:
     chain_state: Optional["ChainState"] = None
     at_sheave: str = ""
     depth_m: float = 2.0
+    length_m: Optional[float] = None
     label: str = ""
 
 
@@ -249,6 +261,37 @@ class ChainSnapshot:
     end_tension_kN: float
     min_radius_m: float
     length_m: float
+    # Interpolated position of the chain's joint (see ChainState.
+    # joint_s_from_bottom_m); None while the joint is still inboard.
+    joint_xyz: Optional[Tuple[float, float, float]] = None
+
+
+def joint_point(st: Optional[ChainState], xyz: "np.ndarray",
+                s: "np.ndarray") -> Optional[Tuple[float, float, float]]:
+    """Where the chain's joint sits on the solved span.
+
+    The joint is a fixed material point ``joint_s_from_bottom_m`` metres
+    from the bottom end. The material coordinate is mapped proportionally
+    onto the discretised arc (whose sampled length can fall slightly short
+    of the true deployed length), so a joint exactly at the sheave shows at
+    the top node rather than vanishing to rounding. Returns None while the
+    joint is inboard (not yet paid past the sheave) or the chain has no
+    joint.
+    """
+    if st is None or st.joint_s_from_bottom_m is None or len(s) < 2:
+        return None
+    L = float(st.length_m)
+    if L <= 0.0:
+        return None
+    frac = 1.0 - float(st.joint_s_from_bottom_m) / L
+    if frac < 0.0 or frac > 1.0:
+        return None
+    s_top = float(s[-1]) * frac
+    s = np.asarray(s, dtype=float)
+    xyz = np.asarray(xyz, dtype=float)
+    return (float(np.interp(s_top, s, xyz[:, 0])),
+            float(np.interp(s_top, s, xyz[:, 1])),
+            float(np.interp(s_top, s, xyz[:, 2])))
 
 
 @dataclass
@@ -292,6 +335,8 @@ class OperationSimulator:
         self._transfer_frac = 0.0
         # Payout rates applied in the current substep (post-controller).
         self._applied_payout: Dict[str, float] = {}
+        # Chains already warned about unactionable payout (no winch on top).
+        self._payout_warned: set = set()
         self._last_snap: Optional[Snapshot] = None
 
     # -- system assembly ----------------------------------------------------
@@ -508,6 +553,14 @@ class OperationSimulator:
                         max(8, st.min_elems), slack_frac=0.02,
                     )
                 self.sc.chains[st.name] = st
+            elif ev.kind == "min_length":
+                st = self.sc.chains.get(ev.chain)
+                need = float(ev.length_m or 0.0)
+                if st is not None and st.length_m < need - 1e-9:
+                    st.length_m = need
+                    if ev.label:
+                        out.warnings.append(f"t={self._t:.0f} s: {ev.label}")
+                continue    # label reported above only when length was added
             else:
                 raise ValueError(f"Unknown event kind {ev.kind!r}")
             if ev.label:
@@ -538,12 +591,21 @@ class OperationSimulator:
         self.sc.vessel_xy = (self.sc.vessel_xy[0] + vx * dt, self.sc.vessel_xy[1] + vy * dt)
         if step.vessel_speed_mps > 0 and not step.keep_heading:
             self.sc.vessel_heading_deg = step.vessel_course_deg
-        # Pay out / haul in.
+        # Pay out / haul in. Only chains whose top end is held on board
+        # (vessel / sheave) have a winch: once a chain has been re-topped
+        # onto a junction (the BU legs after overboard) its scheduled payout
+        # is ignored — there is nothing left holding it.
         self._applied_payout = {}
+        ignored: List[str] = []
         for name, rate in self._payout_rates(step).items():
             if name in self._released or name not in self.sc.chains:
                 continue
             st = self.sc.chains[name]
+            if st.top.kind not in ("vessel", "sheave"):
+                if abs(rate) > 1e-12 and name not in self._payout_warned:
+                    self._payout_warned.add(name)
+                    ignored.append(name)
+                continue
             st.length_m = max(st.target_ds_m * 2.0, st.length_m + rate * dt)
             self._applied_payout[name] = float(rate)
         self._t += dt
@@ -552,7 +614,14 @@ class OperationSimulator:
             n: (st.shape.copy(), st.length_m) for n, st in self.sc.chains.items()
             if n not in self._released
         }
-        return self._equilibrate(step, dt, prev_shapes)
+        snap = self._equilibrate(step, dt, prev_shapes)
+        for name in ignored:
+            snap.warnings.append(
+                f"Payout for '{name}' ignored from t={self._t:.0f} s — its "
+                f"top end is attached to "
+                f"'{self.sc.chains[name].top.junction or self.sc.chains[name].top.kind}'"
+                ", not a vessel winch (e.g. legs after the BU is overboard).")
+        return snap
 
     def _equilibrate(self, step: Step, dt: float, prev_shapes) -> Snapshot:
         """Solve the current scenario state to equilibrium and snapshot it.
@@ -648,6 +717,7 @@ class OperationSimulator:
                 end_tension_kN=c.end_tension_kN,
                 min_radius_m=c.min_radius_m,
                 length_m=float(c.s[-1]),
+                joint_xyz=joint_point(self.sc.chains.get(c.name), c.xyz, c.s),
             )
             for c in res.chains
         ]

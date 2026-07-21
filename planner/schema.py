@@ -8,7 +8,7 @@ from typing import Dict, List, Tuple
 
 from ..workbench.schema import new_id, sanitize_slug, utc_now_iso
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 TABLE_META = "pow_meta"
 TABLE_SCENARIO = "pow_scenario"
@@ -42,15 +42,24 @@ RESOURCE_FIELDS: List[FieldSpec] = [
 
 TASK_FIELDS: List[FieldSpec] = [
     ("task_id", "str"), ("scenario_id", "str"), ("seq", "int"),
-    ("name", "str"), ("description", "str"), ("is_phase", "int"),
+    ("name", "str"), ("description", "str"), ("operation_type", "str"),
+    ("is_phase", "int"),
     ("outline_level", "int"), ("resource_id", "str"),
     ("duration_mode", "str"), ("duration_hours", "float"),
-    ("predecessor_task_id", "str"), ("lag_hours", "float"),
+    ("predecessor_task_id", "str"), ("dependency_type", "str"),
+    ("lag_hours", "float"),
     ("speed_knots", "float"), ("direction", "str"),
+    ("location_mode", "str"), ("location_chainage_m", "float"),
+    ("constraint_type", "str"), ("constraint_datetime", "str"),
+    ("is_milestone", "int"),
     ("fuel_mode", "str"), ("bunker_amount", "float"), ("layer_id", "str"),
     ("layer_source", "str"), ("layer_name", "str"), ("feature_id", "str"),
     ("feature_label", "str"), ("geom_kind", "str"),
-    ("linked_ref_json", "str"), ("created_utc", "str"),
+    ("linked_ref_json", "str"), ("progress_status", "str"),
+    ("percent_complete", "float"), ("actual_start_datetime", "str"),
+    ("actual_finish_datetime", "str"), ("remaining_duration_hours", "float"),
+    ("progress_notes", "str"), ("actual_log_json", "str"),
+    ("progress_updated_utc", "str"), ("created_utc", "str"),
     ("modified_utc", "str"), ("notes", "str"),
 ]
 
@@ -89,6 +98,34 @@ DEFAULT_FUEL_UNIT = "t"
 # Per-24 h fuel rates a task can burn from its resource's profile.
 FUEL_MODES = (("", "(none)"), ("transit", "Transit"), ("dp", "DP"),
               ("anchor", "Anchor"), ("port", "Port"))
+
+OPERATION_TYPES = (
+    ("", "(unspecified)"), ("lay", "Lay"), ("plgr", "PLGR"),
+    ("plough", "Plough"), ("rov", "ROV"), ("recover", "Recover"),
+    ("transit", "Transit"), ("mobilise", "Mobilise"),
+    ("demobilise", "Demobilise"), ("port", "Port call"),
+    ("vehicle_launch", "Vehicle launch"),
+    ("vehicle_recover", "Vehicle recover"),
+    ("midwater_transit", "Mid-water transit"),
+    ("weather", "Weather/downtime"), ("other", "Other"),
+)
+
+DEPENDENCY_TYPES = (
+    ("FS", "Finish-to-start"), ("SS", "Start-to-start"),
+    ("FF", "Finish-to-finish"), ("SF", "Start-to-finish"),
+)
+
+CONSTRAINT_TYPES = (
+    ("", "(none)"), ("snet", "Start no earlier than"),
+    ("fnlt", "Finish no later than"), ("mso", "Must start on"),
+    ("mfo", "Must finish on"),
+)
+
+PROGRESS_STATUSES = (
+    ("not_started", "Not started"), ("in_progress", "In progress"),
+    ("completed", "Completed"), ("on_hold", "On hold"),
+    ("cancelled", "Cancelled"),
+)
 
 
 def default_gpkg_path(project_path: str, project_title: str = "") -> str:

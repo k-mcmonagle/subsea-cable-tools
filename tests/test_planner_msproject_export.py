@@ -37,8 +37,21 @@ def test_non_elapsed_and_blank_fields():
     return _result("plain hours + blank predecessor/resource", ok, text)
 
 
+def test_advanced_dependency_export():
+    specs = [
+        TaskSpec("a", 0, "A", "v", duration_hours=1),
+        TaskSpec("b", 1, "B", "v2", duration_hours=1,
+                 predecessor_task_id="a", dependency_type="SS", lag_hours=2),
+    ]
+    result = compute_schedule(datetime(2026, 1, 1), specs)
+    text = build_msp_tsv(result.tasks, {spec.task_id: spec for spec in specs})
+    ok = text.splitlines()[1].split("\t")[4] == "1SS+2h"
+    return _result("advanced MS Project predecessor syntax", ok, text)
+
+
 def run_all():
-    return [test_exact_tsv(), test_non_elapsed_and_blank_fields()]
+    return [test_exact_tsv(), test_non_elapsed_and_blank_fields(),
+            test_advanced_dependency_export()]
 
 
 if __name__ == "__main__":

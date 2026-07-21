@@ -114,6 +114,30 @@ class FeatureReferenceResolver:
         frame = self.route_frame(ref)
         return frame.point_at_kp(float(chainage_m or 0.0) / 1000.0, clamp=True) if frame else None
 
+    def location_point(self, ref):
+        """Resolve a point feature or an explicit position on a linked line."""
+        resolved = self.resolve(ref)
+        if resolved is None:
+            return None
+        if resolved.geom_kind == "point":
+            return self.point_at_chainage(ref, 0.0)
+        frame = self.route_frame(ref)
+        if frame is None:
+            return None
+        mode = _get(ref, "location_mode", "feature") or "feature"
+        if mode == "line_start":
+            chainage_m = 0.0
+        elif mode == "line_end":
+            chainage_m = frame.total_length_m
+        elif mode == "route_chainage":
+            try:
+                chainage_m = float(_get(ref, "location_chainage_m", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                chainage_m = 0.0
+        else:
+            return None
+        return frame.point_at_kp(chainage_m / 1000.0, clamp=True)
+
 
 def feature_reference(layer, feature, label="") -> Dict:
     geometry_type = QgsWkbTypes.geometryType(feature.geometry().wkbType())

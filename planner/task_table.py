@@ -5,11 +5,12 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime
+import json
 
 from qgis.PyQt.QtCore import QSettings, Qt, pyqtSignal
 from qgis.PyQt.QtGui import QBrush, QColor, QIcon, QPixmap
 from qgis.PyQt.QtWidgets import (
-    QComboBox, QMenu, QPushButton, QTableWidget, QTableWidgetItem,
+    QComboBox, QMenu, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
     QTableWidgetSelectionRange,
 )
 
@@ -30,29 +31,35 @@ class TaskTableWidget(QTableWidget):
     linkRequested = pyqtSignal(str)
     taskSelected = pyqtSignal(str)
     zoomRequested = pyqtSignal(str)
+    advancedRequested = pyqtSignal(str)
+    progressRequested = pyqtSignal(str)
     historyStateChanged = pyqtSignal(bool, bool)
 
     COL_NUMBER = 0
     COL_TASK = 1
-    COL_DESCRIPTION = 2
-    COL_RESOURCE = 3
-    COL_DURATION = 4
-    COL_PREDECESSOR = 5
-    COL_FEATURE = 6
-    COL_DISTANCE = 7
-    COL_SPEED = 8
-    COL_DIRECTION = 9
-    COL_FUEL_MODE = 10
-    COL_BUNKER = 11
-    COL_START = 12
-    COL_FINISH = 13
-    COL_FUEL_USED = 14
-    COL_ROB = 15
-    COL_NOTES = 16
+    COL_OPERATION = 2
+    COL_DESCRIPTION = 3
+    COL_RESOURCE = 4
+    COL_DURATION = 5
+    COL_PREDECESSOR = 6
+    COL_FEATURE = 7
+    COL_DISTANCE = 8
+    COL_SPEED = 9
+    COL_DIRECTION = 10
+    COL_FUEL_MODE = 11
+    COL_BUNKER = 12
+    COL_START = 13
+    COL_FINISH = 14
+    COL_FLOAT = 15
+    COL_FUEL_USED = 16
+    COL_ROB = 17
+    COL_PROGRESS = 18
+    COL_STATUS = 19
+    COL_NOTES = 20
 
-    HEADERS = ["#", "Task", "Description", "Resource", "Duration (h)", "Predecessor",
+    HEADERS = ["#", "Task", "Operation", "Description", "Resource", "Duration (h)", "Predecessor",
                "Linked feature", "Distance (nm)", "Speed (kn)", "Dir", "Fuel", "Bunker",
-               "Start", "Finish", "Fuel used", "Fuel ROB",
+               "Start", "Finish", "Float (h)", "Fuel used", "Fuel ROB", "Progress", "Status",
                "Notes"]
 
     def __init__(self, resolver, parent=None):
@@ -78,12 +85,18 @@ class TaskTableWidget(QTableWidget):
         self.horizontalHeaderItem(self.COL_ROB).setToolTip(
             "Read-only fuel remaining on board at the task finish "
             "(start fuel − burn + bunkers). Red when the plan runs out of fuel.")
+        self.horizontalHeaderItem(self.COL_FLOAT).setToolTip(
+            "Calculated total float. Zero-float tasks are on the critical path.")
+        self.horizontalHeaderItem(self.COL_PROGRESS).setToolTip(
+            "Actual completion recorded through Update progress… in the row context menu.")
         self.resolver = resolver
         self.rows = []
         self.resources = []
         self.collapsed_groups = set()
         self._active_task_ids = set()
         self.anchor = datetime.now().replace(second=0, microsecond=0)
+        self.schedule_mode = "forward"
+        self.resource_start_datetimes = {}
         self.schedule = compute_schedule(self.anchor, [])
         self.fuel = compute_fuel(self.schedule, {}, [])
         self._muted = False
@@ -131,10 +144,14 @@ class TaskTableWidget(QTableWidget):
                 self._user_layout = False
             finally:
                 self._header_muted = False
+        elif not self._user_layout:
+            for column in (self.COL_FLOAT, self.COL_PROGRESS, self.COL_STATUS):
+                self.setColumnHidden(column, True)
         header.sectionResized.connect(self._header_changed)
         header.sectionMoved.connect(self._header_changed)
 
-    def set_plan(self, rows, resources, anchor):
+    def set_plan(self, rows, resources, anchor, schedule_mode="forward",
+                 resource_start_datetimes=None):
         self.rows = [dict(row) for row in rows]
         for row in self.rows:
             # v3 stored explicit phases.  Keep the field for file compatibility,
@@ -144,6 +161,9 @@ class TaskTableWidget(QTableWidget):
         self._normalise_outline()
         self.resources = [dict(row) for row in resources]
         self.anchor = anchor
+        self.schedule_mode = (
+            "backward" if str(schedule_mode or "").lower() == "backward" else "forward")
+        self.resource_start_datetimes = dict(resource_start_datetimes or {})
         self.collapsed_groups.clear()
         self.clear_history()
         self._rebuild()
@@ -210,24 +230,113 @@ class TaskTableWidget(QTableWidget):
         self.anchor = anchor
         self._recompute()
 
+    def set_schedule_mode(self, schedule_mode):
+        self.schedule_mode = (
+            "backward" if str(schedule_mode or "").lower() == "backward" else "forward")
+        self._recompute()
+
+    def set_resource_start_datetimes(self, values):
+        self.resource_start_datetimes = dict(values or {})
+        self._recompute()
+
     def add_task(self):
         self.checkpoint()
-        resource_id = self.resources[0].get("resource_id", "") if self.resources else ""
-        default_speed = self.resources[0].get("default_speed_kn") if self.resources else None
+        previous = self.rows[-1] if self.rows else None
+        resource_id = ((previous or {}).get("resource_id") or
+                       (self.resources[0].get("resource_id", "") if self.resources else ""))
+        resource = next((row for row in self.resources
+                         if row.get("resource_id") == resource_id), {})
+        default_speed = resource.get("default_speed_kn")
         now = schema.utc_now_iso()
-        self.rows.append({
+        row = {
             "task_id": schema.new_id(), "seq": len(self.rows), "name": "New task",
-            "description": "", "is_phase": 0, "outline_level": 0,
+            "description": "", "operation_type": "", "is_phase": 0,
+            "outline_level": int((previous or {}).get("outline_level") or 0),
             "resource_id": resource_id, "duration_mode": "manual",
-            "duration_hours": 1.0, "predecessor_task_id": "", "lag_hours": 0.0,
+            "duration_hours": 1.0,
+            "predecessor_task_id": (previous or {}).get("task_id") or "",
+            "dependency_type": "FS",
+            "lag_hours": 0.0,
             "speed_knots": default_speed, "direction": "forward",
+            "location_mode": "feature", "location_chainage_m": None,
+            "constraint_type": "", "constraint_datetime": "", "is_milestone": 0,
             "fuel_mode": "", "bunker_amount": None, "layer_id": "",
             "layer_source": "", "layer_name": "", "feature_id": "",
             "feature_label": "", "geom_kind": "", "linked_ref_json": "",
+            "progress_status": "not_started", "percent_complete": 0.0,
+            "actual_start_datetime": "", "actual_finish_datetime": "",
+            "remaining_duration_hours": None, "progress_notes": "",
+            "actual_log_json": "[]", "progress_updated_utc": "",
             "created_utc": now, "modified_utc": now, "notes": "",
-        })
+        }
+        # Most follow-on operations happen where the preceding operation
+        # finishes.  Reusing its editable feature reference gives the new task
+        # that position/context without creating another geometry snapshot.
+        if previous is not None:
+            for key in ("layer_id", "layer_source", "layer_name", "feature_id",
+                        "feature_label", "geom_kind", "linked_ref_json"):
+                row[key] = previous.get(key) or ""
+            if row.get("linked_ref_json"):
+                try:
+                    metadata = json.loads(str(row["linked_ref_json"]))
+                    if metadata.get("owned_geometry"):
+                        metadata.pop("owned_geometry", None)
+                        metadata["referenced_task_id"] = previous.get("task_id") or ""
+                        metadata["location_reference"] = True
+                        row["linked_ref_json"] = json.dumps(metadata, sort_keys=True)
+                except (TypeError, ValueError):
+                    pass
+            row["direction"] = previous.get("direction") or "forward"
+            if previous.get("geom_kind") == "line" and not self._is_summary(len(self.rows) - 1):
+                row["location_mode"] = (
+                    "line_start" if previous.get("direction") == "reverse" else "line_end")
+                row["speed_knots"] = None
+        self.rows.append(row)
         self._rebuild()
         self.selectRow(len(self.rows) - 1)
+        self._emit_change()
+
+    def group_selected(self):
+        """Insert an editable summary row above a contiguous selected block."""
+        indices = self.selected_row_indices()
+        if not indices:
+            return
+        indices = self._include_summary_descendants(indices)
+        first, last = min(indices), max(indices)
+        if indices != list(range(first, last + 1)):
+            QMessageBox.information(
+                self, "Group tasks",
+                "Select one contiguous block of tasks to create an outline group.")
+            return
+        self.checkpoint()
+        level = min(int(self.rows[index].get("outline_level") or 0) for index in indices)
+        now = schema.utc_now_iso()
+        group = {
+            "task_id": schema.new_id(), "seq": first, "name": "New group",
+            "description": "", "operation_type": "", "is_phase": 0, "outline_level": level,
+            "resource_id": "", "duration_mode": "manual", "duration_hours": 0.0,
+            "predecessor_task_id": "", "dependency_type": "FS",
+            "lag_hours": 0.0, "speed_knots": None,
+            "direction": "forward", "fuel_mode": "", "bunker_amount": None,
+            "location_mode": "feature", "location_chainage_m": None,
+            "constraint_type": "", "constraint_datetime": "", "is_milestone": 0,
+            "layer_id": "", "layer_source": "", "layer_name": "", "feature_id": "",
+            "feature_label": "", "geom_kind": "", "linked_ref_json": "",
+            "progress_status": "not_started", "percent_complete": 0.0,
+            "actual_start_datetime": "", "actual_finish_datetime": "",
+            "remaining_duration_hours": None, "progress_notes": "",
+            "actual_log_json": "[]", "progress_updated_utc": "",
+            "created_utc": now, "modified_utc": now, "notes": "",
+        }
+        for index in indices:
+            self.rows[index]["outline_level"] = (
+                int(self.rows[index].get("outline_level") or 0) + 1)
+        self.rows.insert(first, group)
+        self._normalise_outline()
+        self._renumber()
+        self._rebuild()
+        self.selectRow(first)
+        self.editItem(self.item(first, self.COL_TASK))
         self._emit_change()
 
     def indent_selected(self, delta):
@@ -469,9 +578,23 @@ class TaskTableWidget(QTableWidget):
         for key in ("layer_id", "layer_source", "layer_name", "feature_id",
                     "feature_label", "geom_kind", "linked_ref_json"):
             task[key] = reference.get(key, "")
-        if task.get("geom_kind") == "line" and _float(task.get("speed_knots")) > 0:
+        if self.spatial_kind(task) == "line" and _float(task.get("speed_knots")) > 0:
             task["duration_mode"] = "computed"
         self.resolver.clear_cache()
+        self._rebuild()
+        row_index = next((index for index, row in enumerate(self.rows)
+                          if row.get("task_id") == task_id), -1)
+        if row_index >= 0:
+            self.selectRow(row_index)
+        self._emit_change()
+
+    def update_task_fields(self, task_id, values, record_history=True):
+        task = self.row_by_id(task_id)
+        if task is None or not values:
+            return
+        if record_history:
+            self.checkpoint()
+        task.update(dict(values))
         self._rebuild()
         row_index = next((index for index, row in enumerate(self.rows)
                           if row.get("task_id") == task_id), -1)
@@ -486,8 +609,9 @@ class TaskTableWidget(QTableWidget):
         specs = []
         for index, row in enumerate(self.rows):
             summary = self._is_summary(index)
+            spatial_kind = "" if summary else self.spatial_kind(row)
             route_length = (self.resolver.route_length_m(row)
-                            if not summary and row.get("geom_kind") == "line" else None)
+                            if spatial_kind == "line" else None)
             specs.append(TaskSpec(
                 task_id=row.get("task_id") or schema.new_id(), seq=index,
                 name=row.get("name") or "", resource_id=row.get("resource_id") or "",
@@ -496,13 +620,35 @@ class TaskTableWidget(QTableWidget):
                 predecessor_task_id=row.get("predecessor_task_id") or "",
                 lag_hours=_float(row.get("lag_hours")), speed_knots=_float(row.get("speed_knots")),
                 direction=row.get("direction") or "forward",
-                geom_kind="" if summary else row.get("geom_kind") or "",
+                geom_kind=spatial_kind,
                 route_length_m=route_length, is_phase=summary,
                 outline_level=int(row.get("outline_level") or 0),
                 fuel_mode="" if summary else row.get("fuel_mode") or "",
                 bunker_amount=0.0 if summary else _float(row.get("bunker_amount")),
+                dependency_type=row.get("dependency_type") or "FS",
+                constraint_type="" if summary else row.get("constraint_type") or "",
+                constraint_datetime=None if summary else row.get("constraint_datetime") or None,
+                is_milestone=False if summary else bool(row.get("is_milestone")),
+                location_key="" if summary else self.location_key(row),
             ))
         return specs
+
+    @staticmethod
+    def spatial_kind(task):
+        if (task.get("location_mode") or "feature") in (
+                "line_start", "line_end", "route_chainage"):
+            return "point"
+        return task.get("geom_kind") or ""
+
+    @staticmethod
+    def location_key(task):
+        feature = task.get("feature_id") or ""
+        source = task.get("layer_source") or task.get("layer_id") or ""
+        if not feature or not source:
+            return ""
+        mode = task.get("location_mode") or "feature"
+        chainage = task.get("location_chainage_m") if mode == "route_chainage" else ""
+        return "%s|%s|%s|%s" % (source, feature, mode, chainage)
 
     def _renumber(self):
         seen = set()
@@ -534,6 +680,7 @@ class TaskTableWidget(QTableWidget):
                 font = task_item.font()
                 font.setBold(summary)
                 task_item.setFont(font)
+                self._operation_combo(row_index, task, summary)
                 self._set_text(row_index, self.COL_DESCRIPTION, task.get("description"))
                 self._resource_combo(row_index, task, summary)
                 if summary:
@@ -544,7 +691,7 @@ class TaskTableWidget(QTableWidget):
                 self._predecessor_combo(row_index, task, summary)
                 self._feature_button(row_index, task, summary)
                 self._readonly_item(row_index, self.COL_DISTANCE, "")
-                if summary or task.get("geom_kind") == "point":
+                if summary or self.spatial_kind(task) == "point":
                     self._readonly_item(row_index, self.COL_SPEED, "")
                 else:
                     self._set_text(
@@ -558,8 +705,15 @@ class TaskTableWidget(QTableWidget):
                                    _display_number(task.get("bunker_amount")))
                 self._readonly_item(row_index, self.COL_START, "")
                 self._readonly_item(row_index, self.COL_FINISH, "")
+                self._readonly_item(row_index, self.COL_FLOAT, "")
                 self._readonly_item(row_index, self.COL_FUEL_USED, "")
                 self._readonly_item(row_index, self.COL_ROB, "")
+                self._readonly_item(
+                    row_index, self.COL_PROGRESS,
+                    "" if summary else "%s%%" % _display_number(task.get("percent_complete")))
+                status = dict(schema.PROGRESS_STATUSES).get(
+                    task.get("progress_status") or "not_started", "Not started")
+                self._readonly_item(row_index, self.COL_STATUS, "" if summary else status)
                 self._set_text(row_index, self.COL_NOTES, task.get("notes"))
         finally:
             self._muted = False
@@ -609,7 +763,14 @@ class TaskTableWidget(QTableWidget):
         zoom = menu.addAction("Zoom to task on map",
                               lambda: self.zoomRequested.emit(task_id))
         zoom.setEnabled(bool(task.get("feature_id")))
+        advanced = menu.addAction("Advanced task settings…",
+                                  lambda: self.advancedRequested.emit(task_id))
+        progress = menu.addAction("Update actual progress…",
+                                  lambda: self.progressRequested.emit(task_id))
+        advanced.setEnabled(not self._is_summary(row))
+        progress.setEnabled(not self._is_summary(row))
         menu.addSeparator()
+        menu.addAction("Group selected tasks", self.group_selected)
         menu.addAction("Indent (make child)", lambda: self.indent_selected(1))
         menu.addAction("Outdent (promote)", lambda: self.indent_selected(-1))
         menu.addAction("Move up", lambda: self.move_selected(-1))
@@ -694,6 +855,28 @@ class TaskTableWidget(QTableWidget):
             lambda _index, c=combo, tid=task_id: self._combo_changed(tid, "resource_id", c.currentData()))
         self.setCellWidget(row, self.COL_RESOURCE, combo)
 
+    def _operation_combo(self, row, task, summary=False):
+        combo = QComboBox()
+        combo.setEditable(True)
+        for value, label in schema.OPERATION_TYPES:
+            combo.addItem(label, value)
+        current = task.get("operation_type") or ""
+        index = combo.findData(current)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        else:
+            combo.setEditText(current)
+        combo.setEnabled(not summary)
+        task_id = task.get("task_id")
+        combo.activated.connect(
+            lambda _index, c=combo, tid=task_id: self._combo_changed(
+                tid, "operation_type", c.currentData() or c.currentText()))
+        if combo.lineEdit() is not None:
+            combo.lineEdit().editingFinished.connect(
+                lambda c=combo, tid=task_id: self._combo_changed(
+                    tid, "operation_type", c.currentData() or c.currentText()))
+        self.setCellWidget(row, self.COL_OPERATION, combo)
+
     def _predecessor_combo(self, row, task, summary=False):
         combo = QComboBox()
         combo.addItem("(anchor)", "")
@@ -719,6 +902,12 @@ class TaskTableWidget(QTableWidget):
             return
         label = task.get("feature_label") or task.get("feature_id") or "Link…"
         layer = task.get("layer_name") or ""
+        location_labels = {
+            "line_start": "start", "line_end": "end", "route_chainage": "position",
+        }
+        location = location_labels.get(task.get("location_mode") or "feature")
+        if location:
+            label = "%s (%s)" % (label, location)
         button = QPushButton((layer + " / " if layer else "") + label)
         button.clicked.connect(lambda _checked=False, tid=task.get("task_id"): self.linkRequested.emit(tid))
         if task.get("feature_id") and self.resolver.resolve(task) is None:
@@ -731,7 +920,7 @@ class TaskTableWidget(QTableWidget):
         combo.addItem("Forward", "forward")
         combo.addItem("Reverse", "reverse")
         combo.setCurrentIndex(max(0, combo.findData(task.get("direction") or "forward")))
-        combo.setEnabled(not summary and task.get("geom_kind") == "line")
+        combo.setEnabled(not summary and self.spatial_kind(task) == "line")
         task_id = task.get("task_id")
         combo.currentIndexChanged.connect(
             lambda _index, c=combo, tid=task_id: self._combo_changed(tid, "direction", c.currentData()))
@@ -788,7 +977,7 @@ class TaskTableWidget(QTableWidget):
             task[field] = item.text()
         if field == "duration_hours":
             duration = _float(task.get("duration_hours"))
-            if task.get("geom_kind") == "line" and duration > 0:
+            if self.spatial_kind(task) == "line" and duration > 0:
                 length_m = self.resolver.route_length_m(task)
                 if length_m is not None and length_m > 0:
                     task["speed_knots"] = length_m / (duration * 3600.0 * 0.514444)
@@ -804,7 +993,7 @@ class TaskTableWidget(QTableWidget):
                 task["duration_mode"] = "manual"
         elif field == "speed_knots":
             task["duration_mode"] = (
-                "computed" if task.get("geom_kind") == "line" and _float(task[field]) > 0 else "manual")
+                "computed" if self.spatial_kind(task) == "line" and _float(task[field]) > 0 else "manual")
         self._recompute()
         self._emit_change()
 
@@ -819,7 +1008,9 @@ class TaskTableWidget(QTableWidget):
             row.get("resource_id") or "": _float(row.get("start_offset_hours"))
             for row in self.resources
         }
-        self.schedule = compute_schedule(self.anchor, specs, resource_offsets)
+        self.schedule = compute_schedule(
+            self.anchor, specs, resource_offsets, self.schedule_mode,
+            self.resource_start_datetimes)
         specs_by_id = {spec.task_id: spec for spec in specs}
         self.fuel = compute_fuel(self.schedule, specs_by_id, self.resources)
         # Only lanes with a fuel profile in use get visible fuel figures.
@@ -834,6 +1025,7 @@ class TaskTableWidget(QTableWidget):
                 scheduled = by_id.get(row.get("task_id"))
                 duration_item = self.item(row_index, self.COL_DURATION)
                 distance_item = self.item(row_index, self.COL_DISTANCE)
+                float_item = self.item(row_index, self.COL_FLOAT)
                 duration_item.setToolTip("")
                 spec = specs[row_index]
                 if spec.geom_kind == "line" and spec.route_length_m is not None:
@@ -843,7 +1035,11 @@ class TaskTableWidget(QTableWidget):
                 else:
                     distance_item.setText("")
                     distance_item.setToolTip("")
-                if self._is_summary(row_index):
+                if row.get("is_milestone") and not self._is_summary(row_index):
+                    duration_item.setText("0")
+                    duration_item.setFlags(duration_item.flags() & ~ITEM_FLAG_EDITABLE)
+                    duration_item.setToolTip("Milestone (zero duration).")
+                elif self._is_summary(row_index):
                     duration_item.setText(_display_number(
                         scheduled.duration_hours if scheduled is not None else 0.0))
                     duration_item.setFlags(duration_item.flags() & ~ITEM_FLAG_EDITABLE)
@@ -874,16 +1070,27 @@ class TaskTableWidget(QTableWidget):
                     self.item(row_index, self.COL_FINISH).setText(scheduled.finish.strftime("%d/%m/%Y %H:%M"))
                     if scheduled.warning:
                         duration_item.setToolTip(scheduled.warning)
+                    float_item.setText(_display_number(scheduled.total_float_hours))
+                    float_item.setToolTip(
+                        "Critical path" if scheduled.critical else "Total float")
+                    float_item.setForeground(
+                        QBrush(QColor("#c62828")) if scheduled.critical else QBrush())
+                    task_item = self.item(row_index, self.COL_TASK)
+                    if task_item is not None and not self._is_summary(row_index):
+                        task_item.setToolTip(
+                            "Critical path task" if scheduled.critical else "")
                 self._update_fuel_cells(row_index, row, fuel_tracked)
         finally:
             self._muted = False
         self.scheduleChanged.emit(self.schedule)
 
     def _auto_size_columns(self):
-        minimums = {self.COL_RESOURCE: 110, self.COL_PREDECESSOR: 130,
+        minimums = {self.COL_OPERATION: 100, self.COL_RESOURCE: 110,
+                    self.COL_PREDECESSOR: 130,
                     self.COL_FEATURE: 150, self.COL_DIRECTION: 80,
                     self.COL_FUEL_MODE: 80, self.COL_START: 110,
-                    self.COL_FINISH: 110}
+                    self.COL_FINISH: 110, self.COL_PROGRESS: 75,
+                    self.COL_STATUS: 90}
         self._header_muted = True
         try:
             self.resizeColumnsToContents()
@@ -930,6 +1137,8 @@ class TaskTableWidget(QTableWidget):
             header.restoreState(self._default_header_state)
             for column in range(self.columnCount()):
                 self.setColumnHidden(column, False)
+            for column in (self.COL_FLOAT, self.COL_PROGRESS, self.COL_STATUS):
+                self.setColumnHidden(column, True)
         finally:
             self._header_muted = False
         self._user_layout = False

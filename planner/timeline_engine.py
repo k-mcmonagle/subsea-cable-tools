@@ -29,6 +29,11 @@ class TaskSpec:
     outline_level: int = 0
     fuel_mode: str = ""
     bunker_amount: float = 0.0
+    dependency_type: str = "FS"
+    constraint_type: str = ""
+    constraint_datetime: object = None
+    is_milestone: bool = False
+    location_key: str = ""
 
 
 @dataclass
@@ -40,6 +45,8 @@ class ScheduledTask:
     duration_hours: float
     resource_id: str = ""
     warning: str = ""
+    total_float_hours: float = 0.0
+    critical: bool = False
 
 
 @dataclass
@@ -49,6 +56,7 @@ class TimelineResult:
     span_start: Optional[datetime] = None
     span_end: Optional[datetime] = None
     errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -102,6 +110,8 @@ def _number(value, default=0.0):
 
 
 def _duration(spec: TaskSpec):
+    if spec.is_milestone:
+        return 0.0, ""
     if spec.duration_mode == "computed":
         length = _number(spec.route_length_m, -1.0)
         speed = _number(spec.speed_knots)
@@ -113,13 +123,59 @@ def _duration(spec: TaskSpec):
     return max(0.0, _number(spec.duration_hours)), ""
 
 
+def _as_datetime(value):
+    if isinstance(value, datetime):
+        return value
+    text = str(value or "").strip()
+    for pattern in ("%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M"):
+        try:
+            return datetime.strptime(text, pattern)
+        except ValueError:
+            continue
+    return None
+
+
+def _dependency_start(spec, hours, predecessor):
+    """Earliest task start imposed by one predecessor relation."""
+    lag = timedelta(hours=_number(spec.lag_hours))
+    relation = str(spec.dependency_type or "FS").upper()
+    if relation == "SS":
+        return predecessor.start + lag
+    if relation == "FF":
+        return predecessor.finish + lag - timedelta(hours=hours)
+    if relation == "SF":
+        return predecessor.start + lag - timedelta(hours=hours)
+    return predecessor.finish + lag
+
+
+def _predecessor_finish(successor_spec, predecessor_hours, successor):
+    """Latest predecessor finish imposed by one successor relation."""
+    lag = timedelta(hours=_number(successor_spec.lag_hours))
+    relation = str(successor_spec.dependency_type or "FS").upper()
+    if relation == "SS":
+        return successor.start - lag + timedelta(hours=predecessor_hours)
+    if relation == "FF":
+        return successor.finish - lag
+    if relation == "SF":
+        return successor.finish - lag + timedelta(hours=predecessor_hours)
+    return successor.start - lag
+
+
+def _warning_text(existing, message):
+    return ((existing + " ") if existing else "") + message
+
+
 def compute_schedule(anchor: datetime, tasks: Sequence[TaskSpec],
-                     resource_start_offsets: Optional[Dict[str, float]] = None) -> TimelineResult:
+                     resource_start_offsets: Optional[Dict[str, float]] = None,
+                     schedule_mode: str = "forward",
+                     resource_start_datetimes: Optional[Dict[str, object]] = None) -> TimelineResult:
     """Schedule operational tasks and derive indented summary-row spans.
 
-    Resources run concurrently, each no earlier than its configured offset from
-    the scenario anchor. Cross-resource finish-to-start links and lag are then
-    applied in the same dependency graph as same-resource links.
+    In ``forward`` mode resources run concurrently, each no earlier than its
+    configured offset from the scenario start.  In ``backward`` mode the anchor
+    is a required plan finish and tasks are placed as late as their successor,
+    resource-lane and finish-to-start constraints allow.  Resource start
+    offsets only apply to forward schedules.
     """
     specs = sorted(list(tasks), key=lambda item: (int(item.seq), item.task_id))
     result = TimelineResult(span_start=anchor, span_end=anchor)
@@ -154,35 +210,118 @@ def compute_schedule(anchor: datetime, tasks: Sequence[TaskSpec],
         ordered = work_specs
 
     scheduled = {}
-    lane_finish = {}
     resource_start_offsets = dict(resource_start_offsets or {})
-    previous = None
+    resource_start_datetimes = {
+        str(key): parsed for key, value in dict(resource_start_datetimes or {}).items()
+        for parsed in [_as_datetime(value)] if parsed is not None
+    }
+    durations = {item.task_id: _duration(item)[0] for item in work_specs}
     row_by_id = {item.task_id: index + 1 for index, item in enumerate(specs)}
-    for item in ordered:
-        hours, warning = _duration(item)
-        lane_key = item.resource_id or "__unassigned__"
-        start = anchor + timedelta(hours=max(
-            0.0, _number(resource_start_offsets.get(item.resource_id, 0.0))))
-        if cycle and previous is not None:
-            start = max(start, previous.finish)
-        elif item.predecessor_task_id in scheduled:
-            start = max(
-                start,
-                scheduled[item.predecessor_task_id].finish + timedelta(
-                    hours=_number(item.lag_hours)),
+    if str(schedule_mode or "forward").lower() == "backward":
+        # Reverse topological order makes every explicit successor available
+        # before its predecessor is positioned.  The lane cursor supplies the
+        # same implicit resource sequencing used by the forward pass.
+        lane_start = {}
+        successor_ids = {item.task_id: [] for item in work_specs}
+        for successor in work_specs:
+            if successor.predecessor_task_id in successor_ids:
+                successor_ids[successor.predecessor_task_id].append(successor.task_id)
+        next_scheduled = None
+        for item in reversed(ordered):
+            hours, warning = _duration(item)
+            lane_key = item.resource_id or "__unassigned__"
+            finish = anchor
+            if cycle and next_scheduled is not None:
+                finish = min(finish, next_scheduled.start)
+            else:
+                for successor_id in successor_ids.get(item.task_id, []):
+                    successor = scheduled.get(successor_id)
+                    if successor is None:
+                        continue
+                    successor_spec = by_id[successor_id]
+                    finish = min(
+                        finish,
+                        _predecessor_finish(successor_spec, hours, successor),
+                    )
+            if lane_key in lane_start:
+                finish = min(finish, lane_start[lane_key])
+            if item.task_id in missing:
+                warning = ((warning + " ") if warning else "") + (
+                    "Missing predecessor; scheduled to the required finish normally.")
+            constraint = _as_datetime(item.constraint_datetime)
+            constraint_type = str(item.constraint_type or "").lower()
+            if constraint is not None and constraint_type == "fnlt":
+                finish = min(finish, constraint)
+            elif constraint is not None and constraint_type == "mfo":
+                if finish < constraint:
+                    warning = _warning_text(
+                        warning, "Must-finish constraint conflicts with a successor/deadline.")
+                finish = constraint
+            start = finish - timedelta(hours=hours)
+            if constraint is not None and constraint_type == "snet" and start < constraint:
+                warning = _warning_text(
+                    warning, "Start-no-earlier constraint conflicts with a successor/deadline.")
+                start = constraint
+                finish = start + timedelta(hours=hours)
+            elif constraint is not None and constraint_type == "mso":
+                if start != constraint:
+                    warning = _warning_text(
+                        warning, "Must-start constraint overrides the calculated late start.")
+                start = constraint
+                finish = start + timedelta(hours=hours)
+            scheduled_task = ScheduledTask(
+                item.task_id, row_by_id[item.task_id], start, finish, hours,
+                item.resource_id, warning,
             )
-        if lane_key in lane_finish:
-            start = max(start, lane_finish[lane_key])
-        if item.task_id in missing:
-            warning = (warning + " " if warning else "") + "Missing predecessor; anchored normally."
-        finish = start + timedelta(hours=hours)
-        scheduled_task = ScheduledTask(
-            item.task_id, row_by_id[item.task_id], start, finish, hours,
-            item.resource_id, warning,
-        )
-        scheduled[item.task_id] = scheduled_task
-        lane_finish[lane_key] = finish
-        previous = scheduled_task
+            scheduled[item.task_id] = scheduled_task
+            lane_start[lane_key] = min(start, lane_start.get(lane_key, start))
+            next_scheduled = scheduled_task
+    else:
+        lane_finish = {}
+        previous = None
+        for item in ordered:
+            hours, warning = _duration(item)
+            lane_key = item.resource_id or "__unassigned__"
+            start = resource_start_datetimes.get(str(item.resource_id or ""))
+            if start is None:
+                start = anchor + timedelta(hours=max(
+                    0.0, _number(resource_start_offsets.get(item.resource_id, 0.0))))
+            if cycle and previous is not None:
+                start = max(start, previous.finish)
+            elif item.predecessor_task_id in scheduled:
+                start = max(start, _dependency_start(
+                    item, hours, scheduled[item.predecessor_task_id]))
+            if lane_key in lane_finish:
+                start = max(start, lane_finish[lane_key])
+            if item.task_id in missing:
+                warning = ((warning + " ") if warning else "") + (
+                    "Missing predecessor; anchored normally.")
+            constraint = _as_datetime(item.constraint_datetime)
+            constraint_type = str(item.constraint_type or "").lower()
+            if constraint is not None and constraint_type == "snet":
+                start = max(start, constraint)
+            elif constraint is not None and constraint_type == "mso":
+                if start > constraint:
+                    warning = _warning_text(
+                        warning, "Must-start constraint conflicts with a predecessor/resource.")
+                start = constraint
+            finish = start + timedelta(hours=hours)
+            if constraint is not None and constraint_type == "mfo":
+                target_start = constraint - timedelta(hours=hours)
+                if start > target_start:
+                    warning = _warning_text(
+                        warning, "Must-finish constraint conflicts with a predecessor/resource.")
+                start, finish = target_start, constraint
+            elif constraint is not None and constraint_type == "fnlt" and finish > constraint:
+                warning = _warning_text(
+                    warning, "Finish-no-later constraint is missed by the calculated schedule.")
+            scheduled_task = ScheduledTask(
+                item.task_id, row_by_id[item.task_id], start, finish, hours,
+                item.resource_id, warning,
+            )
+            scheduled[item.task_id] = scheduled_task
+            lane_finish[lane_key] = max(finish, lane_finish.get(lane_key, finish))
+            previous = scheduled_task
 
     all_scheduled = dict(scheduled)
     for index, summary in enumerate(specs):
@@ -207,11 +346,129 @@ def compute_schedule(anchor: datetime, tasks: Sequence[TaskSpec],
             (finish - start).total_seconds() / 3600.0, "", warning)
 
     result.tasks = sorted(all_scheduled.values(), key=lambda item: item.row)
-    for task in sorted(scheduled.values(), key=lambda item: item.row):
+    for task in sorted(scheduled.values(), key=lambda item: (item.start, item.row)):
         result.by_resource.setdefault(task.resource_id, []).append(task)
     result.span_start = min([anchor] + [item.start for item in result.tasks])
     result.span_end = max([anchor] + [item.finish for item in result.tasks])
+    if str(schedule_mode or "forward").lower() == "backward":
+        for task in scheduled.values():
+            available = resource_start_datetimes.get(str(task.resource_id or ""))
+            if available is not None and task.start < available:
+                message = "Task '%s' starts before its resource is available." % (
+                    by_id[task.task_id].name or task.task_id)
+                task.warning = _warning_text(task.warning, message)
+    for task in scheduled.values():
+        if task.warning:
+            result.warnings.append("%s: %s" % (
+                by_id[task.task_id].name or task.task_id, task.warning))
+    _detect_schedule_conflicts(result, scheduled, by_id)
+    _apply_total_float(result, scheduled, by_id, durations)
+    for index, summary in enumerate(specs):
+        if not summary.is_phase:
+            continue
+        descendants = []
+        level = int(summary.outline_level or 0)
+        for candidate in specs[index + 1:]:
+            if int(candidate.outline_level or 0) <= level:
+                break
+            if not candidate.is_phase and candidate.task_id in scheduled:
+                descendants.append(scheduled[candidate.task_id])
+        target = all_scheduled.get(summary.task_id)
+        if target is not None and descendants:
+            target.total_float_hours = min(item.total_float_hours for item in descendants)
+            target.critical = any(item.critical for item in descendants)
     return result
+
+
+def _apply_total_float(result, scheduled, specs_by_id, durations):
+    """Calculate CPM-style total float over explicit links and resource lanes."""
+    if not scheduled or result.span_end is None:
+        return
+    edges = []
+    explicit = set()
+    for successor in specs_by_id.values():
+        predecessor = successor.predecessor_task_id
+        if predecessor in scheduled and successor.task_id in scheduled:
+            edge = (predecessor, successor.task_id,
+                    str(successor.dependency_type or "FS").upper(),
+                    _number(successor.lag_hours))
+            edges.append(edge)
+            explicit.add((predecessor, successor.task_id))
+    lanes = {}
+    for task in scheduled.values():
+        lanes.setdefault(task.resource_id or "__unassigned__", []).append(task)
+    for lane in lanes.values():
+        lane.sort(key=lambda item: (item.start, item.row))
+        for predecessor, successor in zip(lane, lane[1:]):
+            if (predecessor.task_id, successor.task_id) not in explicit:
+                edges.append((predecessor.task_id, successor.task_id, "FS", 0.0))
+
+    latest = {
+        task_id: result.span_end - timedelta(hours=durations.get(task_id, 0.0))
+        for task_id in scheduled
+    }
+    for task_id, spec in specs_by_id.items():
+        constraint = _as_datetime(spec.constraint_datetime)
+        if constraint is None:
+            continue
+        kind = str(spec.constraint_type or "").lower()
+        if kind in ("fnlt", "mfo"):
+            latest[task_id] = min(
+                latest[task_id], constraint - timedelta(hours=durations.get(task_id, 0.0)))
+        elif kind == "mso":
+            latest[task_id] = min(latest[task_id], constraint)
+
+    for _pass in range(max(1, len(scheduled))):
+        changed = False
+        for predecessor_id, successor_id, relation, lag_hours in edges:
+            successor_start = latest[successor_id]
+            predecessor_hours = durations.get(predecessor_id, 0.0)
+            successor_hours = durations.get(successor_id, 0.0)
+            lag = timedelta(hours=lag_hours)
+            if relation == "SS":
+                allowed = successor_start - lag
+            elif relation == "FF":
+                allowed = (successor_start + timedelta(hours=successor_hours)
+                           - lag - timedelta(hours=predecessor_hours))
+            elif relation == "SF":
+                allowed = successor_start + timedelta(hours=successor_hours) - lag
+            else:
+                allowed = successor_start - lag - timedelta(hours=predecessor_hours)
+            if allowed < latest[predecessor_id]:
+                latest[predecessor_id] = allowed
+                changed = True
+        if not changed:
+            break
+    for task_id, task in scheduled.items():
+        value = max(0.0, (latest[task_id] - task.start).total_seconds() / 3600.0)
+        task.total_float_hours = value
+        task.critical = value <= 1e-6
+
+
+def _detect_schedule_conflicts(result, scheduled, specs_by_id):
+    """Report resource overlaps and simultaneous work at the same location."""
+    tasks = sorted(scheduled.values(), key=lambda item: (item.start, item.row))
+    for index, first in enumerate(tasks):
+        if first.finish <= first.start:
+            continue
+        for second in tasks[index + 1:]:
+            if second.start >= first.finish:
+                break
+            if second.finish <= second.start:
+                continue
+            first_spec = specs_by_id[first.task_id]
+            second_spec = specs_by_id[second.task_id]
+            if first.resource_id == second.resource_id:
+                result.warnings.append(
+                    "Resource conflict: '%s' overlaps '%s'." % (
+                        first_spec.name or first.task_id,
+                        second_spec.name or second.task_id))
+            elif (first_spec.location_key and
+                  first_spec.location_key == second_spec.location_key):
+                result.warnings.append(
+                    "SIMOPS review: '%s' and '%s' overlap at the same linked location." % (
+                        first_spec.name or first.task_id,
+                        second_spec.name or second.task_id))
 
 
 def compute_fuel(result: TimelineResult, specs_by_id: Dict[str, TaskSpec],

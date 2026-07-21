@@ -525,9 +525,12 @@ def run_optimize(cfg: V3Config, progress: Optional[Callable[[float, str], bool]]
         current_at=(current.velocity_at if current else None),
         cancel=cancel,
     )
+    btt = float(op.get("bottom_tension_target_kN", 0.0) or 0.0)
     try:
         res = sopt.optimize_bu_schedule(
             bathy, params, target, schedule=schedule, limits=limits,
+            balance=bool(op.get("balance", True)),
+            bottom_tension_target_kN=(btt if btt > 0.0 else None),
             preview_options=popts, progress=progress,
         )
     except (ValueError, KeyError) as exc:
@@ -700,8 +703,17 @@ def run_operation(cfg: V3Config, progress: Optional[Callable[[float, str], bool]
             rate_drag=bool(cfg.op.get("rate_drag", True)),
             cancel=cancel,
         )
-    if cfg.scenario == "bu_full" and bool(cfg.op.get("balance", True)):
-        opts.controller = ctl.TensionBalanceController("leg1", "leg2")
+    if cfg.scenario == "bu_full":
+        ctrls = []
+        if bool(cfg.op.get("balance", True)):
+            ctrls.append(ctl.TensionBalanceController("leg1", "leg2"))
+        btt = float(cfg.op.get("bottom_tension_target_kN", 0.0) or 0.0)
+        if btt > 0.0:
+            ctrls.append(ctl.BottomTensionController("trunk", btt))
+        if len(ctrls) == 1:
+            opts.controller = ctrls[0]
+        elif ctrls:
+            opts.controller = ctl.CompositeController(ctrls)
     if quality == "quick":
         if cfg.scenario not in ("bu_deployment", "bu_full"):
             return RunOutput(
@@ -862,6 +874,24 @@ def _result_scene(cfg: V3Config, bathy, res: s3d.SolveResult, vessel_xy=(0.0, 0.
     return scene
 
 
+_JOINT_LABELS = {"leg1": "Leg 1 joint", "leg2": "Leg 2 joint",
+                 "trunk": "Trunk joint"}
+
+
+def _joint_markers(snap) -> List[Marker]:
+    """Joint markers from the engine's material-coordinate tracking: each
+    chain snapshot carries ``joint_xyz`` from the moment its joint passes
+    the sheave (legs from the start of payout, the trunk once more than its
+    BU tail is paid out) — see ``ChainState.joint_s_from_bottom_m``."""
+    out: List[Marker] = []
+    for c in snap.chains:
+        j = getattr(c, "joint_xyz", None)
+        if j is not None:
+            out.append(Marker(tuple(j), _JOINT_LABELS.get(c.name, f"{c.name} joint"),
+                              "joint", color="#9467bd", size=7.0))
+    return out
+
+
 def snapshot_scene(snap, bed: BedGrid, title: str = "", cfg: Optional[V3Config] = None) -> SceneData:
     scene = SceneData(title=title or (snap.label or ""))
     scene.bed = bed
@@ -876,6 +906,7 @@ def snapshot_scene(snap, bed: BedGrid, title: str = "", cfg: Optional[V3Config] 
         ))
     for name, xyz in snap.junction_xyz.items():
         scene.markers.append(Marker(tuple(xyz), name, "junction"))
+    scene.markers.extend(_joint_markers(snap))
     # Timeline headings are already in the engine math frame.
     if cfg is not None:
         # Two-sheave scenes attach the cables at the sheaves, so the hull

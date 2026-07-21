@@ -25,14 +25,26 @@ def build_msp_tsv(scheduled_tasks: Sequence, specs_by_id: Dict[str, object],
         spec = specs_by_id.get(task.task_id)
         name = _get(spec, "name", task.task_id)
         predecessor = _get(spec, "predecessor_task_id", "")
+        dependency_type = str(_get(spec, "dependency_type", "FS") or "FS").upper()
+        try:
+            lag_hours = float(_get(spec, "lag_hours", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            lag_hours = 0.0
         resource_id = _get(spec, "resource_id", task.resource_id)
         resource = resources_by_id.get(resource_id)
         resource_name = _get(resource, "name", resource_id)
         duration = ("%.6f" % float(task.duration_hours)).rstrip("0").rstrip(".") or "0"
+        predecessor_text = ""
+        if predecessor in row_numbers:
+            predecessor_text = str(row_numbers[predecessor])
+            if dependency_type != "FS":
+                predecessor_text += dependency_type
+            if abs(lag_hours) > 1e-9:
+                predecessor_text += "%+.6gh" % lag_hours
         columns = [
             _clean(name), duration + suffix, task.start.strftime(MSP_DATE_FMT),
             task.finish.strftime(MSP_DATE_FMT),
-            str(row_numbers[predecessor]) if predecessor in row_numbers else "",
+            predecessor_text,
             _clean(resource_name),
         ]
         lines.append("\t".join(columns))

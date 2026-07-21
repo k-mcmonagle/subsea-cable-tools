@@ -126,6 +126,7 @@ def main() -> int:
         ("planner store", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_planner_store")),
         ("planner feature references", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_planner_feature_ref")),
         ("planner RPL import", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_planner_rpl_import")),
+        ("planner task table", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_planner_task_table")),
         ("planner spatial task tools", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_planner_spatial_tasks")),
         ("planner standard tasks", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_planner_standard_tasks")),
         ("cable lay QC engine", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_laydata_qc")),

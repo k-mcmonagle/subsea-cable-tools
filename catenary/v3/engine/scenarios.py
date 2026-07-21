@@ -496,6 +496,7 @@ def bu_full_deployment(
             geom.sheave_xyz(vessel_xy, vessel_heading_deg, name), dtype=float)
 
     chains: Dict[str, ChainState] = {}
+    leg_len0: Dict[int, float] = {}
     for i, (asm, end_xy, dep) in enumerate(
         ((leg1_assembly, laid_end_1_xy, leg1_deployed_m),
          (leg2_assembly, laid_end_2_xy, leg2_deployed_m)), start=1,
@@ -518,7 +519,12 @@ def bu_full_deployment(
             bottom=Attachment("fixed", xyz=end_xyz),
             shape=shape,
             target_ds_m=target_ds_m,
+            # The leg-to-BU-tail joint has just been made up on deck, so it
+            # sits at the sheave: its material position from the laid end is
+            # the deployed length right now, and it stays there for good.
+            joint_s_from_bottom_m=length,
         )
+        leg_len0[i] = length
 
     depth0 = float(bathy.depth_at(*vessel_xy))
     rows = schedule if schedule is not None else default_bu_schedule(
@@ -532,6 +538,7 @@ def bu_full_deployment(
     # (its start position depends on the vessel position at that moment).
     sheave_h = geom.sheaves["port"].height_m
     trunk_len0 = (sheave_h + bu_spawn_depth_m) * (1.0 + max(0.0, trunk_slack_pct) / 100.0)
+    tail_trunk = float(tail_trunk_m if tail_trunk_m is not None else tail_length_m)
 
     def overboard_events() -> List[Event]:
         trunk = ChainState(
@@ -544,7 +551,13 @@ def bu_full_deployment(
             shape=np.zeros((0, 3)),      # synthesised at apply time
             target_ds_m=max(2.0, target_ds_m / 2.0),
             min_elems=30,
+            # The trunk joint sits its tail length up the trunk from the BU
+            # (the trunk's bottom end); it emerges over the sheave once
+            # more than the tail has been paid out.
+            joint_s_from_bottom_m=tail_trunk,
         )
+        t1 = float(tail_leg1_m if tail_leg1_m is not None else tail_length_m)
+        t2 = float(tail_leg2_m if tail_leg2_m is not None else tail_length_m)
         return [
             Event(
                 kind="add_junction",
@@ -558,6 +571,16 @@ def bu_full_deployment(
                   attachment=Attachment("junction", junction="BU")),
             Event(kind="set_top", chain="leg2",
                   attachment=Attachment("junction", junction="BU")),
+            # The BU tails are between each joint and the BU: overboarding
+            # the BU necessarily takes them over the side, so each leg must
+            # contain at least joint-reference + tail of cable. No-op when
+            # the pay-joints phase already paid the tails out.
+            Event(kind="min_length", chain="leg1",
+                  length_m=leg_len0[1] + t1,
+                  label=f"leg 1 tail ({t1:.0f} m) followed the BU overboard"),
+            Event(kind="min_length", chain="leg2",
+                  length_m=leg_len0[2] + t2,
+                  label=f"leg 2 tail ({t2:.0f} m) followed the BU overboard"),
         ]
 
     steps: List[Step] = []

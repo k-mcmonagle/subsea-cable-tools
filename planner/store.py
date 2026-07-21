@@ -239,6 +239,13 @@ class PlannerStore:
         now = schema.utc_now_iso()
         new_scenario_id = schema.new_id()
         copied_scenario = dict(original)
+        try:
+            copied_settings = json.loads(str(copied_scenario.get("settings_json") or "{}"))
+            if isinstance(copied_settings, dict):
+                copied_settings.pop("baseline", None)
+                copied_scenario["settings_json"] = json.dumps(copied_settings, sort_keys=True)
+        except (TypeError, ValueError):
+            copied_scenario["settings_json"] = "{}"
         copied_scenario.update({
             "scenario_id": new_scenario_id, "name": new_name,
             "duplicated_from_id": scenario_id, "created_utc": now, "modified_utc": now,
@@ -252,6 +259,10 @@ class PlannerStore:
                 "task_id": task_map[row["task_id"]], "scenario_id": new_scenario_id,
                 "predecessor_task_id": task_map.get(row.get("predecessor_task_id"), ""),
                 "created_utc": now, "modified_utc": now,
+                "progress_status": "not_started", "percent_complete": 0.0,
+                "actual_start_datetime": "", "actual_finish_datetime": "",
+                "remaining_duration_hours": None, "progress_notes": "",
+                "actual_log_json": "[]", "progress_updated_utc": "",
             })
             geometry = self.get_task_geometry(row["task_id"])
             if geometry is not None:
@@ -539,5 +550,27 @@ def _migrate_4_to_5(store: PlannerStore) -> None:
         store.sync_geometry_attributes(tasks)
 
 
+def _migrate_5_to_6(store: PlannerStore) -> None:
+    """v5 -> v6: advanced scheduling, explicit locations, and actual progress."""
+    tasks = store.read_table(schema.TABLE_TASK)
+    for task in tasks:
+        task.setdefault("operation_type", "")
+        task.setdefault("dependency_type", "FS")
+        task.setdefault("location_mode", "feature")
+        task.setdefault("location_chainage_m", None)
+        task.setdefault("constraint_type", "")
+        task.setdefault("constraint_datetime", "")
+        task.setdefault("is_milestone", 0)
+        task.setdefault("progress_status", "not_started")
+        task.setdefault("percent_complete", 0.0)
+        task.setdefault("actual_start_datetime", "")
+        task.setdefault("actual_finish_datetime", "")
+        task.setdefault("remaining_duration_hours", None)
+        task.setdefault("progress_notes", "")
+        task.setdefault("actual_log_json", "[]")
+        task.setdefault("progress_updated_utc", "")
+    store._write_table_rows(schema.TABLE_TASK, schema.TASK_FIELDS, tasks)
+
+
 MIGRATIONS = {1: _migrate_1_to_2, 2: _migrate_2_to_3, 3: _migrate_3_to_4,
-              4: _migrate_4_to_5}
+              4: _migrate_4_to_5, 5: _migrate_5_to_6}

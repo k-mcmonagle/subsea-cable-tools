@@ -80,6 +80,70 @@ def test_cycle_fallback():
     return _result("cycle fallback", ok)
 
 
+def test_backward_from_required_finish():
+    required_finish = datetime(2026, 1, 2, 12, 0)
+    specs = [
+        TaskSpec("a", 0, "Prep", "v1", duration_hours=2),
+        TaskSpec("b", 1, "Install", "v1", duration_hours=1,
+                 predecessor_task_id="a", lag_hours=1),
+        TaskSpec("c", 2, "Support vessel", "v2", duration_hours=4),
+    ]
+    result = compute_schedule(required_finish, specs, schedule_mode="backward")
+    by_id = {task.task_id: task for task in result.tasks}
+    ok = by_id["b"].finish == required_finish
+    ok = ok and by_id["b"].start == required_finish - timedelta(hours=1)
+    ok = ok and by_id["a"].finish == required_finish - timedelta(hours=2)
+    ok = ok and by_id["a"].start == required_finish - timedelta(hours=4)
+    ok = ok and by_id["c"].start == required_finish - timedelta(hours=4)
+    ok = ok and result.span_start == required_finish - timedelta(hours=4)
+    ok = ok and result.span_end == required_finish
+    return _result("backward schedule from required finish", ok)
+
+
+def test_advanced_links_constraints_resource_dates_and_float():
+    anchor = datetime(2026, 1, 1)
+    specs = [
+        TaskSpec("a", 0, "Main", "v1", duration_hours=4),
+        TaskSpec("ss", 1, "SS", "v2", duration_hours=2,
+                 predecessor_task_id="a", lag_hours=1, dependency_type="SS"),
+        TaskSpec("ff", 2, "FF", "v3", duration_hours=1,
+                 predecessor_task_id="a", lag_hours=1, dependency_type="FF"),
+        TaskSpec("late", 3, "Constrained", "v4", duration_hours=2,
+                 constraint_type="snet", constraint_datetime=anchor + timedelta(hours=8)),
+        TaskSpec("available", 4, "Availability", "v5", duration_hours=1),
+        TaskSpec("milestone", 5, "Milestone", "v6", duration_hours=99,
+                 is_milestone=True),
+    ]
+    result = compute_schedule(
+        anchor, specs, resource_start_datetimes={"v5": anchor + timedelta(hours=6)})
+    by_id = {task.task_id: task for task in result.tasks}
+    ok = by_id["ss"].start == anchor + timedelta(hours=1)
+    ok = ok and by_id["ff"].finish == anchor + timedelta(hours=5)
+    ok = ok and by_id["late"].start == anchor + timedelta(hours=8)
+    ok = ok and by_id["available"].start == anchor + timedelta(hours=6)
+    ok = ok and by_id["milestone"].duration_hours == 0.0
+
+    critical = compute_schedule(anchor, [
+        TaskSpec("p", 0, "Path 1", "v1", duration_hours=2),
+        TaskSpec("q", 1, "Path 2", "v1", duration_hours=2),
+        TaskSpec("short", 2, "Short", "v2", duration_hours=1),
+    ])
+    critical_by_id = {task.task_id: task for task in critical.tasks}
+    ok = ok and critical_by_id["p"].critical and critical_by_id["q"].critical
+    ok = ok and abs(critical_by_id["short"].total_float_hours - 3.0) < 1e-9
+    return _result("advanced links + constraints + resource dates + critical float", ok)
+
+
+def test_simops_same_location_warning():
+    anchor = datetime(2026, 1, 1)
+    result = compute_schedule(anchor, [
+        TaskSpec("a", 0, "Vessel A", "v1", duration_hours=2, location_key="route|7|end"),
+        TaskSpec("b", 1, "Vessel B", "v2", duration_hours=1, location_key="route|7|end"),
+    ])
+    ok = any("SIMOPS review" in warning for warning in result.warnings)
+    return _result("same-location concurrent work raises SIMOPS review", ok)
+
+
 def test_position_fraction_reverse_and_hold():
     anchor = datetime(2026, 1, 1)
     specs = [
@@ -135,7 +199,10 @@ def run_all():
     return [
         test_duration_resolution(), test_dependencies_resources_and_lag(),
         test_resource_starts_cross_vessel_links_and_outline_summary(),
-        test_cycle_fallback(), test_position_fraction_reverse_and_hold(),
+        test_cycle_fallback(), test_backward_from_required_finish(),
+        test_advanced_links_constraints_resource_dates_and_float(),
+        test_simops_same_location_warning(),
+        test_position_fraction_reverse_and_hold(),
         test_fuel_burn_bunker_and_warnings(),
     ]
 

@@ -51,6 +51,7 @@ from .timeline import (
     OperationSimulator,
     Snapshot,
     Step,
+    joint_point,
 )
 
 
@@ -161,6 +162,21 @@ def tangent_catenary(D: float, h: float, w: float) -> Tuple[float, float, float]
 # enough that a taut trunk stretches only centimetres under a BU load, low
 # enough for stable Newton steps with finite-difference Jacobians.
 TAUT_K_PER_W = 1.0e4
+
+
+def clamp_to_bed(xyz: "np.ndarray", bathy) -> Tuple["np.ndarray", "np.ndarray"]:
+    """Clamp nodes that dipped below the seabed up onto it.
+
+    Display-level bed contact for spans solved without a bed test (the
+    two-point catenaries): the force balance is unchanged, but a rendered
+    polyline never penetrates the bed. Returns ``(xyz, clamped_mask)``.
+    """
+    xyz = np.asarray(xyz, dtype=float).copy()
+    bed = -np.asarray(bathy.depth_at(xyz[:, 0], xyz[:, 1]), dtype=float)
+    below = xyz[:, 2] < bed
+    if np.any(below):
+        xyz[below, 2] = bed[below]
+    return xyz, below
 
 
 def two_point_catenary(p0: "np.ndarray", p1: "np.ndarray", L: float, w: float,
@@ -283,9 +299,9 @@ def leg_solution(p_top: "np.ndarray", anchor_xy: Tuple[float, float],
         # Too short to touch down tangentially: free span to the anchor.
         cat = two_point_catenary(p_top, np.array([ax, ay, anchor_z]), L, w,
                                  n=n_susp)
-        contact = np.zeros(len(cat["xyz"]), dtype=bool)
+        xyz, contact = clamp_to_bed(cat["xyz"], bathy)
         contact[-1] = True
-        return {"F_top": cat["T0_vec"], "xyz": cat["xyz"],
+        return {"F_top": cat["T0_vec"], "xyz": xyz,
                 "tension": cat["tension"], "contact": contact,
                 "tdp": None, "H_bottom": float(cat["tension"][-1])}
 
@@ -432,15 +448,16 @@ def leg_solution_frozen(p_top: "np.ndarray", path_pts: "np.ndarray",
         # the anchor — same fallback as the frictionless model.
         anchor = pts[0]
         cat = two_point_catenary(p_top, anchor, float(L), w, n=n_susp)
-        contact = np.zeros(len(cat["xyz"]), dtype=bool)
+        xyz, contact = clamp_to_bed(cat["xyz"], bathy)
         contact[-1] = True
-        return {"F_top": cat["T0_vec"], "xyz": cat["xyz"],
+        return {"F_top": cat["T0_vec"], "xyz": xyz,
                 "tension": cat["tension"], "contact": contact,
                 "tdp": None, "H_bottom": float(cat["tension"][-1]),
                 "path_pts": None}
 
     tdp = pts[-1]
     D, h, H, s_tan, chord = geom(tdp)
+    susp_bed = None
     if not pooled and abs(s_free - s_tan) <= ds and D > 1e-6:
         # At (or close enough to) tangency: classic tangent catenary.
         a = H / w
@@ -462,7 +479,7 @@ def leg_solution_frozen(p_top: "np.ndarray", path_pts: "np.ndarray",
         # lower-end tension is the residual bottom tension and its exact
         # end force loads the top.
         cat = two_point_catenary(p_top, tdp, max(s_free, 0.05), w, n=n_susp)
-        pts_s = cat["xyz"]                      # top -> TDP
+        pts_s, susp_bed = clamp_to_bed(cat["xyz"], bathy)   # top -> TDP
         t_sus = cat["tension"]
         H = float(t_sus[-1])
         F_top = np.asarray(cat["T0_vec"], dtype=float)
@@ -477,6 +494,8 @@ def leg_solution_frozen(p_top: "np.ndarray", path_pts: "np.ndarray",
     tension = np.concatenate([t_sus, t_bed[1:]])
     contact = np.zeros(len(xyz), dtype=bool)
     contact[len(pts_s) - 1:] = True
+    if susp_bed is not None and np.any(susp_bed):
+        contact[:len(pts_s)] |= susp_bed        # clamped sag counts as contact
 
     return {"F_top": F_top, "xyz": xyz, "tension": tension,
             "contact": contact, "tdp": (float(tdp[0]), float(tdp[1]), float(tdp[2])),
@@ -681,8 +700,10 @@ class QuickOperationSimulator(OperationSimulator):
                     cat = two_point_catenary(p, top, st.length_m, w)
                     xyz = cat["xyz"][::-1]          # top -> BU ordering
                     tension = cat["tension"][::-1]
-                    chains.append(self._chain_snap(st, xyz, tension,
-                                                   np.zeros(len(xyz), dtype=bool)))
+                    # A slack trunk can sag below the bed just before the
+                    # BU lands — clamp the sag onto the bed for display.
+                    xyz, contact = clamp_to_bed(xyz, self.bathy)
+                    chains.append(self._chain_snap(st, xyz, tension, contact))
             for st in legs:
                 sol = self._solve_leg(st, p, st.bottom.xyz[:2], commit=True)
                 chains.append(self._chain_snap(st, sol["xyz"], sol["tension"],
@@ -730,4 +751,5 @@ class QuickOperationSimulator(OperationSimulator):
             end_tension_kN=float(t_kN[-1]),
             min_radius_m=float(np.min(radii)) if len(radii) else float("inf"),
             length_m=float(st.length_m),
+            joint_xyz=joint_point(st, xyz, s),
         )

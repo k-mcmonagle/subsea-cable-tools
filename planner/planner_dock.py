@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 
 from qgis.PyQt.QtCore import QDateTime, QSettings, Qt
@@ -15,7 +15,7 @@ from qgis.PyQt.QtWidgets import (
     QDockWidget, QFileDialog, QFormLayout, QHBoxLayout, QInputDialog, QLabel,
     QMessageBox,
     QLineEdit, QMenu, QPushButton, QSlider, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QTextEdit, QVBoxLayout, QWidget,
 )
 from qgis.core import (
     QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsExpression,
@@ -26,6 +26,7 @@ from qgis.gui import QgsMapLayerComboBox
 
 from ..qgis_compat import (
     BUTTON_BOX_CANCEL, BUTTON_BOX_OK, DIALOG_ACCEPTED, ITEM_DATA_USER_ROLE,
+    ITEM_FLAG_EDITABLE,
     MAP_LAYER_FILTER_LINE,
     MAP_LAYER_FILTER_POINT, MESSAGE_BOX_NO, MESSAGE_BOX_YES, MESSAGE_CRITICAL,
     MESSAGE_INFO, MESSAGE_WARNING,
@@ -56,6 +57,7 @@ LABEL_OPTIONS = (
     ("progress", "Progress", False),
     ("clock", "Simulation time", False),
     ("speed_distance", "Speed and distance", False),
+    ("fuel_rob", "Fuel ROB", False),
 )
 
 
@@ -136,6 +138,8 @@ class PlannerDock(QDockWidget):
         self.task_table.linkRequested.connect(self._link_feature)
         self.task_table.taskSelected.connect(self._task_selected)
         self.task_table.zoomRequested.connect(self._zoom_to_task)
+        self.task_table.advancedRequested.connect(self._edit_advanced_task)
+        self.task_table.progressRequested.connect(self._update_progress)
         self.task_table.historyStateChanged.connect(self._history_state_changed)
         for layer in self.geometry_layers:
             if hasattr(layer, "geometryChanged"):
@@ -160,8 +164,22 @@ class PlannerDock(QDockWidget):
         self.anchor_edit.setCalendarPopup(True)
         self.anchor_edit.setDisplayFormat("dd/MM/yyyy HH:mm")
         self.anchor_edit.dateTimeChanged.connect(self._anchor_changed)
-        layout.addWidget(QLabel("Anchor:"))
+        self.schedule_mode_combo = QComboBox()
+        self.schedule_mode_combo.addItem("Forward", "forward")
+        self.schedule_mode_combo.addItem("Backward", "backward")
+        self.schedule_mode_combo.setToolTip(
+            "Forward plans from a start date. Backward plans place tasks as late as "
+            "possible before a required finish date.")
+        self.schedule_mode_combo.currentIndexChanged.connect(self._schedule_mode_changed)
+        layout.addWidget(self.schedule_mode_combo)
+        self.anchor_label = QLabel("Start:")
+        layout.addWidget(self.anchor_label)
         layout.addWidget(self.anchor_edit)
+        availability_btn = QPushButton("Availability…")
+        availability_btn.setToolTip(
+            "Optional scenario-specific absolute availability dates for each resource.")
+        availability_btn.clicked.connect(self._edit_schedule_availability)
+        layout.addWidget(availability_btn)
         resources_btn = QPushButton("Resources…")
         resources_btn.setToolTip(
             "Project-level vessels/resources shared by every scenario; deleting "
@@ -193,7 +211,10 @@ class PlannerDock(QDockWidget):
         edit_menu = QMenu(edit_btn)
         for label, slot in (
                 ("Delete selected", lambda: self.task_table.delete_selected()),
+                ("Advanced settings for current task…", self._edit_current_advanced),
+                ("Update actual progress…", self._update_current_progress),
                 ("Merge selected routes", self._merge_selected),
+                ("Group selected tasks", lambda: self.task_table.group_selected()),
                 ("Indent (make child)", lambda: self.task_table.indent_selected(1)),
                 ("Outdent (promote)", lambda: self.task_table.indent_selected(-1)),
                 ("Move up", lambda: self.task_table.move_selected(-1)),
@@ -211,6 +232,17 @@ class PlannerDock(QDockWidget):
             "and cost. Set fuel rates in Resources… and a fuel mode on each task.")
         fuel_btn.clicked.connect(self._show_fuel_report)
         layout.addWidget(fuel_btn)
+        baseline_btn = QPushButton("Baseline / actuals…")
+        baseline_menu = QMenu(baseline_btn)
+        baseline_menu.addAction("Set or replace baseline", self._set_baseline)
+        baseline_menu.addAction("Compare with baseline", self._compare_baseline)
+        baseline_menu.addAction("Actual progress report", self._show_progress_report)
+        baseline_menu.addAction("Show critical path / float", self._show_critical_path)
+        baseline_menu.addAction("Schedule warnings", self._show_schedule_warnings)
+        baseline_menu.addSeparator()
+        baseline_menu.addAction("Clear baseline", self._clear_baseline)
+        baseline_btn.setMenu(baseline_menu)
+        layout.addWidget(baseline_btn)
         layout.addStretch(1)
         return layout
 
@@ -294,17 +326,29 @@ class PlannerDock(QDockWidget):
         if scenario is None:
             self._loading = True
             try:
-                self.task_table.set_plan([], [], datetime.now().replace(second=0, microsecond=0))
+                self.schedule_mode_combo.setCurrentIndex(
+                    self.schedule_mode_combo.findData("forward"))
+                self._set_anchor_caption("forward")
+                self.task_table.set_plan(
+                    [], [], datetime.now().replace(second=0, microsecond=0), "forward")
                 self.status_label.setText("Create a scenario to begin")
             finally:
                 self._loading = False
             return
         anchor = _parse_anchor(scenario.get("start_datetime"))
+        settings = _scenario_settings(scenario)
+        mode = settings.get("schedule_mode", "forward")
+        mode = "backward" if mode == "backward" else "forward"
+        resource_dates = settings.get("resource_start_datetimes") or {}
         self._loading = True
         try:
+            self.schedule_mode_combo.setCurrentIndex(max(
+                0, self.schedule_mode_combo.findData(mode)))
+            self._set_anchor_caption(mode)
             self.anchor_edit.setDateTime(QDateTime(anchor))
             self.task_table.set_plan(self.store.list_tasks(scenario_id),
-                                     self.store.list_resources(), anchor)
+                                     self.store.list_resources(), anchor, mode,
+                                     resource_dates)
         finally:
             self._loading = False
         self._schedule_changed(self.task_table.schedule)
@@ -360,6 +404,208 @@ class PlannerDock(QDockWidget):
         scenario["start_datetime"] = anchor.strftime("%Y-%m-%dT%H:%M")
         self.store.save_scenario(scenario)
         self.task_table.set_anchor(anchor)
+
+    def _schedule_mode_changed(self, *_args):
+        mode = self.schedule_mode_combo.currentData() or "forward"
+        self._set_anchor_caption(mode)
+        if self._loading:
+            return
+        scenario = self.store.get_scenario(self.current_scenario_id)
+        if scenario is None:
+            return
+        settings = _scenario_settings(scenario)
+        settings["schedule_mode"] = mode
+        scenario["settings_json"] = json.dumps(settings, sort_keys=True)
+        self.store.save_scenario(scenario)
+        self.task_table.set_schedule_mode(mode)
+
+    def _set_anchor_caption(self, mode):
+        backward = mode == "backward"
+        self.anchor_label.setText("Required finish:" if backward else "Start:")
+        self.anchor_edit.setToolTip(
+            "All unconstrained task chains finish by this date/time."
+            if backward else
+            "Scenario start. Each resource may start later using its availability offset.")
+
+    def _edit_schedule_availability(self):
+        scenario = self.store.get_scenario(self.current_scenario_id)
+        if scenario is None:
+            return
+        settings = _scenario_settings(scenario)
+        dialog = ScheduleAvailabilityDialog(
+            self.task_table.resources,
+            settings.get("resource_start_datetimes") or {},
+            self.anchor_edit.dateTime().toPyDateTime(), self)
+        if qt_exec(dialog) != DIALOG_ACCEPTED:
+            return
+        settings["resource_start_datetimes"] = dialog.values()
+        scenario["settings_json"] = json.dumps(settings, sort_keys=True)
+        self.store.save_scenario(scenario)
+        self.task_table.set_resource_start_datetimes(
+            settings["resource_start_datetimes"])
+
+    def _edit_advanced_task(self, task_id):
+        task = self.task_table.row_by_id(task_id)
+        if task is None:
+            return
+        dialog = AdvancedTaskDialog(task, self)
+        if qt_exec(dialog) == DIALOG_ACCEPTED:
+            self.task_table.update_task_fields(task_id, dialog.values())
+
+    def _edit_current_advanced(self):
+        row = self.task_table.currentRow()
+        if 0 <= row < len(self.task_table.rows) and not self.task_table._is_summary(row):
+            self._edit_advanced_task(self.task_table.rows[row].get("task_id") or "")
+
+    def _update_progress(self, task_id):
+        task = self.task_table.row_by_id(task_id)
+        if task is None:
+            return
+        dialog = ProgressDialog(task, self)
+        if qt_exec(dialog) != DIALOG_ACCEPTED:
+            return
+        self.task_table.update_task_fields(task_id, dialog.values())
+        self.task_table.setColumnHidden(self.task_table.COL_PROGRESS, False)
+        self.task_table.setColumnHidden(self.task_table.COL_STATUS, False)
+        self.task_table._header_changed()
+
+    def _update_current_progress(self):
+        row = self.task_table.currentRow()
+        if 0 <= row < len(self.task_table.rows) and not self.task_table._is_summary(row):
+            self._update_progress(self.task_table.rows[row].get("task_id") or "")
+
+    def _set_baseline(self):
+        scenario = self.store.get_scenario(self.current_scenario_id)
+        if scenario is None or not self.task_table.rows:
+            QMessageBox.information(self, "Planner baseline", "Add some tasks before setting a baseline.")
+            return
+        settings = _scenario_settings(scenario)
+        if settings.get("baseline"):
+            answer = QMessageBox.question(
+                self, "Replace baseline", "Replace the existing scenario baseline?",
+                MESSAGE_BOX_YES | MESSAGE_BOX_NO, MESSAGE_BOX_NO)
+            if answer != MESSAGE_BOX_YES:
+                return
+        scheduled = {item.task_id: item for item in self.task_table.schedule.tasks}
+        tasks = []
+        for row in self.task_table.rows:
+            item = scheduled.get(row.get("task_id"))
+            tasks.append({
+                "task_id": row.get("task_id") or "", "name": row.get("name") or "",
+                "resource_id": row.get("resource_id") or "",
+                "operation_type": row.get("operation_type") or "",
+                "duration_hours": float(
+                    item.duration_hours if item is not None else row.get("duration_hours") or 0.0),
+                "start": item.start.strftime("%Y-%m-%dT%H:%M") if item else "",
+                "finish": item.finish.strftime("%Y-%m-%dT%H:%M") if item else "",
+            })
+        result = self.task_table.schedule
+        settings["baseline"] = {
+            "created_utc": schema.utc_now_iso(), "tasks": tasks,
+            "span_start": result.span_start.strftime("%Y-%m-%dT%H:%M") if result.span_start else "",
+            "span_end": result.span_end.strftime("%Y-%m-%dT%H:%M") if result.span_end else "",
+        }
+        scenario["settings_json"] = json.dumps(settings, sort_keys=True)
+        self.store.save_scenario(scenario)
+        QMessageBox.information(self, "Planner baseline", "The current schedule is now the baseline.")
+
+    def _compare_baseline(self):
+        scenario = self.store.get_scenario(self.current_scenario_id)
+        baseline = _scenario_settings(scenario).get("baseline") if scenario else None
+        if not baseline:
+            QMessageBox.information(self, "Baseline comparison", "No baseline has been set.")
+            return
+        scheduled = {item.task_id: item for item in self.task_table.schedule.tasks}
+        current = {}
+        for row in self.task_table.rows:
+            copied = dict(row)
+            item = scheduled.get(row.get("task_id"))
+            if item is not None:
+                copied["duration_hours"] = item.duration_hours
+            current[row.get("task_id")] = copied
+        baseline_tasks = {row.get("task_id"): row for row in baseline.get("tasks", [])}
+        changed = []
+        fields = ("name", "resource_id", "operation_type", "duration_hours")
+        for task_id in sorted(set(current) | set(baseline_tasks)):
+            before, after = baseline_tasks.get(task_id), current.get(task_id)
+            if before is None:
+                changed.append("Added: %s" % (after.get("name") or "Task"))
+            elif after is None:
+                changed.append("Removed: %s" % (before.get("name") or "Task"))
+            elif any(str(before.get(key) or "") != str(after.get(key) or "") for key in fields):
+                changed.append("Changed: %s" % (after.get("name") or "Task"))
+        baseline_finish = _parse_anchor(baseline.get("span_end"))
+        current_finish = self.task_table.schedule.span_end
+        variance = ((current_finish - baseline_finish).total_seconds() / 3600.0
+                    if current_finish is not None else 0.0)
+        lines = [
+            "Baseline created: %s" % (baseline.get("created_utc") or "unknown"),
+            "Finish variance: %+.1f h" % variance,
+            "Changed tasks: %d" % len(changed),
+        ]
+        if changed:
+            lines.extend([""] + changed[:15])
+            if len(changed) > 15:
+                lines.append("…and %d more" % (len(changed) - 15))
+        QMessageBox.information(self, "Baseline comparison", "\n".join(lines))
+
+    def _clear_baseline(self):
+        scenario = self.store.get_scenario(self.current_scenario_id)
+        if scenario is None:
+            return
+        settings = _scenario_settings(scenario)
+        if not settings.pop("baseline", None):
+            return
+        scenario["settings_json"] = json.dumps(settings, sort_keys=True)
+        self.store.save_scenario(scenario)
+
+    def _show_progress_report(self):
+        rows = [row for row in self.task_table.rows
+                if (row.get("progress_status") or "not_started") != "not_started"
+                or float(row.get("percent_complete") or 0.0) > 0.0]
+        if not rows:
+            QMessageBox.information(self, "Actual progress", "No actual progress has been recorded.")
+            return
+        completed = sum(1 for row in rows if row.get("progress_status") == "completed")
+        lines = ["%d task(s) updated; %d completed." % (len(rows), completed), ""]
+        scheduled = {item.task_id: item for item in self.task_table.schedule.tasks}
+        scenario = self.store.get_scenario(self.current_scenario_id)
+        baseline = _scenario_settings(scenario).get("baseline") if scenario else None
+        baseline_tasks = {
+            item.get("task_id"): item for item in (baseline or {}).get("tasks", [])
+        }
+        for row in rows[:25]:
+            line = "%s — %s%%, %s" % (
+                row.get("name") or "Task", _fmt_fuel(row.get("percent_complete")),
+                dict(schema.PROGRESS_STATUSES).get(
+                    row.get("progress_status") or "not_started", "Not started"))
+            if row.get("remaining_duration_hours") not in (None, ""):
+                line += ", %s h remaining" % _fmt_fuel(row.get("remaining_duration_hours"))
+            item = scheduled.get(row.get("task_id"))
+            actual_finish = _parse_optional_datetime(row.get("actual_finish_datetime"))
+            baseline_finish = _parse_optional_datetime(
+                (baseline_tasks.get(row.get("task_id")) or {}).get("finish"))
+            planned_finish = baseline_finish or (item.finish if item is not None else None)
+            if planned_finish is not None and actual_finish is not None:
+                line += " (finish variance %+.1f h)" % (
+                    (actual_finish - planned_finish).total_seconds() / 3600.0)
+            if row.get("progress_notes"):
+                line += "\n  " + str(row.get("progress_notes"))
+            lines.append(line)
+        QMessageBox.information(self, "Actual progress", "\n".join(lines))
+
+    def _show_critical_path(self):
+        self.task_table.setColumnHidden(self.task_table.COL_FLOAT, False)
+        self.task_table._header_changed()
+        critical = [item for item in self.task_table.schedule.tasks if item.critical]
+        self.status_label.setText("%d critical-path task(s); Float column shown." % len(critical))
+
+    def _show_schedule_warnings(self):
+        result = self.task_table.schedule
+        messages = list(result.errors) + list(result.warnings)
+        QMessageBox.information(
+            self, "Schedule warnings",
+            "\n".join(messages) if messages else "No schedule or SIMOPS warnings.")
 
     def _save_tasks(self, rows):
         if self._loading or not self.current_scenario_id:
@@ -662,6 +908,7 @@ class PlannerDock(QDockWidget):
                     computed=draft.get("duration_mode", "computed") == "computed")
                 task["description"] = draft.get("description", "")
                 task["notes"] = draft.get("notes", "")
+                task["operation_type"] = str(draft.get("operation") or "").strip().lower()
                 reference = self.store.set_task_geometry(
                     task["task_id"], self.current_scenario_id, sequence, task["name"],
                     draft["geometry"], "line", source_crs=draft["source_crs"],
@@ -734,6 +981,8 @@ class PlannerDock(QDockWidget):
         self._update_totals(result)
         if result.errors:
             self.status_label.setText(result.errors[0])
+        elif result.warnings:
+            self.status_label.setText(result.warnings[0])
 
     def _update_totals(self, result):
         table = self.task_table
@@ -820,17 +1069,24 @@ class PlannerDock(QDockWidget):
             resource = resources.get(resource_id, {})
             color = resource.get("color_hex") or schema.DEFAULT_RESOURCE_COLOR
             scheduled = next((item for item in result.tasks if item.task_id == state.task_id), None)
-            frame = self.resolver.route_frame(task) if task.get("geom_kind") == "line" else None
+            spatial_kind = self.task_table.spatial_kind(task)
+            frame = self.resolver.route_frame(task) if spatial_kind == "line" else None
+            fuel_summary = self.task_table.fuel.by_resource.get(resource_id)
+            fuel_tracked = fuel_summary is not None and bool(
+                fuel_summary.rob_start or fuel_summary.total_burn or fuel_summary.total_bunker)
+            task_fuel = (self.task_table.fuel.by_task.get(state.task_id)
+                         if fuel_tracked else None)
             label_text = _simulation_label(
                 task, resource, state, scheduled, when, self.label_settings,
-                frame.total_length_m / 1852.0 if frame is not None else None)
-            if task.get("geom_kind") == "line":
+                frame.total_length_m / 1852.0 if frame is not None else None,
+                task_fuel, resource.get("fuel_unit") or schema.DEFAULT_FUEL_UNIT)
+            if spatial_kind == "line":
                 self.overlay.update_resource(
                     resource_id, frame, state.chainage_m, color,
                     task.get("direction") or "forward", label_text)
-            elif task.get("geom_kind") == "point":
+            elif spatial_kind == "point":
                 self.overlay.show_point(
-                    resource_id, self.resolver.point_at_chainage(task, 0), color, label_text)
+                    resource_id, self.resolver.location_point(task), color, label_text)
             else:
                 self.overlay.hold_resource(resource_id, color, label_text)
             if state.active:
@@ -912,6 +1168,282 @@ class PlannerDock(QDockWidget):
     def closeEvent(self, event):
         self.shutdown()
         super().closeEvent(event)
+
+
+class ScheduleAvailabilityDialog(QDialog):
+    """Optional absolute resource dates stored per scenario, not per vessel."""
+
+    def __init__(self, resources, values, default_datetime, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Scenario resource availability")
+        self.resize(620, 330)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "Leave Override off for the normal scenario start plus resource offset. "
+            "Enable it only where this scenario needs an exact resource date."))
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Resource", "Override", "Available from"])
+        self._rows = []
+        values = dict(values or {})
+        for resource in resources:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            resource_id = resource.get("resource_id") or ""
+            name = QTableWidgetItem(resource.get("name") or "Resource")
+            name.setFlags(name.flags() & ~ITEM_FLAG_EDITABLE)
+            self.table.setItem(row, 0, name)
+            enabled = QCheckBox()
+            enabled.setChecked(resource_id in values and bool(values.get(resource_id)))
+            self.table.setCellWidget(row, 1, enabled)
+            edit = QDateTimeEdit()
+            edit.setCalendarPopup(True)
+            edit.setDisplayFormat("dd/MM/yyyy HH:mm")
+            parsed = (_parse_optional_datetime(values.get(resource_id)) or
+                      default_datetime + timedelta(
+                          hours=max(0.0, float(resource.get("start_offset_hours") or 0.0))))
+            edit.setDateTime(QDateTime(parsed))
+            edit.setEnabled(enabled.isChecked())
+            enabled.toggled.connect(edit.setEnabled)
+            self.table.setCellWidget(row, 2, edit)
+            self._rows.append((resource_id, enabled, edit))
+        layout.addWidget(self.table)
+        box = QDialogButtonBox(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
+        box.accepted.connect(self.accept)
+        box.rejected.connect(self.reject)
+        layout.addWidget(box)
+        _polish_dialog_table(self.table)
+
+    def values(self):
+        return {
+            resource_id: edit.dateTime().toPyDateTime().replace(
+                second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M")
+            for resource_id, enabled, edit in self._rows if enabled.isChecked()
+        }
+
+
+class AdvancedTaskDialog(QDialog):
+    """Advanced scheduling controls; simple tasks never need to open this."""
+
+    def __init__(self, task, parent=None):
+        super().__init__(parent)
+        self.task = dict(task)
+        self.setWindowTitle("Advanced task settings — %s" % (task.get("name") or "Task"))
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "These controls are optional. The defaults preserve the normal simple "
+            "finish-to-start schedule."))
+        form = QFormLayout()
+        self.operation = QComboBox()
+        self.operation.setEditable(True)
+        for value, label in schema.OPERATION_TYPES:
+            self.operation.addItem(label, value)
+        operation = task.get("operation_type") or ""
+        index = self.operation.findData(operation)
+        if index >= 0:
+            self.operation.setCurrentIndex(index)
+        else:
+            self.operation.setEditText(operation)
+        self.dependency = QComboBox()
+        for value, label in schema.DEPENDENCY_TYPES:
+            self.dependency.addItem("%s — %s" % (value, label), value)
+        self.dependency.setCurrentIndex(max(
+            0, self.dependency.findData(task.get("dependency_type") or "FS")))
+        self.lag = QDoubleSpinBox()
+        self.lag.setRange(-100000.0, 100000.0)
+        self.lag.setDecimals(2)
+        self.lag.setSuffix(" h")
+        self.lag.setValue(float(task.get("lag_hours") or 0.0))
+        self.constraint = QComboBox()
+        for value, label in schema.CONSTRAINT_TYPES:
+            self.constraint.addItem(label, value)
+        self.constraint.setCurrentIndex(max(
+            0, self.constraint.findData(task.get("constraint_type") or "")))
+        self.constraint_date = QDateTimeEdit()
+        self.constraint_date.setCalendarPopup(True)
+        self.constraint_date.setDisplayFormat("dd/MM/yyyy HH:mm")
+        parsed = _parse_optional_datetime(task.get("constraint_datetime")) or datetime.now()
+        self.constraint_date.setDateTime(QDateTime(parsed))
+        self.constraint_date.setEnabled(bool(self.constraint.currentData()))
+        self.constraint.currentIndexChanged.connect(
+            lambda _index: self.constraint_date.setEnabled(bool(self.constraint.currentData())))
+        self.milestone = QCheckBox("Zero-duration milestone")
+        self.milestone.setChecked(bool(task.get("is_milestone")))
+        self.location = QComboBox()
+        for label, value in (
+                ("Use linked feature normally", "feature"),
+                ("Start of linked line", "line_start"),
+                ("End of linked line", "line_end"),
+                ("Position along linked line", "route_chainage")):
+            self.location.addItem(label, value)
+        self.location.setCurrentIndex(max(
+            0, self.location.findData(task.get("location_mode") or "feature")))
+        self.chainage = QDoubleSpinBox()
+        self.chainage.setDecimals(1)
+        self.chainage.setRange(0.0, 100000000.0)
+        self.chainage.setSuffix(" m")
+        self.chainage.setValue(float(task.get("location_chainage_m") or 0.0))
+        self.chainage.setEnabled(self.location.currentData() == "route_chainage")
+        self.location.currentIndexChanged.connect(
+            lambda _index: self.chainage.setEnabled(
+                self.location.currentData() == "route_chainage"))
+        if task.get("geom_kind") != "line":
+            self.location.setEnabled(False)
+            self.chainage.setEnabled(False)
+        form.addRow("Operation:", self.operation)
+        form.addRow("Dependency type:", self.dependency)
+        form.addRow("Dependency lag:", self.lag)
+        form.addRow("Constraint:", self.constraint)
+        form.addRow("Constraint date:", self.constraint_date)
+        form.addRow("Milestone:", self.milestone)
+        form.addRow("Linked location:", self.location)
+        form.addRow("Line position:", self.chainage)
+        layout.addLayout(form)
+        box = QDialogButtonBox(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
+        box.accepted.connect(self.accept)
+        box.rejected.connect(self.reject)
+        layout.addWidget(box)
+
+    def values(self):
+        operation = self.operation.currentData() or self.operation.currentText().strip()
+        constraint = self.constraint.currentData() or ""
+        return {
+            "operation_type": operation,
+            "dependency_type": self.dependency.currentData() or "FS",
+            "lag_hours": self.lag.value(), "constraint_type": constraint,
+            "constraint_datetime": (
+                self.constraint_date.dateTime().toPyDateTime().replace(
+                    second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M")
+                if constraint else ""),
+            "is_milestone": 1 if self.milestone.isChecked() else 0,
+            "location_mode": self.location.currentData() or "feature",
+            "location_chainage_m": (
+                self.chainage.value()
+                if self.location.currentData() == "route_chainage" else None),
+        }
+
+
+class ProgressDialog(QDialog):
+    """Capture current actuals and append an auditable operational update."""
+
+    def __init__(self, task, parent=None):
+        super().__init__(parent)
+        self.task = dict(task)
+        self.setWindowTitle("Update actual progress — %s" % (task.get("name") or "Task"))
+        self.resize(620, 560)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.status = QComboBox()
+        for value, label in schema.PROGRESS_STATUSES:
+            self.status.addItem(label, value)
+        self.status.setCurrentIndex(max(
+            0, self.status.findData(task.get("progress_status") or "not_started")))
+        self.percent = QDoubleSpinBox()
+        self.percent.setRange(0.0, 100.0)
+        self.percent.setDecimals(1)
+        self.percent.setSuffix(" %")
+        self.percent.setValue(float(task.get("percent_complete") or 0.0))
+        self.actual_start_check, self.actual_start = self._optional_datetime(
+            task.get("actual_start_datetime"))
+        self.actual_finish_check, self.actual_finish = self._optional_datetime(
+            task.get("actual_finish_datetime"))
+        self.remaining_check = QCheckBox("Set")
+        self.remaining = QDoubleSpinBox()
+        self.remaining.setRange(0.0, 1000000.0)
+        self.remaining.setDecimals(2)
+        self.remaining.setSuffix(" h")
+        remaining = task.get("remaining_duration_hours")
+        self.remaining_check.setChecked(remaining not in (None, ""))
+        self.remaining.setValue(float(remaining or 0.0))
+        self.remaining.setEnabled(self.remaining_check.isChecked())
+        self.remaining_check.toggled.connect(self.remaining.setEnabled)
+        form.addRow("Status:", self.status)
+        form.addRow("Complete:", self.percent)
+        form.addRow("Actual start:", self._optional_row(
+            self.actual_start_check, self.actual_start))
+        form.addRow("Actual finish:", self._optional_row(
+            self.actual_finish_check, self.actual_finish))
+        form.addRow("Remaining duration:", self._optional_row(
+            self.remaining_check, self.remaining))
+        layout.addLayout(form)
+        layout.addWidget(QLabel("Operational update / reason for change:"))
+        self.notes = QTextEdit()
+        self.notes.setPlaceholderText(
+            "For example: cable joint completed 2 h late; weather hold started; scope changed…")
+        self.notes.setMaximumHeight(100)
+        layout.addWidget(self.notes)
+        layout.addWidget(QLabel("Recorded history:"))
+        self.history = QTextEdit()
+        self.history.setReadOnly(True)
+        self.history.setMaximumHeight(150)
+        self.history.setPlainText(_format_actual_history(task.get("actual_log_json")))
+        layout.addWidget(self.history)
+        self.status.currentIndexChanged.connect(self._status_changed)
+        box = QDialogButtonBox(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
+        box.accepted.connect(self.accept)
+        box.rejected.connect(self.reject)
+        layout.addWidget(box)
+
+    @staticmethod
+    def _optional_datetime(value):
+        check = QCheckBox("Set")
+        edit = QDateTimeEdit()
+        edit.setCalendarPopup(True)
+        edit.setDisplayFormat("dd/MM/yyyy HH:mm")
+        parsed = _parse_optional_datetime(value)
+        check.setChecked(parsed is not None)
+        edit.setDateTime(QDateTime(parsed or datetime.now()))
+        edit.setEnabled(check.isChecked())
+        check.toggled.connect(edit.setEnabled)
+        return check, edit
+
+    @staticmethod
+    def _optional_row(check, editor):
+        widget = QWidget()
+        row = QHBoxLayout(widget)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(check)
+        row.addWidget(editor, 1)
+        return widget
+
+    def _status_changed(self, _index=None):
+        status = self.status.currentData()
+        if status == "completed":
+            self.percent.setValue(100.0)
+        elif status == "not_started":
+            self.percent.setValue(0.0)
+
+    def values(self):
+        status = self.status.currentData() or "not_started"
+        now = schema.utc_now_iso()
+        start = (self.actual_start.dateTime().toPyDateTime().replace(
+            second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M")
+                 if self.actual_start_check.isChecked() else "")
+        finish = (self.actual_finish.dateTime().toPyDateTime().replace(
+            second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M")
+                  if self.actual_finish_check.isChecked() else "")
+        note = self.notes.toPlainText().strip()
+        try:
+            history = json.loads(str(self.task.get("actual_log_json") or "[]"))
+            if not isinstance(history, list):
+                history = []
+        except (TypeError, ValueError):
+            history = []
+        history.append({
+            "updated_utc": now, "status": status,
+            "percent_complete": self.percent.value(), "actual_start": start,
+            "actual_finish": finish,
+            "remaining_duration_hours": (
+                self.remaining.value() if self.remaining_check.isChecked() else None),
+            "note": note,
+        })
+        return {
+            "progress_status": status, "percent_complete": self.percent.value(),
+            "actual_start_datetime": start, "actual_finish_datetime": finish,
+            "remaining_duration_hours": (
+                self.remaining.value() if self.remaining_check.isChecked() else None),
+            "progress_notes": note, "actual_log_json": json.dumps(history),
+            "progress_updated_utc": now,
+        }
 
 
 class SketchTasksDialog(QDialog):
@@ -996,11 +1528,12 @@ class StandardTasksDialog(QDialog):
 
     COL_NAME = 0
     COL_DESCRIPTION = 1
-    COL_DURATION = 2
-    COL_SPEED = 3
-    COL_FUEL = 4
-    COL_BUNKER = 5
-    COL_NOTES = 6
+    COL_OPERATION = 2
+    COL_DURATION = 3
+    COL_SPEED = 4
+    COL_FUEL = 5
+    COL_BUNKER = 6
+    COL_NOTES = 7
 
     def __init__(self, templates, parent=None):
         super().__init__(parent)
@@ -1015,14 +1548,15 @@ class StandardTasksDialog(QDialog):
             "linked to geometry as usual.")
         intro.setWordWrap(True)
         layout.addWidget(intro)
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels([
-            "Name", "Description", "Duration (h)", "Speed (kn)", "Fuel",
+            "Name", "Description", "Operation", "Duration (h)", "Speed (kn)", "Fuel",
             "Bunker", "Notes"])
         self.table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
         self.table.setSelectionMode(SELECTION_MODE_EXTENDED)
         self.table.setColumnWidth(self.COL_NAME, 160)
         self.table.setColumnWidth(self.COL_DESCRIPTION, 260)
+        self.table.setColumnWidth(self.COL_OPERATION, 100)
         self.table.setColumnWidth(self.COL_DURATION, 90)
         self.table.setColumnWidth(self.COL_SPEED, 85)
         self.table.setColumnWidth(self.COL_FUEL, 85)
@@ -1058,6 +1592,7 @@ class StandardTasksDialog(QDialog):
 
     def _add_row(self, template=None):
         template = template or {"name": "New standard task", "description": "",
+                                "operation_type": "",
                                 "duration_hours": 1.0, "speed_knots": None,
                                 "fuel_mode": "", "bunker_amount": None, "notes": ""}
         row = self.table.rowCount()
@@ -1078,6 +1613,12 @@ class StandardTasksDialog(QDialog):
             combo.addItem(label, value)
         combo.setCurrentIndex(max(0, combo.findData(template.get("fuel_mode") or "")))
         self.table.setCellWidget(row, self.COL_FUEL, combo)
+        operation_combo = QComboBox()
+        for value, label in schema.OPERATION_TYPES:
+            operation_combo.addItem(label, value)
+        operation_combo.setCurrentIndex(max(
+            0, operation_combo.findData(template.get("operation_type") or "")))
+        self.table.setCellWidget(row, self.COL_OPERATION, operation_combo)
 
     def _remove_selected(self):
         for row in sorted({index.row() for index in
@@ -1090,9 +1631,11 @@ class StandardTasksDialog(QDialog):
         if not name:
             return None
         combo = self.table.cellWidget(row, self.COL_FUEL)
+        operation_combo = self.table.cellWidget(row, self.COL_OPERATION)
         return {
             "name": name,
             "description": self._text(row, self.COL_DESCRIPTION),
+            "operation_type": (operation_combo.currentData() if operation_combo else "") or "",
             "duration_hours": self._number(row, self.COL_DURATION),
             "speed_knots": self._number(row, self.COL_SPEED),
             "fuel_mode": (combo.currentData() if combo else "") or "",
@@ -1192,7 +1735,8 @@ class ResourceDialog(QDialog):
         for column in (6, 7, 8, 9, 10, 11):
             self.table.setColumnWidth(column, 78)
         self.table.horizontalHeaderItem(4).setToolTip(
-            "Earliest availability relative to the scenario anchor; useful for multi-vessel plans.")
+            "Earliest availability relative to the scenario start; useful for multi-vessel "
+            "forward plans. Backward plans instead align unconstrained chains to the required finish.")
         self.table.horizontalHeaderItem(5).setToolTip(
             "Unit for all fuel figures on this resource: tonnes or cubic metres.")
         for column, label in ((6, "transit"), (7, "DP"), (8, "anchor"), (9, "in port")):
@@ -1401,6 +1945,46 @@ def _parse_anchor(value):
         return datetime.now().replace(second=0, microsecond=0)
 
 
+def _parse_optional_datetime(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for pattern in ("%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M"):
+        try:
+            return datetime.strptime(text, pattern)
+        except ValueError:
+            continue
+    return None
+
+
+def _format_actual_history(raw):
+    try:
+        entries = json.loads(str(raw or "[]"))
+        if not isinstance(entries, list):
+            return ""
+    except (TypeError, ValueError):
+        return ""
+    statuses = dict(schema.PROGRESS_STATUSES)
+    lines = []
+    for entry in reversed(entries):
+        line = "%s — %s, %s%%" % (
+            entry.get("updated_utc") or "Unknown time",
+            statuses.get(entry.get("status"), entry.get("status") or "Not started"),
+            _fmt_fuel(entry.get("percent_complete")))
+        if entry.get("note"):
+            line += "\n  " + str(entry.get("note"))
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _scenario_settings(scenario):
+    try:
+        value = json.loads(str((scenario or {}).get("settings_json") or "{}"))
+        return value if isinstance(value, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
 def _setting_bool(key, default):
     value = QSettings().value(key, default)
     if isinstance(value, str):
@@ -1408,7 +1992,8 @@ def _setting_bool(key, default):
     return bool(value)
 
 
-def _simulation_label(task, resource, state, scheduled, when, settings, distance_nm=None):
+def _simulation_label(task, resource, state, scheduled, when, settings,
+                      distance_nm=None, task_fuel=None, fuel_unit=""):
     if not settings.get("show", True):
         return ""
     heading = []
@@ -1424,7 +2009,8 @@ def _simulation_label(task, resource, state, scheduled, when, settings, distance
         lines.append("Progress %.0f%%" % (float(state.fraction or 0.0) * 100.0))
     if settings.get("clock"):
         lines.append(when.strftime("%d/%m/%Y %H:%M"))
-    if settings.get("speed_distance") and task.get("geom_kind") == "line":
+    if (settings.get("speed_distance") and task.get("geom_kind") == "line"
+            and (task.get("location_mode") or "feature") == "feature"):
         details = []
         speed = task.get("speed_knots")
         if speed not in (None, ""):
@@ -1433,6 +2019,11 @@ def _simulation_label(task, resource, state, scheduled, when, settings, distance
             details.append("%s nm" % ("%.3f" % float(distance_nm)).rstrip("0").rstrip("."))
         if details:
             lines.append(" / ".join(details))
+    if settings.get("fuel_rob") and task_fuel is not None:
+        rob = task_fuel.rob_end
+        if state.active:
+            rob = task_fuel.rob_start - task_fuel.burn * float(state.fraction or 0.0)
+        lines.append("Fuel ROB %s %s" % (_fmt_fuel(rob), fuel_unit or "t"))
     return "\n".join(line for line in lines if line)
 
 
@@ -1441,16 +2032,25 @@ def _new_task_row(name, resource_id, seq, speed_knots, duration_hours,
     now = schema.utc_now_iso()
     return {
         "task_id": schema.new_id(), "seq": int(seq), "name": name or "Task",
-        "description": "", "is_phase": 0, "outline_level": 0,
+        "description": "", "operation_type": "", "is_phase": 0, "outline_level": 0,
         "resource_id": resource_id or "",
         "duration_mode": "computed" if computed else "manual",
         "duration_hours": float(duration_hours or 0.0),
-        "predecessor_task_id": predecessor_task_id or "", "lag_hours": 0.0,
+        "predecessor_task_id": predecessor_task_id or "", "dependency_type": "FS",
+        "lag_hours": 0.0,
         "speed_knots": float(speed_knots or 0.0) if speed_knots is not None else None,
-        "direction": "forward", "fuel_mode": "", "bunker_amount": None,
+        "direction": "forward", "location_mode": "feature",
+        "location_chainage_m": None, "constraint_type": "",
+        "constraint_datetime": "", "is_milestone": 0,
+        "fuel_mode": "", "bunker_amount": None,
         "layer_id": "", "layer_source": "",
         "layer_name": "", "feature_id": "", "feature_label": "",
-        "geom_kind": "", "linked_ref_json": "", "created_utc": now,
+        "geom_kind": "", "linked_ref_json": "",
+        "progress_status": "not_started", "percent_complete": 0.0,
+        "actual_start_datetime": "", "actual_finish_datetime": "",
+        "remaining_duration_hours": None, "progress_notes": "",
+        "actual_log_json": "[]", "progress_updated_utc": "",
+        "created_utc": now,
         "modified_utc": now, "notes": "",
     }
 
