@@ -6,6 +6,7 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timedelta
 import json
+import os
 
 from qgis.PyQt.QtCore import QDateTime, QSettings, Qt
 from qgis.PyQt.QtGui import QColor, QCursor, QFontMetrics
@@ -97,15 +98,35 @@ class PlannerDock(QDockWidget):
         self.current_scenario_id = ""
         path = project_gpkg_path() or default_project_gpkg_path()
         self.store = PlannerStore(path)
+        self.store_ready = True
+        error = ""
         try:
             self.store.migrate()
         except Exception as exc:
+            error = str(exc)
+            # A remembered path can be unusable on another machine (missing
+            # drive, or the old CWD-based default under C:\WINDOWS\system32).
+            # Only fall back when there is no file there to lose.
+            fallback = default_project_gpkg_path()
+            self.store_ready = False
+            if not os.path.exists(path) and os.path.normcase(fallback) != os.path.normcase(path):
+                try:
+                    self.store = PlannerStore(fallback)
+                    self.store.migrate()
+                except Exception:
+                    self.store = PlannerStore(path)
+                else:
+                    path = fallback
+                    self.store_ready = True
+                    set_project_gpkg_path(path)
+        if not self.store_ready:
             QMessageBox.warning(
                 None, "Planner",
                 "Could not open or migrate the planner GeoPackage:\n%s\n\n%s\n\n"
                 "Check the file is writable (not locked by another program or "
-                "cloud sync) and reopen the Planner." % (path, exc))
-        if not project_gpkg_path():
+                "cloud sync) and reopen the Planner." % (path, error))
+        if self.store_ready and not project_gpkg_path():
+            # Only remember a location we know we can write to.
             set_project_gpkg_path(path)
         self.geometry_layers = self.store.load_geometry_layers()
         self.resolver = FeatureReferenceResolver(QgsProject.instance(), self.canvas, self.store)
@@ -353,13 +374,32 @@ class PlannerDock(QDockWidget):
             self._loading = False
         self._schedule_changed(self.task_table.schedule)
 
+    def _store_write(self, action, func, *args, **kwargs):
+        """Run a store write, reporting failures instead of raising into a slot."""
+        try:
+            result = func(*args, **kwargs)
+        except Exception as exc:
+            self.store_ready = False
+            QMessageBox.warning(
+                self, "Planner",
+                "Could not %s: the planner GeoPackage could not be written.\n%s\n\n"
+                "%s\n\nSave the QGIS project (the planner file is created beside "
+                "it) or pick a writable location, then reopen the Planner."
+                % (action, self.store.gpkg_path, exc))
+            return False, None
+        self.store_ready = True
+        return True, result
+
     def _new_scenario(self):
         name, ok = QInputDialog.getText(self, "New planning scenario", "Name:")
         if not ok or not name.strip():
             return
         anchor = datetime.now().replace(second=0, microsecond=0)
-        scenario_id = self.store.create_scenario(name.strip(), anchor.strftime("%Y-%m-%dT%H:%M"))
-        self.refresh_scenarios(scenario_id)
+        ok, scenario_id = self._store_write(
+            "create the scenario", self.store.create_scenario,
+            name.strip(), anchor.strftime("%Y-%m-%dT%H:%M"))
+        if ok:
+            self.refresh_scenarios(scenario_id)
 
     def _rename_scenario(self):
         scenario = self.store.get_scenario(self.current_scenario_id)
@@ -368,8 +408,8 @@ class PlannerDock(QDockWidget):
         name, ok = QInputDialog.getText(self, "Rename scenario", "Name:", text=scenario.get("name") or "")
         if ok and name.strip():
             scenario["name"] = name.strip()
-            self.store.save_scenario(scenario)
-            self.refresh_scenarios(self.current_scenario_id)
+            if self._store_write("rename the scenario", self.store.save_scenario, scenario)[0]:
+                self.refresh_scenarios(self.current_scenario_id)
 
     def _duplicate_scenario(self):
         scenario = self.store.get_scenario(self.current_scenario_id)
@@ -378,8 +418,11 @@ class PlannerDock(QDockWidget):
         proposed = "%s copy" % (scenario.get("name") or "Scenario")
         name, ok = QInputDialog.getText(self, "Duplicate scenario", "Copy name:", text=proposed)
         if ok and name.strip():
-            copied_id = self.store.duplicate_scenario(self.current_scenario_id, name.strip())
-            self.refresh_scenarios(copied_id)
+            ok, copied_id = self._store_write(
+                "duplicate the scenario", self.store.duplicate_scenario,
+                self.current_scenario_id, name.strip())
+            if ok:
+                self.refresh_scenarios(copied_id)
 
     def _delete_scenario(self):
         scenario = self.store.get_scenario(self.current_scenario_id)
@@ -391,8 +434,9 @@ class PlannerDock(QDockWidget):
             "scenarios and are kept." % scenario.get("name"),
             MESSAGE_BOX_YES | MESSAGE_BOX_NO, MESSAGE_BOX_NO)
         if answer == MESSAGE_BOX_YES:
-            self.store.delete_scenario(self.current_scenario_id)
-            self.refresh_scenarios()
+            if self._store_write("delete the scenario", self.store.delete_scenario,
+                                 self.current_scenario_id)[0]:
+                self.refresh_scenarios()
 
     def _anchor_changed(self):
         if self._loading:
@@ -402,7 +446,7 @@ class PlannerDock(QDockWidget):
             return
         anchor = self.anchor_edit.dateTime().toPyDateTime().replace(second=0, microsecond=0)
         scenario["start_datetime"] = anchor.strftime("%Y-%m-%dT%H:%M")
-        self.store.save_scenario(scenario)
+        self._store_write("save the scenario start", self.store.save_scenario, scenario)
         self.task_table.set_anchor(anchor)
 
     def _schedule_mode_changed(self, *_args):
@@ -416,7 +460,7 @@ class PlannerDock(QDockWidget):
         settings = _scenario_settings(scenario)
         settings["schedule_mode"] = mode
         scenario["settings_json"] = json.dumps(settings, sort_keys=True)
-        self.store.save_scenario(scenario)
+        self._store_write("save the schedule mode", self.store.save_scenario, scenario)
         self.task_table.set_schedule_mode(mode)
 
     def _set_anchor_caption(self, mode):

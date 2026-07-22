@@ -425,13 +425,46 @@ def unique_layer_name(existing, base: str) -> str:
     return f"{base}_{index}"
 
 
+def _writable(folder: str) -> bool:
+    return bool(folder) and os.path.isdir(folder) and os.access(folder, os.W_OK)
+
+
+def unsaved_project_folder() -> str:
+    """Folder to hold plugin GeoPackages when the project has never been saved.
+
+    The current working directory is not usable: QGIS launched from a Windows
+    shortcut inherits ``C:\\WINDOWS\\system32``, which is not writable, so the
+    GeoPackage cannot be created at all. Fall back to a plugin folder inside the
+    active QGIS profile, then the user home.
+    """
+    candidates = []
+    try:
+        from qgis.core import QgsApplication
+
+        settings_dir = QgsApplication.qgisSettingsDirPath()
+        if settings_dir:
+            candidates.append(os.path.join(settings_dir, "subsea_cable_tools"))
+    except Exception:
+        pass
+    candidates.append(os.path.join(os.path.expanduser("~"), "subsea_cable_tools"))
+    for folder in candidates:
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError:
+            continue
+        if _writable(folder):
+            return folder
+    home = os.path.expanduser("~")
+    return home if _writable(home) else os.getcwd()
+
+
 def default_gpkg_path(project_path: str, project_title: str = "") -> str:
     """Default workbench GeoPackage path beside the project file."""
     if project_path:
         folder = os.path.dirname(project_path)
         stem = os.path.splitext(os.path.basename(project_path))[0]
     else:
-        folder = os.getcwd()
+        folder = unsaved_project_folder()
         stem = sanitize_slug(project_title) if project_title else "project"
     return os.path.join(folder, f"{stem}_workbench.gpkg")
 

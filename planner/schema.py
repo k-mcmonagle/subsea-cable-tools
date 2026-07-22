@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 from typing import Dict, List, Tuple
 
-from ..workbench.schema import new_id, sanitize_slug, utc_now_iso
+from ..workbench.schema import new_id, sanitize_slug, unsaved_project_folder, utc_now_iso
 
 SCHEMA_VERSION = 6
 
@@ -134,6 +134,6 @@ def default_gpkg_path(project_path: str, project_title: str = "") -> str:
         folder = os.path.dirname(project_path)
         stem = os.path.splitext(os.path.basename(project_path))[0]
     else:
-        folder = os.getcwd()
+        folder = unsaved_project_folder()
         stem = sanitize_slug(project_title) if project_title else "project"
     return os.path.join(folder, "%s_planner.gpkg" % stem)
