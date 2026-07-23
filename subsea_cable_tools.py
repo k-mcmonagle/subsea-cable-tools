@@ -9,10 +9,11 @@ import os.path
 
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, Qt
 from qgis.PyQt.QtGui import QIcon
+from qgis.PyQt.QtWidgets import QMenu, QToolButton
 
 from qgis.core import QgsApplication
 
-from .qgis_compat import QAction
+from .qgis_compat import QAction, TOOLBUTTON_POPUP_MODE_INSTANT
 
 # Load Qt resources
 from .resources import *
@@ -77,6 +78,9 @@ class SubseaCableTools:
         self.planner_action = None
         self.explorer_action = None
         self.explorer_window = None
+        self.experimental_menu = None
+        self.experimental_tool_button = None
+        self.experimental_toolbar_action = None
 
     def tr(self, message):
         """Return the translation for a string."""
@@ -139,7 +143,6 @@ class SubseaCableTools:
         self.lay_simulator_action = QAction(QIcon(icon_v3_path), "Cable Lay Simulator (3D)", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
         self.lay_simulator_action.setToolTip("Cable Lay Simulator (3D): static hang, steady lay with drag, and operation simulation (beta).")
         self.lay_simulator_action.triggered.connect(self.show_lay_simulator)
-        self.iface.addToolBarIcon(self.lay_simulator_action)
         self.iface.addPluginToMenu(self.menu, self.lay_simulator_action)
         self.actions.append(self.lay_simulator_action)
 
@@ -151,7 +154,6 @@ class SubseaCableTools:
         self.workbench_action = QAction(wb_icon, "Cable Route Workbench", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
         self.workbench_action.setToolTip("Cable Route Workbench: assemblies, RPLs, fits, and cable systems — with map editing and an SLD.")
         self.workbench_action.triggered.connect(self.show_workbench)
-        self.iface.addToolBarIcon(self.workbench_action)
         self.iface.addPluginToMenu(self.menu, self.workbench_action)
         self.actions.append(self.workbench_action)
 
@@ -163,7 +165,6 @@ class SubseaCableTools:
         self.planner_action.setToolTip(
             "Build map-linked work plans, simulate vessel progress, and copy tasks to MS Project.")
         self.planner_action.triggered.connect(self.show_planner)
-        self.iface.addToolBarIcon(self.planner_action)
         self.iface.addPluginToMenu(self.menu, self.planner_action)
         self.actions.append(self.planner_action)
 
@@ -184,9 +185,38 @@ class SubseaCableTools:
         explorer_icon = QIcon(":/plugins/subsea_cable_tools/icon.png")
         self.explorer_action = QAction(explorer_icon, "Cable Lay Data Explorer", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
         self.explorer_action.triggered.connect(self.show_cable_lay_explorer)
-        self.iface.addToolBarIcon(self.explorer_action)
         self.iface.addPluginToMenu(self.menu, self.explorer_action)
         self.actions.append(self.explorer_action)
+
+        self._add_experimental_toolbar_menu()
+
+    def _add_experimental_toolbar_menu(self):
+        """Add one toolbar dropdown for tools that are still experimental."""
+        parent = self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None
+        self.experimental_tool_button = QToolButton(parent)
+        self.experimental_tool_button.setObjectName(
+            "subseaCableToolsExperimentalButton")
+        self.experimental_tool_button.setIcon(
+            QIcon(":/plugins/subsea_cable_tools/icon.png"))
+        self.experimental_tool_button.setText(self.tr("Experimental"))
+        self.experimental_tool_button.setToolTip(
+            self.tr("Experimental tools (beta)"))
+        # Every part of the button opens the menu; there is no arbitrary
+        # default experimental tool associated with its main click area.
+        self.experimental_tool_button.setPopupMode(
+            TOOLBUTTON_POPUP_MODE_INSTANT)
+
+        self.experimental_menu = QMenu(self.experimental_tool_button)
+        self.experimental_menu.setTitle(self.tr("Experimental tools"))
+        for action in (
+                self.workbench_action,
+                self.planner_action,
+                self.explorer_action,
+                self.lay_simulator_action):
+            self.experimental_menu.addAction(action)
+        self.experimental_tool_button.setMenu(self.experimental_menu)
+        self.experimental_toolbar_action = self.iface.addToolBarWidget(
+            self.experimental_tool_button)
 
     def show_catenary_calculator_v2(self):
         if self.catenary_calculator_v2_dialog is None:
@@ -356,6 +386,21 @@ class SubseaCableTools:
             except Exception:
                 pass
             self.explorer_window = None
+
+        # Remove the shared Experimental toolbar widget before its menu actions.
+        if getattr(self, 'experimental_toolbar_action', None):
+            try:
+                self.iface.removeToolBarIcon(self.experimental_toolbar_action)
+            except Exception:
+                pass
+            self.experimental_toolbar_action = None
+        if getattr(self, 'experimental_tool_button', None):
+            try:
+                self.experimental_tool_button.deleteLater()
+            except Exception:
+                pass
+            self.experimental_tool_button = None
+        self.experimental_menu = None
 
         # Remove actions from menu and toolbar
         if hasattr(self, 'actions'):

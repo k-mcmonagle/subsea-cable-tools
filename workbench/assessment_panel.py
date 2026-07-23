@@ -19,11 +19,7 @@ from __future__ import annotations
 import json
 from typing import Dict, List, Optional
 
-from qgis.core import (
-    QgsMapLayerProxyModel,
-    QgsProject,
-    QgsVectorLayer,
-)
+from qgis.core import QgsProject, QgsVectorLayer
 from qgis.gui import QgsFieldComboBox, QgsMapLayerComboBox
 from qgis.PyQt.QtCore import Qt, QTimer, pyqtSignal
 from qgis.PyQt.QtGui import QBrush, QColor, QPainter, QPen
@@ -54,6 +50,12 @@ from qgis.PyQt.QtWidgets import (
     QWidget,
 )
 
+from ..qgis_compat import (
+    DIALOG_ACCEPTED,
+    MAP_LAYER_FILTER_POLYGON,
+    MAP_LAYER_FILTER_VECTOR,
+    qt_exec,
+)
 from . import assessment_output, rules_inputs, schema
 from .rules_engine import Interval
 from .selection_bus import selection_bus
@@ -268,7 +270,7 @@ class RuleEditorDialog(QDialog):
             self.kind_form.addRow("Upper value (between)", self.value2_spin)
         elif kind == schema.RULE_KIND_PROXIMITY:
             self.layer_combo = QgsMapLayerComboBox()
-            self.layer_combo.setFilters(QgsMapLayerProxyModel.VectorLayer)
+            self.layer_combo.setFilters(MAP_LAYER_FILTER_VECTOR)
             _preselect_layer(self.layer_combo, config.get("layer_id"))
             self.dist_spin = QDoubleSpinBox()
             self.dist_spin.setRange(0.0, 100000.0)
@@ -283,7 +285,7 @@ class RuleEditorDialog(QDialog):
             self.kind_form.addRow("Filter expression", self.filter_edit)
         elif kind == schema.RULE_KIND_POLYGON:
             self.layer_combo = QgsMapLayerComboBox()
-            self.layer_combo.setFilters(QgsMapLayerProxyModel.PolygonLayer)
+            self.layer_combo.setFilters(MAP_LAYER_FILTER_POLYGON)
             _preselect_layer(self.layer_combo, config.get("layer_id"))
             self.field_combo = QgsFieldComboBox()
             self.field_combo.setLayer(self.layer_combo.currentLayer())
@@ -295,7 +297,7 @@ class RuleEditorDialog(QDialog):
             self.kind_form.addRow("Match values (comma)", self.values_edit)
         elif kind == schema.RULE_KIND_KP_TABLE:
             self.layer_combo = QgsMapLayerComboBox()
-            self.layer_combo.setFilters(QgsMapLayerProxyModel.VectorLayer)
+            self.layer_combo.setFilters(MAP_LAYER_FILTER_VECTOR)
             _preselect_layer(self.layer_combo, config.get("layer_id"))
             self.start_field = QgsFieldComboBox()
             self.start_field.setLayer(self.layer_combo.currentLayer())
@@ -679,7 +681,7 @@ class AssessmentPanel(QWidget):
             "notes": "",
         }
         dlg = RuleEditorDialog(rule, self.methods, self)
-        if dlg.exec_() == QDialog.DialogCode.Accepted:
+        if qt_exec(dlg) == DIALOG_ACCEPTED:
             self.rules.append(dlg.result())
             self._save_rules()
             self._rebuild_rule_table()
@@ -690,7 +692,7 @@ class AssessmentPanel(QWidget):
         if not (0 <= row < len(self.rules)):
             return
         dlg = RuleEditorDialog(self.rules[row], self.methods, self)
-        if dlg.exec_() == QDialog.DialogCode.Accepted:
+        if qt_exec(dlg) == DIALOG_ACCEPTED:
             self.rules[row] = dlg.result()
             self._save_rules()
             self._rebuild_rule_table()

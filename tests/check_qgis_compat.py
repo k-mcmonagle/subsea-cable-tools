@@ -29,7 +29,9 @@ CHECKS = (
     ("unscoped header resize mode", re.compile(r"QHeaderView\.(Interactive|Stretch|Fixed|ResizeToContents|Custom)")),
     ("unscoped Qgis message level", re.compile(r"Qgis\.(Info|Warning|Critical|Success)")),
     ("unscoped geometry enum", re.compile(r"QgsWkbTypes\.(LineGeometry|PointGeometry|PolygonGeometry|NullGeometry)")),
-    ("layer instance type enum", re.compile(r"\.(VectorLayer|RasterLayer)\b")),
+    ("layer instance type enum", re.compile(
+        r"QgsMapLayerProxyModel\."
+        r"(VectorLayer|RasterLayer|PointLayer|LineLayer|PolygonLayer)\b")),
     ("QVariant field type", re.compile(r"QVariant\.(String|Double|Int|LongLong|Bool)")),
     ("processing number enum", re.compile(r"QgsProcessingParameterNumber\.(Double|Integer)")),
     ("processing field enum", re.compile(r"QgsProcessingParameterField\.(Numeric|Any)")),
@@ -39,6 +41,9 @@ REQUIRED_COMPAT_ALIASES = (
     "WINDOW_TYPE_WINDOW", "WINDOW_HINT_CUSTOMIZE", "WINDOW_HINT_TITLE",
     "WINDOW_HINT_MIN_MAX", "WINDOW_HINT_CLOSE",
     "WKB_POINT", "WKB_LINESTRING", "WKB_NO_GEOMETRY",
+    "WKB_POINT_Z", "WKB_POINT_M",
+    "HEADER_RESIZE_MODE_FIXED",
+    "MAP_LAYER_FILTER_VECTOR", "MAP_LAYER_FILTER_POLYGON",
     "VECTOR_WRITER_OVERWRITE_LAYER", "VECTOR_WRITER_OVERWRITE_FILE",
     "VECTOR_WRITER_NO_ERROR",
     "DRAG_DROP_MODE_INTERNAL_MOVE", "DROP_ACTION_MOVE",

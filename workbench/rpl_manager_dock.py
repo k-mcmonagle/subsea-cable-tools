@@ -47,6 +47,12 @@ from qgis.core import (
 )
 
 from ..kp_range_utils import make_distance_area
+from ..qgis_compat import (
+    DIALOG_ACCEPTED,
+    WKB_LINESTRING,
+    WKB_POINT,
+    qt_exec,
+)
 from . import rpl_engine, schema
 from .depth_service import DepthService, DepthSourceConfig
 from .rpl_engine import RplModel, SlackMode
@@ -908,7 +914,7 @@ class RplManagerPanel(QWidget):
             return
 
         dialog = FitAssemblyDialog(assemblies, self.model, self)
-        if dialog.exec_() != QDialog.DialogCode.Accepted:
+        if qt_exec(dialog) != DIALOG_ACCEPTED:
             return
         assembly_row = dialog.selected_assembly()
         anchor = dialog.anchor()
@@ -1012,7 +1018,6 @@ class RplManagerPanel(QWidget):
 
     def _write_fit_layers(self, fit_name: str, result):
         from ..processing.cable_lay_parsers import WKT_KEY
-        from qgis.core import QgsWkbTypes
 
         body_specs = [
             ("name", "str"), ("body_type", "str"), ("cable_dist_m", "float"),
@@ -1061,10 +1066,12 @@ class RplManagerPanel(QWidget):
         bodies_layer = schema.fit_bodies_layer_name(fit_name)
         sections_layer = schema.fit_sections_layer_name(fit_name)
         if body_rows:
-            self.store.write_spatial_layer(bodies_layer, body_specs, QgsWkbTypes.Point, body_rows)
+            self.store.write_spatial_layer(
+                bodies_layer, body_specs, WKB_POINT, body_rows)
             self._reload_fit_layer(bodies_layer)
         if section_rows:
-            self.store.write_spatial_layer(sections_layer, section_specs, QgsWkbTypes.LineString, section_rows)
+            self.store.write_spatial_layer(
+                sections_layer, section_specs, WKB_LINESTRING, section_rows)
             self._reload_fit_layer(sections_layer)
 
     def _reload_fit_layer(self, layer_name: str):
@@ -1159,7 +1166,7 @@ class RplManagerPanel(QWidget):
             return
         config = DepthSourceConfig(self.store.rpl_depth_config(self.current_rpl["rpl_id"]))
         dialog = DepthSourcesDialog(config, self)
-        if dialog.exec_() == QDialog.DialogCode.Accepted:
+        if qt_exec(dialog) == DIALOG_ACCEPTED:
             self.current_rpl["depth_source_config"] = json.dumps(dialog.result_config().to_dict())
             try:
                 self.store.save_rpl(self.current_rpl)

@@ -18,6 +18,7 @@ from ...qgis_compat import (
     EDIT_TRIGGER_DOUBLE_CLICKED,
     SELECTION_BEHAVIOR_SELECT_ROWS,
     SELECTION_MODE_SINGLE,
+    qt_exec,
 )
 from ..dataset_model import LayDatasetTableModel
 
@@ -104,6 +105,6 @@ class DataTablePanel(QWidget):
             return
         menu = QMenu(self.view)
         action = menu.addAction("Go to (map + plots)")
-        chosen = menu.exec_(self.view.viewport().mapToGlobal(pos))
+        chosen = qt_exec(menu, self.view.viewport().mapToGlobal(pos))
         if chosen is action:
             self.controller.go_to_record(source_row)

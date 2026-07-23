@@ -26,9 +26,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from qgis.core import QgsCoordinateReferenceSystem, QgsProject, QgsWkbTypes
+from qgis.core import QgsCoordinateReferenceSystem, QgsProject
 
 from ..kp_range_utils import make_distance_area
+from ..qgis_compat import WKB_POINT
 from . import assembly_model as am
 from . import rpl_engine, schema
 from .depth_service import DepthService, DepthSourceConfig
@@ -237,7 +238,7 @@ class WorkbenchV3Adapter:
             return None
 
         layer_name = f"wb_v3_{schema.sanitize_slug(label)}"
-        self.store.write_spatial_layer(layer_name, specs, QgsWkbTypes.Point, rows)
+        self.store.write_spatial_layer(layer_name, specs, WKB_POINT, rows)
         return layer_name
 
 

@@ -24,6 +24,11 @@ try:
         QSplitter, QStackedWidget, QTabWidget, QTableWidget, QTableWidgetItem,
         QTextEdit, QToolButton, QVBoxLayout, QWidget,
     )
+    from ....qgis_compat import (
+        HEADER_RESIZE_MODE_FIXED,
+        HEADER_RESIZE_MODE_INTERACTIVE,
+        qt_exec,
+    )
 except Exception:  # pragma: no cover - standalone testing
     from PyQt5 import QtCore, QtGui
     from PyQt5.QtCore import Qt, QSettings
@@ -34,6 +39,13 @@ except Exception:  # pragma: no cover - standalone testing
         QSplitter, QStackedWidget, QTabWidget, QTableWidget, QTableWidgetItem,
         QTextEdit, QToolButton, QVBoxLayout, QWidget,
     )
+    _RESIZE_MODE = getattr(QHeaderView, "ResizeMode", QHeaderView)
+    HEADER_RESIZE_MODE_FIXED = _RESIZE_MODE.Fixed
+    HEADER_RESIZE_MODE_INTERACTIVE = _RESIZE_MODE.Interactive
+
+    def qt_exec(obj, *args, **kwargs):
+        exec_method = getattr(obj, "exec", None) or getattr(obj, "exec_")
+        return exec_method(*args, **kwargs)
 
 from .results_panel import render_results_html
 from .scene import compass_to_math_deg
@@ -401,14 +413,14 @@ class LaySimulatorDialog(QDialog):
             vh = table.verticalHeader()
             vh.setMinimumSectionSize(row_h)
             vh.setDefaultSectionSize(row_h)
-            vh.setSectionResizeMode(QHeaderView.Fixed)
+            vh.setSectionResizeMode(HEADER_RESIZE_MODE_FIXED)
         except Exception:
             pass
 
         # Let the user drag column dividers; the last column fills the rest.
         try:
             hh = table.horizontalHeader()
-            hh.setSectionResizeMode(QHeaderView.Interactive)
+            hh.setSectionResizeMode(HEADER_RESIZE_MODE_INTERACTIVE)
             hh.setStretchLastSection(stretch_last)
             hh.setMinimumSectionSize(40)
         except Exception:
@@ -2122,7 +2134,7 @@ class LaySimulatorDialog(QDialog):
         row.addWidget(cancel)
         v.addLayout(row)
         dlg.resize(560, 420)
-        dlg.exec() if hasattr(dlg, "exec") else dlg.exec_()
+        qt_exec(dlg)
 
     def _assembly_json(self) -> List[dict]:
         out = []

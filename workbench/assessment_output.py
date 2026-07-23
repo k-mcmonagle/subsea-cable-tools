@@ -12,9 +12,8 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
-from qgis.core import QgsWkbTypes
-
 from ..processing.cable_lay_parsers import WKT_KEY
+from ..qgis_compat import WKB_LINESTRING
 from . import schema
 from .rules_engine import AssessmentResult
 
@@ -85,7 +84,8 @@ def write_assessment_ranges(store, assessment_row: Dict, result: AssessmentResul
 
     store.save_assessment_ranges(assessment_id, registry_rows)
     if spatial_rows:
-        store.write_spatial_layer(layer_name, RANGE_LAYER_FIELDS, QgsWkbTypes.LineString, spatial_rows)
+        store.write_spatial_layer(
+            layer_name, RANGE_LAYER_FIELDS, WKB_LINESTRING, spatial_rows)
 
     assessment_row = dict(assessment_row)
     assessment_row["ranges_layer"] = layer_name

@@ -19,9 +19,9 @@ from qgis.core import (
     QgsProcessingFeedback,
     QgsProject,
     QgsVectorLayer,
-    QgsWkbTypes,
 )
 
+from ..qgis_compat import GEOMETRY_LINE, GEOMETRY_POINT
 from ..processing import cable_lay_parsers as clp
 from ..processing.create_cable_lay_geopackage_algorithm import CreateCableLayGeoPackageAlgorithm
 from ..processing.import_body_log_algorithm import ImportBodyLogAlgorithm
@@ -173,13 +173,13 @@ def test_setup_geopackage() -> bool:
     except Exception as exc:
         return _result("create cable lay geopackage", False, repr(exc))
     expected_geom = {
-        "cable_lay": QgsWkbTypes.PointGeometry,
-        "event_logs": QgsWkbTypes.PointGeometry,
-        "slack_logs": QgsWkbTypes.LineGeometry,
-        "body_logs": QgsWkbTypes.PointGeometry,
-        "model_solutions": QgsWkbTypes.PointGeometry,
-        "as_laid": QgsWkbTypes.PointGeometry,
-        "plough_data": QgsWkbTypes.PointGeometry,
+        "cable_lay": GEOMETRY_POINT,
+        "event_logs": GEOMETRY_POINT,
+        "slack_logs": GEOMETRY_LINE,
+        "body_logs": GEOMETRY_POINT,
+        "model_solutions": GEOMETRY_POINT,
+        "as_laid": GEOMETRY_POINT,
+        "plough_data": GEOMETRY_POINT,
     }
     missing = []
     wrong = []
@@ -204,7 +204,7 @@ def test_slack_importer() -> bool:
     ok = (
         layer is not None
         and layer.featureCount() == 2
-        and layer.geometryType() == QgsWkbTypes.LineGeometry
+        and layer.geometryType() == GEOMETRY_LINE
     )
     return _result("slack importer (lines)", ok, "" if ok else "unexpected result")
 
@@ -233,7 +233,7 @@ def test_cable_lay_importer() -> bool:
     ok = (
         layer is not None
         and layer.featureCount() == 3
-        and layer.geometryType() == QgsWkbTypes.PointGeometry
+        and layer.geometryType() == GEOMETRY_POINT
         and "ISO_Time" in [fld.name() for fld in layer.fields()]
     )
     return _result("cable lay importer (points + ISO_Time)", ok)

@@ -136,6 +136,7 @@ SNAPPING_UNIT_PIXELS = _snapping_member("Pixels", ("MapToolUnit", "UnitType"))
 
 HEADER_RESIZE_MODE_INTERACTIVE = _scoped_member(QHeaderView, "ResizeMode", "Interactive")
 HEADER_RESIZE_MODE_STRETCH = _scoped_member(QHeaderView, "ResizeMode", "Stretch")
+HEADER_RESIZE_MODE_FIXED = _scoped_member(QHeaderView, "ResizeMode", "Fixed")
 
 MESSAGEBOX_YES = _scoped_member(QMessageBox, "StandardButton", "Yes")
 MESSAGEBOX_NO = _scoped_member(QMessageBox, "StandardButton", "No")
@@ -144,6 +145,11 @@ TOOLBUTTON_POPUP_MODE_MENU_BUTTON = _scoped_member(
     QToolButton,
     "ToolButtonPopupMode",
     "MenuButtonPopup",
+)
+TOOLBUTTON_POPUP_MODE_INSTANT = _scoped_member(
+    QToolButton,
+    "ToolButtonPopupMode",
+    "InstantPopup",
 )
 
 MESSAGE_INFO = _scoped_member(Qgis, "MessageLevel", "Info")
@@ -157,6 +163,8 @@ GEOMETRY_POLYGON = _scoped_member(QgsWkbTypes, "GeometryType", "PolygonGeometry"
 GEOMETRY_NULL = _scoped_member(QgsWkbTypes, "GeometryType", "NullGeometry")
 
 WKB_POINT = _wkb_type("Point")
+WKB_POINT_Z = _wkb_type("PointZ")
+WKB_POINT_M = _wkb_type("PointM")
 WKB_LINESTRING = _wkb_type("LineString")
 WKB_NO_GEOMETRY = _wkb_type("NoGeometry")
 
@@ -218,6 +226,8 @@ ITEM_DATA_USER_ROLE = _scoped_member(Qt, "ItemDataRole", "UserRole")
 
 MAP_LAYER_FILTER_POINT = _layer_filter("PointLayer")
 MAP_LAYER_FILTER_LINE = _layer_filter("LineLayer")
+MAP_LAYER_FILTER_POLYGON = _layer_filter("PolygonLayer")
+MAP_LAYER_FILTER_VECTOR = _layer_filter("VectorLayer")
 
 MESSAGE_BOX_YES = _scoped_member(QMessageBox, "StandardButton", "Yes")
 MESSAGE_BOX_NO = _scoped_member(QMessageBox, "StandardButton", "No")

@@ -19,12 +19,12 @@ from qgis.core import (
     QgsPointXY,
     QgsProject,
     QgsVectorLayer,
-    QgsWkbTypes,
 )
 
 from ..kp_geo_utils import RouteFrame
 from ..kp_range_utils import make_distance_area
 from ..processing.cable_lay_parsers import WKT_KEY
+from ..qgis_compat import WKB_LINESTRING, WKB_POINT
 from ..workbench import rules_engine as eng
 from ..workbench import rules_inputs as ri
 from ..workbench import schema
@@ -189,8 +189,10 @@ def _build_rpl(store: WorkbenchStore) -> str:
         })
     points_name = schema.rpl_points_layer_name("test")
     lines_name = schema.rpl_lines_layer_name("test")
-    store.write_spatial_layer(points_name, schema.RPL_POINT_FIELDS, QgsWkbTypes.Point, point_rows)
-    store.write_spatial_layer(lines_name, schema.RPL_LINE_FIELDS, QgsWkbTypes.LineString, line_rows)
+    store.write_spatial_layer(
+        points_name, schema.RPL_POINT_FIELDS, WKB_POINT, point_rows)
+    store.write_spatial_layer(
+        lines_name, schema.RPL_LINE_FIELDS, WKB_LINESTRING, line_rows)
     store.save_rpl({
         "rpl_id": rid, "name": "test", "kind": "planned",
         "points_layer": points_name, "lines_layer": lines_name,

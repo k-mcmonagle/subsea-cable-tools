@@ -137,10 +137,11 @@ class SimulatorMapOverlay:
         Local metric geometry is georeferenced through the AEQD frame at
         ``origin_map_xy`` (in CRS ``crs_authid``, the canvas CRS), so the
         drawn scale is true in any coordinate system."""
-        from qgis.core import QgsGeometry, QgsPointXY, QgsWkbTypes
+        from qgis.core import QgsGeometry, QgsPointXY
         from qgis.gui import QgsRubberBand, QgsVertexMarker
         from qgis.PyQt.QtGui import QColor
 
+        from ....qgis_compat import GEOMETRY_LINE, GEOMETRY_POLYGON
         from .qgis_adapters import local_frame_transforms
 
         self.clear()
@@ -157,7 +158,7 @@ class SimulatorMapOverlay:
             xyz = xyz[np.all(np.isfinite(xyz[:, :2]), axis=1)]
             if len(xyz) < 2:
                 continue
-            band = QgsRubberBand(self._canvas, QgsWkbTypes.LineGeometry)
+            band = QgsRubberBand(self._canvas, GEOMETRY_LINE)
             color = QColor(str(getattr(path, "color", None)
                                or self._CABLE_COLORS[k % len(self._CABLE_COLORS)]))
             color.setAlpha(200)
@@ -173,7 +174,7 @@ class SimulatorMapOverlay:
             from .scene import vessel_footprint
 
             foot = vessel_footprint(vessel)
-            band = QgsRubberBand(self._canvas, QgsWkbTypes.PolygonGeometry)
+            band = QgsRubberBand(self._canvas, GEOMETRY_POLYGON)
             fill = QColor(70, 80, 90, 90)
             band.setColor(fill)
             band.setStrokeColor(QColor(235, 240, 245))

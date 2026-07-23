@@ -39,6 +39,7 @@ from qgis.PyQt.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from ..qgis_compat import DIALOG_ACCEPTED, qt_exec
 from . import assembly_model as am
 from . import schema
 from .assembly_model import Assembly, AssemblyItem
@@ -549,7 +550,7 @@ class AssemblyManagerPanel(QWidget):
         review = am.classify_events(model, classifier)
 
         dialog = ExtractReviewDialog(model, review, f"{rpl.get('name')} assembly", self)
-        if dialog.exec_() != QDialog.DialogCode.Accepted:
+        if qt_exec(dialog) != DIALOG_ACCEPTED:
             return False
         assembly = dialog.result_assembly()
         if assembly is None or not assembly.items:

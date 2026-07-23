@@ -28,11 +28,17 @@ from qgis.core import (
     QgsProject,
     QgsSpatialIndex,
     QgsVectorLayer,
-    QgsWkbTypes,
 )
 
 from ..kp_geo_utils import RouteFrame
 from ..kp_range_utils import make_distance_area
+from ..qgis_compat import (
+    GEOMETRY_POINT,
+    GEOMETRY_POLYGON,
+    WKB_POINT,
+    WKB_POINT_M,
+    WKB_POINT_Z,
+)
 from . import rules_engine as eng
 from . import schema
 from .depth_service import DepthService, DepthSourceConfig
@@ -292,7 +298,7 @@ def _acquire_proximity(sampler, config, project) -> List[Interval]:
         ctx.setFeature(feat)
         return bool(expr.evaluate(ctx))
 
-    if geom_type == QgsWkbTypes.PointGeometry:
+    if geom_type == GEOMETRY_POINT:
         # Chord method: exact per-feature, independent of station spacing.
         for geom, feat in feats.values():
             if not passes_filter(feat):
@@ -317,7 +323,8 @@ def _acquire_proximity(sampler, config, project) -> List[Interval]:
             geom, feat = feats[fid]
             if not passes_filter(feat):
                 continue
-            if geom_type == QgsWkbTypes.PolygonGeometry and geom.contains(QgsGeometry.fromPointXY(pt)):
+            if (geom_type == GEOMETRY_POLYGON and
+                    geom.contains(QgsGeometry.fromPointXY(pt))):
                 flag = True
                 break
             if _distance_to_geom_m(sampler.distance, pt, geom) <= buffer_m + 1e-6:
@@ -409,7 +416,7 @@ def _acquire_manual(sampler, config) -> List[Interval]:
 
 def _iter_points(geom: QgsGeometry):
     try:
-        if geom.wkbType() in (QgsWkbTypes.Point, QgsWkbTypes.PointZ, QgsWkbTypes.PointM):
+        if geom.wkbType() in (WKB_POINT, WKB_POINT_Z, WKB_POINT_M):
             yield geom.asPoint()
             return
         if geom.isMultipart():

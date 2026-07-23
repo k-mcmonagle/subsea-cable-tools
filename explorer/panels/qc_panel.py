@@ -40,6 +40,7 @@ from ...qgis_compat import (
     MESSAGEBOX_YES,
     SELECTION_BEHAVIOR_SELECT_ROWS,
     SELECTION_MODE_SINGLE,
+    WKB_POINT,
 )
 from ...laydata import QcRunner
 from ...laydata.qc_checks import ALL_CHECKS
@@ -332,7 +333,7 @@ class QcPanel(QWidget):
                 gpkg_path,
                 findings_layer,
                 clp.fields_from_specs(clp.QC_FINDINGS_SPECS),
-                clp.QgsWkbTypes.Point,
+                WKB_POINT,
                 existing_rows + rows,
                 transform_context,
             )

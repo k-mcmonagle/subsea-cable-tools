@@ -6,9 +6,10 @@ from __future__ import annotations
 import os
 import tempfile
 
-from qgis.core import QgsProject, QgsWkbTypes
+from qgis.core import QgsProject
 
 from ..processing.cable_lay_parsers import WKT_KEY
+from ..qgis_compat import WKB_LINESTRING, WKB_POINT
 from ..workbench import schema
 from ..workbench.store import WorkbenchReadOnlyError, WorkbenchStore
 
@@ -63,8 +64,9 @@ def _seed_spatial_pair(store: WorkbenchStore, rpl_id: str, name: str,
         "ExtraFlag": "keep" if extra else None,
         WKT_KEY: "LINESTRING (0 50, 0 50.01)",
     }]
-    store.write_spatial_layer(points_name, point_specs, QgsWkbTypes.Point, point_rows)
-    store.write_spatial_layer(lines_name, line_specs, QgsWkbTypes.LineString, line_rows)
+    store.write_spatial_layer(points_name, point_specs, WKB_POINT, point_rows)
+    store.write_spatial_layer(
+        lines_name, line_specs, WKB_LINESTRING, line_rows)
     return points_name, lines_name
 
 

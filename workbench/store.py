@@ -23,7 +23,6 @@ from qgis.core import (
     QgsCoordinateTransformContext,
     QgsProject,
     QgsVectorLayer,
-    QgsWkbTypes,
 )
 
 from ..processing.cable_lay_parsers import (
@@ -32,7 +31,12 @@ from ..processing.cable_lay_parsers import (
     open_gpkg_layer,
     write_layer_to_gpkg,
 )
-from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_LONG_LONG
+from ..qgis_compat import (
+    FIELD_TYPE_DOUBLE,
+    FIELD_TYPE_INT,
+    FIELD_TYPE_LONG_LONG,
+    WKB_NO_GEOMETRY,
+)
 from . import schema
 
 PROJECT_SCOPE = "SubseaCableTools"
@@ -139,7 +143,7 @@ class WorkbenchStore:
             self.gpkg_path,
             table,
             fields,
-            QgsWkbTypes.NoGeometry,
+            WKB_NO_GEOMETRY,
             rows,
             self.transform_context,
         )

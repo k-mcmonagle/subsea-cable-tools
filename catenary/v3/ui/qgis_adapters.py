@@ -285,7 +285,7 @@ def push_chains_to_map(
         QgsProject,
         QgsVectorLayer,
     )
-    from qgis.PyQt.QtCore import QVariant
+    from ....qgis_compat import FIELD_TYPE_STRING
 
     layer = QgsVectorLayer(f"LineStringZ?crs={crs_authid}", name, "memory")
     if not layer.isValid():
@@ -293,7 +293,7 @@ def push_chains_to_map(
             f"Could not create memory layer {name!r} (crs={crs_authid!r})."
         )
     provider = layer.dataProvider()
-    provider.addAttributes([QgsField("name", QVariant.String)])
+    provider.addAttributes([QgsField("name", FIELD_TYPE_STRING)])
     layer.updateFields()
 
     from qgis.core import QgsPointXY
@@ -340,7 +340,7 @@ def push_markers_to_map(
         QgsProject,
         QgsVectorLayer,
     )
-    from qgis.PyQt.QtCore import QVariant
+    from ....qgis_compat import FIELD_TYPE_STRING
 
     layer = QgsVectorLayer(f"PointZ?crs={crs_authid}", name, "memory")
     if not layer.isValid():
@@ -348,7 +348,7 @@ def push_markers_to_map(
             f"Could not create memory layer {name!r} (crs={crs_authid!r})."
         )
     provider = layer.dataProvider()
-    provider.addAttributes([QgsField("label", QVariant.String)])
+    provider.addAttributes([QgsField("label", FIELD_TYPE_STRING)])
     layer.updateFields()
 
     from qgis.core import QgsPointXY

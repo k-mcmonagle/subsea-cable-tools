@@ -112,6 +112,7 @@ def main() -> int:
         ("lay simulator steady lay (V3)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_v3_steady_lay")),
         ("lay simulator timeline (V3)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_v3_timeline")),
         ("lay simulator vessel geometry (V3)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_v3_vessel_geometry")),
+        ("lay simulator QGIS adapters (V3)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_v3_qgis_adapters")),
         ("seabed length algorithm", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_seabed_length")),
         ("cable lay importers", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_cable_lay_importers")),
         ("workbench store", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_workbench_store")),
@@ -130,6 +131,8 @@ def main() -> int:
         ("planner spatial task tools", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_planner_spatial_tasks")),
         ("planner standard tasks", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_planner_standard_tasks")),
         ("cable lay QC engine", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_laydata_qc")),
+        ("experimental toolbar dropdown", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_experimental_toolbar")),
+        ("QGIS compatibility widgets", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_qgis_compat_widgets")),
         ("processing provider", _provider_loads),
         ("main plugin import", _plugin_imports),
     ]

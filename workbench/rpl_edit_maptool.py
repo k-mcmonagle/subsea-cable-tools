@@ -33,9 +33,10 @@ from qgis.core import (
     QgsCoordinateTransform,
     QgsPointXY,
     QgsProject,
-    QgsWkbTypes,
 )
 from qgis.gui import QgsMapTool, QgsRubberBand, QgsVertexMarker
+
+from ..qgis_compat import GEOMETRY_LINE, qt_exec
 
 WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
 HIT_TOLERANCE_PX = 10
@@ -182,7 +183,7 @@ class RplEditTool(QgsMapTool):
         self._remove_marker("_drag_marker")
         self._remove_marker("_snap_marker")
         if self._preview_band is not None:
-            self._preview_band.reset(QgsWkbTypes.LineGeometry)
+            self._preview_band.reset(GEOMETRY_LINE)
 
     def _show_drag_marker(self, pt: QgsPointXY):
         if self._drag_marker is None:
@@ -196,12 +197,12 @@ class RplEditTool(QgsMapTool):
 
     def _update_preview_band(self, idx: int, pt: QgsPointXY):
         if self._preview_band is None:
-            band = QgsRubberBand(self.canvas, QgsWkbTypes.LineGeometry)
+            band = QgsRubberBand(self.canvas, GEOMETRY_LINE)
             band.setColor(QColor(255, 140, 0, 200))
             band.setWidth(2)
             band.setLineStyle(Qt.PenStyle.DashLine)
             self._preview_band = band
-        self._preview_band.reset(QgsWkbTypes.LineGeometry)
+        self._preview_band.reset(GEOMETRY_LINE)
         if idx > 0:
             self._preview_band.addPoint(self._canvas_points[idx - 1])
         self._preview_band.addPoint(pt)
@@ -239,7 +240,7 @@ class RplEditTool(QgsMapTool):
     def _context_menu(self, idx: int, event):
         menu = QMenu()
         delete_action = menu.addAction(f"Delete position {idx}")
-        chosen = menu.exec_(self.canvas.mapToGlobal(event.pos()))
+        chosen = qt_exec(menu, self.canvas.mapToGlobal(event.pos()))
         if chosen == delete_action:
             self.controller.commit_delete(idx)
             self.refresh_geometry()

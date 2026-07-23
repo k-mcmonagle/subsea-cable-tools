@@ -38,6 +38,7 @@ from qgis.core import QgsProject, QgsPointXY, QgsCoordinateReferenceSystem
 
 from ...qgis_compat import (
     EDIT_TRIGGER_DOUBLE_CLICKED,
+    GEOMETRY_LINE,
     HEADER_RESIZE_MODE_STRETCH,
     SELECTION_BEHAVIOR_SELECT_ROWS,
     SELECTION_MODE_SINGLE,
@@ -252,7 +253,7 @@ class InspectionPanel(QWidget):
             if not hasattr(layer, "geometryType"):
                 continue
             try:
-                is_line = layer.geometryType() == 1  # QgsWkbTypes.LineGeometry
+                is_line = layer.geometryType() == GEOMETRY_LINE
             except Exception:
                 is_line = False
             if is_line:

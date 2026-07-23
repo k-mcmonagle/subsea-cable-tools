@@ -15,9 +15,10 @@ from __future__ import annotations
 import os
 import tempfile
 
-from qgis.core import QgsCoordinateReferenceSystem, QgsProject, QgsWkbTypes
+from qgis.core import QgsCoordinateReferenceSystem, QgsProject
 
 from ..kp_range_utils import make_distance_area
+from ..qgis_compat import WKB_LINESTRING, WKB_POINT
 from ..workbench import assembly_model as am
 from ..workbench import rpl_engine as eng
 from ..workbench import schema
@@ -66,8 +67,10 @@ def _register_synthetic_rpl(store: WorkbenchStore, name: str = "Seg 1",
     rows = model_rows_for_layers(model, rpl_id, "synthetic")
     points_layer = schema.rpl_points_layer_name(name)
     lines_layer = schema.rpl_lines_layer_name(name)
-    store.write_spatial_layer(points_layer, schema.RPL_POINT_FIELDS, QgsWkbTypes.Point, rows["points"])
-    store.write_spatial_layer(lines_layer, schema.RPL_LINE_FIELDS, QgsWkbTypes.LineString, rows["lines"])
+    store.write_spatial_layer(
+        points_layer, schema.RPL_POINT_FIELDS, WKB_POINT, rows["points"])
+    store.write_spatial_layer(
+        lines_layer, schema.RPL_LINE_FIELDS, WKB_LINESTRING, rows["lines"])
     store.save_rpl({
         "rpl_id": rpl_id, "name": name, "kind": "planned",
         "points_layer": points_layer, "lines_layer": lines_layer,
