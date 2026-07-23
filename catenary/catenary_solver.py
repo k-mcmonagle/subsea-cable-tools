@@ -844,19 +844,30 @@ class CatenarySystemCalculator:
                     # Give up gracefully: best (least-inconsistent) iterate.
                     return min(eval_history, key=lambda t: abs(t[1] - t[0]))[0]
 
-                lo, hi, flo, _fhi = bracket
-                for _ in range(24):
-                    if (hi - lo) <= tdp_tol_m:
+                lo, hi, flo, fhi = bracket
+                # Track the evaluated x with the smallest |f| = |layback(x) - x|
+                # and bisect below the TDP tolerance: on a steep, non-contractive
+                # profile the residual at the bracket midpoint is ~|g'-1| times
+                # the bracket half-width, so a bracket merely <= tol can still
+                # leave an out-of-tolerance residual. Half a tolerance of width
+                # keeps the returned residual comfortably inside tolerance.
+                best_x = lo if abs(flo) <= abs(fhi) else hi
+                best_abs_f = min(abs(flo), abs(fhi))
+                target_w = min(tdp_tol_m, 0.25)
+                for _ in range(40):
+                    if (hi - lo) <= target_w:
                         break
                     mid = 0.5 * (lo + hi)
                     fm = f(mid)
                     if math.isnan(fm):
                         break
+                    if abs(fm) < best_abs_f:
+                        best_abs_f, best_x = abs(fm), mid
                     if flo * fm <= 0.0:
                         hi = mid
                     else:
                         lo, flo = mid, fm
-                return 0.5 * (lo + hi)
+                return best_x
             finally:
                 self.cfg["ds_m"] = ds_full
 
@@ -918,6 +929,23 @@ class CatenarySystemCalculator:
             self._tdp_x_world = float(x_converged)
             _apply_bottom_tension_scaling(self._tdp_x_world)
             self._solve_once()
+
+            # Picard's step-size test bounds the *input* inconsistency
+            # |layback(x0) - x0|, but it then locks in the *output* x1 =
+            # layback(x0) and re-solves there. On a non-contractive undulating
+            # profile (|g'| > 1, as clamped above) the residual at that locked-in
+            # point is ~|g'|*tol and can exceed tolerance even though Picard
+            # "converged". Verify the actual fixed-point residual and, if it is
+            # out of tolerance, escalate to the bracketed bisection, which solves
+            # layback(x) = x directly.
+            if not used_bisection_fallback:
+                residual = abs(float(self.layback or 0.0) - float(self._tdp_x_world))
+                if residual > tdp_tol_m:
+                    x_bisect = _tdp_bisection_root()
+                    used_bisection_fallback = True
+                    self._tdp_x_world = float(x_bisect)
+                    _apply_bottom_tension_scaling(self._tdp_x_world)
+                    self._solve_once()
             return iters
 
         try:

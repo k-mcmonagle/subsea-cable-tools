@@ -27,6 +27,8 @@ try:
     from ....qgis_compat import (
         HEADER_RESIZE_MODE_FIXED,
         HEADER_RESIZE_MODE_INTERACTIVE,
+        SIZE_POLICY_IGNORED,
+        SIZE_POLICY_PREFERRED,
         qt_exec,
     )
 except Exception:  # pragma: no cover - standalone testing
@@ -42,6 +44,9 @@ except Exception:  # pragma: no cover - standalone testing
     _RESIZE_MODE = getattr(QHeaderView, "ResizeMode", QHeaderView)
     HEADER_RESIZE_MODE_FIXED = _RESIZE_MODE.Fixed
     HEADER_RESIZE_MODE_INTERACTIVE = _RESIZE_MODE.Interactive
+    _SIZE_POLICY = getattr(QSizePolicy, "Policy", QSizePolicy)
+    SIZE_POLICY_IGNORED = _SIZE_POLICY.Ignored
+    SIZE_POLICY_PREFERRED = _SIZE_POLICY.Preferred
 
     def qt_exec(obj, *args, **kwargs):
         exec_method = getattr(obj, "exec", None) or getattr(obj, "exec_")
@@ -2695,9 +2700,9 @@ class LaySimulatorDialog(QDialog):
         for i in range(self.op_stack.count()):
             w = self.op_stack.widget(i)
             if w is cur:
-                w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+                w.setSizePolicy(SIZE_POLICY_PREFERRED, SIZE_POLICY_PREFERRED)
             else:
-                w.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+                w.setSizePolicy(SIZE_POLICY_IGNORED, SIZE_POLICY_IGNORED)
         if cur is not None:
             cur.adjustSize()
         self.op_stack.adjustSize()
@@ -3151,7 +3156,7 @@ class LaySimulatorDialog(QDialog):
             self, "Reset inputs",
             "Reset every input, table and saved value of the Cable Lay "
             "Simulator to its factory default?")
-        if btn != QMessageBox.Yes:
+        if btn != getattr(QMessageBox, "StandardButton", QMessageBox).Yes:
             return
         self._initializing = True
         try:

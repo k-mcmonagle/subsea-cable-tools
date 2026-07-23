@@ -13,7 +13,7 @@ import io
 import json
 from typing import Dict, List, Sequence, Tuple
 
-from . import schema
+from . import operation_types, schema
 
 TEMPLATE_FIELDS = ("name", "description", "operation_type", "duration_hours", "speed_knots",
                    "fuel_mode", "bunker_amount", "notes")
@@ -21,7 +21,8 @@ _NUMBER_FIELDS = ("duration_hours", "speed_knots", "bunker_amount")
 _VALID_FUEL_MODES = {value for value, _label in schema.FUEL_MODES}
 _FUEL_ALIASES = {label.lower(): value for value, label in schema.FUEL_MODES}
 _FUEL_ALIASES["none"] = ""
-_VALID_OPERATIONS = {value for value, _label in schema.OPERATION_TYPES}
+# Operation types are user-defined, so CSV import accepts any operation string;
+# the built-in labels are still recognised as aliases for their stable codes.
 _OPERATION_ALIASES = {label.lower(): value for value, label in schema.OPERATION_TYPES}
 
 
@@ -98,14 +99,15 @@ def templates_from_csv_text(text: str) -> Tuple[List[Dict], List[str]]:
         template = {"name": name, "description": cell("description"),
                     "notes": cell("notes")}
         operation = cell("operation_type").lower()
-        resolved_operation = (operation if operation in _VALID_OPERATIONS
-                              else _OPERATION_ALIASES.get(operation))
-        if resolved_operation is None:
-            resolved_operation = ""
-            if operation:
-                warnings.append("Row %d: unknown operation type '%s'."
-                                % (line_number, cell("operation_type")))
-        template["operation_type"] = resolved_operation
+        # Recognise a built-in label alias, otherwise keep the user's own
+        # operation as a stable slug. Unknown operations are no longer warnings
+        # because the list is user-defined.
+        if operation in _OPERATION_ALIASES:
+            template["operation_type"] = _OPERATION_ALIASES[operation]
+        elif operation:
+            template["operation_type"] = operation_types.slugify(operation)
+        else:
+            template["operation_type"] = ""
         for field in _NUMBER_FIELDS:
             raw_value = cell(field)
             try:

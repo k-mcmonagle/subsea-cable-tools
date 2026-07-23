@@ -21,7 +21,7 @@ from ..qgis_compat import (
     ITEM_FLAG_EDITABLE, SELECTION_BEHAVIOR_SELECT_ROWS, SELECTION_MODE_EXTENDED,
     qt_exec,
 )
-from . import schema
+from . import operation_types, schema
 from .timeline_engine import TaskSpec, compute_fuel, compute_schedule
 
 
@@ -92,6 +92,9 @@ class TaskTableWidget(QTableWidget):
         self.resolver = resolver
         self.rows = []
         self.resources = []
+        # (value, label) operation-type choices; user-configured, blank by
+        # default. The dock pushes the current list via set_operation_choices.
+        self.operation_choices = [operation_types.UNSPECIFIED]
         self.collapsed_groups = set()
         self._active_task_ids = set()
         self.anchor = datetime.now().replace(second=0, microsecond=0)
@@ -169,6 +172,20 @@ class TaskTableWidget(QTableWidget):
         self._rebuild()
         if not self._user_layout:
             self._auto_size_columns()
+
+    def set_operation_choices(self, choices):
+        """Replace the operation-type dropdown choices and refresh the table.
+
+        ``choices`` is a sequence of ``(value, label)`` pairs (typically from
+        ``operation_types.as_choices``). The unspecified entry is ensured to
+        lead the list.
+        """
+        cleaned = [(str(value or ""), str(label or "")) for value, label in (choices or [])]
+        if not cleaned or cleaned[0][0] != "":
+            cleaned = [operation_types.UNSPECIFIED] + [c for c in cleaned if c[0] != ""]
+        self.operation_choices = cleaned
+        if self.rows:
+            self._rebuild()
 
     def set_history_hooks(self, snapshot_provider=None, snapshot_restorer=None):
         """Add optional state hooks so the dock can include owned geometries."""
@@ -858,9 +875,12 @@ class TaskTableWidget(QTableWidget):
     def _operation_combo(self, row, task, summary=False):
         combo = QComboBox()
         combo.setEditable(True)
-        for value, label in schema.OPERATION_TYPES:
-            combo.addItem(label, value)
         current = task.get("operation_type") or ""
+        choices = list(self.operation_choices)
+        if current and current not in {value for value, _label in choices}:
+            choices.append((current, current))
+        for value, label in choices:
+            combo.addItem(label, value)
         index = combo.findData(current)
         if index >= 0:
             combo.setCurrentIndex(index)

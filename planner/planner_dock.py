@@ -37,7 +37,7 @@ from ..qgis_compat import (
     WINDOW_HINT_CUSTOMIZE, WINDOW_HINT_MIN_MAX, WINDOW_HINT_TITLE, WINDOW_TYPE_WINDOW,
     qt_exec,
 )
-from . import schema, standard_tasks
+from . import operation_types, schema, standard_tasks
 from .feature_ref import FeatureReferenceResolver, feature_reference
 from .map_overlay import FeaturePickSession, PlannerMapOverlay
 from .msproject_export import build_msp_tsv
@@ -50,6 +50,7 @@ from .timeline_engine import position_at
 
 LABEL_SETTING_PREFIX = "subsea_cable_tools/planner/simulation_labels/"
 STANDARD_TASKS_SETTING = "subsea_cable_tools/planner/standard_tasks"
+OPERATION_TYPES_SETTING = "subsea_cable_tools/planner/operation_types"
 LABEL_OPTIONS = (
     ("show", "Show task labels", True),
     ("task_name", "Task name", True),
@@ -145,6 +146,7 @@ class PlannerDock(QDockWidget):
         outer.addLayout(self._build_scenario_bar())
         outer.addLayout(self._build_task_buttons())
         self.task_table = TaskTableWidget(self.resolver)
+        self.task_table.set_operation_choices(self._operation_choices())
         self.task_table.set_history_hooks(
             self._planner_history_snapshot, self._restore_planner_history_snapshot)
         outer.addWidget(self.task_table, 1)
@@ -213,6 +215,7 @@ class PlannerDock(QDockWidget):
         layout = QHBoxLayout()
         for label, slot in (("Add task", lambda: self.task_table.add_task()),
                             ("Standard tasks…", self._standard_tasks),
+                            ("Operation types…", self._edit_operation_types),
                             ("Sketch tasks…", self._sketch_tasks),
                             ("Import RPL…", self._import_rpl)):
             button = QPushButton(label)
@@ -492,7 +495,7 @@ class PlannerDock(QDockWidget):
         task = self.task_table.row_by_id(task_id)
         if task is None:
             return
-        dialog = AdvancedTaskDialog(task, self)
+        dialog = AdvancedTaskDialog(task, self, self._operation_choices())
         if qt_exec(dialog) == DIALOG_ACCEPTED:
             self.task_table.update_task_fields(task_id, dialog.values())
 
@@ -810,12 +813,29 @@ class PlannerDock(QDockWidget):
         self._discard_owned_geometry(task_id)
         self.task_table.update_link(task_id, {}, record_history=False)
 
+    def _operation_choices(self):
+        """User-configured operation types as (value, label) combo choices."""
+        raw = QSettings().value(OPERATION_TYPES_SETTING, "")
+        return operation_types.as_choices(operation_types.entries_from_json(raw))
+
+    def _edit_operation_types(self):
+        settings = QSettings()
+        entries = operation_types.entries_from_json(
+            settings.value(OPERATION_TYPES_SETTING, ""))
+        dialog = OperationTypesDialog(entries, self)
+        result = qt_exec(dialog)
+        settings.setValue(OPERATION_TYPES_SETTING,
+                          operation_types.entries_to_json(dialog.entries()))
+        if result == DIALOG_ACCEPTED:
+            self.task_table.set_operation_choices(self._operation_choices())
+
     def _standard_tasks(self):
         settings = QSettings()
         raw = settings.value(STANDARD_TASKS_SETTING, "")
-        templates = (standard_tasks.templates_from_json(raw) if raw
-                     else standard_tasks.default_templates())
-        dialog = StandardTasksDialog(templates, self)
+        # The library starts blank; users curate it (or load the example set
+        # from within the dialog) and it persists per user.
+        templates = standard_tasks.templates_from_json(raw) if raw else []
+        dialog = StandardTasksDialog(templates, self, self._operation_choices())
         result = qt_exec(dialog)
         settings.setValue(STANDARD_TASKS_SETTING,
                           standard_tasks.templates_to_json(dialog.templates()))
@@ -1268,7 +1288,7 @@ class ScheduleAvailabilityDialog(QDialog):
 class AdvancedTaskDialog(QDialog):
     """Advanced scheduling controls; simple tasks never need to open this."""
 
-    def __init__(self, task, parent=None):
+    def __init__(self, task, parent=None, operation_choices=None):
         super().__init__(parent)
         self.task = dict(task)
         self.setWindowTitle("Advanced task settings — %s" % (task.get("name") or "Task"))
@@ -1279,9 +1299,12 @@ class AdvancedTaskDialog(QDialog):
         form = QFormLayout()
         self.operation = QComboBox()
         self.operation.setEditable(True)
-        for value, label in schema.OPERATION_TYPES:
-            self.operation.addItem(label, value)
         operation = task.get("operation_type") or ""
+        for value, label in operation_types.as_choices(
+                [{"value": v, "label": l}
+                 for v, l in (operation_choices or [operation_types.UNSPECIFIED]) if v],
+                include=operation):
+            self.operation.addItem(label, value)
         index = self.operation.findData(operation)
         if index >= 0:
             self.operation.setCurrentIndex(index)
@@ -1579,11 +1602,12 @@ class StandardTasksDialog(QDialog):
     COL_BUNKER = 6
     COL_NOTES = 7
 
-    def __init__(self, templates, parent=None):
+    def __init__(self, templates, parent=None, operation_choices=None):
         super().__init__(parent)
         self.setWindowTitle("Standard tasks")
         self.resize(940, 430)
         self.selected_templates = []
+        self.operation_choices = operation_choices or [operation_types.UNSPECIFIED]
         layout = QVBoxLayout(self)
         intro = QLabel(
             "Curate reusable task templates, stored per user across projects. "
@@ -1616,8 +1640,11 @@ class StandardTasksDialog(QDialog):
         buttons = QHBoxLayout()
         for label, slot in (("Add", lambda: self._add_row()),
                             ("Remove", self._remove_selected),
+                            ("Load examples", self._load_examples),
                             ("Import CSV…", self._import_csv),
-                            ("Export CSV…", self._export_csv)):
+                            ("Export CSV…", self._export_csv),
+                            ("Import JSON…", self._import_json),
+                            ("Export JSON…", self._export_json)):
             button = QPushButton(label)
             button.clicked.connect(slot)
             buttons.addWidget(button)
@@ -1658,10 +1685,17 @@ class StandardTasksDialog(QDialog):
         combo.setCurrentIndex(max(0, combo.findData(template.get("fuel_mode") or "")))
         self.table.setCellWidget(row, self.COL_FUEL, combo)
         operation_combo = QComboBox()
-        for value, label in schema.OPERATION_TYPES:
+        operation_combo.setEditable(True)
+        current_op = template.get("operation_type") or ""
+        for value, label in operation_types.as_choices(
+                [{"value": v, "label": l} for v, l in self.operation_choices if v],
+                include=current_op):
             operation_combo.addItem(label, value)
-        operation_combo.setCurrentIndex(max(
-            0, operation_combo.findData(template.get("operation_type") or "")))
+        op_index = operation_combo.findData(current_op)
+        if op_index >= 0:
+            operation_combo.setCurrentIndex(op_index)
+        else:
+            operation_combo.setEditText(current_op)
         self.table.setCellWidget(row, self.COL_OPERATION, operation_combo)
 
     def _remove_selected(self):
@@ -1679,7 +1713,9 @@ class StandardTasksDialog(QDialog):
         return {
             "name": name,
             "description": self._text(row, self.COL_DESCRIPTION),
-            "operation_type": (operation_combo.currentData() if operation_combo else "") or "",
+            "operation_type": (
+                (operation_combo.currentData() or operation_combo.currentText().strip())
+                if operation_combo else ""),
             "duration_hours": self._number(row, self.COL_DURATION),
             "speed_knots": self._number(row, self.COL_SPEED),
             "fuel_mode": (combo.currentData() if combo else "") or "",
@@ -1758,6 +1794,193 @@ class StandardTasksDialog(QDialog):
         QMessageBox.information(self, "Export standard tasks",
                                 "%d standard task(s) exported to:\n%s"
                                 % (len(templates), path))
+
+    def _load_examples(self):
+        for template in standard_tasks.default_templates():
+            self._add_row(template)
+        QMessageBox.information(
+            self, "Standard tasks",
+            "Added the built-in example templates. Edit or remove any you do "
+            "not need; the library is saved per user when you close.")
+
+    def _import_json(self):
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "Import standard tasks", "", "JSON files (*.json);;All files (*.*)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8-sig") as handle:
+                text = handle.read()
+        except OSError as exc:
+            QMessageBox.warning(self, "Import standard tasks",
+                                "Could not read the file: %s" % exc)
+            return
+        imported = standard_tasks.templates_from_json(text)
+        if not imported:
+            QMessageBox.warning(self, "Import standard tasks",
+                                "No standard tasks found in the file.")
+            return
+        for template in imported:
+            self._add_row(template)
+        QMessageBox.information(self, "Import standard tasks",
+                                "%d standard task(s) added to the library." % len(imported))
+
+    def _export_json(self):
+        templates = self.templates()
+        if not templates:
+            QMessageBox.information(self, "Export standard tasks",
+                                    "There are no standard tasks to export.")
+            return
+        path, _filter = QFileDialog.getSaveFileName(
+            self, "Export standard tasks", "standard_tasks.json",
+            "JSON files (*.json);;All files (*.*)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(standard_tasks.templates_to_json(templates))
+        except OSError as exc:
+            QMessageBox.warning(self, "Export standard tasks",
+                                "Could not write the file: %s" % exc)
+            return
+        QMessageBox.information(self, "Export standard tasks",
+                                "%d standard task(s) exported to:\n%s"
+                                % (len(templates), path))
+
+
+class OperationTypesDialog(QDialog):
+    """Curate the user's list of Planner operation types (blank by default).
+
+    Operation types are stored per user and shared through a simple JSON
+    round-trip. Each row is a display label with an optional stable code; a
+    blank code is derived from the label.
+    """
+
+    COL_LABEL = 0
+    COL_CODE = 1
+
+    def __init__(self, entries, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Operation types")
+        self.resize(520, 420)
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Define the operation types offered in the task Operation dropdown. "
+            "These are stored per user across projects and start blank. The "
+            "optional Code is the value stored on a task; leave it blank to "
+            "derive it from the label. Share a list with Export/Import JSON.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Operation", "Code (optional)"])
+        self.table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
+        self.table.setSelectionMode(SELECTION_MODE_EXTENDED)
+        self.table.setColumnWidth(self.COL_LABEL, 260)
+        self.table.setColumnWidth(self.COL_CODE, 200)
+        layout.addWidget(self.table)
+        buttons = QHBoxLayout()
+        for label, slot in (("Add", lambda: self._add_row()),
+                            ("Remove", self._remove_selected),
+                            ("Load examples", self._load_examples),
+                            ("Import JSON…", self._import_json),
+                            ("Export JSON…", self._export_json)):
+            button = QPushButton(label)
+            button.clicked.connect(slot)
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        save_btn = QPushButton("Save")
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        buttons.addWidget(save_btn)
+        buttons.addWidget(cancel_btn)
+        layout.addLayout(buttons)
+        for entry in operation_types.normalize_entries(entries):
+            self._add_row(entry)
+        _polish_dialog_table(self.table)
+
+    def _add_row(self, entry=None):
+        entry = entry or {"label": "", "value": ""}
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, self.COL_LABEL,
+                           QTableWidgetItem(str(entry.get("label") or "")))
+        self.table.setItem(row, self.COL_CODE,
+                           QTableWidgetItem(str(entry.get("value") or "")))
+
+    def _remove_selected(self):
+        for row in sorted({index.row() for index in
+                           self.table.selectionModel().selectedRows()}, reverse=True):
+            self.table.removeRow(row)
+
+    def entries(self):
+        rows = []
+        for row in range(self.table.rowCount()):
+            label_item = self.table.item(row, self.COL_LABEL)
+            code_item = self.table.item(row, self.COL_CODE)
+            rows.append({
+                "label": label_item.text().strip() if label_item else "",
+                "value": code_item.text().strip() if code_item else "",
+            })
+        return operation_types.normalize_entries(rows)
+
+    def _load_examples(self):
+        existing = {entry["value"] for entry in self.entries()}
+        for entry in operation_types.example_operation_types():
+            if entry["value"] not in existing:
+                self._add_row(entry)
+
+    def _import_json(self):
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "Import operation types", "", "JSON files (*.json);;All files (*.*)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8-sig") as handle:
+                text = handle.read()
+        except OSError as exc:
+            QMessageBox.warning(self, "Import operation types",
+                                "Could not read the file: %s" % exc)
+            return
+        imported, warnings = operation_types.entries_from_json_text(text)
+        if not imported:
+            QMessageBox.warning(self, "Import operation types",
+                                "\n".join(warnings) or "No operation types found in the file.")
+            return
+        existing = {entry["value"] for entry in self.entries()}
+        added = 0
+        for entry in imported:
+            if entry["value"] not in existing:
+                self._add_row(entry)
+                existing.add(entry["value"])
+                added += 1
+        message = "%d operation type(s) added." % added
+        if warnings:
+            message += "\n\n" + "\n".join(warnings[:8])
+        QMessageBox.information(self, "Import operation types", message)
+
+    def _export_json(self):
+        entries = self.entries()
+        if not entries:
+            QMessageBox.information(self, "Export operation types",
+                                    "There are no operation types to export.")
+            return
+        path, _filter = QFileDialog.getSaveFileName(
+            self, "Export operation types", "operation_types.json",
+            "JSON files (*.json);;All files (*.*)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(operation_types.entries_to_json(entries))
+        except OSError as exc:
+            QMessageBox.warning(self, "Export operation types",
+                                "Could not write the file: %s" % exc)
+            return
+        QMessageBox.information(self, "Export operation types",
+                                "%d operation type(s) exported to:\n%s"
+                                % (len(entries), path))
 
 
 class ResourceDialog(QDialog):

@@ -1762,7 +1762,7 @@ class GoToKPDialog(QDialog):
 
         self.setWindowTitle("Go to KP")
         self.setModal(True)
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
 
         layout = QVBoxLayout(self)
 

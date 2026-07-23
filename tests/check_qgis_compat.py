@@ -35,6 +35,7 @@ CHECKS = (
     ("QVariant field type", re.compile(r"QVariant\.(String|Double|Int|LongLong|Bool)")),
     ("processing number enum", re.compile(r"QgsProcessingParameterNumber\.(Double|Integer)")),
     ("processing field enum", re.compile(r"QgsProcessingParameterField\.(Numeric|Any)")),
+    ("unscoped Qt window flag", re.compile(r"Qt\.(Window[A-Za-z]*Hint|FramelessWindowHint|WindowStaysOnTopHint)")),
 )
 
 REQUIRED_COMPAT_ALIASES = (

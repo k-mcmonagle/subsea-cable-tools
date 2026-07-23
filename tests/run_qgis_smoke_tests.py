@@ -130,6 +130,7 @@ def main() -> int:
         ("planner task table", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_planner_task_table")),
         ("planner spatial task tools", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_planner_spatial_tasks")),
         ("planner standard tasks", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_planner_standard_tasks")),
+        ("planner operation types", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_planner_operation_types")),
         ("cable lay QC engine", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_laydata_qc")),
         ("experimental toolbar dropdown", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_experimental_toolbar")),
         ("QGIS compatibility widgets", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_qgis_compat_widgets")),
