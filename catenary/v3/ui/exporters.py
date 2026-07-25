@@ -165,6 +165,21 @@ def schedule_csv_rows(snapshots: Sequence) -> Tuple[List[str], List[List]]:
                 seen.add(c.name)
                 chain_names.append(c.name)
 
+    # Optional columns, present only when any snapshot carries the data:
+    # cable counts (chains with a count reference) and joint positions.
+    count_chains = [n for n in chain_names if any(
+        getattr(c, "count_top_m", None) is not None
+        for s in snapshots for c in s.chains if c.name == n)]
+    joint_keys: List[Tuple[str, str]] = []       # (chain, joint label)
+    seen_j = set()
+    for snap in snapshots:
+        for c in snap.chains:
+            for label, _xyz in (getattr(c, "joints_xyz", None) or []):
+                key = (c.name, str(label))
+                if key not in seen_j:
+                    seen_j.add(key)
+                    joint_keys.append(key)
+
     header = ["dist_from_start_m", "t_s", "phase", "vessel_x_m", "vessel_y_m",
               "heading_degN", "ship_speed_kmh"]
     for name in chain_names:
@@ -173,6 +188,11 @@ def schedule_csv_rows(snapshots: Sequence) -> Tuple[List[str], List[List]]:
         header.append(f"top_tension_{name}_kN")
     for name in chain_names:
         header.append(f"tdp_tension_{name}_kN")
+    for name in count_chains:
+        header.append(f"count_{name}_m")
+    for cname, label in joint_keys:
+        stem = f"joint_{cname}" if label == "joint" else f"joint_{cname}_{label}"
+        header += [f"{stem}_x_m", f"{stem}_y_m", f"{stem}_z_m"]
     header += ["leg_imbalance_kN", "BU_x_m", "BU_y_m", "BU_z_m"]
 
     def _tdp_kN(c) -> Any:
@@ -218,6 +238,19 @@ def schedule_csv_rows(snapshots: Sequence) -> Tuple[List[str], List[List]]:
         for name in chain_names:
             c = by_name.get(name)
             row.append(_tdp_kN(c) if c is not None else "")
+        for name in count_chains:
+            c = by_name.get(name)
+            count = getattr(c, "count_top_m", None) if c is not None else None
+            row.append(_num(count, 1) if count is not None else "")
+        for cname, label in joint_keys:
+            c = by_name.get(cname)
+            found = None
+            for jlabel, jxyz in (getattr(c, "joints_xyz", None) or []):
+                if str(jlabel) == label:
+                    found = jxyz
+                    break
+            row += ([_num(found[0]), _num(found[1]), _num(found[2])]
+                    if found is not None else ["", "", ""])
         c1, c2 = by_name.get("leg1"), by_name.get("leg2")
         row.append(_num(c1.top_tension_kN - c2.top_tension_kN)
                    if c1 is not None and c2 is not None else "")

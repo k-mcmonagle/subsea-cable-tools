@@ -111,16 +111,58 @@ class ChainState:
     min_elems: int = 24
     max_elems: int = 800
     mapper_direction: str = "from_bottom"
+    # Which end of THIS chain the assembly's first row sits at. The BU
+    # scenarios build every line's assembly outward from the branching unit
+    # (tail, tail joint, then the cable beyond), which is the chain's top end
+    # for a leg and its bottom end for the trunk:
+    #
+    #   * ``"top_end"``    — first row at the top node (legs: the BU end).
+    #   * ``"bottom_end"`` — first row at the bottom node (trunk: the BU).
+    #   * ``None``         — legacy: ``mapper_direction`` alone decides, i.e.
+    #     the assembly is pinned by its last row to the bottom end.
+    #
+    # Combined with a ``fill=True`` remainder row this pins every entered
+    # feature at its entered distance from the datum, whatever length the
+    # geometry gives the chain.
+    assembly_datum: Optional[str] = None
     transport_speed_mps: float = 0.0
     # A joint on the line as a MATERIAL coordinate: metres of cable from the
     # bottom (far/laid) end. Fixed for the whole operation — paying out moves
     # the joint outboard along the span, hauling in brings it back over the
     # sheave. None = no joint to track.
     joint_s_from_bottom_m: Optional[float] = None
+    # Additional named joints, each a (label, s_from_bottom_m) material
+    # coordinate with the same semantics as ``joint_s_from_bottom_m`` — e.g.
+    # repair joints or factory splices along a leg or the trunk.
+    joints: List[Tuple[str, float]] = field(default_factory=list)
+    # Cable-count referencing: the cable marking ("roto count") at the
+    # chain's BOTTOM (far/laid) end, metres. With ``count_to_top`` the count
+    # increases from the bottom end toward the vessel, so the count at a
+    # material point is ``count_ref_m + s_from_bottom`` (False flips the
+    # sign). None = no count reference defined.
+    count_ref_m: Optional[float] = None
+    count_to_top: bool = True
 
     def n_elems(self) -> int:
         n = int(math.ceil(self.length_m / max(self.target_ds_m, 0.1)))
         return max(self.min_elems, min(self.max_elems, n))
+
+    def oriented_assembly(self) -> Tuple[List[AssemblyItem], str]:
+        """``(items, mapper direction)`` honouring :attr:`assembly_datum`.
+
+        The mapper always pins the assembly by whichever row ends up next to
+        the chain's bottom node, so a bottom-end datum is expressed by
+        reversing the rows.
+        """
+        if self.assembly_datum == "top_end":
+            return list(self.assembly), "from_bottom"
+        if self.assembly_datum == "bottom_end":
+            return list(self.assembly)[::-1], "from_bottom"
+        if self.assembly_datum is not None:
+            raise ValueError(
+                f"assembly_datum must be 'top_end', 'bottom_end' or None "
+                f"(got {self.assembly_datum!r})")
+        return list(self.assembly), self.mapper_direction
 
 
 @dataclass
@@ -226,6 +268,10 @@ class SimOptions:
     # Global element-length multiplier applied at build time (>1 = coarser).
     # Used by the coarse settle pass and by preview-quality runs.
     mesh_scale: float = 1.0
+    # Minimum substeps for a phase carrying a sheave transfer, so the
+    # top-end lerp is genuinely gradual even when the phase has no vessel
+    # motion or payout to size the substeps from.
+    transfer_min_substeps: int = 8
     # Optional payout controller (duck-typed, e.g. control.
     # TensionBalanceController): ``rates(base_dict, last_snapshot) -> dict``
     # called every substep to redistribute the step's payout rates.
@@ -264,26 +310,33 @@ class ChainSnapshot:
     # Interpolated position of the chain's joint (see ChainState.
     # joint_s_from_bottom_m); None while the joint is still inboard.
     joint_xyz: Optional[Tuple[float, float, float]] = None
+    # All named joints currently outboard: (label, xyz) per resolved joint
+    # (the legacy scalar joint plus every ChainState.joints entry).
+    joints_xyz: List[Tuple[str, Tuple[float, float, float]]] = field(
+        default_factory=list)
+    # Cable count at the top (winch/sheave) end, if the chain has a count
+    # reference (see ChainState.count_ref_m).
+    count_top_m: Optional[float] = None
 
 
-def joint_point(st: Optional[ChainState], xyz: "np.ndarray",
-                s: "np.ndarray") -> Optional[Tuple[float, float, float]]:
-    """Where the chain's joint sits on the solved span.
+def material_point(st: Optional[ChainState], xyz: "np.ndarray",
+                   s: "np.ndarray", s_from_bottom_m: float,
+                   ) -> Optional[Tuple[float, float, float]]:
+    """Where a fixed material coordinate (metres of cable from the bottom
+    end) sits on the solved span.
 
-    The joint is a fixed material point ``joint_s_from_bottom_m`` metres
-    from the bottom end. The material coordinate is mapped proportionally
-    onto the discretised arc (whose sampled length can fall slightly short
-    of the true deployed length), so a joint exactly at the sheave shows at
-    the top node rather than vanishing to rounding. Returns None while the
-    joint is inboard (not yet paid past the sheave) or the chain has no
-    joint.
+    The material coordinate is mapped proportionally onto the discretised
+    arc (whose sampled length can fall slightly short of the true deployed
+    length), so a point exactly at the sheave shows at the top node rather
+    than vanishing to rounding. Returns None while the point is inboard
+    (not yet paid past the sheave).
     """
-    if st is None or st.joint_s_from_bottom_m is None or len(s) < 2:
+    if st is None or len(s) < 2:
         return None
     L = float(st.length_m)
     if L <= 0.0:
         return None
-    frac = 1.0 - float(st.joint_s_from_bottom_m) / L
+    frac = 1.0 - float(s_from_bottom_m) / L
     if frac < 0.0 or frac > 1.0:
         return None
     s_top = float(s[-1]) * frac
@@ -292,6 +345,47 @@ def joint_point(st: Optional[ChainState], xyz: "np.ndarray",
     return (float(np.interp(s_top, s, xyz[:, 0])),
             float(np.interp(s_top, s, xyz[:, 1])),
             float(np.interp(s_top, s, xyz[:, 2])))
+
+
+def joint_point(st: Optional[ChainState], xyz: "np.ndarray",
+                s: "np.ndarray") -> Optional[Tuple[float, float, float]]:
+    """Position of the chain's legacy scalar joint (see
+    ``ChainState.joint_s_from_bottom_m``); None if unset or still inboard."""
+    if st is None or st.joint_s_from_bottom_m is None:
+        return None
+    return material_point(st, xyz, s, float(st.joint_s_from_bottom_m))
+
+
+def joint_points(st: Optional[ChainState], xyz: "np.ndarray",
+                 s: "np.ndarray") -> List[Tuple[str, Tuple[float, float, float]]]:
+    """All currently-outboard joints of a chain as (label, xyz).
+
+    Combines the legacy scalar joint (labelled ``"joint"``) with every
+    named entry in ``ChainState.joints``. Inboard joints are omitted.
+    """
+    out: List[Tuple[str, Tuple[float, float, float]]] = []
+    if st is None:
+        return out
+    if st.joint_s_from_bottom_m is not None:
+        p = material_point(st, xyz, s, float(st.joint_s_from_bottom_m))
+        if p is not None:
+            out.append(("joint", p))
+    for entry in getattr(st, "joints", None) or []:
+        label, s_bot = str(entry[0]), float(entry[1])
+        p = material_point(st, xyz, s, s_bot)
+        if p is not None:
+            out.append((label, p))
+    return out
+
+
+def count_at_m(st: Optional[ChainState],
+               s_from_bottom_m: float) -> Optional[float]:
+    """Cable count at a material coordinate, using the chain's count
+    reference (count at the bottom end). None when no reference is set."""
+    if st is None or st.count_ref_m is None:
+        return None
+    d = float(s_from_bottom_m)
+    return float(st.count_ref_m) + (d if st.count_to_top else -d)
 
 
 @dataclass
@@ -338,8 +432,36 @@ class OperationSimulator:
         # Chains already warned about unactionable payout (no winch on top).
         self._payout_warned: set = set()
         self._last_snap: Optional[Snapshot] = None
+        # Assembly-vs-chain-length mismatches, one message per chain: the
+        # assembly is rebuilt every substep, so warn on the worst fit seen.
+        self._asm_warned: Dict[str, float] = {}
+        self.assembly_warnings: List[str] = []
 
     # -- system assembly ----------------------------------------------------
+
+    def _check_assembly_fit(self, st: ChainState, fit) -> None:
+        """Record a warning when a chain outgrows its assembly.
+
+        Beyond the assembly's extent the end segment's properties are
+        stretched, which is silent in the results otherwise. Only the worst
+        shortfall per chain is reported (chains are rebuilt every substep).
+        """
+        short = float(getattr(fit, "short_by_m", 0.0) or 0.0)
+        if short <= 1.0:
+            return
+        if short <= self._asm_warned.get(st.name, 0.0) + 1.0:
+            return
+        self._asm_warned[st.name] = short
+        msg = (
+            f"'{st.name}': the assembly covers {fit.total_m:.0f} m but the "
+            f"line reaches {st.length_m:.0f} m — the end segment's "
+            f"properties were stretched over the last {short:.0f} m. Add a "
+            "remainder (fill) segment or lengthen the assembly."
+        )
+        self.assembly_warnings = [
+            m for m in self.assembly_warnings
+            if not m.startswith(f"'{st.name}':")
+        ] + [msg]
 
     def _build(self) -> Tuple[CableSystem, Dict[str, int]]:
         """Discretise the current scenario state into a solvable system."""
@@ -399,7 +521,10 @@ class OperationSimulator:
                 shape[-1] = self._sheave_xyz(st.bottom.sheave)
             elif st.bottom.kind == "fixed" and st.bottom.xyz is not None:
                 shape[-1] = st.bottom.xyz
-            mapper = AssemblyMapper(st.assembly, st.defaults, st.mapper_direction)
+            asm_items, asm_direction = st.oriented_assembly()
+            mapper = AssemblyMapper(asm_items, st.defaults, asm_direction,
+                                    span_m=st.length_m)
+            self._check_assembly_fit(st, mapper.fit)
             start_id, top_fixed = end_node_for(st.top, shape[0])
             end_id, bottom_fixed = end_node_for(st.bottom, shape[-1])
             ch = b.add_chain(
@@ -473,6 +598,7 @@ class OperationSimulator:
         )
         self._absorb(res, jnode)
         snap = self._snapshot(res, jnode, label="settle")
+        snap.warnings.extend(self.assembly_warnings)
         self._last_snap = snap
         return snap
 
@@ -513,6 +639,7 @@ class OperationSimulator:
                 if progress is not None:
                     if not progress(min(1.0, done_t / total_t), step.label or ""):
                         out.aborted = True
+                        out.warnings.extend(self.assembly_warnings)
                         return out
             if step.transfer is not None:
                 # Transfer complete: the chain now lives on the destination
@@ -521,6 +648,7 @@ class OperationSimulator:
                 if st is not None:
                     st.top = Attachment("sheave", sheave=step.transfer.to_sheave)
                 self._transfer = None
+        out.warnings.extend(self.assembly_warnings)
         return out
 
     def _apply_events(self, step: Step, out: SimResult):
@@ -581,6 +709,10 @@ class OperationSimulator:
         move = step.vessel_speed_mps * step.duration_s
         pay = max((abs(r) * step.duration_s for r in step.payout_mps.values()), default=0.0)
         n = int(math.ceil(max(move, pay) / max(self.opt.max_move_m, 1.0)))
+        if step.transfer is not None:
+            # A pure-transfer phase (no motion, ~no payout) must still lerp
+            # the top across several substeps, not jump it in one.
+            n = max(n, int(self.opt.transfer_min_substeps))
         return max(1, n)
 
     def _advance(self, step: Step, dt: float) -> Snapshot:
@@ -718,6 +850,10 @@ class OperationSimulator:
                 min_radius_m=c.min_radius_m,
                 length_m=float(c.s[-1]),
                 joint_xyz=joint_point(self.sc.chains.get(c.name), c.xyz, c.s),
+                joints_xyz=joint_points(self.sc.chains.get(c.name), c.xyz, c.s),
+                count_top_m=count_at_m(
+                    self.sc.chains.get(c.name),
+                    getattr(self.sc.chains.get(c.name), "length_m", 0.0) or 0.0),
             )
             for c in res.chains
         ]

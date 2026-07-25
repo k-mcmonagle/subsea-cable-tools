@@ -140,6 +140,7 @@ def optimize_bu_schedule(
     max_rounds: int = 3,
     preview_options: Optional[SimOptions] = None,
     progress=None,
+    sim_factory=None,
 ) -> OptimizeResult:
     """Place the operation so the BU lands on ``target_landing_xy``.
 
@@ -157,6 +158,10 @@ def optimize_bu_schedule(
     leg balance controller: the trunk payout is trimmed each substep to
     hold that touchdown tension during the lay-ahead. Use the
     ``min/max_bottom_tension_kN`` limits to have excursions reported.
+
+    ``sim_factory`` substitutes the simulator class for the preview runs
+    (e.g. ``quick_bu.QuickOperationSimulator``); default is the full
+    :class:`OperationSimulator` at preview options.
     """
     limits = limits or DeploymentLimits()
     p = dict(params)
@@ -214,7 +219,8 @@ def optimize_bu_schedule(
             span = 1.0 / float(max_rounds)
             sub_progress = (lambda f, lbl, _b=base, _s=span:
                             progress(_b + _s * f, f"preview {rounds}: {lbl}"))
-        res = OperationSimulator(scn, bathy, opts).run(sub_progress)
+        make_sim = sim_factory or OperationSimulator
+        res = make_sim(scn, bathy, opts).run(sub_progress)
         landing = _landing_xy(res)
         if landing is None:
             warnings.append(

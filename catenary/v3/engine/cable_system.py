@@ -18,11 +18,20 @@ Property mapping direction:
   assembly. This keeps the material mapping stable while cable is paid out
   (the deployed window grows toward the top of the assembly), so timeline
   simulations use it.
+
+Either way the assembly is pinned by ONE of its ends to the corresponding
+end of the chain, so a chain longer than the assembly gets the far segment's
+properties stretched over the remainder (flagged as ``clamped``). To pin the
+*near* end instead — the usual need when the features that matter are
+measured outward from a datum such as a branching unit, and the length of
+plain cable beyond them is whatever the geometry demands — give one segment
+``fill=True``: :func:`resolve_assembly` expands it so the assembly spans the
+chain exactly, leaving every other row at a fixed distance from the datum.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
@@ -49,6 +58,10 @@ class SegmentSpec:
     cd_normal: float = 1.2
     cd_tangential: float = 0.01
     mass_kgpm: float = 0.0            # physical mass/length; 0 -> derived
+    # Remainder ("fill") segment: its length is not entered but resolved to
+    # whatever is left of the chain after the fixed-length rows
+    # (see :func:`resolve_assembly`). At most one per assembly.
+    fill: bool = False
 
 
 @dataclass
@@ -94,6 +107,7 @@ def parse_assembly(data: Sequence[dict]) -> List[AssemblyItem]:
                     cd_normal=float(entry.get("cd_normal", 1.2) or 1.2),
                     cd_tangential=float(entry.get("cd_tangential", 0.01) or 0.0),
                     mass_kgpm=float(entry.get("mass_kgpm", 0.0) or 0.0),
+                    fill=bool(entry.get("fill", False)),
                 )
             )
     return items
@@ -130,6 +144,8 @@ def assembly_to_json_data(items: Sequence[AssemblyItem]) -> List[dict]:
             d["cd_tangential"] = it.cd_tangential
             if it.mass_kgpm:
                 d["mass_kgpm"] = it.mass_kgpm
+            if it.fill:
+                d["fill"] = True
         out.append(d)
     return out
 
@@ -164,6 +180,66 @@ def uniform_assembly(length_m: float, q_water_npm: float, *, q_air_npm: float = 
 
 
 @dataclass
+class AssemblyFit:
+    """How an assembly fits the chain length it is being mapped onto.
+
+    ``fill_m`` is the length the remainder row(s) resolved to; ``short_by_m``
+    is how much of the chain the assembly fails to cover (its end properties
+    get stretched over that much cable); ``over_by_m`` is assembly beyond the
+    chain's extent (rows the chain never reaches).
+    """
+
+    span_m: Optional[float] = None
+    fixed_m: float = 0.0
+    fill_m: float = 0.0
+    n_fill: int = 0
+    total_m: float = 0.0
+    short_by_m: float = 0.0
+    over_by_m: float = 0.0
+
+    @property
+    def exact(self) -> bool:
+        return self.short_by_m <= 1e-6 and self.over_by_m <= 1e-6
+
+
+def resolve_assembly(items: Sequence[AssemblyItem], span_m: Optional[float] = None,
+                     ) -> Tuple[List[AssemblyItem], AssemblyFit]:
+    """Expand remainder ("fill") segments so the assembly spans ``span_m``.
+
+    Fixed-length rows keep their entered lengths, so every feature stays at
+    its entered distance from the assembly's datum end; the fill row absorbs
+    the balance. Returns a new item list (inputs are not mutated) plus an
+    :class:`AssemblyFit` describing the fit. With ``span_m`` None, or no fill
+    row, the items come back unchanged and the fit just reports the mismatch.
+    """
+    items = list(items)
+    fixed = 0.0
+    n_fill = 0
+    for it in items:
+        if not isinstance(it, SegmentSpec):
+            continue
+        if it.fill:
+            n_fill += 1
+        else:
+            fixed += max(0.0, float(it.length_m))
+    fit = AssemblyFit(span_m=span_m, fixed_m=fixed, n_fill=n_fill)
+    if n_fill and span_m is not None:
+        each = max(0.0, float(span_m) - fixed) / n_fill
+        out: List[AssemblyItem] = []
+        for it in items:
+            if isinstance(it, SegmentSpec) and it.fill:
+                it = replace(it, length_m=each)
+            out.append(it)
+        items = out
+        fit.fill_m = each * n_fill
+    fit.total_m = fixed + fit.fill_m
+    if span_m is not None:
+        fit.short_by_m = max(0.0, float(span_m) - fit.total_m)
+        fit.over_by_m = max(0.0, fit.total_m - float(span_m))
+    return items, fit
+
+
+@dataclass
 class Defaults:
     """Fallbacks for blank per-segment values."""
 
@@ -183,12 +259,17 @@ class AssemblyMapper:
     ``direction`` is 'from_top' (positions measured from the first item) or
     'from_bottom' (from the end of the last item, i.e. material-stable under
     pay-out at the top).
+
+    ``span_m`` is the length of chain the assembly is about to be mapped
+    onto; it resolves remainder ("fill") rows (see :func:`resolve_assembly`)
+    and populates :attr:`fit` so callers can warn about a mismatch.
     """
 
     def __init__(self, items: Sequence[AssemblyItem], defaults: Optional[Defaults] = None,
-                 direction: str = "from_top"):
+                 direction: str = "from_top", span_m: Optional[float] = None):
         if direction not in ("from_top", "from_bottom"):
             raise ValueError("direction must be 'from_top' or 'from_bottom'")
+        items, self.fit = resolve_assembly(items, span_m)
         self.items = list(items)
         self.defaults = defaults or Defaults()
         self.direction = direction
@@ -314,6 +395,9 @@ class Chain:
     rho_kgpm: "np.ndarray"             # physical mass per length
     seg_id: "np.ndarray"               # assembly segment index per element
     transport_speed_mps: float = 0.0   # material speed along the chain (s+)
+    # Elements whose arc position fell outside the assembly, so an end
+    # segment's properties were stretched over them (None = not recorded).
+    clamped: Optional["np.ndarray"] = None
 
     @property
     def n_elems(self) -> int:
@@ -440,6 +524,7 @@ class SystemBuilder:
             rho_kgpm=props["rho_kgpm"],
             seg_id=props["seg_id"],
             transport_speed_mps=float(transport_speed_mps),
+            clamped=props["clamped"],
         )
         self._chains.append(chain)
         if add_bodies:

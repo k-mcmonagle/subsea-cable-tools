@@ -118,10 +118,40 @@ def bu_deployment(
     bu_start_depth_m: Optional[float] = None,
     trunk_slack_pct: float = 2.0,
     static_only: bool = False,
+    leg1_joints: Optional[List[Tuple[str, float]]] = None,
+    leg2_joints: Optional[List[Tuple[str, float]]] = None,
+    trunk_joints: Optional[List[Tuple[str, float]]] = None,
+    count_refs: Optional[Dict[str, float]] = None,
+    schedule: Optional[List["PhaseRow"]] = None,
+    leg_far_ends_xy: Optional[Sequence[Tuple[float, float]]] = None,
 ) -> Scenario:
     """Deploy a branching unit: the BU hangs from the trunk while its two
     pre-laid legs run along the bed; the vessel steams along
     ``vessel_course_deg`` paying out trunk until the BU lands.
+
+    ``schedule`` replaces the single straight-line step with a phase list
+    (e.g. the tension-target planner's vessel track + payout): each row
+    becomes one step; rows must not carry events (no topology changes in
+    the lowering-only scenario).
+
+    Every line's assembly is read **outward from the BU** — the tail, its
+    tail joint, then the cable beyond — with one ``fill=True`` remainder row
+    absorbing whatever length the geometry demands. Nothing is cut or
+    jointed during this scenario (all three lines are made up before it
+    starts), so the BU is a fixed material point on all of them and the
+    entered distances hold whatever leg length the plan produces.
+
+    ``leg*_joints`` / ``trunk_joints`` are optional named joints as
+    (label, metres-from-the-bottom-end) material coordinates, shown in the
+    3D view and exports. ``count_refs`` maps chain names (``leg1``,
+    ``leg2``, ``trunk``) to the cable count at the chain's bottom (laid /
+    BU) end so reported positions carry real cable markings.
+
+    ``leg_far_ends_xy`` overrides the default far-end placement (92 % of
+    the leg length along each azimuth): pass the two anchored ends
+    explicitly — e.g. the layback-consistent geometry from the
+    tension-target planner, where each leg's suspended catenary at the
+    target bottom tension is already accounted for.
 
     Initial state: BU at ``bu_start_depth_m`` below the vessel (default just
     below the surface); legs laid out on the bed along ``leg_azimuths_deg``
@@ -151,13 +181,24 @@ def bu_deployment(
         shape=sagged_shape(chute, np.asarray(bu_start), 30, slack_frac=0.02),
         target_ds_m=max(2.0, target_ds_m / 2.0),
         min_elems=30,
+        # Assembly built outward from the BU (the trunk's bottom end): tail,
+        # tail joint, then the main trunk as a remainder row that grows with
+        # payout. Every entered feature keeps its distance from the BU.
+        assembly_datum="bottom_end",
+        joints=list(trunk_joints or []),
+        count_ref_m=(count_refs or {}).get("trunk"),
     )
 
     chains: Dict[str, ChainState] = {"trunk": trunk}
+    leg_joints = {1: list(leg1_joints or []), 2: list(leg2_joints or [])}
     for i, az in enumerate(leg_azimuths_deg, start=1):
         a = math.radians(az)
         ux, uy = math.cos(a), math.sin(a)
-        end = (leg_length_m * 0.92 * ux, leg_length_m * 0.92 * uy)
+        if leg_far_ends_xy is not None:
+            end = (float(leg_far_ends_xy[i - 1][0]),
+                   float(leg_far_ends_xy[i - 1][1]))
+        else:
+            end = (leg_length_m * 0.92 * ux, leg_length_m * 0.92 * uy)
         end_xyz = (end[0], end[1], _bed_z(bathy, end[0], end[1]))
         # Seed: hanging catenary from the BU to a touchdown guess, then a
         # bed-following tail along the azimuth (follows slopes and grids).
@@ -172,10 +213,31 @@ def bu_deployment(
             bottom=Attachment("fixed", xyz=end_xyz),
             shape=shape,
             target_ds_m=target_ds_m,
+            # A leg hangs from the BU for the whole lowering, so its assembly
+            # is also built outward from the BU — here the chain's TOP end.
+            assembly_datum="top_end",
+            joints=leg_joints.get(i, []),
+            count_ref_m=(count_refs or {}).get(f"leg{i}"),
         )
 
     if static_only:
         steps = []
+    elif schedule is not None:
+        steps = []
+        for row in schedule:
+            if row.event:
+                raise ValueError(
+                    "bu_deployment schedules cannot carry events "
+                    f"(row {row.label!r} has {row.event!r}).")
+            course = (vessel_course_deg if row.course_deg is None
+                      else float(row.course_deg))
+            steps.append(Step(
+                duration_s=float(row.duration_s),
+                vessel_course_deg=course,
+                vessel_speed_mps=float(row.speed_mps),
+                payout_mps=dict(row.payout_mps),
+                label=row.label,
+            ))
     else:
         if duration_s is None:
             # Rough time to land the BU: descent ~ payout rate.
@@ -473,8 +535,18 @@ def bu_full_deployment(
     bu_spawn_depth_m: float = 2.0,
     trunk_slack_pct: float = 2.0,
     target_ds_m: float = 5.0,
+    leg1_joints: Optional[List[Tuple[str, float]]] = None,
+    leg2_joints: Optional[List[Tuple[str, float]]] = None,
+    trunk_joints: Optional[List[Tuple[str, float]]] = None,
+    count_refs: Optional[Dict[str, float]] = None,
 ) -> Scenario:
     """The full BU deployment from the two-sheave jointing set-up.
+
+    ``leg*_joints`` / ``trunk_joints`` add extra named joints as
+    (label, metres-from-bottom) material coordinates on top of the
+    automatic leg/trunk splice joints. ``count_refs`` maps chain names to
+    the cable count at each chain's bottom end (laid end for the legs, the
+    BU for the trunk) so outputs carry real cable markings.
 
     Initial state: the two legs are pre-laid on the bed to their fixed far
     ends (``laid_end_*_xy``), with their recovered ends held over the port
@@ -523,6 +595,8 @@ def bu_full_deployment(
             # sits at the sheave: its material position from the laid end is
             # the deployed length right now, and it stays there for good.
             joint_s_from_bottom_m=length,
+            joints=list((leg1_joints if i == 1 else leg2_joints) or []),
+            count_ref_m=(count_refs or {}).get(f"leg{i}"),
         )
         leg_len0[i] = length
 
@@ -555,6 +629,14 @@ def bu_full_deployment(
             # (the trunk's bottom end); it emerges over the sheave once
             # more than the tail has been paid out.
             joint_s_from_bottom_m=tail_trunk,
+            # The trunk is spawned already made up to the BU, so its
+            # assembly reads outward from the BU like the lowering scenario.
+            # (The legs are NOT: their BU ends are still inboard of the
+            # sheaves until the cut/joint is modelled, so they stay pinned
+            # at their laid ends here.)
+            assembly_datum="bottom_end",
+            joints=list(trunk_joints or []),
+            count_ref_m=(count_refs or {}).get("trunk"),
         )
         t1 = float(tail_leg1_m if tail_leg1_m is not None else tail_length_m)
         t2 = float(tail_leg2_m if tail_leg2_m is not None else tail_length_m)

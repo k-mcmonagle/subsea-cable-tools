@@ -138,6 +138,9 @@ class _SceneCache:
         self.vessel_deck_slice: Optional[slice] = None   # deck footprint (extruded hull)
         self.vessel_chute_slice: Optional[slice] = None  # chute point + CRP point
         self.chute_arc_slice: Optional[slice] = None     # overboarding chute arc
+        self.vessel_sheaves_slice: Optional[slice] = None  # individual sheave points
+        self.vessel_sheave_labels: List[str] = []
+        self.trail_slice: Optional[slice] = None          # vessel snail trail
         self.departure_label: str = "chute"              # text at the departure anchor
         self.vessel_color = "#444444"
         self.vessel_label = ""
@@ -367,6 +370,15 @@ class View3DWidget(QWidget):
         if mk_pts:
             cache.marker_slice = push(np.array(mk_pts))
 
+        trail = getattr(scene, "vessel_trail", None)
+        if trail is not None:
+            tr = np.asarray(trail, dtype=float).reshape(-1, 2)
+            tr = tr[np.isfinite(tr).all(axis=1)]
+            if len(tr) >= 2:
+                wz = float(getattr(scene, "water_z", 0.0))
+                cache.trail_slice = push(
+                    np.column_stack([tr, np.full(len(tr), wz)]))
+
         vessel = getattr(scene, "vessel", None)
         if vessel is not None and np.isfinite(np.asarray(vessel.xy, dtype=float)).all():
             wz = float(getattr(scene, "water_z", 0.0))
@@ -386,6 +398,11 @@ class View3DWidget(QWidget):
                 arc = chute_arc_points(vessel, wz)
                 if arc is not None:
                     cache.chute_arc_slice = push(arc)
+            sheaves = getattr(vessel, "sheaves_xy", None) or []
+            if sheaves:
+                cache.vessel_sheave_labels = [str(s[0]) for s in sheaves]
+                cache.vessel_sheaves_slice = push(np.array(
+                    [(float(s[1]), float(s[2]), wz + height) for s in sheaves]))
             cache.vessel_color = str(getattr(vessel, "color", "#444444"))
             cache.vessel_label = str(getattr(vessel, "label", ""))
             cache.departure_label = str(getattr(vessel, "departure_label", "chute"))
@@ -827,6 +844,19 @@ class View3DWidget(QWidget):
             elif kind == "junction":
                 painter.drawPolygon(QtGui.QPolygonF(
                     [point(x, y - r), point(x + r, y), point(x, y + r), point(x - r, y)]))
+            elif kind == "joint":
+                # Splice symbol: a circle with a bar across it.
+                painter.drawEllipse(QtCore.QRectF(x - r, y - r, 2 * r, 2 * r))
+                painter.setPen(QtGui.QPen(QtGui.QColor(240, 244, 248, 230), 1.6))
+                painter.drawLine(point(x - r * 1.5, y), point(x + r * 1.5, y))
+            elif kind == "target":
+                # Crosshair: open circle with tick marks.
+                painter.setBrush(QtGui.QBrush())
+                painter.setPen(QtGui.QPen(col, 1.8))
+                painter.drawEllipse(QtCore.QRectF(x - r, y - r, 2 * r, 2 * r))
+                for ddx, ddy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    painter.drawLine(point(x + ddx * r * 0.5, y + ddy * r * 0.5),
+                                     point(x + ddx * r * 1.6, y + ddy * r * 1.6))
             else:
                 painter.drawEllipse(QtCore.QRectF(x - r, y - r, 2 * r, 2 * r))
             if label:
@@ -834,6 +864,14 @@ class View3DWidget(QWidget):
 
     def _draw_vessel(self, painter: QtGui.QPainter) -> None:
         cache = self._cache
+        tr_sl = cache.trail_slice
+        if tr_sl is not None:
+            px, py, _, valid = self._proj  # type: ignore[misc]
+            pen = QtGui.QPen(QtGui.QColor(255, 235, 160, 170), 1.6)
+            pen.setStyle(_PEN_STYLE.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(QtGui.QBrush())
+            self._draw_masked_polyline(painter, px[tr_sl], py[tr_sl], valid[tr_sl])
         if cache.vessel_slice is None:
             return
         px, py, _, valid = self._proj  # type: ignore[misc]
@@ -873,6 +911,17 @@ class View3DWidget(QWidget):
             arc = QtGui.QPolygonF([QtCore.QPointF(px[i], py[i])
                                    for i in range(arc_sl.start, arc_sl.stop)])
             painter.drawPolyline(arc)
+
+        sv_sl = cache.vessel_sheaves_slice
+        if sv_sl is not None and valid[sv_sl].all():
+            for k, i in enumerate(range(sv_sl.start, sv_sl.stop)):
+                x, y = float(px[i]), float(py[i])
+                painter.setPen(QtGui.QPen(QtGui.QColor(20, 26, 36), 1.0))
+                painter.setBrush(QtGui.QBrush(QtGui.QColor(255, 200, 90)))
+                painter.drawEllipse(QtCore.QRectF(x - 3, y - 3, 6, 6))
+                if k < len(cache.vessel_sheave_labels):
+                    self._halo_text(painter, x + 5, y - 3,
+                                    cache.vessel_sheave_labels[k])
 
         ch_sl = cache.vessel_chute_slice
         if ch_sl is not None and valid[ch_sl].all():
@@ -953,6 +1002,26 @@ class View3DWidget(QWidget):
         self._halo_text(painter, w - fm.horizontalAdvance(zex_text) - 10, 20, zex_text)
         self._draw_scale_bar(painter)
         self._draw_triad(painter)
+        if (self._color_mode == "tension" and self._cache is not None
+                and self._cache.tension_range is not None):
+            self._draw_tension_legend(painter)
+
+    def _draw_tension_legend(self, painter: QtGui.QPainter) -> None:
+        """Vertical colour key for tension colouring (kN, min -> max)."""
+        t0, t1 = self._cache.tension_range  # type: ignore[union-attr]
+        x0, y1 = 14.0, self.height() - 40.0
+        bar_h, bar_w = 90.0, 10.0
+        y0 = y1 - bar_h
+        grad = QtGui.QLinearGradient(x0, y1, x0, y0)
+        n = len(_VIRIDIS_STOPS)
+        for i, (r, g, b) in enumerate(_VIRIDIS_STOPS):
+            grad.setColorAt(i / (n - 1), QtGui.QColor(int(r), int(g), int(b)))
+        painter.setPen(QtGui.QPen(QtGui.QColor(235, 240, 245, 160), 1.0))
+        painter.setBrush(QtGui.QBrush(grad))
+        painter.drawRect(QtCore.QRectF(x0, y0, bar_w, bar_h))
+        self._halo_text(painter, x0 + bar_w + 6, y0 + 4, "%.1f kN" % t1)
+        self._halo_text(painter, x0 + bar_w + 6, y1 + 4, "%.1f kN" % t0)
+        self._halo_text(painter, x0, y0 - 6, "tension")
 
     def _draw_scale_bar(self, painter: QtGui.QPainter) -> None:
         mpp = self._metres_per_px()

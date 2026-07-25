@@ -43,6 +43,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from .cable_system import resolve_assembly
 from .seeds import solve_catenary_param
 from .solver3d import _radii_array
 from .timeline import (
@@ -51,13 +52,29 @@ from .timeline import (
     OperationSimulator,
     Snapshot,
     Step,
+    count_at_m,
     joint_point,
+    joint_points,
 )
 
 
 # ---------------------------------------------------------------------------
 # Planar catenary primitives
 # ---------------------------------------------------------------------------
+
+def deployed_items(chain: ChainState) -> List:
+    """The chain's assembly rows ordered from its BOTTOM (material zero) end.
+
+    Remainder ("fill") rows are resolved against the deployed length and the
+    assembly datum is honoured, so the same rows the full solver maps are the
+    ones averaged here.
+    """
+    items, direction = chain.oriented_assembly()
+    items, _fit = resolve_assembly(items, float(chain.length_m))
+    if direction == "from_bottom":
+        items = items[::-1]
+    return items
+
 
 def mean_weight_npm(chain: ChainState) -> float:
     """Length-weighted mean submerged weight of the chain's assembly over
@@ -69,9 +86,7 @@ def mean_weight_npm(chain: ChainState) -> float:
     cannot represent it (use the full solver).
     """
     remaining = max(1.0, float(chain.length_m))
-    items = list(chain.assembly)
-    if chain.mapper_direction == "from_bottom":
-        items = items[::-1]
+    items = deployed_items(chain)
     total_w = 0.0
     total_l = 0.0
     for it in items:
@@ -102,9 +117,7 @@ def mean_friction_mu(chain: ChainState) -> float:
     """Length-weighted mean seabed friction coefficient over the deployed
     length (mirror of :func:`mean_weight_npm`; blank = chain defaults)."""
     remaining = max(1.0, float(chain.length_m))
-    items = list(chain.assembly)
-    if chain.mapper_direction == "from_bottom":
-        items = items[::-1]
+    items = deployed_items(chain)
     total_mu = 0.0
     total_l = 0.0
     for it in items:
@@ -558,13 +571,26 @@ class QuickOperationSimulator(OperationSimulator):
 
     def settle(self) -> Snapshot:
         snap = self._quick_snapshot(label="settle")
+        self._check_assemblies()
+        snap.warnings.extend(self.assembly_warnings)
         self._last_snap = snap
         return snap
 
     def _equilibrate(self, step: Step, dt: float, prev_shapes) -> Snapshot:
         snap = self._quick_snapshot(label=step.label)
+        self._check_assemblies()
         self._last_snap = snap
         return snap
+
+    def _check_assemblies(self) -> None:
+        """Assembly-vs-length fit warnings (the quick backend never builds a
+        mapper, so the base class's per-build check does not fire here)."""
+        for name, st in self.sc.chains.items():
+            if name in self._released:
+                continue
+            items, _direction = st.oriented_assembly()
+            _items, fit = resolve_assembly(items, float(st.length_m))
+            self._check_assembly_fit(st, fit)
 
     # -- core ---------------------------------------------------------------
 
@@ -752,4 +778,6 @@ class QuickOperationSimulator(OperationSimulator):
             min_radius_m=float(np.min(radii)) if len(radii) else float("inf"),
             length_m=float(st.length_m),
             joint_xyz=joint_point(st, xyz, s),
+            joints_xyz=joint_points(st, xyz, s),
+            count_top_m=count_at_m(st, float(st.length_m)),
         )

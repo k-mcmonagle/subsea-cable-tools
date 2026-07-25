@@ -256,9 +256,9 @@ def run_static(cfg: V3Config, cancel: Optional[Callable[[], bool]] = None,
 
     defaults = build_defaults(cfg)
     items = build_assembly(cfg)
-    mapper = cs.AssemblyMapper(items, defaults, "from_top")
-    if mapper.total_length_m + 1.0 < total_len:
-        pass  # element_arrays clamps and flags; warn below
+    # span_m resolves any remainder ("fill") row and records the fit so the
+    # short-assembly case can be warned about below.
+    mapper = cs.AssemblyMapper(items, defaults, "from_top", span_m=total_len)
 
     n = max(60, min(800, int(total_len / max(cfg.target_ds_m, 0.5))))
     b = cs.SystemBuilder()
@@ -303,10 +303,12 @@ def run_static(cfg: V3Config, cancel: Optional[Callable[[], bool]] = None,
         "the solve-target placement (the 3D refinement itself models the "
         "full assembly; check the reported tensions against the target)")
     c = res.chains[0]
-    if bool(np.any(chain.seg_id < 0)):
+    if mapper.fit.short_by_m > 1.0:
         out.warnings.append(
-            "The assembly is shorter than the modelled cable length — "
-            "default properties were used beyond its end."
+            f"The assembly covers {mapper.fit.total_m:.0f} m but the modelled "
+            f"cable is {total_len:.0f} m — the end segment's properties were "
+            f"stretched over the last {mapper.fit.short_by_m:.0f} m. Add a "
+            "remainder (fill) segment or lengthen the assembly."
         )
     i_tdp = int(np.argmax(c.contact)) if np.any(c.contact) else len(c.contact) - 1
     exit_deg = abs(c.top_angle_deg)
@@ -387,6 +389,22 @@ def run_steady(cfg: V3Config, cancel: Optional[Callable[[], bool]] = None) -> Ru
     return out
 
 
+def _op_joints(op: dict, chain: str) -> Optional[List[Tuple[str, float]]]:
+    """User-defined named joints for one chain from the op dict:
+    ``op["joints"] = {chain: [[label, s_from_bottom_m], ...]}``."""
+    rows = (op.get("joints") or {}).get(chain) or []
+    out = [(str(r[0]), float(r[1])) for r in rows if len(r) >= 2]
+    return out or None
+
+
+def _op_count_refs(op: dict) -> Optional[Dict[str, float]]:
+    """Cable-count references from the op dict:
+    ``op["count_refs"] = {chain: count_at_bottom_end_m}``."""
+    refs = {str(k): float(v) for k, v in (op.get("count_refs") or {}).items()
+            if v is not None}
+    return refs or None
+
+
 def _build_scenario(cfg: V3Config, bathy, kind: str, *, static_only: bool = False,
                     hold_depth_m: Optional[float] = None):
     """Shared scenario construction for the operation and static-hold paths."""
@@ -425,6 +443,13 @@ def _build_scenario(cfg: V3Config, bathy, kind: str, *, static_only: bool = Fals
             bu_start_depth_m=hold_depth_m if static_only else op.get("bu_start_depth_m"),
             trunk_slack_pct=cfg.trunk_slack_pct,
             static_only=static_only,
+            leg1_joints=_op_joints(op, "leg1"),
+            leg2_joints=_op_joints(op, "leg2"),
+            trunk_joints=_op_joints(op, "trunk"),
+            count_refs=_op_count_refs(op),
+            schedule=(None if static_only else op.get("schedule")),
+            leg_far_ends_xy=(None if static_only
+                             else op.get("leg_far_ends_xy")),
         )
     if kind == "bu_full":
         return scen.bu_full_deployment(
@@ -492,6 +517,10 @@ def _bu_full_kwargs(cfg: V3Config, op: dict) -> dict:
         lay_speed_mps=float(op.get("ship_speed_mps", cfg.ship_speed_mps)),
         trunk_slack_pct=cfg.trunk_slack_pct,
         target_ds_m=cfg.target_ds_m,
+        leg1_joints=_op_joints(op, "leg1"),
+        leg2_joints=_op_joints(op, "leg2"),
+        trunk_joints=_op_joints(op, "trunk"),
+        count_refs=_op_count_refs(op),
     )
 
 
@@ -520,18 +549,22 @@ def run_optimize(cfg: V3Config, progress: Optional[Callable[[float, str], bool]]
         max_leg_imbalance_kN=float(op.get("limit_imbalance_kN", 0.0)),
     )
     current = build_current(cfg)
+    quality = str(op.get("quality", "draft"))
+    sim_factory = None
+    if quality == "quick":
+        from ..engine.quick_bu import QuickOperationSimulator
+        sim_factory = QuickOperationSimulator
     popts = tl.SimOptions.preview(
         rho_water=cfg.rho_water,
         current_at=(current.velocity_at if current else None),
         cancel=cancel,
     )
-    btt = float(op.get("bottom_tension_target_kN", 0.0) or 0.0)
+    popts.controller = _operation_controller(cfg)
     try:
         res = sopt.optimize_bu_schedule(
             bathy, params, target, schedule=schedule, limits=limits,
-            balance=bool(op.get("balance", True)),
-            bottom_tension_target_kN=(btt if btt > 0.0 else None),
             preview_options=popts, progress=progress,
+            sim_factory=sim_factory,
         )
     except (ValueError, KeyError) as exc:
         return RunOutput(mode="optimize", error=str(exc))
@@ -551,19 +584,184 @@ def run_optimize(cfg: V3Config, progress: Optional[Callable[[float, str], bool]]
         "Landing error vs target": f"{res.landing_error_m:.1f} m",
         "Optimised vessel start": f"({res.vessel_start_xy[0]:.1f}, {res.vessel_start_xy[1]:.1f}) m",
         "Preview rounds": str(res.rounds),
-        "Note": "Preview quality — run the simulation for final numbers.",
+        "Note": ("Quick analytic previews — run the simulation at Full "
+                 "quality for final numbers." if quality == "quick" else
+                 "Draft (preview) quality — run the simulation at Full "
+                 "quality for final numbers."),
     }
     if res.preview is not None and res.preview.snapshots:
         out.snapshots = res.preview.snapshots
         bed = _bed_grid_for_snapshots(cfg, bathy, res.preview.snapshots)
+        track = np.array([s.vessel_xy for s in res.preview.snapshots], dtype=float)
 
         def build_scene(i: int) -> SceneData:
             return snapshot_scene(res.preview.snapshots[i], bed,
                                   title=f"preview t = {res.preview.snapshots[i].t_s:.0f} s",
-                                  cfg=cfg)
+                                  cfg=cfg, trail=track[:i + 1])
 
         out.scene_builder = build_scene
         out.scene = build_scene(len(res.preview.snapshots) - 1)
+    return out
+
+
+def _mean_weight_npm(items: Sequence[cs.AssemblyItem], defaults: cs.Defaults) -> float:
+    """Length-weighted mean submerged weight of an assembly (planner input)."""
+    total_w = total_l = 0.0
+    for it in items:
+        if isinstance(it, cs.SegmentSpec) and it.length_m > 0:
+            q = it.q_water_npm or defaults.q_water_npm
+            total_w += q * it.length_m
+            total_l += it.length_m
+    return total_w / total_l if total_l > 0 else defaults.q_water_npm
+
+
+def run_plan(cfg: V3Config, progress: Optional[Callable[[float, str], bool]] = None,
+             cancel: Optional[Callable[[], bool]] = None) -> RunOutput:
+    """Inverse planning for the full BU deployment: derive the lowering
+    schedule (vessel track + trunk payout) from per-leg touchdown-tension
+    targets and the landing target, then verify it with the quick
+    simulator. Returns the schedule and set-up for the dialog to adopt."""
+    from ..engine import bu_plan
+    from ..engine.quick_bu import QuickOperationSimulator
+
+    bathy = build_bathymetry(cfg)
+    op = dict(cfg.op)
+    defaults = build_defaults(cfg)
+    items = build_assembly(cfg)
+    h1 = float(op.get("leg1_bottom_tension_kN", 0.0) or 0.0)
+    h2 = float(op.get("leg2_bottom_tension_kN", 0.0) or 0.0)
+    if h1 <= 0.0 or h2 <= 0.0:
+        return RunOutput(
+            mode="plan",
+            error="Planning from tension targets needs a positive touchdown-"
+                  "tension target for each leg (see the BU full-deployment "
+                  "controls).")
+    leg1_items = cs.parse_assembly(op["leg1_assembly"]) if op.get("leg1_assembly") else items
+    leg2_items = cs.parse_assembly(op["leg2_assembly"]) if op.get("leg2_assembly") else items
+    trunk_items = cs.parse_assembly(op["trunk_assembly"]) if op.get("trunk_assembly") else items
+    w1 = _mean_weight_npm(leg1_items, defaults)
+    w2 = _mean_weight_npm(leg2_items, defaults)
+    wt = _mean_weight_npm(trunk_items, defaults)
+    A1 = (float(op.get("laid_end_1_x", -100.0)), float(op.get("laid_end_1_y", 150.0)))
+    A2 = (float(op.get("laid_end_2_x", -100.0)), float(op.get("laid_end_2_y", -150.0)))
+    target = (float(op.get("target_x", 0.0)), float(op.get("target_y", 0.0)))
+    payout = float(op.get("payout_mps", 0.4)) or 0.4
+    tail = float(op.get("tail_length_m", 90.0))
+    t1 = float(op.get("tail_leg1_m") or tail)
+    t2 = float(op.get("tail_leg2_m") or tail)
+    joint_margin = 20.0     # matches default_bu_schedule's pay-over margin
+
+    def make_plan(aim_xy):
+        return bu_plan.plan_bu_descent(
+            bathy, A1, A2, aim_xy,
+            w_leg1_npm=w1, w_leg2_npm=w2, w_trunk_npm=wt,
+            bu_weight_N=float(op.get("bu_weight_kN", 15.0)) * 1000.0,
+            H1_target_N=h1 * 1000.0, H2_target_N=h2 * 1000.0,
+            sheave_height_m=cfg.chute_height_m,
+            spawn_depth_m=float(op.get("bu_spawn_depth_m", 2.0)),
+        )
+
+    def build_run(plan):
+        """Quick-simulate a plan; returns (SimResult, schedule rows)."""
+        if not plan.feasible:
+            return None, []
+        v0 = plan.states[0].vessel_xy
+        setup = scen.default_bu_schedule(
+            depth_m=float(bathy.depth_at(*v0)), tail_length_m=tail,
+            tail_leg1_m=op.get("tail_leg1_m"), tail_leg2_m=op.get("tail_leg2_m"),
+            tail_trunk_m=op.get("tail_trunk_m"), payout_mps=payout,
+            course_deg=plan.states[0].course_deg,
+        )[:3]                     # hold / pay joints / transfer
+        rows = setup + bu_plan.plan_to_schedule(
+            plan, payout_mps=payout, trunk_slack_pct=cfg.trunk_slack_pct)
+        scn = scen.bu_full_deployment(
+            bathy, leg1_items, leg2_items, trunk_items, defaults,
+            bu_weight_kN=float(op.get("bu_weight_kN", 15.0)),
+            bu_cda_m2=float(op.get("bu_cda_m2", 1.5)),
+            laid_end_1_xy=A1, laid_end_2_xy=A2,
+            # The pay-joints phase adds tail + margin per leg before the
+            # overboard; start short so the legs reach the planned length.
+            leg1_deployed_m=max(50.0, plan.leg_lengths_m["leg1"] - t1 - joint_margin),
+            leg2_deployed_m=max(50.0, plan.leg_lengths_m["leg2"] - t2 - joint_margin),
+            vessel_geom=_bu_full_vessel_geom(cfg),
+            vessel_xy=v0, vessel_heading_deg=plan.states[0].course_deg,
+            schedule=rows,
+            tail_length_m=tail,
+            tail_leg1_m=op.get("tail_leg1_m"), tail_leg2_m=op.get("tail_leg2_m"),
+            tail_trunk_m=op.get("tail_trunk_m"),
+            payout_mps=payout, trunk_slack_pct=cfg.trunk_slack_pct,
+            target_ds_m=cfg.target_ds_m,
+            leg1_joints=_op_joints(op, "leg1"),
+            leg2_joints=_op_joints(op, "leg2"),
+            trunk_joints=_op_joints(op, "trunk"),
+            count_refs=_op_count_refs(op),
+        )
+        sim = QuickOperationSimulator(scn, bathy)
+        return sim.run(), rows
+
+    def simulate(plan):
+        res, _rows = build_run(plan)
+        if res is None:
+            return None
+        for snap in reversed(res.snapshots):
+            xyz = snap.junction_xyz.get("BU")
+            if xyz is not None:
+                return (xyz[0], xyz[1])
+        return None
+
+    if progress is not None:
+        progress(-1.0, "Planning descent from tension targets…")
+    plan = bu_plan.refine_landing(make_plan, simulate, target, rounds=2)
+    if cancel and cancel():
+        return RunOutput(mode="plan", error="cancelled")
+    if not plan.feasible:
+        return RunOutput(
+            mode="plan",
+            error="No feasible descent plan for these tension targets.",
+            error_details="\n".join(plan.warnings))
+    result, rows = build_run(plan)
+
+    out = RunOutput(mode="plan")
+    out.warnings = list(plan.warnings)
+    out.warnings.append(
+        "Planned with the quick analytic model — verify the adopted "
+        "schedule with a Full-quality simulation run.")
+    out.schedule = [r.to_dict() for r in rows]
+    v0 = plan.states[0].vessel_xy
+    out.optimized_setup = {
+        "vessel_x": v0[0], "vessel_y": v0[1],
+        "leg1_deployed_m": max(50.0, plan.leg_lengths_m["leg1"] - t1 - joint_margin),
+        "leg2_deployed_m": max(50.0, plan.leg_lengths_m["leg2"] - t2 - joint_margin),
+        # Initial heading for the planned run (compass, for the UI spin).
+        "lay_az_degN": (90.0 - plan.states[0].course_deg) % 360.0,
+    }
+    landed = simulate(plan)
+    miss = (math.hypot(landed[0] - target[0], landed[1] - target[1])
+            if landed is not None else float("nan"))
+    course_compass = (90.0 - plan.states[-1].course_deg) % 360.0
+    out.facts = {
+        "Leg 1 required length (at overboard)": f"{plan.leg_lengths_m['leg1']:.0f} m",
+        "Leg 2 required length (at overboard)": f"{plan.leg_lengths_m['leg2']:.0f} m",
+        "Leg TDP tension targets": f"{h1:.2f} / {h2:.2f} kN",
+        "Lay-away course at landing": f"{course_compass:.0f} degN",
+        "Predicted landing (quick sim)": (
+            f"({landed[0]:.1f}, {landed[1]:.1f}) m" if landed else "—"),
+        "Landing error vs target": f"{miss:.1f} m" if np.isfinite(miss) else "—",
+        "Trunk top tension at landing": f"{plan.states[-1].trunk_top_N / 1e3:.1f} kN",
+        "Note": "Quick analytic plan — confirm at Full quality.",
+    }
+    if result is not None and result.snapshots:
+        out.snapshots = result.snapshots
+        bed = _bed_grid_for_snapshots(cfg, bathy, result.snapshots)
+        track = np.array([s.vessel_xy for s in result.snapshots], dtype=float)
+
+        def build_scene(i: int) -> SceneData:
+            return snapshot_scene(result.snapshots[i], bed,
+                                  title=f"plan t = {result.snapshots[i].t_s:.0f} s",
+                                  cfg=cfg, trail=track[:i + 1])
+
+        out.scene_builder = build_scene
+        out.scene = build_scene(len(result.snapshots) - 1)
     return out
 
 
@@ -679,9 +877,152 @@ def manual_scene(snap, cfg: V3Config, bathy, bed: BedGrid,
     return scene
 
 
+def _plan_for_lowering(cfg: V3Config, bathy):
+    """Tension-target plan for the lowering-only BU scenario.
+
+    Derives the vessel track and trunk payout that hold both legs at the
+    target touchdown tension, from the scenario's own geometry (leg lead
+    bearings + lengths from the jointing position at the local origin).
+
+    The start state is made CONSISTENT with the targets: each leg's
+    layback at the start depth is computed from the target bottom tension
+    (tangent catenary), its bed route runs away from that touchdown along
+    the lead bearing, and the anchored far end sits where the remaining
+    length ends. The run therefore starts already balanced at target —
+    the vessel only ever moves ahead and pays out (no back-tracking to
+    relieve an over-tight start).
+
+    Returns ``(schedule_rows, far_ends, facts, warnings)`` or
+    ``(None, None, {}, [...])`` when planning is impossible.
+    """
+    from ..engine import bu_plan
+
+    op = dict(cfg.op)
+    target_kN = float(op.get("leg_bottom_tension_kN", 0.0) or 0.0)
+    if target_kN <= 0.0:
+        return None, None, {}, ["Planned lowering needs a positive target "
+                                "leg TDP tension."]
+    defaults = build_defaults(cfg)
+    items = build_assembly(cfg)
+    leg_items = (cs.parse_assembly(op["leg_assembly"])
+                 if op.get("leg_assembly") else items)
+    w_leg = _mean_weight_npm(leg_items, defaults)
+    w_trunk = _mean_weight_npm(items, defaults)
+    L = float(op.get("leg_length_m", 2.0 * bathy.depth_at(0.0, 0.0)))
+    depth0 = float(bathy.depth_at(0.0, 0.0))
+    spawn = op.get("bu_start_depth_m")
+    if spawn is None:
+        spawn = min(10.0, 0.1 * depth0)     # scenario default
+    spawn = max(1.0, min(float(spawn), depth0 - 0.5))
+    payout = float(op.get("payout_mps", 0.4)) or 0.4
+
+    # Layback-consistent geometry: TDP at the target-tension layback from
+    # the start position, bed route leading away along the lead bearing,
+    # anchor at the end of the remaining length.
+    a_cat = target_kN * 1000.0 / w_leg
+    anchors = []
+    for key, default in (("leg1_azimuth_deg", 150.0), ("leg2_azimuth_deg", 210.0)):
+        az = math.radians(compass_to_math_deg(float(op.get(key, default))))
+        ux, uy = math.cos(az), math.sin(az)
+        D0 = 0.0
+        h = depth0 - spawn
+        for _ in range(3):      # iterate TDP depth on non-flat beds
+            h = float(bathy.depth_at(D0 * ux, D0 * uy)) - spawn
+            if h <= 0.5:
+                return None, None, {}, [
+                    "Start depth leaves no water column for the legs."]
+            D0 = a_cat * math.acosh(1.0 + h / a_cat)
+        s0 = a_cat * math.sinh(D0 / a_cat)
+        bed_len = L - s0
+        if bed_len < 10.0:
+            return None, None, {}, [
+                f"Leg length {L:.0f} m is (nearly) all suspended at the "
+                f"start ({s0:.0f} m in the water column at the "
+                f"{target_kN:.1f} kN target) — increase the leg length or "
+                "the target tension."]
+        anchors.append(((D0 + bed_len) * ux, (D0 + bed_len) * uy))
+
+    plan = bu_plan.plan_bu_descent_fixed_lengths(
+        bathy, anchors[0], anchors[1], L, L,
+        w_leg1_npm=w_leg, w_leg2_npm=w_leg, w_trunk_npm=w_trunk,
+        bu_weight_N=float(op.get("bu_weight_kN", 15.0)) * 1000.0,
+        H1_target_N=target_kN * 1000.0, H2_target_N=target_kN * 1000.0,
+        sheave_height_m=cfg.chute_height_m, spawn_depth_m=spawn)
+    if not plan.feasible:
+        return None, None, {}, list(plan.warnings)
+
+    trunk_susp0 = cfg.chute_height_m + spawn
+    rows = bu_plan.plan_to_schedule(
+        plan, payout_mps=payout, trunk_slack_pct=cfg.trunk_slack_pct,
+        overboard_event=False, start_xy=(0.0, 0.0),
+        start_trunk_susp_m=trunk_susp0)
+    # Lay ahead on the trunk after landing, along the final balanced
+    # course (the trunk bottom-tension controller, if set, trims this).
+    V = float(op.get("ship_speed_mps", cfg.ship_speed_mps)) or 0.3
+    t_on = float(op.get("duration_s") or 0.0)
+    t_on = t_on if t_on > 0.0 else 300.0
+    last = plan.states[-1]
+    rows.append(scen.PhaseRow(
+        label="Lay ahead on trunk",
+        duration_s=t_on, course_deg=last.course_deg, speed_mps=V,
+        payout_mps={"trunk": V * 1.02}, distance_m=V * t_on,
+    ))
+    facts = {
+        "Planned landing (BU)": f"({plan.landing_xy[0]:.1f}, {plan.landing_xy[1]:.1f}) m",
+        "Planned lay-away course": f"{(90.0 - last.course_deg) % 360.0:.0f} degN",
+        "Leg TDP tension target": f"{target_kN:.2f} kN (both legs)",
+        "Planned trunk top tension at landing": f"{last.trunk_top_N / 1e3:.1f} kN",
+    }
+    return rows, anchors, facts, list(plan.warnings)
+
+
+def _operation_controller(cfg: V3Config):
+    """Payout controller stack for the BU operation scenarios.
+
+    * ``bu_full``: relative leg balance and/or absolute per-leg touchdown
+      tension targets (``leg1_bottom_tension_kN`` / ``leg2_...``; absolute
+      targets supersede the balance) plus the trunk touchdown target.
+    * ``bu_deployment``: only the trunk pays out, so only the trunk
+      touchdown target applies.
+    """
+    op = cfg.op
+    btt = float(op.get("bottom_tension_target_kN", 0.0) or 0.0)
+    if cfg.scenario == "bu_full":
+        leg_targets = {}
+        for name in ("leg1", "leg2"):
+            v = float(op.get(f"{name}_bottom_tension_kN", 0.0) or 0.0)
+            if v > 0.0:
+                leg_targets[name] = v
+        return ctl.bu_payout_controllers(
+            balance_legs=bool(op.get("balance", True)),
+            leg_bottom_targets_kN=leg_targets or None,
+            trunk_bottom_target_kN=(btt if btt > 0.0 else None),
+        )
+    if cfg.scenario == "bu_deployment" and btt > 0.0:
+        return ctl.BottomTensionController("trunk", btt)
+    return None
+
+
 def run_operation(cfg: V3Config, progress: Optional[Callable[[float, str], bool]] = None,
                   cancel: Optional[Callable[[], bool]] = None) -> RunOutput:
     bathy = build_bathymetry(cfg)
+    # Planned lowering: solve the vessel track + trunk payout that hold the
+    # leg touchdown-tension targets, and run that schedule instead of the
+    # single straight-line step.
+    plan_facts: Dict[str, str] = {}
+    plan_warnings: List[str] = []
+    if (cfg.scenario == "bu_deployment"
+            and bool(cfg.op.get("plan_from_tension"))):
+        rows, far_ends, plan_facts, plan_warnings = _plan_for_lowering(cfg, bathy)
+        if rows is not None:
+            cfg.op = dict(cfg.op)
+            cfg.op["schedule"] = rows
+            cfg.op["leg_far_ends_xy"] = far_ends
+        elif plan_warnings:
+            return RunOutput(
+                mode="operation",
+                error="Could not plan the lowering from the tension "
+                      "targets: " + "; ".join(plan_warnings))
     try:
         scn = _build_scenario(cfg, bathy, cfg.scenario)
     except (ValueError, KeyError) as exc:
@@ -703,17 +1044,7 @@ def run_operation(cfg: V3Config, progress: Optional[Callable[[float, str], bool]
             rate_drag=bool(cfg.op.get("rate_drag", True)),
             cancel=cancel,
         )
-    if cfg.scenario == "bu_full":
-        ctrls = []
-        if bool(cfg.op.get("balance", True)):
-            ctrls.append(ctl.TensionBalanceController("leg1", "leg2"))
-        btt = float(cfg.op.get("bottom_tension_target_kN", 0.0) or 0.0)
-        if btt > 0.0:
-            ctrls.append(ctl.BottomTensionController("trunk", btt))
-        if len(ctrls) == 1:
-            opts.controller = ctrls[0]
-        elif ctrls:
-            opts.controller = ctl.CompositeController(ctrls)
+    opts.controller = _operation_controller(cfg)
     if quality == "quick":
         if cfg.scenario not in ("bu_deployment", "bu_full"):
             return RunOutput(
@@ -728,7 +1059,7 @@ def run_operation(cfg: V3Config, progress: Optional[Callable[[float, str], bool]
     result = sim.run(progress)
 
     out = RunOutput(mode="operation", snapshots=result.snapshots)
-    out.warnings = list(result.warnings)
+    out.warnings = plan_warnings + list(result.warnings)
     if quality == "quick":
         out.warnings.append(
             "Quick analytic model: closed-form catenaries with a frozen-lay "
@@ -741,19 +1072,25 @@ def run_operation(cfg: V3Config, progress: Optional[Callable[[float, str], bool]
     if result.aborted:
         out.warnings.append("Simulation cancelled — snapshots up to the stop are shown.")
     bed = _bed_grid_for_snapshots(cfg, bathy, result.snapshots)
+    track = np.array([s.vessel_xy for s in result.snapshots], dtype=float)
 
     def build_scene(i: int) -> SceneData:
         return snapshot_scene(result.snapshots[i], bed,
-                              title=f"t = {result.snapshots[i].t_s:.0f} s", cfg=cfg)
+                              title=f"t = {result.snapshots[i].t_s:.0f} s",
+                              cfg=cfg, trail=track[:i + 1])
 
     out.scene_builder = build_scene
     if result.snapshots:
         out.scene = build_scene(len(result.snapshots) - 1)
         last = result.snapshots[-1]
         out.facts = {"Steps": str(len(result.snapshots)), "End time": f"{last.t_s:.0f} s"}
+        out.facts.update(plan_facts)
         for c in last.chains:
             out.facts[f"{c.name}: top / TDP / end tension"] = _fmt_tensions(c)
             out.facts[f"{c.name}: min bend radius"] = _fmt_radius(c.min_radius_m, None)
+            count = getattr(c, "count_top_m", None)
+            if count is not None:
+                out.facts[f"{c.name}: cable count at sheave"] = f"{count:.0f} m"
         for name, xyz in last.junction_xyz.items():
             out.facts[f"{name} position"] = f"({xyz[0]:.1f}, {xyz[1]:.1f}, {xyz[2]:.1f}) m"
         c1, c2 = last.chain("leg1"), last.chain("leg2")
@@ -804,6 +1141,17 @@ def _vessel_glyph_sheaves(cfg: V3Config, vessel_xy, heading_math_deg: float) -> 
     h = math.radians(float(heading_math_deg))
     ax = float(vessel_xy[0]) + cfg.sheave_fwd_m * math.cos(h)
     ay = float(vessel_xy[1]) + cfg.sheave_fwd_m * math.sin(h)
+    # Individual sheave positions (same frame math as VesselGeometry.
+    # sheave_xyz: starboard is clockwise of the heading).
+    ch_, sh_ = math.cos(h), math.sin(h)
+    half = 0.5 * abs(cfg.sheave_spacing_m)
+
+    def sheave_pt(stbd_m: float) -> Tuple[float, float]:
+        return (float(vessel_xy[0]) + cfg.sheave_fwd_m * ch_ + stbd_m * sh_,
+                float(vessel_xy[1]) + cfg.sheave_fwd_m * sh_ - stbd_m * ch_)
+
+    port = sheave_pt(-half)
+    stbd = sheave_pt(half)
     return VesselGlyph(
         xy=(ax, ay),
         heading_deg=float(heading_math_deg),
@@ -816,6 +1164,7 @@ def _vessel_glyph_sheaves(cfg: V3Config, vessel_xy, heading_math_deg: float) -> 
         chute_stbd_m=0.0,
         chute_radius_m=0.0,          # no overboarding-chute arc at the sheaves
         departure_label="sheaves",
+        sheaves_xy=[("port", port[0], port[1]), ("stbd", stbd[0], stbd[1])],
     )
 
 
@@ -879,12 +1228,21 @@ _JOINT_LABELS = {"leg1": "Leg 1 joint", "leg2": "Leg 2 joint",
 
 
 def _joint_markers(snap) -> List[Marker]:
-    """Joint markers from the engine's material-coordinate tracking: each
-    chain snapshot carries ``joint_xyz`` from the moment its joint passes
-    the sheave (legs from the start of payout, the trunk once more than its
-    BU tail is paid out) — see ``ChainState.joint_s_from_bottom_m``."""
+    """Joint markers from the engine's material-coordinate tracking.
+
+    Each chain snapshot carries every currently-outboard joint in
+    ``joints_xyz`` (the automatic splice joint plus any user-defined named
+    joints); older snapshots may only have the scalar ``joint_xyz``."""
     out: List[Marker] = []
     for c in snap.chains:
+        named = list(getattr(c, "joints_xyz", None) or [])
+        if named:
+            for label, xyz in named:
+                text = (_JOINT_LABELS.get(c.name, f"{c.name} joint")
+                        if label == "joint" else f"{c.name}: {label}")
+                out.append(Marker(tuple(xyz), text, "joint",
+                                  color="#9467bd", size=7.0))
+            continue
         j = getattr(c, "joint_xyz", None)
         if j is not None:
             out.append(Marker(tuple(j), _JOINT_LABELS.get(c.name, f"{c.name} joint"),
@@ -892,9 +1250,12 @@ def _joint_markers(snap) -> List[Marker]:
     return out
 
 
-def snapshot_scene(snap, bed: BedGrid, title: str = "", cfg: Optional[V3Config] = None) -> SceneData:
+def snapshot_scene(snap, bed: BedGrid, title: str = "", cfg: Optional[V3Config] = None,
+                   trail: Optional["np.ndarray"] = None) -> SceneData:
     scene = SceneData(title=title or (snap.label or ""))
     scene.bed = bed
+    if trail is not None:
+        scene.vessel_trail = np.asarray(trail, dtype=float).reshape(-1, 2)
     for k, c in enumerate(snap.chains):
         scene.cables.append(CablePath(
             xyz=c.xyz.copy(),
@@ -907,6 +1268,24 @@ def snapshot_scene(snap, bed: BedGrid, title: str = "", cfg: Optional[V3Config] 
     for name, xyz in snap.junction_xyz.items():
         scene.markers.append(Marker(tuple(xyz), name, "junction"))
     scene.markers.extend(_joint_markers(snap))
+    # Live touchdown markers: one per chain with a suspended part meeting
+    # the bed, labelled with the touchdown tension — these walk along as
+    # cable lays down / peels off through the timeline.
+    for c in snap.chains:
+        contact = np.asarray(c.contact, dtype=bool)
+        if not contact.any() or contact[0]:
+            continue                       # fully suspended or no free span
+        i = int(np.argmax(contact))
+        s = np.asarray(c.s, dtype=float)
+        # Once a line is essentially fully laid (e.g. the legs after the BU
+        # has landed) the touchdown collapses onto its hang point — drop
+        # the marker instead of stacking labels there.
+        if i < len(s) and float(s[i]) < 5.0:
+            continue
+        t = np.asarray(c.tension_kN, dtype=float)
+        t_tdp = float(t[min(i, len(t) - 1)])
+        scene.markers.append(Marker(
+            tuple(c.xyz[i]), f"{c.name} TDP {t_tdp:.1f} kN", "tdp"))
     # Timeline headings are already in the engine math frame.
     if cfg is not None:
         # Two-sheave scenes attach the cables at the sheaves, so the hull
@@ -1033,6 +1412,9 @@ class SolveWorker(QThread):
                 elif self.cfg.mode == "optimize":
                     out = run_optimize(self.cfg, progress=self._progress,
                                        cancel=lambda: self._cancel)
+                elif self.cfg.mode == "plan":
+                    out = run_plan(self.cfg, progress=self._progress,
+                                   cancel=lambda: self._cancel)
                 else:
                     out = run_static(self.cfg, cancel=lambda: self._cancel,
                                      progress=self._progress)

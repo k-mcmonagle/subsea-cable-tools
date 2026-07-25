@@ -545,7 +545,10 @@ class LaySimulatorDialog(QDialog):
             ("single_steady", "Single cable — steady lay"),
             ("bu_static", "Branching unit — static hold"),
             ("fs_static", "Final splice (bight) — static hold"),
-            ("operation", "Operation simulation (beta)"),
+            ("op_bu", "BU deployment — lowering (simulation)"),
+            ("op_bu_full", "BU deployment — full two-sheave (simulation)"),
+            ("op_final_bight", "Final bight lay-down (simulation)"),
+            ("op_straight_lay", "Straight lay — transient (simulation)"),
         ])
         self.scenario_choice.currentIndexChanged.connect(self._apply_scenario_choice)
         lay.addRow("Modelling", self.scenario_choice)
@@ -583,17 +586,46 @@ class LaySimulatorDialog(QDialog):
             "Final-splice bight held at depth on a lowering rope between "
             "two laid ends. Set the laid ends in 'Position & heading' and "
             "the apex depth under 'What to solve'."),
-        "operation": (
-            "Time-stepped quasi-static simulation of a scripted operation "
-            "(BU deployment, bight lay-down or straight lay). Configure it "
-            "under 'Operation scenario', then click Run simulation."),
+        "op_bu": (
+            "Time-stepped simulation: the BU is lowered on the trunk while "
+            "the vessel steams ahead, its two pre-laid legs anchored on the "
+            "bed. Set leg bearings in 'Position & heading' and rates under "
+            "'Operation scenario'."),
+        "op_bu_full": (
+            "Time-stepped simulation of the complete two-sheave BU "
+            "deployment: jointing hold, joints overboard, sheave transfer, "
+            "BU overboard, lowering and lay-ahead — with an editable phase "
+            "schedule, optimiser and tension-target planner."),
+        "op_final_bight": (
+            "Time-stepped simulation of a final-bight lay-down from a "
+            "stepping vessel on a lowering rope, released when slack."),
+        "op_straight_lay": (
+            "Time-stepped simulation of a straight lay (transient start-up "
+            "against an anchored far end)."),
     }
+
+    # Operation sub-scenario carried by each unified picker entry.
+    _OP_CHOICES = {"op_bu": "bu_deployment", "op_bu_full": "bu_full",
+                   "op_final_bight": "final_bight",
+                   "op_straight_lay": "straight_lay"}
 
     def _apply_scenario_choice(self, *args):
         """Map the single scenario picker onto the internal mode/config."""
         choice = self.scenario_choice.currentData() or "single_static"
+        if choice == "operation":
+            # Legacy stored value (pre-unified picker): resolve it to the
+            # entry matching the last operation sub-scenario.
+            rev = {v: k for k, v in self._OP_CHOICES.items()}
+            target = rev.get(self.scenario_combo.currentData(), "op_bu")
+            i = self.scenario_choice.findData(target)
+            if i >= 0:
+                self.scenario_choice.setCurrentIndex(i)   # re-enters
+                return
+            choice = "op_bu"
         self.scenario_desc.setText(self._SCENARIO_DESCS.get(choice, ""))
-        mode = {"single_steady": "steady", "operation": "operation"}.get(choice, "static")
+        is_op = choice in self._OP_CHOICES
+        mode = "steady" if choice == "single_steady" else (
+            "operation" if is_op else "static")
         config = {"bu_static": "bu", "fs_static": "bight"}.get(choice, "single")
         for combo, val in ((self.mode_combo, mode), (self.static_config, config)):
             i = combo.findData(val)
@@ -601,6 +633,14 @@ class LaySimulatorDialog(QDialog):
                 combo.blockSignals(True)
                 combo.setCurrentIndex(i)
                 combo.blockSignals(False)
+        if is_op:
+            scen = self._OP_CHOICES[choice]
+            i = self.scenario_combo.findData(scen)
+            if i >= 0 and i != self.scenario_combo.currentIndex():
+                self.scenario_combo.blockSignals(True)
+                self.scenario_combo.setCurrentIndex(i)
+                self.scenario_combo.blockSignals(False)
+            self._on_scenario_changed()
         self._on_mode_changed()
 
     def _section_position(self):
@@ -954,6 +994,56 @@ class LaySimulatorDialog(QDialog):
         ]
         for lbl, w in self._bu_geo_rows + self._bu_leglen_row:
             lay.addRow(lbl, w)
+        # Cable-count references: the roto count at each line's far (bottom)
+        # end, so joints/TDP/BU outputs carry real cable markings.
+        self.count_leg1 = self._dspin("count_leg1_m", -1.0, 1e7, -1.0, 100.0, 0, " m")
+        self.count_leg2 = self._dspin("count_leg2_m", -1.0, 1e7, -1.0, 100.0, 0, " m")
+        self.count_trunk = self._dspin("count_trunk_m", -1.0, 1e7, -1.0, 100.0, 0, " m")
+        for w, what in ((self.count_leg1, "leg 1 laid end"),
+                        (self.count_leg2, "leg 2 laid end"),
+                        (self.count_trunk, "trunk at the BU")):
+            w.setSpecialValueText("off")
+            w.setToolTip(
+                f"Cable count (marking) at the {what}. Counts increase "
+                "toward the vessel; the live count at the sheave is then "
+                "reported in results and the ops CSV. 'off' disables count "
+                "referencing for this line.")
+        self._bu_count_rows = [
+            (QLabel("Count at leg 1 laid end"), self.count_leg1),
+            (QLabel("Count at leg 2 laid end"), self.count_leg2),
+            (QLabel("Count at BU (trunk)"), self.count_trunk),
+        ]
+        for lbl, w in self._bu_count_rows:
+            lay.addRow(lbl, w)
+
+        # Named joints along the lines (label + metres from the bottom/laid
+        # end), shown on the 3D view and exported.
+        self.joints_table = QTableWidget(0, 3)
+        self.joints_table.setHorizontalHeaderLabels(
+            ["Line", "Joint label", "From far end\n(m)"])
+        self.joints_table.setMaximumHeight(110)
+        self.joints_table.setToolTip(
+            "Extra joints to track: Line is leg1, leg2 or trunk; the "
+            "position is metres of cable from the line's far end (laid end "
+            "for legs, the BU for the trunk). The leg/trunk splice joints "
+            "of the full deployment are tracked automatically.")
+        self.joints_table.itemChanged.connect(self._schedule)
+        jb = QHBoxLayout()
+        badd = QPushButton("Add joint")
+        badd.clicked.connect(self._joint_add_row)
+        brem = QPushButton("Remove")
+        brem.clicked.connect(self._joint_remove_row)
+        jb.addWidget(badd)
+        jb.addWidget(brem)
+        jb.addStretch(1)
+        jbtns = QWidget()
+        jbtns.setLayout(jb)
+        self._joints_label = QLabel("Named joints")
+        lay.addRow(self._joints_label)
+        lay.addRow(self.joints_table)
+        lay.addRow(jbtns)
+        self._joints_widgets = [self._joints_label, self.joints_table, jbtns]
+
         # Final-bight group.
         self.fb_length = self._dspin("fb_length", 20.0, 20000.0, 300.0, 10.0, 0, " m")
         self._fb_geo_rows = [
@@ -963,6 +1053,44 @@ class LaySimulatorDialog(QDialog):
             lay.addRow(lbl, w)
         self._bu_bight_box = box
         return box
+
+    def _joint_add_row(self, *_a, line: str = "leg1", label: str = "",
+                       s_m: float = 0.0):
+        r = self.joints_table.rowCount()
+        self.joints_table.insertRow(r)
+        self.joints_table.setItem(r, 0, QTableWidgetItem(str(line)))
+        self.joints_table.setItem(r, 1, QTableWidgetItem(str(label)))
+        self.joints_table.setItem(r, 2, QTableWidgetItem(str(s_m)))
+
+    def _joint_remove_row(self):
+        r = self.joints_table.currentRow()
+        if r < 0:
+            r = self.joints_table.rowCount() - 1
+        if r >= 0:
+            self.joints_table.removeRow(r)
+            self._schedule()
+
+    def _joints_cfg(self) -> dict:
+        """Joints table -> {chain: [[label, s_from_bottom_m], ...]}."""
+        out: dict = {}
+        for r in range(self.joints_table.rowCount()):
+            line = _s(self.joints_table.item(r, 0)).lower()
+            label = _s(self.joints_table.item(r, 1)) or f"joint {r + 1}"
+            s_m = _of(self.joints_table.item(r, 2))
+            if line in ("leg1", "leg2", "trunk") and s_m is not None and s_m >= 0:
+                out.setdefault(line, []).append([label, float(s_m)])
+        return out
+
+    def _count_refs_cfg(self) -> dict:
+        """Count-reference spins -> {chain: count_at_bottom_m} ('off' = -1
+        excluded)."""
+        out = {}
+        for name, w in (("leg1", self.count_leg1), ("leg2", self.count_leg2),
+                        ("trunk", self.count_trunk)):
+            v = float(w.value())
+            if v >= 0.0:
+                out[name] = v
+        return out
 
     # Presentation of the "Value" spin box per solve-target mode:
     # (suffix, lo, hi, step, decimals, tooltip).
@@ -1048,9 +1176,14 @@ class LaySimulatorDialog(QDialog):
 
     def _section_operation(self):
         box, lay = self._collapsible("Operation scenario", "operation")
+        # Hidden shadow state: the unified Scenario picker above drives this
+        # combo (kept for config plumbing + settings compatibility).
         self.scenario_combo = self._combo("scenario", SCENARIOS)
         self.scenario_combo.currentIndexChanged.connect(self._on_scenario_changed)
-        lay.addRow("Scenario", self.scenario_combo)
+        self._scenario_combo_label = QLabel("Scenario")
+        lay.addRow(self._scenario_combo_label, self.scenario_combo)
+        self.scenario_combo.setVisible(False)
+        self._scenario_combo_label.setVisible(False)
 
         self.op_quality = self._combo("op_quality", [
             ("full", "Full — accurate solver"),
@@ -1075,6 +1208,43 @@ class LaySimulatorDialog(QDialog):
         self.bu_ship_speed = self._dspin("bu_ship_speed_kmh", 0.0, 8.0, 1.1, 0.1, 2, " km/h")
         bl.addRow("Trunk pay-out rate", self.bu_payout)
         bl.addRow("Ship speed", self.bu_ship_speed)
+        self.bu_start_depth = self._dspin("bu_start_depth_m", 0.0, 8000.0, 0.0, 5.0, 1, " m")
+        self.bu_start_depth.setSpecialValueText("auto")
+        self.bu_start_depth.setToolTip(
+            "BU depth below the surface at the start of the lowering "
+            "(auto = just below the surface).")
+        bl.addRow("BU start depth", self.bu_start_depth)
+        self.bu_duration = self._dspin("bu_duration_s", 0.0, 86400.0, 0.0, 60.0, 0, " s")
+        self.bu_duration.setSpecialValueText("auto")
+        self.bu_duration.setToolTip(
+            "Simulated time (auto = long enough for the BU to land at the "
+            "pay-out rate).")
+        bl.addRow("Duration", self.bu_duration)
+        self.bu_btt = self._dspin("bu_bottom_tension_kN", 0.0, 500.0, 0.0, 0.5, 1, " kN")
+        self.bu_btt.setToolTip(
+            "Target trunk touchdown (TDP) tension: once the trunk touches "
+            "down, a controller trims the scheduled trunk payout to hold "
+            "this bottom tension. 0 = off.")
+        bl.addRow("Target trunk TDP tension (0 = off)", self.bu_btt)
+        self.bu_leg_btt = self._dspin("bu_leg_btt_kN", 0.0, 500.0, 3.0, 0.5, 1, " kN")
+        self.bu_leg_btt.setToolTip(
+            "Target touchdown (TDP) tension for BOTH legs — the residual "
+            "tension each leg is laid down with. With the planned lowering "
+            "below, the vessel track and trunk payout are solved to hold "
+            "this while the BU descends.")
+        bl.addRow("Target leg TDP tension (both legs)", self.bu_leg_btt)
+        self.bu_plan_check = self._check(
+            "bu_plan_from_tension",
+            "Solve vessel path && payout to hold the leg targets", True)
+        self.bu_plan_check.setToolTip(
+            "Planned lowering: instead of a single straight run at fixed "
+            "rates, the run derives the balanced vessel track (the course "
+            "that keeps both legs at the target TDP tension — the leg "
+            "bisector on a flat bed) and the trunk payout per phase, then "
+            "simulates it. The pay-out rate above times the phases; the "
+            "ship speed drives the lay-ahead after landing. Uncheck for "
+            "the plain fixed-rate run.")
+        bl.addRow(self.bu_plan_check)
         self.op_stack.addWidget(bu)
 
         # Full two-sheave BU deployment page.
@@ -1174,18 +1344,40 @@ class LaySimulatorDialog(QDialog):
         self.bf_bottom_tension = self._dspin(
             "bf_bottom_tension_kN", 0.0, 500.0, 0.0, 0.5, 1, " kN")
         self.bf_bottom_tension.setToolTip(
-            "Target trunk touchdown (TDP) tension. When set, a controller "
+            "Target TRUNK touchdown (TDP) tension. When set, a controller "
             "trims the scheduled trunk payout each step to hold this bottom "
             "tension once the trunk has touched down — pays out faster when "
             "the TDP tension is high, slower when it goes slack. 0 = off "
             "(scheduled payout used as-is).")
+        self.bf_leg1_btt = self._dspin("bf_leg1_btt_kN", 0.0, 500.0, 0.0, 0.5, 1, " kN")
+        self.bf_leg2_btt = self._dspin("bf_leg2_btt_kN", 0.0, 500.0, 0.0, 0.5, 1, " kN")
+        for w, n in ((self.bf_leg1_btt, 1), (self.bf_leg2_btt, 2)):
+            w.setToolTip(
+                f"Target leg {n} touchdown (TDP) tension while its winch "
+                "still holds it (before the BU is overboarded): a controller "
+                "trims that leg's scheduled payout to hold this bottom "
+                "tension. Absolute targets supersede the relative balance "
+                "checkbox, and drive the 'Plan from tension targets' "
+                "action. 0 = off.")
+        self.bf_leg1_dep = self._dspin("bf_leg1_dep_m", 0.0, 100000.0, 0.0, 10.0, 0, " m")
+        self.bf_leg2_dep = self._dspin("bf_leg2_dep_m", 0.0, 100000.0, 0.0, 10.0, 0, " m")
+        for w, n in ((self.bf_leg1_dep, 1), (self.bf_leg2_dep, 2)):
+            w.setSpecialValueText("auto")
+            w.setToolTip(
+                f"Deployed length of leg {n} at the jointing position "
+                "(laid end to sheave). Auto derives it from the geometry; "
+                "the tension-target planner sets it explicitly.")
         fl.addRow("BU tail length — leg 1", self.bf_tail1)
         fl.addRow("BU tail length — leg 2", self.bf_tail2)
         fl.addRow("BU tail length — trunk", self.bf_tail_trunk)
+        fl.addRow("Leg 1 deployed length", self.bf_leg1_dep)
+        fl.addRow("Leg 2 deployed length", self.bf_leg2_dep)
         fl.addRow("Nominal pay-out rate", self.bf_payout)
         fl.addRow("Lay-ahead ship speed", self.bf_ship_speed)
         fl.addRow(self.bf_balance)
-        fl.addRow("Target TDP tension (0 = off)", self.bf_bottom_tension)
+        fl.addRow("Target leg 1 TDP tension (0 = off)", self.bf_leg1_btt)
+        fl.addRow("Target leg 2 TDP tension (0 = off)", self.bf_leg2_btt)
+        fl.addRow("Target trunk TDP tension (0 = off)", self.bf_bottom_tension)
 
         # ---- Scripted-schedule area (hidden in manual mode) ----------------
         scripted = QWidget()
@@ -1218,13 +1410,22 @@ class LaySimulatorDialog(QDialog):
             "simulations. Then click Run simulation for full-quality "
             "results.")
         self.btn_optimize.clicked.connect(self._optimize_clicked)
+        self.btn_plan = QPushButton("Plan from tension targets…")
+        self.btn_plan.setToolTip(
+            "Derive the lowering schedule (vessel track + trunk payout) "
+            "from the per-leg TDP tension targets and the landing target, "
+            "using the quick analytic model: the required leg lengths, the "
+            "balanced lay-away course and the payout phases are computed "
+            "for you. Needs both leg TDP targets set above. Then click Run "
+            "simulation to verify at Full quality.")
+        self.btn_plan.clicked.connect(self._plan_clicked)
         btn_default = QPushButton("Default schedule")
         btn_default.setToolTip("Rebuild the five-phase nominal schedule from "
                                "the parameters above.")
         btn_default.clicked.connect(self._sched_fill_default)
         btn_clear = QPushButton("Clear")
         btn_clear.clicked.connect(lambda: self.sched_table.setRowCount(0))
-        for b in (self.btn_optimize, btn_default, btn_clear):
+        for b in (self.btn_optimize, self.btn_plan, btn_default, btn_clear):
             btns.addWidget(b)
         btns.addStretch(1)
         btn_holder = QWidget()
@@ -2313,8 +2514,16 @@ class LaySimulatorDialog(QDialog):
                 "ship_speed_mps": float(self.bf_ship_speed.value()) * KMH,
                 "balance": bool(self.bf_balance.isChecked()),
                 "bottom_tension_target_kN": float(self.bf_bottom_tension.value()),
+                "leg1_bottom_tension_kN": float(self.bf_leg1_btt.value()),
+                "leg2_bottom_tension_kN": float(self.bf_leg2_btt.value()),
+                "leg1_deployed_m": (float(self.bf_leg1_dep.value())
+                                    if self.bf_leg1_dep.value() > 0 else None),
+                "leg2_deployed_m": (float(self.bf_leg2_dep.value())
+                                    if self.bf_leg2_dep.value() > 0 else None),
                 "limit_mbr_m": float(self.def_mbr.value()),
                 "schedule": self._schedule_from_table() or None,
+                "joints": self._joints_cfg(),
+                "count_refs": self._count_refs_cfg(),
             }
         elif kind == "bu":
             cfg.op = {
@@ -2325,6 +2534,15 @@ class LaySimulatorDialog(QDialog):
                 "leg2_azimuth_deg": float(self.bu_leg2_az.value()),
                 "payout_mps": float(self.bu_payout.value()) * KMH,
                 "ship_speed_mps": float(self.bu_ship_speed.value()) * KMH,
+                "bu_start_depth_m": (float(self.bu_start_depth.value())
+                                     if self.bu_start_depth.value() > 0 else None),
+                "duration_s": (float(self.bu_duration.value())
+                               if self.bu_duration.value() > 0 else None),
+                "bottom_tension_target_kN": float(self.bu_btt.value()),
+                "leg_bottom_tension_kN": float(self.bu_leg_btt.value()),
+                "plan_from_tension": bool(self.bu_plan_check.isChecked()),
+                "joints": self._joints_cfg(),
+                "count_refs": self._count_refs_cfg(),
             }
         elif kind == "bight":
             cfg.op = {
@@ -2409,6 +2627,30 @@ class LaySimulatorDialog(QDialog):
         self.op_progress.setValue(0)
         self._start_worker(cfg)
 
+    def _plan_clicked(self):
+        """Derive the lowering schedule from the per-leg TDP tension targets
+        (bu_full scenario only; quick analytic planner)."""
+        if self._worker is not None and self._worker.isRunning():
+            return
+        cfg = self.build_config()
+        if cfg.scenario != "bu_full" or cfg.mode != "operation":
+            QMessageBox.information(
+                self, "Plan from tension targets",
+                "Select the 'BU deployment — full two-sheave (simulation)' "
+                "scenario to plan a deployment from tension targets.")
+            return
+        if (float(cfg.op.get("leg1_bottom_tension_kN", 0.0) or 0.0) <= 0.0
+                or float(cfg.op.get("leg2_bottom_tension_kN", 0.0) or 0.0) <= 0.0):
+            QMessageBox.information(
+                self, "Plan from tension targets",
+                "Set a positive target TDP tension for BOTH legs (the two "
+                "'Target leg TDP tension' inputs) — the planner derives the "
+                "schedule that holds those touchdown tensions.")
+            return
+        cfg.mode = "plan"
+        self.op_progress.setValue(0)
+        self._start_worker(cfg)
+
     def _start_worker(self, cfg: V3Config):
         # Freeze the map placement alongside the config: the overlay must be
         # drawn at the origin this solve used, not wherever a later pick
@@ -2479,20 +2721,22 @@ class LaySimulatorDialog(QDialog):
         except Exception:
             self.profile_view.set_bathy_lookup(None)
 
-        if out.mode == "optimize":
-            # Adopt the optimised schedule + translated set-up so a
-            # subsequent "Run simulation" reproduces the preview at full
-            # quality.
+        if out.mode in ("optimize", "plan"):
+            # Adopt the derived schedule + set-up so a subsequent "Run
+            # simulation" reproduces the preview/plan at full quality.
             if out.schedule:
                 self._schedule_to_table(out.schedule, course_is_compass=False)
             setup = out.optimized_setup or {}
-            # Adopt the translated set-up verbatim (all in the same local
-            # frame over the same bathymetry, so a full-quality re-run
-            # reproduces the preview physics).
+            # Adopt the set-up verbatim (all in the same local frame over
+            # the same bathymetry, so a full-quality re-run reproduces the
+            # preview physics).
             for key, spin in (
                 ("vessel_x", self.bf_vessel_x), ("vessel_y", self.bf_vessel_y),
                 ("laid_end_1_x", self.bf_end1_x), ("laid_end_1_y", self.bf_end1_y),
                 ("laid_end_2_x", self.bf_end2_x), ("laid_end_2_y", self.bf_end2_y),
+                ("leg1_deployed_m", self.bf_leg1_dep),
+                ("leg2_deployed_m", self.bf_leg2_dep),
+                ("lay_az_degN", self.lay_az),
             ):
                 if key in setup:
                     spin.blockSignals(True)
@@ -2501,9 +2745,11 @@ class LaySimulatorDialog(QDialog):
             self._set_dirty(True)
             self.dirty_label.setText(
                 "Schedule optimised (preview) — click Run simulation for "
-                "full-quality results.")
+                "full-quality results." if out.mode == "optimize" else
+                "Schedule planned from tension targets (quick model) — "
+                "click Run simulation to verify at Full quality.")
 
-        if out.mode in ("operation", "optimize") and out.snapshots:
+        if out.mode in ("operation", "optimize", "plan") and out.snapshots:
             self.scrub_widget.setVisible(True)
             self.scrubber.blockSignals(True)
             self.scrubber.setMaximum(len(out.snapshots) - 1)
@@ -2606,6 +2852,9 @@ class LaySimulatorDialog(QDialog):
         gbody.setVisible(show_geo and gbtn.isChecked())
         self._show_rows(self._bu_geo_rows, is_bu_any)          # weight, CdA
         self._show_rows(self._bu_leglen_row, config == "bu")   # bu_full derives it
+        self._show_rows(self._bu_count_rows, is_bu_any)        # count references
+        for w in self._joints_widgets:
+            w.setVisible(is_bu_any)
         self._show_rows(self._fb_geo_rows, config == "bight")
         # Position & heading section: scenario-specific bearing rows and
         # the guided setup button caption.
@@ -2708,10 +2957,25 @@ class LaySimulatorDialog(QDialog):
         self.op_stack.adjustSize()
 
     def _on_scenario_changed(self, *args):
+        scen = self.scenario_combo.currentData()
         idx = {"bu_deployment": 0, "bu_full": 1, "final_bight": 2,
-               "straight_lay": 3}.get(self.scenario_combo.currentData(), 0)
+               "straight_lay": 3}.get(scen, 0)
         self.op_stack.setCurrentIndex(idx)
         self._sync_op_stack_height()
+        # Quality honesty: the quick analytic model only supports the BU
+        # scenarios — grey it out (and fall back to Draft) elsewhere.
+        quick_ok = scen in ("bu_deployment", "bu_full")
+        try:
+            qi = self.op_quality.findData("quick")
+            item = self.op_quality.model().item(qi)
+            if item is not None:
+                item.setEnabled(quick_ok)
+            if not quick_ok and self.op_quality.currentData() == "quick":
+                di = self.op_quality.findData("draft")
+                if di >= 0:
+                    self.op_quality.setCurrentIndex(di)
+        except Exception:
+            pass
         if hasattr(self, "bf_run_mode"):
             self._on_bf_run_mode()
         self._update_config_visibility()
@@ -3249,6 +3513,13 @@ class LaySimulatorDialog(QDialog):
                     self._schedule_to_table(rows, course_is_compass=False)
             except Exception:
                 pass
+        raw = self.settings.value("joints_json")
+        if raw:
+            try:
+                for line, label, s_m in json.loads(str(raw)):
+                    self._joint_add_row(line=line, label=label, s_m=s_m)
+            except Exception:
+                pass
         for key, (btn, body) in self._collapsibles.items():
             val = self.settings.value(f"section_{key}")
             if val is not None:
@@ -3281,6 +3552,16 @@ class LaySimulatorDialog(QDialog):
                 choice = {"bu": "bu_static", "bight": "fs_static"}.get(
                     self.static_config.currentData(), "single_static")
             i = self.scenario_choice.findData(choice)
+            if i >= 0:
+                self.scenario_choice.blockSignals(True)
+                self.scenario_choice.setCurrentIndex(i)
+                self.scenario_choice.blockSignals(False)
+        # Migrate the pre-unified-picker "operation" choice onto the entry
+        # for whichever operation sub-scenario was last selected.
+        if str(self.settings.value("w_scenario_choice")) == "operation":
+            rev = {v: k for k, v in self._OP_CHOICES.items()}
+            target = rev.get(self.scenario_combo.currentData(), "op_bu")
+            i = self.scenario_choice.findData(target)
             if i >= 0:
                 self.scenario_choice.blockSignals(True)
                 self.scenario_choice.setCurrentIndex(i)
@@ -3330,6 +3611,15 @@ class LaySimulatorDialog(QDialog):
         try:
             self.settings.setValue("schedule_json",
                                    json.dumps(self._schedule_from_table()))
+        except Exception:
+            pass
+        try:
+            joints = []
+            for r in range(self.joints_table.rowCount()):
+                joints.append([_s(self.joints_table.item(r, 0)),
+                               _s(self.joints_table.item(r, 1)),
+                               _s(self.joints_table.item(r, 2))])
+            self.settings.setValue("joints_json", json.dumps(joints))
         except Exception:
             pass
 

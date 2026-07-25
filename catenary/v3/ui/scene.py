@@ -81,6 +81,10 @@ class VesselGlyph:
     # Text shown at the departure anchor ("chute"; "sheaves" for the
     # two-sheave BU scenes where xy is the sheave-pair centre).
     departure_label: str = "chute"
+    # Individual overboarding points as (label, x, y) world plan coords,
+    # drawn as labelled dots at deck height — the port/stbd sheaves of the
+    # two-sheave rig. None hides them (single-chute vessels).
+    sheaves_xy: Optional[List[Tuple[str, float, float]]] = None
     color: str = "#444444"
 
 
@@ -184,6 +188,9 @@ class SceneData:
     cables: List[CablePath] = field(default_factory=list)
     markers: List[Marker] = field(default_factory=list)
     vessel: Optional[VesselGlyph] = None
+    # Vessel snail trail: (n, 2) plan positions up to this state, drawn on
+    # the water surface. None hides it.
+    vessel_trail: Optional["np.ndarray"] = None
     water_z: float = 0.0
     show_water_plane: bool = True
     title: str = ""

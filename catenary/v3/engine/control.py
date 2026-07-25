@@ -124,6 +124,50 @@ class CompositeController:
         return out
 
 
+def bu_payout_controllers(
+    *,
+    balance_legs: bool = False,
+    leg_a: str = "leg1",
+    leg_b: str = "leg2",
+    leg_bottom_targets_kN: Optional[Dict[str, float]] = None,
+    trunk_bottom_target_kN: Optional[float] = None,
+    trunk: str = "trunk",
+    gain_mps_per_kN: float = 0.02,
+) -> Optional[object]:
+    """Build the payout controller stack for a BU deployment.
+
+    * ``leg_bottom_targets_kN`` — absolute touchdown-tension target per leg
+      (chain name -> kN). Each leg gets its own
+      :class:`BottomTensionController`; absolute targets supersede the
+      relative balance (both legs at target are, by construction, balanced),
+      so ``balance_legs`` is ignored for any leg with a target.
+    * ``balance_legs`` — the relative sheave-tension balance
+      (:class:`TensionBalanceController`) between ``leg_a``/``leg_b``,
+      used when no absolute leg targets are given.
+    * ``trunk_bottom_target_kN`` — touchdown-tension target for the trunk
+      during the lay-ahead.
+
+    Returns a single controller, a :class:`CompositeController`, or None.
+    """
+    ctrls: list = []
+    leg_targets = {k: v for k, v in (leg_bottom_targets_kN or {}).items()
+                   if v is not None and v > 0.0}
+    if leg_targets:
+        for name, target in leg_targets.items():
+            ctrls.append(BottomTensionController(
+                name, float(target), gain_mps_per_kN=gain_mps_per_kN))
+    elif balance_legs:
+        ctrls.append(TensionBalanceController(
+            leg_a, leg_b, gain_mps_per_kN=gain_mps_per_kN))
+    if trunk_bottom_target_kN is not None and trunk_bottom_target_kN > 0.0:
+        ctrls.append(BottomTensionController(
+            trunk, float(trunk_bottom_target_kN),
+            gain_mps_per_kN=gain_mps_per_kN))
+    if not ctrls:
+        return None
+    return ctrls[0] if len(ctrls) == 1 else CompositeController(ctrls)
+
+
 def balance_leg_lengths(
     sim: OperationSimulator,
     chain_a: str,

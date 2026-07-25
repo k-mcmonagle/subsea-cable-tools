@@ -14,8 +14,10 @@ and constants distilled from the reference papers, with sources).
 > multi-span drape solver on identical 2D problems, and against physical
 > invariants (global drag force balance, junction equilibrium, monotonic BU
 > descent, bight settle) by the automated suites
-> `tests/test_v3_solver3d.py`, `tests/test_v3_steady_lay.py` and
-> `tests/test_v3_timeline.py`. It has **not** been verified against
+> `tests/test_v3_solver3d.py`, `tests/test_v3_steady_lay.py`,
+> `tests/test_v3_timeline.py` and (quick model, controllers, inverse
+> planner, joints/counts) `tests/test_v3_quick_bu.py`,
+> `tests/test_v3_bu_full.py`, `tests/test_v3_bu_plan.py`. It has **not** been verified against
 > commercial lay-simulation software (OrcaFlex, MakaiLay) or measured field
 > data. Treat results as planning-grade estimates, not engineering sign-off
 > values. The tool is released as a **beta**.
@@ -157,6 +159,22 @@ Scenarios:
   ahead paying out trunk; outputs per-leg tensions, BU descent path and
   touchdown. Validated: monotonic descent, landing on the bed, junction
   force balance (implied by convergence), leg symmetry.
+  **Planned lowering (default):** instead of a fixed straight run, the
+  vessel track and trunk payout are solved so BOTH legs hold a target
+  touchdown tension while the BU descends. The start state is made
+  consistent with the targets: each leg's layback at the start depth is
+  computed from the target bottom tension and its bed route leads away
+  from that touchdown along the lead bearing — so the run starts already
+  balanced at target and the vessel only ever advances (no back-tracking
+  to relieve an over-tight start). With the leg lengths given (they were
+  laid to the jointing position), the landing point is an output — the
+  position whose bed paths from the two laid ends equal the leg lengths
+  — and the balanced lay-away course is the leg-lead bisector on a flat
+  bed, skewed appropriately on real bathymetry. Held
+  targets mean no sideways drag at set-down and equal as-laid residual
+  tension in both legs; note the BU is a point body, so attitude (tilt/
+  rotation) at set-down is outside the model. Per-leg touchdown points
+  are marked live in the 3D view with their tensions.
 * **Final bight lay-down** — the joined cable runs from laid end A up to a
   bight apex held by a lowering rope at the vessel and back to laid end B;
   the vessel steps (default perpendicular to the A–B axis) paying out
@@ -174,11 +192,29 @@ Scenarios:
   lowered and laid ahead. A proportional **tension-balance controller**
   redistributes the scheduled leg payout each substep so the sheave
   tensions stay matched (a secant trim on the deployed lengths provides
-  the initial balance), and a **schedule optimiser** places the whole
-  set-up so the BU lands on a target position using preview-quality runs
-  (translation of the operation; limits checked and reported as
-  warnings). The edited/optimised phase schedule is exportable as an
-  operational CSV (time / vessel position / payout per line / tensions).
+  the initial balance); alternatively **absolute per-leg touchdown-tension
+  targets** hang a `BottomTensionController` on each leg while its winch
+  still holds it (absolute targets supersede the relative balance — both
+  legs at target are balanced by construction). The trunk can carry its
+  own touchdown-tension target for the lay-ahead. A **schedule optimiser**
+  places the whole set-up so the BU lands on a target position using
+  preview-quality runs (translation of the operation; limits checked and
+  reported as warnings), and an **inverse planner**
+  (`engine/bu_plan.py`) derives the whole lowering schedule from the leg
+  touchdown-tension targets: the required leg lengths equal the bed path
+  to the landing, each target tension fixes the BU's plan range from its
+  laid end (tangent catenary + length closure), the BU position is the
+  two-circle intersection, and the trunk force balance gives the
+  lay-away course, vessel stand-off and payout — closed-form per depth
+  step, refined against a quick-simulator replay. The edited/optimised/
+  planned phase schedule is exportable as an operational CSV (time /
+  vessel position / payout per line / tensions / cable counts / joint
+  positions). Sheave transfers are always spread over a minimum number
+  of substeps so the top-end lerp stays gradual even in a stationary
+  phase. Chains can carry **named joints** (material coordinates from
+  the far end; the leg/trunk splice joints are tracked automatically)
+  and **cable-count references** (the count at the far/laid end), so
+  displayed positions and the ops CSV line up with real cable markings.
   Modelling caveats: the BU is a point body (no attitude/rotation), the
   in-air weight during the splash transit is not modelled (the junction
   spawns just below the surface at its submerged weight), and deck
@@ -211,7 +247,11 @@ qualitative behaviour.
   a suspended span (touchdown depth only). Validated against the full
   solver on a held-BU case (position within metres, trunk tension within
   ~10 %); always confirm a final schedule at Full quality. The quick
-  run's shapes seed a later full run, so confirming is fast.
+  run's shapes seed a later full run, so confirming is fast. The quality
+  selector is honest about scope: Quick is greyed out for non-BU
+  scenarios, the optimiser states the quality its previews ran at (and
+  can use the quick backend), and manual mode always drives the quick
+  model.
 
 ## What is supported, partially supported, and not supported
 
@@ -224,7 +264,8 @@ qualitative behaviour.
 | Multi-segment assemblies + bodies | **Supported** | V2-compatible JSON, plus diameter/Cd columns. |
 | Seabed friction | **Supported** | Coulomb stick-slip, per segment; history-dependent by nature. |
 | Branching units (Y-topology) | **Supported (beta)** | Junction node + three chains; no BU attitude/rotation model (point body). |
-| Full two-sheave BU deployment | **Supported (beta)** | Phase schedule with transfer/overboard events, payout balance controller, landing-target optimiser; point-body BU, no splash-transit air weight. |
+| Full two-sheave BU deployment | **Supported (beta)** | Phase schedule with transfer/overboard events, payout balance controller, per-leg + trunk touchdown-tension targets, landing-target optimiser, tension-target inverse planner; point-body BU, no splash-transit air weight. |
+| Named joints & cable counts | **Supported** | Material-coordinate joints per chain (3D markers + CSV); count references map outputs to real cable markings. |
 | Final bight lay-down | **Supported (beta)** | Apex held by one lowering line; splice joint not structurally modelled. |
 | Bending stiffness / MBR | **Partial** | Same discrete-moment model and caveats as V2; MBR limit check with warning banner. |
 | Chute/capstan friction | **Partial** | Capstan factor applied to the reported machinery tension; the chute arc geometry itself is not modelled (V2 models the quarter-circle wrap in 2D). |
