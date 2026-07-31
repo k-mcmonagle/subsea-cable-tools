@@ -52,6 +52,7 @@ except Exception:  # pragma: no cover - standalone testing
         exec_method = getattr(obj, "exec", None) or getattr(obj, "exec_")
         return exec_method(*args, **kwargs)
 
+from .integration_editor import BUIntegrationEditor
 from .results_panel import render_results_html
 from .scene import compass_to_math_deg
 from .solve_controller import RunOutput, SolveWorker, V3Config
@@ -228,6 +229,7 @@ class LaySimulatorDialog(QDialog):
         form.addWidget(self._section_position())
         form.addWidget(self._section_environment())
         form.addWidget(self._section_assembly())
+        form.addWidget(self._section_integration())
         form.addWidget(self._section_vessel())
         form.addWidget(self._section_bu_bight())
         form.addWidget(self._section_solve())
@@ -675,10 +677,35 @@ class LaySimulatorDialog(QDialog):
         self._lay_az_label = QLabel("Ship course (lay azimuth)")
         lay.addRow(self._lay_az_label, self.lay_az)
 
-        # BU leg leads (bearings from the setup position).
+        # BU leg geometry: either pick/type the LAID ENDS (positions govern;
+        # bearings become derived) or work by lead bearings alone (legacy —
+        # the far ends are then placed along the bearings from the leg
+        # lengths). The two stay consistent: editing an end updates its
+        # bearing; editing a bearing clears the ends.
+        self._syncing_bu = False
         self.bu_leg1_az = self._dspin("bu_leg1_az", 0.0, 360.0, 150.0, 5.0, 0, " degN")
         self.bu_leg2_az = self._dspin("bu_leg2_az", 0.0, 360.0, 210.0, 5.0, 0, " degN")
+        for w in (self.bu_leg1_az, self.bu_leg2_az):
+            w.setToolTip(
+                "Compass bearing of the leg's bed route away from the BU "
+                "setup position. Derived automatically when the laid ends "
+                "below are set; editing it clears the laid ends (bearings "
+                "then govern).")
+            w.valueChanged.connect(self._bu_az_edited)
+        ends = {}
+        for key in ("bu_end1_x", "bu_end1_y", "bu_end2_x", "bu_end2_y"):
+            ends[key] = self._dspin(key, -1e6, 1e6, 0.0, 10.0, 1, " m")
+            ends[key].setToolTip(
+                "Laid-end position in local metres from the origin (set "
+                "with 'Set up on map', or type surveyed coordinates). "
+                "(0, 0) = not set — the lead bearing and leg length place "
+                "the far end instead.")
+            ends[key].valueChanged.connect(self._bu_end_edited)
+        self.bu_end1_x, self.bu_end1_y = ends["bu_end1_x"], ends["bu_end1_y"]
+        self.bu_end2_x, self.bu_end2_y = ends["bu_end2_x"], ends["bu_end2_y"]
         self._pos_bu_rows = [
+            (QLabel("Leg 1 laid end x / y"), self._pair(self.bu_end1_x, self.bu_end1_y)),
+            (QLabel("Leg 2 laid end x / y"), self._pair(self.bu_end2_x, self.bu_end2_y)),
             (QLabel("Leg 1 lead bearing"), self.bu_leg1_az),
             (QLabel("Leg 2 lead bearing"), self.bu_leg2_az),
         ]
@@ -837,6 +864,18 @@ class LaySimulatorDialog(QDialog):
         note.setWordWrap(True)
         note.setStyleSheet("color:#777; font-size: small;")
         lay.addRow(note)
+        # For the BU scenarios the three lines come from the BU integration
+        # section instead; the table is hidden and this note shown.
+        self._asm_holder = holder
+        self._asm_note = note
+        self._asm_bu_note = QLabel(
+            "This scenario's three lines (trunk, leg 1, leg 2) are defined "
+            "in 'BU integration' below — measured outward from the BU. The "
+            "defaults underneath still fill any blank values.")
+        self._asm_bu_note.setWordWrap(True)
+        self._asm_bu_note.setStyleSheet("color:#777; font-size: small;")
+        self._asm_bu_note.setVisible(False)
+        lay.addRow(self._asm_bu_note)
 
         self.def_qw = self._dspin("def_q_water", -5000.0, 50000.0, 200.0, 10.0, 1, " N/m")
         self.def_qw.setToolTip("Submerged weight per metre. Negative = buoyant.")
@@ -867,6 +906,19 @@ class LaySimulatorDialog(QDialog):
         lay.addRow("Default seabed friction mu", self.def_mu)
         lay.addRow("Default EI", self.def_ei)
         lay.addRow("Default MBR limit (0 = off)", self.def_mbr)
+        return box
+
+    def _section_integration(self):
+        """The BU integration: trunk / leg 1 / leg 2 defined outward from
+        the BU (assemblies, joints, cable counts — one datum for all of
+        them). Shown for the BU scenarios; the BU body weight/CdA stay in
+        'BU / splice properties'."""
+        box, lay = self._collapsible("BU integration (from the BU outward)",
+                                     "integration")
+        self.integration_editor = BUIntegrationEditor()
+        self.integration_editor.changed.connect(self._schedule)
+        lay.addRow(self.integration_editor)
+        self._integration_box = box
         return box
 
     def _section_vessel(self):
@@ -981,16 +1033,24 @@ class LaySimulatorDialog(QDialog):
             "(frontal area times its drag coefficient).")
         self.bu_leg_len = self._dspin("bu_leg_len", 10.0, 20000.0, 300.0, 10.0, 0, " m")
         self.bu_leg_len.setToolTip(
-            "Deployed length of each pre-laid leg, measured from the BU "
-            "along its lead bearing.")
-        # Weight/CdA apply to both BU scenarios; the leg length only to the
+            "Length of cable in leg 1 from the BU to its laid end — from "
+            "the cable counts at jointing. Compared against what the "
+            "picked laid-end geometry demands; a mismatch shows up as "
+            "slack or a taut leg.")
+        self.bu_leg2_len = self._dspin("bu_leg2_len", 0.0, 20000.0, 0.0, 10.0, 0, " m")
+        self.bu_leg2_len.setSpecialValueText("same as leg 1")
+        self.bu_leg2_len.setToolTip(
+            "Length of cable in leg 2 from the BU to its laid end "
+            "(0 = same as leg 1).")
+        # Weight/CdA apply to both BU scenarios; the leg lengths only to the
         # lowering-only one (bu_full derives leg lengths from the laid ends).
         self._bu_geo_rows = [
             (QLabel("BU submerged weight"), self.bu_weight),
             (QLabel("BU drag area Cd*A"), self.bu_cda),
         ]
         self._bu_leglen_row = [
-            (QLabel("Leg length (each)"), self.bu_leg_len),
+            (QLabel("Leg 1 length (BU to laid end)"), self.bu_leg_len),
+            (QLabel("Leg 2 length (BU to laid end)"), self.bu_leg2_len),
         ]
         for lbl, w in self._bu_geo_rows + self._bu_leglen_row:
             lay.addRow(lbl, w)
@@ -2526,12 +2586,16 @@ class LaySimulatorDialog(QDialog):
                 "count_refs": self._count_refs_cfg(),
             }
         elif kind == "bu":
+            L1 = float(self.bu_leg_len.value())
+            L2 = float(self.bu_leg2_len.value()) or L1
             cfg.op = {
                 "bu_weight_kN": float(self.bu_weight.value()),
                 "bu_cda_m2": float(self.bu_cda.value()),
-                "leg_length_m": float(self.bu_leg_len.value()),
+                "leg_length_m": L1,
+                "leg_lengths_m": [L1, L2],
                 "leg1_azimuth_deg": float(self.bu_leg1_az.value()),
                 "leg2_azimuth_deg": float(self.bu_leg2_az.value()),
+                "leg_far_ends_xy": self._bu_far_ends_cfg(),
                 "payout_mps": float(self.bu_payout.value()) * KMH,
                 "ship_speed_mps": float(self.bu_ship_speed.value()) * KMH,
                 "bu_start_depth_m": (float(self.bu_start_depth.value())
@@ -2541,8 +2605,11 @@ class LaySimulatorDialog(QDialog):
                 "bottom_tension_target_kN": float(self.bu_btt.value()),
                 "leg_bottom_tension_kN": float(self.bu_leg_btt.value()),
                 "plan_from_tension": bool(self.bu_plan_check.isChecked()),
-                "joints": self._joints_cfg(),
-                "count_refs": self._count_refs_cfg(),
+                # The whole Y — assemblies, joints and counts, all datumed
+                # on the BU — comes from the integration editor.
+                "integration": self.integration_editor.to_dict(
+                    bu_weight_kN=float(self.bu_weight.value()),
+                    bu_cda_m2=float(self.bu_cda.value())),
             }
         elif kind == "bight":
             cfg.op = {
@@ -2852,10 +2919,22 @@ class LaySimulatorDialog(QDialog):
         gbody.setVisible(show_geo and gbtn.isChecked())
         self._show_rows(self._bu_geo_rows, is_bu_any)          # weight, CdA
         self._show_rows(self._bu_leglen_row, config == "bu")   # bu_full derives it
-        self._show_rows(self._bu_count_rows, is_bu_any)        # count references
+        # Legacy per-line counts/joints stay for the two-sheave scenario
+        # only; the lowering scenario gets them from the BU integration.
+        self._show_rows(self._bu_count_rows, config == "bu_full")
         for w in self._joints_widgets:
-            w.setVisible(is_bu_any)
+            w.setVisible(config == "bu_full")
         self._show_rows(self._fb_geo_rows, config == "bight")
+        # BU integration section (assemblies/joints/counts, BU datum): the
+        # lowering + static-hold scenarios; the generic assembly table is
+        # hidden there (its defaults still apply).
+        ibtn, ibody = self._collapsibles["integration"]
+        show_integ = config == "bu"
+        ibtn.setVisible(show_integ)
+        ibody.setVisible(show_integ and ibtn.isChecked())
+        self._asm_holder.setVisible(not show_integ)
+        self._asm_note.setVisible(not show_integ)
+        self._asm_bu_note.setVisible(show_integ)
         # Position & heading section: scenario-specific bearing rows and
         # the guided setup button caption.
         self._show_rows(self._pos_bu_rows, config == "bu")     # lead bearings
@@ -2871,11 +2950,13 @@ class LaySimulatorDialog(QDialog):
                 "frame (and vessel) on the midpoint.")
         elif config == "bu":
             self.setup_map_btn.setText(
-                "Set up on map:  position, heading, leg 1, leg 2...")
+                "Set up on map:  position, heading, laid ends...")
             self.setup_map_btn.setToolTip(
                 "Four clicks on the map canvas: 1) the BU setup position "
                 "(local origin), 2) a point in the steaming direction, "
-                "3) a point along leg 1's lead, 4) a point along leg 2's lead.")
+                "3) leg 1's laid end, 4) leg 2's laid end — pick them off "
+                "the as-laid route. Sets the laid-end coordinates and the "
+                "derived lead bearings.")
         else:
             self.setup_map_btn.setText("Set up on map:  position, heading...")
             self.setup_map_btn.setToolTip(
@@ -3252,21 +3333,85 @@ class LaySimulatorDialog(QDialog):
         ))
 
     def _pick_bu_setup(self):
+        """Map-first BU lowering set-up: origin, heading, then the two LAID
+        ENDS (real positions from the as-laid route, not just bearings)."""
         def apply(pts):
             from .map_tools import bearing_deg
 
             self._set_local_origin(pts[0])
             loc = self._picks_to_local(pts)
             self.lay_az.setValue(bearing_deg(loc[0], loc[1]))
-            self.bu_leg1_az.setValue(bearing_deg(loc[0], loc[2]))
-            self.bu_leg2_az.setValue(bearing_deg(loc[0], loc[3]))
+            self._set_bu_far_ends(loc[2], loc[3])
+            # Seed each leg length from the picked geometry when the entered
+            # length could not reach the laid end anyway (a count-derived
+            # length that fits is left alone).
+            for spin, end, other in (
+                    (self.bu_leg_len, loc[2], None),
+                    (self.bu_leg2_len, loc[3], self.bu_leg_len)):
+                dist = math.hypot(end[0], end[1])
+                cur = float(spin.value())
+                if cur <= 0.0 and other is not None:
+                    cur = float(other.value())
+                if cur < dist * 1.02:
+                    spin.setValue(round(dist * 1.08))
 
         self._start_pick(4, apply, prompts=(
             "BU setup position (local origin)",
             "a point in the steaming direction",
-            "a point along leg 1's lead",
-            "a point along leg 2's lead",
+            "leg 1 laid end (far end of the pre-laid leg)",
+            "leg 2 laid end",
         ))
+
+    def _set_bu_far_ends(self, end1, end2):
+        """Adopt laid-end local coordinates; bearings become derived."""
+        self._syncing_bu = True
+        try:
+            for spin, v in ((self.bu_end1_x, end1[0]), (self.bu_end1_y, end1[1]),
+                            (self.bu_end2_x, end2[0]), (self.bu_end2_y, end2[1])):
+                spin.setValue(float(v))
+        finally:
+            self._syncing_bu = False
+        self._sync_bu_bearings_from_ends()
+        self._schedule()
+
+    def _sync_bu_bearings_from_ends(self):
+        from .map_tools import bearing_deg
+
+        self._syncing_bu = True
+        try:
+            for (ex, ey), az in (((self.bu_end1_x, self.bu_end1_y), self.bu_leg1_az),
+                                 ((self.bu_end2_x, self.bu_end2_y), self.bu_leg2_az)):
+                end = (float(ex.value()), float(ey.value()))
+                if end != (0.0, 0.0):
+                    az.setValue(bearing_deg((0.0, 0.0), end))
+        finally:
+            self._syncing_bu = False
+
+    def _bu_end_edited(self, *_a):
+        if self._syncing_bu or self._initializing:
+            return
+        self._sync_bu_bearings_from_ends()
+
+    def _bu_az_edited(self, *_a):
+        """A bearing was typed by hand: bearings govern again, so clear the
+        stored laid ends (they no longer match)."""
+        if self._syncing_bu or self._initializing:
+            return
+        self._syncing_bu = True
+        try:
+            for spin in (self.bu_end1_x, self.bu_end1_y,
+                         self.bu_end2_x, self.bu_end2_y):
+                spin.setValue(0.0)
+        finally:
+            self._syncing_bu = False
+
+    def _bu_far_ends_cfg(self):
+        """[(x1, y1), (x2, y2)] local metres, or None when not set."""
+        e1 = (float(self.bu_end1_x.value()), float(self.bu_end1_y.value()))
+        e2 = (float(self.bu_end2_x.value()), float(self.bu_end2_y.value()))
+        if e1 == (0.0, 0.0) and e2 == (0.0, 0.0):
+            return None
+        return [list(e1), list(e2)]
 
     def _pick_bight_ends(self):
         def apply(pts):
@@ -3443,6 +3588,7 @@ class LaySimulatorDialog(QDialog):
             self.current_table.setRowCount(0)
             self.asm_table.setRowCount(0)
             self._asm_add_segment()
+            self.integration_editor.set_from_dict({})
             self._grid_bathy = None
             self._grid_origin = None
             self._picked_centre = None
@@ -3520,6 +3666,9 @@ class LaySimulatorDialog(QDialog):
                     self._joint_add_row(line=line, label=label, s_m=s_m)
             except Exception:
                 pass
+        raw = self.settings.value("bu_integration_json")
+        if raw:
+            self.integration_editor.set_from_json(str(raw))
         for key, (btn, body) in self._collapsibles.items():
             val = self.settings.value(f"section_{key}")
             if val is not None:
@@ -3620,6 +3769,11 @@ class LaySimulatorDialog(QDialog):
                                _s(self.joints_table.item(r, 1)),
                                _s(self.joints_table.item(r, 2))])
             self.settings.setValue("joints_json", json.dumps(joints))
+        except Exception:
+            pass
+        try:
+            self.settings.setValue("bu_integration_json",
+                                   self.integration_editor.to_json())
         except Exception:
             pass
 

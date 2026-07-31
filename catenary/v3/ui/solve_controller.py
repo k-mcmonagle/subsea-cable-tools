@@ -405,6 +405,30 @@ def _op_count_refs(op: dict) -> Optional[Dict[str, float]]:
     return refs or None
 
 
+def _op_leg_lengths(cfg_op: dict, bathy) -> Tuple[float, float]:
+    """Per-leg deployed lengths from the op dict (leg 2 defaults to leg 1)."""
+    lengths = cfg_op.get("leg_lengths_m")
+    if lengths:
+        L1 = float(lengths[0])
+        L2 = float(lengths[1]) if len(lengths) > 1 and lengths[1] else L1
+        return L1, L2
+    L1 = float(cfg_op.get("leg_length_m", 2.0 * bathy.depth_at(0.0, 0.0)))
+    return L1, L1
+
+
+def _lowering_inputs(cfg: V3Config, op: dict, bathy) -> Optional[dict]:
+    """The BU integration's compiled inputs for the lowering scenario, or
+    None when no integration was supplied (legacy configs)."""
+    integ_d = op.get("integration")
+    if not integ_d:
+        return None
+    from ..engine import bu_integration as bi
+
+    integ = bi.BUIntegration.from_dict(integ_d)
+    L1, L2 = _op_leg_lengths(op, bathy)
+    return integ.lowering_inputs(leg1_length_m=L1, leg2_length_m=L2)
+
+
 def _build_scenario(cfg: V3Config, bathy, kind: str, *, static_only: bool = False,
                     hold_depth_m: Optional[float] = None):
     """Shared scenario construction for the operation and static-hold paths."""
@@ -424,12 +448,43 @@ def _build_scenario(cfg: V3Config, bathy, kind: str, *, static_only: bool = Fals
             course_deg=compass_to_math_deg(cfg.lay_azimuth_deg),
         )
     if kind == "bu_deployment":
+        # Line make-up: the BU integration (one BU-datum description of the
+        # whole Y) when present, else the legacy shared/leg assemblies.
+        low = _lowering_inputs(cfg, op, bathy)
+        if low is not None:
+            trunk_items = low["trunk_assembly"]
+            line_kwargs = dict(
+                leg2_assembly=low["leg2_assembly"],
+                leg_length_m=low["leg_length_m"],
+                leg_lengths_m=low["leg_lengths_m"],
+                leg1_joints=low["leg1_joints"],
+                leg2_joints=low["leg2_joints"],
+                trunk_joints=low["trunk_joints"],
+                count_refs=low["count_refs"] or None,
+                count_dirs=low["count_dirs"] or None,
+            )
+            leg_items = low["leg_assembly"]
+        else:
+            trunk_items = items
+            leg_items = (cs.parse_assembly(op["leg_assembly"])
+                         if op.get("leg_assembly") else items)
+            lengths = op.get("leg_lengths_m")
+            L1 = float(op.get("leg_length_m", 2.0 * bathy.depth_at(0.0, 0.0)))
+            line_kwargs = dict(
+                leg_length_m=L1,
+                leg_lengths_m=(tuple(float(v) for v in lengths)
+                               if lengths else None),
+                leg1_joints=_op_joints(op, "leg1"),
+                leg2_joints=_op_joints(op, "leg2"),
+                trunk_joints=_op_joints(op, "trunk"),
+                count_refs=_op_count_refs(op),
+            )
+        ends = op.get("leg_far_ends_xy")
         return scen.bu_deployment(
-            bathy, items, cs.parse_assembly(op["leg_assembly"]) if op.get("leg_assembly") else items,
+            bathy, trunk_items, leg_items,
             defaults,
             bu_weight_kN=float(op.get("bu_weight_kN", 15.0)),
             bu_cda_m2=float(op.get("bu_cda_m2", 1.5)),
-            leg_length_m=float(op.get("leg_length_m", 2.0 * bathy.depth_at(0.0, 0.0))),
             leg_azimuths_deg=(
                 compass_to_math_deg(float(op.get("leg1_azimuth_deg", 150.0))),
                 compass_to_math_deg(float(op.get("leg2_azimuth_deg", 210.0))),
@@ -443,13 +498,11 @@ def _build_scenario(cfg: V3Config, bathy, kind: str, *, static_only: bool = Fals
             bu_start_depth_m=hold_depth_m if static_only else op.get("bu_start_depth_m"),
             trunk_slack_pct=cfg.trunk_slack_pct,
             static_only=static_only,
-            leg1_joints=_op_joints(op, "leg1"),
-            leg2_joints=_op_joints(op, "leg2"),
-            trunk_joints=_op_joints(op, "trunk"),
-            count_refs=_op_count_refs(op),
             schedule=(None if static_only else op.get("schedule")),
-            leg_far_ends_xy=(None if static_only
-                             else op.get("leg_far_ends_xy")),
+            # Picked laid ends govern in every mode, static hold included.
+            leg_far_ends_xy=(tuple(tuple(float(v) for v in e) for e in ends)
+                             if ends else None),
+            **line_kwargs,
         )
     if kind == "bu_full":
         return scen.bu_full_deployment(
@@ -904,11 +957,18 @@ def _plan_for_lowering(cfg: V3Config, bathy):
                                 "leg TDP tension."]
     defaults = build_defaults(cfg)
     items = build_assembly(cfg)
-    leg_items = (cs.parse_assembly(op["leg_assembly"])
-                 if op.get("leg_assembly") else items)
-    w_leg = _mean_weight_npm(leg_items, defaults)
-    w_trunk = _mean_weight_npm(items, defaults)
-    L = float(op.get("leg_length_m", 2.0 * bathy.depth_at(0.0, 0.0)))
+    low = _lowering_inputs(cfg, op, bathy)
+    if low is not None:
+        leg1_items, leg2_items = low["leg_assembly"], low["leg2_assembly"]
+        trunk_items = low["trunk_assembly"]
+    else:
+        leg1_items = leg2_items = (cs.parse_assembly(op["leg_assembly"])
+                                   if op.get("leg_assembly") else items)
+        trunk_items = items
+    w1 = _mean_weight_npm(leg1_items, defaults)
+    w2 = _mean_weight_npm(leg2_items, defaults)
+    w_trunk = _mean_weight_npm(trunk_items, defaults)
+    L1, L2 = _op_leg_lengths(op, bathy)
     depth0 = float(bathy.depth_at(0.0, 0.0))
     spawn = op.get("bu_start_depth_m")
     if spawn is None:
@@ -916,35 +976,46 @@ def _plan_for_lowering(cfg: V3Config, bathy):
     spawn = max(1.0, min(float(spawn), depth0 - 0.5))
     payout = float(op.get("payout_mps", 0.4)) or 0.4
 
-    # Layback-consistent geometry: TDP at the target-tension layback from
-    # the start position, bed route leading away along the lead bearing,
-    # anchor at the end of the remaining length.
-    a_cat = target_kN * 1000.0 / w_leg
-    anchors = []
-    for key, default in (("leg1_azimuth_deg", 150.0), ("leg2_azimuth_deg", 210.0)):
-        az = math.radians(compass_to_math_deg(float(op.get(key, default))))
-        ux, uy = math.cos(az), math.sin(az)
-        D0 = 0.0
-        h = depth0 - spawn
-        for _ in range(3):      # iterate TDP depth on non-flat beds
-            h = float(bathy.depth_at(D0 * ux, D0 * uy)) - spawn
-            if h <= 0.5:
+    picked = op.get("leg_far_ends_xy")
+    if picked:
+        # Positions govern: the laid ends came off the as-laid route (map
+        # picks / typed coordinates); the entered lengths are the cable
+        # that exists — any mismatch surfaces in the planned/simulated
+        # tensions rather than being silently re-geometried away.
+        anchors = [(float(picked[0][0]), float(picked[0][1])),
+                   (float(picked[1][0]), float(picked[1][1]))]
+    else:
+        # Layback-consistent geometry: TDP at the target-tension layback
+        # from the start position, bed route leading away along the lead
+        # bearing, anchor at the end of the remaining length.
+        anchors = []
+        for key, default, w_leg, L in (
+                ("leg1_azimuth_deg", 150.0, w1, L1),
+                ("leg2_azimuth_deg", 210.0, w2, L2)):
+            a_cat = target_kN * 1000.0 / w_leg
+            az = math.radians(compass_to_math_deg(float(op.get(key, default))))
+            ux, uy = math.cos(az), math.sin(az)
+            D0 = 0.0
+            h = depth0 - spawn
+            for _ in range(3):      # iterate TDP depth on non-flat beds
+                h = float(bathy.depth_at(D0 * ux, D0 * uy)) - spawn
+                if h <= 0.5:
+                    return None, None, {}, [
+                        "Start depth leaves no water column for the legs."]
+                D0 = a_cat * math.acosh(1.0 + h / a_cat)
+            s0 = a_cat * math.sinh(D0 / a_cat)
+            bed_len = L - s0
+            if bed_len < 10.0:
                 return None, None, {}, [
-                    "Start depth leaves no water column for the legs."]
-            D0 = a_cat * math.acosh(1.0 + h / a_cat)
-        s0 = a_cat * math.sinh(D0 / a_cat)
-        bed_len = L - s0
-        if bed_len < 10.0:
-            return None, None, {}, [
-                f"Leg length {L:.0f} m is (nearly) all suspended at the "
-                f"start ({s0:.0f} m in the water column at the "
-                f"{target_kN:.1f} kN target) — increase the leg length or "
-                "the target tension."]
-        anchors.append(((D0 + bed_len) * ux, (D0 + bed_len) * uy))
+                    f"Leg length {L:.0f} m is (nearly) all suspended at the "
+                    f"start ({s0:.0f} m in the water column at the "
+                    f"{target_kN:.1f} kN target) — increase the leg length or "
+                    "the target tension."]
+            anchors.append(((D0 + bed_len) * ux, (D0 + bed_len) * uy))
 
     plan = bu_plan.plan_bu_descent_fixed_lengths(
-        bathy, anchors[0], anchors[1], L, L,
-        w_leg1_npm=w_leg, w_leg2_npm=w_leg, w_trunk_npm=w_trunk,
+        bathy, anchors[0], anchors[1], L1, L2,
+        w_leg1_npm=w1, w_leg2_npm=w2, w_trunk_npm=w_trunk,
         bu_weight_N=float(op.get("bu_weight_kN", 15.0)) * 1000.0,
         H1_target_N=target_kN * 1000.0, H2_target_N=target_kN * 1000.0,
         sheave_height_m=cfg.chute_height_m, spawn_depth_m=spawn)
