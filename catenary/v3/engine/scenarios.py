@@ -122,8 +122,11 @@ def bu_deployment(
     leg2_joints: Optional[List[Tuple[str, float]]] = None,
     trunk_joints: Optional[List[Tuple[str, float]]] = None,
     count_refs: Optional[Dict[str, float]] = None,
+    count_dirs: Optional[Dict[str, bool]] = None,
     schedule: Optional[List["PhaseRow"]] = None,
     leg_far_ends_xy: Optional[Sequence[Tuple[float, float]]] = None,
+    leg2_assembly: Optional[List[AssemblyItem]] = None,
+    leg_lengths_m: Optional[Tuple[float, float]] = None,
 ) -> Scenario:
     """Deploy a branching unit: the BU hangs from the trunk while its two
     pre-laid legs run along the bed; the vessel steams along
@@ -145,13 +148,20 @@ def bu_deployment(
     (label, metres-from-the-bottom-end) material coordinates, shown in the
     3D view and exports. ``count_refs`` maps chain names (``leg1``,
     ``leg2``, ``trunk``) to the cable count at the chain's bottom (laid /
-    BU) end so reported positions carry real cable markings.
+    BU) end so reported positions carry real cable markings; ``count_dirs``
+    optionally gives each chain's ``count_to_top`` flag (default True:
+    counts increase from the bottom end toward the top).
 
     ``leg_far_ends_xy`` overrides the default far-end placement (92 % of
     the leg length along each azimuth): pass the two anchored ends
     explicitly — e.g. the layback-consistent geometry from the
     tension-target planner, where each leg's suspended catenary at the
     target bottom tension is already accounted for.
+
+    ``leg2_assembly`` gives leg 2 its own make-up (default: same as
+    ``leg_assembly``); ``leg_lengths_m`` gives the two legs different
+    deployed lengths (default: ``leg_length_m`` for both). Both come
+    straight out of :meth:`bu_integration.BUIntegration.lowering_inputs`.
 
     Initial state: BU at ``bu_start_depth_m`` below the vessel (default just
     below the surface); legs laid out on the bed along ``leg_azimuths_deg``
@@ -187,28 +197,34 @@ def bu_deployment(
         assembly_datum="bottom_end",
         joints=list(trunk_joints or []),
         count_ref_m=(count_refs or {}).get("trunk"),
+        count_to_top=(count_dirs or {}).get("trunk", True),
     )
 
     chains: Dict[str, ChainState] = {"trunk": trunk}
     leg_joints = {1: list(leg1_joints or []), 2: list(leg2_joints or [])}
+    leg_asms = {1: leg_assembly,
+                2: leg2_assembly if leg2_assembly is not None else leg_assembly}
+    leg_lens = {1: float(leg_lengths_m[0]) if leg_lengths_m else float(leg_length_m),
+                2: float(leg_lengths_m[1]) if leg_lengths_m else float(leg_length_m)}
     for i, az in enumerate(leg_azimuths_deg, start=1):
         a = math.radians(az)
         ux, uy = math.cos(a), math.sin(a)
+        L_i = leg_lens[i]
         if leg_far_ends_xy is not None:
             end = (float(leg_far_ends_xy[i - 1][0]),
                    float(leg_far_ends_xy[i - 1][1]))
         else:
-            end = (leg_length_m * 0.92 * ux, leg_length_m * 0.92 * uy)
+            end = (L_i * 0.92 * ux, L_i * 0.92 * uy)
         end_xyz = (end[0], end[1], _bed_z(bathy, end[0], end[1]))
         # Seed: hanging catenary from the BU to a touchdown guess, then a
         # bed-following tail along the azimuth (follows slopes and grids).
-        shape = hanging_leg_seed(bu_start, az, leg_length_m, bathy, 60)
+        shape = hanging_leg_seed(bu_start, az, L_i, bathy, 60)
         shape[-1] = np.asarray(end_xyz)
         chains[f"leg{i}"] = ChainState(
             name=f"leg{i}",
-            assembly=leg_assembly,
+            assembly=leg_asms[i],
             defaults=defaults,
-            length_m=leg_length_m,
+            length_m=L_i,
             top=Attachment("junction", junction="BU"),
             bottom=Attachment("fixed", xyz=end_xyz),
             shape=shape,
@@ -218,6 +234,7 @@ def bu_deployment(
             assembly_datum="top_end",
             joints=leg_joints.get(i, []),
             count_ref_m=(count_refs or {}).get(f"leg{i}"),
+            count_to_top=(count_dirs or {}).get(f"leg{i}", True),
         )
 
     if static_only:
