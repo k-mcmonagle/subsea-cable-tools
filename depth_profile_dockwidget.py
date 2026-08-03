@@ -20,6 +20,12 @@ import bisect
 import numpy as np
 from .plot_widget import Figure, FigureCanvas, NavigationToolbar
 
+# Colour cycle used when one line per raster is drawn on the depth plot.
+_RASTER_SERIES_COLORS = (
+    'tab:blue', 'tab:orange', 'tab:green', 'tab:red', 'tab:purple',
+    'tab:brown', 'tab:pink', 'tab:olive', 'tab:cyan', 'tab:gray',
+)
+
 # Simple sip deletion check fallback
 try:  # sip is available in QGIS Python env; guard for static analysis
     from qgis.PyQt import sip  # type: ignore
@@ -98,6 +104,8 @@ class DepthProfileDockWidget(QDockWidget):
         # Seabed length (3D) calculation
         self.seabed_length = 0.0
         self.sampled_xyz = []  # List of (x, y, z) tuples for 3D length
+        # Per-raster depth series, aligned to self.kp_values: [{'name': str, 'depths': [...]}]
+        self.raster_series = []
 
         # Cached stationing for fast interpolation along long routes
         self._route_seg_starts_m = None
@@ -153,8 +161,15 @@ class DepthProfileDockWidget(QDockWidget):
         self.raster_layer_list = QListWidget()
         self.raster_layer_list.setMinimumWidth(220)
         self.raster_layer_list.setMaximumHeight(80)
-        self.raster_layer_list.setToolTip("Tick one or more rasters. Sampling uses the first raster with valid data at each point; missing coverage remains null.")
+        self.raster_layer_list.setToolTip("Tick one or more rasters. The composite profile uses the highest-resolution raster with valid data at each point; missing coverage remains null.")
         raster_row.addWidget(self.raster_layer_list)
+        self.plot_rasters_separately_chk = QCheckBox("Plot each raster")
+        self.plot_rasters_separately_chk.setToolTip(
+            "Draw one depth line per selected raster (plus the composite used for slope and seabed length).\n"
+            "Samples every raster at every station, so generation is slower with many rasters."
+        )
+        self.plot_rasters_separately_chk.setChecked(bool(self.settings.value("DepthProfile/plot_rasters_separately", True, type=bool)))
+        raster_row.addWidget(self.plot_rasters_separately_chk)
         raster_row.addStretch()
         form_layout.addRow(raster_row)
         
@@ -583,6 +598,8 @@ class DepthProfileDockWidget(QDockWidget):
 
         raster_mode = self.source_type_combo.currentText() == "Raster"
         self.raster_layer_list.setEnabled(raster_mode)
+        if hasattr(self, 'plot_rasters_separately_chk'):
+            self.plot_rasters_separately_chk.setEnabled(raster_mode)
         self.interval_spin.setEnabled(raster_mode)
         if hasattr(self, 'adaptive_interval_chk'):
             self.adaptive_interval_chk.setEnabled(raster_mode)
@@ -848,6 +865,7 @@ class DepthProfileDockWidget(QDockWidget):
         self._build_route_stationing_cache()
 
         # 2. Sampling
+        self.raster_series = []
         if self.source_type_combo.currentText() == "Raster":
             self._sample_raster_mode(ax)
         else:
@@ -874,7 +892,7 @@ class DepthProfileDockWidget(QDockWidget):
                 x_vals = [self.kp_values[-1] - kp for kp in self.kp_values]
             if not x_vals or not self.depth_values:
                 ax_depth.set_title("No profile data generated"); self.canvas.draw(); return
-            ax_depth.plot(x_vals, self.depth_values, color='tab:blue', label='Depth (m)')
+            self._plot_depth_series(ax_depth, x_vals)
             ax_depth.set_ylabel("Depth (m)")
             if self.invert_depth_axis_chk.isChecked():
                 ax_depth.invert_yaxis()
@@ -937,7 +955,10 @@ class DepthProfileDockWidget(QDockWidget):
             x_vals = [self.kp_values[-1] - kp for kp in self.kp_values]
         if not x_vals or not y_vals:
             ax.set_title("No profile data generated"); self.canvas.draw(); return
-        ax.plot(x_vals, y_vals, label=var)
+        if var.startswith("Depth"):
+            self._plot_depth_series(ax, x_vals, single_label=var)
+        else:
+            ax.plot(x_vals, y_vals, label=var)
         if self.invert_kp_axis_chk.isChecked():
             ax.invert_xaxis()
         if ("Slope" in var) and self.invert_slope_axis_chk.isChecked():
@@ -965,7 +986,35 @@ class DepthProfileDockWidget(QDockWidget):
         self.canvas.draw()
         # Switch to plot tab after generating
         self.tab_widget.setCurrentWidget(self.profile_tab)
-    
+
+    def _plot_depth_series(self, ax, x_vals, single_label='Depth (m)'):
+        """Draw the depth curve(s) on ax.
+
+        When several rasters were sampled separately, one line per raster is drawn
+        plus the composite series (dashed) that slope and seabed length derive from.
+        Otherwise a single composite line is drawn, as before.
+        """
+        plottable = []
+        for idx, s in enumerate(getattr(self, 'raster_series', None) or []):
+            if len(s['depths']) != len(x_vals):
+                continue
+            y_vals = [np.nan if v is None else v for v in s['depths']]
+            if not any(not np.isnan(v) for v in y_vals):
+                continue  # raster does not cover the route; keep it out of the legend
+            plottable.append((idx, s['name'], y_vals))
+
+        if len(plottable) < 2:
+            ax.plot(x_vals, [np.nan if v is None else v for v in self.depth_values],
+                    color='tab:blue', label=single_label)
+            return
+
+        for idx, name, y_vals in plottable:
+            ax.plot(x_vals, y_vals, alpha=0.85, label=name,
+                    color=_RASTER_SERIES_COLORS[idx % len(_RASTER_SERIES_COLORS)])
+        composite = [np.nan if v is None else v for v in self.depth_values]
+        ax.plot(x_vals, composite, color='black', linestyle='--', linewidth=0.9,
+                alpha=0.6, label='Composite (best resolution)')
+
     def _compute_seabed_length(self, dual):
         """Compute seabed (3D) length using sampled depths.
 
@@ -1114,9 +1163,30 @@ class DepthProfileDockWidget(QDockWidget):
         # Build arrays
         self.kp_values = []
         self.depth_values = []
+        self.raster_series = []
         dist = 0.0
         valid_count = 0
         missing_count = 0
+
+        # Per-raster series are only worth the extra sampling cost with 2+ rasters.
+        per_raster = len(raster_sources) > 1 and bool(
+            getattr(self, 'plot_rasters_separately_chk', None) and self.plot_rasters_separately_chk.isChecked()
+        )
+        per_raster_depths = [[] for _ in raster_sources] if per_raster else []
+
+        def sample_station(point_xy):
+            """Return (composite_value, source_used), recording per-raster values."""
+            if not per_raster:
+                return self._sample_rasters_at_point_with_source(point_xy, raster_sources)
+            values = self._sample_all_rasters_at_point(point_xy, raster_sources)
+            best_val, best_src = None, None
+            for i, v in enumerate(values):
+                per_raster_depths[i].append(v)
+                # raster_sources is ordered best-resolution-first, so the first
+                # valid value matches the composite used elsewhere.
+                if v is not None and best_val is None:
+                    best_val, best_src = v, raster_sources[i]
+            return best_val, best_src
 
         # Helper to convert pixel area to an approximate pixel size (meters)
         def _pixel_size_m_for_src(src_dict):
@@ -1138,7 +1208,7 @@ class DepthProfileDockWidget(QDockWidget):
             pt = point_geom.asPoint()
 
             # Sample and capture which raster provided the value (if any)
-            val, src_used = self._sample_rasters_at_point_with_source(QgsPointXY(pt.x(), pt.y()), raster_sources)
+            val, src_used = sample_station(QgsPointXY(pt.x(), pt.y()))
             if val is None:
                 missing_count += 1
             else:
@@ -1166,13 +1236,18 @@ class DepthProfileDockWidget(QDockWidget):
             point_geom = self._interpolate_point(self.line_length)
             if point_geom and not point_geom.isEmpty():
                 pt = point_geom.asPoint()
-                val, _ = self._sample_rasters_at_point_with_source(QgsPointXY(pt.x(), pt.y()), raster_sources)
+                val, _ = sample_station(QgsPointXY(pt.x(), pt.y()))
                 if val is None:
                     missing_count += 1
                 else:
                     valid_count += 1
                 self.kp_values.append(self.line_length / 1000.0)
                 self.depth_values.append(val)
+        if per_raster:
+            self.raster_series = [
+                {'name': src['layer'].name(), 'depths': per_raster_depths[i]}
+                for i, src in enumerate(raster_sources)
+            ]
         # Coverage warnings
         try:
             if valid_count == 0 and self.kp_values:
@@ -1195,8 +1270,58 @@ class DepthProfileDockWidget(QDockWidget):
                 self.settings.setValue("DepthProfile/adaptive_interval", bool(self.adaptive_interval_chk.isChecked()))
             if hasattr(self, 'adaptive_interval_factor'):
                 self.settings.setValue("DepthProfile/adaptive_interval_factor", float(self.adaptive_interval_factor.value()))
+            if hasattr(self, 'plot_rasters_separately_chk'):
+                self.settings.setValue("DepthProfile/plot_rasters_separately", bool(self.plot_rasters_separately_chk.isChecked()))
         except Exception:
             pass
+
+    def _sample_raster_source_at_point(self, point_xy_line_crs, src):
+        """Sample a single prepared raster source at a point in line CRS.
+
+        Returns a float, or None when the point is outside the raster, the read
+        fails, or the value is nodata/NaN.
+        """
+        provider = src.get('provider')
+        extent = src.get('extent')
+        transform = src.get('transform')
+        nodata = src.get('nodata')
+        sample_pt = QgsPointXY(point_xy_line_crs.x(), point_xy_line_crs.y())
+        if transform:
+            try:
+                sample_pt = transform.transform(sample_pt)
+            except Exception:
+                return None
+        try:
+            if extent and (sample_pt.x() < extent.xMinimum() or sample_pt.x() > extent.xMaximum() or sample_pt.y() < extent.yMinimum() or sample_pt.y() > extent.yMaximum()):
+                return None
+        except Exception:
+            pass
+        try:
+            sample, ok = provider.sample(sample_pt, 1)
+        except Exception:
+            return None
+        if not ok:
+            return None
+        try:
+            val = float(sample)
+        except Exception:
+            return None
+        try:
+            if nodata is not None and float(nodata) == val:
+                return None
+        except Exception:
+            pass
+        if np.isnan(val):
+            return None
+        return val
+
+    def _sample_all_rasters_at_point(self, point_xy_line_crs, raster_sources):
+        """Sample every raster source at a point in line CRS.
+
+        Returns one float-or-None per source, in raster_sources order, without
+        stopping at the first valid value so per-raster series can be built.
+        """
+        return [self._sample_raster_source_at_point(point_xy_line_crs, src) for src in (raster_sources or [])]
 
     def _sample_rasters_at_point_with_source(self, point_xy_line_crs, raster_sources):
         """Sample multiple rasters at a point and return (value, src_dict_used).
@@ -1204,42 +1329,10 @@ class DepthProfileDockWidget(QDockWidget):
         point_xy_line_crs is in line CRS.
         Returns (None, None) if no valid sample.
         """
-        if not raster_sources:
-            return None, None
-        for src in raster_sources:
-            provider = src.get('provider')
-            extent = src.get('extent')
-            transform = src.get('transform')
-            nodata = src.get('nodata')
-            sample_pt = QgsPointXY(point_xy_line_crs.x(), point_xy_line_crs.y())
-            if transform:
-                try:
-                    sample_pt = transform.transform(sample_pt)
-                except Exception:
-                    continue
-            try:
-                if extent and (sample_pt.x() < extent.xMinimum() or sample_pt.x() > extent.xMaximum() or sample_pt.y() < extent.yMinimum() or sample_pt.y() > extent.yMaximum()):
-                    continue
-            except Exception:
-                pass
-            try:
-                sample, ok = provider.sample(sample_pt, 1)
-            except Exception:
-                continue
-            if not ok:
-                continue
-            try:
-                val = float(sample)
-            except Exception:
-                continue
-            try:
-                if nodata is not None and float(nodata) == val:
-                    continue
-            except Exception:
-                pass
-            if np.isnan(val):
-                continue
-            return val, src
+        for src in (raster_sources or []):
+            val = self._sample_raster_source_at_point(point_xy_line_crs, src)
+            if val is not None:
+                return val, src
         return None, None
 
     def _get_selected_raster_layer_ids(self):
@@ -1337,43 +1430,8 @@ class DepthProfileDockWidget(QDockWidget):
 
         Returns the first valid sample found, else None.
         """
-        if not raster_sources:
-            return None
-        for src in raster_sources:
-            provider = src.get('provider')
-            extent = src.get('extent')
-            transform = src.get('transform')
-            nodata = src.get('nodata')
-            sample_pt = QgsPointXY(point_xy_line_crs.x(), point_xy_line_crs.y())
-            if transform:
-                try:
-                    sample_pt = transform.transform(sample_pt)
-                except Exception:
-                    continue
-            try:
-                if extent and (sample_pt.x() < extent.xMinimum() or sample_pt.x() > extent.xMaximum() or sample_pt.y() < extent.yMinimum() or sample_pt.y() > extent.yMaximum()):
-                    continue
-            except Exception:
-                pass
-            try:
-                sample, ok = provider.sample(sample_pt, 1)
-            except Exception:
-                continue
-            if not ok:
-                continue
-            try:
-                val = float(sample)
-            except Exception:
-                continue
-            try:
-                if nodata is not None and float(nodata) == val:
-                    continue
-            except Exception:
-                pass
-            if np.isnan(val):
-                continue
-            return val
-        return None
+        val, _ = self._sample_rasters_at_point_with_source(point_xy_line_crs, raster_sources)
+        return val
 
     def _build_route_stationing_cache(self):
         """Precompute segment stationing along the route for fast interpolation."""
