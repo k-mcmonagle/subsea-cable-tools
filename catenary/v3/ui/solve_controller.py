@@ -1134,8 +1134,9 @@ def run_operation(cfg: V3Config, progress: Optional[Callable[[float, str], bool]
     if quality == "quick":
         out.warnings.append(
             "Quick analytic model: closed-form catenaries with a frozen-lay "
-            "seabed (laid cable held in place; bed tension decays by "
-            "friction), no hydrodynamic drag — confirm with the full solver.")
+            "seabed (laid cable keeps its as-laid position and tension; only "
+            "a friction slip zone at the touchdown re-adjusts), no "
+            "hydrodynamic drag — confirm with the full solver.")
     elif quality == "draft":
         out.warnings.append(
             "Draft quality: coarse mesh and loose tolerances — re-run at "
@@ -1327,13 +1328,31 @@ def snapshot_scene(snap, bed: BedGrid, title: str = "", cfg: Optional[V3Config] 
     scene.bed = bed
     if trail is not None:
         scene.vessel_trail = np.asarray(trail, dtype=float).reshape(-1, 2)
+    # Cable-over-sheave rendering (V2-style chute contact): chains departing
+    # from the vessel anchor wrap the drawn sheave arc instead of leaving
+    # from its top point. Applies wherever a sheave/chute radius is set and
+    # the departure is the single vessel anchor (not the two-sheave rig).
+    wrap_r = float(getattr(cfg, "chute_radius_m", 0.0) or 0.0) if cfg else 0.0
+    if wrap_r > 0.0 and getattr(cfg, "scenario", "") == "bu_full":
+        wrap_r = 0.0
+    h_rad = math.radians(float(snap.vessel_heading_deg))
+    aft_dir = (-math.cos(h_rad), -math.sin(h_rad))
+    departure = np.array([snap.vessel_xy[0], snap.vessel_xy[1],
+                          float(getattr(cfg, "chute_height_m", 0.0) or 0.0)])
     for k, c in enumerate(snap.chains):
+        xyz, s_m, t_kN, contact = c.xyz.copy(), c.s.copy(), c.tension_kN.copy(), c.contact.copy()
+        if (wrap_r > 0.0 and len(xyz)
+                and float(np.linalg.norm(xyz[0] - departure)) < 1.0):
+            from .scene import wrap_cable_over_sheave
+
+            xyz, s_m, t_kN, contact = wrap_cable_over_sheave(
+                xyz, s_m, t_kN, contact, wrap_r, aft_dir)
         scene.cables.append(CablePath(
-            xyz=c.xyz.copy(),
+            xyz=xyz,
             name=c.name,
-            tension_kN=c.tension_kN.copy(),
-            s_m=c.s.copy(),
-            contact=c.contact.copy(),
+            tension_kN=t_kN,
+            s_m=s_m,
+            contact=contact,
             color=_CHAIN_COLORS[k % len(_CHAIN_COLORS)],
         ))
     for name, xyz in snap.junction_xyz.items():

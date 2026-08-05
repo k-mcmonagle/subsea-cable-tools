@@ -67,6 +67,7 @@ def test_experimental_actions_share_one_toolbar_dropdown():
             plugin.planner_action,
             plugin.explorer_action,
             plugin.lay_simulator_action,
+            plugin.bu_lowering_action,
         ]
         assert all(action not in iface.toolbar_icons
                    for action in experimental_actions)
@@ -79,6 +80,7 @@ def test_experimental_actions_share_one_toolbar_dropdown():
             "Planner",
             "Cable Lay Data Explorer",
             "Cable Lay Simulator (3D)",
+            "BU Lowering Tool (3D)",
         ]
         menu_actions = [action for _menu, action in iface.plugin_menu_actions]
         assert all(action in menu_actions for action in experimental_actions)

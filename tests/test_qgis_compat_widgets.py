@@ -6,6 +6,7 @@ from __future__ import annotations
 from qgis.PyQt.QtWidgets import QApplication
 from qgis.gui import QgsMapCanvas
 
+from ..catenary.v3.ui.bu_lowering_dialog import BULoweringDialog
 from ..catenary.v3.ui.dialog import LaySimulatorDialog
 from ..explorer import CableLayExplorerWindow
 from ..workbench import schema
@@ -33,6 +34,26 @@ def test_lay_simulator_tables_construct():
     dialog.deleteLater()
 
 
+def test_bu_lowering_tool_constructs_and_builds_config():
+    dialog = BULoweringDialog()
+    try:
+        assert dialog.windowTitle()
+        # Own settings scope — never the main simulator's.
+        assert dialog.settings.applicationName() == "BULoweringTool"
+        cfg = dialog.build_config("quick")
+        assert cfg.mode == "operation"
+        assert cfg.scenario == "bu_deployment"
+        assert cfg.op["quality"] == "quick"
+        assert "integration" in cfg.op and cfg.op["integration"]["trunk"]["items"]
+        assert cfg.current_layers == []          # no drag inputs in this tool
+        assert cfg.chute_radius_m == float(dialog.sheave_radius.value())
+        assert dialog.build_config("full").op["quality"] == "full"
+    finally:
+        dialog._save_settings = lambda: None     # don't write user settings
+        dialog.close()
+        dialog.deleteLater()
+
+
 def test_cable_lay_explorer_panels_construct():
     class _Iface:
         def __init__(self):
@@ -56,6 +77,7 @@ def run_all():
     for test in (
             test_workbench_rule_layer_filters_construct,
             test_lay_simulator_tables_construct,
+            test_bu_lowering_tool_constructs_and_builds_config,
             test_cable_lay_explorer_panels_construct):
         try:
             test()

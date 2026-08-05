@@ -227,14 +227,133 @@ def test_frozen_lay_peels_to_tangency():
                 f"no tension spike at the TDP (H = {res['H_bottom']:.0f} N)")
     _assert(len(path) < n0, "tightening must peel laid cable off the bed")
 
-    # Paying the length back out must re-lay and stay tangent too.
+    # Paying the length back out must re-lay and stay near-tangent too.
+    # The rendered span carries the walk band's slack (up to ~half a lay
+    # step), which shows as a few degrees at the touchdown — the failure
+    # mode being guarded against is tens of degrees with a tension spike.
     for _ in range(3):
         L += 10.0
         res = qk.leg_solution_frozen(p_top, path, L, w, bathy, 0.3)
         path = res["path_pts"]
         ang = depart_angle_deg(res)
-        _assert(abs(ang) < 5.0,
-                f"re-laying must stay tangent (depart {ang:.1f} deg)")
+        _assert(abs(ang) < 8.0,
+                f"re-laying must stay near-tangent (depart {ang:.1f} deg)")
+
+
+def test_frozen_lay_keeps_as_laid_tension():
+    """Laid cable keeps the tension it was laid with (friction locks the
+    residual in); only the slip zone next to the touchdown adjusts toward
+    the current bottom tension, inside the Coulomb cone H +/- mu*w*s. The
+    old display recomputed max(0, H - mu*w*s) every step, so any bed run
+    longer than H/(mu*w) read 0 kN however it was laid."""
+    depth = 80.0
+    bathy = bathy_mod.FlatBathymetry(depth)
+    w, mu = 180.0, 0.3
+    p_top = np.array([0.0, 0.0, -5.0])
+    L = 430.0
+    sol = qk.leg_solution(p_top, (-400.0, 0.0), bathy, L, w)
+    path = np.asarray(sol["xyz"])[np.asarray(sol["contact"], dtype=bool)][::-1].copy()
+    T0 = 3000.0
+    Ts = np.full(len(path), T0)
+
+    res = qk.leg_solution_frozen(p_top, path, L, w, bathy, mu, path_T=Ts)
+    con = np.asarray(res["contact"], dtype=bool)
+    t_bed = np.asarray(res["tension"])[con]
+    H = float(res["H_bottom"])
+    _assert(res.get("path_T") is not None, "tension history must be returned")
+    # Anchor end (far behind the TDP) keeps the as-laid tension.
+    _assert(abs(t_bed[-1] - T0) < 1.0,
+            f"far bed run must keep the as-laid {T0:.0f} N (got {t_bed[-1]:.0f})")
+    # Tension is continuous at the touchdown (equals current H there).
+    _assert(abs(t_bed[0] - H) < 1.0,
+            f"TDP bed tension {t_bed[0]:.0f} must match H {H:.0f}")
+    # The whole bed run respects the friction cone about the current H.
+    seg = np.linalg.norm(np.diff(np.asarray(res["xyz"])[con], axis=0), axis=1)
+    s_bed = np.concatenate([[0.0], np.cumsum(seg)])
+    _assert(np.all(t_bed <= H + mu * w * s_bed + 1.0)
+            and np.all(t_bed >= np.maximum(0.0, H - mu * w * s_bed) - 1.0),
+            "bed tension must stay inside the Coulomb cone about H")
+    # Newly laid points record the CONVERGED bottom tension of the solve
+    # that laid them (never transient walk-iteration values), so slack
+    # payout imprints a lower as-laid tension than the pre-payout state.
+    res2 = qk.leg_solution_frozen(p_top, path, L + 30.0, w, bathy, mu,
+                                  path_T=Ts)
+    Ts2 = res2["path_T"]
+    new = Ts2[len(Ts):]
+    H2 = float(res2["H_bottom"])
+    _assert(len(new) > 3, "paying out must lay new points")
+    _assert(np.all(Ts2[:len(Ts)] == Ts), "old as-laid tensions are immutable")
+    _assert(np.all(np.isfinite(new)), "laid tensions must be finalised")
+    _assert(np.allclose(new, H2),
+            f"new points must record the converged H {H2:.0f} N "
+            f"(got {new.min():.0f}-{new.max():.0f})")
+    _assert(H2 < H,
+            f"slack payout must lower the bottom tension ({H2:.0f} vs {H:.0f} N)")
+
+
+def test_no_tension_blowup_when_hang_reaches_the_bed():
+    """The landing singularity: with the touchdown at fixed layback and
+    the hang point descending to the bed, a FORCED tangent-catenary
+    solution's H = w*a diverges (a flat span cannot hold surplus length) —
+    it injected ~100 kN phantom pulls into the BU balance right as the BU
+    landed, so tensions spiked and the geometry visibly jumped. The span
+    must instead degrade to a slack two-point catenary whose bottom
+    tension stays bounded all the way to h = 0."""
+    depth = 80.0
+    bathy = bathy_mod.FlatBathymetry(depth)
+    w, mu = 180.0, 0.3
+    # Laid path ending 10 m (plan) short of the hang; the free length
+    # comfortably exceeds the chord at every hang height (genuine surplus).
+    n = 40
+    path = np.column_stack([np.linspace(-200.0, -10.0, n), np.zeros(n),
+                            np.full(n, -depth)])
+    L = 190.0 + 13.0
+    for h in (5.0, 2.0, 0.5, 0.1, 0.0):
+        p_top = np.array([0.0, 0.0, -depth + h])
+        res = qk.leg_solution_frozen(p_top, path, L, w, bathy, mu)
+        H = float(res["H_bottom"])
+        F = np.asarray(res["F_top"], dtype=float)
+        _assert(H < 20e3,
+                f"h={h}: bottom tension must stay bounded (H = {H/1e3:.1f} kN)")
+        _assert(float(np.linalg.norm(F[:2])) < 25e3,
+                f"h={h}: no phantom horizontal pull on the hang "
+                f"({np.linalg.norm(F[:2])/1e3:.1f} kN)")
+
+
+def test_as_laid_tension_survives_landing():
+    """End to end: after the BU lands and the trunk lays ahead with slack,
+    the trunk's *current* bottom tension is small — but the laid bed run
+    must keep the residual it was laid with (a few kN at landing), not
+    decay to 0 kN behind the touchdown as the old display did."""
+    h = 80.0
+    bathy = bathy_mod.FlatBathymetry(h)
+    asm = _telecom_assembly(3000.0)
+    scn = sc.bu_deployment(
+        bathy, asm, asm, DEFAULTS,
+        bu_weight_kN=15.0, bu_cda_m2=1.5, leg_length_m=150.0,
+        ship_speed_mps=0.3, payout_speed_mps=0.4, target_ds_m=5.0,
+    )
+    sim = qk.QuickOperationSimulator(scn, bathy, tl.SimOptions(max_move_m=8.0))
+    res = sim.run()
+    _assert(not res.aborted, "quick run aborted")
+    last = res.snapshots[-1]
+    _assert(last.junction_xyz["BU"][2] < -h + 2.0, "BU must land")
+    c = last.chain("trunk")
+    con = np.asarray(c.contact, dtype=bool)
+    _assert(con.sum() > 5, "trunk must be laid on the bed after landing")
+    t_bed = np.asarray(c.tension_kN)[con]
+    mu_w = 0.3 * qk.mean_weight_npm(sim.sc.chains["trunk"]) / 1000.0
+    seg = np.linalg.norm(np.diff(np.asarray(c.xyz)[con], axis=0), axis=1)
+    s_far = float(np.sum(seg))
+    tdp_kN = float(t_bed[0])
+    # The old pure-decay display would read ~0 at the far (BU) end of a bed
+    # run this long; the as-laid memory must keep a real residual there.
+    _assert(float(c.end_tension_kN) > max(0.0, tdp_kN - mu_w * s_far) + 0.5,
+            f"trunk far end must keep its as-laid tension "
+            f"({c.end_tension_kN:.2f} kN, decay floor "
+            f"{max(0.0, tdp_kN - mu_w * s_far):.2f} kN)")
+    _assert(float(t_bed.min()) > 0.5,
+            f"laid trunk must not read ~0 kN (min {t_bed.min():.2f} kN)")
 
 
 def test_quick_deployment_runs_in_seconds_and_lands():
@@ -404,6 +523,9 @@ def run_all():
         test_quick_matches_full_solver_static_hold,
         test_blank_segment_weight_uses_defaults,
         test_frozen_lay_peels_to_tangency,
+        test_frozen_lay_keeps_as_laid_tension,
+        test_no_tension_blowup_when_hang_reaches_the_bed,
+        test_as_laid_tension_survives_landing,
         test_quick_deployment_runs_in_seconds_and_lands,
         test_quick_no_bed_penetration,
         test_bottom_tension_controller_trims_payout,

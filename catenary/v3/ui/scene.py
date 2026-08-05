@@ -167,6 +167,107 @@ def chute_arc_points(vessel: "VesselGlyph", water_z: float = 0.0, n: int = 12) -
                                   + np.cos(th)[:, None] * np.array([0.0, 0.0, 1.0])[None, :])
 
 
+def wrap_cable_over_sheave(xyz: "np.ndarray", s_m, tension_kN, contact,
+                           radius_m: float, aft_dir_xy: Tuple[float, float],
+                           n_arc: int = 10):
+    """Redraw a cable's departure so it runs OVER the sheave/chute arc.
+
+    The engine solves the span from the departure anchor (the sheave top);
+    with a sheave radius the physical cable leaves the sheave surface at the
+    tangent point instead — the V2 calculator's chute-contact picture. This
+    is the rendering-side equivalent: the first ``radius * alpha`` metres of
+    cable (``alpha`` = departure angle below horizontal) are replaced by
+    points on the quarter-arc, and the small residual offset between the arc
+    exit and the solved shape is blended out over the following suspended
+    stretch, leaving the touchdown and every laid position untouched.
+
+    ``xyz`` must start at the departure anchor (deck height). ``aft_dir_xy``
+    is the fallback horizontal departure direction for a cable hanging
+    straight down (no horizontal lead). Returns ``(xyz, s_m, tension_kN,
+    contact)`` — new arrays, or the inputs unchanged when no wrap applies.
+    """
+    import math as _m
+
+    r = float(radius_m)
+    pts = np.asarray(xyz, dtype=float)
+    if r <= 0.0 or len(pts) < 3:
+        return xyz, s_m, tension_kN, contact
+    top = pts[0]
+    d = pts[1] - pts[0]
+    horiz = float(np.hypot(d[0], d[1]))
+    if horiz > 1e-9:
+        u = np.array([d[0] / horiz, d[1] / horiz, 0.0])
+    else:
+        ax, ay = float(aft_dir_xy[0]), float(aft_dir_xy[1])
+        nrm = _m.hypot(ax, ay)
+        if nrm < 1e-9:
+            return xyz, s_m, tension_kN, contact
+        u = np.array([ax / nrm, ay / nrm, 0.0])
+    alpha = _m.atan2(max(0.0, -float(d[2])), horiz)
+    alpha = min(alpha, _m.pi / 2.0)
+    if alpha < _m.radians(2.0):
+        return xyz, s_m, tension_kN, contact
+
+    s = (np.asarray(s_m, dtype=float) if s_m is not None
+         else np.concatenate([[0.0], np.cumsum(
+             np.linalg.norm(np.diff(pts, axis=0), axis=1))]))
+    s_cut = min(r * alpha, 0.4 * float(s[-1]))
+    alpha = s_cut / r
+    i_keep = int(np.searchsorted(s, s_cut, side="right"))
+    if i_keep >= len(pts) - 1:
+        return xyz, s_m, tension_kN, contact
+
+    # Quarter-arc geometry: centre below the anchor, horizontal tangent at
+    # the top, leaving at angle theta below horizontal after wrap theta.
+    centre = top - np.array([0.0, 0.0, r])
+    zhat = np.array([0.0, 0.0, 1.0])
+    th = np.linspace(0.0, alpha, max(int(n_arc), 3))
+    arc = centre[None, :] + r * (np.sin(th)[:, None] * u[None, :]
+                                 + np.cos(th)[:, None] * zhat[None, :])
+    s_arc = r * th
+
+    keep = pts[i_keep:].copy()
+    s_keep = s[i_keep:]
+    # Absorb the offset between the arc exit and the solved shape at s_cut
+    # by tapering it LINEARLY in arc length down to the touchdown (the
+    # first laid node) or, for a fully suspended cable, to the far end. A
+    # linear taper is an affine shear: it tilts the remaining span rigidly
+    # about its pinned end and adds no curvature anywhere — any localised
+    # taper (a fixed 30 m blend, a smoothstep) bends an otherwise straight
+    # taut trunk into a visible dogleg below the sheave, and a taper that
+    # outlives the cable drags its far end off its attachment. Laid
+    # (contact) nodes and the far end are never moved, so the touchdown
+    # and the BU/anchor connection stay exactly where the engine put them.
+    con = (np.asarray(contact, dtype=bool) if contact is not None
+           else np.zeros(len(pts), dtype=bool))
+    at_cut = pts[i_keep - 1] + (pts[i_keep] - pts[i_keep - 1]) * (
+        (s_cut - s[i_keep - 1]) / max(s[i_keep] - s[i_keep - 1], 1e-9))
+    delta = arc[-1] - at_cut
+    con_keep = con[i_keep:]
+    if np.any(con_keep):
+        s_pin = float(s_keep[int(np.argmax(con_keep))])
+    else:
+        s_pin = float(s_keep[-1])
+    span = s_pin - s_cut
+    if span <= 1e-9:
+        return xyz, s_m, tension_kN, contact
+    w = np.clip(1.0 - (s_keep - s_cut) / span, 0.0, 1.0)
+    w[con_keep] = 0.0
+    w[-1] = 0.0
+    keep += delta[None, :] * w[:, None]
+
+    new_xyz = np.vstack([arc, keep])
+    new_s = np.concatenate([s_arc, s_keep])
+    if tension_kN is not None:
+        t = np.asarray(tension_kN, dtype=float)
+        t_arc = np.interp(s_arc, s, t)
+        new_t = np.concatenate([t_arc, t[i_keep:]])
+    else:
+        new_t = None
+    new_c = np.concatenate([np.zeros(len(arc), dtype=bool), con[i_keep:]])
+    return new_xyz, new_s, new_t, new_c
+
+
 @dataclass
 class BedGrid:
     """Seabed surface sampled on a regular grid.

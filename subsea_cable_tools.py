@@ -68,6 +68,8 @@ class SubseaCableTools:
         self.catenary_calculator_v2_dialog = None
         self.lay_simulator_action = None
         self.lay_simulator_dialog = None
+        self.bu_lowering_action = None
+        self.bu_lowering_dialog = None
         self.depth_profile_dock = None
         self.depth_profile_action = None
         self.transit_measure_action = None
@@ -146,6 +148,13 @@ class SubseaCableTools:
         self.iface.addPluginToMenu(self.menu, self.lay_simulator_action)
         self.actions.append(self.lay_simulator_action)
 
+        # BU Lowering Tool — the lowering-only BU scenario as its own dialog
+        self.bu_lowering_action = QAction(QIcon(icon_v3_path), "BU Lowering Tool (3D)", self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
+        self.bu_lowering_action.setToolTip("BU Lowering Tool (3D): lower a branching unit on its trunk over two pre-laid legs — quick analytic model with a full-solver verify (beta).")
+        self.bu_lowering_action.triggered.connect(self.show_bu_lowering)
+        self.iface.addPluginToMenu(self.menu, self.bu_lowering_action)
+        self.actions.append(self.bu_lowering_action)
+
         # Cable Route Workbench (assemblies + RPLs + systems in one dock)
         wb_icon = QIcon(":/plugins/subsea_cable_tools/icon.png")
         wb_icon_path = os.path.join(self.plugin_dir, 'workbench_icon.png')
@@ -212,7 +221,8 @@ class SubseaCableTools:
                 self.workbench_action,
                 self.planner_action,
                 self.explorer_action,
-                self.lay_simulator_action):
+                self.lay_simulator_action,
+                self.bu_lowering_action):
             self.experimental_menu.addAction(action)
         self.experimental_tool_button.setMenu(self.experimental_menu)
         self.experimental_toolbar_action = self.iface.addToolBarWidget(
@@ -257,6 +267,26 @@ class SubseaCableTools:
         self.lay_simulator_dialog.show()
         self.lay_simulator_dialog.raise_()
         self.lay_simulator_dialog.activateWindow()
+
+    def show_bu_lowering(self):
+        if self.bu_lowering_dialog is None:
+            try:
+                from .catenary.v3.ui.bu_lowering_dialog import BULoweringDialog
+            except Exception as e:
+                from qgis.PyQt.QtWidgets import QMessageBox
+
+                QMessageBox.critical(
+                    self.iface.mainWindow(),
+                    "Subsea Cable Tools",
+                    "BU Lowering Tool (3D) could not be opened.\n\n"
+                    f"Details: {e}",
+                )
+                return
+
+            self.bu_lowering_dialog = BULoweringDialog(self.iface.mainWindow(), iface=self.iface)
+        self.bu_lowering_dialog.show()
+        self.bu_lowering_dialog.raise_()
+        self.bu_lowering_dialog.activateWindow()
 
     def show_cable_lay_explorer(self):
         """Show the standalone Cable Lay Data Explorer window."""
@@ -447,6 +477,9 @@ class SubseaCableTools:
 
         if hasattr(self, 'lay_simulator_dialog'):
             self.lay_simulator_dialog = None
+
+        if hasattr(self, 'bu_lowering_dialog'):
+            self.bu_lowering_dialog = None
 
         # Remove menu reference
         if hasattr(self, 'menu'):
