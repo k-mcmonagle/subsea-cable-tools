@@ -2,7 +2,8 @@
 """Standalone checks for the KP Mouse live-profile composite/slope math."""
 
 from ..maptools.kp_profile_math import (
-    composite_series, should_invert_depth_axis, slope_series,
+    composite_series, merged_contour_crossings, should_invert_depth_axis,
+    slope_series,
 )
 
 
@@ -37,6 +38,22 @@ def test_composite_falls_back_to_sorted_contours():
     return _result("composite: contour crossings merged and sorted", ok, str(list(zip(x_values, y_values))))
 
 
+def test_merged_contours_interleave_major_minor():
+    # Bathy major/minor sets interleave into one distance-sorted seabed line.
+    profile = {
+        "contours": [
+            {"name": "Bathy_Major", "x": [200.0, 0.0], "y": [-100.0, -50.0]},
+            {"name": "Bathy_Minor", "x": [100.0, 300.0], "y": [-75.0, -125.0]},
+        ],
+    }
+    x_values, y_values = merged_contour_crossings(profile)
+    ok = (x_values == [0.0, 100.0, 200.0, 300.0]
+          and y_values == [-50.0, -75.0, -100.0, -125.0])
+    ok = ok and merged_contour_crossings({"contours": []}) == ([], [])
+    return _result("contour layers merge into one sorted series", ok,
+                   str(list(zip(x_values, y_values))))
+
+
 def test_slope_degrees_and_gaps():
     # 100 m horizontal, 100 m deeper -> 45 degrees; gaps propagate None.
     slopes = slope_series([0.0, 100.0, 200.0, 300.0],
@@ -60,6 +77,7 @@ def test_invert_detection():
 def run_all():
     return [test_composite_prefers_first_raster_and_fills_gaps(),
             test_composite_falls_back_to_sorted_contours(),
+            test_merged_contours_interleave_major_minor(),
             test_slope_degrees_and_gaps(), test_invert_detection()]
 
 

@@ -7,6 +7,19 @@ import math
 from typing import Dict, List, Optional, Tuple
 
 
+def merged_contour_crossings(profile: Dict) -> Tuple[List[float], List[float]]:
+    """All contour-layer crossings merged into one distance-sorted series.
+
+    Bathy data often splits contours across layers (major/minor); a single
+    merged seabed line reads better than overlapping per-layer lines.
+    """
+    crossings = []
+    for series in profile.get("contours", []):
+        crossings.extend(zip(series["x"], series["y"]))
+    crossings.sort(key=lambda pair: pair[0])
+    return [x for x, _y in crossings], [y for _x, y in crossings]
+
+
 def composite_series(profile: Dict) -> Tuple[List[float], List[Optional[float]]]:
     """First-valid depth per station across rasters (resolution order),
     falling back to merged contour crossings when no raster covers the line.
@@ -25,11 +38,7 @@ def composite_series(profile: Dict) -> Tuple[List[float], List[Optional[float]]]
             y_values.append(value)
         if any(value is not None for value in y_values):
             return x_values, y_values
-    crossings = []
-    for series in profile.get("contours", []):
-        crossings.extend(zip(series["x"], series["y"]))
-    crossings.sort(key=lambda pair: pair[0])
-    return [x for x, _y in crossings], [y for _x, y in crossings]
+    return merged_contour_crossings(profile)
 
 
 def slope_series(x_values: List[float], y_values: List[Optional[float]]) -> List[Optional[float]]:

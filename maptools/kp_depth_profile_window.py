@@ -14,7 +14,10 @@ from qgis.PyQt.QtCore import QSettings, QTimer
 from qgis.PyQt.QtWidgets import QCheckBox, QDialog, QHBoxLayout, QLabel, QVBoxLayout
 
 from ..qgis_compat import WINDOW_HINT_CLOSE, WINDOW_HINT_TITLE, WINDOW_TYPE_TOOL
-from .kp_profile_math import composite_series, should_invert_depth_axis, slope_series
+from .kp_profile_math import (
+    composite_series, merged_contour_crossings, should_invert_depth_axis,
+    slope_series,
+)
 
 _SERIES_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
                   "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
@@ -147,18 +150,21 @@ class KPDepthProfileWindow(QDialog):
         seen = set()
         color_index = 0
         values = []
-        for series in profile.get("rasters", []) + [
-                dict(series, contour=True) for series in profile.get("contours", [])]:
+        series_to_draw = list(profile.get("rasters", []))
+        # Contour layers (e.g. bathy major + minor sets) merge into one
+        # distance-sorted seabed line instead of overlapping per-layer lines.
+        contour_layers = profile.get("contours", [])
+        if contour_layers:
+            merged_x, merged_y = merged_contour_crossings(profile)
+            name = (contour_layers[0]["name"] if len(contour_layers) == 1
+                    else "Contours (merged)")
+            series_to_draw.append(
+                {"name": name, "x": merged_x, "y": merged_y, "contour": True})
+        for series in series_to_draw:
             key = ("contour" if series.get("contour") else "raster", series["name"])
             seen.add(key)
-            if series.get("contour"):
-                # Contour crossings, sorted by distance and drawn as a line.
-                pairs = sorted(zip(series["x"], series["y"]), key=lambda pair: pair[0])
-                x_values = [x * factor for x, _y in pairs]
-                y_values = [y for _x, y in pairs]
-            else:
-                x_values = [value * factor for value in series["x"]]
-                y_values = [math.nan if value is None else value for value in series["y"]]
+            x_values = [value * factor for value in series["x"]]
+            y_values = [math.nan if value is None else value for value in series["y"]]
             values.extend(value for value in series["y"] if value is not None)
             curve = self._curves.get(key)
             if curve is None:
