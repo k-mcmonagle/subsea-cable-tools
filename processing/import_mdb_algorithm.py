@@ -13,6 +13,7 @@ import math
 import traceback
 import json
 import tempfile
+import shutil
 import subprocess
 import sys
 import hashlib
@@ -663,7 +664,10 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
             os.environ.get('QGIS_PYTHON_EXECUTABLE', ''),
             os.path.join(exe_dir, 'python3.exe'),
             os.path.join(exe_dir, 'python.exe'),
+            os.path.join(exe_dir, 'python3'),
+            os.path.join(exe_dir, 'python'),
             os.path.join(exe_dir, 'python-qgis.bat'),
+            shutil.which('python3') or '',
             sys.executable,
         ]
         python_exe = ''
@@ -717,9 +721,16 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
         return json.loads(out)
 
     def processAlgorithm(self, parameters, context, feedback):
-        if os.name != 'nt':
+        # The bundled pure-Python reader works on any platform; only fall back
+        # to requiring Windows/ODBC when it is missing (broken install).
+        have_pure_reader = os.path.isdir(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'lib', 'access_parser'))
+        if os.name != 'nt' and not have_pure_reader:
             raise QgsProcessingException(
-                "MDB import requires a Windows ODBC driver (Microsoft Access Database Engine)."
+                "MDB import needs the plugin's bundled MDB reader (lib/access_parser is "
+                "missing — try reinstalling the plugin) or Windows with the Microsoft "
+                "Access Database Engine ODBC driver."
             )
 
         mdb_file = self.parameterAsFile(parameters, self.INPUT_MDB, context)
@@ -922,8 +933,9 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
 </p>
 
 <h4>Prerequisites</h4>
-<p>This tool requires the <b>Microsoft Access Database Engine</b> (or a compatible ODBC driver) to be installed on your system. Without it, QGIS cannot connect to the MDB file. This generally means the tool will only function on a Windows operating system.</p>
-<p><b>Stability note:</b> To avoid silent QGIS crashes caused by native ODBC drivers, this tool reads the MDB in a separate subprocess and then loads the exported layers into QGIS.</p>
+<p><b>None for typical files:</b> the plugin bundles a pure-Python MDB reader, so the tool works out of the box on Windows, macOS, and Linux &mdash; no Microsoft Access Database Engine, ODBC driver, or pyodbc installation is needed.</p>
+<p>If the bundled reader cannot handle a particular file (for example a password-protected or unusual Jet variant), the tool automatically falls back to ODBC, which requires Windows with the <b>Microsoft Access Database Engine</b> driver and <code>pyodbc</code> installed in the QGIS Python environment.</p>
+<p><b>Stability note:</b> The MDB is read in a separate subprocess and the exported layers are then loaded into QGIS. This contains any native ODBC driver crashes (fallback path) and caps memory use on very large files.</p>
 
 <h4>Input Parameters</h4>
 <ul>
