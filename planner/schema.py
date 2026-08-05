@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 from typing import Dict, List, Tuple
 
-from ..workbench.schema import new_id, sanitize_slug, unsaved_project_folder, utc_now_iso
+from ..workbench.schema import gpkg_folder_for, new_id, sanitize_slug, utc_now_iso
 
 SCHEMA_VERSION = 6
 
@@ -129,11 +129,18 @@ PROGRESS_STATUSES = (
 
 
 def default_gpkg_path(project_path: str, project_title: str = "") -> str:
-    """Return the planner GeoPackage path beside the current project."""
+    """Return the planner GeoPackage path beside the current project.
+
+    Falls back to a writable plugin folder when the project is unsaved or its
+    folder is not writable, so the default never lands in an unwritable
+    location such as ``C:\\WINDOWS\\system32``.
+    """
     if project_path:
-        folder = os.path.dirname(project_path)
         stem = os.path.splitext(os.path.basename(project_path))[0]
+        # Keep pointing at an existing file even if the folder probe fails now.
+        beside = os.path.join(os.path.dirname(project_path), "%s_planner.gpkg" % stem)
+        if os.path.exists(beside):
+            return beside
     else:
-        folder = unsaved_project_folder()
         stem = sanitize_slug(project_title) if project_title else "project"
-    return os.path.join(folder, "%s_planner.gpkg" % stem)
+    return os.path.join(gpkg_folder_for(project_path), "%s_planner.gpkg" % stem)

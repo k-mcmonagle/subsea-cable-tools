@@ -426,7 +426,20 @@ def unique_layer_name(existing, base: str) -> str:
 
 
 def _writable(folder: str) -> bool:
-    return bool(folder) and os.path.isdir(folder) and os.access(folder, os.W_OK)
+    """Probe by actually creating a file: ``os.access`` lies on Windows ACLs."""
+    if not folder or not os.path.isdir(folder):
+        return False
+    probe = os.path.join(folder, ".sct_write_probe_%s" % os.getpid())
+    try:
+        with open(probe, "w"):
+            pass
+    except OSError:
+        return False
+    try:
+        os.remove(probe)
+    except OSError:
+        pass
+    return True
 
 
 def unsaved_project_folder() -> str:
@@ -435,7 +448,8 @@ def unsaved_project_folder() -> str:
     The current working directory is not usable: QGIS launched from a Windows
     shortcut inherits ``C:\\WINDOWS\\system32``, which is not writable, so the
     GeoPackage cannot be created at all. Fall back to a plugin folder inside the
-    active QGIS profile, then the user home.
+    active QGIS profile, then the user home, then the system temp folder —
+    never the current working directory.
     """
     candidates = []
     try:
@@ -455,18 +469,38 @@ def unsaved_project_folder() -> str:
         if _writable(folder):
             return folder
     home = os.path.expanduser("~")
-    return home if _writable(home) else os.getcwd()
+    if _writable(home):
+        return home
+    import tempfile
+
+    return tempfile.gettempdir()
+
+
+def gpkg_folder_for(project_path: str) -> str:
+    """Writable folder for a per-project GeoPackage.
+
+    Prefers the folder beside the project file; falls back to
+    :func:`unsaved_project_folder` when the project is unsaved or its folder is
+    not writable (read-only share, revoked cloud-sync folder, …).
+    """
+    if project_path:
+        folder = os.path.dirname(project_path)
+        if _writable(folder):
+            return folder
+    return unsaved_project_folder()
 
 
 def default_gpkg_path(project_path: str, project_title: str = "") -> str:
     """Default workbench GeoPackage path beside the project file."""
     if project_path:
-        folder = os.path.dirname(project_path)
         stem = os.path.splitext(os.path.basename(project_path))[0]
+        # Keep pointing at an existing file even if the folder probe fails now.
+        beside = os.path.join(os.path.dirname(project_path), f"{stem}_workbench.gpkg")
+        if os.path.exists(beside):
+            return beside
     else:
-        folder = unsaved_project_folder()
         stem = sanitize_slug(project_title) if project_title else "project"
-    return os.path.join(folder, f"{stem}_workbench.gpkg")
+    return os.path.join(gpkg_folder_for(project_path), f"{stem}_workbench.gpkg")
 
 
 def new_id() -> str:

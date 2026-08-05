@@ -44,6 +44,7 @@ from .msproject_export import build_msp_tsv
 from .sim_controller import SimulationController
 from .sketch_tool import SketchSession
 from .store import PlannerStore, default_project_gpkg_path, project_gpkg_path, set_project_gpkg_path
+from .task_import_dialog import TaskImportDialog
 from .task_table import TaskTableWidget
 from .timeline_engine import position_at
 
@@ -98,28 +99,8 @@ class PlannerDock(QDockWidget):
         self._save_error = False
         self.current_scenario_id = ""
         path = project_gpkg_path() or default_project_gpkg_path()
-        self.store = PlannerStore(path)
-        self.store_ready = True
-        error = ""
-        try:
-            self.store.migrate()
-        except Exception as exc:
-            error = str(exc)
-            # A remembered path can be unusable on another machine (missing
-            # drive, or the old CWD-based default under C:\WINDOWS\system32).
-            # Only fall back when there is no file there to lose.
-            fallback = default_project_gpkg_path()
-            self.store_ready = False
-            if not os.path.exists(path) and os.path.normcase(fallback) != os.path.normcase(path):
-                try:
-                    self.store = PlannerStore(fallback)
-                    self.store.migrate()
-                except Exception:
-                    self.store = PlannerStore(path)
-                else:
-                    path = fallback
-                    self.store_ready = True
-                    set_project_gpkg_path(path)
+        self.store, path, error = self._open_store_with_recovery(path)
+        self.store_ready = not error
         if not self.store_ready:
             QMessageBox.warning(
                 None, "Planner",
@@ -172,6 +153,55 @@ class PlannerDock(QDockWidget):
         self.topLevelChanged.connect(self._top_level_changed)
         self.refresh_scenarios()
 
+    def _open_store_with_recovery(self, path):
+        """Open/migrate the planner GeoPackage, recovering from bad locations.
+
+        Returns ``(store, path, error)`` where ``error`` is "" on success.
+        A remembered path can be unusable on another machine (missing drive, or
+        the old CWD-based default under C:\\WINDOWS\\system32); fall back to the
+        current default when there is no file there to lose, and finally let
+        the user pick a writable location instead of dead-ending.
+        """
+        try:
+            store = PlannerStore(path)
+            store.migrate()
+            return store, path, ""
+        except Exception as exc:
+            error = str(exc)
+        fallback = default_project_gpkg_path()
+        if not os.path.exists(path) and os.path.normcase(fallback) != os.path.normcase(path):
+            try:
+                store = PlannerStore(fallback)
+                store.migrate()
+                set_project_gpkg_path(fallback)
+                return store, fallback, ""
+            except Exception as exc:
+                error = str(exc)
+                path = fallback
+        while True:
+            answer = QMessageBox.question(
+                None, "Planner",
+                "Could not open or migrate the planner GeoPackage:\n%s\n\n%s\n\n"
+                "Choose a different file or folder for it now?" % (path, error),
+                MESSAGE_BOX_YES | MESSAGE_BOX_NO, MESSAGE_BOX_YES)
+            if answer != MESSAGE_BOX_YES:
+                break
+            suggested = os.path.join(
+                os.path.dirname(fallback), os.path.basename(path) or "project_planner.gpkg")
+            new_path, _filter = QFileDialog.getSaveFileName(
+                None, "Planner GeoPackage", suggested, "GeoPackage (*.gpkg)")
+            if not new_path:
+                break
+            try:
+                store = PlannerStore(new_path)
+                store.migrate()
+                set_project_gpkg_path(new_path)
+                return store, new_path, ""
+            except Exception as exc:
+                error = str(exc)
+                path = new_path
+        return PlannerStore(path), path, error or "Unknown error."
+
     def _build_scenario_bar(self):
         layout = QHBoxLayout()
         layout.addWidget(QLabel("Scenario:"))
@@ -213,13 +243,19 @@ class PlannerDock(QDockWidget):
 
     def _build_task_buttons(self):
         layout = QHBoxLayout()
-        for label, slot in (("Add task", lambda: self.task_table.add_task()),
-                            ("Standard tasks…", self._standard_tasks),
-                            ("Operation types…", self._edit_operation_types),
-                            ("Sketch tasks…", self._sketch_tasks),
-                            ("Import RPL…", self._import_rpl)):
+        for label, slot, tooltip in (
+                ("Add task", lambda: self.task_table.add_task(), ""),
+                ("Standard tasks…", self._standard_tasks, ""),
+                ("Operation types…", self._edit_operation_types, ""),
+                ("Sketch tasks…", self._sketch_tasks, ""),
+                ("Import RPL…", self._import_rpl, ""),
+                ("Import tasks…", self._import_tasks,
+                 "Paste rows copied from MS Project or load a CSV of tasks; "
+                 "assign locations afterwards if needed.")):
             button = QPushButton(label)
             button.clicked.connect(slot)
+            if tooltip:
+                button.setToolTip(tooltip)
             layout.addWidget(button)
         self.undo_btn = QPushButton("Undo")
         self.undo_btn.setEnabled(False)
@@ -855,6 +891,39 @@ class PlannerDock(QDockWidget):
         rows = [standard_tasks.template_to_task_row(template, resource_id)
                 for template in dialog.selected_templates]
         self.task_table.insert_tasks(rows, at)
+
+    def _import_tasks(self):
+        """Paste MS Project rows or load a CSV and append the tasks."""
+        if not self.current_scenario_id:
+            QMessageBox.information(self, "Import tasks",
+                                    "Create or select a scenario first.")
+            return
+        dialog = TaskImportDialog(self.task_table.resources, self)
+        if qt_exec(dialog) != DIALOG_ACCEPTED:
+            return
+        rows = dialog.task_rows()
+        if not rows:
+            return
+        current = self.task_table.currentRow()
+        at = len(self.task_table.rows) if current < 0 else min(
+            current + 1, len(self.task_table.rows))
+        anchor_task = self.task_table.rows[at - 1] if 0 < at <= len(self.task_table.rows) else None
+        anchor_resource = (anchor_task or {}).get("resource_id") or ""
+        default_resource = (self.task_table.resources[0].get("resource_id", "")
+                            if self.task_table.resources else "")
+        for row in rows:
+            if not row.get("resource_id"):
+                row["resource_id"] = anchor_resource or default_resource
+        # Imported rows chain among themselves; hook the first one onto the
+        # task it is inserted after, mirroring Add task — but only when the
+        # dialog's chaining option is on.
+        if (anchor_task is not None and rows and dialog.chain_check.isChecked()
+                and not rows[0].get("predecessor_task_id")):
+            rows[0]["predecessor_task_id"] = anchor_task.get("task_id") or ""
+        self.task_table.insert_tasks(rows, at)
+        self.iface.messageBar().pushMessage(
+            "Planner", "Imported %d task(s)." % len(rows),
+            level=MESSAGE_INFO, duration=4)
 
     def _sketch_tasks(self):
         if not self.current_scenario_id:

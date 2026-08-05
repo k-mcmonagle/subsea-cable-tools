@@ -222,7 +222,12 @@ WINDOW_HINT_CLOSE = _scoped_member(Qt, "WindowType", "WindowCloseButtonHint")
 
 PEN_STYLE_DASH = _scoped_member(Qt, "PenStyle", "DashLine")
 ITEM_FLAG_EDITABLE = _scoped_member(Qt, "ItemFlag", "ItemIsEditable")
+ITEM_FLAG_USER_CHECKABLE = _scoped_member(Qt, "ItemFlag", "ItemIsUserCheckable")
 ITEM_DATA_USER_ROLE = _scoped_member(Qt, "ItemDataRole", "UserRole")
+CHECK_STATE_CHECKED = _scoped_member(Qt, "CheckState", "Checked")
+CHECK_STATE_UNCHECKED = _scoped_member(Qt, "CheckState", "Unchecked")
+WINDOW_TYPE_TOOL = _scoped_member(Qt, "WindowType", "Tool")
+SELECTION_MODE_NONE = _scoped_member(QAbstractItemView, "SelectionMode", "NoSelection")
 
 MAP_LAYER_FILTER_POINT = _layer_filter("PointLayer")
 MAP_LAYER_FILTER_LINE = _layer_filter("LineLayer")
