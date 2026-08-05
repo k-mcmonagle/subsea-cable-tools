@@ -429,11 +429,15 @@ class KPMouseMapTool(QgsMapTool):
                 act_place_ring = menu.addAction("Place Range Ring")
             else:
                 act_place_ring = None
-            # Add depth sampling option if depth layers are configured
+            # Add depth sampling options if depth layers are configured
             if self.showDepth and self.depthSources:
                 act_sample_depth = menu.addAction("Sample Depth at Point")
+                act_profile = menu.addAction("Live Depth Profile Along Range Line (D)")
+                act_profile.setCheckable(True)
+                act_profile.setChecked(self.showDepthProfile)
             else:
                 act_sample_depth = None
+                act_profile = None
             # Optional: keep original copy behaviour
             if self.last_mouse_point is not None and self.last_chainage is not None:
                 act_copy = menu.addAction("Copy KP Info to Clipboard")
@@ -459,6 +463,8 @@ class KPMouseMapTool(QgsMapTool):
                 self._place_range_ring()
             elif act_sample_depth and chosen == act_sample_depth:
                 self._sample_and_display_depth(click_point)
+            elif act_profile and chosen == act_profile:
+                self._toggle_profile_window()
             elif act_goto_kp and chosen == act_goto_kp:
                 self._show_go_to_kp_dialog()
             elif act_copy and chosen == act_copy:
@@ -1041,6 +1047,33 @@ class KPMouseMapTool(QgsMapTool):
             window.clear_profile()
             window.show()
 
+    def _toggle_profile_window(self):
+        """Toggle the live depth profile (right-click menu / D key).
+
+        The choice persists in QSettings so it survives tool restarts.
+        """
+        if not (self.showDepth and self.depthSources):
+            self.iface.messageBar().pushMessage(
+                "KP Mouse Tool",
+                "Configure depth layers first (tool menu → Configure…) to use "
+                "the live depth profile.",
+                level=MESSAGE_INFO, duration=5)
+            return
+        self.showDepthProfile = not self.showDepthProfile
+        QSettings("SubseaCableTools", "KPMouseTool").setValue(
+            "showDepthProfile", self.showDepthProfile)
+        if self.showDepthProfile:
+            if self.range_bearing_origin is not None:
+                self._show_profile_window()
+            else:
+                self.iface.mainWindow().statusBar().showMessage(
+                    "Live depth profile on — left-click to start a "
+                    "range/bearing measurement.", 4000)
+        else:
+            self._hide_profile_window()
+            self.iface.mainWindow().statusBar().showMessage(
+                "Live depth profile off.", 2000)
+
     def _hide_profile_window(self):
         if self.depth_profile_window is not None:
             try:
@@ -1348,6 +1381,8 @@ class KPMouseMapTool(QgsMapTool):
                 self._clear_range_bearing_graphics()
                 self._hide_profile_window()
                 self.iface.mainWindow().statusBar().showMessage("Range/Bearing cleared (ESC).", 2000)
+            elif event.key() == Qt.Key.Key_D:
+                self._toggle_profile_window()
         except Exception:
             pass
 
@@ -1433,7 +1468,6 @@ class KPConfigDialog(QDialog):
         current_use_cartesian=False,
         show_depth=False,
         depth_sources=None,
-        show_depth_profile=False,
         copy_include_rkp=False,
         copy_include_dcc=False,
         copy_include_latlon=False,
@@ -1491,14 +1525,12 @@ class KPConfigDialog(QDialog):
         self.depth_table.setMinimumHeight(120)
         layout.addWidget(self.depth_table)
 
-        self.profile_checkbox = QCheckBox(
-            "Show live depth profile window while measuring range/bearing")
-        self.profile_checkbox.setToolTip(
-            "While a range/bearing measurement is active (left click sets the "
-            "origin), a small window plots the depth along the line to the "
-            "cursor and updates as the mouse moves.")
-        self.profile_checkbox.setChecked(bool(show_depth_profile))
-        layout.addWidget(self.profile_checkbox)
+        self.profile_hint_label = QLabel(
+            "Tip: while the tool is active, toggle the live depth profile "
+            "along the range/bearing line from the right-click menu or by "
+            "pressing D.")
+        self.profile_hint_label.setWordWrap(True)
+        layout.addWidget(self.profile_hint_label)
 
         # Copy-to-clipboard options
         self.copy_label = QLabel("Right-click copy contents:")
@@ -1729,7 +1761,7 @@ class KPConfigDialog(QDialog):
         enabled = self.depth_checkbox.isChecked()
         self.depth_layers_label.setEnabled(enabled)
         self.depth_table.setEnabled(enabled)
-        self.profile_checkbox.setEnabled(enabled)
+        self.profile_hint_label.setEnabled(enabled)
 
     def update_copy_ui(self):
         enabled = self.copy_latlon_checkbox.isChecked()
@@ -1746,7 +1778,6 @@ class KPConfigDialog(QDialog):
         use_cartesian = self.cartesian_checkbox.isChecked()
         show_depth = self.depth_checkbox.isChecked()
         depth_sources = self._selected_depth_sources()
-        show_depth_profile = self.profile_checkbox.isChecked()
         copy_include_rkp = self.copy_rkp_checkbox.isChecked()
         copy_include_dcc = self.copy_dcc_checkbox.isChecked()
         copy_include_latlon = self.copy_latlon_checkbox.isChecked()
@@ -1759,7 +1790,6 @@ class KPConfigDialog(QDialog):
             use_cartesian,
             show_depth,
             depth_sources,
-            show_depth_profile,
             copy_include_rkp,
             copy_include_dcc,
             copy_include_latlon,
@@ -2090,6 +2120,10 @@ class KPMouseTool:
                 self.toolButton.setChecked(False)
                 return
 
+            # The profile toggle is flipped inside the map tool (menu / D key)
+            # and persisted; re-read it so a rebuilt tool keeps the user's state.
+            self.showDepthProfile = QSettings("SubseaCableTools", "KPMouseTool").value(
+                "showDepthProfile", self.showDepthProfile, type=bool)
             self.mapTool = KPMouseMapTool(
                 self.iface.mapCanvas(),
                 layer,
@@ -2140,7 +2174,6 @@ class KPMouseTool:
             self.useCartesian,
             self.showDepth,
             self.depthSourceRefs,
-            self.showDepthProfile,
             self.copyIncludeRKP,
             self.copyIncludeDCC,
             self.copyIncludeLatLon,
@@ -2155,7 +2188,6 @@ class KPMouseTool:
                 use_cartesian,
                 show_depth,
                 depth_sources,
-                show_depth_profile,
                 copy_include_rkp,
                 copy_include_dcc,
                 copy_include_latlon,
@@ -2169,7 +2201,6 @@ class KPMouseTool:
                 self.useCartesian = use_cartesian
                 self.showDepth = show_depth
                 self.depthSourceRefs = list(depth_sources or [])
-                self.showDepthProfile = bool(show_depth_profile)
                 self.copyIncludeRKP = bool(copy_include_rkp)
                 self.copyIncludeDCC = bool(copy_include_dcc)
                 self.copyIncludeLatLon = bool(copy_include_latlon)
@@ -2405,7 +2436,8 @@ class KPMouseTool:
         settings.setValue("copyIncludeLatLon", self.copyIncludeLatLon)
         settings.setValue("copyLatLonFormat", self.copyLatLonFormat)
         settings.setValue("copyLatLonStyle", self.copyLatLonStyle)
-        settings.setValue("showDepthProfile", self.showDepthProfile)
+        # showDepthProfile is written by the map tool's toggle (menu / D key),
+        # not here, so a stale copy can never clobber the user's choice.
         import json
         settings.setValue("depthLayersJson", json.dumps([
             {"id": layer_id, "field": field or ""}
