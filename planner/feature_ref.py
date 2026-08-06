@@ -39,6 +39,17 @@ class FeatureReferenceResolver:
                 if not feature.hasGeometry() or feature.geometry().isEmpty():
                     return None
                 return ResolvedFeature(layer, feature, kind)
+        owner_task_id = shared_owner_task_id(ref)
+        if owner_task_id and self.store is not None:
+            owned = self.store.get_task_geometry(owner_task_id)
+            if owned is None:
+                # The owning task's geometry is gone; the sharer degrades to
+                # "unlinked" instead of resolving a stale feature id below.
+                return None
+            layer, feature, kind = owned
+            if not feature.hasGeometry() or feature.geometry().isEmpty():
+                return None
+            return ResolvedFeature(layer, feature, kind)
         layer_id = _get(ref, "layer_id")
         layer = self.project.mapLayer(layer_id) if layer_id else None
         if layer is None:
@@ -151,15 +162,49 @@ def feature_reference(layer, feature, label="") -> Dict:
     }
 
 
+def shared_reference(owner_reference: Dict, owner_task_id: str) -> Dict:
+    """Build a task reference that shares another task's owned geometry.
+
+    ``owner_reference`` is the owning task's reference fields (its row or the
+    dict returned by ``PlannerStore.set_task_geometry``). Sharers resolve
+    through the owner's task id, so moving the owner's point/route moves every
+    sharer with it.
+    """
+    def _field(key):
+        return str(_get(owner_reference, key, "") or "")
+
+    return {
+        "layer_id": _field("layer_id"), "layer_source": _field("layer_source"),
+        "layer_name": _field("layer_name"), "feature_id": _field("feature_id"),
+        "feature_label": _field("feature_label"), "geom_kind": _field("geom_kind"),
+        "linked_ref_json": json.dumps(
+            {"shared_task_geometry": True, "owner_task_id": str(owner_task_id)},
+            sort_keys=True),
+    }
+
+
+def shared_owner_task_id(ref) -> str:
+    """Task id whose owned geometry this reference shares, or ""."""
+    metadata = _linked_metadata(ref)
+    if metadata.get("shared_task_geometry"):
+        return str(metadata.get("owner_task_id") or "")
+    return ""
+
+
 def _get(obj, key, default=""):
     return obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
 
 
-def _is_owned(ref) -> bool:
+def _linked_metadata(ref) -> Dict:
     raw = _get(ref, "linked_ref_json")
     if not raw:
-        return False
+        return {}
     try:
-        return bool(json.loads(str(raw)).get("owned_geometry"))
+        metadata = json.loads(str(raw))
+        return metadata if isinstance(metadata, dict) else {}
     except (TypeError, ValueError):
-        return False
+        return {}
+
+
+def _is_owned(ref) -> bool:
+    return bool(_linked_metadata(ref).get("owned_geometry"))

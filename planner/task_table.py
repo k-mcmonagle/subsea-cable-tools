@@ -22,7 +22,11 @@ from ..qgis_compat import (
     qt_exec,
 )
 from . import operation_types, schema
+from .feature_ref import shared_owner_task_id
 from .timeline_engine import TaskSpec, compute_fuel, compute_schedule
+
+LINK_KEYS = ("layer_id", "layer_source", "layer_name", "feature_id",
+             "feature_label", "geom_kind", "linked_ref_json")
 
 
 class TaskTableWidget(QTableWidget):
@@ -587,23 +591,65 @@ class TaskTableWidget(QTableWidget):
         super().keyPressEvent(event)
 
     def update_link(self, task_id, reference, record_history=True):
-        task = self.row_by_id(task_id)
-        if task is None:
+        self.update_links_bulk({task_id: reference}, record_history=record_history)
+
+    def update_links_bulk(self, references, record_history=True):
+        """Apply several link updates in one checkpoint/rebuild/save cycle.
+
+        ``references`` maps task_id -> reference fields ({} clears a link).
+        """
+        updates = [(self.row_by_id(task_id), reference or {})
+                   for task_id, reference in (references or {}).items()]
+        updates = [(task, reference) for task, reference in updates if task is not None]
+        if not updates:
             return
         if record_history:
             self.checkpoint()
-        for key in ("layer_id", "layer_source", "layer_name", "feature_id",
-                    "feature_label", "geom_kind", "linked_ref_json"):
-            task[key] = reference.get(key, "")
-        if self.spatial_kind(task) == "line" and _float(task.get("speed_knots")) > 0:
-            task["duration_mode"] = "computed"
+        for task, reference in updates:
+            for key in LINK_KEYS:
+                task[key] = reference.get(key, "")
+            # Optional location fields ride along when a caller shares an
+            # explicit start/end/chainage position with other tasks.
+            for key in ("location_mode", "location_chainage_m"):
+                if key in reference:
+                    task[key] = reference[key]
+            if self.spatial_kind(task) == "line" and _float(task.get("speed_knots")) > 0:
+                task["duration_mode"] = "computed"
         self.resolver.clear_cache()
         self._rebuild()
-        row_index = next((index for index, row in enumerate(self.rows)
-                          if row.get("task_id") == task_id), -1)
-        if row_index >= 0:
-            self.selectRow(row_index)
+        updated_ids = {task.get("task_id") for task, _reference in updates}
+        rows = [index for index, row in enumerate(self.rows)
+                if row.get("task_id") in updated_ids]
+        if len(rows) == 1:
+            self.selectRow(rows[0])
+        elif rows:
+            self._select_rows(rows)
         self._emit_change()
+
+    def apply_reference_fields(self, references):
+        """Mirror reference repairs already written to disk (no re-save)."""
+        changed = False
+        for task_id, reference in (references or {}).items():
+            task = self.row_by_id(task_id)
+            if task is None:
+                continue
+            for key in LINK_KEYS:
+                task[key] = (reference or {}).get(key, "")
+            changed = True
+        if changed:
+            self.resolver.clear_cache()
+            self._rebuild()
+
+    def selected_task_ids(self, include_summary=False):
+        """Task ids of the selected rows, top to bottom."""
+        ids = []
+        for index in self.selected_row_indices():
+            if not (0 <= index < len(self.rows)):
+                continue
+            if not include_summary and self._is_summary(index):
+                continue
+            ids.append(self.rows[index].get("task_id") or "")
+        return [task_id for task_id in ids if task_id]
 
     def update_task_fields(self, task_id, values, record_history=True):
         task = self.row_by_id(task_id)
@@ -646,9 +692,25 @@ class TaskTableWidget(QTableWidget):
                 constraint_type="" if summary else row.get("constraint_type") or "",
                 constraint_datetime=None if summary else row.get("constraint_datetime") or None,
                 is_milestone=False if summary else bool(row.get("is_milestone")),
-                location_key="" if summary else self.location_key(row),
+                location_key="" if summary else self.location_key_for(row),
             ))
         return specs
+
+    def location_key_for(self, task):
+        """Location key, following shared references to the owning task.
+
+        Sharers of one task's geometry get the owner's key so overlapping
+        tasks at the same shared point are flagged together, even after the
+        owner's stored geometry has been re-placed.
+        """
+        owner_id = shared_owner_task_id(task)
+        if owner_id and (task.get("location_mode") or "feature") == "feature":
+            owner = self.row_by_id(owner_id)
+            if owner is not None:
+                key = self.location_key(owner)
+                if key:
+                    return key
+        return self.location_key(task)
 
     @staticmethod
     def spatial_kind(task):
@@ -786,6 +848,9 @@ class TaskTableWidget(QTableWidget):
                                   lambda: self.progressRequested.emit(task_id))
         advanced.setEnabled(not self._is_summary(row))
         progress.setEnabled(not self._is_summary(row))
+        link = menu.addAction("Link or share location…",
+                              lambda: self.linkRequested.emit(task_id))
+        link.setEnabled(not self._is_summary(row))
         menu.addSeparator()
         menu.addAction("Group selected tasks", self.group_selected)
         menu.addAction("Indent (make child)", lambda: self.indent_selected(1))
@@ -928,8 +993,17 @@ class TaskTableWidget(QTableWidget):
         location = location_labels.get(task.get("location_mode") or "feature")
         if location:
             label = "%s (%s)" % (label, location)
+        owner_id = shared_owner_task_id(task)
+        if owner_id:
+            label = "%s ⇄" % label
         button = QPushButton((layer + " / " if layer else "") + label)
         button.clicked.connect(lambda _checked=False, tid=task.get("task_id"): self.linkRequested.emit(tid))
+        if owner_id:
+            owner = self.row_by_id(owner_id)
+            owner_name = (owner or {}).get("name") or "a deleted task"
+            button.setToolTip(
+                "Shared location — this task follows the point/route owned by "
+                "'%s'. Move that task's geometry to move every task sharing it." % owner_name)
         if task.get("feature_id") and self.resolver.resolve(task) is None:
             button.setStyleSheet("QPushButton { background: #d99b32; }")
             button.setToolTip("Linked feature is unavailable: %s / %s" % (layer, label))

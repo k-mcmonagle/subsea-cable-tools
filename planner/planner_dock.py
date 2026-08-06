@@ -38,7 +38,10 @@ from ..qgis_compat import (
     qt_exec,
 )
 from . import operation_types, schema, standard_tasks
-from .feature_ref import FeatureReferenceResolver, feature_reference
+from .feature_ref import (
+    FeatureReferenceResolver, feature_reference, shared_owner_task_id,
+    shared_reference,
+)
 from .map_overlay import FeaturePickSession, PlannerMapOverlay
 from .msproject_export import build_msp_tsv
 from .sim_controller import SimulationController
@@ -146,8 +149,18 @@ class PlannerDock(QDockWidget):
         self.task_table.progressRequested.connect(self._update_progress)
         self.task_table.historyStateChanged.connect(self._history_state_changed)
         for layer in self.geometry_layers:
-            if hasattr(layer, "geometryChanged"):
-                layer.geometryChanged.connect(self._planner_geometry_changed)
+            # Editing the planner point/line layers directly (move a vertex,
+            # commit, delete) must refresh the schedule and link indicators.
+            for signal_name, handler in (
+                    ("geometryChanged", self._planner_geometry_changed),
+                    ("editingStopped", self._planner_geometry_changed),
+                    ("featuresDeleted", self._planner_geometry_removed)):
+                signal = getattr(layer, signal_name, None)
+                if signal is not None:
+                    try:
+                        signal.connect(handler)
+                    except Exception:
+                        pass
         self.sim.timeChanged.connect(self._simulation_time_changed)
         self.sim.playingChanged.connect(self.play_btn.setChecked)
         self.topLevelChanged.connect(self._top_level_changed)
@@ -694,8 +707,12 @@ class PlannerDock(QDockWidget):
         if self._loading or not self.current_scenario_id:
             return
         try:
-            self.store.save_tasks(self.current_scenario_id, rows)
+            repaired = self.store.save_tasks(self.current_scenario_id, rows)
             self._sync_spatial_attributes(self.task_table.schedule)
+            if repaired:
+                # A deleted task's shared geometry was handed to a survivor;
+                # mirror the rewritten links (already on disk) into the table.
+                self.task_table.apply_reference_fields(repaired)
             self._save_error = False
         except Exception as exc:
             # Keep editing usable (changes stay in the table) and report once
@@ -777,13 +794,36 @@ class PlannerDock(QDockWidget):
             self._load_scenario(self.current_scenario_id)
 
     def _link_feature(self, task_id):
+        task = self.task_table.row_by_id(task_id)
+        if task is None:
+            return
+        owned_kind = (task.get("geom_kind") or "") if _owned_geometry(task) else ""
+        selected = self.task_table.selected_task_ids()
+        bulk_ids = list(selected) if (len(selected) >= 2 and task_id in selected) else []
         menu = QMenu(self)
         existing_action = menu.addAction("Choose or pick existing feature…")
-        point_action = menu.addAction("Place new point on map")
-        line_action = menu.addAction("Draw new route on map")
+        point_action = menu.addAction(
+            "Move task point on map" if owned_kind == "point" else "Place new point on map")
+        line_action = menu.addAction(
+            "Redraw task route on map" if owned_kind == "line" else "Draw new route on map")
+        bulk_existing = bulk_point = bulk_share = bulk_clear = None
+        if bulk_ids:
+            count = len(bulk_ids)
+            menu.addSeparator()
+            bulk_existing = menu.addAction(
+                "Link all %d selected tasks to one feature…" % count)
+            bulk_point = menu.addAction(
+                "Place one shared point for the %d selected tasks" % count)
+            bulk_share = menu.addAction(
+                "Give the %d selected tasks this task's location" % count)
         menu.addSeparator()
         clear_action = menu.addAction("Clear geometry link")
+        if bulk_ids:
+            bulk_clear = menu.addAction(
+                "Clear links on the %d selected tasks" % len(bulk_ids))
         chosen = qt_exec(menu, QCursor.pos())
+        if not chosen:
+            return
         if chosen == point_action:
             self._start_task_sketch(task_id, "point")
             return
@@ -793,13 +833,167 @@ class PlannerDock(QDockWidget):
         if chosen == clear_action:
             self._clear_task_link(task_id)
             return
+        if bulk_ids:
+            if chosen == bulk_existing:
+                self._bulk_link_existing(bulk_ids)
+                return
+            if chosen == bulk_point:
+                self._bulk_place_shared_point(bulk_ids)
+                return
+            if chosen == bulk_share:
+                self._bulk_share_from(task_id, bulk_ids)
+                return
+            if chosen == bulk_clear:
+                self._bulk_clear_links(bulk_ids)
+                return
         if chosen != existing_action:
             return
         dialog = FeatureLinkDialog(self.canvas, self.pick_session, self)
         if qt_exec(dialog) == DIALOG_ACCEPTED and dialog.reference is not None:
             self.task_table.checkpoint()
-            self._discard_owned_geometry(task_id)
-            self.task_table.update_link(task_id, dialog.reference, record_history=False)
+            updates = self._transfer_or_discard_owned_geometry(
+                task_id, exclude_ids=(task_id,))
+            updates[task_id] = dict(dialog.reference)
+            self.task_table.update_links_bulk(updates, record_history=False)
+
+    def _bulk_link_existing(self, task_ids):
+        """Link every selected task to the same existing map feature."""
+        dialog = FeatureLinkDialog(self.canvas, self.pick_session, self)
+        if qt_exec(dialog) != DIALOG_ACCEPTED or dialog.reference is None:
+            return
+        self.task_table.checkpoint()
+        updates = {}
+        for linked_id in task_ids:
+            updates.update(self._transfer_or_discard_owned_geometry(
+                linked_id, exclude_ids=task_ids))
+        for linked_id in task_ids:
+            updates[linked_id] = dict(dialog.reference)
+        self.task_table.update_links_bulk(updates, record_history=False)
+        self.iface.messageBar().pushMessage(
+            "Planner", "Linked %d tasks to '%s'." % (
+                len(task_ids), dialog.reference.get("feature_label") or "the feature"),
+            level=MESSAGE_INFO, duration=4)
+
+    def _bulk_place_shared_point(self, task_ids):
+        """Sketch one point and make every selected task use it."""
+        if not self.current_scenario_id:
+            return
+        self.iface.messageBar().pushMessage(
+            "Planner",
+            "Click, snap, or enter latitude/longitude or route KP to place one "
+            "point shared by the %d selected tasks. Escape cancels." % len(task_ids),
+            level=MESSAGE_INFO, duration=8)
+
+        def completed(points):
+            self._apply_shared_point(list(task_ids), points[0])
+
+        self.sketch_session.start(
+            "point", completed, route_options=self._sketch_route_options())
+
+    def _apply_shared_point(self, task_ids, point):
+        owner_id = task_ids[0]
+        owner = self.task_table.row_by_id(owner_id)
+        if owner is None or not self.current_scenario_id:
+            return
+        self.task_table.checkpoint()
+        updates = {}
+        for linked_id in task_ids:
+            updates.update(self._transfer_or_discard_owned_geometry(
+                linked_id, exclude_ids=task_ids))
+        try:
+            reference = self.store.set_task_geometry(
+                owner_id, self.current_scenario_id, int(owner.get("seq") or 0),
+                owner.get("name") or "Task", QgsGeometry.fromPointXY(point), "point",
+                source_crs=self.canvas.mapSettings().destinationCrs(),
+                resource_id=owner.get("resource_id") or "",
+                speed_knots=owner.get("speed_knots"),
+                duration_hours=owner.get("duration_hours"),
+                notes=owner.get("notes") or "", source_kind="drawn",
+                source_ref={"shared_point": True})
+        except Exception as exc:
+            self.iface.messageBar().pushMessage(
+                "Planner", "Could not store the shared point: %s" % exc,
+                level=MESSAGE_CRITICAL, duration=8)
+            return
+        updates[owner_id] = dict(reference)
+        shared = shared_reference(reference, owner_id)
+        for linked_id in task_ids[1:]:
+            updates[linked_id] = dict(shared)
+        self.task_table.update_links_bulk(updates, record_history=False)
+        self.iface.messageBar().pushMessage(
+            "Planner",
+            "%d tasks now share one point. Use 'Move task point on map' on "
+            "'%s' (or edit the Planner Task Points layer) to move them all." % (
+                len(task_ids), owner.get("name") or "Task"),
+            level=MESSAGE_INFO, duration=6)
+
+    def _bulk_share_from(self, source_task_id, task_ids):
+        """Give every other selected task the source task's location."""
+        task = self.task_table.row_by_id(source_task_id)
+        if task is None:
+            return
+        owner_id = ""
+        owner_row = task
+        plain_reference = None
+        if _owned_geometry(task):
+            owner_id = str(source_task_id)
+        else:
+            shared_owner = shared_owner_task_id(task)
+            if shared_owner:
+                owner_id = shared_owner
+                owner_row = self.task_table.row_by_id(shared_owner) or task
+            elif task.get("feature_id"):
+                plain_reference = {
+                    "layer_id": task.get("layer_id") or "",
+                    "layer_source": task.get("layer_source") or "",
+                    "layer_name": task.get("layer_name") or "",
+                    "feature_id": task.get("feature_id") or "",
+                    "feature_label": task.get("feature_label") or "",
+                    "geom_kind": task.get("geom_kind") or "",
+                    "linked_ref_json": task.get("linked_ref_json") or "",
+                }
+            else:
+                self.iface.messageBar().pushMessage(
+                    "Planner",
+                    "This task has no location to share yet — link or place one first.",
+                    level=MESSAGE_WARNING, duration=5)
+                return
+        others = [linked_id for linked_id in task_ids
+                  if linked_id not in (source_task_id, owner_id)]
+        if not others:
+            return
+        self.task_table.checkpoint()
+        updates = {}
+        for linked_id in others:
+            updates.update(self._transfer_or_discard_owned_geometry(
+                linked_id, exclude_ids=task_ids))
+        location_fields = {
+            "location_mode": task.get("location_mode") or "feature",
+            "location_chainage_m": task.get("location_chainage_m"),
+        }
+        if owner_id:
+            shared = dict(shared_reference(owner_row, owner_id), **location_fields)
+            for linked_id in others:
+                updates[linked_id] = dict(shared)
+        else:
+            plain_reference.update(location_fields)
+            for linked_id in others:
+                updates[linked_id] = dict(plain_reference)
+        self.task_table.update_links_bulk(updates, record_history=False)
+        self.iface.messageBar().pushMessage(
+            "Planner", "%d tasks now use the location of '%s'." % (
+                len(others), task.get("name") or "Task"),
+            level=MESSAGE_INFO, duration=4)
+
+    def _bulk_clear_links(self, task_ids):
+        self.task_table.checkpoint()
+        updates = {}
+        for linked_id in task_ids:
+            updates.update(self._transfer_or_discard_owned_geometry(
+                linked_id, exclude_ids=task_ids))
+        for linked_id in task_ids:
+            updates[linked_id] = {}
+        self.task_table.update_links_bulk(updates, record_history=False)
 
     def _start_task_sketch(self, task_id, mode):
         task = self.task_table.row_by_id(task_id)
@@ -837,17 +1031,51 @@ class PlannerDock(QDockWidget):
                 "Planner", "Could not store the sketched geometry: %s" % exc,
                 level=MESSAGE_CRITICAL, duration=8)
             return
-        self.task_table.update_link(task_id, reference, record_history=False)
+        updates = {task_id: dict(reference)}
+        # Tasks sharing this task's location keep following it; refresh their
+        # stored fields so labels and location keys stay in step.
+        shared = shared_reference(reference, task_id)
+        for row in self.task_table.rows:
+            if shared_owner_task_id(row) == str(task_id):
+                updates[str(row.get("task_id") or "")] = dict(shared)
+        self.task_table.update_links_bulk(updates, record_history=False)
 
-    def _discard_owned_geometry(self, task_id):
+    def _transfer_or_discard_owned_geometry(self, task_id, exclude_ids=()):
+        """Free a task's owned geometry before its link changes.
+
+        When other tasks (outside ``exclude_ids``) share the geometry,
+        ownership moves to the first of them and their updated reference
+        fields are returned for the caller's bulk link update; otherwise the
+        stored geometry is deleted and {} is returned.
+        """
         task = self.task_table.row_by_id(task_id)
-        if task is not None and _owned_geometry(task):
+        if task is None or not _owned_geometry(task):
+            return {}
+        excluded = {str(value) for value in exclude_ids}
+        heirs = [row for row in self.task_table.rows
+                 if str(row.get("task_id") or "") not in excluded
+                 and shared_owner_task_id(row) == str(task_id)]
+        if not heirs:
             self.store.delete_task_geometries([task_id])
+            return {}
+        heir = heirs[0]
+        heir_id = str(heir.get("task_id") or "")
+        reference = self.store.reassign_task_geometry(
+            task_id, heir_id, heir.get("name") or "Task")
+        if reference is None:
+            return {}
+        updates = {heir_id: dict(reference)}
+        shared = shared_reference(reference, heir_id)
+        for other in heirs[1:]:
+            updates[str(other.get("task_id") or "")] = dict(shared)
+        return updates
 
     def _clear_task_link(self, task_id):
         self.task_table.checkpoint()
-        self._discard_owned_geometry(task_id)
-        self.task_table.update_link(task_id, {}, record_history=False)
+        updates = self._transfer_or_discard_owned_geometry(
+            task_id, exclude_ids=(task_id,))
+        updates[task_id] = {}
+        self.task_table.update_links_bulk(updates, record_history=False)
 
     def _operation_choices(self):
         """User-configured operation types as (value, label) combo choices."""
@@ -944,6 +1172,7 @@ class PlannerDock(QDockWidget):
         for index, task in enumerate(self.task_table.rows):
             if (task.get("task_id") == exclude_task_id or
                     task.get("geom_kind") != "line" or
+                    shared_owner_task_id(task) or
                     self.task_table._is_summary(index)):
                 continue
             frame = self.resolver.route_frame(task)
@@ -1107,6 +1336,12 @@ class PlannerDock(QDockWidget):
     def _planner_geometry_changed(self, *_args):
         self.resolver.clear_cache()
         self.task_table._recompute()
+
+    def _planner_geometry_removed(self, *_args):
+        # A rebuild refreshes the link buttons so removed geometry shows as
+        # unavailable immediately, not just on the next edit.
+        self.resolver.clear_cache()
+        self.task_table._rebuild()
 
     def _schedule_changed(self, result):
         self.sim.set_result(result)

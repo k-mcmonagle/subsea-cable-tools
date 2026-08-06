@@ -10,6 +10,7 @@ import tempfile
 from qgis.core import QgsCoordinateReferenceSystem, QgsGeometry
 
 from ..planner import schema
+from ..planner.feature_ref import shared_owner_task_id, shared_reference
 from ..planner.store import PlannerStore
 
 
@@ -100,6 +101,55 @@ def test_duplicate_independence_and_remap():
     store.migrate()
     ok = ok and store.read_meta().get("schema_version") == "6"
     return _result("duplicate remapping + independence + migrate no-op", ok)
+
+
+def test_shared_geometry_adoption_and_duplication():
+    """Sharers keep working when the owning task is deleted or duplicated."""
+    store = _temp_store()
+    scenario_id = store.create_scenario("Shared", "2026-01-01T00:00")
+    resource = store.list_resources()[0]
+    owner_id, sharer_a, sharer_b = schema.new_id(), schema.new_id(), schema.new_id()
+    base = {"duration_mode": "manual", "duration_hours": 1.0,
+            "resource_id": resource["resource_id"]}
+    tasks = [
+        dict(base, task_id=owner_id, name="Owner"),
+        dict(base, task_id=sharer_a, name="Sharer A"),
+        dict(base, task_id=sharer_b, name="Sharer B"),
+    ]
+    store.save_tasks(scenario_id, tasks)
+    reference = store.set_task_geometry(
+        owner_id, scenario_id, 0, "Owner", QgsGeometry.fromWkt("POINT(1 2)"),
+        "point", source_crs=QgsCoordinateReferenceSystem("EPSG:4326"),
+        resource_id=resource["resource_id"], source_kind="test")
+    tasks[0].update(reference)
+    shared = shared_reference(reference, owner_id)
+    tasks[1].update(shared)
+    tasks[2].update(shared)
+    store.save_tasks(scenario_id, tasks)
+    ok = shared_owner_task_id(tasks[1]) == owner_id
+
+    # Duplicating repoints sharers at the duplicated owner, not the original.
+    copied_id = store.duplicate_scenario(scenario_id, "Copy")
+    copied = store.list_tasks(copied_id)
+    copied_owner = next(row for row in copied if row["name"] == "Owner")
+    copied_sharer = next(row for row in copied if row["name"] == "Sharer A")
+    ok = ok and shared_owner_task_id(copied_sharer) == copied_owner["task_id"]
+    ok = ok and copied_sharer["feature_id"] == copied_owner["feature_id"]
+    ok = ok and copied_sharer["feature_id"] != reference["feature_id"]
+
+    # Deleting the owner hands the geometry to the first surviving sharer.
+    survivors = [dict(tasks[1]), dict(tasks[2])]
+    repaired = store.save_tasks(scenario_id, survivors)
+    ok = ok and set(repaired) == {sharer_a, sharer_b}
+    ok = ok and not shared_owner_task_id(survivors[0])
+    ok = ok and shared_owner_task_id(survivors[1]) == sharer_a
+    adopted = store.get_task_geometry(sharer_a)
+    ok = ok and adopted is not None
+    if adopted is not None:
+        point = adopted[1].geometry().asPoint()
+        ok = ok and abs(point.x() - 1.0) < 1e-9 and abs(point.y() - 2.0) < 1e-9
+    ok = ok and store.get_task_geometry(owner_id) is None
+    return _result("shared geometry adoption on delete + duplicate remap", ok)
 
 
 def test_v2_to_v3_phase_and_resource_migration():
@@ -225,6 +275,7 @@ def test_v5_to_v6_advanced_task_migration():
 def run_all():
     return [
         test_create_crud_and_meta(), test_duplicate_independence_and_remap(),
+        test_shared_geometry_adoption_and_duplication(),
         test_v2_to_v3_phase_and_resource_migration(), test_v3_to_v4_fuel_migration(),
         test_v4_to_v5_shared_resource_migration(), test_v5_to_v6_advanced_task_migration(),
     ]

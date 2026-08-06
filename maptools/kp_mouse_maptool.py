@@ -227,8 +227,25 @@ class KPMouseMapTool(QgsMapTool):
         self.last_message = ""
         self.last_global_pos = None
 
+    def _ensure_timers(self):
+        """Recreate the tooltip timers if they have been torn down.
+
+        cleanup_resources() sets them to None, but the canvas can keep
+        delivering events to this tool afterwards (e.g. when another feature
+        is being edited while the tool is restored as the active map tool),
+        which used to raise AttributeError on every mouse move.
+        """
+        if self.mouse_stop_timer is None:
+            self.mouse_stop_timer = QTimer(self.canvas)
+            self.mouse_stop_timer.setSingleShot(True)
+            self.mouse_stop_timer.timeout.connect(self.start_persistent_tooltip)
+        if self.persistent_tooltip_timer is None:
+            self.persistent_tooltip_timer = QTimer(self.canvas)
+            self.persistent_tooltip_timer.timeout.connect(self.show_persistent_tooltip)
+
     def canvasMoveEvent(self, event):
         # Stop any timers and hide tooltips when the mouse moves.
+        self._ensure_timers()
         self.persistent_tooltip_timer.stop()
         QToolTip.hideText()
 
@@ -380,7 +397,7 @@ class KPMouseMapTool(QgsMapTool):
 
     def start_persistent_tooltip(self):
         """Called when the mouse stop timer fires. Starts the persistent tooltip timer."""
-        if self.last_message and self.last_global_pos:
+        if self.persistent_tooltip_timer is not None and self.last_message and self.last_global_pos:
             self.persistent_tooltip_timer.start(100)
 
     def show_persistent_tooltip(self):
@@ -390,8 +407,10 @@ class KPMouseMapTool(QgsMapTool):
 
     def canvasLeaveEvent(self, event):
         """Stop timers and hide tooltip when mouse leaves the canvas."""
-        self.persistent_tooltip_timer.stop()
-        self.mouse_stop_timer.stop()
+        if self.persistent_tooltip_timer is not None:
+            self.persistent_tooltip_timer.stop()
+        if self.mouse_stop_timer is not None:
+            self.mouse_stop_timer.stop()
         QToolTip.hideText()
 
     def canvasPressEvent(self, event):
@@ -1270,8 +1289,10 @@ class KPMouseMapTool(QgsMapTool):
             self.iface.messageBar().pushMessage("Error", msg, level=MESSAGE_CRITICAL, duration=4)
 
     def deactivate(self):
-        self.mouse_stop_timer.stop()
-        self.persistent_tooltip_timer.stop()
+        if self.mouse_stop_timer is not None:
+            self.mouse_stop_timer.stop()
+        if self.persistent_tooltip_timer is not None:
+            self.persistent_tooltip_timer.stop()
         QToolTip.hideText()
         if self.rubberBand:
             self.rubberBand.reset(GEOMETRY_LINE)

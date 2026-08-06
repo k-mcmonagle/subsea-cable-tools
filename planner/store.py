@@ -19,6 +19,7 @@ from ..qgis_compat import (
     VECTOR_WRITER_OVERWRITE_LAYER, WKB_LINESTRING, WKB_NO_GEOMETRY, WKB_POINT,
 )
 from . import schema
+from .feature_ref import shared_owner_task_id, shared_reference
 
 PROJECT_SCOPE = "SubseaCableTools"
 PROJECT_KEY_GPKG = "planner_gpkg"
@@ -212,11 +213,21 @@ class PlannerStore:
                 if row.get("scenario_id") == scenario_id]
         return sorted(rows, key=lambda row: (int(row.get("seq") or 0), row.get("name") or ""))
 
-    def save_tasks(self, scenario_id: str, rows: Sequence[Dict]) -> None:
+    def save_tasks(self, scenario_id: str, rows: Sequence[Dict]) -> Dict[str, Dict]:
+        """Persist the scenario's tasks.
+
+        Returns a mapping of task_id -> repaired reference fields for tasks
+        whose links were rewritten because the task owning their shared
+        geometry was deleted (the geometry is handed to the first surviving
+        sharer instead of being dropped). The caller should mirror those
+        repairs into its in-memory rows.
+        """
         old_ids = [row["task_id"] for row in self.list_tasks(scenario_id)]
         retained = {str(row.get("task_id")) for row in rows if row.get("task_id")}
         removed = [task_id for task_id in old_ids if str(task_id) not in retained]
+        repaired: Dict[str, Dict] = {}
         if removed:
+            repaired = self._adopt_orphaned_shared_geometries(removed, rows)
             self.delete_task_geometries(removed)
         if old_ids:
             self.delete_rows(schema.TABLE_TASK, old_ids)
@@ -231,6 +242,75 @@ class PlannerStore:
         if saved:
             self.upsert_rows(schema.TABLE_TASK, saved)
             self.sync_geometry_attributes(saved)
+        return repaired
+
+    def _adopt_orphaned_shared_geometries(self, removed_ids, rows) -> Dict[str, Dict]:
+        """Hand a deleted task's owned geometry to the first surviving sharer.
+
+        Mutates the surviving row dicts in place so the caller writes the
+        repaired references to disk, and returns the repairs keyed by task_id.
+        """
+        repaired: Dict[str, Dict] = {}
+        for removed_id in {str(task_id) for task_id in removed_ids}:
+            heirs = [row for row in rows
+                     if shared_owner_task_id(row) == removed_id]
+            if not heirs:
+                continue
+            heir = heirs[0]
+            heir_id = str(heir.get("task_id") or "")
+            reference = self.reassign_task_geometry(
+                removed_id, heir_id, str(heir.get("name") or "Task"))
+            if reference is None:
+                continue
+            heir.update(reference)
+            repaired[heir_id] = dict(reference)
+            shared = shared_reference(reference, heir_id)
+            for other in heirs[1:]:
+                other.update(shared)
+                repaired[str(other.get("task_id") or "")] = dict(shared)
+        return repaired
+
+    def reassign_task_geometry(self, old_task_id: str, new_task_id: str,
+                               name: str = "") -> Optional[Dict]:
+        """Move ownership of a stored task geometry to another task.
+
+        Returns the new owner's reference fields, or None when the old task
+        has no stored geometry.
+        """
+        found = self.get_task_geometry(str(old_task_id))
+        if found is None:
+            return None
+        layer, feature, kind = found
+        values = {"task_id": str(new_task_id), "name": name or "Task",
+                  "modified_utc": schema.utc_now_iso()}
+        changes = {feature.id(): {
+            index: values[field_name] for field_name, index in (
+                (field_name, layer.fields().indexOf(field_name))
+                for field_name in values) if index >= 0}}
+        if layer.isEditable():
+            for feature_id, attributes in changes.items():
+                for field_index, value in attributes.items():
+                    layer.changeAttributeValue(feature_id, field_index, value)
+        else:
+            layer.dataProvider().changeAttributeValues(changes)
+        layer.triggerRepaint()
+        try:
+            source_ref = json.loads(_attribute_str(feature, "source_ref_json") or "{}")
+            if not isinstance(source_ref, dict):
+                source_ref = {}
+        except (TypeError, ValueError):
+            source_ref = {}
+        return {
+            "layer_id": layer.id(), "layer_source": layer.source(),
+            "layer_name": layer.name(),
+            "feature_id": _attribute_str(feature, "geom_id"),
+            "feature_label": name or "Task", "geom_kind": kind,
+            "linked_ref_json": json.dumps({
+                "owned_geometry": True,
+                "source_kind": _attribute_str(feature, "source_kind") or "drawn",
+                "source_ref": source_ref,
+            }, sort_keys=True),
+        }
 
     def duplicate_scenario(self, scenario_id: str, new_name: str) -> str:
         original = self.get_scenario(scenario_id)
@@ -253,6 +333,7 @@ class PlannerStore:
         task_map = {row["task_id"]: schema.new_id() for row in self.list_tasks(scenario_id)}
         tasks = []
         original_tasks = self.list_tasks(scenario_id)
+        new_reference_by_old_owner = {}
         for row in original_tasks:
             copied = dict(row)
             copied.update({
@@ -277,7 +358,20 @@ class PlannerStore:
                     source_ref={"duplicated_from_task_id": row["task_id"]},
                 )
                 copied.update(reference)
+                new_reference_by_old_owner[row["task_id"]] = reference
             tasks.append(copied)
+        # Repoint shared-location references at the duplicated owner tasks so
+        # the copy is self-contained instead of following the original
+        # scenario's geometry.
+        for original_row, copied in zip(original_tasks, tasks):
+            old_owner = shared_owner_task_id(original_row)
+            if not old_owner:
+                continue
+            new_owner = task_map.get(old_owner)
+            if not new_owner:
+                continue
+            owner_reference = new_reference_by_old_owner.get(old_owner)
+            copied.update(shared_reference(owner_reference or copied, new_owner))
         self.upsert_rows(schema.TABLE_SCENARIO, [copied_scenario])
         if tasks:
             self.upsert_rows(schema.TABLE_TASK, tasks)
@@ -454,6 +548,19 @@ class PlannerStore:
                 else:
                     layer.dataProvider().changeAttributeValues(changes)
                 layer.triggerRepaint()
+
+
+def _attribute_str(feature, name: str) -> str:
+    """Feature attribute as a plain string; "" for NULL/missing values."""
+    try:
+        value = feature[name]
+    except Exception:
+        return ""
+    if value is None:
+        return ""
+    if type(value).__name__ == "QVariant":
+        return "" if not value.isValid() or value.isNull() else str(value.value())
+    return str(value)
 
 
 def _normalise_row(row: Dict) -> Dict:

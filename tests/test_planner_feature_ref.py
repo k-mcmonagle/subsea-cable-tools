@@ -6,7 +6,9 @@ from qgis.core import (
 )
 from qgis.gui import QgsMapCanvas
 
-from ..planner.feature_ref import FeatureReferenceResolver, feature_reference
+from ..planner.feature_ref import (
+    FeatureReferenceResolver, feature_reference, shared_reference,
+)
 
 
 def _result(name, ok, detail=""):
@@ -107,10 +109,49 @@ def test_playback_follows_planned_line_without_losing_geodesic_length():
             geographic.total_length_km, midpoint.x(), midpoint.y(), on_rendered_route))
 
 
+def test_shared_reference_resolves_through_owner():
+    """A task sharing another task's owned geometry follows the live point."""
+    import os
+    import tempfile
+
+    from ..planner import schema
+    from ..planner.store import PlannerStore
+
+    project = QgsProject.instance()
+    project.removeAllMapLayers()
+    folder = tempfile.mkdtemp(prefix="pow_shared_ref_test_")
+    store = PlannerStore(os.path.join(folder, "planner.gpkg"))
+    store.ensure_created()
+    scenario_id = store.create_scenario("Shared refs", "2026-01-01T00:00")
+    owner_id = schema.new_id()
+    reference = store.set_task_geometry(
+        owner_id, scenario_id, 0, "Owner", QgsGeometry.fromWkt("POINT(3 4)"),
+        "point", source_crs=QgsCoordinateReferenceSystem("EPSG:4326"),
+        source_kind="test")
+    canvas = QgsMapCanvas()
+    canvas.setDestinationCrs(QgsCoordinateReferenceSystem("EPSG:4326"))
+    resolver = FeatureReferenceResolver(project, canvas, store)
+    sharer = {"task_id": schema.new_id()}
+    sharer.update(shared_reference(reference, owner_id))
+    resolved = resolver.resolve(sharer)
+    ok = resolved is not None and resolved.geom_kind == "point"
+    if resolved is not None:
+        point = resolved.feature.geometry().asPoint()
+        ok = ok and abs(point.x() - 3.0) < 1e-9 and abs(point.y() - 4.0) < 1e-9
+    location = resolver.location_point(sharer)
+    ok = ok and location is not None and abs(location.x() - 3.0) < 1e-6
+    # Owner geometry gone -> sharer degrades to unresolved, not a stale id.
+    store.delete_task_geometries([owner_id])
+    resolver.clear_cache()
+    ok = ok and resolver.resolve(sharer) is None
+    return _result("shared reference resolves through owning task", ok)
+
+
 def run_all():
     return [
         test_projected_and_source_fallback(),
         test_geographic_length(),
         test_long_geographic_transit(),
         test_playback_follows_planned_line_without_losing_geodesic_length(),
+        test_shared_reference_resolves_through_owner(),
     ]
