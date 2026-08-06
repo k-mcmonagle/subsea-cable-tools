@@ -35,14 +35,15 @@ from ..qgis_compat import (
     SIZE_POLICY_IGNORED, SIZE_POLICY_PREFERRED, TEXT_ELIDE_RIGHT,
     WINDOW_HINT_CLOSE,
     WINDOW_HINT_CUSTOMIZE, WINDOW_HINT_MIN_MAX, WINDOW_HINT_TITLE, WINDOW_TYPE_WINDOW,
-    qt_exec,
+    layer_filters, qt_exec,
 )
-from . import operation_types, schema, standard_tasks
+from . import operation_types, reports, schema, standard_tasks
 from .feature_ref import (
     FeatureReferenceResolver, feature_reference, shared_owner_task_id,
     shared_reference,
 )
 from .map_overlay import FeaturePickSession, PlannerMapOverlay
+from .reports_dialog import ReportsWindow
 from .msproject_export import build_msp_tsv
 from .sim_controller import SimulationController
 from .sketch_tool import SketchSession
@@ -108,6 +109,7 @@ class PlannerDock(QDockWidget):
         self.setObjectName("PlanOfWorkPlannerDock")
         self._loading = False
         self._save_error = False
+        self._reports_window = None
         self.current_scenario_id = ""
         path = project_gpkg_path() or default_project_gpkg_path()
         self.store, path, error = self._open_store_with_recovery(path)
@@ -308,12 +310,13 @@ class PlannerDock(QDockWidget):
             "Indent tasks beneath the preceding row to form a group. "
             "Double-click a bold summary row to collapse or expand it.")
         layout.addWidget(edit_btn)
-        fuel_btn = QPushButton("Fuel report…")
-        fuel_btn.setToolTip(
-            "Per-resource fuel totals: start fuel, burn, bunkers, remaining on board, "
-            "and cost. Set fuel rates in Resources… and a fuel mode on each task.")
-        fuel_btn.clicked.connect(self._show_fuel_report)
-        layout.addWidget(fuel_btn)
+        reports_btn = QPushButton("Reports…")
+        reports_btn.setToolTip(
+            "Charts and tables over the current plan: fuel ROB and consumption, "
+            "breakdowns by operation type or resource, the progress S-curve, and "
+            "plan vs actual variance. Breakdowns can be saved as custom reports.")
+        reports_btn.clicked.connect(self._show_reports)
+        layout.addWidget(reports_btn)
         baseline_btn = QPushButton("Baseline / actuals…")
         baseline_menu = QMenu(baseline_btn)
         baseline_menu.addAction("Set or replace baseline", self._set_baseline)
@@ -1605,36 +1608,60 @@ class PlannerDock(QDockWidget):
         else:
             self.status_label.setText(when.strftime("%d/%m/%Y %H:%M"))
 
-    def _show_fuel_report(self):
-        fuel = self.task_table.fuel
-        resources = {row.get("resource_id"): row for row in self.task_table.resources}
-        sections = []
-        for resource_id, summary in fuel.by_resource.items():
-            if not (summary.rob_start or summary.total_burn or summary.total_bunker):
-                continue
-            resource = resources.get(resource_id, {})
-            unit = summary.unit or "t"
-            lines = ["%s (%s):" % (resource.get("name") or "Resource", unit)]
-            lines.append("  Start fuel: %s" % _fmt_fuel(summary.rob_start))
-            lines.append("  Burned: %s" % _fmt_fuel(summary.total_burn))
-            if summary.total_bunker:
-                lines.append("  Bunkered: %s" % _fmt_fuel(summary.total_bunker))
-            lines.append("  End ROB: %s (lowest %s)" % (
-                _fmt_fuel(summary.rob_end), _fmt_fuel(summary.min_rob)))
-            if summary.cost:
-                lines.append("  Fuel cost: %s" % ("{:,.2f}".format(summary.cost)))
-            for warning in summary.warnings:
-                lines.append("  ⚠ %s" % warning)
-            sections.append("\n".join(lines))
-        if not sections:
-            QMessageBox.information(
-                self, "Fuel report",
-                "No fuel data yet.\n\nSet fuel rates, start fuel, and optionally cost "
-                "per unit in Resources…, then choose a fuel mode (Transit/DP/Anchor/"
-                "Port) for each task. Enter a Bunker amount on port-call tasks to "
-                "take fuel on.")
+    def _show_reports(self):
+        if self._reports_window is None:
+            self._reports_window = ReportsWindow(
+                self._report_context, self._custom_reports,
+                self._save_custom_report, self._delete_custom_report, self)
+        self._reports_window.refresh()
+        self._reports_window.show()
+        self._reports_window.raise_()
+        self._reports_window.activateWindow()
+
+    def _report_context(self):
+        scenario = self.store.get_scenario(self.current_scenario_id)
+        baseline = _scenario_settings(scenario).get("baseline") if scenario else None
+        dataset = reports.build_dataset(
+            self.task_table.rows, self.task_table.schedule, self.task_table.fuel,
+            self.task_table.task_specs(), self.task_table.resources, baseline)
+        return {
+            "dataset": dataset,
+            "resources": self.task_table.resources,
+            "fuel": self.task_table.fuel,
+            "baseline": baseline,
+            "op_labels": dict(schema.OPERATION_TYPES),
+            "status_labels": dict(schema.PROGRESS_STATUSES),
+            "now": datetime.now().replace(second=0, microsecond=0),
+            "span_end": self.task_table.schedule.span_end,
+        }
+
+    def _custom_reports(self):
+        scenario = self.store.get_scenario(self.current_scenario_id)
+        return list(_scenario_settings(scenario).get("custom_reports") or []) \
+            if scenario else []
+
+    def _save_custom_report(self, config):
+        scenario = self.store.get_scenario(self.current_scenario_id)
+        if scenario is None:
             return
-        QMessageBox.information(self, "Fuel report", "\n\n".join(sections))
+        settings = _scenario_settings(scenario)
+        items = [item for item in settings.get("custom_reports") or []
+                 if item.get("name") != config.get("name")]
+        items.append(dict(config))
+        settings["custom_reports"] = items
+        scenario["settings_json"] = json.dumps(settings, sort_keys=True)
+        self._store_write("save the custom report", self.store.save_scenario, scenario)
+
+    def _delete_custom_report(self, name):
+        scenario = self.store.get_scenario(self.current_scenario_id)
+        if scenario is None:
+            return
+        settings = _scenario_settings(scenario)
+        items = [item for item in settings.get("custom_reports") or []
+                 if item.get("name") != name]
+        settings["custom_reports"] = items
+        scenario["settings_json"] = json.dumps(settings, sort_keys=True)
+        self._store_write("delete the custom report", self.store.save_scenario, scenario)
 
     def _copy_ms_project(self):
         result = self.task_table.schedule
@@ -2709,7 +2736,7 @@ class FeatureLinkDialog(QDialog):
         layout = QVBoxLayout(self)
         form = QFormLayout()
         self.layer_combo = QgsMapLayerComboBox()
-        self.layer_combo.setFilters(MAP_LAYER_FILTER_POINT | MAP_LAYER_FILTER_LINE)
+        self.layer_combo.setFilters(layer_filters(MAP_LAYER_FILTER_POINT, MAP_LAYER_FILTER_LINE))
         self.feature_combo = QComboBox()
         form.addRow("Layer:", self.layer_combo)
         form.addRow("Feature:", self.feature_combo)

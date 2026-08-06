@@ -54,7 +54,7 @@ from ..qgis_compat import (
     DIALOG_ACCEPTED,
     MAP_LAYER_FILTER_POLYGON,
     MAP_LAYER_FILTER_VECTOR,
-    qt_exec,
+    layer_filters, qt_exec,
 )
 from . import assessment_output, rules_inputs, schema
 from .rules_engine import Interval
@@ -270,7 +270,7 @@ class RuleEditorDialog(QDialog):
             self.kind_form.addRow("Upper value (between)", self.value2_spin)
         elif kind == schema.RULE_KIND_PROXIMITY:
             self.layer_combo = QgsMapLayerComboBox()
-            self.layer_combo.setFilters(MAP_LAYER_FILTER_VECTOR)
+            self.layer_combo.setFilters(layer_filters(MAP_LAYER_FILTER_VECTOR))
             _preselect_layer(self.layer_combo, config.get("layer_id"))
             self.dist_spin = QDoubleSpinBox()
             self.dist_spin.setRange(0.0, 100000.0)
@@ -285,7 +285,7 @@ class RuleEditorDialog(QDialog):
             self.kind_form.addRow("Filter expression", self.filter_edit)
         elif kind == schema.RULE_KIND_POLYGON:
             self.layer_combo = QgsMapLayerComboBox()
-            self.layer_combo.setFilters(MAP_LAYER_FILTER_POLYGON)
+            self.layer_combo.setFilters(layer_filters(MAP_LAYER_FILTER_POLYGON))
             _preselect_layer(self.layer_combo, config.get("layer_id"))
             self.field_combo = QgsFieldComboBox()
             self.field_combo.setLayer(self.layer_combo.currentLayer())
@@ -297,7 +297,7 @@ class RuleEditorDialog(QDialog):
             self.kind_form.addRow("Match values (comma)", self.values_edit)
         elif kind == schema.RULE_KIND_KP_TABLE:
             self.layer_combo = QgsMapLayerComboBox()
-            self.layer_combo.setFilters(MAP_LAYER_FILTER_VECTOR)
+            self.layer_combo.setFilters(layer_filters(MAP_LAYER_FILTER_VECTOR))
             _preselect_layer(self.layer_combo, config.get("layer_id"))
             self.start_field = QgsFieldComboBox()
             self.start_field.setLayer(self.layer_combo.currentLayer())

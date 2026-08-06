@@ -98,6 +98,26 @@ def snapping_type_flags(*members):
     return value
 
 
+def layer_filters(*members):
+    """Combine layer-filter members into the QFlags wrapper setFilters() wants.
+
+    A bare ORed value can match the deprecated
+    QgsMapLayerProxyModel.Filters overload on QGIS >= 3.34, logging a
+    DeprecationWarning; wrapping in Qgis.LayerFilters selects the new one.
+    """
+    combined = members[0]
+    for member in members[1:]:
+        combined = combined | member
+    for parent, name in ((Qgis, "LayerFilters"), (QgsMapLayerProxyModel, "Filters")):
+        wrapper = getattr(parent, name, None)
+        if wrapper is not None:
+            try:
+                return wrapper(int(combined))
+            except (TypeError, ValueError):
+                return combined
+    return combined
+
+
 def qt_exec(obj, *args, **kwargs):
     exec_method = getattr(obj, "exec", None)
     if exec_method is None:
