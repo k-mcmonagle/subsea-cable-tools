@@ -25,7 +25,7 @@ from ..qgis_compat import (
 from . import operation_types, schema
 from .feature_ref import shared_owner_task_id
 from .timeline_engine import (
-    KNOT_M_PER_HOUR, TaskSpec, compute_fuel, compute_schedule,
+    KNOT_M_PER_HOUR, TaskSpec, compute_cable, compute_fuel, compute_schedule,
     parse_speed_profile, profile_duration_hours, resolve_speed_profile,
 )
 
@@ -94,19 +94,23 @@ class TaskTableWidget(QTableWidget):
     COL_DIRECTION = 10
     COL_FUEL_MODE = 11
     COL_BUNKER = 12
-    COL_START = 13
-    COL_FINISH = 14
-    COL_FLOAT = 15
-    COL_FUEL_USED = 16
-    COL_ROB = 17
-    COL_PROGRESS = 18
-    COL_STATUS = 19
-    COL_NOTES = 20
+    COL_CABLE_MODE = 13
+    COL_CABLE = 14
+    COL_START = 15
+    COL_FINISH = 16
+    COL_FLOAT = 17
+    COL_FUEL_USED = 18
+    COL_ROB = 19
+    COL_CABLE_ONBOARD = 20
+    COL_PROGRESS = 21
+    COL_STATUS = 22
+    COL_NOTES = 23
 
     HEADERS = ["#", "Task", "Operation", "Description", "Resource", "Duration (h)", "Predecessor",
                "Linked feature", "Distance", "Speed", "Dir", "Fuel", "Bunker",
-               "Start", "Finish", "Float (h)", "Fuel used", "Fuel ROB", "Progress", "Status",
-               "Notes"]
+               "Cable", "Cable (km)",
+               "Start", "Finish", "Float (h)", "Fuel used", "Fuel ROB",
+               "Cable onboard", "Progress", "Status", "Notes"]
 
     def __init__(self, resolver, parent=None):
         super().__init__(0, len(self.HEADERS), parent)
@@ -129,6 +133,18 @@ class TaskTableWidget(QTableWidget):
         self.horizontalHeaderItem(self.COL_BUNKER).setToolTip(
             "Fuel taken on during this task (e.g. bunkering at a port call), in the "
             "resource's fuel unit. Credited to remaining fuel at the task finish.")
+        self.horizontalHeaderItem(self.COL_CABLE_MODE).setToolTip(
+            "How this task moves cable relative to its resource: Load and "
+            "Recover bring cable onboard, Lay and Discharge pay it off. "
+            "'(none)' moves no cable.")
+        self.horizontalHeaderItem(self.COL_CABLE).setToolTip(
+            "Cable quantity this task moves, in km. Leave blank on Lay/Recover "
+            "tasks to use the task's distance automatically; Load/Discharge "
+            "need a typed amount.")
+        self.horizontalHeaderItem(self.COL_CABLE_ONBOARD).setToolTip(
+            "Read-only cable on board at the task finish, in km (loads and "
+            "recoveries minus lays and discharges; every resource starts at 0). "
+            "Red when more cable is paid off than the resource has onboard.")
         self.horizontalHeaderItem(self.COL_FUEL_USED).setToolTip(
             "Read-only fuel burned by this task, in the resource's fuel unit. "
             "Summary rows show the total for their group.")
@@ -155,6 +171,7 @@ class TaskTableWidget(QTableWidget):
         self.resource_start_datetimes = {}
         self.schedule = compute_schedule(self.anchor, [])
         self.fuel = compute_fuel(self.schedule, {}, [])
+        self.cable = compute_cable(self.schedule, {})
         self._muted = False
         self._undo_stack = []
         self._redo_stack = []
@@ -392,7 +409,8 @@ class TaskTableWidget(QTableWidget):
             "speed_knots": default_speed, "direction": "forward",
             "location_mode": "feature", "location_chainage_m": None,
             "constraint_type": "", "constraint_datetime": "", "is_milestone": 0,
-            "fuel_mode": "", "bunker_amount": None, "layer_id": "",
+            "fuel_mode": "", "bunker_amount": None,
+            "cable_mode": "", "cable_amount_m": None, "layer_id": "",
             "layer_source": "", "layer_name": "", "feature_id": "",
             "feature_label": "", "geom_kind": "", "linked_ref_json": "",
             "progress_status": "not_started", "percent_complete": 0.0,
@@ -450,6 +468,7 @@ class TaskTableWidget(QTableWidget):
             "predecessor_task_id": "", "dependency_type": "FS",
             "lag_hours": 0.0, "speed_knots": None,
             "direction": "forward", "fuel_mode": "", "bunker_amount": None,
+            "cable_mode": "", "cable_amount_m": None,
             "location_mode": "feature", "location_chainage_m": None,
             "constraint_type": "", "constraint_datetime": "", "is_milestone": 0,
             "layer_id": "", "layer_source": "", "layer_name": "", "feature_id": "",
@@ -808,6 +827,9 @@ class TaskTableWidget(QTableWidget):
                 outline_level=int(row.get("outline_level") or 0),
                 fuel_mode="" if summary else row.get("fuel_mode") or "",
                 bunker_amount=0.0 if summary else _float(row.get("bunker_amount")),
+                cable_mode="" if summary else row.get("cable_mode") or "",
+                cable_amount_m=None if summary or row.get("cable_amount_m") in (None, "")
+                else _float(row.get("cable_amount_m")),
                 dependency_type=row.get("dependency_type") or "FS",
                 constraint_type="" if summary else row.get("constraint_type") or "",
                 constraint_datetime=None if summary else row.get("constraint_datetime") or None,
@@ -905,6 +927,16 @@ class TaskTableWidget(QTableWidget):
                 else:
                     self._set_text(row_index, self.COL_BUNKER,
                                    _display_number(task.get("bunker_amount")))
+                self._cable_mode_combo(row_index, task, summary)
+                if summary:
+                    self._readonly_item(row_index, self.COL_CABLE, "")
+                else:
+                    amount = task.get("cable_amount_m")
+                    self._set_text(
+                        row_index, self.COL_CABLE,
+                        "" if amount in (None, "") else
+                        _display_number(_float(amount) / 1000.0))
+                self._readonly_item(row_index, self.COL_CABLE_ONBOARD, "")
                 self._readonly_item(row_index, self.COL_START, "")
                 self._readonly_item(row_index, self.COL_FINISH, "")
                 self._readonly_item(row_index, self.COL_FLOAT, "")
@@ -1166,6 +1198,17 @@ class TaskTableWidget(QTableWidget):
             lambda _index, c=combo, tid=task_id: self._combo_changed(tid, "fuel_mode", c.currentData()))
         self.setCellWidget(row, self.COL_FUEL_MODE, combo)
 
+    def _cable_mode_combo(self, row, task, summary=False):
+        combo = QComboBox()
+        for value, label in schema.CABLE_MODES:
+            combo.addItem(label, value)
+        combo.setCurrentIndex(max(0, combo.findData(task.get("cable_mode") or "")))
+        combo.setEnabled(not summary)
+        task_id = task.get("task_id")
+        combo.currentIndexChanged.connect(
+            lambda _index, c=combo, tid=task_id: self._combo_changed(tid, "cable_mode", c.currentData()))
+        self.setCellWidget(row, self.COL_CABLE_MODE, combo)
+
     def _combo_changed(self, task_id, field, value):
         if self._muted:
             return
@@ -1187,7 +1230,8 @@ class TaskTableWidget(QTableWidget):
         mapping = {
             self.COL_TASK: "name", self.COL_DESCRIPTION: "description",
             self.COL_DURATION: "duration_hours", self.COL_SPEED: "speed_knots",
-            self.COL_BUNKER: "bunker_amount", self.COL_NOTES: "notes",
+            self.COL_BUNKER: "bunker_amount", self.COL_CABLE: "cable_amount_m",
+            self.COL_NOTES: "notes",
         }
         field = mapping.get(item.column())
         if field is None:
@@ -1203,6 +1247,11 @@ class TaskTableWidget(QTableWidget):
                            else entered * factor / KNOT_M_PER_HOUR)
         elif field == "bunker_amount":
             task[field] = _float(item.text(), None)
+        elif field == "cable_amount_m":
+            # Entered in km; stored in metres. Blank = auto (task distance
+            # for Lay/Recover). The sign comes from the Cable mode.
+            entered = _float(item.text(), None)
+            task[field] = None if entered is None else abs(entered) * 1000.0
         elif field == "name":
             text = item.text().lstrip()
             if text.startswith(("▸ ", "▾ ")):
@@ -1344,6 +1393,7 @@ class TaskTableWidget(QTableWidget):
             self.resource_start_datetimes)
         specs_by_id = {spec.task_id: spec for spec in specs}
         self.fuel = compute_fuel(self.schedule, specs_by_id, self.resources)
+        self.cable = compute_cable(self.schedule, specs_by_id)
         # Only lanes with a fuel profile in use get visible fuel figures.
         fuel_tracked = {
             resource_id for resource_id, summary in self.fuel.by_resource.items()
@@ -1421,6 +1471,7 @@ class TaskTableWidget(QTableWidget):
                         task_item.setToolTip(
                             "Critical path task" if scheduled.critical else "")
                 self._update_fuel_cells(row_index, row, fuel_tracked)
+                self._update_cable_cells(row_index, row)
         finally:
             self._muted = False
         self.scheduleChanged.emit(self.schedule)
@@ -1429,7 +1480,8 @@ class TaskTableWidget(QTableWidget):
         minimums = {self.COL_OPERATION: 100, self.COL_RESOURCE: 110,
                     self.COL_PREDECESSOR: 130,
                     self.COL_FEATURE: 150, self.COL_DIRECTION: 80,
-                    self.COL_FUEL_MODE: 80, self.COL_START: 110,
+                    self.COL_FUEL_MODE: 80, self.COL_CABLE_MODE: 90,
+                    self.COL_START: 110,
                     self.COL_FINISH: 110, self.COL_PROGRESS: 75,
                     self.COL_STATUS: 90}
         self._header_muted = True
@@ -1538,6 +1590,52 @@ class TaskTableWidget(QTableWidget):
             rob_item.setForeground(QBrush(QColor("#c62828")))
             rob_item.setToolTip("The resource runs out of fuel during this task. "
                                 "Add a bunker earlier in the plan or raise the start fuel.")
+
+    def _update_cable_cells(self, row_index, row):
+        """Refresh the read-only onboard cell and the auto-amount display.
+
+        Only ever called from _recompute, inside its muted block, so item
+        edits here do not re-enter _on_item_changed.
+        """
+        onboard_item = self.item(row_index, self.COL_CABLE_ONBOARD)
+        cable_item = self.item(row_index, self.COL_CABLE)
+        if onboard_item is None:
+            return
+        onboard_item.setText("")
+        onboard_item.setForeground(QBrush())
+        onboard_item.setToolTip("")
+        if cable_item is not None and not self._is_summary(row_index):
+            cable_item.setForeground(QBrush())
+            font = cable_item.font()
+            font.setItalic(False)
+            cable_item.setFont(font)
+            cable_item.setToolTip("")
+        if self._is_summary(row_index):
+            return
+        task_cable = self.cable.by_task.get(row.get("task_id"))
+        if task_cable is None:
+            if (cable_item is not None
+                    and row.get("cable_amount_m") in (None, "")):
+                cable_item.setText("")
+            return
+        onboard_item.setText(
+            _display_number(task_cable.onboard_end_m / 1000.0) or "0")
+        if task_cable.onboard_end_m < -1e-9:
+            onboard_item.setForeground(QBrush(QColor("#c62828")))
+            onboard_item.setToolTip(
+                "More cable paid off than the resource has onboard. Add a "
+                "Load task earlier in the plan or check the amounts.")
+        if cable_item is not None and row.get("cable_amount_m") in (None, ""):
+            cable_item.setText(
+                _display_number(task_cable.amount_m / 1000.0)
+                if task_cable.amount_m > 0.0 else "")
+            cable_item.setForeground(QBrush(QColor("#777777")))
+            font = cable_item.font()
+            font.setItalic(True)
+            cable_item.setFont(font)
+            cable_item.setToolTip(
+                "Automatic: the task's distance. Type a value to override, "
+                "or clear it to return to automatic.")
 
     def _emit_change(self):
         self.tasksChanged.emit([dict(row) for row in self.rows])

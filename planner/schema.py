@@ -8,7 +8,7 @@ from typing import Dict, List, Tuple
 
 from ..workbench.schema import gpkg_folder_for, new_id, sanitize_slug, utc_now_iso
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 TABLE_META = "pow_meta"
 TABLE_SCENARIO = "pow_scenario"
@@ -54,7 +54,8 @@ TASK_FIELDS: List[FieldSpec] = [
     ("location_mode", "str"), ("location_chainage_m", "float"),
     ("constraint_type", "str"), ("constraint_datetime", "str"),
     ("is_milestone", "int"),
-    ("fuel_mode", "str"), ("bunker_amount", "float"), ("layer_id", "str"),
+    ("fuel_mode", "str"), ("bunker_amount", "float"),
+    ("cable_mode", "str"), ("cable_amount_m", "float"), ("layer_id", "str"),
     ("layer_source", "str"), ("layer_name", "str"), ("feature_id", "str"),
     ("feature_label", "str"), ("geom_kind", "str"),
     ("linked_ref_json", "str"), ("progress_status", "str"),
@@ -100,6 +101,12 @@ DEFAULT_FUEL_UNIT = "t"
 # Per-24 h fuel rates a task can burn from its resource's profile.
 FUEL_MODES = (("", "(none)"), ("transit", "Transit"), ("dp", "DP"),
               ("anchor", "Anchor"), ("port", "Port"))
+
+# How a task moves cable relative to its resource: Load/Recover bring cable
+# onboard (+), Lay/Discharge pay it off (−). The signed running total is the
+# "cable onboard" tracked along each resource lane, like fuel ROB.
+CABLE_MODES = (("", "(none)"), ("load", "Load"), ("lay", "Lay"),
+               ("recover", "Recover"), ("discharge", "Discharge"))
 
 OPERATION_TYPES = (
     ("", "(unspecified)"), ("lay", "Lay"), ("plgr", "PLGR"),

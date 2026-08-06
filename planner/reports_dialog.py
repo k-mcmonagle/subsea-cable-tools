@@ -48,10 +48,12 @@ _SERIES = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100",
 
 _STANDARD_REPORTS = (
     ("fuel", "Fuel ROB && consumption"),
+    ("cable", "Cable onboard && laid"),
     ("breakdown", "Breakdown by category"),
     ("s_curve", "Progress S-curve"),
     ("variance", "Plan vs actual variance"),
 )
+_CABLE_LAID_COLOR = "#1baf7a"  # distinct from the default resource blue
 
 
 _EPOCH = datetime(1970, 1, 1)
@@ -124,13 +126,17 @@ class ReportsWindow(QDialog):
         self.group_combo = QComboBox()
         for key, label in reports.GROUP_KEYS:
             self.group_combo.addItem(label, key)
+        self.weight_label = QLabel("Progress in:")
+        self.weight_combo = QComboBox()
+        for key, label in reports.S_CURVE_WEIGHTS:
+            self.weight_combo.addItem(label, key)
         self.save_report_btn = QPushButton("Save as report…")
         self.save_report_btn.setToolTip(
             "Save this measure/grouping as a named report for this scenario.")
         self.delete_report_btn = QPushButton("Delete report")
         for widget in (self.measure_label, self.measure_combo, self.group_label,
-                       self.group_combo, self.save_report_btn,
-                       self.delete_report_btn):
+                       self.group_combo, self.weight_label, self.weight_combo,
+                       self.save_report_btn, self.delete_report_btn):
             options.addWidget(widget)
         options.addStretch(1)
         refresh_btn = QPushButton("Refresh")
@@ -171,6 +177,7 @@ class ReportsWindow(QDialog):
         self.report_list.currentItemChanged.connect(lambda *_args: self._render())
         self.measure_combo.currentIndexChanged.connect(lambda *_args: self._render())
         self.group_combo.currentIndexChanged.connect(lambda *_args: self._render())
+        self.weight_combo.currentIndexChanged.connect(lambda *_args: self._render())
         self.save_report_btn.clicked.connect(self._save_current_as_report)
         self.delete_report_btn.clicked.connect(self._delete_current_report)
         self._populate_report_list()
@@ -226,6 +233,9 @@ class ReportsWindow(QDialog):
         for widget in (self.measure_label, self.measure_combo,
                        self.group_label, self.group_combo):
             widget.setVisible(is_breakdown)
+        is_s_curve = kind == "standard" and value == "s_curve"
+        self.weight_label.setVisible(is_s_curve)
+        self.weight_combo.setVisible(is_s_curve)
         self.save_report_btn.setVisible(is_breakdown)
         self.delete_report_btn.setVisible(kind == "custom")
         if kind == "custom":
@@ -235,6 +245,8 @@ class ReportsWindow(QDialog):
             self._render_breakdown()
         elif value == "fuel":
             self._render_fuel()
+        elif value == "cable":
+            self._render_cable()
         elif value == "s_curve":
             self._render_s_curve()
         elif value == "variance":
@@ -364,6 +376,80 @@ class ReportsWindow(QDialog):
                          _fmt(rec.rob_end, 2)])
         self._set_table(headers, rows)
 
+    # ----- cable report ----------------------------------------------------
+
+    def _render_cable(self):
+        self._reset_plot(time_axis=True)
+        context = self._context
+        dataset = context.get("dataset") or []
+        resources = context.get("resources") or []
+        series = reports.cable_series(dataset, resources)
+        laid = reports.cumulative_cable_laid(dataset)
+        if not series:
+            self.summary.setText(
+                "No cable movements yet.\n\nSet the Cable column on tasks: "
+                "Load or Recover brings cable onboard, Lay or Discharge pays "
+                "it off. Lay/Recover tasks use the task's distance "
+                "automatically when the Cable (km) cell is left blank.")
+            self._set_table([], [])
+            return
+        legend = self._legend() if (len(series) + (1 if laid else 0)) > 1 else None
+        lowest = 0.0
+        for index, item in enumerate(series):
+            color = item.color_hex or _SERIES[index % len(_SERIES)]
+            xs = [_ts(when) for when, _km in item.points]
+            ys = [km for _when, km in item.points]
+            lowest = min([lowest] + ys)
+            self.plot.plot(
+                xs, ys, pen=pg.mkPen(color, width=2),
+                name=("%s onboard" % item.resource_name) if legend else None,
+                antialias=True)
+        if laid:
+            self.plot.plot(
+                [_ts(when) for when, _km in laid], [km for _when, km in laid],
+                pen=pg.mkPen(_CABLE_LAID_COLOR, width=2, style=_DASH),
+                name="Total laid" if legend else None, antialias=True)
+        if lowest < 0.0:
+            self.plot.addItem(pg.InfiniteLine(pos=0.0, angle=0, pen=pg.mkPen(
+                _CRITICAL, width=1, style=_DASH)))
+        self._axis_label("left", "Cable (km)")
+        self._axis_label("bottom", "Date")
+
+        cable_labels = dict(context.get("cable_labels") or {})
+        totals = {"lay": 0.0, "load": 0.0, "recover": 0.0, "discharge": 0.0}
+        for rec in dataset:
+            if not rec.is_phase and rec.cable_mode in totals:
+                totals[rec.cable_mode] += rec.cable_amount_m
+        lines = ["Laid %s km, loaded %s km, recovered %s km%s." % (
+            _fmt(totals["lay"] / 1000.0, 2), _fmt(totals["load"] / 1000.0, 2),
+            _fmt(totals["recover"] / 1000.0, 2),
+            (", discharged %s km" % _fmt(totals["discharge"] / 1000.0, 2))
+            if totals["discharge"] else "")]
+        for item in series:
+            low = min(km for _when, km in item.points)
+            end = item.points[-1][1]
+            line = "%s: ends with %s km onboard (lowest %s km)." % (
+                item.resource_name, _fmt(end, 2), _fmt(low, 2))
+            if low < -1e-9:
+                line += " ⚠ More cable paid off than onboard — add a Load "\
+                        "task or check the amounts."
+            lines.append(line)
+        self.summary.setText("\n".join(lines))
+
+        headers = ["Task", "Resource", "Cable", "Start", "Finish",
+                   "Amount (km)", "Onboard after (km)"]
+        rows = []
+        for rec in dataset:
+            if rec.is_phase or not rec.cable_mode:
+                continue
+            rows.append([
+                rec.name, rec.resource_name,
+                cable_labels.get(rec.cable_mode, rec.cable_mode),
+                _fmt_dt(rec.start), _fmt_dt(rec.finish),
+                _fmt(rec.cable_amount_m / 1000.0, 3),
+                _fmt(rec.cable_onboard_end_m / 1000.0, 3)])
+        self._set_table(headers, rows)
+
     # ----- breakdown / custom ---------------------------------------------
 
     def _render_breakdown(self):
@@ -375,6 +461,8 @@ class ReportsWindow(QDialog):
         labels = dict(context.get("op_labels") or {})
         if group_key == "progress_status":
             labels = dict(context.get("status_labels") or {})
+        elif group_key == "cable_mode":
+            labels = dict(context.get("cable_labels") or {})
         totals = reports.aggregate(dataset, measure, group_key, labels)
         measure_entry = next((entry for entry in reports.MEASURES
                               if entry[0] == measure), reports.MEASURES[0])
@@ -440,9 +528,14 @@ class ReportsWindow(QDialog):
         context = self._context
         dataset = context.get("dataset") or []
         now = context.get("now")
-        curves = reports.s_curve(dataset, now=now)
+        weight = self.weight_combo.currentData() or "duration"
+        curves = reports.s_curve(dataset, now=now, weight=weight)
         if not curves.planned:
             self.summary.setText(
+                "No cable-lay tasks to chart yet — set the Cable column to "
+                "Lay on the laying tasks (their distance supplies the "
+                "quantity), or switch Progress in: back to Duration."
+                if weight == "cable_laid" else
                 "No planned work to chart yet — add tasks with durations first.")
             self._set_table([], [])
             return
@@ -466,7 +559,9 @@ class ReportsWindow(QDialog):
             except Exception:
                 pass
         self.plot.setYRange(0.0, 100.0)
-        self._axis_label("left", "Cumulative % complete (duration-weighted)")
+        self._axis_label(
+            "left", "Cumulative % complete (%s)" %
+            ("by cable laid" if weight == "cable_laid" else "duration-weighted"))
         self._axis_label("bottom", "Date")
         lines = []
         if now is not None:

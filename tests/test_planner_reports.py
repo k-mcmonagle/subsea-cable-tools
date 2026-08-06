@@ -4,9 +4,12 @@
 from datetime import datetime, timedelta
 
 from ..planner.reports import (
-    aggregate, build_dataset, fuel_series, s_curve, variance_rows,
+    aggregate, build_dataset, cable_series, cumulative_cable_laid, fuel_series,
+    s_curve, variance_rows,
 )
-from ..planner.timeline_engine import TaskSpec, compute_fuel, compute_schedule
+from ..planner.timeline_engine import (
+    TaskSpec, compute_cable, compute_fuel, compute_schedule,
+)
 
 
 def _result(name, ok, detail=""):
@@ -21,20 +24,25 @@ def _fixture():
     """Two-task single-vessel plan with fuel, a baseline and actuals."""
     specs = [
         TaskSpec("t1", 0, "Lay main route", "v1", "manual", 24.0,
-                 fuel_mode="transit", geom_kind="line", route_length_m=5000.0),
+                 fuel_mode="transit", geom_kind="line", route_length_m=5000.0,
+                 cable_mode="lay"),
         TaskSpec("t2", 1, "ROV survey", "v1", "manual", 12.0,
-                 predecessor_task_id="t1", fuel_mode="dp", bunker_amount=10.0),
+                 predecessor_task_id="t1", fuel_mode="dp", bunker_amount=10.0,
+                 cable_mode="load", cable_amount_m=10000.0),
     ]
     schedule = compute_schedule(ANCHOR, specs)
-    fuel = compute_fuel(schedule, {spec.task_id: spec for spec in specs}, RESOURCES)
+    specs_by_id = {spec.task_id: spec for spec in specs}
+    fuel = compute_fuel(schedule, specs_by_id, RESOURCES)
+    cable = compute_cable(schedule, specs_by_id)
     rows = [
         {"task_id": "t1", "name": "Lay main route", "operation_type": "lay",
-         "resource_id": "v1", "fuel_mode": "transit",
+         "resource_id": "v1", "fuel_mode": "transit", "cable_mode": "lay",
          "progress_status": "completed", "percent_complete": 100.0,
          "actual_start_datetime": "2026-01-01T00:00",
          "actual_finish_datetime": "2026-01-02T06:00"},
         {"task_id": "t2", "name": "ROV survey", "operation_type": "",
          "resource_id": "v1", "fuel_mode": "dp",
+         "cable_mode": "load", "cable_amount_m": 10000.0,
          "progress_status": "in_progress", "percent_complete": 50.0},
     ]
     baseline = {
@@ -46,8 +54,8 @@ def _fixture():
              "start": "2026-01-01T18:00", "finish": "2026-01-02T12:00"},
         ],
     }
-    dataset = build_dataset(rows, schedule, fuel, specs, RESOURCES, baseline)
-    return dataset
+    return build_dataset(rows, schedule, fuel, specs, RESOURCES, baseline,
+                         cable=cable)
 
 
 RESOURCES = [{
@@ -122,6 +130,37 @@ def test_s_curve_and_earned_value():
     return _result("s-curve planned/baseline/actual + SPI", ok)
 
 
+def test_cable_tracking_reports():
+    dataset = _fixture()
+    by_id = {rec.task_id: rec for rec in dataset}
+    # Lay amount auto-resolves to the route length; load uses its typed amount.
+    ok = by_id["t1"].cable_amount_m == 5000.0 and by_id["t1"].cable_delta_m == -5000.0
+    ok = ok and by_id["t1"].cable_onboard_end_m == -5000.0
+    ok = ok and by_id["t2"].cable_onboard_end_m == 5000.0
+    series = cable_series(dataset, RESOURCES)
+    t1_finish = ANCHOR + timedelta(hours=24)
+    t2_finish = ANCHOR + timedelta(hours=36)
+    ok = ok and len(series) == 1 and series[0].points == [
+        (ANCHOR, 0.0), (t1_finish, -5.0),
+        (t1_finish, -5.0), (t2_finish, 5.0)]
+    laid = cumulative_cable_laid(dataset)
+    ok = ok and laid == [(ANCHOR, 0.0), (t1_finish, 5.0)]
+    by_cable = aggregate(dataset, "cable_laid_km", "operation_type", {"lay": "Lay"})
+    ok = ok and by_cable == [("Lay", 5.0)]
+    return _result("cable onboard/laid series + laid measure", ok)
+
+
+def test_s_curve_cable_weighting():
+    dataset = _fixture()
+    now = ANCHOR + timedelta(hours=36)
+    curves = s_curve(dataset, now=now, weight="cable_laid")
+    # Only the lay task carries cable weight: planned 0 -> 100% at its finish.
+    ok = curves.planned[-1] == (ANCHOR + timedelta(hours=24), 100.0)
+    ok = ok and abs(curves.earned_pct_now - 100.0) < 1e-9
+    ok = ok and curves.spi is not None and abs(curves.spi - 1.0) < 1e-9
+    return _result("s-curve weighted by cable laid", ok)
+
+
 def test_variance_rows():
     dataset = _fixture()
     rows = variance_rows(dataset)
@@ -148,6 +187,8 @@ def run_all():
         test_aggregate_measures_and_grouping(),
         test_fuel_series_points(),
         test_s_curve_and_earned_value(),
+        test_cable_tracking_reports(),
+        test_s_curve_cable_weighting(),
         test_variance_rows(),
         test_empty_dataset_is_safe(),
     ]

@@ -689,5 +689,15 @@ def _migrate_6_to_7(store: PlannerStore) -> None:
     store._write_table_rows(schema.TABLE_TASK, schema.TASK_FIELDS, tasks)
 
 
+def _migrate_7_to_8(store: PlannerStore) -> None:
+    """v7 -> v8: per-task cable movement (mode + amount) for onboard tracking."""
+    tasks = store.read_table(schema.TABLE_TASK)
+    for task in tasks:
+        task.setdefault("cable_mode", "")
+        task.setdefault("cable_amount_m", None)
+    store._write_table_rows(schema.TABLE_TASK, schema.TASK_FIELDS, tasks)
+
+
 MIGRATIONS = {1: _migrate_1_to_2, 2: _migrate_2_to_3, 3: _migrate_3_to_4,
-              4: _migrate_4_to_5, 5: _migrate_5_to_6, 6: _migrate_6_to_7}
+              4: _migrate_4_to_5, 5: _migrate_5_to_6, 6: _migrate_6_to_7,
+              7: _migrate_7_to_8}

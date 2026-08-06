@@ -54,6 +54,11 @@ class ReportRow:
     fuel_cost: float = 0.0
     rob_start: float = 0.0
     rob_end: float = 0.0
+    cable_mode: str = ""
+    cable_amount_m: float = 0.0          # resolved unsigned quantity
+    cable_delta_m: float = 0.0           # signed change to cable onboard
+    cable_onboard_start_m: float = 0.0
+    cable_onboard_end_m: float = 0.0
     progress_status: str = "not_started"
     percent_complete: float = 0.0
     actual_start: Optional[datetime] = None
@@ -66,16 +71,19 @@ class ReportRow:
 
 def build_dataset(rows: Sequence[Dict], schedule, fuel, specs: Sequence,
                   resources: Sequence[Dict],
-                  baseline: Optional[Dict] = None) -> List[ReportRow]:
-    """Join task rows, the computed schedule, fuel tracking and the baseline.
+                  baseline: Optional[Dict] = None,
+                  cable=None) -> List[ReportRow]:
+    """Join task rows, the computed schedule, fuel/cable tracking and baseline.
 
-    ``rows``/``resources`` are the planner's stored dicts, ``schedule``/``fuel``
-    are ``TimelineResult``/``FuelResult`` and ``specs`` the ``TaskSpec`` list the
-    schedule was computed from (its resolved route lengths supply distance).
+    ``rows``/``resources`` are the planner's stored dicts, ``schedule``/``fuel``/
+    ``cable`` are ``TimelineResult``/``FuelResult``/``CableResult`` and ``specs``
+    the ``TaskSpec`` list the schedule was computed from (its resolved route
+    lengths supply distance).
     """
     scheduled = {item.task_id: item for item in getattr(schedule, "tasks", [])}
     specs_by_id = {spec.task_id: spec for spec in specs or []}
     fuel_by_task = getattr(fuel, "by_task", {}) or {}
+    cable_by_task = getattr(cable, "by_task", {}) or {}
     resource_rows = {str(row.get("resource_id") or ""): row for row in resources or []}
     baseline_tasks = {
         item.get("task_id"): item
@@ -123,6 +131,13 @@ def build_dataset(rows: Sequence[Dict], schedule, fuel, specs: Sequence,
             record.rob_start, record.rob_end = task_fuel.rob_start, task_fuel.rob_end
             record.fuel_cost = task_fuel.burn * max(
                 0.0, _number(resource.get("fuel_cost_per_unit")))
+        task_cable = cable_by_task.get(task_id)
+        if task_cable is not None:
+            record.cable_mode = task_cable.mode
+            record.cable_amount_m = task_cable.amount_m
+            record.cable_delta_m = task_cable.delta_m
+            record.cable_onboard_start_m = task_cable.onboard_start_m
+            record.cable_onboard_end_m = task_cable.onboard_end_m
         dataset.append(record)
     return dataset
 
@@ -133,6 +148,9 @@ MEASURES = (
     ("distance_km", "Distance", "km"),
     ("fuel_burn", "Fuel burned", ""),
     ("fuel_cost", "Fuel cost", ""),
+    ("cable_laid_km", "Cable laid", "km"),
+    ("cable_loaded_km", "Cable loaded", "km"),
+    ("cable_recovered_km", "Cable recovered", "km"),
     ("count", "Task count", ""),
 )
 
@@ -141,6 +159,7 @@ GROUP_KEYS = (
     ("resource", "Resource"),
     ("progress_status", "Progress status"),
     ("fuel_mode", "Fuel mode"),
+    ("cable_mode", "Cable operation"),
 )
 
 
@@ -153,6 +172,13 @@ def _measure_value(record: ReportRow, measure: str) -> float:
         return record.fuel_burn
     if measure == "fuel_cost":
         return record.fuel_cost
+    if measure == "cable_laid_km":
+        return record.cable_amount_m / 1000.0 if record.cable_mode == "lay" else 0.0
+    if measure == "cable_loaded_km":
+        return record.cable_amount_m / 1000.0 if record.cable_mode == "load" else 0.0
+    if measure == "cable_recovered_km":
+        return (record.cable_amount_m / 1000.0
+                if record.cable_mode == "recover" else 0.0)
     if measure == "count":
         return 1.0
     return 0.0
@@ -232,6 +258,69 @@ def fuel_series(dataset: Sequence[ReportRow],
 
 
 @dataclass
+class CableSeries:
+    resource_id: str
+    resource_name: str = ""
+    color_hex: str = ""
+    # Piecewise-linear cable onboard in km at task boundaries; loads/recoveries
+    # ramp up through their task, lays/discharges ramp down, idle gaps stay flat.
+    points: List[Tuple[datetime, float]] = field(default_factory=list)
+
+
+def cable_series(dataset: Sequence[ReportRow],
+                 resources: Sequence[Dict]) -> List[CableSeries]:
+    """Per-resource cable-onboard-vs-time polylines (km)."""
+    resource_rows = {str(row.get("resource_id") or ""): row for row in resources or []}
+    by_resource: Dict[str, List[ReportRow]] = {}
+    for record in dataset:
+        if (record.is_phase or record.start is None or record.finish is None
+                or not record.cable_mode):
+            continue
+        by_resource.setdefault(record.resource_id, []).append(record)
+    series = []
+    for resource_id, records in by_resource.items():
+        resource = resource_rows.get(resource_id, {})
+        item = CableSeries(
+            resource_id=resource_id,
+            resource_name=str(resource.get("name") or "") or "(no resource)",
+            color_hex=str(resource.get("color_hex") or ""))
+        for rec in sorted(records, key=lambda rec: (rec.start, rec.task_id)):
+            item.points.append((rec.start, rec.cable_onboard_start_m / 1000.0))
+            item.points.append((rec.finish, rec.cable_onboard_end_m / 1000.0))
+        series.append(item)
+    series.sort(key=lambda item: item.resource_name)
+    return series
+
+
+def cumulative_cable_laid(dataset: Sequence[ReportRow]) -> List[Tuple[datetime, float]]:
+    """Total cable laid (km, all resources) vs time.
+
+    Sampled at every lay-task boundary with each task's amount accrued
+    linearly across its scheduled window, so parallel lays sum correctly.
+    """
+    lays = [(rec.start, rec.finish, rec.cable_amount_m / 1000.0)
+            for rec in dataset
+            if not rec.is_phase and rec.cable_mode == "lay"
+            and rec.start is not None and rec.finish is not None
+            and rec.cable_amount_m > 0.0]
+    if not lays:
+        return []
+    times = sorted({when for start, finish, _km in lays for when in (start, finish)})
+    curve = []
+    for when in times:
+        total = 0.0
+        for start, finish, km in lays:
+            span = (finish - start).total_seconds()
+            if span <= 0.0:
+                total += km if when >= finish else 0.0
+            else:
+                fraction = ((when - start).total_seconds()) / span
+                total += km * min(1.0, max(0.0, fraction))
+        curve.append((when, total))
+    return curve
+
+
+@dataclass
 class SCurveResult:
     # Each curve is cumulative % complete (duration-weighted) against time.
     planned: List[Tuple[datetime, float]] = field(default_factory=list)
@@ -275,39 +364,59 @@ def _interpolate(curve: List[Tuple[datetime, float]], when: datetime) -> float:
     return curve[-1][1]
 
 
-def s_curve(dataset: Sequence[ReportRow],
-            now: Optional[datetime] = None) -> SCurveResult:
-    """Planned / baseline / actual progress S-curves, weighted by duration.
+# Progress weightings the S-curve supports: hours of work, or km of cable laid.
+S_CURVE_WEIGHTS = (("duration", "Duration"), ("cable_laid", "Cable laid"))
 
-    The actual curve steps through completed tasks at their recorded actual
-    finish, then closes with the total earned value (including partially
-    complete tasks) at ``now`` — an honest "where we are" point without
-    needing a progress history.
+
+def _progress_weight(record: ReportRow, weight: str) -> float:
+    if weight == "cable_laid":
+        return (record.cable_amount_m
+                if record.cable_mode == "lay" else 0.0)
+    return record.duration_hours
+
+
+def s_curve(dataset: Sequence[ReportRow], now: Optional[datetime] = None,
+            weight: str = "duration") -> SCurveResult:
+    """Planned / baseline / actual progress S-curves.
+
+    ``weight`` picks what "progress" means: hours of scheduled work
+    ("duration") or metres of cable laid ("cable_laid" — only Lay tasks
+    carry weight). The actual curve steps through completed tasks at their
+    recorded actual finish, then closes with the total earned value
+    (including partially complete tasks) at ``now`` — an honest "where we
+    are" point without needing a progress history.
+
+    Baseline snapshots store durations but not cable amounts, so the
+    baseline curve weights baseline finishes by each task's current amount
+    in cable mode.
     """
     result = SCurveResult()
     work = [rec for rec in dataset if not rec.is_phase]
+    weights = {rec.task_id: _progress_weight(rec, weight) for rec in work}
     plan_start = min((rec.start for rec in work if rec.start is not None),
                      default=None)
     result.planned = _cumulative_curve(
-        [(rec.finish, rec.duration_hours) for rec in work
-         if rec.finish is not None and rec.duration_hours > 0.0], plan_start)
+        [(rec.finish, weights[rec.task_id]) for rec in work
+         if rec.finish is not None and weights[rec.task_id] > 0.0], plan_start)
     base_start = min((rec.baseline_start for rec in work
                       if rec.baseline_start is not None), default=None)
     result.baseline = _cumulative_curve(
         [(rec.baseline_finish,
-          rec.baseline_duration_hours if rec.baseline_duration_hours
-          else rec.duration_hours)
+          rec.baseline_duration_hours
+          if weight == "duration" and rec.baseline_duration_hours
+          else weights[rec.task_id])
          for rec in work if rec.baseline_finish is not None], base_start)
 
-    total = sum(rec.duration_hours for rec in work if rec.duration_hours > 0.0)
+    total = sum(value for value in weights.values() if value > 0.0)
     if total > 0.0:
         earned = sum(
-            rec.duration_hours * min(100.0, max(0.0, rec.percent_complete)) / 100.0
-            for rec in work if rec.duration_hours > 0.0)
+            weights[rec.task_id] * min(100.0, max(0.0, rec.percent_complete)) / 100.0
+            for rec in work if weights[rec.task_id] > 0.0)
         completed = [
-            (rec.actual_finish, rec.duration_hours) for rec in work
-            if rec.duration_hours > 0.0 and rec.actual_finish is not None
+            (rec.actual_finish, rec.task_id) for rec in work
+            if weights[rec.task_id] > 0.0 and rec.actual_finish is not None
             and (rec.progress_status == "completed" or rec.percent_complete >= 100.0)]
+        completed = [(when, weights[task_id]) for when, task_id in completed]
         curve = []
         if completed:
             completed.sort(key=lambda pair: pair[0])

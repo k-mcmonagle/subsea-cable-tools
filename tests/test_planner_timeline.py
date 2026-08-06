@@ -3,7 +3,9 @@
 
 from datetime import datetime, timedelta
 
-from ..planner.timeline_engine import TaskSpec, compute_fuel, compute_schedule, position_at
+from ..planner.timeline_engine import (
+    TaskSpec, compute_cable, compute_fuel, compute_schedule, position_at,
+)
 
 
 def _result(name, ok, detail=""):
@@ -287,6 +289,41 @@ def test_task_paced_playback_clock():
     return _result("task-paced playback clock", ok)
 
 
+def test_cable_onboard_tracking():
+    anchor = datetime(2026, 1, 1)
+    specs = [
+        TaskSpec("load", 0, "Load out", "v1", duration_hours=12,
+                 cable_mode="load", cable_amount_m=50000.0),
+        TaskSpec("lay", 1, "Lay route", "v1", duration_hours=24,
+                 predecessor_task_id="load", cable_mode="lay",
+                 geom_kind="line", route_length_m=30000.0),
+        TaskSpec("recover", 2, "Recover stub", "v1", duration_hours=6,
+                 predecessor_task_id="lay", cable_mode="recover",
+                 cable_amount_m=2000.0),
+        TaskSpec("transit", 3, "Transit", "v1", duration_hours=10,
+                 predecessor_task_id="recover"),
+        # Second vessel lays with nothing loaded: onboard goes negative.
+        TaskSpec("bare", 4, "Lay unloaded", "v2", duration_hours=8,
+                 cable_mode="lay", cable_amount_m=4000.0),
+    ]
+    result = compute_schedule(anchor, specs)
+    cable = compute_cable(result, {spec.task_id: spec for spec in specs})
+    v1 = cable.by_resource["v1"]
+    ok = cable.by_task["load"].onboard_end_m == 50000.0
+    # Lay amount comes from the route length when no amount is typed.
+    ok = ok and cable.by_task["lay"].amount_m == 30000.0
+    ok = ok and cable.by_task["lay"].onboard_end_m == 20000.0
+    ok = ok and cable.by_task["recover"].onboard_end_m == 22000.0
+    ok = ok and "transit" not in cable.by_task  # no cable mode, no entry
+    ok = ok and v1.total_loaded_m == 50000.0 and v1.total_laid_m == 30000.0
+    ok = ok and v1.total_recovered_m == 2000.0 and v1.onboard_end_m == 22000.0
+    ok = ok and not v1.warnings
+    v2 = cable.by_resource["v2"]
+    ok = ok and v2.onboard_end_m == -4000.0 and v2.min_onboard_m == -4000.0
+    ok = ok and len(v2.warnings) == 1 and "Lay unloaded" in v2.warnings[0]
+    return _result("cable onboard: auto lay amount, totals, negative warning", ok)
+
+
 def run_all():
     return [
         test_duration_resolution(), test_dependencies_resources_and_lag(),
@@ -296,6 +333,7 @@ def run_all():
         test_simops_same_location_warning(),
         test_position_fraction_reverse_and_hold(),
         test_fuel_burn_bunker_and_warnings(),
+        test_cable_onboard_tracking(),
         test_speed_profile_duration_and_position(),
         test_task_paced_playback_clock(),
     ]

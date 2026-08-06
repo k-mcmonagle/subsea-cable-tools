@@ -33,6 +33,10 @@ class TaskSpec:
     outline_level: int = 0
     fuel_mode: str = ""
     bunker_amount: float = 0.0
+    cable_mode: str = ""
+    # Metres moved by this task; None means "auto" (the task's distance for
+    # lay/recover tasks, nothing otherwise).
+    cable_amount_m: Optional[float] = None
     dependency_type: str = "FS"
     constraint_type: str = ""
     constraint_datetime: object = None
@@ -107,6 +111,38 @@ class ResourceFuel:
 class FuelResult:
     by_task: Dict[str, TaskFuel] = field(default_factory=dict)
     by_resource: Dict[str, ResourceFuel] = field(default_factory=dict)
+
+
+# Sign each cable mode applies to the resource's onboard total.
+CABLE_SIGNS = {"load": 1.0, "recover": 1.0, "lay": -1.0, "discharge": -1.0}
+
+
+@dataclass
+class TaskCable:
+    task_id: str
+    mode: str = ""
+    amount_m: float = 0.0        # unsigned quantity this task moves
+    delta_m: float = 0.0         # signed change to cable onboard
+    onboard_start_m: float = 0.0
+    onboard_end_m: float = 0.0
+
+
+@dataclass
+class ResourceCable:
+    resource_id: str
+    total_loaded_m: float = 0.0
+    total_laid_m: float = 0.0
+    total_recovered_m: float = 0.0
+    total_discharged_m: float = 0.0
+    onboard_end_m: float = 0.0
+    min_onboard_m: float = 0.0
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass
+class CableResult:
+    by_task: Dict[str, TaskCable] = field(default_factory=dict)
+    by_resource: Dict[str, ResourceCable] = field(default_factory=dict)
 
 
 def _number(value, default=0.0):
@@ -607,6 +643,63 @@ def compute_fuel(result: TimelineResult, specs_by_id: Dict[str, TaskSpec],
         summary.cost = summary.total_burn * max(0.0, _number(resource.get("fuel_cost_per_unit")))
         fuel.by_resource[resource_id] = summary
     return fuel
+
+
+def resolve_cable_amount_m(spec: TaskSpec) -> float:
+    """Unsigned metres of cable a task moves.
+
+    An explicit amount always wins; otherwise lay/recover tasks default to
+    the task's own distance (a lay task lays its route), and load/discharge
+    move nothing until an amount is typed.
+    """
+    if spec is None or (spec.cable_mode or "") not in CABLE_SIGNS:
+        return 0.0
+    if spec.cable_amount_m is not None:
+        return max(0.0, _number(spec.cable_amount_m))
+    if spec.cable_mode in ("lay", "recover") and spec.route_length_m:
+        return max(0.0, _number(spec.route_length_m))
+    return 0.0
+
+
+def compute_cable(result: TimelineResult,
+                  specs_by_id: Dict[str, TaskSpec]) -> CableResult:
+    """Track cable onboard along each resource lane.
+
+    Every lane starts at zero; Load/Recover tasks add their amount and
+    Lay/Discharge subtract it, so the running total is the cable on board.
+    A lane that pays off more than it has taken on goes negative and is
+    flagged (usually a missing Load task or amount).
+    """
+    cable = CableResult()
+    for resource_id, lane in result.by_resource.items():
+        onboard = 0.0
+        summary = ResourceCable(resource_id=resource_id)
+        for task in sorted(lane, key=lambda item: (item.start, item.row)):
+            spec = specs_by_id.get(task.task_id)
+            mode = (spec.cable_mode or "") if spec is not None else ""
+            if mode not in CABLE_SIGNS:
+                continue
+            amount = resolve_cable_amount_m(spec)
+            delta = CABLE_SIGNS[mode] * amount
+            onboard_start = onboard
+            onboard += delta
+            cable.by_task[task.task_id] = TaskCable(
+                task.task_id, mode, amount, delta, onboard_start, onboard)
+            totals = {"load": "total_loaded_m", "lay": "total_laid_m",
+                      "recover": "total_recovered_m",
+                      "discharge": "total_discharged_m"}[mode]
+            setattr(summary, totals, getattr(summary, totals) + amount)
+            summary.min_onboard_m = min(summary.min_onboard_m, onboard)
+            if onboard < -1e-9 and onboard_start >= -1e-9:
+                name = (spec.name if spec is not None else "") or task.task_id
+                summary.warnings.append(
+                    "More cable paid off than onboard during '%s' (%s)." % (
+                        name, task.start.strftime("%d/%m/%Y %H:%M")))
+        summary.onboard_end_m = onboard
+        if cable.by_task and any(
+                item.task_id in cable.by_task for item in lane):
+            cable.by_resource[resource_id] = summary
+    return cable
 
 
 def schedule_boundaries(result: TimelineResult) -> List[datetime]:

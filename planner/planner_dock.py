@@ -1623,7 +1623,8 @@ class PlannerDock(QDockWidget):
         baseline = _scenario_settings(scenario).get("baseline") if scenario else None
         dataset = reports.build_dataset(
             self.task_table.rows, self.task_table.schedule, self.task_table.fuel,
-            self.task_table.task_specs(), self.task_table.resources, baseline)
+            self.task_table.task_specs(), self.task_table.resources, baseline,
+            cable=self.task_table.cable)
         return {
             "dataset": dataset,
             "resources": self.task_table.resources,
@@ -1631,6 +1632,7 @@ class PlannerDock(QDockWidget):
             "baseline": baseline,
             "op_labels": dict(schema.OPERATION_TYPES),
             "status_labels": dict(schema.PROGRESS_STATUSES),
+            "cable_labels": dict(schema.CABLE_MODES),
             "now": datetime.now().replace(second=0, microsecond=0),
             "span_end": self.task_table.schedule.span_end,
         }
