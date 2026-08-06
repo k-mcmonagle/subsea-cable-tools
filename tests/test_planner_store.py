@@ -35,7 +35,7 @@ def test_create_crud_and_meta():
         "duration_hours": 12.0, "resource_id": resources[0]["resource_id"],
     }])
     tasks = store.list_tasks(scenario_id)
-    ok = store.exists() and store.read_meta().get("schema_version") == "6"
+    ok = store.exists() and store.read_meta().get("schema_version") == "7"
     ok = ok and len(resources) == 1 and resources[0]["name"] == "Vessel 1"
     ok = ok and float(resources[0]["start_offset_hours"] or 0.0) == 0.0
     ok = ok and resources[0]["fuel_unit"] == schema.DEFAULT_FUEL_UNIT
@@ -99,7 +99,7 @@ def test_duplicate_independence_and_remap():
     store.save_tasks(copied_id, copied_tasks)
     ok = ok and store.list_tasks(original_id)[0]["name"] == "A"
     store.migrate()
-    ok = ok and store.read_meta().get("schema_version") == "6"
+    ok = ok and store.read_meta().get("schema_version") == "7"
     return _result("duplicate remapping + independence + migrate no-op", ok)
 
 
@@ -171,7 +171,7 @@ def test_v2_to_v3_phase_and_resource_migration():
     store.migrate()
     migrated_resource = store.list_resources()[0]
     migrated_task = store.list_tasks(scenario_id)[0]
-    ok = store.read_meta().get("schema_version") == "6"
+    ok = store.read_meta().get("schema_version") == "7"
     ok = ok and float(migrated_resource.get("start_offset_hours") or 0.0) == 0.0
     ok = ok and int(migrated_task.get("is_phase") or 0) == 0
     ok = ok and int(migrated_task.get("outline_level") or 0) == 0
@@ -203,7 +203,7 @@ def test_v3_to_v4_fuel_migration():
     store.migrate()
     migrated_resource = store.list_resources()[0]
     migrated_task = store.list_tasks(scenario_id)[0]
-    ok = store.read_meta().get("schema_version") == "6"
+    ok = store.read_meta().get("schema_version") == "7"
     ok = ok and migrated_resource.get("fuel_unit") == schema.DEFAULT_FUEL_UNIT
     ok = ok and float(migrated_resource.get("fuel_rate_transit") or 0.0) == 0.0
     ok = ok and float(migrated_resource.get("fuel_start") or 0.0) == 0.0
@@ -233,7 +233,7 @@ def test_v4_to_v5_shared_resource_migration():
     store.write_meta("schema_version", "4")
     store.migrate()
     resources = store.list_resources()
-    ok = store.read_meta().get("schema_version") == "6"
+    ok = store.read_meta().get("schema_version") == "7"
     ok = ok and len(resources) == 1
     ok = ok and resources[0]["resource_id"] == shared["resource_id"]
     ok = ok and (resources[0].get("scenario_id") or "") == ""
@@ -264,7 +264,7 @@ def test_v5_to_v6_advanced_task_migration():
     store.write_meta("schema_version", "5")
     store.migrate()
     task = store.list_tasks(scenario_id)[0]
-    ok = store.read_meta().get("schema_version") == "6"
+    ok = store.read_meta().get("schema_version") == "7"
     ok = ok and task.get("dependency_type") == "FS"
     ok = ok and task.get("location_mode") == "feature"
     ok = ok and task.get("progress_status") == "not_started"

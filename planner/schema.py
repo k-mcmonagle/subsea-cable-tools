@@ -8,7 +8,7 @@ from typing import Dict, List, Tuple
 
 from ..workbench.schema import gpkg_folder_for, new_id, sanitize_slug, utc_now_iso
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 TABLE_META = "pow_meta"
 TABLE_SCENARIO = "pow_scenario"
@@ -49,6 +49,8 @@ TASK_FIELDS: List[FieldSpec] = [
     ("predecessor_task_id", "str"), ("dependency_type", "str"),
     ("lag_hours", "float"),
     ("speed_knots", "float"), ("direction", "str"),
+    ("distance_unit", "str"), ("manual_distance_m", "float"),
+    ("speed_profile_json", "str"),
     ("location_mode", "str"), ("location_chainage_m", "float"),
     ("constraint_type", "str"), ("constraint_datetime", "str"),
     ("is_milestone", "int"),

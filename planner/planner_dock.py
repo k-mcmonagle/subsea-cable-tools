@@ -48,8 +48,13 @@ from .sim_controller import SimulationController
 from .sketch_tool import SketchSession
 from .store import PlannerStore, default_project_gpkg_path, project_gpkg_path, set_project_gpkg_path
 from .task_import_dialog import TaskImportDialog
-from .task_table import TaskTableWidget
-from .timeline_engine import position_at
+from .task_table import (
+    DISTANCE_FACTORS, TaskTableWidget, distance_unit_for, _display_number,
+)
+from .timeline_engine import (
+    KNOT_M_PER_HOUR, parse_speed_profile, position_at, profile_duration_hours,
+    resolve_speed_profile,
+)
 
 
 LABEL_SETTING_PREFIX = "subsea_cable_tools/planner/simulation_labels/"
@@ -143,6 +148,7 @@ class PlannerDock(QDockWidget):
         self.task_table.tasksChanged.connect(self._save_tasks)
         self.task_table.scheduleChanged.connect(self._schedule_changed)
         self.task_table.linkRequested.connect(self._link_feature)
+        self.task_table.speedProfileRequested.connect(self._edit_speed_profile)
         self.task_table.taskSelected.connect(self._task_selected)
         self.task_table.zoomRequested.connect(self._zoom_to_task)
         self.task_table.advancedRequested.connect(self._edit_advanced_task)
@@ -994,6 +1000,50 @@ class PlannerDock(QDockWidget):
         for linked_id in task_ids:
             updates[linked_id] = {}
         self.task_table.update_links_bulk(updates, record_history=False)
+
+    def _edit_speed_profile(self, task_id):
+        """Edit a task's per-leg speed profile (loading rates, transit legs)."""
+        task = self.task_table.row_by_id(task_id)
+        if task is None:
+            return
+        unit = distance_unit_for(task)
+        total_m = self.task_table._task_distance_m(task)
+        segments = parse_speed_profile(task.get("speed_profile_json")) or []
+        dialog = SpeedProfileDialog(
+            task.get("name") or "Task", unit, total_m, segments, self)
+        if qt_exec(dialog) != DIALOG_ACCEPTED:
+            return
+        segments = [] if dialog.cleared else dialog.segments()
+        if not segments:
+            if task.get("speed_profile_json"):
+                self.task_table.update_task_fields(task_id, {
+                    "speed_profile_json": "", "duration_mode": "manual"})
+            return
+        values = {
+            "speed_profile_json": json.dumps({"segments": [
+                {"distance_m": distance, "speed_knots": speed}
+                for distance, speed in segments]}, sort_keys=True),
+            "duration_mode": "computed",
+        }
+        hours, warning = profile_duration_hours(segments, total_m)
+        if hours is not None and hours > 0:
+            # Persist the computed duration and average speed so exports and
+            # older plugin versions see sensible single values.
+            values["duration_hours"] = hours
+            resolved = resolve_speed_profile(segments, total_m)
+            if resolved:
+                covered = sum(distance for distance, _speed in resolved)
+                values["speed_knots"] = covered / hours / KNOT_M_PER_HOUR
+        self.task_table.update_task_fields(task_id, values)
+        if warning:
+            self.iface.messageBar().pushMessage(
+                "Planner", warning, level=MESSAGE_WARNING, duration=6)
+        elif hours is None:
+            self.iface.messageBar().pushMessage(
+                "Planner",
+                "The profile's remainder leg needs a measured route or an "
+                "entered distance before it can size itself.",
+                level=MESSAGE_WARNING, duration=6)
 
     def _start_task_sketch(self, task_id, mode):
         task = self.task_table.row_by_id(task_id)
@@ -2428,6 +2478,139 @@ class ResourceDialog(QDialog):
             (colour.name(), text))
 
 
+class SpeedProfileDialog(QDialog):
+    """Per-leg speeds for a task: [distance, speed] rows travelled in order.
+
+    Distances and speeds are edited in the task's distance unit (per hour for
+    speeds) but stored canonically in metres and knots, so changing the
+    task's display unit later never alters the profile.
+    """
+
+    def __init__(self, task_name, unit, total_distance_m, segments, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Speed profile — %s" % task_name)
+        self.unit = unit
+        self.factor = DISTANCE_FACTORS.get(unit, 1852.0)
+        self.total_distance_m = total_distance_m
+        self.cleared = False
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Legs are travelled in order. Distances are in %s, speeds in %s/h. "
+            "Leave a distance blank to make that leg cover the remainder of "
+            "the task distance." % (unit, unit))
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        if total_distance_m is not None:
+            total_label = "Task distance: %s %s" % (
+                _display_number(float(total_distance_m) / self.factor), unit)
+        else:
+            total_label = ("The task has no measured route or entered distance "
+                           "yet, so every leg needs an explicit distance.")
+        layout.addWidget(QLabel(total_label))
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(
+            ["Distance (%s)" % unit, "Speed (%s/h)" % unit])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        for distance_m, speed_knots in segments:
+            self._add_row(distance_m, speed_knots)
+        if not segments:
+            self._add_row(None, None)
+        layout.addWidget(self.table)
+        buttons = QHBoxLayout()
+        add_button = QPushButton("Add leg")
+        add_button.clicked.connect(lambda: self._add_row(None, None))
+        remove_button = QPushButton("Remove selected")
+        remove_button.clicked.connect(self._remove_selected)
+        clear_button = QPushButton("Clear profile")
+        clear_button.setToolTip(
+            "Remove the profile; the task goes back to its single speed/duration.")
+        clear_button.clicked.connect(self._clear)
+        buttons.addWidget(add_button)
+        buttons.addWidget(remove_button)
+        buttons.addWidget(clear_button)
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
+        self.summary = QLabel("")
+        self.summary.setWordWrap(True)
+        layout.addWidget(self.summary)
+        box = QDialogButtonBox(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
+        box.accepted.connect(self.accept)
+        box.rejected.connect(self.reject)
+        layout.addWidget(box)
+        self.table.itemChanged.connect(lambda _item: self._update_summary())
+        self._update_summary()
+        self.resize(420, 360)
+
+    def _add_row(self, distance_m, speed_knots):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        distance_text = ("" if distance_m in (None, "") else
+                         _display_number(float(distance_m) / self.factor))
+        speed_text = ("" if speed_knots in (None, "") else
+                      _display_number(float(speed_knots) * KNOT_M_PER_HOUR / self.factor))
+        self.table.setItem(row, 0, QTableWidgetItem(distance_text))
+        self.table.setItem(row, 1, QTableWidgetItem(speed_text))
+
+    def _remove_selected(self):
+        for index in sorted({item.row() for item in self.table.selectedItems()},
+                            reverse=True):
+            self.table.removeRow(index)
+        self._update_summary()
+
+    def _clear(self):
+        self.cleared = True
+        self.accept()
+
+    def _cell_float(self, row, column):
+        item = self.table.item(row, column)
+        if item is None:
+            return None
+        text = item.text().strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+    def segments(self):
+        """[(distance_m or None, speed_knots)] from the edited rows."""
+        result = []
+        for row in range(self.table.rowCount()):
+            speed = self._cell_float(row, 1)
+            if speed is None or speed <= 0:
+                continue
+            distance = self._cell_float(row, 0)
+            distance_m = None if distance is None or distance <= 0 else distance * self.factor
+            result.append((distance_m, speed * self.factor / KNOT_M_PER_HOUR))
+        return result
+
+    def _update_summary(self):
+        segments = self.segments()
+        if not segments:
+            self.summary.setText("No usable legs yet — each leg needs a speed.")
+            return
+        hours, warning = profile_duration_hours(segments, self.total_distance_m)
+        if hours is None:
+            self.summary.setText(
+                warning or "A remainder leg needs a known task distance.")
+            return
+        resolved = resolve_speed_profile(segments, self.total_distance_m) or []
+        covered_m = sum(distance for distance, _speed in resolved)
+        parts = [
+            "%d leg%s" % (len(segments), "" if len(segments) == 1 else "s"),
+            "%s %s" % (_display_number(covered_m / self.factor), self.unit),
+            "%s h (%s d)" % (_display_number(hours), _display_number(hours / 24.0)),
+        ]
+        if hours > 0:
+            parts.append("avg %s %s/h" % (
+                _display_number(covered_m / hours / self.factor), self.unit))
+        text = "   |   ".join(parts)
+        if warning:
+            text += "\n⚠ " + warning
+        self.summary.setText(text)
+
+
 class FeatureLinkDialog(QDialog):
     def __init__(self, canvas, pick_session, parent=None):
         super().__init__(parent)
@@ -2610,6 +2793,7 @@ def _new_task_row(name, resource_id, seq, speed_knots, duration_hours,
         "predecessor_task_id": predecessor_task_id or "", "dependency_type": "FS",
         "lag_hours": 0.0,
         "speed_knots": float(speed_knots or 0.0) if speed_knots is not None else None,
+        "distance_unit": "", "manual_distance_m": None, "speed_profile_json": "",
         "direction": "forward", "location_mode": "feature",
         "location_chainage_m": None, "constraint_type": "",
         "constraint_datetime": "", "is_milestone": 0,

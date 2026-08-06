@@ -21,8 +21,9 @@ from ..planner.planner_dock import PlannerDock, ResourceDialog, SketchTasksDialo
 from ..planner.sketch_tool import SketchSession, _parse_lat_lon
 from ..planner.spatial_tasks import _join_connected, _reversed_geometry
 from ..planner.store import PlannerStore
-from ..planner.task_table import TaskTableWidget
+from ..planner.task_table import TaskTableWidget, _float
 from ..planner.timeline_engine import ActiveState, ScheduledTask
+from ..qgis_compat import ITEM_FLAG_EDITABLE
 
 
 def _result(name, ok, detail=""):
@@ -173,7 +174,7 @@ def test_multiselect_delete_move_and_bidirectional_duration():
 
     line = _task("line", 0, line=True)
     table.set_plan([line], [{"resource_id": "v", "name": "V"}], datetime(2026, 1, 1))
-    ok = ok and table.item(0, table.COL_DISTANCE).text() == "1"
+    ok = ok and table.item(0, table.COL_DISTANCE).text() == "1 nm"
     table.item(0, table.COL_DURATION).setText("1")
     ok = ok and abs(table.rows[0]["speed_knots"] - 1.0) < 1e-4
     ok = ok and abs(table.schedule.tasks[0].duration_hours - 1.0) < 1e-6
@@ -186,6 +187,69 @@ def test_multiselect_delete_move_and_bidirectional_duration():
     ok = ok and table.item(0, table.COL_DISTANCE).text() == ""
     ok = ok and table.item(0, table.COL_SPEED).text() == ""
     return _result("multi-delete/block move + duration↔speed", ok)
+
+
+def test_manual_distance_units_and_duration_days():
+    """A 20 km loading task at 4 km/h computes 5 h; unit switches never drift."""
+    from ..planner.task_table import KNOT_M_PER_HOUR
+
+    table = TaskTableWidget(_Resolver())
+    table.set_duration_unit("h")
+    loading = _task("load", 0)
+    table.set_plan([loading], [{"resource_id": "v", "name": "V"}], datetime(2026, 1, 1))
+    table.item(0, table.COL_DISTANCE).setText("20 km")
+    ok = abs(_float(table.rows[0].get("manual_distance_m")) - 20000.0) < 1e-6
+    ok = ok and table.rows[0].get("distance_unit") == "km"
+    table.item(0, table.COL_SPEED).setText("4")
+    ok = ok and abs(table.schedule.tasks[0].duration_hours - 5.0) < 1e-6
+    ok = ok and table.item(0, table.COL_DISTANCE).text() == "20 km"
+    ok = ok and table.item(0, table.COL_SPEED).text() == "4"
+
+    # Editing duration back-computes the speed in the task's unit.
+    table.item(0, table.COL_DURATION).setText("10")
+    shown_speed = float(table.item(0, table.COL_SPEED).text())
+    ok = ok and abs(shown_speed - 2.0) < 1e-3
+    ok = ok and abs(table.schedule.tasks[0].duration_hours - 10.0) < 1e-6
+
+    # Switching the display unit converts the view but not the stored data.
+    stored_m = _float(table.rows[0].get("manual_distance_m"))
+    stored_kn = _float(table.rows[0].get("speed_knots"))
+    table.selectRow(0)
+    table._set_distance_unit_selected("nm")
+    ok = ok and abs(_float(table.rows[0].get("manual_distance_m")) - stored_m) < 1e-12
+    ok = ok and abs(_float(table.rows[0].get("speed_knots")) - stored_kn) < 1e-12
+    ok = ok and table.item(0, table.COL_DISTANCE).text().endswith("nm")
+    ok = ok and abs(float(table.item(0, table.COL_DISTANCE).text().split()[0])
+                    - 20000.0 / 1852.0) < 1e-3
+    table.selectRow(0)
+    table._set_distance_unit_selected("km")
+
+    # Day display: same stored hours, shown /24; day entry converts back.
+    table.set_duration_unit("d")
+    ok = ok and abs(float(table.item(0, table.COL_DURATION).text())
+                    - 10.0 / 24.0) < 1e-3
+    table.item(0, table.COL_DURATION).setText("0.5")
+    ok = ok and abs(table.schedule.tasks[0].duration_hours - 12.0) < 1e-6
+    # An explicit suffix overrides the column unit.
+    table.item(0, table.COL_DURATION).setText("6h")
+    ok = ok and abs(table.schedule.tasks[0].duration_hours - 6.0) < 1e-6
+    table.set_duration_unit("h")
+
+    # A speed profile drives the duration: 5 km at 2 km/h + 15 km at 6 km/h.
+    profile = {"segments": [
+        {"distance_m": 5000.0, "speed_knots": 2000.0 / KNOT_M_PER_HOUR},
+        {"distance_m": None, "speed_knots": 6000.0 / KNOT_M_PER_HOUR},
+    ]}
+    import json as _json
+    table.update_task_fields("load", {
+        "speed_profile_json": _json.dumps(profile), "duration_mode": "computed"})
+    ok = ok and abs(table.schedule.tasks[0].duration_hours - 5.0) < 1e-6
+    duration_item = table.item(0, table.COL_DURATION)
+    speed_item = table.item(0, table.COL_SPEED)
+    ok = ok and not (duration_item.flags() & ITEM_FLAG_EDITABLE)
+    ok = ok and not (speed_item.flags() & ITEM_FLAG_EDITABLE)
+    ok = ok and abs(float(speed_item.text()) - 4.0) < 1e-3
+    return _result("manual distance + unit switching + duration days + profile", ok)
 
 
 def test_waypoint_task_configuration():
@@ -352,6 +416,7 @@ def run_all():
         test_sketch_does_not_reopen_transit_measure(),
         test_sketch_snapping_exact_coordinate_and_route_kp(),
         test_multiselect_delete_move_and_bidirectional_duration(),
+        test_manual_distance_units_and_duration_days(),
         test_waypoint_task_configuration(),
         test_simulation_label_content_and_canvas_follow(),
         test_summary_outline_undo_redo_compact_rows_and_resource_configuration(),

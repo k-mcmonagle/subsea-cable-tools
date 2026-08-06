@@ -6,9 +6,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import heapq
+import json
 from typing import Dict, List, Optional, Sequence
 
 KNOT_MPS = 0.514444
+# One knot in metres per hour; the single constant every speed<->distance
+# conversion in the planner uses, so unit round-trips are exact.
+KNOT_M_PER_HOUR = KNOT_MPS * 3600.0
 
 
 @dataclass
@@ -34,6 +38,9 @@ class TaskSpec:
     constraint_datetime: object = None
     is_milestone: bool = False
     location_key: str = ""
+    # Optional piecewise speed profile: [(distance_m or None, speed_knots)].
+    # A None distance is a "remainder" leg sized from route_length_m.
+    speed_profile: Optional[List] = None
 
 
 @dataclass
@@ -109,16 +116,107 @@ def _number(value, default=0.0):
         return default
 
 
+def parse_speed_profile(raw):
+    """Parse a task's speed_profile_json into [(distance_m or None, speed_knots)].
+
+    Returns None when there is no usable profile. Segments with a
+    non-positive speed are dropped; a missing/blank distance marks a
+    "remainder" leg that absorbs whatever the task's total distance leaves.
+    """
+    try:
+        data = json.loads(str(raw or ""))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    segments = []
+    for entry in data.get("segments") or []:
+        if not isinstance(entry, dict):
+            continue
+        speed = _number(entry.get("speed_knots"), 0.0)
+        if speed <= 0.0:
+            continue
+        raw_distance = entry.get("distance_m")
+        if raw_distance in (None, ""):
+            distance = None
+        else:
+            distance = max(0.0, _number(raw_distance, 0.0))
+        segments.append((distance, speed))
+    return segments or None
+
+
+def resolve_speed_profile(segments, total_length_m):
+    """Concrete [(distance_m, speed_knots)] legs, or None when unusable.
+
+    Remainder legs split the distance the explicit legs leave uncovered;
+    they need a known total distance to be sized.
+    """
+    if not segments:
+        return None
+    explicit = sum(d for d, _s in segments if d is not None)
+    remainder_count = sum(1 for d, _s in segments if d is None)
+    remainder_m = 0.0
+    if remainder_count:
+        total = _number(total_length_m, -1.0) if total_length_m is not None else -1.0
+        if total < 0.0:
+            return None
+        remainder_m = max(0.0, total - explicit) / remainder_count
+    resolved = [(remainder_m if d is None else d, s) for d, s in segments]
+    return [(d, s) for d, s in resolved if d > 0.0] or None
+
+
+def profile_duration_hours(segments, total_length_m):
+    """(hours, warning) from a speed profile; (None, warning) when unusable."""
+    resolved = resolve_speed_profile(segments, total_length_m)
+    if resolved is None:
+        if segments and any(d is None for d, _s in segments):
+            return None, ("Speed profile has a remainder leg but the task has "
+                          "no measured or entered distance.")
+        return None, ""
+    hours = sum(d / (s * KNOT_M_PER_HOUR) for d, s in resolved)
+    warning = ""
+    total = _number(total_length_m, -1.0) if total_length_m is not None else -1.0
+    covered = sum(d for d, _s in resolved)
+    if total >= 0.0 and abs(covered - total) > max(1.0, 0.001 * total):
+        warning = "Speed profile covers %.3f km of the task's %.3f km." % (
+            covered / 1000.0, total / 1000.0)
+    return hours, warning
+
+
+def profile_distance_at(resolved, elapsed_hours):
+    """Metres travelled after elapsed_hours along resolved profile legs."""
+    elapsed = max(0.0, _number(elapsed_hours))
+    travelled = 0.0
+    clock = 0.0
+    for distance, speed in resolved:
+        leg_hours = distance / (speed * KNOT_M_PER_HOUR)
+        if elapsed <= clock + leg_hours:
+            return travelled + (elapsed - clock) * speed * KNOT_M_PER_HOUR
+        clock += leg_hours
+        travelled += distance
+    return travelled
+
+
 def _duration(spec: TaskSpec):
     if spec.is_milestone:
         return 0.0, ""
+    if spec.speed_profile:
+        hours, warning = profile_duration_hours(
+            spec.speed_profile, spec.route_length_m)
+        if hours is not None:
+            return hours, warning
+        if warning:
+            return max(0.0, _number(spec.duration_hours)), (
+                warning + " Using the task's stored duration.")
     if spec.duration_mode == "computed":
         length = _number(spec.route_length_m, -1.0)
         speed = _number(spec.speed_knots)
-        if spec.geom_kind == "line" and length >= 0.0 and speed > 0.0:
+        # A measured route or a manually entered distance both qualify.
+        if length >= 0.0 and speed > 0.0:
             return length / (speed * KNOT_MPS) / 3600.0, ""
         return max(0.0, _number(spec.duration_hours)), (
-            "Computed duration needs a linked line and a speed; using manual duration."
+            "Computed duration needs a measured or entered distance and a "
+            "speed; using manual duration."
         )
     return max(0.0, _number(spec.duration_hours)), ""
 
@@ -541,7 +639,19 @@ def position_at(result: TimelineResult, specs_by_id: Dict[str, TaskSpec],
         length = None if spec is None else spec.route_length_m
         chainage = None
         if spec is not None and spec.geom_kind == "line" and length is not None:
-            chainage = float(length) * (1.0 - fraction if spec.direction == "reverse" else fraction)
+            travelled = None
+            if spec.speed_profile and is_active:
+                # Piecewise speeds make position nonlinear in time; walk the
+                # profile so the playback marker matches the leg speeds.
+                resolved = resolve_speed_profile(spec.speed_profile, float(length))
+                if resolved:
+                    elapsed_hours = (when - chosen.start).total_seconds() / 3600.0
+                    travelled = min(float(length),
+                                    profile_distance_at(resolved, elapsed_hours))
+            if travelled is None:
+                travelled = float(length) * fraction
+            chainage = (float(length) - travelled
+                        if spec.direction == "reverse" else travelled)
             chainage = min(float(length), max(0.0, chainage))
         states[resource_id] = ActiveState(chosen.task_id, fraction, chainage, is_active)
     return states

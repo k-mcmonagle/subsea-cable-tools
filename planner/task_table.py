@@ -6,6 +6,7 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime
 import json
+import re
 
 from qgis.PyQt.QtCore import QSettings, Qt, pyqtSignal
 from qgis.PyQt.QtGui import QBrush, QColor, QIcon, QPixmap
@@ -23,16 +24,57 @@ from ..qgis_compat import (
 )
 from . import operation_types, schema
 from .feature_ref import shared_owner_task_id
-from .timeline_engine import TaskSpec, compute_fuel, compute_schedule
+from .timeline_engine import (
+    KNOT_M_PER_HOUR, TaskSpec, compute_fuel, compute_schedule,
+    parse_speed_profile, profile_duration_hours, resolve_speed_profile,
+)
 
 LINK_KEYS = ("layer_id", "layer_source", "layer_name", "feature_id",
              "feature_label", "geom_kind", "linked_ref_json")
+
+# Per-task distance display units; every stored value stays canonical
+# (metres / knots / hours), so switching units never changes the data.
+DISTANCE_FACTORS = {"nm": 1852.0, "km": 1000.0, "m": 1.0}
+DISTANCE_UNIT_LABELS = (("nm", "Nautical miles (nm)"), ("km", "Kilometres (km)"),
+                        ("m", "Metres (m)"))
+DURATION_UNIT_SETTING = "subsea_cable_tools/planner/duration_display_unit"
+
+_VALUE_UNIT_RE = re.compile(
+    r"^\s*([-+]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][-+]?[0-9]+)?)\s*([a-zA-Z]*)\s*$")
+
+_DURATION_SUFFIXES = {"d": "d", "day": "d", "days": "d",
+                      "h": "h", "hr": "h", "hrs": "h", "hour": "h", "hours": "h"}
+
+
+def distance_unit_for(task):
+    """The task's distance display unit; legacy rows default to nm."""
+    unit = str((task or {}).get("distance_unit") or "").lower()
+    return unit if unit in DISTANCE_FACTORS else "nm"
+
+
+def _parse_value_unit(text, suffixes):
+    """(value, canonical_unit or None) from e.g. '20 km' / '1.5d'; None if bad."""
+    match = _VALUE_UNIT_RE.match(str(text or ""))
+    if not match:
+        return None
+    try:
+        value = float(match.group(1))
+    except ValueError:
+        return None
+    suffix = match.group(2).lower()
+    if not suffix:
+        return value, None
+    unit = suffixes.get(suffix)
+    if unit is None:
+        return None
+    return value, unit
 
 
 class TaskTableWidget(QTableWidget):
     tasksChanged = pyqtSignal(object)
     scheduleChanged = pyqtSignal(object)
     linkRequested = pyqtSignal(str)
+    speedProfileRequested = pyqtSignal(str)
     taskSelected = pyqtSignal(str)
     zoomRequested = pyqtSignal(str)
     advancedRequested = pyqtSignal(str)
@@ -62,7 +104,7 @@ class TaskTableWidget(QTableWidget):
     COL_NOTES = 20
 
     HEADERS = ["#", "Task", "Operation", "Description", "Resource", "Duration (h)", "Predecessor",
-               "Linked feature", "Distance (nm)", "Speed (kn)", "Dir", "Fuel", "Bunker",
+               "Linked feature", "Distance", "Speed", "Dir", "Fuel", "Bunker",
                "Start", "Finish", "Float (h)", "Fuel used", "Fuel ROB", "Progress", "Status",
                "Notes"]
 
@@ -70,12 +112,16 @@ class TaskTableWidget(QTableWidget):
         super().__init__(0, len(self.HEADERS), parent)
         self.setHorizontalHeaderLabels(self.HEADERS)
         self.horizontalHeaderItem(self.COL_DURATION).setToolTip(
-            "Line tasks: enter speed to calculate duration, or edit duration to calculate speed.")
+            "Enter speed to calculate duration, or edit duration to calculate speed. "
+            "Values accept an h or d suffix (e.g. 36h, 1.5d); right-click the header "
+            "to display the whole column in days or hours.")
         self.horizontalHeaderItem(self.COL_SPEED).setToolTip(
-            "Knots for route tasks; blank for point operations. Accurate route length is measured "
-            "using the project ellipsoid/CRS settings.")
+            "Speed in the task's distance unit per hour: nm/h (knots), km/h, or m/h. "
+            "Right-click a row to change its distance unit. Blank for tasks with no distance.")
         self.horizontalHeaderItem(self.COL_DISTANCE).setToolTip(
-            "Read-only measured route distance in nautical miles (1 nm = 1,852 m).")
+            "Route tasks show the measured route length (read-only). Other tasks accept a "
+            "manual distance — e.g. '20 km' for a 20 km loading task — which combines with "
+            "Speed to compute the duration. Right-click a row to change its unit.")
         self.horizontalHeaderItem(self.COL_FUEL_MODE).setToolTip(
             "Which of the assigned resource's fuel rates (per 24 h) this task burns: "
             "Transit, DP, Anchor, or Port. '(none)' burns no fuel. Rates are set in "
@@ -96,6 +142,9 @@ class TaskTableWidget(QTableWidget):
         self.resolver = resolver
         self.rows = []
         self.resources = []
+        # Column-wide duration display unit ("h" or "d"); storage stays hours.
+        unit = str(QSettings().value(DURATION_UNIT_SETTING, "h") or "h").lower()
+        self.duration_unit = "d" if unit == "d" else "h"
         # (value, label) operation-type choices; user-configured, blank by
         # default. The dock pushes the current list via set_operation_choices.
         self.operation_choices = [operation_types.UNSPECIFIED]
@@ -156,6 +205,68 @@ class TaskTableWidget(QTableWidget):
                 self.setColumnHidden(column, True)
         header.sectionResized.connect(self._header_changed)
         header.sectionMoved.connect(self._header_changed)
+        self._apply_duration_header()
+
+    # -- unit display helpers ---------------------------------------------
+    def _apply_duration_header(self):
+        item = self.horizontalHeaderItem(self.COL_DURATION)
+        if item is not None:
+            item.setText("Duration (d)" if self.duration_unit == "d" else "Duration (h)")
+
+    def set_duration_unit(self, unit):
+        unit = "d" if str(unit or "").lower() == "d" else "h"
+        if unit == self.duration_unit:
+            return
+        self.duration_unit = unit
+        QSettings().setValue(DURATION_UNIT_SETTING, unit)
+        self._apply_duration_header()
+        if self.rows:
+            self._rebuild()
+
+    def _display_duration(self, hours):
+        if hours in (None, ""):
+            return ""
+        try:
+            value = float(hours)
+        except (TypeError, ValueError):
+            return ""
+        return _display_number(value / 24.0 if self.duration_unit == "d" else value)
+
+    def _parse_duration_hours(self, text):
+        """Hours from duration-cell text; honours h/d suffix, else column unit."""
+        parsed = _parse_value_unit(text, _DURATION_SUFFIXES)
+        if parsed is None:
+            return None
+        value, unit = parsed
+        unit = unit or self.duration_unit
+        return value * 24.0 if unit == "d" else value
+
+    @staticmethod
+    def _manual_distance_m(task):
+        value = _float(task.get("manual_distance_m"), 0.0)
+        return value if value > 0.0 else 0.0
+
+    def _task_distance_m(self, task):
+        """Distance used for duration maths: measured route or manual entry."""
+        if self.spatial_kind(task) == "line":
+            return self.resolver.route_length_m(task)
+        manual = self._manual_distance_m(task)
+        return manual if manual > 0.0 else None
+
+    @staticmethod
+    def _display_distance(metres, unit):
+        factor = DISTANCE_FACTORS.get(unit, 1852.0)
+        return _display_number(float(metres) / factor)
+
+    @staticmethod
+    def _display_speed(speed_knots, unit):
+        if speed_knots in (None, ""):
+            return ""
+        factor = DISTANCE_FACTORS.get(unit, 1852.0)
+        try:
+            return _display_number(float(speed_knots) * KNOT_M_PER_HOUR / factor)
+        except (TypeError, ValueError):
+            return ""
 
     def set_plan(self, rows, resources, anchor, schedule_mode="forward",
                  resource_start_datetimes=None):
@@ -673,8 +784,17 @@ class TaskTableWidget(QTableWidget):
         for index, row in enumerate(self.rows):
             summary = self._is_summary(index)
             spatial_kind = "" if summary else self.spatial_kind(row)
-            route_length = (self.resolver.route_length_m(row)
-                            if spatial_kind == "line" else None)
+            if spatial_kind == "line":
+                route_length = self.resolver.route_length_m(row)
+            elif summary:
+                route_length = None
+            else:
+                # A manually entered distance (loading a cable, spooling, …)
+                # feeds the same computed-duration path as a measured route.
+                manual = self._manual_distance_m(row)
+                route_length = manual if manual > 0.0 else None
+            profile = None if summary else parse_speed_profile(
+                row.get("speed_profile_json"))
             specs.append(TaskSpec(
                 task_id=row.get("task_id") or schema.new_id(), seq=index,
                 name=row.get("name") or "", resource_id=row.get("resource_id") or "",
@@ -693,6 +813,7 @@ class TaskTableWidget(QTableWidget):
                 constraint_datetime=None if summary else row.get("constraint_datetime") or None,
                 is_milestone=False if summary else bool(row.get("is_milestone")),
                 location_key="" if summary else self.location_key_for(row),
+                speed_profile=profile,
             ))
         return specs
 
@@ -766,15 +887,17 @@ class TaskTableWidget(QTableWidget):
                     self._readonly_item(row_index, self.COL_DURATION, "")
                 else:
                     self._set_text(
-                        row_index, self.COL_DURATION, _display_number(task.get("duration_hours")))
+                        row_index, self.COL_DURATION,
+                        self._display_duration(task.get("duration_hours")))
                 self._predecessor_combo(row_index, task, summary)
                 self._feature_button(row_index, task, summary)
                 self._readonly_item(row_index, self.COL_DISTANCE, "")
-                if summary or self.spatial_kind(task) == "point":
+                if summary:
                     self._readonly_item(row_index, self.COL_SPEED, "")
                 else:
-                    self._set_text(
-                        row_index, self.COL_SPEED, _display_number(task.get("speed_knots")))
+                    # Text, flags, and tooltips are refreshed in _recompute,
+                    # which knows the task's distance unit and speed profile.
+                    self._set_text(row_index, self.COL_SPEED, "")
                 self._direction_combo(row_index, task, summary)
                 self._fuel_mode_combo(row_index, task, summary)
                 if summary:
@@ -851,6 +974,18 @@ class TaskTableWidget(QTableWidget):
         link = menu.addAction("Link or share location…",
                               lambda: self.linkRequested.emit(task_id))
         link.setEnabled(not self._is_summary(row))
+        profile_action = menu.addAction(
+            "Speed profile…", lambda: self.speedProfileRequested.emit(task_id))
+        profile_action.setEnabled(not self._is_summary(row))
+        unit_menu = menu.addMenu("Distance unit")
+        unit_menu.setEnabled(not self._is_summary(row))
+        current_unit = distance_unit_for(task)
+        for unit, label in DISTANCE_UNIT_LABELS:
+            unit_action = unit_menu.addAction(label)
+            unit_action.setCheckable(True)
+            unit_action.setChecked(unit == current_unit)
+            unit_action.triggered.connect(
+                lambda _checked=False, u=unit: self._set_distance_unit_selected(u))
         menu.addSeparator()
         menu.addAction("Group selected tasks", self.group_selected)
         menu.addAction("Indent (make child)", lambda: self.indent_selected(1))
@@ -1046,6 +1181,9 @@ class TaskTableWidget(QTableWidget):
         if self._muted or item.row() >= len(self.rows):
             return
         task = self.rows[item.row()]
+        if item.column() == self.COL_DISTANCE:
+            self._distance_edited(item, task)
+            return
         mapping = {
             self.COL_TASK: "name", self.COL_DESCRIPTION: "description",
             self.COL_DURATION: "duration_hours", self.COL_SPEED: "speed_knots",
@@ -1055,7 +1193,15 @@ class TaskTableWidget(QTableWidget):
         if field is None:
             return
         self.checkpoint()
-        if field in ("duration_hours", "speed_knots", "bunker_amount"):
+        if field == "duration_hours":
+            task[field] = self._parse_duration_hours(item.text())
+        elif field == "speed_knots":
+            # Entered in the task's distance unit per hour; stored as knots.
+            entered = _float(item.text(), None)
+            factor = DISTANCE_FACTORS[distance_unit_for(task)]
+            task[field] = (None if entered is None
+                           else entered * factor / KNOT_M_PER_HOUR)
+        elif field == "bunker_amount":
             task[field] = _float(item.text(), None)
         elif field == "name":
             text = item.text().lstrip()
@@ -1071,23 +1217,54 @@ class TaskTableWidget(QTableWidget):
             task[field] = item.text()
         if field == "duration_hours":
             duration = _float(task.get("duration_hours"))
-            if self.spatial_kind(task) == "line" and duration > 0:
-                length_m = self.resolver.route_length_m(task)
-                if length_m is not None and length_m > 0:
-                    task["speed_knots"] = length_m / (duration * 3600.0 * 0.514444)
-                    task["duration_mode"] = "computed"
-                    self._muted = True
-                    try:
-                        speed_item = self.item(item.row(), self.COL_SPEED)
-                        if speed_item is not None:
-                            speed_item.setText(_display_number(task["speed_knots"]))
-                    finally:
-                        self._muted = False
+            length_m = self._task_distance_m(task) if duration > 0 else None
+            if length_m is not None and length_m > 0:
+                task["speed_knots"] = length_m / (duration * 3600.0 * 0.514444)
+                task["duration_mode"] = "computed"
+                self._muted = True
+                try:
+                    speed_item = self.item(item.row(), self.COL_SPEED)
+                    if speed_item is not None:
+                        speed_item.setText(self._display_speed(
+                            task["speed_knots"], distance_unit_for(task)))
+                finally:
+                    self._muted = False
             else:
                 task["duration_mode"] = "manual"
         elif field == "speed_knots":
+            distance_m = self._task_distance_m(task)
             task["duration_mode"] = (
-                "computed" if self.spatial_kind(task) == "line" and _float(task[field]) > 0 else "manual")
+                "computed" if distance_m and _float(task[field]) > 0 else "manual")
+        self._recompute()
+        self._emit_change()
+
+    def _distance_edited(self, item, task):
+        """A manual distance was typed (non-route tasks only)."""
+        if self._is_summary(item.row()) or self.spatial_kind(task) == "line":
+            return
+        text = item.text().strip()
+        value = None
+        unit = None
+        if text:
+            parsed = _parse_value_unit(text, {"nm": "nm", "km": "km", "m": "m"})
+            if parsed is None or parsed[0] < 0:
+                # Unparseable entry: restore the previous display, change nothing.
+                self._recompute()
+                return
+            value, unit = parsed
+        self.checkpoint()
+        if value is None or value == 0:
+            task["manual_distance_m"] = None
+            if task.get("duration_mode") == "computed":
+                task["duration_mode"] = "manual"
+        else:
+            if unit:
+                task["distance_unit"] = unit
+            factor = DISTANCE_FACTORS[distance_unit_for(task)]
+            task["manual_distance_m"] = value * factor
+            if (_float(task.get("speed_knots")) > 0
+                    or parse_speed_profile(task.get("speed_profile_json"))):
+                task["duration_mode"] = "computed"
         self._recompute()
         self._emit_change()
 
@@ -1095,6 +1272,66 @@ class TaskTableWidget(QTableWidget):
         row = self.currentRow()
         if 0 <= row < len(self.rows):
             self.taskSelected.emit(self.rows[row].get("task_id") or "")
+
+    def _refresh_distance_cell(self, item, row, spec, unit, summary_row):
+        if item is None:
+            return
+        if summary_row:
+            item.setText("")
+            item.setToolTip("")
+            item.setFlags(item.flags() & ~ITEM_FLAG_EDITABLE)
+            return
+        if self.spatial_kind(row) == "line":
+            item.setFlags(item.flags() & ~ITEM_FLAG_EDITABLE)
+            if spec.route_length_m is not None:
+                item.setText("%s %s" % (
+                    self._display_distance(spec.route_length_m, unit), unit))
+                item.setToolTip(
+                    "Measured route distance: %s m. Right-click the row to "
+                    "change the display unit." % _display_number(spec.route_length_m))
+            else:
+                item.setText("")
+                item.setToolTip("")
+            return
+        item.setFlags(item.flags() | ITEM_FLAG_EDITABLE)
+        manual = self._manual_distance_m(row)
+        item.setText("%s %s" % (self._display_distance(manual, unit), unit)
+                     if manual else "")
+        item.setToolTip(
+            "Manual distance (e.g. cable length for a loading task). With a "
+            "speed it computes the duration. Accepts a unit suffix: 20 km, "
+            "10 nm, 5000 m.")
+
+    def _refresh_speed_cell(self, row_index, row, spec, unit, summary_row):
+        item = self.item(row_index, self.COL_SPEED)
+        if item is None or summary_row:
+            return
+        factor = DISTANCE_FACTORS.get(unit, 1852.0)
+        if spec.speed_profile:
+            resolved = resolve_speed_profile(spec.speed_profile, spec.route_length_m)
+            average = ""
+            if resolved:
+                total_m = sum(distance for distance, _speed in resolved)
+                hours = sum(distance / (speed * KNOT_M_PER_HOUR)
+                            for distance, speed in resolved)
+                if hours > 0:
+                    average = _display_number(total_m / hours / factor)
+            item.setText(average)
+            item.setFlags(item.flags() & ~ITEM_FLAG_EDITABLE)
+            item.setToolTip(
+                "Average speed from the task's speed profile (%d legs), in %s/h. "
+                "Right-click the row → Speed profile… to edit." % (
+                    len(spec.speed_profile), unit))
+            return
+        item.setFlags(item.flags() | ITEM_FLAG_EDITABLE)
+        if spec.route_length_m is not None:
+            item.setText(self._display_speed(row.get("speed_knots"), unit))
+            item.setToolTip("Speed in %s/h." % unit)
+        else:
+            item.setText("")
+            item.setToolTip(
+                "Speed in %s/h. Link a route or enter a distance for the "
+                "speed to compute a duration." % unit)
 
     def _recompute(self):
         specs = self.task_specs()
@@ -1122,19 +1359,16 @@ class TaskTableWidget(QTableWidget):
                 float_item = self.item(row_index, self.COL_FLOAT)
                 duration_item.setToolTip("")
                 spec = specs[row_index]
-                if spec.geom_kind == "line" and spec.route_length_m is not None:
-                    distance_item.setText(_display_number(spec.route_length_m / 1852.0))
-                    distance_item.setToolTip("Measured distance: %s m" % _display_number(
-                        spec.route_length_m))
-                else:
-                    distance_item.setText("")
-                    distance_item.setToolTip("")
-                if row.get("is_milestone") and not self._is_summary(row_index):
+                unit = distance_unit_for(row)
+                summary_row = self._is_summary(row_index)
+                self._refresh_distance_cell(distance_item, row, spec, unit, summary_row)
+                self._refresh_speed_cell(row_index, row, spec, unit, summary_row)
+                if row.get("is_milestone") and not summary_row:
                     duration_item.setText("0")
                     duration_item.setFlags(duration_item.flags() & ~ITEM_FLAG_EDITABLE)
                     duration_item.setToolTip("Milestone (zero duration).")
-                elif self._is_summary(row_index):
-                    duration_item.setText(_display_number(
+                elif summary_row:
+                    duration_item.setText(self._display_duration(
                         scheduled.duration_hours if scheduled is not None else 0.0))
                     duration_item.setFlags(duration_item.flags() & ~ITEM_FLAG_EDITABLE)
                     duration_item.setForeground(QBrush(QColor("#303030")))
@@ -1143,17 +1377,30 @@ class TaskTableWidget(QTableWidget):
                     font.setBold(True)
                     duration_item.setFont(font)
                     duration_item.setToolTip("Summary span derived from this row's indented tasks.")
+                elif spec.speed_profile:
+                    duration_item.setText(self._display_duration(
+                        scheduled.duration_hours if scheduled is not None
+                        else row.get("duration_hours")))
+                    duration_item.setFlags(duration_item.flags() & ~ITEM_FLAG_EDITABLE)
+                    duration_item.setForeground(QBrush(QColor("#777777")))
+                    font = duration_item.font()
+                    font.setItalic(True)
+                    duration_item.setFont(font)
+                    duration_item.setToolTip(
+                        "Duration comes from the task's speed profile (%d legs). "
+                        "Right-click the row → Speed profile… to change or clear it."
+                        % len(spec.speed_profile))
                 elif row.get("duration_mode") == "computed" and spec.route_length_m is not None and spec.speed_knots > 0:
-                    duration_item.setText(_display_number(scheduled.duration_hours))
+                    duration_item.setText(self._display_duration(scheduled.duration_hours))
                     duration_item.setFlags(duration_item.flags() | ITEM_FLAG_EDITABLE)
                     duration_item.setForeground(QBrush(QColor("#777777")))
                     font = duration_item.font()
                     font.setItalic(True)
                     duration_item.setFont(font)
                     duration_item.setToolTip(
-                        "Calculated from measured route length and speed. Edit this value to recalculate speed.")
+                        "Calculated from the task's distance and speed. Edit this value to recalculate speed.")
                 else:
-                    duration_item.setText(_display_number(row.get("duration_hours")))
+                    duration_item.setText(self._display_duration(row.get("duration_hours")))
                     duration_item.setFlags(duration_item.flags() | ITEM_FLAG_EDITABLE)
                     duration_item.setForeground(QBrush())
                     font = duration_item.font()
@@ -1206,15 +1453,41 @@ class TaskTableWidget(QTableWidget):
         for column in range(len(self.HEADERS)):
             if column in (self.COL_NUMBER, self.COL_TASK):
                 continue
-            action = menu.addAction(self.HEADERS[column])
+            header_item = self.horizontalHeaderItem(column)
+            action = menu.addAction(
+                header_item.text() if header_item else self.HEADERS[column])
             action.setCheckable(True)
             action.setChecked(not self.isColumnHidden(column))
             action.toggled.connect(
                 lambda checked, c=column: self._set_column_visible(c, checked))
         menu.addSeparator()
+        days_action = menu.addAction("Show durations in days")
+        days_action.setCheckable(True)
+        days_action.setChecked(self.duration_unit == "d")
+        days_action.toggled.connect(
+            lambda checked: self.set_duration_unit("d" if checked else "h"))
+        menu.addSeparator()
         menu.addAction("Size columns to contents", self._size_columns_to_contents)
         menu.addAction("Reset column layout", self._reset_header)
         qt_exec(menu, self.horizontalHeader().mapToGlobal(pos))
+
+    def _set_distance_unit_selected(self, unit):
+        """Set the distance display unit on the selected rows (data unchanged)."""
+        if unit not in DISTANCE_FACTORS:
+            return
+        indices = [index for index in self.selected_row_indices()
+                   if 0 <= index < len(self.rows) and not self._is_summary(index)]
+        if not indices and 0 <= self.currentRow() < len(self.rows):
+            indices = [self.currentRow()]
+        rows = [self.rows[index] for index in indices
+                if distance_unit_for(self.rows[index]) != unit]
+        if not rows:
+            return
+        self.checkpoint()
+        for row in rows:
+            row["distance_unit"] = unit
+        self._rebuild()
+        self._emit_change()
 
     def _set_column_visible(self, column, visible):
         self.setColumnHidden(column, not visible)
