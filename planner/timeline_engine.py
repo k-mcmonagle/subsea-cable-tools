@@ -609,6 +609,54 @@ def compute_fuel(result: TimelineResult, specs_by_id: Dict[str, TaskSpec],
     return fuel
 
 
+def schedule_boundaries(result: TimelineResult) -> List[datetime]:
+    """Sorted distinct task start/finish times plus the plan span endpoints."""
+    if result is None or result.span_start is None or result.span_end is None:
+        return []
+    values = {result.span_start, result.span_end}
+    for task in result.tasks:
+        values.add(task.start)
+        values.add(task.finish)
+    return sorted(values)
+
+
+def advance_task_paced(boundaries: Sequence[datetime], current: Optional[datetime],
+                       real_seconds: float, seconds_per_interval: float) -> Optional[datetime]:
+    """Advance a task-paced playback clock by ``real_seconds`` of wall time.
+
+    Every interval between consecutive ``boundaries`` (i.e. every distinct
+    segment of plan activity, tasks and idle gaps alike) consumes the same
+    ``seconds_per_interval`` of real time, so short operations get as much
+    screen time as multi-day transits. Within an interval the clock rate is
+    constant, so map markers still progress smoothly along their routes.
+    A single tick can cross several boundaries; the result is clamped to the
+    final boundary.
+    """
+    if not boundaries or current is None:
+        return current
+    end = boundaries[-1]
+    if current >= end:
+        return end
+    if current < boundaries[0]:
+        current = boundaries[0]
+    pace = max(1e-9, _number(seconds_per_interval, 1.0))
+    remaining = max(0.0, _number(real_seconds))
+    while remaining > 1e-12 and current < end:
+        upcoming = next(value for value in boundaries if value > current)
+        previous = max(value for value in boundaries if value <= current)
+        interval_seconds = (upcoming - previous).total_seconds()
+        rate = interval_seconds / pace  # simulated seconds per real second
+        to_boundary = (upcoming - current).total_seconds()
+        step = rate * remaining
+        if step >= to_boundary - 1e-9:
+            current = upcoming
+            remaining -= to_boundary / rate if rate > 0 else remaining
+        else:
+            current = current + timedelta(seconds=step)
+            remaining = 0.0
+    return min(current, end)
+
+
 def position_at(result: TimelineResult, specs_by_id: Dict[str, TaskSpec],
                 when: datetime) -> Dict[str, ActiveState]:
     """Return the current/held state of each resource at ``when``."""

@@ -251,6 +251,42 @@ def test_speed_profile_duration_and_position():
     return _result("speed profile duration + leg-accurate playback", ok)
 
 
+def test_task_paced_playback_clock():
+    """Each boundary interval gets equal wall time; markers stay smooth."""
+    from ..planner.timeline_engine import advance_task_paced, schedule_boundaries
+
+    anchor = datetime(2026, 8, 14, 0, 0)
+    # A 1 h operation followed by a 24 h transit on one lane.
+    specs = [
+        TaskSpec("short", 0, "Op", "v", "manual", 1.0),
+        TaskSpec("long", 1, "Transit", "v", "manual", 24.0,
+                 predecessor_task_id="short"),
+    ]
+    result = compute_schedule(anchor, specs)
+    boundaries = schedule_boundaries(result)
+    ok = boundaries == [anchor, anchor + timedelta(hours=1),
+                        anchor + timedelta(hours=25)]
+
+    pace = 2.0  # two real seconds per interval
+    # Half a real second into the short task -> a quarter of the way through.
+    quarter = advance_task_paced(boundaries, anchor, 0.5, pace)
+    ok = ok and quarter == anchor + timedelta(minutes=15)
+    # Two real seconds finish the short task exactly; rate stays constant
+    # inside the interval, so the marker glides rather than jumping.
+    ok = ok and advance_task_paced(boundaries, anchor, 2.0, pace) == (
+        anchor + timedelta(hours=1))
+    # One tick can span boundaries: 3 s = short task + half the transit.
+    ok = ok and advance_task_paced(boundaries, anchor, 3.0, pace) == (
+        anchor + timedelta(hours=13))
+    # Overshoot clamps to the end of the plan.
+    ok = ok and advance_task_paced(boundaries, anchor, 99.0, pace) == (
+        anchor + timedelta(hours=25))
+    # Resuming mid-interval keeps the same per-interval pacing.
+    ok = ok and advance_task_paced(boundaries, quarter, 1.5, pace) == (
+        anchor + timedelta(hours=1))
+    return _result("task-paced playback clock", ok)
+
+
 def run_all():
     return [
         test_duration_resolution(), test_dependencies_resources_and_lag(),
@@ -261,6 +297,7 @@ def run_all():
         test_position_fraction_reverse_and_hold(),
         test_fuel_burn_bunker_and_warnings(),
         test_speed_profile_duration_and_position(),
+        test_task_paced_playback_clock(),
     ]
 
 

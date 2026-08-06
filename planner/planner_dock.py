@@ -58,6 +58,9 @@ from .timeline_engine import (
 
 
 LABEL_SETTING_PREFIX = "subsea_cable_tools/planner/simulation_labels/"
+SIM_SPEED_MODE_SETTING = "subsea_cable_tools/planner/sim_speed_mode"
+SIM_SPEED_VALUE_SETTING = "subsea_cable_tools/planner/sim_speed_value"
+SIM_SPEED_CUSTOM_SETTING = "subsea_cable_tools/planner/sim_speed_custom_hours"
 STANDARD_TASKS_SETTING = "subsea_cable_tools/planner/standard_tasks"
 OPERATION_TYPES_SETTING = "subsea_cable_tools/planner/operation_types"
 LABEL_OPTIONS = (
@@ -340,13 +343,48 @@ class PlannerDock(QDockWidget):
         layout.addWidget(self.play_btn)
         layout.addWidget(forward)
         self.speed_combo = QComboBox()
-        for label, value in (("1 min/s", 60), ("10 min/s", 600), ("1 hour/s", 3600),
-                             ("6 hours/s", 21600), ("1 day/s", 86400)):
-            self.speed_combo.addItem(label, value)
-        self.speed_combo.setCurrentIndex(2)
-        self.speed_combo.currentIndexChanged.connect(
-            lambda _index: self.sim.set_speed(self.speed_combo.currentData()))
-        self.sim.set_speed(self.speed_combo.currentData())
+        for label, value in (("1 min/s", 60.0), ("10 min/s", 600.0),
+                             ("1 hour/s", 3600.0), ("6 hours/s", 21600.0),
+                             ("12 hours/s", 43200.0), ("1 day/s", 86400.0)):
+            self.speed_combo.addItem(label, ("constant", value))
+        self.speed_combo.insertSeparator(self.speed_combo.count())
+        for label, value in (("1 task/s", 1.0), ("1 task / 2 s", 2.0),
+                             ("1 task / 10 s", 10.0)):
+            self.speed_combo.addItem(label, ("task", value))
+        self.speed_combo.insertSeparator(self.speed_combo.count())
+        self.speed_combo.addItem("Custom…", ("custom", None))
+        self.speed_combo.setToolTip(
+            "Playback speed. Time modes advance the simulation clock at a fixed "
+            "rate. Task modes give every task (and idle gap) between schedule "
+            "boundaries the same screen time, so short operations no longer "
+            "flash past long transits — markers still move smoothly along their "
+            "routes within each task. Custom… sets an exact simulated-hours-per-"
+            "second rate.")
+        settings = QSettings()
+        try:
+            self._custom_speed_hours = float(
+                settings.value(SIM_SPEED_CUSTOM_SETTING, 24.0) or 24.0)
+        except (TypeError, ValueError):
+            self._custom_speed_hours = 24.0
+        saved_mode = str(settings.value(SIM_SPEED_MODE_SETTING, "constant") or "constant")
+        try:
+            saved_value = float(settings.value(SIM_SPEED_VALUE_SETTING, 3600.0) or 3600.0)
+        except (TypeError, ValueError):
+            saved_value = 3600.0
+        index = self._find_speed_index(saved_mode, saved_value)
+        if index < 0:
+            index = self._find_speed_index("constant", 3600.0)
+        self._speed_index = index
+        self._restoring_speed = True
+        try:
+            if saved_mode == "custom":
+                self.speed_combo.setItemText(index, "Custom (%s h/s)" %
+                                             _display_number(self._custom_speed_hours))
+            self.speed_combo.setCurrentIndex(index)
+            self._apply_speed_selection()
+        finally:
+            self._restoring_speed = False
+        self.speed_combo.currentIndexChanged.connect(self._speed_selected)
         layout.addWidget(self.speed_combo)
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, 1000)
@@ -1444,6 +1482,56 @@ class PlannerDock(QDockWidget):
                 copied["duration_hours"] = scheduled[copied["task_id"]].duration_hours
             rows.append(copied)
         self.store.sync_geometry_attributes(rows)
+
+    def _find_speed_index(self, mode, value):
+        for index in range(self.speed_combo.count()):
+            data = self.speed_combo.itemData(index)
+            if not data:
+                continue
+            item_mode, item_value = data
+            if item_mode != mode:
+                continue
+            if mode == "custom":
+                return index
+            if abs(float(item_value or 0.0) - float(value or 0.0)) < 1e-9:
+                return index
+        return -1
+
+    def _speed_selected(self, _index):
+        self._apply_speed_selection()
+
+    def _apply_speed_selection(self):
+        data = self.speed_combo.currentData()
+        if not data:
+            return
+        mode, value = data
+        settings = QSettings()
+        if mode == "custom":
+            if not self._restoring_speed:
+                hours, ok = QInputDialog.getDouble(
+                    self, "Custom playback speed",
+                    "Simulated hours per real second:",
+                    self._custom_speed_hours, 0.0001, 1000000.0, 4)
+                if not ok:
+                    # Cancelled: return to the previously selected speed.
+                    self.speed_combo.blockSignals(True)
+                    self.speed_combo.setCurrentIndex(self._speed_index)
+                    self.speed_combo.blockSignals(False)
+                    return
+                self._custom_speed_hours = float(hours)
+                settings.setValue(SIM_SPEED_CUSTOM_SETTING, self._custom_speed_hours)
+                self.speed_combo.setItemText(
+                    self.speed_combo.currentIndex(),
+                    "Custom (%s h/s)" % _display_number(self._custom_speed_hours))
+            self.sim.set_speed(self._custom_speed_hours * 3600.0)
+        elif mode == "task":
+            self.sim.set_task_pace(float(value))
+        else:
+            self.sim.set_speed(float(value))
+        self._speed_index = self.speed_combo.currentIndex()
+        settings.setValue(SIM_SPEED_MODE_SETTING, mode)
+        settings.setValue(SIM_SPEED_VALUE_SETTING,
+                          0.0 if value is None else float(value))
 
     def _toggle_play(self, playing):
         if playing:
