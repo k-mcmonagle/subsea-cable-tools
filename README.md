@@ -16,7 +16,7 @@ Targets QGIS 3.22 or newer and declares compatibility through QGIS 4.x (`qgisMax
 
 Available in the Processing Toolbox under **Subsea Cable Tools**, grouped into:
 
-- **Route handling** – Import Excel RPL, Import Cable Lay, Import / Place Ship Outlines, Plot Line Segments from Table, Translate KP Between RPLs, RPL Route Comparison.
+- **Route handling** – guided Import RPL wizard (Workbench) and Import RPL to Workbench (auto-detect) Processing tool, Import Excel RPL (legacy), Import Cable Lay, Import / Place Ship Outlines, Plot Line Segments from Table, Translate KP Between RPLs, RPL Route Comparison.
 - **KP & ranges** – Place KP Points (along route, from CSV, single), Find Nearest KP, KP Range CSV / Highlighter / Merge / Group, Extract KP Ranges (Rule Based), Extract A/C Points, KP Range Depth + Slope Summary.
 - **RPL listings & crossings** – Identify RPL Crossing Points, Identify RPL Area Listing, Identify Features Intersecting RPL, Dynamic Buffer (Lay Corridor), Extract Lines Intersecting Polygons, Export KP Section Chartlets.
 - **Bathymetry** – Import MDB (`import_mdb`, formerly Import Bathy MDB), Add Depth to Point Layer, Create Raster from XYZ, Merge MBES Rasters, Calculate Seabed Length.

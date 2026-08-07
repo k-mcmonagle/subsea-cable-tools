@@ -1,0 +1,511 @@
+# -*- coding: utf-8 -*-
+"""Detection: worksheet scoring, data range, layout, and column mapping.
+
+Detection is content-first: coordinate columns are found from what the cells
+actually contain (hemisphere letters, degree/minute magnitudes, parseable DDM
+text), then the header vocabulary assigns the remaining typed fields, with
+content checks breaking ties. Every assignment carries a human-readable
+reason and the overall result carries a confidence so the wizard can show
+*why* something was chosen and flag ambiguity instead of guessing silently.
+
+Decimal-degree detection deliberately requires a latitude/longitude-ish
+header (bare numeric columns are ambiguous); split-DDM and DDM-text are
+recognised from content alone.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+from . import coords as C
+from .model import (
+    COORD_DDM_TEXT, COORD_DECIMAL_DEGREES, COORD_SPLIT_DDM,
+    FLAT_ARRIVING, ImportProfile, LAYOUT_ALTERNATING, LAYOUT_FLAT,
+    PF_CABLE_DIST_CUM, PF_CHART_NO, PF_DEPTH, PF_DIST_CUM, PF_EVENT,
+    PF_LAT_DEG, PF_LAT_HEMI, PF_LAT_MIN, PF_LAT_TEXT, PF_LON_DEG,
+    PF_LON_HEMI, PF_LON_MIN, PF_LON_TEXT, PF_POS_NO, PF_REMARKS,
+    SF_BEARING, SF_BURIAL, SF_CABLE_CODE, SF_CABLE_DIST, SF_CABLE_TYPE,
+    SF_DATE_INSTALLED, SF_DIST, SF_EEZ, SF_FIBER_PAIR, SF_LAY_DIRECTION,
+    SF_LAY_VESSEL, SF_PROTECTION, SF_SLACK, SF_TARGET_BURIAL, SF_TERRITORIAL,
+    header_signature, normalise_header_text,
+)
+from .parser import parse_point_coords, row_has_coords
+from .reader import SourceGrid
+
+MAX_HEADER_ROWS = 12          # header block search depth above the data start
+MAX_SCAN_ROWS = 4000          # row-scan bound during detection
+GAP_TOLERANCE = 6             # rows of non-data tolerated inside the table
+
+
+@dataclass
+class DetectionResult:
+    profile: ImportProfile
+    position_count: int = 0
+    confidence: float = 0.0            # 0..1
+    reasons: Dict[str, str] = field(default_factory=dict)   # field/topic -> why
+    header_texts: List[str] = field(default_factory=list)   # per column, 1-based-1
+
+
+# ---------------------------------------------------------------------------
+# Column content statistics
+# ---------------------------------------------------------------------------
+@dataclass
+class _ColStats:
+    non_empty: int = 0
+    numeric: int = 0
+    integers: int = 0
+    lat_hemi: int = 0
+    lon_hemi: int = 0
+    ddm_lat: int = 0
+    ddm_lon: int = 0
+    min_val: float = float("inf")
+    max_val: float = float("-inf")
+    monotonic_pairs: int = 0
+    numeric_pairs: int = 0
+
+    @property
+    def numeric_frac(self) -> float:
+        return self.numeric / self.non_empty if self.non_empty else 0.0
+
+
+def _column_stats(grid: SourceGrid, rows: List[int]) -> Dict[int, _ColStats]:
+    stats: Dict[int, _ColStats] = {c: _ColStats() for c in range(1, grid.n_cols + 1)}
+    previous: Dict[int, float] = {}
+    for row in rows:
+        values = grid.row_values(row)
+        for col in range(1, grid.n_cols + 1):
+            value = values[col - 1]
+            if value is None or (isinstance(value, str) and not value.strip()):
+                continue
+            s = stats[col]
+            s.non_empty += 1
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                number = float(value)
+            else:
+                text = str(value).strip()
+                upper = text.upper()
+                if upper in ("N", "S"):
+                    s.lat_hemi += 1
+                elif upper in ("E", "W"):
+                    s.lon_hemi += 1
+                else:
+                    if C.parse_ddm_text(text, C.AXIS_LAT)[0] is not None:
+                        s.ddm_lat += 1
+                    if C.parse_ddm_text(text, C.AXIS_LON)[0] is not None:
+                        s.ddm_lon += 1
+                try:
+                    number = float(text.replace(",", "."))
+                except ValueError:
+                    continue
+            s.numeric += 1
+            if number == int(number):
+                s.integers += 1
+            s.min_val = min(s.min_val, number)
+            s.max_val = max(s.max_val, number)
+            if col in previous:
+                s.numeric_pairs += 1
+                if number >= previous[col]:
+                    s.monotonic_pairs += 1
+            previous[col] = number
+    return stats
+
+
+def _cell_is_datalike(value) -> bool:
+    """Numeric, hemisphere letter, or DDM-parseable — i.e. a body cell."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    text = str(value).strip()
+    if not text:
+        return False
+    if text.upper() in ("N", "S", "E", "W"):
+        return True
+    try:
+        float(text.replace(",", "."))
+        return True
+    except ValueError:
+        pass
+    return (C.parse_ddm_text(text, C.AXIS_LAT)[0] is not None
+            or C.parse_ddm_text(text, C.AXIS_LON)[0] is not None)
+
+
+def _datalike_rows(grid: SourceGrid, limit: int) -> List[int]:
+    """Rows that look like table body (headers/titles/banners excluded)."""
+    rows = []
+    for row in range(1, min(grid.n_rows, limit) + 1):
+        values = [v for v in grid.row_values(row)
+                  if v is not None and str(v).strip() != ""]
+        if len(values) < 2:
+            continue
+        datalike = sum(1 for v in values if _cell_is_datalike(v))
+        if datalike >= 2 and datalike / len(values) >= 0.5:
+            rows.append(row)
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Coordinate configuration detection
+# ---------------------------------------------------------------------------
+def _detect_coordinates(grid: SourceGrid, scan_rows: List[int],
+                        header_texts: List[str],
+                        reasons: Dict[str, str]) -> Optional[Tuple[str, Dict[str, int]]]:
+    """(encoding, coordinate-field mapping) or None."""
+    stats = _column_stats(grid, scan_rows)
+
+    def hemi_cols(kind: str) -> List[int]:
+        result = []
+        for col, s in stats.items():
+            count = s.lat_hemi if kind == "lat" else s.lon_hemi
+            if s.non_empty >= 2 and count / s.non_empty >= 0.8:
+                result.append(col)
+        return result
+
+    lat_hemis, lon_hemis = hemi_cols("lat"), hemi_cols("lon")
+
+    # -- split DDM: hemi column preceded by (deg, min) numeric columns --------
+    def split_for(hemi_col: int, axis_max: float) -> Optional[Tuple[int, int]]:
+        candidates = [c for c in (hemi_col - 2, hemi_col - 1)
+                      if c >= 1 and stats[c].numeric_frac >= 0.8]
+        if len(candidates) < 2:
+            return None
+        deg_col, min_col = candidates[0], candidates[1]
+        sd, sm = stats[deg_col], stats[min_col]
+        if not (0 <= sd.min_val and sd.max_val <= axis_max):
+            return None
+        if not (0 <= sm.min_val and sm.max_val < 60.0):
+            return None
+        # degrees are typically integers; minutes typically fractional
+        if sd.integers < sd.numeric * 0.9 and sm.integers == sm.numeric:
+            deg_col, min_col = min_col, deg_col
+        return deg_col, min_col
+
+    for lat_hemi in lat_hemis:
+        lat_pair = split_for(lat_hemi, 90.0)
+        if not lat_pair:
+            continue
+        for lon_hemi in lon_hemis:
+            if lon_hemi == lat_hemi:
+                continue
+            lon_pair = split_for(lon_hemi, 180.0)
+            if not lon_pair:
+                continue
+            mapping = {
+                PF_LAT_DEG: lat_pair[0], PF_LAT_MIN: lat_pair[1],
+                PF_LAT_HEMI: lat_hemi,
+                PF_LON_DEG: lon_pair[0], PF_LON_MIN: lon_pair[1],
+                PF_LON_HEMI: lon_hemi,
+            }
+            reasons["coordinates"] = (
+                "Split degrees/decimal-minutes/hemisphere columns detected "
+                f"(hemisphere letters in columns {lat_hemi} and {lon_hemi}).")
+            return COORD_SPLIT_DDM, mapping
+
+    # -- DDM text -------------------------------------------------------------
+    ddm_lat_cols = [c for c, s in stats.items()
+                    if s.non_empty >= 2 and s.ddm_lat / s.non_empty >= 0.6]
+    ddm_lon_cols = [c for c, s in stats.items()
+                    if s.non_empty >= 2 and s.ddm_lon / s.non_empty >= 0.6
+                    and c not in ddm_lat_cols]
+    if ddm_lat_cols and ddm_lon_cols:
+        mapping = {PF_LAT_TEXT: ddm_lat_cols[0], PF_LON_TEXT: ddm_lon_cols[0]}
+        reasons["coordinates"] = (
+            f"Combined degrees-minutes text detected in columns "
+            f"{ddm_lat_cols[0]} (lat) and {ddm_lon_cols[0]} (lon).")
+        return COORD_DDM_TEXT, mapping
+
+    # -- decimal degrees: needs lat/lon headers + plausible numeric content ---
+    lat_col = lon_col = None
+    for col in range(1, grid.n_cols + 1):
+        header = header_texts[col - 1] if col <= len(header_texts) else ""
+        s = stats[col]
+        if s.numeric_frac < 0.8 or s.non_empty < 2:
+            continue
+        if re.search(r"\blat", header) and abs(s.min_val) <= 90 and abs(s.max_val) <= 90:
+            lat_col = lat_col or col
+        elif re.search(r"\b(lon|lng|long)", header) and abs(s.min_val) <= 180 and abs(s.max_val) <= 180:
+            lon_col = lon_col or col
+    if lat_col and lon_col:
+        reasons["coordinates"] = (
+            f"Signed decimal degrees under latitude/longitude headers "
+            f"(columns {lat_col} and {lon_col}).")
+        return COORD_DECIMAL_DEGREES, {PF_LAT_TEXT: lat_col, PF_LON_TEXT: lon_col}
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Data range and layout
+# ---------------------------------------------------------------------------
+def _coordinate_rows(grid: SourceGrid, profile: ImportProfile,
+                     limit: int) -> List[int]:
+    rows = []
+    for row in range(1, min(grid.n_rows, limit) + 1):
+        if row_has_coords(grid, row, profile):
+            rows.append(row)
+    return rows
+
+
+def _detect_range_and_layout(coord_rows: List[int],
+                             reasons: Dict[str, str]) -> Tuple[int, int, str]:
+    """(start, end, layout) from the rows where coordinates parse."""
+    if not coord_rows:
+        return 0, 0, LAYOUT_ALTERNATING
+    # Trim isolated early hits (e.g. an example row in a title block) by
+    # keeping the longest run whose internal gaps stay within tolerance.
+    runs: List[List[int]] = [[coord_rows[0]]]
+    for row in coord_rows[1:]:
+        if row - runs[-1][-1] <= GAP_TOLERANCE:
+            runs[-1].append(row)
+        else:
+            runs.append([row])
+    best = max(runs, key=len)
+    start, end = best[0], best[-1]
+
+    gaps = [b - a for a, b in zip(best, best[1:])]
+    if gaps:
+        two = sum(1 for g in gaps if g == 2)
+        one = sum(1 for g in gaps if g == 1)
+        layout = LAYOUT_ALTERNATING if two >= one else LAYOUT_FLAT
+        frac = (two if layout == LAYOUT_ALTERNATING else one) / len(gaps)
+        reasons["layout"] = (
+            f"{'Alternating point/segment rows' if layout == LAYOUT_ALTERNATING else 'One position per row'} "
+            f"({frac:.0%} of row spacing matches).")
+    else:
+        layout = LAYOUT_ALTERNATING
+        reasons["layout"] = "Single position row; layout defaulted to alternating."
+    return start, end, layout
+
+
+# ---------------------------------------------------------------------------
+# Header block & vocabulary mapping
+# ---------------------------------------------------------------------------
+def _header_rows(grid: SourceGrid, data_start: int) -> List[int]:
+    """Contiguous mostly-text rows directly above the data start."""
+    rows: List[int] = []
+    for row in range(data_start - 1, max(0, data_start - 1 - MAX_HEADER_ROWS), -1):
+        values = [v for v in grid.row_values(row) if v is not None
+                  and str(v).strip() != ""]
+        if not values:
+            if rows:
+                break
+            continue
+        texty = sum(1 for v in values
+                    if not isinstance(v, (int, float)) or isinstance(v, bool))
+        if texty / len(values) >= 0.5:
+            rows.append(row)
+        else:
+            break
+    rows.reverse()
+    return rows
+
+
+def header_texts_for(grid: SourceGrid, header_rows: List[int]) -> List[str]:
+    """Per-column concatenated, normalised header text (1-based col - 1)."""
+    texts = []
+    for col in range(1, grid.n_cols + 1):
+        bits = []
+        for row in header_rows:
+            value = grid.cell(row, col)
+            if value is not None and not isinstance(value, (int, float)):
+                bits.append(str(value))
+            elif value is not None:
+                bits.append(str(value))
+        texts.append(normalise_header_text(" ".join(bits)))
+    return texts
+
+
+#: Ordered vocabulary: (field, regex, needs_cable_context, reason). Earlier
+#: entries are more specific and win. ``needs_cable_context`` distinguishes
+#: the cable-distance group from the route-distance group in industry
+#: headers where a "Cable"/"Route" group title sits above "Distance".
+_VOCAB: List[Tuple[str, str, Optional[bool], str]] = [
+    (PF_POS_NO, r"\b(pos|position|wpt|waypoint)\s*(no|num|number|id|#)?\b", None,
+     "position-number header"),
+    (PF_EVENT, r"\bevent\b|\bfeature\b|\bdescription\b", None, "event header"),
+    (PF_CHART_NO, r"\bchart\b", None, "chart header"),
+    (PF_REMARKS, r"remark|comment|note", None, "remarks header"),
+    (PF_DEPTH, r"depth|\bwd\b", None, "depth header"),
+    (SF_SLACK, r"slack", None, "slack header"),
+    (SF_BEARING, r"bearing|\bbrg\b|course|heading", None, "bearing header"),
+    (SF_FIBER_PAIR, r"fib(re|er)", None, "fibre-pair header"),
+    (SF_CABLE_CODE, r"cable\s*code|\bcode\b", None, "cable-code header"),
+    (SF_CABLE_TYPE, r"cable\s*type|\btype\b|armou?r", None, "cable-type header"),
+    (SF_LAY_DIRECTION, r"lay\s*dir", None, "lay-direction header"),
+    (SF_LAY_VESSEL, r"vessel|ship", None, "vessel header"),
+    (SF_PROTECTION, r"protect|burial\s*method|install(ation)?\s*method", None,
+     "protection-method header"),
+    (SF_DATE_INSTALLED, r"date", None, "date header"),
+    (SF_TARGET_BURIAL, r"target.*burial|burial.*target|target.*dob", None,
+     "target-burial header"),
+    (SF_BURIAL, r"burial|\bdob\b|depth\s*of\s*burial", None, "burial header"),
+    (SF_TERRITORIAL, r"territorial|12\s*nm", None, "territorial-water header"),
+    (SF_EEZ, r"\beez\b|exclusive\s*econ", None, "EEZ header"),
+    # distance family — cable group first (more specific), then route/plain
+    (PF_CABLE_DIST_CUM, r"cable.*(cum|total|kp)|(cum|total).*cable", True,
+     "cumulative cable distance header"),
+    (SF_CABLE_DIST, r"cable.*(dist|between|span|leg)", True,
+     "cable span distance header"),
+    (PF_DIST_CUM, r"(cum|total)\w*\s*(dist)?|\bkp\b|route\s*(dist)?.*(cum|total)", False,
+     "cumulative route distance header"),
+    (SF_DIST, r"dist(ance)?\s*(between|span|leg)?|\bspan\b|\bleg\b", False,
+     "span distance header"),
+]
+
+
+def _map_remaining_columns(grid: SourceGrid, header_texts: List[str],
+                           profile: ImportProfile, scan_rows: List[int],
+                           reasons: Dict[str, str]) -> None:
+    """Assign non-coordinate fields by header vocabulary + content checks."""
+    stats = _column_stats(grid, scan_rows)
+    taken = set(profile.mapping.values())
+
+    def content_ok(field_key: str, col: int) -> bool:
+        s = stats.get(col, _ColStats())
+        if field_key in (PF_DIST_CUM, PF_CABLE_DIST_CUM):
+            return s.numeric_frac >= 0.7 and (
+                s.numeric_pairs == 0 or s.monotonic_pairs / s.numeric_pairs >= 0.7)
+        if field_key in (SF_DIST, SF_CABLE_DIST):
+            return s.numeric_frac >= 0.7 and s.min_val >= 0
+        if field_key == SF_BEARING:
+            return s.numeric_frac >= 0.7 and 0 <= s.min_val and s.max_val <= 360
+        if field_key == SF_SLACK:
+            return s.numeric_frac >= 0.6 and -50 <= s.min_val and s.max_val <= 200
+        if field_key == PF_DEPTH:
+            return s.numeric_frac >= 0.6
+        if field_key == PF_POS_NO:
+            # tolerate occasional annotated numbers ("2A") without unmapping
+            return s.numeric_frac >= 0.6 and s.integers >= s.numeric * 0.9
+        return True
+
+    for field_key, pattern, cable_context, why in _VOCAB:
+        if profile.mapping.get(field_key):
+            continue
+        best: Optional[int] = None
+        for col in range(1, grid.n_cols + 1):
+            if col in taken:
+                continue
+            header = header_texts[col - 1] if col <= len(header_texts) else ""
+            if not header or not re.search(pattern, header):
+                continue
+            has_cable = bool(re.search(r"cable", header))
+            if cable_context is True and not has_cable:
+                continue
+            if cable_context is False and has_cable:
+                continue
+            if not content_ok(field_key, col):
+                continue
+            best = col
+            break  # leftmost surviving match wins
+        if best is not None:
+            profile.mapping[field_key] = best
+            taken.add(best)
+            reasons[field_key] = (
+                f"Column {best} ('{header_texts[best - 1]}'): {why}.")
+
+
+# ---------------------------------------------------------------------------
+# Units
+# ---------------------------------------------------------------------------
+def _detect_units(header_texts: List[str], profile: ImportProfile,
+                  reasons: Dict[str, str]) -> None:
+    def unit_of(col: Optional[int], allowed: Tuple[str, ...]) -> Optional[str]:
+        if not col or col > len(header_texts):
+            return None
+        header = header_texts[col - 1]
+        for unit in allowed:
+            if re.search(rf"\b{unit}\b", header):
+                return unit
+        return None
+
+    dist_unit = (unit_of(profile.mapping.get(PF_DIST_CUM), ("km", "nm", "m"))
+                 or unit_of(profile.mapping.get(SF_DIST), ("km", "nm", "m")))
+    if dist_unit:
+        profile.distance_unit = dist_unit
+        reasons["distance_unit"] = f"Header states distances in {dist_unit}."
+    cable_unit = (unit_of(profile.mapping.get(PF_CABLE_DIST_CUM), ("km", "nm", "m"))
+                  or unit_of(profile.mapping.get(SF_CABLE_DIST), ("km", "nm", "m")))
+    if cable_unit:
+        profile.cable_distance_unit = cable_unit
+        reasons["cable_distance_unit"] = f"Header states cable distances in {cable_unit}."
+    depth_unit = unit_of(profile.mapping.get(PF_DEPTH), ("m", "ft"))
+    if depth_unit:
+        profile.depth_unit = depth_unit
+        reasons["depth_unit"] = f"Header states depth in {depth_unit}."
+
+
+# ---------------------------------------------------------------------------
+# Entry points
+# ---------------------------------------------------------------------------
+def detect(grid: SourceGrid) -> DetectionResult:
+    """Full detection for one sheet; the result profile is user-correctable."""
+    reasons: Dict[str, str] = {}
+    profile = ImportProfile(sheet=grid.sheet)
+
+    # Provisional headers from the top of the sheet (refined once the data
+    # start is known) so decimal-degree detection can see lat/lon words.
+    provisional_headers = header_texts_for(
+        grid, list(range(1, min(grid.n_rows, MAX_HEADER_ROWS) + 1)))
+
+    scan_rows = _datalike_rows(grid, MAX_SCAN_ROWS)
+    if not scan_rows:
+        scan_rows = list(range(1, min(grid.n_rows, MAX_SCAN_ROWS) + 1))
+    coord = _detect_coordinates(grid, scan_rows, provisional_headers, reasons)
+    if coord is None:
+        reasons["coordinates"] = "No coordinate columns could be detected."
+        return DetectionResult(profile=profile, reasons=reasons,
+                               header_texts=provisional_headers)
+    profile.coord_encoding, coord_mapping = coord
+    profile.mapping.update(coord_mapping)
+
+    coord_rows = _coordinate_rows(grid, profile, MAX_SCAN_ROWS)
+    start, end, layout = _detect_range_and_layout(coord_rows, reasons)
+    profile.data_start_row, profile.data_end_row = start, end
+    profile.layout = layout
+    profile.flat_semantics = FLAT_ARRIVING
+
+    profile.header_rows = _header_rows(grid, start) if start else []
+    header_texts = (header_texts_for(grid, profile.header_rows)
+                    if profile.header_rows else provisional_headers)
+    profile.header_signature = header_signature(header_texts)
+
+    data_rows = [r for r in coord_rows if start <= r <= end]
+    seg_rows = []
+    if layout == LAYOUT_ALTERNATING:
+        seg_rows = [r + 1 for r in data_rows if r + 1 <= end]
+    _map_remaining_columns(grid, header_texts, profile,
+                           (data_rows + seg_rows) or scan_rows, reasons)
+    _detect_units(header_texts, profile, reasons)
+
+    position_count = len(data_rows)
+    confidence = _confidence(profile, position_count, reasons)
+    return DetectionResult(profile=profile, position_count=position_count,
+                           confidence=confidence, reasons=reasons,
+                           header_texts=header_texts)
+
+
+def _confidence(profile: ImportProfile, positions: int,
+                reasons: Dict[str, str]) -> float:
+    if positions < 2:
+        return 0.0
+    score = 0.5
+    score += min(positions, 50) / 250.0            # up to +0.2 for body size
+    if profile.mapping.get(PF_POS_NO):
+        score += 0.1
+    if profile.mapping.get(PF_DIST_CUM):
+        score += 0.1
+    if "layout" in reasons and "100%" in reasons["layout"]:
+        score += 0.1
+    return min(score, 1.0)
+
+
+def score_sheets(grids: List[SourceGrid]) -> List[DetectionResult]:
+    """Detection for every sheet, best candidate first."""
+    results = [detect(grid) for grid in grids]
+    results.sort(key=lambda r: (r.position_count, r.confidence), reverse=True)
+    return results

@@ -151,7 +151,8 @@ class ImportExcelRPLAlgorithm(QgsProcessingAlgorithm):
 
     def shortHelpString(self):
         return self.tr("""
-<h3>Import Excel RPL</h3>
+<h3>Import Excel RPL (legacy)</h3>
+<p><b>Deprecated:</b> prefer the guided <i>Import RPL...</i> action in the Cable Route Workbench, or the <i>Import RPL to Workbench (auto-detect)</i> Processing tool for batch use. Both detect the worksheet, layout, coordinates, and column mapping automatically, validate the data, and register the result directly as a Workbench revision. This legacy tool remains for existing models/scripts that depend on its parameters.</p>
 <p>This tool imports a cable Route Position List (RPL) from a Microsoft Excel file (.xlsx) into QGIS. It creates two new layers: a <b>point layer</b> for positions (e.g., Start of Cable, End of Cable, Repeater) and a <b>line layer</b> representing the cable segments connecting these points.</p>
 
 <h4>How it Works</h4>

@@ -141,6 +141,13 @@ class RplManagerPanel(QWidget):
         left_layout.addWidget(self.rpl_list)
 
         row1 = QHBoxLayout()
+        import_btn = QPushButton("Import RPL...")
+        import_btn.setToolTip(
+            "Import an RPL workbook/CSV straight into the workbench "
+            "(guided detection, review, and registration)"
+        )
+        import_btn.clicked.connect(self._run_import_wizard)
+        row1.addWidget(import_btn)
         register_btn = QPushButton("Register revision...")
         register_btn.setToolTip(
             "Register an imported RPL point + line layer pair as a segment revision"
@@ -651,6 +658,27 @@ class RplManagerPanel(QWidget):
         self.refresh_rpl_list()
         self._refresh_tables()
         self.rpls_changed.emit()
+
+    def _run_import_wizard(self):
+        """Open the guided Import RPL wizard (detection -> review -> commit)."""
+        try:
+            from .rpl_import_wizard import RplImportWizard
+
+            self._open_store()
+            wizard = RplImportWizard(self.store, self.iface, parent=self)
+
+            def _imported(rpl_id: str):
+                self.refresh_rpl_list()
+                self.rpls_changed.emit()
+                self.select_rpl(rpl_id)
+
+            wizard.imported.connect(_imported)
+            from ..qgis_compat import qt_exec
+
+            qt_exec(wizard)
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Import RPL", f"Could not open the import wizard:\n{exc}")
 
     def _run_register_algorithm(self, initial_parameters=None):
         try:

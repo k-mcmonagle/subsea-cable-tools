@@ -11,7 +11,7 @@ from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 PACKAGE_NAME = "subsea_cable_tools"
-EXPECTED_ALGORITHM_COUNT = 37
+EXPECTED_ALGORITHM_COUNT = 38
 
 
 def _require_qgis() -> None:
@@ -118,6 +118,8 @@ def main() -> int:
         ("workbench store", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_workbench_store")),
         ("workbench route lineage", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_workbench_lineage")),
         ("workbench RPL engine", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_rpl_engine")),
+        ("RPL import core (pure)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_rpl_import_core")),
+        ("RPL import commit service", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_rpl_import_commit")),
         ("workbench assembly + fit", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_fit")),
         ("workbench topology + V3 adapter", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_workbench_adapter")),
         ("workbench rules engine", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_rules_engine")),
