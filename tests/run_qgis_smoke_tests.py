@@ -115,6 +115,7 @@ def main() -> int:
         ("lay simulator QGIS adapters (V3)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_v3_qgis_adapters")),
         ("seabed length algorithm", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_seabed_length")),
         ("cable lay importers", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_cable_lay_importers")),
+        ("MDB import algorithm", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_mdb_import_algorithm")),
         ("workbench store", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_workbench_store")),
         ("workbench route lineage", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_workbench_lineage")),
         ("workbench RPL engine", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_rpl_engine")),
