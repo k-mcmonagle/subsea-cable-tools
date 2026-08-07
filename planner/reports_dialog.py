@@ -52,6 +52,7 @@ _STANDARD_REPORTS = (
     ("breakdown", "Breakdown by category"),
     ("s_curve", "Progress S-curve"),
     ("variance", "Plan vs actual variance"),
+    ("key_dates", "Milestones && key dates"),
 )
 _CABLE_LAID_COLOR = "#1baf7a"  # distinct from the default resource blue
 
@@ -251,6 +252,8 @@ class ReportsWindow(QDialog):
             self._render_s_curve()
         elif value == "variance":
             self._render_variance()
+        elif value == "key_dates":
+            self._render_key_dates()
 
     @staticmethod
     def _select_combo(combo, data):
@@ -560,7 +563,7 @@ class ReportsWindow(QDialog):
                 pass
         self.plot.setYRange(0.0, 100.0)
         self._axis_label(
-            "left", "Cumulative % complete (%s)" %
+            "left", "Cumulative %% complete (%s)" %
             ("by cable laid" if weight == "cable_laid" else "duration-weighted"))
         self._axis_label("bottom", "Date")
         lines = []
@@ -638,6 +641,98 @@ class ReportsWindow(QDialog):
             [[row.name, _fmt_dt(row.baseline_finish),
               _fmt_dt(row.forecast_finish), "%+.1f" % row.variance_hours,
               "yes" if row.is_actual else "forecast"] for row in rows])
+
+    # ----- milestones & key dates ------------------------------------------
+
+    def _render_key_dates(self):
+        self._reset_plot(time_axis=True)
+        context = self._context
+        dataset = context.get("dataset") or []
+        rows = reports.key_dates(dataset)
+        if not rows:
+            self.summary.setText(
+                "No groups or milestones yet.\n\nIndent tasks beneath a "
+                "summary row (Edit / outline… → Group selected tasks) to form "
+                "groups, or mark key tasks as milestones in Advanced task "
+                "settings — each then appears here with its planned, baseline "
+                "and actual dates.")
+            self._set_table([], [])
+            return
+        shown = rows[:30]
+        plot_item = self.plot.getPlotItem()
+        legend = self._legend()
+        planned_y, planned_x0, planned_w = [], [], []
+        baseline_y, baseline_x0, baseline_w = [], [], []
+        mile_planned, mile_baseline, mile_actual = [], [], []
+        for index, row in enumerate(shown):
+            if row.kind == "group":
+                if row.planned_start and row.planned_finish:
+                    planned_y.append(index - 0.18)
+                    planned_x0.append(_ts(row.planned_start))
+                    planned_w.append(max(
+                        1.0, _ts(row.planned_finish) - _ts(row.planned_start)))
+                if row.baseline_start and row.baseline_finish:
+                    baseline_y.append(index + 0.18)
+                    baseline_x0.append(_ts(row.baseline_start))
+                    baseline_w.append(max(
+                        1.0, _ts(row.baseline_finish) - _ts(row.baseline_start)))
+            else:
+                when = row.planned_finish or row.planned_start
+                if when is not None:
+                    mile_planned.append((_ts(when), index))
+                if row.baseline_finish is not None:
+                    mile_baseline.append((_ts(row.baseline_finish), index))
+                if row.actual_finish is not None:
+                    mile_actual.append((_ts(row.actual_finish), index))
+        if planned_y:
+            bars = pg.BarGraphItem(
+                x0=planned_x0, y=planned_y, height=0.32, width=planned_w,
+                brush=pg.mkBrush(_ACCENT), pen=pg.mkPen(_SURFACE))
+            self.plot.addItem(bars)
+            legend.addItem(bars, "Planned")
+        if baseline_y:
+            base_bars = pg.BarGraphItem(
+                x0=baseline_x0, y=baseline_y, height=0.32, width=baseline_w,
+                brush=pg.mkBrush(_INK_MUTED), pen=pg.mkPen(_SURFACE))
+            self.plot.addItem(base_bars)
+            legend.addItem(base_bars, "Baseline")
+        for points, name, color in (
+                (mile_planned, "Milestone (planned)", _ACCENT),
+                (mile_baseline, "Milestone (baseline)", _INK_MUTED),
+                (mile_actual, "Milestone (actual)", _ACCENT_WARM)):
+            if points:
+                scatter = pg.ScatterPlotItem(
+                    [x for x, _y in points], [y for _x, y in points],
+                    symbol="d", size=12, brush=pg.mkBrush(color),
+                    pen=pg.mkPen(_SURFACE))
+                self.plot.addItem(scatter)
+                legend.addItem(scatter, name)
+        axis = plot_item.getAxis("left")
+        axis.setTicks([[(index, _elide("  " * row.level + row.name, 36))
+                        for index, row in enumerate(shown)]])
+        plot_item.getViewBox().invertY(True)
+        plot_item.showGrid(x=True, y=False, alpha=0.15)
+        self._axis_label("bottom", "Date")
+        groups = sum(1 for row in rows if row.kind == "group")
+        milestones = len(rows) - groups
+        lines = ["%d group(s), %d milestone(s)." % (groups, milestones)]
+        if not any(row.baseline_start or row.baseline_finish for row in rows):
+            lines.append("No baseline set — use Baseline / actuals… to freeze "
+                         "one for the baseline columns.")
+        if len(rows) > len(shown):
+            lines.append("Chart shows the first %d rows; the table has all %d."
+                         % (len(shown), len(rows)))
+        self.summary.setText("\n".join(lines))
+        self._set_table(
+            ["Item", "Type", "Planned start", "Planned finish",
+             "Baseline start", "Baseline finish", "Actual start",
+             "Actual finish", "% complete"],
+            [["  " * row.level + row.name,
+              "Group" if row.kind == "group" else "Milestone",
+              _fmt_dt(row.planned_start), _fmt_dt(row.planned_finish),
+              _fmt_dt(row.baseline_start), _fmt_dt(row.baseline_finish),
+              _fmt_dt(row.actual_start), _fmt_dt(row.actual_finish),
+              _fmt(row.percent_complete)] for row in rows])
 
     # ----- exports ---------------------------------------------------------
 

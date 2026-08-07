@@ -361,8 +361,11 @@ class PlannerDock(QDockWidget):
             "rate. Task modes give every task (and idle gap) between schedule "
             "boundaries the same screen time, so short operations no longer "
             "flash past long transits — markers still move smoothly along their "
-            "routes within each task. Custom… sets an exact simulated-hours-per-"
-            "second rate.")
+            "routes within each task. With several vessels there is still one "
+            "shared clock (SIMOPS stay aligned): the boundaries of every vessel "
+            "combine, so a long task speeds up or slows down as another "
+            "vessel's tasks start and finish. Custom… sets an exact simulated-"
+            "hours-per-second rate.")
         settings = QSettings()
         try:
             self._custom_speed_hours = float(

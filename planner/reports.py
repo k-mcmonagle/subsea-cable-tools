@@ -44,6 +44,7 @@ class ReportRow:
     resource_name: str = ""
     is_phase: bool = False
     is_milestone: bool = False
+    outline_level: int = 0
     start: Optional[datetime] = None
     finish: Optional[datetime] = None
     duration_hours: float = 0.0
@@ -106,6 +107,7 @@ def build_dataset(rows: Sequence[Dict], schedule, fuel, specs: Sequence,
             resource_name=str(resource.get("name") or ""),
             is_phase=bool(spec.is_phase) if spec is not None else bool(row.get("is_phase")),
             is_milestone=bool(row.get("is_milestone")),
+            outline_level=int(row.get("outline_level") or 0),
             fuel_mode=str(row.get("fuel_mode") or ""),
             progress_status=str(row.get("progress_status") or "not_started"),
             percent_complete=_number(row.get("percent_complete")),
@@ -446,6 +448,76 @@ def s_curve(dataset: Sequence[ReportRow], now: Optional[datetime] = None,
             if result.planned_pct_now > 0.0:
                 result.spi = result.earned_pct_now / result.planned_pct_now
     return result
+
+
+@dataclass
+class KeyDateRow:
+    task_id: str
+    name: str
+    kind: str                    # "group" or "milestone"
+    level: int = 0
+    planned_start: Optional[datetime] = None
+    planned_finish: Optional[datetime] = None
+    baseline_start: Optional[datetime] = None
+    baseline_finish: Optional[datetime] = None
+    actual_start: Optional[datetime] = None
+    actual_finish: Optional[datetime] = None
+    percent_complete: float = 0.0
+    complete: bool = False
+
+
+def key_dates(dataset: Sequence[ReportRow]) -> List[KeyDateRow]:
+    """Task groups (summary rows) and milestones with their key dates.
+
+    Groups keep their scheduled/baseline spans. A group's actual start is its
+    earliest descendant's recorded start; its actual finish exists only once
+    every descendant task is complete (latest recorded finish). Percent
+    complete is the duration-weighted mean of descendants. Milestones carry
+    their own dates directly. Rows come back in plan order.
+    """
+    out = []
+    records = list(dataset)
+    for index, rec in enumerate(records):
+        if rec.is_phase:
+            children = []
+            for child in records[index + 1:]:
+                if child.outline_level <= rec.outline_level:
+                    break
+                if not child.is_phase:
+                    children.append(child)
+            row = KeyDateRow(
+                task_id=rec.task_id, name=rec.name or "Group", kind="group",
+                level=rec.outline_level,
+                planned_start=rec.start, planned_finish=rec.finish,
+                baseline_start=rec.baseline_start,
+                baseline_finish=rec.baseline_finish)
+            starts = [c.actual_start for c in children if c.actual_start is not None]
+            row.actual_start = min(starts) if starts else None
+            done = [c for c in children
+                    if c.progress_status == "completed" or c.percent_complete >= 100.0]
+            finishes = [c.actual_finish for c in done if c.actual_finish is not None]
+            if children and len(done) == len(children) and finishes:
+                row.actual_finish = max(finishes)
+                row.complete = True
+            total = sum(c.duration_hours for c in children if c.duration_hours > 0.0)
+            if total > 0.0:
+                row.percent_complete = sum(
+                    c.duration_hours * min(100.0, max(0.0, c.percent_complete))
+                    for c in children if c.duration_hours > 0.0) / total
+            out.append(row)
+        elif rec.is_milestone:
+            complete = (rec.progress_status == "completed"
+                        or rec.percent_complete >= 100.0)
+            out.append(KeyDateRow(
+                task_id=rec.task_id, name=rec.name or "Milestone",
+                kind="milestone", level=rec.outline_level,
+                planned_start=rec.start, planned_finish=rec.finish,
+                baseline_start=rec.baseline_start,
+                baseline_finish=rec.baseline_finish,
+                actual_start=rec.actual_start, actual_finish=rec.actual_finish,
+                percent_complete=min(100.0, max(0.0, rec.percent_complete)),
+                complete=complete))
+    return out
 
 
 @dataclass

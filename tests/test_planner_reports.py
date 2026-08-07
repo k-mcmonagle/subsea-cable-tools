@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 from ..planner.reports import (
     aggregate, build_dataset, cable_series, cumulative_cable_laid, fuel_series,
-    s_curve, variance_rows,
+    key_dates, s_curve, variance_rows,
 )
 from ..planner.timeline_engine import (
     TaskSpec, compute_cable, compute_fuel, compute_schedule,
@@ -172,6 +172,48 @@ def test_variance_rows():
     return _result("finish variance vs baseline, worst first", ok)
 
 
+def test_key_dates_groups_and_milestones():
+    specs = [
+        TaskSpec("g", 0, "Campaign", is_phase=True, outline_level=0),
+        TaskSpec("a", 1, "Lay", "v1", duration_hours=24.0, outline_level=1),
+        TaskSpec("b", 2, "Bury", "v1", duration_hours=12.0,
+                 predecessor_task_id="a", outline_level=1),
+        TaskSpec("m", 3, "Ready for service", "v1", duration_hours=0.0,
+                 predecessor_task_id="b", is_milestone=True, outline_level=0),
+    ]
+    schedule = compute_schedule(ANCHOR, specs)
+    rows = [
+        {"task_id": "g", "name": "Campaign", "outline_level": 0},
+        {"task_id": "a", "name": "Lay", "resource_id": "v1", "outline_level": 1,
+         "progress_status": "completed", "percent_complete": 100.0,
+         "actual_start_datetime": "2026-01-01T02:00",
+         "actual_finish_datetime": "2026-01-02T02:00"},
+        {"task_id": "b", "name": "Bury", "resource_id": "v1", "outline_level": 1,
+         "progress_status": "in_progress", "percent_complete": 50.0},
+        {"task_id": "m", "name": "Ready for service", "resource_id": "v1",
+         "is_milestone": 1, "outline_level": 0},
+    ]
+    baseline = {"tasks": [
+        {"task_id": "g", "start": "2026-01-01T00:00", "finish": "2026-01-02T00:00"},
+        {"task_id": "m", "start": "2026-01-02T00:00", "finish": "2026-01-02T00:00"},
+    ]}
+    dataset = build_dataset(rows, schedule, None, specs, [], baseline)
+    items = key_dates(dataset)
+    ok = [item.kind for item in items] == ["group", "milestone"]
+    group, milestone = items
+    ok = ok and group.planned_start == ANCHOR
+    ok = ok and group.planned_finish == ANCHOR + timedelta(hours=36)
+    ok = ok and group.baseline_finish == datetime(2026, 1, 2, 0, 0)
+    # Actual start rolls up; finish stays open while 'Bury' is in progress.
+    ok = ok and group.actual_start == datetime(2026, 1, 1, 2, 0)
+    ok = ok and group.actual_finish is None and not group.complete
+    ok = ok and abs(group.percent_complete
+                    - (24.0 * 100.0 + 12.0 * 50.0) / 36.0) < 1e-6
+    ok = ok and milestone.planned_finish == ANCHOR + timedelta(hours=36)
+    ok = ok and milestone.baseline_finish == datetime(2026, 1, 2, 0, 0)
+    return _result("key dates: group roll-up + milestone", ok)
+
+
 def test_empty_dataset_is_safe():
     empty = build_dataset([], None, None, [], [], None)
     curves = s_curve(empty, now=ANCHOR)
@@ -190,6 +232,7 @@ def run_all():
         test_cable_tracking_reports(),
         test_s_curve_cable_weighting(),
         test_variance_rows(),
+        test_key_dates_groups_and_milestones(),
         test_empty_dataset_is_safe(),
     ]
 

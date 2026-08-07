@@ -736,15 +736,36 @@ class TaskTableWidget(QTableWidget):
         if record_history:
             self.checkpoint()
         for task, reference in updates:
+            old_feature = (task.get("layer_source") or task.get("layer_id") or "",
+                           task.get("feature_id") or "")
             for key in LINK_KEYS:
                 task[key] = reference.get(key, "")
             # Optional location fields ride along when a caller shares an
             # explicit start/end/chainage position with other tasks.
-            for key in ("location_mode", "location_chainage_m"):
-                if key in reference:
-                    task[key] = reference[key]
-            if self.spatial_kind(task) == "line" and _float(task.get("speed_knots")) > 0:
-                task["duration_mode"] = "computed"
+            if "location_mode" in reference:
+                for key in ("location_mode", "location_chainage_m"):
+                    if key in reference:
+                        task[key] = reference[key]
+            else:
+                new_feature = (task.get("layer_source") or task.get("layer_id") or "",
+                               task.get("feature_id") or "")
+                if new_feature != old_feature:
+                    # A start/end/chainage pin refers to the previously linked
+                    # line (usually inherited from the row above); linking a
+                    # different feature means "use this one", so traverse it.
+                    task["location_mode"] = "feature"
+                    task["location_chainage_m"] = None
+            if self.spatial_kind(task) == "line":
+                if _float(task.get("speed_knots")) <= 0:
+                    # Inherited follow-on tasks blank their speed; a newly
+                    # linked route needs one, so seed the resource default.
+                    resource = next(
+                        (row for row in self.resources
+                         if row.get("resource_id") == task.get("resource_id")), {})
+                    task["speed_knots"] = _float(
+                        resource.get("default_speed_kn"), 0.0) or None
+                if _float(task.get("speed_knots")) > 0:
+                    task["duration_mode"] = "computed"
         self.resolver.clear_cache()
         self._rebuild()
         updated_ids = {task.get("task_id") for task, _reference in updates}
