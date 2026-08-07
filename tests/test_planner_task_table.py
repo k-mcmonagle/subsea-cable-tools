@@ -146,9 +146,50 @@ def test_optional_advanced_dialogs():
     return _result("optional advanced task and availability dialogs", ok)
 
 
+def test_duplicate_selected_block():
+    group = _row("g", "Campaign", 0)
+    group["outline_level"] = 0
+    first = _row("a", "Lay", 1)
+    first["outline_level"] = 1
+    first.update({
+        "geom_kind": "line", "progress_status": "completed",
+        "percent_complete": 100.0, "actual_finish_datetime": "2026-01-02T00:00",
+        "linked_ref_json": '{"owned_geometry":true,"source_kind":"sketch"}',
+    })
+    second = _row("b", "Bury", 2, "a")
+    second["outline_level"] = 1
+    table = TaskTableWidget(_Resolver())
+    table.set_plan([group, first, second],
+                   [{"resource_id": "v1", "name": "Vessel 1"}],
+                   datetime(2026, 1, 1))
+    table.selectRow(0)  # summary row; descendants come along automatically
+    table.duplicate_selected()
+    ok = len(table.rows) == 6
+    copies = table.rows[3:]
+    copy_ids = [row.get("task_id") for row in copies]
+    ok = ok and len(set(copy_ids) - {"g", "a", "b"}) == 3
+    copy_group, copy_first, copy_second = copies
+    ok = ok and copy_group.get("name") == "Campaign"
+    ok = ok and int(copy_group.get("outline_level") or 0) == 0
+    ok = ok and int(copy_first.get("outline_level") or 0) == 1
+    # Head chains after the last original task; in-block link is remapped.
+    ok = ok and copy_first.get("predecessor_task_id") == "b"
+    ok = ok and copy_second.get("predecessor_task_id") == copy_first.get("task_id")
+    # Actual progress does not survive duplication.
+    ok = ok and copy_first.get("progress_status") == "not_started"
+    ok = ok and float(copy_first.get("percent_complete") or 0.0) == 0.0
+    ok = ok and not copy_first.get("actual_finish_datetime")
+    # An owned sketch is shared, never cloned: the copy references task "a".
+    ok = ok and "owned_geometry" not in (copy_first.get("linked_ref_json") or "")
+    ok = ok and '"owner_task_id": "a"' in (copy_first.get("linked_ref_json") or "")
+    table.close()
+    return _result("duplicate group: fresh ids, chained heads, shared sketch", ok)
+
+
 def run_all():
     return [
         test_new_task_inherits_previous_context(), test_new_task_uses_previous_line_endpoint(),
         test_group_selected_tasks(), test_fuel_rob_label(),
         test_progress_update_appends_history(), test_optional_advanced_dialogs(),
+        test_duplicate_selected_block(),
     ]

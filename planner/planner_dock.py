@@ -294,6 +294,7 @@ class PlannerDock(QDockWidget):
         edit_btn = QPushButton("Edit / outline…")
         edit_menu = QMenu(edit_btn)
         for label, slot in (
+                ("Duplicate selected", lambda: self.task_table.duplicate_selected()),
                 ("Delete selected", lambda: self.task_table.delete_selected()),
                 ("Advanced settings for current task…", self._edit_current_advanced),
                 ("Update actual progress…", self._update_current_progress),

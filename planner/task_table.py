@@ -23,7 +23,7 @@ from ..qgis_compat import (
     qt_exec,
 )
 from . import operation_types, schema
-from .feature_ref import shared_owner_task_id
+from .feature_ref import shared_owner_task_id, shared_reference
 from .timeline_engine import (
     KNOT_M_PER_HOUR, TaskSpec, compute_cable, compute_fuel, compute_schedule,
     parse_speed_profile, profile_duration_hours, resolve_speed_profile,
@@ -630,6 +630,75 @@ class TaskTableWidget(QTableWidget):
         self._select_rows(range(insert_at, insert_at + len(moving)))
         self._emit_change()
 
+    def duplicate_selected(self):
+        """Duplicate the selected tasks (whole groups included) after the block.
+
+        Copies get fresh ids and cleared actual progress. Predecessor links
+        inside the block are remapped onto the copies; block "heads" (tasks
+        whose predecessor is outside the selection, or none) chain
+        finish-to-start after the last original task so the duplicate runs
+        after the original instead of piling on top of it. A task that owns
+        sketched geometry cannot be cloned outright — its copy shares the
+        original's geometry, so re-placing the original moves both.
+        """
+        indices = self.selected_row_indices()
+        if not indices and 0 <= self.currentRow() < len(self.rows):
+            indices = [self.currentRow()]
+        if not indices:
+            return
+        indices = self._include_summary_descendants(indices)
+        self.checkpoint()
+        now = schema.utc_now_iso()
+        block_ids = {str(self.rows[index].get("task_id") or "") for index in indices}
+        last_original_id = next(
+            (str(self.rows[index].get("task_id") or "")
+             for index in reversed(indices) if not self._is_summary(index)), "")
+        id_map = {}
+        copies = []
+        for index in indices:
+            source = self.rows[index]
+            source_id = str(source.get("task_id") or "")
+            copy = dict(source)
+            copy["task_id"] = schema.new_id()
+            id_map[source_id] = copy["task_id"]
+            copy["created_utc"] = now
+            copy["modified_utc"] = now
+            copy["progress_status"] = "not_started"
+            copy["percent_complete"] = 0.0
+            copy["actual_start_datetime"] = ""
+            copy["actual_finish_datetime"] = ""
+            copy["remaining_duration_hours"] = None
+            copy["progress_notes"] = ""
+            copy["actual_log_json"] = "[]"
+            copy["progress_updated_utc"] = ""
+            if self._owns_geometry(source):
+                copy.update(shared_reference(source, source_id))
+            copies.append((copy, self._is_summary(index)))
+        for copy, is_summary in copies:
+            if is_summary:
+                continue
+            predecessor = str(copy.get("predecessor_task_id") or "")
+            if predecessor in id_map:
+                copy["predecessor_task_id"] = id_map[predecessor]
+            elif last_original_id:
+                copy["predecessor_task_id"] = last_original_id
+        rows = [copy for copy, _is_summary in copies]
+        insert_at = indices[-1] + 1
+        self.rows = self.rows[:insert_at] + rows + self.rows[insert_at:]
+        self._normalise_outline()
+        self._renumber()
+        self._rebuild()
+        self._select_rows(range(insert_at, insert_at + len(rows)))
+        self._emit_change()
+
+    @staticmethod
+    def _owns_geometry(task):
+        try:
+            metadata = json.loads(str(task.get("linked_ref_json") or ""))
+        except (TypeError, ValueError):
+            return False
+        return bool(isinstance(metadata, dict) and metadata.get("owned_geometry"))
+
     def dropEvent(self, event):
         if event.source() is not self:
             super().dropEvent(event)
@@ -705,7 +774,12 @@ class TaskTableWidget(QTableWidget):
                  else Qt.ShiftModifier)
         key_z = Qt.Key.Key_Z if hasattr(Qt, "Key") else Qt.Key_Z
         key_y = Qt.Key.Key_Y if hasattr(Qt, "Key") else Qt.Key_Y
+        key_d = Qt.Key.Key_D if hasattr(Qt, "Key") else Qt.Key_D
         key_delete = Qt.Key.Key_Delete if hasattr(Qt, "Key") else Qt.Key_Delete
+        if event.modifiers() & control and event.key() == key_d:
+            self.duplicate_selected()
+            event.accept()
+            return
         if event.modifiers() & control and event.key() == key_z:
             self.redo() if event.modifiers() & shift else self.undo()
             event.accept()
@@ -1046,6 +1120,10 @@ class TaskTableWidget(QTableWidget):
         menu.addAction("Move up", lambda: self.move_selected(-1))
         menu.addAction("Move down", lambda: self.move_selected(1))
         menu.addSeparator()
+        duplicate = menu.addAction("Duplicate selected", self.duplicate_selected)
+        duplicate.setToolTip(
+            "Copy the selected tasks/groups after the selection (Ctrl+D). "
+            "Copies chain after the originals and share any sketched geometry.")
         menu.addAction("Delete selected", self.delete_selected)
         qt_exec(menu, event.globalPos())
 
