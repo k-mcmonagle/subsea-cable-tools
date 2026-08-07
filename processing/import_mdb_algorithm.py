@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import hashlib
+import time
 try:
     import pyodbc
 except Exception:  # pragma: no cover
@@ -25,7 +26,7 @@ from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
-    QgsProcessingParameterFile,
+    QgsProcessingParameterMultipleLayers,
     QgsProcessingParameterCrs,
     QgsProcessingOutputMultipleLayers,
     QgsVectorLayer,
@@ -35,9 +36,10 @@ from qgis.core import (
     QgsProcessingException,
     QgsCoordinateReferenceSystem,
     QgsProcessingContext,
-    QgsWkbTypes,
+    QgsProcessingUtils,
+    QgsVectorFileWriter,
 )
-from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_STRING, GEOMETRY_LINE, GEOMETRY_POINT, GEOMETRY_POLYGON
+from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_STRING
 
 
 ACCESS_ODBC_DRIVER_NAME = "Microsoft Access Driver (*.mdb, *.accdb)"
@@ -601,47 +603,79 @@ def is_closed(vertices, tol=1e-6):
     return abs(x0 - xn) <= tol and abs(y0 - yn) <= tol
 
 
-def _memory_uri_for_layer(source_layer, import_crs):
-    """Build a memory provider URI matching the source layer geometry as closely as practical."""
-    wkb_name = QgsWkbTypes.displayString(source_layer.wkbType())
-    if not wkb_name or wkb_name == "Unknown":
-        geom_type = source_layer.geometryType()
-        if geom_type == GEOMETRY_POINT:
-            wkb_name = "Point"
-        elif geom_type == GEOMETRY_LINE:
-            wkb_name = "LineString"
-        elif geom_type == GEOMETRY_POLYGON:
-            wkb_name = "Polygon"
-        else:
-            wkb_name = "None"
+class _MdbFieldValueConverter(QgsVectorFileWriter.FieldValueConverter):
+    def __init__(self, renamed_fields):
+        super().__init__()
+        self._renamed_fields = renamed_fields
 
-    if wkb_name == "None":
-        return "None"
+    def fieldDefinition(self, field):
+        output_field = QgsField(field)
+        output_field.setName(self._renamed_fields.get(field.name().casefold(), field.name()))
+        return output_field
 
-    return f"{wkb_name}?crs={import_crs.authid()}"
+    def convert(self, field_index, value):
+        return value
 
 
-def _clone_to_memory_layer(source_layer, layer_name, import_crs, feedback):
-    """Copy an OGR/temp layer into a true in-memory scratch layer."""
-    mem_uri = _memory_uri_for_layer(source_layer, import_crs)
-    mem_layer = QgsVectorLayer(mem_uri, layer_name, "memory")
-    if not mem_layer.isValid():
-        feedback.reportError(f"Could not create memory layer for {layer_name}")
+def _write_to_temporary_gpkg(source_layer, layer_name, import_crs, context, feedback):
+    """Stream a worker layer to an indexed, session-managed GeoPackage."""
+    if import_crs and import_crs.isValid():
+        source_layer.setCrs(import_crs)
+
+    gpkg_path = QgsProcessingUtils.generateTempFilename(
+        _safe_temp_stem(layer_name) + ".gpkg",
+        context,
+    )
+    storage_layer_name = _safe_temp_stem(layer_name)
+    options = QgsVectorFileWriter.SaveVectorOptions()
+    options.driverName = "GPKG"
+    options.layerName = storage_layer_name
+    source_fields = list(source_layer.fields())
+    source_field_names = {field.name().casefold() for field in source_fields}
+    reserved_names = {name for name in source_field_names if name != "fid"}
+    renamed_fields = {}
+    if "fid" in source_field_names:
+        candidate = "source_fid"
+        suffix = 2
+        while candidate.casefold() in reserved_names:
+            candidate = f"source_fid_{suffix}"
+            suffix += 1
+        renamed_fields["fid"] = candidate
+        reserved_names.add(candidate.casefold())
+
+    fid_name = "__subsea_fid"
+    suffix = 2
+    while fid_name.casefold() in source_field_names or fid_name.casefold() in reserved_names:
+        fid_name = f"__subsea_fid_{suffix}"
+        suffix += 1
+    field_converter = _MdbFieldValueConverter(renamed_fields)
+    options.fieldValueConverter = field_converter
+    options.layerOptions = ["SPATIAL_INDEX=YES", f"FID={fid_name}"]
+    if hasattr(options, "feedback"):
+        options.feedback = feedback
+
+    result = QgsVectorFileWriter.writeAsVectorFormatV3(
+        source_layer,
+        gpkg_path,
+        context.transformContext(),
+        options,
+    )
+    writer_error = result[0] if isinstance(result, tuple) else result
+    error_message = result[1] if isinstance(result, tuple) and len(result) > 1 else ""
+    error_scope = getattr(QgsVectorFileWriter, "WriterError", QgsVectorFileWriter)
+    if writer_error != getattr(error_scope, "NoError"):
+        feedback.reportError(f"Could not create disk-backed layer {layer_name}: {error_message}")
         return None
 
-    dp = mem_layer.dataProvider()
-    dp.addAttributes(list(source_layer.fields()))
-    mem_layer.updateFields()
-
-    features = [f for f in source_layer.getFeatures()]
-    if features:
-        dp.addFeatures(features)
-    mem_layer.updateExtents()
-
-    if import_crs and import_crs.isValid():
-        mem_layer.setCrs(import_crs)
-
-    return mem_layer
+    layer = QgsVectorLayer(
+        f"{gpkg_path}|layername={storage_layer_name}",
+        layer_name,
+        "ogr",
+    )
+    if not layer.isValid():
+        feedback.reportError(f"Could not open disk-backed layer {layer_name}")
+        return None
+    return layer
 
 
 class ImportMdbAlgorithm(QgsProcessingAlgorithm):
@@ -650,7 +684,11 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
     OUTPUT_LAYERS = 'OUTPUT_LAYERS'
 
     def initAlgorithm(self, config=None):
-        self.addParameter(QgsProcessingParameterFile(self.INPUT_MDB, self.tr('Input MDB File'), extension='mdb'))
+        self.addParameter(QgsProcessingParameterMultipleLayers(
+            self.INPUT_MDB,
+            self.tr('Input MDB File(s)'),
+            QgsProcessing.TypeFile,
+        ))
         self.addParameter(QgsProcessingParameterCrs(self.TARGET_CRS, self.tr('Coordinate System'), optional=False))
         self.addOutput(QgsProcessingOutputMultipleLayers(self.OUTPUT_LAYERS, self.tr('Imported Layers')))
 
@@ -681,20 +719,43 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
 
         cmd = [python_exe, '-u', worker_path] + args
         feedback.pushInfo('Running MDB worker: ' + ' '.join(cmd))
+        if feedback.isCanceled():
+            raise QgsProcessingException('MDB import canceled.')
         try:
-            completed = subprocess.run(  # nosec B603,B607 - trusted worker path, no shell, args passed as a list.
+            process = subprocess.Popen(  # nosec B603,B607 - trusted worker path, no shell, args passed as a list.
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
             )
+            deadline = None if not timeout else time.monotonic() + timeout
+            while process.poll() is None:
+                if feedback.isCanceled():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    process.communicate()
+                    raise QgsProcessingException('MDB import canceled.')
+                if deadline is not None and time.monotonic() >= deadline:
+                    process.kill()
+                    process.communicate()
+                    raise QgsProcessingException(f'MDB worker timed out after {timeout} seconds.')
+                try:
+                    process.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    pass
+            stdout, stderr = process.communicate()
         except Exception as e:
+            if isinstance(e, QgsProcessingException):
+                raise
             raise QgsProcessingException(f'Failed to run MDB worker: {e}')
 
-        if completed.returncode != 0:
+        if process.returncode != 0:
             # Worker writes JSON to stderr on error.
-            err = (completed.stderr or '').strip()
+            err = (stderr or '').strip()
             try:
                 err_obj = json.loads(err) if err else None
             except Exception:
@@ -707,18 +768,28 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
                     feedback.reportError(tb)
                 raise QgsProcessingException(msg)
 
-            msg = (completed.stderr or completed.stdout or '').strip()
+            msg = (stderr or stdout or '').strip()
             if not msg:
                 msg = (
-                    f"MDB worker failed with exit code {completed.returncode}. "
+                    f"MDB worker failed with exit code {process.returncode}. "
                     "This often indicates a native ODBC/Access driver crash or bitness mismatch."
                 )
             raise QgsProcessingException(msg)
 
-        out = (completed.stdout or '').strip()
+        out = (stdout or '').strip()
         if not out:
             return None
         return json.loads(out)
+
+    @staticmethod
+    def _register_output_layer(context, layer, layer_name, group_name):
+        layer.setName(layer_name)
+        context.temporaryLayerStore().addMapLayer(layer)
+        details = QgsProcessingContext.LayerDetails(layer_name, context.project())
+        details.forceName = True
+        if hasattr(details, 'groupName'):
+            details.groupName = group_name
+        context.addLayerToLoadOnCompletion(layer.id(), details)
 
     def processAlgorithm(self, parameters, context, feedback):
         # The bundled pure-Python reader works on any platform; only fall back
@@ -733,11 +804,35 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
                 "Access Database Engine ODBC driver."
             )
 
-        mdb_file = self.parameterAsFile(parameters, self.INPUT_MDB, context)
+        mdb_files = self.parameterAsFileList(parameters, self.INPUT_MDB, context)
         target_crs = self.parameterAsCrs(parameters, self.TARGET_CRS, context)
-        # NOTE: MDB import runs in a subprocess by default to avoid silent QGIS crashes
-        # caused by native ODBC driver issues. Advanced/debug options are available via
-        # environment variables (keeps the Processing UI simple).
+        if not target_crs or not target_crs.isValid():
+            raise QgsProcessingException("No valid CRS provided. Set a Target CRS.")
+
+        normalized_files = []
+        seen_paths = set()
+        for mdb_file in mdb_files:
+            normalized = os.path.abspath(os.path.normpath(os.fspath(mdb_file)))
+            normalized_key = os.path.normcase(normalized)
+            if normalized_key in seen_paths:
+                continue
+            seen_paths.add(normalized_key)
+            if not os.path.isfile(normalized):
+                raise QgsProcessingException(f"MDB file not found: {normalized}")
+            if os.path.splitext(normalized)[1].lower() not in {'.mdb', '.accdb'}:
+                raise QgsProcessingException(f"Input must be a .mdb or .accdb file: {normalized}")
+            normalized_files.append(normalized)
+
+        if not normalized_files:
+            raise QgsProcessingException("Select at least one MDB or ACCDB file.")
+
+        total_input_bytes = sum(os.path.getsize(path) for path in normalized_files)
+        feedback.pushInfo(
+            f"Selected {len(normalized_files)} database(s), "
+            f"{total_input_bytes / (1024 * 1024):.1f} MB total. "
+            "Outputs are stored as disk-backed temporary GeoPackages to limit RAM use."
+        )
+
         isolate = os.environ.get('SUBSEA_MDB_NO_SUBPROCESS', '0') not in {'1', 'true', 'True'}
         keep_temp = os.environ.get('SUBSEA_MDB_KEEP_TEMP', '0') in {'1', 'true', 'True'}
         load_all_geoms = os.environ.get('SUBSEA_MDB_LOAD_ALL_GEOMS', '0') in {'1', 'true', 'True'}
@@ -747,18 +842,86 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
         except Exception:
             max_features = 0
 
-        if not mdb_file or not os.path.exists(mdb_file):
-            raise QgsProcessingException("Invalid MDB file selected.")
+        output_layers = {}
+        failures = []
+        for file_index, mdb_file in enumerate(normalized_files, start=1):
+            if feedback.isCanceled():
+                raise QgsProcessingException("MDB import canceled.")
+            file_label = os.path.basename(mdb_file)
+            feedback.setProgress(int((file_index - 1) * 100 / len(normalized_files)))
+            feedback.setProgressText(
+                f"Importing database {file_index} of {len(normalized_files)}: {file_label}"
+            )
+            feedback.pushInfo(f"Importing MDB {file_index} of {len(normalized_files)}: {file_label}")
+            try:
+                file_outputs = self._process_mdb_file(
+                    mdb_file,
+                    target_crs,
+                    context,
+                    feedback,
+                    isolate=isolate,
+                    keep_temp=keep_temp,
+                    load_all_geoms=load_all_geoms,
+                    max_features=max_features,
+                )
+            except QgsProcessingException as exc:
+                if feedback.isCanceled():
+                    raise QgsProcessingException("MDB import canceled.")
+                failures.append(f"{file_label}: {exc}")
+                feedback.reportError(failures[-1])
+                continue
+            output_layers.update(file_outputs)
+            feedback.setProgress(int(file_index * 100 / len(normalized_files)))
 
-        ext = os.path.splitext(mdb_file)[1].lower()
-        if ext not in {'.mdb', '.accdb'}:
-            raise QgsProcessingException("Input must be a .mdb or .accdb file.")
+        if not output_layers:
+            detail = "; ".join(failures)
+            message = "No valid layers were imported from the selected MDB files."
+            raise QgsProcessingException(f"{message} {detail}" if detail else message)
+
+        if failures:
+            feedback.reportError(
+                f"Imported {len(normalized_files) - len(failures)} of {len(normalized_files)} MDB files."
+            )
+
+        feedback.setProgress(100)
+        return {self.OUTPUT_LAYERS: output_layers}
+
+    def _process_mdb_file(
+        self,
+        mdb_file,
+        target_crs,
+        context,
+        feedback,
+        isolate,
+        keep_temp,
+        load_all_geoms,
+        max_features,
+    ):
+        file_name = os.path.basename(mdb_file)
+        file_ref = os.path.splitext(file_name)[0]
+        output_namespace = os.path.normcase(os.path.abspath(mdb_file))
+
+        temp_root = QgsProcessingUtils.tempFolder(context)
+        free_bytes = shutil.disk_usage(temp_root).free
+        required_bytes = max(512 * 1024 * 1024, os.path.getsize(mdb_file) * 4)
+        if free_bytes < required_bytes:
+            raise QgsProcessingException(
+                f"Insufficient temporary disk space for {file_name}: "
+                f"{free_bytes / (1024 ** 3):.1f} GB free, approximately "
+                f"{required_bytes / (1024 ** 3):.1f} GB required. "
+                "Free space or set a different Processing temporary folder."
+            )
 
         temp_dir = ''
         if isolate:
             # In isolate mode we intentionally avoid touching ODBC in-process.
-            temp_dir = tempfile.mkdtemp(prefix='subsea_mdb_')
-            feedback.pushInfo(f'Using temp dir: {temp_dir}')
+            if keep_temp:
+                temp_dir = tempfile.mkdtemp(prefix='subsea_mdb_')
+                feedback.pushInfo(f'Keeping worker files in: {temp_dir}')
+            else:
+                temp_marker = QgsProcessingUtils.generateTempFilename('mdb_worker', context)
+                temp_dir = os.path.dirname(temp_marker)
+                feedback.pushInfo(f'Using managed temp dir: {temp_dir}')
 
             tables = self._run_worker(['--mode', 'list', '--mdb', mdb_file], feedback)
             if not tables:
@@ -781,7 +944,16 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException("No feature tables found in the MDB.")
 
         output_layers = {}
-        for table_name, (geom_field_name, geometry_type_code) in feature_tables.items():
+        table_count = len(feature_tables)
+        for table_index, (table_name, (geom_field_name, geometry_type_code)) in enumerate(
+            feature_tables.items(),
+            start=1,
+        ):
+            if feedback.isCanceled():
+                raise QgsProcessingException("MDB import canceled.")
+            feedback.setProgressText(
+                f"{file_name}: table {table_index} of {table_count} - {table_name}"
+            )
             feedback.pushInfo(f"Processing table: {table_name}")
             if target_crs and target_crs.isValid():
                 import_crs = target_crs
@@ -826,19 +998,26 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
                             continue
                         if not path or not os.path.exists(path):
                             continue
-                        layer_name = table_name
+                        table_label = table_name
+                        if len(outputs) > 1:
+                            table_label = f"{table_name} ({geom_type_name})"
+                        layer_name = f"{file_ref} - {table_label}"
                         src_layer = QgsVectorLayer(path, layer_name, 'ogr')
                         if not src_layer.isValid():
                             feedback.reportError(f'Skipping {layer_name}: output layer invalid')
                             continue
-                        layer = _clone_to_memory_layer(src_layer, layer_name, import_crs, feedback)
+                        layer = _write_to_temporary_gpkg(
+                            src_layer,
+                            layer_name,
+                            import_crs,
+                            context,
+                            feedback,
+                        )
                         if layer is None:
                             continue
 
-                        context.temporaryLayerStore().addMapLayer(layer)
-                        details = QgsProcessingContext.LayerDetails(layer_name, context.project())
-                        context.addLayerToLoadOnCompletion(layer.id(), details)
-                        output_layers[f"{table_name}::{geom_type_name}"] = layer.id()
+                        self._register_output_layer(context, layer, layer_name, file_name)
+                        output_layers[f"{output_namespace}::{table_name}::{geom_type_name}"] = layer.id()
                 else:
                     # Non-split mode: expect a single GeoJSON at out_base + '.geojson'
                     out_geojson = out_base + '.geojson'
@@ -846,18 +1025,23 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
                         feedback.reportError(f'Skipping table {table_name}: worker produced no output file')
                         continue
 
-                    src_layer = QgsVectorLayer(out_geojson, table_name, 'ogr')
+                    layer_name = f"{file_ref} - {table_name}"
+                    src_layer = QgsVectorLayer(out_geojson, layer_name, 'ogr')
                     if not src_layer.isValid():
                         feedback.reportError(f'Skipping table {table_name}: output layer invalid')
                         continue
-                    layer = _clone_to_memory_layer(src_layer, table_name, import_crs, feedback)
+                    layer = _write_to_temporary_gpkg(
+                        src_layer,
+                        layer_name,
+                        import_crs,
+                        context,
+                        feedback,
+                    )
                     if layer is None:
                         continue
 
-                    context.temporaryLayerStore().addMapLayer(layer)
-                    details = QgsProcessingContext.LayerDetails(table_name, context.project())
-                    context.addLayerToLoadOnCompletion(layer.id(), details)
-                    output_layers[table_name] = layer.id()
+                    self._register_output_layer(context, layer, layer_name, file_name)
+                    output_layers[f"{output_namespace}::{table_name}"] = layer.id()
                 continue
             else:
                 mem_layer, error = import_table_as_memory_layer(
@@ -874,10 +1058,9 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
 
                 # IMPORTANT: Do NOT add layers directly to QgsProject from a processing algorithm.
                 # Algorithms may run in a background thread and direct project mutations can crash QGIS.
-                context.temporaryLayerStore().addMapLayer(mem_layer)
-                details = QgsProcessingContext.LayerDetails(table_name, context.project())
-                context.addLayerToLoadOnCompletion(mem_layer.id(), details)
-                output_layers[table_name] = mem_layer.id()
+                layer_name = f"{file_ref} - {table_name}"
+                self._register_output_layer(context, mem_layer, layer_name, file_name)
+                output_layers[f"{output_namespace}::{table_name}"] = mem_layer.id()
 
         if isolate and temp_dir and not keep_temp:
             try:
@@ -897,7 +1080,7 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
         if not output_layers:
             raise QgsProcessingException("No valid layers were imported from the MDB.")
 
-        return {self.OUTPUT_LAYERS: output_layers}
+        return output_layers
 
     def name(self):
         return 'import_mdb'
@@ -920,7 +1103,7 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
     def shortHelpString(self):
         return self.tr("""<h3>Import MDB (Experimental)</h3>
 <p><b><font color="red">Warning:</font> This tool is experimental and may not work with all GeoMedia-formatted MDB files. Use with caution.</b></p>
-<p>This tool imports feature tables from a Microsoft Access Database (.mdb) file, typically created by Intergraph GeoMedia, into QGIS as new memory layers. It is not limited to bathymetry &ndash; any GeoMedia feature class (contours, seabed classifications, survey points, infrastructure polygons, etc.) can be loaded.</p>
+<p>This tool imports feature tables from one or more Microsoft Access Database (.mdb or .accdb) files, typically created by Intergraph GeoMedia, into QGIS as new temporary layers. It is not limited to bathymetry &ndash; any GeoMedia feature class (contours, seabed classifications, survey points, infrastructure polygons, etc.) can be loaded.</p>
 
 <h4>How it Works</h4>
 <p>The tool connects to the MDB file and looks for a <code>GFeatures</code> table to identify the feature classes within the database. For each feature class found, it reads the geometry from a binary (BLOB) field and creates a corresponding QGIS layer.</p>
@@ -928,31 +1111,32 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
 <p>It automatically adds two fields to each new layer:
 <ul>
   <li><b>depth:</b> The average Z-value of the feature's vertices, if available (useful for bathymetric data; will be empty/zero for non-3D features).</li>
-  <li><b>source:</b> The filename of the source MDB file for traceability.</li>
+    <li><b>source:</b> The filename of the source MDB file for per-feature traceability.</li>
 </ul>
 </p>
 
 <h4>Prerequisites</h4>
 <p><b>None for typical files:</b> the plugin bundles a pure-Python MDB reader, so the tool works out of the box on Windows, macOS, and Linux &mdash; no Microsoft Access Database Engine, ODBC driver, or pyodbc installation is needed.</p>
 <p>If the bundled reader cannot handle a particular file (for example a password-protected or unusual Jet variant), the tool automatically falls back to ODBC, which requires Windows with the <b>Microsoft Access Database Engine</b> driver and <code>pyodbc</code> installed in the QGIS Python environment.</p>
-<p><b>Stability note:</b> The MDB is read in a separate subprocess and the exported layers are then loaded into QGIS. This contains any native ODBC driver crashes (fallback path) and caps memory use on very large files.</p>
+<p><b>Stability note:</b> Each MDB is read sequentially in a separate, cancellable subprocess. Results are converted to indexed, disk-backed temporary GeoPackages instead of being copied into RAM. Progress shows the current database and table. Large batches can still take time and require temporary disk space; the tool checks for practical free-space headroom before each file.</p>
 
 <h4>Input Parameters</h4>
 <ul>
-  <li><b>Input MDB File:</b> The GeoMedia MDB file you want to import.</li>
+    <li><b>Input MDB File(s):</b> Add one or more GeoMedia MDB/ACCDB files. The picker supports selecting several files at once.</li>
   <li><b>Coordinate System:</b> You <b>must</b> manually select the Coordinate Reference System (CRS) of the data in the MDB file. The tool cannot automatically detect it. Providing the wrong CRS will result in misplaced data.</li>
 </ul>
 
 <h4>Outputs</h4>
 <ul>
-  <li><b>Imported Layers:</b> The tool will create a new layer for each feature table and geometry type successfully imported from the MDB. For example, a table containing both line and polygon features will produce separate layers. Layers are added directly to your QGIS project.</li>
+    <li><b>Imported Layers:</b> The tool creates an indexed temporary GeoPackage layer for each feature table and geometry type successfully imported. Layer names are prefixed with the source file reference, and on QGIS 3.32 or newer each file's layers are placed in a group named after that file. For example, a table containing both line and polygon features will produce separate layers.</li>
 </ul>
 
 <h4>Known Limitations & Troubleshooting</h4>
 <ul>
   <li><b>BLOB Format:</b> The tool is designed to parse a specific binary format for geometry. If your MDB uses a different format, the import will fail.</li>
   <li><b>Metadata Tables:</b> It relies on specific system tables like <code>GFeatures</code>, <code>FieldLookup</code>, and <code>AttributeProperties</code>. If these are missing or have an unexpected structure, the tool will not work.</li>
-  <li><b>Errors:</b> If a table fails to import, a message will be shown in the Log Messages Panel. Check the log for details about ODBC errors or parsing failures.</li>
+    <li><b>Large batches:</b> Temporary GeoPackages remain available for the QGIS session. If space is limited, change the temporary folder under Processing settings to a drive with more free space. Canceling Processing terminates the active MDB worker.</li>
+    <li><b>Errors:</b> If a table or file fails to import, a message will be shown in the Log Messages Panel. Other selected files continue importing where possible. Check the log for details about ODBC errors or parsing failures.</li>
   <li><b>Advanced options (env vars):</b>
     <ul>
       <li><code>SUBSEA_MDB_KEEP_TEMP=1</code> &ndash; keeps intermediate GeoJSONs for debugging</li>
