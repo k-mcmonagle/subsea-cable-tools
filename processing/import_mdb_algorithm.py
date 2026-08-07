@@ -36,10 +36,15 @@ from qgis.core import (
     QgsProcessingException,
     QgsCoordinateReferenceSystem,
     QgsProcessingContext,
-    QgsProcessingUtils,
     QgsVectorFileWriter,
 )
-from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_STRING
+from ..qgis_compat import (
+    FIELD_TYPE_DOUBLE,
+    FIELD_TYPE_INT,
+    FIELD_TYPE_STRING,
+    processing_generate_temp_filename,
+    processing_temp_folder,
+)
 
 
 ACCESS_ODBC_DRIVER_NAME = "Microsoft Access Driver (*.mdb, *.accdb)"
@@ -622,7 +627,7 @@ def _write_to_temporary_gpkg(source_layer, layer_name, import_crs, context, feed
     if import_crs and import_crs.isValid():
         source_layer.setCrs(import_crs)
 
-    gpkg_path = QgsProcessingUtils.generateTempFilename(
+    gpkg_path = processing_generate_temp_filename(
         _safe_temp_stem(layer_name) + ".gpkg",
         context,
     )
@@ -864,7 +869,7 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
                     load_all_geoms=load_all_geoms,
                     max_features=max_features,
                 )
-            except QgsProcessingException as exc:
+            except Exception as exc:  # noqa: BLE001 - one bad file must not kill the batch
                 if feedback.isCanceled():
                     raise QgsProcessingException("MDB import canceled.")
                 failures.append(f"{file_label}: {exc}")
@@ -901,7 +906,7 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
         file_ref = os.path.splitext(file_name)[0]
         output_namespace = os.path.normcase(os.path.abspath(mdb_file))
 
-        temp_root = QgsProcessingUtils.tempFolder(context)
+        temp_root = processing_temp_folder(context)
         free_bytes = shutil.disk_usage(temp_root).free
         required_bytes = max(512 * 1024 * 1024, os.path.getsize(mdb_file) * 4)
         if free_bytes < required_bytes:
@@ -919,7 +924,7 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
                 temp_dir = tempfile.mkdtemp(prefix='subsea_mdb_')
                 feedback.pushInfo(f'Keeping worker files in: {temp_dir}')
             else:
-                temp_marker = QgsProcessingUtils.generateTempFilename('mdb_worker', context)
+                temp_marker = processing_generate_temp_filename('mdb_worker', context)
                 temp_dir = os.path.dirname(temp_marker)
                 feedback.pushInfo(f'Using managed temp dir: {temp_dir}')
 

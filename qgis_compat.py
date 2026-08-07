@@ -283,3 +283,36 @@ def get_event_global_pos(event):
     else:
         # Fallback for QGIS 4 - use current cursor position
         return QCursor.pos()
+
+
+def processing_temp_folder(context=None):
+    """QgsProcessingUtils.tempFolder with the QGIS 3.32+ context overload.
+
+    QGIS 3.32 added an optional QgsProcessingContext argument so temporary
+    files are tracked (and cleaned) per processing run; earlier releases only
+    accept the no-argument form. Falls back gracefully so callers can always
+    pass their context.
+    """
+    from qgis.core import QgsProcessingUtils
+
+    if context is not None:
+        try:
+            return QgsProcessingUtils.tempFolder(context)
+        except TypeError:
+            pass
+    return QgsProcessingUtils.tempFolder()
+
+
+def processing_generate_temp_filename(basename, context=None):
+    """QgsProcessingUtils.generateTempFilename with the 3.32+ context overload.
+
+    See processing_temp_folder for the version background.
+    """
+    from qgis.core import QgsProcessingUtils
+
+    if context is not None:
+        try:
+            return QgsProcessingUtils.generateTempFilename(basename, context)
+        except TypeError:
+            pass
+    return QgsProcessingUtils.generateTempFilename(basename)
