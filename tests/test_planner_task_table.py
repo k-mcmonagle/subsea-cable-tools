@@ -186,10 +186,40 @@ def test_duplicate_selected_block():
     return _result("duplicate group: fresh ids, chained heads, shared sketch", ok)
 
 
+def test_drag_edge_autoscroll():
+    table = TaskTableWidget(_Resolver())
+    rows = [_row("t%d" % index, "Task %d" % index, index) for index in range(60)]
+    table.set_plan(rows, [{"resource_id": "v1", "name": "Vessel 1"}],
+                   datetime(2026, 1, 1))
+    table.resize(500, 240)
+    bar = table.verticalScrollBar()
+    bar.setValue(30)
+    # Hovering a drag near the top edge starts upward scrolling...
+    table._update_drag_scroll(2)
+    ok = table._drag_scroll_speed < 0 and table._drag_scroll_timer.isActive()
+    table._drag_scroll_tick()
+    ok = ok and bar.value() < 30
+    # ...near the bottom edge scrolls down, faster than one row per tick.
+    height = table.viewport().height()
+    table._update_drag_scroll(height - 1)
+    ok = ok and table._drag_scroll_speed > 1
+    before = bar.value()
+    table._drag_scroll_tick()
+    # An unshown table may not have a scroll range yet; only assert movement
+    # when the bar can actually move.
+    ok = ok and (bar.maximum() == 0 or bar.value() > before)
+    # In the middle of the viewport the timer stops.
+    table._update_drag_scroll(height // 2)
+    ok = ok and table._drag_scroll_speed == 0
+    ok = ok and not table._drag_scroll_timer.isActive()
+    table.close()
+    return _result("drag hover near an edge auto-scrolls the task list", ok)
+
+
 def run_all():
     return [
         test_new_task_inherits_previous_context(), test_new_task_uses_previous_line_endpoint(),
         test_group_selected_tasks(), test_fuel_rob_label(),
         test_progress_update_appends_history(), test_optional_advanced_dialogs(),
-        test_duplicate_selected_block(),
+        test_duplicate_selected_block(), test_drag_edge_autoscroll(),
     ]

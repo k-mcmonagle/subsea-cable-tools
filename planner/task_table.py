@@ -8,7 +8,7 @@ from datetime import datetime
 import json
 import re
 
-from qgis.PyQt.QtCore import QSettings, Qt, pyqtSignal
+from qgis.PyQt.QtCore import QSettings, Qt, QTimer, pyqtSignal
 from qgis.PyQt.QtGui import QBrush, QColor, QIcon, QPixmap
 from qgis.PyQt.QtWidgets import (
     QComboBox, QMenu, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
@@ -194,6 +194,14 @@ class TaskTableWidget(QTableWidget):
         self.setDragDropOverwriteMode(False)
         self.setDragDropMode(DRAG_DROP_MODE_INTERNAL_MOVE)
         self.setDefaultDropAction(DROP_ACTION_MOVE)
+        # Qt's built-in drag auto-scroll is a thin band that only advances
+        # while the mouse moves; this timer keeps scrolling while a drag
+        # simply hovers near the top/bottom edge, so off-screen drop targets
+        # are reachable (speed grows toward the edge).
+        self._drag_scroll_speed = 0
+        self._drag_scroll_timer = QTimer(self)
+        self._drag_scroll_timer.setInterval(40)
+        self._drag_scroll_timer.timeout.connect(self._drag_scroll_tick)
         self.setColumnWidth(self.COL_TASK, 160)
         self.setColumnWidth(self.COL_DESCRIPTION, 200)
         self.setColumnWidth(self.COL_FEATURE, 180)
@@ -699,7 +707,46 @@ class TaskTableWidget(QTableWidget):
             return False
         return bool(isinstance(metadata, dict) and metadata.get("owned_geometry"))
 
+    def dragMoveEvent(self, event):
+        super().dragMoveEvent(event)
+        position = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        self._update_drag_scroll(position.y())
+
+    def dragLeaveEvent(self, event):
+        self._stop_drag_scroll()
+        super().dragLeaveEvent(event)
+
+    def _update_drag_scroll(self, y):
+        """Start/adjust edge auto-scroll for a drag hovering at ``y`` (viewport px)."""
+        height = self.viewport().height()
+        margin = min(36, max(12, height // 3))
+        if y < margin:
+            self._drag_scroll_speed = -1 - min(3, (margin - y) // 12)
+        elif y > height - margin:
+            self._drag_scroll_speed = 1 + min(3, (y - (height - margin)) // 12)
+        else:
+            self._stop_drag_scroll()
+            return
+        if not self._drag_scroll_timer.isActive():
+            self._drag_scroll_timer.start()
+
+    def _drag_scroll_tick(self):
+        if not self._drag_scroll_speed:
+            self._stop_drag_scroll()
+            return
+        # Scroll-per-item: value is in rows, so speed is rows per tick.
+        # Clamping at either end is harmless; the timer keeps running in
+        # case the user drags back toward the other edge.
+        bar = self.verticalScrollBar()
+        bar.setValue(bar.value() + self._drag_scroll_speed)
+
+    def _stop_drag_scroll(self):
+        self._drag_scroll_speed = 0
+        if self._drag_scroll_timer.isActive():
+            self._drag_scroll_timer.stop()
+
     def dropEvent(self, event):
+        self._stop_drag_scroll()
         if event.source() is not self:
             super().dropEvent(event)
             return
