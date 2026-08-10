@@ -404,7 +404,7 @@ class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
         return "register_rpl"
 
     def displayName(self):
-        return self.tr("Register RPL Revision into Workbench")
+        return self.tr("Add RPL Layers to Workbench")
 
     def group(self):
         return self.tr("RPL Tools")
@@ -415,7 +415,7 @@ class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
     def shortHelpString(self):
         return self.tr(
             """
-Registers an RPL point + line layer pair (for example the output of Import Excel RPL) into the Cable Route Workbench GeoPackage, making it a managed RPL entity.
+Adds an RPL point + line layer pair already loaded in the project (for example the output of Import Excel RPL) to the Cable Route Workbench, making it a managed segment revision. To import straight from a workbook/CSV instead, use the "Import RPL..." wizard in the Workbench or the "Import RPL to Workbench (auto-detect)" tool.
 
 - Validates that the layers pair up (n points = n segments + 1, FromPos/ToPos chain).
 - Derives per-segment Slack (%) from CableDistBetweenPos / DistBetweenPos where missing.

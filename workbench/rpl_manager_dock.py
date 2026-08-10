@@ -148,9 +148,10 @@ class RplManagerPanel(QWidget):
         )
         import_btn.clicked.connect(self._run_import_wizard)
         row1.addWidget(import_btn)
-        register_btn = QPushButton("Register revision...")
+        register_btn = QPushButton("Add from layers...")
         register_btn.setToolTip(
-            "Register an imported RPL point + line layer pair as a segment revision"
+            "Add an RPL point + line layer pair already loaded in the project "
+            "to the workbench as a segment revision"
         )
         register_btn.clicked.connect(self._run_register_algorithm)
         refresh_btn = QPushButton("Refresh")
@@ -691,7 +692,7 @@ class RplManagerPanel(QWidget):
             self.refresh_rpl_list()
             self.rpls_changed.emit()
         except Exception as exc:
-            QMessageBox.warning(self, "Register RPL", f"Could not open the algorithm dialog:\n{exc}")
+            QMessageBox.warning(self, "Add RPL from layers", f"Could not open the algorithm dialog:\n{exc}")
 
     def _on_slack_mode_changed(self):
         # mode changes only affect what future edits preserve; persist on save

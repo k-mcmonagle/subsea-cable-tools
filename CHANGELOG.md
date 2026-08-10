@@ -58,6 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **"Register RPL revision" renamed to "Add RPL from layers":** the Workbench menus, RPL Manager button, and the Processing tool display name (now *Add RPL Layers to Workbench*) drop the "register" jargon — the action takes an RPL point + line layer pair already loaded in the project and adds it to the Workbench as a segment revision, alongside the file-based *Import RPL…* wizard. The Processing algorithm ID stays `register_rpl`, so existing models and scripts are unaffected.
 - **Project-level resources:** vessels/resources now belong to the project planner file rather than a single scenario — every scenario shares one resource list, duplicating a scenario reuses it, and deleting a scenario keeps it. Planner schema v5 migrates existing files by merging identical per-scenario copies (the common default-vessel case) and remapping tasks onto the survivor; per-scenario copies that differ in any schedule-affecting way are kept side by side so no timing changes silently.
 - **Task-table column usability:** columns default to content-based widths, can be drag-reordered, and a right-click on the header shows/hides non-essential columns (plus "Size columns to contents" and "Reset column layout"). Widths, order, and hidden columns persist per user; the Resources and Standard-tasks dialogs also size to contents and allow reordering.
 

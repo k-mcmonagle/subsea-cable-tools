@@ -87,7 +87,7 @@ class WorkbenchDock(QDockWidget):
         new_menu.addAction("New system...", self._new_system)
         new_menu.addAction("New segment...", self._new_route)
         new_menu.addAction("Import RPL...", self._import_rpl)
-        new_menu.addAction("Register RPL revision...", self._register_rpl)
+        new_menu.addAction("Add RPL from layers...", self._register_rpl)
         new_menu.addAction("New assembly...", self._new_assembly)
         new_menu.addAction("New assessment...", self._new_assessment)
         new_btn.setMenu(new_menu)
@@ -483,7 +483,7 @@ class WorkbenchDock(QDockWidget):
             menu.addAction("New system...", self._new_system)
             menu.addAction("New segment...", self._new_route)
             menu.addAction("Import RPL...", self._import_rpl)
-            menu.addAction("Register RPL revision...", self._register_rpl)
+            menu.addAction("Add RPL from layers...", self._register_rpl)
         elif ref[0] == KIND_GROUP and ref[1] == GROUP_LIBRARY:
             menu.addAction("New assembly...", self._new_assembly)
         elif ref[0] == KIND_SYSTEM:
@@ -492,7 +492,7 @@ class WorkbenchDock(QDockWidget):
         elif ref[0] == KIND_ROUTE:
             menu.addAction("New RPL revision...", self._new_rpl_revision)
             menu.addAction("Import RPL...", self._import_rpl)
-            menu.addAction("Register RPL revision...", self._register_rpl)
+            menu.addAction("Add RPL from layers...", self._register_rpl)
             menu.addAction("Fit assembly...", self._fit_selected_rpl)
             menu.addAction("New assessment...", self._new_assessment)
             self._add_assign_system_menu(menu)
