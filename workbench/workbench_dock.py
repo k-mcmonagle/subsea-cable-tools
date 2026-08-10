@@ -86,6 +86,7 @@ class WorkbenchDock(QDockWidget):
         new_menu = QMenu(new_btn)
         new_menu.addAction("New system...", self._new_system)
         new_menu.addAction("New segment...", self._new_route)
+        new_menu.addAction("Import RPL...", self._import_rpl)
         new_menu.addAction("Register RPL revision...", self._register_rpl)
         new_menu.addAction("New assembly...", self._new_assembly)
         new_menu.addAction("New assessment...", self._new_assessment)
@@ -477,9 +478,11 @@ class WorkbenchDock(QDockWidget):
         if not ref:
             menu.addAction("New system...", self._new_system)
             menu.addAction("New segment...", self._new_route)
+            menu.addAction("Import RPL...", self._import_rpl)
         elif ref[0] == KIND_GROUP and ref[1] == GROUP_UNASSIGNED_SEGMENTS:
             menu.addAction("New system...", self._new_system)
             menu.addAction("New segment...", self._new_route)
+            menu.addAction("Import RPL...", self._import_rpl)
             menu.addAction("Register RPL revision...", self._register_rpl)
         elif ref[0] == KIND_GROUP and ref[1] == GROUP_LIBRARY:
             menu.addAction("New assembly...", self._new_assembly)
@@ -488,6 +491,7 @@ class WorkbenchDock(QDockWidget):
             menu.addAction("Delete system", self._delete_selected)
         elif ref[0] == KIND_ROUTE:
             menu.addAction("New RPL revision...", self._new_rpl_revision)
+            menu.addAction("Import RPL...", self._import_rpl)
             menu.addAction("Register RPL revision...", self._register_rpl)
             menu.addAction("Fit assembly...", self._fit_selected_rpl)
             menu.addAction("New assessment...", self._new_assessment)
@@ -576,6 +580,12 @@ class WorkbenchDock(QDockWidget):
         elif assembly is not None:
             self._select_ref((KIND_ASSEMBLY, assembly.assembly_id))
             self.stack.setCurrentWidget(self.assembly_panel)
+
+    def _import_rpl(self):
+        """Open the guided Import RPL wizard from the workbench tree."""
+        self.stack.setCurrentWidget(self.rpl_panel)
+        self.rpl_panel._run_import_wizard()
+        self.refresh_tree()
 
     def _register_rpl(self):
         self.stack.setCurrentWidget(self.rpl_panel)
