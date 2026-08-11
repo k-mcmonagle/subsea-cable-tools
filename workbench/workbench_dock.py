@@ -9,7 +9,6 @@ RPL revisions.
 
 from __future__ import annotations
 
-import os
 from typing import Dict, Optional
 
 from qgis.PyQt.QtCore import Qt
@@ -55,6 +54,7 @@ class WorkbenchDock(QDockWidget):
         super().__init__("Cable Route Workbench", parent)
         self.iface = iface
         self._project_layer_sync_muted = False
+        self._teardown_muted = False
         self._pending_removed_workbench_layers = set()
         self.setObjectName("CableRouteWorkbenchDock")
         self.setAllowedAreas(
@@ -132,32 +132,81 @@ class WorkbenchDock(QDockWidget):
         self.refresh_tree()
 
     # ------------------------------------------------------ layer sync --
-    def _connect_project_layer_sync(self):
+    def _project_sync_signal_slots(self):
         project = QgsProject.instance()
-        for signal_name, slot in (
-            ("layerWillBeRemoved", self._on_project_layers_will_be_removed),
-            ("layersWillBeRemoved", self._on_project_layers_will_be_removed),
-            ("layersRemoved", self._on_project_layers_removed),
-        ):
+        pairs = [
+            (project, "aboutToBeCleared", self._on_project_teardown_starts),
+            (project, "cleared", self._on_project_teardown_done),
+            (project, "layerWillBeRemoved", self._on_project_layers_will_be_removed),
+            (project, "layersWillBeRemoved", self._on_project_layers_will_be_removed),
+            (project, "layersRemoved", self._on_project_layers_removed),
+        ]
+        if self.iface is not None:
+            pairs.append((self.iface, "projectRead", self._on_project_switched))
+            pairs.append((self.iface, "newProjectCreated", self._on_project_switched))
+        return pairs
+
+    def _connect_project_layer_sync(self):
+        for obj, signal_name, slot in self._project_sync_signal_slots():
             try:
-                getattr(project, signal_name).connect(slot)
+                getattr(obj, signal_name).connect(slot)
             except Exception:
                 pass
 
     def _disconnect_project_layer_sync(self):
-        project = QgsProject.instance()
-        for signal_name, slot in (
-            ("layerWillBeRemoved", self._on_project_layers_will_be_removed),
-            ("layersWillBeRemoved", self._on_project_layers_will_be_removed),
-            ("layersRemoved", self._on_project_layers_removed),
-        ):
+        for obj, signal_name, slot in self._project_sync_signal_slots():
             try:
-                getattr(project, signal_name).disconnect(slot)
+                getattr(obj, signal_name).disconnect(slot)
             except Exception:
                 pass
 
+    def _on_project_teardown_starts(self, *_args):
+        # The project is being cleared (close / open another project): every
+        # layer goes away, and that must NOT be treated as the user deleting
+        # workbench layers.
+        self._teardown_muted = True
+        self._pending_removed_workbench_layers.clear()
+
+    def _on_project_teardown_done(self, *_args):
+        self._teardown_muted = False
+        self._pending_removed_workbench_layers.clear()
+
+    def _on_project_switched(self, *_args):
+        # A different project is now active: drop any stale state and rebuild
+        # the tree from that project's workbench store.
+        self._teardown_muted = False
+        self._pending_removed_workbench_layers.clear()
+        self.refresh_tree()
+
+    @staticmethod
+    def _is_project_teardown(args) -> bool:
+        """True when this removal covers every layer in the project.
+
+        ``QgsProject.clear()`` removes all layers in one batch; a user delete
+        never does. Belt-and-braces for QGIS builds without the
+        ``aboutToBeCleared`` signal.
+        """
+        project = QgsProject.instance()
+        all_ids = set(project.mapLayers().keys())
+        if not all_ids:
+            return False
+        removed_ids = set()
+        for item in _flatten_signal_args(args):
+            if isinstance(item, str):
+                removed_ids.add(item)
+            elif hasattr(item, "id"):
+                try:
+                    removed_ids.add(item.id())
+                except Exception:
+                    pass
+        return all_ids <= removed_ids
+
     def _on_project_layers_will_be_removed(self, *args):
-        if self._project_layer_sync_muted:
+        if self._project_layer_sync_muted or self._teardown_muted:
+            return
+        if self._is_project_teardown(args):
+            self._teardown_muted = True
+            self._pending_removed_workbench_layers.clear()
             return
         store = self._store()
         if store is None or not store.exists():
@@ -166,6 +215,13 @@ class WorkbenchDock(QDockWidget):
             self._pending_removed_workbench_layers.add(layer_name)
 
     def _on_project_layers_removed(self, *_args):
+        if self._teardown_muted:
+            # Teardown flagged from the will-be-removed heuristic; the project
+            # signals (cleared/projectRead) reset the flag too, but do it here
+            # so a lone removeAllMapLayers() cannot leave the sync muted.
+            self._teardown_muted = False
+            self._pending_removed_workbench_layers.clear()
+            return
         if self._project_layer_sync_muted:
             self._pending_removed_workbench_layers.clear()
             return
@@ -187,6 +243,11 @@ class WorkbenchDock(QDockWidget):
         rpls = store.list_rpls()
         for rpl in rpls:
             if rpl.get("points_layer") in layer_names or rpl.get("lines_layer") in layer_names:
+                if rpl.get("status") == schema.STATUS_ISSUED:
+                    # Issued revisions are read-only records: removing their
+                    # layers from the project must never destroy the registry
+                    # entry. The layers stay in the gpkg and can be re-added.
+                    continue
                 rpl_id = rpl.get("rpl_id") or ""
                 sibling_layers.update(self._rpl_project_layer_names(store, rpl_id))
                 removed_rpl_ids.add(rpl_id)
@@ -899,6 +960,10 @@ class WorkbenchDock(QDockWidget):
         self.rpl_panel.closeEvent(event)
         super().closeEvent(event)
 
+    def shutdown(self):
+        """Detach from project signals before the plugin unloads the dock."""
+        self._disconnect_project_layer_sync()
+
 
 def _exec_menu(menu: QMenu, global_pos) -> None:
     exec_fn = getattr(menu, "exec", None) or getattr(menu, "exec_")
@@ -946,18 +1011,6 @@ def _project_layer_ids_for_names(gpkg_path: str, layer_names) -> list:
 
 
 def _layer_name_from_source(source: str, gpkg_path: str) -> Optional[str]:
-    if not source or not gpkg_path:
-        return None
-    parts = str(source).split("|")
-    source_path = parts[0]
-    if _normalised_path(source_path) != _normalised_path(gpkg_path):
-        return None
-    for part in parts[1:]:
-        key, sep, value = part.partition("=")
-        if sep and key.lower() == "layername":
-            return value
-    return None
+    from .project_layers import layer_name_from_source
 
-
-def _normalised_path(path: str) -> str:
-    return os.path.normcase(os.path.abspath(os.path.normpath(path or "")))
+    return layer_name_from_source(source, gpkg_path)

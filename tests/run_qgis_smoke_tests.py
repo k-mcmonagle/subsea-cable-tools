@@ -123,6 +123,8 @@ def main() -> int:
         ("RPL import commit service", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_rpl_import_commit")),
         ("workbench assembly + fit", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_fit")),
         ("workbench topology + V3 adapter", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_workbench_adapter")),
+        ("workbench layer styling (pure)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_workbench_layer_style")),
+        ("workbench project layers + restore", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_workbench_project_layers")),
         ("workbench rules engine", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_rules_engine")),
         ("workbench rules inputs + migrate", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_rules_inputs")),
         ("planner timeline", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_planner_timeline")),

@@ -369,19 +369,9 @@ class RplManagerPanel(QWidget):
     def _find_or_load_layer(self, layer_name: Optional[str]) -> Optional[QgsVectorLayer]:
         if not layer_name or not self.store:
             return None
-        uri_fragment = f"|layername={layer_name}"
-        for layer in QgsProject.instance().mapLayers().values():
-            if isinstance(layer, QgsVectorLayer) and layer.source().endswith(uri_fragment) \
-                    and self.store.gpkg_path in layer.source():
-                return layer
-        layer = self.store.open_layer(layer_name)
-        if layer is not None:
-            project = QgsProject.instance()
-            root = project.layerTreeRoot()
-            group = root.findGroup("Cable Route Workbench") or root.insertGroup(0, "Cable Route Workbench")
-            project.addMapLayer(layer, False)
-            group.addLayer(layer)
-        return layer
+        from .project_layers import ensure_layer
+
+        return ensure_layer(QgsProject.instance(), self.store.gpkg_path, layer_name)
 
     # ------------------------------------------------------------- tables --
     def _refresh_tables(self, model: Optional[RplModel] = None):
@@ -585,6 +575,11 @@ class RplManagerPanel(QWidget):
             return
         if self.sync.commit():
             self._set_status("Saved.")
+            try:
+                from .layer_style import refresh_line_categories
+                refresh_line_categories(self.sync.lines_layer)
+            except Exception:
+                pass
             if self.current_rpl:
                 self.current_rpl["slack_mode"] = self.slack_mode().value
                 try:

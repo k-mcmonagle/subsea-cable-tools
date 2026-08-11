@@ -1240,24 +1240,16 @@ class RplImportWizard(QWizard):
         if result is None:
             return
         try:
-            from qgis.core import QgsProject, QgsVectorLayer
-            from ..processing.cable_lay_parsers import gpkg_layer_uri
+            from qgis.core import QgsProject
+            from .project_layers import ensure_layer
             from .store import set_project_gpkg_path
             project = QgsProject.instance()
             set_project_gpkg_path(result.gpkg_path, project)
-            root = project.layerTreeRoot()
-            group = (root.findGroup("Cable Route Workbench")
-                     or root.insertGroup(0, "Cable Route Workbench"))
             extent = None
-            for layer_name in (result.lines_layer, result.points_layer):
-                layer = QgsVectorLayer(
-                    gpkg_layer_uri(result.gpkg_path, layer_name),
-                    layer_name, "ogr")
-                if layer.isValid():
-                    project.addMapLayer(layer, False)
-                    group.addLayer(layer)
-                    if layer_name == result.lines_layer:
-                        extent = layer.extent()
+            lines = ensure_layer(project, result.gpkg_path, result.lines_layer)
+            ensure_layer(project, result.gpkg_path, result.points_layer)
+            if lines is not None:
+                extent = lines.extent()
             if extent is not None and self.iface is not None:
                 from qgis.core import (QgsCoordinateReferenceSystem,
                                        QgsCoordinateTransform)
@@ -1273,5 +1265,17 @@ class RplImportWizard(QWizard):
                 extent.scale(1.15)
                 canvas.setExtent(extent)
                 canvas.refresh()
+            # Make sure QGIS prompts to save: the layers only survive a
+            # restart if the project (or at least the gpkg entry) is saved.
+            project.setDirty(True)
+            if self.iface is not None:
+                try:
+                    self.iface.messageBar().pushMessage(
+                        "Import RPL",
+                        "RPL imported into the workbench GeoPackage. "
+                        "Save the project to keep the layers in this workspace.",
+                        duration=8)
+                except Exception:
+                    pass
         except Exception:
             pass

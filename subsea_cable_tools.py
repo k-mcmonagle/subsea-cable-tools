@@ -199,6 +199,24 @@ class SubseaCableTools:
 
         self._add_experimental_toolbar_menu()
 
+        # Re-add / repair Cable Route Workbench layers whenever a project is
+        # opened, without requiring the workbench dock itself to be opened.
+        try:
+            self.iface.projectRead.connect(self._restore_workbench_layers)
+        except Exception:
+            pass
+        # The plugin may have been enabled while a project is already open.
+        self._restore_workbench_layers()
+
+    def _restore_workbench_layers(self):
+        """Self-heal workbench layers for the current project (cheap no-op
+        when the project has no workbench GeoPackage)."""
+        try:
+            from .workbench.project_layers import restore_workbench_layers
+            restore_workbench_layers()
+        except Exception:
+            pass
+
     def _add_experimental_toolbar_menu(self):
         """Add one toolbar dropdown for tools that are still experimental."""
         parent = self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None
@@ -373,8 +391,18 @@ class SubseaCableTools:
                 pass
             self.depth_profile_dock = None
 
+        # Stop restoring workbench layers on project read.
+        try:
+            self.iface.projectRead.disconnect(self._restore_workbench_layers)
+        except Exception:
+            pass
+
         # Clean up the Cable Route Workbench dock
         if getattr(self, 'workbench_dock', None):
+            try:
+                self.workbench_dock.shutdown()
+            except Exception:
+                pass
             try:
                 self.iface.removeDockWidget(self.workbench_dock)
             except Exception:
