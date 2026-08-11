@@ -470,6 +470,114 @@ def test_split_ddm_hemisphere_first_order() -> bool:
         "" if ok else f"encoding={profile.coord_encoding} mapping={profile.mapping}")
 
 
+def test_merged_header_industry_layout() -> bool:
+    """Layout from real industry RPLs: 'Latitude'/'Longitude' merged over
+    deg/min/hemi triples (the reader replicates merge anchors into every
+    covered cell), grouped 'Distance (km)' / 'Cable Distance (km)' headers
+    with Between/Cumulative sub-headers, a run of hidden empty columns, and
+    trailing engineering columns."""
+    n = 31
+
+    def pad(cells):
+        return cells + [None] * (n - len(cells))
+
+    gap = [None] * 12  # hidden columns I..T
+    head = ["Pos No.", "Event", "Latitude", "Latitude", "Latitude",
+            "Longitude", "Longitude", "Longitude"] + gap + ["Bearing °T"]
+    rows = [
+        pad(head + ["Distance (km)", "Distance (km)", "Slack %",
+                    "Cable Distance (km)", "Cable Distance (km)", "Cable Code",
+                    "Fiber Pair", "Cable Type", "Approx Depth (m)", "Remarks"]),
+        pad(head + ["Between Positions", "Cumulative Total", "Slack %",
+                    "Between Positions", "Cumulative Total", "Cable Code",
+                    "Fiber Pair", "Cable Type", "Approx Depth (m)", "Remarks"]),
+    ]
+    lat = [(9, 36.1115), (9, 39.075), (9, 42.0), (10, 10.3268)]
+    lon = [(101, 30.1866), (101, 29.2593), (102, 9.2495), (102, 32.1752)]
+    total = 0.0
+    for i in range(4):
+        la_d, la_m = lat[i]
+        lo_d, lo_m = lon[i]
+        rows.append(pad([i + 1, "AC", la_d, la_m, "S", lo_d, lo_m, "E"]
+                        + gap + [None, None, None, None, None, None,
+                                 None, None, None, 1520.0 + i, "note"]))
+        if i < 3:
+            seg = 12.345
+            total += seg
+            rows.append(pad([None] * 8 + gap
+                            + [135.2, seg, round(total, 3), 1.5,
+                               round(seg * 1.015, 3), round(total * 1.015, 3),
+                               "A1", "1-4", "LW" if i else "DA",
+                               None, None]))
+    grid = R.SourceGrid(sheet="RPL", rows=rows, n_cols=n)
+    result = D.detect(grid)
+    profile = result.profile
+    ok = profile.coord_encoding == M.COORD_SPLIT_DDM
+    ok &= profile.mapping.get(M.PF_LAT_DEG) == 3
+    ok &= profile.mapping.get(M.PF_LAT_MIN) == 4
+    ok &= profile.mapping.get(M.PF_LAT_HEMI) == 5
+    ok &= profile.mapping.get(M.PF_LON_DEG) == 6
+    ok &= profile.mapping.get(M.PF_LON_MIN) == 7
+    ok &= profile.mapping.get(M.PF_LON_HEMI) == 8
+    ok &= profile.mapping.get(M.SF_BEARING) == 21
+    ok &= profile.mapping.get(M.SF_DIST) == 22
+    ok &= profile.mapping.get(M.PF_DIST_CUM) == 23
+    ok &= profile.mapping.get(M.SF_SLACK) == 24
+    ok &= profile.mapping.get(M.SF_CABLE_DIST) == 25
+    ok &= profile.mapping.get(M.PF_CABLE_DIST_CUM) == 26
+    ok &= profile.mapping.get(M.SF_CABLE_CODE) == 27
+    ok &= profile.mapping.get(M.SF_FIBER_PAIR) == 28
+    ok &= profile.mapping.get(M.SF_CABLE_TYPE) == 29
+    ok &= profile.mapping.get(M.PF_DEPTH) == 30
+    ok &= profile.mapping.get(M.PF_REMARKS) == 31
+    ok &= profile.distance_unit == "km"
+    doc, diags = P.parse(grid, profile)
+    ok &= len(doc.points) == 4 and not M.has_errors(diags)
+    return _result(
+        "merged-header industry layout fully mapped", ok,
+        "" if ok else f"encoding={profile.coord_encoding} mapping={profile.mapping}")
+
+
+def test_detect_coordinate_columns_for_encoding() -> bool:
+    # Split triples exist: constrained split detection finds them.
+    grid = R.SourceGrid(sheet="RPL", rows=_industry_ddm_rows(), n_cols=14)
+    split = D.detect_coordinate_columns(grid, M.COORD_SPLIT_DDM)
+    ok = split == {M.PF_LAT_DEG: 3, M.PF_LAT_MIN: 4, M.PF_LAT_HEMI: 5,
+                   M.PF_LON_DEG: 6, M.PF_LON_MIN: 7, M.PF_LON_HEMI: 8}
+    # Same sheet: constrained decimal detection targets the decimal columns.
+    decimal = D.detect_coordinate_columns(grid, M.COORD_DECIMAL_DEGREES)
+    ok &= decimal == {M.PF_LAT_TEXT: 9, M.PF_LON_TEXT: 14}
+    # No hemisphere letters: split constrained detection reports nothing.
+    bare = R.SourceGrid(sheet="RPL", rows=_industry_ddm_rows(with_hemis=False),
+                        n_cols=14)
+    ok &= D.detect_coordinate_columns(bare, M.COORD_SPLIT_DDM) is None
+    # Projected has no content signature.
+    ok &= D.detect_coordinate_columns(grid, M.COORD_PROJECTED) is None
+    return _result("encoding-constrained coordinate detection", ok)
+
+
+def test_split_cells_with_unit_symbols() -> bool:
+    # Text cells carrying degree/minute symbols still parse and detect.
+    ok = abs(C.parse_split_ddm("9°", "36.1115'", "S", C.AXIS_LAT)[0]
+             - -(9 + 36.1115 / 60.0)) < 1e-9
+    rows = [
+        ["Pos", "Latitude", None, None, "Longitude", None, None],
+        [1, "9°", "36.1115'", "S", "101°", "30.1866'", "E"],
+        [2, "9°", "39.0750'", "S", "101°", "29.2593'", "E"],
+        [3, "9°", "42.0000'", "S", "102°", "9.2495'", "E"],
+    ]
+    grid = R.SourceGrid(sheet="RPL", rows=rows, n_cols=7)
+    profile = D.detect(grid).profile
+    ok &= profile.coord_encoding == M.COORD_SPLIT_DDM
+    ok &= profile.mapping.get(M.PF_LAT_DEG) == 2
+    ok &= profile.mapping.get(M.PF_LAT_MIN) == 3
+    ok &= profile.mapping.get(M.PF_LAT_HEMI) == 4
+    doc, diags = P.parse(grid, profile)
+    ok &= len(doc.points) == 3 and not M.has_errors(diags)
+    return _result("split cells with °/' unit symbols", ok,
+                   "" if ok else f"encoding={profile.coord_encoding} mapping={profile.mapping}")
+
+
 def test_canonical_fields_beat_derived_navigation_columns() -> bool:
     rows = [
         ["Pos No.", "Event", "Latitude", None, None, "Longitude", None, None,
@@ -799,6 +907,9 @@ def run_all() -> List[bool]:
         test_split_ddm_survives_footer_contamination(),
         test_decimal_fallback_prefers_true_decimal_columns(),
         test_split_ddm_hemisphere_first_order(),
+        test_merged_header_industry_layout(),
+        test_detect_coordinate_columns_for_encoding(),
+        test_split_cells_with_unit_symbols(),
         test_canonical_fields_beat_derived_navigation_columns(),
         test_undetected_sheet_starts_fully_excluded(),
         test_unit_conversion_and_slack_ratio(),

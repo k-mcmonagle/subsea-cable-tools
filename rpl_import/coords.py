@@ -43,6 +43,12 @@ R_OUT_OF_RANGE = "out_of_range"
 R_UNRECOGNISED = "unrecognised_format"
 
 
+#: Unit symbols tolerated after a bare number in a split deg/min cell
+#: (``9°``, ``36.1115'``); full DDM strings still fail _to_float and are
+#: handled by the text parsers.
+_UNIT_SUFFIXES = "°º'′\"″"
+
+
 def _to_float(value) -> Optional[float]:
     if value is None or isinstance(value, bool):
         return None
@@ -50,6 +56,7 @@ def _to_float(value) -> Optional[float]:
         result = float(value)
     else:
         text = str(value).strip().replace(",", ".")
+        text = text.rstrip(_UNIT_SUFFIXES).strip()
         if not text:
             return None
         try:

@@ -111,7 +111,7 @@ def _column_stats(grid: SourceGrid, rows: List[int]) -> Dict[int, _ColStats]:
                     if C.parse_ddm_text(text, C.AXIS_LON)[0] is not None:
                         s.ddm_lon += 1
                 try:
-                    number = float(text.replace(",", "."))
+                    number = float(_strip_unit_symbols(text))
                 except ValueError:
                     continue
             s.numeric += 1
@@ -133,6 +133,12 @@ def _column_stats(grid: SourceGrid, rows: List[int]) -> Dict[int, _ColStats]:
     return stats
 
 
+def _strip_unit_symbols(text: str) -> str:
+    """Bare numbers with a trailing unit symbol (``9°``, ``36.1115'``) count
+    as numeric; full DDM strings still fail float() and stay text."""
+    return text.replace(",", ".").rstrip("°º'′\"″ ").strip()
+
+
 def _cell_is_datalike(value) -> bool:
     """Numeric, hemisphere letter, or DDM-parseable — i.e. a body cell."""
     if value is None:
@@ -147,7 +153,7 @@ def _cell_is_datalike(value) -> bool:
     if text.upper() in ("N", "S", "E", "W"):
         return True
     try:
-        float(text.replace(",", "."))
+        float(_strip_unit_symbols(text))
         return True
     except ValueError:
         pass
@@ -206,12 +212,15 @@ def _dominant_run(rows: List[int], tolerance: int = GAP_TOLERANCE) -> List[int]:
 
 def _detect_coordinates(grid: SourceGrid, scan_rows: List[int],
                         header_texts: List[str],
-                        reasons: Dict[str, str]) -> Optional[Tuple[str, Dict[str, int]]]:
+                        reasons: Dict[str, str],
+                        only: Optional[str] = None) -> Optional[Tuple[str, Dict[str, int]]]:
     """(encoding, coordinate-field mapping) or None.
 
     Preference order is deliberate: split degrees/decimal-minutes/hemisphere
     is the industry-standard RPL form and always wins when present, then
     combined DDM text, then signed decimal degrees under lat/lon headers.
+    ``only`` restricts detection to a single encoding (used when the user
+    picks an encoding manually and wants its columns found automatically).
     """
     stats = _column_stats(grid, _dominant_run(scan_rows))
 
@@ -257,7 +266,7 @@ def _detect_coordinates(grid: SourceGrid, scan_rows: List[int],
             return deg_col, min_col
         return None
 
-    for lat_hemi in lat_hemis:
+    for lat_hemi in (lat_hemis if only in (None, COORD_SPLIT_DDM) else []):
         lat_pair = split_for(lat_hemi, "lat", frozenset(lon_hemis))
         if not lat_pair:
             continue
@@ -280,11 +289,13 @@ def _detect_coordinates(grid: SourceGrid, scan_rows: List[int],
             return COORD_SPLIT_DDM, mapping
 
     # -- DDM text -------------------------------------------------------------
-    ddm_lat_cols = [c for c, s in stats.items()
-                    if s.non_empty >= 2 and s.ddm_lat / s.non_empty >= 0.6]
-    ddm_lon_cols = [c for c, s in stats.items()
-                    if s.non_empty >= 2 and s.ddm_lon / s.non_empty >= 0.6
-                    and c not in ddm_lat_cols]
+    ddm_lat_cols = ddm_lon_cols = []
+    if only in (None, COORD_DDM_TEXT):
+        ddm_lat_cols = [c for c, s in stats.items()
+                        if s.non_empty >= 2 and s.ddm_lat / s.non_empty >= 0.6]
+        ddm_lon_cols = [c for c, s in stats.items()
+                        if s.non_empty >= 2 and s.ddm_lon / s.non_empty >= 0.6
+                        and c not in ddm_lat_cols]
     if ddm_lat_cols and ddm_lon_cols:
         mapping = {PF_LAT_TEXT: ddm_lat_cols[0], PF_LON_TEXT: ddm_lon_cols[0]}
         reasons["coordinates"] = (
@@ -304,6 +315,9 @@ def _detect_coordinates(grid: SourceGrid, scan_rows: List[int],
 
     def in_ddm_group(col: int) -> bool:
         return (col + 1) in hemi_all or (col + 2) in hemi_all
+
+    if only not in (None, COORD_DECIMAL_DEGREES):
+        return None
 
     def decimal_candidate(col: int, header: str, axis: str) -> Optional[int]:
         s = stats[col]
@@ -606,6 +620,27 @@ def _detect_units(header_texts: List[str], profile: ImportProfile,
 # ---------------------------------------------------------------------------
 # Entry points
 # ---------------------------------------------------------------------------
+def detect_coordinate_columns(grid: SourceGrid,
+                              encoding: str) -> Optional[Dict[str, int]]:
+    """Coordinate-field mapping for one specific encoding, or None.
+
+    Used by the wizard when the user manually switches the coordinate
+    encoding: content detection re-runs constrained to that encoding so its
+    columns (deg/min/hemisphere triples, DDM text, decimal degrees) are
+    assigned automatically instead of being hunted down by hand. Projected
+    easting/northing has no content signature and always returns None.
+    """
+    provisional_rows = _provisional_header_rows(grid, MAX_HEADER_ROWS)
+    if not provisional_rows:
+        provisional_rows = list(range(1, min(grid.n_rows, MAX_HEADER_ROWS) + 1))
+    header_texts = header_texts_for(grid, provisional_rows)
+    scan_rows = _datalike_rows(grid, MAX_COLUMN_SCAN_ROWS)
+    if not scan_rows:
+        scan_rows = list(range(1, min(grid.n_rows, MAX_COLUMN_SCAN_ROWS) + 1))
+    found = _detect_coordinates(grid, scan_rows, header_texts, {}, only=encoding)
+    return found[1] if found else None
+
+
 def detect(grid: SourceGrid) -> DetectionResult:
     """Full detection for one sheet; the result profile is user-correctable."""
     reasons: Dict[str, str] = {}

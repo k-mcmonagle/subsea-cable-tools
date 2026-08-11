@@ -493,6 +493,16 @@ class _MappingPage(QWizardPage):
         self.crs_widget = self._make_crs_widget()
         form.addWidget(QLabel("Source CRS"), 5, 0)
         form.addWidget(self.crs_widget, 5, 1)
+        self.redetect_btn = QPushButton("Re-run detection")
+        self.redetect_btn.setToolTip(
+            "Discard the current mapping (including any applied saved "
+            "profile) and re-detect everything from the sheet contents.")
+        self.redetect_btn.clicked.connect(self._redetect)
+        form.addWidget(self.redetect_btn, 6, 0, 1, 2)
+        self.detect_reason_label = QLabel("")
+        self.detect_reason_label.setWordWrap(True)
+        self.detect_reason_label.setStyleSheet("color: gray;")
+        form.addWidget(self.detect_reason_label, 7, 0, 1, 2)
         panel_layout.addWidget(structure)
 
         units = QGroupBox("Units")
@@ -551,6 +561,9 @@ class _MappingPage(QWizardPage):
             widget.currentIndexChanged.connect(self._controls_changed)
         self.start_spin.valueChanged.connect(self._controls_changed)
         self.end_spin.valueChanged.connect(self._controls_changed)
+        # After the generic handler has synced the profile: try to auto-find
+        # the coordinate columns for a manually chosen encoding.
+        self.encoding_combo.currentIndexChanged.connect(self._encoding_changed)
 
     def _make_crs_widget(self):
         try:
@@ -649,6 +662,8 @@ class _MappingPage(QWizardPage):
                 max(0, self.depth_unit.findData(profile.depth_unit)))
             self.slack_unit.setCurrentIndex(1 if profile.slack_is_ratio else 0)
             self._set_crs_authid(profile.source_crs)
+            self.detect_reason_label.setText(
+                self.wiz.detection_reasons.get("coordinates", ""))
             self._update_layout_controls()
             self._rebuild_mapping_table(profile)
         finally:
@@ -728,6 +743,72 @@ class _MappingPage(QWizardPage):
         self._update_layout_controls()
         profile = self._profile_from_controls()
         self._refresh_preview(profile)
+
+    def _redetect(self):
+        """Fresh full autodetect on the current sheet, discarding the current
+        mapping and any auto-applied saved profile."""
+        wiz = self.wiz
+        try:
+            if wiz.grid is None or wiz.grid.sheet != wiz.profile.sheet:
+                wiz.grid = None
+                wiz.load_full_grid()   # loads and runs detection
+            else:
+                result = idetect.detect(wiz.grid)
+                wiz.profile = result.profile
+                wiz.header_texts = result.header_texts
+                wiz.detection_reasons = dict(result.reasons)
+        except Exception as exc:
+            self.profile_label.setText(f"Detection failed: {exc}")
+            return
+        # Block the saved profile from silently re-applying over this run.
+        self._applied_signatures.add(wiz.profile.header_signature)
+        self.grid_model.set_grid(wiz.grid, wiz.profile)
+        self._controls_to_profile_widgets(wiz.profile)
+        if wiz.profile.data_start_row:
+            self.scroll_to_row(wiz.profile.data_start_row)
+        self._refresh_preview(wiz.profile)
+        self.profile_label.setText(
+            "Detection re-run from the sheet contents "
+            "(saved mapping profile not applied).")
+
+    def _encoding_changed(self, *_args):
+        """User picked a coordinate encoding: find its columns automatically.
+
+        Runs after _controls_changed has synced the profile, and only fills
+        in when the required coordinate columns for the chosen encoding are
+        not already assigned — manual assignments are never overwritten.
+        """
+        if self._loading or self.wiz.grid is None:
+            return
+        profile = self.wiz.profile
+        if not profile.required_missing():
+            return
+        encoding = self.encoding_combo.currentData()
+        mapping = idetect.detect_coordinate_columns(self.wiz.grid, encoding)
+        if not mapping:
+            self.profile_label.setText(
+                "Coordinate columns for this encoding were not found "
+                "automatically — assign them in the mapping row above the "
+                "table.")
+            return
+        all_coord_fields = {
+            field for fields in im.REQUIRED_COORD_FIELDS.values()
+            for field in fields
+        }
+        freed = {column for field, column in profile.mapping.items()
+                 if field in all_coord_fields} - set(mapping.values())
+        for field in all_coord_fields:
+            profile.mapping.pop(field, None)
+        profile.mapping.update(mapping)
+        excluded = set(profile.excluded_columns) | freed
+        excluded.difference_update(mapping.values())
+        profile.excluded_columns = sorted(excluded)
+        self._controls_to_profile_widgets(profile)
+        self._refresh_preview(profile)
+        self.profile_label.setText(
+            "Coordinate columns auto-assigned for this encoding: "
+            + ", ".join(f"{field} → {_col_letter(column)}"
+                        for field, column in sorted(mapping.items())))
 
     def _refresh_preview(self, profile: ImportProfile):
         doc, diags = self.wiz.reparse()
