@@ -7,6 +7,11 @@ import os
 import sys
 import importlib.util
 
+# QGIS and lxml can load incompatible libxml runtimes on Windows. openpyxl's
+# optional lxml acceleration has caused native access violations when parsing
+# workbooks, so use its thread-safe standard-library XML backend instead.
+os.environ["OPENPYXL_LXML"] = "False"
+
 _plugin_dir = os.path.dirname(__file__)
 _lib_dir = os.path.join(_plugin_dir, 'lib')
 _VENDORED_MODULES = ('openpyxl', 'pyqtgraph', 'et_xmlfile', 'access_parser', 'construct', 'tabulate')

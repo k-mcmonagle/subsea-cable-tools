@@ -22,6 +22,9 @@ import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+# Also cover direct use of this pure package without plugin package startup.
+os.environ["OPENPYXL_LXML"] = "False"
+
 EXCEL_EXTENSIONS = (".xlsx", ".xlsm")
 CSV_EXTENSIONS = (".csv", ".txt")
 
@@ -77,14 +80,20 @@ class SourceGrid:
 
 def _require_openpyxl():
     try:
-        from openpyxl import load_workbook  # noqa: F401
-        return load_workbook
+        import openpyxl
     except Exception as exc:  # pragma: no cover - environment specific
         raise ReaderError(
             "openpyxl is required to read Excel files but could not be "
             "imported. Ensure the plugin's lib/ folder is present and not "
             "blocked by antivirus. (%s)" % exc
         )
+    if getattr(openpyxl, "LXML", False):
+        raise ReaderError(
+            "Excel support was loaded with an unsafe native XML backend. "
+            "Restart QGIS once to activate the safe workbook reader, then "
+            "try the import again."
+        )
+    return openpyxl.load_workbook
 
 
 def is_excel(path: str) -> bool:

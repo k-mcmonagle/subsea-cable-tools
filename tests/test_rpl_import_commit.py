@@ -240,6 +240,10 @@ def test_inconsistent_model_refused() -> bool:
 def test_wizard_constructs() -> bool:
     """The guided wizard builds headlessly (catches Qt API/compat breakage)."""
     try:
+        from qgis.PyQt.QtCore import QCoreApplication, QThread
+        from qgis.PyQt.QtWidgets import QApplication
+
+        from ..workbench import rpl_import_wizard as wizard_module
         from ..workbench.rpl_import_wizard import RplImportWizard, _GridModel
 
         wizard = RplImportWizard(store=None, iface=None)
@@ -247,11 +251,57 @@ def test_wizard_constructs() -> bool:
         grid_model = _GridModel()
         from ..rpl_import.reader import SourceGrid
 
-        grid = SourceGrid(sheet="T", rows=[[1, "a"], [2, "b"]], n_cols=2)
+        grid = SourceGrid(
+            sheet="T", rows=[[1, "a", "x"], [2, "b", "y"]], n_cols=3)
         grid_model.set_grid(grid, wizard.profile)
-        ok = ok and grid_model.rowCount() == 2 and grid_model.columnCount() == 2
+        ok = ok and grid_model.rowCount() == 2 and grid_model.columnCount() == 3
         index = grid_model.index(0, 1)
         ok = ok and grid_model.data(index) == "a"
+
+        page = wizard.mapping_page
+        wizard.grid = grid
+        wizard.header_texts = ["pos", "event", "notes"]
+        wizard.profile.mapping = {im.PF_POS_NO: 1, im.PF_EVENT: 2}
+        wizard.profile.excluded_columns = [3]
+        page.grid_model.set_grid(grid, wizard.profile)
+        page._controls_to_profile_widgets(wizard.profile)
+        ok = ok and page.mapping_table.columnCount() == 3
+        ok = ok and page.mapping_table.cellWidget(0, 0).currentData() == im.PF_POS_NO
+        ok = ok and page.mapping_table.cellWidget(0, 1).currentData() == im.PF_EVENT
+        extra_combo = page.mapping_table.cellWidget(0, 2)
+        ok = ok and extra_combo.currentData() == ""
+        extra_combo.blockSignals(True)
+        extra_combo.setCurrentIndex(extra_combo.findData("__include_as_extra__"))
+        extra_combo.blockSignals(False)
+        updated = page._profile_from_controls()
+        ok = ok and updated.mapping == wizard.profile.mapping
+        ok = ok and updated.excluded_columns == []
+        ok = ok and page._profile_from_controls().mapping == wizard.profile.mapping
+        ok = ok and page._crs_authid() == "EPSG:4326"
+        ok = ok and page.flat_combo.isHidden()
+        ok = ok and page.table.minimumHeight() >= 360
+        ok = ok and page.mapping_table.horizontalHeader().isHidden()
+        ok = ok and page.mapping_table.height() == 36
+
+        scan_threads = []
+        original_loader = wizard_module.ireader.load_sample_grids
+        try:
+            def fake_loader(_path):
+                scan_threads.append(QThread.currentThread())
+                return [SourceGrid(
+                    sheet="RPL",
+                    rows=[["Pos", "Lat (dd)", "Lon (dd)"],
+                          [1, 50.0, -1.0], [2, 50.01, -1.0]],
+                    n_cols=3)]
+
+            wizard_module.ireader.load_sample_grids = fake_loader
+            page1 = wizard.source_page
+            page1._start_scan("example.xlsx")
+            QApplication.processEvents()
+            ok = ok and len(page1._results) == 1
+            ok = ok and scan_threads == [QCoreApplication.instance().thread()]
+        finally:
+            wizard_module.ireader.load_sample_grids = original_loader
         wizard.deleteLater()
     except Exception as exc:
         import traceback

@@ -229,7 +229,7 @@ class ImportProfile:
     layout: str = LAYOUT_ALTERNATING
     flat_semantics: str = FLAT_ARRIVING
     coord_encoding: str = COORD_SPLIT_DDM
-    source_crs: str = ""                   # e.g. "EPSG:32630" (projected only)
+    source_crs: str = "EPSG:4326"          # user-configurable source CRS
     mapping: Dict[str, int] = field(default_factory=dict)
     excluded_columns: List[int] = field(default_factory=list)
     distance_unit: str = "km"              # DistBetweenPos / cumulative KP

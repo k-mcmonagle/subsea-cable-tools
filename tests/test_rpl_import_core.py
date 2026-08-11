@@ -38,6 +38,7 @@ from sct_rpl_import import reader as R            # noqa: E402
 from sct_rpl_import import validate as V          # noqa: E402
 
 from openpyxl import Workbook                     # noqa: E402
+from openpyxl import LXML as OPENPYXL_USES_LXML   # noqa: E402
 
 
 def _result(name: str, ok: bool, detail: str = "") -> bool:
@@ -152,7 +153,7 @@ def _decimal_degrees_csv(path: str) -> None:
 # Coordinate parser checks
 # ---------------------------------------------------------------------------
 def test_coord_parsers() -> bool:
-    ok = True
+    ok = OPENPYXL_USES_LXML is False
     value, reason = C.parse_split_ddm(50, 30.0, "N", C.AXIS_LAT)
     ok &= reason is None and abs(value - 50.5) < 1e-9
     value, reason = C.parse_split_ddm(1, 30.0, "W", C.AXIS_LON)
@@ -241,8 +242,8 @@ def test_parse_canonical() -> bool:
     ok &= abs(seg0.dist_km - 1.112) < 1e-9 and seg0.slack_pct == 2.0
     ok &= seg0.cable_type == "LW-A"
     ok &= seg0.source_row == 6 and doc.points[3].source_row == 11
-    # extra column ("Zone") preserved on points with a safe name
-    ok &= p0.extras.get("Zone") == "UK"
+    # unidentified columns start excluded and never leak into the model
+    ok &= "Zone" not in p0.extras
     # validation on the clean doc: no errors, no distance mismatches
     findings = V.validate(doc)
     ok &= not M.has_errors(findings)
@@ -330,12 +331,86 @@ def test_decimal_degrees_detection() -> bool:
     return _result("signed decimal degrees behind lat/lon headers", ok)
 
 
+def test_grouped_headers_prefer_split_coordinates() -> bool:
+    rows = [
+        ["Pos", "Event", "Latitude", None, None, "Longitude", None, None,
+         "Decimal Latitude (degrees)", "Radians Latitude", "Sin Latitude"],
+        ["No.", None, None, None, None, None, None, None, None, None, None],
+        [None] * 11,
+        [None] * 11,
+        [None] * 11,
+        [None] * 11,
+        [1, "BU SIN", -9, 36.1115, "S", 101, 30.1866, "E",
+         -9.60185833333332, -0.167583, -0.1668],
+        [None] * 11,
+        [2, "AC", -9, 39.075, "S", 101, 29.2593, "E",
+         -9.65125, -0.168445, -0.16765],
+        [None] * 11,
+        [3, "AC", -9, 42.0, "S", 101, 28.0, "E",
+         -9.7, -0.169297, -0.16849],
+    ]
+    grid = R.SourceGrid(sheet="RPL", rows=rows, n_cols=11)
+    result = D.detect(grid)
+    profile = result.profile
+    ok = profile.header_rows == [1, 2]
+    ok &= profile.coord_encoding == M.COORD_SPLIT_DDM
+    ok &= profile.mapping.get(M.PF_LAT_DEG) == 3
+    ok &= profile.mapping.get(M.PF_LAT_MIN) == 4
+    ok &= profile.mapping.get(M.PF_LAT_HEMI) == 5
+    ok &= profile.mapping.get(M.PF_LON_DEG) == 6
+    ok &= profile.mapping.get(M.PF_LON_MIN) == 7
+    ok &= profile.mapping.get(M.PF_LON_HEMI) == 8
+    ok &= "latitude" in result.header_texts[3]
+    ok &= "longitude" in result.header_texts[6]
+    ok &= "no" not in result.header_texts[3]
+    ok &= "no" not in result.header_texts[6]
+    return _result("grouped headers + values prefer split DDM coordinates", ok,
+                   "" if ok else f"encoding={profile.coord_encoding} mapping={profile.mapping} headers={result.header_texts[:8]}")
+
+
+def test_canonical_fields_beat_derived_navigation_columns() -> bool:
+    rows = [
+        ["Pos No.", "Event", "Latitude", None, None, "Longitude", None, None,
+         "Course", "Distance in miles (6087 ft)", "Bearing °T",
+         "Distance (km) Between Positions", "Cumulative Total", "Slack %"],
+        [1, "Start", 50, 0.0, "N", 1, 0.0, "W",
+         None, None, None, None, 0.0, None],
+        [None, None, None, None, None, None, None, None,
+         0.01, 0.60, 0.0, 1.112, None, 2.0],
+        [2, "Mid", 50, 0.6, "N", 1, 0.0, "W",
+         None, None, None, None, 1.112, None],
+        [None, None, None, None, None, None, None, None,
+         0.01, 0.60, 0.0, 1.112, None, 2.0],
+        [3, "End", 50, 1.2, "N", 1, 0.0, "W",
+         None, None, None, None, 2.224, None],
+    ]
+    grid = R.SourceGrid(sheet="RPL", rows=rows, n_cols=14)
+    profile = D.detect(grid).profile
+    ok = profile.mapping.get(M.SF_BEARING) == 11
+    ok &= profile.mapping.get(M.SF_DIST) == 12
+    ok &= profile.mapping.get(M.PF_DIST_CUM) == 13
+    ok &= profile.mapping.get(M.SF_SLACK) == 14
+    return _result("canonical fields beat derived navigation columns", ok,
+                   "" if ok else f"mapping={profile.mapping}")
+
+
+def test_undetected_sheet_starts_fully_excluded() -> bool:
+    grid = R.SourceGrid(
+        sheet="Notes", rows=[["Topic", "Owner"], ["Permits", "Team"]],
+        n_cols=2)
+    profile = D.detect(grid).profile
+    ok = profile.mapping == {} and profile.excluded_columns == [1, 2]
+    return _result("undetected sheet columns start excluded", ok,
+                   "" if ok else f"excluded={profile.excluded_columns}")
+
+
 # ---------------------------------------------------------------------------
 # Units, profile round-trip, misc invariants
 # ---------------------------------------------------------------------------
 def test_unit_conversion_and_slack_ratio() -> bool:
     profile = M.ImportProfile()
-    ok = M.to_km(1500.0, "m") == 1.5
+    ok = profile.source_crs == "EPSG:4326"
+    ok &= M.to_km(1500.0, "m") == 1.5
     ok &= abs(M.to_km(1.0, "nm") - 1.852) < 1e-12
     ok &= M.to_m(10.0, "ft") == 3.048
     ok &= M.slack_to_percent(1.02, True) is not None
@@ -444,6 +519,21 @@ def test_notes_block_and_footer_are_outside_range() -> bool:
                    "" if ok else f"rows={profile.data_start_row}-{profile.data_end_row} pts={len(doc.points)}")
 
 
+def test_full_sheet_range_detection_excludes_footer() -> bool:
+    rows = [["Pos", "Event", "Lat (dd)", "Lon (dd)"]]
+    for index in range(4500):
+        rows.append([index + 1, "Route point", 50.0 + index / 100000.0, -1.0])
+    rows.extend([
+        ["Prepared by: someone", None, None, None],
+        ["Checked by: someone else", None, None, None],
+    ])
+    grid = R.SourceGrid(sheet="RPL", rows=rows, n_cols=4)
+    profile = D.detect(grid).profile
+    ok = profile.data_start_row == 2 and profile.data_end_row == 4501
+    return _result("full RPL row range retained; trailing notes excluded", ok,
+                   "" if ok else f"rows={profile.data_start_row}-{profile.data_end_row}")
+
+
 def test_manual_range_override_is_authoritative() -> bool:
     path = _tmp("override.csv")
     _flat_csv(path)
@@ -460,14 +550,14 @@ def test_excluded_vs_preserved_extras() -> bool:
     path, results = _detect_canonical()
     profile = results[0].profile
     zone_col = 19
-    profile.excluded_columns = [zone_col]
+    ok = zone_col in profile.excluded_columns
     grid = R.load_grid(path, profile.sheet)
     doc, _ = P.parse(grid, profile)
-    ok = "Zone" not in doc.points[0].extras
-    profile.excluded_columns = []
+    ok &= "Zone" not in doc.points[0].extras
+    profile.excluded_columns.remove(zone_col)
     doc2, _ = P.parse(grid, profile)
     ok &= doc2.points[0].extras.get("Zone") == "UK"
-    return _result("extras preserved by default; exclusion is deliberate", ok)
+    return _result("unidentified columns excluded until explicitly included", ok)
 
 
 # ---------------------------------------------------------------------------
@@ -556,6 +646,44 @@ def test_uncached_formula_reported() -> bool:
     return _result("uncached formula cells surfaced, values left empty", ok)
 
 
+def test_uncached_formula_ignored_in_excluded_column() -> bool:
+    path = _tmp("formula_excluded.xlsx")
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "RPL"
+    ws.append(["Pos", "Event", "Lat (dd)", "Lon (dd)", "Derived", "KP (km)"])
+    ws.append([1, "Start", 50.0, -1.0, "=B99+1", 0.0])
+    ws.append([2, "End", 50.01, -1.0, "=B99+2", "=B99+3"])
+    wb.save(path)
+    profile = D.score_sheets(R.load_sample_grids(path))[0].profile
+    grid = R.load_grid(path, "RPL")
+    _doc, diags = P.parse(grid, profile)
+    formula_diags = [
+        diag for diag in diags
+        if diag.rule_id == "rpl_import.cell.uncached_formula"
+    ]
+    ok = 5 in profile.excluded_columns
+    ok &= [(diag.row, diag.column) for diag in formula_diags] == [(3, 6)]
+    return _result("excluded uncached formulas suppressed; mapped warning kept", ok,
+                   "" if ok else f"excluded={profile.excluded_columns} warnings={[(d.row, d.column) for d in formula_diags]}")
+
+
+def test_unsafe_xml_backend_refused() -> bool:
+    import openpyxl
+
+    original = openpyxl.LXML
+    try:
+        openpyxl.LXML = True
+        try:
+            R._require_openpyxl()
+            ok = False
+        except R.ReaderError as exc:
+            ok = "Restart QGIS" in str(exc)
+    finally:
+        openpyxl.LXML = original
+    return _result("unsafe preloaded XML backend refused safely", ok)
+
+
 def run_all() -> List[bool]:
     results = [
         test_coord_parsers(),
@@ -565,16 +693,22 @@ def run_all() -> List[bool]:
         test_flat_csv_ddm_text_arriving(),
         test_flat_departing_semantics(),
         test_decimal_degrees_detection(),
+        test_grouped_headers_prefer_split_coordinates(),
+        test_canonical_fields_beat_derived_navigation_columns(),
+        test_undetected_sheet_starts_fully_excluded(),
         test_unit_conversion_and_slack_ratio(),
         test_units_detected_from_headers(),
         test_profile_json_round_trip_and_signature(),
         test_extra_field_names_collision_safe(),
         test_non_integer_pos_no_and_chart_text(),
         test_notes_block_and_footer_are_outside_range(),
+        test_full_sheet_range_detection_excludes_footer(),
         test_manual_range_override_is_authoritative(),
         test_excluded_vs_preserved_extras(),
         test_validation_rules(),
         test_uncached_formula_reported(),
+        test_uncached_formula_ignored_in_excluded_column(),
+        test_unsafe_xml_backend_refused(),
     ]
     print("")
     print(f"{sum(results)}/{len(results)} passed")

@@ -288,7 +288,10 @@ def parse(grid: SourceGrid, profile: ImportProfile
             sheet=grid.sheet))
         return doc, diagnostics
 
+    excluded_columns = set(profile.excluded_columns or [])
     for (row, col) in grid.formula_gaps(start, end):
+        if col in excluded_columns:
+            continue
         diagnostics.append(Diagnostic(
             rule_id="rpl_import.cell.uncached_formula",
             severity=SEVERITY_WARNING,

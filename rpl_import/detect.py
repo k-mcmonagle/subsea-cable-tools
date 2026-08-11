@@ -35,7 +35,7 @@ from .parser import parse_point_coords, row_has_coords
 from .reader import SourceGrid
 
 MAX_HEADER_ROWS = 12          # header block search depth above the data start
-MAX_SCAN_ROWS = 4000          # row-scan bound during detection
+MAX_COLUMN_SCAN_ROWS = 4000   # bounded sample used to infer column meanings
 GAP_TOLERANCE = 6             # rows of non-data tolerated inside the table
 
 
@@ -150,6 +150,20 @@ def _datalike_rows(grid: SourceGrid, limit: int) -> List[int]:
     return rows
 
 
+def _provisional_header_rows(grid: SourceGrid, limit: int) -> List[int]:
+    """Header-like rows near the top, excluding rows dominated by values."""
+    rows: List[int] = []
+    for row in range(1, min(grid.n_rows, limit) + 1):
+        values = [value for value in grid.row_values(row)
+                  if value is not None and str(value).strip() != ""]
+        if not values:
+            continue
+        headerlike = sum(1 for value in values if not _cell_is_datalike(value))
+        if headerlike / len(values) >= 0.5:
+            rows.append(row)
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Coordinate configuration detection
 # ---------------------------------------------------------------------------
@@ -177,9 +191,13 @@ def _detect_coordinates(grid: SourceGrid, scan_rows: List[int],
             return None
         deg_col, min_col = candidates[0], candidates[1]
         sd, sm = stats[deg_col], stats[min_col]
-        if not (0 <= sd.min_val and sd.max_val <= axis_max):
+        # Some industry RPLs retain a signed degree value as well as an
+        # explicit hemisphere column. The parser deliberately uses the
+        # hemisphere as authoritative, so detection should compare degree
+        # magnitudes rather than reject these otherwise clear DDM triples.
+        if max(abs(sd.min_val), abs(sd.max_val)) > axis_max:
             return None
-        if not (0 <= sm.min_val and sm.max_val < 60.0):
+        if max(abs(sm.min_val), abs(sm.max_val)) >= 60.0:
             return None
         # degrees are typically integers; minutes typically fractional
         if sd.integers < sd.numeric * 0.9 and sm.integers == sm.numeric:
@@ -306,17 +324,42 @@ def _header_rows(grid: SourceGrid, data_start: int) -> List[int]:
 
 
 def header_texts_for(grid: SourceGrid, header_rows: List[int]) -> List[str]:
-    """Per-column concatenated, normalised header text (1-based col - 1)."""
+    """Combined header text per column, including merged-like group labels.
+
+    Excel merged cells are expanded by the reader. CSV exports cannot retain
+    merges, so a group such as ``Latitude,,,Longitude,,`` appears as a label
+    followed by blank child columns. Blank runs of at least two columns are
+    treated as grouped children and inherit the preceding label. Single blank
+    cells are left alone to avoid inventing context in ordinary flat headers.
+    """
+    rows: List[List[str]] = []
+    for row in header_rows:
+        values = [normalise_header_text(grid.cell(row, col))
+                  for col in range(1, grid.n_cols + 1)]
+        contextual = list(values)
+        column = 0
+        while column < grid.n_cols:
+            if not values[column]:
+                column += 1
+                continue
+            run_start = column + 1
+            run_end = run_start
+            while run_end < grid.n_cols and not values[run_end]:
+                run_end += 1
+            if run_end < grid.n_cols and run_end - run_start >= 2:
+                for child in range(run_start, run_end):
+                    contextual[child] = values[column]
+            column = max(run_end, column + 1)
+        rows.append(contextual)
+
     texts = []
-    for col in range(1, grid.n_cols + 1):
-        bits = []
-        for row in header_rows:
-            value = grid.cell(row, col)
-            if value is not None and not isinstance(value, (int, float)):
-                bits.append(str(value))
-            elif value is not None:
-                bits.append(str(value))
-        texts.append(normalise_header_text(" ".join(bits)))
+    for column in range(grid.n_cols):
+        bits: List[str] = []
+        for row in rows:
+            value = row[column]
+            if value and value not in bits:
+                bits.append(value)
+        texts.append(" ".join(bits))
     return texts
 
 
@@ -383,10 +426,42 @@ def _map_remaining_columns(grid: SourceGrid, header_texts: List[str],
             return s.numeric_frac >= 0.6 and s.integers >= s.numeric * 0.9
         return True
 
+    def header_score(field_key: str, header: str) -> int:
+        """Prefer canonical source fields over nearby derived calculations."""
+        score = 0
+        if field_key == SF_BEARING:
+            if re.search(r"\b(bearing|brg)\b", header):
+                score += 40
+            if re.search(r"\b(course|heading)\b", header):
+                score += 10
+            if re.search(r"radian|\brad\b", header):
+                score -= 30
+        if field_key in (SF_DIST, SF_CABLE_DIST):
+            if re.search(r"between|span|\bleg\b", header):
+                score += 40
+            if re.search(r"\b(km|nm|m)\b", header):
+                score += 10
+            if re.search(r"mile|6087|equator|meridional", header):
+                score -= 30
+            if re.search(r"cum|total|\bkp\b", header):
+                score -= 40
+        if field_key in (PF_DIST_CUM, PF_CABLE_DIST_CUM):
+            if re.search(r"cum|total|\bkp\b", header):
+                score += 40
+            if re.search(r"between|span|\bleg\b", header):
+                score -= 40
+        if field_key == PF_DEPTH:
+            if re.search(r"approx|water|\bwd\b", header):
+                score += 30
+            if re.search(r"burial|\bdob\b", header):
+                score -= 40
+        return score
+
     for field_key, pattern, cable_context, why in _VOCAB:
         if profile.mapping.get(field_key):
             continue
         best: Optional[int] = None
+        best_score: Optional[int] = None
         for col in range(1, grid.n_cols + 1):
             if col in taken:
                 continue
@@ -400,8 +475,10 @@ def _map_remaining_columns(grid: SourceGrid, header_texts: List[str],
                 continue
             if not content_ok(field_key, col):
                 continue
-            best = col
-            break  # leftmost surviving match wins
+            score = header_score(field_key, header)
+            if best is None or score > best_score:
+                best = col
+                best_score = score
         if best is not None:
             profile.mapping[field_key] = best
             taken.add(best)
@@ -449,21 +526,30 @@ def detect(grid: SourceGrid) -> DetectionResult:
 
     # Provisional headers from the top of the sheet (refined once the data
     # start is known) so decimal-degree detection can see lat/lon words.
-    provisional_headers = header_texts_for(
-        grid, list(range(1, min(grid.n_rows, MAX_HEADER_ROWS) + 1)))
+    provisional_rows = _provisional_header_rows(grid, MAX_HEADER_ROWS)
+    if not provisional_rows:
+        provisional_rows = list(
+            range(1, min(grid.n_rows, MAX_HEADER_ROWS) + 1))
+    provisional_headers = header_texts_for(grid, provisional_rows)
 
-    scan_rows = _datalike_rows(grid, MAX_SCAN_ROWS)
+    scan_rows = _datalike_rows(grid, MAX_COLUMN_SCAN_ROWS)
     if not scan_rows:
-        scan_rows = list(range(1, min(grid.n_rows, MAX_SCAN_ROWS) + 1))
+        scan_rows = list(range(
+            1, min(grid.n_rows, MAX_COLUMN_SCAN_ROWS) + 1))
     coord = _detect_coordinates(grid, scan_rows, provisional_headers, reasons)
     if coord is None:
         reasons["coordinates"] = "No coordinate columns could be detected."
+        profile.excluded_columns = list(range(1, grid.n_cols + 1))
         return DetectionResult(profile=profile, reasons=reasons,
                                header_texts=provisional_headers)
     profile.coord_encoding, coord_mapping = coord
     profile.mapping.update(coord_mapping)
 
-    coord_rows = _coordinate_rows(grid, profile, MAX_SCAN_ROWS)
+    # Column inference is sampled for speed, but the confirmed coordinate
+    # mapping is cheap and reliable enough to apply to every loaded row. This
+    # prevents long RPLs being silently capped while still letting the range
+    # detector reject separate footer/notes blocks.
+    coord_rows = _coordinate_rows(grid, profile, grid.n_rows)
     start, end, layout = _detect_range_and_layout(coord_rows, reasons)
     profile.data_start_row, profile.data_end_row = start, end
     profile.layout = layout
@@ -472,6 +558,10 @@ def detect(grid: SourceGrid) -> DetectionResult:
     profile.header_rows = _header_rows(grid, start) if start else []
     header_texts = (header_texts_for(grid, profile.header_rows)
                     if profile.header_rows else provisional_headers)
+    if profile.header_rows:
+        reasons["headers"] = (
+            "Combined header rows "
+            + ", ".join(str(row) for row in profile.header_rows) + ".")
     profile.header_signature = header_signature(header_texts)
 
     data_rows = [r for r in coord_rows if start <= r <= end]
@@ -481,6 +571,11 @@ def detect(grid: SourceGrid) -> DetectionResult:
     _map_remaining_columns(grid, header_texts, profile,
                            (data_rows + seg_rows) or scan_rows, reasons)
     _detect_units(header_texts, profile, reasons)
+    mapped_columns = set(profile.mapping.values())
+    profile.excluded_columns = [
+        column for column in range(1, grid.n_cols + 1)
+        if column not in mapped_columns
+    ]
 
     position_count = len(data_rows)
     confidence = _confidence(profile, position_count, reasons)

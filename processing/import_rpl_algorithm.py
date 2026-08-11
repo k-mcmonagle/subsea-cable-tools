@@ -121,6 +121,7 @@ class ImportRPLAlgorithm(QgsProcessingAlgorithm):
                 raise QgsProcessingException(
                     self.tr(f"Could not read profile JSON: {exc}"))
             detection_note = f"profile from {os.path.basename(profile_path)}"
+            auto_detected = False
         else:
             try:
                 results = idetect.score_sheets(ireader.load_sample_grids(path))
@@ -141,6 +142,7 @@ class ImportRPLAlgorithm(QgsProcessingAlgorithm):
                     "Import RPL wizard to inspect the file."))
             profile = result.profile
             detection_note = "auto-detected"
+            auto_detected = True
             for topic, reason in sorted(result.reasons.items()):
                 feedback.pushInfo(f"[detect] {topic}: {reason}")
 
@@ -150,7 +152,13 @@ class ImportRPLAlgorithm(QgsProcessingAlgorithm):
                 path, sheet=profile.sheet if ireader.is_excel(path) else None)
         except ireader.ReaderError as exc:
             raise QgsProcessingException(str(exc))
-        if not profile.data_end_row:
+        if auto_detected:
+            result = idetect.detect(grid)
+            profile = result.profile
+            feedback.pushInfo(
+                f"[detect] full data range: rows {profile.data_start_row}-"
+                f"{profile.data_end_row} ({result.position_count} positions)")
+        elif not profile.data_end_row:
             profile.data_end_row = grid.n_rows
         doc, parse_diags = iparser.parse(grid, profile)
 

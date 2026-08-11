@@ -8,8 +8,8 @@ Three pages:
    and RPL kind.
 2. Detection & mapping — the actual worksheet in a virtual table view with
    highlighted header/point/segment rows, correctable layout, data range,
-   coordinate encoding, source CRS, units, and column mapping, plus saved
-   mapping profiles keyed by the header signature.
+    coordinate encoding, source CRS, units, and per-column mapping/exclusion,
+    plus saved mapping profiles keyed by the header signature.
 3. Review & import — counts, stated vs computed lengths, grouped navigable
    diagnostics, warning acknowledgement, targeted sign-flip fix, temporary
    map preview. Errors block import; the finish button names the target
@@ -26,15 +26,15 @@ import os
 from typing import Dict, List, Optional
 
 from qgis.PyQt.QtCore import (
-    QAbstractTableModel, QModelIndex, QSettings, Qt, QThread, pyqtSignal,
+    QAbstractTableModel, QModelIndex, QSettings, Qt, QTimer, pyqtSignal,
 )
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QFormLayout,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout,
     QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton,
-    QSpinBox, QSplitter, QTableView, QTableWidget, QTableWidgetItem,
-    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWizard, QWizardPage, QWidget,
+    QSizePolicy, QSpinBox, QSplitter, QTableView, QTableWidget, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout, QWizard, QWizardPage, QWidget,
 )
 
 from ..rpl_import import model as im
@@ -52,6 +52,7 @@ from .rpl_import_service import (
 from .store import WorkbenchStore
 
 PROFILE_SETTINGS_GROUP = "SubseaCableTools/RplImport/profiles"
+_INCLUDE_EXTRA = "__include_as_extra__"
 
 _FIELD_LABELS = [
     (im.PF_POS_NO, "Position number"),
@@ -103,25 +104,6 @@ def _col_letter(index: int) -> str:
         index, rem = divmod(index - 1, 26)
         letters = chr(ord("A") + rem) + letters
     return letters
-
-
-# ---------------------------------------------------------------------------
-# Background worksheet scanner
-# ---------------------------------------------------------------------------
-class _ScanWorker(QThread):
-    finished_ok = pyqtSignal(object)     # List[DetectionResult]
-    failed = pyqtSignal(str)
-
-    def __init__(self, path: str, parent=None):
-        super().__init__(parent)
-        self._path = path
-
-    def run(self):
-        try:
-            grids = ireader.load_sample_grids(self._path)
-            self.finished_ok.emit(idetect.score_sheets(grids))
-        except Exception as exc:
-            self.failed.emit(str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +236,7 @@ class _SourcePage(QWizardPage):
         form.addRow("", self.slack_hint)
         layout.addWidget(dest)
 
-        self._worker: Optional[_ScanWorker] = None
+        self._scan_generation = 0
         self._results: List[idetect.DetectionResult] = []
         self.file_edit.editingFinished.connect(self._file_entered)
         self._kind_changed()
@@ -274,19 +256,33 @@ class _SourcePage(QWizardPage):
             self._start_scan(path)
 
     def _start_scan(self, path: str):
-        if self._worker is not None and self._worker.isRunning():
-            self._worker.wait(100)
+        self._scan_generation += 1
+        generation = self._scan_generation
         self.sheet_list.clear()
         self._results = []
         self.scan_label.setText("Scanning worksheets...")
-        self._worker = _ScanWorker(path, self)
-        self._worker.finished_ok.connect(self._scan_done)
-        self._worker.failed.connect(self._scan_failed)
-        self._worker.start()
+        QTimer.singleShot(
+            0, lambda: self._scan_on_gui_thread(path, generation))
 
         base = os.path.splitext(os.path.basename(path))[0]
         if not self.route_combo.currentText().strip():
             self.route_combo.setEditText(base)
+
+    def _scan_on_gui_thread(self, path: str, generation: int):
+        if generation != self._scan_generation:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            grids = ireader.load_sample_grids(path)
+            results = idetect.score_sheets(grids)
+        except Exception as exc:
+            if generation == self._scan_generation:
+                self._scan_failed(str(exc))
+        else:
+            if generation == self._scan_generation:
+                self._scan_done(results)
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def _scan_done(self, results):
         self._results = list(results)
@@ -378,13 +374,22 @@ class _MappingPage(QWizardPage):
         self.setTitle("Check what was detected")
         self.setSubTitle(
             "Correct the layout, data range, coordinates, units, and column "
-            "mapping. Unassigned columns are preserved as extra attributes.")
+            "mapping. Choose Include as extra for any additional columns "
+            "you want to retain.")
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._loading = False
+        self._syncing_sections = False
         self._applied_signatures: set = set()
 
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self.splitter = splitter
+        splitter.setChildrenCollapsible(False)
+        splitter.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout = QVBoxLayout(self)
-        layout.addWidget(splitter)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(splitter, 1)
 
         self.grid_model = _GridModel(self)
         self.table = QTableView()
@@ -392,11 +397,54 @@ class _MappingPage(QWizardPage):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Interactive)
-        self.table.horizontalHeader().setDefaultSectionSize(90)
+        self.table.horizontalHeader().setDefaultSectionSize(130)
+        self.table.verticalHeader().setFixedWidth(44)
         self.table.verticalHeader().setDefaultSectionSize(20)
-        splitter.addWidget(self.table)
+        self.table.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.table.setMinimumHeight(360)
+
+        preview_panel = QWidget()
+        preview_layout = QVBoxLayout(preview_panel)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setSpacing(2)
+        mapping_title = QLabel(
+            "<b>Column mapping</b> &nbsp; Choose what each source column "
+            "contains. Unidentified columns start excluded.")
+        mapping_title.setWordWrap(True)
+        preview_layout.addWidget(mapping_title)
+
+        self.mapping_table = QTableWidget(1, 0)
+        self.mapping_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.mapping_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.NoSelection)
+        self.mapping_table.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.mapping_table.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.mapping_table.horizontalHeader().setVisible(False)
+        self.mapping_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Interactive)
+        self.mapping_table.horizontalHeader().setDefaultSectionSize(130)
+        self.mapping_table.verticalHeader().setFixedWidth(44)
+        self.mapping_table.verticalHeader().setDefaultSectionSize(32)
+        self.mapping_table.setVerticalHeaderLabels([""])
+        self.mapping_table.setFixedHeight(36)
+        preview_layout.addWidget(self.mapping_table)
+        preview_layout.addWidget(self.table, 1)
+        splitter.addWidget(preview_panel)
+
+        self.table.horizontalScrollBar().valueChanged.connect(
+            self.mapping_table.horizontalScrollBar().setValue)
+        self.table.horizontalHeader().sectionResized.connect(
+            self._preview_section_resized)
+        self.mapping_table.horizontalHeader().sectionResized.connect(
+            self._mapping_section_resized)
 
         panel = QWidget()
+        panel.setMinimumWidth(300)
+        panel.setMaximumWidth(390)
         panel_layout = QVBoxLayout(panel)
 
         structure = QGroupBox("Structure")
@@ -412,26 +460,39 @@ class _MappingPage(QWizardPage):
                                 im.FLAT_ARRIVING)
         self.flat_combo.addItem("Span fields describe the departing span",
                                 im.FLAT_DEPARTING)
-        form.addWidget(QLabel("Flat spans"), 1, 0)
+        self.flat_label = QLabel("Span values")
+        self.flat_combo.setItemText(
+            0, "Apply to the span arriving at this position")
+        self.flat_combo.setItemText(
+            1, "Apply to the span departing from this position")
+        self.flat_combo.setToolTip(
+            "For one-position-per-row files, choose whether span values on "
+            "a row connect from the previous position or to the next one.")
+        form.addWidget(self.flat_label, 1, 0)
         form.addWidget(self.flat_combo, 1, 1)
         self.start_spin = QSpinBox()
         self.start_spin.setRange(1, 1000000)
         self.end_spin = QSpinBox()
         self.end_spin.setRange(1, 1000000)
-        form.addWidget(QLabel("Data rows"), 2, 0)
+        self.header_rows_label = QLabel("Not detected")
+        self.header_rows_label.setToolTip(
+            "Header rows are combined per source column for field detection.")
+        form.addWidget(QLabel("Header rows"), 2, 0)
+        form.addWidget(self.header_rows_label, 2, 1)
+        form.addWidget(QLabel("Data rows"), 3, 0)
         range_row = QHBoxLayout()
         range_row.addWidget(self.start_spin)
         range_row.addWidget(QLabel("to"))
         range_row.addWidget(self.end_spin)
-        form.addLayout(range_row, 2, 1)
+        form.addLayout(range_row, 3, 1)
         self.encoding_combo = QComboBox()
         for key, label in _ENCODINGS:
             self.encoding_combo.addItem(label, key)
-        form.addWidget(QLabel("Coordinates"), 3, 0)
-        form.addWidget(self.encoding_combo, 3, 1)
+        form.addWidget(QLabel("Coordinates"), 4, 0)
+        form.addWidget(self.encoding_combo, 4, 1)
         self.crs_widget = self._make_crs_widget()
-        form.addWidget(QLabel("Source CRS"), 4, 0)
-        form.addWidget(self.crs_widget, 4, 1)
+        form.addWidget(QLabel("Source CRS"), 5, 0)
+        form.addWidget(self.crs_widget, 5, 1)
         panel_layout.addWidget(structure)
 
         units = QGroupBox("Units")
@@ -457,35 +518,32 @@ class _MappingPage(QWizardPage):
         units_form.addWidget(self.slack_unit, 1, 3)
         panel_layout.addWidget(units)
 
-        mapping_box = QGroupBox("Column mapping (unassigned = kept as extra)")
-        mapping_layout = QVBoxLayout(mapping_box)
-        self.mapping_table = QTableWidget(0, 3)
-        self.mapping_table.setHorizontalHeaderLabels(
-            ["Field", "Column", "Why / notes"])
-        self.mapping_table.horizontalHeader().setSectionResizeMode(
-            2, QHeaderView.ResizeMode.Stretch)
-        self.mapping_table.verticalHeader().setVisible(False)
-        mapping_layout.addWidget(self.mapping_table)
-        profile_row = QHBoxLayout()
+        mapping_profile = QGroupBox("Mapping profile")
+        mapping_profile_layout = QVBoxLayout(mapping_profile)
         self.profile_label = QLabel("")
         self.profile_label.setWordWrap(True)
-        save_profile = QPushButton("Save mapping profile...")
+        mapping_profile_layout.addWidget(self.profile_label)
+        profile_buttons = QHBoxLayout()
+        save_profile = QPushButton("Save...")
+        save_profile.setToolTip("Save this mapping for matching headers")
         save_profile.clicked.connect(self._save_profile)
-        delete_profile = QPushButton("Delete profile")
+        delete_profile = QPushButton("Delete")
+        delete_profile.setToolTip("Delete the saved mapping for these headers")
         delete_profile.clicked.connect(self._delete_profile)
-        profile_row.addWidget(self.profile_label, 1)
-        profile_row.addWidget(save_profile)
-        profile_row.addWidget(delete_profile)
-        mapping_layout.addLayout(profile_row)
-        panel_layout.addWidget(mapping_box, 1)
+        profile_buttons.addWidget(save_profile)
+        profile_buttons.addWidget(delete_profile)
+        mapping_profile_layout.addLayout(profile_buttons)
+        panel_layout.addWidget(mapping_profile)
 
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
+        panel_layout.addStretch(1)
         panel_layout.addWidget(self.status_label)
 
         splitter.addWidget(panel)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
+        splitter.setSizes([1000, 340])
 
         for widget in (self.layout_combo, self.flat_combo, self.encoding_combo,
                        self.dist_unit, self.cable_unit, self.depth_unit,
@@ -502,7 +560,7 @@ class _MappingPage(QWizardPage):
             return widget
         except Exception:
             edit = QLineEdit()
-            edit.setPlaceholderText("EPSG:32630")
+            edit.setPlaceholderText("EPSG:4326")
             edit.editingFinished.connect(self._controls_changed)
             return edit
 
@@ -514,6 +572,33 @@ class _MappingPage(QWizardPage):
             return widget.crs().authid()
         except Exception:
             return ""
+
+    def _set_crs_authid(self, authid: str):
+        authid = authid or "EPSG:4326"
+        if isinstance(self.crs_widget, QLineEdit):
+            self.crs_widget.setText(authid)
+            return
+        try:
+            from qgis.core import QgsCoordinateReferenceSystem
+            self.crs_widget.setCrs(QgsCoordinateReferenceSystem(authid))
+        except Exception:
+            pass
+
+    def _preview_section_resized(self, section: int, _old: int, size: int):
+        self._sync_section_width(
+            self.mapping_table.horizontalHeader(), section, size)
+
+    def _mapping_section_resized(self, section: int, _old: int, size: int):
+        self._sync_section_width(self.table.horizontalHeader(), section, size)
+
+    def _sync_section_width(self, target: QHeaderView, section: int, size: int):
+        if self._syncing_sections or section >= target.count():
+            return
+        self._syncing_sections = True
+        try:
+            target.resizeSection(section, size)
+        finally:
+            self._syncing_sections = False
 
     # -- profile <-> controls -------------------------------------------------
     def _profile_from_controls(self) -> ImportProfile:
@@ -529,13 +614,18 @@ class _MappingPage(QWizardPage):
         profile.depth_unit = self.depth_unit.currentData()
         profile.slack_is_ratio = bool(self.slack_unit.currentData())
         mapping: Dict[str, int] = {}
-        for row in range(self.mapping_table.rowCount()):
-            combo = self.mapping_table.cellWidget(row, 1)
-            field_key = combo.property("field_key")
-            col = combo.currentData()
-            if col:
-                mapping[field_key] = col
+        excluded_columns: List[int] = []
+        for column in range(self.mapping_table.columnCount()):
+            combo = self.mapping_table.cellWidget(0, column)
+            field_key = combo.currentData() if combo is not None else ""
+            if field_key == _INCLUDE_EXTRA:
+                continue
+            if field_key:
+                mapping[field_key] = column + 1
+            else:
+                excluded_columns.append(column + 1)
         profile.mapping = mapping
+        profile.excluded_columns = excluded_columns
         return profile
 
     def _controls_to_profile_widgets(self, profile: ImportProfile):
@@ -547,6 +637,8 @@ class _MappingPage(QWizardPage):
                 max(0, self.flat_combo.findData(profile.flat_semantics)))
             self.start_spin.setValue(max(1, profile.data_start_row))
             self.end_spin.setValue(max(1, profile.data_end_row))
+            self.header_rows_label.setText(
+                self._row_list_text(profile.header_rows))
             self.encoding_combo.setCurrentIndex(
                 max(0, self.encoding_combo.findData(profile.coord_encoding)))
             self.dist_unit.setCurrentIndex(
@@ -556,40 +648,84 @@ class _MappingPage(QWizardPage):
             self.depth_unit.setCurrentIndex(
                 max(0, self.depth_unit.findData(profile.depth_unit)))
             self.slack_unit.setCurrentIndex(1 if profile.slack_is_ratio else 0)
-            if isinstance(self.crs_widget, QLineEdit):
-                self.crs_widget.setText(profile.source_crs or "")
+            self._set_crs_authid(profile.source_crs)
+            self._update_layout_controls()
             self._rebuild_mapping_table(profile)
         finally:
             self._loading = False
 
+    @staticmethod
+    def _row_list_text(rows: List[int]) -> str:
+        if not rows:
+            return "Not detected"
+        if rows == list(range(rows[0], rows[-1] + 1)):
+            return (f"{rows[0]}" if len(rows) == 1
+                    else f"{rows[0]}-{rows[-1]} (combined)")
+        return ", ".join(str(row) for row in rows) + " (combined)"
+
     def _rebuild_mapping_table(self, profile: ImportProfile):
         headers = self.wiz.header_texts
         reasons = self.wiz.detection_reasons
-        self.mapping_table.setRowCount(0)
         n_cols = self.wiz.grid.n_cols if self.wiz.grid else 0
-        for field_key, label in _FIELD_LABELS:
-            row = self.mapping_table.rowCount()
-            self.mapping_table.insertRow(row)
-            self.mapping_table.setItem(row, 0, QTableWidgetItem(label))
+        self.mapping_table.clearContents()
+        self.mapping_table.setColumnCount(n_cols)
+        self.mapping_table.setRowCount(1)
+        for column in range(1, n_cols + 1):
+            header = headers[column - 1] if column - 1 < len(headers) else ""
             combo = QComboBox()
-            combo.setProperty("field_key", field_key)
-            combo.addItem("—", 0)
-            for col in range(1, n_cols + 1):
-                header = headers[col - 1] if col - 1 < len(headers) else ""
-                text = _col_letter(col) + (f" · {header}" if header else "")
-                combo.addItem(text, col)
-            current = profile.mapping.get(field_key) or 0
+            combo.addItem("Exclude", "")
+            combo.addItem("Include as extra", _INCLUDE_EXTRA)
+            for field_key, label in _FIELD_LABELS:
+                combo.addItem(label, field_key)
+            current = next(
+                (field_key for field_key, mapped_column in profile.mapping.items()
+                 if mapped_column == column), None)
+            if current is None:
+                current = ("" if column in profile.excluded_columns
+                           else _INCLUDE_EXTRA)
             combo.setCurrentIndex(max(0, combo.findData(current)))
-            combo.currentIndexChanged.connect(self._controls_changed)
-            self.mapping_table.setCellWidget(row, 1, combo)
-            why = QTableWidgetItem(reasons.get(field_key, ""))
-            self.mapping_table.setItem(row, 2, why)
-        self.mapping_table.resizeColumnsToContents()
+            source = _col_letter(column) + (f" · {header}" if header else "")
+            reason = reasons.get(current, reasons.get("coordinates", ""))
+            combo.setToolTip(source + (f"\n{reason}" if reason else ""))
+            combo.currentIndexChanged.connect(
+                lambda _index, col=column: self._mapping_changed(col))
+            self.mapping_table.setCellWidget(0, column - 1, combo)
+        for section in range(n_cols):
+            self.mapping_table.setColumnWidth(
+                section, self.table.columnWidth(section))
+
+    def _mapping_changed(self, column: int):
+        if self._loading:
+            return
+        changed = self.mapping_table.cellWidget(0, column - 1)
+        field_key = changed.currentData() if changed is not None else ""
+        if field_key and field_key != _INCLUDE_EXTRA:
+            self._loading = True
+            try:
+                for other_column in range(self.mapping_table.columnCount()):
+                    if other_column == column - 1:
+                        continue
+                    combo = self.mapping_table.cellWidget(0, other_column)
+                    if combo is not None and combo.currentData() == field_key:
+                        combo.setCurrentIndex(0)
+            finally:
+                self._loading = False
+        reason = self.wiz.detection_reasons.get(
+            field_key, self.wiz.detection_reasons.get("coordinates", ""))
+        if changed is not None:
+            changed.setToolTip(reason)
+        self._controls_changed()
+
+    def _update_layout_controls(self):
+        is_flat = self.layout_combo.currentData() == im.LAYOUT_FLAT
+        self.flat_label.setVisible(is_flat)
+        self.flat_combo.setVisible(is_flat)
 
     # -- reactions -------------------------------------------------------------
     def _controls_changed(self, *args):
         if self._loading:
             return
+        self._update_layout_controls()
         profile = self._profile_from_controls()
         self._refresh_preview(profile)
 
@@ -613,6 +749,12 @@ class _MappingPage(QWizardPage):
             bits.append(f"{len(errors)} error(s)")
         if warnings:
             bits.append(f"{len(warnings)} warning(s)")
+        included_extras = (self.mapping_table.columnCount()
+                           - len(profile.mapping)
+                           - len(profile.excluded_columns))
+        bits.append(f"{len(profile.excluded_columns)} column(s) excluded")
+        if included_extras:
+            bits.append(f"{included_extras} extra column(s) included")
         self.status_label.setText("; ".join(bits))
         self.completeChanged.emit()
 
@@ -886,7 +1028,7 @@ class RplImportWizard(QWizard):
                  parent=None):
         super().__init__(parent)
         self.setWindowTitle("Import RPL")
-        self.resize(1150, 700)
+        self.resize(1400, 820)
         self.store = store
         self.iface = iface
 
@@ -938,8 +1080,10 @@ class RplImportWizard(QWizard):
             return
         self.grid = ireader.load_grid(self.path, sheet=(
             self.profile.sheet if ireader.is_excel(self.path) else None))
-        if not self.profile.data_end_row:
-            self.profile.data_end_row = self.grid.n_rows
+        result = idetect.detect(self.grid)
+        self.profile = result.profile
+        self.header_texts = result.header_texts
+        self.detection_reasons = dict(result.reasons)
 
     def reparse(self, full: bool = False):
         """Parse + (projected transform) + validate under the current profile."""
