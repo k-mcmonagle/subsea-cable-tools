@@ -8,6 +8,8 @@ import gc
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsFeature,
+    QgsField,
+    QgsFields,
     QgsProcessing,
     QgsProcessingContext,
     QgsProcessingException,
@@ -225,6 +227,182 @@ def test_multi_file_dispatch_and_failure_isolation():
     return _result("MDB files dispatch once and failures do not block others", ok, str(algorithm.calls))
 
 
+def test_source_crs_parameter_wording():
+    algorithm = ImportMdbAlgorithm()
+    algorithm.initAlgorithm()
+    parameter = algorithm.parameterDefinition(algorithm.SOURCE_CRS)
+    ok = (
+        parameter is not None
+        # The stored key stays TARGET_CRS so existing models keep working.
+        and algorithm.SOURCE_CRS == "TARGET_CRS"
+        and "Source CRS" in parameter.description()
+        and "MDB" in parameter.description()
+    )
+    return _result("MDB CRS parameter is described as the source CRS", ok)
+
+
+def test_worker_listing_envelope_and_legacy_shape():
+    envelope = {
+        "tables": {"A": {"geom_field_name": "Geometry", "geometry_type_code": 1}},
+        "non_spatial": [{"table": "Sediment_Classification", "row_count": 12,
+                         "reason": "no geometry field and no recognised coordinate pair"}],
+    }
+    tables, non_spatial = ImportMdbAlgorithm._read_listing(envelope)
+    ok = list(tables) == ["A"] and len(non_spatial) == 1
+
+    legacy = {"B": {"geom_field_name": "Geom", "geometry_type_code": 2}}
+    tables, non_spatial = ImportMdbAlgorithm._read_listing(legacy)
+    ok = ok and list(tables) == ["B"] and non_spatial == []
+    ok = ok and ImportMdbAlgorithm._read_listing(None) == ({}, [])
+    return _result("MDB worker listing accepts both response shapes", ok)
+
+
+def test_multipoint_filtering_keeps_environment_behaviour():
+    should_load = ImportMdbAlgorithm._should_load_geometry_type
+    ok = (
+        should_load("LineString", False)
+        and should_load("Polygon", False)
+        and should_load("Point", False)
+        and not should_load("MultiPoint", False)
+        and not should_load("MultiPolygon", False)
+        and should_load("MultiPoint", True)
+    )
+    return _result("MultiPoint layers stay behind SUBSEA_MDB_LOAD_ALL_GEOMS", ok)
+
+
+def test_populated_table_without_geometry_is_reported_as_an_error():
+    feedback = _Feedback()
+    ImportMdbAlgorithm._report_table_result(
+        "Mag_Contact_ID",
+        {
+            "table": "Mag_Contact_ID", "status": "parse_failed", "row_count": 17,
+            "non_null_geometry_count": 17, "blob_decoded_count": 0,
+            "xy_fallback_count": 0, "invalid_geometry_count": 17,
+            "outputs": {}, "message": "no geometry BLOB could be decoded",
+        },
+        feedback,
+    )
+    ok = len(feedback.errors) == 1 and "rows=17" in feedback.errors[0]
+
+    empty_feedback = _Feedback()
+    ImportMdbAlgorithm._report_table_result(
+        "Subcropping_ROCK",
+        {"table": "Subcropping_ROCK", "status": "empty", "row_count": 0,
+         "outputs": {}, "message": "table is empty"},
+        empty_feedback,
+    )
+    ok = ok and not empty_feedback.errors
+    return _result("populated tables with no geometry are escalated, empty ones are not", ok)
+
+
+def test_table_summary_reports_geometry_sources():
+    summary = ImportMdbAlgorithm._summarise_table_result({
+        "table": "Mag_Contact_ID", "row_count": 17, "non_null_geometry_count": 17,
+        "blob_decoded_count": 0, "xy_fallback_count": 17,
+        "invalid_geometry_count": 0, "outputs": {"Point": "/tmp/x.geojson"},
+        "message": "",
+    })
+    ok = (
+        "rows=17" in summary
+        and "non-null BLOBs=17" in summary
+        and "BLOB decoded=0" in summary
+        and "XY fallback=17" in summary
+        and "outputs=Point" in summary
+    )
+    return _result("MDB table summary shows BLOB and fallback counts", ok, summary)
+
+
+def test_non_spatial_tables_are_reported_without_geometry():
+    feedback = _Feedback()
+    ImportMdbAlgorithm._report_non_spatial_tables(
+        [{"table": "Sediment_Classification", "row_count": 12,
+          "classification": "non_spatial",
+          "reason": "no geometry field and no recognised coordinate pair"}],
+        feedback,
+    )
+    ok = not feedback.errors
+    return _result("non-spatial MDB tables are reported, not loaded", ok)
+
+
+def test_temporary_gpkg_path_with_spaces():
+    context = QgsProcessingContext()
+    source = QgsVectorLayer("Point?crs=EPSG:4326&field=name:string", "source", "memory")
+    feature = QgsFeature(source.fields())
+    feature.setAttributes(["a"])
+    source.dataProvider().addFeature(feature)
+    layer = mdb_import._write_to_temporary_gpkg(
+        source,
+        "Survey Data 2024 - Mag Contact ID (Point)",
+        QgsCoordinateReferenceSystem("EPSG:4326"),
+        context,
+        _Feedback(),
+    )
+    ok = layer is not None and layer.isValid() and layer.featureCount() == 1
+    return _result("MDB output names containing spaces still write to GeoPackage", ok)
+
+
+def test_case_insensitive_field_names_are_deduplicated():
+    def _fields(names):
+        fields = QgsFields()
+        for name in names:
+            fields.append(QgsField(name, mdb_import.FIELD_TYPE_DOUBLE))
+        return list(fields)
+
+    renamed, reserved = mdb_import.resolve_gpkg_field_names(
+        _fields(("Depth", "Easting", "depth", "source")))
+    ok = renamed == {"depth": "depth_2"} and "easting" in reserved
+
+    renamed, _ = mdb_import.resolve_gpkg_field_names(_fields(("fid", "source_fid")))
+    ok = ok and renamed == {"fid": "source_fid_2"}
+    return _result("GeoPackage field names are de-duplicated case-insensitively", ok, str(renamed))
+
+
+def test_source_depth_column_does_not_break_geopackage_output():
+    """A source 'Depth' column and the derived 'depth' collide in GeoPackage."""
+    context = QgsProcessingContext()
+    source = QgsVectorLayer(
+        "Point?crs=EPSG:4326&field=Depth:double&field=Easting:double"
+        "&field=depth:double&field=source:string",
+        "source",
+        "memory",
+    )
+    feature = QgsFeature(source.fields())
+    feature.setAttributes([12.5, 500100.0, 34.5, "survey.mdb"])
+    source.dataProvider().addFeature(feature)
+
+    feedback = _Feedback()
+    layer = mdb_import._write_to_temporary_gpkg(
+        source,
+        "Survey - Sonar_Contact (Point)",
+        QgsCoordinateReferenceSystem("EPSG:4326"),
+        context,
+        feedback,
+    )
+    ok = layer is not None and layer.isValid() and layer.featureCount() == 1
+    if ok:
+        names = layer.fields().names()
+        ok = "Depth" in names and "depth_2" in names and not feedback.errors
+        imported = next(layer.getFeatures())
+        ok = ok and imported["Depth"] == 12.5 and imported["depth_2"] == 34.5
+    return _result("source Depth column no longer blocks GeoPackage creation", ok)
+
+
+def test_table_summary_reports_secondary_geometry():
+    summary = ImportMdbAlgorithm._summarise_table_result({
+        "table": "Description_Leader", "row_count": 254,
+        "non_null_geometry_count": 114, "blob_decoded_count": 114,
+        "secondary_blob_decoded_count": 140, "xy_fallback_count": 0,
+        "invalid_geometry_count": 0,
+        "geometry_fields_used": ["LinearGeometry", "CoordGeocodePoint"],
+        "outputs": {"LineString": "a", "Point": "b"}, "message": "",
+    })
+    ok = (
+        "secondary BLOB decoded=140" in summary
+        and "geometry fields=LinearGeometry, CoordGeocodePoint" in summary
+    )
+    return _result("summary reports secondary geometry columns", ok, summary)
+
+
 def run_all():
     return [
         test_multi_file_parameter(),
@@ -233,6 +411,16 @@ def run_all():
         test_cancel_terminates_worker(),
         test_merged_internal_ids_save_to_geopackage(),
         test_multi_file_dispatch_and_failure_isolation(),
+        test_source_crs_parameter_wording(),
+        test_worker_listing_envelope_and_legacy_shape(),
+        test_multipoint_filtering_keeps_environment_behaviour(),
+        test_populated_table_without_geometry_is_reported_as_an_error(),
+        test_table_summary_reports_geometry_sources(),
+        test_non_spatial_tables_are_reported_without_geometry(),
+        test_temporary_gpkg_path_with_spaces(),
+        test_case_insensitive_field_names_are_deduplicated(),
+        test_source_depth_column_does_not_break_geopackage_output(),
+        test_table_summary_reports_secondary_geometry(),
     ]
 
 

@@ -8,7 +8,6 @@ CRS and adds 'depth' and 'source' attributes.
 """
 
 import os
-import struct
 import math
 import traceback
 import json
@@ -45,6 +44,7 @@ from ..qgis_compat import (
     processing_generate_temp_filename,
     processing_temp_folder,
 )
+from .geomedia_blob import parse_blob  # noqa: F401 - re-exported for callers/tests
 
 
 ACCESS_ODBC_DRIVER_NAME = "Microsoft Access Driver (*.mdb, *.accdb)"
@@ -145,54 +145,6 @@ def _test_mdb_connection(mdb_file, feedback=None, timeout_seconds=5):
             sqlstate = e.args[0] if getattr(e, 'args', None) else ''
             raise QgsProcessingException(f"ODBC connection failed: {sqlstate} - {e}")
         raise QgsProcessingException(f"ODBC connection failed: {e}")
-
-
-def parse_blob(blob):
-    try:
-        if blob is None:
-            return None
-
-        # pyodbc can return memoryview/bytearray for BLOB columns
-        if isinstance(blob, memoryview):
-            blob = blob.tobytes()
-
-        if len(blob) < 20:
-            return None
-
-        # 16-byte "magic" prefix
-        magic_16 = blob[:16]
-        # The standard tail is the last 15 bytes we know from old "c2ff..." signature
-        standard_tail = bytes.fromhex("ffd20fbc8ccf11abde08003601b769")
-
-        # Check if bytes 1..16 match
-        if magic_16[1:] != standard_tail:
-            # Optionally log or allow more variations
-            return None
-
-        # Now read the next 4 bytes as the point count
-        num_points = struct.unpack("<i", blob[16:20])[0]
-        if num_points < 0 or num_points > 100000:
-            return None
-
-        # The total length we expect for the geometry is 20 + (24 * num_points)
-        expected_length = 20 + (24 * num_points)
-        if len(blob) < expected_length:
-            return None
-
-        vertices = []
-        offset = 20
-        for _ in range(num_points):
-            coords = struct.unpack("<ddd", blob[offset : offset + 24])
-            vertices.append(coords)
-            offset += 24
-
-        return vertices
-
-    except struct.error:
-        return None
-    except Exception:
-        return None
-
 
 
 def create_wkt(geom_type, vertices):
@@ -615,17 +567,53 @@ class _MdbFieldValueConverter(QgsVectorFileWriter.FieldValueConverter):
 
     def fieldDefinition(self, field):
         output_field = QgsField(field)
-        output_field.setName(self._renamed_fields.get(field.name().casefold(), field.name()))
+        output_field.setName(self._renamed_fields.get(field.name(), field.name()))
         return output_field
 
     def convert(self, field_index, value):
         return value
 
 
-def _write_to_temporary_gpkg(source_layer, layer_name, import_crs, context, feedback):
-    """Stream a worker layer to an indexed, session-managed GeoPackage."""
-    if import_crs and import_crs.isValid():
-        source_layer.setCrs(import_crs)
+def resolve_gpkg_field_names(source_fields):
+    """Return ``(renamed, reserved)`` for GeoPackage-safe field names.
+
+    GeoPackage column names are case-insensitive, so a source ``Depth`` column
+    and the derived ``depth`` attribute collide and the whole table fails to be
+    created. First occurrences keep their name — source attributes are listed
+    before derived ones — and later collisions are suffixed. ``fid`` is always
+    renamed because it is the GeoPackage primary key.
+    """
+    reserved = set()
+    deferred = []
+    for field in source_fields:
+        name = field.name()
+        key = name.casefold()
+        if key == "fid" or key in reserved:
+            deferred.append(name)
+            continue
+        reserved.add(key)
+
+    renamed = {}
+    for name in deferred:
+        base = "source_fid" if name.casefold() == "fid" else name
+        candidate = base
+        suffix = 2
+        while candidate.casefold() in reserved:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        reserved.add(candidate.casefold())
+        renamed[name] = candidate
+    return renamed, reserved
+
+
+def _write_to_temporary_gpkg(source_layer, layer_name, source_crs, context, feedback):
+    """Stream a worker layer to an indexed, session-managed GeoPackage.
+
+    ``source_crs`` is *assigned* to the incoming CRS-less GeoJSON layer. No
+    coordinate transform is performed; MDB coordinates are written unchanged.
+    """
+    if source_crs and source_crs.isValid():
+        source_layer.setCrs(source_crs)
 
     gpkg_path = processing_generate_temp_filename(
         _safe_temp_stem(layer_name) + ".gpkg",
@@ -635,22 +623,17 @@ def _write_to_temporary_gpkg(source_layer, layer_name, import_crs, context, feed
     options = QgsVectorFileWriter.SaveVectorOptions()
     options.driverName = "GPKG"
     options.layerName = storage_layer_name
-    source_fields = list(source_layer.fields())
-    source_field_names = {field.name().casefold() for field in source_fields}
-    reserved_names = {name for name in source_field_names if name != "fid"}
-    renamed_fields = {}
-    if "fid" in source_field_names:
-        candidate = "source_fid"
-        suffix = 2
-        while candidate.casefold() in reserved_names:
-            candidate = f"source_fid_{suffix}"
-            suffix += 1
-        renamed_fields["fid"] = candidate
-        reserved_names.add(candidate.casefold())
+
+    renamed_fields, reserved_names = resolve_gpkg_field_names(list(source_layer.fields()))
+    if renamed_fields:
+        feedback.pushInfo(
+            "  Renamed for GeoPackage (column names are case-insensitive): "
+            + ", ".join(f"{old} -> {new}" for old, new in sorted(renamed_fields.items()))
+        )
 
     fid_name = "__subsea_fid"
     suffix = 2
-    while fid_name.casefold() in source_field_names or fid_name.casefold() in reserved_names:
+    while fid_name.casefold() in reserved_names:
         fid_name = f"__subsea_fid_{suffix}"
         suffix += 1
     field_converter = _MdbFieldValueConverter(renamed_fields)
@@ -685,8 +668,18 @@ def _write_to_temporary_gpkg(source_layer, layer_name, import_crs, context, feed
 
 class ImportMdbAlgorithm(QgsProcessingAlgorithm):
     INPUT_MDB = 'INPUT_MDB'
-    TARGET_CRS = 'TARGET_CRS'
+    # The stored key stays 'TARGET_CRS' so existing models and scripts keep
+    # working. It has only ever assigned the CRS of the MDB coordinates.
+    SOURCE_CRS = 'TARGET_CRS'
+    TARGET_CRS = SOURCE_CRS
     OUTPUT_LAYERS = 'OUTPUT_LAYERS'
+
+    #: Geometry types loaded without SUBSEA_MDB_LOAD_ALL_GEOMS=1.
+    DEFAULT_GEOMETRY_TYPES = frozenset({'LineString', 'Polygon', 'Point'})
+
+    @classmethod
+    def _should_load_geometry_type(cls, geometry_type_name, load_all_geoms):
+        return bool(load_all_geoms) or str(geometry_type_name) in cls.DEFAULT_GEOMETRY_TYPES
 
     def initAlgorithm(self, config=None):
         self.addParameter(QgsProcessingParameterMultipleLayers(
@@ -694,7 +687,11 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
             self.tr('Input MDB File(s)'),
             QgsProcessing.TypeFile,
         ))
-        self.addParameter(QgsProcessingParameterCrs(self.TARGET_CRS, self.tr('Coordinate System'), optional=False))
+        self.addParameter(QgsProcessingParameterCrs(
+            self.SOURCE_CRS,
+            self.tr('Source CRS / CRS of coordinates in MDB'),
+            optional=False,
+        ))
         self.addOutput(QgsProcessingOutputMultipleLayers(self.OUTPUT_LAYERS, self.tr('Imported Layers')))
 
     def _run_worker(self, args, feedback, timeout=600):
@@ -810,9 +807,10 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
             )
 
         mdb_files = self.parameterAsFileList(parameters, self.INPUT_MDB, context)
-        target_crs = self.parameterAsCrs(parameters, self.TARGET_CRS, context)
-        if not target_crs or not target_crs.isValid():
-            raise QgsProcessingException("No valid CRS provided. Set a Target CRS.")
+        source_crs = self.parameterAsCrs(parameters, self.SOURCE_CRS, context)
+        if not source_crs or not source_crs.isValid():
+            raise QgsProcessingException(
+                "No valid CRS provided. Set the Source CRS of the coordinates in the MDB.")
 
         normalized_files = []
         seen_paths = set()
@@ -841,6 +839,7 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
         isolate = os.environ.get('SUBSEA_MDB_NO_SUBPROCESS', '0') not in {'1', 'true', 'True'}
         keep_temp = os.environ.get('SUBSEA_MDB_KEEP_TEMP', '0') in {'1', 'true', 'True'}
         load_all_geoms = os.environ.get('SUBSEA_MDB_LOAD_ALL_GEOMS', '0') in {'1', 'true', 'True'}
+        schema_discovery = os.environ.get('SUBSEA_MDB_SCHEMA_DISCOVERY', '0') in {'1', 'true', 'True'}
         max_features_env = os.environ.get('SUBSEA_MDB_MAX_FEATURES', '0')
         try:
             max_features = int(max_features_env)
@@ -861,13 +860,14 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
             try:
                 file_outputs = self._process_mdb_file(
                     mdb_file,
-                    target_crs,
+                    source_crs,
                     context,
                     feedback,
                     isolate=isolate,
                     keep_temp=keep_temp,
                     load_all_geoms=load_all_geoms,
                     max_features=max_features,
+                    schema_discovery=schema_discovery,
                 )
             except Exception as exc:  # noqa: BLE001 - one bad file must not kill the batch
                 if feedback.isCanceled():
@@ -894,13 +894,14 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
     def _process_mdb_file(
         self,
         mdb_file,
-        target_crs,
+        source_crs,
         context,
         feedback,
         isolate,
         keep_temp,
         load_all_geoms,
         max_features,
+        schema_discovery=False,
     ):
         file_name = os.path.basename(mdb_file)
         file_ref = os.path.splitext(file_name)[0]
@@ -928,14 +929,28 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
                 temp_dir = os.path.dirname(temp_marker)
                 feedback.pushInfo(f'Using managed temp dir: {temp_dir}')
 
-            tables = self._run_worker(['--mode', 'list', '--mdb', mdb_file], feedback)
-            if not tables:
+            listing = self._run_worker(
+                [
+                    '--mode', 'list',
+                    '--mdb', mdb_file,
+                    '--schema-discovery', '1' if schema_discovery else '0',
+                ],
+                feedback,
+            )
+            discovered, non_spatial = self._read_listing(listing)
+            self._report_non_spatial_tables(non_spatial, feedback)
+            if not discovered:
                 raise QgsProcessingException('No feature tables found in the MDB (worker list returned empty).')
 
             feature_tables = {
                 name: (meta.get('geom_field_name'), meta.get('geometry_type_code'))
-                for name, meta in tables.items()
+                for name, meta in discovered.items()
             }
+            for name, meta in discovered.items():
+                if meta.get('discovery') == 'schema':
+                    feedback.pushInfo(
+                        f"  {name}: not registered in GFeatures; discovered from the table schema"
+                    )
         else:
             # Expert-only fallback for debugging environments where subprocess execution is blocked.
             feedback.reportError(
@@ -947,6 +962,15 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
 
         if not feature_tables:
             raise QgsProcessingException("No feature tables found in the MDB.")
+
+        if source_crs and source_crs.isValid():
+            feedback.pushInfo(
+                f"Assigning source CRS {source_crs.authid()} to the imported coordinates "
+                "(no reprojection is performed)."
+            )
+        else:
+            raise QgsProcessingException(
+                "No valid CRS provided. Set the Source CRS of the coordinates in the MDB.")
 
         output_layers = {}
         table_count = len(feature_tables)
@@ -960,85 +984,59 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
                 f"{file_name}: table {table_index} of {table_count} - {table_name}"
             )
             feedback.pushInfo(f"Processing table: {table_name}")
-            if target_crs and target_crs.isValid():
-                import_crs = target_crs
-                feedback.pushInfo(f"Using Target CRS: {target_crs.authid()}")
-            else:
-                raise QgsProcessingException("No valid CRS provided. Set a Target CRS.")
 
             if isolate:
                 out_base = os.path.join(temp_dir, _safe_temp_stem(table_name))
                 # Always split in the worker.
                 # Rationale: GeoMedia/Makai MDB metadata can mislabel geometry types; splitting is the most
                 # reliable way to prevent LineString features being imported as Points.
-                split_mixed = True
                 info = self._run_worker(
                     [
                         '--mode', 'export',
                         '--mdb', mdb_file,
                         '--table', table_name,
-                        '--geom-field', geom_field_name,
-                        '--geom-type', str(int(geometry_type_code)),
+                        '--geom-field', str(geom_field_name or ''),
+                        '--geom-type', str(int(geometry_type_code)) if geometry_type_code is not None else '-1',
                         '--out', out_base,
                         '--max-features', str(int(max_features or 0)),
-                        '--split', '1' if split_mixed else '0',
+                        '--split', '1',
                     ],
                     feedback,
                 )
-                if not info:
-                    feedback.reportError(f'Skipping table {table_name}: worker produced no output')
+                if not isinstance(info, dict):
+                    feedback.reportError(
+                        f'Skipping table {table_name}: the worker returned no result'
+                    )
                     continue
 
-                outputs = info.get('outputs') if isinstance(info, dict) else None
-                if outputs and isinstance(outputs, dict):
-                    # Split mode can create multiple layers.
-                    # By default load LineString (contour lines), Polygon (seabed features / sediment areas),
-                    # and Point layers. MultiPoint is less common and still requires SUBSEA_MDB_LOAD_ALL_GEOMS=1.
-                    default_geom_types = {'LineString', 'Polygon', 'Point'}
-                    found_types = list(outputs.keys())
-                    feedback.pushInfo(f"  Geometry types found in '{table_name}': {found_types}")
-                    for geom_type_name, path in outputs.items():
-                        if (not load_all_geoms) and str(geom_type_name) not in default_geom_types:
-                            feedback.pushInfo(f"  Skipping {geom_type_name} layer for '{table_name}' (set SUBSEA_MDB_LOAD_ALL_GEOMS=1 to include)")
-                            continue
-                        if not path or not os.path.exists(path):
-                            continue
-                        table_label = table_name
-                        if len(outputs) > 1:
-                            table_label = f"{table_name} ({geom_type_name})"
-                        layer_name = f"{file_ref} - {table_label}"
-                        src_layer = QgsVectorLayer(path, layer_name, 'ogr')
-                        if not src_layer.isValid():
-                            feedback.reportError(f'Skipping {layer_name}: output layer invalid')
-                            continue
-                        layer = _write_to_temporary_gpkg(
-                            src_layer,
-                            layer_name,
-                            import_crs,
-                            context,
-                            feedback,
-                        )
-                        if layer is None:
-                            continue
+                outputs = info.get('outputs') or {}
+                self._report_table_result(table_name, info, feedback)
+                if not outputs:
+                    continue
 
-                        self._register_output_layer(context, layer, layer_name, file_name)
-                        output_layers[f"{output_namespace}::{table_name}::{geom_type_name}"] = layer.id()
-                else:
-                    # Non-split mode: expect a single GeoJSON at out_base + '.geojson'
-                    out_geojson = out_base + '.geojson'
-                    if not os.path.exists(out_geojson):
-                        feedback.reportError(f'Skipping table {table_name}: worker produced no output file')
+                for geom_type_name, path in outputs.items():
+                    if not self._should_load_geometry_type(geom_type_name, load_all_geoms):
+                        feedback.pushInfo(
+                            f"  Skipping {geom_type_name} layer for '{table_name}' "
+                            "(set SUBSEA_MDB_LOAD_ALL_GEOMS=1 to include)")
                         continue
-
-                    layer_name = f"{file_ref} - {table_name}"
-                    src_layer = QgsVectorLayer(out_geojson, layer_name, 'ogr')
+                    if not path or not os.path.exists(path):
+                        feedback.reportError(
+                            f"  {table_name}: the worker reported a {geom_type_name} layer "
+                            "but the file is missing")
+                        continue
+                    table_label = table_name
+                    if len(outputs) > 1:
+                        table_label = f"{table_name} ({geom_type_name})"
+                    layer_name = f"{file_ref} - {table_label}"
+                    src_layer = QgsVectorLayer(path, layer_name, 'ogr')
                     if not src_layer.isValid():
-                        feedback.reportError(f'Skipping table {table_name}: output layer invalid')
+                        feedback.reportError(f'Skipping {layer_name}: output layer invalid')
                         continue
                     layer = _write_to_temporary_gpkg(
                         src_layer,
                         layer_name,
-                        import_crs,
+                        source_crs,
                         context,
                         feedback,
                     )
@@ -1046,7 +1044,7 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
                         continue
 
                     self._register_output_layer(context, layer, layer_name, file_name)
-                    output_layers[f"{output_namespace}::{table_name}"] = layer.id()
+                    output_layers[f"{output_namespace}::{table_name}::{geom_type_name}"] = layer.id()
                 continue
             else:
                 mem_layer, error = import_table_as_memory_layer(
@@ -1054,7 +1052,7 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
                     table_name,
                     geom_field_name,
                     geometry_type_code,
-                    import_crs,
+                    source_crs,
                     feedback,
                 )
                 if error:
@@ -1067,25 +1065,96 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
                 self._register_output_layer(context, mem_layer, layer_name, file_name)
                 output_layers[f"{output_namespace}::{table_name}"] = mem_layer.id()
 
+        # Cleanup runs only after every worker file has been opened, copied to a
+        # GeoPackage and validated above. Failures here never fail the import.
         if isolate and temp_dir and not keep_temp:
-            try:
-                # Best-effort cleanup. If files are locked, leave them.
-                for fn in os.listdir(temp_dir):
-                    try:
-                        os.remove(os.path.join(temp_dir, fn))
-                    except Exception:
-                        pass
-                try:
-                    os.rmdir(temp_dir)
-                except Exception:
-                    pass
-            except Exception:
-                pass
+            self._cleanup_worker_temp(temp_dir, feedback)
 
         if not output_layers:
             raise QgsProcessingException("No valid layers were imported from the MDB.")
 
         return output_layers
+
+    @staticmethod
+    def _cleanup_worker_temp(temp_dir, feedback):
+        try:
+            leftovers = os.listdir(temp_dir)
+        except Exception as exc:  # noqa: BLE001 - cleanup is best effort
+            feedback.pushDebugInfo(f'Could not list worker temp dir for cleanup: {exc}')
+            return
+        failed = 0
+        for name in leftovers:
+            try:
+                os.remove(os.path.join(temp_dir, name))
+            except Exception:  # noqa: BLE001
+                failed += 1
+        try:
+            os.rmdir(temp_dir)
+        except Exception as exc:  # noqa: BLE001
+            feedback.pushDebugInfo(f'Worker temp dir left in place: {exc}')
+        if failed:
+            feedback.pushDebugInfo(f'{failed} worker temp file(s) could not be removed.')
+
+    @staticmethod
+    def _read_listing(listing):
+        """Return ``(tables, non_spatial)`` from a worker discovery response.
+
+        Accepts both the structured envelope and the older flat mapping.
+        """
+        if not isinstance(listing, dict):
+            return {}, []
+        if 'tables' in listing and isinstance(listing.get('tables'), dict):
+            return listing['tables'], listing.get('non_spatial') or []
+        return listing, []
+
+    @staticmethod
+    def _report_non_spatial_tables(non_spatial, feedback):
+        for entry in non_spatial or []:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get('table', '?')
+            rows = entry.get('row_count')
+            row_text = f"{rows} rows" if isinstance(rows, int) else "row count unavailable"
+            feedback.pushInfo(
+                f"  {name}: {row_text}; {entry.get('reason', 'no geometry')}; "
+                "treated as a non-spatial table"
+            )
+
+    @staticmethod
+    def _summarise_table_result(info):
+        outputs = info.get('outputs') or {}
+        parts = [
+            f"rows={info.get('row_count', 0)}",
+            f"non-null BLOBs={info.get('non_null_geometry_count', 0)}",
+            f"BLOB decoded={info.get('blob_decoded_count', 0)}",
+        ]
+        if info.get('secondary_blob_decoded_count'):
+            parts.append(f"secondary BLOB decoded={info['secondary_blob_decoded_count']}")
+        parts.append(f"XY fallback={info.get('xy_fallback_count', 0)}")
+        if info.get('invalid_geometry_count'):
+            parts.append(f"unusable rows={info['invalid_geometry_count']}")
+        fields_used = info.get('geometry_fields_used') or []
+        if len(fields_used) > 1:
+            parts.append("geometry fields=" + ", ".join(str(name) for name in fields_used))
+        parts.append(
+            "outputs=" + (", ".join(sorted(outputs)) if outputs else "none"))
+        summary = f"{info.get('table', '?')}: " + ", ".join(parts)
+        message = info.get('message')
+        return f"{summary}; {message}" if message else summary
+
+    @classmethod
+    def _report_table_result(cls, table_name, info, feedback):
+        """Log a per-table summary, escalating populated-but-unusable tables."""
+        status = info.get('status')
+        summary = cls._summarise_table_result(info)
+        if status == 'success':
+            feedback.pushInfo(f"  {summary}")
+        elif status == 'empty':
+            feedback.pushInfo(f"  {summary}")
+        else:
+            # Rows exist but nothing could be turned into geometry: that is a
+            # real problem and must not look like an empty table.
+            feedback.reportError(f"  {summary}")
 
     def name(self):
         return 'import_mdb'
@@ -1111,12 +1180,14 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
 <p>This tool imports feature tables from one or more Microsoft Access Database (.mdb or .accdb) files, typically created by Intergraph GeoMedia, into QGIS as new temporary layers. It is not limited to bathymetry &ndash; any GeoMedia feature class (contours, seabed classifications, survey points, infrastructure polygons, etc.) can be loaded.</p>
 
 <h4>How it Works</h4>
-<p>The tool connects to the MDB file and looks for a <code>GFeatures</code> table to identify the feature classes within the database. For each feature class found, it reads the geometry from a binary (BLOB) field and creates a corresponding QGIS layer.</p>
-<p>By default, the tool imports <b>LineString</b> layers (e.g. bathymetric contour lines, cable routes), <b>Polygon</b> layers (e.g. seabed feature classifications, sediment type areas, restricted areas), and <b>Point</b> layers (e.g. survey points, fixes, assets). Each geometry type is loaded as a separate layer so they never conflict. MultiPoint geometries can be included by setting the <code>SUBSEA_MDB_LOAD_ALL_GEOMS=1</code> environment variable.</p>
-<p>It automatically adds two fields to each new layer:
+<p>The tool connects to the MDB file and looks for a <code>GFeatures</code> table to identify the feature classes within the database. For each feature class found, it reads the geometry from a binary (BLOB) field and creates a corresponding QGIS layer. Setting <code>SUBSEA_MDB_SCHEMA_DISCOVERY=1</code> additionally inspects every physical table so that populated tables missing from <code>GFeatures</code> can be offered when they carry strong spatial evidence (a GeoMedia geometry field or a recognised coordinate pair); metadata, lookup and companion <code>*_Name</code>/<code>*_Text</code> tables are reported but never loaded as geometry layers. That extra pass costs a table-definition parse per table, so it is off by default.</p>
+<p>GeoMedia point, oriented point, polyline, polygon, boundary (polygons with holes) and collection BLOBs are all decoded. If a row's BLOB cannot be decoded and the table has an explicit coordinate pair (Easting/Northing, X/Y, Longitude/Latitude or Lon/Lat, matched case-insensitively), a point is built from those columns instead. Fallback geometry is never silent: every feature records how its geometry was obtained and the log reports BLOB-decoded and fallback counts separately.</p>
+<p>By default, the tool imports <b>LineString</b> layers (e.g. bathymetric contour lines, cable routes), <b>Polygon</b> layers (e.g. seabed feature classifications, sediment type areas, restricted areas), and <b>Point</b> layers (e.g. survey points, fixes, assets). Each geometry type is loaded as a separate layer so they never conflict. MultiPoint and other multi-part geometries can be included by setting the <code>SUBSEA_MDB_LOAD_ALL_GEOMS=1</code> environment variable.</p>
+<p>It automatically adds three fields to each new layer:
 <ul>
   <li><b>depth:</b> The average Z-value of the feature's vertices, if available (useful for bathymetric data; will be empty/zero for non-3D features).</li>
     <li><b>source:</b> The filename of the source MDB file for per-feature traceability.</li>
+    <li><b>geometry_source:</b> <code>blob</code> when the geometry came from the GeoMedia BLOB, or <code>xy_fallback</code> when it was built from a coordinate pair.</li>
 </ul>
 </p>
 
@@ -1128,7 +1199,7 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
 <h4>Input Parameters</h4>
 <ul>
     <li><b>Input MDB File(s):</b> Add one or more GeoMedia MDB/ACCDB files. The picker supports selecting several files at once.</li>
-  <li><b>Coordinate System:</b> You <b>must</b> manually select the Coordinate Reference System (CRS) of the data in the MDB file. The tool cannot automatically detect it. Providing the wrong CRS will result in misplaced data.</li>
+  <li><b>Source CRS / CRS of coordinates in MDB:</b> You <b>must</b> manually select the Coordinate Reference System (CRS) that the coordinates in the MDB are stored in. The tool cannot detect it. This CRS is <i>assigned</i> to the imported layers &mdash; no reprojection is performed &mdash; so providing the wrong CRS will result in misplaced data.</li>
 </ul>
 
 <h4>Outputs</h4>
@@ -1138,15 +1209,16 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
 
 <h4>Known Limitations & Troubleshooting</h4>
 <ul>
-  <li><b>BLOB Format:</b> The tool is designed to parse a specific binary format for geometry. If your MDB uses a different format, the import will fail.</li>
-  <li><b>Metadata Tables:</b> It relies on specific system tables like <code>GFeatures</code>, <code>FieldLookup</code>, and <code>AttributeProperties</code>. If these are missing or have an unexpected structure, the tool will not work.</li>
+  <li><b>BLOB Format:</b> GeoMedia point, polyline, polygon, boundary and collection BLOBs are supported. Other vendor-specific variants (for example text or arc primitives) are still reported as <code>parse_failed</code> rather than imported.</li>
+  <li><b>Metadata Tables:</b> It relies on specific system tables like <code>GFeatures</code>, <code>FieldLookup</code>, and <code>AttributeProperties</code>. If these are missing or have an unexpected structure, only schema-based discovery is available.</li>
     <li><b>Large batches:</b> Temporary GeoPackages remain available for the QGIS session. If space is limited, change the temporary folder under Processing settings to a drive with more free space. Canceling Processing terminates the active MDB worker.</li>
-    <li><b>Errors:</b> If a table or file fails to import, a message will be shown in the Log Messages Panel. Other selected files continue importing where possible. Check the log for details about ODBC errors or parsing failures.</li>
+    <li><b>Errors:</b> Every attempted table reports row counts, BLOB-decoded counts and fallback counts in the Log Messages Panel. A populated table that yields no geometry is reported as an error, not silently skipped. Other tables and files continue importing where possible.</li>
   <li><b>Advanced options (env vars):</b>
     <ul>
       <li><code>SUBSEA_MDB_KEEP_TEMP=1</code> &ndash; keeps intermediate GeoJSONs for debugging</li>
       <li><code>SUBSEA_MDB_MAX_FEATURES=N</code> &ndash; limits rows per table</li>
-      <li><code>SUBSEA_MDB_LOAD_ALL_GEOMS=1</code> &ndash; also loads MultiPoint layers (default loads LineString, Polygon, and Point)</li>
+      <li><code>SUBSEA_MDB_LOAD_ALL_GEOMS=1</code> &ndash; also loads MultiPoint and other multi-part layers (default loads LineString, Polygon, and Point)</li>
+      <li><code>SUBSEA_MDB_SCHEMA_DISCOVERY=1</code> &ndash; also inspects physical tables missing from <code>GFeatures</code> (slower; <code>SUBSEA_MDB_SCHEMA_BUDGET=N</code> caps the inspection at N seconds, default 30)</li>
       <li><code>SUBSEA_MDB_NO_SUBPROCESS=1</code> &ndash; forces in-process ODBC (not recommended; may crash QGIS)</li>
     </ul>
   </li>
