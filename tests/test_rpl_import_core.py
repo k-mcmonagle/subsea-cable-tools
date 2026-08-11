@@ -368,6 +368,108 @@ def test_grouped_headers_prefer_split_coordinates() -> bool:
                    "" if ok else f"encoding={profile.coord_encoding} mapping={profile.mapping} headers={result.header_texts[:8]}")
 
 
+def _industry_ddm_rows(with_hemis: bool = True) -> list:
+    """Sheet shaped like real industry RPLs: banner + grouped 'Latitude' /
+    'Longitude' headers over unlabelled deg/min/hemi sub-columns, derived
+    decimal/radians/sin columns alongside, and a footer whose stray numbers
+    land in the coordinate columns' sheet-wide stats."""
+    n = 14
+
+    def pad(cells):
+        return cells + [None] * (n - len(cells))
+
+    rows = [
+        pad(["Straits RPL", None, None, None, None, None, "Issue", 3]),
+        pad(["Pos", "Event", "Latitude", None, None, "Longitude", None, None,
+             "Decimal", "Radians", "Sin", "Bearing", "Dist. Between Pos.",
+             "Decimal"]),
+        pad(["No.", None, None, None, None, None, None, None,
+             "Latitude", "Latitude", "Latitude", None, "km", "Longitude"]),
+        pad([None, None, None, None, None, None, None, None,
+             "(degrees)", None, None, None, None, "(degrees)"]),
+        pad([None] * n),
+        pad([None] * n),
+    ]
+    import math
+    lat = [(-9, 36.1115), (-9, 39.075), (-9, 42.0), (-10, 10.3268), (-10, 31.2743)]
+    lon = [(101, 30.1866), (101, 29.2593), (102, 9.2495), (102, 32.1752), (103, 2.3096)]
+    for i in range(5):
+        la_d, la_m = lat[i]
+        lo_d, lo_m = lon[i]
+        dd_lat = -(abs(la_d) + la_m / 60.0)
+        dd_lon = lo_d + lo_m / 60.0
+        hemi_lat = "S" if with_hemis else None
+        hemi_lon = "E" if with_hemis else None
+        rows.append(pad([i + 1, "AC", la_d, la_m, hemi_lat, lo_d, lo_m, hemi_lon,
+                         dd_lat, math.radians(dd_lat), math.sin(math.radians(dd_lat)),
+                         None, None, dd_lon]))
+        rows.append(pad([None, None, None, None, None, None, None, None,
+                         None, None, None, 135.2, 12.345, None]))
+    rows.append(pad([None] * n))
+    rows.append(pad(["Notes:", None, 1, "Datum WGS 84 (2024)"]))
+    rows.append(pad([None, None, 2, "Total route length", None, 1234.5, "km"]))
+    return rows
+
+
+def test_split_ddm_survives_footer_contamination() -> bool:
+    grid = R.SourceGrid(sheet="RPL", rows=_industry_ddm_rows(), n_cols=14)
+    result = D.detect(grid)
+    profile = result.profile
+    ok = profile.coord_encoding == M.COORD_SPLIT_DDM
+    ok &= profile.mapping.get(M.PF_LAT_DEG) == 3
+    ok &= profile.mapping.get(M.PF_LAT_MIN) == 4
+    ok &= profile.mapping.get(M.PF_LAT_HEMI) == 5
+    ok &= profile.mapping.get(M.PF_LON_DEG) == 6
+    ok &= profile.mapping.get(M.PF_LON_MIN) == 7
+    ok &= profile.mapping.get(M.PF_LON_HEMI) == 8
+    doc, diags = P.parse(grid, profile)
+    ok &= len(doc.points) == 5 and not M.has_errors(diags)
+    if doc.points:
+        ok &= abs(doc.points[0].lat - -(9 + 36.1115 / 60.0)) < 1e-9
+        ok &= abs(doc.points[0].lon - (101 + 30.1866 / 60.0)) < 1e-9
+    return _result(
+        "split DDM detected despite footer/banner numbers in scan", ok,
+        "" if ok else f"encoding={profile.coord_encoding} mapping={profile.mapping}")
+
+
+def test_decimal_fallback_prefers_true_decimal_columns() -> bool:
+    # Same sheet but the hemisphere columns are empty, so split DDM cannot be
+    # detected. The decimal fallback must then pick the actual decimal
+    # degrees columns (fractional, 'decimal ... (degrees)' headers) — never
+    # the integer degree/minute sub-columns under the grouped headers, and
+    # never the radians/sin derived columns.
+    grid = R.SourceGrid(sheet="RPL", rows=_industry_ddm_rows(with_hemis=False),
+                        n_cols=14)
+    profile = D.detect(grid).profile
+    ok = profile.coord_encoding == M.COORD_DECIMAL_DEGREES
+    ok &= profile.mapping.get(M.PF_LAT_TEXT) == 9
+    ok &= profile.mapping.get(M.PF_LON_TEXT) == 14
+    return _result(
+        "decimal fallback prefers true decimal columns over deg/min/trig", ok,
+        "" if ok else f"encoding={profile.coord_encoding} mapping={profile.mapping}")
+
+
+def test_split_ddm_hemisphere_first_order() -> bool:
+    rows = [
+        ["Pos", "Lat", None, None, "Lon", None, None],
+        [1, "N", 50, 10.5, "W", 1, 20.25],
+        [2, "N", 50, 12.0, "W", 1, 22.5],
+        [3, "N", 50, 13.5, "W", 1, 24.75],
+    ]
+    grid = R.SourceGrid(sheet="RPL", rows=rows, n_cols=7)
+    profile = D.detect(grid).profile
+    ok = profile.coord_encoding == M.COORD_SPLIT_DDM
+    ok &= profile.mapping.get(M.PF_LAT_HEMI) == 2
+    ok &= profile.mapping.get(M.PF_LAT_DEG) == 3
+    ok &= profile.mapping.get(M.PF_LAT_MIN) == 4
+    ok &= profile.mapping.get(M.PF_LON_HEMI) == 5
+    ok &= profile.mapping.get(M.PF_LON_DEG) == 6
+    ok &= profile.mapping.get(M.PF_LON_MIN) == 7
+    return _result(
+        "split DDM with hemisphere-first column order", ok,
+        "" if ok else f"encoding={profile.coord_encoding} mapping={profile.mapping}")
+
+
 def test_canonical_fields_beat_derived_navigation_columns() -> bool:
     rows = [
         ["Pos No.", "Event", "Latitude", None, None, "Longitude", None, None,
@@ -694,6 +796,9 @@ def run_all() -> List[bool]:
         test_flat_departing_semantics(),
         test_decimal_degrees_detection(),
         test_grouped_headers_prefer_split_coordinates(),
+        test_split_ddm_survives_footer_contamination(),
+        test_decimal_fallback_prefers_true_decimal_columns(),
+        test_split_ddm_hemisphere_first_order(),
         test_canonical_fields_beat_derived_navigation_columns(),
         test_undetected_sheet_starts_fully_excluded(),
         test_unit_conversion_and_slack_ratio(),

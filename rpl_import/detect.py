@@ -62,12 +62,25 @@ class _ColStats:
     ddm_lon: int = 0
     min_val: float = float("inf")
     max_val: float = float("-inf")
+    lat_range: int = 0     # numeric with abs <= 90 (plausible latitude degrees)
+    lon_range: int = 0     # numeric with abs <= 180 (plausible longitude degrees)
+    minute_range: int = 0  # numeric with abs < 60 (plausible decimal minutes)
     monotonic_pairs: int = 0
     numeric_pairs: int = 0
 
     @property
     def numeric_frac(self) -> float:
         return self.numeric / self.non_empty if self.non_empty else 0.0
+
+    def mostly_within(self, counter: int) -> bool:
+        """True when nearly all numeric values fall inside a plausibility
+        counter — at most 10% (but always at least one) outliers allowed, so
+        a stray footer number or annotation caught in the scan cannot veto an
+        otherwise clear coordinate column, even in short tables.
+        """
+        if not self.numeric:
+            return False
+        return (self.numeric - counter) <= max(1, self.numeric // 10)
 
 
 def _column_stats(grid: SourceGrid, rows: List[int]) -> Dict[int, _ColStats]:
@@ -106,6 +119,12 @@ def _column_stats(grid: SourceGrid, rows: List[int]) -> Dict[int, _ColStats]:
                 s.integers += 1
             s.min_val = min(s.min_val, number)
             s.max_val = max(s.max_val, number)
+            if abs(number) <= 90.0:
+                s.lat_range += 1
+            if abs(number) <= 180.0:
+                s.lon_range += 1
+            if abs(number) < 60.0:
+                s.minute_range += 1
             if col in previous:
                 s.numeric_pairs += 1
                 if number >= previous[col]:
@@ -167,11 +186,34 @@ def _provisional_header_rows(grid: SourceGrid, limit: int) -> List[int]:
 # ---------------------------------------------------------------------------
 # Coordinate configuration detection
 # ---------------------------------------------------------------------------
+def _dominant_run(rows: List[int], tolerance: int = GAP_TOLERANCE) -> List[int]:
+    """The longest contiguous-ish run of rows (gaps <= tolerance).
+
+    Column statistics computed over every data-like row in a sheet get
+    polluted by title blocks and footer summaries ("Total route length ...
+    1234.5 km"); the table body is the longest run, so restrict to it.
+    """
+    if not rows:
+        return rows
+    runs: List[List[int]] = [[rows[0]]]
+    for row in rows[1:]:
+        if row - runs[-1][-1] <= tolerance:
+            runs[-1].append(row)
+        else:
+            runs.append([row])
+    return max(runs, key=len)
+
+
 def _detect_coordinates(grid: SourceGrid, scan_rows: List[int],
                         header_texts: List[str],
                         reasons: Dict[str, str]) -> Optional[Tuple[str, Dict[str, int]]]:
-    """(encoding, coordinate-field mapping) or None."""
-    stats = _column_stats(grid, scan_rows)
+    """(encoding, coordinate-field mapping) or None.
+
+    Preference order is deliberate: split degrees/decimal-minutes/hemisphere
+    is the industry-standard RPL form and always wins when present, then
+    combined DDM text, then signed decimal degrees under lat/lon headers.
+    """
+    stats = _column_stats(grid, _dominant_run(scan_rows))
 
     def hemi_cols(kind: str) -> List[int]:
         result = []
@@ -183,35 +225,47 @@ def _detect_coordinates(grid: SourceGrid, scan_rows: List[int],
 
     lat_hemis, lon_hemis = hemi_cols("lat"), hemi_cols("lon")
 
-    # -- split DDM: hemi column preceded by (deg, min) numeric columns --------
-    def split_for(hemi_col: int, axis_max: float) -> Optional[Tuple[int, int]]:
-        candidates = [c for c in (hemi_col - 2, hemi_col - 1)
-                      if c >= 1 and stats[c].numeric_frac >= 0.8]
-        if len(candidates) < 2:
-            return None
-        deg_col, min_col = candidates[0], candidates[1]
-        sd, sm = stats[deg_col], stats[min_col]
-        # Some industry RPLs retain a signed degree value as well as an
-        # explicit hemisphere column. The parser deliberately uses the
-        # hemisphere as authoritative, so detection should compare degree
-        # magnitudes rather than reject these otherwise clear DDM triples.
-        if max(abs(sd.min_val), abs(sd.max_val)) > axis_max:
-            return None
-        if max(abs(sm.min_val), abs(sm.max_val)) >= 60.0:
-            return None
-        # degrees are typically integers; minutes typically fractional
-        if sd.integers < sd.numeric * 0.9 and sm.integers == sm.numeric:
-            deg_col, min_col = min_col, deg_col
-        return deg_col, min_col
+    # -- split DDM: (deg, min) numeric columns beside a hemisphere column ----
+    def split_for(hemi_col: int, axis: str,
+                  exclude: frozenset = frozenset()) -> Optional[Tuple[int, int]]:
+        for pair in ((hemi_col - 2, hemi_col - 1),   # deg | min | hemi (usual)
+                     (hemi_col + 1, hemi_col + 2)):  # hemi | deg | min
+            candidates = [c for c in pair
+                          if 1 <= c <= grid.n_cols and c not in exclude
+                          and stats[c].numeric_frac >= 0.8]
+            if len(candidates) < 2:
+                continue
+            deg_col, min_col = candidates[0], candidates[1]
+            sd, sm = stats[deg_col], stats[min_col]
+            # Some industry RPLs retain a signed degree value as well as an
+            # explicit hemisphere column. The parser deliberately uses the
+            # hemisphere as authoritative, so detection compares degree
+            # magnitudes rather than rejecting these otherwise clear triples.
+            if not sd.mostly_within(sd.lat_range if axis == "lat" else sd.lon_range):
+                continue
+            if not sm.mostly_within(sm.minute_range):
+                continue
+            # degrees are typically integers; minutes typically fractional
+            if sd.integers < sd.numeric * 0.9 and sm.integers == sm.numeric:
+                deg_col, min_col = min_col, deg_col
+                sd, sm = stats[deg_col], stats[min_col]
+            # A degrees column is integer-valued (same outlier allowance as
+            # the range checks); a mostly-fractional "degrees" candidate is a
+            # decimal/derived column, not part of a DDM triple.
+            if not sd.mostly_within(sd.integers):
+                continue
+            return deg_col, min_col
+        return None
 
     for lat_hemi in lat_hemis:
-        lat_pair = split_for(lat_hemi, 90.0)
+        lat_pair = split_for(lat_hemi, "lat", frozenset(lon_hemis))
         if not lat_pair:
             continue
         for lon_hemi in lon_hemis:
             if lon_hemi == lat_hemi:
                 continue
-            lon_pair = split_for(lon_hemi, 180.0)
+            lon_pair = split_for(
+                lon_hemi, "lon", frozenset(lat_pair) | {lat_hemi})
             if not lon_pair:
                 continue
             mapping = {
@@ -239,17 +293,50 @@ def _detect_coordinates(grid: SourceGrid, scan_rows: List[int],
         return COORD_DDM_TEXT, mapping
 
     # -- decimal degrees: needs lat/lon headers + plausible numeric content ---
-    lat_col = lon_col = None
+    # Group headers ("Latitude" spanning deg/min/hemi sub-columns) are
+    # inherited by child columns, so several columns can carry a lat/lon-ish
+    # header. Score candidates instead of taking the first: a genuine decimal
+    # column has fractional values and often says "decimal"; columns that sit
+    # immediately before a hemisphere-letter column are part of a split-DDM
+    # group and are never decimal degrees; derived trigonometry columns
+    # (radians/sin/cos) are penalised.
+    hemi_all = set(lat_hemis) | set(lon_hemis)
+
+    def in_ddm_group(col: int) -> bool:
+        return (col + 1) in hemi_all or (col + 2) in hemi_all
+
+    def decimal_candidate(col: int, header: str, axis: str) -> Optional[int]:
+        s = stats[col]
+        if not s.mostly_within(s.lat_range if axis == "lat" else s.lon_range):
+            return None
+        score = 0
+        if re.search(r"decimal|\bdd\b|deg", header):
+            score += 30
+        if s.integers < s.numeric:
+            score += 20          # decimal degrees are fractional in practice
+        if re.search(r"radian|\brad\b|\bsin\b|\bcos\b|\btan\b", header):
+            score -= 60
+        return score
+
+    best: Dict[str, Tuple[int, int]] = {}   # axis -> (score, col)
     for col in range(1, grid.n_cols + 1):
         header = header_texts[col - 1] if col <= len(header_texts) else ""
         s = stats[col]
-        if s.numeric_frac < 0.8 or s.non_empty < 2:
+        if s.numeric_frac < 0.8 or s.non_empty < 2 or in_ddm_group(col):
             continue
-        if re.search(r"\blat", header) and abs(s.min_val) <= 90 and abs(s.max_val) <= 90:
-            lat_col = lat_col or col
-        elif re.search(r"\b(lon|lng|long)", header) and abs(s.min_val) <= 180 and abs(s.max_val) <= 180:
-            lon_col = lon_col or col
-    if lat_col and lon_col:
+        if re.search(r"\blat", header):
+            axis = "lat"
+        elif re.search(r"\b(lon|lng|long)", header):
+            axis = "lon"
+        else:
+            continue
+        score = decimal_candidate(col, header, axis)
+        if score is None:
+            continue
+        if axis not in best or score > best[axis][0]:
+            best[axis] = (score, col)
+    if "lat" in best and "lon" in best and best["lat"][1] != best["lon"][1]:
+        lat_col, lon_col = best["lat"][1], best["lon"][1]
         reasons["coordinates"] = (
             f"Signed decimal degrees under latitude/longitude headers "
             f"(columns {lat_col} and {lon_col}).")
