@@ -19,6 +19,7 @@ re-acquires one rule; a cancelled run leaves the cache warm and resumes.
 
 from __future__ import annotations
 
+import bisect
 import json
 import math
 from dataclasses import dataclass, field
@@ -98,6 +99,9 @@ class DepthSnapshot:
         self._contour_index: Optional[QgsSpatialIndex] = None
         self._contour_sources: List[Dict] = []
         self._contours_prepared = False
+        self._crossing_route = None
+        self._crossings: List[Tuple[float, float]] = []
+        self._crossing_kps: List[float] = []
         self._transform_context = project.transformContext()
         for entry in config.contour_layers:
             layer = project.mapLayer(entry.get("layer_id", ""))
@@ -230,6 +234,168 @@ class DepthSnapshot:
                     best = value
             return best
         return None
+
+    def _sample_rasters(self, point: QgsPointXY) -> Optional[float]:
+        for provider, transform in self._rasters:
+            sample_pt = point
+            if transform is not None:
+                try:
+                    sample_pt = transform.transform(point)
+                except Exception:
+                    continue
+            try:
+                value, ok = provider.sample(sample_pt, self.band)
+            except Exception:
+                continue
+            if ok and value is not None and value == value:
+                return float(value)
+        return None
+
+    def contour_crossings(
+            self, route: RouteFrame,
+            cancel: Optional[Callable[[], bool]] = None,
+            progress: Optional[Callable[[int, int], None]] = None,
+    ) -> List[Tuple[float, float]]:
+        """Return actual ``(KP, depth)`` intersections with the route.
+
+        Longitudinal contour bathymetry must be based on where contours cross
+        the route. Nearest-contour point sampling creates a staircase whose
+        jumps can look like severe slopes even on widely spaced contours.
+        """
+        if self._crossing_route is route:
+            return list(self._crossings)
+        self._crossing_route = route
+        self._crossings = []
+        self._crossing_kps = []
+        if not self._contours or self._contour_index is None:
+            return []
+
+        raw: List[Tuple[float, float]] = []
+        candidates: List[Tuple[QgsGeometry, int]] = []
+        for route_geom in route.geometries:
+            if route_geom is None or route_geom.isEmpty():
+                continue
+            for idx in self._contour_index.intersects(route_geom.boundingBox()):
+                candidates.append((route_geom, idx))
+        total = max(len(candidates), 1)
+        for done, (route_geom, idx) in enumerate(candidates):
+            if done % 100 == 0:
+                if cancel is not None and cancel():
+                    raise ri.AcquisitionCancelled()
+                if progress is not None:
+                    progress(done, total)
+            contour_geom, depth = self._contours[idx]
+            try:
+                intersection = route_geom.intersection(contour_geom)
+            except Exception:
+                continue
+            if intersection is None or intersection.isEmpty():
+                continue
+            try:
+                vertices = intersection.vertices()
+            except Exception:
+                continue
+            for vertex in vertices:
+                try:
+                    hit = route.kp_at_point(QgsPointXY(vertex))
+                except Exception:
+                    continue
+                if hit.snapped_xy is not None and hit.dcc_m <= 0.05:
+                    raw.append((float(hit.kp_km), float(depth)))
+        if progress is not None:
+            progress(total, total)
+
+        # Major/minor layers can repeat the same contour. Collapse identical
+        # crossings while retaining genuinely different nearby contours.
+        raw.sort()
+        crossings: List[Tuple[float, float]] = []
+        for kp, depth in raw:
+            if crossings and abs(kp - crossings[-1][0]) <= 1e-8 \
+                    and abs(depth - crossings[-1][1]) <= 1e-8:
+                continue
+            crossings.append((kp, depth))
+        self._crossings = crossings
+        self._crossing_kps = [kp for kp, _depth in crossings]
+        return list(crossings)
+
+    @staticmethod
+    def _interpolate_crossings(crossings: List[Tuple[float, float]],
+                               kp: float,
+                               crossing_kps: Optional[List[float]] = None
+                               ) -> Optional[float]:
+        """Linearly interpolate between bracketing contour crossings.
+
+        No extrapolation is made outside the surveyed crossing range.
+        """
+        if not crossings:
+            return None
+        kps = crossing_kps if crossing_kps is not None \
+            else [item[0] for item in crossings]
+        index = bisect.bisect_left(kps, float(kp))
+        if index < len(crossings) and abs(crossings[index][0] - kp) <= 1e-9:
+            # Multiple different contour values at exactly one KP are
+            # geometrically ambiguous; report no data instead of inventing a
+            # vertical face or averaging incompatible sources.
+            values = [depth for cross_kp, depth in crossings
+                      if abs(cross_kp - kp) <= 1e-9]
+            return values[0] if values and all(abs(v - values[0]) <= 1e-8
+                                               for v in values) else None
+        if index == 0 or index >= len(crossings):
+            return None
+        kp0, d0 = crossings[index - 1]
+        kp1, d1 = crossings[index]
+        if kp1 - kp0 <= 1e-9:
+            return None
+        ratio = (float(kp) - kp0) / (kp1 - kp0)
+        return d0 + ratio * (d1 - d0)
+
+    def sample_route(self, route: RouteFrame, kp: float) -> Optional[float]:
+        """Depth at KP using raster samples or contour-crossing interpolation."""
+        point = route.point_at_kp(kp, clamp=True)
+        if point is None:
+            return None
+        if self.mode in (0, 1):
+            value = self._sample_rasters(point)
+            if value is not None:
+                return value
+        if self.mode in (0, 2):
+            if self._crossing_route is not route:
+                self.contour_crossings(route)
+            return self._interpolate_crossings(
+                self._crossings, kp, self._crossing_kps)
+        return None
+
+    def profile_samples(self, route: RouteFrame, stations_km: List[float],
+                        cancel: Optional[Callable[[], bool]] = None,
+                        progress: Optional[Callable[[int, int], None]] = None,
+                        ) -> List[Tuple[float, Optional[float]]]:
+        """Sample a route profile and include exact contour-crossing KPs."""
+        marks = list(stations_km)
+        crossing_phase = (self.mode in (0, 2)
+                          and self._crossing_route is not route)
+        if self.mode in (0, 2):
+            crossing_progress = None
+            if progress is not None and crossing_phase:
+                def crossing_progress(done: int, total: int) -> None:
+                    progress(done, 2 * total)
+            crossings = self.contour_crossings(
+                route, cancel, crossing_progress)
+            if marks:
+                lo, hi = min(marks), max(marks)
+                marks.extend(kp for kp, _depth in crossings if lo <= kp <= hi)
+        marks = sorted(set(round(float(kp), 12) for kp in marks))
+        out: List[Tuple[float, Optional[float]]] = []
+        total = max(len(marks), 1)
+        for index, kp in enumerate(marks):
+            if cancel is not None and index % 100 == 0 and cancel():
+                raise ri.AcquisitionCancelled()
+            out.append((kp, self.sample_route(route, kp)))
+            if progress is not None and (index % 100 == 0 or index + 1 == total):
+                if crossing_phase:
+                    progress(total + index + 1, 2 * total)
+                else:
+                    progress(index + 1, total)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -424,9 +590,6 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
 # Predicates for 1 m boundary refinement (§14.3)
 # ---------------------------------------------------------------------------
 
-_SLOPE_DELTA_KM = 0.010  # 10 m central difference for slope predicates
-
-
 def _threshold_predicate(work: AnalysisWork, config: Dict) -> Optional[Callable[[float], bool]]:
     depth = work.depth
     route = work.route
@@ -434,10 +597,7 @@ def _threshold_predicate(work: AnalysisWork, config: Dict) -> Optional[Callable[
         return None
 
     def depth_at(kp: float) -> Optional[float]:
-        pt = route.point_at_kp(kp, clamp=True)
-        if pt is None:
-            return None
-        value = depth.sample(pt.y(), pt.x())
+        value = depth.sample_route(route, kp)
         return abs(float(value)) if value is not None else None
 
     profile = (config.get("profile") or "depth").lower()
@@ -445,11 +605,18 @@ def _threshold_predicate(work: AnalysisWork, config: Dict) -> Optional[Callable[
     def value_at(kp: float) -> Optional[float]:
         if profile != "slope":
             return depth_at(kp)
-        d0 = depth_at(max(work.scope.start_km, kp - _SLOPE_DELTA_KM))
-        d1 = depth_at(min(work.scope.end_km, kp + _SLOPE_DELTA_KM))
+        # Use the same scale as coarse acquisition. The old fixed 10 m
+        # half-window could turn raster noise (or nearest-contour steps) into
+        # severe slopes even when the configured 50/100 m analysis profile
+        # was gentle.
+        delta_km = max(float(work.step_m), 1.0) / 1000.0
+        kp0 = max(work.scope.start_km, kp - delta_km)
+        kp1 = min(work.scope.end_km, kp + delta_km)
+        d0 = depth_at(kp0)
+        d1 = depth_at(kp1)
         if d0 is None or d1 is None:
             return None
-        dx_m = 2.0 * _SLOPE_DELTA_KM * 1000.0
+        dx_m = (kp1 - kp0) * 1000.0
         dz = d1 - d0
         if config.get("slope_signed"):
             return math.degrees(math.atan2(dz, dx_m))
@@ -651,8 +818,14 @@ class BurialAnalysisTask(QgsTask):
                 if work.depth is None:
                     raise ri.RuleInputError("no bathymetry source configured")
                 self.progressMessage.emit("Sampling bathymetry along the scope…")
-                self._depth_series, self._depth_gaps = ri.depth_series_with_gaps(
-                    sampler, work.depth.sample, cancel=cancel)
+                samples = work.depth.profile_samples(
+                    work.route, sampler.stations_km, cancel=cancel)
+                self._depth_series = [
+                    (kp, abs(float(value))) for kp, value in samples
+                    if value is not None]
+                flags = [(kp, value is None) for kp, value in samples]
+                self._depth_gaps = eng.intervals_from_bool_series(
+                    flags, sampler.scope_domain)
             if not self._depth_series:
                 raise ri.RuleInputError("bathymetry has no coverage in the scope")
             intervals = ri.threshold_intervals(
@@ -739,19 +912,23 @@ class ProfileSamplingTask(QgsTask):
             self.progressMessage.emit("Sampling bathymetry profile…")
             length_m = max((self.end_kp - self.start_kp) * 1000.0, 0.0)
             count = max(int(math.ceil(length_m / self.step_m)) + 1, 1)
-            for i in range(count):
-                if i % 25 == 0 and self.isCanceled():
-                    self.cancelled = True
-                    return False
-                kp = min(self.start_kp + i * self.step_m / 1000.0, self.end_kp)
-                point = self.route.point_at_kp(kp, clamp=True)
-                if point is not None:
-                    value = self.depth.sample(point.y(), point.x())
-                    if value is not None and value == value:
-                        self.series.append((kp, abs(float(value))))
-                self.setProgress(25.0 + 75.0 * float(i + 1) / count)
+            marks = [min(self.start_kp + i * self.step_m / 1000.0,
+                         self.end_kp) for i in range(count)]
+
+            def sample_progress(done: int, total: int) -> None:
+                self.setProgress(25.0 + 75.0 * float(done) /
+                                 max(float(total), 1.0))
+
+            samples = self.depth.profile_samples(
+                self.route, marks, cancel=self.isCanceled,
+                progress=sample_progress)
+            self.series = [(kp, abs(float(value))) for kp, value in samples
+                           if value is not None and value == value]
             self.setProgress(100.0)
             return True
+        except ri.AcquisitionCancelled:
+            self.cancelled = True
+            return False
         except Exception as exc:  # pragma: no cover - surfaced in the dock
             self.error = str(exc)
             return False

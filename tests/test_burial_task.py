@@ -154,6 +154,53 @@ def test_direction_maps_slope_limits() -> bool:
     return _result("direction -1 swaps down/up-slope limits", ok)
 
 
+def test_contour_slope_uses_route_crossings() -> bool:
+    """A gentle contour gradient must not become a nearest-contour step."""
+    from ..workbench.depth_service import DepthSourceConfig
+
+    project = QgsProject.instance()
+    route, da = _route()
+    contours = QgsVectorLayer("LineString?crs=EPSG:4326&field=depth:double",
+                              "gentle-contours", "memory")
+    provider = contours.dataProvider()
+    for lat, depth in ((50.05, 100.0), (50.06, 150.0)):
+        feat = QgsFeature(contours.fields())
+        feat.setGeometry(QgsGeometry.fromWkt(
+            f"LINESTRING(-0.05 {lat}, 0.05 {lat})"))
+        feat.setAttributes([depth])
+        provider.addFeature(feat)
+    project.addMapLayer(contours)
+
+    config = DepthSourceConfig({
+        "mode": 2,
+        "contour_layers": [{"layer_id": contours.id(),
+                            "depth_field": "depth"}],
+    })
+    depth = analysis_task.DepthSnapshot(config, project)
+    ok = depth.prepare()
+    sampler = ri.RouteSampler.from_route(route, da, 50.0, Interval(5.4, 6.8))
+    samples = depth.profile_samples(route, sampler.stations_km)
+    series = [(kp, abs(float(value))) for kp, value in samples
+              if value is not None]
+    slopes = ri._slope_series(series)
+    maximum = max((slope for _kp, slope in slopes), default=90.0)
+    excluded = ri.threshold_intervals(
+        series, {"profile": "slope", "op": ">", "value": 15.0,
+                 "abs": True}, sampler.scope_domain)
+
+    # This is the old nearest-contour representation: the full 50 m contour
+    # interval jumps within one 50 m station and falsely exceeds 15 degrees.
+    midpoint = sum(kp for kp, _depth in depth.contour_crossings(route)) / 2.0
+    staircase = [(kp, 100.0 if kp < midpoint else 150.0)
+                 for kp in sampler.stations_km]
+    old_maximum = max(slope for _kp, slope in ri._slope_series(staircase))
+    ok = ok and old_maximum > 15.0 and maximum < 3.5 and not excluded
+
+    project.removeMapLayer(contours.id())
+    return _result("contour slopes interpolate at route crossings", ok,
+                   f"old={old_maximum:.2f}°, corrected={maximum:.2f}°")
+
+
 def test_route_frame_builder() -> bool:
     layer = QgsVectorLayer("LineString?crs=EPSG:4326&field=SeqNo:integer",
                            "route", "memory")
@@ -238,8 +285,8 @@ def test_end_to_end_task_and_generation() -> bool:
     ok = ok and len(results) == 2 and not any(r.error for r in results)
     deep = next(r for r in results if r.rule_row["rule_id"] == "deep")
     xing = next(r for r in results if r.rule_row["rule_id"] == "xing")
-    # depth crosses 500 m at the contour midpoint (~KP 11.1)
-    ok = ok and deep.footprint and 10.0 < deep.footprint[0].start_km < 12.5
+    # Linear contour interpolation crosses 500 m at 4/9 of the route.
+    ok = ok and deep.footprint and 9.0 < deep.footprint[0].start_km < 10.8
     ok = ok and xing.footprint and 4.5 < xing.footprint[0].start_km < 6.0
     ok = ok and eng.interval_length_km(xing.footprint) < 1.5
 
@@ -284,6 +331,16 @@ def test_profile_sampling_task() -> bool:
         def sample(self, lat, lon):
             return -100.0 - lat
 
+        def profile_samples(self, route, stations_km, cancel=None, progress=None):
+            out = []
+            total = len(stations_km)
+            for i, kp in enumerate(stations_km):
+                point = route.point_at_kp(kp, clamp=True)
+                out.append((kp, self.sample(point.y(), point.x())))
+                if progress is not None:
+                    progress(i + 1, total)
+            return out
+
     task = analysis_task.ProfileSamplingTask(
         route, _Depth(), 0.0, 0.3, 100.0, lambda _task: None)
     ok = task.run()
@@ -320,6 +377,7 @@ def run_all() -> list:
         test_buffer_field_override(),
         test_cancellation_raises(),
         test_direction_maps_slope_limits(),
+        test_contour_slope_uses_route_crossings(),
         test_route_frame_builder(),
         test_end_to_end_task_and_generation(),
         test_profile_sampling_task(),

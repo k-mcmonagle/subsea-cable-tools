@@ -222,6 +222,7 @@ class RuleEditorDialog(QDialog):
                 self.op_combo.addItem(op)
             index = self.op_combo.findText(config.get("op") or ">")
             self.op_combo.setCurrentIndex(max(0, index))
+            self.op_combo.currentIndexChanged.connect(self._sync_threshold)
             form.addRow("Condition:", self.op_combo)
             self.value_spin = QDoubleSpinBox()
             self.value2_spin = QDoubleSpinBox()
@@ -238,6 +239,14 @@ class RuleEditorDialog(QDialog):
             self.signed_check.setChecked(bool(config.get("slope_signed")))
             self.signed_check.toggled.connect(self._sync_threshold)
             form.addRow(self.signed_check)
+            self.slope_note = QLabel(
+                "Uses longitudinal slope along the route only. Raster depths "
+                "are evaluated at the analysis sampling interval; contour "
+                "depths are linearly interpolated between their actual route "
+                "crossings. Cross-route slope is not evaluated by this rule.")
+            self.slope_note.setWordWrap(True)
+            self.slope_note.setStyleSheet("color: #666;")
+            form.addRow(self.slope_note)
             self.down_spin = QDoubleSpinBox()
             self.up_spin = QDoubleSpinBox()
             for spin in (self.down_spin, self.up_spin):
@@ -307,6 +316,10 @@ class RuleEditorDialog(QDialog):
     def _sync_threshold(self) -> None:
         is_slope = self.profile_combo.currentData() == "slope"
         signed = is_slope and self.signed_check.isChecked()
+        suffix = " °" if is_slope else " m"
+        self.value_spin.setSuffix(suffix)
+        self.value2_spin.setSuffix(suffix)
+        self.slope_note.setVisible(is_slope)
         self.signed_check.setEnabled(is_slope)
         self.down_spin.setEnabled(signed)
         self.up_spin.setEnabled(signed)
