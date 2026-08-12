@@ -18,8 +18,9 @@ from qgis.core import (
     QgsProject,
     QgsVectorLayer,
 )
+from qgis.gui import QgsMapCanvas, QgsRubberBand, QgsVertexMarker
 
-from ..burial import analysis_task, generation, map_layers
+from ..burial import analysis_task, burial_dock, generation, map_layers
 from ..burial import schema as burial_schema
 from ..burial.plan_model import PlanModel
 from ..kp_geo_utils import RouteFrame
@@ -257,6 +258,22 @@ def test_section_style_has_no_cartographic_offset() -> bool:
                    f"offsets={offsets}")
 
 
+def test_canvas_items_close_without_qobject_api() -> bool:
+    """Closing must support QGIS canvas items which lack deleteLater()."""
+    canvas = QgsMapCanvas()
+    marker = QgsVertexMarker(canvas)
+    band = QgsRubberBand(canvas, burial_dock.GEOMETRY_LINE)
+    marker_had_no_delete_later = not hasattr(marker, "deleteLater")
+    burial_dock._remove_canvas_item(marker)
+    burial_dock._remove_canvas_item(band)
+    burial_dock._remove_canvas_item(marker)  # repeated shutdown is harmless
+    ok = marker.scene() is None and band.scene() is None
+    # QGIS 3 exercises the exact reported compatibility case. QGIS versions
+    # which expose QObject APIs still have to pass the scene-detachment check.
+    detail = f"QGIS3 marker lacks deleteLater={marker_had_no_delete_later}"
+    return _result("canvas overlays close without QObject-only API", ok, detail)
+
+
 def test_end_to_end_task_and_generation() -> bool:
     """build_work -> task.run() (synchronous) -> generate over memory layers."""
     from ..workbench.depth_service import DepthSourceConfig
@@ -419,6 +436,7 @@ def run_all() -> list:
         test_route_frame_builder(),
         test_plan_route_follows_stored_geometry(),
         test_section_style_has_no_cartographic_offset(),
+        test_canvas_items_close_without_qobject_api(),
         test_end_to_end_task_and_generation(),
         test_profile_sampling_task(),
         test_burial_depth_config_is_manual_only(),

@@ -213,7 +213,7 @@ def _load_features_wgs84(layer: QgsVectorLayer, project: QgsProject
         idx_feat = QgsFeature()
         idx_feat.setId(i)
         idx_feat.setGeometry(geom)
-        index.insertFeature(idx_feat)
+        index.addFeature(idx_feat)
     return index, store
 
 

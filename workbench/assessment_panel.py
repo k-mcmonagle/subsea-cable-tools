@@ -778,7 +778,7 @@ class AssessmentPanel(QWidget):
         layer = self._find_or_load_layer(layer_name)
         if layer is not None:
             assessment_output.apply_assessment_style(layer, self.methods)
-            layer.dataProvider().forceReload()
+            layer.dataProvider().reloadData()
             layer.triggerRepaint()
 
     def _load_stored_ranges(self):

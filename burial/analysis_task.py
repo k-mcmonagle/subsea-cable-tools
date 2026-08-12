@@ -178,7 +178,7 @@ class DepthSnapshot:
                 idx_feat = QgsFeature()
                 idx_feat.setId(i)
                 idx_feat.setGeometry(geom)
-                self._contour_index.insertFeature(idx_feat)
+                self._contour_index.addFeature(idx_feat)
             self._contours = contour_feats
         self._contours_prepared = True
         return True

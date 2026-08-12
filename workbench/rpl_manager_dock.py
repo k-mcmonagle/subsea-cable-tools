@@ -1159,7 +1159,7 @@ class RplManagerPanel(QWidget):
         """Load a fit layer, or refresh it if it is already in the project."""
         layer = self._find_or_load_layer(layer_name)
         if layer is not None:
-            layer.dataProvider().forceReload()
+            layer.dataProvider().reloadData()
             layer.triggerRepaint()
 
     def _section_coords(self, kp_lo: float, kp_hi: float) -> List:

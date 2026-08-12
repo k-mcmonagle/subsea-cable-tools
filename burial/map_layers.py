@@ -295,8 +295,11 @@ def _ensure_layer(project: QgsProject, gpkg_path: str, layer_name: str,
                   style_fn) -> Optional[QgsVectorLayer]:
     existing = find_layer(project, gpkg_path, layer_name)
     if existing is not None and existing.isValid():
-        existing.dataProvider().forceReload()
-        existing.triggerRepaint()
+        existing.dataProvider().reloadData()
+        # These are tool-owned, read-only presentation layers. Reapply their
+        # style so fixes (notably removal of the old line offset) also reach
+        # layers already saved in an open project.
+        style_fn(existing)
         return existing
     layer = QgsVectorLayer(gpkg_layer_uri(gpkg_path, layer_name), layer_name, "ogr")
     if not layer.isValid():

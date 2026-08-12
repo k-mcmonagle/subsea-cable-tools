@@ -84,6 +84,32 @@ _STATUS_STYLES = {
 }
 
 
+def _remove_canvas_item(item) -> None:
+    """Detach a QGIS canvas item without assuming it is a QObject.
+
+    ``QgsVertexMarker`` and ``QgsRubberBand`` are QGraphicsItems in supported
+    QGIS 3 builds, where ``deleteLater()`` is not available. Removing the item
+    from its owning scene and dropping our Python reference is the portable
+    disposal path. Every operation is guarded because shutdown may also run
+    while QGIS itself is tearing down the canvas.
+    """
+    if item is None or _sip_isdeleted(item):
+        return
+    try:
+        item.hide()
+    except (AttributeError, RuntimeError):
+        pass
+    try:
+        scene = item.scene()
+    except (AttributeError, RuntimeError):
+        scene = None
+    if scene is not None:
+        try:
+            scene.removeItem(item)
+        except (AttributeError, RuntimeError):
+            pass
+
+
 class BurialPlannerDock(QDockWidget):
     def __init__(self, iface, parent=None):
         super().__init__("Burial Planner (beta)", parent)
@@ -727,14 +753,19 @@ class BurialPlannerDock(QDockWidget):
 
     def shutdown(self) -> None:
         """Transient artefacts only — never deletes data or registry rows."""
-        self.cancel_analysis()
-        self._cancel_profile_refresh(silent=True)
-        for item in (self._marker, self._band):
-            if item is not None and not _sip_isdeleted(item):
-                item.hide()
-                item.deleteLater()
+        try:
+            self.cancel_analysis()
+        except (AttributeError, RuntimeError):
+            pass
+        try:
+            self._cancel_profile_refresh(silent=True)
+        except (AttributeError, RuntimeError):
+            pass
+        items = (self._marker, self._band)
         self._marker = None
         self._band = None
+        for item in items:
+            _remove_canvas_item(item)
 
     def closeEvent(self, event) -> None:
         self.shutdown()
