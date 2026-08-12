@@ -9,6 +9,8 @@ cancellation raising cleanly; direction mapping of slope limits.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 
 from qgis.core import (
     QgsCoordinateReferenceSystem,
@@ -23,6 +25,7 @@ from qgis.gui import QgsMapCanvas, QgsRubberBand, QgsVertexMarker
 from ..burial import analysis_task, burial_dock, generation, map_layers
 from ..burial import schema as burial_schema
 from ..burial.plan_model import PlanModel
+from ..burial.store import BurialStore
 from ..kp_geo_utils import RouteFrame
 from ..kp_range_utils import make_distance_area
 from ..workbench import rules_engine as eng
@@ -274,6 +277,29 @@ def test_canvas_items_close_without_qobject_api() -> bool:
     return _result("canvas overlays close without QObject-only API", ok, detail)
 
 
+def test_existing_plan_file_open_is_non_destructive() -> bool:
+    """Open validates the registry and never creates a missing selected file."""
+    # OGR can retain pooled Windows handles until QGIS exits, so this follows
+    # the other store tests and leaves the OS temporary directory to cleanup.
+    folder = tempfile.mkdtemp(prefix="burial_open_test_")
+    missing = os.path.join(folder, "not-a-plan.gpkg")
+    rejected = False
+    try:
+        burial_dock.BurialPlannerDock._open_existing_store(missing)
+    except ValueError:
+        rejected = True
+    ok = rejected and not os.path.exists(missing)
+
+    valid = os.path.join(folder, "existing-plans.gpkg")
+    store = BurialStore(valid)
+    store.migrate()
+    plan_id = store.save_plan({"name": "Recovered plan", "method": "plough"})
+    reopened = burial_dock.BurialPlannerDock._open_existing_store(valid)
+    plans = reopened.list_plans()
+    ok = ok and len(plans) == 1 and plans[0].get("plan_id") == plan_id
+    return _result("existing plan file is validated before opening", ok)
+
+
 def test_end_to_end_task_and_generation() -> bool:
     """build_work -> task.run() (synchronous) -> generate over memory layers."""
     from ..workbench.depth_service import DepthSourceConfig
@@ -437,6 +463,7 @@ def run_all() -> list:
         test_plan_route_follows_stored_geometry(),
         test_section_style_has_no_cartographic_offset(),
         test_canvas_items_close_without_qobject_api(),
+        test_existing_plan_file_open_is_non_destructive(),
         test_end_to_end_task_and_generation(),
         test_profile_sampling_task(),
         test_burial_depth_config_is_manual_only(),
