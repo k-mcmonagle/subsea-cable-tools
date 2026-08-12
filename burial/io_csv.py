@@ -43,6 +43,7 @@ def metadata_lines(plan: Dict, generation_id: str = "") -> List[str]:
         f"# plan: {plan.get('name') or ''}",
         f"# plan_id: {plan.get('plan_id') or ''}",
         f"# rpl: {plan.get('rpl_name') or ''}",
+        f"# rpl_revision: {plan.get('rpl_revision') or ''}",
         f"# rpl_id: {plan.get('rpl_id') or ''}",
         f"# method: {plan.get('method') or ''}",
         f"# direction: {'A-B' if int(plan.get('direction') or 1) >= 0 else 'B-A'}",

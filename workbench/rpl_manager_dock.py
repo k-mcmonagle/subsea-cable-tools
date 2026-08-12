@@ -27,6 +27,7 @@ from qgis.PyQt.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
@@ -210,6 +211,20 @@ class RplManagerPanel(QWidget):
             header.addWidget(btn)
         right_layout.addLayout(header)
 
+        metadata_row = QHBoxLayout()
+        metadata_row.addWidget(QLabel("RPL revision:"))
+        self.revision_edit = QLineEdit()
+        self.revision_edit.setMaximumWidth(180)
+        self.revision_edit.setPlaceholderText("e.g. Rev 3 or C02")
+        self.revision_edit.setToolTip(
+            "Revision label for this imported RPL. Issued revisions remain read-only.")
+        metadata_row.addWidget(self.revision_edit)
+        self.revision_save_btn = QPushButton("Save revision")
+        self.revision_save_btn.clicked.connect(self._save_revision_label)
+        metadata_row.addWidget(self.revision_save_btn)
+        metadata_row.addStretch(1)
+        right_layout.addLayout(metadata_row)
+
         row3 = QHBoxLayout()
         zoom_btn = QPushButton("Zoom to")
         zoom_btn.clicked.connect(self._zoom_to_current)
@@ -263,6 +278,8 @@ class RplManagerPanel(QWidget):
         self.auto_depth_check.setEnabled(not self._read_only)
         self.depth_btn.setEnabled(not self._read_only)
         self.resample_btn.setEnabled(not self._read_only)
+        self.revision_edit.setEnabled(not self._read_only and self.current_rpl is not None)
+        self.revision_save_btn.setEnabled(not self._read_only and self.current_rpl is not None)
         self._update_edit_buttons()
 
     def _can_edit_current(self) -> bool:
@@ -312,6 +329,7 @@ class RplManagerPanel(QWidget):
             self.model = None
             self.sync = None
             self.set_read_only(False)
+            self.revision_edit.clear()
             self._refresh_tables()
             return
         if self.sync is not None and self.sync.is_dirty():
@@ -337,9 +355,11 @@ class RplManagerPanel(QWidget):
         self.sync = None
         if not self.current_rpl:
             self.set_read_only(False)
+            self.revision_edit.clear()
             self._refresh_tables()
             return
         self.set_read_only(self.current_rpl.get("status") == schema.STATUS_ISSUED)
+        self.revision_edit.setText(self.current_rpl.get("rev_label") or "")
 
         points_layer = self._find_or_load_layer(self.current_rpl.get("points_layer"))
         lines_layer = self._find_or_load_layer(self.current_rpl.get("lines_layer"))
@@ -615,6 +635,43 @@ class RplManagerPanel(QWidget):
     # ---------------------------------------------------------- utilities --
     def _set_status(self, text: str):
         self.status_label.setText(text)
+
+    def _save_revision_label(self):
+        if not self.current_rpl or not self.store or not self._can_edit_current():
+            return
+        label = self.revision_edit.text().strip()
+        if not label:
+            QMessageBox.warning(self, "RPL revision", "Enter a revision label.")
+            return
+        route_id = self.current_rpl.get("route_id") or ""
+        siblings = self.store.revisions_of_route(route_id) if route_id else []
+        duplicate = next((row for row in siblings
+                          if row.get("rpl_id") != self.current_rpl.get("rpl_id")
+                          and (row.get("rev_label") or "").strip().lower()
+                          == label.lower()), None)
+        if duplicate is not None:
+            QMessageBox.warning(
+                self, "RPL revision",
+                f"This segment already has an RPL revision labelled '{label}'.")
+            return
+
+        old_label = self.current_rpl.get("rev_label") or ""
+        self.current_rpl["rev_label"] = label
+        route = self.store.get_route(route_id) if route_id else None
+        if route and route.get("name"):
+            self.current_rpl["name"] = f"{route.get('name')} {label}".strip()
+        elif old_label and (self.current_rpl.get("name") or "").endswith(old_label):
+            base = (self.current_rpl.get("name") or "")[:-len(old_label)].rstrip()
+            self.current_rpl["name"] = f"{base} {label}".strip()
+        try:
+            self.store.save_rpl(self.current_rpl)
+        except (WorkbenchReadOnlyError, ValueError) as exc:
+            QMessageBox.warning(self, "RPL revision", str(exc))
+            return
+        self.revision_edit.setText(label)
+        self._set_status(f"RPL revision updated to {label}.")
+        self.refresh_rpl_list()
+        self.rpls_changed.emit()
 
     def _zoom_to_current(self):
         if self.sync is None:

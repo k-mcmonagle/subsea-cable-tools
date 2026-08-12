@@ -247,6 +247,7 @@ class PlanModel(QObject):
             "method": method,
             "rpl_id": (rpl_row or {}).get("rpl_id") or "",
             "rpl_name": (rpl_row or {}).get("name") or "",
+            "rpl_revision": (rpl_row or {}).get("rev_label") or "",
             "rpl_gpkg_path": (rpl_row or {}).get("gpkg_path") or "",
             "rpl_fingerprint": "",
             "scope_start_kp": 0.0,
@@ -279,9 +280,11 @@ class PlanModel(QObject):
             before={schema.TABLE_PLAN: [before]},
             after={schema.TABLE_PLAN: [dict(self.plan)]}, reason=reason)
         self.logChanged.emit()
-        scope_keys = {"scope_start_kp", "scope_end_kp", "direction", "rpl_id"}
-        if scope_keys & set(updates):
+        changed_keys = set(updates)
+        if "rpl_id" in changed_keys or "rpl_gpkg_path" in changed_keys:
             self._load_route()
+        if {"scope_start_kp", "scope_end_kp", "direction", "rpl_id",
+            "rpl_gpkg_path"} & changed_keys:
             self.mark_stale()
         self.planChanged.emit()
         return True

@@ -35,7 +35,7 @@ from ..workbench.schema import (  # noqa: F401  (re-exported for the package)
     utc_now_iso,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Registry table names ------------------------------------------------------
 TABLE_META = "bp_meta"
@@ -77,6 +77,7 @@ PLAN_FIELDS: List[FieldSpec] = [
     ("method", "str"),               # plough | rov_jet
     ("rpl_id", "str"),               # Workbench rpl_id ("" for a bare line layer)
     ("rpl_name", "str"),             # snapshot
+    ("rpl_revision", "str"),         # Workbench rev_label snapshot
     ("rpl_gpkg_path", "str"),        # snapshot
     ("rpl_fingerprint", "str"),      # modified_utc/hash snapshot (stale detection)
     ("scope_start_kp", "float"),

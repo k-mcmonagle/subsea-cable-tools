@@ -3,14 +3,43 @@
 
 from __future__ import annotations
 
+from qgis.PyQt.QtCore import QObject, pyqtSignal
 from qgis.PyQt.QtWidgets import QApplication
 from qgis.gui import QgsMapCanvas
 
 from ..catenary.v3.ui.bu_lowering_dialog import BULoweringDialog
 from ..catenary.v3.ui.dialog import LaySimulatorDialog
+from ..burial.tabs.inputs_tab import InputsTab
 from ..explorer import CableLayExplorerWindow
 from ..workbench import schema
 from ..workbench.assessment_panel import RuleEditorDialog
+from ..workbench.depth_service import DepthSourceConfig
+
+
+def test_burial_inputs_construct_and_switch_source_type():
+    class _Model(QObject):
+        planChanged = pyqtSignal()
+        inputsChanged = pyqtSignal()
+
+        def __init__(self):
+            super().__init__()
+            self.plan = {}
+            self.inputs = []
+            self.route = None
+
+        def depth_config(self):
+            return DepthSourceConfig({})
+
+    widget = InputsTab(_Model(), lambda: None)
+    assert widget.contour_combo2 is not None
+    widget.inherit_check.setChecked(False)
+    widget.manual_source_combo.setCurrentIndex(
+        widget.manual_source_combo.findData(2))
+    assert widget.contour_combo.isEnabled()
+    assert widget.contour_combo2.isEnabled()
+    assert not widget.raster_combo.isEnabled()
+    widget.close()
+    widget.deleteLater()
 
 
 def test_workbench_rule_layer_filters_construct():
@@ -75,6 +104,7 @@ def run_all():
         return []
     failures = []
     for test in (
+            test_burial_inputs_construct_and_switch_source_type,
             test_workbench_rule_layer_filters_construct,
             test_lay_simulator_tables_construct,
             test_bu_lowering_tool_constructs_and_builds_config,

@@ -33,6 +33,7 @@ class PlanTab(QWidget):
         self.description_edit = QLineEdit()
         self.method_label = QLabel("—")
         self.rpl_label = QLabel("—")
+        self.rpl_revision_label = QLabel("—")
         self.rev_label = QLabel("—")
         self.status_label = QLabel("—")
         self.notes_edit = QPlainTextEdit()
@@ -42,7 +43,8 @@ class PlanTab(QWidget):
         form.addRow("Description:", self.description_edit)
         form.addRow("Method:", self.method_label)
         form.addRow("RPL:", self.rpl_label)
-        form.addRow("Revision:", self.rev_label)
+        form.addRow("RPL revision:", self.rpl_revision_label)
+        form.addRow("Plan revision:", self.rev_label)
         form.addRow("Status:", self.status_label)
         layout.addLayout(form)
         layout.addWidget(QLabel("Notes:"))
@@ -75,6 +77,7 @@ class PlanTab(QWidget):
             self.method_label.setText(
                 schema.METHOD_LABELS.get(plan.get("method") or "", "—"))
             self.rpl_label.setText(plan.get("rpl_name") or "—")
+            self.rpl_revision_label.setText(plan.get("rpl_revision") or "—")
             self.rev_label.setText(plan.get("rev_label") or "—")
             self.status_label.setText(plan.get("status") or "draft")
         finally:

@@ -26,6 +26,7 @@ from qgis.PyQt.QtWidgets import (
     QInputDialog,
     QLabel,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSplitter,
     QTabWidget,
@@ -90,6 +91,8 @@ class BurialPlannerDock(QDockWidget):
         self.setObjectName("SubseaCableToolsBurialPlannerDock")
         self._loading = False
         self._task: Optional[analysis_task.BurialAnalysisTask] = None
+        self._profile_task: Optional[analysis_task.ProfileSamplingTask] = None
+        self._profile_generation = 0
         self._generate_after_analysis = False
         self._marker = None
         self._band = None
@@ -125,11 +128,28 @@ class BurialPlannerDock(QDockWidget):
         self.tabs.addTab(self.review_tab, "Review && Export")
         self.splitter.addWidget(self.tabs)
 
+        profile_pane = QWidget()
+        profile_layout = QVBoxLayout(profile_pane)
+        profile_layout.setContentsMargins(0, 0, 0, 0)
+        profile_status_row = QHBoxLayout()
+        self.profile_status = QLabel("Bathymetry profile")
+        profile_status_row.addWidget(self.profile_status, 1)
+        self.profile_progress = QProgressBar()
+        self.profile_progress.setRange(0, 100)
+        self.profile_progress.setMaximumWidth(240)
+        self.profile_progress.setVisible(False)
+        profile_status_row.addWidget(self.profile_progress)
+        self.profile_cancel = QPushButton("Stop profile refresh")
+        self.profile_cancel.setVisible(False)
+        self.profile_cancel.clicked.connect(self._cancel_profile_refresh)
+        profile_status_row.addWidget(self.profile_cancel)
+        profile_layout.addLayout(profile_status_row)
         self.profile = BurialProfileWidget()
         self.profile.kpHovered.connect(self._on_profile_hover)
         self.profile.kpClicked.connect(self.goto_kp)
         self.profile.eventMoveRequested.connect(self._on_profile_event_moved)
-        self.splitter.addWidget(self.profile)
+        profile_layout.addWidget(self.profile, 1)
+        self.splitter.addWidget(profile_pane)
         self.splitter.setStretchFactor(0, 3)
         self.splitter.setStretchFactor(1, 1)
         outer.addWidget(self.splitter, 1)
@@ -460,21 +480,88 @@ class BurialPlannerDock(QDockWidget):
     # -- profile pane ---------------------------------------------------------
     def _refresh_profile(self) -> None:
         plan = self.model.plan
+        self._cancel_profile_refresh(silent=True)
+        self._profile_generation += 1
+        generation_id = self._profile_generation
         if not plan or self.model.route is None:
             self.profile.clear()
+            self.profile_status.setText(
+                self.model.route_error or "Select a plan route to display its profile.")
             return
         params = self.model.gen_params()
         scope = params.scope
         self.profile.set_scope(scope.start_km, scope.end_km)
-        service = self.model.depth_service()
-        series = []
-        if service.is_available() and scope.length_km > 0:
-            step_m = max(5.0, scope.length_km * 1000.0 / 3000.0)
-            series = [(kp, abs(d)) for kp, d in service.sample_profile(
-                self.model.route, scope.start_km, scope.end_km, step_m)]
-        self.profile.set_profile(series)
+        self.profile.set_profile([])
         self._refresh_profile_overlays()
         self._refresh_profile_events()
+        config = self.model.depth_config()
+        if not config.is_configured():
+            self.profile_status.setText(
+                "No bathymetry configured. Choose a manual source or configure the Workbench RPL.")
+            return
+        if scope.length_km <= 0:
+            self.profile_status.setText("Set a non-zero scope to display the bathymetry profile.")
+            return
+
+        # DepthSnapshot only clones providers/feature sources here.  Contour
+        # iteration, indexing and all route sampling happen inside QgsTask.
+        snapshot = analysis_task.DepthSnapshot(config, QgsProject.instance())
+        step_m = max(5.0, scope.length_km * 1000.0 / 3000.0)
+        task = analysis_task.ProfileSamplingTask(
+            self.model.route, snapshot, scope.start_km, scope.end_km, step_m,
+            lambda finished, token=generation_id: self._profile_finished(finished, token))
+        self._profile_task = task
+        task.progressMessage.connect(
+            lambda message, active=task: self._profile_message(active, message))
+        task.progressChanged.connect(
+            lambda pct, active=task: self._profile_progress_changed(active, pct))
+        self.profile_progress.setValue(0)
+        self.profile_progress.setVisible(True)
+        self.profile_cancel.setVisible(True)
+        self.profile_status.setText("Starting bathymetry profile refresh…")
+        QgsApplication.taskManager().addTask(task)
+
+    def _profile_message(self, task: analysis_task.ProfileSamplingTask,
+                         message: str) -> None:
+        if self._profile_task is task:
+            self.profile_status.setText(message)
+
+    def _profile_progress_changed(self, task: analysis_task.ProfileSamplingTask,
+                                  pct: float) -> None:
+        if self._profile_task is task:
+            self.profile_progress.setValue(int(pct))
+
+    def _cancel_profile_refresh(self, _checked=False, silent: bool = False) -> None:
+        task = self._profile_task
+        if task is not None:
+            task.cancel()
+            self._profile_task = None
+            if not silent:
+                self.profile_status.setText("Profile refresh stopping…")
+        self.profile_progress.setVisible(False)
+        self.profile_cancel.setVisible(False)
+
+    def _profile_finished(self, task: analysis_task.ProfileSamplingTask,
+                          generation_id: int) -> None:
+        if generation_id != self._profile_generation:
+            return
+        if self._profile_task is task:
+            self._profile_task = None
+        self.profile_progress.setVisible(False)
+        self.profile_cancel.setVisible(False)
+        if task.cancelled:
+            self.profile_status.setText("Bathymetry profile refresh cancelled.")
+            return
+        if task.error:
+            self.profile_status.setText(f"Bathymetry profile unavailable: {task.error}")
+            return
+        self.profile.set_profile(task.series)
+        if task.series:
+            self.profile_status.setText(
+                f"Bathymetry profile ready — {len(task.series):,} samples.")
+        else:
+            self.profile_status.setText(
+                "Bathymetry sources have no coverage within the selected scope.")
 
     def _refresh_profile_overlays(self) -> None:
         self.profile.set_overlays(self.model.context)
@@ -581,11 +668,17 @@ class BurialPlannerDock(QDockWidget):
                 self.model.store = store
                 self.model.workbench_store = self.workbench_store()
                 self.model.close_plan()
+        else:
+            # The Workbench may have been created or changed after this dock
+            # opened.  Always refresh the read-only handle so inherited depth
+            # sources and revision metadata resolve immediately.
+            self.model.workbench_store = self.workbench_store()
         self.refresh_plans(self.model.plan_id)
 
     def shutdown(self) -> None:
         """Transient artefacts only — never deletes data or registry rows."""
         self.cancel_analysis()
+        self._cancel_profile_refresh(silent=True)
         for item in (self._marker, self._band):
             if item is not None and not _sip_isdeleted(item):
                 item.hide()

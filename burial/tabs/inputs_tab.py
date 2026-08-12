@@ -38,6 +38,7 @@ from qgis.PyQt.QtWidgets import (
 from ...qgis_compat import (
     DIALOG_ACCEPTED,
     HEADER_RESIZE_MODE_STRETCH,
+    ITEM_DATA_USER_ROLE,
     MAP_LAYER_FILTER_LINE,
     MAP_LAYER_FILTER_POINT,
     MAP_LAYER_FILTER_POLYGON,
@@ -57,6 +58,8 @@ _ROLE_FILTERS = {
     schema.INPUT_ROLE_SOILS: (MAP_LAYER_FILTER_POLYGON,),
     schema.INPUT_ROLE_OTHER: (MAP_LAYER_FILTER_VECTOR,),
 }
+
+_RPL_REVISION_ROLE = int(ITEM_DATA_USER_ROLE) + 1
 
 
 class InputDialog(QDialog):
@@ -150,18 +153,33 @@ class InputsTab(QWidget):
         self.workbench_store_fn = workbench_store_fn  # () -> WorkbenchStore | None
         self._loading = False
 
-        layout = QVBoxLayout(self)
+        # Keep forms at a readable measure when the floating dock is maximised
+        # on a wide monitor. Tables still get a useful 1050 px working width,
+        # while labels and selectors no longer stretch across the whole screen.
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addStretch(1)
+        content = QWidget()
+        content.setMaximumWidth(1050)
+        layout = QVBoxLayout(content)
+        outer.addWidget(content, 4)
+        outer.addStretch(1)
 
         # -- RPL --------------------------------------------------------------
         rpl_box = QGroupBox("Route (RPL)")
         rpl_form = QFormLayout(rpl_box)
         rpl_row = QHBoxLayout()
         self.rpl_combo = QComboBox()
+        self.rpl_combo.currentIndexChanged.connect(self._update_rpl_revision_preview)
         rpl_row.addWidget(self.rpl_combo, 1)
         self.apply_rpl_button = QPushButton("Set route")
         self.apply_rpl_button.clicked.connect(self._apply_rpl)
         rpl_row.addWidget(self.apply_rpl_button)
         rpl_form.addRow("Workbench RPL:", rpl_row)
+        self.rpl_revision_label = QLabel("—")
+        self.rpl_revision_label.setToolTip(
+            "Revision label stored on the selected Cable Workbench RPL.")
+        rpl_form.addRow("Selected RPL revision:", self.rpl_revision_label)
         fallback_row = QHBoxLayout()
         self.fallback_combo = QgsMapLayerComboBox()
         self.fallback_combo.setFilters(layer_filters(MAP_LAYER_FILTER_LINE))
@@ -221,8 +239,18 @@ class InputsTab(QWidget):
         self.inherit_check.setChecked(True)
         self.inherit_check.toggled.connect(self._sync_bathy_enabled)
         bathy_form.addRow(self.inherit_check)
+        self.bathy_summary = QLabel("")
+        self.bathy_summary.setWordWrap(True)
+        bathy_form.addRow("Active source:", self.bathy_summary)
         from ...qgis_compat import MAP_LAYER_FILTER_RASTER
 
+        self.manual_source_combo = QComboBox()
+        self.manual_source_combo.addItem("Raster layer", 1)
+        self.manual_source_combo.addItem("Depth contours (up to two layers)", 2)
+        self.manual_source_combo.currentIndexChanged.connect(self._sync_bathy_enabled)
+        self.manual_source_combo.setToolTip(
+            "Choose exactly one source type. The other controls are disabled "
+            "so raster and contour inputs cannot be mixed accidentally.")
         self.raster_combo = QgsMapLayerComboBox()
         self.raster_combo.setFilters(layer_filters(MAP_LAYER_FILTER_RASTER))
         self.raster_combo.setAllowEmptyLayer(True)
@@ -233,18 +261,29 @@ class InputsTab(QWidget):
         self.contour_combo.setAllowEmptyLayer(True)
         self.contour_field = QgsFieldComboBox()
         self.contour_combo.layerChanged.connect(self.contour_field.setLayer)
+        self.contour_combo2 = QgsMapLayerComboBox()
+        self.contour_combo2.setFilters(layer_filters(MAP_LAYER_FILTER_LINE))
+        self.contour_combo2.setAllowEmptyLayer(True)
+        self.contour_field2 = QgsFieldComboBox()
+        self.contour_combo2.layerChanged.connect(self.contour_field2.setLayer)
         self.search_radius = QDoubleSpinBox()
         self.search_radius.setRange(0.0, 100000.0)
         self.search_radius.setSuffix(" m")
         self.search_radius.setValue(500.0)
+        bathy_form.addRow("Manual source type:", self.manual_source_combo)
         bathy_form.addRow("Raster:", self.raster_combo)
         bathy_form.addRow("Band:", self.raster_band)
-        bathy_form.addRow("Contours:", self.contour_combo)
-        bathy_form.addRow("Depth field:", self.contour_field)
+        bathy_form.addRow("Contour layer 1 (minor or major):", self.contour_combo)
+        bathy_form.addRow("Depth field 1:", self.contour_field)
+        bathy_form.addRow("Contour layer 2 (optional):", self.contour_combo2)
+        bathy_form.addRow("Depth field 2:", self.contour_field2)
         bathy_form.addRow("Contour search radius:", self.search_radius)
         self.apply_bathy_button = QPushButton("Apply bathymetry")
         self.apply_bathy_button.clicked.connect(self._apply_bathy)
         bathy_form.addRow(self.apply_bathy_button)
+        self.apply_status = QLabel("")
+        self.apply_status.setWordWrap(True)
+        bathy_form.addRow(self.apply_status)
         layout.addWidget(bathy_box)
 
         # -- other inputs -----------------------------------------------------
@@ -294,10 +333,12 @@ class InputsTab(QWidget):
         self._refresh_inputs()
 
     def _refresh_rpls(self) -> None:
+        previous = self.rpl_combo.currentData()
         self.rpl_combo.clear()
         store = self.workbench_store_fn()
         if store is None:
             self.rpl_combo.addItem("(no Workbench GeoPackage in this project)", "")
+            self.rpl_revision_label.setText("—")
             return
         try:
             rpls = store.list_rpls()
@@ -305,10 +346,26 @@ class InputsTab(QWidget):
             rpls = []
         current = self.model.plan.get("rpl_id") or ""
         for rpl in rpls:
-            self.rpl_combo.addItem(rpl.get("name") or "RPL", rpl.get("rpl_id"))
+            name = rpl.get("name") or "RPL"
+            revision = (rpl.get("rev_label") or "").strip()
+            label = name if revision and revision.lower() in name.lower() \
+                else (f"{name} — {revision}" if revision else name)
+            self.rpl_combo.addItem(label, rpl.get("rpl_id"))
+            self.rpl_combo.setItemData(
+                self.rpl_combo.count() - 1, revision, _RPL_REVISION_ROLE)
         index = self.rpl_combo.findData(current)
         if index >= 0:
             self.rpl_combo.setCurrentIndex(index)
+        elif previous:
+            previous_index = self.rpl_combo.findData(previous)
+            if previous_index >= 0:
+                self.rpl_combo.setCurrentIndex(previous_index)
+        self._update_rpl_revision_preview()
+
+    def _update_rpl_revision_preview(self, *_args) -> None:
+        revision = self.rpl_combo.currentData(_RPL_REVISION_ROLE) \
+            if self.rpl_combo.count() else ""
+        self.rpl_revision_label.setText(str(revision or "—"))
 
     def _refresh_inputs(self) -> None:
         rows = [r for r in self.model.inputs
@@ -335,12 +392,18 @@ class InputsTab(QWidget):
         rpl = store.get_rpl(rpl_id) or {}
         from .. import map_layers
 
+        # Keep the model's store handle current; the Workbench can be created
+        # after the Burial Planner dock was first opened.
+        self.model.workbench_store = store
         self.model.update_plan({
             "rpl_id": rpl_id,
             "rpl_name": rpl.get("name") or "",
+            "rpl_revision": rpl.get("rev_label") or "",
             "rpl_gpkg_path": store.gpkg_path,
             "rpl_fingerprint": map_layers.rpl_fingerprint(rpl, store.gpkg_path),
         }, reason="route set")
+        self.apply_status.setText(
+            "Workbench route and revision applied. Bathymetry profile refresh started.")
 
     def _apply_fallback(self) -> None:
         layer = self.fallback_combo.currentLayer()
@@ -349,9 +412,11 @@ class InputsTab(QWidget):
         self.model.update_plan({
             "rpl_id": "",
             "rpl_name": layer.name(),
+            "rpl_revision": "",
             "rpl_gpkg_path": layer.source(),
             "rpl_fingerprint": normalised_path(layer.source().split("|")[0]),
         }, reason="route set (line layer)")
+        self.apply_status.setText("Line-layer route applied. Profile refresh started.")
 
     def _full_route(self) -> None:
         if self.model.route is not None:
@@ -359,12 +424,15 @@ class InputsTab(QWidget):
             self.scope_end.setValue(self.model.route.total_length_km)
 
     def _apply_scope(self) -> None:
-        self.model.update_plan({
+        saved = self.model.update_plan({
             "scope_start_kp": self.scope_start.value(),
             "scope_end_kp": self.scope_end.value(),
             "direction": self.direction_combo.currentData(),
             "target_burial_m": self.target_burial.value() or None,
         }, reason="scope/direction")
+        if saved:
+            self.apply_status.setText(
+                "Scope and direction applied. Bathymetry profile is refreshing in the background.")
 
     # -- bathymetry -----------------------------------------------------------
     def _bathy_row(self) -> Optional[Dict]:
@@ -373,75 +441,143 @@ class InputsTab(QWidget):
                 return row
         return None
 
-    def _sync_bathy_enabled(self) -> None:
+    def _sync_bathy_enabled(self, *_args) -> None:
         manual = not self.inherit_check.isChecked()
-        for widget in (self.raster_combo, self.raster_band, self.contour_combo,
-                       self.contour_field, self.search_radius):
-            widget.setEnabled(manual)
+        source_mode = int(self.manual_source_combo.currentData() or 1)
+        self.manual_source_combo.setEnabled(manual)
+        for widget in (self.raster_combo, self.raster_band):
+            widget.setEnabled(manual and source_mode == 1)
+        for widget in (self.contour_combo, self.contour_field,
+                       self.contour_combo2, self.contour_field2,
+                       self.search_radius):
+            widget.setEnabled(manual and source_mode == 2)
 
     def _load_bathy_config(self) -> None:
         row = self._bathy_row()
         self.inherit_check.setChecked(row is None)
-        self._sync_bathy_enabled()
         if row is None:
+            config = self.model.depth_config()
+            rasters = len(config.raster_layer_ids)
+            contours = len(config.contour_layers)
+            if config.is_configured():
+                self.bathy_summary.setText(
+                    f"Inherited from Workbench: {rasters} raster layer(s), "
+                    f"{contours} contour layer(s).")
+            else:
+                self.bathy_summary.setText(
+                    "Workbench inheritance is selected, but this RPL has no depth sources configured.")
+            self._sync_bathy_enabled()
             return
         try:
             config = json.loads(row.get("config_json") or "{}")
         except (ValueError, TypeError):
             config = {}
         project = QgsProject.instance()
+        self.raster_combo.setLayer(None)
+        self.contour_combo.setLayer(None)
+        self.contour_combo2.setLayer(None)
         raster_ids = config.get("raster_layer_ids") or []
+        contours = config.get("contour_layers") or []
+        source_mode = int(config.get("mode") or 0)
+        if source_mode not in (1, 2):
+            source_mode = 1 if raster_ids else 2
+        source_index = self.manual_source_combo.findData(source_mode)
+        self.manual_source_combo.setCurrentIndex(max(0, source_index))
         if raster_ids:
             layer = project.mapLayer(raster_ids[0])
             if layer is not None:
                 self.raster_combo.setLayer(layer)
         self.raster_band.setValue(int(config.get("raster_band") or 1))
-        contours = config.get("contour_layers") or []
         if contours:
             layer = project.mapLayer(contours[0].get("layer_id") or "")
             if layer is not None:
                 self.contour_combo.setLayer(layer)
                 self.contour_field.setLayer(layer)
                 self.contour_field.setField(contours[0].get("depth_field") or "")
+        if len(contours) > 1:
+            layer = project.mapLayer(contours[1].get("layer_id") or "")
+            if layer is not None:
+                self.contour_combo2.setLayer(layer)
+                self.contour_field2.setLayer(layer)
+                self.contour_field2.setField(contours[1].get("depth_field") or "")
         self.search_radius.setValue(float(config.get("contour_search_radius_m") or 500.0))
+        self.bathy_summary.setText(
+            "Manual raster source." if source_mode == 1
+            else f"Manual contours: {len(contours)} layer(s).")
+        self._sync_bathy_enabled()
 
     def _apply_bathy(self) -> None:
         existing = self._bathy_row()
         if self.inherit_check.isChecked():
+            workbench_store = self.workbench_store_fn()
+            if workbench_store is not None:
+                self.model.workbench_store = workbench_store
             if existing is not None:
-                self.model.delete_input(existing.get("input_id"))
+                if not self.model.delete_input(existing.get("input_id")):
+                    return
+            else:
+                # No registry row changes in the already-inherited case, but
+                # Apply still means re-resolve the Workbench config and rerun
+                # the asynchronous profile (e.g. after editing depth sources).
+                self.model.inputsChanged.emit()
+            config = self.model.depth_config()
+            if config.is_configured():
+                self.apply_status.setText(
+                    "Workbench bathymetry inherited. Profile refresh started in the background.")
+            else:
+                self.apply_status.setText(
+                    "Inheritance applied, but the selected Workbench RPL has no configured depth sources.")
+            self._load_bathy_config()
             return
-        config: Dict = {"mode": 0, "raster_layer_ids": [], "raster_band": 1,
+        source_mode = int(self.manual_source_combo.currentData() or 1)
+        config: Dict = {"mode": source_mode, "raster_layer_ids": [], "raster_band": 1,
                         "contour_layers": [], "contour_search_radius_m": 0.0,
                         "auto_resample": True}
-        raster = self.raster_combo.currentLayer()
-        if raster is not None:
+        raster = self.raster_combo.currentLayer() if source_mode == 1 else None
+        if source_mode == 1 and raster is not None:
             config["raster_layer_ids"] = [raster.id()]
             config["raster_band"] = self.raster_band.value()
-        contour = self.contour_combo.currentLayer()
+        contour = self.contour_combo.currentLayer() if source_mode == 2 else None
+        contour2 = self.contour_combo2.currentLayer() if source_mode == 2 else None
         if contour is not None:
-            config["contour_layers"] = [{
+            config["contour_layers"].append({
                 "layer_id": contour.id(),
                 "depth_field": self.contour_field.currentField() or "",
-            }]
+            })
+        if contour2 is not None:
+            if contour is not None and contour2.id() == contour.id():
+                QMessageBox.warning(
+                    self, "Burial Planner",
+                    "Contour layer 1 and contour layer 2 must be different layers.")
+                return
+            config["contour_layers"].append({
+                "layer_id": contour2.id(),
+                "depth_field": self.contour_field2.currentField() or "",
+            })
+        if config["contour_layers"]:
             config["contour_search_radius_m"] = self.search_radius.value()
         if not config["raster_layer_ids"] and not config["contour_layers"]:
             QMessageBox.warning(self, "Burial Planner",
-                                "Pick a raster and/or contour layer, or inherit "
+                                "Pick a raster or at least one contour layer, or inherit "
                                 "from the Workbench.")
             return
+        primary_contour = contour or contour2
         row = dict(existing or {})
         row.update({
             "role": schema.INPUT_ROLE_BATHY,
             "layer_name": (raster.name() if raster is not None
-                           else (contour.name() if contour is not None else "")),
+                           else (primary_contour.name() if primary_contour is not None else "")),
             "layer_source": (raster.source() if raster is not None
-                             else (contour.source() if contour is not None else "")),
+                             else (primary_contour.source() if primary_contour is not None else "")),
             "layer_id_hint": (raster.id() if raster is not None
-                              else (contour.id() if contour is not None else "")),
+                              else (primary_contour.id() if primary_contour is not None else "")),
             "config_json": json.dumps(config),
         })
-        self.model.save_input(row)
+        if self.model.save_input(row):
+            kind = "raster" if source_mode == 1 else \
+                f"{len(config['contour_layers'])} contour layer(s)"
+            self.apply_status.setText(
+                f"Manual {kind} applied. Profile refresh started in the background.")
 
     # -- other inputs ---------------------------------------------------------
     def _add_input(self) -> None:

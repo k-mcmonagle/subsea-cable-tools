@@ -3,11 +3,12 @@
 
 Thread-safety contract (spec §14.1): the task never touches ``QgsProject``,
 GUI objects or live layers. On the main thread, ``build_work`` resolves
-inputs and clones everything into plain structures — feature geometries via
-the ``_load_features_wgs84`` pattern, raster providers via
-``provider.clone()``, rule configs as dicts. The task consumes snapshots
-only; results come back as plain interval data; store/layer writes happen in
-``finished()`` on the main thread (wired by the dock).
+inputs and clones everything into worker-safe snapshots — feature geometries
+via the ``_load_features_wgs84`` pattern, vector feature sources via
+``QgsVectorLayerFeatureSource``, raster providers via ``provider.clone()``,
+and rule configs as dicts. The task consumes snapshots only; results come
+back as plain interval data; store/layer writes happen in ``finished()`` on
+the main thread (wired by the dock).
 
 Caching (spec §14.4): each rule's acquisition (footprint + no-data +
 1 m-refined boundaries) is cached in memory per open plan, keyed over the
@@ -33,6 +34,7 @@ from qgis.core import (
     QgsSpatialIndex,
     QgsTask,
     QgsVectorLayer,
+    QgsVectorLayerFeatureSource,
 )
 from qgis.PyQt.QtCore import pyqtSignal
 
@@ -65,8 +67,9 @@ class DepthSnapshot:
     """Depth sampler safe to use on a worker thread.
 
     Built on the main thread from a ``DepthSourceConfig``: raster providers
-    are cloned (``provider.clone()``), contour features pre-transformed to
-    WGS84 plain geometries. ``sample(lat, lon)`` mirrors DepthService.
+    are cloned (``provider.clone()``) and contour feature-source snapshots are
+    captured. Contours are materialised in the worker thread.
+    ``sample(lat, lon)`` mirrors DepthService.
     """
 
     def __init__(self, config: DepthSourceConfig, project: Optional[QgsProject] = None):
@@ -93,23 +96,64 @@ class DepthSnapshot:
 
         self._contours: List[Tuple[QgsGeometry, float]] = []
         self._contour_index: Optional[QgsSpatialIndex] = None
-        contour_feats = []
+        self._contour_sources: List[Dict] = []
+        self._contours_prepared = False
+        self._transform_context = project.transformContext()
         for entry in config.contour_layers:
             layer = project.mapLayer(entry.get("layer_id", ""))
             if not isinstance(layer, QgsVectorLayer) or not layer.isValid():
                 continue
             depth_field = entry.get("depth_field", "")
-            xform = None
-            if layer.crs() != WGS84:
-                xform = QgsCoordinateTransform(layer.crs(), WGS84, project)
             names = layer.fields().names()
             field_name = depth_field if depth_field in names else (names[0] if names else "")
-            for feat in layer.getFeatures():
+            if not field_name:
+                continue
+            # QgsVectorLayerFeatureSource is the thread-safe snapshot used by
+            # QGIS for background feature iteration.  Creating it here is
+            # cheap; potentially large contour reads and spatial-index builds
+            # are deferred until the worker task starts.
+            self._contour_sources.append({
+                "source": QgsVectorLayerFeatureSource(layer),
+                "crs": layer.crs(),
+                "field_name": field_name,
+                "feature_count": max(int(layer.featureCount()), 0),
+            })
+        self._distance = make_distance_area(WGS84, self._transform_context,
+                                            project=project)
+
+    def prepare(self, cancel: Optional[Callable[[], bool]] = None,
+                progress: Optional[Callable[[int, int], None]] = None) -> bool:
+        """Materialise contour snapshots on the calling worker thread.
+
+        Returns ``False`` when cooperative cancellation was requested.
+        Raster-only configurations complete immediately.
+        """
+        if self._contours_prepared:
+            return True
+        if self.mode == 1:  # raster only
+            self._contours_prepared = True
+            return True
+        contour_feats = []
+        total = sum(max(int(s["feature_count"]), 1)
+                    for s in self._contour_sources) or 1
+        done = 0
+        for spec in self._contour_sources:
+            xform = None
+            if spec["crs"] != WGS84:
+                xform = QgsCoordinateTransform(
+                    spec["crs"], WGS84, self._transform_context)
+            count = max(int(spec["feature_count"]), 1)
+            for idx, feat in enumerate(spec["source"].getFeatures()):
+                if idx % 500 == 0:
+                    if cancel is not None and cancel():
+                        return False
+                    if progress is not None:
+                        progress(done + min(idx, count), total)
                 geom = feat.geometry()
-                if geom is None or geom.isEmpty() or not field_name:
+                if geom is None or geom.isEmpty():
                     continue
                 try:
-                    value = float(feat[field_name])
+                    value = float(feat[spec["field_name"]])
                 except (KeyError, TypeError, ValueError):
                     continue
                 geom = QgsGeometry(geom)
@@ -119,6 +163,9 @@ class DepthSnapshot:
                     except Exception:
                         continue
                 contour_feats.append((geom, value))
+            done += count
+            if progress is not None:
+                progress(done, total)
         if contour_feats:
             self._contour_index = QgsSpatialIndex()
             for i, (geom, _value) in enumerate(contour_feats):
@@ -129,13 +176,15 @@ class DepthSnapshot:
                 idx_feat.setGeometry(geom)
                 self._contour_index.insertFeature(idx_feat)
             self._contours = contour_feats
-        self._distance = make_distance_area(WGS84, project.transformContext(),
-                                            project=project)
+        self._contours_prepared = True
+        return True
 
     def is_available(self) -> bool:
-        return bool(self._rasters or self._contours)
+        return bool(self._rasters or self._contour_sources or self._contours)
 
     def sample(self, lat: float, lon: float) -> Optional[float]:
+        if not self._contours_prepared and not self.prepare():
+            return None
         point = QgsPointXY(lon, lat)
         want_raster = self.mode in (0, 1)
         want_contours = self.mode in (0, 2)
@@ -540,6 +589,11 @@ class BurialAnalysisTask(QgsTask):
         try:
             work = self.work
             total = max(len(work.rules), 1)
+            if work.depth is not None and work.depth.is_available():
+                self.progressMessage.emit("Preparing bathymetry sources…")
+                if not work.depth.prepare(cancel=self.isCanceled):
+                    self.cancelled = True
+                    return False
             self.progressMessage.emit("Building route stations…")
             sampler = ri.RouteSampler.from_route(
                 work.route, work.distance, work.step_m, work.scope)
@@ -643,4 +697,69 @@ class BurialAnalysisTask(QgsTask):
         try:
             self._on_finished(self)
         except Exception:  # never crash QGIS from a completion callback
+            pass
+
+
+class ProfileSamplingTask(QgsTask):
+    """Cancellable background depth sampling for the persistent profile."""
+
+    progressMessage = pyqtSignal(str)
+
+    def __init__(self, route: RouteFrame, depth: DepthSnapshot,
+                 start_kp: float, end_kp: float, step_m: float,
+                 on_finished: Callable[["ProfileSamplingTask"], None]):
+        super().__init__("Burial Planner profile", _CAN_CANCEL)
+        self.route = route
+        self.depth = depth
+        self.start_kp = min(float(start_kp), float(end_kp))
+        self.end_kp = max(float(start_kp), float(end_kp))
+        self.step_m = max(float(step_m), 1.0)
+        self.series: List[Tuple[float, float]] = []
+        self.error: Optional[str] = None
+        self.cancelled = False
+        self._on_finished = on_finished
+
+    def run(self) -> bool:
+        try:
+            if not self.depth.is_available():
+                self.error = "No configured bathymetry layer is available in the project."
+                return False
+            self.progressMessage.emit("Preparing bathymetry…")
+
+            def prep_progress(done: int, total: int) -> None:
+                self.setProgress(25.0 * float(done) / max(float(total), 1.0))
+
+            if not self.depth.prepare(self.isCanceled, prep_progress):
+                self.cancelled = True
+                return False
+            if self.isCanceled():
+                self.cancelled = True
+                return False
+
+            self.progressMessage.emit("Sampling bathymetry profile…")
+            length_m = max((self.end_kp - self.start_kp) * 1000.0, 0.0)
+            count = max(int(math.ceil(length_m / self.step_m)) + 1, 1)
+            for i in range(count):
+                if i % 25 == 0 and self.isCanceled():
+                    self.cancelled = True
+                    return False
+                kp = min(self.start_kp + i * self.step_m / 1000.0, self.end_kp)
+                point = self.route.point_at_kp(kp, clamp=True)
+                if point is not None:
+                    value = self.depth.sample(point.y(), point.x())
+                    if value is not None and value == value:
+                        self.series.append((kp, abs(float(value))))
+                self.setProgress(25.0 + 75.0 * float(i + 1) / count)
+            self.setProgress(100.0)
+            return True
+        except Exception as exc:  # pragma: no cover - surfaced in the dock
+            self.error = str(exc)
+            return False
+
+    def finished(self, ok: bool) -> None:
+        if not ok and not self.cancelled and self.error is None:
+            self.error = "Profile sampling task failed."
+        try:
+            self._on_finished(self)
+        except Exception:
             pass

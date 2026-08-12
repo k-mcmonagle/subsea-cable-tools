@@ -439,7 +439,9 @@ class WorkbenchDock(QDockWidget):
             kind = (rpl.get("kind") or "").replace("_", " ")
             if status == schema.STATUS_ISSUED:
                 status = "issued [locked]"
-            rpl_item = QTreeWidgetItem([rpl.get("name") or "?", f"{kind} - {status}"])
+            revision = rpl.get("rev_label") or "unlabelled"
+            rpl_item = QTreeWidgetItem([
+                rpl.get("name") or "?", f"{revision} - {kind} - {status}"])
             rpl_item.setData(0, Qt.ItemDataRole.UserRole, (KIND_RPL, rpl.get("rpl_id")))
             route_item.addChild(rpl_item)
 

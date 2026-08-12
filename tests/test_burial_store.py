@@ -41,7 +41,8 @@ def _store() -> BurialStore:
 def _plan_row(name="Plan A"):
     return {"plan_id": schema.new_id(), "name": name, "description": "",
             "notes": "", "method": "plough", "rpl_id": "rpl-1",
-            "rpl_name": "Route", "rpl_gpkg_path": "", "rpl_fingerprint": "fp",
+            "rpl_name": "Route", "rpl_revision": "Rev 4",
+            "rpl_gpkg_path": "", "rpl_fingerprint": "fp",
             "scope_start_kp": 0.0, "scope_end_kp": 10.0, "direction": 1,
             "target_burial_m": None, "params_json": "{}"}
 
@@ -66,6 +67,7 @@ def test_plan_round_trip() -> bool:
     plan_id = store.save_plan(_plan_row())
     plan = store.get_plan(plan_id)
     ok = plan is not None and plan.get("status") == schema.PLAN_STATUS_DRAFT
+    ok = ok and plan.get("rpl_revision") == "Rev 4"
     ok = ok and abs(float(plan.get("scope_end_kp")) - 10.0) < 1e-9
     store.save_input({"input_id": schema.new_id(), "plan_id": plan_id,
                       "role": "soils_polygons", "layer_name": "soils",
@@ -115,6 +117,29 @@ def test_plan_round_trip() -> bool:
     actives = [g for g in store.list_generations(plan_id) if int(g.get("active") or 0)]
     ok = ok and len(actives) == 1 and actives[0]["generation_id"] == gen2
     return _result("plan/input/rule/event/section/generation round trip", ok)
+
+
+def test_migrate_v1_adds_rpl_revision() -> bool:
+    _COUNTER[0] += 1
+    name = f"bp_v1_{os.getpid()}_{int(time.time() * 1000)}_{_COUNTER[0]}.gpkg"
+    store = BurialStore(os.path.join(tempfile.gettempdir(), name),
+                        QgsProject.instance().transformContext())
+    old_plan_fields = [field for field in schema.PLAN_FIELDS
+                       if field[0] != "rpl_revision"]
+    plan = _plan_row()
+    plan.pop("rpl_revision", None)
+    store._write_table_rows(schema.TABLE_META, schema.META_FIELDS, [
+        {"key": "schema_version", "value": "1"},
+        {"key": "created_utc", "value": "2026-01-01T00:00:00Z"},
+    ])
+    store._write_table_rows(schema.TABLE_PLAN, old_plan_fields, [plan])
+    store.migrate()
+    migrated = store.get_plan(plan["plan_id"]) or {}
+    stem, ext = os.path.splitext(store.gpkg_path)
+    ok = store.read_meta().get("schema_version") == str(schema.SCHEMA_VERSION)
+    ok = ok and "rpl_revision" in migrated
+    ok = ok and os.path.exists(f"{stem}.migrate_v1.bak{ext}")
+    return _result("migrate v1 adds RPL revision snapshot", ok)
 
 
 def test_duplicate_deep_copy() -> bool:
@@ -194,6 +219,7 @@ def test_change_log_and_rollback() -> bool:
 def run_all() -> list:
     return [
         test_create_and_migrate(),
+        test_migrate_v1_adds_rpl_revision(),
         test_plan_round_trip(),
         test_duplicate_deep_copy(),
         test_change_log_and_rollback(),

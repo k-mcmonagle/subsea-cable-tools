@@ -267,6 +267,30 @@ def test_end_to_end_task_and_generation() -> bool:
                    ok, f"burial={out.summary['burial_km']:.2f} km")
 
 
+def test_profile_sampling_task() -> bool:
+    route, _da = _route()
+
+    class _Depth:
+        def is_available(self):
+            return True
+
+        def prepare(self, cancel=None, progress=None):
+            if progress is not None:
+                progress(1, 1)
+            return not (cancel is not None and cancel())
+
+        def sample(self, lat, lon):
+            return -100.0 - lat
+
+    task = analysis_task.ProfileSamplingTask(
+        route, _Depth(), 0.0, 0.3, 100.0, lambda _task: None)
+    ok = task.run()
+    ok = ok and len(task.series) == 4
+    ok = ok and task.series[0][0] == 0.0 and task.series[-1][0] == 0.3
+    ok = ok and all(depth > 0 for _kp, depth in task.series)
+    return _result("background profile task samples scope with progress", ok)
+
+
 def run_all() -> list:
     return [
         test_scoped_sampler_matches_full(),
@@ -276,6 +300,7 @@ def run_all() -> list:
         test_direction_maps_slope_limits(),
         test_route_frame_builder(),
         test_end_to_end_task_and_generation(),
+        test_profile_sampling_task(),
     ]
 
 

@@ -156,6 +156,7 @@ class BurialStore:
         row.setdefault("created_utc", schema.utc_now_iso())
         row.setdefault("status", schema.PLAN_STATUS_DRAFT)
         row.setdefault("rev_label", "Rev 1")
+        row.setdefault("rpl_revision", "")
         row.setdefault("direction", 1)
         row["modified_utc"] = schema.utc_now_iso()
         self.upsert_rows(schema.TABLE_PLAN, [row])
@@ -398,8 +399,16 @@ class BurialStore:
         return open_gpkg_layer(self.gpkg_path, layer_name)
 
 
+def _migrate_v1_to_v2(store: BurialStore) -> None:
+    """Add the Workbench RPL revision snapshot to existing plan rows."""
+    rows = store.read_table(schema.TABLE_PLAN)
+    for row in rows:
+        row.setdefault("rpl_revision", "")
+    store._write_table_rows(schema.TABLE_PLAN, schema.PLAN_FIELDS, rows)
+
+
 # Maps a starting schema version to the function upgrading it one step.
-MIGRATIONS: Dict[int, object] = {}
+MIGRATIONS: Dict[int, object] = {1: _migrate_v1_to_v2}
 
 
 def _normalise_row(row: Dict) -> Dict:

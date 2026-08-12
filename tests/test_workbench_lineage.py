@@ -204,12 +204,32 @@ def test_next_rev_label() -> bool:
     return _result("revision label and layer-name helpers", ok)
 
 
+def test_edit_draft_rpl_revision() -> bool:
+    store = _temp_store()
+    store.migrate()
+    route_id = store.create_route("S021")
+    rpl_id = schema.new_id()
+    store.save_rpl({
+        "rpl_id": rpl_id, "name": "S021 Rev 1", "kind": "planned",
+        "points_layer": "p", "lines_layer": "l", "route_id": route_id,
+        "rev_label": "Rev 1",
+    })
+    edited = store.get_rpl(rpl_id) or {}
+    edited["rev_label"] = "C02"
+    edited["name"] = "S021 C02"
+    store.save_rpl(edited)
+    got = store.get_rpl(rpl_id) or {}
+    ok = got.get("rev_label") == "C02" and got.get("name") == "S021 C02"
+    return _result("draft RPL revision label remains editable", ok)
+
+
 def run_all() -> list:
     return [
         test_migrate_v2_to_v3(),
         test_new_rpl_revision_deep_copy(),
         test_issue_read_only(),
         test_next_rev_label(),
+        test_edit_draft_rpl_revision(),
     ]
 
 
