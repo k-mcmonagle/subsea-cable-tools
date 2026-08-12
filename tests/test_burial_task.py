@@ -19,7 +19,7 @@ from qgis.core import (
     QgsVectorLayer,
 )
 
-from ..burial import analysis_task, generation
+from ..burial import analysis_task, generation, map_layers
 from ..burial import schema as burial_schema
 from ..burial.plan_model import PlanModel
 from ..kp_geo_utils import RouteFrame
@@ -219,6 +219,44 @@ def test_route_frame_builder() -> bool:
     return _result("route frame from SeqNo-ordered line layer", ok)
 
 
+def test_plan_route_follows_stored_geometry() -> bool:
+    """Generated plan geometry must sit on the RPL as drawn in QGIS."""
+    layer = QgsVectorLayer("LineString?crs=EPSG:4326&field=SeqNo:integer",
+                           "sparse-route", "memory")
+    feat = QgsFeature(layer.fields())
+    feat.setGeometry(QgsGeometry.fromWkt("LINESTRING(-10 60, 10 60)"))
+    feat.setAttributes([0])
+    layer.dataProvider().addFeature(feat)
+
+    route, _da = analysis_task.build_route_frame(layer, QgsProject.instance())
+    midpoint = route.point_at_kp(route.total_length_km / 2.0, clamp=True)
+    segment = route.extract_segment(route.total_length_km * 0.25,
+                                    route.total_length_km * 0.75)
+    vertices = list(segment.vertices()) if segment is not None else []
+    ok = midpoint is not None and abs(midpoint.y() - 60.0) < 1e-10
+    ok = ok and abs(midpoint.x()) < 1e-8
+    ok = ok and len(vertices) >= 2
+    ok = ok and all(abs(point.y() - 60.0) < 1e-10 for point in vertices)
+    return _result("plan route follows stored RPL geometry", ok)
+
+
+def test_section_style_has_no_cartographic_offset() -> bool:
+    """A display offset can become a many-metre error at small map scales."""
+    layer = QgsVectorLayer("LineString?crs=EPSG:4326&field=kind:string",
+                           "plan-sections", "memory")
+    map_layers.apply_sections_style(layer)
+    renderer = layer.renderer()
+    children = renderer.rootRule().children() if renderer is not None else []
+    offsets = []
+    for child in children:
+        symbol = child.symbol()
+        if symbol is not None and symbol.symbolLayerCount():
+            offsets.append(float(symbol.symbolLayer(0).offset()))
+    ok = len(offsets) == 3 and all(abs(offset) < 1e-12 for offset in offsets)
+    return _result("section styling has no map offset", ok,
+                   f"offsets={offsets}")
+
+
 def test_end_to_end_task_and_generation() -> bool:
     """build_work -> task.run() (synchronous) -> generate over memory layers."""
     from ..workbench.depth_service import DepthSourceConfig
@@ -379,6 +417,8 @@ def run_all() -> list:
         test_direction_maps_slope_limits(),
         test_contour_slope_uses_route_crossings(),
         test_route_frame_builder(),
+        test_plan_route_follows_stored_geometry(),
+        test_section_style_has_no_cartographic_offset(),
         test_end_to_end_task_and_generation(),
         test_profile_sampling_task(),
         test_burial_depth_config_is_manual_only(),

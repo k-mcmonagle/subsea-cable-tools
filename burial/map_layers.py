@@ -5,8 +5,8 @@ Geometry is sliced from the plan's RPL via ``RouteFrame`` (the
 ``assessment_output.py`` approach) and written to the plan's GeoPackage as
 EPSG:4326 layers. Layers are managed exclusively by the tool: added
 read-only, refreshed in place (never remove/re-add), styled with a
-rule-based renderer — burial solid, skip dashed, insufficient-information
-grey — with a small offset from the RPL for readability.
+rule-based renderer — burial solid, skip dashed and insufficient-information
+grey — directly on the source RPL geometry.
 
 Also home to the layer-resolution helpers: registered ``bp_input`` rows are
 re-resolved through ``workbench/project_layers.py`` normalised-path
@@ -199,10 +199,6 @@ def apply_sections_style(layer) -> None:
             "color": style["color"], "width": style["width"],
             "line_style": style["style"],
         })
-        try:
-            symbol.symbolLayer(0).setOffset(1.2)  # keep clear of the RPL line
-        except Exception:
-            pass
         child = QgsRuleBasedRenderer.Rule(symbol)
         child.setLabel(style["label"])
         child.setFilterExpression(f"\"kind\" = '{kind}'")

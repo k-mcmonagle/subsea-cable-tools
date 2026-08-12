@@ -35,6 +35,7 @@ ACTION_DELETE_EVENT = "delete_event"
 ACTION_CONFIRM_EVENT = "confirm_event"
 ACTION_LOCK_EVENT = "lock_event"
 ACTION_SPLIT_SECTION = "split_section"
+ACTION_INSERT_SECTION = "insert_section"
 ACTION_MERGE_SECTIONS = "merge_sections"
 ACTION_SET_CONCLUSION = "set_conclusion"
 ACTION_EDIT_SECTION = "edit_section"
@@ -135,3 +136,25 @@ def rollback_operations(entries: List[Dict], target_change_id: str
     for entry in undone:
         ops.extend(invert_entry(entry))
     return ops, undone
+
+
+def latest_effective_entry(entries: List[Dict]) -> Optional[Dict]:
+    """Newest change that has not already been covered by a rollback.
+
+    Rollback rows record the IDs they reversed. Keeping this small piece of
+    history interpretation here lets the Plan Builder offer a conventional
+    one-step Undo without deleting or rewriting the audit trail.
+    """
+    undone = set()
+    for entry in entries:
+        if entry.get("action") != ACTION_ROLLBACK:
+            continue
+        payload = _load(entry.get("after_json") or "")
+        undone.update(str(change_id) for change_id in
+                      (payload.get("undone_change_ids") or []) if change_id)
+    for entry in reversed(sorted(entries, key=lambda row: int(row.get("seq") or 0))):
+        if entry.get("action") == ACTION_ROLLBACK:
+            continue
+        if str(entry.get("change_id") or "") not in undone:
+            return entry
+    return None

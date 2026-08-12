@@ -32,6 +32,11 @@ START = schema.EVENT_BURIAL_START
 END = schema.EVENT_BURIAL_END
 
 
+def _section(sid, kind, start, end):
+    return {"section_id": sid, "kind": kind, "start_kp": start,
+            "end_kp": end}
+
+
 def test_labels() -> bool:
     ok = ev.event_label(START, schema.METHOD_PLOUGH) == "PLDN"
     ok = ok and ev.event_label(END, schema.METHOD_PLOUGH) == "PLUP"
@@ -129,6 +134,75 @@ def test_merge_dedupes_at_boundary() -> bool:
     return _result("kept event at a generated boundary supersedes the candidate", ok)
 
 
+def test_merge_burial_sections_and_skips() -> bool:
+    events = [
+        _event("start-a", 0.0, START), _event("end-a", 2.0, END),
+        _event("start-b", 4.0, START), _event("end-b", 6.0, END),
+        _event("start-c", 8.0, START), _event("end-c", 10.0, END),
+    ]
+    sections = [
+        _section("b1", schema.SECTION_BURIAL, 0.0, 2.0),
+        _section("s1", schema.SECTION_SKIP, 2.0, 4.0),
+        _section("b2", schema.SECTION_BURIAL, 4.0, 6.0),
+        _section("s2", schema.SECTION_SKIP, 6.0, 8.0),
+        _section("b3", schema.SECTION_BURIAL, 8.0, 10.0),
+    ]
+    merged_burial, removed_burial, kind = ev.merge_section_events(
+        events, sections, ["b1", "b2"])
+    ok = kind == schema.SECTION_BURIAL
+    ok = ok and set(removed_burial) == {"end-a", "start-b"}
+    ok = ok and ev.validate_events(merged_burial, 0.0, 10.0, 1).ok
+
+    merged_skips, removed_skips, kind = ev.merge_section_events(
+        events, sections, ["s1", "s2"])
+    ok = ok and kind == schema.SECTION_SKIP
+    ok = ok and set(removed_skips) == {"start-b", "end-b"}
+    ok = ok and ev.validate_events(merged_skips, 0.0, 10.0, 1).ok
+    return _result("merge selected burial sections or selected skips", ok)
+
+
+def test_merge_selection_guards() -> bool:
+    events = [_event("a", 0.0, START), _event("b", 2.0, END),
+              _event("c", 4.0, START), _event("d", 6.0, END),
+              _event("e", 8.0, START), _event("f", 10.0, END)]
+    sections = [
+        _section("b1", schema.SECTION_BURIAL, 0.0, 2.0),
+        _section("s1", schema.SECTION_SKIP, 2.0, 4.0),
+        _section("b2", schema.SECTION_BURIAL, 4.0, 6.0),
+        _section("s2", schema.SECTION_SKIP, 6.0, 8.0),
+        _section("b3", schema.SECTION_BURIAL, 8.0, 10.0),
+    ]
+    guarded = 0
+    for chosen in (["b1", "s1"], ["b1", "b3"]):
+        try:
+            ev.merge_section_events(events, sections, list(chosen))
+        except ValueError:
+            guarded += 1
+    locked = [dict(event) for event in events]
+    locked[1]["locked"] = 1
+    try:
+        ev.merge_section_events(locked, sections, ["b1", "b2"])
+    except ValueError:
+        guarded += 1
+    return _result("merge protects mixed, skipped and locked boundaries", guarded == 3)
+
+
+def test_opposite_section_boundaries_follow_travel_direction() -> bool:
+    forward_skip = ev.opposite_section_boundary_specs(
+        schema.SECTION_BURIAL, 2.0, 3.0, 1)
+    reverse_skip = ev.opposite_section_boundary_specs(
+        schema.SECTION_BURIAL, 2.0, 3.0, -1)
+    forward_burial = ev.opposite_section_boundary_specs(
+        schema.SECTION_SKIP, 2.0, 3.0, 1)
+    reverse_burial = ev.opposite_section_boundary_specs(
+        schema.SECTION_SKIP, 2.0, 3.0, -1)
+    ok = forward_skip == [(END, 2.0), (START, 3.0)]
+    ok = ok and reverse_skip == [(END, 3.0), (START, 2.0)]
+    ok = ok and forward_burial == [(START, 2.0), (END, 3.0)]
+    ok = ok and reverse_burial == [(START, 3.0), (END, 2.0)]
+    return _result("inserted skip/burial boundaries follow travel direction", ok)
+
+
 def run_all() -> list:
     return [
         test_labels(),
@@ -139,6 +213,9 @@ def run_all() -> list:
         test_merge_keeps_user_events(),
         test_merge_conflict_flagging(),
         test_merge_dedupes_at_boundary(),
+        test_merge_burial_sections_and_skips(),
+        test_merge_selection_guards(),
+        test_opposite_section_boundaries_follow_travel_direction(),
     ]
 
 

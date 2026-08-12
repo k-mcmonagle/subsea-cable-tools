@@ -17,8 +17,9 @@ from typing import Dict, List, Optional
 
 from qgis.core import QgsApplication, QgsCoordinateTransform, QgsProject
 from qgis.gui import QgsVertexMarker, QgsRubberBand
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import QSettings, Qt
 from qgis.PyQt.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDockWidget,
     QFileDialog,
@@ -134,6 +135,19 @@ class BurialPlannerDock(QDockWidget):
         profile_status_row = QHBoxLayout()
         self.profile_status = QLabel("Bathymetry profile")
         profile_status_row.addWidget(self.profile_status, 1)
+        self.profile_drag_toggle = QCheckBox("Allow PLDN/PLUP dragging")
+        self.profile_drag_toggle.setChecked(bool(QSettings().value(
+            "SubseaCableTools/BurialPlanner/profile_drag_enabled", False,
+            type=bool)))
+        self.profile_drag_toggle.setToolTip(
+            "When enabled, unlocked PLDN/PLUP lines can be dragged on the "
+            "profile. Changes are saved on release and can be undone with "
+            "Ctrl+Z in Plan Builder.")
+        self.profile_drag_toggle.setStyleSheet(
+            "color: #b36b00; font-weight: 600;"
+            if self.profile_drag_toggle.isChecked() else "")
+        self.profile_drag_toggle.toggled.connect(self._profile_drag_toggled)
+        profile_status_row.addWidget(self.profile_drag_toggle)
         self.profile_progress = QProgressBar()
         self.profile_progress.setRange(0, 100)
         self.profile_progress.setMaximumWidth(240)
@@ -567,7 +581,16 @@ class BurialPlannerDock(QDockWidget):
         self.profile.set_overlays(self.model.context)
 
     def _refresh_profile_events(self) -> None:
-        self.profile.set_events(self.model.events, self.model.method, editable=True)
+        self.profile.set_events(
+            self.model.events, self.model.method,
+            editable=self.profile_drag_toggle.isChecked())
+
+    def _profile_drag_toggled(self, enabled: bool) -> None:
+        QSettings().setValue(
+            "SubseaCableTools/BurialPlanner/profile_drag_enabled", bool(enabled))
+        self.profile_drag_toggle.setStyleSheet(
+            "color: #b36b00; font-weight: 600;" if enabled else "")
+        self._refresh_profile_events()
 
     def _on_profile_event_moved(self, event_id: str, new_kp: float) -> None:
         try:
@@ -618,16 +641,12 @@ class BurialPlannerDock(QDockWidget):
         marker.setCenter(point)
         marker.show()
 
-    def highlight_range(self, start_kp: float, end_kp: float) -> None:
+    def highlight_range(self, start_kp: float, end_kp: float):
         if self.canvas is None or self.model.route is None:
             return
         geom = self.model.route.extract_segment(start_kp, end_kp)
         if geom is None or geom.isEmpty():
             return
-        if self._band is None or _sip_isdeleted(self._band):
-            self._band = QgsRubberBand(self.canvas, GEOMETRY_LINE)
-            self._band.setColor(Qt.GlobalColor.yellow)
-            self._band.setWidth(3)
         try:
             from qgis.core import QgsCoordinateReferenceSystem
 
@@ -638,16 +657,48 @@ class BurialPlannerDock(QDockWidget):
             geom.transform(transform)
         except Exception:
             pass
+        if self._band is None or _sip_isdeleted(self._band):
+            self._band = QgsRubberBand(self.canvas, GEOMETRY_LINE)
+            self._band.setColor(Qt.GlobalColor.yellow)
+            self._band.setWidth(3)
         self._band.setToGeometry(geom, None)
         self._band.show()
+        return geom
 
     def goto_kp(self, kp: float) -> None:
         point = self._canvas_point(kp)
         if point is None or self.canvas is None:
             return
         self.highlight_kp(kp)
+        self.profile.focus_kp(kp)
         self.canvas.setCenter(point)
         self.canvas.refresh()
+
+    def goto_range(self, start_kp: float, end_kp: float) -> None:
+        """Zoom both map and profile to a selected plan section."""
+        geom = self.highlight_range(start_kp, end_kp)
+        self.profile.focus_range(start_kp, end_kp)
+        if geom is None or self.canvas is None:
+            return
+        extent = geom.boundingBox()
+        padding = max(extent.width(), extent.height()) * 0.12
+        if padding <= 0:
+            padding = max(float(self.canvas.mapUnitsPerPixel()) * 40.0, 1e-9)
+        extent.grow(padding)
+        self.canvas.setExtent(extent)
+        self.canvas.refresh()
+
+    def show_plan_scope(self) -> None:
+        if not self.model.plan:
+            return
+        scope = self.model.gen_params().scope
+        self.profile.reset_scope_view()
+        geom = self.highlight_range(scope.start_km, scope.end_km)
+        if geom is not None and self.canvas is not None:
+            extent = geom.boundingBox()
+            extent.grow(max(extent.width(), extent.height()) * 0.05)
+            self.canvas.setExtent(extent)
+            self.canvas.refresh()
 
     # -- window management ----------------------------------------------------
     def _top_level_changed(self, floating: bool) -> None:

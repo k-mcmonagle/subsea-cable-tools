@@ -226,6 +226,30 @@ def test_conclusion_carry_over() -> bool:
     return _result("unchanged sections keep their conclusions across regeneration", ok)
 
 
+def test_manual_burial_across_exclusion_is_flagged() -> bool:
+    params = _params()
+    events = [
+        {"event_id": "start", "event_type": schema.EVENT_BURIAL_START,
+         "kp": 0.0},
+        {"event_id": "end", "event_type": schema.EVENT_BURIAL_END,
+         "kp": 20.0},
+    ]
+    verdict = eng.RangeVerdict(
+        8.0, 12.0, eng.STATUS_EXCLUDED, 0, ["r1"], None)
+    sections = gen.build_sections(
+        events, params, [verdict], [], [], [], [], {"r1": "steep slope"},
+        id_fn=_counter_id_fn())
+    burial = next(section for section in sections
+                  if section["kind"] == schema.SECTION_BURIAL)
+    reason = json.loads(burial["reason_json"])
+    conflicts = reason.get("exclusion_conflicts") or []
+    ok = len(conflicts) == 1
+    ok = ok and conflicts[0]["rules"] == ["steep slope"]
+    ok = ok and conflicts[0]["start_kp"] == 8.0
+    ok = ok and conflicts[0]["end_kp"] == 12.0
+    return _result("manual burial across an exclusion remains visibly flagged", ok)
+
+
 def run_all() -> list:
     return [
         test_basic_sections_and_events(),
@@ -239,6 +263,7 @@ def run_all() -> list:
         test_determinism(),
         test_proposal_diff(),
         test_conclusion_carry_over(),
+        test_manual_burial_across_exclusion_is_flagged(),
     ]
 
 

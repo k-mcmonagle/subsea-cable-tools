@@ -183,3 +183,91 @@ def check_move(events: List[Dict], event_id: str, new_kp: float,
     if result.errors:
         return result.errors[0]
     return None
+
+
+def merge_section_events(events: List[Dict], sections: List[Dict],
+                         section_ids: List[str]
+                         ) -> Tuple[List[Dict], List[str], str]:
+    """Remove boundary events so selected burial sections *or* skips merge.
+
+    The selected sections must all have the same mergeable kind and must
+    include every section of that kind between the first and last selection.
+    Insufficient-information ranges are never swallowed by a manual merge.
+    Returns ``(remaining_events, removed_event_ids, section_kind)``.
+    """
+    wanted = {str(section_id) for section_id in section_ids if section_id}
+    selected = [section for section in sections
+                if str(section.get("section_id") or "") in wanted]
+    if len(selected) != len(wanted) or len(selected) < 2:
+        raise ValueError("Select at least two sections to merge.")
+    kinds = {section.get("kind") or "" for section in selected}
+    if len(kinds) != 1:
+        raise ValueError("Selected sections must all be the same kind.")
+    kind = next(iter(kinds))
+    if kind not in (schema.SECTION_BURIAL, schema.SECTION_SKIP):
+        raise ValueError("Insufficient Information sections cannot be merged.")
+
+    selected.sort(key=lambda section: float(section.get("start_kp") or 0.0))
+    span_start = float(selected[0].get("start_kp") or 0.0)
+    span_end = float(selected[-1].get("end_kp") or 0.0)
+    within_span = [
+        section for section in sections
+        if float(section.get("end_kp") or 0.0) > span_start + _KP_TOL
+        and float(section.get("start_kp") or 0.0) < span_end - _KP_TOL
+    ]
+    if any(section.get("kind") == schema.SECTION_INSUFFICIENT
+           for section in within_span):
+        raise ValueError(
+            "Cannot merge across an Insufficient Information section.")
+    same_kind_ids = {
+        str(section.get("section_id") or "") for section in within_span
+        if section.get("kind") == kind
+    }
+    if same_kind_ids != wanted:
+        raise ValueError(
+            "Select every section of this kind between the first and last selection.")
+
+    merge_gaps = [
+        (float(left.get("end_kp") or 0.0),
+         float(right.get("start_kp") or 0.0))
+        for left, right in zip(selected, selected[1:])
+    ]
+    removed: List[str] = []
+    remaining: List[Dict] = []
+    for event in events:
+        kp = float(event.get("kp") or 0.0)
+        in_gap = any(min(start, end) - _KP_TOL <= kp
+                     <= max(start, end) + _KP_TOL
+                     for start, end in merge_gaps)
+        if not in_gap:
+            remaining.append(dict(event))
+            continue
+        if int(event.get("locked") or 0):
+            raise ValueError(
+                "A locked event lies between the sections — unlock it first.")
+        removed.append(str(event.get("event_id") or ""))
+    if not removed:
+        raise ValueError("No PLDN/PLUP boundaries were found between the sections.")
+    return remaining, removed, kind
+
+
+def opposite_section_boundary_specs(section_kind: str, start_kp: float,
+                                    end_kp: float, direction: int
+                                    ) -> List[Tuple[str, float]]:
+    """Boundary event types/KPs for an opposite-kind range inside a section.
+
+    In a burial section this inserts a skip (PLUP then PLDN in travel order);
+    in a skip it inserts a burial section (PLDN then PLUP). Direction -1
+    reverses the KP order while retaining those travel-order semantics.
+    """
+    if section_kind not in (schema.SECTION_BURIAL, schema.SECTION_SKIP):
+        raise ValueError(
+            "Only burial sections and skips can be split with an inserted range.")
+    lo, hi = sorted((float(start_kp), float(end_kp)))
+    if hi - lo <= _KP_TOL:
+        raise ValueError("The inserted section must have a positive length.")
+    travel_kps = (lo, hi) if int(direction or 1) >= 0 else (hi, lo)
+    types = ((schema.EVENT_BURIAL_END, schema.EVENT_BURIAL_START)
+             if section_kind == schema.SECTION_BURIAL
+             else (schema.EVENT_BURIAL_START, schema.EVENT_BURIAL_END))
+    return list(zip(types, travel_kps))

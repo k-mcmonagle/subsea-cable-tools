@@ -12,14 +12,18 @@ import json
 from typing import Dict, List, Optional
 
 from qgis.PyQt.QtCore import Qt
-from qgis.PyQt.QtGui import QBrush, QColor
+from qgis.PyQt.QtGui import QBrush, QColor, QKeySequence
 from qgis.PyQt.QtWidgets import (
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
+    QFormLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -31,12 +35,17 @@ from qgis.PyQt.QtWidgets import (
 )
 
 from ...qgis_compat import (
+    BUTTON_BOX_CANCEL,
+    BUTTON_BOX_OK,
+    CONTEXT_MENU_POLICY_CUSTOM,
+    DIALOG_ACCEPTED,
     HEADER_RESIZE_MODE_STRETCH,
     ITEM_DATA_USER_ROLE,
     MESSAGE_BOX_NO,
     MESSAGE_BOX_YES,
     SELECTION_BEHAVIOR_SELECT_ROWS,
     SELECTION_MODE_EXTENDED,
+    qt_exec,
 )
 from .. import events as ev
 from .. import schema
@@ -53,6 +62,46 @@ _STATUS_COLORS = {
 }
 
 _VERTICAL = getattr(Qt, "Orientation", Qt).Vertical
+
+
+class SectionRangeDialog(QDialog):
+    """Explicit range for inserting an opposite-kind section."""
+
+    def __init__(self, section: Dict, kind_label: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Split section / insert range")
+        start = float(section.get("start_kp") or 0.0)
+        end = float(section.get("end_kp") or 0.0)
+        length = max(end - start, 0.0)
+        width = min(0.100, length / 3.0)
+        centre = (start + end) / 2.0
+
+        layout = QVBoxLayout(self)
+        note = QLabel(
+            f"Insert {kind_label} inside the selected section. Two editable "
+            "PLDN/PLUP boundaries will be created at the entered KPs.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        form = QFormLayout()
+        self.start_spin = QDoubleSpinBox()
+        self.end_spin = QDoubleSpinBox()
+        for spin in (self.start_spin, self.end_spin):
+            spin.setDecimals(3)
+            spin.setRange(start, end)
+            spin.setSuffix(" km")
+        self.start_spin.setValue(centre - width / 2.0)
+        self.end_spin.setValue(centre + width / 2.0)
+        form.addRow("Start KP:", self.start_spin)
+        form.addRow("End KP:", self.end_spin)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox()
+        buttons.setStandardButtons(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def range_kp(self):
+        return self.start_spin.value(), self.end_spin.value()
 
 
 class BuilderTab(QWidget):
@@ -75,6 +124,13 @@ class BuilderTab(QWidget):
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self.dock.cancel_analysis)
         run_row.addWidget(self.cancel_button)
+        self.undo_button = QPushButton("Undo last edit")
+        self.undo_button.setShortcut(QKeySequence("Ctrl+Z"))
+        self.undo_button.setToolTip(
+            "Undo the latest Plan Builder edit (Ctrl+Z). The undo is recorded "
+            "in the change log and does not resample bathymetry.")
+        self.undo_button.clicked.connect(self._undo_last_edit)
+        run_row.addWidget(self.undo_button)
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setVisible(False)
@@ -102,6 +158,11 @@ class BuilderTab(QWidget):
             len(_EVENT_COLUMNS) - 1, HEADER_RESIZE_MODE_STRETCH)
         self.events_table.itemChanged.connect(self._on_event_item_changed)
         self.events_table.itemSelectionChanged.connect(self._on_event_selected)
+        self.events_table.setContextMenuPolicy(CONTEXT_MENU_POLICY_CUSTOM)
+        self.events_table.customContextMenuRequested.connect(
+            self._event_context_menu)
+        self.events_table.cellDoubleClicked.connect(
+            lambda row, _column: self._goto_event_row(row))
         events_layout.addWidget(self.events_table, 1)
 
         event_buttons = QHBoxLayout()
@@ -156,11 +217,23 @@ class BuilderTab(QWidget):
             7, HEADER_RESIZE_MODE_STRETCH)
         self.sections_table.itemSelectionChanged.connect(self._on_section_selected)
         self.sections_table.itemChanged.connect(self._on_section_item_changed)
+        self.sections_table.setContextMenuPolicy(CONTEXT_MENU_POLICY_CUSTOM)
+        self.sections_table.customContextMenuRequested.connect(
+            self._section_context_menu)
+        self.sections_table.cellDoubleClicked.connect(
+            lambda row, _column: self._goto_section_row(row))
         sections_layout.addWidget(self.sections_table, 1)
 
+        section_hint = QLabel(
+            "Select 2+ Candidate Plough Sections or 2+ Plough Skips to merge. "
+            "Use Split / insert to create an explicit opposite section with "
+            "two adjustable PLDN/PLUP boundaries.")
+        section_hint.setWordWrap(True)
+        section_hint.setStyleSheet("color: #666;")
+        sections_layout.addWidget(section_hint)
         section_buttons = QHBoxLayout()
-        for label, slot in (("Split at KP…", self._split_section),
-                            ("Merge selected", self._merge_sections),
+        for label, slot in (("Split / insert opposite…", self._split_section),
+                            ("Merge selected sections", self._merge_sections),
                             ("Set conclusion…", self._set_conclusion),
                             ("Set confidence…", self._set_confidence),
                             ("Mark final", lambda: self._set_state(schema.SECTION_STATE_FINAL)),
@@ -176,6 +249,7 @@ class BuilderTab(QWidget):
         model.planChanged.connect(self.refresh)
         model.eventsChanged.connect(self.refresh)
         model.sectionsChanged.connect(self._refresh_sections)
+        model.logChanged.connect(self._refresh_undo_state)
         self.refresh()
 
     # -- progress hooks (driven by the dock) ----------------------------------
@@ -256,6 +330,17 @@ class BuilderTab(QWidget):
         finally:
             self._loading = False
         self._refresh_sections()
+        self._refresh_undo_state()
+
+    def _refresh_undo_state(self) -> None:
+        entry = self.model.last_undoable_builder_change()
+        self.undo_button.setEnabled(entry is not None)
+        if entry is not None:
+            action = (entry.get("action") or "edit").replace("_", " ")
+            self.undo_button.setToolTip(
+                f"Undo last edit: {action} (Ctrl+Z). The undo remains in the audit log.")
+        else:
+            self.undo_button.setToolTip("There is no current Plan Builder edit to undo.")
 
     def _refresh_sections(self) -> None:
         self._loading = True
@@ -315,6 +400,12 @@ class BuilderTab(QWidget):
             parts.append("manual")
         if reason.get("dangling_start"):
             parts.append("no end event before scope end")
+        for conflict in reason.get("exclusion_conflicts") or []:
+            rules = ", ".join(conflict.get("rules") or []) or "configured rule"
+            parts.append(
+                f"Manual burial overlaps Exclusion Area ({rules}) at KP "
+                f"{schema.format_kp(conflict.get('start_kp'))}-"
+                f"{schema.format_kp(conflict.get('end_kp'))}")
         for entry in reason.get("screening") or []:
             parts.append(f"Screening: {entry.get('rule')} "
                          f"KP {schema.format_kp(entry.get('start_kp'))}-"
@@ -356,6 +447,88 @@ class BuilderTab(QWidget):
             if section is not None:
                 self.dock.highlight_range(float(section.get("start_kp") or 0.0),
                                           float(section.get("end_kp") or 0.0))
+
+    def _context_row(self, table: QTableWidget, position) -> int:
+        item = table.itemAt(position)
+        if item is None:
+            return -1
+        row = item.row()
+        selected_rows = {index.row() for index in
+                         table.selectionModel().selectedRows()}
+        if row not in selected_rows:
+            table.clearSelection()
+            table.selectRow(row)
+        return row
+
+    def _event_for_row(self, row: int) -> Optional[Dict]:
+        item = self.events_table.item(row, 0)
+        event_id = item.data(ITEM_DATA_USER_ROLE) if item else ""
+        return next((event for event in self.model.events
+                     if event.get("event_id") == event_id), None)
+
+    def _section_for_row(self, row: int) -> Optional[Dict]:
+        item = self.sections_table.item(row, 0)
+        section_id = item.data(ITEM_DATA_USER_ROLE) if item else ""
+        return next((section for section in self.model.sections
+                     if section.get("section_id") == section_id), None)
+
+    def _goto_event_row(self, row: int) -> None:
+        event = self._event_for_row(row)
+        if event is not None:
+            self.dock.goto_kp(float(event.get("kp") or 0.0))
+
+    def _goto_section_row(self, row: int) -> None:
+        section = self._section_for_row(row)
+        if section is not None:
+            self.dock.goto_range(float(section.get("start_kp") or 0.0),
+                                 float(section.get("end_kp") or 0.0))
+
+    def _event_context_menu(self, position) -> None:
+        row = self._context_row(self.events_table, position)
+        event = self._event_for_row(row) if row >= 0 else None
+        if event is None:
+            return
+        menu = QMenu(self)
+        go_action = menu.addAction(
+            f"Go to {ev.event_label(event.get('event_type') or '', self.model.method)} "
+            f"at KP {schema.format_kp(event.get('kp'))}")
+        scope_action = menu.addAction("Show full plan scope")
+        chosen = qt_exec(menu, self.events_table.viewport().mapToGlobal(position))
+        if chosen == go_action:
+            self._goto_event_row(row)
+        elif chosen == scope_action:
+            self.dock.show_plan_scope()
+
+    def _section_context_menu(self, position) -> None:
+        row = self._context_row(self.sections_table, position)
+        section = self._section_for_row(row) if row >= 0 else None
+        if section is None:
+            return
+        menu = QMenu(self)
+        go_action = menu.addAction("Go to section on map and profile")
+        start_action = menu.addAction(
+            f"Go to start KP {schema.format_kp(section.get('start_kp'))}")
+        end_action = menu.addAction(
+            f"Go to end KP {schema.format_kp(section.get('end_kp'))}")
+        scope_action = menu.addAction("Show full plan scope")
+        menu.addSeparator()
+        split_action = menu.addAction("Split / insert opposite section…")
+        split_action.setEnabled(len(self._selected_section_ids()) == 1)
+        merge_action = menu.addAction("Merge selected sections…")
+        merge_action.setEnabled(len(self._selected_section_ids()) >= 2)
+        chosen = qt_exec(menu, self.sections_table.viewport().mapToGlobal(position))
+        if chosen == go_action:
+            self._goto_section_row(row)
+        elif chosen == start_action:
+            self.dock.goto_kp(float(section.get("start_kp") or 0.0))
+        elif chosen == end_action:
+            self.dock.goto_kp(float(section.get("end_kp") or 0.0))
+        elif chosen == scope_action:
+            self.dock.show_plan_scope()
+        elif chosen == split_action:
+            self._split_section()
+        elif chosen == merge_action:
+            self._merge_sections()
 
     # -- event edits -----------------------------------------------------------
     def _on_event_item_changed(self, item) -> None:
@@ -459,8 +632,18 @@ class BuilderTab(QWidget):
             MESSAGE_BOX_YES | MESSAGE_BOX_NO, MESSAGE_BOX_NO)
         if answer != MESSAGE_BOX_YES:
             return
-        for event_id in ids:
-            self.model.delete_event(event_id)
+        try:
+            self.model.delete_events(ids)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Burial Planner", str(exc))
+
+    def _undo_last_edit(self) -> None:
+        entry = self.model.undo_last_builder_edit()
+        if entry is None:
+            self.run_status.setText("There is no Plan Builder edit to undo.")
+            return
+        action = (entry.get("action") or "edit").replace("_", " ")
+        self.run_status.setText(f"Undid: {action}.")
 
     # -- section edits ---------------------------------------------------------
     def _on_section_item_changed(self, item) -> None:
@@ -477,28 +660,62 @@ class BuilderTab(QWidget):
     def _split_section(self) -> None:
         ids = self._selected_section_ids()
         if len(ids) != 1:
-            QMessageBox.information(self, "Burial Planner",
-                                    "Select one burial section to split.")
+            QMessageBox.information(
+                self, "Burial Planner",
+                "Select one Candidate Plough Section or one Plough Skip.")
             return
         section = next((s for s in self.model.sections
                         if s.get("section_id") == ids[0]), None)
         if section is None:
             return
-        kp, ok = QInputDialog.getDouble(
-            self, "Split section", "Split at KP:",
-            (float(section.get("start_kp") or 0.0) + float(section.get("end_kp") or 0.0)) / 2.0,
-            float(section.get("start_kp") or 0.0), float(section.get("end_kp") or 0.0), 3)
-        if not ok:
+        if section.get("kind") == schema.SECTION_INSUFFICIENT:
+            QMessageBox.warning(
+                self, "Burial Planner",
+                "Insufficient Information sections cannot be manually split.")
+            return
+        inserted_label = ("a Plough Skip" if section.get("kind") == schema.SECTION_BURIAL
+                          else "a Candidate Plough Section")
+        dialog = SectionRangeDialog(section, inserted_label, self)
+        if qt_exec(dialog) != DIALOG_ACCEPTED:
+            return
+        start_kp, end_kp = dialog.range_kp()
+        reason = self._maybe_reason("Split section / insert range")
+        if reason is None:
             return
         try:
-            self.model.split_section_at(ids[0], kp)
+            self.model.insert_opposite_section(
+                ids[0], start_kp, end_kp, reason)
         except ValueError as exc:
             QMessageBox.warning(self, "Burial Planner", str(exc))
 
     def _merge_sections(self) -> None:
         ids = self._selected_section_ids()
+        selected = [section for section in self.model.sections
+                    if section.get("section_id") in set(ids)]
+        if len(selected) < 2:
+            QMessageBox.information(
+                self, "Burial Planner",
+                "Select at least two Candidate Plough Sections or two Plough Skips.")
+            return
+        kinds = {section.get("kind") for section in selected}
+        if len(kinds) != 1:
+            QMessageBox.warning(
+                self, "Burial Planner", "Selected sections must be the same kind.")
+            return
+        kind_label = self._kind_label(next(iter(kinds)) or "")
+        answer = QMessageBox.question(
+            self, "Merge sections",
+            f"Merge {len(selected)} selected {kind_label} rows? The intervening "
+            "PLDN/PLUP boundaries will be removed; the outer boundaries remain "
+            "available for dragging or KP editing.",
+            MESSAGE_BOX_YES | MESSAGE_BOX_NO, MESSAGE_BOX_NO)
+        if answer != MESSAGE_BOX_YES:
+            return
+        reason = self._maybe_reason("Merge sections")
+        if reason is None:
+            return
         try:
-            self.model.merge_sections(ids)
+            self.model.merge_sections(ids, reason)
         except ValueError as exc:
             QMessageBox.warning(self, "Burial Planner", str(exc))
 

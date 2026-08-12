@@ -465,6 +465,23 @@ def build_sections(merged_events: List[Dict], params: GenParams,
         reason: Dict = {}
         if end_event is None:
             reason["dangling_start"] = True
+        exclusion_conflicts = []
+        for verdict in excluded_verdicts:
+            overlap = eng.intersect_intervals(
+                [Interval(verdict.start_km, verdict.end_km)], [iv])
+            if eng.interval_length_km(overlap) <= 1e-9:
+                continue
+            names = [rule_names.get(rule_id, rule_id)
+                     for rule_id in verdict.fired_rule_ids]
+            exclusion_conflicts.append({
+                "rules": [name for name in names if name],
+                "start_kp": round(overlap[0].start_km, 6),
+                "end_kp": round(overlap[-1].end_km, 6),
+            })
+        if exclusion_conflicts:
+            # This normally appears only after a deliberate manual event edit
+            # merges burial candidates across an excluded range.
+            reason["exclusion_conflicts"] = exclusion_conflicts
         annotations = []
         for verdict in screening_verdicts:
             overlap = eng.intersect_intervals(

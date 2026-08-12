@@ -14,8 +14,10 @@ import time
 
 from qgis.core import QgsProject
 
-from ..burial import change_log, schema
+from ..burial import change_log, generation, schema
+from ..burial.plan_model import PlanModel
 from ..burial.store import BurialStore
+from ..workbench.rules_engine import Interval
 
 _COUNTER = [0]
 
@@ -213,7 +215,61 @@ def test_change_log_and_rollback() -> bool:
     log = store.list_change_log(plan_id)
     ok = ok and log[-1]["action"] == change_log.ACTION_ROLLBACK  # appended, not erased
     ok = ok and len(log) == 3
+    # The rolled-back move is no longer the latest effective action; a
+    # conventional second Undo can therefore find the preceding add.
+    latest = change_log.latest_effective_entry(log)
+    ok = ok and latest is not None and latest["action"] == change_log.ACTION_ADD_EVENT
     return _result("change log append + rollback restores prior state", ok)
+
+
+def test_plan_builder_merge_insert_and_undo() -> bool:
+    store = _store()
+    plan_id = store.save_plan(_plan_row())
+    params = generation.GenParams(0.0, 10.0, direction=1, method="plough")
+    rule = {
+        "rule_id": "r", "name": "excluded", "enabled": 1,
+        "kind": "manual", "action": "exclude", "risk_level": 0,
+        "criterion_class": "project", "methods_json": "[]",
+        "config_json": "{}",
+    }
+    out = generation.generate(
+        params,
+        [generation.RuleAcquisition(rule, [Interval(2.0, 4.0),
+                                           Interval(6.0, 8.0)])],
+        plan_id=plan_id)
+    store.save_events(plan_id, out.events)
+    store.save_sections(plan_id, out.sections)
+
+    model = PlanModel(store)
+    ok = model.load_plan(plan_id)
+    skip_ids = [section["section_id"] for section in model.sections
+                if section["kind"] == schema.SECTION_SKIP]
+    ok = ok and model.merge_sections(skip_ids, "join nearby skips")
+    merged_skips = [section for section in model.sections
+                    if section["kind"] == schema.SECTION_SKIP]
+    ok = ok and len(merged_skips) == 1
+    ok = ok and abs(merged_skips[0]["start_kp"] - 2.0) < 1e-9
+    ok = ok and abs(merged_skips[0]["end_kp"] - 8.0) < 1e-9
+
+    undone = model.undo_last_builder_edit()
+    ok = ok and undone is not None and undone["action"] == change_log.ACTION_MERGE_SECTIONS
+    restored_skips = [section for section in model.sections
+                      if section["kind"] == schema.SECTION_SKIP]
+    ok = ok and len(restored_skips) == 2
+
+    first_skip = restored_skips[0]
+    ok = ok and model.insert_opposite_section(
+        first_skip["section_id"], 2.5, 3.0, "manual plough candidate")
+    inserted = [section for section in model.sections
+                if section["kind"] == schema.SECTION_BURIAL
+                and abs(section["start_kp"] - 2.5) < 1e-9
+                and abs(section["end_kp"] - 3.0) < 1e-9]
+    ok = ok and len(inserted) == 1
+    undone = model.undo_last_builder_edit()
+    ok = ok and undone is not None and undone["action"] == change_log.ACTION_INSERT_SECTION
+    ok = ok and len([section for section in model.sections
+                     if section["kind"] == schema.SECTION_SKIP]) == 2
+    return _result("Plan Builder merge/insert persist and undo atomically", ok)
 
 
 def run_all() -> list:
@@ -223,6 +279,7 @@ def run_all() -> list:
         test_plan_round_trip(),
         test_duplicate_deep_copy(),
         test_change_log_and_rollback(),
+        test_plan_builder_merge_insert_and_undo(),
     ]
 
 

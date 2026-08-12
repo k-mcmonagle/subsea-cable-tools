@@ -234,12 +234,27 @@ class BurialProfileWidget(QWidget):
             return None
         return math.degrees(math.atan2(d1 - d0, dx_m))
 
-    def _on_mouse_moved(self, pos) -> None:
-        kp = self._kp_at_scene_pos(pos)
-        if kp is None:
-            self._vline.setVisible(False)
-            self._readout.setVisible(False)
-            return
+    def focus_kp(self, kp: float) -> None:
+        """Show the profile crosshair/readout at a table-selected KP."""
+        lo, hi = self._scope
+        value = float(kp)
+        if hi > lo:
+            value = min(max(value, lo), hi)
+        self._show_kp_readout(value)
+
+    def focus_range(self, start_kp: float, end_kp: float) -> None:
+        """Zoom the shared KP axis to a selected section and show its centre."""
+        lo, hi = sorted((float(start_kp), float(end_kp)))
+        if hi > lo:
+            self.plot.setXRange(lo, hi, padding=0.08)
+            self.focus_kp((lo + hi) / 2.0)
+
+    def reset_scope_view(self) -> None:
+        lo, hi = self._scope
+        if hi > lo:
+            self.plot.setXRange(lo, hi, padding=0.02)
+
+    def _show_kp_readout(self, kp: float) -> None:
         sample = self._nearest_sample(kp)
         self._vline.setPos(kp)
         self._vline.setVisible(True)
@@ -255,6 +270,14 @@ class BurialProfileWidget(QWidget):
         else:
             self._readout.setText(lines[0])
             self._readout.setVisible(True)
+
+    def _on_mouse_moved(self, pos) -> None:
+        kp = self._kp_at_scene_pos(pos)
+        if kp is None:
+            self._vline.setVisible(False)
+            self._readout.setVisible(False)
+            return
+        self._show_kp_readout(kp)
         self.kpHovered.emit(kp)
 
     def _on_mouse_clicked(self, event) -> None:

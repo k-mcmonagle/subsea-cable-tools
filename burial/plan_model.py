@@ -32,6 +32,20 @@ from .analysis_task import build_route_frame
 from .store import BurialStore
 
 
+_BUILDER_UNDO_ACTIONS = {
+    change_log.ACTION_ADD_EVENT,
+    change_log.ACTION_MOVE_EVENT,
+    change_log.ACTION_DELETE_EVENT,
+    change_log.ACTION_CONFIRM_EVENT,
+    change_log.ACTION_LOCK_EVENT,
+    change_log.ACTION_SPLIT_SECTION,
+    change_log.ACTION_INSERT_SECTION,
+    change_log.ACTION_MERGE_SECTIONS,
+    change_log.ACTION_SET_CONCLUSION,
+    change_log.ACTION_EDIT_SECTION,
+}
+
+
 class PlanModel(QObject):
     planChanged = pyqtSignal()
     inputsChanged = pyqtSignal()
@@ -420,6 +434,12 @@ class PlanModel(QObject):
         return None
 
     def move_event(self, event_id: str, new_kp: float, reason: str = "") -> bool:
+        target = next((event for event in self.events
+                       if event.get("event_id") == event_id), None)
+        if target is None:
+            raise ValueError("Event not found.")
+        if int(target.get("locked") or 0):
+            raise ValueError("Unlock the event before moving it.")
         lo, hi = self._scope_bounds()
         message = ev.check_move(self.events, event_id, new_kp, lo, hi,
                                 self.direction, self.method)
@@ -436,9 +456,26 @@ class PlanModel(QObject):
                                                event_id, moved, reason)
 
     def delete_event(self, event_id: str, reason: str = "") -> bool:
-        remaining = [dict(e) for e in self.events if e.get("event_id") != event_id]
+        return self.delete_events([event_id], reason)
+
+    def delete_events(self, event_ids: List[str], reason: str = "") -> bool:
+        """Delete a valid event selection atomically as one undoable edit."""
+        wanted = {str(event_id) for event_id in event_ids if event_id}
+        locked = [event for event in self.events
+                  if str(event.get("event_id") or "") in wanted
+                  and int(event.get("locked") or 0)]
+        if locked:
+            raise ValueError("Locked events cannot be deleted — unlock them first.")
+        remaining = [dict(event) for event in self.events
+                     if str(event.get("event_id") or "") not in wanted]
+        lo, hi = self._scope_bounds()
+        result = ev.validate_events(
+            remaining, lo, hi, self.direction, self.method)
+        if result.errors:
+            raise ValueError(result.errors[0])
         return self._write_events_and_sections(change_log.ACTION_DELETE_EVENT,
-                                               event_id, remaining, reason)
+                                               ",".join(sorted(wanted)),
+                                               remaining, reason)
 
     def set_event_status(self, event_ids: List[str], status: str,
                          action: str = change_log.ACTION_CONFIRM_EVENT) -> bool:
@@ -510,21 +547,23 @@ class PlanModel(QObject):
         self.logChanged.emit()
         return True
 
-    def split_section_at(self, section_id: str, kp: float, reason: str = "") -> bool:
-        """Split a burial section by inserting an END+START pair at ``kp``."""
+    def insert_opposite_section(self, section_id: str, start_kp: float,
+                                end_kp: float, reason: str = "") -> bool:
+        """Insert a skip inside burial, or burial inside a skip."""
         section = next((s for s in self.sections
                         if s.get("section_id") == section_id), None)
-        if section is None or section.get("kind") != schema.SECTION_BURIAL:
-            raise ValueError("Select a burial section to split.")
-        start = float(section.get("start_kp") or 0.0)
-        end = float(section.get("end_kp") or 0.0)
-        if not (start < kp < end):
-            raise ValueError("The split KP must lie inside the section.")
-        first, second = ((schema.EVENT_BURIAL_END, schema.EVENT_BURIAL_START)
-                         if self.direction >= 0
-                         else (schema.EVENT_BURIAL_START, schema.EVENT_BURIAL_END))
+        if section is None:
+            raise ValueError("Section not found.")
+        section_start = float(section.get("start_kp") or 0.0)
+        section_end = float(section.get("end_kp") or 0.0)
+        lo, hi = sorted((float(start_kp), float(end_kp)))
+        if not (section_start < lo < hi < section_end):
+            raise ValueError(
+                "The inserted start and end KPs must lie inside the selected section.")
+        specs = ev.opposite_section_boundary_specs(
+            section.get("kind") or "", lo, hi, self.direction)
         added = []
-        for event_type in (first, second):
+        for event_type, kp in specs:
             event = {
                 "event_id": schema.new_id(), "plan_id": self.plan_id,
                 "generation_id": "", "seq": 0, "event_type": event_type,
@@ -534,33 +573,37 @@ class PlanModel(QObject):
             }
             self._stamp_position(event)
             added.append(event)
-        # Nudge the pair apart by 1 m so the ordering is strict.
-        added[0]["kp"] = float(kp) - (0.0005 if self.direction >= 0 else -0.0005)
         candidate = [dict(e) for e in self.events] + added
-        lo, hi = self._scope_bounds()
-        result = ev.validate_events(candidate, lo, hi, self.direction, self.method)
+        scope_lo, scope_hi = self._scope_bounds()
+        result = ev.validate_events(
+            candidate, scope_lo, scope_hi, self.direction, self.method)
         if result.errors:
             raise ValueError(result.errors[0])
         return self._write_events_and_sections(
-            change_log.ACTION_SPLIT_SECTION, section_id, candidate, reason)
+            change_log.ACTION_INSERT_SECTION, section_id, candidate, reason)
+
+    def split_section_at(self, section_id: str, kp: float, reason: str = "") -> bool:
+        """Compatibility helper: insert a visible 1 m opposite-kind range."""
+        section = next((s for s in self.sections
+                        if s.get("section_id") == section_id), None)
+        if section is None:
+            raise ValueError("Section not found.")
+        start = float(section.get("start_kp") or 0.0)
+        end = float(section.get("end_kp") or 0.0)
+        if not (start + 0.0005 < kp < end - 0.0005):
+            raise ValueError("The split KP must lie inside the section.")
+        return self.insert_opposite_section(
+            section_id, float(kp) - 0.0005, float(kp) + 0.0005, reason)
 
     def merge_sections(self, section_ids: List[str], reason: str = "") -> bool:
-        """Merge adjacent burial sections by removing the events between them."""
-        chosen = [s for s in self.sections if s.get("section_id") in set(section_ids)
-                  and s.get("kind") == schema.SECTION_BURIAL]
-        if len(chosen) < 2:
-            raise ValueError("Select two adjacent burial sections to merge.")
-        chosen.sort(key=lambda s: float(s.get("start_kp") or 0.0))
-        drop_ids = set()
-        for a, b in zip(chosen, chosen[1:]):
-            for event in self.events:
-                kp = float(event.get("kp") or 0.0)
-                if float(a.get("end_kp")) - 1e-6 <= kp <= float(b.get("start_kp")) + 1e-6:
-                    if int(event.get("locked") or 0):
-                        raise ValueError(
-                            "A locked event lies between the sections — unlock it first.")
-                    drop_ids.add(event.get("event_id"))
-        remaining = [dict(e) for e in self.events if e.get("event_id") not in drop_ids]
+        """Merge selected burial sections or selected skips."""
+        remaining, _removed, _kind = ev.merge_section_events(
+            self.events, self.sections, section_ids)
+        lo, hi = self._scope_bounds()
+        result = ev.validate_events(
+            remaining, lo, hi, self.direction, self.method)
+        if result.errors:
+            raise ValueError(result.errors[0])
         return self._write_events_and_sections(
             change_log.ACTION_MERGE_SECTIONS, ",".join(section_ids), remaining, reason)
 
@@ -621,6 +664,34 @@ class PlanModel(QObject):
         return True
 
     # -- rollback ------------------------------------------------------------
+    def last_undoable_builder_change(self) -> Optional[Dict]:
+        """Latest effective change when it is a safe Plan Builder edit."""
+        if not self.plan_id:
+            return None
+        entry = change_log.latest_effective_entry(
+            self.store.list_change_log(self.plan_id))
+        if entry is None or entry.get("action") not in _BUILDER_UNDO_ACTIONS:
+            return None
+        return entry
+
+    def undo_last_builder_edit(self) -> Optional[Dict]:
+        """Undo one Plan Builder edit without reloading route/bathymetry."""
+        entry = self.last_undoable_builder_change()
+        if entry is None:
+            return None
+        ok, _ = self._store_write(
+            "undo the last Plan Builder edit", self.store.rollback_to,
+            self.plan_id, entry.get("change_id") or "")
+        if not ok:
+            return None
+        self.events = self.store.list_events(self.plan_id)
+        self.sections = self.store.list_sections(self.plan_id)
+        self.refresh_layers()
+        self.eventsChanged.emit()
+        self.sectionsChanged.emit()
+        self.logChanged.emit()
+        return entry
+
     def rollback_to(self, change_id: str) -> bool:
         ok, _ = self._store_write("roll back", self.store.rollback_to,
                                   self.plan_id, change_id)

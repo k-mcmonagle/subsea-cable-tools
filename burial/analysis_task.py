@@ -492,7 +492,12 @@ def build_route_frame(lines_layer: QgsVectorLayer,
     if not geoms:
         raise ri.RuleInputError("The route layer has no usable line geometry.")
     distance = make_distance_area(WGS84, project.transformContext(), project=project)
-    return RouteFrame.from_source(geoms, distance), distance
+    # KP chainage remains ellipsoidal, but section/event geometry must follow
+    # the RPL's stored line segments exactly. Great-circle interpolation
+    # between sparse geographic vertices can otherwise render several metres
+    # away from the source line.
+    return RouteFrame.from_source(
+        geoms, distance, follow_stored_geometry=True), distance
 
 
 def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
