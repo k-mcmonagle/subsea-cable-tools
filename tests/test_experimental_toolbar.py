@@ -65,6 +65,7 @@ def test_experimental_actions_share_one_toolbar_dropdown():
         experimental_actions = [
             plugin.workbench_action,
             plugin.planner_action,
+            plugin.burial_action,
             plugin.explorer_action,
             plugin.lay_simulator_action,
             plugin.bu_lowering_action,
@@ -78,6 +79,7 @@ def test_experimental_actions_share_one_toolbar_dropdown():
         assert [action.text() for action in experimental_actions] == [
             "Cable Route Workbench",
             "Planner",
+            "Burial Planner (beta)",
             "Cable Lay Data Explorer",
             "Cable Lay Simulator (3D)",
             "BU Lowering Tool (3D)",

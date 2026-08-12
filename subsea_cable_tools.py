@@ -78,6 +78,8 @@ class SubseaCableTools:
         self.workbench_action = None
         self.planner_dock = None
         self.planner_action = None
+        self.burial_dock = None
+        self.burial_action = None
         self.explorer_action = None
         self.explorer_window = None
         self.experimental_menu = None
@@ -177,6 +179,18 @@ class SubseaCableTools:
         self.iface.addPluginToMenu(self.menu, self.planner_action)
         self.actions.append(self.planner_action)
 
+        # Burial planning workflow (plough / ROV jet) over an RPL
+        burial_icon = QIcon(":/plugins/subsea_cable_tools/icon.png")
+        self.burial_action = QAction(
+            burial_icon, "Burial Planner (beta)",
+            self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
+        self.burial_action.setToolTip(
+            "Plan cable burial: exclusion criteria over route and survey data, "
+            "candidate sections, PLDN/PLUP events, synced map/profile/tables.")
+        self.burial_action.triggered.connect(self.show_burial_planner)
+        self.iface.addPluginToMenu(self.menu, self.burial_action)
+        self.actions.append(self.burial_action)
+
         # Transit Measure Tool action
         transit_icon_path = os.path.join(self.plugin_dir, 'transit_measure_icon.png')
         if os.path.exists(transit_icon_path):
@@ -238,6 +252,7 @@ class SubseaCableTools:
         for action in (
                 self.workbench_action,
                 self.planner_action,
+                self.burial_action,
                 self.explorer_action,
                 self.lay_simulator_action,
                 self.bu_lowering_action):
@@ -429,6 +444,22 @@ class SubseaCableTools:
                 pass
             self.planner_dock = None
 
+        # Clean up the Burial Planner dock and its map items.
+        if getattr(self, 'burial_dock', None):
+            try:
+                self.burial_dock.shutdown()
+            except Exception:
+                pass
+            try:
+                self.iface.removeDockWidget(self.burial_dock)
+            except Exception:
+                pass
+            try:
+                self.burial_dock.deleteLater()
+            except Exception:
+                pass
+            self.burial_dock = None
+
         # Clean up the Cable Lay Data Explorer window
         if hasattr(self, 'explorer_window') and self.explorer_window:
             try:
@@ -596,6 +627,23 @@ class SubseaCableTools:
             self.iface.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.planner_dock)
         self.planner_dock.show()
         self.planner_dock.refresh()
+
+    def show_burial_planner(self):
+        """Show the Burial Planner dock (single instance, raise if open)."""
+        if not self.burial_dock:
+            try:
+                from .burial.burial_dock import BurialPlannerDock
+            except Exception as e:
+                from qgis.PyQt.QtWidgets import QMessageBox
+
+                QMessageBox.critical(
+                    self.iface.mainWindow(), "Subsea Cable Tools",
+                    "Burial Planner could not be opened.\n\nDetails: %s" % e)
+                return
+            self.burial_dock = BurialPlannerDock(self.iface)
+            self.iface.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.burial_dock)
+        self.burial_dock.show()
+        self.burial_dock.refresh()
 
     def activate_transit_measure_tool(self):
         if self.transit_measure_tool is None:

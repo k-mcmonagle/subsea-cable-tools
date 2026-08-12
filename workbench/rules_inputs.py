@@ -53,29 +53,54 @@ class RuleInputError(Exception):
     """Raised when a rule's inputs cannot be resolved; converted to a warning."""
 
 
+class AcquisitionCancelled(Exception):
+    """Raised by compute functions when their ``cancel`` callback fires."""
+
+
+_CANCEL_CHUNK = 2000  # stations between cooperative cancel checks
+
+
 # ---------------------------------------------------------------------------
 # Route sampling
 # ---------------------------------------------------------------------------
 
 
 class RouteSampler:
-    """Shared route geometry + KP stations for one assessment run."""
+    """Shared route geometry + KP stations for one assessment run.
+
+    When ``scope`` is given, stations are built only within the scoped KP
+    window plus one coarse-step margin on each side (for slope differencing),
+    so acquisition cost scales with the reviewed extent. Omitting ``scope``
+    preserves the original whole-route behaviour.
+    """
 
     def __init__(self, route: RouteFrame, stations_km: List[float],
-                 coords: List[Optional[QgsPointXY]], distance):
+                 coords: List[Optional[QgsPointXY]], distance,
+                 scope: Optional[Interval] = None):
         self.route = route
         self.stations_km = stations_km
         self.coords = coords  # parallel to stations_km; (x=lon, y=lat) or None
         self.distance = distance
         self.total_km = route.total_length_km
+        self.scope = scope
 
     @property
     def domain(self) -> Interval:
         return Interval(0.0, max(self.total_km, 1e-9))
 
+    @property
+    def scope_domain(self) -> Interval:
+        """The scoped analysis window (falls back to the full route)."""
+        if self.scope is None:
+            return self.domain
+        lo = max(0.0, min(self.scope.start_km, self.scope.end_km))
+        hi = min(self.total_km, max(self.scope.start_km, self.scope.end_km))
+        return Interval(lo, max(hi, lo + 1e-9))
+
     @classmethod
     def for_rpl(cls, store, rpl_id: str, project: Optional[QgsProject] = None,
-                sample_step_m: float = 50.0) -> "RouteSampler":
+                sample_step_m: float = 50.0,
+                scope: Optional[Interval] = None) -> "RouteSampler":
         project = project or QgsProject.instance()
         rpl = store.get_rpl(rpl_id)
         if not rpl:
@@ -101,24 +126,43 @@ class RouteSampler:
 
         distance = make_distance_area(WGS84, project.transformContext())
         route = RouteFrame.from_source(geoms, distance)
+        return cls.from_route(route, distance, sample_step_m, scope)
 
-        stations = _build_stations(route, sample_step_m)
+    @classmethod
+    def from_route(cls, route: RouteFrame, distance, sample_step_m: float = 50.0,
+                   scope: Optional[Interval] = None) -> "RouteSampler":
+        """Build a sampler over an already-constructed RouteFrame.
+
+        Useful for callers that assembled the route from cloned geometries
+        (e.g. a background task's thread-safe snapshot).
+        """
+        stations = _build_stations(route, sample_step_m, scope)
         coords = [route.point_at_kp(kp, clamp=True) for kp in stations]
-        return cls(route, stations, coords, distance)
+        return cls(route, stations, coords, distance, scope)
 
 
-def _build_stations(route: RouteFrame, sample_step_m: float) -> List[float]:
+def _build_stations(route: RouteFrame, sample_step_m: float,
+                    scope: Optional[Interval] = None) -> List[float]:
     total_km = route.total_length_km
     step_km = max(float(sample_step_m), 1.0) / 1000.0
-    marks = [0.0, total_km]
+    if scope is None:
+        lo, hi = 0.0, total_km
+    else:
+        s = min(scope.start_km, scope.end_km)
+        e = max(scope.start_km, scope.end_km)
+        lo = max(0.0, s - step_km)   # one-step margin for slope differencing
+        hi = min(total_km, e + step_km)
+    marks = [lo, hi]
     # route vertices (feature boundaries) keep kinks in the depth/slope profile
     for off_m in route.feature_offsets_m:
-        marks.append(off_m / 1000.0)
-    kp = 0.0
-    while kp < total_km:
+        m = off_m / 1000.0
+        if lo - 1e-9 <= m <= hi + 1e-9:
+            marks.append(m)
+    kp = lo
+    while kp < hi:
         marks.append(kp)
         kp += step_km
-    marks = [min(max(m, 0.0), total_km) for m in marks]
+    marks = [min(max(m, lo), hi) for m in marks]
     marks.sort()
     unique: List[float] = []
     for m in marks:
@@ -266,28 +310,113 @@ def _slope_series(depth_series: List[Tuple[float, float]]) -> List[Tuple[float, 
     return out
 
 
-def _acquire_threshold(sampler, store, rpl_id, config, project) -> List[Interval]:
+def depth_series_with_gaps(sampler: RouteSampler, sample_fn,
+                           cancel: Optional[Callable[[], bool]] = None
+                           ) -> Tuple[List[Tuple[float, float]], List[Interval]]:
+    """(kp, depth-magnitude) series plus the KP intervals with no depth data.
+
+    ``sample_fn(lat, lon) -> Optional[float]`` is the depth source. Gap
+    intervals are derived by midpoint ownership over the no-data stations,
+    clipped to the sampler's scoped domain. Callers may ignore the gaps
+    (Assessment behaviour) or surface them as Insufficient Information.
+    """
+    series: List[Tuple[float, float]] = []
+    flags: List[Tuple[float, bool]] = []
+    for station_index, (kp, pt) in enumerate(zip(sampler.stations_km, sampler.coords)):
+        if cancel is not None and station_index % _CANCEL_CHUNK == 0 and cancel():
+            raise AcquisitionCancelled()
+        depth = sample_fn(pt.y(), pt.x()) if pt is not None else None
+        if depth is None:
+            flags.append((kp, True))
+        else:
+            series.append((kp, abs(float(depth))))
+            flags.append((kp, False))
+    gaps = eng.intervals_from_bool_series(flags, sampler.scope_domain)
+    return series, gaps
+
+
+def threshold_intervals(depth_series: List[Tuple[float, float]], config: Dict,
+                        domain: Interval) -> List[Interval]:
+    """Threshold/slope intervals from a depth-magnitude series (thread-safe).
+
+    Supports the original unsigned depth/slope comparison plus the signed
+    directional slope (``slope_signed`` with ``downslope_max_deg`` /
+    ``upslope_max_deg``; positive slope = deepening with KP) and optional
+    WD-banded limits (``bands``: per-band ``limit`` or, for signed slope,
+    ``downslope_limit`` / ``upslope_limit``). Defaults preserve the original
+    Assessment behaviour exactly.
+    """
     profile = (config.get("profile") or "depth").lower()
     op = config.get("op") or ">"
+    signed = bool(config.get("slope_signed")) and profile == "slope"
+    bands = config.get("bands") or []
+
+    if profile == "slope":
+        series = (eng.signed_slope_series(depth_series) if signed
+                  else _slope_series(depth_series))
+    else:
+        series = depth_series
+
+    if bands:
+        if signed:
+            wd_by_kp = {round(kp, 9): wd for kp, wd in depth_series}
+            flags: List[Tuple[float, bool]] = []
+            for kp, slope in series:
+                wd = wd_by_kp.get(round(kp, 9))
+                band = eng.select_band(bands, wd) if wd is not None else None
+                fired = False
+                if band is not None:
+                    down = band.get("downslope_limit", band.get("limit"))
+                    up = band.get("upslope_limit", band.get("limit"))
+                    if down is not None and slope > float(down):
+                        fired = True
+                    if up is not None and slope < -abs(float(up)):
+                        fired = True
+                flags.append((kp, fired))
+            return eng.intervals_from_bool_series(flags, domain)
+        return eng.intervals_from_banded_threshold(series, depth_series, bands, op, domain)
+
+    if signed:
+        return eng.intervals_from_signed_slope(
+            series, config.get("downslope_max_deg"), config.get("upslope_max_deg"))
+
     value = float(config.get("value", 0.0))
     value2 = config.get("value2")
     value2 = float(value2) if value2 is not None else None
+    # depth is already a magnitude; unsigned slope non-negative -> abs is a no-op.
+    return eng.intervals_from_profile(series, op, value, value2,
+                                      abs_value=bool(config.get("abs", False)))
+
+
+def _acquire_threshold(sampler, store, rpl_id, config, project) -> List[Interval]:
     depth_series = _depth_series(sampler, store, rpl_id, project)
-    if profile == "slope":
-        series = _slope_series(depth_series)
-    else:
-        series = depth_series
-    # depth is already a magnitude; slope already non-negative -> abs is a no-op.
-    return eng.intervals_from_profile(series, op, value, value2, abs_value=bool(config.get("abs", False)))
+    return threshold_intervals(depth_series, config, sampler.domain)
 
 
-def _acquire_proximity(sampler, config, project) -> List[Interval]:
-    layer = _resolve_layer(project, config)
+def _feature_buffer_m(feat, buffer_field: str, default_m: float) -> float:
+    """Per-feature buffer override (``buffer_field``), else the blanket value."""
+    if buffer_field:
+        try:
+            value = float(feat[buffer_field])
+            if value == value and value >= 0.0:  # not NaN, not negative
+                return value
+        except (KeyError, TypeError, ValueError):
+            pass
+    return default_m
+
+
+def proximity_intervals(sampler: RouteSampler, index: QgsSpatialIndex,
+                        feats: Dict[int, Tuple[QgsGeometry, QgsFeature]],
+                        geom_type, config: Dict,
+                        cancel: Optional[Callable[[], bool]] = None) -> List[Interval]:
+    """Proximity intervals over pre-loaded WGS84 features (thread-safe:
+    touches only the supplied snapshot, never the project or live layers).
+    ``cancel`` is checked every ~2000 stations and raises
+    ``AcquisitionCancelled`` when it returns True."""
     distance_m = float(config.get("distance_m", 0.0))
     mode = config.get("mode", "distance")
     buffer_m = distance_m if mode == "distance" else 0.0
-    index, feats = _load_features_wgs84(layer, project)
-    geom_type = layer.geometryType()
+    buffer_field = (config.get("buffer_field") or "").strip()
     intervals: List[Interval] = []
 
     expr, ctx = _filter_expression(config.get("filter_expression", ""))
@@ -303,41 +432,51 @@ def _acquire_proximity(sampler, config, project) -> List[Interval]:
         for geom, feat in feats.values():
             if not passes_filter(feat):
                 continue
+            fb = _feature_buffer_m(feat, buffer_field, buffer_m)
             pt = geom.centroid().asPoint() if geom.isMultipart() else geom.asPoint()
             hit = sampler.route.kp_at_point(QgsPointXY(pt))
             if hit.snapped_xy is None:
                 continue
-            if hit.dcc_m <= buffer_m + 1e-6:
-                half = ((max(buffer_m, 0.0) ** 2 - hit.dcc_m ** 2) ** 0.5) / 1000.0
+            if hit.dcc_m <= fb + 1e-6:
+                half = ((max(fb, 0.0) ** 2 - hit.dcc_m ** 2) ** 0.5) / 1000.0
                 intervals.append(Interval(hit.kp_km - half, hit.kp_km + half))
         return eng.clip_intervals(intervals, sampler.domain)
 
+    # Largest buffer bounds the spatial-index search window.
+    max_buffer_m = buffer_m
+    if buffer_field:
+        for _geom, feat in feats.values():
+            max_buffer_m = max(max_buffer_m, _feature_buffer_m(feat, buffer_field, buffer_m))
+
     # Line / polygon: per-station distance test (captures within-buffer proximity)
     series: List[Tuple[float, bool]] = []
-    for kp, pt in zip(sampler.stations_km, sampler.coords):
+    for station_index, (kp, pt) in enumerate(zip(sampler.stations_km, sampler.coords)):
+        if cancel is not None and station_index % _CANCEL_CHUNK == 0 and cancel():
+            raise AcquisitionCancelled()
         if pt is None:
             series.append((kp, False))
             continue
         flag = False
-        for fid in index.intersects(_search_rect(pt, max(buffer_m, 1.0))):
+        for fid in index.intersects(_search_rect(pt, max(max_buffer_m, 1.0))):
             geom, feat = feats[fid]
             if not passes_filter(feat):
                 continue
+            fb = _feature_buffer_m(feat, buffer_field, buffer_m)
             if (geom_type == GEOMETRY_POLYGON and
                     geom.contains(QgsGeometry.fromPointXY(pt))):
                 flag = True
                 break
-            if _distance_to_geom_m(sampler.distance, pt, geom) <= buffer_m + 1e-6:
+            if _distance_to_geom_m(sampler.distance, pt, geom) <= fb + 1e-6:
                 flag = True
                 break
         series.append((kp, flag))
     intervals = eng.intervals_from_bool_series(series, sampler.domain)
 
     # Exact crossings (thin features a coarse buffer might miss between stations).
-    eps_km = max(buffer_m, 1.0) / 1000.0
     for geom, feat in feats.values():
         if not passes_filter(feat):
             continue
+        eps_km = max(_feature_buffer_m(feat, buffer_field, buffer_m), 1.0) / 1000.0
         for route_geom in sampler.route.geometries:
             inter = route_geom.intersection(geom)
             if inter is None or inter.isEmpty():
@@ -349,12 +488,20 @@ def _acquire_proximity(sampler, config, project) -> List[Interval]:
     return eng.clip_intervals(intervals, sampler.domain)
 
 
-def _acquire_polygon_class(sampler, config, project) -> List[Interval]:
+def _acquire_proximity(sampler, config, project) -> List[Interval]:
     layer = _resolve_layer(project, config)
+    index, feats = _load_features_wgs84(layer, project)
+    return proximity_intervals(sampler, index, feats, layer.geometryType(), config)
+
+
+def polygon_class_intervals(sampler: RouteSampler, index: QgsSpatialIndex,
+                            feats: Dict[int, Tuple[QgsGeometry, QgsFeature]],
+                            config: Dict,
+                            cancel: Optional[Callable[[], bool]] = None) -> List[Interval]:
+    """Polygon-class intervals over pre-loaded WGS84 features (thread-safe)."""
     attribute = config.get("attribute") or ""
     match_values = {str(v).strip().lower() for v in (config.get("match_values") or [])}
     expr, ctx = _filter_expression(config.get("match_expression", ""))
-    index, feats = _load_features_wgs84(layer, project)
 
     def matches(feat) -> bool:
         if expr is not None:
@@ -369,7 +516,9 @@ def _acquire_polygon_class(sampler, config, project) -> List[Interval]:
         return str(val).strip().lower() in match_values
 
     series: List[Tuple[float, bool]] = []
-    for kp, pt in zip(sampler.stations_km, sampler.coords):
+    for station_index, (kp, pt) in enumerate(zip(sampler.stations_km, sampler.coords)):
+        if cancel is not None and station_index % _CANCEL_CHUNK == 0 and cancel():
+            raise AcquisitionCancelled()
         if pt is None:
             series.append((kp, False))
             continue
@@ -384,24 +533,40 @@ def _acquire_polygon_class(sampler, config, project) -> List[Interval]:
     return eng.intervals_from_bool_series(series, sampler.domain)
 
 
-def _acquire_kp_table(sampler, config, project) -> List[Interval]:
+def _acquire_polygon_class(sampler, config, project) -> List[Interval]:
     layer = _resolve_layer(project, config)
+    index, feats = _load_features_wgs84(layer, project)
+    return polygon_class_intervals(sampler, index, feats, config)
+
+
+def kp_table_intervals(rows: Sequence[Dict], config: Dict, domain: Interval
+                       ) -> List[Interval]:
+    """KP-range intervals from plain row dicts (thread-safe)."""
     start_field = config.get("start_field") or "start_kp"
     end_field = config.get("end_field") or "end_kp"
-    expr, ctx = _filter_expression(config.get("filter_expression", ""))
     intervals: List[Interval] = []
+    for row in rows:
+        try:
+            s = float(row[start_field])
+            e = float(row[end_field])
+        except (KeyError, TypeError, ValueError):
+            continue
+        intervals.append(Interval(s, e))
+    return eng.clip_intervals(intervals, domain)
+
+
+def _acquire_kp_table(sampler, config, project) -> List[Interval]:
+    layer = _resolve_layer(project, config)
+    expr, ctx = _filter_expression(config.get("filter_expression", ""))
+    rows: List[Dict] = []
+    names = [f.name() for f in layer.fields()]
     for feat in layer.getFeatures():
         if expr is not None:
             ctx.setFeature(feat)
             if not bool(expr.evaluate(ctx)):
                 continue
-        try:
-            s = float(feat[start_field])
-            e = float(feat[end_field])
-        except (KeyError, TypeError, ValueError):
-            continue
-        intervals.append(Interval(s, e))
-    return eng.clip_intervals(intervals, sampler.domain)
+        rows.append({name: feat[name] for name in names})
+    return kp_table_intervals(rows, config, sampler.domain)
 
 
 def _acquire_manual(sampler, config) -> List[Interval]:

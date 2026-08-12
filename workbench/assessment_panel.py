@@ -22,7 +22,7 @@ from typing import Dict, List, Optional
 from qgis.core import QgsProject, QgsVectorLayer
 from qgis.gui import QgsFieldComboBox, QgsMapLayerComboBox
 from qgis.PyQt.QtCore import Qt, QTimer, pyqtSignal
-from qgis.PyQt.QtGui import QBrush, QColor, QPainter, QPen
+from qgis.PyQt.QtGui import QBrush, QColor
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -42,7 +42,6 @@ from qgis.PyQt.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QSpinBox,
-    QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
@@ -57,101 +56,16 @@ from ..qgis_compat import (
     layer_filters, qt_exec,
 )
 from . import assessment_output, rules_inputs, schema
+from .kp_bars import (
+    ACTION_COLORS,
+    FireBarDelegate,
+    STATUS_COLORS,
+    VerdictStrip,
+)
 from .rules_engine import Interval
 from .selection_bus import selection_bus
 
-# Colours shared by the overview bar, fire-bars and (conceptually) the layer.
-STATUS_COLORS = {
-    schema.STATUS_ALLOWED: QColor("#2ca02c"),
-    schema.STATUS_RISK: QColor("#ff8c00"),
-    schema.STATUS_EXCLUDED: QColor("#d62728"),
-}
-ACTION_COLORS = {
-    schema.RULE_ACTION_EXCLUDE: QColor("#d62728"),
-    schema.RULE_ACTION_RISK: QColor("#ff8c00"),
-    schema.RULE_ACTION_ALLOW: QColor("#2ca02c"),
-}
-_EMPTY_BG = QColor(0, 0, 0, 18)
-
 FIRE_COL = 2  # index of the fire-bar column in the rule table
-
-
-# ---------------------------------------------------------------------------
-# Small painting widgets
-# ---------------------------------------------------------------------------
-
-
-def _paint_spans(painter: QPainter, rect, domain_km: float,
-                 spans: List, radius: int = 2) -> None:
-    """spans: list of (start_km, end_km, QColor)."""
-    painter.save()
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-    painter.fillRect(rect, _EMPTY_BG)
-    if domain_km <= 0:
-        painter.restore()
-        return
-    x0, w = rect.x(), rect.width()
-    for start_km, end_km, color in spans:
-        sx = x0 + (max(0.0, start_km) / domain_km) * w
-        ex = x0 + (min(domain_km, end_km) / domain_km) * w
-        if ex - sx < 1.0:
-            ex = sx + 1.0
-        painter.fillRect(int(sx), rect.y() + 2, int(ex - sx), rect.height() - 4, color)
-    painter.restore()
-
-
-class VerdictStrip(QWidget):
-    """Overview bar: paints the combined verdict spans for one method."""
-
-    kpClicked = pyqtSignal(float)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setMinimumHeight(30)
-        self._domain_km = 0.0
-        self._spans: List = []
-        self._method_name = ""
-        self.setToolTip("Combined suitability for the selected method. Click to locate on the map.")
-
-    def set_spans(self, domain_km: float, spans: List, method_name: str = "") -> None:
-        self._domain_km = domain_km
-        self._spans = spans
-        self._method_name = method_name or ""
-        self.update()
-
-    def paintEvent(self, _event):
-        painter = QPainter(self)
-        rect = self.rect().adjusted(0, 0, -1, -1)
-        _paint_spans(painter, rect, self._domain_km, self._spans)
-        painter.setPen(QPen(QColor(120, 120, 120)))
-        painter.drawRect(rect)
-        painter.setPen(QPen(QColor(40, 40, 40)))
-        if self._method_name:
-            painter.drawText(rect.adjusted(6, 0, -6, 0),
-                             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                             self._method_name)
-        if self._domain_km > 0:
-            painter.drawText(rect.adjusted(6, 0, -6, 0),
-                             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
-                             f"0 - {self._domain_km:.1f} km")
-
-    def mousePressEvent(self, event):
-        if self._domain_km > 0 and self.width() > 0:
-            kp = (event.pos().x() / self.width()) * self._domain_km
-            self.kpClicked.emit(max(0.0, min(self._domain_km, kp)))
-
-
-class FireBarDelegate(QStyledItemDelegate):
-    """Paints a rule's fire intervals in its table cell (domain-aligned)."""
-
-    def paint(self, painter, option, index):
-        data = index.data(Qt.ItemDataRole.UserRole)
-        if not data:
-            super().paint(painter, option, index)
-            return
-        domain_km, intervals, color = data
-        spans = [(s, e, color) for (s, e) in intervals]
-        _paint_spans(painter, option.rect.adjusted(2, 0, -2, 0), domain_km, spans)
 
 
 # ---------------------------------------------------------------------------

@@ -139,6 +139,60 @@ def test_method_filtering() -> bool:
     return _result("per-method rule applicability", ok)
 
 
+def test_subtract_and_complement() -> bool:
+    out = eng.subtract_intervals([Interval(0, 10)], [Interval(2, 3), Interval(5, 6)])
+    got = [(round(i.start_km, 6), round(i.end_km, 6)) for i in out]
+    ok = got == [(0, 2), (3, 5), (6, 10)]
+    comp = eng.complement_intervals([Interval(2, 4)], Interval(0, 10))
+    ok = ok and [(i.start_km, i.end_km) for i in comp] == [(0, 2), (4, 10)]
+    # subtraction fully covering -> empty
+    ok = ok and eng.subtract_intervals([Interval(2, 4)], [Interval(0, 10)]) == []
+    return _result("subtract + complement interval ops", ok, str(got))
+
+
+def test_dilate_intervals() -> bool:
+    out = eng.dilate_intervals([Interval(2, 3)], 0.5, 1.0, Interval(0, 3.2))
+    ok = len(out) == 1 and abs(out[0].start_km - 1.5) < 1e-9 and abs(out[0].end_km - 3.2) < 1e-9
+    # dilation merges neighbours
+    merged = eng.dilate_intervals([Interval(0, 1), Interval(1.5, 2)], 0.3, 0.3)
+    ok = ok and len(merged) == 1
+    return _result("dilate (extension buffers / influence) with clamp + merge", ok)
+
+
+def test_signed_slope() -> bool:
+    # depth 100 -> 200 over 1 km (deepening), then back (shoaling)
+    series = [(0.0, 100.0), (1.0, 200.0), (2.0, 100.0)]
+    signed = eng.signed_slope_series(series)
+    ok = signed[0][1] > 0 and signed[2][1] < 0
+    ivs = eng.intervals_from_signed_slope(signed, downslope_max_deg=3.0,
+                                          upslope_max_deg=None)
+    # only the deepening half breaches the down-slope limit
+    ok = ok and ivs and all(iv.end_km <= 1.5 + 1e-6 for iv in ivs)
+    ivs_up = eng.intervals_from_signed_slope(signed, downslope_max_deg=None,
+                                             upslope_max_deg=3.0)
+    ok = ok and ivs_up and all(iv.start_km >= 0.5 - 1e-6 for iv in ivs_up)
+    return _result("signed slope series + directional limits", ok)
+
+
+def test_banded_threshold() -> bool:
+    dom = Interval(0.0, 4.0)
+    # slope value 8 everywhere; WD shallows->deep; limit 10 in shallow band,
+    # 6 in deep band -> fires only in the deep band
+    kps = [0.0, 1.0, 2.0, 3.0, 4.0]
+    value_series = [(kp, 8.0) for kp in kps]
+    wd_series = [(kp, 100.0 if kp < 2.0 else 900.0) for kp in kps]
+    bands = [{"min_wd": 0.0, "max_wd": 500.0, "limit": 10.0},
+             {"min_wd": 500.0, "limit": 6.0}]
+    ivs = eng.intervals_from_banded_threshold(value_series, wd_series, bands, ">", dom)
+    ok = len(ivs) == 1 and ivs[0].start_km > 1.0 and abs(ivs[0].end_km - 4.0) < 1e-9
+    # a station with no applicable band never fires
+    no_band = eng.intervals_from_banded_threshold(
+        value_series, [(kp, -5.0) for kp in kps],
+        [{"min_wd": 0.0, "max_wd": 500.0, "limit": 1.0}], ">", dom)
+    ok = ok and no_band == []
+    return _result("WD-banded threshold selects band per station", ok)
+
+
 def run_all() -> list:
     return [
         test_normalize_and_intersect(),
@@ -150,6 +204,10 @@ def run_all() -> list:
         test_rule_stats_coverage(),
         test_sliver_merge_and_dissolve(),
         test_method_filtering(),
+        test_subtract_and_complement(),
+        test_dilate_intervals(),
+        test_signed_slope(),
+        test_banded_threshold(),
     ]
 
 

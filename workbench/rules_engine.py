@@ -173,6 +173,55 @@ def clip_intervals(intervals: List[Interval], domain: Interval) -> List[Interval
     return intersect_intervals(intervals, [domain])
 
 
+def subtract_intervals(a: List[Interval], b: List[Interval]) -> List[Interval]:
+    """Ranges of ``a`` not covered by ``b`` (interval-set difference)."""
+    na, nb = normalize(a), normalize(b)
+    out: List[Interval] = []
+    j = 0
+    for iv in na:
+        cursor = iv.start_km
+        while j < len(nb) and nb[j].end_km <= cursor + _TOL:
+            j += 1
+        k = j
+        while k < len(nb) and nb[k].start_km < iv.end_km - _TOL:
+            if nb[k].start_km - cursor > _TOL:
+                out.append(Interval(cursor, nb[k].start_km))
+            cursor = max(cursor, nb[k].end_km)
+            if cursor >= iv.end_km - _TOL:
+                break
+            k += 1
+        if iv.end_km - cursor > _TOL:
+            out.append(Interval(cursor, iv.end_km))
+    return normalize(out)
+
+
+def complement_intervals(intervals: List[Interval], domain: Interval) -> List[Interval]:
+    """Ranges of ``domain`` not covered by ``intervals``."""
+    return subtract_intervals([domain], intervals)
+
+
+def dilate_intervals(
+    intervals: List[Interval],
+    before_km: float = 0.0,
+    after_km: float = 0.0,
+    domain: Optional[Interval] = None,
+) -> List[Interval]:
+    """Extend each interval by ``before_km`` on the low-KP side and
+    ``after_km`` on the high-KP side (both clamped to >= 0), then merge.
+
+    Callers map travel direction onto the two sides: for direction -1 the
+    "before" (approach) side is the high-KP side, so swap the arguments.
+    """
+    before_km = max(0.0, float(before_km or 0.0))
+    after_km = max(0.0, float(after_km or 0.0))
+    out = [Interval(iv.start_km - before_km, iv.end_km + after_km)
+           for iv in normalize(intervals)]
+    out = normalize(out)
+    if domain is not None:
+        out = clip_intervals(out, domain)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Series -> intervals
 # ---------------------------------------------------------------------------
@@ -269,6 +318,96 @@ def intervals_from_bool_series(
         if b - a > _TOL:
             out.append(Interval(a, b))
     return normalize(out)
+
+
+def signed_slope_series(depth_series: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """Central-difference signed seabed slope (degrees) from a depth-magnitude
+    series. Positive = deepening with increasing KP; negative = shoaling.
+
+    The unsigned variant lives in ``rules_inputs._slope_series`` (unchanged);
+    this signed form supports direction-aware up/down-slope limits. Callers map
+    travel direction onto the sign (direction -1 swaps the up/down limits).
+    """
+    pts = sorted(depth_series)
+    n = len(pts)
+    out: List[Tuple[float, float]] = []
+    for i in range(n):
+        if n < 2:
+            out.append((pts[i][0], 0.0))
+            continue
+        lo = max(0, i - 1)
+        hi = min(n - 1, i + 1)
+        dz = pts[hi][1] - pts[lo][1]
+        dx_m = (pts[hi][0] - pts[lo][0]) * 1000.0
+        slope = math.degrees(math.atan2(dz, dx_m)) if dx_m > 1e-9 else 0.0
+        out.append((pts[i][0], slope))
+    return out
+
+
+def intervals_from_signed_slope(
+    slope_series: List[Tuple[float, float]],
+    downslope_max_deg: Optional[float] = None,
+    upslope_max_deg: Optional[float] = None,
+) -> List[Interval]:
+    """Intervals where a signed slope profile breaches either directional limit.
+
+    ``downslope_max_deg`` limits positive slope (deepening with KP);
+    ``upslope_max_deg`` limits the magnitude of negative slope (shoaling).
+    Either may be None (no limit on that side).
+    """
+    out: List[Interval] = []
+    if downslope_max_deg is not None:
+        out.extend(intervals_from_profile(slope_series, ">", float(downslope_max_deg)))
+    if upslope_max_deg is not None:
+        out.extend(intervals_from_profile(slope_series, "<", -abs(float(upslope_max_deg))))
+    return normalize(out)
+
+
+def select_band(bands: List[Dict], wd: float) -> Optional[Dict]:
+    """First band whose [min_wd, max_wd) contains the water depth (magnitude).
+
+    A band omits either bound to leave that side open. No interpolation
+    between bands — a station is governed by exactly the band it falls in.
+    """
+    for band in bands or []:
+        lo = band.get("min_wd")
+        hi = band.get("max_wd")
+        if lo is not None and wd < float(lo):
+            continue
+        if hi is not None and wd >= float(hi):
+            continue
+        return band
+    return None
+
+
+def intervals_from_banded_threshold(
+    value_series: List[Tuple[float, float]],
+    wd_series: List[Tuple[float, float]],
+    bands: List[Dict],
+    op: str,
+    domain: Interval,
+) -> List[Interval]:
+    """Intervals where a per-station value breaches its WD-band's limit.
+
+    ``value_series`` and ``wd_series`` must share station KPs (extra stations
+    on either side are ignored). Stations with no applicable band never fire.
+    Evaluated per station (midpoint ownership) — band switching is a step
+    change by design; callers wanting 1 m boundaries refine afterwards.
+    """
+    wd_by_kp = {round(kp, 9): wd for kp, wd in wd_series}
+    flags: List[Tuple[float, bool]] = []
+    for kp, value in value_series:
+        wd = wd_by_kp.get(round(kp, 9))
+        if wd is None:
+            flags.append((kp, False))
+            continue
+        band = select_band(bands, wd)
+        if band is None or band.get("limit") is None:
+            flags.append((kp, False))
+            continue
+        lo, hi = _cond_bounds(op, float(band["limit"]), None)
+        flags.append((kp, (lo - _TOL) <= value <= (hi + _TOL)))
+    return intervals_from_bool_series(flags, domain)
 
 
 # ---------------------------------------------------------------------------

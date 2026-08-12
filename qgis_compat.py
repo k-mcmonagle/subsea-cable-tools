@@ -253,6 +253,7 @@ MAP_LAYER_FILTER_POINT = _layer_filter("PointLayer")
 MAP_LAYER_FILTER_LINE = _layer_filter("LineLayer")
 MAP_LAYER_FILTER_POLYGON = _layer_filter("PolygonLayer")
 MAP_LAYER_FILTER_VECTOR = _layer_filter("VectorLayer")
+MAP_LAYER_FILTER_RASTER = _layer_filter("RasterLayer")
 
 MESSAGE_BOX_YES = _scoped_member(QMessageBox, "StandardButton", "Yes")
 MESSAGE_BOX_NO = _scoped_member(QMessageBox, "StandardButton", "No")
