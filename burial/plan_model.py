@@ -67,6 +67,8 @@ class PlanModel(QObject):
         self.context = generation.ResolutionContext()
         self.route = None            # RouteFrame over the plan's RPL (WGS84)
         self.distance = None
+        self.resolved_rpl_id = ""
+        self.route_notice = ""
         self.acq_cache: Dict[str, Tuple[List[Interval], List[Interval]]] = {}
         self.route_error = ""
 
@@ -141,6 +143,8 @@ class PlanModel(QObject):
         self.sections = []
         self.context = generation.ResolutionContext()
         self.route = None
+        self.resolved_rpl_id = ""
+        self.route_notice = ""
         self.acq_cache.clear()
         self.planChanged.emit()
 
@@ -159,16 +163,24 @@ class PlanModel(QObject):
         """Route geometry from the Workbench RPL, or any registered line layer."""
         self.route = None
         self.distance = None
+        self.resolved_rpl_id = ""
+        self.route_notice = ""
         self.route_error = ""
         project = QgsProject.instance()
         lines_layer = None
         rpl_id = self.plan.get("rpl_id") or ""
         if rpl_id and self.workbench_store is not None:
             try:
-                rpl = self.workbench_store.get_rpl(rpl_id)
+                rpl, matched_snapshot = self._resolve_workbench_rpl()
                 if rpl:
+                    self.resolved_rpl_id = str(rpl.get("rpl_id") or "")
                     lines_layer = self.workbench_store.open_layer(
                         rpl.get("lines_layer") or "")
+                    if matched_snapshot:
+                        self.route_notice = (
+                            "The saved RPL UUID was not present. A unique "
+                            "Workbench RPL with the same name and revision "
+                            "was matched; click Set route to save the relink.")
             except Exception:
                 lines_layer = None
         if lines_layer is None:
@@ -188,11 +200,32 @@ class PlanModel(QObject):
         except Exception as exc:
             self.route_error = f"Route could not be built: {exc}"
 
+    def _resolve_workbench_rpl(self):
+        """Return ``(row, matched_snapshot)`` for the plan's Workbench RPL."""
+        if self.workbench_store is None:
+            return None, False
+        wanted_id = str(self.plan.get("rpl_id") or "")
+        exact = self.workbench_store.get_rpl(wanted_id) if wanted_id else None
+        if exact is not None:
+            return exact, False
+        wanted_name = str(self.plan.get("rpl_name") or "").strip().casefold()
+        wanted_revision = str(
+            self.plan.get("rpl_revision") or "").strip().casefold()
+        if not wanted_name:
+            return None, False
+        matches = [
+            row for row in self.workbench_store.list_rpls()
+            if str(row.get("name") or "").strip().casefold() == wanted_name
+            and (not wanted_revision or
+                 str(row.get("rev_label") or "").strip().casefold()
+                 == wanted_revision)
+        ]
+        return (matches[0], True) if len(matches) == 1 else (None, False)
+
     def current_rpl_fingerprint(self) -> str:
-        rpl_id = self.plan.get("rpl_id") or ""
-        if rpl_id and self.workbench_store is not None:
+        if self.plan.get("rpl_id") and self.workbench_store is not None:
             try:
-                rpl = self.workbench_store.get_rpl(rpl_id)
+                rpl, _matched_snapshot = self._resolve_workbench_rpl()
             except Exception:
                 rpl = None
             return map_layers.rpl_fingerprint(

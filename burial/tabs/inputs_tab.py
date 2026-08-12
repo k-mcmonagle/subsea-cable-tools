@@ -328,6 +328,10 @@ class InputsTab(QWidget):
             self.direction_combo.setCurrentIndex(max(0, index))
             self.target_burial.setValue(float(plan.get("target_burial_m") or 0.0))
             self._load_bathy_config()
+            if self.model.route_notice:
+                self.apply_status.setText(self.model.route_notice)
+            elif plan and self.model.route_error:
+                self.apply_status.setText(self.model.route_error)
         finally:
             self._loading = False
         self._refresh_inputs()
@@ -344,7 +348,8 @@ class InputsTab(QWidget):
             rpls = store.list_rpls()
         except Exception:
             rpls = []
-        current = self.model.plan.get("rpl_id") or ""
+        current = (self.model.resolved_rpl_id or
+                   self.model.plan.get("rpl_id") or "")
         for rpl in rpls:
             name = rpl.get("name") or "RPL"
             revision = (rpl.get("rev_label") or "").strip()

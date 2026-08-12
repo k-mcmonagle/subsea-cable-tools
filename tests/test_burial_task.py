@@ -30,7 +30,9 @@ from ..kp_geo_utils import RouteFrame
 from ..kp_range_utils import make_distance_area
 from ..workbench import rules_engine as eng
 from ..workbench import rules_inputs as ri
+from ..workbench import store as workbench_store_module
 from ..workbench.rules_engine import Interval
+from ..workbench.store import WorkbenchStore
 
 WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
 
@@ -300,6 +302,80 @@ def test_existing_plan_file_open_is_non_destructive() -> bool:
     return _result("existing plan file is validated before opening", ok)
 
 
+def test_workbench_path_recovers_after_project_move() -> bool:
+    """A stale absolute Workbench path falls back beside the moved project."""
+    project = QgsProject.instance()
+    old_filename = project.fileName()
+    old_path = workbench_store_module.project_gpkg_path(project)
+    folder = tempfile.mkdtemp(prefix="burial_wb_move_test_")
+    try:
+        project.setFileName(os.path.join(folder, "moved-project.qgz"))
+        expected = workbench_store_module.default_project_gpkg_path(project)
+        workbench = WorkbenchStore(expected)
+        workbench.ensure_created()
+        missing = os.path.join(folder, "old-machine", "workbench.gpkg")
+        workbench_store_module.set_project_gpkg_path(missing, project)
+        dock_like = type("DockLike", (), {
+            "store": type(
+                "Store", (), {"gpkg_path": os.path.join(folder, "plans.gpkg")})(),
+            "model": type("Model", (), {"plan": {}})(),
+        })()
+        recovered = burial_dock.BurialPlannerDock.workbench_store(dock_like)
+        ok = recovered is not None
+        ok = ok and os.path.normcase(recovered.gpkg_path) == os.path.normcase(expected)
+        ok = ok and workbench_store_module.project_gpkg_path(project) == expected
+    finally:
+        project.setFileName(old_filename)
+        if old_path:
+            workbench_store_module.set_project_gpkg_path(old_path, project)
+        else:
+            project.removeEntry(workbench_store_module.PROJECT_SCOPE,
+                                workbench_store_module.PROJECT_KEY_GPKG)
+    return _result("Workbench path recovers after project move", ok)
+
+
+def test_reopened_plan_matches_unique_rpl_snapshot() -> bool:
+    """A re-imported RPL can be offered by its saved name and revision."""
+    route_layer = QgsVectorLayer(
+        "LineString?crs=EPSG:4326&field=SeqNo:integer", "route", "memory")
+    feature = QgsFeature(route_layer.fields())
+    feature.setGeometry(QgsGeometry.fromWkt("LINESTRING(0 50, 0 50.1)"))
+    feature.setAttributes([0])
+    route_layer.dataProvider().addFeature(feature)
+    replacement = {
+        "rpl_id": "new-rpl-id", "name": "Test Route", "rev_label": "C03",
+        "lines_layer": "rpl_lines", "modified_utc": "now",
+    }
+
+    class _Workbench:
+        gpkg_path = "moved-workbench.gpkg"
+
+        def get_rpl(self, rpl_id):
+            return replacement if rpl_id == replacement["rpl_id"] else None
+
+        def list_rpls(self):
+            return [replacement]
+
+        def open_layer(self, layer_name):
+            return route_layer if layer_name == "rpl_lines" else None
+
+    folder = tempfile.mkdtemp(prefix="burial_rpl_relink_test_")
+    store = BurialStore(os.path.join(folder, "plans.gpkg"))
+    store.migrate()
+    plan_id = store.save_plan({
+        "name": "Existing plan", "method": "plough", "rpl_id": "old-rpl-id",
+        "rpl_name": "Test Route", "rpl_revision": "C03",
+        "rpl_gpkg_path": "old-workbench.gpkg",
+    })
+    model = PlanModel(store, _Workbench())
+    ok = model.load_plan(plan_id)
+    ok = ok and model.route is not None
+    ok = ok and model.resolved_rpl_id == "new-rpl-id"
+    ok = ok and bool(model.route_notice)
+    ok = ok and model.plan.get("rpl_id") == "old-rpl-id"  # user confirms relink
+    return _result("reopened plan matches unique RPL name + revision", ok)
+
+
 def test_end_to_end_task_and_generation() -> bool:
     """build_work -> task.run() (synchronous) -> generate over memory layers."""
     from ..workbench.depth_service import DepthSourceConfig
@@ -464,6 +540,8 @@ def run_all() -> list:
         test_section_style_has_no_cartographic_offset(),
         test_canvas_items_close_without_qobject_api(),
         test_existing_plan_file_open_is_non_destructive(),
+        test_workbench_path_recovers_after_project_move(),
+        test_reopened_plan_matches_unique_rpl_snapshot(),
         test_end_to_end_task_and_generation(),
         test_profile_sampling_task(),
         test_burial_depth_config_is_manual_only(),

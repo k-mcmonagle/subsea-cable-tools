@@ -63,7 +63,6 @@ from .store import (
     WorkbenchReadOnlyError,
     WorkbenchStore,
     default_project_gpkg_path,
-    project_gpkg_path,
     set_project_gpkg_path,
 )
 
@@ -287,9 +286,13 @@ class RplManagerPanel(QWidget):
 
     # ------------------------------------------------------------- store --
     def _open_store(self):
-        path = project_gpkg_path()
-        if not path:
-            path = default_project_gpkg_path()
+        # The saved entry is often an absolute path and may be stale after a
+        # project is moved to another computer/profile. Use the same
+        # project-side recovery as layer restoration before falling back to a
+        # new default registry.
+        from .project_layers import discover_gpkg_path
+
+        path = discover_gpkg_path() or default_project_gpkg_path()
         self.store = WorkbenchStore(path)
         if self.store.exists():
             set_project_gpkg_path(path)

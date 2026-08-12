@@ -60,6 +60,7 @@ from ..qgis_compat import (
     WINDOW_HINT_TITLE,
     WINDOW_TYPE_WINDOW,
 )
+from ..workbench import project_layers as wb_project_layers
 from ..workbench import store as wb_store_module
 from ..workbench.store import WorkbenchStore
 from . import analysis_task, generation, map_layers, schema
@@ -274,15 +275,75 @@ class BurialPlannerDock(QDockWidget):
         self.refresh_plans()
         return True
 
-    def workbench_store(self) -> Optional[WorkbenchStore]:
-        """Read-only access to the project's Workbench registry, if present."""
+    def workbench_store(self, plan_hint: Optional[Dict] = None
+                        ) -> Optional[WorkbenchStore]:
+        """Resolve the Workbench registry after project/profile relocation.
+
+        Prefer a registry containing the plan's exact RPL UUID, then a unique
+        name+revision match, then the normal project/default Workbench path.
+        """
         try:
-            path = wb_store_module.project_gpkg_path() \
-                or wb_store_module.default_project_gpkg_path()
-            if not path:
+            plan = plan_hint or getattr(getattr(self, "model", None), "plan", {})
+            configured = wb_store_module.project_gpkg_path()
+            discovered = wb_project_layers.discover_gpkg_path()
+            default = wb_store_module.default_project_gpkg_path()
+            snapshot = str(plan.get("rpl_gpkg_path") or "").split("|")[0]
+            project_file = QgsProject.instance().fileName()
+            folders = [
+                os.path.dirname(project_file) if project_file else "",
+                os.path.dirname(getattr(getattr(self, "store", None),
+                                        "gpkg_path", "")),
+            ]
+            candidates = [discovered, configured, default, snapshot]
+            for original in (configured, snapshot):
+                if not original:
+                    continue
+                basename = os.path.basename(original)
+                candidates.extend(os.path.join(folder, basename)
+                                  for folder in folders if folder)
+
+            wanted_id = str(plan.get("rpl_id") or "")
+            wanted_name = str(plan.get("rpl_name") or "").strip().casefold()
+            wanted_revision = str(plan.get("rpl_revision") or "").strip().casefold()
+            valid = []
+            seen = set()
+            discovered_norm = (os.path.normcase(os.path.abspath(discovered))
+                               if discovered else "")
+            for path in candidates:
+                if not path:
+                    continue
+                normal = os.path.normcase(os.path.abspath(path))
+                if normal in seen:
+                    continue
+                seen.add(normal)
+                store = WorkbenchStore(path)
+                if not store.exists():
+                    continue
+                try:
+                    rpls = store.list_rpls()
+                except Exception:
+                    continue
+                score = 5 if normal == discovered_norm else 0
+                if wanted_id and any(str(row.get("rpl_id") or "") == wanted_id
+                                     for row in rpls):
+                    score += 100
+                elif wanted_name:
+                    matches = [
+                        row for row in rpls
+                        if str(row.get("name") or "").strip().casefold() == wanted_name
+                        and (not wanted_revision or
+                             str(row.get("rev_label") or "").strip().casefold()
+                             == wanted_revision)
+                    ]
+                    if len(matches) == 1:
+                        score += 50
+                valid.append((score, store))
+            if not valid:
                 return None
-            store = WorkbenchStore(path)
-            return store if store.exists() else None
+            _score, chosen = max(valid, key=lambda item: item[0])
+            if configured != chosen.gpkg_path:
+                wb_store_module.set_project_gpkg_path(chosen.gpkg_path)
+            return chosen
         except Exception:
             return None
 
@@ -345,6 +406,8 @@ class BurialPlannerDock(QDockWidget):
             return
         plan_id = self.plan_combo.currentData() or ""
         if plan_id and plan_id != self.model.plan_id:
+            plan_hint = self.store.get_plan(plan_id) or {}
+            self.model.workbench_store = self.workbench_store(plan_hint)
             self.model.load_plan(plan_id)
             map_layers.ensure_plan_layers(QgsProject.instance(),
                                           self.store.gpkg_path, self.model.plan)
