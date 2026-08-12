@@ -9,12 +9,14 @@ RPL revisions.
 
 from __future__ import annotations
 
+import os
 from typing import Dict, Optional
 
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QBrush, QColor
 from qgis.PyQt.QtWidgets import (
     QDockWidget,
+    QFileDialog,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -34,6 +36,7 @@ from .assembly_manager_dock import AssemblyManagerPanel
 from .assessment_panel import AssessmentPanel
 from .rpl_manager_dock import RplManagerPanel
 from . import schema
+from .store import WorkbenchStore
 
 KIND_ASSEMBLY = "assembly"
 KIND_RPL = "rpl"
@@ -70,6 +73,20 @@ class WorkbenchDock(QDockWidget):
 
         left = QWidget()
         left_layout = QVBoxLayout(left)
+
+        file_row = QHBoxLayout()
+        file_row.addWidget(QLabel("Workbench file:"))
+        self.store_label = QLabel("Not connected")
+        self.store_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        file_row.addWidget(self.store_label, 1)
+        store_btn = QPushButton("File...")
+        store_menu = QMenu(store_btn)
+        store_menu.addAction("Open existing Workbench...", self._open_existing_workbench)
+        store_menu.addAction("Create new Workbench...", self._create_new_workbench)
+        store_btn.setMenu(store_menu)
+        file_row.addWidget(store_btn)
+        left_layout.addLayout(file_row)
+
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Workbench", "Detail"])
         self.tree.setColumnWidth(0, 240)
@@ -357,12 +374,157 @@ class WorkbenchDock(QDockWidget):
             store.migrate()
         return store
 
+    def _update_store_label(self, store):
+        if store is None or not store.exists():
+            self.store_label.setText("Not connected")
+            self.store_label.setToolTip(
+                "No Workbench registry was found. Use File to open an existing GeoPackage."
+            )
+            return
+        try:
+            count = len(store.list_rpls())
+        except Exception:
+            count = 0
+        suffix = "RPL" if count == 1 else "RPLs"
+        self.store_label.setText(f"{os.path.basename(store.gpkg_path)} ({count} {suffix})")
+        self.store_label.setToolTip(os.path.abspath(store.gpkg_path))
+
+    def _workbench_dialog_folder(self) -> str:
+        store = self.rpl_panel.store
+        if store is not None and store.gpkg_path:
+            return os.path.dirname(os.path.abspath(store.gpkg_path))
+        project_file = QgsProject.instance().fileName() or ""
+        return os.path.dirname(os.path.abspath(project_file)) if project_file else ""
+
+    def _open_existing_workbench(self):
+        if not self._can_switch_workbench():
+            return
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Open existing Cable Route Workbench",
+            self._workbench_dialog_folder(),
+            "GeoPackage (*.gpkg);;All files (*.*)",
+        )
+        if not path:
+            return
+        self._activate_workbench(path)
+
+    def _create_new_workbench(self):
+        if not self._can_switch_workbench():
+            return
+        path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Create Cable Route Workbench",
+            self._workbench_dialog_folder(),
+            "GeoPackage (*.gpkg)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".gpkg"):
+            path += ".gpkg"
+        if os.path.exists(path):
+            QMessageBox.warning(
+                self,
+                "Create Workbench",
+                "That file already exists. Use 'Open existing Workbench...' to open it, "
+                "or choose a new filename.",
+            )
+            return
+        try:
+            store = self._prepare_workbench(path, create=True)
+        except Exception as exc:
+            QMessageBox.warning(self, "Create Workbench", f"Could not create the Workbench:\n{exc}")
+            return
+        self._switch_workbench(store)
+
+    @staticmethod
+    def _prepare_workbench(path: str, create: bool = False):
+        """Validate before migration so an unrelated GeoPackage is untouched."""
+        store = WorkbenchStore(os.path.abspath(path))
+        if create:
+            store.ensure_created()
+        elif not store.exists():
+            raise ValueError(
+                "This GeoPackage is not a Cable Route Workbench registry. "
+                "Choose the Workbench file containing its registry tables, not an exported layer."
+            )
+        store.migrate()
+        return store
+
+    def _activate_workbench(self, path: str):
+        if not self._can_switch_workbench():
+            return False
+        try:
+            store = self._prepare_workbench(path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Open Workbench", str(exc))
+            return False
+        return self._switch_workbench(store)
+
+    def _can_switch_workbench(self) -> bool:
+        if self.rpl_panel.sync is None or not self.rpl_panel.sync.is_dirty():
+            return True
+        QMessageBox.information(
+            self,
+            "Open Workbench",
+            "Save or discard the open RPL edits before switching Workbench files.",
+        )
+        return False
+
+    def _switch_workbench(self, store) -> bool:
+        if not self._can_switch_workbench():
+            return False
+
+        old_store = self.rpl_panel.store
+        old_path = old_store.gpkg_path if old_store is not None else ""
+        new_path = store.gpkg_path
+
+        # Remove only layers registered by the old Workbench, and mute the
+        # normal layer-removal synchroniser so switching files never deletes
+        # registry records.
+        if old_store is not None and old_store.exists() \
+                and os.path.normcase(os.path.abspath(old_path)) != os.path.normcase(os.path.abspath(new_path)):
+            old_names = set()
+            for rpl in old_store.list_rpls():
+                old_names.update(
+                    name for name in (rpl.get("points_layer"), rpl.get("lines_layer")) if name
+                )
+            for fit in old_store.list_fits():
+                old_names.update(self._fit_project_layer_names(old_store, fit))
+            old_names.update(
+                row.get("ranges_layer") for row in old_store.list_assessments()
+                if row.get("ranges_layer")
+            )
+            self._remove_project_layers(old_names)
+
+        from .project_layers import restore_workbench_layers
+        from .store import set_project_gpkg_path
+
+        set_project_gpkg_path(new_path)
+        self.rpl_panel.store = store
+        if self.rpl_panel.edit_btn.isChecked():
+            self.rpl_panel.edit_btn.setChecked(False)
+        self.rpl_panel._on_rpl_selected(None)
+
+        self.assembly_panel.store = store
+        self.assembly_panel.set_fit_context(None)
+        self.assembly_panel._on_assembly_selected(None)
+        self.assessment_panel.set_store(store)
+        self.assessment_panel.assessment = None
+        self.assessment_panel.rpl_id = None
+        self.stack.setCurrentWidget(self.placeholder)
+
+        restore_workbench_layers(QgsProject.instance())
+        self.refresh_tree()
+        return True
+
     def refresh_tree(self):
         current = self._current_ref()
         self.tree.blockSignals(True)
         self.tree.clear()
 
         store = self._store()
+        self._update_store_label(store)
         library_root = QTreeWidgetItem(["Assembly Library", ""])
         library_root.setData(0, Qt.ItemDataRole.UserRole, (KIND_GROUP, GROUP_LIBRARY))
 

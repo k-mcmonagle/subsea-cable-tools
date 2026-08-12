@@ -134,16 +134,59 @@ def ensure_rpl_layers(project: Optional[QgsProject], gpkg_path: str, rpl_row: Di
 
 # -- project-open restore ----------------------------------------------------
 def discover_gpkg_path(project: Optional[QgsProject] = None) -> Optional[str]:
-    """The project's workbench gpkg: stored entry, or the file beside the
-    project if one exists (covers projects saved before the entry was written)."""
+    """Find the project's existing Workbench registry without creating one.
+
+    Besides the saved entry and conventional filename, recover a registry
+    moved with the QGIS project.  If there is exactly one valid Workbench
+    GeoPackage beside the project we can select it unambiguously; if there are
+    several, leave the choice to the Workbench's *Open existing* action.
+    """
     project = project or QgsProject.instance()
     path = project_gpkg_path(project)
-    if path and os.path.exists(path):
+    if _is_workbench_gpkg(path):
         return path
+
+    project_file = project.fileName() or ""
+    project_folder = os.path.dirname(os.path.abspath(project_file)) if project_file else ""
+
+    # Absolute project entries commonly go stale when a project folder is
+    # copied to another computer.  First try the same basename beside the
+    # newly opened project, which remains deterministic even if the folder
+    # contains several registries.
+    if path and project_folder:
+        relocated = os.path.join(project_folder, os.path.basename(path))
+        if _is_workbench_gpkg(relocated):
+            return relocated
+
     fallback = default_project_gpkg_path(project)
-    if fallback and os.path.exists(fallback):
+    if _is_workbench_gpkg(fallback):
         return fallback
+
+    if project_folder and os.path.isdir(project_folder):
+        candidates = []
+        try:
+            names = os.listdir(project_folder)
+        except OSError:
+            names = []
+        for name in names:
+            lowered = name.lower()
+            if not lowered.endswith(".gpkg") or ".bak.gpkg" in lowered:
+                continue
+            candidate = os.path.join(project_folder, name)
+            if _is_workbench_gpkg(candidate):
+                candidates.append(candidate)
+        if len(candidates) == 1:
+            return candidates[0]
     return None
+
+
+def _is_workbench_gpkg(path: Optional[str]) -> bool:
+    if not path:
+        return False
+    try:
+        return WorkbenchStore(path).exists()
+    except Exception:
+        return False
 
 
 def restore_workbench_layers(project: Optional[QgsProject] = None) -> int:

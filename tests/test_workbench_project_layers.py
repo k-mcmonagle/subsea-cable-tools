@@ -18,7 +18,7 @@ from qgis.core import QgsProject
 
 from ..qgis_compat import WKB_LINESTRING, WKB_POINT
 from ..workbench import layer_style, project_layers, schema
-from ..workbench.store import WorkbenchStore, set_project_gpkg_path
+from ..workbench.store import WorkbenchStore, project_gpkg_path, set_project_gpkg_path
 from ..processing.cable_lay_parsers import WKT_KEY
 
 
@@ -136,6 +136,78 @@ def test_restore_completes_half_present_rpl() -> bool:
     return _result("restore completes half-present RPL", ok)
 
 
+def test_discovers_unique_custom_named_registry() -> bool:
+    project = QgsProject.instance()
+    project.clear()
+    folder = tempfile.mkdtemp(prefix="wb_discovery_test_")
+    project.setFileName(os.path.join(folder, "route_project.qgz"))
+    store = WorkbenchStore(os.path.join(folder, "client_route_registry.gpkg"))
+    store.ensure_created()
+    # Simulate an absolute entry left behind after moving from another PC.
+    set_project_gpkg_path(os.path.join(folder, "missing", "old_workbench.gpkg"), project)
+
+    found = project_layers.discover_gpkg_path(project)
+    ok = os.path.normcase(os.path.abspath(found or "")) == os.path.normcase(
+        os.path.abspath(store.gpkg_path)
+    )
+    project.clear()
+    return _result("discover unique custom-named Workbench", ok, found or "not found")
+
+
+def test_discovery_does_not_guess_between_registries() -> bool:
+    project = QgsProject.instance()
+    project.clear()
+    folder = tempfile.mkdtemp(prefix="wb_discovery_ambiguous_test_")
+    project.setFileName(os.path.join(folder, "route_project.qgz"))
+    WorkbenchStore(os.path.join(folder, "route_a.gpkg")).ensure_created()
+    WorkbenchStore(os.path.join(folder, "route_b.gpkg")).ensure_created()
+    set_project_gpkg_path(os.path.join(folder, "missing.gpkg"), project)
+
+    found = project_layers.discover_gpkg_path(project)
+    ok = found is None
+    project.clear()
+    return _result("ambiguous Workbench discovery requires user choice", ok, str(found))
+
+
+def test_open_validation_does_not_modify_unrelated_gpkg() -> bool:
+    from ..workbench.workbench_dock import WorkbenchDock
+
+    folder = tempfile.mkdtemp(prefix="wb_open_validation_test_")
+    path = os.path.join(folder, "ordinary.gpkg")
+    # A missing path is equally important: validation must not create it.
+    try:
+        WorkbenchDock._prepare_workbench(path)
+        rejected = False
+    except ValueError:
+        rejected = True
+    ok = rejected and not os.path.exists(path)
+    return _result("Open Workbench validates without modifying selection", ok)
+
+
+def test_workbench_dock_shows_and_switches_registry() -> bool:
+    from ..workbench.workbench_dock import WorkbenchDock
+
+    project = QgsProject.instance()
+    project.clear()
+    first, _rpl = _store_with_rpl()
+    second_folder = tempfile.mkdtemp(prefix="wb_switch_test_")
+    second = WorkbenchStore(os.path.join(second_folder, "second_registry.gpkg"))
+    second.ensure_created()
+    set_project_gpkg_path(first.gpkg_path, project)
+
+    dock = WorkbenchDock(None)
+    ok = os.path.basename(first.gpkg_path) in dock.store_label.text()
+    ok = ok and "1 RPL" in dock.store_label.text()
+    ok = ok and dock._activate_workbench(second.gpkg_path)
+    ok = ok and project_gpkg_path(project) == os.path.abspath(second.gpkg_path)
+    ok = ok and os.path.basename(second.gpkg_path) in dock.store_label.text()
+    ok = ok and "0 RPLs" in dock.store_label.text()
+    dock.shutdown()
+    dock.deleteLater()
+    project.clear()
+    return _result("Workbench dock displays and switches active registry", ok)
+
+
 def test_teardown_guard() -> bool:
     from ..workbench.workbench_dock import WorkbenchDock
 
@@ -158,6 +230,10 @@ def run_all():
         test_ensure_layer_add_style_dedupe(),
         test_restore_after_reopen(),
         test_restore_completes_half_present_rpl(),
+        test_discovers_unique_custom_named_registry(),
+        test_discovery_does_not_guess_between_registries(),
+        test_open_validation_does_not_modify_unrelated_gpkg(),
+        test_workbench_dock_shows_and_switches_registry(),
         test_teardown_guard(),
     ]
 
