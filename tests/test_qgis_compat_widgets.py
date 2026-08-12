@@ -32,7 +32,8 @@ def test_burial_inputs_construct_and_switch_source_type():
 
     widget = InputsTab(_Model(), lambda: None)
     assert widget.contour_combo2 is not None
-    widget.inherit_check.setChecked(False)
+    assert not hasattr(widget, "inherit_check")
+    assert widget.search_radius.minimum() > 0
     widget.manual_source_combo.setCurrentIndex(
         widget.manual_source_combo.findData(2))
     assert widget.contour_combo.isEnabled()

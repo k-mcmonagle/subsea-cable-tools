@@ -20,6 +20,8 @@ from qgis.core import (
 )
 
 from ..burial import analysis_task, generation
+from ..burial import schema as burial_schema
+from ..burial.plan_model import PlanModel
 from ..kp_geo_utils import RouteFrame
 from ..kp_range_utils import make_distance_area
 from ..workbench import rules_engine as eng
@@ -291,6 +293,26 @@ def test_profile_sampling_task() -> bool:
     return _result("background profile task samples scope with progress", ok)
 
 
+def test_burial_depth_config_is_manual_only() -> bool:
+    class _Workbench:
+        def rpl_depth_config(self, _rpl_id):
+            return {"mode": 1, "raster_layer_ids": ["workbench-raster"]}
+
+    model = PlanModel(object(), _Workbench())
+    model.plan = {"rpl_id": "rpl-1"}
+    ok = not model.depth_config().is_configured()
+    model.inputs = [{
+        "role": burial_schema.INPUT_ROLE_BATHY,
+        "config_json": json.dumps({
+            "mode": 2,
+            "contour_layers": [{"layer_id": "manual", "depth_field": "z"}],
+        }),
+    }]
+    config = model.depth_config()
+    ok = ok and config.mode == 2 and len(config.contour_layers) == 1
+    return _result("Burial Planner bathymetry is manual-only", ok)
+
+
 def run_all() -> list:
     return [
         test_scoped_sampler_matches_full(),
@@ -301,6 +323,7 @@ def run_all() -> list:
         test_route_frame_builder(),
         test_end_to_end_task_and_generation(),
         test_profile_sampling_task(),
+        test_burial_depth_config_is_manual_only(),
     ]
 
 

@@ -497,7 +497,7 @@ class BurialPlannerDock(QDockWidget):
         config = self.model.depth_config()
         if not config.is_configured():
             self.profile_status.setText(
-                "No bathymetry configured. Choose a manual source or configure the Workbench RPL.")
+                "No manual bathymetry configured. Choose a raster or contour source on Inputs.")
             return
         if scope.length_km <= 0:
             self.profile_status.setText("Set a non-zero scope to display the bathymetry profile.")
@@ -670,8 +670,7 @@ class BurialPlannerDock(QDockWidget):
                 self.model.close_plan()
         else:
             # The Workbench may have been created or changed after this dock
-            # opened.  Always refresh the read-only handle so inherited depth
-            # sources and revision metadata resolve immediately.
+            # opened. Always refresh the read-only route/revision handle.
             self.model.workbench_store = self.workbench_store()
         self.refresh_plans(self.model.plan_id)
 

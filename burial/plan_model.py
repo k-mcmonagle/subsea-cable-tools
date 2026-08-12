@@ -203,19 +203,18 @@ class PlanModel(QObject):
 
     # -- depth ---------------------------------------------------------------
     def depth_config(self) -> DepthSourceConfig:
+        """Return only the Burial Planner's explicitly registered source.
+
+        Workbench RPL depth sources are intentionally not inherited. Their
+        settings may suit occasional point edits but are not necessarily
+        appropriate for a whole-plan longitudinal profile.
+        """
         for row in self.inputs:
             if row.get("role") == schema.INPUT_ROLE_BATHY:
                 try:
                     return DepthSourceConfig(json.loads(row.get("config_json") or "{}"))
                 except (ValueError, TypeError):
                     return DepthSourceConfig({})
-        # Inherit the RPL's Workbench depth config when none is registered.
-        rpl_id = self.plan.get("rpl_id") or ""
-        if rpl_id and self.workbench_store is not None:
-            try:
-                return DepthSourceConfig(self.workbench_store.rpl_depth_config(rpl_id))
-            except Exception:
-                pass
         return DepthSourceConfig({})
 
     def depth_service(self) -> DepthService:

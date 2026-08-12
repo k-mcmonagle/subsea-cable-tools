@@ -16,7 +16,6 @@ from typing import Dict, List, Optional
 from qgis.core import QgsProject
 from qgis.gui import QgsFieldComboBox, QgsMapLayerComboBox
 from qgis.PyQt.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -235,10 +234,11 @@ class InputsTab(QWidget):
         # -- bathymetry -------------------------------------------------------
         bathy_box = QGroupBox("Bathymetry")
         bathy_form = QFormLayout(bathy_box)
-        self.inherit_check = QCheckBox("Inherit from the RPL's Workbench depth sources")
-        self.inherit_check.setChecked(True)
-        self.inherit_check.toggled.connect(self._sync_bathy_enabled)
-        bathy_form.addRow(self.inherit_check)
+        manual_note = QLabel(
+            "Select bathymetry specifically for this burial plan. Workbench "
+            "RPL depth sources are not inherited.")
+        manual_note.setWordWrap(True)
+        bathy_form.addRow(manual_note)
         self.bathy_summary = QLabel("")
         self.bathy_summary.setWordWrap(True)
         bathy_form.addRow("Active source:", self.bathy_summary)
@@ -267,7 +267,7 @@ class InputsTab(QWidget):
         self.contour_field2 = QgsFieldComboBox()
         self.contour_combo2.layerChanged.connect(self.contour_field2.setLayer)
         self.search_radius = QDoubleSpinBox()
-        self.search_radius.setRange(0.0, 100000.0)
+        self.search_radius.setRange(1.0, 100000.0)
         self.search_radius.setSuffix(" m")
         self.search_radius.setValue(500.0)
         bathy_form.addRow("Manual source type:", self.manual_source_combo)
@@ -442,30 +442,18 @@ class InputsTab(QWidget):
         return None
 
     def _sync_bathy_enabled(self, *_args) -> None:
-        manual = not self.inherit_check.isChecked()
         source_mode = int(self.manual_source_combo.currentData() or 1)
-        self.manual_source_combo.setEnabled(manual)
         for widget in (self.raster_combo, self.raster_band):
-            widget.setEnabled(manual and source_mode == 1)
+            widget.setEnabled(source_mode == 1)
         for widget in (self.contour_combo, self.contour_field,
                        self.contour_combo2, self.contour_field2,
                        self.search_radius):
-            widget.setEnabled(manual and source_mode == 2)
+            widget.setEnabled(source_mode == 2)
 
     def _load_bathy_config(self) -> None:
         row = self._bathy_row()
-        self.inherit_check.setChecked(row is None)
         if row is None:
-            config = self.model.depth_config()
-            rasters = len(config.raster_layer_ids)
-            contours = len(config.contour_layers)
-            if config.is_configured():
-                self.bathy_summary.setText(
-                    f"Inherited from Workbench: {rasters} raster layer(s), "
-                    f"{contours} contour layer(s).")
-            else:
-                self.bathy_summary.setText(
-                    "Workbench inheritance is selected, but this RPL has no depth sources configured.")
+            self.bathy_summary.setText("No manual bathymetry source configured.")
             self._sync_bathy_enabled()
             return
         try:
@@ -508,27 +496,6 @@ class InputsTab(QWidget):
 
     def _apply_bathy(self) -> None:
         existing = self._bathy_row()
-        if self.inherit_check.isChecked():
-            workbench_store = self.workbench_store_fn()
-            if workbench_store is not None:
-                self.model.workbench_store = workbench_store
-            if existing is not None:
-                if not self.model.delete_input(existing.get("input_id")):
-                    return
-            else:
-                # No registry row changes in the already-inherited case, but
-                # Apply still means re-resolve the Workbench config and rerun
-                # the asynchronous profile (e.g. after editing depth sources).
-                self.model.inputsChanged.emit()
-            config = self.model.depth_config()
-            if config.is_configured():
-                self.apply_status.setText(
-                    "Workbench bathymetry inherited. Profile refresh started in the background.")
-            else:
-                self.apply_status.setText(
-                    "Inheritance applied, but the selected Workbench RPL has no configured depth sources.")
-            self._load_bathy_config()
-            return
         source_mode = int(self.manual_source_combo.currentData() or 1)
         config: Dict = {"mode": source_mode, "raster_layer_ids": [], "raster_band": 1,
                         "contour_layers": [], "contour_search_radius_m": 0.0,
@@ -558,8 +525,7 @@ class InputsTab(QWidget):
             config["contour_search_radius_m"] = self.search_radius.value()
         if not config["raster_layer_ids"] and not config["contour_layers"]:
             QMessageBox.warning(self, "Burial Planner",
-                                "Pick a raster or at least one contour layer, or inherit "
-                                "from the Workbench.")
+                                "Pick a raster or at least one contour layer.")
             return
         primary_contour = contour or contour2
         row = dict(existing or {})
