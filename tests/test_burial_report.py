@@ -129,7 +129,7 @@ def test_report_content() -> bool:
         # rules with source references and condition summaries
         "Guide v3 §2.1" in html_text,
         "depth &gt; 1500.0 m" in html_text,
-        "extended 100.0 m" in html_text,
+        "extended 100/100 m (before/after)" in html_text,
         "disabled" in html_text,
         # provenance + log + footer
         "gen12345" in html_text,

@@ -150,6 +150,51 @@ def test_cancellation_raises() -> bool:
     return _result("cooperative cancellation raises; default path unchanged", ok)
 
 
+def test_polygon_route_corridor_buffer() -> bool:
+    """A polygon near (but not crossing) the route fires only with a
+    route-corridor buffer — fixed metres or a water-depth multiple."""
+    route, da = _route()
+    sampler = ri.RouteSampler.from_route(route, da, 100.0)
+    layer = QgsVectorLayer("Polygon?crs=EPSG:4326&field=S:string", "soils", "memory")
+    feat = QgsFeature(layer.fields())
+    # ~70 m east of the route at its nearest edge.
+    feat.setGeometry(QgsGeometry.fromWkt(
+        "POLYGON((0.001 50.05, 0.01 50.05, 0.01 50.1, 0.001 50.1, 0.001 50.05))"))
+    feat.setAttributes(["ROCK"])
+    layer.dataProvider().addFeature(feat)
+    index, feats = ri._load_features_wgs84(layer, QgsProject.instance())
+    base = {"attribute": "S", "match_values": ["ROCK"]}
+
+    centreline = ri.polygon_class_intervals(sampler, index, feats, dict(base))
+    ok = eng.interval_length_km(centreline) < 1e-9
+
+    fixed = ri.polygon_class_intervals(
+        sampler, index, feats,
+        dict(base, route_buffer_mode="fixed", route_buffer_m=200.0))
+    ok = ok and eng.interval_length_km(fixed) > 1.0
+    narrow = ri.polygon_class_intervals(
+        sampler, index, feats,
+        dict(base, route_buffer_mode="fixed", route_buffer_m=30.0))
+    ok = ok and eng.interval_length_km(narrow) < 1e-9
+
+    wd_wide = ri.polygon_class_intervals(
+        sampler, index, feats,
+        dict(base, route_buffer_mode="wd", route_buffer_wd=1.0),
+        depth_at=lambda _kp: 100.0)
+    ok = ok and eng.interval_length_km(wd_wide) > 1.0
+    wd_narrow = ri.polygon_class_intervals(
+        sampler, index, feats,
+        dict(base, route_buffer_mode="wd", route_buffer_wd=0.5),
+        depth_at=lambda _kp: 100.0)
+    ok = ok and eng.interval_length_km(wd_narrow) < 1e-9
+    # No depth lookup -> degrades to the centreline test, never crashes.
+    wd_no_depth = ri.polygon_class_intervals(
+        sampler, index, feats,
+        dict(base, route_buffer_mode="wd", route_buffer_wd=1.0))
+    ok = ok and eng.interval_length_km(wd_no_depth) < 1e-9
+    return _result("polygon route corridor: fixed and ×WD buffers", ok)
+
+
 def test_direction_maps_slope_limits() -> bool:
     rule = {"rule_id": "r", "config_json": json.dumps({
         "profile": "slope", "slope_signed": True,
@@ -890,6 +935,95 @@ def test_workflow_settings_are_separated() -> bool:
         "workflow controls: profile / exclusions / candidate generation", ok)
 
 
+def test_rule_editor_extension_and_corridor() -> bool:
+    """Extension before/after (fixed / ×WD) and the polygon route corridor
+    round-trip through the editor dialog; legacy extend_m loads."""
+    from ..burial.tabs.rules_tab import ExcludedSectionsDialog, RuleEditorDialog
+    from ..workbench import schema as wb_schema
+
+    def rule(kind, config):
+        return {"rule_id": "r1", "plan_id": "p", "name": "test", "enabled": 1,
+                "kind": kind, "action": "exclude", "risk_level": 0,
+                "criterion_class": burial_schema.CRITERION_PROJECT,
+                "source_ref": "", "methods_json": "[]",
+                "config_json": json.dumps(config), "notes": ""}
+
+    # Legacy symmetric extend_m loads into both fixed spins.
+    dialog = RuleEditorDialog(
+        rule(wb_schema.RULE_KIND_MANUAL, {"extend_m": 250.0}), [], "plough")
+    ok = abs(dialog.extend_before.value() - 250.0) < 1e-9
+    ok = ok and abs(dialog.extend_after.value() - 250.0) < 1e-9
+    result = json.loads(dialog.result_rule()["config_json"])
+    ok = ok and result.get("extend_mode") == "fixed"
+    ok = ok and result.get("extend_before_m") == 250.0
+    ok = ok and "extend_m" not in result
+    dialog.deleteLater()
+
+    # ×WD extension writes the wd keys only.
+    dialog = RuleEditorDialog(
+        rule(wb_schema.RULE_KIND_MANUAL, {}), [], "plough")
+    dialog.extend_mode_combo.setCurrentIndex(
+        dialog.extend_mode_combo.findData(generation.EXTEND_MODE_WD))
+    dialog.extend_before.setValue(1.0)
+    dialog.extend_after.setValue(1.5)
+    result = json.loads(dialog.result_rule()["config_json"])
+    ok = ok and result.get("extend_mode") == "wd"
+    ok = ok and result.get("extend_before_wd") == 1.0
+    ok = ok and result.get("extend_after_wd") == 1.5
+    ok = ok and "extend_before_m" not in result
+    dialog.deleteLater()
+
+    # Polygon corridor: wd mode round-trips; "centreline only" clears keys.
+    poly_config = {"attribute": "class", "match_values": ["ROCK"],
+                   "route_buffer_mode": "wd", "route_buffer_wd": 0.5}
+    dialog = RuleEditorDialog(
+        rule(wb_schema.RULE_KIND_POLYGON, poly_config), [], "plough")
+    ok = ok and dialog.corridor_combo.currentData() == "wd"
+    ok = ok and abs(dialog.corridor_spin.value() - 0.5) < 1e-9
+    result = json.loads(dialog.result_rule()["config_json"])
+    ok = ok and result.get("route_buffer_wd") == 0.5
+    dialog.corridor_combo.setCurrentIndex(0)
+    result = json.loads(dialog.result_rule()["config_json"])
+    ok = ok and "route_buffer_mode" not in result
+    ok = ok and "route_buffer_wd" not in result
+    dialog.deleteLater()
+
+    # WD-band grid: existing bands populate the table and round-trip; an
+    # added row with values persists; blank rows are dropped.
+    bands_config = {"profile": "slope", "op": ">", "value": 12.0,
+                    "bands": [{"min_wd": 0.0, "max_wd": 500.0, "limit": 10.0},
+                              {"min_wd": 500.0, "limit": 6.0}]}
+    dialog = RuleEditorDialog(
+        rule(wb_schema.RULE_KIND_THRESHOLD, bands_config), [], "plough")
+    ok = ok and dialog.bands_table.rowCount() == 2
+    ok = ok and dialog.bands_table.item(0, 1).text() == "500"
+    dialog._append_band_row({})  # stays blank -> dropped on save
+    result = json.loads(dialog.result_rule()["config_json"])
+    ok = ok and result.get("bands") == bands_config["bands"]
+    # Signed-slope band columns only show for signed slope.
+    ok = ok and dialog.bands_table.isColumnHidden(3)
+    dialog.signed_check.setChecked(True)
+    ok = ok and not dialog.bands_table.isColumnHidden(3)
+    # Clearing every band removes the key.
+    while dialog.bands_table.rowCount():
+        dialog.bands_table.removeRow(0)
+    result = json.loads(dialog.result_rule()["config_json"])
+    ok = ok and "bands" not in result
+    dialog.deleteLater()
+
+    # Excluded-sections dialog rows carry the triggering criteria.
+    verdict = eng.RangeVerdict(2.0, 3.5, eng.STATUS_EXCLUDED, 4,
+                               ["r1", "r2"], "r1")
+    sections = ExcludedSectionsDialog(
+        [verdict], {"r1": "Steep slope", "r2": "Rock"}, object())
+    row = sections._row_values(verdict)
+    ok = ok and row[0] == "2.000" and row[3] == "Excluded"
+    ok = ok and row[4] == "Steep slope" and "Rock" in row[5]
+    sections.deleteLater()
+    return _result("rule editor: extension modes + polygon corridor "
+                   "round-trip; excluded-sections rows", ok)
+
+
 def test_burial_depth_config_is_manual_only() -> bool:
     class _Workbench:
         def rpl_depth_config(self, _rpl_id):
@@ -916,6 +1050,7 @@ def run_all() -> list:
         test_depth_series_gaps_and_threshold(),
         test_buffer_field_override(),
         test_cancellation_raises(),
+        test_polygon_route_corridor_buffer(),
         test_direction_maps_slope_limits(),
         test_contour_slope_uses_route_crossings(),
         test_route_frame_builder(),
@@ -935,6 +1070,7 @@ def run_all() -> list:
         test_local_slope_uses_profile_resolution(),
         test_profile_step_resolution_and_staleness(),
         test_workflow_settings_are_separated(),
+        test_rule_editor_extension_and_corridor(),
         test_burial_depth_config_is_manual_only(),
     ]
 

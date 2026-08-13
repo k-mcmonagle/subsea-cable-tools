@@ -130,6 +130,44 @@ def rule_config(rule_row: Dict) -> Dict:
     return config if isinstance(config, dict) else {}
 
 
+# Exclusion Area extension config. Legacy rules carry a single symmetric
+# ``extend_m``; current rules carry a mode plus per-side values, where
+# "before"/"after" follow the direction of installation (like the Constraint
+# Influence Zone) and mode "wd" scales each side by the water depth at the
+# footprint boundary.
+EXTEND_MODE_FIXED = "fixed"
+EXTEND_MODE_WD = "wd"
+EXTENSION_CONFIG_KEYS = (
+    "extend_m", "extend_mode", "extend_before_m", "extend_after_m",
+    "extend_before_wd", "extend_after_wd",
+)
+
+
+def extension_config(config: Dict) -> Dict:
+    """Normalised extension settings: {mode, before, after}.
+
+    ``before``/``after`` are metres for mode "fixed" and water-depth
+    multiples for mode "wd". Legacy symmetric ``extend_m`` maps to fixed
+    before = after = extend_m.
+    """
+    mode = (config.get("extend_mode") or "").strip().lower()
+    if mode == EXTEND_MODE_WD:
+        return {
+            "mode": EXTEND_MODE_WD,
+            "before": max(0.0, float(config.get("extend_before_wd") or 0.0)),
+            "after": max(0.0, float(config.get("extend_after_wd") or 0.0)),
+        }
+    legacy = max(0.0, float(config.get("extend_m") or 0.0))
+    if mode == EXTEND_MODE_FIXED or "extend_before_m" in config \
+            or "extend_after_m" in config:
+        return {
+            "mode": EXTEND_MODE_FIXED,
+            "before": max(0.0, float(config.get("extend_before_m", legacy) or 0.0)),
+            "after": max(0.0, float(config.get("extend_after_m", legacy) or 0.0)),
+        }
+    return {"mode": EXTEND_MODE_FIXED, "before": legacy, "after": legacy}
+
+
 def canonical_json(obj) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -146,7 +184,8 @@ def rule_cache_key(rule_row: Dict, input_fingerprint: str, scope: Interval,
     config = rule_config(rule_row)
     acquisition_config = {
         k: v for k, v in config.items()
-        if k not in ("extend_m", "influence_before_m", "influence_after_m")
+        if k not in EXTENSION_CONFIG_KEYS
+        and k not in ("influence_before_m", "influence_after_m")
     }
     parts = {
         "kind": rule_row.get("kind") or "",
@@ -276,9 +315,59 @@ def _screening_as_risk(rule_row: Dict) -> Dict:
     return rule_row
 
 
-def resolve_stack(params: GenParams, acquisitions: Sequence[RuleAcquisition]
+def _extend_footprint(footprint: List[Interval], config: Dict, direction: int,
+                      scope: Interval,
+                      depth_at: Optional[Callable[[float], Optional[float]]],
+                      warn: Callable[[str], None], rule_name: str
+                      ) -> List[Interval]:
+    """Apply the rule's Exclusion Area extension to its footprint.
+
+    "Before"/"after" follow the direction of installation; mode "wd" scales
+    each side by the water depth at the footprint boundary (falls back to no
+    extension, with a warning, when no depth is available there).
+    """
+    ext = extension_config(config)
+    if ext["before"] <= 0 and ext["after"] <= 0:
+        return footprint
+    # Map travel direction onto the low/high-KP sides.
+    if int(direction) >= 0:
+        low, high = ext["before"], ext["after"]
+    else:
+        low, high = ext["after"], ext["before"]
+    if ext["mode"] == EXTEND_MODE_WD:
+        if depth_at is None:
+            warn(f"Rule '{rule_name}': water-depth-based extension needs a "
+                 "bathymetry profile — extension not applied.")
+            return footprint
+        missing = [False]
+
+        def side_km_at(factor: float):
+            def at(kp: float) -> float:
+                depth = depth_at(kp)
+                if depth is None:
+                    missing[0] = True
+                    return 0.0
+                return factor * abs(float(depth)) / 1000.0
+            return at
+
+        extended = eng.dilate_intervals_variable(
+            footprint, side_km_at(low), side_km_at(high), scope)
+        if missing[0]:
+            warn(f"Rule '{rule_name}': no depth at one or more footprint "
+                 "boundaries — those sides were not extended.")
+        return extended
+    return eng.dilate_intervals(footprint, low / 1000.0, high / 1000.0, scope)
+
+
+def resolve_stack(params: GenParams, acquisitions: Sequence[RuleAcquisition],
+                  depth_at: Optional[Callable[[float], Optional[float]]] = None
                   ) -> Tuple[eng.AssessmentResult, List[LabelledInterval], List[Interval], List[str]]:
-    """Resolve the acquired stack: verdicts + influence zones + no-data + warnings."""
+    """Resolve the acquired stack: verdicts + influence zones + no-data + warnings.
+
+    ``depth_at(kp) -> depth magnitude | None`` enables water-depth-scaled
+    Exclusion Area extensions; without it those rules warn and stay
+    unextended.
+    """
     scope = params.scope
     warnings: List[str] = []
     hits: List[RuleHit] = []
@@ -293,9 +382,9 @@ def resolve_stack(params: GenParams, acquisitions: Sequence[RuleAcquisition]
         config = rule_config(row)
 
         footprint = eng.clip_intervals(acq.footprint, scope)
-        extend_km = max(0.0, float(config.get("extend_m") or 0.0)) / 1000.0
-        if extend_km > 0:
-            footprint = eng.dilate_intervals(footprint, extend_km, extend_km, scope)
+        footprint = _extend_footprint(footprint, config, params.direction,
+                                      scope, depth_at, warnings.append,
+                                      rule.name)
         hits.append(RuleHit(rule, footprint))
 
         before_km = max(0.0, float(config.get("influence_before_m") or 0.0)) / 1000.0
@@ -448,7 +537,8 @@ def build_sections(merged_events: List[Dict], params: GenParams,
         if prev:
             row["section_id"] = prev.get("section_id") or row["section_id"]
             for col in ("state", "conclusion", "confidence", "notes",
-                        "method", "grade_in_m", "grade_out_m", "target_burial_m"):
+                        "method", "grade_in_m", "grade_out_m",
+                        "target_burial_m", "skip_handling"):
                 if prev.get(col) not in (None, ""):
                     row[col] = prev.get(col)
         return row
@@ -471,6 +561,7 @@ def build_sections(merged_events: List[Dict], params: GenParams,
             "grade_in_m": None,
             "grade_out_m": None,
             "target_burial_m": None,
+            "skip_handling": "",
             "notes": "",
         }
 
@@ -571,6 +662,34 @@ def build_sections(merged_events: List[Dict], params: GenParams,
     return sections
 
 
+def assign_skip_handling(sections: Sequence[Dict], transit_max_km: float,
+                         overwrite: bool = False) -> Tuple[List[Dict], int]:
+    """Assign skip handling to skips by length (user-entered policy).
+
+    Skips no longer than ``transit_max_km`` become mid-water transits;
+    longer skips become recover-to-deck. Only TBC skips are touched unless
+    ``overwrite`` — a handling the engineer already chose is never silently
+    replaced. Burial / insufficient-information sections pass through
+    unchanged. Returns ``(updated_sections, changed_count)``.
+    """
+    threshold = max(0.0, float(transit_max_km or 0.0))
+    updated: List[Dict] = []
+    changed = 0
+    for section in sections:
+        row = dict(section)
+        if row.get("kind") == schema.SECTION_SKIP:
+            current = row.get("skip_handling") or ""
+            if overwrite or not current:
+                value = (schema.SKIP_HANDLING_MIDWATER
+                         if float(row.get("length_km") or 0.0) <= threshold + 1e-9
+                         else schema.SKIP_HANDLING_RECOVER)
+                if value != current:
+                    row["skip_handling"] = value
+                    changed += 1
+        updated.append(row)
+    return updated, changed
+
+
 # ---------------------------------------------------------------------------
 # Client-proposal diff (§5, §12)
 # ---------------------------------------------------------------------------
@@ -626,7 +745,11 @@ def generate(params: GenParams, acquisitions: Sequence[RuleAcquisition],
              previous_sections: Optional[List[Dict]] = None,
              proposal_events: Optional[List[Dict]] = None,
              plan_id: str = "", generation_id: str = "",
-             id_fn: Callable[[], str] = schema.new_id) -> GenerationOutput:
+             id_fn: Callable[[], str] = schema.new_id,
+             depth_at: Optional[Callable[[float], Optional[float]]] = None
+             ) -> GenerationOutput:
+    # ``depth_at`` feeds WD-scaled Exclusion Area extensions at resolution
+    # time; it falls back to ``depth_fn`` (the event-stamping depth source).
     """Run the §12 pipeline over already-acquired rule intervals.
 
     ``predicates`` (per rule_id, True inside the footprint) enable 1 m
@@ -650,7 +773,8 @@ def generate(params: GenParams, acquisitions: Sequence[RuleAcquisition],
         refined.append(RuleAcquisition(acq.rule_row, footprint, acq.nodata, acq.error))
 
     # 3. Resolve the stack.
-    result, influence, nodata, warnings = resolve_stack(params, refined)
+    result, influence, nodata, warnings = resolve_stack(
+        params, refined, depth_at=depth_at or depth_fn)
     out.warnings.extend(warnings)
     verdicts = result.per_method.get(params.method, [])
     out.excluded = [v for v in verdicts if v.status == eng.STATUS_EXCLUDED]

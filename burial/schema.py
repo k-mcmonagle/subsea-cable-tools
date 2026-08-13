@@ -35,7 +35,7 @@ from ..workbench.schema import (  # noqa: F401  (re-exported for the package)
     utc_now_iso,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Registry table names ------------------------------------------------------
 TABLE_META = "bp_meta"
@@ -245,6 +245,20 @@ CONCLUSION_LABELS: Dict[str, str] = {
 
 CONFIDENCE_VALUES: List[str] = ["high", "moderate", "low", "insufficient"]
 
+# How a skip is executed operationally (plough mode): recover the plough to
+# deck, or transit with the plough suspended mid-water. Default "" = TBC.
+SKIP_HANDLING_TBC = ""
+SKIP_HANDLING_RECOVER = "recover_to_deck"
+SKIP_HANDLING_MIDWATER = "midwater_transit"
+SKIP_HANDLING_VALUES: List[str] = [
+    SKIP_HANDLING_TBC, SKIP_HANDLING_RECOVER, SKIP_HANDLING_MIDWATER,
+]
+SKIP_HANDLING_LABELS: Dict[str, str] = {
+    SKIP_HANDLING_TBC: "TBC",
+    SKIP_HANDLING_RECOVER: "Recover to deck",
+    SKIP_HANDLING_MIDWATER: "Mid-water transit",
+}
+
 SECTION_FIELDS: List[FieldSpec] = [
     ("section_id", "str"),
     ("plan_id", "str"),
@@ -263,6 +277,7 @@ SECTION_FIELDS: List[FieldSpec] = [
     ("grade_in_m", "float"),
     ("grade_out_m", "float"),
     ("target_burial_m", "float"),
+    ("skip_handling", "str"),        # "" (TBC) | recover_to_deck | midwater_transit
     ("notes", "str"),
 ]
 
@@ -325,6 +340,7 @@ SECTIONS_LAYER_FIELDS: List[FieldSpec] = [
     ("conclusion", "str"),
     ("confidence", "str"),
     ("reasons", "str"),
+    ("skip_handling", "str"),
     ("notes", "str"),
 ]
 

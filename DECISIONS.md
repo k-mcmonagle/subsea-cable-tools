@@ -142,8 +142,11 @@ section references in brackets.
 - **Rule-set JSON format**: `{"format": "subsea_cable_tools.burial.rule_set",
   "version": 1, "rules": [...bp_rule rows sans plan_id...]}` — the
   organisation-owned parameter-set vehicle (§ hard constraints).
-- **WD-band editor is a JSON field in v1** (validated, tooltip documents the
-  keys) — a grid editor is UI sugar that can come later without schema change.
+- **WD bands edit in a grid** (min WD / max WD / limit, plus down/up-slope
+  limit columns shown only for signed slope); blank cells leave that side
+  open, blank rows are dropped, and the stored `bands` JSON structure is
+  unchanged so existing rules and the engine are untouched. First matching
+  band still wins — row order is the precedence.
 - **Duplicate plan does not copy generations or the change log** — they
   describe the original's history; the copy starts a fresh audit trail with
   `supersedes_id` lineage.
@@ -153,6 +156,31 @@ section references in brackets.
 - **Fallback (non-Workbench) routes** are fingerprinted by normalised source
   path only, so stale detection is weaker there — the Inputs tab notes that
   Workbench registration is recommended.
+- **Exclusion Area extension is per-side and direction-aware** (before =
+  approach, after = departure, like the Constraint Influence Zone); a
+  water-depth-multiple extension evaluates the depth **at the footprint
+  boundary being extended** (not a scan of the extended range) — simple,
+  deterministic, and matches the "1 ×WD stand-off" convention. With no depth
+  available at a boundary that side is left unextended with a visible
+  warning, never silently guessed. Extension keys stay resolution-time
+  (cache-exempt); legacy symmetric `extend_m` is honoured on read and
+  rewritten to the new keys on the next edit.
+- **Polygon route-corridor buffers are acquisition config** (they change
+  where the condition is true), so they participate in the rule cache key —
+  and a ×WD corridor appends the bathymetry fingerprint so depth changes
+  invalidate it. Stations with no depth under a ×WD corridor degrade to the
+  centreline test rather than failing the rule.
+- **The per-rule "Excluded sections" bars show the resolved footprint**
+  (extension included, via the engine's rule-hit clipping) so the tab shows
+  exactly what resolution excludes; raw acquisition remains visible by
+  setting the extension to zero.
+- **`skip_handling` is manual-first with an explicit auto-assign** (TBC /
+  Recover to deck / Mid-water transit, plough vocabulary). *Auto-assign skip
+  handling…* applies a length policy — mid-water transit up to a threshold,
+  recover-to-deck above — but the threshold is user-entered (remembered per
+  machine, recorded in the change log), honouring the no-shipped-engineering-
+  values rule; existing assignments are never replaced unless overwrite is
+  ticked, and the whole assignment is one undoable edit.
 
 ## Cross-check against the acceptance walkthrough (§16)
 

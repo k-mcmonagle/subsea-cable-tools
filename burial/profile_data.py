@@ -73,6 +73,20 @@ class PlanProfile:
         """(kp, depth|None) for every station — no-data gap detection."""
         return list(zip(self.kps, self.depths))
 
+    def depth_at(self, kp: float) -> Optional[float]:
+        """Interpolated depth magnitude at a KP (None outside sampled data).
+
+        The (kp, depth) arrays are cached on first use — the lookup serves
+        per-boundary queries (e.g. water-depth-scaled Exclusion Area
+        extensions) without rescanning hundreds of thousands of stations.
+        """
+        cached = self._slope_cache.get("_depth_xy")
+        if cached is None:
+            cached = _valid_pairs(self.kps, self.depths)
+            self._slope_cache["_depth_xy"] = cached
+        xs, ys = cached
+        return _interp(xs, ys, float(kp))
+
     def slope_series(self, half_window_km: float, direction: int
                      ) -> Tuple[List[Sample], List[Sample], List[Sample]]:
         """(longitudinal, cross, absolute) slope series, memoised."""

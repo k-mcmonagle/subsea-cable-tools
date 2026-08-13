@@ -26,7 +26,8 @@ from . import schema
 EVENT_COLUMNS = ["seq", "event_type", "label", "kp", "lat", "lon", "depth_m",
                  "source", "status", "locked", "notes"]
 SECTION_COLUMNS = ["kind", "start_kp", "end_kp", "length_km", "state",
-                   "conclusion", "confidence", "reasons", "notes"]
+                   "conclusion", "confidence", "skip_handling", "reasons",
+                   "notes"]
 INPUT_COLUMNS = ["role", "layer_name", "layer_source", "originator", "revision",
                  "status", "received_utc", "quality", "notes"]
 
@@ -94,6 +95,8 @@ def sections_csv(plan: Dict, sections: Sequence[Dict], generation_id: str = "") 
             schema.CONCLUSION_LABELS.get(section.get("conclusion") or "",
                                          section.get("conclusion") or ""),
             section.get("confidence") or "",
+            (schema.SKIP_HANDLING_LABELS.get(section.get("skip_handling") or "", "")
+             if section.get("kind") == schema.SECTION_SKIP else ""),
             section.get("reason_json") or "",
             section.get("notes") or "",
         ])

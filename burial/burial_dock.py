@@ -128,6 +128,7 @@ class BurialPlannerDock(QDockWidget):
         self._generate_after_analysis = False
         self._marker = None
         self._band = None
+        self._exclusion_bands: List = []
         self._pick_tool = None
         self._store_recovery_note = ""
 
@@ -236,6 +237,7 @@ class BurialPlannerDock(QDockWidget):
 
         self.model.planChanged.connect(self._refresh_strip)
         self.model.planChanged.connect(self._refresh_profile)
+        self.model.planChanged.connect(self.clear_exclusion_preview)
         self.model.eventsChanged.connect(self._refresh_profile_events)
         self.model.sectionsChanged.connect(self._refresh_profile_sections)
         self.model.inputsChanged.connect(self._refresh_profile)
@@ -674,19 +676,21 @@ class BurialPlannerDock(QDockWidget):
                                 task: analysis_task.BurialAnalysisTask) -> None:
         params = self.model.gen_params()
         acquisitions: List[generation.RuleAcquisition] = []
-        rule_hits: Dict[str, List] = {}
         for result in task.results:
             if not result.error and result.cache_key:
                 self.model.acq_cache[result.cache_key] = (result.footprint,
                                                           result.nodata)
             acquisitions.append(generation.RuleAcquisition(
                 result.rule_row, result.footprint, result.nodata, result.error))
-            rule_hits[str(result.rule_row.get("rule_id"))] = [
-                (iv.start_km, iv.end_km) for iv in result.footprint]
 
         resolved, influence, nodata, warnings = generation.resolve_stack(
-            params, acquisitions)
+            params, acquisitions, depth_at=self.model.depth_at_kp)
         verdicts = resolved.per_method.get(params.method, [])
+        # Per-rule bars show the resolved footprint — extension buffers
+        # included — so what fires on screen is what excludes in the plan.
+        rule_hits: Dict[str, List] = {
+            rule_id: [(iv.start_km, iv.end_km) for iv in intervals]
+            for rule_id, intervals in resolved.rule_hits.items()}
         message = "  ·  ".join(warnings) if warnings else \
             f"Exclusion stack current over KP " \
             f"{schema.format_kp(params.scope.start_km)}-" \
@@ -729,7 +733,8 @@ class BurialPlannerDock(QDockWidget):
             position_fn=position_fn, depth_fn=depth_fn,
             previous_sections=self.model.sections,
             proposal_events=proposal or None,
-            plan_id=self.model.plan_id, generation_id=generation_id)
+            plan_id=self.model.plan_id, generation_id=generation_id,
+            depth_at=self.model.depth_at_kp)
 
         fingerprints = {str(r.rule_row.get("rule_id")): r.cache_key
                         for r in task.results}
@@ -1096,6 +1101,49 @@ class BurialPlannerDock(QDockWidget):
         self._band.show()
         return geom
 
+    def set_exclusion_preview(self, spans) -> None:
+        """Draw KP ranges as temporary highlight bands over the route.
+
+        ``spans``: list of ``(start_kp, end_kp, QColor)``. Bands are canvas
+        artefacts only (never saved); pass an empty list to clear. Used by
+        the Exclusions tab to preview Exclusion Areas before a plan is built.
+        """
+        self.clear_exclusion_preview()
+        if not spans or self.canvas is None or self.model.route is None:
+            return
+        try:
+            from qgis.core import QgsCoordinateReferenceSystem
+
+            transform = QgsCoordinateTransform(
+                QgsCoordinateReferenceSystem("EPSG:4326"),
+                self.canvas.mapSettings().destinationCrs(),
+                QgsProject.instance())
+        except Exception:
+            transform = None
+        for start_kp, end_kp, color in spans:
+            geom = self.model.route.extract_segment(float(start_kp),
+                                                    float(end_kp))
+            if geom is None or geom.isEmpty():
+                continue
+            if transform is not None:
+                try:
+                    geom = type(geom)(geom)
+                    geom.transform(transform)
+                except Exception:
+                    pass
+            band = QgsRubberBand(self.canvas, GEOMETRY_LINE)
+            band.setColor(color)
+            band.setWidth(6)
+            band.setToGeometry(geom, None)
+            band.show()
+            self._exclusion_bands.append(band)
+
+    def clear_exclusion_preview(self) -> None:
+        bands = self._exclusion_bands
+        self._exclusion_bands = []
+        for band in bands:
+            _remove_canvas_item(band)
+
     def goto_kp(self, kp: float) -> None:
         point = self._canvas_point(kp)
         if point is None or self.canvas is None:
@@ -1181,9 +1229,10 @@ class BurialPlannerDock(QDockWidget):
                 self.canvas.unsetMapTool(pick_tool)
             except (AttributeError, RuntimeError):
                 pass
-        items = (self._marker, self._band)
+        items = (self._marker, self._band) + tuple(self._exclusion_bands)
         self._marker = None
         self._band = None
+        self._exclusion_bands = []
         for item in items:
             _remove_canvas_item(item)
 

@@ -53,7 +53,11 @@ from .. import schema
 _EVENT_COLUMNS = ["Seq", "Event", "KP", "Lat", "Lon", "Depth (m)", "Source",
                   "Status", "Locked", "Notes"]
 _SECTION_COLUMNS = ["Kind", "Start KP", "End KP", "Length (km)", "State",
-                    "Conclusion", "Confidence", "Reasons", "Notes"]
+                    "Conclusion", "Confidence", "Skip handling", "Reasons",
+                    "Notes"]
+_SECTION_SKIP_HANDLING_COL = 7
+_SECTION_REASONS_COL = 8
+_SECTION_NOTES_COL = 9
 
 _STATUS_COLORS = {
     schema.EVENT_STATUS_CANDIDATE: QColor("#b36b00"),
@@ -125,10 +129,11 @@ class BuilderTab(QWidget):
             "ranges are never removed by this setting. Set 0 to keep every "
             "candidate section.")
         run_row.addWidget(self.min_section_spin)
-        self.generate_button = QPushButton("Generate")
+        self.generate_button = QPushButton("Generate plan")
         self.generate_button.setToolTip(
             "Run the Exclusion stack over the scope and rebuild candidate "
-            "sections and events in the background.")
+            "sections and events in the background. Locked, confirmed and "
+            "manual events are kept; only automatic candidates are replaced.")
         self.generate_button.clicked.connect(self._generate)
         run_row.addWidget(self.generate_button)
         self.cancel_button = QPushButton("Stop (resumable)")
@@ -232,7 +237,7 @@ class BuilderTab(QWidget):
         self.sections_table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
         self.sections_table.setSelectionMode(SELECTION_MODE_EXTENDED)
         self.sections_table.horizontalHeader().setSectionResizeMode(
-            7, HEADER_RESIZE_MODE_STRETCH)
+            _SECTION_REASONS_COL, HEADER_RESIZE_MODE_STRETCH)
         self.sections_table.itemSelectionChanged.connect(self._on_section_selected)
         self.sections_table.itemChanged.connect(self._on_section_item_changed)
         self.sections_table.setContextMenuPolicy(CONTEXT_MENU_POLICY_CUSTOM)
@@ -255,7 +260,8 @@ class BuilderTab(QWidget):
                             ("Set conclusion…", self._set_conclusion),
                             ("Set confidence…", self._set_confidence),
                             ("Mark final", lambda: self._set_state(schema.SECTION_STATE_FINAL)),
-                            ("Mark candidate", lambda: self._set_state(schema.SECTION_STATE_CANDIDATE))):
+                            ("Mark candidate", lambda: self._set_state(schema.SECTION_STATE_CANDIDATE)),
+                            ("Auto-assign skip handling…", self._auto_assign_skip_handling)):
             button = QPushButton(label)
             button.clicked.connect(slot)
             section_buttons.addWidget(button)
@@ -382,6 +388,7 @@ class BuilderTab(QWidget):
             self.sections_table.setRowCount(len(sections))
             for i, section in enumerate(sections):
                 reasons = self._reason_text(section)
+                is_skip = section.get("kind") == schema.SECTION_SKIP
                 values = [
                     self._kind_label(section.get("kind") or ""),
                     schema.format_kp(section.get("start_kp")),
@@ -390,20 +397,41 @@ class BuilderTab(QWidget):
                     section.get("state") or "",
                     schema.CONCLUSION_LABELS.get(section.get("conclusion") or "", ""),
                     section.get("confidence") or "",
+                    "",  # skip handling: combo widget on skip rows
                     reasons,
                     section.get("notes") or "",
                 ]
                 for j, value in enumerate(values):
                     item = QTableWidgetItem(value)
                     flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-                    if j == 8:
+                    if j == _SECTION_NOTES_COL:
                         flags |= Qt.ItemFlag.ItemIsEditable
                     item.setFlags(flags)
                     if j == 0:
                         item.setData(ITEM_DATA_USER_ROLE, section.get("section_id"))
-                    if j == 7:
+                    if j == _SECTION_REASONS_COL:
                         item.setToolTip(reasons)
                     self.sections_table.setItem(i, j, item)
+                if is_skip:
+                    combo = QComboBox()
+                    for handling in schema.SKIP_HANDLING_VALUES:
+                        combo.addItem(schema.SKIP_HANDLING_LABELS[handling],
+                                      handling)
+                    combo.setToolTip(
+                        "How this skip is executed: recover the plough to "
+                        "deck, or transit with the plough suspended "
+                        "mid-water. TBC until decided.")
+                    index = combo.findData(section.get("skip_handling") or "")
+                    combo.setCurrentIndex(max(0, index))
+                    combo.currentIndexChanged.connect(
+                        lambda _index, c=combo,
+                        sid=section.get("section_id"):
+                        self._set_skip_handling(sid, c.currentData()))
+                    self.sections_table.setCellWidget(
+                        i, _SECTION_SKIP_HANDLING_COL, combo)
+                else:
+                    self.sections_table.removeCellWidget(
+                        i, _SECTION_SKIP_HANDLING_COL)
         finally:
             self._loading = False
 
@@ -685,7 +713,7 @@ class BuilderTab(QWidget):
 
     # -- section edits ---------------------------------------------------------
     def _on_section_item_changed(self, item) -> None:
-        if self._loading or item.column() != 8:
+        if self._loading or item.column() != _SECTION_NOTES_COL:
             return
         id_item = self.sections_table.item(item.row(), 0)
         section_id = id_item.data(ITEM_DATA_USER_ROLE) if id_item else ""
@@ -694,6 +722,26 @@ class BuilderTab(QWidget):
 
             self.model.update_section(section_id, {"notes": item.text()},
                                       action=change_log.ACTION_EDIT_SECTION)
+
+    def _set_skip_handling(self, section_id: str, value: str) -> None:
+        if self._loading or not section_id:
+            return
+        # Deferred: update_section rebuilds this table, which would destroy
+        # the combo that is still delivering its change signal.
+        from qgis.PyQt.QtCore import QTimer
+
+        def apply() -> None:
+            from .. import change_log
+
+            section = next((s for s in self.model.sections
+                            if s.get("section_id") == section_id), None)
+            if section is None or (section.get("skip_handling") or "") == (value or ""):
+                return
+            self.model.update_section(section_id,
+                                      {"skip_handling": value or ""},
+                                      action=change_log.ACTION_EDIT_SECTION)
+
+        QTimer.singleShot(0, apply)
 
     def _split_section(self) -> None:
         ids = self._selected_section_ids()
@@ -756,6 +804,70 @@ class BuilderTab(QWidget):
             self.model.merge_sections(ids, reason)
         except ValueError as exc:
             QMessageBox.warning(self, "Burial Planner", str(exc))
+
+    def _auto_assign_skip_handling(self) -> None:
+        """Length-based skip handling with a user-entered threshold.
+
+        No engineering value is shipped: the mid-water-transit maximum length
+        is entered here (remembered per machine) and recorded in the change
+        log with the assignment, which is a single undoable edit.
+        """
+        if not self.model.plan:
+            return
+        skips = [s for s in self.model.sections
+                 if s.get("kind") == schema.SECTION_SKIP]
+        if not skips:
+            QMessageBox.information(self, "Burial Planner",
+                                    "The plan has no skips to assign.")
+            return
+        from qgis.PyQt.QtCore import QSettings
+        from qgis.PyQt.QtWidgets import QCheckBox, QVBoxLayout
+
+        settings = QSettings()
+        settings_key = "SubseaCableTools/BurialPlanner/skip_transit_max_km"
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Auto-assign skip handling")
+        layout = QVBoxLayout(dialog)
+        note = QLabel(
+            "Skips no longer than the threshold are set to Mid-water "
+            "transit; longer skips to Recover to deck. The threshold is "
+            "your operational policy — no default is prescribed. Skips "
+            "already assigned keep their handling unless overwrite is "
+            "ticked. One undoable edit (Ctrl+Z).")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        form = QFormLayout()
+        threshold_spin = QDoubleSpinBox()
+        threshold_spin.setRange(0.0, 1000.0)
+        threshold_spin.setDecimals(3)
+        threshold_spin.setSuffix(" km")
+        threshold_spin.setValue(float(settings.value(settings_key, 0.0,
+                                                     type=float)))
+        form.addRow("Mid-water transit up to:", threshold_spin)
+        overwrite_check = QCheckBox("Overwrite existing assignments (not just TBC)")
+        form.addRow(overwrite_check)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox()
+        buttons.setStandardButtons(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if qt_exec(dialog) != DIALOG_ACCEPTED:
+            return
+        threshold = threshold_spin.value()
+        settings.setValue(settings_key, threshold)
+        changed = self.model.assign_skip_handling(
+            threshold, overwrite=overwrite_check.isChecked())
+        if changed < 0:
+            return  # store error already surfaced by the model
+        if changed == 0:
+            self.run_status.setText(
+                "No skip handling changed — all skips already assigned "
+                "(tick overwrite to reassign).")
+        else:
+            self.run_status.setText(
+                f"Assigned skip handling on {changed} skip(s): mid-water "
+                f"transit ≤ {threshold:g} km, recover to deck above.")
 
     def _set_conclusion(self) -> None:
         ids = self._selected_section_ids()

@@ -222,6 +222,38 @@ def dilate_intervals(
     return out
 
 
+def dilate_intervals_variable(
+    intervals: List[Interval],
+    low_km_at,
+    high_km_at,
+    domain: Optional[Interval] = None,
+) -> List[Interval]:
+    """Dilate with per-boundary extensions (e.g. a water-depth multiple).
+
+    ``low_km_at(kp)`` / ``high_km_at(kp)`` return the extension (km) to apply
+    at an interval's low/high boundary, evaluated at that boundary's KP.
+    ``None`` or negative results mean no extension there. Same low/high-side
+    semantics as ``dilate_intervals``; callers map travel direction onto the
+    two callables.
+    """
+    out: List[Interval] = []
+    for iv in normalize(intervals):
+        try:
+            low = float(low_km_at(iv.start_km) or 0.0)
+        except (TypeError, ValueError):
+            low = 0.0
+        try:
+            high = float(high_km_at(iv.end_km) or 0.0)
+        except (TypeError, ValueError):
+            high = 0.0
+        out.append(Interval(iv.start_km - max(low, 0.0),
+                            iv.end_km + max(high, 0.0)))
+    out = normalize(out)
+    if domain is not None:
+        out = clip_intervals(out, domain)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Series -> intervals
 # ---------------------------------------------------------------------------

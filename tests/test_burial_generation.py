@@ -133,6 +133,67 @@ def test_extension_buffer_and_min_length() -> bool:
                    ok, str(kinds))
 
 
+def test_asymmetric_extension_direction_aware() -> bool:
+    config = {"extend_mode": "fixed", "extend_before_m": 500.0,
+              "extend_after_m": 200.0}
+    acq = gen.RuleAcquisition(_rule("e1", "hazard", config=config),
+                              [Interval(10.0, 11.0)])
+    out = gen.generate(_params(), [acq], id_fn=_counter_id_fn())
+    skips = [(round(s["start_kp"], 3), round(s["end_kp"], 3))
+             for s in out.sections if s["kind"] == "skip"]
+    ok = skips == [(9.5, 11.2)]
+    # Direction -1: approach is the high-KP side.
+    out_rev = gen.generate(_params(direction=-1), [acq], id_fn=_counter_id_fn())
+    skips_rev = [(round(s["start_kp"], 3), round(s["end_kp"], 3))
+                 for s in out_rev.sections if s["kind"] == "skip"]
+    ok = ok and skips_rev == [(9.8, 11.5)]
+    return _result("asymmetric extension follows the direction of installation",
+                   ok, f"{skips} / {skips_rev}")
+
+
+def test_wd_extension() -> bool:
+    config = {"extend_mode": "wd", "extend_before_wd": 1.0,
+              "extend_after_wd": 2.0}
+    acq = gen.RuleAcquisition(_rule("e1", "hazard", config=config),
+                              [Interval(10.0, 11.0)])
+    # 500 m of water everywhere -> 0.5 km before, 1.0 km after.
+    out = gen.generate(_params(), [acq], id_fn=_counter_id_fn(),
+                       depth_at=lambda _kp: 500.0)
+    skips = [(round(s["start_kp"], 3), round(s["end_kp"], 3))
+             for s in out.sections if s["kind"] == "skip"]
+    ok = skips == [(9.5, 12.0)]
+    # No depth source -> unextended footprint plus a warning.
+    out_none = gen.generate(_params(), [acq], id_fn=_counter_id_fn())
+    skips_none = [(round(s["start_kp"], 3), round(s["end_kp"], 3))
+                  for s in out_none.sections if s["kind"] == "skip"]
+    ok = ok and skips_none == [(10.0, 11.0)]
+    ok = ok and any("bathymetry" in w for w in out_none.warnings)
+    # Legacy symmetric extend_m still honoured.
+    legacy = gen.extension_config({"extend_m": 300.0})
+    ok = ok and legacy == {"mode": "fixed", "before": 300.0, "after": 300.0}
+    return _result("water-depth extension scales with depth at the boundary",
+                   ok, f"{skips} / {skips_none}")
+
+
+def test_extension_keys_do_not_invalidate_cache() -> bool:
+    scope = Interval(0.0, 20.0)
+    base = gen.rule_cache_key(_rule("r1", config={"value": 10.0}),
+                              "fp1", scope, 50.0, "rplfp", 1)
+    extended = _rule("r1", config={"value": 10.0, "extend_mode": "wd",
+                                   "extend_before_wd": 1.0,
+                                   "extend_after_wd": 1.5})
+    ok = base == gen.rule_cache_key(extended, "fp1", scope, 50.0, "rplfp", 1)
+    # The polygon route corridor IS acquisition config, so it must invalidate.
+    poly = _rule("p1", config={"attribute": "class"})
+    poly_corridor = _rule("p1", config={"attribute": "class",
+                                        "route_buffer_mode": "fixed",
+                                        "route_buffer_m": 15.0})
+    ok = ok and gen.rule_cache_key(poly, "fp1", scope, 50.0, "rplfp", 1) \
+        != gen.rule_cache_key(poly_corridor, "fp1", scope, 50.0, "rplfp", 1)
+    return _result("extension keys resolution-only; corridor keys invalidate "
+                   "acquisition", ok)
+
+
 def test_nodata_becomes_insufficient() -> bool:
     acq = gen.RuleAcquisition(_rule("d1", "depth"), [Interval(5.0, 6.0)],
                               nodata=[Interval(15.0, 17.0)])
@@ -236,6 +297,38 @@ def test_conclusion_carry_over() -> bool:
     return _result("unchanged sections keep their conclusions across regeneration", ok)
 
 
+def test_assign_skip_handling() -> bool:
+    sections = [
+        {"section_id": "b1", "kind": schema.SECTION_BURIAL, "length_km": 5.0},
+        {"section_id": "s1", "kind": schema.SECTION_SKIP, "length_km": 0.4,
+         "skip_handling": ""},
+        {"section_id": "s2", "kind": schema.SECTION_SKIP, "length_km": 2.0,
+         "skip_handling": ""},
+        {"section_id": "s3", "kind": schema.SECTION_SKIP, "length_km": 0.2,
+         "skip_handling": schema.SKIP_HANDLING_RECOVER},
+        {"section_id": "i1", "kind": schema.SECTION_INSUFFICIENT,
+         "length_km": 1.0},
+    ]
+    updated, changed = gen.assign_skip_handling(sections, 0.5)
+    by_id = {s["section_id"]: s for s in updated}
+    ok = changed == 2
+    ok = ok and by_id["s1"]["skip_handling"] == schema.SKIP_HANDLING_MIDWATER
+    ok = ok and by_id["s2"]["skip_handling"] == schema.SKIP_HANDLING_RECOVER
+    # An engineer's existing choice is never silently replaced…
+    ok = ok and by_id["s3"]["skip_handling"] == schema.SKIP_HANDLING_RECOVER
+    ok = ok and "skip_handling" not in by_id["b1"]
+    # …unless overwrite is explicit.
+    forced, forced_changed = gen.assign_skip_handling(sections, 0.5,
+                                                      overwrite=True)
+    forced_by_id = {s["section_id"]: s for s in forced}
+    ok = ok and forced_changed == 3
+    ok = ok and forced_by_id["s3"]["skip_handling"] == schema.SKIP_HANDLING_MIDWATER
+    # Inputs are never mutated in place.
+    ok = ok and sections[1]["skip_handling"] == ""
+    return _result("skip handling auto-assign: length policy, TBC-only "
+                   "default, overwrite explicit", ok)
+
+
 def test_manual_burial_across_exclusion_is_flagged() -> bool:
     params = _params()
     events = [
@@ -267,12 +360,16 @@ def run_all() -> list:
         test_screening_never_removes(),
         test_influence_flags_on_boundary(),
         test_extension_buffer_and_min_length(),
+        test_asymmetric_extension_direction_aware(),
+        test_wd_extension(),
+        test_extension_keys_do_not_invalidate_cache(),
         test_nodata_becomes_insufficient(),
         test_refinement_converges(),
         test_cache_key_sensitivity(),
         test_determinism(),
         test_proposal_diff(),
         test_conclusion_carry_over(),
+        test_assign_skip_handling(),
         test_manual_burial_across_exclusion_is_flagged(),
     ]
 

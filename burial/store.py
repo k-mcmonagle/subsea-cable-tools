@@ -474,8 +474,17 @@ def _migrate_v1_to_v2(store: BurialStore) -> None:
     store._write_table_rows(schema.TABLE_PLAN, schema.PLAN_FIELDS, rows)
 
 
+def _migrate_v3_to_v4(store: BurialStore) -> None:
+    """Add ``skip_handling`` to bp_section (default "" = TBC)."""
+    rows = store.read_table(schema.TABLE_SECTION)
+    for row in rows:
+        if row.get("skip_handling") is None:
+            row["skip_handling"] = ""
+    store._write_table_rows(schema.TABLE_SECTION, schema.SECTION_FIELDS, rows)
+
+
 # Maps a starting schema version to the function upgrading it one step.
-MIGRATIONS: Dict[int, object] = {1: _migrate_v1_to_v2}
+MIGRATIONS: Dict[int, object] = {1: _migrate_v1_to_v2, 3: _migrate_v3_to_v4}
 
 
 def _normalise_row(row: Dict) -> Dict:

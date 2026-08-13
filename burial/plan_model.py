@@ -280,6 +280,29 @@ class PlanModel(QObject):
         return map_layers.depth_config_fingerprint(
             QgsProject.instance(), self.depth_config())
 
+    def depth_at_kp(self, kp: float) -> Optional[float]:
+        """Water depth magnitude at a KP for resolution-time consumers
+        (water-depth-scaled Exclusion Area extensions).
+
+        Prefers the persisted plan profile (fast interpolation over the
+        stored samples); falls back to sampling the configured bathymetry at
+        the route position.
+        """
+        profile = self.bathy_profile
+        if profile is not None and profile.kps:
+            value = profile.depth_at(kp)
+            if value is not None:
+                return abs(float(value))
+        if self.route is not None:
+            point = self.route.point_at_kp(kp, clamp=True)
+            if point is not None:
+                service = self.depth_service()
+                if service.is_available():
+                    value = service.sample(point.y(), point.x())
+                    if value is not None:
+                        return abs(float(value))
+        return None
+
     # -- sampled plan profile ------------------------------------------------
     def resolve_profile_step_m(self, params: Optional[generation.GenParams] = None
                                ) -> float:
@@ -688,6 +711,37 @@ class PlanModel(QObject):
         self.sectionsChanged.emit()
         self.logChanged.emit()
         return True
+
+    def assign_skip_handling(self, transit_max_km: float,
+                             overwrite: bool = False) -> int:
+        """Auto-assign skip handling by length as one undoable edit.
+
+        Skips ≤ ``transit_max_km`` become mid-water transits, longer skips
+        recover-to-deck; only TBC skips change unless ``overwrite``.
+        Returns the number of skips changed (-1 when the store write failed).
+        """
+        if not self.plan:
+            return 0
+        updated, changed = generation.assign_skip_handling(
+            self.sections, transit_max_km, overwrite)
+        if not changed:
+            return 0
+        before = {schema.TABLE_SECTION: [dict(s) for s in self.sections]}
+        ok, _ = self._store_write("save the sections", self.store.save_sections,
+                                  self.plan_id, updated)
+        if not ok:
+            return -1
+        self.sections = self.store.list_sections(self.plan_id)
+        self.store.append_change(
+            self.plan_id, change_log.ACTION_EDIT_SECTION, "skip_handling_auto",
+            before=before,
+            after={schema.TABLE_SECTION: [dict(s) for s in self.sections]},
+            reason=f"auto-assign skip handling (mid-water transit ≤ "
+                   f"{float(transit_max_km):g} km)")
+        self.refresh_layers()
+        self.sectionsChanged.emit()
+        self.logChanged.emit()
+        return changed
 
     def insert_opposite_section(self, section_id: str, start_kp: float,
                                 end_kp: float, reason: str = "") -> bool:

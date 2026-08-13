@@ -5,8 +5,8 @@ Geometry is sliced from the plan's RPL via ``RouteFrame`` (the
 ``assessment_output.py`` approach) and written to the plan's GeoPackage as
 EPSG:4326 layers. Layers are managed exclusively by the tool: added
 read-only, refreshed in place (never remove/re-add), styled with a
-rule-based renderer — burial solid, skip dashed and insufficient-information
-grey — directly on the source RPL geometry.
+rule-based renderer — burial solid green, skip solid red and
+insufficient-information dashed grey — directly on the source RPL geometry.
 
 Also home to the layer-resolution helpers: registered ``bp_input`` rows are
 re-resolved through ``workbench/project_layers.py`` normalised-path
@@ -201,6 +201,9 @@ def write_plan_layers(store, plan: Dict, sections: Sequence[Dict],
                 section.get("conclusion") or "", section.get("conclusion") or ""),
             "confidence": section.get("confidence") or "",
             "reasons": section.get("reason_json") or "",
+            "skip_handling": schema.SKIP_HANDLING_LABELS.get(
+                section.get("skip_handling") or "", "")
+            if section.get("kind") == schema.SECTION_SKIP else "",
             "notes": section.get("notes") or "",
             WKT_KEY: geom.asWkt(),
         })
@@ -239,7 +242,7 @@ def write_plan_layers(store, plan: Dict, sections: Sequence[Dict],
 _SECTION_STYLES = {
     schema.SECTION_BURIAL: {"color": "#1b7f3b", "width": "1.8", "style": "solid",
                             "label": "Burial"},
-    schema.SECTION_SKIP: {"color": "#d62728", "width": "1.4", "style": "dash",
+    schema.SECTION_SKIP: {"color": "#d62728", "width": "1.4", "style": "solid",
                           "label": "Skip"},
     schema.SECTION_INSUFFICIENT: {"color": "#9e9e9e", "width": "1.4", "style": "dash",
                                   "label": "Insufficient Information"},

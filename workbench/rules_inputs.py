@@ -222,9 +222,23 @@ def _load_features_wgs84(layer: QgsVectorLayer, project: QgsProject
 
 
 def _search_rect(point: QgsPointXY, radius_m: float):
+    """Candidate-search rectangle around a WGS84 point (exact tests follow).
+
+    Longitude degrees shrink with latitude, so the metre->degree conversion
+    must divide by cos(latitude) — the previous equatorial-only conversion
+    made the window ~35% too narrow east-west at 50° N and could miss
+    features lying near the buffer edge. Conservative (slightly oversized)
+    by construction; the caller's distance test decides.
+    """
+    import math
+
     from qgis.core import QgsRectangle
-    deg = max(radius_m, 1.0) / 111320.0 + 1e-6
-    return QgsRectangle(point.x() - deg, point.y() - deg, point.x() + deg, point.y() + deg)
+    radius = max(radius_m, 1.0)
+    deg_lat = radius / 110540.0 + 1e-6
+    cos_lat = max(math.cos(math.radians(point.y())), 0.087)
+    deg_lon = radius / (111320.0 * cos_lat) + 1e-6
+    return QgsRectangle(point.x() - deg_lon, point.y() - deg_lat,
+                        point.x() + deg_lon, point.y() + deg_lat)
 
 
 def _distance_to_geom_m(distance, point: QgsPointXY, geom: QgsGeometry) -> float:
@@ -531,14 +545,53 @@ def _acquire_proximity(sampler, config, project) -> List[Interval]:
     return proximity_intervals(sampler, index, feats, layer.geometryType(), config)
 
 
+def polygon_route_buffer_m_at(config: Dict,
+                              depth_at: Optional[Callable[[float], Optional[float]]]
+                              ) -> Optional[Callable[[float], float]]:
+    """Per-KP route-corridor half-width (m) for a polygon-class rule.
+
+    ``route_buffer_mode``: "" (route centreline only — returns None),
+    "fixed" (``route_buffer_m`` metres) or "wd" (``route_buffer_wd`` × the
+    water depth at that KP via ``depth_at``; stations with no depth fall
+    back to the centreline-only test).
+    """
+    mode = (config.get("route_buffer_mode") or "").strip().lower()
+    if mode == "fixed":
+        fixed = max(0.0, float(config.get("route_buffer_m") or 0.0))
+        if fixed <= 0:
+            return None
+        return lambda _kp: fixed
+    if mode == "wd":
+        factor = max(0.0, float(config.get("route_buffer_wd") or 0.0))
+        if factor <= 0 or depth_at is None:
+            return None
+
+        def at(kp: float) -> float:
+            depth = depth_at(kp)
+            return factor * abs(float(depth)) if depth is not None else 0.0
+
+        return at
+    return None
+
+
 def polygon_class_intervals(sampler: RouteSampler, index: QgsSpatialIndex,
                             feats: Dict[int, Tuple[QgsGeometry, QgsFeature]],
                             config: Dict,
-                            cancel: Optional[Callable[[], bool]] = None) -> List[Interval]:
-    """Polygon-class intervals over pre-loaded WGS84 features (thread-safe)."""
+                            cancel: Optional[Callable[[], bool]] = None,
+                            depth_at: Optional[Callable[[float], Optional[float]]] = None
+                            ) -> List[Interval]:
+    """Polygon-class intervals over pre-loaded WGS84 features (thread-safe).
+
+    By default a station fires when the route centreline lies inside a
+    matching polygon. With a route-corridor buffer configured
+    (``route_buffer_mode``: fixed metres or a water-depth multiple via
+    ``depth_at``) a station also fires when a matching polygon comes within
+    that distance of the route.
+    """
     attribute = config.get("attribute") or ""
     match_values = {str(v).strip().lower() for v in (config.get("match_values") or [])}
     expr, ctx = _filter_expression(config.get("match_expression", ""))
+    buffer_m_at = polygon_route_buffer_m_at(config, depth_at)
 
     def matches(feat) -> bool:
         if expr is not None:
@@ -559,11 +612,18 @@ def polygon_class_intervals(sampler: RouteSampler, index: QgsSpatialIndex,
         if pt is None:
             series.append((kp, False))
             continue
+        buffer_m = max(0.0, float(buffer_m_at(kp))) if buffer_m_at is not None else 0.0
         pt_geom = QgsGeometry.fromPointXY(pt)
         flag = False
-        for fid in index.intersects(_search_rect(pt, 1.0)):
+        for fid in index.intersects(_search_rect(pt, max(buffer_m, 1.0))):
             geom, feat = feats[fid]
-            if geom.contains(pt_geom) and matches(feat):
+            if not matches(feat):
+                continue
+            if geom.contains(pt_geom):
+                flag = True
+                break
+            if buffer_m > 0 and _distance_to_geom_m(
+                    sampler.distance, pt, geom) <= buffer_m + 1e-6:
                 flag = True
                 break
         series.append((kp, flag))

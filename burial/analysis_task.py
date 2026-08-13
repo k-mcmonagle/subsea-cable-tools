@@ -739,6 +739,16 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
                 rule_work.error = "input layer could not be resolved"
             else:
                 input_fp = map_layers.layer_fingerprint(layer)
+                if rule_work.kind == wb_schema.RULE_KIND_POLYGON and \
+                        (rule_work.config.get("route_buffer_mode") or "").lower() == "wd":
+                    if depth is None or not depth.is_available():
+                        rule_work.error = ("a route corridor scaled by water "
+                                           "depth needs a bathymetry source")
+                    else:
+                        # WD-scaled corridors also depend on the bathymetry:
+                        # changing it must invalidate this rule's cache.
+                        input_fp += "|" + map_layers.depth_config_fingerprint(
+                            project, depth_config)
         elif rule_work.kind == wb_schema.RULE_KIND_THRESHOLD:
             if depth is None or not depth.is_available():
                 rule_work.error = "no bathymetry source configured"
@@ -904,7 +914,8 @@ def _threshold_predicate(
     return predicate
 
 
-def _geometry_predicate(work: AnalysisWork, rule_work: RuleWork
+def _geometry_predicate(work: AnalysisWork, rule_work: RuleWork,
+                        depth_at: Optional[Callable[[float], Optional[float]]] = None
                         ) -> Optional[Callable[[float], bool]]:
     if rule_work.feats is None:
         return None
@@ -923,6 +934,10 @@ def _geometry_predicate(work: AnalysisWork, rule_work: RuleWork
     expr, ctx = ri.filter_expression(
         config.get("match_expression" if kind == wb_schema.RULE_KIND_POLYGON
                    else "filter_expression", ""))
+    # Same per-KP route-corridor buffer as polygon acquisition, so boundary
+    # refinement bisects the identical condition.
+    route_buffer_at = (ri.polygon_route_buffer_m_at(config, depth_at)
+                       if kind == wb_schema.RULE_KIND_POLYGON else None)
 
     def matches(feat) -> bool:
         if expr is not None:
@@ -950,9 +965,16 @@ def _geometry_predicate(work: AnalysisWork, rule_work: RuleWork
             return False
         pt_geom = QgsGeometry.fromPointXY(pt)
         if kind == wb_schema.RULE_KIND_POLYGON:
-            for fid in index.intersects(ri.search_rect(pt, 1.0)):
+            corridor_m = max(0.0, float(route_buffer_at(kp))) \
+                if route_buffer_at is not None else 0.0
+            for fid in index.intersects(ri.search_rect(pt, max(corridor_m, 1.0))):
                 geom, feat = feats[fid]
-                if geom.contains(pt_geom) and matches(feat):
+                if not matches(feat):
+                    continue
+                if geom.contains(pt_geom):
+                    return True
+                if corridor_m > 0 and ri.distance_to_geom_m(
+                        distance, pt, geom) <= corridor_m + 1e-6:
                     return True
             return False
         for fid in index.intersects(ri.search_rect(pt, max(max_buffer, 1.0))):
@@ -1070,6 +1092,51 @@ class BurialAnalysisTask(QgsTask):
             self.error = str(exc)
             return False
 
+    def _ensure_depth_lookup(self, sampler: ri.RouteSampler,
+                             sample_progress: Optional[Callable[[int, int], None]] = None
+                             ) -> None:
+        """Build (once per run) the depth series, no-data gaps and lookup.
+
+        Shared by threshold rules and any rule needing water depth at a KP
+        (polygon route-corridor ×WD buffers).
+        """
+        if self._depth_series is not None:
+            return
+        work = self.work
+        if work.depth_samples is not None:
+            # Reuse the persisted plan profile — no resampling.
+            self.progressMessage.emit("Using stored plan profile samples…")
+            samples = work.depth_samples
+        else:
+            if work.depth is None:
+                raise ri.RuleInputError("no bathymetry source configured")
+            self.progressMessage.emit("Sampling bathymetry along the scope…")
+            # Threshold acquisition follows the persisted-profile
+            # resolution even when no current stored profile was
+            # available. The coarse sampler remains appropriate for
+            # geometry rules and boundary brackets, but would miss or
+            # flatten short terrain features.
+            marks = sampler.stations_km
+            if abs(float(work.depth_step_m) - float(work.step_m)) > 1e-9:
+                # Build only scalar KPs here. RouteSampler would also
+                # allocate hundreds of thousands of QgsPointXY objects
+                # which profile_samples immediately recomputes.
+                lo = min(sampler.stations_km)
+                hi = max(sampler.stations_km)
+                step_km = max(float(work.depth_step_m), 1.0) / 1000.0
+                count = max(int(math.ceil((hi - lo) / step_km)) + 1, 1)
+                marks = [min(lo + i * step_km, hi) for i in range(count)]
+            samples = work.depth.profile_samples(
+                work.route, marks, cancel=self.isCanceled,
+                progress=sample_progress)
+        self._depth_series = [
+            (kp, abs(float(value))) for kp, value in samples
+            if value is not None]
+        flags = [(kp, value is None) for kp, value in samples]
+        self._depth_gaps = eng.intervals_from_bool_series(
+            flags, sampler.scope_domain)
+        self._sampled_depth_at = _profile_depth_lookup(samples)
+
     def _acquire(self, sampler: ri.RouteSampler, rule_work: RuleWork,
                  coarse_step_km: float, tol_km: float,
                  progress: Optional[Callable[[float], None]] = None
@@ -1087,43 +1154,7 @@ class BurialAnalysisTask(QgsTask):
                 progress(0.9 * float(done) / max(float(count), 1.0))
 
         if kind == wb_schema.RULE_KIND_THRESHOLD:
-            if self._depth_series is None:
-                if work.depth_samples is not None:
-                    # Reuse the persisted plan profile — no resampling.
-                    self.progressMessage.emit(
-                        "Using stored plan profile samples…")
-                    samples = work.depth_samples
-                else:
-                    if work.depth is None:
-                        raise ri.RuleInputError("no bathymetry source configured")
-                    self.progressMessage.emit(
-                        "Sampling bathymetry along the scope…")
-                    # Threshold acquisition follows the persisted-profile
-                    # resolution even when no current stored profile was
-                    # available. The coarse sampler remains appropriate for
-                    # geometry rules and boundary brackets, but would miss or
-                    # flatten short terrain features.
-                    marks = sampler.stations_km
-                    if abs(float(work.depth_step_m) - float(work.step_m)) > 1e-9:
-                        # Build only scalar KPs here. RouteSampler would also
-                        # allocate hundreds of thousands of QgsPointXY objects
-                        # which profile_samples immediately recomputes.
-                        lo = min(sampler.stations_km)
-                        hi = max(sampler.stations_km)
-                        step_km = max(float(work.depth_step_m), 1.0) / 1000.0
-                        count = max(int(math.ceil((hi - lo) / step_km)) + 1, 1)
-                        marks = [min(lo + i * step_km, hi)
-                                 for i in range(count)]
-                    samples = work.depth.profile_samples(
-                        work.route, marks, cancel=cancel,
-                        progress=sample_progress)
-                self._depth_series = [
-                    (kp, abs(float(value))) for kp, value in samples
-                    if value is not None]
-                flags = [(kp, value is None) for kp, value in samples]
-                self._depth_gaps = eng.intervals_from_bool_series(
-                    flags, sampler.scope_domain)
-                self._sampled_depth_at = _profile_depth_lookup(samples)
+            self._ensure_depth_lookup(sampler, sample_progress)
             if not self._depth_series:
                 raise ri.RuleInputError("bathymetry has no coverage in the scope")
             slope_step_km = max(
@@ -1156,10 +1187,17 @@ class BurialAnalysisTask(QgsTask):
             if kind == wb_schema.RULE_KIND_PROXIMITY:
                 intervals = ri.proximity_intervals(
                     sampler, index, feats, rule_work.geom_type, config, cancel=cancel)
+                predicate = _geometry_predicate(work, rule_work)
             else:
+                depth_at = None
+                if (config.get("route_buffer_mode") or "").lower() == "wd":
+                    self._ensure_depth_lookup(sampler, sample_progress)
+                    depth_at = self._sampled_depth_at
                 intervals = ri.polygon_class_intervals(
-                    sampler, index, feats, config, cancel=cancel)
-            predicate = _geometry_predicate(work, rule_work)
+                    sampler, index, feats, config, cancel=cancel,
+                    depth_at=depth_at)
+                predicate = _geometry_predicate(work, rule_work,
+                                                depth_at=depth_at)
         elif kind == wb_schema.RULE_KIND_KP_TABLE:
             intervals = ri.kp_table_intervals(
                 rule_work.table_rows or [], config, sampler.scope_domain)

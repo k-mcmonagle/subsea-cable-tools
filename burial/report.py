@@ -165,6 +165,11 @@ def rule_condition_text(rule: Dict) -> str:
             parts.append(f"match: {config['match_expression']}")
         elif config.get("attribute"):
             parts.append(f"{config.get('attribute')} in [{values}]")
+        corridor_mode = (config.get("route_buffer_mode") or "").lower()
+        if corridor_mode == "fixed" and config.get("route_buffer_m"):
+            parts.append(f"within {config['route_buffer_m']} m of route")
+        elif corridor_mode == "wd" and config.get("route_buffer_wd"):
+            parts.append(f"within {config['route_buffer_wd']} ×WD of route")
     elif kind == wb_schema.RULE_KIND_KP_TABLE:
         parts.append(f"fields {config.get('start_field') or 'start_kp'}/"
                      f"{config.get('end_field') or 'end_kp'}")
@@ -174,8 +179,13 @@ def rule_condition_text(rule: Dict) -> str:
         ranges = config.get("ranges") or []
         parts.append(", ".join(f"{_kp(r.get('start_kp'))}-{_kp(r.get('end_kp'))}"
                                for r in ranges) or "no ranges")
-    if config.get("extend_m"):
-        parts.append(f"extended {config['extend_m']} m")
+    from . import generation as _generation
+
+    ext = _generation.extension_config(config)
+    if ext["before"] or ext["after"]:
+        unit = "×WD" if ext["mode"] == _generation.EXTEND_MODE_WD else "m"
+        parts.append(f"extended {ext['before']:g}/{ext['after']:g} {unit} "
+                     "(before/after)")
     if config.get("influence_before_m") or config.get("influence_after_m"):
         parts.append(f"influence {config.get('influence_before_m') or 0}/"
                      f"{config.get('influence_after_m') or 0} m")
@@ -301,12 +311,15 @@ def build_report_html(plan: Dict,
             _esc(section.get("state")),
             _esc(schema.CONCLUSION_LABELS.get(section.get("conclusion") or "", "")),
             _esc(section.get("confidence")),
+            _esc(schema.SKIP_HANDLING_LABELS.get(
+                section.get("skip_handling") or "", "")
+                if kind == schema.SECTION_SKIP else ""),
             _esc(section_reason_text(section)),
             _esc(section.get("notes")),
         ))
     parts.append(_table(("#", "Kind", "Start KP", "End KP", "Length (km)",
-                         "State", "Conclusion", "Confidence", "Reasons",
-                         "Notes"), section_rows, raw=True))
+                         "State", "Conclusion", "Confidence", "Skip handling",
+                         "Reasons", "Notes"), section_rows, raw=True))
 
     # -- events ---------------------------------------------------------------
     parts.append("<h2>Events</h2>")
