@@ -495,6 +495,33 @@ class RulesTab(QWidget):
         self.step_spin.setRange(5, 5000)
         self.step_spin.setSuffix(" m")
         params_row.addWidget(self.step_spin)
+        params_row.addWidget(QLabel("Cross offset:"))
+        self.cross_offset_spin = QDoubleSpinBox()
+        self.cross_offset_spin.setRange(0.0, 10000.0)
+        self.cross_offset_spin.setDecimals(1)
+        self.cross_offset_spin.setSuffix(" m")
+        self.cross_offset_spin.setSpecialValueText("Auto (sample step)")
+        self.cross_offset_spin.setToolTip(
+            "Distance either side of the route at which depth is sampled "
+            "for the cross/absolute slope panel — set it to the burial "
+            "vehicle's half track width so the cross slope is measured at "
+            "the scale the machine spans. Auto uses the sample step. "
+            "Changing it marks the stored plan profile stale.")
+        params_row.addWidget(self.cross_offset_spin)
+        params_row.addWidget(QLabel("Profile step:"))
+        self.profile_step_spin = QDoubleSpinBox()
+        self.profile_step_spin.setRange(0.0, 5000.0)
+        self.profile_step_spin.setDecimals(1)
+        self.profile_step_spin.setSuffix(" m")
+        self.profile_step_spin.setSpecialValueText("Auto (bathy cell)")
+        self.profile_step_spin.setToolTip(
+            "Station spacing for the stored plan profile (depth and slope "
+            "panel). Auto follows the smallest configured bathymetry raster "
+            "cell — sampling finer than the data only re-reads the same "
+            "cells. Clamped between 2 m and the sample step (so Generate "
+            "can reuse the stored samples) with a ~500k-station ceiling. "
+            "Changing it marks the stored plan profile stale.")
+        params_row.addWidget(self.profile_step_spin)
         refine_label = QLabel("Boundary refinement: 1 m")
         refine_label.setToolTip(
             "Coarse sampling finds where conditions change; each boundary is "
@@ -533,6 +560,8 @@ class RulesTab(QWidget):
             self.min_section_spin.setValue(params.min_section_km)
             self.sliver_spin.setValue(params.sliver_tol_km)
             self.step_spin.setValue(int(params.coarse_step_m))
+            self.cross_offset_spin.setValue(params.cross_offset_m)
+            self.profile_step_spin.setValue(params.profile_step_m)
             rules = self.model.rules
             self.rule_table.setRowCount(len(rules))
             scope = params.scope
@@ -688,6 +717,8 @@ class RulesTab(QWidget):
             "sliver_tol_km": self.sliver_spin.value(),
             "coarse_step_m": float(self.step_spin.value()),
             "refine_tol_m": 1.0,
+            "cross_offset_m": self.cross_offset_spin.value(),
+            "profile_step_m": self.profile_step_spin.value(),
         })}, reason="analysis parameters")
         self._recompute()
 

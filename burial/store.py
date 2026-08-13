@@ -55,6 +55,8 @@ class BurialStore:
                  transform_context: Optional[QgsCoordinateTransformContext] = None):
         self.gpkg_path = gpkg_path
         self.transform_context = transform_context or QgsProject.instance().transformContext()
+        # Next change-log seq per plan, so appends need not re-read the log.
+        self._change_seq: Dict[str, int] = {}
 
     # -- lifecycle ----------------------------------------------------------
     def exists(self) -> bool:
@@ -131,6 +133,40 @@ class BurialStore:
                      if str(r.get(key_field)) not in drop]
         self.write_table(table, remaining)
 
+    def append_rows(self, table: str, rows: Sequence[Dict]) -> None:
+        """Append new rows to a registry table without rewriting it.
+
+        The change log is append-only and can grow large, so a whole-table
+        rewrite per entry is the wrong cost profile. Uses the provider's
+        addFeatures; falls back to the standard whole-table upsert when the
+        layer cannot be opened or the provider rejects the append.
+        """
+        prepared = [dict(r) for r in rows]
+        layer = open_gpkg_layer(self.gpkg_path, table)
+        if layer is not None and layer.isValid():
+            try:
+                from qgis.core import QgsFeature
+
+                fields = layer.fields()
+                feats = []
+                for row in prepared:
+                    feat = QgsFeature(fields)
+                    for idx in range(fields.count()):
+                        name = fields.at(idx).name()
+                        if name.lower() == "fid":
+                            continue
+                        value = row.get(name)
+                        if value is not None:
+                            feat.setAttribute(idx, value)
+                    feats.append(feat)
+                result = layer.dataProvider().addFeatures(feats)
+                ok = result[0] if isinstance(result, tuple) else bool(result)
+                if ok:
+                    return
+            except Exception:
+                pass
+        self.upsert_rows(table, prepared)
+
     # -- meta ----------------------------------------------------------------
     def read_meta(self) -> Dict[str, str]:
         return {r["key"]: r["value"]
@@ -170,10 +206,12 @@ class BurialStore:
         self.delete_rows(schema.TABLE_PLAN, [plan_id])
         for table in (schema.TABLE_INPUT, schema.TABLE_RULE,
                       schema.TABLE_GENERATION, schema.TABLE_EVENT,
-                      schema.TABLE_SECTION, schema.TABLE_CHANGE_LOG):
+                      schema.TABLE_SECTION, schema.TABLE_CHANGE_LOG,
+                      schema.TABLE_PROFILE):
             remaining = [r for r in self.read_table(table)
                          if r.get("plan_id") != plan_id]
             self.write_table(table, remaining)
+        self._change_seq.pop(plan_id, None)
 
     def duplicate_plan(self, plan_id: str, new_name: str) -> str:
         """Deep copy of inputs/rules/events/sections with new ids; the copy
@@ -245,6 +283,14 @@ class BurialStore:
             new_sections.append(new_row)
         if new_sections:
             self.upsert_rows(schema.TABLE_SECTION, new_sections)
+
+        # The sampled profile is derived but expensive — carry the copy over.
+        profile_row = self.get_plan_profile(plan_id)
+        if profile_row is not None:
+            profile_copy = dict(profile_row)
+            profile_copy["profile_id"] = schema.new_id()
+            profile_copy["plan_id"] = new_plan_id
+            self.upsert_rows(schema.TABLE_PROFILE, [profile_copy])
         return new_plan_id
 
     # -- inputs --------------------------------------------------------------
@@ -353,6 +399,22 @@ class BurialStore:
             normalised.append(row)
         self.write_table(schema.TABLE_SECTION, others + normalised)
 
+    # -- sampled profile -----------------------------------------------------
+    def get_plan_profile(self, plan_id: str) -> Optional[Dict]:
+        rows = [r for r in self.read_table(schema.TABLE_PROFILE)
+                if r.get("plan_id") == plan_id]
+        rows.sort(key=lambda r: (r.get("created_utc") or ""))
+        return rows[-1] if rows else None
+
+    def save_plan_profile(self, row: Dict) -> str:
+        """Replace the plan's sampled profile (one per plan, derived data)."""
+        row = dict(row)
+        row.setdefault("profile_id", schema.new_id())
+        others = [r for r in self.read_table(schema.TABLE_PROFILE)
+                  if r.get("plan_id") != row.get("plan_id")]
+        self.write_table(schema.TABLE_PROFILE, others + [row])
+        return row["profile_id"]
+
     # -- change log ----------------------------------------------------------
     def list_change_log(self, plan_id: str) -> List[Dict]:
         rows = [r for r in self.read_table(schema.TABLE_CHANGE_LOG)
@@ -363,11 +425,16 @@ class BurialStore:
     def append_change(self, plan_id: str, action: str, target_id: str = "",
                       before: Optional[Dict] = None, after: Optional[Dict] = None,
                       reason: str = "") -> Dict:
-        entries = self.list_change_log(plan_id)
+        # Store only the rows that actually changed; rollback inversion is
+        # per-row keyed, so full-table snapshots would only add bulk.
+        before, after = change_log.delta_tables(before, after)
+        seq = self._change_seq.get(plan_id)
+        if seq is None:
+            seq = change_log.next_seq(self.list_change_log(plan_id))
         entry = change_log.make_entry(
-            plan_id, change_log.next_seq(entries), action, target_id,
-            before, after, reason)
-        self.upsert_rows(schema.TABLE_CHANGE_LOG, [entry])
+            plan_id, seq, action, target_id, before, after, reason)
+        self.append_rows(schema.TABLE_CHANGE_LOG, [entry])
+        self._change_seq[plan_id] = seq + 1
         return entry
 
     def rollback_to(self, plan_id: str, change_id: str) -> Dict:

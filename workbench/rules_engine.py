@@ -242,6 +242,11 @@ def _cond_bounds(op: str, value: float, value2: Optional[float]) -> Tuple[float,
     return (-math.inf, math.inf)
 
 
+# Public name for the Burial Planner's refinement predicates
+# (burial/analysis_task.py); keep it stable when refactoring.
+cond_bounds = _cond_bounds
+
+
 def _segment_true_range(
     v0: float, v1: float, lo: float, hi: float
 ) -> Optional[Tuple[float, float]]:

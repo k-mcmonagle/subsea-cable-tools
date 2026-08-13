@@ -99,6 +99,66 @@ def layer_fingerprint(layer: Optional[QgsMapLayer]) -> str:
     return f"{source}|{suffix}|{stamp}|{count}"
 
 
+def depth_config_fingerprint(project: Optional[QgsProject], depth_config) -> str:
+    """Combined content fingerprint of every configured bathymetry layer.
+
+    One formula shared by threshold-rule cache keys and the persisted plan
+    profile's currency check, so "the samples are current" and "the rule
+    cache is current" can never disagree.
+    """
+    project = project or QgsProject.instance()
+    return "|".join(
+        layer_fingerprint(project.mapLayer(layer_id))
+        for layer_id in depth_config.raster_layer_ids
+    ) + "|" + "|".join(
+        layer_fingerprint(project.mapLayer(entry.get("layer_id", "")))
+        for entry in depth_config.contour_layers)
+
+
+def min_raster_cell_size_m(project: Optional[QgsProject], depth_config
+                           ) -> Optional[float]:
+    """Smallest cell size (m) among the configured bathymetry rasters.
+
+    Sampling finer than the raster cell re-reads the same cell — cost
+    without content — so the profile step's Auto mode follows this.
+    Geographic rasters are converted with a cos(latitude) approximation at
+    the layer's extent centre (a sampling-step choice, not a measurement).
+    Returns None when no usable raster is configured (e.g. contours only).
+    """
+    import math
+
+    project = project or QgsProject.instance()
+    best: Optional[float] = None
+    for layer_id in getattr(depth_config, "raster_layer_ids", []) or []:
+        layer = project.mapLayer(layer_id)
+        if not isinstance(layer, QgsRasterLayer) or not layer.isValid():
+            continue
+        try:
+            upp_x = abs(float(layer.rasterUnitsPerPixelX()))
+            upp_y = abs(float(layer.rasterUnitsPerPixelY()))
+        except Exception:
+            continue
+        if upp_x <= 0 and upp_y <= 0:
+            continue
+        try:
+            geographic = layer.crs().isGeographic()
+        except Exception:
+            geographic = False
+        if geographic:
+            try:
+                lat = math.radians(layer.extent().center().y())
+            except Exception:
+                lat = 0.0
+            candidates = [upp_x * 111320.0 * max(math.cos(lat), 0.087),
+                          upp_y * 110540.0]
+        else:
+            candidates = [upp_x, upp_y]
+        cell = min(c for c in candidates if c > 0)
+        if best is None or cell < best:
+            best = cell
+    return best
+
+
 def rpl_fingerprint(rpl_row: Optional[Dict], gpkg_path: str = "") -> str:
     """Stale-detection fingerprint for a Workbench RPL revision."""
     if not rpl_row:
@@ -339,3 +399,96 @@ def remove_plan_layers(project: Optional[QgsProject], gpkg_path: str, plan: Dict
         layer = find_layer(project, gpkg_path, name)
         if layer is not None:
             project.removeMapLayer(layer.id())
+
+
+# -- project-open self-healing ----------------------------------------------
+
+
+def _burial_layer_name(source: str) -> str:
+    """The gpkg layer name when ``source`` looks like a burial plan layer."""
+    for part in str(source or "").split("|")[1:]:
+        key, sep, value = part.partition("=")
+        if sep and key.lower() == "layername" and value.startswith("bp_") \
+                and (value.endswith("_sections") or value.endswith("_events")):
+            return value
+    return ""
+
+
+def discover_gpkg_path(project: Optional[QgsProject] = None) -> Optional[str]:
+    """Find the project's burial-plans GeoPackage without creating one.
+
+    Mirrors the Workbench recovery order: the saved project entry, the same
+    basename beside a relocated project file, then the conventional default
+    path. Returns None when no valid registry is found.
+    """
+    from .store import (
+        BurialStore,
+        default_project_gpkg_path,
+        project_gpkg_path,
+    )
+
+    project = project or QgsProject.instance()
+
+    def is_store(path: Optional[str]) -> bool:
+        if not path:
+            return False
+        try:
+            return BurialStore(path).exists()
+        except Exception:
+            return False
+
+    saved = project_gpkg_path(project)
+    if is_store(saved):
+        return saved
+    project_file = project.fileName() or ""
+    folder = os.path.dirname(os.path.abspath(project_file)) if project_file else ""
+    if saved and folder:
+        relocated = os.path.join(folder, os.path.basename(saved))
+        if is_store(relocated):
+            return relocated
+    fallback = default_project_gpkg_path(project)
+    if is_store(fallback):
+        return fallback
+    return None
+
+
+def restore_burial_layers(project: Optional[QgsProject] = None) -> int:
+    """Repair broken burial plan layers after a project opens. Never raises.
+
+    Runs on ``projectRead`` without requiring the dock: any ``bp_*``
+    sections/events layer whose source no longer resolves (moved GeoPackage,
+    stale relative path, ...) is pointed back at the project's discovered
+    burial-plans GeoPackage and re-styled. Repair only — plan layers are
+    added when a plan is opened in the dock, never here.
+    Returns the number of layers repaired.
+    """
+    try:
+        project = project or QgsProject.instance()
+        broken = [layer for layer in project.mapLayers().values()
+                  if isinstance(layer, QgsVectorLayer) and not layer.isValid()
+                  and _burial_layer_name(layer.source())]
+        if not broken:
+            return 0
+        gpkg_path = discover_gpkg_path(project)
+        if not gpkg_path:
+            return 0
+        from ..workbench.project_layers import repair_layer
+        from ..processing.cable_lay_parsers import open_gpkg_layer
+
+        touched = 0
+        for layer in broken:
+            name = _burial_layer_name(layer.source())
+            if open_gpkg_layer(gpkg_path, name) is None:
+                continue
+            if repair_layer(layer, gpkg_path, name):
+                style_fn = (apply_sections_style if name.endswith("_sections")
+                            else apply_events_style)
+                style_fn(layer)
+                try:
+                    layer.setReadOnly(True)
+                except Exception:
+                    pass
+                touched += 1
+        return touched
+    except Exception:
+        return 0

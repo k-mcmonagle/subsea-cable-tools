@@ -4,7 +4,7 @@
 Thread-safety contract (spec §14.1): the task never touches ``QgsProject``,
 GUI objects or live layers. On the main thread, ``build_work`` resolves
 inputs and clones everything into worker-safe snapshots — feature geometries
-via the ``_load_features_wgs84`` pattern, vector feature sources via
+via the ``rules_inputs.load_features_wgs84`` pattern, vector feature sources via
 ``QgsVectorLayerFeatureSource``, raster providers via ``provider.clone()``,
 and rule configs as dicts. The task consumes snapshots only; results come
 back as plain interval data; store/layer writes happen in ``finished()`` on
@@ -49,6 +49,27 @@ from ..workbench.rules_engine import Interval
 from . import generation, map_layers, schema
 
 WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
+
+
+def _log_callback_failure(context: str) -> None:
+    """A completion callback failed on the main thread.
+
+    The callback runs the whole post-analysis pipeline (generation + store
+    writes), so the guard that keeps QGIS alive must not also make the
+    failure invisible: log the traceback to the QGIS message log.
+    """
+    import traceback
+
+    try:
+        from qgis.core import QgsMessageLog
+
+        from ..qgis_compat import MESSAGE_CRITICAL
+
+        QgsMessageLog.logMessage(
+            f"{context}: completion handler failed\n{traceback.format_exc()}",
+            "Burial Planner", MESSAGE_CRITICAL)
+    except Exception:  # pragma: no cover — logging must never raise
+        pass
 
 
 def _task_flag(name: str, default: int = 0):
@@ -209,7 +230,7 @@ class DepthSnapshot:
         if want_contours and self._contours:
             # 0 = unlimited (DepthService semantics): scan every contour.
             if self.search_radius_m > 0 and self._contour_index is not None:
-                rect = ri._search_rect(point, self.search_radius_m)
+                rect = ri.search_rect(point, self.search_radius_m)
                 candidates = self._contour_index.intersects(rect)
             else:
                 candidates = range(len(self._contours))
@@ -427,6 +448,9 @@ class AnalysisWork:
     refine_tol_m: float
     depth: Optional[DepthSnapshot]
     rules: List[RuleWork] = field(default_factory=list)
+    # Persisted plan-profile samples (kp, depth magnitude | None), injected
+    # when current so threshold acquisition skips resampling bathymetry.
+    depth_samples: Optional[List[Tuple[float, Optional[float]]]] = None
 
 
 @dataclass
@@ -505,7 +529,9 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
                params: generation.GenParams,
                cache: Dict[str, Tuple[List[Interval], List[Interval]]],
                rpl_fp: str,
-               project: Optional[QgsProject] = None) -> Tuple["AnalysisWork", List[str]]:
+               project: Optional[QgsProject] = None,
+               depth_samples: Optional[List[Tuple[float, Optional[float]]]] = None
+               ) -> Tuple["AnalysisWork", List[str]]:
     """Snapshot everything the task needs (main thread). Returns (work, warnings)."""
     project = project or QgsProject.instance()
     warnings: List[str] = []
@@ -517,7 +543,8 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
     work = AnalysisWork(
         route=route, distance=distance, scope=scope,
         step_m=params.coarse_step_m, direction=params.direction,
-        method=params.method, refine_tol_m=params.refine_tol_m, depth=depth)
+        method=params.method, refine_tol_m=params.refine_tol_m, depth=depth,
+        depth_samples=depth_samples)
 
     for row in rule_rows:
         if not int(row.get("enabled") or 0):
@@ -544,7 +571,7 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
             elif rule_work.config.get("layer_id") or rule_work.config.get("layer_source"):
                 # Direct layer reference (e.g. a rule copied from an Assessment).
                 try:
-                    layer = ri._resolve_layer(project, rule_work.config)
+                    layer = ri.resolve_layer(project, rule_work.config)
                 except ri.RuleInputError:
                     layer = None
             if not isinstance(layer, QgsVectorLayer) or not layer.isValid():
@@ -555,12 +582,8 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
             if depth is None or not depth.is_available():
                 rule_work.error = "no bathymetry source configured"
             else:
-                input_fp = "|".join(
-                    map_layers.layer_fingerprint(project.mapLayer(i))
-                    for i in depth_config.raster_layer_ids
-                ) + "|" + "|".join(
-                    map_layers.layer_fingerprint(project.mapLayer(
-                        c.get("layer_id", ""))) for c in depth_config.contour_layers)
+                input_fp = map_layers.depth_config_fingerprint(
+                    project, depth_config)
 
         rule_work.cache_key = generation.rule_cache_key(
             row, input_fp, scope, params.coarse_step_m, rpl_fp, params.direction)
@@ -569,7 +592,7 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
             rule_work.cached = cached
         elif not rule_work.error and needs_layer and layer is not None:
             if rule_work.kind == wb_schema.RULE_KIND_KP_TABLE:
-                expr, ctx = ri._filter_expression(
+                expr, ctx = ri.filter_expression(
                     rule_work.config.get("filter_expression", ""))
                 names = [f.name() for f in layer.fields()]
                 rows = []
@@ -581,7 +604,7 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
                     rows.append({name: feat[name] for name in names})
                 rule_work.table_rows = rows
             else:
-                index, feats = ri._load_features_wgs84(layer, project)
+                index, feats = ri.load_features_wgs84(layer, project)
                 rule_work.feats = (index, feats)
                 rule_work.geom_type = layer.geometryType()
         if rule_work.error:
@@ -656,7 +679,7 @@ def _threshold_predicate(work: AnalysisWork, config: Dict) -> Optional[Callable[
             limit = band.get("limit")
             if limit is None:
                 return False
-            lo, hi = eng._cond_bounds(op, float(limit), None)
+            lo, hi = eng.cond_bounds(op, float(limit), None)
             return lo <= value <= hi
         if signed:
             down = config.get("downslope_max_deg")
@@ -664,7 +687,7 @@ def _threshold_predicate(work: AnalysisWork, config: Dict) -> Optional[Callable[
             return ((down is not None and value < -abs(float(down)))
                     or (up is not None and value > abs(float(up))))
         value2 = config.get("value2")
-        lo, hi = eng._cond_bounds(op, float(config.get("value", 0.0)),
+        lo, hi = eng.cond_bounds(op, float(config.get("value", 0.0)),
                                   float(value2) if value2 is not None else None)
         if bool(config.get("abs", False)):
             value = abs(value)
@@ -689,7 +712,7 @@ def _geometry_predicate(work: AnalysisWork, rule_work: RuleWork
 
     attribute = config.get("attribute") or ""
     match_values = {str(v).strip().lower() for v in (config.get("match_values") or [])}
-    expr, ctx = ri._filter_expression(
+    expr, ctx = ri.filter_expression(
         config.get("match_expression" if kind == wb_schema.RULE_KIND_POLYGON
                    else "filter_expression", ""))
 
@@ -704,30 +727,34 @@ def _geometry_predicate(work: AnalysisWork, rule_work: RuleWork
         except KeyError:
             return False
 
+    # The widest per-feature buffer bounds the candidate search rect; compute
+    # it once — the predicate is evaluated many times during bisection and
+    # re-scanning every feature per call made refinement O(features) per step.
+    max_buffer = buffer_m
+    if buffer_field:
+        for _geom, feat in feats.values():
+            max_buffer = max(max_buffer,
+                             ri.feature_buffer_m(feat, buffer_field, buffer_m))
+
     def predicate(kp: float) -> bool:
         pt = route.point_at_kp(kp, clamp=True)
         if pt is None:
             return False
         pt_geom = QgsGeometry.fromPointXY(pt)
         if kind == wb_schema.RULE_KIND_POLYGON:
-            for fid in index.intersects(ri._search_rect(pt, 1.0)):
+            for fid in index.intersects(ri.search_rect(pt, 1.0)):
                 geom, feat = feats[fid]
                 if geom.contains(pt_geom) and matches(feat):
                     return True
             return False
-        max_buffer = buffer_m
-        if buffer_field:
-            for _geom, feat in feats.values():
-                max_buffer = max(max_buffer,
-                                 ri._feature_buffer_m(feat, buffer_field, buffer_m))
-        for fid in index.intersects(ri._search_rect(pt, max(max_buffer, 1.0))):
+        for fid in index.intersects(ri.search_rect(pt, max(max_buffer, 1.0))):
             geom, feat = feats[fid]
             if not matches(feat):
                 continue
-            fb = ri._feature_buffer_m(feat, buffer_field, buffer_m)
+            fb = ri.feature_buffer_m(feat, buffer_field, buffer_m)
             if rule_work.geom_type == GEOMETRY_POLYGON and geom.contains(pt_geom):
                 return True
-            if ri._distance_to_geom_m(distance, pt, geom) <= fb + 1e-6:
+            if ri.distance_to_geom_m(distance, pt, geom) <= fb + 1e-6:
                 return True
         return False
 
@@ -769,13 +796,17 @@ class BurialAnalysisTask(QgsTask):
             total = max(len(work.rules), 1)
             if work.depth is not None and work.depth.is_available():
                 self.progressMessage.emit("Preparing bathymetry sources…")
-                if not work.depth.prepare(cancel=self.isCanceled):
+                if not work.depth.prepare(
+                        cancel=self.isCanceled,
+                        progress=lambda done, count: self.setProgress(
+                            8.0 * float(done) / max(float(count), 1.0))):
                     self.cancelled = True
                     return False
             self.progressMessage.emit("Building route stations…")
             sampler = ri.RouteSampler.from_route(
                 work.route, work.distance, work.step_m, work.scope)
             self._sampler = sampler
+            self.setProgress(10.0)
             if self.isCanceled():
                 self.cancelled = True
                 return False
@@ -790,6 +821,14 @@ class BurialAnalysisTask(QgsTask):
                 name = rule_work.rule_row.get("name") or rule_work.kind
                 self.progressMessage.emit(f"Evaluating rule: {name}")
                 result = RuleResult(rule_work.rule_row, rule_work.cache_key)
+                # Sub-progress inside the rule's slot, so long phases
+                # (bathymetry sampling) advance the bar instead of stalling it.
+                base = 10.0 + 90.0 * i / total
+                span = 90.0 / total
+
+                def sub_progress(fraction: float, _base=base, _span=span) -> None:
+                    self.setProgress(_base + _span * min(max(fraction, 0.0), 1.0))
+
                 if rule_work.error:
                     result.error = rule_work.error
                 elif rule_work.cached is not None:
@@ -798,7 +837,8 @@ class BurialAnalysisTask(QgsTask):
                 else:
                     try:
                         result.footprint, result.nodata = self._acquire(
-                            sampler, rule_work, coarse_step_km, tol_km)
+                            sampler, rule_work, coarse_step_km, tol_km,
+                            progress=sub_progress)
                     except ri.AcquisitionCancelled:
                         self.cancelled = True
                         return False
@@ -807,7 +847,7 @@ class BurialAnalysisTask(QgsTask):
                     except Exception as exc:  # never let one rule crash the run
                         result.error = f"unexpected error ({exc})"
                 self.results.append(result)
-                self.setProgress(100.0 * (i + 1) / total)
+                self.setProgress(10.0 + 90.0 * (i + 1) / total)
             self.setProgress(100.0)
             return True
         except Exception as exc:  # pragma: no cover — task-level fail-safe
@@ -815,7 +855,8 @@ class BurialAnalysisTask(QgsTask):
             return False
 
     def _acquire(self, sampler: ri.RouteSampler, rule_work: RuleWork,
-                 coarse_step_km: float, tol_km: float
+                 coarse_step_km: float, tol_km: float,
+                 progress: Optional[Callable[[float], None]] = None
                  ) -> Tuple[List[Interval], List[Interval]]:
         work = self.work
         config = rule_work.config
@@ -824,13 +865,26 @@ class BurialAnalysisTask(QgsTask):
         nodata: List[Interval] = []
         predicate: Optional[Callable[[float], bool]] = None
 
+        def sample_progress(done: int, count: int) -> None:
+            if progress is not None:
+                # Sampling dominates the rule's slot; keep 10% for the rest.
+                progress(0.9 * float(done) / max(float(count), 1.0))
+
         if kind == wb_schema.RULE_KIND_THRESHOLD:
             if self._depth_series is None:
-                if work.depth is None:
-                    raise ri.RuleInputError("no bathymetry source configured")
-                self.progressMessage.emit("Sampling bathymetry along the scope…")
-                samples = work.depth.profile_samples(
-                    work.route, sampler.stations_km, cancel=cancel)
+                if work.depth_samples is not None:
+                    # Reuse the persisted plan profile — no resampling.
+                    self.progressMessage.emit(
+                        "Using stored plan profile samples…")
+                    samples = work.depth_samples
+                else:
+                    if work.depth is None:
+                        raise ri.RuleInputError("no bathymetry source configured")
+                    self.progressMessage.emit(
+                        "Sampling bathymetry along the scope…")
+                    samples = work.depth.profile_samples(
+                        work.route, sampler.stations_km, cancel=cancel,
+                        progress=sample_progress)
                 self._depth_series = [
                     (kp, abs(float(value))) for kp, value in samples
                     if value is not None]
@@ -859,11 +913,11 @@ class BurialAnalysisTask(QgsTask):
             intervals = ri.kp_table_intervals(
                 rule_work.table_rows or [], config, sampler.scope_domain)
         elif kind == wb_schema.RULE_KIND_MANUAL:
-            intervals = ri._acquire_manual(sampler, config)
+            intervals = ri.acquire_manual(sampler, config)
         else:
             raise ri.RuleInputError(f"unknown rule kind '{kind}'")
 
-        scope_ranges = ri._scope_intervals(config)
+        scope_ranges = ri.scope_intervals(config)
         intervals = eng.clip_intervals(intervals, sampler.scope_domain)
         if scope_ranges is not None:
             intervals = eng.intersect_intervals(intervals, scope_ranges)
@@ -882,27 +936,73 @@ class BurialAnalysisTask(QgsTask):
         try:
             self._on_finished(self)
         except Exception:  # never crash QGIS from a completion callback
-            pass
+            _log_callback_failure("Burial Planner analysis")
 
 
 class ProfileSamplingTask(QgsTask):
-    """Cancellable background depth sampling for the persistent profile."""
+    """Cancellable background depth sampling for the persistent profile.
+
+    With ``distance`` and ``cross_offset_m`` set, each station additionally
+    samples depth at ± the cross offset perpendicular to the route (geodesic
+    offset via ``computeSpheroidProject``), feeding the cross/absolute slope
+    series. Results: ``series`` (kp, depth magnitude — data stations only)
+    plus the full raw arrays ``kps`` / ``depths`` / ``port_depths`` /
+    ``stbd_depths`` (``None`` = no data) for persistence.
+    """
 
     progressMessage = pyqtSignal(str)
 
     def __init__(self, route: RouteFrame, depth: DepthSnapshot,
                  start_kp: float, end_kp: float, step_m: float,
-                 on_finished: Callable[["ProfileSamplingTask"], None]):
+                 on_finished: Callable[["ProfileSamplingTask"], None],
+                 distance=None, cross_offset_m: float = 0.0):
         super().__init__("Burial Planner profile", _CAN_CANCEL)
         self.route = route
         self.depth = depth
         self.start_kp = min(float(start_kp), float(end_kp))
         self.end_kp = max(float(start_kp), float(end_kp))
         self.step_m = max(float(step_m), 1.0)
+        self.distance = distance
+        self.cross_offset_m = max(float(cross_offset_m or 0.0), 0.0)
         self.series: List[Tuple[float, float]] = []
+        self.kps: List[float] = []
+        self.depths: List[Optional[float]] = []
+        self.port_depths: List[Optional[float]] = []
+        self.stbd_depths: List[Optional[float]] = []
         self.error: Optional[str] = None
         self.cancelled = False
         self._on_finished = on_finished
+
+    def _cross_sample(self, kp: float) -> Tuple[Optional[float], Optional[float]]:
+        """(port, starboard) depth magnitudes at ± the cross offset.
+
+        Starboard is to the right of increasing KP; the direction −1 sign
+        flip happens in the pure slope series, not here.
+        """
+        point = self.route.point_at_kp(kp, clamp=True)
+        if point is None:
+            return None, None
+        delta_km = max(self.step_m / 2000.0, 1e-4)
+        p0 = self.route.point_at_kp(max(kp - delta_km, 0.0), clamp=True)
+        p1 = self.route.point_at_kp(
+            min(kp + delta_km, self.route.total_length_km), clamp=True)
+        if p0 is None or p1 is None:
+            return None, None
+        try:
+            azimuth = float(self.distance.bearing(p0, p1))
+        except Exception:
+            return None, None
+        out = []
+        for side in (-1.0, 1.0):  # port first, then starboard
+            try:
+                offset_pt = self.distance.computeSpheroidProject(
+                    point, self.cross_offset_m, azimuth + side * math.pi / 2.0)
+                value = self.depth.sample(offset_pt.y(), offset_pt.x())
+            except Exception:
+                value = None
+            out.append(abs(float(value))
+                       if value is not None and value == value else None)
+        return out[0], out[1]
 
     def run(self) -> bool:
         try:
@@ -910,6 +1010,8 @@ class ProfileSamplingTask(QgsTask):
                 self.error = "No configured bathymetry layer is available in the project."
                 return False
             self.progressMessage.emit("Preparing bathymetry…")
+            cross = self.cross_offset_m > 0 and self.distance is not None
+            along_share = 50.0 if cross else 75.0
 
             def prep_progress(done: int, total: int) -> None:
                 self.setProgress(25.0 * float(done) / max(float(total), 1.0))
@@ -928,14 +1030,35 @@ class ProfileSamplingTask(QgsTask):
                          self.end_kp) for i in range(count)]
 
             def sample_progress(done: int, total: int) -> None:
-                self.setProgress(25.0 + 75.0 * float(done) /
+                self.setProgress(25.0 + along_share * float(done) /
                                  max(float(total), 1.0))
 
             samples = self.depth.profile_samples(
                 self.route, marks, cancel=self.isCanceled,
                 progress=sample_progress)
-            self.series = [(kp, abs(float(value))) for kp, value in samples
-                           if value is not None and value == value]
+            self.kps = [kp for kp, _value in samples]
+            self.depths = [abs(float(value))
+                           if value is not None and value == value else None
+                           for _kp, value in samples]
+            self.series = [(kp, depth) for kp, depth
+                           in zip(self.kps, self.depths) if depth is not None]
+
+            if cross:
+                self.progressMessage.emit(
+                    f"Sampling cross-offset depths (±{self.cross_offset_m:.0f} m)…")
+                total = max(len(self.kps), 1)
+                for index, kp in enumerate(self.kps):
+                    if index % 50 == 0 and self.isCanceled():
+                        self.cancelled = True
+                        return False
+                    port, stbd = self._cross_sample(kp)
+                    self.port_depths.append(port)
+                    self.stbd_depths.append(stbd)
+                    if index % 100 == 0 or index + 1 == total:
+                        self.setProgress(75.0 + 25.0 * (index + 1) / total)
+            else:
+                self.port_depths = [None] * len(self.kps)
+                self.stbd_depths = [None] * len(self.kps)
             self.setProgress(100.0)
             return True
         except ri.AcquisitionCancelled:
@@ -950,5 +1073,5 @@ class ProfileSamplingTask(QgsTask):
             self.error = "Profile sampling task failed."
         try:
             self._on_finished(self)
-        except Exception:
-            pass
+        except Exception:  # never crash QGIS from a completion callback
+            _log_callback_failure("Burial Planner profile")

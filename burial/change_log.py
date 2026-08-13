@@ -31,6 +31,7 @@ ACTION_DELETE_RULE = "delete_rule"
 ACTION_GENERATE = "generate"
 ACTION_ADD_EVENT = "add_event"
 ACTION_MOVE_EVENT = "move_event"
+ACTION_EDIT_EVENT = "edit_event"
 ACTION_DELETE_EVENT = "delete_event"
 ACTION_CONFIRM_EVENT = "confirm_event"
 ACTION_LOCK_EVENT = "lock_event"
@@ -81,6 +82,43 @@ def make_entry(plan_id: str, seq: int, action: str, target_id: str = "",
         "after_json": json.dumps(after or {}, default=str),
         "reason": reason or "",
     }
+
+
+def delta_tables(before: Optional[TableRows], after: Optional[TableRows]
+                 ) -> Tuple[TableRows, TableRows]:
+    """Reduce full-table before/after snapshots to only the rows that differ.
+
+    Rollback inversion (``invert_entry``) is per-row keyed, so an entry only
+    needs the added, removed and modified rows — storing whole tables made
+    every edit's log entry grow with plan size. Tables without a registered
+    key (e.g. rollback bookkeeping payloads) pass through unchanged, as does
+    a table present on only one side.
+    """
+    before = before or {}
+    after = after or {}
+    out_before: TableRows = {}
+    out_after: TableRows = {}
+    for table in set(before) | set(after):
+        key = schema.TABLE_KEYS.get(table)
+        b_rows = before.get(table) or []
+        a_rows = after.get(table) or []
+        if not key or not isinstance(b_rows, list) or not isinstance(a_rows, list):
+            if table in before:
+                out_before[table] = before[table]
+            if table in after:
+                out_after[table] = after[table]
+            continue
+        b_by = {str(r.get(key)): r for r in b_rows
+                if isinstance(r, dict) and r.get(key)}
+        a_by = {str(r.get(key)): r for r in a_rows
+                if isinstance(r, dict) and r.get(key)}
+        changed_b = [row for k, row in b_by.items() if a_by.get(k) != row]
+        changed_a = [row for k, row in a_by.items() if b_by.get(k) != row]
+        if changed_b:
+            out_before[table] = changed_b
+        if changed_a:
+            out_after[table] = changed_a
+    return out_before, out_after
 
 
 def _load(payload: str) -> TableRows:

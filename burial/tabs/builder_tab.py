@@ -174,6 +174,13 @@ class BuilderTab(QWidget):
         self.add_kp_spin.setRange(0.0, 100000.0)
         self.add_kp_spin.setSuffix(" km")
         add_row.addWidget(self.add_kp_spin)
+        pick_button = QPushButton("Pick…")
+        pick_button.setToolTip(
+            "Pick the KP by clicking the route on the map "
+            "(right-click or Esc cancels). Double-clicking the profile "
+            "also sets this KP.")
+        pick_button.clicked.connect(self._pick_add_kp)
+        add_row.addWidget(pick_button)
         add_button = QPushButton("Add event")
         add_button.clicked.connect(self._add_event)
         add_row.addWidget(add_button)
@@ -547,14 +554,7 @@ class BuilderTab(QWidget):
                 return
             self._try_move(event_id, new_kp)
         elif item.column() == 9:  # notes
-            events = [dict(e) for e in self.model.events]
-            for event in events:
-                if event.get("event_id") == event_id:
-                    event["notes"] = item.text()
-            from .. import change_log
-
-            self.model._write_events_and_sections(
-                change_log.ACTION_MOVE_EVENT, event_id, events, "notes edit")
+            self.model.set_event_notes(event_id, item.text())
 
     def _try_move(self, event_id: str, new_kp: float) -> None:
         reason = self._maybe_reason("Move event")
@@ -574,6 +574,18 @@ class BuilderTab(QWidget):
         if not ok:
             return None
         return text
+
+    def set_add_kp(self, kp: float) -> None:
+        """Prime the add-event KP (map pick / profile double-click)."""
+        self.add_kp_spin.setValue(round(float(kp), 3))
+        self.run_status.setText(
+            f"Add-event KP set to {schema.format_kp(kp)} — choose the event "
+            "type and click Add event.")
+
+    def _pick_add_kp(self) -> None:
+        self.dock.pick_kp_on_map(
+            self.set_add_kp,
+            "Click the route to set the add-event KP (right-click cancels).")
 
     def _add_event(self) -> None:
         if not self.model.plan:

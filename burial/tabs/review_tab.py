@@ -30,7 +30,7 @@ from ...qgis_compat import (
     SELECTION_BEHAVIOR_SELECT_ROWS,
     SELECTION_MODE_SINGLE,
 )
-from .. import io_csv, schema
+from .. import io_csv, report, schema
 
 _LOG_COLUMNS = ["Seq", "When (UTC)", "User", "Action", "Target", "Reason"]
 
@@ -69,6 +69,13 @@ class ReviewTab(QWidget):
         layout.addWidget(log_box, 1)
 
         export_row = QHBoxLayout()
+        report_button = QPushButton("Export report (HTML)…")
+        report_button.setToolTip(
+            "One self-contained HTML file: summary, profile snapshot, "
+            "sections, events, the Exclusion stack with source references, "
+            "input register, generation provenance and change log.")
+        report_button.clicked.connect(self._export_report)
+        export_row.addWidget(report_button)
         for label, slot in (("Export events CSV…", self._export_events),
                             ("Export sections CSV…", self._export_sections),
                             ("Export input register CSV…", self._export_inputs)):
@@ -186,6 +193,63 @@ class ReviewTab(QWidget):
             return
         with open(path, "w", encoding="utf-8", newline="") as handle:
             handle.write(text)
+
+    def _profile_png(self):
+        """Snapshot the dock's profile pane as PNG bytes, or None."""
+        try:
+            from qgis.PyQt.QtCore import QBuffer, QByteArray, QIODevice
+
+            widget = self.dock.profile
+            if widget is None or not widget.isVisible():
+                return None
+            pixmap = widget.grab()
+            if pixmap.isNull():
+                return None
+            data = QByteArray()
+            buffer = QBuffer(data)
+            open_mode = getattr(QIODevice, "OpenModeFlag", QIODevice).WriteOnly
+            buffer.open(open_mode)
+            pixmap.save(buffer, "PNG")
+            buffer.close()
+            return bytes(data)
+        except Exception:
+            return None
+
+    def _export_report(self) -> None:
+        if not self.model.plan:
+            return
+        plan_name = schema.sanitize_slug(self.model.plan.get("name") or "plan")
+        path, _filter = QFileDialog.getSaveFileName(
+            self, "Export burial plan report",
+            f"{plan_name}_burial_plan_report.html", "HTML (*.html)")
+        if not path:
+            return
+        active = self.model.store.active_generation(self.model.plan_id) or {}
+        entries = self.model.store.list_change_log(self.model.plan_id)
+        text = report.build_report_html(
+            plan=self.model.plan, sections=self.model.sections,
+            events=self.model.events, rules=self.model.rules,
+            inputs=self.model.inputs, generation=active,
+            change_log=entries, profile_png=self._profile_png())
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+        except OSError as exc:
+            QMessageBox.warning(self, "Burial Planner",
+                                f"Could not write the report: {exc}")
+            return
+        answer = QMessageBox.question(
+            self, "Burial Planner",
+            "Report exported. Open it in the browser now?",
+            MESSAGE_BOX_YES | MESSAGE_BOX_NO, MESSAGE_BOX_YES)
+        if answer == MESSAGE_BOX_YES:
+            try:
+                from qgis.PyQt.QtCore import QUrl
+                from qgis.PyQt.QtGui import QDesktopServices
+
+                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+            except Exception:
+                pass
 
     def _export_events(self) -> None:
         if self.model.plan:

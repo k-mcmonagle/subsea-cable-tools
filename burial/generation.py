@@ -42,12 +42,19 @@ class GenParams:
     coarse_step_m: float = 50.0
     refine_tol_m: float = 1.0
     sliver_tol_km: float = 0.0
+    cross_offset_m: float = 0.0     # 0 = auto (analysis step)
+    profile_step_m: float = 0.0     # 0 = auto (bathymetry cell size)
 
     @property
     def scope(self) -> Interval:
         lo = min(self.scope_start_kp, self.scope_end_kp)
         hi = max(self.scope_start_kp, self.scope_end_kp)
         return Interval(lo, max(hi, lo + 1e-9))
+
+    @property
+    def effective_cross_offset_m(self) -> float:
+        """Cross-slope sampling offset with the auto default resolved."""
+        return self.cross_offset_m if self.cross_offset_m > 0 else self.coarse_step_m
 
     def to_dict(self) -> Dict:
         return {
@@ -59,6 +66,8 @@ class GenParams:
             "coarse_step_m": self.coarse_step_m,
             "refine_tol_m": self.refine_tol_m,
             "sliver_tol_km": self.sliver_tol_km,
+            "cross_offset_m": self.cross_offset_m,
+            "profile_step_m": self.profile_step_m,
         }
 
 

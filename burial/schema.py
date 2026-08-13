@@ -35,7 +35,7 @@ from ..workbench.schema import (  # noqa: F401  (re-exported for the package)
     utc_now_iso,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Registry table names ------------------------------------------------------
 TABLE_META = "bp_meta"
@@ -46,6 +46,7 @@ TABLE_GENERATION = "bp_generation"
 TABLE_EVENT = "bp_event"
 TABLE_SECTION = "bp_section"
 TABLE_CHANGE_LOG = "bp_change_log"
+TABLE_PROFILE = "bp_profile"
 
 FieldSpec = Tuple[str, str]
 
@@ -265,6 +266,17 @@ SECTION_FIELDS: List[FieldSpec] = [
     ("notes", "str"),
 ]
 
+# One persisted sampling pass per plan (depth + optional cross-offset
+# depths): derived data — rebuilt on demand, never change-logged.
+PROFILE_FIELDS: List[FieldSpec] = [
+    ("profile_id", "str"),
+    ("plan_id", "str"),
+    ("created_utc", "str"),
+    ("params_json", "str"),          # step/cross offset/scope/fingerprints
+    ("samples_json", "str"),         # kps/depths/port/stbd arrays
+    ("sample_count", "int"),
+]
+
 CHANGE_LOG_FIELDS: List[FieldSpec] = [
     ("change_id", "str"),
     ("plan_id", "str"),
@@ -287,6 +299,7 @@ REGISTRY_TABLES: Dict[str, List[FieldSpec]] = {
     TABLE_EVENT: EVENT_FIELDS,
     TABLE_SECTION: SECTION_FIELDS,
     TABLE_CHANGE_LOG: CHANGE_LOG_FIELDS,
+    TABLE_PROFILE: PROFILE_FIELDS,
 }
 
 TABLE_KEYS: Dict[str, str] = {
@@ -297,6 +310,7 @@ TABLE_KEYS: Dict[str, str] = {
     TABLE_EVENT: "event_id",
     TABLE_SECTION: "section_id",
     TABLE_CHANGE_LOG: "change_id",
+    TABLE_PROFILE: "profile_id",
 }
 
 # Per-plan spatial layer schemas -------------------------------------------

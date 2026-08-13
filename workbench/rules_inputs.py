@@ -720,3 +720,21 @@ def run_assessment(store, rpl_id: str, rule_set_id: str, *, sample_step_m: float
     result = eng.evaluate(sampler.domain, methods, hits, min_range_km=min_range_km)
     result.warnings = warnings
     return result, sampler
+
+
+# ---------------------------------------------------------------------------
+# Public acquisition API
+#
+# These helpers started life as module-private but are part of the Burial
+# Planner's acquisition pipeline (burial/analysis_task.py). The public names
+# below are the stable contract: keep them working (or deprecate loudly)
+# when refactoring the underscore-prefixed implementations.
+# ---------------------------------------------------------------------------
+resolve_layer = _resolve_layer
+load_features_wgs84 = _load_features_wgs84
+search_rect = _search_rect
+distance_to_geom_m = _distance_to_geom_m
+filter_expression = _filter_expression
+feature_buffer_m = _feature_buffer_m
+acquire_manual = _acquire_manual
+scope_intervals = _scope_intervals

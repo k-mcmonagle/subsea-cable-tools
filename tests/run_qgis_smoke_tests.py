@@ -130,6 +130,8 @@ def main() -> int:
         ("burial planner events (pure)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_burial_events")),
         ("burial planner generation (pure)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_burial_generation")),
         ("burial planner IO + import scan (pure)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_burial_io")),
+        ("burial planner report (pure)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_burial_report")),
+        ("burial planner profile data (pure)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_burial_profile_data")),
         ("burial planner store", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_burial_store")),
         ("burial planner acquisition + task", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_burial_task")),
         ("planner timeline", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_planner_timeline")),

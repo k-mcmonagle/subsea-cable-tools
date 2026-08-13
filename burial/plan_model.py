@@ -29,12 +29,14 @@ from ..workbench.depth_service import DepthService, DepthSourceConfig
 from ..workbench.rules_engine import Interval
 from . import change_log, events as ev, generation, io_csv, map_layers, schema
 from .analysis_task import build_route_frame
+from .profile_data import PlanProfile
 from .store import BurialStore
 
 
 _BUILDER_UNDO_ACTIONS = {
     change_log.ACTION_ADD_EVENT,
     change_log.ACTION_MOVE_EVENT,
+    change_log.ACTION_EDIT_EVENT,
     change_log.ACTION_DELETE_EVENT,
     change_log.ACTION_CONFIRM_EVENT,
     change_log.ACTION_LOCK_EVENT,
@@ -71,6 +73,7 @@ class PlanModel(QObject):
         self.route_notice = ""
         self.acq_cache: Dict[str, Tuple[List[Interval], List[Interval]]] = {}
         self.route_error = ""
+        self.bathy_profile: Optional[PlanProfile] = None
 
     # -- store write wrapper (Planner pattern) -------------------------------
     def _store_write(self, action: str, func: Callable, *args, **kwargs):
@@ -113,6 +116,8 @@ class PlanModel(QObject):
             coarse_step_m=float(stored.get("coarse_step_m", 50.0)),
             refine_tol_m=float(stored.get("refine_tol_m", 1.0)),
             sliver_tol_km=float(stored.get("sliver_tol_km", 0.0)),
+            cross_offset_m=float(stored.get("cross_offset_m", 0.0)),
+            profile_step_m=float(stored.get("profile_step_m", 0.0)),
         )
 
     def load_plan(self, plan_id: str) -> bool:
@@ -125,6 +130,8 @@ class PlanModel(QObject):
         self.events = self.store.list_events(plan_id)
         self.sections = self.store.list_sections(plan_id)
         self.acq_cache.clear()
+        self.bathy_profile = PlanProfile.from_row(
+            self.store.get_plan_profile(plan_id))
         self._load_context()
         self._load_route()
         self._check_stale()
@@ -146,6 +153,7 @@ class PlanModel(QObject):
         self.resolved_rpl_id = ""
         self.route_notice = ""
         self.acq_cache.clear()
+        self.bathy_profile = None
         self.planChanged.emit()
 
     def _load_context(self) -> None:
@@ -266,6 +274,61 @@ class PlanModel(QObject):
 
     def depth_service(self) -> DepthService:
         return DepthService(self.depth_config(), QgsProject.instance())
+
+    def depth_fingerprint(self) -> str:
+        """Combined fingerprint of the configured bathymetry layers."""
+        return map_layers.depth_config_fingerprint(
+            QgsProject.instance(), self.depth_config())
+
+    # -- sampled plan profile ------------------------------------------------
+    def resolve_profile_step_m(self, params: Optional[generation.GenParams] = None
+                               ) -> float:
+        """The station step the plan profile should be sampled at (m).
+
+        Manual (``profile_step_m`` > 0) wins; Auto follows the smallest
+        configured bathymetry raster cell (contours fall back to 5 m) — the
+        finest scale the data actually contains. Both are clamped to the
+        analysis step (so the stored series stays reusable by Generate),
+        floored at 2 m, and never allowed past ~500k stations.
+        """
+        params = params or self.gen_params()
+        if params.profile_step_m > 0:
+            step = float(params.profile_step_m)
+        else:
+            cell = map_layers.min_raster_cell_size_m(
+                QgsProject.instance(), self.depth_config())
+            step = float(cell) if cell else 5.0
+        step = min(max(step, 2.0), max(params.coarse_step_m, 2.0))
+        floor = params.scope.length_km * 1000.0 / 500000.0
+        return round(max(step, floor), 3)
+
+    def profile_state(self) -> str:
+        """'missing' | 'current' | 'stale' for the persisted plan profile."""
+        profile = self.bathy_profile
+        if profile is None or not profile.kps:
+            return "missing"
+        params = self.gen_params()
+        scope = params.scope
+        current = profile.is_current(
+            self.current_rpl_fingerprint(), self.depth_fingerprint(),
+            scope.start_km, scope.end_km,
+            params.effective_cross_offset_m)
+        # A changed target step (manual override, different raster cell,
+        # tighter analysis step) also warrants a resample.
+        current = current and abs(
+            profile.step_m - self.resolve_profile_step_m(params)) < 0.01
+        return "current" if current else "stale"
+
+    def save_profile(self, profile: PlanProfile) -> bool:
+        """Persist one sampling pass (derived data — not change-logged)."""
+        if not self.plan_id:
+            return False
+        ok, _ = self._store_write(
+            "save the sampled profile", self.store.save_plan_profile,
+            profile.to_row(self.plan_id))
+        if ok:
+            self.bathy_profile = profile
+        return ok
 
     def _stamp_position(self, event: Dict) -> None:
         """kp is the sole edit surface; lat/lon/depth are derived (spec §13)."""
@@ -521,6 +584,16 @@ class PlanModel(QObject):
             updated.append(copy)
         return self._write_events_and_sections(
             action, ",".join(sorted(wanted)), updated, "")
+
+    def set_event_notes(self, event_id: str, notes: str) -> bool:
+        updated = []
+        for event in self.events:
+            copy = dict(event)
+            if copy.get("event_id") == event_id:
+                copy["notes"] = notes
+            updated.append(copy)
+        return self._write_events_and_sections(
+            change_log.ACTION_EDIT_EVENT, event_id, updated, "notes edit")
 
     def set_event_locked(self, event_ids: List[str], locked: bool) -> bool:
         wanted = set(event_ids)

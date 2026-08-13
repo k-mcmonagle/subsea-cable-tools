@@ -25,12 +25,22 @@ section references in brackets.
   separate action picker — one decision instead of two that can contradict;
   `allow`-action rules imported from an Assessment keep their engineer's-
   exception semantics through editing.
-- **[§10 Tab 2/5] Map-pick for scope KPs and map-pick/profile-click event
-  placement are not in v1**; scope is set by spinboxes/full-route and events
-  by typed KP, table edit, nudge and profile drag — the remaining pickers are
-  a small additive map-tool, deferred to keep v1 reviewable.
-- **[§11.5] Cross-slope is deferred** (the spec itself says "confirm before
-  building" and it is open question 4); nothing in the schema blocks it.
+- **[§10 Tab 2/5] Map-pick for scope KPs and event placement shipped after
+  v1** as a one-shot snap-to-route map tool (`kp_pick_tool.py`): *Pick…*
+  buttons fill the scope and add-event KP spinboxes, and a profile
+  double-click primes the add-event KP — filling the entry surfaces rather
+  than mutating the plan directly keeps the existing validation and reason
+  prompts as the single write path.
+- **[§11.5] Cross-slope shipped as a display series first, not a criterion**:
+  the slope panel shows longitudinal, cross and absolute slope from the
+  persisted plan profile, with cross slope a two-point difference across a
+  configurable ± offset (default auto = analysis step; set it to the
+  vehicle's half track width). Signs follow the plugin convention —
+  longitudinal +ve = up-slope, cross +ve = deeper to starboard of the
+  direction of installation (direction −1 flips it). A cross-slope
+  *exclusion rule* remains future work: the display series lets engineers
+  see the data before criteria are formalised, and nothing in the schema
+  blocks the rule later.
 - **[§14.5 / §12.9] Generation writes are atomic per table, not across
   tables**: the store follows the Workbench/Planner whole-layer-rewrite
   pattern which has no cross-table transaction; all generation writes happen
@@ -51,10 +61,38 @@ section references in brackets.
 
 ## Notable interpretations (spec silent or open)
 
-- **Rollback mechanics**: every change-log entry stores the complete affected
-  rows per table in `before_json`/`after_json`; rollback inverts entries
-  newest-first (delete rows added, restore rows before). Simple, exact, and
-  testable without replaying actions.
+- **Rollback mechanics**: every change-log entry stores the affected rows per
+  table in `before_json`/`after_json`; rollback inverts entries newest-first
+  (delete rows added, restore rows before). Simple, exact, and testable
+  without replaying actions. Entries originally snapshotted the *complete*
+  tables; they now store only the added/removed/modified rows
+  (`change_log.delta_tables`) — inversion is per-row keyed, so rollback
+  behaviour is unchanged while entries stay O(edit) instead of O(plan). New
+  entries are appended through the provider (whole-table rewrite kept as
+  fallback) with the next seq cached per plan.
+- **Sample once, plan fast**: bathymetry sampling moved from
+  every-refresh to one persisted pass per plan (`bp_profile`, schema v3).
+  The stored samples carry the fingerprints (route, bathymetry inputs),
+  scope and cross offset they were built with; any mismatch marks them
+  *stale* — shown, never silently rebuilt — and only *Resample profile*
+  (or the automatic first build for a never-sampled plan) reruns sampling.
+  The threshold-rule analysis consumes the stored series when current, so
+  Generate stops resampling too; the 1 m boundary-refinement predicate
+  still samples live rasters (bounded evaluations, exact boundaries). An
+  empty sampling result never replaces stored samples. Derived data — not
+  change-logged, copied on plan duplicate. The station step follows the
+  data: Auto = the smallest configured bathymetry raster cell (5 m for
+  contour-only sources), manually overridable, clamped between 2 m and the
+  analysis step with a ~500k-station ceiling — dense sampling of long
+  routes was made viable by the RouteFrame chainage index, which replaced
+  the per-call full-route walk in ``point_at_kp`` with a one-off index +
+  bisection (bit-identical results, asserted in tests).
+- **Report export is one self-contained HTML file** (`report.py`, pure
+  python): inline CSS and a base64-embedded profile snapshot, so the report
+  survives email/archive without sidecar files, prints acceptably from the
+  browser, and needs no PDF dependency (the no-new-dependencies gate).
+  Content is formatting-only over registry rows — nothing is recomputed, so
+  the report cannot disagree with the tool state it was exported from.
 - **Conflict clearing**: a `conflict` event whose KP is no longer inside an
   Exclusion Area after regeneration is reset to `candidate` (with a warning),
   not silently back to `confirmed` — the engineer re-confirms it.

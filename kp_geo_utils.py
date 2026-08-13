@@ -27,6 +27,7 @@ KP semantics
 
 from __future__ import annotations
 
+import bisect
 from typing import Iterable, Iterator, List, NamedTuple, Optional, Sequence, Union
 
 from qgis.core import (
@@ -647,10 +648,74 @@ class RouteFrame:
 
     # ----- queries -----
 
+    def _ensure_chainage(self) -> None:
+        """Build the per-segment chainage index once (lazily).
+
+        ``point_at_kp`` used to re-walk every vertex with one geodesic
+        measurement per segment on *every* call — O(vertices) per lookup,
+        which made dense sampling of long routes quadratic. The index costs
+        one full walk, after which each lookup is a bisect. Same segments,
+        same ``measureLine`` calls in the same order, so cumulative chainage
+        is identical to the walking implementation.
+        """
+        if getattr(self, "_seg_end_m", None) is not None:
+            return
+        seg_end: List[float] = []
+        segs: List[tuple] = []  # (p1, p2, seg_len_m, cumulative_at_p1_m)
+        cumulative = 0.0
+        first_point: Optional[QgsPointXY] = None
+        last_point: Optional[QgsPointXY] = None
+        for geom in self._geoms:
+            for part in iter_line_parts(geom):
+                if len(part) < 2:
+                    continue
+                if first_point is None:
+                    first_point = QgsPointXY(part[0])
+                for i in range(len(part) - 1):
+                    p1 = part[i]
+                    p2 = part[i + 1]
+                    try:
+                        seg_len = float(self._distance.measureLine(p1, p2))
+                    except Exception:
+                        continue
+                    if seg_len <= 0:
+                        continue
+                    segs.append((p1, p2, seg_len, cumulative))
+                    cumulative += seg_len
+                    seg_end.append(cumulative)
+                    last_point = QgsPointXY(p2)
+        self._segs = segs
+        self._seg_end_m = seg_end
+        self._chain_total_m = cumulative
+        self._chain_first = first_point
+        self._chain_last = last_point
+
     def point_at_kp(self, kp_km: float, *, clamp: bool = False) -> Optional[QgsPointXY]:
-        return point_at_kp(
-            self._geoms, kp_km, self._distance, clamp=clamp,
-            follow_stored_geometry=self._follow_stored_geometry)
+        try:
+            target_m = float(kp_km) * 1000.0
+        except Exception:
+            return None
+        if target_m < 0.0:
+            if not clamp:
+                return None
+            target_m = 0.0
+        self._ensure_chainage()
+        if not self._segs:
+            return None
+        if target_m > self._chain_total_m:
+            if clamp:
+                return (self._chain_last if self._chain_last is not None
+                        else self._chain_first)
+            return None
+        index = bisect.bisect_left(self._seg_end_m, target_m)
+        if index >= len(self._segs):
+            index = len(self._segs) - 1
+        p1, p2, seg_len, cum_start = self._segs[index]
+        if self._follow_stored_geometry:
+            return _interpolate_on_stored_segment(
+                p1, p2, target_m - cum_start, seg_len)
+        return _interpolate_on_segment(
+            p1, p2, self._distance, target_m - cum_start, seg_len)
 
     def kp_at_point(self, point_xy: QgsPointXY) -> KPHit:
         return kp_at_point(self._geoms, point_xy, self._distance)

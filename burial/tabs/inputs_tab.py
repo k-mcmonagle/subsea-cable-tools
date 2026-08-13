@@ -146,10 +146,11 @@ class InputDialog(QDialog):
 
 
 class InputsTab(QWidget):
-    def __init__(self, model, workbench_store_fn, parent=None):
+    def __init__(self, model, workbench_store_fn, dock=None, parent=None):
         super().__init__(parent)
         self.model = model
         self.workbench_store_fn = workbench_store_fn  # () -> WorkbenchStore | None
+        self.dock = dock  # BurialPlannerDock, for KP map picking
         self._loading = False
 
         # Keep forms at a readable measure when the floating dock is maximised
@@ -204,8 +205,20 @@ class InputsTab(QWidget):
             spin.setSuffix(" km")
         scope_row.addWidget(QLabel("KP"))
         scope_row.addWidget(self.scope_start)
+        self.scope_pick_start = QPushButton("Pick…")
+        self.scope_pick_start.clicked.connect(
+            lambda: self._pick_scope_kp(self.scope_start, "start"))
+        scope_row.addWidget(self.scope_pick_start)
         scope_row.addWidget(QLabel("to"))
         scope_row.addWidget(self.scope_end)
+        self.scope_pick_end = QPushButton("Pick…")
+        self.scope_pick_end.clicked.connect(
+            lambda: self._pick_scope_kp(self.scope_end, "end"))
+        scope_row.addWidget(self.scope_pick_end)
+        for button in (self.scope_pick_start, self.scope_pick_end):
+            button.setToolTip(
+                "Pick the KP by clicking the route on the map (right-click "
+                "or Esc cancels). Apply scope / direction saves it.")
         self.full_route_button = QPushButton("Full route")
         self.full_route_button.clicked.connect(self._full_route)
         scope_row.addWidget(self.full_route_button)
@@ -427,6 +440,14 @@ class InputsTab(QWidget):
         if self.model.route is not None:
             self.scope_start.setValue(0.0)
             self.scope_end.setValue(self.model.route.total_length_km)
+
+    def _pick_scope_kp(self, spin, which: str) -> None:
+        if self.dock is None:
+            return
+        self.dock.pick_kp_on_map(
+            spin.setValue,
+            f"Click the route to pick the scope {which} KP "
+            "(right-click cancels).")
 
     def _apply_scope(self) -> None:
         saved = self.model.update_plan({

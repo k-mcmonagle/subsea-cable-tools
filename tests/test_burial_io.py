@@ -102,16 +102,47 @@ def test_change_log_inversion() -> bool:
     return _result("change-log entry inversion + rollback op ordering", ok)
 
 
+def test_change_log_delta() -> bool:
+    """delta_tables keeps only changed rows and stays invertible."""
+    before = {"bp_event": [{"event_id": "e1", "kp": 1.0},
+                           {"event_id": "e2", "kp": 5.0},
+                           {"event_id": "e3", "kp": 9.0}],
+              "bp_section": [{"section_id": "s1", "start_kp": 0.0}]}
+    after = {"bp_event": [{"event_id": "e1", "kp": 2.0},   # moved
+                          {"event_id": "e2", "kp": 5.0},   # unchanged
+                          {"event_id": "e4", "kp": 12.0}],  # added (e3 removed)
+             "bp_section": [{"section_id": "s1", "start_kp": 0.0}]}  # unchanged
+    d_before, d_after = change_log.delta_tables(before, after)
+    ok = {r["event_id"] for r in d_before.get("bp_event", [])} == {"e1", "e3"}
+    ok = ok and {r["event_id"] for r in d_after.get("bp_event", [])} == {"e1", "e4"}
+    ok = ok and "bp_section" not in d_before and "bp_section" not in d_after
+
+    entry = change_log.make_entry("p1", 1, change_log.ACTION_MOVE_EVENT, "e1",
+                                  before=d_before, after=d_after)
+    ops = change_log.invert_entry(entry)
+    ok = ok and ("bp_event", "delete", ["e4"]) in ops
+    upserts = [op for op in ops if op[1] == "upsert"]
+    restored = {r["event_id"]: r for r in upserts[0][2]} if upserts else {}
+    ok = ok and restored.get("e1", {}).get("kp") == 1.0 and "e3" in restored
+
+    # Non-table payloads (rollback bookkeeping) pass through untouched.
+    keep_before, keep_after = change_log.delta_tables(
+        None, {"undone_change_ids": ["c1"]})
+    ok = ok and keep_after == {"undone_change_ids": ["c1"]} and not keep_before
+    return _result("change-log delta snapshots (changed rows only, invertible)", ok)
+
+
 def test_import_scan() -> bool:
     """No imports outside qgis/NumPy/vendored/stdlib/relative in burial/."""
     stdlib = set(getattr(sys, "stdlib_module_names", ()))
     if not stdlib:  # Python < 3.10 (QGIS 3.x): static fallback
         stdlib = {
-            "__future__", "abc", "ast", "bisect", "collections", "copy", "csv",
-            "dataclasses", "datetime", "enum", "functools", "getpass", "hashlib",
-            "importlib", "io", "itertools", "json", "math", "os", "pathlib",
-            "random", "re", "shutil", "string", "sys", "tempfile", "time",
-            "traceback", "typing", "uuid", "warnings",
+            "__future__", "abc", "ast", "base64", "bisect", "collections",
+            "copy", "csv", "dataclasses", "datetime", "enum", "functools",
+            "getpass", "hashlib", "html", "importlib", "io", "itertools",
+            "json", "math", "os", "pathlib", "random", "re", "shutil",
+            "string", "sys", "tempfile", "time", "traceback", "typing",
+            "uuid", "warnings",
         }
     offenders = []
     targets = sorted((PLUGIN_DIR / "burial").rglob("*.py"))
@@ -142,6 +173,7 @@ def run_all() -> list:
         test_events_csv_round_trip(),
         test_kp_range_and_list_imports(),
         test_change_log_inversion(),
+        test_change_log_delta(),
         test_import_scan(),
     ]
 

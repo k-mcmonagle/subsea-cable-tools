@@ -63,7 +63,7 @@ from ..qgis_compat import (
 from ..workbench import project_layers as wb_project_layers
 from ..workbench import store as wb_store_module
 from ..workbench.store import WorkbenchStore
-from . import analysis_task, generation, map_layers, schema
+from . import analysis_task, generation, map_layers, profile_data, schema
 from .plan_model import PlanModel
 from .profile_widget import BurialProfileWidget
 from .store import (
@@ -126,6 +126,7 @@ class BurialPlannerDock(QDockWidget):
         self._generate_after_analysis = False
         self._marker = None
         self._band = None
+        self._pick_tool = None
         self._store_recovery_note = ""
 
         saved_path = project_gpkg_path()
@@ -154,7 +155,7 @@ class BurialPlannerDock(QDockWidget):
         self.splitter = QSplitter(_VERTICAL)
         self.tabs = QTabWidget()
         self.plan_tab = PlanTab(self.model)
-        self.inputs_tab = InputsTab(self.model, self.workbench_store)
+        self.inputs_tab = InputsTab(self.model, self.workbench_store, dock=self)
         self.rules_tab = RulesTab(self.model, self)
         self.builder_tab = BuilderTab(self.model, self)
         self.review_tab = ReviewTab(self.model, self)
@@ -171,6 +172,25 @@ class BurialPlannerDock(QDockWidget):
         profile_status_row = QHBoxLayout()
         self.profile_status = QLabel("Bathymetry profile")
         profile_status_row.addWidget(self.profile_status, 1)
+        self.profile_resample = QPushButton("Resample profile")
+        self.profile_resample.setToolTip(
+            "Rebuild the stored plan profile (depth + cross-offset depths) "
+            "from the configured bathymetry. Sampling runs once and is "
+            "persisted with the plan; it is never rerun silently.")
+        self.profile_resample.setVisible(False)
+        self.profile_resample.clicked.connect(self._resample_profile)
+        profile_status_row.addWidget(self.profile_resample)
+        self.slope_toggle = QCheckBox("Slope panel")
+        self.slope_toggle.setChecked(bool(QSettings().value(
+            "SubseaCableTools/BurialPlanner/slope_panel_visible", False,
+            type=bool)))
+        self.slope_toggle.setToolTip(
+            "Show longitudinal (+ve = up-slope), cross (+ve = deeper to "
+            "starboard of travel) and absolute slope under the depth "
+            "profile. Cross/absolute need cross-offset samples — resample "
+            "the profile after configuring bathymetry.")
+        self.slope_toggle.toggled.connect(self._slope_panel_toggled)
+        profile_status_row.addWidget(self.slope_toggle)
         self.profile_drag_toggle = QCheckBox("Allow PLDN/PLUP dragging")
         self.profile_drag_toggle.setChecked(bool(QSettings().value(
             "SubseaCableTools/BurialPlanner/profile_drag_enabled", False,
@@ -197,7 +217,9 @@ class BurialPlannerDock(QDockWidget):
         self.profile = BurialProfileWidget()
         self.profile.kpHovered.connect(self._on_profile_hover)
         self.profile.kpClicked.connect(self.goto_kp)
+        self.profile.kpDoubleClicked.connect(self._on_profile_double_clicked)
         self.profile.eventMoveRequested.connect(self._on_profile_event_moved)
+        self.profile.set_slope_visible(self.slope_toggle.isChecked())
         profile_layout.addWidget(self.profile, 1)
         self.splitter.addWidget(profile_pane)
         self.splitter.setStretchFactor(0, 3)
@@ -208,6 +230,7 @@ class BurialPlannerDock(QDockWidget):
         self.model.planChanged.connect(self._refresh_strip)
         self.model.planChanged.connect(self._refresh_profile)
         self.model.eventsChanged.connect(self._refresh_profile_events)
+        self.model.sectionsChanged.connect(self._refresh_profile_sections)
         self.model.inputsChanged.connect(self._refresh_profile)
         self.topLevelChanged.connect(self._top_level_changed)
 
@@ -581,10 +604,19 @@ class BurialPlannerDock(QDockWidget):
                 MESSAGE_BOX_YES | MESSAGE_BOX_NO, MESSAGE_BOX_NO)
             if answer != MESSAGE_BOX_YES:
                 return
+        # Reuse the persisted plan profile for threshold rules when it is
+        # current and at least as dense as the analysis step.
+        depth_samples = None
+        stored = self.model.bathy_profile
+        if (stored is not None and stored.kps
+                and self.model.profile_state() == "current"
+                and stored.step_m <= params.coarse_step_m + 1e-9):
+            depth_samples = stored.samples()
         work, warnings = analysis_task.build_work(
             self.model.route, self.model.distance, self.model.plan,
             self.model.rules, self.model.inputs, self.model.depth_config(),
-            params, self.model.acq_cache, self.model.current_rpl_fingerprint())
+            params, self.model.acq_cache, self.model.current_rpl_fingerprint(),
+            depth_samples=depth_samples)
         if warnings:
             self.builder_tab.analysis_message("  ·  ".join(warnings))
         self._generate_after_analysis = generate
@@ -604,7 +636,21 @@ class BurialPlannerDock(QDockWidget):
         if task.error:
             self.builder_tab.analysis_finished(f"Analysis failed: {task.error}")
             return
+        try:
+            self.builder_tab.analysis_message("Applying generation results…")
+            self._apply_analysis_results(task)
+        except Exception as exc:
+            # Without this the failure would be swallowed by the QgsTask
+            # completion guard and Generate would appear to do nothing.
+            self.builder_tab.analysis_finished(f"Generation failed: {exc}")
+            QMessageBox.warning(
+                self, "Burial Planner",
+                "The analysis finished but its results could not be applied:\n"
+                f"{exc}\n\nDetails are in the QGIS message log (Burial Planner).")
+            raise
 
+    def _apply_analysis_results(self,
+                                task: analysis_task.BurialAnalysisTask) -> None:
         params = self.model.gen_params()
         acquisitions: List[generation.RuleAcquisition] = []
         rule_hits: Dict[str, List] = {}
@@ -680,10 +726,17 @@ class BurialPlannerDock(QDockWidget):
 
     # -- profile pane ---------------------------------------------------------
     def _refresh_profile(self) -> None:
+        """Show the persisted plan profile; sample only when none exists.
+
+        Sample-once contract: the stored samples are reused (and marked
+        stale when route/bathymetry/scope/cross offset change) — nothing
+        resamples without the user clicking Resample profile, except the
+        automatic first build for a plan that has never been sampled.
+        """
         plan = self.model.plan
         self._cancel_profile_refresh(silent=True)
         self._profile_generation += 1
-        generation_id = self._profile_generation
+        self.profile_resample.setVisible(False)
         if not plan or self.model.route is None:
             self.profile.clear()
             self.profile_status.setText(
@@ -694,8 +747,10 @@ class BurialPlannerDock(QDockWidget):
         self.profile.set_scope(scope.start_km, scope.end_km)
         self.profile.set_slope_window_m(params.coarse_step_m)
         self.profile.set_profile([])
+        self.profile.set_slope_series([], [], [])
         self._refresh_profile_overlays()
         self._refresh_profile_events()
+        self._refresh_profile_sections()
         config = self.model.depth_config()
         if not config.is_configured():
             self.profile_status.setText(
@@ -704,14 +759,78 @@ class BurialPlannerDock(QDockWidget):
         if scope.length_km <= 0:
             self.profile_status.setText("Set a non-zero scope to display the bathymetry profile.")
             return
+        stored = self.model.bathy_profile
+        if stored is not None and stored.kps:
+            self._display_stored_profile(
+                stored, params, stale=self.model.profile_state() != "current")
+            return
+        self._start_profile_sampling()
+
+    def _display_stored_profile(self, profile: profile_data.PlanProfile,
+                                params: generation.GenParams,
+                                stale: bool) -> None:
+        self.profile.set_profile(profile.series())
+        self._set_slope_series(profile, params)
+        self.profile_resample.setVisible(True)
+        date = (profile.sampled_utc or "")[:16].replace("T", " ")
+        text = (f"Plan profile — {profile.sample_count:,} stations at "
+                f"{profile.step_m:g} m")
+        if profile.cross_offset_m > 0:
+            text += f", cross ±{profile.cross_offset_m:g} m"
+        if date:
+            text += f", sampled {date} UTC"
+        if stale:
+            text += ("  —  STALE: route, bathymetry, scope or cross offset "
+                     "changed since sampling. Click Resample profile.")
+            self.profile_status.setStyleSheet("color: #b36b00; font-weight: 600;")
+        else:
+            self.profile_status.setStyleSheet("")
+        self.profile_status.setText(text)
+
+    def _set_slope_series(self, profile: profile_data.PlanProfile,
+                          params: generation.GenParams) -> None:
+        half_km = max(float(params.coarse_step_m), 1.0) / 1000.0
+        long_series, cross_series, abs_series = profile.slope_series(
+            half_km, params.direction)
+        self.profile.set_slope_series(long_series, cross_series, abs_series)
+
+    def _slope_panel_toggled(self, checked: bool) -> None:
+        QSettings().setValue(
+            "SubseaCableTools/BurialPlanner/slope_panel_visible", bool(checked))
+        self.profile.set_slope_visible(bool(checked))
+
+    def _resample_profile(self) -> None:
+        self._cancel_profile_refresh(silent=True)
+        self._profile_generation += 1
+        self._start_profile_sampling()
+
+    def _start_profile_sampling(self) -> None:
+        """One background sampling pass over the scope (+ one-step margin)."""
+        if not self.model.plan or self.model.route is None:
+            return
+        config = self.model.depth_config()
+        if not config.is_configured():
+            return
+        params = self.model.gen_params()
+        scope = params.scope
+        generation_id = self._profile_generation
+        # Step follows the data: manual override, else the smallest
+        # configured raster cell size (finer stations only re-read the same
+        # cells). Clamped to the analysis step and a ~500k-station ceiling.
+        step_m = self.model.resolve_profile_step_m(params)
+        margin_km = max(params.coarse_step_m, 1.0) / 1000.0
+        start_kp = max(0.0, scope.start_km - margin_km)
+        end_kp = min(self.model.route.total_length_km,
+                     scope.end_km + margin_km)
 
         # DepthSnapshot only clones providers/feature sources here.  Contour
         # iteration, indexing and all route sampling happen inside QgsTask.
         snapshot = analysis_task.DepthSnapshot(config, QgsProject.instance())
-        step_m = max(5.0, scope.length_km * 1000.0 / 3000.0)
         task = analysis_task.ProfileSamplingTask(
-            self.model.route, snapshot, scope.start_km, scope.end_km, step_m,
-            lambda finished, token=generation_id: self._profile_finished(finished, token))
+            self.model.route, snapshot, start_kp, end_kp, step_m,
+            lambda finished, token=generation_id: self._profile_finished(finished, token),
+            distance=self.model.distance,
+            cross_offset_m=params.effective_cross_offset_m)
         self._profile_task = task
         task.progressMessage.connect(
             lambda message, active=task: self._profile_message(active, message))
@@ -720,7 +839,8 @@ class BurialPlannerDock(QDockWidget):
         self.profile_progress.setValue(0)
         self.profile_progress.setVisible(True)
         self.profile_cancel.setVisible(True)
-        self.profile_status.setText("Starting bathymetry profile refresh…")
+        self.profile_status.setStyleSheet("")
+        self.profile_status.setText("Sampling plan profile…")
         QgsApplication.taskManager().addTask(task)
 
     def _profile_message(self, task: analysis_task.ProfileSamplingTask,
@@ -752,18 +872,36 @@ class BurialPlannerDock(QDockWidget):
         self.profile_progress.setVisible(False)
         self.profile_cancel.setVisible(False)
         if task.cancelled:
-            self.profile_status.setText("Bathymetry profile refresh cancelled.")
+            self.profile_status.setText(
+                "Profile sampling cancelled — stored samples unchanged.")
+            self.profile_resample.setVisible(bool(self.model.plan))
             return
         if task.error:
-            self.profile_status.setText(f"Bathymetry profile unavailable: {task.error}")
+            self.profile_status.setText(f"Profile sampling failed: {task.error}")
+            self.profile_resample.setVisible(bool(self.model.plan))
             return
-        self.profile.set_profile(task.series)
-        if task.series:
+        if not task.series:
+            # Nothing sampled — do not overwrite any stored profile with an
+            # empty one; the user fixes the bathymetry config and resamples.
             self.profile_status.setText(
-                f"Bathymetry profile ready — {len(task.series):,} samples.")
-        else:
-            self.profile_status.setText(
-                "Bathymetry sources have no coverage within the selected scope.")
+                "Bathymetry sources have no coverage within the selected "
+                "scope. Check the bathymetry configuration on Inputs, then "
+                "click Resample profile.")
+            self.profile_resample.setVisible(bool(self.model.plan))
+            return
+        params = self.model.gen_params()
+        profile = profile_data.PlanProfile(
+            step_m=task.step_m,
+            cross_offset_m=task.cross_offset_m,
+            scope_start_kp=params.scope.start_km,
+            scope_end_kp=params.scope.end_km,
+            route_fingerprint=self.model.current_rpl_fingerprint(),
+            depth_fingerprint=self.model.depth_fingerprint(),
+            sampled_utc=schema.utc_now_iso(),
+            kps=task.kps, depths=task.depths,
+            port_depths=task.port_depths, stbd_depths=task.stbd_depths)
+        self.model.save_profile(profile)
+        self._display_stored_profile(profile, params, stale=False)
 
     def _refresh_profile_overlays(self) -> None:
         self.profile.set_overlays(self.model.context)
@@ -773,6 +911,9 @@ class BurialPlannerDock(QDockWidget):
             self.model.events, self.model.method,
             editable=self.profile_drag_toggle.isChecked())
 
+    def _refresh_profile_sections(self) -> None:
+        self.profile.set_sections(self.model.sections)
+
     def _profile_drag_toggled(self, enabled: bool) -> None:
         QSettings().setValue(
             "SubseaCableTools/BurialPlanner/profile_drag_enabled", bool(enabled))
@@ -781,11 +922,69 @@ class BurialPlannerDock(QDockWidget):
         self._refresh_profile_events()
 
     def _on_profile_event_moved(self, event_id: str, new_kp: float) -> None:
+        # Same justification contract as table edits: optional reason,
+        # Cancel aborts (and snaps the dragged line back).
+        text, ok = QInputDialog.getText(
+            self, "Move event",
+            f"Move to KP {schema.format_kp(new_kp)} — reason (optional):")
+        if not ok:
+            self.profile.revert_event_line(event_id)
+            return
         try:
-            self.model.move_event(event_id, round(new_kp, 3), "profile drag")
+            self.model.move_event(event_id, round(new_kp, 3),
+                                  text.strip() or "profile drag")
         except ValueError as exc:
             QMessageBox.warning(self, "Burial Planner", str(exc))
             self.profile.revert_event_line(event_id)
+
+    def _on_profile_double_clicked(self, kp: float) -> None:
+        """Double-click on the profile primes the Plan Builder add-event KP."""
+        if not self.model.plan:
+            return
+        self.builder_tab.set_add_kp(kp)
+        self.tabs.setCurrentWidget(self.builder_tab)
+        self.goto_kp(kp)
+
+    # -- KP picking -----------------------------------------------------------
+    def pick_kp_on_map(self, callback, prompt: str = "") -> bool:
+        """One-shot map tool: snap a canvas click to the route, deliver its KP.
+
+        Restores the previously active map tool on pick, right-click or Esc.
+        """
+        if self.canvas is None:
+            return False
+        if self.model.route is None:
+            QMessageBox.warning(self, "Burial Planner",
+                                self.model.route_error
+                                or "Set the plan's route on the Inputs tab first.")
+            return False
+        from .kp_pick_tool import KpPickTool
+
+        previous = self.canvas.mapTool()
+
+        def restore() -> None:
+            self._pick_tool = None
+            try:
+                if self.canvas.mapTool() is tool:
+                    if previous is not None:
+                        self.canvas.setMapTool(previous)
+                    else:
+                        self.canvas.unsetMapTool(tool)
+            except (AttributeError, RuntimeError):
+                pass
+
+        tool = KpPickTool(self.canvas, self.model.route, callback, restore)
+        self._pick_tool = tool
+        self.canvas.setMapTool(tool)
+        if prompt and self.iface is not None:
+            try:
+                from ..qgis_compat import MESSAGE_INFO
+
+                self.iface.messageBar().pushMessage(
+                    "Burial Planner", prompt, MESSAGE_INFO, 4)
+            except Exception:
+                pass
+        return True
 
     # -- map sync -------------------------------------------------------------
     def _canvas_point(self, kp: float):
@@ -931,6 +1130,13 @@ class BurialPlannerDock(QDockWidget):
             self._cancel_profile_refresh(silent=True)
         except (AttributeError, RuntimeError):
             pass
+        pick_tool = self._pick_tool
+        self._pick_tool = None
+        if pick_tool is not None and self.canvas is not None:
+            try:
+                self.canvas.unsetMapTool(pick_tool)
+            except (AttributeError, RuntimeError):
+                pass
         items = (self._marker, self._band)
         self._marker = None
         self._band = None

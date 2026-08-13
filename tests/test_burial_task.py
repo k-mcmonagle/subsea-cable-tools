@@ -507,6 +507,164 @@ def test_profile_sampling_task() -> bool:
     return _result("background profile task samples scope with progress", ok)
 
 
+def test_route_frame_chainage_matches_walk() -> bool:
+    """Chainage-indexed point_at_kp equals the original per-call walk."""
+    from ..kp_geo_utils import point_at_kp as walk_point_at_kp
+
+    da = make_distance_area(WGS84, QgsProject.instance().transformContext())
+    geoms = [QgsGeometry.fromWkt("LINESTRING(0 50, 0 50.1, 0.05 50.15)"),
+             QgsGeometry.fromWkt("LINESTRING(0.05 50.15, 0.1 50.2)")]
+    ok = True
+    for follow in (False, True):
+        route = RouteFrame.from_source(geoms, da,
+                                       follow_stored_geometry=follow)
+        total = route.total_length_km
+        probes = [-1.0, 0.0, 1e-9, total * 0.25, total * 0.5,
+                  total * 0.75, total - 1e-6, total, total + 5.0]
+        for kp in probes:
+            for clamp in (False, True):
+                fast = route.point_at_kp(kp, clamp=clamp)
+                slow = walk_point_at_kp(geoms, kp, da, clamp=clamp,
+                                        follow_stored_geometry=follow)
+                if (fast is None) != (slow is None):
+                    ok = False
+                elif fast is not None:
+                    ok = ok and abs(fast.x() - slow.x()) < 1e-9 \
+                        and abs(fast.y() - slow.y()) < 1e-9
+    return _result("RouteFrame chainage index matches walking point_at_kp", ok)
+
+
+def test_profile_cross_offset_sampling() -> bool:
+    """Cross-offset depths sample either side of the route with the right sign."""
+    from ..burial import profile_data
+
+    route, da = _route()  # due north along lon 0
+
+    class _Depth:
+        def is_available(self):
+            return True
+
+        def prepare(self, cancel=None, progress=None):
+            return True
+
+        def sample(self, lat, lon):
+            # Deeper to the east: magnitude grows with +lon.
+            return -(100.0 + lon * 1000.0)
+
+        def profile_samples(self, route_, stations_km, cancel=None, progress=None):
+            return [(kp, self.sample(route_.point_at_kp(kp, clamp=True).y(),
+                                     route_.point_at_kp(kp, clamp=True).x()))
+                    for kp in stations_km]
+
+    task = analysis_task.ProfileSamplingTask(
+        route, _Depth(), 0.0, 0.3, 100.0, lambda _task: None,
+        distance=da, cross_offset_m=100.0)
+    ok = task.run()
+    ok = ok and len(task.kps) == len(task.port_depths) == len(task.stbd_depths)
+    ok = ok and all(v is not None for v in task.port_depths)
+    # Heading north: starboard = east = deeper (larger magnitude).
+    ok = ok and all(s > p for p, s in zip(task.port_depths, task.stbd_depths))
+
+    cross = profile_data.cross_slope_series(
+        task.kps, task.port_depths, task.stbd_depths, 100.0, direction=1)
+    ok = ok and all(v is not None and v > 0 for _kp, v in cross)
+    flipped = profile_data.cross_slope_series(
+        task.kps, task.port_depths, task.stbd_depths, 100.0, direction=-1)
+    ok = ok and all(v is not None and v < 0 for _kp, v in flipped)
+
+    # Without a distance area the task degrades to along-route sampling only.
+    plain = analysis_task.ProfileSamplingTask(
+        route, _Depth(), 0.0, 0.3, 100.0, lambda _task: None)
+    ok = ok and plain.run() and all(v is None for v in plain.port_depths)
+    return _result("cross-offset sampling: starboard side, sign, direction flip", ok)
+
+
+def test_analysis_reuses_stored_depth_samples() -> bool:
+    """Injected plan-profile samples bypass bathymetry sampling entirely."""
+
+    class _Boom:
+        def is_available(self):
+            return True
+
+        def prepare(self, cancel=None, progress=None):
+            return True
+
+        def profile_samples(self, *_args, **_kwargs):
+            raise AssertionError("stored samples should bypass sampling")
+
+        def sample(self, lat, lon):
+            return -50.0
+
+        def sample_route(self, route_, kp):
+            return -50.0
+
+    route, da = _route()
+    scope = Interval(0.0, 10.0)
+    stations = [round(0.05 * i, 6) for i in range(201)]
+    depth_samples = [(kp, 100.0 + (400.0 if 4.0 <= kp <= 6.0 else 0.0))
+                     for kp in stations]
+    rule_row = {"rule_id": "r-depth", "name": "Deep", "seq": 0, "enabled": 1,
+                "kind": "threshold_profile", "action": "exclude",
+                "criterion_class": "project", "methods_json": "[]",
+                "config_json": json.dumps({"profile": "depth", "op": ">",
+                                           "value": 300.0})}
+    work = analysis_task.AnalysisWork(
+        route=route, distance=da, scope=scope, step_m=50.0, direction=1,
+        method="plough", refine_tol_m=1.0, depth=_Boom(),
+        depth_samples=depth_samples)
+    rule_work = analysis_task.RuleWork(rule_row=rule_row,
+                                       kind="threshold_profile",
+                                       config=json.loads(rule_row["config_json"]))
+    work.rules.append(rule_work)
+    task = analysis_task.BurialAnalysisTask(work, lambda _t: None)
+    ok = task.run()
+    ok = ok and len(task.results) == 1 and not task.results[0].error
+    footprint = task.results[0].footprint
+    ok = ok and len(footprint) == 1
+    ok = ok and abs(footprint[0].start_km - 4.0) < 0.1
+    ok = ok and abs(footprint[0].end_km - 6.0) < 0.1
+    return _result("analysis consumes stored plan-profile samples", ok)
+
+
+def test_profile_step_resolution_and_staleness() -> bool:
+    """Profile step: manual override, auto fallback, clamps; step change -> stale."""
+    from ..burial import profile_data
+
+    model = PlanModel(object(), None)
+    model.plan = {"plan_id": "p1", "scope_start_kp": 0.0, "scope_end_kp": 10.0,
+                  "direction": 1, "method": "plough", "params_json": "{}"}
+    # Auto with no rasters configured -> 5 m fallback (coarse step 50 allows it).
+    ok = abs(model.resolve_profile_step_m() - 5.0) < 1e-9
+    # Manual override wins.
+    model.plan["params_json"] = json.dumps({"profile_step_m": 25.0})
+    ok = ok and abs(model.resolve_profile_step_m() - 25.0) < 1e-9
+    # Clamped to the analysis step so Generate can reuse the samples.
+    model.plan["params_json"] = json.dumps({"profile_step_m": 100.0,
+                                            "coarse_step_m": 50.0})
+    ok = ok and abs(model.resolve_profile_step_m() - 50.0) < 1e-9
+    # Floored at 2 m.
+    model.plan["params_json"] = json.dumps({"profile_step_m": 0.5})
+    ok = ok and abs(model.resolve_profile_step_m() - 2.0) < 1e-9
+    # Station ceiling: a 2000 km scope cannot sample at 2 m.
+    model.plan.update({"scope_end_kp": 2000.0})
+    ok = ok and abs(model.resolve_profile_step_m() - 4.0) < 1e-9
+    model.plan.update({"scope_end_kp": 10.0})
+
+    # A stored profile whose step no longer matches the target goes stale.
+    model.plan["params_json"] = "{}"
+    profile = profile_data.PlanProfile(
+        step_m=model.resolve_profile_step_m(), cross_offset_m=50.0,
+        scope_start_kp=0.0, scope_end_kp=10.0,
+        route_fingerprint=model.current_rpl_fingerprint(),
+        depth_fingerprint=model.depth_fingerprint(),
+        kps=[0.0, 5.0, 10.0], depths=[10.0, 20.0, 30.0])
+    model.bathy_profile = profile
+    ok = ok and model.profile_state() == "current"
+    model.plan["params_json"] = json.dumps({"profile_step_m": 25.0})
+    ok = ok and model.profile_state() == "stale"
+    return _result("profile step: manual/auto/clamps; step change -> stale", ok)
+
+
 def test_burial_depth_config_is_manual_only() -> bool:
     class _Workbench:
         def rpl_depth_config(self, _rpl_id):
@@ -544,6 +702,10 @@ def run_all() -> list:
         test_reopened_plan_matches_unique_rpl_snapshot(),
         test_end_to_end_task_and_generation(),
         test_profile_sampling_task(),
+        test_route_frame_chainage_matches_walk(),
+        test_profile_cross_offset_sampling(),
+        test_analysis_reuses_stored_depth_samples(),
+        test_profile_step_resolution_and_staleness(),
         test_burial_depth_config_is_manual_only(),
     ]
 

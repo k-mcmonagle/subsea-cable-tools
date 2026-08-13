@@ -21,7 +21,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pyqtgraph as pg
 
-from qgis.PyQt.QtCore import Qt, pyqtSignal
+from qgis.PyQt.QtCore import QRectF, Qt, pyqtSignal
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import QVBoxLayout, QWidget
 
@@ -30,8 +30,6 @@ from . import generation, schema
 
 _PEN_STYLE = getattr(Qt, "PenStyle", Qt)
 
-_MAX_PLOT_POINTS = 20000
-
 _REGION_STYLES = {
     "excluded": (QColor(214, 39, 40, 60), QColor(214, 39, 40, 110)),
     "screening": (QColor(255, 140, 0, 45), QColor(255, 140, 0, 90)),
@@ -39,10 +37,21 @@ _REGION_STYLES = {
     "insufficient": (QColor(120, 120, 120, 55), QColor(120, 120, 120, 100)),
 }
 
+# Plan-outcome strip along the top of the plot; colours match the map
+# symbology in map_layers._SECTION_STYLES.
+_STRIP_HEIGHT_PX = 12
+_STRIP_STYLES = {
+    schema.SECTION_BURIAL: (QColor(27, 127, 59, 170), "Burial"),
+    schema.SECTION_SKIP: (QColor(214, 39, 40, 140), "Skip"),
+    schema.SECTION_INSUFFICIENT: (QColor(158, 158, 158, 140),
+                                  "Insufficient Information"),
+}
+
 
 class BurialProfileWidget(QWidget):
     kpHovered = pyqtSignal(float)
     kpClicked = pyqtSignal(float)
+    kpDoubleClicked = pyqtSignal(float)
     eventMoveRequested = pyqtSignal(str, float)
 
     def __init__(self, parent=None):
@@ -57,12 +66,55 @@ class BurialProfileWidget(QWidget):
         item.showGrid(x=True, y=True, alpha=0.25)
         item.vb.invertY(True)  # depth-down axis
 
+        # Slope panel: a second x-linked plot under the depth profile.
+        # Longitudinal +ve = up-slope; cross +ve = deeper to starboard of
+        # travel; absolute = combined gradient magnitude.
+        self.slope_plot = pg.PlotWidget()
+        self.slope_plot.setBackground("w")
+        self.slope_plot.setMenuEnabled(False)
+        self.slope_plot.setLabel("left", "Slope", units="°")
+        self.slope_plot.setMaximumHeight(190)
+        slope_item = self.slope_plot.getPlotItem()
+        slope_item.showGrid(x=True, y=True, alpha=0.25)
+        slope_item.setXLink(item)
+        try:
+            slope_item.addLegend(offset=(6, 2))
+        except Exception:
+            pass
+        zero_line = pg.InfiniteLine(
+            angle=0, pos=0.0, movable=False,
+            pen=pg.mkPen((150, 150, 150), width=1, style=_PEN_STYLE.DashLine))
+        slope_item.addItem(zero_line, ignoreBounds=True)
+        self._slope_curves = {}
+        for key, color, style, label in (
+                ("long", "#ff7f0e", _PEN_STYLE.SolidLine, "Longitudinal"),
+                ("cross", "#9467bd", _PEN_STYLE.SolidLine, "Cross"),
+                ("abs", "#8c564b", _PEN_STYLE.DashLine, "Absolute")):
+            curve = slope_item.plot(
+                [], [], pen=pg.mkPen(color, width=1.6, style=style),
+                name=label, connect="finite")
+            try:
+                curve.setDownsampling(auto=True, method="peak")
+                curve.setClipToView(True)
+            except Exception:
+                pass
+            self._slope_curves[key] = curve
+        self.slope_plot.setVisible(False)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.plot)
+        layout.addWidget(self.plot, 3)
+        layout.addWidget(self.slope_plot, 1)
 
         self._curve = item.plot([], [], pen=pg.mkPen("#1f77b4", width=2),
                                 name="Depth", connect="finite")
+        # Peak-preserving decimation: a naive stride can hide exactly the
+        # narrow bathymetric spikes burial planning cares about.
+        try:
+            self._curve.setDownsampling(auto=True, method="peak")
+            self._curve.setClipToView(True)
+        except Exception:  # pragma: no cover — older pyqtgraph
+            pass
         self._vline = pg.InfiniteLine(
             angle=90, movable=False,
             pen=pg.mkPen((120, 120, 120), width=1, style=_PEN_STYLE.DashLine))
@@ -81,6 +133,18 @@ class BurialProfileWidget(QWidget):
         self._scope: Tuple[float, float] = (0.0, 0.0)
         self._editable = False
         self._slope_half_window_km: Optional[float] = None
+
+        # Plan-outcome strip: a thin x-linked ViewBox pinned to the top of
+        # the plot area, so section colouring never scales with the y-axis.
+        self._strip_vb = pg.ViewBox(enableMouse=False, enableMenu=False)
+        self._strip_vb.setZValue(5)
+        item.scene().addItem(self._strip_vb)
+        self._strip_vb.setXLink(item.vb)
+        self._strip_vb.enableAutoRange(x=False, y=False)
+        self._strip_vb.setYRange(0.0, 1.0, padding=0)
+        self._strip_items: List = []
+        item.vb.sigResized.connect(self._position_strip)
+        self._position_strip()
 
         self.plot.scene().sigMouseMoved.connect(self._on_mouse_moved)
         self.plot.scene().sigMouseClicked.connect(self._on_mouse_clicked)
@@ -105,13 +169,14 @@ class BurialProfileWidget(QWidget):
             self._slope_half_window_km = None
 
     def set_profile(self, series: List[Tuple[float, float]]) -> None:
-        """series: (kp_km, depth_m magnitude); rendered at data resolution."""
+        """series: (kp_km, depth_m magnitude).
+
+        The full series is handed to pyqtgraph; peak-preserving auto
+        downsampling keeps rendering fast without hiding narrow spikes.
+        """
         self._series = sorted(series)
         xs = [kp for kp, _d in self._series]
         ys = [d for _kp, d in self._series]
-        if len(xs) > _MAX_PLOT_POINTS:
-            step = max(1, len(xs) // _MAX_PLOT_POINTS)
-            xs, ys = xs[::step], ys[::step]
         self._curve.setData(xs, ys, connect="finite")
 
     def set_overlays(self, context: generation.ResolutionContext) -> None:
@@ -144,6 +209,61 @@ class BurialProfileWidget(QWidget):
                 f"Constraint Influence Zone of {zone.rule_name}")
         for iv in context.insufficient:
             add("insufficient", iv.start_km, iv.end_km, "Insufficient Information")
+
+    def set_slope_visible(self, visible: bool) -> None:
+        self.slope_plot.setVisible(bool(visible))
+
+    def set_slope_series(self, long_series, cross_series, abs_series) -> None:
+        """Series are (kp, degrees|None) lists; None renders as a gap."""
+        nan = float("nan")
+        for key, series in (("long", long_series), ("cross", cross_series),
+                            ("abs", abs_series)):
+            xs = [kp for kp, _v in series or []]
+            ys = [nan if v is None else float(v) for _kp, v in series or []]
+            self._slope_curves[key].setData(xs, ys, connect="finite")
+
+    def _position_strip(self) -> None:
+        """Pin the outcome strip to the top of the plot area (fixed height)."""
+        vb = self.plot.getPlotItem().vb
+        rect = vb.sceneBoundingRect()
+        self._strip_vb.setGeometry(QRectF(rect.left(), rect.top(),
+                                          rect.width(), _STRIP_HEIGHT_PX))
+        try:
+            self._strip_vb.linkedViewChanged(vb, self._strip_vb.XAxis)
+        except Exception:
+            pass
+        self._strip_vb.setYRange(0.0, 1.0, padding=0)
+
+    def set_sections(self, sections: List[Dict]) -> None:
+        """Colour the top strip with the plan outcome (burial/skip/insufficient)."""
+        for strip_item in self._strip_items:
+            self._strip_vb.removeItem(strip_item)
+        self._strip_items = []
+        for section in sections or []:
+            style = _STRIP_STYLES.get(section.get("kind") or "")
+            if style is None:
+                continue
+            try:
+                start = float(section.get("start_kp"))
+                end = float(section.get("end_kp"))
+            except (TypeError, ValueError):
+                continue
+            color, label = style
+            region = pg.LinearRegionItem(values=(start, end), movable=False,
+                                         brush=pg.mkBrush(color),
+                                         pen=pg.mkPen(color))
+            tooltip = (f"{label} KP {schema.format_kp(start)}-"
+                       f"{schema.format_kp(end)}")
+            conclusion = schema.CONCLUSION_LABELS.get(
+                section.get("conclusion") or "", "")
+            if conclusion:
+                tooltip += f" — {conclusion}"
+            try:
+                region.setToolTip(tooltip)
+            except Exception:
+                pass
+            self._strip_vb.addItem(region)
+            self._strip_items.append(region)
 
     def set_events(self, events: List[Dict], method: str, editable: bool = False) -> None:
         item = self.plot.getPlotItem()
@@ -205,6 +325,8 @@ class BurialProfileWidget(QWidget):
         self.set_profile([])
         self.set_overlays(generation.ResolutionContext())
         self.set_events([], "")
+        self.set_sections([])
+        self.set_slope_series([], [], [])
         self._vline.setVisible(False)
         self._readout.setVisible(False)
 
@@ -328,5 +450,13 @@ class BurialProfileWidget(QWidget):
 
     def _on_mouse_clicked(self, event) -> None:
         kp = self._kp_at_scene_pos(event.scenePos())
-        if kp is not None:
+        if kp is None:
+            return
+        try:
+            double = bool(event.double())
+        except (AttributeError, TypeError):
+            double = False
+        if double:
+            self.kpDoubleClicked.emit(kp)
+        else:
             self.kpClicked.emit(kp)

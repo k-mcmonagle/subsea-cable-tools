@@ -272,6 +272,42 @@ def test_plan_builder_merge_insert_and_undo() -> bool:
     return _result("Plan Builder merge/insert persist and undo atomically", ok)
 
 
+def test_plan_profile_persistence() -> bool:
+    from ..burial.profile_data import PlanProfile
+
+    store = _store()
+    plan_id = store.save_plan(_plan_row("Profiled"))
+    profile = PlanProfile(
+        step_m=25.0, cross_offset_m=40.0,
+        scope_start_kp=0.0, scope_end_kp=10.0,
+        route_fingerprint="route-fp", depth_fingerprint="depth-fp",
+        sampled_utc="2026-08-13T10:00:00Z",
+        kps=[0.0, 5.0, 10.0], depths=[100.0, None, 140.0],
+        port_depths=[99.0, None, 139.0], stbd_depths=[101.0, None, 141.0])
+    store.save_plan_profile(profile.to_row(plan_id))
+    loaded = PlanProfile.from_row(store.get_plan_profile(plan_id))
+    ok = loaded is not None and loaded.kps == [0.0, 5.0, 10.0]
+    ok = ok and loaded.depths == [100.0, None, 140.0]
+    ok = ok and loaded.cross_offset_m == 40.0 and loaded.has_cross()
+
+    # One profile per plan: saving again replaces, never accumulates.
+    profile.step_m = 10.0
+    store.save_plan_profile(profile.to_row(plan_id))
+    rows = [r for r in store.read_table(schema.TABLE_PROFILE)
+            if r.get("plan_id") == plan_id]
+    ok = ok and len(rows) == 1
+    ok = ok and PlanProfile.from_row(rows[0]).step_m == 10.0
+
+    copy_id = store.duplicate_plan(plan_id, "Profiled copy")
+    copied = PlanProfile.from_row(store.get_plan_profile(copy_id))
+    ok = ok and copied is not None and copied.kps == loaded.kps
+
+    store.delete_plan(plan_id)
+    ok = ok and store.get_plan_profile(plan_id) is None
+    ok = ok and store.get_plan_profile(copy_id) is not None
+    return _result("plan profile persists, replaces, copies and deletes", ok)
+
+
 def run_all() -> list:
     return [
         test_create_and_migrate(),
@@ -280,6 +316,7 @@ def run_all() -> list:
         test_duplicate_deep_copy(),
         test_change_log_and_rollback(),
         test_plan_builder_merge_insert_and_undo(),
+        test_plan_profile_persistence(),
     ]
 
 
