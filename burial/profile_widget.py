@@ -267,11 +267,11 @@ class BurialProfileWidget(QWidget):
             self.plot.setXRange(lo, hi, padding=0.02)
 
     def set_slope_window_m(self, step_m: float) -> None:
-        """Match the crosshair slope to the analysis scale.
+        """Match the crosshair slope to the local profile scale.
 
-        The readout differences depths at ±(analysis coarse step) so the
-        number under the cursor is measured over the same window as the
-        slope the rules evaluated, not over one display-resolution interval.
+        The readout differences depths at ±(profile station step), matching
+        the local slope panel and Auto slope rules. An explicit rule-level
+        vehicle footprint can intentionally use a wider evaluation length.
         """
         try:
             self._slope_half_window_km = max(float(step_m), 1.0) / 1000.0

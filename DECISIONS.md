@@ -116,6 +116,26 @@ section references in brackets.
   2 × analysis step. The window is part of the rule config, so the
   acquisition cache invalidates when it changes and the refinement predicate
   uses the same window.
+- **Burial local slope follows the persisted profile, not coarse rule-search
+  spacing**: Auto slope rules and the profile panel difference depths at
+  ± one stored profile step. The profile normally follows raster cell size and
+  is capped at roughly 500,000 stations, so short steep faces remain visible
+  without making thousands of kilometres of route unbounded. An explicit
+  `slope_window_m` remains the opt-in vehicle-footprint average. Derived signed
+  slope arrays are cached per window within an analysis run and the profile
+  step participates in acquisition cache keys.
+- **Burial Auto cross offset also follows profile resolution**: Auto samples
+  port/starboard at ± one bounded profile step for a local cross-terrain
+  angle. An entered cross offset means the burial vehicle's half track width
+  and deliberately reports the two-point slope under that physical span.
+- **Workflow settings follow the stage that consumes them**: Inputs selects
+  route, scope and source layers; the next Bathymetry Profile tab owns profile
+  step, cross offset, status and explicit rebuilding; Exclusions owns coarse
+  spatial-search spacing, classification sliver cleanup and boundary
+  refinement; Plan Builder owns minimum candidate-section length. A missing or
+  stale stored profile blocks depth/slope exclusions and directs the user back
+  to the preparation stage instead of sampling silently with unreviewed
+  defaults.
 - **Influence zones and `extend_m` do not invalidate the acquisition cache**
   — they are resolution-time interval ops (§14.4's "reorder/toggle re-runs
   only resolution" extended to the zone parameters).

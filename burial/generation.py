@@ -42,7 +42,7 @@ class GenParams:
     coarse_step_m: float = 50.0
     refine_tol_m: float = 1.0
     sliver_tol_km: float = 0.0
-    cross_offset_m: float = 0.0     # 0 = auto (analysis step)
+    cross_offset_m: float = 0.0     # 0 = auto (resolved profile step by model)
     profile_step_m: float = 0.0     # 0 = auto (bathymetry cell size)
 
     @property
@@ -53,8 +53,17 @@ class GenParams:
 
     @property
     def effective_cross_offset_m(self) -> float:
-        """Cross-slope sampling offset with the auto default resolved."""
-        return self.cross_offset_m if self.cross_offset_m > 0 else self.coarse_step_m
+        """Legacy context-free cross-offset fallback.
+
+        PlanModel.resolve_cross_offset_m can inspect bathymetry resolution and
+        is the authoritative Burial Planner path. This property remains for
+        callers that only have GenParams.
+        """
+        if self.cross_offset_m > 0:
+            return self.cross_offset_m
+        if self.profile_step_m > 0:
+            return self.profile_step_m
+        return min(self.coarse_step_m, 5.0)
 
     def to_dict(self) -> Dict:
         return {
@@ -126,7 +135,8 @@ def canonical_json(obj) -> str:
 
 
 def rule_cache_key(rule_row: Dict, input_fingerprint: str, scope: Interval,
-                   step_m: float, rpl_fingerprint: str, direction: int) -> str:
+                   step_m: float, rpl_fingerprint: str, direction: int,
+                   profile_step_m: Optional[float] = None) -> str:
     """Cache key for one rule's acquisition (spec §14.4).
 
     Direction participates only when the rule's condition is direction-aware
@@ -147,6 +157,13 @@ def rule_cache_key(rule_row: Dict, input_fingerprint: str, scope: Interval,
         "step_m": float(step_m),
         "rpl_fingerprint": rpl_fingerprint or "",
     }
+    # Burial threshold acquisition can use a denser persisted bathymetry
+    # profile than the coarse rule-search stations. Its resolution affects
+    # whether a narrow depth/slope feature is represented, so changing that
+    # resolution must invalidate an otherwise identical acquisition cache.
+    if (rule_row.get("kind") or "") == "threshold_profile" \
+            and profile_step_m is not None:
+        parts["profile_step_m"] = float(profile_step_m)
     if acquisition_config.get("slope_signed"):
         parts["direction"] = int(direction)
     return hashlib.sha1(canonical_json(parts).encode("utf-8")).hexdigest()

@@ -3,7 +3,8 @@
 
 Single-instance, raise-if-open (Planner behaviour). Top strip: plan selector
 + New / Duplicate / Rename / Delete + status badge + GeoPackage path control.
-Below: the guided tabs (Plan → Inputs → Exclusions → Plan Builder → Review).
+Below: the guided tabs (Plan → Inputs → Bathymetry Profile → Exclusions →
+Plan Builder → Review).
 Bottom: the persistent longitudinal profile pane on a collapsible splitter.
 
 All analysis runs on ``QgsApplication.taskManager()`` with non-modal in-dock
@@ -75,6 +76,7 @@ from .store import (
 from .tabs.builder_tab import BuilderTab
 from .tabs.inputs_tab import InputsTab
 from .tabs.plan_tab import PlanTab
+from .tabs.profile_tab import ProfileTab
 from .tabs.review_tab import ReviewTab
 from .tabs.rules_tab import RulesTab
 
@@ -156,11 +158,13 @@ class BurialPlannerDock(QDockWidget):
         self.tabs = QTabWidget()
         self.plan_tab = PlanTab(self.model)
         self.inputs_tab = InputsTab(self.model, self.workbench_store, dock=self)
+        self.profile_tab = ProfileTab(self.model, self)
         self.rules_tab = RulesTab(self.model, self)
         self.builder_tab = BuilderTab(self.model, self)
         self.review_tab = ReviewTab(self.model, self)
         self.tabs.addTab(self.plan_tab, "Plan")
         self.tabs.addTab(self.inputs_tab, "Inputs")
+        self.tabs.addTab(self.profile_tab, "Bathymetry Profile")
         self.tabs.addTab(self.rules_tab, "Exclusions")
         self.tabs.addTab(self.builder_tab, "Plan Builder")
         self.tabs.addTab(self.review_tab, "Review && Export")
@@ -172,14 +176,6 @@ class BurialPlannerDock(QDockWidget):
         profile_status_row = QHBoxLayout()
         self.profile_status = QLabel("Bathymetry profile")
         profile_status_row.addWidget(self.profile_status, 1)
-        self.profile_resample = QPushButton("Resample profile")
-        self.profile_resample.setToolTip(
-            "Rebuild the stored plan profile (depth + cross-offset depths) "
-            "from the configured bathymetry. Sampling runs once and is "
-            "persisted with the plan; it is never rerun silently.")
-        self.profile_resample.setVisible(False)
-        self.profile_resample.clicked.connect(self._resample_profile)
-        profile_status_row.addWidget(self.profile_resample)
         self.slope_toggle = QCheckBox("Slope panel")
         self.slope_toggle.setChecked(bool(QSettings().value(
             "SubseaCableTools/BurialPlanner/slope_panel_visible", False,
@@ -606,6 +602,18 @@ class BurialPlannerDock(QDockWidget):
             QMessageBox.warning(self, "Burial Planner",
                                 "Set the plan scope on the Inputs tab first.")
             return
+        needs_profile = any(
+            int(rule.get("enabled") or 0)
+            and (rule.get("kind") or "") == "threshold_profile"
+            for rule in self.model.rules)
+        if needs_profile and self.model.profile_state() != "current":
+            QMessageBox.warning(
+                self, "Burial Planner",
+                "Depth/slope exclusions require a current stored bathymetry "
+                "profile. Open Bathymetry Profile, review the sampling "
+                "settings, then click Apply & rebuild profile.")
+            self.tabs.setCurrentWidget(self.profile_tab)
+            return
         stations = params.scope.length_km * 1000.0 / max(params.coarse_step_m, 1.0)
         if stations > 500000:
             answer = QMessageBox.question(
@@ -618,16 +626,18 @@ class BurialPlannerDock(QDockWidget):
         # Reuse the persisted plan profile for threshold rules when it is
         # current and at least as dense as the analysis step.
         depth_samples = None
+        depth_step_m = self.model.resolve_profile_step_m(params)
         stored = self.model.bathy_profile
         if (stored is not None and stored.kps
                 and self.model.profile_state() == "current"
                 and stored.step_m <= params.coarse_step_m + 1e-9):
             depth_samples = stored.samples()
+            depth_step_m = stored.step_m
         work, warnings = analysis_task.build_work(
             self.model.route, self.model.distance, self.model.plan,
             self.model.rules, self.model.inputs, self.model.depth_config(),
             params, self.model.acq_cache, self.model.current_rpl_fingerprint(),
-            depth_samples=depth_samples)
+            depth_samples=depth_samples, depth_step_m=depth_step_m)
         if warnings:
             self.builder_tab.analysis_message("  ·  ".join(warnings))
         self._generate_after_analysis = generate
@@ -747,7 +757,6 @@ class BurialPlannerDock(QDockWidget):
         plan = self.model.plan
         self._cancel_profile_refresh(silent=True)
         self._profile_generation += 1
-        self.profile_resample.setVisible(False)
         if not plan or self.model.route is None:
             self.profile.clear()
             self.profile_status.setText(
@@ -756,7 +765,10 @@ class BurialPlannerDock(QDockWidget):
         params = self.model.gen_params()
         scope = params.scope
         self.profile.set_scope(scope.start_km, scope.end_km)
-        self.profile.set_slope_window_m(params.coarse_step_m)
+        # Replaced with the stored profile's actual resolution when it is
+        # displayed. This fallback covers the empty/loading state.
+        self.profile.set_slope_window_m(
+            self.model.resolve_profile_step_m(params))
         self.profile.set_profile([])
         self.profile.set_slope_series([], [], [])
         self._refresh_profile_overlays()
@@ -775,17 +787,21 @@ class BurialPlannerDock(QDockWidget):
             self._display_stored_profile(
                 stored, params, stale=self.model.profile_state() != "current")
             return
-        self._start_profile_sampling()
+        self.profile_status.setText(
+            "No stored bathymetry profile — configure and rebuild it on the "
+            "Bathymetry Profile tab.")
+        self.profile_tab.refresh()
 
     def _display_stored_profile(self, profile: profile_data.PlanProfile,
                                 params: generation.GenParams,
                                 stale: bool) -> None:
         self.profile.set_profile(profile.series())
+        self.profile.set_slope_window_m(profile.step_m)
         self._set_slope_series(profile, params)
-        self.profile_resample.setVisible(True)
         date = (profile.sampled_utc or "")[:16].replace("T", " ")
         text = (f"Plan profile — {profile.sample_count:,} stations at "
                 f"{profile.step_m:g} m")
+        text += f", local slope over {2.0 * profile.step_m:g} m"
         if profile.cross_offset_m > 0:
             text += f", cross ±{profile.cross_offset_m:g} m"
         if date:
@@ -797,10 +813,14 @@ class BurialPlannerDock(QDockWidget):
         else:
             self.profile_status.setStyleSheet("")
         self.profile_status.setText(text)
+        self.profile_tab.refresh()
 
     def _set_slope_series(self, profile: profile_data.PlanProfile,
                           params: generation.GenParams) -> None:
-        half_km = max(float(params.coarse_step_m), 1.0) / 1000.0
+        # Local terrain slope follows the persisted bathymetry profile. Rules
+        # with an explicit slope_window_m intentionally evaluate over that
+        # requested vehicle footprint; Auto rules use this local series scale.
+        half_km = max(float(profile.step_m), 1.0) / 1000.0
         long_series, cross_series, abs_series = profile.slope_series(
             half_km, params.direction)
         self.profile.set_slope_series(long_series, cross_series, abs_series)
@@ -819,6 +839,10 @@ class BurialPlannerDock(QDockWidget):
         self._cancel_profile_refresh(silent=True)
         self._profile_generation += 1
         self._start_profile_sampling()
+
+    def request_profile_resample(self) -> None:
+        """Public workflow action used by the Bathymetry Profile tab."""
+        self._resample_profile()
 
     def _start_profile_sampling(self) -> None:
         """One background sampling pass over the scope (+ one-step margin)."""
@@ -846,7 +870,7 @@ class BurialPlannerDock(QDockWidget):
             self.model.route, snapshot, start_kp, end_kp, step_m,
             lambda finished, token=generation_id: self._profile_finished(finished, token),
             distance=self.model.distance,
-            cross_offset_m=params.effective_cross_offset_m)
+            cross_offset_m=self.model.resolve_cross_offset_m(params))
         self._profile_task = task
         task.progressMessage.connect(
             lambda message, active=task: self._profile_message(active, message))
@@ -857,12 +881,14 @@ class BurialPlannerDock(QDockWidget):
         self.profile_cancel.setVisible(True)
         self.profile_status.setStyleSheet("")
         self.profile_status.setText("Sampling plan profile…")
+        self.profile_tab.set_runtime_status("Sampling plan profile…")
         QgsApplication.taskManager().addTask(task)
 
     def _profile_message(self, task: analysis_task.ProfileSamplingTask,
                          message: str) -> None:
         if self._profile_task is task:
             self.profile_status.setText(message)
+            self.profile_tab.set_runtime_status(message)
 
     def _profile_progress_changed(self, task: analysis_task.ProfileSamplingTask,
                                   pct: float) -> None:
@@ -876,6 +902,7 @@ class BurialPlannerDock(QDockWidget):
             self._profile_task = None
             if not silent:
                 self.profile_status.setText("Profile refresh stopping…")
+                self.profile_tab.set_runtime_status("Profile refresh stopping…")
         self.profile_progress.setVisible(False)
         self.profile_cancel.setVisible(False)
 
@@ -890,11 +917,12 @@ class BurialPlannerDock(QDockWidget):
         if task.cancelled:
             self.profile_status.setText(
                 "Profile sampling cancelled — stored samples unchanged.")
-            self.profile_resample.setVisible(bool(self.model.plan))
+            self.profile_tab.refresh()
             return
         if task.error:
             self.profile_status.setText(f"Profile sampling failed: {task.error}")
-            self.profile_resample.setVisible(bool(self.model.plan))
+            self.profile_tab.set_runtime_status(
+                f"Profile sampling failed: {task.error}")
             return
         if not task.series:
             # Nothing sampled — do not overwrite any stored profile with an
@@ -902,8 +930,8 @@ class BurialPlannerDock(QDockWidget):
             self.profile_status.setText(
                 "Bathymetry sources have no coverage within the selected "
                 "scope. Check the bathymetry configuration on Inputs, then "
-                "click Resample profile.")
-            self.profile_resample.setVisible(bool(self.model.plan))
+                "rebuild on Bathymetry Profile.")
+            self.profile_tab.refresh()
             return
         params = self.model.gen_params()
         profile = profile_data.PlanProfile(

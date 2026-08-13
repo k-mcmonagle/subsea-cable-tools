@@ -241,7 +241,8 @@ class RuleEditorDialog(QDialog):
             form.addRow(self.signed_check)
             self.slope_note = QLabel(
                 "Uses longitudinal slope along the route only (+ve = up-slope). "
-                "Raster depths are evaluated at the analysis sampling interval; "
+                "Auto uses the stored bathymetry profile resolution so short, "
+                "steep terrain is retained; "
                 "contour depths are linearly interpolated between their actual "
                 "route crossings. Cross-route slope is not evaluated by this rule.")
             self.slope_note.setWordWrap(True)
@@ -251,14 +252,15 @@ class RuleEditorDialog(QDialog):
             self.slope_window_spin.setRange(0.0, 1000.0)
             self.slope_window_spin.setDecimals(1)
             self.slope_window_spin.setSuffix(" m")
-            self.slope_window_spin.setSpecialValueText("Auto (2 × analysis step)")
+            self.slope_window_spin.setSpecialValueText("Auto (2 × profile step)")
             self.slope_window_spin.setToolTip(
                 "Length over which slope is evaluated — set it to the burial "
                 "vehicle's bearing length (plough skids / trencher tracks) so "
                 "the rule sees the gradient the machine actually experiences "
-                "rather than fine-scale terrain shorter than the vehicle. "
-                "0 = Auto: twice the analysis sampling step. Lengths shorter "
-                "than the bathymetry resolution add no real detail.")
+                "rather than local terrain shorter than the vehicle. "
+                "0 = Auto: local terrain slope over twice the stored profile "
+                "station step. Lengths shorter than the bathymetry resolution "
+                "add no real detail.")
             if config.get("slope_window_m"):
                 self.slope_window_spin.setValue(float(config.get("slope_window_m")))
             form.addRow("Slope evaluation length:", self.slope_window_spin)
@@ -478,59 +480,36 @@ class RulesTab(QWidget):
         layout.addLayout(button_row)
 
         params_row = QHBoxLayout()
-        params_row.addWidget(QLabel("Min section:"))
-        self.min_section_spin = QDoubleSpinBox()
-        self.min_section_spin.setRange(0.0, 1000.0)
-        self.min_section_spin.setDecimals(3)
-        self.min_section_spin.setSuffix(" km")
-        params_row.addWidget(self.min_section_spin)
+        params_row.addWidget(QLabel("Sample step:"))
+        self.step_spin = QSpinBox()
+        self.step_spin.setRange(5, 5000)
+        self.step_spin.setSuffix(" m")
+        self.step_spin.setToolTip(
+            "Coarse route-search spacing for spatial exclusions such as "
+            "polygons, crossings and proximity rules. Smaller values improve "
+            "discovery of short features but add processing time. Depth and "
+            "slope thresholds use the stored Bathymetry Profile resolution.")
+        params_row.addWidget(self.step_spin)
         params_row.addWidget(QLabel("Sliver tolerance:"))
         self.sliver_spin = QDoubleSpinBox()
         self.sliver_spin.setRange(0.0, 100.0)
         self.sliver_spin.setDecimals(3)
         self.sliver_spin.setSuffix(" km")
+        self.sliver_spin.setToolTip(
+            "Absorb a final classification range shorter than this into its "
+            "more-severe neighbour. A stricter exclusion is never silently "
+            "discarded. Set 0 to keep every resolved range.")
         params_row.addWidget(self.sliver_spin)
-        params_row.addWidget(QLabel("Sample step:"))
-        self.step_spin = QSpinBox()
-        self.step_spin.setRange(5, 5000)
-        self.step_spin.setSuffix(" m")
-        params_row.addWidget(self.step_spin)
-        params_row.addWidget(QLabel("Cross offset:"))
-        self.cross_offset_spin = QDoubleSpinBox()
-        self.cross_offset_spin.setRange(0.0, 10000.0)
-        self.cross_offset_spin.setDecimals(1)
-        self.cross_offset_spin.setSuffix(" m")
-        self.cross_offset_spin.setSpecialValueText("Auto (sample step)")
-        self.cross_offset_spin.setToolTip(
-            "Distance either side of the route at which depth is sampled "
-            "for the cross/absolute slope panel — set it to the burial "
-            "vehicle's half track width so the cross slope is measured at "
-            "the scale the machine spans. Auto uses the sample step. "
-            "Changing it marks the stored plan profile stale.")
-        params_row.addWidget(self.cross_offset_spin)
-        params_row.addWidget(QLabel("Profile step:"))
-        self.profile_step_spin = QDoubleSpinBox()
-        self.profile_step_spin.setRange(0.0, 5000.0)
-        self.profile_step_spin.setDecimals(1)
-        self.profile_step_spin.setSuffix(" m")
-        self.profile_step_spin.setSpecialValueText("Auto (bathy cell)")
-        self.profile_step_spin.setToolTip(
-            "Station spacing for the stored plan profile (depth and slope "
-            "panel). Auto follows the smallest configured bathymetry raster "
-            "cell — sampling finer than the data only re-reads the same "
-            "cells. Clamped between 2 m and the sample step (so Generate "
-            "can reuse the stored samples) with a ~500k-station ceiling. "
-            "Changing it marks the stored plan profile stale.")
-        params_row.addWidget(self.profile_step_spin)
         refine_label = QLabel("Boundary refinement: 1 m")
         refine_label.setToolTip(
             "Coarse sampling finds where conditions change; each boundary is "
-            "then refined by bisection to 1 m. A feature narrower than the "
-            "sample step between stations can still be missed — reduce the "
-            "step or split the scope for local refinement where that matters.")
+            "then refined by bisection to 1 m. A spatial polygon/proximity "
+            "feature narrower than the Sample step can still be missed — "
+            "reduce the step where that matters. Depth/slope discovery uses "
+            "the Bathymetry Profile step instead.")
         params_row.addWidget(refine_label)
         params_row.addStretch(1)
-        self.save_params_button = QPushButton("Apply parameters")
+        self.save_params_button = QPushButton("Apply && recompute")
         self.save_params_button.clicked.connect(self._save_params)
         params_row.addWidget(self.save_params_button)
         layout.addLayout(params_row)
@@ -557,11 +536,8 @@ class RulesTab(QWidget):
         try:
             plan = self.model.plan
             params = self.model.gen_params()
-            self.min_section_spin.setValue(params.min_section_km)
             self.sliver_spin.setValue(params.sliver_tol_km)
             self.step_spin.setValue(int(params.coarse_step_m))
-            self.cross_offset_spin.setValue(params.cross_offset_m)
-            self.profile_step_spin.setValue(params.profile_step_m)
             rules = self.model.rules
             self.rule_table.setRowCount(len(rules))
             scope = params.scope
@@ -712,15 +688,13 @@ class RulesTab(QWidget):
     def _save_params(self) -> None:
         if not self.model.plan:
             return
-        self.model.update_plan({"params_json": json.dumps({
-            "min_section_km": self.min_section_spin.value(),
+        saved = self.model.update_gen_params({
             "sliver_tol_km": self.sliver_spin.value(),
             "coarse_step_m": float(self.step_spin.value()),
             "refine_tol_m": 1.0,
-            "cross_offset_m": self.cross_offset_spin.value(),
-            "profile_step_m": self.profile_step_spin.value(),
-        })}, reason="analysis parameters")
-        self._recompute()
+        }, reason="exclusion analysis parameters")
+        if saved:
+            self._recompute()
 
     def _recompute(self) -> None:
         self.dock.request_analysis()

@@ -9,6 +9,7 @@ cancellation raising cleanly; direction mapping of slope limits.
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 
@@ -723,6 +724,77 @@ def test_analysis_reuses_stored_depth_samples() -> bool:
     return _result("analysis consumes stored plan-profile samples", ok)
 
 
+def test_local_slope_uses_profile_resolution() -> bool:
+    """A short 25-degree face is not diluted over the coarse 100 m window."""
+    face_start_m = 90.0
+    face_width_m = 25.0
+    gradient = math.tan(math.radians(25.0))
+
+    def depth_at(kp: float) -> float:
+        along_face_m = min(max(kp * 1000.0 - face_start_m, 0.0),
+                           face_width_m)
+        return 100.0 + gradient * along_face_m
+
+    class _ProfileDepth:
+        def is_available(self):
+            return True
+
+        def prepare(self, cancel=None, progress=None):
+            return True
+
+        def profile_samples(self, *_args, **_kwargs):
+            raise AssertionError("stored samples should bypass raster sampling")
+
+        def sample_route(self, _route, kp):
+            return depth_at(kp)
+
+    route, da = _route()
+    scope = Interval(0.0, 0.2)
+    stations = [round(0.005 * i, 6) for i in range(41)]
+    depth_samples = [(kp, depth_at(kp)) for kp in stations]
+
+    def run_rule(window_m=None):
+        config = {"profile": "slope", "op": ">", "value": 15.0,
+                  "abs": True}
+        if window_m is not None:
+            config["slope_window_m"] = window_m
+        rule_row = {
+            "rule_id": "r-slope", "name": "Steep terrain", "seq": 0,
+            "enabled": 1, "kind": "threshold_profile", "action": "exclude",
+            "criterion_class": "project", "methods_json": "[]",
+            "config_json": json.dumps(config),
+        }
+        work = analysis_task.AnalysisWork(
+            route=route, distance=da, scope=scope, step_m=50.0,
+            direction=1, method="plough", refine_tol_m=1.0,
+            depth=_ProfileDepth(), depth_step_m=5.0,
+            depth_samples=depth_samples)
+        work.rules.append(analysis_task.RuleWork(
+            rule_row=rule_row, kind="threshold_profile", config=config))
+        task = analysis_task.BurialAnalysisTask(work, lambda _task: None)
+        return task, task.run()
+
+    local_task, local_ok = run_rule()
+    footprint = local_task.results[0].footprint if local_task.results else []
+    local_peak = max(
+        (abs(slope) for series in local_task._signed_slope_cache.values()
+         for _kp, slope in series), default=0.0)
+
+    # An explicit 100 m vehicle footprint intentionally returns the old
+    # averaged result (~6.65 degrees), demonstrating that the override remains.
+    wide_task, wide_ok = run_rule(100.0)
+    wide_footprint = wide_task.results[0].footprint if wide_task.results else []
+    wide_peak = max(
+        (abs(slope) for series in wide_task._signed_slope_cache.values()
+         for _kp, slope in series), default=0.0)
+
+    ok = (local_ok and wide_ok and footprint and not wide_footprint
+          and 24.5 < local_peak < 25.5 and 6.0 < wide_peak < 7.5)
+    return _result(
+        "local slope resolves 25-degree face; explicit footprint averages it",
+        ok, f"local={local_peak:.2f}° wide={wide_peak:.2f}°")
+
+
 def test_profile_step_resolution_and_staleness() -> bool:
     """Profile step: manual override, auto fallback, clamps; step change -> stale."""
     from ..burial import profile_data
@@ -750,16 +822,72 @@ def test_profile_step_resolution_and_staleness() -> bool:
     # A stored profile whose step no longer matches the target goes stale.
     model.plan["params_json"] = "{}"
     profile = profile_data.PlanProfile(
-        step_m=model.resolve_profile_step_m(), cross_offset_m=50.0,
+        step_m=model.resolve_profile_step_m(),
+        cross_offset_m=model.resolve_cross_offset_m(),
         scope_start_kp=0.0, scope_end_kp=10.0,
         route_fingerprint=model.current_rpl_fingerprint(),
         depth_fingerprint=model.depth_fingerprint(),
         kps=[0.0, 5.0, 10.0], depths=[10.0, 20.0, 30.0])
     model.bathy_profile = profile
     ok = ok and model.profile_state() == "current"
+    ok = ok and abs(model.resolve_cross_offset_m() - 5.0) < 1e-9
+    model.plan["params_json"] = json.dumps({"cross_offset_m": 3.5})
+    ok = ok and abs(model.resolve_cross_offset_m() - 3.5) < 1e-9
     model.plan["params_json"] = json.dumps({"profile_step_m": 25.0})
     ok = ok and model.profile_state() == "stale"
+
+    # Tabs patch only the parameters they own; applying Exclusions must not
+    # erase Profile or Plan Builder settings (and vice versa).
+    model.plan["params_json"] = json.dumps({
+        "profile_step_m": 5.0, "cross_offset_m": 3.0,
+        "coarse_step_m": 50.0, "sliver_tol_km": 0.02,
+        "min_section_km": 0.5,
+    })
+
+    def fake_update(updates, reason=""):
+        model.plan.update(updates)
+        return True
+
+    model.update_plan = fake_update
+    model.mark_stale = lambda: None
+    ok = ok and model.update_gen_params(
+        {"coarse_step_m": 25.0, "sliver_tol_km": 0.01},
+        reason="test")
+    patched = json.loads(model.plan["params_json"])
+    ok = ok and patched["profile_step_m"] == 5.0
+    ok = ok and patched["cross_offset_m"] == 3.0
+    ok = ok and patched["min_section_km"] == 0.5
+    ok = ok and patched["coarse_step_m"] == 25.0
     return _result("profile step: manual/auto/clamps; step change -> stale", ok)
+
+
+def test_workflow_settings_are_separated() -> bool:
+    """Profile, exclusion and generation settings belong to their own tabs."""
+    from ..burial.tabs.builder_tab import BuilderTab
+    from ..burial.tabs.profile_tab import ProfileTab
+    from ..burial.tabs.rules_tab import RulesTab
+
+    class _Dock:
+        def __getattr__(self, _name):
+            return lambda *_args, **_kwargs: None
+
+    model = PlanModel(object(), None)
+    dock = _Dock()
+    profile_tab = ProfileTab(model, dock)
+    rules_tab = RulesTab(model, dock)
+    builder_tab = BuilderTab(model, dock)
+    ok = hasattr(profile_tab, "profile_step_spin")
+    ok = ok and hasattr(profile_tab, "cross_offset_spin")
+    ok = ok and not hasattr(rules_tab, "profile_step_spin")
+    ok = ok and not hasattr(rules_tab, "cross_offset_spin")
+    ok = ok and hasattr(rules_tab, "step_spin")
+    ok = ok and hasattr(rules_tab, "sliver_spin")
+    ok = ok and not hasattr(rules_tab, "min_section_spin")
+    ok = ok and hasattr(builder_tab, "min_section_spin")
+    for widget in (profile_tab, rules_tab, builder_tab):
+        widget.deleteLater()
+    return _result(
+        "workflow controls: profile / exclusions / candidate generation", ok)
 
 
 def test_burial_depth_config_is_manual_only() -> bool:
@@ -804,7 +932,9 @@ def run_all() -> list:
         test_cross_offset_uses_contour_crossings(),
         test_profile_widget_axes_crosshair_toggles(),
         test_analysis_reuses_stored_depth_samples(),
+        test_local_slope_uses_profile_resolution(),
         test_profile_step_resolution_and_staleness(),
+        test_workflow_settings_are_separated(),
         test_burial_depth_config_is_manual_only(),
     ]
 

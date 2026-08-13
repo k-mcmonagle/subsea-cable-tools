@@ -602,6 +602,10 @@ class AnalysisWork:
     method: str
     refine_tol_m: float
     depth: Optional[DepthSnapshot]
+    # Resolution of the persisted/fallback bathymetry profile. This is
+    # deliberately independent of ``step_m`` (the coarse rule-search step):
+    # local slope must follow the terrain data resolution, not search spacing.
+    depth_step_m: float = 0.0
     rules: List[RuleWork] = field(default_factory=list)
     # Persisted plan-profile samples (kp, depth magnitude | None), injected
     # when current so threshold acquisition skips resampling bathymetry.
@@ -685,7 +689,8 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
                cache: Dict[str, Tuple[List[Interval], List[Interval]]],
                rpl_fp: str,
                project: Optional[QgsProject] = None,
-               depth_samples: Optional[List[Tuple[float, Optional[float]]]] = None
+               depth_samples: Optional[List[Tuple[float, Optional[float]]]] = None,
+               depth_step_m: Optional[float] = None,
                ) -> Tuple["AnalysisWork", List[str]]:
     """Snapshot everything the task needs (main thread). Returns (work, warnings)."""
     project = project or QgsProject.instance()
@@ -699,6 +704,7 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
         route=route, distance=distance, scope=scope,
         step_m=params.coarse_step_m, direction=params.direction,
         method=params.method, refine_tol_m=params.refine_tol_m, depth=depth,
+        depth_step_m=max(float(depth_step_m or params.coarse_step_m), 1.0),
         depth_samples=depth_samples)
 
     for row in rule_rows:
@@ -741,7 +747,8 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
                     project, depth_config)
 
         rule_work.cache_key = generation.rule_cache_key(
-            row, input_fp, scope, params.coarse_step_m, rpl_fp, params.direction)
+            row, input_fp, scope, params.coarse_step_m, rpl_fp, params.direction,
+            profile_step_m=work.depth_step_m)
         cached = cache.get(rule_work.cache_key)
         if cached is not None and not rule_work.error:
             rule_work.cached = cached
@@ -773,13 +780,56 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
 # Predicates for 1 m boundary refinement (§14.3)
 # ---------------------------------------------------------------------------
 
-def _threshold_predicate(work: AnalysisWork, config: Dict) -> Optional[Callable[[float], bool]]:
+def _profile_depth_lookup(
+        samples: List[Tuple[float, Optional[float]]],
+        ) -> Optional[Callable[[float], Optional[float]]]:
+    """Linear depth lookup over the already-sampled profile.
+
+    This keeps 1 m boundary refinement on the same immutable data used for
+    acquisition and avoids returning to a raster provider for every bisection
+    evaluation. Interpolation never bridges a no-data station.
+    """
+    ordered = sorted((float(kp), None if value is None else abs(float(value)))
+                     for kp, value in samples)
+    if not ordered:
+        return None
+    xs = [kp for kp, _value in ordered]
+    values = [value for _kp, value in ordered]
+
+    def lookup(kp: float) -> Optional[float]:
+        target = float(kp)
+        if target < xs[0] - 1e-9 or target > xs[-1] + 1e-9:
+            return None
+        index = bisect.bisect_left(xs, target)
+        if index < len(xs) and abs(xs[index] - target) <= 1e-9:
+            return values[index]
+        if index == 0 or index >= len(xs):
+            return None
+        v0, v1 = values[index - 1], values[index]
+        if v0 is None or v1 is None:
+            return None
+        dx = xs[index] - xs[index - 1]
+        if dx <= 1e-12:
+            return v1
+        ratio = (target - xs[index - 1]) / dx
+        return v0 + ratio * (v1 - v0)
+
+    return lookup
+
+
+def _threshold_predicate(
+        work: AnalysisWork, config: Dict,
+        slope_step_km: Optional[float] = None,
+        sampled_depth_at: Optional[Callable[[float], Optional[float]]] = None,
+        ) -> Optional[Callable[[float], bool]]:
     depth = work.depth
     route = work.route
     if depth is None:
         return None
 
     def depth_at(kp: float) -> Optional[float]:
+        if sampled_depth_at is not None:
+            return sampled_depth_at(kp)
         value = depth.sample_route(route, kp)
         return abs(float(value)) if value is not None else None
 
@@ -788,15 +838,18 @@ def _threshold_predicate(work: AnalysisWork, config: Dict) -> Optional[Callable[
     def value_at(kp: float) -> Optional[float]:
         if profile != "slope":
             return depth_at(kp)
-        # Use the same scale as coarse acquisition: the rule's evaluation
-        # length (vehicle footprint) when configured, else the analysis step.
+        # Use the same scale as acquisition: the rule's explicit evaluation
+        # length (vehicle footprint) when configured, else the persisted
+        # bathymetry-profile step. The latter preserves local terrain that a
+        # much wider coarse rule-search interval would average away.
         # A mismatched window here could turn raster noise (or contour steps)
         # into severe slopes the coarse pass never saw, silently defeating
         # refinement. Clamp to the route, not the scope: coarse stations carry
         # a one-step margin outside the scope, so clamping tighter here would
         # give the predicate a different (narrower) window at the scope edges.
-        delta_km = ri.slope_half_window_km(
-            config, max(float(work.step_m), 1.0) / 1000.0)
+        delta_km = ri.slope_half_window_km(config, slope_step_km)
+        if delta_km is None:
+            delta_km = max(float(work.depth_step_m or work.step_m), 1.0) / 1000.0
         kp0 = max(0.0, kp - delta_km)
         kp1 = min(route.total_length_km, kp + delta_km)
         d0 = depth_at(kp0)
@@ -943,13 +996,21 @@ class BurialAnalysisTask(QgsTask):
         self._sampler: Optional[ri.RouteSampler] = None
         self._depth_series: Optional[List[Tuple[float, float]]] = None
         self._depth_gaps: Optional[List[Interval]] = None
+        self._sampled_depth_at: Optional[
+            Callable[[float], Optional[float]]] = None
+        # Signed slope is the common source for signed and magnitude rules.
+        # Cache by physical half-window so a 500k-station route is derived
+        # once for every distinct local/vehicle-footprint scale.
+        self._signed_slope_cache: Dict[
+            float, List[Tuple[float, float]]] = {}
 
     # -- worker thread -------------------------------------------------------
     def run(self) -> bool:  # noqa: C901 — one linear pipeline, clearer inline
         try:
             work = self.work
             total = max(len(work.rules), 1)
-            if work.depth is not None and work.depth.is_available():
+            if (work.depth_samples is None and work.depth is not None
+                    and work.depth.is_available()):
                 self.progressMessage.emit("Preparing bathymetry sources…")
                 if not work.depth.prepare(
                         cancel=self.isCanceled,
@@ -1037,8 +1098,24 @@ class BurialAnalysisTask(QgsTask):
                         raise ri.RuleInputError("no bathymetry source configured")
                     self.progressMessage.emit(
                         "Sampling bathymetry along the scope…")
+                    # Threshold acquisition follows the persisted-profile
+                    # resolution even when no current stored profile was
+                    # available. The coarse sampler remains appropriate for
+                    # geometry rules and boundary brackets, but would miss or
+                    # flatten short terrain features.
+                    marks = sampler.stations_km
+                    if abs(float(work.depth_step_m) - float(work.step_m)) > 1e-9:
+                        # Build only scalar KPs here. RouteSampler would also
+                        # allocate hundreds of thousands of QgsPointXY objects
+                        # which profile_samples immediately recomputes.
+                        lo = min(sampler.stations_km)
+                        hi = max(sampler.stations_km)
+                        step_km = max(float(work.depth_step_m), 1.0) / 1000.0
+                        count = max(int(math.ceil((hi - lo) / step_km)) + 1, 1)
+                        marks = [min(lo + i * step_km, hi)
+                                 for i in range(count)]
                     samples = work.depth.profile_samples(
-                        work.route, sampler.stations_km, cancel=cancel,
+                        work.route, marks, cancel=cancel,
                         progress=sample_progress)
                 self._depth_series = [
                     (kp, abs(float(value))) for kp, value in samples
@@ -1046,13 +1123,32 @@ class BurialAnalysisTask(QgsTask):
                 flags = [(kp, value is None) for kp, value in samples]
                 self._depth_gaps = eng.intervals_from_bool_series(
                     flags, sampler.scope_domain)
+                self._sampled_depth_at = _profile_depth_lookup(samples)
             if not self._depth_series:
                 raise ri.RuleInputError("bathymetry has no coverage in the scope")
+            slope_step_km = max(
+                float(work.depth_step_m or work.step_m), 1.0) / 1000.0
+            prepared_slope = None
+            if (config.get("profile") or "depth").lower() == "slope":
+                half_km = ri.slope_half_window_km(config, slope_step_km)
+                half_km = max(float(half_km or slope_step_km), 1e-9)
+                cache_key = round(half_km, 12)
+                signed_series = self._signed_slope_cache.get(cache_key)
+                if signed_series is None:
+                    signed_series = eng.signed_slope_series(
+                        self._depth_series, half_km)
+                    self._signed_slope_cache[cache_key] = signed_series
+                prepared_slope = (signed_series if config.get("slope_signed")
+                                  else [(kp, abs(value))
+                                        for kp, value in signed_series])
             intervals = ri.threshold_intervals(
                 self._depth_series, config, sampler.scope_domain,
-                step_km=coarse_step_km)
+                step_km=slope_step_km,
+                prepared_slope_series=prepared_slope)
             nodata = list(self._depth_gaps or [])
-            predicate = _threshold_predicate(work, config)
+            predicate = _threshold_predicate(
+                work, config, slope_step_km=slope_step_km,
+                sampled_depth_at=self._sampled_depth_at)
         elif kind in (wb_schema.RULE_KIND_PROXIMITY, wb_schema.RULE_KIND_POLYGON):
             if rule_work.feats is None:
                 raise ri.RuleInputError("input layer could not be resolved")

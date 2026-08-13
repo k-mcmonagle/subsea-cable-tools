@@ -302,6 +302,20 @@ class PlanModel(QObject):
         floor = params.scope.length_km * 1000.0 / 500000.0
         return round(max(step, floor), 3)
 
+    def resolve_cross_offset_m(self, params: Optional[generation.GenParams] = None
+                               ) -> float:
+        """Cross-slope half-span in metres.
+
+        An entered value represents the burial vehicle's half track width.
+        Auto follows the stored-profile resolution, giving a local terrain
+        cross slope instead of silently averaging across the much wider
+        coarse rule-search step.
+        """
+        params = params or self.gen_params()
+        if params.cross_offset_m > 0:
+            return float(params.cross_offset_m)
+        return self.resolve_profile_step_m(params)
+
     def profile_state(self) -> str:
         """'missing' | 'current' | 'stale' for the persisted plan profile."""
         profile = self.bathy_profile
@@ -312,7 +326,7 @@ class PlanModel(QObject):
         current = profile.is_current(
             self.current_rpl_fingerprint(), self.depth_fingerprint(),
             scope.start_km, scope.end_km,
-            params.effective_cross_offset_m)
+            self.resolve_cross_offset_m(params))
         # A changed target step (manual override, different raster cell,
         # tighter analysis step) also warrants a resample.
         current = current and abs(
@@ -397,6 +411,28 @@ class PlanModel(QObject):
             self.mark_stale()
         self.planChanged.emit()
         return True
+
+    def update_gen_params(self, updates: Dict, reason: str = "") -> bool:
+        """Patch selected workflow parameters without overwriting other tabs.
+
+        Bathymetry preparation, exclusion analysis and candidate generation
+        deliberately expose different parts of ``params_json``. Each tab must
+        preserve the values owned by the others when it applies its settings.
+        """
+        if not self.plan:
+            return False
+        try:
+            stored = json.loads(self.plan.get("params_json") or "{}")
+        except (TypeError, ValueError):
+            stored = {}
+        if not isinstance(stored, dict):
+            stored = {}
+        stored.update(updates)
+        saved = self.update_plan(
+            {"params_json": json.dumps(stored)}, reason=reason)
+        if saved:
+            self.mark_stale()
+        return saved
 
     # -- inputs / rules ------------------------------------------------------
     def save_input(self, row: Dict) -> bool:

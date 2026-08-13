@@ -26,6 +26,8 @@ def test_burial_inputs_construct_and_switch_source_type():
             self.plan = {}
             self.inputs = []
             self.route = None
+            self.route_notice = ""
+            self.route_error = ""
 
         def depth_config(self):
             return DepthSourceConfig({})

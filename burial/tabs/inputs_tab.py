@@ -245,7 +245,7 @@ class InputsTab(QWidget):
         layout.addWidget(scope_box)
 
         # -- bathymetry -------------------------------------------------------
-        bathy_box = QGroupBox("Bathymetry")
+        bathy_box = QGroupBox("Bathymetry source")
         bathy_form = QFormLayout(bathy_box)
         manual_note = QLabel(
             "Select bathymetry specifically for this burial plan. Workbench "
@@ -291,7 +291,7 @@ class InputsTab(QWidget):
         bathy_form.addRow("Contour layer 2 (optional):", self.contour_combo2)
         bathy_form.addRow("Depth field 2:", self.contour_field2)
         bathy_form.addRow("Contour search radius:", self.search_radius)
-        self.apply_bathy_button = QPushButton("Apply bathymetry")
+        self.apply_bathy_button = QPushButton("Apply source")
         self.apply_bathy_button.clicked.connect(self._apply_bathy)
         bathy_form.addRow(self.apply_bathy_button)
         self.apply_status = QLabel("")
@@ -421,7 +421,8 @@ class InputsTab(QWidget):
             "rpl_fingerprint": map_layers.rpl_fingerprint(rpl, store.gpkg_path),
         }, reason="route set")
         self.apply_status.setText(
-            "Workbench route and revision applied. Bathymetry profile refresh started.")
+            "Workbench route and revision applied. Continue to Bathymetry "
+            "Profile to review and rebuild the stored samples.")
 
     def _apply_fallback(self) -> None:
         layer = self.fallback_combo.currentLayer()
@@ -434,7 +435,9 @@ class InputsTab(QWidget):
             "rpl_gpkg_path": layer.source(),
             "rpl_fingerprint": normalised_path(layer.source().split("|")[0]),
         }, reason="route set (line layer)")
-        self.apply_status.setText("Line-layer route applied. Profile refresh started.")
+        self.apply_status.setText(
+            "Line-layer route applied. Continue to Bathymetry Profile to "
+            "review and rebuild the stored samples.")
 
     def _full_route(self) -> None:
         if self.model.route is not None:
@@ -458,7 +461,8 @@ class InputsTab(QWidget):
         }, reason="scope/direction")
         if saved:
             self.apply_status.setText(
-                "Scope and direction applied. Bathymetry profile is refreshing in the background.")
+                "Scope and direction applied. Continue to Bathymetry Profile "
+                "to review and rebuild the stored samples.")
 
     # -- bathymetry -----------------------------------------------------------
     def _bathy_row(self) -> Optional[Dict]:
@@ -569,7 +573,8 @@ class InputsTab(QWidget):
             kind = "raster" if source_mode == 1 else \
                 f"{len(config['contour_layers'])} contour layer(s)"
             self.apply_status.setText(
-                f"Manual {kind} applied. Profile refresh started in the background.")
+                f"Manual {kind} applied. Continue to Bathymetry Profile to "
+                "review resolution and rebuild the stored samples.")
 
     # -- other inputs ---------------------------------------------------------
     def _add_input(self) -> None:

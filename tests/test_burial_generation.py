@@ -177,8 +177,18 @@ def test_cache_key_sensitivity() -> bool:
     # influence/extension changes do NOT invalidate acquisition
     influence = _rule("r1", config={"value": 10.0, "influence_before_m": 100.0})
     ok = ok and base == gen.rule_cache_key(influence, "fp1", scope, 50.0, "rplfp", 1)
+    # Persisted profile resolution affects threshold acquisition independently
+    # of the coarse rule-search step.
+    threshold = _rule("t1", config={"profile": "slope", "value": 10.0})
+    threshold["kind"] = "threshold_profile"
+    key_5m = gen.rule_cache_key(
+        threshold, "fp1", scope, 50.0, "rplfp", 1, profile_step_m=5.0)
+    key_25m = gen.rule_cache_key(
+        threshold, "fp1", scope, 50.0, "rplfp", 1, profile_step_m=25.0)
+    ok = ok and key_5m != key_25m
     return _result("cache key: config/fingerprint/scope/step/rpl invalidate; "
-                   "influence + direction (unsigned) do not", ok)
+                   "profile step invalidates thresholds; influence + direction "
+                   "(unsigned) do not", ok)
 
 
 def test_determinism() -> bool:

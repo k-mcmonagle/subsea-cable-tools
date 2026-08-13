@@ -1,5 +1,9 @@
 # Changelog
 
+- **Burial Planner workflow separates bathymetry preparation from exclusions:** the guided tabs are now Plan → Inputs → Bathymetry Profile → Exclusions → Plan Builder → Review. Inputs selects route/scope/source layers; the new profile tab explains and owns Profile step, Cross offset, resolved station count/slope spans, stored-profile state and explicit background rebuilding. Exclusions retains only Sample step, Sliver tolerance and fixed boundary refinement alongside the rule stack. Minimum candidate-section length moves to Plan Builder and is saved when Generate is clicked. The first profile is no longer sampled silently before its settings can be reviewed, and depth/slope analysis redirects to the profile tab when the stored data is missing or stale.
+
+- **Burial Planner local-slope screening no longer flattens short steep terrain:** Auto longitudinal slope now uses the persisted bathymetry profile resolution (normally the raster cell size) rather than the unrelated coarse rule-search step. For example, a 25° face about 25 m wide is no longer averaged across the default 100 m window into roughly 6.6°. The slope panel and crosshair use the same local scale and state their baseline; setting a rule's *Slope evaluation length* remains an explicit vehicle-footprint average. Auto cross slope likewise uses the profile step at each side, while an entered cross offset represents the plough's half track width. Derived slope arrays are cached per evaluation length, profile resolution participates in rule cache keys, and the non-UI acquisition path can still sample at the bounded profile resolution when stored data is not injected. No new dependencies.
+
 All notable changes to the Subsea Cable Tools QGIS plugin will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),

@@ -114,11 +114,22 @@ class BuilderTab(QWidget):
         layout = QVBoxLayout(self)
 
         run_row = QHBoxLayout()
+        run_row.addWidget(QLabel("Minimum candidate section:"))
+        self.min_section_spin = QDoubleSpinBox()
+        self.min_section_spin.setRange(0.0, 1000.0)
+        self.min_section_spin.setDecimals(3)
+        self.min_section_spin.setSuffix(" km")
+        self.min_section_spin.setToolTip(
+            "Do not create an automatic candidate burial section shorter "
+            "than this operational minimum. Exclusion and insufficient-data "
+            "ranges are never removed by this setting. Set 0 to keep every "
+            "candidate section.")
+        run_row.addWidget(self.min_section_spin)
         self.generate_button = QPushButton("Generate")
         self.generate_button.setToolTip(
             "Run the Exclusion stack over the scope and rebuild candidate "
             "sections and events in the background.")
-        self.generate_button.clicked.connect(lambda: self.dock.request_generation())
+        self.generate_button.clicked.connect(self._generate)
         run_row.addWidget(self.generate_button)
         self.cancel_button = QPushButton("Stop (resumable)")
         self.cancel_button.setEnabled(False)
@@ -301,6 +312,8 @@ class BuilderTab(QWidget):
         self._loading = True
         try:
             method = self.model.method
+            self.min_section_spin.setValue(
+                self.model.gen_params().min_section_km)
             self.add_type_combo.clear()
             for event_type in (schema.EVENT_BURIAL_START, schema.EVENT_BURIAL_END):
                 self.add_type_combo.addItem(ev.event_label(event_type, method), event_type)
@@ -338,6 +351,19 @@ class BuilderTab(QWidget):
             self._loading = False
         self._refresh_sections()
         self._refresh_undo_state()
+
+    def _generate(self) -> None:
+        """Save the candidate-section policy, then generate the plan."""
+        if not self.model.plan:
+            return
+        params = self.model.gen_params()
+        wanted = self.min_section_spin.value()
+        if abs(params.min_section_km - wanted) > 1e-9:
+            if not self.model.update_gen_params(
+                    {"min_section_km": wanted},
+                    reason="minimum candidate section"):
+                return
+        self.dock.request_generation()
 
     def _refresh_undo_state(self) -> None:
         entry = self.model.last_undoable_builder_change()

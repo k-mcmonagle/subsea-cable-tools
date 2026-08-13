@@ -55,8 +55,9 @@ class PlanTab(QWidget):
 
         self.hint = QLabel(
             "Create or open a plan with the selector above, register the RPL "
-            "and survey inputs on the Inputs tab, build the Exclusion stack, "
-            "then generate candidate sections in the Plan Builder.")
+            "and survey inputs on Inputs, build the reusable depth/slope data "
+            "on Bathymetry Profile, configure the Exclusion stack, then "
+            "generate candidate sections in Plan Builder.")
         self.hint.setWordWrap(True)
         layout.addWidget(self.hint)
 

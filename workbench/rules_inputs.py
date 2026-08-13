@@ -300,8 +300,11 @@ def slope_half_window_km(config: Dict, step_km: Optional[float]) -> Optional[flo
 
     ``slope_window_m`` in the rule config is the full evaluation length —
     typically the burial vehicle's bearing length — so slope is the depth
-    difference across that footprint. Unset/0 falls back to the acquisition
-    step (window = 2 × step), the pre-existing behaviour.
+    difference across that footprint. Unset/0 falls back to the supplied
+    profile station step (window = 2 × step). Workbench Assessment supplies
+    its acquisition step; the Burial Planner supplies its denser persisted-
+    profile step so short, steep terrain is not averaged over the unrelated
+    coarse rule-search interval.
     """
     try:
         window_m = float(config.get("slope_window_m") or 0.0)
@@ -347,7 +350,10 @@ def depth_series_with_gaps(sampler: RouteSampler, sample_fn,
 
 def threshold_intervals(depth_series: List[Tuple[float, float]], config: Dict,
                         domain: Interval,
-                        step_km: Optional[float] = None) -> List[Interval]:
+                        step_km: Optional[float] = None,
+                        prepared_slope_series: Optional[
+                            List[Tuple[float, float]]] = None,
+                        ) -> List[Interval]:
     """Threshold/slope intervals from a depth-magnitude series (thread-safe).
 
     Supports the original unsigned depth/slope comparison plus the signed
@@ -355,9 +361,11 @@ def threshold_intervals(depth_series: List[Tuple[float, float]], config: Dict,
     ``upslope_max_deg``; positive slope = shoaling/up-slope with KP) and optional
     WD-banded limits (``bands``: per-band ``limit`` or, for signed slope,
     ``downslope_limit`` / ``upslope_limit``). ``step_km`` is the acquisition
-    sampling step, used as the slope half-window so the coarse series and
-    the boundary-refinement predicate measure slope at the same scale
-    (median station spacing when omitted).
+    profile sampling step, used as the local-slope half-window so acquisition
+    and the boundary-refinement predicate measure slope at the same scale
+    (median station spacing when omitted). ``prepared_slope_series`` lets a
+    long-route caller derive a slope array once and reuse it across rules that
+    share an evaluation length.
     """
     profile = (config.get("profile") or "depth").lower()
     op = config.get("op") or ">"
@@ -365,9 +373,12 @@ def threshold_intervals(depth_series: List[Tuple[float, float]], config: Dict,
     bands = config.get("bands") or []
 
     if profile == "slope":
-        half_km = slope_half_window_km(config, step_km)
-        series = (eng.signed_slope_series(depth_series, half_km) if signed
-                  else _slope_series(depth_series, half_km))
+        if prepared_slope_series is not None:
+            series = prepared_slope_series
+        else:
+            half_km = slope_half_window_km(config, step_km)
+            series = (eng.signed_slope_series(depth_series, half_km) if signed
+                      else _slope_series(depth_series, half_km))
     else:
         series = depth_series
 
