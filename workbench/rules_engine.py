@@ -320,27 +320,62 @@ def intervals_from_bool_series(
     return normalize(out)
 
 
-def signed_slope_series(depth_series: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-    """Central-difference signed seabed slope (degrees) from a depth-magnitude
-    series. Positive = deepening with increasing KP; negative = shoaling.
+def _interp_depth(xs: List[float], zs: List[float], kp: float) -> float:
+    """Linear interpolation on a sorted (kp, depth) series, clamped at ends."""
+    import bisect
+    if kp <= xs[0]:
+        return zs[0]
+    if kp >= xs[-1]:
+        return zs[-1]
+    j = bisect.bisect_left(xs, kp)
+    x0, x1 = xs[j - 1], xs[j]
+    if x1 <= x0:
+        return zs[j]
+    t = (kp - x0) / (x1 - x0)
+    return zs[j - 1] + t * (zs[j] - zs[j - 1])
 
-    The unsigned variant lives in ``rules_inputs._slope_series`` (unchanged);
-    this signed form supports direction-aware up/down-slope limits. Callers map
-    travel direction onto the sign (direction -1 swaps the up/down limits).
+
+def signed_slope_series(depth_series: List[Tuple[float, float]],
+                        half_window_km: Optional[float] = None
+                        ) -> List[Tuple[float, float]]:
+    """Signed seabed slope (degrees) from a depth-magnitude series.
+    Positive = shoaling with increasing KP (up-slope); negative = deepening
+    (down-slope) — the plugin-wide sign convention.
+
+    Slope at each station is a central difference over depths linearly
+    interpolated at ``kp ± half_window_km`` (clamped to the series range),
+    so the window keeps a consistent physical width even where stations are
+    irregular — route vertices and contour crossings injected between the
+    regular marks used to shrink the window to their local spacing and turn
+    steps into near-vertical spikes. ``half_window_km`` defaults to the
+    median station spacing; pass the acquisition step so coarse slope and
+    the 1 m refinement predicate agree on scale.
+
+    The unsigned variant (``rules_inputs._slope_series``) is the magnitude
+    of this series. Callers map travel direction onto the sign
+    (direction -1 swaps the up/down limits).
     """
     pts = sorted(depth_series)
     n = len(pts)
+    if n < 2:
+        return [(kp, 0.0) for kp, _ in pts]
+    xs = [kp for kp, _ in pts]
+    zs = [z for _, z in pts]
+    if half_window_km is None:
+        gaps = sorted(xs[i + 1] - xs[i] for i in range(n - 1))
+        half_window_km = max(gaps[len(gaps) // 2], 1e-9)
+    half = max(float(half_window_km), 1e-9)
     out: List[Tuple[float, float]] = []
-    for i in range(n):
-        if n < 2:
-            out.append((pts[i][0], 0.0))
+    for kp in xs:
+        k0 = max(xs[0], kp - half)
+        k1 = min(xs[-1], kp + half)
+        dx_m = (k1 - k0) * 1000.0
+        if dx_m <= 1e-6:
+            out.append((kp, 0.0))
             continue
-        lo = max(0, i - 1)
-        hi = min(n - 1, i + 1)
-        dz = pts[hi][1] - pts[lo][1]
-        dx_m = (pts[hi][0] - pts[lo][0]) * 1000.0
-        slope = math.degrees(math.atan2(dz, dx_m)) if dx_m > 1e-9 else 0.0
-        out.append((pts[i][0], slope))
+        dz = _interp_depth(xs, zs, k1) - _interp_depth(xs, zs, k0)
+        # Depth magnitudes grow downward, so negate for up-slope-positive.
+        out.append((kp, math.degrees(math.atan2(-dz, dx_m))))
     return out
 
 
@@ -351,15 +386,16 @@ def intervals_from_signed_slope(
 ) -> List[Interval]:
     """Intervals where a signed slope profile breaches either directional limit.
 
-    ``downslope_max_deg`` limits positive slope (deepening with KP);
-    ``upslope_max_deg`` limits the magnitude of negative slope (shoaling).
-    Either may be None (no limit on that side).
+    Series sign: positive = shoaling (up-slope). ``upslope_max_deg`` limits
+    positive slope; ``downslope_max_deg`` limits the magnitude of negative
+    slope (deepening). Either may be None (no limit on that side); both
+    limits are entered as magnitudes.
     """
     out: List[Interval] = []
     if downslope_max_deg is not None:
-        out.extend(intervals_from_profile(slope_series, ">", float(downslope_max_deg)))
+        out.extend(intervals_from_profile(slope_series, "<", -abs(float(downslope_max_deg))))
     if upslope_max_deg is not None:
-        out.extend(intervals_from_profile(slope_series, "<", -abs(float(upslope_max_deg))))
+        out.extend(intervals_from_profile(slope_series, ">", abs(float(upslope_max_deg))))
     return normalize(out)
 
 

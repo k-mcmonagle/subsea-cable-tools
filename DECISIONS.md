@@ -59,9 +59,25 @@ section references in brackets.
   Exclusion Area after regeneration is reset to `candidate` (with a warning),
   not silently back to `confirmed` — the engineer re-confirms it.
 - **Direction-aware signed slope**: acquisition stays direction-ignorant
-  (positive slope = deepening with KP); the task swaps down/up-slope limits
-  when direction is B→A, and the cache key includes direction only for
-  signed-slope rules ("direction where relevant", §14.4).
+  (positive slope = shoaling/up-slope with KP); the task swaps down/up-slope
+  limits when direction is B→A, and the cache key includes direction only for
+  signed-slope rules ("direction where relevant", §14.4). This sign
+  convention is plugin-wide (see README "Slope methodology"): the KP
+  Mouse profile, Depth Profile default and KP Range Depth + Slope Summary
+  all report +ve = up-slope, datum-normalised; side slope +ve = deeper to
+  starboard (vehicle leans to starboard).
+- **Slope window is distance-based, not station-index based**: the coarse
+  slope series differences depths interpolated at kp ± the analysis step, so
+  injected stations (route vertices, contour crossings) no longer shrink the
+  window and the coarse series measures slope at the same scale as the 1 m
+  refinement predicate (which brackets boundaries assuming they agree).
+- **Slope rules can evaluate over the vehicle footprint** (`slope_window_m`):
+  a slope rule may set the evaluation length to the plough/trencher bearing
+  length, so the rule sees the gradient the machine spans rather than
+  fine-scale terrain shorter than the vehicle; unset falls back to
+  2 × analysis step. The window is part of the rule config, so the
+  acquisition cache invalidates when it changes and the refinement predicate
+  uses the same window.
 - **Influence zones and `extend_m` do not invalidate the acquisition cache**
   — they are resolution-time interval ops (§14.4's "reorder/toggle re-runs
   only resolution" extended to the zone parameters).

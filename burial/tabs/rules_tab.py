@@ -240,13 +240,28 @@ class RuleEditorDialog(QDialog):
             self.signed_check.toggled.connect(self._sync_threshold)
             form.addRow(self.signed_check)
             self.slope_note = QLabel(
-                "Uses longitudinal slope along the route only. Raster depths "
-                "are evaluated at the analysis sampling interval; contour "
-                "depths are linearly interpolated between their actual route "
-                "crossings. Cross-route slope is not evaluated by this rule.")
+                "Uses longitudinal slope along the route only (+ve = up-slope). "
+                "Raster depths are evaluated at the analysis sampling interval; "
+                "contour depths are linearly interpolated between their actual "
+                "route crossings. Cross-route slope is not evaluated by this rule.")
             self.slope_note.setWordWrap(True)
             self.slope_note.setStyleSheet("color: #666;")
             form.addRow(self.slope_note)
+            self.slope_window_spin = QDoubleSpinBox()
+            self.slope_window_spin.setRange(0.0, 1000.0)
+            self.slope_window_spin.setDecimals(1)
+            self.slope_window_spin.setSuffix(" m")
+            self.slope_window_spin.setSpecialValueText("Auto (2 × analysis step)")
+            self.slope_window_spin.setToolTip(
+                "Length over which slope is evaluated — set it to the burial "
+                "vehicle's bearing length (plough skids / trencher tracks) so "
+                "the rule sees the gradient the machine actually experiences "
+                "rather than fine-scale terrain shorter than the vehicle. "
+                "0 = Auto: twice the analysis sampling step. Lengths shorter "
+                "than the bathymetry resolution add no real detail.")
+            if config.get("slope_window_m"):
+                self.slope_window_spin.setValue(float(config.get("slope_window_m")))
+            form.addRow("Slope evaluation length:", self.slope_window_spin)
             self.down_spin = QDoubleSpinBox()
             self.up_spin = QDoubleSpinBox()
             for spin in (self.down_spin, self.up_spin):
@@ -320,6 +335,7 @@ class RuleEditorDialog(QDialog):
         self.value_spin.setSuffix(suffix)
         self.value2_spin.setSuffix(suffix)
         self.slope_note.setVisible(is_slope)
+        self.slope_window_spin.setEnabled(is_slope)
         self.signed_check.setEnabled(is_slope)
         self.down_spin.setEnabled(signed)
         self.up_spin.setEnabled(signed)
@@ -339,6 +355,10 @@ class RuleEditorDialog(QDialog):
             config["value2"] = (self.value2_spin.value()
                                 if self.op_combo.currentText() == "between" else None)
             config["abs"] = config.get("profile") == "slope" and not self.signed_check.isChecked()
+            if config["profile"] == "slope" and self.slope_window_spin.value() > 0:
+                config["slope_window_m"] = self.slope_window_spin.value()
+            else:
+                config.pop("slope_window_m", None)
             if config["profile"] == "slope" and self.signed_check.isChecked():
                 config["slope_signed"] = True
                 config["downslope_max_deg"] = self.down_spin.value() or None

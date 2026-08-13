@@ -442,8 +442,8 @@ class RuleResult:
 def _effective_config(rule_row: Dict, direction: int) -> Dict:
     """Rule config with travel direction mapped onto signed-slope limits.
 
-    Positive signed slope = deepening with increasing KP. Installing against
-    KP (direction -1) swaps which physical limit applies to which sign.
+    Positive signed slope = shoaling with increasing KP (up-slope). Installing
+    against KP (direction -1) swaps which physical limit applies to which sign.
     """
     config = generation.rule_config(rule_row)
     if config.get("slope_signed") and int(direction) < 0:
@@ -610,13 +610,17 @@ def _threshold_predicate(work: AnalysisWork, config: Dict) -> Optional[Callable[
     def value_at(kp: float) -> Optional[float]:
         if profile != "slope":
             return depth_at(kp)
-        # Use the same scale as coarse acquisition. The old fixed 10 m
-        # half-window could turn raster noise (or nearest-contour steps) into
-        # severe slopes even when the configured 50/100 m analysis profile
-        # was gentle.
-        delta_km = max(float(work.step_m), 1.0) / 1000.0
-        kp0 = max(work.scope.start_km, kp - delta_km)
-        kp1 = min(work.scope.end_km, kp + delta_km)
+        # Use the same scale as coarse acquisition: the rule's evaluation
+        # length (vehicle footprint) when configured, else the analysis step.
+        # A mismatched window here could turn raster noise (or contour steps)
+        # into severe slopes the coarse pass never saw, silently defeating
+        # refinement. Clamp to the route, not the scope: coarse stations carry
+        # a one-step margin outside the scope, so clamping tighter here would
+        # give the predicate a different (narrower) window at the scope edges.
+        delta_km = ri.slope_half_window_km(
+            config, max(float(work.step_m), 1.0) / 1000.0)
+        kp0 = max(0.0, kp - delta_km)
+        kp1 = min(route.total_length_km, kp + delta_km)
         d0 = depth_at(kp0)
         d1 = depth_at(kp1)
         if d0 is None or d1 is None:
@@ -624,7 +628,8 @@ def _threshold_predicate(work: AnalysisWork, config: Dict) -> Optional[Callable[
         dx_m = (kp1 - kp0) * 1000.0
         dz = d1 - d0
         if config.get("slope_signed"):
-            return math.degrees(math.atan2(dz, dx_m))
+            # Depth magnitudes: negate so +ve = shoaling (up-slope).
+            return math.degrees(math.atan2(-dz, dx_m))
         return math.degrees(math.atan2(abs(dz), dx_m))
 
     signed = bool(config.get("slope_signed")) and profile == "slope"
@@ -645,8 +650,9 @@ def _threshold_predicate(work: AnalysisWork, config: Dict) -> Optional[Callable[
             if signed:
                 down = band.get("downslope_limit", band.get("limit"))
                 up = band.get("upslope_limit", band.get("limit"))
-                return ((down is not None and value > float(down))
-                        or (up is not None and value < -abs(float(up))))
+                # +ve slope = shoaling: up-slope limit on the positive side.
+                return ((down is not None and value < -abs(float(down)))
+                        or (up is not None and value > abs(float(up))))
             limit = band.get("limit")
             if limit is None:
                 return False
@@ -655,8 +661,8 @@ def _threshold_predicate(work: AnalysisWork, config: Dict) -> Optional[Callable[
         if signed:
             down = config.get("downslope_max_deg")
             up = config.get("upslope_max_deg")
-            return ((down is not None and value > float(down))
-                    or (up is not None and value < -abs(float(up))))
+            return ((down is not None and value < -abs(float(down)))
+                    or (up is not None and value > abs(float(up))))
         value2 = config.get("value2")
         lo, hi = eng._cond_bounds(op, float(config.get("value", 0.0)),
                                   float(value2) if value2 is not None else None)
@@ -834,7 +840,8 @@ class BurialAnalysisTask(QgsTask):
             if not self._depth_series:
                 raise ri.RuleInputError("bathymetry has no coverage in the scope")
             intervals = ri.threshold_intervals(
-                self._depth_series, config, sampler.scope_domain)
+                self._depth_series, config, sampler.scope_domain,
+                step_km=coarse_step_km)
             nodata = list(self._depth_gaps or [])
             predicate = _threshold_predicate(work, config)
         elif kind in (wb_schema.RULE_KIND_PROXIMITY, wb_schema.RULE_KIND_POLYGON):

@@ -75,7 +75,7 @@ class KPDepthProfileWindow(QDialog):
         self.slope_widget.setBackground("w")
         self.slope_item = self.slope_widget.getPlotItem()
         self.slope_item.showGrid(x=True, y=True, alpha=0.25)
-        self.slope_item.setLabel("left", "Slope (°)")
+        self.slope_item.setLabel("left", "Slope (°, +ve = up-slope)")
         self.slope_item.setLabel("bottom", "Distance from origin (%s)" % self.unit)
         self.slope_widget.setXLink(self.depth_widget)
         layout.addWidget(self.slope_widget, 2)

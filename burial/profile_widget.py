@@ -80,6 +80,7 @@ class BurialProfileWidget(QWidget):
         self._series: List[Tuple[float, float]] = []
         self._scope: Tuple[float, float] = (0.0, 0.0)
         self._editable = False
+        self._slope_half_window_km: Optional[float] = None
 
         self.plot.scene().sigMouseMoved.connect(self._on_mouse_moved)
         self.plot.scene().sigMouseClicked.connect(self._on_mouse_clicked)
@@ -90,6 +91,18 @@ class BurialProfileWidget(QWidget):
         self._scope = (lo, hi)
         if hi > lo:
             self.plot.setXRange(lo, hi, padding=0.02)
+
+    def set_slope_window_m(self, step_m: float) -> None:
+        """Match the crosshair slope to the analysis scale.
+
+        The readout differences depths at ±(analysis coarse step) so the
+        number under the cursor is measured over the same window as the
+        slope the rules evaluated, not over one display-resolution interval.
+        """
+        try:
+            self._slope_half_window_km = max(float(step_m), 1.0) / 1000.0
+        except (TypeError, ValueError):
+            self._slope_half_window_km = None
 
     def set_profile(self, series: List[Tuple[float, float]]) -> None:
         """series: (kp_km, depth_m magnitude); rendered at data resolution."""
@@ -220,19 +233,52 @@ class BurialProfileWidget(QWidget):
         j = min(candidates, key=lambda j: abs(xs[j] - kp))
         return self._series[j]
 
+    def _interp_depth(self, xs: List[float], kp: float) -> Optional[float]:
+        import bisect
+        if kp <= xs[0]:
+            return self._series[0][1]
+        if kp >= xs[-1]:
+            return self._series[-1][1]
+        j = bisect.bisect_left(xs, kp)
+        kp0, d0 = self._series[j - 1]
+        kp1, d1 = self._series[j]
+        if kp1 <= kp0:
+            return d1
+        t = (kp - kp0) / (kp1 - kp0)
+        return d0 + t * (d1 - d0)
+
     def _slope_at(self, kp: float) -> Optional[float]:
+        """Signed slope (°) at kp; positive = shoaling with increasing KP.
+
+        Central difference over ± the analysis half-window when the dock has
+        provided one (so the readout matches what the rules measured), else
+        over the single bracketing display interval. The series holds depth
+        magnitudes, hence the negated difference for up-slope-positive.
+        """
         if len(self._series) < 2:
             return None
         import bisect
 
         xs = [p[0] for p in self._series]
+        half = self._slope_half_window_km
+        if half:
+            k0 = max(xs[0], kp - half)
+            k1 = min(xs[-1], kp + half)
+            dx_m = (k1 - k0) * 1000.0
+            if dx_m <= 1e-6:
+                return None
+            d0 = self._interp_depth(xs, k0)
+            d1 = self._interp_depth(xs, k1)
+            if d0 is None or d1 is None:
+                return None
+            return math.degrees(math.atan2(-(d1 - d0), dx_m))
         i = min(max(bisect.bisect_left(xs, kp), 1), len(xs) - 1)
         kp0, d0 = self._series[i - 1]
         kp1, d1 = self._series[i]
         dx_m = (kp1 - kp0) * 1000.0
         if dx_m <= 0:
             return None
-        return math.degrees(math.atan2(d1 - d0, dx_m))
+        return math.degrees(math.atan2(-(d1 - d0), dx_m))
 
     def focus_kp(self, kp: float) -> None:
         """Show the profile crosshair/readout at a table-selected KP."""

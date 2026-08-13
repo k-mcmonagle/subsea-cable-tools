@@ -160,10 +160,15 @@ def test_dilate_intervals() -> bool:
 
 
 def test_signed_slope() -> bool:
-    # depth 100 -> 200 over 1 km (deepening), then back (shoaling)
+    # depth 100 -> 200 over 1 km (deepening), then back (shoaling).
+    # Up-slope positive: deepening start is -ve, shoaling end is +ve.
     series = [(0.0, 100.0), (1.0, 200.0), (2.0, 100.0)]
     signed = eng.signed_slope_series(series)
-    ok = signed[0][1] > 0 and signed[2][1] < 0
+    ok = signed[0][1] < 0 and signed[2][1] > 0
+    # A wide evaluation window (vehicle footprint) spans the whole V and
+    # averages the crest to ~0° — footprint-scale smoothing by construction.
+    wide = eng.signed_slope_series(series, half_window_km=1.0)
+    ok = ok and abs(wide[1][1]) < 1e-9
     ivs = eng.intervals_from_signed_slope(signed, downslope_max_deg=3.0,
                                           upslope_max_deg=None)
     # only the deepening half breaches the down-slope limit

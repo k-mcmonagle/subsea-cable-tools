@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+import bisect
 import math
 
 from qgis.PyQt.QtCore import QCoreApplication
@@ -62,12 +63,17 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
 
     Depth sources:
       - Raster(s): samples band 1, preferring smallest grid size among overlapping rasters.
-      - Contour(s): uses intersections with the KP-range line; if interpolation is enabled,
-        depth at stations is linearly interpolated between contour hits.
+      - Contour(s): uses intersections with the KP-range line; depth at stations is
+        linearly interpolated between contour hits.
 
-    Sign conventions (matches Depth Profile defaults):
-      - Along-track slope: +ve for up-slope, -ve for down-slope.
-      - Side-slope: +ve for down to starboard, -ve for down to port.
+    Sign conventions (plugin-wide, matches Depth Profile / KP Mouse / Burial Planner):
+      - Along-track slope: +ve = shoaling with increasing chainage (up-slope),
+        -ve = deepening (down-slope).
+      - Side-slope: +ve = deeper to starboard (vehicle leans to starboard),
+        -ve = deeper to port.
+    The seabed datum (positive-down depths vs negative elevations) is detected per
+    feature from the sampled values, so the sign does not depend on how the source
+    stores depth.
     """
 
     INPUT = 'INPUT'
@@ -162,7 +168,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterBoolean(
                 self.INTERPOLATE_CONTOURS,
-                self.tr('Interpolate between contour hits'),
+                self.tr('Interpolate between contour hits (always on; kept for compatibility)'),
                 defaultValue=True,
             )
         )
@@ -302,14 +308,14 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
         out_fields.append(QgsField(self._unique_field_name(out_fields, 'side_max_deg'), FIELD_TYPE_DOUBLE))
         out_fields.append(QgsField(self._unique_field_name(out_fields, 'side_avg_deg'), FIELD_TYPE_DOUBLE))
 
-        # Optional directional extremes
-        # Along-route slope: +ve = up-slope; -ve = down-slope
-        # Side-slope: +ve = down to stbd; -ve = down to port
+        # Optional directional extremes, reported as positive magnitudes:
+        # steepest down-slope (deepening) / up-slope (shoaling) along the route,
+        # steepest fall to starboard / port across it.
         if include_dir:
+            out_fields.append(QgsField(self._unique_field_name(out_fields, 'slope_down_max_deg'), FIELD_TYPE_DOUBLE))
             out_fields.append(QgsField(self._unique_field_name(out_fields, 'slope_up_max_deg'), FIELD_TYPE_DOUBLE))
-            out_fields.append(QgsField(self._unique_field_name(out_fields, 'slope_down_min_deg'), FIELD_TYPE_DOUBLE))
             out_fields.append(QgsField(self._unique_field_name(out_fields, 'side_stbd_max_deg'), FIELD_TYPE_DOUBLE))
-            out_fields.append(QgsField(self._unique_field_name(out_fields, 'side_port_min_deg'), FIELD_TYPE_DOUBLE))
+            out_fields.append(QgsField(self._unique_field_name(out_fields, 'side_port_max_deg'), FIELD_TYPE_DOUBLE))
 
         (sink, dest_id) = self.parameterAsSink(
             parameters,
@@ -374,13 +380,17 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
             # Use a feature-global stationing (meters) so contour profiles and slope stats are consistent
             global_offset_m = 0.0
             for part_points in parts:
-                part_len = self._measure_polyline_m(part_points, distance_area)
+                # Geodesic segment lengths measured once per part; every
+                # station lookup is then a bisect instead of an O(vertices)
+                # re-measure of the whole part.
+                part_cum = self._cumulative_lengths(part_points, distance_area)
+                part_len = part_cum[-1] if part_cum else 0.0
                 if part_len <= 0:
                     continue
 
                 dist_local = 0.0
                 while dist_local <= part_len + 1e-6:
-                    pt = self._interpolate_point_along_points(part_points, dist_local, distance_area)
+                    pt = self._interpolate_from_cumulative(part_points, part_cum, dist_local)
                     if pt is None:
                         break
                     dist_global = global_offset_m + dist_local
@@ -402,6 +412,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
                     try:
                         side_deg = self._compute_side_slope_at_station(
                             part_points,
+                            part_cum,
                             part_len,
                             dist_local,
                             tangent_delta_m,
@@ -436,6 +447,18 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
 
             depth_min, depth_max, depth_avg = self._min_max_avg(station_depth)
 
+            # Datum sign: +1 for positive-down depths, -1 for negative
+            # elevations, so slope signs follow the plugin-wide convention
+            # (+ve = up-slope) regardless of how the source stores depth.
+            finite_depths = sorted(z for z in station_depth
+                                   if z is not None and math.isfinite(float(z)))
+            datum_sign = 1.0
+            if finite_depths and finite_depths[len(finite_depths) // 2] <= 0:
+                datum_sign = -1.0
+            if datum_sign < 0:
+                station_side_slope_deg = [
+                    -v if v is not None else None for v in station_side_slope_deg]
+
             # Along-track slopes per segment (degrees)
             slope_vals_deg: List[Optional[float]] = []
             prev_dist = None
@@ -455,7 +478,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
                     prev_depth = z
                     continue
                 vertical = float(z) - float(prev_depth)
-                vertical_for_slope = -vertical  # +ve = up-slope (shallower)
+                vertical_for_slope = -datum_sign * vertical  # +ve = shoaling (up-slope)
                 slope_rad = math.atan2(vertical_for_slope, horiz_m)
                 slope_vals_deg.append(math.degrees(slope_rad))
                 prev_dist = d
@@ -465,13 +488,18 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
 
             side_min, side_max, side_avg = self._min_max_avg(station_side_slope_deg)
 
+            slope_down_max = None
             slope_up_max = None
-            slope_down_min = None
             side_stbd_max = None
-            side_port_min = None
+            side_port_max = None
             if include_dir:
-                slope_up_max, slope_down_min = self._pos_max_neg_min(slope_vals_deg)
-                side_stbd_max, side_port_min = self._pos_max_neg_min(station_side_slope_deg)
+                # +ve slope = shoaling, so the positive side is up-slope.
+                pos_max, neg_min = self._pos_max_neg_min(slope_vals_deg)
+                slope_up_max = pos_max
+                slope_down_max = abs(neg_min) if neg_min is not None else None
+                pos_max, neg_min = self._pos_max_neg_min(station_side_slope_deg)
+                side_stbd_max = pos_max
+                side_port_max = abs(neg_min) if neg_min is not None else None
 
             out_feat = QgsFeature(out_fields)
             out_feat.setGeometry(geom)
@@ -487,7 +515,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
                 side_avg,
             ]
             if include_dir:
-                attrs.extend([slope_up_max, slope_down_min, side_stbd_max, side_port_min])
+                attrs.extend([slope_down_max, slope_up_max, side_stbd_max, side_port_max])
             out_feat.setAttributes(attrs)
             sink.addFeature(out_feat, QgsFeatureSink.FastInsert)
 
@@ -826,11 +854,9 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
                 dedup.append((d, z))
                 last_d = d
 
-        # If not interpolating, just return the hit list
-        if not interpolate:
-            return dedup
-
-        # Otherwise: return profile points (distance, depth) usable for linear interpolation
+        # Station depths are always interpolated linearly between crossings;
+        # the INTERPOLATE_CONTOURS parameter is kept only for saved-model
+        # compatibility and has no effect.
         return dedup
 
     @staticmethod
@@ -870,6 +896,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
     def _compute_side_slope_at_station(
         self,
         part_points: Sequence[QgsPointXY],
+        part_cum: Sequence[float],
         part_len_m: float,
         dist_m: float,
         tangent_delta_m: float,
@@ -885,8 +912,8 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
         # Derive local tangent using points ahead/behind
         d0 = max(0.0, dist_m - tangent_delta_m)
         d1 = min(part_len_m, dist_m + tangent_delta_m)
-        g0 = self._interpolate_point_along_points(part_points, d0, distance_area)
-        g1 = self._interpolate_point_along_points(part_points, d1, distance_area)
+        g0 = self._interpolate_from_cumulative(part_points, part_cum, d0)
+        g1 = self._interpolate_from_cumulative(part_points, part_cum, d1)
         if g0 is None or g1 is None:
             return None
 
@@ -1111,42 +1138,40 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
             return []
 
     @staticmethod
-    def _measure_polyline_m(points: Sequence[QgsPointXY], distance_area: QgsDistanceArea) -> float:
-        if not points or len(points) < 2:
-            return 0.0
-        total = 0.0
-        for p0, p1 in zip(points[:-1], points[1:]):
-            try:
-                total += float(distance_area.measureLine(p0, p1))
-            except Exception:
-                total += math.hypot(p1.x() - p0.x(), p1.y() - p0.y())
-        return float(total)
-
-    @staticmethod
-    def _interpolate_point_along_points(
-        points: Sequence[QgsPointXY],
-        distance_m: float,
-        distance_area: QgsDistanceArea,
-    ) -> Optional[QgsPointXY]:
+    def _cumulative_lengths(points: Sequence[QgsPointXY],
+                            distance_area: QgsDistanceArea) -> List[float]:
+        """Cumulative geodesic distance (m) at each vertex; last = part length."""
         if not points:
-            return None
-        if distance_m <= 0:
-            return points[0]
-
-        cumulative = 0.0
+            return []
+        cum = [0.0]
         for p0, p1 in zip(points[:-1], points[1:]):
             try:
                 seg = float(distance_area.measureLine(p0, p1))
             except Exception:
                 seg = math.hypot(p1.x() - p0.x(), p1.y() - p0.y())
-            if seg <= 0:
-                continue
-            if cumulative + seg >= distance_m:
-                r = (distance_m - cumulative) / seg
-                return QgsPointXY(p0.x() + r * (p1.x() - p0.x()), p0.y() + r * (p1.y() - p0.y()))
-            cumulative += seg
+            cum.append(cum[-1] + max(seg, 0.0))
+        return cum
 
-        return points[-1]
+    @staticmethod
+    def _interpolate_from_cumulative(
+        points: Sequence[QgsPointXY],
+        cum: Sequence[float],
+        distance_m: float,
+    ) -> Optional[QgsPointXY]:
+        if not points or not cum:
+            return None
+        if distance_m <= 0:
+            return points[0]
+        if distance_m >= cum[-1]:
+            return points[-1]
+        j = bisect.bisect_left(cum, distance_m)
+        j = max(1, min(j, len(points) - 1))
+        seg = cum[j] - cum[j - 1]
+        if seg <= 0:
+            return points[j]
+        r = (distance_m - cum[j - 1]) / seg
+        p0, p1 = points[j - 1], points[j]
+        return QgsPointXY(p0.x() + r * (p1.x() - p0.x()), p0.y() + r * (p1.y() - p0.y()))
 
     @staticmethod
     def _measure_along_parts_m(
@@ -1268,20 +1293,19 @@ Inputs:
 
 Outputs:
 - depth_min / depth_max / depth_avg
-- slope_min_deg / slope_max_deg / slope_avg_deg (along-route slope, signed)
-- side_min_deg / side_max_deg / side_avg_deg (cross-track side slope, signed; +ve down to starboard)
+- slope_min_deg / slope_max_deg / slope_avg_deg (along-route slope, signed; +ve = shoaling / up-slope with chainage)
+- side_min_deg / side_max_deg / side_avg_deg (cross-track side slope, signed; +ve = deeper to starboard)
 
-Optional (when enabled):
-- slope_up_max_deg (max +ve along-route slope)
-- slope_down_min_deg (most -ve along-route slope)
-- side_stbd_max_deg (max +ve side slope)
-- side_port_min_deg (most -ve side slope)
+Optional (when enabled), reported as positive magnitudes:
+- slope_down_max_deg (steepest deepening along the route)
+- slope_up_max_deg (steepest shoaling along the route)
+- side_stbd_max_deg (steepest fall to starboard)
+- side_port_max_deg (steepest fall to port)
 
 Notes:
-- Along-route slope sign matches Depth Profile default (Invert Slope enabled): +ve = up-slope.
-- Side-slope sign matches Depth Profile: +ve = down to starboard.
+- Sign convention is plugin-wide: +ve along-route slope = shoaling (up-slope), +ve side slope = deeper to starboard (vehicle leans to starboard). This matches the KP Mouse profile, the Workbench/Burial Planner rules, and the Depth Profile tool's default. The seabed datum (positive-down depths vs negative elevations) is detected automatically per feature.
 - Adaptive sampling (Raster only): step = max(interval, factor × raster pixel size at each station).
-- For contour mode, enabling interpolation will fill depth between contour intersections along the KP range.
+- Contour depths are always interpolated linearly between contour crossings along the KP range.
 """
         )
 

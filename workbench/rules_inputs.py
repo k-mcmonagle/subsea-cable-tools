@@ -76,13 +76,16 @@ class RouteSampler:
 
     def __init__(self, route: RouteFrame, stations_km: List[float],
                  coords: List[Optional[QgsPointXY]], distance,
-                 scope: Optional[Interval] = None):
+                 scope: Optional[Interval] = None,
+                 step_km: Optional[float] = None):
         self.route = route
         self.stations_km = stations_km
         self.coords = coords  # parallel to stations_km; (x=lon, y=lat) or None
         self.distance = distance
         self.total_km = route.total_length_km
         self.scope = scope
+        self.step_km = step_km  # regular sampling step (slope half-window)
+        self._depth_series_cache: Dict[str, List[Tuple[float, float]]] = {}
 
     @property
     def domain(self) -> Interval:
@@ -138,7 +141,8 @@ class RouteSampler:
         """
         stations = _build_stations(route, sample_step_m, scope)
         coords = [route.point_at_kp(kp, clamp=True) for kp in stations]
-        return cls(route, stations, coords, distance, scope)
+        return cls(route, stations, coords, distance, scope,
+                   step_km=max(float(sample_step_m), 1.0) / 1000.0)
 
 
 def _build_stations(route: RouteFrame, sample_step_m: float,
@@ -291,23 +295,29 @@ def _rpl_depth_series(store, rpl_id: str) -> List[Tuple[float, float]]:
     return out
 
 
-def _slope_series(depth_series: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-    """Central-difference seabed slope (degrees) from a depth-magnitude series."""
-    import math
-    pts = sorted(depth_series)
-    n = len(pts)
-    out: List[Tuple[float, float]] = []
-    for i in range(n):
-        if n < 2:
-            out.append((pts[i][0], 0.0))
-            continue
-        lo = max(0, i - 1)
-        hi = min(n - 1, i + 1)
-        dz = pts[hi][1] - pts[lo][1]
-        dx_m = (pts[hi][0] - pts[lo][0]) * 1000.0
-        slope = math.degrees(math.atan2(abs(dz), dx_m)) if dx_m > 1e-9 else 0.0
-        out.append((pts[i][0], slope))
-    return out
+def slope_half_window_km(config: Dict, step_km: Optional[float]) -> Optional[float]:
+    """Half-window (km) for slope differencing at a rule's evaluation scale.
+
+    ``slope_window_m`` in the rule config is the full evaluation length —
+    typically the burial vehicle's bearing length — so slope is the depth
+    difference across that footprint. Unset/0 falls back to the acquisition
+    step (window = 2 × step), the pre-existing behaviour.
+    """
+    try:
+        window_m = float(config.get("slope_window_m") or 0.0)
+    except (TypeError, ValueError):
+        window_m = 0.0
+    if window_m > 0:
+        return max(window_m, 2.0) / 2000.0
+    return step_km
+
+
+def _slope_series(depth_series: List[Tuple[float, float]],
+                  half_window_km: Optional[float] = None
+                  ) -> List[Tuple[float, float]]:
+    """Unsigned seabed slope (degrees): magnitude of the shared signed series."""
+    return [(kp, abs(slope))
+            for kp, slope in eng.signed_slope_series(depth_series, half_window_km)]
 
 
 def depth_series_with_gaps(sampler: RouteSampler, sample_fn,
@@ -336,15 +346,18 @@ def depth_series_with_gaps(sampler: RouteSampler, sample_fn,
 
 
 def threshold_intervals(depth_series: List[Tuple[float, float]], config: Dict,
-                        domain: Interval) -> List[Interval]:
+                        domain: Interval,
+                        step_km: Optional[float] = None) -> List[Interval]:
     """Threshold/slope intervals from a depth-magnitude series (thread-safe).
 
     Supports the original unsigned depth/slope comparison plus the signed
     directional slope (``slope_signed`` with ``downslope_max_deg`` /
-    ``upslope_max_deg``; positive slope = deepening with KP) and optional
+    ``upslope_max_deg``; positive slope = shoaling/up-slope with KP) and optional
     WD-banded limits (``bands``: per-band ``limit`` or, for signed slope,
-    ``downslope_limit`` / ``upslope_limit``). Defaults preserve the original
-    Assessment behaviour exactly.
+    ``downslope_limit`` / ``upslope_limit``). ``step_km`` is the acquisition
+    sampling step, used as the slope half-window so the coarse series and
+    the boundary-refinement predicate measure slope at the same scale
+    (median station spacing when omitted).
     """
     profile = (config.get("profile") or "depth").lower()
     op = config.get("op") or ">"
@@ -352,8 +365,9 @@ def threshold_intervals(depth_series: List[Tuple[float, float]], config: Dict,
     bands = config.get("bands") or []
 
     if profile == "slope":
-        series = (eng.signed_slope_series(depth_series) if signed
-                  else _slope_series(depth_series))
+        half_km = slope_half_window_km(config, step_km)
+        series = (eng.signed_slope_series(depth_series, half_km) if signed
+                  else _slope_series(depth_series, half_km))
     else:
         series = depth_series
 
@@ -368,9 +382,11 @@ def threshold_intervals(depth_series: List[Tuple[float, float]], config: Dict,
                 if band is not None:
                     down = band.get("downslope_limit", band.get("limit"))
                     up = band.get("upslope_limit", band.get("limit"))
-                    if down is not None and slope > float(down):
+                    # +ve slope = shoaling: up-slope limit governs the
+                    # positive side, down-slope limit the negative side.
+                    if down is not None and slope < -abs(float(down)):
                         fired = True
-                    if up is not None and slope < -abs(float(up)):
+                    if up is not None and slope > abs(float(up)):
                         fired = True
                 flags.append((kp, fired))
             return eng.intervals_from_bool_series(flags, domain)
@@ -389,8 +405,18 @@ def threshold_intervals(depth_series: List[Tuple[float, float]], config: Dict,
 
 
 def _acquire_threshold(sampler, store, rpl_id, config, project) -> List[Interval]:
-    depth_series = _depth_series(sampler, store, rpl_id, project)
-    return threshold_intervals(depth_series, config, sampler.domain)
+    # One route walk per run, not per rule: several threshold rules (depth +
+    # slope limits) share the same stations, and each walk costs a provider
+    # sample per station.
+    cache = getattr(sampler, "_depth_series_cache", None)
+    if cache is not None and rpl_id in cache:
+        depth_series = cache[rpl_id]
+    else:
+        depth_series = _depth_series(sampler, store, rpl_id, project)
+        if cache is not None:
+            cache[rpl_id] = depth_series
+    return threshold_intervals(depth_series, config, sampler.domain,
+                               step_km=getattr(sampler, "step_km", None))
 
 
 def _feature_buffer_m(feat, buffer_field: str, default_m: float) -> float:

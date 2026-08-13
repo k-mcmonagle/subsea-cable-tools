@@ -692,6 +692,7 @@ class BurialPlannerDock(QDockWidget):
         params = self.model.gen_params()
         scope = params.scope
         self.profile.set_scope(scope.start_km, scope.end_km)
+        self.profile.set_slope_window_m(params.coarse_step_m)
         self.profile.set_profile([])
         self._refresh_profile_overlays()
         self._refresh_profile_events()

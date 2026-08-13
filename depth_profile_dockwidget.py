@@ -302,8 +302,17 @@ class DepthProfileDockWidget(QDockWidget):
         self.invert_slope_axis_chk = QCheckBox("Invert Slope Axis")
         self.invert_slope_axis_chk.setChecked(bool(self.settings.value("DepthProfile/invert_slope_axis", False, type=bool)))
         checkboxes_row.addWidget(self.invert_slope_axis_chk)
+        # v2 key: the sign convention under this option changed, so stale
+        # persisted values from the old semantics must not carry over.
         self.invert_slope_chk = QCheckBox("Invert Slope Sign")
-        self.invert_slope_chk.setChecked(bool(self.settings.value("DepthProfile/invert_slope", True, type=bool)))
+        self.invert_slope_chk.setChecked(bool(self.settings.value("DepthProfile/invert_slope_v2", False, type=bool)))
+        self.invert_slope_chk.setToolTip(
+            "Unchecked (default): +ve slope = shoaling with increasing KP "
+            "(up-slope), the plugin-wide convention shared by the KP Mouse "
+            "profile, the Workbench and the Burial Planner. Checked: +ve "
+            "slope = deepening (down-slope). The seabed datum (positive-down "
+            "depths vs negative elevations) is detected automatically, so "
+            "the sign does not depend on how the raster stores depth.")
         checkboxes_row.addWidget(self.invert_slope_chk)
         self.show_tooltips_chk = QCheckBox("Tooltips")
         self.show_tooltips_chk.setChecked(True)
@@ -872,13 +881,20 @@ class DepthProfileDockWidget(QDockWidget):
             self._sample_contour_mode(ax)
 
         # 3. Derived metrics
-        self._compute_slopes()
-        # Side-slope (cross-profile) is optional
+        # Side-slope (cross-profile) is optional and computed first, so the
+        # single _compute_slopes pass can attach the per-segment side columns.
         if getattr(self, 'side_slope_chk', None) and self.side_slope_chk.isChecked():
             try:
                 self._compute_side_slopes_with_progress()
             except Exception as e:
                 self.iface.messageBar().pushMessage("Depth Profile", f"Side slope failed: {e}", level=1, duration=6)
+        else:
+            self.side_slope_deg = []
+            self.side_slope_pct = []
+            self.side_port_depth = []
+            self.side_starboard_depth = []
+            self.side_cross_span_m = []
+        self._compute_slopes()
         dual = self.dual_plot_chk.isChecked() if hasattr(self, 'dual_plot_chk') else False
         self._compute_seabed_length(dual)
 
@@ -1074,7 +1090,7 @@ class DepthProfileDockWidget(QDockWidget):
         self.settings.setValue("DepthProfile/invert_kp_axis", self.invert_kp_axis_chk.isChecked())
         self.settings.setValue("DepthProfile/reverse_x_axis", self.invert_kp_axis_chk.isChecked())
         self.settings.setValue("DepthProfile/invert_slope_axis", self.invert_slope_axis_chk.isChecked())
-        self.settings.setValue("DepthProfile/invert_slope", self.invert_slope_chk.isChecked())
+        self.settings.setValue("DepthProfile/invert_slope_v2", self.invert_slope_chk.isChecked())
         if not dual:
             self.settings.setValue("DepthProfile/variable", self.variable_combo.currentText())
         self.settings.setValue("DepthProfile/dual_plot", dual)
@@ -1105,7 +1121,7 @@ class DepthProfileDockWidget(QDockWidget):
         # Guard against excessive sample counts that can freeze UI
         # - fixed interval: based on interval
         # - adaptive: based on minimum step (best-case lower bound on spacing)
-        expected_samples = int(self.line_length / (min_step_m if adaptive else min_step_m)) + 1 if self.line_length > 0 else 0
+        expected_samples = int(self.line_length / min_step_m) + 1 if self.line_length > 0 else 0
         max_samples = self.max_samples_spin.value() if hasattr(self, 'max_samples_spin') else 50000
         auto_limit = self.auto_limit_chk.isChecked() if hasattr(self, 'auto_limit_chk') else True
         if expected_samples > max_samples:
@@ -1644,6 +1660,17 @@ class DepthProfileDockWidget(QDockWidget):
                 cumulative += seg_len
         return best_cum
 
+    def _datum_sign(self):
+        """+1.0 for positive-down depth data, -1.0 for negative elevations.
+
+        Depth differences are normalised onto a positive-down basis before
+        the plugin-wide up-slope-positive sign is applied, so sources that
+        store seabed as negative elevation need their differences flipped.
+        """
+        from .maptools.kp_profile_math import should_invert_depth_axis
+        positive_down = should_invert_depth_axis(self.depth_values or [])
+        return -1.0 if positive_down is False else 1.0
+
     def _compute_slopes(self):
         self.slope_deg = []
         self.slope_pct = []
@@ -1663,22 +1690,26 @@ class DepthProfileDockWidget(QDockWidget):
         
         if len(self.kp_values) < 2:
             return
-        self.slope_deg.append(0.0)
-        self.slope_pct.append(0.0)
+        datum_sign = self._datum_sign()
+        invert = self.invert_slope_chk.isChecked()
+        # First station has no preceding interval — no fabricated 0° value.
+        self.slope_deg.append(None)
+        self.slope_pct.append(None)
         for i in range(1, len(self.kp_values)):
             d_km = self.kp_values[i] - self.kp_values[i-1]
-            if d_km <= 0:
-                self.slope_deg.append(0.0); self.slope_pct.append(0.0); continue
             v1 = self.depth_values[i-1]
             v2 = self.depth_values[i]
-            if v1 is None or v2 is None:
+            if d_km <= 0 or v1 is None or v2 is None:
                 self.slope_deg.append(None); self.slope_pct.append(None); continue
             horiz_m = d_km * 1000.0
             vertical = v2 - v1
-            vertical_for_slope = -vertical if self.invert_slope_chk.isChecked() else vertical
-            slope_rad = math.atan2(vertical_for_slope, horiz_m) if horiz_m > 0 else 0.0
+            # +ve = shoaling with increasing KP (plugin-wide up-slope-positive
+            # convention); Invert Slope Sign flips to +ve = deepening.
+            upslope = -datum_sign * vertical
+            vertical_for_slope = -upslope if invert else upslope
+            slope_rad = math.atan2(vertical_for_slope, horiz_m)
             self.slope_deg.append(math.degrees(slope_rad))
-            self.slope_pct.append(100.0 * vertical_for_slope / horiz_m if horiz_m > 0 else 0.0)
+            self.slope_pct.append(100.0 * vertical_for_slope / horiz_m)
             
             # Populate segment data for CSV export
             self.segment_kp_from.append(self.kp_values[i-1])
@@ -1755,12 +1786,14 @@ class DepthProfileDockWidget(QDockWidget):
 
     # ---------------------- Side slope (cross-profile) ----------------------
     def _compute_side_slopes_with_progress(self):
-        """Compute side slope (+ve = down to starboard) with a progress indicator.
+        """Compute side slope (+ve = deeper to starboard) with a progress indicator.
 
                 - Raster mode: samples bathymetry across the transect and fits a line (depth vs cross distance).
                     This is smoother and less noisy than a single end-point difference.
                 - Contour mode: collects all contour intersections along the transect and fits a line.
                     This avoids tiny-span blowups (which can yield near-vertical slopes).
+                The datum sign (positive-down depths vs negative elevations) is
+                normalised so +ve always means the seabed falls away to starboard.
         """
         if not self.kp_values:
             return
@@ -1816,6 +1849,8 @@ class DepthProfileDockWidget(QDockWidget):
                     tangent_delta_m = max(5.0, min(50.0, spacing_m / 2.0))
         except Exception:
             tangent_delta_m = 10.0
+
+        datum_sign = self._datum_sign()
 
         # Cross-profile sampling resolution (odd count includes center)
         cross_sample_count = 11
@@ -1940,14 +1975,14 @@ class DepthProfileDockWidget(QDockWidget):
                         stbd_z = a + b * (search_m)
 
                     span = 2.0 * search_m
-                    dz = float(stbd_z) - float(port_z)
-                    slope_rad = math.atan2(b, 1.0)  # b = dz/dt
+                    b_deepening = datum_sign * float(b)  # +ve = deeper to stbd
+                    slope_rad = math.atan2(b_deepening, 1.0)  # b = dz/dt
 
                     self.side_port_depth[i] = float(port_z)
                     self.side_starboard_depth[i] = float(stbd_z)
                     self.side_cross_span_m[i] = span
                     self.side_slope_deg[i] = math.degrees(slope_rad)
-                    self.side_slope_pct[i] = 100.0 * float(b)
+                    self.side_slope_pct[i] = 100.0 * b_deepening
                 else:
                     # Contours: collect all intersections along transect and fit depth vs signed distance.
                     transect = QgsGeometry.fromPolylineXY([port_pt, stbd_pt])
@@ -1985,12 +2020,13 @@ class DepthProfileDockWidget(QDockWidget):
                     stbd_z = a + b * (search_m)
                     span = 2.0 * search_m
 
-                    slope_rad = math.atan2(float(b), 1.0)
+                    b_deepening = datum_sign * float(b)  # +ve = deeper to stbd
+                    slope_rad = math.atan2(b_deepening, 1.0)
                     self.side_port_depth[i] = float(port_z)
                     self.side_starboard_depth[i] = float(stbd_z)
                     self.side_cross_span_m[i] = span
                     self.side_slope_deg[i] = math.degrees(slope_rad)
-                    self.side_slope_pct[i] = 100.0 * float(b)
+                    self.side_slope_pct[i] = 100.0 * b_deepening
             except Exception:
                 continue
 
@@ -2001,12 +2037,6 @@ class DepthProfileDockWidget(QDockWidget):
             self.settings.setValue("DepthProfile/side_slope_enabled", self.side_slope_chk.isChecked())
             self.settings.setValue("DepthProfile/side_slope_search_m", int(search_m))
             self.settings.setValue("DepthProfile/side_slope_plot", self.side_slope_plot_chk.isChecked())
-        except Exception:
-            pass
-
-        # Refresh segment-side columns (segment arrays are built in _compute_slopes; rebuild to include side slope)
-        try:
-            self._compute_slopes()
         except Exception:
             pass
 
@@ -2045,29 +2075,6 @@ class DepthProfileDockWidget(QDockWidget):
             if x.size == 0:
                 return None
             return float(np.mean(y) - float(slope_b) * np.mean(x))
-        except Exception:
-            return None
-
-    def _sample_raster_at_point(self, point_xy, provider, extent, transform_line_to_raster):
-        """Sample raster at a point (point_xy is in line CRS)."""
-        if provider is None:
-            return None
-        sample_pt = QgsPointXY(point_xy.x(), point_xy.y())
-        if transform_line_to_raster:
-            try:
-                sample_pt = transform_line_to_raster.transform(sample_pt)
-            except Exception:
-                pass
-        try:
-            if extent and (sample_pt.x() < extent.xMinimum() or sample_pt.x() > extent.xMaximum() or sample_pt.y() < extent.yMinimum() or sample_pt.y() > extent.yMaximum()):
-                return None
-        except Exception:
-            pass
-        try:
-            sample, ok = provider.sample(sample_pt, 1)
-            if not ok:
-                return None
-            return float(sample)
         except Exception:
             return None
 
