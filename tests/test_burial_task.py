@@ -579,6 +579,58 @@ def test_profile_cross_offset_sampling() -> bool:
     return _result("cross-offset sampling: starboard side, sign, direction flip", ok)
 
 
+def test_cross_offset_uses_contour_crossings() -> bool:
+    """Cross-offset contour depths interpolate offset-line crossings.
+
+    Regression: the cross phase used per-station nearest-contour scans —
+    O(stations × contours), which stalled for hours on ~1000 km routes and
+    invented values from distant contours on flat stretches. It now mirrors
+    the along-route methodology: intersect the offset polylines with the
+    contours and interpolate between bracketing crossings only.
+    """
+    from ..workbench.depth_service import DepthSourceConfig
+
+    project = QgsProject.instance()
+    route, da = _route()  # due north along lon 0, ~22 km
+    contours = QgsVectorLayer("LineString?crs=EPSG:4326&field=depth:double",
+                              "xoff-contours", "memory")
+    provider = contours.dataProvider()
+    # Contours tilted up to the north-east (lat rises 0.1° per 1° lon), so
+    # the port offset line crosses each contour south of the starboard line.
+    for base, depth in ((50.02, 100.0), (50.18, 1000.0)):
+        feat = QgsFeature(contours.fields())
+        feat.setGeometry(QgsGeometry.fromWkt(
+            f"LINESTRING(-0.05 {base - 0.005}, 0.05 {base + 0.005})"))
+        feat.setAttributes([depth])
+        provider.addFeature(feat)
+    project.addMapLayer(contours)
+    config = DepthSourceConfig({
+        "mode": 2,
+        "contour_layers": [{"layer_id": contours.id(),
+                            "depth_field": "depth"}],
+        "contour_search_radius_m": 500.0})
+    snapshot = analysis_task.DepthSnapshot(config, project)
+    task = analysis_task.ProfileSamplingTask(
+        route, snapshot, 0.0, route.total_length_km, 100.0, lambda _t: None,
+        distance=da, cross_offset_m=100.0)
+    ok = task.run() and not task.error
+    ok = ok and len(task.kps) == len(task.port_depths) == len(task.stbd_depths)
+    interior = [(p, s) for p, s in zip(task.port_depths, task.stbd_depths)
+                if p is not None and s is not None]
+    ok = ok and len(interior) > 100
+    # Deepening northwards + NE tilt: at every station the port line sits
+    # effectively further north relative to the contour field -> deeper.
+    ok = ok and all(p > s for p, s in interior)
+    # Outside the bracketing crossings nothing is invented, even though the
+    # nearest contour is well within reach of a nearest-point scan.
+    ok = ok and task.port_depths[0] is None and task.stbd_depths[0] is None
+    ok = ok and task.port_depths[-1] is None and task.stbd_depths[-1] is None
+    ok = ok and any(v is not None for v in task.depths)
+    project.removeMapLayer(contours.id())
+    return _result("cross-offset depths interpolate offset-line contour crossings",
+                   ok, f"{len(interior)} interior stations")
+
+
 def test_analysis_reuses_stored_depth_samples() -> bool:
     """Injected plan-profile samples bypass bathymetry sampling entirely."""
 
@@ -704,6 +756,7 @@ def run_all() -> list:
         test_profile_sampling_task(),
         test_route_frame_chainage_matches_walk(),
         test_profile_cross_offset_sampling(),
+        test_cross_offset_uses_contour_crossings(),
         test_analysis_reuses_stored_depth_samples(),
         test_profile_step_resolution_and_staleness(),
         test_burial_depth_config_is_manual_only(),

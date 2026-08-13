@@ -370,6 +370,161 @@ class DepthSnapshot:
         ratio = (float(kp) - kp0) / (kp1 - kp0)
         return d0 + ratio * (d1 - d0)
 
+    def _polyline_crossings(self, stations_km: List[float],
+                            points: List[Optional[QgsPointXY]],
+                            cancel: Optional[Callable[[], bool]] = None,
+                            chunk_size: int = 512
+                            ) -> List[Tuple[float, float]]:
+        """(KP, depth) contour crossings along a station polyline.
+
+        The polyline is parametrised by station KP: a crossing at fraction t
+        of the segment between stations i and i+1 maps to
+        ``kp_i + t * (kp_{i+1} - kp_i)``. Chunking keeps each candidate
+        lookup's bounding box local, so stretches with no nearby contours
+        cost one index query and nothing else.
+        """
+        raw: List[Tuple[float, float]] = []
+        if not self._contours or self._contour_index is None:
+            return raw
+        n = len(points)
+        start = 0
+        while start < n - 1:
+            if points[start] is None:
+                start += 1
+                continue
+            end = start
+            while (end + 1 < n and points[end + 1] is not None
+                   and end - start < chunk_size):
+                end += 1
+            if end == start:
+                start += 1
+                continue
+            if cancel is not None and cancel():
+                raise ri.AcquisitionCancelled()
+            seg_pts = points[start:end + 1]
+            seg_kps = stations_km[start:end + 1]
+            start = end  # chunks share their boundary station: no gap
+            # Cumulative planar lengths in geometry units (degrees) — the
+            # same metric lineLocatePoint reports, used only to locate a
+            # crossing within the chunk, never as a distance.
+            cum = [0.0]
+            for a, b in zip(seg_pts, seg_pts[1:]):
+                cum.append(cum[-1] + math.hypot(b.x() - a.x(), b.y() - a.y()))
+            if cum[-1] <= 0.0:
+                continue
+            chunk_geom = QgsGeometry.fromPolylineXY(seg_pts)
+            if chunk_geom is None or chunk_geom.isEmpty():
+                continue
+            for idx in self._contour_index.intersects(chunk_geom.boundingBox()):
+                contour_geom, depth = self._contours[idx]
+                try:
+                    intersection = chunk_geom.intersection(contour_geom)
+                except Exception:
+                    continue
+                if intersection is None or intersection.isEmpty():
+                    continue
+                try:
+                    vertices = intersection.vertices()
+                except Exception:
+                    continue
+                for vertex in vertices:
+                    try:
+                        loc = chunk_geom.lineLocatePoint(
+                            QgsGeometry.fromPointXY(QgsPointXY(vertex)))
+                    except Exception:
+                        continue
+                    if loc is None or loc < 0.0:
+                        continue
+                    j = min(max(bisect.bisect_right(cum, loc) - 1, 0),
+                            len(seg_kps) - 2)
+                    seg_len = cum[j + 1] - cum[j]
+                    t = (loc - cum[j]) / seg_len if seg_len > 0 else 0.0
+                    raw.append((seg_kps[j] + t * (seg_kps[j + 1] - seg_kps[j]),
+                                float(depth)))
+        raw.sort()
+        crossings: List[Tuple[float, float]] = []
+        for kp, depth in raw:
+            if crossings and abs(kp - crossings[-1][0]) <= 1e-8 \
+                    and abs(depth - crossings[-1][1]) <= 1e-8:
+                continue
+            crossings.append((kp, depth))
+        return crossings
+
+    def offset_profile_samples(
+            self, route: RouteFrame, stations_km: List[float],
+            offset_m: float, distance,
+            cancel: Optional[Callable[[], bool]] = None,
+            progress: Optional[Callable[[int, int], None]] = None,
+    ) -> Tuple[List[Optional[float]], List[Optional[float]]]:
+        """(port, starboard) depth values at ± ``offset_m`` per station KP.
+
+        Rasters are point-sampled at the geodesically offset positions.
+        Contours follow the along-route methodology: intersect each offset
+        polyline with the contours and interpolate between bracketing
+        crossings — never per-station nearest-point scans, which are both
+        O(stations × contours) (hours on a long route) and a staircase whose
+        nearest contour can be kilometres away in flat areas. Stations with
+        no bracketing crossings return ``None`` instead of an invented value.
+        Starboard is to the right of increasing KP.
+        """
+        n = len(stations_km)
+        port: List[Optional[float]] = [None] * n
+        stbd: List[Optional[float]] = [None] * n
+        if n == 0 or offset_m <= 0 or distance is None:
+            return port, stbd
+        if not self._contours_prepared and not self.prepare(cancel):
+            raise ri.AcquisitionCancelled()
+
+        total_units = 3 * n  # one share for offset points, one per side
+
+        def tick(units: int) -> None:
+            if progress is not None:
+                progress(min(units, total_units), total_units)
+
+        station_pts = [route.point_at_kp(kp, clamp=True) for kp in stations_km]
+        port_pts: List[Optional[QgsPointXY]] = [None] * n
+        stbd_pts: List[Optional[QgsPointXY]] = [None] * n
+        half_pi = math.pi / 2.0
+        for i in range(n):
+            if i % 500 == 0:
+                if cancel is not None and cancel():
+                    raise ri.AcquisitionCancelled()
+                tick(i)
+            point = station_pts[i]
+            if point is None:
+                continue
+            p0 = station_pts[i - 1] if i > 0 else point
+            p1 = station_pts[i + 1] if i + 1 < n else point
+            if p0 is None or p1 is None \
+                    or (p0.x() == p1.x() and p0.y() == p1.y()):
+                continue
+            try:
+                azimuth = float(distance.bearing(p0, p1))
+                port_pts[i] = distance.computeSpheroidProject(
+                    point, float(offset_m), azimuth - half_pi)
+                stbd_pts[i] = distance.computeSpheroidProject(
+                    point, float(offset_m), azimuth + half_pi)
+            except Exception:
+                continue
+        tick(n)
+
+        for share, offset_pts, out in ((2, port_pts, port),
+                                       (3, stbd_pts, stbd)):
+            if self.mode in (0, 1) and self._rasters:
+                for i, pt in enumerate(offset_pts):
+                    if pt is not None:
+                        out[i] = self._sample_rasters(pt)
+            if self.mode in (0, 2) and self._contours:
+                crossings = self._polyline_crossings(
+                    stations_km, offset_pts, cancel)
+                crossing_kps = [kp for kp, _depth in crossings]
+                for i, kp in enumerate(stations_km):
+                    if out[i] is None and offset_pts[i] is not None:
+                        out[i] = self._interpolate_crossings(
+                            crossings, kp, crossing_kps)
+            tick(share * n)
+        return port, stbd
+
     def sample_route(self, route: RouteFrame, kp: float) -> Optional[float]:
         """Depth at KP using raster samples or contour-crossing interpolation."""
         point = route.point_at_kp(kp, clamp=True)
@@ -944,8 +1099,10 @@ class ProfileSamplingTask(QgsTask):
 
     With ``distance`` and ``cross_offset_m`` set, each station additionally
     samples depth at ± the cross offset perpendicular to the route (geodesic
-    offset via ``computeSpheroidProject``), feeding the cross/absolute slope
-    series. Results: ``series`` (kp, depth magnitude — data stations only)
+    offset via ``computeSpheroidProject``; rasters point-sampled, contours
+    interpolated between offset-polyline crossings), feeding the
+    cross/absolute slope series. Results: ``series`` (kp, depth magnitude —
+    data stations only)
     plus the full raw arrays ``kps`` / ``depths`` / ``port_depths`` /
     ``stbd_depths`` (``None`` = no data) for persistence.
     """
@@ -1046,16 +1203,41 @@ class ProfileSamplingTask(QgsTask):
             if cross:
                 self.progressMessage.emit(
                     f"Sampling cross-offset depths (±{self.cross_offset_m:.0f} m)…")
-                total = max(len(self.kps), 1)
-                for index, kp in enumerate(self.kps):
-                    if index % 50 == 0 and self.isCanceled():
-                        self.cancelled = True
-                        return False
-                    port, stbd = self._cross_sample(kp)
-                    self.port_depths.append(port)
-                    self.stbd_depths.append(stbd)
-                    if index % 100 == 0 or index + 1 == total:
-                        self.setProgress(75.0 + 25.0 * (index + 1) / total)
+                offset_fn = getattr(self.depth, "offset_profile_samples", None)
+                if callable(offset_fn):
+                    # One pass per side: rasters point-sampled at the offset
+                    # positions, contours intersected with the offset
+                    # polylines and interpolated between crossings (the
+                    # along-route methodology — per-station nearest-contour
+                    # scans are O(stations × contours) and stall for hours
+                    # on long routes).
+                    def cross_progress(done: int, total_: int) -> None:
+                        self.setProgress(75.0 + 25.0 * float(done) /
+                                         max(float(total_), 1.0))
+
+                    port_values, stbd_values = offset_fn(
+                        self.route, self.kps, self.cross_offset_m,
+                        self.distance, cancel=self.isCanceled,
+                        progress=cross_progress)
+
+                    def magnitudes(values):
+                        return [abs(float(v))
+                                if v is not None and v == v else None
+                                for v in values]
+
+                    self.port_depths = magnitudes(port_values)
+                    self.stbd_depths = magnitudes(stbd_values)
+                else:
+                    total = max(len(self.kps), 1)
+                    for index, kp in enumerate(self.kps):
+                        if index % 50 == 0 and self.isCanceled():
+                            self.cancelled = True
+                            return False
+                        port, stbd = self._cross_sample(kp)
+                        self.port_depths.append(port)
+                        self.stbd_depths.append(stbd)
+                        if index % 100 == 0 or index + 1 == total:
+                            self.setProgress(75.0 + 25.0 * (index + 1) / total)
             else:
                 self.port_depths = [None] * len(self.kps)
                 self.stbd_depths = [None] * len(self.kps)
