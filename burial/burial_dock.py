@@ -224,6 +224,17 @@ class BurialPlannerDock(QDockWidget):
         self.splitter.addWidget(profile_pane)
         self.splitter.setStretchFactor(0, 3)
         self.splitter.setStretchFactor(1, 1)
+        # The tabs' size hints could otherwise squash the profile pane on
+        # refresh; the user's chosen split is restored across sessions.
+        profile_pane.setMinimumHeight(150)
+        splitter_state = QSettings().value(
+            "SubseaCableTools/BurialPlanner/dock_splitter_state")
+        if splitter_state is not None:
+            try:
+                self.splitter.restoreState(splitter_state)
+            except Exception:
+                pass
+        self.splitter.splitterMoved.connect(self._save_dock_splitter_state)
         outer.addWidget(self.splitter, 1)
         self.setWidget(container)
 
@@ -793,6 +804,11 @@ class BurialPlannerDock(QDockWidget):
         long_series, cross_series, abs_series = profile.slope_series(
             half_km, params.direction)
         self.profile.set_slope_series(long_series, cross_series, abs_series)
+
+    def _save_dock_splitter_state(self, *_args) -> None:
+        QSettings().setValue(
+            "SubseaCableTools/BurialPlanner/dock_splitter_state",
+            self.splitter.saveState())
 
     def _slope_panel_toggled(self, checked: bool) -> None:
         QSettings().setValue(

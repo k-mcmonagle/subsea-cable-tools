@@ -21,14 +21,29 @@ from typing import Dict, List, Optional, Tuple
 
 import pyqtgraph as pg
 
-from qgis.PyQt.QtCore import QRectF, Qt, pyqtSignal
+from qgis.PyQt.QtCore import QRectF, QSettings, Qt, pyqtSignal
 from qgis.PyQt.QtGui import QColor
-from qgis.PyQt.QtWidgets import QVBoxLayout, QWidget
+from qgis.PyQt.QtWidgets import (
+    QCheckBox,
+    QHBoxLayout,
+    QSplitter,
+    QVBoxLayout,
+    QWidget,
+)
 
 from . import events as ev
 from . import generation, schema
 
 _PEN_STYLE = getattr(Qt, "PenStyle", Qt)
+_VERTICAL = getattr(Qt, "Orientation", Qt).Vertical
+_MOUSE_LEFT = getattr(Qt, "MouseButton", Qt).LeftButton
+
+# One fixed left-axis width for both plots: x-linking alone still leaves the
+# plot areas offset when the depth and slope tick labels need different
+# widths, which breaks the visual KP alignment between the panels.
+_LEFT_AXIS_WIDTH = 62
+
+_SETTINGS_ROOT = "SubseaCableTools/BurialPlanner"
 
 _REGION_STYLES = {
     "excluded": (QColor(214, 39, 40, 60), QColor(214, 39, 40, 110)),
@@ -58,29 +73,38 @@ class BurialProfileWidget(QWidget):
         super().__init__(parent)
         self.plot = pg.PlotWidget()
         self.plot.setBackground("w")
-        self.plot.setMenuEnabled(False)
+        # Right-click context menu: view-all, axis options, export (CSV/PNG/
+        # SVG). kpClicked is emitted for left clicks only, so the menu and
+        # the map sync don't fight over the right button.
+        self.plot.setMenuEnabled(True)
         self.plot.setLabel("bottom", "KP", units="km")
         self.plot.setLabel("left", "Depth", units="m")
         self.plot.setMouseEnabled(x=True, y=True)
+        self.plot.setMinimumHeight(110)
         item = self.plot.getPlotItem()
         item.showGrid(x=True, y=True, alpha=0.25)
         item.vb.invertY(True)  # depth-down axis
+        self._setup_axes(item)
+        # Y follows the data visible in the current KP window while panning/
+        # zooming x (manual y zoom disables this until View All / auto).
+        item.vb.enableAutoRange(y=True)
+        item.vb.setAutoVisible(y=True)
 
         # Slope panel: a second x-linked plot under the depth profile.
         # Longitudinal +ve = up-slope; cross +ve = deeper to starboard of
         # travel; absolute = combined gradient magnitude.
         self.slope_plot = pg.PlotWidget()
         self.slope_plot.setBackground("w")
-        self.slope_plot.setMenuEnabled(False)
+        self.slope_plot.setMenuEnabled(True)
+        self.slope_plot.setLabel("bottom", "KP", units="km")
         self.slope_plot.setLabel("left", "Slope", units="°")
-        self.slope_plot.setMaximumHeight(190)
+        self.slope_plot.setMinimumHeight(80)
         slope_item = self.slope_plot.getPlotItem()
         slope_item.showGrid(x=True, y=True, alpha=0.25)
+        self._setup_axes(slope_item)
         slope_item.setXLink(item)
-        try:
-            slope_item.addLegend(offset=(6, 2))
-        except Exception:
-            pass
+        slope_item.vb.enableAutoRange(y=True)
+        slope_item.vb.setAutoVisible(y=True)
         zero_line = pg.InfiniteLine(
             angle=0, pos=0.0, movable=False,
             pen=pg.mkPen((150, 150, 150), width=1, style=_PEN_STYLE.DashLine))
@@ -99,12 +123,62 @@ class BurialProfileWidget(QWidget):
             except Exception:
                 pass
             self._slope_curves[key] = curve
-        self.slope_plot.setVisible(False)
+
+        # Crosshair mirrored onto the slope panel.
+        self._slope_vline = pg.InfiniteLine(
+            angle=90, movable=False,
+            pen=pg.mkPen((120, 120, 120), width=1, style=_PEN_STYLE.DashLine))
+        self._slope_vline.setZValue(20)
+        self._slope_vline.setVisible(False)
+        slope_item.addItem(self._slope_vline, ignoreBounds=True)
+
+        # Per-series show/hide, persisted; the coloured checkboxes double as
+        # the legend.
+        settings = QSettings()
+        toggle_row = QHBoxLayout()
+        toggle_row.setContentsMargins(8, 2, 8, 0)
+        toggle_row.setSpacing(12)
+        self._series_toggles: Dict[str, QCheckBox] = {}
+        for key, color, label in (("long", "#ff7f0e", "Longitudinal"),
+                                  ("cross", "#9467bd", "Cross"),
+                                  ("abs", "#8c564b", "Absolute")):
+            box = QCheckBox(label)
+            box.setStyleSheet(f"color: {color}; font-weight: 600;")
+            box.setChecked(bool(settings.value(
+                f"{_SETTINGS_ROOT}/slope_series_{key}", True, type=bool)))
+            box.toggled.connect(
+                lambda checked, k=key: self._series_toggled(k, checked))
+            self._slope_curves[key].setVisible(box.isChecked())
+            self._series_toggles[key] = box
+            toggle_row.addWidget(box)
+        toggle_row.addStretch(1)
+
+        self._slope_pane = QWidget()
+        pane_layout = QVBoxLayout(self._slope_pane)
+        pane_layout.setContentsMargins(0, 0, 0, 0)
+        pane_layout.setSpacing(0)
+        pane_layout.addLayout(toggle_row)
+        pane_layout.addWidget(self.slope_plot, 1)
+        self._slope_pane.setVisible(False)
+
+        # User-adjustable split between depth and slope panels, persisted.
+        self._splitter = QSplitter(_VERTICAL)
+        self._splitter.addWidget(self.plot)
+        self._splitter.addWidget(self._slope_pane)
+        self._splitter.setStretchFactor(0, 3)
+        self._splitter.setStretchFactor(1, 1)
+        self._splitter.setCollapsible(0, False)
+        state = settings.value(f"{_SETTINGS_ROOT}/profile_splitter_state")
+        if state is not None:
+            try:
+                self._splitter.restoreState(state)
+            except Exception:
+                pass
+        self._splitter.splitterMoved.connect(self._save_splitter_state)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.plot, 3)
-        layout.addWidget(self.slope_plot, 1)
+        layout.addWidget(self._splitter)
 
         self._curve = item.plot([], [], pen=pg.mkPen("#1f77b4", width=2),
                                 name="Depth", connect="finite")
@@ -130,6 +204,7 @@ class BurialProfileWidget(QWidget):
         self._regions: List = []
         self._event_lines: List = []
         self._series: List[Tuple[float, float]] = []
+        self._slope_series: Dict[str, List[Tuple[float, Optional[float]]]] = {}
         self._scope: Tuple[float, float] = (0.0, 0.0)
         self._editable = False
         self._slope_half_window_km: Optional[float] = None
@@ -146,8 +221,43 @@ class BurialProfileWidget(QWidget):
         item.vb.sigResized.connect(self._position_strip)
         self._position_strip()
 
-        self.plot.scene().sigMouseMoved.connect(self._on_mouse_moved)
-        self.plot.scene().sigMouseClicked.connect(self._on_mouse_clicked)
+        # Both plots drive one crosshair: hovering or clicking the slope
+        # panel behaves exactly like the depth plot (map sync included).
+        self.plot.scene().sigMouseMoved.connect(
+            lambda pos: self._handle_mouse_moved(pos, self.plot))
+        self.plot.scene().sigMouseClicked.connect(
+            lambda event: self._handle_mouse_clicked(event, self.plot))
+        self.slope_plot.scene().sigMouseMoved.connect(
+            lambda pos: self._handle_mouse_moved(pos, self.slope_plot))
+        self.slope_plot.scene().sigMouseClicked.connect(
+            lambda event: self._handle_mouse_clicked(event, self.slope_plot))
+
+    def _setup_axes(self, plot_item) -> None:
+        """Fixed units and a shared left-axis width on a plot item.
+
+        pyqtgraph's SI auto-prefix relabels an axis once tick values pass
+        1000 — a long route showed "KP (kkm)" — so depths stay in metres and
+        KP in km at any magnitude. The fixed left-axis width keeps both plot
+        areas x-aligned regardless of tick label widths.
+        """
+        for name in ("bottom", "left"):
+            axis = plot_item.getAxis(name)
+            try:
+                axis.enableAutoSIPrefix(False)
+            except Exception:  # pragma: no cover — very old pyqtgraph
+                pass
+        plot_item.getAxis("left").setWidth(_LEFT_AXIS_WIDTH)
+
+    def _series_toggled(self, key: str, checked: bool) -> None:
+        QSettings().setValue(f"{_SETTINGS_ROOT}/slope_series_{key}",
+                             bool(checked))
+        curve = self._slope_curves.get(key)
+        if curve is not None:
+            curve.setVisible(bool(checked))
+
+    def _save_splitter_state(self, *_args) -> None:
+        QSettings().setValue(f"{_SETTINGS_ROOT}/profile_splitter_state",
+                             self._splitter.saveState())
 
     # -- data ---------------------------------------------------------------
     def set_scope(self, start_kp: float, end_kp: float) -> None:
@@ -211,16 +321,33 @@ class BurialProfileWidget(QWidget):
             add("insufficient", iv.start_km, iv.end_km, "Insufficient Information")
 
     def set_slope_visible(self, visible: bool) -> None:
-        self.slope_plot.setVisible(bool(visible))
+        self._slope_pane.setVisible(bool(visible))
 
     def set_slope_series(self, long_series, cross_series, abs_series) -> None:
         """Series are (kp, degrees|None) lists; None renders as a gap."""
         nan = float("nan")
         for key, series in (("long", long_series), ("cross", cross_series),
                             ("abs", abs_series)):
-            xs = [kp for kp, _v in series or []]
-            ys = [nan if v is None else float(v) for _kp, v in series or []]
+            series = list(series or [])
+            self._slope_series[key] = series
+            xs = [kp for kp, _v in series]
+            ys = [nan if v is None else float(v) for _kp, v in series]
             self._slope_curves[key].setData(xs, ys, connect="finite")
+
+    def _slope_series_value_at(self, key: str, kp: float) -> Optional[float]:
+        """Nearest stored slope-series value at kp (None = gap/no series)."""
+        series = self._slope_series.get(key) or []
+        if not series:
+            return None
+        import bisect
+
+        xs = [p[0] for p in series]
+        i = bisect.bisect_left(xs, kp)
+        candidates = [j for j in (i - 1, i) if 0 <= j < len(series)]
+        if not candidates:
+            return None
+        j = min(candidates, key=lambda j: abs(xs[j] - kp))
+        return series[j][1]
 
     def _position_strip(self) -> None:
         """Pin the outcome strip to the top of the plot area (fixed height)."""
@@ -328,6 +455,7 @@ class BurialProfileWidget(QWidget):
         self.set_sections([])
         self.set_slope_series([], [], [])
         self._vline.setVisible(False)
+        self._slope_vline.setVisible(False)
         self._readout.setVisible(False)
 
     # -- interaction --------------------------------------------------------
@@ -336,10 +464,11 @@ class BurialProfileWidget(QWidget):
         if event_id:
             self.eventMoveRequested.emit(event_id, float(line.value()))
 
-    def _kp_at_scene_pos(self, pos) -> Optional[float]:
-        if not self.plot.sceneBoundingRect().contains(pos):
+    def _kp_at_scene_pos(self, pos, plot=None) -> Optional[float]:
+        plot = plot or self.plot
+        if not plot.sceneBoundingRect().contains(pos):
             return None
-        view = self.plot.getViewBox().mapSceneToView(pos)
+        view = plot.getViewBox().mapSceneToView(pos)
         return float(view.x())
 
     def _nearest_sample(self, kp: float) -> Optional[Tuple[float, float]]:
@@ -426,12 +555,24 @@ class BurialProfileWidget(QWidget):
         sample = self._nearest_sample(kp)
         self._vline.setPos(kp)
         self._vline.setVisible(True)
+        self._slope_vline.setPos(kp)
+        self._slope_vline.setVisible(True)
         lines = [f"KP {schema.format_kp(kp)}"]
         if sample is not None:
             lines.append(f"Depth {sample[1]:.1f} m")
             slope = self._slope_at(kp)
             if slope is not None:
                 lines.append(f"Slope {slope:+.1f}°")
+            # Cross/absolute at the cursor when the slope panel shows them.
+            if self._slope_pane.isVisibleTo(self):
+                for key, fmt in (("cross", "Cross {:+.1f}°"),
+                                 ("abs", "Abs {:.1f}°")):
+                    toggle = self._series_toggles.get(key)
+                    if toggle is None or not toggle.isChecked():
+                        continue
+                    value = self._slope_series_value_at(key, kp)
+                    if value is not None:
+                        lines.append(fmt.format(value))
             self._readout.setText("\n".join(lines))
             self._readout.setPos(kp, sample[1])
             self._readout.setVisible(True)
@@ -439,17 +580,23 @@ class BurialProfileWidget(QWidget):
             self._readout.setText(lines[0])
             self._readout.setVisible(True)
 
-    def _on_mouse_moved(self, pos) -> None:
-        kp = self._kp_at_scene_pos(pos)
+    def _handle_mouse_moved(self, pos, plot) -> None:
+        kp = self._kp_at_scene_pos(pos, plot)
         if kp is None:
             self._vline.setVisible(False)
+            self._slope_vline.setVisible(False)
             self._readout.setVisible(False)
             return
         self._show_kp_readout(kp)
         self.kpHovered.emit(kp)
 
-    def _on_mouse_clicked(self, event) -> None:
-        kp = self._kp_at_scene_pos(event.scenePos())
+    def _handle_mouse_clicked(self, event, plot) -> None:
+        try:
+            if event.button() != _MOUSE_LEFT:
+                return  # leave right-click to the pyqtgraph context menu
+        except (AttributeError, TypeError):
+            pass
+        kp = self._kp_at_scene_pos(event.scenePos(), plot)
         if kp is None:
             return
         try:

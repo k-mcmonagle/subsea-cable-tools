@@ -631,6 +631,51 @@ def test_cross_offset_uses_contour_crossings() -> bool:
                    ok, f"{len(interior)} interior stations")
 
 
+def test_profile_widget_axes_crosshair_toggles() -> bool:
+    """Depth/slope plots: aligned axes, no SI-prefixed KP, mirrored crosshair,
+    per-series toggles, adjustable splitter."""
+    from ..burial.profile_widget import BurialProfileWidget
+
+    widget = BurialProfileWidget()
+    plot_item = widget.plot.getPlotItem()
+    slope_item = widget.slope_plot.getPlotItem()
+    # No SI auto-prefix: a 1000 km route must label "KP (km)", not "KP (kkm)".
+    ok = not plot_item.getAxis("bottom").autoSIPrefix
+    ok = ok and not slope_item.getAxis("bottom").autoSIPrefix
+    ok = ok and not plot_item.getAxis("left").autoSIPrefix
+    # Same fixed left-axis width on both plots -> the x axes align exactly.
+    ok = ok and plot_item.getAxis("left").fixedWidth == \
+        slope_item.getAxis("left").fixedWidth is not None
+    # x-link: zooming the depth plot moves the slope plot with it.
+    widget.set_scope(0.0, 10.0)
+    widget.plot.setXRange(2.0, 4.0, padding=0)
+    lo, hi = slope_item.vb.viewRange()[0]
+    ok = ok and abs(lo - 2.0) < 0.2 and abs(hi - 4.0) < 0.2
+    # Crosshair mirrors onto the slope panel.
+    widget.set_slope_visible(True)
+    widget.set_profile([(0.0, 100.0), (10.0, 200.0)])
+    widget.set_slope_series([(0.0, 1.0), (10.0, 1.0)],
+                            [(0.0, -0.5), (10.0, -0.5)],
+                            [(0.0, 1.1), (10.0, 1.1)])
+    widget.focus_kp(3.0)
+    ok = ok and widget._vline.isVisible() and widget._slope_vline.isVisible()
+    ok = ok and abs(float(widget._vline.value()) - 3.0) < 1e-9
+    ok = ok and abs(float(widget._slope_vline.value()) - 3.0) < 1e-9
+    # Readout includes cross/absolute values from the stored series.
+    text = widget._readout.textItem.toPlainText()
+    ok = ok and "Cross" in text and "Abs" in text
+    # Per-series toggles hide/show their curve.
+    widget._series_toggles["cross"].setChecked(False)
+    ok = ok and not widget._slope_curves["cross"].isVisible()
+    widget._series_toggles["cross"].setChecked(True)
+    ok = ok and widget._slope_curves["cross"].isVisible()
+    # Depth and slope plots sit in a user-adjustable splitter; context menus
+    # are enabled for export/axis options.
+    ok = ok and widget._splitter.count() == 2
+    ok = ok and plot_item.vb.menu is not None
+    return _result("profile widget: axes, alignment, crosshair, toggles", ok)
+
+
 def test_analysis_reuses_stored_depth_samples() -> bool:
     """Injected plan-profile samples bypass bathymetry sampling entirely."""
 
@@ -757,6 +802,7 @@ def run_all() -> list:
         test_route_frame_chainage_matches_walk(),
         test_profile_cross_offset_sampling(),
         test_cross_offset_uses_contour_crossings(),
+        test_profile_widget_axes_crosshair_toggles(),
         test_analysis_reuses_stored_depth_samples(),
         test_profile_step_resolution_and_staleness(),
         test_burial_depth_config_is_manual_only(),
