@@ -46,7 +46,7 @@ from ..workbench import rules_inputs as ri
 from ..workbench import schema as wb_schema
 from ..workbench.depth_service import DepthSourceConfig
 from ..workbench.rules_engine import Interval
-from . import generation, map_layers, schema
+from . import generation, map_layers, profile_data, schema
 
 WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
 
@@ -610,6 +610,10 @@ class AnalysisWork:
     # Persisted plan-profile samples (kp, depth magnitude | None), injected
     # when current so threshold acquisition skips resampling bathymetry.
     depth_samples: Optional[List[Tuple[float, Optional[float]]]] = None
+    # Snapshot of the stored profile's cross-offset arrays for cross/absolute
+    # slope criteria: {kps, depths, port, stbd, cross_offset_m} (plain lists —
+    # copied on the main thread so the worker never shares live state).
+    cross_profile: Optional[Dict] = None
 
 
 @dataclass
@@ -691,6 +695,7 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
                project: Optional[QgsProject] = None,
                depth_samples: Optional[List[Tuple[float, Optional[float]]]] = None,
                depth_step_m: Optional[float] = None,
+               cross_profile: Optional[Dict] = None,
                ) -> Tuple["AnalysisWork", List[str]]:
     """Snapshot everything the task needs (main thread). Returns (work, warnings)."""
     project = project or QgsProject.instance()
@@ -705,7 +710,7 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
         step_m=params.coarse_step_m, direction=params.direction,
         method=params.method, refine_tol_m=params.refine_tol_m, depth=depth,
         depth_step_m=max(float(depth_step_m or params.coarse_step_m), 1.0),
-        depth_samples=depth_samples)
+        depth_samples=depth_samples, cross_profile=cross_profile)
 
     for row in rule_rows:
         if not int(row.get("enabled") or 0):
@@ -755,6 +760,24 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
             else:
                 input_fp = map_layers.depth_config_fingerprint(
                     project, depth_config)
+                profile_kind = (rule_work.config.get("profile") or "depth").lower()
+                component = (rule_work.config.get("slope_component") or "long") \
+                    if profile_kind == "slope" else "long"
+                if component in (profile_data.SLOPE_COMPONENT_CROSS,
+                                 profile_data.SLOPE_COMPONENT_ABSOLUTE):
+                    cross = cross_profile or {}
+                    has_cross = bool(cross.get("kps")) \
+                        and any(v is not None for v in cross.get("port") or []) \
+                        and any(v is not None for v in cross.get("stbd") or [])
+                    if not has_cross:
+                        rule_work.error = (
+                            "cross/absolute slope needs the stored bathymetry "
+                            "profile with cross-offset samples — set a cross "
+                            "offset and rebuild on the Bathymetry Profile tab")
+                    else:
+                        # The cross offset changes what the series measures.
+                        input_fp += \
+                            f"|cross={float(cross.get('cross_offset_m') or 0.0):g}"
 
         rule_work.cache_key = generation.rule_cache_key(
             row, input_fp, scope, params.coarse_step_m, rpl_fp, params.direction,
@@ -1137,6 +1160,55 @@ class BurialAnalysisTask(QgsTask):
             flags, sampler.scope_domain)
         self._sampled_depth_at = _profile_depth_lookup(samples)
 
+    def _component_slope_acquire(self, sampler: ri.RouteSampler, config: Dict,
+                                 component: str
+                                 ) -> Tuple[List[Interval], List[Interval]]:
+        """Cross / absolute slope intervals from the stored profile arrays.
+
+        The series is evaluated at the stored-profile stations and linearly
+        interpolated between them (``intervals_from_profile``), so boundary
+        precision follows the profile resolution. Stations where the
+        component cannot be evaluated (no depth, or no cross sample for the
+        cross component) surface as no-data -> Insufficient Information.
+        """
+        work = self.work
+        cross = work.cross_profile or {}
+        kps = cross.get("kps") or []
+        if not kps:
+            raise ri.RuleInputError(
+                "cross/absolute slope needs the stored bathymetry profile "
+                "with cross-offset samples — rebuild it on the Bathymetry "
+                "Profile tab")
+        slope_step_km = max(float(work.depth_step_m or work.step_m), 1.0) / 1000.0
+        half_km = ri.slope_half_window_km(config, slope_step_km) or slope_step_km
+        series = profile_data.slope_component_series(
+            kps, cross.get("depths") or [], cross.get("port") or [],
+            cross.get("stbd") or [], float(cross.get("cross_offset_m") or 0.0),
+            work.direction, component, half_km)
+        valid = [(kp, value) for kp, value in series if value is not None]
+        if not valid:
+            raise ri.RuleInputError(
+                "the stored profile has no evaluable cross-slope stations in "
+                "the scope — rebuild it with a cross offset")
+        flags = [(kp, value is None) for kp, value in series]
+        nodata = eng.intervals_from_bool_series(flags, sampler.scope_domain)
+        bands = config.get("bands") or []
+        if bands:
+            wd_series = [(kp, depth) for kp, depth
+                         in zip(kps, cross.get("depths") or [])
+                         if depth is not None]
+            intervals = eng.intervals_from_banded_threshold(
+                valid, wd_series, bands, config.get("op") or ">",
+                sampler.scope_domain)
+        else:
+            value2 = config.get("value2")
+            intervals = eng.intervals_from_profile(
+                valid, config.get("op") or ">",
+                float(config.get("value", 0.0)),
+                float(value2) if value2 is not None else None,
+                abs_value=True)
+        return intervals, nodata
+
     def _acquire(self, sampler: ri.RouteSampler, rule_work: RuleWork,
                  coarse_step_km: float, tol_km: float,
                  progress: Optional[Callable[[float], None]] = None
@@ -1153,14 +1225,25 @@ class BurialAnalysisTask(QgsTask):
                 # Sampling dominates the rule's slot; keep 10% for the rest.
                 progress(0.9 * float(done) / max(float(count), 1.0))
 
-        if kind == wb_schema.RULE_KIND_THRESHOLD:
+        profile_kind = (config.get("profile") or "depth").lower()
+        component = (config.get("slope_component") or "long") \
+            if profile_kind == "slope" else "long"
+        if kind == wb_schema.RULE_KIND_THRESHOLD and component in (
+                profile_data.SLOPE_COMPONENT_CROSS,
+                profile_data.SLOPE_COMPONENT_ABSOLUTE):
+            # Cross/absolute slope evaluates the stored profile's cross-offset
+            # arrays; boundaries come interpolated from the series itself at
+            # profile resolution, so no bisection predicate is needed.
+            intervals, nodata = self._component_slope_acquire(
+                sampler, config, component)
+        elif kind == wb_schema.RULE_KIND_THRESHOLD:
             self._ensure_depth_lookup(sampler, sample_progress)
             if not self._depth_series:
                 raise ri.RuleInputError("bathymetry has no coverage in the scope")
             slope_step_km = max(
                 float(work.depth_step_m or work.step_m), 1.0) / 1000.0
             prepared_slope = None
-            if (config.get("profile") or "depth").lower() == "slope":
+            if profile_kind == "slope":
                 half_km = ri.slope_half_window_km(config, slope_step_km)
                 half_km = max(float(half_km or slope_step_km), 1e-9)
                 cache_key = round(half_km, 12)

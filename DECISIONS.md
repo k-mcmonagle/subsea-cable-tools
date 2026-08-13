@@ -174,6 +174,32 @@ section references in brackets.
   (extension included, via the engine's rule-hit clipping) so the tab shows
   exactly what resolution excludes; raw acquisition remains visible by
   setting the extension to zero.
+- **Water depth and slope are separate dialogs over one stored kind**
+  (`threshold_profile` + `config.profile` picks the variant) — the schema,
+  engine and rule-set JSON are unchanged, so rules keep copying losslessly
+  to/from Workbench assessments while each dialog shows only its own fields.
+  WD bands live only on the slope dialog: their real use is depth-dependent
+  tool slope capability, and banding a depth criterion by depth is circular
+  (legacy depth rules with bands keep them silently — unmanaged config keys
+  pass through edits).
+- **Slope components**: longitudinal keeps signed limits and the evaluation
+  length; cross is the two-point difference across the profile's sampled
+  ± cross offset, compared as a magnitude (leaning to port or starboard both
+  count, so direction of installation cannot change the verdict); absolute
+  matches the profile pane's trace including its |longitudinal| fallback
+  where cross samples are missing. Cross/absolute boundaries come from
+  linear interpolation of the profile-resolution series rather than 1 m
+  bisection — bathymetry does not exist off the sampled lines, so re-probing
+  would fabricate precision. A slope "search corridor" is deliberately not
+  offered for the same reason: terrain is only known along the route and at
+  the ± cross offset. The cross offset participates in the rule cache
+  fingerprint.
+- **Fresh regeneration is explicit, itemised and rollback-able**: normal
+  Generate keeps user work by contract; *Regenerate fresh…* confirms with
+  exact counts of what will be discarded, keeps client burial-proposal
+  events as external reference unless also ticked, and relies on
+  ``apply_generation``'s before-snapshot so the change log can restore the
+  pre-fresh state — destructive in effect, never in history.
 - **`skip_handling` is manual-first with an explicit auto-assign** (TBC /
   Recover to deck / Mid-water transit, plough vocabulary). *Auto-assign skip
   handling…* applies a length policy — mid-water transit up to a threshold,

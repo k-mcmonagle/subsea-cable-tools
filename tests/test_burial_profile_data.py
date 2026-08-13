@@ -123,6 +123,41 @@ def test_absolute_slope() -> bool:
     return _result("absolute slope combines components, never negative", ok)
 
 
+def test_slope_component_series() -> bool:
+    from ..burial.profile_data import slope_component_series
+
+    kps = [0.0, 0.1, 0.2, 0.3]
+    depths = [100.0, 100.0, 100.0, 100.0]
+    port = [100.0, 100.0, None, 100.0]
+    stbd = [110.0, 100.0, 100.0, 110.0]  # lean at kp 0.0 and 0.3
+    # span 40 m, dz 10 m -> atan2(10, 40) ≈ 14.036°
+    cross = slope_component_series(kps, depths, port, stbd, 20.0, 1,
+                                   "cross", 0.1)
+    ok = abs(cross[0][1] - 14.0362) < 0.01
+    ok = ok and cross[1][1] == 0.0
+    ok = ok and cross[2][1] is None          # missing port sample
+    # Magnitude: direction flip must not change the reported value.
+    cross_rev = slope_component_series(kps, depths, port, stbd, 20.0, -1,
+                                       "cross", 0.1)
+    ok = ok and abs(cross_rev[0][1] - cross[0][1]) < 1e-9
+    # Long is signed and flat here; absolute equals cross where present and
+    # falls back to |long| (0) at the missing-cross station.
+    long_series = slope_component_series(kps, depths, port, stbd, 20.0, 1,
+                                         "long", 0.1)
+    ok = ok and all(abs(v) < 1e-9 for _kp, v in long_series)
+    absolute = slope_component_series(kps, depths, port, stbd, 20.0, 1,
+                                      "absolute", 0.1)
+    ok = ok and abs(absolute[0][1] - cross[0][1]) < 1e-9
+    ok = ok and absolute[2][1] == 0.0
+    try:
+        slope_component_series(kps, depths, port, stbd, 20.0, 1, "bogus", 0.1)
+        ok = False
+    except ValueError:
+        pass
+    return _result("slope component series: cross magnitude, absolute "
+                   "fallback, unknown component rejected", ok)
+
+
 def run_all() -> list:
     return [
         test_row_round_trip(),
@@ -130,6 +165,7 @@ def run_all() -> list:
         test_long_slope_sign_and_gaps(),
         test_cross_slope_sign_and_direction(),
         test_absolute_slope(),
+        test_slope_component_series(),
     ]
 
 

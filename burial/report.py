@@ -130,6 +130,11 @@ def rule_condition_text(rule: Dict) -> str:
     parts: List[str] = []
     if kind == wb_schema.RULE_KIND_THRESHOLD:
         profile = (config.get("profile") or "depth").lower()
+        if profile == "slope":
+            component = config.get("slope_component") or "long"
+            profile = {"long": "longitudinal slope", "cross": "cross slope",
+                       "absolute": "absolute slope"}.get(component,
+                                                         f"{component} slope")
         if config.get("bands"):
             parts.append(f"{profile}: WD-banded limits "
                          f"({len(config.get('bands') or [])} bands)")
@@ -145,7 +150,7 @@ def rule_condition_text(rule: Dict) -> str:
         else:
             op = config.get("op") or ">"
             value = config.get("value")
-            unit = "°" if profile == "slope" else " m"
+            unit = "°" if "slope" in profile else " m"
             text = f"{profile} {op} {value}{unit}"
             if op == "between" and config.get("value2") is not None:
                 text = (f"{profile} between {value} and "

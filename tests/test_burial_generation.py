@@ -297,6 +297,31 @@ def test_conclusion_carry_over() -> bool:
     return _result("unchanged sections keep their conclusions across regeneration", ok)
 
 
+def test_fresh_existing_events() -> bool:
+    events = [
+        {"event_id": "a", "source": "auto", "status": "candidate"},
+        {"event_id": "m", "source": "manual", "status": "confirmed",
+         "locked": 1},
+        {"event_id": "i", "source": "import", "status": "candidate"},
+        {"event_id": "c", "source": "client_proposal", "status": "candidate"},
+    ]
+    kept = gen.fresh_existing_events(events)
+    ok = [e["event_id"] for e in kept] == ["c"]
+    ok = ok and gen.fresh_existing_events(events, keep_client=False) == []
+    # Inputs are copied, never shared.
+    kept[0]["status"] = "changed"
+    ok = ok and events[3]["status"] == "candidate"
+    # A fresh generate over the filtered events rebuilds from the stack only.
+    acq = gen.RuleAcquisition(_rule("r1"), [Interval(8.0, 12.0)])
+    out = gen.generate(_params(), [acq],
+                       existing_events=gen.fresh_existing_events(events),
+                       id_fn=_counter_id_fn())
+    sources = {e.get("source") for e in out.events}
+    ok = ok and "manual" not in sources and "import" not in sources
+    ok = ok and "client_proposal" in sources
+    return _result("fresh regeneration keeps only client-proposal events", ok)
+
+
 def test_assign_skip_handling() -> bool:
     sections = [
         {"section_id": "b1", "kind": schema.SECTION_BURIAL, "length_km": 5.0},
@@ -369,6 +394,7 @@ def run_all() -> list:
         test_determinism(),
         test_proposal_diff(),
         test_conclusion_carry_over(),
+        test_fresh_existing_events(),
         test_assign_skip_handling(),
         test_manual_burial_across_exclusion_is_flagged(),
     ]

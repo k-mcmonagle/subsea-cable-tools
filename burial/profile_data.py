@@ -266,6 +266,46 @@ def cross_slope_series(kps: List[float],
     return out
 
 
+SLOPE_COMPONENT_LONG = "long"
+SLOPE_COMPONENT_CROSS = "cross"
+SLOPE_COMPONENT_ABSOLUTE = "absolute"
+SLOPE_COMPONENTS = (SLOPE_COMPONENT_LONG, SLOPE_COMPONENT_CROSS,
+                    SLOPE_COMPONENT_ABSOLUTE)
+SLOPE_COMPONENT_LABELS = {
+    SLOPE_COMPONENT_LONG: "Longitudinal (along route)",
+    SLOPE_COMPONENT_CROSS: "Cross (across route)",
+    SLOPE_COMPONENT_ABSOLUTE: "Absolute (combined gradient)",
+}
+
+
+def slope_component_series(kps: List[float], depths: List[Optional[float]],
+                           port_depths: List[Optional[float]],
+                           stbd_depths: List[Optional[float]],
+                           cross_offset_m: float, direction: int,
+                           component: str,
+                           half_window_km: float) -> List[Sample]:
+    """(kp, value|None) series for one slope component, for criteria checks.
+
+    ``long`` is signed (+ve = up-slope) so directional limits apply; ``cross``
+    is reported as a magnitude (a limit catches leaning either way);
+    ``absolute`` is the combined-gradient magnitude, matching the profile
+    pane (|longitudinal| where cross samples are missing — a lower bound).
+    ``half_window_km`` scales the longitudinal difference; cross is always
+    the two-point difference across the sampled ± cross offset.
+    """
+    long_series = long_slope_series(kps, depths, half_window_km)
+    if component == SLOPE_COMPONENT_LONG:
+        return long_series
+    cross_series = cross_slope_series(kps, port_depths, stbd_depths,
+                                      cross_offset_m, direction)
+    if component == SLOPE_COMPONENT_CROSS:
+        return [(kp, None if value is None else abs(value))
+                for kp, value in cross_series]
+    if component == SLOPE_COMPONENT_ABSOLUTE:
+        return absolute_slope_series(long_series, cross_series)
+    raise ValueError(f"unknown slope component '{component}'")
+
+
 def absolute_slope_series(long_series: List[Sample],
                           cross_series: List[Sample]) -> List[Sample]:
     """Magnitude of the combined gradient per station (°), never negative.

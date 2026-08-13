@@ -195,6 +195,51 @@ def test_polygon_route_corridor_buffer() -> bool:
     return _result("polygon route corridor: fixed and ×WD buffers", ok)
 
 
+def test_cross_slope_criterion_acquisition() -> bool:
+    """Cross/absolute slope criteria evaluate the stored profile's
+    cross-offset arrays; missing cross samples surface as no-data."""
+    route, da = _route()
+    sampler = ri.RouteSampler.from_route(route, da, 100.0)
+    kps = [i * 0.1 for i in range(0, 221)]
+    depths = [100.0] * len(kps)
+    port = [100.0] * len(kps)
+    # Starboard 10 m deeper between KP 5-8 (span 40 m -> ~14.0°); no cross
+    # samples at all between KP 15-16.
+    stbd = [100.0 + (10.0 if 5.0 <= kp <= 8.0 else 0.0) for kp in kps]
+    for i, kp in enumerate(kps):
+        if 15.0 <= kp <= 16.0:
+            port[i] = None
+            stbd[i] = None
+    work = analysis_task.AnalysisWork(
+        route=route, distance=da, scope=Interval(0.0, 22.0), step_m=100.0,
+        direction=1, method="plough", refine_tol_m=1.0, depth=None,
+        depth_step_m=100.0,
+        cross_profile={"kps": kps, "depths": depths, "port": port,
+                       "stbd": stbd, "cross_offset_m": 20.0})
+    task = analysis_task.BurialAnalysisTask(work, lambda _t: None)
+    config = {"profile": "slope", "slope_component": "cross",
+              "op": ">", "value": 10.0}
+    intervals, nodata = task._component_slope_acquire(sampler, config, "cross")
+    ok = 2.5 < eng.interval_length_km(intervals) < 3.5
+    ok = ok and all(iv.start_km > 4.5 and iv.end_km < 8.5 for iv in intervals)
+    ok = ok and any(iv.start_km < 15.5 < iv.end_km for iv in nodata)
+    # Absolute over flat depth equals the cross magnitude -> same coverage.
+    config_abs = {"profile": "slope", "slope_component": "absolute",
+                  "op": ">", "value": 10.0}
+    intervals_abs, _nodata = task._component_slope_acquire(
+        sampler, config_abs, "absolute")
+    ok = ok and abs(eng.interval_length_km(intervals_abs)
+                    - eng.interval_length_km(intervals)) < 0.2
+    # WD bands select the limit by depth (single open band here).
+    config_bands = {"profile": "slope", "slope_component": "cross", "op": ">",
+                    "bands": [{"min_wd": 0.0, "limit": 10.0}]}
+    intervals_banded, _nodata = task._component_slope_acquire(
+        sampler, config_bands, "cross")
+    ok = ok and eng.interval_length_km(intervals_banded) > 2.0
+    return _result("cross/absolute slope criteria over cross-offset samples",
+                   ok, f"cross={eng.interval_length_km(intervals):.2f} km")
+
+
 def test_direction_maps_slope_limits() -> bool:
     rule = {"rule_id": "r", "config_json": json.dumps({
         "profile": "slope", "slope_signed": True,
@@ -988,6 +1033,38 @@ def test_rule_editor_extension_and_corridor() -> bool:
     ok = ok and "route_buffer_wd" not in result
     dialog.deleteLater()
 
+    # Water depth and slope edit in separate dialogs sharing the stored kind.
+    depth_dialog = RuleEditorDialog(
+        rule(wb_schema.RULE_KIND_THRESHOLD,
+             {"profile": "depth", "op": ">", "value": 1500.0}), [], "plough")
+    ok = ok and "Water depth" in depth_dialog.windowTitle()
+    ok = ok and not hasattr(depth_dialog, "signed_check")
+    ok = ok and not hasattr(depth_dialog, "bands_table")
+    ok = ok and not hasattr(depth_dialog, "component_combo")
+    result = json.loads(depth_dialog.result_rule()["config_json"])
+    ok = ok and result.get("profile") == "depth" and result.get("abs") is False
+    depth_dialog.name_edit.setText("")
+    ok = ok and depth_dialog.result_rule()["name"] == "Water depth"
+    depth_dialog.deleteLater()
+
+    # Slope dialog: component selection round-trips; long omits the key;
+    # signed limits stay longitudinal-only.
+    slope_dialog = RuleEditorDialog(
+        rule(wb_schema.RULE_KIND_THRESHOLD,
+             {"profile": "slope", "op": ">", "value": 12.0}), [], "plough")
+    ok = ok and "Slope" in slope_dialog.windowTitle()
+    ok = ok and slope_dialog.component_combo.currentData() == "long"
+    result = json.loads(slope_dialog.result_rule()["config_json"])
+    ok = ok and "slope_component" not in result
+    cross_index = slope_dialog.component_combo.findData("cross")
+    slope_dialog.component_combo.setCurrentIndex(cross_index)
+    ok = ok and not slope_dialog.signed_check.isEnabled()
+    ok = ok and not slope_dialog.slope_window_spin.isEnabled()
+    result = json.loads(slope_dialog.result_rule()["config_json"])
+    ok = ok and result.get("slope_component") == "cross"
+    ok = ok and not result.get("slope_signed")
+    slope_dialog.deleteLater()
+
     # WD-band grid: existing bands populate the table and round-trip; an
     # added row with values persists; blank rows are dropped.
     bands_config = {"profile": "slope", "op": ">", "value": 12.0,
@@ -1051,6 +1128,7 @@ def run_all() -> list:
         test_buffer_field_override(),
         test_cancellation_raises(),
         test_polygon_route_corridor_buffer(),
+        test_cross_slope_criterion_acquisition(),
         test_direction_maps_slope_limits(),
         test_contour_slope_uses_route_crossings(),
         test_route_frame_builder(),

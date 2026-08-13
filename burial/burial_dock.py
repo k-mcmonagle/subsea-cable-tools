@@ -126,6 +126,8 @@ class BurialPlannerDock(QDockWidget):
         self._profile_task: Optional[analysis_task.ProfileSamplingTask] = None
         self._profile_generation = 0
         self._generate_after_analysis = False
+        self._generate_fresh = False
+        self._fresh_keep_client = True
         self._marker = None
         self._band = None
         self._exclusion_bands: List = []
@@ -581,14 +583,20 @@ class BurialPlannerDock(QDockWidget):
     def request_analysis(self) -> None:
         self._start_analysis(generate=False)
 
-    def request_generation(self) -> None:
-        self._start_analysis(generate=True)
+    def request_generation(self, fresh: bool = False,
+                           keep_client: bool = True) -> None:
+        """Generate the plan; ``fresh`` discards user-made events and section
+        curation and rebuilds purely from the Exclusion stack (recorded as one
+        change-log entry, so it can be rolled back)."""
+        self._start_analysis(generate=True, fresh=fresh,
+                             keep_client=keep_client)
 
     def cancel_analysis(self) -> None:
         if self._task is not None:
             self._task.cancel()
 
-    def _start_analysis(self, generate: bool) -> None:
+    def _start_analysis(self, generate: bool, fresh: bool = False,
+                        keep_client: bool = True) -> None:
         if self._task is not None:
             self.builder_tab.analysis_message("An analysis is already running.")
             return
@@ -628,21 +636,34 @@ class BurialPlannerDock(QDockWidget):
         # Reuse the persisted plan profile for threshold rules when it is
         # current and at least as dense as the analysis step.
         depth_samples = None
+        cross_profile = None
         depth_step_m = self.model.resolve_profile_step_m(params)
         stored = self.model.bathy_profile
         if (stored is not None and stored.kps
-                and self.model.profile_state() == "current"
-                and stored.step_m <= params.coarse_step_m + 1e-9):
-            depth_samples = stored.samples()
-            depth_step_m = stored.step_m
+                and self.model.profile_state() == "current"):
+            if stored.step_m <= params.coarse_step_m + 1e-9:
+                depth_samples = stored.samples()
+                depth_step_m = stored.step_m
+            # Snapshot for cross/absolute slope criteria (plain lists so the
+            # worker never shares live PlanProfile state).
+            cross_profile = {
+                "kps": list(stored.kps),
+                "depths": list(stored.depths),
+                "port": list(stored.port_depths),
+                "stbd": list(stored.stbd_depths),
+                "cross_offset_m": stored.cross_offset_m,
+            }
         work, warnings = analysis_task.build_work(
             self.model.route, self.model.distance, self.model.plan,
             self.model.rules, self.model.inputs, self.model.depth_config(),
             params, self.model.acq_cache, self.model.current_rpl_fingerprint(),
-            depth_samples=depth_samples, depth_step_m=depth_step_m)
+            depth_samples=depth_samples, depth_step_m=depth_step_m,
+            cross_profile=cross_profile)
         if warnings:
             self.builder_tab.analysis_message("  ·  ".join(warnings))
         self._generate_after_analysis = generate
+        self._generate_fresh = generate and fresh
+        self._fresh_keep_client = keep_client
         self._task = analysis_task.BurialAnalysisTask(work, self._analysis_finished)
         self._task.progressMessage.connect(self.rules_tab.set_progress)
         self._task.progressMessage.connect(self.builder_tab.analysis_message)
@@ -710,9 +731,19 @@ class BurialPlannerDock(QDockWidget):
             self.builder_tab.analysis_finished("Exclusions recomputed.")
             return
 
-        # Full generation on the acquired (and refined) intervals.
+        # Full generation on the acquired (and refined) intervals. A fresh
+        # run rebuilds purely from the Exclusion stack: user-made events and
+        # section curation are dropped from the inputs (the prior state is
+        # snapshotted in the change log by apply_generation, so it remains
+        # rollback-able from Review & Export).
         generation_id = schema.new_id()
-        proposal = [e for e in self.model.events
+        existing_events = self.model.events
+        previous_sections = self.model.sections
+        if self._generate_fresh:
+            existing_events = generation.fresh_existing_events(
+                existing_events, keep_client=self._fresh_keep_client)
+            previous_sections = None
+        proposal = [e for e in existing_events
                     if e.get("source") == schema.EVENT_SOURCE_CLIENT]
         service = self.model.depth_service()
         route = self.model.route
@@ -729,9 +760,9 @@ class BurialPlannerDock(QDockWidget):
 
         output = generation.generate(
             params, acquisitions,
-            existing_events=self.model.events,
+            existing_events=existing_events,
             position_fn=position_fn, depth_fn=depth_fn,
-            previous_sections=self.model.sections,
+            previous_sections=previous_sections,
             proposal_events=proposal or None,
             plan_id=self.model.plan_id, generation_id=generation_id,
             depth_at=self.model.depth_at_kp)
@@ -742,7 +773,9 @@ class BurialPlannerDock(QDockWidget):
                                        [dict(r.rule_row) for r in task.results],
                                        fingerprints, generation_id):
             self.builder_tab.show_diff(output.summary, output.proposal_diff)
-            status = "Generation complete."
+            status = ("Fresh regeneration complete — previous state is in "
+                      "the change log (Review & Export)."
+                      if self._generate_fresh else "Generation complete.")
             if output.warnings:
                 status += "  " + "  ·  ".join(output.warnings[:3])
             self.builder_tab.analysis_finished(status)

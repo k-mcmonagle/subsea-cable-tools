@@ -662,6 +662,22 @@ def build_sections(merged_events: List[Dict], params: GenParams,
     return sections
 
 
+def fresh_existing_events(events: Sequence[Dict], keep_client: bool = True
+                          ) -> List[Dict]:
+    """The events that survive a *fresh* regeneration.
+
+    A fresh run rebuilds the plan purely from the Exclusion stack: manual and
+    imported events, confirmations and locks are all discarded (the normal
+    Generate keeps them). Client burial-proposal events are external
+    reference data rather than plan decisions, so they are kept unless
+    ``keep_client`` is False. Callers snapshot the prior state in the change
+    log, so a fresh run remains fully rollback-able.
+    """
+    return [dict(event) for event in events
+            if keep_client
+            and event.get("source") == schema.EVENT_SOURCE_CLIENT]
+
+
 def assign_skip_handling(sections: Sequence[Dict], transit_max_km: float,
                          overwrite: bool = False) -> Tuple[List[Dict], int]:
     """Assign skip handling to skips by length (user-entered policy).

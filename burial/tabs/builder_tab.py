@@ -133,9 +133,19 @@ class BuilderTab(QWidget):
         self.generate_button.setToolTip(
             "Run the Exclusion stack over the scope and rebuild candidate "
             "sections and events in the background. Locked, confirmed and "
-            "manual events are kept; only automatic candidates are replaced.")
+            "manual events are kept (flagged if now inside an Exclusion "
+            "Area); conclusions, notes and skip handling carry over for "
+            "unchanged sections. Only automatic candidates are replaced.")
         self.generate_button.clicked.connect(self._generate)
         run_row.addWidget(self.generate_button)
+        self.fresh_button = QPushButton("Regenerate fresh…")
+        self.fresh_button.setToolTip(
+            "Discard manual edits and rebuild the plan purely from the "
+            "Exclusion stack. Asks for confirmation, lists what will be "
+            "discarded, and records the previous state in the change log "
+            "so it can be rolled back from Review && Export.")
+        self.fresh_button.clicked.connect(self._regenerate_fresh)
+        run_row.addWidget(self.fresh_button)
         self.cancel_button = QPushButton("Stop (resumable)")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self.dock.cancel_analysis)
@@ -279,6 +289,7 @@ class BuilderTab(QWidget):
     # -- progress hooks (driven by the dock) ----------------------------------
     def analysis_started(self) -> None:
         self.generate_button.setEnabled(False)
+        self.fresh_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.progress.setVisible(True)
         self.progress.setValue(0)
@@ -291,6 +302,7 @@ class BuilderTab(QWidget):
 
     def analysis_finished(self, message: str = "") -> None:
         self.generate_button.setEnabled(bool(self.model.plan))
+        self.fresh_button.setEnabled(bool(self.model.plan))
         self.cancel_button.setEnabled(False)
         self.progress.setVisible(False)
         if message:
@@ -324,6 +336,7 @@ class BuilderTab(QWidget):
             for event_type in (schema.EVENT_BURIAL_START, schema.EVENT_BURIAL_END):
                 self.add_type_combo.addItem(ev.event_label(event_type, method), event_type)
             self.generate_button.setEnabled(bool(self.model.plan))
+            self.fresh_button.setEnabled(bool(self.model.plan))
 
             events = self.model.events
             self.events_table.setRowCount(len(events))
@@ -370,6 +383,78 @@ class BuilderTab(QWidget):
                     reason="minimum candidate section"):
                 return
         self.dock.request_generation()
+
+    def _regenerate_fresh(self) -> None:
+        """Confirmed rebuild from the Exclusion stack alone.
+
+        Lists exactly what will be discarded before doing anything; the
+        previous state lands in the change log as part of the generation
+        entry, so the action is destructive-looking but rollback-able.
+        """
+        if not self.model.plan:
+            return
+        events = self.model.events
+        manual = sum(1 for e in events
+                     if e.get("source") in (schema.EVENT_SOURCE_MANUAL,
+                                            schema.EVENT_SOURCE_IMPORT))
+        confirmed = sum(1 for e in events
+                        if e.get("status") == schema.EVENT_STATUS_CONFIRMED)
+        locked = sum(1 for e in events if int(e.get("locked") or 0))
+        client = sum(1 for e in events
+                     if e.get("source") == schema.EVENT_SOURCE_CLIENT)
+        curated = sum(1 for s in self.model.sections
+                      if s.get("conclusion") or s.get("confidence")
+                      or s.get("notes") or s.get("skip_handling")
+                      or s.get("state") == schema.SECTION_STATE_FINAL)
+        parts = []
+        if manual:
+            parts.append(f"{manual} manual/imported event(s)")
+        if confirmed:
+            parts.append(f"{confirmed} confirmation(s)")
+        if locked:
+            parts.append(f"{locked} lock(s)")
+        if curated:
+            parts.append(f"{curated} section(s) with conclusions, "
+                         "confidence, notes, skip handling or final state")
+        summary = ("This will discard " + ", ".join(parts) + "."
+                   if parts else
+                   "No manual changes were found — this simply rebuilds the "
+                   "plan from the Exclusion stack.")
+
+        from qgis.PyQt.QtWidgets import QCheckBox, QVBoxLayout
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Regenerate fresh")
+        layout = QVBoxLayout(dialog)
+        note = QLabel(
+            f"Rebuild the plan purely from the Exclusion stack?\n\n{summary}"
+            "\n\nThe previous state is recorded in the change log and can "
+            "be restored from Review & Export → Rollback.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        client_check = None
+        if client:
+            client_check = QCheckBox(
+                f"Also remove the {client} client burial-proposal event(s) "
+                "(otherwise kept as reference)")
+            layout.addWidget(client_check)
+        buttons = QDialogButtonBox()
+        buttons.setStandardButtons(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if qt_exec(dialog) != DIALOG_ACCEPTED:
+            return
+        params = self.model.gen_params()
+        wanted = self.min_section_spin.value()
+        if abs(params.min_section_km - wanted) > 1e-9:
+            if not self.model.update_gen_params(
+                    {"min_section_km": wanted},
+                    reason="minimum candidate section"):
+                return
+        keep_client = not (client_check is not None
+                           and client_check.isChecked())
+        self.dock.request_generation(fresh=True, keep_client=keep_client)
 
     def _refresh_undo_state(self) -> None:
         entry = self.model.last_undoable_builder_change()

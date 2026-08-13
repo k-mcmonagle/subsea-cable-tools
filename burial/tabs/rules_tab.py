@@ -61,7 +61,7 @@ from ...qgis_compat import (
 from ...workbench import schema as wb_schema
 from ...workbench.kp_bars import ACTION_COLORS, FireBarDelegate, VerdictStrip
 from ...workbench.rules_engine import STATUS_EXCLUDED, STATUS_RISK
-from .. import change_log, generation, schema
+from .. import change_log, generation, profile_data, schema
 
 FIRE_COL = 2
 
@@ -72,6 +72,18 @@ _KIND_LABELS = {
     wb_schema.RULE_KIND_KP_TABLE: "KP range table",
     wb_schema.RULE_KIND_MANUAL: "Manual ranges",
 }
+
+# Add-menu entries. Water depth and slope share the threshold_profile kind
+# (schema/engine unchanged) but edit in their own dialogs — the preset
+# ``profile`` picks the variant.
+_ADD_MENU = (
+    ("Water depth", wb_schema.RULE_KIND_THRESHOLD, {"profile": "depth"}),
+    ("Slope", wb_schema.RULE_KIND_THRESHOLD, {"profile": "slope"}),
+    ("Crossings / proximity", wb_schema.RULE_KIND_PROXIMITY, None),
+    ("Seabed soils / polygon class", wb_schema.RULE_KIND_POLYGON, None),
+    ("KP range table", wb_schema.RULE_KIND_KP_TABLE, None),
+    ("Manual ranges", wb_schema.RULE_KIND_MANUAL, None),
+)
 
 _CLASS_BADGES = {
     schema.CRITERION_NON_DEVIABLE: "ND",
@@ -109,13 +121,23 @@ class RuleEditorDialog(QDialog):
         self.rule = dict(rule)
         self.inputs = inputs
         kind = self.rule.get("kind") or ""
-        self.setWindowTitle(f"Exclusion criterion — {_KIND_LABELS.get(kind, kind)}")
-        # The threshold form carries the WD-band grid; give it room.
-        self.setMinimumWidth(620 if kind == wb_schema.RULE_KIND_THRESHOLD else 460)
         try:
             self.config = json.loads(self.rule.get("config_json") or "{}")
         except (ValueError, TypeError):
             self.config = {}
+        # Water depth and slope share the stored kind but edit separately.
+        self.threshold_profile = ""
+        if kind == wb_schema.RULE_KIND_THRESHOLD:
+            self.threshold_profile = \
+                "slope" if (self.config.get("profile") or "depth") == "slope" \
+                else "depth"
+        if self.threshold_profile:
+            title = "Slope" if self.threshold_profile == "slope" else "Water depth"
+        else:
+            title = _KIND_LABELS.get(kind, kind)
+        self.setWindowTitle(f"Exclusion criterion — {title}")
+        # The slope form carries the WD-band grid; give it room.
+        self.setMinimumWidth(620 if self.threshold_profile == "slope" else 460)
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -248,102 +270,10 @@ class RuleEditorDialog(QDialog):
         form = self.condition_form
         config = self.config
         if kind == wb_schema.RULE_KIND_THRESHOLD:
-            self.profile_combo = QComboBox()
-            self.profile_combo.addItem("Water depth", "depth")
-            self.profile_combo.addItem("Longitudinal slope", "slope")
-            self.profile_combo.setCurrentIndex(
-                1 if (config.get("profile") or "depth") == "slope" else 0)
-            self.profile_combo.currentIndexChanged.connect(self._sync_threshold)
-            form.addRow("Profile:", self.profile_combo)
-            self.op_combo = QComboBox()
-            for op in (">", ">=", "<", "<=", "between"):
-                self.op_combo.addItem(op)
-            index = self.op_combo.findText(config.get("op") or ">")
-            self.op_combo.setCurrentIndex(max(0, index))
-            self.op_combo.currentIndexChanged.connect(self._sync_threshold)
-            form.addRow("Condition:", self.op_combo)
-            self.value_spin = QDoubleSpinBox()
-            self.value2_spin = QDoubleSpinBox()
-            for spin in (self.value_spin, self.value2_spin):
-                spin.setRange(-100000.0, 100000.0)
-                spin.setDecimals(2)
-            self.value_spin.setValue(float(config.get("value") or 0.0))
-            if config.get("value2") is not None:
-                self.value2_spin.setValue(float(config.get("value2")))
-            form.addRow("Value:", self.value_spin)
-            form.addRow("Value 2 (between):", self.value2_spin)
-            self.signed_check = QCheckBox(
-                "Signed slope with separate down/up-slope limits (direction-aware)")
-            self.signed_check.setChecked(bool(config.get("slope_signed")))
-            self.signed_check.toggled.connect(self._sync_threshold)
-            form.addRow(self.signed_check)
-            self.slope_note = QLabel(
-                "Uses longitudinal slope along the route only (+ve = up-slope). "
-                "Auto uses the stored bathymetry profile resolution so short, "
-                "steep terrain is retained; "
-                "contour depths are linearly interpolated between their actual "
-                "route crossings. Cross-route slope is not evaluated by this rule.")
-            self.slope_note.setWordWrap(True)
-            self.slope_note.setStyleSheet("color: #666;")
-            form.addRow(self.slope_note)
-            self.slope_window_spin = QDoubleSpinBox()
-            self.slope_window_spin.setRange(0.0, 1000.0)
-            self.slope_window_spin.setDecimals(1)
-            self.slope_window_spin.setSuffix(" m")
-            self.slope_window_spin.setSpecialValueText("Auto (2 × profile step)")
-            self.slope_window_spin.setToolTip(
-                "Length over which slope is evaluated — set it to the burial "
-                "vehicle's bearing length (plough skids / trencher tracks) so "
-                "the rule sees the gradient the machine actually experiences "
-                "rather than local terrain shorter than the vehicle. "
-                "0 = Auto: local terrain slope over twice the stored profile "
-                "station step. Lengths shorter than the bathymetry resolution "
-                "add no real detail.")
-            if config.get("slope_window_m"):
-                self.slope_window_spin.setValue(float(config.get("slope_window_m")))
-            form.addRow("Slope evaluation length:", self.slope_window_spin)
-            self.down_spin = QDoubleSpinBox()
-            self.up_spin = QDoubleSpinBox()
-            for spin in (self.down_spin, self.up_spin):
-                spin.setRange(0.0, 90.0)
-                spin.setDecimals(1)
-                spin.setSuffix(" °")
-            if config.get("downslope_max_deg") is not None:
-                self.down_spin.setValue(float(config.get("downslope_max_deg")))
-            if config.get("upslope_max_deg") is not None:
-                self.up_spin.setValue(float(config.get("upslope_max_deg")))
-            form.addRow("Down-slope limit:", self.down_spin)
-            form.addRow("Up-slope limit:", self.up_spin)
-            self.bands_table = QTableWidget(0, 5)
-            self.bands_table.setHorizontalHeaderLabels(
-                ["Min WD (m)", "Max WD (m)", "Limit",
-                 "Down-slope limit (°)", "Up-slope limit (°)"])
-            self.bands_table.verticalHeader().setVisible(False)
-            self.bands_table.setMinimumHeight(96)
-            self.bands_table.setMaximumHeight(150)
-            self.bands_table.horizontalHeader().setSectionResizeMode(
-                HEADER_RESIZE_MODE_STRETCH)
-            self.bands_table.setToolTip(
-                "Optional water-depth-banded limits: per station the first "
-                "band whose [Min WD, Max WD) contains the water depth "
-                "applies (no interpolation between bands). Leave Min/Max "
-                "blank to leave that side open. Limit is in metres for a "
-                "depth rule, degrees for slope; signed slope can instead "
-                "set separate down/up-slope limits (Limit is the fallback "
-                "for both).")
-            for band in config.get("bands") or []:
-                self._append_band_row(band)
-            form.addRow("WD bands (optional):", self.bands_table)
-            bands_buttons = QHBoxLayout()
-            add_band = QPushButton("＋ Add band")
-            add_band.clicked.connect(lambda: self._append_band_row({}))
-            bands_buttons.addWidget(add_band)
-            remove_band = QPushButton("− Remove band")
-            remove_band.clicked.connect(self._remove_band_row)
-            bands_buttons.addWidget(remove_band)
-            bands_buttons.addStretch(1)
-            form.addRow("", bands_buttons)
-            self._sync_threshold()
+            if self.threshold_profile == "slope":
+                self._build_slope_form(form, config)
+            else:
+                self._build_depth_form(form, config)
         elif kind == wb_schema.RULE_KIND_PROXIMITY:
             self.input_combo = self._input_combo(
                 [schema.INPUT_ROLE_CROSSINGS_POINTS, schema.INPUT_ROLE_CROSSINGS_LINES,
@@ -353,7 +283,12 @@ class RuleEditorDialog(QDialog):
             self.distance_spin.setRange(0.0, 1000000.0)
             self.distance_spin.setSuffix(" m")
             self.distance_spin.setValue(float(config.get("distance_m") or 0.0))
-            form.addRow("Within distance:", self.distance_spin)
+            self.distance_spin.setToolTip(
+                "Measured from the route centreline to the feature, so it "
+                "applies each side of the route — the full search corridor "
+                "is twice this value.")
+            form.addRow("Within distance (each side of route):",
+                        self.distance_spin)
             self.buffer_field_edit = QLineEdit(config.get("buffer_field") or "")
             self.buffer_field_edit.setPlaceholderText(
                 "optional attribute holding a per-feature buffer (m)")
@@ -362,38 +297,7 @@ class RuleEditorDialog(QDialog):
             self.filter_edit.setPlaceholderText("optional QGIS filter expression")
             form.addRow("Feature filter:", self.filter_edit)
         elif kind == wb_schema.RULE_KIND_POLYGON:
-            self.input_combo = self._input_combo(
-                [schema.INPUT_ROLE_SOILS, schema.INPUT_ROLE_OTHER])
-            form.addRow("Input:", self.input_combo)
-            self.attribute_edit = QLineEdit(config.get("attribute") or "")
-            form.addRow("Attribute:", self.attribute_edit)
-            self.values_edit = QLineEdit(
-                ", ".join(config.get("match_values") or []))
-            self.values_edit.setPlaceholderText("e.g. ROCK, BOULDERS")
-            form.addRow("Match values:", self.values_edit)
-            self.corridor_combo = QComboBox()
-            self.corridor_combo.addItem("Route centreline only (default)", "")
-            self.corridor_combo.addItem("Within fixed distance of route", "fixed")
-            self.corridor_combo.addItem(
-                "Within water-depth multiple of route (×WD)", "wd")
-            corridor_index = self.corridor_combo.findData(
-                (config.get("route_buffer_mode") or "").lower())
-            self.corridor_combo.setCurrentIndex(max(0, corridor_index))
-            self.corridor_combo.currentIndexChanged.connect(self._sync_corridor)
-            form.addRow("Search from:", self.corridor_combo)
-            self.corridor_spin = QDoubleSpinBox()
-            self.corridor_spin.setRange(0.0, 100000.0)
-            mode = (config.get("route_buffer_mode") or "").lower()
-            self.corridor_spin.setValue(
-                float(config.get("route_buffer_wd") or 0.0) if mode == "wd"
-                else float(config.get("route_buffer_m") or 0.0))
-            self.corridor_spin.setToolTip(
-                "Also excludes where a matching polygon comes within this "
-                "distance of the route (e.g. a contractual lay corridor). "
-                "×WD scales the distance with the water depth at each "
-                "station and needs a bathymetry source.")
-            form.addRow("Corridor distance:", self.corridor_spin)
-            self._sync_corridor()
+            self._build_polygon_form(form, config)
         elif kind == wb_schema.RULE_KIND_KP_TABLE:
             self.input_combo = self._input_combo()
             form.addRow("Input:", self.input_combo)
@@ -408,6 +312,168 @@ class RuleEditorDialog(QDialog):
             self.ranges_edit = QLineEdit(_format_scope(ranges))
             self.ranges_edit.setPlaceholderText("e.g. 12.000-13.500, 40.2-41.0")
             form.addRow("KP ranges:", self.ranges_edit)
+
+    def _build_depth_form(self, form: QFormLayout, config: Dict) -> None:
+        self.op_combo = QComboBox()
+        for op in (">", ">=", "<", "<=", "between"):
+            self.op_combo.addItem(op)
+        index = self.op_combo.findText(config.get("op") or ">")
+        self.op_combo.setCurrentIndex(max(0, index))
+        self.op_combo.currentIndexChanged.connect(self._sync_depth)
+        form.addRow("Condition:", self.op_combo)
+        self.value_spin = QDoubleSpinBox()
+        self.value2_spin = QDoubleSpinBox()
+        for spin in (self.value_spin, self.value2_spin):
+            spin.setRange(0.0, 100000.0)
+            spin.setDecimals(2)
+            spin.setSuffix(" m")
+        self.value_spin.setValue(float(config.get("value") or 0.0))
+        if config.get("value2") is not None:
+            self.value2_spin.setValue(float(config.get("value2")))
+        form.addRow("Water depth:", self.value_spin)
+        form.addRow("Value 2 (between):", self.value2_spin)
+        note = QLabel(
+            "Water depth magnitude (m) from the stored bathymetry profile; "
+            "contour depths are linearly interpolated between their actual "
+            "route crossings.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #666;")
+        form.addRow(note)
+        self._sync_depth()
+
+    def _sync_depth(self) -> None:
+        self.value2_spin.setEnabled(self.op_combo.currentText() == "between")
+
+    def _build_slope_form(self, form: QFormLayout, config: Dict) -> None:
+        self.component_combo = QComboBox()
+        for component in profile_data.SLOPE_COMPONENTS:
+            self.component_combo.addItem(
+                profile_data.SLOPE_COMPONENT_LABELS[component], component)
+        index = self.component_combo.findData(
+            config.get("slope_component") or profile_data.SLOPE_COMPONENT_LONG)
+        self.component_combo.setCurrentIndex(max(0, index))
+        self.component_combo.currentIndexChanged.connect(self._sync_threshold)
+        form.addRow("Slope component:", self.component_combo)
+        self.op_combo = QComboBox()
+        for op in (">", ">=", "<", "<=", "between"):
+            self.op_combo.addItem(op)
+        index = self.op_combo.findText(config.get("op") or ">")
+        self.op_combo.setCurrentIndex(max(0, index))
+        self.op_combo.currentIndexChanged.connect(self._sync_threshold)
+        form.addRow("Condition:", self.op_combo)
+        self.value_spin = QDoubleSpinBox()
+        self.value2_spin = QDoubleSpinBox()
+        for spin in (self.value_spin, self.value2_spin):
+            spin.setRange(0.0, 90.0)
+            spin.setDecimals(2)
+            spin.setSuffix(" °")
+        self.value_spin.setValue(float(config.get("value") or 0.0))
+        if config.get("value2") is not None:
+            self.value2_spin.setValue(float(config.get("value2")))
+        form.addRow("Slope angle:", self.value_spin)
+        form.addRow("Value 2 (between):", self.value2_spin)
+        self.signed_check = QCheckBox(
+            "Signed slope with separate down/up-slope limits (direction-aware)")
+        self.signed_check.setChecked(bool(config.get("slope_signed")))
+        self.signed_check.toggled.connect(self._sync_threshold)
+        form.addRow(self.signed_check)
+        self.slope_note = QLabel("")
+        self.slope_note.setWordWrap(True)
+        self.slope_note.setStyleSheet("color: #666;")
+        form.addRow(self.slope_note)
+        self.slope_window_spin = QDoubleSpinBox()
+        self.slope_window_spin.setRange(0.0, 1000.0)
+        self.slope_window_spin.setDecimals(1)
+        self.slope_window_spin.setSuffix(" m")
+        self.slope_window_spin.setSpecialValueText("Auto (2 × profile step)")
+        self.slope_window_spin.setToolTip(
+            "Length over which slope is evaluated — set it to the burial "
+            "vehicle's bearing length (plough skids / trencher tracks) so "
+            "the rule sees the gradient the machine actually experiences "
+            "rather than local terrain shorter than the vehicle. "
+            "0 = Auto: local terrain slope over twice the stored profile "
+            "station step. Lengths shorter than the bathymetry resolution "
+            "add no real detail. Cross slope ignores this — it is always "
+            "the difference across the sampled ± cross offset.")
+        if config.get("slope_window_m"):
+            self.slope_window_spin.setValue(float(config.get("slope_window_m")))
+        form.addRow("Slope evaluation length:", self.slope_window_spin)
+        self.down_spin = QDoubleSpinBox()
+        self.up_spin = QDoubleSpinBox()
+        for spin in (self.down_spin, self.up_spin):
+            spin.setRange(0.0, 90.0)
+            spin.setDecimals(1)
+            spin.setSuffix(" °")
+        if config.get("downslope_max_deg") is not None:
+            self.down_spin.setValue(float(config.get("downslope_max_deg")))
+        if config.get("upslope_max_deg") is not None:
+            self.up_spin.setValue(float(config.get("upslope_max_deg")))
+        form.addRow("Down-slope limit:", self.down_spin)
+        form.addRow("Up-slope limit:", self.up_spin)
+        self.bands_table = QTableWidget(0, 5)
+        self.bands_table.setHorizontalHeaderLabels(
+            ["Min WD (m)", "Max WD (m)", "Limit (°)",
+             "Down-slope limit (°)", "Up-slope limit (°)"])
+        self.bands_table.verticalHeader().setVisible(False)
+        self.bands_table.setMinimumHeight(96)
+        self.bands_table.setMaximumHeight(150)
+        self.bands_table.horizontalHeader().setSectionResizeMode(
+            HEADER_RESIZE_MODE_STRETCH)
+        self.bands_table.setToolTip(
+            "Optional water-depth-banded slope limits — for burial tools "
+            "whose slope capability changes with depth. Per station the "
+            "first band whose [Min WD, Max WD) contains the water depth "
+            "applies (no interpolation between bands). Leave Min/Max blank "
+            "to leave that side open; signed slope can instead set separate "
+            "down/up-slope limits (Limit is the fallback for both).")
+        for band in config.get("bands") or []:
+            self._append_band_row(band)
+        form.addRow("WD-banded limits (optional):", self.bands_table)
+        bands_buttons = QHBoxLayout()
+        add_band = QPushButton("＋ Add band")
+        add_band.clicked.connect(lambda: self._append_band_row({}))
+        bands_buttons.addWidget(add_band)
+        remove_band = QPushButton("− Remove band")
+        remove_band.clicked.connect(self._remove_band_row)
+        bands_buttons.addWidget(remove_band)
+        bands_buttons.addStretch(1)
+        form.addRow("", bands_buttons)
+        self._sync_threshold()
+
+    def _build_polygon_form(self, form: QFormLayout, config: Dict) -> None:
+        self.input_combo = self._input_combo(
+            [schema.INPUT_ROLE_SOILS, schema.INPUT_ROLE_OTHER])
+        form.addRow("Input:", self.input_combo)
+        self.attribute_edit = QLineEdit(config.get("attribute") or "")
+        form.addRow("Attribute:", self.attribute_edit)
+        self.values_edit = QLineEdit(
+            ", ".join(config.get("match_values") or []))
+        self.values_edit.setPlaceholderText("e.g. ROCK, BOULDERS")
+        form.addRow("Match values:", self.values_edit)
+        self.corridor_combo = QComboBox()
+        self.corridor_combo.addItem("Route centreline only (default)", "")
+        self.corridor_combo.addItem("Within fixed distance of route", "fixed")
+        self.corridor_combo.addItem(
+            "Within water-depth multiple of route (×WD)", "wd")
+        corridor_index = self.corridor_combo.findData(
+            (config.get("route_buffer_mode") or "").lower())
+        self.corridor_combo.setCurrentIndex(max(0, corridor_index))
+        self.corridor_combo.currentIndexChanged.connect(self._sync_corridor)
+        form.addRow("Search from:", self.corridor_combo)
+        self.corridor_spin = QDoubleSpinBox()
+        self.corridor_spin.setRange(0.0, 100000.0)
+        mode = (config.get("route_buffer_mode") or "").lower()
+        self.corridor_spin.setValue(
+            float(config.get("route_buffer_wd") or 0.0) if mode == "wd"
+            else float(config.get("route_buffer_m") or 0.0))
+        self.corridor_spin.setToolTip(
+            "Measured from the route centreline to the polygon, so it "
+            "applies each side of the route — the full search corridor is "
+            "twice this value (e.g. 10 m here checks a 20 m wide corridor). "
+            "×WD scales the distance with the water depth at each station "
+            "and needs a bathymetry source.")
+        form.addRow("Distance each side of route:", self.corridor_spin)
+        self._sync_corridor()
 
     _BAND_COLUMN_KEYS = ("min_wd", "max_wd", "limit",
                          "downslope_limit", "upslope_limit")
@@ -444,20 +510,40 @@ class RuleEditorDialog(QDialog):
                 bands.append(band)
         return bands
 
+    _COMPONENT_NOTES = {
+        profile_data.SLOPE_COMPONENT_LONG:
+            "Longitudinal slope along the route (+ve = up-slope) from the "
+            "stored bathymetry profile; contour depths are interpolated "
+            "between their actual route crossings. Tick signed limits to "
+            "set separate down/up-slope maxima (direction-of-installation "
+            "aware).",
+        profile_data.SLOPE_COMPONENT_CROSS:
+            "Cross slope from the profile's ± cross-offset samples (two-"
+            "point difference across the offset). The limit applies to the "
+            "magnitude — leaning to port or starboard both count. Needs a "
+            "profile sampled with a cross offset (Bathymetry Profile tab).",
+        profile_data.SLOPE_COMPONENT_ABSOLUTE:
+            "Absolute slope: magnitude of the combined longitudinal + cross "
+            "gradient, matching the profile pane's Absolute trace. Where "
+            "cross samples are missing it falls back to |longitudinal| "
+            "(a lower bound). Needs a profile sampled with a cross offset.",
+    }
+
     def _sync_threshold(self) -> None:
-        is_slope = self.profile_combo.currentData() == "slope"
-        signed = is_slope and self.signed_check.isChecked()
-        suffix = " °" if is_slope else " m"
-        self.value_spin.setSuffix(suffix)
-        self.value2_spin.setSuffix(suffix)
-        self.slope_note.setVisible(is_slope)
-        self.slope_window_spin.setEnabled(is_slope)
-        self.signed_check.setEnabled(is_slope)
+        component = self.component_combo.currentData() \
+            or profile_data.SLOPE_COMPONENT_LONG
+        is_long = component == profile_data.SLOPE_COMPONENT_LONG
+        signed = is_long and self.signed_check.isChecked()
+        self.slope_note.setText(self._COMPONENT_NOTES.get(component, ""))
+        self.signed_check.setEnabled(is_long)
         self.down_spin.setEnabled(signed)
         self.up_spin.setEnabled(signed)
         self.op_combo.setEnabled(not signed)
         self.value_spin.setEnabled(not signed)
         self.value2_spin.setEnabled(not signed and self.op_combo.currentText() == "between")
+        # Cross is a fixed two-point difference across the sampled offset.
+        self.slope_window_spin.setEnabled(
+            component != profile_data.SLOPE_COMPONENT_CROSS)
         # The directional band limits only mean anything for signed slope.
         self.bands_table.setColumnHidden(3, not signed)
         self.bands_table.setColumnHidden(4, not signed)
@@ -468,27 +554,41 @@ class RuleEditorDialog(QDialog):
         kind = rule.get("kind") or ""
         config = dict(self.config)
         if kind == wb_schema.RULE_KIND_THRESHOLD:
-            config["profile"] = self.profile_combo.currentData()
+            config["profile"] = self.threshold_profile or "depth"
             config["op"] = self.op_combo.currentText()
             config["value"] = self.value_spin.value()
             config["value2"] = (self.value2_spin.value()
                                 if self.op_combo.currentText() == "between" else None)
-            config["abs"] = config.get("profile") == "slope" and not self.signed_check.isChecked()
-            if config["profile"] == "slope" and self.slope_window_spin.value() > 0:
-                config["slope_window_m"] = self.slope_window_spin.value()
+            if self.threshold_profile == "slope":
+                component = self.component_combo.currentData() \
+                    or profile_data.SLOPE_COMPONENT_LONG
+                if component == profile_data.SLOPE_COMPONENT_LONG:
+                    config.pop("slope_component", None)
+                else:
+                    config["slope_component"] = component
+                is_long = component == profile_data.SLOPE_COMPONENT_LONG
+                signed = is_long and self.signed_check.isChecked()
+                config["abs"] = not signed
+                if self.slope_window_spin.value() > 0 \
+                        and component != profile_data.SLOPE_COMPONENT_CROSS:
+                    config["slope_window_m"] = self.slope_window_spin.value()
+                else:
+                    config.pop("slope_window_m", None)
+                if signed:
+                    config["slope_signed"] = True
+                    config["downslope_max_deg"] = self.down_spin.value() or None
+                    config["upslope_max_deg"] = self.up_spin.value() or None
+                else:
+                    config.pop("slope_signed", None)
+                bands = self._bands_from_table()
+                if bands:
+                    config["bands"] = bands
+                else:
+                    config.pop("bands", None)
             else:
-                config.pop("slope_window_m", None)
-            if config["profile"] == "slope" and self.signed_check.isChecked():
-                config["slope_signed"] = True
-                config["downslope_max_deg"] = self.down_spin.value() or None
-                config["upslope_max_deg"] = self.up_spin.value() or None
-            else:
+                config["abs"] = False
                 config.pop("slope_signed", None)
-            bands = self._bands_from_table()
-            if bands:
-                config["bands"] = bands
-            else:
-                config.pop("bands", None)
+                config.pop("slope_component", None)
         elif kind == wb_schema.RULE_KIND_PROXIMITY:
             config["input_id"] = self.input_combo.currentData() or ""
             config["distance_m"] = self.distance_spin.value()
@@ -539,9 +639,13 @@ class RuleEditorDialog(QDialog):
             action = wb_schema.RULE_ACTION_RISK
         else:
             action = wb_schema.RULE_ACTION_EXCLUDE
+        if kind == wb_schema.RULE_KIND_THRESHOLD:
+            default_name = ("Slope" if self.threshold_profile == "slope"
+                            else "Water depth")
+        else:
+            default_name = _KIND_LABELS.get(kind, kind)
         rule.update({
-            "name": self.name_edit.text().strip()
-                    or _KIND_LABELS.get(kind, kind),
+            "name": self.name_edit.text().strip() or default_name,
             "criterion_class": criterion,
             "source_ref": self.source_edit.text().strip(),
             "action": action,
@@ -683,9 +787,10 @@ class RulesTab(QWidget):
         self.add_button.setText("＋ Add criterion ▾")
         self.add_button.setPopupMode(TOOLBUTTON_POPUP_MODE_INSTANT)
         menu = QMenu(self.add_button)
-        for kind, label in _KIND_LABELS.items():
+        for label, kind, preset in _ADD_MENU:
             action = menu.addAction(label)
-            action.triggered.connect(lambda _checked=False, k=kind: self._add_rule(k))
+            action.triggered.connect(
+                lambda _checked=False, k=kind, p=preset: self._add_rule(k, p))
         self.add_button.setMenu(menu)
         button_row.addWidget(self.add_button)
         for label, slot in (("Edit…", self._edit_rule), ("Delete", self._delete_rule),
@@ -931,7 +1036,7 @@ class RulesTab(QWidget):
     def _selected_index(self) -> int:
         return self.rule_table.currentRow()
 
-    def _add_rule(self, kind: str) -> None:
+    def _add_rule(self, kind: str, preset: Optional[Dict] = None) -> None:
         if not self.model.plan:
             return
         rule = {
@@ -945,7 +1050,7 @@ class RulesTab(QWidget):
             "criterion_class": schema.CRITERION_PROJECT,
             "source_ref": "",
             "methods_json": json.dumps([self.model.method]),
-            "config_json": "{}",
+            "config_json": json.dumps(preset or {}),
             "notes": "",
         }
         dialog = RuleEditorDialog(rule, self.model.inputs, self.model.method, self)
