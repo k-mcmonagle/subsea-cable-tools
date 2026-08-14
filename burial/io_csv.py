@@ -25,9 +25,9 @@ from . import schema
 
 EVENT_COLUMNS = ["seq", "event_type", "label", "kp", "lat", "lon", "depth_m",
                  "source", "status", "locked", "notes"]
-SECTION_COLUMNS = ["kind", "start_kp", "end_kp", "length_km", "state",
-                   "conclusion", "confidence", "skip_handling", "reasons",
-                   "notes"]
+SECTION_COLUMNS = ["section_ref", "kind", "start_kp", "end_kp", "length_km",
+                   "state", "conclusion", "confidence", "skip_handling",
+                   "reasons", "notes"]
 INPUT_COLUMNS = ["role", "layer_name", "layer_source", "originator", "revision",
                  "status", "received_utc", "quality", "notes"]
 
@@ -85,8 +85,11 @@ def sections_csv(plan: Dict, sections: Sequence[Dict], generation_id: str = "") 
         buf.write(line + "\r\n")
     writer = csv.writer(buf, lineterminator="\r\n")
     writer.writerow(SECTION_COLUMNS)
+    refs = schema.section_refs(sections, int(plan.get("direction") or 1),
+                               plan.get("method") or "")
     for section in sections:
         writer.writerow([
+            refs.get(str(section.get("section_id") or ""), ""),
             section.get("kind") or "",
             schema.format_kp(section.get("start_kp")),
             schema.format_kp(section.get("end_kp")),

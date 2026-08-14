@@ -183,6 +183,8 @@ def write_plan_layers(store, plan: Dict, sections: Sequence[Dict],
     sections_name = schema.sections_layer_name(*base_args)
     events_name = schema.events_layer_name(*base_args)
 
+    refs = schema.section_refs(sections,
+                               int(plan.get("direction") or 1), method)
     section_rows: List[Dict] = []
     for section in sections:
         geom = route.extract_segment(float(section.get("start_kp") or 0.0),
@@ -190,6 +192,7 @@ def write_plan_layers(store, plan: Dict, sections: Sequence[Dict],
         if geom is None or geom.isEmpty():
             continue
         section_rows.append({
+            "section_ref": refs.get(str(section.get("section_id") or ""), ""),
             "section_id": section.get("section_id") or "",
             "plan_id": section.get("plan_id") or "",
             "kind": section.get("kind") or "",

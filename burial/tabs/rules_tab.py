@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 from typing import Dict, List, Optional
 
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import QSettings, Qt
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
@@ -37,6 +37,7 @@ from qgis.PyQt.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSpinBox,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
@@ -90,6 +91,36 @@ _CLASS_BADGES = {
     schema.CRITERION_PROJECT: "PR",
     schema.CRITERION_SCREENING: "SC",
 }
+
+_BADGE_LEGEND = ("Criterion class: [ND] Non-Deviable Requirement, "
+                 "[PR] Project Exclusion Criterion, [SC] Screening "
+                 "Criterion (flags for assessment — does not exclude).")
+
+_VERTICAL = getattr(Qt, "Orientation", Qt).Vertical
+
+_SHOW_RESOLVED_SETTINGS_KEY = \
+    "SubseaCableTools/BurialPlanner/rules_show_resolved"
+
+_RESOLVED_COLUMNS = ["Start KP", "End KP", "Length (km)", "Status",
+                     "Dominant criterion", "Triggered by"]
+
+
+def verdict_row_values(verdict, rule_names: Dict[str, str]) -> List[str]:
+    """One resolved excluded/flagged range as display strings."""
+    names = [rule_names.get(rid, rid)
+             for rid in (verdict.fired_rule_ids or [])]
+    dominant = rule_names.get(verdict.dominant_rule_id or "",
+                              verdict.dominant_rule_id or "")
+    status = ("Excluded" if verdict.status == STATUS_EXCLUDED
+              else "Flagged (screening)")
+    return [
+        schema.format_kp(verdict.start_km),
+        schema.format_kp(verdict.end_km),
+        schema.format_kp(verdict.end_km - verdict.start_km),
+        status,
+        dominant,
+        ", ".join(n for n in names if n),
+    ]
 
 
 def _parse_scope(text: str) -> List[Dict]:
@@ -660,13 +691,13 @@ class RuleEditorDialog(QDialog):
 class ExcludedSectionsDialog(QDialog):
     """Resolved excluded / flagged KP ranges with their triggering criteria.
 
-    Read-only review table over the current resolution verdicts; double-click
-    (or the Go to button) zooms map + profile to the range; Export CSV writes
-    the same rows with the criteria names.
+    The Exclusions tab now embeds this review as the resolved-exclusions
+    table; the dialog remains for programmatic use and as a pop-out view.
+    Double-click (or the Go to button) zooms map + profile to the range;
+    Export CSV writes the same rows with the criteria names.
     """
 
-    _COLUMNS = ["Start KP", "End KP", "Length (km)", "Status",
-                "Dominant criterion", "Triggered by"]
+    _COLUMNS = _RESOLVED_COLUMNS
 
     def __init__(self, verdicts: List, rule_names: Dict[str, str],
                  dock, parent=None):
@@ -713,20 +744,7 @@ class ExcludedSectionsDialog(QDialog):
         layout.addLayout(button_row)
 
     def _row_values(self, verdict) -> List[str]:
-        names = [self.rule_names.get(rid, rid)
-                 for rid in (verdict.fired_rule_ids or [])]
-        dominant = self.rule_names.get(verdict.dominant_rule_id or "",
-                                       verdict.dominant_rule_id or "")
-        status = ("Excluded" if verdict.status == STATUS_EXCLUDED
-                  else "Flagged (screening)")
-        return [
-            schema.format_kp(verdict.start_km),
-            schema.format_kp(verdict.end_km),
-            schema.format_kp(verdict.end_km - verdict.start_km),
-            status,
-            dominant,
-            ", ".join(n for n in names if n),
-        ]
+        return verdict_row_values(verdict, self.rule_names)
 
     def _goto_row(self, row: int) -> None:
         if 0 <= row < len(self.verdicts):
@@ -769,6 +787,9 @@ class RulesTab(QWidget):
         self.rule_table = QTableWidget(0, 4)
         self.rule_table.setHorizontalHeaderLabels(
             ["On", "Criterion", "Excluded sections", "Coverage"])
+        criterion_header = self.rule_table.horizontalHeaderItem(1)
+        if criterion_header is not None:
+            criterion_header.setToolTip(_BADGE_LEGEND)
         self.rule_table.verticalHeader().setVisible(False)
         self.rule_table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
         self.rule_table.setSelectionMode(SELECTION_MODE_SINGLE)
@@ -780,7 +801,44 @@ class RulesTab(QWidget):
         self.rule_table.doubleClicked.connect(lambda _index: self._edit_rule())
         self.rule_table.setContextMenuPolicy(CONTEXT_MENU_POLICY_CUSTOM)
         self.rule_table.customContextMenuRequested.connect(self._rule_context_menu)
-        layout.addWidget(self.rule_table, 1)
+
+        splitter = QSplitter(_VERTICAL)
+        splitter.addWidget(self.rule_table)
+
+        self.resolved_widget = QWidget()
+        resolved_layout = QVBoxLayout(self.resolved_widget)
+        resolved_layout.setContentsMargins(0, 0, 0, 0)
+        resolved_header = QHBoxLayout()
+        self.resolved_label = QLabel("Resolved exclusions")
+        self.resolved_label.setToolTip(
+            "The excluded / flagged KP ranges after resolving the whole "
+            "stack, with the criteria that triggered them. Click a row to "
+            "highlight the range; double-click to zoom map and profile.")
+        resolved_header.addWidget(self.resolved_label)
+        resolved_header.addStretch(1)
+        resolved_export = QPushButton("Export CSV…")
+        resolved_export.setToolTip(
+            "Write the resolved excluded / flagged ranges with their "
+            "triggering criteria to a CSV file.")
+        resolved_export.clicked.connect(self._export_resolved_csv)
+        resolved_header.addWidget(resolved_export)
+        resolved_layout.addLayout(resolved_header)
+        self.resolved_table = QTableWidget(0, len(_RESOLVED_COLUMNS))
+        self.resolved_table.setHorizontalHeaderLabels(_RESOLVED_COLUMNS)
+        self.resolved_table.verticalHeader().setVisible(False)
+        self.resolved_table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
+        self.resolved_table.setSelectionMode(SELECTION_MODE_SINGLE)
+        self.resolved_table.horizontalHeader().setSectionResizeMode(
+            len(_RESOLVED_COLUMNS) - 1, HEADER_RESIZE_MODE_STRETCH)
+        self.resolved_table.itemSelectionChanged.connect(self._on_resolved_selected)
+        self.resolved_table.cellDoubleClicked.connect(
+            lambda row, _column: self._goto_resolved_row(row))
+        resolved_layout.addWidget(self.resolved_table, 1)
+        splitter.addWidget(self.resolved_widget)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        layout.addWidget(splitter, 1)
+        self._resolved_rows: List = []
 
         button_row = QHBoxLayout()
         self.add_button = QToolButton()
@@ -850,12 +908,14 @@ class RulesTab(QWidget):
             "saved; the plan's sections layer remains the built plan.")
         self.preview_check.toggled.connect(self._refresh_map_preview)
         io_row.addWidget(self.preview_check)
-        self.sections_button = QPushButton("Excluded sections…")
-        self.sections_button.setToolTip(
-            "Table of the resolved excluded / flagged KP ranges with the "
-            "criteria that triggered them, with CSV export.")
-        self.sections_button.clicked.connect(self._show_excluded_sections)
-        io_row.addWidget(self.sections_button)
+        self.resolved_check = QCheckBox("Show resolved exclusions")
+        self.resolved_check.setToolTip(
+            "Show the table of resolved excluded / flagged KP ranges below "
+            "the criteria stack. The setting is remembered.")
+        self.resolved_check.setChecked(
+            QSettings().value(_SHOW_RESOLVED_SETTINGS_KEY, True, type=bool))
+        self.resolved_check.toggled.connect(self._set_resolved_visible)
+        io_row.addWidget(self.resolved_check)
         io_row.addSpacing(12)
         for label, slot in (("Import from Assessment…", self._import_from_assessment),
                             ("Import rule set JSON…", self._import_json),
@@ -868,6 +928,7 @@ class RulesTab(QWidget):
         io_row.addWidget(self.status_label)
         layout.addLayout(io_row)
 
+        self.resolved_widget.setVisible(self.resolved_check.isChecked())
         model.planChanged.connect(self.refresh)
         model.rulesChanged.connect(self.refresh)
         self.refresh()
@@ -922,6 +983,7 @@ class RulesTab(QWidget):
                 coverage_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
                 self.rule_table.setItem(i, 3, coverage_item)
             self._refresh_overview()
+            self._refresh_resolved()
         finally:
             self._loading = False
 
@@ -1018,19 +1080,80 @@ class RulesTab(QWidget):
             start_km, end_km = goto_actions[chosen]
             self.dock.goto_range(start_km, end_km)
 
-    def _show_excluded_sections(self) -> None:
+    def _set_resolved_visible(self, visible: bool) -> None:
+        QSettings().setValue(_SHOW_RESOLVED_SETTINGS_KEY, bool(visible))
+        self.resolved_widget.setVisible(bool(visible))
+
+    def _rule_names(self) -> Dict[str, str]:
+        return {str(r.get("rule_id")): (r.get("name") or "")
+                for r in self.model.rules}
+
+    def _refresh_resolved(self) -> None:
+        """Rebuild the resolved-exclusions table from the current verdicts."""
         verdicts = [v for v in self._current_verdicts()
                     if v.status in (STATUS_EXCLUDED, STATUS_RISK)]
-        if not verdicts:
+        verdicts.sort(key=lambda v: (v.start_km, v.end_km))
+        self._resolved_rows = verdicts
+        rule_names = self._rule_names()
+        self.resolved_table.setRowCount(len(verdicts))
+        excluded_km = sum(v.end_km - v.start_km for v in verdicts
+                          if v.status == STATUS_EXCLUDED)
+        flagged = sum(1 for v in verdicts if v.status == STATUS_RISK)
+        summary = "Resolved exclusions"
+        if verdicts:
+            summary += (f" — {excluded_km:.3f} km excluded in "
+                        f"{len(verdicts) - flagged} range(s)")
+            if flagged:
+                summary += f", {flagged} screening flag(s)"
+        else:
+            summary += " — none yet (run Recompute)"
+        self.resolved_label.setText(summary)
+        for i, verdict in enumerate(verdicts):
+            for j, value in enumerate(verdict_row_values(verdict, rule_names)):
+                item = QTableWidgetItem(value)
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled
+                              | Qt.ItemFlag.ItemIsSelectable)
+                if j == len(_RESOLVED_COLUMNS) - 1:
+                    item.setToolTip(value)
+                self.resolved_table.setItem(i, j, item)
+
+    def _on_resolved_selected(self) -> None:
+        if self._loading:
+            return
+        row = self.resolved_table.currentRow()
+        if 0 <= row < len(self._resolved_rows):
+            verdict = self._resolved_rows[row]
+            self.dock.highlight_range(verdict.start_km, verdict.end_km)
+
+    def _goto_resolved_row(self, row: int) -> None:
+        if 0 <= row < len(self._resolved_rows):
+            verdict = self._resolved_rows[row]
+            self.dock.goto_range(verdict.start_km, verdict.end_km)
+
+    def _export_resolved_csv(self) -> None:
+        if not self._resolved_rows:
             QMessageBox.information(
                 self, "Burial Planner",
                 "No excluded or flagged sections are available yet — run "
                 "Recompute first.")
             return
-        rule_names = {str(r.get("rule_id")): (r.get("name") or "")
-                      for r in self.model.rules}
-        dialog = ExcludedSectionsDialog(verdicts, rule_names, self.dock, self)
-        qt_exec(dialog)
+        path, _filter = QFileDialog.getSaveFileName(
+            self, "Export excluded sections", "excluded_sections.csv",
+            "CSV (*.csv)")
+        if not path:
+            return
+        import csv
+
+        rule_names = self._rule_names()
+        headers = ["start_kp", "end_kp", "length_km", "status",
+                   "dominant_criterion", "triggered_by"]
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(headers)
+            for verdict in self._resolved_rows:
+                writer.writerow(verdict_row_values(verdict, rule_names))
+        self.status_label.setText(
+            f"Exported {len(self._resolved_rows)} resolved range(s).")
 
     # -- edits ----------------------------------------------------------------
     def _selected_index(self) -> int:

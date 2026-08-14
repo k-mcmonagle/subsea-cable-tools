@@ -125,6 +125,7 @@ def test_report_content() -> bool:
         # sections/events/labels
         "Candidate Plough Section" in html_text,
         "Plough Skip" in html_text,
+        "PS-01" in html_text and "SK-01" in html_text,  # working section IDs
         "PLDN" in html_text and "PLUP" in html_text,
         # rules with source references and condition summaries
         "Guide v3 §2.1" in html_text,

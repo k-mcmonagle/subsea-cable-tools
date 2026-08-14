@@ -53,6 +53,7 @@ tr:nth-child(even) td { background: #fafafa; }
 .summary .big { font-size: 1.3em; font-weight: 600; }
 .note { background: #fff8e1; border: 1px solid #f0e0a0; padding: 0.5em 0.8em;
         font-size: 0.85em; margin: 1em 0; }
+.muted { color: #777; font-size: 0.85em; margin: 0.2em 0 0.6em; }
 img.profile { max-width: 100%; border: 1px solid #ccc; margin: 0.5em 0; }
 .footer { margin-top: 2.5em; color: #777; font-size: 0.8em;
           border-top: 1px solid #ccc; padding-top: 0.5em; }
@@ -304,11 +305,15 @@ def build_report_html(plan: Dict,
 
     # -- sections -------------------------------------------------------------
     parts.append("<h2>Sections</h2>")
+    section_refs = schema.section_refs(
+        sections, int(plan.get("direction") or 1), method)
+    parts.append(f"<p class='muted'>{_esc(schema.section_ref_legend(method))}"
+                 "</p>")
     section_rows = []
-    for i, section in enumerate(sections, start=1):
+    for section in sections:
         kind = section.get("kind") or ""
         section_rows.append((
-            str(i),
+            _esc(section_refs.get(str(section.get("section_id") or ""), "")),
             f"<span class='kind-{_esc(kind)}'>"
             f"{_esc(section_kind_label(kind, method))}</span>",
             _kp(section.get("start_kp")), _kp(section.get("end_kp")),
@@ -322,7 +327,7 @@ def build_report_html(plan: Dict,
             _esc(section_reason_text(section)),
             _esc(section.get("notes")),
         ))
-    parts.append(_table(("#", "Kind", "Start KP", "End KP", "Length (km)",
+    parts.append(_table(("ID", "Kind", "Start KP", "End KP", "Length (km)",
                          "State", "Conclusion", "Confidence", "Skip handling",
                          "Reasons", "Notes"), section_rows, raw=True))
 

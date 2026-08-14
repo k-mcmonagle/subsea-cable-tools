@@ -259,6 +259,68 @@ SKIP_HANDLING_LABELS: Dict[str, str] = {
     SKIP_HANDLING_MIDWATER: "Mid-water transit",
 }
 
+# Working section references ("PS-01", "SK-02", …): a short, human-usable ID
+# for tables, exports and documentation. Derived — never stored — so it always
+# reflects the current partition: sections are numbered per kind in travel
+# order (direction -1 counts from the high-KP end). Codes follow the method
+# vocabulary (plough burial sections are Candidate Plough Sections -> PS).
+_SECTION_REF_CODES_DEFAULT: Dict[str, str] = {
+    SECTION_BURIAL: "BS",
+    SECTION_SKIP: "SK",
+    SECTION_INSUFFICIENT: "II",
+}
+_SECTION_REF_CODES_BY_METHOD: Dict[str, Dict[str, str]] = {
+    METHOD_PLOUGH: {
+        SECTION_BURIAL: "PS",
+        SECTION_SKIP: "SK",
+        SECTION_INSUFFICIENT: "II",
+    },
+}
+
+
+def section_ref_code(kind: str, method: str = "") -> str:
+    codes = _SECTION_REF_CODES_BY_METHOD.get(method or "",
+                                             _SECTION_REF_CODES_DEFAULT)
+    return codes.get(kind or "", "XX")
+
+
+def section_ref_legend(method: str = "") -> str:
+    """One-line legend for UI tooltips and report footnotes."""
+    if (method or "") == METHOD_PLOUGH:
+        return ("PS = Candidate Plough Section, SK = Plough Skip, "
+                "II = Insufficient Information — numbered in travel order")
+    return ("BS = Burial section, SK = Skip, II = Insufficient Information "
+            "— numbered in travel order")
+
+
+def section_refs(sections, direction: int = 1, method: str = "") -> Dict[str, str]:
+    """Map ``section_id`` -> working reference (e.g. ``PS-03``).
+
+    Numbering is positional (per kind, in travel order), so inserting or
+    merging sections renumbers the ones after the edit; references become
+    stable once the plan stops changing. Zero-padded to two digits so they
+    sort naturally in documents up to 99 sections per kind.
+    """
+    def sort_key(section) -> Tuple[float, float]:
+        try:
+            start = float(section.get("start_kp") or 0.0)
+            end = float(section.get("end_kp") or 0.0)
+        except (TypeError, ValueError):
+            start = end = 0.0
+        return (start, end)
+
+    ordered = sorted(sections, key=sort_key,
+                     reverse=int(direction or 1) < 0)
+    counters: Dict[str, int] = {}
+    refs: Dict[str, str] = {}
+    for section in ordered:
+        code = section_ref_code(section.get("kind") or "", method)
+        counters[code] = counters.get(code, 0) + 1
+        refs[str(section.get("section_id") or "")] = \
+            f"{code}-{counters[code]:02d}"
+    return refs
+
+
 SECTION_FIELDS: List[FieldSpec] = [
     ("section_id", "str"),
     ("plan_id", "str"),
@@ -330,6 +392,7 @@ TABLE_KEYS: Dict[str, str] = {
 
 # Per-plan spatial layer schemas -------------------------------------------
 SECTIONS_LAYER_FIELDS: List[FieldSpec] = [
+    ("section_ref", "str"),
     ("section_id", "str"),
     ("plan_id", "str"),
     ("kind", "str"),

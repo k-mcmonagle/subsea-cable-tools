@@ -79,6 +79,40 @@ def test_kp_range_and_list_imports() -> bool:
     return _result("KP-range + events-list imports (client proposal tagging)", ok)
 
 
+def _section(sid, kind, start, end):
+    return {"section_id": sid, "plan_id": "p1", "kind": kind,
+            "start_kp": start, "end_kp": end, "length_km": end - start,
+            "state": "candidate", "conclusion": "", "confidence": "",
+            "reason_json": "{}", "skip_handling": "", "notes": ""}
+
+
+def test_section_refs_and_csv() -> bool:
+    """Working IDs: per-kind numbering in travel order; first CSV column."""
+    sections = [
+        _section("s1", schema.SECTION_BURIAL, 5.0, 20.0),
+        _section("s2", schema.SECTION_SKIP, 20.0, 25.0),
+        _section("s3", schema.SECTION_BURIAL, 25.0, 60.0),
+        _section("s4", schema.SECTION_INSUFFICIENT, 60.0, 62.0),
+        _section("s5", schema.SECTION_BURIAL, 62.0, 80.0),
+    ]
+    refs = schema.section_refs(sections, direction=1, method="plough")
+    ok = refs["s1"] == "PS-01" and refs["s3"] == "PS-02" and refs["s5"] == "PS-03"
+    ok = ok and refs["s2"] == "SK-01" and refs["s4"] == "II-01"
+    # Direction -1 numbers from the high-KP end (travel order).
+    rev = schema.section_refs(sections, direction=-1, method="plough")
+    ok = ok and rev["s5"] == "PS-01" and rev["s1"] == "PS-03"
+    # Non-plough methods use the generic burial-section code.
+    generic = schema.section_refs(sections, direction=1, method="rov_jet")
+    ok = ok and generic["s1"] == "BS-01" and generic["s2"] == "SK-01"
+    # The sections CSV carries the ref as its first column.
+    text = io_csv.sections_csv(_plan(), sections, "gen-1")
+    lines = text.splitlines()
+    ok = ok and any(line.startswith("section_ref,kind") for line in lines)
+    ok = ok and any(line.startswith("PS-02,burial,25.000") for line in lines)
+    ok = ok and any(line.startswith("SK-01,skip") for line in lines)
+    return _result("section working refs (per kind, travel order) + CSV", ok)
+
+
 def test_change_log_inversion() -> bool:
     entry = change_log.make_entry(
         "p1", 3, change_log.ACTION_MOVE_EVENT, "e1",
@@ -172,6 +206,7 @@ def run_all() -> list:
     return [
         test_events_csv_round_trip(),
         test_kp_range_and_list_imports(),
+        test_section_refs_and_csv(),
         test_change_log_inversion(),
         test_change_log_delta(),
         test_import_scan(),

@@ -11,9 +11,10 @@ from __future__ import annotations
 import json
 from typing import Dict, List, Optional
 
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import QSettings, Qt
 from qgis.PyQt.QtGui import QBrush, QColor, QKeySequence
 from qgis.PyQt.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -39,7 +40,6 @@ from ...qgis_compat import (
     BUTTON_BOX_OK,
     CONTEXT_MENU_POLICY_CUSTOM,
     DIALOG_ACCEPTED,
-    HEADER_RESIZE_MODE_STRETCH,
     ITEM_DATA_USER_ROLE,
     MESSAGE_BOX_NO,
     MESSAGE_BOX_YES,
@@ -52,12 +52,16 @@ from .. import schema
 
 _EVENT_COLUMNS = ["Seq", "Event", "KP", "Lat", "Lon", "Depth (m)", "Source",
                   "Status", "Locked", "Notes"]
-_SECTION_COLUMNS = ["Kind", "Start KP", "End KP", "Length (km)", "State",
-                    "Conclusion", "Confidence", "Skip handling", "Reasons",
-                    "Notes"]
-_SECTION_SKIP_HANDLING_COL = 7
-_SECTION_REASONS_COL = 8
-_SECTION_NOTES_COL = 9
+_SECTION_COLUMNS = ["ID", "Kind", "Start KP", "End KP", "Length (km)",
+                    "State", "Conclusion", "Confidence", "Skip handling",
+                    "Reasons", "Notes"]
+_SECTION_CONCLUSION_COL = 6
+_SECTION_CONFIDENCE_COL = 7
+_SECTION_SKIP_HANDLING_COL = 8
+_SECTION_REASONS_COL = 9
+_SECTION_NOTES_COL = 10
+
+_SHOW_EVENTS_SETTINGS_KEY = "SubseaCableTools/BurialPlanner/builder_show_events"
 
 _STATUS_COLORS = {
     schema.EVENT_STATUS_CANDIDATE: QColor("#b36b00"),
@@ -157,6 +161,16 @@ class BuilderTab(QWidget):
             "in the change log and does not resample bathymetry.")
         self.undo_button.clicked.connect(self._undo_last_edit)
         run_row.addWidget(self.undo_button)
+        self.show_events_check = QCheckBox("Show events")
+        self.show_events_check.setToolTip(
+            "Show the PLDN/PLUP event list alongside the Sections table. "
+            "Sections are the primary working view; open the event list to "
+            "add, nudge, confirm, lock or delete individual boundary "
+            "events. The setting is remembered.")
+        self.show_events_check.setChecked(
+            QSettings().value(_SHOW_EVENTS_SETTINGS_KEY, False, type=bool))
+        self.show_events_check.toggled.connect(self._set_events_visible)
+        run_row.addWidget(self.show_events_check)
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setVisible(False)
@@ -171,7 +185,8 @@ class BuilderTab(QWidget):
 
         splitter = QSplitter(_VERTICAL)
 
-        events_widget = QWidget()
+        self.events_widget = QWidget()
+        events_widget = self.events_widget
         events_layout = QVBoxLayout(events_widget)
         events_layout.setContentsMargins(0, 0, 0, 0)
         events_layout.addWidget(QLabel("Events"))
@@ -180,8 +195,7 @@ class BuilderTab(QWidget):
         self.events_table.verticalHeader().setVisible(False)
         self.events_table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
         self.events_table.setSelectionMode(SELECTION_MODE_EXTENDED)
-        self.events_table.horizontalHeader().setSectionResizeMode(
-            len(_EVENT_COLUMNS) - 1, HEADER_RESIZE_MODE_STRETCH)
+        self.events_table.horizontalHeader().setStretchLastSection(True)
         self.events_table.itemChanged.connect(self._on_event_item_changed)
         self.events_table.itemSelectionChanged.connect(self._on_event_selected)
         self.events_table.setContextMenuPolicy(CONTEXT_MENU_POLICY_CUSTOM)
@@ -225,17 +239,14 @@ class BuilderTab(QWidget):
             event_buttons.addWidget(button)
         event_buttons.addWidget(self.nudge_spin)
         event_buttons.addSpacing(12)
-        for label, slot in (("Confirm", self._confirm_selected),
-                            ("Confirm all", self._confirm_all),
-                            ("Lock", lambda: self._lock_selected(True)),
-                            ("Unlock", lambda: self._lock_selected(False)),
-                            ("Delete", self._delete_selected)):
-            button = QPushButton(label)
-            button.clicked.connect(slot)
-            event_buttons.addWidget(button)
+        confirm_all_button = QPushButton("Confirm all")
+        confirm_all_button.setToolTip(
+            "Confirm every candidate event. Confirm, lock, unlock and "
+            "delete for a selection are on the row's right-click menu.")
+        confirm_all_button.clicked.connect(self._confirm_all)
+        event_buttons.addWidget(confirm_all_button)
         event_buttons.addStretch(1)
         events_layout.addLayout(event_buttons)
-        splitter.addWidget(events_widget)
 
         sections_widget = QWidget()
         sections_layout = QVBoxLayout(sections_widget)
@@ -246,8 +257,10 @@ class BuilderTab(QWidget):
         self.sections_table.verticalHeader().setVisible(False)
         self.sections_table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
         self.sections_table.setSelectionMode(SELECTION_MODE_EXTENDED)
-        self.sections_table.horizontalHeader().setSectionResizeMode(
-            _SECTION_REASONS_COL, HEADER_RESIZE_MODE_STRETCH)
+        # Every column stays user-resizable (Stretch mode would lock it);
+        # the trailing Notes column absorbs the remaining width.
+        self.sections_table.horizontalHeader().setStretchLastSection(True)
+        self.sections_table.setColumnWidth(_SECTION_REASONS_COL, 240)
         self.sections_table.itemSelectionChanged.connect(self._on_section_selected)
         self.sections_table.itemChanged.connect(self._on_section_item_changed)
         self.sections_table.setContextMenuPolicy(CONTEXT_MENU_POLICY_CUSTOM)
@@ -258,33 +271,38 @@ class BuilderTab(QWidget):
         sections_layout.addWidget(self.sections_table, 1)
 
         section_hint = QLabel(
-            "Select 2+ Candidate Plough Sections or 2+ Plough Skips to merge. "
-            "Use Split / insert to create an explicit opposite section with "
-            "two adjustable PLDN/PLUP boundaries.")
+            "Set conclusion and confidence in the table (or right-click a "
+            "selection to set several at once, mark final, split or merge). "
+            "Select 2+ sections of the same kind to merge.")
         section_hint.setWordWrap(True)
         section_hint.setStyleSheet("color: #666;")
         sections_layout.addWidget(section_hint)
         section_buttons = QHBoxLayout()
         for label, slot in (("Split / insert opposite…", self._split_section),
                             ("Merge selected sections", self._merge_sections),
-                            ("Set conclusion…", self._set_conclusion),
-                            ("Set confidence…", self._set_confidence),
-                            ("Mark final", lambda: self._set_state(schema.SECTION_STATE_FINAL)),
-                            ("Mark candidate", lambda: self._set_state(schema.SECTION_STATE_CANDIDATE)),
                             ("Auto-assign skip handling…", self._auto_assign_skip_handling)):
             button = QPushButton(label)
             button.clicked.connect(slot)
             section_buttons.addWidget(button)
         section_buttons.addStretch(1)
         sections_layout.addLayout(section_buttons)
+
         splitter.addWidget(sections_widget)
+        splitter.addWidget(events_widget)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
         layout.addWidget(splitter, 1)
+        events_widget.setVisible(self.show_events_check.isChecked())
 
         model.planChanged.connect(self.refresh)
         model.eventsChanged.connect(self.refresh)
         model.sectionsChanged.connect(self._refresh_sections)
         model.logChanged.connect(self._refresh_undo_state)
         self.refresh()
+
+    def _set_events_visible(self, visible: bool) -> None:
+        QSettings().setValue(_SHOW_EVENTS_SETTINGS_KEY, bool(visible))
+        self.events_widget.setVisible(bool(visible))
 
     # -- progress hooks (driven by the dock) ----------------------------------
     def analysis_started(self) -> None:
@@ -421,8 +439,6 @@ class BuilderTab(QWidget):
                    "No manual changes were found — this simply rebuilds the "
                    "plan from the Exclusion stack.")
 
-        from qgis.PyQt.QtWidgets import QCheckBox, QVBoxLayout
-
         dialog = QDialog(self)
         dialog.setWindowTitle("Regenerate fresh")
         layout = QVBoxLayout(dialog)
@@ -470,18 +486,28 @@ class BuilderTab(QWidget):
         self._loading = True
         try:
             sections = self.model.sections
+            refs = schema.section_refs(sections, self.model.direction,
+                                       self.model.method)
+            ref_legend = schema.section_ref_legend(self.model.method)
             self.sections_table.setRowCount(len(sections))
             for i, section in enumerate(sections):
                 reasons = self._reason_text(section)
+                section_id = section.get("section_id")
                 is_skip = section.get("kind") == schema.SECTION_SKIP
+                # Insufficient Information rows keep their fixed conclusion
+                # as plain text; burial and skip rows edit in-table.
+                editable = section.get("kind") in (schema.SECTION_BURIAL,
+                                                   schema.SECTION_SKIP)
                 values = [
+                    refs.get(str(section_id or ""), ""),
                     self._kind_label(section.get("kind") or ""),
                     schema.format_kp(section.get("start_kp")),
                     schema.format_kp(section.get("end_kp")),
                     schema.format_kp(section.get("length_km")),
                     section.get("state") or "",
-                    schema.CONCLUSION_LABELS.get(section.get("conclusion") or "", ""),
-                    section.get("confidence") or "",
+                    "" if editable else schema.CONCLUSION_LABELS.get(
+                        section.get("conclusion") or "", ""),
+                    "" if editable else (section.get("confidence") or ""),
                     "",  # skip handling: combo widget on skip rows
                     reasons,
                     section.get("notes") or "",
@@ -493,32 +519,61 @@ class BuilderTab(QWidget):
                         flags |= Qt.ItemFlag.ItemIsEditable
                     item.setFlags(flags)
                     if j == 0:
-                        item.setData(ITEM_DATA_USER_ROLE, section.get("section_id"))
+                        item.setData(ITEM_DATA_USER_ROLE, section_id)
+                        item.setToolTip(ref_legend)
                     if j == _SECTION_REASONS_COL:
                         item.setToolTip(reasons)
+                    if j == _SECTION_NOTES_COL and value:
+                        item.setToolTip(value)
                     self.sections_table.setItem(i, j, item)
+                if editable:
+                    self._add_section_combo(
+                        i, _SECTION_CONCLUSION_COL, section_id, "conclusion",
+                        [(c, schema.CONCLUSION_LABELS[c])
+                         for c in [""] + schema.CONCLUSIONS],
+                        section.get("conclusion") or "",
+                        "Operating-envelope conclusion. Right-click a "
+                        "selection to set several sections at once.")
+                    self._add_section_combo(
+                        i, _SECTION_CONFIDENCE_COL, section_id, "confidence",
+                        [("", "")] + [(v, v) for v in schema.CONFIDENCE_VALUES],
+                        section.get("confidence") or "",
+                        "Evidence confidence. Right-click a selection to "
+                        "set several sections at once.")
+                else:
+                    self.sections_table.removeCellWidget(
+                        i, _SECTION_CONCLUSION_COL)
+                    self.sections_table.removeCellWidget(
+                        i, _SECTION_CONFIDENCE_COL)
                 if is_skip:
-                    combo = QComboBox()
-                    for handling in schema.SKIP_HANDLING_VALUES:
-                        combo.addItem(schema.SKIP_HANDLING_LABELS[handling],
-                                      handling)
-                    combo.setToolTip(
+                    self._add_section_combo(
+                        i, _SECTION_SKIP_HANDLING_COL, section_id,
+                        "skip_handling",
+                        [(h, schema.SKIP_HANDLING_LABELS[h])
+                         for h in schema.SKIP_HANDLING_VALUES],
+                        section.get("skip_handling") or "",
                         "How this skip is executed: recover the plough to "
                         "deck, or transit with the plough suspended "
                         "mid-water. TBC until decided.")
-                    index = combo.findData(section.get("skip_handling") or "")
-                    combo.setCurrentIndex(max(0, index))
-                    combo.currentIndexChanged.connect(
-                        lambda _index, c=combo,
-                        sid=section.get("section_id"):
-                        self._set_skip_handling(sid, c.currentData()))
-                    self.sections_table.setCellWidget(
-                        i, _SECTION_SKIP_HANDLING_COL, combo)
                 else:
                     self.sections_table.removeCellWidget(
                         i, _SECTION_SKIP_HANDLING_COL)
         finally:
             self._loading = False
+
+    def _add_section_combo(self, row: int, column: int, section_id: str,
+                           field: str, options, current: str,
+                           tooltip: str = "") -> None:
+        combo = QComboBox()
+        for value, label in options:
+            combo.addItem(label, value)
+        combo.setCurrentIndex(max(0, combo.findData(current or "")))
+        if tooltip:
+            combo.setToolTip(tooltip)
+        combo.currentIndexChanged.connect(
+            lambda _index, c=combo, sid=section_id, f=field:
+            self._deferred_section_edit(sid, f, c.currentData()))
+        self.sections_table.setCellWidget(row, column, combo)
 
     def _kind_label(self, kind: str) -> str:
         plough = self.model.method == schema.METHOD_PLOUGH
@@ -634,22 +689,38 @@ class BuilderTab(QWidget):
         event = self._event_for_row(row) if row >= 0 else None
         if event is None:
             return
+        count = len(self._selected_event_ids())
         menu = QMenu(self)
         go_action = menu.addAction(
             f"Go to {ev.event_label(event.get('event_type') or '', self.model.method)} "
             f"at KP {schema.format_kp(event.get('kp'))}")
         scope_action = menu.addAction("Show full plan scope")
+        menu.addSeparator()
+        confirm_action = menu.addAction(f"Confirm {count} event(s)")
+        lock_action = menu.addAction(f"Lock {count} event(s)")
+        unlock_action = menu.addAction(f"Unlock {count} event(s)")
+        delete_action = menu.addAction(f"Delete {count} event(s)…")
         chosen = qt_exec(menu, self.events_table.viewport().mapToGlobal(position))
         if chosen == go_action:
             self._goto_event_row(row)
         elif chosen == scope_action:
             self.dock.show_plan_scope()
+        elif chosen == confirm_action:
+            self._confirm_selected()
+        elif chosen == lock_action:
+            self._lock_selected(True)
+        elif chosen == unlock_action:
+            self._lock_selected(False)
+        elif chosen == delete_action:
+            self._delete_selected()
 
     def _section_context_menu(self, position) -> None:
         row = self._context_row(self.sections_table, position)
         section = self._section_for_row(row) if row >= 0 else None
         if section is None:
             return
+        selected_count = len(self._selected_section_ids())
+        suffix = f" ({selected_count} selected)" if selected_count > 1 else ""
         menu = QMenu(self)
         go_action = menu.addAction("Go to section on map and profile")
         start_action = menu.addAction(
@@ -658,10 +729,32 @@ class BuilderTab(QWidget):
             f"Go to end KP {schema.format_kp(section.get('end_kp'))}")
         scope_action = menu.addAction("Show full plan scope")
         menu.addSeparator()
+        conclusion_menu = menu.addMenu(f"Set conclusion{suffix}")
+        conclusion_actions = {}
+        for value in [""] + schema.CONCLUSIONS:
+            label = schema.CONCLUSION_LABELS[value] or "(clear)"
+            conclusion_actions[conclusion_menu.addAction(label)] = value
+        confidence_menu = menu.addMenu(f"Set confidence{suffix}")
+        confidence_actions = {}
+        for value in [""] + schema.CONFIDENCE_VALUES:
+            confidence_actions[confidence_menu.addAction(value or "(clear)")] = value
+        skip_menu = menu.addMenu(f"Set skip handling{suffix}")
+        skip_actions = {}
+        for value in schema.SKIP_HANDLING_VALUES:
+            skip_actions[skip_menu.addAction(
+                schema.SKIP_HANDLING_LABELS[value])] = value
+        wanted = set(self._selected_section_ids())
+        skip_menu.setEnabled(any(
+            s.get("kind") == schema.SECTION_SKIP
+            for s in self.model.sections if s.get("section_id") in wanted))
+        notes_action = menu.addAction(f"Set notes{suffix}…")
+        final_action = menu.addAction(f"Mark final{suffix}")
+        candidate_action = menu.addAction(f"Mark candidate{suffix}")
+        menu.addSeparator()
         split_action = menu.addAction("Split / insert opposite section…")
-        split_action.setEnabled(len(self._selected_section_ids()) == 1)
+        split_action.setEnabled(selected_count == 1)
         merge_action = menu.addAction("Merge selected sections…")
-        merge_action.setEnabled(len(self._selected_section_ids()) >= 2)
+        merge_action.setEnabled(selected_count >= 2)
         chosen = qt_exec(menu, self.sections_table.viewport().mapToGlobal(position))
         if chosen == go_action:
             self._goto_section_row(row)
@@ -671,6 +764,24 @@ class BuilderTab(QWidget):
             self.dock.goto_kp(float(section.get("end_kp") or 0.0))
         elif chosen == scope_action:
             self.dock.show_plan_scope()
+        elif chosen in conclusion_actions:
+            self._apply_section_field("conclusion", conclusion_actions[chosen])
+        elif chosen in confidence_actions:
+            self._apply_section_field("confidence", confidence_actions[chosen])
+        elif chosen in skip_actions:
+            self._apply_section_field("skip_handling", skip_actions[chosen])
+        elif chosen == notes_action:
+            text, ok = QInputDialog.getText(
+                self, "Set notes",
+                f"Notes for the {len(wanted)} selected section(s) "
+                "(replaces existing notes):",
+                QLineEdit.EchoMode.Normal, section.get("notes") or "")
+            if ok:
+                self._apply_section_field("notes", text)
+        elif chosen == final_action:
+            self._apply_section_field("state", schema.SECTION_STATE_FINAL)
+        elif chosen == candidate_action:
+            self._apply_section_field("state", schema.SECTION_STATE_CANDIDATE)
         elif chosen == split_action:
             self._split_section()
         elif chosen == merge_action:
@@ -716,6 +827,8 @@ class BuilderTab(QWidget):
 
     def set_add_kp(self, kp: float) -> None:
         """Prime the add-event KP (map pick / profile double-click)."""
+        if not self.show_events_check.isChecked():
+            self.show_events_check.setChecked(True)  # reveal the add-event row
         self.add_kp_spin.setValue(round(float(kp), 3))
         self.run_status.setText(
             f"Add-event KP set to {schema.format_kp(kp)} — choose the event "
@@ -808,11 +921,15 @@ class BuilderTab(QWidget):
             self.model.update_section(section_id, {"notes": item.text()},
                                       action=change_log.ACTION_EDIT_SECTION)
 
-    def _set_skip_handling(self, section_id: str, value: str) -> None:
+    def _deferred_section_edit(self, section_id: str, field: str,
+                               value: str) -> None:
+        """Apply one in-table combo edit (conclusion/confidence/skip handling).
+
+        Deferred: update_section rebuilds this table, which would destroy
+        the combo that is still delivering its change signal.
+        """
         if self._loading or not section_id:
             return
-        # Deferred: update_section rebuilds this table, which would destroy
-        # the combo that is still delivering its change signal.
         from qgis.PyQt.QtCore import QTimer
 
         def apply() -> None:
@@ -820,11 +937,13 @@ class BuilderTab(QWidget):
 
             section = next((s for s in self.model.sections
                             if s.get("section_id") == section_id), None)
-            if section is None or (section.get("skip_handling") or "") == (value or ""):
+            if section is None or (section.get(field) or "") == (value or ""):
                 return
-            self.model.update_section(section_id,
-                                      {"skip_handling": value or ""},
-                                      action=change_log.ACTION_EDIT_SECTION)
+            action = (change_log.ACTION_SET_CONCLUSION
+                      if field in ("conclusion", "confidence")
+                      else change_log.ACTION_EDIT_SECTION)
+            self.model.update_section(section_id, {field: value or ""},
+                                      action=action)
 
         QTimer.singleShot(0, apply)
 
@@ -905,9 +1024,6 @@ class BuilderTab(QWidget):
             QMessageBox.information(self, "Burial Planner",
                                     "The plan has no skips to assign.")
             return
-        from qgis.PyQt.QtCore import QSettings
-        from qgis.PyQt.QtWidgets import QCheckBox, QVBoxLayout
-
         settings = QSettings()
         settings_key = "SubseaCableTools/BurialPlanner/skip_transit_max_km"
         dialog = QDialog(self)
@@ -954,33 +1070,30 @@ class BuilderTab(QWidget):
                 f"Assigned skip handling on {changed} skip(s): mid-water "
                 f"transit ≤ {threshold:g} km, recover to deck above.")
 
-    def _set_conclusion(self) -> None:
-        ids = self._selected_section_ids()
-        if not ids:
-            return
-        labels = [schema.CONCLUSION_LABELS[c] for c in [""] + schema.CONCLUSIONS]
-        label, ok = QInputDialog.getItem(self, "Conclusion",
-                                         "Operating-envelope conclusion:", labels, 0, False)
-        if not ok:
-            return
-        value = next((k for k, v in schema.CONCLUSION_LABELS.items() if v == label), "")
-        for section_id in ids:
-            self.model.update_section(section_id, {"conclusion": value})
+    def _apply_section_field(self, field: str, value: str) -> None:
+        """Bulk-apply one field to the selected sections (context menu).
 
-    def _set_confidence(self) -> None:
-        ids = self._selected_section_ids()
-        if not ids:
-            return
-        value, ok = QInputDialog.getItem(self, "Confidence", "Evidence confidence:",
-                                         [""] + schema.CONFIDENCE_VALUES, 0, False)
-        if not ok:
-            return
-        for section_id in ids:
-            self.model.update_section(section_id, {"confidence": value})
-
-    def _set_state(self, state: str) -> None:
+        Rows the field does not apply to are skipped: Insufficient
+        Information rows keep their fixed conclusion/confidence and skip
+        handling only exists on skips. State and notes apply to every
+        selected row.
+        """
         from .. import change_log
 
-        for section_id in self._selected_section_ids():
-            self.model.update_section(section_id, {"state": state},
-                                      action=change_log.ACTION_EDIT_SECTION)
+        action = (change_log.ACTION_SET_CONCLUSION
+                  if field in ("conclusion", "confidence")
+                  else change_log.ACTION_EDIT_SECTION)
+        wanted = set(self._selected_section_ids())
+        for section in self.model.sections:
+            section_id = section.get("section_id")
+            if section_id not in wanted:
+                continue
+            if field in ("conclusion", "confidence") \
+                    and section.get("kind") == schema.SECTION_INSUFFICIENT:
+                continue
+            if field == "skip_handling" \
+                    and section.get("kind") != schema.SECTION_SKIP:
+                continue
+            if (section.get(field) or "") == (value or ""):
+                continue
+            self.model.update_section(section_id, {field: value}, action=action)
