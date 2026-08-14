@@ -40,8 +40,11 @@ def _section(sid, kind, start, end):
 def test_labels() -> bool:
     ok = ev.event_label(START, schema.METHOD_PLOUGH) == "PLDN"
     ok = ok and ev.event_label(END, schema.METHOD_PLOUGH) == "PLUP"
-    ok = ok and ev.event_label(START, schema.METHOD_ROV_JET) == "JET_START"
-    ok = ok and ev.event_label(END, schema.METHOD_ROV_JET) == "JET_STOP"
+    ok = ok and ev.event_label(START, schema.METHOD_TRENCHER) == "TRENCH_START"
+    ok = ok and ev.event_label(END, schema.METHOD_TRENCHER) == "TRENCH_END"
+    # Legacy rov_jet plans resolve through the alias to the trencher labels.
+    ok = ok and ev.event_label(START, schema.METHOD_ROV_JET) == "TRENCH_START"
+    ok = ok and ev.event_label(END, schema.METHOD_ROV_JET) == "TRENCH_END"
     return _result("per-method event labels", ok)
 
 

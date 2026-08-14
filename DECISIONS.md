@@ -236,6 +236,20 @@ section references in brackets.
   time**: Workbench `"jet"` maps to `"rov_jet"` on rule copy/JSON import,
   and `generation._engine_rule` / `analysis_task.build_work` normalise
   stored `methods_json` too, so rules copied before the fix keep firing.
+- **One Trencher method (v7)**: ROV jet and mechanical trenching are not
+  distinguished at the planning level, so `rov_jet` folded into `trencher`
+  — one alias map (`schema._METHOD_ALIASES`) heals old plans/rules/tools at
+  migration and again at read time, and the legacy constant stays defined
+  so old exports keep importing. The v5→v6 "all methods of the day" check
+  normalises through the same map so chained migrations stay correct.
+- **The alter-course risk check is one threshold + one level**: every A/C
+  with course change ≥ X° becomes a hazard at the chosen risk level
+  (config: `min_course_change_deg` + `default_risk`; no attribute rules).
+  The scanner still honours old configs carrying `turn_abs` rules, so
+  nothing breaks until such a check is deliberately re-saved through the
+  simplified editor. An unassigned level is rejected on OK because
+  `scan_route_turns` drops unassessed turns — the check would silently
+  record nothing.
 - **"All methods" is stored as `[]`, and the v6 migration widens legacy
   lists**: pre-v6 rules were stamped with the full method list of the day
   (`["plough","rov_jet"]`), which adding the trencher method would silently

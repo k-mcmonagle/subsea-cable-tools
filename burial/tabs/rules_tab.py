@@ -1377,7 +1377,7 @@ class RulesTab(QWidget):
                                     else schema.CRITERION_PROJECT),
                 "source_ref": "",
                 # The Assessment tool's method ids ("jet") map onto the
-                # Burial Planner vocabulary ("rov_jet") so the per-method
+                # Burial Planner vocabulary ("trencher") so the per-method
                 # rule filter does not silently skip copied rules.
                 "methods_json": _normalised_methods_json(
                     row.get("methods_json")),

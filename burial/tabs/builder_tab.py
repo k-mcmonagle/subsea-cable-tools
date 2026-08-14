@@ -806,6 +806,30 @@ class BuilderTab(QWidget):
         skip_menu.setEnabled(any(
             s.get("kind") == schema.SECTION_SKIP
             for s in self.model.sections if s.get("section_id") in wanted))
+        # Tool + configuration in one gesture: top level for tools without
+        # configurations, a submenu per tool that has them.
+        tool_menu = menu.addMenu(f"Set tool{suffix}")
+        tool_actions = {}
+        default_text = tools_mod.tool_display(self.model.tools,
+                                              self.model.default_tool()[0])
+        tool_actions[tool_menu.addAction(
+            f"Plan default ({default_text or 'none'})")] = ("", "")
+        for tool in self.model.tools:
+            name = tool.get("name") or "?"
+            tool_id = tool.get("tool_id") or ""
+            configs = tools_mod.parse_configs(tool)
+            if configs:
+                sub = tool_menu.addMenu(name)
+                tool_actions[sub.addAction("(no configuration)")] = (tool_id, "")
+                for config in configs:
+                    tool_actions[sub.addAction(
+                        tools_mod.config_label(config) or "?")] = \
+                        (tool_id, config.get("config_id") or "")
+            else:
+                tool_actions[tool_menu.addAction(name)] = (tool_id, "")
+        tool_menu.setEnabled(any(
+            s.get("kind") == schema.SECTION_BURIAL
+            for s in self.model.sections if s.get("section_id") in wanted))
         notes_action = menu.addAction(f"Set notes{suffix}…")
         final_action = menu.addAction(f"Mark final{suffix}")
         candidate_action = menu.addAction(f"Mark candidate{suffix}")
@@ -829,6 +853,8 @@ class BuilderTab(QWidget):
             self._apply_section_field("confidence", confidence_actions[chosen])
         elif chosen in skip_actions:
             self._apply_section_field("skip_handling", skip_actions[chosen])
+        elif chosen in tool_actions:
+            self._apply_section_tool(*tool_actions[chosen])
         elif chosen == notes_action:
             text, ok = QInputDialog.getText(
                 self, "Set notes",
@@ -1171,3 +1197,24 @@ class BuilderTab(QWidget):
             if (section.get(field) or "") == (value or ""):
                 continue
             self.model.update_section(section_id, {field: value}, action=action)
+
+    def _apply_section_tool(self, tool_id: str, config_id: str) -> None:
+        """Bulk-assign tool + configuration to the selected burial sections.
+
+        Skip / Insufficient Information rows in the selection are ignored;
+        PlanModel.update_section stamps the section method from the tool.
+        """
+        from .. import change_log
+
+        wanted = set(self._selected_section_ids())
+        for section in self.model.sections:
+            if section.get("section_id") not in wanted \
+                    or section.get("kind") != schema.SECTION_BURIAL:
+                continue
+            if (section.get("tool_id") or "") == (tool_id or "") \
+                    and (section.get("tool_config_id") or "") == (config_id or ""):
+                continue
+            self.model.update_section(
+                section.get("section_id"),
+                {"tool_id": tool_id, "tool_config_id": config_id},
+                action=change_log.ACTION_EDIT_SECTION)

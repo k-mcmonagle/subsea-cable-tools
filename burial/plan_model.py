@@ -99,7 +99,10 @@ class PlanModel(QObject):
 
     @property
     def method(self) -> str:
-        return self.plan.get("method") or schema.METHOD_PLOUGH
+        # Legacy ids (rov_jet) are healed by migration; normalise anyway so
+        # an un-migrated row can never leak the old vocabulary into the UI.
+        return schema.normalise_method(
+            self.plan.get("method") or "") or schema.METHOD_PLOUGH
 
     @property
     def direction(self) -> int:

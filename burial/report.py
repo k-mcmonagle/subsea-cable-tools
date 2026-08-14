@@ -224,7 +224,7 @@ def build_report_html(plan: Dict,
                       risk_checks: Optional[Sequence[Dict]] = None,
                       tools: Optional[Sequence[Dict]] = None) -> str:
     """Assemble the full report; pure formatting, no QGIS access."""
-    method = plan.get("method") or ""
+    method = schema.normalise_method(plan.get("method") or "")
     status = plan.get("status") or ""
     now = now_utc or schema.utc_now_iso()
     scope_start = float(plan.get("scope_start_kp") or 0.0)

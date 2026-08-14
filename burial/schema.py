@@ -37,7 +37,7 @@ from ..workbench.schema import (  # noqa: F401  (re-exported for the package)
     utc_now_iso,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # Registry table names ------------------------------------------------------
 TABLE_META = "bp_meta"
@@ -62,22 +62,25 @@ META_FIELDS: List[FieldSpec] = [
 
 # Methods -------------------------------------------------------------------
 METHOD_PLOUGH = "plough"
-METHOD_ROV_JET = "rov_jet"
 METHOD_TRENCHER = "trencher"
-METHODS: List[str] = [METHOD_PLOUGH, METHOD_ROV_JET, METHOD_TRENCHER]  # enum open by design
+# Legacy id: ROV jet trenching folded into the single Trencher method
+# (schema v7). Kept as a constant so old data/exports keep resolving.
+METHOD_ROV_JET = "rov_jet"
+METHODS: List[str] = [METHOD_PLOUGH, METHOD_TRENCHER]  # enum open by design
 
 METHOD_LABELS: Dict[str, str] = {
     METHOD_PLOUGH: "Plough",
-    METHOD_ROV_JET: "ROV jet",
     METHOD_TRENCHER: "Trencher",
 }
 
 # Method ids seen in older data / the Workbench Assessment tool, mapped to
 # the Burial Planner vocabulary. Workbench DEFAULT_ASSESSMENT_METHODS uses
-# "jet"; a rule copied from an Assessment must not be silently skipped by
-# the per-method rule filter because of the spelling difference.
+# "jet"; plans/rules written before v7 use "rov_jet". Both mean trencher
+# burial here — a rule or plan must not change behaviour because of the
+# spelling.
 _METHOD_ALIASES: Dict[str, str] = {
-    "jet": METHOD_ROV_JET,
+    "jet": METHOD_TRENCHER,
+    METHOD_ROV_JET: METHOD_TRENCHER,
 }
 
 
@@ -229,10 +232,6 @@ METHOD_EVENT_LABELS: Dict[str, Dict[str, str]] = {
     METHOD_PLOUGH: {
         EVENT_BURIAL_START: "PLDN",
         EVENT_BURIAL_END: "PLUP",
-    },
-    METHOD_ROV_JET: {
-        EVENT_BURIAL_START: "JET_START",
-        EVENT_BURIAL_END: "JET_STOP",
     },
     METHOD_TRENCHER: {
         EVENT_BURIAL_START: "TRENCH_START",

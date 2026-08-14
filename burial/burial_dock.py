@@ -459,8 +459,8 @@ class BurialPlannerDock(QDockWidget):
 
     def _refresh_strip(self) -> None:
         plan = self.model.plan
-        self.method_label.setText(
-            schema.METHOD_LABELS.get(plan.get("method") or "", ""))
+        self.method_label.setText(schema.METHOD_LABELS.get(
+            schema.normalise_method(plan.get("method") or ""), ""))
         status = plan.get("status") or ""
         self.status_badge.setText(status)
         self.status_badge.setStyleSheet(_STATUS_STYLES.get(status, ""))

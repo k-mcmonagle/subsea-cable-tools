@@ -100,8 +100,8 @@ class PlanTab(QWidget):
             self.name_edit.setText(plan.get("name") or "")
             self.description_edit.setText(plan.get("description") or "")
             self.notes_edit.setPlainText(plan.get("notes") or "")
-            self.method_label.setText(
-                schema.METHOD_LABELS.get(plan.get("method") or "", "—"))
+            self.method_label.setText(schema.METHOD_LABELS.get(
+                schema.normalise_method(plan.get("method") or ""), "—"))
             self._refresh_tool_combos()
             self.rpl_label.setText(plan.get("rpl_name") or "—")
             self.rpl_revision_label.setText(plan.get("rpl_revision") or "—")

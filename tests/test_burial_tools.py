@@ -69,12 +69,16 @@ def test_plough_vocabulary_unchanged() -> bool:
 
 
 def test_method_alias_normalisation() -> bool:
-    ok = schema.normalise_method("jet") == schema.METHOD_ROV_JET
+    ok = schema.normalise_method("jet") == schema.METHOD_TRENCHER
+    ok = ok and schema.normalise_method("rov_jet") == schema.METHOD_TRENCHER
     ok = ok and schema.normalise_method("plough") == schema.METHOD_PLOUGH
     ok = ok and schema.normalise_method("surface") == "surface"
-    ok = ok and schema.normalise_methods(["plough", "jet", "jet", ""]) == \
-        [schema.METHOD_PLOUGH, schema.METHOD_ROV_JET]
-    return _result("method alias normalisation (jet -> rov_jet)", ok)
+    ok = ok and schema.normalise_methods(
+        ["plough", "jet", "rov_jet", ""]) == \
+        [schema.METHOD_PLOUGH, schema.METHOD_TRENCHER]
+    ok = ok and schema.METHODS == [schema.METHOD_PLOUGH,
+                                   schema.METHOD_TRENCHER]
+    return _result("method alias normalisation (jet/rov_jet -> trencher)", ok)
 
 
 def test_trencher_event_type_import_aliases() -> bool:
@@ -149,7 +153,7 @@ def test_registry_json_round_trip() -> bool:
         "format": tools_mod.TOOL_REGISTRY_FORMAT, "version": 1,
         "tools": [{"name": "Jet Z", "tool_type": "jet"}]})
     parsed2 = tools_mod.parse_registry_json(hand_edited)
-    ok = ok and parsed2[0]["tool_type"] == schema.METHOD_ROV_JET
+    ok = ok and parsed2[0]["tool_type"] == schema.METHOD_TRENCHER
     ok = ok and bool(parsed2[0]["tool_id"])
     failed = False
     try:

@@ -101,8 +101,11 @@ def test_section_refs_and_csv() -> bool:
     # Direction -1 numbers from the high-KP end (travel order).
     rev = schema.section_refs(sections, direction=-1, method="plough")
     ok = ok and rev["s5"] == "PS-01" and rev["s1"] == "PS-03"
-    # Non-plough methods use the generic burial-section code.
-    generic = schema.section_refs(sections, direction=1, method="rov_jet")
+    # Legacy rov_jet aliases to trencher (TS codes); unknown methods fall
+    # back to the generic burial-section code.
+    trench = schema.section_refs(sections, direction=1, method="rov_jet")
+    ok = ok and trench["s1"] == "TS-01" and trench["s2"] == "SK-01"
+    generic = schema.section_refs(sections, direction=1, method="")
     ok = ok and generic["s1"] == "BS-01" and generic["s2"] == "SK-01"
     # The sections CSV carries the ref as its first column.
     text = io_csv.sections_csv(_plan(), sections, "gen-1")

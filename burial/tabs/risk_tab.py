@@ -149,8 +149,34 @@ class CheckEditorDialog(QDialog):
         form.addRow("Label attribute:", self.label_edit)
         layout.addLayout(form)
 
-        bands = QGroupBox("Risk from proximity (nearest approach)")
-        bands_form = QFormLayout(bands)
+        # Alter-course mode is deliberately simple: one threshold, one risk
+        # level (set below). Main consequence of a sharp A/C is the burial
+        # tool running off route at the turn.
+        self.turns_group = QGroupBox("A/C course-change check")
+        turns_form = QFormLayout(self.turns_group)
+        self.min_cc_spin = QDoubleSpinBox()
+        self.min_cc_spin.setRange(0.0, 180.0)
+        self.min_cc_spin.setDecimals(1)
+        self.min_cc_spin.setSuffix(" °")
+        self.min_cc_spin.setValue(
+            float(config.get("min_course_change_deg") or 0.5))
+        self.min_cc_spin.setToolTip(
+            "Every A/C whose course change is at least this angle is "
+            "recorded as a hazard at the risk level chosen below; smaller "
+            "course changes are ignored.")
+        turns_form.addRow("Flag course changes of at least:", self.min_cc_spin)
+        turns_note = QLabel(
+            "Flagged A/Cs are recorded as hazards at the risk level below — "
+            "the main consequence is running off route at the turn. The "
+            "threshold is your criterion (e.g. from the tool's minimum "
+            "turning radius); record its source underneath.")
+        turns_note.setWordWrap(True)
+        turns_note.setStyleSheet("color: #666;")
+        turns_form.addRow(turns_note)
+        layout.addWidget(self.turns_group)
+
+        self.bands_group = QGroupBox("Risk from proximity (nearest approach)")
+        bands_form = QFormLayout(self.bands_group)
         self.band_spins: Dict[str, QDoubleSpinBox] = {}
         for key, label in (("band_high_m", "High within:"),
                            ("band_medium_m", "Medium within:"),
@@ -170,20 +196,10 @@ class CheckEditorDialog(QDialog):
         bands_note.setWordWrap(True)
         bands_note.setStyleSheet("color: #666;")
         bands_form.addRow(bands_note)
-        layout.addWidget(bands)
+        layout.addWidget(self.bands_group)
 
-        attr = QGroupBox("Risk from an attribute (optional)")
-        attr_form = QFormLayout(attr)
-        self.min_cc_spin = QDoubleSpinBox()
-        self.min_cc_spin.setRange(0.0, 180.0)
-        self.min_cc_spin.setDecimals(1)
-        self.min_cc_spin.setSuffix(" °")
-        self.min_cc_spin.setValue(
-            float(config.get("min_course_change_deg") or 0.5))
-        self.min_cc_spin.setToolTip(
-            "Course changes below this are treated as route noise and never "
-            "assessed (matches the Extract A/C Points minimum).")
-        attr_form.addRow("Ignore course changes below:", self.min_cc_spin)
+        self.attr_group = QGroupBox("Risk from an attribute (optional)")
+        attr_form = QFormLayout(self.attr_group)
         self.attribute_edit = QLineEdit(config.get("attribute") or "")
         self.attribute_edit.setPlaceholderText(
             "e.g. Height_m, Class, Diameter")
@@ -213,9 +229,10 @@ class CheckEditorDialog(QDialog):
         rule_buttons.addWidget(remove_rule)
         rule_buttons.addStretch(1)
         attr_form.addRow("", rule_buttons)
-        layout.addWidget(attr)
+        layout.addWidget(self.attr_group)
 
         tail = QFormLayout()
+        self.tail_form = tail
         self.default_combo = QComboBox()
         for level in [schema.RISK_UNASSIGNED] + schema.RISK_LEVELS:
             self.default_combo.addItem(schema.RISK_LABELS[level], level)
@@ -235,28 +252,39 @@ class CheckEditorDialog(QDialog):
 
         buttons = QDialogButtonBox()
         buttons.setStandardButtons(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
-        buttons.accepted.connect(self.accept)
+        buttons.accepted.connect(self._accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
         self._sync_kind()
 
+    def _accept(self) -> None:
+        turns = self.kind_combo.currentData() == risk_scan.CHECK_KIND_ROUTE_TURNS
+        if turns and not (self.default_combo.currentData() or ""):
+            QMessageBox.warning(
+                self, "Burial Planner",
+                "Choose a risk level for flagged A/Cs — with it unassigned "
+                "the check records nothing.")
+            return
+        self.accept()
+
     def _sync_kind(self) -> None:
         turns = self.kind_combo.currentData() == risk_scan.CHECK_KIND_ROUTE_TURNS
+        self.turns_group.setVisible(turns)
+        self.bands_group.setVisible(not turns)
+        self.attr_group.setVisible(not turns)
         for widget in (self.input_combo, self.distance_spin,
                        self.filter_edit, self.label_edit):
             widget.setEnabled(not turns)
-        for spin in self.band_spins.values():
-            spin.setEnabled(not turns)
-        self.min_cc_spin.setEnabled(turns)
-        self.attribute_edit.setEnabled(not turns)
-        if turns:
-            self.attribute_edit.setText(risk_scan.TURN_ABS_ATTR)
-            self.attribute_edit.setToolTip(
-                "Fixed for alter-course checks: rules assess the course-"
-                "change magnitude in degrees (e.g. '25-' → High for turns "
-                "of 25° or more).")
-            if not self.name_edit.text().strip():
-                self.name_edit.setPlaceholderText("A/C course change")
+        risk_label = self.tail_form.labelForField(self.default_combo)
+        if risk_label is not None:
+            risk_label.setText("Risk for flagged A/Cs:" if turns
+                               else "Risk when nothing fires:")
+        self.default_combo.setToolTip(
+            "Every flagged A/C is recorded at this level." if turns else
+            "Applied when a feature is inside the search distance but no "
+            "band or attribute rule fires.")
+        if turns and not self.name_edit.text().strip():
+            self.name_edit.setPlaceholderText("A/C course change")
 
     def _append_rule_row(self, text: str, level: str) -> None:
         row = self.rules_table.rowCount()
@@ -283,7 +311,9 @@ class CheckEditorDialog(QDialog):
             "default_risk": self.default_combo.currentData() or "",
         }
         if turns:
-            config["attribute"] = risk_scan.TURN_ABS_ATTR
+            # Simple by design: every A/C at or above the threshold becomes
+            # a hazard at default_risk. (Older configs with turn_abs
+            # attribute rules keep scanning unchanged until re-saved here.)
             config["min_course_change_deg"] = self.min_cc_spin.value()
         else:
             config.update({
@@ -296,17 +326,17 @@ class CheckEditorDialog(QDialog):
             for key, spin in self.band_spins.items():
                 if spin.value() > 0:
                     config[key] = spin.value()
-        rules: List[Dict] = []
-        for row in range(self.rules_table.rowCount()):
-            item = self.rules_table.item(row, 0)
-            combo = self.rules_table.cellWidget(row, 1)
-            level = combo.currentData() if combo is not None else ""
-            rule = risk.parse_attribute_rule(
-                item.text() if item is not None else "", level or "")
-            if rule is not None:
-                rules.append(rule)
-        if rules:
-            config["attribute_rules"] = rules
+            rules: List[Dict] = []
+            for row in range(self.rules_table.rowCount()):
+                item = self.rules_table.item(row, 0)
+                combo = self.rules_table.cellWidget(row, 1)
+                level = combo.currentData() if combo is not None else ""
+                rule = risk.parse_attribute_rule(
+                    item.text() if item is not None else "", level or "")
+                if rule is not None:
+                    rules.append(rule)
+            if rules:
+                config["attribute_rules"] = rules
         default_name = "A/C course change" if turns else "Risk check"
         check = dict(self.check)
         check.update({

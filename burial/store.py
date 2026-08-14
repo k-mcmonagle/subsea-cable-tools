@@ -603,7 +603,10 @@ def _migrate_v5_to_v6(store: BurialStore) -> None:
                 row[col] = ""
     store._write_table_rows(schema.TABLE_SECTION, schema.SECTION_FIELDS, rows)
 
-    pre_v6_all = {schema.METHOD_PLOUGH, schema.METHOD_ROV_JET}
+    # Normalised through the alias map so this step keeps working after
+    # later vocabulary changes (v7 folded rov_jet into trencher).
+    pre_v6_all = set(schema.normalise_methods(
+        [schema.METHOD_PLOUGH, schema.METHOD_ROV_JET]))
     rule_rows = store.read_table(schema.TABLE_RULE)
     changed = False
     for row in rule_rows:
@@ -621,9 +624,51 @@ def _migrate_v5_to_v6(store: BurialStore) -> None:
                                 rule_rows)
 
 
+def _migrate_v6_to_v7(store: BurialStore) -> None:
+    """Fold the ROV-jet method into Trencher across stored rows.
+
+    ``rov_jet`` plans/sections/tools become ``trencher`` (labels change from
+    JET_START/JET_STOP to TRENCH_START/TRENCH_END; the stored event types
+    were always the generic BURIAL_START/END, so events need no rewrite),
+    and rule method filters are re-spelled in the same vocabulary.
+    """
+    for table, fields, column in (
+            (schema.TABLE_PLAN, schema.PLAN_FIELDS, "method"),
+            (schema.TABLE_SECTION, schema.SECTION_FIELDS, "method"),
+            (schema.TABLE_TOOL, schema.TOOL_FIELDS, "tool_type")):
+        rows = store.read_table(table)
+        changed = False
+        for row in rows:
+            value = row.get(column) or ""
+            healed = schema.normalise_method(value)
+            if healed != value:
+                row[column] = healed
+                changed = True
+        if changed:
+            store._write_table_rows(table, fields, rows)
+
+    rule_rows = store.read_table(schema.TABLE_RULE)
+    changed = False
+    for row in rule_rows:
+        raw = row.get("methods_json") or "[]"
+        try:
+            methods = json.loads(raw)
+        except (ValueError, TypeError):
+            methods = []
+        if not isinstance(methods, list):
+            methods = []
+        healed = json.dumps(schema.normalise_methods(methods))
+        if methods and healed != json.dumps([str(m) for m in methods]):
+            row["methods_json"] = healed
+            changed = True
+    if changed:
+        store._write_table_rows(schema.TABLE_RULE, schema.RULE_FIELDS,
+                                rule_rows)
+
+
 # Maps a starting schema version to the function upgrading it one step.
 MIGRATIONS: Dict[int, object] = {1: _migrate_v1_to_v2, 3: _migrate_v3_to_v4,
-                                 5: _migrate_v5_to_v6}
+                                 5: _migrate_v5_to_v6, 6: _migrate_v6_to_v7}
 
 
 def _normalise_row(row: Dict) -> Dict:

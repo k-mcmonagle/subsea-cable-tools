@@ -50,7 +50,7 @@ def metadata_lines(plan: Dict, generation_id: str = "") -> List[str]:
         f"# rpl: {plan.get('rpl_name') or ''}",
         f"# rpl_revision: {plan.get('rpl_revision') or ''}",
         f"# rpl_id: {plan.get('rpl_id') or ''}",
-        f"# method: {plan.get('method') or ''}",
+        f"# method: {schema.normalise_method(plan.get('method') or '')}",
         f"# direction: {'A-B' if int(plan.get('direction') or 1) >= 0 else 'B-A'}",
         f"# scope_kp: {schema.format_kp(plan.get('scope_start_kp'))}-"
         f"{schema.format_kp(plan.get('scope_end_kp'))}",
@@ -60,7 +60,7 @@ def metadata_lines(plan: Dict, generation_id: str = "") -> List[str]:
 
 
 def events_csv(plan: Dict, events: Sequence[Dict], generation_id: str = "") -> str:
-    method = plan.get("method") or ""
+    method = schema.normalise_method(plan.get("method") or "")
     buf = io.StringIO()
     for line in metadata_lines(plan, generation_id):
         buf.write(line + "\r\n")
