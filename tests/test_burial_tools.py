@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 
 from ..burial import events as ev
+from ..burial import geometry2d
 from ..burial import io_csv, schema
 from ..burial import tools as tools_mod
 
@@ -193,6 +194,50 @@ def test_sections_csv_tool_column() -> bool:
     return _result("sections CSV carries the resolved tool", ok)
 
 
+def test_tool_at_kp() -> bool:
+    tool = _tool()
+    other = _tool("t2", "Trencher Y", schema.METHOD_TRENCHER, [])
+    plan = {"params_json": json.dumps({"tool_id": "t1"})}
+    sections = [
+        {"kind": schema.SECTION_BURIAL, "start_kp": 0.0, "end_kp": 2.0,
+         "tool_id": ""},
+        {"kind": schema.SECTION_SKIP, "start_kp": 2.0, "end_kp": 3.0},
+        {"kind": schema.SECTION_BURIAL, "start_kp": 3.0, "end_kp": 5.0,
+         "tool_id": "t2"},
+    ]
+    tools = [tool, other]
+    ok = tools_mod.tool_at_kp(sections, plan, tools, 1.0) is tool  # inherit
+    ok = ok and tools_mod.tool_at_kp(sections, plan, tools, 4.0) is other
+    ok = ok and tools_mod.tool_at_kp(sections, plan, tools, 2.5) is tool  # skip -> default
+    ok = ok and tools_mod.tool_at_kp(sections, {}, [tool], 2.5) is None
+    return _result("effective tool at KP (section override, default)", ok)
+
+
+def test_placement_maths() -> bool:
+    close = lambda a, b: abs(a - b) < 1e-9
+    # Heading: clockwise from grid north.
+    ok = close(geometry2d.grid_heading_deg((0, 0), (0, 10)), 0.0)     # north
+    ok = ok and close(geometry2d.grid_heading_deg((0, 0), (10, 0)), 90.0)   # east
+    ok = ok and close(geometry2d.grid_heading_deg((0, 0), (0, -10)), 180.0)  # south
+    ok = ok and close(geometry2d.grid_heading_deg((0, 0), (-10, 0)), 270.0)  # west
+    ok = ok and close(geometry2d.grid_heading_deg((5, 5), (5, 5)), 0.0)
+    # Placement: body +Y ends up along the heading; +X is starboard.
+    fwd, stbd = (0.0, 1.0), (1.0, 0.0)
+    north = geometry2d.place_points([fwd, stbd], 0.0, (100.0, 200.0))
+    ok = ok and close(north[0][0], 100.0) and close(north[0][1], 201.0)
+    ok = ok and close(north[1][0], 101.0) and close(north[1][1], 200.0)
+    east = geometry2d.place_points([fwd, stbd], 90.0, (0.0, 0.0))
+    ok = ok and close(east[0][0], 1.0) and close(east[0][1], 0.0)   # fwd -> east
+    ok = ok and close(east[1][0], 0.0) and close(east[1][1], -1.0)  # stbd -> south
+    # KP helpers.
+    ok = ok and geometry2d.parse_kp_list(" 3.0, 1.5; 3.0 bad ") == [1.5, 3.0]
+    series = geometry2d.kp_series(0.0, 1.0, 250.0)
+    ok = ok and series == [0.0, 0.25, 0.5, 0.75, 1.0]
+    ok = ok and geometry2d.kp_series(2.0, 2.0, 100.0) == [2.0]
+    ok = ok and geometry2d.kp_series(5.0, 6.0, 0.0) == [5.0]
+    return _result("footprint placement maths (heading, rotation, KP lists)", ok)
+
+
 def run_all() -> list:
     return [
         test_trencher_vocabulary(),
@@ -204,6 +249,8 @@ def run_all() -> list:
         test_section_tool_inheritance(),
         test_registry_json_round_trip(),
         test_sections_csv_tool_column(),
+        test_tool_at_kp(),
+        test_placement_maths(),
     ]
 
 

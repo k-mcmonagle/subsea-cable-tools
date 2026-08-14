@@ -135,6 +135,27 @@ def section_tool_display(section: Dict, plan: Optional[Dict],
     return ""
 
 
+def tool_at_kp(sections: Sequence[Dict], plan: Optional[Dict],
+               tools: Sequence[Dict], kp_km: float) -> Optional[Dict]:
+    """The effective tool row at a KP: the containing burial section's
+    assignment (blank = plan default), else the plan default tool."""
+    tool_id = ""
+    for section in sections or []:
+        if (section.get("kind") or "") != schema.SECTION_BURIAL:
+            continue
+        try:
+            start = float(section.get("start_kp"))
+            end = float(section.get("end_kp"))
+        except (TypeError, ValueError):
+            continue
+        if min(start, end) - 1e-9 <= float(kp_km) <= max(start, end) + 1e-9:
+            tool_id = str(section.get("tool_id") or "")
+            break
+    if not tool_id:
+        tool_id, _config = plan_default_tool(plan)
+    return tool_by_id(tools, tool_id)
+
+
 # ---------------------------------------------------------------------------
 # JSON registry import/export (the rule-set format precedent)
 # ---------------------------------------------------------------------------

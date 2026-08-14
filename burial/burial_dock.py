@@ -17,8 +17,14 @@ from __future__ import annotations
 import os
 from typing import Dict, List, Optional
 
-from qgis.core import QgsApplication, QgsCoordinateTransform, QgsProject
+from qgis.core import (
+    QgsApplication,
+    QgsCoordinateTransform,
+    QgsGeometry,
+    QgsProject,
+)
 from qgis.gui import QgsVertexMarker, QgsRubberBand
+from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtCore import QSettings, Qt
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
@@ -64,7 +70,8 @@ from ..qgis_compat import (
 from ..workbench import project_layers as wb_project_layers
 from ..workbench import store as wb_store_module
 from ..workbench.store import WorkbenchStore
-from . import analysis_task, generation, map_layers, profile_data, schema
+from . import analysis_task, footprint, generation, map_layers, profile_data, schema
+from . import tools as tools_mod
 from .plan_model import PlanModel
 from .profile_widget import BurialProfileWidget
 from .store import (
@@ -132,6 +139,8 @@ class BurialPlannerDock(QDockWidget):
         self._fresh_keep_client = True
         self._marker = None
         self._band = None
+        self._footprint_band = None
+        self._footprint_cache: Dict[str, object] = {}  # tool_id -> QgsGeometry
         self._exclusion_bands: List = []
         self._pick_tool = None
         self._store_recovery_note = ""
@@ -210,6 +219,18 @@ class BurialPlannerDock(QDockWidget):
             if self.profile_drag_toggle.isChecked() else "")
         self.profile_drag_toggle.toggled.connect(self._profile_drag_toggled)
         profile_status_row.addWidget(self.profile_drag_toggle)
+        self.footprint_toggle = QCheckBox("Tool outline")
+        self.footprint_toggle.setChecked(bool(QSettings().value(
+            "SubseaCableTools/BurialPlanner/tool_footprint_visible", False,
+            type=bool)))
+        self.footprint_toggle.setToolTip(
+            "Show the effective burial tool's footprint on the map, to "
+            "scale, at the hovered/selected profile KP — instant scale "
+            "context for seabed features. Uses the section's tool (or the "
+            "plan default); the tool needs a DXF footprint registered on "
+            "the Burial Tools tab.")
+        self.footprint_toggle.toggled.connect(self._footprint_toggled)
+        profile_status_row.addWidget(self.footprint_toggle)
         self.profile_progress = QProgressBar()
         self.profile_progress.setRange(0, 100)
         self.profile_progress.setMaximumWidth(240)
@@ -247,6 +268,8 @@ class BurialPlannerDock(QDockWidget):
         self.model.planChanged.connect(self._refresh_strip)
         self.model.planChanged.connect(self._refresh_profile)
         self.model.planChanged.connect(self.clear_exclusion_preview)
+        self.model.planChanged.connect(self._clear_footprint_cache)
+        self.model.toolsChanged.connect(self._clear_footprint_cache)
         self.model.eventsChanged.connect(self._refresh_profile_events)
         self.model.sectionsChanged.connect(self._refresh_profile_sections)
         self.model.inputsChanged.connect(self._refresh_profile)
@@ -1111,6 +1134,7 @@ class BurialPlannerDock(QDockWidget):
         marker = self._ensure_marker()
         marker.setCenter(point)
         marker.show()
+        self._update_footprint(kp)
 
     def highlight_kp(self, kp: float) -> None:
         point = self._canvas_point(kp)
@@ -1119,6 +1143,77 @@ class BurialPlannerDock(QDockWidget):
         marker = self._ensure_marker()
         marker.setCenter(point)
         marker.show()
+        self._update_footprint(kp)
+
+    # -- tool footprint overlay ----------------------------------------------
+    def _footprint_toggled(self, checked: bool) -> None:
+        QSettings().setValue(
+            "SubseaCableTools/BurialPlanner/tool_footprint_visible",
+            bool(checked))
+        if not checked:
+            self._hide_footprint()
+
+    def _hide_footprint(self) -> None:
+        if self._footprint_band is not None \
+                and not _sip_isdeleted(self._footprint_band):
+            try:
+                self._footprint_band.hide()
+            except (AttributeError, RuntimeError):
+                pass
+
+    def _clear_footprint_cache(self) -> None:
+        self._footprint_cache = {}
+        self._hide_footprint()
+
+    def _ensure_footprint_band(self, geom_type):
+        band = self._footprint_band
+        if band is None or _sip_isdeleted(band) \
+                or getattr(band, "_bp_geom_type", None) != geom_type:
+            if band is not None:
+                _remove_canvas_item(band)
+            band = QgsRubberBand(self.canvas, geom_type)
+            band.setStrokeColor(QColor(31, 119, 180))
+            band.setFillColor(QColor(31, 119, 180, 60))
+            band.setWidth(2)
+            band._bp_geom_type = geom_type
+            self._footprint_band = band
+        return band
+
+    def _update_footprint(self, kp: float) -> None:
+        """Draw the effective tool's footprint at kp (scale context)."""
+        if not self.footprint_toggle.isChecked() or self.canvas is None \
+                or self.model.route is None:
+            return
+        tool = tools_mod.tool_at_kp(self.model.sections, self.model.plan,
+                                    self.model.tools, kp)
+        tool_id = str((tool or {}).get("tool_id") or "")
+        wkt = str((tool or {}).get("footprint_wkt") or "")
+        if not tool_id or not wkt:
+            self._hide_footprint()
+            return
+        outline = self._footprint_cache.get(tool_id)
+        if outline is None:
+            outline = QgsGeometry.fromWkt(wkt)
+            self._footprint_cache[tool_id] = outline
+        if outline is None or outline.isNull() or outline.isEmpty():
+            self._hide_footprint()
+            return
+        try:
+            dest_crs = self.canvas.mapSettings().destinationCrs()
+            geom, _heading = footprint.place_outline(
+                outline, self.model.route, kp, target_crs=dest_crs)
+        except Exception:
+            geom = None
+        if geom is None or geom.isEmpty():
+            self._hide_footprint()
+            return
+        from ..qgis_compat import GEOMETRY_LINE, GEOMETRY_POLYGON
+
+        geom_type = (GEOMETRY_LINE if outline.type() == GEOMETRY_LINE
+                     else GEOMETRY_POLYGON)
+        band = self._ensure_footprint_band(geom_type)
+        band.setToGeometry(geom, None)
+        band.show()
 
     def highlight_range(self, start_kp: float, end_kp: float):
         if self.canvas is None or self.model.route is None:
@@ -1273,9 +1368,11 @@ class BurialPlannerDock(QDockWidget):
                 self.canvas.unsetMapTool(pick_tool)
             except (AttributeError, RuntimeError):
                 pass
-        items = (self._marker, self._band) + tuple(self._exclusion_bands)
+        items = (self._marker, self._band, self._footprint_band) \
+            + tuple(self._exclusion_bands)
         self._marker = None
         self._band = None
+        self._footprint_band = None
         self._exclusion_bands = []
         for item in items:
             _remove_canvas_item(item)

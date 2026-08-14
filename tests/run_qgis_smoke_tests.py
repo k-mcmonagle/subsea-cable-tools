@@ -11,7 +11,7 @@ from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 PACKAGE_NAME = "subsea_cable_tools"
-EXPECTED_ALGORITHM_COUNT = 38
+EXPECTED_ALGORITHM_COUNT = 39
 
 
 def _require_qgis() -> None:

@@ -93,6 +93,7 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
         safe_add('export_kp_section_chartlets_algorithm', 'ExportKPSectionChartletsAlgorithm')
         safe_add('extract_lines_intersecting_polygons_algorithm', 'ExtractLinesIntersectingPolygonsAlgorithm')
         safe_add('import_ship_outline_algorithm', 'ImportShipOutlineAlgorithm')
+        safe_add('place_outline_along_route_algorithm', 'PlaceOutlineAlongRouteAlgorithm')
         safe_add('place_ship_outlines_algorithm', 'PlaceShipOutlinesAlgorithm')
         safe_add('plot_line_segments_from_table_algorithm', 'PlotLineSegmentsFromTableAlgorithm')
 

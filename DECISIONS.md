@@ -263,6 +263,28 @@ section references in brackets.
   is ready for KP-placed map display (roadmap: live footprint overlay,
   turning-radius tool path).
 
+## Tool footprint display (Phase 3)
+
+- **The footprint is a transient overlay, not a layer**: scale context is a
+  glance-level need, so the canvas rubber band follows the profile
+  hover/selection and vanishes with the toggle — no layer churn, nothing
+  persisted. Chartlet-grade placements go through the *Place Outline Along
+  Route (KP)* Processing algorithm instead.
+- **Placement is per-KP UTM with a projected-grid heading**: each placement
+  transforms into the local UTM zone (the Dynamic Buffer working-CRS
+  pattern) so the outline stays metre-true, and the heading is measured
+  between two projected route points ±20 m around the KP — grid
+  convergence is handled implicitly rather than corrected explicitly. The
+  rotation/heading maths live in pure ``burial/geometry2d.py`` and are
+  headless-tested.
+- **The KP basis remains the RPL**: the footprint is advisory display; no
+  analysis is re-based on where the vehicle body sits (the tool-path /
+  turning-radius roadmap will flag deviation rather than re-base KP).
+- **The placement algorithm is ellipsoidal-only**: it consumes KPs rather
+  than emitting them, so it follows the Burial Planner's WGS84 +
+  project-ellipsoid convention instead of exposing the Distance-mode
+  parameter of the KP-emitting algorithms.
+
 ## Cross-check against the acceptance walkthrough (§16)
 
 Automated coverage: events/alternation/locking (test_burial_events), the

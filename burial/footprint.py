@@ -13,15 +13,43 @@ from __future__ import annotations
 
 import os
 from math import cos, radians, sin
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
-from qgis.core import QgsGeometry, QgsPointXY, QgsVectorLayer
+from qgis.core import (
+    QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform,
+    QgsGeometry,
+    QgsPointXY,
+    QgsProject,
+    QgsVectorLayer,
+)
 
 from ..qgis_compat import GEOMETRY_LINE, GEOMETRY_POLYGON
+from . import geometry2d
+
+WGS84 = "EPSG:4326"
 
 
 class FootprintError(ValueError):
     """Raised when a DXF outline cannot be read."""
+
+
+def map_vertices(geom: QgsGeometry, fn) -> QgsGeometry:
+    """Rebuild a line/polygon geometry with ``fn(QgsPointXY) -> QgsPointXY``
+    applied to every vertex (the shape-preserving per-vertex transform used
+    by both the DXF import and KP placement)."""
+    if geom.isMultipart():
+        if geom.type() == GEOMETRY_LINE:
+            parts = [[fn(pt) for pt in line]
+                     for line in geom.asMultiPolyline()]
+            return QgsGeometry.fromMultiPolylineXY(parts)
+        parts = [[[fn(pt) for pt in ring] for ring in poly]
+                 for poly in geom.asMultiPolygon()]
+        return QgsGeometry.fromMultiPolygonXY(parts)
+    if geom.type() == GEOMETRY_LINE:
+        return QgsGeometry.fromPolylineXY([fn(pt) for pt in geom.asPolyline()])
+    return QgsGeometry.fromPolygonXY(
+        [[fn(pt) for pt in ring] for ring in geom.asPolygon()])
 
 
 def _transform_geometry(geom: QgsGeometry, scale: float, rotation_deg: float,
@@ -35,19 +63,7 @@ def _transform_geometry(geom: QgsGeometry, scale: float, rotation_deg: float,
         y = (pt.y() - offset_y) * scale
         return QgsPointXY(x * cos_r - y * sin_r, x * sin_r + y * cos_r)
 
-    if geom.isMultipart():
-        if geom.type() == GEOMETRY_LINE:
-            parts = [[transform_point(pt) for pt in line]
-                     for line in geom.asMultiPolyline()]
-            return QgsGeometry.fromMultiPolylineXY(parts)
-        parts = [[[transform_point(pt) for pt in ring] for ring in poly]
-                 for poly in geom.asMultiPolygon()]
-        return QgsGeometry.fromMultiPolygonXY(parts)
-    if geom.type() == GEOMETRY_LINE:
-        return QgsGeometry.fromPolylineXY(
-            [transform_point(pt) for pt in geom.asPolyline()])
-    return QgsGeometry.fromPolygonXY(
-        [[transform_point(pt) for pt in ring] for ring in geom.asPolygon()])
+    return map_vertices(geom, transform_point)
 
 
 def load_dxf_outline(dxf_path: str, scale: float = 1.0,
@@ -99,3 +115,79 @@ def load_dxf_outline(dxf_path: str, scale: float = 1.0,
         "width_m": box.width(),
     }
     return merged.asWkt(3), info
+
+
+# ---------------------------------------------------------------------------
+# Placement along a route
+# ---------------------------------------------------------------------------
+
+
+def utm_crs_for(point_wgs84: QgsPointXY) -> QgsCoordinateReferenceSystem:
+    """Metre-true working CRS at a WGS84 point (the Dynamic Buffer pattern):
+    the local UTM zone, EPSG:326xx north / 327xx south."""
+    zone = min(60, max(1, int((float(point_wgs84.x()) + 180.0) / 6.0) + 1))
+    epsg = (32600 if float(point_wgs84.y()) >= 0.0 else 32700) + zone
+    crs = QgsCoordinateReferenceSystem(f"EPSG:{epsg}")
+    return crs if crs.isValid() else QgsCoordinateReferenceSystem("EPSG:3857")
+
+
+def place_outline(outline: QgsGeometry, route, kp_km: float,
+                  heading_offset_deg: float = 0.0,
+                  heading_step_m: float = 20.0,
+                  target_crs: Optional[QgsCoordinateReferenceSystem] = None,
+                  transform_context=None
+                  ) -> Tuple[Optional[QgsGeometry], Optional[float]]:
+    """Place a body-fixed outline on the route at ``kp_km``.
+
+    ``route`` is a WGS84 ``RouteFrame``; the outline is the body frame from
+    the importers (metres, CRP at origin, front along +Y). Placement runs
+    in the local UTM zone so shape and size are metre-true, and the heading
+    is measured between two projected route points ± ``heading_step_m``
+    around the KP — grid convergence comes out in the wash. Returns
+    ``(geometry in target_crs (default WGS84), heading_deg)`` or
+    ``(None, None)`` when the KP cannot be placed.
+    """
+    if outline is None or outline.isNull() or outline.isEmpty() \
+            or route is None:
+        return None, None
+    anchor = route.point_at_kp(float(kp_km), clamp=True)
+    if anchor is None:
+        return None, None
+    step_km = max(float(heading_step_m), 1.0) / 1000.0
+    p_before = route.point_at_kp(float(kp_km) - step_km, clamp=True)
+    p_after = route.point_at_kp(float(kp_km) + step_km, clamp=True)
+    if p_before is None or p_after is None:
+        return None, None
+
+    context = transform_context or QgsProject.instance().transformContext()
+    working = utm_crs_for(anchor)
+    wgs84 = QgsCoordinateReferenceSystem(WGS84)
+    to_working = QgsCoordinateTransform(wgs84, working, context)
+    try:
+        anchor_w = to_working.transform(anchor)
+        before_w = to_working.transform(p_before)
+        after_w = to_working.transform(p_after)
+    except Exception:
+        return None, None
+    heading = geometry2d.grid_heading_deg(
+        (before_w.x(), before_w.y()), (after_w.x(), after_w.y()))
+    heading = (heading + float(heading_offset_deg)) % 360.0
+
+    from math import cos as _cos, radians as _radians, sin as _sin
+    h = _radians(heading)
+    cos_h, sin_h = _cos(h), _sin(h)
+    ax, ay = anchor_w.x(), anchor_w.y()
+
+    def placed_point(pt) -> QgsPointXY:
+        x, y = pt.x(), pt.y()
+        return QgsPointXY(ax + x * cos_h + y * sin_h,
+                          ay - x * sin_h + y * cos_h)
+
+    geom = map_vertices(QgsGeometry(outline), placed_point)
+    out_crs = target_crs or wgs84
+    if out_crs != working:
+        try:
+            geom.transform(QgsCoordinateTransform(working, out_crs, context))
+        except Exception:
+            return None, None
+    return geom, heading
