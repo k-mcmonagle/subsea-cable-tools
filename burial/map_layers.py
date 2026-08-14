@@ -450,10 +450,26 @@ def find_layer(project: QgsProject, gpkg_path: str, layer_name: str
 
 
 def _ensure_layer(project: QgsProject, gpkg_path: str, layer_name: str,
-                  style_fn) -> Optional[QgsVectorLayer]:
+                  style_fn, expected_fields=None) -> Optional[QgsVectorLayer]:
     existing = find_layer(project, gpkg_path, layer_name)
     if existing is not None and existing.isValid():
+        # A loaded layer caches its field map. When the tool's layer schema
+        # gains a column (e.g. section_ref, skip_handling) the cached map can
+        # go stale after the table is rewritten, silently breaking the
+        # rule-based renderer's field lookups ("kind" no longer resolves, so
+        # e.g. skip lines stop drawing). Re-point the layer at its source to
+        # rebuild the field map in place — layer id, tree position and
+        # project references all survive.
+        wanted = {name for name, _type in (expected_fields or [])}
+        have = set(existing.fields().names())
+        if wanted and not wanted.issubset(have):
+            try:
+                existing.setDataSource(gpkg_layer_uri(gpkg_path, layer_name),
+                                       layer_name, "ogr")
+            except Exception:
+                pass
         existing.dataProvider().reloadData()
+        existing.updateExtents()
         # These are tool-owned, read-only presentation layers. Reapply their
         # style so fixes (notably removal of the old line offset) also reach
         # layers already saved in an open project.
@@ -481,13 +497,16 @@ def ensure_plan_layers(project: Optional[QgsProject], gpkg_path: str, plan: Dict
                  plan.get("plan_id") or "")
     sections = _ensure_layer(project, gpkg_path,
                              schema.sections_layer_name(*base_args),
-                             apply_sections_style)
+                             apply_sections_style,
+                             expected_fields=schema.SECTIONS_LAYER_FIELDS)
     events = _ensure_layer(project, gpkg_path,
                            schema.events_layer_name(*base_args),
-                           apply_events_style)
+                           apply_events_style,
+                           expected_fields=schema.EVENTS_LAYER_FIELDS)
     _ensure_layer(project, gpkg_path,
                   schema.hazards_layer_name(*base_args),
-                  apply_hazards_style)
+                  apply_hazards_style,
+                  expected_fields=schema.HAZARDS_LAYER_FIELDS)
     return sections, events
 
 

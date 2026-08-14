@@ -40,6 +40,9 @@ def test_risk_evaluation() -> bool:
     # Exact value match works on the same rule list.
     ok = ok and risk.attribute_risk(
         config, {"height_m": "WRECK"}) == schema.RISK_HIGH
+    # Signed offsets (+stbd / -port): bands apply to the magnitude.
+    ok = ok and risk.evaluate_risk(config, -30.0, {}) == schema.RISK_MEDIUM
+    ok = ok and risk.proximity_risk(config, -8.0) == schema.RISK_HIGH
     # Nothing fires inside the search corridor -> default risk.
     bare = {"default_risk": "medium"}
     ok = ok and risk.evaluate_risk(bare, 500.0, {}) == schema.RISK_MEDIUM

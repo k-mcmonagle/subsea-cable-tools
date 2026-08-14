@@ -25,6 +25,7 @@ from qgis.gui import QgsMapCanvas, QgsRubberBand, QgsVertexMarker
 
 from ..burial import analysis_task, burial_dock, generation, map_layers
 from ..burial import schema as burial_schema
+from ..qgis_compat import WKB_LINESTRING
 from ..burial.plan_model import PlanModel
 from ..burial.store import BurialStore
 from ..kp_geo_utils import RouteFrame
@@ -1131,7 +1132,8 @@ def test_risk_scan_interactions() -> bool:
                  "band_low_m": 100.0})}
     scope = eng.Interval(0.0, 22.0)
 
-    # Point ~36 m starboard of the route near KP 10 -> medium band.
+    # Point ~36 m east of the northbound route near KP 10 -> starboard
+    # (+ve) offset in the medium band.
     points = mem_layer("Point", ["POINT(0.0005 50.09)"], "contacts")
     hazards, _warnings = risk_scan.scan_check(
         "p1", check, points, route, da, scope=scope)
@@ -1140,6 +1142,13 @@ def test_risk_scan_interactions() -> bool:
     ok = ok and abs(point["kp"] - 10.0) < 0.3
     ok = ok and 25.0 < point["offset_m"] < 50.0
     ok = ok and point["risk"] == "medium" and not point["crossing"]
+    # Direction -1 travels south, so the same point is now to port (-ve);
+    # the band still applies to the magnitude.
+    hazards, _warnings = risk_scan.scan_check(
+        "p1", check, points, route, da, scope=scope, direction=-1)
+    ok = ok and len(hazards) == 1
+    ok = ok and -50.0 < hazards[0]["offset_m"] < -25.0
+    ok = ok and hazards[0]["risk"] == "medium"
 
     # East-west line crossing the northbound route: ~90 degree crossing.
     lines = mem_layer("LineString",
@@ -1175,6 +1184,102 @@ def test_risk_scan_interactions() -> bool:
     ok = ok and hazards == []
     return _result("risk scan: point offset, crossing angle, polygon range",
                    ok)
+
+
+def test_risk_scan_route_turns() -> bool:
+    """A/C check: signed course change, min threshold, rules on turn_abs."""
+    from ..burial import risk_scan
+
+    da = make_distance_area(WGS84, QgsProject.instance().transformContext())
+    # Due north ~11.1 km, then a starboard bend to the NE for ~6.6 km.
+    route = RouteFrame.from_source(
+        [QgsGeometry.fromWkt("LINESTRING(0 50, 0 50.1, 0.05 50.15)")], da)
+    check = {"check_id": "c1", "plan_id": "p1", "name": "A/C", "enabled": 1,
+             "source_ref": "", "notes": "",
+             "config_json": json.dumps({
+                 "kind": "route_turns", "min_course_change_deg": 5.0,
+                 "attribute": "turn_abs",
+                 "attribute_rules": [{"min": 20.0, "risk": "high"},
+                                     {"min": 10.0, "max": 20.0,
+                                      "risk": "medium"}]})}
+    hazards, _warnings = risk_scan.scan_check(
+        "p1", check, None, route, da, scope=eng.Interval(0.0, 20.0))
+    ok = len(hazards) == 1
+    turn = hazards[0]
+    attrs = json.loads(turn["attributes_json"])
+    ok = ok and abs(turn["kp"] - 11.1) < 0.2
+    ok = ok and 25.0 < attrs["turn_abs"] < 40.0
+    ok = ok and attrs["alter_course"] > 0          # starboard turn
+    ok = ok and turn["risk"] == "high" and "stbd" in turn["label"]
+    # Direction -1: the same bend is a port turn of the same magnitude.
+    hazards, _warnings = risk_scan.scan_check(
+        "p1", check, None, route, da, scope=eng.Interval(0.0, 20.0),
+        direction=-1)
+    attrs = json.loads(hazards[0]["attributes_json"])
+    ok = ok and attrs["alter_course"] < 0 and hazards[0]["risk"] == "high"
+    # A tighter rule set that the bend complies with yields no hazards.
+    compliant = dict(check)
+    compliant["config_json"] = json.dumps({
+        "kind": "route_turns", "min_course_change_deg": 5.0,
+        "attribute": "turn_abs",
+        "attribute_rules": [{"min": 60.0, "risk": "high"}]})
+    hazards, _warnings = risk_scan.scan_check(
+        "p1", compliant, None, route, da, scope=eng.Interval(0.0, 20.0))
+    ok = ok and hazards == []
+    return _result("risk scan: A/C course change (signed, threshold, rules)",
+                   ok)
+
+
+def test_plan_layer_schema_heal() -> bool:
+    """A loaded plan layer with a stale (pre-section_ref) field map is
+    re-pointed at its source by ensure_plan_layers, so the rule-based
+    renderer's "kind" lookup — and skip lines — keep working."""
+    route, _da = _route()
+    project = QgsProject.instance()
+    tmp = tempfile.mkdtemp()
+    store = BurialStore(os.path.join(tmp, "heal.gpkg"))
+    plan = {"plan_id": "p9", "name": "Heal", "rev_label": "Rev 1",
+            "method": "plough", "direction": 1}
+
+    def section(sid, kind, s, e):
+        return {"section_id": sid, "plan_id": "p9", "kind": kind,
+                "start_kp": s, "end_kp": e, "length_km": e - s,
+                "state": "candidate", "conclusion": "", "confidence": "",
+                "reason_json": "{}", "skip_handling": "", "notes": ""}
+
+    sections = [section("s1", burial_schema.SECTION_BURIAL, 0.0, 8.0),
+                section("s2", burial_schema.SECTION_SKIP, 8.0, 12.0)]
+    name = burial_schema.sections_layer_name("Heal", "Rev 1", "p9")
+
+    # Write the layer with the OLD schema (no section_ref) and load it.
+    old_fields = [f for f in burial_schema.SECTIONS_LAYER_FIELDS
+                  if f[0] != "section_ref"]
+    rows = []
+    for s in sections:
+        geom = route.extract_segment(s["start_kp"], s["end_kp"])
+        row = {k: s.get(k) for k, _t in old_fields}
+        row["reasons"] = "{}"
+        from ..processing.cable_lay_parsers import WKT_KEY
+        row[WKT_KEY] = geom.asWkt()
+        rows.append(row)
+    store.write_spatial_layer(name, old_fields, WKB_LINESTRING, rows)
+    from ..processing.cable_lay_parsers import gpkg_layer_uri
+    stale = QgsVectorLayer(gpkg_layer_uri(store.gpkg_path, name), name, "ogr")
+    ok = stale.isValid()
+    project.addMapLayer(stale, False)
+    ok = ok and "section_ref" not in set(stale.fields().names())
+
+    # The tool rewrites the table with the new schema, then ensures layers.
+    map_layers.write_plan_layers(store, plan, sections, [], route,
+                                 hazards=[], risk_checks=[])
+    ensured, _events = map_layers.ensure_plan_layers(
+        project, store.gpkg_path, plan)
+    ok = ok and ensured is not None and ensured.id() == stale.id()
+    ok = ok and "section_ref" in set(ensured.fields().names())
+    kinds = sorted(f["kind"] for f in ensured.getFeatures())
+    ok = ok and kinds == ["burial", "skip"]
+    project.removeMapLayer(stale.id())
+    return _result("plan layer schema heal: stale field map re-pointed", ok)
 
 
 def test_burial_depth_config_is_manual_only() -> bool:
@@ -1226,6 +1331,8 @@ def run_all() -> list:
         test_workflow_settings_are_separated(),
         test_rule_editor_extension_and_corridor(),
         test_risk_scan_interactions(),
+        test_risk_scan_route_turns(),
+        test_plan_layer_schema_heal(),
         test_burial_depth_config_is_manual_only(),
     ]
 

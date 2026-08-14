@@ -384,9 +384,10 @@ def build_report_html(plan: Dict,
                                      "manual")),
                 _esc(hazard.get("notes")),
             ))
-        parts.append(_table(("Risk", "Status", "KP", "End KP", "Offset (m)",
-                             "Crossing", "Angle (°)", "Feature", "Check",
-                             "Notes"), hazard_rows, raw=True))
+        parts.append(_table(("Risk", "Status", "KP", "End KP",
+                             "Offset (m, +stbd/−port)", "Crossing",
+                             "Angle (°)", "Feature", "Check", "Notes"),
+                            hazard_rows, raw=True))
 
     # -- exclusion stack ------------------------------------------------------
     parts.append("<h2>Exclusion stack</h2>")

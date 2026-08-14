@@ -36,6 +36,7 @@ from qgis.PyQt.QtWidgets import (
     QLineEdit,
     QMenu,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSplitter,
     QTableWidget,
@@ -60,7 +61,7 @@ from ...qgis_compat import (
 )
 from ...workbench.kp_bars import FireBarDelegate, VerdictStrip
 from ...workbench.rules_engine import Interval
-from .. import change_log, map_layers, risk, schema
+from .. import change_log, map_layers, risk, risk_scan, schema
 
 _CHECK_FIRE_COL = 2
 _CHECK_COLUMNS = ["On", "Check", "Findings", "Hazards"]
@@ -95,6 +96,21 @@ class CheckEditorDialog(QDialog):
         self.name_edit = QLineEdit(self.check.get("name") or "")
         self.name_edit.setPlaceholderText("e.g. Boulders ≥ 0.5 m")
         form.addRow("Name:", self.name_edit)
+        self.kind_combo = QComboBox()
+        self.kind_combo.addItem("Features near the route (layer)",
+                                risk_scan.CHECK_KIND_FEATURES)
+        self.kind_combo.addItem("Route alter courses (course change)",
+                                risk_scan.CHECK_KIND_ROUTE_TURNS)
+        self.kind_combo.setCurrentIndex(max(0, self.kind_combo.findData(
+            risk_scan.check_kind(config))))
+        self.kind_combo.currentIndexChanged.connect(self._sync_kind)
+        self.kind_combo.setToolTip(
+            "Feature checks scan a registered input layer. The alter-course "
+            "check scans the route geometry itself: each A/C's course "
+            "change (as in the Extract A/C Points algorithm) is assessed "
+            "against the rules below — flag turns your burial tool cannot "
+            "follow within its minimum turn radius.")
+        form.addRow("Check type:", self.kind_combo)
         self.input_combo = QComboBox()
         self.input_combo.addItem("(pick a registered input)", "")
         for row in inputs:
@@ -151,6 +167,16 @@ class CheckEditorDialog(QDialog):
 
         attr = QGroupBox("Risk from an attribute (optional)")
         attr_form = QFormLayout(attr)
+        self.min_cc_spin = QDoubleSpinBox()
+        self.min_cc_spin.setRange(0.0, 180.0)
+        self.min_cc_spin.setDecimals(1)
+        self.min_cc_spin.setSuffix(" °")
+        self.min_cc_spin.setValue(
+            float(config.get("min_course_change_deg") or 0.5))
+        self.min_cc_spin.setToolTip(
+            "Course changes below this are treated as route noise and never "
+            "assessed (matches the Extract A/C Points minimum).")
+        attr_form.addRow("Ignore course changes below:", self.min_cc_spin)
         self.attribute_edit = QLineEdit(config.get("attribute") or "")
         self.attribute_edit.setPlaceholderText(
             "e.g. Height_m, Class, Diameter")
@@ -205,6 +231,25 @@ class CheckEditorDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self._sync_kind()
+
+    def _sync_kind(self) -> None:
+        turns = self.kind_combo.currentData() == risk_scan.CHECK_KIND_ROUTE_TURNS
+        for widget in (self.input_combo, self.distance_spin,
+                       self.filter_edit, self.label_edit):
+            widget.setEnabled(not turns)
+        for spin in self.band_spins.values():
+            spin.setEnabled(not turns)
+        self.min_cc_spin.setEnabled(turns)
+        self.attribute_edit.setEnabled(not turns)
+        if turns:
+            self.attribute_edit.setText(risk_scan.TURN_ABS_ATTR)
+            self.attribute_edit.setToolTip(
+                "Fixed for alter-course checks: rules assess the course-"
+                "change magnitude in degrees (e.g. '25-' → High for turns "
+                "of 25° or more).")
+            if not self.name_edit.text().strip():
+                self.name_edit.setPlaceholderText("A/C course change")
 
     def _append_rule_row(self, text: str, level: str) -> None:
         row = self.rules_table.rowCount()
@@ -224,17 +269,26 @@ class CheckEditorDialog(QDialog):
             self.rules_table.removeRow(row)
 
     def result_check(self) -> Dict:
+        turns = self.kind_combo.currentData() == risk_scan.CHECK_KIND_ROUTE_TURNS
         config: Dict = {
-            "input_id": self.input_combo.currentData() or "",
-            "distance_m": self.distance_spin.value(),
-            "filter_expression": self.filter_edit.text().strip(),
-            "label_attribute": self.label_edit.text().strip(),
-            "attribute": self.attribute_edit.text().strip(),
+            "kind": self.kind_combo.currentData()
+            or risk_scan.CHECK_KIND_FEATURES,
             "default_risk": self.default_combo.currentData() or "",
         }
-        for key, spin in self.band_spins.items():
-            if spin.value() > 0:
-                config[key] = spin.value()
+        if turns:
+            config["attribute"] = risk_scan.TURN_ABS_ATTR
+            config["min_course_change_deg"] = self.min_cc_spin.value()
+        else:
+            config.update({
+                "input_id": self.input_combo.currentData() or "",
+                "distance_m": self.distance_spin.value(),
+                "filter_expression": self.filter_edit.text().strip(),
+                "label_attribute": self.label_edit.text().strip(),
+                "attribute": self.attribute_edit.text().strip(),
+            })
+            for key, spin in self.band_spins.items():
+                if spin.value() > 0:
+                    config[key] = spin.value()
         rules: List[Dict] = []
         for row in range(self.rules_table.rowCount()):
             item = self.rules_table.item(row, 0)
@@ -246,9 +300,10 @@ class CheckEditorDialog(QDialog):
                 rules.append(rule)
         if rules:
             config["attribute_rules"] = rules
+        default_name = "A/C course change" if turns else "Risk check"
         check = dict(self.check)
         check.update({
-            "name": self.name_edit.text().strip() or "Risk check",
+            "name": self.name_edit.text().strip() or default_name,
             "config_json": json.dumps(config),
             "source_ref": self.source_edit.text().strip(),
             "notes": self.notes_edit.text(),
@@ -324,6 +379,8 @@ class RiskTab(QWidget):
         self.model = model
         self.dock = dock
         self._loading = False
+        self._scan_task = None
+        self._prescan_warnings: List[str] = []
 
         layout = QVBoxLayout(self)
         self.overview = VerdictStrip()
@@ -347,6 +404,9 @@ class RiskTab(QWidget):
         header.setSectionResizeMode(_CHECK_FIRE_COL, HEADER_RESIZE_MODE_STRETCH)
         self.check_table.itemChanged.connect(self._on_check_item_changed)
         self.check_table.doubleClicked.connect(lambda _i: self._edit_check())
+        self.check_table.setContextMenuPolicy(CONTEXT_MENU_POLICY_CUSTOM)
+        self.check_table.customContextMenuRequested.connect(
+            self._check_context_menu)
         checks_layout.addWidget(self.check_table, 1)
 
         check_buttons = QHBoxLayout()
@@ -367,8 +427,17 @@ class RiskTab(QWidget):
             "near the route and rebuild the hazard register. Your review "
             "(risk overrides, status, notes) is carried over by feature; "
             "manual hazards are never touched.")
-        self.run_button.clicked.connect(self._run_checks)
+        self.run_button.clicked.connect(lambda: self._run_checks())
         check_buttons.addWidget(self.run_button)
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setEnabled(False)
+        self.stop_button.clicked.connect(self._cancel_scan)
+        check_buttons.addWidget(self.stop_button)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setVisible(False)
+        self.progress.setMaximumWidth(160)
+        check_buttons.addWidget(self.progress)
         checks_layout.addLayout(check_buttons)
         splitter.addWidget(checks_widget)
 
@@ -388,6 +457,12 @@ class RiskTab(QWidget):
         hazards_layout.addLayout(register_header)
         self.hazard_table = QTableWidget(0, len(_HAZARD_COLUMNS))
         self.hazard_table.setHorizontalHeaderLabels(_HAZARD_COLUMNS)
+        offset_header = self.hazard_table.horizontalHeaderItem(4)
+        if offset_header is not None:
+            offset_header.setToolTip(
+                "Nearest approach from the route centreline, signed by the "
+                "direction of travel: + to starboard, − to port "
+                "(positive when the side cannot be resolved).")
         self.hazard_table.verticalHeader().setVisible(False)
         self.hazard_table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
         self.hazard_table.setSelectionMode(SELECTION_MODE_EXTENDED)
@@ -509,7 +584,7 @@ class RiskTab(QWidget):
                 "",  # status combo
                 schema.format_kp(hazard.get("kp")),
                 schema.format_kp(end_kp) if is_range else "",
-                (f"{float(hazard.get('offset_m') or 0.0):.1f}"
+                (f"{float(hazard.get('offset_m') or 0.0):+.1f}"
                  if not int(hazard.get("crossing") or 0) else "0.0"),
                 "✕" if int(hazard.get("crossing") or 0) else "",
                 f"{float(angle):.1f}" if angle is not None else "",
@@ -778,9 +853,12 @@ class RiskTab(QWidget):
         self.model.save_risk_checks(
             checks, target_id=str(checks[index].get("check_id")))
 
-    # -- scan -----------------------------------------------------------------
-    def _run_checks(self) -> None:
+    # -- scan (background task, BurialAnalysisTask pattern) --------------------
+    def _run_checks(self, check_ids: Optional[List[str]] = None) -> None:
         if not self.model.plan:
+            return
+        if self._scan_task is not None:
+            self.status_label.setText("A scan is already running.")
             return
         if self.model.route is None:
             QMessageBox.warning(
@@ -788,59 +866,148 @@ class RiskTab(QWidget):
                 "The plan's route is not available — set the route on the "
                 "Plan tab first.")
             return
+        wanted = {str(c) for c in check_ids or []}
         checks = [c for c in self.model.risk_checks
-                  if int(c.get("enabled") or 0)]
+                  if int(c.get("enabled") or 0)
+                  and (not wanted or str(c.get("check_id") or "") in wanted)]
         if not checks:
-            self.status_label.setText(
-                "No enabled checks — add a check first.")
+            self.status_label.setText("No enabled checks — add a check first.")
             return
-        from qgis.core import QgsProject
-        from qgis.PyQt.QtWidgets import QApplication
-
-        from .. import risk_scan
+        from qgis.core import QgsApplication, QgsGeometry, QgsProject
 
         params = self.model.gen_params()
         scope = Interval(params.scope.start_km, params.scope.end_km)
         inputs_by_id = {str(r.get("input_id") or ""): r
                         for r in self.model.inputs}
-        hazards: List[Dict] = []
+        # Feature loading happens here on the main thread; the geometry
+        # work runs on the task with cloned route geometries.
+        route_geoms = [QgsGeometry(g) for g in self.model.route.geometries]
+        route_geom = QgsGeometry.collectGeometry(
+            [QgsGeometry(g) for g in route_geoms])
+        jobs = []
         warnings: List[str] = []
-        run_ids: List[str] = []
-        QApplication.setOverrideCursor(
-            getattr(Qt, "CursorShape", Qt).WaitCursor)
-        try:
-            for check in checks:
-                config = risk.check_config(check)
-                input_row = inputs_by_id.get(str(config.get("input_id") or ""))
-                if input_row is None:
-                    warnings.append(
-                        f"Check '{check.get('name')}': no registered input "
-                        "selected — skipped.")
-                    continue
-                layer = map_layers.resolve_input_layer(
-                    QgsProject.instance(), input_row)
-                try:
-                    found, check_warnings = risk_scan.scan_check(
-                        self.model.plan_id, check, layer, self.model.route,
-                        self.model.distance, scope=scope,
-                        progress=self.status_label.setText)
-                except risk_scan.RiskScanError as exc:
-                    warnings.append(str(exc))
-                    continue
-                hazards.extend(found)
-                warnings.extend(check_warnings)
-                run_ids.append(str(check.get("check_id") or ""))
-        finally:
-            QApplication.restoreOverrideCursor()
-        if run_ids:
-            self.model.apply_risk_scan(hazards, check_ids=run_ids)
-        message = (f"Scanned {len(run_ids)} check(s): "
-                   f"{len(hazards)} hazard(s).")
+        for check in checks:
+            config = risk.check_config(check)
+            if risk_scan.check_kind(config) == risk_scan.CHECK_KIND_ROUTE_TURNS:
+                jobs.append((dict(check), None))
+                continue
+            input_row = inputs_by_id.get(str(config.get("input_id") or ""))
+            if input_row is None:
+                warnings.append(
+                    f"Check '{check.get('name')}': no registered input "
+                    "selected — skipped.")
+                continue
+            layer = map_layers.resolve_input_layer(
+                QgsProject.instance(), input_row)
+            try:
+                features = risk_scan.snapshot_check_features(
+                    check, layer, route_geom)
+            except risk_scan.RiskScanError as exc:
+                warnings.append(str(exc))
+                continue
+            jobs.append((dict(check), features))
+        if not jobs:
+            self.status_label.setText(
+                "  ·  ".join(warnings) or "Nothing to scan.")
+            return
+        self._prescan_warnings = warnings
+        task = risk_scan.RiskScanTask(
+            self.model.plan_id, jobs, route_geoms,
+            QgsProject.instance().transformContext(), scope,
+            self.model.direction, self._scan_finished)
+        task.progressMessage.connect(self.status_label.setText)
+        task.progressChanged.connect(
+            lambda pct: self.progress.setValue(int(pct)))
+        self._scan_task = task
+        self.run_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.progress.setVisible(True)
+        self.progress.setValue(0)
+        self.status_label.setText("Scanning…")
+        QgsApplication.taskManager().addTask(task)
+
+    def _cancel_scan(self) -> None:
+        if self._scan_task is not None:
+            self._scan_task.cancel()
+
+    def _scan_finished(self, task) -> None:
+        """Completion callback on the main thread."""
+        self._scan_task = None
+        self.run_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self.progress.setVisible(False)
+        if task.cancelled:
+            self.status_label.setText(
+                "Scan stopped — the hazard register was not changed.")
+            return
+        if task.error:
+            self.status_label.setText(f"Scan failed: {task.error}")
+            return
+        if task.run_check_ids:
+            self.model.apply_risk_scan(task.hazards,
+                                       check_ids=task.run_check_ids)
+        message = (f"Scanned {len(task.run_check_ids)} check(s): "
+                   f"{len(task.hazards)} hazard(s).")
+        warnings = self._prescan_warnings + task.warnings
         if warnings:
             message += "  ·  " + "  ·  ".join(warnings[:4])
             if len(warnings) > 4:
                 message += f"  ·  … {len(warnings) - 4} more"
         self.status_label.setText(message)
+
+    def _check_context_menu(self, position) -> None:
+        item = self.check_table.itemAt(position)
+        if item is None:
+            return
+        row = item.row()
+        self.check_table.selectRow(row)
+        if row >= len(self.model.risk_checks):
+            return
+        check = self.model.risk_checks[row]
+        check_id = str(check.get("check_id") or "")
+        found = risk.sort_hazards(
+            [h for h in self.model.hazards
+             if str(h.get("check_id") or "") == check_id])
+        menu = QMenu(self)
+        edit_action = menu.addAction("Edit check…")
+        run_action = menu.addAction("Run this check")
+        run_action.setEnabled(self._scan_task is None)
+        delete_action = menu.addAction("Delete check")
+        goto_actions = {}
+        if found:
+            menu.addSeparator()
+            shown = found[:20]
+            for hazard in shown:
+                start = float(hazard.get("kp") or 0.0)
+                end = float(hazard.get("end_kp") or start)
+                if abs(end - start) > 5e-4:
+                    where = (f"KP {schema.format_kp(min(start, end))}-"
+                             f"{schema.format_kp(max(start, end))}")
+                else:
+                    where = f"KP {schema.format_kp(start)}"
+                level = schema.RISK_LABELS.get(hazard.get("risk") or "", "")
+                action = menu.addAction(
+                    f"Go to {hazard.get('label') or 'hazard'} — {where}"
+                    + (f"  [{level}]" if level else ""))
+                goto_actions[action] = (min(start, end), max(start, end))
+            if len(found) > len(shown):
+                more = menu.addAction(
+                    f"… {len(found) - len(shown)} more in the register")
+                more.setEnabled(False)
+        chosen = qt_exec(menu,
+                         self.check_table.viewport().mapToGlobal(position))
+        if chosen == edit_action:
+            self._edit_check()
+        elif chosen == run_action:
+            self._run_checks([check_id])
+        elif chosen == delete_action:
+            self._delete_check()
+        elif chosen in goto_actions:
+            start, end = goto_actions[chosen]
+            if end - start > 5e-4:
+                self.dock.goto_range(start, end)
+            else:
+                self.dock.goto_kp(start)
 
     # -- manual hazards / export ----------------------------------------------
     def _add_manual_hazard(self) -> None:

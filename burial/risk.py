@@ -46,10 +46,13 @@ def risk_max(*levels: str) -> str:
 
 
 def proximity_risk(config: Dict, offset_m: Optional[float]) -> str:
-    """Risk from the nearest-approach bands; '' when no band matches."""
+    """Risk from the nearest-approach bands; '' when no band matches.
+
+    Offsets are signed (+ starboard / − port); bands apply to the magnitude.
+    """
     if offset_m is None:
         return schema.RISK_UNASSIGNED
-    offset = max(0.0, float(offset_m))
+    offset = abs(float(offset_m))
     for key, level in (("band_high_m", schema.RISK_HIGH),
                        ("band_medium_m", schema.RISK_MEDIUM),
                        ("band_low_m", schema.RISK_LOW)):
