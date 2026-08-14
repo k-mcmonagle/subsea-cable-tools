@@ -175,8 +175,11 @@ def rpl_fingerprint(rpl_row: Optional[Dict], gpkg_path: str = "") -> str:
 
 
 def write_plan_layers(store, plan: Dict, sections: Sequence[Dict],
-                      events: Sequence[Dict], route) -> Tuple[str, str]:
-    """Write/overwrite the plan's sections + events layers; returns names."""
+                      events: Sequence[Dict], route,
+                      hazards: Optional[Sequence[Dict]] = None,
+                      risk_checks: Optional[Sequence[Dict]] = None
+                      ) -> Tuple[str, str]:
+    """Write/overwrite the plan's sections + events (+ hazards) layers."""
     method = plan.get("method") or ""
     base_args = (plan.get("name") or "plan", plan.get("rev_label") or "",
                  plan.get("plan_id") or "")
@@ -237,6 +240,45 @@ def write_plan_layers(store, plan: Dict, sections: Sequence[Dict],
                               WKB_LINESTRING, section_rows)
     store.write_spatial_layer(events_name, schema.EVENTS_LAYER_FIELDS,
                               WKB_POINT, event_rows)
+
+    if hazards is not None:
+        check_names = {str(c.get("check_id") or ""): (c.get("name") or "")
+                       for c in (risk_checks or [])}
+        hazard_rows: List[Dict] = []
+        for hazard in hazards:
+            lat, lon = hazard.get("lat"), hazard.get("lon")
+            if (lat is None or lon is None) and route is not None:
+                try:
+                    start = float(hazard.get("kp") or 0.0)
+                    end = float(hazard.get("end_kp") or start)
+                except (TypeError, ValueError):
+                    continue
+                point = route.point_at_kp((start + end) / 2.0, clamp=True)
+                if point is None:
+                    continue
+                lat, lon = point.y(), point.x()
+            if lat is None or lon is None:
+                continue
+            hazard_rows.append({
+                "hazard_id": hazard.get("hazard_id") or "",
+                "plan_id": hazard.get("plan_id") or "",
+                "label": hazard.get("label") or "",
+                "check": check_names.get(str(hazard.get("check_id") or ""),
+                                         "manual"),
+                "kp": hazard.get("kp"),
+                "end_kp": hazard.get("end_kp"),
+                "offset_m": hazard.get("offset_m"),
+                "crossing": int(hazard.get("crossing") or 0),
+                "crossing_angle_deg": hazard.get("crossing_angle_deg"),
+                "risk": hazard.get("risk") or "",
+                "status": hazard.get("status") or "",
+                "source": hazard.get("source") or "",
+                "notes": hazard.get("notes") or "",
+                WKT_KEY: f"POINT ({lon} {lat})",
+            })
+        store.write_spatial_layer(schema.hazards_layer_name(*base_args),
+                                  schema.HAZARDS_LAYER_FIELDS,
+                                  WKB_POINT, hazard_rows)
     return sections_name, events_name
 
 
@@ -334,6 +376,56 @@ def apply_events_style(layer) -> None:
     layer.triggerRepaint()
 
 
+_RISK_COLORS = {
+    schema.RISK_HIGH: "#d62728",
+    schema.RISK_MEDIUM: "#ff8c00",
+    schema.RISK_LOW: "#e0b000",
+    schema.RISK_UNASSIGNED: "#909090",
+}
+
+
+def apply_hazards_style(layer) -> None:
+    """Risk-coloured markers; crossings ring-outlined; labelled by name."""
+    try:
+        from qgis.core import (
+            QgsMarkerSymbol,
+            QgsPalLayerSettings,
+            QgsRuleBasedRenderer,
+            QgsTextFormat,
+            QgsVectorLayerSimpleLabeling,
+        )
+    except ImportError:
+        return
+    if layer is None or not layer.isValid():
+        return
+    root = QgsRuleBasedRenderer.Rule(None)
+    for level, color in _RISK_COLORS.items():
+        symbol = QgsMarkerSymbol.createSimple({
+            "name": "circle", "color": color,
+            "outline_color": "#40282828", "outline_width": "0.3",
+            "size": "3.0",
+        })
+        child = QgsRuleBasedRenderer.Rule(symbol)
+        child.setLabel(schema.RISK_LABELS.get(level, level or "Unassigned"))
+        child.setFilterExpression(f"\"risk\" = '{level}'")
+        root.appendChild(child)
+    layer.setRenderer(QgsRuleBasedRenderer(root))
+    try:
+        settings = QgsPalLayerSettings()
+        settings.fieldName = "\"label\" || ' KP ' || format_number(\"kp\", 3)"
+        settings.isExpression = True
+        text_format = QgsTextFormat()
+        font = text_format.font()
+        font.setPointSize(8)
+        text_format.setFont(font)
+        settings.setFormat(text_format)
+        layer.setLabeling(QgsVectorLayerSimpleLabeling(settings))
+        layer.setLabelsEnabled(False)  # off by default; user can enable
+    except Exception:
+        pass
+    layer.triggerRepaint()
+
+
 # -- project sync ------------------------------------------------------------
 
 
@@ -393,6 +485,9 @@ def ensure_plan_layers(project: Optional[QgsProject], gpkg_path: str, plan: Dict
     events = _ensure_layer(project, gpkg_path,
                            schema.events_layer_name(*base_args),
                            apply_events_style)
+    _ensure_layer(project, gpkg_path,
+                  schema.hazards_layer_name(*base_args),
+                  apply_hazards_style)
     return sections, events
 
 
@@ -401,7 +496,8 @@ def remove_plan_layers(project: Optional[QgsProject], gpkg_path: str, plan: Dict
     base_args = (plan.get("name") or "plan", plan.get("rev_label") or "",
                  plan.get("plan_id") or "")
     for name in (schema.sections_layer_name(*base_args),
-                 schema.events_layer_name(*base_args)):
+                 schema.events_layer_name(*base_args),
+                 schema.hazards_layer_name(*base_args)):
         layer = find_layer(project, gpkg_path, name)
         if layer is not None:
             project.removeMapLayer(layer.id())
@@ -415,7 +511,8 @@ def _burial_layer_name(source: str) -> str:
     for part in str(source or "").split("|")[1:]:
         key, sep, value = part.partition("=")
         if sep and key.lower() == "layername" and value.startswith("bp_") \
-                and (value.endswith("_sections") or value.endswith("_events")):
+                and (value.endswith("_sections") or value.endswith("_events")
+                     or value.endswith("_hazards")):
             return value
     return ""
 
@@ -487,8 +584,12 @@ def restore_burial_layers(project: Optional[QgsProject] = None) -> int:
             if open_gpkg_layer(gpkg_path, name) is None:
                 continue
             if repair_layer(layer, gpkg_path, name):
-                style_fn = (apply_sections_style if name.endswith("_sections")
-                            else apply_events_style)
+                if name.endswith("_sections"):
+                    style_fn = apply_sections_style
+                elif name.endswith("_hazards"):
+                    style_fn = apply_hazards_style
+                else:
+                    style_fn = apply_events_style
                 style_fn(layer)
                 try:
                     layer.setReadOnly(True)

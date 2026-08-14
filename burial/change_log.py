@@ -42,6 +42,12 @@ ACTION_SET_CONCLUSION = "set_conclusion"
 ACTION_EDIT_SECTION = "edit_section"
 ACTION_IMPORT = "import"
 ACTION_ROLLBACK = "rollback"
+ACTION_EDIT_RISK_CHECK = "edit_risk_check"
+ACTION_DELETE_RISK_CHECK = "delete_risk_check"
+ACTION_RISK_SCAN = "risk_scan"
+ACTION_ADD_HAZARD = "add_hazard"
+ACTION_EDIT_HAZARD = "edit_hazard"
+ACTION_DELETE_HAZARD = "delete_hazard"
 
 TableRows = Dict[str, List[Dict]]
 

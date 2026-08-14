@@ -955,6 +955,7 @@ def test_workflow_settings_are_separated() -> bool:
     """Profile, exclusion and generation settings belong to their own tabs."""
     from ..burial.tabs.builder_tab import BuilderTab
     from ..burial.tabs.profile_tab import ProfileTab
+    from ..burial.tabs.risk_tab import RiskTab
     from ..burial.tabs.rules_tab import RulesTab
 
     class _Dock:
@@ -966,6 +967,7 @@ def test_workflow_settings_are_separated() -> bool:
     profile_tab = ProfileTab(model, dock)
     rules_tab = RulesTab(model, dock)
     builder_tab = BuilderTab(model, dock)
+    risk_tab = RiskTab(model, dock)
     ok = hasattr(profile_tab, "profile_step_spin")
     ok = ok and hasattr(profile_tab, "cross_offset_spin")
     ok = ok and not hasattr(rules_tab, "profile_step_spin")
@@ -974,7 +976,9 @@ def test_workflow_settings_are_separated() -> bool:
     ok = ok and hasattr(rules_tab, "sliver_spin")
     ok = ok and not hasattr(rules_tab, "min_section_spin")
     ok = ok and hasattr(builder_tab, "min_section_spin")
-    for widget in (profile_tab, rules_tab, builder_tab):
+    ok = ok and hasattr(risk_tab, "run_button")
+    ok = ok and hasattr(risk_tab, "hazard_table")
+    for widget in (profile_tab, rules_tab, builder_tab, risk_tab):
         widget.deleteLater()
     return _result(
         "workflow controls: profile / exclusions / candidate generation", ok)
@@ -1101,6 +1105,78 @@ def test_rule_editor_extension_and_corridor() -> bool:
                    "round-trip; excluded-sections rows", ok)
 
 
+def test_risk_scan_interactions() -> bool:
+    """Risk Profile scan: point offset, line crossing angle, polygon range."""
+    from ..burial import risk_scan
+
+    route, da = _route()  # ~22.2 km due north along lon 0 from lat 50
+
+    def mem_layer(kind, wkts, name):
+        layer = QgsVectorLayer(f"{kind}?crs=EPSG:4326", name, "memory")
+        provider = layer.dataProvider()
+        feats = []
+        for wkt in wkts:
+            feat = QgsFeature()
+            feat.setGeometry(QgsGeometry.fromWkt(wkt))
+            feats.append(feat)
+        provider.addFeatures(feats)
+        layer.updateExtents()
+        return layer
+
+    check = {"check_id": "c1", "plan_id": "p1", "name": "test",
+             "enabled": 1, "source_ref": "", "notes": "",
+             "config_json": json.dumps({
+                 "input_id": "i1", "distance_m": 100.0,
+                 "band_high_m": 10.0, "band_medium_m": 50.0,
+                 "band_low_m": 100.0})}
+    scope = eng.Interval(0.0, 22.0)
+
+    # Point ~36 m starboard of the route near KP 10 -> medium band.
+    points = mem_layer("Point", ["POINT(0.0005 50.09)"], "contacts")
+    hazards, _warnings = risk_scan.scan_check(
+        "p1", check, points, route, da, scope=scope)
+    ok = len(hazards) == 1
+    point = hazards[0]
+    ok = ok and abs(point["kp"] - 10.0) < 0.3
+    ok = ok and 25.0 < point["offset_m"] < 50.0
+    ok = ok and point["risk"] == "medium" and not point["crossing"]
+
+    # East-west line crossing the northbound route: ~90 degree crossing.
+    lines = mem_layer("LineString",
+                      ["LINESTRING(-0.01 50.05, 0.01 50.05)"], "cables")
+    hazards, _warnings = risk_scan.scan_check(
+        "p1", check, lines, route, da, scope=scope)
+    ok = ok and len(hazards) == 1
+    crossing = hazards[0]
+    ok = ok and crossing["crossing"] == 1 and crossing["offset_m"] == 0.0
+    ok = ok and abs(crossing["kp"] - 5.56) < 0.3
+    ok = ok and crossing["crossing_angle_deg"] is not None \
+        and abs(crossing["crossing_angle_deg"] - 90.0) < 3.0
+    ok = ok and crossing["risk"] == "high"
+
+    # Polygon straddling the route -> KP range where the route runs inside.
+    polys = mem_layer(
+        "Polygon",
+        ["POLYGON((-0.01 50.12, 0.01 50.12, 0.01 50.13, -0.01 50.13,"
+         " -0.01 50.12))"], "sandwaves")
+    hazards, _warnings = risk_scan.scan_check(
+        "p1", check, polys, route, da, scope=scope)
+    ok = ok and len(hazards) == 1
+    field = hazards[0]
+    ok = ok and field["crossing"] == 1
+    length = abs(field["end_kp"] - field["kp"])
+    ok = ok and 0.9 < length < 1.4
+    ok = ok and field["risk"] == "high"
+
+    # A feature outside the search distance is not registered.
+    far = mem_layer("Point", ["POINT(0.01 50.09)"], "far")  # ~700 m off
+    hazards, _warnings = risk_scan.scan_check(
+        "p1", check, far, route, da, scope=scope)
+    ok = ok and hazards == []
+    return _result("risk scan: point offset, crossing angle, polygon range",
+                   ok)
+
+
 def test_burial_depth_config_is_manual_only() -> bool:
     class _Workbench:
         def rpl_depth_config(self, _rpl_id):
@@ -1149,6 +1225,7 @@ def run_all() -> list:
         test_profile_step_resolution_and_staleness(),
         test_workflow_settings_are_separated(),
         test_rule_editor_extension_and_corridor(),
+        test_risk_scan_interactions(),
         test_burial_depth_config_is_manual_only(),
     ]
 

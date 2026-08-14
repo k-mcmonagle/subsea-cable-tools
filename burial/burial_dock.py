@@ -78,6 +78,7 @@ from .tabs.inputs_tab import InputsTab
 from .tabs.plan_tab import PlanTab
 from .tabs.profile_tab import ProfileTab
 from .tabs.review_tab import ReviewTab
+from .tabs.risk_tab import RiskTab
 from .tabs.rules_tab import RulesTab
 
 _VERTICAL = getattr(Qt, "Orientation", Qt).Vertical
@@ -163,12 +164,14 @@ class BurialPlannerDock(QDockWidget):
         self.inputs_tab = InputsTab(self.model, self.workbench_store, dock=self)
         self.profile_tab = ProfileTab(self.model, self)
         self.rules_tab = RulesTab(self.model, self)
+        self.risk_tab = RiskTab(self.model, self)
         self.builder_tab = BuilderTab(self.model, self)
         self.review_tab = ReviewTab(self.model, self)
         self.tabs.addTab(self.plan_tab, "Plan")
         self.tabs.addTab(self.inputs_tab, "Inputs")
         self.tabs.addTab(self.profile_tab, "Bathymetry Profile")
         self.tabs.addTab(self.rules_tab, "Exclusions")
+        self.tabs.addTab(self.risk_tab, "Risk Profile")
         self.tabs.addTab(self.builder_tab, "Plan Builder")
         self.tabs.addTab(self.review_tab, "Review && Export")
         self.splitter.addWidget(self.tabs)

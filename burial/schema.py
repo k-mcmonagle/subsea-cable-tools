@@ -35,7 +35,7 @@ from ..workbench.schema import (  # noqa: F401  (re-exported for the package)
     utc_now_iso,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Registry table names ------------------------------------------------------
 TABLE_META = "bp_meta"
@@ -47,6 +47,8 @@ TABLE_EVENT = "bp_event"
 TABLE_SECTION = "bp_section"
 TABLE_CHANGE_LOG = "bp_change_log"
 TABLE_PROFILE = "bp_profile"
+TABLE_RISK_CHECK = "bp_risk_check"
+TABLE_HAZARD = "bp_hazard"
 
 FieldSpec = Tuple[str, str]
 
@@ -343,6 +345,86 @@ SECTION_FIELDS: List[FieldSpec] = [
     ("notes", "str"),
 ]
 
+# Risk Profile --------------------------------------------------------------
+# Feature-level hazard register: checks scan registered inputs (rocks,
+# pockmarks, sandwaves, mag/sonar/linear contacts, …) for features on or
+# near the route and record each interaction as a hazard with a risk level.
+# Distinct from the Exclusion stack: hazards never remove burial length.
+RISK_UNASSIGNED = ""
+RISK_LOW = "low"
+RISK_MEDIUM = "medium"
+RISK_HIGH = "high"
+RISK_LEVELS: List[str] = [RISK_LOW, RISK_MEDIUM, RISK_HIGH]
+
+RISK_LABELS: Dict[str, str] = {
+    RISK_UNASSIGNED: "Unassigned",
+    RISK_LOW: "Low",
+    RISK_MEDIUM: "Medium",
+    RISK_HIGH: "High",
+}
+
+# Severity order for aggregation ("" sorts lowest).
+RISK_ORDER: Dict[str, int] = {
+    RISK_UNASSIGNED: 0, RISK_LOW: 1, RISK_MEDIUM: 2, RISK_HIGH: 3,
+}
+
+HAZARD_STATUS_OPEN = "open"
+HAZARD_STATUS_NOTED = "noted"
+HAZARD_STATUS_ACCEPTED = "accepted"
+HAZARD_STATUS_MITIGATED = "mitigated"
+HAZARD_STATUSES: List[str] = [
+    HAZARD_STATUS_OPEN, HAZARD_STATUS_NOTED,
+    HAZARD_STATUS_ACCEPTED, HAZARD_STATUS_MITIGATED,
+]
+HAZARD_STATUS_LABELS: Dict[str, str] = {
+    HAZARD_STATUS_OPEN: "Open",
+    HAZARD_STATUS_NOTED: "Noted",
+    HAZARD_STATUS_ACCEPTED: "Accepted",
+    HAZARD_STATUS_MITIGATED: "Mitigated",
+}
+
+HAZARD_SOURCE_CHECK = "check"
+HAZARD_SOURCE_MANUAL = "manual"
+
+RISK_SOURCE_AUTO = "auto"
+RISK_SOURCE_USER = "user"
+
+RISK_CHECK_FIELDS: List[FieldSpec] = [
+    ("check_id", "str"),
+    ("plan_id", "str"),
+    ("seq", "int"),
+    ("name", "str"),
+    ("enabled", "int"),
+    ("config_json", "str"),          # input_id / distance_m / filter /
+    #                                  label_attribute / band_*_m /
+    #                                  default_risk / attribute /
+    #                                  attribute_rules
+    ("source_ref", "str"),           # document + revision the criteria follow
+    ("notes", "str"),
+]
+
+HAZARD_FIELDS: List[FieldSpec] = [
+    ("hazard_id", "str"),
+    ("plan_id", "str"),
+    ("check_id", "str"),             # "" for manual hazards
+    ("feature_ref", "str"),          # source feature key (carry-over match)
+    ("label", "str"),
+    ("kp", "float"),
+    ("end_kp", "float"),             # = kp for point interactions
+    ("offset_m", "float"),           # nearest approach; 0 when crossing
+    ("crossing", "int"),
+    ("crossing_angle_deg", "float"),  # nullable; line crossings only
+    ("lat", "float"),
+    ("lon", "float"),
+    ("risk", "str"),                 # "" | low | medium | high (effective)
+    ("auto_risk", "str"),            # the check's assessment (audit)
+    ("risk_source", "str"),          # auto | user
+    ("status", "str"),               # open | noted | accepted | mitigated
+    ("attributes_json", "str"),      # snapshot of the attributes used
+    ("source", "str"),               # check | manual
+    ("notes", "str"),
+]
+
 # One persisted sampling pass per plan (depth + optional cross-offset
 # depths): derived data — rebuilt on demand, never change-logged.
 PROFILE_FIELDS: List[FieldSpec] = [
@@ -377,6 +459,8 @@ REGISTRY_TABLES: Dict[str, List[FieldSpec]] = {
     TABLE_SECTION: SECTION_FIELDS,
     TABLE_CHANGE_LOG: CHANGE_LOG_FIELDS,
     TABLE_PROFILE: PROFILE_FIELDS,
+    TABLE_RISK_CHECK: RISK_CHECK_FIELDS,
+    TABLE_HAZARD: HAZARD_FIELDS,
 }
 
 TABLE_KEYS: Dict[str, str] = {
@@ -388,6 +472,8 @@ TABLE_KEYS: Dict[str, str] = {
     TABLE_SECTION: "section_id",
     TABLE_CHANGE_LOG: "change_id",
     TABLE_PROFILE: "profile_id",
+    TABLE_RISK_CHECK: "check_id",
+    TABLE_HAZARD: "hazard_id",
 }
 
 # Per-plan spatial layer schemas -------------------------------------------
@@ -423,6 +509,22 @@ EVENTS_LAYER_FIELDS: List[FieldSpec] = [
     ("notes", "str"),
 ]
 
+HAZARDS_LAYER_FIELDS: List[FieldSpec] = [
+    ("hazard_id", "str"),
+    ("plan_id", "str"),
+    ("label", "str"),
+    ("check", "str"),
+    ("kp", "float"),
+    ("end_kp", "float"),
+    ("offset_m", "float"),
+    ("crossing", "int"),
+    ("crossing_angle_deg", "float"),
+    ("risk", "str"),
+    ("status", "str"),
+    ("source", "str"),
+    ("notes", "str"),
+]
+
 
 def plan_layer_base(plan_name: str, rev_label: str, plan_id: str) -> str:
     """Base fragment for a plan's spatial layer names.
@@ -443,6 +545,10 @@ def sections_layer_name(plan_name: str, rev_label: str, plan_id: str) -> str:
 
 def events_layer_name(plan_name: str, rev_label: str, plan_id: str) -> str:
     return f"{plan_layer_base(plan_name, rev_label, plan_id)}_events"
+
+
+def hazards_layer_name(plan_name: str, rev_label: str, plan_id: str) -> str:
+    return f"{plan_layer_base(plan_name, rev_label, plan_id)}_hazards"
 
 
 def default_gpkg_path(project_path: str, project_title: str = "") -> str:

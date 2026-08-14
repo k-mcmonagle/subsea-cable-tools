@@ -30,6 +30,9 @@ SECTION_COLUMNS = ["section_ref", "kind", "start_kp", "end_kp", "length_km",
                    "reasons", "notes"]
 INPUT_COLUMNS = ["role", "layer_name", "layer_source", "originator", "revision",
                  "status", "received_utc", "quality", "notes"]
+HAZARD_COLUMNS = ["risk", "status", "kp", "end_kp", "offset_m", "crossing",
+                  "crossing_angle_deg", "feature", "check", "lat", "lon",
+                  "source", "notes"]
 
 
 def _fmt(value, places: int) -> str:
@@ -102,6 +105,34 @@ def sections_csv(plan: Dict, sections: Sequence[Dict], generation_id: str = "") 
              if section.get("kind") == schema.SECTION_SKIP else ""),
             section.get("reason_json") or "",
             section.get("notes") or "",
+        ])
+    return buf.getvalue()
+
+
+def hazards_csv(plan: Dict, hazards: Sequence[Dict],
+                risk_checks: Sequence[Dict] = ()) -> str:
+    check_names = {str(c.get("check_id") or ""): (c.get("name") or "")
+                   for c in risk_checks}
+    buf = io.StringIO()
+    for line in metadata_lines(plan):
+        buf.write(line + "\r\n")
+    writer = csv.writer(buf, lineterminator="\r\n")
+    writer.writerow(HAZARD_COLUMNS)
+    for hazard in hazards:
+        writer.writerow([
+            schema.RISK_LABELS.get(hazard.get("risk") or "", ""),
+            schema.HAZARD_STATUS_LABELS.get(hazard.get("status") or "", ""),
+            schema.format_kp(hazard.get("kp")),
+            schema.format_kp(hazard.get("end_kp")),
+            _fmt(hazard.get("offset_m"), 1),
+            int(hazard.get("crossing") or 0),
+            _fmt(hazard.get("crossing_angle_deg"), 1),
+            hazard.get("label") or "",
+            check_names.get(str(hazard.get("check_id") or ""), "manual"),
+            _fmt(hazard.get("lat"), 7),
+            _fmt(hazard.get("lon"), 7),
+            hazard.get("source") or "",
+            hazard.get("notes") or "",
         ])
     return buf.getvalue()
 

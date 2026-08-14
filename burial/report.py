@@ -223,7 +223,9 @@ def build_report_html(plan: Dict,
                       generation: Optional[Dict] = None,
                       change_log: Optional[Sequence[Dict]] = None,
                       profile_png: Optional[bytes] = None,
-                      now_utc: str = "") -> str:
+                      now_utc: str = "",
+                      hazards: Optional[Sequence[Dict]] = None,
+                      risk_checks: Optional[Sequence[Dict]] = None) -> str:
     """Assemble the full report; pure formatting, no QGIS access."""
     method = plan.get("method") or ""
     status = plan.get("status") or ""
@@ -347,6 +349,44 @@ def build_report_html(plan: Dict,
         ))
     parts.append(_table(("Seq", "Event", "KP", "Lat", "Lon", "Depth (m)",
                          "Source", "Status", "Locked", "Notes"), event_rows))
+
+    # -- risk profile ---------------------------------------------------------
+    if hazards:
+        parts.append("<h2>Risk profile</h2>")
+        counts: Dict[str, int] = {}
+        for hazard in hazards:
+            level = hazard.get("risk") or ""
+            counts[level] = counts.get(level, 0) + 1
+        summary_bits = [
+            f"{counts.get(level, 0)} {schema.RISK_LABELS[level].lower()}"
+            for level in (schema.RISK_HIGH, schema.RISK_MEDIUM, schema.RISK_LOW)
+            if counts.get(level)]
+        if counts.get(""):
+            summary_bits.append(f"{counts['']} unassigned")
+        parts.append(f"<p>{len(list(hazards))} hazard(s)"
+                     + (": " + ", ".join(summary_bits) if summary_bits else "")
+                     + ".</p>")
+        check_names = {str(c.get("check_id") or ""): (c.get("name") or "")
+                       for c in (risk_checks or [])}
+        hazard_rows = []
+        for hazard in hazards:
+            hazard_rows.append((
+                _esc(schema.RISK_LABELS.get(hazard.get("risk") or "", "")),
+                _esc(schema.HAZARD_STATUS_LABELS.get(
+                    hazard.get("status") or "", "")),
+                _kp(hazard.get("kp")),
+                _kp(hazard.get("end_kp")),
+                _num(hazard.get("offset_m"), 1),
+                "yes" if int(hazard.get("crossing") or 0) else "",
+                _num(hazard.get("crossing_angle_deg"), 1),
+                _esc(hazard.get("label")),
+                _esc(check_names.get(str(hazard.get("check_id") or ""),
+                                     "manual")),
+                _esc(hazard.get("notes")),
+            ))
+        parts.append(_table(("Risk", "Status", "KP", "End KP", "Offset (m)",
+                             "Crossing", "Angle (°)", "Feature", "Check",
+                             "Notes"), hazard_rows, raw=True))
 
     # -- exclusion stack ------------------------------------------------------
     parts.append("<h2>Exclusion stack</h2>")

@@ -207,7 +207,8 @@ class BurialStore:
         for table in (schema.TABLE_INPUT, schema.TABLE_RULE,
                       schema.TABLE_GENERATION, schema.TABLE_EVENT,
                       schema.TABLE_SECTION, schema.TABLE_CHANGE_LOG,
-                      schema.TABLE_PROFILE):
+                      schema.TABLE_PROFILE, schema.TABLE_RISK_CHECK,
+                      schema.TABLE_HAZARD):
             remaining = [r for r in self.read_table(table)
                          if r.get("plan_id") != plan_id]
             self.write_table(table, remaining)
@@ -284,6 +285,35 @@ class BurialStore:
         if new_sections:
             self.upsert_rows(schema.TABLE_SECTION, new_sections)
 
+        check_id_map: Dict[str, str] = {}
+        new_checks = []
+        for row in self.list_risk_checks(plan_id):
+            new_row = dict(row)
+            new_row["check_id"] = schema.new_id()
+            check_id_map[str(row.get("check_id"))] = new_row["check_id"]
+            new_row["plan_id"] = new_plan_id
+            try:
+                config = json.loads(new_row.get("config_json") or "{}")
+            except (ValueError, TypeError):
+                config = {}
+            if isinstance(config, dict) and config.get("input_id") in input_id_map:
+                config["input_id"] = input_id_map[config["input_id"]]
+                new_row["config_json"] = json.dumps(config)
+            new_checks.append(new_row)
+        if new_checks:
+            self.upsert_rows(schema.TABLE_RISK_CHECK, new_checks)
+
+        new_hazards = []
+        for row in self.list_hazards(plan_id):
+            new_row = dict(row)
+            new_row["hazard_id"] = schema.new_id()
+            new_row["plan_id"] = new_plan_id
+            new_row["check_id"] = check_id_map.get(
+                str(row.get("check_id") or ""), "")
+            new_hazards.append(new_row)
+        if new_hazards:
+            self.upsert_rows(schema.TABLE_HAZARD, new_hazards)
+
         # The sampled profile is derived but expensive — carry the copy over.
         profile_row = self.get_plan_profile(plan_id)
         if profile_row is not None:
@@ -332,6 +362,45 @@ class BurialStore:
             rule.setdefault("rule_id", schema.new_id())
             normalised.append(rule)
         self.write_table(schema.TABLE_RULE, others + normalised)
+
+    # -- risk checks / hazards ----------------------------------------------
+    def list_risk_checks(self, plan_id: str) -> List[Dict]:
+        rows = [r for r in self.read_table(schema.TABLE_RISK_CHECK)
+                if r.get("plan_id") == plan_id]
+        rows.sort(key=lambda r: int(r.get("seq") or 0))
+        return rows
+
+    def save_risk_checks(self, plan_id: str, checks: Sequence[Dict]) -> None:
+        """Replace the plan's risk checks (seq-normalised, list order wins)."""
+        others = [r for r in self.read_table(schema.TABLE_RISK_CHECK)
+                  if r.get("plan_id") != plan_id]
+        normalised = []
+        for seq, check in enumerate(checks):
+            check = dict(check)
+            check["plan_id"] = plan_id
+            check["seq"] = seq
+            check.setdefault("check_id", schema.new_id())
+            normalised.append(check)
+        self.write_table(schema.TABLE_RISK_CHECK, others + normalised)
+
+    def list_hazards(self, plan_id: str) -> List[Dict]:
+        rows = [r for r in self.read_table(schema.TABLE_HAZARD)
+                if r.get("plan_id") == plan_id]
+        rows.sort(key=lambda r: (float(r.get("kp") or 0.0),
+                                 str(r.get("hazard_id") or "")))
+        return rows
+
+    def save_hazards(self, plan_id: str, rows: Sequence[Dict]) -> None:
+        """Replace all hazards for one plan."""
+        others = [r for r in self.read_table(schema.TABLE_HAZARD)
+                  if r.get("plan_id") != plan_id]
+        normalised = []
+        for row in rows:
+            row = dict(row)
+            row["plan_id"] = plan_id
+            row.setdefault("hazard_id", schema.new_id())
+            normalised.append(row)
+        self.write_table(schema.TABLE_HAZARD, others + normalised)
 
     # -- generations ---------------------------------------------------------
     def list_generations(self, plan_id: str) -> List[Dict]:

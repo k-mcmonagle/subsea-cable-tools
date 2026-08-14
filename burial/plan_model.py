@@ -27,7 +27,7 @@ from qgis.PyQt.QtCore import QObject, pyqtSignal
 
 from ..workbench.depth_service import DepthService, DepthSourceConfig
 from ..workbench.rules_engine import Interval
-from . import change_log, events as ev, generation, io_csv, map_layers, schema
+from . import change_log, events as ev, generation, io_csv, map_layers, risk, schema
 from .analysis_task import build_route_frame
 from .profile_data import PlanProfile
 from .store import BurialStore
@@ -54,6 +54,7 @@ class PlanModel(QObject):
     rulesChanged = pyqtSignal()
     eventsChanged = pyqtSignal()
     sectionsChanged = pyqtSignal()
+    riskChanged = pyqtSignal()       # risk checks and/or hazards
     logChanged = pyqtSignal()
     storeError = pyqtSignal(str)
 
@@ -66,6 +67,8 @@ class PlanModel(QObject):
         self.rules: List[Dict] = []
         self.events: List[Dict] = []
         self.sections: List[Dict] = []
+        self.risk_checks: List[Dict] = []
+        self.hazards: List[Dict] = []
         self.context = generation.ResolutionContext()
         self.route = None            # RouteFrame over the plan's RPL (WGS84)
         self.distance = None
@@ -129,6 +132,8 @@ class PlanModel(QObject):
         self.rules = self.store.list_rules(plan_id)
         self.events = self.store.list_events(plan_id)
         self.sections = self.store.list_sections(plan_id)
+        self.risk_checks = self.store.list_risk_checks(plan_id)
+        self.hazards = self.store.list_hazards(plan_id)
         self.acq_cache.clear()
         self.bathy_profile = PlanProfile.from_row(
             self.store.get_plan_profile(plan_id))
@@ -140,6 +145,7 @@ class PlanModel(QObject):
         self.rulesChanged.emit()
         self.eventsChanged.emit()
         self.sectionsChanged.emit()
+        self.riskChanged.emit()
         return True
 
     def close_plan(self) -> None:
@@ -148,6 +154,8 @@ class PlanModel(QObject):
         self.rules = []
         self.events = []
         self.sections = []
+        self.risk_checks = []
+        self.hazards = []
         self.context = generation.ResolutionContext()
         self.route = None
         self.resolved_rpl_id = ""
@@ -507,6 +515,115 @@ class PlanModel(QObject):
         self.rulesChanged.emit()
         self.logChanged.emit()
         return True
+
+    # -- risk profile --------------------------------------------------------
+    def save_risk_checks(self, checks: List[Dict], target_id: str = "",
+                         action: str = change_log.ACTION_EDIT_RISK_CHECK) -> bool:
+        before_checks = self.store.list_risk_checks(self.plan_id)
+        ok, _ = self._store_write("save the risk checks",
+                                  self.store.save_risk_checks,
+                                  self.plan_id, checks)
+        if not ok:
+            return False
+        self.risk_checks = self.store.list_risk_checks(self.plan_id)
+        self.store.append_change(
+            self.plan_id, action, target_id,
+            before={schema.TABLE_RISK_CHECK: before_checks},
+            after={schema.TABLE_RISK_CHECK: [dict(c) for c in self.risk_checks]})
+        self.riskChanged.emit()
+        self.logChanged.emit()
+        return True
+
+    def _write_hazards(self, action: str, target_id: str,
+                       new_hazards: List[Dict], reason: str = "") -> bool:
+        """One logged, store-written hazard mutation."""
+        before = {schema.TABLE_HAZARD: [dict(h) for h in self.hazards]}
+        ok, _ = self._store_write("save the hazards", self.store.save_hazards,
+                                  self.plan_id, risk.sort_hazards(new_hazards))
+        if not ok:
+            return False
+        self.hazards = self.store.list_hazards(self.plan_id)
+        self.store.append_change(
+            self.plan_id, action, target_id, before=before,
+            after={schema.TABLE_HAZARD: [dict(h) for h in self.hazards]},
+            reason=reason)
+        self.refresh_layers()
+        self.riskChanged.emit()
+        self.logChanged.emit()
+        return True
+
+    def apply_risk_scan(self, auto_hazards: List[Dict],
+                        check_ids: Optional[List[str]] = None) -> bool:
+        """Replace scanned hazards with the fresh results, carrying the
+        user's review (status/notes/user-set risk) over by feature identity.
+
+        ``check_ids`` limits the replacement to those checks (a single-check
+        run must not wipe other checks' findings); manual hazards always
+        survive.
+        """
+        wanted = set(check_ids or [])
+
+        def replaced(hazard: Dict) -> bool:
+            if (hazard.get("source") or "") == schema.HAZARD_SOURCE_MANUAL:
+                return False
+            return not wanted or str(hazard.get("check_id") or "") in wanted
+
+        kept = [dict(h) for h in self.hazards if not replaced(h)]
+        previous = [h for h in self.hazards if replaced(h)]
+        merged = kept + risk.carry_over_hazards(auto_hazards, previous)
+        return self._write_hazards(change_log.ACTION_RISK_SCAN,
+                                   ",".join(sorted(wanted)) or "all", merged)
+
+    def add_manual_hazard(self, kp: float, end_kp: Optional[float],
+                          label: str, risk_level: str, notes: str = "") -> bool:
+        lo, hi = self._scope_bounds()
+        lo, hi = min(lo, hi), max(lo, hi)
+        if not (lo - 1e-9 <= float(kp) <= hi + 1e-9):
+            raise ValueError(
+                f"The hazard KP must lie inside the plan scope "
+                f"KP {schema.format_kp(lo)}-{schema.format_kp(hi)}.")
+        row = risk.new_hazard_row(
+            self.plan_id, "", f"manual-{schema.new_id()[:8]}", label,
+            float(kp), float(end_kp) if end_kp is not None else None,
+            0.0, False, None, None, None, "",
+            source=schema.HAZARD_SOURCE_MANUAL, notes=notes)
+        if self.route is not None:
+            point = self.route.point_at_kp(float(kp), clamp=True)
+            if point is not None:
+                row["lat"], row["lon"] = point.y(), point.x()
+        row["risk"] = risk_level or ""
+        row["risk_source"] = schema.RISK_SOURCE_USER
+        return self._write_hazards(change_log.ACTION_ADD_HAZARD,
+                                   row["hazard_id"],
+                                   [dict(h) for h in self.hazards] + [row])
+
+    def update_hazards(self, hazard_ids: List[str], updates: Dict,
+                       action: str = change_log.ACTION_EDIT_HAZARD) -> bool:
+        wanted = {str(h) for h in hazard_ids if h}
+        if not wanted:
+            return False
+        changed = False
+        rows = []
+        for hazard in self.hazards:
+            row = dict(hazard)
+            if str(row.get("hazard_id") or "") in wanted:
+                if "risk" in updates:
+                    row["risk_source"] = schema.RISK_SOURCE_USER
+                row.update(updates)
+                changed = True
+            rows.append(row)
+        if not changed:
+            return False
+        return self._write_hazards(action, ",".join(sorted(wanted)), rows)
+
+    def delete_hazards(self, hazard_ids: List[str]) -> bool:
+        wanted = {str(h) for h in hazard_ids if h}
+        remaining = [dict(h) for h in self.hazards
+                     if str(h.get("hazard_id") or "") not in wanted]
+        if len(remaining) == len(self.hazards):
+            return False
+        return self._write_hazards(change_log.ACTION_DELETE_HAZARD,
+                                   ",".join(sorted(wanted)), remaining)
 
     # -- events --------------------------------------------------------------
     def _scope_bounds(self) -> Tuple[float, float]:
@@ -904,7 +1021,9 @@ class PlanModel(QObject):
             return
         try:
             map_layers.write_plan_layers(self.store, self.plan, self.sections,
-                                         self.events, self.route)
+                                         self.events, self.route,
+                                         hazards=self.hazards,
+                                         risk_checks=self.risk_checks)
             map_layers.ensure_plan_layers(QgsProject.instance(),
                                           self.store.gpkg_path, self.plan)
         except Exception as exc:
@@ -923,3 +1042,6 @@ class PlanModel(QObject):
 
     def export_inputs_csv(self) -> str:
         return io_csv.inputs_csv(self.plan, self.inputs)
+
+    def export_hazards_csv(self) -> str:
+        return io_csv.hazards_csv(self.plan, self.hazards, self.risk_checks)

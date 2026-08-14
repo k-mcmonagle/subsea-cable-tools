@@ -78,6 +78,7 @@ class ReviewTab(QWidget):
         export_row.addWidget(report_button)
         for label, slot in (("Export events CSV…", self._export_events),
                             ("Export sections CSV…", self._export_sections),
+                            ("Export hazards CSV…", self._export_hazards),
                             ("Export input register CSV…", self._export_inputs)):
             button = QPushButton(label)
             button.clicked.connect(slot)
@@ -230,7 +231,8 @@ class ReviewTab(QWidget):
             plan=self.model.plan, sections=self.model.sections,
             events=self.model.events, rules=self.model.rules,
             inputs=self.model.inputs, generation=active,
-            change_log=entries, profile_png=self._profile_png())
+            change_log=entries, profile_png=self._profile_png(),
+            hazards=self.model.hazards, risk_checks=self.model.risk_checks)
         try:
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write(text)
@@ -258,6 +260,10 @@ class ReviewTab(QWidget):
     def _export_sections(self) -> None:
         if self.model.plan:
             self._export("sections", self.model.export_sections_csv())
+
+    def _export_hazards(self) -> None:
+        if self.model.plan:
+            self._export("hazards", self.model.export_hazards_csv())
 
     def _export_inputs(self) -> None:
         if self.model.plan:
