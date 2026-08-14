@@ -378,9 +378,35 @@ def test_manual_burial_across_exclusion_is_flagged() -> bool:
     return _result("manual burial across an exclusion remains visibly flagged", ok)
 
 
+def test_context_round_trip_keeps_rule_hits() -> bool:
+    """Per-rule resolved footprints persist with the generation context, so
+    the per-criterion fire bars and coverage survive reopening a plan."""
+    acq1 = gen.RuleAcquisition(
+        _rule("r1", "deep water"), [Interval(8.0, 12.0)])
+    acq2 = gen.RuleAcquisition(
+        _rule("r2", "boulders", criterion="screening", action="risk"),
+        [Interval(2.0, 3.0), Interval(9.0, 10.0)])
+    out = gen.generate(_params(), [acq1, acq2], id_fn=_counter_id_fn())
+    ok = set(out.rule_hits) == {"r1", "r2"}
+    ok = ok and len(out.rule_hits["r2"]) == 2
+
+    # Round trip through JSON (as stored in bp_generation.summary_json).
+    data = json.loads(json.dumps(gen.context_to_dict(out)))
+    ctx = gen.context_from_dict(data)
+    ok = ok and set(ctx.rule_hits) == {"r1", "r2"}
+    ok = ok and abs(ctx.rule_hits["r1"][0].start_km - 8.0) < 1e-9
+    ok = ok and abs(ctx.rule_hits["r1"][0].end_km - 12.0) < 1e-9
+    ok = ok and abs(ctx.rule_hits["r2"][1].end_km - 10.0) < 1e-9
+    # Older stored contexts without the key load cleanly.
+    data.pop("rule_hits")
+    ok = ok and gen.context_from_dict(data).rule_hits == {}
+    return _result("resolution context round-trips per-rule hits", ok)
+
+
 def run_all() -> list:
     return [
         test_basic_sections_and_events(),
+        test_context_round_trip_keeps_rule_hits(),
         test_direction_reversed_events(),
         test_screening_never_removes(),
         test_influence_flags_on_boundary(),

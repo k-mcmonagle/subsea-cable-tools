@@ -115,6 +115,9 @@ class GenerationOutput:
     warnings: List[str] = field(default_factory=list)
     summary: Dict = field(default_factory=dict)
     proposal_diff: Optional[Dict] = None
+    # Resolved per-rule footprints (extension buffers included) — feeds the
+    # per-criterion fire bars and coverage after the plan is reopened.
+    rule_hits: Dict[str, List[Interval]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -796,6 +799,8 @@ def generate(params: GenParams, acquisitions: Sequence[RuleAcquisition],
     out.excluded = [v for v in verdicts if v.status == eng.STATUS_EXCLUDED]
     out.screening = [v for v in verdicts if v.status == eng.STATUS_RISK]
     out.influence = influence
+    out.rule_hits = {str(rule_id): list(intervals)
+                     for rule_id, intervals in result.rule_hits.items()}
     excluded_ranges = [Interval(v.start_km, v.end_km) for v in out.excluded]
     out.insufficient = eng.subtract_intervals(nodata, excluded_ranges)
 
@@ -889,6 +894,9 @@ def context_to_dict(out: GenerationOutput) -> Dict:
         "insufficient": [[iv.start_km, iv.end_km] for iv in out.insufficient],
         "dropped_short": [[iv.start_km, iv.end_km] for iv in out.dropped_short],
         "candidates": [[iv.start_km, iv.end_km] for iv in out.candidates],
+        "rule_hits": {str(rule_id): [[iv.start_km, iv.end_km]
+                                     for iv in intervals]
+                      for rule_id, intervals in (out.rule_hits or {}).items()},
     }
 
 
@@ -900,6 +908,7 @@ class ResolutionContext:
     insufficient: List[Interval] = field(default_factory=list)
     dropped_short: List[Interval] = field(default_factory=list)
     candidates: List[Interval] = field(default_factory=list)
+    rule_hits: Dict[str, List[Interval]] = field(default_factory=dict)
 
 
 def context_from_dict(data: Optional[Dict]) -> ResolutionContext:
@@ -936,6 +945,16 @@ def context_from_dict(data: Optional[Dict]) -> ResolutionContext:
                 target.append(Interval(float(pair[0]), float(pair[1])))
             except (IndexError, TypeError, ValueError):
                 continue
+    hits = data.get("rule_hits")
+    if isinstance(hits, dict):
+        for rule_id, pairs in hits.items():
+            intervals: List[Interval] = []
+            for pair in pairs or []:
+                try:
+                    intervals.append(Interval(float(pair[0]), float(pair[1])))
+                except (IndexError, TypeError, ValueError):
+                    continue
+            ctx.rule_hits[str(rule_id)] = intervals
     return ctx
 
 

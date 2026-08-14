@@ -725,6 +725,8 @@ class BurialPlannerDock(QDockWidget):
             out.screening = [v for v in verdicts if v.status == "risk"]
             out.influence = influence
             out.insufficient = nodata
+            out.rule_hits = {rule_id: list(intervals) for rule_id, intervals
+                             in resolved.rule_hits.items()}
             self.model.context = generation.context_from_dict(
                 generation.context_to_dict(out))
             self._refresh_profile_overlays()

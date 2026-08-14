@@ -103,6 +103,11 @@ _SHOW_RESOLVED_SETTINGS_KEY = \
 
 _RESOLVED_COLUMNS = ["Start KP", "End KP", "Length (km)", "Status",
                      "Dominant criterion", "Triggered by"]
+_BY_RULE_COLUMNS = ["Criterion", "Start KP", "End KP", "Length (km)",
+                    "Status"]
+
+_RESOLVED_VIEW_SETTINGS_KEY = \
+    "SubseaCableTools/BurialPlanner/rules_resolved_view"
 
 
 def verdict_row_values(verdict, rule_names: Dict[str, str]) -> List[str]:
@@ -816,6 +821,21 @@ class RulesTab(QWidget):
             "highlight the range; double-click to zoom map and profile.")
         resolved_header.addWidget(self.resolved_label)
         resolved_header.addStretch(1)
+        self.resolved_view_combo = QComboBox()
+        self.resolved_view_combo.addItem("Grouped (resolved ranges)", "grouped")
+        self.resolved_view_combo.addItem("By criterion", "by_rule")
+        self.resolved_view_combo.setToolTip(
+            "Grouped shows each resolved range once with every criterion "
+            "that triggered it. By criterion breaks the ranges down to one "
+            "row per criterion per range, so overlapping criteria can be "
+            "reviewed independently.")
+        stored_view = QSettings().value(_RESOLVED_VIEW_SETTINGS_KEY,
+                                        "grouped", type=str)
+        self.resolved_view_combo.setCurrentIndex(
+            max(0, self.resolved_view_combo.findData(stored_view)))
+        self.resolved_view_combo.currentIndexChanged.connect(
+            self._on_resolved_view_changed)
+        resolved_header.addWidget(self.resolved_view_combo)
         resolved_export = QPushButton("Export CSV…")
         resolved_export.setToolTip(
             "Write the resolved excluded / flagged ranges with their "
@@ -945,6 +965,7 @@ class RulesTab(QWidget):
             self.rule_table.setRowCount(len(rules))
             scope = params.scope
             domain_km = scope.length_km if plan else 0.0
+            rule_hits = self._current_rule_hits()
             for i, rule in enumerate(rules):
                 on_item = QTableWidgetItem()
                 on_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
@@ -968,7 +989,7 @@ class RulesTab(QWidget):
 
                 fire_item = QTableWidgetItem()
                 fire_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-                intervals = self._last_results.get(str(rule.get("rule_id")), [])
+                intervals = rule_hits.get(str(rule.get("rule_id")), [])
                 color = (ACTION_COLORS[wb_schema.RULE_ACTION_RISK]
                          if rule.get("criterion_class") == schema.CRITERION_SCREENING
                          else ACTION_COLORS.get(rule.get("action") or "", QColor("#888")))
@@ -998,6 +1019,16 @@ class RulesTab(QWidget):
         merged = list(context.excluded) + list(context.screening)
         merged.sort(key=lambda v: (v.start_km, v.end_km))
         return merged
+
+    def _current_rule_hits(self) -> Dict[str, List]:
+        """Per-rule resolved intervals: the latest recompute, else the stored
+        plan context (so fire bars and coverage survive reopening)."""
+        if self._last_results:
+            return self._last_results
+        context = getattr(self.model, "context", None)
+        stored = getattr(context, "rule_hits", None) or {}
+        return {rule_id: [(iv.start_km, iv.end_km) for iv in intervals]
+                for rule_id, intervals in stored.items()}
 
     def _refresh_overview(self) -> None:
         params = self.model.gen_params()
@@ -1053,7 +1084,7 @@ class RulesTab(QWidget):
         if row >= len(self.model.rules):
             return
         rule = self.model.rules[row]
-        intervals = self._last_results.get(str(rule.get("rule_id")), [])
+        intervals = self._current_rule_hits().get(str(rule.get("rule_id")), [])
         menu = QMenu(self)
         edit_action = menu.addAction("Edit criterion…")
         delete_action = menu.addAction("Delete criterion")
@@ -1088,14 +1119,53 @@ class RulesTab(QWidget):
         return {str(r.get("rule_id")): (r.get("name") or "")
                 for r in self.model.rules}
 
-    def _refresh_resolved(self) -> None:
-        """Rebuild the resolved-exclusions table from the current verdicts."""
+    def _on_resolved_view_changed(self) -> None:
+        QSettings().setValue(_RESOLVED_VIEW_SETTINGS_KEY,
+                             self.resolved_view_combo.currentData() or "grouped")
+        self._refresh_resolved()
+
+    def _resolved_view_rows(self):
+        """(columns, display rows, (start_km, end_km) spans, summary text)."""
+        rule_names = self._rule_names()
+        if (self.resolved_view_combo.currentData() or "grouped") == "by_rule":
+            columns = _BY_RULE_COLUMNS
+            rows: List[List[str]] = []
+            spans: List = []
+            hits = self._current_rule_hits()
+            fired_criteria = 0
+            for rule in self.model.rules:
+                if not int(rule.get("enabled") or 0):
+                    continue
+                intervals = hits.get(str(rule.get("rule_id")), [])
+                if not intervals:
+                    continue
+                fired_criteria += 1
+                if rule.get("criterion_class") == schema.CRITERION_SCREENING:
+                    status = "Flagged (screening)"
+                elif (rule.get("action") or "") == wb_schema.RULE_ACTION_ALLOW:
+                    status = "Allow exception"
+                else:
+                    status = "Excluded"
+                badge = _CLASS_BADGES.get(rule.get("criterion_class") or "", "")
+                name = (f"[{badge}] " if badge else "") + (rule.get("name") or "")
+                for start_km, end_km in intervals:
+                    rows.append([name, schema.format_kp(start_km),
+                                 schema.format_kp(end_km),
+                                 schema.format_kp(end_km - start_km), status])
+                    spans.append((start_km, end_km))
+            summary = "Resolved exclusions — by criterion"
+            if rows:
+                summary += (f": {len(rows)} range(s) across "
+                            f"{fired_criteria} criteria")
+            else:
+                summary += ": none yet (run Recompute)"
+            return columns, rows, spans, summary
+
         verdicts = [v for v in self._current_verdicts()
                     if v.status in (STATUS_EXCLUDED, STATUS_RISK)]
         verdicts.sort(key=lambda v: (v.start_km, v.end_km))
-        self._resolved_rows = verdicts
-        rule_names = self._rule_names()
-        self.resolved_table.setRowCount(len(verdicts))
+        rows = [verdict_row_values(v, rule_names) for v in verdicts]
+        spans = [(v.start_km, v.end_km) for v in verdicts]
         excluded_km = sum(v.end_km - v.start_km for v in verdicts
                           if v.status == STATUS_EXCLUDED)
         flagged = sum(1 for v in verdicts if v.status == STATUS_RISK)
@@ -1107,13 +1177,24 @@ class RulesTab(QWidget):
                 summary += f", {flagged} screening flag(s)"
         else:
             summary += " — none yet (run Recompute)"
+        return _RESOLVED_COLUMNS, rows, spans, summary
+
+    def _refresh_resolved(self) -> None:
+        """Rebuild the resolved-exclusions table in the selected view."""
+        columns, rows, spans, summary = self._resolved_view_rows()
+        self._resolved_rows = spans
         self.resolved_label.setText(summary)
-        for i, verdict in enumerate(verdicts):
-            for j, value in enumerate(verdict_row_values(verdict, rule_names)):
+        self.resolved_table.setColumnCount(len(columns))
+        self.resolved_table.setHorizontalHeaderLabels(columns)
+        self.resolved_table.horizontalHeader().setSectionResizeMode(
+            len(columns) - 1, HEADER_RESIZE_MODE_STRETCH)
+        self.resolved_table.setRowCount(len(rows))
+        for i, row_values in enumerate(rows):
+            for j, value in enumerate(row_values):
                 item = QTableWidgetItem(value)
                 item.setFlags(Qt.ItemFlag.ItemIsEnabled
                               | Qt.ItemFlag.ItemIsSelectable)
-                if j == len(_RESOLVED_COLUMNS) - 1:
+                if j in (0, len(columns) - 1):
                     item.setToolTip(value)
                 self.resolved_table.setItem(i, j, item)
 
@@ -1122,16 +1203,17 @@ class RulesTab(QWidget):
             return
         row = self.resolved_table.currentRow()
         if 0 <= row < len(self._resolved_rows):
-            verdict = self._resolved_rows[row]
-            self.dock.highlight_range(verdict.start_km, verdict.end_km)
+            start_km, end_km = self._resolved_rows[row]
+            self.dock.highlight_range(start_km, end_km)
 
     def _goto_resolved_row(self, row: int) -> None:
         if 0 <= row < len(self._resolved_rows):
-            verdict = self._resolved_rows[row]
-            self.dock.goto_range(verdict.start_km, verdict.end_km)
+            start_km, end_km = self._resolved_rows[row]
+            self.dock.goto_range(start_km, end_km)
 
     def _export_resolved_csv(self) -> None:
-        if not self._resolved_rows:
+        columns, rows, _spans, _summary = self._resolved_view_rows()
+        if not rows:
             QMessageBox.information(
                 self, "Burial Planner",
                 "No excluded or flagged sections are available yet — run "
@@ -1144,16 +1226,13 @@ class RulesTab(QWidget):
             return
         import csv
 
-        rule_names = self._rule_names()
-        headers = ["start_kp", "end_kp", "length_km", "status",
-                   "dominant_criterion", "triggered_by"]
+        headers = [c.lower().replace(" (km)", "_km").replace(" ", "_")
+                   for c in columns]
         with open(path, "w", encoding="utf-8", newline="") as handle:
             writer = csv.writer(handle)
             writer.writerow(headers)
-            for verdict in self._resolved_rows:
-                writer.writerow(verdict_row_values(verdict, rule_names))
-        self.status_label.setText(
-            f"Exported {len(self._resolved_rows)} resolved range(s).")
+            writer.writerows(rows)
+        self.status_label.setText(f"Exported {len(rows)} resolved range(s).")
 
     # -- edits ----------------------------------------------------------------
     def _selected_index(self) -> int:
