@@ -402,6 +402,37 @@ class BurialStore:
             normalised.append(row)
         self.write_table(schema.TABLE_HAZARD, others + normalised)
 
+    # -- burial tools (project-scoped) ---------------------------------------
+    def list_tools(self) -> List[Dict]:
+        """All registered burial tools. Project-scoped: shared by every plan,
+        never deleted or duplicated with a plan (the Planner vessels model)."""
+        return sorted(self.read_table(schema.TABLE_TOOL),
+                      key=lambda r: (r.get("name") or "").lower())
+
+    def get_tool(self, tool_id: str) -> Optional[Dict]:
+        return next((r for r in self.read_table(schema.TABLE_TOOL)
+                     if r.get("tool_id") == tool_id), None)
+
+    def save_tool(self, row: Dict) -> str:
+        return self.save_tools([row])[0]
+
+    def save_tools(self, rows: Sequence[Dict]) -> List[str]:
+        """Create/update several tools in one whole-table write."""
+        prepared: List[Dict] = []
+        now = schema.utc_now_iso()
+        for row in rows:
+            row = dict(row)
+            row.setdefault("tool_id", schema.new_id())
+            row.setdefault("created_utc", now)
+            row["modified_utc"] = now
+            prepared.append(row)
+        if prepared:
+            self.upsert_rows(schema.TABLE_TOOL, prepared)
+        return [row["tool_id"] for row in prepared]
+
+    def delete_tool(self, tool_id: str) -> None:
+        self.delete_rows(schema.TABLE_TOOL, [tool_id])
+
     # -- generations ---------------------------------------------------------
     def list_generations(self, plan_id: str) -> List[Dict]:
         rows = [r for r in self.read_table(schema.TABLE_GENERATION)
@@ -552,8 +583,47 @@ def _migrate_v3_to_v4(store: BurialStore) -> None:
     store._write_table_rows(schema.TABLE_SECTION, schema.SECTION_FIELDS, rows)
 
 
+def _migrate_v5_to_v6(store: BurialStore) -> None:
+    """Burial Tools registry: rewrite bp_section with the tool columns.
+
+    ``ensure_created`` (already run by ``migrate``) creates the new bp_tool
+    table; this step rewrites bp_section so ``tool_id``/``tool_config_id``
+    exist as real columns (default "" = plan default tool).
+
+    It also heals bp_rule method filters: before v6, ``methods_json``
+    covering every then-known method (plough + rov_jet, however spelled)
+    meant "applies to all methods". Adding the trencher method must not
+    silently narrow those rules, so such lists become the explicit
+    all-methods marker "[]".
+    """
+    rows = store.read_table(schema.TABLE_SECTION)
+    for row in rows:
+        for col in ("tool_id", "tool_config_id"):
+            if row.get(col) is None:
+                row[col] = ""
+    store._write_table_rows(schema.TABLE_SECTION, schema.SECTION_FIELDS, rows)
+
+    pre_v6_all = {schema.METHOD_PLOUGH, schema.METHOD_ROV_JET}
+    rule_rows = store.read_table(schema.TABLE_RULE)
+    changed = False
+    for row in rule_rows:
+        try:
+            methods = json.loads(row.get("methods_json") or "[]")
+        except (ValueError, TypeError):
+            methods = []
+        if not isinstance(methods, list):
+            methods = []
+        if methods and pre_v6_all <= set(schema.normalise_methods(methods)):
+            row["methods_json"] = "[]"
+            changed = True
+    if changed:
+        store._write_table_rows(schema.TABLE_RULE, schema.RULE_FIELDS,
+                                rule_rows)
+
+
 # Maps a starting schema version to the function upgrading it one step.
-MIGRATIONS: Dict[int, object] = {1: _migrate_v1_to_v2, 3: _migrate_v3_to_v4}
+MIGRATIONS: Dict[int, object] = {1: _migrate_v1_to_v2, 3: _migrate_v3_to_v4,
+                                 5: _migrate_v5_to_v6}
 
 
 def _normalise_row(row: Dict) -> Dict:

@@ -161,9 +161,32 @@ class BurialProfileWidget(QWidget):
         pane_layout.addWidget(self.slope_plot, 1)
         self._slope_pane.setVisible(False)
 
+        # Depth pane: a slim toggle row (sea level now; deck-transit path
+        # later) above the depth plot, mirroring the slope pane's legend row.
+        depth_toggle_row = QHBoxLayout()
+        depth_toggle_row.setContentsMargins(8, 2, 8, 0)
+        depth_toggle_row.setSpacing(12)
+        self._sea_toggle = QCheckBox("Sea level (0 m)")
+        self._sea_toggle.setStyleSheet("color: #17becf; font-weight: 600;")
+        self._sea_toggle.setToolTip(
+            "Show the water surface as a dashed line at 0 m depth. While "
+            "shown, the depth axis auto-range includes the surface.")
+        self._sea_toggle.setChecked(bool(settings.value(
+            f"{_SETTINGS_ROOT}/show_sea_level", True, type=bool)))
+        self._sea_toggle.toggled.connect(self._sea_level_toggled)
+        depth_toggle_row.addWidget(self._sea_toggle)
+        depth_toggle_row.addStretch(1)
+
+        self._depth_pane = QWidget()
+        depth_layout = QVBoxLayout(self._depth_pane)
+        depth_layout.setContentsMargins(0, 0, 0, 0)
+        depth_layout.setSpacing(0)
+        depth_layout.addLayout(depth_toggle_row)
+        depth_layout.addWidget(self.plot, 1)
+
         # User-adjustable split between depth and slope panels, persisted.
         self._splitter = QSplitter(_VERTICAL)
-        self._splitter.addWidget(self.plot)
+        self._splitter.addWidget(self._depth_pane)
         self._splitter.addWidget(self._slope_pane)
         self._splitter.setStretchFactor(0, 3)
         self._splitter.setStretchFactor(1, 1)
@@ -179,6 +202,14 @@ class BurialProfileWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._splitter)
+
+        # Sea level: a real (dashed) data item rather than an InfiniteLine so
+        # the y auto-range includes the surface exactly while it is visible.
+        self._sea_curve = item.plot(
+            [], [], pen=pg.mkPen("#17becf", width=1.5,
+                                 style=_PEN_STYLE.DashLine),
+            name="Sea level")
+        self._sea_curve.setZValue(3)
 
         self._curve = item.plot([], [], pen=pg.mkPen("#1f77b4", width=2),
                                 name="Depth", connect="finite")
@@ -259,12 +290,24 @@ class BurialProfileWidget(QWidget):
         QSettings().setValue(f"{_SETTINGS_ROOT}/profile_splitter_state",
                              self._splitter.saveState())
 
+    def _sea_level_toggled(self, checked: bool) -> None:
+        QSettings().setValue(f"{_SETTINGS_ROOT}/show_sea_level", bool(checked))
+        self._update_sea_level()
+
+    def _update_sea_level(self) -> None:
+        lo, hi = self._scope
+        show = self._sea_toggle.isChecked() and hi > lo
+        self._sea_curve.setData([lo, hi] if show else [],
+                                [0.0, 0.0] if show else [])
+        self._sea_curve.setVisible(show)
+
     # -- data ---------------------------------------------------------------
     def set_scope(self, start_kp: float, end_kp: float) -> None:
         lo, hi = min(start_kp, end_kp), max(start_kp, end_kp)
         self._scope = (lo, hi)
         if hi > lo:
             self.plot.setXRange(lo, hi, padding=0.02)
+        self._update_sea_level()
 
     def set_slope_window_m(self, step_m: float) -> None:
         """Match the crosshair slope to the local profile scale.
@@ -449,6 +492,8 @@ class BurialProfileWidget(QWidget):
                 return
 
     def clear(self) -> None:
+        self._scope = (0.0, 0.0)
+        self._update_sea_level()
         self.set_profile([])
         self.set_overlays(generation.ResolutionContext())
         self.set_events([], "")

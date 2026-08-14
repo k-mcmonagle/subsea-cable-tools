@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Sequence
 from ..workbench import schema as wb_schema
 from . import events as ev
 from . import schema
+from . import tools as tools_mod
 
 _KIND_LABELS = {
     wb_schema.RULE_KIND_THRESHOLD: "Water depth / slope threshold",
@@ -85,12 +86,7 @@ def _config(row: Dict) -> Dict:
 
 
 def section_kind_label(kind: str, method: str) -> str:
-    plough = method == schema.METHOD_PLOUGH
-    if kind == schema.SECTION_BURIAL:
-        return "Candidate Plough Section" if plough else "Burial section"
-    if kind == schema.SECTION_SKIP:
-        return "Plough Skip" if plough else "Skip"
-    return "Insufficient Information"
+    return schema.section_kind_label(kind, method)
 
 
 def section_reason_text(section: Dict) -> str:
@@ -225,7 +221,8 @@ def build_report_html(plan: Dict,
                       profile_png: Optional[bytes] = None,
                       now_utc: str = "",
                       hazards: Optional[Sequence[Dict]] = None,
-                      risk_checks: Optional[Sequence[Dict]] = None) -> str:
+                      risk_checks: Optional[Sequence[Dict]] = None,
+                      tools: Optional[Sequence[Dict]] = None) -> str:
     """Assemble the full report; pure formatting, no QGIS access."""
     method = plan.get("method") or ""
     status = plan.get("status") or ""
@@ -254,8 +251,12 @@ def build_report_html(plan: Dict,
     parts.append(f"<h1>Burial plan — {_esc(plan.get('name'))} {badge}</h1>")
     direction = "A → B (with increasing KP)" if int(plan.get("direction") or 1) >= 0 \
         else "B → A (against KP)"
+    default_tool_id, default_config_id = tools_mod.plan_default_tool(plan)
+    default_tool_text = tools_mod.tool_display(
+        tools or [], default_tool_id, default_config_id)
     meta = [
         ("Method", schema.METHOD_LABELS.get(method, method)),
+        ("Default burial tool", default_tool_text or "—"),
         ("RPL", f"{plan.get('rpl_name') or '—'}"
                 + (f" ({plan.get('rpl_revision')})" if plan.get("rpl_revision") else "")),
         ("Scope", f"KP {_kp(scope_start)} – {_kp(scope_end)} ({scope_km:.3f} km)"),
@@ -323,6 +324,7 @@ def build_report_html(plan: Dict,
             _esc(section.get("state")),
             _esc(schema.CONCLUSION_LABELS.get(section.get("conclusion") or "", "")),
             _esc(section.get("confidence")),
+            _esc(tools_mod.section_tool_display(section, plan, tools or [])),
             _esc(schema.SKIP_HANDLING_LABELS.get(
                 section.get("skip_handling") or "", "")
                 if kind == schema.SECTION_SKIP else ""),
@@ -330,8 +332,9 @@ def build_report_html(plan: Dict,
             _esc(section.get("notes")),
         ))
     parts.append(_table(("ID", "Kind", "Start KP", "End KP", "Length (km)",
-                         "State", "Conclusion", "Confidence", "Skip handling",
-                         "Reasons", "Notes"), section_rows, raw=True))
+                         "State", "Conclusion", "Confidence", "Tool",
+                         "Skip handling", "Reasons", "Notes"),
+                        section_rows, raw=True))
 
     # -- events ---------------------------------------------------------------
     parts.append("<h2>Events</h2>")

@@ -49,17 +49,22 @@ from ...qgis_compat import (
 )
 from .. import events as ev
 from .. import schema
+from .. import tools as tools_mod
 
 _EVENT_COLUMNS = ["Seq", "Event", "KP", "Lat", "Lon", "Depth (m)", "Source",
                   "Status", "Locked", "Notes"]
 _SECTION_COLUMNS = ["ID", "Kind", "Start KP", "End KP", "Length (km)",
-                    "State", "Conclusion", "Confidence", "Skip handling",
-                    "Reasons", "Notes"]
-_SECTION_CONCLUSION_COL = 6
-_SECTION_CONFIDENCE_COL = 7
-_SECTION_SKIP_HANDLING_COL = 8
-_SECTION_REASONS_COL = 9
-_SECTION_NOTES_COL = 10
+                    "State", "Conclusion", "Confidence", "Tool",
+                    "Tool config", "Skip handling", "Reasons", "Notes"]
+# Derived from the header list so reordering/inserting columns cannot
+# silently desynchronise a widget from the field it edits.
+_SECTION_CONCLUSION_COL = _SECTION_COLUMNS.index("Conclusion")
+_SECTION_CONFIDENCE_COL = _SECTION_COLUMNS.index("Confidence")
+_SECTION_TOOL_COL = _SECTION_COLUMNS.index("Tool")
+_SECTION_TOOL_CONFIG_COL = _SECTION_COLUMNS.index("Tool config")
+_SECTION_SKIP_HANDLING_COL = _SECTION_COLUMNS.index("Skip handling")
+_SECTION_REASONS_COL = _SECTION_COLUMNS.index("Reasons")
+_SECTION_NOTES_COL = _SECTION_COLUMNS.index("Notes")
 
 _SHOW_EVENTS_SETTINGS_KEY = "SubseaCableTools/BurialPlanner/builder_show_events"
 
@@ -87,7 +92,7 @@ class SectionRangeDialog(QDialog):
         layout = QVBoxLayout(self)
         note = QLabel(
             f"Insert {kind_label} inside the selected section. Two editable "
-            "PLDN/PLUP boundaries will be created at the entered KPs.")
+            "boundary events will be created at the entered KPs.")
         note.setWordWrap(True)
         layout.addWidget(note)
         form = QFormLayout()
@@ -163,7 +168,8 @@ class BuilderTab(QWidget):
         run_row.addWidget(self.undo_button)
         self.show_events_check = QCheckBox("Show events")
         self.show_events_check.setToolTip(
-            "Show the PLDN/PLUP event list alongside the Sections table. "
+            "Show the burial start/end event list alongside the Sections "
+            "table. "
             "Sections are the primary working view; open the event list to "
             "add, nudge, confirm, lock or delete individual boundary "
             "events. The setting is remembered.")
@@ -297,6 +303,7 @@ class BuilderTab(QWidget):
         model.planChanged.connect(self.refresh)
         model.eventsChanged.connect(self.refresh)
         model.sectionsChanged.connect(self._refresh_sections)
+        model.toolsChanged.connect(self._refresh_sections)
         model.logChanged.connect(self._refresh_undo_state)
         self.refresh()
 
@@ -498,6 +505,7 @@ class BuilderTab(QWidget):
                 # as plain text; burial and skip rows edit in-table.
                 editable = section.get("kind") in (schema.SECTION_BURIAL,
                                                    schema.SECTION_SKIP)
+                is_burial = section.get("kind") == schema.SECTION_BURIAL
                 values = [
                     refs.get(str(section_id or ""), ""),
                     self._kind_label(section.get("kind") or ""),
@@ -508,6 +516,8 @@ class BuilderTab(QWidget):
                     "" if editable else schema.CONCLUSION_LABELS.get(
                         section.get("conclusion") or "", ""),
                     "" if editable else (section.get("confidence") or ""),
+                    "",  # tool: combo widget on burial rows
+                    "",  # tool config: combo widget on burial rows
                     "",  # skip handling: combo widget on skip rows
                     reasons,
                     section.get("notes") or "",
@@ -545,6 +555,12 @@ class BuilderTab(QWidget):
                         i, _SECTION_CONCLUSION_COL)
                     self.sections_table.removeCellWidget(
                         i, _SECTION_CONFIDENCE_COL)
+                if is_burial:
+                    self._add_tool_combos(i, section)
+                else:
+                    self.sections_table.removeCellWidget(i, _SECTION_TOOL_COL)
+                    self.sections_table.removeCellWidget(
+                        i, _SECTION_TOOL_CONFIG_COL)
                 if is_skip:
                     self._add_section_combo(
                         i, _SECTION_SKIP_HANDLING_COL, section_id,
@@ -552,8 +568,8 @@ class BuilderTab(QWidget):
                         [(h, schema.SKIP_HANDLING_LABELS[h])
                          for h in schema.SKIP_HANDLING_VALUES],
                         section.get("skip_handling") or "",
-                        "How this skip is executed: recover the plough to "
-                        "deck, or transit with the plough suspended "
+                        "How this skip is executed: recover the burial tool "
+                        "to deck, or transit with the tool suspended "
                         "mid-water. TBC until decided.")
                 else:
                     self.sections_table.removeCellWidget(
@@ -575,13 +591,56 @@ class BuilderTab(QWidget):
             self._deferred_section_edit(sid, f, c.currentData()))
         self.sections_table.setCellWidget(row, column, combo)
 
+    def _add_tool_combos(self, row: int, section: Dict) -> None:
+        """Tool + configuration combos on a burial row.
+
+        "" = inherit the plan default (shown with the resolved name). An
+        explicit assignment also stamps the section's ``method`` with the
+        tool's type; generation still resolves rules against the plan
+        method until mixed-method generation lands.
+        """
+        section_id = section.get("section_id") or ""
+        default_tool_id, default_config_id = self.model.default_tool()
+        default_text = tools_mod.tool_display(self.model.tools,
+                                              default_tool_id)
+        inherit_label = (f"Plan default ({default_text})"
+                         if default_text else "Plan default (none)")
+
+        tool_options = [("", inherit_label)]
+        for tool in self.model.tools:
+            tool_options.append((tool.get("tool_id") or "",
+                                 tool.get("name") or "?"))
+        current_tool = str(section.get("tool_id") or "")
+        if current_tool and not tools_mod.tool_by_id(self.model.tools,
+                                                     current_tool):
+            tool_options.append((current_tool, "(unregistered tool)"))
+        self._add_section_combo(
+            row, _SECTION_TOOL_COL, section_id, "tool_id", tool_options,
+            current_tool,
+            "Burial tool for this section; blank inherits the plan "
+            "default set on the Plan tab. Register tools on the "
+            "Burial Tools tab.")
+
+        config_tool_id = current_tool or default_tool_id
+        config_tool = tools_mod.tool_by_id(self.model.tools, config_tool_id)
+        config_options = [("", "(default)" if current_tool == ""
+                           else "(no configuration)")]
+        for config in tools_mod.parse_configs(config_tool):
+            config_options.append((config.get("config_id") or "",
+                                   tools_mod.config_label(config) or "?"))
+        current_config = str(section.get("tool_config_id") or "")
+        if current_config and all(value != current_config
+                                  for value, _label in config_options):
+            config_options.append((current_config,
+                                   "(unknown configuration)"))
+        self._add_section_combo(
+            row, _SECTION_TOOL_CONFIG_COL, section_id, "tool_config_id",
+            config_options, current_config,
+            "Operating configuration (e.g. jetting vs passive mode) of "
+            "the section's tool.")
+
     def _kind_label(self, kind: str) -> str:
-        plough = self.model.method == schema.METHOD_PLOUGH
-        if kind == schema.SECTION_BURIAL:
-            return "Candidate Plough Section" if plough else "Burial section"
-        if kind == schema.SECTION_SKIP:
-            return "Plough Skip" if plough else "Skip"
-        return "Insufficient Information"
+        return schema.section_kind_label(kind, self.model.method)
 
     def _reason_text(self, section: Dict) -> str:
         try:
@@ -939,6 +998,8 @@ class BuilderTab(QWidget):
                             if s.get("section_id") == section_id), None)
             if section is None or (section.get(field) or "") == (value or ""):
                 return
+            # The tool_id invariant (config reset + method stamp) is
+            # enforced inside PlanModel.update_section for every writer.
             action = (change_log.ACTION_SET_CONCLUSION
                       if field in ("conclusion", "confidence")
                       else change_log.ACTION_EDIT_SECTION)
@@ -950,9 +1011,13 @@ class BuilderTab(QWidget):
     def _split_section(self) -> None:
         ids = self._selected_section_ids()
         if len(ids) != 1:
+            method = self.model.method
             QMessageBox.information(
                 self, "Burial Planner",
-                "Select one Candidate Plough Section or one Plough Skip.")
+                f"Select one "
+                f"{schema.section_kind_label(schema.SECTION_BURIAL, method)} "
+                f"or one "
+                f"{schema.section_kind_label(schema.SECTION_SKIP, method)}.")
             return
         section = next((s for s in self.model.sections
                         if s.get("section_id") == ids[0]), None)
@@ -963,8 +1028,11 @@ class BuilderTab(QWidget):
                 self, "Burial Planner",
                 "Insufficient Information sections cannot be manually split.")
             return
-        inserted_label = ("a Plough Skip" if section.get("kind") == schema.SECTION_BURIAL
-                          else "a Candidate Plough Section")
+        inserted_kind = (schema.SECTION_SKIP
+                         if section.get("kind") == schema.SECTION_BURIAL
+                         else schema.SECTION_BURIAL)
+        inserted_label = \
+            f"a {schema.section_kind_label(inserted_kind, self.model.method)}"
         dialog = SectionRangeDialog(section, inserted_label, self)
         if qt_exec(dialog) != DIALOG_ACCEPTED:
             return
@@ -983,9 +1051,13 @@ class BuilderTab(QWidget):
         selected = [section for section in self.model.sections
                     if section.get("section_id") in set(ids)]
         if len(selected) < 2:
+            method = self.model.method
             QMessageBox.information(
                 self, "Burial Planner",
-                "Select at least two Candidate Plough Sections or two Plough Skips.")
+                f"Select at least two "
+                f"{schema.section_kind_label(schema.SECTION_BURIAL, method)} "
+                f"rows or two "
+                f"{schema.section_kind_label(schema.SECTION_SKIP, method)} rows.")
             return
         kinds = {section.get("kind") for section in selected}
         if len(kinds) != 1:
@@ -993,11 +1065,13 @@ class BuilderTab(QWidget):
                 self, "Burial Planner", "Selected sections must be the same kind.")
             return
         kind_label = self._kind_label(next(iter(kinds)) or "")
+        start_label = ev.event_label(schema.EVENT_BURIAL_START, self.model.method)
+        end_label = ev.event_label(schema.EVENT_BURIAL_END, self.model.method)
         answer = QMessageBox.question(
             self, "Merge sections",
             f"Merge {len(selected)} selected {kind_label} rows? The intervening "
-            "PLDN/PLUP boundaries will be removed; the outer boundaries remain "
-            "available for dragging or KP editing.",
+            f"{start_label}/{end_label} boundaries will be removed; the outer "
+            "boundaries remain available for dragging or KP editing.",
             MESSAGE_BOX_YES | MESSAGE_BOX_NO, MESSAGE_BOX_NO)
         if answer != MESSAGE_BOX_YES:
             return

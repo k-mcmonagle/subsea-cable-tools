@@ -149,6 +149,17 @@ def _format_scope(ranges: List[Dict]) -> str:
                      for r in ranges or [])
 
 
+def _normalised_methods_json(methods_json) -> str:
+    """methods_json with alias method ids mapped to the planner vocabulary."""
+    try:
+        methods = json.loads(methods_json or "[]")
+    except (ValueError, TypeError):
+        methods = []
+    if not isinstance(methods, list):
+        methods = []
+    return json.dumps(schema.normalise_methods(methods))
+
+
 class RuleEditorDialog(QDialog):
     """Edit one bp_rule row (kind fixed at creation)."""
 
@@ -686,7 +697,10 @@ class RuleEditorDialog(QDialog):
             "source_ref": self.source_edit.text().strip(),
             "action": action,
             "risk_level": 2 if criterion == schema.CRITERION_SCREENING else 0,
-            "methods_json": rule.get("methods_json") or json.dumps(schema.METHODS),
+            # "[]" is the explicit all-methods marker: stamping the full
+            # METHODS list would silently narrow the rule the next time a
+            # method is added to the plugin (schema v6 healed old rows).
+            "methods_json": rule.get("methods_json") or "[]",
             "config_json": json.dumps(config),
             "notes": self.notes_edit.text(),
         })
@@ -1362,7 +1376,11 @@ class RulesTab(QWidget):
                                     if (row.get("action") or "") == wb_schema.RULE_ACTION_RISK
                                     else schema.CRITERION_PROJECT),
                 "source_ref": "",
-                "methods_json": row.get("methods_json") or "[]",
+                # The Assessment tool's method ids ("jet") map onto the
+                # Burial Planner vocabulary ("rov_jet") so the per-method
+                # rule filter does not silently skip copied rules.
+                "methods_json": _normalised_methods_json(
+                    row.get("methods_json")),
                 "config_json": row.get("config_json") or "{}",
                 "notes": row.get("notes") or "",
             })
@@ -1408,6 +1426,9 @@ class RulesTab(QWidget):
             row["plan_id"] = self.model.plan_id
             row.setdefault("criterion_class", schema.CRITERION_PROJECT)
             row.setdefault("source_ref", "")
+            if row.get("methods_json"):
+                row["methods_json"] = _normalised_methods_json(
+                    row.get("methods_json"))
             imported.append(row)
         if imported:
             self.model.save_rules(list(self.model.rules) + imported,

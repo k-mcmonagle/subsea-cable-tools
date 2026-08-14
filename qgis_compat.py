@@ -137,6 +137,7 @@ CONTEXT_MENU_POLICY_CUSTOM = _scoped_member(Qt, "ContextMenuPolicy", "CustomCont
 SELECTION_MODE_EXTENDED = _scoped_member(QAbstractItemView, "SelectionMode", "ExtendedSelection")
 SELECTION_MODE_SINGLE = _scoped_member(QAbstractItemView, "SelectionMode", "SingleSelection")
 SELECTION_BEHAVIOR_SELECT_ROWS = _scoped_member(QAbstractItemView, "SelectionBehavior", "SelectRows")
+EDIT_TRIGGER_NONE = _scoped_member(QAbstractItemView, "EditTrigger", "NoEditTriggers")
 EDIT_TRIGGER_DOUBLE_CLICKED = _scoped_member(QAbstractItemView, "EditTrigger", "DoubleClicked")
 EDIT_TRIGGER_SELECTED_CLICKED = _scoped_member(QAbstractItemView, "EditTrigger", "SelectedClicked")
 EDIT_TRIGGER_EDIT_KEY_PRESSED = _scoped_member(QAbstractItemView, "EditTrigger", "EditKeyPressed")

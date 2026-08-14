@@ -23,6 +23,7 @@ from qgis.core import (
     QgsGeometry,
     QgsWkbTypes,
     QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform,
     QgsPointXY,
     QgsProcessingLayerPostProcessorInterface
 )
@@ -172,6 +173,10 @@ This tool imports a ship outline from a DXF file and creates a polygon or polyli
         # Reproject features if DXF CRS is different from output CRS
         dxf_crs = dxf_layer.crs() if dxf_layer.crs().isValid() else QgsCoordinateReferenceSystem('EPSG:3857')
         need_reproject = dxf_crs != output_crs
+        reproject = None
+        if need_reproject:
+            reproject = QgsCoordinateTransform(dxf_crs, output_crs,
+                                               context.transformContext())
 
         # Prepare output fields
         fields = QgsFields()
@@ -200,8 +205,8 @@ This tool imports a ship outline from a DXF file and creates a polygon or polyli
                 continue
             # Transform geometry: scale, rotate, offset
             geom = self._transform_geometry(geom, scale, rotation, offset_x, offset_y)
-            if need_reproject:
-                geom.transform(QgsCoordinateReferenceSystem(output_crs))
+            if reproject is not None:
+                geom.transform(reproject)
             geoms.append(geom)
 
         if not geoms:

@@ -80,6 +80,7 @@ from .tabs.profile_tab import ProfileTab
 from .tabs.review_tab import ReviewTab
 from .tabs.risk_tab import RiskTab
 from .tabs.rules_tab import RulesTab
+from .tabs.tools_tab import ToolsTab
 
 _VERTICAL = getattr(Qt, "Orientation", Qt).Vertical
 
@@ -162,6 +163,7 @@ class BurialPlannerDock(QDockWidget):
         self.tabs = QTabWidget()
         self.plan_tab = PlanTab(self.model)
         self.inputs_tab = InputsTab(self.model, self.workbench_store, dock=self)
+        self.tools_tab = ToolsTab(self.model, self)
         self.profile_tab = ProfileTab(self.model, self)
         self.rules_tab = RulesTab(self.model, self)
         self.risk_tab = RiskTab(self.model, self)
@@ -169,6 +171,7 @@ class BurialPlannerDock(QDockWidget):
         self.review_tab = ReviewTab(self.model, self)
         self.tabs.addTab(self.plan_tab, "Plan")
         self.tabs.addTab(self.inputs_tab, "Inputs")
+        self.tabs.addTab(self.tools_tab, "Burial Tools")
         self.tabs.addTab(self.profile_tab, "Bathymetry Profile")
         self.tabs.addTab(self.rules_tab, "Exclusions")
         self.tabs.addTab(self.risk_tab, "Risk Profile")
@@ -193,14 +196,15 @@ class BurialPlannerDock(QDockWidget):
             "the profile after configuring bathymetry.")
         self.slope_toggle.toggled.connect(self._slope_panel_toggled)
         profile_status_row.addWidget(self.slope_toggle)
-        self.profile_drag_toggle = QCheckBox("Allow PLDN/PLUP dragging")
+        self.profile_drag_toggle = QCheckBox("Allow event dragging")
         self.profile_drag_toggle.setChecked(bool(QSettings().value(
             "SubseaCableTools/BurialPlanner/profile_drag_enabled", False,
             type=bool)))
         self.profile_drag_toggle.setToolTip(
-            "When enabled, unlocked PLDN/PLUP lines can be dragged on the "
-            "profile. Changes are saved on release and can be undone with "
-            "Ctrl+Z in Plan Builder.")
+            "When enabled, unlocked burial start/end lines (PLDN/PLUP, "
+            "TRENCH_START/TRENCH_END…) can be dragged on the profile. "
+            "Changes are saved on release and can be undone with Ctrl+Z "
+            "in Plan Builder.")
         self.profile_drag_toggle.setStyleSheet(
             "color: #b36b00; font-weight: 600;"
             if self.profile_drag_toggle.isChecked() else "")
@@ -308,6 +312,7 @@ class BurialPlannerDock(QDockWidget):
         self.store_ready = True
         set_project_gpkg_path(path)
         self.model.store = store
+        self.model.refresh_tools()  # the registry is per GeoPackage
         self.model.close_plan()
         self.refresh_plans()
         return True
@@ -1237,6 +1242,7 @@ class BurialPlannerDock(QDockWidget):
                 self.store_ready = True
                 self.model.store = store
                 self.model.workbench_store = self.workbench_store()
+                self.model.refresh_tools()  # the registry is per GeoPackage
                 self.model.close_plan()
             else:
                 self.store_ready = False

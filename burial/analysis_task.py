@@ -719,7 +719,8 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
             methods = json.loads(row.get("methods_json") or "[]")
         except (ValueError, TypeError):
             methods = []
-        if methods and params.method not in methods:
+        methods = schema.normalise_methods(methods)
+        if methods and schema.normalise_method(params.method) not in methods:
             continue
         rule_work = RuleWork(rule_row=dict(row))
         rule_work.kind = row.get("kind") or ""

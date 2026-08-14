@@ -208,6 +208,47 @@ section references in brackets.
   values rule; existing assignments are never replaced unless overwrite is
   ticked, and the whole assignment is one undoable edit.
 
+## Burial Tools registry (schema v6)
+
+- **`bp_tool` is project-scoped and outside the plan change log**: tools are
+  shared registry data (the Planner-vessels model) — deleting a plan never
+  touches a tool, deleting a tool never edits a plan (dangling references
+  render "(unregistered tool)"), and tool edits are not entries in any
+  plan's change log; the row carries `source_ref` + `modified_utc` for
+  traceability instead. `TABLE_KEYS` includes `bp_tool` for the store's
+  generic upsert only — plan rollbacks can never mutate the registry.
+- **Configurations are a JSON list on the tool row (`configs_json`), not a
+  child table**: configs are always edited with their tool and are small;
+  each carries a stable `config_id` so per-section assignments survive
+  relabelling. A separate table would add store/rollback plumbing for no
+  gain.
+- **Per-section tool assignment is curation metadata first**: blank =
+  inherit the plan default (`params_json.tool_id`/`tool_config_id`);
+  assigning a tool also stamps the reserved `bp_section.method` with the
+  tool's type and carries over regeneration. Event labels and kind labels
+  still resolve from the **plan** method — switching labels per section
+  arrives with mixed-method generation, not before, so a plan never shows
+  two vocabularies while generation still evaluates one method.
+- **Setting the plan default tool does not mark the plan stale**
+  (`update_gen_params(stale=False)`) — it changes presentation and record,
+  not generation results.
+- **Method-id aliasing is normalised at the boundary and healed at read
+  time**: Workbench `"jet"` maps to `"rov_jet"` on rule copy/JSON import,
+  and `generation._engine_rule` / `analysis_task.build_work` normalise
+  stored `methods_json` too, so rules copied before the fix keep firing.
+- **"All methods" is stored as `[]`, and the v6 migration widens legacy
+  lists**: pre-v6 rules were stamped with the full method list of the day
+  (`["plough","rov_jet"]`), which adding the trencher method would silently
+  narrow — every old rule would stop firing in a trencher plan. The rule
+  editor now stamps `[]` (explicit all-methods), and `_migrate_v5_to_v6`
+  rewrites any stored list covering the whole pre-v6 set to `[]`.
+  A deliberately restricted list (e.g. `["plough"]`) is left alone.
+- **Footprints are stored as WKT on the tool row**, normalised to the Import
+  Ship Outline body-fixed frame (metres, CRP at origin, front along +Y) —
+  a registry JSON travels complete without the source DXF, and the outline
+  is ready for KP-placed map display (roadmap: live footprint overlay,
+  turning-radius tool path).
+
 ## Cross-check against the acceptance walkthrough (§16)
 
 Automated coverage: events/alternation/locking (test_burial_events), the
@@ -216,7 +257,8 @@ determinism, proposal diff (test_burial_generation), store round-trip /
 duplicate / rollback / migrate-backup (test_burial_store), scoped sampling,
 signed+banded thresholds, buffer_field, cancellation, direction mapping and
 an end-to-end build_work → task.run → generate run with a warm-cache re-run
-(test_burial_task), CSV round-trip + import scan (test_burial_io), and the
-shared-engine extensions with the original Assessment behaviour untouched
-(test_rules_engine / test_rules_inputs). The interactive walkthrough steps
+(test_burial_task), CSV round-trip + import scan (test_burial_io), the
+tools registry / trencher vocabulary / method aliasing / JSON round trip
+(test_burial_tools), and the shared-engine extensions with the original
+Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The interactive walkthrough steps
 (dock UX, profile drag, map sync) need a manual pass in QGIS.

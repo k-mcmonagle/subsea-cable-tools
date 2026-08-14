@@ -22,12 +22,13 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import events as ev
 from . import schema
+from . import tools as tools_mod
 
 EVENT_COLUMNS = ["seq", "event_type", "label", "kp", "lat", "lon", "depth_m",
                  "source", "status", "locked", "notes"]
 SECTION_COLUMNS = ["section_ref", "kind", "start_kp", "end_kp", "length_km",
-                   "state", "conclusion", "confidence", "skip_handling",
-                   "reasons", "notes"]
+                   "state", "conclusion", "confidence", "tool",
+                   "skip_handling", "reasons", "notes"]
 INPUT_COLUMNS = ["role", "layer_name", "layer_source", "originator", "revision",
                  "status", "received_utc", "quality", "notes"]
 HAZARD_COLUMNS = ["risk", "status", "kp", "end_kp", "offset_m", "crossing",
@@ -82,7 +83,8 @@ def events_csv(plan: Dict, events: Sequence[Dict], generation_id: str = "") -> s
     return buf.getvalue()
 
 
-def sections_csv(plan: Dict, sections: Sequence[Dict], generation_id: str = "") -> str:
+def sections_csv(plan: Dict, sections: Sequence[Dict], generation_id: str = "",
+                 tools: Sequence[Dict] = ()) -> str:
     buf = io.StringIO()
     for line in metadata_lines(plan, generation_id):
         buf.write(line + "\r\n")
@@ -101,6 +103,7 @@ def sections_csv(plan: Dict, sections: Sequence[Dict], generation_id: str = "") 
             schema.CONCLUSION_LABELS.get(section.get("conclusion") or "",
                                          section.get("conclusion") or ""),
             section.get("confidence") or "",
+            tools_mod.section_tool_display(section, plan, tools),
             (schema.SKIP_HANDLING_LABELS.get(section.get("skip_handling") or "", "")
              if section.get("kind") == schema.SECTION_SKIP else ""),
             section.get("reason_json") or "",
@@ -204,6 +207,9 @@ _TYPE_ALIASES = {
     "jet_start": schema.EVENT_BURIAL_START,
     "jet_stop": schema.EVENT_BURIAL_END,
     "jet_end": schema.EVENT_BURIAL_END,
+    "trench_start": schema.EVENT_BURIAL_START,
+    "trench_end": schema.EVENT_BURIAL_END,
+    "trench_stop": schema.EVENT_BURIAL_END,
     "start": schema.EVENT_BURIAL_START,
     "end": schema.EVENT_BURIAL_END,
 }
@@ -278,7 +284,8 @@ def parse_events_list_csv(text: str, client_proposal: bool = False) -> List[Dict
         note = row[2] if len(row) > 2 else ""
         if kp is None or event_type is None:
             raise ImportError_(f"Row {n}: expected numeric KP and an event type "
-                               "(PLDN/PLUP, JET_START/JET_STOP, START/END).")
+                               "(PLDN/PLUP, JET_START/JET_STOP, "
+                               "TRENCH_START/TRENCH_END, START/END).")
         out.append(_event(kp, event_type, source, note))
     if not out:
         raise ImportError_("The file contains no events.")

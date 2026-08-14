@@ -232,7 +232,8 @@ class ReviewTab(QWidget):
             events=self.model.events, rules=self.model.rules,
             inputs=self.model.inputs, generation=active,
             change_log=entries, profile_png=self._profile_png(),
-            hazards=self.model.hazards, risk_checks=self.model.risk_checks)
+            hazards=self.model.hazards, risk_checks=self.model.risk_checks,
+            tools=self.model.tools)
         try:
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write(text)

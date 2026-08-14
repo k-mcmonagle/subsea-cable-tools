@@ -291,6 +291,9 @@ def _engine_rule(rule_row: Dict) -> Rule:
         methods = json.loads(rule_row.get("methods_json") or "[]")
     except (ValueError, TypeError):
         methods = []
+    # Alias ids ("jet" from a Workbench copy) are healed at read time so
+    # rules stored before the vocabulary was normalised keep firing.
+    methods = schema.normalise_methods(methods)
     return Rule(
         rule_id=str(rule_row.get("rule_id")),
         name=rule_row.get("name") or "",
@@ -540,7 +543,8 @@ def build_sections(merged_events: List[Dict], params: GenParams,
         if prev:
             row["section_id"] = prev.get("section_id") or row["section_id"]
             for col in ("state", "conclusion", "confidence", "notes",
-                        "method", "grade_in_m", "grade_out_m",
+                        "method", "tool_id", "tool_config_id",
+                        "grade_in_m", "grade_out_m",
                         "target_burial_m", "skip_handling"):
                 if prev.get(col) not in (None, ""):
                     row[col] = prev.get(col)
@@ -561,6 +565,8 @@ def build_sections(merged_events: List[Dict], params: GenParams,
             "confidence": "",
             "reason_json": "{}",
             "method": "",
+            "tool_id": "",
+            "tool_config_id": "",
             "grade_in_m": None,
             "grade_out_m": None,
             "target_burial_m": None,

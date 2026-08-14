@@ -17,6 +17,8 @@ Table overview:
 - bp_event       burial events (PLDN/PLUP etc.); KP is the sole edit surface
 - bp_section     derived sections (burial | skip | insufficient_info)
 - bp_change_log  append-only change log with before/after JSON
+- bp_tool        project-scoped Burial Tools registry (ploughs, trenchers…)
+                 with per-tool configurations and an optional DXF footprint
 
 No engineering values are shipped here: criteria values, buffers and limits
 are user-entered, each with a source-reference field.
@@ -35,7 +37,7 @@ from ..workbench.schema import (  # noqa: F401  (re-exported for the package)
     utc_now_iso,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Registry table names ------------------------------------------------------
 TABLE_META = "bp_meta"
@@ -49,6 +51,7 @@ TABLE_CHANGE_LOG = "bp_change_log"
 TABLE_PROFILE = "bp_profile"
 TABLE_RISK_CHECK = "bp_risk_check"
 TABLE_HAZARD = "bp_hazard"
+TABLE_TOOL = "bp_tool"
 
 FieldSpec = Tuple[str, str]
 
@@ -60,12 +63,38 @@ META_FIELDS: List[FieldSpec] = [
 # Methods -------------------------------------------------------------------
 METHOD_PLOUGH = "plough"
 METHOD_ROV_JET = "rov_jet"
-METHODS: List[str] = [METHOD_PLOUGH, METHOD_ROV_JET]  # enum open by design
+METHOD_TRENCHER = "trencher"
+METHODS: List[str] = [METHOD_PLOUGH, METHOD_ROV_JET, METHOD_TRENCHER]  # enum open by design
 
 METHOD_LABELS: Dict[str, str] = {
     METHOD_PLOUGH: "Plough",
     METHOD_ROV_JET: "ROV jet",
+    METHOD_TRENCHER: "Trencher",
 }
+
+# Method ids seen in older data / the Workbench Assessment tool, mapped to
+# the Burial Planner vocabulary. Workbench DEFAULT_ASSESSMENT_METHODS uses
+# "jet"; a rule copied from an Assessment must not be silently skipped by
+# the per-method rule filter because of the spelling difference.
+_METHOD_ALIASES: Dict[str, str] = {
+    "jet": METHOD_ROV_JET,
+}
+
+
+def normalise_method(value: str) -> str:
+    """Canonical method id for ``value`` (aliases mapped, unknowns kept)."""
+    value = (value or "").strip()
+    return _METHOD_ALIASES.get(value.lower(), value)
+
+
+def normalise_methods(values) -> List[str]:
+    """Canonicalise a method-id list, preserving order, dropping duplicates."""
+    out: List[str] = []
+    for value in values or []:
+        method = normalise_method(str(value))
+        if method and method not in out:
+            out.append(method)
+    return out
 
 # Plan status ---------------------------------------------------------------
 PLAN_STATUS_DRAFT = "draft"
@@ -77,7 +106,7 @@ PLAN_FIELDS: List[FieldSpec] = [
     ("name", "str"),
     ("description", "str"),
     ("notes", "str"),
-    ("method", "str"),               # plough | rov_jet
+    ("method", "str"),               # one of METHODS (open enum)
     ("rpl_id", "str"),               # Workbench rpl_id ("" for a bare line layer)
     ("rpl_name", "str"),             # snapshot
     ("rpl_revision", "str"),         # Workbench rev_label snapshot
@@ -192,6 +221,25 @@ EVENT_RESERVED_TYPES: List[str] = [
     "DEPLOY_START", "DEPLOY_END", "LIFT", "LOWER", "TRANSIT_START", "TRANSIT_END",
 ]
 
+# Display labels: generic semantics, per-method vocabulary. Generic terms
+# appear only in code/schema, never in plough-mode UI (spec D4). Consumed via
+# ``events.event_label`` — kept here so every per-method vocabulary (labels,
+# section codes, kind labels) lives in one module.
+METHOD_EVENT_LABELS: Dict[str, Dict[str, str]] = {
+    METHOD_PLOUGH: {
+        EVENT_BURIAL_START: "PLDN",
+        EVENT_BURIAL_END: "PLUP",
+    },
+    METHOD_ROV_JET: {
+        EVENT_BURIAL_START: "JET_START",
+        EVENT_BURIAL_END: "JET_STOP",
+    },
+    METHOD_TRENCHER: {
+        EVENT_BURIAL_START: "TRENCH_START",
+        EVENT_BURIAL_END: "TRENCH_END",
+    },
+}
+
 EVENT_SOURCE_AUTO = "auto"
 EVENT_SOURCE_MANUAL = "manual"
 EVENT_SOURCE_IMPORT = "import"
@@ -247,8 +295,8 @@ CONCLUSION_LABELS: Dict[str, str] = {
 
 CONFIDENCE_VALUES: List[str] = ["high", "moderate", "low", "insufficient"]
 
-# How a skip is executed operationally (plough mode): recover the plough to
-# deck, or transit with the plough suspended mid-water. Default "" = TBC.
+# How a skip is executed operationally: recover the burial tool to deck, or
+# transit with the tool suspended mid-water. Default "" = TBC.
 SKIP_HANDLING_TBC = ""
 SKIP_HANDLING_RECOVER = "recover_to_deck"
 SKIP_HANDLING_MIDWATER = "midwater_transit"
@@ -277,22 +325,54 @@ _SECTION_REF_CODES_BY_METHOD: Dict[str, Dict[str, str]] = {
         SECTION_SKIP: "SK",
         SECTION_INSUFFICIENT: "II",
     },
+    METHOD_TRENCHER: {
+        SECTION_BURIAL: "TS",
+        SECTION_SKIP: "SK",
+        SECTION_INSUFFICIENT: "II",
+    },
+}
+
+# Per-method section-kind display names. Insufficient Information is
+# method-neutral by definition. The single source for the Plan Builder table,
+# dialogs and the report (previously duplicated in both).
+_SECTION_KIND_LABELS_DEFAULT: Dict[str, str] = {
+    SECTION_BURIAL: "Burial section",
+    SECTION_SKIP: "Skip",
+    SECTION_INSUFFICIENT: "Insufficient Information",
+}
+_SECTION_KIND_LABELS_BY_METHOD: Dict[str, Dict[str, str]] = {
+    METHOD_PLOUGH: {
+        SECTION_BURIAL: "Candidate Plough Section",
+        SECTION_SKIP: "Plough Skip",
+        SECTION_INSUFFICIENT: "Insufficient Information",
+    },
+    METHOD_TRENCHER: {
+        SECTION_BURIAL: "Candidate Trench Section",
+        SECTION_SKIP: "Trench Skip",
+        SECTION_INSUFFICIENT: "Insufficient Information",
+    },
 }
 
 
+def section_kind_label(kind: str, method: str = "") -> str:
+    """Method-correct display name for a section kind."""
+    labels = _SECTION_KIND_LABELS_BY_METHOD.get(
+        normalise_method(method), _SECTION_KIND_LABELS_DEFAULT)
+    return labels.get(kind or "", _SECTION_KIND_LABELS_DEFAULT.get(
+        kind or "", kind or ""))
+
+
 def section_ref_code(kind: str, method: str = "") -> str:
-    codes = _SECTION_REF_CODES_BY_METHOD.get(method or "",
+    codes = _SECTION_REF_CODES_BY_METHOD.get(normalise_method(method),
                                              _SECTION_REF_CODES_DEFAULT)
     return codes.get(kind or "", "XX")
 
 
 def section_ref_legend(method: str = "") -> str:
     """One-line legend for UI tooltips and report footnotes."""
-    if (method or "") == METHOD_PLOUGH:
-        return ("PS = Candidate Plough Section, SK = Plough Skip, "
-                "II = Insufficient Information — numbered in travel order")
-    return ("BS = Burial section, SK = Skip, II = Insufficient Information "
-            "— numbered in travel order")
+    parts = [f"{section_ref_code(kind, method)} = {section_kind_label(kind, method)}"
+             for kind in (SECTION_BURIAL, SECTION_SKIP, SECTION_INSUFFICIENT)]
+    return ", ".join(parts) + " — numbered in travel order"
 
 
 def section_refs(sections, direction: int = 1, method: str = "") -> Dict[str, str]:
@@ -336,13 +416,46 @@ SECTION_FIELDS: List[FieldSpec] = [
     ("conclusion", "str"),
     ("confidence", "str"),
     ("reason_json", "str"),
-    # Reserved for the mixed-method / grade roadmap (nullable, unused in v1)
+    # Per-section burial tool (bp_tool reference; "" = plan default).
+    # ``method`` mirrors the assigned tool's type; generation still resolves
+    # rules against the plan method until mixed-method generation lands.
     ("method", "str"),
+    ("tool_id", "str"),
+    ("tool_config_id", "str"),
+    # Reserved for the grade roadmap (nullable, unused in v1)
     ("grade_in_m", "float"),
     ("grade_out_m", "float"),
     ("target_burial_m", "float"),
     ("skip_handling", "str"),        # "" (TBC) | recover_to_deck | midwater_transit
     ("notes", "str"),
+]
+
+# Burial Tools registry -----------------------------------------------------
+# Project-scoped (no plan_id): tools are shared by every plan in the
+# GeoPackage, like the Planner's vessels. No engineering values are shipped;
+# every parameter is user-entered with a source-reference field.
+# ``configs_json`` holds the tool's operating configurations as a JSON list
+# of dicts (see ``tools.py``): each carries a stable ``config_id`` so
+# per-section assignments survive relabelling.
+# ``footprint_wkt`` is a body-fixed outline in metres, CRP at the origin,
+# bow/front along +Y — the frame produced by Import Ship Outline (DXF).
+TOOL_FIELDS: List[FieldSpec] = [
+    ("tool_id", "str"),
+    ("name", "str"),
+    ("tool_type", "str"),            # method id: one of METHODS (open enum)
+    ("source_ref", "str"),           # document + revision the values come from
+    ("configs_json", "str"),
+    ("footprint_wkt", "str"),
+    ("footprint_source", "str"),     # e.g. the DXF file name
+    ("footprint_scale", "float"),
+    ("footprint_crp_x", "float"),
+    ("footprint_crp_y", "float"),
+    ("footprint_rotation_deg", "float"),
+    ("length_m", "float"),           # overall dimensions (optional)
+    ("width_m", "float"),
+    ("notes", "str"),
+    ("created_utc", "str"),
+    ("modified_utc", "str"),
 ]
 
 # Risk Profile --------------------------------------------------------------
@@ -461,6 +574,7 @@ REGISTRY_TABLES: Dict[str, List[FieldSpec]] = {
     TABLE_PROFILE: PROFILE_FIELDS,
     TABLE_RISK_CHECK: RISK_CHECK_FIELDS,
     TABLE_HAZARD: HAZARD_FIELDS,
+    TABLE_TOOL: TOOL_FIELDS,
 }
 
 TABLE_KEYS: Dict[str, str] = {
@@ -474,6 +588,9 @@ TABLE_KEYS: Dict[str, str] = {
     TABLE_PROFILE: "profile_id",
     TABLE_RISK_CHECK: "check_id",
     TABLE_HAZARD: "hazard_id",
+    # bp_tool is project-scoped: it never appears in a plan's change-log
+    # payloads or rollbacks; the key is here for the store's generic upsert.
+    TABLE_TOOL: "tool_id",
 }
 
 # Per-plan spatial layer schemas -------------------------------------------
@@ -489,6 +606,7 @@ SECTIONS_LAYER_FIELDS: List[FieldSpec] = [
     ("conclusion", "str"),
     ("confidence", "str"),
     ("reasons", "str"),
+    ("tool", "str"),
     ("skip_handling", "str"),
     ("notes", "str"),
 ]

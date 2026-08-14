@@ -27,7 +27,7 @@ from qgis.PyQt.QtCore import QObject, pyqtSignal
 
 from ..workbench.depth_service import DepthService, DepthSourceConfig
 from ..workbench.rules_engine import Interval
-from . import change_log, events as ev, generation, io_csv, map_layers, risk, schema
+from . import change_log, events as ev, generation, io_csv, map_layers, risk, schema, tools
 from .analysis_task import build_route_frame
 from .profile_data import PlanProfile
 from .store import BurialStore
@@ -55,6 +55,7 @@ class PlanModel(QObject):
     eventsChanged = pyqtSignal()
     sectionsChanged = pyqtSignal()
     riskChanged = pyqtSignal()       # risk checks and/or hazards
+    toolsChanged = pyqtSignal()      # project-scoped Burial Tools registry
     logChanged = pyqtSignal()
     storeError = pyqtSignal(str)
 
@@ -69,6 +70,7 @@ class PlanModel(QObject):
         self.sections: List[Dict] = []
         self.risk_checks: List[Dict] = []
         self.hazards: List[Dict] = []
+        self.tools: List[Dict] = []  # project-scoped, survives close_plan
         self.context = generation.ResolutionContext()
         self.route = None            # RouteFrame over the plan's RPL (WGS84)
         self.distance = None
@@ -77,6 +79,7 @@ class PlanModel(QObject):
         self.acq_cache: Dict[str, Tuple[List[Interval], List[Interval]]] = {}
         self.route_error = ""
         self.bathy_profile: Optional[PlanProfile] = None
+        self.refresh_tools(emit=False)
 
     # -- store write wrapper (Planner pattern) -------------------------------
     def _store_write(self, action: str, func: Callable, *args, **kwargs):
@@ -391,6 +394,63 @@ class PlanModel(QObject):
         event["depth_m"] = depth
 
     # -- plan CRUD -----------------------------------------------------------
+    # -- burial tools (project-scoped registry) ------------------------------
+    def refresh_tools(self, emit: bool = True) -> None:
+        try:
+            self.tools = self.store.list_tools()
+        except Exception as exc:
+            # Keep the previous list rather than silently rendering every
+            # assignment as "(unregistered tool)" in exports.
+            self.storeError.emit(
+                f"The Burial Tools registry could not be read:\n"
+                f"{self.store.gpkg_path}\n\n{exc}")
+        if emit:
+            self.toolsChanged.emit()
+
+    def save_tool(self, row: Dict) -> str:
+        """Create/update a registry tool. Project-scoped: not part of any
+        plan's change log (the Planner vessels model); the row itself carries
+        source_ref + modified_utc for traceability."""
+        ids = self.save_tools([row])
+        return ids[0] if ids else ""
+
+    def save_tools(self, rows: List[Dict]) -> List[str]:
+        """Bulk create/update: one table write, one signal, one layer refresh
+        (a registry JSON import would otherwise rewrite per tool)."""
+        if not rows:
+            return []
+        try:
+            self.store.ensure_created()
+        except Exception as exc:
+            self.storeError.emit(
+                f"Could not create the Burial Planner GeoPackage:\n{exc}")
+            return []
+        ok, tool_ids = self._store_write("save the burial tools",
+                                         self.store.save_tools, rows)
+        if not ok:
+            return []
+        self._after_tools_changed()
+        return list(tool_ids or [])
+
+    def delete_tool(self, tool_id: str) -> bool:
+        """Remove a registry tool. Plans referencing it keep their ids and
+        render "(unregistered tool)" — nothing in a plan is edited."""
+        ok, _ = self._store_write("delete the burial tool",
+                                  self.store.delete_tool, tool_id)
+        if ok:
+            self._after_tools_changed()
+        return ok
+
+    def _after_tools_changed(self) -> None:
+        self.refresh_tools()
+        # The sections map layer bakes the resolved tool text in at write
+        # time — re-write it so renames/deletes show on the map too.
+        self.refresh_layers()
+
+    def default_tool(self) -> Tuple[str, str]:
+        """The plan's default (tool_id, tool_config_id)."""
+        return tools.plan_default_tool(self.plan)
+
     def create_plan(self, name: str, method: str, description: str = "",
                     rpl_row: Optional[Dict] = None) -> Optional[str]:
         plan = {
@@ -443,12 +503,15 @@ class PlanModel(QObject):
         self.planChanged.emit()
         return True
 
-    def update_gen_params(self, updates: Dict, reason: str = "") -> bool:
+    def update_gen_params(self, updates: Dict, reason: str = "",
+                          stale: bool = True) -> bool:
         """Patch selected workflow parameters without overwriting other tabs.
 
         Bathymetry preparation, exclusion analysis and candidate generation
         deliberately expose different parts of ``params_json``. Each tab must
         preserve the values owned by the others when it applies its settings.
+        ``stale=False`` is for parameters that do not affect generation
+        results (e.g. the default burial tool).
         """
         if not self.plan:
             return False
@@ -461,7 +524,7 @@ class PlanModel(QObject):
         stored.update(updates)
         saved = self.update_plan(
             {"params_json": json.dumps(stored)}, reason=reason)
-        if saved:
+        if saved and stale:
             self.mark_stale()
         return saved
 
@@ -808,6 +871,16 @@ class PlanModel(QObject):
                        if s.get("section_id") == section_id]
         if not before_rows:
             return False
+        if "tool_id" in updates:
+            # Model-level invariant for every writer (combo, import, bulk
+            # edit): changing the tool clears a configuration that belonged
+            # to the previous tool and stamps the section method with the
+            # tool's type ("" = inherit the plan default/method).
+            updates = dict(updates)
+            tool = tools.tool_by_id(self.tools, updates.get("tool_id") or "")
+            updates.setdefault("tool_config_id", "")
+            updates["method"] = schema.normalise_method(
+                (tool or {}).get("tool_type") or "")
         updated = []
         for section in self.sections:
             copy = dict(section)
@@ -911,7 +984,7 @@ class PlanModel(QObject):
     def merge_sections(self, section_ids: List[str], reason: str = "") -> bool:
         """Merge selected burial sections or selected skips."""
         remaining, _removed, _kind = ev.merge_section_events(
-            self.events, self.sections, section_ids)
+            self.events, self.sections, section_ids, self.method)
         lo, hi = self._scope_bounds()
         result = ev.validate_events(
             remaining, lo, hi, self.direction, self.method)
@@ -1023,7 +1096,8 @@ class PlanModel(QObject):
             map_layers.write_plan_layers(self.store, self.plan, self.sections,
                                          self.events, self.route,
                                          hazards=self.hazards,
-                                         risk_checks=self.risk_checks)
+                                         risk_checks=self.risk_checks,
+                                         tools=self.tools)
             map_layers.ensure_plan_layers(QgsProject.instance(),
                                           self.store.gpkg_path, self.plan)
         except Exception as exc:
@@ -1038,7 +1112,8 @@ class PlanModel(QObject):
     def export_sections_csv(self) -> str:
         active = self.store.active_generation(self.plan_id) or {}
         return io_csv.sections_csv(self.plan, self.sections,
-                                   active.get("generation_id") or "")
+                                   active.get("generation_id") or "",
+                                   tools=self.tools)
 
     def export_inputs_csv(self) -> str:
         return io_csv.inputs_csv(self.plan, self.inputs)

@@ -31,6 +31,7 @@ from ..qgis_compat import WKB_LINESTRING, WKB_POINT
 from ..workbench.project_layers import layer_name_from_source, normalised_path
 from . import events as ev
 from . import schema
+from . import tools as tools_mod
 
 BURIAL_GROUP = "Burial Planner"
 
@@ -177,7 +178,8 @@ def rpl_fingerprint(rpl_row: Optional[Dict], gpkg_path: str = "") -> str:
 def write_plan_layers(store, plan: Dict, sections: Sequence[Dict],
                       events: Sequence[Dict], route,
                       hazards: Optional[Sequence[Dict]] = None,
-                      risk_checks: Optional[Sequence[Dict]] = None
+                      risk_checks: Optional[Sequence[Dict]] = None,
+                      tools: Optional[Sequence[Dict]] = None
                       ) -> Tuple[str, str]:
     """Write/overwrite the plan's sections + events (+ hazards) layers."""
     method = plan.get("method") or ""
@@ -207,6 +209,7 @@ def write_plan_layers(store, plan: Dict, sections: Sequence[Dict],
                 section.get("conclusion") or "", section.get("conclusion") or ""),
             "confidence": section.get("confidence") or "",
             "reasons": section.get("reason_json") or "",
+            "tool": tools_mod.section_tool_display(section, plan, tools or []),
             "skip_handling": schema.SKIP_HANDLING_LABELS.get(
                 section.get("skip_handling") or "", "")
             if section.get("kind") == schema.SECTION_SKIP else "",

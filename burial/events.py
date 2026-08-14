@@ -22,25 +22,17 @@ from typing import Dict, List, Optional, Tuple
 
 from . import schema
 
-# Display labels: generic semantics, per-method vocabulary. Generic terms
-# appear only in code/schema, never in plough-mode UI (spec D4).
-_METHOD_EVENT_LABELS: Dict[str, Dict[str, str]] = {
-    schema.METHOD_PLOUGH: {
-        schema.EVENT_BURIAL_START: "PLDN",
-        schema.EVENT_BURIAL_END: "PLUP",
-    },
-    schema.METHOD_ROV_JET: {
-        schema.EVENT_BURIAL_START: "JET_START",
-        schema.EVENT_BURIAL_END: "JET_STOP",
-    },
-}
-
 _KP_TOL = 5e-7  # km (~0.5 mm) — comparisons on stored floats
 
 
 def event_label(event_type: str, method: str) -> str:
-    """The method-correct display label for an event type."""
-    labels = _METHOD_EVENT_LABELS.get(method or "", {})
+    """The method-correct display label for an event type.
+
+    The per-method vocabulary lives in ``schema.METHOD_EVENT_LABELS`` beside
+    the section codes and kind labels.
+    """
+    labels = schema.METHOD_EVENT_LABELS.get(
+        schema.normalise_method(method), {})
     return labels.get(event_type, event_type or "")
 
 
@@ -186,7 +178,7 @@ def check_move(events: List[Dict], event_id: str, new_kp: float,
 
 
 def merge_section_events(events: List[Dict], sections: List[Dict],
-                         section_ids: List[str]
+                         section_ids: List[str], method: str = ""
                          ) -> Tuple[List[Dict], List[str], str]:
     """Remove boundary events so selected burial sections *or* skips merge.
 
@@ -247,7 +239,10 @@ def merge_section_events(events: List[Dict], sections: List[Dict],
                 "A locked event lies between the sections — unlock it first.")
         removed.append(str(event.get("event_id") or ""))
     if not removed:
-        raise ValueError("No PLDN/PLUP boundaries were found between the sections.")
+        raise ValueError(
+            f"No {event_label(schema.EVENT_BURIAL_START, method)}/"
+            f"{event_label(schema.EVENT_BURIAL_END, method)} boundaries were "
+            "found between the sections.")
     return remaining, removed, kind
 
 
