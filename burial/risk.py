@@ -207,12 +207,40 @@ def sort_hazards(hazards: Sequence[Dict]) -> List[Dict]:
     return sorted(hazards, key=key)
 
 
+def merge_risk_spans(spans: Sequence[Tuple[float, float, str]]
+                     ) -> List[Tuple[float, float, str]]:
+    """Merge overlapping/adjacent spans of the same risk level.
+
+    Dense feature fields (thousands of boulder picks) otherwise produce one
+    span per hazard, which makes strip painting and per-check fire bars
+    scale with the register instead of with the route.
+    """
+    by_level: Dict[str, List[Tuple[float, float]]] = {}
+    for start, end, level in spans:
+        by_level.setdefault(level or "", []).append((start, end))
+    merged: List[Tuple[float, float, str]] = []
+    for level, ranges in by_level.items():
+        ranges.sort()
+        current_start, current_end = ranges[0]
+        for start, end in ranges[1:]:
+            if start <= current_end + 1e-9:
+                current_end = max(current_end, end)
+            else:
+                merged.append((current_start, current_end, level))
+                current_start, current_end = start, end
+        merged.append((current_start, current_end, level))
+    # Severe spans last so they draw on top of milder overlapping ones.
+    merged.sort(key=lambda s: (schema.RISK_ORDER.get(s[2], 0), s[0]))
+    return merged
+
+
 def hazard_spans(hazards: Sequence[Dict], point_halfwidth_km: float = 0.025
                  ) -> List[Tuple[float, float, str]]:
     """(start_km, end_km, risk) spans for the overview strip.
 
     Point hazards get a small ± halfwidth so they stay visible at route
-    scale; range hazards use their true extent.
+    scale; range hazards use their true extent. Same-level overlapping
+    spans are merged so the count stays bounded by route coverage.
     """
     spans: List[Tuple[float, float, str]] = []
     for hazard in hazards:
@@ -228,9 +256,7 @@ def hazard_spans(hazards: Sequence[Dict], point_halfwidth_km: float = 0.025
             lo = centre - point_halfwidth_km
             hi = centre + point_halfwidth_km
         spans.append((lo, hi, hazard.get("risk") or ""))
-    # Severe spans last so they draw on top of milder overlapping ones.
-    spans.sort(key=lambda s: schema.RISK_ORDER.get(s[2], 0))
-    return spans
+    return merge_risk_spans(spans)
 
 
 def summarise_hazards(hazards: Sequence[Dict]) -> Dict[str, int]:

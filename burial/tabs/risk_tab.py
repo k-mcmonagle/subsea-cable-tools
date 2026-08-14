@@ -79,6 +79,13 @@ _RISK_COLORS = {
     schema.RISK_UNASSIGNED: QColor("#909090"),
 }
 
+# Register-size guards: per-row combo widgets cost ~1 ms each, so a dense
+# scan (thousands of boulder picks) would freeze the UI on every refresh.
+# Beyond these limits the table shows risk/status as text (edit via the
+# right-click menu) and truncates the view — never the stored register.
+_MAX_COMBO_ROWS = 400
+_MAX_TABLE_ROWS = 2000
+
 
 class CheckEditorDialog(QDialog):
     """Edit one bp_risk_check row."""
@@ -569,8 +576,25 @@ class RiskTab(QWidget):
                 bits.append(f"{counts[schema.RISK_UNASSIGNED]} unassigned")
             bits.append(f"{counts['open']} open")
             summary += " (" + ", ".join(bits) + ")"
+        shown = hazards
+        if len(hazards) > _MAX_TABLE_ROWS:
+            shown = hazards[:_MAX_TABLE_ROWS]
+            summary += (f" — showing the first {_MAX_TABLE_ROWS} by KP; "
+                        "tighten the checks or export the CSV for the rest")
+        use_combos = len(shown) <= _MAX_COMBO_ROWS
+        if not use_combos and len(hazards) <= _MAX_TABLE_ROWS:
+            summary += " — set risk/status via right-click (large register)"
         self.register_label.setText(summary)
 
+        self.hazard_table.setUpdatesEnabled(False)
+        try:
+            self._populate_hazard_rows(shown, check_names, use_combos)
+        finally:
+            self.hazard_table.setUpdatesEnabled(True)
+
+    def _populate_hazard_rows(self, hazards: List[Dict],
+                              check_names: Dict[str, str],
+                              use_combos: bool) -> None:
         self.hazard_table.setRowCount(len(hazards))
         for i, hazard in enumerate(hazards):
             hazard_id = hazard.get("hazard_id")
@@ -579,9 +603,11 @@ class RiskTab(QWidget):
                         and abs(float(end_kp) - float(hazard.get("kp") or 0.0))
                         > 5e-4)
             angle = hazard.get("crossing_angle_deg")
+            level = hazard.get("risk") or ""
             values = [
-                "",  # risk combo
-                "",  # status combo
+                "" if use_combos else schema.RISK_LABELS.get(level, ""),
+                "" if use_combos else schema.HAZARD_STATUS_LABELS.get(
+                    hazard.get("status") or "", ""),
                 schema.format_kp(hazard.get("kp")),
                 schema.format_kp(end_kp) if is_range else "",
                 (f"{float(hazard.get('offset_m') or 0.0):+.1f}"
@@ -600,6 +626,11 @@ class RiskTab(QWidget):
                 item.setFlags(flags)
                 if j == 0:
                     item.setData(ITEM_DATA_USER_ROLE, hazard_id)
+                    if not use_combos:
+                        color = _RISK_COLORS.get(level)
+                        if color is not None:
+                            from qgis.PyQt.QtGui import QBrush
+                            item.setForeground(QBrush(color))
                 if j == 7:
                     try:
                         attributes = json.loads(
@@ -612,6 +643,10 @@ class RiskTab(QWidget):
                 if j == _HAZARD_NOTES_COL and value:
                     item.setToolTip(value)
                 self.hazard_table.setItem(i, j, item)
+            if not use_combos:
+                self.hazard_table.removeCellWidget(i, _HAZARD_RISK_COL)
+                self.hazard_table.removeCellWidget(i, _HAZARD_STATUS_COL)
+                continue
             self._add_hazard_combo(
                 i, _HAZARD_RISK_COL, hazard_id, "risk",
                 [(lv, schema.RISK_LABELS[lv])

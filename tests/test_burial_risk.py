@@ -121,6 +121,10 @@ def test_spans_and_summary() -> bool:
     counts = risk.summarise_hazards(hazards)
     ok = ok and counts["total"] == 3 and counts["high"] == 1 \
         and counts["low"] == 1 and counts[""] == 1 and counts["open"] == 3
+    # Dense same-level fields merge to bounded spans (strip performance).
+    dense = [_hazard("c1", f"d{i}#0", 5.0 + i * 0.01, "high")
+             for i in range(50)]
+    ok = ok and len(risk.hazard_spans(dense)) == 1
     ordered = risk.sort_hazards(list(reversed(hazards)))
     ok = ok and [h["feature_ref"] for h in ordered] == ["m1", "1#0", "2#0"]
     return _result("overview spans + summary + KP ordering", ok)

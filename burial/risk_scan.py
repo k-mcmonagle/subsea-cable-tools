@@ -54,6 +54,12 @@ WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
 CHECK_KIND_FEATURES = "features"
 CHECK_KIND_ROUTE_TURNS = "route_turns"
 
+# One check yielding more interactions than this almost always means the
+# search distance or filter is far too wide, and a register this size makes
+# the whole tab unusable (widgets, layers and change-log entries all scale
+# with it). The cap is reported, never silent.
+MAX_HAZARDS_PER_CHECK = 5000
+
 # Attribute names exposed by the route-turns scan (mirrors the Extract A/C
 # Points processing algorithm's output fields).
 TURN_SIGNED_ATTR = "alter_course"
@@ -309,6 +315,13 @@ def scan_snapshot(plan_id: str, check_row: Dict, features: List[Dict],
     for done, entry in enumerate(features):
         if cancel is not None and done % 50 == 0 and cancel():
             return hazards, warnings
+        if len(hazards) >= MAX_HAZARDS_PER_CHECK:
+            warnings.append(
+                f"Check '{check_name}' hit the {MAX_HAZARDS_PER_CHECK}-"
+                f"hazard cap with {len(features) - done} feature(s) left "
+                "unscanned — tighten the search distance or add a feature "
+                "filter.")
+            break
         if progress is not None and done % 200 == 0:
             progress(f"{check_name}: {done}/{len(features)} features…")
         geom = entry["geom"]

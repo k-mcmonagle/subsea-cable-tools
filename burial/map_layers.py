@@ -466,6 +466,13 @@ def _ensure_layer(project: QgsProject, gpkg_path: str, layer_name: str,
             try:
                 existing.setDataSource(gpkg_layer_uri(gpkg_path, layer_name),
                                        layer_name, "ogr")
+                from qgis.core import QgsMessageLog
+
+                from ..qgis_compat import MESSAGE_INFO
+                QgsMessageLog.logMessage(
+                    f"Rebuilt the stale field map of plan layer "
+                    f"'{layer_name}' (schema gained columns).",
+                    "Burial Planner", MESSAGE_INFO)
             except Exception:
                 pass
         existing.dataProvider().reloadData()
