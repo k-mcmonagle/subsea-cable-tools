@@ -538,6 +538,52 @@ def test_merged_header_industry_layout() -> bool:
         "" if ok else f"encoding={profile.coord_encoding} mapping={profile.mapping}")
 
 
+def test_generic_cable_cumulative_header_uses_guarded_adjacency() -> bool:
+    """A common unmerged header labels the cable span column fully but calls
+    the following column only 'Cumulative Total'. Route KP is already known,
+    so guarded adjacency should supply the missing cable context.
+    """
+    rows = [
+        ["Pos No.", "Event", "Lat (dd)", "Lon (dd)",
+         "Distance Between Positions", "KP Cumulative", "Slack %",
+         "Cable Distance Between Positions", "Cumulative Total", "Depth"],
+        [1, "Start", 50.0, -1.0, None, 0.0, None, None, 0.0, 10.0],
+        [2, "Mid", 50.01, -1.0, 1.112, 1.112, 2.0, 1.134, 1.134, 20.0],
+        [3, "End", 50.02, -1.0, 1.112, 2.224, 2.0, 1.134, 2.268, 30.0],
+    ]
+    grid = R.SourceGrid(sheet="RPL", rows=rows, n_cols=10)
+    result = D.detect(grid)
+    mapping = result.profile.mapping
+    ok = mapping.get(M.SF_DIST) == 5
+    ok &= mapping.get(M.PF_DIST_CUM) == 6
+    ok &= mapping.get(M.SF_CABLE_DIST) == 8
+    ok &= mapping.get(M.PF_CABLE_DIST_CUM) == 9
+    ok &= "immediately follows" in result.reasons.get(M.PF_CABLE_DIST_CUM, "")
+    return _result(
+        "generic cumulative header inherits adjacent cable-distance context", ok,
+        "" if ok else f"mapping={mapping} reasons={result.reasons}")
+
+
+def test_cable_cumulative_adjacency_requires_header_evidence() -> bool:
+    """A monotonic numeric column after cable distance is not enough on its
+    own; without a cumulative/total header it must remain unassigned.
+    """
+    rows = [
+        ["Pos No.", "Event", "Lat (dd)", "Lon (dd)",
+         "Distance Between Positions", "KP Cumulative", "Slack %",
+         "Cable Distance Between Positions", "Measure", "Depth"],
+        [1, "Start", 50.0, -1.0, None, 0.0, None, None, 0.0, 10.0],
+        [2, "Mid", 50.01, -1.0, 1.112, 1.112, 2.0, 1.134, 1.134, 20.0],
+        [3, "End", 50.02, -1.0, 1.112, 2.224, 2.0, 1.134, 2.268, 30.0],
+    ]
+    profile = D.detect(R.SourceGrid(sheet="RPL", rows=rows, n_cols=10)).profile
+    ok = profile.mapping.get(M.SF_CABLE_DIST) == 8
+    ok &= M.PF_CABLE_DIST_CUM not in profile.mapping
+    return _result(
+        "cable cumulative adjacency requires cumulative header evidence", ok,
+        "" if ok else f"mapping={profile.mapping}")
+
+
 def test_detect_coordinate_columns_for_encoding() -> bool:
     # Split triples exist: constrained split detection finds them.
     grid = R.SourceGrid(sheet="RPL", rows=_industry_ddm_rows(), n_cols=14)
@@ -908,6 +954,8 @@ def run_all() -> List[bool]:
         test_decimal_fallback_prefers_true_decimal_columns(),
         test_split_ddm_hemisphere_first_order(),
         test_merged_header_industry_layout(),
+        test_generic_cable_cumulative_header_uses_guarded_adjacency(),
+        test_cable_cumulative_adjacency_requires_header_evidence(),
         test_detect_coordinate_columns_for_encoding(),
         test_split_cells_with_unit_symbols(),
         test_canonical_fields_beat_derived_navigation_columns(),

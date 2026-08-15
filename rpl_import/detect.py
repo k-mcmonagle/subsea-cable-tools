@@ -586,6 +586,30 @@ def _map_remaining_columns(grid: SourceGrid, header_texts: List[str],
             reasons[field_key] = (
                 f"Column {best} ('{header_texts[best - 1]}'): {why}.")
 
+    # Some RPLs use a two-column cable-distance pair without repeating the
+    # group label over the second column, for example ``Cable Distance`` then
+    # simply ``Cumulative``.  The generic second header intentionally cannot
+    # identify itself as cable distance, but its position is a strong
+    # tie-breaker once both the ordinary route KP and cable span have already
+    # been identified.  Do not infer from adjacency alone: the candidate must
+    # still advertise cumulative/total meaning and have cumulative-looking
+    # numeric content, and it must not have been claimed by another field.
+    if (not profile.mapping.get(PF_CABLE_DIST_CUM)
+            and profile.mapping.get(PF_DIST_CUM)
+            and profile.mapping.get(SF_CABLE_DIST)):
+        candidate = profile.mapping[SF_CABLE_DIST] + 1
+        if candidate <= grid.n_cols and candidate not in taken:
+            header = (header_texts[candidate - 1]
+                      if candidate <= len(header_texts) else "")
+            if (re.search(r"\b(cum\w*|total|running)\b", header)
+                    and content_ok(PF_CABLE_DIST_CUM, candidate)):
+                profile.mapping[PF_CABLE_DIST_CUM] = candidate
+                taken.add(candidate)
+                reasons[PF_CABLE_DIST_CUM] = (
+                    f"Column {candidate} ('{header}'): cumulative cable "
+                    f"distance immediately follows detected cable span "
+                    f"distance column {profile.mapping[SF_CABLE_DIST]}.")
+
 
 # ---------------------------------------------------------------------------
 # Units
