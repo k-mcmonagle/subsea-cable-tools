@@ -272,7 +272,9 @@ class PlannerDock(QDockWidget):
                 ("Standard tasks…", self._standard_tasks, ""),
                 ("Operation types…", self._edit_operation_types, ""),
                 ("Sketch tasks…", self._sketch_tasks, ""),
-                ("Import RPL…", self._import_rpl, ""),
+                ("Add from RPL…", self._import_rpl,
+                 "Create planning tasks from a registered Workbench RPL, a project "
+                 "line layer, or a new RPL file."),
                 ("Import tasks…", self._import_tasks,
                  "Paste rows copied from MS Project or load a CSV of tasks; "
                  "assign locations afterwards if needed.")):
