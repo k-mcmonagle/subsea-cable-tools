@@ -10,8 +10,8 @@ from typing import Dict, List, Optional
 from qgis.PyQt.QtCore import QSettings
 from qgis.PyQt.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
-    QHBoxLayout, QLabel, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
-    QWidget,
+    QHBoxLayout, QLabel, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 from qgis.core import QgsGeometry, QgsProject
 
@@ -56,13 +56,18 @@ class SegmentDraft:
 
 
 class RplImportDialog(QDialog):
-    def __init__(self, planner_store, resources, parent=None):
+    def __init__(self, planner_store, resources, parent=None, iface=None,
+                 wizard_factory=None, dialog_exec=qt_exec):
         super().__init__(parent)
         self.setWindowTitle("Import RPL into Planner")
         self.resize(900, 580)
         self.planner_store = planner_store
         self.resources = list(resources)
-        self.sources = _discover_sources(planner_store)
+        self.iface = iface
+        self._wizard_factory = wizard_factory
+        self._dialog_exec = dialog_exec
+        self.sources: List[RplSource] = []
+        self._discovery_errors: List[str] = []
         self.segments: List[SegmentDraft] = []
         self._loading = False
         self._operation_overrides = {}
@@ -71,8 +76,21 @@ class RplImportDialog(QDialog):
         layout = QVBoxLayout(self)
         form = QFormLayout()
         self.source_combo = QComboBox()
-        for source in self.sources:
-            self.source_combo.addItem(source.label, source)
+        source_widget = QWidget()
+        source_layout = QHBoxLayout(source_widget)
+        source_layout.setContentsMargins(0, 0, 0, 0)
+        source_layout.addWidget(self.source_combo, 1)
+        self.import_source_button = QPushButton("Import RPL file...")
+        self.import_source_button.setToolTip(
+            "Open the guided Excel/CSV import wizard, register the RPL in the "
+            "Cable Route Workbench, and select it here.")
+        self.import_source_button.clicked.connect(self._import_new_rpl)
+        source_layout.addWidget(self.import_source_button)
+        self.refresh_sources_button = QPushButton("Refresh")
+        self.refresh_sources_button.setToolTip(
+            "Refresh registered Workbench RPLs and line layers in this project.")
+        self.refresh_sources_button.clicked.connect(self._refresh_sources)
+        source_layout.addWidget(self.refresh_sources_button)
         self.start_spin = _kp_spin()
         self.end_spin = _kp_spin()
         self.group_combo = QComboBox()
@@ -95,7 +113,7 @@ class RplImportDialog(QDialog):
         rules_layout.addWidget(self.use_rules)
         rules_layout.addWidget(rules_button)
         rules_layout.addStretch(1)
-        form.addRow("Source:", self.source_combo)
+        form.addRow("Source:", source_widget)
         form.addRow("Start KP:", self.start_spin)
         form.addRow("End KP:", self.end_spin)
         form.addRow("Task grouping:", self.group_combo)
@@ -103,6 +121,12 @@ class RplImportDialog(QDialog):
         form.addRow("Operation for all sections:", self.operation_combo)
         form.addRow("Automatic mapping:", rules_widget)
         layout.addLayout(form)
+
+        self.source_hint = QLabel(
+            "Choose a registered Workbench RPL or a line layer already loaded "
+            "in this QGIS project. Use Import RPL file to add an Excel/CSV RPL.")
+        self.source_hint.setWordWrap(True)
+        layout.addWidget(self.source_hint)
 
         layout.addWidget(QLabel(
             "Default task speeds by cable type (0 kn creates a manual-duration task):"))
@@ -119,10 +143,11 @@ class RplImportDialog(QDialog):
         layout.addWidget(self.preview, 1)
         self.status = QLabel("")
         layout.addWidget(self.status)
-        box = QDialogButtonBox(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
-        box.accepted.connect(self._accept_if_valid)
-        box.rejected.connect(self.reject)
-        layout.addWidget(box)
+        self.button_box = QDialogButtonBox(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
+        self.ok_button = self.button_box.button(BUTTON_BOX_OK)
+        self.button_box.accepted.connect(self._accept_if_valid)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
 
         self.source_combo.currentIndexChanged.connect(self._source_changed)
         self.start_spin.valueChanged.connect(self._refresh_preview)
@@ -132,7 +157,62 @@ class RplImportDialog(QDialog):
         self.operation_combo.currentIndexChanged.connect(self._apply_operation_to_all)
         self.use_rules.toggled.connect(self._rules_toggled)
         self.speed_table.itemChanged.connect(self._refresh_preview)
+        self._refresh_sources(preserve=False)
+
+    def _refresh_sources(self, *_args, select_rpl_id="", preserve=True):
+        current = self.source_combo.currentData()
+        current_key = _source_key(current) if preserve else None
+        self._discovery_errors = []
+        self.sources = _discover_sources(
+            self.planner_store, errors=self._discovery_errors)
+
+        self.source_combo.blockSignals(True)
+        try:
+            self.source_combo.clear()
+            for source in self.sources:
+                self.source_combo.addItem(source.label, source)
+            if not self.sources:
+                self.source_combo.addItem("No RPL sources available", None)
+
+            selected = -1
+            if select_rpl_id:
+                selected = next((
+                    index for index, source in enumerate(self.sources)
+                    if source.rpl_id == select_rpl_id
+                ), -1)
+            if selected < 0 and current_key is not None:
+                selected = next((
+                    index for index, source in enumerate(self.sources)
+                    if _source_key(source) == current_key
+                ), -1)
+            self.source_combo.setCurrentIndex(selected if selected >= 0 else 0)
+            self.source_combo.setEnabled(bool(self.sources))
+        finally:
+            self.source_combo.blockSignals(False)
         self._source_changed()
+
+    def _import_new_rpl(self):
+        try:
+            from ..workbench.project_layers import discover_gpkg_path
+            from ..workbench.store import WorkbenchStore, default_project_gpkg_path
+
+            path = discover_gpkg_path() or default_project_gpkg_path()
+            store = WorkbenchStore(path)
+            wizard_factory = self._wizard_factory
+            if wizard_factory is None:
+                from ..workbench.rpl_import_wizard import RplImportWizard
+                wizard_factory = RplImportWizard
+            wizard = wizard_factory(store, self.iface, parent=self)
+            imported_ids = []
+            wizard.imported.connect(imported_ids.append)
+            self._dialog_exec(wizard)
+            if imported_ids:
+                self._refresh_sources(
+                    select_rpl_id=imported_ids[-1], preserve=False)
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Import RPL",
+                "Could not open or complete the RPL import wizard:\n%s" % exc)
 
     def _source_changed(self, _index=None):
         source = self.source_combo.currentData()
@@ -291,7 +371,21 @@ class RplImportDialog(QDialog):
             self.preview.setCellWidget(row, 1, operation_combo)
             for column, value in enumerate(values[1:], start=2):
                 self.preview.setItem(row, column, QTableWidgetItem(value))
-        self.status.setText("%d source segment(s) → %d task(s)" % (len(self.segments), len(drafts)))
+        source = self.source_combo.currentData()
+        if source is None:
+            if self._discovery_errors:
+                self.status.setText(
+                    "Workbench RPLs could not be read: %s. You can retry with "
+                    "Refresh or import a new RPL file." % self._discovery_errors[-1])
+            else:
+                self.status.setText(
+                    "No route sources are available. Import an Excel/CSV RPL "
+                    "or add an RPL line layer to this QGIS project.")
+        else:
+            self.status.setText("%d source segment(s) → %d task(s)" % (
+                len(self.segments), len(drafts)))
+        if self.ok_button is not None:
+            self.ok_button.setEnabled(bool(drafts))
 
     def _apply_operation_to_all(self, *_args):
         if self._loading:
@@ -395,7 +489,7 @@ class RplOperationRulesDialog(QDialog):
         return rows
 
 
-def _discover_sources(planner_store) -> List[RplSource]:
+def _discover_sources(planner_store, errors=None) -> List[RplSource]:
     sources = []
     known_sources = set()
     try:
@@ -412,8 +506,9 @@ def _discover_sources(planner_store) -> List[RplSource]:
                             "Workbench: %s" % (row.get("name") or "RPL"), "workbench",
                             line_layer, point_layer, row.get("rpl_id") or ""))
                         known_sources.add(line_layer.source())
-    except Exception:
-        pass
+    except Exception as exc:
+        if errors is not None:
+            errors.append(str(exc))
     planner_sources = {
         planner_store.geometry_layer("line").source() if planner_store.geometry_layer("line") else ""
     }
@@ -428,6 +523,18 @@ def _discover_sources(planner_store) -> List[RplSource]:
         except Exception:
             continue
     return sources
+
+
+def _source_key(source: Optional[RplSource]):
+    if source is None:
+        return None
+    if source.rpl_id:
+        return source.kind, source.rpl_id
+    try:
+        layer_source = source.line_layer.source()
+    except Exception:
+        layer_source = ""
+    return source.kind, layer_source, source.label
 
 
 def _matching_point_layer(line_layer):

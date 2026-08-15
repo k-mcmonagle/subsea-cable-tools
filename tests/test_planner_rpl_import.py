@@ -6,10 +6,13 @@ from __future__ import annotations
 import os
 import tempfile
 
+from qgis.PyQt.QtCore import pyqtSignal
+from qgis.PyQt.QtWidgets import QDialog
 from qgis.core import (
     QgsFeature, QgsField, QgsGeometry, QgsProject, QgsVectorLayer,
 )
 
+from ..planner import rpl_import as rpl_import_module
 from ..planner.rpl_import import (
     DEFAULT_OPERATION_RULES, RplImportDialog, RplSource, _read_segments,
     _rule_operation,
@@ -108,6 +111,79 @@ def test_saved_operation_rule_matching():
     return _result("ProtectionMethod operation rules", ok)
 
 
+def test_empty_state_and_source_refresh():
+    points, lines = _layers()
+    folder = tempfile.mkdtemp(prefix="pow_rpl_source_refresh_")
+    store = PlannerStore(os.path.join(folder, "planner.gpkg"))
+    store.ensure_created()
+    available = []
+    original_discover = rpl_import_module._discover_sources
+    rpl_import_module._discover_sources = lambda _store, errors=None: list(available)
+    dialog = None
+    try:
+        dialog = RplImportDialog(store, [])
+        ok = dialog.source_combo.count() == 1
+        ok = ok and dialog.source_combo.currentData() is None
+        ok = ok and not dialog.source_combo.isEnabled()
+        ok = ok and not dialog.ok_button.isEnabled()
+        ok = ok and "No route sources are available" in dialog.status.text()
+
+        available.append(RplSource(
+            "Project layer: RPL Lines", "project", lines, points))
+        dialog._refresh_sources()
+        ok = ok and dialog.source_combo.isEnabled()
+        ok = ok and dialog.source_combo.currentData().line_layer is lines
+        ok = ok and dialog.ok_button.isEnabled()
+        ok = ok and len(dialog.task_drafts()) == 2
+    finally:
+        if dialog is not None:
+            dialog.close()
+        rpl_import_module._discover_sources = original_discover
+    return _result("Planner RPL empty state + source refresh", ok)
+
+
+def test_import_wizard_handoff_selects_new_rpl():
+    class FakeWizard(QDialog):
+        imported = pyqtSignal(str)
+
+        def __init__(self, _store, _iface, parent=None):
+            super().__init__(parent)
+
+    points, lines = _layers()
+    other_points, other_lines = _layers()
+    other_lines.setName("New RPL Lines")
+    folder = tempfile.mkdtemp(prefix="pow_rpl_wizard_handoff_")
+    store = PlannerStore(os.path.join(folder, "planner.gpkg"))
+    store.ensure_created()
+    available = [RplSource(
+        "Workbench: Existing", "workbench", lines, points, "existing-rpl")]
+    original_discover = rpl_import_module._discover_sources
+    rpl_import_module._discover_sources = lambda _store, errors=None: list(available)
+
+    def execute(wizard):
+        available.append(RplSource(
+            "Workbench: Newly imported", "workbench",
+            other_lines, other_points, "new-rpl"))
+        wizard.imported.emit("new-rpl")
+        return 0
+
+    dialog = None
+    try:
+        dialog = RplImportDialog(
+            store, [], wizard_factory=FakeWizard, dialog_exec=execute)
+        dialog._import_new_rpl()
+        selected = dialog.source_combo.currentData()
+        ok = selected is not None and selected.rpl_id == "new-rpl"
+        ok = ok and selected.line_layer is other_lines
+        ok = ok and len(dialog.task_drafts()) == 2
+    finally:
+        if dialog is not None:
+            dialog.close()
+        rpl_import_module._discover_sources = original_discover
+    return _result("guided import refreshes and selects new Workbench RPL", ok)
+
+
 def run_all():
     return [test_workbench_kp_reading(), test_dialog_grouping_range_and_speeds(),
-            test_saved_operation_rule_matching()]
+            test_saved_operation_rule_matching(), test_empty_state_and_source_refresh(),
+            test_import_wizard_handoff_selects_new_rpl()]

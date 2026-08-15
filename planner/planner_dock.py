@@ -1346,7 +1346,8 @@ class PlannerDock(QDockWidget):
             return
         # Implemented in planner.rpl_import; kept lazy so the core dock remains fast to open.
         from .rpl_import import RplImportDialog
-        dialog = RplImportDialog(self.store, self.task_table.resources, self)
+        dialog = RplImportDialog(
+            self.store, self.task_table.resources, parent=self, iface=self.iface)
         if qt_exec(dialog) != DIALOG_ACCEPTED:
             return
         self._append_imported_drafts(dialog.task_drafts())
