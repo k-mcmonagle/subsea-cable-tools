@@ -15,6 +15,7 @@ clipboard — paste straight into Catenary Calculator V2 / Cable Lay Simulator.
 from __future__ import annotations
 
 import json
+import os
 from typing import Dict, List, Optional
 
 from qgis.PyQt.QtCore import Qt, QSettings, pyqtSignal
@@ -34,6 +35,7 @@ from qgis.PyQt.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -87,6 +89,9 @@ class AssemblyManagerPanel(QWidget):
         self._current_header: Optional[Dict] = None
         self._loading = False
         self._fit_row: Optional[Dict] = None  # active fit context for the KP axis
+        self._fit_model_key = None
+        self._fit_model = None
+        self._sld_dirty = True
         self._read_only = False
 
         self._build_ui()
@@ -140,17 +145,18 @@ class AssemblyManagerPanel(QWidget):
         if self.embedded:
             self.browser.setVisible(False)
 
-        # right: SLD + items table
-        right = QSplitter(Qt.Orientation.Vertical)
+        # right: the same simple Table | Schematic pattern used for systems
+        # and cable segments.
+        right = QTabWidget()
         try:
             from .sld_widget import SldWidget
 
             self.sld = SldWidget()
             self.sld.itemClicked.connect(self._on_sld_item_clicked)
-            right.addWidget(self.sld)
+            sld_page = self.sld
         except Exception:
             self.sld = None
-            right.addWidget(QLabel("SLD unavailable (pyqtgraph could not be loaded)."))
+            sld_page = QLabel("Assembly schematic unavailable.")
 
         table_container = QWidget()
         table_layout = QVBoxLayout(table_container)
@@ -159,7 +165,7 @@ class AssemblyManagerPanel(QWidget):
         toolbar = QHBoxLayout()
         self.add_section_btn = QPushButton("Add section")
         self.add_section_btn.clicked.connect(lambda: self._add_item(am.KIND_SECTION))
-        self.add_body_btn = QPushButton("Add body")
+        self.add_body_btn = QPushButton("Add equipment")
         self.add_body_btn.clicked.connect(lambda: self._add_item(am.KIND_BODY))
         self.remove_item_btn = QPushButton("Delete item")
         self.remove_item_btn.clicked.connect(self._delete_item)
@@ -184,9 +190,10 @@ class AssemblyManagerPanel(QWidget):
         self.items_table.itemChanged.connect(self._on_item_changed)
         self.items_table.itemSelectionChanged.connect(self._on_table_selection)
         table_layout.addWidget(self.items_table)
-        right.addWidget(table_container)
-        right.setStretchFactor(0, 0)
-        right.setStretchFactor(1, 1)
+        right.addTab(table_container, "Table")
+        right.addTab(sld_page, "Schematic")
+        self.views = right
+        self.views.currentChanged.connect(self._on_view_changed)
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -204,16 +211,20 @@ class AssemblyManagerPanel(QWidget):
     # --------------------------------------------------------------- store --
     def _open_store(self):
         path = project_gpkg_path() or default_project_gpkg_path()
-        self.store = WorkbenchStore(path)
+        if (self.store is None
+                or os.path.normcase(os.path.abspath(self.store.gpkg_path))
+                != os.path.normcase(os.path.abspath(path))):
+            self.store = WorkbenchStore(path)
 
-    def refresh_assembly_list(self):
-        self._open_store()
+    def refresh_assembly_list(self, rows=None):
+        if rows is None:
+            self._open_store()
         previous = self.assembly.assembly_id if self.assembly is not None else None
         self.assembly_list.blockSignals(True)
         self.assembly_list.clear()
         restore_row = -1
         if self.store and self.store.exists():
-            for row in self.store.list_assemblies():
+            for row in (rows if rows is not None else self.store.list_assemblies()):
                 total_km = (row.get("total_cable_len_m") or 0.0) / 1000.0
                 item = QListWidgetItem(f"{row.get('name')}  ({row.get('kind')}, {total_km:.2f} km)")
                 item.setData(Qt.ItemDataRole.UserRole, row.get("assembly_id"))
@@ -234,12 +245,23 @@ class AssemblyManagerPanel(QWidget):
     def set_fit_context(self, fit_row: Optional[Dict]):
         """Use a specific fit for the SLD's KP axis (None = auto/first fit)."""
         self._fit_row = fit_row
-        self._apply_kp_axis()
+        self._schedule_sld_refresh()
+
+    def _on_view_changed(self, _index):
+        if self.sld is not None and self.views.currentWidget() is self.sld \
+                and self._sld_dirty:
+            self._apply_kp_axis()
+
+    def _schedule_sld_refresh(self):
+        self._sld_dirty = True
+        if self.sld is not None and self.views.currentWidget() is self.sld:
+            self._apply_kp_axis()
 
     def _apply_kp_axis(self):
         if self.sld is None:
             return
         mapping = None
+        events = None
         if self.assembly is not None and self.store is not None and self.store.exists():
             fit_row = self._fit_row
             if fit_row is None or fit_row.get("assembly_id") != self.assembly.assembly_id:
@@ -248,8 +270,72 @@ class AssemblyManagerPanel(QWidget):
             if fit_row is not None:
                 from .fit import build_fit_mapping
 
-                mapping = build_fit_mapping(self.store, fit_row)
+                model = self._model_for_fit(fit_row)
+                mapping = build_fit_mapping(self.store, fit_row, model=model)
+                events = self._events_for_fit(fit_row, model=model)
+        self.sld.set_assembly(self.assembly, events)
         self.sld.set_kp_mapping(mapping)
+        self._sld_dirty = False
+
+    def _model_for_fit(self, fit_row: Dict):
+        if self.store is None:
+            return None
+        rpl = self.store.get_rpl(fit_row.get("rpl_id") or "")
+        if not rpl:
+            return None
+        key = (rpl.get("rpl_id"), rpl.get("modified_utc"),
+               rpl.get("points_layer"), rpl.get("lines_layer"))
+        if key == self._fit_model_key:
+            return self._fit_model
+        points = self.store.open_layer(rpl.get("points_layer") or "")
+        lines = self.store.open_layer(rpl.get("lines_layer") or "")
+        if points is None or lines is None:
+            return None
+        from .rpl_layer_io import RplLayerSync
+
+        self._fit_model = RplLayerSync(
+            points, lines, rpl.get("rpl_id") or "").load_model()
+        self._fit_model_key = key
+        return self._fit_model
+
+    def invalidate_rpl_cache(self):
+        self._fit_model_key = None
+        self._fit_model = None
+
+    def _events_for_fit(self, fit_row: Dict, model=None) -> List[Dict]:
+        """Map labelled RPL positions into the assembly's cable domain."""
+        if self.assembly is None or self.store is None:
+            return []
+        rpl = self.store.get_rpl(fit_row.get("rpl_id") or "")
+        if not rpl:
+            return []
+        model = model or self._model_for_fit(fit_row)
+        if model is None:
+            return []
+        from . import rpl_engine
+        anchor_kp = float(fit_row.get("anchor_kp_km") or 0.0)
+        route_anchor = rpl_engine.cable_dist_from_kp(model, anchor_kp)
+        if route_anchor is None:
+            return []
+        anchor_assembly_m = float(fit_row.get("anchor_cable_dist_m") or 0.0)
+        direction = 1 if int(fit_row.get("direction") or 1) >= 0 else -1
+        classifier = am.EventClassifier(self.store.list_event_rules())
+        total_m = self.assembly.total_length_m()
+        events = []
+        for point in model.points:
+            if not str(point.event or "").strip() or point.cable_dist_cum_km is None:
+                continue
+            cable_m = anchor_assembly_m + direction * (
+                point.cable_dist_cum_km - route_anchor) * 1000.0
+            if not (0.0 <= cable_m <= total_m):
+                continue
+            classification = classifier.classify(point.event)
+            events.append({
+                "cable_km": cable_m / 1000.0,
+                "category": classification.category,
+                "label": point.event,
+            })
+        return events
 
     def _on_assembly_selected(self, current, _previous=None):
         if current is None:
@@ -264,7 +350,6 @@ class AssemblyManagerPanel(QWidget):
         self.assembly = am.assembly_from_rows(header, items) if header else None
         self.set_read_only(bool(header and header.get("status") == schema.STATUS_ISSUED))
         self._refresh_views()
-        self._apply_kp_axis()
 
     def _persist(self, library_changed: bool = False):
         if self.assembly is None or self.store is None:
@@ -293,6 +378,8 @@ class AssemblyManagerPanel(QWidget):
                         value = getattr(item, attr)
                         if value is None:
                             text = ""
+                        elif attr == "kind":
+                            text = "Section" if item.is_section else "Equipment"
                         elif col in _FLOAT_COLS:
                             text = f"{float(value):.6g}"
                         else:
@@ -308,13 +395,13 @@ class AssemblyManagerPanel(QWidget):
                 total = self.assembly.total_length_m()
                 bodies = sum(1 for i in self.assembly.items if not i.is_section)
                 self.summary_label.setText(
-                    f"  {len(self.assembly.items)} items · {bodies} bodies · {total / 1000.0:.3f} km")
+                    f"  {len(self.assembly.items)} items · {bodies} equipment items · "
+                    f"{total / 1000.0:.3f} km")
             else:
                 self.summary_label.setText("")
         finally:
             self._loading = False
-        if self.sld is not None:
-            self.sld.set_assembly(self.assembly)
+        self._schedule_sld_refresh()
         self._sync_engineering_columns()
 
     def _engineering_columns_visible(self) -> bool:
@@ -375,7 +462,7 @@ class AssemblyManagerPanel(QWidget):
         if kind == am.KIND_SECTION:
             item = AssemblyItem(kind=kind, name="Cable", length_m=1000.0)
         else:
-            item = AssemblyItem(kind=kind, name="Body", length_m=0.0, point_load_kN=0.0)
+            item = AssemblyItem(kind=kind, name="Equipment", length_m=0.0, point_load_kN=0.0)
         self.assembly.items.insert(insert_at, item)
         self._persist()
         self._refresh_views()
@@ -457,7 +544,11 @@ class AssemblyManagerPanel(QWidget):
                 "This assembly is issued. Delete it anyway?")
             if answer != QMessageBox.StandardButton.Yes:
                 return
-        self.store.delete_assembly(self.assembly.assembly_id)
+        try:
+            self.store.delete_assembly(self.assembly.assembly_id)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Delete assembly", str(exc))
+            return
         self.assembly = None
         self._current_header = None
         self.set_read_only(False)
@@ -647,7 +738,11 @@ class ExtractReviewDialog(QDialog):
     """Interactive extract-from-RPL: reclassify events, choose section
     grouping, and watch a live preview of the resulting assembly."""
 
-    CATEGORIES = ["body", "geographic", "installation"]
+    CATEGORIES = [
+        ("Equipment / cable body", "body"),
+        ("Geographic event", "geographic"),
+        ("Installation event", "installation"),
+    ]
 
     def __init__(self, model, review: List[Dict], default_name: str, parent=None):
         super().__init__(parent)
@@ -663,15 +758,17 @@ class ExtractReviewDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
-            "Set the Category of each event — only 'body' events become assembly "
-            "bodies, and every body splits the cable into sections. Unmatched "
-            "events (orange) were defaulted to 'installation'; correct them here."))
+            "Set the category of each event. Only equipment / cable-body events "
+            "become zero-length assembly items; each one splits the homogeneous "
+            "cable lengths into assembly sections. Unmatched events (orange) "
+            "default to Installation event; correct them here."))
 
         options = QHBoxLayout()
         options.addWidget(QLabel("Section grouping:"))
         self.grouping_combo = QComboBox()
-        self.grouping_combo.addItem("By cable type change (and bodies)", am.GROUP_BY_CABLE_TYPE)
-        self.grouping_combo.addItem("Between bodies only", am.GROUP_BETWEEN_BODIES)
+        self.grouping_combo.addItem(
+            "By cable type change (and equipment)", am.GROUP_BY_CABLE_TYPE)
+        self.grouping_combo.addItem("Between equipment only", am.GROUP_BETWEEN_BODIES)
         self.grouping_combo.currentIndexChanged.connect(self._rebuild)
         options.addWidget(self.grouping_combo)
         options.addStretch()
@@ -681,7 +778,7 @@ class ExtractReviewDialog(QDialog):
 
         splitter = QSplitter(Qt.Orientation.Vertical)
 
-        # live preview (falls back to summary-only if pyqtgraph unavailable)
+        # live node-and-line schematic preview
         try:
             from .sld_widget import SldWidget
 
@@ -708,8 +805,10 @@ class ExtractReviewDialog(QDialog):
             self.table.setItem(row, 3, matched_cell)
 
             combo = QComboBox()
-            combo.addItems(self.CATEGORIES)
-            combo.setCurrentText(entry.get("category") or "installation")
+            for category_label, category_id in self.CATEGORIES:
+                combo.addItem(category_label, category_id)
+            category_index = combo.findData(entry.get("category") or "installation")
+            combo.setCurrentIndex(max(category_index, 0))
             combo.currentIndexChanged.connect(self._rebuild)
             self.table.setCellWidget(row, 2, combo)
             self._category_combos.append(combo)
@@ -720,8 +819,8 @@ class ExtractReviewDialog(QDialog):
         layout.addWidget(splitter)
 
         actions = QHBoxLayout()
-        all_bodies_btn = QPushButton("Selected rows → body")
-        all_bodies_btn.setToolTip("Mark every selected row as a body")
+        all_bodies_btn = QPushButton("Selected rows → equipment")
+        all_bodies_btn.setToolTip("Mark every selected row as equipment / a cable body")
         all_bodies_btn.clicked.connect(lambda: self._set_selected_category("body"))
         none_bodies_btn = QPushButton("Selected rows → installation")
         none_bodies_btn.clicked.connect(lambda: self._set_selected_category("installation"))
@@ -745,13 +844,15 @@ class ExtractReviewDialog(QDialog):
         for row in rows:
             combo = self._category_combos[row]
             combo.blockSignals(True)
-            combo.setCurrentText(category)
+            index = combo.findData(category)
+            if index >= 0:
+                combo.setCurrentIndex(index)
             combo.blockSignals(False)
         self._rebuild()
 
     def _classifications(self) -> Dict[int, str]:
         return {
-            entry["seq"]: combo.currentText()
+            entry["seq"]: combo.currentData()
             for entry, combo in zip(self._review, self._category_combos)
         }
 
@@ -763,9 +864,9 @@ class ExtractReviewDialog(QDialog):
             grouping=self.grouping_combo.currentData(),
         )
         sections = sum(1 for i in self._assembly.items if i.is_section)
-        bodies = len(self._assembly.items) - sections
+        equipment = len(self._assembly.items) - sections
         self.summary_label.setText(
-            f"{sections} sections · {bodies} bodies · "
+            f"{sections} sections · {equipment} equipment items · "
             f"{self._assembly.total_length_m() / 1000.0:.3f} km cable")
         if self.preview is not None:
             self.preview.set_assembly(self._assembly)

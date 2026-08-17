@@ -4,10 +4,10 @@
 Three pages:
 
 1. Source & destination — pick a workbook/CSV, scan worksheets in the
-   background, choose/create the Workbench segment (route), revision label
+   background, choose/create the Workbench cable segment, revision label
    and RPL kind.
 2. Detection & mapping — the actual worksheet in a virtual table view with
-   highlighted header/point/segment rows, correctable layout, data range,
+   highlighted header/position/leg rows, correctable layout, data range,
     coordinate encoding, source CRS, units, and per-column mapping/exclusion,
     plus saved mapping profiles keyed by the header signature.
 3. Review & import — counts, stated vs computed lengths, grouped navigable
@@ -216,7 +216,7 @@ class _SourcePage(QWizardPage):
         self.route_combo.setEditable(True)
         self.route_combo.editTextChanged.connect(
             lambda _t: self._update_rev_default())
-        form.addRow("Segment / route", self.route_combo)
+        form.addRow("Cable segment", self.route_combo)
         self.kind_combo = QComboBox()
         self.kind_combo.addItem("Planned", "planned")
         self.kind_combo.addItem("As-laid", "as_laid")
@@ -332,7 +332,7 @@ class _SourcePage(QWizardPage):
                     store.revisions_of_route(route["route_id"]))
                 self.rev_edit.setPlaceholderText(f"blank = {next_label}")
             else:
-                self.rev_edit.setPlaceholderText("blank = Rev 1 (new segment)")
+                self.rev_edit.setPlaceholderText("blank = Rev 1 (new cable segment)")
         except Exception:
             self.rev_edit.setPlaceholderText("blank = next Rev N")
 
@@ -355,7 +355,7 @@ class _SourcePage(QWizardPage):
         if not self.route_combo.currentText().strip():
             base = os.path.splitext(
                 os.path.basename(self.file_edit.text().strip()))[0]
-            self.route_combo.setEditText(base or "Segment")
+            self.route_combo.setEditText(base or "Cable segment")
         sheet = self.sheet_list.currentItem().data(Qt.ItemDataRole.UserRole)
         result = next((r for r in self._results
                        if r.profile.sheet == sheet), None)
@@ -450,7 +450,7 @@ class _MappingPage(QWizardPage):
         structure = QGroupBox("Structure")
         form = QGridLayout(structure)
         self.layout_combo = QComboBox()
-        self.layout_combo.addItem("Alternating point / segment rows",
+        self.layout_combo.addItem("Alternating position / leg rows",
                                   im.LAYOUT_ALTERNATING)
         self.layout_combo.addItem("One position per row (flat)", im.LAYOUT_FLAT)
         form.addWidget(QLabel("Layout"), 0, 0)
@@ -818,7 +818,7 @@ class _MappingPage(QWizardPage):
         errors, warnings, _infos = im.split_diagnostics(diags)
         dupes = profile.duplicate_assignments()
         missing = profile.required_missing()
-        bits = [f"{len(doc.points)} positions, {len(doc.segments)} segments"]
+        bits = [f"{len(doc.points)} positions, {len(doc.segments)} point-to-point legs"]
         if missing:
             bits.append("missing required coordinate columns: "
                         + ", ".join(missing))
@@ -1023,7 +1023,7 @@ class _ReviewPage(QWizardPage):
         computed = wiz.computed_route_km()
         bits = [
             f"<b>{len(doc.points)}</b> positions / "
-            f"<b>{len(doc.segments)}</b> segments from sheet "
+            f"<b>{len(doc.segments)}</b> point-to-point legs from sheet "
             f"'{doc.sheet}', rows {wiz.profile.data_start_row}-"
             f"{wiz.profile.data_end_row}.",
         ]

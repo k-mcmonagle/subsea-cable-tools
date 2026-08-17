@@ -152,8 +152,8 @@ def test_commit_and_audit() -> bool:
         ok = ok and "SegNote" in line_names
         ok = ok and str(lines[1]["CableType"]) == "LW"
 
-    component = store.component_for_subject(result.rpl_id)
-    ok = ok and component is not None
+    component = store.component_for_segment(result.route_id)
+    ok = ok and component is not None and component.get("kind") == "route"
 
     audit = read_import_audit(store, result.rpl_id)
     ok = ok and audit.get("sheet") == "RPL"

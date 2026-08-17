@@ -365,18 +365,18 @@ def commit_import(store: WorkbenchStore, model: RplModel,
 
     1. spatial layers (unique staged names)
     2. wb_meta audit row
-    3. topology component + ports
+    3. stable cable-segment topology component + endpoint ports
     4. wb_rpl registry row  <- the revision "exists" only after this
 
     Any exception before step 4 completes triggers cleanup of steps 1-3.
     Never overwrites an issued revision (labels are checked up front).
     """
     if len(model.points) < 2 or len(model.segments) != len(model.points) - 1:
-        raise CommitError("Model is not consistent (points/segments mismatch).")
+        raise CommitError("Model is not consistent (positions/legs mismatch).")
 
     kind = request.kind if request.kind in ("planned", "as_laid") else "planned"
     slack_mode = request.slack_mode or default_slack_mode(kind)
-    route_name = (request.route_name or "").strip() or "Segment"
+    route_name = (request.route_name or "").strip() or "Cable segment"
 
     store.migrate()
 
@@ -392,7 +392,7 @@ def commit_import(store: WorkbenchStore, model: RplModel,
         if any((r.get("rev_label") or "").strip().lower() == needle
                for r in revisions):
             raise CommitError(
-                f"Segment '{route_name}' already has revision '{rev_label}'. "
+                f"Cable segment '{route_name}' already has revision '{rev_label}'. "
                 "Choose a new label or leave it blank for the next revision.")
         latest = store.latest_revision(route_id)
         supersedes_id = latest.get("rpl_id") if latest else ""
@@ -417,6 +417,7 @@ def commit_import(store: WorkbenchStore, model: RplModel,
 
     staged_layers: List[str] = []
     staged_meta_key: Optional[str] = None
+    existing_component = store.component_for_segment(route_id)
     staged_component: Optional[str] = None
     try:
         rows = model_rows_for_layers(model, rpl_id, request.source_file)
@@ -438,10 +439,9 @@ def commit_import(store: WorkbenchStore, model: RplModel,
         staged_meta_key = IMPORT_AUDIT_META_PREFIX + rpl_id
         store.write_meta(staged_meta_key, json.dumps(audit, sort_keys=True))
 
-        staged_component = store.save_component(
-            {"component_id": schema.new_id(), "kind": "rpl",
-             "subject_id": rpl_id, "name": registered_name},
-            port_labels=["A", "B"])
+        segment_component = store.ensure_segment_component(route_id)
+        if existing_component is None and not created_route:
+            staged_component = segment_component
 
         store.save_rpl({
             "rpl_id": rpl_id,

@@ -169,6 +169,31 @@ def test_derive_slack() -> bool:
     return _result("derive_slack from cable distances", ok)
 
 
+def test_event_to_event_sections() -> bool:
+    model = _model(6, slack_pct=2.0)
+    model.points[0].event = "BMH East"
+    model.points[2].event = "RPT-1"
+    model.points[4].event = "BU-1"
+    model.points[5].event = "Landing West"
+    for index, segment in enumerate(model.segments):
+        segment.attrs["CableType"] = "LW" if index < 2 else "DA"
+    eng.recompute(model, _da())
+    sections = eng.event_sections(model)
+    ok = len(sections) == 3
+    ok = ok and [(s.start_point_index, s.end_point_index) for s in sections] == [
+        (0, 2), (2, 4), (4, 5)]
+    ok = ok and sections[0].from_event == "BMH East"
+    ok = ok and sections[1].to_event == "BU-1"
+    ok = ok and sections[0].leg_count == 2 and sections[2].leg_count == 1
+    ok = ok and abs(sections[0].slack_pct - 2.0) < 1e-9
+    ok = ok and sections[0].attrs["CableType"] == "LW"
+    ok = ok and sections[1].attrs["CableType"] == "DA"
+    model.segments[2].attrs["ProtectionMethod"] = "Burial"
+    mixed = eng.event_sections(model)[1].attrs["ProtectionMethod"]
+    ok = ok and mixed == "Mixed: Burial | (blank)"
+    return _result("RPL sections are derived between event positions", ok)
+
+
 def run_all() -> list:
     return [
         test_recompute_hold_slack(),
@@ -179,6 +204,7 @@ def run_all() -> list:
         test_point_at_kp_and_bearing(),
         test_apply_depths_and_validate(),
         test_derive_slack(),
+        test_event_to_event_sections(),
     ]
 
 

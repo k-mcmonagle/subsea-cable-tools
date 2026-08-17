@@ -2,7 +2,7 @@
 """RPL Manager panel (hosted by the Cable Route Workbench dock).
 
 Users deal with RPLs as entities: browse registered RPLs, inspect live
-Positions/Segments tables, drag-edit positions on the map (with automatic
+Positions/RPL Sections/Legs tables, drag-edit positions on the map (with automatic
 recompute of distances, bearings, cable distance / slack and depth
 resampling), edit slack in-table, and undo/redo/save through the paired
 GeoPackage layers' edit buffers in lockstep.
@@ -13,6 +13,7 @@ Also hosts the Systems tab (CRA-style topology) and the Fit Assembly action.
 from __future__ import annotations
 
 import json
+import os
 from typing import Dict, List, Optional
 
 from qgis.PyQt.QtCore import Qt, QSettings, QTimer, pyqtSignal
@@ -55,28 +56,96 @@ from ..qgis_compat import (
     qt_exec,
 )
 from . import rpl_engine, schema
+from .configurable_table import ConfigurableTable
 from .depth_service import DepthService, DepthSourceConfig
 from .rpl_engine import RplModel, SlackMode
 from .rpl_layer_io import RplLayerSync
+from .rpl_summary import invalidate_rpl_summary, rpl_summary
 from .readonly import make_readonly_banner
 from .store import (
     WorkbenchReadOnlyError,
     WorkbenchStore,
     default_project_gpkg_path,
+    project_gpkg_path,
     set_project_gpkg_path,
 )
 
 WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
 
-POINT_COLUMNS = [
-    ("PosNo", "pos"), ("Event", "event"), ("Lat", "lat"), ("Lon", "lon"),
-    ("KP (km)", "kp"), ("Cable (km)", "cable"), ("Depth (m)", "depth"),
+# User-facing terminology: one managed route is a cable segment; within an
+# RPL, sections run between labelled event positions. Point-to-point engine
+# segments remain available as the advanced Legs table.
+POINT_TABLE_COLUMNS = [
+    ("PosNo", "pos", True), ("Event", "event", True),
+    ("KP (km)", "kp", True), ("Latitude", "lat", True),
+    ("Longitude", "lon", True), ("Cable (km)", "cable", False),
+    ("Depth (m)", "depth", True),
 ]
-SEGMENT_COLUMNS = [
-    ("From", "from"), ("To", "to"), ("Bearing (°)", "bearing"),
-    ("Dist (km)", "dist"), ("Slack (%)", "slack"), ("Cable (km)", "cable"),
-    ("Cable type", "cable_type"),
+SECTION_COLUMNS = [
+    ("From event", "from_event", True), ("To event", "to_event", True),
+    ("From Pos", "from", True), ("To Pos", "to", True),
+    ("Start KP", "start_kp", True), ("End KP", "end_kp", True),
+    ("Length (km)", "dist", True), ("Cable (km)", "cable", True),
+    ("Slack (%)", "slack", True), ("Legs", "leg_count", False),
 ]
+LEG_COLUMNS = [
+    ("From Pos", "from", True), ("From event", "from_event", True),
+    ("To Pos", "to", True), ("To event", "to_event", True),
+    ("Start KP", "start_kp", True), ("End KP", "end_kp", True),
+    ("Bearing (deg)", "bearing", True), ("Dist (km)", "dist", True),
+    ("Slack (%)", "slack", True), ("Cable (km)", "cable", True),
+]
+_POINT_ATTR_ORDER = ["Remarks", "ChartNo", "PosNoText", "SourceFile"]
+_LEG_ATTR_ORDER = [
+    "CableType", "CableCode", "FiberPair", "LayDirection", "LayVessel",
+    "ProtectionMethod", "DateInstalled", "TargetBurialDepth", "BurialDepth",
+    "TerritorialWater", "EEZ", "SourceFile",
+]
+_ATTR_LABELS = {
+    "CableType": "Cable type", "CableCode": "Cable code", "FiberPair": "Fibre pair",
+    "LayDirection": "Lay direction", "LayVessel": "Lay vessel",
+    "ProtectionMethod": "Protection method", "DateInstalled": "Date installed",
+    "TargetBurialDepth": "Target burial depth", "BurialDepth": "Burial depth",
+    "TerritorialWater": "Territorial water", "SourceFile": "Source file",
+    "ChartNo": "Chart no.", "PosNoText": "Position text",
+}
+
+
+def _attribute_keys(attr_rows, preferred) -> List[str]:
+    found = []
+    for attrs in attr_rows:
+        for key in attrs:
+            if key not in found:
+                found.append(key)
+    ordered = [key for key in preferred if key in found]
+    ordered.extend(sorted([key for key in found if key not in ordered],
+                          key=lambda value: value.lower()))
+    return ordered
+
+
+def _attribute_columns(keys, default_visible=None):
+    default_visible = set(default_visible or ())
+    return [(_ATTR_LABELS.get(key, key), f"attr:{key}", key in default_visible)
+            for key in keys]
+
+
+def _text(value) -> str:
+    return "" if value is None else str(value)
+
+
+def _number(value, decimals: int) -> str:
+    return "" if value is None else f"{float(value):.{decimals}f}"
+
+
+def _leg_column_presets(columns):
+    essentials = {key for _label, key, visible in columns if visible}
+    installation = {
+        "from_event", "to_event", "start_kp", "end_kp", "dist", "cable", "slack",
+        "attr:CableType", "attr:CableCode", "attr:LayDirection", "attr:LayVessel",
+        "attr:ProtectionMethod", "attr:DateInstalled", "attr:BurialDepth",
+        "attr:TargetBurialDepth",
+    }
+    return {"Essentials": essentials, "Installation": installation}
 
 
 class RplManagerPanel(QWidget):
@@ -111,6 +180,7 @@ class RplManagerPanel(QWidget):
         self._table_timer.timeout.connect(self._refresh_tables_from_preview)
         self._pending_preview: Optional[RplModel] = None
         self._loading_tables = False
+        self._table_dirty = {0, 1, 2}
         self._read_only = False
 
         self.da = make_distance_area(WGS84, QgsProject.instance().transformContext())
@@ -151,7 +221,7 @@ class RplManagerPanel(QWidget):
         register_btn = QPushButton("Add from layers...")
         register_btn.setToolTip(
             "Add an RPL point + line layer pair already loaded in the project "
-            "to the workbench as a segment revision"
+            "to the workbench as a cable-segment revision"
         )
         register_btn.clicked.connect(self._run_register_algorithm)
         refresh_btn = QPushButton("Refresh")
@@ -248,17 +318,24 @@ class RplManagerPanel(QWidget):
         right_layout.addLayout(row3)
 
         self.tabs = QTabWidget()
-        self.points_table = QTableWidget(0, len(POINT_COLUMNS))
-        self.points_table.setHorizontalHeaderLabels([c[0] for c in POINT_COLUMNS])
+        self.points_table = ConfigurableTable("rpl_positions")
         self.points_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.points_table.itemChanged.connect(self._on_point_item_changed)
-        self.segments_table = QTableWidget(0, len(SEGMENT_COLUMNS))
-        self.segments_table.setHorizontalHeaderLabels([c[0] for c in SEGMENT_COLUMNS])
+        self.sections_table = ConfigurableTable("rpl_sections")
+        self.sections_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.segments_table = ConfigurableTable("rpl_legs")
         self.segments_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.segments_table.itemChanged.connect(self._on_segment_item_changed)
         self.tabs.addTab(self.points_table, "Positions")
-        self.tabs.addTab(self.segments_table, "Segments")
-        self.tabs.addTab(self._build_systems_tab(), "Systems")
+        self.tabs.addTab(self.sections_table, "RPL sections")
+        self.tabs.addTab(self.segments_table, "Legs (advanced)")
+        self.tabs.addTab(self._build_systems_tab(), "Cable systems")
+        self.tabs.setTabToolTip(
+            0, "Every position in the RPL. Right-click the header to choose columns.")
+        self.tabs.setTabToolTip(
+            1, "Derived sections between consecutive event positions. Right-click the header to choose columns.")
+        self.tabs.setTabToolTip(
+            2, "Advanced point-to-point legs used for bearings, distances and slack. Right-click the header to choose columns.")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         right_layout.addWidget(self.tabs)
 
@@ -290,21 +367,32 @@ class RplManagerPanel(QWidget):
         # project is moved to another computer/profile. Use the same
         # project-side recovery as layer restoration before falling back to a
         # new default registry.
+        expected = project_gpkg_path() or default_project_gpkg_path()
+        if (self.store is not None
+                and os.path.normcase(os.path.abspath(self.store.gpkg_path))
+                == os.path.normcase(os.path.abspath(expected))
+                and self.store.exists()):
+            return
+
         from .project_layers import discover_gpkg_path
 
         path = discover_gpkg_path() or default_project_gpkg_path()
-        self.store = WorkbenchStore(path)
+        if (self.store is None
+                or os.path.normcase(os.path.abspath(self.store.gpkg_path))
+                != os.path.normcase(os.path.abspath(path))):
+            self.store = WorkbenchStore(path)
         if self.store.exists():
             set_project_gpkg_path(path)
 
-    def refresh_rpl_list(self):
-        self._open_store()
+    def refresh_rpl_list(self, rows=None):
+        if rows is None:
+            self._open_store()
         previous = self.current_rpl.get("rpl_id") if self.current_rpl else None
         self.rpl_list.blockSignals(True)
         self.rpl_list.clear()
         restore_row = -1
         if self.store and self.store.exists():
-            for row in self.store.list_rpls():
+            for row in (rows if rows is not None else self.store.list_rpls()):
                 item = QListWidgetItem(f"{row.get('name')}  ({row.get('kind')})")
                 item.setData(Qt.ItemDataRole.UserRole, row.get("rpl_id"))
                 self.rpl_list.addItem(item)
@@ -381,7 +469,8 @@ class RplManagerPanel(QWidget):
 
         findings = rpl_engine.validate(self.model)
         self._set_status(
-            f"{len(self.model.points)} positions, {self.model.total_route_km():.3f} km segment, "
+            f"{len(self.model.points)} positions, {len(rpl_engine.event_sections(self.model))} RPL sections, "
+            f"{self.model.total_route_km():.3f} km cable segment, "
             f"{self.model.total_cable_km():.3f} km cable"
             + (f" — {len(findings)} validation notes" if findings else "")
         )
@@ -397,59 +486,126 @@ class RplManagerPanel(QWidget):
         return ensure_layer(QgsProject.instance(), self.store.gpkg_path, layer_name)
 
     # ------------------------------------------------------------- tables --
-    def _refresh_tables(self, model: Optional[RplModel] = None):
+    def _refresh_tables(self, model: Optional[RplModel] = None, mark_dirty: bool = True):
+        """Populate only the visible data tab; defer the other large tables."""
         model = model or self.model
+        if mark_dirty:
+            self._table_dirty.update((0, 1, 2))
+        if model is None:
+            for table in (self.points_table, self.sections_table, self.segments_table):
+                table.setRowCount(0)
+            self._update_edit_buttons()
+            return
+        index = self.tabs.currentIndex()
+        if index not in (0, 1, 2):
+            self._update_edit_buttons()
+            return
         self._loading_tables = True
         try:
-            self.points_table.setRowCount(0)
-            self.segments_table.setRowCount(0)
-            if model is None:
-                return
-            self.points_table.setRowCount(len(model.points))
-            for i, point in enumerate(model.points):
-                values = [
-                    "" if point.pos_no is None else str(point.pos_no),
-                    point.event or "",
-                    f"{point.lat:.6f}",
-                    f"{point.lon:.6f}",
-                    "" if point.dist_cum_km is None else f"{point.dist_cum_km:.3f}",
-                    "" if point.cable_dist_cum_km is None else f"{point.cable_dist_cum_km:.3f}",
-                    "" if point.depth_m is None else f"{point.depth_m:.1f}",
-                ]
-                for col, text in enumerate(values):
-                    item = QTableWidgetItem(text)
-                    if self._read_only or col not in (1,):  # only Event editable in the points table
-                        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                    self.points_table.setItem(i, col, item)
-
-            self.segments_table.setRowCount(len(model.segments))
-            for i, seg in enumerate(model.segments):
-                from_pos = model.points[i].pos_no
-                to_pos = model.points[i + 1].pos_no
-                values = [
-                    "" if from_pos is None else str(from_pos),
-                    "" if to_pos is None else str(to_pos),
-                    "" if seg.bearing_deg is None else f"{seg.bearing_deg:.1f}",
-                    "" if seg.dist_km is None else f"{seg.dist_km:.4f}",
-                    "" if seg.slack_pct is None else f"{seg.slack_pct:.3f}",
-                    "" if seg.cable_dist_km is None else f"{seg.cable_dist_km:.4f}",
-                    str(seg.attrs.get("CableType") or ""),
-                ]
-                for col, text in enumerate(values):
-                    item = QTableWidgetItem(text)
-                    if self._read_only or col != 4:  # only Slack editable
-                        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                    self.segments_table.setItem(i, col, item)
+            if index == 0:
+                self._populate_points_table(model)
+            elif index == 1:
+                self._populate_sections_table(model)
+            else:
+                self._populate_legs_table(model)
+            self._table_dirty.discard(index)
         finally:
             self._loading_tables = False
         self._update_edit_buttons()
+
+    def _populate_points_table(self, model: RplModel):
+        point_attrs = _attribute_keys(
+            (point.attrs for point in model.points), _POINT_ATTR_ORDER)
+        columns = POINT_TABLE_COLUMNS + _attribute_columns(point_attrs, {"Remarks"})
+        essentials = {key for _label, key, visible in columns if visible}
+        self.points_table.configure_columns(columns, {"Essentials": essentials})
+        self.points_table.setUpdatesEnabled(False)
+        try:
+            self.points_table.setRowCount(len(model.points))
+            for row, point in enumerate(model.points):
+                values = {
+                    "pos": _text(point.pos_no), "event": point.event or "",
+                    "lat": f"{point.lat:.6f}", "lon": f"{point.lon:.6f}",
+                    "kp": _number(point.dist_cum_km, 3),
+                    "cable": _number(point.cable_dist_cum_km, 3),
+                    "depth": _number(point.depth_m, 1),
+                }
+                values.update({f"attr:{key}": _text(point.attrs.get(key)) for key in point_attrs})
+                self._set_table_row(self.points_table, row, values, editable_key="event")
+        finally:
+            self.points_table.setUpdatesEnabled(True)
+
+    def _populate_sections_table(self, model: RplModel):
+        leg_attrs = _attribute_keys(
+            (segment.attrs for segment in model.segments), _LEG_ATTR_ORDER)
+        columns = SECTION_COLUMNS + _attribute_columns(leg_attrs, {"CableType"})
+        self.sections_table.configure_columns(columns, _leg_column_presets(columns))
+        sections = rpl_engine.event_sections(model)
+        self.sections_table.setUpdatesEnabled(False)
+        try:
+            self.sections_table.setRowCount(len(sections))
+            for row, section in enumerate(sections):
+                values = {
+                    "from_event": section.from_event or "(cable segment start)",
+                    "to_event": section.to_event or "(cable segment end)",
+                    "from": _text(section.from_pos), "to": _text(section.to_pos),
+                    "start_kp": _number(section.start_kp_km, 3),
+                    "end_kp": _number(section.end_kp_km, 3),
+                    "dist": _number(section.dist_km, 4),
+                    "cable": _number(section.cable_dist_km, 4),
+                    "slack": _number(section.slack_pct, 3),
+                    "leg_count": str(section.leg_count),
+                }
+                values.update({f"attr:{key}": _text(section.attrs.get(key)) for key in leg_attrs})
+                self._set_table_row(
+                    self.sections_table, row, values,
+                    user_data=(section.start_point_index, section.end_point_index))
+        finally:
+            self.sections_table.setUpdatesEnabled(True)
+
+    def _populate_legs_table(self, model: RplModel):
+        leg_attrs = _attribute_keys(
+            (segment.attrs for segment in model.segments), _LEG_ATTR_ORDER)
+        columns = LEG_COLUMNS + _attribute_columns(leg_attrs, {"CableType"})
+        self.segments_table.configure_columns(columns, _leg_column_presets(columns))
+        self.segments_table.setUpdatesEnabled(False)
+        try:
+            self.segments_table.setRowCount(len(model.segments))
+            for row, seg in enumerate(model.segments):
+                p0, p1 = model.points[row], model.points[row + 1]
+                values = {
+                    "from": _text(p0.pos_no), "from_event": p0.event or "",
+                    "to": _text(p1.pos_no), "to_event": p1.event or "",
+                    "start_kp": _number(p0.dist_cum_km, 3),
+                    "end_kp": _number(p1.dist_cum_km, 3),
+                    "bearing": _number(seg.bearing_deg, 1),
+                    "dist": _number(seg.dist_km, 4),
+                    "slack": _number(seg.slack_pct, 3),
+                    "cable": _number(seg.cable_dist_km, 4),
+                }
+                values.update({f"attr:{key}": _text(seg.attrs.get(key)) for key in leg_attrs})
+                self._set_table_row(self.segments_table, row, values, editable_key="slack")
+        finally:
+            self.segments_table.setUpdatesEnabled(True)
+
+    def _set_table_row(self, table, row, values, editable_key="", user_data=None):
+        for column in range(table.columnCount()):
+            key = table.field_key(column)
+            item = QTableWidgetItem(values.get(key, ""))
+            if self._read_only or key != editable_key:
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            if user_data is not None:
+                item.setData(Qt.ItemDataRole.UserRole, user_data)
+            table.setItem(row, column, item)
 
     def _refresh_tables_from_preview(self):
         if self._pending_preview is not None:
             self._refresh_tables(self._pending_preview)
 
     def _on_segment_item_changed(self, item: QTableWidgetItem):
-        if self._loading_tables or self.model is None or item.column() != 4 or not self._can_edit_current():
+        if (self._loading_tables or self.model is None
+                or self.segments_table.field_key(item.column()) != "slack"
+                or not self._can_edit_current()):
             return
         try:
             slack = float(item.text())
@@ -463,11 +619,13 @@ class RplManagerPanel(QWidget):
         changed = rpl_engine.recompute(
             self.model, self.da, slack_mode=SlackMode.HOLD_SLACK, from_seg=seg_idx
         )
-        changed.label = f"Edit slack (segment {seg_idx})"
+        changed.label = f"Edit slack (leg {seg_idx})"
         self._apply(changed)
 
     def _on_point_item_changed(self, item: QTableWidgetItem):
-        if self._loading_tables or self.model is None or item.column() != 1 or not self._can_edit_current():
+        if (self._loading_tables or self.model is None
+                or self.points_table.field_key(item.column()) != "event"
+                or not self._can_edit_current()):
             return
         idx = item.row()
         if not (0 <= idx < len(self.model.points)):
@@ -541,6 +699,7 @@ class RplManagerPanel(QWidget):
         if self.sync is None or self.model is None or not self._can_edit_current():
             return
         self.sync.apply(self.model, changed, changed.label)
+        self._invalidate_current_summary()
         self._refresh_tables()
         if self.edit_tool is not None:
             self.edit_tool.refresh_geometry()
@@ -576,6 +735,7 @@ class RplManagerPanel(QWidget):
         if self.sync is None or self._read_only:
             return
         self.sync.undo()
+        self._invalidate_current_summary()
         self.model = self.sync.load_model()
         self._refresh_tables()
         if self.edit_tool is not None:
@@ -585,6 +745,7 @@ class RplManagerPanel(QWidget):
         if self.sync is None or self._read_only:
             return
         self.sync.redo()
+        self._invalidate_current_summary()
         self.model = self.sync.load_model()
         self._refresh_tables()
         if self.edit_tool is not None:
@@ -597,6 +758,7 @@ class RplManagerPanel(QWidget):
             self._set_status("Issued RPL revisions are read-only.")
             return
         if self.sync.commit():
+            self._invalidate_current_summary()
             self._set_status("Saved.")
             try:
                 from .layer_style import refresh_line_categories
@@ -622,11 +784,16 @@ class RplManagerPanel(QWidget):
         if self.sync is None or self._read_only:
             return
         self.sync.rollback()
+        self._invalidate_current_summary()
         self.model = self.sync.load_model()
         self._refresh_tables()
         if self.edit_tool is not None:
             self.edit_tool.refresh_geometry()
         self._set_status("Changes discarded.")
+
+    def _invalidate_current_summary(self):
+        if self.current_rpl:
+            invalidate_rpl_summary(self.current_rpl.get("rpl_id") or "")
 
     def _update_edit_buttons(self):
         has_sync = self.sync is not None
@@ -655,7 +822,7 @@ class RplManagerPanel(QWidget):
         if duplicate is not None:
             QMessageBox.warning(
                 self, "RPL revision",
-                f"This segment already has an RPL revision labelled '{label}'.")
+                f"This cable segment already has an RPL revision labelled '{label}'.")
             return
 
         old_label = self.current_rpl.get("rev_label") or ""
@@ -715,15 +882,20 @@ class RplManagerPanel(QWidget):
         self._refresh_tables()
         self.rpls_changed.emit()
 
-    def _run_import_wizard(self):
+    def _run_import_wizard(self, route_name: str = "", system_id: str = ""):
         """Open the guided Import RPL wizard (detection -> review -> commit)."""
         try:
             from .rpl_import_wizard import RplImportWizard
 
             self._open_store()
             wizard = RplImportWizard(self.store, self.iface, parent=self)
+            if route_name:
+                wizard.source_page.route_combo.setEditText(route_name)
 
             def _imported(rpl_id: str):
+                row = self.store.get_rpl(rpl_id) if self.store else None
+                if row and system_id:
+                    self.store.assign_route_to_system(row.get("route_id") or "", system_id)
                 self.refresh_rpl_list()
                 self.rpls_changed.emit()
                 self.select_rpl(rpl_id)
@@ -744,6 +916,11 @@ class RplManagerPanel(QWidget):
                 "subsea_cable_processing:register_rpl",
                 dict(initial_parameters or {}),
             )
+            # Processing constructs its own WorkbenchStore, so discard this
+            # panel's registry/summary snapshots before showing its result.
+            if self.store is not None:
+                self.store.clear_cache()
+            invalidate_rpl_summary()
             self.refresh_rpl_list()
             self.rpls_changed.emit()
         except Exception as exc:
@@ -788,9 +965,9 @@ class RplManagerPanel(QWidget):
         layout = QVBoxLayout(container)
         toolbar = QHBoxLayout()
         node_btn = QPushButton("New node…")
-        node_btn.setToolTip("Create a BMH / BU / joint node component")
+        node_btn.setToolTip("Add a BMH, branching unit, joint or other cable-system node")
         node_btn.clicked.connect(self._new_node)
-        connect_btn = QPushButton("Connect ports…")
+        connect_btn = QPushButton("Connect endpoints…")
         connect_btn.clicked.connect(self._connect_ports)
         disconnect_btn = QPushButton("Disconnect")
         disconnect_btn.clicked.connect(self._disconnect_selected)
@@ -804,7 +981,8 @@ class RplManagerPanel(QWidget):
         layout.addLayout(toolbar)
 
         self.systems_tree = QTreeWidget()
-        self.systems_tree.setHeaderLabels(["System / component / port", "Detail"])
+        self.systems_tree.setHeaderLabels(
+            ["Cable system / component / endpoint", "Connected to / detail"])
         self.systems_tree.setColumnWidth(0, 280)
         self.systems_tree.itemDoubleClicked.connect(self._on_system_item_activated)
         layout.addWidget(self.systems_tree)
@@ -813,8 +991,10 @@ class RplManagerPanel(QWidget):
         return container
 
     def _on_tab_changed(self, index: int):
-        if self.tabs.tabText(index) == "Systems":
+        if self.tabs.tabText(index) == "Cable systems":
             self._refresh_systems_tree()
+        elif index in self._table_dirty:
+            self._refresh_tables(self._pending_preview or self.model, mark_dirty=False)
 
     def _refresh_systems_tree(self):
         from qgis.PyQt.QtWidgets import QTreeWidgetItem
@@ -829,11 +1009,18 @@ class RplManagerPanel(QWidget):
         systems_by_id = {s.get("system_id"): s for s in self.store.list_systems()}
         components = {c["component_id"]: c for c in self.store.list_components()}
 
-        for members in graph.connected_systems():
-            system_id = components[members[0]].get("system_id") if members else ""
+        grouped = {}
+        for component_id, component in components.items():
+            grouped.setdefault(component.get("system_id") or "", []).append(component_id)
+
+        for system_id, members in sorted(
+                grouped.items(), key=lambda pair: (
+                    not bool(pair[0]),
+                    (systems_by_id.get(pair[0], {}).get("name") or "").lower())):
+            members = sorted(members)
             system_row = systems_by_id.get(system_id, {})
             top = QTreeWidgetItem([
-                system_row.get("name") or "System",
+                system_row.get("name") or "Unassigned components",
                 f"{len(members)} component(s)",
             ])
             top.setData(0, Qt.ItemDataRole.UserRole, ("system", system_id))
@@ -845,13 +1032,16 @@ class RplManagerPanel(QWidget):
                 child.setData(0, Qt.ItemDataRole.UserRole, ("component", cid))
                 for port in graph.ports_of(cid):
                     conn = graph.connection_of_port(port["port_id"])
+                    endpoint_text = self._port_display(component, port)
                     if conn is None:
                         port_text = "open"
                     else:
-                        peer_cid = graph.peer_component(port["port_id"])
+                        peer_port = graph.peer_port(port["port_id"])
+                        peer_cid = peer_port.get("component_id") if peer_port else None
                         peer = components.get(peer_cid, {})
-                        port_text = f"→ {peer.get('name') or peer_cid}"
-                    port_item = QTreeWidgetItem([f"port {port.get('label')}", port_text])
+                        peer_endpoint = self._port_display(peer, peer_port or {})
+                        port_text = f"→ {peer.get('name') or peer_cid} · {peer_endpoint}"
+                    port_item = QTreeWidgetItem([endpoint_text, port_text])
                     port_item.setData(0, Qt.ItemDataRole.UserRole,
                                       ("port", port["port_id"],
                                        conn.get("connection_id") if conn else None))
@@ -864,18 +1054,78 @@ class RplManagerPanel(QWidget):
 
         findings = graph.validate()
         open_count = len(graph.open_ports())
-        text = f"{self.systems_tree.topLevelItemCount()} system(s), {open_count} open port(s)."
+        assigned_count = sum(1 for system_id in grouped if system_id)
+        unassigned_count = len(grouped.get("", []))
+        text = f"{assigned_count} cable system(s), {open_count} open endpoint(s)"
+        if unassigned_count:
+            text += f", {unassigned_count} unassigned component(s)"
+        text += "."
         if findings:
             text += f"  ⚠ {len(findings)} topology issue(s): " + \
                     "; ".join(f["message"] for f in findings[:3])
         self.systems_status.setText(text)
 
-    def _new_node(self):
+    def select_topology_system(self, system_id: str) -> None:
+        """Refresh and select the requested cable-system group."""
+        self._refresh_systems_tree()
+        for index in range(self.systems_tree.topLevelItemCount()):
+            item = self.systems_tree.topLevelItem(index)
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if data and data[0] == "system" and (data[1] or "") == (system_id or ""):
+                self.systems_tree.setCurrentItem(item)
+                return
+
+    def _port_display(self, component: Dict, port: Dict) -> str:
+        """Human endpoint label; A/B remains a compact secondary convention."""
+        label = str(port.get("label") or "?")
+        if component.get("kind") not in ("route", "rpl"):
+            return label.replace("_", " ").title()
+        if component.get("kind") == "route":
+            rpl = self.store.latest_revision(component.get("subject_id") or "")
+        else:
+            rpl = self.store.get_rpl(component.get("subject_id") or "")
+        role = "Start" if label.strip().upper() == "A" else "End"
+        summary = rpl_summary(self.store, rpl)
+        is_start = label.strip().upper() == "A"
+        kp = summary.start_kp_km if is_start else summary.end_kp_km
+        pos = summary.start_pos if is_start else summary.end_pos
+        event = summary.start_event if is_start else summary.end_event
+        if not rpl:
+            return f"{role} ({label})"
+        bits = [f"{role} ({label})"]
+        if kp is not None:
+            bits.append(f"KP {kp:.3f}")
+        if pos not in (None, ""):
+            bits.append(f"Pos {pos}")
+        if event:
+            bits.append(f"“{event}”")
+        return " · ".join(bits)
+
+    def _rpl_endpoint(self, rpl: Optional[Dict], port_label: str):
+        if not rpl or self.store is None:
+            return None
+        points = self.store.open_layer(rpl.get("points_layer") or "")
+        lines = self.store.open_layer(rpl.get("lines_layer") or "")
+        if points is None or lines is None:
+            return None
+        model = RplLayerSync(points, lines, rpl.get("rpl_id") or "").load_model()
+        if not model.points:
+            return None
+        return model.points[0] if port_label.strip().upper() == "A" else model.points[-1]
+
+    def _new_node(self, _checked=False, *, system_id: str = ""):
         from qgis.PyQt.QtWidgets import QInputDialog
 
         if self.store is None:
             return
         self.store.ensure_created()
+        if not system_id:
+            item = self.systems_tree.currentItem()
+            while item is not None and item.parent() is not None:
+                item = item.parent()
+            data = item.data(0, Qt.ItemDataRole.UserRole) if item is not None else None
+            if data and data[0] == "system":
+                system_id = data[1] or ""
         name, ok = QInputDialog.getText(self, "New node", "Node name (e.g. BU-1, BMH East):")
         if not ok or not name.strip():
             return
@@ -883,16 +1133,17 @@ class RplManagerPanel(QWidget):
         node_type, ok = QInputDialog.getItem(self, "New node", "Node type:", node_types, 0, False)
         if not ok:
             return
-        port_labels = {"bu": ["trunk_in", "branch_1", "branch_2"],
-                       "joint": ["A", "B"],
-                       "bmh": ["A"],
-                       "other": ["A", "B"]}[node_type]
+        port_labels = {"bu": ["Trunk", "Branch 1", "Branch 2"],
+                       "joint": ["Side 1", "Side 2"],
+                       "bmh": ["Cable"],
+                       "other": ["Side 1", "Side 2"]}[node_type]
         self.store.save_component(
             {"component_id": schema.new_id(), "kind": "node", "name": name.strip(),
-             "node_type": node_type},
+             "node_type": node_type, "system_id": system_id or ""},
             port_labels=port_labels,
         )
         self._refresh_systems_tree()
+        self.rpls_changed.emit()
 
     def _connect_ports(self):
         from qgis.PyQt.QtWidgets import QInputDialog
@@ -904,29 +1155,45 @@ class RplManagerPanel(QWidget):
         components = {c["component_id"]: c for c in self.store.list_components()}
         open_ports = graph.open_ports()
         if len(open_ports) < 2:
-            QMessageBox.information(self, "Connect ports", "Fewer than two open ports available.")
+            QMessageBox.information(
+                self, "Connect endpoints", "Fewer than two open endpoints are available.")
             return
 
         def label(port):
             component = components.get(port.get("component_id"), {})
-            return f"{component.get('name') or '?'} · port {port.get('label')}"
+            return f"{component.get('name') or '?'} · {self._port_display(component, port)}"
 
-        labels = [label(p) for p in open_ports]
-        first, ok = QInputDialog.getItem(self, "Connect ports", "First port:", labels, 0, False)
+        raw_labels = [label(p) for p in open_ports]
+        labels = [
+            value if raw_labels.count(value) == 1
+            else f"{value} [{str(port.get('port_id') or '')[:8]}]"
+            for value, port in zip(raw_labels, open_ports)
+        ]
+        first, ok = QInputDialog.getItem(
+            self, "Connect endpoints", "First endpoint:", labels, 0, False)
         if not ok:
             return
         first_idx = labels.index(first)
-        remaining = [l for i, l in enumerate(labels) if i != first_idx]
-        second, ok = QInputDialog.getItem(self, "Connect ports", "Second port:", remaining, 0, False)
+        first_port = open_ports[first_idx]
+        remaining_ports = [p for i, p in enumerate(open_ports) if i != first_idx]
+        remaining_raw = [label(p) for p in remaining_ports]
+        remaining_labels = [
+            value if remaining_raw.count(value) == 1
+            else f"{value} [{str(port.get('port_id') or '')[:8]}]"
+            for value, port in zip(remaining_raw, remaining_ports)
+        ]
+        second, ok = QInputDialog.getItem(
+            self, "Connect endpoints", "Second endpoint:", remaining_labels, 0, False)
         if not ok:
             return
-        second_idx = labels.index(second)
+        second_port = remaining_ports[remaining_labels.index(second)]
         try:
-            self.store.connect_ports(open_ports[first_idx]["port_id"], open_ports[second_idx]["port_id"])
+            self.store.connect_ports(first_port["port_id"], second_port["port_id"])
         except ValueError as exc:
-            QMessageBox.warning(self, "Connect ports", str(exc))
+            QMessageBox.warning(self, "Connect endpoints", str(exc))
             return
         self._refresh_systems_tree()
+        self.rpls_changed.emit()
 
     def _disconnect_selected(self):
         item = self.systems_tree.currentItem()
@@ -934,10 +1201,11 @@ class RplManagerPanel(QWidget):
             return
         data = item.data(0, Qt.ItemDataRole.UserRole)
         if not data or data[0] != "port" or len(data) < 3 or not data[2]:
-            self._set_status("Select a connected port to disconnect.")
+            self._set_status("Select a connected endpoint to disconnect.")
             return
         self.store.disconnect(data[2])
         self._refresh_systems_tree()
+        self.rpls_changed.emit()
 
     def _rename_system(self):
         from qgis.PyQt.QtWidgets import QInputDialog
@@ -962,15 +1230,37 @@ class RplManagerPanel(QWidget):
 
     def _on_system_item_activated(self, item, _column):
         data = item.data(0, Qt.ItemDataRole.UserRole)
-        if not data or data[0] != "component" or self.store is None:
+        if not data or self.store is None:
+            return
+        if data[0] == "port":
+            port = next((p for p in self.store.list_ports()
+                         if p.get("port_id") == data[1]), None)
+            component = next(
+                (c for c in self.store.list_components()
+                 if port and c.get("component_id") == port.get("component_id")), None)
+            if component and component.get("kind") in ("route", "rpl"):
+                rpl = (self.store.latest_revision(component.get("subject_id") or "")
+                       if component.get("kind") == "route"
+                       else self.store.get_rpl(component.get("subject_id") or ""))
+                endpoint = self._rpl_endpoint(rpl, port.get("label") or "")
+                if endpoint is not None:
+                    self._flash_map_position(endpoint.lat, endpoint.lon)
+            return
+        if data[0] != "component":
             return
         component = next(
             (c for c in self.store.list_components() if c.get("component_id") == data[1]), None)
         if component is None:
             return
-        if component.get("kind") == "rpl" and component.get("subject_id"):
+        rpl_id = ""
+        if component.get("kind") == "route":
+            latest = self.store.latest_revision(component.get("subject_id") or "")
+            rpl_id = latest.get("rpl_id") if latest else ""
+        elif component.get("kind") == "rpl":
+            rpl_id = component.get("subject_id") or ""
+        if rpl_id:
             for i in range(self.rpl_list.count()):
-                if self.rpl_list.item(i).data(Qt.ItemDataRole.UserRole) == component["subject_id"]:
+                if self.rpl_list.item(i).data(Qt.ItemDataRole.UserRole) == rpl_id:
                     self.rpl_list.setCurrentRow(i)
                     self.tabs.setCurrentIndex(0)
                     return

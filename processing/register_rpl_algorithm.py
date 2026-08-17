@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
-"""RegisterRPLAlgorithm
+"""Add imported RPL layers to a Cable Route Workbench cable segment.
 
 Registers an imported RPL (a point layer + line layer pair, e.g. from
 "Import Excel RPL") into the Cable Route Workbench GeoPackage:
 
 - validates the pairing (n points = n lines + 1; FromPos/ToPos chain),
 - assigns a stable rpl_id and SeqNo ordering (PosNo is never renumbered),
-- derives per-segment Slack from CableDistBetweenPos / DistBetweenPos where
+- derives per-leg Slack from CableDistBetweenPos / DistBetweenPos where
   missing,
 - copies both layers into the workbench GeoPackage,
-- creates/fetches the stable segment, inserts a new RPL revision row, and adds
-  the RPL's topology component with ports A and B,
+- creates/fetches the stable cable segment, inserts a new RPL revision row,
+  and ensures that segment has topology endpoints A and B,
 - optionally loads the new layers into a "Cable Route Workbench" group.
 """
 
@@ -115,7 +115,7 @@ class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterFeatureSource(
             self.INPUT_LINES, self.tr("RPL line layer"), [QgsProcessing.TypeVectorLine]))
         self.addParameter(QgsProcessingParameterString(
-            self.ROUTE_NAME, self.tr("Segment name (blank = point layer name)"),
+            self.ROUTE_NAME, self.tr("Cable segment name (blank = point layer name)"),
             defaultValue="", optional=True))
         self.addParameter(QgsProcessingParameterString(
             self.REV_LABEL, self.tr("RPL revision label (blank = next Rev N)"),
@@ -219,7 +219,7 @@ class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
         n_points, n_lines = len(model.points), len(model.segments)
         if n_points != n_lines + 1:
             warnings.append(
-                f"Expected {n_points - 1} line segments for {n_points} points, found {n_lines}."
+                f"Expected {n_points - 1} point-to-point legs for {n_points} points, found {n_lines}."
             )
         pos_nos = [p.pos_no for p in model.points]
         chain: List[str] = []
@@ -228,9 +228,9 @@ class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
             to_pos = _int(_value(feature, "ToPos"))
             if i + 1 < len(pos_nos):
                 if from_pos is not None and pos_nos[i] is not None and from_pos != pos_nos[i]:
-                    chain.append(f"segment {i}: FromPos {from_pos} != PosNo {pos_nos[i]}")
+                    chain.append(f"leg {i}: FromPos {from_pos} != PosNo {pos_nos[i]}")
                 if to_pos is not None and pos_nos[i + 1] is not None and to_pos != pos_nos[i + 1]:
-                    chain.append(f"segment {i}: ToPos {to_pos} != PosNo {pos_nos[i + 1]}")
+                    chain.append(f"leg {i}: ToPos {to_pos} != PosNo {pos_nos[i + 1]}")
         if chain:
             warnings.append("FromPos/ToPos chain mismatches: " + "; ".join(chain[:5]))
         return warnings
@@ -248,7 +248,7 @@ class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
         route_name = (self.parameterAsString(parameters, self.ROUTE_NAME, context) or "").strip()
         explicit_route_name = bool(route_name)
         if not route_name:
-            route_name = legacy_name or source_name or "Segment"
+            route_name = legacy_name or source_name or "Cable segment"
         requested_rev_label = (
             self.parameterAsString(parameters, self.REV_LABEL, context) or ""
         ).strip()
@@ -275,7 +275,8 @@ class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
 
         derived = derive_slack(model)
         if derived:
-            feedback.pushInfo(self.tr(f"Derived slack for {derived} segments from cable distances."))
+            feedback.pushInfo(self.tr(
+                f"Derived slack for {derived} point-to-point legs from cable distances."))
 
         store = WorkbenchStore(gpkg_path, context.transformContext())
         store.migrate()
@@ -293,7 +294,7 @@ class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
             if _revision_label_exists(revisions, rev_label):
                 raise QgsProcessingException(
                     self.tr(
-                        f"Segment '{route_name}' already has RPL revision '{rev_label}'. "
+                        f"Cable segment '{route_name}' already has RPL revision '{rev_label}'. "
                         "Use a new revision label or leave it blank for the next revision."
                     )
                 )
@@ -343,10 +344,7 @@ class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
             "issued_utc": "",
             "notes": "",
         })
-        store.save_component(
-            {"component_id": schema.new_id(), "kind": "rpl", "subject_id": rpl_id, "name": registered_name},
-            port_labels=["A", "B"],
-        )
+        store.ensure_segment_component(route_id)
 
         self._gpkg_path = gpkg_path
         self._layer_names = [points_layer_name, lines_layer_name]
@@ -354,7 +352,7 @@ class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
 
         feedback.pushInfo(self.tr(
             f"Registered RPL revision '{registered_name}' ({len(model.points)} positions, "
-            f"{len(model.segments)} segments) into {os.path.basename(gpkg_path)}."))
+            f"{len(model.segments)} point-to-point legs) into {os.path.basename(gpkg_path)}."))
         return {"RPL_ID": rpl_id, "GPKG_PATH": gpkg_path,
                 "ROUTE_ID": route_id, "REV_LABEL": rev_label,
                 "POINTS_LAYER": points_layer_name, "LINES_LAYER": lines_layer_name}
@@ -415,15 +413,15 @@ class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
     def shortHelpString(self):
         return self.tr(
             """
-Adds an RPL point + line layer pair already loaded in the project (for example the output of Import Excel RPL) to the Cable Route Workbench, making it a managed segment revision. To import straight from a workbook/CSV instead, use the "Import RPL..." wizard in the Workbench or the "Import RPL to Workbench (auto-detect)" tool.
+Adds an RPL point + line layer pair already loaded in the project (for example the output of Import Excel RPL) to the Cable Route Workbench, making it a revision of one managed cable segment. To import straight from a workbook/CSV instead, use the "Import RPL..." wizard in the Workbench or the "Import RPL to Workbench (auto-detect)" tool.
 
-- Validates that the layers pair up (n points = n segments + 1, FromPos/ToPos chain).
-- Derives per-segment Slack (%) from CableDistBetweenPos / DistBetweenPos where missing.
-- Uses Segment name as the stable segment identity and creates one RPL revision under it.
+- Validates that the layers pair up (n points = n legs + 1, FromPos/ToPos chain).
+- Derives per-leg Slack (%) from CableDistBetweenPos / DistBetweenPos where missing.
+- Uses Cable segment name as the stable route identity and creates one RPL revision under it.
 - Uses the supplied RPL revision label, or the next available Rev N label when left blank.
-- Names the registered RPL revision as Segment + revision label, for example "S013 Rev 2".
+- Names the registered RPL revision as cable segment + revision label, for example "S013 Rev 2".
 - Copies both layers into the workbench GeoPackage (default: <project>_workbench.gpkg beside the project file) and records the RPL revision in the registry.
-- Creates the RPL's system-topology component with ports A and B so it can later be connected to other RPLs via joints or branching units.
+- Reuses the cable segment's system-topology endpoints A and B across every RPL revision, so the segment can be connected to joints or branching units without rewiring revisions.
 
 Use the RPL Manager dock to browse, edit, and fit assemblies onto registered RPLs.
 """

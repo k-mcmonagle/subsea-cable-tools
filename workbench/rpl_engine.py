@@ -70,6 +70,31 @@ class RplSegment:
 
 
 @dataclass
+class RplSection:
+    """Derived event-to-event portion of an RPL.
+
+    ``RplSegment`` remains the computational point-to-point leg. A user-facing
+    RPL section can contain several such legs and is bounded by positions with
+    event labels (the first and last positions are always boundaries).
+    """
+
+    seq: int
+    start_point_index: int
+    end_point_index: int
+    from_pos: Optional[int]
+    to_pos: Optional[int]
+    from_event: str
+    to_event: str
+    start_kp_km: Optional[float]
+    end_kp_km: Optional[float]
+    dist_km: Optional[float]
+    cable_dist_km: Optional[float]
+    slack_pct: Optional[float]
+    leg_count: int
+    attrs: Dict = field(default_factory=dict)
+
+
+@dataclass
 class RplModel:
     points: List[RplPoint] = field(default_factory=list)
     segments: List[RplSegment] = field(default_factory=list)
@@ -110,6 +135,78 @@ class RplModel:
         start = self.points[0].cable_dist_cum_km or 0.0
         end = self.points[-1].cable_dist_cum_km or 0.0
         return end - start
+
+
+def event_sections(model: RplModel) -> List[RplSection]:
+    """Return the RPL broken into sections between labelled event positions.
+
+    Route endpoints are implicit boundaries even when their Event cells are
+    blank. Attributes common to every point-to-point leg are retained;
+    differing values are reported explicitly rather than choosing one leg.
+    """
+    if len(model.points) < 2:
+        return []
+    boundaries = [0]
+    boundaries.extend(
+        i for i, point in enumerate(model.points[1:-1], 1)
+        if str(point.event or "").strip()
+    )
+    boundaries.append(len(model.points) - 1)
+
+    out: List[RplSection] = []
+    for seq, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
+        legs = model.segments[start:end]
+        p0, p1 = model.points[start], model.points[end]
+        dist = (sum(float(leg.dist_km) for leg in legs)
+                if legs and all(leg.dist_km is not None for leg in legs) else None)
+        cable = (sum(float(leg.cable_dist_km) for leg in legs)
+                 if legs and all(leg.cable_dist_km is not None for leg in legs) else None)
+        slack = None
+        if dist is not None and dist > 0 and cable is not None:
+            slack = (cable / dist - 1.0) * 100.0
+        out.append(RplSection(
+            seq=seq,
+            start_point_index=start,
+            end_point_index=end,
+            from_pos=p0.pos_no,
+            to_pos=p1.pos_no,
+            from_event=str(p0.event or ""),
+            to_event=str(p1.event or ""),
+            start_kp_km=p0.dist_cum_km,
+            end_kp_km=p1.dist_cum_km,
+            dist_km=dist,
+            cable_dist_km=cable,
+            slack_pct=slack,
+            leg_count=len(legs),
+            attrs=_aggregate_leg_attrs(legs),
+        ))
+    return out
+
+
+def _aggregate_leg_attrs(legs: Sequence[RplSegment]) -> Dict:
+    keys: List[str] = []
+    for leg in legs:
+        for key in leg.attrs:
+            if key not in keys:
+                keys.append(key)
+    aggregated = {}
+    for key in keys:
+        values: List[str] = []
+        for leg in legs:
+            value = leg.attrs.get(key)
+            text = "" if value is None else str(value)
+            if text not in values:
+                values.append(text)
+        if not values or values == [""]:
+            aggregated[key] = ""
+        elif len(values) == 1:
+            aggregated[key] = values[0]
+        else:
+            shown = " | ".join(value or "(blank)" for value in values[:3])
+            if len(values) > 3:
+                shown += f" | +{len(values) - 3} more"
+            aggregated[key] = f"Mixed: {shown}"
+    return aggregated
 
 
 @dataclass

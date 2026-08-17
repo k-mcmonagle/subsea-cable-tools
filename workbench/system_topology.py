@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """System topology — pure graph logic over the CRA-style core tables.
 
-A "system" is a connected component of the port graph: RPLs (linear, never
-branching), assemblies, and nodes (BMH / BU / joint) joined by connections.
+A "system" is a connected component of the port graph: cable segments
+(linear, never branching), assemblies, and nodes (BMH / BU / joint) joined by
+connections.
 Branching lives here — a BU node exposes trunk/branch ports that connect
 several RPLs — never inside an RPL itself.
 
@@ -54,6 +55,13 @@ class TopologyGraph:
         other = conn["port_b_id"] if conn.get("port_a_id") == port_id else conn.get("port_a_id")
         port = self.ports.get(other)
         return port.get("component_id") if port else None
+
+    def peer_port(self, port_id: str) -> Optional[Dict]:
+        conn = self._connection_by_port.get(port_id)
+        if conn is None:
+            return None
+        other = conn["port_b_id"] if conn.get("port_a_id") == port_id else conn.get("port_a_id")
+        return self.ports.get(other)
 
     def open_ports(self, component_id: Optional[str] = None) -> List[Dict]:
         """Ports not participating in any connection (optionally per component)."""
@@ -159,7 +167,7 @@ def assign_system_ids(store) -> Dict[str, str]:
             if candidate and candidate in existing_systems:
                 system_id = candidate
                 break
-        if system_id is None:
+        if system_id is None and len(members) > 1:
             system_id = schema.new_id()
             names = [graph.components[cid].get("name") or "" for cid in members]
             label = next((n for n in names if n), "System")
@@ -168,6 +176,11 @@ def assign_system_ids(store) -> Dict[str, str]:
                 "name": label if len(members) == 1 else f"{label} system",
                 "notes": "",
             })
+        if system_id is None:
+            # An isolated, explicitly unassigned component is not a cable
+            # system by itself. This preserves the useful Unassigned group in
+            # the Workbench until the user groups or connects it.
+            system_id = ""
         for cid in members:
             assignment[cid] = system_id
 
@@ -175,7 +188,27 @@ def assign_system_ids(store) -> Dict[str, str]:
         store.upsert_rows(schema.TABLE_SYSTEM, new_system_rows)
 
     components = store.list_components()
+    components_changed = False
     for component in components:
-        component["system_id"] = assignment.get(component.get("component_id"), "")
-    store.write_table(schema.TABLE_COMPONENT, components)
+        resolved = assignment.get(component.get("component_id"), "")
+        if (component.get("system_id") or "") != resolved:
+            component["system_id"] = resolved
+            components_changed = True
+    if components_changed:
+        store.write_table(schema.TABLE_COMPONENT, components)
+    route_systems = {
+        component.get("subject_id"): component.get("system_id") or ""
+        for component in components if component.get("kind") == "route"
+    }
+    routes = store.list_routes()
+    routes_changed = False
+    if routes:
+        for route in routes:
+            if route.get("route_id") in route_systems:
+                resolved = route_systems[route.get("route_id")]
+                if (route.get("system_id") or "") != resolved:
+                    route["system_id"] = resolved
+                    routes_changed = True
+        if routes_changed:
+            store.write_table(schema.TABLE_ROUTE, routes)
     return assignment

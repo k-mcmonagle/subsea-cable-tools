@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Smoke tests for workbench schema v3 route/revision lineage."""
+"""Smoke tests for workbench route/revision lineage and topology migration."""
 
 from __future__ import annotations
 
@@ -114,8 +114,15 @@ def test_migrate_v2_to_v3() -> bool:
     ok = ok and rpl.get("rev_label") == "Rev 1" and rpl.get("status") == schema.STATUS_DRAFT
     ok = ok and assembly and assembly.get("rev_label") == "Rev 1"
     ok = ok and len(store.list_fits(rpl_id=rpl_id)) == 1
+    makeup, makeup_items = store.current_makeup(rpl.get("route_id") or "")
+    ok = ok and makeup is not None
+    ok = ok and [item.get("kind") for item in makeup_items] == ["assembly"]
     ok = ok and os.path.exists(f"{stem}.migrate_v2.bak{ext}")
-    return _result("migrate v2 to v3 route/lineage defaults", ok, f"meta={meta}")
+    ok = ok and os.path.exists(f"{stem}.migrate_v3.bak{ext}")
+    ok = ok and os.path.exists(f"{stem}.migrate_v4.bak{ext}")
+    component = store.component_for_segment(rpl.get("route_id") or "")
+    ok = ok and component is not None and component.get("kind") == "route"
+    return _result("migrate v2 through cable-segment topology", ok, f"meta={meta}")
 
 
 def test_new_rpl_revision_deep_copy() -> bool:
@@ -130,7 +137,6 @@ def test_new_rpl_revision_deep_copy() -> bool:
         "slack_mode": "hold_slack", "depth_source_config": "",
         "route_id": route_id, "rev_label": "Rev 1",
     })
-    store.save_component({"kind": "rpl", "subject_id": rpl_id, "name": "S013 Rev 1"}, ["A", "B"])
     assembly_id = schema.new_id()
     store.save_assembly({"assembly_id": assembly_id, "name": "Trunk", "kind": "cable"}, [])
     store.save_fit({
@@ -139,6 +145,7 @@ def test_new_rpl_revision_deep_copy() -> bool:
         "params_json": "{}",
     })
 
+    component_before = store.component_for_segment(route_id)
     new_id = store.new_rpl_revision(rpl_id)
     old = store.get_rpl(rpl_id) or {}
     new = store.get_rpl(new_id) or {}
@@ -156,7 +163,58 @@ def test_new_rpl_revision_deep_copy() -> bool:
     ok = ok and [r.get("rpl_id") for r in chain] == [new_id, rpl_id]
     ok = ok and (store.latest_revision(route_id) or {}).get("rpl_id") == new_id
     ok = ok and [r.get("rpl_id") for r in revisions] == [rpl_id, new_id]
+    component_after = store.component_for_segment(route_id)
+    ok = ok and component_before and component_after
+    ok = ok and component_before.get("component_id") == component_after.get("component_id")
     return _result("new RPL revision deep copy + lineage", ok)
+
+
+def test_v3_topology_connections_move_to_stable_segment() -> bool:
+    store = _temp_store()
+    store.ensure_created()
+    route_id = "route-v3"
+    store.upsert_rows(schema.TABLE_ROUTE, [{
+        "route_id": route_id, "name": "Legacy segment", "system_id": "",
+    }])
+    for rpl_id, label in (("rpl-v3-a", "Rev 1"), ("rpl-v3-b", "Rev 2")):
+        store.upsert_rows(schema.TABLE_RPL, [{
+            "rpl_id": rpl_id, "route_id": route_id,
+            "name": f"Legacy segment {label}", "rev_label": label,
+            "status": schema.STATUS_DRAFT,
+        }])
+    comp_a = store.save_component({
+        "component_id": "comp-v3-a", "kind": "rpl", "subject_id": "rpl-v3-a",
+        "name": "Legacy segment Rev 1",
+    }, ["A", "B"])
+    comp_b = store.save_component({
+        "component_id": "comp-v3-b", "kind": "rpl", "subject_id": "rpl-v3-b",
+        "name": "Legacy segment Rev 2",
+    }, ["A", "B"])
+    node_a = store.save_component({"kind": "node", "name": "BMH", "node_type": "bmh"}, ["Cable"])
+    node_b = store.save_component({"kind": "node", "name": "BU", "node_type": "bu"}, ["Trunk"])
+
+    def port(component_id, label):
+        return next(p["port_id"] for p in store.list_ports()
+                    if p.get("component_id") == component_id and p.get("label") == label)
+
+    store.connect_ports(port(comp_a, "A"), port(node_a, "Cable"))
+    store.connect_ports(port(comp_b, "B"), port(node_b, "Trunk"))
+    store.write_meta("schema_version", "3")
+    store.migrate()
+
+    component = store.component_for_segment(route_id) or {}
+    component_ports = {p.get("port_id") for p in store.list_ports()
+                       if p.get("component_id") == component.get("component_id")}
+    connected_component_ports = {
+        pid for connection in store.list_connections()
+        for pid in (connection.get("port_a_id"), connection.get("port_b_id"))
+        if pid in component_ports
+    }
+    ok = component.get("kind") == "route" and component.get("subject_id") == route_id
+    ok = ok and len(connected_component_ports) == 2
+    ok = ok and not any(c.get("kind") in ("rpl", "legacy_rpl")
+                        for c in store.list_components())
+    return _result("v3 A/B wiring migrates to stable cable-segment endpoints", ok)
 
 
 def test_issue_read_only() -> bool:
@@ -227,6 +285,7 @@ def run_all() -> list:
     return [
         test_migrate_v2_to_v3(),
         test_new_rpl_revision_deep_copy(),
+        test_v3_topology_connections_move_to_stable_segment(),
         test_issue_read_only(),
         test_next_rev_label(),
         test_edit_draft_rpl_revision(),

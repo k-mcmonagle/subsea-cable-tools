@@ -189,7 +189,14 @@ def test_workbench_dock_shows_and_switches_registry() -> bool:
 
     project = QgsProject.instance()
     project.clear()
-    first, _rpl = _store_with_rpl()
+    first, first_rpl = _store_with_rpl()
+    assembly_id = schema.new_id()
+    first.save_assembly({
+        "assembly_id": assembly_id, "name": "Load 01", "kind": "cable",
+        "total_cable_len_m": 12000.0,
+    }, [{"kind": "section", "name": "LW", "length_m": 12000.0,
+         "cable_type": "LW"}])
+    first.add_makeup_assembly(first_rpl.get("route_id") or "", assembly_id)
     second_folder = tempfile.mkdtemp(prefix="wb_switch_test_")
     second = WorkbenchStore(os.path.join(second_folder, "second_registry.gpkg"))
     second.ensure_created()
@@ -198,8 +205,26 @@ def test_workbench_dock_shows_and_switches_registry() -> bool:
     dock = WorkbenchDock(None)
     ok = os.path.basename(first.gpkg_path) in dock.store_label.text()
     ok = ok and "1 RPL" in dock.store_label.text()
+    ok = ok and dock.rpl_panel.store is dock.assembly_panel.store
+    ok = ok and dock.rpl_panel.store is dock.assessment_panel.store
+    ok = ok and dock.assembly_panel.sld is not None
+    ok = ok and [dock.assembly_panel.views.tabText(i)
+                 for i in range(dock.assembly_panel.views.count())] == ["Table", "Schematic"]
+    tree_text = []
+
+    def collect(item):
+        tree_text.append(item.text(0))
+        for child_index in range(item.childCount()):
+            collect(item.child(child_index))
+
+    for top_index in range(dock.tree.topLevelItemCount()):
+        collect(dock.tree.topLevelItem(top_index))
+    ok = ok and "Assembly Library" not in tree_text
+    ok = ok and "Cable make-up" in tree_text and "Load 01" in tree_text
     ok = ok and dock._activate_workbench(second.gpkg_path)
     ok = ok and project_gpkg_path(project) == os.path.abspath(second.gpkg_path)
+    ok = ok and dock.rpl_panel.store is dock.assembly_panel.store
+    ok = ok and dock.rpl_panel.store is dock.assessment_panel.store
     ok = ok and os.path.basename(second.gpkg_path) in dock.store_label.text()
     ok = ok and "0 RPLs" in dock.store_label.text()
     dock.shutdown()

@@ -143,12 +143,64 @@ def test_topology_invariants() -> bool:
     return _result("CRA topology invariants + cascade delete", ok)
 
 
+def test_registry_read_cache_tracks_mutations() -> bool:
+    store = _temp_store()
+    route_id = store.create_route("Cached route")
+    first = store.list_routes()
+    first[0]["name"] = "caller mutation"
+    second = store.list_routes()
+    ok = second[0].get("name") == "Cached route"
+    route = store.get_route(route_id) or {}
+    route["name"] = "Updated route"
+    store.save_route(route)
+    ok = ok and (store.get_route(route_id) or {}).get("name") == "Updated route"
+    ok = ok and schema.TABLE_ROUTE in store._table_cache
+    store.clear_cache()
+    ok = ok and not store._table_cache
+    ok = ok and (store.get_route(route_id) or {}).get("name") == "Updated route"
+    return _result("registry read cache is isolated, current, and reloadable", ok)
+
+
+def test_segment_makeup_orders_assemblies_and_joints() -> bool:
+    store = _temp_store()
+    route_id = store.create_route("Two-load segment")
+    assembly_ids = []
+    for name, length in (("Load 01", 42000.0), ("Load 02", 38000.0)):
+        assembly_id = schema.new_id()
+        store.save_assembly({
+            "assembly_id": assembly_id, "name": name, "kind": "cable",
+            "total_cable_len_m": length,
+        }, [{"kind": "section", "name": "LW", "length_m": length,
+             "cable_type": "LW"}])
+        assembly_ids.append(assembly_id)
+        store.add_makeup_assembly(route_id, assembly_id)
+
+    header, items = store.current_makeup(route_id)
+    ok = header is not None and header.get("route_id") == route_id
+    ok = ok and [item.get("kind") for item in items] == [
+        "assembly", "joint", "assembly"]
+    ok = ok and items[1].get("name") == "Joint J01"
+    ok = ok and [item.get("assembly_id") for item in items if item.get("kind") == "assembly"] \
+        == assembly_ids
+    try:
+        store.delete_assembly(assembly_ids[0])
+        ok = False
+    except ValueError:
+        pass
+    store.delete_makeup_item(items[0].get("makeup_item_id") or "")
+    _header, remaining = store.current_makeup(route_id)
+    ok = ok and [item.get("kind") for item in remaining] == ["assembly"]
+    return _result("segment make-up orders assemblies and joints", ok)
+
+
 def run_all() -> list:
     return [
         test_create_and_meta(),
         test_assembly_round_trip(),
         test_rpl_and_fit_round_trip(),
         test_topology_invariants(),
+        test_registry_read_cache_tracks_mutations(),
+        test_segment_makeup_orders_assemblies_and_joints(),
     ]
 
 

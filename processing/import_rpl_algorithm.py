@@ -76,7 +76,7 @@ class ImportRPLAlgorithm(QgsProcessingAlgorithm):
             optional=True, fileFilter="JSON (*.json);;All files (*)"))
         self.addParameter(QgsProcessingParameterString(
             self.ROUTE_NAME,
-            self.tr("Segment name (blank = file name)"),
+            self.tr("Cable segment name (blank = file name)"),
             defaultValue="", optional=True))
         self.addParameter(QgsProcessingParameterString(
             self.REV_LABEL, self.tr("Revision label (blank = next Rev N)"),
@@ -233,7 +233,7 @@ class ImportRPLAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(self.tr(
             f"Registered '{result.registered_name}' "
             f"({len(model.points)} positions, {len(model.segments)} "
-            f"segments) into {os.path.basename(result.gpkg_path)}."))
+            f"point-to-point legs) into {os.path.basename(result.gpkg_path)}."))
 
         self._gpkg_path = result.gpkg_path
         self._layer_names = [result.points_layer, result.lines_layer]

@@ -70,6 +70,16 @@ class WorkbenchStore:
     def __init__(self, gpkg_path: str, transform_context: Optional[QgsCoordinateTransformContext] = None):
         self.gpkg_path = gpkg_path
         self.transform_context = transform_context or QgsProject.instance().transformContext()
+        # Registry tables are small but opening an OGR layer for every lookup
+        # is not. One Workbench screen used to reopen wb_rpl dozens of times.
+        # Keep a per-store read-through cache; every mutator below refreshes it.
+        self._table_cache: Dict[str, List[Dict]] = {}
+        self._table_exists_cache: Dict[str, bool] = {}
+
+    def clear_cache(self) -> None:
+        """Forget registry reads, e.g. after an external Processing run."""
+        self._table_cache.clear()
+        self._table_exists_cache.clear()
 
     # -- lifecycle ----------------------------------------------------------
     def exists(self) -> bool:
@@ -119,11 +129,17 @@ class WorkbenchStore:
 
     # -- generic table access ------------------------------------------------
     def _table_exists(self, table: str) -> bool:
+        if table in self._table_exists_cache:
+            return self._table_exists_cache[table]
         if not os.path.exists(self.gpkg_path):
             return False
-        return open_gpkg_layer(self.gpkg_path, table) is not None
+        exists = open_gpkg_layer(self.gpkg_path, table) is not None
+        self._table_exists_cache[table] = exists
+        return exists
 
     def read_table(self, table: str) -> List[Dict]:
+        if table in self._table_cache:
+            return [dict(row) for row in self._table_cache[table]]
         layer = open_gpkg_layer(self.gpkg_path, table)
         if layer is None:
             return []
@@ -131,7 +147,9 @@ class WorkbenchStore:
         rows: List[Dict] = []
         for feature in layer.getFeatures():
             rows.append(_normalise_row({name: feature[name] for name in names}))
-        return rows
+        self._table_cache[table] = [dict(row) for row in rows]
+        self._table_exists_cache[table] = True
+        return [dict(row) for row in rows]
 
     def write_table(self, table: str, rows: Sequence[Dict]) -> None:
         specs = schema.REGISTRY_TABLES[table]
@@ -147,6 +165,8 @@ class WorkbenchStore:
             rows,
             self.transform_context,
         )
+        self._table_cache[table] = [dict(row) for row in rows]
+        self._table_exists_cache[table] = True
 
     def upsert_rows(self, table: str, rows: Sequence[Dict]) -> None:
         """Insert or replace rows by the table's primary key."""
@@ -195,6 +215,11 @@ class WorkbenchStore:
             "modified_utc": now,
             "notes": notes or "",
         }])
+        self.save_component({
+            "component_id": schema.new_id(), "kind": "route",
+            "subject_id": route_id, "name": name,
+            "system_id": system_id or "",
+        }, port_labels=["A", "B"])
         return route_id
 
     def save_route(self, row: Dict) -> None:
@@ -203,10 +228,18 @@ class WorkbenchStore:
         row.setdefault("created_utc", schema.utc_now_iso())
         row["modified_utc"] = schema.utc_now_iso()
         self.upsert_rows(schema.TABLE_ROUTE, [row])
+        component = self.component_for_segment(row["route_id"])
+        if component is not None:
+            component["name"] = row.get("name") or component.get("name") or "Cable segment"
+            component["system_id"] = row.get("system_id") or ""
+            self.save_component(component)
 
     def delete_route(self, route_id: str) -> None:
         if self.revisions_of_route(route_id):
             raise ValueError("Cannot delete a route while it still has RPL revisions.")
+        for makeup in self.list_makeups(route_id):
+            self.delete_makeup(makeup.get("makeup_id") or "")
+        self._delete_components_for_subject(route_id)
         self.delete_rows(schema.TABLE_ROUTE, [route_id])
 
     def assign_route_to_system(self, route_id: str, system_id: str = "") -> None:
@@ -284,6 +317,13 @@ class WorkbenchStore:
         self.write_table(schema.TABLE_ASSEMBLY_ITEM, others + normalised)
 
     def delete_assembly(self, assembly_id: str) -> None:
+        placements = [
+            row for row in self.read_table(schema.TABLE_MAKEUP_ITEM)
+            if row.get("kind") == "assembly" and row.get("assembly_id") == assembly_id
+        ]
+        if placements:
+            raise ValueError(
+                "Cannot delete an assembly while it is used in a cable-segment make-up.")
         self.delete_rows(schema.TABLE_ASSEMBLY, [assembly_id])
         remaining = [
             r for r in self.read_table(schema.TABLE_ASSEMBLY_ITEM) if r.get("assembly_id") != assembly_id
@@ -398,17 +438,7 @@ class WorkbenchStore:
         if fit_rows:
             self.upsert_rows(schema.TABLE_FIT, fit_rows)
 
-        old_component = self.component_for_subject(rpl_id) or {}
-        self.save_component(
-            {
-                "component_id": schema.new_id(),
-                "kind": "rpl",
-                "subject_id": new_id,
-                "name": new_name,
-                "system_id": old_component.get("system_id") or "",
-            },
-            port_labels=["A", "B"],
-        )
+        self.ensure_segment_component(route_id)
         return new_id
 
     def new_assembly_revision(self, assembly_id: str, rev_label: Optional[str] = None) -> str:
@@ -508,6 +538,140 @@ class WorkbenchStore:
 
     def delete_fit(self, fit_id: str) -> None:
         self.delete_rows(schema.TABLE_FIT, [fit_id])
+
+    # -- cable-segment make-up -----------------------------------------------
+    def list_makeups(self, route_id: Optional[str] = None) -> List[Dict]:
+        rows = self.read_table(schema.TABLE_MAKEUP)
+        if route_id is not None:
+            rows = [row for row in rows if row.get("route_id") == route_id]
+        return sorted(rows, key=lambda row: (
+            row.get("created_utc") or "", row.get("name") or ""))
+
+    def get_makeup(self, makeup_id: str) -> Tuple[Optional[Dict], List[Dict]]:
+        header = next((
+            row for row in self.read_table(schema.TABLE_MAKEUP)
+            if row.get("makeup_id") == makeup_id
+        ), None)
+        items = [
+            row for row in self.read_table(schema.TABLE_MAKEUP_ITEM)
+            if row.get("makeup_id") == makeup_id
+        ]
+        items.sort(key=lambda row: int(row.get("seq") or 0))
+        return header, items
+
+    def current_makeup(self, route_id: str) -> Tuple[Optional[Dict], List[Dict]]:
+        rows = self.list_makeups(route_id)
+        if not rows:
+            return None, []
+        current = rows[-1]
+        return self.get_makeup(current.get("makeup_id") or "")
+
+    def save_makeup(self, header: Dict, items: Sequence[Dict]) -> str:
+        header = dict(header)
+        makeup_id = header.setdefault("makeup_id", schema.new_id())
+        existing, _existing_items = self.get_makeup(makeup_id)
+        if _is_issued(existing):
+            raise WorkbenchReadOnlyError(
+                "Issued cable make-ups are read-only. Create a new revision to edit.")
+        merged = dict(existing or {})
+        merged.update(header)
+        merged.setdefault("name", "Cable make-up")
+        merged.setdefault("rev_label", schema.next_rev_label([]))
+        merged.setdefault("status", schema.STATUS_DRAFT)
+        merged.setdefault("supersedes_id", "")
+        merged.setdefault("created_utc", schema.utc_now_iso())
+        merged.setdefault("notes", "")
+        merged["modified_utc"] = schema.utc_now_iso()
+        self.upsert_rows(schema.TABLE_MAKEUP, [merged])
+
+        others = [
+            row for row in self.read_table(schema.TABLE_MAKEUP_ITEM)
+            if row.get("makeup_id") != makeup_id
+        ]
+        normalised = []
+        for seq, source in enumerate(items):
+            row = dict(source)
+            row.setdefault("makeup_item_id", schema.new_id())
+            row["makeup_id"] = makeup_id
+            row["seq"] = seq
+            row.setdefault("kind", "assembly")
+            row.setdefault("assembly_id", "")
+            row.setdefault("name", "")
+            row.setdefault("direction", 1)
+            row.setdefault("use_start_m", None)
+            row.setdefault("use_end_m", None)
+            row.setdefault("params_json", "{}")
+            row.setdefault("notes", "")
+            normalised.append(row)
+        self.write_table(schema.TABLE_MAKEUP_ITEM, others + normalised)
+        return makeup_id
+
+    def ensure_makeup(self, route_id: str) -> Tuple[Dict, List[Dict]]:
+        header, items = self.current_makeup(route_id)
+        if header is not None:
+            return header, items
+        route = self.get_route(route_id) or {}
+        header = {
+            "makeup_id": schema.new_id(), "route_id": route_id,
+            "name": f"{route.get('name') or 'Cable segment'} make-up",
+            "rev_label": "Rev 1", "status": schema.STATUS_DRAFT,
+            "supersedes_id": "", "notes": "",
+        }
+        self.save_makeup(header, [])
+        return self.get_makeup(header["makeup_id"])
+
+    def add_makeup_assembly(self, route_id: str, assembly_id: str,
+                            direction: int = 1) -> str:
+        assembly, _rows = self.get_assembly(assembly_id)
+        if assembly is None:
+            raise ValueError("Assembly not found.")
+        header, items = self.ensure_makeup(route_id)
+        placements = [item for item in items if item.get("kind") == "assembly"]
+        if placements:
+            items.append({
+                "makeup_item_id": schema.new_id(), "kind": "joint",
+                "name": f"Joint J{len(placements):02d}", "direction": 1,
+                "params_json": "{}", "notes": "",
+            })
+        item_id = schema.new_id()
+        items.append({
+            "makeup_item_id": item_id, "kind": "assembly",
+            "assembly_id": assembly_id,
+            "name": assembly.get("name") or "Assembly",
+            "direction": 1 if int(direction or 1) >= 0 else -1,
+            "use_start_m": None, "use_end_m": None,
+            "params_json": "{}", "notes": "",
+        })
+        self.save_makeup(header, items)
+        return item_id
+
+    def delete_makeup_item(self, makeup_item_id: str) -> None:
+        source = next((
+            row for row in self.read_table(schema.TABLE_MAKEUP_ITEM)
+            if row.get("makeup_item_id") == makeup_item_id
+        ), None)
+        if source is None:
+            return
+        header, items = self.get_makeup(source.get("makeup_id") or "")
+        if header is None:
+            return
+        index = next(i for i, row in enumerate(items)
+                     if row.get("makeup_item_id") == makeup_item_id)
+        drop = {index}
+        if source.get("kind") == "assembly":
+            if index + 1 < len(items) and items[index + 1].get("kind") == "joint":
+                drop.add(index + 1)
+            elif index > 0 and items[index - 1].get("kind") == "joint":
+                drop.add(index - 1)
+        self.save_makeup(header, [row for i, row in enumerate(items) if i not in drop])
+
+    def delete_makeup(self, makeup_id: str) -> None:
+        self.delete_rows(schema.TABLE_MAKEUP, [makeup_id])
+        remaining = [
+            row for row in self.read_table(schema.TABLE_MAKEUP_ITEM)
+            if row.get("makeup_id") != makeup_id
+        ]
+        self.write_table(schema.TABLE_MAKEUP_ITEM, remaining)
 
     # -- event rules ------------------------------------------------------------
     def list_event_rules(self) -> List[Dict]:
@@ -726,6 +890,58 @@ class WorkbenchStore:
             None,
         )
 
+    def component_for_segment(self, route_id: str) -> Optional[Dict]:
+        """Topology component for a stable cable-segment identity.
+
+        The fallback recognises pre-v4 components that referenced an RPL
+        revision, allowing the semantic migration and damaged stores to repair
+        themselves without discarding connected ports.
+        """
+        direct = next(
+            (c for c in self.list_components()
+             if c.get("kind") == "route" and c.get("subject_id") == route_id),
+            None,
+        )
+        if direct is not None:
+            return direct
+        revision_ids = {r.get("rpl_id") for r in self.revisions_of_route(route_id)}
+        candidates = [
+            c for c in self.list_components()
+            if c.get("kind") == "rpl" and c.get("subject_id") in revision_ids
+        ]
+        if not candidates:
+            return None
+        used_ports = {
+            pid for connection in self.list_connections()
+            for pid in (connection.get("port_a_id"), connection.get("port_b_id"))
+        }
+        ports = self.list_ports()
+        candidates.sort(
+            key=lambda c: sum(1 for p in ports
+                              if p.get("component_id") == c.get("component_id")
+                              and p.get("port_id") in used_ports),
+            reverse=True,
+        )
+        return candidates[0]
+
+    def ensure_segment_component(self, route_id: str) -> str:
+        route = self.get_route(route_id)
+        if route is None:
+            raise ValueError("Cable segment not found.")
+        component = self.component_for_segment(route_id)
+        if component is None:
+            return self.save_component({
+                "component_id": schema.new_id(), "kind": "route",
+                "subject_id": route_id, "name": route.get("name") or "Cable segment",
+                "system_id": route.get("system_id") or "",
+            }, port_labels=["A", "B"])
+        component["kind"] = "route"
+        component["subject_id"] = route_id
+        component["name"] = route.get("name") or component.get("name") or "Cable segment"
+        component["system_id"] = route.get("system_id") or component.get("system_id") or ""
+        self.save_component(component, port_labels=["A", "B"])
+        return component["component_id"]
+
     def delete_component(self, component_id: str) -> None:
         port_ids = [p["port_id"] for p in self.list_ports() if p.get("component_id") == component_id]
         if port_ids:
@@ -895,10 +1111,138 @@ def _migrate_2_to_3(store: "WorkbenchStore") -> None:
     store.write_table(schema.TABLE_ASSEMBLY, assemblies)
 
 
+def _migrate_3_to_4(store: "WorkbenchStore") -> None:
+    """v3 -> v4: topology follows stable cable segments, not RPL revisions."""
+    for route in store.list_routes():
+        route_id = route.get("route_id") or ""
+        if not route_id:
+            continue
+        canonical_id = store.ensure_segment_component(route_id)
+        revision_ids = {r.get("rpl_id") for r in store.revisions_of_route(route_id)}
+        duplicates = [
+            c for c in store.list_components()
+            if c.get("component_id") != canonical_id
+            and c.get("kind") == "rpl"
+            and c.get("subject_id") in revision_ids
+        ]
+        for duplicate in duplicates:
+            if _merge_component_ports(store, duplicate["component_id"], canonical_id):
+                store.delete_component(duplicate["component_id"])
+            else:
+                # Preserve conflicting historical wiring for manual review.
+                duplicate["kind"] = "legacy_rpl"
+                duplicate["name"] = "Legacy topology — " + (duplicate.get("name") or "RPL")
+                store.save_component(duplicate)
+
+
+def _merge_component_ports(store: "WorkbenchStore", source_id: str,
+                           target_id: str) -> bool:
+    """Move non-conflicting A/B connections; False preserves any conflict."""
+    ports = store.list_ports()
+    source = {p.get("label"): p for p in ports if p.get("component_id") == source_id}
+    target = {p.get("label"): p for p in ports if p.get("component_id") == target_id}
+    connections = store.list_connections()
+    changed = False
+    for label, source_port in source.items():
+        source_pid = source_port.get("port_id")
+        connection = next(
+            (c for c in connections
+             if source_pid in (c.get("port_a_id"), c.get("port_b_id"))), None)
+        if connection is None:
+            continue
+        target_port = target.get(label)
+        if target_port is None:
+            return False
+        target_pid = target_port.get("port_id")
+        occupied = next(
+            (c for c in connections
+             if target_pid in (c.get("port_a_id"), c.get("port_b_id"))), None)
+        if occupied is not None:
+            return False
+        if connection.get("port_a_id") == source_pid:
+            connection["port_a_id"] = target_pid
+        else:
+            connection["port_b_id"] = target_pid
+        changed = True
+    if changed:
+        store.write_table(schema.TABLE_CONNECTION, connections)
+    return True
+
+
+def _migrate_4_to_5(store: "WorkbenchStore") -> None:
+    """Seed segment make-ups from fits on each segment's latest RPL.
+
+    Fits remain untouched: they are geometric analysis records. A lone fit is
+    an unambiguous one-placement make-up; several fits are retained in anchor
+    order but explicitly marked for review because legacy data did not record
+    physical ordering or joint intent.
+    """
+    assemblies = {
+        row.get("assembly_id"): row for row in store.list_assemblies()
+    }
+    latest_by_route = {}
+    for rpl in store.list_rpls():
+        route_id = rpl.get("route_id") or ""
+        current = latest_by_route.get(route_id)
+        key = (rpl.get("created_utc") or "", rpl.get("name") or "")
+        current_key = ((current or {}).get("created_utc") or "",
+                       (current or {}).get("name") or "")
+        if current is None or key >= current_key:
+            latest_by_route[route_id] = rpl
+
+    for route in store.list_routes():
+        route_id = route.get("route_id") or ""
+        if store.list_makeups(route_id):
+            continue
+        latest = latest_by_route.get(route_id)
+        if latest is None:
+            continue
+        fits = sorted(
+            store.list_fits(rpl_id=latest.get("rpl_id") or ""),
+            key=lambda row: float(row.get("anchor_kp_km") or 0.0),
+        )
+        fits = [fit for fit in fits if fit.get("assembly_id") in assemblies]
+        if not fits:
+            continue
+        review = len(fits) > 1
+        header = {
+            "makeup_id": schema.new_id(), "route_id": route_id,
+            "name": f"{route.get('name') or 'Cable segment'} make-up",
+            "rev_label": "Rev 1", "status": schema.STATUS_DRAFT,
+            "supersedes_id": "",
+            "notes": (
+                "Migrated from multiple legacy assembly fits. Review physical "
+                "assembly order, directions and joins."
+                if review else "Migrated from the legacy assembly fit."),
+        }
+        items = []
+        for index, fit in enumerate(fits):
+            if index:
+                items.append({
+                    "makeup_item_id": schema.new_id(), "kind": "joint",
+                    "name": f"Joint J{index:02d}", "direction": 1,
+                    "params_json": "{}",
+                    "notes": "Inferred between legacy fits; review required.",
+                })
+            assembly = assemblies.get(fit.get("assembly_id")) or {}
+            items.append({
+                "makeup_item_id": schema.new_id(), "kind": "assembly",
+                "assembly_id": fit.get("assembly_id") or "",
+                "name": assembly.get("name") or "Assembly",
+                "direction": 1 if int(fit.get("direction") or 1) >= 0 else -1,
+                "use_start_m": None, "use_end_m": None,
+                "params_json": "{}",
+                "notes": "Migrated from fit " + str(fit.get("fit_id") or ""),
+            })
+        store.save_makeup(header, items)
+
+
 # Maps a starting schema version to the function that upgrades it by one step.
 MIGRATIONS = {
     1: _migrate_1_to_2,
     2: _migrate_2_to_3,
+    3: _migrate_3_to_4,
+    4: _migrate_4_to_5,
 }
 
 

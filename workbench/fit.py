@@ -62,23 +62,24 @@ class FitResult:
     warnings: List[str] = field(default_factory=list)
 
 
-def build_fit_mapping(store, fit_row: Dict):
+def build_fit_mapping(store, fit_row: Dict, model=None):
     """Efficient cable->KP closure for a stored wb_fit row.
 
     Loads the RPL model once and returns ``mapping(cable_m) -> Optional[kp_km]``
     (None when the position is off the route), suitable for the SLD's KP axis
     which calls it on every repaint. Returns None if the RPL can't be loaded.
     """
-    from .rpl_layer_io import RplLayerSync
+    if model is None:
+        from .rpl_layer_io import RplLayerSync
 
-    rpl = store.get_rpl(fit_row.get("rpl_id") or "")
-    if not rpl:
-        return None
-    points_layer = store.open_layer(rpl.get("points_layer"))
-    lines_layer = store.open_layer(rpl.get("lines_layer"))
-    if points_layer is None or lines_layer is None:
-        return None
-    model = RplLayerSync(points_layer, lines_layer).load_model()
+        rpl = store.get_rpl(fit_row.get("rpl_id") or "")
+        if not rpl:
+            return None
+        points_layer = store.open_layer(rpl.get("points_layer"))
+        lines_layer = store.open_layer(rpl.get("lines_layer"))
+        if points_layer is None or lines_layer is None:
+            return None
+        model = RplLayerSync(points_layer, lines_layer).load_model()
 
     anchor_kp = float(fit_row.get("anchor_kp_km") or 0.0)
     anchor_cable_m = float(fit_row.get("anchor_cable_dist_m") or 0.0)

@@ -13,6 +13,8 @@ Table overview (all registry tables are geometryless GPKG layers):
 - wb_route           route identity grouping RPL revisions
 - wb_rpl             RPL registry (points/lines layer names + settings)
 - wb_fit             assembly <-> RPL fit anchors
+- wb_makeup          revision-ready physical cable make-up for a segment
+- wb_makeup_item     ordered assembly placements and joints in a make-up
 - wb_event_rule      RPL event classification rules (body|geographic|installation)
 - wb_component       CRA-style topology: components (rpl|assembly|node)
 - wb_port            CRA-style topology: ports on components
@@ -31,7 +33,7 @@ import re
 import time
 from typing import Dict, List, Tuple
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 # Registry table names ------------------------------------------------------
 TABLE_META = "wb_meta"
@@ -40,6 +42,8 @@ TABLE_ASSEMBLY_ITEM = "wb_assembly_item"
 TABLE_ROUTE = "wb_route"
 TABLE_RPL = "wb_rpl"
 TABLE_FIT = "wb_fit"
+TABLE_MAKEUP = "wb_makeup"
+TABLE_MAKEUP_ITEM = "wb_makeup_item"
 TABLE_EVENT_RULE = "wb_event_rule"
 TABLE_COMPONENT = "wb_component"
 TABLE_PORT = "wb_port"
@@ -144,6 +148,32 @@ FIT_FIELDS: List[FieldSpec] = [
     ("created_utc", "str"),
 ]
 
+MAKEUP_FIELDS: List[FieldSpec] = [
+    ("makeup_id", "str"),
+    ("route_id", "str"),
+    ("name", "str"),
+    ("rev_label", "str"),
+    ("status", "str"),
+    ("supersedes_id", "str"),
+    ("created_utc", "str"),
+    ("modified_utc", "str"),
+    ("notes", "str"),
+]
+
+MAKEUP_ITEM_FIELDS: List[FieldSpec] = [
+    ("makeup_item_id", "str"),
+    ("makeup_id", "str"),
+    ("seq", "int"),
+    ("kind", "str"),             # assembly | joint
+    ("assembly_id", "str"),      # assembly placement only
+    ("name", "str"),             # placement label / joint identifier
+    ("direction", "int"),        # +1 normal, -1 reversed
+    ("use_start_m", "float"),    # optional cut/use interval in assembly domain
+    ("use_end_m", "float"),
+    ("params_json", "str"),      # future loading/joint planning extension
+    ("notes", "str"),
+]
+
 EVENT_RULE_FIELDS: List[FieldSpec] = [
     ("rule_id", "str"),
     ("pattern", "str"),    # regex matched case-insensitively against Event text
@@ -154,8 +184,8 @@ EVENT_RULE_FIELDS: List[FieldSpec] = [
 
 COMPONENT_FIELDS: List[FieldSpec] = [
     ("component_id", "str"),
-    ("kind", "str"),        # rpl | assembly | node
-    ("subject_id", "str"),  # wb_rpl.rpl_id / wb_assembly.assembly_id, NULL for nodes
+    ("kind", "str"),        # route | assembly | node (legacy: rpl)
+    ("subject_id", "str"),  # wb_route.route_id / wb_assembly.assembly_id, NULL for nodes
     ("name", "str"),
     ("node_type", "str"),   # nodes only: bmh | bu | joint | other
     ("lat", "float"),       # nodes only, optional
@@ -166,7 +196,7 @@ COMPONENT_FIELDS: List[FieldSpec] = [
 PORT_FIELDS: List[FieldSpec] = [
     ("port_id", "str"),
     ("component_id", "str"),
-    ("label", "str"),  # A/B for linear things; trunk_in|trunk_out|branch for a BU
+    ("label", "str"),  # A/B for cable-segment endpoints; named sides for nodes
 ]
 
 CONNECTION_FIELDS: List[FieldSpec] = [
@@ -244,6 +274,8 @@ REGISTRY_TABLES: Dict[str, List[FieldSpec]] = {
     TABLE_ROUTE: ROUTE_FIELDS,
     TABLE_RPL: RPL_FIELDS,
     TABLE_FIT: FIT_FIELDS,
+    TABLE_MAKEUP: MAKEUP_FIELDS,
+    TABLE_MAKEUP_ITEM: MAKEUP_ITEM_FIELDS,
     TABLE_EVENT_RULE: EVENT_RULE_FIELDS,
     TABLE_COMPONENT: COMPONENT_FIELDS,
     TABLE_PORT: PORT_FIELDS,
@@ -262,6 +294,8 @@ TABLE_KEYS: Dict[str, str] = {
     TABLE_ROUTE: "route_id",
     TABLE_RPL: "rpl_id",
     TABLE_FIT: "fit_id",
+    TABLE_MAKEUP: "makeup_id",
+    TABLE_MAKEUP_ITEM: "makeup_item_id",
     TABLE_EVENT_RULE: "rule_id",
     TABLE_COMPONENT: "component_id",
     TABLE_PORT: "port_id",
