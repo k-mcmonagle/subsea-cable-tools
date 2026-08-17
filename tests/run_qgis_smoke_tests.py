@@ -121,6 +121,7 @@ def main() -> int:
         ("workbench RPL engine", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_rpl_engine")),
         ("RPL import core (pure)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_rpl_import_core")),
         ("RPL import commit service", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_rpl_import_commit")),
+        ("RPL from route line (KML)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_rpl_from_line")),
         ("workbench assembly + fit", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_fit")),
         ("workbench topology + V3 adapter", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_workbench_adapter")),
         ("workbench layer styling (pure)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_workbench_layer_style")),

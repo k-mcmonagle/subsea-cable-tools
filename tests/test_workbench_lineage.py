@@ -281,6 +281,37 @@ def test_edit_draft_rpl_revision() -> bool:
     return _result("draft RPL revision label remains editable", ok)
 
 
+def test_out_of_order_revision_import() -> bool:
+    """Numbered revisions order numerically, not by import date.
+
+    Receiving Rev 3 before a corrected Rev 2 must not make Rev 2 'latest'.
+    Unnumbered labels sort after every numbered one.
+    """
+    store = _temp_store()
+    store.ensure_created()
+    route_id = store.create_route("Segment X")
+    for label, created in (("Rev 3", "2026-01-01T00:00:00Z"),
+                           ("Rev 2", "2026-02-01T00:00:00Z"),
+                           ("As-laid final", "2026-03-01T00:00:00Z")):
+        rpl_id = schema.new_id()
+        points_name, lines_name = _seed_spatial_pair(store, rpl_id, f"Segment X {label}")
+        store.save_rpl({
+            "rpl_id": rpl_id, "name": f"Segment X {label}", "kind": "planned",
+            "points_layer": points_name, "lines_layer": lines_name,
+            "route_id": route_id, "rev_label": label, "created_utc": created,
+        })
+    order = [r.get("rev_label") for r in store.revisions_of_route(route_id)]
+    latest = (store.latest_revision(route_id) or {}).get("rev_label")
+    ok = order == ["Rev 2", "Rev 3", "As-laid final"] and latest == "As-laid final"
+    # numbered-only routes: highest number is latest regardless of import order
+    store.delete_rpl(next(r["rpl_id"] for r in store.revisions_of_route(route_id)
+                          if r.get("rev_label") == "As-laid final"))
+    latest_numbered = (store.latest_revision(route_id) or {}).get("rev_label")
+    ok = ok and latest_numbered == "Rev 3"
+    return _result("out-of-order revision import keeps numeric order",
+                   ok, f"order={order}, latest={latest}/{latest_numbered}")
+
+
 def run_all() -> list:
     return [
         test_migrate_v2_to_v3(),
@@ -289,6 +320,7 @@ def run_all() -> list:
         test_issue_read_only(),
         test_next_rev_label(),
         test_edit_draft_rpl_revision(),
+        test_out_of_order_revision_import(),
     ]
 
 

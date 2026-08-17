@@ -32,6 +32,13 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.core import QgsProject, QgsVectorLayer
 
+from ..qgis_compat import (
+    WINDOW_HINT_CLOSE,
+    WINDOW_HINT_CUSTOMIZE,
+    WINDOW_HINT_MIN_MAX,
+    WINDOW_HINT_TITLE,
+    WINDOW_TYPE_WINDOW,
+)
 from .assembly_manager_dock import AssemblyManagerPanel
 from .assessment_panel import AssessmentPanel
 from .overview_panels import SegmentOverviewPanel, SystemOverviewPanel
@@ -69,6 +76,10 @@ class WorkbenchDock(QDockWidget):
             | Qt.DockWidgetArea.RightDockWidgetArea
             | Qt.DockWidgetArea.BottomDockWidgetArea
         )
+        # Floating on a second monitor is the intended way to use the
+        # workbench; give the floating window real minimise/maximise buttons
+        # (same pattern as the Planner and Burial Planner docks).
+        self.topLevelChanged.connect(self._top_level_changed)
 
         container = QWidget()
         outer = QVBoxLayout(container)
@@ -111,6 +122,7 @@ class WorkbenchDock(QDockWidget):
         new_menu.addAction("New cable segment...", self._new_route)
         new_menu.addAction("Import RPL...", self._import_rpl)
         new_menu.addAction("Add RPL from layers...", self._register_rpl)
+        new_menu.addAction("New RPL from route line (KML...)...", self._import_rpl_from_line)
         new_menu.addAction("New assembly...", self._new_assembly)
         new_menu.addAction("Manage assemblies...", self._manage_assemblies)
         new_menu.addAction("New assessment...", self._new_assessment)
@@ -180,6 +192,14 @@ class WorkbenchDock(QDockWidget):
         self._connect_project_layer_sync()
 
         self.refresh_tree()
+
+    # ------------------------------------------------- window management --
+    def _top_level_changed(self, floating: bool) -> None:
+        if floating:
+            self.setWindowFlags(WINDOW_TYPE_WINDOW | WINDOW_HINT_CUSTOMIZE
+                                | WINDOW_HINT_TITLE | WINDOW_HINT_MIN_MAX
+                                | WINDOW_HINT_CLOSE)
+            self.show()
 
     # ------------------------------------------------------ layer sync --
     def _project_sync_signal_slots(self):
@@ -824,6 +844,7 @@ class WorkbenchDock(QDockWidget):
             menu.addAction("New RPL revision...", self._new_rpl_revision)
             menu.addAction("Import RPL...", self._import_rpl)
             menu.addAction("Add RPL from layers...", self._register_rpl)
+            menu.addAction("New RPL from route line (KML...)...", self._import_rpl_from_line)
             menu.addAction("Fit assembly...", self._fit_selected_rpl)
             menu.addAction("New assessment...", self._new_assessment)
             self._add_assign_system_menu(menu)
@@ -1043,6 +1064,32 @@ class WorkbenchDock(QDockWidget):
             system_id=self._selected_system_id() or "",
         )
         self.refresh_tree()
+
+    def _import_rpl_from_line(self):
+        """Register a bare route line (KML or any line layer) as an RPL revision."""
+        store = self._store()
+        if store is None:
+            QMessageBox.information(
+                self, "New RPL from route line",
+                "Open or create a Workbench file first (File...).")
+            return
+        from .rpl_from_line import RplFromLineDialog
+        from ..qgis_compat import DIALOG_ACCEPTED, qt_exec
+
+        route_id = self._selected_route_id()
+        route = store.get_route(route_id) if route_id else None
+        dialog = RplFromLineDialog(
+            store, parent=self, route_name=(route or {}).get("name") or "")
+        if qt_exec(dialog) != DIALOG_ACCEPTED or not dialog.rpl_id:
+            return
+        system_id = self._selected_system_id() or ""
+        if system_id:
+            row = store.get_rpl(dialog.rpl_id) or {}
+            store.assign_route_to_system(row.get("route_id") or "", system_id)
+        self.rpl_panel.refresh_rpl_list()
+        self.refresh_tree()
+        self._select_ref((KIND_RPL, dialog.rpl_id))
+        self.rpl_panel.select_rpl(dialog.rpl_id)
 
     def _import_for_system(self, system_id: str):
         self._select_ref((KIND_SYSTEM, system_id))

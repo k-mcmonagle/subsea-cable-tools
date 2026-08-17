@@ -250,8 +250,21 @@ class WorkbenchStore:
         self.save_route(row)
 
     def revisions_of_route(self, route_id: str) -> List[Dict]:
+        """A route's revisions in revision order (oldest first, latest last).
+
+        Numbered labels ("Rev 2") order numerically so importing revisions
+        out of receipt order (Rev 3 before a corrected Rev 2) still leaves
+        the highest revision as latest; unnumbered labels ("As-laid final")
+        sort after all numbered ones by creation time.
+        """
         rows = [r for r in self.read_table(schema.TABLE_RPL) if r.get("route_id") == route_id]
-        rows.sort(key=lambda r: (r.get("created_utc") or "", r.get("name") or ""))
+
+        def sort_key(row):
+            match = re.search(r"\brev\s*(\d+)\b", str(row.get("rev_label") or ""), re.IGNORECASE)
+            number = int(match.group(1)) if match else float("inf")
+            return (number, row.get("created_utc") or "", row.get("name") or "")
+
+        rows.sort(key=sort_key)
         return rows
 
     def latest_revision(self, route_id: str) -> Optional[Dict]:
