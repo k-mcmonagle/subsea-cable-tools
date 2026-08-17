@@ -237,19 +237,54 @@ def from_catenary_json(raw: str, name: str = "Imported assembly") -> Assembly:
 # ---------------------------------------------------------------------------
 @dataclass
 class EventClassification:
-    category: str            # body | geographic | installation
-    body_type: str = ""      # for bodies
+    """What an RPL point's event says the point is.
+
+    Every point has a place on the map; the two natures record what else it
+    is, and they can BOTH be true ("JT-3 / AC12" — a joint that currently
+    coincides with an alter-course position): if the assembly changes, the
+    joint moves with it while the geographic reference stays put.
+    """
+
+    category: str            # body | geographic | both
+    body_type: str = ""      # assembly subtype (joint | repeater | bu | ...)
+    geo_type: str = ""       # geographic subtype (crossing | boundary | ...)
+    is_assembly: bool = False
+    is_geographic: bool = False
     matched_pattern: str = ""
     matched: bool = False    # False => defaulted (never silently a body)
+
+    @property
+    def label(self) -> str:
+        if self.is_assembly and self.is_geographic:
+            return "Assembly + geographic"
+        if self.is_assembly:
+            return "Assembly"
+        return "Geographic"
+
+    @property
+    def subtype(self) -> str:
+        parts = [p for p in (self.body_type, self.geo_type) if p]
+        return " + ".join(parts)
+
+
+def _rule_nature(rule: Dict) -> str:
+    category = str(rule.get("category") or "").strip().lower()
+    if category == schema.CATEGORY_BODY:
+        return schema.CATEGORY_BODY
+    # legacy "installation" rows (and anything unknown) read as geographic
+    return schema.CATEGORY_GEOGRAPHIC
 
 
 class EventClassifier:
     """Classifies RPL point Event text using ordered regex rules.
 
     Rules are ``{"pattern", "category", "body_type", "priority"}`` dicts
-    (wb_event_rule rows). Unmatched or blank events default to
-    ``installation`` with ``matched=False`` so callers can flag them —
-    an unmatched event must never silently become an assembly body.
+    (wb_event_rule rows). ALL rules are evaluated: a body match makes the
+    point an assembly component, a geographic match makes it a geographic
+    reference, and one event text can be both — each nature's subtype comes
+    from its own best-priority match. Unmatched or blank events default to
+    ``geographic`` with ``matched=False`` so callers can flag them — an
+    unmatched event must never silently become an assembly body.
     """
 
     def __init__(self, rules: Sequence[Dict]):
@@ -273,16 +308,38 @@ class EventClassifier:
 
     def classify(self, event_text: Optional[str]) -> EventClassification:
         text = (event_text or "").strip()
+        body_rule = None
+        geo_rule = None
         if text:
             for rx, rule in self._rules:
-                if rx.search(text):
-                    return EventClassification(
-                        category=rule.get("category") or schema.CATEGORY_INSTALLATION,
-                        body_type=rule.get("body_type") or "",
-                        matched_pattern=rule.get("pattern") or "",
-                        matched=True,
-                    )
-        return EventClassification(category=schema.CATEGORY_INSTALLATION, matched=False)
+                if not rx.search(text):
+                    continue
+                if _rule_nature(rule) == schema.CATEGORY_BODY:
+                    if body_rule is None:
+                        body_rule = rule
+                elif geo_rule is None:
+                    geo_rule = rule
+                if body_rule is not None and geo_rule is not None:
+                    break
+        if body_rule is None and geo_rule is None:
+            return EventClassification(
+                category=schema.CATEGORY_GEOGRAPHIC, is_geographic=True,
+                matched=False)
+        if body_rule is not None and geo_rule is not None:
+            category = schema.CATEGORY_BOTH
+        elif body_rule is not None:
+            category = schema.CATEGORY_BODY
+        else:
+            category = schema.CATEGORY_GEOGRAPHIC
+        return EventClassification(
+            category=category,
+            body_type=(body_rule or {}).get("body_type") or "",
+            geo_type=(geo_rule or {}).get("body_type") or "",
+            is_assembly=body_rule is not None,
+            is_geographic=geo_rule is not None,
+            matched_pattern=((body_rule or geo_rule) or {}).get("pattern") or "",
+            matched=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +365,7 @@ def classify_events(model, classifier: EventClassifier) -> List[Dict]:
                 "event": point.event,
                 "category": cls.category,
                 "body_type": cls.body_type,
+                "geo_type": cls.geo_type,
                 "matched": cls.matched,
             })
     return review
@@ -322,8 +380,9 @@ def build_assembly_from_rpl(
     """Build an Assembly from an RPL model using per-event classifications.
 
     ``classifications`` maps point ``seq`` -> category; only points whose
-    category is ``body`` become body items, and every body splits the run of
-    segments into sections. Section grouping:
+    category is ``body`` (or ``both`` — an assembly component that currently
+    coincides with a geographic reference) become body items, and every body
+    splits the run of segments into sections. Section grouping:
 
     - GROUP_BY_CABLE_TYPE: consecutive segments sharing
       (CableType, CableCode, FiberPair) merge into one section (a change of
@@ -360,7 +419,8 @@ def build_assembly_from_rpl(
 
     for i, point in enumerate(model.points):
         category = classifications.get(point.seq)
-        if category == schema.CATEGORY_BODY and (point.event or "").strip():
+        is_body = category in (schema.CATEGORY_BODY, schema.CATEGORY_BOTH)
+        if is_body and (point.event or "").strip():
             finish_run_section()
             open_section = None
             open_key = None

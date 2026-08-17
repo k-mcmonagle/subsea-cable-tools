@@ -77,6 +77,7 @@ WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
 # segments remain available as the advanced Legs table.
 POINT_TABLE_COLUMNS = [
     ("PosNo", "pos", True), ("Event", "event", True),
+    ("Category", "category", True),
     ("KP (km)", "kp", True), ("Latitude", "lat", True),
     ("Longitude", "lon", True), ("Cable (km)", "cable", False),
     ("Depth (m)", "depth", True),
@@ -526,18 +527,42 @@ class RplManagerPanel(QWidget):
             self._loading_tables = False
         self._update_edit_buttons()
 
+    def _event_classifier(self):
+        from . import assembly_model as am
+
+        try:
+            if self.store is not None and self.store.exists():
+                return am.EventClassifier(self.store.list_event_rules())
+        except Exception:
+            pass
+        return am.EventClassifier.with_defaults()
+
     def _populate_points_table(self, model: RplModel):
         point_attrs = _attribute_keys(
             (point.attrs for point in model.points), _POINT_ATTR_ORDER)
         columns = POINT_TABLE_COLUMNS + _attribute_columns(point_attrs, {"Remarks"})
         essentials = {key for _label, key, visible in columns if visible}
         self.points_table.configure_columns(columns, {"Essentials": essentials})
+        classifier = self._event_classifier()
+
+        def category_text(event: str) -> str:
+            if not (event or "").strip():
+                return ""
+            cls = classifier.classify(event)
+            text = cls.label
+            if cls.subtype:
+                text += f" — {cls.subtype}"
+            if not cls.matched:
+                text += " (no rule matched)"
+            return text
+
         self.points_table.setUpdatesEnabled(False)
         try:
             self.points_table.setRowCount(len(model.points))
             for row, point in enumerate(model.points):
                 values = {
                     "pos": _text(point.pos_no), "event": point.event or "",
+                    "category": category_text(point.event),
                     "lat": f"{point.lat:.6f}", "lon": f"{point.lon:.6f}",
                     "kp": _number(point.dist_cum_km, 3),
                     "cable": _number(point.cable_dist_cum_km, 3),

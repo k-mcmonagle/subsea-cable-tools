@@ -689,6 +689,11 @@ class WorkbenchStore:
     # -- event rules ------------------------------------------------------------
     def list_event_rules(self) -> List[Dict]:
         rules = self.read_table(schema.TABLE_EVENT_RULE)
+        for rule in rules:
+            # older registries had a third "installation" bucket; those marks
+            # are map references, so they read as geographic now
+            if (rule.get("category") or "").strip().lower() == schema.LEGACY_CATEGORY_INSTALLATION:
+                rule["category"] = schema.CATEGORY_GEOGRAPHIC
         rules.sort(key=lambda r: int(r.get("priority") or 0))
         return rules
 

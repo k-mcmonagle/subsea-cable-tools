@@ -131,6 +131,8 @@ class AssemblyManagerPanel(QWidget):
         import_menu.addAction("From catenary JSON (clipboard)", self._import_catenary_clipboard)
         import_menu.addAction("Extract from registered RPL…", lambda: self._extract_from_rpl())
         import_menu.addSeparator()
+        import_menu.addAction("Edit event classification rules…",
+                              self._edit_event_rules)
         import_menu.addAction("Reset event classification rules to defaults",
                               self._reset_event_rules)
         import_btn.setMenu(import_menu)
@@ -654,6 +656,15 @@ class AssemblyManagerPanel(QWidget):
         self._select_assembly(assembly.assembly_id)
         return True
 
+    def _edit_event_rules(self):
+        if self.store is None or not self.store.exists():
+            QMessageBox.information(self, "Event rules", "No workbench GeoPackage yet.")
+            return
+        dialog = EventRulesDialog(self.store.list_event_rules(), parent=self)
+        if qt_exec(dialog) == DIALOG_ACCEPTED:
+            self.store.save_event_rules(dialog.result_rules())
+            QMessageBox.information(self, "Event rules", "Rules saved.")
+
     def _reset_event_rules(self):
         if self.store is None or not self.store.exists():
             QMessageBox.information(self, "Event rules", "No workbench GeoPackage yet.")
@@ -739,9 +750,9 @@ class ExtractReviewDialog(QDialog):
     grouping, and watch a live preview of the resulting assembly."""
 
     CATEGORIES = [
-        ("Equipment / cable body", "body"),
-        ("Geographic event", "geographic"),
-        ("Installation event", "installation"),
+        ("Assembly component", "body"),
+        ("Geographic reference", "geographic"),
+        ("Assembly + geographic", "both"),
     ]
 
     def __init__(self, model, review: List[Dict], default_name: str, parent=None):
@@ -807,7 +818,7 @@ class ExtractReviewDialog(QDialog):
             combo = QComboBox()
             for category_label, category_id in self.CATEGORIES:
                 combo.addItem(category_label, category_id)
-            category_index = combo.findData(entry.get("category") or "installation")
+            category_index = combo.findData(entry.get("category") or "geographic")
             combo.setCurrentIndex(max(category_index, 0))
             combo.currentIndexChanged.connect(self._rebuild)
             self.table.setCellWidget(row, 2, combo)
@@ -819,11 +830,12 @@ class ExtractReviewDialog(QDialog):
         layout.addWidget(splitter)
 
         actions = QHBoxLayout()
-        all_bodies_btn = QPushButton("Selected rows → equipment")
-        all_bodies_btn.setToolTip("Mark every selected row as equipment / a cable body")
+        all_bodies_btn = QPushButton("Selected rows → assembly")
+        all_bodies_btn.setToolTip("Mark every selected row as a physical assembly component")
         all_bodies_btn.clicked.connect(lambda: self._set_selected_category("body"))
-        none_bodies_btn = QPushButton("Selected rows → installation")
-        none_bodies_btn.clicked.connect(lambda: self._set_selected_category("installation"))
+        none_bodies_btn = QPushButton("Selected rows → geographic")
+        none_bodies_btn.setToolTip("Mark every selected row as a map reference (not part of the assembly)")
+        none_bodies_btn.clicked.connect(lambda: self._set_selected_category("geographic"))
         actions.addWidget(all_bodies_btn)
         actions.addWidget(none_bodies_btn)
         actions.addStretch()
@@ -873,3 +885,122 @@ class ExtractReviewDialog(QDialog):
 
     def result_assembly(self) -> Optional[Assembly]:
         return self._assembly
+
+
+class EventRulesDialog(QDialog):
+    """Edit the project's event classification rules.
+
+    One row per rule: a regex matched against RPL Event text, the nature it
+    assigns (assembly component vs geographic reference), a free-vocabulary
+    subtype (repeater, equaliser, crossing, boundary...), and a priority
+    (lower wins within each nature). An event can match rules of both
+    natures — e.g. "JT-3 / AC12" classifies as assembly + geographic.
+    """
+
+    NATURES = [
+        ("Assembly component", schema.CATEGORY_BODY),
+        ("Geographic reference", schema.CATEGORY_GEOGRAPHIC),
+    ]
+
+    def __init__(self, rules: List[Dict], parent=None):
+        super().__init__(parent)
+        from qgis.PyQt.QtWidgets import QComboBox
+
+        self._combo_cls = QComboBox
+        self.setWindowTitle("Event classification rules")
+        self.resize(760, 480)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "Rules classify RPL Event text (regex, case-insensitive). "
+            "Assembly components move with the assembly; geographic references "
+            "stay put on the map. An event matching both natures is both. "
+            "Subtype is your own vocabulary (repeater, equaliser, crossing, "
+            "maritime boundary...)."))
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(
+            ["Pattern (regex)", "Nature", "Subtype", "Priority"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        for rule in rules:
+            self._append_row(rule)
+        self.table.resizeColumnsToContents()
+        layout.addWidget(self.table)
+
+        actions = QHBoxLayout()
+        add_btn = QPushButton("Add rule")
+        add_btn.clicked.connect(lambda: self._append_row({}))
+        remove_btn = QPushButton("Remove selected")
+        remove_btn.clicked.connect(self._remove_selected)
+        actions.addWidget(add_btn)
+        actions.addWidget(remove_btn)
+        actions.addStretch()
+        layout.addLayout(actions)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._accept_if_valid)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _append_row(self, rule: Dict):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(str(rule.get("pattern") or "")))
+        combo = self._combo_cls()
+        for label, value in self.NATURES:
+            combo.addItem(label, value)
+        category = (rule.get("category") or schema.CATEGORY_GEOGRAPHIC).strip().lower()
+        if category not in (schema.CATEGORY_BODY, schema.CATEGORY_GEOGRAPHIC):
+            category = schema.CATEGORY_GEOGRAPHIC
+        combo.setCurrentIndex(max(combo.findData(category), 0))
+        self.table.setCellWidget(row, 1, combo)
+        self.table.setItem(row, 2, QTableWidgetItem(str(rule.get("body_type") or "")))
+        priority = rule.get("priority")
+        self.table.setItem(row, 3, QTableWidgetItem(
+            "" if priority is None else str(priority)))
+        self._row_rule_ids = getattr(self, "_row_rule_ids", [])
+        self._row_rule_ids.append(str(rule.get("rule_id") or ""))
+
+    def _remove_selected(self):
+        rows = sorted({index.row() for index in self.table.selectedIndexes()}, reverse=True)
+        for row in rows:
+            self.table.removeRow(row)
+            if row < len(getattr(self, "_row_rule_ids", [])):
+                self._row_rule_ids.pop(row)
+
+    def _accept_if_valid(self):
+        import re as _re
+
+        for row in range(self.table.rowCount()):
+            pattern = (self.table.item(row, 0).text() if self.table.item(row, 0) else "").strip()
+            if not pattern:
+                QMessageBox.warning(self, "Event rules", f"Row {row + 1}: pattern is empty.")
+                return
+            try:
+                _re.compile(pattern, _re.IGNORECASE)
+            except _re.error as exc:
+                QMessageBox.warning(
+                    self, "Event rules", f"Row {row + 1}: invalid regex — {exc}")
+                return
+        self.accept()
+
+    def result_rules(self) -> List[Dict]:
+        rules: List[Dict] = []
+        rule_ids = getattr(self, "_row_rule_ids", [])
+        for row in range(self.table.rowCount()):
+            combo = self.table.cellWidget(row, 1)
+            priority_text = (self.table.item(row, 3).text()
+                             if self.table.item(row, 3) else "").strip()
+            try:
+                priority = int(priority_text)
+            except ValueError:
+                priority = (row + 1) * 10
+            rules.append({
+                "rule_id": rule_ids[row] if row < len(rule_ids) and rule_ids[row] else schema.new_id(),
+                "pattern": (self.table.item(row, 0).text() if self.table.item(row, 0) else "").strip(),
+                "category": combo.currentData() if combo else schema.CATEGORY_GEOGRAPHIC,
+                "body_type": (self.table.item(row, 2).text()
+                              if self.table.item(row, 2) else "").strip(),
+                "priority": priority,
+            })
+        return rules

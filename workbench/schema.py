@@ -177,8 +177,8 @@ MAKEUP_ITEM_FIELDS: List[FieldSpec] = [
 EVENT_RULE_FIELDS: List[FieldSpec] = [
     ("rule_id", "str"),
     ("pattern", "str"),    # regex matched case-insensitively against Event text
-    ("category", "str"),   # body | geographic | installation
-    ("body_type", "str"),  # joint | repeater | bu | ... (body rules only)
+    ("category", "str"),   # body | geographic (legacy "installation" reads as geographic)
+    ("body_type", "str"),  # subtype: joint | repeater | ... / crossing | boundary | ...
     ("priority", "int"),   # lower number wins
 ]
 
@@ -348,26 +348,45 @@ RPL_LINE_FIELDS: List[FieldSpec] = [
 ]
 
 # Event classification defaults ---------------------------------------------
-# (pattern, category, body_type, priority). Matched case-insensitively with
-# re.search against the point Event text; lowest priority number wins.
-# Unmatched events are treated as "installation" with a validation note —
-# never silently as a body.
+# (pattern, category, subtype, priority). Matched case-insensitively with
+# re.search against the point Event text.
+#
+# Every RPL point has a place on the map; the classification answers what
+# else it is. Two natures, not mutually exclusive:
+#   - "body"       — a physical component of the cable assembly (repeater,
+#                    joint, branching unit, armour transition). Moves with
+#                    the assembly if the make-up changes.
+#   - "geographic" — a reference to a place (crossing, alter-course, boundary,
+#                    water-depth mark, operational mark). Stays put if the
+#                    assembly changes.
+# One event text can match rules of BOTH natures ("JT-3 / AC12"): the
+# classifier reports both, taking each nature's subtype from its own
+# best-priority match. Unmatched events default to geographic with a
+# validation note — never silently a body.
+#
+# The subtype is a free vocabulary; the defaults below seed the common ones
+# and users can add their own rules (e.g. "equaliser", "maritime boundary").
 CATEGORY_BODY = "body"
 CATEGORY_GEOGRAPHIC = "geographic"
-CATEGORY_INSTALLATION = "installation"
+CATEGORY_BOTH = "both"          # review/display value; rules carry one nature
+# Legacy stored value from schemas that had a third "installation" bucket;
+# read paths normalise it to geographic.
+LEGACY_CATEGORY_INSTALLATION = "installation"
 
 DEFAULT_EVENT_RULES: List[Tuple[str, str, str, int]] = [
     (r"branching\s*unit|\bbu\b", CATEGORY_BODY, "bu", 10),
     (r"repeater|\brptr\b", CATEGORY_BODY, "repeater", 20),
+    (r"equali[sz]er|\beq\b", CATEGORY_BODY, "equaliser", 25),
     (r"joint|\bjt\b|bujb|\bjb\d|\bujb", CATEGORY_BODY, "joint", 30),
     (r"\bbmh\b|beach\s*man\s*hole|beach\s*manhole", CATEGORY_BODY, "bmh", 40),
-    (r"crossing|\bxing\b", CATEGORY_GEOGRAPHIC, "", 50),
-    (r"\brbp\s*\d*\b|route\s*branch", CATEGORY_GEOGRAPHIC, "", 55),
+    (r"^\s*tr\b|transition", CATEGORY_BODY, "transition", 45),  # armour/cable type transitions (Tr DAS/SA)
+    (r"crossing|\bxing\b", CATEGORY_GEOGRAPHIC, "crossing", 50),
+    (r"\brbp\s*\d*\b|route\s*branch", CATEGORY_GEOGRAPHIC, "route_branch", 55),
     (r"\bpldn\b|\bplup\b|plough|burial|\bdse\b|start\s+of|end\s+of|\bsol\b|\beol\b|slack\s*box",
-     CATEGORY_INSTALLATION, "", 60),
-    (r"\bacp?\s*\d*\b|alter\s*course", CATEGORY_GEOGRAPHIC, "", 70),
-    (r"\bwd\s*\d", CATEGORY_GEOGRAPHIC, "", 75),          # water depth marks (WD 1000)
-    (r"^\s*tr\b|transition", CATEGORY_INSTALLATION, "", 80),  # cable type transitions (Tr DAS/SA)
+     CATEGORY_GEOGRAPHIC, "operations", 60),
+    (r"\bacp?\s*\d*\b|alter\s*course", CATEGORY_GEOGRAPHIC, "alter_course", 70),
+    (r"\bwd\s*\d", CATEGORY_GEOGRAPHIC, "water_depth", 75),   # water depth marks (WD 1000)
+    (r"boundary|\beez\b|territorial|median\s*line", CATEGORY_GEOGRAPHIC, "boundary", 78),
 ]
 
 # Route-suitability defaults ------------------------------------------------

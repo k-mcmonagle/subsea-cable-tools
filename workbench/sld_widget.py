@@ -129,9 +129,10 @@ class SldWidget(SystemSchematicWidget):
             if point is None:
                 continue
             color = {
-                "geographic": "#cc6677", "installation": "#718096",
-                "body": "#117733",
-            }.get(event.get("category") or "installation", "#718096")
+                "geographic": "#cc6677", "body": "#117733",
+                "both": "#6f42c1",
+                "installation": "#cc6677",  # legacy category reads as geographic
+            }.get(event.get("category") or "geographic", "#cc6677")
             marker = self.scene().addEllipse(
                 point.x() - 4.5, point.y() - 4.5, 9.0, 9.0,
                 QPen(QColor(color), 1.2), QBrush(QColor(color)))

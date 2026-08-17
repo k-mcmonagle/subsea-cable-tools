@@ -75,10 +75,11 @@ def test_event_classifier_defaults() -> bool:
     checks = [
         ("Branching Unit BU-1", "body", "bu"),
         ("Repeater R3", "body", "repeater"),
+        ("Equaliser EQ1", "body", "equaliser"),
         ("Joint JT-2", "body", "joint"),
         ("Pipeline Crossing", "geographic", ""),
-        ("Start of Burial", "installation", ""),
-        ("PLDN", "installation", ""),
+        ("Start of Burial", "geographic", ""),
+        ("PLDN", "geographic", ""),
     ]
     ok = True
     for text, category, body_type in checks:
@@ -89,18 +90,36 @@ def test_event_classifier_defaults() -> bool:
     real_world = [
         ("AC9", "geographic"),            # alter-course points
         ("WD 1000", "geographic"),        # water depth marks
-        ("Tr DAS/SA", "installation"),    # cable type transition
+        ("Tr DAS/SA", "body"),            # armour/cable type transition — assembly component
         ("S014BUJB001", "body"),          # BU joint box id
         ("BU 2(S000B002);LWS", "body"),
         ("RBP2", "geographic"),
+        ("EEZ Boundary UK/NO", "geographic"),
     ]
     for text, category in real_world:
         cls = classifier.classify(text)
         ok = ok and cls.matched and cls.category == category
 
-    # unmatched events default to installation, flagged unmatched — never a body
+    # geographic subtypes come from the rule vocabulary
+    cls = classifier.classify("Pipeline Crossing")
+    ok = ok and cls.geo_type == "crossing" and cls.is_geographic and not cls.is_assembly
+
+    # one event can be BOTH an assembly component and a geographic reference:
+    # the joint moves with the assembly, the AC position stays on the map
+    cls = classifier.classify("JT-3 / AC12")
+    ok = ok and cls.category == "both" and cls.is_assembly and cls.is_geographic
+    ok = ok and cls.body_type == "joint" and cls.geo_type == "alter_course"
+    ok = ok and cls.label == "Assembly + geographic"
+
+    # legacy "installation" rules read as geographic
+    legacy = am.EventClassifier([
+        {"pattern": r"\bpldn\b", "category": "installation", "body_type": "", "priority": 10}])
+    cls = legacy.classify("PLDN")
+    ok = ok and cls.matched and cls.category == "geographic"
+
+    # unmatched events default to geographic, flagged unmatched — never a body
     cls = classifier.classify("Mystery Event XYZ")
-    ok = ok and not cls.matched and cls.category == "installation"
+    ok = ok and not cls.matched and cls.category == "geographic" and not cls.is_assembly
     return _result("event classifier defaults + safe fallback", ok)
 
 
@@ -135,13 +154,13 @@ def test_build_assembly_overrides_and_grouping() -> bool:
     # cable type changes at segment 3, but the user says only bodies matter
     for i, seg in enumerate(model.segments):
         seg.attrs["CableType"] = "LW" if i < 3 else "DA"
-    model.points[2].event = "MB"           # unmatched -> installation by default
-    model.points[4].event = "AC1"          # geographic by default
+    model.points[2].event = "MB"           # unmatched -> geographic by default
+    model.points[4].event = "AC1"          # geographic by rule
 
     classifier = am.EventClassifier.with_defaults()
     review = am.classify_events(model, classifier)
     classifications = {e["seq"]: e["category"] for e in review}
-    ok = classifications[2] == "installation" and classifications[4] == "geographic"
+    ok = classifications[2] == "geographic" and classifications[4] == "geographic"
 
     # user overrides: MB is actually a body
     classifications[2] = "body"
