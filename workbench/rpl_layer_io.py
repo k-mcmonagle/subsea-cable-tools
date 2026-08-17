@@ -60,6 +60,28 @@ def _int(value) -> Optional[int]:
         return None
 
 
+def _layer_alive(layer) -> bool:
+    """True if the QgsVectorLayer's C++ object still exists.
+
+    Removing a layer from the project (or closing the project) deletes the
+    underlying C++ object while Python references linger; touching one then
+    raises ``RuntimeError: wrapped C/C++ object ... has been deleted``.
+    """
+    if layer is None:
+        return False
+    try:
+        from qgis.PyQt import sip
+        if sip.isdeleted(layer):
+            return False
+    except ImportError:
+        pass
+    try:
+        layer.id()
+    except RuntimeError:
+        return False
+    return True
+
+
 class RplLayerSync:
     """Binds one RPL's points + lines layers to an in-memory model."""
 
@@ -134,30 +156,36 @@ class RplLayerSync:
         return RplModel(points=points, segments=segments)
 
     # -- edit session -----------------------------------------------------------
+    def is_valid(self) -> bool:
+        """Both bound layers still exist as C++ objects."""
+        return _layer_alive(self.points_layer) and _layer_alive(self.lines_layer)
+
     def begin_session(self) -> None:
         for layer in (self.points_layer, self.lines_layer):
-            if not layer.isEditable():
+            if _layer_alive(layer) and not layer.isEditable():
                 layer.startEditing()
 
     def is_dirty(self) -> bool:
         return any(
-            layer.isEditable() and layer.isModified()
+            _layer_alive(layer) and layer.isEditable() and layer.isModified()
             for layer in (self.points_layer, self.lines_layer)
         )
 
     def commit(self) -> bool:
         ok = True
         for layer in (self.points_layer, self.lines_layer):
-            if layer.isEditable():
+            if _layer_alive(layer) and layer.isEditable():
                 ok = layer.commitChanges() and ok
         return ok
 
     def rollback(self) -> None:
         for layer in (self.points_layer, self.lines_layer):
-            if layer.isEditable():
+            if _layer_alive(layer) and layer.isEditable():
                 layer.rollBack()
 
     def undo(self) -> None:
+        if not self.is_valid():
+            return
         for layer in (self.points_layer, self.lines_layer):
             stack = layer.undoStack()
             if stack is not None and stack.canUndo():
@@ -166,6 +194,8 @@ class RplLayerSync:
             layer.triggerRepaint()
 
     def redo(self) -> None:
+        if not self.is_valid():
+            return
         for layer in (self.points_layer, self.lines_layer):
             stack = layer.undoStack()
             if stack is not None and stack.canRedo():
@@ -174,10 +204,14 @@ class RplLayerSync:
             layer.triggerRepaint()
 
     def can_undo(self) -> bool:
+        if not _layer_alive(self.points_layer):
+            return False
         stack = self.points_layer.undoStack()
         return stack is not None and stack.canUndo()
 
     def can_redo(self) -> bool:
+        if not _layer_alive(self.points_layer):
+            return False
         stack = self.points_layer.undoStack()
         return stack is not None and stack.canRedo()
 

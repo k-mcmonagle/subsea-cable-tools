@@ -265,6 +265,10 @@ class WorkbenchDock(QDockWidget):
             self._pending_removed_workbench_layers.add(layer_name)
 
     def _on_project_layers_removed(self, *_args):
+        # Whatever else this removal means, an edit session bound to deleted
+        # layers (e.g. of an issued revision, whose registry row is kept) must
+        # not linger — its C++ objects are gone.
+        self.rpl_panel.drop_dead_sync()
         if self._teardown_muted:
             # Teardown flagged from the will-be-removed heuristic; the project
             # signals (cleared/projectRead) reset the flag too, but do it here
@@ -500,6 +504,7 @@ class WorkbenchDock(QDockWidget):
         return self._switch_workbench(store)
 
     def _can_switch_workbench(self) -> bool:
+        self.rpl_panel.drop_dead_sync()
         if self.rpl_panel.sync is None or not self.rpl_panel.sync.is_dirty():
             return True
         QMessageBox.information(
@@ -1121,6 +1126,7 @@ class WorkbenchDock(QDockWidget):
             QMessageBox.information(
                 self, "New RPL revision", "Select an RPL or cable segment first.")
             return
+        self.rpl_panel.drop_dead_sync()
         if self.rpl_panel.sync is not None and self.rpl_panel.sync.is_dirty():
             QMessageBox.information(
                 self, "New RPL revision",
@@ -1197,6 +1203,7 @@ class WorkbenchDock(QDockWidget):
             latest = store.latest_revision(entity_id)
             kind, entity_id = KIND_RPL, latest.get("rpl_id") if latest else ""
         if kind == KIND_RPL:
+            self.rpl_panel.drop_dead_sync()
             if self.rpl_panel.sync is not None and self.rpl_panel.sync.is_dirty():
                 QMessageBox.information(self, "Issue RPL", "Save or discard open RPL edits first.")
                 return

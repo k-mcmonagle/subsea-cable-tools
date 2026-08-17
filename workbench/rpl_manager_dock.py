@@ -414,7 +414,20 @@ class RplManagerPanel(QWidget):
                     self.rpl_list.setCurrentRow(i)
                 return
 
+    def drop_dead_sync(self) -> None:
+        """Forget an edit session whose project layers were deleted.
+
+        Removing the layers destroys their edit buffers, so there is nothing
+        left to save or roll back; keeping the sync around only produces
+        'wrapped C/C++ object has been deleted' errors on the next access.
+        """
+        if self.sync is not None and not self.sync.is_valid():
+            self.sync = None
+            self.model = None
+            self._update_edit_buttons()
+
     def _on_rpl_selected(self, current, _previous=None):
+        self.drop_dead_sync()
         if current is None:
             self.current_rpl = None
             self.model = None
@@ -696,6 +709,7 @@ class RplManagerPanel(QWidget):
         return rpl_engine.apply_depths(self.model, service.sample, indices=[idx])
 
     def _apply(self, changed: rpl_engine.ChangeSet):
+        self.drop_dead_sync()
         if self.sync is None or self.model is None or not self._can_edit_current():
             return
         self.sync.apply(self.model, changed, changed.label)
@@ -732,6 +746,7 @@ class RplManagerPanel(QWidget):
         self._update_edit_buttons()
 
     def _undo(self):
+        self.drop_dead_sync()
         if self.sync is None or self._read_only:
             return
         self.sync.undo()
@@ -742,6 +757,7 @@ class RplManagerPanel(QWidget):
             self.edit_tool.refresh_geometry()
 
     def _redo(self):
+        self.drop_dead_sync()
         if self.sync is None or self._read_only:
             return
         self.sync.redo()
@@ -752,6 +768,7 @@ class RplManagerPanel(QWidget):
             self.edit_tool.refresh_geometry()
 
     def _save(self):
+        self.drop_dead_sync()
         if self.sync is None:
             return
         if not self._can_edit_current():
@@ -781,6 +798,7 @@ class RplManagerPanel(QWidget):
         self.sync.begin_session()
 
     def _discard(self):
+        self.drop_dead_sync()
         if self.sync is None or self._read_only:
             return
         self.sync.rollback()
@@ -1553,6 +1571,7 @@ class RplManagerPanel(QWidget):
     def closeEvent(self, event):
         if self.edit_btn.isChecked():
             self.edit_btn.setChecked(False)
+        self.drop_dead_sync()
         if self.sync is not None and self.sync.is_dirty():
             answer = QMessageBox.question(
                 self, "Unsaved changes", "Save RPL edits before closing?",

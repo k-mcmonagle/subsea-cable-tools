@@ -281,6 +281,16 @@ class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
         store = WorkbenchStore(gpkg_path, context.transformContext())
         store.migrate()
 
+        conflict = self._registered_input_conflict(parameters, context, store)
+        if conflict:
+            raise QgsProcessingException(self.tr(
+                f"The selected input layers already belong to the registered RPL revision "
+                f"'{conflict}' in this workbench, so running this tool would only duplicate "
+                "that revision's data. To add a received RPL file as a new revision of the "
+                "cable segment, use the 'Import RPL…' wizard; to duplicate the current "
+                "revision for editing, use 'New RPL revision…' in the Workbench."
+            ))
+
         existing_route = next(
             (r for r in store.list_routes()
              if (r.get("name") or "").strip().lower() == route_name.lower()),
@@ -356,6 +366,35 @@ class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
         return {"RPL_ID": rpl_id, "GPKG_PATH": gpkg_path,
                 "ROUTE_ID": route_id, "REV_LABEL": rev_label,
                 "POINTS_LAYER": points_layer_name, "LINES_LAYER": lines_layer_name}
+
+    def _registered_input_conflict(self, parameters, context, store) -> Optional[str]:
+        """Name of the registered RPL revision the input layers belong to, if any.
+
+        Picking an already-registered workbench layer pair as the input is
+        almost always a mistake (it silently creates a new revision holding the
+        previous revision's data); the file-based import wizard or 'New RPL
+        revision' cover the intended flows.
+        """
+        from ..workbench.project_layers import layer_name_from_source
+
+        registered: Dict[str, str] = {}
+        for row in store.list_rpls():
+            for key in ("points_layer", "lines_layer"):
+                if row.get(key):
+                    registered[row[key]] = row.get("name") or row.get("rpl_id") or ""
+        if not registered:
+            return None
+        for param in (self.INPUT_POINTS, self.INPUT_LINES):
+            try:
+                layer = self.parameterAsVectorLayer(parameters, param, context)
+            except Exception:
+                layer = None
+            if layer is None:
+                continue
+            layer_name = layer_name_from_source(layer.source(), store.gpkg_path)
+            if layer_name and layer_name in registered:
+                return registered[layer_name]
+        return None
 
     @staticmethod
     def _specs_with_extras(base_specs, rows: List[Dict]):

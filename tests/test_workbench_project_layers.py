@@ -249,6 +249,40 @@ def test_teardown_guard() -> bool:
     return _result("project teardown heuristic", ok)
 
 
+def test_sync_survives_deleted_layers() -> bool:
+    """RplLayerSync must not raise once its project layers are deleted.
+
+    Removing the layers destroys the wrapped C++ objects; the sync's queries
+    must degrade (not dirty, nothing to undo) instead of raising
+    'wrapped C/C++ object ... has been deleted'.
+    """
+    from ..workbench.rpl_layer_io import RplLayerSync
+
+    project = QgsProject.instance()
+    project.clear()
+    store, rpl = _store_with_rpl()
+    lines = project_layers.ensure_layer(project, store.gpkg_path, rpl["lines_layer"])
+    points = project_layers.ensure_layer(project, store.gpkg_path, rpl["points_layer"])
+    sync = RplLayerSync(points, lines, rpl["rpl_id"])
+    sync.begin_session()
+    ok = sync.is_valid()
+
+    project.removeMapLayers([points.id(), lines.id()])
+    try:
+        ok = ok and not sync.is_valid()
+        ok = ok and not sync.is_dirty()
+        ok = ok and not sync.can_undo() and not sync.can_redo()
+        sync.undo()
+        sync.redo()
+        sync.rollback()
+        sync.commit()
+        sync.begin_session()
+    except RuntimeError as exc:
+        return _result("sync survives deleted layers", False, str(exc))
+    project.clear()
+    return _result("sync survives deleted layers", ok)
+
+
 def run_all():
     return [
         test_layer_name_from_source(),
@@ -260,6 +294,7 @@ def run_all():
         test_open_validation_does_not_modify_unrelated_gpkg(),
         test_workbench_dock_shows_and_switches_registry(),
         test_teardown_guard(),
+        test_sync_survives_deleted_layers(),
     ]
 
 
