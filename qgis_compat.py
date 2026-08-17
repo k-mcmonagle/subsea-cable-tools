@@ -215,6 +215,20 @@ PROCESSING_FIELD_ANY = _member_from_scopes(
     ("DataType", "FieldType", "Type"),
 )
 
+
+def _processing_source_type(legacy_name, scoped_name):
+    """QGIS 4 moved QgsProcessing.Type* to Qgis.ProcessingSourceType."""
+    from qgis.core import QgsProcessing
+
+    value = getattr(QgsProcessing, legacy_name, None)
+    if value is not None:
+        return value
+    return getattr(Qgis.ProcessingSourceType, scoped_name)
+
+
+PROCESSING_SOURCE_FILE = _processing_source_type("TypeFile", "File")
+PROCESSING_SOURCE_RASTER = _processing_source_type("TypeRaster", "Raster")
+
 FIELD_TYPE_STRING = _field_type("QString", "String")
 FIELD_TYPE_DOUBLE = _field_type("Double", "Double")
 FIELD_TYPE_INT = _field_type("Int", "Int")

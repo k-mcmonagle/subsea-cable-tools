@@ -1,36 +1,43 @@
+# -*- coding: utf-8 -*-
+"""Merge MBES rasters into one mosaic at the finest input resolution.
+
+Built on a GDAL virtual raster (gdalbuildvrt -resolution highest) rather
+than gdal_merge, which silently resamples every input to the FIRST file's
+resolution — merging a 0.25 m grid into a 1 m grid used to throw the fine
+detail away depending on selection order. The VRT is then materialised to
+a tiled GeoTIFF, so depth values pass through untouched.
+"""
+
 from qgis.PyQt.QtCore import QCoreApplication
 import os
-import tempfile
 import uuid
 from qgis.core import (
     QgsApplication,
-    QgsProcessing,
     QgsProcessingAlgorithm,
+    QgsProcessingException,
+    QgsProcessingParameterBoolean,
     QgsProcessingParameterMultipleLayers,
     QgsProcessingParameterRasterDestination,
-    QgsProcessingException,
-    QgsRasterLayer
+    QgsProcessingUtils,
+    QgsRasterLayer,
 )
+from ..qgis_compat import PROCESSING_SOURCE_RASTER
 from qgis import processing
 
+
 class MergeMBESRastersAlgorithm(QgsProcessingAlgorithm):
-    """
-    Merge multiple MBES raster layers into a single raster, preserving Z (depth) values
-    and correctly handling NoData values for transparency.
-    """
+    """Mosaic MBES rasters, preserving the finest resolution and NoData."""
+
     INPUTS = 'INPUTS'
     OUTPUT = 'OUTPUT'
     COMPRESS = 'COMPRESS'
-
-    def __init__(self):
-        super().__init__()
 
     def initAlgorithm(self, config=None):
         self.addParameter(
             QgsProcessingParameterMultipleLayers(
                 self.INPUTS,
                 self.tr('Input MBES Raster Layers'),
-                layerType=QgsProcessing.TypeRaster
+                layerType=PROCESSING_SOURCE_RASTER
             )
         )
         self.addParameter(
@@ -39,7 +46,6 @@ class MergeMBESRastersAlgorithm(QgsProcessingAlgorithm):
                 self.tr('Output Merged Raster')
             )
         )
-        from qgis.core import QgsProcessingParameterBoolean
         self.addParameter(
             QgsProcessingParameterBoolean(
                 self.COMPRESS,
@@ -55,95 +61,92 @@ class MergeMBESRastersAlgorithm(QgsProcessingAlgorithm):
             except Exception:
                 return False
 
-        if not alg_available('gdal:merge'):
-            raise QgsProcessingException(
-                "Required Processing algorithm 'gdal:merge' is not available. "
-                'This usually means the GDAL Processing provider is not installed or not enabled.'
-            )
+        for required in ('gdal:buildvirtualraster', 'gdal:translate'):
+            if not alg_available(required):
+                raise QgsProcessingException(
+                    f"Required Processing algorithm '{required}' is not available. "
+                    'This usually means the GDAL Processing provider is not installed or not enabled.'
+                )
 
         raster_layers = self.parameterAsLayerList(parameters, self.INPUTS, context)
         if not raster_layers or len(raster_layers) < 2:
             raise QgsProcessingException('Please select at least two raster layers to merge.')
 
-        output_raster_path = self.parameterAsOutputLayer(parameters, self.OUTPUT, context)
+        final_output = self.parameterAsOutputLayer(parameters, self.OUTPUT, context)
         compress = self.parameterAsBool(parameters, self.COMPRESS, context)
 
-    # If compression is enabled, create to a temp file first, then compress to final output
-        temp_output = None
-        if compress:
-            # Generate a unique temp filename without creating the file (avoid overwrite issues)
-            temp_output = os.path.join(tempfile.gettempdir(), f"mbes_merge_{uuid.uuid4().hex}.tif")
-            final_output = output_raster_path
-            output_raster_path = temp_output
-        else:
-            final_output = output_raster_path
-
-        # Get file paths for all input rasters
+        # --- validate inputs: files, one CRS, note resolutions and NoData ---
         input_files = []
+        crs_by_layer = {}
+        finest = None
         for lyr in raster_layers:
-            if isinstance(lyr, QgsRasterLayer):
-                input_files.append(lyr.source())
-            else:
-                feedback.pushWarning(f'Skipping invalid input: {lyr.name()} is not a raster layer.')
+            if not isinstance(lyr, QgsRasterLayer) or not lyr.isValid():
+                feedback.pushWarning(f'Skipping invalid input: {lyr.name()} is not a valid raster layer.')
+                continue
+            source = lyr.source().split('|')[0]
+            input_files.append(source)
+            crs_by_layer[lyr.name()] = lyr.crs().authid() or lyr.crs().toWkt()
+            res_x = abs(lyr.rasterUnitsPerPixelX())
+            res_y = abs(lyr.rasterUnitsPerPixelY())
+            finest = min(finest, res_x, res_y) if finest is not None else min(res_x, res_y)
+            provider = lyr.dataProvider()
+            has_nodata = bool(provider and provider.sourceHasNoDataValue(1))
+            feedback.pushInfo(
+                f'  {lyr.name()}: {res_x:g} x {res_y:g} units/pixel, '
+                f'CRS {crs_by_layer[lyr.name()]}, '
+                f'NoData {"set" if has_nodata else "NOT set"}')
+            if not has_nodata:
+                feedback.pushWarning(
+                    f'{lyr.name()} has no NoData value; empty areas of this layer '
+                    'may merge as 0 instead of transparent.')
 
         if len(input_files) < 2:
             raise QgsProcessingException('At least two valid raster layers are required to merge.')
+        if len(set(crs_by_layer.values())) > 1:
+            detail = ', '.join(f'{name}: {crs}' for name, crs in crs_by_layer.items())
+            raise QgsProcessingException(
+                'All input rasters must share one CRS — merging mixed CRS would '
+                f'misplace data. Found: {detail}. Reproject first (gdal:warpreproject).')
 
-        feedback.pushInfo(f'Merging {len(input_files)} rasters...')
-        
-        # The 'create' script uses -9999.0 as its NoData value. We will use this for consistency.
-        nodata_value = -9999.0
+        feedback.pushInfo(
+            f'Merging {len(input_files)} rasters at the finest input resolution '
+            f'({finest:g} units/pixel). Where tiles overlap, later-listed inputs win.')
 
-        # Parameters for gdal:merge. 
-        # We explicitly set the input and output NoData values and initialize the output raster
-        # with the NoData value. This prevents areas outside the input extents from being set to 0.
-        merge_params = {
+        # --- build the VRT mosaic at the highest resolution ---
+        vrt_path = os.path.join(
+            QgsProcessingUtils.tempFolder(), f'mbes_merge_{uuid.uuid4().hex[:8]}.vrt')
+        result = processing.run('gdal:buildvirtualraster', {
             'INPUT': input_files,
-            'PCT': False,
+            'RESOLUTION': 1,          # highest — never degrade a fine grid
             'SEPARATE': False,
-            'NODATA_INPUT': nodata_value,
-            'NODATA_OUTPUT': nodata_value,  # Correct parameter name for output NoData
-            'INIT': nodata_value,           # Initialize output with NoData value
-            'DATA_TYPE': 5,                 # 5 = Float32, to preserve floating point depth data
-            'OUTPUT': output_raster_path    # Write directly to the final destination
-        }
-        
-        feedback.pushInfo(f'Using GDAL Merge with NoData value: {nodata_value}')
-        
-        # Run the merge process
-        result = processing.run(
-            'gdal:merge',
-            merge_params,
-            context=context,
-            feedback=feedback
-        )
-
+            'PROJ_DIFFERENCE': False,
+            'ADD_ALPHA': False,
+            'ASSIGN_CRS': None,
+            'RESAMPLING': 0,          # nearest: depth values pass through untouched
+            'SRC_NODATA': None,       # respect each file's own NoData metadata
+            'OUTPUT': vrt_path,
+        }, context=context, feedback=feedback)
         if not result or not result.get('OUTPUT'):
-            raise QgsProcessingException('Raster merge failed. Check the processing log for more details.')
+            raise QgsProcessingException('Raster merge (buildvirtualraster) failed. '
+                                         'Check the processing log for more details.')
 
-        # If compression is enabled, use gdal:translate to compress to final output
-        if compress:
-            feedback.pushInfo('Applying LZW compression using gdal:translate...')
-            if not alg_available('gdal:translate'):
-                raise QgsProcessingException(
-                    "Compression requested but Processing algorithm 'gdal:translate' is not available. "
-                    'Enable the GDAL Processing provider or disable compression.'
-                )
-            translate_params = {
-                'INPUT': output_raster_path,
-                'OUTPUT': final_output,
-                'OPTIONS': 'COMPRESS=LZW',
-                'DATA_TYPE': 5 # Float32
-            }
-            result2 = processing.run('gdal:translate', translate_params, context=context, feedback=feedback)
-            if not result2 or not result2.get('OUTPUT'):
-                raise QgsProcessingException('Compression (gdal:translate) failed. Check the processing log for more details.')
-            feedback.pushInfo('Compression complete.')
-            return {self.OUTPUT: result2['OUTPUT']}
-        else:
-            feedback.pushInfo('Merge complete. Original depth values are preserved.')
-            feedback.pushInfo(f'Output raster created at: {result["OUTPUT"]}')
-            return {self.OUTPUT: result['OUTPUT']}
+        # --- materialise to GeoTIFF ---
+        options = 'COMPRESS=LZW|TILED=YES|BIGTIFF=IF_SAFER' if compress else 'TILED=YES|BIGTIFF=IF_SAFER'
+        result2 = processing.run('gdal:translate', {
+            'INPUT': result['OUTPUT'],
+            'OUTPUT': final_output,
+            'OPTIONS': options,
+            'DATA_TYPE': 0,           # keep the source data type
+        }, context=context, feedback=feedback)
+        if not result2 or not result2.get('OUTPUT'):
+            raise QgsProcessingException('Writing the merged raster (gdal:translate) failed. '
+                                         'Check the processing log for more details.')
+        try:
+            os.remove(vrt_path)
+        except OSError:
+            pass
+        feedback.pushInfo('Merge complete. Original depth values and finest resolution preserved.')
+        return {self.OUTPUT: result2['OUTPUT']}
 
     def createInstance(self):
         return MergeMBESRastersAlgorithm()
@@ -163,14 +166,13 @@ class MergeMBESRastersAlgorithm(QgsProcessingAlgorithm):
     def shortHelpString(self):
         return self.tr("""
 <h3>Merge MBES Rasters</h3>
-<p>This tool merges multiple MBES raster layers into a single raster, preserving depth (Z) values and ensuring NoData areas are transparent.</p>
+<p>Merges multiple MBES raster layers into a single mosaic <b>at the finest input resolution</b> — a 0.25&nbsp;m tile merged with 1&nbsp;m tiles keeps its 0.25&nbsp;m detail regardless of selection order. Depth values pass through untouched (nearest resampling, source data type kept).</p>
 <ul>
-  <li>Select two or more raster layers created by the MBES XYZ tool.</li>
-  <li>The output raster will have the original depth values from the source layers.</li>
-  <li>NoData values are correctly handled, resulting in a seamless mosaic with transparent backgrounds where no data exists.</li>
-  <li>You can apply a custom color style or ramp to the final merged layer within QGIS for visualisation.</li>
-  <li>Useful for mosaicking adjacent or overlapping MBES tiles.</li>
-  <li><b>Compression:</b> Enable LZW compression to reduce output file size without losing data.</li>
+  <li>Select two or more raster layers (e.g. from <i>Create Raster from XYZ</i>).</li>
+  <li>All inputs must share one CRS; mixed CRS is refused with a clear message.</li>
+  <li>Each file's own NoData value is respected, so gaps stay transparent; where tiles overlap, later-listed inputs take priority.</li>
+  <li>The output is a tiled GeoTIFF; LZW compression is lossless.</li>
+  <li>For fast display of large mosaics, build pyramids afterwards (right-click the layer → Properties → Pyramids, or gdaladdo).</li>
 </ul>
 """)
 
