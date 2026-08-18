@@ -77,7 +77,7 @@ section references in brackets.
   *stale* — shown, never silently rebuilt — and only *Resample profile*
   (or the automatic first build for a never-sampled plan) reruns sampling.
   The threshold-rule analysis consumes the stored series when current, so
-  Generate stops resampling too; the 1 m boundary-refinement predicate
+  Generate stops resampling too; the 0.1 m boundary-refinement predicate
   still samples live rasters (bounded evaluations, exact boundaries). An
   empty sampling result never replaces stored samples. Derived data — not
   change-logged, copied on plan duplicate. The station step follows the
@@ -207,6 +207,26 @@ section references in brackets.
   machine, recorded in the change log), honouring the no-shipped-engineering-
   values rule; existing assignments are never replaced unless overwrite is
   ticked, and the whole assignment is one undoable edit.
+
+- **The map follows the plan selector**: every plan keeps its own
+  sections/events/hazards layers, and switching plans checks the selected
+  plan's layer-tree nodes while unchecking every other plan's burial layers
+  — never removing them, so nothing is lost by switching back and a
+  deliberate two-plan comparison can still be re-checked by hand (until the
+  next switch re-asserts the selector). Renaming a plan (or changing its
+  revision label) retires the old-named project layers and rewrites under
+  the new names in the same edit, because the layer names embed both.
+- **Background results carry a plan token**: the exclusion analysis and the
+  risk scan both record the plan they were started on and their results are
+  discarded with a status message when a different plan (or plan file) is
+  open at completion — switching plans mid-run must never write one plan's
+  results into another. The profile sampler already had this via its
+  generation token.
+- **The Burial Planner opens as a floating window by default**: the dock is
+  sized for a second monitor, and the docked-panel width only suits
+  screen-share layouts; re-docking it and closing makes the next open
+  docked again (the user's last mode wins), and floating geometry restores
+  across sessions.
 
 ## Burial Tools registry (schema v6)
 

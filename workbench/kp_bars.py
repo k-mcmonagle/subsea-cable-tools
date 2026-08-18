@@ -45,7 +45,13 @@ def paint_spans(painter: QPainter, rect, domain_km: float,
                 spans: List, radius: int = 2,
                 domain_start_km: float = 0.0) -> None:
     """spans: list of (start_km, end_km, QColor); domain is
-    [domain_start_km, domain_start_km + domain_km]."""
+    [domain_start_km, domain_start_km + domain_km].
+
+    Overlapping sub-pixel spans are coalesced per pixel column, so dense
+    interval sets (thousands of hazards) paint O(bar width) rectangles
+    instead of one fill per span. NaN/inf spans are skipped rather than
+    raising inside a Qt paint event.
+    """
     painter.save()
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
     painter.fillRect(rect, EMPTY_BG)
@@ -55,12 +61,25 @@ def paint_spans(painter: QPainter, rect, domain_km: float,
     x0, w = rect.x(), rect.width()
     lo = domain_start_km
     hi = domain_start_km + domain_km
+    y, height = rect.y() + 2, rect.height() - 4
+    last_sx = last_ex = None
+    last_color = None
     for start_km, end_km, color in spans:
-        sx = x0 + ((max(lo, start_km) - lo) / domain_km) * w
-        ex = x0 + ((min(hi, end_km) - lo) / domain_km) * w
+        try:
+            sx = x0 + ((max(lo, float(start_km)) - lo) / domain_km) * w
+            ex = x0 + ((min(hi, float(end_km)) - lo) / domain_km) * w
+        except (TypeError, ValueError):
+            continue
+        if sx != sx or ex != ex:  # NaN guard
+            continue
         if ex - sx < 1.0:
             ex = sx + 1.0
-        painter.fillRect(int(sx), rect.y() + 2, int(ex - sx), rect.height() - 4, color)
+        sx_i, ex_i = int(sx), int(ex)
+        if last_color is color and last_sx is not None \
+                and sx_i <= last_ex and ex_i <= last_ex:
+            continue  # fully covered by the previous same-colour fill
+        painter.fillRect(sx_i, y, ex_i - sx_i, height, color)
+        last_sx, last_ex, last_color = sx_i, ex_i, color
     painter.restore()
 
 
@@ -80,6 +99,11 @@ class VerdictStrip(QWidget):
 
     def set_spans(self, domain_km: float, spans: List, method_name: str = "",
                   domain_start_km: float = 0.0) -> None:
+        if (domain_km == self._domain_km
+                and domain_start_km == self._domain_start_km
+                and spans == self._spans
+                and (method_name or "") == self._method_name):
+            return  # unchanged — skip the repaint
         self._domain_km = domain_km
         self._domain_start_km = domain_start_km
         self._spans = spans
@@ -120,15 +144,23 @@ class FireBarDelegate(QStyledItemDelegate):
     """
 
     def paint(self, painter, option, index):
-        data = index.data(Qt.ItemDataRole.UserRole)
-        if not data:
-            super().paint(painter, option, index)
-            return
-        if len(data) >= 4:
-            domain_km, intervals, color, domain_start_km = data[:4]
-        else:
-            domain_km, intervals, color = data
-            domain_start_km = 0.0
-        spans = [(s, e, color) for (s, e) in intervals]
-        paint_spans(painter, option.rect.adjusted(2, 0, -2, 0), domain_km, spans,
-                    domain_start_km=domain_start_km)
+        try:
+            data = index.data(Qt.ItemDataRole.UserRole)
+            if not data:
+                super().paint(painter, option, index)
+                return
+            if len(data) >= 4:
+                domain_km, intervals, color, domain_start_km = data[:4]
+            else:
+                domain_km, intervals, color = data
+                domain_start_km = 0.0
+            spans = [(s, e, color) for (s, e) in intervals]
+            paint_spans(painter, option.rect.adjusted(2, 0, -2, 0),
+                        domain_km, spans, domain_start_km=domain_start_km)
+        except Exception:
+            # A malformed payload must never raise inside a Qt paint event
+            # (paint exceptions are noisy and can loop).
+            try:
+                super().paint(painter, option, index)
+            except Exception:
+                pass

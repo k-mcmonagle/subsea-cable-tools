@@ -11,10 +11,11 @@ back as plain interval data; store/layer writes happen in ``finished()`` on
 the main thread (wired by the dock).
 
 Caching (spec §14.4): each rule's acquisition (footprint + no-data +
-1 m-refined boundaries) is cached in memory per open plan, keyed over the
+0.1 m-refined boundaries) is cached in memory per open plan, keyed over the
 canonicalised config, resolved input fingerprints, scope, step, RPL
-fingerprint and (for direction-aware conditions) direction. Editing one rule
-re-acquires one rule; a cancelled run leaves the cache warm and resumes.
+fingerprint, boundary-refinement tolerance and (for direction-aware conditions)
+direction. Editing one rule re-acquires one rule; a cancelled run leaves the
+cache warm and resumes.
 """
 
 from __future__ import annotations
@@ -99,7 +100,10 @@ class DepthSnapshot:
         self.mode = int(config.mode)
         self.band = max(1, int(config.raster_band or 1))
         self.search_radius_m = float(config.contour_search_radius_m or 0.0)
-        self._rasters: List[Tuple[object, Optional[QgsCoordinateTransform]]] = []
+        # (provider, transform, cell) — cell = (x_min, y_max, upp_x, upp_y)
+        # enables the per-cell memo in _sample_rasters.
+        self._rasters: List[Tuple[object, Optional[QgsCoordinateTransform],
+                                  Optional[Tuple[float, float, float, float]]]] = []
         for layer_id in config.raster_layer_ids:
             layer = project.mapLayer(layer_id)
             if not isinstance(layer, QgsRasterLayer) or not layer.isValid():
@@ -114,9 +118,27 @@ class DepthSnapshot:
                     transform = QgsCoordinateTransform(WGS84, layer.crs(), project)
                 except Exception:
                     continue
-            self._rasters.append((provider, transform))
+            cell = None
+            try:
+                extent = provider.extent()
+                x_size, y_size = int(provider.xSize()), int(provider.ySize())
+                if x_size > 0 and y_size > 0 and extent.width() > 0 \
+                        and extent.height() > 0:
+                    cell = (extent.xMinimum(), extent.yMaximum(),
+                            extent.width() / x_size, extent.height() / y_size)
+            except Exception:
+                cell = None
+            self._rasters.append((provider, transform, cell))
+        # Last sampled cell per raster: consecutive stations finer than the
+        # raster grid re-read the same cell, so memoising the previous cell
+        # removes up to ~95% of the GDAL round-trips at fine profile steps.
+        # Results are bit-identical: the key is the exact integer cell.
+        self._raster_last: List[Optional[Tuple[Tuple[int, int], object]]] = \
+            [None] * len(self._rasters)
+        self._raster_miss = object()
 
         self._contours: List[Tuple[QgsGeometry, float]] = []
+        self._contour_scaled_cache: Dict = {}
         self._contour_index: Optional[QgsSpatialIndex] = None
         self._contour_sources: List[Dict] = []
         self._contours_prepared = False
@@ -214,19 +236,9 @@ class DepthSnapshot:
         want_raster = self.mode in (0, 1)
         want_contours = self.mode in (0, 2)
         if want_raster:
-            for provider, transform in self._rasters:
-                sample_pt = point
-                if transform is not None:
-                    try:
-                        sample_pt = transform.transform(point)
-                    except Exception:
-                        continue
-                try:
-                    value, ok = provider.sample(sample_pt, self.band)
-                except Exception:
-                    continue
-                if ok and value is not None and value == value:
-                    return float(value)
+            value = self._sample_rasters(point)
+            if value is not None:
+                return value
         if want_contours and self._contours:
             # 0 = unlimited (DepthService semantics): scan every contour.
             if self.search_radius_m > 0 and self._contour_index is not None:
@@ -236,16 +248,15 @@ class DepthSnapshot:
                 candidates = range(len(self._contours))
             best = None
             best_dist = None
-            pt_geom = QgsGeometry.fromPointXY(point)
             for i in candidates:
                 geom, value = self._contours[i]
                 try:
-                    closest = geom.closestPoint(pt_geom) if hasattr(geom, "closestPoint") \
-                        else geom.nearestPoint(pt_geom)
-                    if closest is None or closest.isEmpty():
-                        continue
-                    dist = float(self._distance.measureLine(
-                        point, QgsPointXY(closest.asPoint())))
+                    # Isotropic-frame nearest point: the raw lon/lat
+                    # minimisation overstated distances by cos(latitude),
+                    # skewing which contour wins and the radius filter.
+                    nearest = ri.isotropic_nearest(
+                        point, geom, self._contour_scaled_cache)
+                    dist = float(self._distance.measureLine(point, nearest))
                 except Exception:
                     continue
                 if self.search_radius_m > 0 and dist > self.search_radius_m:
@@ -257,18 +268,33 @@ class DepthSnapshot:
         return None
 
     def _sample_rasters(self, point: QgsPointXY) -> Optional[float]:
-        for provider, transform in self._rasters:
+        for idx, (provider, transform, cell) in enumerate(self._rasters):
             sample_pt = point
             if transform is not None:
                 try:
                     sample_pt = transform.transform(point)
                 except Exception:
                     continue
+            key = None
+            if cell is not None:
+                x_min, y_max, upp_x, upp_y = cell
+                key = (int(math.floor((sample_pt.x() - x_min) / upp_x)),
+                       int(math.floor((y_max - sample_pt.y()) / upp_y)))
+                last = self._raster_last[idx]
+                if last is not None and last[0] == key:
+                    cached = last[1]
+                    if cached is self._raster_miss:
+                        continue
+                    return cached
             try:
                 value, ok = provider.sample(sample_pt, self.band)
             except Exception:
                 continue
-            if ok and value is not None and value == value:
+            good = ok and value is not None and value == value
+            if key is not None:
+                self._raster_last[idx] = (
+                    key, float(value) if good else self._raster_miss)
+            if good:
                 return float(value)
         return None
 
@@ -356,11 +382,21 @@ class DepthSnapshot:
         if index < len(crossings) and abs(crossings[index][0] - kp) <= 1e-9:
             # Multiple different contour values at exactly one KP are
             # geometrically ambiguous; report no data instead of inventing a
-            # vertical face or averaging incompatible sources.
-            values = [depth for cross_kp, depth in crossings
-                      if abs(cross_kp - kp) <= 1e-9]
-            return values[0] if values and all(abs(v - values[0]) <= 1e-8
-                                               for v in values) else None
+            # vertical face or averaging incompatible sources. The list is
+            # sorted, so only the bisect neighbourhood can match — a full
+            # scan here was O(crossings) per injected crossing station,
+            # i.e. quadratic over dense contour data.
+            values = [crossings[index][1]]
+            for j in range(index - 1, -1, -1):
+                if abs(crossings[j][0] - kp) > 1e-9:
+                    break
+                values.append(crossings[j][1])
+            for j in range(index + 1, len(crossings)):
+                if abs(crossings[j][0] - kp) > 1e-9:
+                    break
+                values.append(crossings[j][1])
+            return values[0] if all(abs(v - values[0]) <= 1e-8
+                                    for v in values) else None
         if index == 0 or index >= len(crossings):
             return None
         kp0, d0 = crossings[index - 1]
@@ -511,7 +547,14 @@ class DepthSnapshot:
         for share, offset_pts, out in ((2, port_pts, port),
                                        (3, stbd_pts, stbd)):
             if self.mode in (0, 1) and self._rasters:
+                base = (share - 1) * n
                 for i, pt in enumerate(offset_pts):
+                    if i % 500 == 0:
+                        # These two loops used to run up to 1M provider
+                        # samples with no cancel check and no progress.
+                        if cancel is not None and cancel():
+                            raise ri.AcquisitionCancelled()
+                        tick(base + i)
                     if pt is not None:
                         out[i] = self._sample_rasters(pt)
             if self.mode in (0, 2) and self._contours:
@@ -549,6 +592,7 @@ class DepthSnapshot:
         marks = list(stations_km)
         crossing_phase = (self.mode in (0, 2)
                           and self._crossing_route is not route)
+        added_crossings = False
         if self.mode in (0, 2):
             crossing_progress = None
             if progress is not None and crossing_phase:
@@ -558,8 +602,16 @@ class DepthSnapshot:
                 route, cancel, crossing_progress)
             if marks:
                 lo, hi = min(marks), max(marks)
-                marks.extend(kp for kp, _depth in crossings if lo <= kp <= hi)
-        marks = sorted(set(round(float(kp), 12) for kp in marks))
+                extra = [kp for kp, _depth in crossings if lo <= kp <= hi]
+                if extra:
+                    marks.extend(extra)
+                    added_crossings = True
+        if added_crossings:
+            marks = sorted(set(round(float(kp), 12) for kp in marks))
+        else:
+            # Stations arrive sorted and unique — re-sorting 500k floats
+            # per pass added nothing.
+            marks = [round(float(kp), 12) for kp in marks]
         out: List[Tuple[float, Optional[float]]] = []
         total = max(len(marks), 1)
         for index, kp in enumerate(marks):
@@ -589,6 +641,12 @@ class RuleWork:
     feats: Optional[Tuple[QgsSpatialIndex, Dict]] = None
     geom_type: object = None
     table_rows: Optional[List[Dict]] = None
+    # Thread-safe layer snapshots (QgsVectorLayerFeatureSource + CRS +
+    # transform context), captured cheaply on the main thread; the actual
+    # feature read + reprojection + spatial-index build happens in the
+    # worker, cancellable — it used to freeze the UI before the task began.
+    layer_snapshot: Optional[Dict] = None
+    table_snapshot: Optional[Dict] = None
     error: str = ""
 
 
@@ -678,6 +736,13 @@ def build_route_frame(lines_layer: QgsVectorLayer,
     geoms = [g for _, g in ordered]
     if not geoms:
         raise ri.RuleInputError("The route layer has no usable line geometry.")
+    from ..kp_geo_utils import crosses_antimeridian
+
+    if crosses_antimeridian(geoms):
+        raise ri.RuleInputError(
+            "The route crosses the ±180° antimeridian, which the analysis "
+            "geometry does not support — positions and intersections would "
+            "be silently wrong. Split or shift the route first.")
     distance = make_distance_area(WGS84, project.transformContext(), project=project)
     # KP chainage remains ellipsoidal, but section/event geometry must follow
     # the RPL's stored line segments exactly. Great-circle interpolation
@@ -703,6 +768,17 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
     inputs_by_id = {str(r.get("input_id")): r for r in inputs}
 
     depth = DepthSnapshot(depth_config, project) if depth_config.is_configured() else None
+
+    # The bathymetry fingerprint walks every configured layer (provider
+    # timestamps, mtimes, feature counts); compute it once per build, not
+    # once per threshold rule.
+    _depth_fp: List[Optional[str]] = [None]
+
+    def depth_fp() -> str:
+        if _depth_fp[0] is None:
+            _depth_fp[0] = map_layers.depth_config_fingerprint(
+                project, depth_config)
+        return _depth_fp[0]
 
     scope = params.scope
     work = AnalysisWork(
@@ -753,14 +829,12 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
                     else:
                         # WD-scaled corridors also depend on the bathymetry:
                         # changing it must invalidate this rule's cache.
-                        input_fp += "|" + map_layers.depth_config_fingerprint(
-                            project, depth_config)
+                        input_fp += "|" + depth_fp()
         elif rule_work.kind == wb_schema.RULE_KIND_THRESHOLD:
             if depth is None or not depth.is_available():
                 rule_work.error = "no bathymetry source configured"
             else:
-                input_fp = map_layers.depth_config_fingerprint(
-                    project, depth_config)
+                input_fp = depth_fp()
                 profile_kind = (rule_work.config.get("profile") or "depth").lower()
                 component = (rule_work.config.get("slope_component") or "long") \
                     if profile_kind == "slope" else "long"
@@ -782,27 +856,33 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
 
         rule_work.cache_key = generation.rule_cache_key(
             row, input_fp, scope, params.coarse_step_m, rpl_fp, params.direction,
-            profile_step_m=work.depth_step_m)
+            profile_step_m=work.depth_step_m,
+            refine_tol_m=params.refine_tol_m)
         cached = cache.get(rule_work.cache_key)
         if cached is not None and not rule_work.error:
             rule_work.cached = cached
         elif not rule_work.error and needs_layer and layer is not None:
-            if rule_work.kind == wb_schema.RULE_KIND_KP_TABLE:
-                expr, ctx = ri.filter_expression(
-                    rule_work.config.get("filter_expression", ""))
-                names = [f.name() for f in layer.fields()]
-                rows = []
-                for feat in layer.getFeatures():
-                    if expr is not None:
-                        ctx.setFeature(feat)
-                        if not bool(expr.evaluate(ctx)):
-                            continue
-                    rows.append({name: feat[name] for name in names})
-                rule_work.table_rows = rows
+            # Snapshot only (cheap): the feature read, reprojection and
+            # index build run inside the task with cancellation, instead of
+            # freezing the UI here for large constraint layers.
+            try:
+                snapshot = {
+                    "source": QgsVectorLayerFeatureSource(layer),
+                    "crs": layer.crs(),
+                    "feature_count": max(int(layer.featureCount()), 0),
+                    "transform_context": project.transformContext(),
+                }
+            except Exception as exc:
+                rule_work.error = f"input layer could not be snapshotted ({exc})"
             else:
-                index, feats = ri.load_features_wgs84(layer, project)
-                rule_work.feats = (index, feats)
-                rule_work.geom_type = layer.geometryType()
+                if rule_work.kind == wb_schema.RULE_KIND_KP_TABLE:
+                    snapshot["fields"] = [f.name() for f in layer.fields()]
+                    snapshot["filter"] = rule_work.config.get(
+                        "filter_expression", "")
+                    rule_work.table_snapshot = snapshot
+                else:
+                    rule_work.layer_snapshot = snapshot
+                    rule_work.geom_type = layer.geometryType()
         if rule_work.error:
             warnings.append(
                 f"Rule '{row.get('name') or rule_work.kind}': {rule_work.error} — skipped.")
@@ -811,7 +891,7 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
 
 
 # ---------------------------------------------------------------------------
-# Predicates for 1 m boundary refinement (§14.3)
+# Predicates for 0.1 m boundary refinement (§14.3)
 # ---------------------------------------------------------------------------
 
 def _profile_depth_lookup(
@@ -819,14 +899,19 @@ def _profile_depth_lookup(
         ) -> Optional[Callable[[float], Optional[float]]]:
     """Linear depth lookup over the already-sampled profile.
 
-    This keeps 1 m boundary refinement on the same immutable data used for
+    This keeps 0.1 m boundary refinement on the same immutable data used for
     acquisition and avoids returning to a raster provider for every bisection
     evaluation. Interpolation never bridges a no-data station.
     """
-    ordered = sorted((float(kp), None if value is None else abs(float(value)))
-                     for kp, value in samples)
+    ordered = [(float(kp), None if value is None else abs(float(value)))
+               for kp, value in samples]
     if not ordered:
         return None
+    if any(ordered[i][0] > ordered[i + 1][0]
+           for i in range(len(ordered) - 1)):
+        # Key on KP only: tied KPs would otherwise compare the Optional
+        # depth values, and None < float raises TypeError.
+        ordered.sort(key=lambda item: item[0])
     xs = [kp for kp, _value in ordered]
     values = [value for _kp, value in ordered]
 
@@ -983,6 +1068,7 @@ def _geometry_predicate(work: AnalysisWork, rule_work: RuleWork,
             max_buffer = max(max_buffer,
                              ri.feature_buffer_m(feat, buffer_field, buffer_m))
 
+    scaled_cache: Dict = {}  # isotropic-frame copies, shared across bisections
     def predicate(kp: float) -> bool:
         pt = route.point_at_kp(kp, clamp=True)
         if pt is None:
@@ -998,7 +1084,7 @@ def _geometry_predicate(work: AnalysisWork, rule_work: RuleWork,
                 if geom.contains(pt_geom):
                     return True
                 if corridor_m > 0 and ri.distance_to_geom_m(
-                        distance, pt, geom) <= corridor_m + 1e-6:
+                        distance, pt, geom, scaled_cache) <= corridor_m + 1e-6:
                     return True
             return False
         for fid in index.intersects(ri.search_rect(pt, max(max_buffer, 1.0))):
@@ -1008,7 +1094,8 @@ def _geometry_predicate(work: AnalysisWork, rule_work: RuleWork,
             fb = ri.feature_buffer_m(feat, buffer_field, buffer_m)
             if rule_work.geom_type == GEOMETRY_POLYGON and geom.contains(pt_geom):
                 return True
-            if ri.distance_to_geom_m(distance, pt, geom) <= fb + 1e-6:
+            if ri.distance_to_geom_m(distance, pt, geom,
+                                     scaled_cache) <= fb + 1e-6:
                 return True
         return False
 
@@ -1054,9 +1141,27 @@ class BurialAnalysisTask(QgsTask):
     def run(self) -> bool:  # noqa: C901 — one linear pipeline, clearer inline
         try:
             work = self.work
+
+            def rule_needs_bathy(rw: RuleWork) -> bool:
+                if rw.cached is not None or rw.error:
+                    return False
+                if rw.kind == wb_schema.RULE_KIND_POLYGON:
+                    return (rw.config.get("route_buffer_mode")
+                            or "").lower() == "wd"
+                if rw.kind != wb_schema.RULE_KIND_THRESHOLD:
+                    return False
+                profile_kind = (rw.config.get("profile") or "depth").lower()
+                component = (rw.config.get("slope_component") or "long") \
+                    if profile_kind == "slope" else "long"
+                # Cross/absolute slope reads the stored cross-profile
+                # arrays, not the live bathymetry sources.
+                return component not in (profile_data.SLOPE_COMPONENT_CROSS,
+                                         profile_data.SLOPE_COMPONENT_ABSOLUTE)
+
             total = max(len(work.rules), 1)
             if (work.depth_samples is None and work.depth is not None
-                    and work.depth.is_available()):
+                    and work.depth.is_available()
+                    and any(rule_needs_bathy(rw) for rw in work.rules)):
                 self.progressMessage.emit("Preparing bathymetry sources…")
                 if not work.depth.prepare(
                         cancel=self.isCanceled,
@@ -1210,6 +1315,37 @@ class BurialAnalysisTask(QgsTask):
                 abs_value=True)
         return intervals, nodata
 
+    def _materialise_rule_inputs(self, rule_work: RuleWork) -> None:
+        """Build the rule's feature index / table rows from its snapshot.
+
+        Runs on the worker thread with cooperative cancellation — the
+        loading used to happen in ``build_work`` and froze the UI for large
+        constraint layers before the progress bar even appeared.
+        """
+        snap = rule_work.layer_snapshot
+        if snap is not None and rule_work.feats is None:
+            name = rule_work.rule_row.get("name") or rule_work.kind
+            self.progressMessage.emit(f"Loading features: {name}")
+            index, feats = ri.load_features_wgs84_from_source(
+                snap["source"], snap["crs"], snap["transform_context"],
+                cancel=self.isCanceled,
+                feature_count=snap.get("feature_count", 0))
+            rule_work.feats = (index, feats)
+        table_snap = rule_work.table_snapshot
+        if table_snap is not None and rule_work.table_rows is None:
+            expr, ctx = ri.filter_expression(table_snap.get("filter", ""))
+            names = table_snap.get("fields") or []
+            rows: List[Dict] = []
+            for i, feat in enumerate(table_snap["source"].getFeatures()):
+                if i % 500 == 0 and self.isCanceled():
+                    raise ri.AcquisitionCancelled()
+                if expr is not None:
+                    ctx.setFeature(feat)
+                    if not bool(expr.evaluate(ctx)):
+                        continue
+                rows.append({name: feat[name] for name in names})
+            rule_work.table_rows = rows
+
     def _acquire(self, sampler: ri.RouteSampler, rule_work: RuleWork,
                  coarse_step_km: float, tol_km: float,
                  progress: Optional[Callable[[float], None]] = None
@@ -1220,6 +1356,7 @@ class BurialAnalysisTask(QgsTask):
         cancel = self.isCanceled
         nodata: List[Interval] = []
         predicate: Optional[Callable[[float], bool]] = None
+        self._materialise_rule_inputs(rule_work)
 
         def sample_progress(done: int, count: int) -> None:
             if progress is not None:
@@ -1298,8 +1435,12 @@ class BurialAnalysisTask(QgsTask):
         if predicate is not None and intervals:
             self.progressMessage.emit(
                 f"Refining boundaries: {rule_work.rule_row.get('name') or kind}")
-            intervals = generation.refine_intervals(
-                intervals, predicate, coarse_step_km, sampler.scope_domain, tol_km)
+            try:
+                intervals = generation.refine_intervals(
+                    intervals, predicate, coarse_step_km,
+                    sampler.scope_domain, tol_km, cancel=cancel)
+            except generation.RefinementCancelled:
+                raise ri.AcquisitionCancelled()
         return intervals, nodata
 
     # -- main thread ---------------------------------------------------------

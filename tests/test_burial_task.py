@@ -893,8 +893,14 @@ def test_profile_step_resolution_and_staleness() -> bool:
     model = PlanModel(object(), None)
     model.plan = {"plan_id": "p1", "scope_start_kp": 0.0, "scope_end_kp": 10.0,
                   "direction": 1, "method": "plough", "params_json": "{}"}
+    # The old fixed 1 m refinement value is upgraded on read so reopened
+    # plans receive the 0.1 m precision fix without a data migration.
+    model.plan["params_json"] = json.dumps({"refine_tol_m": 1.0})
+    ok = abs(model.gen_params().refine_tol_m
+             - generation.BOUNDARY_REFINE_TOL_M) < 1e-12
+    model.plan["params_json"] = "{}"
     # Auto with no rasters configured -> 5 m fallback (coarse step 50 allows it).
-    ok = abs(model.resolve_profile_step_m() - 5.0) < 1e-9
+    ok = ok and abs(model.resolve_profile_step_m() - 5.0) < 1e-9
     # Manual override wins.
     model.plan["params_json"] = json.dumps({"profile_step_m": 25.0})
     ok = ok and abs(model.resolve_profile_step_m() - 25.0) < 1e-9
@@ -1282,6 +1288,59 @@ def test_plan_layer_schema_heal() -> bool:
     return _result("plan layer schema heal: stale field map re-pointed", ok)
 
 
+def test_multi_plan_layer_switching() -> bool:
+    """Two plans in one store: the map follows the plan selector (only the
+    active plan's layers stay checked) and renaming a plan retires its
+    old-named layers instead of leaving stale duplicates."""
+    route, _da = _route()
+    project = QgsProject.instance()
+    tmp = tempfile.mkdtemp()
+    store = BurialStore(os.path.join(tmp, "multi.gpkg"))
+    store.migrate()
+    model = PlanModel(store)
+
+    def build(name):
+        plan_id = model.create_plan(name, "plough")
+        model.route = route  # load_plan clears it (no RPL in this store)
+        model.refresh_layers(immediate=True)
+        return plan_id
+
+    plan_a = build("Alpha")
+    plan_b = build("Beta")
+    group = map_layers.burial_group(project, create=False)
+    ok = group is not None
+
+    def node_for(plan):
+        base = (plan.get("name") or "plan", plan.get("rev_label") or "",
+                plan.get("plan_id") or "")
+        name = burial_schema.sections_layer_name(*base)
+        for node in group.findLayers():
+            if node.layer() is not None and node.layer().name() == name:
+                return node
+        return None
+
+    row_a, row_b = store.get_plan(plan_a), store.get_plan(plan_b)
+    ok = ok and node_for(row_a) is not None and node_for(row_b) is not None
+
+    map_layers.set_active_plan_layers(project, row_b)
+    ok = ok and not node_for(row_a).itemVisibilityChecked()
+    ok = ok and node_for(row_b).itemVisibilityChecked()
+    map_layers.set_active_plan_layers(project, row_a)
+    ok = ok and node_for(row_a).itemVisibilityChecked()
+    ok = ok and not node_for(row_b).itemVisibilityChecked()
+
+    # Rename the loaded plan (Beta): old-named layers must leave the
+    # project and the new-named ones must appear in their place.
+    ok = ok and model.update_plan({"name": "Beta renamed"}, reason="rename")
+    ok = ok and node_for(row_b) is None
+    renamed = store.get_plan(plan_b)
+    ok = ok and node_for(renamed) is not None
+
+    for plan in (row_a, renamed):
+        map_layers.remove_plan_layers(project, store.gpkg_path, plan)
+    return _result("multi-plan layer switching + rename retirement", ok)
+
+
 def test_burial_depth_config_is_manual_only() -> bool:
     class _Workbench:
         def rpl_depth_config(self, _rpl_id):
@@ -1333,6 +1392,7 @@ def run_all() -> list:
         test_risk_scan_interactions(),
         test_risk_scan_route_turns(),
         test_plan_layer_schema_heal(),
+        test_multi_plan_layer_switching(),
         test_burial_depth_config_is_manual_only(),
     ]
 

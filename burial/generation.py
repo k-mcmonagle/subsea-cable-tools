@@ -17,6 +17,7 @@ Spec anchors: generation algorithm (§12), invariants (§13), precision (§14.3)
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 from dataclasses import dataclass, field
@@ -26,6 +27,8 @@ from ..workbench import rules_engine as eng
 from ..workbench.rules_engine import Interval, Rule, RuleHit
 from . import events as ev
 from . import schema
+
+BOUNDARY_REFINE_TOL_M = 0.1
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -40,7 +43,7 @@ class GenParams:
     method: str = schema.METHOD_PLOUGH
     min_section_km: float = 0.0
     coarse_step_m: float = 50.0
-    refine_tol_m: float = 1.0
+    refine_tol_m: float = BOUNDARY_REFINE_TOL_M
     sliver_tol_km: float = 0.0
     cross_offset_m: float = 0.0     # 0 = auto (resolved profile step by model)
     profile_step_m: float = 0.0     # 0 = auto (bathymetry cell size)
@@ -177,12 +180,14 @@ def canonical_json(obj) -> str:
 
 def rule_cache_key(rule_row: Dict, input_fingerprint: str, scope: Interval,
                    step_m: float, rpl_fingerprint: str, direction: int,
-                   profile_step_m: Optional[float] = None) -> str:
+                   profile_step_m: Optional[float] = None,
+                   refine_tol_m: float = BOUNDARY_REFINE_TOL_M) -> str:
     """Cache key for one rule's acquisition (spec §14.4).
 
     Direction participates only when the rule's condition is direction-aware
     (signed slope); influence/extension buffers are resolution-time interval
-    ops and deliberately do not invalidate acquisition.
+    ops and deliberately do not invalidate acquisition. Boundary-refinement
+    tolerance does participate because refined intervals are cached.
     """
     config = rule_config(rule_row)
     acquisition_config = {
@@ -197,6 +202,7 @@ def rule_cache_key(rule_row: Dict, input_fingerprint: str, scope: Interval,
         "input_fingerprint": input_fingerprint or "",
         "scope": [round(scope.start_km, 6), round(scope.end_km, 6)],
         "step_m": float(step_m),
+        "refine_tol_m": float(refine_tol_m),
         "rpl_fingerprint": rpl_fingerprint or "",
     }
     # Burial threshold acquisition can use a denser persisted bathymetry
@@ -222,13 +228,14 @@ def rules_snapshot(rule_rows: Sequence[Dict]) -> str:
 
 
 def refine_boundary(predicate: Callable[[float], bool], inside_kp: float,
-                    outside_kp: float, tol_km: float = 0.001,
+                    outside_kp: float,
+                    tol_km: float = BOUNDARY_REFINE_TOL_M / 1000.0,
                     max_iter: int = 40) -> float:
     """Bisect the footprint boundary between an inside and an outside KP.
 
     ``predicate(kp)`` is True inside the rule's footprint. Returns the
-    boundary located to within ``tol_km`` (~6 evaluations for a 50 m step
-    at 1 m tolerance). The bracket must genuinely straddle the boundary;
+    boundary located to within ``tol_km`` (~9 evaluations for a 50 m step
+    at 0.1 m tolerance). The bracket must genuinely straddle the boundary;
     callers verify that before calling.
     """
     a, b = float(inside_kp), float(outside_kp)
@@ -243,18 +250,29 @@ def refine_boundary(predicate: Callable[[float], bool], inside_kp: float,
     return 0.5 * (a + b)
 
 
+class RefinementCancelled(Exception):
+    """Raised by ``refine_intervals`` when its cancel callback fires."""
+
+
 def refine_intervals(intervals: List[Interval], predicate: Callable[[float], bool],
                      coarse_step_km: float, domain: Interval,
-                     tol_km: float = 0.001) -> List[Interval]:
+                     tol_km: float = BOUNDARY_REFINE_TOL_M / 1000.0,
+                     cancel: Optional[Callable[[], bool]] = None
+                     ) -> List[Interval]:
     """Refine every interval boundary to ``tol_km`` by bisection.
 
     Each boundary is bracketed one coarse step outward from the interval and
     a bounded distance inward; if the predicate does not actually change
     across the bracket (e.g. the interval abuts the domain edge, or the
     condition is flat there) the boundary is left where acquisition put it.
+    ``cancel`` (checked per interval) raises ``RefinementCancelled`` so a
+    Stop pressed during refinement actually stops — a partially refined
+    rule must be discarded by the caller, never cached.
     """
     out: List[Interval] = []
     for iv in eng.normalize(intervals):
+        if cancel is not None and cancel():
+            raise RefinementCancelled()
         start, end = iv.start_km, iv.end_km
         inward = min(coarse_step_km, 0.5 * iv.length_km)
 
@@ -423,6 +441,29 @@ def _inside(kp: float, intervals: List[Interval]) -> bool:
     return any(iv.start_km + 1e-9 < kp < iv.end_km - 1e-9 for iv in intervals)
 
 
+class _InsideIndex:
+    """Bisect-backed 'strictly inside any interval' test.
+
+    Same semantics as ``_inside`` (strict interior with the 1e-9 guard)
+    without the per-query linear scan — event merges against noisy exclusion
+    stacks were O(events × intervals).
+    """
+
+    def __init__(self, intervals: List[Interval]):
+        ordered = sorted(intervals, key=lambda iv: (iv.start_km, iv.end_km))
+        self._starts = [iv.start_km for iv in ordered]
+        self._max_end: List[float] = []
+        running = float("-inf")
+        for iv in ordered:
+            running = max(running, iv.end_km)
+            self._max_end.append(running)
+
+    def __call__(self, kp: float) -> bool:
+        # inside ⇔ some interval has start + 1e-9 < kp and end - 1e-9 > kp.
+        index = bisect.bisect_left(self._starts, kp - 1e-9)
+        return index > 0 and self._max_end[index - 1] - 1e-9 > kp
+
+
 def merge_events(existing: List[Dict], generated: List[Dict],
                  excluded: List[Interval], direction: int, method: str = ""
                  ) -> Tuple[List[Dict], List[Dict], List[str]]:
@@ -445,12 +486,13 @@ def merge_events(existing: List[Dict], generated: List[Dict],
 
     conflicts: List[Dict] = []
     warnings: List[str] = []
+    inside_excluded = _InsideIndex(excluded)
     for event in kept:
         try:
             kp = float(event.get("kp"))
         except (TypeError, ValueError):
             continue
-        if _inside(kp, excluded):
+        if inside_excluded(kp):
             if event.get("status") != schema.EVENT_STATUS_CONFLICT:
                 event["status"] = schema.EVENT_STATUS_CONFLICT
             conflicts.append(event)
@@ -467,12 +509,28 @@ def merge_events(existing: List[Dict], generated: List[Dict],
                 "reset to candidate.")
 
     merged = list(kept)
+    kept_kps: Dict[str, List[float]] = {}
+    for event in kept:
+        # An event with a NULL/unparsable KP has no position: it must not
+        # register at 0.0 and suppress a generated boundary near KP 0.
+        try:
+            kept_kp = float(event.get("kp"))
+        except (TypeError, ValueError):
+            continue
+        kept_kps.setdefault(str(event.get("event_type") or ""),
+                            []).append(kept_kp)
+    for kps in kept_kps.values():
+        kps.sort()
     for gen in generated:
-        duplicate = any(
-            e.get("event_type") == gen.get("event_type")
-            and abs(float(e.get("kp") or 0.0) - float(gen.get("kp") or 0.0)) <= _MATCH_TOL_KM
-            for e in kept
-        )
+        kps = kept_kps.get(str(gen.get("event_type") or ""))
+        duplicate = False
+        if kps:
+            kp = float(gen.get("kp") or 0.0)
+            index = bisect.bisect_left(kps, kp)
+            duplicate = ((index < len(kps)
+                          and kps[index] - kp <= _MATCH_TOL_KM)
+                         or (index > 0
+                             and kp - kps[index - 1] <= _MATCH_TOL_KM))
         if not duplicate:
             merged.append(gen)
     return ev.sort_events(merged, direction), conflicts, warnings
@@ -483,16 +541,40 @@ def merge_events(existing: List[Dict], generated: List[Dict],
 # ---------------------------------------------------------------------------
 
 
+class _VerdictWindow:
+    """Bisect window over disjoint, KP-sorted verdicts.
+
+    Resolution verdicts partition the scope, so per-section overlap lookups
+    can bisect instead of scanning every verdict (sections × verdicts was
+    the residual main-thread quadratic after resolution).
+    """
+
+    def __init__(self, verdicts: List[eng.RangeVerdict]):
+        self.ordered = sorted(verdicts, key=lambda v: (v.start_km, v.end_km))
+        self._starts = [v.start_km for v in self.ordered]
+        self._ends = [v.end_km for v in self.ordered]
+
+    def overlapping(self, iv: Interval):
+        """(verdict, overlap_lo, overlap_hi) with overlap > 1e-9 km."""
+        index = bisect.bisect_right(self._ends, iv.start_km + 1e-9)
+        count = len(self.ordered)
+        while index < count and self._starts[index] < iv.end_km - 1e-9:
+            verdict = self.ordered[index]
+            lo = max(verdict.start_km, iv.start_km)
+            hi = min(verdict.end_km, iv.end_km)
+            if hi - lo > 1e-9:
+                yield verdict, lo, hi
+            index += 1
+
+
 def _reason_for_range(iv: Interval, excluded_verdicts: List[eng.RangeVerdict],
-                      rule_names: Dict[str, str]) -> Dict:
+                      rule_names: Dict[str, str],
+                      window: Optional[_VerdictWindow] = None) -> Dict:
     dominant: Dict[str, float] = {}
     fired: Dict[str, float] = {}
-    for verdict in excluded_verdicts:
-        overlap = eng.intersect_intervals(
-            [Interval(verdict.start_km, verdict.end_km)], [iv])
-        length = eng.interval_length_km(overlap)
-        if length <= 0:
-            continue
+    window = window or _VerdictWindow(excluded_verdicts)
+    for verdict, lo, hi in window.overlapping(iv):
+        length = hi - lo
         if verdict.dominant_rule_id:
             dominant[verdict.dominant_rule_id] = dominant.get(verdict.dominant_rule_id, 0.0) + length
         for rid in verdict.fired_rule_ids:
@@ -526,6 +608,8 @@ def build_sections(merged_events: List[Dict], params: GenParams,
     """
     scope = params.scope
     sections: List[Dict] = []
+    excluded_window = _VerdictWindow(excluded_verdicts)
+    screening_window = _VerdictWindow(screening_verdicts)
 
     prev_by_range: Dict[Tuple[str, float, float], Dict] = {}
     for section in previous_sections or []:
@@ -592,34 +676,30 @@ def build_sections(merged_events: List[Dict], params: GenParams,
         if end_event is None:
             reason["dangling_start"] = True
         exclusion_conflicts = []
-        for verdict in excluded_verdicts:
-            overlap = eng.intersect_intervals(
-                [Interval(verdict.start_km, verdict.end_km)], [iv])
-            if eng.interval_length_km(overlap) <= 1e-9:
-                continue
+        for verdict, lo, hi in excluded_window.overlapping(iv):
             names = [rule_names.get(rule_id, rule_id)
                      for rule_id in verdict.fired_rule_ids]
             exclusion_conflicts.append({
                 "rules": [name for name in names if name],
-                "start_kp": round(overlap[0].start_km, 6),
-                "end_kp": round(overlap[-1].end_km, 6),
+                "start_kp": round(lo, 6),
+                "end_kp": round(hi, 6),
             })
         if exclusion_conflicts:
             # This normally appears only after a deliberate manual event edit
             # merges burial candidates across an excluded range.
             reason["exclusion_conflicts"] = exclusion_conflicts
         annotations = []
-        for verdict in screening_verdicts:
-            overlap = eng.intersect_intervals(
-                [Interval(verdict.start_km, verdict.end_km)], [iv])
-            if eng.interval_length_km(overlap) > 0:
-                for rid in verdict.fired_rule_ids:
-                    name = rule_names.get(rid, rid)
-                    entry = {"rule_id": rid, "rule": name,
-                             "start_kp": round(overlap[0].start_km, 6),
-                             "end_kp": round(overlap[-1].end_km, 6)}
-                    if entry not in annotations:
-                        annotations.append(entry)
+        seen_annotations = set()
+        for verdict, lo, hi in screening_window.overlapping(iv):
+            for rid in verdict.fired_rule_ids:
+                entry_key = (rid, round(lo, 6), round(hi, 6))
+                if entry_key in seen_annotations:
+                    continue
+                seen_annotations.add(entry_key)
+                annotations.append({"rule_id": rid,
+                                    "rule": rule_names.get(rid, rid),
+                                    "start_kp": entry_key[1],
+                                    "end_kp": entry_key[2]})
         if annotations:
             reason["screening"] = annotations
 
@@ -654,7 +734,8 @@ def build_sections(merged_events: List[Dict], params: GenParams,
 
     for iv in skip_ranges:
         row = base_row(schema.SECTION_SKIP, iv.start_km, iv.end_km)
-        reason = _reason_for_range(iv, excluded_verdicts, rule_names)
+        reason = _reason_for_range(iv, excluded_verdicts, rule_names,
+                                   window=excluded_window)
         below_min = any(
             eng.interval_length_km(eng.intersect_intervals([d], [iv])) > 1e-9
             for d in dropped_short
@@ -771,16 +852,22 @@ def generate(params: GenParams, acquisitions: Sequence[RuleAcquisition],
              proposal_events: Optional[List[Dict]] = None,
              plan_id: str = "", generation_id: str = "",
              id_fn: Callable[[], str] = schema.new_id,
-             depth_at: Optional[Callable[[float], Optional[float]]] = None
+             depth_at: Optional[Callable[[float], Optional[float]]] = None,
+             resolution: Optional[Tuple] = None
              ) -> GenerationOutput:
     # ``depth_at`` feeds WD-scaled Exclusion Area extensions at resolution
     # time; it falls back to ``depth_fn`` (the event-stamping depth source).
     """Run the §12 pipeline over already-acquired rule intervals.
 
-    ``predicates`` (per rule_id, True inside the footprint) enable 1 m
+    ``predicates`` (per rule_id, True inside the footprint) enable 0.1 m
     boundary refinement; rules without a predicate keep their acquired
     boundaries. ``position_fn(kp) -> (lat, lon)`` and ``depth_fn(kp)`` stamp
     the emitted events; omitted (e.g. in pure tests) they stamp None.
+
+    ``resolution`` accepts a precomputed ``resolve_stack`` result for
+    exactly these acquisitions (only honoured when no refinement predicates
+    are supplied) — the dock resolves once for the fire bars and reuses it
+    here instead of paying the full resolution twice per Generate.
     """
     out = GenerationOutput()
     scope = params.scope
@@ -797,9 +884,13 @@ def generate(params: GenParams, acquisitions: Sequence[RuleAcquisition],
                                          scope, tol_km)
         refined.append(RuleAcquisition(acq.rule_row, footprint, acq.nodata, acq.error))
 
-    # 3. Resolve the stack.
-    result, influence, nodata, warnings = resolve_stack(
-        params, refined, depth_at=depth_at or depth_fn)
+    # 3. Resolve the stack (or reuse the caller's identical resolution).
+    if resolution is not None and not predicates:
+        result, influence, nodata, warnings = resolution
+        warnings = list(warnings)
+    else:
+        result, influence, nodata, warnings = resolve_stack(
+            params, refined, depth_at=depth_at or depth_fn)
     out.warnings.extend(warnings)
     verdicts = result.per_method.get(params.method, [])
     out.excluded = [v for v in verdicts if v.status == eng.STATUS_EXCLUDED]

@@ -122,13 +122,48 @@ def load_dxf_outline(dxf_path: str, scale: float = 1.0,
 # ---------------------------------------------------------------------------
 
 
+# CRS/transform construction hits PROJ's database — far too expensive to
+# repeat per profile-hover. The UTM zone only changes when the hover crosses
+# a 6° boundary, so cache by EPSG code and (epsg, target authid) pair.
+_crs_cache: Dict[int, QgsCoordinateReferenceSystem] = {}
+_transform_cache: Dict = {}
+
+
 def utm_crs_for(point_wgs84: QgsPointXY) -> QgsCoordinateReferenceSystem:
     """Metre-true working CRS at a WGS84 point (the Dynamic Buffer pattern):
     the local UTM zone, EPSG:326xx north / 327xx south."""
     zone = min(60, max(1, int((float(point_wgs84.x()) + 180.0) / 6.0) + 1))
     epsg = (32600 if float(point_wgs84.y()) >= 0.0 else 32700) + zone
-    crs = QgsCoordinateReferenceSystem(f"EPSG:{epsg}")
-    return crs if crs.isValid() else QgsCoordinateReferenceSystem("EPSG:3857")
+    crs = _crs_cache.get(epsg)
+    if crs is None:
+        crs = QgsCoordinateReferenceSystem(f"EPSG:{epsg}")
+        if not crs.isValid():
+            crs = QgsCoordinateReferenceSystem("EPSG:3857")
+        _crs_cache[epsg] = crs
+    return crs
+
+
+def _cached_transform(source: QgsCoordinateReferenceSystem,
+                      target: QgsCoordinateReferenceSystem,
+                      context, cacheable: bool = True
+                      ) -> QgsCoordinateTransform:
+    """PROJ transform, cached per CRS pair for the default-context path.
+
+    Only the project-default context is cached: keying on ``id(context)``
+    never hit for the per-call temporary the default path creates, and a
+    garbage-collected temporary's id can be recycled for a different
+    context, aliasing a transform built with stale datum settings.
+    """
+    if not cacheable:
+        return QgsCoordinateTransform(source, target, context)
+    key = (source.authid(), target.authid())
+    transform = _transform_cache.get(key)
+    if transform is None:
+        transform = QgsCoordinateTransform(source, target, context)
+        if len(_transform_cache) > 64:
+            _transform_cache.clear()
+        _transform_cache[key] = transform
+    return transform
 
 
 def place_outline(outline: QgsGeometry, route, kp_km: float,
@@ -159,15 +194,21 @@ def place_outline(outline: QgsGeometry, route, kp_km: float,
     if p_before is None or p_after is None:
         return None, None
 
+    cacheable = transform_context is None
     context = transform_context or QgsProject.instance().transformContext()
     working = utm_crs_for(anchor)
     wgs84 = QgsCoordinateReferenceSystem(WGS84)
-    to_working = QgsCoordinateTransform(wgs84, working, context)
+    to_working = _cached_transform(wgs84, working, context, cacheable)
     try:
         anchor_w = to_working.transform(anchor)
         before_w = to_working.transform(p_before)
         after_w = to_working.transform(p_after)
     except Exception:
+        return None, None
+    if (abs(before_w.x() - after_w.x()) < 1e-9
+            and abs(before_w.y() - after_w.y()) < 1e-9):
+        # Degenerate heading step (route shorter than the step): placing
+        # the outline due north here would be silently wrong.
         return None, None
     heading = geometry2d.grid_heading_deg(
         (before_w.x(), before_w.y()), (after_w.x(), after_w.y()))
@@ -187,7 +228,8 @@ def place_outline(outline: QgsGeometry, route, kp_km: float,
     out_crs = target_crs or wgs84
     if out_crs != working:
         try:
-            geom.transform(QgsCoordinateTransform(working, out_crs, context))
+            geom.transform(_cached_transform(working, out_crs, context,
+                                             cacheable))
         except Exception:
             return None, None
     return geom, heading

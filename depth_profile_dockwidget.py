@@ -724,10 +724,10 @@ class DepthProfileDockWidget(QDockWidget):
                 try:
                     total += float(da.measureLength(g))
                 except Exception:
-                    try:
-                        total += float(g.length())
-                    except Exception:
-                        continue
+                    # No planar fallback: on a geographic layer g.length()
+                    # is DEGREES and would silently report a route length
+                    # off by ~10^5. Skipping the part is the honest answer.
+                    continue
             return total if total > 0 else None
         except Exception:
             return None

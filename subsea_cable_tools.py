@@ -661,6 +661,7 @@ class SubseaCableTools:
                 return
             self.burial_dock = BurialPlannerDock(self.iface)
             self.iface.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.burial_dock)
+            self.burial_dock.apply_saved_window_mode()
         self.burial_dock.show()
         self.burial_dock.refresh()
 

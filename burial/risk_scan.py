@@ -45,6 +45,7 @@ from qgis.core import (
 from qgis.PyQt.QtCore import pyqtSignal
 
 from ..qgis_compat import GEOMETRY_LINE, GEOMETRY_POINT, GEOMETRY_POLYGON
+from ..workbench import rules_inputs as ri
 from ..workbench.rules_inputs import _filter_expression, _load_features_wgs84
 from ..workbench.rules_engine import Interval
 from . import risk, schema
@@ -85,11 +86,17 @@ def check_kind(config: Dict) -> str:
 
 
 def _expanded_rect(rect: QgsRectangle, radius_m: float) -> QgsRectangle:
-    """The WGS84 rectangle grown by ``radius_m`` (conservative)."""
+    """The WGS84 rectangle grown by ``radius_m`` (conservative).
+
+    Longitude degrees shrink towards the poles, so the metre→degree
+    conversion must use the *poleward-most* latitude of the box — a route
+    box spanning 40–70°N converted at its centre latitude was ~1.7× too
+    narrow at its northern end and silently dropped true hazards there.
+    """
     radius = max(float(radius_m), 1.0)
     deg_lat = radius / 110540.0 + 1e-6
-    centre_lat = (rect.yMinimum() + rect.yMaximum()) / 2.0
-    cos_lat = max(math.cos(math.radians(centre_lat)), 0.087)
+    extreme_lat = max(abs(rect.yMinimum()), abs(rect.yMaximum()))
+    cos_lat = max(math.cos(math.radians(extreme_lat)), 0.087)
     deg_lon = radius / (111320.0 * cos_lat) + 1e-6
     return QgsRectangle(rect.xMinimum() - deg_lon, rect.yMinimum() - deg_lat,
                         rect.xMaximum() + deg_lon, rect.yMaximum() + deg_lat)
@@ -156,11 +163,33 @@ def _geometry_parts(geom: QgsGeometry) -> List[QgsGeometry]:
 
 def _dedupe_points(points: List[QgsPointXY], tol_deg: float = 1e-7
                    ) -> List[QgsPointXY]:
+    """Order-preserving dedupe within ``tol_deg`` (grid-bucketed).
+
+    The old all-pairs scan was O(k²) — a line running along the route can
+    yield thousands of intersection vertices.
+    """
     unique: List[QgsPointXY] = []
+    buckets: Dict[Tuple[int, int], List[QgsPointXY]] = {}
+    inv = 1.0 / tol_deg
     for point in points:
-        if all(abs(point.x() - u.x()) > tol_deg
-               or abs(point.y() - u.y()) > tol_deg for u in unique):
-            unique.append(point)
+        cell_x = int(math.floor(point.x() * inv))
+        cell_y = int(math.floor(point.y() * inv))
+        duplicate = False
+        for nx in (cell_x - 1, cell_x, cell_x + 1):
+            for ny in (cell_y - 1, cell_y, cell_y + 1):
+                for u in buckets.get((nx, ny), ()):
+                    if abs(point.x() - u.x()) <= tol_deg \
+                            and abs(point.y() - u.y()) <= tol_deg:
+                        duplicate = True
+                        break
+                if duplicate:
+                    break
+            if duplicate:
+                break
+        if duplicate:
+            continue
+        unique.append(point)
+        buckets.setdefault((cell_x, cell_y), []).append(point)
     return unique
 
 
@@ -179,22 +208,43 @@ def _crossing_points(feat_geom: QgsGeometry, route_geom: QgsGeometry
 
 
 def _nearest_approach(route, route_geom: QgsGeometry, feat_geom: QgsGeometry,
-                      distance) -> Optional[Tuple[float, float,
-                                                  QgsPointXY, QgsPointXY]]:
-    """(kp_km, offset_m, route point, feature point) when not crossing."""
+                      distance, scaled_cache: Optional[Dict] = None
+                      ) -> Optional[Tuple[float, float,
+                                          QgsPointXY, QgsPointXY]]:
+    """(kp_km, offset_m, route point, feature point) when not crossing.
+
+    Both nearest-point hops minimise in a locally-isotropic frame
+    (``rules_inputs.isotropic_nearest``): raw lon/lat minimisation is biased
+    by cos(latitude) and overstated ``offset_m`` — hazards genuinely inside
+    a proximity band could be reported outside it.
+    """
+    best: Optional[Tuple[float, QgsPointXY, QgsPointXY]] = None
     try:
-        on_route = route_geom.nearestPoint(feat_geom)
-        route_pt = QgsPointXY(on_route.asPoint())
+        # Seed from the planar geometry-to-geometry nearest pair (global,
+        # but cos(latitude)-biased), then refine with isotropic-frame
+        # alternation; keep whichever pair measures geodesically shorter.
+        seed_route = QgsPointXY(route_geom.nearestPoint(feat_geom).asPoint())
+        candidates = [seed_route]
     except Exception:
+        candidates = []
+    for route_pt in candidates:
+        try:
+            for _hop in range(2):
+                feat_pt = ri.isotropic_nearest(route_pt, feat_geom,
+                                               scaled_cache)
+                route_pt = ri.isotropic_nearest(feat_pt, route_geom,
+                                                scaled_cache)
+            feat_pt = ri.isotropic_nearest(route_pt, feat_geom, scaled_cache)
+            offset = float(distance.measureLine(route_pt, feat_pt))
+        except Exception:
+            continue
+        if best is None or offset < best[0]:
+            best = (offset, route_pt, feat_pt)
+    if best is None:
         return None
+    offset, route_pt, feat_pt = best
     hit = route.kp_at_point(route_pt)
     if hit.snapped_xy is None:
-        return None
-    try:
-        on_feat = feat_geom.nearestPoint(QgsGeometry.fromPointXY(route_pt))
-        feat_pt = QgsPointXY(on_feat.asPoint())
-        offset = float(distance.measureLine(route_pt, feat_pt))
-    except Exception:
         return None
     return hit.kp_km, offset, route_pt, feat_pt
 
@@ -205,14 +255,18 @@ def _nearest_approach(route, route_geom: QgsGeometry, feat_geom: QgsGeometry,
 
 
 def snapshot_check_features(check_row: Dict, layer, route_geom: QgsGeometry,
-                            project: Optional[QgsProject] = None
-                            ) -> List[Dict]:
+                            project: Optional[QgsProject] = None,
+                            preloaded=None) -> List[Dict]:
     """Thread-safe snapshot of a check's candidate features (main thread).
 
     Applies the feature filter, pre-filters with a spatial index over the
     route's search-expanded bounding box, and clones each candidate's WGS84
     geometry plus the attributes the check uses. The result is safe to hand
     to a worker thread.
+
+    ``preloaded`` accepts an ``(index, feats)`` pair from
+    ``rules_inputs.load_features_wgs84`` so several checks over the same
+    layer load and index it once instead of once per check.
     """
     config = risk.check_config(check_row)
     check_name = check_row.get("name") or "check"
@@ -225,7 +279,10 @@ def snapshot_check_features(check_row: Dict, layer, route_geom: QgsGeometry,
             f"Check '{check_name}': the input layer could not be opened.")
     project = project or QgsProject.instance()
 
-    index, feats = _load_features_wgs84(layer, project)
+    if preloaded is not None:
+        index, feats = preloaded
+    else:
+        index, feats = _load_features_wgs84(layer, project)
     expr, ctx = _filter_expression(config.get("filter_expression", ""))
     label_attribute = (config.get("label_attribute") or "").strip()
     risk_attribute = (config.get("attribute") or "").strip()
@@ -276,16 +333,24 @@ def scan_snapshot(plan_id: str, check_row: Dict, features: List[Dict],
                   route, distance, scope: Optional[Interval] = None,
                   direction: int = 1,
                   progress: Optional[Callable[[str], None]] = None,
-                  cancel: Optional[Callable[[], bool]] = None
+                  cancel: Optional[Callable[[], bool]] = None,
+                  route_geom: Optional[QgsGeometry] = None
                   ) -> Tuple[List[Dict], List[str]]:
-    """Run one features check over snapshotted features (thread-safe)."""
+    """Run one features check over snapshotted features (thread-safe).
+
+    ``route_geom`` (a collected copy of the route geometries) can be shared
+    across checks by the caller — rebuilding it per check re-cloned the
+    whole route each time.
+    """
     config = risk.check_config(check_row)
     check_id = str(check_row.get("check_id") or "")
     check_name = check_row.get("name") or "check"
     search_m = float(config.get("distance_m") or 0.0)
+    scaled_cache: Dict = {}
 
-    route_geom = QgsGeometry.collectGeometry(
-        [QgsGeometry(g) for g in route.geometries])
+    if route_geom is None:
+        route_geom = QgsGeometry.collectGeometry(
+            [QgsGeometry(g) for g in route.geometries])
     scope_lo = scope_hi = None
     if scope is not None:
         scope_lo = min(scope.start_km, scope.end_km)
@@ -359,7 +424,8 @@ def scan_snapshot(plan_id: str, check_row: Dict, features: List[Dict],
                     add(entry, part, hit.kp_km, None, 0.0, True, angle,
                         point.y(), point.x())
                 continue
-            near = _nearest_approach(route, route_geom, geom, distance)
+            near = _nearest_approach(route, route_geom, geom, distance,
+                                     scaled_cache)
             if near is not None and near[1] <= search_m:
                 kp, offset, route_pt, feat_pt = near
                 sign = _side_sign(route, distance, kp, route_pt, feat_pt,
@@ -397,7 +463,8 @@ def scan_snapshot(plan_id: str, check_row: Dict, features: List[Dict],
                         mid.y() if mid else None, mid.x() if mid else None)
                     emitted += 1
                 continue
-            near = _nearest_approach(route, route_geom, geom, distance)
+            near = _nearest_approach(route, route_geom, geom, distance,
+                                     scaled_cache)
             if near is not None and near[1] <= search_m:
                 kp, offset, route_pt, feat_pt = near
                 sign = _side_sign(route, distance, kp, route_pt, feat_pt,
@@ -430,7 +497,8 @@ def _route_vertices(route) -> List[QgsPointXY]:
 
 
 def scan_route_turns(plan_id: str, check_row: Dict, route, distance,
-                     scope: Optional[Interval] = None, direction: int = 1
+                     scope: Optional[Interval] = None, direction: int = 1,
+                     cancel: Optional[Callable[[], bool]] = None
                      ) -> Tuple[List[Dict], List[str]]:
     """Alter-course scan over the route geometry (thread-safe).
 
@@ -456,11 +524,18 @@ def scan_route_turns(plan_id: str, check_row: Dict, route, distance,
     hazards: List[Dict] = []
     warnings: List[str] = []
     cumulative_m = 0.0
+    next_seg_m: Optional[float] = None  # measured once, reused next loop
     for i in range(1, len(points)):
-        try:
-            seg_m = float(distance.measureLine(points[i - 1], points[i]))
-        except Exception:
-            seg_m = 0.0
+        if cancel is not None and i % 2000 == 0 and cancel():
+            return hazards, warnings
+        if next_seg_m is None:
+            try:
+                seg_m = float(distance.measureLine(points[i - 1], points[i]))
+            except Exception:
+                seg_m = 0.0
+        else:
+            seg_m = next_seg_m
+        next_seg_m = None
         if seg_m <= 0.0:
             continue
         cumulative_m += seg_m
@@ -468,7 +543,8 @@ def scan_route_turns(plan_id: str, check_row: Dict, route, distance,
             break
         p_prev, p_curr, p_next = points[i - 1], points[i], points[i + 1]
         try:
-            if float(distance.measureLine(p_curr, p_next)) <= 0.0:
+            next_seg_m = float(distance.measureLine(p_curr, p_next))
+            if next_seg_m <= 0.0:
                 continue
             b1 = math.degrees(distance.bearing(p_prev, p_curr))
             b2 = math.degrees(distance.bearing(p_curr, p_next))
@@ -559,8 +635,14 @@ class RiskScanTask(QgsTask):
             from ..kp_range_utils import make_distance_area
 
             distance = make_distance_area(WGS84, self._transform_context)
+            # follow_stored_geometry matches the Burial Planner analysis
+            # (build_route_frame): hazards and plan events must map the same
+            # KP to the same physical position on the stored RPL line.
             route = RouteFrame.from_source(
-                [QgsGeometry(g) for g in self._route_geoms], distance)
+                [QgsGeometry(g) for g in self._route_geoms], distance,
+                follow_stored_geometry=True)
+            route_geom = QgsGeometry.collectGeometry(
+                [QgsGeometry(g) for g in route.geometries])
             total = max(len(self.jobs), 1)
             for i, (check_row, features) in enumerate(self.jobs):
                 if self.isCanceled():
@@ -572,26 +654,56 @@ class RiskScanTask(QgsTask):
                 if check_kind(config) == CHECK_KIND_ROUTE_TURNS:
                     found, warnings = scan_route_turns(
                         self.plan_id, check_row, route, distance,
-                        scope=self.scope, direction=self.direction)
+                        scope=self.scope, direction=self.direction,
+                        cancel=self.isCanceled)
                 else:
                     found, warnings = scan_snapshot(
                         self.plan_id, check_row, features or [], route,
                         distance, scope=self.scope, direction=self.direction,
                         progress=self.progressMessage.emit,
-                        cancel=self.isCanceled)
-                    if self.isCanceled():
-                        self.cancelled = True
-                        return False
+                        cancel=self.isCanceled, route_geom=route_geom)
+                if self.isCanceled():
+                    self.cancelled = True
+                    return False
                 self.hazards.extend(found)
                 self.warnings.extend(warnings)
                 self.run_check_ids.append(str(check_row.get("check_id") or ""))
                 self.setProgress(100.0 * (i + 1) / total)
             return True
-        except Exception as exc:  # surfaced via self.error on the main thread
-            self.error = str(exc)
+        except Exception:  # surfaced via self.error on the main thread
+            import traceback
+
+            self.error = traceback.format_exc(limit=3).strip().splitlines()[-1]
+            try:
+                from qgis.core import QgsMessageLog
+
+                from ..qgis_compat import MESSAGE_CRITICAL
+
+                QgsMessageLog.logMessage(
+                    "Risk scan failed\n" + traceback.format_exc(),
+                    "Burial Planner", MESSAGE_CRITICAL)
+            except Exception:
+                pass
             return False
 
     def finished(self, _ok: bool) -> None:
         if self.isCanceled():
             self.cancelled = True
-        self._on_finished(self)
+        try:
+            self._on_finished(self)
+        except Exception:
+            # Never crash QGIS from a completion callback; without this the
+            # Run button stayed disabled forever after a handler error.
+            try:
+                import traceback
+
+                from qgis.core import QgsMessageLog
+
+                from ..qgis_compat import MESSAGE_CRITICAL
+
+                QgsMessageLog.logMessage(
+                    "Risk scan completion handler failed\n"
+                    + traceback.format_exc(), "Burial Planner",
+                    MESSAGE_CRITICAL)
+            except Exception:
+                pass

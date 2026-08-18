@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 from typing import Dict, List, Optional
 
-from qgis.PyQt.QtCore import QSettings, Qt
+from qgis.PyQt.QtCore import QSettings, Qt, QTimer
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
@@ -55,6 +55,7 @@ from ...qgis_compat import (
     MESSAGE_BOX_NO,
     MESSAGE_BOX_YES,
     SELECTION_BEHAVIOR_SELECT_ROWS,
+    SELECTION_MODE_EXTENDED,
     SELECTION_MODE_SINGLE,
     TOOLBUTTON_POPUP_MODE_INSTANT,
     qt_exec,
@@ -63,6 +64,7 @@ from ...workbench import schema as wb_schema
 from ...workbench.kp_bars import ACTION_COLORS, FireBarDelegate, VerdictStrip
 from ...workbench.rules_engine import STATUS_EXCLUDED, STATUS_RISK
 from .. import change_log, generation, profile_data, schema
+from .. import ui_helpers
 
 FIRE_COL = 2
 
@@ -126,6 +128,27 @@ def verdict_row_values(verdict, rule_names: Dict[str, str]) -> List[str]:
         dominant,
         ", ".join(n for n in names if n),
     ]
+
+
+def _parse_scope_strict(text: str):
+    """(ranges, malformed_chunks) — so typos are reported, not dropped."""
+    ranges: List[Dict] = []
+    bad: List[str] = []
+    for chunk in (text or "").replace(";", ",").split(","):
+        raw = chunk.strip()
+        chunk = raw.replace("–", "-").replace("..", "-")
+        if not chunk:
+            continue
+        parts = chunk.split("-")
+        if len(parts) == 2:
+            try:
+                ranges.append({"start_kp": float(parts[0]),
+                               "end_kp": float(parts[1])})
+                continue
+            except ValueError:
+                pass
+        bad.append(raw)
+    return ranges, bad
 
 
 def _parse_scope(text: str) -> List[Dict]:
@@ -238,7 +261,7 @@ class RuleEditorDialog(QDialog):
             "water-depth multiple scales with the depth at the footprint "
             "boundary (e.g. 1.0 ×WD = one water depth each time).")
         extend_note.setWordWrap(True)
-        extend_note.setStyleSheet("color: #666;")
+        extend_note.setStyleSheet(ui_helpers.hint_style())
         zone_form.addRow(extend_note)
         self._sync_extension()
         self.influence_before = QDoubleSpinBox()
@@ -267,10 +290,49 @@ class RuleEditorDialog(QDialog):
 
         buttons = QDialogButtonBox()
         buttons.setStandardButtons(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
-        buttons.accepted.connect(self.accept)
+        buttons.accepted.connect(self._accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
         self._sync_class()
+
+    def _accept(self) -> None:
+        """Reject malformed KP ranges / band values instead of dropping them."""
+        _ranges, bad = _parse_scope_strict(self.scope_edit.text())
+        if bad:
+            QMessageBox.warning(
+                self, "Burial Planner",
+                "These 'Applies to KP' entries are not valid ranges and "
+                "would be ignored: " + ", ".join(bad[:5])
+                + ". Use start-end pairs like 12.0-45.0.")
+            return
+        if hasattr(self, "ranges_edit"):
+            _ranges, bad = _parse_scope_strict(self.ranges_edit.text())
+            if bad:
+                QMessageBox.warning(
+                    self, "Burial Planner",
+                    "These KP ranges are not valid and would be ignored: "
+                    + ", ".join(bad[:5])
+                    + ". Use start-end pairs like 12.000-13.500.")
+                return
+        if hasattr(self, "bands_table"):
+            bad_cells = []
+            for row in range(self.bands_table.rowCount()):
+                for column, _key in enumerate(self._BAND_COLUMN_KEYS):
+                    item = self.bands_table.item(row, column)
+                    text = (item.text() if item is not None else "").strip()
+                    if not text:
+                        continue
+                    try:
+                        float(text.replace(",", "."))
+                    except ValueError:
+                        bad_cells.append(f"band {row + 1}: '{text}'")
+            if bad_cells:
+                QMessageBox.warning(
+                    self, "Burial Planner",
+                    "These WD-band values are not numbers and would be "
+                    "ignored: " + ", ".join(bad_cells[:5]) + ".")
+                return
+        self.accept()
 
     def _sync_corridor(self) -> None:
         mode = self.corridor_combo.currentData() or ""
@@ -291,10 +353,11 @@ class RuleEditorDialog(QDialog):
         value = self.class_combo.currentData()
         if value == schema.CRITERION_SCREENING:
             self.class_note.setText("Flags for assessment — does not exclude.")
-            self.class_note.setStyleSheet("color: #b36b00;")
+            self.class_note.setStyleSheet(
+                f"color: {ui_helpers.color('warn')};")
         else:
             self.class_note.setText("Acts as an Exclusion Area.")
-            self.class_note.setStyleSheet("color: #666;")
+            self.class_note.setStyleSheet(ui_helpers.hint_style())
 
     # -- kind forms -----------------------------------------------------------
     def _input_combo(self, roles: Optional[List[str]] = None) -> QComboBox:
@@ -331,9 +394,11 @@ class RuleEditorDialog(QDialog):
             self.distance_spin.setSuffix(" m")
             self.distance_spin.setValue(float(config.get("distance_m") or 0.0))
             self.distance_spin.setToolTip(
-                "Measured from the route centreline to the feature, so it "
-                "applies each side of the route — the full search corridor "
-                "is twice this value.")
+                "Shortest spatial distance from each route position to the "
+                "feature. For a line, 500 m means a 500 m perpendicular "
+                "buffer around it; the resulting KP length may be slightly "
+                "more than 1,000 m at an oblique crossing or on a curved "
+                "route.")
             form.addRow("Within distance (each side of route):",
                         self.distance_spin)
             self.buffer_field_edit = QLineEdit(config.get("buffer_field") or "")
@@ -384,7 +449,7 @@ class RuleEditorDialog(QDialog):
             "contour depths are linearly interpolated between their actual "
             "route crossings.")
         note.setWordWrap(True)
-        note.setStyleSheet("color: #666;")
+        note.setStyleSheet(ui_helpers.hint_style())
         form.addRow(note)
         self._sync_depth()
 
@@ -426,7 +491,7 @@ class RuleEditorDialog(QDialog):
         form.addRow(self.signed_check)
         self.slope_note = QLabel("")
         self.slope_note.setWordWrap(True)
-        self.slope_note.setStyleSheet("color: #666;")
+        self.slope_note.setStyleSheet(ui_helpers.hint_style())
         form.addRow(self.slope_note)
         self.slope_window_spin = QDoubleSpinBox()
         self.slope_window_spin.setRange(0.0, 1000.0)
@@ -550,7 +615,7 @@ class RuleEditorDialog(QDialog):
                 if not text:
                     continue
                 try:
-                    band[key] = float(text)
+                    band[key] = float(text.replace(",", "."))
                 except ValueError:
                     continue
             if band:
@@ -795,8 +860,16 @@ class RulesTab(QWidget):
         self.model = model
         self.dock = dock
         self._loading = False
+        self._loaded_plan_id: Optional[str] = None
+        self._params_dirty = False  # unapplied Sample-step/Sliver edits
         self._last_results: Dict[str, List] = {}   # rule_id -> [(s, e), ...]
         self._last_verdicts: List = []
+        # Debounce enable-checkbox toggles: several quick toggles trigger
+        # one recompute instead of queuing one per click.
+        self._recompute_timer = QTimer(self)
+        self._recompute_timer.setSingleShot(True)
+        self._recompute_timer.setInterval(400)
+        self._recompute_timer.timeout.connect(self._recompute)
 
         layout = QVBoxLayout(self)
         self.overview = VerdictStrip()
@@ -811,7 +884,9 @@ class RulesTab(QWidget):
             criterion_header.setToolTip(_BADGE_LEGEND)
         self.rule_table.verticalHeader().setVisible(False)
         self.rule_table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
-        self.rule_table.setSelectionMode(SELECTION_MODE_SINGLE)
+        # Extended selection so several criteria can be deleted at once;
+        # Edit / move act on the current row.
+        self.rule_table.setSelectionMode(SELECTION_MODE_EXTENDED)
         self.rule_table.setItemDelegateForColumn(FIRE_COL, FireBarDelegate(self.rule_table))
         header = self.rule_table.horizontalHeader()
         header.setSectionResizeMode(1, HEADER_RESIZE_MODE_STRETCH)
@@ -885,10 +960,20 @@ class RulesTab(QWidget):
                 lambda _checked=False, k=kind, p=preset: self._add_rule(k, p))
         self.add_button.setMenu(menu)
         button_row.addWidget(self.add_button)
-        for label, slot in (("Edit…", self._edit_rule), ("Delete", self._delete_rule),
-                            ("↑", lambda: self._move_rule(-1)),
-                            ("↓", lambda: self._move_rule(1))):
+        for label, slot, tip in (
+                ("Edit…", self._edit_rule,
+                 "Edit the current criterion (double-click also edits)."),
+                ("Duplicate", self._duplicate_rule,
+                 "Copy the current criterion — handy for near-identical "
+                 "depth or slope bands."),
+                ("Delete…", self._delete_rule,
+                 "Delete the selected criteria (multi-select supported)."),
+                ("↑", lambda: self._move_rule(-1),
+                 "Move the criterion up the stack (display/report order)."),
+                ("↓", lambda: self._move_rule(1),
+                 "Move the criterion down the stack.")):
             button = QPushButton(label)
+            button.setToolTip(tip)
             button.clicked.connect(slot)
             button_row.addWidget(button)
         button_row.addStretch(1)
@@ -899,6 +984,12 @@ class RulesTab(QWidget):
             "recomputes automatically; use this after input layers change.")
         self.recompute_button.clicked.connect(self._recompute)
         button_row.addWidget(self.recompute_button)
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setToolTip(
+            "Stop the running recompute (completed criteria stay cached).")
+        self.stop_button.setEnabled(False)
+        self.stop_button.clicked.connect(self.dock.cancel_analysis)
+        button_row.addWidget(self.stop_button)
         layout.addLayout(button_row)
 
         params_row = QHBoxLayout()
@@ -922,10 +1013,12 @@ class RulesTab(QWidget):
             "more-severe neighbour. A stricter exclusion is never silently "
             "discarded. Set 0 to keep every resolved range.")
         params_row.addWidget(self.sliver_spin)
-        refine_label = QLabel("Boundary refinement: 1 m")
+        self.step_spin.valueChanged.connect(self._mark_params_dirty)
+        self.sliver_spin.valueChanged.connect(self._mark_params_dirty)
+        refine_label = QLabel("Boundary refinement: 0.1 m")
         refine_label.setToolTip(
             "Coarse sampling finds where conditions change; each boundary is "
-            "then refined by bisection to 1 m. A spatial polygon/proximity "
+            "then refined by bisection to 0.1 m. A spatial polygon/proximity "
             "feature narrower than the Sample step can still be missed — "
             "reduce the step where that matters. Depth/slope discovery uses "
             "the Bathymetry Profile step instead.")
@@ -951,30 +1044,50 @@ class RulesTab(QWidget):
         self.resolved_check.toggled.connect(self._set_resolved_visible)
         io_row.addWidget(self.resolved_check)
         io_row.addSpacing(12)
-        for label, slot in (("Import from Assessment…", self._import_from_assessment),
-                            ("Import rule set JSON…", self._import_json),
-                            ("Export rule set JSON…", self._export_json)):
-            button = QPushButton(label)
-            button.clicked.connect(slot)
-            io_row.addWidget(button)
+        io_row.addWidget(ui_helpers.menu_tool_button(
+            "Import / Export ▾",
+            (("Import from Assessment…", self._import_from_assessment),
+             ("Import rule set JSON…", self._import_json),
+             None,
+             ("Export rule set JSON…", self._export_json)),
+            tooltip="Share the criteria stack with the Workbench Assessment "
+                    "tool or as versioned JSON."))
         io_row.addStretch(1)
-        self.status_label = QLabel("")
-        io_row.addWidget(self.status_label)
         layout.addLayout(io_row)
+        # Full-width status line: recompute progress, export confirmations
+        # and preview counts must stay readable at narrow dock widths.
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
 
         self.resolved_widget.setVisible(self.resolved_check.isChecked())
-        model.planChanged.connect(self.refresh)
-        model.rulesChanged.connect(self.refresh)
+        refresh_soon = ui_helpers.coalesced(self, self.refresh)
+        model.planChanged.connect(refresh_soon)
+        model.rulesChanged.connect(refresh_soon)
         self.refresh()
 
     # -- refresh --------------------------------------------------------------
     def refresh(self) -> None:
+        plan_switched = self.model.plan_id != self._loaded_plan_id
+        if plan_switched:
+            # The last recompute's results, any pending debounced
+            # recompute and unapplied parameter edits all belong to the
+            # plan that was open before — never show or apply them here.
+            self._loaded_plan_id = self.model.plan_id
+            self._recompute_timer.stop()
+            self._last_results = {}
+            self._last_verdicts = []
+            self._params_dirty = False
+            self.status_label.setText("")
         self._loading = True
         try:
             plan = self.model.plan
             params = self.model.gen_params()
-            self.sliver_spin.setValue(params.sliver_tol_km)
-            self.step_spin.setValue(int(params.coarse_step_m))
+            if not self._params_dirty:
+                # Never clobber a typed-but-unapplied Sample step/Sliver
+                # value from an unrelated refresh (e.g. a rule toggle).
+                self.sliver_spin.setValue(params.sliver_tol_km)
+                self.step_spin.setValue(int(params.coarse_step_m))
             rules = self.model.rules
             self.rule_table.setRowCount(len(rules))
             scope = params.scope
@@ -1013,14 +1126,31 @@ class RulesTab(QWidget):
 
                 covered = sum(e - s for s, e in intervals)
                 pct = 100.0 * covered / domain_km if domain_km > 0 else 0.0
-                coverage_item = QTableWidgetItem(
-                    f"{covered:.2f} km · {pct:.0f}%" if intervals else "—")
+                computed = bool(rule_hits) or bool(self._current_verdicts())
+                if intervals:
+                    coverage_text = f"{covered:.3f} km · {pct:.2f}%"
+                    coverage_tip = ""
+                elif computed and int(rule.get("enabled") or 0):
+                    coverage_text = "none"
+                    coverage_tip = ("Evaluated — this criterion fired "
+                                    "nowhere in the scope.")
+                else:
+                    coverage_text = "—"
+                    coverage_tip = ("Not evaluated yet — run Recompute "
+                                    "(or enable the criterion).")
+                coverage_item = QTableWidgetItem(coverage_text)
+                if coverage_tip:
+                    coverage_item.setToolTip(coverage_tip)
                 coverage_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
                 self.rule_table.setItem(i, 3, coverage_item)
             self._refresh_overview()
             self._refresh_resolved()
         finally:
             self._loading = False
+        if plan_switched:
+            # Redraw the map preview from the new plan's stored context
+            # (or clear it when the preview toggle is off).
+            self._refresh_map_preview()
 
     def _current_verdicts(self) -> List:
         """Resolved verdicts: the latest recompute, else the stored plan
@@ -1070,6 +1200,16 @@ class RulesTab(QWidget):
     def set_progress(self, message: str) -> None:
         self.status_label.setText(message)
 
+    # -- analysis lifecycle (driven by the dock) -------------------------------
+    def analysis_started(self) -> None:
+        """Prevent stacked recomputes while one is already running."""
+        self.recompute_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+
+    def analysis_finished(self) -> None:
+        self.recompute_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+
     # -- map preview / excluded sections --------------------------------------
     def _refresh_map_preview(self, _checked=None) -> None:
         if not self.preview_check.isChecked():
@@ -1111,16 +1251,22 @@ class RulesTab(QWidget):
                     f"Go to KP {start_km:.3f}-{end_km:.3f} "
                     f"({(end_km - start_km):.3f} km)")
                 goto_actions[action] = (start_km, end_km)
+            more_action = None
             if len(intervals) > len(shown):
-                more = menu.addAction(
-                    f"… {len(intervals) - len(shown)} more — see "
-                    "Excluded sections…")
-                more.setEnabled(False)
+                more_action = menu.addAction(
+                    f"… {len(intervals) - len(shown)} more — open the "
+                    "resolved list…")
+        else:
+            more_action = None
         chosen = qt_exec(menu, self.rule_table.viewport().mapToGlobal(position))
         if chosen == edit_action:
             self._edit_rule()
         elif chosen == delete_action:
             self._delete_rule()
+        elif more_action is not None and chosen == more_action:
+            dialog = ExcludedSectionsDialog(
+                self._current_verdicts(), self._rule_names(), self.dock, self)
+            qt_exec(dialog)
         elif chosen in goto_actions:
             start_km, end_km = goto_actions[chosen]
             self.dock.goto_range(start_km, end_km)
@@ -1252,6 +1398,12 @@ class RulesTab(QWidget):
     def _selected_index(self) -> int:
         return self.rule_table.currentRow()
 
+    def _selected_indices(self) -> List[int]:
+        model = self.rule_table.selectionModel()
+        if model is None:
+            return []
+        return sorted({index.row() for index in model.selectedRows()})
+
     def _add_rule(self, kind: str, preset: Optional[Dict] = None) -> None:
         if not self.model.plan:
             return
@@ -1287,18 +1439,43 @@ class RulesTab(QWidget):
             self.model.save_rules(rules, target_id=str(rules[index].get("rule_id")))
             self._recompute()
 
-    def _delete_rule(self) -> None:
+    def _duplicate_rule(self) -> None:
         index = self._selected_index()
         if index < 0 or index >= len(self.model.rules):
+            self.status_label.setText("Select a criterion to duplicate.")
             return
-        rule = self.model.rules[index]
+        copy = dict(self.model.rules[index])
+        copy["rule_id"] = schema.new_id()
+        copy["name"] = (copy.get("name") or "criterion") + " (copy)"
+        rules = list(self.model.rules)
+        rules.insert(index + 1, copy)
+        self.model.save_rules(rules, target_id=copy["rule_id"])
+        self.rule_table.selectRow(index + 1)
+        self._recompute()
+
+    def _delete_rule(self) -> None:
+        indices = [i for i in self._selected_indices()
+                   if i < len(self.model.rules)]
+        if not indices:
+            self.status_label.setText("Select the criteria to delete.")
+            return
+        names = [self.model.rules[i].get("name") or "criterion"
+                 for i in indices]
+        listed = ", ".join(f"'{n}'" for n in names[:5])
+        if len(names) > 5:
+            listed += f" and {len(names) - 5} more"
         answer = QMessageBox.question(
-            self, "Delete criterion", f"Delete '{rule.get('name') or 'criterion'}'?",
+            self, "Delete criteria",
+            f"Delete {len(names)} criterion/criteria: {listed}?",
             MESSAGE_BOX_YES | MESSAGE_BOX_NO, MESSAGE_BOX_NO)
         if answer != MESSAGE_BOX_YES:
             return
-        rules = [r for i, r in enumerate(self.model.rules) if i != index]
-        self.model.save_rules(rules, target_id=str(rule.get("rule_id")),
+        wanted = set(indices)
+        removed_ids = [str(self.model.rules[i].get("rule_id"))
+                       for i in indices]
+        rules = [r for i, r in enumerate(self.model.rules)
+                 if i not in wanted]
+        self.model.save_rules(rules, target_id=",".join(removed_ids),
                               action=change_log.ACTION_DELETE_RULE)
         self._recompute()
 
@@ -1323,24 +1500,55 @@ class RulesTab(QWidget):
         rules[index] = dict(rules[index])
         rules[index]["enabled"] = 1 if item.checkState() == Qt.CheckState.Checked else 0
         self.model.save_rules(rules, target_id=str(rules[index].get("rule_id")))
-        self._recompute()
+        # Debounced: several quick toggles collapse into one recompute.
+        self._recompute_timer.start()
+
+    def _mark_params_dirty(self, *_args) -> None:
+        if not self._loading:
+            self._params_dirty = True
 
     def _recompute(self) -> None:
         """Apply any changed analysis parameters, then recompute the stack."""
         if not self.model.plan:
             return
+        self._params_dirty = False  # applied (or reconciled) below
         params = self.model.gen_params()
+        try:
+            stored = json.loads(self.model.plan.get("params_json") or "{}")
+        except (TypeError, ValueError):
+            stored = {}
+        if not isinstance(stored, dict):
+            stored = {}
+        stored_refine_tol = float(stored.get(
+            "refine_tol_m", generation.BOUNDARY_REFINE_TOL_M))
         if abs(params.sliver_tol_km - self.sliver_spin.value()) > 1e-12 \
-                or abs(params.coarse_step_m - float(self.step_spin.value())) > 1e-9:
+                or abs(params.coarse_step_m - float(self.step_spin.value())) > 1e-9 \
+                or abs(stored_refine_tol
+                       - generation.BOUNDARY_REFINE_TOL_M) > 1e-12:
             if not self.model.update_gen_params({
                     "sliver_tol_km": self.sliver_spin.value(),
                     "coarse_step_m": float(self.step_spin.value()),
-                    "refine_tol_m": 1.0,
+                    "refine_tol_m": generation.BOUNDARY_REFINE_TOL_M,
             }, reason="exclusion analysis parameters"):
                 return
         self.dock.request_analysis()
 
     # -- rule-set IO ----------------------------------------------------------
+    def _dedupe_imported(self, imported: List[Dict]) -> (List[Dict], int):
+        """Drop imported criteria identical to ones already in the stack.
+
+        Identity = name + kind + configuration; importing the same file
+        twice must not silently double the stack.
+        """
+        def key(rule: Dict):
+            return ((rule.get("name") or "").strip().casefold(),
+                    rule.get("kind") or "",
+                    rule.get("config_json") or "")
+
+        existing = {key(rule) for rule in self.model.rules}
+        fresh = [rule for rule in imported if key(rule) not in existing]
+        return fresh, len(imported) - len(fresh)
+
     def _import_from_assessment(self) -> None:
         store = self.dock.workbench_store()
         if store is None:
@@ -1384,8 +1592,18 @@ class RulesTab(QWidget):
                 "config_json": row.get("config_json") or "{}",
                 "notes": row.get("notes") or "",
             })
+        imported, skipped = self._dedupe_imported(imported)
+        if not imported:
+            self.status_label.setText(
+                "Nothing imported — every criterion in the rule set is "
+                "already in the stack.")
+            return
         self.model.save_rules(list(self.model.rules) + imported,
                               target_id="assessment_import")
+        message = f"Imported {len(imported)} criteria from the Assessment."
+        if skipped:
+            message += f"  Skipped {skipped} identical duplicate(s)."
+        self.status_label.setText(message)
         self._recompute()
 
     def _export_json(self) -> None:
@@ -1430,7 +1648,17 @@ class RulesTab(QWidget):
                 row["methods_json"] = _normalised_methods_json(
                     row.get("methods_json"))
             imported.append(row)
-        if imported:
-            self.model.save_rules(list(self.model.rules) + imported,
-                                  target_id="json_import")
-            self._recompute()
+        imported, skipped = self._dedupe_imported(imported)
+        if not imported:
+            self.status_label.setText(
+                "Nothing imported — every criterion in the file is already "
+                "in the stack." if skipped else
+                "The file contains no criteria.")
+            return
+        self.model.save_rules(list(self.model.rules) + imported,
+                              target_id="json_import")
+        message = f"Imported {len(imported)} criteria."
+        if skipped:
+            message += f"  Skipped {skipped} identical duplicate(s)."
+        self.status_label.setText(message)
+        self._recompute()

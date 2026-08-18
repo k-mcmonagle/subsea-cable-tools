@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
+from contextlib import contextmanager
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from qgis.core import QgsCoordinateTransformContext, QgsProject, QgsVectorLayer
@@ -25,7 +27,7 @@ from ..processing.cable_lay_parsers import (
     write_layer_to_gpkg,
 )
 from ..qgis_compat import WKB_NO_GEOMETRY
-from . import change_log, schema
+from . import change_log, gpkg_sql, schema
 
 PROJECT_SCOPE = "SubseaCableTools"
 PROJECT_KEY_GPKG = "burial_gpkg"
@@ -55,8 +57,69 @@ class BurialStore:
                  transform_context: Optional[QgsCoordinateTransformContext] = None):
         self.gpkg_path = gpkg_path
         self.transform_context = transform_context or QgsProject.instance().transformContext()
-        # Next change-log seq per plan, so appends need not re-read the log.
+        # Next change-log seq per plan, so appends need not re-read the log
+        # (legacy path only; the SQL path derives it in-transaction).
         self._change_seq: Dict[str, int] = {}
+        # None = not probed yet; False = this file refused the direct-SQL
+        # fast path, use the legacy whole-table writer for everything.
+        self._sql_mode: Optional[bool] = None
+
+    # -- direct-SQL fast path -------------------------------------------------
+    def _sql(self) -> Optional[sqlite3.Connection]:
+        """The cached sqlite connection, or None when in legacy mode.
+
+        Probed once per store: the registry must exist and be readable via
+        plain SQL. Mixing per-call fallbacks with open transactions could
+        deadlock against the writer, so the mode is decided per store, not
+        per call; ``ensure_created``/``migrate`` reset the probe after they
+        (re)create tables through the legacy writer.
+        """
+        if self._sql_mode is False:
+            return None
+        if not os.path.exists(self.gpkg_path):
+            return None  # not a failure — the file may be created later
+        try:
+            conn = gpkg_sql.connect(self.gpkg_path)
+            if self._sql_mode is None:
+                if not gpkg_sql.table_exists(conn, schema.TABLE_META):
+                    return None  # registry not created yet; re-probe later
+                self._sql_mode = True
+            return conn
+        except sqlite3.Error:
+            self._log_sql_fallback("open")
+            self._sql_mode = False
+            return None
+
+    def _log_sql_fallback(self, action: str) -> None:
+        try:
+            from qgis.core import QgsMessageLog
+
+            from ..qgis_compat import MESSAGE_INFO
+
+            QgsMessageLog.logMessage(
+                f"Direct-SQL access failed ({action}); using the legacy "
+                f"writer for {os.path.basename(self.gpkg_path)}.",
+                "Burial Planner", MESSAGE_INFO)
+        except Exception:
+            pass
+
+    @contextmanager
+    def transaction(self):
+        """Group several writes into one atomic commit (SQL mode).
+
+        Legacy mode has no transactional writer; the context is then a
+        no-op, preserving the old per-call behaviour.
+        """
+        conn = self._sql()
+        if conn is None:
+            yield
+            return
+        with gpkg_sql.transaction(conn):
+            yield
+
+    def close(self) -> None:
+        """Checkpoint and release the cached SQL connection (if any)."""
+        gpkg_sql.close(self.gpkg_path)
 
     # -- lifecycle ----------------------------------------------------------
     def exists(self) -> bool:
@@ -66,9 +129,13 @@ class BurialStore:
         folder = os.path.dirname(os.path.abspath(self.gpkg_path))
         if folder and not os.path.isdir(folder):
             os.makedirs(folder)
+        created = False
         for table, specs in schema.REGISTRY_TABLES.items():
             if not self._table_exists(table):
                 self._write_table_rows(table, specs, [])
+                created = True
+        if created and self._sql_mode is not False:
+            self._sql_mode = None  # tables changed under us — re-probe
         meta = self.read_meta()
         if "schema_version" not in meta:
             self.write_meta("schema_version", str(schema.SCHEMA_VERSION))
@@ -85,12 +152,23 @@ class BurialStore:
                 migrator(self)
             current += 1
             self.write_meta("schema_version", str(current))
+        if self._sql_mode is not False:
+            self._sql_mode = None  # migrations rewrite tables — re-probe
 
     def backup_before(self, label: str) -> Optional[str]:
         if not os.path.exists(self.gpkg_path):
             return None
+        # Fold any WAL content into the main file first so the copied
+        # .gpkg is complete without its -wal/-shm sidecars.
+        complete = gpkg_sql.checkpoint(self.gpkg_path, truncate=True)
         stem, ext = os.path.splitext(self.gpkg_path)
         target = f"{stem}.{schema.sanitize_slug(label)}.bak{ext}"
+        if not complete and gpkg_sql.backup_to(self.gpkg_path, target):
+            # A concurrent reader (e.g. a plan layer loaded in the project
+            # with its attribute table open) blocked the checkpoint; a
+            # plain file copy would silently miss the frames still in the
+            # -wal sidecar, so snapshot through the SQLite backup API.
+            return target
         try:
             shutil.copy2(self.gpkg_path, target)
             return target
@@ -101,15 +179,33 @@ class BurialStore:
     def _table_exists(self, table: str) -> bool:
         if not os.path.exists(self.gpkg_path):
             return False
+        conn = self._sql()
+        if conn is not None:
+            try:
+                return gpkg_sql.table_exists(conn, table)
+            except sqlite3.Error:
+                pass
         return open_gpkg_layer(self.gpkg_path, table) is not None
 
     def read_table(self, table: str) -> List[Dict]:
+        conn = self._sql()
+        if conn is not None:
+            return gpkg_sql.read_rows(conn, table)
         layer = open_gpkg_layer(self.gpkg_path, table)
         if layer is None:
             return []
         names = [f.name() for f in layer.fields() if f.name().lower() != "fid"]
         return [_normalise_row({name: feat[name] for name in names})
                 for feat in layer.getFeatures()]
+
+    def read_plan_table(self, table: str, plan_id: str) -> List[Dict]:
+        """One plan's rows only — pushed into SQL so cost scales with the
+        plan, not with everything in the GeoPackage."""
+        conn = self._sql()
+        if conn is not None:
+            return gpkg_sql.read_rows(conn, table, "plan_id = ?", (plan_id,))
+        return [r for r in self.read_table(table)
+                if r.get("plan_id") == plan_id]
 
     def write_table(self, table: str, rows: Sequence[Dict]) -> None:
         self._write_table_rows(table, schema.REGISTRY_TABLES[table], list(rows))
@@ -118,8 +214,24 @@ class BurialStore:
         write_layer_to_gpkg(self.gpkg_path, table, fields_from_specs(specs),
                             WKB_NO_GEOMETRY, rows, self.transform_context)
 
+    def _replace_plan_rows(self, table: str, plan_id: str,
+                           rows: Sequence[Dict]) -> None:
+        """Replace one plan's rows: targeted SQL, or whole-table legacy."""
+        conn = self._sql()
+        if conn is not None:
+            gpkg_sql.replace_where(conn, table, "plan_id = ?", (plan_id,),
+                                   list(rows))
+            return
+        others = [r for r in self.read_table(table)
+                  if r.get("plan_id") != plan_id]
+        self.write_table(table, others + list(rows))
+
     def upsert_rows(self, table: str, rows: Sequence[Dict]) -> None:
         key = schema.TABLE_KEYS[table]
+        conn = self._sql()
+        if conn is not None:
+            gpkg_sql.upsert_rows(conn, table, key, list(rows))
+            return
         existing = self.read_table(table)
         incoming = {str(r[key]): r for r in rows}
         merged = [r for r in existing if str(r.get(key)) not in incoming]
@@ -128,6 +240,10 @@ class BurialStore:
 
     def delete_rows(self, table: str, keys: Sequence[str]) -> None:
         key_field = schema.TABLE_KEYS[table]
+        conn = self._sql()
+        if conn is not None:
+            gpkg_sql.delete_keys(conn, table, key_field, list(keys))
+            return
         drop = {str(k) for k in keys}
         remaining = [r for r in self.read_table(table)
                      if str(r.get(key_field)) not in drop]
@@ -137,11 +253,16 @@ class BurialStore:
         """Append new rows to a registry table without rewriting it.
 
         The change log is append-only and can grow large, so a whole-table
-        rewrite per entry is the wrong cost profile. Uses the provider's
-        addFeatures; falls back to the standard whole-table upsert when the
-        layer cannot be opened or the provider rejects the append.
+        rewrite per entry is the wrong cost profile. Uses direct SQL (or the
+        provider's addFeatures in legacy mode); falls back to the standard
+        whole-table upsert when the layer cannot be opened or the provider
+        rejects the append.
         """
         prepared = [dict(r) for r in rows]
+        conn = self._sql()
+        if conn is not None:
+            gpkg_sql.insert_rows(conn, table, prepared)
+            return
         layer = open_gpkg_layer(self.gpkg_path, table)
         if layer is not None and layer.isValid():
             try:
@@ -177,14 +298,24 @@ class BurialStore:
         rows.append({"key": key, "value": value})
         self._write_table_rows(schema.TABLE_META, schema.META_FIELDS, rows)
 
+    def _get_by_key(self, table: str, key_column: str,
+                    value: str) -> Optional[Dict]:
+        conn = self._sql()
+        if conn is not None:
+            rows = gpkg_sql.read_rows(conn, table,
+                                      gpkg_sql.quote_ident(key_column) + " = ?",
+                                      (value,))
+            return rows[0] if rows else None
+        return next((r for r in self.read_table(table)
+                     if r.get(key_column) == value), None)
+
     # -- plans ---------------------------------------------------------------
     def list_plans(self) -> List[Dict]:
         return sorted(self.read_table(schema.TABLE_PLAN),
                       key=lambda r: (r.get("name") or ""))
 
     def get_plan(self, plan_id: str) -> Optional[Dict]:
-        return next((r for r in self.read_table(schema.TABLE_PLAN)
-                     if r.get("plan_id") == plan_id), None)
+        return self._get_by_key(schema.TABLE_PLAN, "plan_id", plan_id)
 
     def save_plan(self, row: Dict) -> str:
         row = dict(row)
@@ -203,24 +334,42 @@ class BurialStore:
         generations, events, sections, change log). Spatial layers stay in
         the gpkg (they may be loaded in the project); callers remove them
         from the layer tree and may overwrite them later."""
-        self.delete_rows(schema.TABLE_PLAN, [plan_id])
-        for table in (schema.TABLE_INPUT, schema.TABLE_RULE,
-                      schema.TABLE_GENERATION, schema.TABLE_EVENT,
-                      schema.TABLE_SECTION, schema.TABLE_CHANGE_LOG,
-                      schema.TABLE_PROFILE, schema.TABLE_RISK_CHECK,
-                      schema.TABLE_HAZARD):
-            remaining = [r for r in self.read_table(table)
-                         if r.get("plan_id") != plan_id]
-            self.write_table(table, remaining)
+        child_tables = (schema.TABLE_INPUT, schema.TABLE_RULE,
+                        schema.TABLE_GENERATION, schema.TABLE_EVENT,
+                        schema.TABLE_SECTION, schema.TABLE_CHANGE_LOG,
+                        schema.TABLE_PROFILE, schema.TABLE_RISK_CHECK,
+                        schema.TABLE_HAZARD)
+        conn = self._sql()
+        if conn is not None:
+            # One atomic transaction: the plan can never be half-deleted.
+            with gpkg_sql.transaction(conn):
+                gpkg_sql.delete_keys(conn, schema.TABLE_PLAN, "plan_id",
+                                     [plan_id])
+                for table in child_tables:
+                    gpkg_sql.delete_where(conn, table, "plan_id = ?",
+                                          (plan_id,))
+        else:
+            self.delete_rows(schema.TABLE_PLAN, [plan_id])
+            for table in child_tables:
+                remaining = [r for r in self.read_table(table)
+                             if r.get("plan_id") != plan_id]
+                self.write_table(table, remaining)
         self._change_seq.pop(plan_id, None)
 
     def duplicate_plan(self, plan_id: str, new_name: str) -> str:
         """Deep copy of inputs/rules/events/sections with new ids; the copy
         records its lineage via ``supersedes_id``. Generations and the change
-        log start fresh (they describe the original's history, not the copy's)."""
+        log start fresh (they describe the original's history, not the copy's).
+        Commits atomically in SQL mode — a mid-copy failure can never leave
+        a half-duplicated plan behind."""
         plan = self.get_plan(plan_id)
         if plan is None:
             raise ValueError("Plan not found.")
+        with self.transaction():
+            return self._duplicate_plan_rows(plan_id, plan, new_name)
+
+    def _duplicate_plan_rows(self, plan_id: str, plan: Dict,
+                             new_name: str) -> str:
         new_plan_id = schema.new_id()
         now = schema.utc_now_iso()
         copy = dict(plan)
@@ -325,14 +474,12 @@ class BurialStore:
 
     # -- inputs --------------------------------------------------------------
     def list_inputs(self, plan_id: str) -> List[Dict]:
-        rows = [r for r in self.read_table(schema.TABLE_INPUT)
-                if r.get("plan_id") == plan_id]
+        rows = self.read_plan_table(schema.TABLE_INPUT, plan_id)
         rows.sort(key=lambda r: (r.get("role") or "", r.get("layer_name") or ""))
         return rows
 
     def get_input(self, input_id: str) -> Optional[Dict]:
-        return next((r for r in self.read_table(schema.TABLE_INPUT)
-                     if r.get("input_id") == input_id), None)
+        return self._get_by_key(schema.TABLE_INPUT, "input_id", input_id)
 
     def save_input(self, row: Dict) -> str:
         row = dict(row)
@@ -345,15 +492,12 @@ class BurialStore:
 
     # -- rules ---------------------------------------------------------------
     def list_rules(self, plan_id: str) -> List[Dict]:
-        rules = [r for r in self.read_table(schema.TABLE_RULE)
-                 if r.get("plan_id") == plan_id]
+        rules = self.read_plan_table(schema.TABLE_RULE, plan_id)
         rules.sort(key=lambda r: int(r.get("seq") or 0))
         return rules
 
     def save_rules(self, plan_id: str, rules: Sequence[Dict]) -> None:
         """Replace the plan's rule stack (seq-normalised, list order wins)."""
-        others = [r for r in self.read_table(schema.TABLE_RULE)
-                  if r.get("plan_id") != plan_id]
         normalised = []
         for seq, rule in enumerate(rules):
             rule = dict(rule)
@@ -361,19 +505,16 @@ class BurialStore:
             rule["seq"] = seq
             rule.setdefault("rule_id", schema.new_id())
             normalised.append(rule)
-        self.write_table(schema.TABLE_RULE, others + normalised)
+        self._replace_plan_rows(schema.TABLE_RULE, plan_id, normalised)
 
     # -- risk checks / hazards ----------------------------------------------
     def list_risk_checks(self, plan_id: str) -> List[Dict]:
-        rows = [r for r in self.read_table(schema.TABLE_RISK_CHECK)
-                if r.get("plan_id") == plan_id]
+        rows = self.read_plan_table(schema.TABLE_RISK_CHECK, plan_id)
         rows.sort(key=lambda r: int(r.get("seq") or 0))
         return rows
 
     def save_risk_checks(self, plan_id: str, checks: Sequence[Dict]) -> None:
         """Replace the plan's risk checks (seq-normalised, list order wins)."""
-        others = [r for r in self.read_table(schema.TABLE_RISK_CHECK)
-                  if r.get("plan_id") != plan_id]
         normalised = []
         for seq, check in enumerate(checks):
             check = dict(check)
@@ -381,26 +522,23 @@ class BurialStore:
             check["seq"] = seq
             check.setdefault("check_id", schema.new_id())
             normalised.append(check)
-        self.write_table(schema.TABLE_RISK_CHECK, others + normalised)
+        self._replace_plan_rows(schema.TABLE_RISK_CHECK, plan_id, normalised)
 
     def list_hazards(self, plan_id: str) -> List[Dict]:
-        rows = [r for r in self.read_table(schema.TABLE_HAZARD)
-                if r.get("plan_id") == plan_id]
+        rows = self.read_plan_table(schema.TABLE_HAZARD, plan_id)
         rows.sort(key=lambda r: (float(r.get("kp") or 0.0),
                                  str(r.get("hazard_id") or "")))
         return rows
 
     def save_hazards(self, plan_id: str, rows: Sequence[Dict]) -> None:
         """Replace all hazards for one plan."""
-        others = [r for r in self.read_table(schema.TABLE_HAZARD)
-                  if r.get("plan_id") != plan_id]
         normalised = []
         for row in rows:
             row = dict(row)
             row["plan_id"] = plan_id
             row.setdefault("hazard_id", schema.new_id())
             normalised.append(row)
-        self.write_table(schema.TABLE_HAZARD, others + normalised)
+        self._replace_plan_rows(schema.TABLE_HAZARD, plan_id, normalised)
 
     # -- burial tools (project-scoped) ---------------------------------------
     def list_tools(self) -> List[Dict]:
@@ -410,8 +548,7 @@ class BurialStore:
                       key=lambda r: (r.get("name") or "").lower())
 
     def get_tool(self, tool_id: str) -> Optional[Dict]:
-        return next((r for r in self.read_table(schema.TABLE_TOOL)
-                     if r.get("tool_id") == tool_id), None)
+        return self._get_by_key(schema.TABLE_TOOL, "tool_id", tool_id)
 
     def save_tool(self, row: Dict) -> str:
         return self.save_tools([row])[0]
@@ -435,8 +572,7 @@ class BurialStore:
 
     # -- generations ---------------------------------------------------------
     def list_generations(self, plan_id: str) -> List[Dict]:
-        rows = [r for r in self.read_table(schema.TABLE_GENERATION)
-                if r.get("plan_id") == plan_id]
+        rows = self.read_plan_table(schema.TABLE_GENERATION, plan_id)
         rows.sort(key=lambda r: (r.get("run_utc") or ""))
         return rows
 
@@ -463,46 +599,41 @@ class BurialStore:
 
     # -- events --------------------------------------------------------------
     def list_events(self, plan_id: str) -> List[Dict]:
-        rows = [r for r in self.read_table(schema.TABLE_EVENT)
-                if r.get("plan_id") == plan_id]
+        rows = self.read_plan_table(schema.TABLE_EVENT, plan_id)
         rows.sort(key=lambda r: int(r.get("seq") or 0))
         return rows
 
     def save_events(self, plan_id: str, rows: Sequence[Dict]) -> None:
         """Replace all events for one plan."""
-        others = [r for r in self.read_table(schema.TABLE_EVENT)
-                  if r.get("plan_id") != plan_id]
         normalised = []
         for row in rows:
             row = dict(row)
             row["plan_id"] = plan_id
             row.setdefault("event_id", schema.new_id())
             normalised.append(row)
-        self.write_table(schema.TABLE_EVENT, others + normalised)
+        self._replace_plan_rows(schema.TABLE_EVENT, plan_id, normalised)
 
     # -- sections ------------------------------------------------------------
     def list_sections(self, plan_id: str) -> List[Dict]:
-        rows = [r for r in self.read_table(schema.TABLE_SECTION)
-                if r.get("plan_id") == plan_id]
+        rows = self.read_plan_table(schema.TABLE_SECTION, plan_id)
         rows.sort(key=lambda r: float(r.get("start_kp") or 0.0))
         return rows
 
     def save_sections(self, plan_id: str, rows: Sequence[Dict]) -> None:
         """Replace all sections for one plan (sections are derived data)."""
-        others = [r for r in self.read_table(schema.TABLE_SECTION)
-                  if r.get("plan_id") != plan_id]
         normalised = []
         for row in rows:
             row = dict(row)
             row["plan_id"] = plan_id
             row.setdefault("section_id", schema.new_id())
             normalised.append(row)
-        self.write_table(schema.TABLE_SECTION, others + normalised)
+        self._replace_plan_rows(schema.TABLE_SECTION, plan_id, normalised)
 
     # -- sampled profile -----------------------------------------------------
     def get_plan_profile(self, plan_id: str) -> Optional[Dict]:
-        rows = [r for r in self.read_table(schema.TABLE_PROFILE)
-                if r.get("plan_id") == plan_id]
+        # Filtered read: profiles can be tens of MB each, so the other
+        # plans' rows must never be materialised here.
+        rows = self.read_plan_table(schema.TABLE_PROFILE, plan_id)
         rows.sort(key=lambda r: (r.get("created_utc") or ""))
         return rows[-1] if rows else None
 
@@ -510,15 +641,13 @@ class BurialStore:
         """Replace the plan's sampled profile (one per plan, derived data)."""
         row = dict(row)
         row.setdefault("profile_id", schema.new_id())
-        others = [r for r in self.read_table(schema.TABLE_PROFILE)
-                  if r.get("plan_id") != row.get("plan_id")]
-        self.write_table(schema.TABLE_PROFILE, others + [row])
+        self._replace_plan_rows(schema.TABLE_PROFILE,
+                                str(row.get("plan_id") or ""), [row])
         return row["profile_id"]
 
     # -- change log ----------------------------------------------------------
     def list_change_log(self, plan_id: str) -> List[Dict]:
-        rows = [r for r in self.read_table(schema.TABLE_CHANGE_LOG)
-                if r.get("plan_id") == plan_id]
+        rows = self.read_plan_table(schema.TABLE_CHANGE_LOG, plan_id)
         rows.sort(key=lambda r: int(r.get("seq") or 0))
         return rows
 
@@ -528,12 +657,28 @@ class BurialStore:
         # Store only the rows that actually changed; rollback inversion is
         # per-row keyed, so full-table snapshots would only add bulk.
         before, after = change_log.delta_tables(before, after)
-        seq = self._change_seq.get(plan_id)
-        if seq is None:
-            seq = change_log.next_seq(self.list_change_log(plan_id))
-        entry = change_log.make_entry(
-            plan_id, seq, action, target_id, before, after, reason)
-        self.append_rows(schema.TABLE_CHANGE_LOG, [entry])
+        conn = self._sql()
+        if conn is not None:
+            # Read MAX(seq) and insert in one transaction (BEGIN IMMEDIATE
+            # serialises writers; nesting joins an enclosing transaction),
+            # so two QGIS sessions can never hand out the same seq — a
+            # duplicate would make rollback ordering ambiguous.
+            with gpkg_sql.transaction(conn):
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(seq), -1) + 1 FROM "
+                    + gpkg_sql.quote_ident(schema.TABLE_CHANGE_LOG)
+                    + " WHERE plan_id = ?", (plan_id,)).fetchone()
+                seq = int(row[0])
+                entry = change_log.make_entry(
+                    plan_id, seq, action, target_id, before, after, reason)
+                self.append_rows(schema.TABLE_CHANGE_LOG, [entry])
+        else:
+            seq = self._change_seq.get(plan_id)
+            if seq is None:
+                seq = change_log.next_seq(self.list_change_log(plan_id))
+            entry = change_log.make_entry(
+                plan_id, seq, action, target_id, before, after, reason)
+            self.append_rows(schema.TABLE_CHANGE_LOG, [entry])
         self._change_seq[plan_id] = seq + 1
         return entry
 
@@ -544,14 +689,15 @@ class BurialStore:
         """
         entries = self.list_change_log(plan_id)
         ops, undone = change_log.rollback_operations(entries, change_id)
-        for table, op, payload in ops:
-            if op == "delete":
-                self.delete_rows(table, list(payload))
-            elif op == "upsert":
-                self.upsert_rows(table, list(payload))
-        return self.append_change(
-            plan_id, change_log.ACTION_ROLLBACK, target_id=change_id,
-            after={"undone_change_ids": [e.get("change_id") for e in undone]})
+        with self.transaction():
+            for table, op, payload in ops:
+                if op == "delete":
+                    self.delete_rows(table, list(payload))
+                elif op == "upsert":
+                    self.upsert_rows(table, list(payload))
+            return self.append_change(
+                plan_id, change_log.ACTION_ROLLBACK, target_id=change_id,
+                after={"undone_change_ids": [e.get("change_id") for e in undone]})
 
     # -- spatial layers ------------------------------------------------------
     def write_spatial_layer(self, layer_name: str, field_specs, wkb_type,

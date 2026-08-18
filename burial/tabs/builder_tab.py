@@ -50,14 +50,19 @@ from ...qgis_compat import (
 from .. import events as ev
 from .. import schema
 from .. import tools as tools_mod
+from .. import ui_helpers
 
 _EVENT_COLUMNS = ["Seq", "Event", "KP", "Lat", "Lon", "Depth (m)", "Source",
                   "Status", "Locked", "Notes"]
+_EVENT_KP_COL = _EVENT_COLUMNS.index("KP")
+_EVENT_NOTES_COL = _EVENT_COLUMNS.index("Notes")
 _SECTION_COLUMNS = ["ID", "Kind", "Start KP", "End KP", "Length (km)",
                     "State", "Conclusion", "Confidence", "Tool",
                     "Tool config", "Skip handling", "Reasons", "Notes"]
 # Derived from the header list so reordering/inserting columns cannot
 # silently desynchronise a widget from the field it edits.
+_SECTION_START_COL = _SECTION_COLUMNS.index("Start KP")
+_SECTION_END_COL = _SECTION_COLUMNS.index("End KP")
 _SECTION_CONCLUSION_COL = _SECTION_COLUMNS.index("Conclusion")
 _SECTION_CONFIDENCE_COL = _SECTION_COLUMNS.index("Confidence")
 _SECTION_TOOL_COL = _SECTION_COLUMNS.index("Tool")
@@ -67,12 +72,17 @@ _SECTION_REASONS_COL = _SECTION_COLUMNS.index("Reasons")
 _SECTION_NOTES_COL = _SECTION_COLUMNS.index("Notes")
 
 _SHOW_EVENTS_SETTINGS_KEY = "SubseaCableTools/BurialPlanner/builder_show_events"
+_SPLITTER_SETTINGS_KEY = "SubseaCableTools/BurialPlanner/builder_splitter_state"
 
-_STATUS_COLORS = {
-    schema.EVENT_STATUS_CANDIDATE: QColor("#b36b00"),
-    schema.EVENT_STATUS_CONFIRMED: QColor("#1b5e20"),
-    schema.EVENT_STATUS_CONFLICT: QColor("#b71c1c"),
-}
+
+def _status_colors():
+    """Theme-aware event status colours (resolved at refresh time)."""
+    return {
+        schema.EVENT_STATUS_CANDIDATE: ui_helpers.qcolor("event_candidate"),
+        schema.EVENT_STATUS_CONFIRMED: ui_helpers.qcolor("event_confirmed"),
+        schema.EVENT_STATUS_CONFLICT: ui_helpers.qcolor("event_conflict"),
+    }
+
 
 _VERTICAL = getattr(Qt, "Orientation", Qt).Vertical
 
@@ -123,6 +133,8 @@ class BuilderTab(QWidget):
         self.model = model
         self.dock = dock
         self._loading = False
+        self._loaded_plan_id = None
+        self._min_section_dirty = False  # typed but not yet generated with
 
         layout = QVBoxLayout(self)
 
@@ -132,6 +144,7 @@ class BuilderTab(QWidget):
         self.min_section_spin.setRange(0.0, 1000.0)
         self.min_section_spin.setDecimals(3)
         self.min_section_spin.setSuffix(" km")
+        self.min_section_spin.valueChanged.connect(self._mark_min_section_dirty)
         self.min_section_spin.setToolTip(
             "Do not create an automatic candidate burial section shorter "
             "than this operational minimum. Exclusion and insufficient-data "
@@ -147,7 +160,7 @@ class BuilderTab(QWidget):
             "unchanged sections. Only automatic candidates are replaced.")
         self.generate_button.clicked.connect(self._generate)
         run_row.addWidget(self.generate_button)
-        self.fresh_button = QPushButton("Regenerate fresh…")
+        self.fresh_button = QPushButton("Discard edits && regenerate…")
         self.fresh_button.setToolTip(
             "Discard manual edits and rebuild the plan purely from the "
             "Exclusion stack. Asks for confirmation, lists what will be "
@@ -155,7 +168,11 @@ class BuilderTab(QWidget):
             "so it can be rolled back from Review && Export.")
         self.fresh_button.clicked.connect(self._regenerate_fresh)
         run_row.addWidget(self.fresh_button)
-        self.cancel_button = QPushButton("Stop (resumable)")
+        self.cancel_button = QPushButton("Stop")
+        self.cancel_button.setToolTip(
+            "Stop the running analysis. Criteria that already finished stay "
+            "cached, so the next Generate resumes from them instead of "
+            "starting over.")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self.dock.cancel_analysis)
         run_row.addWidget(self.cancel_button)
@@ -177,13 +194,21 @@ class BuilderTab(QWidget):
             QSettings().value(_SHOW_EVENTS_SETTINGS_KEY, False, type=bool))
         self.show_events_check.toggled.connect(self._set_events_visible)
         run_row.addWidget(self.show_events_check)
+        run_row.addStretch(1)
+        layout.addLayout(run_row)
+
+        # Progress + status get their own full-width row: the status label
+        # is this tab's feedback channel and must survive narrow docks.
+        feedback_row = QHBoxLayout()
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setVisible(False)
-        run_row.addWidget(self.progress, 1)
+        self.progress.setMaximumWidth(200)
+        feedback_row.addWidget(self.progress)
         self.run_status = QLabel("")
-        run_row.addWidget(self.run_status, 2)
-        layout.addLayout(run_row)
+        self.run_status.setWordWrap(True)
+        feedback_row.addWidget(self.run_status, 1)
+        layout.addLayout(feedback_row)
 
         self.diff_label = QLabel("")
         self.diff_label.setWordWrap(True)
@@ -195,20 +220,39 @@ class BuilderTab(QWidget):
         events_widget = self.events_widget
         events_layout = QVBoxLayout(events_widget)
         events_layout.setContentsMargins(0, 0, 0, 0)
-        events_layout.addWidget(QLabel("Events"))
+        events_header = QHBoxLayout()
+        events_header.addWidget(QLabel("Events"))
+        events_header.addStretch(1)
+        self.events_filter = QLineEdit()
+        self.events_filter.setPlaceholderText("Filter…")
+        self.events_filter.setMaximumWidth(160)
+        self.events_filter.setToolTip(
+            "Hide event rows not matching this text (any column).")
+        self.events_filter.textChanged.connect(
+            lambda _t: self._apply_filter(self.events_table,
+                                          self.events_filter))
+        events_header.addWidget(self.events_filter)
+        events_layout.addLayout(events_header)
         self.events_table = QTableWidget(0, len(_EVENT_COLUMNS))
         self.events_table.setHorizontalHeaderLabels(_EVENT_COLUMNS)
         self.events_table.verticalHeader().setVisible(False)
         self.events_table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
         self.events_table.setSelectionMode(SELECTION_MODE_EXTENDED)
         self.events_table.horizontalHeader().setStretchLastSection(True)
+        ui_helpers.enable_column_menu(
+            self.events_table,
+            "SubseaCableTools/BurialPlanner/builder_events_hidden_columns",
+            always_visible=(0, _EVENT_KP_COL))
         self.events_table.itemChanged.connect(self._on_event_item_changed)
         self.events_table.itemSelectionChanged.connect(self._on_event_selected)
         self.events_table.setContextMenuPolicy(CONTEXT_MENU_POLICY_CUSTOM)
         self.events_table.customContextMenuRequested.connect(
             self._event_context_menu)
+        # Editable cells (KP, Notes) open their editor on double-click;
+        # only the read-only cells navigate.
         self.events_table.cellDoubleClicked.connect(
-            lambda row, _column: self._goto_event_row(row))
+            lambda row, column: self._goto_event_row(row)
+            if column not in (_EVENT_KP_COL, _EVENT_NOTES_COL) else None)
         events_layout.addWidget(self.events_table, 1)
 
         event_buttons = QHBoxLayout()
@@ -237,13 +281,20 @@ class BuilderTab(QWidget):
         self.nudge_spin.setRange(1.0, 1000.0)
         self.nudge_spin.setValue(10.0)
         self.nudge_spin.setSuffix(" m")
-        self.nudge_spin.setToolTip("Nudge step")
-        for label, slot in (("−", lambda: self._nudge(-1)), ("＋", lambda: self._nudge(1))):
+        self.nudge_spin.setToolTip(
+            "Nudge step: how far −/＋ move the selected event.")
+        event_buttons.addWidget(QLabel("Nudge:"))
+        event_buttons.addWidget(self.nudge_spin)
+        for label, sign, tip in (
+                ("−", -1, "Move the selected unlocked event down-KP by the "
+                          "nudge step."),
+                ("＋", 1, "Move the selected unlocked event up-KP by the "
+                         "nudge step.")):
             button = QPushButton(label)
             button.setMaximumWidth(28)
-            button.clicked.connect(slot)
+            button.setToolTip(tip)
+            button.clicked.connect(lambda _c=False, s=sign: self._nudge(s))
             event_buttons.addWidget(button)
-        event_buttons.addWidget(self.nudge_spin)
         event_buttons.addSpacing(12)
         confirm_all_button = QPushButton("Confirm all")
         confirm_all_button.setToolTip(
@@ -257,7 +308,19 @@ class BuilderTab(QWidget):
         sections_widget = QWidget()
         sections_layout = QVBoxLayout(sections_widget)
         sections_layout.setContentsMargins(0, 0, 0, 0)
-        sections_layout.addWidget(QLabel("Sections"))
+        sections_header = QHBoxLayout()
+        sections_header.addWidget(QLabel("Sections"))
+        sections_header.addStretch(1)
+        self.sections_filter = QLineEdit()
+        self.sections_filter.setPlaceholderText("Filter…")
+        self.sections_filter.setMaximumWidth(160)
+        self.sections_filter.setToolTip(
+            "Hide section rows not matching this text (any column).")
+        self.sections_filter.textChanged.connect(
+            lambda _t: self._apply_filter(self.sections_table,
+                                          self.sections_filter))
+        sections_header.addWidget(self.sections_filter)
+        sections_layout.addLayout(sections_header)
         self.sections_table = QTableWidget(0, len(_SECTION_COLUMNS))
         self.sections_table.setHorizontalHeaderLabels(_SECTION_COLUMNS)
         self.sections_table.verticalHeader().setVisible(False)
@@ -267,21 +330,31 @@ class BuilderTab(QWidget):
         # the trailing Notes column absorbs the remaining width.
         self.sections_table.horizontalHeader().setStretchLastSection(True)
         self.sections_table.setColumnWidth(_SECTION_REASONS_COL, 240)
+        # Right-click the header to hide secondary columns (persisted) —
+        # the 13-column table's escape hatch on narrow docks.
+        ui_helpers.enable_column_menu(
+            self.sections_table,
+            "SubseaCableTools/BurialPlanner/builder_sections_hidden_columns",
+            always_visible=(0, _SECTION_START_COL, _SECTION_END_COL))
         self.sections_table.itemSelectionChanged.connect(self._on_section_selected)
         self.sections_table.itemChanged.connect(self._on_section_item_changed)
         self.sections_table.setContextMenuPolicy(CONTEXT_MENU_POLICY_CUSTOM)
         self.sections_table.customContextMenuRequested.connect(
             self._section_context_menu)
         self.sections_table.cellDoubleClicked.connect(
-            lambda row, _column: self._goto_section_row(row))
+            lambda row, column: self._goto_section_row(row)
+            if column not in (_SECTION_START_COL, _SECTION_END_COL,
+                              _SECTION_NOTES_COL) else None)
         sections_layout.addWidget(self.sections_table, 1)
 
         section_hint = QLabel(
-            "Set conclusion and confidence in the table (or right-click a "
-            "selection to set several at once, mark final, split or merge). "
-            "Select 2+ sections of the same kind to merge.")
+            "Edit Start/End KP directly to move a boundary (a confirmation "
+            "shows the exact KP and optional reason). Set conclusion and "
+            "confidence in the table, or right-click a selection to set "
+            "several at once, mark final, split or merge. Select 2+ "
+            "sections of the same kind to merge.")
         section_hint.setWordWrap(True)
-        section_hint.setStyleSheet("color: #666;")
+        section_hint.setStyleSheet(ui_helpers.hint_style())
         sections_layout.addWidget(section_hint)
         section_buttons = QHBoxLayout()
         for label, slot in (("Split / insert opposite…", self._split_section),
@@ -297,19 +370,53 @@ class BuilderTab(QWidget):
         splitter.addWidget(events_widget)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
+        state = QSettings().value(_SPLITTER_SETTINGS_KEY)
+        if state is not None:
+            try:
+                splitter.restoreState(state)
+            except Exception:
+                pass
+        splitter.splitterMoved.connect(
+            lambda *_a: QSettings().setValue(_SPLITTER_SETTINGS_KEY,
+                                             splitter.saveState()))
         layout.addWidget(splitter, 1)
         events_widget.setVisible(self.show_events_check.isChecked())
 
-        model.planChanged.connect(self.refresh)
-        model.eventsChanged.connect(self.refresh)
-        model.sectionsChanged.connect(self._refresh_sections)
-        model.toolsChanged.connect(self._refresh_sections)
+        # Coalesced: load_plan emits planChanged + eventsChanged +
+        # sectionsChanged back-to-back; one deferred rebuild each.
+        refresh_soon = ui_helpers.coalesced(self, self.refresh)
+        sections_soon = ui_helpers.coalesced(self, self._refresh_sections)
+        model.planChanged.connect(refresh_soon)
+        model.eventsChanged.connect(refresh_soon)
+        model.sectionsChanged.connect(sections_soon)
+        model.toolsChanged.connect(sections_soon)
         model.logChanged.connect(self._refresh_undo_state)
         self.refresh()
 
     def _set_events_visible(self, visible: bool) -> None:
         QSettings().setValue(_SHOW_EVENTS_SETTINGS_KEY, bool(visible))
         self.events_widget.setVisible(bool(visible))
+
+    @staticmethod
+    def _apply_filter(table: QTableWidget, filter_edit: QLineEdit) -> None:
+        """Hide rows whose visible text doesn't contain the filter."""
+        needle = (filter_edit.text() or "").strip().lower()
+        for row in range(table.rowCount()):
+            if not needle:
+                table.setRowHidden(row, False)
+                continue
+            match = False
+            for column in range(table.columnCount()):
+                item = table.item(row, column)
+                if item is not None and needle in item.text().lower():
+                    match = True
+                    break
+                widget = table.cellWidget(row, column)
+                if widget is not None and hasattr(widget, "currentText") \
+                        and needle in widget.currentText().lower():
+                    match = True
+                    break
+            table.setRowHidden(row, not match)
 
     # -- progress hooks (driven by the dock) ----------------------------------
     def analysis_started(self) -> None:
@@ -351,12 +458,26 @@ class BuilderTab(QWidget):
         self.diff_label.setText(text)
 
     # -- refresh ---------------------------------------------------------------
+    def _mark_min_section_dirty(self, *_args) -> None:
+        if not self._loading:
+            self._min_section_dirty = True
+
     def refresh(self) -> None:
+        if self.model.plan_id != self._loaded_plan_id:
+            # The generation summary, run status and any typed-but-unused
+            # minimum-section edit belong to the previously open plan.
+            self._loaded_plan_id = self.model.plan_id
+            self._min_section_dirty = False
+            self.diff_label.setText("")
+            self.run_status.setText("")
         self._loading = True
         try:
             method = self.model.method
-            self.min_section_spin.setValue(
-                self.model.gen_params().min_section_km)
+            if not self._min_section_dirty:
+                # Never clobber a typed-but-unapplied minimum from an
+                # unrelated refresh (e.g. confirming or nudging an event).
+                self.min_section_spin.setValue(
+                    self.model.gen_params().min_section_km)
             self.add_type_combo.clear()
             for event_type in (schema.EVENT_BURIAL_START, schema.EVENT_BURIAL_END):
                 self.add_type_combo.addItem(ev.event_label(event_type, method), event_type)
@@ -364,33 +485,41 @@ class BuilderTab(QWidget):
             self.fresh_button.setEnabled(bool(self.model.plan))
 
             events = self.model.events
-            self.events_table.setRowCount(len(events))
-            for i, event in enumerate(events):
-                values = [
-                    str(int(event.get("seq") or 0)),
-                    ev.event_label(event.get("event_type") or "", method),
-                    schema.format_kp(event.get("kp")),
-                    f"{event.get('lat'):.7f}" if event.get("lat") is not None else "",
-                    f"{event.get('lon'):.7f}" if event.get("lon") is not None else "",
-                    f"{event.get('depth_m'):.1f}" if event.get("depth_m") is not None else "",
-                    event.get("source") or "",
-                    event.get("status") or "",
-                    "🔒" if int(event.get("locked") or 0) else "",
-                    event.get("notes") or "",
-                ]
-                for j, value in enumerate(values):
-                    item = QTableWidgetItem(value)
-                    flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-                    if j in (2, 9):  # KP and notes are editable
-                        flags |= Qt.ItemFlag.ItemIsEditable
-                    item.setFlags(flags)
-                    if j == 0:
-                        item.setData(ITEM_DATA_USER_ROLE, event.get("event_id"))
-                    if j == 7:
-                        color = _STATUS_COLORS.get(event.get("status") or "")
-                        if color is not None:
-                            item.setForeground(QBrush(color))
-                    self.events_table.setItem(i, j, item)
+            status_colors = _status_colors()
+            lock_header = self.events_table.horizontalHeaderItem(8)
+            if lock_header is not None:
+                lock_header.setToolTip(
+                    "🔒 = locked: the event cannot be moved or deleted. "
+                    "Lock/unlock a selection from the right-click menu.")
+            with ui_helpers.preserve_table_view(self.events_table):
+                self.events_table.setRowCount(len(events))
+                for i, event in enumerate(events):
+                    values = [
+                        str(int(event.get("seq") or 0)),
+                        ev.event_label(event.get("event_type") or "", method),
+                        schema.format_kp(event.get("kp")),
+                        f"{event.get('lat'):.7f}" if event.get("lat") is not None else "",
+                        f"{event.get('lon'):.7f}" if event.get("lon") is not None else "",
+                        f"{event.get('depth_m'):.1f}" if event.get("depth_m") is not None else "",
+                        event.get("source") or "",
+                        event.get("status") or "",
+                        "🔒" if int(event.get("locked") or 0) else "",
+                        event.get("notes") or "",
+                    ]
+                    for j, value in enumerate(values):
+                        item = QTableWidgetItem(value)
+                        flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                        if j in (_EVENT_KP_COL, _EVENT_NOTES_COL):
+                            flags |= Qt.ItemFlag.ItemIsEditable
+                        item.setFlags(flags)
+                        if j == 0:
+                            item.setData(ITEM_DATA_USER_ROLE, event.get("event_id"))
+                        if j == 7:
+                            color = status_colors.get(event.get("status") or "")
+                            if color is not None:
+                                item.setForeground(QBrush(color))
+                        self.events_table.setItem(i, j, item)
+            self._apply_filter(self.events_table, self.events_filter)
         finally:
             self._loading = False
         self._refresh_sections()
@@ -407,6 +536,7 @@ class BuilderTab(QWidget):
                     {"min_section_km": wanted},
                     reason="minimum candidate section"):
                 return
+        self._min_section_dirty = False
         self.dock.request_generation()
 
     def _regenerate_fresh(self) -> None:
@@ -489,6 +619,20 @@ class BuilderTab(QWidget):
         else:
             self.undo_button.setToolTip("There is no current Plan Builder edit to undo.")
 
+    def _boundary_event(self, kp) -> Optional[Dict]:
+        """The event sitting exactly on a section boundary KP, if any."""
+        try:
+            wanted = float(kp)
+        except (TypeError, ValueError):
+            return None
+        for event in self.model.events:
+            try:
+                if abs(float(event.get("kp")) - wanted) <= 1e-6:
+                    return event
+            except (TypeError, ValueError):
+                continue
+        return None
+
     def _refresh_sections(self) -> None:
         self._loading = True
         try:
@@ -496,6 +640,13 @@ class BuilderTab(QWidget):
             refs = schema.section_refs(sections, self.model.direction,
                                        self.model.method)
             ref_legend = schema.section_ref_legend(self.model.method)
+            self._rebuild_sections_table(sections, refs, ref_legend)
+            self._apply_filter(self.sections_table, self.sections_filter)
+        finally:
+            self._loading = False
+
+    def _rebuild_sections_table(self, sections, refs, ref_legend) -> None:
+        with ui_helpers.preserve_table_view(self.sections_table):
             self.sections_table.setRowCount(len(sections))
             for i, section in enumerate(sections):
                 reasons = self._reason_text(section)
@@ -522,11 +673,37 @@ class BuilderTab(QWidget):
                     reasons,
                     section.get("notes") or "",
                 ]
+                # Boundary events at the section's start/end KPs (if any):
+                # those cells edit in-table, moving the underlying event
+                # with the same validation as a profile drag.
+                start_event = self._boundary_event(section.get("start_kp"))
+                end_event = self._boundary_event(section.get("end_kp"))
                 for j, value in enumerate(values):
                     item = QTableWidgetItem(value)
                     flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
                     if j == _SECTION_NOTES_COL:
                         flags |= Qt.ItemFlag.ItemIsEditable
+                    boundary = (start_event if j == _SECTION_START_COL else
+                                end_event if j == _SECTION_END_COL else None)
+                    if boundary is not None:
+                        if int(boundary.get("locked") or 0):
+                            item.setToolTip(
+                                "Boundary event is locked — unlock it (event "
+                                "list right-click) to move it.")
+                        else:
+                            flags |= Qt.ItemFlag.ItemIsEditable
+                            item.setData(ITEM_DATA_USER_ROLE,
+                                         boundary.get("event_id"))
+                            item.setToolTip(
+                                "Edit to move this boundary event. The move "
+                                "is confirmed with the exact KP and an "
+                                "optional reason, and validated against "
+                                "neighbouring events. Adjacent sections "
+                                "update with it.")
+                    elif j in (_SECTION_START_COL, _SECTION_END_COL):
+                        item.setToolTip(
+                            "This boundary is the plan scope edge (or has "
+                            "no event) — adjust the scope on Inputs.")
                     item.setFlags(flags)
                     if j == 0:
                         item.setData(ITEM_DATA_USER_ROLE, section_id)
@@ -574,8 +751,6 @@ class BuilderTab(QWidget):
                 else:
                     self.sections_table.removeCellWidget(
                         i, _SECTION_SKIP_HANDLING_COL)
-        finally:
-            self._loading = False
 
     def _add_section_combo(self, row: int, column: int, section_id: str,
                            field: str, options, current: str,
@@ -881,34 +1056,57 @@ class BuilderTab(QWidget):
         event_id = id_item.data(ITEM_DATA_USER_ROLE) if id_item else ""
         if not event_id:
             return
-        if item.column() == 2:  # KP
+        if item.column() == _EVENT_KP_COL:
             try:
-                new_kp = float(item.text())
+                new_kp = float(item.text().replace(",", "."))
             except ValueError:
                 self.refresh()
                 return
-            self._try_move(event_id, new_kp)
-        elif item.column() == 9:  # notes
+            if not self.confirm_move_event(event_id, new_kp):
+                self.refresh()
+        elif item.column() == _EVENT_NOTES_COL:
             self.model.set_event_notes(event_id, item.text())
 
-    def _try_move(self, event_id: str, new_kp: float) -> None:
-        reason = self._maybe_reason("Move event")
-        if reason is None:
-            self.refresh()
-            return
+    def confirm_move_event(self, event_id: str, new_kp: float) -> bool:
+        """Confirm and apply an event move; the shared entry point for
+        profile drags, event-table KP edits and section-boundary edits.
+
+        The dialog shows the exact target KP (editable) plus an optional
+        reason. Returns False when cancelled or rejected by validation, so
+        callers can revert their display.
+        """
+        event = next((e for e in self.model.events
+                      if e.get("event_id") == event_id), None)
+        if event is None:
+            return False
+        if int(event.get("locked") or 0):
+            QMessageBox.warning(self, "Burial Planner",
+                                "Unlock the event before moving it.")
+            return False
+        plan = self.model.plan
+        lo = float(plan.get("scope_start_kp") or 0.0)
+        hi = float(plan.get("scope_end_kp") or 0.0)
+        label = ev.event_label(event.get("event_type") or "",
+                               self.model.method)
+        dialog = ui_helpers.MoveEventDialog(
+            label, float(event.get("kp") or 0.0), float(new_kp),
+            lo=lo, hi=hi, parent=self)
+        if qt_exec(dialog) != DIALOG_ACCEPTED:
+            return False
+        kp, reason = dialog.values()
         try:
-            self.model.move_event(event_id, new_kp, reason)
+            return bool(self.model.move_event(event_id, round(kp, 3),
+                                              reason or "moved"))
         except ValueError as exc:
             QMessageBox.warning(self, "Burial Planner", str(exc))
-            self.refresh()
+            return False
 
     def _maybe_reason(self, title: str) -> Optional[str]:
-        """Optional reason prompt on manual event edits (Cancel aborts)."""
-        text, ok = QInputDialog.getText(
-            self, title, "Reason (optional):", QLineEdit.EchoMode.Normal, "")
-        if not ok:
-            return None
-        return text
+        """Optional reason prompt on manual edits (Cancel aborts).
+
+        Suppressible per session via the dialog's checkbox.
+        """
+        return ui_helpers.ask_reason(self, title)
 
     def set_add_kp(self, kp: float) -> None:
         """Prime the add-event KP (map pick / profile double-click)."""
@@ -939,9 +1137,16 @@ class BuilderTab(QWidget):
     def _nudge(self, sign: int) -> None:
         ids = self._selected_event_ids()
         if len(ids) != 1:
+            self.run_status.setText(
+                "Select a single event in the list to nudge it.")
             return
         event = next((e for e in self.model.events if e.get("event_id") == ids[0]), None)
-        if event is None or int(event.get("locked") or 0):
+        if event is None:
+            return
+        if int(event.get("locked") or 0):
+            self.run_status.setText(
+                "The selected event is locked — unlock it (right-click) "
+                "before nudging.")
             return
         delta_km = sign * self.nudge_spin.value() / 1000.0
         try:
@@ -996,7 +1201,25 @@ class BuilderTab(QWidget):
 
     # -- section edits ---------------------------------------------------------
     def _on_section_item_changed(self, item) -> None:
-        if self._loading or item.column() != _SECTION_NOTES_COL:
+        if self._loading:
+            return
+        column = item.column()
+        if column in (_SECTION_START_COL, _SECTION_END_COL):
+            # KP cells carry the boundary event's id; editing one moves the
+            # event (same confirmation + validation as a profile drag).
+            event_id = item.data(ITEM_DATA_USER_ROLE) or ""
+            if not event_id:
+                self._refresh_sections()
+                return
+            try:
+                new_kp = float(item.text().replace(",", "."))
+            except ValueError:
+                self._refresh_sections()
+                return
+            if not self.confirm_move_event(event_id, new_kp):
+                self._refresh_sections()
+            return
+        if column != _SECTION_NOTES_COL:
             return
         id_item = self.sections_table.item(item.row(), 0)
         section_id = id_item.data(ITEM_DATA_USER_ROLE) if id_item else ""

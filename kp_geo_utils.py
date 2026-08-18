@@ -28,6 +28,7 @@ KP semantics
 from __future__ import annotations
 
 import bisect
+import threading
 from typing import Iterable, Iterator, List, NamedTuple, Optional, Sequence, Union
 
 from qgis.core import (
@@ -118,6 +119,26 @@ def _normalise_geoms(geoms) -> List[QgsGeometry]:
         if g is not None and not g.isEmpty():
             out2.append(g)
     return out2
+
+
+def crosses_antimeridian(geoms_or_geom) -> bool:
+    """True when any segment jumps more than 180° of longitude.
+
+    Every planar operation in the plugin (GEOS predicates, search
+    rectangles, stored-segment interpolation) assumes longitudes vary
+    continuously; a route straddling ±180° silently produces positions and
+    intersections on the wrong side of the planet. Callers detect and
+    refuse such routes with a clear message instead.
+    """
+    for geom in _normalise_geoms(geoms_or_geom):
+        for part in iter_line_parts(geom):
+            for i in range(len(part) - 1):
+                try:
+                    if abs(float(part[i + 1].x()) - float(part[i].x())) > 180.0:
+                        return True
+                except (TypeError, ValueError):
+                    continue
+    return False
 
 
 def measure_total_length_m(
@@ -592,6 +613,11 @@ class RouteFrame:
         self._total_m: float = running
         self._distance = distance
         self._follow_stored_geometry = bool(follow_stored_geometry)
+        # Lazy chainage/KP indexes may be built from either the main thread
+        # or a background task; the lock closes the half-initialised window.
+        self._chain_lock = threading.Lock()
+        self._kp_index = None
+        self._seg_feature: List[int] = []
 
     # ----- builders -----
 
@@ -660,35 +686,43 @@ class RouteFrame:
         """
         if getattr(self, "_seg_end_m", None) is not None:
             return
-        seg_end: List[float] = []
-        segs: List[tuple] = []  # (p1, p2, seg_len_m, cumulative_at_p1_m)
-        cumulative = 0.0
-        first_point: Optional[QgsPointXY] = None
-        last_point: Optional[QgsPointXY] = None
-        for geom in self._geoms:
-            for part in iter_line_parts(geom):
-                if len(part) < 2:
-                    continue
-                if first_point is None:
-                    first_point = QgsPointXY(part[0])
-                for i in range(len(part) - 1):
-                    p1 = part[i]
-                    p2 = part[i + 1]
-                    try:
-                        seg_len = float(self._distance.measureLine(p1, p2))
-                    except Exception:
+        with self._chain_lock:
+            if getattr(self, "_seg_end_m", None) is not None:
+                return
+            seg_end: List[float] = []
+            segs: List[tuple] = []  # (p1, p2, seg_len_m, cumulative_at_p1_m)
+            seg_feature: List[int] = []
+            cumulative = 0.0
+            first_point: Optional[QgsPointXY] = None
+            last_point: Optional[QgsPointXY] = None
+            for feature_index, geom in enumerate(self._geoms):
+                for part in iter_line_parts(geom):
+                    if len(part) < 2:
                         continue
-                    if seg_len <= 0:
-                        continue
-                    segs.append((p1, p2, seg_len, cumulative))
-                    cumulative += seg_len
-                    seg_end.append(cumulative)
-                    last_point = QgsPointXY(p2)
-        self._segs = segs
-        self._seg_end_m = seg_end
-        self._chain_total_m = cumulative
-        self._chain_first = first_point
-        self._chain_last = last_point
+                    if first_point is None:
+                        first_point = QgsPointXY(part[0])
+                    for i in range(len(part) - 1):
+                        p1 = part[i]
+                        p2 = part[i + 1]
+                        try:
+                            seg_len = float(self._distance.measureLine(p1, p2))
+                        except Exception:
+                            continue
+                        if seg_len <= 0:
+                            continue
+                        segs.append((p1, p2, seg_len, cumulative))
+                        seg_feature.append(feature_index)
+                        cumulative += seg_len
+                        seg_end.append(cumulative)
+                        last_point = QgsPointXY(p2)
+            self._segs = segs
+            self._seg_feature = seg_feature
+            self._chain_total_m = cumulative
+            self._chain_first = first_point
+            self._chain_last = last_point
+            # The guard attribute is assigned last so a concurrent reader
+            # that passes the unlocked fast check sees a complete index.
+            self._seg_end_m = seg_end
 
     def point_at_kp(self, kp_km: float, *, clamp: bool = False) -> Optional[QgsPointXY]:
         try:
@@ -717,8 +751,84 @@ class RouteFrame:
         return _interpolate_on_segment(
             p1, p2, self._distance, target_m - cum_start, seg_len)
 
+    def _ensure_kp_index(self) -> None:
+        """Spatial index over route segments for nearest-KP queries.
+
+        The free-function ``kp_at_point`` re-measures the whole route
+        geodesically on every call — O(route vertices) per query, which made
+        contour profiles and risk scans quadratic. One segment index turns
+        each query into a k-nearest lookup plus a handful of exact
+        projections; KP still comes from the same ellipsoidal chainage.
+        """
+        if self._kp_index is not None:
+            return
+        self._ensure_chainage()
+        with self._chain_lock:
+            if self._kp_index is not None:
+                return
+            from qgis.core import QgsFeature, QgsSpatialIndex
+
+            index = QgsSpatialIndex()
+            for seg_id, (p1, p2, _len, _cum) in enumerate(self._segs):
+                feat = QgsFeature()
+                feat.setId(seg_id)
+                feat.setGeometry(QgsGeometry.fromPolylineXY(
+                    [QgsPointXY(p1), QgsPointXY(p2)]))
+                index.addFeature(feat)
+            self._kp_index = index
+
     def kp_at_point(self, point_xy: QgsPointXY) -> KPHit:
-        return kp_at_point(self._geoms, point_xy, self._distance)
+        """Nearest KP on the route (indexed; same chainage as point_at_kp).
+
+        Candidate segments come from the spatial index; each candidate gets
+        the exact planar projection and a geodesic ``measureLine`` DCC, and
+        the geodesically closest wins — the same snapped point and partial
+        chainage (planar fraction × ellipsoidal segment length) the walking
+        implementation produced, without walking every vertex per call.
+        """
+        if point_xy is None:
+            return KPHit(0.0, float("inf"), None, -1)
+        self._ensure_kp_index()
+        if not self._segs:
+            return KPHit(0.0, float("inf"), None, -1)
+        query = QgsPointXY(point_xy)
+        try:
+            candidate_ids = self._kp_index.nearestNeighbor(query, 12)
+        except Exception:
+            candidate_ids = []
+        if not candidate_ids:
+            return kp_at_point(self._geoms, point_xy, self._distance)
+        qx, qy = float(query.x()), float(query.y())
+        best_dist = float("inf")
+        best_kp_m = 0.0
+        best_snapped: Optional[QgsPointXY] = None
+        best_feature = -1
+        for seg_id in candidate_ids:
+            if seg_id < 0 or seg_id >= len(self._segs):
+                continue
+            p1, p2, seg_len, cum_start = self._segs[seg_id]
+            x1, y1 = float(p1.x()), float(p1.y())
+            x2, y2 = float(p2.x()), float(p2.y())
+            dx, dy = x2 - x1, y2 - y1
+            planar_sq = dx * dx + dy * dy
+            if planar_sq <= 0.0:
+                continue
+            t = ((qx - x1) * dx + (qy - y1) * dy) / planar_sq
+            t = max(0.0, min(1.0, t))
+            snapped = QgsPointXY(x1 + t * dx, y1 + t * dy)
+            try:
+                dist = float(self._distance.measureLine(query, snapped))
+            except Exception:
+                continue
+            if dist < best_dist:
+                best_dist = dist
+                best_kp_m = cum_start + t * seg_len
+                best_snapped = snapped
+                best_feature = self._seg_feature[seg_id] \
+                    if seg_id < len(self._seg_feature) else -1
+        if best_snapped is None:
+            return kp_at_point(self._geoms, point_xy, self._distance)
+        return KPHit(best_kp_m / 1000.0, best_dist, best_snapped, best_feature)
 
     def extract_segment(self, start_kp_km: float, end_kp_km: float) -> Optional[QgsGeometry]:
         """Extract a sub-line between two KPs across the whole route.

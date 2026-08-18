@@ -14,6 +14,7 @@ so a 1000 km route is only walked once.
 from __future__ import annotations
 
 import json
+import math
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from qgis.core import (
@@ -29,6 +30,7 @@ from qgis.core import (
     QgsSpatialIndex,
     QgsVectorLayer,
 )
+from qgis.PyQt.QtGui import QTransform
 
 from ..kp_geo_utils import RouteFrame
 from ..kp_range_utils import make_distance_area
@@ -126,6 +128,13 @@ class RouteSampler:
         geoms = [g for _, g in ordered]
         if not geoms:
             raise RuleInputError("RPL route has no usable line geometry.")
+        from ..kp_geo_utils import crosses_antimeridian
+
+        if crosses_antimeridian(geoms):
+            raise RuleInputError(
+                "the route crosses the ±180° antimeridian, which the "
+                "assessment geometry does not support — positions and "
+                "intersections would be silently wrong")
 
         distance = make_distance_area(WGS84, project.transformContext())
         route = RouteFrame.from_source(geoms, distance)
@@ -221,6 +230,49 @@ def _load_features_wgs84(layer: QgsVectorLayer, project: QgsProject
     return index, store
 
 
+def _load_features_wgs84_from_source(
+        source, crs, transform_context,
+        cancel: Optional[Callable[[], bool]] = None,
+        progress: Optional[Callable[[int, int], None]] = None,
+        feature_count: int = 0,
+) -> Tuple[QgsSpatialIndex, Dict[int, Tuple[QgsGeometry, QgsFeature]]]:
+    """Worker-thread twin of ``_load_features_wgs84``.
+
+    Takes a ``QgsVectorLayerFeatureSource`` snapshot + its CRS + the
+    project's transform context (all captured on the main thread), so the
+    expensive feature iteration, reprojection and spatial-index build can
+    run inside a QgsTask with cooperative cancellation instead of freezing
+    the UI before the task starts.
+    """
+    xform = None
+    if crs != WGS84:
+        xform = QgsCoordinateTransform(crs, WGS84, transform_context)
+    index = QgsSpatialIndex()
+    store: Dict[int, Tuple[QgsGeometry, QgsFeature]] = {}
+    total = max(int(feature_count), 1)
+    for i, feat in enumerate(source.getFeatures()):
+        if i % 500 == 0:
+            if cancel is not None and cancel():
+                raise AcquisitionCancelled()
+            if progress is not None:
+                progress(min(i, total), total)
+        geom = feat.geometry()
+        if geom is None or geom.isEmpty():
+            continue
+        geom = QgsGeometry(geom)
+        if xform is not None:
+            try:
+                geom.transform(xform)
+            except Exception:
+                continue
+        store[i] = (geom, feat)
+        idx_feat = QgsFeature()
+        idx_feat.setId(i)
+        idx_feat.setGeometry(geom)
+        index.addFeature(idx_feat)
+    return index, store
+
+
 def _search_rect(point: QgsPointXY, radius_m: float):
     """Candidate-search rectangle around a WGS84 point (exact tests follow).
 
@@ -241,10 +293,45 @@ def _search_rect(point: QgsPointXY, radius_m: float):
                         point.x() + deg_lon, point.y() + deg_lat)
 
 
-def _distance_to_geom_m(distance, point: QgsPointXY, geom: QgsGeometry) -> float:
+def _isotropic_nearest(point: QgsPointXY, geom: QgsGeometry,
+                       scaled_cache: Optional[Dict] = None) -> QgsPointXY:
+    """Nearest point on ``geom`` (WGS84) to ``point``, anisotropy-corrected.
+
+    A planar ``nearestPoint`` in raw lon/lat minimises in a frame where the
+    east axis is stretched by 1/cos(latitude), so for any non-axis-aligned
+    edge it picks the wrong point and the measured distance is always an
+    overestimate (up to ~+17 % at 60°, ~+30 % at 70° for diagonal edges) —
+    which silently *shrank* metre-threshold buffers. Minimising in a
+    locally-isotropic frame (longitude × cos latitude at the geometry's own
+    latitude) removes that bias; the geodesic measurement then happens on
+    the corrected point.
+
+    ``scaled_cache`` (keyed by ``id(geom)``, caller-scoped so entries never
+    outlive the geometry objects) avoids rebuilding the scaled copy per
+    station.
+    """
+    entry = scaled_cache.get(id(geom)) if scaled_cache is not None else None
+    if entry is None:
+        lat = geom.boundingBox().center().y()
+        cos_lat = max(math.cos(math.radians(lat)), 1e-6)
+        scaled = QgsGeometry(geom)
+        scaled.transform(QTransform().scale(cos_lat, 1.0))
+        entry = (scaled, cos_lat)
+        if scaled_cache is not None:
+            scaled_cache[id(geom)] = entry
+    scaled, cos_lat = entry
+    query = QgsGeometry.fromPointXY(QgsPointXY(point.x() * cos_lat,
+                                               point.y()))
+    nearest = scaled.nearestPoint(query).asPoint()
+    return QgsPointXY(nearest.x() / cos_lat, nearest.y())
+
+
+def _distance_to_geom_m(distance, point: QgsPointXY, geom: QgsGeometry,
+                        scaled_cache: Optional[Dict] = None) -> float:
+    """Geodesic metres from ``point`` to the nearest point of ``geom``."""
     try:
-        nearest = geom.nearestPoint(QgsGeometry.fromPointXY(point))
-        return float(distance.measureLine(point, nearest.asPoint()))
+        nearest = _isotropic_nearest(point, geom, scaled_cache)
+        return float(distance.measureLine(point, nearest))
     except Exception:
         return float("inf")
 
@@ -480,17 +567,24 @@ def proximity_intervals(sampler: RouteSampler, index: QgsSpatialIndex,
 
     if geom_type == GEOMETRY_POINT:
         # Chord method: exact per-feature, independent of station spacing.
+        # Multipoint features contribute one chord per constituent point —
+        # collapsing them to a centroid placed the hit where nothing exists.
         for geom, feat in feats.values():
             if not passes_filter(feat):
                 continue
             fb = _feature_buffer_m(feat, buffer_field, buffer_m)
-            pt = geom.centroid().asPoint() if geom.isMultipart() else geom.asPoint()
-            hit = sampler.route.kp_at_point(QgsPointXY(pt))
-            if hit.snapped_xy is None:
-                continue
-            if hit.dcc_m <= fb + 1e-6:
-                half = ((max(fb, 0.0) ** 2 - hit.dcc_m ** 2) ** 0.5) / 1000.0
-                intervals.append(Interval(hit.kp_km - half, hit.kp_km + half))
+            if geom.isMultipart():
+                points = [QgsPointXY(p) for p in geom.asMultiPoint()]
+            else:
+                points = [QgsPointXY(geom.asPoint())]
+            for pt in points:
+                hit = sampler.route.kp_at_point(pt)
+                if hit.snapped_xy is None:
+                    continue
+                if hit.dcc_m <= fb + 1e-6:
+                    half = ((max(fb, 0.0) ** 2 - hit.dcc_m ** 2) ** 0.5) / 1000.0
+                    intervals.append(Interval(hit.kp_km - half,
+                                              hit.kp_km + half))
         return eng.clip_intervals(intervals, sampler.domain)
 
     # Largest buffer bounds the spatial-index search window.
@@ -501,6 +595,7 @@ def proximity_intervals(sampler: RouteSampler, index: QgsSpatialIndex,
 
     # Line / polygon: per-station distance test (captures within-buffer proximity)
     series: List[Tuple[float, bool]] = []
+    scaled_cache: Dict = {}
     for station_index, (kp, pt) in enumerate(zip(sampler.stations_km, sampler.coords)):
         if cancel is not None and station_index % _CANCEL_CHUNK == 0 and cancel():
             raise AcquisitionCancelled()
@@ -517,18 +612,24 @@ def proximity_intervals(sampler: RouteSampler, index: QgsSpatialIndex,
                     geom.contains(QgsGeometry.fromPointXY(pt))):
                 flag = True
                 break
-            if _distance_to_geom_m(sampler.distance, pt, geom) <= fb + 1e-6:
+            if _distance_to_geom_m(sampler.distance, pt, geom,
+                                   scaled_cache) <= fb + 1e-6:
                 flag = True
                 break
         series.append((kp, flag))
     intervals = eng.intervals_from_bool_series(series, sampler.domain)
 
     # Exact crossings (thin features a coarse buffer might miss between stations).
+    route_geoms = sampler.route.geometries
+    route_boxes = [g.boundingBox() for g in route_geoms]
     for geom, feat in feats.values():
         if not passes_filter(feat):
             continue
         eps_km = max(_feature_buffer_m(feat, buffer_field, buffer_m), 1.0) / 1000.0
-        for route_geom in sampler.route.geometries:
+        feat_box = geom.boundingBox()
+        for route_geom, route_box in zip(route_geoms, route_boxes):
+            if not route_box.intersects(feat_box):
+                continue
             inter = route_geom.intersection(geom)
             if inter is None or inter.isEmpty():
                 continue
@@ -606,6 +707,7 @@ def polygon_class_intervals(sampler: RouteSampler, index: QgsSpatialIndex,
         return str(val).strip().lower() in match_values
 
     series: List[Tuple[float, bool]] = []
+    scaled_cache: Dict = {}
     for station_index, (kp, pt) in enumerate(zip(sampler.stations_km, sampler.coords)):
         if cancel is not None and station_index % _CANCEL_CHUNK == 0 and cancel():
             raise AcquisitionCancelled()
@@ -623,11 +725,46 @@ def polygon_class_intervals(sampler: RouteSampler, index: QgsSpatialIndex,
                 flag = True
                 break
             if buffer_m > 0 and _distance_to_geom_m(
-                    sampler.distance, pt, geom) <= buffer_m + 1e-6:
+                    sampler.distance, pt, geom,
+                    scaled_cache) <= buffer_m + 1e-6:
                 flag = True
                 break
         series.append((kp, flag))
-    return eng.intervals_from_bool_series(series, sampler.domain)
+    intervals = eng.intervals_from_bool_series(series, sampler.domain)
+
+    # Exact crossings: a matching polygon narrower than the station spacing,
+    # crossed transversely, was invisible to the per-station test (and
+    # boundary refinement can only move existing boundaries, never recover a
+    # missed polygon). Mirror the proximity rule's exact-crossing pass.
+    route_geoms = sampler.route.geometries
+    route_boxes = [g.boundingBox() for g in route_geoms]
+    for geom, feat in feats.values():
+        if not matches(feat):
+            continue
+        feat_box = geom.boundingBox()
+        for route_geom, route_box in zip(route_geoms, route_boxes):
+            if not route_box.intersects(feat_box):
+                continue
+            try:
+                inter = route_geom.intersection(geom)
+            except Exception:
+                continue
+            if inter is None or inter.isEmpty():
+                continue
+            kps: List[float] = []
+            for pt in _iter_points(inter):
+                hit = sampler.route.kp_at_point(QgsPointXY(pt))
+                if hit.snapped_xy is not None:
+                    kps.append(float(hit.kp_km))
+            if not kps:
+                continue
+            # min/max over the intersection vertices covers non-monotone
+            # parts; pad point crossings to a visible ±0.5 m.
+            lo, hi = min(kps), max(kps)
+            if hi - lo < 0.001:
+                lo, hi = lo - 0.0005, hi + 0.0005
+            intervals.append(Interval(lo, hi))
+    return eng.clip_intervals(eng.normalize(intervals), sampler.domain)
 
 
 def _acquire_polygon_class(sampler, config, project) -> List[Interval]:
@@ -803,6 +940,8 @@ def run_assessment(store, rpl_id: str, rule_set_id: str, *, sample_step_m: float
 # ---------------------------------------------------------------------------
 resolve_layer = _resolve_layer
 load_features_wgs84 = _load_features_wgs84
+load_features_wgs84_from_source = _load_features_wgs84_from_source
+isotropic_nearest = _isotropic_nearest
 search_rect = _search_rect
 distance_to_geom_m = _distance_to_geom_m
 filter_expression = _filter_expression

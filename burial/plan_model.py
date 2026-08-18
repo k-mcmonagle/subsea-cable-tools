@@ -23,7 +23,7 @@ import json
 from typing import Callable, Dict, List, Optional, Tuple
 
 from qgis.core import QgsProject
-from qgis.PyQt.QtCore import QObject, pyqtSignal
+from qgis.PyQt.QtCore import QObject, QTimer, pyqtSignal
 
 from ..workbench.depth_service import DepthService, DepthSourceConfig
 from ..workbench.rules_engine import Interval
@@ -79,6 +79,17 @@ class PlanModel(QObject):
         self.acq_cache: Dict[str, Tuple[List[Interval], List[Interval]]] = {}
         self.route_error = ""
         self.bathy_profile: Optional[PlanProfile] = None
+        # Section route-slice WKT memo (cleared when the route changes) and
+        # the debounced layer-refresh machinery: rapid edits coalesce into
+        # one spatial-layer rewrite instead of one per keystroke.
+        self._segment_wkt_cache: Dict = {}
+        self._pending_layer_parts: set = set()
+        self._layer_timer = QTimer(self)
+        self._layer_timer.setSingleShot(True)
+        self._layer_timer.setInterval(150)
+        self._layer_timer.timeout.connect(self._flush_layer_refresh)
+        self._depth_config_cache: Optional[Tuple[str, DepthSourceConfig]] = None
+        self._profile_cache_key: Optional[Tuple[str, str, str]] = None
         self.refresh_tools(emit=False)
 
     # -- store write wrapper (Planner pattern) -------------------------------
@@ -91,6 +102,13 @@ class PlanModel(QObject):
                 f"be written.\n{self.store.gpkg_path}\n\n{exc}")
             return False, None
         return True, result
+
+    def _store_transaction(self, action: str, func: Callable):
+        """Run ``func`` inside one store transaction (atomic in SQL mode)."""
+        def wrapped():
+            with self.store.transaction():
+                return func()
+        return self._store_write(action, wrapped)
 
     # -- loading -------------------------------------------------------------
     @property
@@ -116,6 +134,13 @@ class PlanModel(QObject):
             except (ValueError, TypeError):
                 stored = {}
         stored = stored or {}
+        # ``refine_tol_m`` has never been user-editable. Treat the former
+        # fixed 1 m value as the current fixed default so existing plans gain
+        # the precision fix on their next recompute/generation.
+        refine_tol_m = float(stored.get(
+            "refine_tol_m", generation.BOUNDARY_REFINE_TOL_M))
+        if abs(refine_tol_m - 1.0) < 1e-12:
+            refine_tol_m = generation.BOUNDARY_REFINE_TOL_M
         return generation.GenParams(
             scope_start_kp=float(self.plan.get("scope_start_kp") or 0.0),
             scope_end_kp=float(self.plan.get("scope_end_kp") or 0.0),
@@ -123,7 +148,7 @@ class PlanModel(QObject):
             method=self.method,
             min_section_km=float(stored.get("min_section_km", 0.5)),
             coarse_step_m=float(stored.get("coarse_step_m", 50.0)),
-            refine_tol_m=float(stored.get("refine_tol_m", 1.0)),
+            refine_tol_m=refine_tol_m,
             sliver_tol_km=float(stored.get("sliver_tol_km", 0.0)),
             cross_offset_m=float(stored.get("cross_offset_m", 0.0)),
             profile_step_m=float(stored.get("profile_step_m", 0.0)),
@@ -133,16 +158,20 @@ class PlanModel(QObject):
         plan = self.store.get_plan(plan_id)
         if plan is None:
             return False
+        # A debounced layer write may still be pending for the plan being
+        # left; flush it (against the old plan/route state) rather than
+        # dropping it, or that plan's map layers stay stale on disk.
+        self._flush_layer_refresh()
         self.plan = plan
         self.inputs = self.store.list_inputs(plan_id)
+        self._depth_config_cache = None
         self.rules = self.store.list_rules(plan_id)
         self.events = self.store.list_events(plan_id)
         self.sections = self.store.list_sections(plan_id)
         self.risk_checks = self.store.list_risk_checks(plan_id)
         self.hazards = self.store.list_hazards(plan_id)
         self.acq_cache.clear()
-        self.bathy_profile = PlanProfile.from_row(
-            self.store.get_plan_profile(plan_id))
+        self._load_profile(plan_id)
         self._load_context()
         self._load_route()
         self._check_stale()
@@ -154,7 +183,24 @@ class PlanModel(QObject):
         self.riskChanged.emit()
         return True
 
+    def _load_profile(self, plan_id: str) -> None:
+        """Load the persisted bathymetry profile, reusing the parsed arrays
+        when the stored row is unchanged (parsing a 500k-station JSON blob
+        is expensive; reopening the same plan must not pay it twice)."""
+        row = self.store.get_plan_profile(plan_id)
+        if row is None:
+            self.bathy_profile = None
+            self._profile_cache_key = None
+            return
+        key = (plan_id, str(row.get("profile_id") or ""),
+               str(row.get("sampled_utc") or ""))
+        if self._profile_cache_key == key and self.bathy_profile is not None:
+            return
+        self.bathy_profile = PlanProfile.from_row(row)
+        self._profile_cache_key = key
+
     def close_plan(self) -> None:
+        self._flush_layer_refresh()  # keep a pending write, not drop it
         self.plan = {}
         self.inputs = []
         self.rules = []
@@ -168,6 +214,8 @@ class PlanModel(QObject):
         self.route_notice = ""
         self.acq_cache.clear()
         self.bathy_profile = None
+        self._profile_cache_key = None
+        self._depth_config_cache = None
         self.planChanged.emit()
 
     def _load_context(self) -> None:
@@ -188,6 +236,7 @@ class PlanModel(QObject):
         self.resolved_rpl_id = ""
         self.route_notice = ""
         self.route_error = ""
+        self._segment_wkt_cache.clear()
         project = QgsProject.instance()
         lines_layer = None
         rpl_id = self.plan.get("rpl_id") or ""
@@ -277,14 +326,27 @@ class PlanModel(QObject):
         Workbench RPL depth sources are intentionally not inherited. Their
         settings may suit occasional point edits but are not necessarily
         appropriate for a whole-plan longitudinal profile.
+
+        Memoised on the raw config JSON — this is called many times per
+        Generate/refresh and re-parsing the same string each time added up.
         """
+        raw = ""
         for row in self.inputs:
             if row.get("role") == schema.INPUT_ROLE_BATHY:
-                try:
-                    return DepthSourceConfig(json.loads(row.get("config_json") or "{}"))
-                except (ValueError, TypeError):
-                    return DepthSourceConfig({})
-        return DepthSourceConfig({})
+                raw = row.get("config_json") or "{}"
+                break
+        cached = self._depth_config_cache
+        if cached is not None and cached[0] == raw:
+            return cached[1]
+        if raw:
+            try:
+                config = DepthSourceConfig(json.loads(raw))
+            except (ValueError, TypeError):
+                config = DepthSourceConfig({})
+        else:
+            config = DepthSourceConfig({})
+        self._depth_config_cache = (raw, config)
+        return config
 
     def depth_service(self) -> DepthService:
         return DepthService(self.depth_config(), QgsProject.instance())
@@ -379,6 +441,7 @@ class PlanModel(QObject):
             profile.to_row(self.plan_id))
         if ok:
             self.bathy_profile = profile
+            self._profile_cache_key = None  # reparse on next plan load
         return ok
 
     def _stamp_position(self, event: Dict) -> None:
@@ -403,10 +466,11 @@ class PlanModel(QObject):
             self.tools = self.store.list_tools()
         except Exception as exc:
             # Keep the previous list rather than silently rendering every
-            # assignment as "(unregistered tool)" in exports.
+            # assignment as "(unregistered tool)" in exports. getattr: the
+            # error report must never itself raise on a broken store handle.
             self.storeError.emit(
                 f"The Burial Tools registry could not be read:\n"
-                f"{self.store.gpkg_path}\n\n{exc}")
+                f"{getattr(self.store, 'gpkg_path', '')}\n\n{exc}")
         if emit:
             self.toolsChanged.emit()
 
@@ -448,7 +512,7 @@ class PlanModel(QObject):
         self.refresh_tools()
         # The sections map layer bakes the resolved tool text in at write
         # time — re-write it so renames/deletes show on the map too.
-        self.refresh_layers()
+        self.refresh_layers(parts=("sections",))
 
     def default_tool(self) -> Tuple[str, str]:
         """The plan's default (tool_id, tool_config_id)."""
@@ -498,6 +562,15 @@ class PlanModel(QObject):
             after={schema.TABLE_PLAN: [dict(self.plan)]}, reason=reason)
         self.logChanged.emit()
         changed_keys = set(updates)
+        if (before.get("name"), before.get("rev_label")) != (
+                self.plan.get("name"), self.plan.get("rev_label")):
+            # The spatial layer names embed the plan name and revision:
+            # retire the old-named project layers and rewrite under the new
+            # names, or the map keeps showing the stale pre-rename layers
+            # alongside the new ones forever.
+            map_layers.remove_plan_layers(QgsProject.instance(),
+                                          self.store.gpkg_path, before)
+            self.refresh_layers(immediate=True)
         if "rpl_id" in changed_keys or "rpl_gpkg_path" in changed_keys:
             self._load_route()
         if {"scope_start_kp", "scope_end_kp", "direction", "rpl_id",
@@ -536,15 +609,19 @@ class PlanModel(QObject):
         before_row = self.store.get_input(row.get("input_id") or "")
         row = dict(row)
         row["plan_id"] = self.plan_id
-        ok, input_id = self._store_write("save the input", self.store.save_input, row)
+
+        def write() -> None:
+            input_id = self.store.save_input(row)
+            row["input_id"] = input_id
+            self.store.append_change(
+                self.plan_id, change_log.ACTION_SET_INPUT, input_id,
+                before={schema.TABLE_INPUT: [before_row] if before_row else []},
+                after={schema.TABLE_INPUT: [row]})
+            self.inputs = self.store.list_inputs(self.plan_id)
+
+        ok, _ = self._store_transaction("save the input", write)
         if not ok:
             return False
-        row["input_id"] = input_id
-        self.store.append_change(
-            self.plan_id, change_log.ACTION_SET_INPUT, input_id,
-            before={schema.TABLE_INPUT: [before_row] if before_row else []},
-            after={schema.TABLE_INPUT: [row]})
-        self.inputs = self.store.list_inputs(self.plan_id)
         self.mark_stale()
         self.inputsChanged.emit()
         self.logChanged.emit()
@@ -552,14 +629,18 @@ class PlanModel(QObject):
 
     def delete_input(self, input_id: str) -> bool:
         before_row = self.store.get_input(input_id)
-        ok, _ = self._store_write("delete the input", self.store.delete_input, input_id)
+
+        def write() -> None:
+            self.store.delete_input(input_id)
+            self.store.append_change(
+                self.plan_id, change_log.ACTION_DELETE_INPUT, input_id,
+                before={schema.TABLE_INPUT: [before_row] if before_row else []},
+                after={schema.TABLE_INPUT: []})
+            self.inputs = self.store.list_inputs(self.plan_id)
+
+        ok, _ = self._store_transaction("delete the input", write)
         if not ok:
             return False
-        self.store.append_change(
-            self.plan_id, change_log.ACTION_DELETE_INPUT, input_id,
-            before={schema.TABLE_INPUT: [before_row] if before_row else []},
-            after={schema.TABLE_INPUT: []})
-        self.inputs = self.store.list_inputs(self.plan_id)
         self.mark_stale()
         self.inputsChanged.emit()
         self.logChanged.emit()
@@ -568,15 +649,18 @@ class PlanModel(QObject):
     def save_rules(self, rules: List[Dict], target_id: str = "",
                    action: str = change_log.ACTION_EDIT_RULE) -> bool:
         before_rules = self.store.list_rules(self.plan_id)
-        ok, _ = self._store_write("save the rules", self.store.save_rules,
-                                  self.plan_id, rules)
+
+        def write() -> None:
+            self.store.save_rules(self.plan_id, rules)
+            self.rules = self.store.list_rules(self.plan_id)
+            self.store.append_change(
+                self.plan_id, action, target_id,
+                before={schema.TABLE_RULE: before_rules},
+                after={schema.TABLE_RULE: [dict(r) for r in self.rules]})
+
+        ok, _ = self._store_transaction("save the rules", write)
         if not ok:
             return False
-        self.rules = self.store.list_rules(self.plan_id)
-        self.store.append_change(
-            self.plan_id, action, target_id,
-            before={schema.TABLE_RULE: before_rules},
-            after={schema.TABLE_RULE: [dict(r) for r in self.rules]})
         self.mark_stale()
         self.rulesChanged.emit()
         self.logChanged.emit()
@@ -586,34 +670,80 @@ class PlanModel(QObject):
     def save_risk_checks(self, checks: List[Dict], target_id: str = "",
                          action: str = change_log.ACTION_EDIT_RISK_CHECK) -> bool:
         before_checks = self.store.list_risk_checks(self.plan_id)
-        ok, _ = self._store_write("save the risk checks",
-                                  self.store.save_risk_checks,
-                                  self.plan_id, checks)
+
+        def write() -> None:
+            self.store.save_risk_checks(self.plan_id, checks)
+            self.risk_checks = self.store.list_risk_checks(self.plan_id)
+            self.store.append_change(
+                self.plan_id, action, target_id,
+                before={schema.TABLE_RISK_CHECK: before_checks},
+                after={schema.TABLE_RISK_CHECK: [dict(c) for c in self.risk_checks]})
+
+        ok, _ = self._store_transaction("save the risk checks", write)
         if not ok:
             return False
-        self.risk_checks = self.store.list_risk_checks(self.plan_id)
-        self.store.append_change(
-            self.plan_id, action, target_id,
-            before={schema.TABLE_RISK_CHECK: before_checks},
-            after={schema.TABLE_RISK_CHECK: [dict(c) for c in self.risk_checks]})
+        self.riskChanged.emit()
+        self.logChanged.emit()
+        return True
+
+    def delete_risk_check(self, check_id: str) -> bool:
+        """Delete one check and its scanned hazards atomically.
+
+        One transaction and one change-log entry covering both tables (the
+        events+sections pattern), so a failure can never leave orphan
+        hazards rendered as "manual" and rollback restores both at once.
+        """
+        wanted = str(check_id or "")
+        checks = [dict(c) for c in self.risk_checks
+                  if str(c.get("check_id") or "") != wanted]
+        if len(checks) == len(self.risk_checks):
+            return False
+        hazards = [dict(h) for h in self.hazards
+                   if str(h.get("check_id") or "") != wanted]
+        before = {
+            schema.TABLE_RISK_CHECK: [dict(c) for c in self.risk_checks],
+            schema.TABLE_HAZARD: [dict(h) for h in self.hazards],
+        }
+
+        def write() -> None:
+            self.store.save_risk_checks(self.plan_id, checks)
+            self.risk_checks = self.store.list_risk_checks(self.plan_id)
+            self.store.save_hazards(self.plan_id, risk.sort_hazards(hazards))
+            self.hazards = self.store.list_hazards(self.plan_id)
+            self.store.append_change(
+                self.plan_id, change_log.ACTION_DELETE_RISK_CHECK, wanted,
+                before=before,
+                after={
+                    schema.TABLE_RISK_CHECK: [dict(c) for c in self.risk_checks],
+                    schema.TABLE_HAZARD: [dict(h) for h in self.hazards],
+                })
+
+        ok, _ = self._store_transaction("delete the risk check", write)
+        if not ok:
+            return False
+        self.refresh_layers(parts=("hazards",))
         self.riskChanged.emit()
         self.logChanged.emit()
         return True
 
     def _write_hazards(self, action: str, target_id: str,
                        new_hazards: List[Dict], reason: str = "") -> bool:
-        """One logged, store-written hazard mutation."""
+        """One logged, store-written hazard mutation (atomic in SQL mode)."""
         before = {schema.TABLE_HAZARD: [dict(h) for h in self.hazards]}
-        ok, _ = self._store_write("save the hazards", self.store.save_hazards,
-                                  self.plan_id, risk.sort_hazards(new_hazards))
+
+        def write() -> None:
+            self.store.save_hazards(self.plan_id,
+                                    risk.sort_hazards(new_hazards))
+            self.hazards = self.store.list_hazards(self.plan_id)
+            self.store.append_change(
+                self.plan_id, action, target_id, before=before,
+                after={schema.TABLE_HAZARD: [dict(h) for h in self.hazards]},
+                reason=reason)
+
+        ok, _ = self._store_transaction("save the hazards", write)
         if not ok:
             return False
-        self.hazards = self.store.list_hazards(self.plan_id)
-        self.store.append_change(
-            self.plan_id, action, target_id, before=before,
-            after={schema.TABLE_HAZARD: [dict(h) for h in self.hazards]},
-            reason=reason)
-        self.refresh_layers()
+        self.refresh_layers(parts=("hazards",))
         self.riskChanged.emit()
         self.logChanged.emit()
         return True
@@ -698,30 +828,35 @@ class PlanModel(QObject):
 
     def _write_events_and_sections(self, action: str, target_id: str,
                                    new_events: List[Dict], reason: str) -> bool:
-        """One logged, store-written event mutation + derived section rebuild."""
+        """One logged, store-written event mutation + derived section rebuild.
+
+        Events, sections and the change-log entry commit together (one
+        transaction in SQL mode) so a failure can never leave events moved
+        with sections still describing the old boundaries.
+        """
         before = {
             schema.TABLE_EVENT: [dict(e) for e in self.events],
             schema.TABLE_SECTION: [dict(s) for s in self.sections],
         }
         new_events = ev.sort_events(new_events, self.direction)
         new_sections = self._derive_sections(new_events)
-        ok, _ = self._store_write("save the events", self.store.save_events,
-                                  self.plan_id, new_events)
+
+        def write() -> None:
+            self.store.save_events(self.plan_id, new_events)
+            self.store.save_sections(self.plan_id, new_sections)
+            self.events = self.store.list_events(self.plan_id)
+            self.sections = self.store.list_sections(self.plan_id)
+            self.store.append_change(
+                self.plan_id, action, target_id, before=before,
+                after={
+                    schema.TABLE_EVENT: [dict(e) for e in self.events],
+                    schema.TABLE_SECTION: [dict(s) for s in self.sections],
+                }, reason=reason)
+
+        ok, _ = self._store_transaction("save the events and sections", write)
         if not ok:
             return False
-        ok, _ = self._store_write("save the sections", self.store.save_sections,
-                                  self.plan_id, new_sections)
-        if not ok:
-            return False
-        self.events = self.store.list_events(self.plan_id)
-        self.sections = self.store.list_sections(self.plan_id)
-        self.store.append_change(
-            self.plan_id, action, target_id, before=before,
-            after={
-                schema.TABLE_EVENT: [dict(e) for e in self.events],
-                schema.TABLE_SECTION: [dict(s) for s in self.sections],
-            }, reason=reason)
-        self.refresh_layers()
+        self.refresh_layers(parts=("sections", "events"))
         self.eventsChanged.emit()
         self.sectionsChanged.emit()
         self.logChanged.emit()
@@ -890,17 +1025,21 @@ class PlanModel(QObject):
             if copy.get("section_id") == section_id:
                 copy.update(updates)
             updated.append(copy)
-        ok, _ = self._store_write("save the section", self.store.save_sections,
-                                  self.plan_id, updated)
+
+        def write() -> None:
+            self.store.save_sections(self.plan_id, updated)
+            self.sections = self.store.list_sections(self.plan_id)
+            self.store.append_change(
+                self.plan_id, action, section_id,
+                before={schema.TABLE_SECTION: before_rows},
+                after={schema.TABLE_SECTION: [
+                    dict(s) for s in self.sections
+                    if s.get("section_id") == section_id]})
+
+        ok, _ = self._store_transaction("save the section", write)
         if not ok:
             return False
-        self.sections = self.store.list_sections(self.plan_id)
-        self.store.append_change(
-            self.plan_id, action, section_id,
-            before={schema.TABLE_SECTION: before_rows},
-            after={schema.TABLE_SECTION: [
-                dict(s) for s in self.sections if s.get("section_id") == section_id]})
-        self.refresh_layers()
+        self.refresh_layers(parts=("sections",))
         self.sectionsChanged.emit()
         self.logChanged.emit()
         return True
@@ -920,18 +1059,21 @@ class PlanModel(QObject):
         if not changed:
             return 0
         before = {schema.TABLE_SECTION: [dict(s) for s in self.sections]}
-        ok, _ = self._store_write("save the sections", self.store.save_sections,
-                                  self.plan_id, updated)
+
+        def write() -> None:
+            self.store.save_sections(self.plan_id, updated)
+            self.sections = self.store.list_sections(self.plan_id)
+            self.store.append_change(
+                self.plan_id, change_log.ACTION_EDIT_SECTION,
+                "skip_handling_auto", before=before,
+                after={schema.TABLE_SECTION: [dict(s) for s in self.sections]},
+                reason=f"auto-assign skip handling (mid-water transit ≤ "
+                       f"{float(transit_max_km):g} km)")
+
+        ok, _ = self._store_transaction("save the sections", write)
         if not ok:
             return -1
-        self.sections = self.store.list_sections(self.plan_id)
-        self.store.append_change(
-            self.plan_id, change_log.ACTION_EDIT_SECTION, "skip_handling_auto",
-            before=before,
-            after={schema.TABLE_SECTION: [dict(s) for s in self.sections]},
-            reason=f"auto-assign skip handling (mid-water transit ≤ "
-                   f"{float(transit_max_km):g} km)")
-        self.refresh_layers()
+        self.refresh_layers(parts=("sections",))
         self.sectionsChanged.emit()
         self.logChanged.emit()
         return changed
@@ -1001,13 +1143,19 @@ class PlanModel(QObject):
                          params: generation.GenParams, rule_rows: List[Dict],
                          inputs_fingerprints: Dict[str, str],
                          generation_id: str) -> bool:
-        """Persist one algorithm run atomically-ish: snapshot row + events +
-        sections + layers together, one logged change (main thread)."""
+        """Persist one algorithm run atomically: snapshot row + events +
+        sections + change log in one transaction (main thread)."""
+        # Snapshot only the generation rows that this run actually changes
+        # (the currently-active ones flip to inactive). Snapshotting every
+        # historic generation made each Generate's log entry grow with the
+        # plan's history — every prior row carries its own full context.
+        previously_active = [
+            dict(g) for g in self.store.list_generations(self.plan_id)
+            if int(g.get("active") or 0)]
         before = {
             schema.TABLE_EVENT: [dict(e) for e in self.events],
             schema.TABLE_SECTION: [dict(s) for s in self.sections],
-            schema.TABLE_GENERATION: [dict(g) for g in
-                                      self.store.list_generations(self.plan_id)],
+            schema.TABLE_GENERATION: previously_active,
         }
         summary = dict(output.summary)
         summary["context"] = generation.context_to_dict(output)
@@ -1021,31 +1169,31 @@ class PlanModel(QObject):
             "summary_json": json.dumps(summary),
             "proposal_diff_json": json.dumps(output.proposal_diff or {}),
         }
-        ok, _ = self._store_write("save the generation", self.store.save_generation, gen_row)
-        if not ok:
-            return False
-        ok, _ = self._store_write("save the events", self.store.save_events,
-                                  self.plan_id, output.events)
-        if not ok:
-            return False
-        ok, _ = self._store_write("save the sections", self.store.save_sections,
-                                  self.plan_id, output.sections)
+
+        def write() -> None:
+            self.store.save_generation(gen_row)
+            self.store.save_events(self.plan_id, output.events)
+            self.store.save_sections(self.plan_id, output.sections)
+            self.events = self.store.list_events(self.plan_id)
+            self.sections = self.store.list_sections(self.plan_id)
+            self.plan["status"] = schema.PLAN_STATUS_DRAFT
+            self.plan["rpl_fingerprint"] = self.current_rpl_fingerprint()
+            self.store.save_plan(self.plan)
+            deactivated = [dict(row, active=0) for row in previously_active]
+            self.store.append_change(
+                self.plan_id, change_log.ACTION_GENERATE, generation_id,
+                before=before,
+                after={
+                    schema.TABLE_EVENT: [dict(e) for e in self.events],
+                    schema.TABLE_SECTION: [dict(s) for s in self.sections],
+                    schema.TABLE_GENERATION: deactivated + [gen_row],
+                })
+
+        ok, _ = self._store_transaction("save the generation", write)
         if not ok:
             return False
         self.context = generation.context_from_dict(summary["context"])
-        self.events = self.store.list_events(self.plan_id)
-        self.sections = self.store.list_sections(self.plan_id)
-        self.plan["status"] = schema.PLAN_STATUS_DRAFT
-        self.plan["rpl_fingerprint"] = self.current_rpl_fingerprint()
-        self._store_write("save the plan", self.store.save_plan, self.plan)
-        self.store.append_change(
-            self.plan_id, change_log.ACTION_GENERATE, generation_id, before=before,
-            after={
-                schema.TABLE_EVENT: [dict(e) for e in self.events],
-                schema.TABLE_SECTION: [dict(s) for s in self.sections],
-                schema.TABLE_GENERATION: [gen_row],
-            })
-        self.refresh_layers()
+        self.refresh_layers(parts=("sections", "events"))
         self.planChanged.emit()
         self.eventsChanged.emit()
         self.sectionsChanged.emit()
@@ -1092,17 +1240,38 @@ class PlanModel(QObject):
         return True
 
     # -- layers --------------------------------------------------------------
-    def refresh_layers(self) -> None:
+    def refresh_layers(self, parts=None, immediate: bool = False) -> None:
+        """Schedule a spatial-layer refresh (debounced, per changed part).
+
+        ``parts`` names the layers whose data changed ("sections",
+        "events", "hazards"); None refreshes all three. Rapid consecutive
+        edits coalesce into one write ~150 ms after the last one; pass
+        ``immediate=True`` to flush synchronously.
+        """
         if not self.plan or self.route is None:
             return
+        self._pending_layer_parts.update(
+            map_layers.ALL_PLAN_LAYER_PARTS if parts is None else parts)
+        if immediate:
+            self._flush_layer_refresh()
+        else:
+            self._layer_timer.start()
+
+    def _flush_layer_refresh(self) -> None:
+        self._layer_timer.stop()
+        parts = sorted(self._pending_layer_parts)
+        self._pending_layer_parts = set()
+        if not parts or not self.plan or self.route is None:
+            return
         try:
-            map_layers.write_plan_layers(self.store, self.plan, self.sections,
-                                         self.events, self.route,
-                                         hazards=self.hazards,
-                                         risk_checks=self.risk_checks,
-                                         tools=self.tools)
+            map_layers.write_plan_layers(
+                self.store, self.plan, self.sections, self.events, self.route,
+                hazards=self.hazards, risk_checks=self.risk_checks,
+                tools=self.tools, parts=parts,
+                segment_wkt_cache=self._segment_wkt_cache)
             map_layers.ensure_plan_layers(QgsProject.instance(),
-                                          self.store.gpkg_path, self.plan)
+                                          self.store.gpkg_path, self.plan,
+                                          parts=parts)
         except Exception as exc:
             self.storeError.emit(f"Plan layers could not be refreshed: {exc}")
 

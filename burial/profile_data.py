@@ -30,9 +30,24 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+try:  # NumPy ships with QGIS; the pure-python paths remain as fallback.
+    import numpy as _np
+except ImportError:  # pragma: no cover
+    _np = None
+
 from . import schema
 
 Sample = Tuple[float, Optional[float]]
+
+# Slope-series memo: keep a handful of window keys; a user sweeping the
+# evaluation length must not accumulate 500k-element lists forever.
+_MAX_SLOPE_CACHE_KEYS = 6
+
+
+def _nan_array(values: List[Optional[float]]):
+    """values (None = gap) → float64 array with NaN gaps (NumPy path)."""
+    return _np.array([_np.nan if v is None else v for v in values],
+                     dtype=float)
 
 
 @dataclass
@@ -61,17 +76,37 @@ class PlanProfile:
         return len(self.kps)
 
     def has_cross(self) -> bool:
-        return (self.cross_offset_m > 0
-                and any(v is not None for v in self.port_depths)
-                and any(v is not None for v in self.stbd_depths))
+        cached = self._slope_cache.get("_has_cross")
+        if cached is None:
+            cached = (self.cross_offset_m > 0
+                      and any(v is not None for v in self.port_depths)
+                      and any(v is not None for v in self.stbd_depths))
+            self._slope_cache["_has_cross"] = cached
+        return cached
 
     def series(self) -> List[Tuple[float, float]]:
-        """(kp, depth magnitude) for stations with data — display/analysis."""
-        return [(kp, d) for kp, d in zip(self.kps, self.depths) if d is not None]
+        """(kp, depth magnitude) for stations with data — display/analysis.
+
+        Memoised: rebuilding a 500k-tuple list per profile refresh was a
+        visible stall. Treat the result as read-only.
+        """
+        cached = self._slope_cache.get("_series")
+        if cached is None:
+            cached = [(kp, d) for kp, d in zip(self.kps, self.depths)
+                      if d is not None]
+            self._slope_cache["_series"] = cached
+        return cached
 
     def samples(self) -> List[Sample]:
-        """(kp, depth|None) for every station — no-data gap detection."""
-        return list(zip(self.kps, self.depths))
+        """(kp, depth|None) for every station — no-data gap detection.
+
+        Memoised; treat the result as read-only.
+        """
+        cached = self._slope_cache.get("_samples")
+        if cached is None:
+            cached = list(zip(self.kps, self.depths))
+            self._slope_cache["_samples"] = cached
+        return cached
 
     def depth_at(self, kp: float) -> Optional[float]:
         """Interpolated depth magnitude at a KP (None outside sampled data).
@@ -101,6 +136,12 @@ class PlanProfile:
             self.cross_offset_m, direction) if self.has_cross() else []
         abs_series = absolute_slope_series(long_series, cross_series)
         result = (long_series, cross_series, abs_series)
+        # Bounded memo: drop the oldest window entries so sweeping the
+        # evaluation length cannot retain unlimited 500k-element lists.
+        window_keys = [k for k in self._slope_cache
+                       if isinstance(k, tuple)]
+        while len(window_keys) >= _MAX_SLOPE_CACHE_KEYS:
+            self._slope_cache.pop(window_keys.pop(0), None)
         self._slope_cache[key] = result
         return result
 
@@ -128,6 +169,9 @@ class PlanProfile:
         }
 
         def compact(values: List[Optional[float]], places: int) -> List:
+            if _np is not None and values:
+                rounded = _np.round(_nan_array(values), places)
+                return [None if v != v else v for v in rounded.tolist()]
             return [None if v is None else round(float(v), places)
                     for v in values]
 
@@ -157,11 +201,21 @@ class PlanProfile:
             return None
         if not isinstance(params, dict) or not isinstance(samples, dict):
             return None
-        kps = [float(v) for v in (samples.get("kps") or [])]
+        # json.loads already yields numbers — the defensive per-element
+        # float() conversion over 4 × 500k values cost seconds per plan
+        # open. Convert lazily only when a non-number sneaks in.
+        raw_kps = samples.get("kps") or []
+        try:
+            kps = [v + 0.0 for v in raw_kps]
+        except TypeError:
+            kps = [float(v) for v in raw_kps]
 
         def floats(key: str) -> List[Optional[float]]:
             values = samples.get(key) or []
-            out = [None if v is None else float(v) for v in values]
+            try:
+                out = [None if v is None else v + 0.0 for v in values]
+            except TypeError:
+                out = [None if v is None else float(v) for v in values]
             out.extend([None] * (len(kps) - len(out)))
             return out[:len(kps)]
 
@@ -219,9 +273,11 @@ def long_slope_series(kps: List[float], depths: List[Optional[float]],
     window (the analysis-step / vehicle-footprint convention), clamped to
     the sampled range so edge stations use the available window.
     """
+    half = max(float(half_window_km), 1e-9)
+    if _np is not None and kps:
+        return _long_slope_series_np(kps, depths, half)
     xs, ys = _valid_pairs(kps, depths)
     out: List[Sample] = []
-    half = max(float(half_window_km), 1e-9)
     for kp in kps:
         if not xs:
             out.append((kp, None))
@@ -242,6 +298,32 @@ def long_slope_series(kps: List[float], depths: List[Optional[float]],
     return out
 
 
+def _long_slope_series_np(kps: List[float], depths: List[Optional[float]],
+                          half: float) -> List[Sample]:
+    """Vectorised twin of the pure-python loop above (same semantics:
+    interpolation across no-data gaps between valid stations, None where
+    the clamped window collapses)."""
+    kp_arr = _np.asarray(kps, dtype=float)
+    depth_arr = _nan_array(depths)
+    valid = ~_np.isnan(depth_arr)
+    if not bool(valid.any()):
+        return [(kp, None) for kp in kps]
+    xs = kp_arr[valid]
+    ys = depth_arr[valid]
+    k0 = _np.clip(kp_arr - half, xs[0], xs[-1])
+    k1 = _np.clip(kp_arr + half, xs[0], xs[-1])
+    dx_m = (k1 - k0) * 1000.0
+    d0 = _np.interp(k0, xs, ys)
+    d1 = _np.interp(k1, xs, ys)
+    with _np.errstate(invalid="ignore"):
+        slopes = _np.degrees(_np.arctan2(-(d1 - d0), dx_m))
+    bad = dx_m <= 1e-6
+    values = slopes.tolist()
+    flags = bad.tolist()
+    return [(kp, None if flag else value)
+            for kp, value, flag in zip(kps, values, flags)]
+
+
 def cross_slope_series(kps: List[float],
                        port_depths: List[Optional[float]],
                        stbd_depths: List[Optional[float]],
@@ -254,9 +336,17 @@ def cross_slope_series(kps: List[float],
     installing against KP swaps the vehicle's port/starboard, so the sign
     flips for direction −1.
     """
-    out: List[Sample] = []
     span_m = 2.0 * max(float(cross_offset_m), 1e-9)
     sign = -1.0 if int(direction or 1) < 0 else 1.0
+    if _np is not None and kps:
+        port_arr = _nan_array(port_depths)
+        stbd_arr = _nan_array(stbd_depths)
+        with _np.errstate(invalid="ignore"):
+            slopes = sign * _np.degrees(
+                _np.arctan2(stbd_arr - port_arr, span_m))
+        return [(kp, None if value != value else value)
+                for kp, value in zip(kps, slopes.tolist())]
+    out: List[Sample] = []
     for kp, port, stbd in zip(kps, port_depths, stbd_depths):
         if port is None or stbd is None:
             out.append((kp, None))
@@ -313,13 +403,22 @@ def absolute_slope_series(long_series: List[Sample],
     Where cross slope is unavailable the longitudinal magnitude is reported
     (a lower bound on the true absolute slope).
     """
-    cross_by_kp = {kp: value for kp, value in cross_series}
+    # Both series are built over the same station list, so positional
+    # pairing applies; the float-keyed dict is only the fallback for
+    # callers that pass differently-shaped series.
+    if len(cross_series) == len(long_series):
+        paired = ((kp, long_deg, cross_deg)
+                  for (kp, long_deg), (_kp2, cross_deg)
+                  in zip(long_series, cross_series))
+    else:
+        cross_by_kp = {kp: value for kp, value in cross_series}
+        paired = ((kp, long_deg, cross_by_kp.get(kp))
+                  for kp, long_deg in long_series)
     out: List[Sample] = []
-    for kp, long_deg in long_series:
+    for kp, long_deg, cross_deg in paired:
         if long_deg is None:
             out.append((kp, None))
             continue
-        cross_deg = cross_by_kp.get(kp)
         if cross_deg is None:
             out.append((kp, abs(long_deg)))
             continue

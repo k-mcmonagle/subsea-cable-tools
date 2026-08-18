@@ -21,7 +21,6 @@ import json
 from typing import Dict, List, Optional
 
 from qgis.PyQt.QtCore import Qt
-from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -61,7 +60,8 @@ from ...qgis_compat import (
 )
 from ...workbench.kp_bars import FireBarDelegate, VerdictStrip
 from ...workbench.rules_engine import Interval
-from .. import change_log, map_layers, risk, risk_scan, schema
+from .. import map_layers, risk, risk_scan, schema
+from .. import ui_helpers
 
 _CHECK_FIRE_COL = 2
 _CHECK_COLUMNS = ["On", "Check", "Findings", "Hazards"]
@@ -72,12 +72,15 @@ _HAZARD_RISK_COL = 0
 _HAZARD_STATUS_COL = 1
 _HAZARD_NOTES_COL = 9
 
-_RISK_COLORS = {
-    schema.RISK_HIGH: QColor("#d62728"),
-    schema.RISK_MEDIUM: QColor("#ff8c00"),
-    schema.RISK_LOW: QColor("#e0b000"),
-    schema.RISK_UNASSIGNED: QColor("#909090"),
-}
+
+def _risk_colors():
+    """Theme-aware risk colours (resolved at refresh time)."""
+    return {
+        schema.RISK_HIGH: ui_helpers.qcolor("risk_high"),
+        schema.RISK_MEDIUM: ui_helpers.qcolor("risk_medium"),
+        schema.RISK_LOW: ui_helpers.qcolor("risk_low"),
+        schema.RISK_UNASSIGNED: ui_helpers.qcolor("risk_unassigned"),
+    }
 
 # Register-size guards: per-row combo widgets cost ~1 ms each, so a dense
 # scan (thousands of boulder picks) would freeze the UI on every refresh.
@@ -171,7 +174,7 @@ class CheckEditorDialog(QDialog):
             "threshold is your criterion (e.g. from the tool's minimum "
             "turning radius); record its source underneath.")
         turns_note.setWordWrap(True)
-        turns_note.setStyleSheet("color: #666;")
+        turns_note.setStyleSheet(ui_helpers.hint_style())
         turns_form.addRow(turns_note)
         layout.addWidget(self.turns_group)
 
@@ -194,7 +197,7 @@ class CheckEditorDialog(QDialog):
             "band off. Values are your project's criteria — record the "
             "source below.")
         bands_note.setWordWrap(True)
-        bands_note.setStyleSheet("color: #666;")
+        bands_note.setStyleSheet(ui_helpers.hint_style())
         bands_form.addRow(bands_note)
         layout.addWidget(self.bands_group)
 
@@ -265,6 +268,30 @@ class CheckEditorDialog(QDialog):
                 "Choose a risk level for flagged A/Cs — with it unassigned "
                 "the check records nothing.")
             return
+        if not turns:
+            if not (self.input_combo.currentData() or ""):
+                QMessageBox.warning(
+                    self, "Burial Planner",
+                    "Pick a registered input for this feature check — "
+                    "without one the check is skipped at scan time. "
+                    "Register layers on the Inputs tab first.")
+                return
+            bad_rules = []
+            for row in range(self.rules_table.rowCount()):
+                item = self.rules_table.item(row, 0)
+                text = (item.text() if item is not None else "").strip()
+                if not text:
+                    continue
+                if risk.parse_attribute_rule(text, schema.RISK_LOW) is None:
+                    bad_rules.append(f"rule {row + 1}: '{text}'")
+            if bad_rules:
+                QMessageBox.warning(
+                    self, "Burial Planner",
+                    "These attribute rules are not valid and would be "
+                    "ignored: " + ", ".join(bad_rules[:5])
+                    + ". Use an exact value (ROCK) or a numeric range "
+                    "(2-5, 2-, -3).")
+                return
         self.accept()
 
     def _sync_kind(self) -> None:
@@ -391,14 +418,29 @@ class ManualHazardDialog(QDialog):
         layout.addLayout(form)
         buttons = QDialogButtonBox()
         buttons.setStandardButtons(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
-        buttons.accepted.connect(self.accept)
+        buttons.accepted.connect(self._accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def _accept(self) -> None:
+        if self.range_check.isChecked() \
+                and self.end_spin.value() <= self.kp_spin.value():
+            QMessageBox.warning(
+                self, "Burial Planner",
+                "The range end KP must be greater than the start KP "
+                "(or untick 'KP range').")
+            return
+        self.accept()
+
     def _pick_kp(self) -> None:
-        self.dock.pick_kp_on_map(
-            lambda kp: self.kp_spin.setValue(round(float(kp), 3)),
-            "Click the route to set the hazard KP (right-click cancels).")
+        # This dialog is application-modal while exec() runs: hide it for
+        # the duration of the pick or the canvas can never take the click;
+        # on_finished re-shows it on pick, cancel or tool switch alike.
+        if self.dock.pick_kp_on_map(
+                lambda kp: self.kp_spin.setValue(round(float(kp), 3)),
+                "Click the route to set the hazard KP (right-click cancels).",
+                on_finished=self.show):
+            self.hide()
 
     def values(self):
         end_kp = self.end_spin.value() if self.range_check.isChecked() else None
@@ -431,6 +473,11 @@ class RiskTab(QWidget):
         checks_layout.setContentsMargins(0, 0, 0, 0)
         self.check_table = QTableWidget(0, len(_CHECK_COLUMNS))
         self.check_table.setHorizontalHeaderLabels(_CHECK_COLUMNS)
+        findings_header = self.check_table.horizontalHeaderItem(_CHECK_FIRE_COL)
+        if findings_header is not None:
+            findings_header.setToolTip(
+                "KP extent of this check's hazards along the scope; the bar "
+                "colour is the check's worst assigned risk.")
         self.check_table.verticalHeader().setVisible(False)
         self.check_table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
         self.check_table.setSelectionMode(SELECTION_MODE_SINGLE)
@@ -447,24 +494,31 @@ class RiskTab(QWidget):
         checks_layout.addWidget(self.check_table, 1)
 
         check_buttons = QHBoxLayout()
-        add_button = QPushButton("＋ Add check…")
-        add_button.clicked.connect(self._add_check)
-        check_buttons.addWidget(add_button)
-        for label, slot in (("Edit…", self._edit_check),
-                            ("Delete", self._delete_check),
-                            ("↑", lambda: self._move_check(-1)),
-                            ("↓", lambda: self._move_check(1))):
+        self.add_check_button = QPushButton("＋ Add check…")
+        self.add_check_button.clicked.connect(self._add_check)
+        check_buttons.addWidget(self.add_check_button)
+        for label, slot, tip in (
+                ("Edit…", self._edit_check,
+                 "Edit the current check (double-click also edits)."),
+                ("Delete…", self._delete_check,
+                 "Delete the current check and its hazards (confirmed)."),
+                ("↑", lambda: self._move_check(-1),
+                 "Move the check up the list."),
+                ("↓", lambda: self._move_check(1),
+                 "Move the check down the list.")):
             button = QPushButton(label)
+            button.setToolTip(tip)
             button.clicked.connect(slot)
             check_buttons.addWidget(button)
         check_buttons.addStretch(1)
-        self.run_button = QPushButton("Run checks")
-        self.run_button.setToolTip(
-            "Scan every enabled check's input layer for features on or "
-            "near the route and rebuild the hazard register. Your review "
-            "(risk overrides, status, notes) is carried over by feature; "
-            "manual hazards are never touched.")
-        self.run_button.clicked.connect(lambda: self._run_checks())
+        self.run_button = ui_helpers.menu_tool_button(
+            "Run ▾",
+            (("Run all enabled checks", lambda: self._run_checks()),
+             ("Run selected check", self._run_selected_check)),
+            tooltip="Scan the registered input layers for features on or "
+                    "near the route and rebuild the hazard register. Your "
+                    "review (risk overrides, status, notes) is carried over "
+                    "by feature; manual hazards are never touched.")
         check_buttons.addWidget(self.run_button)
         self.stop_button = QPushButton("Stop")
         self.stop_button.setEnabled(False)
@@ -500,17 +554,38 @@ class RiskTab(QWidget):
                 "Nearest approach from the route centreline, signed by the "
                 "direction of travel: + to starboard, − to port "
                 "(positive when the side cannot be resolved).")
+        crossing_header = self.hazard_table.horizontalHeaderItem(5)
+        if crossing_header is not None:
+            crossing_header.setToolTip(
+                "✕ = the feature crosses the route (offset 0).")
+        angle_header = self.hazard_table.horizontalHeaderItem(6)
+        if angle_header is not None:
+            angle_header.setToolTip(
+                "Crossing angle in degrees, where applicable.")
+        notes_header = self.hazard_table.horizontalHeaderItem(
+            _HAZARD_NOTES_COL)
+        if notes_header is not None:
+            notes_header.setToolTip(
+                "Editable in place — double-click a Notes cell to edit. "
+                "Double-clicking other cells zooms to the hazard.")
         self.hazard_table.verticalHeader().setVisible(False)
         self.hazard_table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
         self.hazard_table.setSelectionMode(SELECTION_MODE_EXTENDED)
         self.hazard_table.horizontalHeader().setStretchLastSection(True)
+        # Right-click the header to hide secondary columns (persisted).
+        ui_helpers.enable_column_menu(
+            self.hazard_table,
+            "SubseaCableTools/BurialPlanner/hazard_hidden_columns",
+            always_visible=(_HAZARD_RISK_COL, 2))
         self.hazard_table.itemChanged.connect(self._on_hazard_item_changed)
         self.hazard_table.itemSelectionChanged.connect(self._on_hazard_selected)
         self.hazard_table.setContextMenuPolicy(CONTEXT_MENU_POLICY_CUSTOM)
         self.hazard_table.customContextMenuRequested.connect(
             self._hazard_context_menu)
+        # Notes edits on double-click; other cells navigate.
         self.hazard_table.cellDoubleClicked.connect(
-            lambda row, _column: self._goto_hazard_row(row))
+            lambda row, column: self._goto_hazard_row(row)
+            if column != _HAZARD_NOTES_COL else None)
         hazards_layout.addWidget(self.hazard_table, 1)
         splitter.addWidget(hazards_widget)
         splitter.setStretchFactor(0, 2)
@@ -523,14 +598,18 @@ class RiskTab(QWidget):
         status_row.addWidget(self.status_label, 1)
         layout.addLayout(status_row)
 
-        model.planChanged.connect(self.refresh)
-        model.riskChanged.connect(self.refresh)
+        refresh_soon = ui_helpers.coalesced(self, self.refresh)
+        model.planChanged.connect(refresh_soon)
+        model.riskChanged.connect(refresh_soon)
         self.refresh()
 
     # -- refresh --------------------------------------------------------------
     def refresh(self) -> None:
         self._loading = True
         try:
+            has_plan = bool(self.model.plan)
+            self.add_check_button.setEnabled(has_plan)
+            self.run_button.setEnabled(has_plan and self._scan_task is None)
             params = self.model.gen_params()
             scope = params.scope
             checks = self.model.risk_checks
@@ -540,6 +619,9 @@ class RiskTab(QWidget):
                 by_check.setdefault(str(hazard.get("check_id") or ""),
                                     []).append(hazard)
 
+            self._checks_view = ui_helpers.preserve_table_view(
+                self.check_table)
+            self._checks_view.__enter__()
             self.check_table.setRowCount(len(checks))
             for i, check in enumerate(checks):
                 on_item = QTableWidgetItem()
@@ -570,7 +652,7 @@ class RiskTab(QWidget):
                                    | Qt.ItemFlag.ItemIsSelectable)
                 fire_item.setData(
                     ITEM_DATA_USER_ROLE,
-                    (scope.length_km, intervals, _RISK_COLORS[worst],
+                    (scope.length_km, intervals, _risk_colors()[worst],
                      scope.start_km))
                 self.check_table.setItem(i, _CHECK_FIRE_COL, fire_item)
 
@@ -579,6 +661,7 @@ class RiskTab(QWidget):
                 count_item.setFlags(Qt.ItemFlag.ItemIsEnabled
                                     | Qt.ItemFlag.ItemIsSelectable)
                 self.check_table.setItem(i, 3, count_item)
+            self._checks_view.__exit__(None, None, None)
 
             self._refresh_hazards()
             self._refresh_overview(scope)
@@ -587,9 +670,10 @@ class RiskTab(QWidget):
 
     def _refresh_overview(self, scope) -> None:
         spans = []
+        risk_colors = _risk_colors()
         for start_km, end_km, level in risk.hazard_spans(self.model.hazards):
-            spans.append((start_km, end_km, _RISK_COLORS.get(
-                level, _RISK_COLORS[schema.RISK_UNASSIGNED])))
+            spans.append((start_km, end_km, risk_colors.get(
+                level, risk_colors[schema.RISK_UNASSIGNED])))
         self.overview.set_spans(scope.length_km, spans, "Risk",
                                 domain_start_km=scope.start_km)
 
@@ -618,7 +702,8 @@ class RiskTab(QWidget):
 
         self.hazard_table.setUpdatesEnabled(False)
         try:
-            self._populate_hazard_rows(shown, check_names, use_combos)
+            with ui_helpers.preserve_table_view(self.hazard_table):
+                self._populate_hazard_rows(shown, check_names, use_combos)
         finally:
             self.hazard_table.setUpdatesEnabled(True)
 
@@ -657,7 +742,7 @@ class RiskTab(QWidget):
                 if j == 0:
                     item.setData(ITEM_DATA_USER_ROLE, hazard_id)
                     if not use_combos:
-                        color = _RISK_COLORS.get(level)
+                        color = _risk_colors().get(level)
                         if color is not None:
                             from qgis.PyQt.QtGui import QBrush
                             item.setForeground(QBrush(color))
@@ -703,7 +788,7 @@ class RiskTab(QWidget):
         if tooltip:
             combo.setToolTip(tooltip)
         if field == "risk":
-            color = _RISK_COLORS.get(current or "")
+            color = _risk_colors().get(current or "")
             if color is not None:
                 combo.setStyleSheet(f"color: {color.name()};")
         combo.currentIndexChanged.connect(
@@ -886,13 +971,7 @@ class RiskTab(QWidget):
                                       MESSAGE_BOX_NO)
         if answer != MESSAGE_BOX_YES:
             return
-        checks = [c for i, c in enumerate(self.model.risk_checks) if i != index]
-        self.model.save_risk_checks(
-            checks, target_id=check_id,
-            action=change_log.ACTION_DELETE_RISK_CHECK)
-        if found:
-            self.model.delete_hazards(
-                [h.get("hazard_id") for h in found])
+        self.model.delete_risk_check(check_id)
 
     def _move_check(self, delta: int) -> None:
         index = self._selected_check_index()
@@ -918,9 +997,18 @@ class RiskTab(QWidget):
         self.model.save_risk_checks(
             checks, target_id=str(checks[index].get("check_id")))
 
+    def _run_selected_check(self) -> None:
+        index = self._selected_check_index()
+        if index < 0 or index >= len(self.model.risk_checks):
+            self.status_label.setText("Select a check to run it alone.")
+            return
+        check_id = str(self.model.risk_checks[index].get("check_id") or "")
+        self._run_checks([check_id])
+
     # -- scan (background task, BurialAnalysisTask pattern) --------------------
     def _run_checks(self, check_ids: Optional[List[str]] = None) -> None:
         if not self.model.plan:
+            self.status_label.setText("Open a plan first.")
             return
         if self._scan_task is not None:
             self.status_label.setText("A scan is already running.")
@@ -951,6 +1039,9 @@ class RiskTab(QWidget):
             [QgsGeometry(g) for g in route_geoms])
         jobs = []
         warnings: List[str] = []
+        # Load + index each distinct input layer once, however many checks
+        # scan it (previously once per check).
+        layer_cache: Dict[str, tuple] = {}
         for check in checks:
             config = risk.check_config(check)
             if risk_scan.check_kind(config) == risk_scan.CHECK_KIND_ROUTE_TURNS:
@@ -965,10 +1056,25 @@ class RiskTab(QWidget):
             layer = map_layers.resolve_input_layer(
                 QgsProject.instance(), input_row)
             try:
+                preloaded = None
+                layer_key = layer.id() if layer is not None else ""
+                if layer_key:
+                    preloaded = layer_cache.get(layer_key)
+                    if preloaded is None and layer.isValid():
+                        from ...workbench import rules_inputs as ri
+
+                        preloaded = ri.load_features_wgs84(
+                            layer, QgsProject.instance())
+                        layer_cache[layer_key] = preloaded
                 features = risk_scan.snapshot_check_features(
-                    check, layer, route_geom)
+                    check, layer, route_geom, preloaded=preloaded)
             except risk_scan.RiskScanError as exc:
                 warnings.append(str(exc))
+                continue
+            except Exception as exc:
+                warnings.append(
+                    f"Check '{check.get('name')}': the input layer could "
+                    f"not be read ({exc}) — skipped.")
                 continue
             jobs.append((dict(check), features))
         if not jobs:
@@ -995,12 +1101,36 @@ class RiskTab(QWidget):
         if self._scan_task is not None:
             self._scan_task.cancel()
 
+    def shutdown(self) -> None:
+        """Cancel and forget a running scan (dock close / plugin unload).
+
+        Without this a task that never delivers ``finished`` left the Run
+        button permanently reporting "a scan is already running".
+        """
+        task = self._scan_task
+        self._scan_task = None
+        if task is not None:
+            try:
+                task.cancel()
+            except Exception:
+                pass
+        self.run_button.setEnabled(bool(self.model.plan))
+        self.stop_button.setEnabled(False)
+        self.progress.setVisible(False)
+
     def _scan_finished(self, task) -> None:
         """Completion callback on the main thread."""
         self._scan_task = None
         self.run_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.progress.setVisible(False)
+        if task.plan_id != self.model.plan_id:
+            # The user switched plans while the scan ran — these hazards
+            # belong to the plan the scan was started on, not this one.
+            self.status_label.setText(
+                "Scan discarded — a different plan is now open. Re-run the "
+                "scan with its plan selected.")
+            return
         if task.cancelled:
             self.status_label.setText(
                 "Scan stopped — the hazard register was not changed.")

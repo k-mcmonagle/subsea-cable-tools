@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 from typing import Dict, List, Optional
 
+from qgis.PyQt.QtCore import QTimer
 from qgis.PyQt.QtWidgets import (
     QComboBox,
     QDialog,
@@ -50,6 +51,7 @@ from ...qgis_compat import (
 )
 from .. import schema
 from .. import tools as tools_mod
+from .. import ui_helpers
 
 _TABLE_COLUMNS = ["Name", "Type", "Configurations", "Footprint",
                   "Source ref", "Notes"]
@@ -153,10 +155,16 @@ class ToolDialog(QDialog):
             "when not applicable. The Plan Builder assigns a configuration "
             "per section.")
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: #666;")
+        hint.setStyleSheet(ui_helpers.hint_style())
         configs_layout.addWidget(hint)
         self.configs_table = QTableWidget(0, len(_CONFIG_COLUMNS))
         self.configs_table.setHorizontalHeaderLabels(_CONFIG_COLUMNS)
+        numeric_keys = {key for key, _label in tools_mod.CONFIG_NUMERIC_FIELDS}
+        for column, key in enumerate(_CONFIG_KEYS):
+            header_item = self.configs_table.horizontalHeaderItem(column)
+            if header_item is not None and key in numeric_keys:
+                header_item.setToolTip("Metres. Leave blank when not "
+                                       "applicable.")
         self.configs_table.verticalHeader().setVisible(False)
         self.configs_table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
         self.configs_table.setSelectionMode(SELECTION_MODE_SINGLE)
@@ -346,33 +354,59 @@ class ToolsTab(QWidget):
         self.table.setSelectionMode(SELECTION_MODE_SINGLE)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setEditTriggers(EDIT_TRIGGER_NONE)
+        self.table.setToolTip("Double-click a tool to edit it.")
         self.table.cellDoubleClicked.connect(lambda _r, _c: self._edit_tool())
+        self.table.itemSelectionChanged.connect(self._sync_buttons)
         layout.addWidget(self.table, 1)
 
         buttons = QHBoxLayout()
-        for label, slot in (("Add tool…", self._add_tool),
-                            ("Edit…", self._edit_tool),
-                            ("Delete", self._delete_tool),
-                            ("Import registry JSON…", self._import_json),
-                            ("Export registry JSON…", self._export_json)):
-            button = QPushButton(label)
-            button.clicked.connect(slot)
-            buttons.addWidget(button)
+        add_button = QPushButton("Add tool…")
+        add_button.clicked.connect(self._add_tool)
+        buttons.addWidget(add_button)
+        self.edit_button = QPushButton("Edit…")
+        self.edit_button.clicked.connect(self._edit_tool)
+        buttons.addWidget(self.edit_button)
+        self.delete_button = QPushButton("Delete…")
+        self.delete_button.clicked.connect(self._delete_tool)
+        buttons.addWidget(self.delete_button)
+        buttons.addWidget(ui_helpers.menu_tool_button(
+            "Registry ▾",
+            (("Import registry JSON…", self._import_json),
+             ("Export registry JSON…", self._export_json)),
+            tooltip="Share the tool registry between projects and "
+                    "organisations as versioned JSON."))
         buttons.addStretch(1)
         layout.addLayout(buttons)
 
         self.status_label = QLabel("")
-        self.status_label.setStyleSheet("color: #666;")
+        self.status_label.setStyleSheet(ui_helpers.hint_style())
         layout.addWidget(self.status_label)
+        self._status_timer = QTimer(self)
+        self._status_timer.setSingleShot(True)
+        self._status_timer.setInterval(6000)
+        self._status_timer.timeout.connect(
+            lambda: self.status_label.setText(""))
 
         model.toolsChanged.connect(self.refresh)
         self.refresh()
+
+    def _flash(self, text: str) -> None:
+        """Transient status feedback that clears itself."""
+        self.status_label.setText(text)
+        self._status_timer.start()
+
+    def _sync_buttons(self) -> None:
+        has_selection = self._selected_tool() is not None
+        self.edit_button.setEnabled(has_selection)
+        self.delete_button.setEnabled(has_selection)
 
     # -- table ---------------------------------------------------------------
     def refresh(self) -> None:
         self._loading = True
         try:
             tools = self.model.tools
+            self._table_view = ui_helpers.preserve_table_view(self.table)
+            self._table_view.__enter__()
             self.table.setRowCount(len(tools))
             for i, tool in enumerate(tools):
                 configs = tools_mod.parse_configs(tool)
@@ -403,6 +437,8 @@ class ToolsTab(QWidget):
                     if j == 2 and configs:
                         item.setToolTip(config_text)
                     self.table.setItem(i, j, item)
+            self._table_view.__exit__(None, None, None)
+            self._sync_buttons()
         finally:
             self._loading = False
 
@@ -420,7 +456,7 @@ class ToolsTab(QWidget):
         if qt_exec(dialog) != DIALOG_ACCEPTED:
             return
         if self.model.save_tool(dialog.result_row()):
-            self.status_label.setText("Tool registered.")
+            self._flash("Tool registered.")
 
     def _edit_tool(self) -> None:
         tool = self._selected_tool()
@@ -430,7 +466,7 @@ class ToolsTab(QWidget):
         if qt_exec(dialog) != DIALOG_ACCEPTED:
             return
         if self.model.save_tool(dialog.result_row()):
-            self.status_label.setText("Tool updated.")
+            self._flash("Tool updated.")
 
     def _delete_tool(self) -> None:
         tool = self._selected_tool()
@@ -445,7 +481,7 @@ class ToolsTab(QWidget):
         if answer != MESSAGE_BOX_YES:
             return
         if self.model.delete_tool(tool.get("tool_id") or ""):
-            self.status_label.setText("Tool deleted.")
+            self._flash("Tool deleted.")
 
     def _import_json(self) -> None:
         path, _filter = QFileDialog.getOpenFileName(
@@ -461,13 +497,23 @@ class ToolsTab(QWidget):
             return
         existing = {str(t.get("tool_id") or "") for t in self.model.tools}
         updated = sum(1 for r in rows if r.get("tool_id") in existing)
+        if updated:
+            answer = QMessageBox.question(
+                self, "Import tool registry",
+                f"{updated} of the {len(rows)} imported tool(s) already "
+                "exist in this registry and will be overwritten with the "
+                "imported values. Continue?",
+                MESSAGE_BOX_YES | MESSAGE_BOX_NO, MESSAGE_BOX_NO)
+            if answer != MESSAGE_BOX_YES:
+                return
         saved = len(self.model.save_tools(rows))
-        self.status_label.setText(
+        self._flash(
             f"Imported {saved} tool(s)"
             + (f" ({updated} updated existing)" if updated else "") + ".")
 
     def _export_json(self) -> None:
         if not self.model.tools:
+            self._flash("The registry is empty — nothing to export.")
             return
         path, _filter = QFileDialog.getSaveFileName(
             self, "Export tool registry", "burial_tools.json",
@@ -481,5 +527,4 @@ class ToolsTab(QWidget):
             QMessageBox.warning(self, "Burial Planner",
                                 f"The registry could not be written: {exc}")
             return
-        self.status_label.setText(
-            f"Exported {len(self.model.tools)} tool(s).")
+        self._flash(f"Exported {len(self.model.tools)} tool(s).")

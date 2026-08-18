@@ -27,19 +27,20 @@ from qgis.gui import QgsVertexMarker, QgsRubberBand
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtCore import QSettings, Qt
 from qgis.PyQt.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QDockWidget,
     QFileDialog,
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
     QSplitter,
     QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -61,6 +62,7 @@ from ..qgis_compat import (
     GEOMETRY_LINE,
     MESSAGE_BOX_NO,
     MESSAGE_BOX_YES,
+    TOOLBUTTON_POPUP_MODE_INSTANT,
     WINDOW_HINT_CLOSE,
     WINDOW_HINT_CUSTOMIZE,
     WINDOW_HINT_MIN_MAX,
@@ -72,6 +74,7 @@ from ..workbench import store as wb_store_module
 from ..workbench.store import WorkbenchStore
 from . import analysis_task, footprint, generation, map_layers, profile_data, schema
 from . import tools as tools_mod
+from . import ui_helpers
 from .plan_model import PlanModel
 from .profile_widget import BurialProfileWidget
 from .store import (
@@ -91,11 +94,8 @@ from .tabs.tools_tab import ToolsTab
 
 _VERTICAL = getattr(Qt, "Orientation", Qt).Vertical
 
-_STATUS_STYLES = {
-    schema.PLAN_STATUS_DRAFT: "background:#e8f5e9;color:#1b5e20;padding:2px 8px;",
-    schema.PLAN_STATUS_STALE: "background:#fff3cd;color:#7a4f00;padding:2px 8px;",
-    schema.PLAN_STATUS_ISSUED: "background:#e3f2fd;color:#0d47a1;padding:2px 8px;",
-}
+_FLOATING_GEOMETRY_KEY = "SubseaCableTools/BurialPlanner/floating_geometry"
+_FLOATING_MODE_KEY = "SubseaCableTools/BurialPlanner/floating"
 
 
 def _remove_canvas_item(item) -> None:
@@ -132,6 +132,7 @@ class BurialPlannerDock(QDockWidget):
         self.setObjectName("SubseaCableToolsBurialPlannerDock")
         self._loading = False
         self._task: Optional[analysis_task.BurialAnalysisTask] = None
+        self._task_plan_id = ""
         self._profile_task: Optional[analysis_task.ProfileSamplingTask] = None
         self._profile_generation = 0
         self._generate_after_analysis = False
@@ -186,6 +187,12 @@ class BurialPlannerDock(QDockWidget):
         self.tabs.addTab(self.risk_tab, "Risk Profile")
         self.tabs.addTab(self.builder_tab, "Plan Builder")
         self.tabs.addTab(self.review_tab, "Review && Export")
+        # Workflow badges: these tabs gain a " ⚠" suffix (and a tooltip)
+        # when a prerequisite the workflow depends on is missing or stale.
+        self._tab_titles = {
+            self.inputs_tab: "Inputs",
+            self.profile_tab: "Bathymetry Profile",
+        }
         self.splitter.addWidget(self.tabs)
 
         profile_pane = QWidget()
@@ -194,7 +201,26 @@ class BurialPlannerDock(QDockWidget):
         profile_status_row = QHBoxLayout()
         self.profile_status = QLabel("Bathymetry profile")
         profile_status_row.addWidget(self.profile_status, 1)
-        self.slope_toggle = QCheckBox("Slope panel")
+        self.goto_kp_edit = QLineEdit()
+        self.goto_kp_edit.setPlaceholderText("Go to KP…")
+        self.goto_kp_edit.setMaximumWidth(90)
+        self.goto_kp_edit.setToolTip(
+            "Type a KP (km) and press Enter to centre the map and the "
+            "profile crosshair there.")
+        self.goto_kp_edit.returnPressed.connect(self._goto_kp_entered)
+        profile_status_row.addWidget(self.goto_kp_edit)
+        # The three profile view toggles live in one compact menu button so
+        # the row survives narrow (screen-share) dock widths.
+        self.view_button = QToolButton()
+        self.view_button.setText("View ▾")
+        self.view_button.setPopupMode(TOOLBUTTON_POPUP_MODE_INSTANT)
+        self.view_button.setToolTip(
+            "Profile view options: slope panel, event dragging, tool "
+            "outline, image export.")
+        view_menu = QMenu(self.view_button)
+        view_menu.setToolTipsVisible(True)
+        self.slope_toggle = view_menu.addAction("Slope panel")
+        self.slope_toggle.setCheckable(True)
         self.slope_toggle.setChecked(bool(QSettings().value(
             "SubseaCableTools/BurialPlanner/slope_panel_visible", False,
             type=bool)))
@@ -204,22 +230,19 @@ class BurialPlannerDock(QDockWidget):
             "profile. Cross/absolute need cross-offset samples — resample "
             "the profile after configuring bathymetry.")
         self.slope_toggle.toggled.connect(self._slope_panel_toggled)
-        profile_status_row.addWidget(self.slope_toggle)
-        self.profile_drag_toggle = QCheckBox("Allow event dragging")
+        self.profile_drag_toggle = view_menu.addAction("Allow event dragging")
+        self.profile_drag_toggle.setCheckable(True)
         self.profile_drag_toggle.setChecked(bool(QSettings().value(
             "SubseaCableTools/BurialPlanner/profile_drag_enabled", False,
             type=bool)))
         self.profile_drag_toggle.setToolTip(
             "When enabled, unlocked burial start/end lines (PLDN/PLUP, "
             "TRENCH_START/TRENCH_END…) can be dragged on the profile. "
-            "Changes are saved on release and can be undone with Ctrl+Z "
-            "in Plan Builder.")
-        self.profile_drag_toggle.setStyleSheet(
-            "color: #b36b00; font-weight: 600;"
-            if self.profile_drag_toggle.isChecked() else "")
+            "A confirmation shows the exact KP (editable) with an optional "
+            "reason; moves can be undone with Ctrl+Z in Plan Builder.")
         self.profile_drag_toggle.toggled.connect(self._profile_drag_toggled)
-        profile_status_row.addWidget(self.profile_drag_toggle)
-        self.footprint_toggle = QCheckBox("Tool outline")
+        self.footprint_toggle = view_menu.addAction("Tool outline")
+        self.footprint_toggle.setCheckable(True)
         self.footprint_toggle.setChecked(bool(QSettings().value(
             "SubseaCableTools/BurialPlanner/tool_footprint_visible", False,
             type=bool)))
@@ -230,7 +253,12 @@ class BurialPlannerDock(QDockWidget):
             "plan default); the tool needs a DXF footprint registered on "
             "the Burial Tools tab.")
         self.footprint_toggle.toggled.connect(self._footprint_toggled)
-        profile_status_row.addWidget(self.footprint_toggle)
+        view_menu.addSeparator()
+        view_menu.addAction("Export profile image…",
+                            self._export_profile_image)
+        self.view_button.setMenu(view_menu)
+        self._style_view_button(self.profile_drag_toggle.isChecked())
+        profile_status_row.addWidget(self.view_button)
         self.profile_progress = QProgressBar()
         self.profile_progress.setRange(0, 100)
         self.profile_progress.setMaximumWidth(240)
@@ -273,6 +301,7 @@ class BurialPlannerDock(QDockWidget):
         self.model.eventsChanged.connect(self._refresh_profile_events)
         self.model.sectionsChanged.connect(self._refresh_profile_sections)
         self.model.inputsChanged.connect(self._refresh_profile)
+        self.model.inputsChanged.connect(self._refresh_tab_badges)
         self.topLevelChanged.connect(self._top_level_changed)
 
         self.refresh_plans()
@@ -331,6 +360,10 @@ class BurialPlannerDock(QDockWidget):
                 "for it to finish before changing the plan file.")
             return False
         self._cancel_profile_refresh(silent=True)
+        try:
+            self.store.close()  # checkpoint + release the old SQL handle
+        except Exception:
+            pass
         self.store = store
         self.store_ready = True
         set_project_gpkg_path(path)
@@ -424,13 +457,17 @@ class BurialPlannerDock(QDockWidget):
             "No plans in this file — use Plan file… to open an existing file")
         self.plan_combo.currentIndexChanged.connect(self._plan_selected)
         strip.addWidget(self.plan_combo, 1)
-        for label, slot in (("New", self._new_plan), ("Duplicate", self._duplicate_plan),
-                            ("Rename", self._rename_plan), ("Delete", self._delete_plan)):
-            button = QPushButton(label)
-            button.clicked.connect(slot)
-            strip.addWidget(button)
-        self.method_label = QLabel("")
-        strip.addWidget(self.method_label)
+        # One compact menu instead of four buttons so the strip fits a
+        # narrow (screen-share) dock width.
+        self.plan_actions_button = ui_helpers.menu_tool_button(
+            "Plan ▾",
+            (("New…", self._new_plan),
+             ("Duplicate…", self._duplicate_plan),
+             ("Rename…", self._rename_plan),
+             None,
+             ("Delete…", self._delete_plan)),
+            tooltip="Create, duplicate, rename or delete plans in this file.")
+        strip.addWidget(self.plan_actions_button)
         self.status_badge = QLabel("")
         strip.addWidget(self.status_badge)
         self.gpkg_name = QLabel("")
@@ -474,20 +511,37 @@ class BurialPlannerDock(QDockWidget):
             plan_hint = self.store.get_plan(plan_id) or {}
             self.model.workbench_store = self.workbench_store(plan_hint)
             self.model.load_plan(plan_id)
-            map_layers.ensure_plan_layers(QgsProject.instance(),
-                                          self.store.gpkg_path, self.model.plan)
+            sections_layer, _events_layer = map_layers.ensure_plan_layers(
+                QgsProject.instance(), self.store.gpkg_path, self.model.plan)
+            if sections_layer is None \
+                    and (self.model.sections or self.model.events) \
+                    and self.model.route is not None:
+                # The plan has data but its spatial tables were never
+                # written (e.g. a fresh duplicate) — build them now instead
+                # of showing an empty map until the first edit.
+                self.model.refresh_layers(immediate=True)
+            # The map follows the selector: show this plan's layers, hide
+            # the other plans' (still in the project, just unchecked).
+            map_layers.set_active_plan_layers(QgsProject.instance(),
+                                              self.model.plan)
         elif not plan_id:
             self.model.close_plan()
         self._refresh_strip()
 
     def _refresh_strip(self) -> None:
         plan = self.model.plan
-        self.method_label.setText(schema.METHOD_LABELS.get(
-            schema.normalise_method(plan.get("method") or ""), ""))
+        method_text = schema.METHOD_LABELS.get(
+            schema.normalise_method(plan.get("method") or ""), "")
+        self.plan_combo.setToolTip(
+            f"Method: {method_text}" if method_text else "")
         status = plan.get("status") or ""
         self.status_badge.setText(status)
-        self.status_badge.setStyleSheet(_STATUS_STYLES.get(status, ""))
+        self.status_badge.setStyleSheet(ui_helpers.badge_style(status))
+        self.status_badge.setToolTip(
+            ("Plan status. " + f"Method: {method_text}.") if method_text
+            else "Plan status.")
         self.status_badge.setVisible(bool(status and plan))
+        self._refresh_tab_badges()
         self.gpkg_button.setToolTip(self.store.gpkg_path)
         plan_count = self.plan_combo.count()
         state = ("unavailable" if not self.store_ready else
@@ -504,6 +558,42 @@ class BurialPlannerDock(QDockWidget):
                 self._loading = False
         if index >= 0 and self.plan_combo.itemText(index) != (plan.get("name") or "Plan"):
             self.plan_combo.setItemText(index, plan.get("name") or "Plan")
+
+    def _refresh_tab_badges(self) -> None:
+        """Flag workflow prerequisites on the tab titles themselves."""
+        def set_badge(widget, warn: bool, tip: str) -> None:
+            index = self.tabs.indexOf(widget)
+            if index < 0:
+                return
+            title = self._tab_titles.get(widget) or \
+                self.tabs.tabText(index).replace(" ⚠", "")
+            self.tabs.setTabText(index, title + (" ⚠" if warn else ""))
+            self.tabs.setTabToolTip(index, tip if warn else "")
+
+        plan = self.model.plan
+        if not plan:
+            set_badge(self.inputs_tab, False, "")
+            set_badge(self.profile_tab, False, "")
+            return
+        route_missing = self.model.route is None
+        scope_zero = self.model.gen_params().scope.length_km <= 1e-9
+        bathy_missing = not self.model.depth_config().is_configured()
+        problems = []
+        if route_missing:
+            problems.append("no route set")
+        if scope_zero:
+            problems.append("scope not set")
+        if bathy_missing:
+            problems.append("no bathymetry source")
+        set_badge(self.inputs_tab, bool(problems),
+                  ("This plan still needs: " + ", ".join(problems) + ".")
+                  if problems else "")
+        state = self.model.profile_state() if not problems else "missing"
+        warn_profile = not problems and state != "current"
+        tip = ("The stored bathymetry profile is stale — rebuild it here "
+               "before generating." if state == "stale"
+               else "No stored bathymetry profile — build it here.")
+        set_badge(self.profile_tab, warn_profile, tip)
 
     def _new_plan(self) -> None:
         if not self.store_ready:
@@ -631,6 +721,14 @@ class BurialPlannerDock(QDockWidget):
         if self._task is not None:
             self.builder_tab.analysis_message("An analysis is already running.")
             return
+        if self._profile_task is not None:
+            # The route frame and profile store are shared state; running
+            # both tasks at once risked racing their lazy indexes and
+            # swapping the profile mid-analysis.
+            self.builder_tab.analysis_message(
+                "Wait for the profile sampling to finish (or stop it) "
+                "before running the analysis.")
+            return
         if not self.model.plan:
             return
         if self.model.route is None:
@@ -695,15 +793,34 @@ class BurialPlannerDock(QDockWidget):
         self._generate_after_analysis = generate
         self._generate_fresh = generate and fresh
         self._fresh_keep_client = keep_client
+        # Results are applied against the parameters the work was built
+        # with; re-reading the model after the run silently mixed old
+        # intervals with new scope/method/sliver settings when the user
+        # edited them mid-run.
+        self._task_params = params
+        self._task_plan_id = self.model.plan_id
         self._task = analysis_task.BurialAnalysisTask(work, self._analysis_finished)
         self._task.progressMessage.connect(self.rules_tab.set_progress)
         self._task.progressMessage.connect(self.builder_tab.analysis_message)
         self._task.progressChanged.connect(self.builder_tab.analysis_progress)
         self.builder_tab.analysis_started()
+        self.rules_tab.analysis_started()
         QgsApplication.taskManager().addTask(self._task)
 
     def _analysis_finished(self, task: analysis_task.BurialAnalysisTask) -> None:
         self._task = None
+        try:
+            self.rules_tab.analysis_finished()
+        except Exception:
+            pass  # must never block resetting the builder progress below
+        if getattr(self, "_task_plan_id", "") != self.model.plan_id:
+            # The user switched plans (or plan files) while the analysis
+            # ran — the results were built from the other plan's rules and
+            # scope and must never be applied to this one.
+            self.builder_tab.analysis_finished(
+                "Analysis discarded — a different plan is now open. Run it "
+                "again with its plan selected.")
+            return
         if task.cancelled:
             self.builder_tab.analysis_finished(
                 "Stopped — completed rules stay cached; run again to resume.")
@@ -726,7 +843,9 @@ class BurialPlannerDock(QDockWidget):
 
     def _apply_analysis_results(self,
                                 task: analysis_task.BurialAnalysisTask) -> None:
-        params = self.model.gen_params()
+        # The parameters snapshotted when the work was built — not a fresh
+        # read that could have changed while the task ran.
+        params = getattr(self, "_task_params", None) or self.model.gen_params()
         acquisitions: List[generation.RuleAcquisition] = []
         for result in task.results:
             if not result.error and result.cache_key:
@@ -751,15 +870,13 @@ class BurialPlannerDock(QDockWidget):
 
         if not self._generate_after_analysis:
             # Fire-bar refresh only: update profile overlays from resolution.
-            out = generation.GenerationOutput()
-            out.excluded = [v for v in verdicts if v.status == "excluded"]
-            out.screening = [v for v in verdicts if v.status == "risk"]
-            out.influence = influence
-            out.insufficient = nodata
-            out.rule_hits = {rule_id: list(intervals) for rule_id, intervals
-                             in resolved.rule_hits.items()}
-            self.model.context = generation.context_from_dict(
-                generation.context_to_dict(out))
+            self.model.context = generation.ResolutionContext(
+                excluded=[v for v in verdicts if v.status == "excluded"],
+                screening=[v for v in verdicts if v.status == "risk"],
+                influence=list(influence),
+                insufficient=list(nodata),
+                rule_hits={rule_id: list(intervals) for rule_id, intervals
+                           in resolved.rule_hits.items()})
             self._refresh_profile_overlays()
             self.builder_tab.analysis_finished("Exclusions recomputed.")
             return
@@ -798,7 +915,10 @@ class BurialPlannerDock(QDockWidget):
             previous_sections=previous_sections,
             proposal_events=proposal or None,
             plan_id=self.model.plan_id, generation_id=generation_id,
-            depth_at=self.model.depth_at_kp)
+            depth_at=self.model.depth_at_kp,
+            # Reuse the fire-bar resolution — resolving the identical stack
+            # twice per Generate was the largest main-thread duplicate.
+            resolution=(resolved, influence, nodata, warnings))
 
         fingerprints = {str(r.rule_row.get("rule_id")): r.cache_key
                         for r in task.results}
@@ -880,11 +1000,12 @@ class BurialPlannerDock(QDockWidget):
         if stale:
             text += ("  —  STALE: route, bathymetry, scope or cross offset "
                      "changed since sampling. Click Resample profile.")
-            self.profile_status.setStyleSheet("color: #b36b00; font-weight: 600;")
+            self.profile_status.setStyleSheet(ui_helpers.status_style("warn"))
         else:
             self.profile_status.setStyleSheet("")
         self.profile_status.setText(text)
         self.profile_tab.refresh()
+        self._refresh_tab_badges()
 
     def _set_slope_series(self, profile: profile_data.PlanProfile,
                           params: generation.GenParams) -> None:
@@ -919,6 +1040,11 @@ class BurialPlannerDock(QDockWidget):
         """One background sampling pass over the scope (+ one-step margin)."""
         if not self.model.plan or self.model.route is None:
             return
+        if self._task is not None:
+            self.profile_status.setText(
+                "Wait for the running analysis to finish (or stop it) "
+                "before resampling the profile.")
+            return
         config = self.model.depth_config()
         if not config.is_configured():
             return
@@ -934,6 +1060,12 @@ class BurialPlannerDock(QDockWidget):
         end_kp = min(self.model.route.total_length_km,
                      scope.end_km + margin_km)
 
+        # Fingerprints captured before sampling starts: if a bathymetry
+        # file is replaced on disk mid-run (no model signal fires), the
+        # stored profile must not claim currency against data its samples
+        # never came from.
+        self._profile_fingerprints = (self.model.current_rpl_fingerprint(),
+                                      self.model.depth_fingerprint())
         # DepthSnapshot only clones providers/feature sources here.  Contour
         # iteration, indexing and all route sampling happen inside QgsTask.
         snapshot = analysis_task.DepthSnapshot(config, QgsProject.instance())
@@ -1005,13 +1137,17 @@ class BurialPlannerDock(QDockWidget):
             self.profile_tab.refresh()
             return
         params = self.model.gen_params()
+        route_fp, depth_fp = getattr(
+            self, "_profile_fingerprints",
+            (self.model.current_rpl_fingerprint(),
+             self.model.depth_fingerprint()))
         profile = profile_data.PlanProfile(
             step_m=task.step_m,
             cross_offset_m=task.cross_offset_m,
             scope_start_kp=params.scope.start_km,
             scope_end_kp=params.scope.end_km,
-            route_fingerprint=self.model.current_rpl_fingerprint(),
-            depth_fingerprint=self.model.depth_fingerprint(),
+            route_fingerprint=route_fp,
+            depth_fingerprint=depth_fp,
             sampled_utc=schema.utc_now_iso(),
             kps=task.kps, depths=task.depths,
             port_depths=task.port_depths, stbd_depths=task.stbd_depths)
@@ -1032,24 +1168,46 @@ class BurialPlannerDock(QDockWidget):
     def _profile_drag_toggled(self, enabled: bool) -> None:
         QSettings().setValue(
             "SubseaCableTools/BurialPlanner/profile_drag_enabled", bool(enabled))
-        self.profile_drag_toggle.setStyleSheet(
-            "color: #b36b00; font-weight: 600;" if enabled else "")
+        self._style_view_button(enabled)
         self._refresh_profile_events()
 
-    def _on_profile_event_moved(self, event_id: str, new_kp: float) -> None:
-        # Same justification contract as table edits: optional reason,
-        # Cancel aborts (and snaps the dragged line back).
-        text, ok = QInputDialog.getText(
-            self, "Move event",
-            f"Move to KP {schema.format_kp(new_kp)} — reason (optional):")
-        if not ok:
-            self.profile.revert_event_line(event_id)
-            return
+    def _style_view_button(self, drag_enabled: bool) -> None:
+        """Amber View button = event dragging is live (edit mode warning)."""
+        self.view_button.setStyleSheet(
+            f"color: {ui_helpers.color('warn')}; font-weight: 600;"
+            if drag_enabled else "")
+
+    def _goto_kp_entered(self) -> None:
+        text = (self.goto_kp_edit.text() or "").lower().replace("kp", "")
+        text = text.replace(",", ".").strip()
         try:
-            self.model.move_event(event_id, round(new_kp, 3),
-                                  text.strip() or "profile drag")
-        except ValueError as exc:
-            QMessageBox.warning(self, "Burial Planner", str(exc))
+            kp = float(text)
+        except ValueError:
+            return
+        self.goto_kp(kp)
+
+    def _export_profile_image(self) -> None:
+        """Save the profile pane (as displayed) to a PNG file."""
+        pixmap = self.profile.grab()
+        if pixmap.isNull():
+            QMessageBox.warning(self, "Burial Planner",
+                                "The profile pane could not be captured.")
+            return
+        name = schema.sanitize_slug(
+            (self.model.plan.get("name") or "profile")) + "_profile.png"
+        path, _filter = QFileDialog.getSaveFileName(
+            self, "Export profile image", name, "PNG (*.png)")
+        if not path:
+            return
+        if not pixmap.save(path, "PNG"):
+            QMessageBox.warning(self, "Burial Planner",
+                                f"Could not write the image:\n{path}")
+
+    def _on_profile_event_moved(self, event_id: str, new_kp: float) -> None:
+        # Same confirmation as table KP edits: the dialog shows the exact
+        # (editable) KP plus an optional reason; Cancel snaps the line back.
+        if not self.builder_tab.confirm_move_event(event_id,
+                                                   round(new_kp, 3)):
             self.profile.revert_event_line(event_id)
 
     def _on_profile_double_clicked(self, kp: float) -> None:
@@ -1061,10 +1219,14 @@ class BurialPlannerDock(QDockWidget):
         self.goto_kp(kp)
 
     # -- KP picking -----------------------------------------------------------
-    def pick_kp_on_map(self, callback, prompt: str = "") -> bool:
+    def pick_kp_on_map(self, callback, prompt: str = "",
+                       on_finished=None) -> bool:
         """One-shot map tool: snap a canvas click to the route, deliver its KP.
 
         Restores the previously active map tool on pick, right-click or Esc.
+        ``on_finished`` (if given) runs when the pick ends for any reason —
+        picked, cancelled or the user switching tools — after the previous
+        map tool is restored (modal callers re-show themselves with it).
         """
         if self.canvas is None:
             return False
@@ -1087,6 +1249,11 @@ class BurialPlannerDock(QDockWidget):
                         self.canvas.unsetMapTool(tool)
             except (AttributeError, RuntimeError):
                 pass
+            if on_finished is not None:
+                try:
+                    on_finished()
+                except Exception:
+                    pass
 
         tool = KpPickTool(self.canvas, self.model.route, callback, restore)
         self._pick_tool = tool
@@ -1102,6 +1269,24 @@ class BurialPlannerDock(QDockWidget):
         return True
 
     # -- map sync -------------------------------------------------------------
+    def _canvas_transform(self):
+        """WGS84 → canvas transform, cached per destination CRS.
+
+        Rebuilding a QgsCoordinateTransform on every hover was a hidden
+        PROJ lookup per mouse move.
+        """
+        from qgis.core import QgsCoordinateReferenceSystem
+
+        dest = self.canvas.mapSettings().destinationCrs()
+        cached = getattr(self, "_canvas_transform_cache", None)
+        if cached is not None and cached[0] == dest.authid():
+            return cached[1]
+        transform = QgsCoordinateTransform(
+            QgsCoordinateReferenceSystem("EPSG:4326"), dest,
+            QgsProject.instance())
+        self._canvas_transform_cache = (dest.authid(), transform)
+        return transform
+
     def _canvas_point(self, kp: float):
         if self.model.route is None or self.canvas is None:
             return None
@@ -1109,12 +1294,7 @@ class BurialPlannerDock(QDockWidget):
         if point is None:
             return None
         try:
-            from qgis.core import QgsCoordinateReferenceSystem
-
-            transform = QgsCoordinateTransform(
-                QgsCoordinateReferenceSystem("EPSG:4326"),
-                self.canvas.mapSettings().destinationCrs(), QgsProject.instance())
-            return transform.transform(point)
+            return self._canvas_transform().transform(point)
         except Exception:
             return point
 
@@ -1318,12 +1498,42 @@ class BurialPlannerDock(QDockWidget):
             self.canvas.refresh()
 
     # -- window management ----------------------------------------------------
+    def apply_saved_window_mode(self) -> None:
+        """Open as a floating window by default.
+
+        The dock honours the user's last choice: re-docking it and closing
+        makes the next open docked again; floating (the default) restores
+        the saved monitor/size via ``_top_level_changed``.
+        """
+        if bool(QSettings().value(_FLOATING_MODE_KEY, True, type=bool)) \
+                and not self.isFloating():
+            self.setFloating(True)
+
     def _top_level_changed(self, floating: bool) -> None:
         if floating:
             self.setWindowFlags(WINDOW_TYPE_WINDOW | WINDOW_HINT_CUSTOMIZE
                                 | WINDOW_HINT_TITLE | WINDOW_HINT_MIN_MAX
                                 | WINDOW_HINT_CLOSE)
             self.show()
+            # Reopen on the same monitor at the same size (second-screen
+            # workflows keep their window placement across sessions).
+            geometry = QSettings().value(_FLOATING_GEOMETRY_KEY)
+            if geometry is not None:
+                try:
+                    self.restoreGeometry(geometry)
+                except Exception:
+                    pass
+            else:
+                self.resize(1100, 750)
+
+    def _save_window_state(self) -> None:
+        try:
+            settings = QSettings()
+            settings.setValue(_FLOATING_MODE_KEY, self.isFloating())
+            if self.isFloating():
+                settings.setValue(_FLOATING_GEOMETRY_KEY, self.saveGeometry())
+        except Exception:
+            pass
 
     def refresh(self) -> None:
         """Re-read the current project's store on every open."""
@@ -1333,6 +1543,10 @@ class BurialPlannerDock(QDockWidget):
             store, path, error = self._open_store_with_recovery(
                 path, create_if_missing=not bool(saved_path))
             if not error:
+                try:
+                    self.store.close()
+                except Exception:
+                    pass
                 self.store = store
                 self.store_ready = True
                 self.model.store = store
@@ -1353,12 +1567,21 @@ class BurialPlannerDock(QDockWidget):
 
     def shutdown(self) -> None:
         """Transient artefacts only — never deletes data or registry rows."""
+        self._save_window_state()  # unload may bypass closeEvent
         try:
             self.cancel_analysis()
         except (AttributeError, RuntimeError):
             pass
         try:
+            self.store.close()  # checkpoint WAL + release the SQL handle
+        except Exception:
+            pass
+        try:
             self._cancel_profile_refresh(silent=True)
+        except (AttributeError, RuntimeError):
+            pass
+        try:
+            self.risk_tab.shutdown()
         except (AttributeError, RuntimeError):
             pass
         pick_tool = self._pick_tool
@@ -1378,5 +1601,5 @@ class BurialPlannerDock(QDockWidget):
             _remove_canvas_item(item)
 
     def closeEvent(self, event) -> None:
-        self.shutdown()
+        self.shutdown()  # saves the window state first
         super().closeEvent(event)

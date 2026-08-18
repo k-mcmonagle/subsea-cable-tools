@@ -235,10 +235,24 @@ class BurialProfileWidget(QWidget):
         self._regions: List = []
         self._event_lines: List = []
         self._series: List[Tuple[float, float]] = []
+        # Cached KP arrays for the crosshair lookups: rebuilding these lists
+        # (up to ~500k floats, three or four times) on EVERY mouse move was
+        # the dominant hover cost on long routes.
+        self._series_xs: List[float] = []
         self._slope_series: Dict[str, List[Tuple[float, Optional[float]]]] = {}
+        self._slope_series_xs: Dict[str, List[float]] = {}
         self._scope: Tuple[float, float] = (0.0, 0.0)
         self._editable = False
         self._slope_half_window_km: Optional[float] = None
+        # Map-sync throttle: the crosshair/readout stays immediate, but the
+        # canvas marker + tool footprint redraw at most every ~30 ms.
+        from qgis.PyQt.QtCore import QTimer
+
+        self._hover_kp: Optional[float] = None
+        self._hover_timer = QTimer(self)
+        self._hover_timer.setSingleShot(True)
+        self._hover_timer.setInterval(30)
+        self._hover_timer.timeout.connect(self._emit_hover)
 
         # Plan-outcome strip: a thin x-linked ViewBox pinned to the top of
         # the plot area, so section colouring never scales with the y-axis.
@@ -330,6 +344,7 @@ class BurialProfileWidget(QWidget):
         self._series = sorted(series)
         xs = [kp for kp, _d in self._series]
         ys = [d for _kp, d in self._series]
+        self._series_xs = xs  # cached for the per-hover lookups
         self._curve.setData(xs, ys, connect="finite")
 
     def set_overlays(self, context: generation.ResolutionContext) -> None:
@@ -375,6 +390,7 @@ class BurialProfileWidget(QWidget):
             self._slope_series[key] = series
             xs = [kp for kp, _v in series]
             ys = [nan if v is None else float(v) for _kp, v in series]
+            self._slope_series_xs[key] = xs  # cached for hover lookups
             self._slope_curves[key].setData(xs, ys, connect="finite")
 
     def _slope_series_value_at(self, key: str, kp: float) -> Optional[float]:
@@ -384,7 +400,7 @@ class BurialProfileWidget(QWidget):
             return None
         import bisect
 
-        xs = [p[0] for p in series]
+        xs = self._slope_series_xs.get(key) or [p[0] for p in series]
         i = bisect.bisect_left(xs, kp)
         candidates = [j for j in (i - 1, i) if 0 <= j < len(series)]
         if not candidates:
@@ -521,7 +537,7 @@ class BurialProfileWidget(QWidget):
             return None
         import bisect
 
-        xs = [p[0] for p in self._series]
+        xs = self._series_xs
         i = bisect.bisect_left(xs, kp)
         candidates = [j for j in (i - 1, i) if 0 <= j < len(self._series)]
         if not candidates:
@@ -555,7 +571,7 @@ class BurialProfileWidget(QWidget):
             return None
         import bisect
 
-        xs = [p[0] for p in self._series]
+        xs = self._series_xs
         half = self._slope_half_window_km
         if half:
             k0 = max(xs[0], kp - half)
@@ -625,6 +641,10 @@ class BurialProfileWidget(QWidget):
             self._readout.setText(lines[0])
             self._readout.setVisible(True)
 
+    def _emit_hover(self) -> None:
+        if self._hover_kp is not None:
+            self.kpHovered.emit(self._hover_kp)
+
     def _handle_mouse_moved(self, pos, plot) -> None:
         kp = self._kp_at_scene_pos(pos, plot)
         if kp is None:
@@ -633,7 +653,11 @@ class BurialProfileWidget(QWidget):
             self._readout.setVisible(False)
             return
         self._show_kp_readout(kp)
-        self.kpHovered.emit(kp)
+        # Throttled: the map marker + tool footprint follow the latest KP at
+        # ~30 ms cadence instead of once per mouse-move event.
+        self._hover_kp = kp
+        if not self._hover_timer.isActive():
+            self._hover_timer.start()
 
     def _handle_mouse_clicked(self, event, plot) -> None:
         try:

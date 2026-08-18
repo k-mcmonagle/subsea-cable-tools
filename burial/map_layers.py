@@ -175,13 +175,45 @@ def rpl_fingerprint(rpl_row: Optional[Dict], gpkg_path: str = "") -> str:
 # -- writing -----------------------------------------------------------------
 
 
+ALL_PLAN_LAYER_PARTS = ("sections", "events", "hazards")
+
+
+def _section_wkt(route, start_kp: float, end_kp: float,
+                 cache: Optional[Dict]) -> Optional[str]:
+    """Route-slice WKT for a section, memoised across refreshes.
+
+    Slicing + WKT serialisation of long route segments is the dominant CPU
+    cost of a layer refresh; only the edited section's geometry actually
+    changes, so unchanged (start, end) pairs come from the cache. The cache
+    is owned by the caller and cleared whenever the route changes.
+    """
+    key = (round(float(start_kp), 9), round(float(end_kp), 9))
+    if cache is not None and key in cache:
+        return cache[key]
+    geom = route.extract_segment(float(start_kp), float(end_kp)) \
+        if route else None
+    wkt = None if geom is None or geom.isEmpty() else geom.asWkt()
+    if cache is not None:
+        cache[key] = wkt
+    return wkt
+
+
 def write_plan_layers(store, plan: Dict, sections: Sequence[Dict],
                       events: Sequence[Dict], route,
                       hazards: Optional[Sequence[Dict]] = None,
                       risk_checks: Optional[Sequence[Dict]] = None,
-                      tools: Optional[Sequence[Dict]] = None
+                      tools: Optional[Sequence[Dict]] = None,
+                      parts: Optional[Sequence[str]] = None,
+                      segment_wkt_cache: Optional[Dict] = None
                       ) -> Tuple[str, str]:
-    """Write/overwrite the plan's sections + events (+ hazards) layers."""
+    """Write/overwrite the plan's sections + events (+ hazards) layers.
+
+    ``parts`` limits the rewrite to the named layers ("sections", "events",
+    "hazards") — an edit that touched only one dataset must not pay for
+    rewriting the other two. None keeps the historic write-everything
+    behaviour.
+    """
+    wanted = set(parts) if parts is not None else set(ALL_PLAN_LAYER_PARTS)
     method = plan.get("method") or ""
     base_args = (plan.get("name") or "plan", plan.get("rev_label") or "",
                  plan.get("plan_id") or "")
@@ -189,12 +221,14 @@ def write_plan_layers(store, plan: Dict, sections: Sequence[Dict],
     events_name = schema.events_layer_name(*base_args)
 
     refs = schema.section_refs(sections,
-                               int(plan.get("direction") or 1), method)
+                               int(plan.get("direction") or 1), method) \
+        if "sections" in wanted else {}
     section_rows: List[Dict] = []
-    for section in sections:
-        geom = route.extract_segment(float(section.get("start_kp") or 0.0),
-                                     float(section.get("end_kp") or 0.0)) if route else None
-        if geom is None or geom.isEmpty():
+    for section in sections if "sections" in wanted else []:
+        wkt = _section_wkt(route, float(section.get("start_kp") or 0.0),
+                           float(section.get("end_kp") or 0.0),
+                           segment_wkt_cache)
+        if not wkt:
             continue
         section_rows.append({
             "section_ref": refs.get(str(section.get("section_id") or ""), ""),
@@ -214,11 +248,11 @@ def write_plan_layers(store, plan: Dict, sections: Sequence[Dict],
                 section.get("skip_handling") or "", "")
             if section.get("kind") == schema.SECTION_SKIP else "",
             "notes": section.get("notes") or "",
-            WKT_KEY: geom.asWkt(),
+            WKT_KEY: wkt,
         })
 
     event_rows: List[Dict] = []
-    for event in events:
+    for event in events if "events" in wanted else []:
         point = route.point_at_kp(float(event.get("kp") or 0.0), clamp=True) if route else None
         if point is None:
             continue
@@ -239,12 +273,14 @@ def write_plan_layers(store, plan: Dict, sections: Sequence[Dict],
             WKT_KEY: f"POINT ({point.x()} {point.y()})",
         })
 
-    store.write_spatial_layer(sections_name, schema.SECTIONS_LAYER_FIELDS,
-                              WKB_LINESTRING, section_rows)
-    store.write_spatial_layer(events_name, schema.EVENTS_LAYER_FIELDS,
-                              WKB_POINT, event_rows)
+    if "sections" in wanted:
+        store.write_spatial_layer(sections_name, schema.SECTIONS_LAYER_FIELDS,
+                                  WKB_LINESTRING, section_rows)
+    if "events" in wanted:
+        store.write_spatial_layer(events_name, schema.EVENTS_LAYER_FIELDS,
+                                  WKB_POINT, event_rows)
 
-    if hazards is not None:
+    if hazards is not None and "hazards" in wanted:
         check_names = {str(c.get("check_id") or ""): (c.get("name") or "")
                        for c in (risk_checks or [])}
         hazard_rows: List[Dict] = []
@@ -441,19 +477,41 @@ def burial_group(project: Optional[QgsProject] = None, create: bool = True):
     return group
 
 
+# Bump when any apply_*_style output changes so already-loaded layers are
+# restyled exactly once (the old code rebuilt renderers + labelling and
+# forced three canvas repaints on every single edit).
+_STYLE_VERSION = "1"
+_STYLE_VERSION_PROPERTY = "bp_style_version"
+
+# (normalised gpkg path, layer name) -> map layer id. Avoids scanning every
+# project layer three times per refresh.
+_layer_id_cache: Dict[Tuple[str, str], str] = {}
+
+
 def find_layer(project: QgsProject, gpkg_path: str, layer_name: str
                ) -> Optional[QgsVectorLayer]:
     if not layer_name:
         return None
+    cache_key = (normalised_path(gpkg_path), layer_name)
+    cached_id = _layer_id_cache.get(cache_key)
+    if cached_id:
+        layer = project.mapLayer(cached_id)
+        if isinstance(layer, QgsVectorLayer) and layer.isValid() \
+                and layer_name_from_source(layer.source(),
+                                           gpkg_path) == layer_name:
+            return layer
+        _layer_id_cache.pop(cache_key, None)
     for layer in project.mapLayers().values():
         if isinstance(layer, QgsVectorLayer) \
                 and layer_name_from_source(layer.source(), gpkg_path) == layer_name:
+            _layer_id_cache[cache_key] = layer.id()
             return layer
     return None
 
 
 def _ensure_layer(project: QgsProject, gpkg_path: str, layer_name: str,
-                  style_fn, expected_fields=None) -> Optional[QgsVectorLayer]:
+                  style_fn, expected_fields=None,
+                  reload: bool = True) -> Optional[QgsVectorLayer]:
     existing = find_layer(project, gpkg_path, layer_name)
     if existing is not None and existing.isValid():
         # A loaded layer caches its field map. When the tool's layer schema
@@ -465,7 +523,8 @@ def _ensure_layer(project: QgsProject, gpkg_path: str, layer_name: str,
         # project references all survive.
         wanted = {name for name, _type in (expected_fields or [])}
         have = set(existing.fields().names())
-        if wanted and not wanted.issubset(have):
+        fields_stale = bool(wanted) and not wanted.issubset(have)
+        if fields_stale:
             try:
                 existing.setDataSource(gpkg_layer_uri(gpkg_path, layer_name),
                                        layer_name, "ogr")
@@ -478,12 +537,20 @@ def _ensure_layer(project: QgsProject, gpkg_path: str, layer_name: str,
                     "Burial Planner", MESSAGE_INFO)
             except Exception:
                 pass
-        existing.dataProvider().reloadData()
-        existing.updateExtents()
-        # These are tool-owned, read-only presentation layers. Reapply their
-        # style so fixes (notably removal of the old line offset) also reach
-        # layers already saved in an open project.
-        style_fn(existing)
+        if reload:
+            existing.dataProvider().reloadData()
+            existing.updateExtents()
+        # Tool-owned presentation layers: reapply the style only when the
+        # styling code changed (or the field map was rebuilt), so style
+        # fixes still reach layers saved in old projects without paying a
+        # renderer + labelling rebuild and repaint per edit.
+        if fields_stale or str(existing.customProperty(
+                _STYLE_VERSION_PROPERTY, "")) != _STYLE_VERSION:
+            style_fn(existing)
+            existing.setCustomProperty(_STYLE_VERSION_PROPERTY,
+                                       _STYLE_VERSION)
+        elif reload:
+            existing.triggerRepaint()
         return existing
     layer = QgsVectorLayer(gpkg_layer_uri(gpkg_path, layer_name), layer_name, "ogr")
     if not layer.isValid():
@@ -496,28 +563,70 @@ def _ensure_layer(project: QgsProject, gpkg_path: str, layer_name: str,
     except Exception:
         pass
     style_fn(layer)
+    layer.setCustomProperty(_STYLE_VERSION_PROPERTY, _STYLE_VERSION)
+    _layer_id_cache[(normalised_path(gpkg_path), layer_name)] = layer.id()
     return layer
 
 
-def ensure_plan_layers(project: Optional[QgsProject], gpkg_path: str, plan: Dict
+def ensure_plan_layers(project: Optional[QgsProject], gpkg_path: str, plan: Dict,
+                       parts: Optional[Sequence[str]] = None
                        ) -> Tuple[Optional[QgsVectorLayer], Optional[QgsVectorLayer]]:
-    """Find-or-add the plan's sections + events layers (sections beneath)."""
+    """Find-or-add the plan's sections + events layers (sections beneath).
+
+    ``parts`` limits provider reloads/repaints to the layers whose tables
+    were just rewritten; the others are only ensured present.
+    """
     project = project or QgsProject.instance()
+    wanted = set(parts) if parts is not None else set(ALL_PLAN_LAYER_PARTS)
     base_args = (plan.get("name") or "plan", plan.get("rev_label") or "",
                  plan.get("plan_id") or "")
     sections = _ensure_layer(project, gpkg_path,
                              schema.sections_layer_name(*base_args),
                              apply_sections_style,
-                             expected_fields=schema.SECTIONS_LAYER_FIELDS)
+                             expected_fields=schema.SECTIONS_LAYER_FIELDS,
+                             reload="sections" in wanted)
     events = _ensure_layer(project, gpkg_path,
                            schema.events_layer_name(*base_args),
                            apply_events_style,
-                           expected_fields=schema.EVENTS_LAYER_FIELDS)
+                           expected_fields=schema.EVENTS_LAYER_FIELDS,
+                           reload="events" in wanted)
     _ensure_layer(project, gpkg_path,
                   schema.hazards_layer_name(*base_args),
                   apply_hazards_style,
-                  expected_fields=schema.HAZARDS_LAYER_FIELDS)
+                  expected_fields=schema.HAZARDS_LAYER_FIELDS,
+                  reload="hazards" in wanted)
     return sections, events
+
+
+def set_active_plan_layers(project: Optional[QgsProject], plan: Dict) -> None:
+    """Make the selected plan the visible one in the Burial Planner group.
+
+    Layer visibility follows the dock's plan selector: the active plan's
+    sections/events/hazards nodes are checked and every other plan's burial
+    layers are unchecked — never removed, so nothing is lost by switching
+    back and forth (and a comparison overlay can still be re-checked by
+    hand until the next plan switch).
+    """
+    project = project or QgsProject.instance()
+    group = burial_group(project, create=False)
+    if group is None:
+        return
+    base_args = (plan.get("name") or "plan", plan.get("rev_label") or "",
+                 plan.get("plan_id") or "")
+    active = {schema.sections_layer_name(*base_args),
+              schema.events_layer_name(*base_args),
+              schema.hazards_layer_name(*base_args)}
+    for node in group.findLayers():
+        layer = node.layer()
+        if layer is None:
+            continue
+        name = _burial_layer_name(layer.source())
+        if not name:
+            continue
+        try:
+            node.setItemVisibilityChecked(name in active)
+        except (AttributeError, RuntimeError):
+            pass
 
 
 def remove_plan_layers(project: Optional[QgsProject], gpkg_path: str, plan: Dict) -> None:

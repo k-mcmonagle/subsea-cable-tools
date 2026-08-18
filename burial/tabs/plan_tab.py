@@ -22,6 +22,7 @@ from qgis.PyQt.QtWidgets import (
 
 from .. import schema
 from .. import tools as tools_mod
+from .. import ui_helpers
 
 
 class PlanTab(QWidget):
@@ -29,16 +30,28 @@ class PlanTab(QWidget):
         super().__init__(parent)
         self.model = model
         self._loading = False
+        self._dirty = False
+        self._loaded_plan_id = ""
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
         self.name_edit = QLineEdit()
         self.description_edit = QLineEdit()
         self.method_label = QLabel("—")
+        self.method_label.setToolTip(
+            "Chosen when the plan is created; tools of a different type can "
+            "still be assigned per section in the Plan Builder.")
         self.rpl_label = QLabel("—")
+        self.rpl_label.setToolTip("The plan's route — set on the Inputs tab.")
         self.rpl_revision_label = QLabel("—")
+        self.rpl_revision_label.setToolTip(
+            "Revision of the Workbench RPL the plan is anchored to.")
         self.rev_label = QLabel("—")
         self.status_label = QLabel("—")
+        self.status_label.setToolTip(
+            "draft while being edited; stale when the route, scope or "
+            "inputs changed after the last generation; issued when locked "
+            "for release.")
         self.notes_edit = QPlainTextEdit()
         self.notes_edit.setPlaceholderText(
             "Assumptions, review-basis notes, references…")
@@ -70,9 +83,22 @@ class PlanTab(QWidget):
         layout.addLayout(form)
         layout.addWidget(QLabel("Notes:"))
         layout.addWidget(self.notes_edit, 1)
+        save_row = QHBoxLayout()
         self.save_button = QPushButton("Save plan details")
+        self.save_button.setToolTip(
+            "Save name, description and notes. The default tool saves "
+            "immediately when picked.")
         self.save_button.clicked.connect(self._save)
-        layout.addWidget(self.save_button)
+        save_row.addWidget(self.save_button)
+        self.save_status = QLabel("")
+        self.save_status.setStyleSheet(ui_helpers.hint_style())
+        save_row.addWidget(self.save_status, 1)
+        layout.addLayout(save_row)
+        # Dirty tracking: unsaved edits mark the save button and survive
+        # background refreshes of the same plan.
+        self.name_edit.textEdited.connect(self._mark_dirty)
+        self.description_edit.textEdited.connect(self._mark_dirty)
+        self.notes_edit.textChanged.connect(self._notes_changed)
 
         self.hint = QLabel(
             "Create or open a plan with the selector above, register the RPL "
@@ -93,13 +119,22 @@ class PlanTab(QWidget):
         try:
             plan = self.model.plan
             has_plan = bool(plan)
+            plan_id = str(plan.get("plan_id") or "")
+            same_plan = plan_id == self._loaded_plan_id
             for widget in (self.name_edit, self.description_edit,
                            self.notes_edit, self.save_button,
                            self.tool_combo, self.tool_config_combo):
                 widget.setEnabled(has_plan)
-            self.name_edit.setText(plan.get("name") or "")
-            self.description_edit.setText(plan.get("description") or "")
-            self.notes_edit.setPlainText(plan.get("notes") or "")
+            # A background refresh of the same plan must not clobber
+            # unsaved name/description/notes edits.
+            if not (same_plan and self._dirty):
+                self.name_edit.setText(plan.get("name") or "")
+                self.description_edit.setText(plan.get("description") or "")
+                self.notes_edit.setPlainText(plan.get("notes") or "")
+                self._set_dirty(False)
+            if not same_plan:
+                self.save_status.setText("")
+            self._loaded_plan_id = plan_id
             self.method_label.setText(schema.METHOD_LABELS.get(
                 schema.normalise_method(plan.get("method") or ""), "—"))
             self._refresh_tool_combos()
@@ -109,6 +144,21 @@ class PlanTab(QWidget):
             self.status_label.setText(plan.get("status") or "draft")
         finally:
             self._loading = False
+
+    def _mark_dirty(self, *_args) -> None:
+        if not self._loading:
+            self._set_dirty(True)
+
+    def _notes_changed(self) -> None:
+        self._mark_dirty()
+
+    def _set_dirty(self, dirty: bool) -> None:
+        self._dirty = bool(dirty)
+        self.save_button.setText("Save plan details *" if self._dirty
+                                 else "Save plan details")
+        if self._dirty:
+            self.save_status.setText("Unsaved changes.")
+            self.save_status.setStyleSheet(ui_helpers.status_style("warn"))
 
     def _on_tools_changed(self) -> None:
         was_loading = self._loading
@@ -170,8 +220,25 @@ class PlanTab(QWidget):
     def _save(self) -> None:
         if self._loading or not self.model.plan:
             return
-        self.model.update_plan({
-            "name": self.name_edit.text().strip() or (self.model.plan.get("name") or "Plan"),
+        name = self.name_edit.text().strip()
+        blank_name = not name
+        if blank_name:
+            name = self.model.plan.get("name") or "Plan"
+            self.name_edit.setText(name)
+        if self.model.update_plan({
+            "name": name,
             "description": self.description_edit.text(),
             "notes": self.notes_edit.toPlainText(),
-        })
+        }):
+            # Cleared only after the write succeeded: on a store failure
+            # the edits stay dirty-protected instead of silently reverting
+            # on the next refresh.
+            self._set_dirty(False)
+            if blank_name:
+                self.save_status.setText(
+                    "Saved — the plan needs a name, so the previous name "
+                    "was kept.")
+                self.save_status.setStyleSheet(ui_helpers.status_style("warn"))
+            else:
+                self.save_status.setText("Saved.")
+                self.save_status.setStyleSheet(ui_helpers.status_style("ok"))

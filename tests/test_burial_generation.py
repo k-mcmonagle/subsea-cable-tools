@@ -219,6 +219,23 @@ def test_refinement_converges() -> bool:
     return _result("boundary refinement converges to <= 1 m", ok, f"err={err_m:.2f} m")
 
 
+def test_default_refinement_keeps_symmetric_buffer_at_display_length() -> bool:
+    """A 500 m crossing buffer must not display as a 1001 m exclusion."""
+    centre_kp = 10.0
+    half_width_km = 0.5
+    predicate = lambda kp: abs(kp - centre_kp) <= half_width_km
+    coarse = [Interval(9.45, 10.55)]
+    refined = gen.refine_intervals(
+        coarse, predicate, coarse_step_km=0.05,
+        domain=Interval(0.0, 20.0))
+    length_m = refined[0].length_km * 1000.0
+    ok = abs(length_m - 1000.0) <= gen.BOUNDARY_REFINE_TOL_M + 1e-9
+    ok = ok and round(length_m) == 1000
+    return _result(
+        "default refinement preserves a 500 m-each-side displayed length",
+        ok, f"length={length_m:.3f} m")
+
+
 def test_cache_key_sensitivity() -> bool:
     scope = Interval(0.0, 20.0)
     rule = _rule("r1", config={"value": 10.0})
@@ -230,6 +247,8 @@ def test_cache_key_sensitivity() -> bool:
     ok = ok and base != gen.rule_cache_key(rule, "fp1", Interval(0, 10), 50.0, "rplfp", 1)
     ok = ok and base != gen.rule_cache_key(rule, "fp1", scope, 25.0, "rplfp", 1)
     ok = ok and base != gen.rule_cache_key(rule, "fp1", scope, 50.0, "rplfp2", 1)
+    ok = ok and base != gen.rule_cache_key(
+        rule, "fp1", scope, 50.0, "rplfp", 1, refine_tol_m=1.0)
     # direction only matters for signed slope
     ok = ok and base == gen.rule_cache_key(rule, "fp1", scope, 50.0, "rplfp", -1)
     signed = _rule("r1", config={"slope_signed": True})
@@ -247,7 +266,8 @@ def test_cache_key_sensitivity() -> bool:
     key_25m = gen.rule_cache_key(
         threshold, "fp1", scope, 50.0, "rplfp", 1, profile_step_m=25.0)
     ok = ok and key_5m != key_25m
-    return _result("cache key: config/fingerprint/scope/step/rpl invalidate; "
+    return _result("cache key: config/fingerprint/scope/step/refinement/rpl "
+                   "invalidate; "
                    "profile step invalidates thresholds; influence + direction "
                    "(unsigned) do not", ok)
 
@@ -416,6 +436,7 @@ def run_all() -> list:
         test_extension_keys_do_not_invalidate_cache(),
         test_nodata_becomes_insufficient(),
         test_refinement_converges(),
+        test_default_refinement_keeps_symmetric_buffer_at_display_length(),
         test_cache_key_sensitivity(),
         test_determinism(),
         test_proposal_diff(),

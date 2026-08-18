@@ -21,12 +21,14 @@ from qgis.PyQt.QtWidgets import (
     QDialogButtonBox,
     QDoubleSpinBox,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -50,6 +52,7 @@ from ...qgis_compat import (
 )
 from ...workbench.project_layers import normalised_path
 from .. import schema
+from .. import ui_helpers
 
 _ROLE_FILTERS = {
     schema.INPUT_ROLE_CROSSINGS_POINTS: (MAP_LAYER_FILTER_POINT,),
@@ -105,7 +108,7 @@ class InputDialog(QDialog):
         from ...qgis_compat import BUTTON_BOX_CANCEL, BUTTON_BOX_OK
 
         buttons.setStandardButtons(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
-        buttons.accepted.connect(self.accept)
+        buttons.accepted.connect(self._accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
@@ -113,6 +116,17 @@ class InputDialog(QDialog):
         if index >= 0:
             self.role_combo.setCurrentIndex(index)
         self._sync_filter()
+        if self.row.get("layer_id_hint") or self.row.get("layer_source"):
+            # Editing an existing registration: start from the layer the
+            # row is bound to — otherwise the combo silently defaults to
+            # the first matching project layer and OK re-points the input.
+            from .. import map_layers
+
+            current = map_layers.resolve_input_layer(QgsProject.instance(),
+                                                     self.row)
+            if current is not None \
+                    and QgsProject.instance().mapLayer(current.id()) is not None:
+                self.layer_combo.setLayer(current)
         if self.row.get("status") == "superseded":
             self.status_combo.setCurrentIndex(1)
         quality_index = self.quality_combo.findText(self.row.get("quality") or "")
@@ -123,6 +137,15 @@ class InputDialog(QDialog):
         role = self.role_combo.currentData()
         members = _ROLE_FILTERS.get(role, (MAP_LAYER_FILTER_VECTOR,))
         self.layer_combo.setFilters(layer_filters(*members))
+
+    def _accept(self) -> None:
+        if self.layer_combo.currentLayer() is None:
+            QMessageBox.warning(
+                self, "Burial Planner",
+                "Pick a layer to register — no matching layer is selected "
+                "(the list is filtered by the chosen role).")
+            return
+        self.accept()
 
     def result_row(self) -> Optional[Dict]:
         layer = self.layer_combo.currentLayer()
@@ -155,8 +178,18 @@ class InputsTab(QWidget):
 
         # Keep forms at a readable measure when the floating dock is maximised
         # on a wide monitor. Tables still get a useful 1050 px working width,
-        # while labels and selectors no longer stretch across the whole screen.
-        outer = QHBoxLayout(self)
+        # while labels and selectors no longer stretch across the whole
+        # screen. The scroll area keeps everything reachable on short docks.
+        tab_layout = QVBoxLayout(self)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame
+                             if hasattr(QFrame, "Shape") else QFrame.NoFrame)
+        tab_layout.addWidget(scroll)
+        scroll_body = QWidget()
+        scroll.setWidget(scroll_body)
+        outer = QHBoxLayout(scroll_body)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addStretch(1)
         content = QWidget()
@@ -168,21 +201,42 @@ class InputsTab(QWidget):
         # -- RPL --------------------------------------------------------------
         rpl_box = QGroupBox("Route (RPL)")
         rpl_form = QFormLayout(rpl_box)
+        self.active_route_label = QLabel("—")
+        self.active_route_label.setWordWrap(True)
+        self.active_route_label.setToolTip(
+            "The route the plan currently uses — set with one of the "
+            "buttons below (the last one applied wins).")
+        rpl_form.addRow("Active route:", self.active_route_label)
         rpl_row = QHBoxLayout()
         self.rpl_combo = QComboBox()
+        self.rpl_combo.setToolTip(
+            "RPLs registered in this project's Cable Workbench. Set route "
+            "anchors the plan to the selected RPL and its revision.")
         self.rpl_combo.currentIndexChanged.connect(self._update_rpl_revision_preview)
         rpl_row.addWidget(self.rpl_combo, 1)
+        refresh_rpls_button = QPushButton("⟳")
+        refresh_rpls_button.setMaximumWidth(28)
+        refresh_rpls_button.setToolTip(
+            "Reload the Workbench RPL list (e.g. after registering a new "
+            "RPL in the Workbench).")
+        refresh_rpls_button.clicked.connect(self._refresh_rpls)
+        rpl_row.addWidget(refresh_rpls_button)
         self.apply_rpl_button = QPushButton("Set route")
+        self.apply_rpl_button.setToolTip(
+            "Anchor the plan to the selected Workbench RPL.")
         self.apply_rpl_button.clicked.connect(self._apply_rpl)
         rpl_row.addWidget(self.apply_rpl_button)
         rpl_form.addRow("Workbench RPL:", rpl_row)
         self.rpl_revision_label = QLabel("—")
         self.rpl_revision_label.setToolTip(
-            "Revision label stored on the selected Cable Workbench RPL.")
+            "Revision label stored on the RPL selected in the list above "
+            "(a preview — Set route applies it).")
         rpl_form.addRow("Selected RPL revision:", self.rpl_revision_label)
         fallback_row = QHBoxLayout()
         self.fallback_combo = QgsMapLayerComboBox()
         self.fallback_combo.setFilters(layer_filters(MAP_LAYER_FILTER_LINE))
+        self.fallback_combo.setToolTip(
+            "Fallback: any project line layer in Workbench RPL format.")
         fallback_row.addWidget(self.fallback_combo, 1)
         self.apply_fallback_button = QPushButton("Use line layer")
         self.apply_fallback_button.setToolTip(
@@ -196,37 +250,46 @@ class InputsTab(QWidget):
         # -- scope + direction ------------------------------------------------
         scope_box = QGroupBox("Scope and direction")
         scope_form = QFormLayout(scope_box)
-        scope_row = QHBoxLayout()
         self.scope_start = QDoubleSpinBox()
         self.scope_end = QDoubleSpinBox()
         for spin in (self.scope_start, self.scope_end):
             spin.setDecimals(3)
             spin.setRange(0.0, 100000.0)
             spin.setSuffix(" km")
-        scope_row.addWidget(QLabel("KP"))
-        scope_row.addWidget(self.scope_start)
+            spin.setToolTip(
+                "Analysis and profile sampling are limited to this KP "
+                "range. Apply scope / direction saves it.")
+        # Two rows so the controls still fit a narrow docked width.
+        start_row = QHBoxLayout()
+        start_row.addWidget(self.scope_start, 1)
         self.scope_pick_start = QPushButton("Pick…")
         self.scope_pick_start.clicked.connect(
             lambda: self._pick_scope_kp(self.scope_start, "start"))
-        scope_row.addWidget(self.scope_pick_start)
-        scope_row.addWidget(QLabel("to"))
-        scope_row.addWidget(self.scope_end)
+        start_row.addWidget(self.scope_pick_start)
+        scope_form.addRow("Scope from KP:", start_row)
+        end_row = QHBoxLayout()
+        end_row.addWidget(self.scope_end, 1)
         self.scope_pick_end = QPushButton("Pick…")
         self.scope_pick_end.clicked.connect(
             lambda: self._pick_scope_kp(self.scope_end, "end"))
-        scope_row.addWidget(self.scope_pick_end)
+        end_row.addWidget(self.scope_pick_end)
+        self.full_route_button = QPushButton("Full route")
+        self.full_route_button.setToolTip(
+            "Set the scope to the whole route (KP 0 to route end).")
+        self.full_route_button.clicked.connect(self._full_route)
+        end_row.addWidget(self.full_route_button)
+        scope_form.addRow("to KP:", end_row)
         for button in (self.scope_pick_start, self.scope_pick_end):
             button.setToolTip(
                 "Pick the KP by clicking the route on the map (right-click "
                 "or Esc cancels). Apply scope / direction saves it.")
-        self.full_route_button = QPushButton("Full route")
-        self.full_route_button.clicked.connect(self._full_route)
-        scope_row.addWidget(self.full_route_button)
-        scope_row.addStretch(1)
-        scope_form.addRow("Scope:", scope_row)
         self.direction_combo = QComboBox()
         self.direction_combo.addItem("A → B (with increasing KP)", 1)
         self.direction_combo.addItem("B → A (against KP)", -1)
+        self.direction_combo.setToolTip(
+            "Direction of installation. Approach/departure semantics "
+            "(Exclusion Area extensions, influence zones, signed slope) "
+            "follow it.")
         scope_form.addRow("Direction of installation:", self.direction_combo)
         self.target_burial = QDoubleSpinBox()
         self.target_burial.setDecimals(2)
@@ -240,6 +303,8 @@ class InputsTab(QWidget):
         scope_note.setWordWrap(True)
         scope_form.addRow(scope_note)
         self.apply_scope_button = QPushButton("Apply scope / direction")
+        self.apply_scope_button.setToolTip(
+            "Save the scope, direction and target burial depth to the plan.")
         self.apply_scope_button.clicked.connect(self._apply_scope)
         scope_form.addRow(self.apply_scope_button)
         layout.addWidget(scope_box)
@@ -283,20 +348,25 @@ class InputsTab(QWidget):
         self.search_radius.setRange(1.0, 100000.0)
         self.search_radius.setSuffix(" m")
         self.search_radius.setValue(500.0)
+        for widget in (self.contour_combo, self.contour_combo2):
+            widget.setToolTip(
+                "Depth contour line layer. When two layers are given (e.g. "
+                "minor and major contours) their crossings are merged into "
+                "one profile; depths are interpolated between the actual "
+                "route crossings.")
         bathy_form.addRow("Manual source type:", self.manual_source_combo)
         bathy_form.addRow("Raster:", self.raster_combo)
         bathy_form.addRow("Band:", self.raster_band)
-        bathy_form.addRow("Contour layer 1 (minor or major):", self.contour_combo)
+        bathy_form.addRow("Contour layer 1:", self.contour_combo)
         bathy_form.addRow("Depth field 1:", self.contour_field)
         bathy_form.addRow("Contour layer 2 (optional):", self.contour_combo2)
         bathy_form.addRow("Depth field 2:", self.contour_field2)
         bathy_form.addRow("Contour search radius:", self.search_radius)
         self.apply_bathy_button = QPushButton("Apply source")
+        self.apply_bathy_button.setToolTip(
+            "Save this bathymetry source configuration to the plan.")
         self.apply_bathy_button.clicked.connect(self._apply_bathy)
         bathy_form.addRow(self.apply_bathy_button)
-        self.apply_status = QLabel("")
-        self.apply_status.setWordWrap(True)
-        bathy_form.addRow(self.apply_status)
         layout.addWidget(bathy_box)
 
         # -- other inputs -----------------------------------------------------
@@ -310,19 +380,77 @@ class InputsTab(QWidget):
         self.inputs_table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
         self.inputs_table.verticalHeader().setVisible(False)
         inputs_layout.addWidget(self.inputs_table, 1)
+        self.inputs_table.itemSelectionChanged.connect(
+            self._sync_input_buttons)
         button_row = QHBoxLayout()
-        for label, slot in (("Add…", self._add_input), ("Edit…", self._edit_input),
-                            ("Remove", self._remove_input)):
-            button = QPushButton(label)
-            button.clicked.connect(slot)
-            button_row.addWidget(button)
+        self.add_input_button = QPushButton("Add…")
+        self.add_input_button.clicked.connect(self._add_input)
+        button_row.addWidget(self.add_input_button)
+        self.edit_input_button = QPushButton("Edit…")
+        self.edit_input_button.clicked.connect(self._edit_input)
+        button_row.addWidget(self.edit_input_button)
+        self.remove_input_button = QPushButton("Remove…")
+        self.remove_input_button.clicked.connect(self._remove_input)
+        button_row.addWidget(self.remove_input_button)
         button_row.addStretch(1)
         inputs_layout.addLayout(button_row)
         layout.addWidget(inputs_box, 1)
 
+        # One status line for the whole tab (route, scope and bathymetry
+        # feedback all land here, full-width so it survives narrow docks).
+        self.apply_status = QLabel("")
+        self.apply_status.setWordWrap(True)
+        layout.addWidget(self.apply_status)
+
+        # Unapplied edits mark the matching Apply button; a background
+        # refresh of the same plan must not clobber them.
+        self._dirty = set()
+        for widget, signal in (
+                (self.scope_start, "valueChanged"),
+                (self.scope_end, "valueChanged"),
+                (self.direction_combo, "currentIndexChanged"),
+                (self.target_burial, "valueChanged")):
+            getattr(widget, signal).connect(
+                lambda *_a, s=self: s._mark_dirty("scope"))
+        for widget, signal in (
+                (self.manual_source_combo, "currentIndexChanged"),
+                (self.raster_combo, "layerChanged"),
+                (self.raster_band, "valueChanged"),
+                (self.contour_combo, "layerChanged"),
+                (self.contour_field, "fieldChanged"),
+                (self.contour_combo2, "layerChanged"),
+                (self.contour_field2, "fieldChanged"),
+                (self.search_radius, "valueChanged")):
+            getattr(widget, signal).connect(
+                lambda *_a, s=self: s._mark_dirty("bathy"))
+
         model.planChanged.connect(self.refresh)
         model.inputsChanged.connect(self._refresh_inputs)
         self.refresh()
+
+    def _mark_dirty(self, key: str) -> None:
+        if self._loading:
+            return
+        self._dirty.add(key)
+        self._sync_dirty_markers()
+
+    def _clear_dirty(self, key: str) -> None:
+        self._dirty.discard(key)
+        self._sync_dirty_markers()
+
+    def _sync_dirty_markers(self) -> None:
+        self.apply_scope_button.setText(
+            "Apply scope / direction *" if "scope" in self._dirty
+            else "Apply scope / direction")
+        self.apply_bathy_button.setText(
+            "Apply source *" if "bathy" in self._dirty else "Apply source")
+
+    def _sync_input_buttons(self) -> None:
+        has_plan = bool(self.model.plan)
+        has_selection = bool(self._selected_input_id())
+        self.add_input_button.setEnabled(has_plan)
+        self.edit_input_button.setEnabled(has_plan and has_selection)
+        self.remove_input_button.setEnabled(has_plan and has_selection)
 
     # -- refresh --------------------------------------------------------------
     def refresh(self) -> None:
@@ -330,24 +458,52 @@ class InputsTab(QWidget):
         try:
             plan = self.model.plan
             enabled = bool(plan)
-            self.setEnabled(True)
+            plan_id = str(plan.get("plan_id") or "")
+            same_plan = plan_id == getattr(self, "_loaded_plan_id", "")
+            self._loaded_plan_id = plan_id
+            if not same_plan:
+                self._dirty = set()
+                self._sync_dirty_markers()
+                self.apply_status.setText("")
             for widget in (self.apply_rpl_button, self.apply_fallback_button,
                            self.apply_scope_button, self.apply_bathy_button):
                 widget.setEnabled(enabled)
             self._refresh_rpls()
-            self.scope_start.setValue(float(plan.get("scope_start_kp") or 0.0))
-            self.scope_end.setValue(float(plan.get("scope_end_kp") or 0.0))
-            index = self.direction_combo.findData(int(plan.get("direction") or 1))
-            self.direction_combo.setCurrentIndex(max(0, index))
-            self.target_burial.setValue(float(plan.get("target_burial_m") or 0.0))
-            self._load_bathy_config()
+            route_name = plan.get("rpl_name") or ""
+            revision = plan.get("rpl_revision") or ""
+            if route_name:
+                kind = ("Workbench RPL" if plan.get("rpl_id")
+                        else "project line layer")
+                self.active_route_label.setText(
+                    route_name + (f" — {revision}" if revision else "")
+                    + f"  ({kind})")
+            else:
+                self.active_route_label.setText(
+                    "— (no route set)" if plan else "—")
+            if not (same_plan and "scope" in self._dirty):
+                self.scope_start.setValue(
+                    float(plan.get("scope_start_kp") or 0.0))
+                self.scope_end.setValue(float(plan.get("scope_end_kp") or 0.0))
+                index = self.direction_combo.findData(
+                    int(plan.get("direction") or 1))
+                self.direction_combo.setCurrentIndex(max(0, index))
+                self.target_burial.setValue(
+                    float(plan.get("target_burial_m") or 0.0))
+                self._clear_dirty("scope")
+            if not (same_plan and "bathy" in self._dirty):
+                self._load_bathy_config()
+                self._clear_dirty("bathy")
             if self.model.route_notice:
-                self.apply_status.setText(self.model.route_notice)
+                self._set_status(self.model.route_notice, "warn")
             elif plan and self.model.route_error:
-                self.apply_status.setText(self.model.route_error)
+                self._set_status(self.model.route_error, "error")
         finally:
             self._loading = False
         self._refresh_inputs()
+
+    def _set_status(self, text: str, kind: str = "") -> None:
+        self.apply_status.setText(text)
+        self.apply_status.setStyleSheet(ui_helpers.status_style(kind))
 
     def _refresh_rpls(self) -> None:
         previous = self.rpl_combo.currentData()
@@ -400,12 +556,16 @@ class InputsTab(QWidget):
 
                     item.setData(ITEM_DATA_USER_ROLE, row.get("input_id"))
                 self.inputs_table.setItem(i, j, item)
+        self._sync_input_buttons()
 
     # -- RPL / scope ----------------------------------------------------------
     def _apply_rpl(self) -> None:
         store = self.workbench_store_fn()
         rpl_id = self.rpl_combo.currentData()
         if not store or not rpl_id:
+            self._set_status(
+                "No Workbench RPL is selected — register the route in the "
+                "Cable Workbench or use a line layer below.", "warn")
             return
         rpl = store.get_rpl(rpl_id) or {}
         from .. import map_layers
@@ -413,36 +573,55 @@ class InputsTab(QWidget):
         # Keep the model's store handle current; the Workbench can be created
         # after the Burial Planner dock was first opened.
         self.model.workbench_store = store
-        self.model.update_plan({
+        if not self.model.update_plan({
             "rpl_id": rpl_id,
             "rpl_name": rpl.get("name") or "",
             "rpl_revision": rpl.get("rev_label") or "",
             "rpl_gpkg_path": store.gpkg_path,
             "rpl_fingerprint": map_layers.rpl_fingerprint(rpl, store.gpkg_path),
-        }, reason="route set")
-        self.apply_status.setText(
+        }, reason="route set"):
+            return
+        if self.model.route is None:
+            # The reference saved but the route itself would not open —
+            # a success message here would mask the broken state.
+            self._set_status(
+                self.model.route_error
+                or "The route was saved but could not be opened.", "error")
+            return
+        self._set_status(
             "Workbench route and revision applied. Continue to Bathymetry "
-            "Profile to review and rebuild the stored samples.")
+            "Profile to review and rebuild the stored samples.", "ok")
 
     def _apply_fallback(self) -> None:
         layer = self.fallback_combo.currentLayer()
         if layer is None:
+            self._set_status("No line layer is selected.", "warn")
             return
-        self.model.update_plan({
+        if not self.model.update_plan({
             "rpl_id": "",
             "rpl_name": layer.name(),
             "rpl_revision": "",
             "rpl_gpkg_path": layer.source(),
             "rpl_fingerprint": normalised_path(layer.source().split("|")[0]),
-        }, reason="route set (line layer)")
-        self.apply_status.setText(
+        }, reason="route set (line layer)"):
+            return
+        if self.model.route is None:
+            self._set_status(
+                self.model.route_error
+                or "The route was saved but could not be opened.", "error")
+            return
+        self._set_status(
             "Line-layer route applied. Continue to Bathymetry Profile to "
-            "review and rebuild the stored samples.")
+            "review and rebuild the stored samples.", "ok")
 
     def _full_route(self) -> None:
-        if self.model.route is not None:
-            self.scope_start.setValue(0.0)
-            self.scope_end.setValue(self.model.route.total_length_km)
+        if self.model.route is None:
+            self._set_status(
+                "Set the route first — Full route needs the route length.",
+                "warn")
+            return
+        self.scope_start.setValue(0.0)
+        self.scope_end.setValue(self.model.route.total_length_km)
 
     def _pick_scope_kp(self, spin, which: str) -> None:
         if self.dock is None:
@@ -453,16 +632,24 @@ class InputsTab(QWidget):
             "(right-click cancels).")
 
     def _apply_scope(self) -> None:
+        start = self.scope_start.value()
+        end = self.scope_end.value()
+        if end <= start:
+            self._set_status(
+                "The scope end KP must be greater than the start KP — "
+                "nothing was saved.", "error")
+            return
         saved = self.model.update_plan({
-            "scope_start_kp": self.scope_start.value(),
-            "scope_end_kp": self.scope_end.value(),
+            "scope_start_kp": start,
+            "scope_end_kp": end,
             "direction": self.direction_combo.currentData(),
             "target_burial_m": self.target_burial.value() or None,
         }, reason="scope/direction")
         if saved:
-            self.apply_status.setText(
+            self._clear_dirty("scope")
+            self._set_status(
                 "Scope and direction applied. Continue to Bathymetry Profile "
-                "to review and rebuild the stored samples.")
+                "to review and rebuild the stored samples.", "ok")
 
     # -- bathymetry -----------------------------------------------------------
     def _bathy_row(self) -> Optional[Dict]:
@@ -536,6 +723,16 @@ class InputsTab(QWidget):
             config["raster_band"] = self.raster_band.value()
         contour = self.contour_combo.currentLayer() if source_mode == 2 else None
         contour2 = self.contour_combo2.currentLayer() if source_mode == 2 else None
+        for layer, field_combo, label in (
+                (contour, self.contour_field, "contour layer 1"),
+                (contour2, self.contour_field2, "contour layer 2")):
+            if layer is not None and not (field_combo.currentField() or ""):
+                QMessageBox.warning(
+                    self, "Burial Planner",
+                    f"Pick the depth field for {label} — without it the "
+                    "first attribute would be used, which is rarely the "
+                    "depth.")
+                return
         if contour is not None:
             config["contour_layers"].append({
                 "layer_id": contour.id(),
@@ -570,11 +767,12 @@ class InputsTab(QWidget):
             "config_json": json.dumps(config),
         })
         if self.model.save_input(row):
+            self._clear_dirty("bathy")
             kind = "raster" if source_mode == 1 else \
                 f"{len(config['contour_layers'])} contour layer(s)"
-            self.apply_status.setText(
+            self._set_status(
                 f"Manual {kind} applied. Continue to Bathymetry Profile to "
-                "review resolution and rebuild the stored samples.")
+                "review resolution and rebuild the stored samples.", "ok")
 
     # -- other inputs ---------------------------------------------------------
     def _add_input(self) -> None:

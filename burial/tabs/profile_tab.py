@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import math
+from typing import Optional
 
 from qgis.core import QgsProject
+from qgis.PyQt.QtGui import QFont
 from qgis.PyQt.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
@@ -17,6 +19,8 @@ from qgis.PyQt.QtWidgets import (
     QWidget,
 )
 
+from .. import ui_helpers
+
 
 class ProfileTab(QWidget):
     """Profile sampling controls kept separate from exclusion resolution."""
@@ -26,6 +30,8 @@ class ProfileTab(QWidget):
         self.model = model
         self.dock = dock
         self._loading = False
+        self._dirty = False
+        self._loaded_plan_id = ""
 
         outer = QHBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -56,7 +62,7 @@ class ProfileTab(QWidget):
             "Route, scope and source layers are selected on Inputs. Return to "
             "Inputs whenever the source data or reviewed KP range changes.")
         source_note.setWordWrap(True)
-        source_note.setStyleSheet("color: #666;")
+        source_note.setStyleSheet(ui_helpers.hint_style())
         source_form.addRow(source_note)
         layout.addWidget(source_box)
 
@@ -106,16 +112,41 @@ class ProfileTab(QWidget):
         self.rebuild_button.setToolTip(
             "Save these settings, then rebuild and persist depth plus "
             "cross-offset samples in the background.")
+        # The rebuild is the primary action of this tab — make it read so.
+        bold = QFont(self.rebuild_button.font())
+        bold.setBold(True)
+        self.rebuild_button.setFont(bold)
         self.rebuild_button.clicked.connect(self._apply_and_rebuild)
         button_row.addWidget(self.rebuild_button)
         button_row.addStretch(1)
         build_layout.addLayout(button_row)
+        self.apply_feedback = QLabel("")
+        self.apply_feedback.setWordWrap(True)
+        self.apply_feedback.setStyleSheet(ui_helpers.hint_style())
+        build_layout.addWidget(self.apply_feedback)
         layout.addWidget(build_box)
         layout.addStretch(1)
+
+        # Unapplied spin edits mark the buttons and survive background
+        # refreshes of the same plan.
+        self.profile_step_spin.valueChanged.connect(self._mark_dirty)
+        self.cross_offset_spin.valueChanged.connect(self._mark_dirty)
 
         model.planChanged.connect(self.refresh)
         model.inputsChanged.connect(self.refresh)
         self.refresh()
+
+    def _mark_dirty(self, *_args) -> None:
+        if self._loading:
+            return
+        self._set_dirty(True)
+
+    def _set_dirty(self, dirty: bool) -> None:
+        self._dirty = bool(dirty)
+        self.apply_button.setText("Apply settings *" if dirty
+                                  else "Apply settings")
+        self.rebuild_button.setText("Apply && rebuild profile *" if dirty
+                                    else "Apply && rebuild profile")
 
     def _source_text(self) -> str:
         config = self.model.depth_config()
@@ -140,9 +171,18 @@ class ProfileTab(QWidget):
         self._loading = True
         try:
             plan = self.model.plan
+            plan_id = str(plan.get("plan_id") or "")
+            same_plan = plan_id == self._loaded_plan_id
             params = self.model.gen_params()
-            self.profile_step_spin.setValue(params.profile_step_m)
-            self.cross_offset_spin.setValue(params.cross_offset_m)
+            # Never clobber edited-but-unapplied values on a background
+            # refresh of the same plan.
+            if not (same_plan and self._dirty):
+                self.profile_step_spin.setValue(params.profile_step_m)
+                self.cross_offset_spin.setValue(params.cross_offset_m)
+                self._set_dirty(False)
+            if not same_plan:
+                self.apply_feedback.setText("")
+            self._loaded_plan_id = plan_id
             enabled = bool(plan)
             self.apply_button.setEnabled(enabled)
 
@@ -171,25 +211,40 @@ class ProfileTab(QWidget):
             profile = self.model.bathy_profile
             if state == "missing":
                 state_text = "No stored profile. Apply settings and rebuild it."
-                style = "color: #b71c1c; font-weight: 600;"
+                style = ui_helpers.status_style("error")
             elif state == "stale":
                 state_text = (
                     "Stored profile is stale because its route, scope, source, "
                     "resolution or cross offset differs from the current setup. "
                     "Rebuild before generating exclusions.")
-                style = "color: #b36b00; font-weight: 600;"
+                style = ui_helpers.status_style("warn")
             else:
                 state_text = (
                     f"Current: {profile.sample_count:,} stations at "
                     f"{profile.step_m:g} m, cross ±{profile.cross_offset_m:g} m."
                     if profile is not None else "Current profile.")
-                style = "color: #1b5e20; font-weight: 600;"
+                style = ui_helpers.status_style("ok")
             self.profile_state_label.setText(state_text)
             self.profile_state_label.setStyleSheet(style)
-            can_rebuild = (enabled and self.model.route is not None
-                           and params.scope.length_km > 0
-                           and self.model.depth_config().is_configured())
-            self.rebuild_button.setEnabled(can_rebuild)
+            blockers = []
+            if not enabled:
+                blockers.append("no plan is open")
+            else:
+                if self.model.route is None:
+                    blockers.append("the route is not set (Inputs)")
+                if params.scope.length_km <= 0:
+                    blockers.append("the scope is not set (Inputs)")
+                if not self.model.depth_config().is_configured():
+                    blockers.append("no bathymetry source is configured "
+                                    "(Inputs)")
+            self.rebuild_button.setEnabled(not blockers)
+            if blockers:
+                self.rebuild_button.setToolTip(
+                    "Cannot rebuild yet: " + "; ".join(blockers) + ".")
+            else:
+                self.rebuild_button.setToolTip(
+                    "Save these settings, then rebuild and persist depth "
+                    "plus cross-offset samples in the background.")
         finally:
             self._loading = False
 
@@ -199,7 +254,8 @@ class ProfileTab(QWidget):
             self.profile_state_label.setText(text)
             self.profile_state_label.setStyleSheet("")
 
-    def _save_settings(self) -> bool:
+    def _save_settings(self) -> Optional[bool]:
+        """True = saved, False = write failed, None = nothing to save."""
         if self._loading or not self.model.plan:
             return False
         profile_step = self.profile_step_spin.value()
@@ -207,17 +263,30 @@ class ProfileTab(QWidget):
         params = self.model.gen_params()
         if (abs(params.profile_step_m - profile_step) <= 1e-9
                 and abs(params.cross_offset_m - cross_offset) <= 1e-9):
-            return True
-        return self.model.update_gen_params({
+            self._set_dirty(False)
+            return None
+        if self.model.update_gen_params({
             "profile_step_m": profile_step,
             "cross_offset_m": cross_offset,
-        }, reason="bathymetry profile parameters")
+        }, reason="bathymetry profile parameters"):
+            # Cleared only after the write succeeded: on a store failure
+            # the edits stay dirty-protected instead of silently reverting
+            # on the next refresh.
+            self._set_dirty(False)
+            return True
+        return False
 
     def _apply_settings(self) -> None:
-        if self._save_settings():
-            self.refresh()
+        saved = self._save_settings()
+        if saved is None:
+            self.apply_feedback.setText(
+                "No changes to apply — the stored settings already match.")
+        elif saved:
+            self.apply_feedback.setText("Settings applied.")
+        self.refresh()
 
     def _apply_and_rebuild(self) -> None:
-        if self._save_settings():
+        if self._save_settings() is not False:
+            self.apply_feedback.setText("")
             self.dock.request_profile_resample()
 

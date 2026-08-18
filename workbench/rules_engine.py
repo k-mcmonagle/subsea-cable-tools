@@ -560,39 +560,81 @@ def _merge_slivers(verdicts: List[RangeVerdict], min_km: float, tol: float) -> L
 
     An excluded sliver stricter than both neighbours is kept (exclusions are
     never silently dropped).
+
+    Single left-to-right pass with local backtracking. The previous
+    restart-from-scratch loop re-sorted and re-dissolved the whole list
+    after every merge (O(n² log n)); a merge only changes its own
+    neighbourhood, so re-examining from one entry back reaches the same
+    fixpoint.
     """
     if min_km <= 0 or len(verdicts) < 2:
         return verdicts
     work = list(verdicts)
-    changed = True
-    while changed and len(work) > 1:
-        changed = False
-        for i, v in enumerate(work):
-            if v.length_km >= min_km - tol:
-                continue
-            left = work[i - 1] if i > 0 else None
-            right = work[i + 1] if i < len(work) - 1 else None
-            best = None
-            best_sev = -1
-            for neigh in (left, right):
-                if neigh is not None and neigh.risk_level > best_sev:
-                    best_sev = neigh.risk_level
-                    best = neigh
-            if best is None or v.risk_level > best_sev:
-                # No neighbour, or this sliver is stricter than both -> keep it.
-                continue
-            # Extend the chosen neighbour to swallow the sliver.
-            new_start = min(best.start_km, v.start_km)
-            new_end = max(best.end_km, v.end_km)
-            fired = list(dict.fromkeys(best.fired_rule_ids + v.fired_rule_ids))
-            best_new = RangeVerdict(new_start, new_end, best.status, best.risk_level,
-                                    fired, best.dominant_rule_id)
-            work = [w for w in work if w is not v and w is not best]
-            work.append(best_new)
-            work.sort(key=lambda w: w.start_km)
-            work = dissolve_adjacent(work, tol)
-            changed = True
-            break
+
+    def dissolve_at(index: int) -> int:
+        """Dissolve ``index`` into equal neighbours; return its new index."""
+        # Merge with left neighbour first, then right (same outcome as a
+        # full dissolve pass over an otherwise-dissolved list).
+        while index > 0:
+            left, v = work[index - 1], work[index]
+            if left.status == v.status and left.risk_level == v.risk_level \
+                    and left.dominant_rule_id == v.dominant_rule_id \
+                    and abs(left.end_km - v.start_km) <= tol:
+                fired = list(dict.fromkeys(left.fired_rule_ids + v.fired_rule_ids))
+                work[index - 1] = RangeVerdict(
+                    left.start_km, v.end_km, left.status, left.risk_level,
+                    fired, left.dominant_rule_id)
+                del work[index]
+                index -= 1
+            else:
+                break
+        while index < len(work) - 1:
+            v, right = work[index], work[index + 1]
+            if v.status == right.status and v.risk_level == right.risk_level \
+                    and v.dominant_rule_id == right.dominant_rule_id \
+                    and abs(v.end_km - right.start_km) <= tol:
+                fired = list(dict.fromkeys(v.fired_rule_ids + right.fired_rule_ids))
+                work[index] = RangeVerdict(
+                    v.start_km, right.end_km, v.status, v.risk_level,
+                    fired, v.dominant_rule_id)
+                del work[index + 1]
+            else:
+                break
+        return index
+
+    i = 0
+    while i < len(work) and len(work) > 1:
+        v = work[i]
+        if v.length_km >= min_km - tol:
+            i += 1
+            continue
+        left = work[i - 1] if i > 0 else None
+        right = work[i + 1] if i < len(work) - 1 else None
+        best = None
+        best_index = -1
+        best_sev = -1
+        for neigh, index in ((left, i - 1), (right, i + 1)):
+            if neigh is not None and neigh.risk_level > best_sev:
+                best_sev = neigh.risk_level
+                best = neigh
+                best_index = index
+        if best is None or v.risk_level > best_sev:
+            # No neighbour, or this sliver is stricter than both -> keep it.
+            i += 1
+            continue
+        # Extend the chosen neighbour to swallow the sliver.
+        new_start = min(best.start_km, v.start_km)
+        new_end = max(best.end_km, v.end_km)
+        fired = list(dict.fromkeys(best.fired_rule_ids + v.fired_rule_ids))
+        merged = RangeVerdict(new_start, new_end, best.status, best.risk_level,
+                              fired, best.dominant_rule_id)
+        low = min(i, best_index)
+        work[low] = merged
+        del work[low + 1]
+        low = dissolve_at(low)
+        # The merge only changed this neighbourhood — re-examine from just
+        # before it.
+        i = max(low - 1, 0)
     return work
 
 
@@ -630,12 +672,44 @@ def evaluate(
         ]
         applicable.sort(key=lambda h: h.rule.seq)
         breaks = _collect_breakpoints(domain, applicable, tol_km)
+        # Sweep: atoms are visited in KP order, so each rule keeps a cursor
+        # into its (normalized, sorted, disjoint) interval list instead of
+        # scanning every interval per atom — the per-atom containment test
+        # was O(total intervals) and made noisy threshold rules quadratic.
+        interval_lists = [h.intervals for h in applicable]
+        rules = [h.rule for h in applicable]
+        cursors = [0] * len(applicable)
         verdicts: List[RangeVerdict] = []
         for a, b in zip(breaks, breaks[1:]):
             if b - a <= tol_km:
                 continue
             mid = 0.5 * (a + b)
-            severity, dominant, fired = _resolve_atom(mid, applicable, tol_km)
+            severity = SEVERITY_ALLOWED
+            dominant: Optional[str] = None
+            fired: List[str] = []
+            for index, rule in enumerate(rules):
+                ivs = interval_lists[index]
+                cur = cursors[index]
+                count = len(ivs)
+                while cur < count and ivs[cur].end_km < mid - tol_km:
+                    cur += 1
+                cursors[index] = cur
+                if cur >= count or ivs[cur].start_km > mid + tol_km:
+                    continue
+                fired.append(rule.rule_id)
+                if rule.action == ACTION_EXCLUDE:
+                    severity = SEVERITY_EXCLUDED
+                    dominant = rule.rule_id
+                elif rule.action == ACTION_RISK:
+                    level = int(rule.risk_level or 0)
+                    if level > severity:
+                        severity = level
+                        dominant = rule.rule_id
+                    elif level == severity and severity > SEVERITY_ALLOWED:
+                        dominant = rule.rule_id
+                elif rule.action == ACTION_ALLOW:
+                    severity = SEVERITY_ALLOWED
+                    dominant = rule.rule_id
             verdicts.append(RangeVerdict(a, b, severity_to_status(severity), severity,
                                          fired, dominant))
         verdicts = dissolve_adjacent(verdicts, tol_km)
