@@ -122,7 +122,7 @@ class WorkbenchDock(QDockWidget):
         new_menu.addAction("New cable segment...", self._new_route)
         new_menu.addAction("Import RPL...", self._import_rpl)
         new_menu.addAction("Add RPL from layers...", self._register_rpl)
-        new_menu.addAction("New RPL from route line (KML...)...", self._import_rpl_from_line)
+        new_menu.addAction("New RPL from route line or points (KML...)...", self._import_rpl_from_line)
         new_menu.addAction("New assembly...", self._new_assembly)
         new_menu.addAction("Manage assemblies...", self._manage_assemblies)
         new_menu.addAction("New assessment...", self._new_assessment)
@@ -624,8 +624,7 @@ class WorkbenchDock(QDockWidget):
             for rpl in rpl_rows:
                 revisions_by_route.setdefault(rpl.get("route_id") or "", []).append(rpl)
             for revisions in revisions_by_route.values():
-                revisions.sort(key=lambda row: (
-                    row.get("created_utc") or "", row.get("name") or ""))
+                revisions.sort(key=schema.revision_sort_key)
             assessments_by_rpl: Dict[str, list] = {}
             for assessment in assessments:
                 assessments_by_rpl.setdefault(
@@ -844,7 +843,7 @@ class WorkbenchDock(QDockWidget):
             menu.addAction("New RPL revision...", self._new_rpl_revision)
             menu.addAction("Import RPL...", self._import_rpl)
             menu.addAction("Add RPL from layers...", self._register_rpl)
-            menu.addAction("New RPL from route line (KML...)...", self._import_rpl_from_line)
+            menu.addAction("New RPL from route line or points (KML...)...", self._import_rpl_from_line)
             menu.addAction("Fit assembly...", self._fit_selected_rpl)
             menu.addAction("New assessment...", self._new_assessment)
             self._add_assign_system_menu(menu)
@@ -1066,7 +1065,7 @@ class WorkbenchDock(QDockWidget):
         self.refresh_tree()
 
     def _import_rpl_from_line(self):
-        """Register a bare route line (KML or any line layer) as an RPL revision."""
+        """Register a bare route line or point sequence as an RPL revision."""
         store = self._store()
         if store is None:
             QMessageBox.information(

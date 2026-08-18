@@ -456,6 +456,20 @@ def assessment_ranges_layer_name(assessment_name: str) -> str:
     return f"wb_assess_{sanitize_slug(assessment_name)}_ranges"
 
 
+def revision_sort_key(row) -> tuple:
+    """Shared ordering for a segment's RPL revisions (oldest first).
+
+    Numbered labels ("Rev 2") order numerically so importing revisions out
+    of receipt order (Rev 3 before a corrected Rev 2) still sorts Rev 3
+    last; unnumbered labels ("C02", "As-laid final") sort after all
+    numbered ones by creation time. Every list that orders revisions must
+    use this key so the store and the panels never disagree.
+    """
+    match = re.search(r"\brev\s*(\d+)\b", str(row.get("rev_label") or ""), re.IGNORECASE)
+    number = int(match.group(1)) if match else float("inf")
+    return (number, row.get("created_utc") or "", row.get("name") or "")
+
+
 def next_rev_label(existing) -> str:
     """Return the next friendly revision label from existing labels/rows."""
     max_n = 0

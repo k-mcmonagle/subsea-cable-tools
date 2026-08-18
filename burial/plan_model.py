@@ -312,9 +312,23 @@ class PlanModel(QObject):
             self.plan["status"] = schema.PLAN_STATUS_STALE
             self._store_write("update the plan status", self.store.save_plan, self.plan)
 
+    def _has_derived_state(self) -> bool:
+        """Whether the plan carries results computed from its current inputs.
+
+        A duplicated plan has events/sections but no generation rows (those
+        are deliberately not copied), so checking active_generation alone
+        left duplicates unable to ever show as stale.
+        """
+        try:
+            return bool(self.store.active_generation(self.plan_id)
+                        or self.store.list_events(self.plan_id)
+                        or self.store.list_sections(self.plan_id))
+        except Exception:
+            return False
+
     def mark_stale(self) -> None:
         if self.plan and self.plan.get("status") != schema.PLAN_STATUS_STALE \
-                and self.store.active_generation(self.plan_id):
+                and self._has_derived_state():
             self.plan["status"] = schema.PLAN_STATUS_STALE
             self._store_write("update the plan status", self.store.save_plan, self.plan)
             self.planChanged.emit()

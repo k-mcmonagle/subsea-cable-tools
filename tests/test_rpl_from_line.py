@@ -19,7 +19,11 @@ from qgis.core import QgsFeature, QgsGeometry, QgsPointXY, QgsProject, QgsVector
 from ..workbench.rpl_from_line import (
     RouteLineError,
     load_line_file,
+    load_route_file,
+    match_events_to_vertices,
     model_from_lonlat,
+    point_records,
+    route_from_points,
     vertices_lonlat,
 )
 from ..workbench.rpl_import_service import CommitRequest, commit_import
@@ -140,12 +144,103 @@ def test_kml_round_trip_and_commit() -> bool:
                    ok, f"rev={result.rev_label} then {second.rev_label}")
 
 
+def _memory_points(records, crs="EPSG:4326"):
+    layer = QgsVectorLayer(f"Point?crs={crs}&field=Event:string", "events", "memory")
+    provider = layer.dataProvider()
+    features = []
+    for x, y, label in records:
+        feature = QgsFeature(layer.fields())
+        feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(x, y)))
+        feature["Event"] = label
+        features.append(feature)
+    provider.addFeatures(features)
+    layer.updateExtents()
+    return layer
+
+
+def test_route_from_points() -> bool:
+    layer = _memory_points([
+        (0.0, 50.0, "BMH East"),
+        (0.1, 50.0, ""),
+        (0.1, 50.0, "AC1"),          # consecutive duplicate carries its label
+        (0.2, 50.05, "Joint"),
+    ])
+    coords, events = route_from_points(layer, "Event")
+    ok = coords == [(0.0, 50.0), (0.1, 50.0), (0.2, 50.05)]
+    ok = ok and events == {0: "BMH East", 1: "AC1", 2: "Joint"}
+    # without a label field, positions still import
+    coords_plain, events_plain = route_from_points(layer)
+    ok = ok and coords_plain == coords and events_plain == {}
+    single = _memory_points([(0.0, 50.0, "only")])
+    try:
+        route_from_points(single, "Event")
+        ok = False
+    except RouteLineError:
+        pass
+    return _result("route from ordered points: order, dedupe, labels", ok)
+
+
+def test_match_events_to_vertices() -> bool:
+    coords = [(0.0, 50.0), (0.1, 50.0), (0.2, 50.05)]
+    events = [
+        (0.0001, 50.0, "A End BMH"),      # ~7 m from vertex 0 → assigned
+        (0.1, 50.00005, "AC1"),           # ~6 m from vertex 1 → assigned
+        (0.5, 51.0, "Far away"),          # >100 m from everything → warned
+        (0.1004, 50.0, "AC1 duplicate"),  # ~29 m, vertex 1 contested → closer AC1 wins
+    ]
+    matched, warnings = match_events_to_vertices(coords, events)
+    ok = matched.get(0) == "A End BMH" and matched.get(1) == "AC1"
+    ok = ok and 2 not in matched
+    ok = ok and len(warnings) == 2
+    ok = ok and any("Far away" in w for w in warnings)
+    model = model_from_lonlat(coords, events=matched)
+    ok = ok and model.points[0].event == "A End BMH"
+    ok = ok and model.points[1].event == "AC1"
+    ok = ok and model.points[2].event == "B End"   # end default kept
+    return _result("event points match nearest vertex with warnings", ok,
+                   f"warnings={len(warnings)}")
+
+
+def test_kml_with_event_placemarks() -> bool:
+    folder = tempfile.mkdtemp(prefix="wb_lineimport_test_")
+    kml_path = os.path.join(folder, "route_events.kml")
+    with open(kml_path, "w", encoding="utf-8") as handle:
+        handle.write(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<kml xmlns="http://www.opengis.net/kml/2.2"><Document>'
+            '<Placemark><name>Route</name><LineString><coordinates>'
+            '0.0,50.0,0 0.1,50.0,0 0.2,50.05,0'
+            '</coordinates></LineString></Placemark>'
+            '<Placemark><name>BMH East</name><Point><coordinates>'
+            '0.0,50.0,0</coordinates></Point></Placemark>'
+            '<Placemark><name>AC1</name><Point><coordinates>'
+            '0.1,50.0,0</coordinates></Point></Placemark>'
+            '</Document></kml>\n')
+    line, points = load_route_file(kml_path)
+    ok = line is not None and points is not None
+    if not ok:
+        return _result("KML with placemarks yields line + points", False)
+    coords = vertices_lonlat(line)
+    records = [r for r in point_records(points, "Name") if r[2]]
+    matched, warnings = match_events_to_vertices(coords, records)
+    model = model_from_lonlat(coords, events=matched)
+    ok = ok and model.points[0].event == "BMH East"
+    ok = ok and model.points[1].event == "AC1"
+    ok = ok and model.points[2].event == "B End"
+    ok = ok and not warnings
+    return _result("KML route + event placemarks carry labels", ok,
+                   f"events={[p.event for p in model.points]}")
+
+
 def run_all():
     return [
         test_model_from_lonlat(),
         test_vertices_extraction_rules(),
         test_crs_transform(),
         test_kml_round_trip_and_commit(),
+        test_route_from_points(),
+        test_match_events_to_vertices(),
+        test_kml_with_event_placemarks(),
     ]
 
 

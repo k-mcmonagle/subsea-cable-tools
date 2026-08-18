@@ -502,8 +502,11 @@ def _discover_sources(planner_store, errors=None) -> List[RplSource]:
                     line_layer = store.open_layer(row.get("lines_layer") or "")
                     point_layer = store.open_layer(row.get("points_layer") or "")
                     if line_layer is not None:
+                        kind = (row.get("kind") or "").replace("_", "-")
+                        suffix = " (%s)" % kind if kind else ""
                         sources.append(RplSource(
-                            "Workbench: %s" % (row.get("name") or "RPL"), "workbench",
+                            "Workbench: %s%s" % (row.get("name") or "RPL", suffix),
+                            "workbench",
                             line_layer, point_layer, row.get("rpl_id") or ""))
                         known_sources.add(line_layer.source())
     except Exception as exc:

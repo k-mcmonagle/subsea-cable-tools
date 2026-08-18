@@ -524,6 +524,9 @@ class InputsTab(QWidget):
             revision = (rpl.get("rev_label") or "").strip()
             label = name if revision and revision.lower() in name.lower() \
                 else (f"{name} — {revision}" if revision else name)
+            kind = (rpl.get("kind") or "").replace("_", "-").strip()
+            if kind:
+                label = f"{label} ({kind})"
             self.rpl_combo.addItem(label, rpl.get("rpl_id"))
             self.rpl_combo.setItemData(
                 self.rpl_combo.count() - 1, revision, _RPL_REVISION_ROLE)

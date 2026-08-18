@@ -345,7 +345,7 @@ class _SourcePage(QWizardPage):
                     self.route_combo.addItem(route.get("name") or "")
             except Exception:
                 pass
-        self.route_combo.setEditText("")
+        self.route_combo.setEditText(self.wiz.preset_route_name or "")
 
     def isComplete(self):
         return bool(self.file_edit.text().strip()
@@ -1112,6 +1112,9 @@ class RplImportWizard(QWizard):
         self.resize(1400, 820)
         self.store = store
         self.iface = iface
+        # Cable segment the wizard was launched for; survives the source
+        # page's initializePage, which repopulates the segment combo on show.
+        self.preset_route_name: str = ""
 
         self.path: str = ""
         self.scan_results: List[idetect.DetectionResult] = []

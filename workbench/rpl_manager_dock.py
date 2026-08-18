@@ -933,6 +933,9 @@ class RplManagerPanel(QWidget):
             self._open_store()
             wizard = RplImportWizard(self.store, self.iface, parent=self)
             if route_name:
+                # initializePage repopulates the combo on show, so the preset
+                # must live on the wizard, not just in the combo text.
+                wizard.preset_route_name = route_name
                 wizard.source_page.route_combo.setEditText(route_name)
 
             def _imported(rpl_id: str):

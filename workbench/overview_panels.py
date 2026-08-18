@@ -37,7 +37,7 @@ class SystemOverviewPanel(QWidget):
         self.views = QTabWidget()
         self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels([
-            "Cable segment", "Latest RPL", "Assemblies", "RPL sections",
+            "Cable segment", "RPL revision", "Assemblies", "RPL sections",
             "Route length", "Cable length", "Cable type", "Status",
         ])
         _configure_table(self.table)
@@ -164,7 +164,7 @@ class SystemOverviewPanel(QWidget):
         rows += (
             f"<div style='margin-top:6px'>Optional as required: "
             f"{_count(fits, 'assembly fit')}; {_count(assessments, 'assessment')}.</div>"
-            f"<div>{_count(issued, 'issued latest revision')}.</div>")
+            f"<div>{_count(issued, 'issued revision')}.</div>")
         self.guidance.setText(f"<b>Next suggested action:</b> {first_pending}<br><br>{rows}")
         self._schematic_args = (store, system_id, graph, rpls_all)
         self._render_schematic_if_visible()
@@ -224,7 +224,9 @@ class SegmentOverviewPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._route_id = ""
-        self._latest_rpl_id = ""
+        self._selected_rpl_id = ""
+        self._store = None
+        self._makeup_summary_base = ""
         self._schematic_args = None
         self._makeup_total_m = 0.0
         self._makeup_placement_count = 0
@@ -277,8 +279,9 @@ class SegmentOverviewPanel(QWidget):
             "Depth", "Event",
         ])
         _configure_table(self.positions_table)
-        self.positions_table.setToolTip("Double-click a position to open the latest RPL revision.")
-        self.positions_table.cellDoubleClicked.connect(self._latest_activated)
+        self.positions_table.setToolTip(
+            "Double-click a position to open the selected RPL revision.")
+        self.positions_table.cellDoubleClicked.connect(self._selected_activated)
         self.detail_tables.addTab(self.positions_table, "Positions")
         self.sections_table = QTableWidget(0, 9)
         self.sections_table.setHorizontalHeaderLabels([
@@ -286,11 +289,15 @@ class SegmentOverviewPanel(QWidget):
             "Cable length", "Slack", "Cable type", "Legs",
         ])
         _configure_table(self.sections_table)
-        self.sections_table.setToolTip("Double-click an RPL section to open the latest revision.")
-        self.sections_table.cellDoubleClicked.connect(self._latest_activated)
+        self.sections_table.setToolTip(
+            "Double-click an RPL section to open the selected revision.")
+        self.sections_table.cellDoubleClicked.connect(self._selected_activated)
         self.detail_tables.addTab(self.sections_table, "RPL sections")
         self.revisions = QTreeWidget()
         self.revisions.setHeaderLabels(["RPL revision", "Kind", "Status"])
+        self.revisions.setToolTip(
+            "Selecting a revision loads its positions, sections and actions.")
+        self.revisions.currentItemChanged.connect(self._revision_selection_changed)
         self.revisions.itemDoubleClicked.connect(self._revision_activated)
         self.detail_tables.addTab(self.revisions, "RPL revisions")
         table_layout.addWidget(self.detail_tables)
@@ -308,12 +315,12 @@ class SegmentOverviewPanel(QWidget):
         layout.addWidget(self.guidance)
         actions = QHBoxLayout()
         buttons = [
-            ("Open latest RPL", lambda: self.openRevisionRequested.emit(self._latest_rpl_id)),
+            ("Open RPL", lambda: self.openRevisionRequested.emit(self._selected_rpl_id)),
             ("Import revision...", lambda: self.importRevisionRequested.emit(self._route_id)),
             ("Extract assembly from RPL...",
-             lambda: self.extractAssemblyRequested.emit(self._latest_rpl_id)),
-            ("Fit assembly...", lambda: self.fitAssemblyRequested.emit(self._latest_rpl_id)),
-            ("New assessment...", lambda: self.assessmentRequested.emit(self._latest_rpl_id)),
+             lambda: self.extractAssemblyRequested.emit(self._selected_rpl_id)),
+            ("Fit assembly...", lambda: self.fitAssemblyRequested.emit(self._selected_rpl_id)),
+            ("New assessment...", lambda: self.assessmentRequested.emit(self._selected_rpl_id)),
             ("Cable-system topology", lambda: self.topologyRequested.emit(self._route_id)),
         ]
         self._needs_revision_buttons = []
@@ -322,20 +329,27 @@ class SegmentOverviewPanel(QWidget):
             button.clicked.connect(slot)
             actions.addWidget(button)
             if label not in ("Import revision...", "Cable-system topology"):
+                button.setToolTip(
+                    "Acts on the revision selected under RPL revisions.")
                 self._needs_revision_buttons.append(button)
         actions.addStretch()
         layout.addLayout(actions)
 
     def load_segment(self, store, route_id: str) -> None:
         self._route_id = route_id or ""
+        self._store = store
         route = store.get_route(route_id) if store and route_id else None
+        self.revisions.blockSignals(True)
         self.revisions.clear()
+        self.revisions.blockSignals(False)
         self.makeup_table.setRowCount(0)
         self.makeup_summary.clear()
+        self._makeup_summary_base = ""
         self._makeup_total_m = 0.0
         self._makeup_placement_count = 0
         self.positions_table.setRowCount(0)
         self.sections_table.setRowCount(0)
+        self._selected_rpl_id = ""
         if not route:
             self.title.setText("Cable segment")
             self.endpoint_summary.setText("No cable segment selected.")
@@ -345,12 +359,11 @@ class SegmentOverviewPanel(QWidget):
             return
         self.title.setText(route.get("name") or "Cable segment")
         self._populate_makeup(store, route_id)
+        self._makeup_summary_base = self.makeup_summary.text()
         self._schematic_args = (store, route_id, route.get("name") or "Cable segment")
         self._render_schematic_if_visible()
-        rows = [row for row in store.list_rpls() if row.get("route_id") == route_id]
-        rows.sort(key=_revision_key)
-        latest = rows[-1] if rows else None
-        self._latest_rpl_id = latest.get("rpl_id") if latest else ""
+        rows = store.revisions_of_route(route_id)
+        self.revisions.blockSignals(True)
         for row in reversed(rows):
             item = QTreeWidgetItem([
                 row.get("rev_label") or "Unlabelled",
@@ -359,35 +372,56 @@ class SegmentOverviewPanel(QWidget):
             ])
             item.setData(0, Qt.ItemDataRole.UserRole, row.get("rpl_id") or "")
             self.revisions.addTopLevelItem(item)
+        self.revisions.blockSignals(False)
         for button in self._needs_revision_buttons:
-            button.setEnabled(bool(latest))
-        if latest is None:
+            button.setEnabled(bool(rows))
+        if not rows:
             self.endpoint_summary.setText("No RPL revision has been imported yet.")
             self.guidance.setText("Next suggested action: import the first RPL revision.")
             return
-        summary = rpl_summary(store, latest)
+        # Selecting the top row loads its details via the selection handler.
+        self.revisions.setCurrentItem(self.revisions.topLevelItem(0))
+
+    def _revision_selection_changed(self, current, _previous=None):
+        rpl_id = current.data(0, Qt.ItemDataRole.UserRole) if current else ""
+        self._load_revision_details(str(rpl_id or ""))
+
+    def _load_revision_details(self, rpl_id: str) -> None:
+        self._selected_rpl_id = rpl_id
+        self.positions_table.setRowCount(0)
+        self.sections_table.setRowCount(0)
+        store = self._store
+        rpl = store.get_rpl(rpl_id) if store and rpl_id else None
+        if rpl is None:
+            self.makeup_summary.setText(self._makeup_summary_base)
+            return
+        summary = rpl_summary(store, rpl)
+        coverage = ""
         if summary.cable_length_km is not None and self._makeup_total_m > 0.0:
             delta_m = self._makeup_total_m - summary.cable_length_km * 1000.0
             if abs(delta_m) <= 1.0:
-                coverage = "Make-up matches the latest RPL cable length."
+                coverage = "Make-up matches this revision's cable length."
             elif delta_m < 0.0:
-                coverage = f"Make-up is {_length_m(-delta_m)} short of the latest RPL."
+                coverage = f"Make-up is {_length_m(-delta_m)} short of this revision."
             else:
-                coverage = f"Make-up exceeds the latest RPL by {_length_m(delta_m)}."
-            self.makeup_summary.setText(
-                self.makeup_summary.text() + f" · {coverage}")
+                coverage = f"Make-up exceeds this revision by {_length_m(delta_m)}."
+        self.makeup_summary.setText(
+            self._makeup_summary_base + (f" · {coverage}" if coverage else ""))
         start = _endpoint_text(summary, "A")
         end = _endpoint_text(summary, "B")
+        rev = rpl.get("rev_label") or "Unlabelled"
+        kind = (rpl.get("kind") or "").replace("_", " ")
         self.endpoint_summary.setText(
-            f"{start}\n{end}\n{_count(summary.section_count, 'event-to-event RPL section')}"
+            f"{rev} ({kind})\n{start}\n{end}\n"
+            f"{_count(summary.section_count, 'event-to-event RPL section')}"
             f" · {_km(summary.route_length_km)} route · {_km(summary.cable_length_km)} cable")
         self._populate_positions(summary)
         self._populate_sections(summary)
-        fits = store.list_fits(rpl_id=latest.get("rpl_id"))
-        assessments = store.list_assessments(latest.get("rpl_id"))
+        fits = store.list_fits(rpl_id=rpl_id)
+        assessments = store.list_assessments(rpl_id)
         if self._makeup_placement_count == 0:
             next_action = "Add the first assembly to define this segment's cable make-up."
-        elif latest.get("status") == schema.STATUS_ISSUED:
+        elif rpl.get("status") == schema.STATUS_ISSUED:
             next_action = "Revision issued; create a new revision for further changes."
         elif not fits and not assessments:
             next_action = (
@@ -535,9 +569,9 @@ class SegmentOverviewPanel(QWidget):
         finally:
             self.sections_table.setUpdatesEnabled(True)
 
-    def _latest_activated(self, _row, _column):
-        if self._latest_rpl_id:
-            self.openRevisionRequested.emit(self._latest_rpl_id)
+    def _selected_activated(self, _row, _column):
+        if self._selected_rpl_id:
+            self.openRevisionRequested.emit(self._selected_rpl_id)
 
     def _revision_activated(self, item, _column):
         rpl_id = item.data(0, Qt.ItemDataRole.UserRole)
@@ -601,4 +635,6 @@ def _count(value: int, singular: str) -> str:
 
 
 def _revision_key(row):
-    return row.get("created_utc") or "", row.get("name") or ""
+    # Delegates to the store's ordering so panels never disagree with
+    # store.revisions_of_route about which revision sorts last.
+    return schema.revision_sort_key(row)

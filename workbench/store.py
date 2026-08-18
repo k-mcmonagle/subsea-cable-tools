@@ -258,13 +258,7 @@ class WorkbenchStore:
         sort after all numbered ones by creation time.
         """
         rows = [r for r in self.read_table(schema.TABLE_RPL) if r.get("route_id") == route_id]
-
-        def sort_key(row):
-            match = re.search(r"\brev\s*(\d+)\b", str(row.get("rev_label") or ""), re.IGNORECASE)
-            number = int(match.group(1)) if match else float("inf")
-            return (number, row.get("created_utc") or "", row.get("name") or "")
-
-        rows.sort(key=sort_key)
+        rows.sort(key=schema.revision_sort_key)
         return rows
 
     def latest_revision(self, route_id: str) -> Optional[Dict]:
@@ -411,6 +405,12 @@ class WorkbenchStore:
         route = self.get_route(route_id) or {"name": old.get("name") or "Route"}
         if not rev_label:
             rev_label = schema.next_rev_label(self.revisions_of_route(route_id))
+        wanted = rev_label.strip().lower()
+        if any((r.get("rev_label") or "").strip().lower() == wanted
+               for r in self.revisions_of_route(route_id)):
+            raise ValueError(
+                f"Revision label '{rev_label}' already exists for this cable "
+                "segment. Choose a different label.")
 
         new_id = schema.new_id()
         new_name = f"{route.get('name') or old.get('name') or 'Route'} {rev_label}".strip()

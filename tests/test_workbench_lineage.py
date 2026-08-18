@@ -312,6 +312,28 @@ def test_out_of_order_revision_import() -> bool:
                    ok, f"order={order}, latest={latest}/{latest_numbered}")
 
 
+def test_new_revision_refuses_duplicate_label() -> bool:
+    store = _temp_store()
+    store.migrate()
+    route_id = store.create_route("S030")
+    rpl_id = schema.new_id()
+    points_layer, lines_layer = _seed_spatial_pair(store, rpl_id, "S030 Rev 1")
+    store.save_rpl({
+        "rpl_id": rpl_id, "name": "S030 Rev 1", "kind": "planned",
+        "points_layer": points_layer, "lines_layer": lines_layer,
+        "route_id": route_id, "rev_label": "Rev 1",
+    })
+    ok = False
+    try:
+        store.new_rpl_revision(rpl_id, "rev 1")   # case-insensitive duplicate
+    except ValueError:
+        ok = True
+    # a fresh label still works, and the default label skips the duplicate
+    new_id = store.new_rpl_revision(rpl_id, "Rev 2")
+    ok = ok and (store.get_rpl(new_id) or {}).get("rev_label") == "Rev 2"
+    return _result("new revision refuses duplicate label per segment", ok)
+
+
 def run_all() -> list:
     return [
         test_migrate_v2_to_v3(),
@@ -321,6 +343,7 @@ def run_all() -> list:
         test_next_rev_label(),
         test_edit_draft_rpl_revision(),
         test_out_of_order_revision_import(),
+        test_new_revision_refuses_duplicate_label(),
     ]
 
 
