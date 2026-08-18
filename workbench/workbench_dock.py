@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 from typing import Dict, Optional
 
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import QSettings, Qt
 from qgis.PyQt.QtGui import QBrush, QColor
 from qgis.PyQt.QtWidgets import (
     QDockWidget,
@@ -56,10 +56,15 @@ KIND_ROUTE = "route"
 KIND_MAKEUP = "makeup"
 KIND_PLACEMENT = "placement"
 KIND_MAKEUP_ITEM = "makeup_item"
+KIND_RPL_GROUP = "rpl_group"            # payload: route_id
+KIND_ASSEMBLY_GROUP = "assembly_group"  # payload: route_id
 
 GROUP_UNASSIGNED_SEGMENTS = "unassigned_segments"
 
 AMBER = QBrush(QColor(200, 120, 0))
+
+_FLOATING_GEOMETRY_KEY = "SubseaCableTools/Workbench/floating_geometry"
+_FLOATING_MODE_KEY = "SubseaCableTools/Workbench/floating"
 
 
 class WorkbenchDock(QDockWidget):
@@ -194,12 +199,42 @@ class WorkbenchDock(QDockWidget):
         self.refresh_tree()
 
     # ------------------------------------------------- window management --
+    def apply_saved_window_mode(self) -> None:
+        """Open as a floating window by default.
+
+        Honours the user's last choice (same pattern as the Burial Planner):
+        re-docking it and closing makes the next open docked again; floating
+        (the default) restores the saved monitor/size via
+        ``_top_level_changed``.
+        """
+        if bool(QSettings().value(_FLOATING_MODE_KEY, True, type=bool))                 and not self.isFloating():
+            self.setFloating(True)
+
     def _top_level_changed(self, floating: bool) -> None:
         if floating:
             self.setWindowFlags(WINDOW_TYPE_WINDOW | WINDOW_HINT_CUSTOMIZE
                                 | WINDOW_HINT_TITLE | WINDOW_HINT_MIN_MAX
                                 | WINDOW_HINT_CLOSE)
             self.show()
+            # Reopen on the same monitor at the same size (second-screen
+            # workflows keep their window placement across sessions).
+            geometry = QSettings().value(_FLOATING_GEOMETRY_KEY)
+            if geometry is not None:
+                try:
+                    self.restoreGeometry(geometry)
+                except Exception:
+                    pass
+            else:
+                self.resize(1200, 780)
+
+    def _save_window_state(self) -> None:
+        try:
+            settings = QSettings()
+            settings.setValue(_FLOATING_MODE_KEY, self.isFloating())
+            if self.isFloating():
+                settings.setValue(_FLOATING_GEOMETRY_KEY, self.saveGeometry())
+        except Exception:
+            pass
 
     # ------------------------------------------------------ layer sync --
     def _project_sync_signal_slots(self):
@@ -605,15 +640,12 @@ class WorkbenchDock(QDockWidget):
             systems = {r.get("system_id"): r for r in store.list_systems()}
             makeups = store.list_makeups()
             makeup_items = store.read_table(schema.TABLE_MAKEUP_ITEM)
-            current_makeup_by_route = {}
+            makeups_by_route: Dict[str, list] = {}
             for makeup in makeups:
-                route_id = makeup.get("route_id") or ""
-                current = current_makeup_by_route.get(route_id)
-                key = (makeup.get("created_utc") or "", makeup.get("name") or "")
-                current_key = ((current or {}).get("created_utc") or "",
-                               (current or {}).get("name") or "")
-                if current is None or key >= current_key:
-                    current_makeup_by_route[route_id] = makeup
+                makeups_by_route.setdefault(
+                    makeup.get("route_id") or "", []).append(makeup)
+            for rows in makeups_by_route.values():
+                rows.sort(key=schema.revision_sort_key)
             makeup_items_by_id: Dict[str, list] = {}
             for makeup_item in makeup_items:
                 makeup_items_by_id.setdefault(
@@ -665,7 +697,7 @@ class WorkbenchDock(QDockWidget):
                     parent, route, assemblies,
                     revisions_by_route.get(route.get("route_id") or "", []),
                     assessments_by_rpl,
-                    current_makeup_by_route.get(route.get("route_id") or ""),
+                    makeups_by_route.get(route.get("route_id") or "", []),
                     makeup_items_by_id)
 
         self.tree.blockSignals(False)
@@ -676,52 +708,74 @@ class WorkbenchDock(QDockWidget):
             self._select_ref(current)
 
     def _add_route_item(self, parent, route, assemblies, revisions,
-                        assessments_by_rpl, makeup, makeup_items_by_id):
-        makeup_items = (makeup_items_by_id.get(makeup.get("makeup_id") or "", [])
-                        if makeup else [])
+                        assessments_by_rpl, makeups, makeup_items_by_id):
+        route_id = route.get("route_id") or ""
+        current_makeup = makeups[-1] if makeups else None
+        current_items = (makeup_items_by_id.get(
+            current_makeup.get("makeup_id") or "", []) if current_makeup else [])
         placement_count = sum(
-            1 for item in makeup_items if item.get("kind") == "assembly")
+            1 for item in current_items if item.get("kind") == "assembly")
         detail = (
-            f"{len(revisions)} revision" + ("" if len(revisions) == 1 else "s")
+            f"{len(revisions)} RPL revision" + ("" if len(revisions) == 1 else "s")
             + f" · {placement_count} assembl"
             + ("y" if placement_count == 1 else "ies"))
         route_item = QTreeWidgetItem([route.get("name") or "Cable segment", detail])
-        route_item.setData(0, Qt.ItemDataRole.UserRole,
-                           (KIND_ROUTE, route.get("route_id")))
+        route_item.setData(0, Qt.ItemDataRole.UserRole, (KIND_ROUTE, route_id))
         parent.addChild(route_item)
 
-        total_m = sum(
-            _placement_length_m(
-                item, assemblies.get(item.get("assembly_id")) or {})
-            for item in makeup_items if item.get("kind") == "assembly")
-        makeup_detail = (
-            f"{placement_count} assembl{'y' if placement_count == 1 else 'ies'}"
-            f" · {total_m / 1000.0:.3f} km")
-        makeup_node = QTreeWidgetItem(["Cable make-up", makeup_detail])
-        makeup_node.setData(
-            0, Qt.ItemDataRole.UserRole,
-            (KIND_MAKEUP, route.get("route_id") or ""))
-        route_item.addChild(makeup_node)
-        for makeup_item in makeup_items:
-            if makeup_item.get("kind") == "assembly":
-                assembly = assemblies.get(makeup_item.get("assembly_id")) or {}
-                direction = "A→B" if int(makeup_item.get("direction") or 1) >= 0 else "B→A"
-                length_km = _placement_length_m(makeup_item, assembly) / 1000.0
-                child = QTreeWidgetItem([
-                    assembly.get("name") or makeup_item.get("name") or "Assembly",
-                    f"{length_km:.3f} km · {direction}",
-                ])
-                child.setData(
-                    0, Qt.ItemDataRole.UserRole,
-                    (KIND_PLACEMENT, makeup_item.get("makeup_item_id") or ""))
-            else:
-                child = QTreeWidgetItem([
-                    makeup_item.get("name") or "Joint", "assembly joint"])
-                child.setData(
-                    0, Qt.ItemDataRole.UserRole,
-                    (KIND_MAKEUP_ITEM, makeup_item.get("makeup_item_id") or ""))
-            makeup_node.addChild(child)
-        makeup_node.setExpanded(True)
+        rpl_group = QTreeWidgetItem(
+            ["RPL", f"{len(revisions)} revision" + ("" if len(revisions) == 1 else "s")])
+        rpl_group.setData(0, Qt.ItemDataRole.UserRole, (KIND_RPL_GROUP, route_id))
+        route_item.addChild(rpl_group)
+
+        assembly_group = QTreeWidgetItem(
+            ["Assembly",
+             f"{len(makeups)} revision" + ("" if len(makeups) == 1 else "s")])
+        assembly_group.setData(
+            0, Qt.ItemDataRole.UserRole, (KIND_ASSEMBLY_GROUP, route_id))
+        route_item.addChild(assembly_group)
+
+        for makeup in makeups:
+            makeup_items = makeup_items_by_id.get(makeup.get("makeup_id") or "", [])
+            count = sum(1 for item in makeup_items if item.get("kind") == "assembly")
+            total_m = sum(
+                _placement_length_m(
+                    item, assemblies.get(item.get("assembly_id")) or {})
+                for item in makeup_items if item.get("kind") == "assembly")
+            status = makeup.get("status") or schema.STATUS_DRAFT
+            if status == schema.STATUS_ISSUED:
+                status = "issued [locked]"
+            makeup_node = QTreeWidgetItem([
+                makeup.get("rev_label") or makeup.get("name") or "Make-up",
+                f"{count} assembl{'y' if count == 1 else 'ies'}"
+                f" · {total_m / 1000.0:.3f} km · {status}",
+            ])
+            makeup_node.setData(
+                0, Qt.ItemDataRole.UserRole,
+                (KIND_MAKEUP, makeup.get("makeup_id") or ""))
+            assembly_group.addChild(makeup_node)
+            for makeup_item in makeup_items:
+                if makeup_item.get("kind") == "assembly":
+                    assembly = assemblies.get(makeup_item.get("assembly_id")) or {}
+                    direction = "A→B" if int(makeup_item.get("direction") or 1) >= 0 else "B→A"
+                    length_km = _placement_length_m(makeup_item, assembly) / 1000.0
+                    child = QTreeWidgetItem([
+                        assembly.get("name") or makeup_item.get("name") or "Assembly",
+                        f"{length_km:.3f} km · {direction}",
+                    ])
+                    child.setData(
+                        0, Qt.ItemDataRole.UserRole,
+                        (KIND_PLACEMENT, makeup_item.get("makeup_item_id") or ""))
+                else:
+                    child = QTreeWidgetItem([
+                        makeup_item.get("name") or "Joint", "assembly joint"])
+                    child.setData(
+                        0, Qt.ItemDataRole.UserRole,
+                        (KIND_MAKEUP_ITEM, makeup_item.get("makeup_item_id") or ""))
+                makeup_node.addChild(child)
+            makeup_node.setExpanded(True)
+        rpl_group.setExpanded(True)
+        assembly_group.setExpanded(True)
 
         for rpl in revisions:
             status = rpl.get("status") or schema.STATUS_DRAFT
@@ -732,7 +786,7 @@ class WorkbenchDock(QDockWidget):
             rpl_item = QTreeWidgetItem([
                 rpl.get("name") or "?", f"{revision} - {kind} - {status}"])
             rpl_item.setData(0, Qt.ItemDataRole.UserRole, (KIND_RPL, rpl.get("rpl_id")))
-            route_item.addChild(rpl_item)
+            rpl_group.addChild(rpl_item)
 
             for assessment in assessments_by_rpl.get(rpl.get("rpl_id") or "", []):
                 status = assessment.get("status") or "not run"
@@ -785,9 +839,19 @@ class WorkbenchDock(QDockWidget):
             store = self._store()
             self.segment_overview.load_segment(store, entity_id)
             self.stack.setCurrentWidget(self.segment_overview)
-        elif kind in (KIND_MAKEUP, KIND_MAKEUP_ITEM):
+        elif kind == KIND_RPL_GROUP:
             store = self._store()
-            route_id = entity_id if kind == KIND_MAKEUP else self._route_for_makeup_item(entity_id)
+            if store:
+                self.segment_overview.load_segment(store, entity_id)
+                self.stack.setCurrentWidget(self.segment_overview)
+        elif kind in (KIND_ASSEMBLY_GROUP, KIND_MAKEUP, KIND_MAKEUP_ITEM):
+            store = self._store()
+            if kind == KIND_ASSEMBLY_GROUP:
+                route_id = entity_id
+            elif kind == KIND_MAKEUP:
+                route_id = self._route_for_makeup(entity_id)
+            else:
+                route_id = self._route_for_makeup_item(entity_id)
             if store and route_id:
                 self.segment_overview.load_segment(store, route_id)
                 self.segment_overview.views.setCurrentIndex(0)
@@ -835,6 +899,8 @@ class WorkbenchDock(QDockWidget):
             menu.addAction("Add RPL from layers...", self._register_rpl)
         elif ref[0] == KIND_SYSTEM:
             menu.addAction("New cable segment...", self._new_route)
+            menu.addAction("Import RPL...", self._import_rpl)
+            menu.addAction("Rename system...", self._rename_system)
             menu.addAction("Delete system", self._delete_selected)
         elif ref[0] == KIND_ROUTE:
             menu.addAction("Add existing assembly...", self._add_assembly_to_selected_segment)
@@ -849,9 +915,20 @@ class WorkbenchDock(QDockWidget):
             self._add_assign_system_menu(menu)
             menu.addAction("Rename cable segment...", self._rename_route)
             menu.addAction("Delete cable segment", self._delete_selected)
+        elif ref[0] == KIND_RPL_GROUP:
+            menu.addAction("New RPL revision...", self._new_rpl_revision)
+            menu.addAction("Import RPL...", self._import_rpl)
+            menu.addAction("Add RPL from layers...", self._register_rpl)
+            menu.addAction("New RPL from route line or points (KML...)...", self._import_rpl_from_line)
+        elif ref[0] == KIND_ASSEMBLY_GROUP:
+            menu.addAction("Add existing assembly...", self._add_assembly_to_selected_segment)
+            menu.addAction("Create assembly for segment...", self._create_assembly_for_selected_segment)
+            menu.addAction("New make-up revision...", self._new_makeup_revision)
         elif ref[0] == KIND_MAKEUP:
             menu.addAction("Add existing assembly...", self._add_assembly_to_selected_segment)
             menu.addAction("Create assembly for segment...", self._create_assembly_for_selected_segment)
+            menu.addAction("New make-up revision...", self._new_makeup_revision)
+            menu.addAction("Delete make-up revision", self._delete_selected)
         elif ref[0] == KIND_PLACEMENT:
             menu.addAction("Open assembly", lambda: self._on_tree_selection(item))
             menu.addAction("Remove from cable make-up", self._delete_selected)
@@ -860,13 +937,19 @@ class WorkbenchDock(QDockWidget):
         elif ref[0] == KIND_RPL:
             store = self._store()
             rpl = store.get_rpl(ref[1]) if store else None
-            menu.addAction("New revision...", self._new_rpl_revision)
+            menu.addAction("Zoom to on map", self._zoom_to_selected_rpl)
+            menu.addAction("Export RPL sheet...", self._export_selected_rpl_sheet)
+            menu.addSeparator()
+            menu.addAction("Duplicate as new revision...", self._new_rpl_revision)
+            menu.addAction("Edit revision label...", self._edit_rpl_revision_label)
             label = "Reopen" if rpl and rpl.get("status") == schema.STATUS_ISSUED else "Mark issued"
             menu.addAction(label, self._mark_issued)
+            menu.addSeparator()
             menu.addAction("Fit assembly...", self._fit_selected_rpl)
             menu.addAction("New assessment...", self._new_assessment)
             compare = menu.addAction("Compare with...")
             compare.setEnabled(False)
+            menu.addSeparator()
             menu.addAction("Delete RPL", self._delete_selected)
         elif ref[0] == KIND_ASSEMBLY:
             assembly = self._assembly_row(ref[1])
@@ -1030,7 +1113,7 @@ class WorkbenchDock(QDockWidget):
             return
         self.refresh_tree()
         if route_id:
-            self._select_ref((KIND_MAKEUP, route_id))
+            self._select_ref((KIND_ASSEMBLY_GROUP, route_id))
 
     def _extract_assembly_from_rpl(self, rpl_id: str):
         if not self.assembly_panel.extract_from_rpl_id(rpl_id):
@@ -1308,6 +1391,89 @@ class WorkbenchDock(QDockWidget):
         self.refresh_tree()
         self._select_ref((KIND_ROUTE, route_id))
 
+    def _rename_system(self):
+        store = self._store()
+        system_id = self._selected_system_id()
+        if store is None or system_id is None:
+            return
+        system = next((row for row in store.list_systems()
+                       if row.get("system_id") == system_id), None)
+        if system is None:
+            return
+        name, ok = QInputDialog.getText(
+            self, "Rename system", "System name:", text=system.get("name") or "")
+        if not ok or not name.strip():
+            return
+        system = dict(system)
+        system["name"] = name.strip()
+        store.save_system(system)
+        self.refresh_tree()
+
+    def _edit_rpl_revision_label(self):
+        rpl_id = self._selected_rpl_id()
+        store = self._store()
+        if store is None or rpl_id is None:
+            return
+        rpl = store.get_rpl(rpl_id)
+        if rpl is None:
+            return
+        label, ok = QInputDialog.getText(
+            self, "Edit RPL revision label", "Revision label:",
+            text=rpl.get("rev_label") or "")
+        if not ok or not label.strip():
+            return
+        # reuse the RPL panel's save path (duplicate check, name suffix, lock
+        # handling) by driving its revision editor
+        self.rpl_panel.select_rpl(rpl_id)
+        self.rpl_panel.revision_edit.setText(label.strip())
+        self.rpl_panel._save_revision_label()
+        self.refresh_tree()
+
+    def _zoom_to_selected_rpl(self):
+        rpl_id = self._selected_rpl_id()
+        if rpl_id is None:
+            return
+        self.rpl_panel.select_rpl(rpl_id)
+        self.rpl_panel._zoom_to_current()
+
+    def _export_selected_rpl_sheet(self):
+        rpl_id = self._selected_rpl_id()
+        if rpl_id is None:
+            return
+        self.rpl_panel.select_rpl(rpl_id)
+        self.rpl_panel._export_sheet()
+
+    def _new_makeup_revision(self):
+        store = self._store()
+        ref = self._current_ref()
+        if store is None or not ref:
+            return
+        if ref[0] == KIND_MAKEUP:
+            makeup_id = ref[1]
+            header, _items = store.get_makeup(makeup_id)
+            route_id = (header or {}).get("route_id") or ""
+        else:
+            route_id = self._selected_route_id() or ""
+            header, _items = store.current_makeup(route_id)
+            if header is None:
+                QMessageBox.information(
+                    self, "New make-up revision",
+                    "This cable segment has no make-up yet — add an assembly first.")
+                return
+            makeup_id = header.get("makeup_id") or ""
+        default = schema.next_rev_label(store.list_makeups(route_id))
+        label, ok = QInputDialog.getText(
+            self, "New make-up revision", "Revision label:", text=default)
+        if not ok or not label.strip():
+            return
+        try:
+            new_id = store.new_makeup_revision(makeup_id, label.strip())
+        except Exception as exc:
+            QMessageBox.warning(self, "New make-up revision", str(exc))
+            return
+        self.refresh_tree()
+        self._select_ref((KIND_MAKEUP, new_id))
+
     def _duplicate_assembly(self):
         assembly_id = self._selected_assembly_id()
         if assembly_id is None:
@@ -1334,6 +1500,26 @@ class WorkbenchDock(QDockWidget):
         if kind in (KIND_PLACEMENT, KIND_MAKEUP_ITEM):
             self._remove_makeup_item(
                 self._route_for_makeup_item(entity_id) or "", entity_id)
+            return
+        if kind == KIND_MAKEUP:
+            header, _items = store.get_makeup(entity_id)
+            if header is None:
+                return
+            if (header.get("status") == schema.STATUS_ISSUED
+                    and not self._confirm_delete_issued("make-up revision")):
+                return
+            answer = QMessageBox.question(
+                self, "Delete make-up revision",
+                f"Delete make-up revision "
+                f"'{header.get('rev_label') or header.get('name') or '?'}' "
+                "and its assembly placements?")
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            route_id = header.get("route_id") or ""
+            store.delete_makeup(entity_id)
+            self.refresh_tree()
+            if route_id:
+                self._select_ref((KIND_ASSEMBLY_GROUP, route_id))
             return
         try:
             if kind == KIND_ROUTE:
@@ -1443,10 +1629,10 @@ class WorkbenchDock(QDockWidget):
         store = self._store()
         if not ref or store is None:
             return None
-        if ref[0] == KIND_ROUTE:
+        if ref[0] in (KIND_ROUTE, KIND_RPL_GROUP, KIND_ASSEMBLY_GROUP):
             return ref[1]
         if ref[0] == KIND_MAKEUP:
-            return ref[1]
+            return self._route_for_makeup(ref[1])
         if ref[0] in (KIND_PLACEMENT, KIND_MAKEUP_ITEM):
             return self._route_for_makeup_item(ref[1])
         rpl_id = self._selected_rpl_id()
@@ -1473,6 +1659,13 @@ class WorkbenchDock(QDockWidget):
             if row.get("makeup_item_id") == item_id
         ), None)
 
+    def _route_for_makeup(self, makeup_id: str) -> Optional[str]:
+        store = self._store()
+        if store is None:
+            return None
+        header, _items = store.get_makeup(makeup_id)
+        return header.get("route_id") if header else None
+
     def _route_for_makeup_item(self, item_id: str) -> Optional[str]:
         store = self._store()
         item = self._makeup_item(item_id)
@@ -1489,11 +1682,13 @@ class WorkbenchDock(QDockWidget):
         return header
 
     def closeEvent(self, event):
+        self._save_window_state()
         self.rpl_panel.closeEvent(event)
         super().closeEvent(event)
 
     def shutdown(self):
         """Detach from project signals before the plugin unloads the dock."""
+        self._save_window_state()  # unload may bypass closeEvent
         self._disconnect_project_layer_sync()
 
 

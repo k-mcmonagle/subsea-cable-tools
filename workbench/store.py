@@ -678,6 +678,35 @@ class WorkbenchStore:
                 drop.add(index - 1)
         self.save_makeup(header, [row for i, row in enumerate(items) if i not in drop])
 
+    def new_makeup_revision(self, makeup_id: str,
+                            rev_label: Optional[str] = None) -> str:
+        """Copy a make-up (header + items) as the next draft revision."""
+        old, items = self.get_makeup(makeup_id)
+        if old is None:
+            raise ValueError("Cable make-up not found.")
+        route_id = old.get("route_id") or ""
+        siblings = self.list_makeups(route_id)
+        if not rev_label:
+            rev_label = schema.next_rev_label(siblings)
+        wanted = rev_label.strip().lower()
+        if any((row.get("rev_label") or "").strip().lower() == wanted
+               for row in siblings):
+            raise ValueError(
+                f"Revision label '{rev_label}' already exists for this cable "
+                "segment's make-up. Choose a different label.")
+        header = dict(old)
+        header.update({
+            "makeup_id": schema.new_id(), "rev_label": rev_label.strip(),
+            "status": schema.STATUS_DRAFT, "supersedes_id": makeup_id,
+            "created_utc": schema.utc_now_iso(),
+        })
+        copies = []
+        for row in items:
+            copy = dict(row)
+            copy["makeup_item_id"] = schema.new_id()
+            copies.append(copy)
+        return self.save_makeup(header, copies)
+
     def delete_makeup(self, makeup_id: str) -> None:
         self.delete_rows(schema.TABLE_MAKEUP, [makeup_id])
         remaining = [

@@ -155,6 +155,17 @@ class RplLayerSync:
         self._line_fids = [row[1] for row in line_rows]
         return RplModel(points=points, segments=segments)
 
+    # -- feature lookup ---------------------------------------------------------
+    def point_fids(self, indices) -> List[int]:
+        """Layer feature ids for the given model point indices (order kept)."""
+        return [self._point_fids[i] for i in indices
+                if 0 <= i < len(self._point_fids)]
+
+    def line_fids(self, indices) -> List[int]:
+        """Layer feature ids for the given model segment indices (order kept)."""
+        return [self._line_fids[i] for i in indices
+                if 0 <= i < len(self._line_fids)]
+
     # -- edit session -----------------------------------------------------------
     def is_valid(self) -> bool:
         """Both bound layers still exist as C++ objects."""

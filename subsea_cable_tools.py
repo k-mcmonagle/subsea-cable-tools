@@ -627,6 +627,7 @@ class SubseaCableTools:
 
             self.workbench_dock = WorkbenchDock(self.iface)
             self.iface.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.workbench_dock)
+            self.workbench_dock.apply_saved_window_mode()
         self.workbench_dock.show()
         self.workbench_dock.refresh_tree()
 

@@ -25,12 +25,14 @@ from qgis.PyQt.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSplitter,
@@ -45,11 +47,13 @@ from qgis.core import (
     QgsCoordinateTransform,
     QgsProject,
     QgsRasterLayer,
+    QgsRectangle,
     QgsVectorLayer,
 )
 
 from ..kp_range_utils import make_distance_area
 from ..qgis_compat import (
+    CONTEXT_MENU_POLICY_CUSTOM,
     DIALOG_ACCEPTED,
     WKB_LINESTRING,
     WKB_POINT,
@@ -60,6 +64,13 @@ from .configurable_table import ConfigurableTable
 from .depth_service import DepthService, DepthSourceConfig
 from .rpl_engine import RplModel, SlackMode
 from .rpl_layer_io import RplLayerSync
+from . import rpl_sheet
+from .rpl_sheet import (
+    ATTR_LABELS as _ATTR_LABELS,
+    LEG_ATTR_ORDER as _LEG_ATTR_ORDER,
+    POINT_ATTR_ORDER as _POINT_ATTR_ORDER,
+    attribute_keys as _attribute_keys,
+)
 from .rpl_summary import invalidate_rpl_summary, rpl_summary
 from .readonly import make_readonly_banner
 from .store import (
@@ -72,22 +83,17 @@ from .store import (
 
 WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
 
-# User-facing terminology: one managed route is a cable segment; within an
-# RPL, sections run between labelled event positions. Point-to-point engine
-# segments remain available as the advanced Legs table.
+# User-facing terminology: one managed route is a cable segment. The two data
+# tabs mirror the paired GeoPackage layers exactly (Positions = points layer,
+# Legs = lines layer); the RPL sheet tab interleaves them in the alternating
+# workbook presentation RPLs are published in. Event-to-event section rollups
+# live in the cable segment overview panel.
 POINT_TABLE_COLUMNS = [
     ("PosNo", "pos", True), ("Event", "event", True),
     ("Category", "category", True),
     ("KP (km)", "kp", True), ("Latitude", "lat", True),
     ("Longitude", "lon", True), ("Cable (km)", "cable", False),
     ("Depth (m)", "depth", True),
-]
-SECTION_COLUMNS = [
-    ("From event", "from_event", True), ("To event", "to_event", True),
-    ("From Pos", "from", True), ("To Pos", "to", True),
-    ("Start KP", "start_kp", True), ("End KP", "end_kp", True),
-    ("Length (km)", "dist", True), ("Cable (km)", "cable", True),
-    ("Slack (%)", "slack", True), ("Legs", "leg_count", False),
 ]
 LEG_COLUMNS = [
     ("From Pos", "from", True), ("From event", "from_event", True),
@@ -96,34 +102,6 @@ LEG_COLUMNS = [
     ("Bearing (deg)", "bearing", True), ("Dist (km)", "dist", True),
     ("Slack (%)", "slack", True), ("Cable (km)", "cable", True),
 ]
-_POINT_ATTR_ORDER = ["Remarks", "ChartNo", "PosNoText", "SourceFile"]
-_LEG_ATTR_ORDER = [
-    "CableType", "CableCode", "FiberPair", "LayDirection", "LayVessel",
-    "ProtectionMethod", "DateInstalled", "TargetBurialDepth", "BurialDepth",
-    "TerritorialWater", "EEZ", "SourceFile",
-]
-_ATTR_LABELS = {
-    "CableType": "Cable type", "CableCode": "Cable code", "FiberPair": "Fibre pair",
-    "LayDirection": "Lay direction", "LayVessel": "Lay vessel",
-    "ProtectionMethod": "Protection method", "DateInstalled": "Date installed",
-    "TargetBurialDepth": "Target burial depth", "BurialDepth": "Burial depth",
-    "TerritorialWater": "Territorial water", "SourceFile": "Source file",
-    "ChartNo": "Chart no.", "PosNoText": "Position text",
-}
-
-
-def _attribute_keys(attr_rows, preferred) -> List[str]:
-    found = []
-    for attrs in attr_rows:
-        for key in attrs:
-            if key not in found:
-                found.append(key)
-    ordered = [key for key in preferred if key in found]
-    ordered.extend(sorted([key for key in found if key not in ordered],
-                          key=lambda value: value.lower()))
-    return ordered
-
-
 def _attribute_columns(keys, default_visible=None):
     default_visible = set(default_visible or ())
     return [(_ATTR_LABELS.get(key, key), f"attr:{key}", key in default_visible)
@@ -322,28 +300,52 @@ class RplManagerPanel(QWidget):
         self.points_table = ConfigurableTable("rpl_positions")
         self.points_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.points_table.itemChanged.connect(self._on_point_item_changed)
-        self.sections_table = ConfigurableTable("rpl_sections")
-        self.sections_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.segments_table = ConfigurableTable("rpl_legs")
         self.segments_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.segments_table.itemChanged.connect(self._on_segment_item_changed)
         self.tabs.addTab(self.points_table, "Positions")
-        self.tabs.addTab(self.sections_table, "RPL sections")
-        self.tabs.addTab(self.segments_table, "Legs (advanced)")
+        self.tabs.addTab(self.segments_table, "Legs")
+        self.tabs.addTab(self._build_sheet_tab(), "RPL sheet")
         self.tabs.addTab(self._build_systems_tab(), "Cable systems")
         self.tabs.setTabToolTip(
-            0, "Every position in the RPL. Right-click the header to choose columns.")
+            0, "The RPL points layer, one row per position. Right-click the header to choose columns.")
         self.tabs.setTabToolTip(
-            1, "Derived sections between consecutive event positions. Right-click the header to choose columns.")
+            1, "The RPL lines layer, one row per point-to-point leg (bearing, distance, slack). "
+               "Right-click the header to choose columns.")
         self.tabs.setTabToolTip(
-            2, "Advanced point-to-point legs used for bearings, distances and slack. Right-click the header to choose columns.")
+            2, "Read-only alternating position/leg rows — the layout RPL workbooks are published in.")
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        for table in (self.points_table, self.segments_table, self.sheet_table):
+            # ConfigurableTable claims the *header* context menu for column
+            # choice; the viewport menu is free for row actions.
+            table.setContextMenuPolicy(CONTEXT_MENU_POLICY_CUSTOM)
+            table.customContextMenuRequested.connect(
+                lambda pos, t=table: self._row_context_menu(t, pos))
         right_layout.addWidget(self.tabs)
 
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         self._update_edit_buttons()
+
+    def _build_sheet_tab(self) -> QWidget:
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 4, 0, 0)
+        bar = QHBoxLayout()
+        export_btn = QPushButton("Export sheet…")
+        export_btn.setToolTip(
+            "Save this alternating position/leg sheet as an Excel workbook or CSV")
+        export_btn.clicked.connect(self._export_sheet)
+        bar.addWidget(export_btn)
+        bar.addStretch()
+        layout.addLayout(bar)
+        self.sheet_table = QTableWidget(0, 0)
+        self.sheet_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.sheet_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.sheet_table.verticalHeader().setVisible(False)
+        layout.addWidget(self.sheet_table)
+        return container
 
     def set_read_only(self, read_only: bool) -> None:
         self._read_only = bool(read_only)
@@ -455,6 +457,8 @@ class RplManagerPanel(QWidget):
         self.load_rpl(rpl_id)
 
     def load_rpl(self, rpl_id: str):
+        # a row highlight belongs to the RPL that produced it
+        self._clear_map_highlight()
         self.current_rpl = self.store.get_rpl(rpl_id) if self.store else None
         self.model = None
         self.sync = None
@@ -506,7 +510,7 @@ class RplManagerPanel(QWidget):
         if mark_dirty:
             self._table_dirty.update((0, 1, 2))
         if model is None:
-            for table in (self.points_table, self.sections_table, self.segments_table):
+            for table in (self.points_table, self.segments_table, self.sheet_table):
                 table.setRowCount(0)
             self._update_edit_buttons()
             return
@@ -519,9 +523,9 @@ class RplManagerPanel(QWidget):
             if index == 0:
                 self._populate_points_table(model)
             elif index == 1:
-                self._populate_sections_table(model)
-            else:
                 self._populate_legs_table(model)
+            else:
+                self._populate_sheet_table(model)
             self._table_dirty.discard(index)
         finally:
             self._loading_tables = False
@@ -573,33 +577,61 @@ class RplManagerPanel(QWidget):
         finally:
             self.points_table.setUpdatesEnabled(True)
 
-    def _populate_sections_table(self, model: RplModel):
-        leg_attrs = _attribute_keys(
-            (segment.attrs for segment in model.segments), _LEG_ATTR_ORDER)
-        columns = SECTION_COLUMNS + _attribute_columns(leg_attrs, {"CableType"})
-        self.sections_table.configure_columns(columns, _leg_column_presets(columns))
-        sections = rpl_engine.event_sections(model)
-        self.sections_table.setUpdatesEnabled(False)
+    def _populate_sheet_table(self, model: RplModel):
+        headers, rows, kinds = rpl_sheet.build_sheet(model)
+        leg_brush = self.sheet_table.palette().alternateBase()
+        self.sheet_table.setUpdatesEnabled(False)
         try:
-            self.sections_table.setRowCount(len(sections))
-            for row, section in enumerate(sections):
-                values = {
-                    "from_event": section.from_event or "(cable segment start)",
-                    "to_event": section.to_event or "(cable segment end)",
-                    "from": _text(section.from_pos), "to": _text(section.to_pos),
-                    "start_kp": _number(section.start_kp_km, 3),
-                    "end_kp": _number(section.end_kp_km, 3),
-                    "dist": _number(section.dist_km, 4),
-                    "cable": _number(section.cable_dist_km, 4),
-                    "slack": _number(section.slack_pct, 3),
-                    "leg_count": str(section.leg_count),
-                }
-                values.update({f"attr:{key}": _text(section.attrs.get(key)) for key in leg_attrs})
-                self._set_table_row(
-                    self.sections_table, row, values,
-                    user_data=(section.start_point_index, section.end_point_index))
+            self.sheet_table.setColumnCount(len(headers))
+            self.sheet_table.setHorizontalHeaderLabels(headers)
+            self.sheet_table.setRowCount(len(rows))
+            for row, (values, kind) in enumerate(zip(rows, kinds)):
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    if kind == rpl_sheet.ROW_LEG:
+                        item.setBackground(leg_brush)
+                    self.sheet_table.setItem(row, column, item)
+            self.sheet_table.resizeColumnsToContents()
+            for column in range(self.sheet_table.columnCount()):
+                self.sheet_table.setColumnWidth(
+                    column, min(max(self.sheet_table.columnWidth(column), 60), 280))
         finally:
-            self.sections_table.setUpdatesEnabled(True)
+            self.sheet_table.setUpdatesEnabled(True)
+
+    def _export_sheet(self):
+        if self.model is None or self.current_rpl is None:
+            return
+        name = (self.current_rpl.get("name") or "RPL").strip()
+        safe = "".join(c if c not in r'\/:*?"<>|' else "_" for c in name)
+        start_dir = os.path.dirname(self.store.gpkg_path) if self.store else ""
+        path, selected = QFileDialog.getSaveFileName(
+            self, "Export RPL sheet", os.path.join(start_dir, f"{safe} RPL.xlsx"),
+            "Excel workbook (*.xlsx);;CSV (*.csv)")
+        if not path:
+            return
+        headers, rows, kinds = rpl_sheet.build_sheet(self.model)
+        try:
+            if path.lower().endswith(".csv") or "CSV" in selected:
+                if not path.lower().endswith(".csv"):
+                    path += ".csv"
+                rpl_sheet.write_csv(path, headers, rows)
+            else:
+                if not path.lower().endswith(".xlsx"):
+                    path += ".xlsx"
+                try:
+                    rpl_sheet.write_xlsx(path, headers, rows, kinds, title=name)
+                except ImportError:
+                    QMessageBox.warning(
+                        self, "Export RPL sheet",
+                        "This QGIS install has no openpyxl module for .xlsx "
+                        "output. Choose the CSV format instead.")
+                    return
+        except OSError as exc:
+            QMessageBox.warning(self, "Export RPL sheet",
+                                f"Could not write the file:\n{exc}")
+            return
+        self._set_status(f"RPL sheet exported to {path}")
 
     def _populate_legs_table(self, model: RplModel):
         leg_attrs = _attribute_keys(
@@ -902,6 +934,98 @@ class RplManagerPanel(QWidget):
         except Exception:
             pass
         extent.scale(1.1)
+        canvas.setExtent(extent)
+        canvas.refresh()
+
+    # ------------------------------------------------- row -> map highlight --
+    def _row_map_targets(self, table, row):
+        """Model (point indices, segment indices) covered by one table row."""
+        if self.model is None or row < 0:
+            return [], []
+        if table is self.points_table:
+            return ([row], []) if row < len(self.model.points) else ([], [])
+        if table is self.segments_table:
+            if row >= len(self.model.segments):
+                return [], []
+            return [row, row + 1], [row]
+        if table is self.sheet_table:
+            # alternating rows: even = point i, odd = leg i joining i and i+1
+            if row % 2 == 0:
+                idx = row // 2
+                return ([idx], []) if idx < len(self.model.points) else ([], [])
+            idx = (row - 1) // 2
+            if idx >= len(self.model.segments):
+                return [], []
+            return [idx, idx + 1], [idx]
+        return [], []
+
+    def _selected_map_targets(self, table):
+        points, segments = set(), set()
+        for row in {index.row() for index in table.selectedIndexes()}:
+            row_points, row_segments = self._row_map_targets(table, row)
+            points.update(row_points)
+            segments.update(row_segments)
+        return sorted(points), sorted(segments)
+
+    def _row_context_menu(self, table, pos):
+        row = table.rowAt(pos.y())
+        if row < 0 or self.model is None or self.sync is None or not self.sync.is_valid():
+            return
+        if row not in {index.row() for index in table.selectedIndexes()}:
+            table.selectRow(row)
+        points, segments = self._selected_map_targets(table)
+        if not points and not segments:
+            return
+        noun = "position" if len(points) == 1 else "positions"
+        menu = QMenu(table)
+        menu.addAction(f"Zoom to on map ({len(points)} {noun})",
+                       lambda: self._highlight_on_map(points, segments, zoom=True))
+        menu.addAction("Highlight on map (keep view)",
+                       lambda: self._highlight_on_map(points, segments, zoom=False))
+        menu.addSeparator()
+        menu.addAction("Clear map highlight", self._clear_map_highlight)
+        qt_exec(menu, table.viewport().mapToGlobal(pos))
+
+    def _highlight_on_map(self, point_indices, segment_indices, zoom: bool = True):
+        if self.sync is None or not self.sync.is_valid():
+            return
+        self.sync.points_layer.selectByIds(self.sync.point_fids(point_indices))
+        self.sync.lines_layer.selectByIds(self.sync.line_fids(segment_indices))
+        if zoom:
+            self._zoom_to_selection()
+
+    def _clear_map_highlight(self):
+        if self.sync is None or not self.sync.is_valid():
+            return
+        self.sync.points_layer.removeSelection()
+        self.sync.lines_layer.removeSelection()
+
+    def _zoom_to_selection(self):
+        canvas = self.iface.mapCanvas()
+        target_crs = canvas.mapSettings().destinationCrs()
+        extent = QgsRectangle()
+        extent.setMinimal()
+        for layer in (self.sync.points_layer, self.sync.lines_layer):
+            if not layer.selectedFeatureCount():
+                continue
+            box = layer.boundingBoxOfSelected()
+            if box.isNull():
+                continue
+            try:
+                box = QgsCoordinateTransform(
+                    layer.crs(), target_crs, QgsProject.instance()
+                ).transformBoundingBox(box)
+            except Exception:
+                continue
+            extent.combineExtentWith(box)
+        if extent.isNull():
+            return
+        if extent.width() <= 0 and extent.height() <= 0:
+            # a single position has no area; keep a readable scale instead of
+            # zooming infinitely far in
+            extent.grow(canvas.mapUnitsPerPixel() * 150)
+        else:
+            extent.scale(1.25)
         canvas.setExtent(extent)
         canvas.refresh()
 

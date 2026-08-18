@@ -272,7 +272,7 @@ class SegmentOverviewPanel(QWidget):
         makeup_actions.addWidget(self.remove_makeup_btn)
         makeup_actions.addStretch()
         makeup_layout.addLayout(makeup_actions)
-        self.detail_tables.addTab(makeup_page, "Cable make-up")
+        self.detail_tables.addTab(makeup_page, "Assembly")
         self.positions_table = QTableWidget(0, 7)
         self.positions_table.setHorizontalHeaderLabels([
             "Position", "KP", "Cable distance", "Latitude", "Longitude",
