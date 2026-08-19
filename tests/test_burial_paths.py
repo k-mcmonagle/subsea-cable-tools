@@ -83,21 +83,23 @@ def test_back_to_back_cluster_and_corridor() -> bool:
     solution = geom.generate_route_path(route, 25.0, "fillet")
     ok = solution.course_change_count == 3
     ok = ok and solution.compound_cluster_count >= 1
-    # Interacting corners are exact-through as one cluster; the independent
-    # final corner remains the requested default fillet.
-    compound = [item for item in solution.diagnostics
-                if item.solution == "compound"]
-    ok = ok and len(compound) >= 2
-    ok = ok and all(_near_point(solution.points, route[item.vertex_index])
-                    for item in compound)
+    # Interacting corners form one cluster. If exact-through would require a
+    # Dubins revolution, they become an explicit reviewed best fit; the
+    # independent final corner remains the requested default fillet.
+    clustered = [item for item in solution.diagnostics
+                 if item.solution in ("compound", "best_fit")]
+    ok = ok and len(clustered) >= 2
+    ok = ok and all(item.status == "review" for item in clustered)
+    ok = ok and all(part.length_m / part.radius_m <= math.pi + 1e-7
+                    for part in solution.primitives if part.radius_m)
     ok = ok and any(item.solution == "fillet" and item.miss_m > 0.0
                     for item in solution.diagnostics)
-    rejected = False
-    try:
-        geom.generate_route_path(route, 25.0, "fillet", max_deviation_m=1.0)
-    except geom.PathGeometryError:
-        rejected = True
-    ok = ok and rejected
+    limited = geom.generate_route_path(
+        route, 25.0, "fillet", max_deviation_m=1.0)
+    ok = ok and limited.max_offset_m > 1.0
+    ok = ok and any(
+        item.status == "review" and "review threshold" in item.message
+        for item in limited.diagnostics)
     return _result("back-to-back course changes form a compound cluster", ok)
 
 
@@ -209,6 +211,70 @@ def test_offset_window_matches_brute_force() -> bool:
                    f"{windowed:.3f} vs {brute:.3f} m")
 
 
+def test_polyline_slice_uses_chainage_index() -> bool:
+    """Dense route slicing must use indexed bounds, not scan every vertex."""
+    class IndexedOnlySequence:
+        def __init__(self, values):
+            self.values = values
+
+        def __len__(self):
+            return len(self.values)
+
+        def __getitem__(self, item):
+            return self.values[item]
+
+        def __iter__(self):
+            raise AssertionError("polyline_slice walked the complete route")
+
+    raw_points = [(float(index), 0.0) for index in range(10001)]
+    raw_chainages = [float(index) for index in range(10001)]
+    sliced = geom.polyline_slice(
+        IndexedOnlySequence(raw_points),
+        IndexedOnlySequence(raw_chainages), 4000.25, 4002.75)
+    expected = [(4000.25, 0.0), (4001.0, 0.0), (4002.0, 0.0),
+                (4002.75, 0.0)]
+    return _result("polyline slicing uses chainage bisection",
+                   sliced == expected)
+
+
+def test_heading_lattice_prunes_dominated_predecessors() -> bool:
+    """Strict DP lower bounds skip work without changing solver output."""
+    controls = [(0.0, 0.0), (500.0, 50.0),
+                (1000.0, -50.0), (1500.0, 0.0)]
+    original_edge = geom._edge_best
+    original_prune = geom._predecessor_cannot_beat
+    calls = [0, 0]
+    run = [0]
+
+    def counted(*args, **kwargs):
+        calls[run[0]] += 1
+        return original_edge(*args, **kwargs)
+
+    geom._edge_best = counted
+    try:
+        optimized = geom.solve_waypoint_path(
+            controls, 100.0, reference=controls,
+            heading_step_deg=15.0, refine_step_deg=15.0)
+        run[0] = 1
+        geom._predecessor_cannot_beat = lambda *_args: False
+        unpruned = geom.solve_waypoint_path(
+            controls, 100.0, reference=controls,
+            heading_step_deg=15.0, refine_step_deg=15.0)
+    finally:
+        geom._edge_best = original_edge
+        geom._predecessor_cannot_beat = original_prune
+    ok = calls[0] < calls[1]
+    ok = ok and optimized.points == unpruned.points
+    ok = ok and optimized.primitives == unpruned.primitives
+    ok = ok and optimized.waypoint_headings == unpruned.waypoint_headings
+    ok = ok and optimized.path_types == unpruned.path_types
+    ok = ok and optimized.max_offset_m == unpruned.max_offset_m
+    ok = ok and optimized.rms_offset_m == unpruned.rms_offset_m
+    ok = ok and optimized.length_m == unpruned.length_m
+    return _result("heading lattice prunes dominated predecessors", ok,
+                   f"{calls[0]} vs {calls[1]} edge solves")
+
+
 def test_depth_banded_radius_per_corner() -> bool:
     # Two identical corners; a synthetic depth lookup puts the first in
     # shallow water (small radius band) and the second in deep water.
@@ -294,10 +360,8 @@ def test_compound_solver_cancellation() -> bool:
     return _result("compound solver cancellation is cooperative", cancelled)
 
 
-def test_crowded_cluster_merges_instead_of_failing() -> bool:
-    """A compound corner crowded against a neighbouring fillet near the
-    route end used to raise "not enough route either side of a turn
-    cluster"; it must now merge with the neighbour and best-fit."""
+def test_tight_route_end_uses_wide_recovery() -> bool:
+    """A too-close route end gets one reviewed excursion, not an orbit."""
     theta = math.radians(82.0)
     route = [(0.0, 0.0), (900.0, 0.0), (900.0, 56.0),
              (900.0 + 3.0 * math.cos(theta), 56.0 + 3.0 * math.sin(theta))]
@@ -307,41 +371,93 @@ def test_crowded_cluster_merges_instead_of_failing() -> bool:
 
     solution = geom.generate_route_path(
         route, 20.0, "fillet", radius_for_vertex=radius_for_vertex)
-    ok = solution.course_change_count == 2
-    ok = ok and len(solution.points) >= 2
-    # The crowded pair resolves as one merged compound cluster (exact
-    # through, or a reviewed best fit) instead of raising the old
-    # "not enough route either side of a turn cluster" error.
-    ok = ok and all(item.solution in ("compound", "best_fit")
-                    for item in solution.diagnostics)
-    ok = ok and solution.compound_cluster_count == 1
-    return _result("crowded cluster merges instead of failing", ok,
-                   "/".join(sorted({d.solution
-                                    for d in solution.diagnostics})))
+    arcs = [part.length_m / part.radius_m
+            for part in solution.primitives if part.radius_m]
+    ok = geom.distance(solution.points[-1], route[-1]) <= 1e-6
+    ok = ok and bool(arcs) and max(arcs) <= math.pi + 1e-7
+    ok = ok and any(
+        item.solution == "best_fit" and item.status == "review"
+        and "wide minimum-radius recovery" in item.message
+        for item in solution.diagnostics)
+    return _result("tight route end uses reviewed wide recovery", ok,
+                   f"offset={solution.max_offset_m:.1f} m")
 
 
-def test_short_route_best_fit() -> bool:
-    """A scoped route far shorter than the turning radius still returns a
-    best-fit path with review status rather than erroring."""
+def test_short_route_returns_non_looping_best_fit() -> bool:
+    """Even a scope shorter than its radius returns a reviewed recovery."""
     route = [(0.0, 0.0), (30.0, 0.0), (30.0, 20.0)]
     solution = geom.generate_route_path(route, 200.0, "fillet")
-    ok = len(solution.points) >= 2
-    ok = ok and solution.course_change_count == 1
-    diag = solution.diagnostics[0]
-    ok = ok and diag.solution in ("compound", "best_fit")
-    curved = [part.radius_m for part in solution.primitives
-              if part.kind in ("L", "R")]
-    ok = ok and all(radius >= 200.0 - 1e-6 for radius in curved)
-    # A hard corridor forces the best-fit ladder; the anchors-only rung
-    # cannot satisfy 1 m either, so THAT is the case that still errors.
-    rejected = False
-    try:
-        geom.generate_route_path(route, 200.0, "fillet", max_deviation_m=1.0)
-    except geom.PathGeometryError:
-        rejected = True
-    ok = ok and rejected
-    return _result("short route still solves (no tangent error)", ok,
-                   f"{diag.solution}, miss={diag.miss_m:.1f} m")
+    arcs = [part.length_m / part.radius_m
+            for part in solution.primitives if part.radius_m]
+    ok = geom.distance(solution.points[0], route[0]) <= 1e-6
+    ok = ok and geom.distance(solution.points[-1], route[-1]) <= 1e-6
+    ok = ok and bool(arcs) and max(arcs) <= math.pi + 1e-7
+    ok = ok and all(item.solution == "best_fit"
+                    and item.status == "review"
+                    for item in solution.diagnostics)
+    return _result("short route returns non-looping best fit", ok,
+                   f"offset={solution.max_offset_m:.1f} m")
+
+
+def test_tight_start_cluster_becomes_reviewed_best_fit() -> bool:
+    """Close A/Cs at route entry must not generate orbiting Dubins loops."""
+    route = [(0.0, 0.0), (5.0, 0.0), (5.0, 5.0),
+             (15.0, 5.0), (4000.0, 5.0)]
+    solution = geom.generate_route_path(route, 950.0, "through_ac")
+    arc_angles = [part.length_m / part.radius_m
+                  for part in solution.primitives
+                  if part.kind in ("L", "R") and part.radius_m]
+    ok = bool(arc_angles) and max(arc_angles) <= math.pi + 1e-7
+    ok = ok and any(item.solution == "best_fit"
+                    and item.status == "review"
+                    and "tightly spaced" in item.message
+                    for item in solution.diagnostics)
+    ok = ok and solution.max_offset_m < 950.0
+    return _result("tight start A/Cs use non-looping reviewed best fit", ok,
+                   f"offset={solution.max_offset_m:.1f} m")
+
+
+def test_failed_local_window_rejoins_farther_downstream() -> bool:
+    """A failed chunk absorbs later controls before terminal recovery."""
+    route = [
+        (0.0, 0.0), (25.0, -43.301), (284.808, 106.699),
+        (284.808, 156.699), (456.881, 402.444),
+        (477.359, 388.105), (532.083, 237.754),
+        (250.175, 135.148),
+    ]
+    solution = geom.generate_route_path(
+        route, 60.0, "through_ac", max_cluster_size=2)
+    recovered = [item for item in solution.diagnostics if item.recovery]
+    arcs = [part.length_m / part.radius_m
+            for part in solution.primitives if part.radius_m]
+    ok = bool(recovered)
+    ok = ok and not any(item.wide_recovery
+                        for item in solution.diagnostics)
+    ok = ok and all(item.solution == "best_fit"
+                    and item.status == "review"
+                    and "rejoins farther along" in item.message
+                    for item in recovered)
+    ok = ok and geom.distance(solution.points[-1], route[-1]) <= 1e-6
+    ok = ok and bool(arcs) and max(arcs) <= math.pi + 1e-7
+    return _result("failed local window rejoins farther downstream", ok,
+                   f"controls={len(recovered)}")
+
+
+def test_last_cluster_uses_remaining_straight_route() -> bool:
+    """A last turn searches its collinear tail before going off-route."""
+    p1 = (5.0, 5.0 * math.sqrt(3.0))
+    p2 = (p1[0] - 10.0, p1[1] + 10.0 * math.sqrt(3.0))
+    p3 = (p2[0] - 1000.0, p2[1] + 1000.0 * math.sqrt(3.0))
+    route = [(0.0, 0.0), p1, p2, p3]
+    solution = geom.generate_route_path(route, 200.0, "through_ac")
+    ok = len(solution.diagnostics) == 1
+    item = solution.diagnostics[0]
+    ok = ok and item.recovery and not item.wide_recovery
+    ok = ok and item.miss_m <= 1e-6
+    ok = ok and "retains the feasible controls" in item.message
+    ok = ok and geom.distance(solution.points[-1], route[-1]) <= 1e-6
+    return _result("last cluster uses remaining straight RPL", ok,
+                   f"offset={solution.max_offset_m:.1f} m")
 
 
 def test_through_mode_chunks_large_clusters() -> bool:
@@ -413,6 +529,116 @@ def test_adjustments_config_and_fingerprints() -> bool:
     return _result("adjustments sanitise + fingerprint staleness", ok)
 
 
+def _spur_hairpin_route(tail: str) -> list:
+    """A near-vertical spur into a ~95 deg hairpin onto a long ESE line —
+    the 'route not designed for ploughing' shape. ``tail`` selects a
+    sparse (one vertex then 3 km straight) or gently curving remainder."""
+    points = []
+    y = -160.0
+    while y < -5.0:
+        points.append((0.0, y))
+        y += 18.0
+    points.append((0.0, 0.0))
+    heading = math.radians(-4.0)
+    x, yy = 0.0, 0.0
+    if tail == "sparse":
+        legs = ((400.0, -2.0), (3000.0, -2.0), (500.0, -1.5), (600.0, 2.0))
+        for leg, delta in legs:
+            heading += math.radians(delta)
+            x += leg * math.cos(heading)
+            yy += leg * math.sin(heading)
+            points.append((x, yy))
+        return points
+    heading = math.radians(-2.0)
+    wiggles = (4, -6, 2, -3, 5, -2, 3, -4, 2, -8, -6, -4, 3, -5)
+    legs = (140, 180, 240, 240, 250, 250, 300, 300, 400, 400, 350, 350,
+            350, 400)
+    for leg, wiggle in zip(legs, wiggles):
+        heading -= math.radians(1.0)
+        x += leg * math.cos(heading)
+        yy += leg * math.sin(heading) + wiggle * 0.15
+        points.append((x, yy))
+    return points
+
+
+def test_relaxed_cluster_rejoins_route_early() -> bool:
+    """After a forced hairpin excursion the path must merge back onto the
+    RPL at the earliest credible station and then follow it, instead of
+    crawling to the far anchor along one Dubins diagonal."""
+    route = _spur_hairpin_route("sparse")
+    solution = geom.generate_route_path(route, 400.0, "fillet")
+    reference = geom.clean_polyline(route)
+    series = geom.signed_offset_series(solution.points, reference)
+    tail = [abs(offset) for station, offset in series if station > 1500.0]
+    ok = bool(tail) and max(tail) < 25.0
+    ok = ok and solution.max_offset_m < 320.0
+    arcs = [part.length_m / part.radius_m
+            for part in solution.primitives if part.radius_m]
+    ok = ok and bool(arcs) and max(arcs) <= math.pi + 1e-7
+    return _result("relaxed cluster rejoins the RPL early", ok,
+                   f"max={solution.max_offset_m:.0f} m, "
+                   f"tail<{max(tail):.1f} m" if tail else "no tail")
+
+
+def test_dropped_control_miss_uses_final_path() -> bool:
+    """A reported control miss can never exceed the control's true distance
+    to the FINAL stitched path (the truncated-window bug reported hundreds
+    of metres for controls the path actually passes through)."""
+    clean = geom.clean_polyline(_spur_hairpin_route("curved"))
+    solution = geom.generate_route_path(clean, 400.0, "fillet")
+    checked = 0
+    ok = True
+    for item in solution.diagnostics:
+        actual = geom.point_polyline_distance(
+            clean[item.vertex_index], solution.points)
+        ok = ok and item.miss_m <= actual + 1e-6
+        checked += 1
+    ok = ok and checked > 0 and any(
+        item.solution == "best_fit" for item in solution.diagnostics)
+    return _result("dropped-control miss measured on the final path", ok,
+                   f"{checked} diagnostics checked")
+
+
+def test_window_always_covers_cluster_corners() -> bool:
+    """A neighbour's large entry pad must not shrink a cluster window to
+    exclude the cluster's own corners — that used to stitch the excluded
+    corners back in as raw RPL, silently violating the minimum radius."""
+    points = []
+    y = -400.0
+    while y < -20.0:
+        points.append((6.0 * (1.0 + y / 400.0), y))
+        y += 45.0
+    points.append((0.0, 0.0))
+    heading = math.radians(-1.0)
+    x, yy = 0.0, 0.0
+    legs = (250, 350, 500, 300, 350, 450, 500, 400, 2200, 2600, 1500)
+    turns = (-1.0, -0.8, 1.2, -1.5, 0.8, -1.0, 1.5, -1.2, -3.0, -2.0, -1.0)
+    for leg, delta in zip(legs, turns):
+        heading += math.radians(delta)
+        x += leg * math.cos(heading)
+        yy += leg * math.sin(heading)
+        points.append((x, yy))
+    solution = geom.generate_route_path(points, 1000.0, "fillet")
+    tightest = geom.minimum_polyline_radius(solution.points)
+    ok = tightest is not None and tightest >= 999.0
+    ok = ok and geom.distance(solution.points[-1], points[-1]) <= 1e-6
+    return _result("cluster window always covers its corners", ok,
+                   f"tightest radius {0.0 if tightest is None else tightest:.0f} m")
+
+
+def test_infeasible_corners_dropped_route_followed() -> bool:
+    """The control ladder drops the individually infeasible tight corners
+    and keeps the path pinned to the remaining straight route."""
+    route = [(0.0, 0.0), (5.0, 0.0), (5.0, 5.0),
+             (15.0, 5.0), (4000.0, 5.0)]
+    solution = geom.generate_route_path(route, 950.0, "through_ac")
+    ok = solution.max_offset_m < 50.0
+    ok = ok and any(item.solution == "best_fit"
+                    for item in solution.diagnostics)
+    return _result("infeasible corners dropped, route followed", ok,
+                   f"offset={solution.max_offset_m:.1f} m")
+
+
 def test_signed_offset_series() -> bool:
     reference = [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0)]
     points = [(10.0, 5.0), (50.0, -3.0), (105.0, 50.0), (95.0, 80.0)]
@@ -438,15 +664,24 @@ def run_all() -> list:
         test_persistence_fingerprints_and_wkt(),
         test_dubins_words_reintegrate_exactly(),
         test_offset_window_matches_brute_force(),
+        test_polyline_slice_uses_chainage_index(),
+        test_heading_lattice_prunes_dominated_predecessors(),
         test_depth_banded_radius_per_corner(),
         test_progress_callback_counts_groups(),
         test_radius_rules_config_and_fingerprints(),
         test_compound_solver_cancellation(),
-        test_crowded_cluster_merges_instead_of_failing(),
-        test_short_route_best_fit(),
+        test_tight_route_end_uses_wide_recovery(),
+        test_short_route_returns_non_looping_best_fit(),
+        test_tight_start_cluster_becomes_reviewed_best_fit(),
+        test_failed_local_window_rejoins_farther_downstream(),
+        test_last_cluster_uses_remaining_straight_route(),
         test_through_mode_chunks_large_clusters(),
         test_manual_adjustment_control(),
         test_adjustments_config_and_fingerprints(),
+        test_relaxed_cluster_rejoins_route_early(),
+        test_dropped_control_miss_uses_final_path(),
+        test_window_always_covers_cluster_corners(),
+        test_infeasible_corners_dropped_route_followed(),
         test_signed_offset_series(),
     ]
 

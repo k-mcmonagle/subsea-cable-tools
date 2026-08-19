@@ -283,6 +283,7 @@ class BurialPlannerDock(QDockWidget):
         profile_status_row.addWidget(self.profile_cancel)
         profile_layout.addLayout(profile_status_row)
         self.profile = BurialProfileWidget()
+        self.profile.link_kp_plot(self.paths_tab.dcc_plot)
         self.profile.kpHovered.connect(self._on_profile_hover)
         self.profile.kpClicked.connect(self.goto_kp)
         self.profile.kpDoubleClicked.connect(self._on_profile_double_clicked)

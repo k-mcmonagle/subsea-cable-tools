@@ -726,6 +726,8 @@ def test_cross_offset_uses_contour_crossings() -> bool:
 def test_profile_widget_axes_crosshair_toggles() -> bool:
     """Depth/slope plots: aligned axes, no SI-prefixed KP, mirrored crosshair,
     per-series toggles, adjustable splitter."""
+    import pyqtgraph as pg
+
     from ..burial.profile_widget import BurialProfileWidget
 
     widget = BurialProfileWidget()
@@ -743,6 +745,17 @@ def test_profile_widget_axes_crosshair_toggles() -> bool:
     widget.plot.setXRange(2.0, 4.0, padding=0)
     lo, hi = slope_item.vb.viewRange()[0]
     ok = ok and abs(lo - 2.0) < 0.2 and abs(hi - 4.0) < 0.2
+    # Optional plots in other tabs can join the same KP domain and inherit
+    # the fixed plot-area origin.
+    linked_plot = pg.PlotWidget()
+    widget.link_kp_plot(linked_plot)
+    linked_item = linked_plot.getPlotItem()
+    widget.plot.setXRange(5.0, 7.0, padding=0)
+    linked_lo, linked_hi = linked_item.vb.viewRange()[0]
+    ok = ok and abs(linked_lo - 5.0) < 0.2 \
+        and abs(linked_hi - 7.0) < 0.2
+    ok = ok and linked_item.getAxis("left").fixedWidth == \
+        plot_item.getAxis("left").fixedWidth
     # Crosshair mirrors onto the slope panel.
     widget.set_slope_visible(True)
     widget.set_profile([(0.0, 100.0), (10.0, 200.0)])
@@ -765,6 +778,8 @@ def test_profile_widget_axes_crosshair_toggles() -> bool:
     # are enabled for export/axis options.
     ok = ok and widget._splitter.count() == 2
     ok = ok and plot_item.vb.menu is not None
+    linked_plot.close()
+    linked_plot.deleteLater()
     return _result("profile widget: axes, alignment, crosshair, toggles", ok)
 
 

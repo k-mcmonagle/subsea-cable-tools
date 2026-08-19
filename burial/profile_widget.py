@@ -293,6 +293,18 @@ class BurialProfileWidget(QWidget):
                 pass
         plot_item.getAxis("left").setWidth(_LEFT_AXIS_WIDTH)
 
+    def link_kp_plot(self, plot_widget) -> None:
+        """Give another plot the profile's KP range and axis alignment.
+
+        Installation-path deviation is optional and lives in another tab,
+        but it represents the same scoped KP domain. Linking through this
+        method keeps zoom/pan and the fixed plot-area origin consistent with
+        both the depth and slope panels without exposing layout constants.
+        """
+        other_item = plot_widget.getPlotItem()
+        self._setup_axes(other_item)
+        other_item.setXLink(self.plot.getPlotItem())
+
     def _series_toggled(self, key: str, checked: bool) -> None:
         QSettings().setValue(f"{_SETTINGS_ROOT}/slope_series_{key}",
                              bool(checked))

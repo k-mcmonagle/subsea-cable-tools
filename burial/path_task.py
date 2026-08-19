@@ -185,7 +185,7 @@ class _RoutePlane:
 
         # Lightweight sampled grid.  It avoids O(route vertices x path
         # vertices) nearest-segment searches on dense RPLs.  A generous cell
-        # keeps long-leg indexing bounded and includes turn-out loops.
+        # keeps long-leg indexing bounded and includes wide turn-out arcs.
         self.cell_m = max(1000.0, 6.0 * max(float(radius_m), 1.0))
         self.grid: Dict[Tuple[int, int], set] = {}
         for index, (a, b) in enumerate(zip(self.points, self.points[1:])):
@@ -530,8 +530,8 @@ class InstallationPathTask(QgsTask):
                 tool_dcc.append(dcc)
 
             # KP-windowed nearest tool-path vertex per course change: the
-            # tool KPs are near-monotone (local turn-out loops excepted), so
-            # a sorted-KP window bounds the nearest-point search.
+            # tool KPs are near-monotone (local turn-out excursions
+            # excepted), so a sorted-KP window bounds the nearest search.
             kp_order = sorted(range(len(tool_kps)),
                               key=tool_kps.__getitem__)
             sorted_tool_kps = [tool_kps[i] for i in kp_order]
@@ -587,6 +587,9 @@ class InstallationPathTask(QgsTask):
                     "depth_m": depth_value,
                     "depth_diff_m": depth_diff,
                     "control_kind": item.control_kind,
+                    "recovery": item.recovery,
+                    "wide_recovery": item.wide_recovery,
+                    "corridor_relaxed": item.corridor_relaxed,
                     "status": item.status, "message": item.message,
                 })
 
@@ -678,7 +681,15 @@ class InstallationPathTask(QgsTask):
                 "adjustment_count": len(work.adjustments),
                 "best_fit_count": sum(
                     1 for item in diagnostics
-                    if item.get("solution") == "best_fit"),
+                    if item.get("solution") == "best_fit"
+                    and item.get("control_kind") != "adjustment"),
+                "recovery_control_count": sum(
+                    1 for item in diagnostics if item.get("recovery")),
+                "wide_recovery": any(
+                    item.get("wide_recovery") for item in diagnostics),
+                "deviation_review_count": sum(
+                    1 for item in diagnostics
+                    if item.get("corridor_relaxed")),
                 "course_change_count": solution.course_change_count,
                 "compound_cluster_count": solution.compound_cluster_count,
                 "review_count": sum(1 for item in diagnostics

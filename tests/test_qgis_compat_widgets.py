@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from qgis.PyQt.QtCore import QObject, pyqtSignal
+from qgis.PyQt.QtCore import QObject, QSettings, pyqtSignal
 from qgis.PyQt.QtWidgets import QApplication
 from qgis.core import QgsProject
 from qgis.gui import QgsMapCanvas
@@ -59,6 +59,11 @@ def test_burial_installation_paths_widgets_construct():
     import tempfile
     import time
 
+    visibility_key = "SubseaCableTools/BurialPlanner/dcc_plot_visible"
+    settings = QSettings()
+    had_visibility = settings.contains(visibility_key)
+    saved_visibility = settings.value(visibility_key)
+    settings.remove(visibility_key)
     path = os.path.join(
         tempfile.gettempdir(),
         f"bp_paths_widget_{os.getpid()}_{int(time.time() * 1000)}.gpkg")
@@ -70,6 +75,18 @@ def test_burial_installation_paths_widgets_construct():
     assert "course change" in widget.mode_combo.itemText(1).lower()
     assert widget.vessel_combo.count() == 1  # placeholder only
     assert "Constant tool radius" in widget.radius_rules_label.text()
+    assert not widget.show_dcc.isChecked()  # first-use default is off
+    assert widget.results_splitter.count() == 2
+    assert widget.dcc_plot.maximumHeight() > 230  # user-sized, not capped
+    # Laptop-height layout: settings scroll above results on a splitter,
+    # with collapsible (checkable) settings groups.
+    assert widget.tab_splitter.count() == 2
+    assert not widget.tab_splitter.childrenCollapsible() \
+        or widget.tab_splitter.widget(1) is not None
+    from qgis.PyQt.QtWidgets import QGroupBox, QScrollArea
+    assert isinstance(widget.tab_splitter.widget(0), QScrollArea)
+    boxes = widget.tab_splitter.widget(0).findChildren(QGroupBox)
+    assert len(boxes) >= 3 and all(box.isCheckable() for box in boxes)
     dialog = LaybackProfileDialog({
         "name": "Test", "points_json": "[[0,50],[100,150]]",
         "outside_mode": "hold"})
@@ -100,6 +117,10 @@ def test_burial_installation_paths_widgets_construct():
     widget.close()
     widget.deleteLater()
     store.close()
+    if had_visibility:
+        settings.setValue(visibility_key, saved_visibility)
+    else:
+        settings.remove(visibility_key)
 
 
 def test_workbench_rule_layer_filters_construct():

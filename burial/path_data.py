@@ -15,7 +15,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import tools as tools_mod
 
-ALGORITHM_VERSION = "1"
+# v2: reachability-guided RPL rejoin for relaxed clusters (feasible-corner
+# ladder rung, on-route rejoin waypoints, best-of-variants selection).
+ALGORITHM_VERSION = "2"
 MODE_FILLET = "fillet"
 MODE_THROUGH = "through_ac"
 MODES = (MODE_FILLET, MODE_THROUGH)

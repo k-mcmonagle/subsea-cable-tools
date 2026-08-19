@@ -89,6 +89,9 @@ class RoutePathDiagnostic:
     message: str = ""
     radius_m: float = 0.0
     control_kind: str = "corner"    # "corner" | "adjustment"
+    recovery: bool = False
+    wide_recovery: bool = False
+    corridor_relaxed: bool = False
 
 
 @dataclass
@@ -183,8 +186,12 @@ def polyline_slice(points: Sequence[Point], chainages: Sequence[float],
         point = point_at_distance(points, chainages, lo)
         return [point]
     out = [point_at_distance(points, chainages, lo)]
-    out.extend(point for point, station in zip(points, chainages)
-               if lo + _EPS < station < hi - _EPS)
+    # Chainages are monotone. Locate the interior span directly instead of
+    # walking the complete route for every replacement. The latter makes a
+    # long route with many independent fillets quadratic in its vertex count.
+    first = bisect.bisect_right(chainages, lo + _EPS)
+    stop = bisect.bisect_left(chainages, hi - _EPS)
+    out.extend(points[first:stop])
     out.append(point_at_distance(points, chainages, hi))
     return clean_polyline(out)
 
@@ -459,8 +466,8 @@ def _ordered_point_offset(point: Point, reference: Sequence[Point],
     a moving segment window makes offset scoring O(path vertices) for dense
     routes instead of O(path vertices x RPL vertices). The window expands
     whenever its best match touches an edge, retaining exactness for rapid
-    progress across many short reference legs and allowing local Dubins loops
-    to move backwards.
+    progress across many short reference legs and allowing local turn-out /
+    turn-in excursions to move backwards.
     """
     count = len(reference) - 1
     if count <= 0:
@@ -628,9 +635,9 @@ def _edge_best(start: Pose, end: Pose, radius: float,
     best = None
     direct = distance((start[0], start[1]), (end[0], end[1]))
     # A mathematical Dubins connection always exists, but paths containing
-    # multiple gratuitous revolutions are not credible route fits.  Allow up
-    # to 6piR beyond the direct span so very close controls keep a usable
-    # local solution while runaway multi-loop candidates are discarded.
+    # gratuitous revolutions are not credible burial-tool movements. The
+    # broad length ceiling remains a final sanity bound after the explicit
+    # per-arc / wrapped-heading credibility check below.
     length_ceiling = direct + 6.0 * math.pi * radius
     corridor = (float(max_deviation_m) + 1e-7
                 if max_deviation_m is not None else None)
@@ -638,6 +645,25 @@ def _edge_best(start: Pose, end: Pose, radius: float,
                                        chord_tolerance_m):
         if cancel is not None and cancel():
             raise PathCancelled()
+        # A route course change is normalised to at most 180 degrees. A
+        # Dubins edge that turns farther than that in one primitive, or takes
+        # the wrapped long way between its headings, is orbiting merely to
+        # hit poses that are too close for this radius. Reject it so the
+        # compound control ladder can drop the tight A/C(s), report a
+        # reviewed best fit, and avoid operationally impossible loops.
+        signed_turn = 0.0
+        credible = True
+        for primitive in candidate.primitives:
+            if primitive.kind not in ("L", "R"):
+                continue
+            angle = primitive.length_m / max(
+                float(primitive.radius_m or radius), _EPS)
+            if angle > math.pi + 1e-7:
+                credible = False
+                break
+            signed_turn += angle if primitive.kind == "L" else -angle
+        if not credible or abs(signed_turn) > math.pi + 1e-7:
+            continue
         if candidate.length_m > length_ceiling + 1e-7:
             continue
         # Anything strictly beyond the best-so-far max (or the corridor)
@@ -733,6 +759,29 @@ def _resample_edge(edge: PathSolution, chord_tolerance_m: float
         length_m=edge.length_m, path_types=list(edge.path_types))
 
 
+def _predecessor_cannot_beat(prior_cost: Tuple,
+                             incumbent_cost: Tuple,
+                             direct_distance_m: float) -> bool:
+    """Whether a DP predecessor is strictly worse than an incumbent.
+
+    Edge maximum offset and integral are non-negative, and a bounded-
+    curvature connection cannot be shorter than the direct endpoint span.
+    These lower bounds let the heading lattice skip an edge solve only when
+    it cannot change the selected state. Strict comparisons preserve full
+    scoring of ties and therefore the existing deterministic tie-breaks.
+    """
+    if prior_cost[0] != incumbent_cost[0]:
+        return prior_cost[0] > incumbent_cost[0]
+    if prior_cost[1] != incumbent_cost[1]:
+        return prior_cost[1] > incumbent_cost[1]
+    length_floor = prior_cost[2] + direct_distance_m
+    # Stay conservative around floating-point equality: an analytically
+    # straight Dubins edge can accumulate a few ulps below its direct span.
+    tolerance = 1e-9 * max(1.0, abs(length_floor),
+                           abs(incumbent_cost[2]))
+    return length_floor > incumbent_cost[2] + tolerance
+
+
 def _solve_heading_lattice(waypoints: Sequence[Point],
                            heading_sets: Sequence[Sequence[float]],
                            radius: float, reference: Sequence[Point],
@@ -759,9 +808,13 @@ def _solve_heading_lattice(waypoints: Sequence[Point],
             leg_progress(leg, len(waypoints) - 1)
         current = states[-1]
         following: Dict[int, Tuple[Tuple, int, PathSolution]] = {}
+        direct_distance = distance(waypoints[leg], waypoints[leg + 1])
         for to_index, to_heading in enumerate(heading_sets[leg + 1]):
             best_state = None
             for from_index, (prior_cost, _prev, _edge) in current.items():
+                if best_state is not None and _predecessor_cannot_beat(
+                        prior_cost, best_state[0], direct_distance):
+                    continue
                 key = (leg, from_index, to_index)
                 edge = edge_cache.get(key)
                 if key not in edge_cache:
@@ -921,6 +974,12 @@ class _Replacement:
     # Per-corner distance from each member control to the final path.
     misses: Dict[int, float] = field(default_factory=dict)
     dropped: List[int] = field(default_factory=list)
+    # Recovery paths deliberately relax route controls while preserving the
+    # tool radius. ``wide_recovery`` is the final, off-route excursion used
+    # only when the scoped route ends before a normal rejoin is possible.
+    recovery: bool = False
+    wide_recovery: bool = False
+    corridor_relaxed: bool = False
 
 
 def _route_corners(points: Sequence[Point], chainages: Sequence[float],
@@ -1024,23 +1083,241 @@ def _control_ladder(members: Sequence[_Corner]) -> List[List[_Corner]]:
     """Progressively relaxed control subsets for the best-fit fallback.
 
     The first rung passes through every control (the exact objective).
-    When that has no bounded-curvature solution the ladder drops the
-    smallest course changes first — a racing line that still aims for the
-    significant A/Cs — and finally keeps only manual adjustments, then
+    When that has no bounded-curvature solution the next rung drops only
+    the corners that are individually infeasible at their radius (no
+    tangent fillet fits their legs) — those are what usually break an
+    exact-through solve, while the surviving gentle corners keep the path
+    pinned to the RPL. Later rungs fall back to the historical racing
+    line (largest course changes), manual adjustments only, and finally
     nothing but the entry/exit anchors.
     """
     ladder: List[List[_Corner]] = [list(members)]
+
+    def _push(subset: List[_Corner]) -> None:
+        if len(subset) < len(ladder[-1]) \
+                and all(subset != rung for rung in ladder):
+            ladder.append(subset)
+
+    feasible = [c for c in members if c.adjustment or c.fillet is not None]
+    if feasible:
+        _push(feasible)
     if len(members) > 1:
         keep = max(1, (len(members) + 1) // 2)
         ranked = sorted(members,
                         key=lambda c: (not c.adjustment, -abs(c.turn_rad)))
-        subset = sorted(ranked[:keep], key=lambda c: c.station_m)
-        if len(subset) < len(members):
-            ladder.append(subset)
-    adjustments = [c for c in members if c.adjustment]
-    if len(adjustments) < len(ladder[-1]):
-        ladder.append(adjustments)   # may be empty: anchors only
+        _push(sorted(ranked[:keep], key=lambda c: c.station_m))
+    _push([c for c in members if c.adjustment])
+    # Even manual shaping points are preferences once an exact solution is
+    # impossible. The minimum radius and forward-only motion remain hard;
+    # every missed control is retained in diagnostics for review.
+    if ladder[-1]:
+        ladder.append([])            # anchors only
     return ladder
+
+
+def _has_credible_connection(start: Pose, end: Pose, radius: float) -> bool:
+    """Whether a non-orbiting Dubins path joins two poses.
+
+    Mirrors the credibility rule in :func:`_edge_best` (every arc at most a
+    half revolution and no wrapped net turn) without any reference scoring,
+    so a reachability probe costs microseconds.
+    """
+    for candidate in dubins_candidates(start, end, radius,
+                                       chord_tolerance_m=radius):
+        signed_turn = 0.0
+        credible = True
+        for primitive in candidate.primitives:
+            if primitive.kind not in ("L", "R"):
+                continue
+            angle = primitive.length_m / max(
+                float(primitive.radius_m or radius), _EPS)
+            if angle > math.pi + 1e-7:
+                credible = False
+                break
+            signed_turn += angle if primitive.kind == "L" else -angle
+        if credible and abs(signed_turn) <= math.pi + 1e-7:
+            return True
+    return False
+
+
+def _rejoin_stations(route: Sequence[Point], chainages: Sequence[float],
+                     entry_point: Point, station_a: float, station_b: float,
+                     radius: float, max_points: int = 4) -> List[float]:
+    """On-route waypoint stations for one long control gap.
+
+    The first station is found by scanning for the earliest point where a
+    credible Dubins manoeuvre from the gap's entry pose can merge with the
+    local route direction — placing it any earlier would make the whole
+    (mandatory-waypoint) rung infeasible, any later wastes route adherence.
+    Follow-up stations at a comfortable spacing keep the path pinned to the
+    RPL across the remainder of the gap.
+    """
+    gap = float(station_b) - float(station_a)
+    if gap <= 2.0 * radius:
+        return []
+    entry_heading = polyline_heading_at(route, chainages, station_a)
+    pose = (float(entry_point[0]), float(entry_point[1]), entry_heading)
+    end_target = point_at_distance(route, chainages, station_b)
+    end_heading = polyline_heading_at(route, chainages,
+                                      max(station_a, station_b - 1e-7))
+    end_pose = (end_target[0], end_target[1], end_heading)
+    # A slim end margin only: the continuation credibility check below is
+    # what actually guarantees the tail edge works, and the best merge
+    # station often sits close to the gap end.
+    limit = station_b - 0.1 * radius
+
+    fan_step = math.radians(15.0)
+
+    def usable(station: float) -> bool:
+        # A rejoin waypoint must be passable at SOME lattice-like heading:
+        # reachable from the gap entry AND leaving a credible continuation
+        # to the gap end. The heading need not be the route tangent — the
+        # earliest physical rejoin is often a shallow crossing followed by
+        # an arc onto the line, which the heading lattice can express as
+        # two edges around one waypoint. Without the continuation check a
+        # station still upstream of the excursion (trivially reachable
+        # straight ahead) would be accepted and the impossible manoeuvre
+        # merely deferred to the following edge.
+        # Near-tangent band only (±30°): a realistic merge crosses or joins
+        # the line shallowly. Steeper crossings are usually reachable much
+        # earlier but force a taller excursion first, which the mandatory
+        # waypoint would then lock in.
+        target = point_at_distance(route, chainages, station)
+        base = polyline_heading_at(route, chainages, station)
+        # Only stations already pointing the gap-exit way are rejoin
+        # candidates. A station on the entry side of the excursion (e.g.
+        # still on a spur before a hairpin) is trivially reachable straight
+        # ahead and would anchor the waypoint before the manoeuvre.
+        if abs(wrap_pi(base - end_heading)) > math.radians(45.0):
+            return False
+        for k in (0, 1, -1, 2, -2):
+            target_pose = (target[0], target[1], base + k * fan_step)
+            if _has_credible_connection(pose, target_pose, radius) \
+                    and _has_credible_connection(target_pose, end_pose,
+                                                 radius):
+                return True
+        return False
+
+    step = max(radius / 4.0, gap / 64.0)
+    first = None
+    station = station_a + step
+    while station < limit:
+        if usable(station):
+            first = station
+            break
+        station += step
+    if first is None:
+        return []
+    # The coarse step means ``first`` sits up to one step past the true
+    # earliest rejoin — deliberate margin so the mandatory waypoint stays
+    # comfortably inside the reachable set for the lattice's discrete fan.
+    out = [first]
+    station = first + 2.5 * radius
+    while station < limit and len(out) < int(max_points):
+        out.append(station)
+        station += 2.5 * radius
+    return out
+
+
+def _controls_with_rejoin(route: Sequence[Point], chainages: Sequence[float],
+                          subset: Sequence[_Corner], start: float, end: float,
+                          anchor_start: Point, anchor_end: Point,
+                          radius: float) -> Optional[List[Point]]:
+    """Control list augmented with on-route rejoin waypoints.
+
+    A single Dubins edge is one arc-straight-arc: after a forced turn-out
+    excursion it can only crawl back to a distant anchor along one long
+    diagonal. Mandatory waypoints placed ON the reference inside long
+    control gaps let the heading lattice rejoin the RPL early and then
+    follow it, which is how a real plough/trencher would be driven.
+    Returns ``None`` when every gap is short enough not to matter.
+    """
+    entries: List[Tuple[float, Point]] = [(float(start), anchor_start)]
+    for corner in subset:
+        entries.append((min(max(corner.station_m, float(start)), float(end)),
+                        _control_point(route, corner)))
+    entries.append((float(end), anchor_end))
+    controls: List[Point] = [anchor_start]
+    added = False
+    for (station_a, point_a), (station_b, point_b) in zip(entries,
+                                                          entries[1:]):
+        for station in _rejoin_stations(route, chainages, point_a,
+                                        station_a, station_b, radius):
+            controls.append(point_at_distance(route, chainages, station))
+            added = True
+        controls.append(point_b)
+    return controls if added else None
+
+
+def _wide_recovery_solution(
+        anchor_start: Point, anchor_end: Point,
+        start_heading: float, end_heading: float, radius: float,
+        reference: Sequence[Point], chord_tolerance_m: float,
+        cancel: Optional[Callable[[], bool]] = None) -> PathSolution:
+    """Return a non-orbiting excursion that reaches a too-close endpoint.
+
+    Some finite route scopes are shorter than the minimum-radius vehicle
+    needs to reverse or acquire the terminal heading. A direct Dubins edge
+    can then contain a near-complete circle. Instead, place one temporary
+    control well outside the tight area and solve two individually credible
+    edges. This produces a wide, reviewable recovery manoeuvre which still
+    honours the radius and rejoins the exact route endpoint and heading.
+    """
+    direct = distance(anchor_start, anchor_end)
+    start_forward = (math.cos(start_heading), math.sin(start_heading))
+    start_left = (-start_forward[1], start_forward[0])
+    end_forward = (math.cos(end_heading), math.sin(end_heading))
+    end_left = (-end_forward[1], end_forward[0])
+
+    def shifted(origin: Point, along: Point, along_m: float,
+                across: Point = (0.0, 0.0), across_m: float = 0.0) -> Point:
+        return (origin[0] + along[0] * along_m + across[0] * across_m,
+                origin[1] + along[1] * along_m + across[1] * across_m)
+
+    # The first successful scale is used so a pathological short scope does
+    # not choose a needlessly enormous recovery merely to reduce a secondary
+    # score by a small amount.
+    for factor in (2.0, 4.0, 8.0, 16.0):
+        if cancel is not None and cancel():
+            raise PathCancelled()
+        advance = direct + factor * radius
+        lateral = factor * radius
+        candidates = [
+            shifted(anchor_start, start_forward, advance),
+            shifted(anchor_start, start_forward, advance,
+                    start_left, lateral),
+            shifted(anchor_start, start_forward, advance,
+                    start_left, -lateral),
+            shifted(anchor_end, end_forward, -advance),
+            shifted(anchor_end, end_forward, -advance,
+                    end_left, lateral),
+            shifted(anchor_end, end_forward, -advance,
+                    end_left, -lateral),
+        ]
+        best = None
+        seen = set()
+        for waypoint in candidates:
+            key = (round(waypoint[0], 7), round(waypoint[1], 7))
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                candidate = solve_waypoint_path(
+                    [anchor_start, waypoint, anchor_end], radius,
+                    start_heading=start_heading, end_heading=end_heading,
+                    reference=reference, max_deviation_m=None,
+                    chord_tolerance_m=chord_tolerance_m, cancel=cancel)
+            except PathGeometryError:
+                continue
+            score = (candidate.max_offset_m, candidate.length_m,
+                     waypoint[0], waypoint[1])
+            if best is None or score < best[0]:
+                best = (score, candidate)
+        if best is not None:
+            return best[1]
+    raise PathGeometryError(
+        "No forward-only minimum-radius recovery reaches the scoped route "
+        "endpoint without an orbit.")
 
 
 def _compound_replacement(route: Sequence[Point], chainages: Sequence[float],
@@ -1050,7 +1327,9 @@ def _compound_replacement(route: Sequence[Point], chainages: Sequence[float],
                           start: float, end: float,
                           cancel: Optional[Callable[[], bool]] = None,
                           fraction_progress: Optional[
-                              Callable[[float], None]] = None
+                              Callable[[float], None]] = None,
+                          recovery: bool = False,
+                          allow_wide_recovery: bool = False
                           ) -> _Replacement:
     _rs, _re, radius = _compound_window(corners, group)
     anchor_start = point_at_distance(route, chainages, start)
@@ -1062,29 +1341,87 @@ def _compound_replacement(route: Sequence[Point], chainages: Sequence[float],
                                       max(start, end - 1e-7))
     solution = None
     passed: set = set()
-    for subset in _control_ladder(members):
-        controls = [anchor_start]
-        controls.extend(_control_point(route, corner) for corner in subset)
-        controls.append(anchor_end)
-        try:
-            solution = solve_waypoint_path(
-                controls, radius, start_heading=start_heading,
-                end_heading=end_heading, reference=reference,
-                max_deviation_m=max_deviation_m,
-                chord_tolerance_m=chord_tolerance_m, cancel=cancel,
-                progress=(None if fraction_progress is None else
-                          lambda done, total:
-                          fraction_progress(done / max(total, 1))))
-            passed = {corner.number for corner in subset}
+    corridor_relaxed = False
+    wide_recovery = False
+    ladder = _control_ladder(members)
+    if recovery and len(members) > 4:
+        # A widened recovery may cover many future course changes. Retrying
+        # all of them would recreate the large heading lattice that the
+        # chunking optimisation avoids. Prefer the individually feasible
+        # controls (they keep the path on the RPL after the excursion),
+        # then the four most important, then the anchors alone.
+        feasible = [corner for corner in members
+                    if corner.adjustment or corner.fillet is not None][:8]
+        selected = sorted(
+            sorted(members,
+                   key=lambda corner: (not corner.adjustment,
+                                       -abs(corner.turn_rad)))[:4],
+            key=lambda corner: corner.station_m)
+        ladder = []
+        if feasible:
+            ladder.append(feasible)
+        if selected and selected != feasible:
+            ladder.append(selected)
+        ladder.append([])
+    limits = [max_deviation_m]
+    if max_deviation_m is not None and max_deviation_m > 0.0:
+        limits.append(None)
+    for limit in limits:
+        for subset in ladder:
+            # Each relaxed rung is solved both plain and with on-route
+            # rejoin waypoints in its long control gaps (early rejoin +
+            # line following, which one arc-straight-arc Dubins edge can
+            # never express). The better result by the solver's own cost
+            # order wins, so augmentation can never worsen a rung.
+            # Exact-through (nothing dropped, no recovery) keeps its
+            # historical unconstrained turn-out freedom.
+            plain = [anchor_start]
+            plain.extend(_control_point(route, corner) for corner in subset)
+            plain.append(anchor_end)
+            variants: List[List[Point]] = [plain]
+            if recovery or len(subset) < len(members):
+                augmented = _controls_with_rejoin(
+                    route, chainages, subset, start, end,
+                    anchor_start, anchor_end, radius)
+                if augmented is not None:
+                    variants.insert(0, augmented)
+            best = None
+            for controls in variants:
+                try:
+                    candidate = solve_waypoint_path(
+                        controls, radius, start_heading=start_heading,
+                        end_heading=end_heading, reference=reference,
+                        max_deviation_m=limit,
+                        chord_tolerance_m=chord_tolerance_m, cancel=cancel,
+                        progress=(None if fraction_progress is None else
+                                  lambda done, total:
+                                  fraction_progress(done / max(total, 1))))
+                except PathGeometryError:
+                    continue
+                key = (candidate.max_offset_m, candidate.rms_offset_m,
+                       candidate.length_m)
+                if best is None or key < best[0]:
+                    best = (key, candidate)
+            if best is not None:
+                solution = best[1]
+                passed = {corner.number for corner in subset}
+                corridor_relaxed = limit is None and max_deviation_m is not None
+                break
+        if solution is not None:
             break
-        except PathGeometryError:
-            continue
+    if solution is None and allow_wide_recovery:
+        solution = _wide_recovery_solution(
+            anchor_start, anchor_end, start_heading, end_heading, radius,
+            reference, chord_tolerance_m, cancel)
+        passed = set()
+        corridor_relaxed = bool(max_deviation_m)
+        wide_recovery = True
     if solution is None:
         raise PathGeometryError(
-            "No bounded-curvature path fits the turn cluster near station "
-            f"{corners[group[0]].station_m:.0f} m even as a best fit"
-            + (" within the maximum route deviation."
-               if max_deviation_m else "."))
+            "No direct non-looping bounded-curvature path fits the turn "
+            f"cluster near station {corners[group[0]].station_m:.0f} m, "
+            "even after relaxing its course-change controls. A farther "
+            f"RPL rejoin is required for the {radius:g} m turning radius.")
     misses: Dict[int, float] = {}
     dropped: List[int] = []
     for corner in members:
@@ -1096,11 +1433,13 @@ def _compound_replacement(route: Sequence[Point], chainages: Sequence[float],
             if corner.number in passed and miss <= 1e-6 else miss
         if corner.number not in passed:
             dropped.append(corner.number)
-    kind = "compound" if not dropped else "best_fit"
+    kind = "compound" if not (dropped or recovery or wide_recovery
+                               or corridor_relaxed) else "best_fit"
     return _Replacement(
         start, end, solution.points, solution.primitives,
         [corner.number for corner in members], kind,
-        solution.max_offset_m, radius, misses, dropped)
+        solution.max_offset_m, radius, misses, dropped,
+        recovery, wide_recovery, corridor_relaxed)
 
 
 def _adjustment_corners(route: Sequence[Point], chainages: Sequence[float],
@@ -1186,11 +1525,15 @@ def generate_route_path(route_points: Sequence[Point], radius_m: float,
     persisted configs, but all geometry course changes are controls).
 
     Robustness contract: a turn cluster crowded by its neighbour or the
-    route ends merges with the crowding group instead of failing, and a
-    cluster with no exact-through solution degrades to a best-fit racing
-    line (dropping the smallest course changes first) reported per corner
-    as ``best_fit`` / ``review`` with the real vertex miss — generation
-    only errors when not even an entry-to-exit path exists.
+    route ends merges with the crowding group instead of failing. A cluster
+    with no credible non-looping exact-through solution degrades to a
+    best-fit path that drops the infeasible corners first, merges back onto
+    the RPL at the earliest credible station (reachability-scanned on-route
+    rejoin waypoints), progressively skips further controls, and widens its
+    RPL rejoin downstream. If the finite route ends before that is possible, one
+    wide non-orbiting recovery excursion returns to the exact endpoint. The
+    configured deviation is a review threshold in these fallbacks, never a
+    reason to suppress the most credible path that can be generated.
 
     ``progress(done_groups, total_groups)`` is called before each turn group
     is solved and once after the last — compound clusters dominate the wall
@@ -1209,6 +1552,10 @@ def generate_route_path(route_points: Sequence[Point], radius_m: float,
     radius = float(radius_m)
     if not math.isfinite(radius) or radius <= 0.0:
         raise PathGeometryError("Minimum turning radius must be greater than zero.")
+    if max_deviation_m is not None:
+        max_deviation_m = float(max_deviation_m)
+        if not math.isfinite(max_deviation_m) or max_deviation_m <= 0.0:
+            max_deviation_m = None
     chainages = cumulative_lengths(route)
     corners = _route_corners(route, chainages, radius,
                              chord_tolerance_m, radius_for_vertex)
@@ -1274,17 +1621,30 @@ def generate_route_path(route_points: Sequence[Point], radius_m: float,
         requested_start, requested_end, group_radius = \
             _compound_window(corners, group)
         start = max(0.0, requested_start, previous_end)
-        end = min(chainages[-1], requested_end, next_start)
-        if end - start <= max(group_radius * 0.1, 1e-6):
+        forced_rejoin = item.get("rejoin_end")
+        end = (min(chainages[-1], float(forced_rejoin))
+               if forced_rejoin is not None
+               else min(chainages[-1], requested_end, next_start))
+        # The window must contain every member corner: a neighbour's large
+        # entry pad can otherwise push ``end`` before this cluster's own
+        # stations, a trivially solvable anchor-to-anchor window "succeeds",
+        # and the excluded corners are stitched back in as RAW RPL — a
+        # silent minimum-radius violation.
+        uncovered_by_previous = start > corners[group[0]].station_m + 1e-6
+        uncovered_by_next = end < corners[group[-1]].station_m - 1e-6
+        if end - start <= max(group_radius * 0.1, 1e-6) \
+                or uncovered_by_previous or uncovered_by_next:
             # The cluster is crowded.  Merge with whichever neighbour is
             # doing the crowding and re-solve the union as one cluster —
             # the "not enough route either side" failure becomes a bigger
             # compound solve instead of an error.
             crowded_by_previous = index > 0 and item.get("start") is None \
-                and previous_end > requested_start + 1e-9
+                and (previous_end > requested_start + 1e-9
+                     or uncovered_by_previous)
             crowded_by_next = index + 1 < len(plan_items) \
                 and item.get("end") is None \
-                and next_start < requested_end - 1e-9
+                and (next_start < requested_end - 1e-9
+                     or uncovered_by_next)
             if crowded_by_previous:
                 previous_item = plan_items.pop(index - 1)
                 if replacements:
@@ -1315,17 +1675,42 @@ def generate_route_path(route_points: Sequence[Point], radius_m: float,
                     plan_items[index:index + 1] = merged
                 continue
 
-        compound_count += 1
         fraction_progress = None
         if progress is not None:
             def fraction_progress(fraction: float, _index=index) -> None:
                 total = len(plan_items)
                 progress(min(_index + max(0.0, min(fraction, 1.0)),
                              total), total)
-        replacements.append(_compound_replacement(
-            route, chainages, corners, group,
-            chord_tolerance_m, max_deviation_m,
-            start, end, cancel, fraction_progress))
+        try:
+            replacement = _compound_replacement(
+                route, chainages, corners, group,
+                chord_tolerance_m, max_deviation_m,
+                start, end, cancel, fraction_progress,
+                recovery=bool(item.get("recovery")),
+                allow_wide_recovery=(
+                    index + 1 >= len(plan_items)
+                    and end >= chainages[-1] - 1e-7))
+        except PathGeometryError:
+            if index + 1 < len(plan_items):
+                # The original exit pose is too close for a credible direct
+                # connection. Absorb the next planned group and retry with
+                # its later exit; skipped controls remain review diagnostics.
+                following_item = plan_items.pop(index + 1)
+                item["group"] = group + following_item["group"]
+                item["end"] = following_item.get("end")
+                item["recovery"] = True
+                continue
+            if end < chainages[-1] - 1e-7:
+                # No later turn group exists, but straight/collinear RPL may
+                # remain. Search progressively farther along it before using
+                # the terminal off-route excursion.
+                advance = max(2.0 * group_radius, end - start, 1.0)
+                item["rejoin_end"] = min(chainages[-1], end + advance)
+                item["recovery"] = True
+                continue
+            raise
+        replacements.append(replacement)
+        compound_count += 1
         index += 1
 
     if progress is not None:
@@ -1349,11 +1734,6 @@ def generate_route_path(route_points: Sequence[Point], radius_m: float,
         points.extend(tail if not points else tail[1:])
     points = clean_polyline(points)
     maximum, _integral, rms = path_offset_metrics(points, route, cancel)
-    if max_deviation_m is not None and max_deviation_m > 0.0 \
-            and maximum > max_deviation_m + 1e-6:
-        raise PathGeometryError(
-            f"The best path departs {maximum:.1f} m from the RPL, exceeding "
-            f"the {max_deviation_m:.1f} m maximum.")
 
     replacement_by_corner = {}
     for replacement in replacements:
@@ -1368,25 +1748,56 @@ def generate_route_path(route_points: Sequence[Point], radius_m: float,
             message = "Tangent circular fillet."
         else:
             miss = replacement.misses.get(corner.number, 0.0)
+            if corner.number in replacement.dropped:
+                # A dropped control can still end up close to (or on) the
+                # final path once the untouched RPL pieces are stitched
+                # around its window — report the real distance, not the
+                # distance to the truncated window solution.
+                miss = min(miss, point_polyline_distance(
+                    _control_point(route, corner), points))
+                replacement.misses[corner.number] = miss
             if corner.adjustment:
                 message = (f"Manual path adjustment; the path passes "
                            f"{miss:.2f} m from the requested point.")
             elif replacement.solution == "best_fit":
-                message = (
-                    "No bounded-curvature path passes through every "
-                    "course-change point in this cluster at "
-                    f"{replacement.solved_radius_m:g} m — best-fit path "
-                    "shown"
-                    + (" (this point was dropped from the exact-through "
-                       f"controls; vertex miss {miss:.2f} m)." if dropped
-                       else f" (vertex miss {miss:.2f} m)."))
+                if replacement.wide_recovery:
+                    message = (
+                        "The scoped route ends before a direct non-looping "
+                        f"rejoin is possible at {replacement.solved_radius_m:g} "
+                        "m radius. A wide minimum-radius recovery excursion "
+                        f"rejoins the exact endpoint; vertex miss {miss:.2f} m.")
+                elif replacement.recovery:
+                    message = (
+                        "The original rejoin window was too tight for a "
+                        f"credible {replacement.solved_radius_m:g} m-radius "
+                        "path. The recovery "
+                        + ("skips conflicting controls and "
+                           if replacement.dropped
+                           else "retains the feasible controls and ")
+                        + ("rejoins farther along the RPL; vertex miss "
+                           f"{miss:.2f} m."))
+                else:
+                    message = (
+                        "The course changes in this cluster are too tightly "
+                        "spaced for a credible non-looping path to pass through "
+                        f"every point at {replacement.solved_radius_m:g} m "
+                        f"— best-fit path shown; vertex miss {miss:.2f} m.")
+                if dropped:
+                    message += " This point was dropped as an exact control."
+                if replacement.corridor_relaxed:
+                    message += (
+                        " The configured route-deviation limit was exceeded "
+                        "and is reported as a review threshold.")
             else:
                 message = ("Compound bounded-curvature solution through "
                            "every course-change point in the cluster, "
                            f"solved at {replacement.solved_radius_m:g} m "
                            "(the largest radius requirement among its "
                            "corners).")
-        if replacement.solution == "best_fit":
+        corridor_review = bool(
+            max_deviation_m is not None and max_deviation_m > 0.0
+            and replacement.max_offset_m > max_deviation_m + 1e-6)
+        if replacement.solution == "best_fit" or corridor_review:
             status = "review"
         elif max_deviation_m is None or max_deviation_m <= 0.0:
             status = "review" if replacement.solution == "compound" else "ok"
@@ -1394,13 +1805,19 @@ def generate_route_path(route_points: Sequence[Point], radius_m: float,
             status = "ok"
         side = "" if corner.adjustment else \
             ("port" if corner.turn_rad > 0.0 else "starboard")
+        if corridor_review and "review threshold" not in message:
+            message += (
+                f" The {max_deviation_m:g} m route-deviation limit was "
+                "exceeded and is reported as a review threshold.")
         diagnostics.append(RoutePathDiagnostic(
             corner.number, corner.index, corner.station_m,
             math.degrees(corner.turn_rad), side,
             "adjustment" if corner.adjustment else replacement.solution,
             miss, replacement.max_offset_m,
             status, message, corner.radius_m,
-            "adjustment" if corner.adjustment else "corner"))
+            "adjustment" if corner.adjustment else "corner",
+            replacement.recovery, replacement.wide_recovery,
+            replacement.corridor_relaxed or corridor_review))
     return RoutePathResult(
         points=points, primitives=primitives,
         max_offset_m=maximum, rms_offset_m=rms,

@@ -10,7 +10,7 @@ from typing import Dict, List, Optional
 import pyqtgraph as pg
 
 from qgis.core import QgsApplication, QgsProject
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import QSettings, Qt
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -19,6 +19,7 @@ from qgis.PyQt.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -27,6 +28,8 @@ from qgis.PyQt.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -51,6 +54,9 @@ from .. import tools as tools_mod
 from ..analysis_task import DepthSnapshot
 from ..path_task import InstallationPathTask, build_path_work
 from .. import ui_helpers
+
+_VERTICAL = getattr(Qt, "Orientation", Qt).Vertical
+_SETTINGS_ROOT = "SubseaCableTools/BurialPlanner"
 
 
 class LaybackProfileDialog(QDialog):
@@ -459,9 +465,40 @@ class PathsTab(QWidget):
         self._radius_rules = []  # staged bands; persisted on Apply/Generate
         self._adjustments: List[Dict] = []  # staged manual shaping points
         self._dcc_series: tuple = ([], [])  # plotted KP / DCC arrays
+        self._dcc_available = False
 
-        layout = QVBoxLayout(self)
+        # Short laptop screens (and the ~450 px docked height) cannot show
+        # the full settings stack AND useful results at once. The tab is a
+        # persisted vertical splitter: a scrollable settings pane (its three
+        # groups individually collapsible via their title checkboxes) above,
+        # and the results area (actions, status, plot, diagnostics) below.
+        tab_layout = QVBoxLayout(self)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        self.tab_splitter = QSplitter(_VERTICAL)
+        tab_layout.addWidget(self.tab_splitter)
+
+        settings_scroll = QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setFrameShape(
+            QFrame.Shape.NoFrame if hasattr(QFrame, "Shape")
+            else QFrame.NoFrame)
+        scroll_body = QWidget()
+        settings_scroll.setWidget(scroll_body)
+        scroll_outer = QHBoxLayout(scroll_body)
+        scroll_outer.setContentsMargins(0, 0, 0, 0)
+        scroll_outer.addStretch(1)
+        settings_column = QWidget()
+        settings_column.setMaximumWidth(1050)
+        layout = QVBoxLayout(settings_column)
+        scroll_outer.addWidget(settings_column, 4)
+        scroll_outer.addStretch(1)
+
         intro = QLabel(
+            "Radius-constrained tool path from every RPL course change — "
+            "a derived review product; analysis and KP references stay on "
+            "the RPL (hover for details).")
+        intro.setWordWrap(True)
+        intro.setToolTip(
             "Generate a realistic burial-tool path from every course change "
             "in the RPL geometry, using the plan default tool configuration. "
             "The default uses tangent circular fillets; the pass-through "
@@ -470,12 +507,13 @@ class PathsTab(QWidget):
             "KP references continue to use the RPL — the installation path "
             "is a derived operational-geometry product for review, display "
             "and reporting.")
-        intro.setWordWrap(True)
         intro.setStyleSheet(ui_helpers.hint_style())
         layout.addWidget(intro)
 
-        settings = QGroupBox("Tool path settings")
-        form = QFormLayout(settings)
+        settings, settings_body = self._collapsible_group(
+            "Tool path settings", "settings")
+        form = QFormLayout(settings_body)
+        form.setContentsMargins(0, 0, 0, 0)
         self.tool_label = QLabel("—")
         self.radius_label = QLabel("—")
         form.addRow("Plan default tool:", self.tool_label)
@@ -490,9 +528,11 @@ class PathsTab(QWidget):
             "vertex, allowing turn-out then turn-in while retaining the "
             "minimum radius. Dense course-change chains are solved in "
             "bounded chunks so progress keeps moving; a cluster with no "
-            "exact-through solution degrades to a reviewed best fit "
-            "(smallest course changes dropped first, real vertex miss "
-            "reported) instead of failing. Generation runs in the "
+            "credible non-looping exact-through solution degrades to a "
+            "reviewed best fit (smallest course changes dropped first, "
+            "real vertex miss reported), widens its rejoin downstream and, "
+            "for a too-short route end, uses one wide minimum-radius "
+            "recovery excursion. Generation runs in the "
             "background and can be stopped at any time.")
         form.addRow("Path objective:", self.mode_combo)
         radius_rules_row = QHBoxLayout()
@@ -513,17 +553,21 @@ class PathsTab(QWidget):
         self.max_deviation_spin.setSuffix(" m")
         self.max_deviation_spin.setSpecialValueText("Report only")
         self.max_deviation_spin.setToolTip(
-            "Optional maximum distance from the RPL. Report only records "
-            "the calculated excursion; a positive value rejects compound "
-            "solutions or fillets outside that corridor.")
-        form.addRow("Maximum route deviation:", self.max_deviation_spin)
+            "Optional review threshold for distance from the RPL. A "
+            "positive value guides the preferred solution; if no path fits "
+            "that corridor, the best minimum-radius recovery is still "
+            "generated and clearly marked for review.")
+        form.addRow("Route deviation review threshold:",
+                    self.max_deviation_spin)
         self.apply_button = QPushButton("Apply settings")
         self.apply_button.clicked.connect(self._apply_settings)
         form.addRow("", self.apply_button)
         layout.addWidget(settings)
 
-        barge = QGroupBox("Barge track (plough plans)")
-        barge_form = QFormLayout(barge)
+        barge, barge_body = self._collapsible_group(
+            "Barge track (plough plans)", "barge")
+        barge_form = QFormLayout(barge_body)
+        barge_form.setContentsMargins(0, 0, 0, 0)
         self.generate_barge_check = QCheckBox(
             "Generate the tow-point / vessel track with the tool path")
         self.generate_barge_check.toggled.connect(self._barge_toggled)
@@ -565,26 +609,32 @@ class PathsTab(QWidget):
         vessel_row.addWidget(self.delete_vessel_button)
         barge_form.addRow("Vessel:", vessel_row)
         barge_note = QLabel(
-            "The track is B(s) = tool(s) + horizontal layback(s) × forward "
-            "tangent(s). A multi-point layback profile samples the registered "
-            "bathymetry by water depth. No vessel dynamics, current, catenary "
-            "or touchdown analysis is implied.")
+            "Kinematic tow-point track only — no vessel dynamics, current, "
+            "catenary or touchdown analysis is implied (hover for details).")
         barge_note.setWordWrap(True)
+        barge_note.setToolTip(
+            "The track is B(s) = tool(s) + horizontal layback(s) × forward "
+            "tangent(s). A multi-point layback profile samples the "
+            "registered bathymetry by water depth.")
         barge_note.setStyleSheet(ui_helpers.hint_style())
         barge_form.addRow(barge_note)
         layout.addWidget(barge)
 
-        adjust_box = QGroupBox("Path adjustments (manual shaping points)")
-        adjust_layout = QVBoxLayout(adjust_box)
+        adjust_box, adjust_body = self._collapsible_group(
+            "Path adjustments (manual shaping points)", "adjust")
+        adjust_layout = QVBoxLayout(adjust_body)
+        adjust_layout.setContentsMargins(0, 0, 0, 0)
         adjust_note = QLabel(
             "Points the tool path must additionally pass through, as KP + "
-            "cross-course offset (positive = port of travel). Add them by "
-            "clicking the map beside the route — each click stages one "
-            "adjustment, right-click or Esc finishes — or edit the values "
-            "in the table. Click Generate to re-solve with the staged "
-            "adjustments; they are saved with the path settings and mark "
-            "the stored result stale until regenerated.")
+            "cross-course offset (positive = port of travel); Generate "
+            "re-solves with the staged list (hover for details).")
         adjust_note.setWordWrap(True)
+        adjust_note.setToolTip(
+            "Add adjustments by clicking the map beside the route — each "
+            "click stages one adjustment, right-click or Esc finishes — or "
+            "edit the values in the table. Click Generate to re-solve with "
+            "the staged adjustments; they are saved with the path settings "
+            "and mark the stored result stale until regenerated.")
         adjust_note.setStyleSheet(ui_helpers.hint_style())
         adjust_layout.addWidget(adjust_note)
         self.adjust_table = QTableWidget(0, 3)
@@ -616,7 +666,16 @@ class PathsTab(QWidget):
         adjust_buttons.addStretch(1)
         adjust_layout.addLayout(adjust_buttons)
         layout.addWidget(adjust_box)
+        layout.addStretch(1)
+        self.tab_splitter.addWidget(settings_scroll)
 
+        results = QWidget()
+        results_layout = QVBoxLayout(results)
+        results_layout.setContentsMargins(4, 4, 4, 0)
+        self.tab_splitter.addWidget(results)
+
+        # One compact row: generation actions on the left, map display
+        # toggles on the right — two rows fewer on short screens.
         actions = QHBoxLayout()
         self.generate_button = QPushButton("Generate installation paths")
         self.stop_button = QPushButton("Stop")
@@ -629,17 +688,7 @@ class PathsTab(QWidget):
         actions.addWidget(self.stop_button)
         actions.addWidget(self.clear_button)
         actions.addStretch(1)
-        layout.addLayout(actions)
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
-        self.progress.setVisible(False)
-        layout.addWidget(self.progress)
-        self.status_label = QLabel("No path generated.")
-        self.status_label.setWordWrap(True)
-        layout.addWidget(self.status_label)
-
-        display = QHBoxLayout()
-        display.addWidget(QLabel("Map display:"))
+        actions.addWidget(QLabel("Map display:"))
         self.show_tool = QCheckBox("Tool path")
         self.show_barge = QCheckBox("Barge track")
         self.show_issues = QCheckBox("Course-change points")
@@ -652,22 +701,43 @@ class PathsTab(QWidget):
             lambda checked: self._set_visibility("barge", checked))
         self.show_issues.toggled.connect(
             lambda checked: self._set_visibility("issues", checked))
-        display.addWidget(self.show_tool)
-        display.addWidget(self.show_barge)
-        display.addWidget(self.show_issues)
-        display.addStretch(1)
-        layout.addLayout(display)
+        actions.addWidget(self.show_tool)
+        actions.addWidget(self.show_barge)
+        actions.addWidget(self.show_issues)
+        results_layout.addLayout(actions)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setVisible(False)
+        results_layout.addWidget(self.progress)
+        self.status_label = QLabel("No path generated.")
+        self.status_label.setWordWrap(True)
+        results_layout.addWidget(self.status_label)
 
         self.summary_label = QLabel("")
         self.summary_label.setWordWrap(True)
-        layout.addWidget(self.summary_label)
+        results_layout.addWidget(self.summary_label)
+
+        dcc_controls = QHBoxLayout()
+        self.show_dcc = QCheckBox("Show KP vs DCC plot")
+        self.show_dcc.setChecked(bool(QSettings().value(
+            f"{_SETTINGS_ROOT}/dcc_plot_visible", False, type=bool)))
+        self.show_dcc.setToolTip(
+            "Show the route-relative deviation plot. Its KP range is linked "
+            "to the persistent depth/slope profile below. Drag the divider "
+            "under the plot to change its height; right-click the plot for "
+            "axis and export controls.")
+        self.show_dcc.toggled.connect(self._dcc_visibility_toggled)
+        dcc_controls.addWidget(self.show_dcc)
+        dcc_controls.addStretch(1)
+        results_layout.addLayout(dcc_controls)
 
         self.dcc_box = QGroupBox("Deviation from RPL — KP vs DCC")
         dcc_layout = QVBoxLayout(self.dcc_box)
         self.dcc_plot = pg.PlotWidget()
         self.dcc_plot.setBackground("w")   # match the profile pane
-        self.dcc_plot.setMaximumHeight(230)
-        self.dcc_plot.setMinimumHeight(140)
+        self.dcc_plot.setMinimumHeight(100)
+        self.dcc_plot.setMenuEnabled(True)
+        self.dcc_plot.setMouseEnabled(x=True, y=True)
         plot_item = self.dcc_plot.getPlotItem()
         plot_item.setLabel("bottom", "KP (km)")
         plot_item.setLabel("left", "DCC (m)  + port / − starboard")
@@ -691,7 +761,6 @@ class PathsTab(QWidget):
         self.dcc_readout.setStyleSheet(ui_helpers.hint_style())
         dcc_layout.addWidget(self.dcc_readout)
         self.dcc_box.setVisible(False)
-        layout.addWidget(self.dcc_box)
 
         self.table = QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels([
@@ -709,7 +778,46 @@ class PathsTab(QWidget):
             "zoom the map and profile there.")
         self.table.itemSelectionChanged.connect(self._diag_row_selected)
         self.table.cellDoubleClicked.connect(self._diag_row_activated)
-        layout.addWidget(self.table, 1)
+
+        # The DCC plot and diagnostics table share a persisted, user-sized
+        # vertical splitter. Hiding the plot (the default) gives the table the
+        # full results area without retaining a fixed blank plot height.
+        self.results_splitter = QSplitter(_VERTICAL)
+        self.results_splitter.addWidget(self.dcc_box)
+        self.results_splitter.addWidget(self.table)
+        self.results_splitter.setStretchFactor(0, 1)
+        self.results_splitter.setStretchFactor(1, 3)
+        self.results_splitter.setCollapsible(0, True)
+        self.results_splitter.setCollapsible(1, False)
+        splitter_state = QSettings().value(
+            f"{_SETTINGS_ROOT}/path_results_splitter_state")
+        if splitter_state is not None:
+            try:
+                self.results_splitter.restoreState(splitter_state)
+            except Exception:
+                pass
+        self.results_splitter.splitterMoved.connect(
+            self._save_results_splitter_state)
+        results_layout.addWidget(self.results_splitter, 1)
+
+        # Extra height goes to the results; the settings pane scrolls and can
+        # be dragged closed entirely on a short screen.
+        self.tab_splitter.setStretchFactor(0, 0)
+        self.tab_splitter.setStretchFactor(1, 1)
+        self.tab_splitter.setCollapsible(0, True)
+        self.tab_splitter.setCollapsible(1, False)
+        self.tab_splitter.setSizes([420, 480])
+        tab_state = QSettings().value(
+            f"{_SETTINGS_ROOT}/path_tab_splitter_state")
+        if tab_state is not None:
+            try:
+                self.tab_splitter.restoreState(tab_state)
+            except Exception:
+                pass
+        self.tab_splitter.splitterMoved.connect(
+            lambda *_args: QSettings().setValue(
+                f"{_SETTINGS_ROOT}/path_tab_splitter_state",
+                self.tab_splitter.saveState()))
 
         model.planChanged.connect(self.refresh)
         model.toolsChanged.connect(self.refresh)
@@ -718,6 +826,32 @@ class PathsTab(QWidget):
         model.laybacksChanged.connect(self.refresh)
         model.vesselsChanged.connect(self.refresh)
         self.refresh()
+
+    def _collapsible_group(self, title: str, key: str):
+        """A group box whose title checkbox collapses its body (persisted).
+
+        Collapsing reclaims vertical space on short laptop/docked screens.
+        Values inside a collapsed group still participate in the applied
+        configuration exactly as before.
+        """
+        box = QGroupBox(title)
+        box.setCheckable(True)
+        box.setToolTip("Untick the title to collapse this section; the "
+                       "choice is remembered.")
+        outer = QVBoxLayout(box)
+        body = QWidget()
+        outer.addWidget(body)
+        setting = f"{_SETTINGS_ROOT}/path_{key}_expanded"
+        expanded = bool(QSettings().value(setting, True, type=bool))
+        box.setChecked(expanded)
+        body.setVisible(expanded)
+
+        def _toggled(checked: bool) -> None:
+            body.setVisible(bool(checked))
+            QSettings().setValue(setting, bool(checked))
+
+        box.toggled.connect(_toggled)
+        return box, body
 
     def _profile_id(self) -> str:
         return str(self.layback_combo.currentData() or "")
@@ -927,6 +1061,16 @@ class PathsTab(QWidget):
             self._apply_settings()
 
     # -- DCC plot --------------------------------------------------------------
+    def _dcc_visibility_toggled(self, checked: bool) -> None:
+        QSettings().setValue(f"{_SETTINGS_ROOT}/dcc_plot_visible",
+                             bool(checked))
+        self.dcc_box.setVisible(bool(checked) and self._dcc_available)
+
+    def _save_results_splitter_state(self, *_args) -> None:
+        QSettings().setValue(
+            f"{_SETTINGS_ROOT}/path_results_splitter_state",
+            self.results_splitter.saveState())
+
     def _dcc_at(self, kp: float) -> Optional[float]:
         kps, values = self._dcc_series
         if not kps:
@@ -950,11 +1094,13 @@ class PathsTab(QWidget):
         values = list((series or {}).get("m") or [])
         if len(kps) != len(values) or len(kps) < 2:
             self._dcc_series = ([], [])
+            self._dcc_available = False
+            self.show_dcc.setEnabled(False)
             self.dcc_box.setVisible(False)
             return
         # The hover/marker interpolator needs ascending KP; the raw series
         # is in travel order (descending for direction −1, locally
-        # non-monotone through turn-out loops), so keep a sorted copy.
+        # non-monotone through turn-out excursions), so keep a sorted copy.
         order = sorted(range(len(kps)), key=kps.__getitem__)
         self._dcc_series = ([kps[i] for i in order],
                             [values[i] for i in order])
@@ -979,7 +1125,9 @@ class PathsTab(QWidget):
                 "data": kp,
             })
         self._dcc_markers.setData(spots)
-        self.dcc_box.setVisible(True)
+        self._dcc_available = True
+        self.show_dcc.setEnabled(True)
+        self.dcc_box.setVisible(self.show_dcc.isChecked())
 
     def _dcc_hover(self, pos) -> None:
         try:
@@ -1322,8 +1470,21 @@ class PathsTab(QWidget):
                     except (TypeError, ValueError):
                         pass
                 if summary.get("best_fit_count"):
-                    bits.append(f"{int(summary['best_fit_count'])} "
-                                "best-fit course change(s) — review")
+                    bits.append(
+                        f"{int(summary['best_fit_count'])} course change(s) "
+                        "not met exactly by the non-looping radius path — "
+                        "best fit/review")
+                if summary.get("recovery_control_count"):
+                    bits.append(
+                        f"{int(summary['recovery_control_count'])} control(s) "
+                        "covered by a farther-downstream recovery")
+                if summary.get("wide_recovery"):
+                    bits.append(
+                        "wide endpoint recovery used — review route scope")
+                if summary.get("deviation_review_count"):
+                    bits.append(
+                        f"route-deviation threshold exceeded/review "
+                        f"{int(summary['deviation_review_count'])}")
                 if summary.get("adjustment_count"):
                     bits.append(f"{int(summary['adjustment_count'])} "
                                 "manual adjustment(s)")
@@ -1358,6 +1519,7 @@ class PathsTab(QWidget):
                 for column, value in enumerate(values):
                     cell = QTableWidgetItem(str(value))
                     cell.setData(ITEM_DATA_USER_ROLE, item)
+                    cell.setToolTip(str(item.get("message") or ""))
                     self.table.setItem(table_row, column, cell)
             available = bool(self.model.plan)
             self.apply_button.setEnabled(available and self._task is None)
