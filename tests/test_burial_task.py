@@ -1322,6 +1322,23 @@ def test_multi_plan_layer_switching() -> bool:
     row_a, row_b = store.get_plan(plan_a), store.get_plan(plan_b)
     ok = ok and node_for(row_a) is not None and node_for(row_b) is not None
 
+    # Each plan's layers live in the plan's own subgroup.
+    sub_a = map_layers.plan_group(project, row_a, create=False)
+    sub_b = map_layers.plan_group(project, row_b, create=False)
+    ok = ok and sub_a is not None and sub_b is not None
+    ok = ok and node_for(row_a).parent() is sub_a
+    ok = ok and node_for(row_b).parent() is sub_b
+    ok = ok and sub_a.name() == map_layers.plan_group_name(row_a)
+
+    # Pre-grouping migration: a flat node under the Burial Planner group
+    # moves into the plan's subgroup on the next ensure.
+    flat = node_for(row_a).clone()
+    sub_a.removeChildNode(node_for(row_a))
+    group.addChildNode(flat)
+    ok = ok and node_for(row_a).parent() is group
+    map_layers.ensure_plan_layers(project, store.gpkg_path, row_a)
+    ok = ok and node_for(row_a).parent() is sub_a
+
     map_layers.set_active_plan_layers(project, row_b)
     ok = ok and not node_for(row_a).itemVisibilityChecked()
     ok = ok and node_for(row_b).itemVisibilityChecked()
@@ -1335,10 +1352,18 @@ def test_multi_plan_layer_switching() -> bool:
     ok = ok and node_for(row_b) is None
     renamed = store.get_plan(plan_b)
     ok = ok and node_for(renamed) is not None
+    # The old-named plan subgroup empties out and is pruned; the renamed
+    # plan gets its own subgroup.
+    ok = ok and map_layers.plan_group(project, row_b, create=False) is None
+    ok = ok and node_for(renamed).parent() is \
+        map_layers.plan_group(project, renamed, create=False)
 
     for plan in (row_a, renamed):
         map_layers.remove_plan_layers(project, store.gpkg_path, plan)
-    return _result("multi-plan layer switching + rename retirement", ok)
+    ok = ok and map_layers.plan_group(project, row_a, create=False) is None
+    ok = ok and map_layers.plan_group(project, renamed, create=False) is None
+    return _result("multi-plan layer switching + rename retirement + grouping",
+                   ok)
 
 
 def test_burial_depth_config_is_manual_only() -> bool:

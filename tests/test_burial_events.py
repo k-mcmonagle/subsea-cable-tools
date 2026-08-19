@@ -206,6 +206,83 @@ def test_opposite_section_boundaries_follow_travel_direction() -> bool:
     return _result("inserted skip/burial boundaries follow travel direction", ok)
 
 
+def test_delete_section_events() -> bool:
+    # burial [2,5] | skip [5,6] | burial [6,9] inside scope [0,10]:
+    # the leading skip [0,2] and trailing skip [9,10] are scope-edge skips.
+    events = [_event("a", 2.0, START), _event("b", 5.0, END),
+              _event("c", 6.0, START), _event("d", 9.0, END)]
+    sections = [_section("s0", schema.SECTION_SKIP, 0.0, 2.0),
+                _section("b1", schema.SECTION_BURIAL, 2.0, 5.0),
+                _section("s1", schema.SECTION_SKIP, 5.0, 6.0),
+                _section("b2", schema.SECTION_BURIAL, 6.0, 9.0),
+                _section("s2", schema.SECTION_SKIP, 9.0, 10.0),
+                _section("i1", schema.SECTION_INSUFFICIENT, 10.0, 11.0)]
+    # Deleting the interior skip removes its PLUP/PLDN pair -> burials merge.
+    remaining, removed, section = ev.delete_section_events(
+        events, sections, "s1", "plough")
+    ok = sorted(removed) == ["b", "c"]
+    ok = ok and [e["event_id"] for e in remaining] == ["a", "d"]
+    ok = ok and section["section_id"] == "s1"
+    ok = ok and ev.validate_events(remaining, 0.0, 10.0, 1, "plough").ok
+    # Deleting a burial section removes its own pair -> skips merge.
+    remaining2, removed2, _ = ev.delete_section_events(
+        events, sections, "b1", "plough")
+    ok = ok and sorted(removed2) == ["a", "b"]
+    ok = ok and ev.validate_events(remaining2, 0.0, 10.0, 1, "plough").ok
+    guarded = 0
+    # A scope-edge skip has no event on one side: nothing to merge with.
+    for target in ("s0", "s2"):
+        try:
+            ev.delete_section_events(events, sections, target, "plough")
+        except ValueError:
+            guarded += 1
+    # Insufficient Information sections cannot be deleted.
+    try:
+        ev.delete_section_events(events, sections, "i1", "plough")
+    except ValueError:
+        guarded += 1
+    # A locked boundary event blocks the deletion.
+    locked = [dict(e, locked=1 if e["event_id"] == "b" else 0) for e in events]
+    try:
+        ev.delete_section_events(locked, sections, "s1", "plough")
+    except ValueError:
+        guarded += 1
+    return _result("delete section merges neighbours, guards edges/locks",
+                   ok and guarded == 4)
+
+
+def test_note_helpers() -> bool:
+    ok = ev.append_note("", "x") == "x"
+    ok = ok and ev.append_note("a", "") == "a"
+    ok = ok and ev.append_note("a", "b") == "a; b"
+    # Reasons cannot break the bracket pattern.
+    ok = ok and ev.audit_note("t", "why [not]") == "[t: why (not)]"
+    ok = ok and ev.audit_note("t") == "[t]"
+    return _result("note append/audit formatting", ok)
+
+
+def test_upsert_move_note_coalesces() -> bool:
+    manual = "manual note"
+    one = ev.upsert_move_note(manual, "PLUP", 5.0, 5.01, "nudge +10 m")
+    ok = one == "manual note; [PLUP moved KP 5.000→5.010: nudge +10 m]"
+    # A second move of the same event collapses the chain, keeping the
+    # origin KP and the latest reason.
+    two = ev.upsert_move_note(one, "PLUP", 5.01, 5.02, "nudge +10 m")
+    ok = ok and two == "manual note; [PLUP moved KP 5.000→5.020: nudge +10 m]"
+    # Moving back to the origin drops the note entirely.
+    back = ev.upsert_move_note(two, "PLUP", 5.02, 5.0)
+    ok = ok and back == manual
+    # Coalescing is per-label: another event's note is left alone.
+    other = ev.upsert_move_note(two, "PLDN", 2.0, 2.1)
+    ok = ok and "[PLUP moved KP 5.000→5.020: nudge +10 m]" in other
+    ok = ok and "[PLDN moved KP 2.000→2.100]" in other
+    # Mid-string removal keeps the separators tidy.
+    mid = ev.upsert_move_note(two + "; trailing", "PLUP", 5.02, 5.03)
+    ok = ok and mid == ("manual note; trailing; "
+                        "[PLUP moved KP 5.000→5.030]")
+    return _result("move notes coalesce chains and stay editable", ok)
+
+
 def run_all() -> list:
     return [
         test_labels(),
@@ -219,6 +296,9 @@ def run_all() -> list:
         test_merge_burial_sections_and_skips(),
         test_merge_selection_guards(),
         test_opposite_section_boundaries_follow_travel_direction(),
+        test_delete_section_events(),
+        test_note_helpers(),
+        test_upsert_move_note_coalesces(),
     ]
 
 

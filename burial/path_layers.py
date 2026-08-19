@@ -163,13 +163,16 @@ def ensure_path_layers(project: Optional[QgsProject], gpkg_path: str,
     args = _base_args(plan)
     tool = map_layers._ensure_layer(
         project, gpkg_path, schema.tool_path_layer_name(*args),
-        apply_tool_path_style, schema.TOOL_PATH_LAYER_FIELDS, reload=reload)
+        apply_tool_path_style, schema.TOOL_PATH_LAYER_FIELDS, reload=reload,
+        plan=plan)
     barge = map_layers._ensure_layer(
         project, gpkg_path, schema.barge_track_layer_name(*args),
-        apply_barge_track_style, schema.BARGE_TRACK_LAYER_FIELDS, reload=reload)
+        apply_barge_track_style, schema.BARGE_TRACK_LAYER_FIELDS,
+        reload=reload, plan=plan)
     issues = map_layers._ensure_layer(
         project, gpkg_path, schema.path_issues_layer_name(*args),
-        apply_path_issues_style, schema.PATH_ISSUES_LAYER_FIELDS, reload=reload)
+        apply_path_issues_style, schema.PATH_ISSUES_LAYER_FIELDS,
+        reload=reload, plan=plan)
     return tool, barge, issues
 
 

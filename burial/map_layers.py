@@ -477,6 +477,73 @@ def burial_group(project: Optional[QgsProject] = None, create: bool = True):
     return group
 
 
+def plan_group_name(plan: Dict) -> str:
+    """Display name of a plan's layer-tree subgroup."""
+    name = str(plan.get("name") or "Plan").strip() or "Plan"
+    rev = str(plan.get("rev_label") or "").strip()
+    return f"{name} ({rev})" if rev else name
+
+
+def plan_group(project: Optional[QgsProject], plan: Dict,
+               create: bool = True):
+    """Find-or-create the plan's subgroup inside the Burial Planner group.
+
+    Each plan's sections/events/hazards (and installation-path) layers live
+    in their own group so a multi-plan project stays organised. Matching is
+    by display name within the Burial Planner group only — an unrelated
+    user group elsewhere with the same name is never touched.
+    """
+    parent = burial_group(project, create=create)
+    if parent is None:
+        return None
+    try:
+        from qgis.core import QgsLayerTreeGroup
+    except ImportError:
+        return parent
+    name = plan_group_name(plan)
+    for child in parent.children():
+        if isinstance(child, QgsLayerTreeGroup) and child.name() == name:
+            return child
+    if not create:
+        return None
+    return parent.addGroup(name)
+
+
+def _move_layer_into_group(project: QgsProject, layer, group) -> None:
+    """Move an existing layer-tree node into ``group`` (no-op when already
+    there). Used to migrate pre-grouping projects, where plan layers sat
+    directly under the Burial Planner group: the node is cloned into the
+    subgroup (visibility and expanded state survive) and the original
+    removed — the map layer itself is never touched."""
+    if group is None:
+        return
+    try:
+        node = project.layerTreeRoot().findLayer(layer.id())
+        if node is None or node.parent() is group:
+            return
+        clone = node.clone()
+        group.addChildNode(clone)
+        parent = node.parent()
+        if parent is not None:
+            parent.removeChildNode(node)
+    except Exception:
+        pass  # organisational only — never break a layer refresh over it
+
+
+def _prune_empty_plan_group(project: QgsProject, plan: Dict) -> None:
+    """Remove the plan's subgroup once its last layer is gone (rename
+    retirement / plan deletion). A non-empty group — e.g. shared by a
+    like-named duplicate plan — is left alone."""
+    try:
+        group = plan_group(project, plan, create=False)
+        if group is not None and not group.children():
+            parent = group.parent()
+            if parent is not None:
+                parent.removeChildNode(group)
+    except Exception:
+        pass
+
+
 # Bump when any apply_*_style output changes so already-loaded layers are
 # restyled exactly once (the old code rebuilt renderers + labelling and
 # forced three canvas repaints on every single edit).
@@ -511,9 +578,16 @@ def find_layer(project: QgsProject, gpkg_path: str, layer_name: str
 
 def _ensure_layer(project: QgsProject, gpkg_path: str, layer_name: str,
                   style_fn, expected_fields=None,
-                  reload: bool = True) -> Optional[QgsVectorLayer]:
+                  reload: bool = True,
+                  plan: Optional[Dict] = None) -> Optional[QgsVectorLayer]:
     existing = find_layer(project, gpkg_path, layer_name)
     if existing is not None and existing.isValid():
+        if plan:
+            # Pre-grouping projects keep working: a plan layer sitting flat
+            # in the Burial Planner group migrates into the plan's subgroup
+            # the first time the plan is ensured.
+            _move_layer_into_group(project, existing,
+                                   plan_group(project, plan))
         # A loaded layer caches its field map. When the tool's layer schema
         # gains a column (e.g. section_ref, skip_handling) the cached map can
         # go stale after the table is rewritten, silently breaking the
@@ -555,7 +629,8 @@ def _ensure_layer(project: QgsProject, gpkg_path: str, layer_name: str,
     layer = QgsVectorLayer(gpkg_layer_uri(gpkg_path, layer_name), layer_name, "ogr")
     if not layer.isValid():
         return None
-    group = burial_group(project)
+    group = (plan_group(project, plan) if plan else None) \
+        or burial_group(project)
     project.addMapLayer(layer, False)
     group.addLayer(layer)
     try:
@@ -584,17 +659,17 @@ def ensure_plan_layers(project: Optional[QgsProject], gpkg_path: str, plan: Dict
                              schema.sections_layer_name(*base_args),
                              apply_sections_style,
                              expected_fields=schema.SECTIONS_LAYER_FIELDS,
-                             reload="sections" in wanted)
+                             reload="sections" in wanted, plan=plan)
     events = _ensure_layer(project, gpkg_path,
                            schema.events_layer_name(*base_args),
                            apply_events_style,
                            expected_fields=schema.EVENTS_LAYER_FIELDS,
-                           reload="events" in wanted)
+                           reload="events" in wanted, plan=plan)
     _ensure_layer(project, gpkg_path,
                   schema.hazards_layer_name(*base_args),
                   apply_hazards_style,
                   expected_fields=schema.HAZARDS_LAYER_FIELDS,
-                  reload="hazards" in wanted)
+                  reload="hazards" in wanted, plan=plan)
     return sections, events
 
 
@@ -619,7 +694,7 @@ def set_active_plan_layers(project: Optional[QgsProject], plan: Dict) -> None:
               schema.tool_path_layer_name(*base_args),
               schema.barge_track_layer_name(*base_args),
               schema.path_issues_layer_name(*base_args)}
-    for node in group.findLayers():
+    for node in group.findLayers():  # recursive: plan subgroups included
         layer = node.layer()
         if layer is None:
             continue
@@ -628,6 +703,14 @@ def set_active_plan_layers(project: Optional[QgsProject], plan: Dict) -> None:
             continue
         try:
             node.setItemVisibilityChecked(name in active)
+        except (AttributeError, RuntimeError):
+            pass
+    # The active plan's subgroup itself must be checked, or its freshly
+    # checked layers stay invisible behind an unchecked parent.
+    sub = plan_group(project, plan, create=False)
+    if sub is not None:
+        try:
+            sub.setItemVisibilityChecked(True)
         except (AttributeError, RuntimeError):
             pass
 
@@ -645,6 +728,7 @@ def remove_plan_layers(project: Optional[QgsProject], gpkg_path: str, plan: Dict
         layer = find_layer(project, gpkg_path, name)
         if layer is not None:
             project.removeMapLayer(layer.id())
+    _prune_empty_plan_group(project, plan)
 
 
 # -- project-open self-healing ----------------------------------------------

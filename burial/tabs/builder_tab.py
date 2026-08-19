@@ -351,8 +351,10 @@ class BuilderTab(QWidget):
             "Edit Start/End KP directly to move a boundary (a confirmation "
             "shows the exact KP and optional reason). Set conclusion and "
             "confidence in the table, or right-click a selection to set "
-            "several at once, mark final, split or merge. Select 2+ "
-            "sections of the same kind to merge.")
+            "several at once, mark final, split, merge or delete. Select 2+ "
+            "sections of the same kind to merge; deleting a section merges "
+            "its neighbours into one. Edits append an audit note to the "
+            "affected Notes cells (still freely editable).")
         section_hint.setWordWrap(True)
         section_hint.setStyleSheet(ui_helpers.hint_style())
         sections_layout.addWidget(section_hint)
@@ -1013,6 +1015,11 @@ class BuilderTab(QWidget):
         split_action.setEnabled(selected_count == 1)
         merge_action = menu.addAction("Merge selected sections…")
         merge_action.setEnabled(selected_count >= 2)
+        delete_action = menu.addAction("Delete section (merge neighbours)…")
+        delete_action.setEnabled(
+            selected_count == 1
+            and section.get("kind") in (schema.SECTION_BURIAL,
+                                        schema.SECTION_SKIP))
         chosen = qt_exec(menu, self.sections_table.viewport().mapToGlobal(position))
         if chosen == go_action:
             self._goto_section_row(row)
@@ -1046,6 +1053,8 @@ class BuilderTab(QWidget):
             self._split_section()
         elif chosen == merge_action:
             self._merge_sections()
+        elif chosen == delete_action:
+            self._delete_section()
 
     # -- event edits -----------------------------------------------------------
     def _on_event_item_changed(self, item) -> None:
@@ -1329,6 +1338,49 @@ class BuilderTab(QWidget):
             return
         try:
             self.model.merge_sections(ids, reason)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Burial Planner", str(exc))
+
+    def _delete_section(self) -> None:
+        """Delete one burial section or skip; its neighbours merge into one."""
+        ids = self._selected_section_ids()
+        if len(ids) != 1:
+            QMessageBox.information(
+                self, "Burial Planner",
+                "Select a single section to delete.")
+            return
+        section = next((s for s in self.model.sections
+                        if s.get("section_id") == ids[0]), None)
+        if section is None:
+            return
+        if section.get("kind") not in (schema.SECTION_BURIAL,
+                                       schema.SECTION_SKIP):
+            QMessageBox.warning(
+                self, "Burial Planner",
+                "Insufficient Information sections cannot be deleted — they "
+                "reflect missing data coverage, not boundary events.")
+            return
+        kind_label = self._kind_label(section.get("kind") or "")
+        start_label = ev.event_label(schema.EVENT_BURIAL_START, self.model.method)
+        end_label = ev.event_label(schema.EVENT_BURIAL_END, self.model.method)
+        answer = QMessageBox.question(
+            self, "Delete section",
+            f"Delete the {kind_label} KP "
+            f"{schema.format_kp(section.get('start_kp'))}-"
+            f"{schema.format_kp(section.get('end_kp'))}?\n\n"
+            f"Its {start_label}/{end_label} boundary events are removed and "
+            "the neighbouring sections merge into one. Notes from the "
+            "removed section and its neighbours are carried into the merged "
+            "section, with an audit note naming the removed KP range. "
+            "The edit is undoable (Ctrl+Z) and recorded in the change log.",
+            MESSAGE_BOX_YES | MESSAGE_BOX_NO, MESSAGE_BOX_NO)
+        if answer != MESSAGE_BOX_YES:
+            return
+        reason = self._maybe_reason("Delete section")
+        if reason is None:
+            return
+        try:
+            self.model.delete_section(ids[0], reason)
         except ValueError as exc:
             QMessageBox.warning(self, "Burial Planner", str(exc))
 

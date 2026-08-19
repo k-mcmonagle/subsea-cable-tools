@@ -598,13 +598,22 @@ def build_sections(merged_events: List[Dict], params: GenParams,
                    rule_names: Dict[str, str],
                    previous_sections: Optional[List[Dict]] = None,
                    id_fn: Callable[[], str] = schema.new_id,
-                   plan_id: str = "") -> List[Dict]:
+                   plan_id: str = "",
+                   carry_by_overlap: bool = False) -> List[Dict]:
     """Rebuild the section partition (burial | skip | insufficient_info).
 
     Screening annotations and Constraint Influence Zone flags land in
     ``reason_json``; conclusions/state/confidence/notes carry over from
     ``previous_sections`` for sections whose kind and boundaries are unchanged
     (regeneration must not wipe the user's assessment of untouched sections).
+
+    ``carry_by_overlap`` extends the carry-over to the interactive-edit case
+    where a boundary event moved: a new section whose range did not match
+    exactly inherits from the single same-kind previous section it overlaps.
+    A section overlapped by two or more previous ones (a manual merge) stays
+    fresh — inheriting one side's assessment would be arbitrary — and the
+    generation path keeps the exact-match-only behaviour, where a shifted
+    boundary means the assessment genuinely needs review.
     """
     scope = params.scope
     sections: List[Dict] = []
@@ -621,17 +630,29 @@ def build_sections(merged_events: List[Dict], params: GenParams,
             continue
         prev_by_range[key] = section
 
+    carry_cols = ("state", "conclusion", "confidence", "notes",
+                  "method", "tool_id", "tool_config_id",
+                  "grade_in_m", "grade_out_m",
+                  "target_burial_m", "skip_handling")
+
+    def copy_carried(row: Dict, prev: Dict) -> None:
+        for col in carry_cols:
+            if prev.get(col) not in (None, ""):
+                row[col] = prev.get(col)
+
+    # Tracked structurally (not by id) so the overlap pass cannot be fooled
+    # by an id_fn that reuses ids across runs (deterministic test ids).
+    exact_matched_rows: set = set()      # id() of new rows carried exactly
+    exact_matched_prev: set = set()      # id() of consumed previous rows
+
     def carry_over(row: Dict) -> Dict:
         key = (row["kind"], round(row["start_kp"], 4), round(row["end_kp"], 4))
         prev = prev_by_range.get(key)
         if prev:
             row["section_id"] = prev.get("section_id") or row["section_id"]
-            for col in ("state", "conclusion", "confidence", "notes",
-                        "method", "tool_id", "tool_config_id",
-                        "grade_in_m", "grade_out_m",
-                        "target_burial_m", "skip_handling"):
-                if prev.get(col) not in (None, ""):
-                    row[col] = prev.get(col)
+            copy_carried(row, prev)
+            exact_matched_rows.add(id(row))
+            exact_matched_prev.add(id(prev))
         return row
 
     def base_row(kind: str, start: float, end: float) -> Dict:
@@ -747,9 +768,56 @@ def build_sections(merged_events: List[Dict], params: GenParams,
         row["reason_json"] = json.dumps(reason)
         sections.append(carry_over(row))
 
+    if carry_by_overlap and previous_sections:
+        leftovers = [p for p in previous_sections
+                     if id(p) not in exact_matched_prev]
+        fresh = [row for row in sections if id(row) not in exact_matched_rows]
+        _carry_by_overlap(fresh, leftovers, carry_cols)
+
     sections.sort(key=lambda s: (float(s.get("start_kp") or 0.0),
                                  float(s.get("end_kp") or 0.0)))
     return sections
+
+
+def _carry_by_overlap(fresh: List[Dict], leftovers: List[Dict],
+                      carry_cols: Tuple[str, ...]) -> None:
+    """Second carry pass for boundary moves (see ``build_sections``).
+
+    ``fresh`` are the new sections no exact range match carried; ``leftovers``
+    the previous sections nothing consumed. A fresh section inherits the
+    curated columns from the single same-kind leftover overlapping it. The
+    previous section's id is reused only when the mapping is one-to-one, so
+    a split (both halves overlapping one parent) copies the assessment to
+    both halves without ever duplicating a section id.
+    """
+    tol = 1e-6
+
+    def overlaps(row: Dict, prev: Dict) -> bool:
+        try:
+            lo = max(float(row["start_kp"]), float(prev.get("start_kp")))
+            hi = min(float(row["end_kp"]), float(prev.get("end_kp")))
+        except (TypeError, ValueError, KeyError):
+            return False
+        return hi - lo > tol
+
+    matches = []  # (row, prev) with exactly one same-kind overlapping prev
+    prev_use_count: Dict[str, int] = {}
+    for row in fresh:
+        candidates = [p for p in leftovers
+                      if (p.get("kind") or "") == row["kind"]
+                      and overlaps(row, p)]
+        if len(candidates) == 1:
+            prev = candidates[0]
+            matches.append((row, prev))
+            pid = str(prev.get("section_id") or "")
+            prev_use_count[pid] = prev_use_count.get(pid, 0) + 1
+    for row, prev in matches:
+        pid = str(prev.get("section_id") or "")
+        if pid and prev_use_count.get(pid) == 1:
+            row["section_id"] = pid
+        for col in carry_cols:
+            if prev.get(col) not in (None, ""):
+                row[col] = prev.get(col)
 
 
 def fresh_existing_events(events: Sequence[Dict], keep_client: bool = True

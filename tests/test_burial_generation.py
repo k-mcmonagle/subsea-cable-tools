@@ -317,6 +317,59 @@ def test_conclusion_carry_over() -> bool:
     return _result("unchanged sections keep their conclusions across regeneration", ok)
 
 
+def _event(eid, kp, etype):
+    return {"event_id": eid, "plan_id": "p", "generation_id": "", "seq": 0,
+            "event_type": etype, "kp": kp, "end_kp": None, "source": "auto",
+            "status": "candidate", "locked": 0, "notes": ""}
+
+
+def test_overlap_carry_over() -> bool:
+    """carry_by_overlap: a moved boundary keeps the adjacent sections'
+    curated columns; an ambiguous (merged) range stays fresh."""
+    def build(events, previous=None, overlap=True):
+        return gen.build_sections(events, _params(), [], [], [], [], [], {},
+                                  previous_sections=previous,
+                                  id_fn=_counter_id_fn(),
+                                  carry_by_overlap=overlap)
+
+    events = [_event("a", 2.0, "BURIAL_START"), _event("b", 5.0, "BURIAL_END"),
+              _event("c", 6.0, "BURIAL_START"), _event("d", 9.0, "BURIAL_END")]
+    previous = build(events)
+    by_range = {(s["kind"], s["start_kp"], s["end_kp"]): s for s in previous}
+    first = by_range[("burial", 2.0, 5.0)]
+    first["notes"] = "curated note"
+    first["conclusion"] = schema.CONCLUSION_NORMAL
+    first["tool_id"] = "T1"
+    mid_skip = by_range[("skip", 5.0, 6.0)]
+    mid_skip["notes"] = "skip note"
+
+    # Nudge the PLUP at 5.0 to 5.1: both adjacent sections change range but
+    # keep their assessment (and their section ids for a 1:1 match).
+    moved = [dict(e, kp=5.1 if e["event_id"] == "b" else e["kp"])
+             for e in events]
+    nudged = {(s["kind"], round(s["start_kp"], 3), round(s["end_kp"], 3)): s
+              for s in build(moved, previous)}
+    grown = nudged[("burial", 2.0, 5.1)]
+    shrunk = nudged[("skip", 5.1, 6.0)]
+    ok = grown["notes"] == "curated note"
+    ok = ok and grown["conclusion"] == schema.CONCLUSION_NORMAL
+    ok = ok and grown["tool_id"] == "T1"
+    ok = ok and grown["section_id"] == first["section_id"]
+    ok = ok and shrunk["notes"] == "skip note"
+    # The generation path (carry_by_overlap=False) keeps exact-match-only.
+    strict = {(s["kind"], round(s["start_kp"], 3), round(s["end_kp"], 3)): s
+              for s in build(moved, previous, overlap=False)}
+    ok = ok and strict[("burial", 2.0, 5.1)]["notes"] == ""
+    # Removing the b/c pair merges the burials: two same-kind overlaps are
+    # ambiguous, so the merged section stays fresh.
+    merged_events = [events[0], events[3]]
+    merged = {(s["kind"], round(s["start_kp"], 3), round(s["end_kp"], 3)): s
+              for s in build(merged_events, previous)}
+    ok = ok and merged[("burial", 2.0, 9.0)]["notes"] == ""
+    ok = ok and merged[("burial", 2.0, 9.0)]["conclusion"] == ""
+    return _result("overlap carry keeps assessments across boundary moves", ok)
+
+
 def test_fresh_existing_events() -> bool:
     events = [
         {"event_id": "a", "source": "auto", "status": "candidate"},
@@ -441,6 +494,7 @@ def run_all() -> list:
         test_determinism(),
         test_proposal_diff(),
         test_conclusion_carry_over(),
+        test_overlap_carry_over(),
         test_fresh_existing_events(),
         test_assign_skip_handling(),
         test_manual_burial_across_exclusion_is_flagged(),

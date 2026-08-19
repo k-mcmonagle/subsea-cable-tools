@@ -44,6 +44,7 @@ _BUILDER_UNDO_ACTIONS = {
     change_log.ACTION_SPLIT_SECTION,
     change_log.ACTION_INSERT_SECTION,
     change_log.ACTION_MERGE_SECTIONS,
+    change_log.ACTION_DELETE_SECTION,
     change_log.ACTION_SET_CONCLUSION,
     change_log.ACTION_EDIT_SECTION,
 }
@@ -1019,12 +1020,21 @@ class PlanModel(QObject):
                 float(self.plan.get("scope_end_kp") or 0.0))
 
     def _write_events_and_sections(self, action: str, target_id: str,
-                                   new_events: List[Dict], reason: str) -> bool:
+                                   new_events: List[Dict], reason: str,
+                                   note_specs: Optional[List[Tuple[
+                                       float, Callable[[str], str]]]] = None
+                                   ) -> bool:
         """One logged, store-written event mutation + derived section rebuild.
 
         Events, sections and the change-log entry commit together (one
         transaction in SQL mode) so a failure can never leave events moved
         with sections still describing the old boundaries.
+
+        ``note_specs`` are ``(kp, apply)`` pairs: after the sections are
+        re-derived, ``apply(existing_notes)`` rewrites the Notes of every
+        section containing that KP — the mechanism behind the automatic
+        audit notes in the Plan Builder Notes columns. A KP sitting exactly
+        on a boundary annotates both adjacent sections.
         """
         before = {
             schema.TABLE_EVENT: [dict(e) for e in self.events],
@@ -1032,6 +1042,16 @@ class PlanModel(QObject):
         }
         new_events = ev.sort_events(new_events, self.direction)
         new_sections = self._derive_sections(new_events)
+        tol = 1e-6
+        for kp, apply_fn in note_specs or []:
+            for section in new_sections:
+                try:
+                    lo = float(section.get("start_kp"))
+                    hi = float(section.get("end_kp"))
+                except (TypeError, ValueError):
+                    continue
+                if lo - tol <= float(kp) <= hi + tol:
+                    section["notes"] = apply_fn(section.get("notes") or "")
 
         def write() -> None:
             self.store.save_events(self.plan_id, new_events)
@@ -1061,7 +1081,10 @@ class PlanModel(QObject):
             events, params, self.context.excluded, self.context.screening,
             self.context.influence, self.context.insufficient,
             self.context.dropped_short, rule_names,
-            previous_sections=self.sections, plan_id=self.plan_id)
+            previous_sections=self.sections, plan_id=self.plan_id,
+            # Interactive edits move boundaries deliberately; the adjacent
+            # sections' notes/conclusions/tools must survive the rebuild.
+            carry_by_overlap=True)
 
     def _active_params(self) -> Dict:
         active = self.store.active_generation(self.plan_id)
@@ -1110,15 +1133,28 @@ class PlanModel(QObject):
                                 self.direction, self.method)
         if message:
             raise ValueError(message)
+        old_kp = float(target.get("kp") or 0.0)
+        label = ev.event_label(target.get("event_type") or "", self.method)
+        # "moved" is the confirmation dialog's fallback, not a real reason.
+        note_reason = "" if reason in ("", "moved") else reason
         moved = []
         for event in self.events:
             copy = dict(event)
             if copy.get("event_id") == event_id:
                 copy["kp"] = float(new_kp)
+                copy["notes"] = ev.upsert_move_note(
+                    copy.get("notes") or "", label, old_kp, new_kp,
+                    note_reason)
                 self._stamp_position(copy)
             moved.append(copy)
+        # The new KP sits exactly on the shared boundary, so this annotates
+        # both adjacent sections; move chains coalesce into one note.
+        note_specs = [(float(new_kp),
+                       lambda existing: ev.upsert_move_note(
+                           existing, label, old_kp, new_kp, note_reason))]
         return self._write_events_and_sections(change_log.ACTION_MOVE_EVENT,
-                                               event_id, moved, reason)
+                                               event_id, moved, reason,
+                                               note_specs)
 
     def delete_event(self, event_id: str, reason: str = "") -> bool:
         return self.delete_events([event_id], reason)
@@ -1138,9 +1174,19 @@ class PlanModel(QObject):
             remaining, lo, hi, self.direction, self.method)
         if result.errors:
             raise ValueError(result.errors[0])
+        note_specs = []
+        for event in self.events:
+            if str(event.get("event_id") or "") not in wanted:
+                continue
+            kp = float(event.get("kp") or 0.0)
+            text = ev.audit_note(
+                f"{ev.event_label(event.get('event_type') or '', self.method)}"
+                f" at KP {schema.format_kp(kp)} deleted", reason)
+            note_specs.append(
+                (kp, lambda existing, t=text: ev.append_note(existing, t)))
         return self._write_events_and_sections(change_log.ACTION_DELETE_EVENT,
                                                ",".join(sorted(wanted)),
-                                               remaining, reason)
+                                               remaining, reason, note_specs)
 
     def set_event_status(self, event_ids: List[str], status: str,
                          action: str = change_log.ACTION_CONFIRM_EVENT) -> bool:
@@ -1302,8 +1348,17 @@ class PlanModel(QObject):
             candidate, scope_lo, scope_hi, self.direction, self.method)
         if result.errors:
             raise ValueError(result.errors[0])
+        inserted_kind = (schema.SECTION_SKIP
+                         if section.get("kind") == schema.SECTION_BURIAL
+                         else schema.SECTION_BURIAL)
+        text = ev.audit_note(
+            f"{schema.section_kind_label(inserted_kind, self.method)} KP "
+            f"{schema.format_kp(lo)}-{schema.format_kp(hi)} inserted", reason)
+        note_specs = [((lo + hi) / 2.0,
+                       lambda existing: ev.append_note(existing, text))]
         return self._write_events_and_sections(
-            change_log.ACTION_INSERT_SECTION, section_id, candidate, reason)
+            change_log.ACTION_INSERT_SECTION, section_id, candidate, reason,
+            note_specs)
 
     def split_section_at(self, section_id: str, kp: float, reason: str = "") -> bool:
         """Compatibility helper: insert a visible 1 m opposite-kind range."""
@@ -1320,15 +1375,99 @@ class PlanModel(QObject):
 
     def merge_sections(self, section_ids: List[str], reason: str = "") -> bool:
         """Merge selected burial sections or selected skips."""
-        remaining, _removed, _kind = ev.merge_section_events(
+        remaining, _removed, kind = ev.merge_section_events(
             self.events, self.sections, section_ids, self.method)
         lo, hi = self._scope_bounds()
         result = ev.validate_events(
             remaining, lo, hi, self.direction, self.method)
         if result.errors:
             raise ValueError(result.errors[0])
+        wanted = {str(section_id) for section_id in section_ids if section_id}
+        selected = [s for s in self.sections
+                    if str(s.get("section_id") or "") in wanted]
+        span_lo = min(float(s.get("start_kp") or 0.0) for s in selected)
+        span_hi = max(float(s.get("end_kp") or 0.0) for s in selected)
+        audit = ev.audit_note(
+            f"{len(selected)} {schema.section_kind_label(kind, self.method)} "
+            f"sections merged KP {schema.format_kp(span_lo)}-"
+            f"{schema.format_kp(span_hi)}", reason)
+        note_specs = [((span_lo + span_hi) / 2.0,
+                       self._fold_notes_fn(span_lo, span_hi, audit))]
         return self._write_events_and_sections(
-            change_log.ACTION_MERGE_SECTIONS, ",".join(section_ids), remaining, reason)
+            change_log.ACTION_MERGE_SECTIONS, ",".join(section_ids),
+            remaining, reason, note_specs)
+
+    def delete_section(self, section_id: str, reason: str = "") -> bool:
+        """Delete a burial section or skip outright.
+
+        Its boundary events are removed and the neighbouring sections merge
+        into one; the notes of the removed section and its neighbours are
+        folded into the merged section together with an audit note naming
+        the removed KP range.
+        """
+        remaining, _removed, section = ev.delete_section_events(
+            self.events, self.sections, section_id, self.method)
+        lo, hi = self._scope_bounds()
+        result = ev.validate_events(
+            remaining, lo, hi, self.direction, self.method)
+        if result.errors:
+            raise ValueError(result.errors[0])
+        start = float(section.get("start_kp") or 0.0)
+        end = float(section.get("end_kp") or 0.0)
+        audit = ev.audit_note(
+            f"{schema.section_kind_label(section.get('kind') or '', self.method)}"
+            f" KP {schema.format_kp(start)}-{schema.format_kp(end)} removed, "
+            "neighbours merged", reason)
+        # The neighbours either side merge into the survivor, so the notes
+        # fold spans from the left neighbour's start to the right one's end.
+        span_lo, span_hi = start, end
+        for other in self.sections:
+            try:
+                other_lo = float(other.get("start_kp"))
+                other_hi = float(other.get("end_kp"))
+            except (TypeError, ValueError):
+                continue
+            if abs(other_hi - start) <= 1e-6:
+                span_lo = min(span_lo, other_lo)
+            if abs(other_lo - end) <= 1e-6:
+                span_hi = max(span_hi, other_hi)
+        note_specs = [((start + end) / 2.0,
+                       self._fold_notes_fn(span_lo, span_hi, audit))]
+        return self._write_events_and_sections(
+            change_log.ACTION_DELETE_SECTION, section_id, remaining, reason,
+            note_specs)
+
+    def _fold_notes_fn(self, span_lo: float, span_hi: float,
+                       audit: str) -> Callable[[str], str]:
+        """Notes rewriter folding the manual notes of every current section
+        strictly inside ``[span_lo, span_hi]`` into the target, then
+        appending the audit note. Sections replaced by a merge/delete lose
+        their rows, so their notes would otherwise silently disappear;
+        sections that merely touch the span boundary survive unchanged and
+        keep their own notes."""
+        tol = 1e-6
+        old_notes: List[str] = []
+        for section in sorted(self.sections,
+                              key=lambda s: float(s.get("start_kp") or 0.0)):
+            try:
+                lo = float(section.get("start_kp"))
+                hi = float(section.get("end_kp"))
+            except (TypeError, ValueError):
+                continue
+            if hi <= span_lo + tol or lo >= span_hi - tol:
+                continue
+            note = (section.get("notes") or "").strip()
+            if note:
+                old_notes.append(note)
+
+        def apply(existing: str) -> str:
+            out = existing
+            for note in old_notes:
+                if note not in out:
+                    out = ev.append_note(out, note)
+            return ev.append_note(out, audit)
+
+        return apply
 
     # -- generation ----------------------------------------------------------
     def apply_generation(self, output: generation.GenerationOutput,

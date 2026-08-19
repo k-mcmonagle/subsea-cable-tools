@@ -17,12 +17,14 @@ Invariants enforced here (spec §13):
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from . import schema
 
 _KP_TOL = 5e-7  # km (~0.5 mm) — comparisons on stored floats
+_BOUNDARY_TOL = 1e-6  # km — matching an event to a section boundary
 
 
 def event_label(event_type: str, method: str) -> str:
@@ -266,3 +268,116 @@ def opposite_section_boundary_specs(section_kind: str, start_kp: float,
              if section_kind == schema.SECTION_BURIAL
              else (schema.EVENT_BURIAL_START, schema.EVENT_BURIAL_END))
     return list(zip(types, travel_kps))
+
+
+def delete_section_events(events: List[Dict], sections: List[Dict],
+                          section_id: str, method: str = ""
+                          ) -> Tuple[List[Dict], List[str], Dict]:
+    """Remove a section's boundary events so its neighbours merge into one.
+
+    Deleting a skip removes its bounding BURIAL_END/BURIAL_START pair and
+    the burial sections either side become one; deleting a burial section
+    removes its own pair and the surrounding skips merge. Only interior
+    sections qualify: a boundary without an event is the plan scope edge,
+    where there is no second neighbour to merge with.
+    Returns ``(remaining_events, removed_event_ids, section)``.
+    """
+    section = next((s for s in sections
+                    if str(s.get("section_id") or "") == str(section_id)), None)
+    if section is None:
+        raise ValueError("Section not found.")
+    kind = section.get("kind") or ""
+    if kind not in (schema.SECTION_BURIAL, schema.SECTION_SKIP):
+        raise ValueError(
+            "Insufficient Information sections cannot be deleted — they "
+            "reflect missing data coverage, not boundary events.")
+    start = float(section.get("start_kp") or 0.0)
+    end = float(section.get("end_kp") or 0.0)
+    removed: List[str] = []
+    remaining: List[Dict] = []
+    has_start = has_end = False
+    for event in events:
+        kp = float(event.get("kp") or 0.0)
+        if start - _BOUNDARY_TOL <= kp <= end + _BOUNDARY_TOL:
+            if int(event.get("locked") or 0):
+                raise ValueError(
+                    f"{event_label(event.get('event_type') or '', method)} at "
+                    f"KP {schema.format_kp(kp)} is locked — unlock it before "
+                    "deleting the section.")
+            has_start = has_start or abs(kp - start) <= _BOUNDARY_TOL
+            has_end = has_end or abs(kp - end) <= _BOUNDARY_TOL
+            removed.append(str(event.get("event_id") or ""))
+        else:
+            remaining.append(dict(event))
+    if not (has_start and has_end):
+        missing = schema.format_kp(end if has_start else start)
+        raise ValueError(
+            f"The section boundary at KP {missing} has no boundary event "
+            "(the plan scope edge or an Insufficient Information boundary), "
+            "so there is no neighbour on that side to merge with. Move the "
+            "other boundary event instead, or adjust the plan scope on "
+            "Inputs.")
+    return remaining, removed, section
+
+
+# -- notes ---------------------------------------------------------------
+# Automatic audit notes appended to the Plan Builder Notes columns. They are
+# plain editable text: "[...]" marks machine-appended context, "; " joins
+# entries, and reasons are sanitised so a note can never break the pattern.
+
+_NOTE_SEP = "; "
+
+
+def _clean_reason(reason: str) -> str:
+    return (reason or "").replace("[", "(").replace("]", ")").strip()
+
+
+def append_note(existing: str, addition: str) -> str:
+    """Join a new note onto existing notes without disturbing them."""
+    existing = (existing or "").strip()
+    addition = (addition or "").strip()
+    if not addition:
+        return existing
+    if not existing:
+        return addition
+    return existing + _NOTE_SEP + addition
+
+
+def audit_note(text: str, reason: str = "") -> str:
+    """One bracketed audit entry, e.g. ``[skip KP 2.000-3.000 removed: r]``."""
+    reason = _clean_reason(reason)
+    return f"[{text}: {reason}]" if reason else f"[{text}]"
+
+
+def upsert_move_note(existing: str, label: str, old_kp, new_kp,
+                     reason: str = "") -> str:
+    """Append a boundary-move audit note, coalescing move chains.
+
+    Repeated moves of the same event (e.g. successive nudges) collapse into
+    one ``[<label> moved KP <origin>→<final>]`` entry instead of a trail: an
+    existing entry ending at ``old_kp`` is replaced, keeping its origin KP
+    and the latest reason.
+    """
+    existing = (existing or "").strip()
+    old_text = schema.format_kp(old_kp)
+    new_text = schema.format_kp(new_kp)
+    origin = old_text
+    pattern = re.compile(
+        r"\[" + re.escape(label) + r" moved KP (\d+(?:\.\d+)?)→"
+        + re.escape(old_text) + r"(?::[^\]]*)?\]")
+    match = pattern.search(existing)
+    if match:
+        origin = match.group(1)
+        head, tail = existing[:match.start()], existing[match.end():]
+        # Absorb one adjacent separator so a mid-string removal cannot
+        # leave "a; ; b" behind.
+        if tail.startswith(_NOTE_SEP):
+            tail = tail[len(_NOTE_SEP):]
+        elif head.endswith(_NOTE_SEP):
+            head = head[:-len(_NOTE_SEP)]
+        existing = (head + tail).strip()
+    if origin == new_text:
+        # The chain returned to its origin — drop the note entirely.
+        return existing
+    return append_note(existing, audit_note(
+        f"{label} moved KP {origin}→{new_text}", reason))
