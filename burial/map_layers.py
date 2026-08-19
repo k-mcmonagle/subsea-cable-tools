@@ -615,7 +615,10 @@ def set_active_plan_layers(project: Optional[QgsProject], plan: Dict) -> None:
                  plan.get("plan_id") or "")
     active = {schema.sections_layer_name(*base_args),
               schema.events_layer_name(*base_args),
-              schema.hazards_layer_name(*base_args)}
+              schema.hazards_layer_name(*base_args),
+              schema.tool_path_layer_name(*base_args),
+              schema.barge_track_layer_name(*base_args),
+              schema.path_issues_layer_name(*base_args)}
     for node in group.findLayers():
         layer = node.layer()
         if layer is None:
@@ -635,7 +638,10 @@ def remove_plan_layers(project: Optional[QgsProject], gpkg_path: str, plan: Dict
                  plan.get("plan_id") or "")
     for name in (schema.sections_layer_name(*base_args),
                  schema.events_layer_name(*base_args),
-                 schema.hazards_layer_name(*base_args)):
+                 schema.hazards_layer_name(*base_args),
+                 schema.tool_path_layer_name(*base_args),
+                 schema.barge_track_layer_name(*base_args),
+                 schema.path_issues_layer_name(*base_args)):
         layer = find_layer(project, gpkg_path, name)
         if layer is not None:
             project.removeMapLayer(layer.id())
@@ -650,7 +656,10 @@ def _burial_layer_name(source: str) -> str:
         key, sep, value = part.partition("=")
         if sep and key.lower() == "layername" and value.startswith("bp_") \
                 and (value.endswith("_sections") or value.endswith("_events")
-                     or value.endswith("_hazards")):
+                     or value.endswith("_hazards")
+                     or value.endswith("_tool_path")
+                     or value.endswith("_barge_track")
+                     or value.endswith("_path_issues")):
             return value
     return ""
 
@@ -726,6 +735,15 @@ def restore_burial_layers(project: Optional[QgsProject] = None) -> int:
                     style_fn = apply_sections_style
                 elif name.endswith("_hazards"):
                     style_fn = apply_hazards_style
+                elif name.endswith("_tool_path"):
+                    from .path_layers import apply_tool_path_style
+                    style_fn = apply_tool_path_style
+                elif name.endswith("_barge_track"):
+                    from .path_layers import apply_barge_track_style
+                    style_fn = apply_barge_track_style
+                elif name.endswith("_path_issues"):
+                    from .path_layers import apply_path_issues_style
+                    style_fn = apply_path_issues_style
                 else:
                     style_fn = apply_events_style
                 style_fn(layer)

@@ -14,6 +14,7 @@ progress and a working Stop (resumable) — QGIS stays usable throughout. No
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Dict, List, Optional
 
@@ -21,6 +22,7 @@ from qgis.core import (
     QgsApplication,
     QgsCoordinateTransform,
     QgsGeometry,
+    QgsPointXY,
     QgsProject,
 )
 from qgis.gui import QgsVertexMarker, QgsRubberBand
@@ -72,7 +74,8 @@ from ..qgis_compat import (
 from ..workbench import project_layers as wb_project_layers
 from ..workbench import store as wb_store_module
 from ..workbench.store import WorkbenchStore
-from . import analysis_task, footprint, generation, map_layers, profile_data, schema
+from . import (analysis_task, footprint, generation, map_layers, path_data,
+               profile_data, schema)
 from . import tools as tools_mod
 from . import ui_helpers
 from .plan_model import PlanModel
@@ -86,6 +89,7 @@ from .store import (
 from .tabs.builder_tab import BuilderTab
 from .tabs.inputs_tab import InputsTab
 from .tabs.plan_tab import PlanTab
+from .tabs.paths_tab import PathsTab
 from .tabs.profile_tab import ProfileTab
 from .tabs.review_tab import ReviewTab
 from .tabs.risk_tab import RiskTab
@@ -141,7 +145,12 @@ class BurialPlannerDock(QDockWidget):
         self._marker = None
         self._band = None
         self._footprint_band = None
+        self._vessel_band = None
         self._footprint_cache: Dict[str, object] = {}  # tool_id -> QgsGeometry
+        # path_id -> (tool path points, barge points) parsed from the
+        # persisted WKT; vessel_id -> outline QgsGeometry.
+        self._path_points_cache: Dict[str, object] = {}
+        self._vessel_outline_cache: Dict[str, object] = {}
         self._exclusion_bands: List = []
         self._pick_tool = None
         self._store_recovery_note = ""
@@ -177,6 +186,7 @@ class BurialPlannerDock(QDockWidget):
         self.profile_tab = ProfileTab(self.model, self)
         self.rules_tab = RulesTab(self.model, self)
         self.risk_tab = RiskTab(self.model, self)
+        self.paths_tab = PathsTab(self.model, self)
         self.builder_tab = BuilderTab(self.model, self)
         self.review_tab = ReviewTab(self.model, self)
         self.tabs.addTab(self.plan_tab, "Plan")
@@ -185,6 +195,7 @@ class BurialPlannerDock(QDockWidget):
         self.tabs.addTab(self.profile_tab, "Bathymetry Profile")
         self.tabs.addTab(self.rules_tab, "Exclusions")
         self.tabs.addTab(self.risk_tab, "Risk Profile")
+        self.tabs.addTab(self.paths_tab, "Installation Paths")
         self.tabs.addTab(self.builder_tab, "Plan Builder")
         self.tabs.addTab(self.review_tab, "Review && Export")
         # Workflow badges: these tabs gain a " ⚠" suffix (and a tooltip)
@@ -251,7 +262,9 @@ class BurialPlannerDock(QDockWidget):
             "scale, at the hovered/selected profile KP — instant scale "
             "context for seabed features. Uses the section's tool (or the "
             "plan default); the tool needs a DXF footprint registered on "
-            "the Burial Tools tab.")
+            "the Burial Tools tab. When Installation Paths are generated "
+            "the outline rides the tool path, and the selected vessel's "
+            "outline (if imported) rides the barge track at the tow point.")
         self.footprint_toggle.toggled.connect(self._footprint_toggled)
         view_menu.addSeparator()
         view_menu.addAction("Export profile image…",
@@ -298,6 +311,8 @@ class BurialPlannerDock(QDockWidget):
         self.model.planChanged.connect(self.clear_exclusion_preview)
         self.model.planChanged.connect(self._clear_footprint_cache)
         self.model.toolsChanged.connect(self._clear_footprint_cache)
+        self.model.pathsChanged.connect(self._clear_footprint_cache)
+        self.model.vesselsChanged.connect(self._clear_footprint_cache)
         self.model.eventsChanged.connect(self._refresh_profile_events)
         self.model.sectionsChanged.connect(self._refresh_profile_sections)
         self.model.inputsChanged.connect(self._refresh_profile)
@@ -359,6 +374,12 @@ class BurialPlannerDock(QDockWidget):
                 "An exclusion analysis is still running. Stop it and wait "
                 "for it to finish before changing the plan file.")
             return False
+        if getattr(self.paths_tab, "is_running", lambda: False)():
+            QMessageBox.information(
+                self, "Burial Planner",
+                "Installation path generation is still running. Stop it "
+                "and wait for it to finish before changing the plan file.")
+            return False
         self._cancel_profile_refresh(silent=True)
         try:
             self.store.close()  # checkpoint + release the old SQL handle
@@ -369,6 +390,7 @@ class BurialPlannerDock(QDockWidget):
         set_project_gpkg_path(path)
         self.model.store = store
         self.model.refresh_tools()  # the registry is per GeoPackage
+        self.model.refresh_layback_profiles()
         self.model.close_plan()
         self.refresh_plans()
         return True
@@ -520,6 +542,10 @@ class BurialPlannerDock(QDockWidget):
                 # written (e.g. a fresh duplicate) — build them now instead
                 # of showing an empty map until the first edit.
                 self.model.refresh_layers(immediate=True)
+            if self.model.path_result:
+                # Path WKT is authoritative in the registry; rebuildable
+                # spatial layers may not yet exist after a file move/copy.
+                self.model.refresh_path_layers()
             # The map follows the selector: show this plan's layers, hide
             # the other plans' (still in the project, just unchecked).
             map_layers.set_active_plan_layers(QgsProject.instance(),
@@ -1333,67 +1359,166 @@ class BurialPlannerDock(QDockWidget):
         if not checked:
             self._hide_footprint()
 
-    def _hide_footprint(self) -> None:
-        if self._footprint_band is not None \
-                and not _sip_isdeleted(self._footprint_band):
+    @staticmethod
+    def _hide_band(band) -> None:
+        if band is not None and not _sip_isdeleted(band):
             try:
-                self._footprint_band.hide()
+                band.hide()
             except (AttributeError, RuntimeError):
                 pass
 
+    def _hide_footprint(self) -> None:
+        self._hide_band(self._footprint_band)
+        self._hide_band(self._vessel_band)
+
     def _clear_footprint_cache(self) -> None:
         self._footprint_cache = {}
+        self._path_points_cache = {}
+        self._vessel_outline_cache = {}
         self._hide_footprint()
 
-    def _ensure_footprint_band(self, geom_type):
-        band = self._footprint_band
+    def _ensure_outline_band(self, attr: str, geom_type, color: QColor):
+        band = getattr(self, attr)
         if band is None or _sip_isdeleted(band) \
                 or getattr(band, "_bp_geom_type", None) != geom_type:
             if band is not None:
                 _remove_canvas_item(band)
             band = QgsRubberBand(self.canvas, geom_type)
-            band.setStrokeColor(QColor(31, 119, 180))
-            band.setFillColor(QColor(31, 119, 180, 60))
+            band.setStrokeColor(color)
+            band.setFillColor(QColor(color.red(), color.green(),
+                                     color.blue(), 60))
             band.setWidth(2)
             band._bp_geom_type = geom_type
-            self._footprint_band = band
+            setattr(self, attr, band)
         return band
 
+    def _ensure_footprint_band(self, geom_type):
+        return self._ensure_outline_band("_footprint_band", geom_type,
+                                         QColor(31, 119, 180))
+
+    def _path_display_points(self):
+        """(tool path points, barge points) parsed from the saved result."""
+        result = self.model.path_result or {}
+        path_id = str(result.get("path_id") or "")
+        if not path_id or not result.get("tool_path_wkt"):
+            return [], []
+        cached = self._path_points_cache.get(path_id)
+        if cached is None:
+            cached = (path_data.parse_linestring_wkt(
+                          result.get("tool_path_wkt") or ""),
+                      path_data.parse_linestring_wkt(
+                          result.get("barge_track_wkt") or ""))
+            self._path_points_cache = {path_id: cached}
+        return cached
+
+    def _nearest_path_index(self, points, kp: float) -> Optional[int]:
+        if len(points) < 2:
+            return None
+        anchor = self.model.route.point_at_kp(float(kp), clamp=True)
+        if anchor is None:
+            return None
+        ax, ay = float(anchor.x()), float(anchor.y())
+        # Longitude compression: adequate for nearest-vertex picking at the
+        # sub-kilometre offsets an installation path can reach.
+        scale = max(0.05, math.cos(math.radians(min(89.0, abs(ay)))))
+        return min(range(len(points)), key=lambda i: (
+            ((points[i][0] - ax) * scale) ** 2 + (points[i][1] - ay) ** 2))
+
+    @staticmethod
+    def _polyline_pose(points, index: int):
+        """(anchor, before, after) WGS84 triplet at a polyline vertex."""
+        anchor = QgsPointXY(points[index][0], points[index][1])
+        before = QgsPointXY(*points[max(0, index - 1)])
+        after = QgsPointXY(*points[min(len(points) - 1, index + 1)])
+        return anchor, before, after
+
+    def _place_body_outline(self, outline, pose, dest_crs):
+        try:
+            geom, _heading = footprint.place_outline_at(
+                outline, *pose, target_crs=dest_crs)
+        except Exception:
+            return None
+        return None if geom is None or geom.isEmpty() else geom
+
     def _update_footprint(self, kp: float) -> None:
-        """Draw the effective tool's footprint at kp (scale context)."""
+        """Draw the effective tool (and towing vessel) outline at kp.
+
+        A saved installation path takes precedence: the tool outline rides
+        the generated tool path and the vessel outline rides the barge track
+        at the matching tow point.  Without a path the tool outline falls
+        back to the RPL, as before.
+        """
         if not self.footprint_toggle.isChecked() or self.canvas is None \
                 or self.model.route is None:
             return
+        from ..qgis_compat import GEOMETRY_LINE, GEOMETRY_POLYGON
+
+        dest_crs = self.canvas.mapSettings().destinationCrs()
+        tool_points, barge_points = self._path_display_points()
+        anchor_index = self._nearest_path_index(tool_points, kp)
+
         tool = tools_mod.tool_at_kp(self.model.sections, self.model.plan,
                                     self.model.tools, kp)
         tool_id = str((tool or {}).get("tool_id") or "")
         wkt = str((tool or {}).get("footprint_wkt") or "")
-        if not tool_id or not wkt:
-            self._hide_footprint()
-            return
-        outline = self._footprint_cache.get(tool_id)
-        if outline is None:
-            outline = QgsGeometry.fromWkt(wkt)
-            self._footprint_cache[tool_id] = outline
-        if outline is None or outline.isNull() or outline.isEmpty():
-            self._hide_footprint()
-            return
-        try:
-            dest_crs = self.canvas.mapSettings().destinationCrs()
-            geom, _heading = footprint.place_outline(
-                outline, self.model.route, kp, target_crs=dest_crs)
-        except Exception:
-            geom = None
-        if geom is None or geom.isEmpty():
-            self._hide_footprint()
-            return
-        from ..qgis_compat import GEOMETRY_LINE, GEOMETRY_POLYGON
+        tool_shown = False
+        if tool_id and wkt:
+            outline = self._footprint_cache.get(tool_id)
+            if outline is None:
+                outline = QgsGeometry.fromWkt(wkt)
+                self._footprint_cache[tool_id] = outline
+            if outline is not None and not outline.isNull() \
+                    and not outline.isEmpty():
+                geom = None
+                if anchor_index is not None:
+                    geom = self._place_body_outline(
+                        outline, self._polyline_pose(tool_points,
+                                                     anchor_index), dest_crs)
+                if geom is None:
+                    try:
+                        geom, _heading = footprint.place_outline(
+                            outline, self.model.route, kp,
+                            target_crs=dest_crs)
+                    except Exception:
+                        geom = None
+                if geom is not None and not geom.isEmpty():
+                    geom_type = (GEOMETRY_LINE
+                                 if outline.type() == GEOMETRY_LINE
+                                 else GEOMETRY_POLYGON)
+                    band = self._ensure_footprint_band(geom_type)
+                    band.setToGeometry(geom, None)
+                    band.show()
+                    tool_shown = True
+        if not tool_shown:
+            self._hide_band(self._footprint_band)
 
-        geom_type = (GEOMETRY_LINE if outline.type() == GEOMETRY_LINE
-                     else GEOMETRY_POLYGON)
-        band = self._ensure_footprint_band(geom_type)
-        band.setToGeometry(geom, None)
-        band.show()
+        vessel_shown = False
+        if anchor_index is not None and anchor_index < len(barge_points):
+            vessel = self.model.vessel(str(
+                self.model.path_config().get("vessel_id") or ""))
+            vessel_id = str((vessel or {}).get("vessel_id") or "")
+            vessel_wkt = str((vessel or {}).get("footprint_wkt") or "")
+            if vessel_id and vessel_wkt:
+                outline = self._vessel_outline_cache.get(vessel_id)
+                if outline is None:
+                    outline = QgsGeometry.fromWkt(vessel_wkt)
+                    self._vessel_outline_cache[vessel_id] = outline
+                if outline is not None and not outline.isNull() \
+                        and not outline.isEmpty():
+                    geom = self._place_body_outline(
+                        outline, self._polyline_pose(barge_points,
+                                                     anchor_index), dest_crs)
+                    if geom is not None:
+                        geom_type = (GEOMETRY_LINE
+                                     if outline.type() == GEOMETRY_LINE
+                                     else GEOMETRY_POLYGON)
+                        band = self._ensure_outline_band(
+                            "_vessel_band", geom_type, QColor(122, 61, 184))
+                        band.setToGeometry(geom, None)
+                        band.show()
+                        vessel_shown = True
+        if not vessel_shown:
+            self._hide_band(self._vessel_band)
 
     def highlight_range(self, start_kp: float, end_kp: float):
         if self.canvas is None or self.model.route is None:
@@ -1552,6 +1677,7 @@ class BurialPlannerDock(QDockWidget):
                 self.model.store = store
                 self.model.workbench_store = self.workbench_store()
                 self.model.refresh_tools()  # the registry is per GeoPackage
+                self.model.refresh_layback_profiles()
                 self.model.close_plan()
             else:
                 self.store_ready = False
@@ -1570,6 +1696,10 @@ class BurialPlannerDock(QDockWidget):
         self._save_window_state()  # unload may bypass closeEvent
         try:
             self.cancel_analysis()
+        except (AttributeError, RuntimeError):
+            pass
+        try:
+            self.paths_tab.shutdown()
         except (AttributeError, RuntimeError):
             pass
         try:

@@ -114,6 +114,14 @@ def plan_default_tool(plan: Optional[Dict]) -> Tuple[str, str]:
             str(params.get("tool_config_id") or ""))
 
 
+def plan_default_config(plan: Optional[Dict], tools: Sequence[Dict]
+                        ) -> Tuple[Optional[Dict], Optional[Dict]]:
+    """Return the registered default tool and configuration rows."""
+    tool_id, config_id = plan_default_tool(plan)
+    tool = tool_by_id(tools, tool_id)
+    return tool, config_by_id(tool, config_id)
+
+
 def section_tool_display(section: Dict, plan: Optional[Dict],
                          tools: Sequence[Dict]) -> str:
     """The effective tool text for one section ("" when nothing is set).

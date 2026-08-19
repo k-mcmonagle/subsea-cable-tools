@@ -222,7 +222,10 @@ def build_report_html(plan: Dict,
                       now_utc: str = "",
                       hazards: Optional[Sequence[Dict]] = None,
                       risk_checks: Optional[Sequence[Dict]] = None,
-                      tools: Optional[Sequence[Dict]] = None) -> str:
+                      tools: Optional[Sequence[Dict]] = None,
+                      path_result: Optional[Dict] = None,
+                      path_state: Optional[Dict[str, str]] = None,
+                      path_vessel: Optional[Dict] = None) -> str:
     """Assemble the full report; pure formatting, no QGIS access."""
     method = schema.normalise_method(plan.get("method") or "")
     status = plan.get("status") or ""
@@ -305,6 +308,121 @@ def build_report_html(plan: Dict,
         parts.append("<h2>Longitudinal profile</h2>")
         parts.append(f"<img class='profile' alt='Bathymetry profile' "
                      f"src='data:image/png;base64,{encoded}'>")
+
+    # -- installation paths --------------------------------------------------
+    parts.append("<h2>Installation paths</h2>")
+    if path_result and path_result.get("tool_path_wkt"):
+        try:
+            path_summary = json.loads(path_result.get("summary_json") or "{}")
+        except (ValueError, TypeError):
+            path_summary = {}
+        try:
+            path_config = json.loads(path_result.get("config_json") or "{}")
+        except (ValueError, TypeError):
+            path_config = {}
+        try:
+            path_diagnostics = json.loads(
+                path_result.get("diagnostics_json") or "[]")
+        except (ValueError, TypeError):
+            path_diagnostics = []
+        state = path_state or {}
+        objective = {
+            "fillet": "Tangent circular fillets",
+            "through_ac": "Pass through every course change",
+        }.get(path_config.get("mode"), path_config.get("mode") or "—")
+        if path_summary.get("radius_rules_count"):
+            radius_text = (
+                f"{_num(path_summary.get('radius_min_m'), 1)} – "
+                f"{_num(path_summary.get('radius_max_m'), 1)} m "
+                f"(depth-based, "
+                f"{int(path_summary.get('radius_rules_count') or 0)} band(s); "
+                f"tool floor {_num(path_summary.get('radius_m'), 1)} m)")
+        else:
+            radius_text = f"{_num(path_summary.get('radius_m'), 1)} m"
+        vessel_radius = 0.0
+        try:
+            vessel_radius = float(
+                (path_vessel or {}).get("min_turn_radius_m") or 0.0)
+        except (TypeError, ValueError):
+            vessel_radius = 0.0
+        if not path_summary.get("barge_generated"):
+            vessel_check = "no barge track generated"
+        elif path_summary.get("barge_min_radius_m") is None:
+            vessel_check = "the barge track is straight"
+        elif vessel_radius <= 0.0:
+            vessel_check = (
+                f"tightest barge turn "
+                f"{_num(path_summary.get('barge_min_radius_m'), 0)} m "
+                "(no vessel minimum turning radius registered)")
+        else:
+            track_radius = float(path_summary.get("barge_min_radius_m"))
+            name = (path_vessel or {}).get("name") or "vessel"
+            if track_radius + 1e-6 < vessel_radius:
+                vessel_check = (
+                    f"EXCEEDED — tightest barge turn {_num(track_radius, 0)} "
+                    f"m is inside {name}'s {_num(vessel_radius, 0)} m "
+                    "minimum")
+            else:
+                vessel_check = (
+                    f"OK — tightest barge turn {_num(track_radius, 0)} m ≥ "
+                    f"{name} minimum {_num(vessel_radius, 0)} m")
+        depth_diff_worst = path_summary.get("depth_diff_worst_m")
+        path_meta = [
+            ("Generated", path_result.get("generated_utc") or "—"),
+            ("Tool-path state", state.get("tool") or "unknown"),
+            ("Barge-track state", state.get("barge") or "missing"),
+            ("Objective", objective),
+            ("Tool", path_summary.get("tool") or "—"),
+            ("Minimum turning radius", radius_text),
+            ("Tool-path length", f"{_num(path_summary.get('length_m'), 1)} m"),
+            ("Maximum / RMS RPL offset",
+             f"{_num(path_summary.get('max_offset_m'), 1)} / "
+             f"{_num(path_summary.get('rms_offset_m'), 1)} m"),
+            ("Course changes",
+             str(path_summary.get("course_change_count") or 0)),
+            ("Compound clusters",
+             str(path_summary.get("compound_cluster_count") or 0)),
+            ("Layback profile", path_summary.get("layback_name") or "—"),
+            ("Layback range",
+             (f"{_num(path_summary.get('layback_min_m'), 1)} – "
+              f"{_num(path_summary.get('layback_max_m'), 1)} m")
+             if path_summary.get("barge_generated") else "not generated"),
+            ("Barge-track length",
+             f"{_num(path_summary.get('barge_length_m'), 1)} m"
+             if path_summary.get("barge_generated") else "—"),
+            ("Vessel turn check", vessel_check),
+            ("Worst path-vs-RPL depth difference",
+             f"{float(depth_diff_worst):+.1f} m"
+             if depth_diff_worst is not None else "not sampled"),
+        ]
+        parts.append("<p class='meta'>" + "<br>".join(
+            f"<b>{_esc(key)}:</b> {_esc(value)}"
+            for key, value in path_meta) + "</p>")
+        parts.append(
+            "<p class='muted'>Bounded-curvature planning geometry only: "
+            "constant-radius joins may change curvature abruptly. The barge "
+            "track is a horizontal tow-point offset and is not a dynamic "
+            "tow/catenary/current simulation.</p>")
+        diagnostic_rows = []
+        for item in path_diagnostics if isinstance(path_diagnostics, list) else []:
+            depth_diff = item.get("depth_diff_m")
+            diagnostic_rows.append((
+                _kp(item.get("kp")), _num(item.get("turn_deg"), 2),
+                item.get("side") or "", item.get("solution") or "",
+                _num(item.get("radius_m"), 0),
+                _num(item.get("miss_m"), 2),
+                _num(item.get("max_offset_m"), 2),
+                (f"{float(depth_diff):+.1f}" if depth_diff is not None
+                 else "—"),
+                item.get("status") or "", item.get("message") or ""))
+        if diagnostic_rows:
+            parts.append(_table(
+                ("KP", "Course change (°)", "Side", "Solution", "Radius (m)",
+                 "Vertex miss (m)", "Cluster offset (m)", "Depth Δ (m)",
+                 "Status", "Message"),
+                diagnostic_rows))
+    else:
+        parts.append("<p class='muted'>No installation path has been generated.</p>")
 
     # -- sections -------------------------------------------------------------
     parts.append("<h2>Sections</h2>")

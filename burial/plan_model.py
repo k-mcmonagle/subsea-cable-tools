@@ -27,7 +27,8 @@ from qgis.PyQt.QtCore import QObject, QTimer, pyqtSignal
 
 from ..workbench.depth_service import DepthService, DepthSourceConfig
 from ..workbench.rules_engine import Interval
-from . import change_log, events as ev, generation, io_csv, map_layers, risk, schema, tools
+from . import (change_log, events as ev, generation, io_csv, map_layers,
+               path_data, path_layers, risk, schema, tools)
 from .analysis_task import build_route_frame
 from .profile_data import PlanProfile
 from .store import BurialStore
@@ -56,6 +57,9 @@ class PlanModel(QObject):
     sectionsChanged = pyqtSignal()
     riskChanged = pyqtSignal()       # risk checks and/or hazards
     toolsChanged = pyqtSignal()      # project-scoped Burial Tools registry
+    pathsChanged = pyqtSignal()      # result and/or its current/stale state
+    laybacksChanged = pyqtSignal()   # project-scoped layback profiles
+    vesselsChanged = pyqtSignal()    # project-scoped vessel registry
     logChanged = pyqtSignal()
     storeError = pyqtSignal(str)
 
@@ -71,6 +75,9 @@ class PlanModel(QObject):
         self.risk_checks: List[Dict] = []
         self.hazards: List[Dict] = []
         self.tools: List[Dict] = []  # project-scoped, survives close_plan
+        self.layback_profiles: List[Dict] = []  # project-scoped
+        self.vessels: List[Dict] = []           # project-scoped
+        self.path_result: Optional[Dict] = None
         self.context = generation.ResolutionContext()
         self.route = None            # RouteFrame over the plan's RPL (WGS84)
         self.distance = None
@@ -91,6 +98,7 @@ class PlanModel(QObject):
         self._depth_config_cache: Optional[Tuple[str, DepthSourceConfig]] = None
         self._profile_cache_key: Optional[Tuple[str, str, str]] = None
         self.refresh_tools(emit=False)
+        self.refresh_layback_profiles(emit=False)
 
     # -- store write wrapper (Planner pattern) -------------------------------
     def _store_write(self, action: str, func: Callable, *args, **kwargs):
@@ -170,6 +178,7 @@ class PlanModel(QObject):
         self.sections = self.store.list_sections(plan_id)
         self.risk_checks = self.store.list_risk_checks(plan_id)
         self.hazards = self.store.list_hazards(plan_id)
+        self.path_result = self.store.get_path_result(plan_id)
         self.acq_cache.clear()
         self._load_profile(plan_id)
         self._load_context()
@@ -181,6 +190,7 @@ class PlanModel(QObject):
         self.eventsChanged.emit()
         self.sectionsChanged.emit()
         self.riskChanged.emit()
+        self.pathsChanged.emit()
         return True
 
     def _load_profile(self, plan_id: str) -> None:
@@ -208,6 +218,7 @@ class PlanModel(QObject):
         self.sections = []
         self.risk_checks = []
         self.hazards = []
+        self.path_result = None
         self.context = generation.ResolutionContext()
         self.route = None
         self.resolved_rpl_id = ""
@@ -217,6 +228,7 @@ class PlanModel(QObject):
         self._profile_cache_key = None
         self._depth_config_cache = None
         self.planChanged.emit()
+        self.pathsChanged.emit()
 
     def _load_context(self) -> None:
         self.context = generation.ResolutionContext()
@@ -456,6 +468,9 @@ class PlanModel(QObject):
         if ok:
             self.bathy_profile = profile
             self._profile_cache_key = None  # reparse on next plan load
+            if self.path_result:
+                self.refresh_path_layers()
+                self.pathsChanged.emit()
         return ok
 
     def _stamp_position(self, event: Dict) -> None:
@@ -527,10 +542,161 @@ class PlanModel(QObject):
         # The sections map layer bakes the resolved tool text in at write
         # time — re-write it so renames/deletes show on the map too.
         self.refresh_layers(parts=("sections",))
+        if self.path_result:
+            self.refresh_path_layers()
+        self.pathsChanged.emit()
 
     def default_tool(self) -> Tuple[str, str]:
         """The plan's default (tool_id, tool_config_id)."""
         return tools.plan_default_tool(self.plan)
+
+    # -- installation paths -------------------------------------------------
+    def refresh_layback_profiles(self, emit: bool = True) -> None:
+        try:
+            self.layback_profiles = self.store.list_layback_profiles()
+        except Exception as exc:
+            self.storeError.emit(
+                f"The layback profile registry could not be read:\n"
+                f"{getattr(self.store, 'gpkg_path', '')}\n\n{exc}")
+        self.refresh_vessels(emit=emit)
+        if emit:
+            self.laybacksChanged.emit()
+            self.pathsChanged.emit()
+
+    def refresh_vessels(self, emit: bool = True) -> None:
+        try:
+            self.vessels = self.store.list_vessels()
+        except Exception as exc:
+            self.storeError.emit(
+                f"The vessel registry could not be read:\n"
+                f"{getattr(self.store, 'gpkg_path', '')}\n\n{exc}")
+        if emit:
+            self.vesselsChanged.emit()
+
+    def vessel(self, vessel_id: str) -> Optional[Dict]:
+        wanted = str(vessel_id or "")
+        return next((row for row in self.vessels
+                     if str(row.get("vessel_id") or "") == wanted), None)
+
+    def save_vessel(self, row: Dict) -> str:
+        try:
+            self.store.ensure_created()
+        except Exception as exc:
+            self.storeError.emit(
+                f"Could not create the Burial Planner GeoPackage:\n{exc}")
+            return ""
+        ok, vessel_id = self._store_write(
+            "save the vessel", self.store.save_vessel, row)
+        if not ok:
+            return ""
+        self.refresh_vessels()
+        self.pathsChanged.emit()
+        return str(vessel_id or "")
+
+    def delete_vessel(self, vessel_id: str) -> bool:
+        ok, _ = self._store_write(
+            "delete the vessel", self.store.delete_vessel, vessel_id)
+        if ok:
+            self.refresh_vessels()
+            self.pathsChanged.emit()
+        return ok
+
+    def layback_profile(self, layback_id: str) -> Optional[Dict]:
+        wanted = str(layback_id or "")
+        return next((row for row in self.layback_profiles
+                     if str(row.get("layback_id") or "") == wanted), None)
+
+    def save_layback_profile(self, row: Dict) -> str:
+        try:
+            self.store.ensure_created()
+        except Exception as exc:
+            self.storeError.emit(
+                f"Could not create the Burial Planner GeoPackage:\n{exc}")
+            return ""
+        ok, layback_id = self._store_write(
+            "save the layback profile", self.store.save_layback_profile, row)
+        if not ok:
+            return ""
+        self.refresh_layback_profiles()
+        if self.path_result:
+            self.refresh_path_layers()
+        return str(layback_id or "")
+
+    def delete_layback_profile(self, layback_id: str) -> bool:
+        ok, _ = self._store_write(
+            "delete the layback profile", self.store.delete_layback_profile,
+            layback_id)
+        if ok:
+            self.refresh_layback_profiles()
+            if self.path_result:
+                self.refresh_path_layers()
+        return ok
+
+    def path_config(self) -> Dict:
+        return path_data.config_from_plan(self.plan)
+
+    def path_fingerprints(self, config: Optional[Dict] = None) -> Dict[str, str]:
+        config = dict(config or self.path_config())
+        tool, tool_config = path_data.effective_tool_and_config(
+            self.plan, self.tools)
+        layback = self.layback_profile(config.get("layback_id") or "")
+        depth_basis = self.depth_fingerprint()
+        if len(path_data.layback_points(layback)) > 1 \
+                or config.get("radius_rules"):
+            profile = self.bathy_profile
+            if profile is not None and self.profile_state() == "current":
+                depth_basis += (f"|profile:{profile.sampled_utc}:"
+                                f"{profile.step_m:g}")
+            else:
+                depth_basis += "|live-sampling"
+        return path_data.build_fingerprints(
+            self.plan, self.current_rpl_fingerprint(), tool, tool_config,
+            config, layback, depth_basis)
+
+    def path_state(self, config: Optional[Dict] = None) -> Dict[str, str]:
+        return path_data.result_state(
+            self.path_result, self.path_fingerprints(config))
+
+    def save_path_result(self, row: Dict) -> bool:
+        """Persist one derived result, then refresh its map caches."""
+        if not self.plan_id:
+            return False
+        row = dict(row)
+        row["plan_id"] = self.plan_id
+        ok, _ = self._store_write(
+            "save the installation paths", self.store.save_path_result, row)
+        if not ok:
+            return False
+        self.path_result = self.store.get_path_result(self.plan_id)
+        self.refresh_path_layers()
+        self.pathsChanged.emit()
+        return True
+
+    def delete_path_result(self) -> bool:
+        if not self.plan_id:
+            return False
+        ok, _ = self._store_write(
+            "clear the installation paths", self.store.delete_path_result,
+            self.plan_id)
+        if not ok:
+            return False
+        self.path_result = None
+        self.refresh_path_layers()
+        self.pathsChanged.emit()
+        return True
+
+    def refresh_path_layers(self, ensure: bool = True) -> None:
+        if not self.plan:
+            return
+        try:
+            path_layers.write_path_layers(
+                self.store, self.plan, self.path_result, self.path_state())
+            if ensure:
+                path_layers.ensure_path_layers(
+                    QgsProject.instance(), self.store.gpkg_path, self.plan)
+        except Exception as exc:
+            self.storeError.emit(
+                f"Installation path layers could not be refreshed: {exc}")
 
     def create_plan(self, name: str, method: str, description: str = "",
                     rpl_row: Optional[Dict] = None) -> Optional[str]:
@@ -590,6 +756,12 @@ class PlanModel(QObject):
         if {"scope_start_kp", "scope_end_kp", "direction", "rpl_id",
             "rpl_gpkg_path"} & changed_keys:
             self.mark_stale()
+        if self.path_result and ({
+                "scope_start_kp", "scope_end_kp", "direction", "rpl_id",
+                "rpl_gpkg_path", "params_json", "name", "rev_label",
+        } & changed_keys):
+            self.refresh_path_layers()
+            self.pathsChanged.emit()
         self.planChanged.emit()
         return True
 
@@ -637,6 +809,9 @@ class PlanModel(QObject):
         if not ok:
             return False
         self.mark_stale()
+        if self.path_result:
+            self.refresh_path_layers()
+            self.pathsChanged.emit()
         self.inputsChanged.emit()
         self.logChanged.emit()
         return True
@@ -656,6 +831,9 @@ class PlanModel(QObject):
         if not ok:
             return False
         self.mark_stale()
+        if self.path_result:
+            self.refresh_path_layers()
+            self.pathsChanged.emit()
         self.inputsChanged.emit()
         self.logChanged.emit()
         return True

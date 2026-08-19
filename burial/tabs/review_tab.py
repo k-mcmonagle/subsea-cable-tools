@@ -120,6 +120,7 @@ class ReviewTab(QWidget):
         refresh_soon = ui_helpers.coalesced(self, self.refresh)
         model.planChanged.connect(refresh_soon)
         model.sectionsChanged.connect(refresh_soon)
+        model.pathsChanged.connect(refresh_soon)
         model.logChanged.connect(self._refresh_log)
         self.refresh()
 
@@ -160,12 +161,15 @@ class ReviewTab(QWidget):
             provenance = (f"<br>Generation {str(active.get('generation_id') or '')[:8]} "
                           f"run {active.get('run_utc') or '?'} · "
                           f"{len(fingerprints)} input fingerprint(s) recorded")
+        path_state = self.model.path_state()
+        path_note = (f"<br><b>Installation path</b> {path_state.get('tool')} · "
+                     f"<b>Barge track</b> {path_state.get('barge')}")
         self.summary_label.setText(
             f"<b>Scope</b> {scope_km:.3f} km · <b>Burial</b> {burial:.3f} km "
             f"({pct:.0f}%) · <b>Skips</b> {skips:.3f} km · "
             f"<b>Insufficient Information</b> {insufficient:.3f} km · "
             f"{len(sections)} sections, {len(self.model.events)} events"
-            f"<ul>{conclusion_bits}</ul>{provenance}")
+            f"<ul>{conclusion_bits}</ul>{provenance}{path_note}")
         self._refresh_log()
 
     def _refresh_log(self) -> None:
@@ -273,7 +277,10 @@ class ReviewTab(QWidget):
             inputs=self.model.inputs, generation=active,
             change_log=entries, profile_png=self._profile_png(),
             hazards=self.model.hazards, risk_checks=self.model.risk_checks,
-            tools=self.model.tools)
+            tools=self.model.tools, path_result=self.model.path_result,
+            path_state=self.model.path_state(),
+            path_vessel=self.model.vessel(
+                str(self.model.path_config().get("vessel_id") or "")))
         try:
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write(text)

@@ -338,7 +338,7 @@ class BurialStore:
                         schema.TABLE_GENERATION, schema.TABLE_EVENT,
                         schema.TABLE_SECTION, schema.TABLE_CHANGE_LOG,
                         schema.TABLE_PROFILE, schema.TABLE_RISK_CHECK,
-                        schema.TABLE_HAZARD)
+                        schema.TABLE_HAZARD, schema.TABLE_PATH_RESULT)
         conn = self._sql()
         if conn is not None:
             # One atomic transaction: the plan can never be half-deleted.
@@ -569,6 +569,67 @@ class BurialStore:
 
     def delete_tool(self, tool_id: str) -> None:
         self.delete_rows(schema.TABLE_TOOL, [tool_id])
+
+    # -- installation paths -------------------------------------------------
+    def get_path_result(self, plan_id: str) -> Optional[Dict]:
+        rows = self.read_plan_table(schema.TABLE_PATH_RESULT, plan_id)
+        rows.sort(key=lambda row: str(row.get("generated_utc") or ""))
+        return rows[-1] if rows else None
+
+    def save_path_result(self, row: Dict) -> str:
+        """Replace the plan's current derived Installation Paths result."""
+        row = dict(row)
+        row.setdefault("path_id", schema.new_id())
+        row.setdefault("generated_utc", schema.utc_now_iso())
+        self._replace_plan_rows(schema.TABLE_PATH_RESULT,
+                                str(row.get("plan_id") or ""), [row])
+        return str(row["path_id"])
+
+    def delete_path_result(self, plan_id: str) -> None:
+        self._replace_plan_rows(schema.TABLE_PATH_RESULT, str(plan_id), [])
+
+    # -- layback profiles (project-scoped) ----------------------------------
+    def list_layback_profiles(self) -> List[Dict]:
+        return sorted(self.read_table(schema.TABLE_LAYBACK_PROFILE),
+                      key=lambda row: str(row.get("name") or "").casefold())
+
+    def get_layback_profile(self, layback_id: str) -> Optional[Dict]:
+        return self._get_by_key(schema.TABLE_LAYBACK_PROFILE,
+                                "layback_id", layback_id)
+
+    def save_layback_profile(self, row: Dict) -> str:
+        row = dict(row)
+        now = schema.utc_now_iso()
+        row.setdefault("layback_id", schema.new_id())
+        if not row.get("created_utc"):
+            row["created_utc"] = now
+        row["modified_utc"] = now
+        self.upsert_rows(schema.TABLE_LAYBACK_PROFILE, [row])
+        return str(row["layback_id"])
+
+    def delete_layback_profile(self, layback_id: str) -> None:
+        self.delete_rows(schema.TABLE_LAYBACK_PROFILE, [layback_id])
+
+    # -- vessels (project-scoped) --------------------------------------------
+    def list_vessels(self) -> List[Dict]:
+        return sorted(self.read_table(schema.TABLE_VESSEL),
+                      key=lambda row: str(row.get("name") or "").casefold())
+
+    def get_vessel(self, vessel_id: str) -> Optional[Dict]:
+        return self._get_by_key(schema.TABLE_VESSEL, "vessel_id", vessel_id)
+
+    def save_vessel(self, row: Dict) -> str:
+        row = dict(row)
+        now = schema.utc_now_iso()
+        row.setdefault("vessel_id", schema.new_id())
+        if not row.get("created_utc"):
+            row["created_utc"] = now
+        row["modified_utc"] = now
+        self.upsert_rows(schema.TABLE_VESSEL, [row])
+        return str(row["vessel_id"])
+
+    def delete_vessel(self, vessel_id: str) -> None:
+        self.delete_rows(schema.TABLE_VESSEL, [vessel_id])
 
     # -- generations ---------------------------------------------------------
     def list_generations(self, plan_id: str) -> List[Dict]:

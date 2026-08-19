@@ -37,7 +37,7 @@ from ..workbench.schema import (  # noqa: F401  (re-exported for the package)
     utc_now_iso,
 )
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # Registry table names ------------------------------------------------------
 TABLE_META = "bp_meta"
@@ -52,6 +52,9 @@ TABLE_PROFILE = "bp_profile"
 TABLE_RISK_CHECK = "bp_risk_check"
 TABLE_HAZARD = "bp_hazard"
 TABLE_TOOL = "bp_tool"
+TABLE_PATH_RESULT = "bp_path_result"
+TABLE_LAYBACK_PROFILE = "bp_layback_profile"
+TABLE_VESSEL = "bp_vessel"
 
 FieldSpec = Tuple[str, str]
 
@@ -457,6 +460,59 @@ TOOL_FIELDS: List[FieldSpec] = [
     ("modified_utc", "str"),
 ]
 
+# Installation Paths -------------------------------------------------------
+# One current derived path result per plan.  Authoritative WKT is retained in
+# the registry row so a disposable map-layer refresh can fail without losing
+# the calculated result.  Fingerprints make stale state explicit.
+PATH_RESULT_FIELDS: List[FieldSpec] = [
+    ("path_id", "str"),
+    ("plan_id", "str"),
+    ("generated_utc", "str"),
+    ("algorithm_version", "str"),
+    ("config_json", "str"),
+    ("fingerprints_json", "str"),
+    ("summary_json", "str"),
+    ("tool_path_wkt", "str"),
+    ("barge_track_wkt", "str"),
+    ("diagnostics_json", "str"),
+]
+
+# Project-scoped reusable horizontal-layback profiles.  A one-point profile
+# is a constant layback; two or more points interpolate layback by water depth.
+LAYBACK_PROFILE_FIELDS: List[FieldSpec] = [
+    ("layback_id", "str"),
+    ("name", "str"),
+    ("points_json", "str"),
+    ("outside_mode", "str"),         # error | hold
+    ("source_ref", "str"),
+    ("notes", "str"),
+    ("created_utc", "str"),
+    ("modified_utc", "str"),
+]
+
+# Project-scoped installation vessels.  ``footprint_wkt`` uses the same
+# body-fixed frame as the burial-tool footprint (metres, CRP at the origin,
+# bow along +Y) so the DXF importer and outline placement are shared.  The
+# minimum turning radius is a display/check value for the generated barge
+# track — it never constrains the tool-path solver.
+VESSEL_FIELDS: List[FieldSpec] = [
+    ("vessel_id", "str"),
+    ("name", "str"),
+    ("min_turn_radius_m", "float"),
+    ("footprint_wkt", "str"),
+    ("footprint_source", "str"),
+    ("footprint_scale", "float"),
+    ("footprint_crp_x", "float"),
+    ("footprint_crp_y", "float"),
+    ("footprint_rotation_deg", "float"),
+    ("length_m", "float"),
+    ("width_m", "float"),
+    ("source_ref", "str"),
+    ("notes", "str"),
+    ("created_utc", "str"),
+    ("modified_utc", "str"),
+]
+
 # Risk Profile --------------------------------------------------------------
 # Feature-level hazard register: checks scan registered inputs (rocks,
 # pockmarks, sandwaves, mag/sonar/linear contacts, …) for features on or
@@ -574,6 +630,9 @@ REGISTRY_TABLES: Dict[str, List[FieldSpec]] = {
     TABLE_RISK_CHECK: RISK_CHECK_FIELDS,
     TABLE_HAZARD: HAZARD_FIELDS,
     TABLE_TOOL: TOOL_FIELDS,
+    TABLE_PATH_RESULT: PATH_RESULT_FIELDS,
+    TABLE_LAYBACK_PROFILE: LAYBACK_PROFILE_FIELDS,
+    TABLE_VESSEL: VESSEL_FIELDS,
 }
 
 TABLE_KEYS: Dict[str, str] = {
@@ -590,6 +649,9 @@ TABLE_KEYS: Dict[str, str] = {
     # bp_tool is project-scoped: it never appears in a plan's change-log
     # payloads or rollbacks; the key is here for the store's generic upsert.
     TABLE_TOOL: "tool_id",
+    TABLE_PATH_RESULT: "path_id",
+    TABLE_LAYBACK_PROFILE: "layback_id",
+    TABLE_VESSEL: "vessel_id",
 }
 
 # Per-plan spatial layer schemas -------------------------------------------
@@ -642,6 +704,46 @@ HAZARDS_LAYER_FIELDS: List[FieldSpec] = [
     ("notes", "str"),
 ]
 
+TOOL_PATH_LAYER_FIELDS: List[FieldSpec] = [
+    ("path_id", "str"),
+    ("plan_id", "str"),
+    ("mode", "str"),
+    ("tool", "str"),
+    ("radius_m", "float"),
+    ("length_m", "float"),
+    ("max_offset_m", "float"),
+    ("rms_offset_m", "float"),
+    ("status", "str"),
+    ("generated_utc", "str"),
+]
+
+BARGE_TRACK_LAYER_FIELDS: List[FieldSpec] = [
+    ("path_id", "str"),
+    ("plan_id", "str"),
+    ("layback", "str"),
+    ("length_m", "float"),
+    ("min_radius_m", "float"),
+    ("status", "str"),
+    ("generated_utc", "str"),
+]
+
+PATH_ISSUES_LAYER_FIELDS: List[FieldSpec] = [
+    ("path_id", "str"),
+    ("plan_id", "str"),
+    ("control_no", "int"),
+    ("kp", "float"),
+    ("turn_deg", "float"),
+    ("side", "str"),
+    ("solution", "str"),
+    ("radius_m", "float"),
+    ("depth_m", "float"),
+    ("miss_m", "float"),
+    ("max_offset_m", "float"),
+    ("depth_diff_m", "float"),
+    ("status", "str"),
+    ("message", "str"),
+]
+
 
 def plan_layer_base(plan_name: str, rev_label: str, plan_id: str) -> str:
     """Base fragment for a plan's spatial layer names.
@@ -666,6 +768,18 @@ def events_layer_name(plan_name: str, rev_label: str, plan_id: str) -> str:
 
 def hazards_layer_name(plan_name: str, rev_label: str, plan_id: str) -> str:
     return f"{plan_layer_base(plan_name, rev_label, plan_id)}_hazards"
+
+
+def tool_path_layer_name(plan_name: str, rev_label: str, plan_id: str) -> str:
+    return f"{plan_layer_base(plan_name, rev_label, plan_id)}_tool_path"
+
+
+def barge_track_layer_name(plan_name: str, rev_label: str, plan_id: str) -> str:
+    return f"{plan_layer_base(plan_name, rev_label, plan_id)}_barge_track"
+
+
+def path_issues_layer_name(plan_name: str, rev_label: str, plan_id: str) -> str:
+    return f"{plan_layer_base(plan_name, rev_label, plan_id)}_path_issues"
 
 
 def default_gpkg_path(project_path: str, project_title: str = "") -> str:

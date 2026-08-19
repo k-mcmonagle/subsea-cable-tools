@@ -213,7 +213,15 @@ def place_outline(outline: QgsGeometry, route, kp_km: float,
     heading = geometry2d.grid_heading_deg(
         (before_w.x(), before_w.y()), (after_w.x(), after_w.y()))
     heading = (heading + float(heading_offset_deg)) % 360.0
+    return _place_in_working(outline, anchor_w, heading, working,
+                             target_crs or wgs84, context, cacheable)
 
+
+def _place_in_working(outline: QgsGeometry, anchor_w: QgsPointXY,
+                      heading: float, working, out_crs, context,
+                      cacheable: bool
+                      ) -> Tuple[Optional[QgsGeometry], Optional[float]]:
+    """Rotate/translate a body-fixed outline at a projected anchor pose."""
     from math import cos as _cos, radians as _radians, sin as _sin
     h = _radians(heading)
     cos_h, sin_h = _cos(h), _sin(h)
@@ -225,7 +233,6 @@ def place_outline(outline: QgsGeometry, route, kp_km: float,
                           ay - x * sin_h + y * cos_h)
 
     geom = map_vertices(QgsGeometry(outline), placed_point)
-    out_crs = target_crs or wgs84
     if out_crs != working:
         try:
             geom.transform(_cached_transform(working, out_crs, context,
@@ -233,3 +240,39 @@ def place_outline(outline: QgsGeometry, route, kp_km: float,
         except Exception:
             return None, None
     return geom, heading
+
+
+def place_outline_at(outline: QgsGeometry, anchor: QgsPointXY,
+                     before: QgsPointXY, after: QgsPointXY,
+                     heading_offset_deg: float = 0.0,
+                     target_crs: Optional[QgsCoordinateReferenceSystem] = None,
+                     transform_context=None
+                     ) -> Tuple[Optional[QgsGeometry], Optional[float]]:
+    """Place a body-fixed outline at an explicit WGS84 position.
+
+    ``before``/``after`` are neighbouring WGS84 points giving the heading —
+    typically the adjacent vertices of a generated installation path.  Same
+    frame conventions and UTM working projection as :func:`place_outline`.
+    """
+    if outline is None or outline.isNull() or outline.isEmpty() \
+            or anchor is None or before is None or after is None:
+        return None, None
+    cacheable = transform_context is None
+    context = transform_context or QgsProject.instance().transformContext()
+    working = utm_crs_for(anchor)
+    wgs84 = QgsCoordinateReferenceSystem(WGS84)
+    to_working = _cached_transform(wgs84, working, context, cacheable)
+    try:
+        anchor_w = to_working.transform(anchor)
+        before_w = to_working.transform(before)
+        after_w = to_working.transform(after)
+    except Exception:
+        return None, None
+    if (abs(before_w.x() - after_w.x()) < 1e-9
+            and abs(before_w.y() - after_w.y()) < 1e-9):
+        return None, None
+    heading = geometry2d.grid_heading_deg(
+        (before_w.x(), before_w.y()), (after_w.x(), after_w.y()))
+    heading = (heading + float(heading_offset_deg)) % 360.0
+    return _place_in_working(outline, anchor_w, heading, working,
+                             target_crs or wgs84, context, cacheable)

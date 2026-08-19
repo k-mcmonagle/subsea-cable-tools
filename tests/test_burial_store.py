@@ -118,6 +118,25 @@ def test_plan_round_trip() -> bool:
                                   "summary_json": "{}", "proposal_diff_json": "{}"})
     actives = [g for g in store.list_generations(plan_id) if int(g.get("active") or 0)]
     ok = ok and len(actives) == 1 and actives[0]["generation_id"] == gen2
+    path_id = store.save_path_result({
+        "plan_id": plan_id, "algorithm_version": "1",
+        "config_json": "{}", "fingerprints_json": "{}",
+        "summary_json": "{}", "tool_path_wkt": "LINESTRING (0 0, 1 1)",
+        "barge_track_wkt": "", "diagnostics_json": "[]"})
+    path = store.get_path_result(plan_id)
+    ok = ok and path is not None and path.get("path_id") == path_id
+    layback_id = store.save_layback_profile({
+        "name": "constant", "points_json": "[[0,100]]",
+        "outside_mode": "hold", "source_ref": "test", "notes": ""})
+    ok = ok and store.get_layback_profile(layback_id).get("name") == "constant"
+    vessel_id = store.save_vessel({
+        "name": "CLV Test", "min_turn_radius_m": 950.0,
+        "footprint_wkt": "", "source_ref": "test", "notes": ""})
+    vessel = store.get_vessel(vessel_id)
+    ok = ok and vessel is not None \
+        and float(vessel.get("min_turn_radius_m")) == 950.0
+    store.delete_vessel(vessel_id)
+    ok = ok and store.get_vessel(vessel_id) is None
     return _result("plan/input/rule/event/section/generation round trip", ok)
 
 

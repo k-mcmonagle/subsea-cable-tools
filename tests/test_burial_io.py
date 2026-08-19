@@ -175,10 +175,10 @@ def test_import_scan() -> bool:
     if not stdlib:  # Python < 3.10 (QGIS 3.x): static fallback
         stdlib = {
             "__future__", "abc", "ast", "base64", "bisect", "collections",
-            "copy", "csv", "dataclasses", "datetime", "enum", "functools",
+            "contextlib", "copy", "csv", "dataclasses", "datetime", "enum", "functools",
             "getpass", "hashlib", "html", "importlib", "io", "itertools",
             "json", "math", "os", "pathlib", "random", "re", "shutil",
-            "string", "sys", "tempfile", "time", "traceback", "typing",
+            "sqlite3", "string", "sys", "tempfile", "time", "traceback", "typing",
             "uuid", "warnings",
         }
     offenders = []

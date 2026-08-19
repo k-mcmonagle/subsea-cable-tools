@@ -170,11 +170,47 @@ def test_rule_condition_text() -> bool:
     return _result("rule condition summaries per kind", ok)
 
 
+def test_installation_path_report_block() -> bool:
+    path_result = {
+        "generated_utc": "2026-02-02T11:00:00Z",
+        "tool_path_wkt": "LINESTRING (0 0, 1 1)",
+        "barge_track_wkt": "LINESTRING (0 0, 1 1)",
+        "config_json": json.dumps({"mode": "through_ac"}),
+        "summary_json": json.dumps({
+            "tool": "Plough X — Normal", "radius_m": 250.0,
+            "length_m": 20500.0, "max_offset_m": 42.0,
+            "rms_offset_m": 12.0, "course_change_count": 3,
+            "compound_cluster_count": 1, "barge_generated": True,
+            "layback_name": "Normal tow", "layback_min_m": 500.0,
+            "layback_max_m": 650.0, "barge_length_m": 20600.0}),
+        "diagnostics_json": json.dumps([{
+            "kp": 8.5, "turn_deg": 45.0, "side": "port",
+            "solution": "compound", "miss_m": 0.0,
+            "max_offset_m": 42.0, "status": "review",
+            "message": "turn-out / turn-in"}]),
+    }
+    html_text = _report_html(
+        path_result=path_result,
+        path_state={"tool": "current", "barge": "stale"})
+    checks = [
+        "Installation paths" in html_text,
+        "Pass through every course change" in html_text,
+        "Plough X" in html_text,
+        "250.0 m" in html_text,
+        "Normal tow" in html_text,
+        "KP" in html_text and "8.500" in html_text,
+        "turn-out / turn-in" in html_text,
+        "bounded-curvature planning geometry" in html_text.lower(),
+    ]
+    return _result("report includes installation path audit block", all(checks))
+
+
 def run_all() -> list:
     return [
         test_report_content(),
         test_report_profile_image_and_optionals(),
         test_rule_condition_text(),
+        test_installation_path_report_block(),
     ]
 
 
