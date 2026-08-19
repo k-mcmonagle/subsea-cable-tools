@@ -489,9 +489,16 @@ def _ordered_point_offset(point: Point, reference: Sequence[Point],
 
 
 def path_offset_metrics(points: Sequence[Point], reference: Sequence[Point],
-                        cancel: Optional[Callable[[], bool]] = None
+                        cancel: Optional[Callable[[], bool]] = None,
+                        abort_above: Optional[float] = None
                         ) -> Tuple[float, float, float]:
-    """Return maximum offset, integral(offset^2 ds), RMS offset."""
+    """Return maximum offset, integral(offset^2 ds), RMS offset.
+
+    ``abort_above`` short-circuits candidate ranking: the maximum offset is
+    the primary cost key, so a path already strictly worse than the best
+    candidate so far cannot win and scoring the rest of it is wasted work.
+    Returns ``(inf, inf, inf)`` when aborted.
+    """
     if not points:
         return float("inf"), float("inf"), float("inf")
     offsets = []
@@ -501,6 +508,8 @@ def path_offset_metrics(points: Sequence[Point], reference: Sequence[Point],
             raise PathCancelled()
         offset, previous_segment = _ordered_point_offset(
             point, reference, previous_segment)
+        if abort_above is not None and offset > abort_above:
+            return float("inf"), float("inf"), float("inf")
         offsets.append(offset)
     maximum = max(offsets)
     integral = 0.0
@@ -565,15 +574,28 @@ def _bisector_heading(before: Point, at: Point, after: Point) -> float:
 def _initial_heading_sets(waypoints: Sequence[Point], start_heading: float,
                           end_heading: float, step_deg: float
                           ) -> List[List[float]]:
+    """Candidate headings per waypoint: a fan around the local direction.
+
+    A route-following path's waypoint heading lies near the local route
+    direction — turn-out/turn-in solutions deviate by up to ~90° plus the
+    course change itself, never arbitrarily. Restricting the lattice to
+    that fan (instead of the historical full circle) cuts the DP edge
+    count roughly quadratically without excluding credible solutions; a
+    near-reversal widens back to the full circle.
+    """
     step = math.radians(min(max(float(step_deg), 3.0), 45.0))
-    uniform = [i * step for i in range(max(1, int(math.ceil(_TAU / step))))]
     sets: List[List[float]] = [[_mod2pi(start_heading)]]
     for index in range(1, len(waypoints) - 1):
-        local = [heading(waypoints[index - 1], waypoints[index]),
-                 heading(waypoints[index], waypoints[index + 1]),
-                 _bisector_heading(waypoints[index - 1], waypoints[index],
-                                   waypoints[index + 1])]
-        sets.append(_unique_angles(uniform + local))
+        h_in = heading(waypoints[index - 1], waypoints[index])
+        h_out = heading(waypoints[index], waypoints[index + 1])
+        bisector = _bisector_heading(waypoints[index - 1], waypoints[index],
+                                     waypoints[index + 1])
+        turn = abs(wrap_pi(h_out - h_in))
+        half = min(math.pi, math.radians(90.0) + turn)
+        count = int(math.ceil(half / step))
+        fan = [bisector + offset * step
+               for offset in range(-count, count + 1)]
+        sets.append(_unique_angles(fan + [h_in, h_out, bisector]))
     sets.append([_mod2pi(end_heading)])
     return sets
 
@@ -610,16 +632,26 @@ def _edge_best(start: Pose, end: Pose, radius: float,
     # to 6piR beyond the direct span so very close controls keep a usable
     # local solution while runaway multi-loop candidates are discarded.
     length_ceiling = direct + 6.0 * math.pi * radius
+    corridor = (float(max_deviation_m) + 1e-7
+                if max_deviation_m is not None else None)
     for candidate in dubins_candidates(start, end, radius,
                                        chord_tolerance_m):
         if cancel is not None and cancel():
             raise PathCancelled()
         if candidate.length_m > length_ceiling + 1e-7:
             continue
+        # Anything strictly beyond the best-so-far max (or the corridor)
+        # cannot win; ties on the max still score fully so the integral
+        # tie-break stays exact.
+        abort_above = corridor
+        if best is not None and (abort_above is None
+                                 or best[0][0] < abort_above):
+            abort_above = best[0][0]
         maximum, integral, rms = path_offset_metrics(
-            candidate.points, reference, cancel)
-        if max_deviation_m is not None \
-                and maximum > float(max_deviation_m) + 1e-7:
+            candidate.points, reference, cancel, abort_above=abort_above)
+        if not math.isfinite(maximum):
+            continue
+        if corridor is not None and maximum > corridor:
             continue
         candidate.max_offset_m = maximum
         candidate.rms_offset_m = rms
@@ -665,13 +697,54 @@ def _reference_legs(waypoints: Sequence[Point], reference: Sequence[Point]
     return legs
 
 
+def _resample_edge(edge: PathSolution, chord_tolerance_m: float
+                   ) -> PathSolution:
+    """Regenerate an edge's sampled points from its exact primitives.
+
+    The heading-lattice search scores candidates at a coarse chord
+    tolerance for speed; only the winning edges are resampled at the
+    requested output tolerance. Endpoints stay exact.
+    """
+    if not edge.primitives:
+        return edge
+    pose = edge.primitives[0].start
+    points: List[Point] = [(pose[0], pose[1])]
+    primitives: List[Primitive] = []
+    for primitive in edge.primitives:
+        if primitive.kind == "S":
+            parameter, radius = primitive.length_m, 1.0
+        else:
+            radius = float(primitive.radius_m or 1.0)
+            parameter = primitive.length_m / max(radius, _EPS)
+        sampled, pose, rebuilt = _advance(pose, primitive.kind, parameter,
+                                          radius, chord_tolerance_m)
+        points.extend(sampled[1:])
+        primitives.append(rebuilt)
+    end = edge.primitives[-1].end
+    points[-1] = (float(end[0]), float(end[1]))
+    if primitives:
+        last = primitives[-1]
+        primitives[-1] = Primitive(last.kind, last.start, end,
+                                   last.length_m, last.radius_m)
+    return PathSolution(
+        points=points, primitives=primitives,
+        waypoint_headings=list(edge.waypoint_headings),
+        max_offset_m=edge.max_offset_m, rms_offset_m=edge.rms_offset_m,
+        length_m=edge.length_m, path_types=list(edge.path_types))
+
+
 def _solve_heading_lattice(waypoints: Sequence[Point],
                            heading_sets: Sequence[Sequence[float]],
                            radius: float, reference: Sequence[Point],
                            chord_tolerance_m: float,
                            max_deviation_m: Optional[float],
-                           cancel: Optional[Callable[[], bool]] = None
+                           cancel: Optional[Callable[[], bool]] = None,
+                           search_tolerance_m: Optional[float] = None,
+                           leg_progress: Optional[
+                               Callable[[int, int], None]] = None
                            ) -> PathSolution:
+    search_tolerance = max(float(search_tolerance_m or chord_tolerance_m),
+                           chord_tolerance_m)
     # states[index][heading_index] = (aggregate cost, previous index,
     # edge solution).  max offset combines with max; integral and length sum.
     states: List[Dict[int, Tuple[Tuple, Optional[int], Optional[PathSolution]]]] = [
@@ -682,6 +755,8 @@ def _solve_heading_lattice(waypoints: Sequence[Point],
     for leg in range(len(waypoints) - 1):
         if cancel is not None and cancel():
             raise PathCancelled()
+        if leg_progress is not None:
+            leg_progress(leg, len(waypoints) - 1)
         current = states[-1]
         following: Dict[int, Tuple[Tuple, int, PathSolution]] = {}
         for to_index, to_heading in enumerate(heading_sets[leg + 1]):
@@ -695,7 +770,7 @@ def _solve_heading_lattice(waypoints: Sequence[Point],
                         heading_sets[leg][from_index]),
                         (waypoints[leg + 1][0], waypoints[leg + 1][1],
                         to_heading), radius, leg_references[leg],
-                        chord_tolerance_m, max_deviation_m, cancel)
+                        search_tolerance, max_deviation_m, cancel)
                     edge_cache[key] = edge
                 if edge is None:
                     continue
@@ -730,6 +805,8 @@ def _solve_heading_lattice(waypoints: Sequence[Point],
     primitives: List[Primitive] = []
     path_types: List[str] = []
     for edge in edges:
+        if search_tolerance > chord_tolerance_m + 1e-9:
+            edge = _resample_edge(edge, chord_tolerance_m)
         if not points:
             points.extend(edge.points)
         else:
@@ -754,13 +831,19 @@ def solve_waypoint_path(waypoints: Sequence[Point], radius_m: float,
                         heading_step_deg: float = 15.0,
                         refine_step_deg: float = 3.0,
                         chord_tolerance_m: float = 0.25,
-                        cancel: Optional[Callable[[], bool]] = None
+                        cancel: Optional[Callable[[], bool]] = None,
+                        progress: Optional[Callable[[int, int], None]] = None
                         ) -> PathSolution:
     """Bounded-curvature path through every ordered waypoint.
 
     Intermediate waypoint headings are free but shared by the incoming and
-    outgoing Dubins legs.  A coarse full-circle lattice is solved first,
-    followed by a local refinement around the selected headings.
+    outgoing Dubins legs.  A coarse lattice fanned around the local route
+    direction is solved first, followed by a local refinement around the
+    selected headings.  Candidates are scored on a coarse arc sampling
+    (proportional to the radius); the winning edges are resampled at
+    ``chord_tolerance_m`` so the output geometry keeps full fidelity.
+    ``progress(done_units, total_units)`` reports DP legs across both the
+    coarse and refinement passes.
     """
     controls = clean_polyline(waypoints)
     if len(controls) < 2:
@@ -773,12 +856,26 @@ def solve_waypoint_path(waypoints: Sequence[Point], radius_m: float,
     end = heading(controls[-2], controls[-1]) \
         if end_heading is None else float(end_heading)
     route = clean_polyline(reference or controls)
+    # Ranking candidates does not need millimetric arc sampling: a sagitta
+    # around R/300 (capped at 3 m) keeps peaks visible while cutting the
+    # dominant scoring cost for large radii several-fold.
+    search_tolerance = max(chord_tolerance_m, min(3.0, radius / 300.0))
     headings = _initial_heading_sets(controls, start, end,
                                      heading_step_deg)
+    legs = len(controls) - 1
+    two_pass = len(controls) > 2 and refine_step_deg < heading_step_deg
+    total_units = legs * (2 if two_pass else 1)
+
+    def _pass_progress(offset: int):
+        if progress is None:
+            return None
+        return lambda done, _total: progress(offset + done, total_units)
+
     coarse = _solve_heading_lattice(
         controls, headings, radius, route, chord_tolerance_m,
-        max_deviation_m, cancel)
-    if len(controls) <= 2 or refine_step_deg >= heading_step_deg:
+        max_deviation_m, cancel, search_tolerance_m=search_tolerance,
+        leg_progress=_pass_progress(0))
+    if not two_pass:
         return coarse
     refined = _refined_heading_sets(
         headings, coarse.waypoint_headings, heading_step_deg,
@@ -786,7 +883,8 @@ def solve_waypoint_path(waypoints: Sequence[Point], radius_m: float,
     try:
         return _solve_heading_lattice(
             controls, refined, radius, route, chord_tolerance_m,
-            max_deviation_m, cancel)
+            max_deviation_m, cancel, search_tolerance_m=search_tolerance,
+            leg_progress=_pass_progress(legs))
     except PathGeometryError:
         return coarse
 
@@ -950,7 +1048,9 @@ def _compound_replacement(route: Sequence[Point], chainages: Sequence[float],
                           chord_tolerance_m: float,
                           max_deviation_m: Optional[float],
                           start: float, end: float,
-                          cancel: Optional[Callable[[], bool]] = None
+                          cancel: Optional[Callable[[], bool]] = None,
+                          fraction_progress: Optional[
+                              Callable[[float], None]] = None
                           ) -> _Replacement:
     _rs, _re, radius = _compound_window(corners, group)
     anchor_start = point_at_distance(route, chainages, start)
@@ -971,7 +1071,10 @@ def _compound_replacement(route: Sequence[Point], chainages: Sequence[float],
                 controls, radius, start_heading=start_heading,
                 end_heading=end_heading, reference=reference,
                 max_deviation_m=max_deviation_m,
-                chord_tolerance_m=chord_tolerance_m, cancel=cancel)
+                chord_tolerance_m=chord_tolerance_m, cancel=cancel,
+                progress=(None if fraction_progress is None else
+                          lambda done, total:
+                          fraction_progress(done / max(total, 1))))
             passed = {corner.number for corner in subset}
             break
         except PathGeometryError:
@@ -1213,10 +1316,16 @@ def generate_route_path(route_points: Sequence[Point], radius_m: float,
                 continue
 
         compound_count += 1
+        fraction_progress = None
+        if progress is not None:
+            def fraction_progress(fraction: float, _index=index) -> None:
+                total = len(plan_items)
+                progress(min(_index + max(0.0, min(fraction, 1.0)),
+                             total), total)
         replacements.append(_compound_replacement(
             route, chainages, corners, group,
             chord_tolerance_m, max_deviation_m,
-            start, end, cancel))
+            start, end, cancel, fraction_progress))
         index += 1
 
     if progress is not None:

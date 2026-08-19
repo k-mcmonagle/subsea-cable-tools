@@ -18,6 +18,7 @@ from __future__ import annotations
 import bisect
 import json
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -381,6 +382,26 @@ class InstallationPathTask(QgsTask):
             self.cancelled = True
             raise InterruptedError()
 
+    def _breathing_cancel(self) -> Callable[[], bool]:
+        """Cancel probe that periodically yields the GIL.
+
+        The solver is pure Python: without an explicit sleep it holds the
+        GIL almost continuously, starving the main thread's Python (map
+        tools, hover overlays, other plugins) and making the whole QGIS UI
+        feel frozen while a path generates. Sleeping ~1 ms every 40 ms
+        costs under 3% wall time and keeps the UI fluid.
+        """
+        state = {"next": 0.0}
+
+        def probe() -> bool:
+            now = time.monotonic()
+            if now >= state["next"]:
+                state["next"] = now + 0.04
+                time.sleep(0.001)
+            return self.isCanceled()
+
+        return probe
+
     def run(self) -> bool:  # noqa: C901 - deliberately linear task pipeline
         try:
             work = self.work
@@ -487,7 +508,7 @@ class InstallationPathTask(QgsTask):
             solution = path_geometry.generate_route_path(
                 plane.points, work.radius_m, work.mode,
                 (work.max_deviation_m if work.max_deviation_m > 0.0 else None),
-                work.chord_tolerance_m, cancel=self.isCanceled,
+                work.chord_tolerance_m, cancel=self._breathing_cancel(),
                 progress=_solve_progress,
                 radius_for_vertex=radius_for_vertex,
                 extra_controls=extra_controls)
