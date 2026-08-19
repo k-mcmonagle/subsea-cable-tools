@@ -111,6 +111,46 @@ def test_task_reverse_direction_passes_controls() -> bool:
     return _result("reverse-direction exact-through task", ok)
 
 
+def test_task_dcc_series_and_adjustment() -> bool:
+    """The task persists a signed KP-vs-DCC series and honours a manual
+    path adjustment (positive DCC = port of travel)."""
+    route, distance, _source = _route()
+    mid_kp = round(route.total_length_km / 2.0, 3)
+    config = dict(path_data.DEFAULT_CONFIG, mode=path_data.MODE_FILLET,
+                  adjustments=[{"kp": mid_kp, "dcc_m": 25.0}])
+    plan = {
+        "plan_id": "plan-path-dcc", "scope_start_kp": 0.0,
+        "scope_end_kp": route.total_length_km, "direction": 1,
+    }
+    work = build_path_work(
+        route, distance, plan, 20.0, path_data.MODE_FILLET, 0.0,
+        "Test plough — Normal", schema.METHOD_PLOUGH,
+        {"tool": "tool-fp", "barge": "barge-fp"}, config)
+    ok = work.adjustments == [{"kp": mid_kp, "dcc_m": 25.0}]
+    task = InstallationPathTask(work, lambda _task: None)
+    ok = ok and task.run() and task.result is not None
+    if task.result is None:
+        return _result("DCC series + manual adjustment task", False,
+                       task.error or "no result")
+    summary = task.result.summary
+    series = summary.get("dcc") or {}
+    kps, values = series.get("kp") or [], series.get("m") or []
+    ok = ok and len(kps) == len(values) and len(kps) > 10
+    ok = ok and summary.get("adjustment_count") == 1
+    # The adjustment pulls the path ~25 m to port near mid-KP, and the
+    # summary's worst DCC agrees with the series.
+    near = [value for kp, value in zip(kps, values)
+            if abs(kp - mid_kp) < 0.15]
+    ok = ok and near and max(near) > 20.0
+    ok = ok and abs(float(summary.get("dcc_max_abs_m"))
+                    - max(abs(v) for v in values)) < 0.5
+    adj = [item for item in task.result.diagnostics
+           if item.get("control_kind") == "adjustment"]
+    ok = ok and len(adj) == 1 and adj[0]["solution"] == "adjustment"
+    return _result("DCC series + manual adjustment task", ok,
+                   f"max DCC {summary.get('dcc_max_abs_m')} m")
+
+
 def test_task_depth_banded_radius_from_profile() -> bool:
     route, distance, _source = _route()
     plan = {
@@ -270,6 +310,7 @@ def run_all() -> list:
     return [
         test_task_georeferences_tool_and_constant_layback(),
         test_task_reverse_direction_passes_controls(),
+        test_task_dcc_series_and_adjustment(),
         test_task_depth_banded_radius_from_profile(),
         test_outlines_place_on_tool_path_and_barge_track(),
         test_path_map_layers_round_trip(),

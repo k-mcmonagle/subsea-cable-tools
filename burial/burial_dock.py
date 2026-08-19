@@ -1294,6 +1294,57 @@ class BurialPlannerDock(QDockWidget):
                 pass
         return True
 
+    def pick_route_offset_on_map(self, callback, prompt: str = "",
+                                 on_finished=None) -> bool:
+        """Multi-shot map tool delivering (KP, signed DCC) per click.
+
+        Used by Installation Paths to place path adjustments: each click
+        reports the nearest route KP and the click's cross-course offset
+        (positive = port of travel). Right-click or Esc ends the picking
+        and restores the previously active map tool.
+        """
+        if self.canvas is None:
+            return False
+        if self.model.route is None:
+            QMessageBox.warning(self, "Burial Planner",
+                                self.model.route_error
+                                or "Set the plan's route on the Inputs tab first.")
+            return False
+        from .kp_pick_tool import RouteOffsetPickTool
+
+        previous = self.canvas.mapTool()
+
+        def restore() -> None:
+            self._pick_tool = None
+            try:
+                if self.canvas.mapTool() is tool:
+                    if previous is not None:
+                        self.canvas.setMapTool(previous)
+                    else:
+                        self.canvas.unsetMapTool(tool)
+            except (AttributeError, RuntimeError):
+                pass
+            if on_finished is not None:
+                try:
+                    on_finished()
+                except Exception:
+                    pass
+
+        tool = RouteOffsetPickTool(self.canvas, self.model.route, callback,
+                                   direction=self.model.direction,
+                                   on_finished=restore)
+        self._pick_tool = tool
+        self.canvas.setMapTool(tool)
+        if prompt and self.iface is not None:
+            try:
+                from ..qgis_compat import MESSAGE_INFO
+
+                self.iface.messageBar().pushMessage(
+                    "Burial Planner", prompt, MESSAGE_INFO, 6)
+            except Exception:
+                pass
+        return True
+
     # -- map sync -------------------------------------------------------------
     def _canvas_transform(self):
         """WGS84 → canvas transform, cached per destination CRS.

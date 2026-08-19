@@ -378,10 +378,18 @@ def build_report_html(plan: Dict,
             ("Maximum / RMS RPL offset",
              f"{_num(path_summary.get('max_offset_m'), 1)} / "
              f"{_num(path_summary.get('rms_offset_m'), 1)} m"),
+            ("Maximum DCC",
+             (f"{_num(path_summary.get('dcc_max_abs_m'), 1)} m at KP "
+              f"{_kp(path_summary.get('dcc_max_kp'))}")
+             if path_summary.get("dcc_max_abs_m") is not None else "—"),
             ("Course changes",
              str(path_summary.get("course_change_count") or 0)),
             ("Compound clusters",
              str(path_summary.get("compound_cluster_count") or 0)),
+            ("Best-fit course changes (review)",
+             str(path_summary.get("best_fit_count") or 0)),
+            ("Manual path adjustments",
+             str(path_summary.get("adjustment_count") or 0)),
             ("Layback profile", path_summary.get("layback_name") or "—"),
             ("Layback range",
              (f"{_num(path_summary.get('layback_min_m'), 1)} – "

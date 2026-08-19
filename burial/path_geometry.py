@@ -88,6 +88,7 @@ class RoutePathDiagnostic:
     status: str
     message: str = ""
     radius_m: float = 0.0
+    control_kind: str = "corner"    # "corner" | "adjustment"
 
 
 @dataclass
@@ -512,6 +513,40 @@ def path_offset_metrics(points: Sequence[Point], reference: Sequence[Point],
     return maximum, integral, rms
 
 
+def signed_offset_series(points: Sequence[Point],
+                         reference: Sequence[Point]
+                         ) -> List[Tuple[float, float]]:
+    """(station_m along reference, signed cross-course offset) per point.
+
+    Positive offsets lie to the LEFT of the reference travel direction
+    (port when the reference is in travel order).  Uses the same moving
+    segment window as :func:`path_offset_metrics`.
+    """
+    if len(reference) < 2:
+        return []
+    chainages = cumulative_lengths(reference)
+    previous_segment = 0
+    out: List[Tuple[float, float]] = []
+    for point in points:
+        offset, segment = _ordered_point_offset(point, reference,
+                                                previous_segment)
+        previous_segment = segment
+        a, b = reference[segment], reference[segment + 1]
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        denom = dx * dx + dy * dy
+        if denom <= _EPS:
+            out.append((chainages[segment], 0.0))
+            continue
+        t = ((point[0] - a[0]) * dx + (point[1] - a[1]) * dy) / denom
+        t = min(max(t, 0.0), 1.0)
+        qx, qy = a[0] + t * dx, a[1] + t * dy
+        cross = dx * (point[1] - qy) - dy * (point[0] - qx)
+        sign = 1.0 if cross > 0.0 else (-1.0 if cross < 0.0 else 0.0)
+        station = chainages[segment] + t * distance(a, b)
+        out.append((station, sign * offset))
+    return out
+
+
 def _unique_angles(values: Iterable[float], tolerance: float = 1e-7
                    ) -> List[float]:
     out: List[float] = []
@@ -769,6 +804,10 @@ class _Corner:
     after_m: float
     radius_m: float = 0.0
     fillet: Optional[Fillet] = None
+    # Manual shaping control: an off-route point the path must pass through
+    # (a user adjustment). ``None`` means the control is the route vertex.
+    control: Optional[Point] = None
+    adjustment: bool = False
 
 
 @dataclass
@@ -781,6 +820,9 @@ class _Replacement:
     solution: str
     max_offset_m: float
     solved_radius_m: float = 0.0
+    # Per-corner distance from each member control to the final path.
+    misses: Dict[int, float] = field(default_factory=dict)
+    dropped: List[int] = field(default_factory=list)
 
 
 def _route_corners(points: Sequence[Point], chainages: Sequence[float],
@@ -858,13 +900,9 @@ def _cluster_corner_numbers(corners: Sequence[_Corner],
     return groups
 
 
-def _compound_replacement(route: Sequence[Point], chainages: Sequence[float],
-                          corners: Sequence[_Corner], group: Sequence[int],
-                          chord_tolerance_m: float,
-                          max_deviation_m: Optional[float],
-                          previous_end: float, next_start: float,
-                          cancel: Optional[Callable[[], bool]] = None
-                          ) -> _Replacement:
+def _compound_window(corners: Sequence[_Corner], group: Sequence[int]
+                     ) -> Tuple[float, float, float]:
+    """(requested_start, requested_end, radius) for one compound cluster."""
     # A cluster with depth-varying corner radii is solved at the largest
     # member radius: the minimum-turn constraint is a lower bound, so the
     # widest requirement is the safe one for every corner it contains.
@@ -874,36 +912,155 @@ def _compound_replacement(route: Sequence[Point], chainages: Sequence[float],
         else 3.0 * radius
     last_tangent = last.tangent_m if math.isfinite(last.tangent_m) \
         else 3.0 * radius
-    requested_start = first.station_m - max(2.0 * radius,
-                                             first_tangent + radius)
-    requested_end = last.station_m + max(2.0 * radius,
-                                          last_tangent + radius)
-    # Do not consume an adjacent independent replacement: clamping to the
-    # neighbours' boundaries keeps replacements ordered and disjoint while
-    # granting this cluster the whole remaining lead-in/lead-out.
-    start = max(0.0, requested_start, previous_end)
-    end = min(chainages[-1], requested_end, next_start)
-    if end - start <= max(radius * 0.1, 1e-6):
-        raise PathGeometryError(
-            "There is not enough route either side of a turn cluster to "
-            "establish entry and exit tangents.")
+    return (first.station_m - max(2.0 * radius, first_tangent + radius),
+            last.station_m + max(2.0 * radius, last_tangent + radius),
+            radius)
+
+
+def _control_point(route: Sequence[Point], corner: _Corner) -> Point:
+    return corner.control if corner.control is not None \
+        else route[corner.index]
+
+
+def _control_ladder(members: Sequence[_Corner]) -> List[List[_Corner]]:
+    """Progressively relaxed control subsets for the best-fit fallback.
+
+    The first rung passes through every control (the exact objective).
+    When that has no bounded-curvature solution the ladder drops the
+    smallest course changes first — a racing line that still aims for the
+    significant A/Cs — and finally keeps only manual adjustments, then
+    nothing but the entry/exit anchors.
+    """
+    ladder: List[List[_Corner]] = [list(members)]
+    if len(members) > 1:
+        keep = max(1, (len(members) + 1) // 2)
+        ranked = sorted(members,
+                        key=lambda c: (not c.adjustment, -abs(c.turn_rad)))
+        subset = sorted(ranked[:keep], key=lambda c: c.station_m)
+        if len(subset) < len(members):
+            ladder.append(subset)
+    adjustments = [c for c in members if c.adjustment]
+    if len(adjustments) < len(ladder[-1]):
+        ladder.append(adjustments)   # may be empty: anchors only
+    return ladder
+
+
+def _compound_replacement(route: Sequence[Point], chainages: Sequence[float],
+                          corners: Sequence[_Corner], group: Sequence[int],
+                          chord_tolerance_m: float,
+                          max_deviation_m: Optional[float],
+                          start: float, end: float,
+                          cancel: Optional[Callable[[], bool]] = None
+                          ) -> _Replacement:
+    _rs, _re, radius = _compound_window(corners, group)
     anchor_start = point_at_distance(route, chainages, start)
     anchor_end = point_at_distance(route, chainages, end)
-    controls = [anchor_start]
-    controls.extend(route[corners[index].index] for index in group)
-    controls.append(anchor_end)
+    members = [corners[index] for index in group]
     reference = polyline_slice(route, chainages, start, end)
-    solution = solve_waypoint_path(
-        controls, radius,
-        start_heading=polyline_heading_at(route, chainages, start),
-        end_heading=polyline_heading_at(
-            route, chainages, max(start, end - 1e-7)),
-        reference=reference, max_deviation_m=max_deviation_m,
-        chord_tolerance_m=chord_tolerance_m, cancel=cancel)
+    start_heading = polyline_heading_at(route, chainages, start)
+    end_heading = polyline_heading_at(route, chainages,
+                                      max(start, end - 1e-7))
+    solution = None
+    passed: set = set()
+    for subset in _control_ladder(members):
+        controls = [anchor_start]
+        controls.extend(_control_point(route, corner) for corner in subset)
+        controls.append(anchor_end)
+        try:
+            solution = solve_waypoint_path(
+                controls, radius, start_heading=start_heading,
+                end_heading=end_heading, reference=reference,
+                max_deviation_m=max_deviation_m,
+                chord_tolerance_m=chord_tolerance_m, cancel=cancel)
+            passed = {corner.number for corner in subset}
+            break
+        except PathGeometryError:
+            continue
+    if solution is None:
+        raise PathGeometryError(
+            "No bounded-curvature path fits the turn cluster near station "
+            f"{corners[group[0]].station_m:.0f} m even as a best fit"
+            + (" within the maximum route deviation."
+               if max_deviation_m else "."))
+    misses: Dict[int, float] = {}
+    dropped: List[int] = []
+    for corner in members:
+        miss = point_polyline_distance(_control_point(route, corner),
+                                       solution.points)
+        # Controls the solver passed through are hit exactly (they are
+        # Dubins endpoints); keep those at a clean 0.0.
+        misses[corner.number] = 0.0 \
+            if corner.number in passed and miss <= 1e-6 else miss
+        if corner.number not in passed:
+            dropped.append(corner.number)
+    kind = "compound" if not dropped else "best_fit"
     return _Replacement(
         start, end, solution.points, solution.primitives,
-        [corners[index].number for index in group], "compound",
-        solution.max_offset_m, radius)
+        [corner.number for corner in members], kind,
+        solution.max_offset_m, radius, misses, dropped)
+
+
+def _adjustment_corners(route: Sequence[Point], chainages: Sequence[float],
+                        extra_controls: Sequence[Tuple[float, Point]],
+                        radius: float,
+                        radius_for_vertex: Optional[
+                            Callable[[int, float], float]] = None
+                        ) -> List[_Corner]:
+    """Manual shaping controls as pseudo-corners (turn 0, always compound)."""
+    out: List[_Corner] = []
+    for raw_station, raw_point in extra_controls or []:
+        station = min(max(float(raw_station), 0.0), float(chainages[-1]))
+        point = (float(raw_point[0]), float(raw_point[1]))
+        index = min(max(bisect.bisect_left(chainages, station), 1),
+                    len(route) - 2) if len(route) > 2 else 1
+        corner_radius = radius
+        if radius_for_vertex is not None:
+            corner_radius = float(radius_for_vertex(index, station))
+            if not math.isfinite(corner_radius) or corner_radius <= 0.0:
+                raise PathGeometryError(
+                    "A depth-based minimum turning radius must be finite "
+                    "and greater than zero.")
+        out.append(_Corner(
+            0, index, station, 0.0, corner_radius,
+            station, chainages[-1] - station, corner_radius,
+            None, control=point, adjustment=True))
+    return out
+
+
+def _split_oversized(plan_items: List[Dict], corners: Sequence[_Corner],
+                     max_corners: int) -> List[Dict]:
+    """Split any turn group with too many corners into bounded chunks.
+
+    A single mega-cluster (dense course changes at a large radius) makes
+    the heading-lattice solve intractable — the pass-through "stuck at a
+    few percent" failure.  Chunks share forced boundaries at the midpoint
+    of the gap between their edge corners; both sides anchor to the route
+    heading there, so the stitched path stays tangent-continuous.
+    """
+    out: List[Dict] = []
+    for item in plan_items:
+        group = item["group"]
+        if len(group) <= max_corners:
+            out.append(item)
+            continue
+        chunks = [group[i:i + max_corners]
+                  for i in range(0, len(group), max_corners)]
+        for k, chunk in enumerate(chunks):
+            piece = {"group": chunk, "start": None, "end": None}
+            if k == 0:
+                piece["start"] = item.get("start")
+            else:
+                piece["start"] = 0.5 * (
+                    corners[chunks[k - 1][-1]].station_m
+                    + corners[chunk[0]].station_m)
+            if k == len(chunks) - 1:
+                piece["end"] = item.get("end")
+            else:
+                piece["end"] = 0.5 * (
+                    corners[chunk[-1]].station_m
+                    + corners[chunks[k + 1][0]].station_m)
+            out.append(piece)
+    return out
 
 
 def generate_route_path(route_points: Sequence[Point], radius_m: float,
@@ -913,7 +1070,10 @@ def generate_route_path(route_points: Sequence[Point], radius_m: float,
                         cancel: Optional[Callable[[], bool]] = None,
                         progress: Optional[Callable[[int, int], None]] = None,
                         radius_for_vertex: Optional[
-                            Callable[[int, float], float]] = None
+                            Callable[[int, float], float]] = None,
+                        extra_controls: Optional[
+                            Sequence[Tuple[float, Point]]] = None,
+                        max_cluster_size: int = 8
                         ) -> RoutePathResult:
     """Generate a radius-constrained path over every route course change.
 
@@ -922,12 +1082,23 @@ def generate_route_path(route_points: Sequence[Point], radius_m: float,
     uses the compound solver for every corner (the historical name is kept in
     persisted configs, but all geometry course changes are controls).
 
+    Robustness contract: a turn cluster crowded by its neighbour or the
+    route ends merges with the crowding group instead of failing, and a
+    cluster with no exact-through solution degrades to a best-fit racing
+    line (dropping the smallest course changes first) reported per corner
+    as ``best_fit`` / ``review`` with the real vertex miss — generation
+    only errors when not even an entry-to-exit path exists.
+
     ``progress(done_groups, total_groups)`` is called before each turn group
     is solved and once after the last — compound clusters dominate the wall
     time, so this is the callback a UI progress bar should follow.
     ``radius_for_vertex(vertex_index, station_m)`` supplies a per-corner
     minimum radius (e.g. banded by water depth); ``radius_m`` remains the
     scalar default and validation floor.
+    ``extra_controls`` are manual shaping points ``(station_m, (x, y))`` the
+    path must additionally pass through (user path adjustments); each forces
+    a compound solve around its station.  ``max_cluster_size`` bounds the
+    corners solved in one heading lattice; larger clusters are chunked.
     """
     route = clean_polyline(route_points)
     if len(route) < 2:
@@ -938,6 +1109,11 @@ def generate_route_path(route_points: Sequence[Point], radius_m: float,
     chainages = cumulative_lengths(route)
     corners = _route_corners(route, chainages, radius,
                              chord_tolerance_m, radius_for_vertex)
+    corners.extend(_adjustment_corners(route, chainages, extra_controls or [],
+                                       radius, radius_for_vertex))
+    corners.sort(key=lambda corner: corner.station_m)
+    for number, corner in enumerate(corners, 1):
+        corner.number = number
     if not corners:
         return RoutePathResult(
             points=list(route), length_m=chainages[-1],
@@ -945,16 +1121,24 @@ def generate_route_path(route_points: Sequence[Point], radius_m: float,
             course_change_count=0)
 
     through = mode in ("through_ac", "through", "pass_through")
-    groups = _cluster_corner_numbers(corners, through)
+    plan_items: List[Dict] = [
+        {"group": group, "start": None, "end": None}
+        for group in _cluster_corner_numbers(corners, through)]
+    plan_items = _split_oversized(plan_items, corners,
+                                  max(2, int(max_cluster_size)))
     replacements: List[_Replacement] = []
     compound_count = 0
-    for group_index, group in enumerate(groups):
+    index = 0
+    while index < len(plan_items):
         if cancel is not None and cancel():
             raise PathCancelled()
         if progress is not None:
-            progress(group_index, len(groups))
+            progress(index, len(plan_items))
+        item = plan_items[index]
+        group = item["group"]
         use_compound = through or len(group) > 1 \
-            or corners[group[0]].fillet is None
+            or corners[group[0]].fillet is None \
+            or any(corners[member].adjustment for member in group)
         if not use_compound:
             corner = corners[group[0]]
             fillet = corner.fillet
@@ -965,12 +1149,16 @@ def generate_route_path(route_points: Sequence[Point], radius_m: float,
                 corner.station_m + fillet.tangent_distance_m,
                 fillet.points, [fillet.primitive], [corner.number],
                 "fillet", fillet.miss_distance_m, corner.radius_m))
+            index += 1
             continue
 
-        compound_count += 1
         previous_end = replacements[-1].end_m if replacements else 0.0
-        if group_index + 1 < len(groups):
-            following = corners[groups[group_index + 1][0]]
+        if item.get("start") is not None:
+            previous_end = max(previous_end, float(item["start"]))
+        if item.get("end") is not None:
+            next_start = float(item["end"])
+        elif index + 1 < len(plan_items):
+            following = corners[plan_items[index + 1]["group"][0]]
             following_pad = max(2.0 * following.radius_m,
                                 (following.tangent_m
                                  if math.isfinite(following.tangent_m)
@@ -980,13 +1168,59 @@ def generate_route_path(route_points: Sequence[Point], radius_m: float,
                              following.station_m - following_pad)
         else:
             next_start = chainages[-1]
+        requested_start, requested_end, group_radius = \
+            _compound_window(corners, group)
+        start = max(0.0, requested_start, previous_end)
+        end = min(chainages[-1], requested_end, next_start)
+        if end - start <= max(group_radius * 0.1, 1e-6):
+            # The cluster is crowded.  Merge with whichever neighbour is
+            # doing the crowding and re-solve the union as one cluster —
+            # the "not enough route either side" failure becomes a bigger
+            # compound solve instead of an error.
+            crowded_by_previous = index > 0 and item.get("start") is None \
+                and previous_end > requested_start + 1e-9
+            crowded_by_next = index + 1 < len(plan_items) \
+                and item.get("end") is None \
+                and next_start < requested_end - 1e-9
+            if crowded_by_previous:
+                previous_item = plan_items.pop(index - 1)
+                if replacements:
+                    replacements.pop()
+                item["group"] = previous_item["group"] + group
+                item["start"] = previous_item.get("start")
+                index -= 1
+            elif crowded_by_next:
+                next_item = plan_items.pop(index + 1)
+                item["group"] = group + next_item["group"]
+                item["end"] = next_item.get("end")
+            elif end > start + 1e-6:
+                # Route ends bind on both sides (a short scoped route):
+                # solve with whatever window exists; the best-fit ladder
+                # keeps this from failing outright.
+                pass
+            else:
+                raise PathGeometryError(
+                    f"The scoped route around station "
+                    f"{corners[group[0]].station_m:.0f} m is shorter than "
+                    f"the {group_radius:g} m turning radius allows — there "
+                    "is no usable route length to fit a path. Reduce the "
+                    "radius or extend the plan scope.")
+            if crowded_by_previous or crowded_by_next:
+                if len(item["group"]) > max(2, int(max_cluster_size)):
+                    merged = _split_oversized([item], corners,
+                                              max(2, int(max_cluster_size)))
+                    plan_items[index:index + 1] = merged
+                continue
+
+        compound_count += 1
         replacements.append(_compound_replacement(
             route, chainages, corners, group,
             chord_tolerance_m, max_deviation_m,
-            previous_end, next_start, cancel))
+            start, end, cancel))
+        index += 1
 
     if progress is not None:
-        progress(len(groups), len(groups))
+        progress(len(plan_items), len(plan_items))
 
     # Stitch untouched RPL pieces and replacements in travel order.
     points: List[Point] = []
@@ -1019,24 +1253,45 @@ def generate_route_path(route_points: Sequence[Point], radius_m: float,
     diagnostics: List[RoutePathDiagnostic] = []
     for corner in corners:
         replacement = replacement_by_corner[corner.number]
+        dropped = corner.number in replacement.dropped
         if replacement.solution == "fillet":
             miss = corner.fillet.miss_distance_m if corner.fillet else 0.0
             message = "Tangent circular fillet."
         else:
-            miss = 0.0
-            message = ("Compound bounded-curvature solution through every "
-                       "course-change point in the cluster, solved at "
-                       f"{replacement.solved_radius_m:g} m (the largest "
-                       "radius requirement among its corners).")
-        status = "ok"
-        if max_deviation_m is None or max_deviation_m <= 0.0:
+            miss = replacement.misses.get(corner.number, 0.0)
+            if corner.adjustment:
+                message = (f"Manual path adjustment; the path passes "
+                           f"{miss:.2f} m from the requested point.")
+            elif replacement.solution == "best_fit":
+                message = (
+                    "No bounded-curvature path passes through every "
+                    "course-change point in this cluster at "
+                    f"{replacement.solved_radius_m:g} m — best-fit path "
+                    "shown"
+                    + (" (this point was dropped from the exact-through "
+                       f"controls; vertex miss {miss:.2f} m)." if dropped
+                       else f" (vertex miss {miss:.2f} m)."))
+            else:
+                message = ("Compound bounded-curvature solution through "
+                           "every course-change point in the cluster, "
+                           f"solved at {replacement.solved_radius_m:g} m "
+                           "(the largest radius requirement among its "
+                           "corners).")
+        if replacement.solution == "best_fit":
+            status = "review"
+        elif max_deviation_m is None or max_deviation_m <= 0.0:
             status = "review" if replacement.solution == "compound" else "ok"
+        else:
+            status = "ok"
+        side = "" if corner.adjustment else \
+            ("port" if corner.turn_rad > 0.0 else "starboard")
         diagnostics.append(RoutePathDiagnostic(
             corner.number, corner.index, corner.station_m,
-            math.degrees(corner.turn_rad),
-            "port" if corner.turn_rad > 0.0 else "starboard",
-            replacement.solution, miss, replacement.max_offset_m,
-            status, message, corner.radius_m))
+            math.degrees(corner.turn_rad), side,
+            "adjustment" if corner.adjustment else replacement.solution,
+            miss, replacement.max_offset_m,
+            status, message, corner.radius_m,
+            "adjustment" if corner.adjustment else "corner"))
     return RoutePathResult(
         points=points, primitives=primitives,
         max_offset_m=maximum, rms_offset_m=rms,

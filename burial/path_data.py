@@ -37,7 +37,43 @@ DEFAULT_CONFIG = {
     # water depth is at most ``max_depth_m`` uses that band's radius; empty
     # means the tool configuration's constant radius applies everywhere.
     "radius_rules": [],
+    # Manual path adjustments: [{"kp": ..., "dcc_m": ...}, ...].  Each is a
+    # point the tool path must additionally pass through, ``dcc_m`` metres
+    # cross-course from the RPL at that KP (positive = port of travel).
+    "adjustments": [],
 }
+
+# More shaping points than this is no longer "tweaking" — refuse early
+# rather than letting the compound solver grind.
+MAX_ADJUSTMENTS = 100
+
+
+def sanitise_adjustments(raw) -> List[Dict[str, float]]:
+    """Ordered, validated manual path adjustments; drops unusable entries."""
+    out: List[Dict[str, float]] = []
+    if not isinstance(raw, (list, tuple)):
+        return out
+    for value in raw:
+        if isinstance(value, dict):
+            kp, dcc = value.get("kp"), value.get("dcc_m")
+        elif isinstance(value, (list, tuple)) and len(value) >= 2:
+            kp, dcc = value[0], value[1]
+        else:
+            continue
+        try:
+            kp, dcc = float(kp), float(dcc)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(kp) and math.isfinite(dcc) and kp >= 0.0:
+            out.append({"kp": round(kp, 5), "dcc_m": round(dcc, 2)})
+    out.sort(key=lambda item: item["kp"])
+    deduped: List[Dict[str, float]] = []
+    for item in out:
+        if deduped and abs(item["kp"] - deduped[-1]["kp"]) <= 1e-6:
+            deduped[-1] = item   # later entry at the same KP wins
+        else:
+            deduped.append(item)
+    return deduped[:MAX_ADJUSTMENTS]
 
 
 def sanitise_radius_rules(raw) -> List[Dict[str, float]]:
@@ -107,6 +143,7 @@ def config_from_plan(plan: Optional[Dict]) -> Dict:
     out["generate_barge"] = bool(out.get("generate_barge"))
     out["vessel_id"] = str(out.get("vessel_id") or "")
     out["radius_rules"] = sanitise_radius_rules(out.get("radius_rules"))
+    out["adjustments"] = sanitise_adjustments(out.get("adjustments"))
     return out
 
 
@@ -173,6 +210,12 @@ def build_fingerprints(plan: Dict, route_fingerprint: str,
         # never samples depth.
         "radius_depth": depth_fingerprint if radius_rules else "",
     }
+    # Only present when non-empty so pre-adjustment results keep their
+    # stored fingerprints (adding the key unconditionally would flip every
+    # existing result to stale on upgrade).
+    adjustments = sanitise_adjustments(path_config.get("adjustments"))
+    if adjustments:
+        tool_payload["adjustments"] = adjustments
     tool_fp = digest(tool_payload)
     barge_payload = {
         "tool_path": tool_fp,

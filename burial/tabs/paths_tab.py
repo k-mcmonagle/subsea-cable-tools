@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import json
 import math
-from typing import Dict, Optional
+from typing import Dict, List, Optional
+
+import pyqtgraph as pg
 
 from qgis.core import QgsApplication, QgsProject
+from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -454,6 +457,8 @@ class PathsTab(QWidget):
         self._task: Optional[InstallationPathTask] = None
         self._generation = 0
         self._radius_rules = []  # staged bands; persisted on Apply/Generate
+        self._adjustments: List[Dict] = []  # staged manual shaping points
+        self._dcc_series: tuple = ([], [])  # plotted KP / DCC arrays
 
         layout = QVBoxLayout(self)
         intro = QLabel(
@@ -483,10 +488,12 @@ class PathsTab(QWidget):
             "Fillet uses tangent radius arcs and may miss the original "
             "vertex. Pass-through optimises a shared heading at every route "
             "vertex, allowing turn-out then turn-in while retaining the "
-            "minimum radius. Pass-through solves every course change as a "
-            "compound cluster and can take several minutes on a route with "
-            "many course changes; generation runs in the background and can "
-            "be stopped at any time.")
+            "minimum radius. Dense course-change chains are solved in "
+            "bounded chunks so progress keeps moving; a cluster with no "
+            "exact-through solution degrades to a reviewed best fit "
+            "(smallest course changes dropped first, real vertex miss "
+            "reported) instead of failing. Generation runs in the "
+            "background and can be stopped at any time.")
         form.addRow("Path objective:", self.mode_combo)
         radius_rules_row = QHBoxLayout()
         self.radius_rules_label = QLabel("Constant tool radius")
@@ -567,6 +574,49 @@ class PathsTab(QWidget):
         barge_form.addRow(barge_note)
         layout.addWidget(barge)
 
+        adjust_box = QGroupBox("Path adjustments (manual shaping points)")
+        adjust_layout = QVBoxLayout(adjust_box)
+        adjust_note = QLabel(
+            "Points the tool path must additionally pass through, as KP + "
+            "cross-course offset (positive = port of travel). Add them by "
+            "clicking the map beside the route — each click stages one "
+            "adjustment, right-click or Esc finishes — or edit the values "
+            "in the table. Click Generate to re-solve with the staged "
+            "adjustments; they are saved with the path settings and mark "
+            "the stored result stale until regenerated.")
+        adjust_note.setWordWrap(True)
+        adjust_note.setStyleSheet(ui_helpers.hint_style())
+        adjust_layout.addWidget(adjust_note)
+        self.adjust_table = QTableWidget(0, 3)
+        self.adjust_table.setHorizontalHeaderLabels(
+            ["KP", "DCC (m)", "Side"])
+        self.adjust_table.horizontalHeader().setSectionResizeMode(
+            HEADER_RESIZE_MODE_STRETCH)
+        self.adjust_table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
+        self.adjust_table.setSelectionMode(SELECTION_MODE_SINGLE)
+        self.adjust_table.setMaximumHeight(140)
+        self.adjust_table.itemChanged.connect(self._on_adjust_item_changed)
+        self.adjust_table.itemSelectionChanged.connect(
+            self._adjust_row_selected)
+        adjust_layout.addWidget(self.adjust_table)
+        adjust_buttons = QHBoxLayout()
+        self.adjust_pick_button = QPushButton("Add by map click…")
+        self.adjust_pick_button.setToolTip(
+            "Activate a map tool: every left-click beside the route stages "
+            "one adjustment at the clicked KP and offset. Right-click or "
+            "Esc finishes and saves the staged list.")
+        self.adjust_pick_button.clicked.connect(self._add_adjustments_by_map)
+        self.adjust_remove_button = QPushButton("Remove selected")
+        self.adjust_remove_button.clicked.connect(self._remove_adjustment)
+        self.adjust_clear_button = QPushButton("Clear all")
+        self.adjust_clear_button.clicked.connect(self._clear_adjustments)
+        adjust_buttons.addWidget(self.adjust_pick_button)
+        adjust_buttons.addWidget(self.adjust_remove_button)
+        adjust_buttons.addWidget(self.adjust_clear_button)
+        adjust_buttons.addStretch(1)
+        adjust_layout.addLayout(adjust_buttons)
+        layout.addWidget(adjust_box)
+
         actions = QHBoxLayout()
         self.generate_button = QPushButton("Generate installation paths")
         self.stop_button = QPushButton("Stop")
@@ -611,6 +661,38 @@ class PathsTab(QWidget):
         self.summary_label = QLabel("")
         self.summary_label.setWordWrap(True)
         layout.addWidget(self.summary_label)
+
+        self.dcc_box = QGroupBox("Deviation from RPL — KP vs DCC")
+        dcc_layout = QVBoxLayout(self.dcc_box)
+        self.dcc_plot = pg.PlotWidget()
+        self.dcc_plot.setBackground("w")   # match the profile pane
+        self.dcc_plot.setMaximumHeight(230)
+        self.dcc_plot.setMinimumHeight(140)
+        plot_item = self.dcc_plot.getPlotItem()
+        plot_item.setLabel("bottom", "KP (km)")
+        plot_item.setLabel("left", "DCC (m)  + port / − starboard")
+        plot_item.showGrid(x=True, y=True, alpha=0.25)
+        plot_item.addLine(y=0.0, pen=pg.mkPen((150, 150, 150), width=1))
+        self._dcc_curve = plot_item.plot(
+            [], [], pen=pg.mkPen((0, 166, 214), width=1.6))
+        self._dcc_markers = pg.ScatterPlotItem(size=8, pen=pg.mkPen(None))
+        plot_item.addItem(self._dcc_markers)
+        try:
+            self.dcc_plot.scene().sigMouseMoved.connect(self._dcc_hover)
+            self.dcc_plot.scene().sigMouseClicked.connect(self._dcc_clicked)
+        except Exception:
+            pass
+        dcc_layout.addWidget(self.dcc_plot)
+        self.dcc_readout = QLabel(
+            "Hover for KP / DCC; click to go to that KP on the map and "
+            "profile. Markers are course changes (red = review, purple "
+            "diamonds = manual adjustments).")
+        self.dcc_readout.setWordWrap(True)
+        self.dcc_readout.setStyleSheet(ui_helpers.hint_style())
+        dcc_layout.addWidget(self.dcc_readout)
+        self.dcc_box.setVisible(False)
+        layout.addWidget(self.dcc_box)
+
         self.table = QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels([
             "KP", "Course change (°)", "Side", "Solution", "Radius (m)",
@@ -622,7 +704,11 @@ class PathsTab(QWidget):
         self.table.setSelectionMode(SELECTION_MODE_SINGLE)
         self.table.setToolTip(
             "One diagnostic for every non-collinear geometry vertex in the "
-            "scoped RPL, independent of any A/C label or event threshold.")
+            "scoped RPL, independent of any A/C label or event threshold. "
+            "Select a row to highlight its KP on the map; double-click to "
+            "zoom the map and profile there.")
+        self.table.itemSelectionChanged.connect(self._diag_row_selected)
+        self.table.cellDoubleClicked.connect(self._diag_row_activated)
         layout.addWidget(self.table, 1)
 
         model.planChanged.connect(self.refresh)
@@ -648,6 +734,7 @@ class PathsTab(QWidget):
             "vessel_id": self._vessel_id(),
             "radius_rules": path_data.sanitise_radius_rules(
                 self._radius_rules),
+            "adjustments": path_data.sanitise_adjustments(self._adjustments),
         }
 
     def _apply_settings(self) -> bool:
@@ -754,6 +841,193 @@ class PathsTab(QWidget):
             MESSAGE_BOX_YES | MESSAGE_BOX_NO, MESSAGE_BOX_NO)
         if answer == MESSAGE_BOX_YES:
             self.model.delete_vessel(row.get("vessel_id") or "")
+
+    # -- path adjustments ------------------------------------------------------
+    def _refresh_adjust_table(self) -> None:
+        was_loading = self._loading
+        self._loading = True
+        try:
+            self.adjust_table.setRowCount(len(self._adjustments))
+            for row, item in enumerate(self._adjustments):
+                dcc = float(item.get("dcc_m") or 0.0)
+                side = "port" if dcc > 0 else ("starboard" if dcc < 0 else "—")
+                values = [f"{float(item.get('kp') or 0.0):.3f}",
+                          f"{dcc:.1f}", side]
+                for column, value in enumerate(values):
+                    cell = QTableWidgetItem(value)
+                    if column == 2:   # side is derived from the DCC sign
+                        cell.setFlags(Qt.ItemFlag.ItemIsEnabled
+                                      | Qt.ItemFlag.ItemIsSelectable)
+                    self.adjust_table.setItem(row, column, cell)
+        finally:
+            self._loading = was_loading
+
+    def _on_adjust_item_changed(self, _item) -> None:
+        if self._loading:
+            return
+        rows = []
+        for row in range(self.adjust_table.rowCount()):
+            kp_item = self.adjust_table.item(row, 0)
+            dcc_item = self.adjust_table.item(row, 1)
+            try:
+                rows.append({
+                    "kp": float((kp_item.text() if kp_item else "")
+                                .replace(",", ".")),
+                    "dcc_m": float((dcc_item.text() if dcc_item else "")
+                                   .replace(",", ".")),
+                })
+            except (TypeError, ValueError):
+                continue
+        self._adjustments = path_data.sanitise_adjustments(rows)
+        self._refresh_adjust_table()
+        self._apply_settings()
+
+    def _adjust_row_selected(self) -> None:
+        row = self.adjust_table.currentRow()
+        if self.dock is None or not (0 <= row < len(self._adjustments)):
+            return
+        self.dock.highlight_kp(float(self._adjustments[row].get("kp") or 0.0))
+
+    def _add_adjustments_by_map(self) -> None:
+        if self.dock is None or not self.model.plan:
+            return
+
+        def picked(kp: float, dcc_m: float) -> None:
+            staged = self._adjustments + [{"kp": kp, "dcc_m": dcc_m}]
+            self._adjustments = path_data.sanitise_adjustments(staged)
+            self._refresh_adjust_table()
+            self.status_label.setText(
+                f"{len(self._adjustments)} path adjustment(s) staged — "
+                "right-click or Esc to finish picking, then Generate to "
+                "re-solve.")
+
+        self.dock.pick_route_offset_on_map(
+            picked,
+            "Click beside the route to place path adjustments "
+            "(right-click or Esc finishes).",
+            on_finished=self._apply_settings)
+
+    def _remove_adjustment(self) -> None:
+        row = self.adjust_table.currentRow()
+        if 0 <= row < len(self._adjustments):
+            del self._adjustments[row]
+            self._refresh_adjust_table()
+            self._apply_settings()
+
+    def _clear_adjustments(self) -> None:
+        if not self._adjustments:
+            return
+        answer = QMessageBox.question(
+            self, "Clear path adjustments",
+            f"Remove all {len(self._adjustments)} manual shaping point(s)?",
+            MESSAGE_BOX_YES | MESSAGE_BOX_NO, MESSAGE_BOX_NO)
+        if answer == MESSAGE_BOX_YES:
+            self._adjustments = []
+            self._refresh_adjust_table()
+            self._apply_settings()
+
+    # -- DCC plot --------------------------------------------------------------
+    def _dcc_at(self, kp: float) -> Optional[float]:
+        kps, values = self._dcc_series
+        if not kps:
+            return None
+        import bisect
+
+        index = bisect.bisect_left(kps, float(kp))
+        if index <= 0:
+            return values[0]
+        if index >= len(kps):
+            return values[-1]
+        x0, x1 = kps[index - 1], kps[index]
+        if x1 <= x0:
+            return values[index]
+        t = (float(kp) - x0) / (x1 - x0)
+        return values[index - 1] + t * (values[index] - values[index - 1])
+
+    def _refresh_dcc_plot(self, summary: Dict, diagnostics) -> None:
+        series = summary.get("dcc") if isinstance(summary, dict) else None
+        kps = list((series or {}).get("kp") or [])
+        values = list((series or {}).get("m") or [])
+        if len(kps) != len(values) or len(kps) < 2:
+            self._dcc_series = ([], [])
+            self.dcc_box.setVisible(False)
+            return
+        # The hover/marker interpolator needs ascending KP; the raw series
+        # is in travel order (descending for direction −1, locally
+        # non-monotone through turn-out loops), so keep a sorted copy.
+        order = sorted(range(len(kps)), key=kps.__getitem__)
+        self._dcc_series = ([kps[i] for i in order],
+                            [values[i] for i in order])
+        self._dcc_curve.setData(kps, values)
+        spots = []
+        for item in diagnostics if isinstance(diagnostics, list) else []:
+            try:
+                kp = float(item.get("kp"))
+            except (TypeError, ValueError):
+                continue
+            dcc = self._dcc_at(kp)
+            if dcc is None:
+                continue
+            adjustment = (item.get("control_kind") == "adjustment")
+            review = (item.get("status") or "ok") != "ok"
+            spots.append({
+                "pos": (kp, dcc),
+                "symbol": "d" if adjustment else "o",
+                "brush": pg.mkBrush(122, 61, 184) if adjustment
+                else (pg.mkBrush(214, 39, 40) if review
+                      else pg.mkBrush(53, 168, 83)),
+                "data": kp,
+            })
+        self._dcc_markers.setData(spots)
+        self.dcc_box.setVisible(True)
+
+    def _dcc_hover(self, pos) -> None:
+        try:
+            plot_item = self.dcc_plot.getPlotItem()
+            if not plot_item.sceneBoundingRect().contains(pos):
+                return
+            view_point = plot_item.vb.mapSceneToView(pos)
+            kp = float(view_point.x())
+        except Exception:
+            return
+        dcc = self._dcc_at(kp)
+        if dcc is None:
+            return
+        side = "port" if dcc > 0 else ("starboard" if dcc < 0 else "on route")
+        self.dcc_readout.setText(
+            f"KP {kp:.3f} — DCC {dcc:+.1f} m ({side}). Click to go to this "
+            "KP on the map and profile.")
+        if self.dock is not None:
+            self.dock.highlight_kp(kp)
+
+    def _dcc_clicked(self, event) -> None:
+        try:
+            plot_item = self.dcc_plot.getPlotItem()
+            view_point = plot_item.vb.mapSceneToView(event.scenePos())
+            kp = float(view_point.x())
+        except Exception:
+            return
+        if self.dock is not None and self._dcc_series[0]:
+            self.dock.goto_kp(kp)
+
+    # -- diagnostics table sync -------------------------------------------------
+    def _diag_kp_for_row(self, row: int) -> Optional[float]:
+        item = self.table.item(row, 0)
+        payload = item.data(ITEM_DATA_USER_ROLE) if item else None
+        try:
+            return float((payload or {}).get("kp"))
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+    def _diag_row_selected(self) -> None:
+        kp = self._diag_kp_for_row(self.table.currentRow())
+        if kp is not None and self.dock is not None:
+            self.dock.highlight_kp(kp)
+
+    def _diag_row_activated(self, row: int, _column: int) -> None:
+        kp = self._diag_kp_for_row(row)
+        if kp is not None and self.dock is not None:
+            self.dock.goto_kp(kp)
 
     def _generate(self) -> None:
         if self._task is not None:
@@ -943,6 +1217,9 @@ class PathsTab(QWidget):
             self._radius_rules = path_data.sanitise_radius_rules(
                 config.get("radius_rules"))
             self._refresh_radius_rules_label()
+            self._adjustments = path_data.sanitise_adjustments(
+                config.get("adjustments"))
+            self._refresh_adjust_table()
             selected_vessel = str(config.get("vessel_id") or "")
             self.vessel_combo.clear()
             self.vessel_combo.addItem("(no vessel selected)", "")
@@ -1036,6 +1313,20 @@ class PathsTab(QWidget):
                         f"{float(summary.get('radius_min_m') or 0):g}–"
                         f"{float(summary.get('radius_max_m') or 0):g} m "
                         f"(depth-based)"))
+                dcc_max = summary.get("dcc_max_abs_m")
+                if dcc_max is not None:
+                    try:
+                        bits.append(
+                            f"max DCC {float(dcc_max):,.1f} m at KP "
+                            f"{float(summary.get('dcc_max_kp')):.3f}")
+                    except (TypeError, ValueError):
+                        pass
+                if summary.get("best_fit_count"):
+                    bits.append(f"{int(summary['best_fit_count'])} "
+                                "best-fit course change(s) — review")
+                if summary.get("adjustment_count"):
+                    bits.append(f"{int(summary['adjustment_count'])} "
+                                "manual adjustment(s)")
                 depth_diff_worst = summary.get("depth_diff_worst_m")
                 if depth_diff_worst is not None:
                     bits.append(
@@ -1047,6 +1338,7 @@ class PathsTab(QWidget):
             else:
                 self.summary_label.setText("")
             diagnostics = path_data.parse_json_field(row, "diagnostics_json", [])
+            self._refresh_dcc_plot(summary, diagnostics)
             self.table.setRowCount(0)
             for item in diagnostics if isinstance(diagnostics, list) else []:
                 table_row = self.table.rowCount()
@@ -1071,6 +1363,10 @@ class PathsTab(QWidget):
             self.apply_button.setEnabled(available and self._task is None)
             self.radius_rules_button.setEnabled(
                 available and self._task is None)
+            for button in (self.adjust_pick_button,
+                           self.adjust_remove_button,
+                           self.adjust_clear_button):
+                button.setEnabled(available and self._task is None)
             self.generate_button.setEnabled(available and self._task is None)
             self.clear_button.setEnabled(bool(row) and self._task is None)
         finally:

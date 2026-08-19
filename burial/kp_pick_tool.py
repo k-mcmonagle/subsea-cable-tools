@@ -136,3 +136,63 @@ class KpPickTool(QgsMapTool):
                 self._on_finished()
             except Exception:
                 pass
+
+
+class RouteOffsetPickTool(KpPickTool):
+    """Multi-shot pick delivering ``(kp, signed cross-course offset)``.
+
+    Each left-click reports the nearest route KP plus the click's DCC in
+    metres, signed positive to port of the direction of travel
+    (``direction`` −1 flips the side). The tool stays active for further
+    clicks until right-click, Esc or a map-tool switch ends it, so several
+    path adjustments can be placed in one pass.
+    """
+
+    def __init__(self, canvas, route, on_picked, direction: int = 1,
+                 on_finished=None):
+        super().__init__(canvas, route, on_picked, on_finished)
+        self._direction = 1 if int(direction or 1) >= 0 else -1
+
+    def _signed_offset(self, wgs_click, hit) -> Optional[float]:
+        """Sign the KPHit's DCC by which side of the route the click is."""
+        import math
+
+        kp = float(hit.kp_km)
+        ahead = self._route.point_at_kp(kp + 0.002, clamp=True)
+        behind = self._route.point_at_kp(max(kp - 0.002, 0.0), clamp=True)
+        snapped = hit.snapped_xy
+        if ahead is None or behind is None or snapped is None:
+            return None
+        scale = math.cos(math.radians(float(snapped.y())))
+        vx = (ahead.x() - behind.x()) * scale
+        vy = ahead.y() - behind.y()
+        wx = (wgs_click.x() - snapped.x()) * scale
+        wy = wgs_click.y() - snapped.y()
+        cross = vx * wy - vy * wx
+        side = 1.0 if cross > 0.0 else (-1.0 if cross < 0.0 else 0.0)
+        return side * self._direction * float(hit.dcc_m)
+
+    def canvasReleaseEvent(self, event) -> None:  # noqa: N802 (QGIS API)
+        if event.button() == Qt.MouseButton.RightButton:
+            self._finish()
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        map_point = self.toMapCoordinates(event.pos())
+        wgs_point = self._to_wgs84(map_point)
+        if wgs_point is None:
+            return
+        try:
+            hit = self._route.kp_at_point(wgs_point)
+        except Exception:
+            return
+        if hit.snapped_xy is None:
+            return
+        offset = self._signed_offset(wgs_point, hit)
+        if offset is None:
+            return
+        try:
+            # Multi-shot: deliver and stay active for the next click.
+            self._on_picked(round(float(hit.kp_km), 3), round(offset, 1))
+        except Exception:
+            self._finish()

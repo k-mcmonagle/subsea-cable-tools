@@ -72,6 +72,9 @@ class PathWork:
     # Water-depth-banded minimum turning radius, sanitised and ordered by
     # path_data.sanitise_radius_rules.  Empty = constant tool radius.
     radius_rules: List[Dict] = field(default_factory=list)
+    # Manual path adjustments [{"kp": ..., "dcc_m": ...}] (sanitised);
+    # each becomes a mandatory off-route control for the solver.
+    adjustments: List[Dict] = field(default_factory=list)
 
 
 @dataclass
@@ -130,6 +133,8 @@ def build_path_work(route: RouteFrame, distance: QgsDistanceArea, plan: Dict,
         depth=depth,
         depth_samples=(list(depth_samples) if depth_samples is not None else None),
         radius_rules=path_data.sanitise_radius_rules(radius_rules or []),
+        adjustments=path_data.sanitise_adjustments(
+            (config or {}).get("adjustments")),
     )
 
 
@@ -234,15 +239,15 @@ class _RoutePlane:
                 "A generated point could not be located against the route.")
         return best[1], best[2], best[3], best[4], best[5]
 
-    def to_wgs84(self, point: Point) -> Tuple[Point, float]:
-        _index, _fraction, residual_x, residual_y, kp = self.locate(point)
+    def _place(self, kp: float, residual_x: float, residual_y: float
+               ) -> Point:
         base = self.source_route.point_at_kp(kp, clamp=True)
         if base is None:
             raise path_geometry.PathGeometryError(
                 "A generated path station could not be placed on the RPL.")
         offset = math.hypot(residual_x, residual_y)
         if offset <= 1e-7:
-            return (float(base.x()), float(base.y())), kp
+            return (float(base.x()), float(base.y()))
         # The unrolled plane's +X/+Y axes are east/north because every leg
         # was accumulated from its true bearing. Retaining both residual
         # components also handles a compound path whose nearest location is
@@ -251,7 +256,90 @@ class _RoutePlane:
         bearing = math.atan2(residual_x, residual_y)
         placed = self.distance.computeSpheroidProject(
             base, offset, bearing)
-        return (float(placed.x()), float(placed.y())), kp
+        return (float(placed.x()), float(placed.y()))
+
+    def to_wgs84(self, point: Point) -> Tuple[Point, float]:
+        _index, _fraction, residual_x, residual_y, kp = self.locate(point)
+        return self._place(kp, residual_x, residual_y), kp
+
+    def to_wgs84_full(self, point: Point) -> Tuple[Point, float, float]:
+        """((lon, lat), route KP, signed cross-course offset in metres).
+
+        Positive DCC lies to port of the direction of travel (the plane's
+        points are already in travel order).
+        """
+        index, _fraction, residual_x, residual_y, kp = self.locate(point)
+        a, b = self.points[index], self.points[index + 1]
+        cross = (b[0] - a[0]) * residual_y - (b[1] - a[1]) * residual_x
+        offset = math.hypot(residual_x, residual_y)
+        dcc = offset if cross > 0.0 else (-offset if cross < 0.0 else 0.0)
+        return self._place(kp, residual_x, residual_y), kp, dcc
+
+    def station_control_for_kp(self, kp: float, dcc_m: float
+                               ) -> Tuple[float, Point]:
+        """(plane station, plane point) for a KP + signed cross-course
+        offset — the solver-frame form of one manual path adjustment."""
+        kps = self.kps
+        if not hasattr(self, "_chainages"):
+            self._chainages = path_geometry.cumulative_lengths(self.points)
+        chainages = self._chainages
+        ascending = kps[-1] >= kps[0]
+        lo, hi = (kps[0], kps[-1]) if ascending else (kps[-1], kps[0])
+        value = min(max(float(kp), lo), hi)
+        segment = None
+        for index in range(len(kps) - 1):
+            a, b = kps[index], kps[index + 1]
+            if (a - 1e-12 <= value <= b + 1e-12) if ascending \
+                    else (b - 1e-12 <= value <= a + 1e-12):
+                segment = index
+                break
+        if segment is None:
+            segment = len(kps) - 2
+        span = kps[segment + 1] - kps[segment]
+        t = 0.0 if abs(span) <= 1e-12 else (value - kps[segment]) / span
+        t = min(max(t, 0.0), 1.0)
+        a, b = self.points[segment], self.points[segment + 1]
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        length = math.hypot(dx, dy)
+        if length <= 1e-9:
+            raise path_geometry.PathGeometryError(
+                f"No usable route leg at KP {value:.3f} for a path "
+                "adjustment.")
+        base = (a[0] + t * dx, a[1] + t * dy)
+        station = chainages[segment] + t * length
+        # Port of travel = left of the leg direction.
+        nx, ny = -dy / length, dx / length
+        return station, (base[0] + float(dcc_m) * nx,
+                         base[1] + float(dcc_m) * ny)
+
+
+def _downsample_dcc(kps: Sequence[float], values: Sequence[float],
+                    limit: int = 2400) -> Dict[str, List[float]]:
+    """Bounded KP-vs-DCC series keeping each bucket's worst excursion.
+
+    The persisted summary must stay a review artefact, not a bulk dataset:
+    buckets keep the sample with the largest |DCC| so peaks are never
+    smoothed away, and the endpoints always survive.
+    """
+    count = len(kps)
+    if count == 0 or count != len(values):
+        return {"kp": [], "m": []}
+    keep: List[int] = []
+    if count <= limit:
+        keep = list(range(count))
+    else:
+        keep.append(0)
+        buckets = max(limit - 2, 1)
+        for bucket in range(buckets):
+            lo = 1 + bucket * (count - 2) // buckets
+            hi = 1 + (bucket + 1) * (count - 2) // buckets
+            if hi <= lo:
+                continue
+            keep.append(max(range(lo, hi), key=lambda i: abs(values[i])))
+        keep.append(count - 1)
+        keep = sorted(set(keep))
+    return {"kp": [round(float(kps[i]), 5) for i in keep],
+            "m": [round(float(values[i]), 2) for i in keep]}
 
 
 def _interpolated_depth(samples: Sequence[Tuple[float, Optional[float]]],
@@ -391,26 +479,34 @@ class InstallationPathTask(QgsTask):
                         f"Solving {total} turn group(s) at bounded curvature…")
                 self.setProgress(10.0 + 45.0 * done / total)
 
+            extra_controls = []
+            for adjustment in work.adjustments:
+                extra_controls.append(plane.station_control_for_kp(
+                    adjustment.get("kp"), adjustment.get("dcc_m")))
+
             solution = path_geometry.generate_route_path(
                 plane.points, work.radius_m, work.mode,
                 (work.max_deviation_m if work.max_deviation_m > 0.0 else None),
                 work.chord_tolerance_m, cancel=self.isCanceled,
                 progress=_solve_progress,
-                radius_for_vertex=radius_for_vertex)
+                radius_for_vertex=radius_for_vertex,
+                extra_controls=extra_controls)
             self._check_cancel()
             self.setProgress(58.0)
 
             self.progressMessage.emit("Placing the tool path on the map…")
             tool_wgs: List[Point] = []
             tool_kps: List[float] = []
+            tool_dcc: List[float] = []
             total = max(len(solution.points), 1)
             for index, point in enumerate(solution.points):
                 if index % 256 == 0:
                     self._check_cancel()
                     self.setProgress(58.0 + 17.0 * index / total)
-                mapped, kp = plane.to_wgs84(point)
+                mapped, kp, dcc = plane.to_wgs84_full(point)
                 tool_wgs.append(mapped)
                 tool_kps.append(kp)
+                tool_dcc.append(dcc)
 
             # KP-windowed nearest tool-path vertex per course change: the
             # tool KPs are near-monotone (local turn-out loops excepted), so
@@ -469,6 +565,7 @@ class InstallationPathTask(QgsTask):
                     "radius_m": item.radius_m,
                     "depth_m": depth_value,
                     "depth_diff_m": depth_diff,
+                    "control_kind": item.control_kind,
                     "status": item.status, "message": item.message,
                 })
 
@@ -530,6 +627,12 @@ class InstallationPathTask(QgsTask):
 
             applied_radii = [item["radius_m"] for item in diagnostics
                              if item.get("radius_m")]
+            dcc_max_abs = dcc_max_kp = None
+            if tool_dcc:
+                worst = max(range(len(tool_dcc)),
+                            key=lambda i: abs(tool_dcc[i]))
+                dcc_max_abs = abs(tool_dcc[worst])
+                dcc_max_kp = tool_kps[worst]
             summary = {
                 "mode": work.mode,
                 "tool": work.tool_display,
@@ -545,6 +648,16 @@ class InstallationPathTask(QgsTask):
                 "route_length_m": path_geometry.polyline_length(plane.points),
                 "max_offset_m": solution.max_offset_m,
                 "rms_offset_m": solution.rms_offset_m,
+                # Signed cross-course deviation from the RPL by KP
+                # (positive = port of travel), downsampled but keeping
+                # every bucket's worst excursion.
+                "dcc": _downsample_dcc(tool_kps, tool_dcc),
+                "dcc_max_abs_m": dcc_max_abs,
+                "dcc_max_kp": dcc_max_kp,
+                "adjustment_count": len(work.adjustments),
+                "best_fit_count": sum(
+                    1 for item in diagnostics
+                    if item.get("solution") == "best_fit"),
                 "course_change_count": solution.course_change_count,
                 "compound_cluster_count": solution.compound_cluster_count,
                 "review_count": sum(1 for item in diagnostics

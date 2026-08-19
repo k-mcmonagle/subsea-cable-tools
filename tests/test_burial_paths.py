@@ -294,6 +294,139 @@ def test_compound_solver_cancellation() -> bool:
     return _result("compound solver cancellation is cooperative", cancelled)
 
 
+def test_crowded_cluster_merges_instead_of_failing() -> bool:
+    """A compound corner crowded against a neighbouring fillet near the
+    route end used to raise "not enough route either side of a turn
+    cluster"; it must now merge with the neighbour and best-fit."""
+    theta = math.radians(82.0)
+    route = [(0.0, 0.0), (900.0, 0.0), (900.0, 56.0),
+             (900.0 + 3.0 * math.cos(theta), 56.0 + 3.0 * math.sin(theta))]
+
+    def radius_for_vertex(_index, station_m):
+        return 20.0 if station_m < 930.0 else 400.0
+
+    solution = geom.generate_route_path(
+        route, 20.0, "fillet", radius_for_vertex=radius_for_vertex)
+    ok = solution.course_change_count == 2
+    ok = ok and len(solution.points) >= 2
+    # The crowded pair resolves as one merged compound cluster (exact
+    # through, or a reviewed best fit) instead of raising the old
+    # "not enough route either side of a turn cluster" error.
+    ok = ok and all(item.solution in ("compound", "best_fit")
+                    for item in solution.diagnostics)
+    ok = ok and solution.compound_cluster_count == 1
+    return _result("crowded cluster merges instead of failing", ok,
+                   "/".join(sorted({d.solution
+                                    for d in solution.diagnostics})))
+
+
+def test_short_route_best_fit() -> bool:
+    """A scoped route far shorter than the turning radius still returns a
+    best-fit path with review status rather than erroring."""
+    route = [(0.0, 0.0), (30.0, 0.0), (30.0, 20.0)]
+    solution = geom.generate_route_path(route, 200.0, "fillet")
+    ok = len(solution.points) >= 2
+    ok = ok and solution.course_change_count == 1
+    diag = solution.diagnostics[0]
+    ok = ok and diag.solution in ("compound", "best_fit")
+    curved = [part.radius_m for part in solution.primitives
+              if part.kind in ("L", "R")]
+    ok = ok and all(radius >= 200.0 - 1e-6 for radius in curved)
+    # A hard corridor forces the best-fit ladder; the anchors-only rung
+    # cannot satisfy 1 m either, so THAT is the case that still errors.
+    rejected = False
+    try:
+        geom.generate_route_path(route, 200.0, "fillet", max_deviation_m=1.0)
+    except geom.PathGeometryError:
+        rejected = True
+    ok = ok and rejected
+    return _result("short route still solves (no tangent error)", ok,
+                   f"{diag.solution}, miss={diag.miss_m:.1f} m")
+
+
+def test_through_mode_chunks_large_clusters() -> bool:
+    """A dense corner chain in pass-through mode is split into bounded
+    chunks (the mega-cluster used to sit at one group and looked hung)."""
+    route = [(0.0, 0.0)]
+    x, y = 0.0, 0.0
+    for index in range(13):
+        x += 40.0
+        y += 6.0 if index % 2 == 0 else -6.0
+        route.append((x, y))
+    calls = []
+    solution = geom.generate_route_path(
+        route, 30.0, "through_ac",
+        progress=lambda done, total: calls.append((done, total)))
+    ok = solution.course_change_count == len(route) - 2
+    ok = ok and len(solution.diagnostics) == len(route) - 2
+    ok = ok and bool(calls) and calls[-1][1] >= 2   # chunked: >1 group
+    ok = ok and calls[-1][0] == calls[-1][1]
+    return _result("through mode chunks dense clusters", ok,
+                   f"groups={calls[-1][1]}")
+
+
+def test_manual_adjustment_control() -> bool:
+    """A user path adjustment (station, offset point) pulls the path
+    through it and reports an 'adjustment' diagnostic."""
+    route = [(0.0, 0.0), (1000.0, 0.0)]
+    solution = geom.generate_route_path(
+        route, 50.0, "fillet", extra_controls=[(500.0, (500.0, 40.0))])
+    ok = _near_point(solution.points, (500.0, 40.0), 1e-6)
+    adj = [item for item in solution.diagnostics
+           if item.control_kind == "adjustment"]
+    ok = ok and len(adj) == 1 and adj[0].solution == "adjustment"
+    ok = ok and adj[0].miss_m == 0.0
+    series = geom.signed_offset_series(solution.points, route)
+    peak = max(series, key=lambda pair: abs(pair[1]))
+    # The path reaches the +40 m adjustment (small arc overshoot allowed)
+    # on the port side, near the requested station.
+    ok = ok and 39.0 <= peak[1] <= 50.0 and abs(peak[0] - 500.0) < 100.0
+    return _result("manual adjustment control pulls the path", ok,
+                   f"peak {peak[1]:.1f} m at {peak[0]:.0f} m")
+
+
+def test_adjustments_config_and_fingerprints() -> bool:
+    raw = [{"kp": "2.5", "dcc_m": 30.0}, [1.0, -15.0],
+           {"kp": -1.0, "dcc_m": 5.0}, "junk",
+           {"kp": 2.5, "dcc_m": 12.0}]
+    adjustments = path_data.sanitise_adjustments(raw)
+    ok = adjustments == [{"kp": 1.0, "dcc_m": -15.0},
+                         {"kp": 2.5, "dcc_m": 12.0}]
+    plan = {"scope_start_kp": 0.0, "scope_end_kp": 5.0, "direction": 1,
+            "params_json": "{}"}
+    tool = {"tool_id": "t1", "modified_utc": "a"}
+    config_row = {"config_id": "c1", "min_turn_radius_m": 200.0}
+    base_config = path_data.config_from_plan(plan)
+    ok = ok and base_config["adjustments"] == []
+    adjusted = dict(base_config, adjustments=adjustments)
+    base = path_data.build_fingerprints(
+        plan, "route-a", tool, config_row, base_config, None, "d")
+    with_adjustments = path_data.build_fingerprints(
+        plan, "route-a", tool, config_row, adjusted, None, "d")
+    # Adjustments change the geometry fingerprint; an empty list keeps the
+    # pre-upgrade digest so stored results do not all flip to stale.
+    ok = ok and base["tool"] != with_adjustments["tool"]
+    explicit_empty = path_data.build_fingerprints(
+        plan, "route-a", tool, config_row,
+        dict(base_config, adjustments=[]), None, "d")
+    ok = ok and explicit_empty["tool"] == base["tool"]
+    return _result("adjustments sanitise + fingerprint staleness", ok)
+
+
+def test_signed_offset_series() -> bool:
+    reference = [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0)]
+    points = [(10.0, 5.0), (50.0, -3.0), (105.0, 50.0), (95.0, 80.0)]
+    series = geom.signed_offset_series(points, reference)
+    ok = len(series) == 4
+    # Left of +X travel is positive; right negative.
+    ok = ok and abs(series[0][0] - 10.0) < 1e-9 and abs(series[0][1] - 5.0) < 1e-9
+    ok = ok and abs(series[1][1] + 3.0) < 1e-9
+    # Second leg travels +Y: x>100 is right (negative), x<100 left.
+    ok = ok and abs(series[2][0] - 150.0) < 1e-9 and abs(series[2][1] + 5.0) < 1e-9
+    ok = ok and abs(series[3][1] - 5.0) < 1e-9
+    return _result("signed offsets follow travel-left convention", ok)
+
+
 def run_all() -> list:
     return [
         test_dubins_endpoints_and_radius(),
@@ -309,6 +442,12 @@ def run_all() -> list:
         test_progress_callback_counts_groups(),
         test_radius_rules_config_and_fingerprints(),
         test_compound_solver_cancellation(),
+        test_crowded_cluster_merges_instead_of_failing(),
+        test_short_route_best_fit(),
+        test_through_mode_chunks_large_clusters(),
+        test_manual_adjustment_control(),
+        test_adjustments_config_and_fingerprints(),
+        test_signed_offset_series(),
     ]
 
 
