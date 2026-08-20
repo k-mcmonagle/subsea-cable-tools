@@ -181,13 +181,23 @@ def check_move(events: List[Dict], event_id: str, new_kp: float,
 
 def merge_section_events(events: List[Dict], sections: List[Dict],
                          section_ids: List[str], method: str = ""
-                         ) -> Tuple[List[Dict], List[str], str]:
+                         ) -> Tuple[List[Dict], List[str], str,
+                                    List[Tuple[float, float]], List[Dict]]:
     """Remove boundary events so selected burial sections *or* skips merge.
 
-    The selected sections must all have the same mergeable kind and must
-    include every section of that kind between the first and last selection.
-    Insufficient-information ranges are never swallowed by a manual merge.
-    Returns ``(remaining_events, removed_event_ids, section_kind)``.
+    The selection must contain exactly one mergeable kind (burial or skip)
+    and every section of that kind between the first and last selection.
+    Insufficient-information ranges are never swallowed silently, but they
+    merge when *explicitly selected* alongside their neighbours: their KP
+    ranges come back as ``dismissed_ranges`` (``(start_kp, end_kp)`` pairs)
+    for the caller to remove from the plan's no-data context. A burial
+    boundary event that must extend across an edge II range is moved to the
+    span edge rather than removed; those (still-in-``remaining``) event
+    dicts are returned as ``moved_events`` so the caller can re-stamp their
+    derived position/depth.
+
+    Returns ``(remaining_events, removed_event_ids, section_kind,
+    dismissed_ranges, moved_events)``.
     """
     wanted = {str(section_id) for section_id in section_ids if section_id}
     selected = [section for section in sections
@@ -195,11 +205,16 @@ def merge_section_events(events: List[Dict], sections: List[Dict],
     if len(selected) != len(wanted) or len(selected) < 2:
         raise ValueError("Select at least two sections to merge.")
     kinds = {section.get("kind") or "" for section in selected}
-    if len(kinds) != 1:
+    target_kinds = kinds - {schema.SECTION_INSUFFICIENT}
+    if not target_kinds:
+        raise ValueError(
+            "Select the neighbouring section to merge the Insufficient "
+            "Information range into.")
+    if len(target_kinds) != 1:
         raise ValueError("Selected sections must all be the same kind.")
-    kind = next(iter(kinds))
+    kind = next(iter(target_kinds))
     if kind not in (schema.SECTION_BURIAL, schema.SECTION_SKIP):
-        raise ValueError("Insufficient Information sections cannot be merged.")
+        raise ValueError("Only burial sections and skips can be merged.")
 
     selected.sort(key=lambda section: float(section.get("start_kp") or 0.0))
     span_start = float(selected[0].get("start_kp") or 0.0)
@@ -210,42 +225,70 @@ def merge_section_events(events: List[Dict], sections: List[Dict],
         and float(section.get("start_kp") or 0.0) < span_end - _KP_TOL
     ]
     if any(section.get("kind") == schema.SECTION_INSUFFICIENT
+           and str(section.get("section_id") or "") not in wanted
            for section in within_span):
         raise ValueError(
-            "Cannot merge across an Insufficient Information section.")
+            "Cannot merge across an Insufficient Information section that "
+            "is not part of the selection.")
     same_kind_ids = {
         str(section.get("section_id") or "") for section in within_span
         if section.get("kind") == kind
     }
-    if same_kind_ids != wanted:
+    wanted_target = {
+        str(section.get("section_id") or "") for section in selected
+        if section.get("kind") == kind
+    }
+    if same_kind_ids != wanted_target:
         raise ValueError(
             "Select every section of this kind between the first and last selection.")
 
-    merge_gaps = [
-        (float(left.get("end_kp") or 0.0),
-         float(right.get("start_kp") or 0.0))
-        for left, right in zip(selected, selected[1:])
+    dismissed_ranges = [
+        (float(section.get("start_kp") or 0.0),
+         float(section.get("end_kp") or 0.0))
+        for section in selected
+        if section.get("kind") == schema.SECTION_INSUFFICIENT
     ]
+
+    # A burial boundary event adjacent to a *selected edge* II range must
+    # move to the span edge (removal would leave the pair dangling); every
+    # other boundary event strictly inside the span is removed.
+    targets = [section for section in selected if section.get("kind") == kind]
+    moves: List[Tuple[float, float]] = []
+    if kind == schema.SECTION_BURIAL:
+        first_start = float(targets[0].get("start_kp") or 0.0)
+        last_end = float(targets[-1].get("end_kp") or 0.0)
+        if first_start - span_start > _KP_TOL:
+            moves.append((first_start, span_start))
+        if span_end - last_end > _KP_TOL:
+            moves.append((last_end, span_end))
+
     removed: List[str] = []
     remaining: List[Dict] = []
+    moved: List[Dict] = []
     for event in events:
         kp = float(event.get("kp") or 0.0)
-        in_gap = any(min(start, end) - _KP_TOL <= kp
-                     <= max(start, end) + _KP_TOL
-                     for start, end in merge_gaps)
-        if not in_gap:
+        inside = span_start + _KP_TOL < kp < span_end - _KP_TOL
+        if not inside:
             remaining.append(dict(event))
             continue
         if int(event.get("locked") or 0):
             raise ValueError(
                 "A locked event lies between the sections — unlock it first.")
-        removed.append(str(event.get("event_id") or ""))
-    if not removed:
+        new_kp = next((new for old, new in moves
+                       if abs(kp - old) <= _BOUNDARY_TOL), None)
+        if new_kp is not None:
+            copy = dict(event)
+            copy["kp"] = new_kp
+            remaining.append(copy)
+            moved.append(copy)
+        else:
+            removed.append(str(event.get("event_id") or ""))
+    if not removed and not moved and not dismissed_ranges:
         raise ValueError(
             f"No {event_label(schema.EVENT_BURIAL_START, method)}/"
             f"{event_label(schema.EVENT_BURIAL_END, method)} boundaries were "
             "found between the sections.")
-    return remaining, removed, kind
+    return remaining, removed, kind, dismissed_ranges, moved
 
 
 def opposite_section_boundary_specs(section_kind: str, start_kp: float,
@@ -288,9 +331,11 @@ def delete_section_events(events: List[Dict], sections: List[Dict],
         raise ValueError("Section not found.")
     kind = section.get("kind") or ""
     if kind not in (schema.SECTION_BURIAL, schema.SECTION_SKIP):
+        # Insufficient Information sections have no boundary events; the
+        # plan model dismisses their no-data range instead of calling here.
         raise ValueError(
-            "Insufficient Information sections cannot be deleted — they "
-            "reflect missing data coverage, not boundary events.")
+            "Only burial sections and skips are deleted via their "
+            "boundary events.")
     start = float(section.get("start_kp") or 0.0)
     end = float(section.get("end_kp") or 0.0)
     removed: List[str] = []

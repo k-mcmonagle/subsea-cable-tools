@@ -207,6 +207,49 @@ def test_nodata_becomes_insufficient() -> bool:
     return _result("no-data ranges surface as Insufficient Information", ok)
 
 
+def test_dismissed_nodata_becomes_skip() -> bool:
+    """A dismissed no-data range regenerates as a tagged skip, never II or
+    a burial candidate; the sections still tile the scope exactly."""
+    acq = gen.RuleAcquisition(_rule("d1", "depth"), [Interval(5.0, 6.0)],
+                              nodata=[Interval(14.0, 17.0)])
+    out = gen.generate(_params(dismissed_insufficient=[(15.0, 17.0)]), [acq],
+                       id_fn=_counter_id_fn())
+    insufficient = [s for s in out.sections if s["kind"] == "insufficient_info"]
+    ok = len(insufficient) == 1
+    ok = ok and abs(insufficient[0]["end_kp"] - 15.0) < 1e-6  # [14,15] remains
+    dismissed_skips = [
+        s for s in out.sections if s["kind"] == schema.SECTION_SKIP
+        and json.loads(s["reason_json"]).get("insufficient_dismissed")]
+    ok = ok and len(dismissed_skips) == 1
+    ok = ok and abs(dismissed_skips[0]["start_kp"] - 15.0) < 1e-6
+    ok = ok and abs(dismissed_skips[0]["end_kp"] - 17.0) < 1e-6
+    ok = ok and not json.loads(
+        dismissed_skips[0]["reason_json"]).get("manual")
+    # Still no burial candidate over the data-less range.
+    ok = ok and not any(iv.start_km <= 16.0 <= iv.end_km
+                        for iv in out.candidates)
+    # The section partition still tiles the scope with no gaps or overlaps.
+    ordered = sorted(out.sections, key=lambda s: s["start_kp"])
+    ok = ok and abs(ordered[0]["start_kp"] - 0.0) < 1e-6
+    ok = ok and abs(ordered[-1]["end_kp"] - 20.0) < 1e-6
+    ok = ok and all(abs(a["end_kp"] - b["start_kp"]) < 1e-6
+                    for a, b in zip(ordered, ordered[1:]))
+    # Dismissals persist through the params round-trip (plan storage).
+    round_trip = gen.dismissed_pairs(
+        json.loads(json.dumps(
+            _params(dismissed_insufficient=[(15.0, 17.0)]).to_dict()))
+        .get("dismissed_insufficient"))
+    ok = ok and round_trip == [(15.0, 17.0)]
+    return _result("dismissed no-data ranges regenerate as tagged skips", ok)
+
+
+def test_dismissed_pairs_normalise() -> bool:
+    pairs = gen.dismissed_pairs([[3.0, 2.0], [2.5, 4.0], [9.0, 9.0],
+                                 ["bad", 1.0], [6.0, 7.0]])
+    ok = pairs == [(2.0, 4.0), (6.0, 7.0)]
+    return _result("dismissed pairs union, reorder and drop invalid entries", ok)
+
+
 def test_refinement_converges() -> bool:
     # analytic footprint: condition true where kp > 7.123456
     true_boundary = 7.123456
@@ -488,6 +531,8 @@ def run_all() -> list:
         test_wd_extension(),
         test_extension_keys_do_not_invalidate_cache(),
         test_nodata_becomes_insufficient(),
+        test_dismissed_nodata_becomes_skip(),
+        test_dismissed_pairs_normalise(),
         test_refinement_converges(),
         test_default_refinement_keeps_symmetric_buffer_at_display_length(),
         test_cache_key_sensitivity(),

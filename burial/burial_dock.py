@@ -14,6 +14,7 @@ progress and a working Stop (resumable) — QGIS stays usable throughout. No
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import os
 from typing import Dict, List, Optional
@@ -920,6 +921,10 @@ class BurialPlannerDock(QDockWidget):
             existing_events = generation.fresh_existing_events(
                 existing_events, keep_client=self._fresh_keep_client)
             previous_sections = None
+            # Dismissed Insufficient Information ranges are curation too:
+            # a fresh run rebuilds purely from the Exclusion stack, so any
+            # dismissed no-data range reappears as II.
+            params = dataclasses.replace(params, dismissed_insufficient=[])
         proposal = [e for e in existing_events
                     if e.get("source") == schema.EVENT_SOURCE_CLIENT]
         service = self.model.depth_service()

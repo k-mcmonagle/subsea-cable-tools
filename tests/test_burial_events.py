@@ -150,18 +150,86 @@ def test_merge_burial_sections_and_skips() -> bool:
         _section("s2", schema.SECTION_SKIP, 6.0, 8.0),
         _section("b3", schema.SECTION_BURIAL, 8.0, 10.0),
     ]
-    merged_burial, removed_burial, kind = ev.merge_section_events(
-        events, sections, ["b1", "b2"])
+    merged_burial, removed_burial, kind, dismissed, moved = \
+        ev.merge_section_events(events, sections, ["b1", "b2"])
     ok = kind == schema.SECTION_BURIAL
     ok = ok and set(removed_burial) == {"end-a", "start-b"}
+    ok = ok and not dismissed and not moved
     ok = ok and ev.validate_events(merged_burial, 0.0, 10.0, 1).ok
 
-    merged_skips, removed_skips, kind = ev.merge_section_events(
-        events, sections, ["s1", "s2"])
+    merged_skips, removed_skips, kind, dismissed, moved = \
+        ev.merge_section_events(events, sections, ["s1", "s2"])
     ok = ok and kind == schema.SECTION_SKIP
     ok = ok and set(removed_skips) == {"start-b", "end-b"}
+    ok = ok and not dismissed and not moved
     ok = ok and ev.validate_events(merged_skips, 0.0, 10.0, 1).ok
     return _result("merge selected burial sections or selected skips", ok)
+
+
+def test_merge_with_insufficient_between_burials() -> bool:
+    # burial [0,2] | II [2,4] | burial [4,6] | skip [6,10]
+    events = [_event("start-a", 0.0, START), _event("end-a", 2.0, END),
+              _event("start-b", 4.0, START), _event("end-b", 6.0, END)]
+    sections = [
+        _section("b1", schema.SECTION_BURIAL, 0.0, 2.0),
+        _section("i1", schema.SECTION_INSUFFICIENT, 2.0, 4.0),
+        _section("b2", schema.SECTION_BURIAL, 4.0, 6.0),
+        _section("s1", schema.SECTION_SKIP, 6.0, 10.0),
+    ]
+    remaining, removed, kind, dismissed, moved = ev.merge_section_events(
+        events, sections, ["b1", "i1", "b2"])
+    ok = kind == schema.SECTION_BURIAL
+    ok = ok and set(removed) == {"end-a", "start-b"}
+    ok = ok and dismissed == [(2.0, 4.0)] and not moved
+    ok = ok and ev.validate_events(remaining, 0.0, 10.0, 1).ok
+    pairs = ev.burial_pairs(remaining, 1)
+    ok = ok and len(pairs) == 1
+    ok = ok and float(pairs[0][0]["kp"]) == 0.0
+    ok = ok and float(pairs[0][1]["kp"]) == 6.0
+    return _result("merge burials across a selected II range dismisses it", ok)
+
+
+def test_merge_edge_insufficient_moves_boundary() -> bool:
+    # II [0,2] | burial [2,5] | skip [5,10]: merging the edge II into the
+    # burial must MOVE the burial start to KP 0, never remove it.
+    events = [_event("start-a", 2.0, START), _event("end-a", 5.0, END)]
+    sections = [
+        _section("i1", schema.SECTION_INSUFFICIENT, 0.0, 2.0),
+        _section("b1", schema.SECTION_BURIAL, 2.0, 5.0),
+        _section("s1", schema.SECTION_SKIP, 5.0, 10.0),
+    ]
+    remaining, removed, kind, dismissed, moved = ev.merge_section_events(
+        events, sections, ["i1", "b1"])
+    ok = kind == schema.SECTION_BURIAL and not removed
+    ok = ok and dismissed == [(0.0, 2.0)]
+    ok = ok and len(moved) == 1 and float(moved[0]["kp"]) == 0.0
+    ok = ok and moved[0]["event_id"] == "start-a"
+    ok = ok and ev.validate_events(remaining, 0.0, 10.0, 1).ok
+    pairs = ev.burial_pairs(remaining, 1)
+    ok = ok and len(pairs) == 1 and float(pairs[0][0]["kp"]) == 0.0
+    return _result("merging an edge II moves the burial boundary event", ok)
+
+
+def test_merge_insufficient_between_skips() -> bool:
+    # burial [0,2] | skip [2,4] | II [4,6] | skip [6,8] | burial [8,10]:
+    # no events sit at skip/II boundaries — the dismissal alone merges them.
+    events = [_event("a", 0.0, START), _event("b", 2.0, END),
+              _event("c", 8.0, START), _event("d", 10.0, END)]
+    sections = [
+        _section("b1", schema.SECTION_BURIAL, 0.0, 2.0),
+        _section("s1", schema.SECTION_SKIP, 2.0, 4.0),
+        _section("i1", schema.SECTION_INSUFFICIENT, 4.0, 6.0),
+        _section("s2", schema.SECTION_SKIP, 6.0, 8.0),
+        _section("b2", schema.SECTION_BURIAL, 8.0, 10.0),
+    ]
+    remaining, removed, kind, dismissed, moved = ev.merge_section_events(
+        events, sections, ["s1", "i1", "s2"])
+    ok = kind == schema.SECTION_SKIP
+    ok = ok and not removed and not moved
+    ok = ok and dismissed == [(4.0, 6.0)]
+    ok = ok and len(remaining) == 4
+    ok = ok and ev.validate_events(remaining, 0.0, 10.0, 1).ok
+    return _result("skips merge across a selected II range via dismissal", ok)
 
 
 def test_merge_selection_guards() -> bool:
@@ -188,6 +256,39 @@ def test_merge_selection_guards() -> bool:
     except ValueError:
         guarded += 1
     return _result("merge protects mixed, skipped and locked boundaries", guarded == 3)
+
+
+def test_merge_insufficient_guards() -> bool:
+    # burial [0,2] | II [2,4] | burial [4,6] | skip [6,10]
+    events = [_event("start-a", 0.0, START), _event("end-a", 2.0, END),
+              _event("start-b", 4.0, START), _event("end-b", 6.0, END)]
+    sections = [
+        _section("b1", schema.SECTION_BURIAL, 0.0, 2.0),
+        _section("i1", schema.SECTION_INSUFFICIENT, 2.0, 4.0),
+        _section("b2", schema.SECTION_BURIAL, 4.0, 6.0),
+        _section("s1", schema.SECTION_SKIP, 6.0, 10.0),
+    ]
+    guarded = 0
+    # An unselected II range between the sections still blocks the merge.
+    try:
+        ev.merge_section_events(events, sections, ["b1", "b2"])
+    except ValueError as exc:
+        guarded += 1 if "Insufficient Information" in str(exc) else 0
+    # II ranges never merge on their own.
+    try:
+        ev.merge_section_events(
+            events, sections + [
+                _section("i2", schema.SECTION_INSUFFICIENT, 6.0, 7.0)],
+            ["i1", "i2"])
+    except ValueError:
+        guarded += 1
+    # Mixed target kinds stay rejected even with an II selected.
+    try:
+        ev.merge_section_events(events, sections, ["i1", "b2", "s1"])
+    except ValueError:
+        guarded += 1
+    return _result("II merge guards: unselected/only-II/mixed selections",
+                   guarded == 3)
 
 
 def test_opposite_section_boundaries_follow_travel_direction() -> bool:
@@ -294,7 +395,11 @@ def run_all() -> list:
         test_merge_conflict_flagging(),
         test_merge_dedupes_at_boundary(),
         test_merge_burial_sections_and_skips(),
+        test_merge_with_insufficient_between_burials(),
+        test_merge_edge_insufficient_moves_boundary(),
+        test_merge_insufficient_between_skips(),
         test_merge_selection_guards(),
+        test_merge_insufficient_guards(),
         test_opposite_section_boundaries_follow_travel_direction(),
         test_delete_section_events(),
         test_note_helpers(),

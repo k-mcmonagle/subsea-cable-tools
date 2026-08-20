@@ -291,6 +291,83 @@ def test_plan_builder_merge_insert_and_undo() -> bool:
     return _result("Plan Builder merge/insert persist and undo atomically", ok)
 
 
+def test_dismiss_insufficient_persist_and_undo() -> bool:
+    """Deleting an II section dismisses its no-data range: it becomes a
+    tagged skip, survives reopening the plan, and undoes atomically."""
+    store = _store()
+    plan_id = store.save_plan(_plan_row())
+    params = generation.GenParams(0.0, 10.0, direction=1, method="plough")
+    rule = {
+        "rule_id": "r", "name": "excluded", "enabled": 1,
+        "kind": "manual", "action": "exclude", "risk_level": 0,
+        "criterion_class": "project", "methods_json": "[]",
+        "config_json": "{}",
+    }
+    out = generation.generate(
+        params,
+        [generation.RuleAcquisition(rule, [Interval(2.0, 4.0)],
+                                    nodata=[Interval(6.0, 8.0)])],
+        plan_id=plan_id)
+    summary = dict(out.summary)
+    summary["context"] = generation.context_to_dict(out)
+    store.save_generation({"plan_id": plan_id, "active": 1,
+                           "rules_snapshot_json": "[]",
+                           "params_json": json.dumps(params.to_dict()),
+                           "inputs_fingerprint_json": "{}",
+                           "summary_json": json.dumps(summary),
+                           "proposal_diff_json": "{}"})
+    store.save_events(plan_id, out.events)
+    store.save_sections(plan_id, out.sections)
+
+    model = PlanModel(store)
+    ok = model.load_plan(plan_id)
+    ii = [s for s in model.sections
+          if s["kind"] == schema.SECTION_INSUFFICIENT]
+    ok = ok and len(ii) == 1
+    events_before = len(model.events)
+    ok = ok and model.delete_section(ii[0]["section_id"], "no bathy coverage")
+    ok = ok and not any(s["kind"] == schema.SECTION_INSUFFICIENT
+                        for s in model.sections)
+    ok = ok and len(model.events) == events_before  # no events touched
+    dismissed_skip = next(
+        (s for s in model.sections if s["kind"] == schema.SECTION_SKIP
+         and abs(float(s["start_kp"]) - 6.0) < 1e-6
+         and abs(float(s["end_kp"]) - 8.0) < 1e-6), None)
+    ok = ok and dismissed_skip is not None
+    ok = ok and json.loads(
+        dismissed_skip["reason_json"]).get("insufficient_dismissed") is True
+    ok = ok and "dismissed" in (dismissed_skip.get("notes") or "")
+    # Sections still tile the scope exactly.
+    ordered = sorted(model.sections, key=lambda s: float(s["start_kp"]))
+    ok = ok and abs(float(ordered[0]["start_kp"]) - 0.0) < 1e-6
+    ok = ok and abs(float(ordered[-1]["end_kp"]) - 10.0) < 1e-6
+    ok = ok and all(abs(float(a["end_kp"]) - float(b["start_kp"])) < 1e-6
+                    for a, b in zip(ordered, ordered[1:]))
+    # The dismissal is persisted with the plan and the stored context:
+    # a reopened plan shows no II section and remembers the dismissal.
+    stored = json.loads(model.plan.get("params_json") or "{}")
+    ok = ok and stored.get("dismissed_insufficient") == [[6.0, 8.0]]
+    model2 = PlanModel(store)
+    ok = ok and model2.load_plan(plan_id)
+    ok = ok and not any(s["kind"] == schema.SECTION_INSUFFICIENT
+                        for s in model2.sections)
+    ok = ok and not model2.context.insufficient
+    ok = ok and model2.gen_params().dismissed_insufficient == [(6.0, 8.0)]
+
+    # Undo restores the II section, the plan params and the context.
+    undone = model.undo_last_builder_edit()
+    ok = ok and undone is not None
+    ok = ok and undone["action"] == change_log.ACTION_DISMISS_INSUFFICIENT
+    restored = [s for s in model.sections
+                if s["kind"] == schema.SECTION_INSUFFICIENT]
+    ok = ok and len(restored) == 1
+    ok = ok and abs(float(restored[0]["start_kp"]) - 6.0) < 1e-6
+    stored_after = json.loads(model.plan.get("params_json") or "{}")
+    ok = ok and not stored_after.get("dismissed_insufficient")
+    ok = ok and len(model.context.insufficient) == 1
+    return _result("dismiss II persists, reopens dismissed and undoes", ok)
+
+
 def test_plan_profile_persistence() -> bool:
     from ..burial.profile_data import PlanProfile
 
@@ -335,6 +412,7 @@ def run_all() -> list:
         test_duplicate_deep_copy(),
         test_change_log_and_rollback(),
         test_plan_builder_merge_insert_and_undo(),
+        test_dismiss_insufficient_persist_and_undo(),
         test_plan_profile_persistence(),
     ]
 

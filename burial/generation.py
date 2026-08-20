@@ -47,6 +47,11 @@ class GenParams:
     sliver_tol_km: float = 0.0
     cross_offset_m: float = 0.0     # 0 = auto (resolved profile step by model)
     profile_step_m: float = 0.0     # 0 = auto (bathymetry cell size)
+    # No-data ranges the user dismissed from Insufficient Information
+    # ((start_kp, end_kp) pairs). A dismissed range is reported as a skip
+    # rather than II on every later run — never as a burial candidate,
+    # because there is still no data there.
+    dismissed_insufficient: List[Tuple[float, float]] = field(default_factory=list)
 
     @property
     def scope(self) -> Interval:
@@ -80,7 +85,34 @@ class GenParams:
             "sliver_tol_km": self.sliver_tol_km,
             "cross_offset_m": self.cross_offset_m,
             "profile_step_m": self.profile_step_m,
+            "dismissed_insufficient": [
+                [round(float(a), 6), round(float(b), 6)]
+                for a, b in self.dismissed_insufficient],
         }
+
+
+def dismissed_pairs(value) -> List[Tuple[float, float]]:
+    """Parse a stored dismissed-insufficient list (``[[start, end], ...]``).
+
+    Overlapping/abutting pairs are unioned and zero-length ones dropped, so
+    repeated dismissals of adjacent ranges never accumulate duplicates.
+    """
+    intervals: List[Interval] = []
+    for pair in value or []:
+        try:
+            a, b = float(pair[0]), float(pair[1])
+        except (IndexError, TypeError, ValueError):
+            continue
+        lo, hi = (a, b) if a <= b else (b, a)
+        intervals.append(Interval(lo, hi))
+    return [(iv.start_km, iv.end_km) for iv in eng.normalize(intervals)]
+
+
+def dismissed_intervals(params: "GenParams") -> List[Interval]:
+    """The dismissed no-data ranges as scope-clipped, unioned intervals."""
+    intervals = [Interval(min(a, b), max(a, b))
+                 for a, b in params.dismissed_insufficient or []]
+    return eng.clip_intervals(eng.normalize(intervals), params.scope)
 
 
 @dataclass
@@ -599,7 +631,8 @@ def build_sections(merged_events: List[Dict], params: GenParams,
                    previous_sections: Optional[List[Dict]] = None,
                    id_fn: Callable[[], str] = schema.new_id,
                    plan_id: str = "",
-                   carry_by_overlap: bool = False) -> List[Dict]:
+                   carry_by_overlap: bool = False,
+                   dismissed: Optional[List[Interval]] = None) -> List[Dict]:
     """Rebuild the section partition (burial | skip | insufficient_info).
 
     Screening annotations and Constraint Influence Zone flags land in
@@ -614,6 +647,10 @@ def build_sections(merged_events: List[Dict], params: GenParams,
     fresh — inheriting one side's assessment would be arbitrary — and the
     generation path keeps the exact-match-only behaviour, where a shifted
     boundary means the assessment genuinely needs review.
+
+    ``dismissed`` marks no-data ranges the user dismissed from Insufficient
+    Information; skips overlapping one are tagged ``insufficient_dismissed``
+    in ``reason_json`` so the origin of the skip stays visible.
     """
     scope = params.scope
     sections: List[Dict] = []
@@ -763,7 +800,15 @@ def build_sections(merged_events: List[Dict], params: GenParams,
         )
         if below_min:
             reason["below_min_length"] = True
-        if not reason.get("fired_rule_ids") and not below_min:
+        # A skip covering a dismissed no-data range says so: the range is
+        # data-less, and skip only because the user dismissed the II state.
+        dismissed_here = any(
+            eng.interval_length_km(eng.intersect_intervals([d], [iv])) > 1e-9
+            for d in dismissed or [])
+        if dismissed_here:
+            reason["insufficient_dismissed"] = True
+        if not reason.get("fired_rule_ids") and not below_min \
+                and not dismissed_here:
             reason["manual"] = True
         row["reason_json"] = json.dumps(reason)
         sections.append(carry_over(row))
@@ -967,11 +1012,16 @@ def generate(params: GenParams, acquisitions: Sequence[RuleAcquisition],
     out.rule_hits = {str(rule_id): list(intervals)
                      for rule_id, intervals in result.rule_hits.items()}
     excluded_ranges = [Interval(v.start_km, v.end_km) for v in out.excluded]
-    out.insufficient = eng.subtract_intervals(nodata, excluded_ranges)
+    # A user-dismissed no-data range is reported as a skip rather than
+    # Insufficient Information; it still never becomes a burial candidate,
+    # because there is still no data there.
+    raw_insufficient = eng.subtract_intervals(nodata, excluded_ranges)
+    dismissed = dismissed_intervals(params)
+    out.insufficient = eng.subtract_intervals(raw_insufficient, dismissed)
 
-    # 4-5. Candidates = scope - excluded - insufficient; drop the short ones.
+    # 4-5. Candidates = scope - excluded - no-data; drop the short ones.
     available = eng.subtract_intervals([scope], excluded_ranges)
-    candidates = eng.subtract_intervals(available, out.insufficient)
+    candidates = eng.subtract_intervals(available, raw_insufficient)
     kept: List[Interval] = []
     for iv in candidates:
         if params.min_section_km > 0 and iv.length_km < params.min_section_km - 1e-9:
@@ -1023,7 +1073,8 @@ def generate(params: GenParams, acquisitions: Sequence[RuleAcquisition],
     out.sections = build_sections(
         merged, params, out.excluded, out.screening, influence,
         out.insufficient, out.dropped_short, rule_names,
-        previous_sections=previous_sections, id_fn=id_fn, plan_id=plan_id)
+        previous_sections=previous_sections, id_fn=id_fn, plan_id=plan_id,
+        dismissed=dismissed)
 
     # Proposal diff (client burial proposal as review starting point).
     if proposal_events:

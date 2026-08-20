@@ -61,6 +61,24 @@ section references in brackets.
 
 ## Notable interpretations (spec silent or open)
 
+- **Insufficient Information sections can be dismissed, never silently
+  swallowed**: an II range has no boundary events (it comes from no-data
+  intervals in the resolution context), so deleting or merging one is not
+  event surgery but a *dismissal* of its no-data range. Deleting an II
+  section reclassifies the range as a skip (tagged
+  `insufficient_dismissed` in `reason_json`, coalescing with adjacent
+  skips); merging works only when the II rows are explicitly selected
+  alongside a single neighbouring kind — an unselected II between merge
+  targets still blocks the merge, and a burial boundary event that must
+  extend across an edge II range is moved to the span edge, never removed
+  (removal would leave a dangling pair). The dismissal persists in the
+  plan's `params_json` (`dismissed_insufficient`) and in the active
+  generation's stored context, so a reopened plan and a normal Generate
+  keep the range a skip — but never a burial candidate, because there is
+  still no data there — while *Generate (fresh)* drops dismissals along
+  with all other curation. One undoable change-log entry carries the
+  plan, generation, event and section rows together.
+
 - **Rollback mechanics**: every change-log entry stores the affected rows per
   table in `before_json`/`after_json`; rollback inverts entries newest-first
   (delete rows added, restore rows before). Simple, exact, and testable

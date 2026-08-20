@@ -104,6 +104,8 @@ def section_reason_text(section: Dict) -> str:
         parts.append("below minimum section length")
     if reason.get("insufficient_information"):
         parts.append("Insufficient Information")
+    if reason.get("insufficient_dismissed"):
+        parts.append("no data (Insufficient Information dismissed)")
     if reason.get("manual"):
         parts.append("manual")
     if reason.get("dangling_start"):

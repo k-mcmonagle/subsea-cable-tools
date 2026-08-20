@@ -353,8 +353,10 @@ class BuilderTab(QWidget):
             "confidence in the table, or right-click a selection to set "
             "several at once, mark final, split, merge or delete. Select 2+ "
             "sections of the same kind to merge; deleting a section merges "
-            "its neighbours into one. Edits append an audit note to the "
-            "affected Notes cells (still freely editable).")
+            "its neighbours into one. Insufficient Information sections can "
+            "be deleted (the no-data range becomes a skip) or merged into a "
+            "selected neighbour. Edits append an audit note to the affected "
+            "Notes cells (still freely editable).")
         section_hint.setWordWrap(True)
         section_hint.setStyleSheet(ui_helpers.hint_style())
         sections_layout.addWidget(section_hint)
@@ -833,6 +835,8 @@ class BuilderTab(QWidget):
             parts.append("below minimum section length")
         if reason.get("insufficient_information"):
             parts.append("Insufficient Information")
+        if reason.get("insufficient_dismissed"):
+            parts.append("no data (Insufficient Information dismissed)")
         if reason.get("manual"):
             parts.append("manual")
         if reason.get("dangling_start"):
@@ -1015,11 +1019,15 @@ class BuilderTab(QWidget):
         split_action.setEnabled(selected_count == 1)
         merge_action = menu.addAction("Merge selected sections…")
         merge_action.setEnabled(selected_count >= 2)
-        delete_action = menu.addAction("Delete section (merge neighbours)…")
+        delete_label = ("Delete section (dismiss no-data range)…"
+                        if section.get("kind") == schema.SECTION_INSUFFICIENT
+                        else "Delete section (merge neighbours)…")
+        delete_action = menu.addAction(delete_label)
         delete_action.setEnabled(
             selected_count == 1
             and section.get("kind") in (schema.SECTION_BURIAL,
-                                        schema.SECTION_SKIP))
+                                        schema.SECTION_SKIP,
+                                        schema.SECTION_INSUFFICIENT))
         chosen = qt_exec(menu, self.sections_table.viewport().mapToGlobal(position))
         if chosen == go_action:
             self._goto_section_row(row)
@@ -1318,18 +1326,36 @@ class BuilderTab(QWidget):
                 f"{schema.section_kind_label(schema.SECTION_SKIP, method)} rows.")
             return
         kinds = {section.get("kind") for section in selected}
-        if len(kinds) != 1:
+        target_kinds = kinds - {schema.SECTION_INSUFFICIENT}
+        if not target_kinds:
+            QMessageBox.warning(
+                self, "Burial Planner",
+                "Select the neighbouring section as well — an Insufficient "
+                "Information range merges into a burial section or skip, "
+                "never on its own.")
+            return
+        if len(target_kinds) != 1:
             QMessageBox.warning(
                 self, "Burial Planner", "Selected sections must be the same kind.")
             return
-        kind_label = self._kind_label(next(iter(kinds)) or "")
+        kind_label = self._kind_label(next(iter(target_kinds)) or "")
         start_label = ev.event_label(schema.EVENT_BURIAL_START, self.model.method)
         end_label = ev.event_label(schema.EVENT_BURIAL_END, self.model.method)
+        message = (
+            f"Merge {len(selected)} selected rows into one {kind_label}? "
+            f"The intervening {start_label}/{end_label} boundaries will be "
+            "removed; the outer boundaries remain available for dragging "
+            "or KP editing.")
+        if schema.SECTION_INSUFFICIENT in kinds:
+            message += (
+                "\n\nThe selected Insufficient Information range(s) will be "
+                "dismissed: there is still no data there, but the range "
+                "will no longer be reported separately — on later Generate "
+                "runs it stays dismissed (a Generate (fresh) restores it). "
+                "The edit is undoable (Ctrl+Z) and recorded in the change "
+                "log.")
         answer = QMessageBox.question(
-            self, "Merge sections",
-            f"Merge {len(selected)} selected {kind_label} rows? The intervening "
-            f"{start_label}/{end_label} boundaries will be removed; the outer "
-            "boundaries remain available for dragging or KP editing.",
+            self, "Merge sections", message,
             MESSAGE_BOX_YES | MESSAGE_BOX_NO, MESSAGE_BOX_NO)
         if answer != MESSAGE_BOX_YES:
             return
@@ -1353,26 +1379,36 @@ class BuilderTab(QWidget):
                         if s.get("section_id") == ids[0]), None)
         if section is None:
             return
-        if section.get("kind") not in (schema.SECTION_BURIAL,
-                                       schema.SECTION_SKIP):
-            QMessageBox.warning(
-                self, "Burial Planner",
-                "Insufficient Information sections cannot be deleted — they "
-                "reflect missing data coverage, not boundary events.")
-            return
         kind_label = self._kind_label(section.get("kind") or "")
-        start_label = ev.event_label(schema.EVENT_BURIAL_START, self.model.method)
-        end_label = ev.event_label(schema.EVENT_BURIAL_END, self.model.method)
+        span = (f"KP {schema.format_kp(section.get('start_kp'))}-"
+                f"{schema.format_kp(section.get('end_kp'))}")
+        if section.get("kind") == schema.SECTION_INSUFFICIENT:
+            skip_label = self._kind_label(schema.SECTION_SKIP)
+            message = (
+                f"Dismiss the {kind_label} section {span}?\n\n"
+                "No events change: there is still no data over this range, "
+                f"but it will be reported as a {skip_label} (joining any "
+                "adjacent one) instead of Insufficient Information. Later "
+                "Generate runs keep the dismissal; a Generate (fresh) "
+                "restores it. Its notes are carried into the resulting "
+                "section with an audit note naming the dismissed KP range. "
+                "The edit is undoable (Ctrl+Z) and recorded in the change "
+                "log.")
+        else:
+            start_label = ev.event_label(schema.EVENT_BURIAL_START,
+                                         self.model.method)
+            end_label = ev.event_label(schema.EVENT_BURIAL_END,
+                                       self.model.method)
+            message = (
+                f"Delete the {kind_label} {span}?\n\n"
+                f"Its {start_label}/{end_label} boundary events are removed "
+                "and the neighbouring sections merge into one. Notes from "
+                "the removed section and its neighbours are carried into "
+                "the merged section, with an audit note naming the removed "
+                "KP range. The edit is undoable (Ctrl+Z) and recorded in "
+                "the change log.")
         answer = QMessageBox.question(
-            self, "Delete section",
-            f"Delete the {kind_label} KP "
-            f"{schema.format_kp(section.get('start_kp'))}-"
-            f"{schema.format_kp(section.get('end_kp'))}?\n\n"
-            f"Its {start_label}/{end_label} boundary events are removed and "
-            "the neighbouring sections merge into one. Notes from the "
-            "removed section and its neighbours are carried into the merged "
-            "section, with an audit note naming the removed KP range. "
-            "The edit is undoable (Ctrl+Z) and recorded in the change log.",
+            self, "Delete section", message,
             MESSAGE_BOX_YES | MESSAGE_BOX_NO, MESSAGE_BOX_NO)
         if answer != MESSAGE_BOX_YES:
             return
