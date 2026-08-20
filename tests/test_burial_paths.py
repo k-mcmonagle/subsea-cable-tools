@@ -639,6 +639,53 @@ def test_infeasible_corners_dropped_route_followed() -> bool:
                    f"offset={solution.max_offset_m:.1f} m")
 
 
+def _hairpin_wiggle_route() -> list:
+    """Spur into a 95 deg hairpin, then a gently wiggling 3.5 km tail with
+    course changes every ~500 m — the user-reported 'multiple A/Cs in a
+    short space' shape that used to lose the whole tail."""
+    points = [(0.0, 0.0)]
+    heading, x, y = 0.0, 0.0, 0.0
+    for _ in range(8):
+        x += 20.0 * math.cos(heading)
+        y += 20.0 * math.sin(heading)
+        points.append((x, y))
+    heading += math.radians(95.0)
+    x += 300.0 * math.cos(heading)
+    y += 300.0 * math.sin(heading)
+    points.append((x, y))
+    for turn in (-2.0, -3.0, 2.0, -4.0, 3.0, -2.0, -3.0, 2.0):
+        heading += math.radians(turn)
+        x += 500.0 * math.cos(heading)
+        y += 500.0 * math.sin(heading)
+        points.append((x, y))
+    heading += math.radians(0.0)
+    points.append((x + 3000.0 * math.cos(heading),
+                   y + 3000.0 * math.sin(heading)))
+    return points
+
+
+def test_unreachable_control_drops_alone() -> bool:
+    """An infeasible leg near the window entry (the hairpin) must drop
+    only the unreachable controls: the path merges back onto the RPL and
+    follows the wiggling tail instead of crossing it as one diagonal."""
+    route = geom.clean_polyline(_hairpin_wiggle_route())
+    solution = geom.generate_route_path(route, 600.0, "fillet")
+    series = geom.signed_offset_series(solution.points, route)
+    tail = [abs(offset) for station, offset in series if station > 2400.0]
+    ok = bool(tail) and max(tail) < 80.0
+    # Not every downstream corner may be an exact control, but the final
+    # path must pass close to the later ones (they used to miss by 250+ m).
+    late = [item for item in solution.diagnostics
+            if item.station_m > 2400.0 and item.turn_deg != 0.0]
+    ok = ok and late and all(item.miss_m < 80.0 for item in late)
+    arcs = [part.length_m / part.radius_m
+            for part in solution.primitives if part.radius_m]
+    ok = ok and bool(arcs) and max(arcs) <= math.pi + 1e-7
+    ok = ok and geom.distance(solution.points[-1], route[-1]) <= 1e-6
+    return _result("unreachable control drops alone, tail followed", ok,
+                   f"tail max {max(tail):.1f} m" if tail else "no tail")
+
+
 def test_signed_offset_series() -> bool:
     reference = [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0)]
     points = [(10.0, 5.0), (50.0, -3.0), (105.0, 50.0), (95.0, 80.0)]
@@ -682,6 +729,7 @@ def run_all() -> list:
         test_dropped_control_miss_uses_final_path(),
         test_window_always_covers_cluster_corners(),
         test_infeasible_corners_dropped_route_followed(),
+        test_unreachable_control_drops_alone(),
         test_signed_offset_series(),
     ]
 

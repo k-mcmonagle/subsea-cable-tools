@@ -28,7 +28,7 @@ from qgis.core import (
 )
 from qgis.gui import QgsVertexMarker, QgsRubberBand
 from qgis.PyQt.QtGui import QColor
-from qgis.PyQt.QtCore import QSettings, Qt
+from qgis.PyQt.QtCore import QEvent, QSettings, Qt, QTimer
 from qgis.PyQt.QtWidgets import (
     QComboBox,
     QDockWidget,
@@ -99,6 +99,19 @@ from .tabs.tools_tab import ToolsTab
 
 _VERTICAL = getattr(Qt, "Orientation", Qt).Vertical
 
+# Qt5 exposes QEvent enum members flat; Qt6 scopes them under QEvent.Type.
+_EVENT_SCOPE = getattr(QEvent, "Type", QEvent)
+_EVENT_MOUSE_MOVE = getattr(_EVENT_SCOPE, "MouseMove")
+_EVENT_LEAVE = getattr(_EVENT_SCOPE, "Leave")
+
+
+def _mouse_event_pos(event):
+    """Widget-local mouse position for Qt5 (pos) and Qt6 (position)."""
+    position = getattr(event, "position", None)
+    if position is not None:
+        return position().toPoint()
+    return event.pos()
+
 _FLOATING_GEOMETRY_KEY = "SubseaCableTools/BurialPlanner/floating_geometry"
 _FLOATING_MODE_KEY = "SubseaCableTools/BurialPlanner/floating"
 
@@ -152,8 +165,13 @@ class BurialPlannerDock(QDockWidget):
         # persisted WKT; vessel_id -> outline QgsGeometry.
         self._path_points_cache: Dict[str, object] = {}
         self._vessel_outline_cache: Dict[str, object] = {}
+        # path_id -> (lon scale, scaled QgsGeometry) for cursor snapping.
+        self._path_snap_cache: Dict[str, object] = {}
         self._exclusion_bands: List = []
         self._pick_tool = None
+        self._cursor_outline_enabled = False
+        self._cursor_outline_pos = None
+        self._cursor_outline_timer = None
         self._store_recovery_note = ""
 
         saved_path = project_gpkg_path()
@@ -267,6 +285,19 @@ class BurialPlannerDock(QDockWidget):
             "the outline rides the tool path, and the selected vessel's "
             "outline (if imported) rides the barge track at the tow point.")
         self.footprint_toggle.toggled.connect(self._footprint_toggled)
+        self.cursor_outline_toggle = view_menu.addAction(
+            "Outline follows map cursor")
+        self.cursor_outline_toggle.setCheckable(True)
+        self.cursor_outline_toggle.setChecked(False)  # deliberate default
+        self.cursor_outline_toggle.setToolTip(
+            "While enabled, the burial tool outline is drawn on the map "
+            "snapped to the generated tool path (or the RPL when no path "
+            "exists yet) at the point closest to the mouse cursor, with "
+            "the vessel outline at the matching barge-track tow point. "
+            "Purely an overlay — the active map tool keeps working. Off "
+            "by default each session.")
+        self.cursor_outline_toggle.toggled.connect(
+            self._cursor_outline_toggled)
         view_menu.addSeparator()
         view_menu.addAction("Export profile image…",
                             self._export_profile_image)
@@ -1431,6 +1462,7 @@ class BurialPlannerDock(QDockWidget):
     def _clear_footprint_cache(self) -> None:
         self._footprint_cache = {}
         self._path_points_cache = {}
+        self._path_snap_cache = {}
         self._vessel_outline_cache = {}
         self._hide_footprint()
 
@@ -1508,14 +1540,32 @@ class BurialPlannerDock(QDockWidget):
         if not self.footprint_toggle.isChecked() or self.canvas is None \
                 or self.model.route is None:
             return
+        tool_points, barge_points = self._path_display_points()
+        anchor_index = self._nearest_path_index(tool_points, kp)
+        tool_pose = barge_pose = None
+        if anchor_index is not None:
+            tool_pose = self._polyline_pose(tool_points, anchor_index)
+            if anchor_index < len(barge_points):
+                barge_pose = self._polyline_pose(barge_points, anchor_index)
+        self._draw_outlines(kp, tool_pose, barge_pose)
+
+    def _draw_outlines(self, kp, tool_pose, barge_pose) -> None:
+        """Draw the tool (and vessel) outline bands at the given poses.
+
+        ``tool_pose``/``barge_pose`` are WGS84 ``(anchor, before, after)``
+        triplets or ``None``; without a tool pose the tool outline falls
+        back to the RPL at ``kp``.  Shared by the profile-hover overlay and
+        the follow-cursor overlay.
+        """
+        if self.canvas is None:
+            return
         from ..qgis_compat import GEOMETRY_LINE, GEOMETRY_POLYGON
 
         dest_crs = self.canvas.mapSettings().destinationCrs()
-        tool_points, barge_points = self._path_display_points()
-        anchor_index = self._nearest_path_index(tool_points, kp)
-
-        tool = tools_mod.tool_at_kp(self.model.sections, self.model.plan,
-                                    self.model.tools, kp)
+        tool = None
+        if kp is not None:
+            tool = tools_mod.tool_at_kp(self.model.sections, self.model.plan,
+                                        self.model.tools, kp)
         tool_id = str((tool or {}).get("tool_id") or "")
         wkt = str((tool or {}).get("footprint_wkt") or "")
         tool_shown = False
@@ -1527,11 +1577,11 @@ class BurialPlannerDock(QDockWidget):
             if outline is not None and not outline.isNull() \
                     and not outline.isEmpty():
                 geom = None
-                if anchor_index is not None:
-                    geom = self._place_body_outline(
-                        outline, self._polyline_pose(tool_points,
-                                                     anchor_index), dest_crs)
-                if geom is None:
+                if tool_pose is not None:
+                    geom = self._place_body_outline(outline, tool_pose,
+                                                    dest_crs)
+                if geom is None and kp is not None \
+                        and self.model.route is not None:
                     try:
                         geom, _heading = footprint.place_outline(
                             outline, self.model.route, kp,
@@ -1550,7 +1600,7 @@ class BurialPlannerDock(QDockWidget):
             self._hide_band(self._footprint_band)
 
         vessel_shown = False
-        if anchor_index is not None and anchor_index < len(barge_points):
+        if barge_pose is not None:
             vessel = self.model.vessel(str(
                 self.model.path_config().get("vessel_id") or ""))
             vessel_id = str((vessel or {}).get("vessel_id") or "")
@@ -1562,9 +1612,8 @@ class BurialPlannerDock(QDockWidget):
                     self._vessel_outline_cache[vessel_id] = outline
                 if outline is not None and not outline.isNull() \
                         and not outline.isEmpty():
-                    geom = self._place_body_outline(
-                        outline, self._polyline_pose(barge_points,
-                                                     anchor_index), dest_crs)
+                    geom = self._place_body_outline(outline, barge_pose,
+                                                    dest_crs)
                     if geom is not None:
                         geom_type = (GEOMETRY_LINE
                                      if outline.type() == GEOMETRY_LINE
@@ -1576,6 +1625,163 @@ class BurialPlannerDock(QDockWidget):
                         vessel_shown = True
         if not vessel_shown:
             self._hide_band(self._vessel_band)
+
+    # -- follow-cursor outline overlay ----------------------------------------
+    def _cursor_outline_toggled(self, checked: bool) -> None:
+        """Attach/detach the passive canvas mouse watcher.
+
+        An event filter on the canvas viewport (never a map tool) so the
+        user's active tool — pan, identify, a pick tool — keeps working.
+        Nothing is installed while the toggle is off.
+        """
+        self._cursor_outline_enabled = bool(checked)
+        if self.canvas is None:
+            return
+        viewport = self.canvas.viewport()
+        if checked:
+            if viewport is not None:
+                viewport.installEventFilter(self)
+        else:
+            if viewport is not None:
+                try:
+                    viewport.removeEventFilter(self)
+                except (AttributeError, RuntimeError):
+                    pass
+            if self._cursor_outline_timer is not None:
+                self._cursor_outline_timer.stop()
+            self._cursor_outline_pos = None
+            self._hide_footprint()
+
+    def eventFilter(self, obj, event):
+        if self._cursor_outline_enabled and self.canvas is not None \
+                and not _sip_isdeleted(self.canvas) \
+                and obj is self.canvas.viewport():
+            try:
+                etype = event.type()
+                if etype == _EVENT_MOUSE_MOVE:
+                    self._cursor_outline_pos = _mouse_event_pos(event)
+                    timer = self._cursor_outline_timer
+                    if timer is None:
+                        timer = QTimer(self)
+                        timer.setSingleShot(True)
+                        timer.setInterval(30)  # coalesce like profile hover
+                        timer.timeout.connect(self._cursor_outline_tick)
+                        self._cursor_outline_timer = timer
+                    if not timer.isActive():
+                        timer.start()
+                elif etype == _EVENT_LEAVE:
+                    self._cursor_outline_pos = None
+                    self._hide_footprint()
+            except (AttributeError, RuntimeError):
+                pass
+        return super().eventFilter(obj, event)
+
+    def _canvas_to_wgs84(self, map_point):
+        """Canvas-CRS point → WGS84, cached per destination CRS."""
+        from qgis.core import QgsCoordinateReferenceSystem
+
+        dest = self.canvas.mapSettings().destinationCrs()
+        if dest.authid() == "EPSG:4326":
+            return QgsPointXY(map_point)
+        cached = getattr(self, "_canvas_inverse_cache", None)
+        if cached is None or cached[0] != dest.authid():
+            transform = QgsCoordinateTransform(
+                dest, QgsCoordinateReferenceSystem("EPSG:4326"),
+                QgsProject.instance())
+            cached = (dest.authid(), transform)
+            self._canvas_inverse_cache = cached
+        try:
+            return cached[1].transform(map_point)
+        except Exception:
+            return None
+
+    def _snap_to_tool_path(self, wgs_point, points):
+        """Nearest tool-path segment: ``(index, fraction)`` or ``None``.
+
+        Snapping runs on a longitude-compressed copy of the path held in a
+        ``QgsGeometry`` so ``closestSegmentWithContext`` (C++) does the
+        per-mouse-move work; adequate for the sub-kilometre offsets an
+        installation path can reach (same convention as
+        :meth:`_nearest_path_index`).
+        """
+        if len(points) < 2:
+            return None
+        result = self.model.path_result or {}
+        path_id = str(result.get("path_id") or "")
+        entry = self._path_snap_cache.get(path_id) if path_id else None
+        if entry is None:
+            mean_lat = sum(p[1] for p in points) / len(points)
+            scale = max(0.05, math.cos(math.radians(min(89.0,
+                                                        abs(mean_lat)))))
+            geom = QgsGeometry.fromPolylineXY(
+                [QgsPointXY(p[0] * scale, p[1]) for p in points])
+            entry = (scale, geom)
+            self._path_snap_cache = {path_id: entry} if path_id else {}
+        scale, geom = entry
+        probe = QgsPointXY(float(wgs_point.x()) * scale,
+                           float(wgs_point.y()))
+        try:
+            sqr_dist, min_point, after_vertex, _side = \
+                geom.closestSegmentWithContext(probe)
+        except Exception:
+            return None
+        if sqr_dist < 0 or after_vertex <= 0:
+            return None
+        index = min(int(after_vertex) - 1, len(points) - 2)
+        ax, ay = points[index][0] * scale, points[index][1]
+        bx, by = points[index + 1][0] * scale, points[index + 1][1]
+        span = math.hypot(bx - ax, by - ay)
+        fraction = 0.0 if span <= 0.0 else min(1.0, max(0.0, math.hypot(
+            float(min_point.x()) - ax, float(min_point.y()) - ay) / span))
+        return index, fraction
+
+    @staticmethod
+    def _segment_pose(points, index: int, fraction: float):
+        """WGS84 ``(anchor, before, after)`` interpolated along a segment."""
+        a, b = points[index], points[index + 1]
+        anchor = QgsPointXY(a[0] + fraction * (b[0] - a[0]),
+                            a[1] + fraction * (b[1] - a[1]))
+        return anchor, QgsPointXY(a[0], a[1]), QgsPointXY(b[0], b[1])
+
+    def _cursor_outline_tick(self) -> None:
+        if not self._cursor_outline_enabled or self.canvas is None \
+                or _sip_isdeleted(self.canvas):
+            return
+        pos = self._cursor_outline_pos
+        if pos is None:
+            return
+        try:
+            map_point = self.canvas.getCoordinateTransform() \
+                .toMapCoordinates(pos.x(), pos.y())
+        except (AttributeError, RuntimeError):
+            return
+        wgs = self._canvas_to_wgs84(map_point)
+        if wgs is None:
+            return
+        tool_points, barge_points = self._path_display_points()
+        tool_pose = barge_pose = kp = None
+        snap = self._snap_to_tool_path(wgs, tool_points)
+        if snap is not None:
+            index, fraction = snap
+            tool_pose = self._segment_pose(tool_points, index, fraction)
+            if index + 1 < len(barge_points):
+                barge_pose = self._segment_pose(barge_points, index,
+                                                fraction)
+            probe = tool_pose[0]
+        else:
+            probe = wgs
+        if self.model.route is not None:
+            try:
+                hit = self.model.route.kp_at_point(probe)
+                if hit is not None and hit.snapped_xy is not None \
+                        and math.isfinite(hit.dcc_m):
+                    kp = float(hit.kp_km)
+            except Exception:
+                kp = None
+        if tool_pose is None and kp is None:
+            self._hide_footprint()
+            return
+        self._draw_outlines(kp, tool_pose, barge_pose)
 
     def highlight_range(self, start_kp: float, end_kp: float):
         if self.canvas is None or self.model.route is None:
@@ -1778,11 +1984,27 @@ class BurialPlannerDock(QDockWidget):
                 self.canvas.unsetMapTool(pick_tool)
             except (AttributeError, RuntimeError):
                 pass
-        items = (self._marker, self._band, self._footprint_band) \
-            + tuple(self._exclusion_bands)
+        # Follow-cursor overlay: detach the viewport watcher and stop the
+        # coalescing timer before the canvas items are removed.
+        self._cursor_outline_enabled = False
+        self._cursor_outline_pos = None
+        if self._cursor_outline_timer is not None:
+            try:
+                self._cursor_outline_timer.stop()
+            except (AttributeError, RuntimeError):
+                pass
+            self._cursor_outline_timer = None
+        if self.canvas is not None and not _sip_isdeleted(self.canvas):
+            try:
+                self.canvas.viewport().removeEventFilter(self)
+            except (AttributeError, RuntimeError):
+                pass
+        items = (self._marker, self._band, self._footprint_band,
+                 self._vessel_band) + tuple(self._exclusion_bands)
         self._marker = None
         self._band = None
         self._footprint_band = None
+        self._vessel_band = None
         self._exclusion_bands = []
         for item in items:
             _remove_canvas_item(item)

@@ -17,7 +17,11 @@ from . import tools as tools_mod
 
 # v2: reachability-guided RPL rejoin for relaxed clusters (feasible-corner
 # ladder rung, on-route rejoin waypoints, best-of-variants selection).
-ALGORITHM_VERSION = "2"
+# v3: an unreachable lattice leg drops only its own control (never the whole
+# rung), rejoin waypoints cover complete control gaps, and best-fit rungs
+# are accepted by route-adherence cost (adjustments honoured first) instead
+# of ladder order — fixes long route sections being crossed as one diagonal.
+ALGORITHM_VERSION = "3"
 MODE_FILLET = "fillet"
 MODE_THROUGH = "through_ac"
 MODES = (MODE_FILLET, MODE_THROUGH)

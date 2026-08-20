@@ -838,8 +838,13 @@ def _solve_heading_lattice(waypoints: Sequence[Point],
             if best_state is not None:
                 following[to_index] = best_state
         if not following:
-            raise PathGeometryError(
+            error = PathGeometryError(
                 "No bounded-curvature waypoint path fits the deviation envelope.")
+            # Which leg had no credible edge. The caller can drop the
+            # unreachable waypoint alone instead of abandoning the whole
+            # control set (waypoint ``leg + 1`` in the cleaned control list).
+            error.failed_leg = leg
+            raise error
         states.append(following)
 
     final_index = min(states[-1], key=lambda idx: states[-1][idx][0])
@@ -1211,42 +1216,134 @@ def _rejoin_stations(route: Sequence[Point], chainages: Sequence[float],
     # The coarse step means ``first`` sits up to one step past the true
     # earliest rejoin — deliberate margin so the mandatory waypoint stays
     # comfortably inside the reachable set for the lattice's discrete fan.
+    #
+    # Follow-up stations must cover the WHOLE remaining gap: a Dubins edge
+    # is one arc-straight-arc, so any unpinned remainder is crossed as a
+    # single diagonal that ignores the route between the pins. The count
+    # stays bounded (lattice cost); the spacing widens only when a very
+    # long gap would need more waypoints than the bound allows.
     out = [first]
-    station = first + 2.5 * radius
-    while station < limit and len(out) < int(max_points):
+    remaining = limit - first
+    count = max(int(max_points),
+                min(12, int(remaining / (2.5 * radius))))
+    spacing = max(2.5 * radius, remaining / max(count, 1))
+    station = first + spacing
+    while station < limit and len(out) <= count:
         out.append(station)
-        station += 2.5 * radius
+        station += spacing
     return out
 
 
-def _controls_with_rejoin(route: Sequence[Point], chainages: Sequence[float],
-                          subset: Sequence[_Corner], start: float, end: float,
-                          anchor_start: Point, anchor_end: Point,
-                          radius: float) -> Optional[List[Point]]:
-    """Control list augmented with on-route rejoin waypoints.
+def _variant_controls(route: Sequence[Point], chainages: Sequence[float],
+                      subset: Sequence[_Corner], start: float, end: float,
+                      anchor_start: Point, anchor_end: Point,
+                      radius: float, with_rejoin: bool,
+                      banned_stations: Sequence[float] = ()
+                      ) -> Tuple[List[Point], List]:
+    """Ordered control points plus per-control provenance metadata.
 
-    A single Dubins edge is one arc-straight-arc: after a forced turn-out
-    excursion it can only crawl back to a distant anchor along one long
-    diagonal. Mandatory waypoints placed ON the reference inside long
-    control gaps let the heading lattice rejoin the RPL early and then
-    follow it, which is how a real plough/trencher would be driven.
-    Returns ``None`` when every gap is short enough not to matter.
+    ``meta[i]`` is ``None`` for the two window anchors, the member
+    :class:`_Corner` for a route control, or the float rejoin station for
+    an on-route rejoin waypoint.  Consecutive duplicates are dropped at the
+    same tolerance :func:`solve_waypoint_path` cleans with, so a lattice
+    ``failed_leg`` index maps back onto this metadata exactly.
+
+    With ``with_rejoin`` the long control gaps gain mandatory waypoints ON
+    the reference: a single Dubins edge is one arc-straight-arc, so after a
+    forced turn-out excursion it can only crawl back to a distant anchor
+    along one long diagonal.  Rejoin waypoints let the heading lattice
+    merge back onto the RPL early and then follow it, which is how a real
+    plough/trencher would be driven.  ``banned_stations`` removes rejoin
+    stations a previous attempt proved unreachable.
     """
-    entries: List[Tuple[float, Point]] = [(float(start), anchor_start)]
+    entries: List[Tuple[float, Point, Optional[_Corner]]] = [
+        (float(start), anchor_start, None)]
     for corner in subset:
         entries.append((min(max(corner.station_m, float(start)), float(end)),
-                        _control_point(route, corner)))
-    entries.append((float(end), anchor_end))
+                        _control_point(route, corner), corner))
+    entries.append((float(end), anchor_end, None))
     controls: List[Point] = [anchor_start]
-    added = False
-    for (station_a, point_a), (station_b, point_b) in zip(entries,
-                                                          entries[1:]):
-        for station in _rejoin_stations(route, chainages, point_a,
-                                        station_a, station_b, radius):
-            controls.append(point_at_distance(route, chainages, station))
-            added = True
-        controls.append(point_b)
-    return controls if added else None
+    meta: List = [None]
+
+    def push(point: Point, tag) -> None:
+        if distance(controls[-1], point) > 1e-6:
+            controls.append((float(point[0]), float(point[1])))
+            meta.append(tag)
+
+    for (station_a, point_a, _tag_a), (station_b, point_b, tag_b) in zip(
+            entries, entries[1:]):
+        if with_rejoin:
+            for station in _rejoin_stations(route, chainages, point_a,
+                                            station_a, station_b, radius):
+                if any(abs(station - value) <= 0.5
+                       for value in banned_stations):
+                    continue
+                push(point_at_distance(route, chainages, station),
+                     float(station))
+        push(point_b, tag_b)
+    return controls, meta
+
+
+def _solve_variant_with_drops(
+        route: Sequence[Point], chainages: Sequence[float],
+        subset: Sequence[_Corner], start: float, end: float,
+        anchor_start: Point, anchor_end: Point, radius: float,
+        start_heading: float, end_heading: float,
+        reference: Sequence[Point], limit: Optional[float],
+        chord_tolerance_m: float, with_rejoin: bool,
+        cancel: Optional[Callable[[], bool]] = None,
+        progress: Optional[Callable[[int, int], None]] = None
+        ) -> Optional[Tuple[PathSolution, List[_Corner]]]:
+    """Solve one control-set variant, dropping only unreachable controls.
+
+    Historically a whole rung failed when ANY single lattice leg had no
+    credible bounded-curvature edge — e.g. a hairpin near the window entry
+    made the first leg infeasible and every perfectly solvable downstream
+    control was discarded with it, so the path crossed kilometres of route
+    as one anchor-to-anchor Dubins diagonal.  Here the specific waypoint
+    the lattice reports as unreachable is removed (a member control or a
+    rejoin waypoint) and the solve retried; rejoin waypoints are
+    recomputed for the enlarged gaps so the path is pulled back onto the
+    reference as early as physically credible.
+
+    Returns ``(solution, surviving controls)`` or ``None``.
+    """
+    survivors = list(subset)
+    banned: List[float] = []
+    for _attempt in range(len(subset) + 16):
+        if cancel is not None and cancel():
+            raise PathCancelled()
+        controls, meta = _variant_controls(
+            route, chainages, survivors, start, end, anchor_start,
+            anchor_end, radius, with_rejoin, banned)
+        try:
+            solution = solve_waypoint_path(
+                controls, radius, start_heading=start_heading,
+                end_heading=end_heading, reference=reference,
+                max_deviation_m=limit, chord_tolerance_m=chord_tolerance_m,
+                cancel=cancel, progress=progress)
+            return solution, survivors
+        except PathGeometryError as error:
+            leg = getattr(error, "failed_leg", None)
+            if leg is None:
+                return None
+            # Waypoint ``leg + 1`` was unreachable; when it is the end
+            # anchor, the constraint that blocks it is the last interior
+            # waypoint instead.
+            target = leg + 1
+            if target >= len(controls) - 1:
+                target = leg
+            if target <= 0 or target >= len(controls) - 1:
+                return None
+            tag = meta[target]
+            if isinstance(tag, _Corner):
+                survivors = [corner for corner in survivors
+                             if corner is not tag]
+            elif tag is not None:
+                banned.append(float(tag))
+            else:
+                return None
+    return None
 
 
 def _wide_recovery_solution(
@@ -1366,48 +1463,83 @@ def _compound_replacement(route: Sequence[Point], chainages: Sequence[float],
     limits = [max_deviation_m]
     if max_deviation_m is not None and max_deviation_m > 0.0:
         limits.append(None)
-    for limit in limits:
-        for subset in ladder:
-            # Each relaxed rung is solved both plain and with on-route
-            # rejoin waypoints in its long control gaps (early rejoin +
-            # line following, which one arc-straight-arc Dubins edge can
-            # never express). The better result by the solver's own cost
-            # order wins, so augmentation can never worsen a rung.
-            # Exact-through (nothing dropped, no recovery) keeps its
-            # historical unconstrained turn-out freedom.
-            plain = [anchor_start]
-            plain.extend(_control_point(route, corner) for corner in subset)
-            plain.append(anchor_end)
-            variants: List[List[Point]] = [plain]
-            if recovery or len(subset) < len(members):
-                augmented = _controls_with_rejoin(
-                    route, chainages, subset, start, end,
-                    anchor_start, anchor_end, radius)
-                if augmented is not None:
-                    variants.insert(0, augmented)
-            best = None
-            for controls in variants:
-                try:
-                    candidate = solve_waypoint_path(
-                        controls, radius, start_heading=start_heading,
-                        end_heading=end_heading, reference=reference,
-                        max_deviation_m=limit,
-                        chord_tolerance_m=chord_tolerance_m, cancel=cancel,
-                        progress=(None if fraction_progress is None else
-                                  lambda done, total:
-                                  fraction_progress(done / max(total, 1))))
-                except PathGeometryError:
+    solve_progress = (None if fraction_progress is None else
+                      lambda done, total:
+                      fraction_progress(done / max(total, 1)))
+
+    def _solve_rung(subset: Sequence[_Corner], limit: Optional[float]
+                    ) -> Optional[Tuple[Tuple, PathSolution, List[_Corner]]]:
+        # Each rung is solved plain and (for relaxed/recovery rungs) with
+        # on-route rejoin waypoints in its long control gaps (early rejoin
+        # + line following, which one arc-straight-arc Dubins edge can
+        # never express). The better result by the solver's own cost order
+        # wins, so augmentation can never worsen a rung.  Exact-through
+        # (nothing dropped, no recovery) keeps its historical
+        # unconstrained turn-out freedom — unless its solve had to drop
+        # controls, in which case the rejoin variant is tried after all.
+        allow_rejoin = recovery or len(subset) < len(members)
+        best = None
+        variants = (True, False) if allow_rejoin else (False,)
+        retried_with_rejoin = allow_rejoin
+        while True:
+            for use_rejoin in variants:
+                outcome = _solve_variant_with_drops(
+                    route, chainages, subset, start, end, anchor_start,
+                    anchor_end, radius, start_heading, end_heading,
+                    reference, limit, chord_tolerance_m, use_rejoin,
+                    cancel, solve_progress)
+                if outcome is None:
                     continue
+                candidate, survivors = outcome
                 key = (candidate.max_offset_m, candidate.rms_offset_m,
                        candidate.length_m)
                 if best is None or key < best[0]:
-                    best = (key, candidate)
-            if best is not None:
-                solution = best[1]
-                passed = {corner.number for corner in subset}
-                corridor_relaxed = limit is None and max_deviation_m is not None
+                    best = (key, candidate, survivors)
+            if retried_with_rejoin or best is None \
+                    or len(best[2]) >= len(subset):
+                return best
+            retried_with_rejoin = True
+            variants = (True,)
+
+    for limit in limits:
+        accepted = None
+        candidates: List[Tuple[Tuple, PathSolution, List[_Corner]]] = []
+        seen_signatures = set()
+        for subset in ladder:
+            signature = tuple(corner.number for corner in subset)
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+            rung = _solve_rung(subset, limit)
+            if rung is None:
+                continue
+            seen_signatures.add(
+                tuple(corner.number for corner in rung[2]))
+            candidates.append(rung)
+            # A rung solved without dropping anything: no later (smaller)
+            # rung can honour more controls, so stop descending.  When it
+            # is the full exact-through objective, it is final.
+            if len(rung[2]) >= len(subset):
+                if len(subset) == len(members):
+                    accepted = rung
                 break
-        if solution is not None:
+        if accepted is None and candidates:
+            # No rung met its full objective. Honour the user's manual
+            # adjustments first, then the solver's own (max offset, rms,
+            # length) cost order against the route.  Cost — not the count
+            # of honoured corners — is what a real tool driver optimises:
+            # slaloming exactly through infeasibly tight corners deviates
+            # more overall than a smoothed line past them, while truly
+            # skipping a route section costs a huge offset and loses.
+            accepted = min(
+                candidates,
+                key=lambda item: (
+                    -sum(1 for corner in item[2] if corner.adjustment),
+                    item[0]))
+        if accepted is not None:
+            solution = accepted[1]
+            passed = {corner.number for corner in accepted[2]}
+            corridor_relaxed = limit is None and max_deviation_m is not None
             break
     if solution is None and allow_wide_recovery:
         solution = _wide_recovery_solution(
