@@ -133,6 +133,8 @@ SIZE_POLICY_IGNORED = _scoped_member(QSizePolicy, "Policy", "Ignored")
 SIZE_POLICY_PREFERRED = _scoped_member(QSizePolicy, "Policy", "Preferred")
 TEXT_ELIDE_RIGHT = _scoped_member(Qt, "TextElideMode", "ElideRight")
 CONTEXT_MENU_POLICY_CUSTOM = _scoped_member(Qt, "ContextMenuPolicy", "CustomContextMenu")
+MOUSE_BUTTON_LEFT = _scoped_member(Qt, "MouseButton", "LeftButton")
+KEYBOARD_MODIFIER_NONE = _scoped_member(Qt, "KeyboardModifier", "NoModifier")
 
 SELECTION_MODE_EXTENDED = _scoped_member(QAbstractItemView, "SelectionMode", "ExtendedSelection")
 SELECTION_MODE_SINGLE = _scoped_member(QAbstractItemView, "SelectionMode", "SingleSelection")

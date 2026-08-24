@@ -25,7 +25,8 @@ from qgis.gui import QgsMapCanvas, QgsRubberBand, QgsVertexMarker
 
 from ..burial import analysis_task, burial_dock, generation, map_layers
 from ..burial import schema as burial_schema
-from ..qgis_compat import ITEM_DATA_USER_ROLE, WKB_LINESTRING
+from ..qgis_compat import (ITEM_DATA_USER_ROLE, KEYBOARD_MODIFIER_NONE,
+                           MOUSE_BUTTON_LEFT, WKB_LINESTRING)
 from ..burial.plan_model import PlanModel
 from ..burial.store import BurialStore
 from ..kp_geo_utils import RouteFrame
@@ -1641,6 +1642,70 @@ def test_column_menu_persists_by_label() -> bool:
     return _result("column menu: label-keyed persistence + defaults", ok)
 
 
+def test_column_menu_survives_garbage_collection() -> bool:
+    """Regression: a header right-click after a cyclic-GC pass crashed QGIS
+    (access violation) — the column-menu slot was a nested closure Qt kept
+    dispatching to after Python had freed it. The handler now lives in a
+    QObject owned by the table; the menu must open and apply a choice
+    after ``gc.collect()``."""
+    import gc
+
+    from qgis.PyQt.QtCore import QPoint, QSettings, QTimer
+    from qgis.PyQt.QtTest import QTest
+    from qgis.PyQt.QtWidgets import QApplication, QTableWidget
+
+    from ..burial import ui_helpers
+
+    key = "SubseaCableTools/BurialPlanner/test_column_menu_gc"
+    QSettings().remove(key)
+    table = QTableWidget(0, 4)
+    table.setHorizontalHeaderLabels(["ID", "KP", "rKP", "Notes"])
+    ui_helpers.enable_column_menu(table, key, always_visible=(0,),
+                                  default_hidden=("rKP",))
+    table.resize(400, 200)
+    table.show()
+    for _ in range(3):
+        gc.collect()
+    seen = {}
+
+    def close_menu():
+        popup = QApplication.activePopupWidget()
+        seen["popup"] = type(popup).__name__ if popup is not None else None
+        if popup is None:
+            return
+        notes = [a for a in popup.actions() if a.data() == 3]
+        if notes:
+            rect = popup.actionGeometry(notes[0])
+            QTest.mouseClick(popup, MOUSE_BUTTON_LEFT, KEYBOARD_MODIFIER_NONE,
+                             rect.center())
+        if QApplication.activePopupWidget() is not None:
+            popup.close()
+
+    QTimer.singleShot(150, close_menu)
+    # Same signal a real right-click on the header emits.
+    table.horizontalHeader().customContextMenuRequested.emit(QPoint(20, 5))
+    ok = seen.get("popup") == "QMenu"
+    ok = ok and table.isColumnHidden(3) and table.isColumnHidden(2)
+    ok = ok and not table.isColumnHidden(1)
+    ok = ok and isinstance(getattr(table, "_column_menu", None),
+                           ui_helpers._ColumnMenu)
+    try:
+        saved = json.loads(QSettings().value(key) or "{}")
+    except (TypeError, ValueError):
+        saved = {}
+    ok = ok and "Notes" in (saved.get("hidden") or [])
+    # Second open after another GC pass: the helper is still wired.
+    gc.collect()
+    seen.clear()
+    QTimer.singleShot(150, close_menu)
+    table.horizontalHeader().customContextMenuRequested.emit(QPoint(20, 5))
+    ok = ok and seen.get("popup") == "QMenu" and not table.isColumnHidden(3)
+    QSettings().remove(key)
+    table.deleteLater()
+    return _result("column menu: survives garbage collection (QGIS crash)",
+                   ok, f"popup={seen.get('popup')}")
+
+
 def test_goto_range_guards_degenerate_ranges() -> bool:
     """NaN / equal / non-numeric ranges never reach the canvas or profile."""
     from ..burial.burial_dock import BurialPlannerDock
@@ -1755,6 +1820,7 @@ def run_all() -> list:
         test_profile_bands_replace_per_range_items(),
         test_builder_sections_table_delegates_and_optional_columns(),
         test_column_menu_persists_by_label(),
+        test_column_menu_survives_garbage_collection(),
         test_goto_range_guards_degenerate_ranges(),
         test_highlight_ranges_multi_selection(),
     ]

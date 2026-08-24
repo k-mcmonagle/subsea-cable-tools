@@ -851,6 +851,9 @@ class PathsTab(QWidget):
             QSettings().setValue(setting, bool(checked))
 
         box.toggled.connect(_toggled)
+        # Keep the closure slot alive with the widget: PyQt does not, and a
+        # collected slot crashes QGIS on the next emit (see ui_helpers).
+        box._toggled_slot = _toggled
         return box, body
 
     def _profile_id(self) -> str:

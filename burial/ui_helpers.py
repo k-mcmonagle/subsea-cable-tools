@@ -22,7 +22,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import QObject, Qt
 from qgis.PyQt.QtGui import QColor, QPalette
 from qgis.PyQt.QtWidgets import (
     QApplication,
@@ -45,6 +45,23 @@ from ..qgis_compat import (
     ITEM_DATA_USER_ROLE,
     TOOLBUTTON_POPUP_MODE_INSTANT,
 )
+
+try:
+    from qgis.PyQt import sip as _sip
+except ImportError:  # pragma: no cover - very old bindings
+    try:
+        import sip as _sip
+    except ImportError:
+        _sip = None
+
+
+def _sip_isdeleted(obj) -> bool:
+    if _sip is None:
+        return False
+    try:
+        return bool(_sip.isdeleted(obj))
+    except (TypeError, RuntimeError):
+        return False
 
 # (light, dark) hex pairs for each semantic colour.
 _COLORS = {
@@ -304,6 +321,112 @@ def _column_labels(table) -> List[str]:
     return labels
 
 
+class _ColumnMenu(QObject):
+    """Header right-click column chooser, owned by its table.
+
+    A ``QObject`` child of the table with bound-method slots — never a
+    nested closure. PyQt does not keep a Python closure connected to a
+    signal alive on its own: once the cyclic garbage collector freed the
+    old ``show_menu`` closure, the next header right-click dispatched into
+    freed memory and took the whole QGIS process down with an access
+    violation. The table (C++ parent) keeps this helper alive for exactly
+    as long as the header can emit, and the menu is resolved from
+    ``exec``'s return value so no per-action lambdas exist either.
+    """
+
+    def __init__(self, table, settings_key: str,
+                 always_visible: Sequence[int],
+                 default_hidden: Sequence[str]):
+        super().__init__(table)
+        self._table = table
+        self._header = table.horizontalHeader()
+        self._settings_key = settings_key
+        self._always_visible = tuple(always_visible or ())
+        self._default_hidden = set(default_hidden or ())
+        self._labels = _column_labels(table)
+
+    def _alive(self) -> bool:
+        try:
+            return (not _sip_isdeleted(self._table)
+                    and not _sip_isdeleted(self._header))
+        except (AttributeError, RuntimeError, TypeError):
+            return False
+
+    def _label(self, column: int) -> str:
+        if column < len(self._labels) and self._labels[column]:
+            return self._labels[column]
+        return f"Column {column + 1}"
+
+    def save(self) -> None:
+        import json
+
+        from qgis.PyQt.QtCore import QSettings
+
+        if not self._alive():
+            return
+        table = self._table
+        hidden = [self._labels[column] for column in range(table.columnCount())
+                  if column < len(self._labels)
+                  and table.isColumnHidden(column)]
+        QSettings().setValue(self._settings_key, json.dumps(
+            {"hidden": hidden, "known": list(self._labels)}))
+
+    def show_all(self) -> None:
+        if not self._alive():
+            return
+        for column in range(self._table.columnCount()):
+            self._table.setColumnHidden(column, False)
+        self.save()
+
+    def reset(self) -> None:
+        if not self._alive():
+            return
+        for column in range(self._table.columnCount()):
+            self._table.setColumnHidden(
+                column, column not in self._always_visible
+                and self._label(column) in self._default_hidden)
+        self.save()
+
+    def show_menu(self, position) -> None:
+        from ..qgis_compat import qt_exec
+
+        if not self._alive():
+            return
+        table = self._table
+        # No parent: the menu is a one-shot local. A table-parented menu
+        # would outlive every right-click and pile up on the table.
+        menu = QMenu()
+        for column in range(table.columnCount()):
+            action = menu.addAction(self._label(column))
+            action.setCheckable(True)
+            action.setChecked(not table.isColumnHidden(column))
+            action.setData(column)
+            if column in self._always_visible:
+                action.setEnabled(False)
+        menu.addSeparator()
+        menu.addAction("Show all columns").setData("all")
+        menu.addAction("Reset to default columns").setData("reset")
+        try:
+            chosen = qt_exec(menu, self._header.mapToGlobal(position))
+            data = chosen.data() if chosen is not None else None
+        finally:
+            menu.deleteLater()
+        if data is None or not self._alive():
+            return
+        if data == "all":
+            self.show_all()
+        elif data == "reset":
+            self.reset()
+        else:
+            try:
+                column = int(data)
+            except (TypeError, ValueError):
+                return
+            if 0 <= column < table.columnCount():
+                table.setColumnHidden(column, not table.isColumnHidden(column))
+                self.save()
+
+
 def enable_column_menu(table, settings_key: str,
                        always_visible: Sequence[int] = (0,),
                        default_hidden: Sequence[str] = ()) -> None:
@@ -317,56 +440,26 @@ def enable_column_menu(table, settings_key: str,
     column the saved state has never seen follows ``default_hidden`` (labels
     of optional columns that start hidden — e.g. positions and reverse KP);
     legacy index lists are honoured on tables whose columns did not change.
+
+    The handler lives in a ``_ColumnMenu`` object parented to the table
+    (see its docstring for why a closure slot crashed QGIS).
     """
-    import json
-
-    from qgis.PyQt.QtCore import QSettings
-
-    from ..qgis_compat import CONTEXT_MENU_POLICY_CUSTOM, qt_exec
+    from ..qgis_compat import CONTEXT_MENU_POLICY_CUSTOM
 
     header = table.horizontalHeader()
     header.setContextMenuPolicy(CONTEXT_MENU_POLICY_CUSTOM)
     header.setToolTip("Right-click to choose which columns are shown.")
-    labels = _column_labels(table)
-    default_hidden = set(default_hidden or ())
-
-    def save() -> None:
-        hidden = [labels[column] for column in range(table.columnCount())
-                  if table.isColumnHidden(column) and column < len(labels)]
-        QSettings().setValue(settings_key, json.dumps(
-            {"hidden": hidden, "known": labels}))
-
-    def show_menu(position) -> None:
-        menu = QMenu(table)
-        for column in range(table.columnCount()):
-            label = labels[column] if column < len(labels) else ""
-            action = menu.addAction(label or f"Column {column + 1}")
-            action.setCheckable(True)
-            action.setChecked(not table.isColumnHidden(column))
-            if column in always_visible:
-                action.setEnabled(False)
-            action.toggled.connect(
-                lambda checked, c=column:
-                (table.setColumnHidden(c, not checked), save()))
-        menu.addSeparator()
-
-        def show_all() -> None:
-            for column in range(table.columnCount()):
-                table.setColumnHidden(column, False)
-            save()
-
-        def reset() -> None:
-            for column in range(table.columnCount()):
-                table.setColumnHidden(
-                    column, column not in always_visible
-                    and labels[column] in default_hidden)
-            save()
-
-        menu.addAction("Show all columns", show_all)
-        menu.addAction("Reset to default columns", reset)
-        qt_exec(menu, header.mapToGlobal(position))
-
-    header.customContextMenuRequested.connect(show_menu)
+    previous = getattr(table, "_column_menu", None)
+    if previous is not None:
+        try:
+            header.customContextMenuRequested.disconnect(previous.show_menu)
+        except (TypeError, RuntimeError):
+            pass
+    helper = _ColumnMenu(table, settings_key, always_visible, default_hidden)
+    header.customContextMenuRequested.connect(helper.show_menu)
+    # Belt and braces: the C++ parent keeps the helper alive, and so does
+    # this Python-side reference on the table wrapper.
+    table._column_menu = helper
     apply_saved_column_visibility(table, settings_key, always_visible,
                                   default_hidden)
 
