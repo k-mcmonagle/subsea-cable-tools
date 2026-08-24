@@ -1941,7 +1941,7 @@ class PlanModel(QObject):
         active = self.store.active_generation(self.plan_id) or {}
         return io_csv.sections_csv(self.plan, self.sections,
                                    active.get("generation_id") or "",
-                                   tools=self.tools)
+                                   tools=self.tools, route=self.route)
 
     def export_inputs_csv(self) -> str:
         return io_csv.inputs_csv(self.plan, self.inputs)

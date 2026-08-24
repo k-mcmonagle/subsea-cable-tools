@@ -10,6 +10,7 @@ spec's no-new-dependencies gate.
 from __future__ import annotations
 
 import ast
+import json
 import sys
 from pathlib import Path
 
@@ -116,6 +117,70 @@ def test_section_refs_and_csv() -> bool:
     return _result("section working refs (per kind, travel order) + CSV", ok)
 
 
+SKIP_HANDLING_SAMPLE = schema.SKIP_HANDLING_RECOVER
+
+
+def test_sections_csv_exports_every_builder_column() -> bool:
+    """The sections CSV carries every Plan Builder column — including the
+    hidden-by-default rKP and boundary positions (from the route) and a
+    readable reasons rendering — regardless of which columns are shown."""
+    import csv as csv_mod
+
+    class _Point:
+        def __init__(self, x, y):
+            self._x, self._y = x, y
+
+        def x(self):
+            return self._x
+
+        def y(self):
+            return self._y
+
+    class _Route:
+        total_length_km = 100.0
+
+        def point_at_kp(self, kp, clamp=False):
+            return _Point(-3.0 + kp * 0.01, 56.0 + kp * 0.001)
+
+    sections = [
+        _section("s1", schema.SECTION_BURIAL, 0.0, 25.0),
+        _section("s2", schema.SECTION_SKIP, 25.0, 40.0),
+    ]
+    sections[0]["reason_json"] = json.dumps({"manual": True})
+    sections[1]["skip_handling"] = SKIP_HANDLING_SAMPLE
+    text = io_csv.sections_csv(_plan(), sections, "gen-1", route=_Route())
+    rows = [line for line in text.splitlines() if not line.startswith("#")]
+    parsed = list(csv_mod.reader(rows))
+    header = parsed[0]
+    ok = header == io_csv.SECTION_COLUMNS
+    expected = ["section_ref", "kind", "start_kp", "end_kp", "start_rkp",
+                "end_rkp", "start_lat", "start_lon", "end_lat", "end_lon",
+                "length_km", "state", "conclusion", "confidence", "tool",
+                "tool_config", "skip_handling", "reasons", "reasons_text",
+                "notes"]
+    ok = ok and header == expected
+    first = dict(zip(header, parsed[1]))
+    ok = ok and first["section_ref"] == "PS-01"
+    ok = ok and first["start_rkp"] == "100.000" and first["end_rkp"] == "75.000"
+    ok = ok and first["start_lat"] == "56.0000000" and first["start_lon"] == "-3.0000000"
+    ok = ok and first["end_lat"] == "56.0250000" and first["end_lon"] == "-2.7500000"
+    ok = ok and first["reasons"] == json.dumps({"manual": True})
+    ok = ok and first["reasons_text"] == "manual"
+    second = dict(zip(header, parsed[2]))
+    ok = ok and second["skip_handling"] == schema.SKIP_HANDLING_LABELS[
+        SKIP_HANDLING_SAMPLE]
+    ok = ok and second["start_rkp"] == "75.000"
+    # Without a route the route-derived columns are blank, never wrong.
+    text = io_csv.sections_csv(_plan(), sections, "gen-1")
+    rows = [line for line in text.splitlines() if not line.startswith("#")]
+    bare = dict(zip(header, list(csv_mod.reader(rows))[1]))
+    ok = ok and all(bare[c] == "" for c in ("start_rkp", "end_rkp", "start_lat",
+                                            "start_lon", "end_lat", "end_lon"))
+    ok = ok and bare["start_kp"] == "0.000"
+    return _result("sections CSV: every Builder column, route-derived + text",
+                   ok, f"header={header[:6]}...")
+
+
 def test_change_log_inversion() -> bool:
     entry = change_log.make_entry(
         "p1", 3, change_log.ACTION_MOVE_EVENT, "e1",
@@ -210,6 +275,7 @@ def run_all() -> list:
         test_events_csv_round_trip(),
         test_kp_range_and_list_imports(),
         test_section_refs_and_csv(),
+        test_sections_csv_exports_every_builder_column(),
         test_change_log_inversion(),
         test_change_log_delta(),
         test_import_scan(),

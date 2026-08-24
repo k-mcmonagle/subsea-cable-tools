@@ -26,9 +26,16 @@ from . import tools as tools_mod
 
 EVENT_COLUMNS = ["seq", "event_type", "label", "kp", "lat", "lon", "depth_m",
                  "source", "status", "locked", "notes"]
-SECTION_COLUMNS = ["section_ref", "kind", "start_kp", "end_kp", "length_km",
-                   "state", "conclusion", "confidence", "tool",
-                   "skip_handling", "reasons", "notes"]
+# Every Plan Builder Sections column is exported, hidden or not — rKP
+# (route length − KP) and the RPL boundary positions need the route, and
+# are blank without one. ``reasons`` is the raw reason_json;
+# ``reasons_text`` is the readable Builder/report rendering.
+SECTION_COLUMNS = ["section_ref", "kind", "start_kp", "end_kp",
+                   "start_rkp", "end_rkp",
+                   "start_lat", "start_lon", "end_lat", "end_lon",
+                   "length_km", "state", "conclusion", "confidence", "tool",
+                   "tool_config", "skip_handling", "reasons", "reasons_text",
+                   "notes"]
 INPUT_COLUMNS = ["role", "layer_name", "layer_source", "originator", "revision",
                  "status", "received_utc", "quality", "notes"]
 HAZARD_COLUMNS = ["risk", "status", "kp", "end_kp", "offset_m", "crossing",
@@ -83,8 +90,72 @@ def events_csv(plan: Dict, events: Sequence[Dict], generation_id: str = "") -> s
     return buf.getvalue()
 
 
+def _route_length_km(route) -> Optional[float]:
+    if route is None:
+        return None
+    try:
+        total = float(route.total_length_km)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return total if total > 0 else None
+
+
+def _rkp_text(kp, total_km: Optional[float]) -> str:
+    """Reverse KP (route length − KP), KP Mouse convention."""
+    if total_km is None or kp is None:
+        return ""
+    try:
+        return schema.format_kp(total_km - float(kp))
+    except (TypeError, ValueError):
+        return ""
+
+
+def _position_text(route, kp) -> Tuple[str, str]:
+    """``(lat, lon)`` on the RPL at ``kp`` (7 dp, as the Builder shows)."""
+    if route is None or kp is None:
+        return "", ""
+    try:
+        point = route.point_at_kp(float(kp), clamp=True)
+    except (TypeError, ValueError, AttributeError):
+        return "", ""
+    if point is None:
+        return "", ""
+    try:
+        return f"{point.y():.7f}", f"{point.x():.7f}"
+    except (AttributeError, TypeError, ValueError):
+        return "", ""
+
+
+def _section_config_text(section: Dict, plan: Dict,
+                         tools: Sequence[Dict]) -> str:
+    """The effective configuration label alone (blank when none applies)."""
+    if (section.get("kind") or "") != schema.SECTION_BURIAL:
+        return ""
+    tool_id = str(section.get("tool_id") or "")
+    config_id = str(section.get("tool_config_id") or "")
+    default_tool, default_config = tools_mod.plan_default_tool(plan)
+    if not tool_id:
+        tool_id = default_tool
+        config_id = config_id or default_config
+    if not tool_id or not config_id:
+        return ""
+    tool = tools_mod.tool_by_id(tools, tool_id)
+    if tool is None:
+        return ""
+    return (tools_mod.config_label(tools_mod.config_by_id(tool, config_id))
+            or "(unknown configuration)")
+
+
 def sections_csv(plan: Dict, sections: Sequence[Dict], generation_id: str = "",
-                 tools: Sequence[Dict] = ()) -> str:
+                 tools: Sequence[Dict] = (), route=None) -> str:
+    """Sections CSV with every Plan Builder column (see SECTION_COLUMNS).
+
+    ``route`` is the plan's RouteFrame (or None): it supplies the reverse
+    KP and start/end positions exactly as the Builder computes them.
+    """
+    from . import report as report_mod
+
+    total_km = _route_length_km(route)
     buf = io.StringIO()
     for line in metadata_lines(plan, generation_id):
         buf.write(line + "\r\n")
@@ -93,20 +164,29 @@ def sections_csv(plan: Dict, sections: Sequence[Dict], generation_id: str = "",
     refs = schema.section_refs(sections, int(plan.get("direction") or 1),
                                plan.get("method") or "")
     for section in sections:
+        start_kp = section.get("start_kp")
+        end_kp = section.get("end_kp")
+        start_lat, start_lon = _position_text(route, start_kp)
+        end_lat, end_lon = _position_text(route, end_kp)
         writer.writerow([
             refs.get(str(section.get("section_id") or ""), ""),
             section.get("kind") or "",
-            schema.format_kp(section.get("start_kp")),
-            schema.format_kp(section.get("end_kp")),
+            schema.format_kp(start_kp),
+            schema.format_kp(end_kp),
+            _rkp_text(start_kp, total_km),
+            _rkp_text(end_kp, total_km),
+            start_lat, start_lon, end_lat, end_lon,
             schema.format_kp(section.get("length_km")),
             section.get("state") or "",
             schema.CONCLUSION_LABELS.get(section.get("conclusion") or "",
                                          section.get("conclusion") or ""),
             section.get("confidence") or "",
             tools_mod.section_tool_display(section, plan, tools),
+            _section_config_text(section, plan, tools),
             (schema.SKIP_HANDLING_LABELS.get(section.get("skip_handling") or "", "")
              if section.get("kind") == schema.SECTION_SKIP else ""),
             section.get("reason_json") or "",
+            report_mod.section_reason_text(section),
             section.get("notes") or "",
         ])
     return buf.getvalue()
