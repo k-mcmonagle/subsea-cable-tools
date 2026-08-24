@@ -94,6 +94,13 @@ class GenParams:
         }
 
 
+ZERO_LENGTH_KM = 1e-6  # 1 mm — below this a range is residue, not a section
+
+def _drop_zero_length(ranges):
+    """Drop sub-millimetre intervals: arithmetic residue, never a section."""
+    return [iv for iv in ranges if iv.end_km - iv.start_km >= ZERO_LENGTH_KM]
+
+
 def dismissed_pairs(value) -> List[Tuple[float, float]]:
     """Parse a stored dismissed-insufficient list (``[[start, end], ...]``).
 
@@ -563,7 +570,7 @@ def resolve_stack(params: GenParams, acquisitions: Sequence[RuleAcquisition],
         if (acq.rule_row.get("kind") or "") == schema.RULE_KIND_COVERAGE:
             result.rule_hits[str(acq.rule_row.get("rule_id"))] = \
                 eng.clip_intervals(acq.nodata, scope)
-    return result, influence, eng.normalize(nodata), warnings
+    return result, influence, _drop_zero_length(eng.normalize(nodata)), warnings
 
 
 # ---------------------------------------------------------------------------
@@ -895,10 +902,15 @@ def build_sections(merged_events: List[Dict], params: GenParams,
         row["reason_json"] = json.dumps(reason)
         sections.append(carry_over(row))
 
-    # Remaining scope: insufficient-information first, then skips.
+    # Remaining scope: insufficient-information first, then skips. Ranges
+    # shorter than 1 mm are interval-arithmetic residue (a no-data interval
+    # touching a burial edge), never a real section: a zero-length row has
+    # no slice to draw, no boundary events and a zero-area map extent.
     remaining = eng.subtract_intervals([scope], burial_ranges)
-    insufficient_ranges = eng.intersect_intervals(remaining, insufficient)
-    skip_ranges = eng.subtract_intervals(remaining, insufficient_ranges)
+    insufficient_ranges = _drop_zero_length(
+        eng.intersect_intervals(remaining, insufficient))
+    skip_ranges = _drop_zero_length(
+        eng.subtract_intervals(remaining, insufficient_ranges))
 
     for iv in insufficient_ranges:
         row = base_row(schema.SECTION_INSUFFICIENT, iv.start_km, iv.end_km)

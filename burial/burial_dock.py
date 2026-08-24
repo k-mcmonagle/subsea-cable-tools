@@ -1902,8 +1902,9 @@ class BurialPlannerDock(QDockWidget):
             return
         if not (math.isfinite(start_kp) and math.isfinite(end_kp)):
             return
-        if start_kp == end_kp:
-            # A zero-length range has no slice to frame; centre on it instead.
+        if abs(end_kp - start_kp) < 1e-6:  # < 1 mm: a zero-length row
+            # No slice to frame (a degenerate section from an older plan
+            # or a rounding sliver); centre on the KP at a sane scale.
             self.goto_kp(start_kp)
             return
         geom = self.highlight_range(start_kp, end_kp)
@@ -1927,10 +1928,12 @@ class BurialPlannerDock(QDockWidget):
         if not all(math.isfinite(v) for v in (
                 size, extent.xMinimum(), extent.yMinimum())):
             return
-        try:
-            min_size = max(float(self.canvas.mapUnitsPerPixel()) * 40.0, 1e-9)
-        except (AttributeError, RuntimeError):
-            min_size = 1e-9
+        # Floor on the framed size: 40 px at the current scale, but never
+        # below ~50 m of ground — once the canvas is already at a
+        # pathological scale (a zero-length section zoomed before this
+        # guard existed reads "0.2 mm" on the scale bar) the pixel-based
+        # floor would keep it there.
+        min_size = self._min_frame_size()
         if size < min_size:
             grow = (min_size - size) / 2.0
             extent.grow(grow)
@@ -1938,6 +1941,31 @@ class BurialPlannerDock(QDockWidget):
         extent.grow(size * pad_fraction)
         self.canvas.setExtent(extent)
         self.canvas.refresh()
+
+    def _min_frame_size(self) -> float:
+        floor = 50.0  # metres
+        try:
+            crs = self.canvas.mapSettings().destinationCrs()
+            if crs.isGeographic():
+                floor = 50.0 / 111320.0  # degrees at the equator
+            else:
+                from qgis.core import QgsUnitTypes
+
+                factor = QgsUnitTypes.fromUnitToUnitFactor(
+                    QgsUnitTypes.DistanceUnit.Meters
+                    if hasattr(QgsUnitTypes, "DistanceUnit")
+                    else QgsUnitTypes.DistanceMeters, crs.mapUnits())
+                if factor and math.isfinite(factor) and factor > 0:
+                    floor = 50.0 * factor
+        except Exception:
+            pass
+        try:
+            pixel_based = float(self.canvas.mapUnitsPerPixel()) * 40.0
+        except (AttributeError, RuntimeError):
+            pixel_based = 0.0
+        if not math.isfinite(pixel_based):
+            pixel_based = 0.0
+        return max(pixel_based, floor, 1e-9)
 
     def show_plan_scope(self) -> None:
         if not self.model.plan:

@@ -207,6 +207,26 @@ def test_nodata_becomes_insufficient() -> bool:
     return _result("no-data ranges surface as Insufficient Information", ok)
 
 
+def test_zero_length_ranges_never_become_sections() -> bool:
+    """A sub-millimetre no-data residue (e.g. a no-data interval touching an
+    exclusion edge) must not surface as a 0.000 km section: such rows have
+    no slice to draw and produced a zero-area map extent on zoom."""
+    acq = gen.RuleAcquisition(_rule("d1", "depth"), [Interval(5.0, 6.0)],
+                              nodata=[Interval(6.0, 6.0000004),
+                                      Interval(15.0, 17.0)])
+    out = gen.generate(_params(), [acq], id_fn=_counter_id_fn())
+    lengths = [s["end_kp"] - s["start_kp"] for s in out.sections]
+    ok = all(length >= gen.ZERO_LENGTH_KM for length in lengths)
+    insufficient = [s for s in out.sections if s["kind"] == "insufficient_info"]
+    ok = ok and len(insufficient) == 1
+    ok = ok and abs(insufficient[0]["start_kp"] - 15.0) < 1e-6
+    # No boundary event was manufactured for the residue either.
+    ok = ok and not any(abs(float(e["kp"]) - 6.0000004) < 1e-9
+                        for e in out.events)
+    return _result("sub-millimetre ranges never become sections", ok,
+                   f"min length {min(lengths):.9f} km")
+
+
 def test_exclusion_never_swallows_own_nodata() -> bool:
     """A rule's hits interpolated across its own no-data gap must not turn
     the gap into an exclusion — the gap stays Insufficient Information. A
@@ -621,6 +641,7 @@ def test_context_round_trip_keeps_rule_hits() -> bool:
 def run_all() -> list:
     return [
         test_basic_sections_and_events(),
+        test_zero_length_ranges_never_become_sections(),
         test_context_round_trip_keeps_rule_hits(),
         test_direction_reversed_events(),
         test_screening_never_removes(),
