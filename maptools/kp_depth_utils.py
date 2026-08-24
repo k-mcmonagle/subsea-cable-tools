@@ -60,6 +60,12 @@ class DepthSampler:
     def has_sources(self) -> bool:
         return bool(self._rasters or self._contours)
 
+    def finest_pixel_size_m(self) -> Optional[float]:
+        """Cell size (m) of the highest-resolution configured raster."""
+        sizes = [math.sqrt(src["pixel_area"]) for src in self._rasters
+                 if src.get("pixel_area")]
+        return min(sizes) if sizes else None
+
     def source_count(self) -> int:
         return len(self._rasters) + len(self._contours)
 
@@ -148,7 +154,12 @@ class DepthSampler:
         except (TypeError, ValueError):
             return None
         nodata = src.get("nodata")
-        if nodata is not None and value == float(nodata):
+        # Tolerant comparison: Float32 nodata values widened to double by the
+        # provider are not always bit-identical to sourceNoDataValue().
+        if nodata is not None and (
+                value == float(nodata)
+                or abs(value - float(nodata))
+                <= 1e-6 * max(1.0, abs(float(nodata)))):
             return None
         if math.isnan(value):
             return None
@@ -195,18 +206,28 @@ class DepthSampler:
                 samples: int = 120) -> Dict:
         """Depth series along the straight line ``start``→``end``.
 
-        Returns ``{"length_m", "rasters": [{"name", "x", "y"}],
+        Returns ``{"length_m", "pixel_size_m", "rasters": [{"name", "x", "y"}],
         "contours": [{"name", "x", "y"}]}`` with ``x`` in metres from ``start``
         and ``None`` gaps in raster series where a raster has no coverage.
+
+        ``samples`` is a ceiling: on a coarse grid the station count drops so
+        stations stay at least half a raster cell apart — denser sampling of a
+        nearest-cell provider only re-reads the same pixels and turns each
+        cell edge into a fake near-vertical step.
         """
         try:
             length_m = float(distance_area.measureLine(start, end))
         except Exception:
             length_m = math.hypot(end.x() - start.x(), end.y() - start.y())
-        result = {"length_m": length_m, "rasters": [], "contours": []}
+        pixel_size_m = self.finest_pixel_size_m()
+        result = {"length_m": length_m, "pixel_size_m": pixel_size_m,
+                  "rasters": [], "contours": []}
         if length_m <= 0 or not self.has_sources():
             return result
         samples = max(2, int(samples))
+        if pixel_size_m and pixel_size_m > 0:
+            per_half_cell = int(math.ceil(length_m / (pixel_size_m / 2.0)))
+            samples = max(2, min(samples, per_half_cell))
         stations = []
         for step in range(samples + 1):
             fraction = step / float(samples)

@@ -22,9 +22,11 @@ from qgis.core import (
     QgsProcessingParameterNumber,
     QgsProcessingUtils,
     QgsRectangle,
-    QgsVectorLayer,
 )
-from ..qgis_compat import PROCESSING_NUMBER_DOUBLE, PROCESSING_SOURCE_FILE
+from ..qgis_compat import (
+    PROCESSING_NUMBER_DOUBLE, PROCESSING_NUMBER_INTEGER,
+    PROCESSING_SOURCE_FILE,
+)
 from qgis import processing
 try:
     import numpy as np
@@ -114,8 +116,13 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
     GRID_SIZE = 'GRID_SIZE'
     MAX_DISTANCE = 'MAX_DISTANCE'
     METHOD = 'METHOD'
+    FILL_DISTANCE = 'FILL_DISTANCE'
     OUTPUT = 'OUTPUT'
     COMPRESS = 'COMPRESS'
+
+    METHOD_DIRECT = 0
+    METHOD_IDW = 1
+    METHOD_AVERAGE = 2
 
     def initAlgorithm(self, config=None):
         self.addParameter(
@@ -144,7 +151,7 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.MAX_DISTANCE,
-                self.tr('Maximum Interpolation Distance (0 = auto)'),
+                self.tr('Search radius for IDW / Bin average (0 = auto)'),
                 type=PROCESSING_NUMBER_DOUBLE,
                 defaultValue=0.0,
                 minValue=0.0,
@@ -156,11 +163,22 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
                 self.METHOD,
                 self.tr('Rasterization Method'),
                 options=[
-                    self.tr('Direct Rasterization (fast, preserves original data points)'),
-                    self.tr('IDW Interpolation (slower, fills gaps)')
+                    self.tr('Direct Rasterization (gridded exports: burns each point untouched)'),
+                    self.tr('IDW Interpolation (scattered soundings: distance-weighted, fills gaps)'),
+                    self.tr('Bin Average (scattered soundings: mean of the points in each cell)'),
                 ],
                 defaultValue=0,
                 optional=False
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.FILL_DISTANCE,
+                self.tr('Fill no-data gaps up to this many cells (0 = no filling)'),
+                type=PROCESSING_NUMBER_INTEGER,
+                defaultValue=0,
+                minValue=0,
+                optional=True
             )
         )
         self.addParameter(
@@ -219,6 +237,7 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
         grid_size_param = self.parameterAsDouble(parameters, self.GRID_SIZE, context)
         max_distance_param = self.parameterAsDouble(parameters, self.MAX_DISTANCE, context)
         method_index = self.parameterAsInt(parameters, self.METHOD, context)
+        fill_cells = self.parameterAsInt(parameters, self.FILL_DISTANCE, context)
         output_folder = self.parameterAsString(parameters, self.OUTPUT, context)
         compress = self.parameterAsBool(parameters, self.COMPRESS, context)
 
@@ -227,11 +246,21 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
                 QgsProcessingUtils.tempFolder(), 'xyz_rasters_' + uuid.uuid4().hex[:8])
         os.makedirs(output_folder, exist_ok=True)
 
-        if method_index == 0 and not alg_available('gdal:rasterize'):
+        required = {
+            self.METHOD_DIRECT: ('gdal:rasterize',),
+            self.METHOD_IDW: ('gdal:gridinversedistancenearestneighbor',
+                              'gdal:gridinversedistance'),
+            self.METHOD_AVERAGE: ('gdal:gridaverage',),
+        }.get(method_index, ())
+        if required and not any(alg_available(a) for a in required):
             raise QgsProcessingException(
-                "Required Processing algorithm 'gdal:rasterize' is not available. "
-                'This usually means the GDAL Processing provider is not installed or not enabled.'
-            )
+                'Required Processing algorithm %s is not available. This '
+                'usually means the GDAL Processing provider is not installed '
+                'or not enabled.' % ' / '.join(required))
+        if fill_cells > 0 and not alg_available('gdal:fillnodata'):
+            raise QgsProcessingException(
+                "Gap filling requested but 'gdal:fillnodata' is not available. "
+                'Enable the GDAL Processing provider or set gap filling to 0.')
 
         file_list_str = ', '.join(os.path.basename(p) for p in xyz_paths)
         feedback.pushInfo(f'Starting processing for {len(xyz_paths)} file(s): {file_list_str}')
@@ -248,8 +277,8 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
             try:
                 output_paths.append(self._process_one(
                     xyz_path, target_crs, grid_size_param, max_distance_param,
-                    method_index, output_folder, compress, context, feedback,
-                    alg_available))
+                    method_index, fill_cells, output_folder, compress,
+                    context, feedback, alg_available))
             except QgsProcessingException as exc:
                 if len(xyz_paths) == 1:
                     raise
@@ -269,8 +298,9 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
         return {self.OUTPUT: output_folder}
 
     def _process_one(self, xyz_path, target_crs, grid_size_param,
-                     max_distance_param, method_index, output_folder, compress,
-                     context, feedback, alg_available):
+                     max_distance_param, method_index, fill_cells,
+                     output_folder, compress, context, feedback,
+                     alg_available):
         base_name = os.path.splitext(os.path.basename(xyz_path))[0]
 
         # --- read ---
@@ -299,13 +329,33 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
         # --- per-file grid size ---
         xs, ys = data[:, 0], data[:, 1]
         grid_size = grid_size_param
-        if grid_size <= 0:
+        auto_grid = grid_size <= 0
+        if auto_grid:
             grid_size = detect_grid_size(xs, ys)
             feedback.pushInfo(f'Auto-detected grid size for this file: {grid_size:.4f}')
 
-        extent = cell_centred_extent(xs, ys, grid_size)
-        width = max(1, int(round(extent.width() / grid_size)))
-        height = max(1, int(round(extent.height() / grid_size)))
+        def _raster_shape(cell):
+            ext = cell_centred_extent(xs, ys, cell)
+            return (ext, max(1, int(round(ext.width() / cell))),
+                    max(1, int(round(ext.height() / cell))))
+
+        extent, width, height = _raster_shape(grid_size)
+        if auto_grid and width * height > MAX_RASTER_CELLS:
+            # Median-gap detection collapses on scattered (non-gridded)
+            # soundings, where nearly every coordinate is unique. Fall back
+            # to a density-based estimate (mean point spacing over the
+            # bounding box), which is how dedicated importers size the grid.
+            area = extent.width() * extent.height()
+            if area > 0 and len(data) > 0:
+                density_size = float(np.sqrt(area / len(data)))
+                if density_size > grid_size:
+                    grid_size = density_size
+                    extent, width, height = _raster_shape(grid_size)
+                    feedback.pushWarning(
+                        'The data does not look regularly gridded; using a '
+                        f'density-based grid size of {grid_size:.4f} instead. '
+                        'Set an explicit Grid Size to override, and consider '
+                        'the Bin Average method for scattered soundings.')
         if width * height > MAX_RASTER_CELLS:
             raise QgsProcessingException(
                 f'{os.path.basename(xyz_path)}: a {width} x {height} pixel raster at '
@@ -315,9 +365,15 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(f'Output raster: {width} x {height} pixels at {grid_size:.4f}')
 
         max_distance = max_distance_param
-        if method_index == 1 and max_distance <= 0:
+        if method_index == self.METHOD_IDW and max_distance <= 0:
             max_distance = grid_size * 3
-            feedback.pushInfo(f'Using auto max interpolation distance: {max_distance:.4f}')
+            feedback.pushInfo(f'Using auto IDW search radius: {max_distance:.4f}')
+        elif method_index == self.METHOD_AVERAGE and max_distance <= 0:
+            # Circumscribed cell radius: every point in the cell contributes
+            # to its own cell with minimal bleed into the neighbours — the
+            # bin-and-average behaviour of dedicated MBES importers.
+            max_distance = grid_size * 0.7071
+            feedback.pushInfo(f'Using auto bin-average radius: {max_distance:.4f}')
 
         # --- CSV + VRT bridge (unique names: parallel runs must not collide) ---
         temp_folder = QgsProcessingUtils.tempFolder()
@@ -339,14 +395,15 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
 </OGRVRTDataSource>""")
 
         final_output = os.path.join(output_folder, f'{base_name}.tif')
-        if compress:
+        fill_path = None
+        if compress or fill_cells > 0:
             output_raster_path = os.path.join(temp_folder, f'xyz_{token}_raw.tif')
         else:
             output_raster_path = final_output
 
         try:
             # --- rasterize ---
-            if method_index == 0:
+            if method_index == self.METHOD_DIRECT:
                 feedback.pushInfo('Using direct rasterization (gdal:rasterize)...')
                 result = processing.run('gdal:rasterize', {
                     'INPUT': vrt_path,
@@ -356,18 +413,45 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
                     'HEIGHT': grid_size,
                     'EXTENT': extent,
                     'NODATA': -9999.0,
+                    # Pre-fill the band: without -init, unwritten cells rely
+                    # on GDAL initialising to the nodata value.
+                    'INIT': -9999.0,
                     'DATA_TYPE': 5,           # Float32
                     'OUTPUT': output_raster_path,
                 }, context=context, feedback=feedback)
+            elif method_index == self.METHOD_AVERAGE:
+                result = self._run_average(
+                    vrt_path, extent, width, height, max_distance,
+                    output_raster_path, context, feedback)
             else:
                 result = self._run_idw(
-                    vrt_path, extent, width, height, grid_size, max_distance,
+                    vrt_path, extent, width, height, max_distance,
                     output_raster_path, context, feedback, alg_available)
 
             if not result or not result.get('OUTPUT'):
                 raise QgsProcessingException(
                     f'Raster creation failed for {os.path.basename(xyz_path)}. '
                     'Check the processing log for more details.')
+
+            # --- optional gap fill ---
+            if fill_cells > 0:
+                feedback.pushInfo(
+                    f'Filling no-data gaps up to {fill_cells} cell(s) '
+                    '(gdal:fillnodata)...')
+                fill_path = (os.path.join(temp_folder, f'xyz_{token}_fill.tif')
+                             if compress else final_output)
+                fill_result = processing.run('gdal:fillnodata', {
+                    'INPUT': output_raster_path,
+                    'BAND': 1,
+                    'DISTANCE': fill_cells,
+                    'ITERATIONS': 0,
+                    'NO_MASK': False,
+                    'OUTPUT': fill_path,
+                }, context=context, feedback=feedback)
+                if not fill_result or not fill_result.get('OUTPUT'):
+                    raise QgsProcessingException(
+                        f'Gap filling (gdal:fillnodata) failed for {os.path.basename(xyz_path)}.')
+                result = fill_result
 
             # --- compress ---
             if compress:
@@ -377,7 +461,7 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
                         "Compression requested but 'gdal:translate' is not available. "
                         'Enable the GDAL Processing provider or disable compression.')
                 result2 = processing.run('gdal:translate', {
-                    'INPUT': output_raster_path,
+                    'INPUT': result['OUTPUT'],
                     'OUTPUT': final_output,
                     'OPTIONS': 'COMPRESS=LZW|TILED=YES|BIGTIFF=IF_SAFER',
                     'DATA_TYPE': 0,           # keep source type (Float32)
@@ -391,14 +475,14 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
         finally:
             # The temp CSV duplicates the whole point cloud; reclaim it per
             # file so a long batch doesn't fill the temp drive.
-            for stale in (temp_csv_path, vrt_path):
+            stale_paths = [temp_csv_path, vrt_path]
+            if output_raster_path != final_output:
+                stale_paths.append(output_raster_path)
+            if fill_path and fill_path != final_output:
+                stale_paths.append(fill_path)
+            for stale in stale_paths:
                 try:
                     os.remove(stale)
-                except OSError:
-                    pass
-            if compress:
-                try:
-                    os.remove(output_raster_path)
                 except OSError:
                     pass
 
@@ -406,30 +490,25 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
         context.addLayerToLoadOnCompletion(output_path, details)
         return output_path
 
-    def _run_idw(self, vrt_path, extent, width, height, grid_size, max_distance,
-                 output_raster_path, context, feedback, alg_available):
-        def native_idw():
-            point_layer = QgsVectorLayer(vrt_path, 'points_for_idw', 'ogr')
-            if not point_layer.isValid():
-                raise QgsProcessingException(
-                    'Failed to load temporary VRT as a vector layer for IDW fallback.')
-            field_index = point_layer.fields().indexFromName('z')
-            interp_data = f'{point_layer.id()}::~::{field_index}::~::0::~::0'
-            return processing.run('native:idwinterpolation', {
-                'INTERPOLATION_DATA': interp_data,
-                'DISTANCE_COEFFICIENT': 2.0,
-                'EXTENT': extent,
-                'PIXEL_SIZE': grid_size,
-                'OUTPUT': output_raster_path,
-            }, context=context, feedback=feedback)
+    @staticmethod
+    def _grid_extra(extent, width, height):
+        """gdal_grid has no EXTENT/SIZE parameters in Processing; pass the
+        cell-centred extent and exact raster size through EXTRA so the output
+        aligns with the direct-rasterization grid."""
+        return (f'-txe {extent.xMinimum()} {extent.xMaximum()} '
+                f'-tye {extent.yMinimum()} {extent.yMaximum()} '
+                f'-outsize {width} {height}')
 
-        if not alg_available('gdal:grididw'):
-            feedback.pushWarning(
-                "'gdal:grididw' is not available. Falling back to native:idwinterpolation.")
-            return native_idw()
-        feedback.pushInfo('Using IDW interpolation (gdal:grididw)...')
-        try:
-            return processing.run('gdal:grididw', {
+    def _run_idw(self, vrt_path, extent, width, height, max_distance,
+                 output_raster_path, context, feedback, alg_available):
+        # 'gdal:grididw' (used by earlier plugin versions) never existed in
+        # QGIS Processing, so IDW silently fell back to a broken
+        # native:idwinterpolation call. These are the real algorithm ids.
+        if alg_available('gdal:gridinversedistancenearestneighbor'):
+            feedback.pushInfo(
+                'Using IDW interpolation '
+                '(gdal:gridinversedistancenearestneighbor)...')
+            return processing.run('gdal:gridinversedistancenearestneighbor', {
                 'INPUT': vrt_path,
                 'Z_FIELD': 'z',
                 'POWER': 2.0,
@@ -438,16 +517,44 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
                 'MAX_POINTS': 12,
                 'MIN_POINTS': 1,
                 'NODATA': -9999.0,
-                'DATA_TYPE': 5,
+                'DATA_TYPE': 5,           # Float32
+                'EXTRA': self._grid_extra(extent, width, height),
                 'OUTPUT': output_raster_path,
-                'EXTRA': (f'-txe {extent.xMinimum()} {extent.xMaximum()} '
-                          f'-tye {extent.yMinimum()} {extent.yMaximum()} '
-                          f'-outsize {width} {height}'),
             }, context=context, feedback=feedback)
-        except QgsProcessingException as exc:
-            feedback.pushWarning(
-                f'gdal:grididw failed: {exc}. Falling back to native:idwinterpolation.')
-            return native_idw()
+        feedback.pushInfo('Using IDW interpolation (gdal:gridinversedistance)...')
+        return processing.run('gdal:gridinversedistance', {
+            'INPUT': vrt_path,
+            'Z_FIELD': 'z',
+            'POWER': 2.0,
+            'SMOOTHING': 0.0,
+            'RADIUS_1': max_distance,
+            'RADIUS_2': max_distance,
+            'MAX_POINTS': 12,
+            'MIN_POINTS': 1,
+            'NODATA': -9999.0,
+            'DATA_TYPE': 5,               # Float32
+            'EXTRA': self._grid_extra(extent, width, height),
+            'OUTPUT': output_raster_path,
+        }, context=context, feedback=feedback)
+
+    def _run_average(self, vrt_path, extent, width, height, radius,
+                     output_raster_path, context, feedback):
+        """Mean of the soundings around each cell centre (gdal:gridaverage) —
+        the bin-and-average import dedicated MBES tools use, so dense raw
+        soundings grid without last-point-wins noise."""
+        feedback.pushInfo('Using bin averaging (gdal:gridaverage)...')
+        return processing.run('gdal:gridaverage', {
+            'INPUT': vrt_path,
+            'Z_FIELD': 'z',
+            'RADIUS_1': radius,
+            'RADIUS_2': radius,
+            'ANGLE': 0.0,
+            'MIN_POINTS': 1,
+            'NODATA': -9999.0,
+            'DATA_TYPE': 5,               # Float32
+            'EXTRA': self._grid_extra(extent, width, height),
+            'OUTPUT': output_raster_path,
+        }, context=context, feedback=feedback)
 
     # --- Metadata ---
     def createInstance(self):
@@ -476,14 +583,15 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
   <li><b>Auto grid size:</b> with Grid Size at 0, the cell size is detected per file from the data spacing, so mixed-resolution deliveries (e.g. 0.5&nbsp;m and 1&nbsp;m tiles) each keep full accuracy.</li>
   <li><b>Cell registration:</b> XYZ coordinates are treated as cell centres, so output pixels align exactly with the source grid (no half-pixel shift).</li>
   <li><b>One CRS:</b> the chosen CRS applies to every file in the run.</li>
-  <li><b>Methods:</b> <i>Direct rasterisation</i> burns the original values untouched (recommended for gridded MBES); <i>IDW interpolation</i> fills gaps but smooths.</li>
+  <li><b>Methods:</b> <i>Direct rasterisation</i> burns each point untouched — exact for pre-gridded MBES exports, but where several soundings share a cell only the last one survives. <i>Bin Average</i> writes the mean of the soundings around each cell centre (the behaviour of dedicated MBES importers) — use it for raw/scattered soundings. <i>IDW interpolation</i> distance-weights within a search radius and also fills small gaps, at the cost of smoothing.</li>
+  <li><b>Gap filling:</b> optionally interpolate no-data holes up to N cells across (GDAL fillnodata) after gridding; 0 leaves gaps as no-data.</li>
   <li><b>Compression:</b> LZW is lossless; outputs are tiled for fast display.</li>
 </ul>
 
 <h4>Notes</h4>
 <ul>
   <li>Files need at least 3 numeric columns (X, Y, Z); extra columns are ignored. Comma, semicolon, tab or space delimited; leading header lines are skipped automatically.</li>
-  <li>If auto-detection reports an absurdly large raster, the data is probably not regularly gridded — set an explicit Grid Size.</li>
+  <li>Auto grid size uses the median data spacing for gridded exports; on scattered soundings it falls back to a density-based estimate with a warning — set an explicit Grid Size to control it.</li>
   <li>In a multi-file run a bad file is skipped with a warning; the rest still process.</li>
   <li>To mosaic the results, use <i>Merge MBES Rasters</i> — it keeps the finest input resolution.</li>
 </ul>

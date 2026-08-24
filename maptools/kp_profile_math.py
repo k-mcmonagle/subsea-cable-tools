@@ -1,10 +1,19 @@
 # -*- coding: utf-8 -*-
-"""Pure math for the KP Mouse live depth/slope profile (QGIS-free, testable)."""
+"""Pure math for the KP Mouse live depth/slope profile (QGIS-free, testable).
+
+The slope/datum primitives live in the plugin-wide ``slope_utils`` module;
+this module keeps the KP Mouse specific composite/contour handling and
+re-exports the shared functions under their historical names.
+"""
 
 from __future__ import annotations
 
-import math
 from typing import Dict, List, Optional, Tuple
+
+from ..slope_utils import (  # noqa: F401  (re-exported API)
+    auto_half_window_m, interval_slope_series, should_invert_depth_axis,
+    windowed_slope_series,
+)
 
 
 def merged_contour_crossings(profile: Dict) -> Tuple[List[float], List[float]]:
@@ -51,39 +60,33 @@ def composite_series(profile: Dict) -> Tuple[List[float], List[Optional[float]]]
 
 def slope_series(x_values: List[float], y_values: List[Optional[float]],
                  positive_down: Optional[bool] = None) -> List[Optional[float]]:
-    """Per-interval slope in degrees at each station.
+    """Per-interval slope in degrees at each station (shared implementation).
 
     ``x`` in metres, values in metres. Sign follows the plugin-wide
-    convention: **positive = shoaling along the line** (up-slope),
-    regardless of whether the source stores positive-down depths or
-    negative elevations. ``positive_down`` overrides the datum; when None
-    it is auto-detected from the data (median sign). ``None`` marks the
-    first station (no preceding interval) and any interval with a missing
-    endpoint.
+    convention: **positive = shoaling along the line** (up-slope). ``None``
+    marks the first station and any interval with a missing endpoint.
     """
-    if not x_values:
-        return []
-    if positive_down is None:
-        positive_down = should_invert_depth_axis(y_values)
-    # Elevation data already carries the up-slope-positive sign; positive-down
-    # depth data needs the difference negated.
-    sign = 1.0 if positive_down is False else -1.0
-    slopes: List[Optional[float]] = [None]
-    for index in range(1, len(x_values)):
-        dx = x_values[index] - x_values[index - 1]
-        v1 = y_values[index - 1] if index - 1 < len(y_values) else None
-        v2 = y_values[index] if index < len(y_values) else None
-        if dx <= 0 or v1 is None or v2 is None:
-            slopes.append(None)
-            continue
-        slopes.append(math.degrees(math.atan2(sign * (v2 - v1), dx)))
-    return slopes
+    return interval_slope_series(x_values, y_values, positive_down)
 
 
-def should_invert_depth_axis(values: List[Optional[float]]) -> Optional[bool]:
-    """True when depths are positive-down (invert so deeper plots lower),
-    False for negative elevations, None when there is no data to judge."""
-    finite = [value for value in values if value is not None]
-    if not finite:
-        return None
-    return sorted(finite)[len(finite) // 2] > 0
+def profile_slope_series(x_values: List[float],
+                         y_values: List[Optional[float]],
+                         pixel_size_m: Optional[float] = None,
+                         positive_down: Optional[bool] = None
+                         ) -> Tuple[List[Optional[float]], Optional[float]]:
+    """Slope series for the live profile, robust to sub-cell sampling.
+
+    Central difference over ``x ± half_window`` where the half window is the
+    larger of the raster cell size and the median station spacing, so a
+    nearest-cell staircase on a coarse grid cannot read as near-vertical
+    spikes. Falls back to the per-interval series when no window can be
+    derived (fewer than two stations). Returns ``(slopes, half_window_m)``;
+    the half window is None on the fallback path.
+    """
+    half_window_m = auto_half_window_m(x_values, pixel_size_m)
+    if half_window_m is None:
+        return slope_series(x_values, y_values, positive_down), None
+    slopes = windowed_slope_series(
+        x_values, y_values, half_window_m,
+        positive_down=positive_down, degenerate=None, mask_missing=True)
+    return slopes, half_window_m

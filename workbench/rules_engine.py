@@ -40,6 +40,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from ..slope_utils import windowed_slope_series as _shared_windowed_slope
+
 # Severity lattice / status strings (kept in sync with schema constants).
 SEVERITY_ALLOWED = 0
 SEVERITY_EXCLUDED = 4
@@ -357,21 +359,6 @@ def intervals_from_bool_series(
     return normalize(out)
 
 
-def _interp_depth(xs: List[float], zs: List[float], kp: float) -> float:
-    """Linear interpolation on a sorted (kp, depth) series, clamped at ends."""
-    import bisect
-    if kp <= xs[0]:
-        return zs[0]
-    if kp >= xs[-1]:
-        return zs[-1]
-    j = bisect.bisect_left(xs, kp)
-    x0, x1 = xs[j - 1], xs[j]
-    if x1 <= x0:
-        return zs[j]
-    t = (kp - x0) / (x1 - x0)
-    return zs[j - 1] + t * (zs[j] - zs[j - 1])
-
-
 def signed_slope_series(depth_series: List[Tuple[float, float]],
                         half_window_km: Optional[float] = None
                         ) -> List[Tuple[float, float]]:
@@ -401,19 +388,14 @@ def signed_slope_series(depth_series: List[Tuple[float, float]],
     if half_window_km is None:
         gaps = sorted(xs[i + 1] - xs[i] for i in range(n - 1))
         half_window_km = max(gaps[len(gaps) // 2], 1e-9)
-    half = max(float(half_window_km), 1e-9)
-    out: List[Tuple[float, float]] = []
-    for kp in xs:
-        k0 = max(xs[0], kp - half)
-        k1 = min(xs[-1], kp + half)
-        dx_m = (k1 - k0) * 1000.0
-        if dx_m <= 1e-6:
-            out.append((kp, 0.0))
-            continue
-        dz = _interp_depth(xs, zs, k1) - _interp_depth(xs, zs, k0)
-        # Depth magnitudes grow downward, so negate for up-slope-positive.
-        out.append((kp, math.degrees(math.atan2(-dz, dx_m))))
-    return out
+    # Depth magnitudes grow downward (positive_down), so the shared math
+    # negates the difference for up-slope-positive. Degenerate stations
+    # (collapsed window) stay 0.0 here: rule evaluation treats them as
+    # flat rather than dropping the station.
+    values = _shared_windowed_slope(
+        xs, zs, half_window_km, x_units_m=1000.0,
+        positive_down=True, degenerate=0.0)
+    return list(zip(xs, values))
 
 
 def intervals_from_signed_slope(

@@ -36,6 +36,7 @@ except ImportError:  # pragma: no cover
     _np = None
 
 from . import schema
+from ..slope_utils import windowed_slope_series as _shared_windowed_slope
 
 Sample = Tuple[float, Optional[float]]
 
@@ -271,57 +272,14 @@ def long_slope_series(kps: List[float], depths: List[Optional[float]],
 
     Central difference of interpolated depth magnitudes at kp ± the half
     window (the analysis-step / vehicle-footprint convention), clamped to
-    the sampled range so edge stations use the available window.
+    the sampled range so edge stations use the available window. The math
+    is the shared plugin-wide implementation (``slope_utils``); depths are
+    magnitudes, so positive-down applies.
     """
-    half = max(float(half_window_km), 1e-9)
-    if _np is not None and kps:
-        return _long_slope_series_np(kps, depths, half)
-    xs, ys = _valid_pairs(kps, depths)
-    out: List[Sample] = []
-    for kp in kps:
-        if not xs:
-            out.append((kp, None))
-            continue
-        k0 = max(xs[0], kp - half)
-        k1 = min(xs[-1], kp + half)
-        dx_m = (k1 - k0) * 1000.0
-        if dx_m <= 1e-6:
-            out.append((kp, None))
-            continue
-        d0 = _interp(xs, ys, k0)
-        d1 = _interp(xs, ys, k1)
-        if d0 is None or d1 is None:
-            out.append((kp, None))
-            continue
-        # Depth magnitudes: negate so positive = shoaling (up-slope).
-        out.append((kp, math.degrees(math.atan2(-(d1 - d0), dx_m))))
-    return out
-
-
-def _long_slope_series_np(kps: List[float], depths: List[Optional[float]],
-                          half: float) -> List[Sample]:
-    """Vectorised twin of the pure-python loop above (same semantics:
-    interpolation across no-data gaps between valid stations, None where
-    the clamped window collapses)."""
-    kp_arr = _np.asarray(kps, dtype=float)
-    depth_arr = _nan_array(depths)
-    valid = ~_np.isnan(depth_arr)
-    if not bool(valid.any()):
-        return [(kp, None) for kp in kps]
-    xs = kp_arr[valid]
-    ys = depth_arr[valid]
-    k0 = _np.clip(kp_arr - half, xs[0], xs[-1])
-    k1 = _np.clip(kp_arr + half, xs[0], xs[-1])
-    dx_m = (k1 - k0) * 1000.0
-    d0 = _np.interp(k0, xs, ys)
-    d1 = _np.interp(k1, xs, ys)
-    with _np.errstate(invalid="ignore"):
-        slopes = _np.degrees(_np.arctan2(-(d1 - d0), dx_m))
-    bad = dx_m <= 1e-6
-    values = slopes.tolist()
-    flags = bad.tolist()
-    return [(kp, None if flag else value)
-            for kp, value, flag in zip(kps, values, flags)]
+    values = _shared_windowed_slope(
+        kps, depths, half_window_km, x_units_m=1000.0,
+        positive_down=True, degenerate=None)
+    return list(zip(kps, values))
 
 
 def cross_slope_series(kps: List[float],

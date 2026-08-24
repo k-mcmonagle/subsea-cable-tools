@@ -7,12 +7,14 @@ from qgis.PyQt.QtCore import Qt, QSettings, QTimer
 from qgis.PyQt.QtWidgets import QApplication
 from qgis.core import (
     QgsProject, QgsVectorLayer, QgsRasterLayer, QgsWkbTypes, QgsGeometry, QgsPointXY,
-    QgsDistanceArea, QgsFeatureRequest, QgsCoordinateTransform, QgsSpatialIndex, QgsFeature
+    QgsDistanceArea, QgsFeatureRequest, QgsCoordinateTransform,
+    QgsCoordinateReferenceSystem, QgsSpatialIndex, QgsFeature
 )
 from .qgis_compat import SIZE_POLICY_EXPANDING, GEOMETRY_POINT, GEOMETRY_LINE
 from qgis.gui import QgsVertexMarker, QgsRubberBand
 from .maptools.temp_line_maptool import TempLineMapTool  # new temporary line drawing tool
 from .kp_range_utils import make_distance_area
+from .slope_utils import ols_slope
 
 # Added standard library & third-party imports
 import math
@@ -1687,7 +1689,14 @@ class DepthProfileDockWidget(QDockWidget):
         self.segment_port_depth = []
         self.segment_starboard_depth = []
         self.segment_cross_span_m = []
-        
+        self.segment_euclidean_length = []
+        # Cleared with the rest: these accumulated across successive
+        # Generate runs and mis-paired rows in the CSV export.
+        self.segment_lat_from = []
+        self.segment_lon_from = []
+        self.segment_lat_to = []
+        self.segment_lon_to = []
+
         if len(self.kp_values) < 2:
             return
         datum_sign = self._datum_sign()
@@ -1730,9 +1739,14 @@ class DepthProfileDockWidget(QDockWidget):
                     plan_dist = self.distance_area.measureLine(p1, p2)
                     dz = v2 - v1  # Always use actual depth difference for 3D length
                     seabed_dist = math.sqrt(plan_dist**2 + dz**2)
-                    # Transform to lat/lon
+                    # Transform to geographic lat/lon for the CSV export.
+                    # (Transforming to distance_area.sourceCrs() was an
+                    # identity — the CSV carried line-CRS eastings/northings.)
                     if self.current_line_crs:
-                        transform = QgsCoordinateTransform(self.current_line_crs, self.distance_area.sourceCrs(), self.iface.mapCanvas().mapSettings().transformContext())
+                        transform = QgsCoordinateTransform(
+                            self.current_line_crs,
+                            QgsCoordinateReferenceSystem("EPSG:4326"),
+                            self.iface.mapCanvas().mapSettings().transformContext())
                         p1_latlon = transform.transform(p1)
                         p2_latlon = transform.transform(p2)
                         lat_from = p1_latlon.y()
@@ -1752,11 +1766,8 @@ class DepthProfileDockWidget(QDockWidget):
             
             # Also calculate simple Euclidean distance for Excel verification
             euclidean_dist = math.sqrt(horiz_m**2 + (v2 - v1)**2)
-            
+
             self.segment_seabed_length.append(seabed_dist)
-            # Store Euclidean distance for potential future use
-            if not hasattr(self, 'segment_euclidean_length'):
-                self.segment_euclidean_length = []
             self.segment_euclidean_length.append(euclidean_dist)
             self.segment_lat_from.append(lat_from)
             self.segment_lon_from.append(lon_from)
@@ -2041,27 +2052,11 @@ class DepthProfileDockWidget(QDockWidget):
             pass
 
     def _ols_slope(self, x_vals, y_vals):
-        """Return OLS slope for y = a + b*x.
-
-        x_vals/y_vals are iterables of floats.
-        """
+        """Return OLS slope for y = a + b*x (shared plugin implementation)."""
         try:
-            if not x_vals or not y_vals or len(x_vals) != len(y_vals) or len(x_vals) < 2:
+            if not x_vals or not y_vals or len(x_vals) != len(y_vals):
                 return None
-            x = np.asarray(x_vals, dtype=float)
-            y = np.asarray(y_vals, dtype=float)
-            mask = np.isfinite(x) & np.isfinite(y)
-            x = x[mask]
-            y = y[mask]
-            if x.size < 2:
-                return None
-            x_mean = float(np.mean(x))
-            y_mean = float(np.mean(y))
-            denom = float(np.sum((x - x_mean) ** 2))
-            if denom <= 0:
-                return None
-            num = float(np.sum((x - x_mean) * (y - y_mean)))
-            return num / denom
+            return ols_slope(x_vals, y_vals)
         except Exception:
             return None
 

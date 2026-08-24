@@ -15,8 +15,8 @@ from qgis.PyQt.QtWidgets import QCheckBox, QDialog, QHBoxLayout, QLabel, QVBoxLa
 
 from ..qgis_compat import WINDOW_HINT_CLOSE, WINDOW_HINT_TITLE, WINDOW_TYPE_TOOL
 from .kp_profile_math import (
-    composite_series, merged_contour_crossings, should_invert_depth_axis,
-    slope_series,
+    composite_series, merged_contour_crossings, profile_slope_series,
+    should_invert_depth_axis,
 )
 
 _SERIES_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
@@ -177,9 +177,12 @@ class KPDepthProfileWindow(QDialog):
         for key in [key for key in self._curves if key not in seen]:
             self._remove_curve(self._curves.pop(key))
 
-        # Slope of the composite (best-resolution-first) profile.
+        # Slope of the composite (best-resolution-first) profile, measured
+        # over a window no smaller than the raster cell so coarse grids and
+        # short range lines don't read as staircases of vertical spikes.
         comp_x, comp_y = composite_series(profile)
-        slopes = slope_series(comp_x, comp_y)
+        slopes, half_window_m = profile_slope_series(
+            comp_x, comp_y, profile.get("pixel_size_m"))
         slope_x = [value * factor for value in comp_x]
         slope_y = [math.nan if value is None else value for value in slopes]
         if self._slope_curve is None:
@@ -191,8 +194,11 @@ class KPDepthProfileWindow(QDialog):
         length = profile.get("length_m", 0.0) * factor
         finite_slopes = [abs(value) for value in slopes if value is not None]
         if values:
-            slope_text = (", max slope %.1f°" % max(finite_slopes)
-                          if finite_slopes else "")
+            slope_text = ""
+            if finite_slopes:
+                slope_text = ", max slope %.1f°" % max(finite_slopes)
+                if half_window_m:
+                    slope_text += " (±%.0f m window)" % half_window_m
             self.status_label.setText(
                 "Range %.3f %s — depth %.1f to %.1f m%s"
                 % (length, self.unit, min(values), max(values), slope_text))

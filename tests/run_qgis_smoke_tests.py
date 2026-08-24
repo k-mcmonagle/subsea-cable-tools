@@ -123,6 +123,8 @@ def main() -> int:
         ("RPL import commit service", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_rpl_import_commit")),
         ("RPL from route line (KML)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_rpl_from_line")),
         ("MBES XYZ raster tools", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_mbes_xyz_tools")),
+        ("shared slope math (pure)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_slope_utils")),
+        ("KP Mouse profile math (pure)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_kp_profile_math")),
         ("workbench assembly + fit", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_fit")),
         ("workbench topology + V3 adapter", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_workbench_adapter")),
         ("workbench layer styling (pure)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_workbench_layer_style")),

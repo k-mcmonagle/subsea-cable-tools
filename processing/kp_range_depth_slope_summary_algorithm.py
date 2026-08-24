@@ -41,6 +41,7 @@ from qgis.core import (
     QgsWkbTypes,
 )
 from ..qgis_compat import FIELD_TYPE_DOUBLE, GEOMETRY_LINE, GEOMETRY_POINT, PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE
+from ..slope_utils import datum_sign as shared_datum_sign, ols_slope
 
 
 @dataclass(frozen=True)
@@ -450,11 +451,9 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
             # Datum sign: +1 for positive-down depths, -1 for negative
             # elevations, so slope signs follow the plugin-wide convention
             # (+ve = up-slope) regardless of how the source stores depth.
-            finite_depths = sorted(z for z in station_depth
-                                   if z is not None and math.isfinite(float(z)))
-            datum_sign = 1.0
-            if finite_depths and finite_depths[len(finite_depths) // 2] <= 0:
-                datum_sign = -1.0
+            datum_sign = shared_datum_sign(
+                [z for z in station_depth
+                 if z is not None and math.isfinite(float(z))])
             if datum_sign < 0:
                 station_side_slope_deg = [
                     -v if v is not None else None for v in station_side_slope_deg]
@@ -1101,26 +1100,10 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
 
     @staticmethod
     def _ols_slope(x_vals: Sequence[float], y_vals: Sequence[float]) -> Optional[float]:
-        if not x_vals or not y_vals or len(x_vals) != len(y_vals) or len(x_vals) < 2:
+        """OLS slope dz/dt (shared plugin implementation)."""
+        if not x_vals or not y_vals or len(x_vals) != len(y_vals):
             return None
-
-        # Filter finite pairs
-        pairs = [(float(x), float(y)) for x, y in zip(x_vals, y_vals) if math.isfinite(x) and math.isfinite(y)]
-        if len(pairs) < 2:
-            return None
-
-        xs = [p[0] for p in pairs]
-        ys = [p[1] for p in pairs]
-
-        x_mean = sum(xs) / float(len(xs))
-        y_mean = sum(ys) / float(len(ys))
-
-        denom = sum((x - x_mean) ** 2 for x in xs)
-        if denom <= 0:
-            return None
-
-        num = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
-        return num / denom
+        return ols_slope(x_vals, y_vals)
 
     # --------------------------- Geometry helpers --------------------------
 
