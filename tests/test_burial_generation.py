@@ -207,6 +207,40 @@ def test_nodata_becomes_insufficient() -> bool:
     return _result("no-data ranges surface as Insufficient Information", ok)
 
 
+def test_exclusion_never_swallows_own_nodata() -> bool:
+    """A rule's hits interpolated across its own no-data gap must not turn
+    the gap into an exclusion — the gap stays Insufficient Information. A
+    geometry rule (no nodata of its own) excluding inside another rule's
+    gap is genuine evidence and still excludes."""
+    # Threshold rule: footprint 4-12 km, but 8-11 km of it is the rule's
+    # own bathymetry gap (a bridged-interpolation artefact).
+    acq = gen.RuleAcquisition(_rule("s1", "depth"), [Interval(4.0, 12.0)],
+                              nodata=[Interval(8.0, 11.0)])
+    out = gen.generate(_params(), [acq], id_fn=_counter_id_fn())
+    insufficient = [s for s in out.sections if s["kind"] == "insufficient_info"]
+    ok = len(insufficient) == 1
+    ok = ok and abs(insufficient[0]["start_kp"] - 8.0) < 1e-6
+    ok = ok and abs(insufficient[0]["end_kp"] - 11.0) < 1e-6
+    # The gap is not excluded; the genuine hits either side still are.
+    ok = ok and not any(v.start_km <= 9.5 <= v.end_km for v in out.excluded)
+    ok = ok and any(v.start_km <= 5.0 <= v.end_km for v in out.excluded)
+    ok = ok and any(v.start_km <= 11.5 <= v.end_km for v in out.excluded)
+    # And never a candidate.
+    ok = ok and not any(iv.start_km <= 9.5 <= iv.end_km
+                        for iv in out.candidates)
+
+    # Geometry rule (e.g. cable crossing) inside the threshold rule's gap:
+    # its evidence does not depend on bathymetry, so exclusion wins there.
+    geo = gen.RuleAcquisition(_rule("g1", "crossing"), [Interval(9.0, 9.4)])
+    out2 = gen.generate(_params(), [acq, geo], id_fn=_counter_id_fn())
+    ok = ok and any(v.start_km <= 9.2 <= v.end_km for v in out2.excluded)
+    insufficient2 = [s for s in out2.sections
+                     if s["kind"] == "insufficient_info"]
+    covered = sum(s["end_kp"] - s["start_kp"] for s in insufficient2)
+    ok = ok and abs(covered - (3.0 - 0.4)) < 1e-6
+    return _result("exclusion never swallows the rule's own no-data gap", ok)
+
+
 def test_dismissed_nodata_becomes_skip() -> bool:
     """A dismissed no-data range regenerates as a tagged skip, never II or
     a burial candidate; the sections still tile the scope exactly."""
@@ -531,6 +565,7 @@ def run_all() -> list:
         test_wd_extension(),
         test_extension_keys_do_not_invalidate_cache(),
         test_nodata_becomes_insufficient(),
+        test_exclusion_never_swallows_own_nodata(),
         test_dismissed_nodata_becomes_skip(),
         test_dismissed_pairs_normalise(),
         test_refinement_converges(),

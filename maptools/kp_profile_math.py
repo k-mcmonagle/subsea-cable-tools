@@ -139,7 +139,12 @@ def profile_slope_series(profile: Dict,
     spacing = gaps[len(gaps) // 2]
     slopes: List[Optional[float]] = [None] * n
     max_half = None
+    seam_breaks: List[int] = []
     for start, end in contiguous_runs(xs, ys, group_ids=sources):
+        # A run starting right after another valid station broke on a source
+        # change, not a gap — remember it so the seam gets a visible break.
+        if start > 0 and start - 1 < len(ys) and ys[start - 1] is not None:
+            seam_breaks.append(start)
         run_x = xs[start:end + 1]
         run_y = ys[start:end + 1]
         for offset, x in enumerate(run_x):
@@ -154,6 +159,12 @@ def profile_slope_series(profile: Dict,
             slopes[index] = math.degrees(math.atan2(sign * (d1 - d0), k1 - k0))
             if max_half is None or half > max_half:
                 max_half = half
+    # Each side of a raster seam reports its own within-run slope, but the
+    # transition itself is unmeasurable (the grids may disagree on datum):
+    # blank the seam-adjacent station so the plotted curve visibly breaks
+    # instead of joining two sources as if the slope were continuous.
+    for index in seam_breaks:
+        slopes[index] = None
     return xs, slopes, max_half
 
 

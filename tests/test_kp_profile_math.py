@@ -118,9 +118,12 @@ def test_profile_slope_masks_seams_and_gaps():
     _cx, _cy, sources, cells = composite_series_with_sources(profile)
     ok = out_x == xs and sources[0] == 0 and sources[-1] == 1
     ok = ok and cells[0] == 10.0 and cells[-1] == 40.0
+    # The seam-adjacent station (first coarse station) is blanked so the
+    # plotted curve visibly breaks at the source transition.
+    ok = ok and slopes[6] is None
     finite = [value for value in slopes if value is not None]
-    # True gradient 0.1 m/m ≈ 5.7° everywhere; the 10 m seam step over one
-    # 10 m interval would read ≈ 47° if bridged.
+    # True gradient 0.1 m/m ≈ 5.7° everywhere else; the 10 m seam step over
+    # one 10 m interval would read ≈ 47° if bridged.
     ok = ok and finite and all(abs(abs(v) - 5.71) < 0.6 for v in finite)
     ok = ok and max_half == 40.0
     # No-data gap in a single raster also masks instead of bridging.

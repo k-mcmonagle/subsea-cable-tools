@@ -438,6 +438,16 @@ def resolve_stack(params: GenParams, acquisitions: Sequence[RuleAcquisition],
         config = rule_config(row)
 
         footprint = eng.clip_intervals(acq.footprint, scope)
+        # A rule never asserts its condition where its own input had no
+        # data: threshold hits interpolated across a bathymetry gap would
+        # otherwise "exclude" the gap and swallow its Insufficient
+        # Information verdict (raw_insufficient subtracts exclusions).
+        # Applied before extension — a stand-off extension deliberately may
+        # reach into a gap — and only to the rule's own nodata, so e.g. a
+        # cable-crossing exclusion inside a bathymetry gap still excludes.
+        if footprint and acq.nodata:
+            footprint = eng.subtract_intervals(
+                footprint, eng.clip_intervals(acq.nodata, scope))
         footprint = _extend_footprint(footprint, config, params.direction,
                                       scope, depth_at, warnings.append,
                                       rule.name)

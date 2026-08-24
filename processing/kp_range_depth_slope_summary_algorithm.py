@@ -388,6 +388,10 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
             station_dist_m: List[float] = []
             station_xy: List[QgsPointXY] = []
             station_depth: List[Optional[float]] = []
+            # Which raster supplied each station (id() of the source, None
+            # for contours/no data): slope runs break at source changes so a
+            # datum offset between rasters cannot read as a slope spike.
+            station_source: List[Optional[int]] = []
             station_side_slope_deg: List[Optional[float]] = []
 
             # Choose tangent delta based on station spacing for stability
@@ -422,6 +426,8 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
                             z = self._sample_contour_profile_at_distance(contour_profile, dist_global)
 
                     station_depth.append(z)
+                    station_source.append(
+                        id(raster_used) if raster_used is not None else None)
 
                     # Side slope at this station
                     side_deg = None
@@ -457,6 +463,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
                 station_dist_m.append(float('nan'))
                 station_xy.append(QgsPointXY())
                 station_depth.append(None)
+                station_source.append(None)
                 station_side_slope_deg.append(None)
 
                 global_offset_m += part_len
@@ -481,12 +488,21 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
             runs: List[Tuple[List[float], List[float]]] = []
             run_d: List[float] = []
             run_z: List[float] = []
-            for d, z in zip(station_dist_m, station_depth):
+            run_src: Optional[int] = None
+            for d, z, src in zip(station_dist_m, station_depth,
+                                 station_source):
                 if not math.isfinite(d) or z is None:
                     if len(run_d) >= 2:
                         runs.append((run_d, run_z))
-                    run_d, run_z = [], []
+                    run_d, run_z, run_src = [], [], None
                     continue
+                if run_d and src != run_src:
+                    # Supplying raster changed: never difference depths
+                    # across the seam (the grids may disagree on datum).
+                    if len(run_d) >= 2:
+                        runs.append((run_d, run_z))
+                    run_d, run_z = [], []
+                run_src = src
                 run_d.append(float(d))
                 run_z.append(float(z))
             if len(run_d) >= 2:
@@ -882,7 +898,13 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
         if not profile:
             return None
 
-        # Clamp to end values (matches typical profile expectations)
+        # No data outside the bracketing crossings: contour bathymetry only
+        # exists where contours cross the line, so extending the first/last
+        # value along the rest of the route would fabricate coverage (and
+        # feed fabricated depths into the depth/slope statistics). Matches
+        # the Burial Planner's contour handling.
+        if distance_m < profile[0][0] or distance_m > profile[-1][0]:
+            return None
         if distance_m <= profile[0][0]:
             return float(profile[0][1])
         if distance_m >= profile[-1][0]:

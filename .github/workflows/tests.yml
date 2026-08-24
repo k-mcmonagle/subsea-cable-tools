@@ -1,0 +1,26 @@
+name: Pure test suites
+
+# The QGIS-free calculation suites (slope math, burial generation/events/IO,
+# rules engine, RPL import core, ...). The QGIS/GDAL integration suites need
+# a QGIS install and run locally via tests/run_qgis_smoke_tests.py.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pure-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install NumPy (exercises the vectorised paths)
+        run: pip install numpy
+      - name: Run pure suites (NumPy)
+        run: python tests/run_pure_tests.py

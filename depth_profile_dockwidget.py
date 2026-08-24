@@ -57,6 +57,7 @@ class DepthProfileDockWidget(QDockWidget):
         self._closing = False
         self._project_signals_connected = False
         # Internal runtime state
+        self.depth_source_ids = []
         self.line_parts = []
         self.line_length = 0.0
         # Placeholder distance area; reassigned via make_distance_area against the
@@ -1194,6 +1195,10 @@ class DepthProfileDockWidget(QDockWidget):
         # Build arrays
         self.kp_values = []
         self.depth_values = []
+        # Which raster supplied each station (layer id or None): slope is
+        # never evaluated across a change of source, so a vertical-datum
+        # offset between two rasters cannot read as a slope spike.
+        self.depth_source_ids = []
         self.raster_series = []
         dist = 0.0
         valid_count = 0
@@ -1246,6 +1251,8 @@ class DepthProfileDockWidget(QDockWidget):
                 valid_count += 1
             self.kp_values.append(dist / 1000.0)
             self.depth_values.append(val)
+            self.depth_source_ids.append(
+                src_used['layer'].id() if src_used is not None else None)
 
             # Step: fixed or adaptive based on raster resolution at this station.
             if adaptive:
@@ -1267,13 +1274,15 @@ class DepthProfileDockWidget(QDockWidget):
             point_geom = self._interpolate_point(self.line_length)
             if point_geom and not point_geom.isEmpty():
                 pt = point_geom.asPoint()
-                val, _ = sample_station(QgsPointXY(pt.x(), pt.y()))
+                val, src_used = sample_station(QgsPointXY(pt.x(), pt.y()))
                 if val is None:
                     missing_count += 1
                 else:
                     valid_count += 1
                 self.kp_values.append(self.line_length / 1000.0)
                 self.depth_values.append(val)
+                self.depth_source_ids.append(
+                    src_used['layer'].id() if src_used is not None else None)
         if per_raster:
             self.raster_series = [
                 {'name': src['layer'].name(), 'depths': per_raster_depths[i]}
@@ -1591,10 +1600,16 @@ class DepthProfileDockWidget(QDockWidget):
         pairs = sorted(zip(kps, depths))
         self.kp_values = [p[0] for p in pairs]
         self.depth_values = [p[1] for p in pairs]
+        self.depth_source_ids = []   # contour profile: single merged source
         if self.interpolate_contours_chk.isChecked() and len(self.kp_values) >= 2:
+            # Resample only BETWEEN the bracketing crossings: contour
+            # bathymetry does not exist before the first or after the last
+            # crossing, and starting the resample at KP 0 used to clamp-fill
+            # the run-in with a fabricated flat depth.
+            first_kp = self.kp_values[0]
             total_kp = self.kp_values[-1]
-            sample_count = min(1000, max(50, int(total_kp * 20)))
-            new_kp = np.linspace(0, total_kp, sample_count)
+            sample_count = min(1000, max(50, int((total_kp - first_kp) * 20)))
+            new_kp = np.linspace(first_kp, total_kp, sample_count)
             new_depth = np.interp(new_kp, self.kp_values, self.depth_values)
             self.kp_values = list(new_kp)
             self.depth_values = list(new_depth)
@@ -1723,7 +1738,14 @@ class DepthProfileDockWidget(QDockWidget):
         positive_down = datum_sign > 0
         x_m = [kp * 1000.0 for kp in self.kp_values]
         station_slope = [None] * len(self.kp_values)
-        for run_start, run_end in contiguous_runs(x_m, self.depth_values):
+        # Runs also break where the supplying raster changes (when the
+        # sampler recorded provenance), so a vertical-datum offset between
+        # two rasters shows as a slope break, never a spike.
+        source_ids = getattr(self, 'depth_source_ids', None)
+        if not source_ids or len(source_ids) != len(self.kp_values):
+            source_ids = None
+        for run_start, run_end in contiguous_runs(x_m, self.depth_values,
+                                                  group_ids=source_ids):
             run_x = x_m[run_start:run_end + 1]
             run_y = [float(v) for v in self.depth_values[run_start:run_end + 1]]
             if window_m > 0:
@@ -2437,6 +2459,7 @@ class DepthProfileDockWidget(QDockWidget):
         self.vertical_line2 = None
         self.kp_values = []
         self.depth_values = []
+        self.depth_source_ids = []
         self.slope_deg = []
         self.slope_pct = []
         self.side_slope_deg = []

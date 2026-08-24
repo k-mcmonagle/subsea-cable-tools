@@ -40,6 +40,13 @@ import uuid
 # exhausts memory/disk. ~500M Float32 cells is already a 2 GB uncompressed file.
 MAX_RASTER_CELLS = 500_000_000
 
+# The Bin Average method holds raster-sized accumulators in RAM (float64
+# sums + int64 counts + the Float32 output ≈ 20 bytes per cell, on top of
+# the loaded point cloud), so it gets a tighter ceiling: 120M cells ≈ 2.4 GB
+# of accumulators. Beyond that, use a larger grid size or Direct/IDW (which
+# stream through GDAL).
+MAX_AVERAGE_CELLS = 120_000_000
+
 
 def sniff_xyz_format(path, probe_lines=10):
     """(delimiter, skiprows) for an XYZ text file.
@@ -416,6 +423,13 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
                 'produced a too-small cell size — set an explicit Grid Size instead.')
         feedback.pushInfo(
             f'Output raster: {width} x {height} pixels at {grid_x:.4f} x {grid_y:.4f}')
+        if method_index == self.METHOD_AVERAGE and width * height > MAX_AVERAGE_CELLS:
+            est_gb = width * height * 20.0 / 1e9
+            raise QgsProcessingException(
+                f'{os.path.basename(xyz_path)}: Bin Average would need '
+                f'roughly {est_gb:.1f} GB of in-memory accumulators for a '
+                f'{width} x {height} raster. Use a larger Grid Size, or the '
+                'Direct/IDW method, which stream through GDAL.')
 
         grid_mean = (grid_x + grid_y) / 2.0
         max_distance = max_distance_param
