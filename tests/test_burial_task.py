@@ -25,7 +25,7 @@ from qgis.gui import QgsMapCanvas, QgsRubberBand, QgsVertexMarker
 
 from ..burial import analysis_task, burial_dock, generation, map_layers
 from ..burial import schema as burial_schema
-from ..qgis_compat import WKB_LINESTRING
+from ..qgis_compat import ITEM_DATA_USER_ROLE, WKB_LINESTRING
 from ..burial.plan_model import PlanModel
 from ..burial.store import BurialStore
 from ..kp_geo_utils import RouteFrame
@@ -1401,6 +1401,284 @@ def test_burial_depth_config_is_manual_only() -> bool:
     return _result("Burial Planner bathymetry is manual-only", ok)
 
 
+def test_profile_bands_replace_per_range_items() -> bool:
+    """Thousands of overlay ranges + sections cost a handful of items, the
+    hover readout still names the ranges under the crosshair, and zooming
+    to a sliver stays cheap."""
+    import time
+
+    from ..burial import generation
+    from ..burial.profile_widget import BurialProfileWidget, RangeBandItem
+
+    widget = BurialProfileWidget()
+    widget.set_scope(0.0, 100.0)
+    widget.set_profile([(kp / 10.0, 50.0 + (kp % 7)) for kp in range(1001)])
+    context = generation.ResolutionContext()
+    context.insufficient = [Interval(i * 0.05, i * 0.05 + 0.02)
+                            for i in range(2000)]
+    sections = []
+    for i in range(2000):
+        kind = (burial_schema.SECTION_INSUFFICIENT if i % 2 else
+                burial_schema.SECTION_BURIAL)
+        sections.append({"section_id": f"s{i}", "kind": kind,
+                         "start_kp": i * 0.05, "end_kp": i * 0.05 + 0.05,
+                         "conclusion": ""})
+    t0 = time.perf_counter()
+    widget.set_overlays(context)
+    widget.set_sections(sections)
+    build_s = time.perf_counter() - t0
+    plot_items = widget.plot.getPlotItem().listDataItems()
+    scene_bands = [item for item in widget.plot.scene().items()
+                   if isinstance(item, RangeBandItem)]
+    # 4 overlay kinds + 1 strip band, regardless of range count.
+    ok = len(scene_bands) == 5
+    ok = ok and len(widget._regions["insufficient"].ranges()) == 2000
+    ok = ok and len(widget._strip_band.ranges()) == 2000
+    ok = ok and len(plot_items) < 10
+    t0 = time.perf_counter()
+    for _ in range(20):
+        widget.focus_range(10.0, 10.02)
+        widget.focus_range(0.0, 100.0)
+    zoom_s = (time.perf_counter() - t0) / 40.0
+    ok = ok and zoom_s < 0.2
+    # Readout lists the overlay and the section under the KP (old tooltips).
+    labels = widget.overlay_labels_at(10.01)
+    ok = ok and "Insufficient Information" in labels
+    ok = ok and any(text.startswith("Burial KP 10.000") for text in labels)
+    ok = ok and widget.overlay_labels_at(10.03) == [
+        text for text in widget.overlay_labels_at(10.03)
+        if text.startswith("Burial")]
+    widget.focus_kp(10.01)
+    readout = widget._readout.textItem.toPlainText()
+    ok = ok and "Insufficient Information" in readout
+    # Events: painted markers normally, draggable lines only in edit mode.
+    events = [{"event_id": f"e{i}", "kp": i * 0.05,
+               "event_type": (burial_schema.EVENT_BURIAL_START if i % 2 == 0
+                              else burial_schema.EVENT_BURIAL_END),
+               "status": "candidate", "locked": 0} for i in range(2000)]
+    t0 = time.perf_counter()
+    widget.set_events(events, "plough", editable=False)
+    events_s = time.perf_counter() - t0
+    ok = ok and not widget._event_lines
+    ok = ok and widget._event_markers.count() == 2000
+    ok = ok and events_s < 0.5
+    widget.set_events(events[:5], "plough", editable=True)
+    ok = ok and len(widget._event_lines) == 5
+    ok = ok and widget._event_markers.count() == 0
+    widget.clear()
+    ok = ok and not widget._strip_band.ranges()
+    widget.deleteLater()
+    return _result("profile: band items, hover labels, cheap zoom", ok,
+                   f"build={build_s * 1000:.0f} ms zoom={zoom_s * 1000:.1f} ms "
+                   f"events={events_s * 1000:.0f} ms")
+
+
+def test_builder_sections_table_delegates_and_optional_columns() -> bool:
+    """Sections table: no widget per cell, drop-down cells carry value +
+    label, boundary lookup is indexed, optional rKP/position columns hold
+    route-derived values and start hidden."""
+    import time
+
+    from qgis.PyQt.QtCore import QSettings
+
+    from ..burial import ui_helpers
+    from ..burial.tabs import builder_tab as bt
+
+    class _Dock:
+        def __getattr__(self, _name):
+            return lambda *_args, **_kwargs: None
+
+    for key in ("SubseaCableTools/BurialPlanner/builder_sections_columns",
+                "SubseaCableTools/BurialPlanner/builder_events_columns"):
+        QSettings().remove(key)
+    class _Store:
+        def list_change_log(self, *_args, **_kwargs):
+            return []
+
+    route, _da = _route()
+    total_km = route.total_length_km
+    model = PlanModel(_Store(), None)
+    model.plan = {"plan_id": "p1", "scope_start_kp": 0.0,
+                  "scope_end_kp": total_km, "direction": 1,
+                  "method": "plough",
+                  "params_json": json.dumps({"tool_id": "t1"})}
+    model.route = route
+    model.tools = [{"tool_id": "t1", "name": "Plough X", "tool_type": "plough",
+                    "configs_json": json.dumps([
+                        {"config_id": "c1", "label": "Share 1"}])}]
+    n = 1500
+    step = total_km / n
+    sections, events = [], []
+    for i in range(n):
+        kind = (burial_schema.SECTION_BURIAL if i % 3 == 0 else
+                burial_schema.SECTION_SKIP if i % 3 == 1 else
+                burial_schema.SECTION_INSUFFICIENT)
+        start, end = i * step, (i + 1) * step
+        sections.append({"section_id": f"s{i}", "plan_id": "p1", "kind": kind,
+                         "start_kp": start, "end_kp": end,
+                         "length_km": end - start, "state": "candidate",
+                         "conclusion": "", "confidence": "", "tool_id": "",
+                         "tool_config_id": "", "skip_handling": "",
+                         "reason_json": "{}", "notes": ""})
+        events.append({"event_id": f"e{i}", "plan_id": "p1", "seq": i,
+                       "event_type": burial_schema.EVENT_BURIAL_START,
+                       "kp": start, "lat": None, "lon": None, "depth_m": None,
+                       "source": "auto", "status": "candidate", "locked": 0,
+                       "notes": ""})
+    model.sections = sections
+    model.events = events
+    tab = bt.BuilderTab(model, _Dock())
+    t0 = time.perf_counter()
+    tab.refresh()
+    refresh_s = time.perf_counter() - t0
+    table = tab.sections_table
+    ok = table.rowCount() == n
+    ok = ok and refresh_s < 8.0
+    # No cell widgets anywhere.
+    ok = ok and all(table.cellWidget(0, c) is None
+                    for c in range(table.columnCount()))
+    # Burial row: conclusion/tool cells are drop-downs; default tool label.
+    conclusion_item = table.item(0, bt._SECTION_CONCLUSION_COL)
+    tool_item = table.item(0, bt._SECTION_TOOL_COL)
+    ok = ok and bool(conclusion_item.data(ui_helpers.COMBO_FLAG_ROLE))
+    ok = ok and tool_item.text().startswith("Plan default (Plough X")
+    ok = ok and tool_item.data(ui_helpers.COMBO_VALUE_ROLE) == ""
+    index = table.model().index(0, bt._SECTION_TOOL_COL)
+    options = tab._section_combo_options(index)
+    ok = ok and options is not None and ("t1", "Plough X") in options
+    # II row: no drop-downs at all.
+    ii_row = 2
+    ok = ok and not table.item(ii_row, bt._SECTION_CONCLUSION_COL).data(
+        ui_helpers.COMBO_FLAG_ROLE)
+    ok = ok and tab._section_combo_options(
+        table.model().index(ii_row, bt._SECTION_TOOL_COL)) is None
+    # Skip row: skip handling drop-down only.
+    ok = ok and bool(table.item(1, bt._SECTION_SKIP_HANDLING_COL).data(
+        ui_helpers.COMBO_FLAG_ROLE))
+    ok = ok and not table.item(1, bt._SECTION_TOOL_COL).data(
+        ui_helpers.COMBO_FLAG_ROLE)
+    # Boundary event index: the start cell of row 7 edits event e7.
+    start_item = table.item(7, bt._SECTION_START_COL)
+    ok = ok and start_item.data(ITEM_DATA_USER_ROLE) == "e7"
+    ok = ok and tab._boundary_event(7 * step + 5e-7)["event_id"] == "e7"
+    ok = ok and tab._boundary_event(7 * step + 5e-6) is None
+    # Optional columns: reverse KP and positions from the route.
+    row = 3
+    start_kp = sections[row]["start_kp"]
+    rkp_text = table.item(row, bt._SECTION_START_RKP_COL).text()
+    ok = ok and abs(float(rkp_text) - (total_km - start_kp)) < 1e-3
+    point = route.point_at_kp(start_kp, clamp=True)
+    ok = ok and abs(float(table.item(row, bt._SECTION_START_LAT_COL).text())
+                    - point.y()) < 1e-7
+    ok = ok and abs(float(table.item(row, bt._SECTION_START_LON_COL).text())
+                    - point.x()) < 1e-7
+    end_point = route.point_at_kp(sections[row]["end_kp"], clamp=True)
+    ok = ok and abs(float(table.item(row, bt._SECTION_END_LAT_COL).text())
+                    - end_point.y()) < 1e-7
+    for column in (bt._SECTION_START_RKP_COL, bt._SECTION_END_RKP_COL,
+                   bt._SECTION_START_LAT_COL, bt._SECTION_END_LON_COL):
+        ok = ok and table.isColumnHidden(column)
+    ok = ok and not table.isColumnHidden(bt._SECTION_LENGTH_COL)
+    # Events table: rKP column present (hidden by default), value correct.
+    ev_table = tab.events_table
+    ok = ok and ev_table.isColumnHidden(bt._EVENT_RKP_COL)
+    ok = ok and abs(float(ev_table.item(7, bt._EVENT_RKP_COL).text())
+                    - (total_km - events[7]["kp"])) < 1e-3
+    # A delegate commit applies through the deferred single-edit path.
+    applied = []
+    model.update_section = lambda sid, updates, action="": (
+        applied.append((sid, dict(updates))) or True)
+    tab._section_combo_committed(
+        table.model().index(0, bt._SECTION_CONCLUSION_COL), "feasible")
+    from qgis.PyQt.QtCore import QCoreApplication, QEventLoop
+
+    QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents
+                                   if hasattr(QEventLoop, "ProcessEventsFlag")
+                                   else QEventLoop.AllEvents)
+    ok = ok and applied == [("s0", {"conclusion": "feasible"})]
+    tab.deleteLater()
+    return _result("builder: delegate drop-downs, indexed boundaries, "
+                   "optional rKP/position columns", ok,
+                   f"refresh {n} rows = {refresh_s * 1000:.0f} ms")
+
+
+def test_column_menu_persists_by_label() -> bool:
+    """Hidden columns survive a column being inserted before them, and a
+    never-seen column follows its default."""
+    from qgis.PyQt.QtCore import QSettings
+    from qgis.PyQt.QtWidgets import QTableWidget
+
+    from ..burial import ui_helpers
+
+    key = "SubseaCableTools/BurialPlanner/test_column_menu"
+    QSettings().remove(key)
+    first = QTableWidget(0, 3)
+    first.setHorizontalHeaderLabels(["ID", "KP", "Notes"])
+    ui_helpers.enable_column_menu(first, key, always_visible=(0,),
+                                  default_hidden=())
+    ok = not first.isColumnHidden(2)
+    first.setColumnHidden(2, True)
+    # Persist through the same path the menu uses.
+    import json
+    QSettings().setValue(key, json.dumps(
+        {"hidden": ["Notes"], "known": ["ID", "KP", "Notes"]}))
+    second = QTableWidget(0, 4)
+    second.setHorizontalHeaderLabels(["ID", "KP", "rKP", "Notes"])
+    ui_helpers.enable_column_menu(second, key, always_visible=(0,),
+                                  default_hidden=("rKP",))
+    ok = ok and second.isColumnHidden(3)        # Notes stays hidden by label
+    ok = ok and second.isColumnHidden(2)        # new column: default hidden
+    ok = ok and not second.isColumnHidden(1)
+    # Legacy index list still maps onto an unchanged table.
+    QSettings().setValue(key, json.dumps([1]))
+    third = QTableWidget(0, 3)
+    third.setHorizontalHeaderLabels(["ID", "KP", "Notes"])
+    ui_helpers.enable_column_menu(third, key, always_visible=(0,))
+    ok = ok and third.isColumnHidden(1) and not third.isColumnHidden(2)
+    QSettings().remove(key)
+    for table in (first, second, third):
+        table.deleteLater()
+    return _result("column menu: label-keyed persistence + defaults", ok)
+
+
+def test_goto_range_guards_degenerate_ranges() -> bool:
+    """NaN / equal / non-numeric ranges never reach the canvas or profile."""
+    from ..burial.burial_dock import BurialPlannerDock
+
+    calls = []
+
+    class _Profile:
+        def focus_range(self, *args):
+            calls.append(("focus_range", args))
+
+        def focus_kp(self, *args):
+            calls.append(("focus_kp", args))
+
+    class _Stub:
+        canvas = None
+        profile = _Profile()
+
+        def highlight_range(self, *args):
+            calls.append(("highlight", args))
+            return None
+
+        def goto_kp(self, kp):
+            calls.append(("goto_kp", (kp,)))
+
+    stub = _Stub()
+    BurialPlannerDock.goto_range(stub, float("nan"), 1.0)
+    BurialPlannerDock.goto_range(stub, "x", 1.0)
+    BurialPlannerDock.goto_range(stub, None, 1.0)
+    ok = calls == []
+    BurialPlannerDock.goto_range(stub, 2.0, 2.0)
+    ok = ok and calls == [("goto_kp", (2.0,))]
+    calls.clear()
+    BurialPlannerDock.goto_range(stub, 3.0, 1.0)
+    ok = ok and calls == [("highlight", (3.0, 1.0)),
+                          ("focus_range", (3.0, 1.0))]
+    return _result("goto_range: degenerate ranges guarded", ok)
+
+
 def run_all() -> list:
     return [
         test_scoped_sampler_matches_full(),
@@ -1434,6 +1712,10 @@ def run_all() -> list:
         test_plan_layer_schema_heal(),
         test_multi_plan_layer_switching(),
         test_burial_depth_config_is_manual_only(),
+        test_profile_bands_replace_per_range_items(),
+        test_builder_sections_table_delegates_and_optional_columns(),
+        test_column_menu_persists_by_label(),
+        test_goto_range_guards_degenerate_ranges(),
     ]
 
 

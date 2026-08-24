@@ -314,6 +314,88 @@ def test_routeframe_total_length_and_extract() -> bool:
     )
 
 
+def test_routeframe_extract_matches_walking_slice() -> bool:
+    """Indexed ``RouteFrame.extract_segment`` reproduces the vertex walk.
+
+    Regression for the chainage-indexed slice: same interpolated ends and
+    the same interior vertices as ``extract_line_segment`` on a dense
+    single-feature route, including a range that ends exactly on a vertex
+    and a range that starts at KP 0.
+    """
+    import math
+
+    da = _da_geog()
+    # 200-vertex zig-zag so segments differ in length and bearing.
+    points = [f"{i * 0.01} {0.002 * (i % 3)}" for i in range(200)]
+    geom = _line("LINESTRING(" + ", ".join(points) + ")")
+    rf = RouteFrame([geom], [measure_total_length_m(geom, da)], da)
+    total_km = rf.total_length_km
+    # KP of vertex 50 (exact chainage), for the on-vertex end case.
+    vertex_kp = sum(float(da.measureLine(QgsPointXY(float(points[i].split()[0]),
+                                                    float(points[i].split()[1])),
+                                         QgsPointXY(float(points[i + 1].split()[0]),
+                                                    float(points[i + 1].split()[1]))))
+                    for i in range(50)) / 1000.0
+    ok = True
+    detail = []
+    for start_km, end_km in ((total_km * 0.31, total_km * 0.77),
+                             (0.0, total_km * 0.2),
+                             (total_km * 0.1, vertex_kp),
+                             (total_km * 0.9, total_km)):
+        indexed = rf.extract_segment(start_km, end_km)
+        walked = extract_line_segment(geom, start_km, end_km, da)
+        if indexed is None or walked is None:
+            ok = False
+            detail.append(f"None for {start_km:.3f}-{end_km:.3f}")
+            continue
+        a = [tuple(p) for p in iter_line_parts(indexed)[0]]
+        b = [tuple(p) for p in iter_line_parts(walked)[0]]
+        # The walk may duplicate a vertex when a range ends exactly on it.
+        dedup = []
+        for pt in b:
+            if not dedup or (abs(pt[0] - dedup[-1][0]) > 1e-12
+                             or abs(pt[1] - dedup[-1][1]) > 1e-12):
+                dedup.append(pt)
+        same = len(a) == len(dedup) and all(
+            math.hypot(pa[0] - pb[0], pa[1] - pb[1]) < 1e-9
+            for pa, pb in zip(a, dedup))
+        if not same:
+            ok = False
+            detail.append(f"{start_km:.3f}-{end_km:.3f}: {len(a)} vs "
+                          f"{len(dedup)} vertices")
+    # Ends coincide with point_at_kp (shared chainage index).
+    sub = rf.extract_segment(total_km * 0.4, total_km * 0.6)
+    pts = iter_line_parts(sub)[0]
+    p_start = rf.point_at_kp(total_km * 0.4)
+    p_end = rf.point_at_kp(total_km * 0.6)
+    ok = ok and math.hypot(pts[0].x() - p_start.x(),
+                           pts[0].y() - p_start.y()) < 1e-9
+    ok = ok and math.hypot(pts[-1].x() - p_end.x(),
+                           pts[-1].y() - p_end.y()) < 1e-9
+    # Degenerate inputs never raise or return a slice.
+    ok = ok and rf.extract_segment(float("nan"), 1.0) is None
+    ok = ok and rf.extract_segment(2.0, 2.0) is None
+    ok = ok and rf.extract_segment(total_km + 1.0, total_km + 2.0) is None
+    return _result("RouteFrame.extract_segment == vertex walk (indexed)", ok,
+                   "; ".join(detail))
+
+
+def test_routeframe_extract_multi_feature_gap_keeps_jump_vertex() -> bool:
+    """Across a gap between features the slice keeps both gap vertices."""
+    da = _da_geog()
+    geoms = [_line("LINESTRING(0 0, 0.5 0)"), _line("LINESTRING(0.6 0, 1 0)")]
+    rf = RouteFrame(geoms, [measure_total_length_m(g, da) for g in geoms], da)
+    total_km = rf.total_length_km
+    sub = rf.extract_segment(total_km * 0.1, total_km * 0.9)
+    pts = [(round(p.x(), 9), round(p.y(), 9)) for p in iter_line_parts(sub)[0]]
+    ok = (0.5, 0.0) in pts and (0.6, 0.0) in pts
+    sub_km = measure_total_length_m(sub, da) / 1000.0
+    # Chainage does not count the gap, but the slice geometry spans it.
+    ok = ok and sub_km > total_km * 0.8
+    return _result("RouteFrame.extract_segment keeps feature-gap vertices",
+                   ok, f"vertices={pts}")
+
+
 # ---------------------------------------------------------------------------
 # Regression: RPLComparator no longer silently falls back to planar metres
 # when the project ellipsoid is unset (1.6 fix).
@@ -458,6 +540,8 @@ def run_all() -> List[bool]:
         test_extract_line_segment_basic(),
         test_extract_line_segment_out_of_range(),
         test_routeframe_total_length_and_extract(),
+        test_routeframe_extract_matches_walking_slice(),
+        test_routeframe_extract_multi_feature_gap_keeps_jump_vertex(),
         test_rplcomparator_ellipsoid_fallback(),
         test_geodesic_interpolation_long_geographic_segment(),
         test_geodesic_interpolation_projected_unchanged(),

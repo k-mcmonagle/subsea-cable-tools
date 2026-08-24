@@ -373,3 +373,28 @@ tools registry / trencher vocabulary / method aliasing / JSON round trip
 (test_burial_tools), and the shared-engine extensions with the original
 Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The interactive walkthrough steps
 (dock UX, profile drag, map sync) need a manual pass in QGIS.
+
+- **Large-plan UI scaling: paint, don't instantiate.** The Plan Builder
+  sections table and the profile pane are the two surfaces whose cost grew
+  with section count, and both used one Qt object per thing (a `QComboBox`
+  per drop-down cell, a `LinearRegionItem` per overlay range / section).
+  Both now paint from plain data — `ComboColumnDelegate` draws the current
+  label + arrow and creates a single editor on click; `RangeBandItem` holds
+  the ranges of one kind as tuples and paints the visible ones — so a plan
+  with thousands of Insufficient Information slivers costs the same widgets
+  as a plan with ten sections. The per-region tooltips moved into the
+  crosshair readout (`overlay_labels_at`) rather than being dropped. Whole-
+  table `save_sections` on every edit remains the store's documented
+  pattern; the UI side no longer amplifies it.
+- **Stall watchdog is on whenever the dock is open, off otherwise.**
+  `faulthandler.dump_traceback_later` re-armed by a GUI-thread `QTimer`
+  (stdlib, C-level, survives deadlocks). It is process-global, so the dock
+  cancels it on close and never sets `exit=True`; the cost is one cancel +
+  re-arm every 2 s. Threshold 8 s: long enough that a legitimate synchronous
+  write never dumps, short enough that a "not responding" is captured well
+  before the user reaches for Task Manager.
+- **Reverse KP in the Plan Builder is route length − KP** (the KP Mouse /
+  Depth Profile convention), independent of the plan's installation
+  direction — direction already governs section reference ordering and
+  event semantics, and a second direction-dependent KP would invite
+  confusion between the two.

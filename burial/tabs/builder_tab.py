@@ -52,17 +52,34 @@ from .. import schema
 from .. import tools as tools_mod
 from .. import ui_helpers
 
-_EVENT_COLUMNS = ["Seq", "Event", "KP", "Lat", "Lon", "Depth (m)", "Source",
-                  "Status", "Locked", "Notes"]
+_EVENT_COLUMNS = ["Seq", "Event", "KP", "rKP", "Lat", "Lon", "Depth (m)",
+                  "Source", "Status", "Locked", "Notes"]
 _EVENT_KP_COL = _EVENT_COLUMNS.index("KP")
+_EVENT_RKP_COL = _EVENT_COLUMNS.index("rKP")
+_EVENT_STATUS_COL = _EVENT_COLUMNS.index("Status")
+_EVENT_LOCKED_COL = _EVENT_COLUMNS.index("Locked")
 _EVENT_NOTES_COL = _EVENT_COLUMNS.index("Notes")
-_SECTION_COLUMNS = ["ID", "Kind", "Start KP", "End KP", "Length (km)",
+# Optional columns start hidden; the header right-click menu shows them.
+_EVENT_DEFAULT_HIDDEN = ("rKP",)
+_SECTION_COLUMNS = ["ID", "Kind", "Start KP", "End KP",
+                    "Start rKP", "End rKP",
+                    "Start Lat", "Start Lon", "End Lat", "End Lon",
+                    "Length (km)",
                     "State", "Conclusion", "Confidence", "Tool",
                     "Tool config", "Skip handling", "Reasons", "Notes"]
+_SECTION_DEFAULT_HIDDEN = ("Start rKP", "End rKP", "Start Lat", "Start Lon",
+                           "End Lat", "End Lon")
 # Derived from the header list so reordering/inserting columns cannot
 # silently desynchronise a widget from the field it edits.
 _SECTION_START_COL = _SECTION_COLUMNS.index("Start KP")
 _SECTION_END_COL = _SECTION_COLUMNS.index("End KP")
+_SECTION_START_RKP_COL = _SECTION_COLUMNS.index("Start rKP")
+_SECTION_END_RKP_COL = _SECTION_COLUMNS.index("End rKP")
+_SECTION_START_LAT_COL = _SECTION_COLUMNS.index("Start Lat")
+_SECTION_START_LON_COL = _SECTION_COLUMNS.index("Start Lon")
+_SECTION_END_LAT_COL = _SECTION_COLUMNS.index("End Lat")
+_SECTION_END_LON_COL = _SECTION_COLUMNS.index("End Lon")
+_SECTION_LENGTH_COL = _SECTION_COLUMNS.index("Length (km)")
 _SECTION_CONCLUSION_COL = _SECTION_COLUMNS.index("Conclusion")
 _SECTION_CONFIDENCE_COL = _SECTION_COLUMNS.index("Confidence")
 _SECTION_TOOL_COL = _SECTION_COLUMNS.index("Tool")
@@ -70,6 +87,39 @@ _SECTION_TOOL_CONFIG_COL = _SECTION_COLUMNS.index("Tool config")
 _SECTION_SKIP_HANDLING_COL = _SECTION_COLUMNS.index("Skip handling")
 _SECTION_REASONS_COL = _SECTION_COLUMNS.index("Reasons")
 _SECTION_NOTES_COL = _SECTION_COLUMNS.index("Notes")
+# Drop-down cells (delegate-edited; see ui_helpers.ComboColumnDelegate).
+_SECTION_COMBO_COLS = (_SECTION_CONCLUSION_COL, _SECTION_CONFIDENCE_COL,
+                       _SECTION_TOOL_COL, _SECTION_TOOL_CONFIG_COL,
+                       _SECTION_SKIP_HANDLING_COL)
+_SECTION_COMBO_FIELDS = {
+    _SECTION_CONCLUSION_COL: "conclusion",
+    _SECTION_CONFIDENCE_COL: "confidence",
+    _SECTION_TOOL_COL: "tool_id",
+    _SECTION_TOOL_CONFIG_COL: "tool_config_id",
+    _SECTION_SKIP_HANDLING_COL: "skip_handling",
+}
+_SECTION_COMBO_TOOLTIPS = {
+    _SECTION_CONCLUSION_COL: (
+        "Operating-envelope conclusion. Click to choose; right-click a "
+        "selection to set several sections at once."),
+    _SECTION_CONFIDENCE_COL: (
+        "Evidence confidence. Click to choose; right-click a selection to "
+        "set several sections at once."),
+    _SECTION_TOOL_COL: (
+        "Burial tool for this section; blank inherits the plan default set "
+        "on the Plan tab. Register tools on the Burial Tools tab."),
+    _SECTION_TOOL_CONFIG_COL: (
+        "Operating configuration (e.g. jetting vs passive mode) of the "
+        "section's tool."),
+    _SECTION_SKIP_HANDLING_COL: (
+        "How this skip is executed: recover the burial tool to deck, or "
+        "transit with the tool suspended mid-water. TBC until decided."),
+}
+_RKP_TOOLTIP = ("Reverse KP: route length minus KP, measured from the far "
+                "end of the RPL (same convention as KP Mouse and the Depth "
+                "Profile tool).")
+_POSITION_TOOLTIP = ("WGS84 position on the RPL at this KP — the same "
+                     "point the event list and map layers use.")
 
 _SHOW_EVENTS_SETTINGS_KEY = "SubseaCableTools/BurialPlanner/builder_show_events"
 _SPLITTER_SETTINGS_KEY = "SubseaCableTools/BurialPlanner/builder_splitter_state"
@@ -241,8 +291,12 @@ class BuilderTab(QWidget):
         self.events_table.horizontalHeader().setStretchLastSection(True)
         ui_helpers.enable_column_menu(
             self.events_table,
-            "SubseaCableTools/BurialPlanner/builder_events_hidden_columns",
-            always_visible=(0, _EVENT_KP_COL))
+            "SubseaCableTools/BurialPlanner/builder_events_columns",
+            always_visible=(0, _EVENT_KP_COL),
+            default_hidden=_EVENT_DEFAULT_HIDDEN)
+        rkp_header = self.events_table.horizontalHeaderItem(_EVENT_RKP_COL)
+        if rkp_header is not None:
+            rkp_header.setToolTip(_RKP_TOOLTIP)
         self.events_table.itemChanged.connect(self._on_event_item_changed)
         self.events_table.itemSelectionChanged.connect(self._on_event_selected)
         self.events_table.setContextMenuPolicy(CONTEXT_MENU_POLICY_CUSTOM)
@@ -332,10 +386,33 @@ class BuilderTab(QWidget):
         self.sections_table.setColumnWidth(_SECTION_REASONS_COL, 240)
         # Right-click the header to hide secondary columns (persisted) —
         # the 13-column table's escape hatch on narrow docks.
+        # Optional columns (reverse KP, start/end positions) start hidden;
+        # visibility is persisted by label so later column changes never
+        # re-target a saved choice.
         ui_helpers.enable_column_menu(
             self.sections_table,
-            "SubseaCableTools/BurialPlanner/builder_sections_hidden_columns",
-            always_visible=(0, _SECTION_START_COL, _SECTION_END_COL))
+            "SubseaCableTools/BurialPlanner/builder_sections_columns",
+            always_visible=(0, _SECTION_START_COL, _SECTION_END_COL),
+            default_hidden=_SECTION_DEFAULT_HIDDEN)
+        for column, tip in ((_SECTION_START_RKP_COL, _RKP_TOOLTIP),
+                            (_SECTION_END_RKP_COL, _RKP_TOOLTIP),
+                            (_SECTION_START_LAT_COL, _POSITION_TOOLTIP),
+                            (_SECTION_START_LON_COL, _POSITION_TOOLTIP),
+                            (_SECTION_END_LAT_COL, _POSITION_TOOLTIP),
+                            (_SECTION_END_LON_COL, _POSITION_TOOLTIP)):
+            header_item = self.sections_table.horizontalHeaderItem(column)
+            if header_item is not None:
+                header_item.setToolTip(tip)
+        # Drop-down cells are painted from item data and edited through one
+        # delegate editor at a time: a QComboBox widget per row made every
+        # rebuild (i.e. every edit) cost thousands of widgets on large plans.
+        self._section_delegate = ui_helpers.ComboColumnDelegate(
+            self.sections_table, self._section_combo_options,
+            self._section_combo_committed)
+        for column in _SECTION_COMBO_COLS:
+            self.sections_table.setItemDelegateForColumn(
+                column, self._section_delegate)
+        self._boundary_index: Dict[int, Dict] = {}
         self.sections_table.itemSelectionChanged.connect(self._on_section_selected)
         self.sections_table.itemChanged.connect(self._on_section_item_changed)
         self.sections_table.setContextMenuPolicy(CONTEXT_MENU_POLICY_CUSTOM)
@@ -344,7 +421,8 @@ class BuilderTab(QWidget):
         self.sections_table.cellDoubleClicked.connect(
             lambda row, column: self._goto_section_row(row)
             if column not in (_SECTION_START_COL, _SECTION_END_COL,
-                              _SECTION_NOTES_COL) else None)
+                              _SECTION_NOTES_COL) + _SECTION_COMBO_COLS
+            else None)
         sections_layout.addWidget(self.sections_table, 1)
 
         section_hint = QLabel(
@@ -419,11 +497,6 @@ class BuilderTab(QWidget):
                 if item is not None and needle in item.text().lower():
                     match = True
                     break
-                widget = table.cellWidget(row, column)
-                if widget is not None and hasattr(widget, "currentText") \
-                        and needle in widget.currentText().lower():
-                    match = True
-                    break
             table.setRowHidden(row, not match)
 
     # -- progress hooks (driven by the dock) ----------------------------------
@@ -494,18 +567,22 @@ class BuilderTab(QWidget):
 
             events = self.model.events
             status_colors = _status_colors()
-            lock_header = self.events_table.horizontalHeaderItem(8)
+            lock_header = self.events_table.horizontalHeaderItem(
+                _EVENT_LOCKED_COL)
             if lock_header is not None:
                 lock_header.setToolTip(
                     "🔒 = locked: the event cannot be moved or deleted. "
                     "Lock/unlock a selection from the right-click menu.")
-            with ui_helpers.preserve_table_view(self.events_table):
+            total_km = self._route_length_km()
+            with ui_helpers.preserve_table_view(self.events_table), \
+                    ui_helpers.silent_rebuild(self.events_table):
                 self.events_table.setRowCount(len(events))
                 for i, event in enumerate(events):
                     values = [
                         str(int(event.get("seq") or 0)),
                         ev.event_label(event.get("event_type") or "", method),
                         schema.format_kp(event.get("kp")),
+                        self._format_rkp(event.get("kp"), total_km),
                         f"{event.get('lat'):.7f}" if event.get("lat") is not None else "",
                         f"{event.get('lon'):.7f}" if event.get("lon") is not None else "",
                         f"{event.get('depth_m'):.1f}" if event.get("depth_m") is not None else "",
@@ -522,7 +599,7 @@ class BuilderTab(QWidget):
                         item.setFlags(flags)
                         if j == 0:
                             item.setData(ITEM_DATA_USER_ROLE, event.get("event_id"))
-                        if j == 7:
+                        if j == _EVENT_STATUS_COL:
                             color = status_colors.get(event.get("status") or "")
                             if color is not None:
                                 item.setForeground(QBrush(color))
@@ -627,18 +704,69 @@ class BuilderTab(QWidget):
         else:
             self.undo_button.setToolTip("There is no current Plan Builder edit to undo.")
 
+    def _route_length_km(self) -> Optional[float]:
+        route = self.model.route
+        if route is None:
+            return None
+        try:
+            total = float(route.total_length_km)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return total if total > 0 else None
+
+    @staticmethod
+    def _format_rkp(kp, total_km: Optional[float]) -> str:
+        """Reverse KP (route length − KP), KP Mouse convention."""
+        if total_km is None or kp is None:
+            return ""
+        try:
+            return schema.format_kp(total_km - float(kp))
+        except (TypeError, ValueError):
+            return ""
+
+    def _position_text(self, kp) -> tuple:
+        """``(lat, lon)`` strings on the RPL at kp (blank without a route)."""
+        route = self.model.route
+        if route is None or kp is None:
+            return "", ""
+        try:
+            point = route.point_at_kp(float(kp), clamp=True)
+        except (TypeError, ValueError):
+            return "", ""
+        if point is None:
+            return "", ""
+        return f"{point.y():.7f}", f"{point.x():.7f}"
+
+    @staticmethod
+    def _boundary_key(kp) -> Optional[int]:
+        try:
+            return int(round(float(kp) * 1e6))
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def _rebuild_boundary_index(self) -> None:
+        """Events keyed by KP (µm precision) for O(1) boundary lookups.
+
+        The previous linear scan per section boundary made the sections
+        rebuild O(sections × events).
+        """
+        index: Dict[int, Dict] = {}
+        for event in self.model.events:
+            key = self._boundary_key(event.get("kp"))
+            if key is not None and key not in index:
+                index[key] = event
+        self._boundary_index = index
+
     def _boundary_event(self, kp) -> Optional[Dict]:
         """The event sitting exactly on a section boundary KP, if any."""
-        try:
-            wanted = float(kp)
-        except (TypeError, ValueError):
+        key = self._boundary_key(kp)
+        if key is None:
             return None
-        for event in self.model.events:
-            try:
-                if abs(float(event.get("kp")) - wanted) <= 1e-6:
-                    return event
-            except (TypeError, ValueError):
-                continue
+        index = self._boundary_index
+        for candidate in (key, key - 1, key + 1):  # |Δ| <= 1e-6 km, as before
+            event = index.get(candidate)
+            if event is not None:
+                return event
         return None
 
     def _refresh_sections(self) -> None:
@@ -648,47 +776,78 @@ class BuilderTab(QWidget):
             refs = schema.section_refs(sections, self.model.direction,
                                        self.model.method)
             ref_legend = schema.section_ref_legend(self.model.method)
+            self._rebuild_boundary_index()
             self._rebuild_sections_table(sections, refs, ref_legend)
             self._apply_filter(self.sections_table, self.sections_filter)
         finally:
             self._loading = False
 
     def _rebuild_sections_table(self, sections, refs, ref_legend) -> None:
-        with ui_helpers.preserve_table_view(self.sections_table):
-            self.sections_table.setRowCount(len(sections))
+        table = self.sections_table
+        total_km = self._route_length_km()
+        editable_flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        with ui_helpers.preserve_table_view(table), \
+                ui_helpers.silent_rebuild(table):
+            table.setRowCount(len(sections))
             for i, section in enumerate(sections):
                 reasons = self._reason_text(section)
                 section_id = section.get("section_id")
-                is_skip = section.get("kind") == schema.SECTION_SKIP
+                kind = section.get("kind")
+                is_skip = kind == schema.SECTION_SKIP
                 # Insufficient Information rows keep their fixed conclusion
                 # as plain text; burial and skip rows edit in-table.
-                editable = section.get("kind") in (schema.SECTION_BURIAL,
-                                                   schema.SECTION_SKIP)
-                is_burial = section.get("kind") == schema.SECTION_BURIAL
+                editable = kind in (schema.SECTION_BURIAL, schema.SECTION_SKIP)
+                is_burial = kind == schema.SECTION_BURIAL
+                start_kp = section.get("start_kp")
+                end_kp = section.get("end_kp")
+                start_lat, start_lon = self._position_text(start_kp)
+                end_lat, end_lon = self._position_text(end_kp)
                 values = [
                     refs.get(str(section_id or ""), ""),
-                    self._kind_label(section.get("kind") or ""),
-                    schema.format_kp(section.get("start_kp")),
-                    schema.format_kp(section.get("end_kp")),
+                    self._kind_label(kind or ""),
+                    schema.format_kp(start_kp),
+                    schema.format_kp(end_kp),
+                    self._format_rkp(start_kp, total_km),
+                    self._format_rkp(end_kp, total_km),
+                    start_lat, start_lon, end_lat, end_lon,
                     schema.format_kp(section.get("length_km")),
                     section.get("state") or "",
-                    "" if editable else schema.CONCLUSION_LABELS.get(
+                    schema.CONCLUSION_LABELS.get(
                         section.get("conclusion") or "", ""),
-                    "" if editable else (section.get("confidence") or ""),
-                    "",  # tool: combo widget on burial rows
-                    "",  # tool config: combo widget on burial rows
-                    "",  # skip handling: combo widget on skip rows
+                    section.get("confidence") or "",
+                    "",  # tool: drop-down on burial rows
+                    "",  # tool config: drop-down on burial rows
+                    "",  # skip handling: drop-down on skip rows
                     reasons,
                     section.get("notes") or "",
                 ]
+                combos: Dict[int, tuple] = {}
+                if editable:
+                    combos[_SECTION_CONCLUSION_COL] = (
+                        section.get("conclusion") or "",
+                        values[_SECTION_CONCLUSION_COL])
+                    combos[_SECTION_CONFIDENCE_COL] = (
+                        section.get("confidence") or "",
+                        values[_SECTION_CONFIDENCE_COL])
+                if is_burial:
+                    tool_value, tool_label = self._current_tool_display(section)
+                    combos[_SECTION_TOOL_COL] = (tool_value, tool_label)
+                    config_value, config_label = \
+                        self._current_config_display(section)
+                    combos[_SECTION_TOOL_CONFIG_COL] = (config_value,
+                                                        config_label)
+                if is_skip:
+                    handling = section.get("skip_handling") or ""
+                    combos[_SECTION_SKIP_HANDLING_COL] = (
+                        handling, schema.SKIP_HANDLING_LABELS.get(handling, ""))
                 # Boundary events at the section's start/end KPs (if any):
                 # those cells edit in-table, moving the underlying event
                 # with the same validation as a profile drag.
-                start_event = self._boundary_event(section.get("start_kp"))
-                end_event = self._boundary_event(section.get("end_kp"))
+                start_event = self._boundary_event(start_kp)
+                end_event = self._boundary_event(end_kp)
                 for j, value in enumerate(values):
                     item = QTableWidgetItem(value)
-                    flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                    flags = editable_flags
                     if j == _SECTION_NOTES_COL:
                         flags |= Qt.ItemFlag.ItemIsEditable
                     boundary = (start_event if j == _SECTION_START_COL else
@@ -712,6 +871,12 @@ class BuilderTab(QWidget):
                         item.setToolTip(
                             "This boundary is the plan scope edge (or has "
                             "no event) — adjust the scope on Inputs.")
+                    combo = combos.get(j)
+                    if combo is not None:
+                        flags |= Qt.ItemFlag.ItemIsEditable
+                        ui_helpers.ComboColumnDelegate.mark_item(
+                            item, combo[0], combo[1])
+                        item.setToolTip(_SECTION_COMBO_TOOLTIPS[j])
                     item.setFlags(flags)
                     if j == 0:
                         item.setData(ITEM_DATA_USER_ROLE, section_id)
@@ -720,107 +885,92 @@ class BuilderTab(QWidget):
                         item.setToolTip(reasons)
                     if j == _SECTION_NOTES_COL and value:
                         item.setToolTip(value)
-                    self.sections_table.setItem(i, j, item)
-                if editable:
-                    self._add_section_combo(
-                        i, _SECTION_CONCLUSION_COL, section_id, "conclusion",
-                        [(c, schema.CONCLUSION_LABELS[c])
-                         for c in [""] + schema.CONCLUSIONS],
-                        section.get("conclusion") or "",
-                        "Operating-envelope conclusion. Right-click a "
-                        "selection to set several sections at once.")
-                    self._add_section_combo(
-                        i, _SECTION_CONFIDENCE_COL, section_id, "confidence",
-                        [("", "")] + [(v, v) for v in schema.CONFIDENCE_VALUES],
-                        section.get("confidence") or "",
-                        "Evidence confidence. Right-click a selection to "
-                        "set several sections at once.")
-                else:
-                    self.sections_table.removeCellWidget(
-                        i, _SECTION_CONCLUSION_COL)
-                    self.sections_table.removeCellWidget(
-                        i, _SECTION_CONFIDENCE_COL)
-                if is_burial:
-                    self._add_tool_combos(i, section)
-                else:
-                    self.sections_table.removeCellWidget(i, _SECTION_TOOL_COL)
-                    self.sections_table.removeCellWidget(
-                        i, _SECTION_TOOL_CONFIG_COL)
-                if is_skip:
-                    self._add_section_combo(
-                        i, _SECTION_SKIP_HANDLING_COL, section_id,
-                        "skip_handling",
-                        [(h, schema.SKIP_HANDLING_LABELS[h])
-                         for h in schema.SKIP_HANDLING_VALUES],
-                        section.get("skip_handling") or "",
-                        "How this skip is executed: recover the burial tool "
-                        "to deck, or transit with the tool suspended "
-                        "mid-water. TBC until decided.")
-                else:
-                    self.sections_table.removeCellWidget(
-                        i, _SECTION_SKIP_HANDLING_COL)
+                    table.setItem(i, j, item)
 
-    def _add_section_combo(self, row: int, column: int, section_id: str,
-                           field: str, options, current: str,
-                           tooltip: str = "") -> None:
-        combo = QComboBox()
-        for value, label in options:
-            combo.addItem(label, value)
-        combo.setCurrentIndex(max(0, combo.findData(current or "")))
-        if tooltip:
-            combo.setToolTip(tooltip)
-        combo.currentIndexChanged.connect(
-            lambda _index, c=combo, sid=section_id, f=field:
-            self._deferred_section_edit(sid, f, c.currentData()))
-        self.sections_table.setCellWidget(row, column, combo)
-
-    def _add_tool_combos(self, row: int, section: Dict) -> None:
-        """Tool + configuration combos on a burial row.
+    # -- drop-down cells (delegate callbacks) ---------------------------------
+    def _tool_options(self, section: Dict) -> List[tuple]:
+        """``(value, label)`` choices for a burial row's Tool cell.
 
         "" = inherit the plan default (shown with the resolved name). An
         explicit assignment also stamps the section's ``method`` with the
         tool's type; generation still resolves rules against the plan
         method until mixed-method generation lands.
         """
-        section_id = section.get("section_id") or ""
-        default_tool_id, default_config_id = self.model.default_tool()
+        default_tool_id, _default_config_id = self.model.default_tool()
         default_text = tools_mod.tool_display(self.model.tools,
                                               default_tool_id)
         inherit_label = (f"Plan default ({default_text})"
                          if default_text else "Plan default (none)")
-
-        tool_options = [("", inherit_label)]
+        options = [("", inherit_label)]
         for tool in self.model.tools:
-            tool_options.append((tool.get("tool_id") or "",
-                                 tool.get("name") or "?"))
+            options.append((tool.get("tool_id") or "",
+                            tool.get("name") or "?"))
         current_tool = str(section.get("tool_id") or "")
         if current_tool and not tools_mod.tool_by_id(self.model.tools,
                                                      current_tool):
-            tool_options.append((current_tool, "(unregistered tool)"))
-        self._add_section_combo(
-            row, _SECTION_TOOL_COL, section_id, "tool_id", tool_options,
-            current_tool,
-            "Burial tool for this section; blank inherits the plan "
-            "default set on the Plan tab. Register tools on the "
-            "Burial Tools tab.")
+            options.append((current_tool, "(unregistered tool)"))
+        return options
 
-        config_tool_id = current_tool or default_tool_id
-        config_tool = tools_mod.tool_by_id(self.model.tools, config_tool_id)
-        config_options = [("", "(default)" if current_tool == ""
-                           else "(no configuration)")]
+    def _config_options(self, section: Dict) -> List[tuple]:
+        current_tool = str(section.get("tool_id") or "")
+        default_tool_id, _default_config_id = self.model.default_tool()
+        config_tool = tools_mod.tool_by_id(self.model.tools,
+                                           current_tool or default_tool_id)
+        options = [("", "(default)" if current_tool == ""
+                    else "(no configuration)")]
         for config in tools_mod.parse_configs(config_tool):
-            config_options.append((config.get("config_id") or "",
-                                   tools_mod.config_label(config) or "?"))
+            options.append((config.get("config_id") or "",
+                            tools_mod.config_label(config) or "?"))
         current_config = str(section.get("tool_config_id") or "")
         if current_config and all(value != current_config
-                                  for value, _label in config_options):
-            config_options.append((current_config,
-                                   "(unknown configuration)"))
-        self._add_section_combo(
-            row, _SECTION_TOOL_CONFIG_COL, section_id, "tool_config_id",
-            config_options, current_config,
-            "Operating configuration (e.g. jetting vs passive mode) of "
-            "the section's tool.")
+                                  for value, _label in options):
+            options.append((current_config, "(unknown configuration)"))
+        return options
+
+    @staticmethod
+    def _label_for(options: List[tuple], value: str) -> str:
+        return next((label for v, label in options if v == (value or "")),
+                    value or "")
+
+    def _current_tool_display(self, section: Dict) -> tuple:
+        value = str(section.get("tool_id") or "")
+        return value, self._label_for(self._tool_options(section), value)
+
+    def _current_config_display(self, section: Dict) -> tuple:
+        value = str(section.get("tool_config_id") or "")
+        return value, self._label_for(self._config_options(section), value)
+
+    def _section_combo_options(self, index) -> Optional[List[tuple]]:
+        """Delegate hook: choices for a drop-down cell, None if not one."""
+        section = self._section_for_row(index.row())
+        if section is None:
+            return None
+        column = index.column()
+        kind = section.get("kind")
+        editable = kind in (schema.SECTION_BURIAL, schema.SECTION_SKIP)
+        if column == _SECTION_CONCLUSION_COL and editable:
+            return [(c, schema.CONCLUSION_LABELS[c])
+                    for c in [""] + schema.CONCLUSIONS]
+        if column == _SECTION_CONFIDENCE_COL and editable:
+            return [("", "")] + [(v, v) for v in schema.CONFIDENCE_VALUES]
+        if column == _SECTION_TOOL_COL and kind == schema.SECTION_BURIAL:
+            return self._tool_options(section)
+        if column == _SECTION_TOOL_CONFIG_COL \
+                and kind == schema.SECTION_BURIAL:
+            return self._config_options(section)
+        if column == _SECTION_SKIP_HANDLING_COL and kind == schema.SECTION_SKIP:
+            return [(h, schema.SKIP_HANDLING_LABELS[h])
+                    for h in schema.SKIP_HANDLING_VALUES]
+        return None
+
+    def _section_combo_committed(self, index, value: str) -> None:
+        """Delegate hook: one drop-down edit chosen by the user."""
+        field = _SECTION_COMBO_FIELDS.get(index.column())
+        section = self._section_for_row(index.row())
+        if field is None or section is None:
+            return
+        self._deferred_section_edit(section.get("section_id") or "",
+                                    field, value)
 
     def _kind_label(self, kind: str) -> str:
         return schema.section_kind_label(kind, self.model.method)

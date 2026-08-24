@@ -76,7 +76,7 @@ from ..workbench import project_layers as wb_project_layers
 from ..workbench import store as wb_store_module
 from ..workbench.store import WorkbenchStore
 from . import (analysis_task, footprint, generation, map_layers, path_data,
-               profile_data, schema)
+               profile_data, schema, watchdog)
 from . import tools as tools_mod
 from . import ui_helpers
 from .plan_model import PlanModel
@@ -173,6 +173,11 @@ class BurialPlannerDock(QDockWidget):
         self._cursor_outline_pos = None
         self._cursor_outline_timer = None
         self._store_recovery_note = ""
+        # Last highlighted (start, end) → canvas geometry: a row double-click
+        # highlights on selection and again on go-to; slice the route once.
+        self._highlight_cache = None
+        # GUI-thread stall diagnostics (stdlib faulthandler; see watchdog.py).
+        self._watchdog = watchdog.StallWatchdog(parent=self)
 
         saved_path = project_gpkg_path()
         path = saved_path or default_project_gpkg_path()
@@ -338,6 +343,19 @@ class BurialPlannerDock(QDockWidget):
         self.splitter.splitterMoved.connect(self._save_dock_splitter_state)
         outer.addWidget(self.splitter, 1)
         self.setWidget(container)
+        if self._watchdog.start():
+            try:
+                from qgis.core import QgsMessageLog
+
+                from ..qgis_compat import MESSAGE_INFO
+                QgsMessageLog.logMessage(
+                    "Stall watchdog armed: if QGIS stops responding for more "
+                    f"than {self._watchdog.threshold_s:g} s while the Burial "
+                    "Planner is open, all thread stacks are written to "
+                    f"{self._watchdog.log_path}",
+                    "Burial Planner", MESSAGE_INFO)
+            except Exception:
+                pass
 
         self.model.planChanged.connect(self._refresh_strip)
         self.model.planChanged.connect(self._refresh_profile)
@@ -1788,20 +1806,33 @@ class BurialPlannerDock(QDockWidget):
 
     def highlight_range(self, start_kp: float, end_kp: float):
         if self.canvas is None or self.model.route is None:
-            return
-        geom = self.model.route.extract_segment(start_kp, end_kp)
-        if geom is None or geom.isEmpty():
-            return
+            return None
         try:
-            from qgis.core import QgsCoordinateReferenceSystem
+            key = (round(float(start_kp), 9), round(float(end_kp), 9),
+                   self.canvas.mapSettings().destinationCrs().authid(),
+                   id(self.model.route),
+                   round(float(self.model.route.total_length_m), 6))
+        except (TypeError, ValueError, AttributeError, RuntimeError):
+            return None
+        cached = self._highlight_cache
+        if cached is not None and cached[0] == key:
+            geom = cached[1]
+        else:
+            geom = self.model.route.extract_segment(start_kp, end_kp)
+            if geom is None or geom.isEmpty():
+                return None
+            try:
+                from qgis.core import QgsCoordinateReferenceSystem
 
-            transform = QgsCoordinateTransform(
-                QgsCoordinateReferenceSystem("EPSG:4326"),
-                self.canvas.mapSettings().destinationCrs(), QgsProject.instance())
-            geom = type(geom)(geom)
-            geom.transform(transform)
-        except Exception:
-            pass
+                transform = QgsCoordinateTransform(
+                    QgsCoordinateReferenceSystem("EPSG:4326"),
+                    self.canvas.mapSettings().destinationCrs(),
+                    QgsProject.instance())
+                geom = type(geom)(geom)
+                geom.transform(transform)
+            except Exception:
+                pass
+            self._highlight_cache = (key, geom)
         if self._band is None or _sip_isdeleted(self._band):
             self._band = QgsRubberBand(self.canvas, GEOMETRY_LINE)
             self._band.setColor(Qt.GlobalColor.yellow)
@@ -1864,15 +1895,47 @@ class BurialPlannerDock(QDockWidget):
 
     def goto_range(self, start_kp: float, end_kp: float) -> None:
         """Zoom both map and profile to a selected plan section."""
+        try:
+            start_kp = float(start_kp)
+            end_kp = float(end_kp)
+        except (TypeError, ValueError):
+            return
+        if not (math.isfinite(start_kp) and math.isfinite(end_kp)):
+            return
+        if start_kp == end_kp:
+            # A zero-length range has no slice to frame; centre on it instead.
+            self.goto_kp(start_kp)
+            return
         geom = self.highlight_range(start_kp, end_kp)
         self.profile.focus_range(start_kp, end_kp)
         if geom is None or self.canvas is None:
             return
+        self._zoom_to_geometry(geom, 0.12)
+
+    def _zoom_to_geometry(self, geom, pad_fraction: float) -> None:
+        """Frame a canvas-CRS geometry with a sane minimum extent.
+
+        A sliver section (a few metres of route) or a straight north-south
+        run gives a bounding box with a zero dimension; QGIS handles a zero
+        width badly (extreme scales), so the extent never shrinks below
+        ~40 px of the current view or 5 map units.
+        """
         extent = geom.boundingBox()
-        padding = max(extent.width(), extent.height()) * 0.12
-        if padding <= 0:
-            padding = max(float(self.canvas.mapUnitsPerPixel()) * 40.0, 1e-9)
-        extent.grow(padding)
+        if extent.isNull():
+            return
+        size = max(extent.width(), extent.height())
+        if not all(math.isfinite(v) for v in (
+                size, extent.xMinimum(), extent.yMinimum())):
+            return
+        try:
+            min_size = max(float(self.canvas.mapUnitsPerPixel()) * 40.0, 1e-9)
+        except (AttributeError, RuntimeError):
+            min_size = 1e-9
+        if size < min_size:
+            grow = (min_size - size) / 2.0
+            extent.grow(grow)
+            size = min_size
+        extent.grow(size * pad_fraction)
         self.canvas.setExtent(extent)
         self.canvas.refresh()
 
@@ -1883,10 +1946,7 @@ class BurialPlannerDock(QDockWidget):
         self.profile.reset_scope_view()
         geom = self.highlight_range(scope.start_km, scope.end_km)
         if geom is not None and self.canvas is not None:
-            extent = geom.boundingBox()
-            extent.grow(max(extent.width(), extent.height()) * 0.05)
-            self.canvas.setExtent(extent)
-            self.canvas.refresh()
+            self._zoom_to_geometry(geom, 0.05)
 
     # -- window management ----------------------------------------------------
     def apply_saved_window_mode(self) -> None:
@@ -1960,6 +2020,10 @@ class BurialPlannerDock(QDockWidget):
     def shutdown(self) -> None:
         """Transient artefacts only — never deletes data or registry rows."""
         self._save_window_state()  # unload may bypass closeEvent
+        try:
+            self._watchdog.stop()
+        except (AttributeError, RuntimeError):
+            pass
         try:
             self.cancel_analysis()
         except (AttributeError, RuntimeError):

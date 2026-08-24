@@ -63,6 +63,215 @@ _STRIP_STYLES = {
 }
 
 
+class RangeBandItem(pg.GraphicsObject):
+    """Every KP range of one kind, painted in a single item.
+
+    One ``LinearRegionItem`` per range meant thousands of graphics items on
+    plans with many slivers (edge-of-bathymetry Insufficient Information
+    ranges, one strip rectangle per section): every zoom re-laid-out each of
+    them and the auto-range walked them all. This item keeps the ranges as
+    plain tuples, paints only those inside the visible KP window, and
+    contributes nothing to auto-range (as the region items did on the y
+    axis). ``labels_at(kp)`` replaces the per-region tooltips — the profile
+    readout lists the ranges under the crosshair.
+    """
+
+    def __init__(self, brush=None, pen=None):
+        super().__init__()
+        self._ranges: List[Tuple[float, float, str, object]] = []
+        self._starts: List[float] = []
+        self._max_len = 0.0
+        self._brush = pg.mkBrush(brush) if brush is not None else None
+        self._pen = pg.mkPen(pen) if pen is not None else None
+        self._xmin = 0.0
+        self._xmax = 0.0
+
+    def set_ranges(self, ranges) -> None:
+        """``ranges``: iterable of ``(start, end, label[, brush])``."""
+        cleaned = []
+        for entry in ranges or []:
+            try:
+                start = float(entry[0])
+                end = float(entry[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if not (math.isfinite(start) and math.isfinite(end)):
+                continue
+            lo, hi = (start, end) if start <= end else (end, start)
+            label = entry[2] if len(entry) > 2 else ""
+            brush = (pg.mkBrush(entry[3])
+                     if len(entry) > 3 and entry[3] is not None else None)
+            cleaned.append((lo, hi, label, brush))
+        cleaned.sort(key=lambda r: (r[0], r[1]))
+        self._ranges = cleaned
+        self._starts = [r[0] for r in cleaned]
+        self._max_len = max((r[1] - r[0] for r in cleaned), default=0.0)
+        self._xmin = cleaned[0][0] if cleaned else 0.0
+        self._xmax = max((r[1] for r in cleaned), default=0.0)
+        self.prepareGeometryChange()
+        self.update()
+
+    def ranges(self):
+        return [(lo, hi, label) for lo, hi, label, _b in self._ranges]
+
+    def _visible(self, lo: float, hi: float):
+        """Ranges overlapping [lo, hi] (sorted by start; bounded scan)."""
+        import bisect
+
+        first = bisect.bisect_left(self._starts, lo - self._max_len)
+        for index in range(first, len(self._ranges)):
+            start, end, label, brush = self._ranges[index]
+            if start > hi:
+                break
+            if end >= lo:
+                yield start, end, label, brush
+
+    def labels_at(self, kp: float) -> List[str]:
+        return [label for _s, _e, label, _b in self._visible(kp, kp)
+                if label]
+
+    def boundingRect(self):
+        if not self._ranges:
+            return QRectF()
+        view = self.viewRect()
+        if view is None:
+            return QRectF()
+        rect = QRectF(view)
+        rect.setLeft(self._xmin)
+        rect.setRight(self._xmax)
+        return rect
+
+    def dataBounds(self, axis, frac=1.0, orthoRange=None):
+        return None  # never drives auto-range (matches the y behaviour before)
+
+    def viewRangeChanged(self) -> None:
+        self.prepareGeometryChange()
+        self.update()
+
+    def paint(self, painter, *_args) -> None:
+        if not self._ranges:
+            return
+        view = self.viewRect()
+        if view is None:
+            return
+        top, height = view.top(), view.height()
+        painter.setPen(self._pen if self._pen is not None
+                       else pg.mkPen(None))
+        default_brush = (self._brush if self._brush is not None
+                         else pg.mkBrush(None))
+        for start, end, _label, brush in self._visible(view.left(),
+                                                       view.right()):
+            painter.setBrush(brush if brush is not None else default_brush)
+            painter.drawRect(QRectF(start, top, end - start, height))
+
+
+class EventMarkerItem(pg.GraphicsObject):
+    """Read-only event markers (line + label) painted from one item.
+
+    An ``InfiniteLine`` with an ``InfLineLabel`` per event cost ~1.3 ms each
+    to build, on every event edit and plan load; a few hundred events made
+    each refresh a visible stall. This item keeps ``(kp, pen, label,
+    row)`` tuples, paints the lines inside the visible KP window and draws
+    labels in device space (unscaled text) only while few enough events are
+    visible for the labels to be readable. Draggable lines are still used
+    in edit mode, where the user explicitly opts into per-event handles.
+    """
+
+    LABEL_LIMIT = 60  # labels are drawn only when at most this many are visible
+
+    def __init__(self):
+        super().__init__()
+        self._events: List[Tuple[float, object, str, int]] = []
+        self._kps: List[float] = []
+        self._font = None
+
+    def set_events(self, events) -> None:
+        """``events``: iterable of ``(kp, pen, label, row)``; row 0/1 stacks
+        labels so a start and an end at nearby KPs do not overprint."""
+        cleaned = []
+        for kp, pen, label, row in events or ():
+            try:
+                kp = float(kp)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(kp):
+                continue
+            cleaned.append((kp, pen, str(label or ""), int(row or 0)))
+        cleaned.sort(key=lambda e: e[0])
+        self._events = cleaned
+        self._kps = [e[0] for e in cleaned]
+        self.prepareGeometryChange()
+        self.update()
+
+    def count(self) -> int:
+        return len(self._events)
+
+    def _visible(self, lo: float, hi: float):
+        import bisect
+
+        first = bisect.bisect_left(self._kps, lo)
+        for index in range(first, len(self._events)):
+            entry = self._events[index]
+            if entry[0] > hi:
+                break
+            yield entry
+
+    def boundingRect(self):
+        if not self._events:
+            return QRectF()
+        view = self.viewRect()
+        if view is None:
+            return QRectF()
+        rect = QRectF(view)
+        rect.setLeft(self._kps[0])
+        rect.setRight(self._kps[-1])
+        return rect
+
+    def dataBounds(self, axis, frac=1.0, orthoRange=None):
+        return None
+
+    def viewRangeChanged(self) -> None:
+        self.prepareGeometryChange()
+        self.update()
+
+    def paint(self, painter, *_args) -> None:
+        if not self._events:
+            return
+        view = self.viewRect()
+        if view is None:
+            return
+        from qgis.PyQt.QtCore import QPointF
+
+        top, bottom = view.top(), view.bottom()
+        visible = list(self._visible(view.left(), view.right()))
+        for kp, pen, _label, _row in visible:
+            painter.setPen(pen)
+            painter.drawLine(QPointF(kp, top), QPointF(kp, bottom))
+        if not visible or len(visible) > self.LABEL_LIMIT:
+            return
+        # Labels in device space so text is never scaled by the view.
+        transform = painter.transform()
+        device_top = min(transform.map(QPointF(view.left(), top)).y(),
+                         transform.map(QPointF(view.left(), bottom)).y())
+        painter.save()
+        try:
+            painter.resetTransform()
+            if self._font is None:
+                self._font = painter.font()
+                self._font.setPointSizeF(max(7.0, self._font.pointSizeF() - 1))
+            painter.setFont(self._font)
+            line_h = painter.fontMetrics().height()
+            for kp, pen, label, row in visible:
+                if not label:
+                    continue
+                x = transform.map(QPointF(kp, top)).x()
+                y = device_top + 4 + line_h * (row + 1)
+                painter.setPen(pen.color())
+                painter.drawText(QPointF(x + 3, y), label)
+        finally:
+            painter.restore()
+
+
 class BurialProfileWidget(QWidget):
     kpHovered = pyqtSignal(float)
     kpClicked = pyqtSignal(float)
@@ -232,8 +441,18 @@ class BurialProfileWidget(QWidget):
         self._readout.setVisible(False)
         item.addItem(self._readout)
 
-        self._regions: List = []
+        # One band item per overlay kind (see RangeBandItem).
+        self._regions: Dict[str, RangeBandItem] = {}
+        for kind, (brush, pen) in _REGION_STYLES.items():
+            band = RangeBandItem(brush=brush, pen=pen)
+            band.setZValue(2 if kind == "excluded" else 1)
+            item.addItem(band, ignoreBounds=True)
+            self._regions[kind] = band
         self._event_lines: List = []
+        # Read-only markers: one painted item (see EventMarkerItem).
+        self._event_markers = EventMarkerItem()
+        self._event_markers.setZValue(10)
+        item.addItem(self._event_markers, ignoreBounds=True)
         self._series: List[Tuple[float, float]] = []
         # Cached KP arrays for the crosshair lookups: rebuilding these lists
         # (up to ~500k floats, three or four times) on EVERY mouse move was
@@ -262,7 +481,8 @@ class BurialProfileWidget(QWidget):
         self._strip_vb.setXLink(item.vb)
         self._strip_vb.enableAutoRange(x=False, y=False)
         self._strip_vb.setYRange(0.0, 1.0, padding=0)
-        self._strip_items: List = []
+        self._strip_band = RangeBandItem()
+        self._strip_vb.addItem(self._strip_band, ignoreBounds=True)
         item.vb.sigResized.connect(self._position_strip)
         self._position_strip()
 
@@ -360,35 +580,19 @@ class BurialProfileWidget(QWidget):
         self._curve.setData(xs, ys, connect="finite")
 
     def set_overlays(self, context: generation.ResolutionContext) -> None:
-        item = self.plot.getPlotItem()
-        for region in self._regions:
-            item.removeItem(region)
-        self._regions = []
-
-        def add(kind: str, start: float, end: float, tooltip: str = ""):
-            brush, pen = _REGION_STYLES[kind]
-            region = pg.LinearRegionItem(values=(start, end), movable=False,
-                                         brush=pg.mkBrush(brush),
-                                         pen=pg.mkPen(pen))
-            region.setZValue(2 if kind == "excluded" else 1)
-            if tooltip:
-                try:
-                    region.setToolTip(tooltip)
-                except Exception:
-                    pass
-            item.addItem(region)
-            self._regions.append(region)
-
-        for verdict in context.excluded:
-            add("excluded", verdict.start_km, verdict.end_km, "Exclusion Area")
-        for verdict in context.screening:
-            add("screening", verdict.start_km, verdict.end_km,
-                "Screening Criterion — flags for assessment")
-        for zone in context.influence:
-            add("influence", zone.start_km, zone.end_km,
-                f"Constraint Influence Zone of {zone.rule_name}")
-        for iv in context.insufficient:
-            add("insufficient", iv.start_km, iv.end_km, "Insufficient Information")
+        self._regions["excluded"].set_ranges(
+            (v.start_km, v.end_km, "Exclusion Area")
+            for v in context.excluded)
+        self._regions["screening"].set_ranges(
+            (v.start_km, v.end_km, "Screening Criterion — flags for assessment")
+            for v in context.screening)
+        self._regions["influence"].set_ranges(
+            (z.start_km, z.end_km,
+             f"Constraint Influence Zone of {z.rule_name}")
+            for z in context.influence)
+        self._regions["insufficient"].set_ranges(
+            (iv.start_km, iv.end_km, "Insufficient Information")
+            for iv in context.insufficient)
 
     def set_slope_visible(self, visible: bool) -> None:
         self._slope_pane.setVisible(bool(visible))
@@ -434,9 +638,7 @@ class BurialProfileWidget(QWidget):
 
     def set_sections(self, sections: List[Dict]) -> None:
         """Colour the top strip with the plan outcome (burial/skip/insufficient)."""
-        for strip_item in self._strip_items:
-            self._strip_vb.removeItem(strip_item)
-        self._strip_items = []
+        ranges = []
         for section in sections or []:
             style = _STRIP_STYLES.get(section.get("kind") or "")
             if style is None:
@@ -447,28 +649,36 @@ class BurialProfileWidget(QWidget):
             except (TypeError, ValueError):
                 continue
             color, label = style
-            region = pg.LinearRegionItem(values=(start, end), movable=False,
-                                         brush=pg.mkBrush(color),
-                                         pen=pg.mkPen(color))
-            tooltip = (f"{label} KP {schema.format_kp(start)}-"
-                       f"{schema.format_kp(end)}")
+            text = (f"{label} KP {schema.format_kp(start)}-"
+                    f"{schema.format_kp(end)}")
             conclusion = schema.CONCLUSION_LABELS.get(
                 section.get("conclusion") or "", "")
             if conclusion:
-                tooltip += f" — {conclusion}"
-            try:
-                region.setToolTip(tooltip)
-            except Exception:
-                pass
-            self._strip_vb.addItem(region)
-            self._strip_items.append(region)
+                text += f" — {conclusion}"
+            ranges.append((start, end, text, color))
+        self._strip_band.set_ranges(ranges)
+
+    def overlay_labels_at(self, kp: float) -> List[str]:
+        """Overlay/section descriptions under a KP (the old region tooltips)."""
+        labels: List[str] = []
+        for kind in ("excluded", "screening", "influence", "insufficient"):
+            for label in self._regions[kind].labels_at(kp):
+                if label not in labels:
+                    labels.append(label)
+        labels.extend(self._strip_band.labels_at(kp))
+        return labels
 
     def set_events(self, events: List[Dict], method: str, editable: bool = False) -> None:
+        """Event markers: one painted item normally; draggable lines in
+        edit mode (the profile drag toggle), where per-event handles are
+        the point."""
         item = self.plot.getPlotItem()
         for line in self._event_lines:
             item.removeItem(line)
         self._event_lines = []
         self._editable = editable
+        painted = []
+        lo, hi = self._scope
         for event in events:
             try:
                 kp = float(event.get("kp"))
@@ -486,19 +696,21 @@ class BurialProfileWidget(QWidget):
                 else _PEN_STYLE.DashLine
             label = ev.event_label(event.get("event_type") or "", method)
             marker = "▼" if is_start else "▲"
+            text = f"{marker} {label} {schema.format_kp(kp)}"
+            pen = pg.mkPen(color, width=2, style=style)
             movable = editable and not int(event.get("locked") or 0)
+            if not editable:
+                painted.append((kp, pen, text, 0 if is_start else 1))
+                continue
             try:
                 line = pg.InfiniteLine(
-                    pos=kp, angle=90, movable=movable,
-                    pen=pg.mkPen(color, width=2, style=style),
-                    label=f"{marker} {label} {schema.format_kp(kp)}",
+                    pos=kp, angle=90, movable=movable, pen=pen, label=text,
                     labelOpts={"position": 0.92 if is_start else 0.84,
                                "color": color, "movable": False})
             except TypeError:  # older pyqtgraph without label kwargs
                 line = pg.InfiniteLine(pos=kp, angle=90, movable=movable,
-                                       pen=pg.mkPen(color, width=2, style=style))
+                                       pen=pen)
             line.setZValue(10)
-            lo, hi = self._scope
             if hi > lo and movable:
                 line.setBounds((lo, hi))
             line._bp_event_id = event.get("event_id") or ""
@@ -507,6 +719,7 @@ class BurialProfileWidget(QWidget):
                 line.sigPositionChangeFinished.connect(self._on_line_moved)
             item.addItem(line, ignoreBounds=True)
             self._event_lines.append(line)
+        self._event_markers.set_events(painted)
 
     def revert_event_line(self, event_id: str) -> None:
         """Snap a dragged line back after a rejected move."""
@@ -646,11 +859,13 @@ class BurialProfileWidget(QWidget):
                     value = self._slope_series_value_at(key, kp)
                     if value is not None:
                         lines.append(fmt.format(value))
+            lines.extend(self.overlay_labels_at(kp)[:4])
             self._readout.setText("\n".join(lines))
             self._readout.setPos(kp, sample[1])
             self._readout.setVisible(True)
         else:
-            self._readout.setText(lines[0])
+            lines.extend(self.overlay_labels_at(kp)[:4])
+            self._readout.setText("\n".join(lines))
             self._readout.setVisible(True)
 
     def _emit_hover(self) -> None:

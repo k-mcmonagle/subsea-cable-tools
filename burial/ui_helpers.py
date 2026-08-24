@@ -11,13 +11,18 @@
   position across a full rebuild.
 - ``menu_tool_button``: collapse several related actions into one compact
   drop-down button (narrow-dock layout).
+- ``enable_column_menu``: header right-click column visibility, persisted
+  by label with optional default-hidden columns.
+- ``ComboColumnDelegate``: drop-down cells painted from item data (one
+  editor on demand instead of a ``QComboBox`` widget per row).
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Callable, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
+from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QColor, QPalette
 from qgis.PyQt.QtWidgets import (
     QApplication,
@@ -29,6 +34,7 @@ from qgis.PyQt.QtWidgets import (
     QLabel,
     QLineEdit,
     QMenu,
+    QStyledItemDelegate,
     QToolButton,
     QVBoxLayout,
 )
@@ -245,6 +251,28 @@ def preserve_table_view(table, id_column: int = 0):
     table.horizontalScrollBar().setValue(h_scroll)
 
 
+@contextmanager
+def silent_rebuild(table):
+    """Block per-item signals and repaints while a table is rebuilt.
+
+    ``setItem`` emits ``itemChanged``/``cellChanged`` per cell and repaints
+    per row; a full rebuild of a large table delivered thousands of slots
+    that only checked a ``_loading`` flag. Selection-model signals are left
+    to ``preserve_table_view``.
+    """
+    blocked = table.blockSignals(True)
+    table.setUpdatesEnabled(False)
+    try:
+        yield
+    finally:
+        table.setUpdatesEnabled(True)
+        table.blockSignals(blocked)
+        try:
+            table.viewport().update()
+        except (AttributeError, RuntimeError):
+            pass
+
+
 def coalesced(parent, fn: Callable, interval_ms: int = 0) -> Callable:
     """A slot that runs ``fn`` once per event-loop burst.
 
@@ -268,12 +296,27 @@ def coalesced(parent, fn: Callable, interval_ms: int = 0) -> Callable:
     return trigger
 
 
+def _column_labels(table) -> List[str]:
+    labels = []
+    for column in range(table.columnCount()):
+        item = table.horizontalHeaderItem(column)
+        labels.append(item.text() if item is not None else f"Column {column + 1}")
+    return labels
+
+
 def enable_column_menu(table, settings_key: str,
-                       always_visible: Sequence[int] = (0,)) -> None:
+                       always_visible: Sequence[int] = (0,),
+                       default_hidden: Sequence[str] = ()) -> None:
     """Right-click on a table header toggles column visibility (persisted).
 
     The narrow-dock escape hatch for wide tables: secondary columns can be
     hidden per machine without losing them for good.
+
+    Visibility is persisted by *header label*, so inserting a column in a
+    later version never re-targets a saved choice at the wrong column. A
+    column the saved state has never seen follows ``default_hidden`` (labels
+    of optional columns that start hidden — e.g. positions and reverse KP);
+    legacy index lists are honoured on tables whose columns did not change.
     """
     import json
 
@@ -284,17 +327,19 @@ def enable_column_menu(table, settings_key: str,
     header = table.horizontalHeader()
     header.setContextMenuPolicy(CONTEXT_MENU_POLICY_CUSTOM)
     header.setToolTip("Right-click to choose which columns are shown.")
+    labels = _column_labels(table)
+    default_hidden = set(default_hidden or ())
 
     def save() -> None:
-        hidden = [column for column in range(table.columnCount())
-                  if table.isColumnHidden(column)]
-        QSettings().setValue(settings_key, json.dumps(hidden))
+        hidden = [labels[column] for column in range(table.columnCount())
+                  if table.isColumnHidden(column) and column < len(labels)]
+        QSettings().setValue(settings_key, json.dumps(
+            {"hidden": hidden, "known": labels}))
 
     def show_menu(position) -> None:
         menu = QMenu(table)
         for column in range(table.columnCount()):
-            item = table.horizontalHeaderItem(column)
-            label = item.text() if item is not None else str(column + 1)
+            label = labels[column] if column < len(labels) else ""
             action = menu.addAction(label or f"Column {column + 1}")
             action.setCheckable(True)
             action.setChecked(not table.isColumnHidden(column))
@@ -303,20 +348,168 @@ def enable_column_menu(table, settings_key: str,
             action.toggled.connect(
                 lambda checked, c=column:
                 (table.setColumnHidden(c, not checked), save()))
+        menu.addSeparator()
+
+        def show_all() -> None:
+            for column in range(table.columnCount()):
+                table.setColumnHidden(column, False)
+            save()
+
+        def reset() -> None:
+            for column in range(table.columnCount()):
+                table.setColumnHidden(
+                    column, column not in always_visible
+                    and labels[column] in default_hidden)
+            save()
+
+        menu.addAction("Show all columns", show_all)
+        menu.addAction("Reset to default columns", reset)
         qt_exec(menu, header.mapToGlobal(position))
 
     header.customContextMenuRequested.connect(show_menu)
+    apply_saved_column_visibility(table, settings_key, always_visible,
+                                  default_hidden)
+
+
+def apply_saved_column_visibility(table, settings_key: str,
+                                  always_visible: Sequence[int] = (0,),
+                                  default_hidden: Sequence[str] = ()) -> None:
+    """Restore column visibility saved by ``enable_column_menu``."""
+    import json
+
+    from qgis.PyQt.QtCore import QSettings
+
+    labels = _column_labels(table)
+    default_hidden = set(default_hidden or ())
+    raw = QSettings().value(settings_key)
+    hidden_labels = None
+    known = set()
     try:
-        hidden = json.loads(QSettings().value(settings_key) or "[]")
+        saved = json.loads(raw) if raw else None
     except (ValueError, TypeError):
-        hidden = []
-    for column in hidden:
-        try:
-            column = int(column)
-        except (TypeError, ValueError):
+        saved = None
+    if isinstance(saved, dict):
+        hidden_labels = {str(v) for v in (saved.get("hidden") or [])}
+        known = {str(v) for v in (saved.get("known") or [])}
+    elif isinstance(saved, list):
+        # Legacy index list (pre-label persistence).
+        hidden_labels = set()
+        for column in saved:
+            try:
+                column = int(column)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= column < len(labels):
+                hidden_labels.add(labels[column])
+        known = set(labels)
+    for column, label in enumerate(labels):
+        if column in always_visible:
+            table.setColumnHidden(column, False)
             continue
-        if column not in always_visible and column < table.columnCount():
-            table.setColumnHidden(column, True)
+        if hidden_labels is not None and label in known:
+            table.setColumnHidden(column, label in hidden_labels)
+        else:
+            table.setColumnHidden(column, label in default_hidden)
+
+
+# Item data roles used by ComboColumnDelegate (ints: Qt6 enums do not
+# support arithmetic, and setData/data accept plain ints on both bindings).
+COMBO_VALUE_ROLE = int(ITEM_DATA_USER_ROLE) + 16
+COMBO_FLAG_ROLE = int(ITEM_DATA_USER_ROLE) + 17
+
+
+class ComboColumnDelegate(QStyledItemDelegate):
+    """Drop-down cells without a ``QComboBox`` widget per row.
+
+    A ``setCellWidget`` combo per row costs a real widget (create, style,
+    lay out, destroy on every rebuild) — thousands of rows froze the GUI for
+    the duration of every refresh. The delegate paints the current label
+    plus a drop-down arrow from item data and only creates a combo for the
+    cell being edited; a single click on the cell opens it with its popup.
+
+    ``options_for(index)`` returns ``[(value, label), ...]`` for an index or
+    ``None`` when the cell is not a drop-down; ``on_commit(index, value)``
+    is called after the item's text/value are updated.
+    """
+
+    def __init__(self, table, options_for: Callable, on_commit: Callable,
+                 parent=None):
+        super().__init__(parent or table)
+        self._table = table
+        self._options_for = options_for
+        self._on_commit = on_commit
+        table.clicked.connect(self._open_on_click)
+
+    @staticmethod
+    def mark_item(item, value: str, label: str) -> None:
+        """Stamp a table item as a drop-down cell showing ``label``."""
+        item.setText(label)
+        item.setData(COMBO_VALUE_ROLE, value or "")
+        item.setData(COMBO_FLAG_ROLE, True)
+
+    def _open_on_click(self, index) -> None:
+        if index.isValid() and bool(index.data(COMBO_FLAG_ROLE)):
+            self._table.edit(index)
+
+    def createEditor(self, parent, option, index):
+        options = self._options_for(index)
+        if options is None:
+            return None
+        from qgis.PyQt.QtWidgets import QComboBox
+
+        combo = QComboBox(parent)
+        for value, label in options:
+            combo.addItem(label, value)
+        combo.activated.connect(lambda _i, c=combo: self._commit(c))
+        return combo
+
+    def _commit(self, combo) -> None:
+        self.commitData.emit(combo)
+        self.closeEditor.emit(combo)
+
+    def setEditorData(self, editor, index) -> None:
+        current = index.data(COMBO_VALUE_ROLE)
+        position = editor.findData(current if current is not None else "")
+        editor.setCurrentIndex(max(0, position))
+        from qgis.PyQt.QtCore import QTimer
+
+        QTimer.singleShot(0, editor.showPopup)
+
+    def setModelData(self, editor, model, index) -> None:
+        value = editor.currentData()
+        value = "" if value is None else str(value)
+        if str(index.data(COMBO_VALUE_ROLE) or "") == value:
+            return
+        model.setData(index, editor.currentText())
+        model.setData(index, value, COMBO_VALUE_ROLE)
+        self._on_commit(index, value)
+
+    def paint(self, painter, option, index) -> None:
+        is_combo = bool(index.data(COMBO_FLAG_ROLE))
+        if is_combo:
+            # Reserve the arrow gutter so long labels elide before it.
+            option.rect.setRight(option.rect.right() - 14)
+        super().paint(painter, option, index)
+        if not is_combo:
+            return
+        rect = option.rect
+        rect.setRight(rect.right() + 14)
+        size = max(3, min(5, rect.height() // 4))
+        cx = rect.right() - size - 4
+        cy = rect.center().y()
+        from qgis.PyQt.QtCore import QPointF
+        from qgis.PyQt.QtGui import QPolygonF
+
+        arrow = QPolygonF([QPointF(cx - size, cy - size / 2.0),
+                           QPointF(cx + size, cy - size / 2.0),
+                           QPointF(cx, cy + size / 2.0)])
+        painter.save()
+        try:
+            painter.setPen(getattr(Qt, "PenStyle", Qt).NoPen)
+            painter.setBrush(option.palette.text())
+            painter.drawPolygon(arrow)
+        finally:
+            painter.restore()
 
 
 def menu_tool_button(text: str,

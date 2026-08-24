@@ -28,6 +28,7 @@ KP semantics
 from __future__ import annotations
 
 import bisect
+import math
 import threading
 from typing import Iterable, Iterator, List, NamedTuple, Optional, Sequence, Union
 
@@ -833,15 +834,20 @@ class RouteFrame:
     def extract_segment(self, start_kp_km: float, end_kp_km: float) -> Optional[QgsGeometry]:
         """Extract a sub-line between two KPs across the whole route.
 
-        Walks features in order, slicing the first feature at ``start_kp`` and
-        the last feature at ``end_kp``, returning a single LineString. Returns
-        ``None`` if the range is invalid or fully outside the route.
+        Uses the same per-segment chainage index as ``point_at_kp`` (built
+        once, then a bisect per call) instead of re-walking every vertex with
+        a geodesic measurement on each call — highlighting a section near the
+        end of a long dense route used to cost a full-route walk, twice per
+        double-click. Returns a single LineString, or ``None`` if the range
+        is invalid or fully outside the route.
         """
 
         try:
             s = float(start_kp_km)
             e = float(end_kp_km)
         except Exception:
+            return None
+        if not (math.isfinite(s) and math.isfinite(e)):
             return None
         if s == e:
             return None
@@ -852,45 +858,56 @@ class RouteFrame:
         end_m = e * 1000.0
         if end_m <= 0 or start_m >= self._total_m:
             return None
+        self._ensure_chainage()
+        segs = self._segs
+        if not segs:
+            return None
         start_m = max(0.0, start_m)
-        end_m = min(self._total_m, end_m)
+        end_m = min(self._total_m, self._chain_total_m, end_m)
+        if end_m <= start_m:
+            return None
 
-        # Single-feature fast path.
-        if len(self._geoms) == 1:
-            return extract_line_segment(
-                self._geoms[0], start_m / 1000.0, end_m / 1000.0, self._distance,
-                follow_stored_geometry=self._follow_stored_geometry)
+        seg_end = self._seg_end_m
+        first = bisect.bisect_left(seg_end, start_m)
+        last = bisect.bisect_left(seg_end, end_m)
+        first = min(first, len(segs) - 1)
+        last = min(last, len(segs) - 1)
 
-        # Multi-feature: collect points across affected features.
+        def interp(p1, p2, along_m, seg_len):
+            point = (_interpolate_on_stored_segment(p1, p2, along_m, seg_len)
+                     if self._follow_stored_geometry else
+                     _interpolate_on_segment(p1, p2, self._distance,
+                                             along_m, seg_len))
+            try:
+                return p1.__class__(point.x(), point.y())
+            except Exception:
+                return type(p1)(point.x(), point.y())
+
         points: List = []
-        for idx, geom in enumerate(self._geoms):
-            f_start = self._offsets_m[idx]
-            f_end = f_start + self._feature_lengths_m[idx]
-            if f_end <= start_m or f_start >= end_m:
-                continue
-            local_start_km = max(0.0, start_m - f_start) / 1000.0
-            local_end_km = min(self._feature_lengths_m[idx], end_m - f_start) / 1000.0
-            sub = extract_line_segment(
-                geom, local_start_km, local_end_km, self._distance,
-                follow_stored_geometry=self._follow_stored_geometry)
-            if sub is None or sub.isEmpty():
-                continue
-            for part in iter_line_parts(sub):
-                if not part:
-                    continue
-                if points and part:
-                    # Avoid duplicating the join vertex when consecutive
-                    # features share an endpoint.
-                    last = points[-1]
-                    first = part[0]
-                    if abs(float(last.x()) - float(first.x())) < 1e-12 and abs(float(last.y()) - float(first.y())) < 1e-12:
-                        points.extend(part[1:])
-                        continue
-                points.extend(part)
+        p1, p2, seg_len, cum_start = segs[first]
+        points.append(interp(p1, p2, start_m - cum_start, seg_len))
+        last_vertex = p2
+        if first == last:
+            points.append(interp(p1, p2, end_m - cum_start, seg_len))
+        else:
+            points.append(p2)
+            for index in range(first + 1, last):
+                p1, p2, _seg_len, _cum = segs[index]
+                if (abs(float(p1.x()) - float(last_vertex.x())) >= 1e-12
+                        or abs(float(p1.y()) - float(last_vertex.y())) >= 1e-12):
+                    # Discontinuity between features/parts: keep the jump
+                    # vertex so the slice mirrors the stored route.
+                    points.append(p1)
+                points.append(p2)
+                last_vertex = p2
+            p1, p2, seg_len, cum_start = segs[last]
+            if (abs(float(p1.x()) - float(last_vertex.x())) >= 1e-12
+                    or abs(float(p1.y()) - float(last_vertex.y())) >= 1e-12):
+                points.append(p1)
+            points.append(interp(p1, p2, end_m - cum_start, seg_len))
 
         if len(points) < 2:
             return None
-
         try:
             return QgsGeometry.fromPolyline(points)
         except Exception:
