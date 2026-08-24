@@ -79,6 +79,43 @@ section references in brackets.
   with all other curation. One undoable change-log entry carries the
   plan, generation, event and section rows together.
 
+- **II resolution has a target kind, but never a new section kind**:
+  resolving an II range as *burial* stores the same `params_json` entry
+  with a `"burial"` third element (legacy two-element entries stay skip;
+  overlapping re-resolutions paint latest-wins), rejoins the range to the
+  candidates on Generate (exclusions still win over it), and tags the
+  resulting burial section `insufficient_override` in `reason_json` —
+  the plan vocabulary stays strictly burial/skip/II, so no renderer,
+  editor, CSV or migration surface changes, older plugin versions degrade
+  a burial entry to a skip dismissal instead of erroring, and the data
+  gap stays permanently visible on a section the engineer chose to bury.
+  The interactive edit is boundary-event surgery
+  (`events.resolve_insufficient_events`): the union of burial ranges with
+  the selected II ranges determines the target coverage, seam events
+  inside a merged component are removed (locked aborts), missing edge
+  events are created as manual candidates (superseded in place by the
+  next Generate's identical boundaries). Merging II rows into a burial
+  neighbour records a burial resolution for the same reason — recording
+  it as a skip dismissal made the next Generate silently revert the
+  merge. Bulk resolution (the length-threshold dialog) reuses the same
+  single-entry write path, so any number of slivers resolve as one
+  undoable edit; the threshold is user-entered (no shipped engineering
+  value).
+
+- **The Data coverage check is a rule kind (`data_coverage`), not a new
+  subsystem**: it rides the rule stack's acquisition, caching, enable
+  toggle, scope ranges and fire bars, but contributes only *no-data*
+  (footprint always empty), so it can never exclude and needs no engine
+  changes — resolve simply unions its complement into the II class.
+  Sources: the configured bathymetry's no-sample stations (so bathy gaps
+  surface as II even in a plan with no depth/slope criterion), or a
+  registered polygon input via the existing `polygon_class_intervals`
+  with no class filter (optional expression). Its fire bar shows the
+  missing ranges (II grey) — what the rule asserts — and the risk
+  profile was rejected as a home because hazards never change the
+  section partition. The kind is Burial-Planner-only; older plugin
+  versions skip it with the standard unknown-kind per-rule warning.
+
 - **Rollback mechanics**: every change-log entry stores the affected rows per
   table in `before_json`/`after_json`; rollback inverts entries newest-first
   (delete rows added, restore rows before). Simple, exact, and testable

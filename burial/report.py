@@ -106,6 +106,12 @@ def section_reason_text(section: Dict) -> str:
         parts.append("Insufficient Information")
     if reason.get("insufficient_dismissed"):
         parts.append("no data (Insufficient Information dismissed)")
+    overrides = reason.get("insufficient_override") or []
+    if overrides:
+        ranges = ", ".join(f"KP {_kp(entry[0])}-{_kp(entry[1])}"
+                           for entry in overrides if len(entry) >= 2)
+        parts.append(f"no data over {ranges} — Insufficient Information "
+                     "resolved as burial by engineer")
     if reason.get("manual"):
         parts.append("manual")
     if reason.get("dangling_start"):
@@ -183,6 +189,16 @@ def rule_condition_text(rule: Dict) -> str:
         ranges = config.get("ranges") or []
         parts.append(", ".join(f"{_kp(r.get('start_kp'))}-{_kp(r.get('end_kp'))}"
                                for r in ranges) or "no ranges")
+    elif kind == schema.RULE_KIND_COVERAGE:
+        source = (config.get("coverage_source") or "bathymetry").lower()
+        if source == "polygon":
+            parts.append("route outside the coverage polygons -> "
+                         "Insufficient Information")
+            if config.get("match_expression"):
+                parts.append(f"filter: {config['match_expression']}")
+        else:
+            parts.append("bathymetry stations without a depth sample -> "
+                         "Insufficient Information")
     from . import generation as _generation
 
     ext = _generation.extension_config(config)

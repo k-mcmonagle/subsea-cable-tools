@@ -313,6 +313,103 @@ def opposite_section_boundary_specs(section_kind: str, start_kp: float,
     return list(zip(types, travel_kps))
 
 
+def resolve_insufficient_events(events: List[Dict], sections: List[Dict],
+                                section_ids: List[str], direction: int
+                                ) -> Tuple[List[Dict], List[Tuple[str, float]],
+                                           List[str]]:
+    """Boundary-event surgery turning selected II ranges into burial ranges.
+
+    The desired burial coverage is the union of the current burial sections
+    with the selected Insufficient Information ranges (abutting ranges
+    coalesce, so a resolved range merges with its burial neighbours into
+    one section). Within every union component touching a selected range:
+
+    - boundary events strictly inside the component are removed (they are
+      seams being merged away; a locked one aborts with a clear message);
+    - a component edge without an existing boundary event gets a new one,
+      returned as ``(event_type, kp)`` specs for the caller to create
+      (direction −1 reverses which edge is the start).
+
+    Burial sections in untouched components keep their events unchanged.
+    Returns ``(remaining_events, new_event_specs, removed_event_ids)``.
+    """
+    wanted = {str(section_id) for section_id in section_ids if section_id}
+    selected = [section for section in sections
+                if str(section.get("section_id") or "") in wanted]
+    if len(selected) != len(wanted) or not selected:
+        raise ValueError("Section not found.")
+    if any(section.get("kind") != schema.SECTION_INSUFFICIENT
+           for section in selected):
+        raise ValueError(
+            "Only Insufficient Information sections can be resolved.")
+    ii_ranges = [(float(section.get("start_kp") or 0.0),
+                  float(section.get("end_kp") or 0.0))
+                 for section in selected]
+    burial_ranges = [(float(section.get("start_kp") or 0.0),
+                      float(section.get("end_kp") or 0.0))
+                     for section in sections
+                     if section.get("kind") == schema.SECTION_BURIAL]
+
+    # Union with abutting merge (sections tile the scope, so a resolved
+    # range and its burial neighbour share an exact boundary KP).
+    merged: List[List[float]] = []
+    for lo, hi in sorted(ii_ranges + burial_ranges):
+        if merged and lo <= merged[-1][1] + _BOUNDARY_TOL:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    affected = [component for component in merged
+                if any(lo < component[1] - _KP_TOL
+                       and hi > component[0] + _KP_TOL
+                       for lo, hi in ii_ranges)]
+
+    def component_for(kp: float) -> Optional[List[float]]:
+        for component in affected:
+            if component[0] - _BOUNDARY_TOL <= kp \
+                    <= component[1] + _BOUNDARY_TOL:
+                return component
+        return None
+
+    remaining: List[Dict] = []
+    removed: List[str] = []
+    found_edges = set()
+    for event in events:
+        if not (is_start(event) or is_end(event)):
+            remaining.append(dict(event))
+            continue
+        kp = float(event.get("kp") or 0.0)
+        component = component_for(kp)
+        if component is None:
+            remaining.append(dict(event))
+            continue
+        at_start = abs(kp - component[0]) <= _BOUNDARY_TOL
+        at_end = abs(kp - component[1]) <= _BOUNDARY_TOL
+        if at_start or at_end:
+            # Already the outer boundary of the merged burial range; its
+            # type is correct by construction (an abutting burial section
+            # is part of the same component).
+            remaining.append(dict(event))
+            found_edges.add((component[0], component[1],
+                             "start" if at_start else "end"))
+            continue
+        if int(event.get("locked") or 0):
+            raise ValueError(
+                f"A locked event at KP {schema.format_kp(kp)} lies inside "
+                "the resolved range — unlock it first.")
+        removed.append(str(event.get("event_id") or ""))
+
+    forward = int(direction or 1) >= 0
+    low_type = schema.EVENT_BURIAL_START if forward else schema.EVENT_BURIAL_END
+    high_type = schema.EVENT_BURIAL_END if forward else schema.EVENT_BURIAL_START
+    specs: List[Tuple[str, float]] = []
+    for component in affected:
+        if (component[0], component[1], "start") not in found_edges:
+            specs.append((low_type, component[0]))
+        if (component[0], component[1], "end") not in found_edges:
+            specs.append((high_type, component[1]))
+    return remaining, specs, removed
+
+
 def delete_section_events(events: List[Dict], sections: List[Dict],
                           section_id: str, method: str = ""
                           ) -> Tuple[List[Dict], List[str], Dict]:

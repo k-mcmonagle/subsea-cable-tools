@@ -807,7 +807,10 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
         input_fp = ""
         needs_layer = rule_work.kind in (wb_schema.RULE_KIND_PROXIMITY,
                                          wb_schema.RULE_KIND_POLYGON,
-                                         wb_schema.RULE_KIND_KP_TABLE)
+                                         wb_schema.RULE_KIND_KP_TABLE) \
+            or (rule_work.kind == schema.RULE_KIND_COVERAGE
+                and (rule_work.config.get("coverage_source")
+                     or "bathymetry") == "polygon")
         if needs_layer:
             if input_row is not None:
                 layer = map_layers.resolve_input_layer(project, input_row)
@@ -830,6 +833,14 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
                         # WD-scaled corridors also depend on the bathymetry:
                         # changing it must invalidate this rule's cache.
                         input_fp += "|" + depth_fp()
+        elif rule_work.kind == schema.RULE_KIND_COVERAGE:
+            # Bathymetry mode (the polygon mode took the needs_layer path):
+            # the check reads the depth samples' no-data gaps, so it needs
+            # the bathymetry and follows its fingerprint.
+            if depth is None or not depth.is_available():
+                rule_work.error = "no bathymetry source configured"
+            else:
+                input_fp = depth_fp()
         elif rule_work.kind == wb_schema.RULE_KIND_THRESHOLD:
             if depth is None or not depth.is_available():
                 rule_work.error = "no bathymetry source configured"
@@ -1427,6 +1438,23 @@ class BurialAnalysisTask(QgsTask):
                 rule_work.table_rows or [], config, sampler.scope_domain)
         elif kind == wb_schema.RULE_KIND_MANUAL:
             intervals = ri.acquire_manual(sampler, config)
+        elif kind == schema.RULE_KIND_COVERAGE:
+            # No footprint, ever: the check asserts "no evaluable data
+            # here" (-> Insufficient Information), never an exclusion.
+            source = (config.get("coverage_source") or "bathymetry").lower()
+            if source == "polygon":
+                if rule_work.feats is None:
+                    raise ri.RuleInputError("input layer could not be resolved")
+                index, feats = rule_work.feats
+                covered = ri.polygon_class_intervals(
+                    sampler, index, feats, config, cancel=cancel)
+                nodata = eng.subtract_intervals(
+                    [sampler.scope_domain],
+                    eng.clip_intervals(covered, sampler.scope_domain))
+            else:
+                self._ensure_depth_lookup(sampler, sample_progress)
+                nodata = list(self._depth_gaps or [])
+            intervals = []
         else:
             raise ri.RuleInputError(f"unknown rule kind '{kind}'")
 
@@ -1434,6 +1462,11 @@ class BurialAnalysisTask(QgsTask):
         intervals = eng.clip_intervals(intervals, sampler.scope_domain)
         if scope_ranges is not None:
             intervals = eng.intersect_intervals(intervals, scope_ranges)
+        if kind == schema.RULE_KIND_COVERAGE:
+            # "Applies to KP" limits where the coverage check reports gaps.
+            nodata = eng.clip_intervals(nodata, sampler.scope_domain)
+            if scope_ranges is not None:
+                nodata = eng.intersect_intervals(nodata, scope_ranges)
 
         if predicate is not None and intervals:
             self.progressMessage.emit(

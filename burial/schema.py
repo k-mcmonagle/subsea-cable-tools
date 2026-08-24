@@ -189,6 +189,12 @@ CRITERION_LABELS: Dict[str, str] = {
 # RULE_ACTION_*). bp_rule is wb_rule plus plan_id, criterion_class and
 # source_ref, so rules copy losslessly between the tools (extra columns
 # dropped on copy to the Workbench, defaulted on copy from it).
+# One Burial-Planner-only kind exists: a data-coverage check contributes
+# no-data (Insufficient Information) instead of a footprint — route outside
+# the selected coverage (configured bathymetry, or a coverage polygon
+# input) is flagged as having no evaluable data, and never excludes.
+# Older plugin versions skip the unknown kind with a per-rule warning.
+RULE_KIND_COVERAGE = "data_coverage"
 RULE_FIELDS: List[FieldSpec] = [
     ("rule_id", "str"),
     ("plan_id", "str"),

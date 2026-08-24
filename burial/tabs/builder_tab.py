@@ -354,7 +354,9 @@ class BuilderTab(QWidget):
             "several at once, mark final, split, merge or delete. Select 2+ "
             "sections of the same kind to merge; deleting a section merges "
             "its neighbours into one. Insufficient Information sections can "
-            "be deleted (the no-data range becomes a skip) or merged into a "
+            "be resolved as skips or burial sections (right-click, or the "
+            "Resolve Insufficient Information… button for every short one "
+            "at once) — the no-data range stays flagged — or merged into a "
             "selected neighbour. Edits append an audit note to the affected "
             "Notes cells (still freely editable).")
         section_hint.setWordWrap(True)
@@ -363,6 +365,8 @@ class BuilderTab(QWidget):
         section_buttons = QHBoxLayout()
         for label, slot in (("Split / insert opposite…", self._split_section),
                             ("Merge selected sections", self._merge_sections),
+                            ("Resolve Insufficient Information…",
+                             self._resolve_insufficient_bulk),
                             ("Auto-assign skip handling…", self._auto_assign_skip_handling)):
             button = QPushButton(label)
             button.clicked.connect(slot)
@@ -837,6 +841,14 @@ class BuilderTab(QWidget):
             parts.append("Insufficient Information")
         if reason.get("insufficient_dismissed"):
             parts.append("no data (Insufficient Information dismissed)")
+        overrides = reason.get("insufficient_override") or []
+        if overrides:
+            ranges = ", ".join(
+                f"KP {schema.format_kp(entry[0])}-{schema.format_kp(entry[1])}"
+                for entry in overrides if len(entry) >= 2)
+            parts.append(
+                f"no data over {ranges} — Insufficient Information resolved "
+                "as burial by engineer")
         if reason.get("manual"):
             parts.append("manual")
         if reason.get("dangling_start"):
@@ -1028,6 +1040,22 @@ class BuilderTab(QWidget):
             and section.get("kind") in (schema.SECTION_BURIAL,
                                         schema.SECTION_SKIP,
                                         schema.SECTION_INSUFFICIENT))
+        all_ii = bool(wanted) and all(
+            s.get("kind") == schema.SECTION_INSUFFICIENT
+            for s in self.model.sections if s.get("section_id") in wanted)
+        method = self.model.method
+        resolve_skip_action = menu.addAction(
+            f"Resolve as {schema.section_kind_label(schema.SECTION_SKIP, method)}"
+            f"{suffix}…")
+        resolve_burial_action = menu.addAction(
+            f"Resolve as {schema.section_kind_label(schema.SECTION_BURIAL, method)}"
+            f"{suffix}…")
+        for action in (resolve_skip_action, resolve_burial_action):
+            action.setEnabled(all_ii)
+            action.setToolTip(
+                "Resolve the selected Insufficient Information range(s) — "
+                "enabled when only Insufficient Information rows are "
+                "selected.")
         chosen = qt_exec(menu, self.sections_table.viewport().mapToGlobal(position))
         if chosen == go_action:
             self._goto_section_row(row)
@@ -1063,6 +1091,10 @@ class BuilderTab(QWidget):
             self._merge_sections()
         elif chosen == delete_action:
             self._delete_section()
+        elif chosen == resolve_skip_action:
+            self._resolve_insufficient(list(wanted), schema.SECTION_SKIP)
+        elif chosen == resolve_burial_action:
+            self._resolve_insufficient(list(wanted), schema.SECTION_BURIAL)
 
     # -- event edits -----------------------------------------------------------
     def _on_event_item_changed(self, item) -> None:
@@ -1419,6 +1451,138 @@ class BuilderTab(QWidget):
             self.model.delete_section(ids[0], reason)
         except ValueError as exc:
             QMessageBox.warning(self, "Burial Planner", str(exc))
+
+    def _resolve_insufficient(self, section_ids: List[str],
+                              as_kind: str) -> None:
+        """Confirm and resolve the selected II sections as skip or burial."""
+        sections = [s for s in self.model.sections
+                    if s.get("section_id") in set(section_ids)
+                    and s.get("kind") == schema.SECTION_INSUFFICIENT]
+        if not sections:
+            QMessageBox.information(
+                self, "Burial Planner",
+                "Select one or more Insufficient Information sections.")
+            return
+        method = self.model.method
+        kind_label = self._kind_label(as_kind)
+        total_km = sum(float(s.get("length_km") or 0.0) for s in sections)
+        spans = ", ".join(
+            f"KP {schema.format_kp(s.get('start_kp'))}-"
+            f"{schema.format_kp(s.get('end_kp'))}"
+            for s in sorted(sections,
+                            key=lambda s: float(s.get("start_kp") or 0.0))[:6])
+        if len(sections) > 6:
+            spans += f" and {len(sections) - 6} more"
+        message = (f"Resolve {len(sections)} Insufficient Information "
+                   f"section(s) ({total_km:.3f} km — {spans}) as "
+                   f"{kind_label}?\n\n")
+        if as_kind == schema.SECTION_BURIAL:
+            start_label = ev.event_label(schema.EVENT_BURIAL_START, method)
+            end_label = ev.event_label(schema.EVENT_BURIAL_END, method)
+            message += (
+                "There is still no data over these ranges — resolving as "
+                f"{kind_label} records your decision to bury through them "
+                f"anyway. {start_label}/{end_label} boundaries are created "
+                "or extended so each range joins any adjacent "
+                f"{self._kind_label(schema.SECTION_BURIAL)}, and the "
+                "resulting section keeps a visible 'no data' flag in its "
+                "Reasons column and the report.")
+        else:
+            message += (
+                "There is still no data over these ranges — they will be "
+                f"reported as {kind_label}s (joining any adjacent one) "
+                "with a visible 'no data' flag instead of Insufficient "
+                "Information.")
+        message += ("\n\nLater Generate runs keep the resolution; Discard "
+                    "edits && regenerate restores Insufficient Information. "
+                    "One undoable edit (Ctrl+Z), recorded in the change "
+                    "log.")
+        answer = QMessageBox.question(
+            self, "Resolve Insufficient Information", message,
+            MESSAGE_BOX_YES | MESSAGE_BOX_NO, MESSAGE_BOX_NO)
+        if answer != MESSAGE_BOX_YES:
+            return
+        reason = self._maybe_reason("Resolve Insufficient Information")
+        if reason is None:
+            return
+        try:
+            self.model.resolve_insufficient_sections(
+                [s.get("section_id") for s in sections], as_kind, reason)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Burial Planner", str(exc))
+            return
+        self.run_status.setText(
+            f"Resolved {len(sections)} Insufficient Information section(s) "
+            f"as {kind_label} ({total_km:.3f} km).")
+
+    def _resolve_insufficient_bulk(self) -> None:
+        """Resolve II sections in bulk, filtered by a length threshold.
+
+        The tool for a plan whose route clips the edge of the bathymetry
+        coverage: dozens of short II slivers resolve in one undoable edit.
+        No engineering value is shipped — the threshold is user-entered and
+        remembered per machine.
+        """
+        if not self.model.plan:
+            return
+        ii_sections = [s for s in self.model.sections
+                       if s.get("kind") == schema.SECTION_INSUFFICIENT]
+        if not ii_sections:
+            QMessageBox.information(
+                self, "Burial Planner",
+                "The plan has no Insufficient Information sections.")
+            return
+        settings = QSettings()
+        settings_key = "SubseaCableTools/BurialPlanner/resolve_ii_max_km"
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Resolve Insufficient Information")
+        layout = QVBoxLayout(dialog)
+        note = QLabel(
+            f"The plan has {len(ii_sections)} Insufficient Information "
+            "section(s). Resolve every one no longer than the threshold "
+            "(0 = resolve all) as a skip or a burial section. There is "
+            "still no data over the resolved ranges — the decision stays "
+            "visible as a 'no data' flag on each resulting section, and "
+            "later Generate runs keep it. One undoable edit (Ctrl+Z). "
+            "To resolve specific rows instead, select them and use the "
+            "right-click menu.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        form = QFormLayout()
+        threshold_spin = QDoubleSpinBox()
+        threshold_spin.setRange(0.0, 10000.0)
+        threshold_spin.setDecimals(3)
+        threshold_spin.setSuffix(" km")
+        threshold_spin.setValue(float(settings.value(settings_key, 0.0,
+                                                     type=float)))
+        form.addRow("Resolve sections up to:", threshold_spin)
+        kind_combo = QComboBox()
+        kind_combo.addItem(self._kind_label(schema.SECTION_SKIP),
+                           schema.SECTION_SKIP)
+        kind_combo.addItem(self._kind_label(schema.SECTION_BURIAL),
+                           schema.SECTION_BURIAL)
+        form.addRow("Resolve as:", kind_combo)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox()
+        buttons.setStandardButtons(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if qt_exec(dialog) != DIALOG_ACCEPTED:
+            return
+        threshold = threshold_spin.value()
+        settings.setValue(settings_key, threshold)
+        matching = [s for s in ii_sections
+                    if threshold <= 0
+                    or float(s.get("length_km") or 0.0) <= threshold + 1e-9]
+        if not matching:
+            self.run_status.setText(
+                f"No Insufficient Information section is {threshold:g} km "
+                "or shorter — nothing resolved.")
+            return
+        self._resolve_insufficient(
+            [s.get("section_id") for s in matching],
+            kind_combo.currentData() or schema.SECTION_SKIP)
 
     def _auto_assign_skip_handling(self) -> None:
         """Length-based skip handling with a user-entered threshold.

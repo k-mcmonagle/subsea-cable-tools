@@ -47,11 +47,15 @@ class GenParams:
     sliver_tol_km: float = 0.0
     cross_offset_m: float = 0.0     # 0 = auto (resolved profile step by model)
     profile_step_m: float = 0.0     # 0 = auto (bathymetry cell size)
-    # No-data ranges the user dismissed from Insufficient Information
-    # ((start_kp, end_kp) pairs). A dismissed range is reported as a skip
-    # rather than II on every later run — never as a burial candidate,
-    # because there is still no data there.
-    dismissed_insufficient: List[Tuple[float, float]] = field(default_factory=list)
+    # No-data ranges the user resolved out of Insufficient Information.
+    # Entries are ``(start_kp, end_kp)`` (legacy — resolve as skip) or
+    # ``(start_kp, end_kp, "skip"|"burial")``. A skip-resolved range is
+    # reported as a skip rather than II on every later run — never as a
+    # burial candidate, because there is still no data there. A
+    # burial-resolved range rejoins the candidates (the engineer accepts
+    # burial across the gap) and the resulting burial section carries an
+    # ``insufficient_override`` flag so the missing data stays visible.
+    dismissed_insufficient: List[Tuple] = field(default_factory=list)
 
     @property
     def scope(self) -> Interval:
@@ -85,9 +89,8 @@ class GenParams:
             "sliver_tol_km": self.sliver_tol_km,
             "cross_offset_m": self.cross_offset_m,
             "profile_step_m": self.profile_step_m,
-            "dismissed_insufficient": [
-                [round(float(a), 6), round(float(b), 6)]
-                for a, b in self.dismissed_insufficient],
+            "dismissed_insufficient":
+                normalise_resolutions(self.dismissed_insufficient),
         }
 
 
@@ -108,11 +111,94 @@ def dismissed_pairs(value) -> List[Tuple[float, float]]:
     return [(iv.start_km, iv.end_km) for iv in eng.normalize(intervals)]
 
 
+# Resolution kinds for a no-data range the user has taken a decision on.
+# The values deliberately equal the section kinds they produce.
+RESOLVE_SKIP = schema.SECTION_SKIP
+RESOLVE_BURIAL = schema.SECTION_BURIAL
+
+
+def resolution_entries(value) -> List[Tuple[float, float, str]]:
+    """Parse a stored resolution list into ``(start, end, kind)`` entries.
+
+    Entries are ``[start, end]`` (legacy — resolve as skip) or
+    ``[start, end, "skip"|"burial"]``. Order is preserved because later
+    entries override earlier overlapping ones when painted
+    (``_paint_resolutions``). Invalid and zero-length entries are dropped;
+    an unknown kind falls back to skip (old files stay old behaviour).
+    """
+    out: List[Tuple[float, float, str]] = []
+    for entry in value or []:
+        try:
+            a, b = float(entry[0]), float(entry[1])
+        except (IndexError, TypeError, ValueError):
+            continue
+        lo, hi = (a, b) if a <= b else (b, a)
+        if hi - lo <= 0:
+            continue
+        try:
+            kind = str(entry[2]).strip().lower()
+        except (IndexError, TypeError):
+            kind = ""
+        out.append((lo, hi, RESOLVE_BURIAL if kind == RESOLVE_BURIAL
+                    else RESOLVE_SKIP))
+    return out
+
+
+def _paint_resolutions(entries: Sequence[Tuple[float, float, str]],
+                       clip: Optional[Interval] = None
+                       ) -> Dict[str, List[Interval]]:
+    """Paint the entries in order (later wins) into per-kind interval sets."""
+    painted: Dict[str, List[Interval]] = {RESOLVE_SKIP: [], RESOLVE_BURIAL: []}
+    for lo, hi, kind in entries:
+        iv = [Interval(lo, hi)]
+        for key in painted:
+            painted[key] = eng.subtract_intervals(painted[key], iv)
+        painted[kind] = eng.normalize(painted[kind] + iv)
+    if clip is not None:
+        for key in painted:
+            painted[key] = eng.clip_intervals(painted[key], clip)
+    return painted
+
+
+def normalise_resolutions(value) -> List[List]:
+    """Stored-form resolution list: painted (later wins), disjoint, sorted.
+
+    Skip resolutions stay two-element ``[start, end]`` entries so plans
+    written by this version remain fully readable by older plugin versions
+    unless a burial resolution is actually present (an old reader then sees
+    the first two floats and degrades that entry to a skip dismissal).
+    """
+    painted = _paint_resolutions(resolution_entries(value))
+    out: List[List] = []
+    for kind in (RESOLVE_SKIP, RESOLVE_BURIAL):
+        for iv in painted[kind]:
+            entry = [round(iv.start_km, 6), round(iv.end_km, 6)]
+            if kind == RESOLVE_BURIAL:
+                entry.append(RESOLVE_BURIAL)
+            out.append(entry)
+    out.sort(key=lambda e: (e[0], e[1]))
+    return out
+
+
+def resolved_intervals(params: "GenParams", kind: str) -> List[Interval]:
+    """The no-data ranges resolved as ``kind``, scope-clipped and unioned."""
+    entries = resolution_entries(params.dismissed_insufficient)
+    return _paint_resolutions(entries, params.scope)[kind]
+
+
 def dismissed_intervals(params: "GenParams") -> List[Interval]:
-    """The dismissed no-data ranges as scope-clipped, unioned intervals."""
-    intervals = [Interval(min(a, b), max(a, b))
-                 for a, b in params.dismissed_insufficient or []]
-    return eng.clip_intervals(eng.normalize(intervals), params.scope)
+    """The skip-resolved (dismissed) no-data ranges, scope-clipped."""
+    return resolved_intervals(params, RESOLVE_SKIP)
+
+
+def unresolved_insufficient(params: "GenParams",
+                            nodata: Sequence[Interval]) -> List[Interval]:
+    """No-data ranges with every user resolution (skip or burial) removed."""
+    painted = _paint_resolutions(
+        resolution_entries(params.dismissed_insufficient), params.scope)
+    return eng.subtract_intervals(
+        eng.subtract_intervals(list(nodata), painted[RESOLVE_SKIP]),
+        painted[RESOLVE_BURIAL])
 
 
 @dataclass
@@ -241,7 +327,9 @@ def rule_cache_key(rule_row: Dict, input_fingerprint: str, scope: Interval,
     # profile than the coarse rule-search stations. Its resolution affects
     # whether a narrow depth/slope feature is represented, so changing that
     # resolution must invalidate an otherwise identical acquisition cache.
-    if (rule_row.get("kind") or "") == "threshold_profile" \
+    # Data-coverage checks read the same profile for their no-data gaps.
+    if (rule_row.get("kind") or "") in ("threshold_profile",
+                                        schema.RULE_KIND_COVERAGE) \
             and profile_step_m is not None:
         parts["profile_step_m"] = float(profile_step_m)
     if acquisition_config.get("slope_signed"):
@@ -469,6 +557,12 @@ def resolve_stack(params: GenParams, acquisitions: Sequence[RuleAcquisition],
 
     result = eng.evaluate(scope, [params.method], hits,
                           min_range_km=params.sliver_tol_km)
+    # A data-coverage check has no footprint (it never excludes); its fire
+    # bar shows where coverage is MISSING, which is what the rule asserts.
+    for acq in acquisitions:
+        if (acq.rule_row.get("kind") or "") == schema.RULE_KIND_COVERAGE:
+            result.rule_hits[str(acq.rule_row.get("rule_id"))] = \
+                eng.clip_intervals(acq.nodata, scope)
     return result, influence, eng.normalize(nodata), warnings
 
 
@@ -642,7 +736,9 @@ def build_sections(merged_events: List[Dict], params: GenParams,
                    id_fn: Callable[[], str] = schema.new_id,
                    plan_id: str = "",
                    carry_by_overlap: bool = False,
-                   dismissed: Optional[List[Interval]] = None) -> List[Dict]:
+                   dismissed: Optional[List[Interval]] = None,
+                   resolved_burial: Optional[List[Interval]] = None
+                   ) -> List[Dict]:
     """Rebuild the section partition (burial | skip | insufficient_info).
 
     Screening annotations and Constraint Influence Zone flags land in
@@ -661,6 +757,10 @@ def build_sections(merged_events: List[Dict], params: GenParams,
     ``dismissed`` marks no-data ranges the user dismissed from Insufficient
     Information; skips overlapping one are tagged ``insufficient_dismissed``
     in ``reason_json`` so the origin of the skip stays visible.
+    ``resolved_burial`` marks no-data ranges the user resolved as burial:
+    burial sections overlapping one are tagged ``insufficient_override``
+    (with the data-less KP ranges) so the missing data stays visible even
+    though the section is planned for burial.
     """
     scope = params.scope
     sections: List[Dict] = []
@@ -785,6 +885,13 @@ def build_sections(merged_events: List[Dict], params: GenParams,
                     })
         if flags:
             reason["influence_flags"] = flags
+        # A burial section spanning a no-data range the engineer resolved
+        # as burial keeps the gap visible: burial by decision, not by data.
+        overrides = eng.intersect_intervals([iv], resolved_burial or [])
+        if overrides:
+            reason["insufficient_override"] = [
+                [round(o.start_km, 6), round(o.end_km, 6)]
+                for o in overrides]
         row["reason_json"] = json.dumps(reason)
         sections.append(carry_over(row))
 
@@ -810,11 +917,13 @@ def build_sections(merged_events: List[Dict], params: GenParams,
         )
         if below_min:
             reason["below_min_length"] = True
-        # A skip covering a dismissed no-data range says so: the range is
-        # data-less, and skip only because the user dismissed the II state.
+        # A skip covering a resolved no-data range says so: the range is
+        # data-less, and skip only because the user resolved the II state
+        # (a burial-resolved range can still land in a skip when its
+        # boundary events were later edited away).
         dismissed_here = any(
             eng.interval_length_km(eng.intersect_intervals([d], [iv])) > 1e-9
-            for d in dismissed or [])
+            for d in list(dismissed or []) + list(resolved_burial or []))
         if dismissed_here:
             reason["insufficient_dismissed"] = True
         if not reason.get("fired_rule_ids") and not below_min \
@@ -1022,16 +1131,23 @@ def generate(params: GenParams, acquisitions: Sequence[RuleAcquisition],
     out.rule_hits = {str(rule_id): list(intervals)
                      for rule_id, intervals in result.rule_hits.items()}
     excluded_ranges = [Interval(v.start_km, v.end_km) for v in out.excluded]
-    # A user-dismissed no-data range is reported as a skip rather than
-    # Insufficient Information; it still never becomes a burial candidate,
-    # because there is still no data there.
+    # A skip-resolved (dismissed) no-data range is reported as a skip rather
+    # than Insufficient Information; it still never becomes a burial
+    # candidate, because there is still no data there. A burial-resolved
+    # range rejoins the candidates — the engineer explicitly accepted
+    # burial across the gap — and the resulting burial section is tagged
+    # ``insufficient_override`` so the missing data stays visible.
+    # Exclusions always win over a burial resolution.
     raw_insufficient = eng.subtract_intervals(nodata, excluded_ranges)
     dismissed = dismissed_intervals(params)
-    out.insufficient = eng.subtract_intervals(raw_insufficient, dismissed)
+    resolved_burial = resolved_intervals(params, RESOLVE_BURIAL)
+    out.insufficient = eng.subtract_intervals(
+        eng.subtract_intervals(raw_insufficient, dismissed), resolved_burial)
 
-    # 4-5. Candidates = scope - excluded - no-data; drop the short ones.
+    # 4-5. Candidates = scope - excluded - unresolved no-data; drop shorts.
     available = eng.subtract_intervals([scope], excluded_ranges)
-    candidates = eng.subtract_intervals(available, raw_insufficient)
+    candidates = eng.subtract_intervals(
+        available, eng.subtract_intervals(raw_insufficient, resolved_burial))
     kept: List[Interval] = []
     for iv in candidates:
         if params.min_section_km > 0 and iv.length_km < params.min_section_km - 1e-9:
@@ -1084,7 +1200,7 @@ def generate(params: GenParams, acquisitions: Sequence[RuleAcquisition],
         merged, params, out.excluded, out.screening, influence,
         out.insufficient, out.dropped_short, rule_names,
         previous_sections=previous_sections, id_fn=id_fn, plan_id=plan_id,
-        dismissed=dismissed)
+        dismissed=dismissed, resolved_burial=resolved_burial)
 
     # Proposal diff (client burial proposal as review starting point).
     if proposal_events:

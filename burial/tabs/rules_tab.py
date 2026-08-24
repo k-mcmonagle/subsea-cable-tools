@@ -74,11 +74,13 @@ _KIND_LABELS = {
     wb_schema.RULE_KIND_POLYGON: "Seabed soils / polygon class",
     wb_schema.RULE_KIND_KP_TABLE: "KP range table",
     wb_schema.RULE_KIND_MANUAL: "Manual ranges",
+    schema.RULE_KIND_COVERAGE: "Data coverage",
 }
 
 # Add-menu entries. Water depth and slope share the threshold_profile kind
 # (schema/engine unchanged) but edit in their own dialogs — the preset
-# ``profile`` picks the variant.
+# ``profile`` picks the variant. The data-coverage check contributes
+# Insufficient Information (never exclusions) — see schema.RULE_KIND_COVERAGE.
 _ADD_MENU = (
     ("Water depth", wb_schema.RULE_KIND_THRESHOLD, {"profile": "depth"}),
     ("Slope", wb_schema.RULE_KIND_THRESHOLD, {"profile": "slope"}),
@@ -86,6 +88,7 @@ _ADD_MENU = (
     ("Seabed soils / polygon class", wb_schema.RULE_KIND_POLYGON, None),
     ("KP range table", wb_schema.RULE_KIND_KP_TABLE, None),
     ("Manual ranges", wb_schema.RULE_KIND_MANUAL, None),
+    ("Data coverage check", schema.RULE_KIND_COVERAGE, None),
 )
 
 _CLASS_BADGES = {
@@ -201,11 +204,13 @@ class RuleEditorDialog(QDialog):
             self.threshold_profile = \
                 "slope" if (self.config.get("profile") or "depth") == "slope" \
                 else "depth"
+        self.is_coverage = kind == schema.RULE_KIND_COVERAGE
         if self.threshold_profile:
             title = "Slope" if self.threshold_profile == "slope" else "Water depth"
         else:
             title = _KIND_LABELS.get(kind, kind)
-        self.setWindowTitle(f"Exclusion criterion — {title}")
+        self.setWindowTitle("Data coverage check" if self.is_coverage
+                            else f"Exclusion criterion — {title}")
         # The slope form carries the WD-band grid; give it room.
         self.setMinimumWidth(620 if self.threshold_profile == "slope" else 460)
 
@@ -229,10 +234,39 @@ class RuleEditorDialog(QDialog):
         form.addRow("Source reference:", self.source_edit)
         layout.addLayout(form)
 
-        condition = QGroupBox("Condition")
+        condition = QGroupBox("Coverage" if self.is_coverage else "Condition")
         self.condition_form = QFormLayout(condition)
         self._build_kind_form(kind)
         layout.addWidget(condition)
+
+        if self.is_coverage:
+            # A coverage check never excludes, so class, Exclusion Area
+            # extension and Constraint Influence Zone do not apply.
+            self.class_combo.setVisible(False)
+            label = form.labelForField(self.class_combo)
+            if label is not None:
+                label.setVisible(False)
+            self.class_note.setText(
+                "Route outside the selected coverage is reported as "
+                "Insufficient Information — this check never excludes "
+                "by itself.")
+            self.class_note.setStyleSheet(ui_helpers.hint_style())
+
+            tail = QFormLayout()
+            self.scope_edit = QLineEdit(
+                _format_scope(self.config.get("scope_ranges") or []))
+            self.scope_edit.setPlaceholderText(
+                "whole scope (or e.g. 12.0-45.0, 80-92)")
+            tail.addRow("Applies to KP:", self.scope_edit)
+            self.notes_edit = QLineEdit(self.rule.get("notes") or "")
+            tail.addRow("Notes:", self.notes_edit)
+            layout.addLayout(tail)
+            buttons = QDialogButtonBox()
+            buttons.setStandardButtons(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
+            buttons.accepted.connect(self._accept)
+            buttons.rejected.connect(self.reject)
+            layout.addWidget(buttons)
+            return
 
         zones = QGroupBox("Exclusion Area extension and Constraint Influence Zone")
         zone_form = QFormLayout(zones)
@@ -334,6 +368,11 @@ class RuleEditorDialog(QDialog):
                 return
         self.accept()
 
+    def _sync_coverage(self) -> None:
+        polygon = (self.coverage_source_combo.currentData() or "") == "polygon"
+        self.coverage_input_combo.setEnabled(polygon)
+        self.coverage_filter_edit.setEnabled(polygon)
+
     def _sync_corridor(self) -> None:
         mode = self.corridor_combo.currentData() or ""
         self.corridor_spin.setEnabled(bool(mode))
@@ -424,6 +463,39 @@ class RuleEditorDialog(QDialog):
             self.ranges_edit = QLineEdit(_format_scope(ranges))
             self.ranges_edit.setPlaceholderText("e.g. 12.000-13.500, 40.2-41.0")
             form.addRow("KP ranges:", self.ranges_edit)
+        elif kind == schema.RULE_KIND_COVERAGE:
+            self.coverage_source_combo = QComboBox()
+            self.coverage_source_combo.addItem(
+                "Configured bathymetry (stations with no depth sample)",
+                "bathymetry")
+            self.coverage_source_combo.addItem(
+                "Coverage polygon layer (registered input)", "polygon")
+            index = self.coverage_source_combo.findData(
+                (config.get("coverage_source") or "bathymetry").lower())
+            self.coverage_source_combo.setCurrentIndex(max(0, index))
+            self.coverage_source_combo.currentIndexChanged.connect(
+                self._sync_coverage)
+            form.addRow("Coverage source:", self.coverage_source_combo)
+            self.coverage_input_combo = self._input_combo()
+            form.addRow("Coverage polygon input:", self.coverage_input_combo)
+            self.coverage_filter_edit = QLineEdit(
+                config.get("match_expression") or "")
+            self.coverage_filter_edit.setPlaceholderText(
+                "optional QGIS filter expression")
+            form.addRow("Feature filter:", self.coverage_filter_edit)
+            coverage_note = QLabel(
+                "Where the route leaves the selected coverage — bathymetry "
+                "stations without a depth value, or the route outside every "
+                "(matching) polygon of the chosen input — the plan reports "
+                "Insufficient Information. Use a survey-extent, bounding-box "
+                "or MBES-coverage polygon layer registered on the Inputs "
+                "tab, or the bathymetry itself. In the Plan Builder those "
+                "ranges can then be resolved as skips or burial sections "
+                "while the data gap stays highlighted.")
+            coverage_note.setWordWrap(True)
+            coverage_note.setStyleSheet(ui_helpers.hint_style())
+            form.addRow(coverage_note)
+            self._sync_coverage()
 
     def _build_depth_form(self, form: QFormLayout, config: Dict) -> None:
         self.op_combo = QComboBox()
@@ -727,15 +799,24 @@ class RuleEditorDialog(QDialog):
             config["filter_expression"] = self.filter_edit.text().strip()
         elif kind == wb_schema.RULE_KIND_MANUAL:
             config["ranges"] = _parse_scope(self.ranges_edit.text())
-        extend_mode = self.extend_mode_combo.currentData()
-        for key in generation.EXTENSION_CONFIG_KEYS:
-            config.pop(key, None)
-        config["extend_mode"] = extend_mode
-        suffix = "wd" if extend_mode == generation.EXTEND_MODE_WD else "m"
-        config[f"extend_before_{suffix}"] = self.extend_before.value() or 0.0
-        config[f"extend_after_{suffix}"] = self.extend_after.value() or 0.0
-        config["influence_before_m"] = self.influence_before.value() or 0.0
-        config["influence_after_m"] = self.influence_after.value() or 0.0
+        elif kind == schema.RULE_KIND_COVERAGE:
+            config["coverage_source"] = \
+                self.coverage_source_combo.currentData() or "bathymetry"
+            config["input_id"] = self.coverage_input_combo.currentData() or ""
+            config["match_expression"] = \
+                self.coverage_filter_edit.text().strip()
+        if not self.is_coverage:
+            # Coverage checks have no footprint: extension and influence
+            # zones do not apply and their widgets are never built.
+            extend_mode = self.extend_mode_combo.currentData()
+            for key in generation.EXTENSION_CONFIG_KEYS:
+                config.pop(key, None)
+            config["extend_mode"] = extend_mode
+            suffix = "wd" if extend_mode == generation.EXTEND_MODE_WD else "m"
+            config[f"extend_before_{suffix}"] = self.extend_before.value() or 0.0
+            config[f"extend_after_{suffix}"] = self.extend_after.value() or 0.0
+            config["influence_before_m"] = self.influence_before.value() or 0.0
+            config["influence_after_m"] = self.influence_after.value() or 0.0
         scope = _parse_scope(self.scope_edit.text())
         if scope:
             config["scope_ranges"] = scope
@@ -1103,9 +1184,17 @@ class RulesTab(QWidget):
                 self.rule_table.setItem(i, 0, on_item)
 
                 badge = _CLASS_BADGES.get(rule.get("criterion_class") or "", "")
-                text = f"[{badge}] {rule.get('name') or ''}" if badge else (rule.get("name") or "")
-                if rule.get("criterion_class") == schema.CRITERION_SCREENING:
-                    text += "  — flags for assessment, does not exclude"
+                is_coverage = (rule.get("kind") or "") == \
+                    schema.RULE_KIND_COVERAGE
+                if is_coverage:
+                    text = rule.get("name") or ""
+                    text += ("  — missing data → Insufficient Information, "
+                             "does not exclude")
+                else:
+                    text = f"[{badge}] {rule.get('name') or ''}" if badge \
+                        else (rule.get("name") or "")
+                    if rule.get("criterion_class") == schema.CRITERION_SCREENING:
+                        text += "  — flags for assessment, does not exclude"
                 name_item = QTableWidgetItem(text)
                 name_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
                 tooltip = f"{schema.CRITERION_LABELS.get(rule.get('criterion_class') or '', '')}"
@@ -1117,9 +1206,15 @@ class RulesTab(QWidget):
                 fire_item = QTableWidgetItem()
                 fire_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
                 intervals = rule_hits.get(str(rule.get("rule_id")), [])
-                color = (ACTION_COLORS[wb_schema.RULE_ACTION_RISK]
-                         if rule.get("criterion_class") == schema.CRITERION_SCREENING
-                         else ACTION_COLORS.get(rule.get("action") or "", QColor("#888")))
+                if is_coverage:
+                    # The bar shows where data is MISSING — draw it in the
+                    # Insufficient Information grey, not an exclusion red.
+                    color = QColor("#9e9e9e")
+                elif rule.get("criterion_class") == schema.CRITERION_SCREENING:
+                    color = ACTION_COLORS[wb_schema.RULE_ACTION_RISK]
+                else:
+                    color = ACTION_COLORS.get(rule.get("action") or "",
+                                              QColor("#888"))
                 fire_item.setData(ITEM_DATA_USER_ROLE,
                                   (domain_km, intervals, color, scope.start_km))
                 self.rule_table.setItem(i, FIRE_COL, fire_item)

@@ -47,6 +47,7 @@ _BUILDER_UNDO_ACTIONS = {
     change_log.ACTION_MERGE_SECTIONS,
     change_log.ACTION_DELETE_SECTION,
     change_log.ACTION_DISMISS_INSUFFICIENT,
+    change_log.ACTION_RESOLVE_INSUFFICIENT,
     change_log.ACTION_SET_CONCLUSION,
     change_log.ACTION_EDIT_SECTION,
 }
@@ -163,7 +164,7 @@ class PlanModel(QObject):
             sliver_tol_km=float(stored.get("sliver_tol_km", 0.0)),
             cross_offset_m=float(stored.get("cross_offset_m", 0.0)),
             profile_step_m=float(stored.get("profile_step_m", 0.0)),
-            dismissed_insufficient=generation.dismissed_pairs(
+            dismissed_insufficient=generation.resolution_entries(
                 stored.get("dismissed_insufficient")),
         )
 
@@ -1027,8 +1028,8 @@ class PlanModel(QObject):
                                    new_events: List[Dict], reason: str,
                                    note_specs: Optional[List[Tuple[
                                        float, Callable[[str], str]]]] = None,
-                                   dismiss: Optional[List[Tuple[
-                                       float, float]]] = None) -> bool:
+                                   dismiss: Optional[List[Tuple]] = None
+                                   ) -> bool:
         """One logged, store-written event mutation + derived section rebuild.
 
         Events, sections and the change-log entry commit together (one
@@ -1042,18 +1043,21 @@ class PlanModel(QObject):
         on a boundary annotates both adjacent sections.
 
         ``dismiss`` lists no-data KP ranges to remove from the plan's
-        Insufficient Information context in the same edit: the resolution
-        context, the plan's persisted dismissal list (``params_json``) and
-        the active generation's stored context all update together, so the
-        dismissed range stays a skip after reopening the plan and across
-        later Generate runs, and the change-log entry rolls all of it back.
+        Insufficient Information context in the same edit, as
+        ``(start, end)`` pairs (resolve as skip) or ``(start, end, kind)``
+        entries (kind ``skip`` or ``burial``): the resolution context, the
+        plan's persisted resolution list (``params_json``) and the active
+        generation's stored context all update together, so the resolved
+        range keeps its skip/burial state after reopening the plan and
+        across later Generate runs, and the change-log entry rolls all of
+        it back.
         """
         before = {
             schema.TABLE_EVENT: [dict(e) for e in self.events],
             schema.TABLE_SECTION: [dict(s) for s in self.sections],
         }
-        dismiss_intervals = [Interval(min(a, b), max(a, b))
-                             for a, b in dismiss or []]
+        dismiss_entries = generation.resolution_entries(dismiss)
+        dismiss_intervals = [Interval(a, b) for a, b, _k in dismiss_entries]
         plan_before: Optional[Dict] = None
         gen_before: Optional[Dict] = None
         gen_after: Optional[Dict] = None
@@ -1067,21 +1071,21 @@ class PlanModel(QObject):
             before[schema.TABLE_PLAN] = [dict(plan_before)]
             if gen_before:
                 before[schema.TABLE_GENERATION] = [dict(gen_before)]
-            # Persist the dismissal for future Generate runs — before the
-            # section rebuild, which reads it to tag the resulting skips.
+            # Persist the resolution for future Generate runs — before the
+            # section rebuild, which reads it to tag the resulting
+            # sections. New entries are appended so they override earlier
+            # overlapping ones (latest decision wins).
             try:
                 stored = json.loads(self.plan.get("params_json") or "{}")
             except (TypeError, ValueError):
                 stored = {}
             if not isinstance(stored, dict):
                 stored = {}
-            pairs = generation.dismissed_pairs(
+            entries = generation.resolution_entries(
                 stored.get("dismissed_insufficient"))
-            pairs.extend((iv.start_km, iv.end_km)
-                         for iv in dismiss_intervals)
-            stored["dismissed_insufficient"] = [
-                [round(a, 6), round(b, 6)]
-                for a, b in generation.dismissed_pairs(pairs)]
+            entries.extend(dismiss_entries)
+            stored["dismissed_insufficient"] = \
+                generation.normalise_resolutions(entries)
             self.plan["params_json"] = json.dumps(stored)
         new_events = ev.sort_events(new_events, self.direction)
         new_sections = self._derive_sections(new_events)
@@ -1114,6 +1118,13 @@ class PlanModel(QObject):
                     [iv.start_km, iv.end_km]
                     for iv in self.context.insufficient]
                 summary["context"] = context
+                summary["burial_km"] = round(sum(
+                    float(s.get("length_km") or 0.0) for s in new_sections
+                    if s.get("kind") == schema.SECTION_BURIAL), 6)
+                scope_km = float(summary.get("scope_km") or 0.0)
+                if scope_km > 0:
+                    summary["burial_pct"] = round(
+                        100.0 * summary["burial_km"] / scope_km, 2)
                 summary["skip_km"] = round(sum(
                     float(s.get("length_km") or 0.0) for s in new_sections
                     if s.get("kind") == schema.SECTION_SKIP), 6)
@@ -1165,10 +1176,13 @@ class PlanModel(QObject):
     def _derive_sections(self, events: List[Dict]) -> List[Dict]:
         params = self.gen_params(self._active_params() or None)
         rule_names = {str(r.get("rule_id")): (r.get("name") or "") for r in self.rules}
-        # Dismissed no-data ranges come from the *plan* params (live
+        # Resolved no-data ranges come from the *plan* params (live
         # curation), not the active generation's snapshot, which predates
-        # any dismissals made since that run.
-        dismissed = generation.dismissed_intervals(self.gen_params())
+        # any resolutions made since that run.
+        live_params = self.gen_params()
+        dismissed = generation.dismissed_intervals(live_params)
+        resolved_burial = generation.resolved_intervals(
+            live_params, generation.RESOLVE_BURIAL)
         return generation.build_sections(
             events, params, self.context.excluded, self.context.screening,
             self.context.influence, self.context.insufficient,
@@ -1176,7 +1190,8 @@ class PlanModel(QObject):
             previous_sections=self.sections, plan_id=self.plan_id,
             # Interactive edits move boundaries deliberately; the adjacent
             # sections' notes/conclusions/tools must survive the rebuild.
-            carry_by_overlap=True, dismissed=dismissed)
+            carry_by_overlap=True, dismissed=dismissed,
+            resolved_burial=resolved_burial)
 
     def _active_params(self) -> Dict:
         active = self.store.active_generation(self.plan_id)
@@ -1499,9 +1514,16 @@ class PlanModel(QObject):
         audit = ev.audit_note(text, reason)
         note_specs = [((span_lo + span_hi) / 2.0,
                        self._fold_notes_fn(span_lo, span_hi, audit))]
+        # A range merged into a burial section is a burial resolution: the
+        # engineer accepted burial across the gap, so later Generate runs
+        # must keep it burial (a skip merge keeps today's skip dismissal).
+        resolve_kind = (generation.RESOLVE_BURIAL
+                        if kind == schema.SECTION_BURIAL
+                        else generation.RESOLVE_SKIP)
         return self._write_events_and_sections(
             change_log.ACTION_MERGE_SECTIONS, ",".join(section_ids),
-            remaining, reason, note_specs, dismiss=dismissed or None)
+            remaining, reason, note_specs,
+            dismiss=[(a, b, resolve_kind) for a, b in dismissed] or None)
 
     def delete_section(self, section_id: str, reason: str = "") -> bool:
         """Delete a burial section or skip outright.
@@ -1575,6 +1597,71 @@ class PlanModel(QObject):
             [dict(e) for e in self.events], reason, note_specs,
             dismiss=[(start, end)])
 
+    def resolve_insufficient_sections(self, section_ids: List[str],
+                                      as_kind: str, reason: str = "") -> bool:
+        """Resolve Insufficient Information sections as skip or burial.
+
+        One undoable change-log entry covers every selected range. Resolving
+        as skip is a (bulk) dismissal: no events change, the ranges become
+        skips coalescing with their neighbours. Resolving as burial inserts
+        or extends boundary events so the ranges become burial sections,
+        merging with abutting burial sections; the resulting sections carry
+        an ``insufficient_override`` flag because there is still no data
+        there. Both resolutions persist across later Generate runs and
+        reset on Generate (fresh).
+        """
+        wanted = {str(section_id) for section_id in section_ids if section_id}
+        selected = [s for s in self.sections
+                    if str(s.get("section_id") or "") in wanted]
+        if len(selected) != len(wanted) or not selected:
+            raise ValueError("Section not found.")
+        if any(s.get("kind") != schema.SECTION_INSUFFICIENT
+               for s in selected):
+            raise ValueError(
+                "Only Insufficient Information sections can be resolved.")
+        if as_kind not in (schema.SECTION_BURIAL, schema.SECTION_SKIP):
+            raise ValueError("Resolve as a burial section or a skip.")
+        ranges = sorted((float(s.get("start_kp") or 0.0),
+                         float(s.get("end_kp") or 0.0)) for s in selected)
+        kind_label = schema.section_kind_label(as_kind, self.method)
+        note_specs = []
+        for start, end in ranges:
+            audit = ev.audit_note(
+                f"Insufficient Information KP {schema.format_kp(start)}-"
+                f"{schema.format_kp(end)} resolved as {kind_label} "
+                "(no data)", reason)
+            note_specs.append(((start + end) / 2.0,
+                               self._fold_notes_fn(start, end, audit)))
+        target = ",".join(sorted(wanted))
+        if as_kind == schema.SECTION_SKIP:
+            return self._write_events_and_sections(
+                change_log.ACTION_DISMISS_INSUFFICIENT, target,
+                [dict(e) for e in self.events], reason, note_specs,
+                dismiss=[(a, b, generation.RESOLVE_SKIP)
+                         for a, b in ranges])
+        remaining, specs, _removed = ev.resolve_insufficient_events(
+            self.events, self.sections, list(wanted), self.direction)
+        for event_type, kp in specs:
+            event = {
+                "event_id": schema.new_id(), "plan_id": self.plan_id,
+                "generation_id": "", "seq": 0, "event_type": event_type,
+                "kp": float(kp), "end_kp": None,
+                "source": schema.EVENT_SOURCE_MANUAL,
+                "status": schema.EVENT_STATUS_CANDIDATE, "locked": 0,
+                "notes": "",
+            }
+            self._stamp_position(event)
+            remaining.append(event)
+        lo, hi = self._scope_bounds()
+        result = ev.validate_events(
+            remaining, lo, hi, self.direction, self.method)
+        if result.errors:
+            raise ValueError(result.errors[0])
+        return self._write_events_and_sections(
+            change_log.ACTION_RESOLVE_INSUFFICIENT, target,
+            remaining, reason, note_specs,
+            dismiss=[(a, b, generation.RESOLVE_BURIAL) for a, b in ranges])
+
     def _fold_notes_fn(self, span_lo: float, span_hi: float,
                        audit: str) -> Callable[[str], str]:
         """Notes rewriter folding the manual notes of every current section
@@ -1637,11 +1724,10 @@ class PlanModel(QObject):
             stored_params = {}
         if not isinstance(stored_params, dict):
             stored_params = {}
-        run_pairs = [[round(a, 6), round(b, 6)]
-                     for a, b in generation.dismissed_pairs(
-                         params.dismissed_insufficient)]
-        if run_pairs or "dismissed_insufficient" in stored_params:
-            stored_params["dismissed_insufficient"] = run_pairs
+        run_entries = generation.normalise_resolutions(
+            params.dismissed_insufficient)
+        if run_entries or "dismissed_insufficient" in stored_params:
+            stored_params["dismissed_insufficient"] = run_entries
             self.plan["params_json"] = json.dumps(stored_params)
         summary = dict(output.summary)
         summary["context"] = generation.context_to_dict(output)

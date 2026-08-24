@@ -284,6 +284,71 @@ def test_dismissed_pairs_normalise() -> bool:
     return _result("dismissed pairs union, reorder and drop invalid entries", ok)
 
 
+def test_burial_resolved_nodata_regenerates_as_burial() -> bool:
+    """A burial-resolved no-data range rejoins the candidates: it becomes
+    (part of) a burial section tagged ``insufficient_override``, never II,
+    and persists through the params round-trip. Exclusions still win."""
+    acq = gen.RuleAcquisition(_rule("d1", "depth"), [Interval(5.0, 6.0)],
+                              nodata=[Interval(14.0, 17.0)])
+    params = _params(dismissed_insufficient=[(15.0, 17.0, "burial")])
+    out = gen.generate(params, [acq], id_fn=_counter_id_fn())
+    insufficient = [s for s in out.sections if s["kind"] == "insufficient_info"]
+    ok = len(insufficient) == 1
+    ok = ok and abs(insufficient[0]["end_kp"] - 15.0) < 1e-6  # [14,15] remains
+    # The resolved range is a candidate again and coalesces with the
+    # data-covered candidate beyond it into one burial section [15,20]
+    # (the unresolved [14,15] gap still separates it from [6,14]).
+    resolved = [s for s in out.sections if s["kind"] == schema.SECTION_BURIAL
+                and abs(s["start_kp"] - 15.0) < 1e-6]
+    ok = ok and len(resolved) == 1
+    ok = ok and abs(resolved[0]["end_kp"] - 20.0) < 1e-6
+    reason = json.loads(resolved[0]["reason_json"])
+    ok = ok and reason.get("insufficient_override") == [[15.0, 17.0]]
+    # Other burial sections carry no override flag.
+    others = [s for s in out.sections if s["kind"] == schema.SECTION_BURIAL
+              and abs(s["start_kp"] - 15.0) >= 1e-6]
+    ok = ok and all("insufficient_override" not in
+                    json.loads(s["reason_json"]) for s in others)
+    # The partition still tiles the scope exactly.
+    ordered = sorted(out.sections, key=lambda s: s["start_kp"])
+    ok = ok and abs(ordered[0]["start_kp"] - 0.0) < 1e-6
+    ok = ok and abs(ordered[-1]["end_kp"] - 20.0) < 1e-6
+    ok = ok and all(abs(a["end_kp"] - b["start_kp"]) < 1e-6
+                    for a, b in zip(ordered, ordered[1:]))
+    # Round trip through params storage keeps the burial kind.
+    stored = json.loads(json.dumps(params.to_dict()))
+    entries = gen.resolution_entries(stored.get("dismissed_insufficient"))
+    ok = ok and entries == [(15.0, 17.0, "burial")]
+    # An exclusion overlapping a burial resolution still excludes.
+    excl = gen.RuleAcquisition(_rule("x1", "crossing"), [Interval(16.0, 16.5)])
+    out2 = gen.generate(params, [acq, excl], id_fn=_counter_id_fn())
+    ok = ok and any(s["kind"] == schema.SECTION_SKIP
+                    and s["start_kp"] <= 16.2 <= s["end_kp"]
+                    for s in out2.sections)
+    return _result("burial-resolved no-data regenerates as tagged burial", ok)
+
+
+def test_resolution_entries_latest_wins() -> bool:
+    """Overlapping resolutions paint in order (latest decision wins) and
+    normalise to disjoint stored entries; legacy 2-element entries stay
+    two-element skips."""
+    stored = gen.normalise_resolutions(
+        [[2.0, 6.0], [4.0, 8.0, "burial"], [5.0, 5.5]])
+    ok = stored == [[2.0, 4.0], [4.0, 5.0, "burial"], [5.0, 5.5],
+                    [5.5, 8.0, "burial"]]
+    params = _params(dismissed_insufficient=stored)
+    skip = [(iv.start_km, iv.end_km)
+            for iv in gen.dismissed_intervals(params)]
+    burial = [(iv.start_km, iv.end_km)
+              for iv in gen.resolved_intervals(params, gen.RESOLVE_BURIAL)]
+    ok = ok and skip == [(2.0, 4.0), (5.0, 5.5)]
+    ok = ok and burial == [(4.0, 5.0), (5.5, 8.0)]
+    # Legacy-only lists normalise exactly as before (2-element entries).
+    legacy = gen.normalise_resolutions([[3.0, 2.0], [2.5, 4.0], [6.0, 7.0]])
+    ok = ok and legacy == [[2.0, 4.0], [6.0, 7.0]]
+    return _result("resolution entries paint latest-wins and normalise", ok)
+
+
 def test_refinement_converges() -> bool:
     # analytic footprint: condition true where kp > 7.123456
     true_boundary = 7.123456
@@ -568,6 +633,8 @@ def run_all() -> list:
         test_exclusion_never_swallows_own_nodata(),
         test_dismissed_nodata_becomes_skip(),
         test_dismissed_pairs_normalise(),
+        test_burial_resolved_nodata_regenerates_as_burial(),
+        test_resolution_entries_latest_wins(),
         test_refinement_converges(),
         test_default_refinement_keeps_symmetric_buffer_at_display_length(),
         test_cache_key_sensitivity(),

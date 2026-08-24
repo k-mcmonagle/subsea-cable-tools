@@ -929,11 +929,14 @@ class BurialPlannerDock(QDockWidget):
 
         if not self._generate_after_analysis:
             # Fire-bar refresh only: update profile overlays from resolution.
+            # User-resolved no-data ranges (skip or burial) are not II —
+            # same subtraction as generation.generate().
             self.model.context = generation.ResolutionContext(
                 excluded=[v for v in verdicts if v.status == "excluded"],
                 screening=[v for v in verdicts if v.status == "risk"],
                 influence=list(influence),
-                insufficient=list(nodata),
+                insufficient=generation.unresolved_insufficient(
+                    params, nodata),
                 rule_hits={rule_id: list(intervals) for rule_id, intervals
                            in resolved.rule_hits.items()})
             self._refresh_profile_overlays()

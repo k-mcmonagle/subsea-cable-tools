@@ -384,6 +384,66 @@ def test_upsert_move_note_coalesces() -> bool:
     return _result("move notes coalesce chains and stay editable", ok)
 
 
+def test_resolve_insufficient_events() -> bool:
+    """Resolving II ranges as burial creates or reuses boundary events so
+    the ranges coalesce with abutting burial sections; a locked interior
+    event aborts; non-II selections are rejected."""
+    # burial [0,2] | II [2,4] | burial [4,6] | skip [6,8] | II [8,9] | skip [9,10]
+    events = [_event("a", 0.0, START), _event("b", 2.0, END),
+              _event("c", 4.0, START), _event("d", 6.0, END)]
+    sections = [
+        _section("b1", schema.SECTION_BURIAL, 0.0, 2.0),
+        _section("i1", schema.SECTION_INSUFFICIENT, 2.0, 4.0),
+        _section("b2", schema.SECTION_BURIAL, 4.0, 6.0),
+        _section("s1", schema.SECTION_SKIP, 6.0, 8.0),
+        _section("i2", schema.SECTION_INSUFFICIENT, 8.0, 9.0),
+        _section("s2", schema.SECTION_SKIP, 9.0, 10.0),
+    ]
+    # II between two burial sections: the seam events go, edges stay.
+    remaining, specs, removed = ev.resolve_insufficient_events(
+        events, sections, ["i1"], 1)
+    ok = set(removed) == {"b", "c"} and specs == []
+    ok = ok and [e["event_id"] for e in remaining] == ["a", "d"]
+    ok = ok and ev.validate_events(remaining, 0.0, 10.0, 1).ok
+
+    # Standalone II inside skips: both boundary events are created.
+    remaining2, specs2, removed2 = ev.resolve_insufficient_events(
+        events, sections, ["i2"], 1)
+    ok = ok and not removed2 and len(remaining2) == 4
+    ok = ok and specs2 == [(START, 8.0), (END, 9.0)]
+    # Direction -1 swaps which edge is the start.
+    _r3, specs3, _d3 = ev.resolve_insufficient_events(
+        events, sections, ["i2"], -1)
+    ok = ok and specs3 == [(END, 8.0), (START, 9.0)]
+
+    # Both II ranges in one call: one merged component [0,6] + one new pair.
+    remaining4, specs4, removed4 = ev.resolve_insufficient_events(
+        events, sections, ["i1", "i2"], 1)
+    ok = ok and set(removed4) == {"b", "c"}
+    ok = ok and specs4 == [(START, 8.0), (END, 9.0)]
+    merged_events = remaining4 + [_event(f"n{i}", kp, etype)
+                                  for i, (etype, kp) in enumerate(specs4)]
+    ok = ok and ev.validate_events(merged_events, 0.0, 10.0, 1).ok
+    pairs = ev.burial_pairs(ev.sort_events(merged_events, 1), 1)
+    spans = [(float(s["kp"]), float(e["kp"])) for s, e in pairs]
+    ok = ok and spans == [(0.0, 6.0), (8.0, 9.0)]
+
+    # Guards: a locked seam event aborts; non-II selections are rejected.
+    guarded = 0
+    locked = [dict(e) for e in events]
+    locked[1]["locked"] = 1
+    try:
+        ev.resolve_insufficient_events(locked, sections, ["i1"], 1)
+    except ValueError:
+        guarded += 1
+    try:
+        ev.resolve_insufficient_events(events, sections, ["b1"], 1)
+    except ValueError:
+        guarded += 1
+    ok = ok and guarded == 2
+    return _result("resolve II ranges as burial via event surgery", ok)
+
+
 def run_all() -> list:
     return [
         test_labels(),
@@ -400,6 +460,7 @@ def run_all() -> list:
         test_merge_insufficient_between_skips(),
         test_merge_selection_guards(),
         test_merge_insufficient_guards(),
+        test_resolve_insufficient_events(),
         test_opposite_section_boundaries_follow_travel_direction(),
         test_delete_section_events(),
         test_note_helpers(),

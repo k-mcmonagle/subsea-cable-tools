@@ -352,7 +352,8 @@ def test_dismiss_insufficient_persist_and_undo() -> bool:
     ok = ok and not any(s["kind"] == schema.SECTION_INSUFFICIENT
                         for s in model2.sections)
     ok = ok and not model2.context.insufficient
-    ok = ok and model2.gen_params().dismissed_insufficient == [(6.0, 8.0)]
+    ok = ok and model2.gen_params().dismissed_insufficient == \
+        [(6.0, 8.0, schema.SECTION_SKIP)]
 
     # Undo restores the II section, the plan params and the context.
     undone = model.undo_last_builder_edit()
@@ -366,6 +367,100 @@ def test_dismiss_insufficient_persist_and_undo() -> bool:
     ok = ok and not stored_after.get("dismissed_insufficient")
     ok = ok and len(model.context.insufficient) == 1
     return _result("dismiss II persists, reopens dismissed and undoes", ok)
+
+
+def test_resolve_insufficient_as_burial_persist_and_undo() -> bool:
+    """Resolving an II section as burial merges it into the abutting burial
+    sections, tags the result, persists the resolution (surviving a normal
+    re-Generate) and undoes atomically."""
+    store = _store()
+    plan_id = store.save_plan(_plan_row())
+    params = generation.GenParams(0.0, 10.0, direction=1, method="plough")
+    rule = {
+        "rule_id": "r", "name": "excluded", "enabled": 1,
+        "kind": "manual", "action": "exclude", "risk_level": 0,
+        "criterion_class": "project", "methods_json": "[]",
+        "config_json": "{}",
+    }
+    acquisitions = [generation.RuleAcquisition(
+        rule, [Interval(2.0, 4.0)], nodata=[Interval(6.0, 8.0)])]
+    out = generation.generate(params, acquisitions, plan_id=plan_id)
+    summary = dict(out.summary)
+    summary["context"] = generation.context_to_dict(out)
+    store.save_generation({"plan_id": plan_id, "active": 1,
+                           "rules_snapshot_json": "[]",
+                           "params_json": json.dumps(params.to_dict()),
+                           "inputs_fingerprint_json": "{}",
+                           "summary_json": json.dumps(summary),
+                           "proposal_diff_json": "{}"})
+    store.save_events(plan_id, out.events)
+    store.save_sections(plan_id, out.sections)
+
+    model = PlanModel(store)
+    ok = model.load_plan(plan_id)
+    ii = [s for s in model.sections
+          if s["kind"] == schema.SECTION_INSUFFICIENT]
+    ok = ok and len(ii) == 1
+    ok = ok and model.resolve_insufficient_sections(
+        [ii[0]["section_id"]], schema.SECTION_BURIAL, "engineer judgement")
+    ok = ok and not any(s["kind"] == schema.SECTION_INSUFFICIENT
+                        for s in model.sections)
+    # [4,6] + [6,8] + [8,10] coalesce into one burial section, tagged.
+    resolved = next(
+        (s for s in model.sections if s["kind"] == schema.SECTION_BURIAL
+         and abs(float(s["start_kp"]) - 4.0) < 1e-6
+         and abs(float(s["end_kp"]) - 10.0) < 1e-6), None)
+    ok = ok and resolved is not None
+    reason = json.loads(resolved["reason_json"]) if resolved else {}
+    ok = ok and reason.get("insufficient_override") == [[6.0, 8.0]]
+    ok = ok and "resolved as" in (resolved.get("notes") or "")
+    # Sections still tile the scope exactly.
+    ordered = sorted(model.sections, key=lambda s: float(s["start_kp"]))
+    ok = ok and abs(float(ordered[0]["start_kp"]) - 0.0) < 1e-6
+    ok = ok and abs(float(ordered[-1]["end_kp"]) - 10.0) < 1e-6
+    ok = ok and all(abs(float(a["end_kp"]) - float(b["start_kp"])) < 1e-6
+                    for a, b in zip(ordered, ordered[1:]))
+    # Persisted with the burial kind; a reopened plan keeps the resolution.
+    stored = json.loads(model.plan.get("params_json") or "{}")
+    ok = ok and stored.get("dismissed_insufficient") == \
+        [[6.0, 8.0, schema.SECTION_BURIAL]]
+    model2 = PlanModel(store)
+    ok = ok and model2.load_plan(plan_id)
+    ok = ok and not any(s["kind"] == schema.SECTION_INSUFFICIENT
+                        for s in model2.sections)
+    ok = ok and not model2.context.insufficient
+
+    # A normal re-Generate honours the resolution: the range stays burial
+    # (never II) and the tag survives.
+    regen = generation.generate(
+        model2.gen_params(), acquisitions,
+        existing_events=[dict(e) for e in model2.events],
+        previous_sections=[dict(s) for s in model2.sections],
+        plan_id=plan_id)
+    ok = ok and not any(s["kind"] == schema.SECTION_INSUFFICIENT
+                        for s in regen.sections)
+    regen_burial = next(
+        (s for s in regen.sections if s["kind"] == schema.SECTION_BURIAL
+         and float(s["start_kp"]) <= 6.5 <= float(s["end_kp"])), None)
+    ok = ok and regen_burial is not None
+    ok = ok and json.loads(regen_burial["reason_json"]).get(
+        "insufficient_override") == [[6.0, 8.0]]
+
+    # Undo restores the II section, the plan params and the context.
+    undone = model.undo_last_builder_edit()
+    ok = ok and undone is not None
+    ok = ok and undone["action"] == change_log.ACTION_RESOLVE_INSUFFICIENT
+    restored = [s for s in model.sections
+                if s["kind"] == schema.SECTION_INSUFFICIENT]
+    ok = ok and len(restored) == 1
+    ok = ok and abs(float(restored[0]["start_kp"]) - 6.0) < 1e-6
+    stored_after = json.loads(model.plan.get("params_json") or "{}")
+    ok = ok and not stored_after.get("dismissed_insufficient")
+    ok = ok and len(model.context.insufficient) == 1
+    ok = ok and any(s["kind"] == schema.SECTION_BURIAL
+                    and abs(float(s["end_kp"]) - 6.0) < 1e-6
+                    for s in model.sections)
+    return _result("resolve II as burial persists, regenerates and undoes", ok)
 
 
 def test_plan_profile_persistence() -> bool:
@@ -413,6 +508,7 @@ def run_all() -> list:
         test_change_log_and_rollback(),
         test_plan_builder_merge_insert_and_undo(),
         test_dismiss_insufficient_persist_and_undo(),
+        test_resolve_insufficient_as_burial_persist_and_undo(),
         test_plan_profile_persistence(),
     ]
 
