@@ -1679,6 +1679,46 @@ def test_goto_range_guards_degenerate_ranges() -> bool:
     return _result("goto_range: degenerate ranges guarded", ok)
 
 
+def test_highlight_ranges_multi_selection() -> bool:
+    """Several selected sections highlight as one multi-part band."""
+    from ..burial.burial_dock import BurialPlannerDock
+
+    route, _da = _route()
+    canvas = QgsMapCanvas()
+    canvas.setDestinationCrs(WGS84)
+
+    class _Model:
+        pass
+
+    class _Stub:
+        pass
+
+    stub = _Stub()
+    stub.canvas = canvas
+    stub.model = _Model()
+    stub.model.route = route
+    stub._band = None
+    stub._highlight_cache = None
+    stub.highlight_range = lambda a, b: BurialPlannerDock.highlight_range(stub, a, b)
+    stub._hide_band = BurialPlannerDock._hide_band
+    total = route.total_length_km
+    BurialPlannerDock.highlight_ranges(stub, [(1.0, 3.0), (5.0, 7.0),
+                                              (float("nan"), 9.0),
+                                              (10.0, 10.0000001)])
+    ok = stub._band is not None
+    geom = stub._band.asGeometry()
+    ok = ok and geom.isMultipart() and len(geom.asMultiPolyline()) == 2
+    # Single range goes through the cached single-slice path.
+    BurialPlannerDock.highlight_ranges(stub, [(2.0, 4.0)])
+    ok = ok and stub._highlight_cache is not None         and stub._highlight_cache[0][:2] == (2.0, 4.0)
+    # Empty selection hides the band.
+    BurialPlannerDock.highlight_ranges(stub, [])
+    ok = ok and not stub._band.isVisible()
+    canvas.deleteLater()
+    return _result("highlight_ranges: multi-part band, cache, clear", ok,
+                   f"route {total:.3f} km")
+
+
 def run_all() -> list:
     return [
         test_scoped_sampler_matches_full(),
@@ -1716,6 +1756,7 @@ def run_all() -> list:
         test_builder_sections_table_delegates_and_optional_columns(),
         test_column_menu_persists_by_label(),
         test_goto_range_guards_degenerate_ranges(),
+        test_highlight_ranges_multi_selection(),
     ]
 
 

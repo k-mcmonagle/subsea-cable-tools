@@ -1841,6 +1841,58 @@ class BurialPlannerDock(QDockWidget):
         self._band.show()
         return geom
 
+    def highlight_ranges(self, ranges) -> None:
+        """Highlight several KP ranges at once (multi-row table selection).
+
+        One rubber band holding a multi-part line: each range is sliced
+        with the indexed ``extract_segment`` and the parts are transformed
+        to the canvas CRS in a single pass. Passing an empty list clears.
+        """
+        cleaned = []
+        for entry in ranges or ():
+            try:
+                start, end = float(entry[0]), float(entry[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if math.isfinite(start) and math.isfinite(end)                     and abs(end - start) >= 1e-6:
+                cleaned.append((start, end))
+        if not cleaned:
+            self._hide_band(self._band)
+            return
+        if len(cleaned) == 1:
+            self.highlight_range(*cleaned[0])
+            return
+        if self.canvas is None or self.model.route is None:
+            return
+        parts = []
+        for start, end in cleaned:
+            geom = self.model.route.extract_segment(start, end)
+            if geom is not None and not geom.isEmpty():
+                parts.append(geom)
+        if not parts:
+            self._hide_band(self._band)
+            return
+        try:
+            geom = QgsGeometry.collectGeometry(parts)
+        except Exception:
+            geom = parts[0]
+        try:
+            from qgis.core import QgsCoordinateReferenceSystem
+
+            transform = QgsCoordinateTransform(
+                QgsCoordinateReferenceSystem("EPSG:4326"),
+                self.canvas.mapSettings().destinationCrs(),
+                QgsProject.instance())
+            geom.transform(transform)
+        except Exception:
+            pass
+        if self._band is None or _sip_isdeleted(self._band):
+            self._band = QgsRubberBand(self.canvas, GEOMETRY_LINE)
+            self._band.setColor(Qt.GlobalColor.yellow)
+            self._band.setWidth(3)
+        self._band.setToGeometry(geom, None)
+        self._band.show()
+
     def set_exclusion_preview(self, spans) -> None:
         """Draw KP ranges as temporary highlight bands over the route.
 

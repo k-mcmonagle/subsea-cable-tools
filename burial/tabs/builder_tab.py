@@ -1043,13 +1043,14 @@ class BuilderTab(QWidget):
                 self.dock.highlight_kp(float(event.get("kp") or 0.0))
 
     def _on_section_selected(self) -> None:
-        ids = self._selected_section_ids()
-        if len(ids) == 1:
-            section = next((s for s in self.model.sections
-                            if s.get("section_id") == ids[0]), None)
-            if section is not None:
-                self.dock.highlight_range(float(section.get("start_kp") or 0.0),
-                                          float(section.get("end_kp") or 0.0))
+        """Highlight every selected section's route slice on the map."""
+        wanted = set(self._selected_section_ids())
+        if not wanted:
+            return
+        ranges = [(section.get("start_kp"), section.get("end_kp"))
+                  for section in self.model.sections
+                  if section.get("section_id") in wanted]
+        self.dock.highlight_ranges(ranges)
 
     def _context_row(self, table: QTableWidget, position) -> int:
         item = table.itemAt(position)
