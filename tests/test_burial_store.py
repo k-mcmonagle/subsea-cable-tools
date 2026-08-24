@@ -14,6 +14,7 @@ import time
 
 from qgis.core import QgsProject
 
+from ..burial import events as ev
 from ..burial import change_log, generation, schema
 from ..burial.plan_model import PlanModel
 from ..burial.store import BurialStore
@@ -499,9 +500,77 @@ def test_plan_profile_persistence() -> bool:
     return _result("plan profile persists, replaces, copies and deletes", ok)
 
 
+def test_merge_span_persist_and_undo() -> bool:
+    """Explicit-target merge (mixed kinds, single-row reclassify) persists
+    consistent PLDN/PLUP pairs and undoes atomically."""
+    store = _store()
+    plan_id = store.save_plan(_plan_row())
+    params = generation.GenParams(0.0, 10.0, direction=1, method="plough")
+    rule = {
+        "rule_id": "r", "name": "excluded", "enabled": 1,
+        "kind": "manual", "action": "exclude", "risk_level": 0,
+        "criterion_class": "project", "methods_json": "[]",
+        "config_json": "{}",
+    }
+    out = generation.generate(
+        params,
+        [generation.RuleAcquisition(rule, [Interval(2.0, 4.0),
+                                           Interval(6.0, 8.0)])],
+        plan_id=plan_id)
+    store.save_events(plan_id, out.events)
+    store.save_sections(plan_id, out.sections)
+    model = PlanModel(store)
+    ok = model.load_plan(plan_id)
+
+    def row(kind, start):
+        return next(s for s in model.sections
+                    if s["kind"] == kind and abs(s["start_kp"] - start) < 1e-9)
+
+    def kinds():
+        return [(s["kind"], round(s["start_kp"], 3), round(s["end_kp"], 3))
+                for s in sorted(model.sections, key=lambda s: s["start_kp"])]
+
+    # Mixed selection [skip 2-4, burial 4-6] -> burial: coalesces with 0-2.
+    ids = [row(schema.SECTION_SKIP, 2.0)["section_id"],
+           row(schema.SECTION_BURIAL, 4.0)["section_id"]]
+    preview = model.preview_merge_span(ids, schema.SECTION_BURIAL)
+    ok = ok and len(preview.absorbed) == 2 and len(preview.removed_ids) == 2
+    ok = ok and model.merge_span(ids, schema.SECTION_BURIAL, "one plough run")
+    ok = ok and kinds() == [(schema.SECTION_BURIAL, 0.0, 6.0),
+                            (schema.SECTION_SKIP, 6.0, 8.0),
+                            (schema.SECTION_BURIAL, 8.0, 10.0)]
+    ok = ok and ev.validate_events(model.events, 0.0, 10.0, 1).ok
+    ok = ok and "one plough run" in (row(schema.SECTION_BURIAL, 0.0)["notes"] or "")
+    reloaded = PlanModel(store)
+    ok = ok and reloaded.load_plan(plan_id) and len(reloaded.sections) == 3
+    undone = model.undo_last_builder_edit()
+    ok = ok and undone is not None         and undone["action"] == change_log.ACTION_MERGE_SECTIONS
+    ok = ok and len(model.sections) == 5 and len(model.events) == 6
+
+    # Single-row reclassify: burial 4-6 -> skip joins both skips.
+    ids = [row(schema.SECTION_BURIAL, 4.0)["section_id"]]
+    ok = ok and model.merge_span(ids, schema.SECTION_SKIP, "too short")
+    ok = ok and kinds() == [(schema.SECTION_BURIAL, 0.0, 2.0),
+                            (schema.SECTION_SKIP, 2.0, 8.0),
+                            (schema.SECTION_BURIAL, 8.0, 10.0)]
+    ok = ok and ev.validate_events(model.events, 0.0, 10.0, 1).ok
+    undone = model.undo_last_builder_edit()
+    ok = ok and undone is not None and len(model.sections) == 5
+
+    # A no-op target is refused without touching the store.
+    try:
+        model.merge_span(ids, schema.SECTION_BURIAL, "")
+        ok = False
+    except ValueError:
+        pass
+    ok = ok and len(model.sections) == 5
+    return _result("merge span: persist + undo, mixed kinds and reclassify", ok)
+
+
 def run_all() -> list:
     return [
         test_create_and_migrate(),
+        test_merge_span_persist_and_undo(),
         test_migrate_v1_adds_rpl_revision(),
         test_plan_round_trip(),
         test_duplicate_deep_copy(),

@@ -435,14 +435,17 @@ class BuilderTab(QWidget):
             "be resolved as skips or burial sections (right-click, or the "
             "Resolve Insufficient Information… button for every short one "
             "at once) — the no-data range stays flagged — or merged into a "
-            "selected neighbour. Edits append an audit note to the affected "
-            "Notes cells (still freely editable).")
+            "selected neighbour. Merge → gives any selected span one "
+            "outcome (burial or skip), absorbing rows of the other kind "
+            "and keeping the boundary pairs consistent. Edits append an "
+            "audit note to the affected Notes cells (still freely editable).")
         section_hint.setWordWrap(True)
         section_hint.setStyleSheet(ui_helpers.hint_style())
         sections_layout.addWidget(section_hint)
         section_buttons = QHBoxLayout()
         for label, slot in (("Split / insert opposite…", self._split_section),
                             ("Merge selected sections", self._merge_sections),
+                            ("Merge →…", self._merge_span_menu),
                             ("Resolve Insufficient Information…",
                              self._resolve_insufficient_bulk),
                             ("Auto-assign skip handling…", self._auto_assign_skip_handling)):
@@ -1182,6 +1185,22 @@ class BuilderTab(QWidget):
         split_action.setEnabled(selected_count == 1)
         merge_action = menu.addAction("Merge selected sections…")
         merge_action.setEnabled(selected_count >= 2)
+        merge_action.setToolTip(
+            "Merge rows of one kind (plus any selected Insufficient "
+            "Information rows); the kind of the selected rows is the result.")
+        merge_burial_action = menu.addAction(
+            f"Merge selected → {self._kind_label(schema.SECTION_BURIAL)}…")
+        merge_skip_action = menu.addAction(
+            f"Merge selected → {self._kind_label(schema.SECTION_SKIP)}…")
+        for action in (merge_burial_action, merge_skip_action):
+            action.setEnabled(selected_count >= 1)
+            action.setToolTip(
+                "Give the selected KP span (first start to last end) one "
+                "outcome: intervening rows of the other kind are absorbed, "
+                "boundary events are kept, moved or created so the "
+                "PLDN/PLUP pairs stay consistent, and Insufficient "
+                "Information rows inside are resolved as that kind. A "
+                "single row reclassifies it.")
         delete_label = ("Delete section (dismiss no-data range)…"
                         if section.get("kind") == schema.SECTION_INSUFFICIENT
                         else "Delete section (merge neighbours)…")
@@ -1240,6 +1259,10 @@ class BuilderTab(QWidget):
             self._split_section()
         elif chosen == merge_action:
             self._merge_sections()
+        elif chosen == merge_burial_action:
+            self._merge_span(schema.SECTION_BURIAL)
+        elif chosen == merge_skip_action:
+            self._merge_span(schema.SECTION_SKIP)
         elif chosen == delete_action:
             self._delete_section()
         elif chosen == resolve_skip_action:
@@ -1547,6 +1570,91 @@ class BuilderTab(QWidget):
             return
         try:
             self.model.merge_sections(ids, reason)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Burial Planner", str(exc))
+
+    def _merge_span_menu(self) -> None:
+        """Button form of the explicit-target merge: pick the outcome."""
+        from qgis.PyQt.QtGui import QCursor
+
+        menu = QMenu(self)
+        actions = {
+            menu.addAction(
+                f"Merge selected → {self._kind_label(schema.SECTION_BURIAL)}…"):
+            schema.SECTION_BURIAL,
+            menu.addAction(
+                f"Merge selected → {self._kind_label(schema.SECTION_SKIP)}…"):
+            schema.SECTION_SKIP,
+        }
+        chosen = qt_exec(menu, QCursor.pos())
+        if chosen in actions:
+            self._merge_span(actions[chosen])
+
+    def _merge_span(self, target_kind: str) -> None:
+        """Merge the selection's KP hull into one section of ``target_kind``.
+
+        Shows exactly what will happen (absorbed rows, boundaries removed /
+        moved / created, no-data ranges resolved) before writing one
+        undoable change-log entry.
+        """
+        ids = self._selected_section_ids()
+        if not ids:
+            QMessageBox.information(
+                self, "Burial Planner", "Select one or more sections first.")
+            return
+        try:
+            plan = self.model.preview_merge_span(ids, target_kind)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Burial Planner", str(exc))
+            return
+        method = self.model.method
+        kind_label = self._kind_label(target_kind)
+        lo, hi = plan.span
+        refs = schema.section_refs(self.model.sections, self.model.direction,
+                                   method)
+        selected = set(ids)
+        absorbed = [refs.get(str(s.get("section_id") or ""), "?")
+                    + ("" if s.get("section_id") in selected else " (not selected)")
+                    for s in plan.absorbed]
+        lines = [
+            f"Merge KP {schema.format_kp(lo)}-{schema.format_kp(hi)} into "
+            f"one {kind_label}?",
+            "",
+            f"Sections replaced: {', '.join(absorbed)}",
+        ]
+        by_id = {str(e.get("event_id") or ""): e for e in self.model.events}
+        if plan.removed_ids:
+            lines.append("Boundaries removed: " + ", ".join(
+                f"{ev.event_label(by_id[i].get('event_type') or '', method)} "
+                f"{schema.format_kp(by_id[i].get('kp'))}"
+                for i in plan.removed_ids if i in by_id))
+        if plan.moved:
+            lines.append("Boundaries moved to the span edge: " + ", ".join(
+                f"{ev.event_label(e.get('event_type') or '', method)} → "
+                f"{schema.format_kp(e.get('kp'))}" for e in plan.moved))
+        if plan.specs:
+            lines.append("Boundaries created: " + ", ".join(
+                f"{ev.event_label(t, method)} {schema.format_kp(kp)}"
+                for t, kp in plan.specs))
+        if plan.dismissed:
+            lines.append(
+                f"Insufficient Information resolved as {kind_label} "
+                "(no data there — stays flagged, persists across Generate): "
+                + ", ".join(f"KP {schema.format_kp(a)}-{schema.format_kp(b)}"
+                            for a, b in plan.dismissed))
+        lines.append("")
+        lines.append("Notes of replaced rows are folded into the result; the "
+                     "edit is undoable (Ctrl+Z) and recorded in the change log.")
+        answer = QMessageBox.question(
+            self, f"Merge → {kind_label}", "\n".join(lines),
+            MESSAGE_BOX_YES | MESSAGE_BOX_NO, MESSAGE_BOX_NO)
+        if answer != MESSAGE_BOX_YES:
+            return
+        reason = self._maybe_reason(f"Merge → {kind_label}")
+        if reason is None:
+            return
+        try:
+            self.model.merge_span(ids, target_kind, reason)
         except ValueError as exc:
             QMessageBox.warning(self, "Burial Planner", str(exc))
 

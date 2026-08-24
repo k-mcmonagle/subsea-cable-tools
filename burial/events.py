@@ -291,6 +291,132 @@ def merge_section_events(events: List[Dict], sections: List[Dict],
     return remaining, removed, kind, dismissed_ranges, moved
 
 
+@dataclass
+class SpanMerge:
+    """Result of :func:`merge_span_events` (pure; nothing is written)."""
+    remaining: List[Dict] = field(default_factory=list)
+    removed_ids: List[str] = field(default_factory=list)
+    moved: List[Dict] = field(default_factory=list)      # dicts in ``remaining``
+    specs: List[Tuple[str, float]] = field(default_factory=list)
+    dismissed: List[Tuple[float, float]] = field(default_factory=list)
+    absorbed: List[Dict] = field(default_factory=list)   # sections inside span
+    span: Tuple[float, float] = (0.0, 0.0)
+
+
+def merge_span_events(events: List[Dict], sections: List[Dict],
+                      span_start: float, span_end: float, target_kind: str,
+                      direction: int = 1) -> SpanMerge:
+    """Give one contiguous KP span a single outcome (burial or skip).
+
+    The general form of merging: every boundary event strictly inside the
+    span goes (a locked one aborts), and each span edge ends up with
+    exactly the event the alternation needs given the neighbour on that
+    side —
+
+    - burial target: PLDN at the start / PLUP at the end, *unless* the
+      neighbour is burial too, in which case no edge event (the sections
+      coalesce);
+    - skip target: no edge event, *unless* the neighbour is burial, in
+      which case PLUP at the start / PLDN at the end.
+
+    Direction −1 swaps which type sits at the low/high KP. An event that
+    must be removed but matches a needed edge is *moved* there instead
+    (its id, status and notes survive; ``moved`` lists the dicts for the
+    caller to re-stamp lat/lon/depth). Missing edge events come back as
+    ``specs`` for the caller to create. Insufficient Information rows
+    inside the span are returned as ``dismissed`` ranges to resolve as
+    the target kind. Scope edges count as "no neighbour".
+    """
+    if target_kind not in (schema.SECTION_BURIAL, schema.SECTION_SKIP):
+        raise ValueError("Merge into a burial section or a skip.")
+    lo, hi = sorted((float(span_start), float(span_end)))
+    if hi - lo <= _KP_TOL:
+        raise ValueError("The merged span must have a positive length.")
+
+    def s_lo(section) -> float:
+        return float(section.get("start_kp") or 0.0)
+
+    def s_hi(section) -> float:
+        return float(section.get("end_kp") or 0.0)
+
+    absorbed = sorted(
+        (section for section in sections
+         if s_hi(section) > lo + _KP_TOL and s_lo(section) < hi - _KP_TOL),
+        key=s_lo)
+    if any(s_lo(section) < lo - _BOUNDARY_TOL or s_hi(section) > hi + _BOUNDARY_TOL
+           for section in absorbed):
+        raise ValueError(
+            "The span must cover whole sections — extend the selection to "
+            "the section boundaries.")
+    before = next((section for section in sections
+                   if abs(s_hi(section) - lo) <= _BOUNDARY_TOL), None)
+    after = next((section for section in sections
+                  if abs(s_lo(section) - hi) <= _BOUNDARY_TOL), None)
+    want_burial = target_kind == schema.SECTION_BURIAL
+    before_burial = before is not None and before.get("kind") == schema.SECTION_BURIAL
+    after_burial = after is not None and after.get("kind") == schema.SECTION_BURIAL
+
+    forward = int(direction or 1) >= 0
+    low_type = schema.EVENT_BURIAL_START if forward else schema.EVENT_BURIAL_END
+    high_type = schema.EVENT_BURIAL_END if forward else schema.EVENT_BURIAL_START
+    # Needed edge events: (kp, type) or None.
+    need_lo = (lo, low_type if want_burial else high_type) \
+        if want_burial != before_burial else None
+    need_hi = (hi, high_type if want_burial else low_type) \
+        if want_burial != after_burial else None
+
+    result = SpanMerge(span=(lo, hi), absorbed=absorbed)
+    result.dismissed = [(s_lo(section), s_hi(section)) for section in absorbed
+                        if section.get("kind") == schema.SECTION_INSUFFICIENT]
+
+    remaining: List[Dict] = []
+    surplus: List[Dict] = []  # boundary events the span no longer wants
+    for event in events:
+        if not (is_start(event) or is_end(event)):
+            remaining.append(dict(event))
+            continue
+        kp = float(event.get("kp") or 0.0)
+        at_lo = abs(kp - lo) <= _BOUNDARY_TOL
+        at_hi = abs(kp - hi) <= _BOUNDARY_TOL
+        inside = lo + _KP_TOL < kp < hi - _KP_TOL
+        if not (inside or at_lo or at_hi):
+            remaining.append(dict(event))
+            continue
+        need = need_lo if at_lo else need_hi if at_hi else None
+        if need is not None and event.get("event_type") == need[1]:
+            remaining.append(dict(event))  # already the right edge event
+            if at_lo:
+                need_lo = None
+            else:
+                need_hi = None
+            continue
+        if int(event.get("locked") or 0):
+            raise ValueError(
+                f"A locked event at KP {schema.format_kp(kp)} would have to "
+                "move or go — unlock it first.")
+        surplus.append(dict(event))
+
+    for need in (need_lo, need_hi):
+        if need is None:
+            continue
+        kp, event_type = need
+        candidates = [e for e in surplus if e.get("event_type") == event_type]
+        if candidates:
+            chosen = min(candidates, key=lambda e: abs(float(e.get("kp") or 0.0) - kp))
+            surplus.remove(chosen)
+            chosen["kp"] = kp
+            remaining.append(chosen)
+            result.moved.append(chosen)
+        else:
+            result.specs.append((event_type, kp))
+    result.removed_ids = [str(e.get("event_id") or "") for e in surplus]
+    result.remaining = remaining
+    if not (result.removed_ids or result.moved or result.specs
+            or result.dismissed):
+        raise ValueError("Nothing to merge: the span already has that outcome.")
+    return result
+
+
 def opposite_section_boundary_specs(section_kind: str, start_kp: float,
                                     end_kp: float, direction: int
                                     ) -> List[Tuple[str, float]]:

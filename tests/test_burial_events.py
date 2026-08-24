@@ -444,9 +444,149 @@ def test_resolve_insufficient_events() -> bool:
     return _result("resolve II ranges as burial via event surgery", ok)
 
 
+def _span_fixture():
+    """b1 0-2 | s1 2-4 | b2 4-6 | s2 6-8 | b3 8-10 (scope 0-10)."""
+    events = [
+        _event("start-a", 0.0, START), _event("end-a", 2.0, END),
+        _event("start-b", 4.0, START), _event("end-b", 6.0, END),
+        _event("start-c", 8.0, START), _event("end-c", 10.0, END),
+    ]
+    sections = [
+        _section("b1", schema.SECTION_BURIAL, 0.0, 2.0),
+        _section("s1", schema.SECTION_SKIP, 2.0, 4.0),
+        _section("b2", schema.SECTION_BURIAL, 4.0, 6.0),
+        _section("s2", schema.SECTION_SKIP, 6.0, 8.0),
+        _section("b3", schema.SECTION_BURIAL, 8.0, 10.0),
+    ]
+    return events, sections
+
+
+def _kps(events):
+    return sorted((round(float(e["kp"]), 6), e["event_type"], e["event_id"])
+                  for e in events)
+
+
+def test_merge_span_explicit_target() -> bool:
+    """Explicit-target merge keeps PLDN/PLUP alternation in every shape."""
+    events, sections = _span_fixture()
+    ok = True
+
+    # [PS, SK, PS] -> burial: inside pair removed, edges kept.
+    r = ev.merge_span_events(events, sections, 0.0, 6.0, schema.SECTION_BURIAL)
+    ok = ok and set(r.removed_ids) == {"end-a", "start-b"}
+    ok = ok and not r.specs and not r.moved and not r.dismissed
+    ok = ok and ev.validate_events(r.remaining, 0.0, 10.0, 1).ok
+    ok = ok and [x[2] for x in _kps(r.remaining)] == \
+        ["start-a", "end-b", "start-c", "end-c"]
+
+    # [SK, PS, SK] -> skip: inside pair removed, edge events (which face
+    # burial neighbours) kept.
+    r = ev.merge_span_events(events, sections, 2.0, 8.0, schema.SECTION_SKIP)
+    ok = ok and set(r.removed_ids) == {"start-b", "end-b"}
+    ok = ok and not r.specs and not r.moved
+    ok = ok and ev.validate_events(r.remaining, 0.0, 10.0, 1).ok
+
+    # Mixed [PS, SK] -> skip: PLDN at 4 goes (skip neighbour before),
+    # PLDN at 8 stays (burial neighbour after).
+    r = ev.merge_span_events(events, sections, 4.0, 8.0, schema.SECTION_SKIP)
+    ok = ok and set(r.removed_ids) == {"start-b", "end-b"}
+    ok = ok and ev.validate_events(r.remaining, 0.0, 10.0, 1).ok
+    ok = ok and [x[2] for x in _kps(r.remaining)] == \
+        ["start-a", "end-a", "start-c", "end-c"]
+
+    # Mixed [SK, PS] -> burial: coalesces with b1 (PLUP at 2 removed),
+    # PLUP at 6 kept.
+    r = ev.merge_span_events(events, sections, 2.0, 6.0, schema.SECTION_BURIAL)
+    ok = ok and set(r.removed_ids) == {"end-a", "start-b"}
+    ok = ok and ev.validate_events(r.remaining, 0.0, 10.0, 1).ok
+    ok = ok and [x[2] for x in _kps(r.remaining)] == \
+        ["start-a", "end-b", "start-c", "end-c"]
+
+    # Single-row reclassify: b2 -> skip removes its own pair.
+    r = ev.merge_span_events(events, sections, 4.0, 6.0, schema.SECTION_SKIP)
+    ok = ok and set(r.removed_ids) == {"start-b", "end-b"}
+    ok = ok and ev.validate_events(r.remaining, 0.0, 10.0, 1).ok
+    # ... and s1 -> burial coalesces b1+s1+b2 into one section.
+    r = ev.merge_span_events(events, sections, 2.0, 4.0, schema.SECTION_BURIAL)
+    ok = ok and set(r.removed_ids) == {"end-a", "start-b"}
+    ok = ok and ev.validate_events(r.remaining, 0.0, 10.0, 1).ok
+
+    # Absorbed rows are reported, and a span that cuts a section is refused.
+    r = ev.merge_span_events(events, sections, 0.0, 6.0, schema.SECTION_BURIAL)
+    ok = ok and [x["section_id"] for x in r.absorbed] == ["b1", "s1", "b2"]
+    try:
+        ev.merge_span_events(events, sections, 1.0, 6.0, schema.SECTION_BURIAL)
+        ok = False
+    except ValueError:
+        pass
+    # No-op is refused rather than writing an empty change.
+    try:
+        ev.merge_span_events(events, sections, 4.0, 6.0, schema.SECTION_BURIAL)
+        ok = False
+    except ValueError:
+        pass
+    return _result("merge span: explicit burial/skip target keeps pairs", ok)
+
+
+def test_merge_span_moves_and_creates_edge_events() -> bool:
+    """Edge events are moved (id kept) when a matching surplus exists,
+    created otherwise; II rows inside are returned for resolution; a
+    locked inside event aborts; direction -1 swaps the edge types."""
+    events = [
+        _event("start-a", 0.0, START, status="confirmed"),
+        _event("end-a", 2.0, END, status="confirmed"),
+        _event("start-b", 4.0, START), _event("end-b", 6.0, END),
+    ]
+    sections = [
+        _section("b1", schema.SECTION_BURIAL, 0.0, 2.0),
+        _section("ii", schema.SECTION_INSUFFICIENT, 2.0, 3.0),
+        _section("s1", schema.SECTION_SKIP, 3.0, 4.0),
+        _section("b2", schema.SECTION_BURIAL, 4.0, 6.0),
+        _section("s2", schema.SECTION_SKIP, 6.0, 8.0),
+    ]
+    # b1 + ii -> burial: the confirmed PLUP moves from 2 to 3 (id kept).
+    r = ev.merge_span_events(events, sections, 0.0, 3.0, schema.SECTION_BURIAL)
+    ok = not r.removed_ids and not r.specs
+    ok = ok and len(r.moved) == 1 and r.moved[0]["event_id"] == "end-a"
+    ok = ok and abs(float(r.moved[0]["kp"]) - 3.0) < 1e-9
+    ok = ok and r.moved[0]["status"] == "confirmed"
+    ok = ok and r.dismissed == [(2.0, 3.0)]
+    ok = ok and ev.validate_events(r.remaining, 0.0, 8.0, 1).ok
+    # b1 + ii + s1 -> burial: coalesces with b2 (both inner events go).
+    r = ev.merge_span_events(events, sections, 0.0, 4.0, schema.SECTION_BURIAL)
+    ok = ok and set(r.removed_ids) == {"end-a", "start-b"} and not r.specs
+    ok = ok and ev.validate_events(r.remaining, 0.0, 8.0, 1).ok
+    # ii + s1 -> skip: no events change, II range dismissed as skip.
+    r = ev.merge_span_events(events, sections, 2.0, 4.0, schema.SECTION_SKIP)
+    ok = ok and not r.removed_ids and not r.specs and not r.moved
+    ok = ok and r.dismissed == [(2.0, 3.0)]
+    # Skip-only neighbourhood -> burial creates both edge events.
+    skips = [_section("s0", schema.SECTION_SKIP, 0.0, 2.0),
+             _section("s1", schema.SECTION_SKIP, 2.0, 4.0),
+             _section("s2", schema.SECTION_SKIP, 4.0, 6.0)]
+    r = ev.merge_span_events([], skips, 2.0, 4.0, schema.SECTION_BURIAL)
+    ok = ok and r.specs == [(START, 2.0), (END, 4.0)]
+    # Direction -1: START sits at the high KP.
+    r = ev.merge_span_events([], skips, 2.0, 4.0, schema.SECTION_BURIAL,
+                             direction=-1)
+    ok = ok and r.specs == [(END, 2.0), (START, 4.0)]
+    # Locked inside event aborts.
+    locked = [dict(e, locked=1) if e["event_id"] == "start-b" else e
+              for e in events]
+    try:
+        ev.merge_span_events(locked, sections, 3.0, 6.0, schema.SECTION_SKIP)
+        ok = False
+    except ValueError as exc:
+        ok = ok and "locked" in str(exc)
+    return _result("merge span: edge events moved/created, II resolved, "
+                   "locked aborts, direction -1", ok)
+
+
 def run_all() -> list:
     return [
         test_labels(),
+        test_merge_span_explicit_target(),
+        test_merge_span_moves_and_creates_edge_events(),
         test_ordering_and_seq(),
         test_alternation_validation(),
         test_move_past_partner_rejected(),

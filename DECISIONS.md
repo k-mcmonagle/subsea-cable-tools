@@ -398,3 +398,15 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   direction — direction already governs section reference ordering and
   event semantics, and a second direction-dependent KP would invite
   confusion between the two.
+- **Merge is "one span, one outcome"; the target is explicit, never
+  inferred from a mixed selection.** Sections are derived from the
+  alternating event sequence, so every merge is boundary-event surgery:
+  remove what is strictly inside the span, then make each edge carry
+  exactly the event the alternation needs given its neighbour (burial
+  target: PLDN/PLUP unless the neighbour is burial; skip target: none
+  unless the neighbour is burial). `events.merge_span_events` implements
+  that rule once for mixed selections, single-row reclassification and II
+  absorption; the older same-kind `merge_section_events` is kept as-is so
+  existing habits and change-log semantics do not shift. Surplus edge
+  events are *moved* rather than deleted-and-recreated when their type
+  matches a needed edge, so confirmations and notes survive a merge.

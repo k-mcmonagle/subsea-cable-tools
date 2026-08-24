@@ -1525,6 +1525,72 @@ class PlanModel(QObject):
             remaining, reason, note_specs,
             dismiss=[(a, b, resolve_kind) for a, b in dismissed] or None)
 
+    def preview_merge_span(self, section_ids: List[str], target_kind: str
+                           ) -> ev.SpanMerge:
+        """Dry run of :meth:`merge_span` (for the confirmation dialog)."""
+        wanted = {str(section_id) for section_id in section_ids if section_id}
+        selected = [s for s in self.sections
+                    if str(s.get("section_id") or "") in wanted]
+        if len(selected) != len(wanted) or not selected:
+            raise ValueError("Select at least one section.")
+        lo = min(float(s.get("start_kp") or 0.0) for s in selected)
+        hi = max(float(s.get("end_kp") or 0.0) for s in selected)
+        return ev.merge_span_events(self.events, self.sections, lo, hi,
+                                    target_kind, self.direction)
+
+    def merge_span(self, section_ids: List[str], target_kind: str,
+                   reason: str = "") -> bool:
+        """Merge the selection's KP hull into one burial section or skip.
+
+        Unlike :meth:`merge_sections` (same-kind rows only, target implied)
+        the target is explicit, so mixed selections and single-row
+        reclassification work: intervening opposite-kind rows are absorbed,
+        edge events are kept/moved/created so PLDN/PLUP alternation holds,
+        and Insufficient Information rows inside are resolved as the target
+        kind (persistently, like the resolve actions). One undoable change-
+        log entry.
+        """
+        plan = self.preview_merge_span(section_ids, target_kind)
+        remaining = plan.remaining
+        for event in plan.moved:
+            self._stamp_position(event)
+        for event_type, kp in plan.specs:
+            event = {
+                "event_id": schema.new_id(), "plan_id": self.plan_id,
+                "generation_id": "", "seq": 0, "event_type": event_type,
+                "kp": float(kp), "end_kp": None,
+                "source": schema.EVENT_SOURCE_MANUAL,
+                "status": schema.EVENT_STATUS_CANDIDATE, "locked": 0,
+                "notes": "",
+            }
+            self._stamp_position(event)
+            remaining.append(event)
+        lo, hi = self._scope_bounds()
+        result = ev.validate_events(
+            remaining, lo, hi, self.direction, self.method)
+        if result.errors:
+            raise ValueError(result.errors[0])
+        span_lo, span_hi = plan.span
+        kind_label = schema.section_kind_label(target_kind, self.method)
+        text = (f"{len(plan.absorbed)} section(s) merged into one "
+                f"{kind_label} KP {schema.format_kp(span_lo)}-"
+                f"{schema.format_kp(span_hi)}")
+        if plan.dismissed:
+            ranges = ", ".join(
+                f"KP {schema.format_kp(a)}-{schema.format_kp(b)}"
+                for a, b in plan.dismissed)
+            text += f" (Insufficient Information resolved as {kind_label}: {ranges})"
+        audit = ev.audit_note(text, reason)
+        note_specs = [((span_lo + span_hi) / 2.0,
+                       self._fold_notes_fn(span_lo, span_hi, audit))]
+        resolve_kind = (generation.RESOLVE_BURIAL
+                        if target_kind == schema.SECTION_BURIAL
+                        else generation.RESOLVE_SKIP)
+        return self._write_events_and_sections(
+            change_log.ACTION_MERGE_SECTIONS, ",".join(section_ids),
+            remaining, reason, note_specs,
+            dismiss=[(a, b, resolve_kind) for a, b in plan.dismissed] or None)
+
     def delete_section(self, section_id: str, reason: str = "") -> bool:
         """Delete a burial section or skip outright.
 
