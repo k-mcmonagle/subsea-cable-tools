@@ -188,6 +188,46 @@ def _windowed_slope_series_np(x_values, y_values, half, x_units_m, sign,
             for value, flag in zip(values, flags)]
 
 
+def contiguous_runs(x_values: Sequence[float],
+                    y_values: Sequence[Optional[float]],
+                    max_gap: Optional[float] = None,
+                    group_ids: Optional[Sequence] = None
+                    ) -> List[Tuple[int, int]]:
+    """(start, end) index ranges (inclusive) of contiguous valid stations.
+
+    A run breaks at a missing value, at a spacing jump larger than
+    ``max_gap``, and at a change of ``group_ids`` (e.g. which raster
+    supplied the station). Consumers that must never bridge no-data gaps or
+    source seams evaluate slope per run; :func:`windowed_slope_series`
+    itself deliberately interpolates across gaps (the Burial Planner
+    semantic, where no-data ranges are flagged separately).
+    """
+    runs: List[Tuple[int, int]] = []
+    start = None
+    for index in range(len(x_values)):
+        valid = index < len(y_values) and y_values[index] is not None
+        if not valid:
+            if start is not None:
+                runs.append((start, index - 1))
+                start = None
+            continue
+        if start is not None:
+            breaks = False
+            if max_gap is not None and (
+                    x_values[index] - x_values[index - 1]) > max_gap:
+                breaks = True
+            if group_ids is not None and group_ids[index] != group_ids[index - 1]:
+                breaks = True
+            if breaks:
+                runs.append((start, index - 1))
+                start = index
+        else:
+            start = index
+    if start is not None:
+        runs.append((start, len(x_values) - 1))
+    return runs
+
+
 def auto_half_window_m(x_values_m: Sequence[float],
                        pixel_size_m: Optional[float] = None
                        ) -> Optional[float]:

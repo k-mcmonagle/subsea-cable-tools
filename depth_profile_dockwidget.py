@@ -14,7 +14,9 @@ from .qgis_compat import SIZE_POLICY_EXPANDING, GEOMETRY_POINT, GEOMETRY_LINE
 from qgis.gui import QgsVertexMarker, QgsRubberBand
 from .maptools.temp_line_maptool import TempLineMapTool  # new temporary line drawing tool
 from .kp_range_utils import make_distance_area
-from .slope_utils import ols_slope
+from .slope_utils import (
+    contiguous_runs, interval_slope_series, ols_slope, windowed_slope_series,
+)
 
 # Added standard library & third-party imports
 import math
@@ -261,6 +263,17 @@ class DepthProfileDockWidget(QDockWidget):
         self.side_slope_plot_chk = QCheckBox("Plot Side")
         self.side_slope_plot_chk.setChecked(bool(self.settings.value("DepthProfile/side_slope_plot", True, type=bool)))
         options_row.addWidget(self.side_slope_plot_chk)
+        options_row.addWidget(QLabel("Slope Window (m):"))
+        self.slope_window_spin = QSpinBox()
+        self.slope_window_spin.setRange(0, 100000)
+        self.slope_window_spin.setValue(int(self.settings.value("DepthProfile/slope_window_m", 0)))
+        self.slope_window_spin.setToolTip(
+            "Slope evaluation length in metres (shared engine): 0 measures "
+            "each sampling interval; a value evaluates a central difference "
+            "over ± half this window at every station — e.g. a plough "
+            "bearing length, or ≥ the raster cell size to stop coarse-grid "
+            "staircase spikes. Windows never bridge no-data gaps.")
+        options_row.addWidget(self.slope_window_spin)
         options_row.addStretch()
         form_layout.addRow(options_row)
         
@@ -1701,32 +1714,58 @@ class DepthProfileDockWidget(QDockWidget):
             return
         datum_sign = self._datum_sign()
         invert = self.invert_slope_chk.isChecked()
+        window_m = float(self.slope_window_spin.value())
+        self.settings.setValue("DepthProfile/slope_window_m", int(window_m))
+        # Station slope from the shared engine, per contiguous run of valid
+        # stations (no-data gaps are never bridged). +ve = shoaling with
+        # increasing KP (plugin-wide convention); window 0 = per sampling
+        # interval, a value = central difference over ± window/2.
+        positive_down = datum_sign > 0
+        x_m = [kp * 1000.0 for kp in self.kp_values]
+        station_slope = [None] * len(self.kp_values)
+        for run_start, run_end in contiguous_runs(x_m, self.depth_values):
+            run_x = x_m[run_start:run_end + 1]
+            run_y = [float(v) for v in self.depth_values[run_start:run_end + 1]]
+            if window_m > 0:
+                vals = windowed_slope_series(
+                    run_x, run_y, window_m / 2.0,
+                    positive_down=positive_down, degenerate=None)
+            else:
+                vals = interval_slope_series(
+                    run_x, run_y, positive_down=positive_down)
+            for offset, value in enumerate(vals):
+                station_slope[run_start + offset] = value
         # First station has no preceding interval — no fabricated 0° value.
-        self.slope_deg.append(None)
-        self.slope_pct.append(None)
+        self.slope_deg.append(
+            None if station_slope[0] is None
+            else (-station_slope[0] if invert else station_slope[0]))
+        self.slope_pct.append(
+            None if self.slope_deg[0] is None
+            else 100.0 * math.tan(math.radians(self.slope_deg[0])))
         for i in range(1, len(self.kp_values)):
             d_km = self.kp_values[i] - self.kp_values[i-1]
             v1 = self.depth_values[i-1]
             v2 = self.depth_values[i]
-            if d_km <= 0 or v1 is None or v2 is None:
-                self.slope_deg.append(None); self.slope_pct.append(None); continue
+            raw = station_slope[i]
+            slope_deg_i = None if raw is None else (-raw if invert else raw)
+            slope_pct_i = (None if slope_deg_i is None
+                           else 100.0 * math.tan(math.radians(slope_deg_i)))
+            if d_km <= 0 or v1 is None or v2 is None or slope_deg_i is None:
+                self.slope_deg.append(slope_deg_i)
+                self.slope_pct.append(slope_pct_i)
+                continue
             horiz_m = d_km * 1000.0
             vertical = v2 - v1
-            # +ve = shoaling with increasing KP (plugin-wide up-slope-positive
-            # convention); Invert Slope Sign flips to +ve = deepening.
-            upslope = -datum_sign * vertical
-            vertical_for_slope = -upslope if invert else upslope
-            slope_rad = math.atan2(vertical_for_slope, horiz_m)
-            self.slope_deg.append(math.degrees(slope_rad))
-            self.slope_pct.append(100.0 * vertical_for_slope / horiz_m)
-            
-            # Populate segment data for CSV export
+            self.slope_deg.append(slope_deg_i)
+            self.slope_pct.append(slope_pct_i)
+
+            # Populate segment data for CSV export (slope aligned to KP_to)
             self.segment_kp_from.append(self.kp_values[i-1])
             self.segment_kp_to.append(self.kp_values[i])
             self.segment_depth_from.append(v1)
             self.segment_depth_to.append(v2)
-            self.segment_slope_deg.append(math.degrees(slope_rad))
-            self.segment_slope_pct.append(100.0 * vertical_for_slope / horiz_m if horiz_m > 0 else 0.0)
+            self.segment_slope_deg.append(slope_deg_i)
+            self.segment_slope_pct.append(slope_pct_i)
             
             # Calculate 3D seabed length for this segment using same method as _compute_seabed_length
             # Note: seabed length uses actual depth difference, not inverted

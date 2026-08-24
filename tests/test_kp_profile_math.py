@@ -2,8 +2,8 @@
 """Standalone checks for the KP Mouse live-profile composite/slope math."""
 
 from ..maptools.kp_profile_math import (
-    composite_series, merged_contour_crossings, should_invert_depth_axis,
-    slope_series,
+    composite_series, composite_series_with_sources, merged_contour_crossings,
+    profile_slope_series, should_invert_depth_axis, slope_series,
 )
 
 
@@ -99,12 +99,51 @@ def test_invert_detection():
     return _result("invert axis auto-detection from data sign", ok)
 
 
+def test_profile_slope_masks_seams_and_gaps():
+    # Two rasters: the fine one covers the first half, the coarse one (with
+    # a 10 m vertical datum offset) the second half. The seam must yield
+    # None slopes, never a fabricated near-vertical spike; each half's
+    # slope window follows its own source's cell size.
+    xs = [10.0 * i for i in range(11)]                       # 0..100 m
+    fine = [-50.0 - 0.1 * x if x <= 50.0 else None for x in xs]
+    coarse = [None if x <= 50.0 else -60.0 - 0.1 * x - 10.0 for x in xs]
+    profile = {
+        "rasters": [
+            {"name": "fine", "x": xs, "y": fine, "pixel_size_m": 10.0},
+            {"name": "coarse", "x": xs, "y": coarse, "pixel_size_m": 40.0},
+        ],
+        "contours": [],
+    }
+    out_x, slopes, max_half = profile_slope_series(profile)
+    _cx, _cy, sources, cells = composite_series_with_sources(profile)
+    ok = out_x == xs and sources[0] == 0 and sources[-1] == 1
+    ok = ok and cells[0] == 10.0 and cells[-1] == 40.0
+    finite = [value for value in slopes if value is not None]
+    # True gradient 0.1 m/m ≈ 5.7° everywhere; the 10 m seam step over one
+    # 10 m interval would read ≈ 47° if bridged.
+    ok = ok and finite and all(abs(abs(v) - 5.71) < 0.6 for v in finite)
+    ok = ok and max_half == 40.0
+    # No-data gap in a single raster also masks instead of bridging.
+    gappy = {"rasters": [{"name": "r", "x": xs,
+                          "y": [-50.0, -51.0, -52.0, None, None,
+                                -80.0, -81.0, -82.0, -83.0, -84.0, -85.0],
+                          "pixel_size_m": 10.0}], "contours": []}
+    _gx, gap_slopes, _gh = profile_slope_series(gappy)
+    ok = ok and gap_slopes[3] is None and gap_slopes[4] is None
+    # The 27 m step across the gap must not leak into neighbouring slopes.
+    ok = ok and all(abs(v) < 8.0 for v in gap_slopes if v is not None)
+    return _result("profile slope: seams and gaps mask, cell-scaled windows",
+                   ok, str([None if v is None else round(v, 1)
+                            for v in slopes]))
+
+
 def run_all():
     return [test_composite_prefers_first_raster_and_fills_gaps(),
             test_composite_falls_back_to_sorted_contours(),
             test_merged_contours_interleave_major_minor(),
             test_merged_contours_collapse_duplicate_crossings(),
-            test_slope_degrees_and_gaps(), test_invert_detection()]
+            test_slope_degrees_and_gaps(), test_invert_detection(),
+            test_profile_slope_masks_seams_and_gaps()]
 
 
 if __name__ == "__main__":

@@ -22,6 +22,11 @@ from qgis.core import (
 from ..kp_range_utils import make_distance_area
 from ..qgis_compat import GEOMETRY_LINE, LAYER_RASTER, LAYER_VECTOR
 
+# Ceiling on live-profile stations: enough that a 25 km line over a 100 m
+# grid still samples every cell, cheap enough (× number of rasters) to
+# re-run inside the 150 ms hover refresh without janking the canvas.
+_MAX_STATIONS = 500
+
 
 def is_depth_capable_layer(layer) -> bool:
     try:
@@ -206,14 +211,17 @@ class DepthSampler:
                 samples: int = 120) -> Dict:
         """Depth series along the straight line ``start``→``end``.
 
-        Returns ``{"length_m", "pixel_size_m", "rasters": [{"name", "x", "y"}],
-        "contours": [{"name", "x", "y"}]}`` with ``x`` in metres from ``start``
-        and ``None`` gaps in raster series where a raster has no coverage.
+        Returns ``{"length_m", "pixel_size_m", "rasters": [{"name", "x",
+        "y", "pixel_size_m"}], "contours": [{"name", "x", "y"}]}`` with
+        ``x`` in metres from ``start`` and ``None`` gaps in raster series
+        where a raster has no coverage.
 
-        ``samples`` is a ceiling: on a coarse grid the station count drops so
-        stations stay at least half a raster cell apart — denser sampling of a
-        nearest-cell provider only re-reads the same pixels and turns each
-        cell edge into a fake near-vertical step.
+        The station count adapts to the finest raster cell: spacing is
+        floored at half a cell (denser sampling of a nearest-cell provider
+        only re-reads the same pixels and turns each cell edge into a fake
+        near-vertical step) and the count rises above ``samples`` on long
+        lines — capped at ``_MAX_STATIONS`` so live hover sampling of
+        several rasters stays cheap.
         """
         try:
             length_m = float(distance_area.measureLine(start, end))
@@ -227,7 +235,7 @@ class DepthSampler:
         samples = max(2, int(samples))
         if pixel_size_m and pixel_size_m > 0:
             per_half_cell = int(math.ceil(length_m / (pixel_size_m / 2.0)))
-            samples = max(2, min(samples, per_half_cell))
+            samples = max(2, min(_MAX_STATIONS, per_half_cell))
         stations = []
         for step in range(samples + 1):
             fraction = step / float(samples)
@@ -237,9 +245,12 @@ class DepthSampler:
         for src in self._rasters:
             values = [self._sample_raster(src, point) for _dist, point in stations]
             if any(value is not None for value in values):
+                pixel_area = src.get("pixel_area")
                 result["rasters"].append({
                     "name": src["name"],
-                    "x": [dist for dist, _point in stations], "y": values})
+                    "x": [dist for dist, _point in stations], "y": values,
+                    "pixel_size_m": (math.sqrt(pixel_area)
+                                     if pixel_area else None)})
         if self._contours:
             line = QgsGeometry.fromPolylineXY([QgsPointXY(start), QgsPointXY(end)])
             for src in self._contours:

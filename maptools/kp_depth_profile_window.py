@@ -15,8 +15,7 @@ from qgis.PyQt.QtWidgets import QCheckBox, QDialog, QHBoxLayout, QLabel, QVBoxLa
 
 from ..qgis_compat import WINDOW_HINT_CLOSE, WINDOW_HINT_TITLE, WINDOW_TYPE_TOOL
 from .kp_profile_math import (
-    composite_series, merged_contour_crossings, profile_slope_series,
-    should_invert_depth_axis,
+    merged_contour_crossings, profile_slope_series, should_invert_depth_axis,
 )
 
 _SERIES_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
@@ -178,11 +177,12 @@ class KPDepthProfileWindow(QDialog):
             self._remove_curve(self._curves.pop(key))
 
         # Slope of the composite (best-resolution-first) profile, measured
-        # over a window no smaller than the raster cell so coarse grids and
-        # short range lines don't read as staircases of vertical spikes.
-        comp_x, comp_y = composite_series(profile)
-        slopes, half_window_m = profile_slope_series(
-            comp_x, comp_y, profile.get("pixel_size_m"))
+        # over a window no smaller than each station's own source-raster
+        # cell so coarse grids and short range lines don't read as
+        # staircases of vertical spikes; windows never bridge no-data gaps
+        # or raster seams (a datum offset between grids shows as a gap,
+        # not a fake slope).
+        comp_x, slopes, half_window_m = profile_slope_series(profile)
         slope_x = [value * factor for value in comp_x]
         slope_y = [math.nan if value is None else value for value in slopes]
         if self._slope_curve is None:

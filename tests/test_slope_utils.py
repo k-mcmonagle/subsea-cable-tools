@@ -5,8 +5,8 @@ import math
 
 from .. import slope_utils
 from ..slope_utils import (
-    auto_half_window_m, datum_sign, interval_slope_series, ols_slope,
-    should_invert_depth_axis, windowed_slope_series,
+    auto_half_window_m, contiguous_runs, datum_sign, interval_slope_series,
+    ols_slope, should_invert_depth_axis, windowed_slope_series,
 )
 
 
@@ -108,6 +108,21 @@ def test_windowed_km_units_matches_burial_convention():
                    "%.3f° vs %.3f°" % (mid, expected))
 
 
+def test_contiguous_runs():
+    xs = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+    ys = [1.0, 1.0, None, 1.0, 1.0, 1.0]
+    ok = contiguous_runs(xs, ys) == [(0, 1), (3, 5)]
+    # Source seams break runs even where values are continuous.
+    ok = ok and contiguous_runs(xs, [1.0] * 6,
+                                group_ids=[0, 0, 0, 1, 1, 1]) == [(0, 2), (3, 5)]
+    # Spacing jumps beyond max_gap break runs (irregular series).
+    ok = ok and contiguous_runs([0.0, 1.0, 10.0, 11.0], [1.0] * 4,
+                                max_gap=5.0) == [(0, 1), (2, 3)]
+    ok = ok and contiguous_runs([], []) == []
+    ok = ok and contiguous_runs([1.0], [None]) == []
+    return _result("contiguous runs: gaps, seams, max_gap", ok)
+
+
 def test_auto_half_window():
     ok = auto_half_window_m([0.0, 5.0, 10.0], 50.0) == 50.0     # cell wins
     ok = ok and auto_half_window_m([0.0, 40.0, 80.0], 10.0) == 40.0  # spacing wins
@@ -142,6 +157,7 @@ def run_all():
             test_windowed_gap_and_degenerate_handling(),
             test_windowed_numpy_and_pure_paths_agree(),
             test_windowed_km_units_matches_burial_convention(),
+            test_contiguous_runs(),
             test_auto_half_window(),
             test_datum_helpers(),
             test_ols_slope()]

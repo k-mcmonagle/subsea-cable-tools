@@ -26,8 +26,10 @@ from qgis.core import (
 
 from ..processing.create_mbes_raster_from_xyz_algorithm import (
     CreateMBESRasterFromXYZAlgorithm,
+    bin_average_grid,
     cell_centred_extent,
     detect_grid_size,
+    detect_grid_spacing,
     sniff_xyz_format,
 )
 from ..processing.merge_mbes_rasters_algorithm import MergeMBESRastersAlgorithm
@@ -117,7 +119,20 @@ def test_pure_helpers() -> bool:
         ok = ok and abs(extent.xMinimum() - (-0.25)) < 1e-9
         ok = ok and abs(extent.xMaximum() - 2.75) < 1e-9
         ok = ok and abs(round(extent.width() / 0.5) - 6) < 1e-9
-    return _result("pure helpers: sniff, grid detect, cell-centred extent", ok)
+        # Per-axis spacing is preserved, not averaged away.
+        gx, gy = detect_grid_spacing(np.array([0.0, 1.0, 2.0]),
+                                     np.array([0.0, 0.5, 1.0]))
+        ok = ok and abs(gx - 1.0) < 1e-9 and abs(gy - 0.5) < 1e-9
+        # True per-cell binning: two points in one pixel average; empty
+        # pixels stay nodata; row 0 is the top (north) row.
+        grid = bin_average_grid(
+            [0.2, 0.4, 1.5], [0.5, 0.5, 1.5], [-10.0, -12.0, -20.0],
+            1.0, 1.0, 0.0, 2.0, 2, 2)
+        ok = ok and abs(float(grid[1][0]) - (-11.0)) < 1e-6   # mean of 2
+        ok = ok and abs(float(grid[0][1]) - (-20.0)) < 1e-6   # single point
+        ok = ok and float(grid[0][0]) == -9999.0              # empty cell
+        ok = ok and float(grid[1][1]) == -9999.0
+    return _result("pure helpers: sniff, grid detect, extent, bin average", ok)
 
 
 def test_multifile_create_and_merge() -> bool:
@@ -198,10 +213,76 @@ def test_multifile_create_and_merge() -> bool:
     return _result("multi-file create + merge keeps per-file resolution", ok, detail)
 
 
+def test_bin_average_end_to_end() -> bool:
+    """Scattered soundings through METHOD=Bin Average: cell means, nodata
+    holes preserved, gap fill closes them on request."""
+    if np is None:
+        return _result("bin average end to end", False, "NumPy unavailable")
+    if not _init_processing():
+        return _result("bin average end to end", True,
+                       "skipped: GDAL processing provider unavailable")
+
+    folder = tempfile.mkdtemp(prefix="mbes_avg_")
+    path = os.path.join(folder, "scatter.xyz")
+    # Two soundings inside cell (0,0), one in (2,2); cell (1,1) empty.
+    with open(path, "w") as handle:
+        handle.write("500000.2 6000000.3 -10.0\n"
+                     "500000.4 6000000.1 -14.0\n"
+                     "500002.5 6000002.5 -30.0\n")
+    out_folder = os.path.join(folder, "rasters")
+    algorithm = CreateMBESRasterFromXYZAlgorithm()
+    algorithm.initAlgorithm()
+    context = QgsProcessingContext()
+    context.setProject(QgsProject.instance())
+    feedback = QgsProcessingFeedback()
+    from qgis import processing
+
+    processing.run(algorithm, {
+        "INPUT_XYZ": [path],
+        "CRS": "EPSG:32631",
+        "GRID_SIZE": 1.0,
+        "MAX_DISTANCE": 0.0,
+        "METHOD": 2,               # Bin Average
+        "FILL_DISTANCE": 0,
+        "OUTPUT": out_folder,
+        "COMPRESS": True,
+    }, context=context, feedback=feedback)
+    raster = os.path.join(out_folder, "scatter.tif")
+    ok = os.path.isfile(raster)
+    if not ok:
+        return _result("bin average end to end", False, "output missing")
+    _, mean_cell = _sample(raster, 500000.3, 6000000.2)
+    _, single = _sample(raster, 500002.5, 6000002.5)
+    _, hole = _sample(raster, 500001.4, 6000001.4)
+    ok = ok and mean_cell is not None and abs(mean_cell - (-12.0)) < 1e-4
+    ok = ok and single is not None and abs(single - (-30.0)) < 1e-4
+    ok = ok and (hole is None or hole <= -9998.0 or math.isnan(hole))
+
+    # Same input with gap filling: the interior hole gets interpolated.
+    out_folder2 = os.path.join(folder, "rasters_fill")
+    processing.run(algorithm, {
+        "INPUT_XYZ": [path],
+        "CRS": "EPSG:32631",
+        "GRID_SIZE": 1.0,
+        "MAX_DISTANCE": 0.0,
+        "METHOD": 2,
+        "FILL_DISTANCE": 3,
+        "OUTPUT": out_folder2,
+        "COMPRESS": True,
+    }, context=context, feedback=feedback)
+    _, filled = _sample(os.path.join(out_folder2, "scatter.tif"),
+                        500001.4, 6000001.4)
+    ok = ok and filled is not None and not math.isnan(filled)
+    ok = ok and -31.0 < filled < -9.0
+    return _result("bin average end to end (means, nodata, gap fill)", ok,
+                   f"mean={mean_cell} single={single} filled={filled}")
+
+
 def run_all():
     return [
         test_pure_helpers(),
         test_multifile_create_and_merge(),
+        test_bin_average_end_to_end(),
     ]
 
 

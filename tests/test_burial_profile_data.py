@@ -118,8 +118,15 @@ def test_absolute_slope() -> bool:
     ok = abs(abs_series[0][1] - combined) < 1e-9
     ok = ok and abs_series[0][1] >= 4.0 and abs_series[1][1] > 0
     ok = ok and abs_series[2][1] is None
-    # No cross data at kp 0.3 -> longitudinal magnitude as a lower bound.
+    # No cross data at kp 0.3 -> longitudinal magnitude as a lower bound
+    # (display behaviour) ...
     ok = ok and abs_series[3][1] == 5.0
+    # ... but rule evaluation (require_cross) must not trust the lower
+    # bound: the station reads None and surfaces as Insufficient instead.
+    strict = absolute_slope_series(long_series, cross_series,
+                                   require_cross=True)
+    ok = ok and abs(strict[0][1] - combined) < 1e-9
+    ok = ok and strict[3][1] is None
     return _result("absolute slope combines components, never negative", ok)
 
 

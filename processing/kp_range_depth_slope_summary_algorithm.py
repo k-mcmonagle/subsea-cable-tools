@@ -41,7 +41,10 @@ from qgis.core import (
     QgsWkbTypes,
 )
 from ..qgis_compat import FIELD_TYPE_DOUBLE, GEOMETRY_LINE, GEOMETRY_POINT, PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE
-from ..slope_utils import datum_sign as shared_datum_sign, ols_slope
+from ..slope_utils import (
+    datum_sign as shared_datum_sign, interval_slope_series, ols_slope,
+    windowed_slope_series,
+)
 
 
 @dataclass(frozen=True)
@@ -93,6 +96,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
     ADAPTIVE_INTERVAL = 'ADAPTIVE_INTERVAL'
     ADAPTIVE_INTERVAL_FACTOR = 'ADAPTIVE_INTERVAL_FACTOR'
 
+    SLOPE_WINDOW_M = 'SLOPE_WINDOW_M'
     SIDE_SLOPE_SEARCH_M = 'SIDE_SLOPE_SEARCH_M'
 
     INCLUDE_DIRECTIONAL_EXTREMES = 'INCLUDE_DIRECTIONAL_EXTREMES'
@@ -205,6 +209,16 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
 
         self.addParameter(
             QgsProcessingParameterNumber(
+                self.SLOPE_WINDOW_M,
+                self.tr('Slope evaluation window (m) (0 = per sampling interval)'),
+                type=PROCESSING_NUMBER_DOUBLE,
+                minValue=0.0,
+                defaultValue=0.0,
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterNumber(
                 self.SIDE_SLOPE_SEARCH_M,
                 self.tr('Side slope cross-search (m) (half-width)'),
                 type=PROCESSING_NUMBER_DOUBLE,
@@ -250,6 +264,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
         sample_interval_m = float(self.parameterAsDouble(parameters, self.SAMPLE_INTERVAL_M, context))
         adaptive_interval = bool(self.parameterAsBool(parameters, self.ADAPTIVE_INTERVAL, context))
         adaptive_factor = float(self.parameterAsDouble(parameters, self.ADAPTIVE_INTERVAL_FACTOR, context))
+        slope_window_m = float(self.parameterAsDouble(parameters, self.SLOPE_WINDOW_M, context))
         side_search_m = float(self.parameterAsDouble(parameters, self.SIDE_SLOPE_SEARCH_M, context))
         include_dir = bool(self.parameterAsBool(parameters, self.INCLUDE_DIRECTIONAL_EXTREMES, context))
 
@@ -458,30 +473,34 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
                 station_side_slope_deg = [
                     -v if v is not None else None for v in station_side_slope_deg]
 
-            # Along-track slopes per segment (degrees)
-            slope_vals_deg: List[Optional[float]] = []
-            prev_dist = None
-            prev_depth = None
+            # Along-track slopes (degrees) — shared engine, evaluated per
+            # contiguous run of finite stations so multipart breaks and
+            # no-data stations are never bridged. positive_down maps the
+            # datum sign onto the shared up-slope-positive convention.
+            positive_down = datum_sign > 0
+            runs: List[Tuple[List[float], List[float]]] = []
+            run_d: List[float] = []
+            run_z: List[float] = []
             for d, z in zip(station_dist_m, station_depth):
                 if not math.isfinite(d) or z is None:
-                    prev_dist = None
-                    prev_depth = None
+                    if len(run_d) >= 2:
+                        runs.append((run_d, run_z))
+                    run_d, run_z = [], []
                     continue
-                if prev_dist is None or prev_depth is None:
-                    prev_dist = d
-                    prev_depth = z
-                    continue
-                horiz_m = float(d) - float(prev_dist)
-                if horiz_m <= 0:
-                    prev_dist = d
-                    prev_depth = z
-                    continue
-                vertical = float(z) - float(prev_depth)
-                vertical_for_slope = -datum_sign * vertical  # +ve = shoaling (up-slope)
-                slope_rad = math.atan2(vertical_for_slope, horiz_m)
-                slope_vals_deg.append(math.degrees(slope_rad))
-                prev_dist = d
-                prev_depth = z
+                run_d.append(float(d))
+                run_z.append(float(z))
+            if len(run_d) >= 2:
+                runs.append((run_d, run_z))
+            slope_vals_deg: List[Optional[float]] = []
+            for ds, zs in runs:
+                if slope_window_m > 0:
+                    vals = windowed_slope_series(
+                        ds, zs, slope_window_m / 2.0,
+                        positive_down=positive_down, degenerate=None)
+                else:
+                    vals = interval_slope_series(
+                        ds, zs, positive_down=positive_down)
+                slope_vals_deg.extend(v for v in vals if v is not None)
 
             slope_min, slope_max, slope_avg = self._min_max_avg(slope_vals_deg)
 

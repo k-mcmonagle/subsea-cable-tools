@@ -16,6 +16,7 @@ from qgis.core import (
     QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingParameterBoolean,
+    QgsProcessingParameterEnum,
     QgsProcessingParameterMultipleLayers,
     QgsProcessingParameterRasterDestination,
     QgsProcessingUtils,
@@ -31,6 +32,7 @@ class MergeMBESRastersAlgorithm(QgsProcessingAlgorithm):
     INPUTS = 'INPUTS'
     OUTPUT = 'OUTPUT'
     COMPRESS = 'COMPRESS'
+    RESAMPLING = 'RESAMPLING'
 
     def initAlgorithm(self, config=None):
         self.addParameter(
@@ -38,6 +40,17 @@ class MergeMBESRastersAlgorithm(QgsProcessingAlgorithm):
                 self.INPUTS,
                 self.tr('Input MBES Raster Layers'),
                 layerType=PROCESSING_SOURCE_RASTER
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterEnum(
+                self.RESAMPLING,
+                self.tr('Resampling of coarser inputs to the finest grid'),
+                options=[
+                    self.tr('Nearest (values pass through untouched, blocky)'),
+                    self.tr('Bilinear (smooth surface, values interpolated)'),
+                ],
+                defaultValue=0,
             )
         )
         self.addParameter(
@@ -74,6 +87,7 @@ class MergeMBESRastersAlgorithm(QgsProcessingAlgorithm):
 
         final_output = self.parameterAsOutputLayer(parameters, self.OUTPUT, context)
         compress = self.parameterAsBool(parameters, self.COMPRESS, context)
+        resampling = int(self.parameterAsEnum(parameters, self.RESAMPLING, context))
 
         # --- validate inputs: files, one CRS, note resolutions and NoData ---
         input_files = []
@@ -122,7 +136,9 @@ class MergeMBESRastersAlgorithm(QgsProcessingAlgorithm):
             'PROJ_DIFFERENCE': False,
             'ADD_ALPHA': False,
             'ASSIGN_CRS': None,
-            'RESAMPLING': 0,          # nearest: depth values pass through untouched
+            # 0 nearest (values pass through untouched), 1 bilinear (coarser
+            # inputs upsampled smoothly instead of as blocks).
+            'RESAMPLING': 1 if resampling == 1 else 0,
             'SRC_NODATA': None,       # respect each file's own NoData metadata
             'OUTPUT': vrt_path,
         }, context=context, feedback=feedback)

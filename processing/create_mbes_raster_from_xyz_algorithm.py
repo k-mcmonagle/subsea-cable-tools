@@ -79,33 +79,66 @@ def sniff_xyz_format(path, probe_lines=10):
     return delimiter, skiprows
 
 
-def detect_grid_size(xs, ys):
-    """Median spacing between distinct sorted coordinates, per axis, averaged.
+def detect_grid_spacing(xs, ys):
+    """(x spacing, y spacing): median gap between distinct sorted coordinates.
 
     Exact for regularly gridded exports (the normal MBES deliverable) even
     with missing cells, because the median of the unique-coordinate gaps is
-    the grid step. Scattered data can under-estimate; the raster-size guard
-    catches the pathological results.
+    the grid step — and kept per-axis, so rectangular-cell exports are not
+    misregistered by averaging. Scattered data can under-estimate; the
+    raster-size guard catches the pathological results.
     """
     dx = np.diff(np.unique(xs))
     dy = np.diff(np.unique(ys))
     grid_x = float(np.median(dx[dx > 1e-9])) if np.any(dx > 1e-9) else 1.0
     grid_y = float(np.median(dy[dy > 1e-9])) if np.any(dy > 1e-9) else 1.0
+    return grid_x, grid_y
+
+
+def detect_grid_size(xs, ys):
+    """Single representative grid size (mean of the per-axis spacings)."""
+    grid_x, grid_y = detect_grid_spacing(xs, ys)
     return (grid_x + grid_y) / 2.0
 
 
-def cell_centred_extent(xs, ys, grid_size):
-    """Extent padded by half a cell so every point sits at a cell centre.
+def cell_centred_extent_xy(xs, ys, grid_x, grid_y):
+    """Extent padded by half a cell per axis so points sit at cell centres.
 
     XYZ grid exports give cell-centre coordinates; an extent built from the
     raw min/max would place the outermost points on the raster edge and
     shift every cell half a pixel (the edge row/column can even be dropped).
     """
-    half = grid_size / 2.0
     return QgsRectangle(
-        float(np.min(xs)) - half, float(np.min(ys)) - half,
-        float(np.max(xs)) + half, float(np.max(ys)) + half,
+        float(np.min(xs)) - grid_x / 2.0, float(np.min(ys)) - grid_y / 2.0,
+        float(np.max(xs)) + grid_x / 2.0, float(np.max(ys)) + grid_y / 2.0,
     )
+
+
+def cell_centred_extent(xs, ys, grid_size):
+    """Square-cell convenience wrapper around :func:`cell_centred_extent_xy`."""
+    return cell_centred_extent_xy(xs, ys, grid_size, grid_size)
+
+
+def bin_average_grid(xs, ys, zs, grid_x, grid_y, x_min, y_max,
+                     width, height, nodata=-9999.0):
+    """Mean of the points in each pixel — true per-cell binning.
+
+    Row 0 is the top (north) row, matching GeoTIFF layout. Cells with no
+    points hold ``nodata``. Unlike a radial gdal_grid average, a point
+    contributes to exactly the one cell that contains it.
+    """
+    col = np.floor((np.asarray(xs, dtype=float) - x_min) / grid_x).astype(np.int64)
+    row = np.floor((y_max - np.asarray(ys, dtype=float)) / grid_y).astype(np.int64)
+    np.clip(col, 0, width - 1, out=col)
+    np.clip(row, 0, height - 1, out=row)
+    flat = row * width + col
+    counts = np.bincount(flat, minlength=width * height)
+    sums = np.bincount(flat, weights=np.asarray(zs, dtype=float),
+                       minlength=width * height)
+    grid = np.full(width * height, float(nodata), dtype=np.float32)
+    filled = counts > 0
+    grid[filled] = (sums[filled] / counts[filled]).astype(np.float32)
+    return grid.reshape(height, width)
 
 
 class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
@@ -151,7 +184,7 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.MAX_DISTANCE,
-                self.tr('Search radius for IDW / Bin average (0 = auto)'),
+                self.tr('IDW search radius (0 = auto)'),
                 type=PROCESSING_NUMBER_DOUBLE,
                 defaultValue=0.0,
                 minValue=0.0,
@@ -250,7 +283,6 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
             self.METHOD_DIRECT: ('gdal:rasterize',),
             self.METHOD_IDW: ('gdal:gridinversedistancenearestneighbor',
                               'gdal:gridinversedistance'),
-            self.METHOD_AVERAGE: ('gdal:gridaverage',),
         }.get(method_index, ())
         if required and not any(alg_available(a) for a in required):
             raise QgsProcessingException(
@@ -326,20 +358,40 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
                 f'No data points found in {os.path.basename(xyz_path)}.')
         feedback.pushInfo(f'Read {len(data)} data points.')
 
-        # --- per-file grid size ---
+        # --- CRS sanity: a geographic CRS with projected-looking coordinates
+        # (or vice versa) silently produces a garbage georeference. ---
         xs, ys = data[:, 0], data[:, 1]
-        grid_size = grid_size_param
-        auto_grid = grid_size <= 0
-        if auto_grid:
-            grid_size = detect_grid_size(xs, ys)
-            feedback.pushInfo(f'Auto-detected grid size for this file: {grid_size:.4f}')
+        max_x = float(np.max(np.abs(xs)))
+        max_y = float(np.max(np.abs(ys)))
+        if target_crs.isGeographic() and (max_x > 360.0 or max_y > 90.0):
+            raise QgsProcessingException(
+                f'{os.path.basename(xyz_path)}: coordinates reach '
+                f'({max_x:.1f}, {max_y:.1f}) but the selected CRS '
+                f'({target_crs.authid()}) is geographic (degrees). Select the '
+                'projected CRS the file was exported in (e.g. the UTM zone).')
+        if not target_crs.isGeographic() and max_x <= 180.0 and max_y <= 90.0:
+            feedback.pushWarning(
+                'Coordinates look like latitude/longitude but the selected '
+                f'CRS ({target_crs.authid()}) is projected — check the CRS '
+                'if the output lands in the wrong place.')
 
-        def _raster_shape(cell):
-            ext = cell_centred_extent(xs, ys, cell)
-            return (ext, max(1, int(round(ext.width() / cell))),
-                    max(1, int(round(ext.height() / cell))))
+        # --- per-file grid size (kept per-axis: rectangular cells are not
+        # misregistered by averaging the two spacings) ---
+        if grid_size_param > 0:
+            auto_grid = False
+            grid_x = grid_y = grid_size_param
+        else:
+            auto_grid = True
+            grid_x, grid_y = detect_grid_spacing(xs, ys)
+            feedback.pushInfo(
+                f'Auto-detected grid spacing for this file: {grid_x:.4f} x {grid_y:.4f}')
 
-        extent, width, height = _raster_shape(grid_size)
+        def _raster_shape(cell_x, cell_y):
+            ext = cell_centred_extent_xy(xs, ys, cell_x, cell_y)
+            return (ext, max(1, int(round(ext.width() / cell_x))),
+                    max(1, int(round(ext.height() / cell_y))))
+
+        extent, width, height = _raster_shape(grid_x, grid_y)
         if auto_grid and width * height > MAX_RASTER_CELLS:
             # Median-gap detection collapses on scattered (non-gridded)
             # soundings, where nearly every coordinate is unique. Fall back
@@ -348,43 +400,44 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
             area = extent.width() * extent.height()
             if area > 0 and len(data) > 0:
                 density_size = float(np.sqrt(area / len(data)))
-                if density_size > grid_size:
-                    grid_size = density_size
-                    extent, width, height = _raster_shape(grid_size)
+                if density_size > max(grid_x, grid_y):
+                    grid_x = grid_y = density_size
+                    extent, width, height = _raster_shape(grid_x, grid_y)
                     feedback.pushWarning(
                         'The data does not look regularly gridded; using a '
-                        f'density-based grid size of {grid_size:.4f} instead. '
+                        f'density-based grid size of {density_size:.4f} instead. '
                         'Set an explicit Grid Size to override, and consider '
                         'the Bin Average method for scattered soundings.')
         if width * height > MAX_RASTER_CELLS:
             raise QgsProcessingException(
                 f'{os.path.basename(xyz_path)}: a {width} x {height} pixel raster at '
-                f'grid size {grid_size:.4f} is unreasonably large. The data is '
-                'probably not regularly gridded, so auto-detection produced a '
-                'too-small cell size — set an explicit Grid Size instead.')
-        feedback.pushInfo(f'Output raster: {width} x {height} pixels at {grid_size:.4f}')
+                f'grid spacing {grid_x:.4f} x {grid_y:.4f} is unreasonably large. '
+                'The data is probably not regularly gridded, so auto-detection '
+                'produced a too-small cell size — set an explicit Grid Size instead.')
+        feedback.pushInfo(
+            f'Output raster: {width} x {height} pixels at {grid_x:.4f} x {grid_y:.4f}')
 
+        grid_mean = (grid_x + grid_y) / 2.0
         max_distance = max_distance_param
         if method_index == self.METHOD_IDW and max_distance <= 0:
-            max_distance = grid_size * 3
+            max_distance = grid_mean * 3
             feedback.pushInfo(f'Using auto IDW search radius: {max_distance:.4f}')
-        elif method_index == self.METHOD_AVERAGE and max_distance <= 0:
-            # Circumscribed cell radius: every point in the cell contributes
-            # to its own cell with minimal bleed into the neighbours — the
-            # bin-and-average behaviour of dedicated MBES importers.
-            max_distance = grid_size * 0.7071
-            feedback.pushInfo(f'Using auto bin-average radius: {max_distance:.4f}')
 
-        # --- CSV + VRT bridge (unique names: parallel runs must not collide) ---
         temp_folder = QgsProcessingUtils.tempFolder()
         token = uuid.uuid4().hex[:8]
-        csv_name = f'xyz_{token}.csv'
-        temp_csv_path = os.path.join(temp_folder, csv_name)
-        np.savetxt(temp_csv_path, data, delimiter=',', header='x,y,z',
-                   comments='', fmt='%.12f')
-        vrt_path = os.path.join(temp_folder, f'xyz_{token}.vrt')
-        with open(vrt_path, 'w') as handle:
-            handle.write(f"""<OGRVRTDataSource>
+        temp_csv_path = None
+        vrt_path = None
+        if method_index != self.METHOD_AVERAGE:
+            # --- CSV + VRT bridge for the GDAL-tool methods (unique names:
+            # parallel runs must not collide). Bin averaging works on the
+            # in-memory array directly and skips this round-trip entirely.
+            csv_name = f'xyz_{token}.csv'
+            temp_csv_path = os.path.join(temp_folder, csv_name)
+            np.savetxt(temp_csv_path, data, delimiter=',', header='x,y,z',
+                       comments='', fmt='%.12f')
+            vrt_path = os.path.join(temp_folder, f'xyz_{token}.vrt')
+            with open(vrt_path, 'w') as handle:
+                handle.write(f"""<OGRVRTDataSource>
     <OGRVRTLayer name="points">
         <SrcDataSource>{temp_csv_path.replace(os.sep, '/')}</SrcDataSource>
         <SrcLayer>{os.path.splitext(csv_name)[0]}</SrcLayer>
@@ -409,8 +462,8 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
                     'INPUT': vrt_path,
                     'FIELD': 'z',
                     'UNITS': 1,               # georeferenced units
-                    'WIDTH': grid_size,
-                    'HEIGHT': grid_size,
+                    'WIDTH': grid_x,
+                    'HEIGHT': grid_y,
                     'EXTENT': extent,
                     'NODATA': -9999.0,
                     # Pre-fill the band: without -init, unwritten cells rely
@@ -421,8 +474,8 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
                 }, context=context, feedback=feedback)
             elif method_index == self.METHOD_AVERAGE:
                 result = self._run_average(
-                    vrt_path, extent, width, height, max_distance,
-                    output_raster_path, context, feedback)
+                    data, grid_x, grid_y, extent, width, height, target_crs,
+                    output_raster_path, feedback)
             else:
                 result = self._run_idw(
                     vrt_path, extent, width, height, max_distance,
@@ -475,7 +528,7 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
         finally:
             # The temp CSV duplicates the whole point cloud; reclaim it per
             # file so a long batch doesn't fill the temp drive.
-            stale_paths = [temp_csv_path, vrt_path]
+            stale_paths = [p for p in (temp_csv_path, vrt_path) if p]
             if output_raster_path != final_output:
                 stale_paths.append(output_raster_path)
             if fill_path and fill_path != final_output:
@@ -537,24 +590,38 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
             'OUTPUT': output_raster_path,
         }, context=context, feedback=feedback)
 
-    def _run_average(self, vrt_path, extent, width, height, radius,
-                     output_raster_path, context, feedback):
-        """Mean of the soundings around each cell centre (gdal:gridaverage) —
-        the bin-and-average import dedicated MBES tools use, so dense raw
-        soundings grid without last-point-wins noise."""
-        feedback.pushInfo('Using bin averaging (gdal:gridaverage)...')
-        return processing.run('gdal:gridaverage', {
-            'INPUT': vrt_path,
-            'Z_FIELD': 'z',
-            'RADIUS_1': radius,
-            'RADIUS_2': radius,
-            'ANGLE': 0.0,
-            'MIN_POINTS': 1,
-            'NODATA': -9999.0,
-            'DATA_TYPE': 5,               # Float32
-            'EXTRA': self._grid_extra(extent, width, height),
-            'OUTPUT': output_raster_path,
-        }, context=context, feedback=feedback)
+    def _run_average(self, data, grid_x, grid_y, extent, width, height,
+                     target_crs, output_raster_path, feedback):
+        """True per-cell binning: mean of the points in each pixel.
+
+        The bin-and-average import dedicated MBES tools use, so dense raw
+        soundings grid without last-point-wins noise. Pure NumPy binning
+        (each point contributes to exactly its containing cell — no radial
+        neighbourhood bleed) written straight through the GDAL bindings, so
+        this path needs no temp CSV/VRT round-trip of the point cloud.
+        """
+        from osgeo import gdal
+        feedback.pushInfo('Using bin averaging (per-cell mean, NumPy)...')
+        grid = bin_average_grid(
+            data[:, 0], data[:, 1], data[:, 2], grid_x, grid_y,
+            extent.xMinimum(), extent.yMaximum(), width, height)
+        driver = gdal.GetDriverByName('GTiff')
+        dataset = driver.Create(output_raster_path, width, height, 1,
+                                gdal.GDT_Float32)
+        if dataset is None:
+            raise QgsProcessingException(
+                f'Could not create output raster {output_raster_path}.')
+        try:
+            dataset.SetGeoTransform((extent.xMinimum(), grid_x, 0.0,
+                                     extent.yMaximum(), 0.0, -grid_y))
+            dataset.SetProjection(target_crs.toWkt())
+            band = dataset.GetRasterBand(1)
+            band.SetNoDataValue(-9999.0)
+            band.WriteArray(grid)
+            band.FlushCache()
+        finally:
+            dataset = None
+        return {'OUTPUT': output_raster_path}
 
     # --- Metadata ---
     def createInstance(self):
@@ -583,7 +650,7 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
   <li><b>Auto grid size:</b> with Grid Size at 0, the cell size is detected per file from the data spacing, so mixed-resolution deliveries (e.g. 0.5&nbsp;m and 1&nbsp;m tiles) each keep full accuracy.</li>
   <li><b>Cell registration:</b> XYZ coordinates are treated as cell centres, so output pixels align exactly with the source grid (no half-pixel shift).</li>
   <li><b>One CRS:</b> the chosen CRS applies to every file in the run.</li>
-  <li><b>Methods:</b> <i>Direct rasterisation</i> burns each point untouched — exact for pre-gridded MBES exports, but where several soundings share a cell only the last one survives. <i>Bin Average</i> writes the mean of the soundings around each cell centre (the behaviour of dedicated MBES importers) — use it for raw/scattered soundings. <i>IDW interpolation</i> distance-weights within a search radius and also fills small gaps, at the cost of smoothing.</li>
+  <li><b>Methods:</b> <i>Direct rasterisation</i> burns each point untouched — exact for pre-gridded MBES exports, but where several soundings share a cell only the last one survives. <i>Bin Average</i> writes the mean of the soundings falling in each pixel (true per-cell binning, the behaviour of dedicated MBES importers) — use it for raw/scattered soundings. <i>IDW interpolation</i> distance-weights within a search radius and also fills small gaps, at the cost of smoothing.</li>
   <li><b>Gap filling:</b> optionally interpolate no-data holes up to N cells across (GDAL fillnodata) after gridding; 0 leaves gaps as no-data.</li>
   <li><b>Compression:</b> LZW is lossless; outputs are tiled for fast display.</li>
 </ul>

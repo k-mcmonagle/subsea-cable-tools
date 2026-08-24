@@ -10,9 +10,12 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
+import bisect
+import math
+
 from ..slope_utils import (  # noqa: F401  (re-exported API)
-    auto_half_window_m, interval_slope_series, should_invert_depth_axis,
-    windowed_slope_series,
+    auto_half_window_m, contiguous_runs, interval_slope_series,
+    should_invert_depth_axis, windowed_slope_series,
 )
 
 
@@ -69,24 +72,100 @@ def slope_series(x_values: List[float], y_values: List[Optional[float]],
     return interval_slope_series(x_values, y_values, positive_down)
 
 
-def profile_slope_series(x_values: List[float],
-                         y_values: List[Optional[float]],
-                         pixel_size_m: Optional[float] = None,
-                         positive_down: Optional[bool] = None
-                         ) -> Tuple[List[Optional[float]], Optional[float]]:
-    """Slope series for the live profile, robust to sub-cell sampling.
+def composite_series_with_sources(profile: Dict
+                                  ) -> Tuple[List[float],
+                                             List[Optional[float]],
+                                             List[Optional[int]],
+                                             List[Optional[float]]]:
+    """:func:`composite_series` plus per-station provenance.
 
-    Central difference over ``x ± half_window`` where the half window is the
-    larger of the raster cell size and the median station spacing, so a
-    nearest-cell staircase on a coarse grid cannot read as near-vertical
-    spikes. Falls back to the per-interval series when no window can be
-    derived (fewer than two stations). Returns ``(slopes, half_window_m)``;
-    the half window is None on the fallback path.
+    Returns ``(x, y, source_index, cell_size_m)`` where ``source_index`` is
+    the index of the raster series that supplied each station (None for
+    no-data stations and for the contour fallback) and ``cell_size_m`` is
+    that raster's cell size, so slope evaluation can scale to — and refuse
+    to cross — the data that actually supplied each value.
     """
-    half_window_m = auto_half_window_m(x_values, pixel_size_m)
-    if half_window_m is None:
-        return slope_series(x_values, y_values, positive_down), None
-    slopes = windowed_slope_series(
-        x_values, y_values, half_window_m,
-        positive_down=positive_down, degenerate=None, mask_missing=True)
-    return slopes, half_window_m
+    rasters = profile.get("rasters", [])
+    if rasters:
+        x_values = rasters[0]["x"]
+        y_values: List[Optional[float]] = []
+        sources: List[Optional[int]] = []
+        cells: List[Optional[float]] = []
+        for index in range(len(x_values)):
+            value, source, cell = None, None, None
+            for r_index, series in enumerate(rasters):
+                candidate = series["y"][index] if index < len(series["y"]) else None
+                if candidate is not None:
+                    value, source = candidate, r_index
+                    cell = series.get("pixel_size_m")
+                    break
+            y_values.append(value)
+            sources.append(source)
+            cells.append(cell)
+        if any(value is not None for value in y_values):
+            return x_values, y_values, sources, cells
+    x_values, y_values = merged_contour_crossings(profile)
+    return x_values, y_values, [None] * len(x_values), [None] * len(x_values)
+
+
+def profile_slope_series(profile: Dict,
+                         positive_down: Optional[bool] = None
+                         ) -> Tuple[List[float], List[Optional[float]],
+                                    Optional[float]]:
+    """Slope for the live profile: cell-scaled windows, no bridged seams.
+
+    Slope at each station is a central difference over ``x ± half`` where
+    ``half`` is the larger of that station's own source-raster cell size and
+    the median station spacing — sub-cell nearest-neighbour sampling cannot
+    read as a staircase of near-vertical spikes, and a fine grid is not
+    over-smoothed just because a coarser raster exists elsewhere on the
+    line. The window is evaluated strictly within one contiguous run of
+    same-source valid stations: a window touching a no-data gap or a raster
+    seam yields None (a datum offset between two grids must surface as a
+    visible gap, never as a fabricated slope). Returns
+    ``(x, slopes, max_half_window_m)`` aligned to the composite stations.
+    """
+    xs, ys, sources, cells = composite_series_with_sources(profile)
+    n = len(xs)
+    if n < 2:
+        return xs, [None] * n, None
+    if positive_down is None:
+        positive_down = should_invert_depth_axis(ys)
+    sign = 1.0 if positive_down is False else -1.0
+    gaps = sorted(xs[i + 1] - xs[i] for i in range(n - 1)
+                  if xs[i + 1] > xs[i])
+    if not gaps:
+        return xs, [None] * n, None
+    spacing = gaps[len(gaps) // 2]
+    slopes: List[Optional[float]] = [None] * n
+    max_half = None
+    for start, end in contiguous_runs(xs, ys, group_ids=sources):
+        run_x = xs[start:end + 1]
+        run_y = ys[start:end + 1]
+        for offset, x in enumerate(run_x):
+            index = start + offset
+            half = max(cells[index] or 0.0, spacing)
+            k0 = max(run_x[0], x - half)
+            k1 = min(run_x[-1], x + half)
+            if k1 - k0 <= 1e-6:
+                continue
+            d0 = _interp_run(run_x, run_y, k0)
+            d1 = _interp_run(run_x, run_y, k1)
+            slopes[index] = math.degrees(math.atan2(sign * (d1 - d0), k1 - k0))
+            if max_half is None or half > max_half:
+                max_half = half
+    return xs, slopes, max_half
+
+
+def _interp_run(run_x: List[float], run_y: List[float], x: float) -> float:
+    """Linear interpolation inside one contiguous all-valid run."""
+    index = bisect.bisect_left(run_x, x)
+    if index <= 0:
+        return run_y[0]
+    if index >= len(run_x):
+        return run_y[-1]
+    x0, x1 = run_x[index - 1], run_x[index]
+    if x1 - x0 <= 1e-12:
+        return run_y[index]
+    t = (x - x0) / (x1 - x0)
+    return run_y[index - 1] + t * (run_y[index] - run_y[index - 1])

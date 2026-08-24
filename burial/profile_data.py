@@ -331,15 +331,20 @@ def slope_component_series(kps: List[float], depths: List[Optional[float]],
                            stbd_depths: List[Optional[float]],
                            cross_offset_m: float, direction: int,
                            component: str,
-                           half_window_km: float) -> List[Sample]:
+                           half_window_km: float,
+                           require_cross: bool = False) -> List[Sample]:
     """(kp, value|None) series for one slope component, for criteria checks.
 
     ``long`` is signed (+ve = up-slope) so directional limits apply; ``cross``
     is reported as a magnitude (a limit catches leaning either way);
-    ``absolute`` is the combined-gradient magnitude, matching the profile
-    pane (|longitudinal| where cross samples are missing — a lower bound).
-    ``half_window_km`` scales the longitudinal difference; cross is always
-    the two-point difference across the sampled ± cross offset.
+    ``absolute`` is the combined-gradient magnitude. With ``require_cross``
+    False (display) it matches the profile pane, reporting |longitudinal|
+    where cross samples are missing (a labelled lower bound); with
+    ``require_cross`` True (rule evaluation) those stations are None so a
+    criterion can never pass on an under-reported lower bound — they surface
+    as Insufficient Information instead. ``half_window_km`` scales the
+    longitudinal difference; cross is always the two-point difference across
+    the sampled ± cross offset.
     """
     long_series = long_slope_series(kps, depths, half_window_km)
     if component == SLOPE_COMPONENT_LONG:
@@ -350,16 +355,20 @@ def slope_component_series(kps: List[float], depths: List[Optional[float]],
         return [(kp, None if value is None else abs(value))
                 for kp, value in cross_series]
     if component == SLOPE_COMPONENT_ABSOLUTE:
-        return absolute_slope_series(long_series, cross_series)
+        return absolute_slope_series(long_series, cross_series,
+                                     require_cross=require_cross)
     raise ValueError(f"unknown slope component '{component}'")
 
 
 def absolute_slope_series(long_series: List[Sample],
-                          cross_series: List[Sample]) -> List[Sample]:
+                          cross_series: List[Sample],
+                          require_cross: bool = False) -> List[Sample]:
     """Magnitude of the combined gradient per station (°), never negative.
 
     Where cross slope is unavailable the longitudinal magnitude is reported
-    (a lower bound on the true absolute slope).
+    (a lower bound on the true absolute slope) — unless ``require_cross``,
+    which reports None there so rule evaluation treats the station as
+    no-data rather than trusting a lower bound.
     """
     # Both series are built over the same station list, so positional
     # pairing applies; the float-keyed dict is only the fallback for
@@ -378,7 +387,7 @@ def absolute_slope_series(long_series: List[Sample],
             out.append((kp, None))
             continue
         if cross_deg is None:
-            out.append((kp, abs(long_deg)))
+            out.append((kp, None if require_cross else abs(long_deg)))
             continue
         gradient = math.hypot(math.tan(math.radians(long_deg)),
                               math.tan(math.radians(cross_deg)))

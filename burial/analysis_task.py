@@ -1287,10 +1287,13 @@ class BurialAnalysisTask(QgsTask):
                 "Profile tab")
         slope_step_km = max(float(work.depth_step_m or work.step_m), 1.0) / 1000.0
         half_km = ri.slope_half_window_km(config, slope_step_km) or slope_step_km
+        # require_cross: an absolute-slope *rule* must never pass on the
+        # |longitudinal| lower bound the display pane shows where cross
+        # samples are missing — those stations go no-data -> Insufficient.
         series = profile_data.slope_component_series(
             kps, cross.get("depths") or [], cross.get("port") or [],
             cross.get("stbd") or [], float(cross.get("cross_offset_m") or 0.0),
-            work.direction, component, half_km)
+            work.direction, component, half_km, require_cross=True)
         valid = [(kp, value) for kp, value in series if value is not None]
         if not valid:
             raise ri.RuleInputError(
