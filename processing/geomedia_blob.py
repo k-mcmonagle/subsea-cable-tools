@@ -17,6 +17,7 @@ importing as zero features:
 type code                        body
 ===============================  ==========================================
 0xC0 point, 0xC8 oriented point  three doubles - **no point count**
+0xC1 line segment                six doubles (two XYZ vertices) - no count
 0xC2 polyline, 0xC3 polygon      int32 point count, then 24 bytes per point
 0xC5 boundary                    int32 size + exterior, int32 size + interior
 0xC6 collection, 0xCB multiline, int32 part count, then int32 size + part
@@ -39,6 +40,7 @@ HEADER_SIGNATURE = bytes.fromhex("ffd20f")
 HEADER_SIZE = 16
 
 GEOMEDIA_POINT = 0xC0
+GEOMEDIA_LINE = 0xC1
 GEOMEDIA_POLYLINE = 0xC2
 GEOMEDIA_POLYGON = 0xC3
 GEOMEDIA_BOUNDARY = 0xC5
@@ -187,6 +189,13 @@ def decode_geometry_blob(blob, _depth=0):
                 return None
             vertex = struct.unpack_from("<ddd", body, 0)
             return GeomediaGeometry("Point", ((vertex,),), ())
+
+        if type_code == GEOMEDIA_LINE:
+            if len(body) < 48:
+                return None
+            start = struct.unpack_from("<ddd", body, 0)
+            end = struct.unpack_from("<ddd", body, 24)
+            return GeomediaGeometry("LineString", ((start, end),), ())
 
         if type_code in (GEOMEDIA_POLYLINE, GEOMEDIA_POLYGON):
             vertices = _read_vertices(body)

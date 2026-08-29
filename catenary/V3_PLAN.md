@@ -173,7 +173,7 @@ junction nodes:
   the mode's validity bound.
 - New `V3_MODEL_NOTES.md` in the same style as MODEL_NOTES.md: what each
   mode computes, assumptions, what it must not be used for, validation
-  status (including "not verified against OrcaFlex/MakaiLay or field data"
+  status (including "not verified against OrcaFlex or field data"
   until that comparison exists).
 
 ## 4. 3D viewport (no new dependencies)

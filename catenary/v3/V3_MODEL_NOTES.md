@@ -18,7 +18,7 @@ and constants distilled from the reference papers, with sources).
 > `tests/test_v3_timeline.py` and (quick model, controllers, inverse
 > planner, joints/counts) `tests/test_v3_quick_bu.py`,
 > `tests/test_v3_bu_full.py`, `tests/test_v3_bu_plan.py`. It has **not** been verified against
-> commercial lay-simulation software (OrcaFlex, MakaiLay) or measured field
+> commercial lay-simulation software (e.g. OrcaFlex) or measured field
 > data. Treat results as planning-grade estimates, not engineering sign-off
 > values. The tool is released as a **beta**.
 

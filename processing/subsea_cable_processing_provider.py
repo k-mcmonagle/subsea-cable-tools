@@ -83,6 +83,7 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
 
         # --- MDB Tools ---
         safe_add('import_mdb_algorithm', 'ImportMdbAlgorithm')
+        safe_add('import_path_file_algorithm', 'ImportPathFileAlgorithm')
 
         # --- MBES Tools ---
         safe_add('create_mbes_raster_from_xyz_algorithm', 'CreateMBESRasterFromXYZAlgorithm')

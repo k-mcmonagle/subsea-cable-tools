@@ -125,9 +125,12 @@ class WorkbenchDock(QDockWidget):
         new_menu = QMenu(new_btn)
         new_menu.addAction("New system...", self._new_system)
         new_menu.addAction("New cable segment...", self._new_route)
-        new_menu.addAction("Import RPL...", self._import_rpl)
-        new_menu.addAction("Add RPL from layers...", self._register_rpl)
+        new_menu.addSeparator()
+        new_menu.addAction("Import RPL (Excel/CSV)...", self._import_rpl)
+        new_menu.addAction("Import path file (.pthmdb)...", self._import_path_file)
         new_menu.addAction("New RPL from route line or points (KML...)...", self._import_rpl_from_line)
+        new_menu.addAction("Add RPL from layers...", self._register_rpl)
+        new_menu.addSeparator()
         new_menu.addAction("New assembly...", self._new_assembly)
         new_menu.addAction("Manage assemblies...", self._manage_assemblies)
         new_menu.addAction("New assessment...", self._new_assessment)
@@ -891,15 +894,18 @@ class WorkbenchDock(QDockWidget):
         if not ref:
             menu.addAction("New system...", self._new_system)
             menu.addAction("New cable segment...", self._new_route)
-            menu.addAction("Import RPL...", self._import_rpl)
+            menu.addAction("Import RPL (Excel/CSV)...", self._import_rpl)
+            menu.addAction("Import path file (.pthmdb)...", self._import_path_file)
         elif ref[0] == KIND_GROUP and ref[1] == GROUP_UNASSIGNED_SEGMENTS:
             menu.addAction("New system...", self._new_system)
             menu.addAction("New cable segment...", self._new_route)
-            menu.addAction("Import RPL...", self._import_rpl)
+            menu.addAction("Import RPL (Excel/CSV)...", self._import_rpl)
+            menu.addAction("Import path file (.pthmdb)...", self._import_path_file)
             menu.addAction("Add RPL from layers...", self._register_rpl)
         elif ref[0] == KIND_SYSTEM:
             menu.addAction("New cable segment...", self._new_route)
-            menu.addAction("Import RPL...", self._import_rpl)
+            menu.addAction("Import RPL (Excel/CSV)...", self._import_rpl)
+            menu.addAction("Import path file (.pthmdb)...", self._import_path_file)
             menu.addAction("Rename system...", self._rename_system)
             menu.addAction("Delete system", self._delete_selected)
         elif ref[0] == KIND_ROUTE:
@@ -907,9 +913,10 @@ class WorkbenchDock(QDockWidget):
             menu.addAction("Create assembly for segment...", self._create_assembly_for_selected_segment)
             menu.addSeparator()
             menu.addAction("New RPL revision...", self._new_rpl_revision)
-            menu.addAction("Import RPL...", self._import_rpl)
-            menu.addAction("Add RPL from layers...", self._register_rpl)
+            menu.addAction("Import RPL (Excel/CSV)...", self._import_rpl)
+            menu.addAction("Import path file (.pthmdb)...", self._import_path_file)
             menu.addAction("New RPL from route line or points (KML...)...", self._import_rpl_from_line)
+            menu.addAction("Add RPL from layers...", self._register_rpl)
             menu.addAction("Fit assembly...", self._fit_selected_rpl)
             menu.addAction("New assessment...", self._new_assessment)
             self._add_assign_system_menu(menu)
@@ -917,9 +924,10 @@ class WorkbenchDock(QDockWidget):
             menu.addAction("Delete cable segment", self._delete_selected)
         elif ref[0] == KIND_RPL_GROUP:
             menu.addAction("New RPL revision...", self._new_rpl_revision)
-            menu.addAction("Import RPL...", self._import_rpl)
-            menu.addAction("Add RPL from layers...", self._register_rpl)
+            menu.addAction("Import RPL (Excel/CSV)...", self._import_rpl)
+            menu.addAction("Import path file (.pthmdb)...", self._import_path_file)
             menu.addAction("New RPL from route line or points (KML...)...", self._import_rpl_from_line)
+            menu.addAction("Add RPL from layers...", self._register_rpl)
         elif ref[0] == KIND_ASSEMBLY_GROUP:
             menu.addAction("Add existing assembly...", self._add_assembly_to_selected_segment)
             menu.addAction("Create assembly for segment...", self._create_assembly_for_selected_segment)
@@ -1168,6 +1176,39 @@ class WorkbenchDock(QDockWidget):
         if system_id:
             row = store.get_rpl(dialog.rpl_id) or {}
             store.assign_route_to_system(row.get("route_id") or "", system_id)
+        self.rpl_panel.refresh_rpl_list()
+        self.refresh_tree()
+        self._select_ref((KIND_RPL, dialog.rpl_id))
+        self.rpl_panel.select_rpl(dialog.rpl_id)
+
+    def _import_path_file(self):
+        """Import a path file (.pthmdb) as an RPL revision."""
+        store = self._store()
+        if store is None:
+            QMessageBox.information(
+                self, "Import path file",
+                "Open or create a Workbench file first (File...).")
+            return
+        from .pthmdb_import import PthmdbImportDialog
+        from ..qgis_compat import DIALOG_ACCEPTED, qt_exec
+
+        route_id = self._selected_route_id()
+        route = store.get_route(route_id) if route_id else None
+        dialog = PthmdbImportDialog(
+            store, parent=self, route_name=(route or {}).get("name") or "")
+        if qt_exec(dialog) != DIALOG_ACCEPTED or not dialog.rpl_id:
+            return
+        system_id = self._selected_system_id() or ""
+        if system_id:
+            row = store.get_rpl(dialog.rpl_id) or {}
+            store.assign_route_to_system(row.get("route_id") or "", system_id)
+        if dialog.extract_assembly:
+            try:
+                self.assembly_panel.extract_from_rpl_id(dialog.rpl_id)
+            except Exception as exc:  # RPL committed; extraction is best-effort
+                QMessageBox.warning(
+                    self, "Import path file",
+                    f"RPL imported, but assembly extraction failed: {exc}")
         self.rpl_panel.refresh_rpl_list()
         self.refresh_tree()
         self._select_ref((KIND_RPL, dialog.rpl_id))

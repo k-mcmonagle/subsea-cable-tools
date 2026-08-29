@@ -11,7 +11,7 @@ from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 PACKAGE_NAME = "subsea_cable_tools"
-EXPECTED_ALGORITHM_COUNT = 39
+EXPECTED_ALGORITHM_COUNT = 40
 
 
 def _require_qgis() -> None:
@@ -122,6 +122,7 @@ def main() -> int:
         ("RPL import core (pure)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_rpl_import_core")),
         ("RPL import commit service", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_rpl_import_commit")),
         ("RPL from route line (KML)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_rpl_from_line")),
+        ("Path file import (.pthmdb)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_pthmdb_import")),
         ("MBES XYZ raster tools", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_mbes_xyz_tools")),
         ("shared slope math (pure)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_slope_utils")),
         ("KP Mouse profile math (pure)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_kp_profile_math")),

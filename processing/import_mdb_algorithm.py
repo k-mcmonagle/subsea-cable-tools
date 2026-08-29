@@ -988,7 +988,7 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
             if isolate:
                 out_base = os.path.join(temp_dir, _safe_temp_stem(table_name))
                 # Always split in the worker.
-                # Rationale: GeoMedia/Makai MDB metadata can mislabel geometry types; splitting is the most
+                # Rationale: GeoMedia MDB metadata can mislabel geometry types; splitting is the most
                 # reliable way to prevent LineString features being imported as Points.
                 info = self._run_worker(
                     [
