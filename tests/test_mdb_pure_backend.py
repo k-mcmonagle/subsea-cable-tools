@@ -27,7 +27,7 @@ def test_gfeatures_interpretation():
     col_names = ["GeometryType", "Name", "PrimaryGeometryFieldName", "Description"]
     rows = [
         (1, "Bathy_Major", "LinearGeometry", ""),
-        (33, "Coverage_Image", "Raster", ""),          # filtered: type 33
+        (33, "Description", "", ""),                   # text class, field resolved later
         (2, "Areas", "AreaGeometry", ""),
         ("bad", "Broken", "Geom", ""),                 # filtered: non-numeric type
         (1, None, "Geom", ""),                         # filtered: no name
@@ -35,6 +35,7 @@ def test_gfeatures_interpretation():
     out = worker._feature_tables_from_gfeatures(col_names, rows)
     ok = out == {
         "Bathy_Major": {"geom_field_name": "LinearGeometry", "geometry_type_code": 1},
+        "Description": {"geom_field_name": "", "geometry_type_code": 33},
         "Areas": {"geom_field_name": "AreaGeometry", "geometry_type_code": 2},
     }
     return _result("GFeatures rows filtered and mapped", ok, str(out))

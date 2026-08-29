@@ -100,9 +100,14 @@ _METADATA_PREFIXES = ("MSYS", "USYS", "GDO")
 _COMPANION_SUFFIXES = ("_NAME", "_TEXT", "_ANNOTATION", "_LABEL")
 
 #: Field names GeoMedia commonly uses for the geometry BLOB itself.
+#: ``graphictext`` covers text feature classes (e.g. a ``GraphicText`` column)
+#: whose GFeatures row leaves PrimaryGeometryFieldName empty.
 _GEOMETRY_FIELD_HINTS = (
-    "geometry", "geom", "coordgeocode",
+    "geometry", "geom", "coordgeocode", "graphictext",
 )
+
+#: GFeatures geometry type code for graphic (text/coverage) feature classes.
+GRAPHIC_TYPE_CODE = 33
 
 #: Explicit, ordered coordinate-pair aliases. Pairs are never mixed across
 #: families, so a Depth column can never be taken as a Y ordinate.
@@ -249,11 +254,19 @@ def find_candidate_z_field(col_names, exclude=()):
 
 
 def find_candidate_geometry_fields(col_names):
-    """Return fields whose names look like GeoMedia geometry BLOB columns."""
-    return [
-        name for name in col_names
-        if any(hint in normalise_field_name(name) for hint in _GEOMETRY_FIELD_HINTS)
-    ]
+    """Return fields whose names look like GeoMedia geometry BLOB columns.
+
+    ``*_sk`` companions are spatial-key indexes, never geometry BLOBs, so they
+    are excluded even though their names contain a geometry hint.
+    """
+    candidates = []
+    for name in col_names:
+        normalised = normalise_field_name(name)
+        if normalised.endswith("_sk"):
+            continue
+        if any(hint in normalised for hint in _GEOMETRY_FIELD_HINTS):
+            candidates.append(name)
+    return candidates
 
 
 def _finite_number(value):
@@ -469,12 +482,14 @@ def _feature_tables_from_gfeatures(col_names, rows):
             geometry_type = int(row[type_i])
         except (TypeError, ValueError):
             continue
-        if geometry_type == 33:
+        if row[name_i] is None:
             continue
-        if row[name_i] is None or row[field_i] is None:
+        # Graphic (text) classes routinely leave PrimaryGeometryFieldName
+        # empty; the export resolves the BLOB column from the table schema.
+        if row[field_i] is None and geometry_type != GRAPHIC_TYPE_CODE:
             continue
         out[str(row[name_i])] = {
-            "geom_field_name": str(row[field_i]),
+            "geom_field_name": str(row[field_i] or ""),
             "geometry_type_code": geometry_type,
         }
     return out
@@ -902,7 +917,7 @@ def _resolve_geometry_field(col_names, geom_field_name):
 
 
 def _decode_row_geometry(blob_bytes, geometry_type_code, forced_kind=None):
-    """Return ``(geojson, kind, mean_z)`` for a decodable BLOB, else ``None``."""
+    """Return ``(geojson, kind, mean_z, text)`` for a decodable BLOB, else ``None``."""
     decoded = decode_geometry_blob(blob_bytes)
     if decoded is None:
         return None
@@ -916,7 +931,8 @@ def _decode_row_geometry(blob_bytes, geometry_type_code, forced_kind=None):
     geometry = geojson_for_kind(kind, decoded)
     if geometry is None:
         return None
-    return geometry, kind, sum(v[2] for v in vertices) / len(vertices)
+    mean_z = sum(v[2] for v in vertices) / len(vertices)
+    return geometry, kind, mean_z, decoded.text
 
 
 def _write_rows_to_geojson(mdb_path, table_name, col_names, rows,
@@ -933,6 +949,15 @@ def _write_rows_to_geojson(mdb_path, table_name, col_names, rows,
 
     geom_index, geom_field_name, geom_field_missing = _resolve_geometry_field(
         col_names, geom_field_name)
+
+    # Graphic (text) classes are registered without a primary geometry field;
+    # take the first schema column that looks like a geometry BLOB instead.
+    if geom_index is None and not geom_field_missing and \
+            geometry_type_code == GRAPHIC_TYPE_CODE:
+        candidates = find_candidate_geometry_fields(col_names)
+        if candidates:
+            geom_field_name = candidates[0]
+            geom_index = col_names.index(geom_field_name)
 
     # GFeatures names only the *primary* geometry column; GeoMedia tables often
     # carry a second one (e.g. CoordGeocodePoint) that holds the geometry for
@@ -951,7 +976,8 @@ def _write_rows_to_geojson(mdb_path, table_name, col_names, rows,
     layer_type = None
     if not split:
         layer_type = _layer_type_for_code(geometry_type_code)
-        if layer_type is None and geometry_type_code not in (10, None, -1):
+        # 10 (point-like) and 33 (graphic/text) defer to the decoded BLOBs.
+        if layer_type is None and geometry_type_code not in (10, GRAPHIC_TYPE_CODE, None, -1):
             return make_table_result(
                 table_name,
                 "unsupported",
@@ -987,12 +1013,13 @@ def _write_rows_to_geojson(mdb_path, table_name, col_names, rows,
             geometry_source = None
             depth = None
             kind = None
+            label_text = None
             forced_kind = layer_type if not split else None
 
             attempt = (_decode_row_geometry(blob_bytes, geometry_type_code, forced_kind)
                        if blob_bytes is not None else None)
             if attempt is not None:
-                geometry, kind, depth = attempt
+                geometry, kind, depth, label_text = attempt
                 geometry_source = "blob"
                 blob_decoded_count += 1
                 if not split and layer_type is None:
@@ -1008,7 +1035,7 @@ def _write_rows_to_geojson(mdb_path, table_name, col_names, rows,
                     attempt = _decode_row_geometry(alternate, geometry_type_code, forced_kind)
                     if attempt is None:
                         continue
-                    geometry, kind, depth = attempt
+                    geometry, kind, depth, label_text = attempt
                     geometry_source = "secondary_blob"
                     secondary_blob_decoded_count += 1
                     if not split and layer_type is None:
@@ -1047,6 +1074,11 @@ def _write_rows_to_geojson(mdb_path, table_name, col_names, rows,
             props["depth"] = depth
             props["source"] = source_name
             props["geometry_source"] = geometry_source
+            if label_text is not None:
+                key = "label_text"
+                if key in props:
+                    key = "gm_label_text"
+                props[key] = label_text
 
             feature = {"type": "Feature", "geometry": geometry, "properties": props}
             if not sink.write(str(kind), feature):

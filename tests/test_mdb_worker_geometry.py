@@ -61,6 +61,18 @@ def boundary_blob(exterior, interior):
             + struct.pack("<i", len(inner)) + inner)
 
 
+def text_blob(x, y, text, z=0.0, encoding="cp1252", count=None):
+    payload = text.encode(encoding)
+    if count is None:
+        count = len(text) if encoding == "utf-16-le" else len(payload)
+    return (_header(geomedia_blob.GEOMEDIA_TEXT)
+            + struct.pack("<ddd", x, y, z)
+            + struct.pack("<dddd", 0.0, 0.0, 0.0, 1.0)
+            + bytes.fromhex("00000109")
+            + struct.pack("<i", count)
+            + payload)
+
+
 def collection_blob(type_code, sub_blobs):
     body = struct.pack("<i", len(sub_blobs))
     for sub in sub_blobs:
@@ -138,6 +150,50 @@ def test_collection_of_points_decodes_to_multipoint():
     blob = collection_blob(geomedia_blob.GEOMEDIA_COLLECTION,
                            [point_blob(1.0, 2.0), point_blob(3.0, 4.0)])
     assert geomedia_blob.decode_geometry_blob(blob).kind == "MultiPoint"
+
+
+def test_text_blob_decodes_to_point_with_label():
+    decoded = geomedia_blob.decode_geometry_blob(text_blob(107.15, -5.89, "ECHO-S3-TS-SC001"))
+    assert decoded.kind == "Point"
+    assert decoded.rings[0][0][:2] == (107.15, -5.89)
+    assert decoded.text == "ECHO-S3-TS-SC001"
+
+
+def test_text_blob_decodes_cp1252_labels():
+    # Slope annotations use the Windows-1252 degree sign.
+    decoded = geomedia_blob.decode_geometry_blob(text_blob(108.07, -4.07, "12°"))
+    assert decoded.text == "12°"
+
+
+def test_text_blob_decodes_utf16_labels():
+    decoded = geomedia_blob.decode_geometry_blob(
+        text_blob(1.0, 2.0, "Sand wave", encoding="utf-16-le"))
+    assert decoded.kind == "Point"
+    assert decoded.text == "Sand wave"
+
+
+def test_text_blob_with_empty_label_still_yields_the_point():
+    decoded = geomedia_blob.decode_geometry_blob(text_blob(3.0, 4.0, ""))
+    assert decoded.kind == "Point"
+    assert decoded.text == ""
+
+
+def test_malformed_text_blobs_are_rejected():
+    good = text_blob(1.0, 2.0, "abc")
+    # Body shorter than origin + quaternion + flags + count.
+    assert geomedia_blob.decode_geometry_blob(good[:16 + 63]) is None
+    # Negative byte count.
+    bad_count = good[:16 + 60] + struct.pack("<i", -5) + b"abc"
+    assert geomedia_blob.decode_geometry_blob(bad_count) is None
+    # A count larger than the payload keeps what is present rather than failing.
+    truncated = geomedia_blob.decode_geometry_blob(good[:-1])
+    assert truncated.kind == "Point"
+    assert truncated.text == "ab"
+
+
+def test_non_text_geometries_carry_no_text():
+    assert geomedia_blob.decode_geometry_blob(point_blob(1.0, 2.0)).text is None
+    assert geomedia_blob.decode_geometry_blob(line_blob(TRACK)).text is None
 
 
 def test_unknown_and_malformed_blobs_are_rejected():
@@ -552,6 +608,63 @@ def test_non_spatial_table_is_reported_without_invented_geometry(monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# Text (graphic) feature classes
+# --------------------------------------------------------------------------
+
+def test_text_table_exports_points_with_label_text(tmp_path):
+    # Real GeoMedia text tables: TextGeometry BLOB plus a TextGeometry_sk
+    # spatial key, and an empty PrimaryGeometryFieldName in GFeatures.
+    rows = [
+        (1, text_blob(107.15, -5.89, "Possible GRAVEL patch"), b"\x01\x02"),
+        (2, text_blob(107.16, -5.90, "12°"), b"\x03\x04"),
+    ]
+    result = _export(tmp_path, ["ID1", "TextGeometry", "TextGeometry_sk"],
+                     rows, "", 33)
+    assert result["status"] == "success"
+    assert result["geometry_types_found"] == ["Point"]
+    assert result["geometry_fields_used"] == ["TextGeometry"]
+    features = _features(result, "Point")
+    assert [f["properties"]["label_text"] for f in features] == [
+        "Possible GRAVEL patch", "12°"]
+    assert features[0]["geometry"]["coordinates"] == [107.15, -5.89]
+    # The spatial key is not mistaken for the geometry BLOB.
+    assert features[0]["properties"]["TextGeometry_sk"] == "<binary:2>"
+
+
+def test_text_table_resolves_a_graphictext_column(tmp_path):
+    # Bathy slope annotations name the BLOB column GraphicText.
+    rows = [(1, text_blob(108.07, -4.07, "9°"), None)]
+    result = _export(tmp_path, ["ID1", "GraphicText", "GraphicText_sk"], rows, "", 33)
+    assert result["status"] == "success"
+    assert result["geometry_fields_used"] == ["GraphicText"]
+    assert _features(result, "Point")[0]["properties"]["label_text"] == "9°"
+
+
+def test_text_table_null_geometry_rows_are_skipped_not_fatal(tmp_path):
+    rows = [
+        (1, None, None),
+        (2, text_blob(1.0, 2.0, "abc"), None),
+    ]
+    result = _export(tmp_path, ["ID1", "TextGeometry", "TextGeometry_sk"], rows, "", 33)
+    assert result["status"] == "success"
+    assert result["written"] == 1
+    assert result["row_count"] == 2
+
+
+def test_spatial_key_columns_are_not_geometry_candidates():
+    assert worker.find_candidate_geometry_fields(
+        ["ID1", "TextGeometry", "TextGeometry_sk"]) == ["TextGeometry"]
+    assert worker.find_candidate_geometry_fields(
+        ["ID1", "GraphicText", "GraphicText_sk"]) == ["GraphicText"]
+
+
+def test_non_text_tables_do_not_gain_a_label_field(tmp_path):
+    result = _export(tmp_path, ["Id", "Geometry"], [(1, line_blob(TRACK))], "Geometry", 1)
+    props = _features(result, "LineString")[0]["properties"]
+    assert "label_text" not in props
+
+
+# --------------------------------------------------------------------------
 # Preserved behaviour
 # --------------------------------------------------------------------------
 
@@ -560,12 +673,15 @@ def test_gfeatures_interpretation_is_unchanged():
     rows = [
         (1, "Bathy_Major", "LinearGeometry", ""),
         (33, "Coverage_Image", "Raster", ""),
+        (33, "Description", None, ""),
         (2, "Areas", "AreaGeometry", ""),
         ("bad", "Broken", "Geom", ""),
         (1, None, "Geom", ""),
     ]
     assert worker._feature_tables_from_gfeatures(col_names, rows) == {
         "Bathy_Major": {"geom_field_name": "LinearGeometry", "geometry_type_code": 1},
+        "Coverage_Image": {"geom_field_name": "Raster", "geometry_type_code": 33},
+        "Description": {"geom_field_name": "", "geometry_type_code": 33},
         "Areas": {"geom_field_name": "AreaGeometry", "geometry_type_code": 2},
     }
 

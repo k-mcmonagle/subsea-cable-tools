@@ -22,6 +22,11 @@ type code                        body
 0xC5 boundary                    int32 size + exterior, int32 size + interior
 0xC6 collection, 0xCB multiline, int32 part count, then int32 size + part
 0xCC multipolygon
+0xC9 graphic text                origin XYZ (3 doubles), orientation
+                                 quaternion (4 doubles), 4 opaque bytes
+                                 (alignment/format flags), int32 byte count,
+                                 then the label bytes (Windows-1252, or
+                                 UTF-16LE when the payload is twice the count)
 ===============================  ==========================================
 
 A reader that always treats bytes 16..19 as a point count therefore decodes
@@ -46,6 +51,7 @@ GEOMEDIA_POLYGON = 0xC3
 GEOMEDIA_BOUNDARY = 0xC5
 GEOMEDIA_COLLECTION = 0xC6
 GEOMEDIA_ORIENTED_POINT = 0xC8
+GEOMEDIA_TEXT = 0xC9
 GEOMEDIA_MULTILINE = 0xCB
 GEOMEDIA_MULTIPOLYGON = 0xCC
 
@@ -57,8 +63,11 @@ MULTI_KINDS = ("MultiPoint", "MultiLineString", "MultiPolygon", "GeometryCollect
 
 
 #: ``rings`` holds vertex tuples for simple geometries (a polygon's first ring
-#: is its exterior); ``parts`` holds nested geometries for collections.
-GeomediaGeometry = namedtuple("GeomediaGeometry", ("kind", "rings", "parts"))
+#: is its exterior); ``parts`` holds nested geometries for collections;
+#: ``text`` carries the label string of a graphic-text (0xC9) blob, ``None``
+#: for every other geometry kind.
+GeomediaGeometry = namedtuple(
+    "GeomediaGeometry", ("kind", "rings", "parts", "text"), defaults=(None,))
 
 
 def coerce_blob_bytes(value):
@@ -170,6 +179,28 @@ def _decode_boundary(body, depth):
     return GeomediaGeometry("Polygon", tuple(rings), ())
 
 
+#: Text body: origin (24) + quaternion (32) + flag bytes (4) + byte count (4).
+_TEXT_BODY_MIN = 64
+
+
+def _decode_text(body):
+    if len(body) < _TEXT_BODY_MIN:
+        return None
+    vertex = struct.unpack_from("<ddd", body, 0)
+    count = _read_int32(body, 60)
+    if count is None or count < 0:
+        return None
+    payload = body[_TEXT_BODY_MIN:]
+    # GeoMedia writes the label in the database code page with ``count`` bytes;
+    # some writers store UTF-16LE instead, in which case the payload holds two
+    # bytes per counted character.
+    if count and len(payload) >= 2 * count and not any(payload[1:2 * count:2]):
+        text = payload[:2 * count].decode("utf-16-le", "replace")
+    else:
+        text = payload[:count].decode("cp1252", "replace")
+    return GeomediaGeometry("Point", ((vertex,),), (), text)
+
+
 def decode_geometry_blob(blob, _depth=0):
     """Decode a GeoMedia geometry BLOB, or return ``None`` if unrecognised."""
     if _depth > _MAX_NESTING:
@@ -203,6 +234,9 @@ def decode_geometry_blob(blob, _depth=0):
                 return None
             kind = "LineString" if type_code == GEOMEDIA_POLYLINE else "Polygon"
             return GeomediaGeometry(kind, (tuple(vertices),), ())
+
+        if type_code == GEOMEDIA_TEXT:
+            return _decode_text(body)
 
         if type_code == GEOMEDIA_BOUNDARY:
             return _decode_boundary(body, _depth)

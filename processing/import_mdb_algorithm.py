@@ -44,7 +44,8 @@ from ..qgis_compat import (
     processing_generate_temp_filename,
     processing_temp_folder,
 )
-from .geomedia_blob import parse_blob  # noqa: F401 - re-exported for callers/tests
+from .geomedia_blob import decode_geometry_blob, parse_blob  # noqa: F401 - re-exported for callers/tests
+from .mdb_odbc_worker import GRAPHIC_TYPE_CODE, find_candidate_geometry_fields
 
 
 ACCESS_ODBC_DRIVER_NAME = "Microsoft Access Driver (*.mdb, *.accdb)"
@@ -248,9 +249,6 @@ def get_feature_tables(mdb_file, feedback):
                 )
                 + " FROM "
                 + _quote_access_identifier(gfeatures_table)
-                + " WHERE "
-                + _quote_access_identifier(geom_type_col)
-                + " <> 33"
             )
             feedback.pushInfo(f"Executing SQL: {sql}")
             cursor.execute(sql)
@@ -384,6 +382,14 @@ def import_table_as_memory_layer(mdb_file, table_name, geom_field_name, geometry
     try:
         with pyodbc.connect(conn_str) as conn:
             cursor = conn.cursor()
+            if not geom_field_name and geometry_type_code == GRAPHIC_TYPE_CODE:
+                # Text classes leave PrimaryGeometryFieldName empty in
+                # GFeatures; find the BLOB column from the table schema.
+                candidates = find_candidate_geometry_fields(
+                    _get_column_names(cursor, table_name))
+                if not candidates:
+                    return None, f"No geometry BLOB column found in text table {table_name}"
+                geom_field_name = candidates[0]
             sql = (
                 "SELECT * FROM "  # nosec B608
                 + _quote_access_identifier(table_name)
@@ -409,7 +415,7 @@ def import_table_as_memory_layer(mdb_file, table_name, geom_field_name, geometry
                 layer_type = "LineString"
             elif geometry_type_code == 2:
                 layer_type = "Polygon"
-            elif geometry_type_code == 3:
+            elif geometry_type_code in (3, GRAPHIC_TYPE_CODE):
                 layer_type = "Point"
             elif geometry_type_code == 10:
                 # For code 10, inspect the first feature.
@@ -445,6 +451,8 @@ def import_table_as_memory_layer(mdb_file, table_name, geom_field_name, geometry
                 else:
                     fields.append(QgsField(field_name, FIELD_TYPE_STRING))
             # Add extra fields.
+            if geometry_type_code == GRAPHIC_TYPE_CODE:
+                fields.append(QgsField("label_text", FIELD_TYPE_STRING))
             fields.append(QgsField("depth", FIELD_TYPE_DOUBLE))
             fields.append(QgsField("source", FIELD_TYPE_STRING))
             dp.addAttributes(fields)
@@ -475,6 +483,10 @@ def import_table_as_memory_layer(mdb_file, table_name, geom_field_name, geometry
                     break
 
                 blob = row[geom_index]
+                label_text = None
+                if geometry_type_code == GRAPHIC_TYPE_CODE:
+                    decoded = decode_geometry_blob(blob)
+                    label_text = decoded.text if decoded is not None else None
                 vertices = parse_blob(blob)
                 if not vertices:
                     skipped_parse += 1
@@ -519,6 +531,8 @@ def import_table_as_memory_layer(mdb_file, table_name, geom_field_name, geometry
                     except (ValueError, TypeError):
                         attr_values.append(None)
 
+                if geometry_type_code == GRAPHIC_TYPE_CODE:
+                    attr_values.append(label_text if label_text is not None else "")
                 attr_values.append(avg_depth)
                 attr_values.append(source_name)
                 feat.setAttributes(attr_values)
@@ -732,24 +746,36 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
             )
             deadline = None if not timeout else time.monotonic() + timeout
-            while process.poll() is None:
+            # The pipes must be drained WHILE the worker runs: a worker whose
+            # stdout exceeds the OS pipe buffer (a few KB) blocks on its final
+            # write and never exits, deadlocking a poll()-only loop.
+            # communicate(timeout=...) starts background reader threads on the
+            # first call and resumes them on every retry, so it both drains and
+            # stays cancellable.
+            while True:
                 if feedback.isCanceled():
                     process.terminate()
                     try:
                         process.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         process.kill()
-                    process.communicate()
+                    try:
+                        process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
                     raise QgsProcessingException('MDB import canceled.')
                 if deadline is not None and time.monotonic() >= deadline:
                     process.kill()
-                    process.communicate()
+                    try:
+                        process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
                     raise QgsProcessingException(f'MDB worker timed out after {timeout} seconds.')
                 try:
-                    process.wait(timeout=0.2)
+                    stdout, stderr = process.communicate(timeout=0.2)
+                    break
                 except subprocess.TimeoutExpired:
-                    pass
-            stdout, stderr = process.communicate()
+                    continue
         except Exception as e:
             if isinstance(e, QgsProcessingException):
                 raise
@@ -1181,7 +1207,7 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
 
 <h4>How it Works</h4>
 <p>The tool connects to the MDB file and looks for a <code>GFeatures</code> table to identify the feature classes within the database. For each feature class found, it reads the geometry from a binary (BLOB) field and creates a corresponding QGIS layer. Setting <code>SUBSEA_MDB_SCHEMA_DISCOVERY=1</code> additionally inspects every physical table so that populated tables missing from <code>GFeatures</code> can be offered when they carry strong spatial evidence (a GeoMedia geometry field or a recognised coordinate pair); metadata, lookup and companion <code>*_Name</code>/<code>*_Text</code> tables are reported but never loaded as geometry layers. That extra pass costs a table-definition parse per table, so it is off by default.</p>
-<p>GeoMedia point, oriented point, polyline, polygon, boundary (polygons with holes) and collection BLOBs are all decoded. If a row's BLOB cannot be decoded and the table has an explicit coordinate pair (Easting/Northing, X/Y, Longitude/Latitude or Lon/Lat, matched case-insensitively), a point is built from those columns instead. Fallback geometry is never silent: every feature records how its geometry was obtained and the log reports BLOB-decoded and fallback counts separately.</p>
+<p>GeoMedia point, oriented point, polyline, polygon, boundary (polygons with holes), collection and graphic-text BLOBs are all decoded. Text feature classes (for example <code>Description</code>, <code>Sediment_Classification</code> or <code>*_Name</code> annotation tables) import as point layers carrying the label string in a <code>label_text</code> field, ready for labelling in QGIS. If a row's BLOB cannot be decoded and the table has an explicit coordinate pair (Easting/Northing, X/Y, Longitude/Latitude or Lon/Lat, matched case-insensitively), a point is built from those columns instead. Fallback geometry is never silent: every feature records how its geometry was obtained and the log reports BLOB-decoded and fallback counts separately.</p>
 <p>By default, the tool imports <b>LineString</b> layers (e.g. bathymetric contour lines, cable routes), <b>Polygon</b> layers (e.g. seabed feature classifications, sediment type areas, restricted areas), and <b>Point</b> layers (e.g. survey points, fixes, assets). Each geometry type is loaded as a separate layer so they never conflict. MultiPoint and other multi-part geometries can be included by setting the <code>SUBSEA_MDB_LOAD_ALL_GEOMS=1</code> environment variable.</p>
 <p>It automatically adds three fields to each new layer:
 <ul>
@@ -1189,6 +1215,8 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
     <li><b>source:</b> The filename of the source MDB file for per-feature traceability.</li>
     <li><b>geometry_source:</b> <code>blob</code> when the geometry came from the GeoMedia BLOB, or <code>xy_fallback</code> when it was built from a coordinate pair.</li>
 </ul>
+Text features additionally carry a <b>label_text</b> field holding the decoded label string.
+
 </p>
 
 <h4>Prerequisites</h4>
@@ -1209,7 +1237,7 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
 
 <h4>Known Limitations & Troubleshooting</h4>
 <ul>
-  <li><b>BLOB Format:</b> GeoMedia point, polyline, polygon, boundary and collection BLOBs are supported. Other vendor-specific variants (for example text or arc primitives) are still reported as <code>parse_failed</code> rather than imported.</li>
+  <li><b>BLOB Format:</b> GeoMedia point, polyline, polygon, boundary, collection and graphic-text BLOBs are supported. Other vendor-specific variants (for example arc primitives) are still reported as <code>parse_failed</code> rather than imported. Text placement (rotation, alignment, font) is not preserved &mdash; only the anchor point and the string.</li>
   <li><b>Metadata Tables:</b> It relies on specific system tables like <code>GFeatures</code>, <code>FieldLookup</code>, and <code>AttributeProperties</code>. If these are missing or have an unexpected structure, only schema-based discovery is available.</li>
     <li><b>Large batches:</b> Temporary GeoPackages remain available for the QGIS session. If space is limited, change the temporary folder under Processing settings to a drive with more free space. Canceling Processing terminates the active MDB worker.</li>
     <li><b>Errors:</b> Every attempted table reports row counts, BLOB-decoded counts and fallback counts in the Log Messages Panel. A populated table that yields no geometry is reported as an error, not silently skipped. Other tables and files continue importing where possible.</li>
