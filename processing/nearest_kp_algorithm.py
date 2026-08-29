@@ -40,6 +40,7 @@ from qgis.core import (
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_STRING
 
 import math
+from ..kp_geo_utils import get_features_skip_invalid
 
 
 class NearestKPAlgorithm(QgsProcessingAlgorithm):
@@ -208,7 +209,7 @@ class NearestKPAlgorithm(QgsProcessingAlgorithm):
         # Cache path features/geometries once (avoids re-iterating provider for every point)
         # and compute cumulative offsets so KP is relative to the whole input RPL layer
         # (matching KP Mouse Map Tool behaviour for multi-feature RPLs).
-        path_features = list(paths_source.getFeatures())
+        path_features = list(get_features_skip_invalid(paths_source))
         path_geoms = []
         path_ids = []
         path_offsets_m = []
@@ -226,7 +227,7 @@ class NearestKPAlgorithm(QgsProcessingAlgorithm):
         processed_features = 0
 
         # Iterate through each point feature
-        for point_feature in points_source.getFeatures():
+        for point_feature in get_features_skip_invalid(points_source):
             if feedback.isCanceled():
                 break
 

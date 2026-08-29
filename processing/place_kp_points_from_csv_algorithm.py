@@ -39,6 +39,7 @@ from qgis.core import (QgsProcessing,
                        QgsDistanceArea,
                        QgsProcessingException)
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_FIELD_NUMERIC
+from ..kp_geo_utils import get_features_skip_invalid
 
 class PlaceKpPointsFromCsvAlgorithm(QgsProcessingAlgorithm):
     INPUT_TABLE = 'INPUT_TABLE'
@@ -258,11 +259,13 @@ class PlaceKpPointsFromCsvAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException(self.invalidSinkError(parameters, self.OUTPUT))
 
         # Dissolve line layer into a single geometry
-        line_features = list(line_layer.getFeatures())
+        line_features = list(get_features_skip_invalid(line_layer))
         if not line_features:
             raise QgsProcessingException(self.tr("Input line layer has no features."))
         
-        geometries = [f.geometry() for f in line_features]
+        geometries = [f.geometry() for f in line_features if f.hasGeometry() and not f.geometry().isEmpty()]
+        if not geometries:
+            raise QgsProcessingException(self.tr("Input line layer has no usable geometries."))
         merged_geometry = QgsGeometry.unaryUnion(geometries)
         
         if merged_geometry.isEmpty():
@@ -336,7 +339,7 @@ class PlaceKpPointsFromCsvAlgorithm(QgsProcessingAlgorithm):
 
                 feedback.setProgress(int((current + 1) / max(total_rows, 1) * 100))
         else:
-            input_features = list(input_table.getFeatures())
+            input_features = list(get_features_skip_invalid(input_table))
             total_rows = len(input_features)
 
             for current, feature in enumerate(input_features):

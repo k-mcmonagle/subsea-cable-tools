@@ -28,6 +28,7 @@ from ..kp_range_utils import (
     add_distance_mode_parameter,
     read_distance_mode,
 )
+from ..kp_geo_utils import get_features_skip_invalid
 
 class KPRangeHighlighterAlgorithm(QgsProcessingAlgorithm):
     """
@@ -105,7 +106,8 @@ class KPRangeHighlighterAlgorithm(QgsProcessingAlgorithm):
                                                context, fields, source.wkbType(), source.sourceCrs())
 
         # Combine all features into a single geometry
-        geometries = [f.geometry() for f in source.getFeatures()]
+        geometries = [f.geometry() for f in get_features_skip_invalid(source)
+                      if f.hasGeometry() and not f.geometry().isEmpty()]
         if not geometries:
             return {self.OUTPUT: dest_id}
 

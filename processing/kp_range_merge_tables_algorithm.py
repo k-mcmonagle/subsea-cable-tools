@@ -42,6 +42,7 @@ from qgis.core import (
     QgsWkbTypes,
 )
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, PROCESSING_FIELD_ANY, PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE
+from ..kp_geo_utils import get_features_skip_invalid
 
 
 @dataclass(frozen=True)
@@ -1115,7 +1116,7 @@ class KPRangeMergeTablesAlgorithm(QgsProcessingAlgorithm):
         reported_errors = 0
         max_reported_errors = 20
 
-        for i, f in enumerate(src.getFeatures()):
+        for i, f in enumerate(get_features_skip_invalid(src)):
             if feedback.isCanceled():
                 break
 

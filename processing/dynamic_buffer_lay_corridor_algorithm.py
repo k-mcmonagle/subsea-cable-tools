@@ -38,6 +38,7 @@ from qgis.core import (
 )
 from ..qgis_compat import FIELD_TYPE_DOUBLE, GEOMETRY_LINE, GEOMETRY_POLYGON, PROCESSING_NUMBER_DOUBLE
 from . import depth_sampling
+from ..kp_geo_utils import get_features_skip_invalid
 
 
 class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
@@ -324,7 +325,7 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
         # IMPORTANT: QgsGeometry.buffer() uses layer units.
         # If the input CRS is geographic (degrees), buffering with "meters" produces massive/wrong buffers.
         # We therefore do sampling + buffering in a projected working CRS (meters), then transform results back.
-        features_preview = list(source.getFeatures(QgsFeatureRequest().setLimit(1)))
+        features_preview = list(get_features_skip_invalid(source, QgsFeatureRequest().setLimit(1)))
         preview_geom = features_preview[0].geometry() if features_preview else None
         working_crs = self._select_working_crs(source_crs, preview_geom)
         to_working = QgsCoordinateTransform(source_crs, working_crs, QgsProject.instance()) if working_crs != source_crs else None
@@ -362,7 +363,7 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
         corridor_geoms: List[QgsGeometry] = []
 
         # Re-fetch features, since we may have consumed one in preview.
-        features = list(source.getFeatures())
+        features = list(get_features_skip_invalid(source))
         total = len(features) if features else 1
         for idx, f in enumerate(features):
             if feedback.isCanceled():

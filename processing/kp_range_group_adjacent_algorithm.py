@@ -50,6 +50,7 @@ from qgis.core import (
     QgsWkbTypes,
 )
 from ..qgis_compat import PROCESSING_FIELD_ANY, PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE
+from ..kp_geo_utils import get_features_skip_invalid
 
 
 @dataclass
@@ -213,7 +214,7 @@ class KPRangeGroupAdjacentAlgorithm(QgsProcessingAlgorithm):
 
         rows: List[_Row] = []
         total = source.featureCount() or 0
-        for i, f in enumerate(source.getFeatures()):
+        for i, f in enumerate(get_features_skip_invalid(source)):
             if feedback.isCanceled():
                 break
 

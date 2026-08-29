@@ -41,6 +41,7 @@ from ..kp_range_utils import (
     add_distance_mode_parameter,
     read_distance_mode,
 )
+from ..kp_geo_utils import get_features_skip_invalid
 
 class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
     INPUT_LAYER = 'INPUT_LAYER'
@@ -300,7 +301,8 @@ class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
         )
 
         # Combine all features from the line layer into a single geometry
-        geometries = [f.geometry() for f in source.getFeatures()]
+        geometries = [f.geometry() for f in get_features_skip_invalid(source)
+                      if f.hasGeometry() and not f.geometry().isEmpty()]
         if not geometries:
             return {self.OUTPUT: dest_id}
 
@@ -350,7 +352,7 @@ class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
 
                 feedback.setProgress(int((current + 1) / max(total_rows, 1) * 100))
         else:
-            input_features = list(input_layer.getFeatures())
+            input_features = list(get_features_skip_invalid(input_layer))
             total_rows = len(input_features)
 
             for current, feature in enumerate(input_features):

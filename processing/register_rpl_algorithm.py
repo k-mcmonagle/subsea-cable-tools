@@ -43,6 +43,7 @@ from ..workbench.store import (
     project_gpkg_path,
     set_project_gpkg_path,
 )
+from ..kp_geo_utils import get_features_skip_invalid
 
 WORKBENCH_GROUP = "Cable Route Workbench"
 
@@ -262,8 +263,8 @@ class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
         if not gpkg_path or gpkg_path.lower() in ("temporary_output", "temporary output"):
             gpkg_path = project_gpkg_path(context.project()) or default_project_gpkg_path(context.project())
 
-        point_features = list(points_source.getFeatures())
-        line_features = list(lines_source.getFeatures())
+        point_features = list(get_features_skip_invalid(points_source))
+        line_features = list(get_features_skip_invalid(lines_source))
         model = self.build_model(point_features, line_features)
 
         for warning in self.check_pairing(model, line_features):

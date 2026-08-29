@@ -101,6 +101,41 @@ def iter_line_parts(line_geometry: QgsGeometry) -> List[List]:
         return []
 
 
+def get_features_skip_invalid(source, request=None):
+    """Iterate a feature source without Processing's invalid-geometry filter.
+
+    ``parameterAsSource`` wraps the input layer in a
+    ``QgsProcessingFeatureSource`` that applies the user's Processing
+    "Invalid features filtering" setting. The QGIS default aborts the whole
+    algorithm on the first GEOS-invalid feature (e.g. a zero-length line
+    left behind by digitising), and the "skip" setting silently drops such
+    features — which shortens the route and shifts every KP after the gap.
+    The plugin's tools measure along linework and never rely on OGC
+    validity, so they opt out of the check the same way QGIS core
+    algorithms do, and handle null/empty geometries explicitly instead.
+
+    Safe to call with a plain ``QgsVectorLayer``/``QgsFeatureSource``,
+    where it behaves exactly like ``source.getFeatures()``.
+    """
+    from qgis.core import Qgis, QgsFeatureRequest, QgsProcessingFeatureSource
+
+    if request is None:
+        request = QgsFeatureRequest()
+    if isinstance(source, QgsProcessingFeatureSource):
+        flag_scope = getattr(Qgis, "ProcessingFeatureSourceFlag", None)
+        flag = getattr(flag_scope, "SkipGeometryValidityChecks", None)
+        if flag is None:
+            flag = getattr(
+                QgsProcessingFeatureSource, "FlagSkipGeometryValidityChecks", None
+            )
+        if flag is not None:
+            try:
+                return source.getFeatures(request, flag)
+            except TypeError:
+                pass
+    return source.getFeatures(request)
+
+
 def _normalise_geoms(geoms) -> List[QgsGeometry]:
     """Accept a single geometry, an iterable, or a feature source."""
 
@@ -110,7 +145,7 @@ def _normalise_geoms(geoms) -> List[QgsGeometry]:
         return [geoms]
     if isinstance(geoms, QgsFeatureSource):
         out: List[QgsGeometry] = []
-        for feat in geoms.getFeatures():
+        for feat in get_features_skip_invalid(geoms):
             g = feat.geometry()
             if g is not None and not g.isEmpty():
                 out.append(QgsGeometry(g))

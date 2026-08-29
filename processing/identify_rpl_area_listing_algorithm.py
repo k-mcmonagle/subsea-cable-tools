@@ -45,6 +45,7 @@ from qgis.core import (
     QgsWkbTypes,
 )
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_LONG_LONG, FIELD_TYPE_STRING, GEOMETRY_LINE
+from ..kp_geo_utils import get_features_skip_invalid
 
 
 @dataclass(frozen=True)
@@ -309,7 +310,7 @@ class IdentifyRPLAreaListingAlgorithm(QgsProcessingAlgorithm):
 
         rpl_infos: List[_RplGeomInfo] = []
         cumulative_base_m = 0.0
-        for f in rpl_source.getFeatures():
+        for f in get_features_skip_invalid(rpl_source):
             if feedback.isCanceled():
                 break
             if not f.hasGeometry():

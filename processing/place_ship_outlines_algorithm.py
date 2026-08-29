@@ -27,6 +27,7 @@ from qgis.core import (
 )
 from ..qgis_compat import GEOMETRY_LINE, PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE, PROCESSING_NUMBER_INTEGER
 import os
+from ..kp_geo_utils import get_features_skip_invalid
 
 class PlaceShipOutlinesAlgorithm(QgsProcessingAlgorithm):
     SHIP_OUTLINE = 'SHIP_OUTLINE'
@@ -191,7 +192,7 @@ This tool places a ship outline geometry at each point in a point layer, with op
         outline_attrs = outline_features[0].attributes() if outline_features else []
     # Removed unused outline_field_names variable
 
-        for i, point_feat in enumerate(point_source.getFeatures()):
+        for i, point_feat in enumerate(get_features_skip_invalid(point_source)):
             if feedback.isCanceled():
                 break
             # Skip points based on interval (place at 0-based indices 0, interval, 2*interval, ...)

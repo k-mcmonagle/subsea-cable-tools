@@ -29,6 +29,7 @@ from qgis.core import (QgsProcessing,
                        QgsDistanceArea,
                        QgsProcessingLayerPostProcessorInterface)
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, GEOMETRY_LINE, PROCESSING_NUMBER_DOUBLE
+from ..kp_geo_utils import get_features_skip_invalid
 
 class ExtractACPointsAlgorithm(QgsProcessingAlgorithm):
     INPUT_RPL = 'INPUT_RPL'
@@ -130,7 +131,7 @@ class ExtractACPointsAlgorithm(QgsProcessingAlgorithm):
 
         # Collect all geometries and merge them into continuous lines
         # This is crucial if the input layer consists of many separate segments
-        geometries = [f.geometry() for f in source.getFeatures() if f.hasGeometry()]
+        geometries = [f.geometry() for f in get_features_skip_invalid(source) if f.hasGeometry()]
         if not geometries:
             return {self.OUTPUT: dest_id}
 

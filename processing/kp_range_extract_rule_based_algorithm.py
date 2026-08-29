@@ -52,6 +52,7 @@ from ..kp_range_utils import (
     add_distance_mode_parameter,
     read_distance_mode,
 )
+from ..kp_geo_utils import get_features_skip_invalid
 
 
 @dataclass
@@ -335,7 +336,7 @@ class ExtractKPRangesRuleBasedAlgorithm(QgsProcessingAlgorithm):
         source,
         feedback,
     ) -> Tuple[List[List[QgsPointXY]], List[Tuple[QgsFeature, List[List[QgsPointXY]]]]]:
-        feats = list(source.getFeatures(QgsFeatureRequest()))
+        feats = list(get_features_skip_invalid(source, QgsFeatureRequest()))
 
         route_parts: List[List[QgsPointXY]] = []
         per_feature: List[Tuple[QgsFeature, List[List[QgsPointXY]]]] = []

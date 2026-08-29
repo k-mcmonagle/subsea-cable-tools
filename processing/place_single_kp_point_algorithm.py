@@ -30,6 +30,7 @@ from qgis.core import (QgsProcessing,
                        QgsCoordinateReferenceSystem,
                        QgsCoordinateTransform)
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, GEOMETRY_LINE, PROCESSING_NUMBER_DOUBLE
+from ..kp_geo_utils import get_features_skip_invalid
 
 
 def _make_local_aeqd_crs(lat: float, lon: float) -> QgsCoordinateReferenceSystem:
@@ -301,7 +302,7 @@ class PlaceSingleKpPointAlgorithm(QgsProcessingAlgorithm):
             if dcc_line_sink is None:
                 raise QgsProcessingException(self.invalidSinkError(parameters, self.OUTPUT_DCC_LINE))
 
-        line_features = list(line_layer.getFeatures())
+        line_features = list(get_features_skip_invalid(line_layer))
         if not line_features:
             raise QgsProcessingException(self.tr("Input line layer has no features."))
 

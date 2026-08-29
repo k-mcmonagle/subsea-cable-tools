@@ -26,6 +26,7 @@ from qgis.core import (
     QgsProcessingContext
 )
 from ..qgis_compat import FIELD_TYPE_STRING, PROCESSING_FIELD_NUMERIC
+from ..kp_geo_utils import get_features_skip_invalid
 
 class PlotLineSegmentsFromTableAlgorithm(QgsProcessingAlgorithm):
     INPUT_TABLE = 'INPUT_TABLE'
@@ -153,7 +154,7 @@ class PlotLineSegmentsFromTableAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(self.tr(f"Processing {total_features} features..."))
 
         skipped_count = 0
-        for current, feature in enumerate(table_layer.getFeatures()):
+        for current, feature in enumerate(get_features_skip_invalid(table_layer)):
             if feedback.isCanceled():
                 break
 

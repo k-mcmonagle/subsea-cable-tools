@@ -114,6 +114,7 @@ def main() -> int:
         ("lay simulator vessel geometry (V3)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_v3_vessel_geometry")),
         ("lay simulator QGIS adapters (V3)", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_v3_qgis_adapters")),
         ("seabed length algorithm", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_seabed_length")),
+        ("invalid-geometry input tolerance", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_invalid_geometry_sources")),
         ("cable lay importers", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_cable_lay_importers")),
         ("MDB import algorithm", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_mdb_import_algorithm")),
         ("workbench store", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_workbench_store")),

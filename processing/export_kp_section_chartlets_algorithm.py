@@ -49,6 +49,7 @@ from qgis.core import (
 from ..qgis_compat import PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE, PROCESSING_NUMBER_INTEGER
 
 from ..kp_range_utils import extract_line_segment, make_distance_area, measure_total_length_m
+from ..kp_geo_utils import get_features_skip_invalid
 
 
 def _safe_filename(value: str) -> str:
@@ -313,7 +314,8 @@ Output:
         return g
 
     def _dissolve_rpl_geometry(self, rpl_source, context, feedback) -> Optional[QgsGeometry]:
-        geometries = [f.geometry() for f in rpl_source.getFeatures()]
+        geometries = [f.geometry() for f in get_features_skip_invalid(rpl_source)
+                      if f.hasGeometry() and not f.geometry().isEmpty()]
         if not geometries:
             return None
         combined = QgsGeometry.unaryUnion(geometries)
@@ -429,7 +431,7 @@ Output:
                 self.tr('Start/End KP fields are required when Reference RPL line is provided (or use fields named start_kp/end_kp).')
             )
 
-        features = list(ranges_source.getFeatures())
+        features = list(get_features_skip_invalid(ranges_source))
         total = len(features)
         if total == 0:
             feedback.pushInfo(self.tr('No features found in KP ranges input.'))

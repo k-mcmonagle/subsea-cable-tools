@@ -43,6 +43,7 @@ from qgis.core import (
 )
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE, PROCESSING_NUMBER_INTEGER
 from . import depth_sampling
+from ..kp_geo_utils import get_features_skip_invalid
 
 
 class AddDepthToPointLayerAlgorithm(QgsProcessingAlgorithm):
@@ -301,7 +302,7 @@ class AddDepthToPointLayerAlgorithm(QgsProcessingAlgorithm):
         if sink is None:
             raise QgsProcessingException(self.invalidSinkError(parameters, self.OUTPUT))
 
-        features = list(source.getFeatures())
+        features = list(get_features_skip_invalid(source))
         total = len(features) if features else 1
         added = 0
 

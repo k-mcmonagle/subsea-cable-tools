@@ -44,6 +44,7 @@ from qgis.core import (
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, GEOMETRY_POINT
 
 from .rpl_comparison_utils import RPLComparator
+from ..kp_geo_utils import get_features_skip_invalid
 
 
 class TranslateKPFromRPLToRPLAlgorithm(QgsProcessingAlgorithm):
@@ -157,7 +158,7 @@ class TranslateKPFromRPLToRPLAlgorithm(QgsProcessingAlgorithm):
         features_processed = 0
         features_skipped = 0
 
-        for tgt_feature in target_points.getFeatures():
+        for tgt_feature in get_features_skip_invalid(target_points):
             if feedback.isCanceled():
                 break
 

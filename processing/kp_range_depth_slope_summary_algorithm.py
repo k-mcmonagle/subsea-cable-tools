@@ -45,6 +45,7 @@ from ..slope_utils import (
     datum_sign as shared_datum_sign, interval_slope_series, ols_slope,
     windowed_slope_series,
 )
+from ..kp_geo_utils import get_features_skip_invalid
 
 
 @dataclass(frozen=True)
@@ -348,7 +349,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
             line_crs, context.transformContext(), project=context.project()
         )
 
-        features = list(source.getFeatures())
+        features = list(get_features_skip_invalid(source))
         total = len(features)
         for idx, feat in enumerate(features):
             if feedback.isCanceled():

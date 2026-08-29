@@ -24,6 +24,7 @@ from ..kp_range_utils import (
     add_distance_mode_parameter,
     read_distance_mode,
 )
+from ..kp_geo_utils import get_features_skip_invalid
 
 class PlaceKpPointsAlgorithm(QgsProcessingAlgorithm):
     """
@@ -158,12 +159,19 @@ class PlaceKpPointsAlgorithm(QgsProcessingAlgorithm):
 
         source_line_name = line_layer.sourceName()
 
-        line_features = list(line_layer.getFeatures())
+        line_features = list(get_features_skip_invalid(line_layer))
         if not line_features:
             feedback.pushInfo(self.tr("Input line layer has no features."))
             return {self.OUTPUT: None}
 
-        geometries = [f.geometry() for f in line_features]
+        geometries = [f.geometry() for f in line_features if f.hasGeometry() and not f.geometry().isEmpty()]
+        skipped = len(line_features) - len(geometries)
+        if skipped:
+            feedback.pushWarning(self.tr(
+                f"{skipped} feature(s) with no usable geometry were skipped."))
+        if not geometries:
+            feedback.pushInfo(self.tr("Input line layer has no usable geometries."))
+            return {self.OUTPUT: None}
         merged_geometry = QgsGeometry.unaryUnion(geometries)
         
         if merged_geometry.isEmpty():
