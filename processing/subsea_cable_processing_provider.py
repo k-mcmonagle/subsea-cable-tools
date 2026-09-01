@@ -77,6 +77,7 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
         safe_add('import_3d_model_solutions_algorithm', 'Import3DModelSolutionsAlgorithm')
         safe_add('import_as_laid_algorithm', 'ImportAsLaidAlgorithm')
         safe_add('import_plough_data_algorithm', 'ImportPloughDataAlgorithm')
+        safe_add('recompute_iso_time_algorithm', 'RecomputeIsoTimeAlgorithm')
 
         # --- Cable Lay QC & Analysis ---
         safe_add('run_cable_lay_qc_algorithm', 'RunCableLayQcAlgorithm')

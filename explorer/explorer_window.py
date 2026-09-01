@@ -41,6 +41,7 @@ from .layer_loader import LayerLoadTask, build_spec
 from .map_sync import MapSyncController
 from .panels.data_table_panel import DataTablePanel
 from .panels.inspection_panel import InspectionPanel
+from .panels.manage_panel import ManagePanel
 from .panels.plot_panel import PlotPanel
 from .panels.processing_panel import ProcessingPanel
 from .panels.qc_panel import QcPanel
@@ -97,14 +98,16 @@ class CableLayExplorerWindow(QMainWindow):
         self.table_panel = DataTablePanel(self)
         self.setCentralWidget(self.table_panel)
 
-        # Analysis dock: QC / Inspection / Processing tabs.
+        # Analysis dock: QC / Inspection / Processing / Manage tabs.
         self.qc_panel = QcPanel(self)
         self.inspection_panel = InspectionPanel(self)
         self.processing_panel = ProcessingPanel(self)
+        self.manage_panel = ManagePanel(self)
         self.analysis_tabs = QTabWidget()
         self.analysis_tabs.addTab(self.qc_panel, "QC")
         self.analysis_tabs.addTab(self.inspection_panel, "Inspection")
         self.analysis_tabs.addTab(self.processing_panel, "Processing")
+        self.analysis_tabs.addTab(self.manage_panel, "Manage")
         self.qc_dock = QDockWidget("Analysis", self)
         self.qc_dock.setObjectName("AnalysisDock")
         self.qc_dock.setWidget(self.analysis_tabs)
@@ -371,6 +374,7 @@ class CableLayExplorerWindow(QMainWindow):
         self.qc_panel.set_dataset(active)
         self.inspection_panel.set_dataset(active)
         self.processing_panel.set_dataset(active)
+        self.manage_panel.set_dataset(active)
         for dock in self._plot_docks:
             widget = dock.widget()
             if widget is not None:

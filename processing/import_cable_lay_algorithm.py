@@ -85,6 +85,12 @@ class ImportCableLayAlgorithm(CableLayImportAlgorithm):
             return ["ISO_Time", "source_file"]
         return ["Time", "source_file"]
 
+    def log_params(self, parameters, context):
+        params = super().log_params(parameters, context)
+        params["parse_time"] = self.parameterAsBool(parameters, self.PARSE_TIME, context)
+        params["downsample"] = self.parameterAsInt(parameters, self.DOWNSAMPLE, context)
+        return params
+
     def shortHelpString(self):
         return self.tr(
             """

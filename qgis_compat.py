@@ -275,6 +275,22 @@ MAP_LAYER_FILTER_RASTER = _layer_filter("RasterLayer")
 MESSAGE_BOX_YES = _scoped_member(QMessageBox, "StandardButton", "Yes")
 MESSAGE_BOX_NO = _scoped_member(QMessageBox, "StandardButton", "No")
 
+def _feature_request_no_geometry():
+    """``NoGeometry`` feature-request flag: QGIS 4 moved it from the
+    QgsFeatureRequest enum to Qgis.FeatureRequestFlag."""
+    from qgis.core import QgsFeatureRequest
+
+    scope = getattr(Qgis, "FeatureRequestFlag", None)
+    if scope is not None and hasattr(scope, "NoGeometry"):
+        return scope.NoGeometry
+    flag_scope = getattr(QgsFeatureRequest, "Flag", None)
+    if flag_scope is not None and hasattr(flag_scope, "NoGeometry"):
+        return flag_scope.NoGeometry
+    return QgsFeatureRequest.NoGeometry
+
+
+FEATURE_REQUEST_NO_GEOMETRY = _feature_request_no_geometry()
+
 VECTOR_WRITER_OVERWRITE_LAYER = _scoped_member(
     QgsVectorFileWriter, "ActionOnExistingFile", "CreateOrOverwriteLayer")
 VECTOR_WRITER_OVERWRITE_FILE = _scoped_member(

@@ -23,6 +23,7 @@ file-named scratch layers.
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Dict, List, Optional, Tuple
 
@@ -138,6 +139,47 @@ class CableLayImportAlgorithm(QgsProcessingAlgorithm):
             )
         return start_date
 
+    def log_params(self, parameters, context) -> Dict:
+        """Scalar parameters recorded in ``import_log`` for reproducibility.
+
+        Subclasses with extra parameters that affect parsing should extend the
+        returned dict.
+        """
+        params: Dict = {}
+        if self.parameterDefinition(self.START_DATE) is not None:
+            params["start_date"] = self.parameterAsString(
+                parameters, self.START_DATE, context
+            ).strip()
+        return params
+
+    def _log_import(
+        self, parameters, context, feedback, gpkg_path, layer_name, per_file_counts, duplicates
+    ) -> None:
+        """Record one ``import_log`` row per input file (never fails the import)."""
+        try:
+            params = self.log_params(parameters, context)
+            start_date = params.get("start_date", "")
+            extra = {k: v for k, v in params.items() if k != "start_date"}
+            extra["run_duplicates_removed"] = duplicates
+            params_json = json.dumps(extra, sort_keys=True)
+            for source_file, rows_parsed in per_file_counts:
+                clp.log_import(
+                    gpkg_path,
+                    context.transformContext(),
+                    {
+                        "layer_name": layer_name,
+                        "source_file": source_file,
+                        "algorithm": self.name(),
+                        "start_date": start_date,
+                        "params_json": params_json,
+                        "rows_parsed": rows_parsed,
+                    },
+                )
+        except Exception as exc:  # pragma: no cover - logging must never abort
+            feedback.pushWarning(
+                self.tr("Could not write to the import log: {error}").format(error=exc)
+            )
+
     def _resolve_destination(self, parameters, context, feedback) -> Tuple[str, str]:
         """Return (gpkg_path, layer_name) from the chosen layer or GeoPackage."""
         target = self.parameterAsVectorLayer(parameters, self.TARGET_LAYER, context)
@@ -188,46 +230,74 @@ class CableLayImportAlgorithm(QgsProcessingAlgorithm):
         # Parse every selected file, unioning the schema across them.
         new_rows: List[Dict] = []
         new_fields: QgsFields = None
+        per_file_counts: List[Tuple[str, int]] = []
         for path in files:
             if feedback.isCanceled():
                 break
             feedback.pushInfo(self.tr("Parsing {name} ...").format(name=os.path.basename(path)))
             rows, fields = self.parse_rows(path, parameters, context, feedback)
             new_rows.extend(rows)
+            per_file_counts.append((os.path.basename(path), len(rows)))
             new_fields = fields if new_fields is None else clp.union_fields(new_fields, fields)
         if not new_rows:
             raise QgsProcessingException(
                 self.tr("No valid records were parsed from the input file(s).")
             )
 
-        # Merge with the existing layer (if the GeoPackage already has it).
-        existing_rows: List[Dict] = []
-        existing_fields = None
+        key_fields = self.dedupe_key(parameters, context)
         existing_layer = clp.open_gpkg_layer(gpkg_path, layer_name)
-        if existing_layer is not None:
-            existing_rows, existing_fields = clp.rows_from_source(existing_layer)
+
+        if existing_layer is not None and clp.fields_cover(existing_layer.fields(), new_fields):
+            # Fast path: the stored schema already covers the new data, so
+            # append through the provider — no full-table rewrite, which keeps
+            # imports into multi-GB GeoPackages quick. Only the key columns of
+            # the existing rows are read (for deduplication), never the table.
+            existing_count = existing_layer.featureCount()
             feedback.pushInfo(
                 self.tr("Appending to existing '{layer}' ({n} feature(s)).").format(
-                    layer=layer_name, n=len(existing_rows)
+                    layer=layer_name, n=existing_count
                 )
             )
+            unique_new, _ = clp.merge_and_dedupe([], new_rows, key_fields)
+            existing_keys = clp.read_key_set(existing_layer, key_fields)
+            to_add = [
+                row for row in unique_new
+                if clp.row_key(row, key_fields) not in existing_keys
+            ]
+            duplicates = len(new_rows) - len(to_add)
+            try:
+                clp.append_features_to_layer(existing_layer, to_add)
+            except RuntimeError as exc:
+                raise QgsProcessingException(str(exc))
+            written = existing_count + len(to_add)
+        else:
+            # Full write: fresh layer, or an existing layer whose schema must
+            # grow to fit new columns (rare) — the original read-merge-rewrite.
+            existing_rows: List[Dict] = []
+            existing_fields = None
+            if existing_layer is not None:
+                existing_rows, existing_fields = clp.rows_from_source(existing_layer)
+                feedback.pushInfo(
+                    self.tr(
+                        "New column(s) in this import - rewriting '{layer}' "
+                        "({n} existing feature(s)) with the extended schema."
+                    ).format(layer=layer_name, n=len(existing_rows))
+                )
 
-        out_fields = clp.union_fields(existing_fields, new_fields)
-        merged, duplicates = clp.merge_and_dedupe(
-            existing_rows, new_rows, self.dedupe_key(parameters, context)
-        )
+            out_fields = clp.union_fields(existing_fields, new_fields)
+            merged, duplicates = clp.merge_and_dedupe(existing_rows, new_rows, key_fields)
 
-        try:
-            written = clp.write_layer_to_gpkg(
-                gpkg_path,
-                layer_name,
-                out_fields,
-                self.OUTPUT_WKB,
-                merged,
-                context.transformContext(),
-            )
-        except RuntimeError as exc:
-            raise QgsProcessingException(str(exc))
+            try:
+                written = clp.write_layer_to_gpkg(
+                    gpkg_path,
+                    layer_name,
+                    out_fields,
+                    self.OUTPUT_WKB,
+                    merged,
+                    context.transformContext(),
+                )
+            except RuntimeError as exc:
+                raise QgsProcessingException(str(exc))
 
         feedback.pushInfo(
             self.tr(
@@ -240,6 +310,10 @@ class CableLayImportAlgorithm(QgsProcessingAlgorithm):
                 layer=layer_name,
                 total=written,
             )
+        )
+
+        self._log_import(
+            parameters, context, feedback, gpkg_path, layer_name, per_file_counts, duplicates
         )
 
         layer_uri = clp.gpkg_layer_uri(gpkg_path, layer_name)

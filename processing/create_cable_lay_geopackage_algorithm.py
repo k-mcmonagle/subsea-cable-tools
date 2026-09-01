@@ -115,7 +115,7 @@ left untouched (their data is preserved) and only missing layers are added.</p>
     def processAlgorithm(self, parameters, context, feedback):
         gpkg_path = self.parameterAsFileOutput(parameters, self.GEOPACKAGE, context)
 
-        schemas = {**clp.CANONICAL_SCHEMAS, **clp.QC_SCHEMAS}
+        schemas = {**clp.CANONICAL_SCHEMAS, **clp.QC_SCHEMAS, **clp.MANAGEMENT_SCHEMAS}
         # Build the ordered list of layer types: the toolbox-matching display
         # order first, then any remaining schemas (future-proofing).
         ordered_types = [t for t in self.DISPLAY_ORDER if t in schemas]

@@ -37,7 +37,12 @@ from qgis.core import (
     QgsWkbTypes,
 )
 
-from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_LONG_LONG, FIELD_TYPE_STRING
+from ..qgis_compat import (
+    FEATURE_REQUEST_NO_GEOMETRY,
+    FIELD_TYPE_DOUBLE,
+    FIELD_TYPE_LONG_LONG,
+    FIELD_TYPE_STRING,
+)
 
 WGS84 = "EPSG:4326"
 
@@ -325,6 +330,48 @@ def _key_value(value) -> str:
     return str(value)
 
 
+def row_key(row: Dict, key_fields: Sequence[str]) -> Tuple[str, ...]:
+    """The dedupe key tuple for a row dict (same normalisation as the merge)."""
+    return tuple(_key_value(row.get(field)) for field in key_fields)
+
+
+def read_key_set(layer, key_fields: Sequence[str]) -> set:
+    """The set of dedupe-key tuples already present in ``layer``.
+
+    Reads only the key attributes (and no geometry), so checking a very large
+    layer for duplicates stays cheap. QVariant nulls normalise to ``""`` like
+    ``None`` does in :func:`row_key`.
+    """
+    from qgis.core import QgsFeatureRequest
+
+    fields = layer.fields()
+    present = [field for field in key_fields if fields.indexOf(field) >= 0]
+    request = QgsFeatureRequest().setFlags(FEATURE_REQUEST_NO_GEOMETRY)
+    request.setSubsetOfAttributes(present, fields)
+
+    def key_value(feature, field):
+        if fields.indexOf(field) < 0:
+            return ""
+        value = feature[field]
+        if value is None:
+            return ""
+        text = str(value)
+        if text == "NULL" and not isinstance(value, str):
+            return ""
+        return text
+
+    keys = set()
+    for feature in layer.getFeatures(request):
+        keys.add(tuple(key_value(feature, field) for field in key_fields))
+    return keys
+
+
+def fields_cover(existing: QgsFields, new_fields: QgsFields) -> bool:
+    """True when every field of ``new_fields`` exists (by name) in ``existing``."""
+    present = {field.name() for field in existing}
+    return all(field.name() in present for field in new_fields)
+
+
 def rows_from_source(source) -> Tuple[List[Dict], QgsFields]:
     """Read an existing feature source into rows + its field schema.
 
@@ -546,14 +593,13 @@ QC_SCHEMAS = {
 }
 
 
-def ensure_qc_layers(gpkg_path: str, transform_context) -> List[str]:
-    """Create the ``qc_findings`` / ``qc_config`` layers if they are absent.
+def _ensure_layers(gpkg_path: str, schemas: Dict, transform_context) -> List[str]:
+    """Create any of ``schemas``' layers missing from ``gpkg_path``.
 
-    Safe to call on any existing cable-lay GeoPackage (older ones created before
-    the QC layers existed). Returns the physical names of any layers created.
+    Returns the physical (prefixed) names of the layers created.
     """
     created: List[str] = []
-    for layer_type, (wkb_type, specs) in QC_SCHEMAS.items():
+    for layer_type, (wkb_type, specs) in schemas.items():
         layer_name = prefixed_layer_name(gpkg_path, layer_type)
         if open_gpkg_layer(gpkg_path, layer_name) is not None:
             continue
@@ -562,3 +608,107 @@ def ensure_qc_layers(gpkg_path: str, transform_context) -> List[str]:
         )
         created.append(layer_name)
     return created
+
+
+def ensure_qc_layers(gpkg_path: str, transform_context) -> List[str]:
+    """Create the ``qc_findings`` / ``qc_config`` layers if they are absent.
+
+    Safe to call on any existing cable-lay GeoPackage (older ones created before
+    the QC layers existed). Returns the physical names of any layers created.
+    """
+    return _ensure_layers(gpkg_path, QC_SCHEMAS, transform_context)
+
+
+# ---------------------------------------------------------------------------
+# Management layers. ``import_log`` records the provenance of every import run
+# (which file, which start date, how many rows) so a wrong Project Start Date
+# can later be corrected deterministically; ``edit_log`` records every
+# management operation applied to the GeoPackage (recompute, dedupe, ...) so
+# the file carries its own revision history. Both are attribute-only tables
+# that travel with the project GeoPackage, like ``qc_config``.
+# ---------------------------------------------------------------------------
+IMPORT_LOG_SPECS: List[Tuple[str, str]] = [
+    ("layer_name", "str"), ("source_file", "str"), ("algorithm", "str"),
+    ("start_date", "str"), ("params_json", "str"),
+    ("rows_parsed", "int"), ("imported_at", "str"),
+]
+
+EDIT_LOG_SPECS: List[Tuple[str, str]] = [
+    ("layer_name", "str"), ("operation", "str"), ("params_json", "str"),
+    ("rows_affected", "int"), ("details", "str"), ("edited_at", "str"),
+]
+
+MANAGEMENT_SCHEMAS = {
+    "import_log": (QgsWkbTypes.NoGeometry, IMPORT_LOG_SPECS),
+    "edit_log": (QgsWkbTypes.NoGeometry, EDIT_LOG_SPECS),
+}
+
+
+def ensure_management_layers(gpkg_path: str, transform_context) -> List[str]:
+    """Create the ``import_log`` / ``edit_log`` tables if they are absent.
+
+    Safe to call on any existing cable-lay GeoPackage. Returns the physical
+    names of any layers created.
+    """
+    return _ensure_layers(gpkg_path, MANAGEMENT_SCHEMAS, transform_context)
+
+
+def now_iso() -> str:
+    """Local timestamp string used for the log tables."""
+    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def append_rows_to_layer(gpkg_path: str, layer_name: str, rows: List[Dict]) -> int:
+    """Append ``rows`` to an existing GeoPackage layer via its data provider.
+
+    Unlike :func:`write_layer_to_gpkg` this does not rewrite the table, so it
+    is safe for appends into large GeoPackages. Row keys that are not
+    fields of the layer are ignored. Returns the number of features added.
+    Raises ``RuntimeError`` when the layer is missing or the append fails.
+    """
+    layer = open_gpkg_layer(gpkg_path, layer_name)
+    if layer is None:
+        raise RuntimeError(f"Layer '{layer_name}' not found in {gpkg_path}")
+    return append_features_to_layer(layer, rows)
+
+
+def append_features_to_layer(layer, rows: List[Dict]) -> int:
+    """Append ``rows`` to an already-open layer via its data provider."""
+    fields = layer.fields()
+    features = []
+    for row in rows:
+        feature = QgsFeature(fields)
+        for index, field in enumerate(fields):
+            if field.name() in row:
+                feature.setAttribute(index, row[field.name()])
+        wkt = row.get(WKT_KEY)
+        if wkt:
+            geom = QgsGeometry.fromWkt(wkt)
+            if geom is not None and not geom.isEmpty():
+                feature.setGeometry(geom)
+        features.append(feature)
+    if not features:
+        return 0
+    ok, _ = layer.dataProvider().addFeatures(features)
+    if not ok:
+        raise RuntimeError(
+            f"Could not append to '{layer.name()}': "
+            f"{layer.dataProvider().error().summary()}"
+        )
+    return len(features)
+
+
+def log_import(gpkg_path: str, transform_context, row: Dict) -> None:
+    """Record one import into the ``import_log`` table (created if absent)."""
+    ensure_management_layers(gpkg_path, transform_context)
+    entry = dict(row)
+    entry.setdefault("imported_at", now_iso())
+    append_rows_to_layer(gpkg_path, prefixed_layer_name(gpkg_path, "import_log"), [entry])
+
+
+def log_edit(gpkg_path: str, transform_context, row: Dict) -> None:
+    """Record one management operation into the ``edit_log`` table."""
+    ensure_management_layers(gpkg_path, transform_context)
+    entry = dict(row)
+    entry.setdefault("edited_at", now_iso())
+    append_rows_to_layer(gpkg_path, prefixed_layer_name(gpkg_path, "edit_log"), [entry])
