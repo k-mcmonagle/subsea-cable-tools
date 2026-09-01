@@ -3,7 +3,7 @@ name=Subsea Cable Tools
 qgisMinimumVersion=3.22
 qgisMaximumVersion=4.99
 description=Tools to support working with subsea cable data in QGIS.
-version=1.8.0
+version=1.9.0
 author=Kieran McMonagle
 email=kieran.mcmonagle@globalmarine.group
 
@@ -15,7 +15,19 @@ repository=https://github.com/k-mcmonagle/subsea-cable-tools
 hasProcessingProvider=yes
 
 # changelog
-changelog=Version 1.8.0:
+changelog=Version 1.9.0:
+  - NEW: Burial Planner (beta) — a dockable workflow that resolves an ordered stack of exclusion criteria (depth/slope thresholds, crossings/proximity, seabed-soils polygons, KP-range tables, manual ranges, and a generic data-coverage check) into burial sections, skips, and Insufficient Information ranges, with a synced profile pane, an append-only undoable change log, and CSV/HTML report export. Beta: sanity-check outputs against your own methods before operational use.
+  - NEW: Installation Paths — generates a planning-grade burial-tool path from every RPL course change (tangent fillets or forward-only Dubins pass-through), with depth-banded turning radius, a vessel registry with turn checking, manual path adjustments, and a KP-vs-deviation plot.
+  - NEW: .pthmdb path-file import — reads GeoMedia path databases directly (no Access/ODBC install needed) via both a Processing tool and a Cable Route Workbench import route, including optional assembly extraction and bathymetry profile import.
+  - Workbench: RPL points now classify as assembly, geographic, or both (user-editable rules), revision selection no longer guesses a "latest," and RPL import gains a guided wizard with per-worksheet detection, saved mapping profiles, and a rollback-safe commit with a durable import audit.
+  - One slope convention plugin-wide: every tool now reports along-route/side slope with the same sign and datum handling, backed by a shared, headless-tested `slope_utils` module; the KP Mouse live profile and Depth Profile tools no longer fabricate slope across missing data or raster seams.
+  - MBES tools: true per-cell Bin Average gridding, per-axis grid-spacing detection, multi-file XYZ import with exact cell registration, and a raster merge that always keeps the finest input resolution.
+  - Import MDB: bundled pure-Python Jet/Access reader (no pyodbc/Access driver needed), decodes all GeoMedia geometry BLOB variants including GeoMedia text/label features, fixes a worker-subprocess deadlock on large discovery listings, and reports per-table outcomes instead of failing silently.
+  - Processing tools no longer abort on a layer containing an invalid (e.g. zero-length or null) geometry — KP tools and 19 other algorithms now skip such features instead of erroring or silently shortening the route.
+  - Planner: cable quantity tracking (loaded/laid/recovered, cable onboard), a Reports window (fuel ROB, breakdowns, progress S-curve, plan-vs-actual variance), task import from MS Project/CSV, duplicate tasks/groups, and a milestones/key-dates report.
+  - Cable Lay Simulator (3D): a focused BU Lowering Tool dialog, a BU-datum integration editor for describing branching-unit make-up in one place, and quick-model fixes for bed tension, touchdown continuity, and force-balance convergence.
+  - This is a large beta feature set — please sanity-check Burial Planner and Installation Paths outputs against your own methods before operational use. See CHANGELOG.md for the full list.
+Version 1.8.0:
   - NEW: Planner (beta) — dockable spatial scenario planning with ordered, map-linked tasks, resource lanes, predecessor/lag scheduling, and simulated vessel playback over route geometry.
   - Multi-resource planning: independent vessel start offsets, cross-resource dependencies, selectable marker colours, and MS Project-style indented/collapsible summary groups.
   - Undo/redo for task, outline, ordering, link, import, sketch, merge, and deletion changes, including Planner-owned geometry.
