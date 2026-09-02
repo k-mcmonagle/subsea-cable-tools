@@ -29,6 +29,7 @@ Design notes
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional, Tuple
@@ -71,6 +72,7 @@ from ...qgis_compat import (
     SELECTION_MODE_EXTENDED,
     qt_exec,
 )
+from ...processing import cable_lay_gpkg_ops as gops
 from ...processing import cable_lay_manage_ops as ops
 from ...processing import cable_lay_parsers as clp
 from ..manage_task import ManageEditTask, run_edit_sync
@@ -200,9 +202,12 @@ class ManagePanel(QWidget):
         layout.setContentsMargins(4, 4, 4, 4)
 
         self.tabs = QTabWidget()
+        self.import_tab = self._build_import_tab()
+        self.tabs.addTab(self.import_tab, "Import")
         self.tabs.addTab(self._build_sources_tab(), "Sources")
         self.tabs.addTab(self._build_gaps_tab(), "Gap fill")
-        self.tabs.addTab(self._build_history_tab(), "History")
+        self.history_tab = self._build_history_tab()
+        self.tabs.addTab(self.history_tab, "History")
         self.tabs.currentChanged.connect(self._on_subtab_changed)
         layout.addWidget(self.tabs, 1)
 
@@ -306,6 +311,203 @@ class ManagePanel(QWidget):
         layout.addWidget(self.filter_check)
         return widget
 
+    def _build_import_tab(self) -> QWidget:
+        """Import files into one of the project data file's layers.
+
+        The Processing import tools stay the single implementation: the tab
+        opens the matching tool pre-targeted at the layer (so the batch mode,
+        help text and fast-append path are all still there), then reloads.
+        """
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(2, 2, 2, 2)
+        form = QFormLayout()
+        self.import_type_combo = QComboBox()
+        for layer_type in gops.IMPORTABLE_TYPES:
+            self.import_type_combo.addItem(gops.TYPE_LABELS[layer_type], layer_type)
+        self.import_type_combo.setToolTip("Which layer of the project data file to import into.")
+        form.addRow("Layer:", self.import_type_combo)
+        layout.addLayout(form)
+        self.import_summary = QLabel("")
+        self.import_summary.setWordWrap(True)
+        layout.addWidget(self.import_summary)
+        self.import_button = QPushButton("Import files…")
+        self.import_button.setToolTip(
+            "Opens the matching Import tool with this layer pre-selected. Pick one "
+            "or more files; the import runs in the background with its own "
+            "progress, records the files in the import log, and the layer is "
+            "reloaded here afterwards."
+        )
+        self.import_button.clicked.connect(self.run_import)
+        layout.addWidget(self.import_button)
+        layout.addWidget(QLabel("Recent imports into this layer:"))
+        self.import_recent = QTableWidget(0, 4)
+        self.import_recent.setHorizontalHeaderLabels(["Imported", "File", "Rows", "Start date"])
+        self.import_recent.setEditTriggers(EDIT_TRIGGER_NONE)
+        self.import_recent.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
+        self.import_recent.horizontalHeader().setSectionResizeMode(1, HEADER_RESIZE_MODE_STRETCH)
+        self.import_recent.verticalHeader().setVisible(False)
+        layout.addWidget(self.import_recent, 1)
+        self.import_type_combo.currentIndexChanged.connect(self._on_import_type_changed)
+        return widget
+
+    def _on_import_type_changed(self, _index: int) -> None:
+        self._refresh_import_summary()
+
+    def _project_path(self) -> Optional[str]:
+        getter = getattr(self.controller, "project_path", None)
+        return getter() if getter is not None else None
+
+    def show_import(self, layer_type: Optional[str] = None) -> None:
+        """Bring the Import sub-tab forward, optionally preselecting a type."""
+        if layer_type:
+            index = self.import_type_combo.findData(layer_type)
+            if index >= 0:
+                self.import_type_combo.setCurrentIndex(index)
+        self.tabs.setCurrentWidget(self.import_tab)
+        self._refresh_import_summary()
+
+    def _refresh_import_summary(self) -> None:
+        layer_type = self.import_type_combo.currentData()
+        path = self._project_path()
+        self.import_recent.setRowCount(0)
+        if not path:
+            self.import_summary.setText(
+                "No data file is set for this project. Create or open one on the "
+                "Project tab first."
+            )
+            self.import_button.setEnabled(False)
+            return
+        self.import_button.setEnabled(self._edit_task is None)
+        tables = gops.list_tables(path)
+        if tables is None:
+            self.import_summary.setText(
+                f"{os.path.basename(path)} could not be read. See the Project tab."
+            )
+            self.import_button.setEnabled(False)
+            return
+        names = [name for name, _ in tables]
+        table = gops.find_layer_for_type(path, names, layer_type)
+        label = gops.TYPE_LABELS.get(layer_type, layer_type)
+        if table is None:
+            self.import_summary.setText(
+                f"{os.path.basename(path)} has no {label} layer yet - it is created "
+                "when you import."
+            )
+            return
+        entry_getter = getattr(self.controller, "project_entry", None)
+        entry = entry_getter(layer_type) if entry_getter is not None else None
+        rows = entry.get("rows") if entry else None
+        count = f"{rows:,} rows" if isinstance(rows, int) else "row count pending"
+        self.import_summary.setText(f"Target: {table} in {os.path.basename(path)} ({count}).")
+        self._populate_recent_imports(path, table)
+
+    def _populate_recent_imports(self, path: str, table: str, limit: int = 25) -> None:
+        log_name = None
+        for name, _ in gops.list_tables(path) or []:
+            if gops.layer_type_for_name(name) == "import_log":
+                log_name = name
+                break
+        if log_name is None:
+            return
+        log_layer = clp.open_gpkg_layer(path, log_name)
+        if log_layer is None:
+            return
+        entries = []
+        for feature in log_layer.getFeatures():
+            if str(feature["layer_name"] or "") != table:
+                continue
+            entries.append((
+                str(feature["imported_at"] or ""), str(feature["source_file"] or ""),
+                feature["rows_parsed"], str(feature["start_date"] or ""),
+            ))
+        entries.sort(key=lambda e: e[0], reverse=True)
+        grid = self.import_recent
+        for stamp, source, rows, start in entries[:limit]:
+            row = grid.rowCount()
+            grid.insertRow(row)
+            grid.setItem(row, 0, _cell(stamp[:16].replace("T", " ")))
+            grid.setItem(row, 1, _cell(source))
+            grid.setItem(row, 2, _cell(rows if rows is not None else ""))
+            grid.setItem(row, 3, _cell(start))
+
+    def run_import(self) -> None:
+        """Open the Processing import tool targeted at the chosen layer."""
+        layer_type = self.import_type_combo.currentData()
+        path = self._project_path()
+        if not path or not layer_type:
+            self.status_label.setText("Set a data file on the Project tab first.")
+            return
+        if self._edit_task is not None:
+            self.status_label.setText("Another management edit is still running.")
+            return
+        busy = getattr(self.controller, "is_busy", None)
+        if busy is not None and busy():
+            self.status_label.setText("Wait for the current load or edit to finish.")
+            return
+        try:
+            import processing  # the QGIS Processing plugin (present in QGIS Desktop)
+        except ImportError:
+            QMessageBox.warning(
+                self, "Import",
+                "The QGIS Processing plugin is not available, so the import tool "
+                "cannot be opened from here. Use the Processing Toolbox instead.",
+            )
+            return
+        label = gops.TYPE_LABELS.get(layer_type, layer_type)
+        tables = gops.list_tables(path)
+        if tables is None:
+            QMessageBox.warning(self, "Import", f"{os.path.basename(path)} could not be read.")
+            return
+        names = [name for name, _ in tables]
+        table = gops.find_layer_for_type(path, names, layer_type)
+        if table is None:
+            answer = QMessageBox.question(
+                self, "Import",
+                f"{os.path.basename(path)} has no {label} layer. Create it now?",
+                MESSAGEBOX_YES | MESSAGEBOX_NO,
+            )
+            if answer != MESSAGEBOX_YES:
+                return
+            try:
+                table = gops.ensure_layer(path, layer_type, self.controller.transform_context())
+            except RuntimeError as exc:
+                QMessageBox.critical(self, "Import", str(exc))
+                return
+        layer = gops.add_layer_to_project(path, table)
+        if layer is None:
+            QMessageBox.warning(
+                self, "Import", f"Layer '{table}' could not be opened from {path}."
+            )
+            return
+        try:
+            ops.check_not_editing(layer)
+        except RuntimeError as exc:
+            QMessageBox.warning(self, "Import", str(exc))
+            return
+        self.status_label.setText(f"Import tool open for {table}…")
+        try:
+            processing.execAlgorithmDialog(
+                gops.ALGORITHM_FOR_TYPE[layer_type], {"TARGET_LAYER": layer.id()}
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Import", f"Could not open the import tool: {exc}")
+            self.status_label.setText("")
+            return
+        self._after_import(path, table, layer.id())
+
+    def _after_import(self, path: str, table: str, layer_id: str) -> None:
+        """Whatever the tool did (or not), make every view agree with the file."""
+        ops.reload_project_layers(path, table)
+        self._sources_dirty = True
+        self._history_dirty = True
+        self._recorded = None
+        hook = getattr(self.controller, "after_import", None)
+        if hook is not None:
+            hook(layer_id)
+        self._refresh_import_summary()
+        self.status_label.setText(f"Import tool closed; {table} reloaded.")
+
     def _build_gaps_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
@@ -388,6 +590,15 @@ class ManagePanel(QWidget):
         self._history_dirty = True
         self._sync_filter_check()
         self._sync_view_check()
+        # Default the Import target to the active layer's type when it has one.
+        physical = self._physical_layer_name() if dataset is not None else None
+        layer_type = gops.layer_type_for_name(physical) if physical else None
+        if layer_type in gops.IMPORTABLE_TYPES:
+            index = self.import_type_combo.findData(layer_type)
+            if index >= 0 and index != self.import_type_combo.currentIndex():
+                self.import_type_combo.blockSignals(True)
+                self.import_type_combo.setCurrentIndex(index)
+                self.import_type_combo.blockSignals(False)
         self._refresh_visible()
 
     def sync_active_only(self, active_only: bool) -> None:
@@ -422,8 +633,10 @@ class ManagePanel(QWidget):
             self._populate_sources()
             self._populate_source_combos()
             self._update_buttons()
-        if self._history_dirty and self.tabs.currentIndex() == 2:
+        if self._history_dirty and self.tabs.currentWidget() is self.history_tab:
             self.refresh_history()
+        if self.tabs.currentWidget() is self.import_tab:
+            self._refresh_import_summary()
 
     # -- shared accessors --------------------------------------------------
     def _physical_layer_name(self) -> Optional[str]:

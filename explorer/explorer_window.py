@@ -44,6 +44,7 @@ from .panels.inspection_panel import InspectionPanel
 from .panels.manage_panel import ManagePanel
 from .panels.plot_panel import PlotPanel
 from .panels.processing_panel import ProcessingPanel
+from .panels.project_panel import ProjectPanel
 from .panels.qc_panel import QcPanel
 from ..laydata import LayDataset
 
@@ -108,12 +109,14 @@ class CableLayExplorerWindow(QMainWindow):
         self.table_panel = DataTablePanel(self)
         self.setCentralWidget(self.table_panel)
 
-        # Analysis dock: QC / Inspection / Processing / Manage tabs.
+        # Analysis dock: Project / Manage / QC / Inspection / Processing tabs.
+        self.project_panel = ProjectPanel(self)
         self.qc_panel = QcPanel(self)
         self.inspection_panel = InspectionPanel(self)
         self.processing_panel = ProcessingPanel(self)
         self.manage_panel = ManagePanel(self)
         self.analysis_tabs = QTabWidget()
+        self.analysis_tabs.addTab(self.project_panel, "Project")
         self.analysis_tabs.addTab(self.manage_panel, "Manage")
         self.analysis_tabs.addTab(self.qc_panel, "QC")
         self.analysis_tabs.addTab(self.inspection_panel, "Inspection")
@@ -131,6 +134,48 @@ class CableLayExplorerWindow(QMainWindow):
         self._restore_state()
         self.populate_layers()
         self._restore_loaded_layers()
+        self.project_panel.attach_project_signals()
+
+    # -- project data file (Project tab / Manage > Import) ------------------
+    def project_path(self) -> Optional[str]:
+        """The project's cable-lay data file (managed on the Project tab)."""
+        return self.project_panel.current_path()
+
+    def project_entry(self, layer_type: str) -> Optional[dict]:
+        return self.project_panel.entry_for_type(layer_type)
+
+    def loaded_layer_ids(self) -> List[str]:
+        return list(self._datasets.keys())
+
+    def is_busy(self) -> bool:
+        """True while a layer load or a management edit is running."""
+        return self._load_task is not None or self.manage_panel._edit_task is not None
+
+    def load_layers(self, layer_ids: List[str]) -> None:
+        """Load more project layers into the Explorer (keeps the current ones)."""
+        new = [i for i in layer_ids if i not in self._datasets]
+        if not new:
+            return
+        self._pending_active = new[0]
+        self.set_loaded_layers(list(self._datasets.keys()) + new)
+
+    def unload_layers(self, layer_ids: List[str]) -> None:
+        drop = set(layer_ids)
+        remaining = [i for i in self._datasets if i not in drop]
+        if len(remaining) != len(self._datasets):
+            self.set_loaded_layers(remaining)
+
+    def go_to_import(self, layer_type: Optional[str] = None) -> None:
+        self.analysis_tabs.setCurrentWidget(self.manage_panel)
+        self.manage_panel.show_import(layer_type)
+
+    def after_import(self, layer_id: str) -> None:
+        """An import tool just closed: refresh the file view and the datasets."""
+        if layer_id in self._datasets:
+            self.reload_dataset()
+        elif QgsProject.instance().mapLayer(layer_id) is not None:
+            self.load_layers([layer_id])
+        self.project_panel.refresh_soon()
 
     # -- active dataset / layer accessors ---------------------------------
     @property
@@ -345,6 +390,7 @@ class CableLayExplorerWindow(QMainWindow):
             self._active_layer_id = next(iter(self._datasets), None)
         self.populate_layers()
         self._refresh_all()
+        self.project_panel.refresh_soon()  # "Explorer" column of the inventory
 
     def _start_background_load(self, to_load: list, wanted: list) -> None:
         """Kick off a cancellable background load with a progress dialog."""
@@ -1108,6 +1154,10 @@ class CableLayExplorerWindow(QMainWindow):
         """Full teardown for plugin unload: remove canvas graphics."""
         try:
             self._cancel_load()
+        except Exception:
+            pass
+        try:
+            self.project_panel.detach_project_signals()
         except Exception:
             pass
         try:

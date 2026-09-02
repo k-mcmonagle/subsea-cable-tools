@@ -422,6 +422,39 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   explicit, separate option that now restores the previous filter on
   uncheck, and the Sources summary states when a map filter is limiting
   its counts.
+- **The Explorer's Project tab owns one data file per QGIS project; the
+  Manage tab owns what goes into it.** The file path lives in the project's
+  custom properties (the Burial Planner / Planner / Workbench pattern) and
+  is *discovered*, never created: saved path, then the same basename beside
+  the project (copied project folders), then the file behind the loaded
+  cable-lay layers, then the conventional `<project>_cable_lay.gpkg`; a
+  recovery is announced once in the status line, a missing file is shown as
+  such with *Open…* / *New…* offered. Existing files are never overwritten
+  (New / Duplicate refuse) and Delete removes the project layers and closes
+  cached sqlite handles before unlinking, because Windows will not delete an
+  open file. Import stays in the Processing algorithms: the Manage > Import
+  sub-tab opens the matching tool via `processing.execAlgorithmDialog` with
+  `TARGET_LAYER` pre-set, so there is one import implementation, one help
+  text and one fast-append path, and a scripted import and a UI import
+  behave identically.
+- **Data-file layers resolve by type suffix, not by expected name.** A
+  duplicated `ProjectX.gpkg` becomes `ProjectY.gpkg` still holding
+  `ProjectX_cable_lay`; renaming tables in place (gpkg_contents, geometry
+  columns, rtree triggers) is not safe across the GDAL versions QGIS 3.30
+  and 4 ship. `cable_lay_gpkg_ops.find_layer_for_type` therefore prefers
+  `<stem>_<type>`, then bare `<type>`, then any `*_<type>`; "add missing
+  layers" only creates a type with no table at all, and the inventory shows
+  a differing name or a second table of the same type as a status rather
+  than an error. Project layers are matched by decoded provider URI, so
+  layer-tree renames are irrelevant.
+- **Inventory scans are sqlite-only and run in a QgsTask.** Row counts on a
+  multi-GB file cost a `COUNT(*)` per table; reading through
+  `QgsVectorLayer` would both freeze the GUI and be unsafe off the main
+  thread. `inventory()` opens the file read-only with the standard library
+  and reports progress/cancel through the task; the panel disables actions
+  and says "Scanning…" until it returns, and every file job (create,
+  duplicate, add layers, VACUUM) goes through the same `TaskRunner` with a
+  cancellable progress dialog so the user always sees what is happening.
 - **Merge is "one span, one outcome"; the target is explicit, never
   inferred from a mixed selection.** Sections are derived from the
   alternating event sequence, so every merge is boundary-event surgery:

@@ -160,6 +160,7 @@ SNAPPING_UNIT_PIXELS = _snapping_member("Pixels", ("MapToolUnit", "UnitType"))
 HEADER_RESIZE_MODE_INTERACTIVE = _scoped_member(QHeaderView, "ResizeMode", "Interactive")
 HEADER_RESIZE_MODE_STRETCH = _scoped_member(QHeaderView, "ResizeMode", "Stretch")
 HEADER_RESIZE_MODE_FIXED = _scoped_member(QHeaderView, "ResizeMode", "Fixed")
+HEADER_RESIZE_MODE_CONTENTS = _scoped_member(QHeaderView, "ResizeMode", "ResizeToContents")
 
 MESSAGEBOX_YES = _scoped_member(QMessageBox, "StandardButton", "Yes")
 MESSAGEBOX_NO = _scoped_member(QMessageBox, "StandardButton", "No")

@@ -117,6 +117,7 @@ def main() -> int:
         ("invalid-geometry input tolerance", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_invalid_geometry_sources")),
         ("cable lay importers", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_cable_lay_importers")),
         ("cable lay management ops", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_cable_lay_manage")),
+        ("cable lay project data file ops", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_cable_lay_gpkg_ops")),
         ("MDB import algorithm", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_mdb_import_algorithm")),
         ("workbench store", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_workbench_store")),
         ("workbench route lineage", lambda: _run_module(f"{PACKAGE_NAME}.tests.test_workbench_lineage")),
