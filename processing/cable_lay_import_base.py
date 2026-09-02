@@ -252,7 +252,7 @@ class CableLayImportAlgorithm(QgsProcessingAlgorithm):
             # append through the provider — no full-table rewrite, which keeps
             # imports into multi-GB GeoPackages quick. Only the key columns of
             # the existing rows are read (for deduplication), never the table.
-            existing_count = existing_layer.featureCount()
+            existing_count = max(int(existing_layer.featureCount()), 0)
             feedback.pushInfo(
                 self.tr("Appending to existing '{layer}' ({n} feature(s)).").format(
                     layer=layer_name, n=existing_count

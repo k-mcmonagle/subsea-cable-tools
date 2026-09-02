@@ -14,7 +14,7 @@ import json
 import math
 import os
 from collections import OrderedDict
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -78,6 +78,13 @@ class CableLayExplorerWindow(QMainWindow):
         # preserved). One layer is "active" at a time and drives the table, QC
         # and Inspection panels; every loaded layer is available to the plots.
         self._datasets: "OrderedDict[str, LayDataset]" = OrderedDict()
+        # "Active rows only": an in-memory view (record_status active/empty)
+        # served to the table, plots, QC and Inspection panels instead of the
+        # full dataset. Views are derived lazily per layer and cached against
+        # the full dataset object they came from; the Manage panel always
+        # gets the full dataset so standby/excluded rows stay manageable.
+        self._active_only = False
+        self._views: Dict[str, Tuple[LayDataset, LayDataset]] = {}
         self._active_layer_id: Optional[str] = None
         self._load_task = None
         self._load_progress = None
@@ -123,9 +130,46 @@ class CableLayExplorerWindow(QMainWindow):
     # -- active dataset / layer accessors ---------------------------------
     @property
     def dataset(self) -> Optional[LayDataset]:
+        """The active layer's dataset as the panels should see it (view-aware)."""
+        return self._view_for(self._active_layer_id)
+
+    @property
+    def full_dataset(self) -> Optional[LayDataset]:
+        """The active layer's complete dataset, every record status included."""
         if self._active_layer_id is None:
             return None
         return self._datasets.get(self._active_layer_id)
+
+    def _view_for(self, layer_id: Optional[str]) -> Optional[LayDataset]:
+        if layer_id is None:
+            return None
+        full = self._datasets.get(layer_id)
+        if full is None or not self._active_only:
+            return full
+        cached = self._views.get(layer_id)
+        if cached is not None and cached[0] is full:
+            return cached[1]
+        view = full.active_view()
+        self._views[layer_id] = (full, view)
+        return view
+
+    def active_only(self) -> bool:
+        return self._active_only
+
+    def set_active_only(self, enabled: bool) -> None:
+        """Toggle the in-memory active-rows view (also drives the toolbar action)."""
+        enabled = bool(enabled)
+        if self.active_only_action.isChecked() != enabled:
+            self.active_only_action.setChecked(enabled)  # re-enters via toggled
+            return
+        if enabled == self._active_only:
+            return
+        self._active_only = enabled
+        self._views.clear()
+        self._refresh_all()
+
+    def _on_active_only_toggled(self, checked: bool) -> None:
+        self.set_active_only(checked)
 
     @property
     def layer(self):
@@ -156,6 +200,17 @@ class CableLayExplorerWindow(QMainWindow):
         reload_action.setToolTip("Re-read every loaded layer from the project")
         reload_action.triggered.connect(self.reload_dataset)
         toolbar.addAction(reload_action)
+
+        self.active_only_action = QAction("Active rows only", self)
+        self.active_only_action.setCheckable(True)
+        self.active_only_action.setChecked(False)
+        self.active_only_action.setToolTip(
+            "Show only rows whose record_status is active (or empty) in the "
+            "table, plots, QC and Inspection - in memory, nothing is written. "
+            "Standby / excluded rows from the Manage tab's curation are hidden."
+        )
+        self.active_only_action.toggled.connect(self._on_active_only_toggled)
+        toolbar.addAction(self.active_only_action)
 
         add_plot_action = QAction("Add plot panel", self)
         add_plot_action.triggered.connect(lambda: self.add_plot_panel())
@@ -368,19 +423,38 @@ class CableLayExplorerWindow(QMainWindow):
 
     def _refresh_all(self) -> None:
         """Push the active dataset to every panel and refresh plot sources."""
+        # Drop cached views whose full dataset is gone (unloaded / reloaded).
+        for layer_id in list(self._views.keys()):
+            cached = self._views[layer_id]
+            if self._datasets.get(layer_id) is not cached[0]:
+                del self._views[layer_id]
         active = self.dataset
         self.map_sync.set_layer(self.layer)
         self.table_panel.set_dataset(active)
         self.qc_panel.set_dataset(active)
         self.inspection_panel.set_dataset(active)
         self.processing_panel.set_dataset(active)
-        self.manage_panel.set_dataset(active)
+        # Manage always works on the complete dataset (every record status).
+        self.manage_panel.sync_active_only(self._active_only)
+        self.manage_panel.set_dataset(self.full_dataset)
+        self._update_view_hint()
         for dock in self._plot_docks:
             widget = dock.widget()
             if widget is not None:
                 # set_dataset already rebuilds the (multi-layer) series menu and
                 # replots, so an extra refresh_sources() here would replot twice.
                 widget.set_dataset(active)
+
+    def _update_view_hint(self) -> None:
+        """Window title suffix so a filtered view is never mistaken for the data."""
+        title = "Cable Lay Data Explorer"
+        if self._active_only:
+            full, view = self.full_dataset, self.dataset
+            if full is not None and view is not None and view is not full:
+                title += f" - active rows only ({view.row_count:,} of {full.row_count:,})"
+            else:
+                title += " - active rows only"
+        self.setWindowTitle(title)
 
     def _refresh_plot_sources(self) -> None:
         for panel in self._plot_panels():
@@ -399,13 +473,13 @@ class CableLayExplorerWindow(QMainWindow):
         for layer_id in ordered:
             layer = QgsProject.instance().mapLayer(layer_id)
             name = layer.name() if layer is not None else layer_id
-            sources.append((layer_id, name, self._datasets[layer_id]))
+            sources.append((layer_id, name, self._view_for(layer_id)))
         return sources
 
     def dataset_for(self, layer_id: Optional[str]):
         if layer_id is None:
             return self.dataset
-        return self._datasets.get(layer_id)
+        return self._view_for(layer_id)
 
     def primary_layer_id(self) -> Optional[str]:
         return self._active_layer_id
@@ -787,6 +861,10 @@ class CableLayExplorerWindow(QMainWindow):
             self._lock_x = checked
             self.lock_x_action.setChecked(checked)
 
+        active_only = self.settings.value(f"{_SETTINGS_GROUP}/active_only")
+        if active_only is not None:
+            self.set_active_only(str(active_only).lower() in ("true", "1"))
+
     def _clear_highlight(self) -> None:
         self.map_sync.clear()
         self._last_hover_row = None
@@ -809,6 +887,7 @@ class CableLayExplorerWindow(QMainWindow):
         self.settings.setValue(f"{_SETTINGS_GROUP}/plot_layout", self._plot_layout_mode)
         self.settings.setValue(f"{_SETTINGS_GROUP}/sync_crosshair", self._sync_crosshair)
         self.settings.setValue(f"{_SETTINGS_GROUP}/lock_x", self._lock_x)
+        self.settings.setValue(f"{_SETTINGS_GROUP}/active_only", self._active_only)
         self.settings.setValue(
             f"{_SETTINGS_GROUP}/loaded_layers", json.dumps(list(self._datasets.keys()))
         )

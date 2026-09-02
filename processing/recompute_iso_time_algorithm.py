@@ -9,7 +9,6 @@ the wrong Project Start Date was used at import.
 from __future__ import annotations
 
 import json
-import os
 import re
 from typing import List, Optional
 
@@ -238,22 +237,7 @@ travels with the data.</p>
         project = context.project()
         if not gpkg_path or project is None:
             return {}
-        target = os.path.normcase(os.path.normpath(gpkg_path))
-        registry = QgsProviderRegistry.instance()
-        for layer in project.mapLayers().values():
-            try:
-                decoded = registry.decodeUri(layer.providerType(), layer.source())
-            except Exception:
-                continue
-            path = decoded.get("path", "")
-            if not path:
-                continue
-            if (
-                os.path.normcase(os.path.normpath(path)) == target
-                and decoded.get("layerName") == layer_name
-            ):
-                layer.reload()
-                layer.triggerRepaint()
+        ops.reload_project_layers(gpkg_path, layer_name, project)
         return {}
 
     def _source_file_list(self, parameters, context) -> Optional[List[str]]:

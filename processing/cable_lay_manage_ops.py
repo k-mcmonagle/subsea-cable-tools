@@ -14,8 +14,11 @@ rewrite — so they stay fast and memory-light on multi-gigabyte GeoPackages.
 
 from __future__ import annotations
 
-from datetime import timedelta
+import os
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Sequence, Set, Tuple
+
+import numpy as np
 
 from qgis.core import QgsFeatureRequest, QgsVectorLayer
 
@@ -33,6 +36,79 @@ _BATCH_SIZE = 5000
 
 def _no_geometry_flag():
     return FEATURE_REQUEST_NO_GEOMETRY
+
+
+def _report(feedback, done: int, total: int) -> None:
+    """Push a percentage to ``feedback`` when it can take one.
+
+    Both ``QgsProcessingFeedback`` and ``QgsTask`` expose ``setProgress``; a
+    plain object without it (or ``None``) is silently ignored.
+    """
+    if feedback is None or total <= 0:
+        return
+    setter = getattr(feedback, "setProgress", None)
+    if setter is not None:
+        try:
+            setter(min(100.0, done / total * 100.0))
+        except Exception:
+            pass
+
+
+def _canceled(feedback) -> bool:
+    return feedback is not None and feedback.isCanceled()
+
+
+def _estimated_count(layer: QgsVectorLayer) -> int:
+    try:
+        return max(int(layer.featureCount()), 1)
+    except Exception:
+        return 1
+
+
+def check_not_editing(layer: QgsVectorLayer) -> None:
+    """Refuse provider-level edits on a layer that is in QGIS edit mode.
+
+    Provider writes bypass the edit buffer, so they would be invisible to an
+    open editing session and could be undone by its rollback.
+    """
+    if layer is not None and layer.isEditable():
+        raise RuntimeError(
+            f"'{layer.name()}' is in edit mode. Save or discard its edits in "
+            "QGIS (toggle editing off) before managing it here."
+        )
+
+
+def reload_project_layers(gpkg_path: str, layer_name: Optional[str] = None, project=None) -> int:
+    """Reload every project layer backed by ``gpkg_path`` (optionally one table).
+
+    Call on the main thread after editing a GeoPackage through a private
+    connection so loaded copies pick up new rows, fields and deletions.
+    Returns the number of layers reloaded.
+    """
+    from qgis.core import QgsProject, QgsProviderRegistry
+
+    if project is None:
+        project = QgsProject.instance()
+    target = os.path.normcase(os.path.normpath(gpkg_path))
+    registry = QgsProviderRegistry.instance()
+    reloaded = 0
+    for layer in project.mapLayers().values():
+        try:
+            decoded = registry.decodeUri(layer.providerType(), layer.source())
+        except Exception:
+            continue
+        path = decoded.get("path", "")
+        if not path or os.path.normcase(os.path.normpath(path)) != target:
+            continue
+        if layer_name and decoded.get("layerName") != layer_name:
+            continue
+        try:
+            layer.reload()
+            layer.triggerRepaint()
+            reloaded += 1
+        except Exception:
+            continue
+    return reloaded
 
 
 def source_field_for(layer: QgsVectorLayer) -> Optional[str]:
@@ -78,11 +154,17 @@ def layer_type_for_name(layer_name: str) -> Optional[str]:
 
 
 def _text(value) -> str:
-    """A stripped string for an attribute value; QVariant/None nulls become ''."""
+    """A stripped string for an attribute value; QVariant/None nulls become ''.
+
+    Only a *null QVariant* (whose text is ``NULL``) collapses to ``""``; a
+    genuine string ``"NULL"`` / ``"null"`` stored in the data is kept.
+    """
     if value is None:
         return ""
     text = str(value).strip()
-    return "" if text.upper() == "NULL" else text
+    if text == "NULL" and not isinstance(value, str):
+        return ""
+    return text
 
 
 def _wanted(value, source_files: Optional[Set[str]]) -> bool:
@@ -143,6 +225,8 @@ def recompute_iso_time(
     provider = layer.dataProvider()
     counts = {"examined": 0, "updated": 0, "unchanged": 0, "skipped": 0}
     changes: Dict[int, Dict[int, object]] = {}
+    total = _estimated_count(layer)
+    scanned = 0
 
     def flush():
         if not changes:
@@ -154,8 +238,11 @@ def recompute_iso_time(
         changes.clear()
 
     for feature in layer.getFeatures(request):
-        if feedback is not None and feedback.isCanceled():
-            break
+        scanned += 1
+        if scanned % _BATCH_SIZE == 0:
+            if _canceled(feedback):
+                break
+            _report(feedback, scanned, total)
         if source_field and not _wanted(feature[source_field], wanted):
             continue
         counts["examined"] += 1
@@ -193,8 +280,6 @@ def _day_delta(start_date: str, old_start_date: str) -> Optional[timedelta]:
 
 
 def _shift_iso(iso_value: str, delta: timedelta) -> Optional[str]:
-    from datetime import datetime
-
     try:
         dt = datetime.strptime(iso_value, "%Y-%m-%dT%H:%M:%S")
     except (TypeError, ValueError):
@@ -227,13 +312,16 @@ def dedupe_layer_in_place(
 
     seen: Set[Tuple] = set()
     doomed: List[int] = []
-    for feature in layer.getFeatures(request):
-        if feedback is not None and feedback.isCanceled():
-            return 0
+    total = _estimated_count(layer)
+    for scanned, feature in enumerate(layer.getFeatures(request), 1):
+        if scanned % _BATCH_SIZE == 0:
+            if _canceled(feedback):
+                return 0
+            _report(feedback, scanned, total)
         if source_field and wanted is not None and not _wanted(feature[source_field], wanted):
             continue
         key = tuple(
-            "" if fields.indexOf(f) < 0 else _text(feature[f]) for f in key_fields
+            "" if fields.indexOf(f) < 0 else clp.key_value(feature[f]) for f in key_fields
         )
         if key in seen:
             doomed.append(feature.id())
@@ -267,14 +355,15 @@ def delete_source_rows(
     wanted = set(source_files)
     request = QgsFeatureRequest().setFlags(_no_geometry_flag())
     request.setSubsetOfAttributes([source_field], layer.fields())
-    doomed = [
-        f.id()
-        for f in layer.getFeatures(request)
-        if _wanted(f[source_field], wanted)
-        and not (feedback is not None and feedback.isCanceled())
-    ]
-    if feedback is not None and feedback.isCanceled():
-        return 0
+    total = _estimated_count(layer)
+    doomed: List[int] = []
+    for scanned, feature in enumerate(layer.getFeatures(request), 1):
+        if scanned % _BATCH_SIZE == 0:
+            if _canceled(feedback):
+                return 0
+            _report(feedback, scanned, total)
+        if _wanted(feature[source_field], wanted):
+            doomed.append(feature.id())
     if doomed:
         _delete_fids(layer, doomed)
     return len(doomed)
@@ -323,7 +412,7 @@ def ensure_status_field(layer: QgsVectorLayer) -> int:
     return idx
 
 
-def apply_status(layer: QgsVectorLayer, fid_to_status: Dict[int, str]) -> int:
+def apply_status(layer: QgsVectorLayer, fid_to_status: Dict[int, str], feedback=None) -> int:
     """Set ``record_status`` per feature id (batched). Returns rows changed."""
     if not fid_to_status:
         return 0
@@ -331,11 +420,14 @@ def apply_status(layer: QgsVectorLayer, fid_to_status: Dict[int, str]) -> int:
     provider = layer.dataProvider()
     items = list(fid_to_status.items())
     for start in range(0, len(items), _BATCH_SIZE):
+        if _canceled(feedback):
+            return start
         batch = {fid: {idx: status} for fid, status in items[start:start + _BATCH_SIZE]}
         if not provider.changeAttributeValues(batch):
             raise RuntimeError(
                 f"Provider rejected the status update: {provider.error().summary()}"
             )
+        _report(feedback, start + len(batch), len(items))
     return len(items)
 
 
@@ -353,12 +445,15 @@ def set_source_status(
     request = QgsFeatureRequest().setFlags(_no_geometry_flag())
     request.setSubsetOfAttributes([source_field], layer.fields())
     changes: Dict[int, str] = {}
-    for feature in layer.getFeatures(request):
-        if feedback is not None and feedback.isCanceled():
-            return 0
+    total = _estimated_count(layer)
+    for scanned, feature in enumerate(layer.getFeatures(request), 1):
+        if scanned % _BATCH_SIZE == 0:
+            if _canceled(feedback):
+                return 0
+            _report(feedback, scanned, total)
         if _wanted(feature[source_field], wanted):
             changes[feature.id()] = status
-    return apply_status(layer, changes)
+    return apply_status(layer, changes, feedback=feedback)
 
 
 # ---------------------------------------------------------------------------
@@ -369,13 +464,43 @@ def find_gaps_in_epochs(
 ) -> List[Tuple[float, float]]:
     """Gaps (as ``(start, end)`` epoch pairs) where consecutive sorted samples
     are more than ``threshold_s`` seconds apart. Non-finite values are ignored.
+    Vectorised: one sort plus one diff, whatever the row count.
     """
-    clean = sorted(t for t in epochs if t == t)  # drop NaN
-    gaps: List[Tuple[float, float]] = []
-    for previous, current in zip(clean, clean[1:]):
-        if current - previous > threshold_s:
-            gaps.append((previous, current))
-    return gaps
+    arr = np.asarray(epochs, dtype=float)
+    clean = np.sort(arr[np.isfinite(arr)])
+    if clean.size < 2:
+        return []
+    breaks = np.nonzero(np.diff(clean) > threshold_s)[0]
+    return [(float(clean[i]), float(clean[i + 1])) for i in breaks.tolist()]
+
+
+def gap_index_for_epochs(
+    epochs: Sequence[float], gaps: Sequence[Tuple[float, float]]
+) -> np.ndarray:
+    """Index (into ``gaps``) of the gap each epoch falls strictly inside, or -1.
+
+    ``np.searchsorted`` on the gap starts, so the cost is O(n log g) instead
+    of the O(n * g) of testing every epoch against every gap - the difference
+    between a sub-second and a multi-second click on a million-row layer.
+    """
+    arr = np.asarray(epochs, dtype=float)
+    out = np.full(arr.shape, -1, dtype=np.int64)
+    if arr.size == 0 or not len(gaps):
+        return out
+    bounds = np.asarray(gaps, dtype=float).reshape(-1, 2)
+    order = np.argsort(bounds[:, 0], kind="stable")
+    starts = bounds[order, 0]
+    ends = bounds[order, 1]
+    finite = np.isfinite(arr)
+    values = arr[finite]
+    pos = np.searchsorted(starts, values, side="right") - 1
+    valid = pos >= 0
+    inside = np.zeros(values.shape, dtype=bool)
+    inside[valid] = (values[valid] > starts[pos[valid]]) & (values[valid] < ends[pos[valid]])
+    result = np.full(values.shape, -1, dtype=np.int64)
+    result[inside] = order[pos[inside]]
+    out[finite] = result
+    return out
 
 
 def epoch_in_gaps(epoch: float, gaps: Sequence[Tuple[float, float]]) -> bool:
@@ -390,10 +515,19 @@ def classify_gap_fill(
 ) -> List[str]:
     """Per secondary sample: ``active`` when it fills a primary gap, else
     ``standby``. Same order as the input epochs."""
-    return [
-        STATUS_ACTIVE if epoch_in_gaps(t, gaps) else STATUS_STANDBY
-        for t in secondary_epochs
-    ]
+    indices = gap_index_for_epochs(secondary_epochs, gaps)
+    return [STATUS_ACTIVE if i >= 0 else STATUS_STANDBY for i in indices.tolist()]
+
+
+def count_in_gaps(
+    epochs: Sequence[float], gaps: Sequence[Tuple[float, float]]
+) -> List[int]:
+    """How many of ``epochs`` fall inside each gap (same order as ``gaps``)."""
+    if not len(gaps):
+        return []
+    indices = gap_index_for_epochs(epochs, gaps)
+    hits = indices[indices >= 0]
+    return np.bincount(hits, minlength=len(gaps)).tolist()
 
 
 # ---------------------------------------------------------------------------

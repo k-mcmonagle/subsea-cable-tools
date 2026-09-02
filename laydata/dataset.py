@@ -40,6 +40,11 @@ TIME_FIELD_CANDIDATES: Tuple[str, ...] = ("ISO_Time",)
 
 _EPOCH = datetime(1970, 1, 1)
 
+# Curation column written by the Data Explorer's Manage tab (kept in sync with
+# ``processing.cable_lay_manage_ops.STATUS_FIELD``; not imported to keep this
+# module free of QGIS dependencies).
+RECORD_STATUS_FIELD = "record_status"
+
 
 def parse_iso_epoch(value) -> float:
     """Parse an ISO-8601 timestamp to seconds since 1970-01-01 (naive).
@@ -126,6 +131,9 @@ class LayDataset:
         self._is_numeric_cache: Dict[str, bool] = {}
         self._sources_cache: Optional[List[str]] = None
         self._time_epoch: Optional[np.ndarray] = None
+        self._status_cache: Optional[np.ndarray] = None
+        self._active_cache: Optional[np.ndarray] = None
+        self._source_masks_cache: Optional[Dict[str, np.ndarray]] = None
 
         self.fids = (
             np.asarray(list(fids), dtype=np.int64)
@@ -277,6 +285,93 @@ class LayDataset:
                 order = np.argsort(group_epoch[valid], kind="stable")
                 indices = indices[order]
             yield value, indices
+
+    def source_masks(self) -> Dict[str, np.ndarray]:
+        """``{source_value: boolean row mask}`` for every non-empty source.
+
+        Computed once per dataset (one pass over the source column) and cached,
+        so panels that need per-file views do not each rescan millions of
+        rows. Empty when the dataset has no source field.
+        """
+        if self._source_masks_cache is None:
+            masks: Dict[str, np.ndarray] = {}
+            if self.source_field is not None:
+                values = np.array(
+                    [("" if v is None else str(v)) for v in self.columns[self.source_field]],
+                    dtype=object,
+                )
+                for name in sorted(set(values.tolist())):
+                    if name:
+                        masks[name] = values == name
+            self._source_masks_cache = masks
+        return dict(self._source_masks_cache)
+
+    # -- record status (non-destructive curation) --------------------------
+    def status_array(self) -> Optional[np.ndarray]:
+        """Stripped ``record_status`` text per row, or ``None`` without the column.
+
+        NULL attributes (``None`` or a null QVariant, whose text is ``NULL``)
+        become ``""`` so callers only need to compare against the plain
+        status words.
+        """
+        if RECORD_STATUS_FIELD not in self.columns:
+            return None
+        if self._status_cache is None:
+            out = []
+            for value in self.columns[RECORD_STATUS_FIELD]:
+                text = "" if value is None else str(value).strip()
+                out.append("" if text == "NULL" else text)
+            self._status_cache = np.array(out, dtype=object)
+        return self._status_cache
+
+    def active_mask(self) -> np.ndarray:
+        """Rows that count as active: status ``active``, empty, or no column."""
+        if self._active_cache is None:
+            statuses = self.status_array()
+            if statuses is None:
+                self._active_cache = np.ones(self.row_count, dtype=bool)
+            else:
+                self._active_cache = (statuses == "") | (statuses == "active")
+        return self._active_cache
+
+    @property
+    def has_status_field(self) -> bool:
+        return RECORD_STATUS_FIELD in self.columns
+
+    def subset(self, mask: np.ndarray) -> "LayDataset":
+        """A new dataset holding only the rows where ``mask`` is True.
+
+        Row indices in the subset are renumbered, but ``fids`` still point at
+        the original layer features, so map sync and QC findings keep working.
+        Field / source / time detection is carried over unchanged.
+        """
+        mask = np.asarray(mask, dtype=bool)
+        view = LayDataset.__new__(LayDataset)
+        view.layer_name = self.layer_name
+        view.columns = {name: values[mask] for name, values in self.columns.items()}
+        view.row_count = int(mask.sum())
+        view._numeric_cache = {
+            name: values[mask] for name, values in self._numeric_cache.items()
+        }
+        view._is_numeric_cache = dict(self._is_numeric_cache)
+        view._sources_cache = None
+        view._time_epoch = None if self._time_epoch is None else self._time_epoch[mask]
+        view._status_cache = None if self._status_cache is None else self._status_cache[mask]
+        view._active_cache = None
+        view._source_masks_cache = None
+        view.fids = self.fids[mask]
+        view._lat = None if self._lat is None else self._lat[mask]
+        view._lon = None if self._lon is None else self._lon[mask]
+        view.source_field = self.source_field
+        view.time_field = self.time_field
+        return view
+
+    def active_view(self) -> "LayDataset":
+        """``self`` when every row is active, else a subset of the active rows."""
+        mask = self.active_mask()
+        if bool(mask.all()):
+            return self
+        return self.subset(mask)
 
     # -- QGIS loading ------------------------------------------------------
     @classmethod

@@ -261,6 +261,8 @@ PEN_STYLE_DASH = _scoped_member(Qt, "PenStyle", "DashLine")
 ITEM_FLAG_EDITABLE = _scoped_member(Qt, "ItemFlag", "ItemIsEditable")
 ITEM_FLAG_USER_CHECKABLE = _scoped_member(Qt, "ItemFlag", "ItemIsUserCheckable")
 ITEM_DATA_USER_ROLE = _scoped_member(Qt, "ItemDataRole", "UserRole")
+ITEM_DATA_DISPLAY_ROLE = _scoped_member(Qt, "ItemDataRole", "DisplayRole")
+ITEM_DATA_EDIT_ROLE = _scoped_member(Qt, "ItemDataRole", "EditRole")
 CHECK_STATE_CHECKED = _scoped_member(Qt, "CheckState", "Checked")
 CHECK_STATE_UNCHECKED = _scoped_member(Qt, "CheckState", "Unchecked")
 WINDOW_TYPE_TOOL = _scoped_member(Qt, "WindowType", "Tool")
@@ -272,8 +274,9 @@ MAP_LAYER_FILTER_POLYGON = _layer_filter("PolygonLayer")
 MAP_LAYER_FILTER_VECTOR = _layer_filter("VectorLayer")
 MAP_LAYER_FILTER_RASTER = _layer_filter("RasterLayer")
 
-MESSAGE_BOX_YES = _scoped_member(QMessageBox, "StandardButton", "Yes")
-MESSAGE_BOX_NO = _scoped_member(QMessageBox, "StandardButton", "No")
+# Older alias spelling kept for the Burial Planner / Cable Route Workbench.
+MESSAGE_BOX_YES = MESSAGEBOX_YES
+MESSAGE_BOX_NO = MESSAGEBOX_NO
 
 def _feature_request_no_geometry():
     """``NoGeometry`` feature-request flag: QGIS 4 moved it from the

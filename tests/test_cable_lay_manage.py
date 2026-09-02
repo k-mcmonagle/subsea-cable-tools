@@ -46,15 +46,22 @@ _CABLE_LAY_FILE = (
 )
 
 
+def _temp_dir() -> str:
+    """Per-process scratch dir so parallel QGIS 3 / QGIS 4 runs never share files."""
+    path = os.path.join(tempfile.gettempdir(), f"sct_mgmt_tests_{os.getpid()}")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def _write_temp(name: str, content: str) -> str:
-    path = os.path.join(tempfile.gettempdir(), name)
+    path = os.path.join(_temp_dir(), name)
     with open(path, "w", encoding="utf-8", newline="") as handle:
         handle.write(content)
     return path
 
 
 def _fresh_gpkg(name: str) -> str:
-    path = os.path.join(tempfile.gettempdir(), name)
+    path = os.path.join(_temp_dir(), name)
     for suffix in ("", "-wal", "-shm", "-journal"):
         try:
             os.remove(path + suffix)
@@ -334,8 +341,10 @@ def test_manage_panel_gap_fill() -> bool:
         layer = _import([a, b], gpkg, "2024-01-01")
         if layer is None or layer.featureCount() != 5:
             return _result("Manage panel gap fill (end-to-end)", False, "import failed")
+        ManagePanel.run_async = False  # edits run inline (still on a private layer)
         panel = ManagePanel(_Controller(layer, gpkg))
         panel.set_dataset(LayDataset.from_qgis_layer(layer))
+        panel.refresh_now()
 
         if panel.sources_table.rowCount() != 2:
             return _result(
@@ -354,7 +363,7 @@ def test_manage_panel_gap_fill() -> bool:
 
         panel.primary_combo.setCurrentText("sct_mgmt_panel_a.csv")
         panel.secondary_combo.setCurrentText("sct_mgmt_panel_b.csv")
-        panel.threshold_edit.setText("60")
+        panel.threshold_spin.setValue(60)
         panel.find_gaps()
         if panel.gaps_table.rowCount() != 1:
             return _result(
@@ -363,6 +372,8 @@ def test_manage_panel_gap_fill() -> bool:
             )
         panel.apply_gap_fill()
 
+        # The edit went through a private connection; re-open to see the new column.
+        layer = _open(gpkg, clp.prefixed_layer_name(gpkg, "cable_lay"))
         status_by_time = {}
         for feature in layer.getFeatures():
             if str(feature["source_file"]) == "sct_mgmt_panel_b.csv":
@@ -383,6 +394,149 @@ def test_manage_panel_gap_fill() -> bool:
     return _result(
         "Manage panel gap fill (end-to-end)", ok, f"secondary statuses={status_by_time}"
     )
+
+
+def test_manage_panel_edits_ignore_map_filter() -> bool:
+    """Regression: a provider filter on the project layer must not hide rows
+    from the Manage panel's edits (they run on a private layer)."""
+    name = "Manage panel edits ignore map filter"
+    try:
+        from ..explorer.panels.manage_panel import ManagePanel
+        from ..laydata import LayDataset
+    except Exception as exc:
+        return _result(name, False, f"import: {exc!r}")
+
+    a = _write_temp("sct_mgmt_pfilter_a.csv", _PRIMARY_FILE)
+    b = _write_temp("sct_mgmt_pfilter_b.csv", _SECONDARY_FILE)
+    gpkg = _fresh_gpkg("sct_mgmt_pfilter.gpkg")
+    try:
+        layer = _import([a, b], gpkg, "2024-01-01")
+        if layer is None or layer.featureCount() != 5:
+            return _result(
+                name, False,
+                f"import failed: count={None if layer is None else layer.featureCount()}",
+            )
+        # One row of file a goes to standby, then the map filter hides it.
+        first_a = next(
+            f.id() for f in layer.getFeatures()
+            if str(f["source_file"]) == "sct_mgmt_pfilter_a.csv"
+        )
+        ops.apply_status(layer, {first_a: ops.STATUS_STANDBY})
+        layer.setSubsetString(ops.active_subset_expression())
+        visible = layer.featureCount()
+
+        ManagePanel.run_async = False
+        panel = ManagePanel(_Controller(layer, gpkg))
+        panel.set_dataset(LayDataset.from_qgis_layer(layer))
+        panel.refresh_now()
+        row = next(
+            r for r in range(panel.sources_table.rowCount())
+            if panel.sources_table.item(r, 0).text() == "sct_mgmt_pfilter_a.csv"
+        )
+        panel.sources_table.selectRow(row)
+        panel.status_combo.setCurrentText(ops.STATUS_EXCLUDED)
+        panel.set_status()
+        layer.setSubsetString("")
+        reopened = _open(gpkg, clp.prefixed_layer_name(gpkg, "cable_lay"))
+        excluded_a = sum(
+            1 for f in reopened.getFeatures()
+            if str(f["source_file"]) == "sct_mgmt_pfilter_a.csv"
+            and str(f["record_status"]) == ops.STATUS_EXCLUDED
+        )
+    except Exception as exc:
+        return _result(name, False, repr(exc))
+    ok = visible == 4 and excluded_a == 3
+    return _result(name, ok, f"visible with filter={visible} (expected 4), "
+                             f"excluded rows of a={excluded_a} (expected 3)")
+
+
+def test_key_value_normalisation() -> bool:
+    """Parser-typed and provider-typed dedupe keys must compare equal."""
+    name = "dedupe key normalisation (int/float/null)"
+    ok = (
+        clp.key_value(1) == "1" == clp.key_value(1.0)
+        and clp.key_value(None) == ""
+        and clp.key_value(float("nan")) == ""
+        and clp.key_value("NULL") == "NULL"
+        and clp.key_value(0.025) == clp.key_value(0.025)
+        and clp.key_value("1,14:00:00") == "1,14:00:00"
+    )
+    detail = "pure checks"
+    if ok:
+        try:
+            from qgis.core import QgsFeature
+
+            mem = QgsVectorLayer("None?field=KP1:double&field=source_file:string", "m", "memory")
+            feature = QgsFeature(mem.fields())
+            feature.setAttributes([1, "x.csv"])  # stored as double 1.0
+            mem.dataProvider().addFeatures([feature])
+            stored = clp.read_key_set(mem, ["KP1", "source_file"])
+            fresh = clp.row_key({"KP1": 1, "source_file": "x.csv"}, ["KP1", "source_file"])
+            ok = fresh in stored
+            detail = f"stored={stored} fresh={fresh}"
+        except Exception as exc:
+            return _result(name, False, repr(exc))
+    return _result(name, ok, detail)
+
+
+def test_dataset_views() -> bool:
+    """LayDataset.active_mask / subset / source_masks."""
+    name = "LayDataset active view + source masks"
+    try:
+        from ..laydata import LayDataset
+
+        dataset = LayDataset(
+            columns={
+                "ISO_Time": ["2024-01-01T00:00:00", "2024-01-01T00:00:01",
+                             "2024-01-01T00:00:02", "2024-01-01T00:00:03",
+                             "2024-01-01T00:00:04"],
+                "source_file": ["a", "a", "b", "b", None],
+                "record_status": [None, "active", "standby", "excluded", "NULL"],
+            },
+            fids=[10, 11, 12, 13, 14],
+        )
+        mask = dataset.active_mask().tolist()
+        view = dataset.active_view()
+        masks = dataset.source_masks()
+        ok = (
+            mask == [True, True, False, False, True]
+            and view.row_count == 3
+            and view.fids.tolist() == [10, 11, 14]
+            and view.time_epoch is not None and len(view.time_epoch) == 3
+            and sorted(masks) == ["a", "b"]
+            and masks["b"].tolist() == [False, False, True, True, False]
+            and dataset.active_view() is not dataset
+            and view.active_view() is view
+        )
+    except Exception as exc:
+        return _result(name, False, repr(exc))
+    return _result(name, ok, f"mask={mask} view_rows={view.row_count}")
+
+
+def test_gap_math_vectorised() -> bool:
+    """Vectorised gap classification agrees with the scalar reference."""
+    name = "gap math (vectorised == scalar reference)"
+    try:
+        import random
+
+        import numpy as np
+
+        rng = random.Random(7)
+        primary = sorted(rng.uniform(0, 100000) for _ in range(3000))
+        gaps = ops.find_gaps_in_epochs(primary, 60.0)
+        secondary = [rng.uniform(-100, 100100) for _ in range(5000)]
+        secondary += [float("nan"), gaps[0][0], gaps[0][1]] if gaps else [float("nan")]
+        expected = [ops.STATUS_ACTIVE if ops.epoch_in_gaps(t, gaps) else ops.STATUS_STANDBY
+                    for t in secondary]
+        got = ops.classify_gap_fill(secondary, gaps)
+        counts = ops.count_in_gaps(secondary, gaps)
+        expected_counts = [sum(1 for t in secondary if t == t and s < t < e) for s, e in gaps]
+        ok = got == expected and counts == expected_counts and len(gaps) > 0
+        ok = ok and ops.count_in_gaps(np.array([]), gaps) == [0] * len(gaps)
+        ok = ok and ops.find_gaps_in_epochs([], 10) == [] and ops.count_in_gaps([1.0], []) == []
+    except Exception as exc:
+        return _result(name, False, repr(exc))
+    return _result(name, ok, f"gaps={len(gaps)} rows={len(secondary)}")
 
 
 def test_vacuum() -> bool:
@@ -412,6 +566,10 @@ def run_all() -> List[bool]:
         test_fast_append_and_relog(),
         test_status_ops_and_filter(),
         test_manage_panel_gap_fill(),
+        test_manage_panel_edits_ignore_map_filter(),
+        test_key_value_normalisation(),
+        test_dataset_views(),
+        test_gap_math_vectorised(),
         test_vacuum(),
     ]
     print("")

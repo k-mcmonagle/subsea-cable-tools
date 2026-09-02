@@ -324,10 +324,34 @@ def merge_and_dedupe(
     return merged, duplicates
 
 
-def _key_value(value) -> str:
+def key_value(value) -> str:
+    """Normalised text of a dedupe-key attribute value.
+
+    The same function serves rows freshly parsed from a file (Python ints,
+    floats, strings) and attributes read back from the GeoPackage provider
+    (QVariant nulls, doubles for integer-valued keys), so the two compare
+    equal: nulls become ``""`` and integer-valued floats drop their ``.0``.
+    """
     if value is None:
         return ""
-    return str(value)
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        if value != value:  # NaN
+            return ""
+        if value.is_integer():
+            return str(int(value))
+        return repr(value)
+    if isinstance(value, int):
+        return str(value)
+    text = str(value)
+    if text == "NULL" and not isinstance(value, str):
+        return ""  # PyQt5 null QVariant
+    return text
+
+
+def _key_value(value) -> str:
+    return key_value(value)
 
 
 def row_key(row: Dict, key_fields: Sequence[str]) -> Tuple[str, ...]:
@@ -349,20 +373,14 @@ def read_key_set(layer, key_fields: Sequence[str]) -> set:
     request = QgsFeatureRequest().setFlags(FEATURE_REQUEST_NO_GEOMETRY)
     request.setSubsetOfAttributes(present, fields)
 
-    def key_value(feature, field):
+    def feature_key_value(feature, field):
         if fields.indexOf(field) < 0:
             return ""
-        value = feature[field]
-        if value is None:
-            return ""
-        text = str(value)
-        if text == "NULL" and not isinstance(value, str):
-            return ""
-        return text
+        return key_value(feature[field])
 
     keys = set()
     for feature in layer.getFeatures(request):
-        keys.add(tuple(key_value(feature, field) for field in key_fields))
+        keys.add(tuple(feature_key_value(feature, field) for field in key_fields))
     return keys
 
 

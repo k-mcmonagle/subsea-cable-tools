@@ -398,6 +398,30 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   direction — direction already governs section reference ordering and
   event semantics, and a second direction-dependent KP would invite
   confusion between the two.
+- **Data Explorer management edits never touch the project layer.** A
+  project layer carries the user's provider filter (`subsetString`), so any
+  scan over it silently skips hidden rows — with the active-rows map filter
+  on, "set status" and "remove rows" reported success while changing
+  nothing. Every Manage-tab edit therefore opens a *private* layer on the
+  same GeoPackage table inside a `QgsTask` (`explorer/manage_task.py`, the
+  same pattern the processing algorithms use), runs the shared op from
+  `cable_lay_manage_ops` with the task as progress/cancel feedback, and the
+  project layer is reloaded on the main thread afterwards. Provider-level
+  writes also bypass an open edit buffer, so a layer in edit mode is refused
+  rather than edited behind the session's back. Tests drive the same code
+  path synchronously (`ManagePanel.run_async = False`).
+- **Curation is surfaced through an in-memory "Active rows only" view, not
+  the provider filter.** `record_status` is only useful if the table, plots,
+  QC and Inspection panels honour it, and a provider `subsetString` is the
+  wrong tool for that: it reloads the layer, hides standby rows from the
+  Manage tab itself (so a gap fill cannot be reviewed or reversed while it
+  is on), and clobbers whatever filter the user had. The Explorer instead
+  serves each panel a `LayDataset.active_view()` — a numpy mask over the
+  already-loaded arrays, cached per layer, free at any size — while the
+  Manage tab always receives the full dataset. The map filter remains an
+  explicit, separate option that now restores the previous filter on
+  uncheck, and the Sources summary states when a map filter is limiting
+  its counts.
 - **Merge is "one span, one outcome"; the target is explicit, never
   inferred from a mixed selection.** Sections are derived from the
   alternating event sequence, so every merge is boundary-event surgery:
