@@ -63,6 +63,10 @@ class PlotPanel(QWidget):
         self._show_qc = False
         self._show_events = False
         self._select_mode = False
+        # Extra (non-plotted) fields of the active layer shown in the hover
+        # tooltip, e.g. KP while plotting depth against time.
+        self._tooltip_fields: List[str] = []
+        self._context_row: Optional[int] = None  # record under the last right-click
 
         # Render state (rebuilt on every replot).
         self._axis = None
@@ -162,6 +166,14 @@ class PlotPanel(QWidget):
         self._select_action.setChecked(self._select_mode)
         self._select_action.toggled.connect(self._on_select_toggled)
 
+        self.tooltip_menu = menu.addMenu("Tooltip fields")
+        self.tooltip_menu.setToolTip(
+            "Extra fields of the active layer to show in the hover tooltip "
+            "without plotting them (the plotted series are always shown)."
+        )
+        self.tooltip_menu.triggered.connect(self._on_tooltip_field_toggled)
+        self._rebuild_tooltip_menu()
+
         menu.addSeparator()
         self._float_action = menu.addAction("Pop out / dock this plot")
         self._float_action.triggered.connect(lambda: self.controller.toggle_float_panel(self))
@@ -169,6 +181,55 @@ class PlotPanel(QWidget):
         export.triggered.connect(self._export_csv)
         reset = menu.addAction("Reset view")
         reset.triggered.connect(self._reset_view)
+
+    def _rebuild_tooltip_menu(self) -> None:
+        """One checkable entry per field of the active layer (tooltip extras)."""
+        menu = getattr(self, "tooltip_menu", None)
+        if menu is None:
+            return
+        menu.clear()
+        dataset = self._dataset
+        if dataset is None:
+            menu.addAction("(load a layer first)").setEnabled(False)
+            return
+        clear = menu.addAction("None (plotted series only)")
+        clear.setData("__clear__")
+        menu.addSeparator()
+        for name in dataset.field_names:
+            action = menu.addAction(name)
+            action.setCheckable(True)
+            action.setChecked(name in self._tooltip_fields)
+            action.setData(name)
+
+    def _on_tooltip_field_toggled(self, action) -> None:
+        key = action.data()
+        if key == "__clear__":
+            self._tooltip_fields = []
+        elif isinstance(key, str):
+            if action.isChecked():
+                if key not in self._tooltip_fields:
+                    self._tooltip_fields.append(key)
+            else:
+                self._tooltip_fields = [f for f in self._tooltip_fields if f != key]
+        self._rebuild_tooltip_menu()
+        self._last_hover_row = None  # force the label to redraw on next hover
+
+    def _tooltip_extra_lines(self, source_row: int) -> List[str]:
+        dataset = self._dataset
+        if dataset is None or not self._tooltip_fields:
+            return []
+        lines: List[str] = []
+        for field in self._tooltip_fields:
+            if field not in dataset.columns:
+                continue
+            if dataset.is_numeric_field(field):
+                value = dataset.numeric(field)[source_row]
+                text = f"{float(value):.6g}" if np.isfinite(value) else "-"
+            else:
+                raw = dataset.columns[field][source_row]
+                text = "-" if raw is None else str(raw)
+            lines.append(f"{field}: {text}")
+        return lines
 
     # -- dataset / fields --------------------------------------------------
     def _numeric_fields(self) -> List[str]:
@@ -206,6 +267,7 @@ class PlotPanel(QWidget):
         if not self._series and numeric:
             self._series = [{"layer": None, "field": self._default_y(numeric), "axis": "left"}]
         self._rebuild_series_menu()
+        self._rebuild_tooltip_menu()
         self.replot()
 
     def refresh_sources(self) -> None:
@@ -303,6 +365,7 @@ class PlotPanel(QWidget):
             "qc": self._show_qc,
             "events": self._show_events,
             "series": [dict(s) for s in self._series],
+            "tooltip_fields": list(self._tooltip_fields),
         }
 
     def apply_config(self, config: Optional[dict]) -> None:
@@ -314,6 +377,8 @@ class PlotPanel(QWidget):
         self._show_legend = bool(config.get("legend", True))
         self._show_qc = bool(config.get("qc", False))
         self._show_events = bool(config.get("events", False))
+        fields = config.get("tooltip_fields")
+        self._tooltip_fields = [f for f in fields if isinstance(f, str)] if isinstance(fields, list) else []
         series = config.get("series")
         if series is None and config.get("y"):
             series = [{"layer": None, "field": config["y"], "axis": "left"}]
@@ -655,6 +720,18 @@ class PlotPanel(QWidget):
         self._label.setVisible(False)
         plot_item.addItem(self._label)
 
+        # Right-click: pyqtgraph's own view menu gains a "go to" entry for the
+        # record under the cursor (recorded by _on_click on the right button).
+        try:
+            vb_menu = plot_item.vb.menu
+            if vb_menu is not None and not getattr(vb_menu, "_sct_goto_added", False):
+                vb_menu.addSeparator()
+                goto = vb_menu.addAction("Go to this record (map + table + plots)")
+                goto.triggered.connect(self._go_to_context_record)
+                vb_menu._sct_goto_added = True
+        except Exception:
+            pass
+
         if self._show_legend and len(legend_entries) > 1:
             legend = plot_item.addLegend(offset=(10, 10))
             for name, color in legend_entries:
@@ -855,7 +932,19 @@ class PlotPanel(QWidget):
         if event.xdata is None or self._x_full is None or self._x_full.size == 0:
             return
         idx = self._nearest_index(float(event.xdata))
-        self.controller.highlight_record(int(self._rows_full[idx]), from_plot=True)
+        source_row = int(self._rows_full[idx])
+        if getattr(event, "button", 1) == 3:
+            # Right button: remember the record for the view menu's "Go to".
+            self._context_row = source_row
+            return
+        if getattr(event, "dblclick", False):
+            self.controller.go_to_record(source_row)
+            return
+        self.controller.highlight_record(source_row, from_plot=True)
+
+    def _go_to_context_record(self) -> None:
+        if self._context_row is not None:
+            self.controller.go_to_record(int(self._context_row))
 
     def _on_motion(self, event) -> None:
         if event.xdata is None or self._x_full is None or self._x_full.size == 0:
@@ -892,10 +981,11 @@ class PlotPanel(QWidget):
                 raw = series["y"][idx] if idx is not None else np.nan
             yv = float(raw) if np.isfinite(raw) else np.nan
             series["dot"].setData([x], [yv] if np.isfinite(yv) else [])
-            series["dot"].setVisible(np.isfinite(yv))
+            series["dot"].setVisible(bool(np.isfinite(yv)))  # PyQt6 rejects numpy.bool
             lines.append(f"{series['field']}: {yv:.4g}" if np.isfinite(yv) else f"{series['field']}: -")
             if label_y is None and np.isfinite(yv) and series.get("axis") != "right":
                 label_y = yv
+        lines.extend(self._tooltip_extra_lines(source_row))
         self._label.setText("\n".join(lines))
         if label_y is None:
             label_y = 0.0

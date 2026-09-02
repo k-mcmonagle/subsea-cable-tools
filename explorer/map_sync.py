@@ -48,6 +48,15 @@ class MapSyncController:
             pass
         self.rubber.reset(GEOMETRY_LINE)
 
+        # Hover marker: follows the plot crosshair (no pan), distinct from the
+        # red click/selection cross so both can be read at once.
+        self.hover_marker = QgsVertexMarker(canvas)
+        self.hover_marker.setColor(QColor(30, 110, 255))
+        self.hover_marker.setIconType(QgsVertexMarker.ICON_CIRCLE)
+        self.hover_marker.setIconSize(12)
+        self.hover_marker.setPenWidth(2)
+        self.hover_marker.hide()
+
     # -- configuration -----------------------------------------------------
     def set_layer(self, layer) -> None:
         self._layer = layer
@@ -95,6 +104,21 @@ class MapSyncController:
             self.canvas.setCenter(mid)
             self.canvas.refresh()
 
+    def hover_point(self, lon: float, lat: float) -> None:
+        """Move the hover marker to a record (never pans the map)."""
+        if self.hover_marker is None:
+            return
+        point = self._to_canvas(lon, lat)
+        if point is None:
+            self.hover_marker.hide()
+            return
+        self.hover_marker.setCenter(point)
+        self.hover_marker.show()
+
+    def clear_hover(self) -> None:
+        if self.hover_marker is not None:
+            self.hover_marker.hide()
+
     def select_feature(self, fid: Optional[int]) -> None:
         if self._layer is None or fid is None:
             return
@@ -108,10 +132,11 @@ class MapSyncController:
             self.marker.hide()
         if self.rubber is not None:
             self.rubber.reset(GEOMETRY_LINE)
+        self.clear_hover()
 
     def cleanup(self) -> None:
         """Remove graphics items from the canvas scene (call on window close)."""
-        for item in (self.marker, self.rubber):
+        for item in (self.marker, self.rubber, self.hover_marker):
             if item is None:
                 continue
             try:
@@ -120,3 +145,4 @@ class MapSyncController:
                 pass
         self.marker = None
         self.rubber = None
+        self.hover_marker = None

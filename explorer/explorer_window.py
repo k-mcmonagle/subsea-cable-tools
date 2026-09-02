@@ -111,10 +111,10 @@ class CableLayExplorerWindow(QMainWindow):
         self.processing_panel = ProcessingPanel(self)
         self.manage_panel = ManagePanel(self)
         self.analysis_tabs = QTabWidget()
+        self.analysis_tabs.addTab(self.manage_panel, "Manage")
         self.analysis_tabs.addTab(self.qc_panel, "QC")
         self.analysis_tabs.addTab(self.inspection_panel, "Inspection")
         self.analysis_tabs.addTab(self.processing_panel, "Processing")
-        self.analysis_tabs.addTab(self.manage_panel, "Manage")
         self.qc_dock = QDockWidget("Analysis", self)
         self.qc_dock.setObjectName("AnalysisDock")
         self.qc_dock.setWidget(self.analysis_tabs)
@@ -185,14 +185,21 @@ class CableLayExplorerWindow(QMainWindow):
         self.addToolBar(toolbar)
 
         choose_action = QAction("Choose layers\u2026", self)
-        choose_action.setToolTip("Select which project layers to load into the Explorer")
+        choose_action.setToolTip(
+            "Select which project layers to load into the Explorer. Every loaded "
+            "layer is available to the plots; one of them is the active layer."
+        )
         choose_action.triggered.connect(self._choose_layers)
         toolbar.addAction(choose_action)
 
-        toolbar.addWidget(QLabel(" Table layer: "))
+        toolbar.addWidget(QLabel(" Active layer: "))
         self.layer_combo = QComboBox()
         self.layer_combo.setMinimumWidth(240)
-        self.layer_combo.setToolTip("Which loaded layer the table, QC and Inspection panels use")
+        self.layer_combo.setToolTip(
+            "The loaded layer that the table, Manage, QC and Inspection panels "
+            "work on, and the default source for new plot series. Plots can also "
+            "add series from any other loaded layer."
+        )
         self.layer_combo.currentIndexChanged.connect(self._on_table_layer_changed)
         toolbar.addWidget(self.layer_combo)
 
@@ -237,6 +244,12 @@ class CableLayExplorerWindow(QMainWindow):
         self.sync_action = QAction("Sync crosshair", self)
         self.sync_action.setCheckable(True)
         self.sync_action.setChecked(True)
+        self.sync_action.setToolTip(
+            "Hovering a plot moves the crosshair on every other plot and a blue "
+            "marker on the map to the same record. Click a plot to highlight the "
+            "record (red) in the table and map; double-click or right-click to "
+            "go to it (pans the map, centres the plots)."
+        )
         self.sync_action.toggled.connect(self._on_sync_toggled)
         toolbar.addAction(self.sync_action)
 
@@ -622,6 +635,7 @@ class CableLayExplorerWindow(QMainWindow):
         if not checked:
             for panel in self._plot_panels():
                 panel.clear_hover()
+            self.map_sync.clear_hover()
 
     def broadcast_hover(self, source_row: int, origin=None) -> None:
         if not self._sync_crosshair:
@@ -633,6 +647,23 @@ class CableLayExplorerWindow(QMainWindow):
             if panel is origin:
                 continue
             panel.set_hover(source_row)
+        self._update_map_hover(source_row)
+
+    def _update_map_hover(self, source_row: int) -> None:
+        """Move the blue map marker to the hovered record (never pans)."""
+        dataset = self.dataset
+        if dataset is None or not dataset.has_geometry:
+            self.map_sync.clear_hover()
+            return
+        if not (0 <= source_row < dataset.row_count):
+            self.map_sync.clear_hover()
+            return
+        lat = dataset.lat[source_row]
+        lon = dataset.lon[source_row]
+        if np.isfinite(lat) and np.isfinite(lon):
+            self.map_sync.hover_point(float(lon), float(lat))
+        else:
+            self.map_sync.clear_hover()
 
     # -- X axis linking + global X mode ------------------------------------
     def _on_lock_x_toggled(self, checked: bool) -> None:

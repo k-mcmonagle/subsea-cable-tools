@@ -132,12 +132,13 @@ class LineCollection:
 
 
 class PlotMouseEvent:
-    def __init__(self, name: str, inaxes: Optional["PyQtGraphAxis"], xdata: Optional[float], ydata: Optional[float], button: Optional[int] = None):
+    def __init__(self, name: str, inaxes: Optional["PyQtGraphAxis"], xdata: Optional[float], ydata: Optional[float], button: Optional[int] = None, dblclick: bool = False):
         self.name = name
         self.inaxes = inaxes
         self.xdata = xdata
         self.ydata = ydata
         self.button = button
+        self.dblclick = dblclick  # matplotlib-compatible double-click flag
 
 
 class PyQtGraphLine:
@@ -305,7 +306,12 @@ class PyQtGraphCanvas(QWidget):
                 button = 1
         except Exception:
             pass
-        event = PlotMouseEvent("button_press_event", axis, xdata, ydata, button=button)
+        dblclick = False
+        try:
+            dblclick = bool(mouse_event.double())
+        except Exception:
+            pass
+        event = PlotMouseEvent("button_press_event", axis, xdata, ydata, button=button, dblclick=dblclick)
         self._emit("button_press_event", event)
 
     def _emit(self, event_name: str, event: PlotMouseEvent):
