@@ -276,6 +276,15 @@ class ManagePanel(QWidget):
         )
         self.compact_button.clicked.connect(self.compact_gpkg)
         buttons.addWidget(self.compact_button, 1, 1)
+
+        self.temporal_button = QPushButton("Enable QGIS temporal…")
+        self.temporal_button.setToolTip(
+            "Let the QGIS Temporal Controller play through this layer: adds a "
+            "virtual ISO_DateTime field (project only, nothing written to the "
+            "GeoPackage) and sets the layer's temporal properties to it."
+        )
+        self.temporal_button.clicked.connect(self.enable_temporal)
+        buttons.addWidget(self.temporal_button, 2, 0, 1, 2)
         layout.addLayout(buttons)
 
         self.view_check = QCheckBox("Explorer view: active rows only")
@@ -484,6 +493,10 @@ class ManagePanel(QWidget):
         self.status_combo.setEnabled(selected)
         self.remove_button.setEnabled(selected)
         self.compact_button.setEnabled(bool(self.controller.gpkg_path()))
+        self.temporal_button.setEnabled(
+            self.controller.layer is not None
+            and self._dataset is not None and self._dataset.time_field is not None
+        )
         two_sources = manageable and len(self._source_masks()) >= 2
         self.find_gaps_button.setEnabled(two_sources)
         self.fill_gaps_button.setEnabled(two_sources and bool(self._gaps))
@@ -897,6 +910,33 @@ class ManagePanel(QWidget):
         self.status_label.setText(
             f"Compacted: {before / (1024 * 1024):.1f} MB -> "
             f"{after / (1024 * 1024):.1f} MB ({saved:.1f} MB reclaimed)."
+        )
+
+    def enable_temporal(self) -> None:
+        layer = self.controller.layer
+        dataset = self._dataset
+        if layer is None or dataset is None or dataset.time_field is None:
+            self.status_label.setText("Load a layer with an ISO_Time column first.")
+            return
+        answer = QMessageBox.question(
+            self,
+            "Enable QGIS temporal",
+            "Show every record up to the current time (accumulate)?\n\n"
+            "Yes: lay data / tracks - the map fills in as time advances.\n"
+            "No: events - only records inside the current time step show.",
+            MESSAGEBOX_YES | MESSAGEBOX_NO,
+        )
+        try:
+            field = ops.enable_temporal_navigation(
+                layer, dataset.time_field, accumulate=(answer == MESSAGEBOX_YES)
+            )
+        except RuntimeError as exc:
+            QMessageBox.critical(self, "Enable QGIS temporal", str(exc))
+            return
+        self.status_label.setText(
+            f"Temporal navigation enabled on '{layer.name()}' via virtual field {field}. "
+            "Open View > Panels > Temporal Controller and press play; the Explorer's "
+            "own record stepping (Ctrl+Left/Right) works independently."
         )
 
     # -- actions: gap fill -------------------------------------------------

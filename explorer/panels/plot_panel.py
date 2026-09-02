@@ -44,6 +44,11 @@ _DASH_LINE = getattr(getattr(Qt, "PenStyle", Qt), "DashLine")
 _INSTANT_POPUP = getattr(getattr(QToolButton, "ToolButtonPopupMode", QToolButton), "InstantPopup")
 
 _SEVERITY_COLORS = {"ERROR": (214, 39, 40), "WARNING": (255, 140, 0), "INFO": (31, 119, 180)}
+_STRONG_FOCUS = getattr(getattr(Qt, "FocusPolicy", Qt), "StrongFocus")
+_KEYS = getattr(Qt, "Key", Qt)
+_KEY_LEFT = getattr(_KEYS, "Key_Left")
+_KEY_RIGHT = getattr(_KEYS, "Key_Right")
+_KEY_ESCAPE = getattr(_KEYS, "Key_Escape")
 
 
 class PlotPanel(QWidget):
@@ -67,6 +72,7 @@ class PlotPanel(QWidget):
         # tooltip, e.g. KP while plotting depth against time.
         self._tooltip_fields: List[str] = []
         self._context_row: Optional[int] = None  # record under the last right-click
+        self._pinned = False  # click pins the tooltip; click again / Esc releases
 
         # Render state (rebuilt on every replot).
         self._axis = None
@@ -132,6 +138,23 @@ class PlotPanel(QWidget):
 
         self.canvas.mpl_connect("button_press_event", self._on_click)
         self.canvas.mpl_connect("motion_notify_event", self._on_motion)
+        # Keyboard: Left/Right step through records, Esc clears (see keyPressEvent).
+        self.setFocusPolicy(_STRONG_FOCUS)
+        self.canvas.setFocusPolicy(_STRONG_FOCUS)
+        self.canvas.setFocusProxy(self)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        key = event.key()
+        if key == _KEY_LEFT:
+            self.controller.step_record(-1)
+        elif key == _KEY_RIGHT:
+            self.controller.step_record(1)
+        elif key == _KEY_ESCAPE:
+            self.controller.escape()
+        else:
+            super().keyPressEvent(event)
+            return
+        event.accept()
 
     # -- options menu ------------------------------------------------------
     def _build_options_menu(self) -> None:
@@ -937,16 +960,37 @@ class PlotPanel(QWidget):
             # Right button: remember the record for the view menu's "Go to".
             self._context_row = source_row
             return
+        self.setFocus()
         if getattr(event, "dblclick", False):
+            self._pinned = False
             self.controller.go_to_record(source_row)
             return
+        if self._pinned:
+            # Second click releases the pinned tooltip; hover follows the mouse again.
+            self._pinned = False
+            self.set_hover(source_row, force=True)
+            return
         self.controller.highlight_record(source_row, from_plot=True)
+        self._pinned = True
+        self.set_hover(source_row, force=True)
+        self.controller.broadcast_hover(source_row, origin=self)
+
+    def unpin(self) -> None:
+        if self._pinned:
+            self._pinned = False
+            self._last_hover_row = None
+
+    @property
+    def pinned(self) -> bool:
+        return self._pinned
 
     def _go_to_context_record(self) -> None:
         if self._context_row is not None:
             self.controller.go_to_record(int(self._context_row))
 
     def _on_motion(self, event) -> None:
+        if self._pinned:
+            return
         if event.xdata is None or self._x_full is None or self._x_full.size == 0:
             return
         idx = self._nearest_index(float(event.xdata))
@@ -954,10 +998,12 @@ class PlotPanel(QWidget):
         self.set_hover(source_row)
         self.controller.broadcast_hover(source_row, origin=self)
 
-    def set_hover(self, source_row: int) -> None:
+    def set_hover(self, source_row: int, force: bool = False) -> None:
         if self._pos_for_row is None or self._vline is None:
             return
-        if source_row == self._last_hover_row:
+        if self._pinned and not force:
+            return  # a pinned tooltip ignores other panels' hover
+        if source_row == self._last_hover_row and not force:
             return
         self._last_hover_row = source_row
         if source_row < 0 or source_row >= self._pos_for_row.size:
@@ -986,6 +1032,8 @@ class PlotPanel(QWidget):
             if label_y is None and np.isfinite(yv) and series.get("axis") != "right":
                 label_y = yv
         lines.extend(self._tooltip_extra_lines(source_row))
+        if self._pinned:
+            lines.append("(pinned - click to release)")
         self._label.setText("\n".join(lines))
         if label_y is None:
             label_y = 0.0
@@ -995,6 +1043,7 @@ class PlotPanel(QWidget):
         self.canvas.draw_idle()
 
     def clear_hover(self) -> None:
+        self._pinned = False
         self._last_hover_row = None
         self._set_overlay_visible(False)
         self.canvas.draw_idle()

@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from qgis.PyQt.QtCore import QSettings, Qt
-from qgis.PyQt.QtGui import QGuiApplication
+from qgis.PyQt.QtGui import QGuiApplication, QKeySequence
 from qgis.PyQt.QtWidgets import (
     QApplication,
     QComboBox,
@@ -96,6 +96,9 @@ class CableLayExplorerWindow(QMainWindow):
         self._syncing = False
         self._sync_crosshair = True
         self._last_hover_row = None
+        self._current_row: Optional[int] = None  # last highlighted / stepped record
+        self._selection_layer = None  # project layer whose selectionChanged we follow
+        self._kp_field_cache: dict = {}
         self._plot_layout_mode = "Tabbed"
         self._lock_x = False
         self.settings = QSettings()
@@ -121,6 +124,8 @@ class CableLayExplorerWindow(QMainWindow):
         self.addDockWidget(_DOCK_RIGHT, self.qc_dock)
 
         self._restore_plots()
+        self._build_shortcuts()
+        self.statusBar().showMessage("")
 
         self._fit_initial_size()
         self._restore_state()
@@ -256,6 +261,27 @@ class CableLayExplorerWindow(QMainWindow):
         clear_action = QAction("Clear highlight", self)
         clear_action.triggered.connect(self._clear_highlight)
         toolbar.addAction(clear_action)
+
+    def _build_shortcuts(self) -> None:
+        """Window-wide keys: Ctrl+Left/Right step records, Esc clears."""
+        self.step_back_action = QAction("Previous record", self)
+        self.step_back_action.setShortcut(QKeySequence("Ctrl+Left"))
+        self.step_back_action.triggered.connect(self._step_back)
+        self.addAction(self.step_back_action)
+        self.step_forward_action = QAction("Next record", self)
+        self.step_forward_action.setShortcut(QKeySequence("Ctrl+Right"))
+        self.step_forward_action.triggered.connect(self._step_forward)
+        self.addAction(self.step_forward_action)
+        self.escape_action = QAction("Clear highlight and selection", self)
+        self.escape_action.setShortcut(QKeySequence("Esc"))
+        self.escape_action.triggered.connect(self.escape)
+        self.addAction(self.escape_action)
+
+    def _step_back(self) -> None:
+        self.step_record(-1)
+
+    def _step_forward(self) -> None:
+        self.step_record(1)
 
     def _fit_initial_size(self) -> None:
         try:
@@ -443,6 +469,8 @@ class CableLayExplorerWindow(QMainWindow):
                 del self._views[layer_id]
         active = self.dataset
         self.map_sync.set_layer(self.layer)
+        self._connect_selection(self.layer)
+        self._current_row = None
         self.table_panel.set_dataset(active)
         self.qc_panel.set_dataset(active)
         self.inspection_panel.set_dataset(active)
@@ -648,6 +676,7 @@ class CableLayExplorerWindow(QMainWindow):
                 continue
             panel.set_hover(source_row)
         self._update_map_hover(source_row)
+        self._update_status_readout(source_row)
 
     def _update_map_hover(self, source_row: int) -> None:
         """Move the blue map marker to the hovered record (never pans)."""
@@ -732,21 +761,135 @@ class CableLayExplorerWindow(QMainWindow):
 
     # -- go-to: focus map + all plots on a record / event ------------------
     def go_to_record(self, source_row: int) -> None:
+        self.focus_record(source_row, pan=True)
+
+    def focus_record(self, source_row: int, pan=True) -> None:
+        """Highlight a record everywhere and centre the plots on it.
+
+        ``pan`` is True (always pan the map), False (never) or ``"if_outside"``
+        (pan only when the record is off-screen - used by keyboard stepping).
+        """
         if self.dataset is None or not (0 <= source_row < self.dataset.row_count):
             return
+        self._current_row = int(source_row)
         if self.dataset.has_geometry:
             lat = self.dataset.lat[source_row]
             lon = self.dataset.lon[source_row]
             if np.isfinite(lat) and np.isfinite(lon):
-                self.map_sync.highlight_point(float(lon), float(lat), pan=True)
-        self.map_sync.select_feature(int(self.dataset.fids[source_row]))
+                self.map_sync.highlight_point(float(lon), float(lat), pan=pan)
         self._syncing = True
         try:
+            self.map_sync.select_feature(int(self.dataset.fids[source_row]))
             self.table_panel.select_source_row(source_row)
         finally:
             self._syncing = False
         for panel in self._plot_panels():
+            panel.unpin()
             panel.center_on_record(source_row)
+            panel.set_hover(source_row, force=True)
+        self._last_hover_row = source_row
+        self._update_map_hover(source_row)
+        self._update_status_readout(source_row)
+
+    def step_record(self, delta: int) -> None:
+        """Move the current record by ``delta`` rows (keyboard stepping)."""
+        if self.dataset is None or self.dataset.row_count == 0:
+            return
+        current = self._current_row if self._current_row is not None else -1 if delta > 0 else self.dataset.row_count
+        target = max(0, min(self.dataset.row_count - 1, current + int(delta)))
+        if target == self._current_row:
+            return
+        self.focus_record(target, pan="if_outside")
+
+    def escape(self) -> None:
+        """Esc: clear highlight, hover, pinned tooltips and the map selection."""
+        self._clear_highlight()
+        if self.layer is not None:
+            self._syncing = True
+            try:
+                self.layer.removeSelection()
+            except Exception:
+                pass
+            finally:
+                self._syncing = False
+        self.statusBar().clearMessage()
+
+    def go_to_finding(self, finding) -> None:
+        """Double-clicked QC finding: pan the map and centre every plot on it."""
+        self.highlight_finding(finding)
+        row = None
+        fid = getattr(finding, "feature_fid", None)
+        if fid is not None:
+            row = self._row_for_fid(int(fid))
+        if row is not None:
+            self.focus_record(row, pan=True)
+            return
+        t = None
+        start = getattr(finding, "time_start", None)
+        if start:
+            from ..laydata.dataset import parse_iso_epoch
+
+            value = parse_iso_epoch(start)
+            t = float(value) if np.isfinite(value) else None
+        for panel in self._plot_panels():
+            panel.center_on_time(t)
+
+    # -- map -> explorer selection sync ------------------------------------
+    def _connect_selection(self, layer) -> None:
+        if layer is self._selection_layer:
+            return
+        if self._selection_layer is not None:
+            try:
+                self._selection_layer.selectionChanged.disconnect(self._on_map_selection_changed)
+            except Exception:
+                pass
+        self._selection_layer = layer
+        if layer is not None:
+            try:
+                layer.selectionChanged.connect(self._on_map_selection_changed)
+            except Exception:
+                self._selection_layer = None
+
+    def _on_map_selection_changed(self, selected, _deselected, _clear_and_select) -> None:
+        """A feature selected on the QGIS map (or attribute table) focuses the Explorer."""
+        if self._syncing or not selected:
+            return
+        row = self._row_for_fid(int(selected[0]))
+        if row is None:
+            return
+        self.focus_record(row, pan=False)
+
+    # -- status bar readout --------------------------------------------------
+    def _kp_field(self, dataset) -> Optional[str]:
+        key = id(dataset)
+        if key not in self._kp_field_cache:
+            found = None
+            for name in dataset.field_names:
+                if "kp" in name.lower() and dataset.is_numeric_field(name):
+                    found = name
+                    break
+            self._kp_field_cache = {key: found}
+        return self._kp_field_cache[key]
+
+    def _update_status_readout(self, source_row: int) -> None:
+        dataset = self.dataset
+        if dataset is None or not (0 <= source_row < dataset.row_count):
+            self.statusBar().clearMessage()
+            return
+        parts = [f"Record {source_row + 1:,} of {dataset.row_count:,}"]
+        if dataset.time_field is not None:
+            parts.append(f"{dataset.time_field}: {dataset.iso_time_at(source_row) or '-'}")
+        kp = self._kp_field(dataset)
+        if kp is not None:
+            value = dataset.numeric(kp)[source_row]
+            parts.append(f"{kp}: {value:.4f}" if np.isfinite(value) else f"{kp}: -")
+        if dataset.source_field is not None:
+            parts.append(f"{dataset.source_field}: {dataset.source_at(source_row) or '-'}")
+        if dataset.has_geometry:
+            lat, lon = dataset.lat[source_row], dataset.lon[source_row]
+            if np.isfinite(lat) and np.isfinite(lon):
+                parts.append(f"{lat:.6f}, {lon:.6f}")
+        self.statusBar().showMessage("   |   ".join(parts))
 
     def go_to_event(self, layer_id: str, row: int) -> None:
         dataset = self.dataset_for(layer_id)
@@ -801,6 +944,8 @@ class CableLayExplorerWindow(QMainWindow):
     def highlight_record(self, source_row: int, from_table: bool = False, from_plot: bool = False) -> None:
         if self.dataset is None or self._syncing:
             return
+        self._current_row = int(source_row)
+        self._update_status_readout(source_row)
         self._syncing = True
         try:
             lat = lon = None
@@ -909,6 +1054,13 @@ class CableLayExplorerWindow(QMainWindow):
             self.restoreGeometry(geometry)
         if state is not None:
             self.restoreState(state)
+        tab = self.settings.value(f"{_SETTINGS_GROUP}/analysis_tab")
+        try:
+            index = int(tab)
+        except (TypeError, ValueError):
+            index = -1
+        if 0 <= index < self.analysis_tabs.count():
+            self.analysis_tabs.setCurrentIndex(index)
 
     def _save_state(self) -> None:
         self.settings.setValue(f"{_SETTINGS_GROUP}/geometry", self.saveGeometry())
@@ -919,6 +1071,7 @@ class CableLayExplorerWindow(QMainWindow):
         self.settings.setValue(f"{_SETTINGS_GROUP}/sync_crosshair", self._sync_crosshair)
         self.settings.setValue(f"{_SETTINGS_GROUP}/lock_x", self._lock_x)
         self.settings.setValue(f"{_SETTINGS_GROUP}/active_only", self._active_only)
+        self.settings.setValue(f"{_SETTINGS_GROUP}/analysis_tab", self.analysis_tabs.currentIndex())
         self.settings.setValue(
             f"{_SETTINGS_GROUP}/loaded_layers", json.dumps(list(self._datasets.keys()))
         )
@@ -947,6 +1100,7 @@ class CableLayExplorerWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         self._cancel_load()
         self._save_state()
+        self._connect_selection(None)
         self.map_sync.clear()
         super().closeEvent(event)
 
@@ -954,6 +1108,10 @@ class CableLayExplorerWindow(QMainWindow):
         """Full teardown for plugin unload: remove canvas graphics."""
         try:
             self._cancel_load()
+        except Exception:
+            pass
+        try:
+            self._connect_selection(None)
         except Exception:
             pass
         try:

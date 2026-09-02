@@ -35,6 +35,7 @@ from qgis.core import QgsApplication
 
 from ...qgis_compat import (
     EDIT_TRIGGER_DOUBLE_CLICKED,
+    EDIT_TRIGGER_NONE,
     HEADER_RESIZE_MODE_STRETCH,
     MESSAGEBOX_NO,
     MESSAGEBOX_YES,
@@ -102,10 +103,15 @@ class QcPanel(QWidget):
         self.findings_table.setHorizontalHeaderLabels(["Severity", "Check", "Message", "Time", "Value"])
         self.findings_table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
         self.findings_table.setSelectionMode(SELECTION_MODE_SINGLE)
-        self.findings_table.setEditTriggers(EDIT_TRIGGER_DOUBLE_CLICKED)
+        self.findings_table.setEditTriggers(EDIT_TRIGGER_NONE)
         self.findings_table.setSortingEnabled(True)
         self.findings_table.horizontalHeader().setSectionResizeMode(2, HEADER_RESIZE_MODE_STRETCH)
+        self.findings_table.setToolTip(
+            "Click a finding to highlight it; double-click to go to it (pans the "
+            "map and centres every plot)."
+        )
         self.findings_table.itemSelectionChanged.connect(self._on_finding_selected)
+        self.findings_table.cellDoubleClicked.connect(self._on_finding_double_clicked)
         results_layout.addWidget(self.findings_table, 1)
 
         splitter.addWidget(results)
@@ -291,6 +297,17 @@ class QcPanel(QWidget):
         index = int(index)
         if 0 <= index < len(self._findings):
             self.controller.highlight_finding(self._findings[index])
+
+    def _on_finding_double_clicked(self, row: int, _col: int) -> None:
+        item = self.findings_table.item(row, 0)
+        if item is None:
+            return
+        index = item.data(self._user_role)
+        if index is None:
+            return
+        index = int(index)
+        if 0 <= index < len(self._findings):
+            self.controller.go_to_finding(self._findings[index])
 
     def save_findings(self) -> None:
         if not self._findings:

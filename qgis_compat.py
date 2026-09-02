@@ -236,6 +236,7 @@ FIELD_TYPE_DOUBLE = _field_type("Double", "Double")
 FIELD_TYPE_INT = _field_type("Int", "Int")
 FIELD_TYPE_LONG_LONG = _field_type("LongLong", "LongLong")
 FIELD_TYPE_BOOL = _field_type("Bool", "Bool")
+FIELD_TYPE_DATETIME = _field_type("QDateTime", "DateTime")
 
 # QDialogButtonBox button constants - PyQt6 moved these under StandardButton scope
 BUTTON_BOX_OK = _scoped_member(QDialogButtonBox, "StandardButton", "Ok")

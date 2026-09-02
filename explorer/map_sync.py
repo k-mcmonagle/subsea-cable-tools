@@ -76,7 +76,9 @@ class MapSyncController:
         return point
 
     # -- highlighting ------------------------------------------------------
-    def highlight_point(self, lon: float, lat: float, pan: bool = False) -> None:
+    def highlight_point(self, lon: float, lat: float, pan=False) -> None:
+        """``pan`` may be True, False or ``"if_outside"`` (pan only when the
+        point is not within the current map extent - used by record stepping)."""
         point = self._to_canvas(lon, lat)
         self.rubber.reset(GEOMETRY_LINE)
         if point is None:
@@ -84,6 +86,11 @@ class MapSyncController:
             return
         self.marker.setCenter(point)
         self.marker.show()
+        if pan == "if_outside":
+            try:
+                pan = not self.canvas.extent().contains(point)
+            except Exception:
+                pan = False
         if pan:
             self.canvas.setCenter(point)
             self.canvas.refresh()

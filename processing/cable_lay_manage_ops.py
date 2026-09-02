@@ -531,6 +531,60 @@ def count_in_gaps(
 
 
 # ---------------------------------------------------------------------------
+# QGIS temporal navigation
+# ---------------------------------------------------------------------------
+TEMPORAL_FIELD = "ISO_DateTime"
+
+
+def _temporal_mode_instant():
+    """``FeatureDateTimeInstantFromField`` across the QGIS 3 / 4 enum homes."""
+    from qgis.core import Qgis, QgsVectorLayerTemporalProperties
+
+    scope = getattr(Qgis, "VectorTemporalMode", None)
+    if scope is not None and hasattr(scope, "FeatureDateTimeInstantFromField"):
+        return scope.FeatureDateTimeInstantFromField
+    return QgsVectorLayerTemporalProperties.ModeFeatureDateTimeInstantFromField
+
+
+def enable_temporal_navigation(
+    layer: QgsVectorLayer, time_field: str = "ISO_Time", accumulate: bool = False
+) -> str:
+    """Make a cable-lay layer usable by the QGIS Temporal Controller.
+
+    The importers store ``ISO_Time`` as text (portable, dedupe-friendly), which
+    the temporal panel's field picker does not list. Instead of changing the
+    stored schema this adds a *virtual* DateTime field ``ISO_DateTime``
+    (``to_datetime("ISO_Time")``, lives in the project, never written to the
+    GeoPackage) and switches the layer's temporal properties to "single field
+    with date/time" on it. ``accumulate`` shows every feature up to the current
+    frame instead of only the frame's own features (useful for lay data).
+    Returns the virtual field name. Raises ``RuntimeError`` without the time
+    field.
+    """
+    from qgis.core import QgsField
+
+    from ..qgis_compat import FIELD_TYPE_DATETIME
+
+    fields = layer.fields()
+    if fields.indexOf(time_field) < 0:
+        raise RuntimeError(f"Layer has no {time_field} field.")
+    if fields.indexOf(TEMPORAL_FIELD) < 0:
+        layer.addExpressionField(
+            f'to_datetime("{time_field}")', QgsField(TEMPORAL_FIELD, FIELD_TYPE_DATETIME)
+        )
+    props = layer.temporalProperties()
+    props.setMode(_temporal_mode_instant())
+    props.setStartField(TEMPORAL_FIELD)
+    try:
+        props.setAccumulateFeatures(bool(accumulate))
+    except Exception:
+        pass
+    props.setIsActive(True)
+    layer.triggerRepaint()
+    return TEMPORAL_FIELD
+
+
+# ---------------------------------------------------------------------------
 # GeoPackage maintenance
 # ---------------------------------------------------------------------------
 def vacuum_gpkg(gpkg_path: str) -> Tuple[int, int]:

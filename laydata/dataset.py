@@ -459,6 +459,19 @@ class LayDataset:
             if progress is not None and idx % 2000 == 0:
                 progress(idx)
 
+        # Date/time attributes (e.g. the virtual ISO_DateTime field added for
+        # QGIS temporal navigation) arrive as QDateTime objects; store them as
+        # ISO text so the table shows something readable and epoch parsing
+        # keeps working.
+        for name, values in columns.items():
+            sample = next((v for v in values if v is not None), None)
+            if sample is not None and hasattr(sample, "toString") and hasattr(sample, "isValid"):
+                columns[name] = [
+                    (v.toString("yyyy-MM-ddTHH:mm:ss") if hasattr(v, "toString") and v.isValid() else None)
+                    if v is not None else None
+                    for v in values
+                ]
+
         return cls(
             columns=columns,
             lat=lats,
