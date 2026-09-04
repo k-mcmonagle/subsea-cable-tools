@@ -220,7 +220,7 @@ def test_workbench_dock_shows_and_switches_registry() -> bool:
     for top_index in range(dock.tree.topLevelItemCount()):
         collect(dock.tree.topLevelItem(top_index))
     ok = ok and "Assembly Library" not in tree_text
-    ok = ok and "Cable make-up" in tree_text and "Load 01" in tree_text
+    ok = ok and "Assembly" in tree_text and "Load 01" in tree_text
     ok = ok and dock._activate_workbench(second.gpkg_path)
     ok = ok and project_gpkg_path(project) == os.path.abspath(second.gpkg_path)
     ok = ok and dock.rpl_panel.store is dock.assembly_panel.store

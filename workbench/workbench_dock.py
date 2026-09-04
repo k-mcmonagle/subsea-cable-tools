@@ -184,8 +184,7 @@ class WorkbenchDock(QDockWidget):
         self.assembly_panel.assembly_saved.connect(lambda _id: self._refresh_labels())
         self.assessment_panel.assessments_changed.connect(self.refresh_tree)
         self.system_overview.importSegmentRequested.connect(self._import_for_system)
-        self.system_overview.addNodeRequested.connect(self._add_node_for_system)
-        self.system_overview.connectRequested.connect(self._connect_for_system)
+        self.system_overview.topologyChanged.connect(self._on_topology_changed)
         self.system_overview.componentActivated.connect(self._open_schematic_component)
         self.segment_overview.openRevisionRequested.connect(self._open_rpl_id)
         self.segment_overview.importRevisionRequested.connect(self._import_for_route)
@@ -906,6 +905,14 @@ class WorkbenchDock(QDockWidget):
             menu.addAction("New cable segment...", self._new_route)
             menu.addAction("Import RPL (Excel/CSV)...", self._import_rpl)
             menu.addAction("Import path file (.pthmdb)...", self._import_path_file)
+            menu.addSeparator()
+            menu.addAction("Add BU / node...",
+                           lambda _checked=False, sid=ref[1]: self._add_node_for_system(sid))
+            menu.addAction("Connect endpoints...",
+                           lambda _checked=False, sid=ref[1]: self._connect_for_system(sid))
+            menu.addAction("Show schematic",
+                           lambda _checked=False, sid=ref[1]: self._show_system_schematic(sid))
+            menu.addSeparator()
             menu.addAction("Rename system...", self._rename_system)
             menu.addAction("Delete system", self._delete_selected)
         elif ref[0] == KIND_ROUTE:
@@ -1214,6 +1221,11 @@ class WorkbenchDock(QDockWidget):
         self._select_ref((KIND_RPL, dialog.rpl_id))
         self.rpl_panel.select_rpl(dialog.rpl_id)
 
+    def _show_system_schematic(self, system_id: str):
+        self._select_ref((KIND_SYSTEM, system_id))
+        self.stack.setCurrentWidget(self.system_overview)
+        self.system_overview.show_schematic()
+
     def _import_for_system(self, system_id: str):
         self._select_ref((KIND_SYSTEM, system_id))
         self._import_rpl()
@@ -1252,21 +1264,47 @@ class WorkbenchDock(QDockWidget):
         self.rpl_panel.select_topology_system(system_id)
 
     def _add_node_for_system(self, system_id: str):
-        self._open_topology_for_system(system_id)
-        self.rpl_panel._new_node(system_id=system_id)
+        self._select_ref((KIND_SYSTEM, system_id))
+        self.stack.setCurrentWidget(self.system_overview)
+        self.system_overview.add_node("", "bu")
 
     def _connect_for_system(self, system_id: str):
-        self._open_topology_for_system(system_id)
-        self.rpl_panel._connect_ports()
+        self._select_ref((KIND_SYSTEM, system_id))
+        self.stack.setCurrentWidget(self.system_overview)
+        self.system_overview.connect_dialog("")
+
+    def _on_topology_changed(self):
+        """A topology edit on the system page: refresh the tree, keep the page."""
+        store = self._store()
+        if store is not None:
+            store.clear_cache()
+        self.refresh_tree()
+        if self.tree.currentItem() is not None:
+            ref = self._current_ref()
+            if ref and ref[0] == KIND_SYSTEM:
+                self.stack.setCurrentWidget(self.system_overview)
 
     def _open_topology_for_route(self, route_id: str):
+        """Show the segment's system schematic (the place to make connections)."""
         store = self._store()
         route = store.get_route(route_id) if store else None
-        self._open_topology_for_system((route or {}).get("system_id") or "")
+        system_id = (route or {}).get("system_id") or ""
+        if not system_id:
+            QMessageBox.information(
+                self, "Cable-system topology",
+                "This cable segment is not in a system yet. Use 'Move cable "
+                "segment to system' on the segment, or create a system first.")
+            return
+        self._select_ref((KIND_SYSTEM, system_id))
+        self.stack.setCurrentWidget(self.system_overview)
+        self.system_overview.show_schematic()
 
     def _open_schematic_component(self, kind: str, subject_id: str):
         if kind == "route":
             self._select_ref((KIND_ROUTE, subject_id))
+        elif kind in ("node", "connection"):
+            # Nodes are edited in place on the system schematic; nothing to open.
+            return
         else:
             system_id = self._selected_system_id() or ""
             self._open_topology_for_system(system_id)

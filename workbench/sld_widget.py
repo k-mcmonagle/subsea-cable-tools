@@ -121,31 +121,56 @@ class SldWidget(SystemSchematicWidget):
         self.home()
 
     def _draw_route_events(self):
-        for event in self._events:
-            cable_km = event.get("cable_km")
-            if cable_km is None:
+        """Fitted RPL events along the assembly, decluttered.
+
+        Every event keeps its dot and tooltip; a label is only drawn when it
+        does not collide with the previous label on the same run (dense
+        alter-course lists otherwise paint over each other), and body events
+        that are already equipment nodes of the assembly are not repeated.
+        """
+        node_names = {
+            _event_key(node.get("label")) for node in self._nodes.values()
+            if node.get("node_type") == "equipment"}
+        events = sorted(
+            (event for event in self._events if event.get("cable_km") is not None),
+            key=lambda event: float(event["cable_km"]))
+        last_label_point = None
+        last_label_half = 0.0
+        for event in events:
+            cable_km = float(event["cable_km"])
+            label_text = str(event.get("label") or "Event")
+            category = event.get("category") or "geographic"
+            if category in ("body", "both") and _event_key(label_text) in node_names:
                 continue
-            point = self._point_at_cable(float(cable_km) * 1000.0)
+            point = self._point_at_cable(cable_km * 1000.0)
             if point is None:
                 continue
             color = {
                 "geographic": "#cc6677", "body": "#117733",
                 "both": "#6f42c1",
                 "installation": "#cc6677",  # legacy category reads as geographic
-            }.get(event.get("category") or "geographic", "#cc6677")
+            }.get(category, "#cc6677")
             marker = self.scene().addEllipse(
                 point.x() - 4.5, point.y() - 4.5, 9.0, 9.0,
                 QPen(QColor(color), 1.2), QBrush(QColor(color)))
             marker.setZValue(7)
-            label_text = str(event.get("label") or "Event")
+            tooltip = f"{label_text}\nCable distance: {cable_km:.3f} km"
+            marker.setToolTip(tooltip)
             label = self.scene().addSimpleText(label_text)
+            half = label.boundingRect().width() / 2.0
+            if last_label_point is not None:
+                gap = math.hypot(point.x() - last_label_point.x(),
+                                 point.y() - last_label_point.y())
+                if gap < last_label_half + half + 10.0:
+                    # Too close to the previous label: keep the dot only.
+                    self.scene().removeItem(label)
+                    continue
             label.setBrush(QBrush(QColor("#52606d")))
             label.setZValue(7)
             _center_text(label, point + QPointF(0.0, 34.0))
-            tooltip = f"{label_text}\nCable distance: {float(cable_km):.3f} km"
-            marker.setToolTip(tooltip)
             label.setToolTip(tooltip)
             self._detail_labels.append(label)
+            last_label_point, last_label_half = point, half
 
     def set_kp_mapping(self, mapping):
         """Keep the fit mapping for marker tooltips; no plot axis is needed."""
@@ -226,6 +251,10 @@ class SldWidget(SystemSchematicWidget):
             if cable_m is not None:
                 self.cableDistClicked.emit(float(cable_m))
         super().mousePressEvent(event)
+
+
+def _event_key(value) -> str:
+    return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
 
 
 def _boundary_node(label):

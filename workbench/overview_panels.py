@@ -4,28 +4,40 @@
 from __future__ import annotations
 
 from qgis.PyQt.QtCore import Qt, pyqtSignal
+from qgis.PyQt.QtGui import QBrush, QColor
 from qgis.PyQt.QtWidgets import (
-    QAbstractItemView, QHBoxLayout, QHeaderView, QLabel, QPushButton,
-    QTabWidget, QTableWidget, QTableWidgetItem, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout, QWidget,
+    QAbstractItemView, QComboBox, QHBoxLayout, QHeaderView, QInputDialog,
+    QLabel, QMessageBox, QPushButton, QTabWidget, QTableWidget,
+    QTableWidgetItem, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from . import schema
-from .rpl_summary import rpl_summary
+from .rpl_summary import (
+    format_cable_type_lengths, rpl_summary, sum_cable_type_lengths,
+)
 from .system_schematic import SegmentSchematicWidget, SystemSchematicWidget
-from .system_topology import TopologyGraph
+from .system_topology import TopologyGraph, endpoint_label, is_segment_component
 
 
 class SystemOverviewPanel(QWidget):
+    """System page: segment table, interactive schematic and endpoint list.
+
+    Topology edits (connect, disconnect, add/rename/delete nodes) are applied
+    here against the store, then ``topologyChanged`` asks the dock to refresh.
+    """
+
     importSegmentRequested = pyqtSignal(str)
-    addNodeRequested = pyqtSignal(str)
-    connectRequested = pyqtSignal(str)
+    addNodeRequested = pyqtSignal(str)          # kept for compatibility (handled here)
+    connectRequested = pyqtSignal(str)          # kept for compatibility (handled here)
     componentActivated = pyqtSignal(str, str)
+    topologyChanged = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._system_id = ""
+        self._store = None
         self._schematic_args = None
+        self._graph = None
         layout = QVBoxLayout(self)
         self.title = QLabel()
         self.title.setStyleSheet("font-size: 18px; font-weight: 600;")
@@ -38,15 +50,58 @@ class SystemOverviewPanel(QWidget):
         self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels([
             "Cable segment", "RPL revision", "Assemblies", "RPL sections",
-            "Route length", "Cable length", "Cable type", "Status",
+            "Route length", "Cable length", "Cable types", "Status",
         ])
         _configure_table(self.table)
         self.table.setToolTip("Double-click a cable segment to open its overview.")
         self.table.cellDoubleClicked.connect(self._segment_activated)
         self.views.addTab(self.table, "Table")
+        schematic_page = QWidget()
+        schematic_layout = QVBoxLayout(schematic_page)
+        schematic_layout.setContentsMargins(0, 0, 0, 0)
+        schematic_layout.setSpacing(4)
         self.schematic = SystemSchematicWidget()
         self.schematic.componentActivated.connect(self.componentActivated)
-        self.views.addTab(self.schematic, "Schematic")
+        self.schematic.connectRequested.connect(self.connect_ports)
+        self.schematic.disconnectRequested.connect(self.disconnect)
+        self.schematic.addNodeRequested.connect(self.add_node)
+        self.schematic.nodeActionRequested.connect(self._node_action)
+        self.schematic.statusMessage.connect(self._set_status)
+        schematic_layout.addWidget(self.schematic, 1)
+        self.schematic_status = QLabel(
+            "Amber = open endpoint. Right-click one and choose \u2018Start connection "
+            "from here\u2019 (or Shift+click), then click the other endpoint. "
+            "Right-click anything for more actions.")
+        self.schematic_status.setWordWrap(True)
+        self.schematic_status.setStyleSheet("color:#52606d;")
+        schematic_layout.addWidget(self.schematic_status)
+        self.views.addTab(schematic_page, "Schematic")
+        endpoints_page = QWidget()
+        endpoints_layout = QVBoxLayout(endpoints_page)
+        endpoints_layout.setContentsMargins(0, 0, 0, 0)
+        self.endpoints_table = QTableWidget(0, 4)
+        self.endpoints_table.setHorizontalHeaderLabels([
+            "Component", "Endpoint", "Status", "Connected to",
+        ])
+        _configure_table(self.endpoints_table)
+        self.endpoints_table.setToolTip(
+            "Every endpoint in this system. Double-click an open endpoint to "
+            "connect it; select a connected one and press Disconnect.")
+        self.endpoints_table.cellDoubleClicked.connect(self._endpoint_activated)
+        self.endpoints_table.itemSelectionChanged.connect(self._endpoint_selection_changed)
+        endpoints_layout.addWidget(self.endpoints_table, 1)
+        endpoint_actions = QHBoxLayout()
+        self.connect_selected_btn = QPushButton("Connect selected...")
+        self.connect_selected_btn.clicked.connect(self._connect_selected_endpoint)
+        self.connect_selected_btn.setEnabled(False)
+        self.disconnect_btn = QPushButton("Disconnect")
+        self.disconnect_btn.clicked.connect(self._disconnect_selected_endpoint)
+        self.disconnect_btn.setEnabled(False)
+        endpoint_actions.addWidget(self.connect_selected_btn)
+        endpoint_actions.addWidget(self.disconnect_btn)
+        endpoint_actions.addStretch()
+        endpoints_layout.addLayout(endpoint_actions)
+        self.views.addTab(endpoints_page, "Endpoints")
         self.views.currentChanged.connect(self._view_changed)
         layout.addWidget(self.views, 1)
 
@@ -57,20 +112,35 @@ class SystemOverviewPanel(QWidget):
             "QLabel { background:#f3f6f8; border:1px solid #d7dde2; padding:10px; }")
         layout.addWidget(self.guidance)
         actions = QHBoxLayout()
-        for label, signal in (
-            ("Import cable segment...", self.importSegmentRequested),
-            ("Add BU / node...", self.addNodeRequested),
-            ("Connect endpoints...", self.connectRequested),
-        ):
-            button = QPushButton(label)
-            button.clicked.connect(lambda _checked=False, s=signal: s.emit(self._system_id))
-            actions.addWidget(button)
+        import_btn = QPushButton("Import cable segment...")
+        import_btn.clicked.connect(
+            lambda _checked=False: self.importSegmentRequested.emit(self._system_id))
+        actions.addWidget(import_btn)
+        node_btn = QPushButton("Add BU / node...")
+        node_btn.setToolTip("Add a branching unit, beach manhole, joint or other node, "
+                            "optionally connected to an open endpoint")
+        node_btn.clicked.connect(lambda _checked=False: self.add_node("", "bu"))
+        actions.addWidget(node_btn)
+        connect_btn = QPushButton("Connect endpoints...")
+        connect_btn.setToolTip("Pick two open endpoints side by side")
+        connect_btn.clicked.connect(lambda _checked=False: self.connect_dialog(""))
+        actions.addWidget(connect_btn)
+        suggest_btn = QPushButton("Suggest connections...")
+        suggest_btn.setToolTip(
+            "Propose nodes and connections from matching RPL endpoint events "
+            "(e.g. both segments ending at \u201cBU-1\u201d)")
+        suggest_btn.clicked.connect(self.suggest_connections)
+        actions.addWidget(suggest_btn)
         actions.addStretch()
         layout.addLayout(actions)
 
+    # ------------------------------------------------------------ loading --
     def load_system(self, store, system_id: str) -> None:
         self._system_id = system_id or ""
+        self._store = store
         self.table.setRowCount(0)
+        self.endpoints_table.setRowCount(0)
+        self._graph = None
         if store is None or not system_id:
             self.title.setText("Cable system")
             self.summary.setText("No cable system selected.")
@@ -132,6 +202,8 @@ class SystemOverviewPanel(QWidget):
                          if summary.route_length_km is not None]
         cable_lengths = [summary.cable_length_km for summary in summaries.values()
                          if summary.cable_length_km is not None]
+        type_totals = sum_cable_type_lengths(
+            summary.cable_type_lengths for summary in summaries.values())
 
         name = system.get("name") or "Cable system"
         self.title.setText(name)
@@ -141,11 +213,20 @@ class SystemOverviewPanel(QWidget):
         if cable_lengths:
             length_bits.append(f"{sum(cable_lengths):.3f} km cable")
         suffix = (" · " + " · ".join(length_bits)) if length_bits else ""
-        self.summary.setText(
+        text = (
             f"{_count(len(routes), 'cable segment')} · {_count(len(nodes), 'node')} · "
             f"{_count(len(revisions), 'RPL revision')} · "
             f"{_count(open_count, 'open endpoint')}{suffix}")
+        by_type = format_cable_type_lengths(type_totals)
+        if by_type:
+            text += "\nBy cable type (route): " + by_type
+            cable_by_type = format_cable_type_lengths(type_totals, measure="cable")
+            if cable_by_type and cable_by_type != by_type:
+                text += "\nBy cable type (cable): " + cable_by_type
+        self.summary.setText(text)
         self._populate_segments(routes, latest_by_route, summaries, makeup_counts)
+        self._graph = graph
+        self._populate_endpoints(store, graph, members, latest_by_route)
 
         core_checks = [
             (bool(routes), "Add at least one cable segment"),
@@ -173,11 +254,199 @@ class SystemOverviewPanel(QWidget):
         self._render_schematic_if_visible()
 
     def _render_schematic_if_visible(self):
-        if self.views.currentWidget() is not self.schematic or self._schematic_args is None:
+        if self.views.currentIndex() != 1 or self._schematic_args is None:
             return
         store, system_id, graph, rpls = self._schematic_args
         self._schematic_args = None
-        self.schematic.set_system(store, system_id, graph=graph, rpls=rpls)
+        self.schematic.set_system(store, system_id, graph=graph, rpls=rpls,
+                                  classify=self._classifier())
+
+    def _classifier(self):
+        from .assembly_model import EventClassifier
+
+        try:
+            if self._store is not None and self._store.exists():
+                return EventClassifier(self._store.list_event_rules()).classify
+        except Exception:
+            pass
+        return EventClassifier.with_defaults().classify
+
+    def show_schematic(self) -> None:
+        self.views.setCurrentIndex(1)
+
+    # ----------------------------------------------------------- topology --
+    def _reload(self):
+        """Re-read the store after a topology edit and tell the dock."""
+        if self._store is None:
+            return
+        from .system_topology import assign_system_ids
+
+        assign_system_ids(self._store)
+        # The schematic keeps its expanded segments and pending state while
+        # the system id is unchanged, so a plain reload is enough.
+        self.load_system(self._store, self._system_id)
+        self.topologyChanged.emit()
+
+    def _set_status(self, text: str):
+        self.schematic_status.setText(text)
+
+    def connect_ports(self, port_a_id: str, port_b_id: str) -> bool:
+        if self._store is None or not port_a_id or not port_b_id:
+            return False
+        try:
+            self._store.connect_ports(port_a_id, port_b_id)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Connect endpoints", str(exc))
+            return False
+        self._set_status("Connected. Amber endpoints remain open.")
+        self._reload()
+        return True
+
+    def disconnect(self, connection_id: str) -> None:
+        if self._store is None or not connection_id:
+            return
+        self._store.disconnect(connection_id)
+        self._set_status("Disconnected.")
+        self._reload()
+
+    def connect_dialog(self, first_port_id: str = "") -> None:
+        if self._store is None:
+            return
+        from .topology_dialogs import ConnectEndpointsDialog, run_dialog
+
+        dialog = ConnectEndpointsDialog(self._store, self._system_id, first_port_id, self)
+        if run_dialog(dialog):
+            self.connect_ports(dialog.first_port_id(), dialog.second_port_id())
+
+    def add_node(self, port_id: str = "", node_type: str = "bu") -> None:
+        if self._store is None:
+            return
+        self._store.ensure_created()
+        from .topology_dialogs import NodeDialog, run_dialog
+
+        dialog = NodeDialog(self._store, self._system_id, node_type or "bu",
+                            port_id or "", self)
+        if not run_dialog(dialog):
+            return
+        try:
+            dialog.create()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Add node", str(exc))
+        self._set_status("Node added. Click an open endpoint, then a node port, to connect.")
+        self._reload()
+
+    def suggest_connections(self) -> None:
+        if self._store is None:
+            return
+        from .topology_dialogs import SuggestConnectionsDialog, run_dialog
+
+        dialog = SuggestConnectionsDialog(
+            self._store, self._system_id, self._classifier(), self)
+        if not run_dialog(dialog):
+            return
+        try:
+            count = dialog.apply()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Suggest connections", str(exc))
+            count = 0
+        self._set_status(f"Applied {count} connection{'' if count == 1 else 's'}.")
+        self._reload()
+
+    def _node_action(self, action: str, component_id: str) -> None:
+        if self._store is None or not component_id:
+            return
+        component = next((c for c in self._store.list_components()
+                          if c.get("component_id") == component_id), None)
+        if component is None:
+            return
+        if action == "rename":
+            name, ok = QInputDialog.getText(
+                self, "Rename node", "Node name:", text=component.get("name") or "")
+            if not ok or not name.strip():
+                return
+            component["name"] = name.strip()
+            self._store.save_component(component)
+        elif action == "add_port":
+            self._store.add_port(component_id)
+        elif action == "delete":
+            answer = QMessageBox.question(
+                self, "Delete node",
+                f"Delete node '{component.get('name') or component_id}' and its connections?")
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            self._store.delete_component(component_id)
+        else:
+            return
+        self._reload()
+
+    # ---------------------------------------------------------- endpoints --
+    def _populate_endpoints(self, store, graph, members, latest_by_route):
+        rows = []
+        for component in sorted(members, key=lambda c: (
+                c.get("kind") != "route", (c.get("name") or "").lower())):
+            summary = None
+            if is_segment_component(component):
+                summary = rpl_summary(store, latest_by_route.get(component.get("subject_id") or ""))
+            for port in graph.ports_of(component["component_id"]):
+                connection = graph.connection_of_port(port["port_id"])
+                if connection is None:
+                    status, peer_text = "open", ""
+                else:
+                    peer = graph.peer_port(port["port_id"]) or {}
+                    peer_component = graph.components.get(peer.get("component_id")) or {}
+                    status = "connected"
+                    peer_text = f"{peer_component.get('name') or '?'} · " + endpoint_label(
+                        peer_component, peer)
+                rows.append((port["port_id"], (connection or {}).get("connection_id") or "", [
+                    component.get("name") or "?", endpoint_label(component, port, summary),
+                    status, peer_text,
+                ]))
+        self.endpoints_table.setUpdatesEnabled(False)
+        try:
+            self.endpoints_table.setRowCount(len(rows))
+            for row_index, (port_id, connection_id, values) in enumerate(rows):
+                _set_row(self.endpoints_table, row_index, values, port_id)
+                first = self.endpoints_table.item(row_index, 0)
+                if first is not None:
+                    first.setData(int(Qt.ItemDataRole.UserRole) + 1, connection_id)
+                status_item = self.endpoints_table.item(row_index, 2)
+                if status_item is not None and values[2] == "open":
+                    status_item.setForeground(QBrush(QColor(200, 120, 0)))
+        finally:
+            self.endpoints_table.setUpdatesEnabled(True)
+        self._endpoint_selection_changed()
+
+    def _selected_endpoint(self):
+        row = self.endpoints_table.currentRow()
+        item = self.endpoints_table.item(row, 0) if row >= 0 else None
+        if item is None:
+            return "", ""
+        return (str(item.data(Qt.ItemDataRole.UserRole) or ""),
+                str(item.data(int(Qt.ItemDataRole.UserRole) + 1) or ""))
+
+    def _endpoint_selection_changed(self):
+        port_id, connection_id = self._selected_endpoint()
+        self.connect_selected_btn.setEnabled(bool(port_id) and not connection_id)
+        self.disconnect_btn.setEnabled(bool(connection_id))
+
+    def _endpoint_activated(self, row, _column):
+        item = self.endpoints_table.item(row, 0)
+        if item is None:
+            return
+        port_id = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        connection_id = str(item.data(int(Qt.ItemDataRole.UserRole) + 1) or "")
+        if port_id and not connection_id:
+            self.connect_dialog(port_id)
+
+    def _connect_selected_endpoint(self):
+        port_id, connection_id = self._selected_endpoint()
+        if port_id and not connection_id:
+            self.connect_dialog(port_id)
+
+    def _disconnect_selected_endpoint(self):
+        _port_id, connection_id = self._selected_endpoint()
+        if connection_id:
+            self.disconnect(connection_id)
 
     def _populate_segments(self, routes, latest_by_route, summaries, makeup_counts):
         self.table.setUpdatesEnabled(False)
@@ -195,10 +464,17 @@ class SystemOverviewPanel(QWidget):
                     str(summary.section_count) if rpl else "",
                     _km(summary.route_length_km) if rpl else "",
                     _km(summary.cable_length_km) if rpl else "",
-                    summary.cable_type if rpl else "",
+                    (format_cable_type_lengths(summary.cable_type_lengths)
+                     or summary.cable_type) if rpl else "",
                     rpl.get("status") or ("Missing RPL" if not rpl else schema.STATUS_DRAFT),
                 ]
                 _set_row(self.table, row_index, values, route_id)
+                type_item = self.table.item(row_index, 6)
+                if type_item is not None and rpl:
+                    type_item.setToolTip(
+                        "Route km per cable type\nCable km: "
+                        + (format_cable_type_lengths(
+                            summary.cable_type_lengths, measure="cable") or "n/a"))
         finally:
             self.table.setUpdatesEnabled(True)
 
@@ -230,6 +506,7 @@ class SegmentOverviewPanel(QWidget):
         self._schematic_args = None
         self._makeup_total_m = 0.0
         self._makeup_placement_count = 0
+        self._schematic_rpl_id = ""
         layout = QVBoxLayout(self)
         self.title = QLabel()
         self.title.setStyleSheet("font-size: 18px; font-weight: 600;")
@@ -302,9 +579,27 @@ class SegmentOverviewPanel(QWidget):
         self.detail_tables.addTab(self.revisions, "RPL revisions")
         table_layout.addWidget(self.detail_tables)
         self.views.addTab(table_page, "Table")
+        schematic_page = QWidget()
+        schematic_layout = QVBoxLayout(schematic_page)
+        schematic_layout.setContentsMargins(0, 0, 0, 0)
+        schematic_layout.setSpacing(4)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Show:"))
+        self.schematic_mode = QComboBox()
+        self.schematic_mode.addItem("Cable make-up (assemblies and joints)", "makeup")
+        self.schematic_mode.addItem("RPL sections (event to event)", "sections")
+        self.schematic_mode.setToolTip(
+            "Make-up: the physical assembly/joint chain placed on this segment.\n"
+            "RPL sections: the selected revision split at every event, with cable "
+            "type and length per section.")
+        self.schematic_mode.currentIndexChanged.connect(self._schematic_mode_changed)
+        mode_row.addWidget(self.schematic_mode)
+        mode_row.addStretch()
+        schematic_layout.addLayout(mode_row)
         self.schematic = SegmentSchematicWidget()
         self.schematic.componentActivated.connect(self._schematic_activated)
-        self.views.addTab(self.schematic, "Schematic")
+        schematic_layout.addWidget(self.schematic, 1)
+        self.views.addTab(schematic_page, "Schematic")
         self.views.currentChanged.connect(self._view_changed)
         layout.addWidget(self.views, 1)
 
@@ -361,6 +656,7 @@ class SegmentOverviewPanel(QWidget):
         self._populate_makeup(store, route_id)
         self._makeup_summary_base = self.makeup_summary.text()
         self._schematic_args = (store, route_id, route.get("name") or "Cable segment")
+        self._schematic_rpl_id = ""
         self._render_schematic_if_visible()
         rows = store.revisions_of_route(route_id)
         self.revisions.blockSignals(True)
@@ -411,12 +707,19 @@ class SegmentOverviewPanel(QWidget):
         end = _endpoint_text(summary, "B")
         rev = rpl.get("rev_label") or "Unlabelled"
         kind = (rpl.get("kind") or "").replace("_", " ")
+        by_type = format_cable_type_lengths(summary.cable_type_lengths)
         self.endpoint_summary.setText(
             f"{rev} ({kind})\n{start}\n{end}\n"
             f"{_count(summary.section_count, 'event-to-event RPL section')}"
-            f" · {_km(summary.route_length_km)} route · {_km(summary.cable_length_km)} cable")
+            f" · {_km(summary.route_length_km)} route · {_km(summary.cable_length_km)} cable"
+            + (f"\nBy cable type (route): {by_type}" if by_type else ""))
         self._populate_positions(summary)
         self._populate_sections(summary)
+        if self._schematic_rpl_id != rpl_id:
+            self._schematic_rpl_id = rpl_id
+            if self.schematic_mode.currentData() == "sections":
+                self._schematic_args = (store, self._route_id, self.title.text())
+                self._render_schematic_if_visible()
         fits = store.list_fits(rpl_id=rpl_id)
         assessments = store.list_assessments(rpl_id)
         if self._makeup_placement_count == 0:
@@ -530,12 +833,33 @@ class SegmentOverviewPanel(QWidget):
     def _view_changed(self, _index):
         self._render_schematic_if_visible()
 
+    def _schematic_mode_changed(self, _index):
+        if self._store is not None and self._route_id:
+            self._schematic_args = (self._store, self._route_id, self.title.text())
+            self._render_schematic_if_visible()
+
     def _render_schematic_if_visible(self):
-        if self.views.currentWidget() is not self.schematic or self._schematic_args is None:
+        if self.views.currentIndex() != 1 or self._schematic_args is None:
             return
         args = self._schematic_args
         self._schematic_args = None
+        if self.schematic_mode.currentData() == "sections":
+            store, route_id, route_name = args
+            rpl = store.get_rpl(self._selected_rpl_id) if self._selected_rpl_id else None
+            self.schematic.set_segment(store, rpl, route_id, route_name,
+                                       classify=self._classifier())
+            return
         self.schematic.set_makeup(*args)
+
+    def _classifier(self):
+        from .assembly_model import EventClassifier
+
+        try:
+            if self._store is not None and self._store.exists():
+                return EventClassifier(self._store.list_event_rules()).classify
+        except Exception:
+            pass
+        return EventClassifier.with_defaults().classify
 
     def _populate_positions(self, summary):
         self.positions_table.setUpdatesEnabled(False)

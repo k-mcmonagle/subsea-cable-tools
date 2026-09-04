@@ -931,6 +931,29 @@ class WorkbenchStore:
                 self.upsert_rows(schema.TABLE_PORT, ports)
         return component_id
 
+    def add_port(self, component_id: str, label: str = "") -> str:
+        """Append one port to a node (e.g. an extra BU branch); returns its id.
+
+        A blank label continues the ``Branch n`` / ``Side n`` numbering of the
+        component's existing ports.
+        """
+        existing = [p for p in self.list_ports() if p.get("component_id") == component_id]
+        if not label:
+            labels = [str(p.get("label") or "") for p in existing]
+            prefix = "Branch" if any(l.startswith("Branch") for l in labels) else "Side"
+            numbers = []
+            for value in labels:
+                if value.startswith(prefix):
+                    try:
+                        numbers.append(int(value[len(prefix):].strip() or 0))
+                    except ValueError:
+                        pass
+            label = f"{prefix} {max(numbers or [0]) + 1}"
+        port_id = schema.new_id()
+        self.upsert_rows(schema.TABLE_PORT, [
+            {"port_id": port_id, "component_id": component_id, "label": label}])
+        return port_id
+
     def component_for_subject(self, subject_id: str) -> Optional[Dict]:
         return next(
             (c for c in self.list_components() if c.get("subject_id") == subject_id),

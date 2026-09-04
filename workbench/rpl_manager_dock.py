@@ -1247,29 +1247,16 @@ class RplManagerPanel(QWidget):
 
     def _port_display(self, component: Dict, port: Dict) -> str:
         """Human endpoint label; A/B remains a compact secondary convention."""
-        label = str(port.get("label") or "?")
+        from .system_topology import endpoint_label
+
         if component.get("kind") not in ("route", "rpl"):
-            return label.replace("_", " ").title()
+            return endpoint_label(component, port)
         if component.get("kind") == "route":
             rpl = self.store.latest_revision(component.get("subject_id") or "")
         else:
             rpl = self.store.get_rpl(component.get("subject_id") or "")
-        role = "Start" if label.strip().upper() == "A" else "End"
-        summary = rpl_summary(self.store, rpl)
-        is_start = label.strip().upper() == "A"
-        kp = summary.start_kp_km if is_start else summary.end_kp_km
-        pos = summary.start_pos if is_start else summary.end_pos
-        event = summary.start_event if is_start else summary.end_event
-        if not rpl:
-            return f"{role} ({label})"
-        bits = [f"{role} ({label})"]
-        if kp is not None:
-            bits.append(f"KP {kp:.3f}")
-        if pos not in (None, ""):
-            bits.append(f"Pos {pos}")
-        if event:
-            bits.append(f"“{event}”")
-        return " · ".join(bits)
+        summary = rpl_summary(self.store, rpl) if rpl else None
+        return endpoint_label(component, port, summary)
 
     def _rpl_endpoint(self, rpl: Optional[Dict], port_label: str):
         if not rpl or self.store is None:
@@ -1283,82 +1270,47 @@ class RplManagerPanel(QWidget):
             return None
         return model.points[0] if port_label.strip().upper() == "A" else model.points[-1]
 
-    def _new_node(self, _checked=False, *, system_id: str = ""):
-        from qgis.PyQt.QtWidgets import QInputDialog
+    def _current_system_id(self) -> str:
+        item = self.systems_tree.currentItem()
+        while item is not None and item.parent() is not None:
+            item = item.parent()
+        data = item.data(0, Qt.ItemDataRole.UserRole) if item is not None else None
+        if data and data[0] == "system":
+            return data[1] or ""
+        return ""
 
+    def _new_node(self, _checked=False, *, system_id: str = ""):
         if self.store is None:
             return
         self.store.ensure_created()
-        if not system_id:
-            item = self.systems_tree.currentItem()
-            while item is not None and item.parent() is not None:
-                item = item.parent()
-            data = item.data(0, Qt.ItemDataRole.UserRole) if item is not None else None
-            if data and data[0] == "system":
-                system_id = data[1] or ""
-        name, ok = QInputDialog.getText(self, "New node", "Node name (e.g. BU-1, BMH East):")
-        if not ok or not name.strip():
+        from .topology_dialogs import NodeDialog, run_dialog
+
+        dialog = NodeDialog(self.store, system_id or self._current_system_id(), "bu", "", self)
+        if not run_dialog(dialog):
             return
-        node_types = ["bu", "joint", "bmh", "other"]
-        node_type, ok = QInputDialog.getItem(self, "New node", "Node type:", node_types, 0, False)
-        if not ok:
-            return
-        port_labels = {"bu": ["Trunk", "Branch 1", "Branch 2"],
-                       "joint": ["Side 1", "Side 2"],
-                       "bmh": ["Cable"],
-                       "other": ["Side 1", "Side 2"]}[node_type]
-        self.store.save_component(
-            {"component_id": schema.new_id(), "kind": "node", "name": name.strip(),
-             "node_type": node_type, "system_id": system_id or ""},
-            port_labels=port_labels,
-        )
+        try:
+            dialog.create()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Add node", str(exc))
         self._refresh_systems_tree()
         self.rpls_changed.emit()
 
     def _connect_ports(self):
-        from qgis.PyQt.QtWidgets import QInputDialog
-        from .system_topology import TopologyGraph
-
         if self.store is None or not self.store.exists():
             return
-        graph = TopologyGraph.from_store(self.store)
-        components = {c["component_id"]: c for c in self.store.list_components()}
-        open_ports = graph.open_ports()
-        if len(open_ports) < 2:
-            QMessageBox.information(
-                self, "Connect endpoints", "Fewer than two open endpoints are available.")
-            return
+        from .topology_dialogs import ConnectEndpointsDialog, run_dialog
 
-        def label(port):
-            component = components.get(port.get("component_id"), {})
-            return f"{component.get('name') or '?'} · {self._port_display(component, port)}"
-
-        raw_labels = [label(p) for p in open_ports]
-        labels = [
-            value if raw_labels.count(value) == 1
-            else f"{value} [{str(port.get('port_id') or '')[:8]}]"
-            for value, port in zip(raw_labels, open_ports)
-        ]
-        first, ok = QInputDialog.getItem(
-            self, "Connect endpoints", "First endpoint:", labels, 0, False)
-        if not ok:
+        first_port = ""
+        item = self.systems_tree.currentItem()
+        data = item.data(0, Qt.ItemDataRole.UserRole) if item is not None else None
+        if data and data[0] == "port" and len(data) >= 3 and not data[2]:
+            first_port = data[1] or ""
+        dialog = ConnectEndpointsDialog(
+            self.store, self._current_system_id(), first_port, self)
+        if not run_dialog(dialog):
             return
-        first_idx = labels.index(first)
-        first_port = open_ports[first_idx]
-        remaining_ports = [p for i, p in enumerate(open_ports) if i != first_idx]
-        remaining_raw = [label(p) for p in remaining_ports]
-        remaining_labels = [
-            value if remaining_raw.count(value) == 1
-            else f"{value} [{str(port.get('port_id') or '')[:8]}]"
-            for value, port in zip(remaining_raw, remaining_ports)
-        ]
-        second, ok = QInputDialog.getItem(
-            self, "Connect endpoints", "Second endpoint:", remaining_labels, 0, False)
-        if not ok:
-            return
-        second_port = remaining_ports[remaining_labels.index(second)]
         try:
-            self.store.connect_ports(first_port["port_id"], second_port["port_id"])
+            self.store.connect_ports(dialog.first_port_id(), dialog.second_port_id())
         except ValueError as exc:
             QMessageBox.warning(self, "Connect endpoints", str(exc))
             return

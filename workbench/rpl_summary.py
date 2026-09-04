@@ -6,9 +6,14 @@ from __future__ import annotations
 import os
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from qgis.core import QgsFeatureRequest, QgsProject
+
+
+# (cable type, route km, cable km) in first-appearance order. Legs whose
+# CableType is blank accumulate under "" so totals still add up.
+CableTypeLength = Tuple[str, Optional[float], Optional[float]]
 
 
 @dataclass(frozen=True)
@@ -34,6 +39,7 @@ class RplSectionSummary:
     cable_length_km: Optional[float] = None
     cable_type: str = ""
     leg_count: int = 0
+    cable_type_lengths: Tuple[CableTypeLength, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -52,6 +58,7 @@ class RplSummary:
     cable_type: str = ""
     positions: Tuple[RplPositionSummary, ...] = ()
     sections: Tuple[RplSectionSummary, ...] = ()
+    cable_type_lengths: Tuple[CableTypeLength, ...] = ()
 
 
 class RplSummaryCache:
@@ -121,11 +128,8 @@ def _read_summary(store, rpl: Dict) -> RplSummary:
         route_length = _difference(first.get("kp"), last.get("kp"))
     if cable_length is None:
         cable_length = _difference(first.get("cable_kp"), last.get("cable_kp"))
-    cable_types = []
-    for row in line_rows:
-        value = str(row.get("cable_type") or "").strip()
-        if value and value not in cable_types:
-            cable_types.append(value)
+    type_lengths = cable_type_lengths(line_rows)
+    cable_types = [name for name, _route, _cable in type_lengths if name]
     if len(cable_types) > 3:
         cable_type = " / ".join(cable_types[:3]) + f" / +{len(cable_types) - 3}"
     else:
@@ -156,6 +160,7 @@ def _read_summary(store, rpl: Dict) -> RplSummary:
                 [leg.get("cable_km") for leg in section_legs]),
             cable_type=" / ".join(section_types) if section_types else "",
             leg_count=len(section_legs),
+            cable_type_lengths=cable_type_lengths(section_legs),
         ))
     positions = tuple(RplPositionSummary(
         pos=row.get("pos"), event=str(row.get("event") or "").strip(),
@@ -173,7 +178,58 @@ def _read_summary(store, rpl: Dict) -> RplSummary:
         start_kp_km=first.get("kp"), end_kp_km=last.get("kp"),
         route_length_km=route_length, cable_length_km=cable_length,
         cable_type=cable_type, positions=positions, sections=tuple(sections),
+        cable_type_lengths=type_lengths,
     )
+
+
+def cable_type_lengths(legs: Iterable[Dict]) -> Tuple[CableTypeLength, ...]:
+    """Sum route/cable km per cable type over leg rows, first-appearance order.
+
+    A type whose legs miss a length value reports ``None`` for that measure
+    rather than a misleading partial sum (same rule as the RPL totals).
+    """
+    order: List[str] = []
+    route: Dict[str, List] = {}
+    cable: Dict[str, List] = {}
+    for leg in legs:
+        name = str(leg.get("cable_type") or "").strip()
+        if name not in route:
+            order.append(name)
+            route[name], cable[name] = [], []
+        route[name].append(leg.get("route_km"))
+        cable[name].append(leg.get("cable_km"))
+    return tuple((name, _complete_sum(route[name]), _complete_sum(cable[name]))
+                 for name in order)
+
+
+def sum_cable_type_lengths(groups: Iterable[Sequence[CableTypeLength]]) -> Tuple[CableTypeLength, ...]:
+    """Merge per-type sums from several RPLs/sections (a system total)."""
+    order: List[str] = []
+    route: Dict[str, List] = {}
+    cable: Dict[str, List] = {}
+    for group in groups:
+        for name, route_km, cable_km in group or ():
+            if name not in route:
+                order.append(name)
+                route[name], cable[name] = [], []
+            route[name].append(route_km)
+            cable[name].append(cable_km)
+    return tuple((name, _complete_sum(route[name]), _complete_sum(cable[name]))
+                 for name in order)
+
+
+def format_cable_type_lengths(type_lengths: Sequence[CableTypeLength],
+                              measure: str = "route", separator: str = " · ",
+                              limit: int = 0) -> str:
+    """``"LW 12.300 km · DA 4.100 km"`` — blank types read as "Cable type not set"."""
+    bits = []
+    for name, route_km, cable_km in type_lengths or ():
+        value = route_km if measure == "route" else cable_km
+        label = name or "Cable type not set"
+        bits.append(f"{label} {value:.3f} km" if value is not None else label)
+    if limit and len(bits) > limit:
+        bits = bits[:limit] + [f"+{len(bits) - limit} more"]
+    return separator.join(bits)
 
 
 def _open_layer(store, layer_name: str):

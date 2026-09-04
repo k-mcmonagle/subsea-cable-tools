@@ -183,20 +183,28 @@ def test_guided_overviews_construct() -> bool:
     ok = system_panel.title.text() == "Guided system"
     ok = ok and "cable segment" in system_panel.summary.text()
     ok = ok and [system_panel.views.tabText(i)
-                 for i in range(system_panel.views.count())] == ["Table", "Schematic"]
+                 for i in range(system_panel.views.count())] == [
+                     "Table", "Schematic", "Endpoints"]
     ok = ok and system_panel.table.rowCount() == 1
     ok = ok and system_panel.table.item(0, 0).text() == "Guided segment"
     ok = ok and system_panel.table.item(0, 2).text() == "1"
-    ok = ok and system_panel.table.item(0, 6).text() == "LW"
+    # Cable types are summed per type, not just listed.
+    ok = ok and system_panel.table.item(0, 6).text().startswith("LW ")
+    ok = ok and system_panel.table.item(0, 6).text().endswith(" km")
+    ok = ok and "By cable type (route): LW " in system_panel.summary.text()
+    ok = ok and system_panel.endpoints_table.rowCount() == 2
+    ok = ok and system_panel.endpoints_table.item(0, 2).text() == "open"
     ok = ok and system_panel._schematic_args is not None
     system_panel.views.setCurrentIndex(1)
     ok = ok and system_panel._schematic_args is None
     ok = ok and not system_panel.schematic.scene().itemsBoundingRect().isEmpty()
     schematic_text = "\n".join(_graphics_text(item)
                                 for item in system_panel.schematic.scene().items())
-    ok = ok and "Start (A)" in schematic_text
-    ok = ok and "End (B)" in schematic_text
-    ok = ok and "LW" in schematic_text
+    # Open endpoints are labelled with the RPL event, with A/B as sublabel.
+    ok = ok and "Start terminal" in schematic_text
+    ok = ok and "End terminal" in schematic_text
+    ok = ok and "Start (A) · open" in schematic_text
+    ok = ok and "LW " in schematic_text and "km" in schematic_text
     schematic_tooltips = "\n".join(
         item.toolTip() for item in system_panel.schematic.scene().items()
         if hasattr(item, "toolTip"))
@@ -214,6 +222,7 @@ def test_guided_overviews_construct() -> bool:
     ok = ok and "event-to-event RPL section" in segment_panel.endpoint_summary.text()
     ok = ok and "Start terminal" in segment_panel.endpoint_summary.text()
     ok = ok and "End terminal" in segment_panel.endpoint_summary.text()
+    ok = ok and "By cable type (route): LW " in segment_panel.endpoint_summary.text()
     ok = ok and segment_panel._schematic_args is not None
     segment_panel.views.setCurrentIndex(1)
     ok = ok and segment_panel._schematic_args is None
@@ -222,9 +231,280 @@ def test_guided_overviews_construct() -> bool:
     ok = ok and "Guided load" in segment_text
     ok = ok and "LW" in segment_text and "km" in segment_text
     ok = ok and "Start terminal" not in segment_text
+    # The segment schematic can switch to the RPL-sections view.
+    segment_panel.schematic_mode.setCurrentIndex(1)
+    section_text = "\n".join(_graphics_text(item)
+                              for item in segment_panel.schematic.scene().items())
+    ok = ok and "Start terminal" in section_text and "End terminal" in section_text
+    ok = ok and "Guided load" not in section_text
     system_panel.deleteLater()
     segment_panel.deleteLater()
     return _result("guided system/segment overviews and schematic construct", ok)
+
+
+def _two_segment_system(store, system_name="Click system"):
+    """Seg A (BMH West → JT-1 → BU-1) and Seg B (BU-1 → BMH East) in one system."""
+    system_id = store.create_system(system_name)
+    rpl_ids = []
+    for name, events in (("Seg A", ("BMH West", "BU-1")),
+                         ("Seg B", ("BU-1", "BMH East"))):
+        points = [
+            RplPoint(seq=i, pos_no=i + 1,
+                     event=(events[0] if i == 0 else events[1] if i == 5
+                            else "JT-1" if (i == 2 and name == "Seg A") else ""),
+                     lat=50.0 + 0.01 * i, lon=0.0, depth_m=-100.0)
+            for i in range(6)
+        ]
+        segments = [RplSegment(seq=i, slack_pct=1.0,
+                               attrs={"CableType": "LW" if i < 3 else "DA"})
+                    for i in range(5)]
+        model = RplModel(points=points, segments=segments)
+        eng.recompute(model, _da(), slack_mode=SlackMode.HOLD_SLACK)
+        rpl_id = schema.new_id()
+        route_id = store.create_route(name, system_id=system_id)
+        rows = model_rows_for_layers(model, rpl_id, "synthetic")
+        points_layer = schema.rpl_points_layer_name(name)
+        lines_layer = schema.rpl_lines_layer_name(name)
+        store.write_spatial_layer(points_layer, schema.RPL_POINT_FIELDS, WKB_POINT, rows["points"])
+        store.write_spatial_layer(lines_layer, schema.RPL_LINE_FIELDS, WKB_LINESTRING, rows["lines"])
+        store.save_rpl({
+            "rpl_id": rpl_id, "name": name, "kind": "planned",
+            "points_layer": points_layer, "lines_layer": lines_layer,
+            "slack_mode": "hold_slack", "depth_source_config": "",
+            "route_id": route_id, "rev_label": "Rev 1",
+        })
+        rpl_ids.append(rpl_id)
+    assign_system_ids(store)
+    return system_id, rpl_ids
+
+
+def test_schematic_click_to_connect_and_expand() -> bool:
+    """Two segments ending at BU-1: connect through the schematic, expand sections."""
+    from ..workbench.system_schematic import _free_angles
+    from ..workbench.topology_dialogs import build_proposals, next_node_name
+
+    store = _temp_store()
+    system_id, rpl_ids = _two_segment_system(store)
+
+    # Per-type sums on the summary: LW over 3 legs, DA over 2 legs, both present.
+    from ..workbench.rpl_summary import format_cable_type_lengths, rpl_summary
+    summary = rpl_summary(store, store.get_rpl(rpl_ids[0]))
+    types = [name for name, _r, _c in summary.cable_type_lengths]
+    ok = types == ["LW", "DA"]
+    lw_km = summary.cable_type_lengths[0][1]
+    ok = ok and lw_km is not None and abs(sum(
+        t[1] for t in summary.cable_type_lengths) - summary.route_length_km) < 1e-6
+    ok = ok and format_cable_type_lengths(summary.cable_type_lengths).startswith("LW ")
+    ok = ok and " · DA " in format_cable_type_lengths(summary.cable_type_lengths)
+
+    panel = SystemOverviewPanel()
+    panel.load_system(store, system_id)
+    panel.views.setCurrentIndex(1)
+    widget = panel.schematic
+    ok = ok and len(widget.open_endpoints()) == 4
+    text = "\n".join(_graphics_text(item) for item in widget.scene().items())
+    ok = ok and "BMH West" in text and "BU-1" in text and "BMH East" in text
+
+    # Suggestions: BU-1 shared by two open ends -> one BU node proposal;
+    # the BMH ends each become a BMH node proposal.
+    proposals = build_proposals(store, TopologyGraph.from_store(store), system_id)
+    kinds = sorted((p["kind"], p["node_type"] if p["kind"] == "node" else "")
+                   for p in proposals)
+    ok = ok and kinds == [("node", "bmh"), ("node", "bmh"), ("node", "bu")]
+    bu_proposal = next(p for p in proposals if p.get("node_type") == "bu")
+    ok = ok and len(bu_proposal["ports"]) == 2 and bu_proposal["component_id"] is None
+    ok = ok and next_node_name(store, "bu", system_id) == "BU-1"
+
+    # Click-to-connect: arm one open segment end, click the other -> a
+    # direct connection; the widget emits and the panel writes.
+    graph = TopologyGraph.from_store(store)
+    open_ports = graph.open_ports()
+    seg_a_b = next(p for p in open_ports if p["label"] == "B"
+                   and graph.components[p["component_id"]]["name"] == "Seg A")
+    seg_b_a = next(p for p in open_ports if p["label"] == "A"
+                   and graph.components[p["component_id"]]["name"] == "Seg B")
+    widget.click_port(seg_a_b["port_id"])
+    ok = ok and widget.pending_port_id() == seg_a_b["port_id"]
+    widget.click_port(seg_a_b["port_id"])       # second click on the same end cancels
+    ok = ok and widget.pending_port_id() == ""
+    widget.click_port(seg_a_b["port_id"])
+    widget.click_port(seg_b_a["port_id"])
+    ok = ok and len(store.list_connections()) == 1
+    ok = ok and len(TopologyGraph.from_store(store).open_ports()) == 2
+    ok = ok and panel.views.currentIndex() == 1
+    text = "\n".join(_graphics_text(item) for item in panel.schematic.scene().items())
+    ok = ok and "BU-1" in text  # direct connection labelled with the shared event
+
+    # Disconnect through the panel, then add a BU node via a proposal instead.
+    connection_id = store.list_connections()[0]["connection_id"]
+    panel.disconnect(connection_id)
+    ok = ok and not store.list_connections()
+    from ..workbench.system_topology import apply_proposal
+    proposals = build_proposals(store, TopologyGraph.from_store(store), system_id)
+    bu_proposal = next(p for p in proposals if p.get("node_type") == "bu")
+    created = apply_proposal(store, bu_proposal, system_id)
+    ok = ok and len(created) == 2
+    graph = TopologyGraph.from_store(store)
+    bu = next(c for c in graph.components.values() if c.get("node_type") == "bu")
+    ok = ok and bu.get("name") == "BU-1"
+    ok = ok and len(graph.ports_of(bu["component_id"])) == 2  # trunk + 1 branch
+    # A spare branch shows as an open stub handle in the schematic.
+    store.add_port(bu["component_id"])
+    ports = [p["label"] for p in TopologyGraph.from_store(store).ports_of(bu["component_id"])]
+    ok = ok and "Branch 2" in ports
+    panel.load_system(store, system_id)
+    panel.views.setCurrentIndex(1)
+    widget = panel.schematic
+    ok = ok and len(widget._ports) == 1 and widget._ports[0]["label"] == "Branch 2"
+    text = "\n".join(_graphics_text(item) for item in widget.scene().items())
+    ok = ok and "Branch 2" in text
+    ok = ok and "BMH West" in text and "BMH East" in text
+
+    # Expand one segment into its RPL sections, then all.
+    route_a = store.component_for_segment(
+        (store.get_rpl(rpl_ids[0]) or {}).get("route_id"))["subject_id"]
+    widget.set_route_expanded(route_a, True)
+    edge_count = len(widget._edges)
+    ok = ok and edge_count == 3   # Seg A: 2 sections (JT-1 splits it) + Seg B collapsed
+    text = "\n".join(_graphics_text(item) for item in widget.scene().items())
+    ok = ok and "JT-1" in text
+    widget.set_detail_all(True)
+    ok = ok and len(widget._edges) == 3 and widget.is_route_expanded(route_a)
+    widget.set_detail_all(False)
+    widget.set_route_expanded(route_a, False)
+    ok = ok and len(widget._edges) == 2
+    # Stub angles avoid the directions already used by edges.
+    angles = _free_angles([0.0], 2)
+    ok = ok and len(angles) == 2 and all(abs(a) > 0.5 for a in angles)
+    panel.deleteLater()
+    return _result("schematic click-to-connect, suggestions, stubs and expand", ok)
+
+
+def test_schematic_context_menus_build() -> bool:
+    """Right-click menus for endpoints, nodes and segments build without exec."""
+    from qgis.PyQt.QtWidgets import QMenu
+
+    store = _temp_store()
+    system_id, _rpl_ids = _two_segment_system(store, "Menu system")
+    bu = store.save_component({"kind": "node", "name": "BU-1", "node_type": "bu",
+                               "system_id": system_id}, ["Trunk", "Branch 1", "Branch 2"])
+    graph = TopologyGraph.from_store(store)
+    seg_a = next(c for c in graph.components.values() if c.get("name") == "Seg A")
+    seg_a_b = next(p for p in graph.ports_of(seg_a["component_id"]) if p["label"] == "B")
+    trunk = next(p for p in graph.ports_of(bu) if p["label"] == "Trunk")
+    store.connect_ports(seg_a_b["port_id"], trunk["port_id"])
+    panel = SystemOverviewPanel()
+    panel.load_system(store, system_id)
+    panel.views.setCurrentIndex(1)
+    widget = panel.schematic
+    graph = TopologyGraph.from_store(store)
+    seg_a_a = next(p for p in graph.ports_of(seg_a["component_id"]) if p["label"] == "A")
+
+    def texts(menu):
+        return [a.text() for a in menu.actions()]
+
+    open_menu = QMenu()
+    widget._fill_port_menu(open_menu, seg_a_a["port_id"])
+    ok = "Connect to" in texts(open_menu)
+    ok = ok and "Add branching unit here…" in texts(open_menu)
+    ok = ok and "Expand into RPL sections" in texts(open_menu)
+    connect_sub = next(a.menu() for a in open_menu.actions() if a.text() == "Connect to")
+    # Seg B's two open ends + the BU's two open branches, none from Seg A itself.
+    ok = ok and len([a for a in connect_sub.actions() if a.isEnabled()]) == 4
+    connected_menu = QMenu()
+    widget._fill_port_menu(connected_menu, seg_a_b["port_id"])
+    ok = ok and "Disconnect" in texts(connected_menu)
+    node_menu = QMenu()
+    widget._fill_node_menu(node_menu, bu)
+    ok = ok and {"Disconnect", "Rename node…", "Add branch port", "Delete node"} <= set(texts(node_menu))
+    route_menu = QMenu()
+    widget.set_route_expanded(seg_a["subject_id"], True)
+    widget._fill_route_menu(route_menu, seg_a["subject_id"])
+    ok = ok and "Collapse to segment summary" in texts(route_menu)
+    # An open endpoint's menu starts with the explicit arming action.
+    ok = ok and texts(open_menu)[0].startswith("Start connection from here")
+    # Pending state: arming an endpoint offers a direct "Connect to <pending>" entry.
+    widget.start_connection(seg_a_a["port_id"])
+    seg_b = next(c for c in graph.components.values() if c.get("name") == "Seg B")
+    seg_b_a = next(p for p in graph.ports_of(seg_b["component_id"]) if p["label"] == "A")
+    pending_menu = QMenu()
+    widget._fill_port_menu(pending_menu, seg_b_a["port_id"])
+    ok = ok and texts(pending_menu)[0].startswith("Connect to Seg A")
+    widget.cancel_pending()
+    ok = ok and widget.pending_port_id() == ""
+    # Node action through the panel: add a port, and the stub count follows.
+    panel._node_action("add_port", bu)
+    graph = TopologyGraph.from_store(store)
+    ok = ok and len(graph.ports_of(bu)) == 4
+    ok = ok and len(panel.schematic._ports) == 3
+    ok = ok and panel.endpoints_table.rowCount() == 8
+    panel.deleteLater()
+    return _result("schematic context menus and node actions", ok)
+
+
+def test_topology_dialogs_construct() -> bool:
+    """Node, connect and suggestion dialogs build headlessly and write correctly."""
+    from ..workbench.topology_dialogs import (
+        ConnectEndpointsDialog, NodeDialog, SuggestConnectionsDialog,
+    )
+
+    store = _temp_store()
+    system_id, _rpl_ids = _two_segment_system(store, "Dialog system")
+    graph = TopologyGraph.from_store(store)
+    seg_a = next(c for c in graph.components.values() if c.get("name") == "Seg A")
+    seg_a_b = next(p for p in graph.ports_of(seg_a["component_id"]) if p["label"] == "B")
+
+    # Connect dialog: first list = the 4 open ends of this system; the second
+    # list never offers the first endpoint's own segment.
+    connect = ConnectEndpointsDialog(store, system_id, seg_a_b["port_id"])
+    ok = connect.first_list.count() == 4
+    ok = ok and connect.first_port_id() == seg_a_b["port_id"]
+    ok = ok and connect.second_list.count() == 2
+    second_labels = [connect.second_list.item(i).text() for i in range(connect.second_list.count())]
+    ok = ok and all(label.startswith("Seg B") for label in second_labels)
+    ok = ok and "Seg A" in connect.preview.text() and "⟷" in connect.preview.text()
+    ok = ok and "“BU-1”" in connect.preview.text()
+    connect.deleteLater()
+
+    # Node dialog: auto-named BU-1, trunk + branches, connects to the chosen end.
+    node = NodeDialog(store, system_id, "bu", seg_a_b["port_id"])
+    ok = ok and node.name_edit.text() == "BU-1"
+    ok = ok and node.port_labels() == ["Trunk", "Branch 1", "Branch 2"]
+    node.branch_spin.setValue(3)
+    ok = ok and node.port_labels() == ["Trunk", "Branch 1", "Branch 2", "Branch 3"]
+    ok = ok and node.connect_port_id() == seg_a_b["port_id"]
+    node.type_combo.setCurrentIndex(node.type_combo.findData("bmh"))
+    ok = ok and node.name_edit.text() == "BMH-1" and node.port_labels() == ["Cable"]
+    node.type_combo.setCurrentIndex(node.type_combo.findData("bu"))
+    component_id = node.create()
+    node.deleteLater()
+    graph = TopologyGraph.from_store(store)
+    ok = ok and graph.components[component_id]["node_type"] == "bu"
+    ok = ok and len(graph.ports_of(component_id)) == 4
+    ok = ok and graph.peer_component(seg_a_b["port_id"]) == component_id
+    # Second BU continues the numbering.
+    node2 = NodeDialog(store, system_id, "bu")
+    ok = ok and node2.name_edit.text() == "BU-2"
+    node2.deleteLater()
+
+    # Suggestions now reuse the existing BU-1 for Seg B's open start and
+    # propose the two BMH nodes; applying writes them all.
+    suggest = SuggestConnectionsDialog(store, system_id)
+    proposals = suggest.proposals()
+    ok = ok and len(proposals) == 3 and suggest.list.count() == 3
+    reuse = next((p for p in proposals if p.get("node_type") == "bu"), None)
+    ok = ok and reuse is not None and reuse["component_id"] == component_id
+    applied = suggest.apply()
+    suggest.deleteLater()
+    ok = ok and applied == 3
+    graph = TopologyGraph.from_store(store)
+    ok = ok and len(graph.open_ports()) == 2   # two spare BU branches
+    ok = ok and all(p["component_id"] == component_id for p in graph.open_ports())
+    ok = ok and len(graph.connected_systems()) == 1
+    # Everything still belongs to the one named system after re-assignment.
+    assign_system_ids(store)
+    ok = ok and {c.get("system_id") for c in store.list_components()} == {system_id}
+    return _result("topology dialogs construct and write nodes/connections", ok)
 
 
 def test_node_line_assembly_sld_wraps() -> bool:
@@ -248,8 +528,25 @@ def test_node_line_assembly_sld_wraps() -> bool:
     ok = ok and widget._wrap_button.isChecked() and len(y_rows) > 1
     widget.mark_cable_dist(2500.0)
     ok = ok and widget._marker_item is not None
+    # Dense fitted events: every dot is drawn but labels are thinned, and a
+    # body event that is already an equipment node is not repeated.
+    events = [{"cable_km": 0.5 + 0.02 * n, "category": "geographic", "label": f"AC{n}"}
+              for n in range(30)]
+    events.append({"cable_km": 4.0, "category": "body", "label": "BU-1"})
+    widget.set_assembly(am.Assembly(name="Wrapped assembly", items=items), events)
+    labels = [_graphics_text(item) for item in widget.scene().items()
+              if _graphics_text(item)]
+    ac_labels = [text for text in labels if text.startswith("AC")]
+    ok = ok and 0 < len(ac_labels) < 30
+    ok = ok and labels.count("BU-1") == 1
+    dots = [item for item in widget.scene().items()
+            if hasattr(item, "rect") and abs(item.rect().width() - 9.0) < 1e-6]
+    ok = ok and len(dots) == 30
+    # Toolbar buttons are children of the view, not the scrolling viewport.
+    ok = ok and widget._home.parent() is widget
     widget.deleteLater()
-    return _result("node-line assembly SLD supports wrapping", ok)
+    return _result("node-line assembly SLD supports wrapping and declutters events", ok,
+                   f"labels={len(ac_labels)}/30")
 
 
 def test_configurable_table_columns_persist() -> bool:
@@ -309,13 +606,13 @@ def test_rpl_tables_populate_lazily() -> bool:
     panel.tabs.setCurrentIndex(0)
     panel._refresh_tables()
     ok = panel.points_table.rowCount() == 3
-    ok = ok and panel.sections_table.rowCount() == 0
     ok = ok and panel.segments_table.rowCount() == 0
+    ok = ok and panel.sheet_table.rowCount() == 0
     panel.tabs.setCurrentIndex(1)
-    ok = ok and panel.sections_table.rowCount() == 2
-    ok = ok and panel.segments_table.rowCount() == 0
-    panel.tabs.setCurrentIndex(2)
     ok = ok and panel.segments_table.rowCount() == 2
+    ok = ok and panel.sheet_table.rowCount() == 0
+    panel.tabs.setCurrentIndex(2)
+    ok = ok and panel.sheet_table.rowCount() > 0
     panel.deleteLater()
     return _result("RPL tables populate only when their tab is opened", ok)
 
@@ -380,6 +677,9 @@ def run_all() -> list:
         test_systems_bmh_bu_example(),
         test_manual_and_unassigned_system_membership(),
         test_guided_overviews_construct(),
+        test_schematic_click_to_connect_and_expand(),
+        test_topology_dialogs_construct(),
+        test_schematic_context_menus_build(),
         test_node_line_assembly_sld_wraps(),
         test_configurable_table_columns_persist(),
         test_assembly_review_uses_section_equipment_language(),

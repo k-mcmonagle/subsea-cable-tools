@@ -29,6 +29,7 @@ PURE_MODULES = [
     "test_rules_engine",
     "test_planner_reports",
     "test_rpl_import_core",
+    "test_system_topology",
 ]
 
 

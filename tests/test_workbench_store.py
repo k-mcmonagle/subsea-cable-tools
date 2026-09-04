@@ -143,6 +143,21 @@ def test_topology_invariants() -> bool:
     return _result("CRA topology invariants + cascade delete", ok)
 
 
+def test_add_port_continues_numbering() -> bool:
+    store = _temp_store()
+    bu = store.save_component({"kind": "node", "name": "BU-1", "node_type": "bu"},
+                              ["Trunk", "Branch 1", "Branch 2"])
+    store.add_port(bu)
+    labels = sorted(p["label"] for p in store.list_ports() if p["component_id"] == bu)
+    ok = labels == ["Branch 1", "Branch 2", "Branch 3", "Trunk"]
+    joint = store.save_component({"kind": "node", "name": "J", "node_type": "joint"},
+                                 ["Side 1", "Side 2"])
+    store.add_port(joint)
+    labels = sorted(p["label"] for p in store.list_ports() if p["component_id"] == joint)
+    ok = ok and labels == ["Side 1", "Side 2", "Side 3"]
+    return _result("add_port continues Branch/Side numbering", ok, str(labels))
+
+
 def test_registry_read_cache_tracks_mutations() -> bool:
     store = _temp_store()
     route_id = store.create_route("Cached route")
@@ -199,6 +214,7 @@ def run_all() -> list:
         test_assembly_round_trip(),
         test_rpl_and_fit_round_trip(),
         test_topology_invariants(),
+        test_add_port_continues_numbering(),
         test_registry_read_cache_tracks_mutations(),
         test_segment_makeup_orders_assemblies_and_joints(),
     ]
