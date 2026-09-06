@@ -64,7 +64,7 @@ from .configurable_table import ConfigurableTable
 from .depth_service import DepthService, DepthSourceConfig
 from .rpl_engine import RplModel, SlackMode
 from .rpl_layer_io import RplLayerSync
-from . import rpl_sheet
+from . import rpl_kml, rpl_sheet
 from .rpl_sheet import (
     ATTR_LABELS as _ATTR_LABELS,
     LEG_ATTR_ORDER as _LEG_ATTR_ORDER,
@@ -277,6 +277,14 @@ class RplManagerPanel(QWidget):
         zoom_btn = QPushButton("Zoom to")
         zoom_btn.clicked.connect(self._zoom_to_current)
         row3.addWidget(zoom_btn)
+        export_kml_btn = QPushButton("Export KML…")
+        export_kml_btn.setToolTip(
+            "Export this RPL to KML (Google Earth / GIS): the whole route line, "
+            "one line per leg, and one point per position — every RPL attribute "
+            "included."
+        )
+        export_kml_btn.clicked.connect(self._export_kml)
+        row3.addWidget(export_kml_btn)
         self.depth_btn = QPushButton("Depth sources…")
         self.depth_btn.clicked.connect(self._edit_depth_sources)
         row3.addWidget(self.depth_btn)
@@ -632,6 +640,27 @@ class RplManagerPanel(QWidget):
                                 f"Could not write the file:\n{exc}")
             return
         self._set_status(f"RPL sheet exported to {path}")
+
+    def _export_kml(self):
+        if self.model is None or self.current_rpl is None:
+            return
+        name = (self.current_rpl.get("name") or "RPL").strip()
+        safe = "".join(c if c not in r'\/:*?"<>|' else "_" for c in name)
+        start_dir = os.path.dirname(self.store.gpkg_path) if self.store else ""
+        path, _selected = QFileDialog.getSaveFileName(
+            self, "Export RPL to KML", os.path.join(start_dir, f"{safe}.kml"),
+            "KML document (*.kml);;All files (*.*)")
+        if not path:
+            return
+        if not path.lower().endswith(".kml"):
+            path += ".kml"
+        try:
+            rpl_kml.write_kml(path, self.model, name, self.current_rpl)
+        except OSError as exc:
+            QMessageBox.warning(self, "Export RPL to KML",
+                                f"Could not write the file:\n{exc}")
+            return
+        self._set_status(f"KML exported to {path}")
 
     def _populate_legs_table(self, model: RplModel):
         leg_attrs = _attribute_keys(

@@ -954,6 +954,7 @@ class WorkbenchDock(QDockWidget):
             rpl = store.get_rpl(ref[1]) if store else None
             menu.addAction("Zoom to on map", self._zoom_to_selected_rpl)
             menu.addAction("Export RPL sheet...", self._export_selected_rpl_sheet)
+            menu.addAction("Export KML...", self._export_selected_rpl_kml)
             menu.addSeparator()
             menu.addAction("Duplicate as new revision...", self._new_rpl_revision)
             menu.addAction("Edit revision label...", self._edit_rpl_revision_label)
@@ -1521,6 +1522,13 @@ class WorkbenchDock(QDockWidget):
             return
         self.rpl_panel.select_rpl(rpl_id)
         self.rpl_panel._export_sheet()
+
+    def _export_selected_rpl_kml(self):
+        rpl_id = self._selected_rpl_id()
+        if rpl_id is None:
+            return
+        self.rpl_panel.select_rpl(rpl_id)
+        self.rpl_panel._export_kml()
 
     def _new_makeup_revision(self):
         store = self._store()
