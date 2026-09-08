@@ -244,6 +244,8 @@ class KPMouseMapTool(QgsMapTool):
             self.persistent_tooltip_timer.timeout.connect(self.show_persistent_tooltip)
 
     def canvasMoveEvent(self, event):
+        window = self.depth_profile_window
+        profile_frozen = window is not None and window.isVisible() and window.frozen
         # Stop any timers and hide tooltips when the mouse moves.
         self._ensure_timers()
         self.persistent_tooltip_timer.stop()
@@ -377,8 +379,8 @@ class KPMouseMapTool(QgsMapTool):
         self.last_message = message
         self.last_global_pos = get_event_global_pos(event)
 
-        # Append range & bearing info if origin set
-        if self.range_bearing_origin is not None:
+        # Freeze only the range line/profile; KP placement keeps tracking the map.
+        if self.range_bearing_origin is not None and not profile_frozen:
             range_distance_m, bearing_deg = self._compute_range_bearing(self.range_bearing_origin, mousePoint)
             # Convert distance to display unit
             display_range = self._convert_distance(range_distance_m)
@@ -388,7 +390,7 @@ class KPMouseMapTool(QgsMapTool):
             self._update_range_bearing_graphics(mousePoint, range_distance_m)
             # Live depth profile along the range line (throttled internally).
             self._update_profile_window(mousePoint)
-        else:
+        elif self.range_bearing_origin is None:
             # Clear any existing range/bearing graphics if user cleared origin
             self._clear_range_bearing_graphics()
 
@@ -414,6 +416,10 @@ class KPMouseMapTool(QgsMapTool):
         QToolTip.hideText()
 
     def canvasPressEvent(self, event):
+        window = self.depth_profile_window
+        if (window is not None and window.isVisible() and window.frozen
+                and window.pin_check.isChecked() and event.button() == Qt.MouseButton.LeftButton):
+            return
         # Left click toggles range/bearing measurement: start -> stop -> start ...
         if event.button() == Qt.MouseButton.LeftButton:
             if self.range_bearing_origin is None:
@@ -1055,7 +1061,9 @@ class KPMouseMapTool(QgsMapTool):
         if self.depth_profile_window is None:
             from .kp_depth_profile_window import KPDepthProfileWindow
             window = KPDepthProfileWindow(self.iface.mainWindow(), self.measurementUnit)
-            window.configure(sampler, self.distanceArea)
+            from ..kp_geo_utils import RouteFrame
+            frame = RouteFrame.from_source([QgsGeometry(g) for g in self.features_geoms], self.distanceArea)
+            window.configure(sampler, self.distanceArea, frame)
             self.depth_profile_window = window
         return self.depth_profile_window
 
@@ -1402,6 +1410,11 @@ class KPMouseMapTool(QgsMapTool):
                 self._clear_range_bearing_graphics()
                 self._hide_profile_window()
                 self.iface.mainWindow().statusBar().showMessage("Range/Bearing cleared (ESC).", 2000)
+            elif event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+                window = self.depth_profile_window
+                if window is not None and window.isVisible():
+                    window.set_frozen(not window.frozen)
+                    QToolTip.hideText()
             elif event.key() == Qt.Key.Key_D:
                 self._toggle_profile_window()
         except Exception:
@@ -1541,10 +1554,14 @@ class KPConfigDialog(QDialog):
         layout.addWidget(self.depth_layers_label)
         self.depth_table = QTableWidget(0, 2)
         self.depth_table.setHorizontalHeaderLabels(["Layer", "Depth field (contours)"])
+        source_options_btn = QPushButton("Bathymetry source conventions…")
+        from ..bathymetry_sampling import configure_layers
+        source_options_btn.clicked.connect(lambda: configure_layers(self))
         self.depth_table.verticalHeader().setVisible(False)
         self.depth_table.setSelectionMode(SELECTION_MODE_NONE)
         self.depth_table.setMinimumHeight(120)
         layout.addWidget(self.depth_table)
+        layout.addWidget(source_options_btn)
 
         self.profile_hint_label = QLabel(
             "Tip: while the tool is active, toggle the live depth profile "

@@ -701,6 +701,7 @@ class RuleEditorDialog(QDialog):
             "between their actual route crossings. Tick signed limits to "
             "set separate down/up-slope maxima (direction-of-installation "
             "aware).",
+        profile_data.SLOPE_COMPONENT_CROSS_MAX: ("Maximum absolute local slope within the cross span, at native survey resolution. Missing coverage is insufficient information."),
         profile_data.SLOPE_COMPONENT_CROSS:
             "Cross slope from the profile's ± cross-offset samples (two-"
             "point difference across the offset). The limit applies to the "
@@ -709,8 +710,8 @@ class RuleEditorDialog(QDialog):
         profile_data.SLOPE_COMPONENT_ABSOLUTE:
             "Absolute slope: magnitude of the combined longitudinal + cross "
             "gradient, matching the profile pane's Absolute trace. Where "
-            "cross samples are missing it falls back to |longitudinal| "
-            "(a lower bound). Needs a profile sampled with a cross offset.",
+            "either component is unsupported it is unavailable and the criterion "
+            "reports insufficient information. Needs a profile sampled with a cross offset.",
     }
 
     def _sync_threshold(self) -> None:
@@ -727,7 +728,7 @@ class RuleEditorDialog(QDialog):
         self.value2_spin.setEnabled(not signed and self.op_combo.currentText() == "between")
         # Cross is a fixed two-point difference across the sampled offset.
         self.slope_window_spin.setEnabled(
-            component != profile_data.SLOPE_COMPONENT_CROSS)
+            component not in (profile_data.SLOPE_COMPONENT_CROSS, profile_data.SLOPE_COMPONENT_CROSS_MAX))
         # The directional band limits only mean anything for signed slope.
         self.bands_table.setColumnHidden(3, not signed)
         self.bands_table.setColumnHidden(4, not signed)
@@ -754,7 +755,7 @@ class RuleEditorDialog(QDialog):
                 signed = is_long and self.signed_check.isChecked()
                 config["abs"] = not signed
                 if self.slope_window_spin.value() > 0 \
-                        and component != profile_data.SLOPE_COMPONENT_CROSS:
+                        and component not in (profile_data.SLOPE_COMPONENT_CROSS, profile_data.SLOPE_COMPONENT_CROSS_MAX):
                     config["slope_window_m"] = self.slope_window_spin.value()
                 else:
                     config.pop("slope_window_m", None)

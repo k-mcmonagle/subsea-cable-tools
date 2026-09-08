@@ -363,6 +363,8 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
         if len(data) == 0:
             raise QgsProcessingException(
                 f'No data points found in {os.path.basename(xyz_path)}.')
+        if not np.isfinite(data).all():
+            raise QgsProcessingException('XYZ contains nonfinite coordinates/depths; remove or flag invalid soundings before gridding.')
         feedback.pushInfo(f'Read {len(data)} data points.')
 
         # --- CRS sanity: a geographic CRS with projected-looking coordinates
@@ -431,6 +433,12 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
                 f'{width} x {height} raster. Use a larger Grid Size, or the '
                 'Direct/IDW method, which stream through GDAL.')
 
+        if method_index == self.METHOD_DIRECT:
+            cols = np.floor((data[:,0]-extent.xMinimum())/grid_x).astype(np.int64)
+            rows = np.floor((extent.yMaximum()-data[:,1])/grid_y).astype(np.int64)
+            duplicate_count = len(data) - len(np.unique(rows * width + cols))
+            if duplicate_count:
+                feedback.pushWarning(f'{duplicate_count:,} soundings share output cells: Direct keeps the last sounding. Use Bin Average for scattered soundings.')
         grid_mean = (grid_x + grid_y) / 2.0
         max_distance = max_distance_param
         if method_index == self.METHOD_IDW and max_distance <= 0:

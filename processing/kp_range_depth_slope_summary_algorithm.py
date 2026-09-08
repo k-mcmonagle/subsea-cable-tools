@@ -41,7 +41,9 @@ from qgis.core import (
     QgsWkbTypes,
 )
 from ..qgis_compat import FIELD_TYPE_DOUBLE, GEOMETRY_LINE, GEOMETRY_POINT, PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE
+from ..bathymetry_sampling import RasterSampler, expand_rasters, normalise_depth, layer_options, metres_per_unit
 from ..slope_utils import (
+    supported_slopes, clean_crossings, interpolate_covered, cross_profile_metrics,
     datum_sign as shared_datum_sign, interval_slope_series, ols_slope,
     windowed_slope_series,
 )
@@ -55,6 +57,7 @@ class _RasterSource:
     transform: Optional[QgsCoordinateTransform]
     nodata: Optional[float]
     pixel_area_m2: Optional[float]
+    sampler: object = None
 
 
 class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
@@ -428,7 +431,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
 
                     station_depth.append(z)
                     station_source.append(
-                        id(raster_used) if raster_used is not None else None)
+                        raster_used.sampler.source_id if raster_used is not None else None)
 
                     # Side slope at this station
                     side_deg = None
@@ -458,7 +461,15 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
                         px = self._pixel_size_m_from_raster_source(raster_used)
                         if px is not None:
                             step = max(step, float(adaptive_factor) * float(px))
-                    dist_local += step
+                    next_distance = min(part_len, dist_local + step)
+                    if depth_source_mode == 2 and contour_profile:
+                        crossing_distances = [d - global_offset_m for d,z in contour_profile]
+                        j = bisect.bisect_right(crossing_distances, dist_local + 1e-8)
+                        if j < len(crossing_distances):
+                            next_distance = min(next_distance, crossing_distances[j])
+                    if next_distance <= dist_local + 1e-8:
+                        break
+                    dist_local = next_distance
 
                 # Break between parts so we don't compute along-track slope across disjoint segments
                 station_dist_m.append(float('nan'))
@@ -471,54 +482,10 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
 
             depth_min, depth_max, depth_avg = self._min_max_avg(station_depth)
 
-            # Datum sign: +1 for positive-down depths, -1 for negative
-            # elevations, so slope signs follow the plugin-wide convention
-            # (+ve = up-slope) regardless of how the source stores depth.
-            datum_sign = shared_datum_sign(
-                [z for z in station_depth
-                 if z is not None and math.isfinite(float(z))])
-            if datum_sign < 0:
-                station_side_slope_deg = [
-                    -v if v is not None else None for v in station_side_slope_deg]
-
-            # Along-track slopes (degrees) — shared engine, evaluated per
-            # contiguous run of finite stations so multipart breaks and
-            # no-data stations are never bridged. positive_down maps the
-            # datum sign onto the shared up-slope-positive convention.
-            positive_down = datum_sign > 0
-            runs: List[Tuple[List[float], List[float]]] = []
-            run_d: List[float] = []
-            run_z: List[float] = []
-            run_src: Optional[int] = None
-            for d, z, src in zip(station_dist_m, station_depth,
-                                 station_source):
-                if not math.isfinite(d) or z is None:
-                    if len(run_d) >= 2:
-                        runs.append((run_d, run_z))
-                    run_d, run_z, run_src = [], [], None
-                    continue
-                if run_d and src != run_src:
-                    # Supplying raster changed: never difference depths
-                    # across the seam (the grids may disagree on datum).
-                    if len(run_d) >= 2:
-                        runs.append((run_d, run_z))
-                    run_d, run_z = [], []
-                run_src = src
-                run_d.append(float(d))
-                run_z.append(float(z))
-            if len(run_d) >= 2:
-                runs.append((run_d, run_z))
-            slope_vals_deg: List[Optional[float]] = []
-            for ds, zs in runs:
-                if slope_window_m > 0:
-                    vals = windowed_slope_series(
-                        ds, zs, slope_window_m / 2.0,
-                        positive_down=positive_down, degenerate=None)
-                else:
-                    vals = interval_slope_series(
-                        ds, zs, positive_down=positive_down)
-                slope_vals_deg.extend(v for v in vals if v is not None)
-
+            cell_by_source = {src.sampler.source_id: src.sampler.cell_m for src in raster_sources}
+            station_cells = [cell_by_source.get(source, 0) for source in station_source]
+            slope_vals_deg, _ = supported_slopes(station_dist_m, station_depth,
+                station_cells, station_source, slope_window_m, positive_down=True)
             slope_min, slope_max, slope_avg = self._min_max_avg(slope_vals_deg)
 
             side_min, side_max, side_avg = self._min_max_avg(station_side_slope_deg)
@@ -564,7 +531,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
     @staticmethod
     def _prepare_raster_sources(line_crs, raster_layers: Sequence[QgsRasterLayer], context) -> List[_RasterSource]:
         sources: List[_RasterSource] = []
-        for raster_layer in raster_layers:
+        for raster_layer in expand_rasters(raster_layers):
             if not raster_layer or not raster_layer.isValid():
                 continue
             provider = raster_layer.dataProvider()
@@ -577,7 +544,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
                 try:
                     transform = QgsCoordinateTransform(line_crs, raster_crs, QgsProject.instance())
                 except Exception:
-                    transform = None
+                    continue
 
             nodata = None
             try:
@@ -586,35 +553,15 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
             except Exception:
                 nodata = None
 
-            pixel_area_m2 = None
-            try:
-                rupx = abs(float(raster_layer.rasterUnitsPerPixelX()))
-                rupy = abs(float(raster_layer.rasterUnitsPerPixelY()))
-                if rupx > 0 and rupy > 0:
-                    if raster_crs.isGeographic():
-                        da = make_distance_area(
-                            raster_crs, context.transformContext(), project=context.project()
-                        )
-                        c = raster_layer.extent().center()
-                        p0 = QgsPointXY(c.x(), c.y())
-                        px = QgsPointXY(c.x() + rupx, c.y())
-                        py = QgsPointXY(c.x(), c.y() + rupy)
-                        dx_m = float(da.measureLine(p0, px))
-                        dy_m = float(da.measureLine(p0, py))
-                        if dx_m > 0 and dy_m > 0:
-                            pixel_area_m2 = dx_m * dy_m
-                    else:
-                        pixel_area_m2 = rupx * rupy
-            except Exception:
-                pixel_area_m2 = None
-
+            sampler = RasterSampler(raster_layer)
+            pixel_area_m2 = sampler.cell_m ** 2
             sources.append(
                 _RasterSource(
                     provider=provider,
                     extent=raster_layer.extent(),
                     transform=transform,
                     nodata=nodata,
-                    pixel_area_m2=pixel_area_m2,
+                    pixel_area_m2=pixel_area_m2, sampler=sampler,
                 )
             )
 
@@ -626,104 +573,19 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
         return sources
 
     @staticmethod
-    def _sample_rasters_at_point(point_xy_line_crs: QgsPointXY, raster_sources: Sequence[_RasterSource]) -> Optional[float]:
-        if not raster_sources:
-            return None
-
-        for src in raster_sources:
-            sample_pt = QgsPointXY(point_xy_line_crs.x(), point_xy_line_crs.y())
-            if src.transform is not None:
-                try:
-                    sample_pt = src.transform.transform(sample_pt)
-                except Exception:
-                    continue
-
-            try:
-                extent = src.extent
-                if extent and (
-                    sample_pt.x() < extent.xMinimum()
-                    or sample_pt.x() > extent.xMaximum()
-                    or sample_pt.y() < extent.yMinimum()
-                    or sample_pt.y() > extent.yMaximum()
-                ):
-                    continue
-            except Exception:
-                pass
-
-            try:
-                sample, ok = src.provider.sample(sample_pt, 1)
-            except Exception:
-                continue
-            if not ok:
-                continue
-
-            try:
-                val = float(sample)
-            except Exception:
-                continue
-
-            try:
-                if src.nodata is not None and float(src.nodata) == val:
-                    continue
-            except Exception:
-                pass
-
-            if math.isnan(val):
-                continue
-            return val
-
-        return None
+    def _sample_rasters_at_point(point_xy_line_crs, raster_sources):
+        return KPRangeDepthSlopeSummaryAlgorithm._sample_rasters_at_point_with_source(point_xy_line_crs, raster_sources)[0]
 
     @staticmethod
-    def _sample_rasters_at_point_with_source(
-        point_xy_line_crs: QgsPointXY,
-        raster_sources: Sequence[_RasterSource],
-    ) -> Tuple[Optional[float], Optional[_RasterSource]]:
-        if not raster_sources:
-            return None, None
-
+    def _sample_rasters_at_point_with_source(point_xy_line_crs, raster_sources):
         for src in raster_sources:
-            sample_pt = QgsPointXY(point_xy_line_crs.x(), point_xy_line_crs.y())
-            if src.transform is not None:
-                try:
-                    sample_pt = src.transform.transform(sample_pt)
-                except Exception:
-                    continue
-
             try:
-                extent = src.extent
-                if extent and (
-                    sample_pt.x() < extent.xMinimum()
-                    or sample_pt.x() > extent.xMaximum()
-                    or sample_pt.y() < extent.yMinimum()
-                    or sample_pt.y() > extent.yMaximum()
-                ):
-                    continue
-            except Exception:
-                pass
-
-            try:
-                sample, ok = src.provider.sample(sample_pt, 1)
+                point = src.transform.transform(point_xy_line_crs) if src.transform else point_xy_line_crs
+                value = src.sampler.sample(point)
+                if value is not None:
+                    return value, src
             except Exception:
                 continue
-            if not ok:
-                continue
-
-            try:
-                val = float(sample)
-            except Exception:
-                continue
-
-            try:
-                if src.nodata is not None and float(src.nodata) == val:
-                    continue
-            except Exception:
-                pass
-
-            if math.isnan(val):
-                continue
-            return val, src
-
         return None, None
 
     @staticmethod
@@ -756,6 +618,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
         next_id = 1
 
         for layer_idx, layer in enumerate(contour_layers):
+            options = layer_options(layer)
             if not layer:
                 continue
             depth_field = depth_fields[layer_idx] if layer_idx < len(depth_fields) else ''
@@ -780,7 +643,8 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
                     z = feat[depth_field]
                     if z is None:
                         continue
-                    zf = float(z)
+                    zf = normalise_depth(z, options)
+                    if zf is None: continue
                 except Exception:
                     continue
 
@@ -820,6 +684,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
         hits: List[Tuple[float, float]] = []
         request = QgsFeatureRequest()
         for layer_idx, contour_layer in enumerate(contour_layers):
+            options = layer_options(contour_layer)
             if feedback.isCanceled():
                 return None
             depth_field = depth_fields[layer_idx] if layer_idx < len(depth_fields) else ''
@@ -844,7 +709,8 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
                     except Exception:
                         continue
                 try:
-                    zf = float(feat[depth_field])
+                    zf = normalise_depth(feat[depth_field], options)
+                    if zf is None: continue
                 except Exception:
                     continue
 
@@ -877,62 +743,12 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
         if not hits:
             return None
 
-        hits.sort(key=lambda t: t[0])
-
-        # Reduce duplicates at same distance by keeping the last (stable)
-        dedup: List[Tuple[float, float]] = []
-        last_d = None
-        for d, z in hits:
-            if last_d is not None and abs(d - last_d) < 1e-6:
-                dedup[-1] = (d, z)
-            else:
-                dedup.append((d, z))
-                last_d = d
-
-        # Station depths are always interpolated linearly between crossings;
-        # the INTERPOLATE_CONTOURS parameter is kept only for saved-model
-        # compatibility and has no effect.
-        return dedup
+        return clean_crossings(hits)
 
     @staticmethod
     def _sample_contour_profile_at_distance(profile: Sequence[Tuple[float, float]], distance_m: float) -> Optional[float]:
-        if not profile:
-            return None
+        return interpolate_covered([x for x,z in profile], [z for x,z in profile], distance_m) if profile else None
 
-        # No data outside the bracketing crossings: contour bathymetry only
-        # exists where contours cross the line, so extending the first/last
-        # value along the rest of the route would fabricate coverage (and
-        # feed fabricated depths into the depth/slope statistics). Matches
-        # the Burial Planner's contour handling.
-        if distance_m < profile[0][0] or distance_m > profile[-1][0]:
-            return None
-        if distance_m <= profile[0][0]:
-            return float(profile[0][1])
-        if distance_m >= profile[-1][0]:
-            return float(profile[-1][1])
-
-        # Binary search for bracketing points
-        lo = 0
-        hi = len(profile) - 1
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            dmid = profile[mid][0]
-            if dmid < distance_m:
-                lo = mid + 1
-            elif dmid > distance_m:
-                hi = mid - 1
-            else:
-                return float(profile[mid][1])
-
-        j = max(1, lo)
-        d1, z1 = profile[j - 1]
-        d2, z2 = profile[j]
-        if d2 <= d1:
-            return float(z1)
-        t = (distance_m - d1) / (d2 - d1)
-        return float(z1 + t * (z2 - z1))
-
-    # --------------------------- Side slope ---------------------------
 
     def _compute_side_slope_at_station(
         self,
@@ -990,85 +806,37 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
                 return None
             ux = dx / mag
             uy = dy / mag
-            nx = uy
-            ny = -ux
+            nx = uy / metres_per_unit(line_crs)
+            ny = -ux / metres_per_unit(line_crs)
             port_pt = QgsPointXY(center_xy.x() - nx * search_m, center_xy.y() - ny * search_m)
             stbd_pt = QgsPointXY(center_xy.x() + nx * search_m, center_xy.y() + ny * search_m)
 
         if port_pt is None or stbd_pt is None:
             return None
 
-        # Raster mode: sample across transect and fit depth = a + b*t (t in meters, + starboard)
         if depth_source_mode == 1:
-            if not raster_sources:
-                return None
-            cross_sample_count = 21 if search_m >= 500.0 else 11
-            offsets = [(-search_m + i * (2.0 * search_m) / (cross_sample_count - 1)) for i in range(cross_sample_count)]
-            t_vals: List[float] = []
-            z_vals: List[float] = []
-            for t in offsets:
+            cell = min((src.sampler.cell_m for src in raster_sources), default=search_m)
+            count = max(11, min(2001, int(math.ceil(2*search_m/max(cell,.1)))+1))
+            xs = [-search_m + i*2*search_m/(count-1) for i in range(count)]
+            zs, sources, cells = [], [], []
+            for t in xs:
                 if is_geo:
-                    if normal_bearing is None:
-                        continue
-                    try:
-                        if t >= 0:
-                            pt = distance_area.computeSpheroidProject(QgsPointXY(center_xy.x(), center_xy.y()), float(t), normal_bearing)
-                        else:
-                            pt = distance_area.computeSpheroidProject(QgsPointXY(center_xy.x(), center_xy.y()), float(-t), normal_bearing + math.pi)
-                    except Exception:
-                        continue
+                    pt = distance_area.computeSpheroidProject(center_xy,abs(t),normal_bearing if t>=0 else normal_bearing+math.pi)
                 else:
-                    pt = QgsPointXY(center_xy.x() + nx * float(t), center_xy.y() + ny * float(t))
-
-                z = self._sample_rasters_at_point(pt, raster_sources)
-                if z is None:
-                    continue
-                t_vals.append(float(t))
-                z_vals.append(float(z))
-
-            if len(t_vals) < 2:
-                return None
-
-            b = self._ols_slope(t_vals, z_vals)
-            if b is None:
-                return None
-            slope_rad = math.atan2(float(b), 1.0)  # b = dz/dt
-            return math.degrees(slope_rad)
-
-        # Contour mode: intersections along transect and fit depth vs t
+                    pt = QgsPointXY(center_xy.x()+nx*t,center_xy.y()+ny*t)
+                z, src = self._sample_rasters_at_point_with_source(pt,raster_sources)
+                zs.append(z); sources.append(src.sampler.source_id if src else None); cells.append(src.sampler.cell_m if src else None)
+            return cross_profile_metrics(xs,zs,search_m,True,cells,sources)[0]
         if depth_source_mode == 2:
-            if contour_index is None or contour_data is None:
-                return None
-
-            transect = QgsGeometry.fromPolylineXY([port_pt, stbd_pt])
-            hits = self._contour_intersections(transect, center_xy, nx, ny, distance_area, is_geo, contour_index, contour_data)
-            if not hits:
-                return None
-
-            # Reduce duplicates: for same depth, keep closest-to-center per side
-            best_by_depth_side: Dict[Tuple[int, float], Tuple[float, float, float]] = {}
-            for t, z in hits:
-                side = 1 if t > 0 else (-1 if t < 0 else 0)
-                if side == 0:
-                    continue
-                key = (side, float(z))
-                abs_t = abs(float(t))
-                prev = best_by_depth_side.get(key)
-                if prev is None or abs_t < prev[0]:
-                    best_by_depth_side[key] = (abs_t, float(t), float(z))
-
-            pairs = [(v[1], v[2]) for v in best_by_depth_side.values()]
-            if len(pairs) < 2:
-                return None
-
-            t_vals = [p[0] for p in pairs]
-            z_vals = [p[1] for p in pairs]
-            b = self._ols_slope(t_vals, z_vals)
-            if b is None:
-                return None
-            slope_rad = math.atan2(float(b), 1.0)
-            return math.degrees(slope_rad)
-
+            if is_geo:
+                port_pt = distance_area.computeSpheroidProject(center_xy,2*search_m,normal_bearing+math.pi)
+                stbd_pt = distance_area.computeSpheroidProject(center_xy,2*search_m,normal_bearing)
+            else:
+                port_pt = QgsPointXY(center_xy.x()-nx*2*search_m,center_xy.y()-ny*2*search_m)
+                stbd_pt = QgsPointXY(center_xy.x()+nx*2*search_m,center_xy.y()+ny*2*search_m)
+            hits = self._contour_intersections(QgsGeometry.fromPolylineXY([port_pt,stbd_pt]),center_xy,nx,ny,distance_area,is_geo,contour_index,contour_data)
+            pairs = clean_crossings(hits)
+            return cross_profile_metrics([x for x,z in pairs],[z for x,z in pairs],search_m,True)[0]
         return None
 
     @staticmethod

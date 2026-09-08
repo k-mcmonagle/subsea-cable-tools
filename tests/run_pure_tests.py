@@ -20,6 +20,7 @@ PACKAGE_NAME = "subsea_cable_tools"
 
 PURE_MODULES = [
     "test_slope_utils",
+    "test_profile_reliability",
     "test_kp_profile_math",
     "test_burial_profile_data",
     "test_burial_generation",

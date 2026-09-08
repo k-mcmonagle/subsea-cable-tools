@@ -853,6 +853,8 @@ class BurialPlannerDock(QDockWidget):
             # Snapshot for cross/absolute slope criteria (plain lists so the
             # worker never shares live PlanProfile state).
             cross_profile = {
+                "cross_max": list(stored.cross_max_deg),
+                "sources": list(stored.source_ids), "cells": list(stored.cell_sizes_m),
                 "kps": list(stored.kps),
                 "depths": list(stored.depths),
                 "port": list(stored.port_depths),
@@ -1070,13 +1072,13 @@ class BurialPlannerDock(QDockWidget):
     def _display_stored_profile(self, profile: profile_data.PlanProfile,
                                 params: generation.GenParams,
                                 stale: bool) -> None:
-        self.profile.set_profile(profile.series())
+        self.profile.set_profile(profile.samples())
         self.profile.set_slope_window_m(profile.step_m)
         self._set_slope_series(profile, params)
         date = (profile.sampled_utc or "")[:16].replace("T", " ")
         text = (f"Plan profile — {profile.sample_count:,} stations at "
                 f"{profile.step_m:g} m")
-        text += f", local slope over {2.0 * profile.step_m:g} m"
+        text += ", local slope at native resolution; full supported baselines"
         if profile.cross_offset_m > 0:
             text += f", cross ±{profile.cross_offset_m:g} m"
         if date:
@@ -1096,10 +1098,11 @@ class BurialPlannerDock(QDockWidget):
         # Local terrain slope follows the persisted bathymetry profile. Rules
         # with an explicit slope_window_m intentionally evaluate over that
         # requested vehicle footprint; Auto rules use this local series scale.
-        half_km = max(float(profile.step_m), 1.0) / 1000.0
+        half_km = 0.0  # automatic, respecting each native source
         long_series, cross_series, abs_series = profile.slope_series(
             half_km, params.direction)
-        self.profile.set_slope_series(long_series, cross_series, abs_series)
+        self.profile.set_slope_series(long_series, cross_series, abs_series,
+                                      list(zip(profile.kps, profile.cross_max_deg)))
 
     def _save_dock_splitter_state(self, *_args) -> None:
         QSettings().setValue(
@@ -1234,6 +1237,7 @@ class BurialPlannerDock(QDockWidget):
             depth_fingerprint=depth_fp,
             sampled_utc=schema.utc_now_iso(),
             kps=task.kps, depths=task.depths,
+            source_ids=task.source_ids, cell_sizes_m=task.cell_sizes_m, cross_max_deg=task.cross_max_deg,
             port_depths=task.port_depths, stbd_depths=task.stbd_depths)
         self.model.save_profile(profile)
         self._display_stored_profile(profile, params, stale=False)

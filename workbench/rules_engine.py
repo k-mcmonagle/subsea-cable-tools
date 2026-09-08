@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from ..slope_utils import windowed_slope_series as _shared_windowed_slope
+from ..slope_utils import is_finite
 
 # Severity lattice / status strings (kept in sync with schema constants).
 SEVERITY_ALLOWED = 0
@@ -319,11 +320,11 @@ def intervals_from_profile(
     lands on the interpolated KP rather than snapping to a sample. When
     ``abs_value`` is set the magnitude is compared (e.g. slope steepness).
     """
-    pts = sorted((float(kp), abs(float(v)) if abs_value else float(v)) for kp, v in series)
+    pts = sorted(((float(kp), (abs(float(v)) if abs_value else float(v)) if is_finite(v) else None) for kp, v in series), key=lambda p:p[0])
     lo, hi = _cond_bounds(op, value, value2)
     out: List[Interval] = []
     for (kp0, v0), (kp1, v1) in zip(pts, pts[1:]):
-        if kp1 <= kp0:
+        if kp1 <= kp0 or v0 is None or v1 is None:
             continue
         sr = _segment_true_range(v0, v1, lo, hi)
         if sr is None:
@@ -367,7 +368,7 @@ def signed_slope_series(depth_series: List[Tuple[float, float]],
     (down-slope) — the plugin-wide sign convention.
 
     Slope at each station is a central difference over depths linearly
-    interpolated at ``kp ± half_window_km`` (clamped to the series range),
+    interpolated at ``kp ± half_window_km`` (full baseline shifted inward at edges),
     so the window keeps a consistent physical width even where stations are
     irregular — route vertices and contour crossings injected between the
     regular marks used to shrink the window to their local spacing and turn
@@ -379,22 +380,19 @@ def signed_slope_series(depth_series: List[Tuple[float, float]],
     of this series. Callers map travel direction onto the sign
     (direction -1 swaps the up/down limits).
     """
-    pts = sorted(depth_series)
+    pts = sorted(depth_series, key=lambda p:p[0])
     n = len(pts)
     if n < 2:
-        return [(kp, 0.0) for kp, _ in pts]
+        return [(kp, None) for kp, _ in pts]
     xs = [kp for kp, _ in pts]
     zs = [z for _, z in pts]
     if half_window_km is None:
         gaps = sorted(xs[i + 1] - xs[i] for i in range(n - 1))
         half_window_km = max(gaps[len(gaps) // 2], 1e-9)
-    # Depth magnitudes grow downward (positive_down), so the shared math
-    # negates the difference for up-slope-positive. Degenerate stations
-    # (collapsed window) stay 0.0 here: rule evaluation treats them as
-    # flat rather than dropping the station.
+    # Unsupported/missing windows are unknown, never fabricated flat slopes.
     values = _shared_windowed_slope(
         xs, zs, half_window_km, x_units_m=1000.0,
-        positive_down=True, degenerate=0.0)
+        positive_down=True, degenerate=None)
     return list(zip(xs, values))
 
 
@@ -453,7 +451,7 @@ def intervals_from_banded_threshold(
     flags: List[Tuple[float, bool]] = []
     for kp, value in value_series:
         wd = wd_by_kp.get(round(kp, 9))
-        if wd is None:
+        if wd is None or not is_finite(value):
             flags.append((kp, False))
             continue
         band = select_band(bands, wd)

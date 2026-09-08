@@ -46,6 +46,8 @@ from ..workbench import rules_engine as eng
 from ..workbench import rules_inputs as ri
 from ..workbench import schema as wb_schema
 from ..workbench.depth_service import DepthSourceConfig
+from ..bathymetry_sampling import RasterSampler, expand_rasters, layer_options, normalise_depth
+from ..slope_utils import cross_profile_metrics, clean_crossings, interpolate_covered, is_finite
 from ..workbench.rules_engine import Interval
 from . import generation, map_layers, profile_data, schema
 
@@ -104,31 +106,15 @@ class DepthSnapshot:
         # enables the per-cell memo in _sample_rasters.
         self._rasters: List[Tuple[object, Optional[QgsCoordinateTransform],
                                   Optional[Tuple[float, float, float, float]]]] = []
-        for layer_id in config.raster_layer_ids:
-            layer = project.mapLayer(layer_id)
-            if not isinstance(layer, QgsRasterLayer) or not layer.isValid():
-                continue
-            try:
-                provider = layer.dataProvider().clone()
-            except Exception:
-                continue
-            transform = None
-            if layer.crs() != WGS84:
-                try:
-                    transform = QgsCoordinateTransform(WGS84, layer.crs(), project)
-                except Exception:
-                    continue
-            cell = None
-            try:
-                extent = provider.extent()
-                x_size, y_size = int(provider.xSize()), int(provider.ySize())
-                if x_size > 0 and y_size > 0 and extent.width() > 0 \
-                        and extent.height() > 0:
-                    cell = (extent.xMinimum(), extent.yMaximum(),
-                            extent.width() / x_size, extent.height() / y_size)
-            except Exception:
-                cell = None
-            self._rasters.append((provider, transform, cell))
+        self._native_samplers = []
+        self.last_source = None
+        self.last_cell_m = None
+        layers = [project.mapLayer(layer_id) for layer_id in config.raster_layer_ids]
+        for layer in expand_rasters([l for l in layers if isinstance(l, QgsRasterLayer) and l.isValid()]):
+            sampler = RasterSampler(layer, self.band, clone=True)
+            transform = QgsCoordinateTransform(WGS84, layer.crs(), project) if layer.crs() != WGS84 else None
+            self._native_samplers.append((sampler, transform))
+            self._rasters.append((sampler.provider, transform, None))
         # Last sampled cell per raster: consecutive stations finer than the
         # raster grid re-read the same cell, so memoising the previous cell
         # removes up to ~95% of the GDAL round-trips at fine profile steps.
@@ -160,7 +146,7 @@ class DepthSnapshot:
             # cheap; potentially large contour reads and spatial-index builds
             # are deferred until the worker task starts.
             self._contour_sources.append({
-                "source": QgsVectorLayerFeatureSource(layer),
+                "source": QgsVectorLayerFeatureSource(layer), "options": layer_options(layer),
                 "crs": layer.crs(),
                 "field_name": field_name,
                 "feature_count": max(int(layer.featureCount()), 0),
@@ -200,7 +186,9 @@ class DepthSnapshot:
                 if geom is None or geom.isEmpty():
                     continue
                 try:
-                    value = float(feat[spec["field_name"]])
+                    value = normalise_depth(feat[spec["field_name"]], spec["options"])
+                    if value is None:
+                        continue
                 except (KeyError, TypeError, ValueError):
                     continue
                 geom = QgsGeometry(geom)
@@ -268,34 +256,16 @@ class DepthSnapshot:
         return None
 
     def _sample_rasters(self, point: QgsPointXY) -> Optional[float]:
-        for idx, (provider, transform, cell) in enumerate(self._rasters):
-            sample_pt = point
-            if transform is not None:
-                try:
-                    sample_pt = transform.transform(point)
-                except Exception:
-                    continue
-            key = None
-            if cell is not None:
-                x_min, y_max, upp_x, upp_y = cell
-                key = (int(math.floor((sample_pt.x() - x_min) / upp_x)),
-                       int(math.floor((y_max - sample_pt.y()) / upp_y)))
-                last = self._raster_last[idx]
-                if last is not None and last[0] == key:
-                    cached = last[1]
-                    if cached is self._raster_miss:
-                        continue
-                    return cached
+        self.last_source = self.last_cell_m = None
+        for sampler, transform in self._native_samplers:
             try:
-                value, ok = provider.sample(sample_pt, self.band)
+                pt = transform.transform(point) if transform else point
+                value = sampler.sample(pt)
             except Exception:
                 continue
-            good = ok and value is not None and value == value
-            if key is not None:
-                self._raster_last[idx] = (
-                    key, float(value) if good else self._raster_miss)
-            if good:
-                return float(value)
+            if value is not None:
+                self.last_source, self.last_cell_m = sampler.source_id, sampler.cell_m
+                return value
         return None
 
     def contour_crossings(
@@ -376,35 +346,15 @@ class DepthSnapshot:
         """
         if not crossings:
             return None
-        kps = crossing_kps if crossing_kps is not None \
-            else [item[0] for item in crossings]
-        index = bisect.bisect_left(kps, float(kp))
-        if index < len(crossings) and abs(crossings[index][0] - kp) <= 1e-9:
-            # Multiple different contour values at exactly one KP are
-            # geometrically ambiguous; report no data instead of inventing a
-            # vertical face or averaging incompatible sources. The list is
-            # sorted, so only the bisect neighbourhood can match — a full
-            # scan here was O(crossings) per injected crossing station,
-            # i.e. quadratic over dense contour data.
-            values = [crossings[index][1]]
-            for j in range(index - 1, -1, -1):
-                if abs(crossings[j][0] - kp) > 1e-9:
-                    break
-                values.append(crossings[j][1])
-            for j in range(index + 1, len(crossings)):
-                if abs(crossings[j][0] - kp) > 1e-9:
-                    break
-                values.append(crossings[j][1])
-            return values[0] if all(abs(v - values[0]) <= 1e-8
-                                    for v in values) else None
-        if index == 0 or index >= len(crossings):
-            return None
-        kp0, d0 = crossings[index - 1]
-        kp1, d1 = crossings[index]
-        if kp1 - kp0 <= 1e-9:
-            return None
-        ratio = (float(kp) - kp0) / (kp1 - kp0)
-        return d0 + ratio * (d1 - d0)
+        # Co-located conflicting observations are gaps on both sides.
+        xs = crossing_kps if crossing_kps is not None else [x for x,y in crossings]
+        index = bisect.bisect_left(xs, kp)
+        lo, hi = max(0,index-1), min(len(xs),index+2)
+        # Include duplicate neighbours of the bracket, not the entire route.
+        while lo > 0 and abs(xs[lo]-xs[lo-1]) <= 1e-9: lo -= 1
+        while hi < len(xs) and abs(xs[hi]-xs[hi-1]) <= 1e-9: hi += 1
+        pairs = clean_crossings(crossings[lo:hi], tolerance=1e-9)
+        return interpolate_covered([x for x,y in pairs],[y for x,y in pairs],kp)
 
     def _polyline_crossings(self, stations_km: List[float],
                             points: List[Optional[QgsPointXY]],
@@ -486,90 +436,55 @@ class DepthSnapshot:
             crossings.append((kp, depth))
         return crossings
 
-    def offset_profile_samples(
-            self, route: RouteFrame, stations_km: List[float],
-            offset_m: float, distance,
-            cancel: Optional[Callable[[], bool]] = None,
-            progress: Optional[Callable[[int, int], None]] = None,
-    ) -> Tuple[List[Optional[float]], List[Optional[float]]]:
-        """(port, starboard) depth values at ± ``offset_m`` per station KP.
+    def offset_profile_samples(self, route, stations_km, offset_m, distance,
+                               cancel=None, progress=None):
+        """Shared transverse profile method: supported tilt plus local peak.
 
-        Rasters are point-sampled at the geodesically offset positions.
-        Contours follow the along-route methodology: intersect each offset
-        polyline with the contours and interpolate between bracketing
-        crossings — never per-station nearest-point scans, which are both
-        O(stations × contours) (hours on a long route) and a staircase whose
-        nearest contour can be kilometres away in flat areas. Stations with
-        no bracketing crossings return ``None`` instead of an invented value.
-        Starboard is to the right of increasing KP.
+        Contours are intersected along each transverse line, extending the
+        search to twice the requested half-width to bracket the endpoints.
+        Raster coverage is checked throughout the span, not just at its ends.
         """
+        port, stbd, peaks = [], [], []
         n = len(stations_km)
-        port: List[Optional[float]] = [None] * n
-        stbd: List[Optional[float]] = [None] * n
-        if n == 0 or offset_m <= 0 or distance is None:
-            return port, stbd
-        if not self._contours_prepared and not self.prepare(cancel):
-            raise ri.AcquisitionCancelled()
-
-        total_units = 3 * n  # one share for offset points, one per side
-
-        def tick(units: int) -> None:
-            if progress is not None:
-                progress(min(units, total_units), total_units)
-
-        station_pts = [route.point_at_kp(kp, clamp=True) for kp in stations_km]
-        port_pts: List[Optional[QgsPointXY]] = [None] * n
-        stbd_pts: List[Optional[QgsPointXY]] = [None] * n
-        half_pi = math.pi / 2.0
-        for i in range(n):
-            if i % 500 == 0:
-                if cancel is not None and cancel():
-                    raise ri.AcquisitionCancelled()
-                tick(i)
-            point = station_pts[i]
-            if point is None:
-                continue
-            p0 = station_pts[i - 1] if i > 0 else point
-            p1 = station_pts[i + 1] if i + 1 < n else point
-            if p0 is None or p1 is None \
-                    or (p0.x() == p1.x() and p0.y() == p1.y()):
-                continue
-            try:
-                azimuth = float(distance.bearing(p0, p1))
-                port_pts[i] = distance.computeSpheroidProject(
-                    point, float(offset_m), azimuth - half_pi)
-                stbd_pts[i] = distance.computeSpheroidProject(
-                    point, float(offset_m), azimuth + half_pi)
-            except Exception:
-                continue
-        tick(n)
-
-        for share, offset_pts, out in ((2, port_pts, port),
-                                       (3, stbd_pts, stbd)):
-            if self.mode in (0, 1) and self._rasters:
-                base = (share - 1) * n
-                for i, pt in enumerate(offset_pts):
-                    if i % 500 == 0:
-                        # These two loops used to run up to 1M provider
-                        # samples with no cancel check and no progress.
-                        if cancel is not None and cancel():
-                            raise ri.AcquisitionCancelled()
-                        tick(base + i)
-                    if pt is not None:
-                        out[i] = self._sample_rasters(pt)
-            if self.mode in (0, 2) and self._contours:
-                crossings = self._polyline_crossings(
-                    stations_km, offset_pts, cancel)
-                crossing_kps = [kp for kp, _depth in crossings]
-                for i, kp in enumerate(stations_km):
-                    if out[i] is None and offset_pts[i] is not None:
-                        out[i] = self._interpolate_crossings(
-                            crossings, kp, crossing_kps)
-            tick(share * n)
+        for i, kp in enumerate(stations_km):
+            if cancel and cancel(): raise ri.AcquisitionCancelled()
+            center = route.point_at_kp(kp, clamp=True)
+            a = route.point_at_kp(max(0, kp-.005), clamp=True)
+            b = route.point_at_kp(min(route.total_length_km, kp+.005), clamp=True)
+            pz = sz = peak = None
+            if center is not None and a is not None and b is not None and distance.measureLine(a,b) > 1e-6:
+                bearing = distance.bearing(a,b) + math.pi/2
+                def offset(t):
+                    return distance.computeSpheroidProject(center, abs(t), bearing if t >= 0 else bearing+math.pi)
+                candidates = []
+                if self.mode in (0, 1):
+                    cell = min((sam.cell_m for sam, _ in self._native_samplers), default=offset_m)
+                    count = max(11, min(2001, int(math.ceil(2*offset_m/max(cell,.1)))+1))
+                    xs = [-offset_m + j*2*offset_m/(count-1) for j in range(count)]
+                    zs, sources, cells = [], [], []
+                    for t in xs:
+                        zs.append(self._sample_rasters(offset(t)))
+                        sources.append(self.last_source); cells.append(self.last_cell_m)
+                    candidates.append(cross_profile_metrics(xs,zs,offset_m,True,cells,sources))
+                if self.mode in (0, 2) and not any(c[0] is not None for c in candidates):
+                    crossings = self._polyline_crossings([-2*offset_m/1000, 2*offset_m/1000],
+                                                        [offset(-2*offset_m),offset(2*offset_m)],cancel)
+                    pairs = clean_crossings((x*1000,z) for x,z in crossings)
+                    xs, zs = [x for x,z in pairs], [z for x,z in pairs]
+                    candidates.append(cross_profile_metrics(xs,zs,offset_m,True))
+                for tilt, candidate_peak, p, q in candidates:
+                    if candidate_peak is not None: peak = max(peak or 0, candidate_peak)
+                    if tilt is not None:
+                        pz, sz = p, q
+                        break
+            port.append(pz); stbd.append(sz); peaks.append(peak)
+            if progress and (i % 25 == 0 or i+1 == n): progress(i+1,max(n,1))
+        self.cross_max_deg = peaks
         return port, stbd
 
     def sample_route(self, route: RouteFrame, kp: float) -> Optional[float]:
         """Depth at KP using raster samples or contour-crossing interpolation."""
+        self.last_source = self.last_cell_m = None
         point = route.point_at_kp(kp, clamp=True)
         if point is None:
             return None
@@ -580,6 +495,7 @@ class DepthSnapshot:
         if self.mode in (0, 2):
             if self._crossing_route is not route:
                 self.contour_crossings(route)
+            self.last_source, self.last_cell_m = "contours", 0.0
             return self._interpolate_crossings(
                 self._crossings, kp, self._crossing_kps)
         return None
@@ -613,11 +529,14 @@ class DepthSnapshot:
             # per pass added nothing.
             marks = [round(float(kp), 12) for kp in marks]
         out: List[Tuple[float, Optional[float]]] = []
+        self.profile_sources, self.profile_cells = [], []
         total = max(len(marks), 1)
         for index, kp in enumerate(marks):
             if cancel is not None and index % 100 == 0 and cancel():
                 raise ri.AcquisitionCancelled()
             out.append((kp, self.sample_route(route, kp)))
+            self.profile_sources.append(self.last_source)
+            self.profile_cells.append(self.last_cell_m)
             if progress is not None and (index % 100 == 0 or index + 1 == total):
                 if crossing_phase:
                     progress(total + index + 1, 2 * total)
@@ -849,7 +768,7 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
                 profile_kind = (rule_work.config.get("profile") or "depth").lower()
                 component = (rule_work.config.get("slope_component") or "long") \
                     if profile_kind == "slope" else "long"
-                if component in (profile_data.SLOPE_COMPONENT_CROSS,
+                if component in (profile_data.SLOPE_COMPONENT_CROSS_MAX, profile_data.SLOPE_COMPONENT_CROSS,
                                  profile_data.SLOPE_COMPONENT_ABSOLUTE):
                     cross = cross_profile or {}
                     has_cross = bool(cross.get("kps")) \
@@ -878,7 +797,7 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
             # freezing the UI here for large constraint layers.
             try:
                 snapshot = {
-                    "source": QgsVectorLayerFeatureSource(layer),
+                    "source": QgsVectorLayerFeatureSource(layer), "options": layer_options(layer),
                     "crs": layer.crs(),
                     "feature_count": max(int(layer.featureCount()), 0),
                     "transform_context": project.transformContext(),
@@ -1166,7 +1085,7 @@ class BurialAnalysisTask(QgsTask):
                     if profile_kind == "slope" else "long"
                 # Cross/absolute slope reads the stored cross-profile
                 # arrays, not the live bathymetry sources.
-                return component not in (profile_data.SLOPE_COMPONENT_CROSS,
+                return component not in (profile_data.SLOPE_COMPONENT_CROSS_MAX, profile_data.SLOPE_COMPONENT_CROSS,
                                          profile_data.SLOPE_COMPONENT_ABSOLUTE)
 
             total = max(len(work.rules), 1)
@@ -1269,8 +1188,9 @@ class BurialAnalysisTask(QgsTask):
             samples = work.depth.profile_samples(
                 work.route, marks, cancel=self.isCanceled,
                 progress=sample_progress)
+        self._slope_samples = samples
         self._depth_series = [
-            (kp, abs(float(value))) for kp, value in samples
+            (kp, float(value)) for kp, value in samples
             if value is not None]
         flags = [(kp, value is None) for kp, value in samples]
         self._depth_gaps = eng.intervals_from_bool_series(
@@ -1304,7 +1224,8 @@ class BurialAnalysisTask(QgsTask):
         series = profile_data.slope_component_series(
             kps, cross.get("depths") or [], cross.get("port") or [],
             cross.get("stbd") or [], float(cross.get("cross_offset_m") or 0.0),
-            work.direction, component, half_km, require_cross=True)
+            work.direction, component, half_km if config.get("slope_window_m") else 0.0, require_cross=True,
+            source_ids=cross.get("sources"), cell_sizes_m=cross.get("cells"), cross_max_deg=cross.get("cross_max"))
         valid = [(kp, value) for kp, value in series if value is not None]
         if not valid:
             raise ri.RuleInputError(
@@ -1318,12 +1239,12 @@ class BurialAnalysisTask(QgsTask):
                          in zip(kps, cross.get("depths") or [])
                          if depth is not None]
             intervals = eng.intervals_from_banded_threshold(
-                valid, wd_series, bands, config.get("op") or ">",
+                series, wd_series, bands, config.get("op") or ">",
                 sampler.scope_domain)
         else:
             value2 = config.get("value2")
             intervals = eng.intervals_from_profile(
-                valid, config.get("op") or ">",
+                series, config.get("op") or ">",
                 float(config.get("value", 0.0)),
                 float(value2) if value2 is not None else None,
                 abs_value=True)
@@ -1381,7 +1302,7 @@ class BurialAnalysisTask(QgsTask):
         component = (config.get("slope_component") or "long") \
             if profile_kind == "slope" else "long"
         if kind == wb_schema.RULE_KIND_THRESHOLD and component in (
-                profile_data.SLOPE_COMPONENT_CROSS,
+                profile_data.SLOPE_COMPONENT_CROSS_MAX, profile_data.SLOPE_COMPONENT_CROSS,
                 profile_data.SLOPE_COMPONENT_ABSOLUTE):
             # Cross/absolute slope evaluates the stored profile's cross-offset
             # arrays; boundaries come interpolated from the series itself at
@@ -1401,20 +1322,30 @@ class BurialAnalysisTask(QgsTask):
                 cache_key = round(half_km, 12)
                 signed_series = self._signed_slope_cache.get(cache_key)
                 if signed_series is None:
-                    signed_series = eng.signed_slope_series(
-                        self._depth_series, half_km)
+                    metadata = work.cross_profile or {}
+                    sources = metadata.get('sources') or getattr(work.depth, 'profile_sources', None)
+                    cells = metadata.get('cells') or getattr(work.depth, 'profile_cells', None)
+                    signed_series = profile_data.long_slope_series(
+                        [kp for kp,v in self._slope_samples], [v for kp,v in self._slope_samples],
+                        half_km if config.get('slope_window_m') else 0.0, sources, cells)
                     self._signed_slope_cache[cache_key] = signed_series
                 prepared_slope = (signed_series if config.get("slope_signed")
-                                  else [(kp, abs(value))
+                                  else [(kp, None if value is None else abs(value))
                                         for kp, value in signed_series])
             intervals = ri.threshold_intervals(
                 self._depth_series, config, sampler.scope_domain,
                 step_km=slope_step_km,
                 prepared_slope_series=prepared_slope)
             nodata = list(self._depth_gaps or [])
-            predicate = _threshold_predicate(
-                work, config, slope_step_km=slope_step_km,
-                sampled_depth_at=self._sampled_depth_at)
+            if profile_kind == 'slope':
+                nodata = eng.normalize(nodata + eng.intervals_from_bool_series(
+                    [(kp, value is None) for kp, value in prepared_slope], sampler.scope_domain))
+                # Boundaries use this exact supported series; no second,
+                # differently truncated resampling predicate.
+                predicate = None
+            else:
+                predicate = _threshold_predicate(work, config, slope_step_km=slope_step_km,
+                                                 sampled_depth_at=self._sampled_depth_at)
         elif kind in (wb_schema.RULE_KIND_PROXIMITY, wb_schema.RULE_KIND_POLYGON):
             if rule_work.feats is None:
                 raise ri.RuleInputError("input layer could not be resolved")
@@ -1589,9 +1520,12 @@ class ProfileSamplingTask(QgsTask):
                 self.route, marks, cancel=self.isCanceled,
                 progress=sample_progress)
             self.kps = [kp for kp, _value in samples]
-            self.depths = [abs(float(value))
+            self.depths = [float(value)
                            if value is not None and value == value else None
                            for _kp, value in samples]
+            self.source_ids = list(getattr(self.depth, "profile_sources", []))
+            self.cell_sizes_m = list(getattr(self.depth, "profile_cells", []))
+            self.cross_max_deg = []
             self.series = [(kp, depth) for kp, depth
                            in zip(self.kps, self.depths) if depth is not None]
 
@@ -1616,10 +1550,11 @@ class ProfileSamplingTask(QgsTask):
                         progress=cross_progress)
 
                     def magnitudes(values):
-                        return [abs(float(v))
+                        return [float(v)
                                 if v is not None and v == v else None
                                 for v in values]
 
+                    self.cross_max_deg = list(getattr(self.depth, "cross_max_deg", []))
                     self.port_depths = magnitudes(port_values)
                     self.stbd_depths = magnitudes(stbd_values)
                 else:

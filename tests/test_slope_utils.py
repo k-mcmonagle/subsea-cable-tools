@@ -61,7 +61,7 @@ def test_windowed_gap_and_degenerate_handling():
                                    degenerate=None, mask_missing=True)
     unmasked = windowed_slope_series(xs, depths, 10.0, positive_down=True,
                                      degenerate=None, mask_missing=False)
-    ok = masked[1] is None and unmasked[1] is not None
+    ok = masked == unmasked == [None] * 4
     # Degenerate: no valid data at all.
     empty = windowed_slope_series(xs, [None] * 4, 10.0, degenerate=0.0)
     ok = ok and empty == [0.0, 0.0, 0.0, 0.0]

@@ -125,7 +125,7 @@ def test_profile_slope_masks_seams_and_gaps():
     # True gradient 0.1 m/m ≈ 5.7° everywhere else; the 10 m seam step over
     # one 10 m interval would read ≈ 47° if bridged.
     ok = ok and finite and all(abs(abs(v) - 5.71) < 0.6 for v in finite)
-    ok = ok and max_half == 40.0
+    ok = ok and max_half == 10.0 and all(v is None for v in slopes[6:])
     # No-data gap in a single raster also masks instead of bridging.
     gappy = {"rasters": [{"name": "r", "x": xs,
                           "y": [-50.0, -51.0, -52.0, None, None,

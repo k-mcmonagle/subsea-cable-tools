@@ -359,12 +359,10 @@ def _depth_series(sampler: RouteSampler, store, rpl_id: str, project: QgsProject
     service = DepthService(config, project)
     series: List[Tuple[float, float]] = []
     if service.is_available():
-        for kp, pt in zip(sampler.stations_km, sampler.coords):
-            if pt is None:
-                continue
-            depth = service.sample(pt.y(), pt.x())
-            if depth is not None:
-                series.append((kp, abs(float(depth))))
+        snapshot = service._snapshot
+        snapshot.prepare()
+        series = snapshot.profile_samples(sampler.route, sampler.stations_km)
+        sampler._depth_metadata = {'sources': snapshot.profile_sources, 'cells': snapshot.profile_cells}
     if not series:
         series = _rpl_depth_series(store, rpl_id)
     if not series:
@@ -420,7 +418,7 @@ def _slope_series(depth_series: List[Tuple[float, float]],
                   half_window_km: Optional[float] = None
                   ) -> List[Tuple[float, float]]:
     """Unsigned seabed slope (degrees): magnitude of the shared signed series."""
-    return [(kp, abs(slope))
+    return [(kp, None if slope is None else abs(slope))
             for kp, slope in eng.signed_slope_series(depth_series, half_window_km)]
 
 
@@ -491,7 +489,7 @@ def threshold_intervals(depth_series: List[Tuple[float, float]], config: Dict,
                 wd = wd_by_kp.get(round(kp, 9))
                 band = eng.select_band(bands, wd) if wd is not None else None
                 fired = False
-                if band is not None:
+                if band is not None and slope is not None:
                     down = band.get("downslope_limit", band.get("limit"))
                     up = band.get("upslope_limit", band.get("limit"))
                     # +ve slope = shoaling: up-slope limit governs the
@@ -527,8 +525,18 @@ def _acquire_threshold(sampler, store, rpl_id, config, project) -> List[Interval
         depth_series = _depth_series(sampler, store, rpl_id, project)
         if cache is not None:
             cache[rpl_id] = depth_series
+    prepared = None
+    if (config.get('profile') or '').lower() == 'slope':
+        from ..burial.profile_data import long_slope_series
+        metadata = getattr(sampler, '_depth_metadata', {})
+        half = slope_half_window_km(config, getattr(sampler,'step_km',None)) or 0
+        prepared = long_slope_series([kp for kp,z in depth_series], [z for kp,z in depth_series],
+            half if config.get('slope_window_m') else 0, metadata.get('sources'),metadata.get('cells'))
+        if not config.get('slope_signed'):
+            prepared = [(kp,None if z is None else abs(z)) for kp,z in prepared]
     return threshold_intervals(depth_series, config, sampler.domain,
-                               step_km=getattr(sampler, "step_km", None))
+                               step_km=getattr(sampler, 'step_km', None), prepared_slope_series=prepared)
+
 
 
 def _feature_buffer_m(feat, buffer_field: str, default_m: float) -> float:

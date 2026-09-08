@@ -14,7 +14,7 @@ import bisect
 import math
 
 from ..slope_utils import (  # noqa: F401  (re-exported API)
-    auto_half_window_m, contiguous_runs, interval_slope_series,
+    auto_half_window_m, contiguous_runs, interval_slope_series, supported_slopes, clean_crossings, terrace_baseline_m,
     should_invert_depth_axis, windowed_slope_series,
 )
 
@@ -31,12 +31,7 @@ def merged_contour_crossings(profile: Dict) -> Tuple[List[float], List[float]]:
     crossings = []
     for series in profile.get("contours", []):
         crossings.extend(zip(series["x"], series["y"]))
-    crossings.sort(key=lambda pair: pair[0])
-    merged: List[Tuple[float, float]] = []
-    for x, y in crossings:
-        if merged and abs(x - merged[-1][0]) <= 1e-6 and y == merged[-1][1]:
-            continue
-        merged.append((x, y))
+    merged = clean_crossings(crossings)
     return [x for x, _y in merged], [y for _x, y in merged]
 
 
@@ -108,75 +103,14 @@ def composite_series_with_sources(profile: Dict
     return x_values, y_values, [None] * len(x_values), [None] * len(x_values)
 
 
-def profile_slope_series(profile: Dict,
-                         positive_down: Optional[bool] = None
-                         ) -> Tuple[List[float], List[Optional[float]],
-                                    Optional[float]]:
-    """Slope for the live profile: cell-scaled windows, no bridged seams.
-
-    Slope at each station is a central difference over ``x ± half`` where
-    ``half`` is the larger of that station's own source-raster cell size and
-    the median station spacing — sub-cell nearest-neighbour sampling cannot
-    read as a staircase of near-vertical spikes, and a fine grid is not
-    over-smoothed just because a coarser raster exists elsewhere on the
-    line. The window is evaluated strictly within one contiguous run of
-    same-source valid stations: a window touching a no-data gap or a raster
-    seam yields None (a datum offset between two grids must surface as a
-    visible gap, never as a fabricated slope). Returns
-    ``(x, slopes, max_half_window_m)`` aligned to the composite stations.
-    """
+def profile_slope_series(profile: Dict, positive_down: Optional[bool] = None):
+    """Shared supported slopes; full native-resolution windows, no seams."""
     xs, ys, sources, cells = composite_series_with_sources(profile)
-    n = len(xs)
-    if n < 2:
-        return xs, [None] * n, None
-    if positive_down is None:
-        positive_down = should_invert_depth_axis(ys)
-    sign = 1.0 if positive_down is False else -1.0
-    gaps = sorted(xs[i + 1] - xs[i] for i in range(n - 1)
-                  if xs[i + 1] > xs[i])
-    if not gaps:
-        return xs, [None] * n, None
-    spacing = gaps[len(gaps) // 2]
-    slopes: List[Optional[float]] = [None] * n
-    max_half = None
-    seam_breaks: List[int] = []
-    for start, end in contiguous_runs(xs, ys, group_ids=sources):
-        # A run starting right after another valid station broke on a source
-        # change, not a gap — remember it so the seam gets a visible break.
-        if start > 0 and start - 1 < len(ys) and ys[start - 1] is not None:
-            seam_breaks.append(start)
-        run_x = xs[start:end + 1]
-        run_y = ys[start:end + 1]
-        for offset, x in enumerate(run_x):
-            index = start + offset
-            half = max(cells[index] or 0.0, spacing)
-            k0 = max(run_x[0], x - half)
-            k1 = min(run_x[-1], x + half)
-            if k1 - k0 <= 1e-6:
-                continue
-            d0 = _interp_run(run_x, run_y, k0)
-            d1 = _interp_run(run_x, run_y, k1)
-            slopes[index] = math.degrees(math.atan2(sign * (d1 - d0), k1 - k0))
-            if max_half is None or half > max_half:
-                max_half = half
-    # Each side of a raster seam reports its own within-run slope, but the
-    # transition itself is unmeasurable (the grids may disagree on datum):
-    # blank the seam-adjacent station so the plotted curve visibly breaks
-    # instead of joining two sources as if the slope were continuous.
-    for index in seam_breaks:
-        slopes[index] = None
-    return xs, slopes, max_half
-
-
-def _interp_run(run_x: List[float], run_y: List[float], x: float) -> float:
-    """Linear interpolation inside one contiguous all-valid run."""
-    index = bisect.bisect_left(run_x, x)
-    if index <= 0:
-        return run_y[0]
-    if index >= len(run_x):
-        return run_y[-1]
-    x0, x1 = run_x[index - 1], run_x[index]
-    if x1 - x0 <= 1e-12:
-        return run_y[index]
-    t = (x - x0) / (x1 - x0)
-    return run_y[index - 1] + t * (run_y[index] - run_y[index - 1])
+    profile["terrace_baseline_m"] = max((terrace_baseline_m(xs[a:b+1], ys[a:b+1],
+        max((c or 0 for c in cells[a:b+1]), default=0))
+        for a,b in contiguous_runs(xs, ys, group_ids=sources)
+        if any(cells[a:b+1])), default=0)
+    slopes, widths = supported_slopes(xs, ys, cells, sources,
+                                     profile.get("slope_window_m", 0), positive_down)
+    profile["slope_baseline_m"] = widths
+    return xs, slopes, max((w / 2 for w in widths if w), default=None)

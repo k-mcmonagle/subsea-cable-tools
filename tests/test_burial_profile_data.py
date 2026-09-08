@@ -83,10 +83,9 @@ def test_long_slope_sign_and_gaps() -> bool:
     shoaling = list(reversed(deepening))
     up = long_slope_series(kps, shoaling, half_window_km=0.1)
     ok = ok and all(v is not None and v > 0 for _kp, v in up)
-    # Interior gaps are bridged by interpolation (same as the crosshair);
-    # the bridged slope still reports the deepening trend.
+    # Interior gaps cannot support a slope; neither display nor analysis bridges them.
     gappy = long_slope_series(kps, [100.0, None, None, None, 140.0], 0.05)
-    ok = ok and gappy[2][1] is not None and gappy[2][1] < 0
+    ok = ok and all(v is None for kp, v in gappy)
     # A single data point offers no window at all -> None everywhere.
     lone = long_slope_series(kps, [None, None, 120.0, None, None], 0.05)
     ok = ok and all(v is None for _kp, v in lone)

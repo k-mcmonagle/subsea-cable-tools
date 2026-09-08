@@ -18,7 +18,7 @@ Slope conventions (plugin-wide, see README "Slope methodology"):
 - absolute: magnitude of the combined gradient
   (``atan(sqrt(tan²long + tan²cross))``), never negative.
 
-Depths are stored as magnitudes (the Burial Planner convention); ``None``
+Depths are stored in metres, positive down; ``None``
 marks stations with no data.
 """
 
@@ -37,6 +37,7 @@ except ImportError:  # pragma: no cover
 
 from . import schema
 from ..slope_utils import windowed_slope_series as _shared_windowed_slope
+from ..slope_utils import supported_slopes, interpolate_covered, is_finite
 
 Sample = Tuple[float, Optional[float]]
 
@@ -66,6 +67,10 @@ class PlanProfile:
     depths: List[Optional[float]] = field(default_factory=list)
     port_depths: List[Optional[float]] = field(default_factory=list)
     stbd_depths: List[Optional[float]] = field(default_factory=list)
+    source_ids: List = field(default_factory=list)
+    cell_sizes_m: List = field(default_factory=list)
+    cross_max_deg: List = field(default_factory=list)
+    calculation_version: int = 2
     # Memoised slope series per (half window, direction) — profiles can hold
     # hundreds of thousands of stations, so recomputing per refresh would
     # stall the UI. Not persisted.
@@ -116,12 +121,7 @@ class PlanProfile:
         per-boundary queries (e.g. water-depth-scaled Exclusion Area
         extensions) without rescanning hundreds of thousands of stations.
         """
-        cached = self._slope_cache.get("_depth_xy")
-        if cached is None:
-            cached = _valid_pairs(self.kps, self.depths)
-            self._slope_cache["_depth_xy"] = cached
-        xs, ys = cached
-        return _interp(xs, ys, float(kp))
+        return interpolate_covered(self.kps, self.depths, float(kp), self.source_ids or None)
 
     def slope_series(self, half_window_km: float, direction: int
                      ) -> Tuple[List[Sample], List[Sample], List[Sample]]:
@@ -131,11 +131,11 @@ class PlanProfile:
         cached = self._slope_cache.get(key)
         if cached is not None:
             return cached
-        long_series = long_slope_series(self.kps, self.depths, half_window_km)
+        long_series = long_slope_series(self.kps, self.depths, half_window_km, self.source_ids, self.cell_sizes_m)
         cross_series = cross_slope_series(
             self.kps, self.port_depths, self.stbd_depths,
             self.cross_offset_m, direction) if self.has_cross() else []
-        abs_series = absolute_slope_series(long_series, cross_series)
+        abs_series = absolute_slope_series(long_series, cross_series, require_cross=True)
         result = (long_series, cross_series, abs_series)
         # Bounded memo: drop the oldest window entries so sweeping the
         # evaluation length cannot retain unlimited 500k-element lists.
@@ -150,7 +150,7 @@ class PlanProfile:
     def is_current(self, route_fingerprint: str, depth_fingerprint: str,
                    scope_start_kp: float, scope_end_kp: float,
                    cross_offset_m: float) -> bool:
-        return (bool(self.kps)
+        return (self.calculation_version == 2 and bool(self.kps)
                 and self.route_fingerprint == (route_fingerprint or "")
                 and self.depth_fingerprint == (depth_fingerprint or "")
                 and abs(self.scope_start_kp - float(scope_start_kp)) < 1e-6
@@ -160,6 +160,7 @@ class PlanProfile:
     # -- persistence ----------------------------------------------------------
     def to_row(self, plan_id: str, profile_id: str = "") -> Dict:
         params = {
+            "calculation_version": self.calculation_version,
             "step_m": self.step_m,
             "cross_offset_m": self.cross_offset_m,
             "scope_start_kp": self.scope_start_kp,
@@ -177,10 +178,12 @@ class PlanProfile:
                     for v in values]
 
         samples = {
-            "kps": compact(self.kps, 6),
-            "depths": compact(self.depths, 3),
-            "port": compact(self.port_depths, 3),
-            "stbd": compact(self.stbd_depths, 3),
+            "kps": compact(self.kps, 9),
+            "depths": compact(self.depths, 6),
+            "port": compact(self.port_depths, 6),
+            "stbd": compact(self.stbd_depths, 6),
+            "sources": self.source_ids, "cells": self.cell_sizes_m,
+            "cross_max": self.cross_max_deg,
         }
         return {
             "profile_id": profile_id or schema.new_id(),
@@ -221,6 +224,10 @@ class PlanProfile:
             return out[:len(kps)]
 
         return cls(
+            calculation_version=int(params.get("calculation_version") or 1),
+            source_ids=samples.get("sources") or [],
+            cell_sizes_m=samples.get("cells") or [],
+            cross_max_deg=samples.get("cross_max") or [],
             step_m=float(params.get("step_m") or 0.0),
             cross_offset_m=float(params.get("cross_offset_m") or 0.0),
             scope_start_kp=float(params.get("scope_start_kp") or 0.0),
@@ -267,18 +274,16 @@ def _interp(xs: List[float], ys: List[float], kp: float) -> Optional[float]:
 
 
 def long_slope_series(kps: List[float], depths: List[Optional[float]],
-                      half_window_km: float) -> List[Sample]:
+                      half_window_km: float, source_ids=None, cell_sizes_m=None) -> List[Sample]:
     """Signed longitudinal slope (°) per station; +ve = up-slope.
 
-    Central difference of interpolated depth magnitudes at kp ± the half
-    window (the analysis-step / vehicle-footprint convention), clamped to
-    the sampled range so edge stations use the available window. The math
-    is the shared plugin-wide implementation (``slope_utils``); depths are
-    magnitudes, so positive-down applies.
+    A positive half-window requests a complete physical baseline. Zero uses
+    the shared native-resolution automatic method. Runs split at missing
+    samples and source changes; insufficient support returns None.
     """
-    values = _shared_windowed_slope(
-        kps, depths, half_window_km, x_units_m=1000.0,
-        positive_down=True, degenerate=None)
+    values, _ = supported_slopes([kp * 1000 for kp in kps], depths,
+                                  cell_sizes_m, source_ids or None,
+                                  2 * half_window_km * 1000, positive_down=True)
     return list(zip(kps, values))
 
 
@@ -294,7 +299,9 @@ def cross_slope_series(kps: List[float],
     installing against KP swaps the vehicle's port/starboard, so the sign
     flips for direction −1.
     """
-    span_m = 2.0 * max(float(cross_offset_m), 1e-9)
+    if not is_finite(cross_offset_m) or cross_offset_m <= 0:
+        return [(kp, None) for kp in kps]
+    span_m = 2.0 * float(cross_offset_m)
     sign = -1.0 if int(direction or 1) < 0 else 1.0
     if _np is not None and kps:
         port_arr = _nan_array(port_depths)
@@ -317,11 +324,13 @@ def cross_slope_series(kps: List[float],
 SLOPE_COMPONENT_LONG = "long"
 SLOPE_COMPONENT_CROSS = "cross"
 SLOPE_COMPONENT_ABSOLUTE = "absolute"
+SLOPE_COMPONENT_CROSS_MAX = "cross_max"
 SLOPE_COMPONENTS = (SLOPE_COMPONENT_LONG, SLOPE_COMPONENT_CROSS,
-                    SLOPE_COMPONENT_ABSOLUTE)
+                    SLOPE_COMPONENT_ABSOLUTE, SLOPE_COMPONENT_CROSS_MAX)
 SLOPE_COMPONENT_LABELS = {
     SLOPE_COMPONENT_LONG: "Longitudinal (along route)",
-    SLOPE_COMPONENT_CROSS: "Cross (across route)",
+    SLOPE_COMPONENT_CROSS: "Cross tilt (endpoint difference)",
+    SLOPE_COMPONENT_CROSS_MAX: "Maximum local cross slope",
     SLOPE_COMPONENT_ABSOLUTE: "Absolute (combined gradient)",
 }
 
@@ -332,7 +341,7 @@ def slope_component_series(kps: List[float], depths: List[Optional[float]],
                            cross_offset_m: float, direction: int,
                            component: str,
                            half_window_km: float,
-                           require_cross: bool = False) -> List[Sample]:
+                           require_cross: bool = False, source_ids=None, cell_sizes_m=None, cross_max_deg=None) -> List[Sample]:
     """(kp, value|None) series for one slope component, for criteria checks.
 
     ``long`` is signed (+ve = up-slope) so directional limits apply; ``cross``
@@ -346,7 +355,10 @@ def slope_component_series(kps: List[float], depths: List[Optional[float]],
     longitudinal difference; cross is always the two-point difference across
     the sampled ± cross offset.
     """
-    long_series = long_slope_series(kps, depths, half_window_km)
+    if component == SLOPE_COMPONENT_CROSS_MAX:
+        peaks = cross_max_deg or []
+        return [(kp, peaks[i] if i < len(peaks) else None) for i,kp in enumerate(kps)]
+    long_series = long_slope_series(kps, depths, half_window_km, source_ids, cell_sizes_m)
     if component == SLOPE_COMPONENT_LONG:
         return long_series
     cross_series = cross_slope_series(kps, port_depths, stbd_depths,

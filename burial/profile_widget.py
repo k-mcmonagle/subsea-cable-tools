@@ -321,7 +321,8 @@ class BurialProfileWidget(QWidget):
         self._slope_curves = {}
         for key, color, style, label in (
                 ("long", "#ff7f0e", _PEN_STYLE.SolidLine, "Longitudinal"),
-                ("cross", "#9467bd", _PEN_STYLE.SolidLine, "Cross"),
+                ("cross", "#9467bd", _PEN_STYLE.SolidLine, "Cross tilt"),
+                ("cross_max", "#d62728", _PEN_STYLE.DotLine, "Max local cross"),
                 ("abs", "#8c564b", _PEN_STYLE.DashLine, "Absolute")):
             curve = slope_item.plot(
                 [], [], pen=pg.mkPen(color, width=1.6, style=style),
@@ -349,7 +350,8 @@ class BurialProfileWidget(QWidget):
         toggle_row.setSpacing(12)
         self._series_toggles: Dict[str, QCheckBox] = {}
         for key, color, label in (("long", "#ff7f0e", "Longitudinal"),
-                                  ("cross", "#9467bd", "Cross"),
+                                  ("cross", "#9467bd", "Cross tilt"),
+                                  ("cross_max", "#d62728", "Max local cross"),
                                   ("abs", "#8c564b", "Absolute")):
             box = QCheckBox(label)
             box.setStyleSheet(f"color: {color}; font-weight: 600;")
@@ -575,7 +577,7 @@ class BurialProfileWidget(QWidget):
         """
         self._series = sorted(series)
         xs = [kp for kp, _d in self._series]
-        ys = [d for _kp, d in self._series]
+        ys = [float("nan") if d is None else d for _kp, d in self._series]
         self._series_xs = xs  # cached for the per-hover lookups
         self._curve.setData(xs, ys, connect="finite")
 
@@ -597,11 +599,11 @@ class BurialProfileWidget(QWidget):
     def set_slope_visible(self, visible: bool) -> None:
         self._slope_pane.setVisible(bool(visible))
 
-    def set_slope_series(self, long_series, cross_series, abs_series) -> None:
+    def set_slope_series(self, long_series, cross_series, abs_series, cross_max_series=None) -> None:
         """Series are (kp, degrees|None) lists; None renders as a gap."""
         nan = float("nan")
         for key, series in (("long", long_series), ("cross", cross_series),
-                            ("abs", abs_series)):
+                            ("abs", abs_series), ("cross_max", cross_max_series)):
             series = list(series or [])
             self._slope_series[key] = series
             xs = [kp for kp, _v in series]
@@ -768,54 +770,16 @@ class BurialProfileWidget(QWidget):
         if not candidates:
             return None
         j = min(candidates, key=lambda j: abs(xs[j] - kp))
-        return self._series[j]
+        return self._series[j] if self._series[j][1] is not None else None
 
-    def _interp_depth(self, xs: List[float], kp: float) -> Optional[float]:
-        import bisect
-        if kp <= xs[0]:
-            return self._series[0][1]
-        if kp >= xs[-1]:
-            return self._series[-1][1]
-        j = bisect.bisect_left(xs, kp)
-        kp0, d0 = self._series[j - 1]
-        kp1, d1 = self._series[j]
-        if kp1 <= kp0:
-            return d1
-        t = (kp - kp0) / (kp1 - kp0)
-        return d0 + t * (d1 - d0)
+    def _interp_depth(self, xs, kp):
+        from ..slope_utils import interpolate_covered
+        return interpolate_covered(xs, [d for x,d in self._series], kp)
 
-    def _slope_at(self, kp: float) -> Optional[float]:
-        """Signed slope (°) at kp; positive = shoaling with increasing KP.
-
-        Central difference over ± the analysis half-window when the dock has
-        provided one (so the readout matches what the rules measured), else
-        over the single bracketing display interval. The series holds depth
-        magnitudes, hence the negated difference for up-slope-positive.
-        """
-        if len(self._series) < 2:
-            return None
-        import bisect
-
-        xs = self._series_xs
-        half = self._slope_half_window_km
-        if half:
-            k0 = max(xs[0], kp - half)
-            k1 = min(xs[-1], kp + half)
-            dx_m = (k1 - k0) * 1000.0
-            if dx_m <= 1e-6:
-                return None
-            d0 = self._interp_depth(xs, k0)
-            d1 = self._interp_depth(xs, k1)
-            if d0 is None or d1 is None:
-                return None
-            return math.degrees(math.atan2(-(d1 - d0), dx_m))
-        i = min(max(bisect.bisect_left(xs, kp), 1), len(xs) - 1)
-        kp0, d0 = self._series[i - 1]
-        kp1, d1 = self._series[i]
-        dx_m = (kp1 - kp0) * 1000.0
-        if dx_m <= 0:
-            return None
-        return math.degrees(math.atan2(-(d1 - d0), dx_m))
+    def _slope_at(self, kp):
+        # Read the same supported series as the pane/rules; never recalculate
+        # a different window from the hover position.
+        return self._slope_series_value_at('long', kp)
 
     def focus_kp(self, kp: float) -> None:
         """Show the profile crosshair/readout at a table-selected KP."""
@@ -851,7 +815,8 @@ class BurialProfileWidget(QWidget):
                 lines.append(f"Slope {slope:+.1f}°")
             # Cross/absolute at the cursor when the slope panel shows them.
             if self._slope_pane.isVisibleTo(self):
-                for key, fmt in (("cross", "Cross {:+.1f}°"),
+                for key, fmt in (("cross", "Cross tilt {:+.1f}°"),
+                                 ("cross_max", "Max local cross {:.1f}°"),
                                  ("abs", "Abs {:.1f}°")):
                     toggle = self._series_toggles.get(key)
                     if toggle is None or not toggle.isChecked():

@@ -64,6 +64,10 @@ class ProfileTab(QWidget):
         source_note.setWordWrap(True)
         source_note.setStyleSheet(ui_helpers.hint_style())
         source_form.addRow(source_note)
+        from ...bathymetry_sampling import configure_layers
+        options_btn = QPushButton("Bathymetry source conventions…")
+        options_btn.clicked.connect(lambda: configure_layers(self))
+        source_form.addRow(options_btn)
         layout.addWidget(source_box)
 
         settings_box = QGroupBox("Profile sampling and terrain-slope resolution")

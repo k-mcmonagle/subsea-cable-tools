@@ -61,38 +61,17 @@ class DepthService:
     def __init__(self, config: DepthSourceConfig, project: Optional[QgsProject] = None):
         self.config = config
         self.project = project or QgsProject.instance()
-        rasters = [
-            layer for layer in (self.project.mapLayer(i) for i in config.raster_layer_ids)
-            if isinstance(layer, QgsRasterLayer)
-        ]
-        contour_layers = []
-        depth_fields = []
-        for entry in config.contour_layers:
-            layer = self.project.mapLayer(entry.get("layer_id", ""))
-            if isinstance(layer, QgsVectorLayer):
-                contour_layers.append(layer)
-                depth_fields.append(entry.get("depth_field", ""))
-        self._raster_samplers = depth_sampling.build_raster_samplers(rasters, WGS84)
-        self._contour_samplers = depth_sampling.build_contour_samplers(
-            contour_layers, depth_fields, WGS84
-        )
+        # Lazy import avoids a module cycle: the snapshot consumes the
+        # configuration class above, while this service uses its sampler.
+        from ..burial.analysis_task import DepthSnapshot
+        self._snapshot = DepthSnapshot(config, self.project)
 
-    def is_available(self) -> bool:
-        return bool(self._raster_samplers or self._contour_samplers)
+    def is_available(self):
+        return self._snapshot.is_available()
 
-    def sample(self, lat: float, lon: float) -> Optional[float]:
-        if not self.is_available():
-            return None
-        return depth_sampling.sample_depth(
-            QgsPointXY(lon, lat),
-            self.config.mode,
-            self._raster_samplers,
-            self._contour_samplers,
-            self.config.contour_search_radius_m,
-            self.project.transformContext(),
-            project=self.project,
-            band=self.config.raster_band,
-        )
+    def sample(self, lat, lon):
+        return self._snapshot.sample(lat, lon)
+
 
     def sample_many(self, coords: Sequence[Tuple[float, float]]) -> List[Optional[float]]:
         return [self.sample(lat, lon) for lat, lon in coords]
@@ -100,17 +79,9 @@ class DepthService:
     def sample_profile(self, route_frame, kp0_km: float, kp1_km: float, step_m: float = 25.0
                        ) -> List[Tuple[float, float]]:
         """(kp_km, depth_m) pairs along a RouteFrame between two KPs."""
-        out: List[Tuple[float, float]] = []
-        if step_m <= 0:
-            step_m = 25.0
-        kp = min(kp0_km, kp1_km)
-        end = max(kp0_km, kp1_km)
-        step_km = step_m / 1000.0
-        while kp <= end + 1e-9:
-            point = route_frame.point_at_kp(min(kp, end), clamp=True)
-            if point is not None:
-                depth = self.sample(point.y(), point.x())
-                if depth is not None:
-                    out.append((min(kp, end), float(depth)))
-            kp += step_km
-        return out
+        import math
+        lo, hi = sorted([kp0_km, kp1_km])
+        step = max(step_m, 1) / 1000
+        marks = [min(hi, lo+i*step) for i in range(int(math.ceil((hi-lo)/step))+1)]
+        self._snapshot.prepare()
+        return self._snapshot.profile_samples(route_frame, marks)

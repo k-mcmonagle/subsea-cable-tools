@@ -9,6 +9,7 @@ a tiled GeoTIFF, so depth values pass through untouched.
 """
 
 from qgis.PyQt.QtCore import QCoreApplication
+import json
 import os
 import uuid
 from qgis.core import (
@@ -133,9 +134,9 @@ class MergeMBESRastersAlgorithm(QgsProcessingAlgorithm):
                 'coarser tiles are upsampled to the finest grid '
                 f'({"bilinear interpolation" if resampling == 1 else "nearest-neighbour blocks"}). '
                 'The upsampled cells carry no new information and the mosaic '
-                'loses per-cell source provenance — treat it as a display/'
-                'profiling surface and refer engineering analyses to the '
-                'source grids. Overlapping tiles are not checked for vertical-'
+                'does not store per-cell source provenance. This plugin records '
+                'native source paths in a sidecar for engineering profiles; '
+                'other tools reading only the TIFF use the upsampled surface. Overlapping tiles are not checked for vertical-'
                 'datum agreement; verify overlaps before relying on seam areas.')
 
         # --- build the VRT mosaic at the highest resolution ---
@@ -173,7 +174,21 @@ class MergeMBESRastersAlgorithm(QgsProcessingAlgorithm):
             os.remove(vrt_path)
         except OSError:
             pass
-        feedback.pushInfo('Merge complete. Original depth values and finest resolution preserved.')
+        from ..bathymetry_sampling import layer_options, expand_rasters
+        native = expand_rasters(raster_layers)
+        manifest_path = str(result2['OUTPUT']) + '.sources.json'
+        with open(manifest_path, 'w', encoding='utf-8') as stream:
+            json.dump({'version': 2, 'analysis_priority': 'finest native first',
+                       'sources': [{'path': os.path.abspath(layer.source().split('|')[0]),
+                                    'name': layer.name(), 'options': layer_options(layer)}
+                                   for layer in native]}, stream, indent=2)
+        feedback.pushInfo('Engineering profiles read the native sources recorded in ' + manifest_path)
+        feedback.pushInfo('Keep the native source rasters and the .sources.json sidecar with this result. '
+                          'Temporary processing files may be deleted; save source grids permanently '
+                          'and rerun the merge for a reusable result. Profile overlaps use finest native '
+                          'resolution first, which can differ from the displayed mosaic overlap order.')
+        feedback.pushInfo('Merge complete. Output pixel size matches the finest input; '
+                          'coarser areas retain their original information resolution.')
         return {self.OUTPUT: result2['OUTPUT']}
 
     def createInstance(self):

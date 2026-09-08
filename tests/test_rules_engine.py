@@ -163,7 +163,7 @@ def test_signed_slope() -> bool:
     # depth 100 -> 200 over 1 km (deepening), then back (shoaling).
     # Up-slope positive: deepening start is -ve, shoaling end is +ve.
     series = [(0.0, 100.0), (1.0, 200.0), (2.0, 100.0)]
-    signed = eng.signed_slope_series(series)
+    signed = eng.signed_slope_series(series, half_window_km=0.5)
     ok = signed[0][1] < 0 and signed[2][1] > 0
     # A wide evaluation window (vehicle footprint) spans the whole V and
     # averages the crest to ~0° — footprint-scale smoothing by construction.

@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased — profile reliability and measurements
+
+- Shared native-cell bilinear bathymetry sampling, explicit per-layer vertical conventions/units, full supported slope baselines, and no interpolation across missing coverage or source seams.
+- Preserve exact contour crossings; flag conflicting depths. Use supported transverse endpoint tilt and report maximum local cross slope separately, including a Burial Planner criterion.
+- Persist burial source/resolution/peak metadata and invalidate older profiles/settings. Keep slope previews and rule evaluation on the same calculation. Covered seabed length excludes unknown stretches and seams.
+- New MBES merge source manifests retain access to native grids for engineering profiles; warn about duplicate-cell soundings in direct XYZ import and reject nonfinite XYZ records.
+- KP profile Space freeze/resume, source/raw views, measurement snapping and repeated annotations, independent units, delete/clear, PNG/CSV export, seabed/slope shading, and controlled map-click/close lifecycle.
+- Regression coverage includes analytical planes, short baselines, gaps/seams, conflicting contours, depressions, persistent provenance and QGIS sampling/window/export workflows.
+
+
 All notable changes to the Subsea Cable Tools QGIS plugin will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
@@ -614,3 +624,11 @@ This is the first published release since 1.3.0 and consolidates all stable impr
 - Import bathymetry MDB algorithm
 - Import Excel RPL algorithm
 - KP Mouse MapTool for interactive KP measurement
+
+- Follow-up: detect repeated raster terraces when choosing automatic slope averaging lengths; report the heuristic and retain unaltered depth samples. Add elastic profile measurement preview, Length/X/Y results, projected route-KP axis labels and CSV provenance.
+
+- Add labelled elastic measurement triangles and unsigned endpoint angle in the quick profile and CSV. Clarify MBES merge resolution, native-source sidecar dependencies and temporary-file lifetime in processing feedback.
+
+- Move quick-profile Measure into the depth plot context menu; retain pan and zoom while measuring, and let Escape leave measurement mode without closing the profile.
+
+- Add draggable measurement endpoints and default physical 1:1 depth-profile axes with an unlock checkbox. Fix QGIS 4 message-level enums in Depth Profile and empty-group truth testing in Burial Planner.

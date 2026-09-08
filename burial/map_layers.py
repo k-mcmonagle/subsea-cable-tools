@@ -107,13 +107,14 @@ def depth_config_fingerprint(project: Optional[QgsProject], depth_config) -> str
     profile's currency check, so "the samples are current" and "the rule
     cache is current" can never disagree.
     """
+    from ..bathymetry_sampling import layer_options, expand_rasters, VERSION
+    import json
     project = project or QgsProject.instance()
-    return "|".join(
-        layer_fingerprint(project.mapLayer(layer_id))
-        for layer_id in depth_config.raster_layer_ids
-    ) + "|" + "|".join(
-        layer_fingerprint(project.mapLayer(entry.get("layer_id", "")))
-        for entry in depth_config.contour_layers)
+    rasters = [project.mapLayer(i) for i in depth_config.raster_layer_ids]
+    layers = expand_rasters([l for l in rasters if l is not None])
+    layers += [project.mapLayer(e.get('layer_id','')) for e in depth_config.contour_layers]
+    return VERSION + '|' + str(depth_config.mode) + '|' + str(depth_config.raster_band) + '|' + json.dumps(depth_config.contour_layers, sort_keys=True) + '|' + '|'.join(
+        layer_fingerprint(l) + json.dumps(layer_options(l), sort_keys=True) for l in layers if l is not None)
 
 
 def min_raster_cell_size_m(project: Optional[QgsProject], depth_config
@@ -126,38 +127,11 @@ def min_raster_cell_size_m(project: Optional[QgsProject], depth_config
     the layer's extent centre (a sampling-step choice, not a measurement).
     Returns None when no usable raster is configured (e.g. contours only).
     """
-    import math
-
+    from ..bathymetry_sampling import native_cell_m, expand_rasters
     project = project or QgsProject.instance()
-    best: Optional[float] = None
-    for layer_id in getattr(depth_config, "raster_layer_ids", []) or []:
-        layer = project.mapLayer(layer_id)
-        if not isinstance(layer, QgsRasterLayer) or not layer.isValid():
-            continue
-        try:
-            upp_x = abs(float(layer.rasterUnitsPerPixelX()))
-            upp_y = abs(float(layer.rasterUnitsPerPixelY()))
-        except Exception:
-            continue
-        if upp_x <= 0 and upp_y <= 0:
-            continue
-        try:
-            geographic = layer.crs().isGeographic()
-        except Exception:
-            geographic = False
-        if geographic:
-            try:
-                lat = math.radians(layer.extent().center().y())
-            except Exception:
-                lat = 0.0
-            candidates = [upp_x * 111320.0 * max(math.cos(lat), 0.087),
-                          upp_y * 110540.0]
-        else:
-            candidates = [upp_x, upp_y]
-        cell = min(c for c in candidates if c > 0)
-        if best is None or cell < best:
-            best = cell
-    return best
+    layers = [project.mapLayer(i) for i in depth_config.raster_layer_ids]
+    return min((native_cell_m(l) for l in expand_rasters(
+        [l for l in layers if isinstance(l,QgsRasterLayer) and l.isValid()])), default=None)
 
 
 def rpl_fingerprint(rpl_row: Optional[Dict], gpkg_path: str = "") -> str:
@@ -629,8 +603,10 @@ def _ensure_layer(project: QgsProject, gpkg_path: str, layer_name: str,
     layer = QgsVectorLayer(gpkg_layer_uri(gpkg_path, layer_name), layer_name, "ogr")
     if not layer.isValid():
         return None
-    group = (plan_group(project, plan) if plan else None) \
-        or burial_group(project)
+    group = plan_group(project, plan) if plan else None
+    # QGIS 4 makes empty layer-tree groups false; they are still valid groups.
+    if group is None:
+        group = burial_group(project)
     project.addMapLayer(layer, False)
     group.addLayer(layer)
     try:

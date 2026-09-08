@@ -10,11 +10,13 @@ from qgis.core import (
     QgsDistanceArea, QgsFeatureRequest, QgsCoordinateTransform,
     QgsCoordinateReferenceSystem, QgsSpatialIndex, QgsFeature
 )
-from .qgis_compat import SIZE_POLICY_EXPANDING, GEOMETRY_POINT, GEOMETRY_LINE
+from .qgis_compat import SIZE_POLICY_EXPANDING, GEOMETRY_POINT, GEOMETRY_LINE, MESSAGE_INFO, MESSAGE_WARNING, MESSAGE_CRITICAL
 from qgis.gui import QgsVertexMarker, QgsRubberBand
 from .maptools.temp_line_maptool import TempLineMapTool  # new temporary line drawing tool
 from .kp_range_utils import make_distance_area
+from .bathymetry_sampling import RasterSampler, expand_rasters, layer_options, normalise_depth, metres_per_unit, configure_layers
 from .slope_utils import (
+    supported_slopes, clean_crossings, interpolate_covered, cross_profile_metrics,
     contiguous_runs, interval_slope_series, ols_slope, windowed_slope_series,
 )
 
@@ -78,6 +80,7 @@ class DepthProfileDockWidget(QDockWidget):
         self.slope_pct = []
         # Side-slope (cross-profile) data
         self.side_slope_deg = []
+        self.side_local_max_deg = []
         self.side_slope_pct = []
         self.side_port_depth = []
         self.side_starboard_depth = []
@@ -157,6 +160,9 @@ class DepthProfileDockWidget(QDockWidget):
         self.source_type_combo.addItems(["Raster", "Contours"])
         self.source_type_combo.setMinimumWidth(80)
         source_row.addWidget(self.source_type_combo)
+        settings_btn = QPushButton("Source conventions…")
+        settings_btn.clicked.connect(lambda: configure_layers(self))
+        source_row.addWidget(settings_btn)
         source_row.addStretch()
         form_layout.addRow(source_row)
         
@@ -252,14 +258,14 @@ class DepthProfileDockWidget(QDockWidget):
         self.interpolate_contours_chk.setChecked(bool(self.settings.value("DepthProfile/interp_contours", True, type=bool)))
         options_row.addWidget(self.interpolate_contours_chk)
         # Side slope controls (cross-profile)
-        self.side_slope_chk = QCheckBox("Side Slope")
+        self.side_slope_chk = QCheckBox("Cross tilt / local max")
         self.side_slope_chk.setChecked(bool(self.settings.value("DepthProfile/side_slope_enabled", False, type=bool)))
         options_row.addWidget(self.side_slope_chk)
         options_row.addWidget(QLabel("Cross Search (m):"))
         self.side_slope_search_spin = QSpinBox()
         self.side_slope_search_spin.setRange(1, 50000)
         self.side_slope_search_spin.setValue(int(self.settings.value("DepthProfile/side_slope_search_m", 200)))
-        self.side_slope_search_spin.setToolTip("Maximum distance to search to port/starboard for side slope (half-width).")
+        self.side_slope_search_spin.setToolTip("Cross-profile half-width in metres. Endpoint tilt needs complete coverage; local maximum is reported separately. Contours search twice this distance for endpoint brackets.")
         options_row.addWidget(self.side_slope_search_spin)
         self.side_slope_plot_chk = QCheckBox("Plot Side")
         self.side_slope_plot_chk.setChecked(bool(self.settings.value("DepthProfile/side_slope_plot", True, type=bool)))
@@ -268,12 +274,10 @@ class DepthProfileDockWidget(QDockWidget):
         self.slope_window_spin = QSpinBox()
         self.slope_window_spin.setRange(0, 100000)
         self.slope_window_spin.setValue(int(self.settings.value("DepthProfile/slope_window_m", 0)))
+        self.slope_window_spin.setSpecialValueText("Automatic (native resolution)")
         self.slope_window_spin.setToolTip(
-            "Slope evaluation length in metres (shared engine): 0 measures "
-            "each sampling interval; a value evaluates a central difference "
-            "over ± half this window at every station — e.g. a plough "
-            "bearing length, or ≥ the raster cell size to stop coarse-grid "
-            "staircase spikes. Windows never bridge no-data gaps.")
+            "0: automatic native-resolution baseline (contours use exact crossing intervals). "
+            "A positive length is a fixed physical baseline in metres. Unsupported windows, gaps and source seams give no slope.")
         options_row.addWidget(self.slope_window_spin)
         options_row.addStretch()
         form_layout.addRow(options_row)
@@ -903,9 +907,10 @@ class DepthProfileDockWidget(QDockWidget):
             try:
                 self._compute_side_slopes_with_progress()
             except Exception as e:
-                self.iface.messageBar().pushMessage("Depth Profile", f"Side slope failed: {e}", level=1, duration=6)
+                self.iface.messageBar().pushMessage("Depth Profile", f"Side slope failed: {e}", level=MESSAGE_WARNING, duration=6)
         else:
             self.side_slope_deg = []
+            self.side_local_max_deg = []
             self.side_slope_pct = []
             self.side_port_depth = []
             self.side_starboard_depth = []
@@ -942,14 +947,16 @@ class DepthProfileDockWidget(QDockWidget):
                 try:
                     if 'deg' in slope_unit:
                         y_side = self.side_slope_deg
-                        side_label = 'Side Slope (deg)'
+                        side_label = 'Cross tilt (deg)'
                     else:
                         y_side = self.side_slope_pct
-                        side_label = 'Side Slope (%)'
+                        side_label = 'Cross tilt (%)'
                     if y_side and len(y_side) == len(x_vals):
                         y_side_clean = [np.nan if v is None else v for v in y_side]
                         if any(not np.isnan(v) for v in y_side_clean):
                             ax_slope.plot(x_vals, y_side_clean, color='tab:green', alpha=0.9, label=side_label)
+                        if self.side_local_max_deg:
+                            ax_slope.plot(x_vals,[np.nan if v is None else (v if 'deg' in slope_unit else 100*math.tan(math.radians(v))) for v in self.side_local_max_deg], color='tab:red',linestyle=':',label='Max local cross slope')
                 except Exception:
                     pass
             ax_slope.set_ylabel(slope_label); ax_slope.set_xlabel("KP (km)")
@@ -961,9 +968,9 @@ class DepthProfileDockWidget(QDockWidget):
                 plan_len = self.line_length
                 seabed_len = self.seabed_length
                 if plan_len and seabed_len:
-                    delta = seabed_len - plan_len
-                    ratio = seabed_len / plan_len if plan_len > 0 else 0
-                    ax_depth.set_title(f"Plan: {plan_len:,.1f} m | Seabed: {seabed_len:,.1f} m (Δ {delta:,.1f} m, {ratio:,.3f}x)")
+                    delta = seabed_len - self.seabed_covered_m
+                    ratio = seabed_len / self.seabed_covered_m if self.seabed_covered_m > 0 else 0
+                    ax_depth.set_title(f"Plan: {plan_len:,.1f} m | Covered plan: {self.seabed_covered_m:,.1f} m | Seabed: {seabed_len:,.1f} m (Δ {delta:,.1f} m, {ratio:,.3f}x)")
             except Exception:
                 pass
             try: self.figure.tight_layout()
@@ -1001,18 +1008,20 @@ class DepthProfileDockWidget(QDockWidget):
                 if "Slope" in var:
                     if "deg" in var:
                         y_side = self.side_slope_deg
-                        side_label = 'Side Slope (deg)'
+                        side_label = 'Cross tilt (deg)'
                     else:
                         y_side = self.side_slope_pct
-                        side_label = 'Side Slope (%)'
+                        side_label = 'Cross tilt (%)'
                     if y_side and len(y_side) == len(x_vals):
                         y_side_clean = [np.nan if v is None else v for v in y_side]
                         if any(not np.isnan(v) for v in y_side_clean):
                             ax.plot(x_vals, y_side_clean, color='tab:green', alpha=0.9, label=side_label)
+                            if self.side_local_max_deg:
+                                ax.plot(x_vals, [np.nan if v is None else (v if 'deg' in side_label else 100*math.tan(math.radians(v))) for v in self.side_local_max_deg], color='tab:orange', linestyle=':', label='Max local cross slope')
             except Exception:
                 pass
         ax.set_xlabel("KP (km)"); ax.grid(True); ax.legend()
-        ax.set_title(f"Route Length (plan): {self.line_length:,.1f} m | Seabed Length (3D): {self.seabed_length:,.1f} m")
+        ax.set_title(f"Plan: {self.line_length:,.1f} m | Covered plan: {self.seabed_covered_m:,.1f} m | Sampled seabed: {self.seabed_length:,.1f} m")
         try: self.figure.tight_layout()
         except Exception: pass
         self.canvas.draw()
@@ -1026,6 +1035,12 @@ class DepthProfileDockWidget(QDockWidget):
         plus the composite series (dashed) that slope and seabed length derive from.
         Otherwise a single composite line is drawn, as before.
         """
+        valid = [v for v in self.depth_values if v is not None]
+        if valid:
+            floor = max(valid) + max(.1, (max(valid)-min(valid))*.05)
+            for a,b in contiguous_runs([kp*1000 for kp in self.kp_values],self.depth_values,
+                                       group_ids=getattr(self,'depth_source_ids',None) or None):
+                ax.fill_between(x_vals[a:b+1],self.depth_values[a:b+1],floor,color='steelblue',alpha=.12)
         plottable = []
         for idx, s in enumerate(getattr(self, 'raster_series', None) or []):
             if len(s['depths']) != len(x_vals):
@@ -1059,43 +1074,26 @@ class DepthProfileDockWidget(QDockWidget):
         """
         self.sampled_xyz = []
         self.seabed_length = 0.0
+        self.seabed_covered_m = 0.0
         self.seabed_elongation_ratio = None
         if not self.kp_values or not self.depth_values:
             return
-        # Collect valid consecutive samples
-        pts = []  # (QgsPointXY, depth)
-        for i, kp in enumerate(self.kp_values):
-            if i >= len(self.depth_values):
-                break
-            depth_val = self.depth_values[i]
-            if depth_val is None:
-                continue
-            geom = self._interpolate_point(kp * 1000.0)
-            if not geom or geom.isEmpty():
-                continue
-            pts.append((geom.asPoint(), float(depth_val)))
-        if len(pts) < 2:
-            return
-        total = 0.0
-        for (p0, z0), (p1, z1) in zip(pts[:-1], pts[1:]):
-            try:
-                plan = self.distance_area.measureLine(p0, p1)
-            except Exception:
-                # fallback Euclidean in layer units
-                dx = p1.x()-p0.x(); dy = p1.y()-p0.y(); plan = math.hypot(dx, dy)
-            dz = (z1 - z0)
-            seg_3d = math.sqrt(plan*plan + dz*dz)
-            total += seg_3d
-            self.sampled_xyz.append((p0.x(), p0.y(), z0))
-        # append last point
-        last_pt, last_z = pts[-1]
-        self.sampled_xyz.append((last_pt.x(), last_pt.y(), last_z))
-        self.seabed_length = total
-        if self.line_length > 0:
-            try:
-                self.seabed_elongation_ratio = self.seabed_length / self.line_length
-            except Exception:
-                pass
+        x_m = [kp * 1000 for kp in self.kp_values]
+        sources = getattr(self, 'depth_source_ids', None) or None
+        self.seabed_covered_m = 0.0
+        for a, b in contiguous_runs(x_m, self.depth_values, group_ids=sources):
+            for i in range(a, b + 1):
+                point = self._interpolate_point(x_m[i])
+                if point and not point.isEmpty():
+                    pt = point.asPoint()
+                    self.sampled_xyz.append((pt.x(), pt.y(), self.depth_values[i]))
+                if i == a:
+                    continue
+                horizontal = x_m[i] - x_m[i - 1]
+                self.seabed_covered_m += horizontal
+                self.seabed_length += math.hypot(horizontal, self.depth_values[i] - self.depth_values[i - 1])
+        if self.seabed_covered_m > 0:
+            self.seabed_elongation_ratio = self.seabed_length / self.seabed_covered_m
         self.connect_canvas_events()
         if self.show_tooltips_chk.isChecked():
             self.enable_tooltips()
@@ -1126,7 +1124,12 @@ class DepthProfileDockWidget(QDockWidget):
             return
 
         line_crs = self.current_line_crs if self.current_line_crs else raster_layers[0].crs()
-        raster_sources = self._prepare_raster_sources(line_crs, raster_layers)
+        try:
+            raster_sources = self._prepare_raster_sources(line_crs, raster_layers)
+        except (ValueError, OSError) as exc:
+            ax.set_title("Bathymetry source unavailable")
+            self.iface.messageBar().pushMessage("Depth Profile", str(exc), level=MESSAGE_CRITICAL, duration=10)
+            return
         if not raster_sources:
             ax.set_title("Select valid raster layer(s)")
             return
@@ -1148,14 +1151,14 @@ class DepthProfileDockWidget(QDockWidget):
                     self.iface.messageBar().pushMessage(
                         "Depth Profile",
                         f"Auto limit: minimum step raised {min_step_m}m -> {new_min_step}m (expected {expected_samples:,} > max {max_samples:,}).",
-                        level=1, duration=7
+                        level=MESSAGE_WARNING, duration=7
                     )
                     min_step_m = new_min_step
             else:
                 self.iface.messageBar().pushMessage(
                     "Depth Profile",
                     f"Warning: high sample count ({expected_samples:,}) exceeds max preference ({max_samples:,}) but Auto Limit is off.",
-                    level=1, duration=8
+                    level=MESSAGE_WARNING, duration=8
                 )
         # Quick envelope overlap test (rough): if route bbox doesn't intersect ANY selected raster extent, early exit.
         try:
@@ -1188,7 +1191,7 @@ class DepthProfileDockWidget(QDockWidget):
                             break
                     if not any_overlap:
                         ax.set_title("Route outside raster extent")
-                        self.iface.messageBar().pushMessage("Depth Profile", "Selected route does not overlap any selected raster extent.", level=1, duration=6)
+                        self.iface.messageBar().pushMessage("Depth Profile", "Selected route does not overlap any selected raster extent.", level=MESSAGE_WARNING, duration=6)
                         return
         except Exception:
             pass
@@ -1199,6 +1202,7 @@ class DepthProfileDockWidget(QDockWidget):
         # never evaluated across a change of source, so a vertical-datum
         # offset between two rasters cannot read as a slope spike.
         self.depth_source_ids = []
+        self.depth_cell_m = []
         self.raster_series = []
         dist = 0.0
         valid_count = 0
@@ -1252,7 +1256,8 @@ class DepthProfileDockWidget(QDockWidget):
             self.kp_values.append(dist / 1000.0)
             self.depth_values.append(val)
             self.depth_source_ids.append(
-                src_used['layer'].id() if src_used is not None else None)
+                src_used['sampler'].source_id if src_used is not None else None)
+            self.depth_cell_m.append(src_used['cell_m'] if src_used else None)
 
             # Step: fixed or adaptive based on raster resolution at this station.
             if adaptive:
@@ -1282,7 +1287,8 @@ class DepthProfileDockWidget(QDockWidget):
                 self.kp_values.append(self.line_length / 1000.0)
                 self.depth_values.append(val)
                 self.depth_source_ids.append(
-                    src_used['layer'].id() if src_used is not None else None)
+                    src_used['sampler'].source_id if src_used is not None else None)
+                self.depth_cell_m.append(src_used['cell_m'] if src_used else None)
         if per_raster:
             self.raster_series = [
                 {'name': src['layer'].name(), 'depths': per_raster_depths[i]}
@@ -1292,7 +1298,7 @@ class DepthProfileDockWidget(QDockWidget):
         try:
             if valid_count == 0 and self.kp_values:
                 self.iface.messageBar().pushMessage(
-                    "Depth Profile", "No raster coverage along selected route (all samples null).", level=1, duration=6)
+                    "Depth Profile", "No raster coverage along selected route (all samples null).", level=MESSAGE_WARNING, duration=6)
                 ax.set_title("No raster coverage along route")
             elif valid_count > 0 and self.depth_values:
                 ratio = valid_count / float(len(self.depth_values))
@@ -1300,7 +1306,7 @@ class DepthProfileDockWidget(QDockWidget):
                     self.iface.messageBar().pushMessage(
                         "Depth Profile",
                         f"Partial raster coverage: {ratio*100:.1f}% of samples valid ({missing_count:,} missing).",
-                        level=1, duration=7)
+                        level=MESSAGE_WARNING, duration=7)
         except Exception:
             pass
 
@@ -1321,39 +1327,13 @@ class DepthProfileDockWidget(QDockWidget):
         Returns a float, or None when the point is outside the raster, the read
         fails, or the value is nodata/NaN.
         """
-        provider = src.get('provider')
-        extent = src.get('extent')
-        transform = src.get('transform')
-        nodata = src.get('nodata')
-        sample_pt = QgsPointXY(point_xy_line_crs.x(), point_xy_line_crs.y())
-        if transform:
+        point = QgsPointXY(point_xy_line_crs)
+        if src.get('transform'):
             try:
-                sample_pt = transform.transform(sample_pt)
+                point = src['transform'].transform(point)
             except Exception:
                 return None
-        try:
-            if extent and (sample_pt.x() < extent.xMinimum() or sample_pt.x() > extent.xMaximum() or sample_pt.y() < extent.yMinimum() or sample_pt.y() > extent.yMaximum()):
-                return None
-        except Exception:
-            pass
-        try:
-            sample, ok = provider.sample(sample_pt, 1)
-        except Exception:
-            return None
-        if not ok:
-            return None
-        try:
-            val = float(sample)
-        except Exception:
-            return None
-        try:
-            if nodata is not None and float(nodata) == val:
-                return None
-        except Exception:
-            pass
-        if np.isnan(val):
-            return None
-        return val
+        return src['sampler'].sample(point)
 
     def _sample_all_rasters_at_point(self, point_xy_line_crs, raster_sources):
         """Sample every raster source at a point in line CRS.
@@ -1399,7 +1379,7 @@ class DepthProfileDockWidget(QDockWidget):
     def _prepare_raster_sources(self, line_crs, raster_layers):
         """Prepare per-raster provider/extent/transform/nodata for fast repeated sampling."""
         sources = []
-        for raster_layer in (raster_layers or []):
+        for raster_layer in expand_rasters(raster_layers or []):
             if not raster_layer or not isinstance(raster_layer, QgsRasterLayer):
                 continue
             provider = raster_layer.dataProvider()
@@ -1411,7 +1391,7 @@ class DepthProfileDockWidget(QDockWidget):
                 try:
                     transform = QgsCoordinateTransform(line_crs, raster_crs, QgsProject.instance())
                 except Exception:
-                    transform = None
+                    continue
             nodata = None
             try:
                 if provider.sourceHasNoDataValue(1):
@@ -1419,37 +1399,10 @@ class DepthProfileDockWidget(QDockWidget):
             except Exception:
                 nodata = None
 
-            # Approximate raster resolution for overlap preference.
-            # For projected CRSs with meter-ish units this is close to m².
-            # For geographic CRSs, we convert pixel size to meters at raster center.
-            pixel_area_m2 = None
-            try:
-                rupx = float(raster_layer.rasterUnitsPerPixelX())
-                rupy = float(raster_layer.rasterUnitsPerPixelY())
-                # Some rasters report negative y pixel size
-                rupx = abs(rupx)
-                rupy = abs(rupy)
-                if rupx > 0 and rupy > 0:
-                    if raster_crs.isGeographic():
-                        # Convert degrees to meters at raster center using ellipsoidal measurement.
-                        da = make_distance_area(
-                            raster_crs, QgsProject.instance().transformContext()
-                        )
-                        c = raster_layer.extent().center()
-                        p0 = QgsPointXY(c.x(), c.y())
-                        px = QgsPointXY(c.x() + rupx, c.y())
-                        py = QgsPointXY(c.x(), c.y() + rupy)
-                        dx_m = float(da.measureLine(p0, px))
-                        dy_m = float(da.measureLine(p0, py))
-                        if dx_m > 0 and dy_m > 0:
-                            pixel_area_m2 = dx_m * dy_m
-                    else:
-                        # Best-effort: assumes CRS units are meters (common for bathy)
-                        pixel_area_m2 = rupx * rupy
-            except Exception:
-                pixel_area_m2 = None
+            sampler = RasterSampler(raster_layer)
+            pixel_area_m2 = sampler.cell_m ** 2
             sources.append({
-                'layer': raster_layer,
+                'layer': raster_layer, 'sampler': sampler, 'cell_m': sampler.cell_m,
                 'provider': provider,
                 'extent': raster_layer.extent(),
                 'transform': transform,
@@ -1540,6 +1493,7 @@ class DepthProfileDockWidget(QDockWidget):
         line_crs = self.current_line_crs if self.current_line_crs else contour_layers[0].crs()
         
         for layer_idx, contour_layer in enumerate(contour_layers):
+            options = layer_options(contour_layer)
             depth_field = depth_fields[layer_idx]
             contour_crs = contour_layer.crs()
             transform_contour_to_line = None
@@ -1562,7 +1516,9 @@ class DepthProfileDockWidget(QDockWidget):
                 if inter.isEmpty():
                     continue
                 try:
-                    depth_val = float(feat[depth_field])
+                    depth_val = normalise_depth(feat[depth_field], options)
+                    if depth_val is None:
+                        continue
                 except Exception:
                     continue
                 points = []
@@ -1597,22 +1553,13 @@ class DepthProfileDockWidget(QDockWidget):
         if not kps:
             ax.set_title("No contour intersections")
             return
-        pairs = sorted(zip(kps, depths))
+        pairs = clean_crossings(zip(kps, depths), tolerance=1e-9)
         self.kp_values = [p[0] for p in pairs]
         self.depth_values = [p[1] for p in pairs]
-        self.depth_source_ids = []   # contour profile: single merged source
-        if self.interpolate_contours_chk.isChecked() and len(self.kp_values) >= 2:
-            # Resample only BETWEEN the bracketing crossings: contour
-            # bathymetry does not exist before the first or after the last
-            # crossing, and starting the resample at KP 0 used to clamp-fill
-            # the run-in with a fabricated flat depth.
-            first_kp = self.kp_values[0]
-            total_kp = self.kp_values[-1]
-            sample_count = min(1000, max(50, int((total_kp - first_kp) * 20)))
-            new_kp = np.linspace(first_kp, total_kp, sample_count)
-            new_depth = np.interp(new_kp, self.kp_values, self.depth_values)
-            self.kp_values = list(new_kp)
-            self.depth_values = list(new_depth)
+        self.depth_source_ids = []
+        self.depth_cell_m = []
+        # Exact intersections define the linear profile. The plotting line
+        # already interpolates between vertices; resampling loses detail.
 
     # ---------------------- Geometry helpers ----------------------
     def _interpolate_point(self, distance_m):
@@ -1697,9 +1644,7 @@ class DepthProfileDockWidget(QDockWidget):
         the plugin-wide up-slope-positive sign is applied, so sources that
         store seabed as negative elevation need their differences flipped.
         """
-        from .maptools.kp_profile_math import should_invert_depth_axis
-        positive_down = should_invert_depth_axis(self.depth_values or [])
-        return -1.0 if positive_down is False else 1.0
+        return 1.0  # shared sampler normalises all sources to positive-down metres
 
     def _compute_slopes(self):
         self.slope_deg = []
@@ -1727,15 +1672,13 @@ class DepthProfileDockWidget(QDockWidget):
 
         if len(self.kp_values) < 2:
             return
-        datum_sign = self._datum_sign()
         invert = self.invert_slope_chk.isChecked()
         window_m = float(self.slope_window_spin.value())
         self.settings.setValue("DepthProfile/slope_window_m", int(window_m))
         # Station slope from the shared engine, per contiguous run of valid
         # stations (no-data gaps are never bridged). +ve = shoaling with
-        # increasing KP (plugin-wide convention); window 0 = per sampling
-        # interval, a value = central difference over ± window/2.
-        positive_down = datum_sign > 0
+        # increasing KP. Zero selects native-resolution automatic baselines;
+        # positive lengths require the full supported physical window.
         x_m = [kp * 1000.0 for kp in self.kp_values]
         station_slope = [None] * len(self.kp_values)
         # Runs also break where the supplying raster changes (when the
@@ -1744,19 +1687,9 @@ class DepthProfileDockWidget(QDockWidget):
         source_ids = getattr(self, 'depth_source_ids', None)
         if not source_ids or len(source_ids) != len(self.kp_values):
             source_ids = None
-        for run_start, run_end in contiguous_runs(x_m, self.depth_values,
-                                                  group_ids=source_ids):
-            run_x = x_m[run_start:run_end + 1]
-            run_y = [float(v) for v in self.depth_values[run_start:run_end + 1]]
-            if window_m > 0:
-                vals = windowed_slope_series(
-                    run_x, run_y, window_m / 2.0,
-                    positive_down=positive_down, degenerate=None)
-            else:
-                vals = interval_slope_series(
-                    run_x, run_y, positive_down=positive_down)
-            for offset, value in enumerate(vals):
-                station_slope[run_start + offset] = value
+        station_slope, self.slope_baseline_m = supported_slopes(
+            x_m, self.depth_values, getattr(self, 'depth_cell_m', None),
+            source_ids, window_m, positive_down=True)
         # First station has no preceding interval — no fabricated 0° value.
         self.slope_deg.append(
             None if station_slope[0] is None
@@ -1772,11 +1705,15 @@ class DepthProfileDockWidget(QDockWidget):
             slope_deg_i = None if raw is None else (-raw if invert else raw)
             slope_pct_i = (None if slope_deg_i is None
                            else 100.0 * math.tan(math.radians(slope_deg_i)))
-            if d_km <= 0 or v1 is None or v2 is None or slope_deg_i is None:
+            if d_km <= 0 or v1 is None or v2 is None:
                 self.slope_deg.append(slope_deg_i)
                 self.slope_pct.append(slope_pct_i)
                 continue
             horiz_m = d_km * 1000.0
+            if source_ids is not None and source_ids[i] != source_ids[i-1]:
+                self.slope_deg.append(slope_deg_i)
+                self.slope_pct.append(slope_pct_i)
+                continue
             vertical = v2 - v1
             self.slope_deg.append(slope_deg_i)
             self.slope_pct.append(slope_pct_i)
@@ -1877,6 +1814,7 @@ class DepthProfileDockWidget(QDockWidget):
         # Reset arrays
         n = len(self.kp_values)
         self.side_slope_deg = [None] * n
+        self.side_local_max_deg = [None] * n
         self.side_slope_pct = [None] * n
         self.side_port_depth = [None] * n
         self.side_starboard_depth = [None] * n
@@ -1895,19 +1833,19 @@ class DepthProfileDockWidget(QDockWidget):
         if mode == "Contours":
             contour_index, contour_data = self._build_combined_contour_index_for_side_slope()
             if contour_index is None or contour_data is None:
-                self.iface.messageBar().pushMessage("Depth Profile", "Side slope: no contour data available.", level=1, duration=5)
+                self.iface.messageBar().pushMessage("Depth Profile", "Side slope: no contour data available.", level=MESSAGE_WARNING, duration=5)
                 return
 
         raster_sources = None
         if mode == "Raster":
             raster_layers = self._get_selected_raster_layers() if hasattr(self, '_get_selected_raster_layers') else []
             if not raster_layers:
-                self.iface.messageBar().pushMessage("Depth Profile", "Side slope: select one or more raster layers.", level=1, duration=5)
+                self.iface.messageBar().pushMessage("Depth Profile", "Side slope: select one or more raster layers.", level=MESSAGE_WARNING, duration=5)
                 return
             line_crs = self.current_line_crs if self.current_line_crs else raster_layers[0].crs()
             raster_sources = self._prepare_raster_sources(line_crs, raster_layers)
             if not raster_sources:
-                self.iface.messageBar().pushMessage("Depth Profile", "Side slope: select valid raster layer(s).", level=1, duration=5)
+                self.iface.messageBar().pushMessage("Depth Profile", "Side slope: select valid raster layer(s).", level=MESSAGE_WARNING, duration=5)
                 return
 
         # Tangent sampling distance (meters along route) - tie to station spacing for stability
@@ -1935,7 +1873,7 @@ class DepthProfileDockWidget(QDockWidget):
         # Compute side slope station-by-station
         for i, kp in enumerate(self.kp_values):
             if progress.wasCanceled():
-                self.iface.messageBar().pushMessage("Depth Profile", "Side slope canceled.", level=1, duration=4)
+                self.iface.messageBar().pushMessage("Depth Profile", "Side slope canceled.", level=MESSAGE_WARNING, duration=4)
                 break
 
             if i % 25 == 0:
@@ -1990,115 +1928,49 @@ class DepthProfileDockWidget(QDockWidget):
                         continue
                     ux = dx / mag; uy = dy / mag
                     # Starboard (right) normal: rotate clockwise
-                    nx = uy
-                    ny = -ux
+                    nx = uy / metres_per_unit(self.current_line_crs)
+                    ny = -ux / metres_per_unit(self.current_line_crs)
                     port_pt = QgsPointXY(center.x() - nx * search_m, center.y() - ny * search_m)
                     stbd_pt = QgsPointXY(center.x() + nx * search_m, center.y() + ny * search_m)
 
                 if mode == "Raster":
-                    if not raster_sources:
-                        continue
-                    # Sample across transect and fit depth = a + b*t, where t is cross distance (+ starboard).
-                    offsets = np.linspace(-search_m, search_m, cross_sample_count)
-                    t_vals = []
-                    z_vals = []
-                    port_z = None
-                    stbd_z = None
-
+                    cell = max((src['cell_m'] for src in raster_sources), default=1)
+                    # Resolve local features at native resolution, bounded for UI responsiveness.
+                    count = max(11, min(2001, int(math.ceil(2 * search_m / max(cell, .1))) + 1))
+                    offsets = list(np.linspace(-search_m, search_m, count))
+                    z_vals, cells, sources = [], [], []
                     for t in offsets:
                         if is_geo:
-                            # Move along the normal geodesically by |t|.
-                            if normal_bearing is None:
-                                continue
-                            try:
-                                if t >= 0:
-                                    pt = self.distance_area.computeSpheroidProject(QgsPointXY(center.x(), center.y()), float(t), normal_bearing)
-                                else:
-                                    pt = self.distance_area.computeSpheroidProject(QgsPointXY(center.x(), center.y()), float(-t), normal_bearing + math.pi)
-                            except Exception:
-                                continue
+                            pt = self.distance_area.computeSpheroidProject(
+                                QgsPointXY(center), abs(float(t)),
+                                normal_bearing if t >= 0 else normal_bearing + math.pi)
                         else:
-                            pt = QgsPointXY(center.x() + nx * float(t), center.y() + ny * float(t))
-                        # Use first raster with valid data at this point
-                        z = self._sample_rasters_at_point(pt, raster_sources)
-                        if z is None:
-                            continue
-                        t_vals.append(float(t))
-                        z_vals.append(float(z))
-                        if abs(t + search_m) < 1e-6:
-                            port_z = float(z)
-                        if abs(t - search_m) < 1e-6:
-                            stbd_z = float(z)
-
-                    if len(t_vals) < 2:
-                        continue
-
-                    b = self._ols_slope(t_vals, z_vals)
-                    if b is None:
-                        continue
-
-                    # Prefer endpoint samples if available; otherwise predict from fit.
-                    a = self._ols_intercept(t_vals, z_vals, b)
-                    if a is None:
-                        a = 0.0
-                    if port_z is None:
-                        port_z = a + b * (-search_m)
-                    if stbd_z is None:
-                        stbd_z = a + b * (search_m)
-
-                    span = 2.0 * search_m
-                    b_deepening = datum_sign * float(b)  # +ve = deeper to stbd
-                    slope_rad = math.atan2(b_deepening, 1.0)  # b = dz/dt
-
-                    self.side_port_depth[i] = float(port_z)
-                    self.side_starboard_depth[i] = float(stbd_z)
-                    self.side_cross_span_m[i] = span
-                    self.side_slope_deg[i] = math.degrees(slope_rad)
-                    self.side_slope_pct[i] = 100.0 * b_deepening
+                            pt = QgsPointXY(center.x() + nx * t, center.y() + ny * t)
+                        z, src = self._sample_rasters_at_point_with_source(pt, raster_sources)
+                        z_vals.append(z)
+                        cells.append(src['cell_m'] if src else None)
+                        sources.append(src['sampler'].source_id if src else None)
                 else:
-                    # Contours: collect all intersections along transect and fit depth vs signed distance.
+                    if is_geo:
+                        port_pt = self.distance_area.computeSpheroidProject(QgsPointXY(center), 2*search_m, normal_bearing + math.pi)
+                        stbd_pt = self.distance_area.computeSpheroidProject(QgsPointXY(center), 2*search_m, normal_bearing)
+                    else:
+                        port_pt = QgsPointXY(center.x()-nx*2*search_m, center.y()-ny*2*search_m)
+                        stbd_pt = QgsPointXY(center.x()+nx*2*search_m, center.y()+ny*2*search_m)
                     transect = QgsGeometry.fromPolylineXY([port_pt, stbd_pt])
                     hits = self._contour_intersections(transect, center, nx, ny, contour_index, contour_data)
-                    if not hits:
-                        continue
-
-                    # Reduce duplicates: for same depth, keep the closest-to-center hit per side.
-                    best_by_depth_side = {}
-                    for t, z, px, py in hits:
-                        side = 1 if t > 0 else (-1 if t < 0 else 0)
-                        if side == 0:
-                            continue
-                        key = (side, float(z))
-                        abs_t = abs(float(t))
-                        prev = best_by_depth_side.get(key)
-                        if prev is None or abs_t < prev[0]:
-                            best_by_depth_side[key] = (abs_t, float(t), float(z))
-                    pairs = [(v[1], v[2]) for v in best_by_depth_side.values()]
-
-                    if len(pairs) < 2:
-                        continue
-
-                    t_vals = [p[0] for p in pairs]
-                    z_vals = [p[1] for p in pairs]
-                    b = self._ols_slope(t_vals, z_vals)
-                    if b is None:
-                        continue
-                    a = self._ols_intercept(t_vals, z_vals, b)
-                    if a is None:
-                        a = 0.0
-
-                    # Determine representative port/stbd depths at the transect ends.
-                    port_z = a + b * (-search_m)
-                    stbd_z = a + b * (search_m)
-                    span = 2.0 * search_m
-
-                    b_deepening = datum_sign * float(b)  # +ve = deeper to stbd
-                    slope_rad = math.atan2(b_deepening, 1.0)
-                    self.side_port_depth[i] = float(port_z)
-                    self.side_starboard_depth[i] = float(stbd_z)
-                    self.side_cross_span_m[i] = span
-                    self.side_slope_deg[i] = math.degrees(slope_rad)
-                    self.side_slope_pct[i] = 100.0 * b_deepening
+                    pairs = clean_crossings((t, z) for t, z, _x, _y in hits)
+                    offsets = [t for t, z in pairs]
+                    z_vals = [z for t, z in pairs]
+                    cells = sources = None
+                tilt, peak, port_z, stbd_z = cross_profile_metrics(
+                    offsets, z_vals, search_m, True, cells, sources)
+                self.side_slope_deg[i] = tilt
+                self.side_local_max_deg[i] = peak
+                self.side_slope_pct[i] = None if tilt is None else 100 * math.tan(math.radians(tilt))
+                self.side_port_depth[i] = port_z
+                self.side_starboard_depth[i] = stbd_z
+                self.side_cross_span_m[i] = 2 * search_m if tilt is not None else None
             except Exception:
                 continue
 
@@ -2168,6 +2040,7 @@ class DepthProfileDockWidget(QDockWidget):
         next_id = 1
 
         for layer_idx, layer in enumerate(contour_layers):
+            options = layer_options(layer)
             depth_field = depth_fields[layer_idx]
             transform = None
             if layer.crs() != line_crs:
@@ -2187,7 +2060,9 @@ class DepthProfileDockWidget(QDockWidget):
                     depth_val = feat[depth_field]
                     if depth_val is None:
                         continue
-                    depth_f = float(depth_val)
+                    depth_f = normalise_depth(depth_val, options)
+                    if depth_f is None:
+                        continue
                 except Exception:
                     continue
 
@@ -2272,7 +2147,7 @@ class DepthProfileDockWidget(QDockWidget):
                     else:
                         vx = p.x() - cx
                         vy = p.y() - cy
-                        t = float(vx * nx + vy * ny)
+                        t = float(vx * nx + vy * ny) / (nx * nx + ny * ny)
                     out.append((t, float(depth), float(p.x()), float(p.y())))
                 except Exception:
                     continue
@@ -2463,6 +2338,7 @@ class DepthProfileDockWidget(QDockWidget):
         self.slope_deg = []
         self.slope_pct = []
         self.side_slope_deg = []
+        self.side_local_max_deg = []
         self.side_slope_pct = []
         self.side_port_depth = []
         self.side_starboard_depth = []
@@ -2526,9 +2402,9 @@ class DepthProfileDockWidget(QDockWidget):
                 except Exception: pass
             except Exception:
                 pass
-            self.iface.messageBar().pushMessage("Depth Profile", f"Temporary line captured ({len(points)} pts)", level=0, duration=3)
+            self.iface.messageBar().pushMessage("Depth Profile", f"Temporary line captured ({len(points)} pts)", level=MESSAGE_INFO, duration=3)
         def canceled():
-            self.iface.messageBar().pushMessage("Depth Profile", "Drawing canceled", level=1, duration=2)
+            self.iface.messageBar().pushMessage("Depth Profile", "Drawing canceled", level=MESSAGE_WARNING, duration=2)
         # Instantiate map tool (now expects iface for messaging) and activate
         self.temp_line_tool = TempLineMapTool(canvas, self.iface, finished, canceled)
         canvas.setMapTool(self.temp_line_tool)
@@ -2549,7 +2425,7 @@ class DepthProfileDockWidget(QDockWidget):
         except Exception:
             pass
         self.temp_line_rubber = None
-        self.iface.messageBar().pushMessage("Depth Profile", "Temporary line cleared", level=0, duration=2)
+        self.iface.messageBar().pushMessage("Depth Profile", "Temporary line cleared", level=MESSAGE_INFO, duration=2)
 
     def closeEvent(self, event):  # noqa
         self._closing = True
@@ -2596,7 +2472,7 @@ class DepthProfileDockWidget(QDockWidget):
           measurement settings match.
         """
         if not self.kp_values or not self.depth_values:
-            self.iface.messageBar().pushMessage("Depth Profile", "No profile data to export. Generate first.", level=1, duration=4)
+            self.iface.messageBar().pushMessage("Depth Profile", "No profile data to export. Generate first.", level=MESSAGE_WARNING, duration=4)
             return
 
         # Choose DXF units (persisted). Default to metres to match common CAD workflows.
@@ -2722,7 +2598,7 @@ class DepthProfileDockWidget(QDockWidget):
                 point_layers = []
 
             if not point_layers:
-                self.iface.messageBar().pushMessage("Depth Profile", "No point layers found in project for events export.", level=1, duration=5)
+                self.iface.messageBar().pushMessage("Depth Profile", "No point layers found in project for events export.", level=MESSAGE_WARNING, duration=5)
                 add_events = False
             else:
                 # Make names unique-ish for selection
@@ -2756,7 +2632,7 @@ class DepthProfileDockWidget(QDockWidget):
                 # Choose KP and label fields
                 field_names = [f.name() for f in event_layer.fields()]
                 if not field_names:
-                    self.iface.messageBar().pushMessage("Depth Profile", "Selected events layer has no fields.", level=1, duration=5)
+                    self.iface.messageBar().pushMessage("Depth Profile", "Selected events layer has no fields.", level=MESSAGE_WARNING, duration=5)
                     add_events = False
                 else:
                     kp_default = str(self.settings.value("DepthProfile/dxf_events_kp_field", field_names[0] if field_names else ""))
@@ -2883,7 +2759,7 @@ class DepthProfileDockWidget(QDockWidget):
         if current_x:
             segments.append((current_x, current_y))
         if not segments:
-            self.iface.messageBar().pushMessage("Depth Profile", "All depth values are null; nothing to export.", level=1, duration=4)
+            self.iface.messageBar().pushMessage("Depth Profile", "All depth values are null; nothing to export.", level=MESSAGE_WARNING, duration=4)
             return
 
         def _dxf_line_entity(x1, y1, x2, y2, layer="0"):
@@ -3044,23 +2920,26 @@ class DepthProfileDockWidget(QDockWidget):
             self.iface.messageBar().pushMessage(
                 "Depth Profile",
                 f"DXF exported ({units_hint}): {path} | X-axis: 1 km = {x_scale:.0f} {units_hint}",
-                level=0,
+                level=MESSAGE_INFO,
                 duration=7,
             )
         except Exception as e:
-            self.iface.messageBar().pushMessage("Depth Profile", f"Failed to write DXF: {e}", level=2, duration=6)
+            self.iface.messageBar().pushMessage("Depth Profile", f"Failed to write DXF: {e}", level=MESSAGE_CRITICAL, duration=6)
 
     def export_csv(self):
         """Export the current segment-based KP, Depth, and Slope data to a CSV file."""
         if not self.segment_kp_from:
-            self.iface.messageBar().pushMessage("Depth Profile", "No profile data to export. Generate first.", level=1, duration=4)
+            self.iface.messageBar().pushMessage("Depth Profile", "No profile data to export. Generate first.", level=MESSAGE_WARNING, duration=4)
             return
         path, _ = QFileDialog.getSaveFileName(self, "Save CSV", "depth_profile.csv", "CSV Files (*.csv)")
         if not path:
             return
         try:
-            with open(path, 'w', encoding='utf-8') as f:
-                f.write("KP_from (km),KP_to (km),Lat_from,Lon_from,Lat_to,Lon_to,Depth_from (m),Depth_to (m),Slope (deg),Slope (%),SideSlope (deg),SideSlope (%),PortDepth (m),StbdDepth (m),CrossSpan (m),Seabed_Length (m),Euclidean_Length (m)\n")
+            import csv
+            with open(path, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.writer(f)
+                station_by_kp = {round(kp,9): i for i,kp in enumerate(self.kp_values)}
+                f.write("KP_from (km),KP_to (km),Lat_from,Lon_from,Lat_to,Lon_to,Depth_from (m),Depth_to (m),Slope (deg),Slope (%),SideSlope (deg),SideSlope (%),PortDepth (m),StbdDepth (m),CrossSpan (m),Seabed_Length (m),Euclidean_Length (m),SlopeBaseline (m),MaxLocalCrossSlope (deg),DepthSource\n")
                 for kp_from, kp_to, lat_from, lon_from, lat_to, lon_to, depth_from, depth_to, slope_deg, slope_pct, side_deg, side_pct, port_z, stbd_z, span_m, seabed_len, euclidean_len in zip(
                     self.segment_kp_from, self.segment_kp_to, self.segment_lat_from, self.segment_lon_from, 
                     self.segment_lat_to, self.segment_lon_to, self.segment_depth_from, 
@@ -3088,7 +2967,16 @@ class DepthProfileDockWidget(QDockWidget):
                     span_str = f"{span_m:.3f}" if span_m is not None else ""
                     seabed_len_str = f"{seabed_len:.3f}" if seabed_len is not None else ""
                     euclidean_len_str = f"{euclidean_len:.3f}" if euclidean_len is not None else ""
-                    f.write(f"{kp_from_str},{kp_to_str},{lat_from_str},{lon_from_str},{lat_to_str},{lon_to_str},{depth_from_str},{depth_to_str},{slope_deg_str},{slope_pct_str},{side_deg_str},{side_pct_str},{port_z_str},{stbd_z_str},{span_str},{seabed_len_str},{euclidean_len_str}\n")
-            self.iface.messageBar().pushMessage("Depth Profile", f"CSV exported: {path}", level=0, duration=5)
+                    index = station_by_kp[round(kp_to,9)]
+                    widths = getattr(self, 'slope_baseline_m', [])
+                    peaks = getattr(self, 'side_local_max_deg', [])
+                    sources = getattr(self, 'depth_source_ids', [])
+                    writer.writerow([kp_from_str,kp_to_str,lat_from_str,lon_from_str,lat_to_str,lon_to_str,
+                        depth_from_str,depth_to_str,slope_deg_str,slope_pct_str,side_deg_str,side_pct_str,
+                        port_z_str,stbd_z_str,span_str,seabed_len_str,euclidean_len_str,
+                        widths[index] if index < len(widths) else None,
+                        peaks[index] if index < len(peaks) else None,
+                        sources[index] if index < len(sources) else 'contours'])
+            self.iface.messageBar().pushMessage("Depth Profile", f"CSV exported: {path}", level=MESSAGE_INFO, duration=5)
         except Exception as e:
-            self.iface.messageBar().pushMessage("Depth Profile", f"Failed to write CSV: {e}", level=2, duration=6)
+            self.iface.messageBar().pushMessage("Depth Profile", f"Failed to write CSV: {e}", level=MESSAGE_CRITICAL, duration=6)

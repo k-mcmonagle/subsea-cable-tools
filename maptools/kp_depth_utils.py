@@ -19,6 +19,7 @@ from qgis.core import (
     QgsSpatialIndex,
 )
 
+from ..bathymetry_sampling import RasterSampler, expand_rasters, layer_options, normalise_depth
 from ..kp_range_utils import make_distance_area
 from ..qgis_compat import GEOMETRY_LINE, LAYER_RASTER, LAYER_VECTOR
 
@@ -50,17 +51,19 @@ class DepthSampler:
         self.crs = crs
         self._rasters: List[Dict] = []
         self._contours: List[Dict] = []
+        self.errors = []
         for layer, field in (sources or []):
             if layer is None:
                 continue
             try:
                 if layer.type() == LAYER_RASTER:
-                    self._prepare_raster(layer)
+                    for native in expand_rasters([layer]):
+                        self._prepare_raster(native)
                 elif (layer.type() == LAYER_VECTOR
                       and layer.geometryType() == GEOMETRY_LINE and field):
                     self._prepare_contour(layer, field)
-            except Exception:
-                continue
+            except Exception as exc:
+                self.errors.append(str(exc))
 
     def has_sources(self) -> bool:
         return bool(self._rasters or self._contours)
@@ -90,35 +93,14 @@ class DepthSampler:
                 nodata = provider.sourceNoDataValue(1)
         except Exception:
             nodata = None
-        pixel_area = None
-        try:
-            units_x = abs(float(layer.rasterUnitsPerPixelX()))
-            units_y = abs(float(layer.rasterUnitsPerPixelY()))
-            if units_x > 0 and units_y > 0:
-                if layer.crs().isGeographic():
-                    area = make_distance_area(
-                        layer.crs(), QgsProject.instance().transformContext())
-                    center = layer.extent().center()
-                    dx = float(area.measureLine(
-                        QgsPointXY(center.x(), center.y()),
-                        QgsPointXY(center.x() + units_x, center.y())))
-                    dy = float(area.measureLine(
-                        QgsPointXY(center.x(), center.y()),
-                        QgsPointXY(center.x(), center.y() + units_y)))
-                    pixel_area = dx * dy if dx > 0 and dy > 0 else None
-                else:
-                    pixel_area = units_x * units_y
-        except Exception:
-            pixel_area = None
+        sampler = RasterSampler(layer)
         self._rasters.append({
-            "name": layer.name(), "provider": provider,
+            "name": layer.name(), "provider": provider, "sampler": sampler,
+            "source_id": sampler.source_id, "options": sampler.options,
             "extent": layer.extent(), "transform": self._transform_to(layer.crs()),
-            "nodata": nodata, "pixel_area": pixel_area,
+            "nodata": nodata, "pixel_area": sampler.cell_m ** 2,
         })
-        # Prefer higher resolution rasters (smaller pixels) for first-valid wins.
-        self._rasters.sort(key=lambda src: (
-            src.get("pixel_area") is None,
-            src.get("pixel_area") if src.get("pixel_area") is not None else float("inf")))
+        self._rasters.sort(key=lambda src: src['pixel_area'])
 
     def _prepare_contour(self, layer, field):
         field_index = layer.fields().lookupField(field)
@@ -127,6 +109,7 @@ class DepthSampler:
         index = QgsSpatialIndex(layer.getFeatures())
         self._contours.append({
             "name": layer.name(), "layer": layer, "field_index": field_index,
+            "options": layer_options(layer),
             "index": index, "transform": self._transform_to(layer.crs()),
             "back_transform": (
                 None if layer.crs() == self.crs else QgsCoordinateTransform(
@@ -134,7 +117,7 @@ class DepthSampler:
         })
 
     # -- point sampling ----------------------------------------------------
-    def _sample_raster(self, src, point: QgsPointXY) -> Optional[float]:
+    def _sample_raster(self, src, point: QgsPointXY, method=None) -> Optional[float]:
         sample_point = QgsPointXY(point)
         transform = src.get("transform")
         if transform is not None:
@@ -142,39 +125,13 @@ class DepthSampler:
                 sample_point = transform.transform(sample_point)
             except Exception:
                 return None
-        extent = src.get("extent")
-        try:
-            if extent is not None and not extent.contains(sample_point):
-                return None
-        except Exception:
-            pass
-        try:
-            value, ok = src["provider"].sample(sample_point, 1)
-        except Exception:
-            return None
-        if not ok:
-            return None
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            return None
-        nodata = src.get("nodata")
-        # Tolerant comparison: Float32 nodata values widened to double by the
-        # provider are not always bit-identical to sourceNoDataValue().
-        if nodata is not None and (
-                value == float(nodata)
-                or abs(value - float(nodata))
-                <= 1e-6 * max(1.0, abs(float(nodata)))):
-            return None
-        if math.isnan(value):
-            return None
-        return value
+        return src['sampler'].sample(sample_point, method)
 
     def _contour_value(self, src, feature_id) -> Optional[float]:
         try:
             feature = src["layer"].getFeature(feature_id)
             value = feature.attribute(src["field_index"])
-            return float(value) if value is not None else None
+            return normalise_depth(value, src["options"])
         except (TypeError, ValueError, RuntimeError):
             return None
 
@@ -223,12 +180,15 @@ class DepthSampler:
         lines — capped at ``_MAX_STATIONS`` so live hover sampling of
         several rasters stays cheap.
         """
+        if self.errors:
+            raise ValueError("; ".join(self.errors))
         try:
             length_m = float(distance_area.measureLine(start, end))
         except Exception:
             length_m = math.hypot(end.x() - start.x(), end.y() - start.y())
         pixel_size_m = self.finest_pixel_size_m()
         result = {"length_m": length_m, "pixel_size_m": pixel_size_m,
+                  "crs": self.crs.authid() or self.crs.toWkt(),
                   "rasters": [], "contours": []}
         if length_m <= 0 or not self.has_sources():
             return result
@@ -247,8 +207,10 @@ class DepthSampler:
             if any(value is not None for value in values):
                 pixel_area = src.get("pixel_area")
                 result["rasters"].append({
-                    "name": src["name"],
+                    "name": src["name"], "source_id": src["source_id"],
+                    "sampling": src["options"].get("sampling"), "datum": src["options"].get("datum"),
                     "x": [dist for dist, _point in stations], "y": values,
+                    "raw_y": [self._sample_raster(src, pt, "nearest") for _x, pt in stations],
                     "pixel_size_m": (math.sqrt(pixel_area)
                                      if pixel_area else None)})
         if self._contours:
