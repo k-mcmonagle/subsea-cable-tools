@@ -5,6 +5,7 @@ Run directly: python tests/test_rpl_sheet.py
 """
 
 import csv
+import gc
 import importlib.util
 import os
 import sys
@@ -104,12 +105,22 @@ class TestWriters(unittest.TestCase):
             path = os.path.join(tmp, "sheet.xlsx")
             rpl_sheet.write_xlsx(path, headers, rows, kinds,
                                  title="Test/RPL: a very long name over 31 chars")
-            book = openpyxl.load_workbook(path)
-            sheet = book.active
-            self.assertLessEqual(len(sheet.title), 31)
-            self.assertNotIn("/", sheet.title)
-            kp = headers.index("KP (km)") + 1
-            self.assertEqual(sheet.cell(row=2, column=kp).value, 0.0)
+            book = openpyxl.load_workbook(path, read_only=True)
+            try:
+                sheet = book.active
+                title = sheet.title
+                kp = headers.index("KP (km)") + 1
+                kp_value = sheet.cell(row=2, column=kp).value
+            finally:
+                # openpyxl keeps zip member streams alive until the reader
+                # objects are collected; Windows then refuses to delete the
+                # temp folder. Close and collect before leaving the block.
+                book.close()
+                del sheet, book
+                gc.collect()
+            self.assertLessEqual(len(title), 31)
+            self.assertNotIn("/", title)
+            self.assertEqual(kp_value, 0.0)
 
 
 if __name__ == "__main__":

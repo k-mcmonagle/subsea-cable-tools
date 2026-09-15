@@ -33,7 +33,28 @@ PURE_MODULES = [
     "test_planner_reports",
     "test_rpl_import_core",
     "test_system_topology",
+    "test_burial_gpkg_sql",
+    "test_burial_risk",
+    "test_planner_task_import",
+    "test_rules_engine_equivalence",
+    "test_v3_assembly_datum",
+    "test_v3_bu_full",
+    "test_v3_bu_integration",
+    "test_v3_bu_lowering_tool",
+    "test_v3_bu_plan",
+    "test_v3_integration_ui",
+    "test_v3_manual",
+    "test_v3_quick_bu",
+    "test_v3_solver_regression",
+    "test_v3_timeseries_view",
 ]
+
+
+def _passed(result) -> bool:
+    """Suites return either a list of per-test booleans or a failure count."""
+    if isinstance(result, list):
+        return all(result)
+    return not bool(result)
 
 
 def _register_plugin_package() -> None:
@@ -59,8 +80,7 @@ def main() -> int:
         print(f"\n== {name} ==")
         try:
             module = importlib.import_module(f"{PACKAGE_NAME}.tests.{name}")
-            results = module.run_all()
-            if not all(results):
+            if not _passed(module.run_all()):
                 failures.append(name)
         except Exception as exc:
             print(f"[ERROR] {name}: {exc!r}")

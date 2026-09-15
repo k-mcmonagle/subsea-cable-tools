@@ -131,7 +131,7 @@ def test_cancel_terminates_worker():
         def kill(self):
             self.returncode = -9
 
-        def communicate(self):
+        def communicate(self, timeout=None):
             return "", ""
 
     fake_process = FakeProcess()
