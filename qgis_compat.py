@@ -118,6 +118,28 @@ def layer_filters(*members):
     return combined
 
 
+def symbol_layer_property(name: str):
+    """A ``QgsSymbolLayer`` data-defined property key by bare name.
+
+    QGIS 4 moved the keys to ``Qgis.SymbolLayerProperty.<Name>``; QGIS 3
+    has ``QgsSymbolLayer.Property<Name>`` (also reachable as
+    ``QgsSymbolLayer.Property.Property<Name>``). Returns None when no
+    variant exists so callers can skip the data-defined override.
+    """
+    from qgis.core import Qgis, QgsSymbolLayer
+
+    scoped = getattr(Qgis, "SymbolLayerProperty", None)
+    if scoped is not None and hasattr(scoped, name):
+        return getattr(scoped, name)
+    legacy = getattr(QgsSymbolLayer, "Property", None)
+    for candidate in (f"Property{name}", name):
+        if hasattr(QgsSymbolLayer, candidate):
+            return getattr(QgsSymbolLayer, candidate)
+        if legacy is not None and hasattr(legacy, candidate):
+            return getattr(legacy, candidate)
+    return None
+
+
 def qt_exec(obj, *args, **kwargs):
     exec_method = getattr(obj, "exec", None)
     if exec_method is None:

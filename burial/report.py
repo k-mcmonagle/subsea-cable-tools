@@ -243,7 +243,11 @@ def build_report_html(plan: Dict,
                       tools: Optional[Sequence[Dict]] = None,
                       path_result: Optional[Dict] = None,
                       path_state: Optional[Dict[str, str]] = None,
-                      path_vessel: Optional[Dict] = None) -> str:
+                      path_vessel: Optional[Dict] = None,
+                      ground_units: Optional[Sequence[Dict]] = None,
+                      ground_classes: Optional[Sequence[Dict]] = None,
+                      bas_rows: Optional[Sequence[Dict]] = None,
+                      bas_columns: Optional[Sequence[Dict]] = None) -> str:
     """Assemble the full report; pure formatting, no QGIS access."""
     method = schema.normalise_method(plan.get("method") or "")
     status = plan.get("status") or ""
@@ -503,6 +507,113 @@ def build_report_html(plan: Dict,
         ))
     parts.append(_table(("Seq", "Event", "KP", "Lat", "Lon", "Depth (m)",
                          "Source", "Status", "Locked", "Notes"), event_rows))
+
+    # -- ground model -----------------------------------------------------------
+    if ground_units:
+        from . import ground_model
+
+        parts.append("<h2>Ground model</h2>")
+        by_code = ground_model.class_lookup(ground_classes or [])
+        try:
+            meta = json.loads(plan.get("params_json") or "{}").get("ground_model") or {}
+        except (TypeError, ValueError, AttributeError):
+            meta = {}
+        provenance = []
+        if meta.get("source_ref"):
+            provenance.append(f"Source: {_esc(meta['source_ref'])}")
+        if meta.get("source_rpl"):
+            provenance.append("KPs re-referenced from "
+                              f"{_esc(meta['source_rpl'])} "
+                              f"({_esc(meta.get('method') or '')})")
+        target = plan.get("target_burial_m")
+        try:
+            target_m = float(target) if target not in (None, "") else None
+        except (TypeError, ValueError):
+            target_m = None
+        summary_rows = []
+        for entry in ground_model.summarise_by_class(
+                ground_units, depth_m=None, start_kp=scope_start, end_kp=scope_end):
+            code = entry["soil_class"]
+            summary_rows.append((code or "(no unit)",
+                                 ground_model.label_for(code, by_code) if code else "",
+                                 f"{entry['length_km']:.3f}"))
+        parts.append(f"<p>{len(list(ground_units))} unit(s)"
+                     + ("; " + "; ".join(provenance) if provenance else "")
+                     + ".</p>")
+        parts.append("<h3>Seabed class over the scope</h3>")
+        parts.append(_table(("Class", "Label", "Length (km)"), summary_rows))
+        if target_m:
+            target_rows = []
+            for entry in ground_model.summarise_by_class(
+                    ground_units, depth_m=target_m, start_kp=scope_start,
+                    end_kp=scope_end):
+                code = entry["soil_class"]
+                target_rows.append((code or "(no unit)",
+                                    ground_model.label_for(code, by_code) if code else "",
+                                    f"{entry['length_km']:.3f}"))
+            parts.append(f"<h3>Class at the target burial depth "
+                         f"({target_m:.2f} m below seabed)</h3>")
+            parts.append(_table(("Class", "Label", "Length (km)"), target_rows))
+        unit_rows = []
+        for unit in ground_model.sort_units(ground_units):
+            base = unit.get("base_m")
+            base_end = unit.get("base_end_m")
+            top_end = unit.get("top_end_m")
+            top_text = _num(unit.get("top_m"), 2) + (
+                f" → {_num(top_end, 2)}" if top_end is not None else "")
+            base_text = ("open" if base is None else _num(base, 2)) + (
+                f" → {_num(base_end, 2)}" if base_end is not None else "")
+            unit_rows.append((
+                _kp(unit.get("start_kp")), _kp(unit.get("end_kp")),
+                top_text, base_text,
+                unit.get("soil_class") or "",
+                unit.get("description") or "", unit.get("strength") or "",
+                ground_model.CONFIDENCE_LABELS.get(unit.get("confidence") or "", ""),
+                unit.get("source_ref") or "",
+                (f"{_kp(unit.get('src_start_kp'))}–{_kp(unit.get('src_end_kp'))} "
+                 f"{unit.get('src_rpl') or ''}").strip()
+                if unit.get("src_start_kp") is not None else "",
+                unit.get("rereference_flags") or "",
+            ))
+        parts.append(_table(("Start KP", "End KP", "Top (m)", "Base (m)", "Class",
+                             "Description", "Strength", "Confidence", "Source",
+                             "Delivered KPs", "Re-ref flags"), unit_rows))
+
+    # -- BAS register -------------------------------------------------------------
+    if bas_rows:
+        from . import bas_model
+
+        parts.append("<h2>Burial Assessment Study register</h2>")
+        columns = bas_model.normalise_columns(bas_columns or [])
+        try:
+            bas_meta = json.loads(plan.get("params_json") or "{}").get("bas") or {}
+        except (TypeError, ValueError, AttributeError):
+            bas_meta = {}
+        provenance = []
+        if bas_meta.get("source_ref"):
+            provenance.append(f"Source: {_esc(bas_meta['source_ref'])}")
+        if bas_meta.get("source_rpl"):
+            provenance.append("KPs re-referenced from "
+                              f"{_esc(bas_meta['source_rpl'])} "
+                              f"({_esc(bas_meta.get('method') or '')})")
+        decoded = bas_model.sort_rows(bas_rows)
+        gaps = bas_model.coverage_gaps(decoded, scope_start, scope_end)
+        missing = sum(b - a for a, b in gaps)
+        parts.append(f"<p>{len(decoded)} row(s)"
+                     + ("; " + "; ".join(provenance) if provenance else "")
+                     + (f"; {missing:.3f} km of the scope has no row" if missing > 1e-6 else "")
+                     + ".</p>")
+        bas_table = []
+        for row in decoded:
+            bas_table.append(
+                [_kp(row.get("start_kp")), _kp(row.get("end_kp"))]
+                + [row["values"].get(c["key"], "") for c in columns]
+                + [(f"{_kp(row.get('src_start_kp'))}–{_kp(row.get('src_end_kp'))} "
+                    f"{row.get('src_rpl') or ''}").strip()
+                   if row.get("src_start_kp") is not None else "",
+                   row.get("rereference_flags") or "", row.get("notes") or ""])
+        parts.append(_table(["Start KP", "End KP"] + [c["label"] for c in columns]
+                            + ["Delivered KPs", "Re-ref flags", "Notes"], bas_table))
 
     # -- risk profile ---------------------------------------------------------
     if hazards:

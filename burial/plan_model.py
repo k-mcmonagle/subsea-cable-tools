@@ -64,6 +64,8 @@ class PlanModel(QObject):
     pathsChanged = pyqtSignal()      # result and/or its current/stale state
     laybacksChanged = pyqtSignal()   # project-scoped layback profiles
     vesselsChanged = pyqtSignal()    # project-scoped vessel registry
+    groundChanged = pyqtSignal()     # ground-model units and/or classes
+    basChanged = pyqtSignal()        # BAS register rows and/or columns
     logChanged = pyqtSignal()
     storeError = pyqtSignal(str)
 
@@ -81,6 +83,9 @@ class PlanModel(QObject):
         self.tools: List[Dict] = []  # project-scoped, survives close_plan
         self.layback_profiles: List[Dict] = []  # project-scoped
         self.vessels: List[Dict] = []           # project-scoped
+        self.ground_units: List[Dict] = []
+        self.ground_classes: List[Dict] = []    # project-scoped
+        self.bas_rows: List[Dict] = []          # decoded (values dict)
         self.path_result: Optional[Dict] = None
         self.context = generation.ResolutionContext()
         self.route = None            # RouteFrame over the plan's RPL (WGS84)
@@ -185,6 +190,9 @@ class PlanModel(QObject):
         self.risk_checks = self.store.list_risk_checks(plan_id)
         self.hazards = self.store.list_hazards(plan_id)
         self.path_result = self.store.get_path_result(plan_id)
+        self.ground_units = self.store.list_ground_units(plan_id)
+        self.refresh_ground_classes(emit=False)
+        self._load_bas_rows()
         self.acq_cache.clear()
         self._load_profile(plan_id)
         self._load_context()
@@ -197,6 +205,8 @@ class PlanModel(QObject):
         self.sectionsChanged.emit()
         self.riskChanged.emit()
         self.pathsChanged.emit()
+        self.groundChanged.emit()
+        self.basChanged.emit()
         return True
 
     def _load_profile(self, plan_id: str) -> None:
@@ -224,6 +234,8 @@ class PlanModel(QObject):
         self.sections = []
         self.risk_checks = []
         self.hazards = []
+        self.ground_units = []
+        self.bas_rows = []
         self.path_result = None
         self.context = generation.ResolutionContext()
         self.route = None
@@ -235,6 +247,8 @@ class PlanModel(QObject):
         self._depth_config_cache = None
         self.planChanged.emit()
         self.pathsChanged.emit()
+        self.groundChanged.emit()
+        self.basChanged.emit()
 
     def _load_context(self) -> None:
         self.context = generation.ResolutionContext()
@@ -759,6 +773,10 @@ class PlanModel(QObject):
             self.refresh_layers(immediate=True)
         if "rpl_id" in changed_keys or "rpl_gpkg_path" in changed_keys:
             self._load_route()
+        if {"target_burial_m", "scope_start_kp", "scope_end_kp"} & changed_keys:
+            # The ground overlay's target-depth ribbon and its clipping
+            # window follow these plan values.
+            self.refresh_layers(parts=("ground",))
         if {"scope_start_kp", "scope_end_kp", "direction", "rpl_id",
             "rpl_gpkg_path"} & changed_keys:
             self.mark_stale()
@@ -863,6 +881,162 @@ class PlanModel(QObject):
         self.rulesChanged.emit()
         self.logChanged.emit()
         return True
+
+    # -- ground model --------------------------------------------------------
+    def refresh_ground_classes(self, emit: bool = True) -> None:
+        try:
+            self.ground_classes = self.store.list_ground_classes()
+        except Exception as exc:
+            self.storeError.emit(
+                f"The soil-class registry could not be read:\n"
+                f"{getattr(self.store, 'gpkg_path', '')}\n\n{exc}")
+        if emit:
+            self.groundChanged.emit()
+
+    def save_ground_classes(self, rows: List[Dict]) -> bool:
+        """Replace the project-scoped soil-class vocabulary (not plan
+        state, so not change-logged — like tools and vessels)."""
+        try:
+            self.store.ensure_created()
+        except Exception as exc:
+            self.storeError.emit(
+                f"Could not create the Burial Planner GeoPackage:\n{exc}")
+            return False
+        ok, _ = self._store_write("save the soil classes",
+                                  self.store.save_ground_classes, rows)
+        if not ok:
+            return False
+        self.refresh_ground_classes()
+        self.refresh_layers(parts=("ground",))  # colours/labels ride on features
+        return True
+
+    def save_ground_units(self, units: List[Dict],
+                          action: str = change_log.ACTION_EDIT_GROUND,
+                          reason: str = "", new_classes: Optional[List[Dict]] = None,
+                          params_updates: Optional[Dict] = None) -> bool:
+        """One logged replacement of the plan's ground-model units.
+
+        ``new_classes`` (codes the units use that the registry lacks) are
+        appended to the vocabulary in the same transaction; ``params_updates``
+        patches ``params_json`` (import provenance / the KP map) without
+        marking the plan stale — the ground model does not feed generation.
+        """
+        if not self.plan:
+            return False
+        from . import ground_model
+
+        before = {schema.TABLE_GROUND_UNIT: [dict(u) for u in self.ground_units]}
+        ordered = ground_model.sort_units(units)
+        for unit in ordered:
+            unit["plan_id"] = self.plan_id
+            unit.setdefault("unit_id", schema.new_id())
+
+        def write() -> None:
+            if new_classes:
+                merged = list(self.store.list_ground_classes()) + list(new_classes)
+                self.store.save_ground_classes(merged)
+            self.store.save_ground_units(self.plan_id, ordered)
+            self.ground_units = self.store.list_ground_units(self.plan_id)
+            self.store.append_change(
+                self.plan_id, action, "", before=before,
+                after={schema.TABLE_GROUND_UNIT: [dict(u) for u in self.ground_units]},
+                reason=reason)
+
+        ok, _ = self._store_transaction("save the ground model", write)
+        if not ok:
+            return False
+        if new_classes:
+            self.refresh_ground_classes(emit=False)
+        if params_updates:
+            self.update_gen_params(params_updates, reason=reason or action,
+                                   stale=False)
+        self.refresh_layers(parts=("ground",))
+        self.groundChanged.emit()
+        self.logChanged.emit()
+        return True
+
+    # -- BAS register --------------------------------------------------------
+    def _load_bas_rows(self) -> None:
+        from . import bas_model
+
+        self.bas_rows = [bas_model.decode_row(r)
+                         for r in self.store.list_bas_rows(self.plan_id)]
+
+    def bas_meta(self) -> Dict:
+        """Column list + provenance stored in ``params_json["bas"]``."""
+        try:
+            stored = json.loads(self.plan.get("params_json") or "{}")
+        except (TypeError, ValueError):
+            return {}
+        meta = stored.get("bas") if isinstance(stored, dict) else None
+        return dict(meta) if isinstance(meta, dict) else {}
+
+    def bas_columns(self) -> List[Dict]:
+        from . import bas_model
+
+        return bas_model.normalise_columns(self.bas_meta().get("columns"))
+
+    def save_bas(self, rows: List[Dict], columns: Optional[List[Dict]] = None,
+                 action: str = change_log.ACTION_EDIT_BAS, reason: str = "",
+                 meta_updates: Optional[Dict] = None) -> bool:
+        """One logged replacement of the BAS rows; ``columns`` (when given)
+        and ``meta_updates`` patch ``params_json["bas"]`` without marking
+        the plan stale (the register does not feed generation)."""
+        if not self.plan:
+            return False
+        from . import bas_model
+
+        before = {schema.TABLE_BAS_ROW: [bas_model.encode_row(r) for r in self.bas_rows]}
+        ordered = [bas_model.encode_row(r) for r in bas_model.sort_rows(rows)]
+        for row in ordered:
+            row["plan_id"] = self.plan_id
+            if not row.get("row_id"):
+                row["row_id"] = schema.new_id()
+
+        def write() -> None:
+            self.store.save_bas_rows(self.plan_id, ordered)
+            self._load_bas_rows()
+            self.store.append_change(
+                self.plan_id, action, "", before=before,
+                after={schema.TABLE_BAS_ROW: [bas_model.encode_row(r) for r in self.bas_rows]},
+                reason=reason)
+
+        ok, _ = self._store_transaction("save the BAS register", write)
+        if not ok:
+            return False
+        meta = self.bas_meta()
+        if columns is not None:
+            meta["columns"] = bas_model.normalise_columns(columns)
+        if meta_updates:
+            meta.update(meta_updates)
+        if columns is not None or meta_updates:
+            self.update_gen_params({"bas": meta}, reason=reason or action, stale=False)
+        self.refresh_layers(parts=("bas",))
+        self.basChanged.emit()
+        self.logChanged.emit()
+        return True
+
+    def save_bas_columns(self, columns: List[Dict], reason: str = "") -> bool:
+        """Column list only (labels/kinds/order); values keep their keys."""
+        from . import bas_model
+
+        meta = self.bas_meta()
+        meta["columns"] = bas_model.normalise_columns(columns)
+        if not self.update_gen_params({"bas": meta}, reason=reason or "BAS columns",
+                                      stale=False):
+            return False
+        self.refresh_layers(parts=("bas",))  # the layer's field set follows
+        self.basChanged.emit()
+        return True
+
+    def ground_meta(self) -> Dict:
+        """Import provenance / KP map stored in ``params_json``."""
+        try:
+            stored = json.loads(self.plan.get("params_json") or "{}")
+        except (TypeError, ValueError):
+            return {}
+        meta = stored.get("ground_model") if isinstance(stored, dict) else None
+        return meta if isinstance(meta, dict) else {}
 
     # -- risk profile --------------------------------------------------------
     def save_risk_checks(self, checks: List[Dict], target_id: str = "",
@@ -1920,14 +2094,20 @@ class PlanModel(QObject):
         if not parts or not self.plan or self.route is None:
             return
         try:
+            from . import bas_model
+
+            bas_columns = self.bas_columns()
             map_layers.write_plan_layers(
                 self.store, self.plan, self.sections, self.events, self.route,
                 hazards=self.hazards, risk_checks=self.risk_checks,
                 tools=self.tools, parts=parts,
-                segment_wkt_cache=self._segment_wkt_cache)
-            map_layers.ensure_plan_layers(QgsProject.instance(),
-                                          self.store.gpkg_path, self.plan,
-                                          parts=parts)
+                segment_wkt_cache=self._segment_wkt_cache,
+                ground_units=self.ground_units,
+                ground_classes=self.ground_classes,
+                bas_rows=self.bas_rows, bas_columns=bas_columns)
+            map_layers.ensure_plan_layers(
+                QgsProject.instance(), self.store.gpkg_path, self.plan,
+                parts=parts, bas_fields=bas_model.layer_fields(bas_columns))
         except Exception as exc:
             self.storeError.emit(f"Plan layers could not be refreshed: {exc}")
 

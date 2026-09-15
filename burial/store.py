@@ -463,6 +463,24 @@ class BurialStore:
         if new_hazards:
             self.upsert_rows(schema.TABLE_HAZARD, new_hazards)
 
+        new_units = []
+        for row in self.list_ground_units(plan_id):
+            new_row = dict(row)
+            new_row["unit_id"] = schema.new_id()
+            new_row["plan_id"] = new_plan_id
+            new_units.append(new_row)
+        if new_units:
+            self.upsert_rows(schema.TABLE_GROUND_UNIT, new_units)
+
+        new_bas = []
+        for row in self.list_bas_rows(plan_id):
+            new_row = dict(row)
+            new_row["row_id"] = schema.new_id()
+            new_row["plan_id"] = new_plan_id
+            new_bas.append(new_row)
+        if new_bas:
+            self.upsert_rows(schema.TABLE_BAS_ROW, new_bas)
+
         # The sampled profile is derived but expensive — carry the copy over.
         profile_row = self.get_plan_profile(plan_id)
         if profile_row is not None:
@@ -689,6 +707,61 @@ class BurialStore:
             row.setdefault("section_id", schema.new_id())
             normalised.append(row)
         self._replace_plan_rows(schema.TABLE_SECTION, plan_id, normalised)
+
+    # -- ground model --------------------------------------------------------
+    def list_ground_units(self, plan_id: str) -> List[Dict]:
+        rows = self.read_plan_table(schema.TABLE_GROUND_UNIT, plan_id)
+        rows.sort(key=lambda r: (int(r.get("seq") or 0),
+                                 float(r.get("start_kp") or 0.0)))
+        return rows
+
+    def save_ground_units(self, plan_id: str, rows: Sequence[Dict]) -> None:
+        """Replace all ground-model units for one plan."""
+        normalised = []
+        for row in rows:
+            row = dict(row)
+            row["plan_id"] = plan_id
+            row.setdefault("unit_id", schema.new_id())
+            normalised.append(row)
+        self._replace_plan_rows(schema.TABLE_GROUND_UNIT, plan_id, normalised)
+
+    def list_ground_classes(self) -> List[Dict]:
+        rows = self.read_table(schema.TABLE_GROUND_CLASS)
+        rows.sort(key=lambda r: (int(r.get("seq") or 0),
+                                 str(r.get("code") or "").casefold()))
+        return rows
+
+    def save_ground_classes(self, rows: Sequence[Dict]) -> None:
+        """Replace the project-scoped soil-class vocabulary."""
+        normalised = []
+        for i, row in enumerate(rows):
+            row = dict(row)
+            row.setdefault("class_id", schema.new_id())
+            row["seq"] = i
+            normalised.append(row)
+        conn = self._sql()
+        if conn is not None:
+            gpkg_sql.replace_where(conn, schema.TABLE_GROUND_CLASS, "1 = 1",
+                                   (), normalised)
+            return
+        self.write_table(schema.TABLE_GROUND_CLASS, normalised)
+
+    # -- BAS register --------------------------------------------------------
+    def list_bas_rows(self, plan_id: str) -> List[Dict]:
+        rows = self.read_plan_table(schema.TABLE_BAS_ROW, plan_id)
+        rows.sort(key=lambda r: (int(r.get("seq") or 0),
+                                 float(r.get("start_kp") or 0.0)))
+        return rows
+
+    def save_bas_rows(self, plan_id: str, rows: Sequence[Dict]) -> None:
+        """Replace all BAS rows for one plan (store-form rows)."""
+        normalised = []
+        for row in rows:
+            row = dict(row)
+            row["plan_id"] = plan_id
+            row.setdefault("row_id", schema.new_id())
+            normalised.append(row)
+        self._replace_plan_rows(schema.TABLE_BAS_ROW, plan_id, normalised)
 
     # -- sampled profile -----------------------------------------------------
     def get_plan_profile(self, plan_id: str) -> Optional[Dict]:

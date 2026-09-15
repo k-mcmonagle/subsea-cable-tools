@@ -27,6 +27,8 @@ PURE_MODULES = [
     "test_burial_events",
     "test_burial_io",
     "test_burial_report",
+    "test_burial_ground",
+    "test_burial_bas",
     "test_rules_engine",
     "test_planner_reports",
     "test_rpl_import_core",

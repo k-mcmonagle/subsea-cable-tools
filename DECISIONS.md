@@ -467,3 +467,75 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   existing habits and change-log semantics do not shift. Surplus edge
   events are *moved* rather than deleted-and-recreated when their type
   matches a needed edge, so confirmations and notes survive a merge.
+
+## Ground Model tab and KP re-referencing (not in the v0.3 spec)
+
+- **Units are KP × depth polygons, not a 1-D class strip**: a ground
+  model row is `start_kp, end_kp, top_m, base_m` (+ optional `top_end_m`
+  / `base_end_m` for sloping horizons; NULL base = open unit). The
+  existing seabed-soils polygon rule is a binary KP predicate and stays
+  as it is; the ground model is a separate `bp_ground_unit` table so the
+  depth dimension exists for the burial-tool questions (what is at the
+  target burial depth, not just at the seabed) and for a future
+  sub-bottom / geotechnical overlay in the same plane.
+- **Soil classes are project-scoped, units are plan-scoped**: the
+  vocabulary (`bp_ground_class`: code, label, group, colour) is shared
+  across plans like tools and vessels and is not change-logged; the units
+  are per plan, change-logged as one entry per Apply/import/re-reference
+  (whole-set replacement, rollback restores the set) and copied on plan
+  duplicate. Unknown codes met on import are created with a keyword-
+  guessed group and a group colour rather than rejected.
+- **The ground model does not feed generation** and so never marks the
+  plan stale; its plan-level provenance (source document, source RPL,
+  the KP map) lives under `params_json["ground_model"]` via
+  `update_gen_params(..., stale=False)` — no new plan columns.
+- **KP re-referencing is a persisted, monotone piecewise-linear map**
+  (`kp_rereference.KpMap`), never a per-point nearest snap. Geometry
+  anchors come from walking the *source* revision and projecting onto
+  the *target*; stations beyond the offset tolerance or projecting
+  backwards are dropped and recorded as gaps that the map interpolates
+  across with a `gap` flag. Small anchor sets (hand-entered pairs) use
+  an O(n²) longest-monotone-subsequence that breaks ties by offset
+  smoothness so the outlier pair is the one dropped; dense samples use
+  the O(n log n) form and are Douglas–Peucker-thinned on the offset
+  curve. Beyond the last anchor the last offset is carried (unit slope)
+  and flagged `extrapolated`; ranges whose mapped length changes by more
+  than 10 % are flagged `stretched`, collapsed/turned ones `reversed`.
+- **Provenance beats precision**: every mapped unit keeps the KPs and
+  revision it was delivered against (`src_start_kp`, `src_end_kp`,
+  `src_rpl`); a later re-reference maps from those, not from the
+  already-mapped values, so successive RPL changes do not compound.
+- **Not done yet (deliberately)**: re-referencing plan events/sections
+  themselves when the RPL changes (today they keep their KP numbers and
+  go stale), a BAS tab, and SBP / CPT / core overlays — see the README
+  notes and the session write-up; the KP map and the depth-plane plot
+  are the building blocks those need.
+- **The BAS register stores conclusions, not a burial-assessment method**:
+  consultancies differ (BPI, CBRA, bespoke) and clients rely on the
+  consultant's numbers, so the tab is a KP-range register with a
+  per-plan flexible column set (`values_json` + `params_json["bas"]
+  ["columns"]`) rather than a calculation. Only start/end KP are real
+  columns so the store schema never changes when a study adds a field;
+  renaming a column keeps its key (no data loss), removing one drops the
+  values on the next Apply. Rules that consume BAS columns (required DoL
+  vs tool capability, residual-risk bands) are the intended next step
+  and can read the register by column key.
+- **Spreadsheet behaviour lives in one widget** (`spreadsheet_table.py`):
+  copy/paste/fill/clear/undo are table-level and reach the owner through
+  ordinary `itemChanged` signals, so the BAS tab keeps a single data path
+  and the widget can back other editable tables later. Cell-edit undo is
+  in-table (unsaved edits); saved state is undone through the change log
+  as everywhere else.
+- **Overlays are offset ribbons, not competing line styles**: the ground
+  model (seabed class, class at target depth) draws to port of the route
+  and the BAS register to starboard, both as ordinary per-plan gpkg
+  layers in the plan's group that ride the existing parts-based refresh
+  (`ALL_PLAN_LAYER_PARTS` gains "ground"/"bas"), naming, rename/remove/
+  restore/switch and stale-field healing. Sections stay on the line and
+  the tool path keeps its own geometry, so nothing overdraws. Colours are
+  feature attributes with a data-defined stroke so the renderer is built
+  once; the BAS layer's fields are derived from the plan's column list
+  (the only per-plan schema in the tool), which the stale-field healer
+  already handles. Overlays are clipped to scope and route and skip
+  off-route rows instead of raising.
+

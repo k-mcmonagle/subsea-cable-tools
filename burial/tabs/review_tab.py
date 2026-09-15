@@ -280,7 +280,11 @@ class ReviewTab(QWidget):
             tools=self.model.tools, path_result=self.model.path_result,
             path_state=self.model.path_state(),
             path_vessel=self.model.vessel(
-                str(self.model.path_config().get("vessel_id") or "")))
+                str(self.model.path_config().get("vessel_id") or "")),
+            ground_units=self.model.ground_units,
+            ground_classes=self.model.ground_classes,
+            bas_rows=self.model.bas_rows,
+            bas_columns=self.model.bas_columns())
         try:
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write(text)

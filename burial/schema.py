@@ -37,7 +37,7 @@ from ..workbench.schema import (  # noqa: F401  (re-exported for the package)
     utc_now_iso,
 )
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # Registry table names ------------------------------------------------------
 TABLE_META = "bp_meta"
@@ -55,6 +55,9 @@ TABLE_TOOL = "bp_tool"
 TABLE_PATH_RESULT = "bp_path_result"
 TABLE_LAYBACK_PROFILE = "bp_layback_profile"
 TABLE_VESSEL = "bp_vessel"
+TABLE_GROUND_UNIT = "bp_ground_unit"
+TABLE_GROUND_CLASS = "bp_ground_class"
+TABLE_BAS_ROW = "bp_bas_row"
 
 FieldSpec = Tuple[str, str]
 
@@ -610,6 +613,62 @@ PROFILE_FIELDS: List[FieldSpec] = [
     ("sample_count", "int"),
 ]
 
+# Ground model: soil units in the KP × depth-below-seabed plane. ``top_m``
+# and ``base_m`` are depths at the start KP; the ``*_end_m`` pair (nullable)
+# gives the depths at the end KP for sloping horizons. A NULL base is an
+# open unit (extends downward). ``src_*`` keep the KPs exactly as delivered
+# against the source document's RPL revision so the model can be
+# re-referenced again from the original numbers when the route changes.
+GROUND_UNIT_FIELDS: List[FieldSpec] = [
+    ("unit_id", "str"),
+    ("plan_id", "str"),
+    ("seq", "int"),
+    ("start_kp", "float"),           # on the plan's current route
+    ("end_kp", "float"),
+    ("top_m", "float"),              # m below seabed at start KP (0 = seabed)
+    ("base_m", "float"),             # nullable: open base
+    ("top_end_m", "float"),          # nullable: same as top_m
+    ("base_end_m", "float"),         # nullable: same as base_m
+    ("soil_class", "str"),           # code into bp_ground_class (open)
+    ("description", "str"),
+    ("strength", "str"),             # free text: "su 20-40 kPa", "dense"
+    ("confidence", "str"),           # "" | high | medium | low
+    ("source_ref", "str"),           # document + revision
+    ("src_start_kp", "float"),       # nullable: KP as delivered
+    ("src_end_kp", "float"),
+    ("src_rpl", "str"),              # RPL revision the source KPs reference
+    ("rereference_flags", "str"),    # "" | extrapolated,gap,stretched,...
+    ("notes", "str"),
+]
+
+# Project-scoped soil-class vocabulary (colour + group per code).
+GROUND_CLASS_FIELDS: List[FieldSpec] = [
+    ("class_id", "str"),
+    ("code", "str"),
+    ("label", "str"),
+    ("group", "str"),                # ground_model.GROUPS
+    ("color", "str"),                # "#rrggbb"
+    ("notes", "str"),
+    ("seq", "int"),
+]
+
+# Burial Assessment Study register: KP ranges with a flexible, per-plan
+# column set (``params_json["bas"]["columns"]``); the values ride in
+# ``values_json`` keyed by column key. Provenance columns as bp_ground_unit.
+BAS_ROW_FIELDS: List[FieldSpec] = [
+    ("row_id", "str"),
+    ("plan_id", "str"),
+    ("seq", "int"),
+    ("start_kp", "float"),
+    ("end_kp", "float"),
+    ("values_json", "str"),
+    ("src_start_kp", "float"),
+    ("src_end_kp", "float"),
+    ("src_rpl", "str"),
+    ("rereference_flags", "str"),
+    ("notes", "str"),
+]
+
 CHANGE_LOG_FIELDS: List[FieldSpec] = [
     ("change_id", "str"),
     ("plan_id", "str"),
@@ -639,6 +698,9 @@ REGISTRY_TABLES: Dict[str, List[FieldSpec]] = {
     TABLE_PATH_RESULT: PATH_RESULT_FIELDS,
     TABLE_LAYBACK_PROFILE: LAYBACK_PROFILE_FIELDS,
     TABLE_VESSEL: VESSEL_FIELDS,
+    TABLE_GROUND_UNIT: GROUND_UNIT_FIELDS,
+    TABLE_GROUND_CLASS: GROUND_CLASS_FIELDS,
+    TABLE_BAS_ROW: BAS_ROW_FIELDS,
 }
 
 TABLE_KEYS: Dict[str, str] = {
@@ -658,6 +720,9 @@ TABLE_KEYS: Dict[str, str] = {
     TABLE_PATH_RESULT: "path_id",
     TABLE_LAYBACK_PROFILE: "layback_id",
     TABLE_VESSEL: "vessel_id",
+    TABLE_GROUND_UNIT: "unit_id",
+    TABLE_GROUND_CLASS: "class_id",
+    TABLE_BAS_ROW: "row_id",
 }
 
 # Per-plan spatial layer schemas -------------------------------------------
@@ -786,6 +851,50 @@ def barge_track_layer_name(plan_name: str, rev_label: str, plan_id: str) -> str:
 
 def path_issues_layer_name(plan_name: str, rev_label: str, plan_id: str) -> str:
     return f"{plan_layer_base(plan_name, rev_label, plan_id)}_path_issues"
+
+
+def ground_layer_name(plan_name: str, rev_label: str, plan_id: str) -> str:
+    return f"{plan_layer_base(plan_name, rev_label, plan_id)}_ground"
+
+
+def bas_layer_name(plan_name: str, rev_label: str, plan_id: str) -> str:
+    return f"{plan_layer_base(plan_name, rev_label, plan_id)}_bas"
+
+
+# Ground-model overlay: one route slice per run of a soil class along the
+# route at a given horizon ("seabed" = topmost unit, "target" = the unit at
+# the plan's target burial depth). Colour rides on the feature so the
+# renderer needs no rebuild when the class registry changes.
+GROUND_LAYER_FIELDS: List[FieldSpec] = [
+    ("plan_id", "str"),
+    ("horizon", "str"),              # seabed | target
+    ("depth_m", "float"),            # probe depth below seabed
+    ("start_kp", "float"),
+    ("end_kp", "float"),
+    ("length_km", "float"),
+    ("soil_class", "str"),
+    ("class_label", "str"),
+    ("group", "str"),
+    ("color", "str"),
+    ("unit_count", "int"),           # units contributing to the run
+]
+
+# BAS overlay: one route slice per register row; the flexible columns are
+# appended per plan by ``bas_model.layer_fields``.
+BAS_LAYER_BASE_FIELDS: List[FieldSpec] = [
+    ("row_id", "str"),
+    ("plan_id", "str"),
+    ("start_kp", "float"),
+    ("end_kp", "float"),
+    ("length_km", "float"),
+]
+BAS_LAYER_TAIL_FIELDS: List[FieldSpec] = [
+    ("src_start_kp", "float"),
+    ("src_end_kp", "float"),
+    ("src_rpl", "str"),
+    ("rereference_flags", "str"),
+    ("notes", "str"),
+]
 
 
 def default_gpkg_path(project_path: str, project_title: str = "") -> str:

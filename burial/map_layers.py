@@ -149,7 +149,7 @@ def rpl_fingerprint(rpl_row: Optional[Dict], gpkg_path: str = "") -> str:
 # -- writing -----------------------------------------------------------------
 
 
-ALL_PLAN_LAYER_PARTS = ("sections", "events", "hazards")
+ALL_PLAN_LAYER_PARTS = ("sections", "events", "hazards", "ground", "bas")
 
 
 def _section_wkt(route, start_kp: float, end_kp: float,
@@ -178,14 +178,20 @@ def write_plan_layers(store, plan: Dict, sections: Sequence[Dict],
                       risk_checks: Optional[Sequence[Dict]] = None,
                       tools: Optional[Sequence[Dict]] = None,
                       parts: Optional[Sequence[str]] = None,
-                      segment_wkt_cache: Optional[Dict] = None
+                      segment_wkt_cache: Optional[Dict] = None,
+                      ground_units: Optional[Sequence[Dict]] = None,
+                      ground_classes: Optional[Sequence[Dict]] = None,
+                      bas_rows: Optional[Sequence[Dict]] = None,
+                      bas_columns: Optional[Sequence[Dict]] = None
                       ) -> Tuple[str, str]:
-    """Write/overwrite the plan's sections + events (+ hazards) layers.
+    """Write/overwrite the plan's sections + events (+ hazards, ground
+    model, BAS) layers.
 
     ``parts`` limits the rewrite to the named layers ("sections", "events",
-    "hazards") — an edit that touched only one dataset must not pay for
-    rewriting the other two. None keeps the historic write-everything
-    behaviour.
+    "hazards", "ground", "bas") — an edit that touched only one dataset
+    must not pay for rewriting the others. None keeps the historic
+    write-everything behaviour. The ground/BAS overlays are written only
+    when their rows are passed (None skips them, as for hazards).
     """
     wanted = set(parts) if parts is not None else set(ALL_PLAN_LAYER_PARTS)
     method = plan.get("method") or ""
@@ -292,7 +298,128 @@ def write_plan_layers(store, plan: Dict, sections: Sequence[Dict],
         store.write_spatial_layer(schema.hazards_layer_name(*base_args),
                                   schema.HAZARDS_LAYER_FIELDS,
                                   WKB_POINT, hazard_rows)
+
+    if ground_units is not None and "ground" in wanted:
+        store.write_spatial_layer(
+            schema.ground_layer_name(*base_args), schema.GROUND_LAYER_FIELDS,
+            WKB_LINESTRING,
+            _ground_layer_rows(plan, ground_units, ground_classes or [],
+                               route, segment_wkt_cache))
+
+    if bas_rows is not None and "bas" in wanted:
+        from . import bas_model
+
+        columns = bas_model.normalise_columns(bas_columns or [])
+        store.write_spatial_layer(
+            schema.bas_layer_name(*base_args), bas_model.layer_fields(columns),
+            WKB_LINESTRING,
+            _bas_layer_rows(plan, bas_rows, columns, route, segment_wkt_cache))
     return sections_name, events_name
+
+
+def _route_window(route, plan: Dict) -> Tuple[float, float]:
+    """The KP window overlays are clipped to: the plan scope when set,
+    else the whole route."""
+    try:
+        total = float(route.total_length_km)
+    except (AttributeError, TypeError, ValueError):
+        total = 0.0
+    try:
+        lo = float(plan.get("scope_start_kp") or 0.0)
+        hi = float(plan.get("scope_end_kp") or 0.0)
+    except (TypeError, ValueError):
+        lo, hi = 0.0, 0.0
+    lo, hi = sorted((lo, hi))
+    if hi - lo <= 1e-9:
+        return 0.0, total
+    return max(0.0, lo), (min(hi, total) if total > 0 else hi)
+
+
+def _ground_layer_rows(plan: Dict, units: Sequence[Dict], classes: Sequence[Dict],
+                       route, cache: Optional[Dict]) -> List[Dict]:
+    """Seabed-class and target-depth-class runs as route slices.
+
+    Runs come from ``ground_model.class_runs`` (exact at unit boundaries,
+    sampled along sloping horizons) so overlapping units at different
+    depths never stack on the map: each horizon is one clean ribbon.
+    """
+    from . import ground_model
+
+    if route is None or not units:
+        return []
+    lo, hi = _route_window(route, plan)
+    if hi - lo <= 1e-9:
+        return []
+    by_code = ground_model.class_lookup(classes)
+    horizons = [("seabed", 0.0)]
+    try:
+        target = float(plan.get("target_burial_m")) \
+            if plan.get("target_burial_m") not in (None, "") else None
+    except (TypeError, ValueError):
+        target = None
+    if target is not None and target > 0:
+        horizons.append(("target", target))
+    rows: List[Dict] = []
+    plan_id = plan.get("plan_id") or ""
+    for horizon, depth in horizons:
+        for start, end, code, count in ground_model.class_runs(units, depth, lo, hi):
+            wkt = _section_wkt(route, start, end, cache)
+            if not wkt:
+                continue
+            cls = by_code.get(code.casefold())
+            rows.append({
+                "plan_id": plan_id, "horizon": horizon, "depth_m": depth,
+                "start_kp": start, "end_kp": end, "length_km": end - start,
+                "soil_class": code,
+                "class_label": ground_model.label_for(code, by_code),
+                "group": str(cls.get("group") or "") if cls else ground_model.guess_group(code),
+                "color": ground_model.color_for(code, by_code),
+                "unit_count": int(count),
+                WKT_KEY: wkt,
+            })
+    return rows
+
+
+def _bas_layer_rows(plan: Dict, bas_rows: Sequence[Dict], columns: Sequence[Dict],
+                    route, cache: Optional[Dict]) -> List[Dict]:
+    from . import bas_model
+
+    if route is None or not bas_rows:
+        return []
+    try:
+        total = float(route.total_length_km)
+    except (AttributeError, TypeError, ValueError):
+        total = 0.0
+    rows: List[Dict] = []
+    plan_id = plan.get("plan_id") or ""
+    for raw in bas_rows:
+        row = bas_model.decode_row(raw)
+        if row["start_kp"] is None or row["end_kp"] is None:
+            continue
+        # Clip to the route: a register can extend past either end of the
+        # RPL it was delivered against (or be off-route entirely after a
+        # bad re-reference) — never let that raise or draw garbage.
+        start = max(0.0, row["start_kp"])
+        end = min(total, row["end_kp"]) if total > 0 else row["end_kp"]
+        if end - start <= 1e-9:
+            continue
+        wkt = _section_wkt(route, start, end, cache)
+        if not wkt:
+            continue
+        feature = {
+            "row_id": row.get("row_id") or "", "plan_id": plan_id,
+            "start_kp": row["start_kp"], "end_kp": row["end_kp"],
+            "length_km": row["end_kp"] - row["start_kp"],
+            "src_start_kp": row.get("src_start_kp"),
+            "src_end_kp": row.get("src_end_kp"),
+            "src_rpl": row.get("src_rpl") or "",
+            "rereference_flags": row.get("rereference_flags") or "",
+            "notes": row.get("notes") or "",
+            WKT_KEY: wkt,
+        }
+        feature.update(bas_model.layer_values(row, columns))
+        rows.append(feature)
+    return rows
 
 
 # -- styling -----------------------------------------------------------------
@@ -440,6 +567,84 @@ def apply_hazards_style(layer) -> None:
 
 
 # -- project sync ------------------------------------------------------------
+
+
+# Overlays sit beside the route, not on it, so the burial/skip sections
+# (drawn on the line) and the tool path (its own geometry) stay readable:
+# ground-model ribbons to port (positive offset, seabed nearest the route,
+# target depth outside it) and the BAS register to starboard.
+_GROUND_OFFSETS_MM = {"seabed": "1.3", "target": "2.7"}
+_BAS_OFFSET_MM = "-1.6"
+_BAS_COLOR = "#b8860b"
+
+
+def _data_defined_colour(symbol, field: str) -> None:
+    """Stroke colour from a feature field, on every symbol layer."""
+    try:
+        from qgis.core import QgsProperty
+
+        from ..qgis_compat import symbol_layer_property
+        key = symbol_layer_property("StrokeColor")
+        if key is None:
+            return
+        for i in range(symbol.symbolLayerCount()):
+            symbol.symbolLayer(i).setDataDefinedProperty(
+                key, QgsProperty.fromField(field))
+    except Exception:
+        pass
+
+
+def apply_ground_style(layer) -> None:
+    try:
+        from qgis.core import QgsLineSymbol, QgsRuleBasedRenderer
+    except ImportError:
+        return
+    if layer is None or not layer.isValid():
+        return
+    root = QgsRuleBasedRenderer.Rule(None)
+    for horizon, label in (("seabed", "Seabed soil class"),
+                           ("target", "Soil class at target burial depth")):
+        symbol = QgsLineSymbol.createSimple({
+            "color": "#c8c8c8", "width": "1.4", "line_style": "solid",
+            "offset": _GROUND_OFFSETS_MM[horizon], "offset_unit": "MM",
+            "capstyle": "flat"})
+        _data_defined_colour(symbol, "color")
+        rule = QgsRuleBasedRenderer.Rule(symbol)
+        rule.setLabel(label)
+        rule.setFilterExpression("\"horizon\" = '" + horizon + "'")
+        root.appendChild(rule)
+    layer.setRenderer(QgsRuleBasedRenderer(root))
+    try:
+        layer.setDisplayExpression(
+            "concat(\"class_label\", ' (', \"horizon\", ') KP ', "
+            "format_number(\"start_kp\", 3), '-', format_number(\"end_kp\", 3))")
+    except Exception:
+        pass
+    layer.triggerRepaint()
+
+
+def apply_bas_style(layer) -> None:
+    try:
+        from qgis.core import QgsLineSymbol, QgsRuleBasedRenderer
+    except ImportError:
+        return
+    if layer is None or not layer.isValid():
+        return
+    symbol = QgsLineSymbol.createSimple({
+        "color": _BAS_COLOR, "width": "1.2", "line_style": "solid",
+        "offset": _BAS_OFFSET_MM, "offset_unit": "MM", "capstyle": "flat"})
+    root = QgsRuleBasedRenderer.Rule(None)
+    rule = QgsRuleBasedRenderer.Rule(symbol)
+    rule.setLabel("BAS register row")
+    root.appendChild(rule)
+    layer.setRenderer(QgsRuleBasedRenderer(root))
+    try:
+        layer.setDisplayExpression(
+            "concat('BAS KP ', format_number(\"start_kp\", 3), '-', "
+            "format_number(\"end_kp\", 3))")
+    except Exception:
+        pass
+    layer.triggerRepaint()
 
 
 def burial_group(project: Optional[QgsProject] = None, create: bool = True):
@@ -620,7 +825,8 @@ def _ensure_layer(project: QgsProject, gpkg_path: str, layer_name: str,
 
 
 def ensure_plan_layers(project: Optional[QgsProject], gpkg_path: str, plan: Dict,
-                       parts: Optional[Sequence[str]] = None
+                       parts: Optional[Sequence[str]] = None,
+                       bas_fields=None
                        ) -> Tuple[Optional[QgsVectorLayer], Optional[QgsVectorLayer]]:
     """Find-or-add the plan's sections + events layers (sections beneath).
 
@@ -646,7 +852,42 @@ def ensure_plan_layers(project: Optional[QgsProject], gpkg_path: str, plan: Dict
                   apply_hazards_style,
                   expected_fields=schema.HAZARDS_LAYER_FIELDS,
                   reload="hazards" in wanted, plan=plan)
+    _ensure_layer(project, gpkg_path,
+                  schema.ground_layer_name(*base_args),
+                  apply_ground_style,
+                  expected_fields=schema.GROUND_LAYER_FIELDS,
+                  reload="ground" in wanted, plan=plan)
+    _ensure_layer(project, gpkg_path,
+                  schema.bas_layer_name(*base_args),
+                  apply_bas_style,
+                  expected_fields=bas_fields or schema.BAS_LAYER_BASE_FIELDS,
+                  reload="bas" in wanted, plan=plan)
     return sections, events
+
+
+def set_plan_layer_visibility(project: Optional[QgsProject], gpkg_path: str,
+                              plan: Dict, name_fn, visible: bool) -> None:
+    """Check/uncheck one of the plan's layers in the layer tree (tab toggles)."""
+    project = project or QgsProject.instance()
+    base_args = (plan.get("name") or "plan", plan.get("rev_label") or "",
+                 plan.get("plan_id") or "")
+    layer = find_layer(project, gpkg_path, name_fn(*base_args))
+    if layer is None:
+        return
+    node = project.layerTreeRoot().findLayer(layer.id())
+    if node is not None:
+        try:
+            node.setItemVisibilityChecked(bool(visible))
+        except (AttributeError, RuntimeError):
+            pass
+
+
+def plan_layer_exists(project: Optional[QgsProject], gpkg_path: str,
+                      plan: Dict, name_fn) -> bool:
+    project = project or QgsProject.instance()
+    base_args = (plan.get("name") or "plan", plan.get("rev_label") or "",
+                 plan.get("plan_id") or "")
+    return find_layer(project, gpkg_path, name_fn(*base_args)) is not None
 
 
 def set_active_plan_layers(project: Optional[QgsProject], plan: Dict) -> None:
@@ -669,7 +910,9 @@ def set_active_plan_layers(project: Optional[QgsProject], plan: Dict) -> None:
               schema.hazards_layer_name(*base_args),
               schema.tool_path_layer_name(*base_args),
               schema.barge_track_layer_name(*base_args),
-              schema.path_issues_layer_name(*base_args)}
+              schema.path_issues_layer_name(*base_args),
+              schema.ground_layer_name(*base_args),
+              schema.bas_layer_name(*base_args)}
     for node in group.findLayers():  # recursive: plan subgroups included
         layer = node.layer()
         if layer is None:
@@ -700,7 +943,9 @@ def remove_plan_layers(project: Optional[QgsProject], gpkg_path: str, plan: Dict
                  schema.hazards_layer_name(*base_args),
                  schema.tool_path_layer_name(*base_args),
                  schema.barge_track_layer_name(*base_args),
-                 schema.path_issues_layer_name(*base_args)):
+                 schema.path_issues_layer_name(*base_args),
+                 schema.ground_layer_name(*base_args),
+                 schema.bas_layer_name(*base_args)):
         layer = find_layer(project, gpkg_path, name)
         if layer is not None:
             project.removeMapLayer(layer.id())
@@ -719,7 +964,9 @@ def _burial_layer_name(source: str) -> str:
                      or value.endswith("_hazards")
                      or value.endswith("_tool_path")
                      or value.endswith("_barge_track")
-                     or value.endswith("_path_issues")):
+                     or value.endswith("_path_issues")
+                     or value.endswith("_ground")
+                     or value.endswith("_bas")):
             return value
     return ""
 
@@ -804,6 +1051,10 @@ def restore_burial_layers(project: Optional[QgsProject] = None) -> int:
                 elif name.endswith("_path_issues"):
                     from .path_layers import apply_path_issues_style
                     style_fn = apply_path_issues_style
+                elif name.endswith("_ground"):
+                    style_fn = apply_ground_style
+                elif name.endswith("_bas"):
+                    style_fn = apply_bas_style
                 else:
                     style_fn = apply_events_style
                 style_fn(layer)

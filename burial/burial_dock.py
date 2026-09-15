@@ -87,7 +87,9 @@ from .store import (
     project_gpkg_path,
     set_project_gpkg_path,
 )
+from .tabs.bas_tab import BasTab
 from .tabs.builder_tab import BuilderTab
+from .tabs.ground_tab import GroundTab
 from .tabs.inputs_tab import InputsTab
 from .tabs.plan_tab import PlanTab
 from .tabs.paths_tab import PathsTab
@@ -208,6 +210,8 @@ class BurialPlannerDock(QDockWidget):
         self.inputs_tab = InputsTab(self.model, self.workbench_store, dock=self)
         self.tools_tab = ToolsTab(self.model, self)
         self.profile_tab = ProfileTab(self.model, self)
+        self.ground_tab = GroundTab(self.model, self)
+        self.bas_tab = BasTab(self.model, self)
         self.rules_tab = RulesTab(self.model, self)
         self.risk_tab = RiskTab(self.model, self)
         self.paths_tab = PathsTab(self.model, self)
@@ -217,6 +221,8 @@ class BurialPlannerDock(QDockWidget):
         self.tabs.addTab(self.inputs_tab, "Inputs")
         self.tabs.addTab(self.tools_tab, "Burial Tools")
         self.tabs.addTab(self.profile_tab, "Bathymetry Profile")
+        self.tabs.addTab(self.ground_tab, "Ground Model")
+        self.tabs.addTab(self.bas_tab, "BAS")
         self.tabs.addTab(self.rules_tab, "Exclusions")
         self.tabs.addTab(self.risk_tab, "Risk Profile")
         self.tabs.addTab(self.paths_tab, "Installation Paths")
@@ -321,6 +327,7 @@ class BurialPlannerDock(QDockWidget):
         profile_layout.addLayout(profile_status_row)
         self.profile = BurialProfileWidget()
         self.profile.link_kp_plot(self.paths_tab.dcc_plot)
+        self.profile.link_kp_plot(self.ground_tab.plot.plot)
         self.profile.kpHovered.connect(self._on_profile_hover)
         self.profile.kpClicked.connect(self.goto_kp)
         self.profile.kpDoubleClicked.connect(self._on_profile_double_clicked)
@@ -593,6 +600,19 @@ class BurialPlannerDock(QDockWidget):
                 # written (e.g. a fresh duplicate) — build them now instead
                 # of showing an empty map until the first edit.
                 self.model.refresh_layers(immediate=True)
+            overlay_parts = [
+                part for part, rows, name_fn in (
+                    ("ground", self.model.ground_units, schema.ground_layer_name),
+                    ("bas", self.model.bas_rows, schema.bas_layer_name))
+                if rows and self.model.route is not None
+                and not map_layers.plan_layer_exists(
+                    QgsProject.instance(), self.store.gpkg_path,
+                    self.model.plan, name_fn)]
+            if overlay_parts:
+                # Same for the ground-model / BAS overlays: rows are
+                # registry-authoritative, the layers are rebuildable.
+                self.model.refresh_layers(parts=tuple(overlay_parts),
+                                          immediate=True)
             if self.model.path_result:
                 # Path WKT is authoritative in the registry; rebuildable
                 # spatial layers may not yet exist after a file move/copy.
@@ -1447,6 +1467,10 @@ class BurialPlannerDock(QDockWidget):
         return self._marker
 
     def _on_profile_hover(self, kp: float) -> None:
+        try:
+            self.ground_tab.sync_kp(kp)
+        except Exception:
+            pass
         point = self._canvas_point(kp)
         if point is None:
             return
