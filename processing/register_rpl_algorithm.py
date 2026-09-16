@@ -45,8 +45,6 @@ from ..workbench.store import (
 )
 from ..kp_geo_utils import get_features_skip_invalid
 
-WORKBENCH_GROUP = "Cable Route Workbench"
-
 
 def _value(feature, name: str):
     try:
@@ -426,16 +424,14 @@ class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
             return {}
         project = context.project() or QgsProject.instance()
         set_project_gpkg_path(self._gpkg_path, project)
-        root = project.layerTreeRoot()
-        group = root.findGroup(WORKBENCH_GROUP) or root.insertGroup(0, WORKBENCH_GROUP)
-        from .cable_lay_parsers import gpkg_layer_uri
-        from qgis.core import QgsVectorLayer
+        # Same layer management as the workbench dock, so the layers are named
+        # and grouped by system / segment / revision.
+        from ..workbench.project_layers import build_placements, ensure_layer
+        from ..workbench.store import WorkbenchStore
 
+        placements = build_placements(WorkbenchStore(self._gpkg_path))
         for layer_name in getattr(self, "_layer_names", []):
-            layer = QgsVectorLayer(gpkg_layer_uri(self._gpkg_path, layer_name), layer_name, "ogr")
-            if layer.isValid():
-                project.addMapLayer(layer, False)
-                group.addLayer(layer)
+            ensure_layer(project, self._gpkg_path, layer_name, placements=placements)
         return {}
 
     def name(self):

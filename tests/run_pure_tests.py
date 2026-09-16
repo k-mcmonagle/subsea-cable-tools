@@ -32,6 +32,7 @@ PURE_MODULES = [
     "test_rules_engine",
     "test_planner_reports",
     "test_rpl_import_core",
+    "test_rpl_compare",
     "test_system_topology",
     "test_burial_gpkg_sql",
     "test_burial_risk",

@@ -27,6 +27,7 @@ from ..workbench.assembly_manager_dock import ExtractReviewDialog
 from ..workbench.configurable_table import ConfigurableTable
 from ..workbench.rpl_engine import RplModel, RplPoint, RplSegment, SlackMode
 from ..workbench.rpl_layer_io import model_rows_for_layers
+from ..workbench.rpl_compare import statistic_rows as _statistic_rows
 from ..workbench.rpl_manager_dock import RplManagerPanel
 from ..workbench.overview_panels import SegmentOverviewPanel, SystemOverviewPanel
 from ..workbench.sld_widget import SldWidget
@@ -213,7 +214,11 @@ def test_guided_overviews_construct() -> bool:
     ok = ok and segment_panel.schematic._home.toolTip().startswith("Home")
     ok = ok and segment_panel.title.text() == "Guided segment"
     ok = ok and [segment_panel.views.tabText(i)
-                 for i in range(segment_panel.views.count())] == ["Table", "Schematic"]
+                 for i in range(segment_panel.views.count())] == [
+                     "Table", "Schematic", "Compare revisions"]
+    # One revision only: the compare tab says so rather than comparing.
+    ok = ok and segment_panel.compare.combo_a.count() == 1
+    ok = ok and "fewer than two" in segment_panel.compare.summary.text()
     ok = ok and segment_panel.positions_table.rowCount() == 11
     ok = ok and segment_panel.sections_table.rowCount() == 1
     ok = ok and segment_panel.sections_table.item(0, 7).text() == "LW"
@@ -672,6 +677,86 @@ def test_v3_adapter_contract() -> bool:
     return _result("V3 adapter contract (routes/bathy/azimuth/window/results)", ok)
 
 
+def test_compare_revisions_tab() -> bool:
+    """The compare tab reads both revisions and reports the real differences."""
+    store = _temp_store()
+    rpl_id = _register_synthetic_rpl(store, "Compared segment")
+    route_id = (store.get_rpl(rpl_id) or {}).get("route_id")
+    rev2_id = store.new_rpl_revision(rpl_id, "Rev 2")
+
+    # Edit Rev 2: nudge one position, rename another, re-armour a leg.
+    rev2 = store.get_rpl(rev2_id) or {}
+    points_layer = store.open_layer(rev2.get("points_layer") or "")
+    lines_layer = store.open_layer(rev2.get("lines_layer") or "")
+    ok = points_layer is not None and lines_layer is not None
+    if not ok:
+        return _result("compare revisions tab", False, "revision layers missing")
+
+    fields = points_layer.fields()
+    lat_idx = fields.indexOf("Latitude")
+    event_idx = fields.indexOf("Event")
+    features = sorted(points_layer.getFeatures(),
+                      key=lambda f: f["SeqNo"] if f["SeqNo"] is not None else 0)
+    points_layer.startEditing()
+    # ~0.005 deg north of where Rev 1 put it: a real, reportable move.
+    points_layer.changeAttributeValue(
+        features[5].id(), lat_idx, float(features[5]["Latitude"]) + 0.005)
+    points_layer.changeAttributeValue(
+        features[-1].id(), event_idx, "End terminal (revised)")
+    points_layer.commitChanges()
+
+    type_idx = lines_layer.fields().indexOf("CableType")
+    legs = sorted(lines_layer.getFeatures(),
+                  key=lambda f: f["SeqNo"] if f["SeqNo"] is not None else 0)
+    lines_layer.startEditing()
+    lines_layer.changeAttributeValue(legs[0].id(), type_idx, "DA")
+    lines_layer.commitChanges()
+
+    panel = SegmentOverviewPanel()
+    panel.load_segment(store, route_id)
+    compare = panel.compare
+    ok = compare.combo_a.count() == 2 and compare.combo_b.count() == 2
+    # Defaults to the newest pair, oldest on the left.
+    ok = ok and compare.combo_b.currentData() == rev2_id
+    ok = ok and compare.combo_a.currentData() == rpl_id
+
+    panel.views.setCurrentIndex(2)          # showing the tab runs the comparison
+    comparison = compare._comparison
+    ok = ok and comparison is not None
+    if not ok:
+        panel.deleteLater()
+        return _result("compare revisions tab", False, "no comparison produced")
+
+    counts = comparison.position_counts()
+    ok = ok and counts.get("changed") == 2
+    ok = ok and counts.get("added", 0) == 0 and counts.get("removed", 0) == 0
+    ok = ok and counts.get("unchanged") == 9
+    moved = [m for m in comparison.positions
+             if m.distance_m is not None and m.distance_m > 100.0]
+    ok = ok and len(moved) == 1
+    renamed = [m for m in comparison.positions if "event" in m.changes]
+    ok = ok and len(renamed) == 1
+
+    # The moved position changes the two legs either side of it.
+    leg_counts = comparison.leg_counts()
+    ok = ok and leg_counts.get("changed", 0) >= 1
+    ok = ok and leg_counts.get("added", 0) == 0 and leg_counts.get("removed", 0) == 0
+    cable_type_changes = [m for m in comparison.legs if "cable_type" in m.changes]
+    ok = ok and len(cable_type_changes) == 1
+
+    stats = {row[0]: row for row in _statistic_rows(comparison)}
+    ok = ok and stats["Positions"][1] == "11" and stats["Positions"][2] == "11"
+    ok = ok and "LW (route)" in stats and "DA (route)" in stats
+    # The tables are populated and the export is available.
+    ok = ok and compare.stats_table.rowCount() > 0
+    ok = ok and compare.positions_table.rowCount() == 2      # changes only
+    ok = ok and compare.export_btn.isEnabled()
+    compare.changes_only.setChecked(False)
+    ok = ok and compare.positions_table.rowCount() == 11
+    panel.deleteLater()
+    return _result("compare revisions tab", ok, str(counts))
+
+
 def run_all() -> list:
     return [
         test_systems_bmh_bu_example(),
@@ -684,6 +769,7 @@ def run_all() -> list:
         test_configurable_table_columns_persist(),
         test_assembly_review_uses_section_equipment_language(),
         test_rpl_tables_populate_lazily(),
+        test_compare_revisions_tab(),
         test_v3_adapter_contract(),
     ]
 

@@ -30,7 +30,6 @@ from qgis.core import (
     QgsProcessingParameterFileDestination,
     QgsProcessingParameterString,
     QgsProject,
-    QgsVectorLayer,
 )
 
 from ..rpl_import import model as im
@@ -48,8 +47,6 @@ from ..workbench.store import (
     WorkbenchStore, default_project_gpkg_path, project_gpkg_path,
     set_project_gpkg_path,
 )
-
-WORKBENCH_GROUP = "Cable Route Workbench"
 
 
 class ImportRPLAlgorithm(QgsProcessingAlgorithm):
@@ -259,17 +256,15 @@ class ImportRPLAlgorithm(QgsProcessingAlgorithm):
             return {}
         project = context.project() or QgsProject.instance()
         set_project_gpkg_path(self._gpkg_path, project)
-        root = project.layerTreeRoot()
-        group = (root.findGroup(WORKBENCH_GROUP)
-                 or root.insertGroup(0, WORKBENCH_GROUP))
-        from .cable_lay_parsers import gpkg_layer_uri
+        # Goes through the workbench's own layer management so the layers are
+        # named and grouped by system / segment / revision like every other
+        # route into the workbench.
+        from ..workbench.project_layers import build_placements, ensure_layer
+        from ..workbench.store import WorkbenchStore
 
+        placements = build_placements(WorkbenchStore(self._gpkg_path))
         for layer_name in getattr(self, "_layer_names", []):
-            layer = QgsVectorLayer(
-                gpkg_layer_uri(self._gpkg_path, layer_name), layer_name, "ogr")
-            if layer.isValid():
-                project.addMapLayer(layer, False)
-                group.addLayer(layer)
+            ensure_layer(project, self._gpkg_path, layer_name, placements=placements)
         return {}
 
     def name(self):

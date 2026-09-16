@@ -12,6 +12,7 @@ from qgis.PyQt.QtWidgets import (
 )
 
 from . import schema
+from .compare_panel import RevisionComparePanel
 from .rpl_summary import (
     format_cable_type_lengths, rpl_summary, sum_cable_type_lengths,
 )
@@ -496,6 +497,7 @@ class SegmentOverviewPanel(QWidget):
     createAssemblyRequested = pyqtSignal(str)
     removeMakeupItemRequested = pyqtSignal(str, str)
     openAssemblyRequested = pyqtSignal(str)
+    zoomToPositionRequested = pyqtSignal(float, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -600,6 +602,9 @@ class SegmentOverviewPanel(QWidget):
         self.schematic.componentActivated.connect(self._schematic_activated)
         schematic_layout.addWidget(self.schematic, 1)
         self.views.addTab(schematic_page, "Schematic")
+        self.compare = RevisionComparePanel()
+        self.compare.zoomRequested.connect(self.zoomToPositionRequested)
+        self.views.addTab(self.compare, "Compare revisions")
         self.views.currentChanged.connect(self._view_changed)
         layout.addWidget(self.views, 1)
 
@@ -645,6 +650,8 @@ class SegmentOverviewPanel(QWidget):
         self.positions_table.setRowCount(0)
         self.sections_table.setRowCount(0)
         self._selected_rpl_id = ""
+        self.compare.load_segment(store, route_id if route else "")
+        self.compare.set_visible_tab(self.views.currentWidget() is self.compare)
         if not route:
             self.title.setText("Cable segment")
             self.endpoint_summary.setText("No cable segment selected.")
@@ -832,6 +839,7 @@ class SegmentOverviewPanel(QWidget):
 
     def _view_changed(self, _index):
         self._render_schematic_if_visible()
+        self.compare.set_visible_tab(self.views.currentWidget() is self.compare)
 
     def _schematic_mode_changed(self, _index):
         if self._store is not None and self._route_id:

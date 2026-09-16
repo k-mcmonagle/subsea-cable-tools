@@ -1325,13 +1325,17 @@ class RplImportWizard(QWizard):
             return
         try:
             from qgis.core import QgsProject
-            from .project_layers import ensure_layer
-            from .store import set_project_gpkg_path
+            from .project_layers import build_placements, ensure_layer
+            from .store import set_project_gpkg_path, WorkbenchStore
             project = QgsProject.instance()
             set_project_gpkg_path(result.gpkg_path, project)
             extent = None
-            lines = ensure_layer(project, result.gpkg_path, result.lines_layer)
-            ensure_layer(project, result.gpkg_path, result.points_layer)
+            # Name and group the new layers after the revision they hold.
+            placements = build_placements(WorkbenchStore(result.gpkg_path))
+            lines = ensure_layer(project, result.gpkg_path, result.lines_layer,
+                                 placements=placements)
+            ensure_layer(project, result.gpkg_path, result.points_layer,
+                         placements=placements)
             if lines is not None:
                 extent = lines.extent()
             if extent is not None and self.iface is not None:

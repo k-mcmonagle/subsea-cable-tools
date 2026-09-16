@@ -20,8 +20,10 @@ from ..burial.tabs.paths_tab import (
 from ..burial.plan_model import PlanModel
 from ..burial.store import BurialStore
 from ..explorer import CableLayExplorerWindow
-from ..workbench import schema
+from ..workbench import layer_style, schema
 from ..workbench.assessment_panel import RuleEditorDialog
+from ..workbench.cable_type_dialog import CableTypeColourDialog
+from ..workbench.compare_panel import RevisionComparePanel
 from ..workbench.depth_service import DepthSourceConfig
 
 
@@ -179,6 +181,36 @@ def test_cable_lay_explorer_panels_construct():
     window.shutdown()
 
 
+def test_workbench_cable_type_dialog_constructs():
+    """The colour editor builds with no registry and lists the known types."""
+    previous = layer_style.user_cable_type_colours()
+    try:
+        layer_style.set_user_cable_type_colours({"XYZ": "#010203"})
+        dialog = CableTypeColourDialog(None)
+        assert dialog.table.rowCount() >= len(layer_style.KNOWN_CABLE_TYPE_COLOURS)
+        tokens = {dialog.table.item(row, 0).text()
+                  for row in range(dialog.table.rowCount())}
+        assert "XYZ" in tokens and "DA" in tokens
+        sources = {dialog.table.item(row, 0).text(): dialog.table.item(row, 2).text()
+                   for row in range(dialog.table.rowCount())}
+        assert sources["XYZ"] == "Custom"
+        assert sources["DA"] == "Standard"
+        assert dialog.palette() == {"xyz".upper(): "#010203"}
+        dialog.deleteLater()
+    finally:
+        layer_style.set_user_cable_type_colours(previous)
+
+
+def test_workbench_compare_panel_constructs():
+    panel = RevisionComparePanel()
+    panel.load_segment(None, "")
+    assert [panel.tabs.tabText(i) for i in range(panel.tabs.count())] == [
+        "Statistics", "Positions", "Legs"]
+    assert not panel.export_btn.isEnabled()
+    panel.set_visible_tab(True)          # nothing selected: must not raise
+    panel.deleteLater()
+
+
 def run_all():
     if QApplication.instance() is None:
         print("[SKIP] compatibility widget checks need QApplication")
@@ -190,7 +222,9 @@ def run_all():
             test_workbench_rule_layer_filters_construct,
             test_lay_simulator_tables_construct,
             test_bu_lowering_tool_constructs_and_builds_config,
-            test_cable_lay_explorer_panels_construct):
+            test_cable_lay_explorer_panels_construct,
+            test_workbench_cable_type_dialog_constructs,
+            test_workbench_compare_panel_constructs):
         try:
             test()
             QApplication.processEvents()

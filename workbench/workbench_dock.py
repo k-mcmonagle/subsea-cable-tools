@@ -105,6 +105,9 @@ class WorkbenchDock(QDockWidget):
         store_menu.addAction("Create new Workbench...", self._create_new_workbench)
         store_menu.addSeparator()
         store_menu.addAction("Manage assemblies...", self._manage_assemblies)
+        store_menu.addSeparator()
+        store_menu.addAction("Cable type colours...", self._edit_cable_type_colours)
+        store_menu.addAction("Organise map layers", self._organise_map_layers)
         store_btn.setMenu(store_menu)
         file_row.addWidget(store_btn)
         left_layout.addLayout(file_row)
@@ -196,6 +199,7 @@ class WorkbenchDock(QDockWidget):
         self.segment_overview.createAssemblyRequested.connect(self._create_assembly_for_segment)
         self.segment_overview.removeMakeupItemRequested.connect(self._remove_makeup_item)
         self.segment_overview.openAssemblyRequested.connect(self._open_assembly_id)
+        self.segment_overview.zoomToPositionRequested.connect(self._zoom_to_position)
         self._connect_project_layer_sync()
 
         self.refresh_tree()
@@ -1028,6 +1032,36 @@ class WorkbenchDock(QDockWidget):
         self.assembly_panel._new_assembly()
         self.refresh_tree()
 
+    def _edit_cable_type_colours(self):
+        """Edit the user's cable-type palette and restyle the map layers."""
+        from .cable_type_dialog import edit_cable_type_colours
+
+        store = self._store()
+        restyled = edit_cable_type_colours(store, self)
+        if restyled is None:
+            return
+        self.iface.messageBar().pushInfo(
+            "Cable Route Workbench",
+            f"Cable type colours applied to {restyled} layer"
+            f"{'' if restyled == 1 else 's'}.")
+
+    def _organise_map_layers(self):
+        """Rename and regroup the project's workbench layers by hand."""
+        moved = self._organise_layers()
+        self.iface.messageBar().pushInfo(
+            "Cable Route Workbench",
+            f"Organised {moved} workbench layer{'' if moved == 1 else 's'}."
+            if moved else "Workbench layers are already organised.")
+
+    def _organise_layers(self) -> int:
+        """File the project's workbench layers under system / segment / revision."""
+        from .project_layers import organise_workbench_layers
+
+        store = self.rpl_panel.store
+        if store is None or not store.exists():
+            return 0
+        return organise_workbench_layers(QgsProject.instance(), store)
+
     def _manage_assemblies(self):
         """Open the secondary assembly catalogue without restoring a tree root."""
         self.assembly_panel.browser.setVisible(True)
@@ -1450,6 +1484,7 @@ class WorkbenchDock(QDockWidget):
         if store is None or route_id is None:
             return
         store.assign_route_to_system(route_id, system_id)
+        self._organise_layers()
         self.refresh_tree()
         self._select_ref((KIND_ROUTE, route_id))
 
@@ -1468,6 +1503,7 @@ class WorkbenchDock(QDockWidget):
             return
         route["name"] = name.strip()
         store.save_route(route)
+        self._organise_layers()
         self.refresh_tree()
         self._select_ref((KIND_ROUTE, route_id))
 
@@ -1487,6 +1523,7 @@ class WorkbenchDock(QDockWidget):
         system = dict(system)
         system["name"] = name.strip()
         store.save_system(system)
+        self._organise_layers()
         self.refresh_tree()
 
     def _edit_rpl_revision_label(self):
@@ -1507,7 +1544,27 @@ class WorkbenchDock(QDockWidget):
         self.rpl_panel.select_rpl(rpl_id)
         self.rpl_panel.revision_edit.setText(label.strip())
         self.rpl_panel._save_revision_label()
+        self._organise_layers()
         self.refresh_tree()
+
+    def _zoom_to_position(self, latitude: float, longitude: float):
+        """Centre the map on one WGS84 position (a comparison table row)."""
+        if self.iface is None:
+            return
+        from qgis.core import (QgsCoordinateReferenceSystem, QgsCoordinateTransform,
+                               QgsPointXY)
+
+        canvas = self.iface.mapCanvas()
+        try:
+            transform = QgsCoordinateTransform(
+                QgsCoordinateReferenceSystem("EPSG:4326"),
+                canvas.mapSettings().destinationCrs(),
+                QgsProject.instance().transformContext())
+            point = transform.transform(QgsPointXY(float(longitude), float(latitude)))
+        except Exception:
+            return
+        canvas.setCenter(point)
+        canvas.refresh()
 
     def _zoom_to_selected_rpl(self):
         rpl_id = self._selected_rpl_id()

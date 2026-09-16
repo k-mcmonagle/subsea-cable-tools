@@ -8,6 +8,10 @@ Ranges can come from:
 
 The first two columns are interpreted as start/end KP (km). Any additional
 columns are carried through to the output.
+
+A row whose start and end KP are the same (within the point tolerance) is a
+single position, not a range: it is emitted to the secondary point output
+instead of being rejected as a zero-length segment.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from qgis.core import (QgsProcessing,
                        QgsProcessingParameterFeatureSource,
                        QgsProcessingParameterFeatureSink,
                        QgsProcessingParameterField,
+                       QgsProcessingParameterNumber,
                        QgsProcessingParameterString,
                        QgsFeature,
                        QgsGeometry,
@@ -32,7 +37,12 @@ from qgis.core import (QgsProcessing,
                        QgsField,
                        QgsWkbTypes,
                        QgsDistanceArea)
-from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_FIELD_NUMERIC
+from ..qgis_compat import (
+    FIELD_TYPE_DOUBLE,
+    FIELD_TYPE_STRING,
+    PROCESSING_FIELD_NUMERIC,
+    PROCESSING_NUMBER_DOUBLE,
+)
 
 from ..kp_range_utils import (
     extract_line_segment,
@@ -41,7 +51,7 @@ from ..kp_range_utils import (
     add_distance_mode_parameter,
     read_distance_mode,
 )
-from ..kp_geo_utils import get_features_skip_invalid
+from ..kp_geo_utils import get_features_skip_invalid, point_at_kp
 
 class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
     INPUT_LAYER = 'INPUT_LAYER'
@@ -49,7 +59,9 @@ class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
     START_KP_FIELD = 'START_KP_FIELD'
     END_KP_FIELD = 'END_KP_FIELD'
     PASTED_RANGES = 'PASTED_RANGES'
+    POINT_TOLERANCE = 'POINT_TOLERANCE'
     OUTPUT = 'OUTPUT'
+    OUTPUT_POINTS = 'OUTPUT_POINTS'
 
     _DEFAULT_COL_PREFIX = 'col_'
 
@@ -238,9 +250,27 @@ class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
             )
         )
         self.addParameter(
+            QgsProcessingParameterNumber(
+                self.POINT_TOLERANCE,
+                self.tr('Treat a range shorter than this as a point (m)'),
+                type=PROCESSING_NUMBER_DOUBLE,
+                defaultValue=0.0,
+                minValue=0.0,
+                optional=True,
+            )
+        )
+        self.addParameter(
             QgsProcessingParameterFeatureSink(
                 self.OUTPUT,
-                self.tr('Output layer')
+                self.tr('Output layer (ranges)')
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterFeatureSink(
+                self.OUTPUT_POINTS,
+                self.tr('Output layer (single positions)'),
+                optional=True,
+                createByDefault=True,
             )
         )
 
@@ -299,18 +329,31 @@ class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
             QgsWkbTypes.LineString,
             source.sourceCrs(),
         )
+        # A row whose start and end KP are equal describes a position, not a
+        # range, so it goes to its own point sink rather than being rejected.
+        (point_sink, point_dest_id) = self.parameterAsSink(
+            parameters,
+            self.OUTPUT_POINTS,
+            context,
+            fields,
+            QgsWkbTypes.Point,
+            source.sourceCrs(),
+        )
+        point_tolerance_m = max(
+            0.0, float(self.parameterAsDouble(parameters, self.POINT_TOLERANCE, context) or 0.0))
+        counts = {'ranges': 0, 'points': 0, 'skipped': 0}
 
         # Combine all features from the line layer into a single geometry
         geometries = [f.geometry() for f in get_features_skip_invalid(source)
                       if f.hasGeometry() and not f.geometry().isEmpty()]
         if not geometries:
-            return {self.OUTPUT: dest_id}
+            return {self.OUTPUT: dest_id, self.OUTPUT_POINTS: point_dest_id}
 
         combined_geom = QgsGeometry.unaryUnion(geometries)
 
         if combined_geom.isEmpty():
             feedback.pushInfo("Input line layer is empty or invalid.")
-            return {self.OUTPUT: dest_id}
+            return {self.OUTPUT: dest_id, self.OUTPUT_POINTS: point_dest_id}
 
         distance_mode = read_distance_mode(self, parameters, context)
         try:
@@ -325,31 +368,62 @@ class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
         total_length = float(measure_total_length_m(combined_geom, distance_calculator))
         feedback.pushInfo(f"Total length of dissolved input line: {total_length} meters")
 
+        def emit(start_kp, end_kp, carried, source_table_name):
+            """Write one row to the range sink, or to the point sink if it is one."""
+            if start_kp < 0 or end_kp < 0:
+                feedback.reportError(
+                    f"KP range {start_kp}-{end_kp} is before the start of the line. Skipping.")
+                counts['skipped'] += 1
+                return
+            if (start_kp * 1000) > total_length or (end_kp * 1000) > total_length:
+                feedback.reportError(
+                    f"KP range {start_kp}-{end_kp} exceeds total line length of {total_length/1000:.2f} km. Skipping."
+                )
+                counts['skipped'] += 1
+                return
+            attributes = [start_kp, end_kp]
+            attributes.extend(carried)
+            attributes.append(source_table_name)
+            attributes.append(source.sourceName())
+
+            if abs(end_kp - start_kp) * 1000.0 <= point_tolerance_m:
+                if point_sink is None:
+                    feedback.reportError(
+                        f"KP {start_kp} is a single position but no point output was "
+                        "requested. Skipping.")
+                    counts['skipped'] += 1
+                    return
+                kp = (start_kp + end_kp) / 2.0
+                point_xy = point_at_kp(combined_geom, kp, distance_calculator, clamp=True)
+                if point_xy is None:
+                    feedback.reportError(f"Could not place a point at KP {kp}. Skipping.")
+                    counts['skipped'] += 1
+                    return
+                feat = QgsFeature(fields)
+                feat.setGeometry(QgsGeometry.fromPointXY(point_xy))
+                feat.setAttributes(attributes)
+                point_sink.addFeature(feat, QgsFeatureSink.FastInsert)
+                counts['points'] += 1
+                return
+
+            seg_geom = extract_line_segment(combined_geom, start_kp, end_kp, distance_calculator)
+            if seg_geom and not seg_geom.isEmpty():
+                feat = QgsFeature(fields)
+                feat.setGeometry(seg_geom)
+                feat.setAttributes(attributes)
+                sink.addFeature(feat, QgsFeatureSink.FastInsert)
+                counts['ranges'] += 1
+            else:
+                feedback.reportError(
+                    f"Could not extract line segment for KP range {start_kp}-{end_kp}. Skipping.")
+                counts['skipped'] += 1
+
         if use_pasted:
             total_rows = len(pasted_rows)
             for current, (start_kp, end_kp, extras) in enumerate(pasted_rows):
                 if feedback.isCanceled():
                     break
-
-                if (start_kp * 1000) > total_length or (end_kp * 1000) > total_length:
-                    feedback.reportError(
-                        f"KP range {start_kp}-{end_kp} exceeds total line length of {total_length/1000:.2f} km. Skipping."
-                    )
-                    continue
-
-                seg_geom = extract_line_segment(combined_geom, start_kp, end_kp, distance_calculator)
-                if seg_geom and not seg_geom.isEmpty():
-                    feat = QgsFeature(fields)
-                    feat.setGeometry(seg_geom)
-                    attributes = [start_kp, end_kp]
-                    attributes.extend(extras)
-                    attributes.append('pasted_text')
-                    attributes.append(source.sourceName())
-                    feat.setAttributes(attributes)
-                    sink.addFeature(feat, QgsFeatureSink.FastInsert)
-                else:
-                    feedback.reportError(f"Could not extract line segment for KP range {start_kp}-{end_kp}. Skipping.")
-
+                emit(start_kp, end_kp, extras, 'pasted_text')
                 feedback.setProgress(int((current + 1) / max(total_rows, 1) * 100))
         else:
             input_features = list(get_features_skip_invalid(input_layer))
@@ -363,30 +437,17 @@ class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
                     end_kp = float(feature[end_kp_field])
                 except (ValueError, KeyError, TypeError):
                     feedback.reportError(f"Invalid KP values in row {current + 1}. Skipping.")
+                    counts['skipped'] += 1
                     continue
-
-                if (start_kp * 1000) > total_length or (end_kp * 1000) > total_length:
-                    feedback.reportError(
-                        f"KP range {start_kp}-{end_kp} exceeds total line length of {total_length/1000:.2f} km. Skipping."
-                    )
-                    continue
-
-                seg_geom = extract_line_segment(combined_geom, start_kp, end_kp, distance_calculator)
-
-                if seg_geom and not seg_geom.isEmpty():
-                    feat = QgsFeature(fields)
-                    feat.setGeometry(seg_geom)
-                    attributes = [start_kp, end_kp]
-                    for field_name in additional_fields:
-                        attributes.append(feature[field_name])
-                    attributes.append(input_layer.sourceName())
-                    attributes.append(source.sourceName())
-                    feat.setAttributes(attributes)
-                    sink.addFeature(feat, QgsFeatureSink.FastInsert)
-                else:
-                    feedback.reportError(f"Could not extract line segment for KP range {start_kp}-{end_kp}. Skipping.")
+                emit(start_kp, end_kp,
+                     [feature[name] for name in additional_fields],
+                     input_layer.sourceName())
                 feedback.setProgress(int((current + 1) / max(total_rows, 1) * 100))
-        return {self.OUTPUT: dest_id}
+
+        feedback.pushInfo(
+            f"Wrote {counts['ranges']} range(s) and {counts['points']} single position(s); "
+            f"{counts['skipped']} row(s) skipped.")
+        return {self.OUTPUT: dest_id, self.OUTPUT_POINTS: point_dest_id}
 
     def shortHelpString(self):
         return self.tr("""
@@ -397,9 +458,15 @@ You can provide KP ranges either:
 1) From a table layer (like a loaded CSV with no geometry), OR
 2) By pasting rows directly from Excel/CSV into the 'Paste KP ranges' box.
 
-For pasted text, the first two columns are interpreted as Start KP and End KP (in km). Any other columns are carried through to the output as text fields.
+For pasted text, the first two columns are interpreted as Start KP and End KP (in km). Any other columns are carried through to the output.
 
 All carried-through columns will be included in the output layer, along with fields for the source table and line layer names.
+
+**Single positions**
+
+A row whose Start KP and End KP are the same is a position rather than a range. Those rows are written to the second output, 'Output layer (single positions)', as points on the reference line, with exactly the same attributes as the range output. Rows are no longer rejected for being zero-length.
+
+Raise 'Treat a range shorter than this as a point (m)' above 0 to send very short ranges (rounded KPs, for example) to the point output as well.
 
 **Instructions:**
 

@@ -509,7 +509,8 @@ class RplManagerPanel(QWidget):
             return None
         from .project_layers import ensure_layer
 
-        return ensure_layer(QgsProject.instance(), self.store.gpkg_path, layer_name)
+        return ensure_layer(QgsProject.instance(), self.store.gpkg_path, layer_name,
+                            store=self.store)
 
     # ------------------------------------------------------------- tables --
     def _refresh_tables(self, model: Optional[RplModel] = None, mark_dirty: bool = True):

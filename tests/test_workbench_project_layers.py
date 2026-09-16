@@ -2,9 +2,11 @@
 """Checks for workbench project-layer management and standard styling.
 
 Covers source-URI matching (Windows case/slash robustness), ensure_layer
-add/dedupe, the automatic CableType/Event symbology, project-open restore
-(restore_workbench_layers), and the project-teardown guard that protects the
-registry when QGIS clears all layers.
+add/dedupe, the system / segment / revision naming and grouping, the
+automatic CableType/Event symbology and its preservation of a user's own
+style, project-open restore (restore_workbench_layers), and the
+project-teardown guard that protects the registry when QGIS clears all
+layers.
 
 Requires the QGIS API (run via tests/run_qgis_smoke_tests.py).
 """
@@ -283,10 +285,211 @@ def test_sync_survives_deleted_layers() -> bool:
     return _result("sync survives deleted layers", ok)
 
 
+def _store_with_system_and_route():
+    """A registry with one system, one segment and two RPL revisions."""
+    folder = tempfile.mkdtemp(prefix="wb_grouping_test_")
+    store = WorkbenchStore(os.path.join(folder, "workbench.gpkg"))
+    store.ensure_created()
+    system_id = store.create_system("Atlantic Link")
+    route_id = store.create_route("Segment 1", system_id=system_id)
+    rpls = []
+    for index, label in enumerate(("Rev 1", "Rev 2")):
+        rpl_id = schema.new_id()
+        points_layer = schema.rpl_points_layer_name(f"Segment 1 {label}")
+        lines_layer = schema.rpl_lines_layer_name(f"Segment 1 {label}")
+        store.write_spatial_layer(points_layer, POINT_SPECS, WKB_POINT, [
+            {"rpl_id": rpl_id, "SeqNo": 0, "Event": "BMH", WKT_KEY: "POINT (0 0)"},
+            {"rpl_id": rpl_id, "SeqNo": 1, "Event": "BU-1",
+             WKT_KEY: f"POINT (0.{index + 1} 0)"},
+        ])
+        store.write_spatial_layer(lines_layer, LINE_SPECS, WKB_LINESTRING, [
+            {"rpl_id": rpl_id, "SeqNo": 0, "CableType": "DA",
+             WKT_KEY: f"LINESTRING (0 0, 0.{index + 1} 0)"},
+        ])
+        store.save_rpl({
+            "rpl_id": rpl_id, "name": f"Segment 1 {label}", "kind": "rpl",
+            "points_layer": points_layer, "lines_layer": lines_layer,
+            "route_id": route_id, "rev_label": label,
+        })
+        rpls.append(store.get_rpl(rpl_id))
+    return store, route_id, rpls
+
+
+def test_layers_are_named_and_grouped() -> bool:
+    project = QgsProject.instance()
+    project.clear()
+    store, _route_id, rpls = _store_with_system_and_route()
+
+    placements = project_layers.build_placements(store)
+    lines = project_layers.ensure_layer(
+        project, store.gpkg_path, rpls[1]["lines_layer"], placements=placements)
+    points = project_layers.ensure_layer(
+        project, store.gpkg_path, rpls[1]["points_layer"], placements=placements)
+    ok = lines is not None and points is not None
+    sep = project_layers.NAME_SEPARATOR
+    expected = sep.join(["Atlantic Link", "Segment 1", "Rev 2", "Lines"])
+    ok = ok and lines.name() == expected
+    ok = ok and points.name().endswith(sep + "Points")
+
+    root = project.layerTreeRoot().findGroup(project_layers.WORKBENCH_GROUP)
+    ok = ok and root is not None
+    system_group = root.findGroup("Atlantic Link") if root else None
+    ok = ok and system_group is not None
+    segment_group = system_group.findGroup("Segment 1") if system_group else None
+    ok = ok and segment_group is not None
+    revision_group = segment_group.findGroup("Rev 2") if segment_group else None
+    ok = ok and revision_group is not None and len(revision_group.findLayers()) == 2
+    # Layers stay findable by source no matter what they are called.
+    ok = ok and project_layers.find_layer(
+        project, store.gpkg_path, rpls[1]["lines_layer"]) is lines
+    project.clear()
+    return _result("layers named and grouped by system / segment / revision", ok)
+
+
+def test_organise_follows_a_rename() -> bool:
+    project = QgsProject.instance()
+    project.clear()
+    store, route_id, rpls = _store_with_system_and_route()
+    placements = project_layers.build_placements(store)
+    lines = project_layers.ensure_layer(
+        project, store.gpkg_path, rpls[0]["lines_layer"], placements=placements)
+
+    route = store.get_route(route_id)
+    route["name"] = "Segment 1A"
+    store.save_route(route)
+    moved = project_layers.organise_workbench_layers(project, store)
+
+    ok = moved >= 1 and "Segment 1A" in lines.name()
+    root = project.layerTreeRoot().findGroup(project_layers.WORKBENCH_GROUP)
+    system_group = root.findGroup("Atlantic Link") if root else None
+    ok = ok and system_group is not None
+    ok = ok and system_group.findGroup("Segment 1A") is not None
+    # The stale group is cleaned up rather than left behind empty.
+    ok = ok and system_group.findGroup("Segment 1") is None
+    project.clear()
+    return _result("organise_workbench_layers follows a rename", ok)
+
+
+def test_saved_style_is_not_overwritten() -> bool:
+    """A style the user saved as the layer default must survive a reload."""
+    from qgis.core import QgsCategorizedSymbolRenderer, QgsLineSymbol, QgsRendererCategory
+
+    project = QgsProject.instance()
+    project.clear()
+    store, rpl = _store_with_rpl()
+    lines = project_layers.ensure_layer(project, store.gpkg_path, rpl["lines_layer"])
+    ok = lines is not None
+
+    # Stand in for the user's own symbology: one magenta category on the same
+    # field, saved into the GeoPackage as the default style.
+    custom = QgsCategorizedSymbolRenderer(layer_style.CABLE_TYPE_FIELD, [
+        QgsRendererCategory("DA", QgsLineSymbol.createSimple({"color": "#ff00ff"}), "DA"),
+    ])
+    lines.setRenderer(custom)
+    layer_style.save_default_style(lines)
+
+    # Re-styling on the way in must leave it alone, only adding the missing
+    # category for the cable type that has no rule yet.
+    layer_style.style_rpl_layer(lines, rpl["lines_layer"])
+    renderer = lines.renderer()
+    ok = ok and isinstance(renderer, QgsCategorizedSymbolRenderer)
+    colours = {str(c.value()): c.symbol().color().name().lower()
+               for c in renderer.categories()}
+    ok = ok and colours.get("DA") == "#ff00ff"
+    ok = ok and "LW" in colours          # new value picked up
+    project.clear()
+    return _result("a user's saved style is not overwritten", ok)
+
+
+def test_user_palette_applies() -> bool:
+    from qgis.core import QgsCategorizedSymbolRenderer
+
+    project = QgsProject.instance()
+    project.clear()
+    store, rpl = _store_with_rpl()
+    previous = layer_style.user_cable_type_colours()
+    try:
+        layer_style.set_user_cable_type_colours({"DA": "#123456"})
+        lines = project_layers.ensure_layer(project, store.gpkg_path, rpl["lines_layer"])
+        ok = lines is not None
+        # ensure_layer's first styling already uses the palette.
+        renderer = lines.renderer()
+        ok = ok and isinstance(renderer, QgsCategorizedSymbolRenderer)
+        colours = {str(c.value()): c.symbol().color().name().lower()
+                   for c in renderer.categories()}
+        ok = ok and colours.get("DA") == "#123456"
+
+        layer_style.set_user_cable_type_colours({"DA": "#654321"})
+        restyled = layer_style.restyle_workbench_layers(
+            project, gpkg_path=store.gpkg_path)
+        colours = {str(c.value()): c.symbol().color().name().lower()
+                   for c in lines.renderer().categories()}
+        ok = ok and restyled == 1 and colours.get("DA") == "#654321"
+    finally:
+        layer_style.set_user_cable_type_colours(previous)
+    project.clear()
+    return _result("user cable-type palette is applied and reapplied", ok)
+
+
+def test_organise_does_not_delete_the_registry() -> bool:
+    """Moving a layer's tree node must not read as "the user removed it".
+
+    The dock deletes an RPL from the registry when its project layers are
+    removed. Regrouping removes and re-adds layer-tree nodes, so if that ever
+    reached the removal path it would destroy the revision. The clone is
+    inserted before the original node is dropped precisely so QGIS's
+    layer-tree/registry bridge still finds the layer and keeps it.
+    """
+    from ..workbench.workbench_dock import WorkbenchDock
+
+    project = QgsProject.instance()
+    project.clear()
+    store, route_id, rpls = _store_with_system_and_route()
+    set_project_gpkg_path(store.gpkg_path, project)
+    placements = project_layers.build_placements(store)
+    for rpl in rpls:
+        project_layers.ensure_rpl_layers(project, store.gpkg_path, rpl,
+                                         placements=placements)
+    layer_ids = set(project.mapLayers())
+    ok = len(layer_ids) == 4
+
+    dock = WorkbenchDock(None)          # connects the project-layer sync
+    try:
+        # Flatten everything back into the top group, then re-file it: the
+        # move path runs for every layer.
+        top = project_layers.workbench_group(project)
+        for layer in list(project.mapLayers().values()):
+            project_layers.move_layer_to_group(project, layer, top)
+        route = store.get_route(route_id)
+        route["name"] = "Segment 1 renamed"
+        store.save_route(route)
+        moved = project_layers.organise_workbench_layers(project, store)
+
+        ok = ok and moved == 4
+        ok = ok and set(project.mapLayers()) == layer_ids      # nothing dropped
+        ok = ok and len(store.list_rpls()) == 2                # registry intact
+        ok = ok and store.get_route(route_id) is not None
+        ok = ok and all(layer.isValid() for layer in project.mapLayers().values())
+        for rpl in rpls:
+            for key in ("points_layer", "lines_layer"):
+                ok = ok and project_layers.find_layer(
+                    project, store.gpkg_path, rpl[key]) is not None
+    finally:
+        dock.shutdown()
+        dock.deleteLater()
+    project.clear()
+    return _result("regrouping never deletes registry rows or layers", ok)
+
+
 def run_all():
     return [
         test_layer_name_from_source(),
         test_ensure_layer_add_style_dedupe(),
+        test_layers_are_named_and_grouped(),
+        test_organise_follows_a_rename(),
+        test_organise_does_not_delete_the_registry(),
+        test_saved_style_is_not_overwritten(),
+        test_user_palette_applies(),
         test_restore_after_reopen(),
         test_restore_completes_half_present_rpl(),
         test_discovers_unique_custom_named_registry(),

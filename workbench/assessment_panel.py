@@ -822,7 +822,7 @@ class AssessmentPanel(QWidget):
         # apply_style=False: assessment layers get their own rule-based style
         # from assessment_output.apply_assessment_style.
         return ensure_layer(QgsProject.instance(), self.store.gpkg_path, layer_name,
-                            apply_style=False)
+                            apply_style=False, store=self.store)
 
     # -------------------------------------------------------------- export --
     def _export_csv(self):

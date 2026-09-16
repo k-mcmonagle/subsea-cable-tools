@@ -6,14 +6,20 @@ from __future__ import annotations
 import os
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Optional, Tuple
 
 from qgis.core import QgsFeatureRequest, QgsProject
 
-
-# (cable type, route km, cable km) in first-appearance order. Legs whose
-# CableType is blank accumulate under "" so totals still add up.
-CableTypeLength = Tuple[str, Optional[float], Optional[float]]
+# The per-cable-type sums live in the pure comparison module so the
+# revision comparison can use them headless; re-exported here because this
+# is where the rest of the workbench imports them from.
+from .rpl_compare import (  # noqa: F401
+    CableTypeLength,
+    cable_type_lengths,
+    format_cable_type_lengths,
+    sum_cable_type_lengths,
+)
+from .rpl_compare import complete_sum as _complete_sum
 
 
 @dataclass(frozen=True)
@@ -108,10 +114,10 @@ def invalidate_rpl_summary(rpl_id: str = "") -> None:
 
 
 def _read_summary(store, rpl: Dict) -> RplSummary:
-    points = _open_layer(store, rpl.get("points_layer") or "")
-    lines = _open_layer(store, rpl.get("lines_layer") or "")
-    point_rows = _point_rows(points)
-    line_rows = _line_rows(lines)
+    points = open_rpl_layer(store, rpl.get("points_layer") or "")
+    lines = open_rpl_layer(store, rpl.get("lines_layer") or "")
+    point_rows = read_point_rows(points)
+    line_rows = read_leg_rows(lines)
     if not point_rows:
         return RplSummary(leg_count=len(line_rows))
 
@@ -182,57 +188,13 @@ def _read_summary(store, rpl: Dict) -> RplSummary:
     )
 
 
-def cable_type_lengths(legs: Iterable[Dict]) -> Tuple[CableTypeLength, ...]:
-    """Sum route/cable km per cable type over leg rows, first-appearance order.
+def open_rpl_layer(store, layer_name: str):
+    """The project's copy of a workbench layer if it has one, else the file's.
 
-    A type whose legs miss a length value reports ``None`` for that measure
-    rather than a misleading partial sum (same rule as the RPL totals).
+    Reading through the project layer means unsaved edits in the RPL editor
+    are reflected; falling back to the store keeps summaries available for
+    revisions that are not on the map.
     """
-    order: List[str] = []
-    route: Dict[str, List] = {}
-    cable: Dict[str, List] = {}
-    for leg in legs:
-        name = str(leg.get("cable_type") or "").strip()
-        if name not in route:
-            order.append(name)
-            route[name], cable[name] = [], []
-        route[name].append(leg.get("route_km"))
-        cable[name].append(leg.get("cable_km"))
-    return tuple((name, _complete_sum(route[name]), _complete_sum(cable[name]))
-                 for name in order)
-
-
-def sum_cable_type_lengths(groups: Iterable[Sequence[CableTypeLength]]) -> Tuple[CableTypeLength, ...]:
-    """Merge per-type sums from several RPLs/sections (a system total)."""
-    order: List[str] = []
-    route: Dict[str, List] = {}
-    cable: Dict[str, List] = {}
-    for group in groups:
-        for name, route_km, cable_km in group or ():
-            if name not in route:
-                order.append(name)
-                route[name], cable[name] = [], []
-            route[name].append(route_km)
-            cable[name].append(cable_km)
-    return tuple((name, _complete_sum(route[name]), _complete_sum(cable[name]))
-                 for name in order)
-
-
-def format_cable_type_lengths(type_lengths: Sequence[CableTypeLength],
-                              measure: str = "route", separator: str = " · ",
-                              limit: int = 0) -> str:
-    """``"LW 12.300 km · DA 4.100 km"`` — blank types read as "Cable type not set"."""
-    bits = []
-    for name, route_km, cable_km in type_lengths or ():
-        value = route_km if measure == "route" else cable_km
-        label = name or "Cable type not set"
-        bits.append(f"{label} {value:.3f} km" if value is not None else label)
-    if limit and len(bits) > limit:
-        bits = bits[:limit] + [f"+{len(bits) - limit} more"]
-    return separator.join(bits)
-
-
-def _open_layer(store, layer_name: str):
     if not layer_name:
         return None
     try:
@@ -245,12 +207,13 @@ def _open_layer(store, layer_name: str):
     return store.open_layer(layer_name)
 
 
-def _point_rows(layer):
+def read_point_rows(layer):
+    """SeqNo-ordered dicts for an RPL point layer (geometry not read)."""
     if layer is None or not layer.isValid():
         return []
     names = (
         "SeqNo", "PosNo", "Event", "DistCumulative", "CableDistCumulative",
-        "Latitude", "Longitude", "ApproxDepth",
+        "Latitude", "Longitude", "ApproxDepth", "Remarks",
     )
     fields = layer.fields()
     indexes = [fields.indexOf(name) for name in names]
@@ -263,15 +226,19 @@ def _point_rows(layer):
             "event": values[2], "kp": _float(values[3]),
             "cable_kp": _float(values[4]), "lat": _float(values[5]),
             "lon": _float(values[6]), "depth": _float(values[7]),
+            "remarks": values[8],
         })
     rows.sort(key=lambda row: row["seq"])
     return rows
 
 
-def _line_rows(layer):
+def read_leg_rows(layer):
+    """SeqNo-ordered dicts for an RPL line layer (geometry not read)."""
     if layer is None or not layer.isValid():
         return []
-    names = ("SeqNo", "DistBetweenPos", "CableDistBetweenPos", "CableType")
+    names = ("SeqNo", "DistBetweenPos", "CableDistBetweenPos", "CableType",
+             "FromPos", "ToPos", "Bearing", "Slack", "CableCode",
+             "ProtectionMethod", "TargetBurialDepth")
     fields = layer.fields()
     indexes = [fields.indexOf(name) for name in names]
     request = _attribute_request([index for index in indexes if index >= 0])
@@ -281,9 +248,19 @@ def _line_rows(layer):
         rows.append({
             "seq": _number(values[0], fallback), "route_km": _float(values[1]),
             "cable_km": _float(values[2]), "cable_type": values[3],
+            "from_pos": values[4], "to_pos": values[5],
+            "bearing": _float(values[6]), "slack": _float(values[7]),
+            "cable_code": values[8], "protection": values[9],
+            "target_burial_m": _float(values[10]),
         })
     rows.sort(key=lambda row: row["seq"])
     return rows
+
+
+# Back-compat aliases for the pre-1.10 private names.
+_open_layer = open_rpl_layer
+_point_rows = read_point_rows
+_line_rows = read_leg_rows
 
 
 def _attribute_request(indexes):
@@ -319,11 +296,6 @@ def _number(value, fallback):
         return int(value)
     except (TypeError, ValueError):
         return fallback
-
-
-def _complete_sum(values) -> Optional[float]:
-    return (sum(float(value) for value in values)
-            if values and all(value is not None for value in values) else None)
 
 
 def _difference(start, end) -> Optional[float]:
