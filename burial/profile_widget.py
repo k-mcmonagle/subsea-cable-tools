@@ -23,19 +23,45 @@ import pyqtgraph as pg
 
 from qgis.PyQt.QtCore import QRectF, QSettings, Qt, pyqtSignal
 from qgis.PyQt.QtGui import QColor
+from qgis.PyQt.QtGui import QKeySequence
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
     QHBoxLayout,
+    QLabel,
+    QPushButton,
     QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from ..qgis_compat import QAction
+try:
+    from qgis.PyQt.QtGui import QShortcut
+except ImportError:  # pragma: no cover - Qt5
+    from qgis.PyQt.QtWidgets import QShortcut
+
+from ..maptools.profile_measurements import measurement
+from ..qgis_compat import (
+    EDIT_TRIGGER_NONE,
+    HEADER_RESIZE_MODE_STRETCH,
+    QAction,
+    SELECTION_BEHAVIOR_SELECT_ROWS,
+    SELECTION_MODE_SINGLE,
+)
+from ..slope_utils import interpolate_covered, is_finite
+from . import ui_helpers
 from . import events as ev
 from . import generation, schema
 
 _PEN_STYLE = getattr(Qt, "PenStyle", Qt)
+_ITEM_FLAG = getattr(Qt, "ItemFlag", Qt)
+_SHORTCUT_CONTEXT = getattr(getattr(Qt, "ShortcutContext", Qt),
+                            "WidgetWithChildrenShortcut")
+_MEASURE_COLOR = "#c2185b"
+_MEASURE_TEXT_COLOR = "#8e1243"
+_MEASURE_COLUMNS = ["#", "Length (m)", "X (m)", "Y (m)", "Angle (\u00b0)",
+                    "Along seabed (m)"]
 _VERTICAL = getattr(Qt, "Orientation", Qt).Vertical
 _MOUSE_LEFT = getattr(Qt, "MouseButton", Qt).LeftButton
 
@@ -406,10 +432,70 @@ class BurialProfileWidget(QWidget):
         self._true_scale_action.setToolTip(self._true_scale_toggle.toolTip())
         self._true_scale_action.triggered.connect(
             lambda checked: self._true_scale_toggle.setChecked(bool(checked)))
+        # Measure: two-point measurements on the depth plot (length, X, Y,
+        # angle, distance along the seabed), as in the KP Mouse profile
+        # window. Metres throughout; KP clicks do not sync the map while on.
+        self._measure_toggle = QCheckBox("Measure")
+        self._measure_toggle.setStyleSheet(
+            f"color: {_MEASURE_COLOR}; font-weight: 600;")
+        self._measure_toggle.setToolTip(
+            "Click two points on the depth plot to measure between them: "
+            "straight-line length, horizontal (X) and vertical (Y) "
+            "separation, endpoint angle and, for snapped points, the "
+            "distance along the seabed. Repeat for more measurements; drag "
+            "the endpoints to adjust. While measuring, clicks do not move "
+            "the map. Esc cancels a pending point or leaves measuring; "
+            "Delete removes the selected measurement.")
+        self._measure_toggle.toggled.connect(self._measure_toggled)
+        depth_toggle_row.addWidget(self._measure_toggle)
+        self._snap_toggle = QCheckBox("Snap to profile")
+        self._snap_toggle.setChecked(True)
+        self._snap_toggle.setToolTip(
+            "Place points on the sampled seabed depth at the clicked KP "
+            "(untick to measure between free points on the plot).")
+        depth_toggle_row.addWidget(self._snap_toggle)
+        self._measure_delete = QPushButton("Delete / undo")
+        self._measure_delete.setFlat(True)
+        self._measure_delete.setToolTip(
+            "Remove the pending point, else the selected (or last) "
+            "measurement.")
+        self._measure_delete.clicked.connect(self.delete_measurement)
+        depth_toggle_row.addWidget(self._measure_delete)
+        self._measure_clear = QPushButton("Clear measurements")
+        self._measure_clear.setFlat(True)
+        self._measure_clear.clicked.connect(self.clear_measurements)
+        depth_toggle_row.addWidget(self._measure_clear)
+        self._measure_hint = QLabel("")
+        self._measure_hint.setStyleSheet(ui_helpers.hint_style())
+        depth_toggle_row.addWidget(self._measure_hint)
+        depth_toggle_row.addStretch(1)
+        self._measure_action = QAction("Measure", self)
+        self._measure_action.setCheckable(True)
+        self._measure_action.setToolTip(self._measure_toggle.toolTip())
+        self._measure_action.triggered.connect(
+            lambda checked: self._measure_toggle.setChecked(bool(checked)))
         menu = getattr(item.vb, "menu", None)
         if menu is not None:
             menu.addSeparator()
+            menu.addAction(self._measure_action)
             menu.addAction(self._true_scale_action)
+        self._measure_table = QTableWidget(0, len(_MEASURE_COLUMNS))
+        self._measure_table.setHorizontalHeaderLabels(_MEASURE_COLUMNS)
+        self._measure_table.verticalHeader().setVisible(False)
+        self._measure_table.horizontalHeader().setSectionResizeMode(
+            HEADER_RESIZE_MODE_STRETCH)
+        self._measure_table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
+        self._measure_table.setSelectionMode(SELECTION_MODE_SINGLE)
+        self._measure_table.setEditTriggers(EDIT_TRIGGER_NONE)
+        self._measure_table.setMaximumHeight(96)
+        self._measure_table.setToolTip(
+            "Length: straight line between the endpoints. X: horizontal "
+            "separation. Y: depth difference. Angle: endpoint inclination "
+            "to horizontal (0\u201390\u00b0), not the steepest seabed slope "
+            "between the points. Along seabed: profile length between the "
+            "points (snapped measurements only). All values in metres, "
+            "independent of the plot's vertical exaggeration.")
+        self._measure_table.setVisible(False)
 
         self._depth_pane = QWidget()
         depth_layout = QVBoxLayout(self._depth_pane)
@@ -417,6 +503,7 @@ class BurialProfileWidget(QWidget):
         depth_layout.setSpacing(0)
         depth_layout.addLayout(depth_toggle_row)
         depth_layout.addWidget(self.plot, 1)
+        depth_layout.addWidget(self._measure_table)
 
         # User-adjustable split between depth and slope panels, persisted.
         self._splitter = QSplitter(_VERTICAL)
@@ -479,6 +566,20 @@ class BurialProfileWidget(QWidget):
         self._event_markers.setZValue(10)
         item.addItem(self._event_markers, ignoreBounds=True)
         self._series: List[Tuple[float, float]] = []
+        self._series_ys: List[float] = []
+        self._measurements: List[Dict] = []
+        self._measure_graphics: List = []
+        self._measure_first: Optional[Tuple[Tuple[float, float], bool]] = None
+        self._measure_first_marker = None
+        self._measure_preview = None
+        self._moving_endpoint = False
+        self._profile_signature: Tuple = ()
+        for keys, slot in (("Escape", self._measure_escape),
+                           ("Delete", self.delete_measurement)):
+            shortcut = QShortcut(QKeySequence(keys), self)
+            shortcut.setContext(_SHORTCUT_CONTEXT)
+            shortcut.activated.connect(slot)
+        self._sync_measure_controls()
         # Cached KP arrays for the crosshair lookups: rebuilding these lists
         # (up to ~500k floats, three or four times) on EVERY mouse move was
         # the dominant hover cost on long routes.
@@ -618,6 +719,295 @@ class BurialProfileWidget(QWidget):
         self.plot.getPlotItem().vb.setRange(
             xRange=(lo, hi), yRange=(y_lo, y_hi), padding=0.02)
 
+    # -- measurements (two-point, as in the KP Mouse profile window) --------
+    def measuring(self) -> bool:
+        return self._measure_toggle.isChecked()
+
+    def set_measuring(self, on: bool) -> None:
+        self._measure_toggle.setChecked(bool(on))
+
+    def measurements(self) -> List[Dict]:
+        """Copies of the placed measurements (endpoints in metres)."""
+        return [dict(m) for m in self._measurements]
+
+    def _measure_toggled(self, checked: bool) -> None:
+        self._measure_action.blockSignals(True)
+        try:
+            self._measure_action.setChecked(bool(checked))
+        finally:
+            self._measure_action.blockSignals(False)
+        self._measure_first = None
+        self._hide_measure_preview()
+        self._sync_measure_controls()
+
+    def _sync_measure_controls(self) -> None:
+        measuring = self.measuring()
+        has_rows = bool(self._measurements)
+        self._snap_toggle.setVisible(measuring)
+        self._measure_delete.setVisible(measuring or has_rows)
+        self._measure_clear.setVisible(measuring or has_rows)
+        self._measure_delete.setEnabled(has_rows or self._measure_first is not None)
+        self._measure_clear.setEnabled(has_rows or self._measure_first is not None)
+        self._measure_table.setVisible(has_rows)
+        if not measuring:
+            hint = ""
+        elif self._measure_first is not None:
+            hint = "Click the second point (Esc cancels)."
+        elif not self._series:
+            hint = "No profile to measure yet."
+        else:
+            hint = ("Click two points on the depth plot; drag to pan, "
+                    "scroll to zoom. Esc leaves measuring.")
+        self._measure_hint.setText(hint)
+        self._measure_hint.setVisible(bool(hint))
+
+    def _snap_depth(self, kp: float) -> Optional[float]:
+        if not self._series_xs:
+            return None
+        depth = interpolate_covered(self._series_xs, self._series_ys, kp)
+        return float(depth) if is_finite(depth) else None
+
+    def _measure_point(self, kp: float, depth_m: float,
+                       snapped: bool) -> Optional[Tuple[float, float]]:
+        """(x_m, z_m) for a plot position, snapped to the profile if asked."""
+        if snapped:
+            snapped_depth = self._snap_depth(kp)
+            if snapped_depth is None:
+                return None
+            depth_m = snapped_depth
+        if not is_finite(kp) or not is_finite(depth_m):
+            return None
+        return (float(kp) * 1000.0, float(depth_m))
+
+    def _measure_click(self, kp: float, depth_m: float) -> bool:
+        """Place an endpoint at a depth-plot position. True when consumed."""
+        snapped = self._snap_toggle.isChecked()
+        point = self._measure_point(kp, depth_m, snapped)
+        if point is None:
+            self._measure_hint.setText(
+                "No profile depth there — click within the sampled profile "
+                "or untick Snap to profile.")
+            self._measure_hint.setVisible(True)
+            return True
+        if self._measure_first is None:
+            self._measure_first = (point, snapped)
+            self._hide_measure_preview()
+            self._draw_first_point(point)
+            self._sync_measure_controls()
+            return True
+        first, first_snapped = self._measure_first
+        if first_snapped != snapped:
+            # Snapping changed mid-measurement: start again from this point.
+            self._measure_first = (point, snapped)
+            self._draw_first_point(point)
+            self._sync_measure_controls()
+            return True
+        self._add_measurement(first, point, snapped)
+        return True
+
+    def _seabed_series_m(self):
+        return ([x * 1000.0 for x in self._series_xs], self._series_ys)
+
+    def _add_measurement(self, a: Tuple[float, float], b: Tuple[float, float],
+                         snapped: bool) -> None:
+        xs_m, ys = self._seabed_series_m() if snapped else (None, None)
+        self._measurements.append({
+            "a": a, "b": b, "snapped": snapped,
+            "metrics": measurement(a, b, xs_m, ys)})
+        self._measure_first = None
+        self._hide_measure_preview()
+        self._redraw_measurements()
+
+    def _draw_first_point(self, point: Tuple[float, float]) -> None:
+        if self._measure_first_marker is None:
+            self._measure_first_marker = self.plot.getPlotItem().plot(
+                [], [], pen=None, symbol="o", symbolSize=8,
+                symbolBrush=_MEASURE_COLOR, symbolPen=pg.mkPen(_MEASURE_COLOR))
+            self._measure_first_marker.setZValue(30)
+        self._measure_first_marker.setData([point[0] / 1000.0], [point[1]])
+        self._measure_first_marker.setVisible(True)
+
+    def _hide_measure_preview(self) -> None:
+        if self._measure_preview is not None:
+            for graphic in self._measure_preview:
+                graphic.hide()
+        if self._measure_first is None and self._measure_first_marker is not None:
+            self._measure_first_marker.setVisible(False)
+
+    def _measure_move(self, pos, plot) -> None:
+        """Rubber-band triangle from the first point to the cursor."""
+        if self._measure_first is None or plot is not self.plot:
+            self._hide_measure_preview()
+            return
+        if not plot.sceneBoundingRect().contains(pos):
+            self._hide_measure_preview()
+            return
+        view = plot.getViewBox().mapSceneToView(pos)
+        first, snapped = self._measure_first
+        point = self._measure_point(float(view.x()), float(view.y()), snapped)
+        if point is None:
+            self._hide_measure_preview()
+            return
+        if self._measure_preview is None:
+            self._measure_preview = self._make_triangle(preview=True)
+        self._update_triangle(self._measure_preview, first, point,
+                              measurement(first, point))
+
+    def _make_triangle(self, preview: bool = False):
+        item = self.plot.getPlotItem()
+        diagonal = pg.PlotDataItem(pen=pg.mkPen(
+            _MEASURE_COLOR, width=2,
+            style=_PEN_STYLE.DashLine if preview else _PEN_STYLE.SolidLine))
+        legs = pg.PlotDataItem(pen=pg.mkPen(_MEASURE_COLOR, width=1,
+                                            style=_PEN_STYLE.DashLine))
+        labels = [pg.TextItem(color=_MEASURE_TEXT_COLOR, anchor=anchor,
+                              fill=pg.mkBrush(255, 255, 255, 210))
+                  for anchor in ((0.5, 1), (0.5, 0), (0, 0.5))]
+        graphics = (diagonal, legs, *labels)
+        for graphic in graphics:
+            graphic.setZValue(31)
+            item.addItem(graphic, ignoreBounds=True)
+        return graphics
+
+    @staticmethod
+    def _angle_text(values: Dict) -> str:
+        angle = values.get("angle_deg")
+        return "\u2014" if angle is None else f"{angle:.2f}\u00b0"
+
+    @staticmethod
+    def _measure_cells(values: Dict) -> List[str]:
+        seabed = values.get("seabed_distance_m")
+        return [f"{values['endpoint_distance_m']:.2f}",
+                f"{values['width_m']:.2f}",
+                f"{values['height_m']:.2f}",
+                BurialProfileWidget._angle_text(values),
+                "\u2014" if seabed is None else f"{seabed:.2f}"]
+
+    def _update_triangle(self, graphics, a, b, values: Dict,
+                         number: Optional[int] = None) -> None:
+        # Plot units: x in km, depth in m (positive down, inverted axis).
+        ax, az, bx, bz = a[0] / 1000.0, a[1], b[0] / 1000.0, b[1]
+        diagonal, legs, length_label, x_label, y_label = graphics
+        diagonal.setData([ax, bx], [az, bz])
+        legs.setData([ax, bx, bx], [az, az, bz])   # right angle at (b.x, a.z)
+        length, width, height, angle, _seabed = self._measure_cells(values)
+        prefix = f"{number}: " if number is not None else ""
+        # Labels sit outside the triangle so shallow slopes do not stack
+        # the X and diagonal text; the depth axis is always inverted here.
+        down_on_screen = (bz - az) >= 0
+        x_label.setAnchor((0.5, 1 if down_on_screen else 0))
+        length_label.setAnchor((0.5, 0 if down_on_screen else 1))
+        y_label.setAnchor((0 if bx >= ax else 1, 0.5))
+        length_label.setText(f"{prefix}Length {length} m / {angle}")
+        length_label.setPos((ax + bx) / 2.0, (az + bz) / 2.0)
+        x_label.setText(f"X {width} m")
+        x_label.setPos((ax + bx) / 2.0, az)
+        y_label.setText(f"Y {height} m")
+        y_label.setPos(bx, (az + bz) / 2.0)
+        for graphic in graphics:
+            graphic.show()
+        x_label.setVisible(abs(bx - ax) > 1e-12)
+        y_label.setVisible(abs(bz - az) > 1e-12)
+
+    def _remove_measurement_graphics(self) -> None:
+        item = self.plot.getPlotItem()
+        for graphics, handles in self._measure_graphics:
+            for graphic in list(graphics) + list(handles):
+                try:
+                    item.removeItem(graphic)
+                except Exception:
+                    pass
+        self._measure_graphics = []
+
+    def _redraw_measurements(self) -> None:
+        self._remove_measurement_graphics()
+        item = self.plot.getPlotItem()
+        self._measure_table.setRowCount(len(self._measurements))
+        for row, m in enumerate(self._measurements):
+            graphics = self._make_triangle()
+            handles = []
+            for endpoint, point in enumerate((m["a"], m["b"])):
+                handle = pg.TargetItem(
+                    pos=(point[0] / 1000.0, point[1]), size=11, symbol="o",
+                    movable=True, pen=pg.mkPen(_MEASURE_COLOR),
+                    brush=pg.mkBrush("#ffffff"),
+                    hoverPen=pg.mkPen("#1565c0", width=2))
+                handle.setZValue(100)
+                item.addItem(handle, ignoreBounds=True)
+                handle.sigPositionChanged.connect(
+                    lambda target, r=row, e=endpoint:
+                    self._move_endpoint(r, e, target))
+                handles.append(handle)
+            self._measure_graphics.append((graphics, handles))
+            self._update_triangle(graphics, m["a"], m["b"], m["metrics"], row + 1)
+            self._fill_measure_row(row, m)
+        self._sync_measure_controls()
+
+    def _fill_measure_row(self, row: int, m: Dict) -> None:
+        cells = [str(row + 1)] + self._measure_cells(m["metrics"])
+        for column, value in enumerate(cells):
+            cell = QTableWidgetItem(value)
+            cell.setFlags(_ITEM_FLAG.ItemIsEnabled | _ITEM_FLAG.ItemIsSelectable)
+            cell.setToolTip("Snapped to the profile" if m["snapped"]
+                            else "Free points (not snapped)")
+            self._measure_table.setItem(row, column, cell)
+
+    def _move_endpoint(self, row: int, endpoint: int, target) -> None:
+        if self._moving_endpoint or row >= len(self._measurements):
+            return
+        m = self._measurements[row]
+        key = "a" if endpoint == 0 else "b"
+        kp, depth = float(target.pos().x()), float(target.pos().y())
+        point = self._measure_point(kp, depth, m["snapped"])
+        if point is None:
+            point = m[key]  # stay at the last valid position at gaps
+        self._moving_endpoint = True
+        try:
+            target.setPos(point[0] / 1000.0, point[1])
+            m[key] = point
+            xs_m, ys = self._seabed_series_m() if m["snapped"] else (None, None)
+            m["metrics"] = measurement(m["a"], m["b"], xs_m, ys)
+            graphics, _handles = self._measure_graphics[row]
+            self._update_triangle(graphics, m["a"], m["b"], m["metrics"], row + 1)
+            self._fill_measure_row(row, m)
+        finally:
+            self._moving_endpoint = False
+
+    def delete_measurement(self) -> None:
+        """Drop the pending endpoint, else the selected (or last) row."""
+        if self._measure_first is not None:
+            self._measure_first = None
+            self._hide_measure_preview()
+            self._sync_measure_controls()
+            return
+        if not self._measurements:
+            return
+        row = self._measure_table.currentRow()
+        self._measurements.pop(row if 0 <= row < len(self._measurements) else -1)
+        self._redraw_measurements()
+
+    def clear_measurements(self) -> None:
+        self._measurements = []
+        self._measure_first = None
+        self._hide_measure_preview()
+        self._remove_measurement_graphics()
+        self._measure_table.setRowCount(0)
+        self._sync_measure_controls()
+
+    def _measure_escape(self) -> None:
+        if self._measure_first is not None:
+            self.delete_measurement()
+        elif self.measuring():
+            self.set_measuring(False)
+
+    def _profile_fingerprint(self) -> Tuple:
+        xs, ys = self._series_xs, self._series_ys
+        if not xs:
+            return ()
+        step = max(1, len(xs) // 64)
+        return (len(xs), xs[0], xs[-1],
+                tuple(ys[i] if ys[i] == ys[i] else None for i in range(0, len(xs), step)))
+
     def _update_sea_level(self) -> None:
         lo, hi = self._scope
         show = self._sea_toggle.isChecked() and hi > lo
@@ -655,7 +1045,17 @@ class BurialProfileWidget(QWidget):
         xs = [kp for kp, _d in self._series]
         ys = [float("nan") if d is None else d for _kp, d in self._series]
         self._series_xs = xs  # cached for the per-hover lookups
+        self._series_ys = ys
         self._curve.setData(xs, ys, connect="finite")
+        # Measurements belong to the profile they were placed on: a
+        # different profile (resample, other plan) drops them, while the
+        # empty-then-same redraw every refresh performs keeps them.
+        if xs:
+            signature = self._profile_fingerprint()
+            if self._measurements and signature != self._profile_signature:
+                self.clear_measurements()
+            self._profile_signature = signature
+        self._sync_measure_controls()
 
     def set_overlays(self, context: generation.ResolutionContext) -> None:
         self._regions["excluded"].set_ranges(
@@ -821,6 +1221,8 @@ class BurialProfileWidget(QWidget):
         self._vline.setVisible(False)
         self._slope_vline.setVisible(False)
         self._readout.setVisible(False)
+        self.clear_measurements()
+        self._profile_signature = ()
 
     # -- interaction --------------------------------------------------------
     def _on_line_moved(self, line) -> None:
@@ -924,6 +1326,8 @@ class BurialProfileWidget(QWidget):
             self._readout.setVisible(False)
             return
         self._show_kp_readout(kp)
+        if self.measuring():
+            self._measure_move(pos, plot)
         # Throttled: the map marker + tool footprint follow the latest KP at
         # ~30 ms cadence instead of once per mouse-move event.
         self._hover_kp = kp
@@ -943,6 +1347,19 @@ class BurialProfileWidget(QWidget):
             double = bool(event.double())
         except (AttributeError, TypeError):
             double = False
+        if self.measuring():
+            # Measuring owns left clicks on the depth plot: no map sync,
+            # no event placement. Drags never reach here (pyqtgraph
+            # emits clicks separately), so pan/zoom keep working.
+            if plot is self.plot and not double:
+                depth = float(plot.getViewBox().mapSceneToView(
+                    event.scenePos()).y())
+                if self._measure_click(kp, depth):
+                    try:
+                        event.accept()
+                    except (AttributeError, TypeError):
+                        pass
+            return
         if double:
             self.kpDoubleClicked.emit(kp)
         else:

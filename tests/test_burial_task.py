@@ -784,6 +784,75 @@ def test_profile_widget_axes_crosshair_toggles() -> bool:
     return _result("profile widget: axes, alignment, crosshair, toggles", ok)
 
 
+def test_profile_widget_measurements() -> bool:
+    """Two-point measurements on the depth plot: snapping, metrics in
+    metres, table rows, delete/clear, Escape, and survival across the
+    empty-then-same redraw a refresh performs."""
+    import math
+
+    from ..burial.profile_widget import BurialProfileWidget
+
+    widget = BurialProfileWidget()
+    widget.set_scope(0.0, 10.0)
+    profile = [(0.0, 100.0), (10.0, 200.0)]
+    widget.set_profile(profile)
+    ok = not widget.measuring() and not widget._measure_table.isVisibleTo(widget)
+    widget.set_measuring(True)
+    ok = ok and widget._measure_action.isChecked()
+    # Snapped: depth comes from the profile, not the click position.
+    widget._measure_click(1.0, 999.0)
+    ok = ok and widget._measure_first is not None
+    widget._measure_click(3.0, 999.0)
+    rows = widget.measurements()
+    ok = ok and len(rows) == 1 and widget._measure_first is None
+    metrics = rows[0]["metrics"] if rows else {}
+    ok = ok and abs(metrics.get("width_m", 0) - 2000.0) < 1e-6
+    ok = ok and abs(metrics.get("height_m", 0) - 20.0) < 1e-6
+    ok = ok and abs(metrics.get("endpoint_distance_m", 0)
+                    - math.hypot(2000.0, 20.0)) < 1e-6
+    ok = ok and metrics.get("seabed_distance_m") is not None
+    ok = ok and widget._measure_table.rowCount() == 1
+    ok = ok and widget._measure_table.item(0, 2).text() == "2000.00"
+    ok = ok and len(widget._measure_graphics) == 1
+    # Outside the sampled profile a snapped click is refused (no row).
+    widget._measure_click(12.0, 150.0)
+    ok = ok and widget._measure_first is None and len(widget.measurements()) == 1
+    # Free (unsnapped) points use the clicked depth.
+    widget._snap_toggle.setChecked(False)
+    widget._measure_click(4.0, 100.0)
+    widget._measure_click(4.0, 160.0)
+    rows = widget.measurements()
+    ok = ok and len(rows) == 2 and rows[1]["metrics"]["seabed_distance_m"] is None
+    ok = ok and abs(rows[1]["metrics"]["height_m"] - 60.0) < 1e-6
+    ok = ok and rows[1]["metrics"]["angle_deg"] == 90.0
+    # A refresh redraws the same profile via [] then samples: kept.
+    widget.set_profile([])
+    widget.set_profile(profile)
+    ok = ok and len(widget.measurements()) == 2
+    # Escape with a pending point drops the point, not the rows.
+    widget._measure_click(5.0, 120.0)
+    widget._measure_escape()
+    ok = ok and widget._measure_first is None and len(widget.measurements()) == 2
+    # Delete removes the last row; Escape with nothing pending leaves
+    # measure mode (rows stay, controls stay visible).
+    widget.delete_measurement()
+    ok = ok and len(widget.measurements()) == 1
+    widget._measure_escape()
+    ok = ok and not widget.measuring() and len(widget.measurements()) == 1
+    ok = ok and widget._measure_clear.isVisibleTo(widget)
+    # A different profile drops measurements; clear() too.
+    widget.set_profile([(0.0, 100.0), (5.0, 300.0), (10.0, 200.0)])
+    ok = ok and not widget.measurements()
+    widget.set_measuring(True)
+    widget._measure_click(1.0, 0.0)
+    widget._measure_click(2.0, 0.0)
+    widget.clear()
+    ok = ok and not widget.measurements() and widget._measure_table.rowCount() == 0
+    ok = ok and not widget._measure_graphics
+    widget.deleteLater()
+    return _result("profile widget: two-point measurements", ok)
+
+
 def test_analysis_reuses_stored_depth_samples() -> bool:
     """Injected plan-profile samples bypass bathymetry sampling entirely."""
 
@@ -1807,6 +1876,7 @@ def run_all() -> list:
         test_profile_cross_offset_sampling(),
         test_cross_offset_uses_contour_crossings(),
         test_profile_widget_axes_crosshair_toggles(),
+        test_profile_widget_measurements(),
         test_analysis_reuses_stored_depth_samples(),
         test_local_slope_uses_profile_resolution(),
         test_profile_step_resolution_and_staleness(),
