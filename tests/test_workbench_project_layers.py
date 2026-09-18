@@ -337,7 +337,10 @@ def test_layers_are_named_and_grouped() -> bool:
     ok = ok and system_group is not None
     segment_group = system_group.findGroup("Segment 1") if system_group else None
     ok = ok and segment_group is not None
-    revision_group = segment_group.findGroup("Rev 2") if segment_group else None
+    # The revision group reads like its layers: "<segment> · <revision>".
+    revision_group = segment_group.findGroup(sep.join(["Segment 1", "Rev 2"])) \
+        if segment_group else None
+    ok = ok and (segment_group is None or segment_group.findGroup("Rev 2") is None)
     ok = ok and revision_group is not None and len(revision_group.findLayers()) == 2
     # Layers stay findable by source no matter what they are called.
     ok = ok and project_layers.find_layer(

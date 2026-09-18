@@ -102,6 +102,58 @@ def test_polygon_class() -> bool:
     return _result("polygon_class acquisition", ok, f"coverage={cov:.2f} km")
 
 
+def test_polygon_class_ranges_and_expression() -> bool:
+    """Numeric ``match_rules`` bins and a ``match_expression`` on the
+    polygon-class rule; the shared matcher serves both."""
+    sampler = _sampler()
+    layer = _add_layer("Polygon?crs=EPSG:4326&field=GRADE:double&field=SOIL:string",
+                       "graded")
+    pr = layer.dataProvider()
+    # Two polygons along the route: lat 50.02-50.04 grade 3, 50.06-50.08 grade 7.
+    for lat0, grade, soil in ((50.02, 3.0, "SAND"), (50.06, 7.0, "ROCK")):
+        feat = QgsFeature(layer.fields())
+        feat.setGeometry(QgsGeometry.fromWkt(
+            f"POLYGON((-0.01 {lat0}, 0.01 {lat0}, 0.01 {lat0 + 0.02}, "
+            f"-0.01 {lat0 + 0.02}, -0.01 {lat0}))"))
+        feat.setAttributes([grade, soil])
+        pr.addFeature(feat)
+    base = {"layer_id": layer.id(), "attribute": "GRADE"}
+    low = ri._acquire_polygon_class(
+        sampler, dict(base, match_rules=[{"min": 0, "max": 5, "max_inclusive": False}]),
+        QgsProject.instance())
+    high = ri._acquire_polygon_class(
+        sampler, dict(base, match_rules=[{"min": 5, "min_inclusive": True}]),
+        QgsProject.instance())
+    both = ri._acquire_polygon_class(
+        sampler, dict(base, match_values=["7"],
+                      match_rules=[{"max": 5, "max_inclusive": False}]),
+        QgsProject.instance())
+    expr = ri._acquire_polygon_class(
+        sampler, dict(base, match_values=["nothing"],
+                      match_expression='"SOIL" = \'ROCK\' AND "GRADE" >= 5'),
+        QgsProject.instance())
+    none = ri._acquire_polygon_class(
+        sampler, dict(base, match_rules=[{"min": 5, "max": 5, "min_inclusive": False}]),
+        QgsProject.instance())
+    km = eng.interval_length_km
+    ok = 1.5 < km(low) < 3.0 and 1.5 < km(high) < 3.0
+    ok = ok and 3.5 < km(both) < 5.5
+    ok = ok and 1.5 < km(expr) < 3.0 and km(none) < 1e-6
+    # Exact-value legacy path is untouched.
+    legacy = ri._acquire_polygon_class(
+        sampler, {"layer_id": layer.id(), "attribute": "SOIL", "match_values": ["rock"]},
+        QgsProject.instance())
+    ok = ok and 1.5 < km(legacy) < 3.0
+    # The matcher itself (used by boundary refinement) agrees.
+    matcher = ri.polygon_feature_matcher(
+        dict(base, match_rules=[{"min": 5, "min_inclusive": True}]))
+    feats = list(layer.getFeatures())
+    ok = ok and [matcher(f) for f in feats] == [False, True]
+    QgsProject.instance().removeMapLayer(layer.id())
+    return _result("polygon_class ranges + expression", ok,
+                   f"low={km(low):.2f} high={km(high):.2f} both={km(both):.2f} km")
+
+
 def test_proximity_point() -> bool:
     sampler = _sampler()
     layer = _add_layer("Point?crs=EPSG:4326", "hazards")
@@ -235,6 +287,7 @@ def run_all() -> list:
     return [
         test_manual_and_kp_table(),
         test_polygon_class(),
+        test_polygon_class_ranges_and_expression(),
         test_proximity_point(),
         test_migrate_framework(),
         test_store_rule_crud(),

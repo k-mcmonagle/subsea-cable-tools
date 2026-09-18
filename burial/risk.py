@@ -12,7 +12,11 @@ and the effective auto risk is the *most severe* of the two:
   a feature whose nearest approach is within the band gets that level
   (0 disables a band; crossings are offset 0 and hit the tightest band);
 - attribute rules: ordered ``attribute_rules`` over one feature attribute,
-  each either an exact value match or a numeric range — first match wins.
+  each an exact value match, a numeric range (with explicit inclusive /
+  exclusive bounds) or a QGIS expression over the whole feature — first
+  match wins. The condition vocabulary lives in ``attribute_rules.py``;
+  expression rules are evaluated by the QGIS-side scan and passed in as
+  ``expression_hits``.
 
 ``default_risk`` applies when a feature is inside the search corridor but
 no band or attribute rule fires. No engineering values are shipped — every
@@ -24,7 +28,7 @@ from __future__ import annotations
 import json
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from . import schema
+from . import attribute_rules, schema
 
 
 def check_config(check_row: Dict) -> Dict:
@@ -66,37 +70,40 @@ def proximity_risk(config: Dict, offset_m: Optional[float]) -> str:
 
 
 def _rule_matches(rule: Dict, value) -> bool:
-    if "match" in rule:
-        return str(value).strip().casefold() == \
-            str(rule.get("match") or "").strip().casefold()
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return False
-    minimum = rule.get("min")
-    maximum = rule.get("max")
-    if minimum is not None and number < float(minimum) - 1e-12:
-        return False
-    if maximum is not None and number > float(maximum) + 1e-12:
-        return False
-    return minimum is not None or maximum is not None
+    """Value / range rule test (kept for callers of the old name)."""
+    return attribute_rules.rule_matches(rule, value)
 
 
-def attribute_risk(config: Dict, attributes: Dict) -> str:
-    """Risk from the check's attribute rules; '' when none match."""
+def attribute_risk(config: Dict, attributes: Dict,
+                   expression_hits: Optional[Sequence[bool]] = None) -> str:
+    """Risk from the check's attribute rules; '' when none match.
+
+    Value and range rules read ``config['attribute']`` from ``attributes``
+    (a missing or null value never fires). Expression rules use
+    ``expression_hits`` — one pre-evaluated bool per expression rule, in
+    rule order (see ``attribute_rules.expression_texts``) — so they work
+    even with no attribute chosen. First match wins, in rule order.
+    """
     attribute = (config.get("attribute") or "").strip()
-    rules = config.get("attribute_rules") or []
-    if not attribute or not rules:
+    rules = [rule for rule in (config.get("attribute_rules") or [])
+             if isinstance(rule, dict)]
+    if not rules:
         return schema.RISK_UNASSIGNED
-    if attribute not in attributes:
-        return schema.RISK_UNASSIGNED
-    value = attributes.get(attribute)
-    if value is None:
-        return schema.RISK_UNASSIGNED
+    has_value = bool(attribute) and attribute in attributes \
+        and not attribute_rules.is_null(attributes.get(attribute))
+    value = attributes.get(attribute) if has_value else None
+    expression_index = 0
     for rule in rules:
-        if not isinstance(rule, dict):
-            continue
-        if _rule_matches(rule, value):
+        if attribute_rules.rule_kind(rule) == attribute_rules.KIND_EXPRESSION:
+            hit = None
+            if expression_hits is not None \
+                    and expression_index < len(expression_hits):
+                hit = expression_hits[expression_index]
+            expression_index += 1
+            fired = attribute_rules.rule_matches(rule, None, hit)
+        else:
+            fired = has_value and attribute_rules.rule_matches(rule, value)
+        if fired:
             level = rule.get("risk") or ""
             if level in schema.RISK_ORDER:
                 return level
@@ -104,10 +111,12 @@ def attribute_risk(config: Dict, attributes: Dict) -> str:
 
 
 def evaluate_risk(config: Dict, offset_m: Optional[float],
-                  attributes: Optional[Dict] = None) -> str:
+                  attributes: Optional[Dict] = None,
+                  expression_hits: Optional[Sequence[bool]] = None) -> str:
     """Effective auto risk: max(proximity, attribute), else default_risk."""
     level = risk_max(proximity_risk(config, offset_m),
-                     attribute_risk(config, attributes or {}))
+                     attribute_risk(config, attributes or {},
+                                    expression_hits))
     if level:
         return level
     default = config.get("default_risk") or ""
@@ -148,7 +157,13 @@ def parse_attribute_rule(text: str, risk: str) -> Optional[Dict]:
 
 
 def format_attribute_rule(rule: Dict) -> str:
-    """Rule dict -> the editor's text form."""
+    """Rule dict -> the legacy ``a-b`` text form (inclusive bounds).
+
+    Kept for older callers; the editor now uses a structured table (see
+    ``attribute_rules.describe_rule`` for a readable summary).
+    """
+    if "expression" in rule:
+        return str(rule.get("expression") or "")
     if "match" in rule:
         return str(rule.get("match") or "")
     low = rule.get("min")

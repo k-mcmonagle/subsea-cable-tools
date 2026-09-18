@@ -11,13 +11,15 @@ The layer tree mirrors the workbench tree::
     Cable Route Workbench
       <cable system>
         <cable segment>
-          <RPL revision>
-            Sys A - Seg 1 - Rev 2 - Lines
-            Sys A - Seg 1 - Rev 2 - Points
+          <cable segment> · <RPL revision>
+            Sys A · Seg 1 · Rev 2 · Lines
+            Sys A · Seg 1 · Rev 2 · Points
 
 so a layer name identifies the revision it belongs to even away from its
 group (in a processing dialog's layer picker, say), and a system, segment or
-revision can be switched on and off as a unit. Assessment and assembly-fit
+revision can be switched on and off as a unit. The revision group carries
+the segment name too ("Seg 1 · Rev 2" rather than a bare "Rev 2"), so it
+reads like the layers under it when several segments are expanded. Assessment and assembly-fit
 outputs join the revision they were produced from.
 
 Placement is applied when a layer is added, and
@@ -127,7 +129,10 @@ def build_placements(store) -> Dict[str, LayerPlacement]:
         revision = _clean(rpl.get("rev_label"),
                           _clean(rpl.get("name"), UNLABELLED_REVISION))
         prefix = (system, segment, revision)
-        group = (WORKBENCH_GROUP, system, segment, revision)
+        # The revision group is named like its layers (segment · revision):
+        # a bare "Rev 2" is ambiguous once two segments are expanded.
+        group = (WORKBENCH_GROUP, system, segment,
+                 compose_layer_name((segment, revision)))
         rpl_id = str(rpl.get("rpl_id") or "")
         if rpl_id:
             rpl_context[rpl_id] = (compose_layer_name(prefix), group)

@@ -32,6 +32,7 @@ from qgis.core import (
 )
 from qgis.PyQt.QtGui import QTransform
 
+from ..burial import attribute_rules
 from ..kp_geo_utils import RouteFrame
 from ..kp_range_utils import make_distance_area
 from ..qgis_compat import (
@@ -683,6 +684,34 @@ def polygon_route_buffer_m_at(config: Dict,
     return None
 
 
+def polygon_feature_matcher(config: Dict) -> Callable[[QgsFeature], bool]:
+    """The polygon-class rule's per-feature test, shared by acquisition
+    and boundary refinement so both bisect the identical condition.
+
+    ``match_expression`` (a QGIS expression over the feature) wins when
+    set; otherwise the ``attribute`` value must equal one of
+    ``match_values`` or fall in one of the ``match_rules`` ranges (see
+    ``burial.attribute_rules``). No attribute at all = every polygon.
+    """
+    attribute = config.get("attribute") or ""
+    rules = attribute_rules.polygon_match_rules(config)
+    expr, ctx = _filter_expression(config.get("match_expression", ""))
+
+    def matches(feat) -> bool:
+        if expr is not None:
+            ctx.setFeature(feat)
+            return bool(expr.evaluate(ctx))
+        if not attribute:
+            return True
+        try:
+            val = feat[attribute]
+        except KeyError:
+            return False
+        return attribute_rules.any_rule_matches(rules, val)
+
+    return matches
+
+
 def polygon_class_intervals(sampler: RouteSampler, index: QgsSpatialIndex,
                             feats: Dict[int, Tuple[QgsGeometry, QgsFeature]],
                             config: Dict,
@@ -697,22 +726,8 @@ def polygon_class_intervals(sampler: RouteSampler, index: QgsSpatialIndex,
     ``depth_at``) a station also fires when a matching polygon comes within
     that distance of the route.
     """
-    attribute = config.get("attribute") or ""
-    match_values = {str(v).strip().lower() for v in (config.get("match_values") or [])}
-    expr, ctx = _filter_expression(config.get("match_expression", ""))
+    matches = polygon_feature_matcher(config)
     buffer_m_at = polygon_route_buffer_m_at(config, depth_at)
-
-    def matches(feat) -> bool:
-        if expr is not None:
-            ctx.setFeature(feat)
-            return bool(expr.evaluate(ctx))
-        if not attribute:
-            return True
-        try:
-            val = feat[attribute]
-        except KeyError:
-            return False
-        return str(val).strip().lower() in match_values
 
     series: List[Tuple[float, bool]] = []
     scaled_cache: Dict = {}

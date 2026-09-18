@@ -16,6 +16,7 @@ import json
 from typing import Dict, List, Optional, Sequence
 
 from ..workbench import schema as wb_schema
+from . import attribute_rules
 from . import events as ev
 from . import schema
 from . import tools as tools_mod
@@ -171,10 +172,16 @@ def rule_condition_text(rule: Dict) -> str:
             parts.append(f"filter: {config['filter_expression']}")
     elif kind == wb_schema.RULE_KIND_POLYGON:
         values = ", ".join(config.get("match_values") or [])
+        ranges = [attribute_rules.describe_rule(rule, config.get("attribute"))
+                  for rule in (config.get("match_rules") or [])
+                  if isinstance(rule, dict)]
         if config.get("match_expression"):
             parts.append(f"match: {config['match_expression']}")
         elif config.get("attribute"):
-            parts.append(f"{config.get('attribute')} in [{values}]")
+            if values:
+                parts.append(f"{config.get('attribute')} in [{values}]")
+            if ranges:
+                parts.append(" or ".join(ranges))
         corridor_mode = (config.get("route_buffer_mode") or "").lower()
         if corridor_mode == "fixed" and config.get("route_buffer_m"):
             parts.append(f"within {config['route_buffer_m']} m of route")

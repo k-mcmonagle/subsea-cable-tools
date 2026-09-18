@@ -48,7 +48,7 @@ from ..qgis_compat import GEOMETRY_LINE, GEOMETRY_POINT, GEOMETRY_POLYGON
 from ..workbench import rules_inputs as ri
 from ..workbench.rules_inputs import _filter_expression, _load_features_wgs84
 from ..workbench.rules_engine import Interval
-from . import risk, schema
+from . import attribute_rules, risk, schema
 
 WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
 
@@ -286,6 +286,11 @@ def snapshot_check_features(check_row: Dict, layer, route_geom: QgsGeometry,
     expr, ctx = _filter_expression(config.get("filter_expression", ""))
     label_attribute = (config.get("label_attribute") or "").strip()
     risk_attribute = (config.get("attribute") or "").strip()
+    # Expression rules need the live QgsFeature: evaluate them here (main
+    # thread) and hand the worker one bool per expression rule.
+    rule_expressions = [
+        _filter_expression(text) for text in
+        attribute_rules.expression_texts(config.get("attribute_rules") or [])]
     layer_name = layer.name()
 
     candidates = index.intersects(_expanded_rect(route_geom.boundingBox(),
@@ -309,6 +314,16 @@ def snapshot_check_features(check_row: Dict, layer, route_geom: QgsGeometry,
             except KeyError:
                 continue
             attributes[name] = None if value is None else value
+        expression_hits: List[bool] = []
+        for rule_expr, rule_ctx in rule_expressions:
+            if rule_expr is None:
+                expression_hits.append(False)
+                continue
+            rule_ctx.setFeature(feat)
+            try:
+                expression_hits.append(bool(rule_expr.evaluate(rule_ctx)))
+            except Exception:
+                expression_hits.append(False)
         fid = feat.id()
         label = ""
         if label_attribute:
@@ -318,6 +333,7 @@ def snapshot_check_features(check_row: Dict, layer, route_geom: QgsGeometry,
         out.append({
             "geom": QgsGeometry(geom),
             "attrs": attributes,
+            "expression_hits": expression_hits,
             "fid": fid,
             "label": label or f"{layer_name} #{fid}",
         })
@@ -371,7 +387,8 @@ def scan_snapshot(plan_id: str, check_row: Dict, features: List[Dict],
         hi = max(kp, end_kp if end_kp is not None else kp)
         if not in_scope(lo, hi):
             return
-        auto = risk.evaluate_risk(config, abs(offset_m), entry["attrs"])
+        auto = risk.evaluate_risk(config, abs(offset_m), entry["attrs"],
+                                  entry.get("expression_hits"))
         hazards.append(risk.new_hazard_row(
             plan_id, check_id, f"{entry['fid']}#{part}", entry["label"],
             lo, hi, offset_m, crossing, angle, lat, lon, auto,

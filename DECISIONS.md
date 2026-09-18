@@ -539,3 +539,19 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   already handles. Overlays are clipped to scope and route and skip
   off-route rows instead of raising.
 
+- **One condition vocabulary for attributes** (`attribute_rules.py`): risk
+  checks and the polygon-class exclusion both store conditions as the same
+  small dicts — `{"match": v}`, `{"min", "max", "min_inclusive",
+  "max_inclusive"}`, `{"expression": text}` — so one pure module owns
+  matching, validation and the readable summary, and one widget
+  (`tabs/attribute_widgets.AttributeRulesTable`) edits both. The inclusive
+  flags default to *true* when absent because that is what the pre-flag
+  `a-b` text form meant; the editor writes them explicitly (new ranges
+  default to `[a, b)`) so adjoining bins never double-count a boundary.
+  Expression rules are evaluated where the `QgsFeature` is (the main-thread
+  snapshot / the engine's matcher) and reach the pure evaluator as a list of
+  pre-computed hits, keeping `risk.py` QGIS-free and the worker thread away
+  from layers. Older plugin versions read a range rule as inclusive and an
+  expression rule as never firing; the polygon rule's `match_values` stays
+  the simple path and `match_rules` / `match_expression` are additive, so
+  no schema bump and no migration.

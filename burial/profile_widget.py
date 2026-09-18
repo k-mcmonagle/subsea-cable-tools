@@ -31,6 +31,7 @@ from qgis.PyQt.QtWidgets import (
     QWidget,
 )
 
+from ..qgis_compat import QAction
 from . import events as ev
 from . import generation, schema
 
@@ -44,6 +45,10 @@ _MOUSE_LEFT = getattr(Qt, "MouseButton", Qt).LeftButton
 _LEFT_AXIS_WIDTH = 62
 
 _SETTINGS_ROOT = "SubseaCableTools/BurialPlanner"
+
+# True-scale view: KP is in km and depth in m, so one x unit must span
+# 1000 y units for 1:1 (pyqtgraph's aspect ratio is x-scale / y-scale).
+_TRUE_SCALE_RATIO = 1000.0
 
 _REGION_STYLES = {
     "excluded": (QColor(214, 39, 40, 60), QColor(214, 39, 40, 110)),
@@ -386,7 +391,25 @@ class BurialProfileWidget(QWidget):
             f"{_SETTINGS_ROOT}/show_sea_level", True, type=bool)))
         self._sea_toggle.toggled.connect(self._sea_level_toggled)
         depth_toggle_row.addWidget(self._sea_toggle)
+        # True scale (1:1): lock the depth axis to the KP axis so the
+        # profile shows the seabed's real gradient (also on right-click).
+        self._true_scale_toggle = QCheckBox("True scale (1:1)")
+        self._true_scale_toggle.setToolTip(
+            "Lock the depth and KP axes to the same scale (1 km along the "
+            "route = 1000 m of depth) so slopes appear as they really are. "
+            "Untick to return to the stretched auto-scaled view.")
+        self._true_scale_toggle.toggled.connect(self._true_scale_toggled)
+        depth_toggle_row.addWidget(self._true_scale_toggle)
         depth_toggle_row.addStretch(1)
+        self._true_scale_action = QAction("True scale (1:1)", self)
+        self._true_scale_action.setCheckable(True)
+        self._true_scale_action.setToolTip(self._true_scale_toggle.toolTip())
+        self._true_scale_action.triggered.connect(
+            lambda checked: self._true_scale_toggle.setChecked(bool(checked)))
+        menu = getattr(item.vb, "menu", None)
+        if menu is not None:
+            menu.addSeparator()
+            menu.addAction(self._true_scale_action)
 
         self._depth_pane = QWidget()
         depth_layout = QVBoxLayout(self._depth_pane)
@@ -541,6 +564,59 @@ class BurialProfileWidget(QWidget):
     def _sea_level_toggled(self, checked: bool) -> None:
         QSettings().setValue(f"{_SETTINGS_ROOT}/show_sea_level", bool(checked))
         self._update_sea_level()
+        if self.true_scale():
+            self._fit_true_scale()
+
+    # -- true scale (1:1) ---------------------------------------------------
+    def true_scale(self) -> bool:
+        return self._true_scale_toggle.isChecked()
+
+    def set_true_scale(self, on: bool) -> None:
+        """Programmatic toggle (the checkbox and menu action follow)."""
+        self._true_scale_toggle.setChecked(bool(on))
+
+    def _true_scale_toggled(self, checked: bool) -> None:
+        self._true_scale_action.blockSignals(True)
+        try:
+            self._true_scale_action.setChecked(bool(checked))
+        finally:
+            self._true_scale_action.blockSignals(False)
+        vb = self.plot.getPlotItem().vb
+        if checked:
+            # Aspect locking and y auto-visible fight each other: the
+            # locked view derives its own y span from the KP window.
+            vb.setAutoVisible(y=False)
+            vb.enableAutoRange(y=False)
+            vb.setAspectLocked(True, ratio=_TRUE_SCALE_RATIO)
+            self._fit_true_scale()
+        else:
+            vb.setAspectLocked(False)
+            vb.enableAutoRange(y=True)
+            vb.setAutoVisible(y=True)
+            self.reset_scope_view()
+
+    def _fit_true_scale(self) -> None:
+        """Frame the scope at 1:1 with the profile (and sea level) in view.
+
+        With the aspect locked pyqtgraph widens whichever axis it must to
+        keep the whole target range visible, so asking for the scope in x
+        and the data span in y shows the true-scale profile centred.
+        """
+        lo, hi = self._scope
+        if hi <= lo:
+            return
+        ys = [depth for kp, depth in self._series
+              if depth is not None and depth == depth and lo <= kp <= hi]
+        if ys:
+            y_lo, y_hi = min(ys), max(ys)
+        else:
+            y_lo, y_hi = 0.0, 1.0
+        if self._sea_toggle.isChecked():
+            y_lo = min(y_lo, 0.0)
+        if y_hi <= y_lo:
+            y_hi = y_lo + 1.0
+        self.plot.getPlotItem().vb.setRange(
+            xRange=(lo, hi), yRange=(y_lo, y_hi), padding=0.02)
 
     def _update_sea_level(self) -> None:
         lo, hi = self._scope
@@ -799,7 +875,10 @@ class BurialProfileWidget(QWidget):
     def reset_scope_view(self) -> None:
         lo, hi = self._scope
         if hi > lo:
-            self.plot.setXRange(lo, hi, padding=0.02)
+            if self.true_scale():
+                self._fit_true_scale()
+            else:
+                self.plot.setXRange(lo, hi, padding=0.02)
 
     def _show_kp_readout(self, kp: float) -> None:
         sample = self._nearest_sample(kp)

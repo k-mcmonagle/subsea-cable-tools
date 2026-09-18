@@ -62,6 +62,13 @@ from ...workbench.kp_bars import FireBarDelegate, VerdictStrip
 from ...workbench.rules_engine import Interval
 from .. import map_layers, risk, risk_scan, schema
 from .. import ui_helpers
+from .attribute_widgets import (
+    AttributeRulesTable,
+    ExpressionEdit,
+    FieldCombo,
+    expression_problem,
+    resolve_input_layer,
+)
 
 _CHECK_FIRE_COL = 2
 _CHECK_COLUMNS = ["On", "Check", "Findings", "Hazards"]
@@ -133,6 +140,7 @@ class CheckEditorDialog(QDialog):
                 row.get("input_id"))
         self.input_combo.setCurrentIndex(
             max(0, self.input_combo.findData(config.get("input_id") or "")))
+        self.input_combo.currentIndexChanged.connect(self._sync_input_layer)
         form.addRow("Input:", self.input_combo)
         self.distance_spin = QDoubleSpinBox()
         self.distance_spin.setRange(0.0, 1000000.0)
@@ -143,11 +151,16 @@ class CheckEditorDialog(QDialog):
             "Search distance from the route centreline, applied each side. "
             "Features beyond this are not registered at all.")
         form.addRow("Search within (each side of route):", self.distance_spin)
-        self.filter_edit = QLineEdit(config.get("filter_expression") or "")
-        self.filter_edit.setPlaceholderText("optional QGIS filter expression")
+        self.filter_edit = ExpressionEdit(
+            config.get("filter_expression") or "",
+            "optional QGIS filter expression")
+        self.filter_edit.setToolTip(
+            "Only features for which this expression is true are scanned "
+            "at all (e.g. \"Status\" = 'live'). Leave blank for every "
+            "feature.")
         form.addRow("Feature filter:", self.filter_edit)
-        self.label_edit = QLineEdit(config.get("label_attribute") or "")
-        self.label_edit.setPlaceholderText(
+        self.label_edit = FieldCombo(
+            config.get("label_attribute") or "",
             "attribute naming each feature (e.g. Name, ContactID)")
         form.addRow("Label attribute:", self.label_edit)
         layout.addLayout(form)
@@ -203,35 +216,26 @@ class CheckEditorDialog(QDialog):
 
         self.attr_group = QGroupBox("Risk from an attribute (optional)")
         attr_form = QFormLayout(self.attr_group)
-        self.attribute_edit = QLineEdit(config.get("attribute") or "")
-        self.attribute_edit.setPlaceholderText(
-            "e.g. Height_m, Class, Diameter")
+        self.attribute_edit = FieldCombo(
+            config.get("attribute") or "",
+            "pick a field of the input layer (e.g. Height_m, Class)")
+        self.attribute_edit.setToolTip(
+            "The field the Value / Range rows below read. Expression rows "
+            "can reference any field.")
         attr_form.addRow("Attribute:", self.attribute_edit)
-        self.rules_table = QTableWidget(0, 2)
-        self.rules_table.setHorizontalHeaderLabels(["Value or range", "Risk"])
-        self.rules_table.verticalHeader().setVisible(False)
-        self.rules_table.setMinimumHeight(90)
-        self.rules_table.setMaximumHeight(140)
-        self.rules_table.horizontalHeader().setSectionResizeMode(
-            0, HEADER_RESIZE_MODE_STRETCH)
-        self.rules_table.setToolTip(
-            "First matching rule wins. Exact value (e.g. ROCK) or numeric "
-            "range a-b with either side open (2- = at least 2, -3 = up to "
-            "3). The effective risk is the most severe of proximity and "
-            "attribute.")
-        for rule in config.get("attribute_rules") or []:
-            self._append_rule_row(risk.format_attribute_rule(rule),
-                                  rule.get("risk") or "")
+        self.rules_table = AttributeRulesTable(with_kind=True, with_risk=True)
+        self.rules_table.set_attribute_name_provider(self.attribute_edit.text)
+        self.rules_table.set_rules(config.get("attribute_rules") or [])
         attr_form.addRow("Rules:", self.rules_table)
-        rule_buttons = QHBoxLayout()
-        add_rule = QPushButton("＋ Add rule")
-        add_rule.clicked.connect(lambda: self._append_rule_row("", ""))
-        rule_buttons.addWidget(add_rule)
-        remove_rule = QPushButton("− Remove rule")
-        remove_rule.clicked.connect(self._remove_rule_row)
-        rule_buttons.addWidget(remove_rule)
-        rule_buttons.addStretch(1)
-        attr_form.addRow("", rule_buttons)
+        rules_note = QLabel(
+            "First matching row wins, top to bottom. Ranges take ≥ / > "
+            "and < / ≤ bounds so bins are unambiguous (e.g. ≥ 0 … "
+            "< 5 High, ≥ 5 … < 10 Medium, ≥ 10 … ≤ 200 Low). "
+            "The effective risk is the most severe of proximity and "
+            "attribute.")
+        rules_note.setWordWrap(True)
+        rules_note.setStyleSheet(ui_helpers.hint_style())
+        attr_form.addRow(rules_note)
         layout.addWidget(self.attr_group)
 
         tail = QFormLayout()
@@ -258,7 +262,16 @@ class CheckEditorDialog(QDialog):
         buttons.accepted.connect(self._accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self._sync_input_layer()
         self._sync_kind()
+
+    def _sync_input_layer(self, *_args) -> None:
+        """Point the field pickers / expression builders at the input."""
+        layer = resolve_input_layer(self.inputs,
+                                    self.input_combo.currentData() or "")
+        for widget in (self.attribute_edit, self.label_edit,
+                       self.filter_edit, self.rules_table):
+            widget.set_layer(layer)
 
     def _accept(self) -> None:
         turns = self.kind_combo.currentData() == risk_scan.CHECK_KIND_ROUTE_TURNS
@@ -276,21 +289,28 @@ class CheckEditorDialog(QDialog):
                     "without one the check is skipped at scan time. "
                     "Register layers on the Inputs tab first.")
                 return
-            bad_rules = []
-            for row in range(self.rules_table.rowCount()):
-                item = self.rules_table.item(row, 0)
-                text = (item.text() if item is not None else "").strip()
-                if not text:
-                    continue
-                if risk.parse_attribute_rule(text, schema.RISK_LOW) is None:
-                    bad_rules.append(f"rule {row + 1}: '{text}'")
+            filter_problem = expression_problem(self.filter_edit.text())
+            if filter_problem:
+                QMessageBox.warning(
+                    self, "Burial Planner",
+                    f"The feature filter does not parse: {filter_problem}")
+                return
+            bad_rules = self.rules_table.invalid_rows()
             if bad_rules:
                 QMessageBox.warning(
                     self, "Burial Planner",
                     "These attribute rules are not valid and would be "
-                    "ignored: " + ", ".join(bad_rules[:5])
-                    + ". Use an exact value (ROCK) or a numeric range "
-                    "(2-5, 2-, -3).")
+                    "ignored: " + "; ".join(bad_rules[:5])
+                    + ". A range needs a numeric From and/or To; an "
+                    "expression must parse.")
+                return
+            needs_attribute = any(
+                "expression" not in rule for rule in self.rules_table.rules())
+            if needs_attribute and not self.attribute_edit.text():
+                QMessageBox.warning(
+                    self, "Burial Planner",
+                    "Pick the attribute the Value / Range rules read "
+                    "(or use expression rules, which name their own fields).")
                 return
         self.accept()
 
@@ -312,23 +332,6 @@ class CheckEditorDialog(QDialog):
             "band or attribute rule fires.")
         if turns and not self.name_edit.text().strip():
             self.name_edit.setPlaceholderText("A/C course change")
-
-    def _append_rule_row(self, text: str, level: str) -> None:
-        row = self.rules_table.rowCount()
-        self.rules_table.insertRow(row)
-        self.rules_table.setItem(row, 0, QTableWidgetItem(text))
-        combo = QComboBox()
-        for value in schema.RISK_LEVELS:
-            combo.addItem(schema.RISK_LABELS[value], value)
-        combo.setCurrentIndex(max(0, combo.findData(level or schema.RISK_LOW)))
-        self.rules_table.setCellWidget(row, 1, combo)
-
-    def _remove_rule_row(self) -> None:
-        row = self.rules_table.currentRow()
-        if row < 0:
-            row = self.rules_table.rowCount() - 1
-        if row >= 0:
-            self.rules_table.removeRow(row)
 
     def result_check(self) -> Dict:
         turns = self.kind_combo.currentData() == risk_scan.CHECK_KIND_ROUTE_TURNS
@@ -353,15 +356,7 @@ class CheckEditorDialog(QDialog):
             for key, spin in self.band_spins.items():
                 if spin.value() > 0:
                     config[key] = spin.value()
-            rules: List[Dict] = []
-            for row in range(self.rules_table.rowCount()):
-                item = self.rules_table.item(row, 0)
-                combo = self.rules_table.cellWidget(row, 1)
-                level = combo.currentData() if combo is not None else ""
-                rule = risk.parse_attribute_rule(
-                    item.text() if item is not None else "", level or "")
-                if rule is not None:
-                    rules.append(rule)
+            rules = self.rules_table.rules()
             if rules:
                 config["attribute_rules"] = rules
         default_name = "A/C course change" if turns else "Risk check"

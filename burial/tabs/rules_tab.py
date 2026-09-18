@@ -65,6 +65,13 @@ from ...workbench.kp_bars import ACTION_COLORS, FireBarDelegate, VerdictStrip
 from ...workbench.rules_engine import STATUS_EXCLUDED, STATUS_RISK
 from .. import change_log, generation, profile_data, schema
 from .. import ui_helpers
+from .attribute_widgets import (
+    AttributeRulesTable,
+    ExpressionEdit,
+    FieldCombo,
+    expression_problem,
+    resolve_input_layer,
+)
 
 FIRE_COL = 2
 
@@ -236,7 +243,10 @@ class RuleEditorDialog(QDialog):
 
         condition = QGroupBox("Coverage" if self.is_coverage else "Condition")
         self.condition_form = QFormLayout(condition)
+        # Field pickers / expression editors that follow the chosen input.
+        self._layer_widgets: List = []
         self._build_kind_form(kind)
+        self._sync_input_layer()
         layout.addWidget(condition)
 
         if self.is_coverage:
@@ -348,6 +358,35 @@ class RuleEditorDialog(QDialog):
                     + ", ".join(bad[:5])
                     + ". Use start-end pairs like 12.000-13.500.")
                 return
+        for label, widget in (("feature filter", getattr(self, "filter_edit", None)),
+                              ("coverage filter",
+                               getattr(self, "coverage_filter_edit", None)),
+                              ("match expression",
+                               getattr(self, "match_expression_edit", None))):
+            problem = expression_problem(widget.text()) \
+                if isinstance(widget, ExpressionEdit) else None
+            if problem:
+                QMessageBox.warning(
+                    self, "Burial Planner",
+                    f"The {label} does not parse: {problem}")
+                return
+        if hasattr(self, "ranges_table"):
+            bad_ranges = self.ranges_table.invalid_rows()
+            if bad_ranges:
+                QMessageBox.warning(
+                    self, "Burial Planner",
+                    "These value ranges are not valid and would be "
+                    "ignored: " + "; ".join(bad_ranges[:5])
+                    + ". Each range needs a numeric From and/or To.")
+                return
+            if (self.ranges_table.rules() or self.values_edit.text().strip()) \
+                    and not self.attribute_field.text() \
+                    and not self.match_expression_edit.text():
+                QMessageBox.warning(
+                    self, "Burial Planner",
+                    "Pick the attribute the match values / ranges read, "
+                    "or match by expression instead.")
+                return
         if hasattr(self, "bands_table"):
             bad_cells = []
             for row in range(self.bands_table.rowCount()):
@@ -372,6 +411,30 @@ class RuleEditorDialog(QDialog):
         polygon = (self.coverage_source_combo.currentData() or "") == "polygon"
         self.coverage_input_combo.setEnabled(polygon)
         self.coverage_filter_edit.setEnabled(polygon)
+
+    def _sync_input_layer(self, *_args) -> None:
+        """Point the field pickers / expression builders at the input."""
+        combo = getattr(self, "input_combo", None) \
+            or getattr(self, "coverage_input_combo", None)
+        layer = resolve_input_layer(
+            self.inputs, combo.currentData() or "") if combo is not None \
+            else None
+        for widget in self._layer_widgets:
+            widget.set_layer(layer)
+
+    def _sync_polygon_match(self, *_args) -> None:
+        """An expression overrides the attribute matching: grey it out."""
+        by_expression = bool(self.match_expression_edit.text())
+        for widget in (self.attribute_field, self.values_edit,
+                       self.ranges_table):
+            widget.setEnabled(not by_expression)
+        self.polygon_note.setText(
+            "Matching by expression — the attribute, values and ranges "
+            "above are ignored while an expression is set."
+            if by_expression else
+            "A polygon counts when the attribute equals any listed value "
+            "OR falls in any range. Leave both empty (and no expression) "
+            "to use every polygon of the input.")
 
     def _sync_corridor(self) -> None:
         mode = self.corridor_combo.currentData() or ""
@@ -413,7 +476,20 @@ class RuleEditorDialog(QDialog):
                 row.get("input_id"))
         index = combo.findData(self.config.get("input_id") or "")
         combo.setCurrentIndex(max(0, index))
+        combo.currentIndexChanged.connect(self._sync_input_layer)
         return combo
+
+    def _field_combo(self, key: str, default: str = "",
+                     placeholder: str = "") -> FieldCombo:
+        combo = FieldCombo(self.config.get(key) or default, placeholder)
+        self._layer_widgets.append(combo)
+        return combo
+
+    def _expression_edit(self, key: str, placeholder: str = "") -> ExpressionEdit:
+        edit = ExpressionEdit(self.config.get(key) or "",
+                              placeholder or "optional QGIS filter expression")
+        self._layer_widgets.append(edit)
+        return edit
 
     def _build_kind_form(self, kind: str) -> None:
         form = self.condition_form
@@ -440,23 +516,25 @@ class RuleEditorDialog(QDialog):
                 "route.")
             form.addRow("Within distance (each side of route):",
                         self.distance_spin)
-            self.buffer_field_edit = QLineEdit(config.get("buffer_field") or "")
-            self.buffer_field_edit.setPlaceholderText(
+            self.buffer_field_edit = self._field_combo(
+                "buffer_field", "",
                 "optional attribute holding a per-feature buffer (m)")
             form.addRow("Per-feature buffer field:", self.buffer_field_edit)
-            self.filter_edit = QLineEdit(config.get("filter_expression") or "")
-            self.filter_edit.setPlaceholderText("optional QGIS filter expression")
+            self.filter_edit = self._expression_edit("filter_expression")
+            self.filter_edit.setToolTip(
+                "Only features for which this expression is true count "
+                "(e.g. \"Status\" = 'live'). Leave blank for every feature.")
             form.addRow("Feature filter:", self.filter_edit)
         elif kind == wb_schema.RULE_KIND_POLYGON:
             self._build_polygon_form(form, config)
         elif kind == wb_schema.RULE_KIND_KP_TABLE:
             self.input_combo = self._input_combo()
             form.addRow("Input:", self.input_combo)
-            self.start_field_edit = QLineEdit(config.get("start_field") or "start_kp")
-            self.end_field_edit = QLineEdit(config.get("end_field") or "end_kp")
+            self.start_field_edit = self._field_combo("start_field", "start_kp")
+            self.end_field_edit = self._field_combo("end_field", "end_kp")
             form.addRow("Start KP field:", self.start_field_edit)
             form.addRow("End KP field:", self.end_field_edit)
-            self.filter_edit = QLineEdit(config.get("filter_expression") or "")
+            self.filter_edit = self._expression_edit("filter_expression")
             form.addRow("Feature filter:", self.filter_edit)
         elif kind == wb_schema.RULE_KIND_MANUAL:
             ranges = config.get("ranges") or []
@@ -478,10 +556,7 @@ class RuleEditorDialog(QDialog):
             form.addRow("Coverage source:", self.coverage_source_combo)
             self.coverage_input_combo = self._input_combo()
             form.addRow("Coverage polygon input:", self.coverage_input_combo)
-            self.coverage_filter_edit = QLineEdit(
-                config.get("match_expression") or "")
-            self.coverage_filter_edit.setPlaceholderText(
-                "optional QGIS filter expression")
+            self.coverage_filter_edit = self._expression_edit("match_expression")
             form.addRow("Feature filter:", self.coverage_filter_edit)
             coverage_note = QLabel(
                 "Where the route leaves the selected coverage — bathymetry "
@@ -628,12 +703,33 @@ class RuleEditorDialog(QDialog):
         self.input_combo = self._input_combo(
             [schema.INPUT_ROLE_SOILS, schema.INPUT_ROLE_OTHER])
         form.addRow("Input:", self.input_combo)
-        self.attribute_edit = QLineEdit(config.get("attribute") or "")
-        form.addRow("Attribute:", self.attribute_edit)
+        self.attribute_field = self._field_combo(
+            "attribute", "", "pick a field of the input layer")
+        form.addRow("Attribute:", self.attribute_field)
         self.values_edit = QLineEdit(
             ", ".join(config.get("match_values") or []))
         self.values_edit.setPlaceholderText("e.g. ROCK, BOULDERS")
+        self.values_edit.setToolTip(
+            "Comma-separated exact values (case-insensitive).")
         form.addRow("Match values:", self.values_edit)
+        self.ranges_table = AttributeRulesTable(with_kind=False, with_risk=False)
+        self.ranges_table.set_attribute_name_provider(self.attribute_field.text)
+        self.ranges_table.set_rules(config.get("match_rules") or [])
+        self._layer_widgets.append(self.ranges_table)
+        form.addRow("Value ranges (optional):", self.ranges_table)
+        self.match_expression_edit = self._expression_edit(
+            "match_expression",
+            "advanced: e.g. \"Grade\" >= 5 AND \"Soil\" <> 'SAND'")
+        self.match_expression_edit.setToolTip(
+            "Full QGIS expression over each polygon. When set it replaces "
+            "the attribute / values / ranges above entirely.")
+        self.match_expression_edit.textChanged.connect(self._sync_polygon_match)
+        form.addRow("Match by expression:", self.match_expression_edit)
+        self.polygon_note = QLabel("")
+        self.polygon_note.setWordWrap(True)
+        self.polygon_note.setStyleSheet(ui_helpers.hint_style())
+        form.addRow(self.polygon_note)
+        self._sync_polygon_match()
         self.corridor_combo = QComboBox()
         self.corridor_combo.addItem("Route centreline only (default)", "")
         self.corridor_combo.addItem("Within fixed distance of route", "fixed")
@@ -782,9 +878,19 @@ class RuleEditorDialog(QDialog):
             config["filter_expression"] = self.filter_edit.text().strip()
         elif kind == wb_schema.RULE_KIND_POLYGON:
             config["input_id"] = self.input_combo.currentData() or ""
-            config["attribute"] = self.attribute_edit.text().strip()
+            config["attribute"] = self.attribute_field.text().strip()
             config["match_values"] = [v.strip() for v in
                                       self.values_edit.text().split(",") if v.strip()]
+            match_rules = self.ranges_table.rules()
+            if match_rules:
+                config["match_rules"] = match_rules
+            else:
+                config.pop("match_rules", None)
+            expression = self.match_expression_edit.text()
+            if expression:
+                config["match_expression"] = expression
+            else:
+                config.pop("match_expression", None)
             corridor_mode = self.corridor_combo.currentData() or ""
             corridor_value = self.corridor_spin.value()
             for key in ("route_buffer_mode", "route_buffer_m", "route_buffer_wd"):

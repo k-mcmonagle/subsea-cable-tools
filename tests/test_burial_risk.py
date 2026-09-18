@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 
-from ..burial import io_csv, risk, schema
+from ..burial import attribute_rules, io_csv, risk, schema
 
 
 def _result(name: str, ok: bool, detail: str = "") -> bool:
@@ -150,10 +150,73 @@ def test_hazards_csv() -> bool:
     return _result("hazards CSV export (labels, checks, angles)", ok)
 
 
+def test_range_bounds_and_expression_rules() -> bool:
+    """Explicit ≥/> and </≤ bounds, legacy inclusive default, expression
+    hits, validation and the readable summary."""
+    ar = attribute_rules
+    # Adjoining bins with exclusive upper bounds: a boundary value lands
+    # in exactly one bin.
+    bins = [{"min": 0, "max": 5, "max_inclusive": False, "risk": "high"},
+            {"min": 5, "max": 10, "max_inclusive": False, "risk": "medium"},
+            {"min": 10, "max": 200, "risk": "low"}]
+    config = {"attribute": "grade", "attribute_rules": bins}
+    ok = risk.attribute_risk(config, {"grade": 4.999}) == "high"
+    ok = ok and risk.attribute_risk(config, {"grade": 5}) == "medium"
+    ok = ok and risk.attribute_risk(config, {"grade": 10}) == "low"
+    ok = ok and risk.attribute_risk(config, {"grade": 200}) == "low"
+    ok = ok and risk.attribute_risk(config, {"grade": 200.5}) == ""
+    ok = ok and risk.attribute_risk(config, {"grade": "7,5"}) == "medium"
+    ok = ok and risk.attribute_risk(config, {"grade": None}) == ""
+    # Strict lower bound; legacy rules without flags stay inclusive.
+    strict = {"min": 2, "min_inclusive": False}
+    ok = ok and not ar.rule_matches(strict, 2) and ar.rule_matches(strict, 2.01)
+    ok = ok and ar.rule_matches({"min": 2, "max": 3}, 3)
+    ok = ok and ar.rule_matches({"max": 3, "max_inclusive": True}, 3)
+    ok = ok and not ar.rule_matches({"max": 3, "max_inclusive": False}, 3)
+    # Value rules: case-insensitive; null never matches.
+    ok = ok and ar.rule_matches({"match": "Rock"}, " ROCK ")
+    ok = ok and not ar.rule_matches({"match": "None"}, None)
+    # Expression rules fire from pre-evaluated hits (aligned with the
+    # expression rules only) and need no attribute at all.
+    mixed = {"attribute": "", "attribute_rules": [
+        {"expression": '"h" > 2', "risk": "high"},
+        {"match": "X", "risk": "low"},
+        {"expression": '"h" > 1', "risk": "medium"}]}
+    ok = ok and risk.evaluate_risk(mixed, 500.0, {}, [False, True]) == "medium"
+    ok = ok and risk.evaluate_risk(mixed, 500.0, {}, [True, True]) == "high"
+    ok = ok and risk.evaluate_risk(mixed, 500.0, {}, None) == ""
+    ok = ok and ar.expression_texts(mixed["attribute_rules"]) == \
+        ['"h" > 2', '"h" > 1']
+    # Attribute rules still work alongside expression rules.
+    both = {"attribute": "cls", "attribute_rules": [
+        {"expression": "1=1", "risk": "low"},
+        {"match": "WRECK", "risk": "high"}]}
+    ok = ok and risk.attribute_risk(both, {"cls": "wreck"}, [False]) == "high"
+    ok = ok and risk.attribute_risk(both, {"cls": "sand"}, [True]) == "low"
+    # Validation + summary.
+    ok = ok and ar.validate_rule({"min": 5, "max": 2}) is not None
+    ok = ok and ar.validate_rule({"match": "  "}) is not None
+    ok = ok and ar.validate_rule({"min": "abc"}) is not None
+    ok = ok and ar.validate_rule({}) is not None
+    ok = ok and ar.validate_rule(bins[0]) is None
+    ok = ok and ar.describe_rule(bins[0], "grade") == "0 \u2264 grade < 5"
+    ok = ok and ar.describe_rule({"min": 2, "min_inclusive": False}, "h") == "2 < h"
+    ok = ok and ar.describe_rule({"match": "ROCK"}, "soil") == "soil = ROCK"
+    # Polygon rule: values and ranges together, any may match.
+    poly = {"attribute": "soil", "match_values": ["ROCK"],
+            "match_rules": [{"min": 5, "max_inclusive": False}]}
+    rules = ar.polygon_match_rules(poly)
+    ok = ok and len(rules) == 2
+    ok = ok and ar.any_rule_matches(rules, "rock")
+    ok = ok and ar.any_rule_matches(rules, 7) and not ar.any_rule_matches(rules, 4)
+    return _result("range bounds, expression hits, validation, summaries", ok)
+
+
 def run_all() -> list:
     return [
         test_risk_evaluation(),
         test_attribute_rule_text_form(),
+        test_range_bounds_and_expression_rules(),
         test_carry_over(),
         test_spans_and_summary(),
         test_hazards_csv(),

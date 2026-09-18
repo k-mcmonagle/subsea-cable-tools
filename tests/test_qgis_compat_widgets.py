@@ -10,7 +10,11 @@ from qgis.gui import QgsMapCanvas
 
 from ..catenary.v3.ui.bu_lowering_dialog import BULoweringDialog
 from ..catenary.v3.ui.dialog import LaySimulatorDialog
+from ..burial.tabs.attribute_widgets import AttributeRulesTable
 from ..burial.tabs.inputs_tab import InputsTab
+from ..burial.tabs.risk_tab import CheckEditorDialog
+from ..burial.tabs.rules_tab import RuleEditorDialog as BurialRuleEditorDialog
+from ..burial.profile_widget import BurialProfileWidget
 from ..burial.tabs.paths_tab import (
     LaybackProfileDialog,
     PathsTab,
@@ -139,6 +143,116 @@ def test_workbench_rule_layer_filters_construct():
         dialog.deleteLater()
 
 
+def test_burial_attribute_rule_editors_round_trip():
+    import json
+
+    # Risk check: value / range (explicit bounds) / expression rows survive
+    # the editor unchanged, and the field pickers accept free text with no
+    # layer loaded.
+    rules = [
+        {"min": 0.0, "max": 5.0, "min_inclusive": True,
+         "max_inclusive": False, "risk": "high"},
+        {"match": "WRECK", "risk": "high"},
+        {"expression": '"Height_m" > 2', "risk": "medium"},
+        {"min": 5.0, "risk": "low"},   # legacy: no flags = inclusive
+    ]
+    check = {"name": "Boulders", "config_json": json.dumps({
+        "kind": "features", "input_id": "", "distance_m": 50.0,
+        "attribute": "Height_m", "attribute_rules": rules,
+        "filter_expression": '"Status" = \'live\'',
+        "label_attribute": "Name", "default_risk": "low"})}
+    dialog = CheckEditorDialog(check, [])
+    assert dialog.attribute_edit.text() == "Height_m"
+    assert dialog.label_edit.text() == "Name"
+    assert dialog.filter_edit.text() == '"Status" = \'live\''
+    assert dialog.rules_table.row_count() == 4
+    assert not dialog.rules_table.invalid_rows()
+    out = json.loads(dialog.result_check()["config_json"])
+    assert out["attribute"] == "Height_m"
+    assert out["attribute_rules"] == [
+        {"min": 0.0, "min_inclusive": True, "max": 5.0,
+         "max_inclusive": False, "risk": "high"},
+        {"match": "WRECK", "risk": "high"},
+        {"expression": '"Height_m" > 2', "risk": "medium"},
+        {"min": 5.0, "min_inclusive": True, "risk": "low"},
+    ], out["attribute_rules"]
+    assert out["filter_expression"] == '"Status" = \'live\''
+    assert dialog.rules_table.describe()[0] == "0 \u2264 Height_m < 5"
+    dialog.close()
+    dialog.deleteLater()
+
+    # Structured table: a bad expression and an inverted range are
+    # reported (not silently dropped); a new range row defaults to [a, b).
+    table = AttributeRulesTable(with_kind=True, with_risk=True)
+    table.add_row({"expression": "this is not (an expression"})
+    table.add_row({"min": 9, "max": 1})
+    problems = table.invalid_rows()
+    assert len(problems) == 2, problems
+    table.set_rules([{"min": 1, "max": 2}])
+    table.add_row({})
+    table.table.item(1, table.col_value).setText("3")
+    table.table.item(1, table.col_to).setText("4")
+    kind_combo = table.table.cellWidget(1, table.col_kind)
+    kind_combo.setCurrentIndex(kind_combo.findData("range"))
+    got = table.rules()
+    assert got[0] == {"min": 1.0, "min_inclusive": True, "max": 2.0,
+                      "max_inclusive": True, "risk": "low"}, got
+    assert got[1] == {"min": 3.0, "min_inclusive": True, "max": 4.0,
+                      "max_inclusive": False, "risk": "low"}, got
+    table.deleteLater()
+
+    # Exclusion polygon rule: values + ranges + expression round trip; the
+    # legacy exact-values path is unchanged and an empty expression is
+    # not stored.
+    rule = {"kind": schema.RULE_KIND_POLYGON, "name": "Soils",
+            "criterion_class": "project",
+            "config_json": json.dumps({
+                "input_id": "", "attribute": "GRADE",
+                "match_values": ["ROCK"],
+                "match_rules": [{"min": 5.0, "min_inclusive": True}]})}
+    dialog = BurialRuleEditorDialog(rule, [], "plough")
+    assert dialog.attribute_field.text() == "GRADE"
+    assert dialog.ranges_table.row_count() == 1
+    assert dialog.attribute_field.isEnabled()
+    out = json.loads(dialog.result_rule()["config_json"])
+    assert out["attribute"] == "GRADE"
+    assert out["match_values"] == ["ROCK"]
+    assert out["match_rules"] == [{"min": 5.0, "min_inclusive": True}], out
+    assert "match_expression" not in out
+    dialog.match_expression_edit.setText('"GRADE" >= 5')
+    assert not dialog.attribute_field.isEnabled()
+    out = json.loads(dialog.result_rule()["config_json"])
+    assert out["match_expression"] == '"GRADE" >= 5'
+    dialog.close()
+    dialog.deleteLater()
+
+    for kind in (schema.RULE_KIND_PROXIMITY, schema.RULE_KIND_KP_TABLE):
+        dialog = BurialRuleEditorDialog(
+            {"kind": kind, "name": kind, "config_json": "{}"}, [], "plough")
+        assert dialog.filter_edit.text() == ""
+        dialog.close()
+        dialog.deleteLater()
+
+
+def test_burial_profile_true_scale_toggle():
+    widget = BurialProfileWidget()
+    widget.set_scope(0.0, 10.0)
+    widget.set_profile([(0.0, 100.0), (5.0, 1500.0), (10.0, 200.0)])
+    vb = widget.plot.getPlotItem().vb
+    assert vb.state["aspectLocked"] is False
+    widget.set_true_scale(True)
+    assert widget.true_scale()
+    assert widget._true_scale_action.isChecked()
+    assert float(vb.state["aspectLocked"]) == 1000.0
+    widget.reset_scope_view()            # keeps the lock
+    assert float(vb.state["aspectLocked"]) == 1000.0
+    widget._true_scale_action.trigger()  # menu entry toggles it back off
+    assert not widget.true_scale()
+    assert vb.state["aspectLocked"] is False
+    assert vb.state["autoRange"][1]
+    widget.deleteLater()
+
+
 def test_lay_simulator_tables_construct():
     dialog = LaySimulatorDialog()
     assert dialog.windowTitle()
@@ -220,6 +334,8 @@ def run_all():
             test_burial_inputs_construct_and_switch_source_type,
             test_burial_installation_paths_widgets_construct,
             test_workbench_rule_layer_filters_construct,
+            test_burial_attribute_rule_editors_round_trip,
+            test_burial_profile_true_scale_toggle,
             test_lay_simulator_tables_construct,
             test_bu_lowering_tool_constructs_and_builds_config,
             test_cable_lay_explorer_panels_construct,

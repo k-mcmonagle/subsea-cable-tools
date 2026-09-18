@@ -968,26 +968,24 @@ def _geometry_predicate(work: AnalysisWork, rule_work: RuleWork,
     buffer_field = (config.get("buffer_field") or "").strip()
     from ..qgis_compat import GEOMETRY_POLYGON
 
-    attribute = config.get("attribute") or ""
-    match_values = {str(v).strip().lower() for v in (config.get("match_values") or [])}
-    expr, ctx = ri.filter_expression(
-        config.get("match_expression" if kind == wb_schema.RULE_KIND_POLYGON
-                   else "filter_expression", ""))
+    expr, ctx = ri.filter_expression(config.get("filter_expression", "")) \
+        if kind != wb_schema.RULE_KIND_POLYGON else (None, None)
+    # Polygon-class matching (values, ranges, expression) is the engine's
+    # own matcher, so refinement bisects exactly what acquisition saw.
+    polygon_matches = ri.polygon_feature_matcher(config) \
+        if kind == wb_schema.RULE_KIND_POLYGON else None
     # Same per-KP route-corridor buffer as polygon acquisition, so boundary
     # refinement bisects the identical condition.
     route_buffer_at = (ri.polygon_route_buffer_m_at(config, depth_at)
                        if kind == wb_schema.RULE_KIND_POLYGON else None)
 
     def matches(feat) -> bool:
+        if polygon_matches is not None:
+            return polygon_matches(feat)
         if expr is not None:
             ctx.setFeature(feat)
             return bool(expr.evaluate(ctx))
-        if kind != wb_schema.RULE_KIND_POLYGON or not attribute:
-            return True
-        try:
-            return str(feat[attribute]).strip().lower() in match_values
-        except KeyError:
-            return False
+        return True
 
     # The widest per-feature buffer bounds the candidate search rect; compute
     # it once — the predicate is evaluated many times during bisection and
