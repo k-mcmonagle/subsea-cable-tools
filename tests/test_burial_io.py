@@ -156,8 +156,8 @@ def test_sections_csv_exports_every_builder_column() -> bool:
     expected = ["section_ref", "kind", "start_kp", "end_kp", "start_rkp",
                 "end_rkp", "start_lat", "start_lon", "end_lat", "end_lon",
                 "length_km", "state", "conclusion", "confidence", "tool",
-                "tool_config", "skip_handling", "reasons", "reasons_text",
-                "notes"]
+                "tool_config", "skip_handling", "target_burial_m",
+                "reasons", "reasons_text", "notes"]
     ok = ok and header == expected
     first = dict(zip(header, parsed[1]))
     ok = ok and first["section_ref"] == "PS-01"

@@ -338,7 +338,8 @@ class BurialStore:
                         schema.TABLE_GENERATION, schema.TABLE_EVENT,
                         schema.TABLE_SECTION, schema.TABLE_CHANGE_LOG,
                         schema.TABLE_PROFILE, schema.TABLE_RISK_CHECK,
-                        schema.TABLE_HAZARD, schema.TABLE_PATH_RESULT)
+                        schema.TABLE_HAZARD, schema.TABLE_PATH_RESULT,
+                        schema.TABLE_ANALYSIS)
         conn = self._sql()
         if conn is not None:
             # One atomic transaction: the plan can never be half-deleted.
@@ -780,6 +781,19 @@ class BurialStore:
         return row["profile_id"]
 
     # -- change log ----------------------------------------------------------
+    # -- latest analysis results (derived; one row per plan) ------------------
+    def get_analysis(self, plan_id: str) -> Optional[Dict]:
+        rows = self.read_plan_table(schema.TABLE_ANALYSIS, plan_id)
+        return rows[-1] if rows else None
+
+    def save_analysis(self, row: Dict) -> str:
+        row = dict(row)
+        row.setdefault("analysis_id", schema.new_id())
+        row["modified_utc"] = schema.utc_now_iso()
+        self._replace_plan_rows(schema.TABLE_ANALYSIS,
+                                str(row.get("plan_id") or ""), [row])
+        return row["analysis_id"]
+
     def list_change_log(self, plan_id: str) -> List[Dict]:
         rows = self.read_plan_table(schema.TABLE_CHANGE_LOG, plan_id)
         rows.sort(key=lambda r: int(r.get("seq") or 0))

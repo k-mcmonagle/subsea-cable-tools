@@ -7,7 +7,11 @@ GeoPackage (``bp_profile``). The profile pane, slope panel and threshold-rule
 analysis all read the stored samples; nothing resamples silently. Currency
 is judged by fingerprints (route, bathymetry inputs) plus the scope and
 cross offset the samples were built with: any mismatch marks the profile
-stale and the user chooses when to resample.
+stale and the user chooses when to resample. ``stale_reasons`` says *what*
+changed. Route identity is the route geometry itself and bathymetry
+identity is per layer (source + content stamp + conventions), so reopening
+the project, editing another table in the same GeoPackage or relabelling
+the RPL no longer invalidates a correctly sampled profile.
 
 Slope conventions (plugin-wide, see README "Slope methodology"):
 
@@ -63,6 +67,11 @@ class PlanProfile:
     route_fingerprint: str = ""
     depth_fingerprint: str = ""
     sampled_utc: str = ""
+    # v2 identity (empty on profiles sampled before it existed):
+    route_geom_fingerprint: str = ""     # map_layers.route_geometry_fingerprint
+    depth_layers: Dict[str, str] = field(default_factory=dict)
+    depth_signature: str = ""            # mode | band | depth fields
+    depth_layer_names: Dict[str, str] = field(default_factory=dict)
     kps: List[float] = field(default_factory=list)
     depths: List[Optional[float]] = field(default_factory=list)
     port_depths: List[Optional[float]] = field(default_factory=list)
@@ -147,6 +156,116 @@ class PlanProfile:
         return result
 
     # -- currency -------------------------------------------------------------
+    def stale_reasons(self, route_fingerprint: str = "",
+                      route_geom_fingerprint: str = "",
+                      depth_fingerprint: str = "",
+                      legacy_depth_fingerprint: str = "",
+                      depth_layers: Optional[Dict[str, str]] = None,
+                      depth_signature: str = "",
+                      scope_start_kp: float = 0.0, scope_end_kp: float = 0.0,
+                      cross_offset_m: float = 0.0,
+                      step_m: Optional[float] = None,
+                      layer_names: Optional[Dict[str, str]] = None
+                      ) -> List[str]:
+        """Human reasons the stored samples no longer match (empty = current).
+
+        Route: the geometry fingerprint when both sides have one, else the
+        RPL fingerprint compared without its registry-path component (a
+        project opened from another folder is the same route). Bathymetry:
+        exact v2 match, else the v1 formula (profiles sampled before v2),
+        else a per-layer diff naming the layer and what changed.
+        """
+        if not self.kps:
+            return ["no stored samples"]
+        reasons: List[str] = []
+        if self.calculation_version != 2:
+            reasons.append("the sampling method was updated")
+        if self.route_geom_fingerprint and route_geom_fingerprint:
+            if self.route_geom_fingerprint != route_geom_fingerprint:
+                reasons.append("the route geometry changed")
+        elif _rpl_core(self.route_fingerprint) != _rpl_core(route_fingerprint):
+            reasons.append("the route (RPL revision) changed")
+        reasons.extend(self._depth_reasons(
+            depth_fingerprint, legacy_depth_fingerprint, depth_layers or {},
+            depth_signature, {**self.depth_layer_names, **(layer_names or {})}))
+        if abs(self.scope_start_kp - float(scope_start_kp)) >= 1e-6 \
+                or abs(self.scope_end_kp - float(scope_end_kp)) >= 1e-6:
+            reasons.append(
+                f"the scope changed (sampled KP {self.scope_start_kp:.3f}–"
+                f"{self.scope_end_kp:.3f}, now {float(scope_start_kp):.3f}–"
+                f"{float(scope_end_kp):.3f})")
+        if abs(self.cross_offset_m - float(cross_offset_m)) >= 1e-6:
+            reasons.append(
+                f"the cross-slope half-width changed ({self.cross_offset_m:g}"
+                f" → {float(cross_offset_m):g} m)")
+        if step_m is not None and abs(self.step_m - float(step_m)) >= 0.01:
+            reasons.append(f"the station step changed ({self.step_m:g} → "
+                           f"{float(step_m):g} m)")
+        return reasons
+
+    def _depth_reasons(self, depth_fp: str, legacy_fp: str,
+                       layers_now: Dict[str, str], signature_now: str,
+                       names: Dict[str, str]) -> List[str]:
+        if self.depth_fingerprint and self.depth_fingerprint == depth_fp:
+            return []
+        if not self.depth_layers:
+            # Sampled before per-layer identity: the v1 formula decides.
+            if legacy_fp and self.depth_fingerprint == legacy_fp:
+                return []
+            return ["the bathymetry source changed since sampling"]
+        reasons: List[str] = []
+        if self.depth_signature and signature_now \
+                and self.depth_signature != signature_now:
+            reasons.append("the bathymetry configuration (source type, band "
+                           "or depth field) changed")
+
+        def label(key: str) -> str:
+            name = names.get(key) or ""
+            if name:
+                return f"'{name}'"
+            tail = key.replace("\\", "/").split("|")[0].rsplit("/", 1)[-1]
+            return f"'{tail}'" if tail else "a bathymetry layer"
+
+        for key in layers_now:
+            if key.startswith("missing:"):
+                reasons.append("a configured bathymetry layer is not in the "
+                               "project — re-add it or re-point the source on "
+                               "Inputs")
+            elif key.startswith("error:"):
+                reasons.append("a bathymetry mosaic could not be read ("
+                               + key[len("error:"):] + ")")
+        for key, stored in self.depth_layers.items():
+            if key.startswith(("missing:", "error:")):
+                continue
+            current = layers_now.get(key)
+            if current is None:
+                if not any(k.startswith(("missing:", "error:"))
+                           for k in layers_now):
+                    reasons.append(f"bathymetry layer {label(key)} is no "
+                                   "longer part of the source")
+                continue
+            if current == stored:
+                continue
+            old = (stored.split("|", 2) + ["", "", ""])[:3]
+            new = (current.split("|", 2) + ["", "", ""])[:3]
+            what = []
+            if old[0] != new[0]:
+                what.append("its data was modified")
+            if old[1] != new[1] and old[1] and new[1]:
+                what.append(f"feature count {old[1]} → {new[1]}")
+            if old[2] != new[2]:
+                what.append("its depth conventions (vertical sense, units, "
+                            "datum or sampling) differ — if they were set "
+                            "without saving the QGIS project, save it")
+            reasons.append(f"bathymetry layer {label(key)}: "
+                           + "; ".join(what or ["changed"]))
+        for key in layers_now:
+            if key not in self.depth_layers and not key.startswith(
+                    ("missing:", "error:")):
+                reasons.append(f"bathymetry layer {label(key)} was added to "
+                               "the source")
+        return reasons or ["the bathymetry source changed since sampling"]
+
     def is_current(self, route_fingerprint: str, depth_fingerprint: str,
                    scope_start_kp: float, scope_end_kp: float,
                    cross_offset_m: float) -> bool:
@@ -168,6 +287,10 @@ class PlanProfile:
             "route_fingerprint": self.route_fingerprint,
             "depth_fingerprint": self.depth_fingerprint,
             "sampled_utc": self.sampled_utc,
+            "route_geom_fingerprint": self.route_geom_fingerprint,
+            "depth_layers": dict(self.depth_layers),
+            "depth_signature": self.depth_signature,
+            "depth_layer_names": dict(self.depth_layer_names),
         }
 
         def compact(values: List[Optional[float]], places: int) -> List:
@@ -177,13 +300,18 @@ class PlanProfile:
             return [None if v is None else round(float(v), places)
                     for v in values]
 
+        # Source ids (a full layer URI per station) and cell sizes are
+        # piecewise constant along the route: run-length encoding cut a
+        # 200k-station profile from ~15 MB of repeated URIs to a few bytes.
         samples = {
             "kps": compact(self.kps, 9),
             "depths": compact(self.depths, 6),
             "port": compact(self.port_depths, 6),
             "stbd": compact(self.stbd_depths, 6),
-            "sources": self.source_ids, "cells": self.cell_sizes_m,
-            "cross_max": self.cross_max_deg,
+            "sources_rle": run_length_encode(self.source_ids),
+            "cells_rle": run_length_encode(self.cell_sizes_m),
+            "cross_max": compact(self.cross_max_deg, 4)
+            if self.cross_max_deg else [],
         }
         return {
             "profile_id": profile_id or schema.new_id(),
@@ -223,11 +351,28 @@ class PlanProfile:
             out.extend([None] * (len(kps) - len(out)))
             return out[:len(kps)]
 
+        if "sources_rle" in samples:
+            source_ids = run_length_decode(samples.get("sources_rle"))
+        else:
+            source_ids = samples.get("sources") or []
+        if "cells_rle" in samples:
+            cell_sizes = run_length_decode(samples.get("cells_rle"))
+        else:
+            cell_sizes = samples.get("cells") or []
+        depth_layers = params.get("depth_layers")
+        layer_names = params.get("depth_layer_names")
         return cls(
             calculation_version=int(params.get("calculation_version") or 1),
-            source_ids=samples.get("sources") or [],
-            cell_sizes_m=samples.get("cells") or [],
+            source_ids=source_ids,
+            cell_sizes_m=cell_sizes,
             cross_max_deg=samples.get("cross_max") or [],
+            route_geom_fingerprint=str(params.get("route_geom_fingerprint")
+                                       or ""),
+            depth_layers={str(k): str(v) for k, v in depth_layers.items()}
+            if isinstance(depth_layers, dict) else {},
+            depth_signature=str(params.get("depth_signature") or ""),
+            depth_layer_names={str(k): str(v) for k, v in layer_names.items()}
+            if isinstance(layer_names, dict) else {},
             step_m=float(params.get("step_m") or 0.0),
             cross_offset_m=float(params.get("cross_offset_m") or 0.0),
             scope_start_kp=float(params.get("scope_start_kp") or 0.0),
@@ -240,6 +385,35 @@ class PlanProfile:
             port_depths=floats("port"),
             stbd_depths=floats("stbd"),
         )
+
+
+def _rpl_core(fingerprint: str) -> str:
+    """RPL fingerprint without its registry-path component (rpl_id |
+    modified | lines layer) — the path differs when the same project is
+    opened from another folder or machine."""
+    return "|".join(str(fingerprint or "").split("|")[:3])
+
+
+def run_length_encode(values) -> List[List]:
+    """``[[value, count], …]`` for a list of JSON scalars."""
+    out: List[List] = []
+    for value in values or []:
+        if out and out[-1][0] == value:
+            out[-1][1] += 1
+        else:
+            out.append([value, 1])
+    return out
+
+
+def run_length_decode(runs) -> List:
+    out: List = []
+    for entry in runs or []:
+        try:
+            value, count = entry[0], int(entry[1])
+        except (IndexError, TypeError, ValueError):
+            continue
+        out.extend([value] * max(0, count))
+    return out
 
 
 # ---------------------------------------------------------------------------

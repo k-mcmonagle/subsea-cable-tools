@@ -1481,6 +1481,12 @@ def test_profile_bands_replace_per_range_items() -> bool:
     from ..burial.profile_widget import BurialProfileWidget, RangeBandItem
 
     widget = BurialProfileWidget()
+    # Overlay visibility is a persisted user preference; force everything
+    # visible in memory only (never rewrite the tester's QGIS settings).
+    widget._overlay_visible = {key: True for key in widget._overlay_visible}
+    widget._ii_hidden = set()
+    widget._hazard_levels_hidden = set()
+    widget._apply_overlay_visibility()
     widget.set_scope(0.0, 100.0)
     widget.set_profile([(kp / 10.0, 50.0 + (kp % 7)) for kp in range(1001)])
     context = generation.ResolutionContext()
@@ -1500,8 +1506,10 @@ def test_profile_bands_replace_per_range_items() -> bool:
     plot_items = widget.plot.getPlotItem().listDataItems()
     scene_bands = [item for item in widget.plot.scene().items()
                    if isinstance(item, RangeBandItem)]
-    # 4 overlay kinds + 1 strip band, regardless of range count.
-    ok = len(scene_bands) == 5
+    # 4 overlay kinds + the section strip + the hazard strip, regardless
+    # of range count (the per-criterion no-data label band is never
+    # added to the scene).
+    ok = len(scene_bands) == 6
     ok = ok and len(widget._regions["insufficient"].ranges()) == 2000
     ok = ok and len(widget._strip_band.ranges()) == 2000
     ok = ok and len(plot_items) < 10

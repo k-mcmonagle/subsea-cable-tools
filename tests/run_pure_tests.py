@@ -31,6 +31,7 @@ PURE_MODULES = [
     "test_burial_generation",
     "test_burial_events",
     "test_burial_io",
+    "test_burial_targets_state",
     "test_burial_report",
     "test_burial_ground",
     "test_burial_bas",

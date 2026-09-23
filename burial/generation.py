@@ -246,6 +246,24 @@ class GenerationOutput:
     # Resolved per-rule footprints (extension buffers included) — feeds the
     # per-criterion fire bars and coverage after the plan is reopened.
     rule_hits: Dict[str, List[Interval]] = field(default_factory=dict)
+    # Per-rule no-data ranges (clipped to the scope): which criterion could
+    # not be evaluated where — attributes Insufficient Information to its
+    # source criteria for display filtering and tooltips.
+    rule_nodata: Dict[str, List[Interval]] = field(default_factory=dict)
+
+
+def rule_nodata_map(acquisitions: Sequence["RuleAcquisition"],
+                    scope: Interval) -> Dict[str, List[Interval]]:
+    """``{rule_id: no-data intervals}`` for rules that reported gaps."""
+    out: Dict[str, List[Interval]] = {}
+    for acq in acquisitions:
+        if acq.error or not acq.nodata:
+            continue
+        clipped = _drop_zero_length(eng.normalize(
+            eng.clip_intervals(acq.nodata, scope)))
+        if clipped:
+            out[str(acq.rule_row.get("rule_id"))] = clipped
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1142,6 +1160,7 @@ def generate(params: GenParams, acquisitions: Sequence[RuleAcquisition],
     out.influence = influence
     out.rule_hits = {str(rule_id): list(intervals)
                      for rule_id, intervals in result.rule_hits.items()}
+    out.rule_nodata = rule_nodata_map(acquisitions, scope)
     excluded_ranges = [Interval(v.start_km, v.end_km) for v in out.excluded]
     # A skip-resolved (dismissed) no-data range is reported as a skip rather
     # than Insufficient Information; it still never becomes a burial
@@ -1251,6 +1270,10 @@ def context_to_dict(out: GenerationOutput) -> Dict:
         "rule_hits": {str(rule_id): [[iv.start_km, iv.end_km]
                                      for iv in intervals]
                       for rule_id, intervals in (out.rule_hits or {}).items()},
+        "rule_nodata": {str(rule_id): [[iv.start_km, iv.end_km]
+                                       for iv in intervals]
+                        for rule_id, intervals in
+                        (getattr(out, "rule_nodata", None) or {}).items()},
     }
 
 
@@ -1263,6 +1286,10 @@ class ResolutionContext:
     dropped_short: List[Interval] = field(default_factory=list)
     candidates: List[Interval] = field(default_factory=list)
     rule_hits: Dict[str, List[Interval]] = field(default_factory=dict)
+    # Per-rule no-data (see GenerationOutput.rule_nodata); empty for
+    # contexts stored before it existed — consumers then treat every
+    # Insufficient Information range as unattributed.
+    rule_nodata: Dict[str, List[Interval]] = field(default_factory=dict)
 
 
 def context_from_dict(data: Optional[Dict]) -> ResolutionContext:
@@ -1299,8 +1326,11 @@ def context_from_dict(data: Optional[Dict]) -> ResolutionContext:
                 target.append(Interval(float(pair[0]), float(pair[1])))
             except (IndexError, TypeError, ValueError):
                 continue
-    hits = data.get("rule_hits")
-    if isinstance(hits, dict):
+    for key, target in (("rule_hits", ctx.rule_hits),
+                        ("rule_nodata", ctx.rule_nodata)):
+        hits = data.get(key)
+        if not isinstance(hits, dict):
+            continue
         for rule_id, pairs in hits.items():
             intervals: List[Interval] = []
             for pair in pairs or []:
@@ -1308,8 +1338,14 @@ def context_from_dict(data: Optional[Dict]) -> ResolutionContext:
                     intervals.append(Interval(float(pair[0]), float(pair[1])))
                 except (IndexError, TypeError, ValueError):
                     continue
-            ctx.rule_hits[str(rule_id)] = intervals
+            target[str(rule_id)] = intervals
     return ctx
+
+
+def context_dict(ctx: "ResolutionContext") -> Dict:
+    """Serialise a ResolutionContext (the ``context_to_dict`` twin for
+    contexts that did not come from a full generation run)."""
+    return context_to_dict(ctx)  # attribute-compatible with GenerationOutput
 
 
 def summarise(out: GenerationOutput, params: GenParams) -> Dict:

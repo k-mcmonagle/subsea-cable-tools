@@ -197,15 +197,18 @@ class GroundModelPlot(QWidget):
             angle=0, pos=0.0, movable=False,
             pen=pg.mkPen((90, 90, 90), width=1.4))
         item.addItem(self._seabed_line, ignoreBounds=True)
-        self._target_line = pg.InfiniteLine(
-            angle=0, pos=1.0, movable=False,
-            pen=pg.mkPen("#1b7f3b", width=1.6, style=_PEN_STYLE.DashLine),
-            label="Target burial {value:.2f} m",
-            labelOpts={"position": 0.02, "color": "#1b7f3b",
-                       "movable": False})
+        # Target burial depth: a stepped line so KP-range targets (deeper
+        # through a shipping lane, …) read directly against the units.
+        self._target_line = item.plot(
+            [], [], pen=pg.mkPen("#1b7f3b", width=1.6,
+                                 style=_PEN_STYLE.DashLine),
+            connect="finite")
         self._target_line.setZValue(15)
-        self._target_line.setVisible(False)
-        item.addItem(self._target_line, ignoreBounds=True)
+        self._target_label = pg.TextItem(color="#1b7f3b", anchor=(0, 1))
+        self._target_label.setZValue(16)
+        self._target_label.setVisible(False)
+        item.addItem(self._target_label, ignoreBounds=True)
+        self._target_runs: List = []
 
         self._vline = pg.InfiniteLine(
             angle=90, movable=False,
@@ -253,17 +256,54 @@ class GroundModelPlot(QWidget):
         self._scope = (lo, hi)
 
     def set_target_depth(self, depth_m: Optional[float]) -> None:
+        """A single target over the whole scope (see set_target_runs)."""
         try:
             value = None if depth_m is None else float(depth_m)
         except (TypeError, ValueError):
             value = None
-        self._target_m = value if value is not None and value > 0 else None
-        if self._target_m is None:
-            self._target_line.setVisible(False)
+        lo, hi = self._scope
+        if hi <= lo:
+            lo, hi = 0.0, 1.0
+        self.set_target_runs([(lo, hi, value)])
+
+    def set_target_runs(self, runs) -> None:
+        """``(start_kp, end_kp, depth|None)`` runs → one stepped line."""
+        xs: List[float] = []
+        ys: List[float] = []
+        cleaned = []
+        nan = float("nan")
+        for start, end, depth in runs or []:
+            try:
+                value = None if depth is None else float(depth)
+            except (TypeError, ValueError):
+                value = None
+            if value is None or value <= 0:
+                if xs:
+                    xs.append(float(start))
+                    ys.append(nan)  # break the line where there is no target
+                continue
+            cleaned.append((float(start), float(end), value))
+            xs.extend([float(start), float(end)])
+            ys.extend([value, value])
+        self._target_runs = cleaned
+        self._target_m = max((d for _s, _e, d in cleaned), default=None)
+        self._target_line.setData(xs, ys, connect="finite")
+        if cleaned:
+            depths = sorted({d for _s, _e, d in cleaned})
+            text = ("Target burial " + (f"{depths[0]:.2f} m" if len(depths) == 1
+                    else f"{depths[0]:g}–{depths[-1]:g} m"))
+            self._target_label.setText(text)
+            self._target_label.setPos(cleaned[0][0], cleaned[0][2])
+            self._target_label.setVisible(True)
         else:
-            self._target_line.setPos(self._target_m)
-            self._target_line.setVisible(True)
+            self._target_label.setVisible(False)
         self._fit_depth()
+
+    def target_at(self, kp: float) -> Optional[float]:
+        for start, end, depth in self._target_runs:
+            if start - 1e-9 <= kp <= end + 1e-9:
+                return depth
+        return None
 
     def set_selected(self, unit_id: str) -> None:
         self._unit_item.set_selected(unit_id)

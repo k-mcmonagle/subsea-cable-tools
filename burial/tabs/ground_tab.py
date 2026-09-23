@@ -255,7 +255,8 @@ class GroundTab(QWidget):
         self.plot.set_units(self._working, self.model.ground_classes)
         scope = self.model.gen_params().scope
         self.plot.set_scope(scope.start_km, scope.end_km)
-        self.plot.set_target_depth(self.model.plan.get("target_burial_m"))
+        self.plot.set_target_runs(self.model.target_runs()
+                                  if self.model.plan else [])
 
     def _update_status(self) -> None:
         if not self._working:
@@ -267,19 +268,23 @@ class GroundTab(QWidget):
         hi = max(u["end_kp"] for u in self._working if u["end_kp"] is not None)
         text = (f"{len(self._working)} unit(s), {len(codes)} class(es), "
                 f"KP {schema.format_kp(lo)}–{schema.format_kp(hi)}.")
-        target = self.model.plan.get("target_burial_m")
         scope = self.model.gen_params().scope
         kind = ""
-        try:
-            target_m = float(target) if target is not None else None
-        except (TypeError, ValueError):
-            target_m = None
-        if target_m and scope.length_km > 0:
-            gaps = ground_model.coverage_gaps(
-                self._working, scope.start_km, scope.end_km, target_m)
-            missing = sum(b - a for a, b in gaps)
+        if scope.length_km > 0:
+            # Per target run: KP-range targets are checked at their own
+            # depth, the default everywhere else.
+            missing = 0.0
+            depths = set()
+            for start, end, target_m in self.model.target_runs():
+                if not target_m:
+                    continue
+                depths.add(target_m)
+                gaps = ground_model.coverage_gaps(
+                    self._working, start, end, target_m)
+                missing += sum(b - a for a, b in gaps)
             if missing > 1e-6:
-                text += (f" No unit at the target burial depth ({target_m:.2f} m) "
+                label = ", ".join(f"{d:g}" for d in sorted(depths))
+                text += (f" No unit at the target burial depth ({label} m) "
                          f"over {missing:.3f} km of the scope.")
                 kind = "warn"
         meta = self.model.ground_meta()

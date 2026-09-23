@@ -1,11 +1,16 @@
 # -*- coding: utf-8 -*-
-"""Inputs tab — RPL, scope, direction, bathymetry and registered inputs.
+"""Inputs tab — RPL, scope, direction, target burial depth, bathymetry and
+registered inputs.
 
 The scope spinboxes are the cost control for long routes: analysis is
-limited to the scoped KP range (stated plainly in the UI). Registered
-inputs become the only selectable sources inside rule configs (stable
-``input_id`` indirection), each carrying optional Input Data Register
-metadata (originator, revision, status, quality).
+limited to the scoped KP range (stated plainly in the UI). The target burial
+depth has a plan default plus optional KP-range overrides (see
+``target_depth.py``). Registered inputs become the only selectable sources
+inside rule configs (stable ``input_id`` indirection), each carrying
+optional Input Data Register metadata (originator, revision, status,
+quality); *Add inputs…* registers many layers at once, and the table shows
+whether each input still resolves (and which criteria use it) so a removed
+or re-added layer is visible instead of silently breaking a rule.
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ from typing import Dict, List, Optional
 
 from qgis.core import QgsProject
 from qgis.gui import QgsFieldComboBox, QgsMapLayerComboBox
+from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import (
     QComboBox,
     QDialog,
@@ -38,6 +44,7 @@ from qgis.PyQt.QtWidgets import (
 
 from ...qgis_compat import (
     DIALOG_ACCEPTED,
+    HEADER_RESIZE_MODE_CONTENTS,
     HEADER_RESIZE_MODE_STRETCH,
     ITEM_DATA_USER_ROLE,
     MAP_LAYER_FILTER_LINE,
@@ -47,12 +54,14 @@ from ...qgis_compat import (
     MESSAGE_BOX_NO,
     MESSAGE_BOX_YES,
     SELECTION_BEHAVIOR_SELECT_ROWS,
+    SELECTION_MODE_EXTENDED,
     layer_filters,
     qt_exec,
 )
 from ...workbench.project_layers import normalised_path
-from .. import schema
+from .. import schema, target_depth
 from .. import ui_helpers
+from .input_picker import AddInputsDialog
 
 _ROLE_FILTERS = {
     schema.INPUT_ROLE_CROSSINGS_POINTS: (MAP_LAYER_FILTER_POINT,),
@@ -62,6 +71,16 @@ _ROLE_FILTERS = {
 }
 
 _RPL_REVISION_ROLE = int(ITEM_DATA_USER_ROLE) + 1
+
+_INPUT_COLUMNS = ["Role", "Layer", "Status", "Used by", "Originator",
+                  "Revision", "Quality"]
+_TARGET_COLUMNS = ["Start KP", "End KP", "Target (m)", "Notes"]
+_STATUS_TEXT = {
+    "ok": "✓ in project",
+    "relinked": "✓ matched by source",
+    "file": "⚠ not in project",
+    "missing": "✗ missing",
+}
 
 
 class InputDialog(QDialog):
@@ -291,12 +310,6 @@ class InputsTab(QWidget):
             "(Exclusion Area extensions, influence zones, signed slope) "
             "follow it.")
         scope_form.addRow("Direction of installation:", self.direction_combo)
-        self.target_burial = QDoubleSpinBox()
-        self.target_burial.setDecimals(2)
-        self.target_burial.setRange(0.0, 20.0)
-        self.target_burial.setSuffix(" m")
-        self.target_burial.setToolTip("Informational in this version.")
-        scope_form.addRow("Target burial depth:", self.target_burial)
         scope_note = QLabel(
             "Analysis is limited to the scoped KP range — on long routes, "
             "scope is the run-time control.")
@@ -304,10 +317,76 @@ class InputsTab(QWidget):
         scope_form.addRow(scope_note)
         self.apply_scope_button = QPushButton("Apply scope / direction")
         self.apply_scope_button.setToolTip(
-            "Save the scope, direction and target burial depth to the plan.")
+            "Save the scope and direction to the plan.")
         self.apply_scope_button.clicked.connect(self._apply_scope)
         scope_form.addRow(self.apply_scope_button)
         layout.addWidget(scope_box)
+
+        # -- target burial depth ----------------------------------------------
+        target_box = QGroupBox("Target burial depth")
+        target_layout = QVBoxLayout(target_box)
+        target_form = QFormLayout()
+        self.target_burial = QDoubleSpinBox()
+        self.target_burial.setDecimals(2)
+        self.target_burial.setRange(0.0, 20.0)
+        self.target_burial.setSuffix(" m")
+        self.target_burial.setSpecialValueText("None")
+        self.target_burial.setToolTip(
+            "Target depth of lowering below seabed wherever no KP range "
+            "below sets another. Used by the Ground Model (target horizon), "
+            "Plan Builder, exports and the report.")
+        target_form.addRow("Default target:", self.target_burial)
+        target_layout.addLayout(target_form)
+        target_note = QLabel(
+            "Different targets on parts of the route (e.g. deeper through a "
+            "shipping lane or anchorage): add KP ranges — a range overrides "
+            "the default inside it. Ranges may not overlap.")
+        target_note.setWordWrap(True)
+        target_note.setStyleSheet(ui_helpers.hint_style())
+        target_layout.addWidget(target_note)
+        self.target_table = QTableWidget(0, len(_TARGET_COLUMNS))
+        self.target_table.setHorizontalHeaderLabels(_TARGET_COLUMNS)
+        self.target_table.verticalHeader().setVisible(False)
+        self.target_table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
+        self.target_table.horizontalHeader().setSectionResizeMode(
+            len(_TARGET_COLUMNS) - 1, HEADER_RESIZE_MODE_STRETCH)
+        self.target_table.setMinimumHeight(90)
+        self.target_table.setMaximumHeight(180)
+        self.target_table.itemChanged.connect(
+            lambda *_a: self._mark_dirty("target"))
+        target_layout.addWidget(self.target_table)
+        target_buttons = QHBoxLayout()
+        self.add_target_button = QPushButton("Add range")
+        self.add_target_button.setToolTip(
+            "Add a KP range (starts after the last range; edit the cells).")
+        self.add_target_button.clicked.connect(self._add_target_row)
+        target_buttons.addWidget(self.add_target_button)
+        self.pick_target_button = QPushButton("Pick KPs…")
+        self.pick_target_button.setToolTip(
+            "Click the route twice on the map to add a range from the two "
+            "KPs (right-click or Esc cancels).")
+        self.pick_target_button.clicked.connect(self._pick_target_range)
+        target_buttons.addWidget(self.pick_target_button)
+        self.remove_target_button = QPushButton("Remove")
+        self.remove_target_button.clicked.connect(self._remove_target_rows)
+        target_buttons.addWidget(self.remove_target_button)
+        self.import_target_button = QPushButton("From RPL…")
+        self.import_target_button.setToolTip(
+            "Fill the ranges from the TargetBurialDepth of the plan's "
+            "Workbench RPL legs (replaces the ranges below).")
+        self.import_target_button.clicked.connect(self._import_rpl_targets)
+        target_buttons.addWidget(self.import_target_button)
+        target_buttons.addStretch(1)
+        self.apply_target_button = QPushButton("Apply targets")
+        self.apply_target_button.setToolTip(
+            "Save the default target and the KP ranges to the plan.")
+        self.apply_target_button.clicked.connect(self._apply_targets)
+        target_buttons.addWidget(self.apply_target_button)
+        target_layout.addLayout(target_buttons)
+        self.target_summary = QLabel("")
+        self.target_summary.setWordWrap(True)
+        target_layout.addWidget(self.target_summary)
+        layout.addWidget(target_box)
 
         # -- bathymetry -------------------------------------------------------
         bathy_box = QGroupBox("Bathymetry source")
@@ -320,6 +399,13 @@ class InputsTab(QWidget):
         self.bathy_summary = QLabel("")
         self.bathy_summary.setWordWrap(True)
         bathy_form.addRow("Active source:", self.bathy_summary)
+        self.bathy_relink_button = QPushButton("Save relinked layers")
+        self.bathy_relink_button.setToolTip(
+            "The saved bathymetry layer id is no longer in the project but a "
+            "layer with the same source is — save the new link.")
+        self.bathy_relink_button.clicked.connect(self._save_bathy_relink)
+        self.bathy_relink_button.setVisible(False)
+        bathy_form.addRow(self.bathy_relink_button)
         from ...qgis_compat import MAP_LAYER_FILTER_RASTER
 
         self.manual_source_combo = QComboBox()
@@ -372,21 +458,48 @@ class InputsTab(QWidget):
         # -- other inputs -----------------------------------------------------
         inputs_box = QGroupBox("Registered inputs")
         inputs_layout = QVBoxLayout(inputs_box)
-        self.inputs_table = QTableWidget(0, 5)
-        self.inputs_table.setHorizontalHeaderLabels(
-            ["Role", "Layer", "Originator", "Revision", "Quality"])
-        self.inputs_table.horizontalHeader().setSectionResizeMode(
-            1, HEADER_RESIZE_MODE_STRETCH)
+        filter_row = QHBoxLayout()
+        self.inputs_filter = QLineEdit()
+        self.inputs_filter.setPlaceholderText("Filter inputs…")
+        self.inputs_filter.setClearButtonEnabled(True)
+        self.inputs_filter.textChanged.connect(self._apply_inputs_filter)
+        filter_row.addWidget(self.inputs_filter, 1)
+        self.inputs_summary = QLabel("")
+        filter_row.addWidget(self.inputs_summary)
+        inputs_layout.addLayout(filter_row)
+        self.inputs_table = QTableWidget(0, len(_INPUT_COLUMNS))
+        self.inputs_table.setHorizontalHeaderLabels(_INPUT_COLUMNS)
+        header = self.inputs_table.horizontalHeader()
+        for column in range(len(_INPUT_COLUMNS)):
+            header.setSectionResizeMode(column, HEADER_RESIZE_MODE_CONTENTS)
+        header.setSectionResizeMode(1, HEADER_RESIZE_MODE_STRETCH)
+        status_header = self.inputs_table.horizontalHeaderItem(2)
+        if status_header is not None:
+            status_header.setToolTip(
+                "Whether the input still resolves: ✓ the registered project "
+                "layer (or a project layer with the same source), ⚠ not in "
+                "the project but readable from its file, ✗ missing — criteria "
+                "using it report a missing input until it is relinked.")
         self.inputs_table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
+        self.inputs_table.setSelectionMode(SELECTION_MODE_EXTENDED)
         self.inputs_table.verticalHeader().setVisible(False)
+        self.inputs_table.setSortingEnabled(False)
+        self.inputs_table.doubleClicked.connect(lambda _i: self._edit_input())
         inputs_layout.addWidget(self.inputs_table, 1)
         self.inputs_table.itemSelectionChanged.connect(
             self._sync_input_buttons)
         button_row = QHBoxLayout()
-        self.add_input_button = QPushButton("Add…")
-        self.add_input_button.clicked.connect(self._add_input)
+        self.add_input_button = QPushButton("Add inputs…")
+        self.add_input_button.setToolTip(
+            "Pick one or many project layers (search, geometry filter, "
+            "Layers-panel selection) and register them with roles and "
+            "register details in one go.")
+        self.add_input_button.clicked.connect(self._add_inputs)
         button_row.addWidget(self.add_input_button)
-        self.edit_input_button = QPushButton("Edit…")
+        self.edit_input_button = QPushButton("Edit / relink…")
+        self.edit_input_button.setToolTip(
+            "Edit the selected input's role, layer (relink) and register "
+            "details. Double-click a row also edits.")
         self.edit_input_button.clicked.connect(self._edit_input)
         button_row.addWidget(self.edit_input_button)
         self.remove_input_button = QPushButton("Remove…")
@@ -408,10 +521,11 @@ class InputsTab(QWidget):
         for widget, signal in (
                 (self.scope_start, "valueChanged"),
                 (self.scope_end, "valueChanged"),
-                (self.direction_combo, "currentIndexChanged"),
-                (self.target_burial, "valueChanged")):
+                (self.direction_combo, "currentIndexChanged")):
             getattr(widget, signal).connect(
                 lambda *_a, s=self: s._mark_dirty("scope"))
+        self.target_burial.valueChanged.connect(
+            lambda *_a: self._mark_dirty("target"))
         for widget, signal in (
                 (self.manual_source_combo, "currentIndexChanged"),
                 (self.raster_combo, "layerChanged"),
@@ -425,7 +539,17 @@ class InputsTab(QWidget):
                 lambda *_a, s=self: s._mark_dirty("bathy"))
 
         model.planChanged.connect(self.refresh)
-        model.inputsChanged.connect(self._refresh_inputs)
+        # Coalesced: input status can open layer files, and a project load
+        # or a burst of rule toggles must cost one refresh, not dozens.
+        inputs_soon = ui_helpers.coalesced(self, self._refresh_inputs)
+        model.inputsChanged.connect(inputs_soon)
+        model.inputsChanged.connect(self._refresh_bathy_notice)
+        # "Used by" follows the criteria and checks (optional on
+        # lightweight models).
+        for name in ("rulesChanged", "riskChanged"):
+            signal = getattr(model, name, None)
+            if signal is not None:
+                signal.connect(inputs_soon)
         self.refresh()
 
     def _mark_dirty(self, key: str) -> None:
@@ -444,13 +568,15 @@ class InputsTab(QWidget):
             else "Apply scope / direction")
         self.apply_bathy_button.setText(
             "Apply source *" if "bathy" in self._dirty else "Apply source")
+        self.apply_target_button.setText(
+            "Apply targets *" if "target" in self._dirty else "Apply targets")
 
     def _sync_input_buttons(self) -> None:
         has_plan = bool(self.model.plan)
-        has_selection = bool(self._selected_input_id())
+        selected = self._selected_input_ids()
         self.add_input_button.setEnabled(has_plan)
-        self.edit_input_button.setEnabled(has_plan and has_selection)
-        self.remove_input_button.setEnabled(has_plan and has_selection)
+        self.edit_input_button.setEnabled(has_plan and len(selected) == 1)
+        self.remove_input_button.setEnabled(has_plan and bool(selected))
 
     # -- refresh --------------------------------------------------------------
     def refresh(self) -> None:
@@ -466,7 +592,10 @@ class InputsTab(QWidget):
                 self._sync_dirty_markers()
                 self.apply_status.setText("")
             for widget in (self.apply_rpl_button, self.apply_fallback_button,
-                           self.apply_scope_button, self.apply_bathy_button):
+                           self.apply_scope_button, self.apply_bathy_button,
+                           self.apply_target_button, self.add_target_button,
+                           self.pick_target_button, self.remove_target_button,
+                           self.import_target_button):
                 widget.setEnabled(enabled)
             self._refresh_rpls()
             route_name = plan.get("rpl_name") or ""
@@ -487,12 +616,15 @@ class InputsTab(QWidget):
                 index = self.direction_combo.findData(
                     int(plan.get("direction") or 1))
                 self.direction_combo.setCurrentIndex(max(0, index))
-                self.target_burial.setValue(
-                    float(plan.get("target_burial_m") or 0.0))
                 self._clear_dirty("scope")
+            if not (same_plan and "target" in self._dirty):
+                self._load_targets()
+                self._clear_dirty("target")
             if not (same_plan and "bathy" in self._dirty):
                 self._load_bathy_config()
                 self._clear_dirty("bathy")
+            self._refresh_bathy_notice()
+            self._update_target_summary()
             if self.model.route_notice:
                 self._set_status(self.model.route_notice, "warn")
             elif plan and self.model.route_error:
@@ -547,19 +679,71 @@ class InputsTab(QWidget):
     def _refresh_inputs(self) -> None:
         rows = [r for r in self.model.inputs
                 if r.get("role") != schema.INPUT_ROLE_BATHY]
+        rows.sort(key=lambda r: (schema.INPUT_ROLES.index(r.get("role"))
+                                 if r.get("role") in schema.INPUT_ROLES else 99,
+                                 (r.get("layer_name") or "").lower()))
+        usage = self.model.input_usage() if self.model.plan else {}
+        counts = {"ok": 0, "relinked": 0, "file": 0, "missing": 0}
+        flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
         self.inputs_table.setRowCount(len(rows))
         for i, row in enumerate(rows):
-            values = [schema.INPUT_ROLE_LABELS.get(row.get("role") or "", row.get("role") or ""),
-                      row.get("layer_name") or "", row.get("originator") or "",
-                      row.get("revision") or "", row.get("quality") or ""]
+            try:
+                state, detail, layer = self.model.input_status(row)
+            except Exception as exc:  # never let one bad row break the tab
+                state, detail, layer = "missing", str(exc), None
+            counts[state] = counts.get(state, 0) + 1
+            stored_name = row.get("layer_name") or ""
+            live_name = layer.name() if layer is not None else ""
+            name = live_name or stored_name
+            users = usage.get(str(row.get("input_id") or ""), [])
+            values = [
+                schema.INPUT_ROLE_LABELS.get(row.get("role") or "",
+                                             row.get("role") or ""),
+                name,
+                _STATUS_TEXT.get(state, state),
+                str(len(users)) if users else "—",
+                row.get("originator") or "", row.get("revision") or "",
+                row.get("quality") or "",
+            ]
             for j, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
+                item.setFlags(flags)
                 if j == 0:
-                    from ...qgis_compat import ITEM_DATA_USER_ROLE
-
                     item.setData(ITEM_DATA_USER_ROLE, row.get("input_id"))
+                if j == 1:
+                    tip = row.get("layer_source") or ""
+                    if live_name and stored_name and live_name != stored_name:
+                        tip = (f"Registered as '{stored_name}', now named "
+                               f"'{live_name}'.\n") + tip
+                    item.setToolTip(tip)
+                if j == 2:
+                    item.setToolTip(detail)
+                    if state in ("file", "missing"):
+                        item.setForeground(ui_helpers.qcolor(
+                            "error" if state == "missing" else "warn"))
+                if j == 3:
+                    item.setToolTip("\n".join(users) if users else
+                                    "Not used by any criterion or check.")
                 self.inputs_table.setItem(i, j, item)
+        bad = counts.get("missing", 0) + counts.get("file", 0)
+        text = f"{len(rows)} input(s)"
+        if bad:
+            text += f" — {bad} need attention"
+        self.inputs_summary.setText(text)
+        self.inputs_summary.setStyleSheet(
+            ui_helpers.status_style("warn") if bad else "")
+        self._apply_inputs_filter()
         self._sync_input_buttons()
+
+    def _apply_inputs_filter(self, *_args) -> None:
+        words = self.inputs_filter.text().lower().split()
+        for row in range(self.inputs_table.rowCount()):
+            text = " ".join(
+                (self.inputs_table.item(row, col).text()
+                 if self.inputs_table.item(row, col) else "")
+                for col in range(self.inputs_table.columnCount())).lower()
+            self.inputs_table.setRowHidden(
+                row, not all(word in text for word in words))
 
     # -- RPL / scope ----------------------------------------------------------
     def _apply_rpl(self) -> None:
@@ -646,7 +830,6 @@ class InputsTab(QWidget):
             "scope_start_kp": start,
             "scope_end_kp": end,
             "direction": self.direction_combo.currentData(),
-            "target_burial_m": self.target_burial.value() or None,
         }, reason="scope/direction")
         if saved:
             self._clear_dirty("scope")
@@ -684,8 +867,12 @@ class InputsTab(QWidget):
         self.raster_combo.setLayer(None)
         self.contour_combo.setLayer(None)
         self.contour_combo2.setLayer(None)
-        raster_ids = config.get("raster_layer_ids") or []
-        contours = config.get("contour_layers") or []
+        # The model's config has stale layer ids relinked by source.
+        resolved = self.model.depth_config()
+        raster_ids = list(resolved.raster_layer_ids) or \
+            (config.get("raster_layer_ids") or [])
+        contours = list(resolved.contour_layers) or \
+            (config.get("contour_layers") or [])
         source_mode = int(config.get("mode") or 0)
         if source_mode not in (1, 2):
             source_mode = 1 if raster_ids else 2
@@ -709,10 +896,59 @@ class InputsTab(QWidget):
                 self.contour_field2.setLayer(layer)
                 self.contour_field2.setField(contours[1].get("depth_field") or "")
         self.search_radius.setValue(float(config.get("contour_search_radius_m") or 500.0))
-        self.bathy_summary.setText(
-            "Manual raster source." if source_mode == 1
-            else f"Manual contours: {len(contours)} layer(s).")
         self._sync_bathy_enabled()
+
+    def _refresh_bathy_notice(self) -> None:
+        """Describe the active source, flagging missing/relinked layers
+        rather than silently showing an empty layer selector."""
+        if self._bathy_row() is None:
+            self.bathy_summary.setText("No manual bathymetry source configured.")
+            self.bathy_summary.setStyleSheet("")
+            self.bathy_relink_button.setVisible(False)
+            return
+        config = self.model.depth_config()
+        project = QgsProject.instance()
+        ids = list(config.raster_layer_ids) or [
+            e.get("layer_id") or "" for e in config.contour_layers]
+        names, missing = [], 0
+        for layer_id in ids:
+            layer = project.mapLayer(layer_id)
+            if layer is None:
+                missing += 1
+            else:
+                names.append(layer.name())
+        kind = ("Raster" if config.raster_layer_ids
+                else f"Contours ({len(config.contour_layers)} layer(s))")
+        text = f"{kind}: " + (", ".join(names) or "—")
+        style = ""
+        if missing:
+            text += (f" — ⚠ {missing} configured layer(s) are not in the "
+                     "project. Re-add the layer (it is found again by its "
+                     "source) or choose another source and Apply.")
+            style = ui_helpers.status_style("warn")
+        relinks = self.model.depth_relinks
+        if relinks:
+            text += (" — relinked by source: " + ", ".join(relinks)
+                     + " (the saved layer id was gone).")
+        self.bathy_summary.setText(text)
+        self.bathy_summary.setStyleSheet(style)
+        self.bathy_relink_button.setVisible(bool(relinks))
+
+    def _save_bathy_relink(self) -> None:
+        existing = self._bathy_row()
+        if existing is None:
+            return
+        config = self.model.depth_config()
+        try:
+            data = json.loads(existing.get("config_json") or "{}")
+        except (TypeError, ValueError):
+            data = {}
+        data["raster_layer_ids"] = list(config.raster_layer_ids)
+        data["contour_layers"] = list(config.contour_layers)
+        row = dict(existing)
+        row["config_json"] = json.dumps(data)
+        if self.model.save_input(row):
+            self._set_status("Bathymetry relink saved.", "ok")
 
     def _apply_bathy(self) -> None:
         existing = self._bathy_row()
@@ -723,6 +959,9 @@ class InputsTab(QWidget):
         raster = self.raster_combo.currentLayer() if source_mode == 1 else None
         if source_mode == 1 and raster is not None:
             config["raster_layer_ids"] = [raster.id()]
+            # Sources ride along so a removed-and-re-added layer (new id)
+            # is found again instead of silently dropping the bathymetry.
+            config["raster_sources"] = [raster.source()]
             config["raster_band"] = self.raster_band.value()
         contour = self.contour_combo.currentLayer() if source_mode == 2 else None
         contour2 = self.contour_combo2.currentLayer() if source_mode == 2 else None
@@ -739,6 +978,7 @@ class InputsTab(QWidget):
         if contour is not None:
             config["contour_layers"].append({
                 "layer_id": contour.id(),
+                "source": contour.source(),
                 "depth_field": self.contour_field.currentField() or "",
             })
         if contour2 is not None:
@@ -749,6 +989,7 @@ class InputsTab(QWidget):
                 return
             config["contour_layers"].append({
                 "layer_id": contour2.id(),
+                "source": contour2.source(),
                 "depth_field": self.contour_field2.currentField() or "",
             })
         if config["contour_layers"]:
@@ -778,7 +1019,24 @@ class InputsTab(QWidget):
                 "review resolution and rebuild the stored samples.", "ok")
 
     # -- other inputs ---------------------------------------------------------
+    def _add_inputs(self) -> None:
+        if not self.model.plan:
+            return
+        dialog = AddInputsDialog(self.model.inputs, self._panel_selection,
+                                 parent=self)
+        if qt_exec(dialog) != DIALOG_ACCEPTED:
+            return
+        rows = dialog.result_rows()
+        if rows and self.model.save_inputs(rows):
+            self._set_status(f"Registered {len(rows)} input(s).", "ok")
+
+    def _panel_selection(self):
+        iface = getattr(self.dock, "iface", None) if self.dock else None
+        view = iface.layerTreeView() if iface is not None else None
+        return view.selectedLayers() if view is not None else []
+
     def _add_input(self) -> None:
+        """Single-layer registration (kept for scripts/tests)."""
         if not self.model.plan:
             return
         dialog = InputDialog(parent=self)
@@ -787,14 +1045,22 @@ class InputsTab(QWidget):
             if row:
                 self.model.save_input(row)
 
-    def _selected_input_id(self) -> str:
-        row = self.inputs_table.currentRow()
-        if row < 0:
-            return ""
-        item = self.inputs_table.item(row, 0)
-        from ...qgis_compat import ITEM_DATA_USER_ROLE
+    def _selected_input_ids(self) -> List[str]:
+        model = self.inputs_table.selectionModel()
+        rows = sorted({index.row() for index in model.selectedRows()}) \
+            if model is not None else []
+        if not rows and self.inputs_table.currentRow() >= 0:
+            rows = [self.inputs_table.currentRow()]
+        ids = []
+        for row in rows:
+            item = self.inputs_table.item(row, 0)
+            if item is not None and item.data(ITEM_DATA_USER_ROLE):
+                ids.append(item.data(ITEM_DATA_USER_ROLE))
+        return ids
 
-        return item.data(ITEM_DATA_USER_ROLE) if item else ""
+    def _selected_input_id(self) -> str:
+        ids = self._selected_input_ids()
+        return ids[0] if len(ids) == 1 else ""
 
     def _edit_input(self) -> None:
         input_id = self._selected_input_id()
@@ -811,13 +1077,205 @@ class InputsTab(QWidget):
                 self.model.save_input(new_row)
 
     def _remove_input(self) -> None:
-        input_id = self._selected_input_id()
-        if not input_id:
+        input_ids = self._selected_input_ids()
+        if not input_ids:
             return
+        usage = self.model.input_usage()
+        users = []
+        for input_id in input_ids:
+            users.extend(usage.get(str(input_id), []))
+        message = (f"Remove {len(input_ids)} registered input(s)?"
+                   if len(input_ids) > 1 else
+                   "Remove this registered input?")
+        if users:
+            listed = "\n• ".join(users[:8])
+            more = f"\n… and {len(users) - 8} more" if len(users) > 8 else ""
+            message += ("\n\nThese criteria/checks use it and will report a "
+                        f"missing input until re-pointed:\n• {listed}{more}")
         answer = QMessageBox.question(
-            self, "Remove input",
-            "Remove this registered input? Rules referencing it will report a "
-            "missing input until re-pointed.",
+            self, "Remove input", message,
             MESSAGE_BOX_YES | MESSAGE_BOX_NO, MESSAGE_BOX_NO)
         if answer == MESSAGE_BOX_YES:
-            self.model.delete_input(input_id)
+            for input_id in input_ids:
+                if not self.model.delete_input(input_id):
+                    break
+
+    # -- target burial depth ---------------------------------------------------
+    def _load_targets(self) -> None:
+        plan = self.model.plan
+        self.target_burial.setValue(float(plan.get("target_burial_m") or 0.0))
+        self._fill_target_table(self.model.target_ranges() if plan else [])
+
+    def _fill_target_table(self, ranges) -> None:
+        self.target_table.blockSignals(True)
+        try:
+            self.target_table.setRowCount(0)
+            for entry in ranges:
+                self._append_target_row(entry)
+        finally:
+            self.target_table.blockSignals(False)
+
+    def _append_target_row(self, entry: Dict) -> None:
+        row = self.target_table.rowCount()
+        self.target_table.insertRow(row)
+        values = [schema.format_kp(entry.get("start_kp")),
+                  schema.format_kp(entry.get("end_kp")),
+                  "" if entry.get("depth_m") in (None, "")
+                  else f"{float(entry['depth_m']):g}",
+                  str(entry.get("notes") or "")]
+        for column, value in enumerate(values):
+            self.target_table.setItem(row, column, QTableWidgetItem(value))
+
+    def _table_targets(self) -> List[Dict]:
+        rows = []
+        for row in range(self.target_table.rowCount()):
+            def cell(column: int) -> str:
+                item = self.target_table.item(row, column)
+                return item.text().strip() if item is not None else ""
+
+            def number(column: int):
+                text = cell(column).replace(",", ".")
+                try:
+                    return float(text) if text else None
+                except ValueError:
+                    return text  # validate_ranges reports it
+            rows.append({"start_kp": number(0), "end_kp": number(1),
+                         "depth_m": number(2), "notes": cell(3)})
+        return rows
+
+    def _add_target_row(self) -> None:
+        ranges = self._table_targets()
+        starts = [r["end_kp"] for r in ranges
+                  if isinstance(r.get("end_kp"), float)]
+        start = max(starts) if starts else self.scope_start.value()
+        end = start + 1.0
+        if self.model.route is not None:
+            end = min(end, self.model.route.total_length_km)
+        self._append_target_row({"start_kp": start, "end_kp": end,
+                                 "depth_m": self.target_burial.value() or None,
+                                 "notes": ""})
+        self._mark_dirty("target")
+        self.target_table.setCurrentCell(self.target_table.rowCount() - 1, 2)
+
+    def _pick_target_range(self) -> None:
+        if self.dock is None:
+            return
+        picked: List[float] = []
+
+        def second(kp: float) -> None:
+            picked.append(kp)
+            lo, hi = sorted(picked[:2])
+            if hi - lo <= 1e-6:
+                self._set_status("The two KPs are the same — no range added.",
+                                 "warn")
+                return
+            self._append_target_row({
+                "start_kp": lo, "end_kp": hi,
+                "depth_m": self.target_burial.value() or None, "notes": ""})
+            self._mark_dirty("target")
+            self.target_table.setCurrentCell(self.target_table.rowCount() - 1, 2)
+            self._set_status("Range added — enter its target depth, then "
+                             "Apply targets.", "info")
+
+        def first(kp: float) -> None:
+            picked.append(kp)
+            self.dock.pick_kp_on_map(
+                second, "Click the route at the other end of the target "
+                "range (right-click cancels).")
+
+        self.dock.pick_kp_on_map(
+            first, "Click the route at one end of the target range "
+            "(right-click cancels).")
+
+    def _remove_target_rows(self) -> None:
+        rows = sorted({index.row() for index in
+                       self.target_table.selectionModel().selectedRows()},
+                      reverse=True)
+        if not rows and self.target_table.currentRow() >= 0:
+            rows = [self.target_table.currentRow()]
+        for row in rows:
+            self.target_table.removeRow(row)
+        if rows:
+            self._mark_dirty("target")
+
+    def _import_rpl_targets(self) -> None:
+        legs = self._rpl_legs_with_kp()
+        ranges = target_depth.ranges_from_legs(legs)
+        if not ranges:
+            self._set_status(
+                "The plan's RPL has no legs with a TargetBurialDepth (or the "
+                "route is not a Workbench RPL) — nothing imported.", "warn")
+            return
+        if self.target_table.rowCount():
+            answer = QMessageBox.question(
+                self, "Target burial depth",
+                f"Replace the {self.target_table.rowCount()} range(s) in the "
+                f"table with {len(ranges)} range(s) from the RPL?",
+                MESSAGE_BOX_YES | MESSAGE_BOX_NO, MESSAGE_BOX_NO)
+            if answer != MESSAGE_BOX_YES:
+                return
+        self._fill_target_table(ranges)
+        self._mark_dirty("target")
+        self._set_status(f"{len(ranges)} range(s) read from the RPL — review "
+                         "them, then Apply targets.", "info")
+
+    def _rpl_legs_with_kp(self) -> List[Dict]:
+        """RPL legs with start/end KP (from their From/To positions)."""
+        store = self.workbench_store_fn()
+        rpl_id = self.model.resolved_rpl_id or self.model.plan.get("rpl_id")
+        if store is None or not rpl_id:
+            return []
+        try:
+            from ...workbench import rpl_summary
+
+            rpl = store.get_rpl(rpl_id) or {}
+            points = rpl_summary.read_point_rows(rpl_summary.open_rpl_layer(
+                store, rpl.get("points_layer") or ""))
+            legs = rpl_summary.read_leg_rows(rpl_summary.open_rpl_layer(
+                store, rpl.get("lines_layer") or ""))
+        except Exception:
+            return []
+        kp_by_pos = {str(p.get("pos")): p.get("kp") for p in points
+                     if p.get("kp") is not None}
+        out, cursor = [], 0.0
+        for leg in legs:
+            start = kp_by_pos.get(str(leg.get("from_pos")))
+            end = kp_by_pos.get(str(leg.get("to_pos")))
+            if start is None or end is None:
+                # Fall back to the cumulative leg length.
+                length = leg.get("route_km") or 0.0
+                start, end = cursor, cursor + float(length)
+            cursor = end
+            out.append(dict(leg, start_kp=start, end_kp=end,
+                            label=f"RPL leg {leg.get('seq')}"))
+        return out
+
+    def _update_target_summary(self) -> None:
+        if not self.model.plan:
+            self.target_summary.setText("")
+            return
+        text = target_depth.summary_text(self.model.target_default(),
+                                         self.model.target_ranges())
+        if "target" in self._dirty:
+            text += "  (unapplied edits)"
+        self.target_summary.setText(text)
+
+    def _apply_targets(self) -> None:
+        ranges = self._table_targets()
+        length = self.model.route.total_length_km \
+            if self.model.route is not None else None
+        problems = target_depth.validate_ranges(ranges, length)
+        if problems:
+            self._set_status("Targets not saved: " + " ".join(problems[:3]),
+                             "error")
+            return
+        if length:
+            # Clamp the 3-dp rounding past the route end onto the route.
+            for entry in ranges:
+                entry["start_kp"] = max(0.0, entry["start_kp"])
+                entry["end_kp"] = min(length, entry["end_kp"])
+        if self.model.update_targets(self.target_burial.value() or None,
+                                     ranges):
+            self._clear_dirty("target")
+            self._update_target_summary()
+            self._set_status("Target burial depth applied.", "ok")

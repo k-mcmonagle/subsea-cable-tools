@@ -13,12 +13,14 @@ Signals:
     rulesChanged     exclusion stack
     eventsChanged    events (and therefore sections)
     sectionsChanged  sections only (conclusions, splits, …)
+    analysisChanged  latest Exclusions recompute / Risk scan record
     logChanged       change log appended
     storeError(str)  a store write failed; state kept in memory
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -28,8 +30,9 @@ from qgis.PyQt.QtCore import QObject, QTimer, pyqtSignal
 from ..workbench.depth_service import DepthService, DepthSourceConfig
 from ..workbench import rules_engine as eng
 from ..workbench.rules_engine import Interval
-from . import (change_log, events as ev, generation, io_csv, map_layers,
-               path_data, path_layers, risk, schema, tools)
+from . import (analysis_state, change_log, events as ev, generation,
+               io_csv, map_layers, path_data, path_layers, risk, schema,
+               target_depth, tools)
 from .analysis_task import build_route_frame
 from .profile_data import PlanProfile
 from .store import BurialStore
@@ -66,6 +69,7 @@ class PlanModel(QObject):
     vesselsChanged = pyqtSignal()    # project-scoped vessel registry
     groundChanged = pyqtSignal()     # ground-model units and/or classes
     basChanged = pyqtSignal()        # BAS register rows and/or columns
+    analysisChanged = pyqtSignal()   # persisted latest analysis results
     logChanged = pyqtSignal()
     storeError = pyqtSignal(str)
 
@@ -88,6 +92,13 @@ class PlanModel(QObject):
         self.bas_rows: List[Dict] = []          # decoded (values dict)
         self.path_result: Optional[Dict] = None
         self.context = generation.ResolutionContext()
+        # Latest Exclusions recompute (persisted in bp_analysis). Display
+        # only: section derivation keeps using ``context`` — the resolution
+        # the plan was actually generated from — until the next Generate.
+        self.analysis_row: Optional[Dict] = None
+        self.analysis_context: Optional[generation.ResolutionContext] = None
+        self.analysis_nodata: List[Interval] = []
+        self._route_geom_fp = ""
         self.route = None            # RouteFrame over the plan's RPL (WGS84)
         self.distance = None
         self.resolved_rpl_id = ""
@@ -104,7 +115,11 @@ class PlanModel(QObject):
         self._layer_timer.setSingleShot(True)
         self._layer_timer.setInterval(150)
         self._layer_timer.timeout.connect(self._flush_layer_refresh)
-        self._depth_config_cache: Optional[Tuple[str, DepthSourceConfig]] = None
+        self._depth_config_cache: Optional[Tuple[Tuple, DepthSourceConfig]] = None
+        # Bathymetry identity memo (see _depth_info) and the relinks the
+        # last depth_config() resolution made (layer re-added -> new id).
+        self._depth_info_cache: Optional[Tuple[Tuple, float, Dict]] = None
+        self.depth_relinks: List[str] = []
         self._profile_cache_key: Optional[Tuple[str, str, str]] = None
         self.refresh_tools(emit=False)
         self.refresh_layback_profiles(emit=False)
@@ -184,6 +199,7 @@ class PlanModel(QObject):
         self.plan = plan
         self.inputs = self.store.list_inputs(plan_id)
         self._depth_config_cache = None
+        self._depth_info_cache = None
         self.rules = self.store.list_rules(plan_id)
         self.events = self.store.list_events(plan_id)
         self.sections = self.store.list_sections(plan_id)
@@ -197,6 +213,7 @@ class PlanModel(QObject):
         self._load_profile(plan_id)
         self._load_context()
         self._load_route()
+        self._load_analysis()
         self._check_stale()
         self.planChanged.emit()
         self.inputsChanged.emit()
@@ -207,6 +224,7 @@ class PlanModel(QObject):
         self.pathsChanged.emit()
         self.groundChanged.emit()
         self.basChanged.emit()
+        self.analysisChanged.emit()
         return True
 
     def _load_profile(self, plan_id: str) -> None:
@@ -238,6 +256,10 @@ class PlanModel(QObject):
         self.bas_rows = []
         self.path_result = None
         self.context = generation.ResolutionContext()
+        self.analysis_row = None
+        self.analysis_context = None
+        self.analysis_nodata = []
+        self._route_geom_fp = ""
         self.route = None
         self.resolved_rpl_id = ""
         self.route_notice = ""
@@ -245,10 +267,12 @@ class PlanModel(QObject):
         self.bathy_profile = None
         self._profile_cache_key = None
         self._depth_config_cache = None
+        self._depth_info_cache = None
         self.planChanged.emit()
         self.pathsChanged.emit()
         self.groundChanged.emit()
         self.basChanged.emit()
+        self.analysisChanged.emit()
 
     def _load_context(self) -> None:
         self.context = generation.ResolutionContext()
@@ -268,6 +292,7 @@ class PlanModel(QObject):
         self.resolved_rpl_id = ""
         self.route_notice = ""
         self.route_error = ""
+        self._route_geom_fp = ""
         self._segment_wkt_cache.clear()
         project = QgsProject.instance()
         lines_layer = None
@@ -365,7 +390,268 @@ class PlanModel(QObject):
             self._store_write("update the plan status", self.store.save_plan, self.plan)
             self.planChanged.emit()
 
+    # -- route identity ------------------------------------------------------
+    def route_geometry_fingerprint(self) -> str:
+        """Content fingerprint of the route geometry (WGS84, ~1 cm).
+
+        Unlike the Workbench RPL fingerprint (modified time + registry path)
+        this only changes when the route itself moves, so editing an RPL's
+        revision label or depth sources — or opening the project from a
+        different folder — does not invalidate derived results.
+        """
+        if self.route is None:
+            return ""
+        if not self._route_geom_fp:
+            try:
+                self._route_geom_fp = map_layers.route_geometry_fingerprint(
+                    self.route)
+            except Exception:
+                self._route_geom_fp = ""
+        return self._route_geom_fp
+
+    # -- latest analysis results (bp_analysis) -------------------------------
+    def _profile_stamp(self) -> str:
+        profile = self.bathy_profile
+        return str(profile.sampled_utc or "") if profile is not None else ""
+
+    def exclusion_fingerprints(self, params: Optional[generation.GenParams] = None,
+                               rules: Optional[List[Dict]] = None,
+                               inputs: Optional[List[Dict]] = None,
+                               profile_stamp: Optional[str] = None) -> Dict:
+        return analysis_state.exclusion_fingerprints(
+            params or self.gen_params(),
+            self.rules if rules is None else rules,
+            self.inputs if inputs is None else inputs,
+            route_fp=self.route_geometry_fingerprint(),
+            profile_stamp=(self._profile_stamp() if profile_stamp is None
+                           else profile_stamp))
+
+    def analysis_basis(self) -> Dict:
+        """What a recompute is computed from, captured at launch."""
+        return {"rules": [dict(r) for r in self.rules],
+                "inputs": [dict(r) for r in self.inputs],
+                "profile_stamp": self._profile_stamp()}
+
+    def _load_analysis(self) -> None:
+        """Read the plan's latest analysis row (tolerating a missing table
+        or a corrupt payload: the tabs then fall back to the generation)."""
+        self.analysis_row = None
+        self.analysis_context = None
+        self.analysis_nodata = []
+        if not self.plan_id:
+            return
+        try:
+            row = self.store.get_analysis(self.plan_id)
+        except Exception:
+            row = None
+        if not row:
+            return
+        self.analysis_row = row
+        payload = analysis_state.decode_json(row.get("context_json"), {})
+        if payload:
+            self.analysis_context = generation.context_from_dict(payload)
+            nodata = []
+            for pair in payload.get("nodata") or []:
+                try:
+                    nodata.append(Interval(float(pair[0]), float(pair[1])))
+                except (IndexError, TypeError, ValueError):
+                    continue
+            self.analysis_nodata = nodata
+            self._refresh_analysis_insufficient()
+
+    def _refresh_analysis_insufficient(self) -> None:
+        """Insufficient Information shown for the latest analysis follows the
+        *live* resolutions: an II range resolved in Plan Builder after the
+        run disappears without a recompute. Exclusions win over no-data."""
+        ctx = self.analysis_context
+        if ctx is None:
+            return
+        self._analysis_ii_key = str(self.plan.get("params_json") or "")
+        params = self.gen_params()
+        excluded = [Interval(v.start_km, v.end_km) for v in ctx.excluded]
+        ctx.insufficient = generation.unresolved_insufficient(
+            params, eng.subtract_intervals(list(self.analysis_nodata),
+                                           excluded))
+
+    def display_context(self) -> generation.ResolutionContext:
+        """The resolution to *show* (fire bars, overlays, previews): the
+        latest recompute when one is stored, else the generation's."""
+        if self.analysis_context is not None:
+            if getattr(self, "_analysis_ii_key", None) != str(
+                    self.plan.get("params_json") or ""):
+                self._refresh_analysis_insufficient()
+            return self.analysis_context
+        return self.context
+
+    def save_analysis(self, context: generation.ResolutionContext,
+                      nodata: List[Interval], params: generation.GenParams,
+                      rules: List[Dict], message: str = "",
+                      warnings: Optional[List[str]] = None,
+                      basis: Optional[Dict] = None) -> bool:
+        """Persist the latest Exclusions resolution (derived; not logged)."""
+        if not self.plan_id:
+            return False
+        run_utc = schema.utc_now_iso()
+        row = dict(self.analysis_row or {})
+        row.update({"plan_id": self.plan_id})
+        row.update(analysis_state.encode_exclusions(
+            generation.context_dict(context),
+            [(iv.start_km, iv.end_km) for iv in nodata],
+            self.exclusion_fingerprints(
+                params, rules, (basis or {}).get("inputs"),
+                (basis or {}).get("profile_stamp")),
+            message, warnings or [], run_utc))
+        ok, _ = self._store_write("save the exclusion results",
+                                  self.store.save_analysis, row)
+        # Keep the result in memory even when the write failed — the user
+        # still sees what they just computed (storeError already reported).
+        self.analysis_row = row if ok else dict(row, _unsaved=True)
+        self.analysis_context = context
+        self.analysis_nodata = list(nodata)
+        self._refresh_analysis_insufficient()
+        self.analysisChanged.emit()
+        return ok
+
+    def analysis_status(self) -> Dict:
+        """Where the displayed exclusion results came from and what changed
+        since. Keys: ``source`` (recompute | generation | none), ``run_utc``,
+        ``message``, ``warnings``, ``reasons`` (global changes, human text)
+        and ``rule_state`` (rule_id -> analysis_state.STATE_*)."""
+        current = self.exclusion_fingerprints()
+        status = {"source": "none", "run_utc": "", "message": "",
+                  "warnings": [], "reasons": [],
+                  "rule_state": {k: analysis_state.STATE_NONE
+                                 for k in current["rules"]}}
+        row = self.analysis_row
+        stored = None
+        if row and self.analysis_context is not None:
+            stored = analysis_state.decode_json(row.get("fingerprints_json"), {})
+            payload = analysis_state.decode_json(row.get("context_json"), {})
+            status.update(source="recompute",
+                          run_utc=str(row.get("run_utc") or ""),
+                          message=str(row.get("message") or ""),
+                          warnings=list(payload.get("warnings") or []))
+        else:
+            active = None
+            try:
+                active = self.store.active_generation(self.plan_id) \
+                    if self.plan_id else None
+            except Exception:
+                active = None
+            if active:
+                # Plans generated before bp_analysis existed: judge the
+                # generation's context against its own frozen rule stack.
+                try:
+                    snapshot = json.loads(
+                        active.get("rules_snapshot_json") or "[]")
+                    stored_params = json.loads(active.get("params_json") or "{}")
+                    # Same healing as the live parameters (legacy refine
+                    # tolerance, method aliases), but the run's own
+                    # scope/direction/method rather than the current plan's.
+                    gen_params = dataclasses.replace(
+                        self.gen_params(stored_params),
+                        scope_start_kp=float(stored_params.get(
+                            "scope_start_kp") or 0.0),
+                        scope_end_kp=float(stored_params.get(
+                            "scope_end_kp") or 0.0),
+                        direction=1 if int(stored_params.get(
+                            "direction") or 1) >= 0 else -1,
+                        method=schema.normalise_method(
+                            str(stored_params.get("method") or ""))
+                        or self.method)
+                    snapshot = [r for r in snapshot if isinstance(r, dict)] \
+                        if isinstance(snapshot, list) else []
+                    stored = analysis_state.exclusion_fingerprints(
+                        gen_params, snapshot, self.inputs,
+                        profile_stamp=self._profile_stamp())
+                    # The generation stored no route or profile identity.
+                    stored["global"]["route"] = ""
+                except (TypeError, ValueError, AttributeError):
+                    stored = None
+                status.update(source="generation",
+                              run_utc=str(active.get("run_utc") or ""))
+        if stored:
+            status["reasons"] = analysis_state.compare_global(
+                stored.get("global"), current["global"])
+            status["rule_state"] = analysis_state.compare_items(
+                stored.get("rules"), current["rules"])
+            if status["source"] == "generation":
+                # No profile identity was stored with generations: never
+                # report depth/slope criteria stale on that account alone.
+                for rule in self.rules:
+                    rid = str(rule.get("rule_id"))
+                    if (rule.get("kind") or "") == "threshold_profile" \
+                            and status["rule_state"].get(rid) == \
+                            analysis_state.STATE_CHANGED:
+                        legacy = analysis_state.rule_fingerprint(
+                            rule, {str(r.get("input_id") or ""): r
+                                   for r in self.inputs}, "")
+                        if legacy == (stored.get("rules") or {}).get(rid):
+                            status["rule_state"][rid] = \
+                                analysis_state.STATE_CURRENT
+        return status
+
+    # -- risk scan records ---------------------------------------------------
+    def risk_check_fingerprints(self) -> Dict[str, str]:
+        by_id = {str(r.get("input_id") or ""): r for r in self.inputs}
+        return {str(c.get("check_id")): analysis_state.check_fingerprint(c, by_id)
+                for c in self.risk_checks}
+
+    def risk_runs(self) -> Dict:
+        return analysis_state.risk_runs(self.analysis_row)
+
+    def record_risk_run(self, check_ids: List[str], counts: Dict[str, int],
+                        warnings: Dict[str, List[str]], message: str) -> bool:
+        """Remember which checks ran, when, on what settings, and what they
+        found — so "ran, found nothing" survives reopening the project."""
+        if not self.plan_id:
+            return False
+        fps = self.risk_check_fingerprints()
+        runs = analysis_state.record_risk_run(
+            self.risk_runs(), {cid: fps.get(cid, "") for cid in check_ids},
+            counts, warnings, message, schema.utc_now_iso())
+        row = dict(self.analysis_row or {})
+        row["plan_id"] = self.plan_id
+        row["risk_json"] = analysis_state.canonical(runs)
+        row.pop("_unsaved", None)
+        ok, _ = self._store_write("save the risk scan record",
+                                  self.store.save_analysis, row)
+        self.analysis_row = row
+        self.analysisChanged.emit()
+        return ok
+
+    def risk_status(self) -> Dict[str, Dict]:
+        """``{check_id: {"state", "run_utc", "count", "warnings"}}``."""
+        runs = self.risk_runs().get("runs") or {}
+        out: Dict[str, Dict] = {}
+        for check_id, fp in self.risk_check_fingerprints().items():
+            run = runs.get(check_id)
+            if not isinstance(run, dict):
+                out[check_id] = {"state": analysis_state.STATE_NEW}
+                continue
+            try:
+                count = int(run.get("count") or 0)
+            except (TypeError, ValueError):
+                count = 0
+            warnings = run.get("warnings")
+            out[check_id] = {
+                "state": (analysis_state.STATE_CURRENT
+                          if run.get("fp") == fp
+                          else analysis_state.STATE_CHANGED),
+                "run_utc": str(run.get("run_utc") or ""),
+                "count": count,
+                "warnings": [str(w) for w in warnings]
+                if isinstance(warnings, list) else [],
+            }
+        return out
+
     # -- depth ---------------------------------------------------------------
+    def _bathy_raw(self) -> str:
+        for row in self.inputs:
+            if row.get("role") == schema.INPUT_ROLE_BATHY:
+                return row.get("config_json") or "{}"
+        return ""
+
     def depth_config(self) -> DepthSourceConfig:
         """Return only the Burial Planner's explicitly registered source.
 
@@ -373,34 +659,85 @@ class PlanModel(QObject):
         settings may suit occasional point edits but are not necessarily
         appropriate for a whole-plan longitudinal profile.
 
-        Memoised on the raw config JSON — this is called many times per
-        Generate/refresh and re-parsing the same string each time added up.
+        Layers are stored by project layer id *and* source. When an id is no
+        longer in the project but a layer with the same source is (the
+        layer was removed and re-added, or the project rebuilt), the
+        returned config points at that layer instead — in memory only;
+        ``depth_relinks`` names what was relinked so the Inputs tab can
+        offer to save it.
+
+        Memoised on the raw config JSON and the project's layer ids — this
+        is called many times per Generate/refresh.
         """
-        raw = ""
-        for row in self.inputs:
-            if row.get("role") == schema.INPUT_ROLE_BATHY:
-                raw = row.get("config_json") or "{}"
-                break
+        raw = self._bathy_raw()
+        project = QgsProject.instance()
+        key = (raw, tuple(sorted(project.mapLayers().keys())))
         cached = self._depth_config_cache
-        if cached is not None and cached[0] == raw:
+        if cached is not None and cached[0] == key:
             return cached[1]
+        data: Dict = {}
         if raw:
             try:
-                config = DepthSourceConfig(json.loads(raw))
+                data = json.loads(raw)
             except (ValueError, TypeError):
-                config = DepthSourceConfig({})
-        else:
-            config = DepthSourceConfig({})
-        self._depth_config_cache = (raw, config)
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+        data, relinks = map_layers.relink_depth_config(project, data)
+        self.depth_relinks = relinks
+        config = DepthSourceConfig(data)
+        self._depth_config_cache = (key, config)
         return config
+
+    def invalidate_depth_cache(self) -> None:
+        """Forget memoised bathymetry state (layers added/removed, project
+        reloaded, or the user asked to check again)."""
+        self._depth_config_cache = None
+        self._depth_info_cache = None
 
     def depth_service(self) -> DepthService:
         return DepthService(self.depth_config(), QgsProject.instance())
 
+    # Short-lived: collapses the 3–4 currency checks a single refresh makes
+    # (each opening mosaic children, reading GeoPackage metadata and
+    # counting features) while still noticing a file edited on disk the
+    # next time the user interacts.
+    _DEPTH_INFO_TTL_S = 2.0
+
+    def _depth_info(self) -> Dict:
+        import time
+
+        config = self.depth_config()
+        key = (self._depth_config_cache[0] if self._depth_config_cache
+               else None, id(config))
+        now = time.monotonic()
+        cached = self._depth_info_cache
+        if cached is not None and cached[0] == key \
+                and now - cached[1] < self._DEPTH_INFO_TTL_S:
+            return cached[2]
+        project = QgsProject.instance()
+        layers = map_layers.depth_layer_fingerprints(project, config)
+        from ..bathymetry_sampling import VERSION
+
+        info = {
+            "layers": layers,
+            "signature": map_layers.depth_config_signature(config),
+            "fingerprint": "|".join(
+                [map_layers.DEPTH_FP_VERSION, VERSION,
+                 map_layers.depth_config_signature(config)]
+                + [f"{k}={v}" for k, v in sorted(layers.items())]),
+            "names": map_layers.depth_layer_names(project, config),
+        }
+        try:
+            info["cell"] = map_layers.min_raster_cell_size_m(project, config)
+        except Exception:
+            info["cell"] = None
+        self._depth_info_cache = (key, now, info)
+        return info
+
     def depth_fingerprint(self) -> str:
         """Combined fingerprint of the configured bathymetry layers."""
-        return map_layers.depth_config_fingerprint(
-            QgsProject.instance(), self.depth_config())
+        return self._depth_info()["fingerprint"]
 
     def depth_at_kp(self, kp: float) -> Optional[float]:
         """Water depth magnitude at a KP for resolution-time consumers
@@ -440,8 +777,7 @@ class PlanModel(QObject):
         if params.profile_step_m > 0:
             step = float(params.profile_step_m)
         else:
-            cell = map_layers.min_raster_cell_size_m(
-                QgsProject.instance(), self.depth_config())
+            cell = self._depth_info().get("cell")
             step = float(cell) if cell else 5.0
         step = min(max(step, 2.0), max(params.coarse_step_m, 2.0))
         floor = params.scope.length_km * 1000.0 / 500000.0
@@ -461,22 +797,53 @@ class PlanModel(QObject):
             return float(params.cross_offset_m)
         return self.resolve_profile_step_m(params)
 
+    def profile_stale_reasons(self) -> List[str]:
+        """Why the stored profile is stale (empty = current or missing)."""
+        profile = self.bathy_profile
+        if profile is None or not profile.kps:
+            return []
+        params = self.gen_params()
+        scope = params.scope
+        try:
+            info = self._depth_info()
+            legacy = ""
+            if not profile.depth_layers:  # sampled before v2 identity
+                legacy = map_layers.legacy_depth_config_fingerprint(
+                    QgsProject.instance(), self.depth_config())
+            return profile.stale_reasons(
+                route_fingerprint=self.current_rpl_fingerprint(),
+                route_geom_fingerprint=self.route_geometry_fingerprint(),
+                depth_fingerprint=info["fingerprint"],
+                legacy_depth_fingerprint=legacy,
+                depth_layers=info["layers"],
+                depth_signature=info["signature"],
+                scope_start_kp=scope.start_km, scope_end_kp=scope.end_km,
+                cross_offset_m=self.resolve_cross_offset_m(params),
+                # A changed target step (manual override, different raster
+                # cell, tighter analysis step) also warrants a resample.
+                step_m=self.resolve_profile_step_m(params),
+                layer_names=info.get("names"))
+        except Exception as exc:  # never let a currency check break a refresh
+            return [f"the currency check failed ({exc})"]
+
     def profile_state(self) -> str:
         """'missing' | 'current' | 'stale' for the persisted plan profile."""
         profile = self.bathy_profile
         if profile is None or not profile.kps:
             return "missing"
-        params = self.gen_params()
-        scope = params.scope
-        current = profile.is_current(
-            self.current_rpl_fingerprint(), self.depth_fingerprint(),
-            scope.start_km, scope.end_km,
-            self.resolve_cross_offset_m(params))
-        # A changed target step (manual override, different raster cell,
-        # tighter analysis step) also warrants a resample.
-        current = current and abs(
-            profile.step_m - self.resolve_profile_step_m(params)) < 0.01
-        return "current" if current else "stale"
+        return "stale" if self.profile_stale_reasons() else "current"
+
+    def profile_identity(self) -> Dict:
+        """Identity captured when sampling starts (stored with the profile)."""
+        info = self._depth_info()
+        return {
+            "route_fingerprint": self.current_rpl_fingerprint(),
+            "route_geom_fingerprint": self.route_geometry_fingerprint(),
+            "depth_fingerprint": info["fingerprint"],
+            "depth_layers": dict(info["layers"]),
+            "depth_signature": info["signature"],
+            "depth_layer_names": dict(info.get("names") or {}),
+        }
 
     def save_profile(self, profile: PlanProfile) -> bool:
         """Persist one sampling pass (derived data — not change-logged)."""
@@ -655,12 +1022,14 @@ class PlanModel(QObject):
     def path_config(self) -> Dict:
         return path_data.config_from_plan(self.plan)
 
-    def path_fingerprints(self, config: Optional[Dict] = None) -> Dict[str, str]:
+    def path_fingerprints(self, config: Optional[Dict] = None,
+                          depth_basis: Optional[str] = None) -> Dict[str, str]:
         config = dict(config or self.path_config())
         tool, tool_config = path_data.effective_tool_and_config(
             self.plan, self.tools)
         layback = self.layback_profile(config.get("layback_id") or "")
-        depth_basis = self.depth_fingerprint()
+        if depth_basis is None:
+            depth_basis = self.depth_fingerprint()
         if len(path_data.layback_points(layback)) > 1 \
                 or config.get("radius_rules"):
             profile = self.bathy_profile
@@ -674,8 +1043,22 @@ class PlanModel(QObject):
             config, layback, depth_basis)
 
     def path_state(self, config: Optional[Dict] = None) -> Dict[str, str]:
-        return path_data.result_state(
+        state = path_data.result_state(
             self.path_result, self.path_fingerprints(config))
+        if self.path_result and "stale" in state.values():
+            # Results computed before the content-based bathymetry
+            # fingerprint: judge them by the formula they were stored with
+            # rather than flagging every one stale on upgrade.
+            legacy = map_layers.legacy_depth_config_fingerprint(
+                QgsProject.instance(), self.depth_config())
+            if legacy:
+                old = path_data.result_state(
+                    self.path_result, self.path_fingerprints(
+                        config, depth_basis=legacy))
+                if list(old.values()).count("current") > \
+                        list(state.values()).count("current"):
+                    return old
+        return state
 
     def save_path_result(self, row: Dict) -> bool:
         """Persist one derived result, then refresh its map caches."""
@@ -839,6 +1222,144 @@ class PlanModel(QObject):
         self.inputsChanged.emit()
         self.logChanged.emit()
         return True
+
+    def save_inputs(self, rows: List[Dict]) -> bool:
+        """Register several inputs in one transaction and one change-log
+        entry (the multi-layer Add inputs dialog)."""
+        if not self.plan_id or not rows:
+            return False
+        prepared = []
+        for row in rows:
+            row = dict(row)
+            row["plan_id"] = self.plan_id
+            row.setdefault("input_id", schema.new_id())
+            prepared.append(row)
+
+        def write() -> None:
+            for row in prepared:
+                self.store.save_input(row)
+            self.store.append_change(
+                self.plan_id, change_log.ACTION_SET_INPUT,
+                ",".join(str(r["input_id"]) for r in prepared),
+                before={schema.TABLE_INPUT: []},
+                after={schema.TABLE_INPUT: prepared},
+                reason=f"registered {len(prepared)} input(s)")
+            self.inputs = self.store.list_inputs(self.plan_id)
+
+        ok, _ = self._store_transaction("register the inputs", write)
+        if not ok:
+            return False
+        self.mark_stale()
+        if self.path_result:
+            self.refresh_path_layers()
+            self.pathsChanged.emit()
+        self.inputsChanged.emit()
+        self.logChanged.emit()
+        return True
+
+    def input_usage(self) -> Dict[str, List[str]]:
+        """``{input_id: ["Exclusion: name", "Risk check: name", …]}``."""
+        usage: Dict[str, List[str]] = {}
+
+        def walk(value, label: str) -> None:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key == "input_id" and item:
+                        names = usage.setdefault(str(item), [])
+                        if label not in names:
+                            names.append(label)
+                    else:
+                        walk(item, label)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item, label)
+
+        for kind, rows in (("Exclusion", self.rules),
+                           ("Risk check", self.risk_checks)):
+            for row in rows:
+                try:
+                    config = json.loads(row.get("config_json") or "{}")
+                except (TypeError, ValueError):
+                    continue
+                walk(config, f"{kind}: {row.get('name') or 'unnamed'}")
+        return usage
+
+    def input_status(self, row: Dict) -> Tuple[str, str, Optional[object]]:
+        """``(state, detail, layer)`` for a registered input.
+
+        state: ``ok`` (the saved project layer) | ``relinked`` (found in the
+        project by source — the saved id is gone) | ``file`` (not in the
+        project; opened from its source) | ``missing``.
+        """
+        project = QgsProject.instance()
+        hint = row.get("layer_id_hint") or ""
+        layer = project.mapLayer(hint) if hint else None
+        if layer is not None and layer.isValid():
+            return "ok", layer.name(), layer
+        source = row.get("layer_source") or ""
+        match = map_layers.find_layer_by_source(project, source)
+        if match is not None:
+            return ("relinked", f"found in the project as '{match.name()}' "
+                    "(the saved layer id is gone)", match)
+        try:
+            layer = map_layers.resolve_input_layer(project, row)
+        except Exception:
+            layer = None
+        if layer is not None:
+            return ("file", "not in the project — read from its file "
+                    "(add it to the map to review it)", layer)
+        return ("missing", "not in the project and its source could not be "
+                "opened — relink it (Edit…) or remove it", None)
+
+    def relink_input(self, input_id: str, layer) -> bool:
+        """Point an input at a project layer (keeps its register metadata)."""
+        row = next((r for r in self.inputs
+                    if r.get("input_id") == input_id), None)
+        if row is None or layer is None:
+            return False
+        updated = dict(row)
+        updated.update({"layer_name": layer.name(),
+                        "layer_source": layer.source(),
+                        "layer_id_hint": layer.id()})
+        return self.save_input(updated)
+
+    # -- target burial depth ---------------------------------------------------
+    def target_ranges(self) -> List[Dict]:
+        return target_depth.plan_ranges(self.plan)
+
+    def target_default(self) -> Optional[float]:
+        return target_depth.plan_default(self.plan)
+
+    def target_runs(self, start_kp: Optional[float] = None,
+                    end_kp: Optional[float] = None):
+        scope = self.gen_params().scope
+        return target_depth.target_runs(
+            self.target_default(), self.target_ranges(),
+            scope.start_km if start_kp is None else start_kp,
+            scope.end_km if end_kp is None else end_kp)
+
+    def update_targets(self, default_m: Optional[float],
+                       ranges: List[Dict]) -> bool:
+        """Save the default target and its KP-range overrides together (one
+        change-log entry); refreshes the ground overlay's target horizon."""
+        try:
+            params = json.loads(self.plan.get("params_json") or "{}")
+        except (TypeError, ValueError):
+            params = {}
+        if not isinstance(params, dict):
+            params = {}
+        cleaned = target_depth.normalise_ranges(ranges)
+        if cleaned:
+            params[target_depth.PARAMS_KEY] = cleaned
+        else:
+            params.pop(target_depth.PARAMS_KEY, None)
+        ok = self.update_plan({
+            "target_burial_m": default_m if default_m else None,
+            "params_json": json.dumps(params),
+        }, reason="target burial depth")
+        if ok and "target_burial_m" not in self.plan:
+            self.refresh_layers(parts=("ground",))
+        return ok
 
     def delete_input(self, input_id: str) -> bool:
         before_row = self.store.get_input(input_id)

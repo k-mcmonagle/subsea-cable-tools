@@ -4,7 +4,11 @@
 Depth vs KP over the plan scope with the plan always in view: combined
 Exclusion Area shading (red), screening annotations (amber), Constraint
 Influence Zones (blue tint), Insufficient Information (grey), section strip
-colouring via region items, and event markers (draggable in edit mode).
+colouring via region items, a Risk Profile hazard strip, and event markers
+(draggable in edit mode). The *Overlays* menu shows/hides each overlay
+(persisted) and filters Insufficient Information by the criterion that
+could not be evaluated — e.g. hide the no-data ranges of a cross-slope
+criterion on flat contour-only seabed while keeping the others.
 Crosshair readout shows KP (3 dp), depth and longitudinal slope; hover and
 click are re-emitted so the dock can sync the map canvas.
 
@@ -21,17 +25,21 @@ from typing import Dict, List, Optional, Tuple
 
 import pyqtgraph as pg
 
+import json
+
 from qgis.PyQt.QtCore import QRectF, QSettings, Qt, pyqtSignal
-from qgis.PyQt.QtGui import QColor
+from qgis.PyQt.QtGui import QColor, QIcon, QPixmap
 from qgis.PyQt.QtGui import QKeySequence
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QPushButton,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -48,7 +56,10 @@ from ..qgis_compat import (
     QAction,
     SELECTION_BEHAVIOR_SELECT_ROWS,
     SELECTION_MODE_SINGLE,
+    TOOLBUTTON_POPUP_MODE_INSTANT,
 )
+from ..workbench import rules_engine as eng
+from ..workbench.rules_engine import Interval
 from ..slope_utils import interpolate_covered, is_finite
 from . import ui_helpers
 from . import events as ev
@@ -83,6 +94,37 @@ _REGION_STYLES = {
     "insufficient": (QColor(120, 120, 120, 55), QColor(120, 120, 120, 100)),
 }
 
+# Overlay keys shown/hidden from the Overlays menu (persisted per user).
+_OVERLAY_LABELS = (
+    ("excluded", "Exclusion Areas", "#d62728"),
+    ("screening", "Screening flags", "#ff8c00"),
+    ("influence", "Constraint Influence Zones", "#1f77b4"),
+    ("insufficient", "Insufficient Information", "#787878"),
+    ("hazards", "Risk Profile hazards (strip)", "#8e44ad"),
+    ("sections", "Plan outcome (section strip)", "#1b7f3b"),
+)
+# Key for Insufficient Information no criterion claims (e.g. contexts
+# stored before per-criterion no-data was recorded).
+_II_OTHER = "__other__"
+_HAZARD_STRIP_PX = 8
+_HAZARD_ALPHA = 200
+
+_SLOPE_TIPS = {
+    "long": "Longitudinal: pitch along the route, signed (+ = up-slope with "
+            "increasing KP). Use for up/down-slope limits.",
+    "cross": "Cross tilt: average side-to-side tilt between the port and "
+             "starboard samples (± the cross offset), signed (+ = deeper to "
+             "starboard of travel). Use for vehicle roll; a symmetric trench "
+             "reads ~0.",
+    "cross_max": "Max local cross: steepest local side slope between the "
+                 "port and starboard samples. Equals |cross tilt| unless the "
+                 "cross offset spans several cells (set the vehicle "
+                 "half-track). Use to catch a steep wall inside the track.",
+    "abs": "Absolute: combined gradient magnitude of longitudinal and cross "
+           "slope — 'maximum slope in any direction'. Blank where cross "
+           "slope has no data.",
+}
+
 # Plan-outcome strip along the top of the plot; colours match the map
 # symbology in map_layers._SECTION_STYLES.
 _STRIP_HEIGHT_PX = 12
@@ -92,6 +134,13 @@ _STRIP_STYLES = {
     schema.SECTION_INSUFFICIENT: (QColor(158, 158, 158, 140),
                                   "Insufficient Information"),
 }
+
+
+def _intersect(a: List[Interval], b: List[Interval]) -> List[Interval]:
+    """Intersection of two interval sets."""
+    if not a or not b:
+        return []
+    return eng.intersect_intervals(list(a), list(b))
 
 
 class RangeBandItem(pg.GraphicsObject):
@@ -107,7 +156,7 @@ class RangeBandItem(pg.GraphicsObject):
     readout lists the ranges under the crosshair.
     """
 
-    def __init__(self, brush=None, pen=None):
+    def __init__(self, brush=None, pen=None, min_px: float = 0.0):
         super().__init__()
         self._ranges: List[Tuple[float, float, str, object]] = []
         self._starts: List[float] = []
@@ -116,6 +165,10 @@ class RangeBandItem(pg.GraphicsObject):
         self._pen = pg.mkPen(pen) if pen is not None else None
         self._xmin = 0.0
         self._xmax = 0.0
+        # Ranges narrower than this many pixels are drawn (and hit-tested)
+        # at this width — point hazards stay visible at route scale
+        # without claiming a fixed ground extent when zoomed in.
+        self._min_px = float(min_px)
 
     def set_ranges(self, ranges) -> None:
         """``ranges``: iterable of ``(start, end, label[, brush])``."""
@@ -157,8 +210,18 @@ class RangeBandItem(pg.GraphicsObject):
             if end >= lo:
                 yield start, end, label, brush
 
+    def _min_width(self) -> float:
+        if self._min_px <= 0:
+            return 0.0
+        try:
+            px = self.pixelWidth()
+        except Exception:
+            px = 0.0
+        return self._min_px * px if px and math.isfinite(px) else 0.0
+
     def labels_at(self, kp: float) -> List[str]:
-        return [label for _s, _e, label, _b in self._visible(kp, kp)
+        pad = self._min_width() / 2.0
+        return [label for _s, _e, label, _b in self._visible(kp - pad, kp + pad)
                 if label]
 
     def boundingRect(self):
@@ -190,10 +253,16 @@ class RangeBandItem(pg.GraphicsObject):
                        else pg.mkPen(None))
         default_brush = (self._brush if self._brush is not None
                          else pg.mkBrush(None))
-        for start, end, _label, brush in self._visible(view.left(),
-                                                       view.right()):
+        min_width = self._min_width()
+        pad = min_width / 2.0
+        for start, end, _label, brush in self._visible(view.left() - pad,
+                                                       view.right() + pad):
             painter.setBrush(brush if brush is not None else default_brush)
-            painter.drawRect(QRectF(start, top, end - start, height))
+            width = end - start
+            if width < min_width:
+                start = (start + end) / 2.0 - pad
+                width = min_width
+            painter.drawRect(QRectF(start, top, width, height))
 
 
 class EventMarkerItem(pg.GraphicsObject):
@@ -386,6 +455,7 @@ class BurialProfileWidget(QWidget):
                                   ("abs", "#8c564b", "Absolute")):
             box = QCheckBox(label)
             box.setStyleSheet(f"color: {color}; font-weight: 600;")
+            box.setToolTip(_SLOPE_TIPS.get(key, ""))
             box.setChecked(bool(settings.value(
                 f"{_SETTINGS_ROOT}/slope_series_{key}", True, type=bool)))
             box.toggled.connect(
@@ -426,6 +496,30 @@ class BurialProfileWidget(QWidget):
             "Untick to return to the stretched auto-scaled view.")
         self._true_scale_toggle.toggled.connect(self._true_scale_toggled)
         depth_toggle_row.addWidget(self._true_scale_toggle)
+        # Overlays: show/hide each overlay kind, and filter Insufficient
+        # Information by source criterion (all persisted).
+        self._overlay_visible: Dict[str, bool] = {
+            key: bool(settings.value(f"{_SETTINGS_ROOT}/profile_overlay_{key}",
+                                     True, type=bool))
+            for key, _label, _color in _OVERLAY_LABELS}
+        self._ii_hidden = set(self._load_json_setting("profile_ii_hidden", []))
+        self._hazard_levels_hidden = set(
+            self._load_json_setting("profile_hazard_levels_hidden", []))
+        self._overlay_context = generation.ResolutionContext()
+        self._overlay_rule_names: Dict[str, str] = {}
+        self._hazards: List[Dict] = []
+        self._overlay_button = QToolButton()
+        self._overlay_button.setPopupMode(TOOLBUTTON_POPUP_MODE_INSTANT)
+        self._overlay_button.setToolTip(
+            "Show or hide the profile overlays — Exclusion Areas, screening "
+            "flags, influence zones, Insufficient Information (filterable by "
+            "the criterion that had no data), the Risk Profile hazard strip "
+            "and the plan outcome strip. Choices are remembered.")
+        self._overlay_menu = QMenu(self._overlay_button)
+        self._overlay_menu.setToolTipsVisible(True)
+        self._overlay_menu.aboutToShow.connect(self._rebuild_overlay_menu)
+        self._overlay_button.setMenu(self._overlay_menu)
+        depth_toggle_row.addWidget(self._overlay_button)
         depth_toggle_row.addStretch(1)
         self._true_scale_action = QAction("True scale (1:1)", self)
         self._true_scale_action.setCheckable(True)
@@ -560,6 +654,9 @@ class BurialProfileWidget(QWidget):
             band.setZValue(2 if kind == "excluded" else 1)
             item.addItem(band, ignoreBounds=True)
             self._regions[kind] = band
+        # Per-criterion Insufficient Information labels (never painted: the
+        # union is painted by the "insufficient" band above).
+        self._ii_labels = RangeBandItem()
         self._event_lines: List = []
         # Read-only markers: one painted item (see EventMarkerItem).
         self._event_markers = EventMarkerItem()
@@ -609,8 +706,19 @@ class BurialProfileWidget(QWidget):
         self._strip_vb.setYRange(0.0, 1.0, padding=0)
         self._strip_band = RangeBandItem()
         self._strip_vb.addItem(self._strip_band, ignoreBounds=True)
+        # Risk Profile hazard strip just under the outcome strip: hazards
+        # (often thousands of point picks) never shade the bathymetry.
+        self._hazard_vb = pg.ViewBox(enableMouse=False, enableMenu=False)
+        self._hazard_vb.setZValue(5)
+        item.scene().addItem(self._hazard_vb)
+        self._hazard_vb.setXLink(item.vb)
+        self._hazard_vb.enableAutoRange(x=False, y=False)
+        self._hazard_vb.setYRange(0.0, 1.0, padding=0)
+        self._hazard_band = RangeBandItem(min_px=3.0)
+        self._hazard_vb.addItem(self._hazard_band, ignoreBounds=True)
         item.vb.sigResized.connect(self._position_strip)
         self._position_strip()
+        self._apply_overlay_visibility()
 
         # Both plots drive one crosshair: hovering or clicking the slope
         # panel behaves exactly like the depth plot (map sync included).
@@ -1057,7 +1165,14 @@ class BurialProfileWidget(QWidget):
             self._profile_signature = signature
         self._sync_measure_controls()
 
-    def set_overlays(self, context: generation.ResolutionContext) -> None:
+    def set_overlays(self, context: generation.ResolutionContext,
+                     rule_names: Optional[Dict[str, str]] = None) -> None:
+        """Resolved exclusion overlays. ``rule_names`` (rule_id -> name)
+        labels Insufficient Information with the criteria that had no data
+        and feeds the Overlays menu's per-criterion filter."""
+        self._overlay_context = context or generation.ResolutionContext()
+        self._overlay_rule_names = dict(rule_names or {})
+        context = self._overlay_context
         self._regions["excluded"].set_ranges(
             (v.start_km, v.end_km, "Exclusion Area")
             for v in context.excluded)
@@ -1068,9 +1183,95 @@ class BurialProfileWidget(QWidget):
             (z.start_km, z.end_km,
              f"Constraint Influence Zone of {z.rule_name}")
             for z in context.influence)
+        self._apply_insufficient_filter()
+
+    def insufficient_sources(self) -> List[Tuple[str, str, float]]:
+        """``(key, label, km)`` of the criteria behind the displayed
+        Insufficient Information (``_II_OTHER`` for unattributed ranges)."""
+        context = self._overlay_context
+        insufficient = list(context.insufficient)
+        if not insufficient:
+            return []
+        out = []
+        claimed: List[Interval] = []
+        for rule_id, gaps in (getattr(context, "rule_nodata", None) or {}).items():
+            inside = _intersect(insufficient, gaps)
+            km = sum(iv.length_km for iv in inside)
+            if km <= 1e-9:
+                continue
+            claimed.extend(gaps)
+            out.append((rule_id, self._overlay_rule_names.get(
+                rule_id, "criterion (deleted)"), km))
+        out.sort(key=lambda item: item[1].lower())
+        rest = eng.subtract_intervals(insufficient, eng.normalize(claimed))
+        rest_km = sum(iv.length_km for iv in rest)
+        if rest_km > 1e-9:
+            out.append((_II_OTHER, "Other / not attributed", rest_km))
+        return out
+
+    def _visible_insufficient(self) -> List[Interval]:
+        context = self._overlay_context
+        insufficient = list(context.insufficient)
+        if not self._ii_hidden or not insufficient:
+            return insufficient
+        by_rule = getattr(context, "rule_nodata", None) or {}
+        shown: List[Interval] = []
+        claimed: List[Interval] = []
+        for rule_id, gaps in by_rule.items():
+            claimed.extend(gaps)
+            if rule_id not in self._ii_hidden:
+                shown.extend(gaps)
+        visible = _intersect(insufficient, eng.normalize(shown))
+        if _II_OTHER not in self._ii_hidden:
+            visible += eng.subtract_intervals(insufficient,
+                                              eng.normalize(claimed))
+        return eng.normalize(visible)
+
+    def _apply_insufficient_filter(self) -> None:
+        context = self._overlay_context
+        visible = self._visible_insufficient()
         self._regions["insufficient"].set_ranges(
             (iv.start_km, iv.end_km, "Insufficient Information")
-            for iv in context.insufficient)
+            for iv in visible)
+        # Per-criterion labels for the readout, limited to what is shown.
+        labels = []
+        for rule_id, gaps in (getattr(context, "rule_nodata", None) or {}).items():
+            if rule_id in self._ii_hidden:
+                continue
+            name = self._overlay_rule_names.get(rule_id, "criterion")
+            for iv in _intersect(visible, gaps):
+                labels.append((iv.start_km, iv.end_km, f"  no data: {name}"))
+        self._ii_labels.set_ranges(labels)
+
+    def set_hazards(self, hazards: List[Dict]) -> None:
+        """Risk Profile hazards on the hazard strip, coloured by risk."""
+        self._hazards = list(hazards or [])
+        self._apply_hazards()
+
+    def _apply_hazards(self) -> None:
+        colors = {
+            schema.RISK_HIGH: ui_helpers.qcolor("risk_high"),
+            schema.RISK_MEDIUM: ui_helpers.qcolor("risk_medium"),
+            schema.RISK_LOW: ui_helpers.qcolor("risk_low"),
+            schema.RISK_UNASSIGNED: ui_helpers.qcolor("risk_unassigned"),
+        }
+        ranges = []
+        for hazard in self._hazards:
+            level = hazard.get("risk") or ""
+            if level in self._hazard_levels_hidden:
+                continue
+            try:
+                start = float(hazard.get("kp"))
+                end_value = hazard.get("end_kp")
+                end = float(end_value) if end_value is not None else start
+            except (TypeError, ValueError):
+                continue
+            color = QColor(colors.get(level, colors[schema.RISK_UNASSIGNED]))
+            color.setAlpha(_HAZARD_ALPHA)
+            text = (f"Hazard: {hazard.get('label') or 'hazard'} "
+                    f"[{schema.RISK_LABELS.get(level, 'Unassigned')}]")
+            ranges.append((start, end, text, color))
+        self._hazard_band.set_ranges(ranges)
 
     def set_slope_visible(self, visible: bool) -> None:
         self._slope_pane.setVisible(bool(visible))
@@ -1106,13 +1307,20 @@ class BurialProfileWidget(QWidget):
         """Pin the outcome strip to the top of the plot area (fixed height)."""
         vb = self.plot.getPlotItem().vb
         rect = vb.sceneBoundingRect()
-        self._strip_vb.setGeometry(QRectF(rect.left(), rect.top(),
-                                          rect.width(), _STRIP_HEIGHT_PX))
-        try:
-            self._strip_vb.linkedViewChanged(vb, self._strip_vb.XAxis)
-        except Exception:
-            pass
-        self._strip_vb.setYRange(0.0, 1.0, padding=0)
+        top = rect.top()
+        hazard_vb = getattr(self, "_hazard_vb", None)
+        for strip, height in ((self._strip_vb, _STRIP_HEIGHT_PX),
+                              (hazard_vb, _HAZARD_STRIP_PX)):
+            if strip is None:
+                continue
+            strip.setGeometry(QRectF(rect.left(), top, rect.width(), height))
+            try:
+                strip.linkedViewChanged(vb, strip.XAxis)
+            except Exception:
+                pass
+            strip.setYRange(0.0, 1.0, padding=0)
+            if strip.isVisible():
+                top += height + 1
 
     def set_sections(self, sections: List[Dict]) -> None:
         """Colour the top strip with the plan outcome (burial/skip/insufficient)."""
@@ -1137,14 +1345,165 @@ class BurialProfileWidget(QWidget):
         self._strip_band.set_ranges(ranges)
 
     def overlay_labels_at(self, kp: float) -> List[str]:
-        """Overlay/section descriptions under a KP (the old region tooltips)."""
+        """Overlay/section descriptions under a KP (the old region tooltips).
+
+        Hidden overlays contribute nothing, so the readout matches the plot.
+        """
         labels: List[str] = []
         for kind in ("excluded", "screening", "influence", "insufficient"):
+            if not self._overlay_visible.get(kind, True):
+                continue
             for label in self._regions[kind].labels_at(kp):
                 if label not in labels:
                     labels.append(label)
-        labels.extend(self._strip_band.labels_at(kp))
+            if kind == "insufficient":
+                for label in self._ii_labels.labels_at(kp)[:3]:
+                    if label not in labels:
+                        labels.append(label)
+        if self._overlay_visible.get("hazards", True):
+            hazards = self._hazard_band.labels_at(kp)
+            labels.extend(hazards[:3])
+            if len(hazards) > 3:
+                labels.append(f"  … {len(hazards) - 3} more hazards here")
+        if self._overlay_visible.get("sections", True):
+            labels.extend(self._strip_band.labels_at(kp))
         return labels
+
+    # -- overlay visibility (Overlays menu) -----------------------------------
+    @staticmethod
+    def _load_json_setting(name: str, default):
+        raw = QSettings().value(f"{_SETTINGS_ROOT}/{name}", "", type=str)
+        try:
+            value = json.loads(raw) if raw else default
+        except (TypeError, ValueError):
+            return default
+        return value if isinstance(value, type(default)) else default
+
+    @staticmethod
+    def _save_json_setting(name: str, value) -> None:
+        QSettings().setValue(f"{_SETTINGS_ROOT}/{name}", json.dumps(value))
+
+    def overlay_visible(self, key: str) -> bool:
+        return bool(self._overlay_visible.get(key, True))
+
+    def set_overlay_visible(self, key: str, visible: bool) -> None:
+        self._overlay_visible[key] = bool(visible)
+        QSettings().setValue(f"{_SETTINGS_ROOT}/profile_overlay_{key}",
+                             bool(visible))
+        self._apply_overlay_visibility()
+
+    def set_insufficient_source_visible(self, key: str, visible: bool) -> None:
+        if visible:
+            self._ii_hidden.discard(key)
+        else:
+            self._ii_hidden.add(key)
+        self._save_json_setting("profile_ii_hidden", sorted(self._ii_hidden))
+        self._apply_insufficient_filter()
+        self._sync_overlay_button()
+
+    def set_hazard_level_visible(self, level: str, visible: bool) -> None:
+        if visible:
+            self._hazard_levels_hidden.discard(level)
+        else:
+            self._hazard_levels_hidden.add(level)
+        self._save_json_setting("profile_hazard_levels_hidden",
+                                sorted(self._hazard_levels_hidden))
+        self._apply_hazards()
+        self._sync_overlay_button()
+
+    def _apply_overlay_visibility(self) -> None:
+        for kind, band in self._regions.items():
+            band.setVisible(self.overlay_visible(kind))
+        self._hazard_vb.setVisible(self.overlay_visible("hazards"))
+        self._strip_vb.setVisible(self.overlay_visible("sections"))
+        self._position_strip()
+        self._sync_overlay_button()
+
+    def _hidden_overlay_count(self) -> int:
+        hidden = sum(1 for key, _l, _c in _OVERLAY_LABELS
+                     if not self.overlay_visible(key))
+        if self.overlay_visible("insufficient") and self._ii_hidden:
+            present = {key for key, _label, _km in self.insufficient_sources()}
+            if present & self._ii_hidden:
+                hidden += 1
+        if self.overlay_visible("hazards") and self._hazard_levels_hidden:
+            hidden += 1
+        return hidden
+
+    def _sync_overlay_button(self) -> None:
+        hidden = self._hidden_overlay_count()
+        self._overlay_button.setText(
+            f"Overlays ({hidden} hidden) ▾" if hidden else "Overlays ▾")
+
+    @staticmethod
+    def _swatch(color: str) -> QIcon:
+        pixmap = QPixmap(12, 12)
+        pixmap.fill(QColor(color))
+        return QIcon(pixmap)
+
+    def _rebuild_overlay_menu(self) -> None:
+        menu = self._overlay_menu
+        menu.clear()
+        for key, label, color in _OVERLAY_LABELS:
+            action = menu.addAction(self._swatch(color), label)
+            action.setCheckable(True)
+            action.setChecked(self.overlay_visible(key))
+            action.toggled.connect(
+                lambda checked, k=key: self.set_overlay_visible(k, checked))
+            if key == "insufficient":
+                sources = self.insufficient_sources()
+                sub = menu.addMenu("    Insufficient Information from")
+                sub.setToolTipsVisible(True)
+                sub.setEnabled(bool(sources) and self.overlay_visible(key))
+                if not sources:
+                    sub.setTitle("    Insufficient Information from (none)")
+                for source_key, name, km in sources:
+                    item = sub.addAction(f"{name}  ({km:.3f} km)")
+                    item.setCheckable(True)
+                    item.setChecked(source_key not in self._ii_hidden)
+                    item.setToolTip(
+                        "No-data ranges this criterion could not evaluate. "
+                        "Hiding them is display-only — the plan's "
+                        "Insufficient Information sections are unchanged "
+                        "(resolve those in Plan Builder).")
+                    item.toggled.connect(
+                        lambda checked, k=source_key:
+                        self.set_insufficient_source_visible(k, checked))
+                if sources:
+                    sub.addSeparator()
+                    show_all = sub.addAction("Show all")
+                    show_all.triggered.connect(self._show_all_insufficient)
+            elif key == "hazards":
+                sub = menu.addMenu("    Hazard risk levels")
+                sub.setEnabled(self.overlay_visible(key))
+                for level in list(reversed(schema.RISK_LEVELS)) + [
+                        schema.RISK_UNASSIGNED]:
+                    item = sub.addAction(schema.RISK_LABELS[level])
+                    item.setCheckable(True)
+                    item.setChecked(level not in self._hazard_levels_hidden)
+                    item.toggled.connect(
+                        lambda checked, lv=level:
+                        self.set_hazard_level_visible(lv, checked))
+        menu.addSeparator()
+        reset = menu.addAction("Show all overlays")
+        reset.triggered.connect(self.show_all_overlays)
+
+    def _show_all_insufficient(self) -> None:
+        self._ii_hidden.clear()
+        self._save_json_setting("profile_ii_hidden", [])
+        self._apply_insufficient_filter()
+        self._sync_overlay_button()
+
+    def show_all_overlays(self) -> None:
+        for key, _label, _color in _OVERLAY_LABELS:
+            self._overlay_visible[key] = True
+            QSettings().setValue(f"{_SETTINGS_ROOT}/profile_overlay_{key}",
+                                 True)
+        self._hazard_levels_hidden.clear()
+        self._save_json_setting("profile_hazard_levels_hidden", [])
+        self._apply_hazards()
+        self._show_all_insufficient()
+        self._apply_overlay_visibility()
 
     def set_events(self, events: List[Dict], method: str, editable: bool = False) -> None:
         """Event markers: one painted item normally; draggable lines in
@@ -1215,6 +1574,7 @@ class BurialProfileWidget(QWidget):
         self._update_sea_level()
         self.set_profile([])
         self.set_overlays(generation.ResolutionContext())
+        self.set_hazards([])
         self.set_events([], "")
         self.set_sections([])
         self.set_slope_series([], [], [])

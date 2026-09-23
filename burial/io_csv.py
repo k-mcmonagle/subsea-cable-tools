@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import events as ev
 from . import schema
+from . import target_depth
 from . import tools as tools_mod
 
 EVENT_COLUMNS = ["seq", "event_type", "label", "kp", "lat", "lon", "depth_m",
@@ -34,8 +35,8 @@ SECTION_COLUMNS = ["section_ref", "kind", "start_kp", "end_kp",
                    "start_rkp", "end_rkp",
                    "start_lat", "start_lon", "end_lat", "end_lon",
                    "length_km", "state", "conclusion", "confidence", "tool",
-                   "tool_config", "skip_handling", "reasons", "reasons_text",
-                   "notes"]
+                   "tool_config", "skip_handling", "target_burial_m",
+                   "reasons", "reasons_text", "notes"]
 INPUT_COLUMNS = ["role", "layer_name", "layer_source", "originator", "revision",
                  "status", "received_utc", "quality", "notes"]
 HAZARD_COLUMNS = ["risk", "status", "kp", "end_kp", "offset_m", "crossing",
@@ -163,6 +164,8 @@ def sections_csv(plan: Dict, sections: Sequence[Dict], generation_id: str = "",
     writer.writerow(SECTION_COLUMNS)
     refs = schema.section_refs(sections, int(plan.get("direction") or 1),
                                plan.get("method") or "")
+    target_default = target_depth.plan_default(plan)
+    target_ranges = target_depth.plan_ranges(plan)
     for section in sections:
         start_kp = section.get("start_kp")
         end_kp = section.get("end_kp")
@@ -185,6 +188,9 @@ def sections_csv(plan: Dict, sections: Sequence[Dict], generation_id: str = "",
             _section_config_text(section, plan, tools),
             (schema.SKIP_HANDLING_LABELS.get(section.get("skip_handling") or "", "")
              if section.get("kind") == schema.SECTION_SKIP else ""),
+            (target_depth.format_span(target_depth.depth_span(
+                target_default, target_ranges, start_kp, end_kp))
+             if section.get("kind") == schema.SECTION_BURIAL else ""),
             section.get("reason_json") or "",
             report_mod.section_reason_text(section),
             section.get("notes") or "",

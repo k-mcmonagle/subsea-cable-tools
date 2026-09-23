@@ -373,9 +373,33 @@ class BurialPlannerDock(QDockWidget):
         self.model.vesselsChanged.connect(self._clear_footprint_cache)
         self.model.eventsChanged.connect(self._refresh_profile_events)
         self.model.sectionsChanged.connect(self._refresh_profile_sections)
+        # Overlays follow the persisted analysis, the hazard register and
+        # criterion names (the Insufficient Information filter lists them).
+        overlays_soon = ui_helpers.coalesced(self, self._refresh_profile_overlays)
+        self.model.analysisChanged.connect(overlays_soon)
+        self.model.riskChanged.connect(overlays_soon)
+        self.model.rulesChanged.connect(overlays_soon)
         self.model.inputsChanged.connect(self._refresh_profile)
         self.model.inputsChanged.connect(self._refresh_tab_badges)
         self.topLevelChanged.connect(self._top_level_changed)
+
+        # Project lifecycle: re-resolve the plan file, route and layers
+        # after the project is (re)opened while this dock stays open, and
+        # re-check bathymetry/input availability when layers come and go.
+        self._layers_timer = QTimer(self)
+        self._layers_timer.setSingleShot(True)
+        self._layers_timer.setInterval(300)
+        self._layers_timer.timeout.connect(self._project_layers_changed)
+        project = QgsProject.instance()
+        self._project_hooks = []
+        for signal, slot in ((project.readProject, self._project_reloaded),
+                             (project.layersAdded, self._schedule_layers_check),
+                             (project.layersRemoved, self._schedule_layers_check)):
+            try:
+                signal.connect(slot)
+                self._project_hooks.append((signal, slot))
+            except (AttributeError, TypeError, RuntimeError):
+                pass
 
         self.refresh_plans()
 
@@ -685,10 +709,14 @@ class BurialPlannerDock(QDockWidget):
         set_badge(self.inputs_tab, bool(problems),
                   ("This plan still needs: " + ", ".join(problems) + ".")
                   if problems else "")
-        state = self.model.profile_state() if not problems else "missing"
+        reasons = self.model.profile_stale_reasons() if not problems else []
+        state = ("missing" if problems or self.model.bathy_profile is None
+                 or not self.model.bathy_profile.kps
+                 else ("stale" if reasons else "current"))
         warn_profile = not problems and state != "current"
-        tip = ("The stored bathymetry profile is stale — rebuild it here "
-               "before generating." if state == "stale"
+        tip = ("The stored bathymetry profile is out of date — "
+               + "; ".join(reasons[:3]) + ". Rebuild it here before "
+               "generating." if state == "stale"
                else "No stored bathymetry profile — build it here.")
         set_badge(self.profile_tab, warn_profile, tip)
 
@@ -843,11 +871,14 @@ class BurialPlannerDock(QDockWidget):
             and (rule.get("kind") or "") == "threshold_profile"
             for rule in self.model.rules)
         if needs_profile and self.model.profile_state() != "current":
+            reasons = self.model.profile_stale_reasons()
             QMessageBox.warning(
                 self, "Burial Planner",
                 "Depth/slope exclusions require a current stored bathymetry "
                 "profile. Open Bathymetry Profile, review the sampling "
-                "settings, then click Apply & rebuild profile.")
+                "settings, then click Apply & rebuild profile."
+                + ("\n\nOut of date because:\n• " + "\n• ".join(reasons)
+                   if reasons else ""))
             self.tabs.setCurrentWidget(self.profile_tab)
             return
         stations = params.scope.length_km * 1000.0 / max(params.coarse_step_m, 1.0)
@@ -898,6 +929,11 @@ class BurialPlannerDock(QDockWidget):
         # edited them mid-run.
         self._task_params = params
         self._task_plan_id = self.model.plan_id
+        # The whole stack as it stood at launch (disabled and other-method
+        # criteria included): their "did not fire" is part of the result,
+        # and an edit made while the task runs must show as out of date.
+        self._task_rules = [dict(r) for r in self.model.rules]
+        self._task_basis = self.model.analysis_basis()
         self._task = analysis_task.BurialAnalysisTask(work, self._analysis_finished)
         self._task.progressMessage.connect(self.rules_tab.set_progress)
         self._task.progressMessage.connect(self.builder_tab.analysis_message)
@@ -956,30 +992,34 @@ class BurialPlannerDock(QDockWidget):
         resolved, influence, nodata, warnings = generation.resolve_stack(
             params, acquisitions, depth_at=self.model.depth_at_kp)
         verdicts = resolved.per_method.get(params.method, [])
-        # Per-rule bars show the resolved footprint — extension buffers
-        # included — so what fires on screen is what excludes in the plan.
-        rule_hits: Dict[str, List] = {
-            rule_id: [(iv.start_km, iv.end_km) for iv in intervals]
-            for rule_id, intervals in resolved.rule_hits.items()}
+        # Per-rule bars show the resolved footprint (resolved.rule_hits) —
+        # extension buffers included — so what fires on screen is what
+        # excludes in the plan.
         message = "  ·  ".join(warnings) if warnings else \
-            f"Exclusion stack current over KP " \
+            f"Exclusion stack evaluated over KP " \
             f"{schema.format_kp(params.scope.start_km)}-" \
             f"{schema.format_kp(params.scope.end_km)}."
-        self.rules_tab.set_results(rule_hits, verdicts, message)
+        task_rules = getattr(self, "_task_rules", None) or \
+            [dict(r.rule_row) for r in task.results]
+        # Persisted (bp_analysis) so the fire bars, resolved table and
+        # profile overlays survive closing and reopening the project. The
+        # generation's own context (section derivation) is left alone: the
+        # plan stays built on its last Generate until the next one.
+        analysis_context = generation.ResolutionContext(
+            excluded=[v for v in verdicts if v.status == "excluded"],
+            screening=[v for v in verdicts if v.status == "risk"],
+            influence=list(influence),
+            rule_hits={rule_id: list(intervals) for rule_id, intervals
+                       in resolved.rule_hits.items()},
+            rule_nodata=generation.rule_nodata_map(acquisitions,
+                                                   params.scope))
+        self.model.save_analysis(analysis_context, list(nodata), params,
+                                 task_rules, message, warnings,
+                                 basis=getattr(self, "_task_basis", None))
+        self.rules_tab.set_results(message)
+        self._refresh_profile_overlays()
 
         if not self._generate_after_analysis:
-            # Fire-bar refresh only: update profile overlays from resolution.
-            # User-resolved no-data ranges (skip or burial) are not II —
-            # same subtraction as generation.generate().
-            self.model.context = generation.ResolutionContext(
-                excluded=[v for v in verdicts if v.status == "excluded"],
-                screening=[v for v in verdicts if v.status == "risk"],
-                influence=list(influence),
-                insufficient=generation.unresolved_insufficient(
-                    params, nodata),
-                rule_hits={rule_id: list(intervals) for rule_id, intervals
-                           in resolved.rule_hits.items()})
-            self._refresh_profile_overlays()
             self.builder_tab.analysis_finished("Exclusions recomputed.")
             return
 
@@ -1082,7 +1122,7 @@ class BurialPlannerDock(QDockWidget):
         stored = self.model.bathy_profile
         if stored is not None and stored.kps:
             self._display_stored_profile(
-                stored, params, stale=self.model.profile_state() != "current")
+                stored, params, reasons=self.model.profile_stale_reasons())
             return
         self.profile_status.setText(
             "No stored bathymetry profile — configure and rebuild it on the "
@@ -1091,7 +1131,8 @@ class BurialPlannerDock(QDockWidget):
 
     def _display_stored_profile(self, profile: profile_data.PlanProfile,
                                 params: generation.GenParams,
-                                stale: bool) -> None:
+                                stale: bool = False,
+                                reasons: Optional[List[str]] = None) -> None:
         self.profile.set_profile(profile.samples())
         self.profile.set_slope_window_m(profile.step_m)
         self._set_slope_series(profile, params)
@@ -1103,12 +1144,22 @@ class BurialPlannerDock(QDockWidget):
             text += f", cross ±{profile.cross_offset_m:g} m"
         if date:
             text += f", sampled {date} UTC"
-        if stale:
-            text += ("  —  STALE: route, bathymetry, scope or cross offset "
-                     "changed since sampling. Click Resample profile.")
+        reasons = list(reasons or [])
+        if stale and not reasons:
+            reasons = ["the inputs changed since sampling"]
+        if reasons:
+            # Say exactly what changed — "stale" with no reason left users
+            # guessing whether to trust (or resample) the profile.
+            text += ("  —  OUT OF DATE: " + "; ".join(reasons[:2])
+                     + ("; …" if len(reasons) > 2 else "")
+                     + ". Rebuild on the Bathymetry Profile tab.")
             self.profile_status.setStyleSheet(ui_helpers.status_style("warn"))
+            self.profile_status.setToolTip(
+                "The stored profile no longer matches its inputs:\n• "
+                + "\n• ".join(reasons))
         else:
             self.profile_status.setStyleSheet("")
+            self.profile_status.setToolTip("")
         self.profile_status.setText(text)
         self.profile_tab.refresh()
         self._refresh_tab_badges()
@@ -1167,12 +1218,12 @@ class BurialPlannerDock(QDockWidget):
         end_kp = min(self.model.route.total_length_km,
                      scope.end_km + margin_km)
 
-        # Fingerprints captured before sampling starts: if a bathymetry
-        # file is replaced on disk mid-run (no model signal fires), the
-        # stored profile must not claim currency against data its samples
-        # never came from.
-        self._profile_fingerprints = (self.model.current_rpl_fingerprint(),
-                                      self.model.depth_fingerprint())
+        # Identity captured before sampling starts: if a bathymetry file is
+        # replaced on disk mid-run (no model signal fires), the stored
+        # profile must not claim currency against data its samples never
+        # came from.
+        self.model.invalidate_depth_cache()
+        self._profile_identity = self.model.profile_identity()
         # DepthSnapshot only clones providers/feature sources here.  Contour
         # iteration, indexing and all route sampling happen inside QgsTask.
         snapshot = analysis_task.DepthSnapshot(config, QgsProject.instance())
@@ -1244,26 +1295,34 @@ class BurialPlannerDock(QDockWidget):
             self.profile_tab.refresh()
             return
         params = self.model.gen_params()
-        route_fp, depth_fp = getattr(
-            self, "_profile_fingerprints",
-            (self.model.current_rpl_fingerprint(),
-             self.model.depth_fingerprint()))
+        identity = getattr(self, "_profile_identity", None) or \
+            self.model.profile_identity()
         profile = profile_data.PlanProfile(
             step_m=task.step_m,
             cross_offset_m=task.cross_offset_m,
             scope_start_kp=params.scope.start_km,
             scope_end_kp=params.scope.end_km,
-            route_fingerprint=route_fp,
-            depth_fingerprint=depth_fp,
+            route_fingerprint=identity["route_fingerprint"],
+            depth_fingerprint=identity["depth_fingerprint"],
+            route_geom_fingerprint=identity["route_geom_fingerprint"],
+            depth_layers=identity["depth_layers"],
+            depth_signature=identity["depth_signature"],
+            depth_layer_names=identity["depth_layer_names"],
             sampled_utc=schema.utc_now_iso(),
             kps=task.kps, depths=task.depths,
             source_ids=task.source_ids, cell_sizes_m=task.cell_sizes_m, cross_max_deg=task.cross_max_deg,
             port_depths=task.port_depths, stbd_depths=task.stbd_depths)
         self.model.save_profile(profile)
-        self._display_stored_profile(profile, params, stale=False)
+        self._display_stored_profile(profile, params)
 
     def _refresh_profile_overlays(self) -> None:
-        self.profile.set_overlays(self.model.context)
+        self.profile.set_overlays(self.model.display_context(),
+                                  self._rule_names())
+        self.profile.set_hazards(self.model.hazards)
+
+    def _rule_names(self) -> Dict[str, str]:
+        return {str(r.get("rule_id")): (r.get("name") or "criterion")
+                for r in self.model.rules}
 
     def _refresh_profile_events(self) -> None:
         self.profile.set_events(
@@ -2094,6 +2153,31 @@ class BurialPlannerDock(QDockWidget):
         except Exception:
             pass
 
+    def _schedule_layers_check(self, *_args) -> None:
+        self._layers_timer.start()  # coalesce a project load's burst
+
+    def _project_layers_changed(self) -> None:
+        """Layers were added or removed: bathymetry may have been relinked
+        or gone missing, and registered inputs may resolve differently."""
+        if not self.model.plan:
+            return
+        self.model.invalidate_depth_cache()
+        self.model.inputsChanged.emit()  # inputs table + profile + badges
+
+    def _project_reloaded(self, *_args) -> None:
+        """The project was (re)opened with this dock open: reopen the
+        project's plan file and reload the plan against the new layers."""
+        if getattr(self, "_shutting_down", False):
+            return
+        plan_id = self.model.plan_id
+        self.model.invalidate_depth_cache()
+        self.refresh()
+        if plan_id and plan_id == self.model.plan_id:
+            # Same plan file and plan: reload so route, bathymetry and
+            # inputs resolve against the freshly loaded layers.
+            self.model.workbench_store = self.workbench_store(self.model.plan)
+            self.model.load_plan(plan_id)
+
     def refresh(self) -> None:
         """Re-read the current project's store on every open."""
         saved_path = project_gpkg_path()
@@ -2127,6 +2211,17 @@ class BurialPlannerDock(QDockWidget):
 
     def shutdown(self) -> None:
         """Transient artefacts only — never deletes data or registry rows."""
+        self._shutting_down = True
+        for signal, slot in getattr(self, "_project_hooks", []):
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        self._project_hooks = []
+        try:
+            self._layers_timer.stop()
+        except (AttributeError, RuntimeError):
+            pass
         self._save_window_state()  # unload may bypass closeEvent
         try:
             self._watchdog.stop()

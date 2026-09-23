@@ -21,6 +21,29 @@ from qgis.PyQt.QtWidgets import (
 
 from .. import ui_helpers
 
+# Plain-language guide to the slope panel's four series (the question
+# engineers kept asking: "which slope do I look at?").
+SLOPE_GUIDE_HTML = (
+    "<b>Which slope should I look at?</b>"
+    "<ul style='margin-left:-20px'>"
+    "<li><b>Longitudinal</b> (orange) — pitch along the route, signed: "
+    "+ = up-slope with increasing KP. Use it for up/down-slope limits of the "
+    "burial tool.</li>"
+    "<li><b>Cross tilt</b> (purple) — average side-to-side tilt between the "
+    "port and starboard samples (± the cross offset), signed: + = deeper to "
+    "starboard of travel. Use it for vehicle roll across the track width; a "
+    "symmetric trench reads ~0.</li>"
+    "<li><b>Max local cross</b> (red dotted) — the steepest local side "
+    "slope found between those two points. Only differs from cross tilt "
+    "when the cross offset is several cells wide (set it to the vehicle "
+    "half-track); use it to catch a steep wall inside the track.</li>"
+    "<li><b>Absolute</b> (brown dashed) — the combined gradient magnitude "
+    "(longitudinal and cross together). Use it for 'maximum slope in any "
+    "direction' criteria. It is blank where cross slope has no data.</li>"
+    "</ul>"
+    "Gaps are honest: a slope is left blank rather than bridged across "
+    "missing data or between different surveys.")
+
 
 class ProfileTab(QWidget):
     """Profile sampling controls kept separate from exclusion resolution."""
@@ -98,6 +121,11 @@ class ProfileTab(QWidget):
         self.resolution_label = QLabel("—")
         self.resolution_label.setWordWrap(True)
         settings_form.addRow("Resolved sampling:", self.resolution_label)
+        self.cross_hint = QLabel("")
+        self.cross_hint.setWordWrap(True)
+        self.cross_hint.setStyleSheet(ui_helpers.status_style("warn"))
+        self.cross_hint.setVisible(False)
+        settings_form.addRow(self.cross_hint)
         layout.addWidget(settings_box)
 
         build_box = QGroupBox("Stored plan profile")
@@ -122,6 +150,12 @@ class ProfileTab(QWidget):
         self.rebuild_button.setFont(bold)
         self.rebuild_button.clicked.connect(self._apply_and_rebuild)
         button_row.addWidget(self.rebuild_button)
+        self.recheck_button = QPushButton("Re-check")
+        self.recheck_button.setToolTip(
+            "Check again whether the stored profile still matches the route "
+            "and bathymetry (e.g. after replacing a file on disk).")
+        self.recheck_button.clicked.connect(self._recheck)
+        button_row.addWidget(self.recheck_button)
         button_row.addStretch(1)
         build_layout.addLayout(button_row)
         self.apply_feedback = QLabel("")
@@ -129,6 +163,13 @@ class ProfileTab(QWidget):
         self.apply_feedback.setStyleSheet(ui_helpers.hint_style())
         build_layout.addWidget(self.apply_feedback)
         layout.addWidget(build_box)
+
+        guide_box = QGroupBox("Reading the slope panel")
+        guide_layout = QVBoxLayout(guide_box)
+        guide = QLabel(SLOPE_GUIDE_HTML)
+        guide.setWordWrap(True)
+        guide_layout.addWidget(guide)
+        layout.addWidget(guide_box)
         layout.addStretch(1)
 
         # Unapplied spin edits mark the buttons and survive background
@@ -161,15 +202,23 @@ class ProfileTab(QWidget):
             names = []
             for layer_id in config.raster_layer_ids:
                 layer = project.mapLayer(layer_id)
-                names.append(layer.name() if layer is not None else "missing raster")
-            return f"Raster band {config.raster_band}: " + ", ".join(names)
-        names = []
-        for entry in config.contour_layers:
-            layer = project.mapLayer(entry.get("layer_id") or "")
-            name = layer.name() if layer is not None else "missing contours"
-            field = entry.get("depth_field") or "first field"
-            names.append(f"{name} [{field}]")
-        return "Contours: " + ", ".join(names)
+                names.append(layer.name() if layer is not None
+                              else "⚠ raster not in the project")
+            text = f"Raster band {config.raster_band}: " + ", ".join(names)
+        else:
+            names = []
+            for entry in config.contour_layers:
+                layer = project.mapLayer(entry.get("layer_id") or "")
+                name = layer.name() if layer is not None \
+                    else "⚠ contour layer not in the project"
+                field = entry.get("depth_field") or "first field"
+                names.append(f"{name} [{field}]")
+            text = "Contours: " + ", ".join(names)
+        if self.model.depth_relinks:
+            text += (" — relinked by source to " + ", ".join(
+                self.model.depth_relinks) + " (the saved layer id was not "
+                "in the project; Apply source on Inputs to keep it)")
+        return text
 
     def refresh(self) -> None:
         self._loading = True
@@ -210,17 +259,35 @@ class ProfileTab(QWidget):
                 f"local longitudinal slope baseline {2.0 * resolved_step:g} m; "
                 f"cross-slope span {2.0 * resolved_cross:g} m "
                 f"(±{resolved_cross:g} m).")
+            config = self.model.depth_config()
+            contours_only = bool(config.contour_layers) and \
+                not config.raster_layer_ids
+            if contours_only and params.cross_offset_m <= 0:
+                # Auto = the 5 m contour step: a ±5 m transverse line needs a
+                # contour crossing on each side, which flat seabed never has.
+                self.cross_hint.setText(
+                    f"Contour-only bathymetry with Auto cross offset samples "
+                    f"only ±{resolved_cross:g} m either side: unless the "
+                    "seabed is steep, no contour falls that close and cross/"
+                    "absolute slope come out as no data (Insufficient "
+                    "Information). Enter the burial tool's half-track width "
+                    "(typically 5–25 m) — or hide that criterion's no-data "
+                    "ranges from the profile's Overlays menu.")
+                self.cross_hint.setVisible(True)
+            else:
+                self.cross_hint.setVisible(False)
 
-            state = self.model.profile_state()
+            reasons = self.model.profile_stale_reasons()
             profile = self.model.bathy_profile
+            state = ("missing" if profile is None or not profile.kps
+                     else ("stale" if reasons else "current"))
             if state == "missing":
                 state_text = "No stored profile. Apply settings and rebuild it."
                 style = ui_helpers.status_style("error")
             elif state == "stale":
                 state_text = (
-                    "Stored profile is stale because its route, scope, source, "
-                    "resolution or cross offset differs from the current setup. "
-                    "Rebuild before generating exclusions.")
+                    "The stored profile is out of date — rebuild before "
+                    "generating exclusions:\n• " + "\n• ".join(reasons))
                 style = ui_helpers.status_style("warn")
             else:
                 state_text = (
@@ -288,6 +355,16 @@ class ProfileTab(QWidget):
         elif saved:
             self.apply_feedback.setText("Settings applied.")
         self.refresh()
+
+    def _recheck(self) -> None:
+        self.model.invalidate_depth_cache()
+        self.apply_feedback.setText("Checked against the current route and "
+                                    "bathymetry.")
+        self.refresh()
+        try:
+            self.dock._refresh_profile()
+        except (AttributeError, RuntimeError):
+            pass
 
     def _apply_and_rebuild(self) -> None:
         if self._save_settings() is not False:

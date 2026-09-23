@@ -9,7 +9,10 @@ config. Screening rules draw in the risk palette and are captioned
 "flags for assessment — does not exclude".
 
 Fire-bar recompute runs in the background through the dock's analysis task
-with per-rule caching — no modal dialogs.
+with per-rule caching — no modal dialogs. The latest result is persisted
+per plan (``bp_analysis``) so the bars, coverage and resolved table survive
+reopening the project; criteria whose settings changed since that run are
+drawn faded with a dashed outline and marked "(out of date)".
 """
 
 from __future__ import annotations
@@ -50,6 +53,7 @@ from ...qgis_compat import (
     BUTTON_BOX_OK,
     CONTEXT_MENU_POLICY_CUSTOM,
     DIALOG_ACCEPTED,
+    HEADER_RESIZE_MODE_CONTENTS,
     HEADER_RESIZE_MODE_STRETCH,
     ITEM_DATA_USER_ROLE,
     MESSAGE_BOX_NO,
@@ -61,9 +65,16 @@ from ...qgis_compat import (
     qt_exec,
 )
 from ...workbench import schema as wb_schema
-from ...workbench.kp_bars import ACTION_COLORS, FireBarDelegate, VerdictStrip
+from ...workbench.kp_bars import (
+    ACTION_COLORS,
+    FireBarDelegate,
+    FireBarHover,
+    VerdictStrip,
+    intervals_at,
+    intervals_by_distance,
+)
 from ...workbench.rules_engine import STATUS_EXCLUDED, STATUS_RISK
-from .. import change_log, generation, profile_data, schema
+from .. import analysis_state, change_log, generation, profile_data, schema
 from .. import ui_helpers
 from .attribute_widgets import (
     AttributeRulesTable,
@@ -1050,8 +1061,9 @@ class RulesTab(QWidget):
         self._loading = False
         self._loaded_plan_id: Optional[str] = None
         self._params_dirty = False  # unapplied Sample-step/Sliver edits
-        self._last_results: Dict[str, List] = {}   # rule_id -> [(s, e), ...]
-        self._last_verdicts: List = []
+        # Transient status (progress, export confirmations); when empty the
+        # status line describes the stored run and what changed since.
+        self._transient_status = ""
         # Debounce enable-checkbox toggles: several quick toggles trigger
         # one recompute instead of queuing one per click.
         self._recompute_timer = QTimer(self)
@@ -1075,10 +1087,26 @@ class RulesTab(QWidget):
         # Extended selection so several criteria can be deleted at once;
         # Edit / move act on the current row.
         self.rule_table.setSelectionMode(SELECTION_MODE_EXTENDED)
-        self.rule_table.setItemDelegateForColumn(FIRE_COL, FireBarDelegate(self.rule_table))
+        self._fire_delegate = FireBarDelegate(self.rule_table)
+        self.rule_table.setItemDelegateForColumn(FIRE_COL, self._fire_delegate)
+        # Hover a bar: one KP line across every criterion's bar plus a
+        # tooltip naming the KP and the range(s) under it.
+        self._fire_hover = FireBarHover(self.rule_table, FIRE_COL,
+                                        self._fire_delegate,
+                                        self._fire_tooltip)
         header = self.rule_table.horizontalHeader()
+        # On/Coverage size to their contents so "12.345 km · 12.34 %" is
+        # never clipped; the name and the bar share the remaining width.
+        header.setSectionResizeMode(0, HEADER_RESIZE_MODE_CONTENTS)
         header.setSectionResizeMode(1, HEADER_RESIZE_MODE_STRETCH)
         header.setSectionResizeMode(FIRE_COL, HEADER_RESIZE_MODE_STRETCH)
+        header.setSectionResizeMode(3, HEADER_RESIZE_MODE_CONTENTS)
+        coverage_header = self.rule_table.horizontalHeaderItem(3)
+        if coverage_header is not None:
+            coverage_header.setToolTip(
+                "Length and share of the scope where the criterion fired "
+                "(resolved, extension buffers included). \"no data\" is the "
+                "length it could not evaluate (Insufficient Information).")
         self.rule_table.itemChanged.connect(self._on_item_changed)
         self.rule_table.doubleClicked.connect(lambda _index: self._edit_rule())
         self.rule_table.setContextMenuPolicy(CONTEXT_MENU_POLICY_CUSTOM)
@@ -1252,6 +1280,8 @@ class RulesTab(QWidget):
         refresh_soon = ui_helpers.coalesced(self, self.refresh)
         model.planChanged.connect(refresh_soon)
         model.rulesChanged.connect(refresh_soon)
+        model.inputsChanged.connect(refresh_soon)
+        model.analysisChanged.connect(refresh_soon)
         self.refresh()
 
     # -- refresh --------------------------------------------------------------
@@ -1263,10 +1293,8 @@ class RulesTab(QWidget):
             # plan that was open before — never show or apply them here.
             self._loaded_plan_id = self.model.plan_id
             self._recompute_timer.stop()
-            self._last_results = {}
-            self._last_verdicts = []
             self._params_dirty = False
-            self.status_label.setText("")
+            self._transient_status = ""
         self._loading = True
         try:
             plan = self.model.plan
@@ -1281,6 +1309,11 @@ class RulesTab(QWidget):
             scope = params.scope
             domain_km = scope.length_km if plan else 0.0
             rule_hits = self._current_rule_hits()
+            rule_nodata = self._current_rule_nodata()
+            status = self.model.analysis_status() if plan else {
+                "source": "none", "rule_state": {}, "reasons": []}
+            self._analysis_status = status
+            everything_stale = bool(status.get("reasons"))
             for i, rule in enumerate(rules):
                 on_item = QTableWidgetItem()
                 on_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
@@ -1312,7 +1345,13 @@ class RulesTab(QWidget):
 
                 fire_item = QTableWidgetItem()
                 fire_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-                intervals = rule_hits.get(str(rule.get("rule_id")), [])
+                rule_id = str(rule.get("rule_id"))
+                intervals = rule_hits.get(rule_id, [])
+                nodata = [] if is_coverage else rule_nodata.get(rule_id, [])
+                state = status["rule_state"].get(
+                    rule_id, analysis_state.STATE_NONE)
+                stale = bool(intervals or nodata) and (
+                    everything_stale or state == analysis_state.STATE_CHANGED)
                 if is_coverage:
                     # The bar shows where data is MISSING — draw it in the
                     # Insufficient Information grey, not an exclusion red.
@@ -1323,23 +1362,43 @@ class RulesTab(QWidget):
                     color = ACTION_COLORS.get(rule.get("action") or "",
                                               QColor("#888"))
                 fire_item.setData(ITEM_DATA_USER_ROLE,
-                                  (domain_km, intervals, color, scope.start_km))
+                                  (domain_km, intervals, color, scope.start_km,
+                                   {"stale": stale, "nodata": nodata}))
                 self.rule_table.setItem(i, FIRE_COL, fire_item)
 
                 covered = sum(e - s for s, e in intervals)
                 pct = 100.0 * covered / domain_km if domain_km > 0 else 0.0
-                computed = bool(rule_hits) or bool(self._current_verdicts())
+                missing = sum(e - s for s, e in nodata)
+                evaluated = state in (analysis_state.STATE_CURRENT,
+                                      analysis_state.STATE_CHANGED)
                 if intervals:
-                    coverage_text = f"{covered:.3f} km · {pct:.2f}%"
-                    coverage_tip = ""
-                elif computed and int(rule.get("enabled") or 0):
+                    coverage_text = f"{covered:.3f} km · {pct:.1f}%"
+                    coverage_tip = (f"Fired over {covered:.3f} km "
+                                    f"({pct:.2f}% of the scope) in "
+                                    f"{len(intervals)} range(s).")
+                elif evaluated and int(rule.get("enabled") or 0):
                     coverage_text = "none"
                     coverage_tip = ("Evaluated — this criterion fired "
                                     "nowhere in the scope.")
+                elif not int(rule.get("enabled") or 0):
+                    coverage_text = "off"
+                    coverage_tip = "Disabled — not part of the stack."
                 else:
                     coverage_text = "—"
                     coverage_tip = ("Not evaluated yet — run Recompute "
                                     "(or enable the criterion).")
+                if missing > 1e-9:
+                    coverage_text += f" · no data {missing:.3f} km"
+                    coverage_tip += (f"\nNo data over {missing:.3f} km "
+                                     "(grey on the bar) — Insufficient "
+                                     "Information for this criterion.")
+                if stale:
+                    coverage_text += " (out of date)"
+                    coverage_tip += ("\nOut of date: " + (
+                        "changed " + ", ".join(status["reasons"])
+                        if everything_stale else
+                        "this criterion's settings or input changed")
+                        + " since the last run — Recompute to update.")
                 coverage_item = QTableWidgetItem(coverage_text)
                 if coverage_tip:
                     coverage_item.setToolTip(coverage_tip)
@@ -1347,6 +1406,7 @@ class RulesTab(QWidget):
                 self.rule_table.setItem(i, 3, coverage_item)
             self._refresh_overview()
             self._refresh_resolved()
+            self._refresh_status_line()
         finally:
             self._loading = False
         if plan_switched:
@@ -1354,12 +1414,58 @@ class RulesTab(QWidget):
             # (or clear it when the preview toggle is off).
             self._refresh_map_preview()
 
+    def _refresh_status_line(self) -> None:
+        """The transient message, else a description of the stored run."""
+        if self._transient_status:
+            self.status_label.setText(self._transient_status)
+            self.status_label.setStyleSheet("")
+            return
+        status = getattr(self, "_analysis_status", None) or {}
+        source = status.get("source") or "none"
+        if not self.model.plan or source == "none":
+            self.status_label.setText(
+                "Not evaluated yet — Recompute evaluates the stack." if
+                self.model.plan and self.model.rules else "")
+            self.status_label.setStyleSheet("")
+            return
+        when = analysis_state.format_utc(status.get("run_utc") or "")
+        text = ("Showing the last recompute" if source == "recompute"
+                else "Showing the last Generate")
+        if when:
+            text += f" ({when})"
+        text += "."
+        changed = [rid for rid, state in (status.get("rule_state") or {}).items()
+                   if state in (analysis_state.STATE_CHANGED,
+                                analysis_state.STATE_NEW)
+                   and any(str(r.get("rule_id")) == rid
+                           and int(r.get("enabled") or 0)
+                           for r in self.model.rules)]
+        kind = ""
+        if status.get("reasons"):
+            text += (" Out of date — " + ", ".join(status["reasons"])
+                     + " changed since. Click Recompute.")
+            kind = "warn"
+        elif changed:
+            text += (f" {len(changed)} criterion/criteria changed or added "
+                     "since — click Recompute.")
+            kind = "warn"
+        warnings = status.get("warnings") or []
+        if warnings:
+            text += f"  ·  {len(warnings)} warning(s): " + "  ·  ".join(
+                warnings[:2]) + ("  ·  …" if len(warnings) > 2 else "")
+            kind = kind or "warn"
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(ui_helpers.status_style(kind)
+                                        if kind else "")
+
+    def _set_transient(self, text: str) -> None:
+        self._transient_status = text or ""
+        self._refresh_status_line()
+
     def _current_verdicts(self) -> List:
-        """Resolved verdicts: the latest recompute, else the stored plan
-        context (so the overview and tools work right after reopening)."""
-        if self._last_verdicts:
-            return self._last_verdicts
-        context = getattr(self.model, "context", None)
+        """Resolved verdicts of the displayed run (the latest recompute,
+        persisted; else the last Generate)."""
+        context = self.model.display_context()
         if context is None:
             return []
         merged = list(context.excluded) + list(context.screening)
@@ -1367,14 +1473,45 @@ class RulesTab(QWidget):
         return merged
 
     def _current_rule_hits(self) -> Dict[str, List]:
-        """Per-rule resolved intervals: the latest recompute, else the stored
-        plan context (so fire bars and coverage survive reopening)."""
-        if self._last_results:
-            return self._last_results
-        context = getattr(self.model, "context", None)
+        """Per-rule resolved intervals of the displayed run."""
+        context = self.model.display_context()
         stored = getattr(context, "rule_hits", None) or {}
         return {rule_id: [(iv.start_km, iv.end_km) for iv in intervals]
                 for rule_id, intervals in stored.items()}
+
+    def _current_rule_nodata(self) -> Dict[str, List]:
+        context = self.model.display_context()
+        stored = getattr(context, "rule_nodata", None) or {}
+        return {rule_id: [(iv.start_km, iv.end_km) for iv in intervals]
+                for rule_id, intervals in stored.items()}
+
+    def _fire_tooltip(self, row: int, kp: float, px_km: float) -> str:
+        """Hover text for a criterion's bar at ``kp``."""
+        if row >= len(self.model.rules):
+            return f"KP {kp:.3f}"
+        rule = self.model.rules[row]
+        rule_id = str(rule.get("rule_id"))
+        lines = [f"KP {kp:.3f} — {rule.get('name') or 'criterion'}"]
+        # One pixel of tolerance so hairline ranges are hoverable.
+        tol = max(px_km, 0.0)
+        hits = intervals_at(self._current_rule_hits().get(rule_id, []), kp, tol)
+        for lo, hi in hits[:3]:
+            lines.append(f"Fired: KP {lo:.3f}–{hi:.3f} ({hi - lo:.3f} km)")
+        gaps = intervals_at(self._current_rule_nodata().get(rule_id, []), kp,
+                            tol)
+        for lo, hi in gaps[:2]:
+            lines.append(f"No data: KP {lo:.3f}–{hi:.3f} ({hi - lo:.3f} km)")
+        if not hits and not gaps:
+            nearest = intervals_by_distance(
+                self._current_rule_hits().get(rule_id, []), kp)
+            if nearest:
+                distance, lo, hi = nearest[0]
+                lines.append(f"Clear here — nearest range KP {lo:.3f}–"
+                             f"{hi:.3f}, {distance * 1000:.0f} m away")
+            else:
+                lines.append("Clear here")
+        lines.append("Right-click for the ranges nearest this KP.")
+        return "\n".join(lines)
 
     def _refresh_overview(self) -> None:
         params = self.model.gen_params()
@@ -1385,22 +1522,22 @@ class RulesTab(QWidget):
         for verdict in self._current_verdicts():
             color = STATUS_COLORS.get(verdict.status)
             if color is not None and verdict.status in (STATUS_EXCLUDED, STATUS_RISK):
-                spans.append((verdict.start_km, verdict.end_km, color))
+                label = ("Excluded" if verdict.status == STATUS_EXCLUDED
+                         else "Flagged (screening)")
+                spans.append((verdict.start_km, verdict.end_km, color, label))
         method_label = schema.METHOD_LABELS.get(self.model.method, self.model.method)
         self.overview.set_spans(scope.length_km, spans, method_label,
                                 domain_start_km=scope.start_km)
 
-    def set_results(self, rule_hits: Dict[str, List], verdicts: List,
-                    message: str = "") -> None:
-        """Called by the dock when a background analysis lands."""
-        self._last_results = rule_hits
-        self._last_verdicts = verdicts
-        self.status_label.setText(message)
+    def set_results(self, message: str = "") -> None:
+        """Called by the dock when a background analysis lands (the results
+        themselves are already persisted on the model)."""
+        self._transient_status = ""
         self.refresh()
         self._refresh_map_preview()
 
     def set_progress(self, message: str) -> None:
-        self.status_label.setText(message)
+        self._set_transient(message)
 
     # -- analysis lifecycle (driven by the dock) -------------------------------
     def analysis_started(self) -> None:
@@ -1411,6 +1548,18 @@ class RulesTab(QWidget):
     def analysis_finished(self) -> None:
         self.recompute_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+        # Stopped / failed runs leave their last progress message; clear it
+        # after a moment so the stored-run description returns.
+        if self._transient_status:
+            QTimer.singleShot(4000, lambda m=self._transient_status:
+                              self._expire_transient(m))
+
+    def _expire_transient(self, message: str) -> None:
+        try:
+            if self._transient_status == message:
+                self._set_transient("")
+        except RuntimeError:  # widget already deleted
+            pass
 
     # -- map preview / excluded sections --------------------------------------
     def _refresh_map_preview(self, _checked=None) -> None:
@@ -1426,10 +1575,6 @@ class RulesTab(QWidget):
             elif verdict.status == STATUS_RISK:
                 spans.append((verdict.start_km, verdict.end_km, flagged))
         self.dock.set_exclusion_preview(spans)
-        if spans:
-            self.status_label.setText(
-                f"Previewing {len(spans)} Exclusion Area / flagged range(s) "
-                "on the map.")
 
     def _rule_context_menu(self, position) -> None:
         item = self.rule_table.itemAt(position)
@@ -1441,17 +1586,32 @@ class RulesTab(QWidget):
             return
         rule = self.model.rules[row]
         intervals = self._current_rule_hits().get(str(rule.get("rule_id")), [])
+        # Right-click on the bar: ranges nearest the clicked KP first (the
+        # one under the cursor is marked); elsewhere in the row: KP order.
+        hit = self._fire_hover.kp_at(position)
         menu = QMenu(self)
         edit_action = menu.addAction("Edit criterion…")
         delete_action = menu.addAction("Delete criterion")
         goto_actions = {}
         if intervals:
             menu.addSeparator()
-            shown = intervals[:20]
-            for start_km, end_km in shown:
-                action = menu.addAction(
-                    f"Go to KP {start_km:.3f}-{end_km:.3f} "
-                    f"({(end_km - start_km):.3f} km)")
+            if hit is not None:
+                _row, click_kp, px_km = hit
+                ordered = intervals_by_distance(intervals, click_kp)
+                header = menu.addAction(
+                    f"Ranges nearest KP {click_kp:.3f}:")
+                header.setEnabled(False)
+            else:
+                ordered = [(None, s, e) for s, e in intervals]
+                px_km = 0.0
+            shown = ordered[:20]
+            for distance, start_km, end_km in shown:
+                label = (f"Go to KP {start_km:.3f}-{end_km:.3f} "
+                         f"({(end_km - start_km):.3f} km)")
+                if distance is not None:
+                    label += ("  ◀ at cursor" if distance <= px_km
+                              else f"  · {distance * 1000:,.0f} m away")
+                action = menu.addAction(label)
                 goto_actions[action] = (start_km, end_km)
             more_action = None
             if len(intervals) > len(shown):
@@ -1594,7 +1754,7 @@ class RulesTab(QWidget):
             writer = csv.writer(handle)
             writer.writerow(headers)
             writer.writerows(rows)
-        self.status_label.setText(f"Exported {len(rows)} resolved range(s).")
+        self._set_transient(f"Exported {len(rows)} resolved range(s).")
 
     # -- edits ----------------------------------------------------------------
     def _selected_index(self) -> int:
@@ -1644,7 +1804,7 @@ class RulesTab(QWidget):
     def _duplicate_rule(self) -> None:
         index = self._selected_index()
         if index < 0 or index >= len(self.model.rules):
-            self.status_label.setText("Select a criterion to duplicate.")
+            self._set_transient("Select a criterion to duplicate.")
             return
         copy = dict(self.model.rules[index])
         copy["rule_id"] = schema.new_id()
@@ -1659,7 +1819,7 @@ class RulesTab(QWidget):
         indices = [i for i in self._selected_indices()
                    if i < len(self.model.rules)]
         if not indices:
-            self.status_label.setText("Select the criteria to delete.")
+            self._set_transient("Select the criteria to delete.")
             return
         names = [self.model.rules[i].get("name") or "criterion"
                  for i in indices]
@@ -1796,7 +1956,7 @@ class RulesTab(QWidget):
             })
         imported, skipped = self._dedupe_imported(imported)
         if not imported:
-            self.status_label.setText(
+            self._set_transient(
                 "Nothing imported — every criterion in the rule set is "
                 "already in the stack.")
             return
@@ -1805,7 +1965,7 @@ class RulesTab(QWidget):
         message = f"Imported {len(imported)} criteria from the Assessment."
         if skipped:
             message += f"  Skipped {skipped} identical duplicate(s)."
-        self.status_label.setText(message)
+        self._set_transient(message)
         self._recompute()
 
     def _export_json(self) -> None:
@@ -1824,7 +1984,7 @@ class RulesTab(QWidget):
         }
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
-        self.status_label.setText(f"Exported {len(self.model.rules)} criteria.")
+        self._set_transient(f"Exported {len(self.model.rules)} criteria.")
 
     def _import_json(self) -> None:
         path, _filter = QFileDialog.getOpenFileName(
@@ -1852,7 +2012,7 @@ class RulesTab(QWidget):
             imported.append(row)
         imported, skipped = self._dedupe_imported(imported)
         if not imported:
-            self.status_label.setText(
+            self._set_transient(
                 "Nothing imported — every criterion in the file is already "
                 "in the stack." if skipped else
                 "The file contains no criteria.")
@@ -1862,5 +2022,5 @@ class RulesTab(QWidget):
         message = f"Imported {len(imported)} criteria."
         if skipped:
             message += f"  Skipped {skipped} identical duplicate(s)."
-        self.status_label.setText(message)
+        self._set_transient(message)
         self._recompute()

@@ -555,3 +555,51 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   expression rule as never firing; the polygon rule's `match_values` stays
   the simple path and `match_rules` / `match_expression` are additive, so
   no schema bump and no migration.
+
+## Persisted analysis, profile identity, KP-range targets (schema v10)
+
+- **The latest Exclusions recompute and Risk scans live in `bp_analysis`
+  (one row per plan), not in `bp_generation` or `params_json`.** They are
+  derived display state: writing them into the plan would change-log every
+  recompute and bump the plan's modified time; writing a generation row
+  would make a recompute look like a Generate. Not change-logged, not
+  copied by Duplicate (like generations), deleted with the plan.
+- **Display vs derivation.** `PlanModel.context` stays the resolution the
+  plan was generated from (section derivation on manual edits);
+  `display_context()` is the latest recompute when stored. Before this, a
+  recompute overwrote `context` in memory only, so edits derived sections
+  from a different stack until the plan was reopened.
+- **Currency is fingerprinted per criterion / per check** (kind, action,
+  class, methods, config, the registered input it reads and — for depth /
+  slope criteria — the stored profile's sample time) plus a named global
+  part (scope, direction, method, sample step, sliver, refinement, route
+  geometry). Names, notes and order are excluded so renaming never flags a
+  result. Feature edits inside an input layer are *not* detected (hashing
+  every input on each refresh is too slow); tooltips say to Recompute after
+  editing inputs. Plans generated before v10 are judged against the
+  generation's own frozen rule stack and parameters.
+- **Profile identity is content-based.** Route = hash of the RouteFrame's
+  WGS84 geometry at 7 dp. Bathymetry = per layer (normalised source +
+  `gpkg_contents.last_change` for GeoPackage tables / newest of .shp+.dbf
+  / file mtime, feature count, depth conventions), keyed by source not
+  layer id so a re-added layer matches. The v1 fingerprint is kept only to
+  recognise profiles sampled before v2 (no mass "stale" on upgrade).
+  Installation-path results that depend on bathymetry reuse the same
+  fingerprint and are likewise also judged by the v1 formula, so they do
+  not flip to stale on upgrade.
+- **Bathymetry layers are relinked by source in memory** when their saved id
+  is gone; the Inputs tab offers to save the relink rather than rewriting
+  the plan silently on load.
+- **Target burial depth by KP range is stored in `params_json`**
+  (`target_burial_ranges`) beside the existing `target_burial_m` default —
+  no schema change. Ranges may not overlap (a KP has one target). The
+  target stays informational for generation: exclusions decide where to
+  bury; the target describes how deep, feeding the ground model, Plan
+  Builder column, CSV and report. The reserved per-section
+  `target_burial_m` column is left untouched for a future per-section
+  override.
+- **Hiding Insufficient Information on the profile is display-only.** The
+  per-criterion no-data (`rule_nodata`) is recorded so the profile can say
+  *which* criterion lacked data and filter by it; changing what the plan
+  treats as Insufficient Information remains a Plan Builder decision
+  (resolve as skip/burial), keeping the audit trail in the change log.

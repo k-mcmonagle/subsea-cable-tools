@@ -100,13 +100,266 @@ def layer_fingerprint(layer: Optional[QgsMapLayer]) -> str:
     return f"{source}|{suffix}|{stamp}|{count}"
 
 
+# -- bathymetry content fingerprints ------------------------------------------
+#
+# v2 (content-based). The v1 formula below keyed layers by project layer id
+# and stamped them with the whole file's modification time, so a correctly
+# sampled profile went STALE when another table in the same GeoPackage was
+# edited, when a layer was re-added (new id), or when the project was
+# reopened from elsewhere. v2 identifies each layer by its normalised source
+# and stamps it with what actually describes its content:
+#   GeoPackage table   gpkg_contents.last_change of *that* table
+#   shapefile          newest of .shp / .dbf modification times
+#   other files        the file modification time
+# plus feature count and the sampling conventions (vertical/units/datum…).
+
+DEPTH_FP_VERSION = "depth-v2"
+
+
+def _gpkg_table_parts(layer) -> Tuple[str, str]:
+    """(gpkg path, table) for a GeoPackage-backed layer, else ("", "")."""
+    source = str(layer.source() or "")
+    if source.upper().startswith("GPKG:"):
+        # GDAL raster: GPKG:<path>:<table> (the path may contain a drive
+        # letter colon, so split from the right).
+        body = source[5:]
+        path, _sep, table = body.rpartition(":")
+        return (path, table) if path.lower().endswith(".gpkg") else ("", "")
+    parts = source.split("|")
+    path = parts[0]
+    if not path.lower().endswith(".gpkg"):
+        return "", ""
+    for part in parts[1:]:
+        key, sep, value = part.partition("=")
+        if sep and key.strip().lower() == "layername":
+            return path, value.strip()
+    return path, ""
+
+
+def _gpkg_last_change(path: str, table: str) -> str:
+    """``gpkg_contents.last_change`` for one table (read-only, never locks
+    the file for writers); "" when unavailable."""
+    import sqlite3
+    from urllib.request import pathname2url
+
+    if not path or not table or not os.path.exists(path):
+        return ""
+    try:
+        uri = "file:" + pathname2url(os.path.abspath(path)) + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+    except sqlite3.Error:
+        return ""
+    try:
+        row = conn.execute(
+            "SELECT last_change FROM gpkg_contents WHERE table_name = ?",
+            (table,)).fetchone()
+        return str(row[0]) if row and row[0] else ""
+    except sqlite3.Error:
+        return ""
+    finally:
+        conn.close()
+
+
+def layer_content_stamp(layer: Optional[QgsMapLayer]) -> str:
+    """What changes when the layer's *content* changes (see v2 notes)."""
+    if layer is None:
+        return ""
+    path, table = _gpkg_table_parts(layer)
+    if path and table:
+        stamp = _gpkg_last_change(path, table)
+        if stamp:
+            return "gpkg:" + stamp
+    path = path or str(layer.source()).split("|")[0]
+    candidates = [path]
+    if path.lower().endswith(".shp"):
+        candidates.append(path[:-4] + ".dbf")
+    stamps = []
+    for candidate in candidates:
+        try:
+            if os.path.exists(candidate):
+                stamps.append(int(os.path.getmtime(candidate)))
+        except OSError:
+            continue
+    return f"mtime:{max(stamps)}" if stamps else ""
+
+
+def source_identity(source: str) -> str:
+    """Session-independent identity of a provider source string:
+    normalised path (+ ``|layername=…`` style suffix / GPKG raster table)."""
+    source = str(source or "")
+    if not source:
+        return ""
+    if source.upper().startswith("GPKG:"):
+        path, _sep, table = source[5:].rpartition(":")
+        if path.lower().endswith(".gpkg"):
+            return f"GPKG:{normalised_path(path)}:{table}"
+        return source
+    head = normalised_path(source.split("|")[0])
+    suffix = "|".join(source.split("|")[1:])
+    return f"{head}|{suffix}" if suffix else head
+
+
+def layer_identity(layer: Optional[QgsMapLayer]) -> str:
+    """Session-independent identity: normalised source path + suffix."""
+    if layer is None:
+        return ""
+    return source_identity(str(layer.source() or ""))
+
+
+def find_layer_by_source(project: Optional[QgsProject], source: str,
+                         want_raster: Optional[bool] = None
+                         ) -> Optional[QgsMapLayer]:
+    """A valid project layer with the same source identity, if any."""
+    wanted = source_identity(source)
+    if not wanted:
+        return None
+    project = project or QgsProject.instance()
+    for layer in project.mapLayers().values():
+        if want_raster is not None and (
+                isinstance(layer, QgsRasterLayer) != want_raster):
+            continue
+        if layer_identity(layer) == wanted and layer.isValid():
+            return layer
+    return None
+
+
+def relink_depth_config(project: Optional[QgsProject], data: Dict
+                        ) -> Tuple[Dict, List[str]]:
+    """Point stale bathymetry layer ids at project layers with the stored
+    source. Returns ``(config dict, relink notes)``; ``data`` is untouched.
+
+    Sources ride in the config as ``raster_sources`` (parallel to
+    ``raster_layer_ids``) and ``contour_layers[i]["source"]``; configs saved
+    before they existed cannot be relinked (their ids are used as-is).
+    """
+    project = project or QgsProject.instance()
+    out = dict(data or {})
+    notes: List[str] = []
+    ids = [str(i) for i in (out.get("raster_layer_ids") or [])
+           if isinstance(i, str)]
+    sources = [s if isinstance(s, str) else ""
+               for s in (out.get("raster_sources") or [])]
+    for index, layer_id in enumerate(ids):
+        if project.mapLayer(layer_id) is not None:
+            continue
+        source = sources[index] if index < len(sources) else ""
+        layer = find_layer_by_source(project, source, want_raster=True)
+        if layer is not None:
+            ids[index] = layer.id()
+            notes.append(f"raster '{layer.name()}'")
+    out["raster_layer_ids"] = ids
+    contours = []
+    for entry in out.get("contour_layers") or []:
+        if not isinstance(entry, dict):
+            continue  # corrupt entry: skip rather than break every refresh
+        entry = dict(entry)
+        if project.mapLayer(entry.get("layer_id") or "") is None:
+            layer = find_layer_by_source(project, entry.get("source") or "",
+                                         want_raster=False)
+            if layer is not None:
+                entry["layer_id"] = layer.id()
+                notes.append(f"contours '{layer.name()}'")
+        contours.append(entry)
+    out["contour_layers"] = contours
+    return out, notes
+
+
+def depth_layer_names(project: Optional[QgsProject], depth_config
+                      ) -> Dict[str, str]:
+    """``{layer identity: layer name}`` for the configured (unexpanded)
+    bathymetry layers — labels for stale reasons."""
+    project = project or QgsProject.instance()
+    names: Dict[str, str] = {}
+    ids = list(depth_config.raster_layer_ids) + [
+        e.get("layer_id", "") for e in depth_config.contour_layers]
+    for layer_id in ids:
+        layer = project.mapLayer(layer_id or "")
+        if layer is not None:
+            names[layer_identity(layer)] = layer.name()
+    return names
+
+
+def depth_layer_fingerprints(project: Optional[QgsProject], depth_config
+                             ) -> Dict[str, str]:
+    """``{layer identity: content fingerprint}`` of every configured
+    bathymetry layer; a configured layer that cannot be found maps
+    ``"missing:<id>"`` to "" so a missing layer is reported, not ignored.
+    Never raises (a broken mosaic manifest becomes an ``error:`` entry)."""
+    from ..bathymetry_sampling import layer_options, expand_rasters
+    import json
+
+    project = project or QgsProject.instance()
+    out: Dict[str, str] = {}
+    rasters = []
+    for layer_id in depth_config.raster_layer_ids:
+        layer = project.mapLayer(layer_id)
+        if layer is None:
+            out[f"missing:{layer_id}"] = ""
+        else:
+            rasters.append(layer)
+    try:
+        layers = expand_rasters(rasters)
+    except Exception as exc:  # missing native mosaic sources, bad manifest
+        out[f"error:{exc}"] = ""
+        layers = []
+    for entry in depth_config.contour_layers:
+        layer = project.mapLayer(entry.get("layer_id", ""))
+        if layer is None:
+            out[f"missing:{entry.get('layer_id', '')}"] = ""
+        else:
+            layers.append(layer)
+    for layer in layers:
+        count = ""
+        if isinstance(layer, QgsVectorLayer):
+            try:
+                value = int(layer.featureCount())
+                count = str(value) if value >= 0 else ""
+            except Exception:
+                count = ""
+        out[layer_identity(layer)] = "|".join([
+            layer_content_stamp(layer), count,
+            json.dumps(layer_options(layer), sort_keys=True)])
+    return out
+
+
+def depth_config_signature(depth_config) -> str:
+    """The non-layer part of the bathymetry configuration."""
+    import json
+
+    fields = [str(e.get("depth_field") or "") for e in depth_config.contour_layers]
+    return "|".join([str(depth_config.mode), str(depth_config.raster_band),
+                     json.dumps(fields)])
+
+
 def depth_config_fingerprint(project: Optional[QgsProject], depth_config) -> str:
     """Combined content fingerprint of every configured bathymetry layer.
 
-    One formula shared by threshold-rule cache keys and the persisted plan
-    profile's currency check, so "the samples are current" and "the rule
-    cache is current" can never disagree.
+    One formula shared by threshold-rule cache keys, installation paths and
+    the persisted plan profile's currency check, so "the samples are
+    current" and "the rule cache is current" can never disagree.
     """
+    from ..bathymetry_sampling import VERSION
+
+    layers = depth_layer_fingerprints(project, depth_config)
+    return "|".join([DEPTH_FP_VERSION, VERSION,
+                     depth_config_signature(depth_config)] +
+                    [f"{key}={value}" for key, value in sorted(layers.items())])
+
+
+def legacy_depth_config_fingerprint(project: Optional[QgsProject],
+                                    depth_config) -> str:
+    """The v1 fingerprint — only to recognise profiles sampled before v2
+    as current (so upgrading does not mark every stored profile stale).
+    Never raises."""
+    try:
+        return _legacy_depth_config_fingerprint(project, depth_config)
+    except Exception:
+        return ""
+
+
+def _legacy_depth_config_fingerprint(project: Optional[QgsProject],
+                                     depth_config) -> str:
+    """v1: layer ids + whole-file mtimes (kept verbatim for comparison)."""
     from ..bathymetry_sampling import layer_options, expand_rasters, VERSION
     import json
     project = project or QgsProject.instance()
@@ -130,8 +383,12 @@ def min_raster_cell_size_m(project: Optional[QgsProject], depth_config
     from ..bathymetry_sampling import native_cell_m, expand_rasters
     project = project or QgsProject.instance()
     layers = [project.mapLayer(i) for i in depth_config.raster_layer_ids]
-    return min((native_cell_m(l) for l in expand_rasters(
-        [l for l in layers if isinstance(l,QgsRasterLayer) and l.isValid()])), default=None)
+    try:
+        expanded = expand_rasters(
+            [l for l in layers if isinstance(l, QgsRasterLayer) and l.isValid()])
+    except Exception:  # unreadable mosaic manifest / missing native source
+        return None
+    return min((native_cell_m(l) for l in expanded), default=None)
 
 
 def rpl_fingerprint(rpl_row: Optional[Dict], gpkg_path: str = "") -> str:
@@ -144,6 +401,28 @@ def rpl_fingerprint(rpl_row: Optional[Dict], gpkg_path: str = "") -> str:
         str(rpl_row.get("lines_layer") or ""),
         normalised_path(gpkg_path) if gpkg_path else "",
     ])
+
+
+def route_geometry_fingerprint(route) -> str:
+    """Content hash of a RouteFrame's WGS84 geometry (7 dp ≈ 1 cm).
+
+    Rounded WKT keeps the hash stable across sessions (no ulp-level
+    transform noise) while any real vertex move changes it.
+    """
+    import hashlib
+
+    digest = hashlib.sha1()
+    for geom in getattr(route, "geometries", None) or []:
+        try:
+            digest.update(geom.asWkt(7).encode("ascii", "ignore"))
+        except Exception:
+            continue
+        digest.update(b";")
+    try:
+        digest.update(f"{float(route.total_length_km):.6f}".encode("ascii"))
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return "geom:" + digest.hexdigest()[:20]
 
 
 # -- writing -----------------------------------------------------------------
@@ -350,19 +629,23 @@ def _ground_layer_rows(plan: Dict, units: Sequence[Dict], classes: Sequence[Dict
     lo, hi = _route_window(route, plan)
     if hi - lo <= 1e-9:
         return []
+    from . import target_depth
+
     by_code = ground_model.class_lookup(classes)
-    horizons = [("seabed", 0.0)]
-    try:
-        target = float(plan.get("target_burial_m")) \
-            if plan.get("target_burial_m") not in (None, "") else None
-    except (TypeError, ValueError):
-        target = None
-    if target is not None and target > 0:
-        horizons.append(("target", target))
+    # (horizon, depth, window start, window end): the seabed over the whole
+    # window, then the target horizon per target run (KP-range overrides
+    # probe at their own depth).
+    horizons = [("seabed", 0.0, lo, hi)]
+    for start, end, depth in target_depth.target_runs(
+            target_depth.plan_default(plan), target_depth.plan_ranges(plan),
+            lo, hi):
+        if depth is not None and depth > 0:
+            horizons.append(("target", depth, start, end))
     rows: List[Dict] = []
     plan_id = plan.get("plan_id") or ""
-    for horizon, depth in horizons:
-        for start, end, code, count in ground_model.class_runs(units, depth, lo, hi):
+    for horizon, depth, win_lo, win_hi in horizons:
+        for start, end, code, count in ground_model.class_runs(
+                units, depth, win_lo, win_hi):
             wkt = _section_wkt(route, start, end, cache)
             if not wkt:
                 continue

@@ -49,6 +49,7 @@ from ...qgis_compat import (
 )
 from .. import events as ev
 from .. import schema
+from .. import target_depth
 from .. import tools as tools_mod
 from .. import ui_helpers
 
@@ -66,7 +67,8 @@ _SECTION_COLUMNS = ["ID", "Kind", "Start KP", "End KP",
                     "Start Lat", "Start Lon", "End Lat", "End Lon",
                     "Length (km)",
                     "State", "Conclusion", "Confidence", "Tool",
-                    "Tool config", "Skip handling", "Reasons", "Notes"]
+                    "Tool config", "Skip handling", "Target (m)", "Reasons",
+                    "Notes"]
 _SECTION_DEFAULT_HIDDEN = ("Start rKP", "End rKP", "Start Lat", "Start Lon",
                            "End Lat", "End Lon")
 # Derived from the header list so reordering/inserting columns cannot
@@ -85,6 +87,7 @@ _SECTION_CONFIDENCE_COL = _SECTION_COLUMNS.index("Confidence")
 _SECTION_TOOL_COL = _SECTION_COLUMNS.index("Tool")
 _SECTION_TOOL_CONFIG_COL = _SECTION_COLUMNS.index("Tool config")
 _SECTION_SKIP_HANDLING_COL = _SECTION_COLUMNS.index("Skip handling")
+_SECTION_TARGET_COL = _SECTION_COLUMNS.index("Target (m)")
 _SECTION_REASONS_COL = _SECTION_COLUMNS.index("Reasons")
 _SECTION_NOTES_COL = _SECTION_COLUMNS.index("Notes")
 # Drop-down cells (delegate-edited; see ui_helpers.ComboColumnDelegate).
@@ -788,6 +791,8 @@ class BuilderTab(QWidget):
     def _rebuild_sections_table(self, sections, refs, ref_legend) -> None:
         table = self.sections_table
         total_km = self._route_length_km()
+        target_default = self.model.target_default()
+        target_ranges = self.model.target_ranges()
         editable_flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
         with ui_helpers.preserve_table_view(table), \
                 ui_helpers.silent_rebuild(table):
@@ -821,6 +826,9 @@ class BuilderTab(QWidget):
                     "",  # tool: drop-down on burial rows
                     "",  # tool config: drop-down on burial rows
                     "",  # skip handling: drop-down on skip rows
+                    (target_depth.format_span(target_depth.depth_span(
+                        target_default, target_ranges, start_kp, end_kp))
+                     if is_burial else ""),
                     reasons,
                     section.get("notes") or "",
                 ]

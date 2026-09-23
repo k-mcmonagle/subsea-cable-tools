@@ -13,6 +13,11 @@ The register carries the engineer's review: risk can be overridden,
 status (Open/Noted/Accepted/Mitigated) and notes are kept, and a re-scan
 carries that review over by feature identity. Manual hazards (desktop
 study items, fishing grounds, …) live alongside scanned ones.
+
+Each scan is recorded per check (``bp_analysis.risk_json``): when it ran, on
+which settings and how many hazards it found — so after reopening the
+project a check reads "none found" rather than "not run", and a check whose
+settings or input changed since its scan is marked out of date.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ from __future__ import annotations
 import json
 from typing import Dict, List, Optional
 
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import Qt, QTimer
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -49,6 +54,7 @@ from ...qgis_compat import (
     BUTTON_BOX_OK,
     CONTEXT_MENU_POLICY_CUSTOM,
     DIALOG_ACCEPTED,
+    HEADER_RESIZE_MODE_CONTENTS,
     HEADER_RESIZE_MODE_STRETCH,
     ITEM_DATA_USER_ROLE,
     MESSAGE_BOX_NO,
@@ -58,9 +64,14 @@ from ...qgis_compat import (
     SELECTION_MODE_SINGLE,
     qt_exec,
 )
-from ...workbench.kp_bars import FireBarDelegate, VerdictStrip
+from ...workbench.kp_bars import (
+    FireBarDelegate,
+    FireBarHover,
+    VerdictStrip,
+)
 from ...workbench.rules_engine import Interval
-from .. import map_layers, risk, risk_scan, schema
+from ...workbench import rules_engine as eng
+from .. import analysis_state, map_layers, risk, risk_scan, schema
 from .. import ui_helpers
 from .attribute_widgets import (
     AttributeRulesTable,
@@ -71,7 +82,8 @@ from .attribute_widgets import (
 )
 
 _CHECK_FIRE_COL = 2
-_CHECK_COLUMNS = ["On", "Check", "Findings", "Hazards"]
+_CHECK_COLUMNS = ["On", "Check", "Findings", "Hazards · extent"]
+_CHECK_COUNT_COL = 3
 
 _HAZARD_COLUMNS = ["Risk", "Status", "KP", "End KP", "Offset (m)", "X-ing",
                    "Angle (°)", "Feature", "Check", "Notes"]
@@ -455,6 +467,7 @@ class RiskTab(QWidget):
         self._loading = False
         self._scan_task = None
         self._prescan_warnings: List[str] = []
+        self._transient_status = ""
 
         layout = QVBoxLayout(self)
         self.overview = VerdictStrip()
@@ -476,11 +489,24 @@ class RiskTab(QWidget):
         self.check_table.verticalHeader().setVisible(False)
         self.check_table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
         self.check_table.setSelectionMode(SELECTION_MODE_SINGLE)
+        self._fire_delegate = FireBarDelegate(self.check_table)
         self.check_table.setItemDelegateForColumn(
-            _CHECK_FIRE_COL, FireBarDelegate(self.check_table))
+            _CHECK_FIRE_COL, self._fire_delegate)
+        self._fire_hover = FireBarHover(self.check_table, _CHECK_FIRE_COL,
+                                        self._fire_delegate,
+                                        self._fire_tooltip)
         header = self.check_table.horizontalHeader()
+        header.setSectionResizeMode(0, HEADER_RESIZE_MODE_CONTENTS)
         header.setSectionResizeMode(1, HEADER_RESIZE_MODE_STRETCH)
         header.setSectionResizeMode(_CHECK_FIRE_COL, HEADER_RESIZE_MODE_STRETCH)
+        header.setSectionResizeMode(_CHECK_COUNT_COL,
+                                    HEADER_RESIZE_MODE_CONTENTS)
+        count_header = self.check_table.horizontalHeaderItem(_CHECK_COUNT_COL)
+        if count_header is not None:
+            count_header.setToolTip(
+                "Hazards found by the check's last scan, and the length and "
+                "share of the scope they cover (range hazards at their true "
+                "extent; point hazards as the ±25 m drawn on the bar).")
         self.check_table.itemChanged.connect(self._on_check_item_changed)
         self.check_table.doubleClicked.connect(lambda _i: self._edit_check())
         self.check_table.setContextMenuPolicy(CONTEXT_MENU_POLICY_CUSTOM)
@@ -596,6 +622,8 @@ class RiskTab(QWidget):
         refresh_soon = ui_helpers.coalesced(self, self.refresh)
         model.planChanged.connect(refresh_soon)
         model.riskChanged.connect(refresh_soon)
+        model.inputsChanged.connect(refresh_soon)
+        model.analysisChanged.connect(refresh_soon)
         self.refresh()
 
     # -- refresh --------------------------------------------------------------
@@ -613,6 +641,9 @@ class RiskTab(QWidget):
             for hazard in hazards:
                 by_check.setdefault(str(hazard.get("check_id") or ""),
                                     []).append(hazard)
+            run_state = self.model.risk_status() if has_plan else {}
+            self._run_state = run_state
+            domain_km = scope.length_km if has_plan else 0.0
 
             self._checks_view = ui_helpers.preserve_table_view(
                 self.check_table)
@@ -642,33 +673,148 @@ class RiskTab(QWidget):
                     worst = risk.risk_max(worst, hazard.get("risk") or "")
                 intervals = [(s, e) for s, e, _level in
                              risk.hazard_spans(found)]
+                check_id = str(check.get("check_id") or "")
+                run = run_state.get(check_id) or {}
+                state = run.get("state", analysis_state.STATE_NEW)
+                stale = bool(found) and state == analysis_state.STATE_CHANGED
                 fire_item = QTableWidgetItem()
                 fire_item.setFlags(Qt.ItemFlag.ItemIsEnabled
                                    | Qt.ItemFlag.ItemIsSelectable)
                 fire_item.setData(
                     ITEM_DATA_USER_ROLE,
                     (scope.length_km, intervals, _risk_colors()[worst],
-                     scope.start_km))
+                     scope.start_km, {"stale": stale}))
                 self.check_table.setItem(i, _CHECK_FIRE_COL, fire_item)
 
-                count_item = QTableWidgetItem(
-                    f"{len(found)}" if found else "—")
+                count_text, count_tip = self._count_cell(
+                    found, intervals, domain_km, run, state,
+                    bool(int(check.get("enabled") or 0)))
+                count_item = QTableWidgetItem(count_text)
+                count_item.setToolTip(count_tip)
                 count_item.setFlags(Qt.ItemFlag.ItemIsEnabled
                                     | Qt.ItemFlag.ItemIsSelectable)
-                self.check_table.setItem(i, 3, count_item)
+                self.check_table.setItem(i, _CHECK_COUNT_COL, count_item)
             self._checks_view.__exit__(None, None, None)
 
             self._refresh_hazards()
             self._refresh_overview(scope)
+            self._refresh_status_line()
         finally:
             self._loading = False
+
+    @staticmethod
+    def _count_cell(found: List[Dict], intervals, domain_km: float,
+                    run: Dict, state: str, enabled: bool):
+        """(text, tooltip) for a check's Hazards · extent cell."""
+        when = analysis_state.format_utc(run.get("run_utc") or "")
+        if found:
+            covered = sum(iv.length_km for iv in eng.normalize(
+                [Interval(s, e) for s, e in intervals]))
+            pct = 100.0 * covered / domain_km if domain_km > 0 else 0.0
+            text = f"{len(found)} · {covered:.3f} km · {pct:.1f}%"
+            tip = (f"{len(found)} hazard(s) over {covered:.3f} km "
+                   f"({pct:.2f}% of the scope).")
+        elif state in (analysis_state.STATE_CURRENT,
+                       analysis_state.STATE_CHANGED):
+            text = "none"
+            tip = "Scanned — no features found on or near the route."
+        elif not enabled:
+            return "off", "Disabled — not scanned by Run all."
+        else:
+            return "—", "Not scanned yet — Run ▾ scans the enabled checks."
+        if when:
+            tip += f"\nLast scan: {when}."
+        if state == analysis_state.STATE_CHANGED:
+            text += " (out of date)"
+            tip += ("\nOut of date: the check's settings or input changed "
+                    "since its scan — run it again.")
+        for warning in (run.get("warnings") or [])[:3]:
+            tip += f"\n⚠ {warning}"
+        return text, tip
+
+    def _refresh_status_line(self) -> None:
+        if self._transient_status or self._scan_task is not None:
+            self.status_label.setText(self._transient_status)
+            return
+        runs = self.model.risk_runs() if self.model.plan else {}
+        message = runs.get("message") or ""
+        when = analysis_state.format_utc(runs.get("run_utc") or "")
+        stale = sum(1 for info in (getattr(self, "_run_state", {}) or {}).values()
+                    if info.get("state") == analysis_state.STATE_CHANGED)
+        text = ""
+        if when:
+            text = f"Last scan {when}: {message}" if message else \
+                f"Last scan {when}."
+        if stale:
+            text += (f"  ·  {stale} check(s) changed since their scan — "
+                     "run them again.")
+        self.status_label.setText(text.strip())
+
+    def _set_transient(self, text: str) -> None:
+        self._transient_status = text or ""
+        self._refresh_status_line()
+
+    def _fire_tooltip(self, row: int, kp: float, px_km: float) -> str:
+        checks = self.model.risk_checks
+        if row >= len(checks):
+            return f"KP {kp:.3f}"
+        check = checks[row]
+        check_id = str(check.get("check_id") or "")
+        lines = [f"KP {kp:.3f} — {check.get('name') or 'check'}"]
+        near = self._hazards_by_distance(check_id, kp)
+        tol = max(px_km, 0.025)  # a point hazard is drawn ±25 m wide
+        under = [(d, h) for d, h in near if d <= tol]
+        for _d, hazard in under[:5]:
+            lines.append(self._hazard_line(hazard))
+        if len(under) > 5:
+            lines.append(f"… {len(under) - 5} more here")
+        if not under:
+            if near:
+                distance, hazard = near[0]
+                lines.append(f"Clear here — nearest: {hazard.get('label') or 'hazard'}"
+                             f", {distance * 1000:,.0f} m away")
+            else:
+                lines.append("No hazards from this check")
+        lines.append("Right-click for the hazards nearest this KP.")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _hazard_line(hazard: Dict) -> str:
+        start = float(hazard.get("kp") or 0.0)
+        end = float(hazard.get("end_kp") or start)
+        lo, hi = min(start, end), max(start, end)
+        where = (f"KP {lo:.3f}–{hi:.3f}" if hi - lo > 5e-4
+                 else f"KP {lo:.3f}")
+        level = schema.RISK_LABELS.get(hazard.get("risk") or "", "")
+        return (f"{hazard.get('label') or 'hazard'} — {where}"
+                + (f"  [{level}]" if level else ""))
+
+    def _hazards_by_distance(self, check_id: str, kp: float):
+        """``[(distance_km, hazard)]`` nearest-first (0 = under the KP)."""
+        out = []
+        for hazard in self.model.hazards:
+            if str(hazard.get("check_id") or "") != check_id:
+                continue
+            try:
+                start = float(hazard.get("kp") or 0.0)
+                end = float(hazard.get("end_kp") if hazard.get("end_kp")
+                            is not None else start)
+            except (TypeError, ValueError):
+                continue
+            lo, hi = min(start, end), max(start, end)
+            distance = 0.0 if lo <= kp <= hi else min(abs(kp - lo),
+                                                      abs(kp - hi))
+            out.append((distance, hazard))
+        out.sort(key=lambda item: (item[0], float(item[1].get("kp") or 0.0)))
+        return out
 
     def _refresh_overview(self, scope) -> None:
         spans = []
         risk_colors = _risk_colors()
         for start_km, end_km, level in risk.hazard_spans(self.model.hazards):
             spans.append((start_km, end_km, risk_colors.get(
-                level, risk_colors[schema.RISK_UNASSIGNED])))
+                level, risk_colors[schema.RISK_UNASSIGNED]),
+                f"{schema.RISK_LABELS.get(level, 'Unassigned')} risk"))
         self.overview.set_spans(scope.length_km, spans, "Risk",
                                 domain_start_km=scope.start_km)
 
@@ -995,7 +1141,7 @@ class RiskTab(QWidget):
     def _run_selected_check(self) -> None:
         index = self._selected_check_index()
         if index < 0 or index >= len(self.model.risk_checks):
-            self.status_label.setText("Select a check to run it alone.")
+            self._set_transient("Select a check to run it alone.")
             return
         check_id = str(self.model.risk_checks[index].get("check_id") or "")
         self._run_checks([check_id])
@@ -1003,10 +1149,10 @@ class RiskTab(QWidget):
     # -- scan (background task, BurialAnalysisTask pattern) --------------------
     def _run_checks(self, check_ids: Optional[List[str]] = None) -> None:
         if not self.model.plan:
-            self.status_label.setText("Open a plan first.")
+            self._set_transient("Open a plan first.")
             return
         if self._scan_task is not None:
-            self.status_label.setText("A scan is already running.")
+            self._set_transient("A scan is already running.")
             return
         if self.model.route is None:
             QMessageBox.warning(
@@ -1019,7 +1165,7 @@ class RiskTab(QWidget):
                   if int(c.get("enabled") or 0)
                   and (not wanted or str(c.get("check_id") or "") in wanted)]
         if not checks:
-            self.status_label.setText("No enabled checks — add a check first.")
+            self._set_transient("No enabled checks — add a check first.")
             return
         from qgis.core import QgsApplication, QgsGeometry, QgsProject
 
@@ -1073,15 +1219,14 @@ class RiskTab(QWidget):
                 continue
             jobs.append((dict(check), features))
         if not jobs:
-            self.status_label.setText(
-                "  ·  ".join(warnings) or "Nothing to scan.")
+            self._set_transient("  ·  ".join(warnings) or "Nothing to scan.")
             return
         self._prescan_warnings = warnings
         task = risk_scan.RiskScanTask(
             self.model.plan_id, jobs, route_geoms,
             QgsProject.instance().transformContext(), scope,
             self.model.direction, self._scan_finished)
-        task.progressMessage.connect(self.status_label.setText)
+        task.progressMessage.connect(self._set_transient)
         task.progressChanged.connect(
             lambda pct: self.progress.setValue(int(pct)))
         self._scan_task = task
@@ -1089,7 +1234,7 @@ class RiskTab(QWidget):
         self.stop_button.setEnabled(True)
         self.progress.setVisible(True)
         self.progress.setValue(0)
-        self.status_label.setText("Scanning…")
+        self._set_transient("Scanning…")
         QgsApplication.taskManager().addTask(task)
 
     def _cancel_scan(self) -> None:
@@ -1122,20 +1267,15 @@ class RiskTab(QWidget):
         if task.plan_id != self.model.plan_id:
             # The user switched plans while the scan ran — these hazards
             # belong to the plan the scan was started on, not this one.
-            self.status_label.setText(
-                "Scan discarded — a different plan is now open. Re-run the "
-                "scan with its plan selected.")
+            self._flash("Scan discarded — a different plan is now open. "
+                        "Re-run the scan with its plan selected.")
             return
         if task.cancelled:
-            self.status_label.setText(
-                "Scan stopped — the hazard register was not changed.")
+            self._flash("Scan stopped — the hazard register was not changed.")
             return
         if task.error:
-            self.status_label.setText(f"Scan failed: {task.error}")
+            self._flash(f"Scan failed: {task.error}")
             return
-        if task.run_check_ids:
-            self.model.apply_risk_scan(task.hazards,
-                                       check_ids=task.run_check_ids)
         message = (f"Scanned {len(task.run_check_ids)} check(s): "
                    f"{len(task.hazards)} hazard(s).")
         warnings = self._prescan_warnings + task.warnings
@@ -1143,7 +1283,38 @@ class RiskTab(QWidget):
             message += "  ·  " + "  ·  ".join(warnings[:4])
             if len(warnings) > 4:
                 message += f"  ·  … {len(warnings) - 4} more"
-        self.status_label.setText(message)
+        self._transient_status = ""
+        if task.run_check_ids:
+            self.model.apply_risk_scan(task.hazards,
+                                       check_ids=task.run_check_ids)
+            counts: Dict[str, int] = {}
+            for hazard in task.hazards:
+                key = str(hazard.get("check_id") or "")
+                counts[key] = counts.get(key, 0) + 1
+            per_check: Dict[str, List[str]] = {}
+            names = {str(c.get("check_id") or ""): (c.get("name") or "")
+                     for c in self.model.risk_checks}
+            for warning in warnings:
+                for check_id, name in names.items():
+                    if name and f"'{name}'" in warning:
+                        per_check.setdefault(check_id, []).append(warning)
+            self.model.record_risk_run(task.run_check_ids, counts,
+                                       per_check, message)
+        else:
+            self._flash(message)
+        self._refresh_status_line()
+
+    def _flash(self, message: str) -> None:
+        """A transient outcome line that yields to the stored-scan summary."""
+        self._set_transient(message)
+        QTimer.singleShot(6000, lambda m=message: self._expire_transient(m))
+
+    def _expire_transient(self, message: str) -> None:
+        try:
+            if self._transient_status == message:
+                self._set_transient("")
+        except RuntimeError:  # widget already deleted
+            pass
 
     def _check_context_menu(self, position) -> None:
         item = self.check_table.itemAt(position)
@@ -1155,9 +1326,17 @@ class RiskTab(QWidget):
             return
         check = self.model.risk_checks[row]
         check_id = str(check.get("check_id") or "")
-        found = risk.sort_hazards(
-            [h for h in self.model.hazards
-             if str(h.get("check_id") or "") == check_id])
+        # On the bar: nearest the clicked KP first; elsewhere: KP order.
+        hit = self._fire_hover.kp_at(position)
+        if hit is not None:
+            click_kp = hit[1]
+            found = [h for _d, h in self._hazards_by_distance(check_id,
+                                                              click_kp)]
+        else:
+            click_kp = None
+            found = risk.sort_hazards(
+                [h for h in self.model.hazards
+                 if str(h.get("check_id") or "") == check_id])
         menu = QMenu(self)
         edit_action = menu.addAction("Edit check…")
         run_action = menu.addAction("Run this check")
@@ -1166,6 +1345,9 @@ class RiskTab(QWidget):
         goto_actions = {}
         if found:
             menu.addSeparator()
+            if click_kp is not None:
+                header = menu.addAction(f"Hazards nearest KP {click_kp:.3f}:")
+                header.setEnabled(False)
             shown = found[:20]
             for hazard in shown:
                 start = float(hazard.get("kp") or 0.0)
@@ -1229,5 +1411,4 @@ class RiskTab(QWidget):
             QMessageBox.warning(self, "Burial Planner",
                                 f"Could not write the CSV: {exc}")
             return
-        self.status_label.setText(
-            f"Exported {len(self.model.hazards)} hazard(s).")
+        self._flash(f"Exported {len(self.model.hazards)} hazard(s).")

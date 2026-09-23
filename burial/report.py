@@ -19,6 +19,7 @@ from ..workbench import schema as wb_schema
 from . import attribute_rules
 from . import events as ev
 from . import schema
+from . import target_depth
 from . import tools as tools_mod
 
 _KIND_LABELS = {
@@ -224,6 +225,14 @@ def rule_condition_text(rule: Dict) -> str:
     return "; ".join(parts)
 
 
+def _target_text(plan: Dict) -> str:
+    default = target_depth.plan_default(plan)
+    ranges = target_depth.plan_ranges(plan)
+    if not default and not ranges:
+        return "—"
+    return target_depth.summary_text(default, ranges).rstrip(".")
+
+
 def _table(headers: Sequence[str], rows: Sequence[Sequence[str]],
            raw: bool = False) -> str:
     """rows are already-escaped (raw=True) or plain text cells."""
@@ -294,12 +303,21 @@ def build_report_html(plan: Dict,
         ("Scope", f"KP {_kp(scope_start)} – {_kp(scope_end)} ({scope_km:.3f} km)"),
         ("Direction of installation", direction),
         ("Plan revision", plan.get("rev_label") or "—"),
-        ("Target burial depth",
-         f"{plan.get('target_burial_m')} m" if plan.get("target_burial_m") else "—"),
+        ("Target burial depth", _target_text(plan)),
         ("Description", plan.get("description") or "—"),
     ]
     parts.append("<p class='meta'>" + "<br>".join(
         f"<b>{_esc(k)}:</b> {_esc(v)}" for k, v in meta) + "</p>")
+    target_ranges = target_depth.plan_ranges(plan)
+    if target_ranges:
+        parts.append("<h3>Target burial depth by KP range</h3>")
+        parts.append(_table(
+            ("Start KP", "End KP", "Length (km)", "Target (m)", "Notes"),
+            [(_kp(r["start_kp"]), _kp(r["end_kp"]),
+              f"{r['end_kp'] - r['start_kp']:.3f}", f"{r['depth_m']:g}",
+              r.get("notes") or "") for r in target_ranges]))
+        parts.append("<p class='meta'>Outside these ranges the default "
+                     "target applies.</p>")
     if plan.get("notes"):
         parts.append(f"<p class='meta'><b>Notes:</b> {_esc(plan.get('notes'))}</p>")
     parts.append(
@@ -532,11 +550,9 @@ def build_report_html(plan: Dict,
             provenance.append("KPs re-referenced from "
                               f"{_esc(meta['source_rpl'])} "
                               f"({_esc(meta.get('method') or '')})")
-        target = plan.get("target_burial_m")
-        try:
-            target_m = float(target) if target not in (None, "") else None
-        except (TypeError, ValueError):
-            target_m = None
+        target_runs = [(a, b, d) for a, b, d in target_depth.target_runs(
+            target_depth.plan_default(plan), target_depth.plan_ranges(plan),
+            scope_start, scope_end) if d]
         summary_rows = []
         for entry in ground_model.summarise_by_class(
                 ground_units, depth_m=None, start_kp=scope_start, end_kp=scope_end):
@@ -549,17 +565,27 @@ def build_report_html(plan: Dict,
                      + ".</p>")
         parts.append("<h3>Seabed class over the scope</h3>")
         parts.append(_table(("Class", "Label", "Length (km)"), summary_rows))
-        if target_m:
-            target_rows = []
-            for entry in ground_model.summarise_by_class(
-                    ground_units, depth_m=target_m, start_kp=scope_start,
-                    end_kp=scope_end):
-                code = entry["soil_class"]
-                target_rows.append((code or "(no unit)",
-                                    ground_model.label_for(code, by_code) if code else "",
-                                    f"{entry['length_km']:.3f}"))
+        if target_runs:
+            # Each target run probes the ground model at its own depth; the
+            # class lengths are summed across runs.
+            lengths: Dict[str, float] = {}
+            for run_lo, run_hi, run_depth in target_runs:
+                for entry in ground_model.summarise_by_class(
+                        ground_units, depth_m=run_depth, start_kp=run_lo,
+                        end_kp=run_hi):
+                    code = entry["soil_class"] or ""
+                    lengths[code] = lengths.get(code, 0.0) + entry["length_km"]
+            target_rows = [
+                (code or "(no unit)",
+                 ground_model.label_for(code, by_code) if code else "",
+                 f"{km:.3f}")
+                for code, km in sorted(lengths.items(),
+                                       key=lambda item: -item[1])]
+            depths = sorted({d for _a, _b, d in target_runs})
+            depth_text = (f"{depths[0]:.2f} m" if len(depths) == 1 else
+                          ", ".join(f"{d:g}" for d in depths) + " m by KP range")
             parts.append(f"<h3>Class at the target burial depth "
-                         f"({target_m:.2f} m below seabed)</h3>")
+                         f"({depth_text} below seabed)</h3>")
             parts.append(_table(("Class", "Label", "Length (km)"), target_rows))
         unit_rows = []
         for unit in ground_model.sort_units(ground_units):

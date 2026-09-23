@@ -19,6 +19,8 @@ Table overview:
 - bp_change_log  append-only change log with before/after JSON
 - bp_tool        project-scoped Burial Tools registry (ploughs, trenchers…)
                  with per-tool configurations and an optional DXF footprint
+- bp_analysis    latest Exclusions recompute / Risk Profile run per plan
+                 (derived display state + currency fingerprints)
 
 No engineering values are shipped here: criteria values, buffers and limits
 are user-entered, each with a source-reference field.
@@ -37,7 +39,7 @@ from ..workbench.schema import (  # noqa: F401  (re-exported for the package)
     utc_now_iso,
 )
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # Registry table names ------------------------------------------------------
 TABLE_META = "bp_meta"
@@ -58,6 +60,7 @@ TABLE_VESSEL = "bp_vessel"
 TABLE_GROUND_UNIT = "bp_ground_unit"
 TABLE_GROUND_CLASS = "bp_ground_class"
 TABLE_BAS_ROW = "bp_bas_row"
+TABLE_ANALYSIS = "bp_analysis"
 
 FieldSpec = Tuple[str, str]
 
@@ -669,6 +672,23 @@ BAS_ROW_FIELDS: List[FieldSpec] = [
     ("notes", "str"),
 ]
 
+# Latest analysis results per plan (one row): the Exclusions tab's resolved
+# stack and the Risk Profile's per-check run records survive closing and
+# reopening the project. Derived data — rebuilt by Recompute / Run checks,
+# never change-logged. ``fingerprints_json`` / ``risk_json`` hold the
+# currency fingerprints (see analysis_state.py) so the tabs can say which
+# results are out of date instead of silently showing old bars.
+ANALYSIS_FIELDS: List[FieldSpec] = [
+    ("analysis_id", "str"),
+    ("plan_id", "str"),
+    ("run_utc", "str"),              # last Exclusions recompute/generate
+    ("context_json", "str"),         # serialised ResolutionContext + nodata
+    ("fingerprints_json", "str"),    # {"global": {...}, "rules": {id: fp}}
+    ("message", "str"),              # the run's status line
+    ("risk_json", "str"),            # {"runs": {check_id: {...}}, ...}
+    ("modified_utc", "str"),
+]
+
 CHANGE_LOG_FIELDS: List[FieldSpec] = [
     ("change_id", "str"),
     ("plan_id", "str"),
@@ -701,6 +721,7 @@ REGISTRY_TABLES: Dict[str, List[FieldSpec]] = {
     TABLE_GROUND_UNIT: GROUND_UNIT_FIELDS,
     TABLE_GROUND_CLASS: GROUND_CLASS_FIELDS,
     TABLE_BAS_ROW: BAS_ROW_FIELDS,
+    TABLE_ANALYSIS: ANALYSIS_FIELDS,
 }
 
 TABLE_KEYS: Dict[str, str] = {
@@ -723,6 +744,7 @@ TABLE_KEYS: Dict[str, str] = {
     TABLE_GROUND_UNIT: "unit_id",
     TABLE_GROUND_CLASS: "class_id",
     TABLE_BAS_ROW: "row_id",
+    TABLE_ANALYSIS: "analysis_id",
 }
 
 # Per-plan spatial layer schemas -------------------------------------------

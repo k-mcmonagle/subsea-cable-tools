@@ -155,6 +155,8 @@ CHECKS = [
     ('burial planner events (pure)', 'test_burial_events'),
     ('burial planner generation (pure)', 'test_burial_generation'),
     ('burial planner IO + import scan (pure)', 'test_burial_io'),
+    ('burial planner targets + analysis currency (pure)', 'test_burial_targets_state'),
+    ('burial planner persistence, overlays, inputs picker', 'test_burial_persistence'),
     ('burial planner report (pure)', 'test_burial_report'),
     ('burial planner profile data (pure)', 'test_burial_profile_data'),
     ('burial planner ground model + KP re-reference (pure)', 'test_burial_ground'),
