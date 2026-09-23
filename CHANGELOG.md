@@ -8,6 +8,7 @@
 - New MBES merge source manifests retain access to native grids for engineering profiles; warn about duplicate-cell soundings in direct XYZ import and reject nonfinite XYZ records.
 - KP profile Space freeze/resume, source/raw views, measurement snapping and repeated annotations, independent units, delete/clear, PNG/CSV export, seabed/slope shading, and controlled map-click/close lifecycle.
 - Regression coverage includes analytical planes, short baselines, gaps/seams, conflicting contours, depressions, persistent provenance and QGIS sampling/window/export workflows.
+- **Import MDB — text labels arrive complete** (`processing/geomedia_blob.py`, `processing/mdb_odbc_worker.py`): UTF-16 labels whose length is stored in bytes are recognised (previously decoded as `"p\x00i\x00…"`, which QGIS truncated to the first letter), NULs are stripped from every string attribute, and rich-text (RTF) labels are converted to plain `label_text` with the original kept in `label_rtf`. Text features gain `label_rotation` (GeoMedia degrees counter-clockwise; use `-"label_rotation"` for QGIS data-defined rotation) and `label_alignment` (GeoMedia's 0–10 justification). Geometry BLOB columns with unfamiliar names are now recognised by content, and multi-part layers left out by default are reported as a warning with their feature count. Existing layers, feature counts and attributes are unchanged.
 
 
 All notable changes to the Subsea Cable Tools QGIS plugin will be documented in this file.

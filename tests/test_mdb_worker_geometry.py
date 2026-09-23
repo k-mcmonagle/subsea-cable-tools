@@ -61,16 +61,18 @@ def boundary_blob(exterior, interior):
             + struct.pack("<i", len(inner)) + inner)
 
 
-def text_blob(x, y, text, z=0.0, encoding="cp1252", count=None):
+def text_blob(x, y, text, z=0.0, encoding="cp1252", count=None,
+              rotation=0.0, alignment=9, trailer=b""):
     payload = text.encode(encoding)
     if count is None:
         count = len(text) if encoding == "utf-16-le" else len(payload)
     return (_header(geomedia_blob.GEOMEDIA_TEXT)
             + struct.pack("<ddd", x, y, z)
-            + struct.pack("<dddd", 0.0, 0.0, 0.0, 1.0)
-            + bytes.fromhex("00000109")
+            + struct.pack("<d", rotation)
+            + struct.pack("<ddd", 0.0, 0.0, 1.0)
+            + bytes([0, 0, 1, alignment])
             + struct.pack("<i", count)
-            + payload)
+            + payload + trailer)
 
 
 def collection_blob(type_code, sub_blobs):
@@ -194,6 +196,63 @@ def test_malformed_text_blobs_are_rejected():
 def test_non_text_geometries_carry_no_text():
     assert geomedia_blob.decode_geometry_blob(point_blob(1.0, 2.0)).text is None
     assert geomedia_blob.decode_geometry_blob(line_blob(TRACK)).text is None
+    assert geomedia_blob.decode_geometry_blob(point_blob(1.0, 2.0)).rotation is None
+
+
+def test_text_blob_decodes_utf16_labels_counted_in_bytes():
+    # Decoded as Windows-1252 this was "p\x00i\x00...", which GDAL truncated
+    # to "p" when QGIS loaded the layer.
+    blob = text_blob(1.0, 2.0, "pipeline crossing", encoding="utf-16-le", count=34)
+    assert geomedia_blob.decode_geometry_blob(blob).text == "pipeline crossing"
+
+
+def test_text_blob_labels_never_carry_nul_characters():
+    utf16_terminated = text_blob(1.0, 2.0, "Sand wave\x00", encoding="utf-16-le", count=20)
+    assert geomedia_blob.decode_geometry_blob(utf16_terminated).text == "Sand wave"
+    ansi_terminated = text_blob(1.0, 2.0, "Boulder\x00")
+    assert geomedia_blob.decode_geometry_blob(ansi_terminated).text == "Boulder"
+
+
+def test_single_character_labels_stay_single_characters():
+    # A genuine one-letter class code must not be mistaken for UTF-16.
+    assert geomedia_blob.decode_geometry_blob(text_blob(1.0, 2.0, "p")).text == "p"
+    padded = text_blob(1.0, 2.0, "p", trailer=b"\x00")
+    assert geomedia_blob.decode_geometry_blob(padded).text == "p"
+    assert geomedia_blob.decode_geometry_blob(text_blob(1.0, 2.0, "sm")).text == "sm"
+
+
+def test_text_blob_carries_rotation_and_alignment():
+    decoded = geomedia_blob.decode_geometry_blob(
+        text_blob(1.0, 2.0, "12°", rotation=120.0, alignment=10))
+    assert decoded.rotation == 120.0
+    assert decoded.alignment == 10
+    assert decoded.rings[0][0][:2] == (1.0, 2.0)
+
+
+RTF_LABEL = (r"{\rtf1\ansi\deff0{\fonttbl{\f0\fswiss Arial;}}{\colortbl;\red0\green0\blue0;}"
+             r"{\*\generator Riched20;}\f0\fs20 Possible \b GRAVEL\b0  patch 12\'b0\par"
+             r" Caf\u233?\par}")
+
+
+def test_rtf_labels_are_converted_to_plain_text():
+    decoded = geomedia_blob.decode_geometry_blob(text_blob(1.0, 2.0, RTF_LABEL))
+    assert decoded.text == "Possible GRAVEL patch 12°\nCafé"
+    assert decoded.rtf == RTF_LABEL
+
+
+def test_rtf_to_text_handles_escapes_and_skipped_groups():
+    assert geomedia_blob.rtf_to_text(r"{\rtf1 a\{b\}c\\d}") == "a{b}c\\d"
+    assert geomedia_blob.rtf_to_text(r"{\rtf1{\info{\title secret}}visible}") == "visible"
+    # 舑 (en dash) followed by two fallback bytes that must be dropped.
+    en_dash_rtf = r"{\rtf1\uc2 x" + "\\" + "u8211" + r"\'96\'96y}"
+    assert geomedia_blob.rtf_to_text(en_dash_rtf) == "x" + chr(0x2013) + "y"
+    assert geomedia_blob.rtf_to_text(r"{\rtf1 a\tab b\line c}") == "a\tb\nc"
+
+
+def test_plain_labels_are_not_treated_as_rtf():
+    decoded = geomedia_blob.decode_geometry_blob(text_blob(1.0, 2.0, "{curly} label"))
+    assert decoded.text == "{curly} label"
+    assert decoded.rtf is None
 
 
 def test_unknown_and_malformed_blobs_are_rejected():
@@ -662,6 +721,66 @@ def test_non_text_tables_do_not_gain_a_label_field(tmp_path):
     result = _export(tmp_path, ["Id", "Geometry"], [(1, line_blob(TRACK))], "Geometry", 1)
     props = _features(result, "LineString")[0]["properties"]
     assert "label_text" not in props
+    assert "label_rotation" not in props
+
+
+def test_text_table_exports_rotation_alignment_and_rtf(tmp_path):
+    rows = [
+        (1, text_blob(1.0, 2.0, "12°", rotation=45.0, alignment=0), None),
+        (2, text_blob(1.0, 2.0, RTF_LABEL), None),
+    ]
+    result = _export(tmp_path, ["ID1", "GraphicText", "GraphicText_sk"], rows, "", 33)
+    plain, rich = [f["properties"] for f in _features(result, "Point")]
+    assert (plain["label_text"], plain["label_rotation"], plain["label_alignment"]) == (
+        "12°", 45.0, 0)
+    assert "label_rtf" not in plain
+    assert rich["label_text"] == "Possible GRAVEL patch 12°\nCafé"
+    assert rich["label_rtf"] == RTF_LABEL
+    assert rich["label_alignment"] == 9
+
+
+def test_label_fields_do_not_overwrite_source_columns(tmp_path):
+    rows = [(1, "source value", text_blob(1.0, 2.0, "decoded", rotation=30.0))]
+    result = _export(tmp_path, ["ID1", "label_rotation", "TextGeometry"], rows, "", 33)
+    props = _features(result, "Point")[0]["properties"]
+    assert props["label_rotation"] == "source value"
+    assert props["gm_label_rotation"] == 30.0
+    assert props["label_text"] == "decoded"
+
+
+def test_string_attributes_never_carry_nul_characters(tmp_path):
+    rows = [(1, "Sand\x00wave\x00", line_blob(TRACK))]
+    result = _export(tmp_path, ["Id", "Remark", "Geometry"], rows, "Geometry", 1)
+    assert _features(result, "LineString")[0]["properties"]["Remark"] == "Sandwave"
+
+
+def test_text_table_with_an_unfamiliar_blob_column_name_is_found_by_content(tmp_path):
+    rows = [
+        (1, None, "key"),
+        (2, text_blob(1.0, 2.0, "abc"), "key"),
+    ]
+    result = _export(tmp_path, ["ID1", "SpatialText", "SpatialText_sk"], rows, "", 33)
+    assert result["status"] == "success"
+    assert result["geometry_fields_used"] == ["SpatialText"]
+    assert _features(result, "Point")[0]["properties"]["label_text"] == "abc"
+    assert result["feature_counts"] == {"Point": 1}
+
+
+def test_secondary_blob_column_is_found_by_content(tmp_path):
+    rows = [
+        (1, line_blob(TRACK), None),
+        (2, None, point_blob(5.0, 6.0)),
+    ]
+    result = _export(tmp_path, ["ID1", "LinearGeometry", "Anchor"], rows, "LinearGeometry", 1,
+                     split=True)
+    assert result["secondary_blob_decoded_count"] == 1
+    assert result["geometry_fields_used"] == ["LinearGeometry", "Anchor"]
+    assert result["feature_counts"] == {"LineString": 1, "Point": 1}
+
+
+def test_binary_and_text_columns_are_not_mistaken_for_geometry():
+    rows = [(1, b"\x01\x02", "text", point_blob(1.0, 2.0).decode("latin-1"))]
+    assert worker.find_blob_geometry_columns(["ID1", "Key", "Name", "Str"], rows) == []
 
 
 # --------------------------------------------------------------------------

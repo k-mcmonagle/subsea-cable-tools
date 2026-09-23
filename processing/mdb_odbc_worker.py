@@ -32,6 +32,7 @@ This script intentionally does NOT import qgis.*.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import math
 import os
@@ -670,7 +671,12 @@ def _coerce_json_value(v):
     except Exception:
         pass
 
-    if isinstance(v, (int, float, bool, str)):
+    if isinstance(v, str):
+        # GDAL reads GeoJSON strings as C strings: an embedded NUL would
+        # silently truncate the value in QGIS.
+        return v.replace("\x00", "")
+
+    if isinstance(v, (int, float, bool)):
         return v
 
     # bytes-like (excluding the geometry blob which we omit)
@@ -683,7 +689,7 @@ def _coerce_json_value(v):
         return f"<binary:{ln}>"
 
     try:
-        return str(v)
+        return str(v).replace("\x00", "")
     except Exception:
         return None
 
@@ -916,8 +922,50 @@ def _resolve_geometry_field(col_names, geom_field_name):
     return col_names.index(resolved), resolved, False
 
 
+def _text_properties(decoded):
+    """Return the label attributes of a decoded text BLOB, else ``None``."""
+    if decoded.text is None:
+        return None
+    props = {
+        "label_text": decoded.text,
+        "label_rotation": decoded.rotation,
+        "label_alignment": decoded.alignment,
+    }
+    if decoded.rtf is not None:
+        props["label_rtf"] = decoded.rtf.replace("\x00", "")
+    return props
+
+
+#: Rows scanned to recognise geometry BLOB columns by their content.
+_CONTENT_SCAN_ROWS = 500
+
+
+def find_blob_geometry_columns(col_names, rows):
+    """Return indexes of columns holding GeoMedia geometry BLOBs.
+
+    Recognises the BLOB signature rather than the column name, so warehouses
+    that name their geometry columns differently still import. ``*_sk``
+    spatial keys are never geometry.
+    """
+    found = []
+    for index, name in enumerate(col_names):
+        if normalise_field_name(name).endswith("_sk"):
+            continue
+        for row in rows:
+            value = row[index] if index < len(row) else None
+            data = coerce_blob_bytes(value)
+            if data is None:
+                continue
+            # Judge each column by its first non-empty value; text columns
+            # are never geometry.
+            if not isinstance(value, str) and decode_geometry_blob(data) is not None:
+                found.append(index)
+            break
+    return found
+
+
 def _decode_row_geometry(blob_bytes, geometry_type_code, forced_kind=None):
-    """Return ``(geojson, kind, mean_z, text)`` for a decodable BLOB, else ``None``."""
+    """Return ``(geojson, kind, mean_z, label_props)`` for a decodable BLOB, else ``None``."""
     decoded = decode_geometry_blob(blob_bytes)
     if decoded is None:
         return None
@@ -932,7 +980,7 @@ def _decode_row_geometry(blob_bytes, geometry_type_code, forced_kind=None):
     if geometry is None:
         return None
     mean_z = sum(v[2] for v in vertices) / len(vertices)
-    return geometry, kind, mean_z, decoded.text
+    return geometry, kind, mean_z, _text_properties(decoded)
 
 
 def _write_rows_to_geojson(mdb_path, table_name, col_names, rows,
@@ -946,18 +994,27 @@ def _write_rows_to_geojson(mdb_path, table_name, col_names, rows,
     """
     col_names = list(col_names)
     rows = iter(rows)
+    # Look at the first rows to recognise BLOB columns by content; they are
+    # replayed ahead of the rest, so nothing is consumed.
+    head = list(itertools.islice(rows, _CONTENT_SCAN_ROWS))
+    rows = itertools.chain(head, rows)
+    blob_columns = find_blob_geometry_columns(col_names, head)
 
     geom_index, geom_field_name, geom_field_missing = _resolve_geometry_field(
         col_names, geom_field_name)
 
     # Graphic (text) classes are registered without a primary geometry field;
-    # take the first schema column that looks like a geometry BLOB instead.
+    # take the first schema column that looks like a geometry BLOB instead,
+    # by name or, failing that, by content.
     if geom_index is None and not geom_field_missing and \
             geometry_type_code == GRAPHIC_TYPE_CODE:
         candidates = find_candidate_geometry_fields(col_names)
         if candidates:
             geom_field_name = candidates[0]
             geom_index = col_names.index(geom_field_name)
+        elif blob_columns:
+            geom_index = blob_columns[0]
+            geom_field_name = col_names[geom_index]
 
     # GFeatures names only the *primary* geometry column; GeoMedia tables often
     # carry a second one (e.g. CoordGeocodePoint) that holds the geometry for
@@ -967,6 +1024,10 @@ def _write_rows_to_geojson(mdb_path, table_name, col_names, rows,
         secondary_geom_indexes = [
             col_names.index(name) for name in find_candidate_geometry_fields(col_names)
             if col_names.index(name) != geom_index
+        ]
+        secondary_geom_indexes += [
+            index for index in blob_columns
+            if index != geom_index and index not in secondary_geom_indexes
         ]
 
     pair = find_candidate_coordinate_pair(col_names) if allow_xy_fallback else None
@@ -1013,13 +1074,13 @@ def _write_rows_to_geojson(mdb_path, table_name, col_names, rows,
             geometry_source = None
             depth = None
             kind = None
-            label_text = None
+            label_props = None
             forced_kind = layer_type if not split else None
 
             attempt = (_decode_row_geometry(blob_bytes, geometry_type_code, forced_kind)
                        if blob_bytes is not None else None)
             if attempt is not None:
-                geometry, kind, depth, label_text = attempt
+                geometry, kind, depth, label_props = attempt
                 geometry_source = "blob"
                 blob_decoded_count += 1
                 if not split and layer_type is None:
@@ -1035,7 +1096,7 @@ def _write_rows_to_geojson(mdb_path, table_name, col_names, rows,
                     attempt = _decode_row_geometry(alternate, geometry_type_code, forced_kind)
                     if attempt is None:
                         continue
-                    geometry, kind, depth, label_text = attempt
+                    geometry, kind, depth, label_props = attempt
                     geometry_source = "secondary_blob"
                     secondary_blob_decoded_count += 1
                     if not split and layer_type is None:
@@ -1074,11 +1135,10 @@ def _write_rows_to_geojson(mdb_path, table_name, col_names, rows,
             props["depth"] = depth
             props["source"] = source_name
             props["geometry_source"] = geometry_source
-            if label_text is not None:
-                key = "label_text"
+            for key, value in (label_props or {}).items():
                 if key in props:
-                    key = "gm_label_text"
-                props[key] = label_text
+                    key = "gm_" + key
+                props[key] = value
 
             feature = {"type": "Feature", "geometry": geometry, "properties": props}
             if not sink.write(str(kind), feature):
@@ -1125,6 +1185,7 @@ def _write_rows_to_geojson(mdb_path, table_name, col_names, rows,
         geometry_types_found=sorted(outputs.keys()),
         geometry_fields_used=geometry_fields_used,
         outputs=outputs,
+        feature_counts=sink.counts(),
         message=message,
         layer_type=layer_type,
         written=written,

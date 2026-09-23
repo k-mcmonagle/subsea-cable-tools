@@ -453,6 +453,8 @@ def import_table_as_memory_layer(mdb_file, table_name, geom_field_name, geometry
             # Add extra fields.
             if geometry_type_code == GRAPHIC_TYPE_CODE:
                 fields.append(QgsField("label_text", FIELD_TYPE_STRING))
+                fields.append(QgsField("label_rotation", FIELD_TYPE_DOUBLE))
+                fields.append(QgsField("label_alignment", FIELD_TYPE_INT))
             fields.append(QgsField("depth", FIELD_TYPE_DOUBLE))
             fields.append(QgsField("source", FIELD_TYPE_STRING))
             dp.addAttributes(fields)
@@ -483,10 +485,9 @@ def import_table_as_memory_layer(mdb_file, table_name, geom_field_name, geometry
                     break
 
                 blob = row[geom_index]
-                label_text = None
+                decoded_text = None
                 if geometry_type_code == GRAPHIC_TYPE_CODE:
-                    decoded = decode_geometry_blob(blob)
-                    label_text = decoded.text if decoded is not None else None
+                    decoded_text = decode_geometry_blob(blob)
                 vertices = parse_blob(blob)
                 if not vertices:
                     skipped_parse += 1
@@ -527,12 +528,16 @@ def import_table_as_memory_layer(mdb_file, table_name, geom_field_name, geometry
                         elif field_def.type() == FIELD_TYPE_DOUBLE:
                             attr_values.append(float(value) if value is not None else None)
                         else:
-                            attr_values.append(str(value) if value is not None else "")
+                            attr_values.append(
+                                str(value).replace("\x00", "") if value is not None else "")
                     except (ValueError, TypeError):
                         attr_values.append(None)
 
                 if geometry_type_code == GRAPHIC_TYPE_CODE:
-                    attr_values.append(label_text if label_text is not None else "")
+                    has_text = decoded_text is not None and decoded_text.text is not None
+                    attr_values.append(decoded_text.text if has_text else "")
+                    attr_values.append(decoded_text.rotation if has_text else None)
+                    attr_values.append(decoded_text.alignment if has_text else None)
                 attr_values.append(avg_depth)
                 attr_values.append(source_name)
                 feat.setAttributes(attr_values)
@@ -1042,9 +1047,11 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
 
                 for geom_type_name, path in outputs.items():
                     if not self._should_load_geometry_type(geom_type_name, load_all_geoms):
-                        feedback.pushInfo(
-                            f"  Skipping {geom_type_name} layer for '{table_name}' "
-                            "(set SUBSEA_MDB_LOAD_ALL_GEOMS=1 to include)")
+                        count = (info.get('feature_counts') or {}).get(geom_type_name)
+                        count_text = f"{count} " if isinstance(count, int) else ""
+                        feedback.pushWarning(
+                            f"  Not loaded: {count_text}{geom_type_name} feature(s) in "
+                            f"'{table_name}' (set SUBSEA_MDB_LOAD_ALL_GEOMS=1 to include)")
                         continue
                     if not path or not os.path.exists(path):
                         feedback.reportError(
@@ -1208,14 +1215,19 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
 <h4>How it Works</h4>
 <p>The tool connects to the MDB file and looks for a <code>GFeatures</code> table to identify the feature classes within the database. For each feature class found, it reads the geometry from a binary (BLOB) field and creates a corresponding QGIS layer. Setting <code>SUBSEA_MDB_SCHEMA_DISCOVERY=1</code> additionally inspects every physical table so that populated tables missing from <code>GFeatures</code> can be offered when they carry strong spatial evidence (a GeoMedia geometry field or a recognised coordinate pair); metadata, lookup and companion <code>*_Name</code>/<code>*_Text</code> tables are reported but never loaded as geometry layers. That extra pass costs a table-definition parse per table, so it is off by default.</p>
 <p>GeoMedia point, oriented point, polyline, polygon, boundary (polygons with holes), collection and graphic-text BLOBs are all decoded. Text feature classes (for example <code>Description</code>, <code>Sediment_Classification</code> or <code>*_Name</code> annotation tables) import as point layers carrying the label string in a <code>label_text</code> field, ready for labelling in QGIS. If a row's BLOB cannot be decoded and the table has an explicit coordinate pair (Easting/Northing, X/Y, Longitude/Latitude or Lon/Lat, matched case-insensitively), a point is built from those columns instead. Fallback geometry is never silent: every feature records how its geometry was obtained and the log reports BLOB-decoded and fallback counts separately.</p>
-<p>By default, the tool imports <b>LineString</b> layers (e.g. bathymetric contour lines, cable routes), <b>Polygon</b> layers (e.g. seabed feature classifications, sediment type areas, restricted areas), and <b>Point</b> layers (e.g. survey points, fixes, assets). Each geometry type is loaded as a separate layer so they never conflict. MultiPoint and other multi-part geometries can be included by setting the <code>SUBSEA_MDB_LOAD_ALL_GEOMS=1</code> environment variable.</p>
+<p>By default, the tool imports <b>LineString</b> layers (e.g. bathymetric contour lines, cable routes), <b>Polygon</b> layers (e.g. seabed feature classifications, sediment type areas, restricted areas), and <b>Point</b> layers (e.g. survey points, fixes, assets). Each geometry type is loaded as a separate layer so they never conflict. MultiPoint and other multi-part geometries can be included by setting the <code>SUBSEA_MDB_LOAD_ALL_GEOMS=1</code> environment variable; when they are left out the log shows a warning with the number of features not loaded.</p>
 <p>It automatically adds three fields to each new layer:
 <ul>
   <li><b>depth:</b> The average Z-value of the feature's vertices, if available (useful for bathymetric data; will be empty/zero for non-3D features).</li>
     <li><b>source:</b> The filename of the source MDB file for per-feature traceability.</li>
     <li><b>geometry_source:</b> <code>blob</code> when the geometry came from the GeoMedia BLOB, or <code>xy_fallback</code> when it was built from a coordinate pair.</li>
 </ul>
-Text features additionally carry a <b>label_text</b> field holding the decoded label string.
+Text features additionally carry:
+<ul>
+  <li><b>label_text:</b> the label string (plain text; rich-text labels are converted, with the original kept in <b>label_rtf</b>).</li>
+  <li><b>label_rotation:</b> GeoMedia's label angle in degrees counter-clockwise. QGIS rotates labels clockwise, so use <code>-"label_rotation"</code> as the data-defined label rotation.</li>
+  <li><b>label_alignment:</b> GeoMedia's justification code (0&ndash;10) around the anchor point.</li>
+</ul>
 
 </p>
 
@@ -1237,7 +1249,7 @@ Text features additionally carry a <b>label_text</b> field holding the decoded l
 
 <h4>Known Limitations & Troubleshooting</h4>
 <ul>
-  <li><b>BLOB Format:</b> GeoMedia point, polyline, polygon, boundary, collection and graphic-text BLOBs are supported. Other vendor-specific variants (for example arc primitives) are still reported as <code>parse_failed</code> rather than imported. Text placement (rotation, alignment, font) is not preserved &mdash; only the anchor point and the string.</li>
+  <li><b>BLOB Format:</b> GeoMedia point, polyline, polygon, boundary, collection and graphic-text BLOBs are supported. Other vendor-specific variants (for example arc primitives) are still reported as <code>parse_failed</code> rather than imported. Label rotation and alignment are kept as attributes; font and size are not. Geometry columns are recognised by name or, when the name is unfamiliar, by the GeoMedia BLOB signature in their content.</li>
   <li><b>Metadata Tables:</b> It relies on specific system tables like <code>GFeatures</code>, <code>FieldLookup</code>, and <code>AttributeProperties</code>. If these are missing or have an unexpected structure, only schema-based discovery is available.</li>
     <li><b>Large batches:</b> Temporary GeoPackages remain available for the QGIS session. If space is limited, change the temporary folder under Processing settings to a drive with more free space. Canceling Processing terminates the active MDB worker.</li>
     <li><b>Errors:</b> Every attempted table reports row counts, BLOB-decoded counts and fallback counts in the Log Messages Panel. A populated table that yields no geometry is reported as an error, not silently skipped. Other tables and files continue importing where possible.</li>

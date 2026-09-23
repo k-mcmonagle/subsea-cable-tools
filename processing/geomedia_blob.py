@@ -22,12 +22,18 @@ type code                        body
 0xC5 boundary                    int32 size + exterior, int32 size + interior
 0xC6 collection, 0xCB multiline, int32 part count, then int32 size + part
 0xCC multipolygon
-0xC9 graphic text                origin XYZ (3 doubles), orientation
-                                 quaternion (4 doubles), 4 opaque bytes
-                                 (alignment/format flags), int32 byte count,
-                                 then the label bytes (Windows-1252, or
-                                 UTF-16LE when the payload is twice the count)
+0xC9 graphic text                origin XYZ (3 doubles), rotation in
+                                 degrees counter-clockwise (1 double),
+                                 normal vector (3 doubles, usually 0,0,1),
+                                 3 flag bytes, 1 alignment byte (0-10),
+                                 int32 count, then the label bytes
+                                 (Windows-1252 or UTF-16LE; plain or RTF)
 ===============================  ==========================================
+
+UTF-16 labels are recognised
+whether ``count`` holds characters or bytes: decoding a byte-counted UTF-16
+label as Windows-1252 yields ``"l\\x00a\\x00..."``, which GDAL then truncates
+at the first NUL, so the label arrives in QGIS as its first letter.
 
 A reader that always treats bytes 16..19 as a point count therefore decodes
 garbage for every point, boundary and collection feature.
@@ -35,6 +41,8 @@ garbage for every point, boundary and collection feature.
 
 from __future__ import annotations
 
+import math
+import re
 import struct
 from collections import namedtuple
 
@@ -64,10 +72,14 @@ MULTI_KINDS = ("MultiPoint", "MultiLineString", "MultiPolygon", "GeometryCollect
 
 #: ``rings`` holds vertex tuples for simple geometries (a polygon's first ring
 #: is its exterior); ``parts`` holds nested geometries for collections;
-#: ``text`` carries the label string of a graphic-text (0xC9) blob, ``None``
-#: for every other geometry kind.
+#: ``text`` carries the plain label string of a graphic-text (0xC9) blob,
+#: ``rtf`` the original string when GeoMedia stored rich text, ``rotation``
+#: the label angle (degrees counter-clockwise) and ``alignment`` GeoMedia's
+#: 0-10 justification code. All four are ``None`` for other geometry kinds.
 GeomediaGeometry = namedtuple(
-    "GeomediaGeometry", ("kind", "rings", "parts", "text"), defaults=(None,))
+    "GeomediaGeometry",
+    ("kind", "rings", "parts", "text", "rtf", "rotation", "alignment"),
+    defaults=(None, None, None, None))
 
 
 def coerce_blob_bytes(value):
@@ -179,26 +191,122 @@ def _decode_boundary(body, depth):
     return GeomediaGeometry("Polygon", tuple(rings), ())
 
 
-#: Text body: origin (24) + quaternion (32) + flag bytes (4) + byte count (4).
+#: Text body: origin (24) + rotation (8) + normal (24) + flags (3) +
+#: alignment (1) + count (4).
 _TEXT_BODY_MIN = 64
+_TEXT_ALIGNMENT_OFFSET = 59
+
+#: One RTF token: control word, hex escape, control symbol, brace, line
+#: break (ignored in RTF source) or a run of literal text.
+_RTF_TOKEN = re.compile(
+    r"\\([a-zA-Z]+)(-?\d+)? ?|\\'([0-9a-fA-F]{2})|\\([^a-zA-Z'])|([{}])|[\r\n]+|([^\\{}\r\n]+)")
+#: Destinations whose content is formatting metadata, never label text.
+_RTF_SKIPPED_DESTINATIONS = {
+    "fonttbl", "colortbl", "stylesheet", "info", "pict", "header", "footer",
+    "generator", "listtable", "listoverridetable", "rsidtbl", "themedata",
+    "datastore", "latentstyles", "xmlnstbl", "mmathPr",
+}
+_RTF_CHARACTER_WORDS = {
+    "par": "\n", "line": "\n", "tab": "\t", "emdash": "\u2014", "endash": "\u2013",
+    "lquote": "\u2018", "rquote": "\u2019", "ldblquote": "\u201c",
+    "rdblquote": "\u201d", "bullet": "\u2022",
+}
+
+
+def rtf_to_text(rtf):
+    """Return the visible text of an RTF string (formatting is discarded)."""
+    out = []
+    stack = []
+    skip = False
+    unicode_fallback = 1
+    pending_fallback = 0
+    for match in _RTF_TOKEN.finditer(rtf):
+        word, arg, hex_code, symbol, brace, literal = match.groups()
+        if brace == "{":
+            stack.append((skip, unicode_fallback))
+            continue
+        if brace == "}":
+            if stack:
+                skip, unicode_fallback = stack.pop()
+            continue
+        # A \uN character is followed by fallback characters for old readers.
+        if pending_fallback and (literal or hex_code):
+            if hex_code:
+                pending_fallback -= 1
+                continue
+            dropped = min(pending_fallback, len(literal))
+            literal = literal[dropped:]
+            pending_fallback -= dropped
+            if not literal:
+                continue
+        if word is not None:
+            if word in _RTF_SKIPPED_DESTINATIONS:
+                skip = True
+            elif word == "uc":
+                unicode_fallback = int(arg or 1)
+            elif word == "u":
+                if not skip and arg:
+                    out.append(chr(int(arg) & 0xFFFF))
+                pending_fallback = unicode_fallback
+            elif not skip and word in _RTF_CHARACTER_WORDS:
+                out.append(_RTF_CHARACTER_WORDS[word])
+            continue
+        if symbol is not None:
+            if symbol == "*":
+                skip = True  # ignorable destination
+            elif not skip:
+                if symbol in "\\{}":
+                    out.append(symbol)
+                elif symbol == "~":
+                    out.append("\u00a0")
+                elif symbol in "\r\n":
+                    out.append("\n")
+            continue
+        if skip:
+            continue
+        if hex_code:
+            out.append(bytes([int(hex_code, 16)]).decode("cp1252", "replace"))
+        elif literal:
+            out.append(literal)
+    return "".join(out).strip()
+
+
+def is_rtf(text):
+    return text.lstrip().startswith("{\\rtf")
+
+
+def _decode_label_bytes(payload, count):
+    """Decode a text-blob label, whichever way the writer counted it."""
+    if count >= 1 and len(payload) >= 2 * count and not any(payload[1:2 * count:2]):
+        # UTF-16LE, ``count`` in characters.
+        data, encoding = payload[:2 * count], "utf-16-le"
+    elif (count >= 2 and count % 2 == 0 and len(payload) >= count
+            and not any(payload[1:count:2]) and any(payload[0:count:2])):
+        # UTF-16LE, ``count`` in bytes.
+        data, encoding = payload[:count], "utf-16-le"
+    else:
+        data, encoding = payload[:count], "cp1252"
+    # A NUL terminator or padding would truncate the value downstream (GDAL
+    # reads strings as C strings), so NULs never survive decoding.
+    return data.decode(encoding, "replace").replace("\x00", "")
 
 
 def _decode_text(body):
     if len(body) < _TEXT_BODY_MIN:
         return None
     vertex = struct.unpack_from("<ddd", body, 0)
+    rotation = struct.unpack_from("<d", body, 24)[0]
     count = _read_int32(body, 60)
     if count is None or count < 0:
         return None
-    payload = body[_TEXT_BODY_MIN:]
-    # GeoMedia writes the label in the database code page with ``count`` bytes;
-    # some writers store UTF-16LE instead, in which case the payload holds two
-    # bytes per counted character.
-    if count and len(payload) >= 2 * count and not any(payload[1:2 * count:2]):
-        text = payload[:2 * count].decode("utf-16-le", "replace")
-    else:
-        text = payload[:count].decode("cp1252", "replace")
-    return GeomediaGeometry("Point", ((vertex,),), (), text)
+    text = _decode_label_bytes(body[_TEXT_BODY_MIN:], count)
+    rtf = None
+    if is_rtf(text):
+        rtf, text = text, rtf_to_text(text)
+    return GeomediaGeometry(
+        "Point", ((vertex,),), (), text, rtf,
+        rotation if math.isfinite(rotation) else None,
+        body[_TEXT_ALIGNMENT_OFFSET])
 
 
 def decode_geometry_blob(blob, _depth=0):
