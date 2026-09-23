@@ -25,6 +25,23 @@ def measurement(a, b, xs=None, ys=None):
     return result
 
 
+def write_measurements_csv(path, measurements, x_label='distance_m', x_factor=1.0):
+    """One row per on-plot measurement. Endpoint x is reported in the plot's
+    horizontal convention (``x_factor`` per metre, e.g. 0.001 for KP km)."""
+    fields = ['number', 'source', 'snapped', 'from_' + x_label, 'from_depth_m',
+              'to_' + x_label, 'to_depth_m', 'width_m', 'depth_change_m', 'height_m',
+              'endpoint_distance_m', 'seabed_distance_m', 'angle_deg', 'slope_deg']
+    with open(path, 'w', newline='', encoding='utf-8-sig') as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields, extrasaction='ignore')
+        writer.writeheader()
+        for number, m in enumerate(measurements, 1):
+            row = {'number': number, 'source': m['source'], 'snapped': int(bool(m.get('snapped'))),
+                   'from_' + x_label: m['a'][0] * x_factor, 'from_depth_m': m['a'][1],
+                   'to_' + x_label: m['b'][0] * x_factor, 'to_depth_m': m['b'][1]}
+            row.update(m['metrics'])
+            writer.writerow(row)
+
+
 def write_profile_csv(path, profile, series, slopes_x, slopes, measurements):
     """Long-form observations plus measurement rows; blanks denote unavailable data."""
     fields = ['record', 'source', 'distance_m', 'depth_positive_down_m', 'slope_deg',

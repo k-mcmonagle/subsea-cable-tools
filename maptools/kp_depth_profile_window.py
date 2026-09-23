@@ -5,12 +5,12 @@ import math
 import pyqtgraph as pg
 from qgis.PyQt.QtCore import QSettings, QTimer, Qt, pyqtSignal
 from qgis.PyQt.QtWidgets import (QCheckBox, QDialog, QHBoxLayout, QLabel,
-    QVBoxLayout, QPushButton, QComboBox, QDoubleSpinBox, QTableWidget,
-    QTableWidgetItem, QFileDialog, QMessageBox, QWidget, QAbstractItemView)
+    QVBoxLayout, QPushButton, QComboBox, QDoubleSpinBox, QFileDialog, QMessageBox, QWidget)
 from ..qgis_compat import WINDOW_HINT_CLOSE, WINDOW_HINT_TITLE, WINDOW_TYPE_TOOL
-from ..slope_utils import interpolate_covered, is_finite
+from ..slope_utils import is_finite
 from .kp_profile_math import merged_contour_crossings, profile_slope_series
-from .profile_measurements import UNITS, measurement, write_profile_csv
+from .profile_measure_controller import HINT, ProfileMeasureController
+from .profile_measurements import UNITS, write_profile_csv
 
 _COLORS = ['#1565c0', '#c05a10', '#238443', '#8e44ad', '#b22222']
 
@@ -42,11 +42,6 @@ class KPDepthProfileWindow(QDialog):
         self._pending = self._sampler = self._distance_area = None
         self._profile = None
         self._route_frame = None
-        self._preview = None
-        self._moving_endpoint = False
-        self._measurement_graphics = []
-        self._measurements = []
-        self._first_point = None
         self._series = []
         self._settings = QSettings('SubseaCableTools', 'KPMouseTool')
         self._timer = QTimer(self); self._timer.setSingleShot(True)
@@ -88,27 +83,25 @@ class KPDepthProfileWindow(QDialog):
             item.getAxis('bottom').enableAutoSIPrefix(False)
             item.getAxis('left').enableAutoSIPrefix(False)
         self._legend = self.depth_item.addLegend()
-        self.depth_widget.scene().sigMouseClicked.connect(self._plot_click)
-        self.depth_widget.scene().sigMouseMoved.connect(self._plot_move)
+        self.measure = ProfileMeasureController(
+            self, plot_factors=lambda: (UNITS[self.x_units.currentText()], UNITS[self.z_units.currentText()]),
+            text_units=lambda: (self.x_units.currentText(), self.z_units.currentText()),
+            depth_down=self.invert_check.isChecked)
+        self.measure.modeChanged.connect(self._measure_mode)
+        self.measure.statusChanged.connect(lambda text: self.status_label.setText(text))
+        self.measure.attach(self.depth_item)
+        self.measure_action = self.measure.action
+        self.snap_check = self.measure.snap_check
+        self.measure_source = self.measure.source_combo
+        self.undo_btn = self.measure.delete_btn
+        self.table = self.measure.table
         row = QHBoxLayout(); layout.addLayout(row)
-        menu = self.depth_item.vb.getMenu(None)
-        self.measure_action = menu.addAction('Measure')
-        self.measure_action.setCheckable(True)
-        self.measure_action.setToolTip('Click two endpoints; drag to pan and scroll to zoom. Uncheck to stop measuring.')
-        self.measure_action.toggled.connect(self._measure_mode)
         row.addWidget(QLabel('Right-click plot to measure'))
-        self.snap_check = QCheckBox('Snap to profile'); self.snap_check.setChecked(True); row.addWidget(self.snap_check)
-        self.measure_source = QComboBox(); row.addWidget(self.measure_source, 1)
-        self.measure_source.currentIndexChanged.connect(self._cancel_pending_measurement)
-        self.snap_check.toggled.connect(self._cancel_pending_measurement)
-        self.undo_btn = QPushButton('Delete / undo'); self.undo_btn.clicked.connect(self._delete_measurement); row.addWidget(self.undo_btn)
-        clear = QPushButton('Clear measurements'); clear.clicked.connect(self.clear_measurements); row.addWidget(clear)
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(['Length', 'X', 'Y', 'Angle (°)'])
-        self.table.setToolTip('Length: straight line between endpoints (horizontal units). X: horizontal separation. Y: absolute depth difference (vertical units). Angle: unsigned endpoint inclination to horizontal (0–90°), not the maximum seabed slope between points. Measurements use true distances, regardless of vertical exaggeration or KP labels.')
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setMaximumHeight(145); layout.addWidget(self.table)
+        row.addWidget(self.snap_check)
+        row.addWidget(self.measure_source, 1)
+        row.addWidget(self.undo_btn)
+        row.addWidget(self.measure.clear_btn)
+        layout.addWidget(self.table)
         row = QHBoxLayout(); layout.addLayout(row)
         self.status_label = QLabel('Move over the map; Space freezes the line.'); self.status_label.setWordWrap(True)
         row.addWidget(self.status_label, 1)
@@ -174,7 +167,7 @@ class KPDepthProfileWindow(QDialog):
         try:
             self._profile = self._sampler.profile(origin, target, self._distance_area)
             self._profile['endpoints'] = [(origin.x(), origin.y()), (target.x(), target.y())]
-            self._measurements = []; self._first_point = None; self.table.setRowCount(0)
+            self.measure.reset()
             self._redraw()
         except Exception as exc:
             self._profile = None
@@ -183,13 +176,11 @@ class KPDepthProfileWindow(QDialog):
 
     def _calculation_changed(self, *_):
         # Existing measurements belong to the previous calculation surface.
-        self._measurements = []; self._first_point = None; self.table.setRowCount(0)
+        self.measure.reset()
         self._redraw()
 
     def _redraw(self, *_):
         self.depth_item.clear(); self.slope_item.clear(); self._legend.clear()
-        self._preview = None
-        self._measurement_graphics = []
         for item in (self.depth_item, self.slope_item):
             axis = item.getAxis("bottom"); axis.picture = None; axis.update()
         self._series = []
@@ -217,11 +208,6 @@ class KPDepthProfileWindow(QDialog):
         if profile['contours']:
             x, y = merged_contour_crossings(profile)
             self._series.append({'name':'Contours (linear crossings)', 'x':x, 'y':y})
-        previous = self.measure_source.currentText()
-        self.measure_source.blockSignals(True); self.measure_source.clear()
-        for series in self._series: self.measure_source.addItem(series['name'])
-        if previous: self.measure_source.setCurrentText(previous)
-        self.measure_source.blockSignals(False)
         for i, series in enumerate(self._series):
             x = [v * xf for v in series['x']]
             y = [v * zf if is_finite(v) else math.nan for v in series['y']]
@@ -238,192 +224,19 @@ class KPDepthProfileWindow(QDialog):
         sy = [v if is_finite(v) else math.nan for v in self._slopes]
         kwargs = {'fillLevel':0, 'brush':pg.mkBrush(90, 100, 120, 40)} if self.shade_check.isChecked() else {}
         self.slope_item.plot(sx, sy, pen=pg.mkPen('#444444', width=2), connect='finite', antialias=True, **kwargs)
-        self._draw_measurements()
+        self.measure.set_series(self._series)
         self._update_status()
 
     def _measure_mode(self, checked):
         if checked:
             self.set_frozen(True)
-        self._first_point = None
-        self.depth_item.vb.setMouseEnabled(x=True, y=True)
-        self._redraw()
-
-    def _plot_click(self, event):
-        if not self.measure_action.isChecked() or event.button() != Qt.MouseButton.LeftButton:
-            return
-        # Pyqtgraph emits clicks separately from drags. Ignore clicks already
-        # consumed by plot controls and double-clicks used for navigation.
-        if getattr(event, 'isAccepted', lambda: False)() or getattr(event, 'double', lambda: False)():
-            return
-        if not self.depth_item.vb.sceneBoundingRect().contains(event.scenePos()):
-            return
-        index = self.measure_source.currentIndex()
-        if not 0 <= index < len(self._series): return
-        point = self.depth_item.vb.mapSceneToView(event.scenePos())
-        x = point.x() / UNITS[self.x_units.currentText()]
-        z = point.y() / UNITS[self.z_units.currentText()]
-        series = self._series[index]
-        if self.snap_check.isChecked():
-            z = interpolate_covered(series['x'], series['y'], x)
-            if z is None:
-                self.status_label.setText('No supported profile at that position. Choose a point within coverage.')
-                return
-        if not is_finite(x) or not is_finite(z): return
-        event.accept()
-        if self._first_point is None:
-            self._first_point = ((x, z), index, self.snap_check.isChecked())
-            self.status_label.setText('First point placed. Click the second point; Escape cancels this measurement.')
-            self._redraw()
-            self.status_label.setText("First point placed. Click the second point; Escape cancels.")
-            return
-        a, first_index, snapped = self._first_point
-        if first_index != index or snapped != self.snap_check.isChecked():
-            self._first_point = None
-            self.status_label.setText('Source or snapping changed. Place the first point again.')
-            return
-        metrics = measurement(a, (x, z), series['x'] if snapped else None, series['y'] if snapped else None)
-        self._measurements.append({'a':a, 'b':(x,z), 'source':series['name'], 'source_index':index, 'snapped':snapped, 'metrics':metrics})
-        self._first_point = None
-        self._redraw()
-
-    def _cancel_pending_measurement(self, *_):
-        if self._first_point is not None:
-            self._first_point = None
-            self._redraw()
-
-    def _measurement_text(self, values):
-        xf, zf = UNITS[self.x_units.currentText()], UNITS[self.z_units.currentText()]
-        return ['%.3f %s' % (values[key]*factor, unit) for key,factor,unit in
-                [('endpoint_distance_m',xf,self.x_units.currentText()),
-                 ('width_m',xf,self.x_units.currentText()),
-                 ('height_m',zf,self.z_units.currentText())]]
-
-    def _plot_move(self, position):
-        if not self._first_point or not self.measure_action.isChecked():
-            return
-        a,index,snapped = self._first_point
-        if (not self.depth_item.vb.sceneBoundingRect().contains(position)
-                or index != self.measure_source.currentIndex()
-                or snapped != self.snap_check.isChecked()):
-            if self._preview:
-                for item in self._preview: item.hide()
-            return
-        point = self.depth_item.vb.mapSceneToView(position)
-        xf, zf = UNITS[self.x_units.currentText()], UNITS[self.z_units.currentText()]
-        x,z = point.x()/xf, point.y()/zf
-        series = self._series[index]
-        if snapped: z = interpolate_covered(series['x'],series['y'],x)
-        if not is_finite(x) or not is_finite(z):
-            if self._preview:
-                for item in self._preview: item.hide()
-            return
-        if self._preview is None:
-            self._preview = self._make_triangle(preview=True)
-        self._update_triangle(self._preview, a, (x,z), measurement(a,(x,z)))
-
-    def _make_triangle(self, preview=False):
-        diagonal = pg.PlotDataItem(pen=pg.mkPen('#c2185b',width=2,
-            style=Qt.PenStyle.DashLine if preview else Qt.PenStyle.SolidLine))
-        legs = pg.PlotDataItem(pen=pg.mkPen('#c2185b',width=1,style=Qt.PenStyle.DashLine))
-        labels = [pg.TextItem(color='#8e1243',anchor=anchor,
-                  fill=pg.mkBrush(255,255,255,210)) for anchor in ((.5,1),(.5,0),(0,.5))]
-        items = (diagonal,legs,*labels)
-        for item in items: self.depth_item.addItem(item,ignoreBounds=True)
-        return items
-
-    @staticmethod
-    def _angle_text(values):
-        angle = values.get('angle_deg')
-        return '—' if angle is None else '%.2f°' % angle
-
-    def _update_triangle(self, items, a, b, values, number=None):
-        xf, zf = UNITS[self.x_units.currentText()], UNITS[self.z_units.currentText()]
-        ax,az,bx,bz = a[0]*xf,a[1]*zf,b[0]*xf,b[1]*zf
-        diagonal,legs,length_label,x_label,y_label = items
-        diagonal.setData([ax,bx],[az,bz])
-        # Right-angle corner is (b.x, a.z); legs retain physical X/Y meaning.
-        legs.setData([ax,bx,bx],[az,az,bz])
-        length,x,y = self._measurement_text(values)
-        prefix = '%d: ' % number if number is not None else ''
-        # Put labels outside the triangle so shallow slopes do not stack X
-        # and diagonal text on top of one another. Respect depth-axis inversion.
-        down_on_screen = (bz-az) * (1 if self.invert_check.isChecked() else -1) >= 0
-        x_label.setAnchor((.5,1 if down_on_screen else 0))
-        length_label.setAnchor((.5,0 if down_on_screen else 1))
-        y_label.setAnchor((0 if bx >= ax else 1,.5))
-        length_label.setText(prefix+'Length '+length+' / '+self._angle_text(values))
-        length_label.setPos((ax+bx)/2,(az+bz)/2)
-        x_label.setText('X '+x); x_label.setPos((ax+bx)/2,az)
-        y_label.setText('Y '+y); y_label.setPos(bx,(az+bz)/2)
-        # Zero-length legs have no distinct side on which to place a label.
-        for item in items: item.show()
-        x_label.setVisible(abs(bx-ax)>1e-12)
-        y_label.setVisible(abs(bz-az)>1e-12)
-
-    def _draw_measurements(self):
-        xf, zf = UNITS[self.x_units.currentText()], UNITS[self.z_units.currentText()]
-        self.table.setRowCount(len(self._measurements))
-        for row, m in enumerate(self._measurements):
-            a,b = m['a'],m['b']
-            triangle = self._make_triangle()
-            handles = []
-            for endpoint, point in enumerate((a,b)):
-                handle = pg.TargetItem(pos=(point[0]*xf,point[1]*zf),size=11,symbol='o',
-                    movable=True,pen=pg.mkPen('#c2185b'),brush=pg.mkBrush('#ffffff'),
-                    hoverPen=pg.mkPen('#1565c0',width=2))
-                handle.setZValue(100)
-                self.depth_item.addItem(handle,ignoreBounds=True)
-                handle.sigPositionChanged.connect(lambda target,r=row,e=endpoint: self._move_endpoint(r,e,target))
-                handles.append(handle)
-            self._measurement_graphics.append((triangle,handles))
-            cells = self._measurement_text(m['metrics'])
-            self._update_triangle(triangle,a,b,m['metrics'],row+1)
-            cells.append(self._angle_text(m['metrics']))
-            for col,value in enumerate(cells):
-                cell = QTableWidgetItem(value); cell.setToolTip(m['source']); self.table.setItem(row,col,cell)
-        if self._first_point:
-            (x,z),_,_ = self._first_point
-            self.depth_item.plot([x*xf],[z*zf],pen=None,symbol='o',symbolBrush='#c2185b')
-
-    def _move_endpoint(self, row, endpoint, target):
-        if self._moving_endpoint or row >= len(self._measurements):
-            return
-        m = self._measurements[row]
-        xf,zf = UNITS[self.x_units.currentText()],UNITS[self.z_units.currentText()]
-        x,z = target.pos().x()/xf,target.pos().y()/zf
-        index = m.get('source_index', -1)
-        series = self._series[index] if 0 <= index < len(self._series) else None
-        snapped = m.get('snapped',False)
-        if snapped:
-            z = interpolate_covered(series['x'],series['y'],x) if series else None
-        key = 'a' if endpoint == 0 else 'b'
-        if not is_finite(x) or not is_finite(z):
-            x,z = m[key]  # Keep the last valid endpoint at gaps / outside coverage.
-        self._moving_endpoint = True
-        try:
-            target.setPos(x*xf,z*zf)
-            m[key] = (x,z)
-            m['metrics'] = measurement(m['a'],m['b'],
-                series['x'] if snapped and series else None,
-                series['y'] if snapped and series else None)
-            triangle,_ = self._measurement_graphics[row]
-            self._update_triangle(triangle,m['a'],m['b'],m['metrics'],row+1)
-            cells = self._measurement_text(m['metrics'])+[self._angle_text(m['metrics'])]
-            for col,value in enumerate(cells): self.table.item(row,col).setText(value)
-        finally:
-            self._moving_endpoint = False
+        self._update_status()
 
     def _delete_measurement(self):
-        if self._first_point:
-            self._first_point = None
-        elif self._measurements:
-            row = self.table.currentRow()
-            self._measurements.pop(row if row >= 0 else -1)
-        self._redraw()
+        self.measure.delete_measurement()
 
     def clear_measurements(self):
-        self._measurements = []; self._first_point = None; self.table.setRowCount(0)
-        if self._profile: self._redraw()
+        self.measure.clear()
 
     def _update_status(self):
         state = 'Frozen' if self.frozen else 'Live'
@@ -438,7 +251,7 @@ class KPDepthProfileWindow(QDialog):
             text += '. Repeated raster terraces: suggested averaging length %.2f m; native resolution needs verification' % terrace
             if self.window_spin.value() and self.window_spin.value() < terrace:
                 text += ' — selected length may exaggerate step edges'
-        if self.measure_action.isChecked(): text += '. Click two points; drag to pan; scroll to zoom. Right-click → Measure to stop; Escape cancels; Delete removes a measurement.'
+        if self.measure.active: text += '. ' + HINT + ' Right-click → Measure to stop.'
         self.status_label.setText(text)
 
     def _export(self, kind):
@@ -455,7 +268,7 @@ class KPDepthProfileWindow(QDialog):
                 distances = {x for s in self._series for x in s['x']} | set(self._slopes_x)
                 self._working_profile['route_kp'] = {x:self._kp_at_distance(x) for x in distances}
                 self._working_profile['axis_labels'] = 'nearest route KP (km); distance spacing' if self.kp_check.isChecked() else 'distance'
-                write_profile_csv(path,self._working_profile,self._series,self._slopes_x,self._slopes,self._measurements)
+                write_profile_csv(path,self._working_profile,self._series,self._slopes_x,self._slopes,self.measure.measurements)
         except Exception as exc:
             QMessageBox.warning(self,'Export failed',str(exc))
 
@@ -465,12 +278,8 @@ class KPDepthProfileWindow(QDialog):
     def keyPressEvent(self,event):
         if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
             self.set_frozen(not self.frozen); event.accept()
-        elif event.key() == Qt.Key.Key_Delete:
-            self._delete_measurement(); event.accept()
-        elif event.key() == Qt.Key.Key_Escape and self._first_point:
-            self._first_point = None; self._redraw(); event.accept()
-        elif event.key() == Qt.Key.Key_Escape and self.measure_action.isChecked():
-            self.measure_action.setChecked(False); event.accept()
+        elif self.measure.handle_key(event):
+            event.accept()
         elif event.key() == Qt.Key.Key_Escape:
             self.close(); event.accept()
         else: super().keyPressEvent(event)

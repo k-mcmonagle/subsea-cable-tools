@@ -25,7 +25,7 @@ Available in the Processing Toolbox under **Subsea Cable Tools**, grouped into:
 
 - **KP Mouse Tool** – live KP/DCC under the cursor; ellipsoidal or cartesian distance modes; geodesic range ring; "Go to KP…".
 - **KP Data Plotter** – dockable plot of KP-based table data against a route, with crosshair, marker and per-field axis assignment.
-- **Depth Profile** – dockable profile from MBES raster(s) or contours along a route or temporary line; depth/slope plots with adaptive sampling.
+- **Depth Profile** – dockable profile from MBES raster(s) or contours along a route or temporary line; depth/slope plots with adaptive sampling, on-plot two-point measurements (shared with the KP Mouse quick profile), vertical exaggeration and PNG/CSV export.
 - **Catenary Calculator V2** (multi-segment) — 2D static model with multi-span drape, chute wrap geometry and buoyancy analysis; see [catenary/MODEL_NOTES.md](catenary/MODEL_NOTES.md) for the precise assumptions and validity envelope. (The legacy V1 calculator was removed in 1.7.0.)
 - **Cable Lay Simulator (3D)** *(beta, new in 1.7.0)* — the next-generation catenary tool: interactive software-rendered 3D view plus profile/plan views over real bathymetry (including grids sampled from a project raster), with hydrodynamic drag throughout. Three modes: **Static hang** (V2 physics in 3D with current loading), **Steady lay** (ship speed + pay-out solved in the vessel frame, validated against Zajac 1957 closed forms which are shown live as quick answers), and **Operation simulation** (quasi-static stepping with a timeline scrubber: branching-unit deployment, final-bight lay-down, transient straight lay). CSV / 3D DXF export and results-to-map layers. Assumptions and validation status: [catenary/v3/V3_MODEL_NOTES.md](catenary/v3/V3_MODEL_NOTES.md).
 - **Transit Measure Tool** – cumulative geodesic distance along a drawn path with transit-time output and an optional Quick Buffer.
@@ -86,7 +86,22 @@ end-to-end seabed-length check, provider registration) from a QGIS Python:
 ```
 
 The runner boots a headless `QgsApplication` when needed and works under both
-QGIS 3.22+ (Qt5) and QGIS 4.x (Qt6). The pure calculation suites
+QGIS 3.22+ (Qt5) and QGIS 4.x (Qt6).
+
+Most of the run time is the cable lay simulator and catenary group (`lay`).
+For changes that do not touch `catenary/` or the lay-simulator tools, skip it:
+
+```
+python-qgis.bat tests\run_qgis_smoke_tests.py --fast          # everything except the lay group
+python-qgis.bat tests\run_qgis_smoke_tests.py --only lay      # just the lay group
+python-qgis.bat tests\run_qgis_smoke_tests.py -k profile      # checks whose label/module contains "profile"
+python tests\run_qgis_smoke_tests.py --list --fast            # show what would run (no QGIS needed)
+python tests\run_pure_tests.py --fast                         # QGIS-free suites without test_v3_*
+```
+
+Each check prints its duration and the run ends with the slowest checks.
+`plot_widget.py` and `slope_utils.py` are shared with the catenary tools, so
+changes there still warrant a full run. The pure calculation suites
 (`tests/test_catenary_solver.py`, `tests/test_simple_catenary.py`) also run on
 any plain Python (NumPy required for the V2 solver).
 

@@ -84,7 +84,7 @@ with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
     dock.slope_window_spin.setValue(0)
     dock._compute_slopes()
     assert len(dock.slope_deg)==len(dock.kp_values) and dock.slope_deg[10] is None
-    dock._compute_seabed_length(False)
+    dock._compute_seabed_length()
     assert abs(dock.seabed_covered_m-170)<1e-6
     dock.depth_source_ids=['a']*19
     dock._get_selected_raster_layers=lambda:[layer]
@@ -151,25 +151,25 @@ with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
     window.measure_action.trigger()
     assert window.measure_action.isChecked()
     assert all(window.depth_item.vb.state['mouseEnabled'])
-    window._plot_click(Click(50,115))
-    window._plot_move(Click(100,120).scenePos())
-    assert window._preview is not None and window._preview[0].isVisible()
-    assert len(window._preview) == 5
-    assert all(abs(v-e)<1e-6 for v,e in zip(window._preview[1].getData()[0],[50,100,100]))
-    leg_y = window._preview[1].getData()[1]
+    window.measure._on_click(Click(50,115))
+    window.measure._on_move(Click(100,120).scenePos())
+    assert window.measure.preview is not None and window.measure.preview[0].isVisible()
+    assert len(window.measure.preview) == 5
+    assert all(abs(v-e)<1e-6 for v,e in zip(window.measure.preview[1].getData()[0],[50,100,100]))
+    leg_y = window.measure.preview[1].getData()[1]
     assert abs(leg_y[0]-leg_y[1])<1e-6
-    assert len(window._measurements) == 0
-    assert abs(window._preview[0].getData()[0][1]-100)<1e-6
-    window._plot_click(Click(100,120))
-    assert window._preview is None and window.table.columnCount() == 4
+    assert len(window.measure.measurements) == 0
+    assert abs(window.measure.preview[0].getData()[0][1]-100)<1e-6
+    window.measure._on_click(Click(100,120))
+    assert window.measure.preview is None and window.table.columnCount() == 5
     window.kp_check.setChecked(True)
     kp = window._kp_at_distance(50)
     assert kp is not None and .099 < kp < .101
     labels = window.slope_item.getAxis('bottom').tickStrings([50],1,10)
     assert labels == ['%.4f' % kp]
     assert window._kp_at_distance(-1) is None
-    assert len(window._measurements)==1
-    assert abs(window._measurements[0]['metrics']['width_m']-50)<1e-6
+    assert len(window.measure.measurements)==1
+    assert abs(window.measure.measurements[0]['metrics']['width_m']-50)<1e-6
     assert window.table.item(0,3).text().endswith('°')
     assert window.scale_check.isChecked()
     assert abs(window.depth_item.vb.getAspectRatio()-1)<.001
@@ -179,9 +179,9 @@ with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
     window.z_units.setCurrentText('ft')
     QApplication.processEvents()
     assert abs(window.depth_item.vb.getAspectRatio()-1)<.001
-    triangle,handles = window._measurement_graphics[0]
+    triangle,handles = window.measure.graphics[0]
     handles[1].setPos(120/.3048,0)
-    moved = window._measurements[0]
+    moved = window.measure.measurements[0]
     assert abs(moved['b'][0]-120)<1e-6 and moved['b'][1]>100
     assert abs(moved['metrics']['width_m']-70)<1e-6
     assert abs(triangle[0].getData()[0][1]-120/.3048)<1e-6
@@ -196,33 +196,33 @@ with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
     from qgis.PyQt.QtCore import QPoint, QPointF, QEvent
     from qgis.PyQt.QtGui import QMouseEvent
     QApplication.processEvents()
-    handle = window._measurement_graphics[0][1][1]
+    handle = window.measure.graphics[0][1][1]
     viewport = window.depth_widget.viewport()
     start = window.depth_widget.mapFromScene(handle.mapToScene(QPointF(0,0)))
     end = start+QPoint(20,5)
-    original = window._measurements[0]['b']
-    original_a = window._measurements[0]['a']
+    original = window.measure.measurements[0]['b']
+    original_a = window.measure.measurements[0]['a']
     QTest.mousePress(viewport,Qt.MouseButton.LeftButton,Qt.KeyboardModifier.NoModifier,start)
     move = QMouseEvent(QEvent.Type.MouseMove,QPointF(end),QPointF(viewport.mapToGlobal(end)),
                        Qt.MouseButton.NoButton,Qt.MouseButton.LeftButton,Qt.KeyboardModifier.NoModifier)
     QApplication.sendEvent(viewport,move)
     QTest.mouseRelease(viewport,Qt.MouseButton.LeftButton,Qt.KeyboardModifier.NoModifier,end)
     QApplication.processEvents()
-    assert window._measurements[0]['b'] != original
-    assert window._measurements[0]['a'] == original_a
-    assert window._first_point is None and len(window._measurements)==1
+    assert window.measure.measurements[0]['b'] != original
+    assert window.measure.measurements[0]['a'] == original_a
+    assert window.measure.first_point is None and len(window.measure.measurements)==1
     print('[PASS] actual endpoint drag, snapped editing, gap rejection and physical 1:1 across mixed units')
     assert window.plot_container.grab().save(str(Path(temp)/'profile.png'))
-    assert len(window._measurements)==1 and 'ft' in window.table.item(0,1).text()
+    assert len(window.measure.measurements)==1 and 'ft' in window.table.item(0,1).text()
     QApplication.processEvents()
     if os.environ.get('PROFILE_TEST_PNG'):
         window.plot_container.grab().save(os.environ['PROFILE_TEST_PNG'])
-    window._delete_measurement(); assert not window._measurements
-    window._plot_click(Click(50/.3048,115/.3048))
-    window._plot_move(Click(100/.3048,120/.3048).scenePos())
-    assert window._preview is not None
+    window._delete_measurement(); assert not window.measure.measurements
+    window.measure._on_click(Click(50/.3048,115/.3048))
+    window.measure._on_move(Click(100/.3048,120/.3048).scenePos())
+    assert window.measure.preview is not None
     window.snap_check.setChecked(False)
-    assert window._first_point is None and window._preview is None
+    assert window.measure.first_point is None and window.measure.preview is None
     # Real viewport gestures while measuring: a drag pans without placing a point.
     from qgis.PyQt.QtTest import QTest
     from qgis.PyQt.QtCore import QPoint, QPointF, QEvent
@@ -239,7 +239,7 @@ with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
     QApplication.processEvents()
     QTest.mouseRelease(viewport,Qt.MouseButton.LeftButton,Qt.KeyboardModifier.NoModifier,center+QPoint(45,15))
     QApplication.processEvents()
-    assert window._first_point is None and not window._measurements
+    assert window.measure.first_point is None and not window.measure.measurements
     assert window.depth_item.vb.viewRange()[0] != before_range
     before_width = window.depth_item.vb.viewRange()[0][1]-window.depth_item.vb.viewRange()[0][0]
     wheel = QWheelEvent(QPointF(center),QPointF(viewport.mapToGlobal(center)),QPoint(),QPoint(0,120),
@@ -247,7 +247,7 @@ with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
     QApplication.sendEvent(viewport,wheel); QApplication.processEvents()
     after_range = window.depth_item.vb.viewRange()[0]
     assert after_range[1]-after_range[0] < before_width
-    assert window._first_point is None and not window._measurements
+    assert window.measure.first_point is None and not window.measure.measurements
     window.measure_action.trigger()
     assert not window.measure_action.isChecked() and all(window.depth_item.vb.state['mouseEnabled'])
     print('[PASS] context-menu measurement keeps viewport drag pan and wheel zoom without placing endpoints')

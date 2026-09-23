@@ -17,7 +17,7 @@ from qgis.PyQt.QtWidgets import QFileDialog, QGraphicsPathItem, QHBoxLayout, QPu
 
 _PEN_STYLE = getattr(Qt, "PenStyle", Qt)
 _MOUSE_BUTTON = getattr(Qt, "MouseButton", Qt)
-__SUBSEA_PLOT_WIDGET_PATCH_VERSION__ = 7
+__SUBSEA_PLOT_WIDGET_PATCH_VERSION__ = 8
 _REQUIRED_SVG_EXPORTER_PATCH_VERSION = 4
 
 
@@ -40,6 +40,7 @@ _NAMED_COLORS = {
     "brown": "#8c564b",
     "k": "#000000",
     "lightblue": "#add8e6",
+    "steelblue": "#4682b4",
     "tab:blue": "#1f77b4",
     "tab:orange": "#ff7f0e",
     "tab:green": "#2ca02c",
@@ -633,6 +634,58 @@ class PyQtGraphAxis:
         self._add_item(item)
 
         line = PyQtGraphLine(item, xdata, ydata, label=label, kind="polygon")
+        if label:
+            self._legend_items.append(line)
+        return [line]
+
+    def fill_between(self, x_values, y1, y2=0, *args, **kwargs):
+        """Shade between two curves (matplotlib ``fill_between`` subset).
+
+        ``y2`` may be a scalar or a sequence. Stations where x, y1 or y2 is
+        missing split the shading, so gaps in the data stay unshaded.
+        """
+        label = kwargs.pop("label", None)
+        facecolor = kwargs.pop("facecolor", kwargs.pop("color", None))
+        alpha = kwargs.pop("alpha", None)
+        zorder = kwargs.pop("zorder", None)
+        if facecolor is None and args:
+            facecolor = args[0]
+
+        xdata = _values(x_values)
+        upper = _values(y1)
+        if isinstance(y2, (int, float)) or y2 is None:
+            lower = [math.nan if y2 is None else float(y2)] * len(xdata)
+        else:
+            lower = _values(y2)
+
+        path = QPainterPath()
+        run: List[Tuple[float, float, float]] = []
+
+        def close_run():
+            if len(run) >= 2:
+                path.moveTo(run[0][0], run[0][1])
+                for x_val, top, _bottom in run[1:]:
+                    path.lineTo(x_val, top)
+                for x_val, _top, bottom in reversed(run):
+                    path.lineTo(x_val, bottom)
+                path.closeSubpath()
+            run.clear()
+
+        for x_val, top, bottom in zip(xdata, upper, lower):
+            if math.isnan(x_val) or math.isnan(top) or math.isnan(bottom):
+                close_run()
+            else:
+                run.append((x_val, top, bottom))
+        close_run()
+        if path.isEmpty():
+            return []
+
+        item = QGraphicsPathItem(path)
+        item.setBrush(pg.mkBrush(_as_plot_color(facecolor, "#7f7f7f", alpha=alpha)))
+        item.setPen(pg.mkPen(None))
+        item.setZValue(float(zorder) if zorder is not None else -10.0)
+        self._add_item(item)
+        line = PyQtGraphLine(item, xdata, upper, label=label, kind="polygon")
         if label:
             self._legend_items.append(line)
         return [line]

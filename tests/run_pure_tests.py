@@ -2,7 +2,10 @@
 """Run the QGIS-free test suites under plain Python (NumPy optional but
 recommended — it exercises the vectorised paths).
 
-Usage:  python tests/run_pure_tests.py [module ...]
+Usage:  python tests/run_pure_tests.py [--fast] [-k TEXT] [module ...]
+
+--fast skips the lay simulator (test_v3_*) suites, which dominate the run
+time; use it for changes outside catenary/ and the lay-simulator tools.
 
 Modules default to every suite that imports without the QGIS API. The
 QGIS-dependent suites run via tests/run_qgis_smoke_tests.py instead.
@@ -10,9 +13,11 @@ QGIS-dependent suites run via tests/run_qgis_smoke_tests.py instead.
 
 from __future__ import annotations
 
+import argparse
 import importlib
 import importlib.util
 import sys
+import time
 from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
@@ -74,11 +79,23 @@ def _register_plugin_package() -> None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Run the QGIS-free test suites.")
+    parser.add_argument("modules", nargs="*", help="suites to run (default: all)")
+    parser.add_argument("--fast", action="store_true", help="skip the lay simulator (test_v3_*) suites")
+    parser.add_argument("-k", dest="patterns", action="append", default=[], metavar="TEXT",
+                        help="run suites whose name contains TEXT (repeatable)")
+    args = parser.parse_args()
+    modules = args.modules or PURE_MODULES
+    if args.fast:
+        modules = [m for m in modules if not m.startswith("test_v3_")]
+    if args.patterns:
+        modules = [m for m in modules if any(p.lower() in m.lower() for p in args.patterns)]
     _register_plugin_package()
-    modules = sys.argv[1:] or PURE_MODULES
     failures = []
+    timings = []
     for name in modules:
         print(f"\n== {name} ==")
+        t0 = time.perf_counter()
         try:
             module = importlib.import_module(f"{PACKAGE_NAME}.tests.{name}")
             if not _passed(module.run_all()):
@@ -86,6 +103,8 @@ def main() -> int:
         except Exception as exc:
             print(f"[ERROR] {name}: {exc!r}")
             failures.append(name)
+        timings.append((time.perf_counter() - t0, name))
+    print("\nSlowest:", ", ".join(f"{n} {t:.1f} s" for t, n in sorted(timings, reverse=True)[:5]))
     print("\nFAILURES:", failures if failures else "none")
     return 1 if failures else 0
 
