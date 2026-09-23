@@ -30,6 +30,10 @@ KIND_TEXT = "text"
 KIND_NUMBER = "number"
 KINDS: List[str] = [KIND_TEXT, KIND_NUMBER]
 KIND_LABELS: Dict[str, str] = {KIND_TEXT: "Text", KIND_NUMBER: "Number"}
+# Number columns may carry "decimals": the places shown in the table and
+# written to the export, report and map layer. The stored value keeps what
+# was imported or typed; absent = show values as entered.
+MAX_DECIMALS = 6
 
 # Fixed (real) columns shown before the flexible ones.
 FIXED_KEYS: List[str] = ["start_kp", "end_kp"]
@@ -75,9 +79,50 @@ def normalise_columns(columns: Optional[Sequence[Dict]]) -> List[Dict]:
             continue
         seen.add(key)
         kind = str(col.get("kind") or KIND_TEXT)
-        out.append({"key": key, "label": label or key,
-                    "kind": kind if kind in KINDS else KIND_TEXT})
+        clean = {"key": key, "label": label or key,
+                 "kind": kind if kind in KINDS else KIND_TEXT}
+        decimals = column_decimals(col)
+        if decimals is not None and clean["kind"] == KIND_NUMBER:
+            clean["decimals"] = decimals
+        out.append(clean)
     return out
+
+
+def column_decimals(column: Dict) -> Optional[int]:
+    """The column's decimal places (None = as entered)."""
+    value = column.get("decimals") if isinstance(column, dict) else None
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    try:
+        places = int(value)
+    except (TypeError, ValueError):
+        return None
+    return places if 0 <= places <= MAX_DECIMALS else None
+
+
+def decimals_label(places: Optional[int]) -> str:
+    """'As entered' / '3 (0.001)' for the decimal-places choices."""
+    if places is None:
+        return "As entered"
+    if places == 0:
+        return "0 (1)"
+    return f"{places} (0.{'0' * (places - 1)}1)"
+
+
+def format_value(text, column: Dict) -> str:
+    """A cell value at the column's decimal places. Text columns, blank
+    cells and non-numeric text come back unchanged."""
+    raw = "" if text is None else str(text)
+    if column.get("kind") != KIND_NUMBER:
+        return raw
+    places = column_decimals(column)
+    if places is None:
+        return raw
+    value = _to_number(raw)
+    if value is None:
+        return raw
+    out = f"{value:.{places}f}"
+    return out[1:] if out.startswith("-") and float(out) == 0 else out
 
 
 def guess_kind(values: Iterable[str]) -> str:
@@ -331,7 +376,11 @@ def layer_values(row: Dict, columns: Sequence[Dict]) -> Dict[str, object]:
     for col in normalise_columns(columns):
         text = values.get(col["key"], "")
         if col.get("kind") == KIND_NUMBER:
-            out[col["key"]] = _to_number(text)
+            value = _to_number(text)
+            places = column_decimals(col)
+            if value is not None and places is not None:
+                value = round(value, places)
+            out[col["key"]] = value
         else:
             out[col["key"]] = text
     return out
@@ -354,7 +403,7 @@ def rows_csv(plan: Dict, rows: Sequence[Dict], columns: Sequence[Dict]) -> str:
     for row in sort_rows(rows):
         writer.writerow(
             [_fmt(row.get("start_kp")), _fmt(row.get("end_kp"))]
-            + [row["values"].get(c["key"], "") for c in cols]
+            + [format_value(row["values"].get(c["key"], ""), c) for c in cols]
             + [_fmt(row.get("src_start_kp")), _fmt(row.get("src_end_kp")),
                row.get("src_rpl") or "", row.get("rereference_flags") or "",
                row.get("notes") or ""])

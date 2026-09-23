@@ -1506,10 +1506,10 @@ def test_profile_bands_replace_per_range_items() -> bool:
     plot_items = widget.plot.getPlotItem().listDataItems()
     scene_bands = [item for item in widget.plot.scene().items()
                    if isinstance(item, RangeBandItem)]
-    # 4 overlay kinds + the section strip + the hazard strip, regardless
-    # of range count (the per-criterion no-data label band is never
-    # added to the scene).
-    ok = len(scene_bands) == 6
+    # 4 overlay kinds + the section strip + the hazard strip + the
+    # full-height hazard bands, regardless of range count (the
+    # per-criterion no-data label band is never added to the scene).
+    ok = len(scene_bands) == 7
     ok = ok and len(widget._regions["insufficient"].ranges()) == 2000
     ok = ok and len(widget._strip_band.ranges()) == 2000
     ok = ok and len(plot_items) < 10

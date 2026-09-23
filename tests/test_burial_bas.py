@@ -124,9 +124,36 @@ def test_layer_fields_values() -> bool:
     return _result("map layer fields + values", ok)
 
 
+def test_column_decimals() -> bool:
+    cols = bm.normalise_columns([
+        {"key": "dist", "label": "Distance (km)", "kind": "number", "decimals": 3},
+        {"key": "dol", "label": "DoL", "kind": "number", "decimals": "9"},
+        {"key": "soil", "label": "Soil", "kind": "text", "decimals": 2}])
+    ok = cols[0].get("decimals") == 3
+    ok = ok and "decimals" not in cols[1]           # out of range -> as entered
+    ok = ok and "decimals" not in cols[2]           # text columns never round
+    dist = cols[0]
+    ok = ok and bm.format_value("12.3456789", dist) == "12.346"
+    ok = ok and bm.format_value("12,3456789", dist) == "12.346"
+    ok = ok and bm.format_value("", dist) == ""
+    ok = ok and bm.format_value("n/a", dist) == "n/a"
+    ok = ok and bm.format_value("-0.0001", dist) == "0.000"
+    ok = ok and bm.format_value("12.3456789", cols[1]) == "12.3456789"
+    ok = ok and bm.format_value("1.5", {"kind": "number", "decimals": 0}) == "2"
+    ok = ok and bm.decimals_label(None) == "As entered"
+    ok = ok and bm.decimals_label(0) == "0 (1)"
+    ok = ok and bm.decimals_label(3) == "3 (0.001)"
+    row = {"start_kp": 0.0, "end_kp": 1.0, "values": {"dist": "1.23456"}}
+    ok = ok and bm.layer_values(bm.encode_row(row), [dist])["dist"] == 1.235
+    csv_text = bm.rows_csv({"name": "P"}, [row], [dist])
+    ok = ok and "1.235" in csv_text and "1.23456" not in csv_text
+    return _result("number column decimals: normalise, format, layer, CSV", ok)
+
+
 def run_all():
     return [test_layer_fields_values(), test_columns(), test_import_and_round_trip(),
-            test_validate_and_coverage(), test_rereference_and_csv()]
+            test_validate_and_coverage(), test_rereference_and_csv(),
+            test_column_decimals()]
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 from typing import Dict, List, Optional
 
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import QTimer, Qt
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -298,18 +298,22 @@ class BasColumnsDialog(QDialog):
         self.columns: List[Dict] = []
         layout = QVBoxLayout(self)
         hint = QLabel("Number columns are checked for numeric values on Apply "
-                      "and sort numerically; text columns sort alphabetically.")
+                      "and sort numerically; text columns sort alphabetically. "
+                      "Decimals sets the places a number column shows (and "
+                      "exports) — e.g. 3 for km to the nearest metre; the "
+                      "stored values keep their full precision.")
         hint.setWordWrap(True)
         hint.setStyleSheet(ui_helpers.hint_style())
         layout.addWidget(hint)
-        self.table = QTableWidget(0, 2)
-        self.table.setHorizontalHeaderLabels(["Label", "Kind"])
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Label", "Kind", "Decimals"])
         self.table.horizontalHeader().setSectionResizeMode(HEADER_RESIZE_MODE_STRETCH)
         self.table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
         self.table.setSelectionMode(SELECTION_MODE_SINGLE)
         self._delegate = ui_helpers.ComboColumnDelegate(
             self.table, self._combo_options, self._combo_commit)
         self.table.setItemDelegateForColumn(1, self._delegate)
+        self.table.setItemDelegateForColumn(2, self._delegate)
         layout.addWidget(self.table, 1)
         buttons = QHBoxLayout()
         for text, slot in (("Add", self._add), ("Remove", self._remove),
@@ -327,13 +331,34 @@ class BasColumnsDialog(QDialog):
         self._rebuild()
 
     def _combo_options(self, index):
-        if index.column() != 1:
-            return None
-        return [(k, bas_model.KIND_LABELS[k]) for k in bas_model.KINDS]
+        if index.column() == 1:
+            return [(k, bas_model.KIND_LABELS[k]) for k in bas_model.KINDS]
+        if index.column() == 2 and 0 <= index.row() < len(self._rows) \
+                and self._rows[index.row()].get("kind") == bas_model.KIND_NUMBER:
+            return [("", bas_model.decimals_label(None))] + [
+                (str(n), bas_model.decimals_label(n))
+                for n in range(bas_model.MAX_DECIMALS + 1)]
+        return None
 
     def _combo_commit(self, index, value) -> None:
-        if 0 <= index.row() < len(self._rows):
-            self._rows[index.row()]["kind"] = value
+        if not 0 <= index.row() < len(self._rows):
+            return
+        col = self._rows[index.row()]
+        if index.column() == 1:
+            col["kind"] = value
+            if value != bas_model.KIND_NUMBER:
+                col.pop("decimals", None)
+            # Deferred: the delegate is still finishing this cell's edit.
+            QTimer.singleShot(0, self._resync)
+        elif index.column() == 2:
+            if value == "":
+                col.pop("decimals", None)
+            else:
+                col["decimals"] = int(value)
+
+    def _resync(self) -> None:
+        self._sync()
+        self._rebuild()
 
     def _rebuild(self) -> None:
         with ui_helpers.silent_rebuild(self.table):
@@ -345,6 +370,18 @@ class BasColumnsDialog(QDialog):
                 ui_helpers.ComboColumnDelegate.mark_item(
                     kind_item, kind, bas_model.KIND_LABELS.get(kind, kind))
                 self.table.setItem(i, 1, kind_item)
+                places_item = QTableWidgetItem()
+                if kind == bas_model.KIND_NUMBER:
+                    places = bas_model.column_decimals(col)
+                    ui_helpers.ComboColumnDelegate.mark_item(
+                        places_item, "" if places is None else str(places),
+                        bas_model.decimals_label(places))
+                else:
+                    places_item.setText("—")
+                    places_item.setFlags(places_item.flags()
+                                         & ~Qt.ItemFlag.ItemIsEditable)
+                    places_item.setToolTip("Text columns show values as entered.")
+                self.table.setItem(i, 2, places_item)
 
     def _sync(self) -> None:
         for i, col in enumerate(self._rows):

@@ -4,8 +4,9 @@
 Depth vs KP over the plan scope with the plan always in view: combined
 Exclusion Area shading (red), screening annotations (amber), Constraint
 Influence Zones (blue tint), Insufficient Information (grey), section strip
-colouring via region items, a Risk Profile hazard strip, and event markers
-(draggable in edit mode). The *Overlays* menu shows/hides each overlay
+colouring via region items, Risk Profile hazards (full-height bands or a
+top strip, chosen in the Overlays menu), and event markers (draggable in
+edit mode). The *Overlays* menu shows/hides each overlay
 (persisted) and filters Insufficient Information by the criterion that
 could not be evaluated — e.g. hide the no-data ranges of a cross-slope
 criterion on flat contour-only seabed while keeping the others.
@@ -32,6 +33,7 @@ from qgis.PyQt.QtGui import QColor, QIcon, QPixmap
 from qgis.PyQt.QtGui import QKeySequence
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMenu,
@@ -66,6 +68,8 @@ from . import events as ev
 from . import generation, schema
 
 _PEN_STYLE = getattr(Qt, "PenStyle", Qt)
+_FRAME_VLINE = getattr(QFrame, "Shape", QFrame).VLine
+_FRAME_SUNKEN = getattr(QFrame, "Shadow", QFrame).Sunken
 _ITEM_FLAG = getattr(Qt, "ItemFlag", Qt)
 _SHORTCUT_CONTEXT = getattr(getattr(Qt, "ShortcutContext", Qt),
                             "WidgetWithChildrenShortcut")
@@ -100,7 +104,7 @@ _OVERLAY_LABELS = (
     ("screening", "Screening flags", "#ff8c00"),
     ("influence", "Constraint Influence Zones", "#1f77b4"),
     ("insufficient", "Insufficient Information", "#787878"),
-    ("hazards", "Risk Profile hazards (strip)", "#8e44ad"),
+    ("hazards", "Risk Profile hazards", "#8e44ad"),
     ("sections", "Plan outcome (section strip)", "#1b7f3b"),
 )
 # Key for Insufficient Information no criterion claims (e.g. contexts
@@ -108,6 +112,19 @@ _OVERLAY_LABELS = (
 _II_OTHER = "__other__"
 _HAZARD_STRIP_PX = 8
 _HAZARD_ALPHA = 200
+# Hazard display: full-height bands through the plot (like Exclusion
+# Areas, the default) or a thin strip under the outcome strip.
+HAZARD_STYLE_FULL = "full"
+HAZARD_STYLE_STRIP = "strip"
+_HAZARD_STYLES = (
+    (HAZARD_STYLE_FULL, "Full-height bands",
+     "Shade each hazard's KP range through the whole plot height, like the "
+     "Exclusion Areas."),
+    (HAZARD_STYLE_STRIP, "Strip along the top",
+     "A thin coloured strip under the plan outcome strip — keeps dense "
+     "hazard picks off the bathymetry."),
+)
+_HAZARD_FULL_ALPHA = 70
 
 _SLOPE_TIPS = {
     "long": "Longitudinal: pitch along the route, signed (+ = up-slope with "
@@ -505,6 +522,10 @@ class BurialProfileWidget(QWidget):
         self._ii_hidden = set(self._load_json_setting("profile_ii_hidden", []))
         self._hazard_levels_hidden = set(
             self._load_json_setting("profile_hazard_levels_hidden", []))
+        style = str(settings.value(f"{_SETTINGS_ROOT}/profile_hazard_style",
+                                   HAZARD_STYLE_FULL, type=str))
+        self._hazard_style = (style if style in {k for k, _l, _t in _HAZARD_STYLES}
+                              else HAZARD_STYLE_FULL)
         self._overlay_context = generation.ResolutionContext()
         self._overlay_rule_names: Dict[str, str] = {}
         self._hazards: List[Dict] = []
@@ -513,14 +534,14 @@ class BurialProfileWidget(QWidget):
         self._overlay_button.setToolTip(
             "Show or hide the profile overlays — Exclusion Areas, screening "
             "flags, influence zones, Insufficient Information (filterable by "
-            "the criterion that had no data), the Risk Profile hazard strip "
-            "and the plan outcome strip. Choices are remembered.")
+            "the criterion that had no data), Risk Profile hazards (as "
+            "full-height bands or a top strip) and the plan outcome strip. "
+            "Choices are remembered.")
         self._overlay_menu = QMenu(self._overlay_button)
         self._overlay_menu.setToolTipsVisible(True)
         self._overlay_menu.aboutToShow.connect(self._rebuild_overlay_menu)
         self._overlay_button.setMenu(self._overlay_menu)
         depth_toggle_row.addWidget(self._overlay_button)
-        depth_toggle_row.addStretch(1)
         self._true_scale_action = QAction("True scale (1:1)", self)
         self._true_scale_action.setCheckable(True)
         self._true_scale_action.setToolTip(self._true_scale_toggle.toolTip())
@@ -529,6 +550,11 @@ class BurialProfileWidget(QWidget):
         # Measure: two-point measurements on the depth plot (length, X, Y,
         # angle, distance along the seabed), as in the KP Mouse profile
         # window. Metres throughout; KP clicks do not sync the map while on.
+        # Left-aligned after the view toggles, set off by a divider.
+        divider = QFrame()
+        divider.setFrameShape(_FRAME_VLINE)
+        divider.setFrameShadow(_FRAME_SUNKEN)
+        depth_toggle_row.addWidget(divider)
         self._measure_toggle = QCheckBox("Measure")
         self._measure_toggle.setStyleSheet(
             f"color: {_MEASURE_COLOR}; font-weight: 600;")
@@ -657,6 +683,11 @@ class BurialProfileWidget(QWidget):
         # Per-criterion Insufficient Information labels (never painted: the
         # union is painted by the "insufficient" band above).
         self._ii_labels = RangeBandItem()
+        # Risk Profile hazards as full-height bands (the alternative is the
+        # hazard strip below); min_px keeps point hazards visible.
+        self._hazard_full = RangeBandItem(min_px=3.0)
+        self._hazard_full.setZValue(3)
+        item.addItem(self._hazard_full, ignoreBounds=True)
         self._event_lines: List = []
         # Read-only markers: one painted item (see EventMarkerItem).
         self._event_markers = EventMarkerItem()
@@ -1255,7 +1286,7 @@ class BurialProfileWidget(QWidget):
             schema.RISK_LOW: ui_helpers.qcolor("risk_low"),
             schema.RISK_UNASSIGNED: ui_helpers.qcolor("risk_unassigned"),
         }
-        ranges = []
+        strip, full = [], []
         for hazard in self._hazards:
             level = hazard.get("risk") or ""
             if level in self._hazard_levels_hidden:
@@ -1266,12 +1297,32 @@ class BurialProfileWidget(QWidget):
                 end = float(end_value) if end_value is not None else start
             except (TypeError, ValueError):
                 continue
-            color = QColor(colors.get(level, colors[schema.RISK_UNASSIGNED]))
+            base = colors.get(level, colors[schema.RISK_UNASSIGNED])
+            color = QColor(base)
             color.setAlpha(_HAZARD_ALPHA)
+            shade = QColor(base)
+            shade.setAlpha(_HAZARD_FULL_ALPHA)
             text = (f"Hazard: {hazard.get('label') or 'hazard'} "
                     f"[{schema.RISK_LABELS.get(level, 'Unassigned')}]")
-            ranges.append((start, end, text, color))
-        self._hazard_band.set_ranges(ranges)
+            strip.append((start, end, text, color))
+            full.append((start, end, text, shade))
+        self._hazard_band.set_ranges(strip)
+        self._hazard_full.set_ranges(full)
+
+    def hazard_style(self) -> str:
+        return self._hazard_style
+
+    def set_hazard_style(self, style: str) -> None:
+        """Hazards as full-height bands or the top strip (persisted)."""
+        if style not in (HAZARD_STYLE_FULL, HAZARD_STYLE_STRIP):
+            return
+        self._hazard_style = style
+        QSettings().setValue(f"{_SETTINGS_ROOT}/profile_hazard_style", style)
+        self._apply_overlay_visibility()
+
+    def _active_hazard_band(self) -> RangeBandItem:
+        return (self._hazard_full if self._hazard_style == HAZARD_STYLE_FULL
+                else self._hazard_band)
 
     def set_slope_visible(self, visible: bool) -> None:
         self._slope_pane.setVisible(bool(visible))
@@ -1361,7 +1412,7 @@ class BurialProfileWidget(QWidget):
                     if label not in labels:
                         labels.append(label)
         if self._overlay_visible.get("hazards", True):
-            hazards = self._hazard_band.labels_at(kp)
+            hazards = self._active_hazard_band().labels_at(kp)
             labels.extend(hazards[:3])
             if len(hazards) > 3:
                 labels.append(f"  … {len(hazards) - 3} more hazards here")
@@ -1414,7 +1465,10 @@ class BurialProfileWidget(QWidget):
     def _apply_overlay_visibility(self) -> None:
         for kind, band in self._regions.items():
             band.setVisible(self.overlay_visible(kind))
-        self._hazard_vb.setVisible(self.overlay_visible("hazards"))
+        hazards = self.overlay_visible("hazards")
+        full = self._hazard_style == HAZARD_STYLE_FULL
+        self._hazard_full.setVisible(hazards and full)
+        self._hazard_vb.setVisible(hazards and not full)
         self._strip_vb.setVisible(self.overlay_visible("sections"))
         self._position_strip()
         self._sync_overlay_button()
@@ -1474,6 +1528,16 @@ class BurialProfileWidget(QWidget):
                     show_all = sub.addAction("Show all")
                     show_all.triggered.connect(self._show_all_insufficient)
             elif key == "hazards":
+                display = menu.addMenu("    Hazard display")
+                display.setToolTipsVisible(True)
+                display.setEnabled(self.overlay_visible(key))
+                for style, style_label, tip in _HAZARD_STYLES:
+                    choice = display.addAction(style_label)
+                    choice.setCheckable(True)
+                    choice.setChecked(self._hazard_style == style)
+                    choice.setToolTip(tip)
+                    choice.triggered.connect(
+                        lambda _checked, st=style: self.set_hazard_style(st))
                 sub = menu.addMenu("    Hazard risk levels")
                 sub.setEnabled(self.overlay_visible(key))
                 for level in list(reversed(schema.RISK_LEVELS)) + [

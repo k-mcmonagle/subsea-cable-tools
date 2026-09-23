@@ -48,16 +48,26 @@ def test_burial_inputs_construct_and_switch_source_type():
             return DepthSourceConfig({})
 
     widget = InputsTab(_Model(), lambda: None)
-    assert widget.contour_combo2 is not None
     assert not hasattr(widget, "inherit_check")
-    assert widget.search_radius.minimum() > 0
-    widget.manual_source_combo.setCurrentIndex(
-        widget.manual_source_combo.findData(2))
-    assert widget.contour_combo.isEnabled()
-    assert widget.contour_combo2.isEnabled()
-    assert not widget.raster_combo.isEnabled()
+    # No Workbench: the route source opens on the line-layer picker, and
+    # only the chosen source's picker is shown.
+    assert widget.route_layer_radio.isChecked()
+    assert widget.route_pages.currentIndex() == 1
+    widget.route_workbench_radio.click()
+    assert widget.route_pages.currentIndex() == 0
+    assert "Configure bathymetry" in widget.apply_bathy_button.text()
     widget.close()
     widget.deleteLater()
+
+    from ..burial.tabs.bathy_dialog import BathymetryDialog
+
+    dialog = BathymetryDialog(None, DepthSourceConfig({}))
+    assert dialog.raster_radio.isChecked()
+    assert not dialog.ok_button.isEnabled()
+    assert dialog.search_radius.minimum() > 0
+    dialog.set_mode(2)
+    assert dialog.pages.currentIndex() == 1
+    dialog.deleteLater()
 
 
 def test_burial_installation_paths_widgets_construct():

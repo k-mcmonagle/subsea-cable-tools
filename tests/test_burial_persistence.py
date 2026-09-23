@@ -432,6 +432,140 @@ def test_add_inputs_picker_and_model_batch() -> bool:
                    "register, usage, status, relink", ok)
 
 
+def test_inputs_dialog_lists_registered() -> bool:
+    """Reopening a plan: the Inputs dialog shows the registered inputs on the
+    right (editable, removable) and keeps their layers off the left list."""
+    from ..burial.tabs import input_picker as picker
+
+    lines = _memory_layer("line", "Telecom cable as-laid")
+    polys = _memory_layer("polygon", "Seabed sediments rev B")
+    points = _memory_layer("point", "Boulders")
+    store = _store()
+    model = PlanModel(store)
+    model.create_plan("Inputs reopen", "plough")
+    ok = model.save_inputs([
+        {"role": burial_schema.INPUT_ROLE_CROSSINGS_LINES,
+         "layer_name": lines.name(), "layer_source": lines.source(),
+         "layer_id_hint": lines.id(), "originator": "Fugro"},
+        {"role": burial_schema.INPUT_ROLE_SOILS,
+         "layer_name": polys.name(), "layer_source": polys.source(),
+         "layer_id_hint": polys.id()},
+        {"role": burial_schema.INPUT_ROLE_OTHER,
+         "layer_name": "Gone", "layer_source": "/nowhere/gone.shp",
+         "layer_id_hint": "gone_id"}])
+    reopened = PlanModel(store)
+    reopened.load_plan(model.plan_id)
+    dialog = picker.AddInputsDialog(reopened.inputs)
+    ok = ok and dialog.stage_table.rowCount() == 3
+    names = sorted(dialog.stage_table.item(r, 0).text()
+                   for r in range(dialog.stage_table.rowCount()))
+    ok = ok and names == ["✓ Gone", "✓ Seabed sediments rev B",
+                          "✓ Telecom cable as-laid"]
+    visible = [dialog.layer_tree.topLevelItem(i).data(0, ITEM_DATA_USER_ROLE)
+               for i in range(dialog.layer_tree.topLevelItemCount())
+               if not dialog.layer_tree.topLevelItem(i).isHidden()]
+    ok = ok and lines.id() not in visible and polys.id() not in visible
+    ok = ok and points.id() in visible
+    # Nothing changed yet: OK has nothing to save.
+    ok = ok and not dialog.ok_button.isEnabled()
+    ok = ok and dialog.result_rows() == [] and dialog.removed_input_ids() == []
+    # Edit one registered row, remove another, add a new layer.
+    row_of = {dialog.stage_table.item(r, 0).text(): r
+              for r in range(dialog.stage_table.rowCount())}
+    dialog.stage_table.item(row_of["✓ Telecom cable as-laid"], 3).setText("B")
+    dialog.stage_table.selectRow(row_of["✓ Gone"])
+    dialog._remove_staged()
+    dialog.stage_layers([points])
+    ok = ok and dialog.ok_button.isEnabled()
+    rows = dialog.result_rows()
+    removed = dialog.removed_input_ids()
+    updated = [r for r in rows if r.get("input_id")]
+    ok = ok and len(rows) == 2 and len(updated) == 1
+    ok = ok and updated[0]["revision"] == "B" and updated[0]["originator"] == "Fugro"
+    ok = ok and len(removed) == 1
+    dialog.deleteLater()
+    log_before = len(store.list_change_log(reopened.plan_id))
+    ok = ok and reopened.save_inputs(rows, remove_ids=removed)
+    ok = ok and len(store.list_change_log(reopened.plan_id)) == log_before + 1
+    ok = ok and sorted(r["layer_name"] for r in reopened.inputs) == [
+        "Boulders", "Seabed sediments rev B", "Telecom cable as-laid"]
+    cable = next(r for r in reopened.inputs if r["layer_name"] == lines.name())
+    ok = ok and cable["revision"] == "B"
+    for layer in (lines, polys, points):
+        QgsProject.instance().removeMapLayer(layer.id())
+    return _result("Inputs dialog: registered inputs listed on reopen, "
+                   "edit/remove/add saved in one entry", ok)
+
+
+def test_bathymetry_dialog_registers_input() -> bool:
+    """Bathymetry is chosen in the two-pane dialog, saved as the plan's
+    bathymetry input with register details, reopened as configured, and
+    listed with the other registered inputs."""
+    from ..burial.tabs.bathy_dialog import (BathymetryDialog, MODE_CONTOURS,
+                                            guess_depth_field)
+    from ..burial.tabs.inputs_tab import InputsTab
+
+    ok = guess_depth_field(["name", "DEPTH_M"]) == "DEPTH_M"
+    ok = ok and guess_depth_field(["id", "z"]) == "z"
+    ok = ok and guess_depth_field(["id", "name"]) == ""
+    minor = QgsVectorLayer("LineString?crs=EPSG:4326&field=name:string"
+                           "&field=depth_m:double", "Contours minor", "memory")
+    major = QgsVectorLayer("LineString?crs=EPSG:4326&field=elev:double",
+                           "Contours major", "memory")
+    points = _memory_layer("point", "Soundings")
+    for layer in (minor, major):
+        QgsProject.instance().addMapLayer(layer)
+    store = _store()
+    model = PlanModel(store)
+    model.create_plan("Bathy", "plough")
+
+    dialog = BathymetryDialog(None, model.depth_config())
+    ok = ok and not dialog.ok_button.isEnabled()      # nothing chosen yet
+    dialog.set_mode(MODE_CONTOURS)
+    shown = [dialog.layer_tree.topLevelItem(i).text(0)
+             for i in range(dialog.layer_tree.topLevelItemCount())
+             if not dialog.layer_tree.topLevelItem(i).isHidden()]
+    ok = ok and "Contours minor" in shown and "Soundings" not in shown
+    dialog.use_layers([minor, major])
+    ok = ok and dialog.slots[0].field.currentField() == "depth_m"
+    ok = ok and dialog.slots[1].field.currentField() == "elev"
+    ok = ok and dialog.ok_button.isEnabled()
+    dialog.originator.setText("Fugro")
+    dialog.revision.setText("C")
+    row = dialog.result_row()
+    dialog.deleteLater()
+    config = json.loads(row["config_json"])
+    ok = ok and row["role"] == burial_schema.INPUT_ROLE_BATHY
+    ok = ok and config["mode"] == MODE_CONTOURS
+    ok = ok and [c["depth_field"] for c in config["contour_layers"]] == [
+        "depth_m", "elev"]
+    ok = ok and model.save_input(row)
+    depth = model.depth_config()
+    ok = ok and [c["layer_id"] for c in depth.contour_layers] == [
+        minor.id(), major.id()]
+
+    saved = next(r for r in model.inputs
+                 if r["role"] == burial_schema.INPUT_ROLE_BATHY)
+    ok = ok and saved["originator"] == "Fugro" and saved["revision"] == "C"
+    again = BathymetryDialog(saved, model.depth_config())
+    ok = ok and again.contour_radio.isChecked()
+    ok = ok and [s.layer.id() if s.layer else "" for s in again.slots] == [
+        minor.id(), major.id()]
+    ok = ok and again.originator.text() == "Fugro"
+    again.deleteLater()
+
+    tab = InputsTab(model, lambda: None)
+    roles = [tab.inputs_table.item(r, 0).text()
+             for r in range(tab.inputs_table.rowCount())]
+    ok = ok and roles == ["Bathymetry"]
+    ok = ok and "Contours (2 layer(s))" in tab.bathy_summary.text()
+    tab.deleteLater()
+    for layer in (minor, major, points):
+        QgsProject.instance().removeMapLayer(layer.id())
+    return _result("Bathymetry dialog: contour slots, depth-field guess, "
+                   "register details, reopen, listed as an input", ok)
+
+
 def test_profile_overlay_filters_and_hazards() -> bool:
     from ..burial.profile_widget import BurialProfileWidget
 
@@ -439,6 +573,7 @@ def test_profile_overlay_filters_and_hazards() -> bool:
     widget._overlay_visible = {key: True for key in widget._overlay_visible}
     widget._ii_hidden = set()
     widget._hazard_levels_hidden = set()
+    widget._hazard_style = "full"  # never the persisting setter in tests
     widget._apply_overlay_visibility()
     widget.set_scope(0.0, 10.0)
     ctx = generation.ResolutionContext(
@@ -477,8 +612,20 @@ def test_profile_overlay_filters_and_hazards() -> bool:
     widget._apply_hazards()
     ok = ok and [r[2] for r in widget._hazard_band.ranges()] == [
         "Hazard: Boulder [High]"]
+    # Display style: full-height bands (default) or the top strip.
+    ok = ok and len(widget._hazard_full.ranges()) == 1
+    ok = ok and widget._hazard_full.isVisible() is not False
+    ok = ok and not widget._hazard_vb.isVisible()
+    ok = ok and "Hazard: Boulder [High]" in widget.overlay_labels_at(3.0)
+    widget._hazard_style = "strip"
+    widget._apply_overlay_visibility()
+    ok = ok and not widget._hazard_full.isVisible()
+    ok = ok and "Hazard: Boulder [High]" in widget.overlay_labels_at(3.0)
+    widget._hazard_style = "full"
+    widget._apply_overlay_visibility()
     widget.clear()
     ok = ok and not widget._hazard_band.ranges()
+    ok = ok and not widget._hazard_full.ranges()
     widget.deleteLater()
     return _result("profile overlays: per-criterion II filter, visibility, "
                    "hazard strip", ok)
@@ -582,6 +729,8 @@ def run_all() -> list:
         test_model_relinks_bathymetry_and_reports_reasons(),
         test_kp_bar_helpers_and_hover(),
         test_add_inputs_picker_and_model_batch(),
+        test_inputs_dialog_lists_registered(),
+        test_bathymetry_dialog_registers_input(),
         test_profile_overlay_filters_and_hazards(),
         test_target_ranges_in_model_and_ground_overlay(),
         test_dock_builds_and_survives_project_reload(),

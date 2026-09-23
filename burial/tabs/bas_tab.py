@@ -305,11 +305,25 @@ class BasTab(QWidget):
             return "" if value is None else f"{float(value):.3f}"
         if key in ("src_rpl", "rereference_flags", "notes"):
             return str(row.get(key) or "")
-        return str(row.get("values", {}).get(key, ""))
+        raw = str(row.get("values", {}).get(key, ""))
+        column = self._column(key)
+        return bas_model.format_value(raw, column) if column else raw
+
+    def _column(self, key: str) -> Optional[Dict]:
+        return next((c for c in self._columns if c.get("key") == key), None)
+
+    @staticmethod
+    def _value_tooltip(row: Dict, key: str, shown: str) -> str:
+        """The stored value when the column's decimals round it for display."""
+        raw = str(row.get("values", {}).get(key, ""))
+        return f"Stored value: {raw}" if raw.strip() != shown.strip() else ""
 
     def _fill_row(self, index: int, row: Dict) -> None:
         for col, (header, key, kind) in enumerate(self._specs):
-            item = QTableWidgetItem(self._cell_text(row, key, kind))
+            text = self._cell_text(row, key, kind)
+            item = QTableWidgetItem(text)
+            if kind == bas_model.KIND_NUMBER:
+                item.setToolTip(self._value_tooltip(row, key, text))
             flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
             if not kind.endswith("_ro"):
                 flags |= Qt.ItemFlag.ItemIsEditable
@@ -348,7 +362,27 @@ class BasTab(QWidget):
         elif key in ("notes",):
             row[key] = text
         else:
-            row.setdefault("values", {})[key] = text
+            values = row.setdefault("values", {})
+            column = self._column(key)
+            if column is not None and bas_model.column_decimals(column) is not None:
+                # The cell shows the rounded value: leaving it as shown keeps
+                # the stored precision; a new value is stored as typed and
+                # shown rounded (the tooltip keeps the stored value).
+                stored = str(values.get(key, ""))
+                changed = text != bas_model.format_value(stored, column).strip()
+                if changed:
+                    values[key] = text
+                shown = self._cell_text(row, key, kind)
+                self._loading = True
+                try:
+                    self.table.amend_last(r, c, shown)
+                    item.setToolTip(self._value_tooltip(row, key, shown))
+                finally:
+                    self._loading = False
+                if not changed:
+                    return
+            else:
+                values[key] = text
         self._mark_dirty()
         if kind == "kp":
             self._refresh_strip()
@@ -541,7 +575,41 @@ class BasTab(QWidget):
         menu.addSeparator()
         menu.addAction("Undo cell edit\tCtrl+Z", self.table.undo)
         menu.addAction("Redo\tCtrl+Y", self.table.redo)
+        column = self._column(self._specs[index.column()][1]) \
+            if index.isValid() and index.column() < len(self._specs) else None
+        if column is not None and column.get("kind") == bas_model.KIND_NUMBER:
+            menu.addSeparator()
+            places_menu = menu.addMenu(f"Decimal places — {column['label']}")
+            current = bas_model.column_decimals(column)
+            for places in [None] + list(range(bas_model.MAX_DECIMALS + 1)):
+                action = places_menu.addAction(bas_model.decimals_label(places))
+                action.setCheckable(True)
+                action.setChecked(places == current)
+                action.triggered.connect(
+                    lambda _checked, k=column["key"], p=places:
+                    self.set_column_decimals(k, p))
         qt_exec(menu, self.table.viewport().mapToGlobal(pos))
+
+    def set_column_decimals(self, key: str, places: Optional[int]) -> None:
+        """Display/export precision of one number column (saved with the
+        plan's column list; stored values are unchanged)."""
+        columns = [dict(c) for c in self._columns]
+        for col in columns:
+            if col.get("key") == key:
+                if places is None:
+                    col.pop("decimals", None)
+                else:
+                    col["decimals"] = int(places)
+        columns = bas_model.normalise_columns(columns)
+        if columns == self._columns:
+            return
+        label = next((c["label"] for c in columns if c["key"] == key), key)
+        self._columns = columns
+        self.model.save_bas_columns(
+            columns, reason=f"BAS column '{label}' decimals: "
+                            f"{bas_model.decimals_label(places)}")
+        self._rebuild_table()
+        self._update_status()
 
     # -- apply / revert ----------------------------------------------------------------
     def _apply(self) -> None:

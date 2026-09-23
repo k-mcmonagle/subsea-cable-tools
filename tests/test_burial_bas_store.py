@@ -191,7 +191,27 @@ def test_tab_and_spreadsheet() -> bool:
     columns_dialog._add()
     columns_dialog._save()
     _check(ok_list, 23, len(columns_dialog.columns) == 3 and columns_dialog.columns[2]["key"] == "new_column")
-    for widget in (tab, import_dialog, columns_dialog):
+    # Decimal places: display rounds, the stored value keeps its precision;
+    # re-committing the shown text is not an edit, a new value is stored.
+    tab.table.item(0, 2).setText("1.23456")
+    tab._apply()
+    tab.set_column_decimals("req_dol_m", 2)
+    _check(ok_list, 24, bas_model.column_decimals(next(
+        c for c in model.bas_columns() if c["key"] == "req_dol_m")) == 2)
+    tab.refresh()
+    _check(ok_list, 25, tab.table.item(0, 2).text() == "1.23"
+           and "1.23456" in tab.table.item(0, 2).toolTip())
+    tab.table.item(0, 2).setText("1.23")
+    _check(ok_list, 26, not tab._dirty
+           and tab._working[0]["values"]["req_dol_m"] == "1.23456")
+    tab.table.item(0, 2).setText("1.987")
+    _check(ok_list, 27, tab._dirty and tab._working[0]["values"]["req_dol_m"] == "1.987"
+           and tab.table.item(0, 2).text() == "1.99")
+    tab.set_column_decimals("req_dol_m", None)
+    _check(ok_list, 28, tab.table.item(0, 2).text() == "1.987")
+    places_dialog = BasColumnsDialog(model.bas_columns())
+    _check(ok_list, 29, places_dialog.table.columnCount() == 3)
+    for widget in (tab, import_dialog, columns_dialog, places_dialog):
         widget.deleteLater()
     ok = all(v for _n, v in ok_list)
     failed = [n for n, v in ok_list if not v]

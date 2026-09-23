@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from qgis.core import QgsProject
 from qgis.PyQt.QtCore import QObject, QTimer, pyqtSignal
@@ -1223,27 +1223,52 @@ class PlanModel(QObject):
         self.logChanged.emit()
         return True
 
-    def save_inputs(self, rows: List[Dict]) -> bool:
-        """Register several inputs in one transaction and one change-log
-        entry (the multi-layer Add inputs dialog)."""
-        if not self.plan_id or not rows:
+    def save_inputs(self, rows: List[Dict],
+                    remove_ids: Sequence[str] = ()) -> bool:
+        """Register new inputs, update existing ones (rows carrying their
+        ``input_id``) and unregister ``remove_ids`` in one transaction and
+        one change-log entry (the multi-layer Inputs dialog)."""
+        remove_ids = [str(i) for i in remove_ids or [] if i]
+        if not self.plan_id or not (rows or remove_ids):
             return False
         prepared = []
-        for row in rows:
+        before_rows = []
+        added = updated = 0
+        for row in rows or []:
             row = dict(row)
             row["plan_id"] = self.plan_id
-            row.setdefault("input_id", schema.new_id())
+            existing = (self.store.get_input(row["input_id"])
+                        if row.get("input_id") else None)
+            if existing:
+                before_rows.append(existing)
+                updated += 1
+            else:
+                row.setdefault("input_id", schema.new_id())
+                added += 1
             prepared.append(row)
+        removed = []
+        for input_id in remove_ids:
+            existing = self.store.get_input(input_id)
+            if existing:
+                before_rows.append(existing)
+                removed.append(input_id)
+        parts = [f"{label} {count} input(s)" for label, count in (
+            ("registered", added), ("updated", updated),
+            ("removed", len(removed))) if count]
 
         def write() -> None:
             for row in prepared:
                 self.store.save_input(row)
+            for input_id in removed:
+                self.store.delete_input(input_id)
             self.store.append_change(
-                self.plan_id, change_log.ACTION_SET_INPUT,
-                ",".join(str(r["input_id"]) for r in prepared),
-                before={schema.TABLE_INPUT: []},
+                self.plan_id,
+                change_log.ACTION_SET_INPUT if prepared
+                else change_log.ACTION_DELETE_INPUT,
+                ",".join([str(r["input_id"]) for r in prepared] + removed),
+                before={schema.TABLE_INPUT: before_rows},
                 after={schema.TABLE_INPUT: prepared},
-                reason=f"registered {len(prepared)} input(s)")
+                reason=", ".join(parts))
             self.inputs = self.store.list_inputs(self.plan_id)
 
         ok, _ = self._store_transaction("register the inputs", write)

@@ -640,7 +640,8 @@ def build_report_html(plan: Dict,
         for row in decoded:
             bas_table.append(
                 [_kp(row.get("start_kp")), _kp(row.get("end_kp"))]
-                + [row["values"].get(c["key"], "") for c in columns]
+                + [bas_model.format_value(row["values"].get(c["key"], ""), c)
+                   for c in columns]
                 + [(f"{_kp(row.get('src_start_kp'))}–{_kp(row.get('src_end_kp'))} "
                     f"{row.get('src_rpl') or ''}").strip()
                    if row.get("src_start_kp") is not None else "",
