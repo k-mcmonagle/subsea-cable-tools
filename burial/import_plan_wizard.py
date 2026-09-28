@@ -392,8 +392,11 @@ _SECTION_BG = {
 }
 _WARN_BG = QColor(255, 214, 196)
 _INFO_BG = QColor(255, 244, 196)
+# Woven like the RPL itself: position rows (events) interleaved with the
+# segment rows joining them (protection method, and the section the plan
+# puts there). Position i is table row 2i; segment i → i+1 is row 2i + 1.
 _RPL_COLUMNS = ["Pos", "RPL KP", "Plan KP", "Off route (m)", "Event", "Remarks",
-                "Protection (to next)", "Read as", "Section after"]
+                "Protection", "Read as", "Section"]
 _C_PROT, _C_READ, _C_SECTION = 6, 7, 8
 MODE_EVENTS = "events"
 MODE_PROTECTION = "protection"
@@ -686,31 +689,57 @@ class _RplEventsPage(QWizardPage):
     def _fill_table(self) -> None:
         self.table.setColumnHidden(_C_PROT, False)   # hidden columns are not resized
         self.table.setRowCount(0)
-        self.table.setRowCount(len(self.rows))
-        for r, row in enumerate(self.rows):
+        self.table.setRowCount(max(0, 2 * len(self.rows) - 1))
+        seg_font = None
+        for i, row in enumerate(self.rows):
             offset = "" if row.offset_m is None else f"{row.offset_m:.1f}"
             values = ("" if row.pos_no is None else row.pos_no, _kp_text(row.stated_kp),
                       _kp_text(row.kp) if row.kp is not None else "not placed", offset,
-                      row.event, row.remarks, row.protection, "", "")
+                      row.event, row.remarks, "", "", "")
             for c, value in enumerate(values):
                 item = _item(value)
                 if c == 3 and row.offset_m is not None and row.offset_m > rpi.OFFSET_TOL_M:
                     item.setBackground(QBrush(_WARN_BG))
                     item.setToolTip("More than %.0f m from the plan route: the routes differ "
                                     "here." % rpi.OFFSET_TOL_M)
-                self.table.setItem(r, c, item)
+                self.table.setItem(2 * i, c, item)
+            if i == len(self.rows) - 1:
+                continue
+            nxt = self.rows[i + 1]
+            length = ("" if row.kp is None or nxt.kp is None
+                      else f"{abs(float(nxt.kp) - float(row.kp)):.3f} km")
+            for c in range(len(_RPL_COLUMNS)):
+                item = _item(length if c == 2 else (row.protection if c == _C_PROT else ""))
+                if seg_font is None:
+                    seg_font = item.font()
+                    seg_font.setItalic(True)
+                item.setFont(seg_font)
+                item.setToolTip(f"Segment {row.name} → {nxt.name}")
+                self.table.setItem(2 * i + 1, c, item)
         self.table.resizeColumnsToContents()
         for c in (4, 5, _C_PROT):
             self.table.setColumnWidth(c, min(self.table.columnWidth(c), 260))
         self.table.setColumnHidden(_C_PROT, not any(r.protection for r in self.rows))
 
     def _update_state_cells(self) -> None:
-        state = ""
-        order = rpi.travel_order(self.rows, self.wiz.model.direction)
-        after = {}
-        for index in order:
-            state = self.walk.after.get(index, state)
-            after[index] = state
+        methods = rpi.segment_methods(self.rows, self.walk)
+        for i, method in enumerate(methods):
+            if method is None:
+                label, colour = "not placed", _WARN_BG
+            elif method == rpi.M_SKIP:
+                label, colour = "Skip (marked)", _SECTION_BG[rpi.M_SKIP]
+            elif not method:
+                label, colour = "skip", _SECTION_BG[rpi.M_SKIP]
+            else:
+                label, colour = rpi.METHOD_LABELS[method], _SECTION_BG[method]
+            for c in range(len(_RPL_COLUMNS)):
+                item = self.table.item(2 * i + 1, c)
+                if item is not None:
+                    item.setBackground(QBrush(colour))
+                    item.setForeground(QBrush(_DIM_FG if not method else QColor(0, 0, 0)))
+            section = self.table.item(2 * i + 1, _C_SECTION)
+            if section is not None:
+                section.setText(label)
         for r in range(len(self.rows)):
             tokens = self.tokens.get(r, [])
             read = QTableWidgetItem(" + ".join(t.label for t in tokens))
@@ -727,22 +756,19 @@ class _RplEventsPage(QWizardPage):
                 read.setBackground(QBrush(_WARN_BG if warn else _INFO_BG))
                 tips += [i.text for i in issues]
             read.setToolTip("\n".join(tips))
-            self.table.setItem(r, _C_READ, read)
-            method = after.get(r, "")
-            label = rpi.METHOD_LABELS.get(method, "") if method else "skip"
-            section = _item(label)
-            section.setBackground(QBrush(_SECTION_BG.get(method or rpi.M_SKIP)))
-            if not method:
-                section.setForeground(QBrush(_DIM_FG))
-            self.table.setItem(r, _C_SECTION, section)
+            self.table.setItem(2 * r, _C_READ, read)
         self.table.resizeColumnToContents(_C_READ)
+        self.table.resizeColumnToContents(_C_SECTION)
 
     def _apply_filter(self, *_):
+        # Filtered: event positions only (segments are hidden with the rest).
         only = self.only_events.isChecked()
         for r in range(len(self.rows)):
             show = (not only or r in self.tokens or r in self.overrides
                     or r in self.walk.issues or bool(self.rows[r].event))
-            self.table.setRowHidden(r, not show)
+            self.table.setRowHidden(2 * r, not show)
+            if r < len(self.rows) - 1:
+                self.table.setRowHidden(2 * r + 1, only)
 
     def _fill_issues(self) -> None:
         self.issue_list.clear()
@@ -761,9 +787,10 @@ class _RplEventsPage(QWizardPage):
         index = item.data(Qt.ItemDataRole.UserRole)
         if index is None:
             return
-        self.table.setRowHidden(int(index), False)
-        self.table.selectRow(int(index))
-        self.table.scrollToItem(self.table.item(int(index), 0),
+        row = 2 * int(index)
+        self.table.setRowHidden(row, False)
+        self.table.selectRow(row)
+        self.table.scrollToItem(self.table.item(row, 0),
                                 QAbstractItemView.ScrollHint.PositionAtCenter)
 
     def _update_status(self, *_):
@@ -781,6 +808,10 @@ class _RplEventsPage(QWizardPage):
         text = (f"<b>{self.rpl_label}</b>: {len(self.rows)} position(s), {placed} placed on the "
                 f"plan route, {len(self.tokens)} with events. <b>{len(spans)} burial section(s)</b>"
                 + (f" — {', '.join(parts)}" if parts else "") + ".")
+        if int(self.wiz.model.direction or 1) < 0:
+            text += (" This plan is laid towards <i>decreasing</i> KP, so <i>Read as</i> "
+                     "gives each boundary in that direction (PLDN where burial starts as the "
+                     "plan travels); the segment colours show what is buried where.")
         warns = self.walk.count(rpi.LEVEL_WARN)
         if warns:
             text += f" <span style='color:#b05000'>{warns} event(s) need a look (listed below).</span>"
@@ -794,8 +825,18 @@ class _RplEventsPage(QWizardPage):
         self.completeChanged.emit()
 
     # -- edits
-    def selected_rows(self) -> List[int]:
-        return sorted({index.row() for index in self.table.selectionModel().selectedRows()})
+    def selected_rows(self, segments: bool = False) -> List[int]:
+        """RPL positions selected in the table. A selected segment row
+        counts as both its end positions when ``segments`` (for "Selected
+        rows are"), and is ignored otherwise (events sit on positions)."""
+        out = set()
+        for index in self.table.selectionModel().selectedRows():
+            r = index.row()
+            if r % 2 == 0:
+                out.add(r // 2)
+            elif segments:
+                out.update((r // 2, r // 2 + 1))
+        return sorted(out)
 
     def _fill_start_menu(self, menu: QMenu) -> None:
         for method in rpi.METHODS:
@@ -832,7 +873,7 @@ class _RplEventsPage(QWizardPage):
     def paint(self, method: str, rows: Optional[List[int]] = None) -> bool:
         try:
             updates = rpi.paint(self.rows, self.tokens,
-                                rows if rows is not None else self.selected_rows(),
+                                rows if rows is not None else self.selected_rows(True),
                                 method, self.wiz.model.direction)
         except ValueError as exc:
             QMessageBox.information(self, "Burial plan from RPL", str(exc))
@@ -1034,6 +1075,15 @@ class ImportPlanWizard(QWizard):
         if path and self.source is not None:
             self.source.load(path)
 
+    def _write(self, events, label, patch, reason) -> bool:
+        """``model.import_plan`` under a busy cursor (raises ValueError)."""
+        from qgis.PyQt.QtWidgets import QApplication
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            return self.model.import_plan(events, label, section_patch=patch, reason=reason)
+        finally:
+            QApplication.restoreOverrideCursor()
+
     def commit(self) -> bool:
         review = self.review
         if review.result is None or review.result.errors:
@@ -1049,8 +1099,8 @@ class ImportPlanWizard(QWizard):
             label = f"RPL events: {self.rpl.rpl_label}"
             reason += "; boundary events placed by position"
             try:
-                ok = self.model.import_plan(review.events, label, section_patch=patch,
-                                            reason=f"imported plan from RPL ({reason})")
+                ok = self._write(review.events, label, patch,
+                                 f"imported plan from RPL ({reason})")
             except ValueError as exc:
                 QMessageBox.warning(self, "Import burial plan",
                                     f"The plan could not be imported:\n{exc}")
@@ -1064,8 +1114,7 @@ class ImportPlanWizard(QWizard):
         if self.source.reference.rpl_id():
             reason += f"; KPs translated from {self.source.reference.label()}"
         try:
-            ok = self.model.import_plan(review.events, label, section_patch=patch,
-                                        reason=f"imported plan ({reason})")
+            ok = self._write(review.events, label, patch, f"imported plan ({reason})")
         except ValueError as exc:
             QMessageBox.warning(self, "Import burial plan", f"The plan could not be imported:\n{exc}")
             return False

@@ -231,11 +231,28 @@ def test_protection_method_source():
                    f"labels={labels} notes={notes}")
 
 
+def test_segment_methods_direction_independent():
+    rows = _rows(_RPL)
+    auto = rpi.auto_tokens(rows)
+    forward = rpi.segment_methods(rows, rpi.walk(rows, auto, 1))
+    # The same RPL on a plan laid the other way (events swapped automatically)
+    # buries the same segments.
+    reverse = rpi.segment_methods(rows, rpi.walk(rows, rpi.effective_tokens(auto, {}, True), -1))
+    expected = ["", PL, PL, "", PL, TR, TR, ""]
+    skip_rows = _rows([(0.0, "", ""), (1.0, "Start skip", ""), (2.0, "End skip", ""),
+                       (3.0, "", "")])
+    skip_rows[3].kp = None
+    marked = rpi.segment_methods(skip_rows, rpi.walk(skip_rows, rpi.auto_tokens(skip_rows), 1))
+    ok = forward == expected and reverse == expected and marked == ["", SK, None]
+    return _result("segment sections: by mid-point, same whichever way the plan is laid",
+                   ok, f"forward={forward} reverse={reverse} marked={marked}")
+
+
 def run_all():
     return [test_phrasings(), test_walk_typical_rpl(), test_build_result_and_events(),
             test_reverse_direction_and_swap(), test_skip_events_and_fallbacks(),
             test_issues_are_reported_not_fatal(), test_paint_and_set_token(),
-            test_protection_method_source()]
+            test_protection_method_source(), test_segment_methods_direction_independent()]
 
 
 if __name__ == "__main__":

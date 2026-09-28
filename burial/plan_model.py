@@ -137,6 +137,8 @@ class PlanModel(QObject):
         # Bathymetry identity memo (see _depth_info) and the relinks the
         # last depth_config() resolution made (layer re-added -> new id).
         self._depth_info_cache: Optional[Tuple[Tuple, float, Dict]] = None
+        # Sampler shared by consecutive _stamp_position calls (see there).
+        self._stamp_service_cache: Optional[Tuple[int, float, DepthService]] = None
         self.depth_relinks: List[str] = []
         self._profile_cache_key: Optional[Tuple[str, str, str]] = None
         self.refresh_tools(emit=False)
@@ -231,6 +233,7 @@ class PlanModel(QObject):
         self.inputs = self.store.list_inputs(plan_id)
         self._depth_config_cache = None
         self._depth_info_cache = None
+        self._stamp_service_cache = None
         self.rules = self.store.list_rules(plan_id)
         self.events = self.store.list_events(plan_id)
         self.sections = self.store.list_sections(plan_id)
@@ -300,6 +303,7 @@ class PlanModel(QObject):
         self._profile_cache_key = None
         self._depth_config_cache = None
         self._depth_info_cache = None
+        self._stamp_service_cache = None
         self.planChanged.emit()
         self.pathsChanged.emit()
         self.groundChanged.emit()
@@ -1054,6 +1058,7 @@ class PlanModel(QObject):
         reloaded, or the user asked to check again)."""
         self._depth_config_cache = None
         self._depth_info_cache = None
+        self._stamp_service_cache = None
 
     def depth_service(self) -> DepthService:
         return DepthService(self.depth_config(), QgsProject.instance())
@@ -1220,6 +1225,27 @@ class PlanModel(QObject):
                 self.pathsChanged.emit()
         return ok
 
+    # A DepthService clones every raster provider and, on its first sample,
+    # reads every contour feature into a spatial index. Stamping a batch
+    # (an import, a merge, a transfer) must share one, or each event pays
+    # that cost again and a large import freezes the UI for minutes.
+    _STAMP_SERVICE_TTL_S = 2.0
+
+    def _stamping_depth_service(self) -> DepthService:
+        import time
+
+        config = self.depth_config()
+        now = time.monotonic()
+        cached = self._stamp_service_cache
+        if cached is not None and cached[0] == id(config) \
+                and now - cached[1] < self._STAMP_SERVICE_TTL_S:
+            service = cached[2]
+        else:
+            service = DepthService(config, QgsProject.instance())
+        # Kept alive while in use: the window restarts on every stamp.
+        self._stamp_service_cache = (id(config), now, service)
+        return service
+
     def _stamp_position(self, event: Dict) -> None:
         """kp is the sole edit surface; lat/lon/depth are derived (spec §13)."""
         kp = float(event.get("kp") or 0.0)
@@ -1228,7 +1254,7 @@ class PlanModel(QObject):
             point = self.route.point_at_kp(kp, clamp=True)
             if point is not None:
                 lat, lon = point.y(), point.x()
-                service = self.depth_service()
+                service = self._stamping_depth_service()
                 if service.is_available():
                     depth = service.sample(lat, lon)
         event["lat"] = lat

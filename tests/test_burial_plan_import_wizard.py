@@ -208,6 +208,52 @@ def test_rpl_events_import(temp: str) -> bool:
                    bool(ok), f"kp={kp} burial={burial} tools={page.tool_map()}")
 
 
+def test_import_shares_one_depth_sampler(temp: str) -> bool:
+    """Regression: every stamped event built its own DepthService, which
+    clones the rasters and re-reads every contour — an 80-event import
+    froze QGIS for minutes on a real bathymetry project."""
+    from ..burial import plan_model as pm
+    from ..burial import rpl_plan_import as rpi
+    from ..burial.import_plan_wizard import SOURCE_RPL, ImportPlanWizard
+    folder = os.path.join(temp, "sampler")
+    os.makedirs(folder, exist_ok=True)
+    model = _model(folder)
+    built = []
+
+    class _CountingService:
+        def __init__(self, *_args, **_kwargs):
+            built.append(1)
+
+        def is_available(self):
+            return True
+
+        def sample(self, _lat, _lon):
+            return -42.0
+
+    rows = []
+    for i in range(141):
+        event = ("PLDN" if i % 7 == 1 else "PLUP" if i % 7 == 4 else "")
+        rows.append(rpi.RplRow(seq=i, pos_no=i + 1, event=event, stated_kp=0.05 * i,
+                               kp=0.05 * i, offset_m=0.0))
+    original = pm.DepthService
+    pm.DepthService = _CountingService
+    try:
+        model._stamp_service_cache = None
+        wizard = ImportPlanWizard(model, None, source_kind=SOURCE_RPL)
+        wizard.rpl.initializePage()
+        wizard.rpl.set_rows(rows, "test")
+        wizard.review.initializePage()
+        built.clear()
+        ok = wizard.commit()
+    finally:
+        pm.DepthService = original
+    events = model.events
+    ok = ok and len(events) == 40 and len(built) == 1
+    ok = ok and all(e.get("depth_m") == -42.0 for e in events)
+    return _result("import: one depth sampler for the whole batch (was one per event)",
+                   bool(ok), f"events={len(events)} samplers built={len(built)}")
+
+
 def run_all():
     from qgis.PyQt.QtCore import QSettings
     results = []
@@ -219,6 +265,7 @@ def run_all():
         os.makedirs(os.path.join(temp, "overlay"), exist_ok=True)
         try:
             for test in (test_replace_import, test_overlay_import, test_rpl_events_import,
+                         test_import_shares_one_depth_sampler,
                          test_rpl_protection_import):
                 try:
                     results.append(test(temp))

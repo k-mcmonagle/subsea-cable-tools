@@ -421,6 +421,23 @@ def walk(rows: Sequence[RplRow], tokens: Dict[int, List[Token]], direction: int 
     return out
 
 
+def segment_methods(rows: Sequence[RplRow], result_walk: Walk) -> List[Optional[str]]:
+    """Section of each RPL segment (row *k* → *k + 1*, RPL order): the
+    span covering its mid-point — a burial method, ``M_SKIP`` for a marked
+    skip, "" for an unmarked gap (also a skip), ``None`` when either end
+    could not be placed. Independent of the lay direction."""
+    out: List[Optional[str]] = []
+    for a, b in zip(rows, rows[1:]):
+        if a.kp is None or b.kp is None:
+            out.append(None)
+            continue
+        mid = (float(a.kp) + float(b.kp)) / 2.0
+        hit = next((s for s in result_walk.spans if s.lo - _KP_TOL <= mid <= s.hi + _KP_TOL),
+                   None)
+        out.append(hit.method if hit is not None else "")
+    return out
+
+
 def auto_swap(rows: Sequence[RplRow], auto: Dict[int, List[Token]], direction: int = 1) -> bool:
     """True when the events pair up better with starts and ends swapped
     (events written for the opposite lay direction, or labelled the wrong way)."""

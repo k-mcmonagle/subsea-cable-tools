@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **One row can hold several events.** `PLUP / Start PLB` is a tool transition at one KP. Everything between burial sections is a skip. A skip marked inside a plough section resumes the plough after it, and an RPL that marks only skips reads everything else as burial.
   - **Protection method column.** Each change of method between consecutive segments becomes a boundary. Values are read as Plough ("Plough 1.0 m", "Ploughed"), PLB ("PLB", "Jetted", "PLIB"), MFE, Burial ("Buried"), or Skip ("Surface laid", "Not buried", rock placement, blanks). Each distinct value can be re-mapped, and the choices are remembered. Imported sections are noted with their protection values. This source is picked automatically when the RPL has no boundary events but its protection method names burial.
   - **Swap starts and ends** is set automatically when the events pair up better swapped, for example an RPL written from the other landing. You can still toggle it.
-  - **Review every row before importing.** The preview shows *Read as* and *Section after* columns, coloured by tool, and each row can be edited: *Set start*, *Set end*, *Selected rows are Plough / PLB / MFE / Burial / Skip* (the rest of the plan is kept), *Clear*, *Reset*. Stray ends, missing PLUPs, unclosed starts and crossings inside a burial section are listed; click one to jump to its row.
+  - **Review every row before importing.** The preview is woven like the RPL: position rows carry the events and a *Read as* column, and between them segment rows show their length, protection method and the section the plan puts there, coloured by tool. The segment colours read the same whichever way the plan is laid. Each position can be edited: *Set start*, *Set end*, *Selected rows are Plough / PLB / MFE / Burial / Skip* (the rest of the plan is kept), *Clear*, *Reset*. Stray ends, missing PLUPs, unclosed starts and crossings inside a burial section are listed; click one to jump to its row.
   - **Import settings.** Each tool type maps to a registered tool, and the choice is remembered. An *Import window* KP range limits the import, and overlay replaces only that window. The import goes through the same Review page and is one undoable edit.
 
 - **One reliable KP, tied to the RPL** (`kp_datum.py`, `burial/plan_rereference.py`, `burial/rpl_reference.py`):
@@ -129,6 +129,7 @@ Also added KML export.
 
 ### Fixed
 
+- **Burial Planner no longer freezes on large imports or batch edits** (`burial/plan_model.py`): each event stamped with a position built its own bathymetry sampler. On a project with bathymetry, every event cloned the rasters and re-read and indexed every contour feature, so importing about 80 events kept QGIS unresponsive for minutes. Consecutive stamps now share one sampler, so the import finishes at once, and the import shows a busy cursor while it writes. The same fix applies to event merges, moves and plan transfers.
 - **KP handling fixes:**
   - **Burial Planner:**
     - *Targets from RPL* and the RPL-depth fallback used the RPL's printed KPs against measured KPs; they now measure each position.
