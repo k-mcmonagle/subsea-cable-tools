@@ -34,7 +34,7 @@ from qgis.PyQt.QtGui import QTransform
 
 from ..burial import attribute_rules
 from ..kp_geo_utils import RouteFrame
-from ..kp_range_utils import make_distance_area
+from ..kp_range_utils import make_kp_distance_area
 from ..qgis_compat import (
     GEOMETRY_POINT,
     GEOMETRY_POLYGON,
@@ -86,21 +86,24 @@ class RouteSampler:
         self.coords = coords  # parallel to stations_km; (x=lon, y=lat) or None
         self.distance = distance
         self.total_km = route.total_length_km
+        # KP domain: RPLs may start at a non-zero KP.
+        self.start_km = float(getattr(route, "start_kp_km", 0.0) or 0.0)
+        self.end_km = self.start_km + self.total_km
         self.scope = scope
         self.step_km = step_km  # regular sampling step (slope half-window)
         self._depth_series_cache: Dict[str, List[Tuple[float, float]]] = {}
 
     @property
     def domain(self) -> Interval:
-        return Interval(0.0, max(self.total_km, 1e-9))
+        return Interval(self.start_km, max(self.end_km, self.start_km + 1e-9))
 
     @property
     def scope_domain(self) -> Interval:
         """The scoped analysis window (falls back to the full route)."""
         if self.scope is None:
             return self.domain
-        lo = max(0.0, min(self.scope.start_km, self.scope.end_km))
-        hi = min(self.total_km, max(self.scope.start_km, self.scope.end_km))
+        lo = max(self.start_km, min(self.scope.start_km, self.scope.end_km))
+        hi = min(self.end_km, max(self.scope.start_km, self.scope.end_km))
         return Interval(lo, max(hi, lo + 1e-9))
 
     @classmethod
@@ -137,7 +140,7 @@ class RouteSampler:
                 "assessment geometry does not support — positions and "
                 "intersections would be silently wrong")
 
-        distance = make_distance_area(WGS84, project.transformContext())
+        distance = make_kp_distance_area(WGS84, project.transformContext())
         route = RouteFrame.from_source(geoms, distance)
         return cls.from_route(route, distance, sample_step_m, scope)
 
@@ -157,19 +160,20 @@ class RouteSampler:
 
 def _build_stations(route: RouteFrame, sample_step_m: float,
                     scope: Optional[Interval] = None) -> List[float]:
-    total_km = route.total_length_km
+    first_km = float(getattr(route, "start_kp_km", 0.0) or 0.0)
+    total_km = first_km + route.total_length_km   # route end KP
     step_km = max(float(sample_step_m), 1.0) / 1000.0
     if scope is None:
-        lo, hi = 0.0, total_km
+        lo, hi = first_km, total_km
     else:
         s = min(scope.start_km, scope.end_km)
         e = max(scope.start_km, scope.end_km)
-        lo = max(0.0, s - step_km)   # one-step margin for slope differencing
+        lo = max(first_km, s - step_km)   # one-step margin for slope differencing
         hi = min(total_km, e + step_km)
     marks = [lo, hi]
     # route vertices (feature boundaries) keep kinks in the depth/slope profile
     for off_m in route.feature_offsets_m:
-        m = off_m / 1000.0
+        m = first_km + off_m / 1000.0
         if lo - 1e-9 <= m <= hi + 1e-9:
             marks.append(m)
     kp = lo
@@ -365,13 +369,16 @@ def _depth_series(sampler: RouteSampler, store, rpl_id: str, project: QgsProject
         series = snapshot.profile_samples(sampler.route, sampler.stations_km)
         sampler._depth_metadata = {'sources': snapshot.profile_sources, 'cells': snapshot.profile_cells}
     if not series:
-        series = _rpl_depth_series(store, rpl_id)
+        series = _rpl_depth_series(store, rpl_id, sampler.route)
     if not series:
         raise RuleInputError("no depth source configured and RPL has no ApproxDepth values.")
     return series
 
 
-def _rpl_depth_series(store, rpl_id: str) -> List[Tuple[float, float]]:
+def _rpl_depth_series(store, rpl_id: str, route=None) -> List[Tuple[float, float]]:
+    """RPL ApproxDepth keyed by KP. With ``route`` (the sampler's WGS84
+    RouteFrame) each position's KP is *measured* on the route, the same KP
+    the stations use; the stated DistCumulative is only a fallback."""
     rpl = store.get_rpl(rpl_id)
     if not rpl:
         return []
@@ -379,12 +386,27 @@ def _rpl_depth_series(store, rpl_id: str) -> List[Tuple[float, float]]:
     if points is None or not points.isValid():
         return []
     out: List[Tuple[float, float]] = []
+    xform = None
+    if route is not None and points.crs() != WGS84:
+        from qgis.core import QgsCoordinateTransform
+        xform = QgsCoordinateTransform(points.crs(), WGS84, QgsProject.instance())
     for feat in points.getFeatures():
         try:
             kp = float(feat["DistCumulative"])
             depth = feat["ApproxDepth"]
         except (KeyError, TypeError, ValueError):
             continue
+        geom = feat.geometry()
+        if route is not None and geom is not None and not geom.isEmpty():
+            try:
+                point = QgsPointXY(geom.asPoint())
+                if xform is not None:
+                    point = xform.transform(point)
+                hit = route.kp_at_point(point)
+                if hit.snapped_xy is not None:
+                    kp = hit.kp_km
+            except Exception:
+                pass
         if depth is None:
             continue
         try:

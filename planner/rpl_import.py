@@ -16,7 +16,7 @@ from qgis.PyQt.QtWidgets import (
 from qgis.core import QgsGeometry, QgsProject
 
 from ..kp_geo_utils import RouteFrame
-from ..kp_range_utils import make_distance_area
+from ..kp_range_utils import make_kp_distance_area
 from ..qgis_compat import (
     BUTTON_BOX_CANCEL, BUTTON_BOX_OK, DIALOG_ACCEPTED, GEOMETRY_LINE, GEOMETRY_POINT,
     ITEM_FLAG_EDITABLE, LAYER_VECTOR, qt_exec,
@@ -574,7 +574,7 @@ def _read_segments(source: Optional[RplSource]) -> List[SegmentDraft]:
     features = list(line_layer.getFeatures())
     features.sort(key=lambda feature: _float_attr(feature, seq_field, feature.id()))
     point_kp = _point_kp_lookup(source.point_layer)
-    distance = make_distance_area(line_layer.crs(), QgsProject.instance().transformContext())
+    distance = make_kp_distance_area(line_layer.crs(), QgsProject.instance().transformContext())
     running_kp = 0.0
     segments = []
     for feature in features:
@@ -628,7 +628,7 @@ def _clip_segment(segment, start, end, crs):
     span = segment.kp_end - segment.kp_start
     if span <= 0:
         return segment
-    distance = make_distance_area(crs, QgsProject.instance().transformContext())
+    distance = make_kp_distance_area(crs, QgsProject.instance().transformContext())
     frame = RouteFrame.from_source([segment.geometry], distance)
     start_fraction = (overlap_start - segment.kp_start) / span
     end_fraction = (overlap_end - segment.kp_start) / span

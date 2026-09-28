@@ -109,8 +109,8 @@ def _acute_angle_deg(bearing_a: float, bearing_b: float) -> float:
 
 def _route_bearing(route, distance, kp: float) -> Optional[float]:
     half_km = 0.02
-    p1 = route.point_at_kp(max(kp - half_km, 0.0), clamp=True)
-    p2 = route.point_at_kp(min(kp + half_km, route.total_length_km), clamp=True)
+    p1 = route.point_at_kp(max(kp - half_km, route.start_kp_km), clamp=True)
+    p2 = route.point_at_kp(min(kp + half_km, route.end_kp_km), clamp=True)
     if p1 is None or p2 is None or p1 == p2:
         return None
     try:
@@ -631,9 +631,12 @@ class RiskScanTask(QgsTask):
                  route_geoms: List[QgsGeometry], transform_context,
                  scope: Optional[Interval], direction: int,
                  on_finished: Callable[["RiskScanTask"], None],
-                 description: str = "Burial Planner risk scan"):
+                 description: str = "Burial Planner risk scan",
+                 start_kp_km: float = 0.0, kp_mode=("", "")):
         super().__init__(description, _CAN_CANCEL)
         self.plan_id = plan_id
+        self._start_kp_km = float(start_kp_km or 0.0)
+        self._kp_mode = tuple(kp_mode or ("", ""))
         self.jobs = jobs
         self._route_geoms = route_geoms
         self._transform_context = transform_context
@@ -649,15 +652,17 @@ class RiskScanTask(QgsTask):
     def run(self) -> bool:
         try:
             from ..kp_geo_utils import RouteFrame
-            from ..kp_range_utils import make_distance_area
+            from ..kp_range_utils import make_kp_distance_area
 
-            distance = make_distance_area(WGS84, self._transform_context)
+            distance = make_kp_distance_area(
+                WGS84, self._transform_context, mode=self._kp_mode[0] or "ellipsoidal",
+                grid_crs=self._kp_mode[1] or "")
             # follow_stored_geometry matches the Burial Planner analysis
             # (build_route_frame): hazards and plan events must map the same
             # KP to the same physical position on the stored RPL line.
             route = RouteFrame.from_source(
                 [QgsGeometry(g) for g in self._route_geoms], distance,
-                follow_stored_geometry=True)
+                follow_stored_geometry=True, start_kp_km=self._start_kp_km)
             route_geom = QgsGeometry.collectGeometry(
                 [QgsGeometry(g) for g in route.geometries])
             total = max(len(self.jobs), 1)

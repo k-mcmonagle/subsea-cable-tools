@@ -97,17 +97,18 @@ def events_csv(plan: Dict, events: Sequence[Dict], generation_id: str = "",
 
 
 def _route_length_km(route) -> Optional[float]:
+    """The route end KP (reverse KP = end KP − KP); None without a route."""
     if route is None:
         return None
     try:
-        total = float(route.total_length_km)
+        total = float(getattr(route, "end_kp_km", route.total_length_km))
     except (AttributeError, TypeError, ValueError):
         return None
     return total if total > 0 else None
 
 
 def _rkp_text(kp, total_km: Optional[float]) -> str:
-    """Reverse KP (route length − KP), KP Mouse convention."""
+    """Reverse KP (route end KP − KP), KP Mouse convention."""
     if total_km is None or kp is None:
         return ""
     try:

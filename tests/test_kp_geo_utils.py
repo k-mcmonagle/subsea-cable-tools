@@ -450,25 +450,30 @@ def test_rplcomparator_ellipsoid_fallback() -> bool:
 
 
 def test_geodesic_interpolation_long_geographic_segment() -> bool:
-    """On a long east-west geographic segment, ``point_at_kp`` must return a
-    point on the geodesic — not a planar lon/lat midpoint. The geodesic
-    between (-30, 60) and (30, 60) bows northward and has its midpoint near
-    (0, 62.6); the old planar code returned exactly (0, 60).
+    """Long east-west geographic segment (-30,60)-(30,60).
+
+    Default (``follow_stored_geometry=True``, the plugin's one KP rule): the
+    point at mid-KP lies on the segment as drawn, (0, 60), and KP -> point
+    -> KP round-trips exactly. Explicit ``follow_stored_geometry=False``
+    still follows the geodesic, which bows north to ~(0, 62.6).
     """
 
     geom = _line("LINESTRING(-30 60, 30 60)")
     da = _da_geog()
     total_km = measure_total_length_m(geom, da) / 1000.0
     mid = point_at_kp(geom, total_km / 2.0, da)
-    if mid is None:
+    arc = point_at_kp(geom, total_km / 2.0, da, follow_stored_geometry=False)
+    if mid is None or arc is None:
         return _result("geodesic interpolation on long geographic segment", False, "None")
-
-    geodesic_north = mid.y() - 60.0
-    ok = abs(mid.x()) < 1e-3 and geodesic_north > 1.0
+    back = kp_at_point(geom, mid, da).kp_km
+    ok = abs(mid.x()) < 1e-6 and abs(mid.y() - 60.0) < 1e-6
+    ok = ok and abs(back - total_km / 2.0) < 1e-6
+    ok = ok and abs(arc.x()) < 1e-3 and arc.y() - 60.0 > 1.0
     return _result(
-        "geodesic interpolation on long geographic segment",
+        "long geographic segment: default follows the drawn line and round-trips; "
+        "arc mode still available",
         ok,
-        f"mid=({mid.x():.6f}, {mid.y():.6f}) geodesic_north_of_60={geodesic_north:.3f}deg",
+        f"mid=({mid.x():.6f}, {mid.y():.6f}) arc_y={arc.y():.3f} round_trip={abs(back - total_km / 2.0) * 1e6:.3f} mm",
     )
 
 

@@ -29,7 +29,7 @@ from qgis.core import (QgsProcessing,
                        QgsDistanceArea,
                        QgsProcessingLayerPostProcessorInterface)
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, GEOMETRY_LINE, PROCESSING_NUMBER_DOUBLE
-from ..kp_geo_utils import get_features_skip_invalid
+from ..kp_geo_utils import get_features_skip_invalid, ordered_route_geometry
 
 class ExtractACPointsAlgorithm(QgsProcessingAlgorithm):
     INPUT_RPL = 'INPUT_RPL'
@@ -135,33 +135,10 @@ class ExtractACPointsAlgorithm(QgsProcessingAlgorithm):
         if not geometries:
             return {self.OUTPUT: dest_id}
 
-        # Combine all features into a single (multi)line geometry.
-        # Prefer unaryUnion (dissolves boundaries) when available; fall back to collectGeometry.
-        try:
-            combined_geom = QgsGeometry.unaryUnion(geometries)
-        except Exception:
-            combined_geom = QgsGeometry.collectGeometry(geometries)
-
-        # Ensure we have a line geometry before attempting line-merge.
-        if combined_geom and combined_geom.type() != GEOMETRY_LINE:
-            try:
-                combined_geom = combined_geom.convertToType(GEOMETRY_LINE, True)
-            except Exception:
-                pass
-
-        # QGIS 3.36 uses mergeLines(); lineMerge() is not available.
-        merged_geom = combined_geom
-        if merged_geom is not None:
-            if hasattr(merged_geom, 'mergeLines'):
-                try:
-                    merged_geom = merged_geom.mergeLines()
-                except Exception:
-                    merged_geom = combined_geom
-            elif hasattr(merged_geom, 'lineMerge'):
-                try:
-                    merged_geom = merged_geom.lineMerge()
-                except Exception:
-                    merged_geom = combined_geom
+        # Shared route builder: features in SeqNo/layer order, touching legs
+        # joined into continuous lines, nothing re-ordered or reversed — the
+        # same chainage every other KP tool uses.
+        merged_geom = ordered_route_geometry(list(get_features_skip_invalid(source)))
         
         if merged_geom.isEmpty():
             feedback.pushInfo("Input line layer is empty or invalid after merging.")

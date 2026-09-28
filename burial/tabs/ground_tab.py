@@ -423,6 +423,12 @@ class GroundTab(QWidget):
                 except ValueError:
                     self._restore_cell(row, col)
                     return
+                if key in ("start_kp", "end_kp") and unit.get(key) != value:
+                    # A typed KP supersedes the delivered one: a later
+                    # "re-reference from source KPs" must not undo it.
+                    unit["src_start_kp"] = unit["src_end_kp"] = None
+                    unit["src_rpl"] = ""
+                    unit["rereference_flags"] = "edited"
                 unit[key] = value
             self._restore_cell(row, col)  # canonical formatting
         elif kind in ("class", "confidence"):
@@ -547,8 +553,15 @@ class GroundTab(QWidget):
             right["start_kp"] = kp
             right["top_m"] = top_kp
             right["base_m"] = base_kp
-            right["src_start_kp"] = right["src_end_kp"] = None
-            right["rereference_flags"] = ""
+            # Delivery (source) KPs split at the matching source KP, so a
+            # later re-reference from source KPs keeps both halves in place.
+            src_a, src_b = unit.get("src_start_kp"), unit.get("src_end_kp")
+            if src_a is not None and src_b is not None and end > start:
+                src_kp = float(src_a) + (kp - start) / (end - start) * (float(src_b) - float(src_a))
+                right["src_start_kp"] = round(src_kp, 6)
+                unit["src_end_kp"] = round(src_kp, 6)
+            else:
+                right["src_start_kp"] = right["src_end_kp"] = None
             unit["end_kp"] = kp
             if unit.get("top_end_m") is not None:
                 unit["top_end_m"] = top_kp

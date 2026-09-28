@@ -12,6 +12,7 @@ from qgis.PyQt.QtWidgets import (
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -321,6 +322,52 @@ class ReviewTab(QWidget):
         if self.model.plan:
             self._export("inputs", self.model.export_inputs_csv())
 
+    def _reference_events(self, text: str, events):
+        """Ask which RPL the file's KPs refer to; translate when not the plan's.
+
+        Files exported by the planner carry ``# rpl_id:`` — that RPL is
+        pre-selected. Returns the (possibly translated) events, or None.
+        """
+        from ..rpl_reference import kp_transform, rpl_choices
+        choices = rpl_choices(self.model)
+        if len(choices) <= 1:
+            return events
+        header_rpl = ""
+        for line in text.splitlines()[:20]:
+            if line.lstrip().lower().startswith("# rpl_id:"):
+                header_rpl = line.split(":", 1)[1].strip()
+        plan_rpl = str(self.model.resolved_rpl_id or self.model.plan.get("rpl_id") or "")
+        labels = [label for label, _rid in choices]
+        current = next((i for i, (_l, rid) in enumerate(choices)
+                        if header_rpl and rid == header_rpl and rid != plan_rpl), 0)
+        label, ok = QInputDialog.getItem(
+            self, "Import events / KP ranges",
+            "The KPs in this file refer to:", labels, current, False)
+        if not ok:
+            return None
+        rpl_id = choices[labels.index(label)][1]
+        try:
+            _map_range, kp_map = kp_transform(self.model, rpl_id)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Burial Planner", str(exc))
+            return None
+        if kp_map is None:
+            return events
+        flagged = 0
+        out = []
+        for event in events:
+            event = dict(event)
+            kp, flags = kp_map.map_kp(float(event.get("kp") or 0.0))
+            event["kp"] = round(kp, 6)
+            flagged += bool(flags)
+            out.append(event)
+        if flagged:
+            QMessageBox.information(
+                self, "Burial Planner",
+                f"{flagged} KP(s) were translated across stretches where the two "
+                "routes differ — check them after the import.")
+        return out
+
     def _import_csv(self) -> None:
         if not self.model.plan:
             return
@@ -335,6 +382,9 @@ class ReviewTab(QWidget):
                 text, client_proposal=self.proposal_check.isChecked())
         except (OSError, io_csv.ImportError_) as exc:
             QMessageBox.warning(self, "Burial Planner", f"Import failed: {exc}")
+            return
+        events = self._reference_events(text, events)
+        if events is None:
             return
         try:
             self.model.import_events(events, fmt,

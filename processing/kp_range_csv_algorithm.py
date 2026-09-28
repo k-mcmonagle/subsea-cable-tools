@@ -51,7 +51,7 @@ from ..kp_range_utils import (
     add_distance_mode_parameter,
     read_distance_mode,
 )
-from ..kp_geo_utils import get_features_skip_invalid, point_at_kp
+from ..kp_geo_utils import get_features_skip_invalid, ordered_route_geometry, point_at_kp
 
 class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
     INPUT_LAYER = 'INPUT_LAYER'
@@ -349,7 +349,8 @@ class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
         if not geometries:
             return {self.OUTPUT: dest_id, self.OUTPUT_POINTS: point_dest_id}
 
-        combined_geom = QgsGeometry.unaryUnion(geometries)
+        # Shared route builder (SeqNo/layer order, no noding).
+        combined_geom = ordered_route_geometry(list(get_features_skip_invalid(source)))
 
         if combined_geom.isEmpty():
             feedback.pushInfo("Input line layer is empty or invalid.")

@@ -48,8 +48,8 @@ from qgis.core import (
 )
 from ..qgis_compat import PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE, PROCESSING_NUMBER_INTEGER
 
-from ..kp_range_utils import extract_line_segment, make_distance_area, measure_total_length_m
-from ..kp_geo_utils import get_features_skip_invalid
+from ..kp_range_utils import extract_line_segment, make_kp_distance_area, measure_total_length_m
+from ..kp_geo_utils import get_features_skip_invalid, ordered_route_geometry
 
 
 def _safe_filename(value: str) -> str:
@@ -314,11 +314,11 @@ Output:
         return g
 
     def _dissolve_rpl_geometry(self, rpl_source, context, feedback) -> Optional[QgsGeometry]:
-        geometries = [f.geometry() for f in get_features_skip_invalid(rpl_source)
-                      if f.hasGeometry() and not f.geometry().isEmpty()]
-        if not geometries:
+        features = list(get_features_skip_invalid(rpl_source))
+        if not features:
             return None
-        combined = QgsGeometry.unaryUnion(geometries)
+        # Shared route builder: SeqNo/layer order, no noding (KP = RouteFrame KP).
+        combined = ordered_route_geometry(features)
         if combined is None or combined.isEmpty():
             return None
         return combined
@@ -417,7 +417,7 @@ Output:
             if rpl_geom is None:
                 raise QgsProcessingException(self.tr('Reference RPL line layer has no valid geometry.'))
 
-            distance_calculator = make_distance_area(
+            distance_calculator = make_kp_distance_area(
                 rpl_source.sourceCrs(), context.transformContext(), project=context.project()
             )
             total_length_m = float(measure_total_length_m(rpl_geom, distance_calculator))

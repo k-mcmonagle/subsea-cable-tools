@@ -403,6 +403,13 @@ def rpl_fingerprint(rpl_row: Optional[Dict], gpkg_path: str = "") -> str:
     ])
 
 
+def rpl_fingerprint_core(fingerprint: str) -> str:
+    """The RPL fingerprint without the Workbench file location, so moving or
+    copying a project folder never makes a plan look stale."""
+    parts = (fingerprint or "").split("|")
+    return "|".join(parts[:3]) if len(parts) >= 4 else (fingerprint or "")
+
+
 def route_geometry_fingerprint(route) -> str:
     """Content hash of a RouteFrame's WGS84 geometry (7 dp ≈ 1 cm).
 
@@ -420,6 +427,11 @@ def route_geometry_fingerprint(route) -> str:
         digest.update(b";")
     try:
         digest.update(f"{float(route.total_length_km):.6f}".encode("ascii"))
+        # A different start KP renumbers every station: derived results
+        # (analysis, profile, paths) keyed on this hash must go stale.
+        start = float(getattr(route, "start_kp_km", 0.0) or 0.0)
+        if start:
+            digest.update(f"@{start:.6f}".encode("ascii"))
     except (AttributeError, TypeError, ValueError):
         pass
     return "geom:" + digest.hexdigest()[:20]
@@ -603,9 +615,10 @@ def _route_window(route, plan: Dict) -> Tuple[float, float]:
     """The KP window overlays are clipped to: the plan scope when set,
     else the whole route."""
     try:
-        total = float(route.total_length_km)
+        first = float(getattr(route, "start_kp_km", 0.0) or 0.0)
+        total = float(getattr(route, "end_kp_km", route.total_length_km))
     except (AttributeError, TypeError, ValueError):
-        total = 0.0
+        first, total = 0.0, 0.0
     try:
         lo = float(plan.get("scope_start_kp") or 0.0)
         hi = float(plan.get("scope_end_kp") or 0.0)
@@ -613,8 +626,8 @@ def _route_window(route, plan: Dict) -> Tuple[float, float]:
         lo, hi = 0.0, 0.0
     lo, hi = sorted((lo, hi))
     if hi - lo <= 1e-9:
-        return 0.0, total
-    return max(0.0, lo), (min(hi, total) if total > 0 else hi)
+        return first, total
+    return max(first, lo), (min(hi, total) if total > 0 else hi)
 
 
 def _ground_layer_rows(plan: Dict, units: Sequence[Dict], classes: Sequence[Dict],
@@ -673,9 +686,10 @@ def _bas_layer_rows(plan: Dict, bas_rows: Sequence[Dict], columns: Sequence[Dict
     if route is None or not bas_rows:
         return []
     try:
-        total = float(route.total_length_km)
+        first = float(getattr(route, "start_kp_km", 0.0) or 0.0)
+        total = float(getattr(route, "end_kp_km", route.total_length_km))
     except (AttributeError, TypeError, ValueError):
-        total = 0.0
+        first, total = 0.0, 0.0
     rows: List[Dict] = []
     plan_id = plan.get("plan_id") or ""
     for raw in bas_rows:
@@ -685,7 +699,7 @@ def _bas_layer_rows(plan: Dict, bas_rows: Sequence[Dict], columns: Sequence[Dict
         # Clip to the route: a register can extend past either end of the
         # RPL it was delivered against (or be off-route entirely after a
         # bad re-reference) — never let that raise or draw garbage.
-        start = max(0.0, row["start_kp"])
+        start = max(first, row["start_kp"])
         end = min(total, row["end_kp"]) if total > 0 else row["end_kp"]
         if end - start <= 1e-9:
             continue

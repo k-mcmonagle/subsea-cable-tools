@@ -44,7 +44,7 @@ from qgis.core import (
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_FIELD_NUMERIC
 
 from .rpl_comparison_utils import RPLComparator
-from ..kp_range_utils import make_distance_area
+from ..kp_range_utils import make_kp_distance_area
 
 
 class RPLRouteComparisonAlgorithm(QgsProcessingAlgorithm):
@@ -335,7 +335,7 @@ the design point to the as-laid point and includes the following attributes:
         # Use the shared helper so the WGS84 fallback is applied when the
         # project ellipsoid is unset (matches every other KP-emitting tool).
         try:
-            distance_calc = make_distance_area(
+            distance_calc = make_kp_distance_area(
                 crs, context.transformContext(), project=context.project()
             )
         except ValueError as exc:

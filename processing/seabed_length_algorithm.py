@@ -25,7 +25,7 @@ if lib_dir not in sys.path:
 
 from qgis.PyQt.QtCore import QCoreApplication
 from ..kp_range_utils import make_distance_area
-from ..kp_geo_utils import extract_line_segment
+from ..kp_geo_utils import extract_line_segment, ordered_route_geometry
 from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
@@ -236,14 +236,8 @@ class SeabedLengthAlgorithm(QgsProcessingAlgorithm):
             feedback.setProgress((route_idx / total_routes) * 100)
 
             # Merge geometries for the route
-            merged_geom = None
-            for feature in features:
-                geom = feature.geometry()
-                if geom and not geom.isEmpty():
-                    if merged_geom is None:
-                        merged_geom = geom
-                    else:
-                        merged_geom = merged_geom.combine(geom)
+            # Shared route builder (SeqNo/layer order, no noding).
+            merged_geom = ordered_route_geometry(list(features))
 
             if not merged_geom or merged_geom.isEmpty():
                 continue

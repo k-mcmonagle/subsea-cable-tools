@@ -230,6 +230,20 @@ class InputsTab(QWidget):
             "The route the plan currently uses. Choose a source below and "
             "Set route to change it.")
         rpl_form.addRow("Active route:", self.active_route_label)
+        kp_row = QHBoxLayout()
+        self.kp_mode_label = QLabel("—")
+        self.kp_mode_label.setToolTip(
+            "How this plan measures KP. Plans keep their own setting (taken from "
+            "Subsea Cable Tools ▸ KP settings when created) so a later change of the "
+            "plugin setting never renumbers an existing plan.")
+        kp_row.addWidget(self.kp_mode_label, 1)
+        self.kp_mode_button = QPushButton("Change…")
+        self.kp_mode_button.setToolTip(
+            "Switch this plan between Geodesic and Cartesian (grid) KP. Every stored "
+            "KP is translated so items keep their seabed position (one undoable edit).")
+        self.kp_mode_button.clicked.connect(self._change_kp_mode)
+        kp_row.addWidget(self.kp_mode_button)
+        rpl_form.addRow("KP distance:", kp_row)
         source_row = QHBoxLayout()
         self.route_workbench_radio = QRadioButton("Workbench RPL")
         self.route_workbench_radio.setToolTip(
@@ -577,6 +591,8 @@ class InputsTab(QWidget):
                 self.active_route_label.setText(
                     "— (no route set)" if plan else "—")
             self._select_route_source(plan)
+            self.kp_mode_label.setText(self.model.kp_mode_text() if plan else "—")
+            self.kp_mode_button.setEnabled(bool(plan))
             if not (same_plan and "scope" in self._dirty):
                 self.scope_start.setValue(
                     float(plan.get("scope_start_kp") or 0.0))
@@ -590,8 +606,10 @@ class InputsTab(QWidget):
                 self._clear_dirty("target")
             self._refresh_bathy_notice()
             self._update_target_summary()
-            if self.model.route_notice:
-                self._set_status(self.model.route_notice, "warn")
+            messages = self.model.route_messages() if plan else []
+            if messages:
+                level = "warn" if any(lv == "warn" for _t, lv in messages) else "info"
+                self._set_status("  ".join(text for text, _lv in messages), level)
             elif plan and self.model.route_error:
                 self._set_status(self.model.route_error, "error")
         finally:
@@ -752,13 +770,21 @@ class InputsTab(QWidget):
         # Keep the model's store handle current; the Workbench can be created
         # after the Burial Planner dock was first opened.
         self.model.workbench_store = store
-        if not self.model.update_plan({
+        updates = {
             "rpl_id": rpl_id,
             "rpl_name": rpl.get("name") or "",
             "rpl_revision": rpl.get("rev_label") or "",
             "rpl_gpkg_path": store.gpkg_path,
             "rpl_fingerprint": map_layers.rpl_fingerprint(rpl, store.gpkg_path),
-        }, reason="route set"):
+        }
+        moving = (self.model.route is not None
+                  and str(self.model.resolved_rpl_id or self.model.plan.get("rpl_id") or "")
+                  != str(rpl_id) and self.model._plan_has_kp_data())
+        if moving:
+            result = self._change_route_with_rereference(rpl, updates)
+            if result is None:
+                return
+        elif not self.model.change_route(updates, reason="route set"):
             return
         if self.model.route is None:
             # The reference saved but the route itself would not open —
@@ -770,6 +796,70 @@ class InputsTab(QWidget):
         self._set_status(
             "Workbench route and revision applied. Continue to Bathymetry "
             "Profile to review and rebuild the stored samples.", "ok")
+
+    def _change_route_with_rereference(self, rpl: Dict, updates: Dict):
+        """Move a plan with KP data onto another RPL, asking how to treat KPs."""
+        from ..rereference_qgis import rpl_label
+        try:
+            kp_map, report, new_route = self.model.preview_route_change(rpl)
+        except ValueError as exc:
+            self._set_status(f"The new route could not be compared: {exc}", "error")
+            return None
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Change the plan's RPL")
+        box.setText(
+            f"Move this plan onto '{rpl_label(rpl)}' "
+            f"(KP {new_route.start_kp_km:.3f}–{new_route.end_kp_km:.3f})?\n\n"
+            "Recommended: keep every event, section, target, hazard, BAS and "
+            "ground-model range at its seabed position and give it the new "
+            "route's KP.\n\n" + report.summary())
+        details = report.flagged[:40] + report.outside[:40]
+        if details:
+            box.setDetailedText("\n".join(details))
+        keep_position = box.addButton("Keep seabed positions (re-reference KPs)",
+                                      QMessageBox.ButtonRole.AcceptRole)
+        keep_numbers = box.addButton("Keep KP numbers", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(keep_position)
+        qt_exec(box)
+        clicked = box.clickedButton()
+        if clicked == keep_position:
+            result = self.model.change_route(updates, kp_map)
+            if result:
+                self._set_status("Plan moved to the new RPL; KPs re-referenced "
+                                 f"({result.summary()}) Undo from Review && Export.", "ok")
+            return result
+        if clicked == keep_numbers:
+            return self.model.change_route(updates, None, reason="route set (KP numbers kept)")
+        return None
+
+    def _change_kp_mode(self) -> None:
+        if not self.model.plan:
+            return
+        from ...kp_settings_dialog import KpSettingsDialog
+        mode, grid = self.model.kp_mode()
+        dialog = KpSettingsDialog(
+            self, mode, grid, title="Plan KP distance",
+            note="Changes this plan only. Stored KPs are re-measured so every item "
+                 "keeps its seabed position; the change is one undoable edit.")
+        if not qt_exec(dialog):
+            return
+        new_mode, new_grid = dialog.values()
+        if (new_mode, new_grid) == (mode, grid):
+            return
+        try:
+            result = self.model.change_kp_mode(new_mode, new_grid)
+        except ValueError as exc:
+            self._set_status(str(exc), "error")
+            return
+        if result is None:
+            return
+        text = f"KP distance is now {self.model.kp_mode_text()}."
+        if result is not True:
+            text += f" {result.summary()} Undo from Review && Export."
+        self._set_status(text, "ok")
+        self.kp_mode_label.setText(self.model.kp_mode_text())
 
     def _apply_fallback(self) -> None:
         layer = self.fallback_combo.currentLayer()
@@ -799,8 +889,8 @@ class InputsTab(QWidget):
                 "Set the route first — Full route needs the route length.",
                 "warn")
             return
-        self.scope_start.setValue(0.0)
-        self.scope_end.setValue(self.model.route.total_length_km)
+        self.scope_start.setValue(self.model.route.start_kp_km)
+        self.scope_end.setValue(self.model.route.end_kp_km)
 
     def _pick_scope_kp(self, spin, which: str) -> None:
         if self.dock is None:
@@ -817,6 +907,14 @@ class InputsTab(QWidget):
             self._set_status(
                 "The scope end KP must be greater than the start KP — "
                 "nothing was saved.", "error")
+            return
+        route = self.model.route
+        if route is not None and (start < route.start_kp_km - 0.0005
+                                  or end > route.end_kp_km + 0.0005):
+            self._set_status(
+                f"The scope KP {start:.3f}–{end:.3f} extends beyond the route "
+                f"(KP {route.start_kp_km:.3f}–{route.end_kp_km:.3f}) — nothing "
+                "was saved. Use Full route or pick KPs on the map.", "error")
             return
         saved = self.model.update_plan({
             "scope_start_kp": start,
@@ -1048,7 +1146,7 @@ class InputsTab(QWidget):
         start = max(starts) if starts else self.scope_start.value()
         end = start + 1.0
         if self.model.route is not None:
-            end = min(end, self.model.route.total_length_km)
+            end = min(end, self.model.route.end_kp_km)
         self._append_target_row({"start_kp": start, "end_kp": end,
                                  "depth_m": self.target_burial.value() or None,
                                  "notes": ""})
@@ -1133,9 +1231,25 @@ class InputsTab(QWidget):
                 store, rpl.get("lines_layer") or ""))
         except Exception:
             return []
-        kp_by_pos = {str(p.get("pos")): p.get("kp") for p in points
-                     if p.get("kp") is not None}
-        out, cursor = [], 0.0
+        # KP of each position is *measured* on the plan route (the stated
+        # DistCumulative is only a fallback), so ranges line up with every
+        # other plan KP even when the RPL's printed KPs drift.
+        route = self.model.route
+        kp_by_pos = {}
+        for p in points:
+            kp = p.get("kp")
+            if route is not None and p.get("lat") is not None and p.get("lon") is not None:
+                try:
+                    from qgis.core import QgsPointXY
+                    hit = route.kp_at_point(QgsPointXY(float(p["lon"]), float(p["lat"])))
+                    if hit.snapped_xy is not None:
+                        kp = hit.kp_km
+                except Exception:
+                    pass
+            if kp is not None:
+                kp_by_pos[str(p.get("pos"))] = kp
+        out = []
+        cursor = route.start_kp_km if route is not None else 0.0
         for leg in legs:
             start = kp_by_pos.get(str(leg.get("from_pos")))
             end = kp_by_pos.get(str(leg.get("to_pos")))
@@ -1160,7 +1274,7 @@ class InputsTab(QWidget):
 
     def _apply_targets(self) -> None:
         ranges = self._table_targets()
-        length = self.model.route.total_length_km \
+        length = (self.model.route.start_kp_km, self.model.route.end_kp_km) \
             if self.model.route is not None else None
         problems = target_depth.validate_ranges(ranges, length)
         if problems:

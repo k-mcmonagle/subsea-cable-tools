@@ -24,7 +24,9 @@ from qgis.gui import QgsMapTool, QgsRubberBand, QgsVertexMarker
 from ..qgis_compat import QAction, DIALOG_ACCEPTED, qt_exec, DISTANCE_METERS, FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_LONG_LONG, FIELD_TYPE_STRING, GEOMETRY_LINE, GEOMETRY_POINT, GEOMETRY_POLYGON, LAYER_RASTER, LAYER_VECTOR, MESSAGE_CRITICAL, MESSAGE_INFO, MESSAGE_SUCCESS, MESSAGE_WARNING, TOOLBUTTON_POPUP_MODE_MENU_BUTTON, BUTTON_BOX_OK, BUTTON_BOX_CANCEL, BUTTON_BOX_CLOSE, BUTTON_BOX_ACCEPT_ROLE, get_event_global_pos, ITEM_DATA_USER_ROLE, ITEM_FLAG_EDITABLE, ITEM_FLAG_USER_CHECKABLE, CHECK_STATE_CHECKED, CHECK_STATE_UNCHECKED, SELECTION_MODE_NONE, HEADER_RESIZE_MODE_STRETCH
 import math
 
-from ..kp_range_utils import make_distance_area
+from ..kp_range_utils import (KP_MODE_CARTESIAN, KP_MODE_GEODESIC, describe_kp_mode,
+                              kp_distance_mode, kp_grid_crs_setting, make_distance_area,
+                              make_kp_distance_area, set_kp_distance_settings)
 try:  # sip is available in QGIS Python env; guard for static analysis
     from qgis.PyQt import sip  # type: ignore
     _sip_isdeleted = sip.isdeleted
@@ -88,24 +90,12 @@ class KPMouseMapTool(QgsMapTool):
         # Distance / chainage preparation. Geometries are transformed into the
         # project CRS below, so we build the distance area against the project CRS.
         project_crs = self.canvas.mapSettings().destinationCrs()
-        # Guard: planar/cartesian measurements in a geographic CRS would return degrees.
-        # We disable cartesian here to prevent silently wrong results (the config dialog
-        # also disables the option when the project CRS is geographic).
-        if self.useCartesian and project_crs.isGeographic():
-            self.useCartesian = False
-            try:
-                self.iface.messageBar().pushMessage(
-                    "KP Mouse Tool",
-                    "Cartesian distance requires a projected project CRS; falling back to ellipsoidal.",
-                    level=MESSAGE_WARNING,
-                    duration=5,
-                )
-            except Exception:
-                pass
-        self.distanceArea = make_distance_area(
+        # KP follows the plugin-wide KP setting (geodesic, or cartesian grid —
+        # which also works on a geographic project CRS via the grid CRS).
+        self.distanceArea = make_kp_distance_area(
             project_crs,
             QgsProject.instance().transformContext(),
-            mode="cartesian" if self.useCartesian else "ellipsoidal",
+            mode=KP_MODE_CARTESIAN if self.useCartesian else KP_MODE_GEODESIC,
         )
 
         # Cache line geometries
@@ -196,15 +186,10 @@ class KPMouseMapTool(QgsMapTool):
 
         # Set up distance measurements (ellipsoidal or planar).
         project_crs = self.canvas.mapSettings().destinationCrs()
-        if self.useCartesian and project_crs.isGeographic():
-            # Defensive: cartesian on a geographic CRS yields degrees. Fall back
-            # silently here (the constructor / config dialog will have already
-            # surfaced this to the user the first time).
-            self.useCartesian = False
-        self.distanceArea = make_distance_area(
+        self.distanceArea = make_kp_distance_area(
             project_crs,
             QgsProject.instance().transformContext(),
-            mode="cartesian" if self.useCartesian else "ellipsoidal",
+            mode=KP_MODE_CARTESIAN if self.useCartesian else KP_MODE_GEODESIC,
         )
 
         # Cache geometries and their lengths in project CRS
@@ -1592,7 +1577,13 @@ class KPConfigDialog(QDialog):
         layout.addWidget(self.reverse_kp_checkbox)
 
         # Cartesian checkbox
-        self.cartesian_checkbox = QCheckBox("Use Cartesian distances (planar, in project CRS units)")
+        self.cartesian_checkbox = QCheckBox(
+            "Cartesian (grid) KP — plugin-wide setting")
+        self.cartesian_checkbox.setToolTip(
+            "Measure KP as planar grid distances instead of geodesic (WGS84). This is "
+            "the plugin-wide KP setting: KP tools, docks and new Burial Planner plans "
+            "all follow it. The grid CRS is chosen in Subsea Cable Tools ▸ KP settings "
+            "(default: the project CRS when projected, else the route's UTM zone).")
         self.cartesian_checkbox.setChecked(current_use_cartesian)
         layout.addWidget(self.cartesian_checkbox)
 
@@ -1664,8 +1655,9 @@ class KPConfigDialog(QDialog):
 
         # Note about calculations
         self.note_label = QLabel(
-            "Note: Ellipsoidal uses the project's ellipsoid (fallback WGS84). "
-            "Cartesian uses planar distances in the project CRS (requires a projected CRS)."
+            "Note: KP is geodesic on WGS84 by default. Cartesian (grid) uses planar "
+            "distances in the grid CRS set in Subsea Cable Tools ▸ KP settings "
+            f"(currently: {describe_kp_mode(KP_MODE_CARTESIAN)})."
         )
         self.note_label.setWordWrap(True)
         layout.addWidget(self.note_label)
@@ -1800,12 +1792,10 @@ class KPConfigDialog(QDialog):
         total_vertices = 0
 
         d_ell = make_distance_area(project_crs, transform_context, mode="ellipsoidal")
-        planar_ok = not project_crs.isGeographic()
-        d_planar = (
-            make_distance_area(project_crs, transform_context, mode="cartesian")
-            if planar_ok
-            else None
-        )
+        # Grid length works on any project CRS (grid CRS from KP settings).
+        planar_ok = True
+        d_planar = make_kp_distance_area(project_crs, transform_context,
+                                         mode=KP_MODE_CARTESIAN)
 
         for feature in layer.getFeatures():
             geom = QgsGeometry(feature.geometry())
@@ -1843,11 +1833,8 @@ class KPConfigDialog(QDialog):
             f"Length (ellipsoidal): {length_ell_km:.3f} km\n{planar_line}\nAC Count: {total_vertices}"
         )
 
-        # Enable Cartesian checkbox only if the project CRS is projected
-        is_projected = not project_crs.isGeographic()
-        self.cartesian_checkbox.setEnabled(is_projected)
-        if not is_projected:
-            self.cartesian_checkbox.setChecked(False)
+        # Cartesian (grid) works on any project CRS: a geographic project is
+        # measured in the grid CRS (KP settings) or the route's UTM zone.
 
     def update_depth_ui(self):
         """Enable the depth layer table/profile option with the main checkbox."""
@@ -2217,6 +2204,8 @@ class KPMouseTool:
             # and persisted; re-read it so a rebuilt tool keeps the user's state.
             self.showDepthProfile = QSettings("SubseaCableTools", "KPMouseTool").value(
                 "showDepthProfile", self.showDepthProfile, type=bool)
+            # Pick up a change made in KP settings since the tool was set up.
+            self.useCartesian = kp_distance_mode() == KP_MODE_CARTESIAN
             self.mapTool = KPMouseMapTool(
                 self.iface.mapCanvas(),
                 layer,
@@ -2292,6 +2281,10 @@ class KPMouseTool:
                 self.measurementUnit = unit
                 self.showReverseKP = show_reverse_kp
                 self.useCartesian = use_cartesian
+                # The checkbox is the plugin-wide KP setting.
+                set_kp_distance_settings(
+                    KP_MODE_CARTESIAN if use_cartesian else KP_MODE_GEODESIC,
+                    kp_grid_crs_setting())
                 self.showDepth = show_depth
                 self.depthSourceRefs = list(depth_sources or [])
                 self.copyIncludeRKP = bool(copy_include_rkp)
@@ -2368,11 +2361,10 @@ class KPMouseTool:
 
     def _make_distance_area(self) -> QgsDistanceArea:
         project_crs = self.iface.mapCanvas().mapSettings().destinationCrs()
-        use_cartesian = self.useCartesian and not project_crs.isGeographic()
-        return make_distance_area(
+        return make_kp_distance_area(
             project_crs,
             QgsProject.instance().transformContext(),
-            mode="cartesian" if use_cartesian else "ellipsoidal",
+            mode=KP_MODE_CARTESIAN if self.useCartesian else KP_MODE_GEODESIC,
         )
 
     def _iter_reference_geometries_project_crs(self):
@@ -2547,7 +2539,7 @@ class KPMouseTool:
             self.referenceLayer = QgsProject.instance().mapLayer(layer_id)
         self.measurementUnit = settings.value("measurementUnit", "km")
         self.showReverseKP = settings.value("showReverseKP", False, type=bool)
-        self.useCartesian = settings.value("useCartesian", False, type=bool)
+        self.useCartesian = kp_distance_mode() == KP_MODE_CARTESIAN
         self.showDepth = settings.value("showDepth", False, type=bool)
         # New clipboard settings (default: only KP)
         self.copyIncludeRKP = settings.value("copyIncludeRKP", False, type=bool)

@@ -30,7 +30,7 @@ from qgis.core import (QgsProcessing,
                        QgsCoordinateReferenceSystem,
                        QgsCoordinateTransform)
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, GEOMETRY_LINE, PROCESSING_NUMBER_DOUBLE
-from ..kp_geo_utils import get_features_skip_invalid
+from ..kp_geo_utils import get_features_skip_invalid, ordered_route_geometry
 
 
 def _make_local_aeqd_crs(lat: float, lon: float) -> QgsCoordinateReferenceSystem:
@@ -310,29 +310,8 @@ class PlaceSingleKpPointAlgorithm(QgsProcessingAlgorithm):
         if not geometries:
             raise QgsProcessingException(self.tr("Input line layer has no geometries."))
 
-        try:
-            combined_geom = QgsGeometry.unaryUnion(geometries)
-        except Exception:
-            combined_geom = QgsGeometry.collectGeometry(geometries)
-
-        if combined_geom and combined_geom.type() != GEOMETRY_LINE:
-            try:
-                combined_geom = combined_geom.convertToType(GEOMETRY_LINE, True)
-            except Exception:
-                pass
-
-        merged_geometry = combined_geom
-        if merged_geometry is not None:
-            if hasattr(merged_geometry, 'mergeLines'):
-                try:
-                    merged_geometry = merged_geometry.mergeLines()
-                except Exception:
-                    merged_geometry = combined_geom
-            elif hasattr(merged_geometry, 'lineMerge'):
-                try:
-                    merged_geometry = merged_geometry.lineMerge()
-                except Exception:
-                    merged_geometry = combined_geom
+        # Shared route builder (SeqNo/layer order, no noding or reversal).
+        merged_geometry = ordered_route_geometry(line_features)
         
         if merged_geometry.isEmpty():
             raise QgsProcessingException(self.tr("Geometry is empty after merging features."))

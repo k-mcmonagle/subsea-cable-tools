@@ -15,7 +15,7 @@ from qgis.gui import QgsVertexMarker, QgsRubberBand
 from .maptools.temp_line_maptool import TempLineMapTool  # new temporary line drawing tool
 from .maptools.profile_measure_controller import HINT as MEASURE_HINT, ProfileMeasureController
 from .maptools.profile_measurements import UNITS, write_measurements_csv
-from .kp_range_utils import make_distance_area
+from .kp_range_utils import make_kp_distance_area
 from .bathymetry_sampling import RasterSampler, expand_rasters, layer_options, normalise_depth, metres_per_unit, configure_layers
 from .slope_utils import (
     supported_slopes, clean_crossings, interpolate_covered, cross_profile_metrics,
@@ -67,7 +67,7 @@ class DepthProfileDockWidget(QDockWidget):
         # Placeholder distance area; reassigned via make_distance_area against the
         # active reference-line CRS once a route is loaded.
         _project = QgsProject.instance()
-        self.distance_area = make_distance_area(
+        self.distance_area = make_kp_distance_area(
             _project.crs(), _project.transformContext(), project=_project
         )
         self.marker = None
@@ -486,7 +486,7 @@ class DepthProfileDockWidget(QDockWidget):
             "<li><b>Tips & Notes:</b>"
             "  <ul>"
             "    <li>Ensure all layers use the same CRS as the project for correct marker placement.</li>"
-            "    <li>KP (chainage) is computed using QGIS project measurement settings (ellipsoid). If you need grid/projection distance, set your project ellipsoid appropriately.</li>"
+            "    <li>KP (chainage) is measured geodesically on the WGS84 ellipsoid, the same way in every Subsea Cable Tools KP tool and the Burial Planner.</li>"
             "    <li><b>Reverse KP</b> re-numbers KP along the route, while <b>Invert KP Axis</b> only flips the displayed X-axis direction.</li>"
             "    <li>Sampling interval and max samples affect performance and detail.</li>"
             "    <li>For large datasets, plotting may take a few seconds.</li>"
@@ -826,7 +826,7 @@ class DepthProfileDockWidget(QDockWidget):
         # Drawn route
         try:
             if self.use_drawn_chk.isChecked() and self.temp_drawn_points and len(self.temp_drawn_points) >= 2:
-                da = make_distance_area(
+                da = make_kp_distance_area(
                     project.crs(), project.transformContext(), project=project
                 )
                 length = 0.0
@@ -842,7 +842,7 @@ class DepthProfileDockWidget(QDockWidget):
             line_layer = QgsProject.instance().mapLayer(layer_id) if layer_id else None
             if not line_layer or not isinstance(line_layer, QgsVectorLayer) or line_layer.geometryType() != GEOMETRY_LINE:
                 return None
-            da = make_distance_area(
+            da = make_kp_distance_area(
                 line_layer.sourceCrs(), project.transformContext(), project=project
             )
             total = 0.0
@@ -1074,7 +1074,7 @@ class DepthProfileDockWidget(QDockWidget):
                 self._status_msg = "Drawn line must have at least 2 points"
                 return False
             self.line_parts = [list(self.temp_drawn_points)]
-            self.distance_area = make_distance_area(
+            self.distance_area = make_kp_distance_area(
                 project.crs(), project.transformContext(), project=project
             )
             self.line_length = sum(self.distance_area.measureLine(a, b) for a, b in
@@ -1090,8 +1090,9 @@ class DepthProfileDockWidget(QDockWidget):
         if not line_layer or not isinstance(line_layer, QgsVectorLayer) or line_layer.geometryType() != GEOMETRY_LINE:
             self._status_msg = "Select a valid route line layer or draw a line"
             return False
-        geoms = [f.geometry() for f in self._route_features(line_layer)
-                 if f.hasGeometry() and not f.geometry().isEmpty()]
+        route_features = [f for f in self._route_features(line_layer)
+                          if f.hasGeometry() and not f.geometry().isEmpty()]
+        geoms = [f.geometry() for f in route_features]
         if not geoms:
             self._status_msg = ("No selected route features" if self.selected_only_chk.isChecked()
                                 else "Route layer empty")
@@ -1100,10 +1101,11 @@ class DepthProfileDockWidget(QDockWidget):
             # Keep the digitised vertex order: KP 0 is the first vertex.
             merged = QgsGeometry(geoms[0])
         else:
-            # Join end-to-end features into continuous lines without noding
-            # at crossings (unaryUnion split self-crossing routes into
-            # arbitrarily ordered parts).
-            merged = QgsGeometry.collectGeometry(geoms).mergeLines()
+            # Shared route builder: SeqNo/layer order, touching features
+            # joined, never noded or re-ordered (mergeLines could flip or
+            # re-order legs, so KP differed from the other KP tools).
+            from .kp_geo_utils import ordered_route_geometry
+            merged = ordered_route_geometry(route_features)
         if merged.isEmpty():
             self._status_msg = "Merged route geometry empty"
             return False
@@ -1112,7 +1114,7 @@ class DepthProfileDockWidget(QDockWidget):
         if not self.line_parts:
             self._status_msg = "Route geometry has no line segments"
             return False
-        self.distance_area = make_distance_area(
+        self.distance_area = make_kp_distance_area(
             line_layer.sourceCrs(), project.transformContext(), project=project
         )
         self.line_length = self.distance_area.measureLength(merged)

@@ -83,11 +83,17 @@ def validate_ranges(value, route_length_km: Optional[float] = None
         if depth is None or depth <= 0:
             problems.append(f"Row {index}: enter a target depth above 0 m.")
             continue
-        if route_length_km and route_length_km > 0 and (
-                start < -_ROUTE_END_TOL_KM
-                or end > route_length_km + _ROUTE_END_TOL_KM):
+        # ``route_length_km`` is the route end KP, or (start KP, end KP)
+        # for RPLs that do not start at KP 0.
+        if isinstance(route_length_km, (tuple, list)):
+            route_lo, route_hi = float(route_length_km[0]), float(route_length_km[1])
+        else:
+            route_lo, route_hi = 0.0, float(route_length_km or 0.0)
+        if route_hi > route_lo and (
+                start < route_lo - _ROUTE_END_TOL_KM
+                or end > route_hi + _ROUTE_END_TOL_KM):
             problems.append(f"Row {index}: KP {start:.3f}–{end:.3f} is outside "
-                            f"the route (0–{route_length_km:.3f}).")
+                            f"the route ({route_lo:.3f}–{route_hi:.3f}).")
         rows.append((start, end, index))
     rows.sort()
     for (s1, e1, i1), (s2, e2, i2) in zip(rows, rows[1:]):

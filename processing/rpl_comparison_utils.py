@@ -33,7 +33,7 @@ from qgis.core import (
 from ..qgis_compat import GEOMETRY_POINT
 
 from ..kp_geo_utils import RouteFrame
-from ..kp_range_utils import make_distance_area
+from ..kp_range_utils import make_kp_distance_area
 
 
 class RPLComparator:
@@ -68,8 +68,8 @@ class RPLComparator:
         )
         # Always ellipsoidal here — the previous implementation effectively
         # required this (and silently broke when the ellipsoid was unset).
-        self.distance_calculator = make_distance_area(
-            crs, transform_context, mode="ellipsoidal", project=project
+        self.distance_calculator = make_kp_distance_area(
+            crs, transform_context, project=project
         )
 
         # Build cached route frames over each layer. RouteFrame iterates the

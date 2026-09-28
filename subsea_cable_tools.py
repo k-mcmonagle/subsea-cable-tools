@@ -211,6 +211,17 @@ class SubseaCableTools:
         self.iface.addPluginToMenu(self.menu, self.explorer_action)
         self.actions.append(self.explorer_action)
 
+        # Plugin-wide KP distance setting (Geodesic WGS84 / Cartesian grid)
+        self.kp_settings_action = QAction(
+            QIcon(":/plugins/subsea_cable_tools/icon.png"), "KP settings…",
+            self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
+        self.kp_settings_action.setToolTip(
+            "How KP is measured across the plugin: Geodesic (WGS84, default) or "
+            "Cartesian (grid).")
+        self.kp_settings_action.triggered.connect(self.show_kp_settings)
+        self.iface.addPluginToMenu(self.menu, self.kp_settings_action)
+        self.actions.append(self.kp_settings_action)
+
         self._add_experimental_toolbar_menu()
 
         # Re-add / repair Cable Route Workbench and Burial Planner layers
@@ -357,6 +368,18 @@ class SubseaCableTools:
         self.explorer_window.show()
         self.explorer_window.raise_()
         self.explorer_window.activateWindow()
+
+    def show_kp_settings(self):
+        from .kp_settings_dialog import edit_global_kp_settings
+        parent = self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None
+        if edit_global_kp_settings(parent):
+            from .kp_range_utils import describe_kp_mode
+            try:
+                self.iface.messageBar().pushMessage(
+                    "Subsea Cable Tools", "KP distance: " + describe_kp_mode()
+                    + ". Reopen KP tools to apply.", duration=5)
+            except Exception:
+                pass
 
     def unload(self):
         """Remove the plugin menu items and icons from QGIS GUI and clean up all resources."""

@@ -3,7 +3,7 @@ from qgis.PyQt.QtCore import Qt
 from qgis.core import QgsProject, QgsVectorLayer, QgsWkbTypes, QgsGeometry, QgsPointXY, QgsDistanceArea, QgsCoordinateTransform
 from .qgis_compat import SELECTION_MODE_EXTENDED, GEOMETRY_LINE, GEOMETRY_NULL
 from qgis.gui import QgsVertexMarker
-from .kp_range_utils import make_distance_area
+from .kp_range_utils import make_kp_distance_area
 try:  # Safe sip import for deleted checks
     from qgis.PyQt import sip  # type: ignore
     _sip_isdeleted = sip.isdeleted
@@ -44,7 +44,7 @@ class KpPlotterDockWidget(QDockWidget):
         # Placeholder distance area; reassigned via make_distance_area against the
         # active reference-line CRS once a layer is loaded.
         _project = QgsProject.instance()
-        self.distance_area = make_distance_area(
+        self.distance_area = make_kp_distance_area(
             _project.crs(), _project.transformContext(), project=_project
         )
 
@@ -86,7 +86,10 @@ class KpPlotterDockWidget(QDockWidget):
         self.right_col_layout.addWidget(self.reverse_y_checkbox)
         self.reverse_y_secondary_checkbox = QCheckBox("Reverse Secondary Y Axis")
         self.right_col_layout.addWidget(self.reverse_y_secondary_checkbox)
-        self.reverse_kp_checkbox = QCheckBox("Reverse KP")
+        self.reverse_kp_checkbox = QCheckBox("Table KPs are reverse KPs")
+        self.reverse_kp_checkbox.setToolTip(
+            "Tick when the table's KPs are measured from the route END (reverse KP / rKP): "
+            "the marker is placed at route length − KP. Leave unticked for normal KPs.")
         self.reverse_kp_checkbox.setChecked(False)
         self.right_col_layout.addWidget(self.reverse_kp_checkbox)
         self.tooltip_checkbox = QCheckBox("Show Value Tooltips")
@@ -426,7 +429,7 @@ class KpPlotterDockWidget(QDockWidget):
         # transformed to project CRS at display time (see update_map_marker).
         project = QgsProject.instance()
         self.line_crs = line_layer.sourceCrs()
-        self.distance_area = make_distance_area(
+        self.distance_area = make_kp_distance_area(
             self.line_crs, project.transformContext(), project=project
         )
         try:
@@ -442,8 +445,10 @@ class KpPlotterDockWidget(QDockWidget):
             ax.set_title("Reference line layer has no features.")
             self.canvas.draw()
             return
-        geometries = [f.geometry() for f in line_features]
-        merged_geometry = QgsGeometry.unaryUnion(geometries)
+        # Shared route builder (SeqNo/layer order, no noding) — the same KP as
+        # the KP Mouse Tool and processing tools.
+        from .kp_geo_utils import ordered_route_geometry
+        merged_geometry = ordered_route_geometry(line_features)
         if merged_geometry.isEmpty():
             ax.set_title("Reference line geometry is empty after merging.")
             self.canvas.draw()

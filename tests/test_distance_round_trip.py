@@ -90,15 +90,22 @@ def test_empty_ellipsoid_fallback() -> bool:
 
 
 def test_cartesian_on_geographic_rejected() -> bool:
-    """Cartesian mode must raise ValueError on a geographic CRS."""
+    """Cartesian mode on a geographic CRS measures in a grid (UTM) CRS.
 
-    try:
-        make_distance_area(QgsCoordinateReferenceSystem("EPSG:4326"), mode="cartesian")
-    except ValueError:
-        _result("cartesian on geographic CRS rejected", True)
-        return True
-    _result("cartesian on geographic CRS rejected", False, "no ValueError raised")
-    return False
+    It used to raise; now KP can be chained on the projection for any
+    route. The result must be metres (close to geodesic), never degrees.
+    """
+
+    from qgis.core import QgsPointXY
+    from ..kp_range_utils import GridDistanceArea
+    da = make_distance_area(QgsCoordinateReferenceSystem("EPSG:4326"), mode="cartesian")
+    geo = make_distance_area(QgsCoordinateReferenceSystem("EPSG:4326"))
+    a, b = QgsPointXY(1.0, 55.0), QgsPointXY(1.1, 55.05)
+    grid_m, geo_m = da.measureLine(a, b), geo.measureLine(a, b)
+    ok = isinstance(da, GridDistanceArea) and abs(grid_m - geo_m) / geo_m < 0.002
+    _result("cartesian on geographic CRS measures in grid metres", ok,
+            f"grid={grid_m:.2f} m geodesic={geo_m:.2f} m")
+    return ok
 
 
 def test_cartesian_on_projected_ok() -> bool:

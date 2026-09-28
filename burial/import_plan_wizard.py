@@ -110,6 +110,10 @@ class _SourcePage(QWizardPage):
         self.unit_combo.currentIndexChanged.connect(self.completeChanged)
         opts.addWidget(self.unit_combo)
         form.addRow(opts)
+        from .rpl_reference import RplReferencePicker
+        self.reference = RplReferencePicker(wizard.model, self)
+        self.reference.changed.connect(self.completeChanged)
+        form.addRow(self.reference)
         layout.addLayout(form)
 
         self.table = QTableWidget()
@@ -419,8 +423,14 @@ class _ReviewPage(QWizardPage):
         spec = self.wiz.values.spec()
         scope = model._scope_bounds()
         names = {str(t.get("tool_id") or ""): t.get("name") or "" for t in model.tools or []}
-        self.result = pi.build_plan(src.data_rows, spec, scope, model.direction,
-                                    src.first_row_number, names)
+        try:
+            map_range, _kp_map = src.reference.transform()
+        except ValueError as exc:
+            map_range = None
+            self.result = pi.ImportResult(errors=[f"KP reference: {exc}"])
+        else:
+            self.result = pi.build_plan(src.data_rows, spec, scope, model.direction,
+                                        src.first_row_number, names, map_range)
         result = self.result
         self.events, self.dropped = ([], [])
         if not result.errors:
@@ -444,6 +454,9 @@ class _ReviewPage(QWizardPage):
         if scope_km > 0:
             text += f" of the {scope_km:.3f} km scope ({100.0 * result.burial_km / scope_km:.1f}%)"
         text += "."
+        if src.reference.rpl_id():
+            text += (f" KPs were quoted on <i>{src.reference.label()}</i> and are shown "
+                     "translated to this plan's RPL (same seabed positions).")
         if self.mode() == pi.MODE_MERGE and not result.errors:
             text += (f" After overlaying: {len(self.events) // 2} burial section(s) in the plan.")
         self.summary.setText(text)
@@ -505,6 +518,8 @@ class ImportPlanWizard(QWizard):
 
         label = os.path.basename(self.source.path_edit.text()) or "plan table"
         reason = "overlay" if review.mode() == pi.MODE_MERGE else "replace"
+        if self.source.reference.rpl_id():
+            reason += f"; KPs translated from {self.source.reference.label()}"
         try:
             ok = self.model.import_plan(review.events, label, section_patch=patch,
                                         reason=f"imported plan ({reason})")

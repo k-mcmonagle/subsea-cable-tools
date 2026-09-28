@@ -302,10 +302,10 @@ class InspectionPanel(QWidget):
             return []
         try:
             from ...kp_geo_utils import RouteFrame
-            from ...kp_range_utils import make_distance_area
+            from ...kp_range_utils import make_kp_distance_area
 
             crs4326 = QgsCoordinateReferenceSystem("EPSG:4326")
-            distance = make_distance_area(crs4326, self.controller.transform_context())
+            distance = make_kp_distance_area(crs4326, self.controller.transform_context())
             route = RouteFrame.from_source(
                 route_layer, distance, target_crs=crs4326, project=QgsProject.instance()
             )

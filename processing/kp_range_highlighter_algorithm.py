@@ -28,7 +28,7 @@ from ..kp_range_utils import (
     add_distance_mode_parameter,
     read_distance_mode,
 )
-from ..kp_geo_utils import get_features_skip_invalid
+from ..kp_geo_utils import get_features_skip_invalid, ordered_route_geometry
 
 class KPRangeHighlighterAlgorithm(QgsProcessingAlgorithm):
     """
@@ -111,8 +111,8 @@ class KPRangeHighlighterAlgorithm(QgsProcessingAlgorithm):
         if not geometries:
             return {self.OUTPUT: dest_id}
 
-        # Use unaryUnion to dissolve the geometries into a single line
-        combined_geom = QgsGeometry.unaryUnion(geometries)
+        # Shared route builder (SeqNo/layer order, no noding).
+        combined_geom = ordered_route_geometry(list(get_features_skip_invalid(source)))
 
         if combined_geom.isEmpty() or not combined_geom.isMultipart():
             line_parts = [combined_geom.asPolyline()]

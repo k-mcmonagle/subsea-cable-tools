@@ -24,7 +24,7 @@ from ..kp_range_utils import (
     add_distance_mode_parameter,
     read_distance_mode,
 )
-from ..kp_geo_utils import get_features_skip_invalid
+from ..kp_geo_utils import get_features_skip_invalid, ordered_route_geometry
 
 class PlaceKpPointsAlgorithm(QgsProcessingAlgorithm):
     """
@@ -172,7 +172,8 @@ class PlaceKpPointsAlgorithm(QgsProcessingAlgorithm):
         if not geometries:
             feedback.pushInfo(self.tr("Input line layer has no usable geometries."))
             return {self.OUTPUT: None}
-        merged_geometry = QgsGeometry.unaryUnion(geometries)
+        # Shared route builder (SeqNo/layer order, no noding).
+        merged_geometry = ordered_route_geometry(line_features)
         
         if merged_geometry.isEmpty():
             feedback.pushInfo(self.tr("Geometry is empty after merging features."))

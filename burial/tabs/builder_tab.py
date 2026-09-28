@@ -730,14 +730,15 @@ class BuilderTab(QWidget):
         if route is None:
             return None
         try:
-            total = float(route.total_length_km)
+            # Reverse KP counts back from the route end KP.
+            total = float(getattr(route, "end_kp_km", route.total_length_km))
         except (AttributeError, TypeError, ValueError):
             return None
         return total if total > 0 else None
 
     @staticmethod
     def _format_rkp(kp, total_km: Optional[float]) -> str:
-        """Reverse KP (route length − KP), KP Mouse convention."""
+        """Reverse KP (route end KP − KP), KP Mouse convention."""
         if total_km is None or kp is None:
             return ""
         try:

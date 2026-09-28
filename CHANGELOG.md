@@ -20,6 +20,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **One reliable KP, tied to the RPL** (`kp_datum.py`, `burial/plan_rereference.py`, `burial/rpl_reference.py`):
+  - **Burial Planner KPs read like the RPL.** Plans on an RPL that starts at a non-zero KP (e.g. 12.345) now use that start KP. Chainage beyond it is always measured by the plugin (WGS84 geodesic). Existing plans on such RPLs are renumbered once when opened; this is logged and can be undone.
+  - **Background check of the RPL's printed KPs.** The Inputs tab says when the RPL's stated KPs (`DistCumulative`) differ from the measured KPs by more than 1 m, with a warning from 5 m. It recognises RPLs chained on the map projection (grid/cartesian). Positions are never changed by the check.
+  - **Moving a plan to another RPL or revision.** Set route offers **Keep seabed positions (re-reference KPs)**, the recommended default, which re-KPs every event, section, target range, hazard, exclusion-rule range, ground unit, BAS row, resolved no-data range and path adjustment in one undoable edit, with a preview of the largest change and any flagged stretches. **Keep KP numbers** is also available.
+  - **Newer revision notice.** The planner tells you when the Workbench has a newer revision of the plan's RPL.
+  - **Imports ask which RPL their KPs refer to.** The Import plan wizard and the events/KP-range CSV import add *KPs referenced to*; a planner export's `# rpl_id` is pre-selected. KPs on another RPL are translated by seabed position, and *Register another RPL…* opens the Workbench RPL import.
+  - **Cartesian (grid) KP option, plugin-wide** (`Subsea Cable Tools ▸ KP settings…`, `kp_settings_dialog.py`):
+    - Geodesic (WGS84) stays the default.
+    - **Cartesian** measures KP as planar distances in a grid CRS: a CRS you choose, else the project CRS when projected, else the route's UTM zone. It works for routes in any CRS; before, it was refused for geographic layers.
+    - The KP Mouse Tool's *Cartesian* checkbox is now this plugin-wide switch. If it was ticked before, that choice carries over.
+    - Followed by the Depth Profile, KP Plotter, the Planner, the RPL comparison / crossing / area-listing / chartlet / outline tools, and the default of every KP processing tool's *Distance mode*.
+    - **Burial plans keep their own KP mode** (set from the plugin setting when created; existing plans stay geodesic), so changing the global setting never renumbers a plan. *Inputs ▸ KP distance ▸ Change…* switches a plan and re-measures every stored KP so items keep their seabed position, as one undoable edit.
+  - **One KP definition across every tool:**
+    - Always WGS84, no longer the project ellipsoid.
+    - Points are placed along segments as drawn, so KP → point → KP round-trips exactly. Previously the default could differ by tens of metres on long geographic legs.
+    - Multi-feature routes are assembled in `SeqNo`/layer order without noding or re-ordering, in KP Range CSV, KP Range Highlighter, Place KP Points (all three), Export KP Section Chartlets, Extract A/C Points, Seabed Length, KP Plotter and Depth Profile, matching the KP Mouse Tool and Burial Planner.
+
 - **Burial Planner — multi-tool plans (Plough, PLB, Inspection)**: each burial section takes its labels from its own tool, so one plan can run Plough → PLB → Plough. Ploughs keep **PLDN/PLUP** (section code PS). Trenchers/ROVs and the new **Mass Flow Excavator** tool type read **Start PLB / End PLB** (PB, "PLB Section"). The new **Inspection** tool type reads Start/End Inspection (IN), ready for PLIB/remedial planning.
   - Continuous burial that changes tool is a **tool transition**: PLUP and Start PLB at the same KP, with no skip between. Create one with Plan Builder right-click → **Set tool for KP range…**, or import it (continuous rows with different tools now become transitions instead of merging).
   - A transition drags, nudges and moves as one boundary and cannot pass another boundary. Merging across it keeps the first section's tool.
@@ -103,6 +120,19 @@ Also added KML export.
 
 ### Fixed
 
+- **KP handling fixes:**
+  - **Burial Planner:**
+    - *Targets from RPL* and the RPL-depth fallback used the RPL's printed KPs against measured KPs; they now measure each position.
+    - Scope beyond the route is refused.
+    - Moving the project folder no longer marks plans stale.
+    - KP-range CSV imports work on plans laid against KP.
+  - **Re-referencing (Ground Model / BAS):**
+    - *Constant KP shift* no longer flags every value as extrapolated.
+    - Shift and matched-pair re-references record their provenance.
+    - Splitting a ground unit splits its delivered KPs correctly.
+    - A typed KP edit clears the delivered KPs, so a later re-reference cannot undo it.
+  - **Identify RPL Crossing Points / Area Listing** use the nearest route segment, not the first within 0.5 m, which gave the earliest KP on looping routes.
+  - **KP Plotter's** reverse option now reads *Table KPs are reverse KPs*.
 - **Depth Profile crashed on every raster profile** (`AttributeError: 'PyQtGraphAxis' object has no attribute 'fill_between'`, reported from QGIS 3.22): the seabed shading added with the shared slope work called `fill_between`, which the pyqtgraph plot shim (`plot_widget.py`) did not implement. The shim now provides a gap-aware `fill_between`. `tests/test_depth_profile_dock.py` drives `generate_profile()` end to end (raster, dual, slope-only, multi-raster, contours, Reverse KP, measurements, exports) on an analytical plane; the earlier tests never called it.
 - **Depth Profile with Reverse KP**: the crosshair, tooltip, map marker and map centring looked up the station at the mirrored KP, so the marker appeared at the wrong end of the route. They now map the plotted KP to the correct station.
 - **Depth Profile map marker performance**: every mouse move over the plot called a full map canvas refresh, which re-rendered all layers. The vertical marker now repaints on its own and its coordinate transform is cached. The marker and the drawn-line rubber band are now removed from the map scene on clear/close; previously `deleteLater()`, which map canvas items do not have, failed silently and left hidden items behind. The marker is now placed from the route's actual CRS: a drawn line with a route layer selected in another CRS used to be transformed from the wrong CRS.

@@ -57,6 +57,23 @@ _BUILDER_UNDO_ACTIONS = {
 }
 
 
+def _route_vertices(route) -> List:
+    """Every vertex of a RouteFrame (for vertex-by-vertex KP maps)."""
+    from ..kp_geo_utils import iter_line_parts
+    from qgis.core import QgsPointXY
+    out = []
+    for geom in route.geometries:
+        for part in iter_line_parts(geom):
+            out.extend(QgsPointXY(p) for p in part)
+    return out
+
+
+def describe_kp(plan_row: Dict, model) -> str:
+    from ..kp_range_utils import describe_kp_mode
+    mode, grid = model.kp_mode(plan_row)
+    return describe_kp_mode(mode, grid)
+
+
 class PlanModel(QObject):
     planChanged = pyqtSignal()
     inputsChanged = pyqtSignal()
@@ -227,6 +244,7 @@ class PlanModel(QObject):
         self._load_profile(plan_id)
         self._load_context()
         self._load_route()
+        self._sync_kp_datum()
         self._load_analysis()
         self._check_stale()
         self.planChanged.emit()
@@ -306,6 +324,10 @@ class PlanModel(QObject):
         self.resolved_rpl_id = ""
         self.route_notice = ""
         self.route_error = ""
+        self.rpl_positions = []
+        self.kp_check = None
+        self.newer_rpl = None
+        rpl_row = None
         self._route_geom_fp = ""
         self._segment_wkt_cache.clear()
         project = QgsProject.instance()
@@ -316,6 +338,7 @@ class PlanModel(QObject):
                 rpl, matched_snapshot = self._resolve_workbench_rpl()
                 if rpl:
                     self.resolved_rpl_id = str(rpl.get("rpl_id") or "")
+                    rpl_row = rpl
                     lines_layer = self.workbench_store.open_layer(
                         rpl.get("lines_layer") or "")
                     if matched_snapshot:
@@ -338,9 +361,332 @@ class PlanModel(QObject):
             self.route_error = "The plan's route layer could not be opened."
             return
         try:
-            self.route, self.distance = build_route_frame(lines_layer, project)
+            if rpl_row is not None:
+                # The one way an RPL becomes a route: measured WGS84
+                # chainage anchored at the RPL's start KP.
+                from .rereference_qgis import rpl_route
+                self.route, self.distance, self.rpl_positions = rpl_route(
+                    self.workbench_store, rpl_row, project, self.kp_mode())
+            else:
+                mode, grid = self.kp_mode()
+                self.route, self.distance = build_route_frame(
+                    lines_layer, project, distance_mode=mode, grid_crs=grid)
         except Exception as exc:
             self.route_error = f"Route could not be built: {exc}"
+            return
+        if self.rpl_positions:
+            try:
+                from .. import kp_datum
+                self.kp_check = kp_datum.check_route_kps(self.route, self.rpl_positions)
+            except Exception:
+                self.kp_check = None
+        if rpl_row is not None:
+            self.newer_rpl = self._newer_revision(rpl_row)
+
+    def route_messages(self) -> List[Tuple[str, str]]:
+        """``[(text, level)]`` about the route's KP reference for the UI."""
+        out: List[Tuple[str, str]] = []
+        if self.route_notice:
+            out.append((self.route_notice, "warn"))
+        if self.newer_rpl:
+            out.append((
+                f"A newer revision of this RPL is in the Workbench "
+                f"({self.newer_rpl.get('rev_label') or self.newer_rpl.get('name') or ''}). "
+                "Select it and Set route to move the plan onto it — KPs are "
+                "re-referenced so everything keeps its seabed position.", "warn"))
+        check = getattr(self, "kp_check", None)
+        if check is not None and check.level != "ok":
+            out.append((check.summary(), check.level))
+        return out
+
+    def _newer_revision(self, rpl: Dict) -> Optional[Dict]:
+        """The latest Workbench revision of the plan's route, if newer."""
+        route_id = rpl.get("route_id") or ""
+        if not route_id or self.workbench_store is None:
+            return None
+        try:
+            latest = self.workbench_store.latest_revision(route_id)
+        except Exception:
+            return None
+        if latest and str(latest.get("rpl_id") or "") != str(rpl.get("rpl_id") or ""):
+            return latest
+        return None
+
+    # -- KP datum ------------------------------------------------------------
+    def kp_datum_start(self) -> Optional[float]:
+        """Start KP the plan's stored KPs are numbered from (None = legacy)."""
+        try:
+            params = json.loads(self.plan.get("params_json") or "{}")
+        except (TypeError, ValueError):
+            return None
+        datum = params.get("kp_datum") if isinstance(params, dict) else None
+        if isinstance(datum, dict) and datum.get("start_kp") is not None:
+            try:
+                return float(datum["start_kp"])
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def kp_mode(self, plan_row: Optional[Dict] = None) -> Tuple[str, str]:
+        """The plan's KP distance ``(mode, grid_crs)``.
+
+        Plans keep their own mode (set at creation from the plugin KP
+        setting) so a later change of the global setting never renumbers an
+        existing plan. Plans without one are geodesic — how they were made.
+        """
+        try:
+            params = json.loads((plan_row or self.plan or {}).get("params_json") or "{}")
+        except (TypeError, ValueError):
+            params = {}
+        datum = params.get("kp_datum") if isinstance(params, dict) else None
+        if isinstance(datum, dict) and datum.get("mode") == "cartesian":
+            return "cartesian", str(datum.get("grid_crs") or "")
+        return "ellipsoidal", ""
+
+    def kp_mode_text(self) -> str:
+        from ..kp_range_utils import describe_kp_mode
+        mode, grid = self.kp_mode()
+        return describe_kp_mode(mode, grid)
+
+    def _set_kp_datum(self, plan_row: Dict, start_kp: float,
+                      mode: Optional[Tuple[str, str]] = None) -> Dict:
+        row = dict(plan_row)
+        try:
+            params = json.loads(row.get("params_json") or "{}")
+        except (TypeError, ValueError):
+            params = {}
+        if not isinstance(params, dict):
+            params = {}
+        kp_mode, grid = mode if mode is not None else self.kp_mode(row)
+        params["kp_datum"] = {"start_kp": round(float(start_kp), 6),
+                              "rpl_id": self.resolved_rpl_id or row.get("rpl_id") or "",
+                              "mode": kp_mode, "grid_crs": grid}
+        row["params_json"] = json.dumps(params)
+        return row
+
+    def change_kp_mode(self, mode: str, grid_crs: str = "", reason: str = ""):
+        """Switch the plan between geodesic and Cartesian (grid) KP.
+
+        Same route, different chainage: every stored KP is translated so
+        items keep their seabed position (vertex-by-vertex KP map), as one
+        undoable edit. Returns the re-reference report, or None.
+        """
+        from .kp_rereference import KpMap
+        if self.route is None:
+            raise ValueError("Set the plan route first.")
+        old_route = self.route
+        old_plan = dict(self.plan)
+        self.plan = self._set_kp_datum(self.plan, old_route.start_kp_km, (mode, grid_crs))
+        self._load_route()
+        new_route = self.route
+        if new_route is None:
+            self.plan = old_plan
+            self._load_route()
+            raise ValueError(self.route_error or "The route could not be rebuilt.")
+        anchors = [(old_route.kp_at_point(p).kp_km, new_route.kp_at_point(p).kp_km)
+                   for p in _route_vertices(new_route)]
+        kp_map = KpMap.from_anchors(anchors, source_label=describe_kp(old_plan, self),
+                                    target_label=self.kp_mode_text())
+        if not self._plan_has_kp_data():
+            self._store_write("save the plan KP mode", self.store.save_plan, self.plan)
+            self.planChanged.emit()
+            return True
+        new_plan_row = dict(self.plan)
+        self.plan = old_plan
+        report = self.rereference_plan(
+            kp_map, f"KP distance → {describe_kp(new_plan_row, self)}",
+            reason or "KP distance mode changed; items keep their seabed position.",
+            plan_updates={"params_json": new_plan_row["params_json"]},
+            datum_start=new_route.start_kp_km)
+        if report is None:
+            self._load_route()
+            return None
+        self.mark_stale()
+        return report
+
+    def _plan_has_kp_data(self) -> bool:
+        return bool(self.events or self.sections or self.hazards
+                    or self.ground_units or self.bas_rows
+                    or target_depth.plan_ranges(self.plan))
+
+    def _sync_kp_datum(self) -> None:
+        """Keep stored KPs numbered like the RPL (its start KP).
+
+        Plans created before start-KP support stored chainage from 0; on an
+        RPL that starts at, say, KP 12.345 every stored KP is shifted once,
+        as a logged, undoable edit. Plans on KP-0 RPLs only record the datum.
+        """
+        if not self.plan or self.route is None:
+            return
+        start = float(getattr(self.route, "start_kp_km", 0.0) or 0.0)
+        stored = self.kp_datum_start()
+        previous = 0.0 if stored is None else stored
+        if abs(start - previous) > 1e-9 and self._plan_has_kp_data():
+            from .kp_rereference import KpMap
+            delta = start - previous
+            if self.rereference_plan(
+                    KpMap.shift(delta),
+                    f"RPL start KP {schema.format_kp(start)}",
+                    f"Plan KPs renumbered by {delta:+.3f} km to follow the RPL "
+                    f"start KP ({schema.format_kp(start)}).",
+                    datum_start=start):
+                self.route_notice = (
+                    (self.route_notice + " ") if self.route_notice else "") + (
+                    f"The RPL starts at KP {schema.format_kp(start)}: this plan's "
+                    f"KPs were renumbered by {delta:+.3f} km to match it "
+                    "(logged; undo from Review && Export).")
+            return
+        if stored is None or abs(start - previous) > 1e-9:
+            self.plan = self._set_kp_datum(self.plan, start)
+            self._store_write("record the plan KP datum", self.store.save_plan, self.plan)
+
+    def rereference_plan(self, kp_map, label: str, reason: str = "",
+                         plan_updates: Optional[Dict] = None,
+                         datum_start: Optional[float] = None):
+        """Translate every stored KP through ``kp_map`` as one undoable edit.
+
+        ``self.route`` must already be the route the new KPs refer to (event
+        positions are re-stamped on it). ``plan_updates`` (e.g. the new
+        RPL identity) are applied in the same change-log entry. Returns the
+        :class:`plan_rereference.PlanRereferenceReport`, or None on failure.
+        """
+        from . import bas_model, plan_rereference
+
+        generation_row = self.store.active_generation(self.plan_id)
+        bounds = None
+        if self.route is not None:
+            bounds = (self.route.start_kp_km, self.route.end_kp_km)
+        mapped = plan_rereference.map_plan(
+            kp_map, self.plan, self.events, self.sections, self.hazards,
+            self.rules, self.ground_units,
+            [bas_model.encode_row(r) for r in self.bas_rows],
+            generation_row, bounds, self.event_labels())
+        new_plan = dict(mapped["plan"])
+        new_plan.update(plan_updates or {})
+        new_plan = self._set_kp_datum(
+            new_plan, datum_start if datum_start is not None
+            else getattr(self.route, "start_kp_km", 0.0))
+        for event in mapped["events"]:
+            self._stamp_position(event)
+        report = mapped["report"]
+        before = {
+            schema.TABLE_PLAN: [dict(self.plan)],
+            schema.TABLE_EVENT: [dict(e) for e in self.events],
+            schema.TABLE_SECTION: [dict(s) for s in self.sections],
+            schema.TABLE_HAZARD: [dict(h) for h in self.hazards],
+            schema.TABLE_RULE: [dict(r) for r in self.rules],
+            schema.TABLE_GROUND_UNIT: [dict(u) for u in self.ground_units],
+            schema.TABLE_BAS_ROW: [bas_model.encode_row(r) for r in self.bas_rows],
+        }
+        if generation_row:
+            before[schema.TABLE_GENERATION] = [dict(generation_row)]
+
+        def write() -> None:
+            self.store.save_plan(new_plan)
+            self.store.save_events(self.plan_id, ev.sort_events(mapped["events"], self.direction))
+            self.store.save_sections(self.plan_id, mapped["sections"])
+            self.store.save_hazards(self.plan_id, mapped["hazards"])
+            self.store.save_rules(self.plan_id, mapped["rules"])
+            self.store.save_ground_units(self.plan_id, mapped["ground_units"])
+            self.store.save_bas_rows(self.plan_id, mapped["bas_rows"])
+            if mapped["generation"]:
+                self.store.save_generation(mapped["generation"])
+            after = {
+                schema.TABLE_PLAN: [dict(new_plan)],
+                schema.TABLE_EVENT: self.store.list_events(self.plan_id),
+                schema.TABLE_SECTION: self.store.list_sections(self.plan_id),
+                schema.TABLE_HAZARD: self.store.list_hazards(self.plan_id),
+                schema.TABLE_RULE: self.store.list_rules(self.plan_id),
+                schema.TABLE_GROUND_UNIT: self.store.list_ground_units(self.plan_id),
+                schema.TABLE_BAS_ROW: self.store.list_bas_rows(self.plan_id),
+            }
+            if mapped["generation"]:
+                after[schema.TABLE_GENERATION] = [dict(mapped["generation"])]
+            self.store.append_change(
+                self.plan_id, change_log.ACTION_REREFERENCE_PLAN, label,
+                before=before, after=after,
+                reason=(reason + " " if reason else "") + report.summary())
+
+        ok, _ = self._store_transaction("re-reference the plan KPs", write)
+        if not ok:
+            return None
+        self.plan = new_plan
+        self.events = self.store.list_events(self.plan_id)
+        self.sections = self.store.list_sections(self.plan_id)
+        self.hazards = self.store.list_hazards(self.plan_id)
+        self.rules = self.store.list_rules(self.plan_id)
+        self.ground_units = self.store.list_ground_units(self.plan_id)
+        self._load_bas_rows()
+        self._load_context()
+        self.acq_cache.clear()
+        self.refresh_layers()
+        for signal in (self.planChanged, self.eventsChanged, self.sectionsChanged,
+                       self.riskChanged, self.rulesChanged, self.groundChanged,
+                       self.basChanged, self.logChanged):
+            signal.emit()
+        return report
+
+    def preview_route_change(self, rpl: Dict):
+        """Dry run of moving the plan onto Workbench RPL ``rpl``.
+
+        Returns ``(kp_map, report, new_route)``: the geometry map from the
+        current route to the new one (items keep their seabed position) and
+        what re-referencing would do. Raises ValueError.
+        """
+        from . import bas_model, plan_rereference
+        from .rereference_qgis import geometry_map, rpl_label, rpl_route
+
+        if self.route is None:
+            raise ValueError("The plan's current route is not loaded.")
+        if self.workbench_store is None:
+            raise ValueError("The Cable Workbench store is not available.")
+        new_route, _distance, _positions = rpl_route(
+            self.workbench_store, rpl, QgsProject.instance(), self.kp_mode())
+        kp_map = geometry_map(
+            self.route, new_route,
+            source_label=self.plan.get("rpl_name") or "current route",
+            target_label=rpl_label(rpl))
+        mapped = plan_rereference.map_plan(
+            kp_map, self.plan, self.events, self.sections, self.hazards,
+            self.rules, self.ground_units,
+            [bas_model.encode_row(r) for r in self.bas_rows],
+            self.store.active_generation(self.plan_id),
+            (new_route.start_kp_km, new_route.end_kp_km), self.event_labels())
+        return kp_map, mapped["report"], new_route
+
+    def change_route(self, updates: Dict, kp_map=None, reason: str = ""):
+        """Point the plan at another RPL; with ``kp_map`` translate its KPs.
+
+        Without a map the stored KP numbers are kept (they move with the new
+        line). Returns the re-reference report (or True without a map).
+        """
+        old_route = self.route
+        if kp_map is None or old_route is None or not self._plan_has_kp_data():
+            if not self.update_plan(updates, reason=reason or "route changed"):
+                return None
+            if self.route is not None:
+                self.plan = self._set_kp_datum(self.plan, self.route.start_kp_km)
+                self._store_write("record the plan KP datum", self.store.save_plan, self.plan)
+            return True
+        # Load the new route first so events are re-stamped on it; the plan
+        # row (with the new RPL identity) is written with the KPs.
+        previous_plan = dict(self.plan)
+        self.plan.update(updates)
+        self._load_route()
+        if self.route is None:
+            self.plan = previous_plan
+            self._load_route()
+            raise ValueError(self.route_error or "The new route could not be loaded.")
+        report = self.rereference_plan(
+            kp_map, str(updates.get("rpl_name") or updates.get("rpl_id") or "route"),
+            reason or "Plan moved to another RPL; items keep their seabed position.",
+            plan_updates=updates)
+        if report is None:
+            self.plan = previous_plan
+            self._load_route()
+            return None
+        self.mark_stale()
+        return report
 
     def _resolve_workbench_rpl(self):
         """Return ``(row, matched_snapshot)`` for the plan's Workbench RPL."""
@@ -376,8 +722,8 @@ class PlanModel(QObject):
 
     def _check_stale(self) -> None:
         """Mark the plan stale when the RPL changed since it was anchored."""
-        stored = self.plan.get("rpl_fingerprint") or ""
-        current = self.current_rpl_fingerprint()
+        stored = map_layers.rpl_fingerprint_core(self.plan.get("rpl_fingerprint") or "")
+        current = map_layers.rpl_fingerprint_core(self.current_rpl_fingerprint())
         if stored and current and stored != current \
                 and self.plan.get("status") != schema.PLAN_STATUS_STALE:
             self.plan["status"] = schema.PLAN_STATUS_STALE
@@ -1136,6 +1482,14 @@ class PlanModel(QObject):
             "rev_label": "Rev 1",
             "supersedes_id": "",
         }
+        # New plans take the plugin-wide KP distance setting and keep it.
+        from ..kp_range_utils import (KP_MODE_CARTESIAN, kp_distance_mode,
+                                      kp_grid_crs_setting, resolve_grid_crs)
+        if kp_distance_mode() == KP_MODE_CARTESIAN:
+            grid = resolve_grid_crs(kp_grid_crs_setting())
+            plan["params_json"] = json.dumps({"kp_datum": {
+                "start_kp": 0.0, "rpl_id": plan["rpl_id"], "mode": KP_MODE_CARTESIAN,
+                "grid_crs": grid.authid() if grid is not None else ""}})
         ok, plan_id = self._store_write("create the plan", self.store.save_plan, plan)
         if not ok:
             return None
@@ -2117,6 +2471,12 @@ class PlanModel(QObject):
         for event in imported:
             copy = dict(event)
             copy["plan_id"] = self.plan_id
+            if label == "kp_ranges" and self.direction < 0:
+                # KP-range rows become START at the low KP; in a plan laid
+                # against KP the start is the high end.
+                copy["event_type"] = (schema.EVENT_BURIAL_END
+                                      if copy.get("event_type") == schema.EVENT_BURIAL_START
+                                      else schema.EVENT_BURIAL_START)
             if client_proposal:
                 copy["source"] = schema.EVENT_SOURCE_CLIENT
             self._stamp_position(copy)

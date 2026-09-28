@@ -201,9 +201,16 @@ class KpReferenceWidget(QGroupBox):
         method = self.method()
         if method == kp_rereference.METHOD_GEOMETRY:
             return str(self.rpl_combo.currentText() or "")
-        if method == kp_rereference.METHOD_IDENTITY:
-            return (f"{self.model.plan.get('rpl_name') or ''} "
+        plan_rpl = (f"{self.model.plan.get('rpl_name') or ''} "
                     f"{self.model.plan.get('rpl_revision') or ''}").strip()
+        if method == kp_rereference.METHOD_IDENTITY:
+            return plan_rpl
+        # Shift / matched pairs: record how the delivered KPs were adjusted
+        # so the provenance is never blank.
+        if method == kp_rereference.METHOD_SHIFT:
+            return f"{plan_rpl} (KP shift {self.shift_spin.value():+.3f} km)".strip()
+        if method == kp_rereference.METHOD_ANCHORS:
+            return f"{plan_rpl} (matched KP pairs)".strip()
         return ""
 
     def build_map(self) -> kp_rereference.KpMap:
@@ -218,7 +225,7 @@ class KpReferenceWidget(QGroupBox):
             if len(pairs) < 1:
                 raise ValueError("Enter at least one 'source_kp, target_kp' pair.")
             return kp_rereference.KpMap.from_anchors(
-                pairs, target_label=self.source_label())
+                pairs, source_label=self.source_label())
         rpl_id = str(self.rpl_combo.currentData() or "")
         if not rpl_id:
             raise ValueError("Select the RPL revision the source KPs refer to.")
@@ -229,8 +236,9 @@ class KpReferenceWidget(QGroupBox):
         if self.model.route is None:
             raise ValueError("The plan has no usable route; set one in Inputs first.")
         store = self.dock.workbench_store()
+        # Measure the source RPL the same way as the plan (geodesic or grid).
         src_route, label = rereference_qgis.open_route_for_rpl(
-            store, rpl_id, QgsProject.instance())
+            store, rpl_id, QgsProject.instance(), self.model.kp_mode())
         target = (f"{self.model.plan.get('rpl_name') or ''} "
                   f"{self.model.plan.get('rpl_revision') or ''}").strip()
         kp_map = rereference_qgis.geometry_map(

@@ -351,6 +351,11 @@ class BasTab(QWidget):
                     value = float(text.replace(",", "."))
                 except ValueError:
                     value = row.get(key)
+            if key in ("start_kp", "end_kp") and row.get(key) != value:
+                # A typed KP supersedes the delivered one (see Ground Model).
+                row["src_start_kp"] = row["src_end_kp"] = None
+                row["src_rpl"] = ""
+                row["rereference_flags"] = "edited"
             row[key] = value
             self._loading = True
             try:

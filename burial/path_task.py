@@ -76,6 +76,8 @@ class PathWork:
     # Manual path adjustments [{"kp": ..., "dcc_m": ...}] (sanitised);
     # each becomes a mandatory off-route control for the solver.
     adjustments: List[Dict] = field(default_factory=list)
+    # KP of the route start (RPLs that do not start at KP 0).
+    route_start_kp: float = 0.0
 
 
 @dataclass
@@ -114,13 +116,14 @@ def build_path_work(route: RouteFrame, distance: QgsDistanceArea, plan: Dict,
     # QgsDistanceArea has a copy constructor in supported QGIS versions.  A
     # dedicated instance ensures its lazy geodesic state is never shared with
     # canvas/main-thread queries while this task is running.
-    try:
-        worker_distance = QgsDistanceArea(distance)
-    except Exception:
-        worker_distance = distance
+    from ..kp_range_utils import clone_distance_area
+    # Keeps a grid (Cartesian KP) distance area grid; a plain copy would
+    # silently fall back to geodesic chainage.
+    worker_distance = clone_distance_area(distance)
     return PathWork(
         plan_id=str(plan.get("plan_id") or ""),
         geometries=geoms,
+        route_start_kp=float(getattr(route, "start_kp_km", 0.0) or 0.0),
         distance=worker_distance,
         scope_start_kp=float(plan.get("scope_start_kp") or 0.0),
         scope_end_kp=float(plan.get("scope_end_kp") or 0.0),
@@ -407,9 +410,11 @@ class InstallationPathTask(QgsTask):
             work = self.work
             self.progressMessage.emit("Extracting every scoped route course change…")
             source_route = RouteFrame.from_source(
-                work.geometries, work.distance, follow_stored_geometry=True)
-            low = max(0.0, min(work.scope_start_kp, work.scope_end_kp))
-            high = min(source_route.total_length_km,
+                work.geometries, work.distance, follow_stored_geometry=True,
+                start_kp_km=work.route_start_kp)
+            low = max(source_route.start_kp_km,
+                      min(work.scope_start_kp, work.scope_end_kp))
+            high = min(source_route.end_kp_km,
                        max(work.scope_start_kp, work.scope_end_kp))
             if high <= low:
                 raise path_geometry.PathGeometryError(

@@ -10,7 +10,7 @@ from typing import Dict, Optional, Tuple
 from qgis.core import QgsFeatureRequest, QgsProject, QgsWkbTypes
 
 from ..kp_geo_utils import RouteFrame
-from ..kp_range_utils import make_distance_area
+from ..kp_range_utils import make_kp_distance_area
 from ..qgis_compat import GEOMETRY_LINE, GEOMETRY_POINT
 
 
@@ -89,7 +89,7 @@ class FeatureReferenceResolver:
         cached = self._route_cache.get(key)
         if cached is not None:
             return cached
-        distance = make_distance_area(target_crs, self.project.transformContext(), project=self.project)
+        distance = make_kp_distance_area(target_crs, self.project.transformContext(), project=self.project)
         try:
             frame = RouteFrame.from_source(
                 [resolved.feature.geometry()], distance, target_crs=target_crs,

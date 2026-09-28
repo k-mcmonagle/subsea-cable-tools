@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from qgis.PyQt.QtCore import QCoreApplication
-from ..kp_range_utils import make_distance_area
+from ..kp_range_utils import make_kp_distance_area
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
@@ -78,42 +78,38 @@ def _kp_m_on_geom(
     distance: QgsDistanceArea,
     tolerance_m: float = 0.5,
 ) -> float:
-    """Returns KP in meters to a point on/near a specific geometry, including cumulative_base_m."""
+    """KP in metres (incl. ``cumulative_base_m``) of the point on ``geom``
+    nearest ``point_on_or_near_geom``.
 
-    target_pt_xy = QgsPointXY(point_on_or_near_geom)
-    cumulative_length = float(cumulative_base_m)
-
-    parts = _as_parts(geom)
-    for part in parts:
+    Uses the *nearest* segment (not the first within a tolerance, which
+    returned the earliest KP on looping or overlapping routes) and the
+    same partial-length rule as ``kp_geo_utils.RouteFrame``: planar
+    fraction along the segment x its geodesic length. ``tolerance_m`` is
+    kept for API compatibility.
+    """
+    target = QgsPointXY(point_on_or_near_geom)
+    qx, qy = float(target.x()), float(target.y())
+    cumulative = float(cumulative_base_m)
+    best = None  # (geodesic distance, kp_m)
+    for part in _as_parts(geom):
         for i in range(len(part) - 1):
             v1 = QgsPointXY(part[i])
             v2 = QgsPointXY(part[i + 1])
             seg_len = float(distance.measureLine(v1, v2))
             if seg_len <= 0.0:
                 continue
-
-            segment_geom = QgsGeometry.fromPolylineXY([v1, v2])
-            nearest_on_segment = segment_geom.nearestPoint(QgsGeometry.fromPointXY(target_pt_xy))
-            if not nearest_on_segment.isEmpty():
-                nearest_pt = nearest_on_segment.asPoint()
-                dist_to_nearest = float(distance.measureLine(target_pt_xy, QgsPointXY(nearest_pt)))
-                if dist_to_nearest <= tolerance_m:
-                    dist_along_segment = float(distance.measureLine(v1, QgsPointXY(nearest_pt)))
-                    return cumulative_length + dist_along_segment
-
-            cumulative_length += seg_len
-
-    # Fallback: snap to nearest point on geom, then retry with a slightly larger tolerance.
-    snapped = geom.nearestPoint(QgsGeometry.fromPointXY(target_pt_xy))
-    if not snapped.isEmpty():
-        try:
-            snapped_xy = QgsPointXY(snapped.asPoint())
-            if tolerance_m < 2.0:
-                return _kp_m_on_geom(snapped_xy, geom, cumulative_base_m, distance, tolerance_m=2.0)
-        except Exception:
-            pass
-
-    return float(cumulative_base_m)
+            dx, dy = v2.x() - v1.x(), v2.y() - v1.y()
+            planar_sq = dx * dx + dy * dy
+            t = 0.0 if planar_sq <= 0 else max(0.0, min(1.0, ((qx - v1.x()) * dx + (qy - v1.y()) * dy) / planar_sq))
+            foot = QgsPointXY(v1.x() + t * dx, v1.y() + t * dy)
+            try:
+                dist = float(distance.measureLine(target, foot))
+            except Exception:
+                continue
+            if best is None or dist < best[0]:
+                best = (dist, cumulative + t * seg_len)
+            cumulative += seg_len
+    return best[1] if best is not None else float(cumulative_base_m)
 
 
 def _distance_point_to_segment_sq(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
@@ -520,7 +516,7 @@ class IdentifyRPLCrossingPointsAlgorithm(QgsProcessingAlgorithm):
         rpl_crs = rpl_source.sourceCrs()
 
         # Distance calculator for KP measurements (geodetic via project ellipsoid; falls back to WGS84)
-        distance_calculator = make_distance_area(
+        distance_calculator = make_kp_distance_area(
             rpl_crs, context.transformContext(), project=context.project()
         )
 

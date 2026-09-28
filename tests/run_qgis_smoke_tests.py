@@ -147,6 +147,8 @@ CHECKS = [
     ('shared slope math (pure)', 'test_slope_utils'),
     ('KP Mouse profile math (pure)', 'test_kp_profile_math'),
     ('KP axis round ticks (pure)', 'test_kp_axis'),
+    ('KP datum + plan re-reference (pure)', 'test_kp_datum'),
+    ('KP reference: start KP, route builder, RPL moves', 'test_kp_reference'),
     ('workbench assembly + fit', 'test_fit'),
     ('workbench topology + V3 adapter', 'test_workbench_adapter'),
     ('workbench layer styling (pure)', 'test_workbench_layer_style'),

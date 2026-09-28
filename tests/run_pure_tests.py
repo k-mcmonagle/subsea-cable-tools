@@ -28,6 +28,7 @@ PURE_MODULES = [
     "test_profile_reliability",
     "test_kp_profile_math",
     "test_kp_axis",
+    "test_kp_datum",
     "test_burial_profile_data",
     "test_burial_generation",
     "test_burial_events",

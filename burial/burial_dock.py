@@ -1212,8 +1212,8 @@ class BurialPlannerDock(QDockWidget):
         # cells). Clamped to the analysis step and a ~500k-station ceiling.
         step_m = self.model.resolve_profile_step_m(params)
         margin_km = max(params.coarse_step_m, 1.0) / 1000.0
-        start_kp = max(0.0, scope.start_km - margin_km)
-        end_kp = min(self.model.route.total_length_km,
+        start_kp = max(self.model.route.start_kp_km, scope.start_km - margin_km)
+        end_kp = min(self.model.route.end_kp_km,
                      scope.end_km + margin_km)
 
         # Identity captured before sampling starts: if a bathymetry file is

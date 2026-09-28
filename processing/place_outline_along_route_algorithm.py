@@ -30,7 +30,7 @@ from qgis.core import (
 from ..burial import footprint
 from ..burial import geometry2d
 from ..kp_geo_utils import RouteFrame
-from ..kp_range_utils import make_distance_area
+from ..kp_range_utils import make_kp_distance_area
 from ..qgis_compat import (
     FIELD_TYPE_DOUBLE,
     FIELD_TYPE_STRING,
@@ -82,8 +82,8 @@ Outline (DXF)" produces.
 KP to End KP every Interval metres (leave the list empty to use the \
 series; set Interval to 0 for a single placement at Start KP).
 
-KP chainage is measured ellipsoidally on the project ellipsoid \
-(WGS84 fallback), matching the plugin's other KP tools. Each placement is \
+KP chainage is measured geodesically on the WGS84 ellipsoid, \
+matching the plugin's other KP tools. Each placement is \
 done in the local UTM zone, so the outline stays metre-true and the \
 heading (written to the output) accounts for grid convergence. Output is \
 in EPSG:4326 with kp / heading_deg / source attributes.
@@ -157,7 +157,7 @@ in EPSG:4326 with kp / heading_deg / source attributes.
         # WGS84 route frame + ellipsoidal chainage: the Burial Planner /
         # KP-tools convention, so KPs here match the rest of the plugin.
         wgs84 = QgsCoordinateReferenceSystem(_WGS84)
-        distance = make_distance_area(
+        distance = make_kp_distance_area(
             wgs84, context.transformContext(),
             project=context.project() or QgsProject.instance())
         try:

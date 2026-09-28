@@ -12,7 +12,7 @@ features ordered by SeqNo, stored-geometry interpolation.
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from . import kp_rereference
 from .analysis_task import build_route_frame
@@ -26,20 +26,45 @@ def rpl_label(rpl: dict) -> str:
     return f"{name} — {rev}" if rev else name
 
 
-def open_route_for_rpl(workbench_store, rpl_id: str, project):
+def rpl_route(workbench_store, rpl: Dict, project, kp_mode: Tuple[str, str] = ("", "")):
+    """``(RouteFrame, distance, positions)`` for a Workbench RPL row.
+
+    The single way an RPL becomes a route: measured WGS84 chainage along
+    its lines layer, anchored at the RPL's start KP (stated KP of its first
+    position). ``positions`` are ``[(QgsPointXY, stated KP)]`` for the
+    background stated-KP check. Raises ValueError.
+    """
+    from .. import kp_datum
+
+    layer = workbench_store.open_layer(rpl.get("lines_layer") or "")
+    if layer is None or not layer.isValid():
+        raise ValueError(f"The lines layer of '{rpl_label(rpl)}' could not "
+                         "be opened.")
+    positions = []
+    try:
+        points = workbench_store.open_layer(rpl.get("points_layer") or "")
+        positions = kp_datum.rpl_positions(points)
+    except Exception:
+        positions = []
+    mode, grid = kp_mode or ("", "")
+    route, distance = build_route_frame(layer, project,
+                                        start_kp_km=kp_datum.start_kp_of(positions),
+                                        distance_mode=mode or "ellipsoidal",
+                                        grid_crs=grid or "")
+    if route is None:
+        raise ValueError(f"'{rpl_label(rpl)}' has no usable route geometry.")
+    return route, distance, positions
+
+
+def open_route_for_rpl(workbench_store, rpl_id: str, project,
+                       kp_mode: Tuple[str, str] = ("", "")):
     """``(RouteFrame, label)`` for a Workbench RPL; raises ValueError."""
     if workbench_store is None:
         raise ValueError("The Cable Workbench store is not available.")
     rpl = workbench_store.get_rpl(rpl_id)
     if rpl is None:
         raise ValueError("The selected RPL is no longer in the Workbench.")
-    layer = workbench_store.open_layer(rpl.get("lines_layer") or "")
-    if layer is None or not layer.isValid():
-        raise ValueError(f"The lines layer of '{rpl_label(rpl)}' could not "
-                         "be opened.")
-    route, _distance = build_route_frame(layer, project)
-    if route is None:
-        raise ValueError(f"'{rpl_label(rpl)}' has no usable route geometry.")
+    route, _distance, _positions = rpl_route(workbench_store, rpl, project, kp_mode)
     return route, rpl_label(rpl)
 
 
@@ -48,8 +73,9 @@ def sample_correspondence(src_route, dst_route, step_km: float = 0.05,
                           end_kp: Optional[float] = None
                           ) -> List[Tuple[float, float, float]]:
     """Walk the source route and project every station onto the target."""
-    total = float(src_route.total_length_km)
-    lo = 0.0 if start_kp is None else max(0.0, float(start_kp))
+    first = float(getattr(src_route, "start_kp_km", 0.0) or 0.0)
+    total = float(getattr(src_route, "end_kp_km", src_route.total_length_km))
+    lo = first if start_kp is None else max(first, float(start_kp))
     hi = total if end_kp is None else min(total, float(end_kp))
     if hi <= lo:
         return []

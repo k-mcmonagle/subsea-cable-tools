@@ -633,3 +633,55 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   overlap carry-over cannot choose between two parents.
 - **Installation Paths stay single-tool**: they use the default tool's
   turning radius; a plan with other tool types asks for confirmation first.
+
+## One KP definition; RPL-referenced plans
+
+- **KP is measured, never read from the RPL.** Every tool measures KP as
+  geodesic chainage on **WGS84** (`make_distance_area` no longer follows
+  the project ellipsoid) along the route as stored: positions are
+  interpolated linearly along each segment, fraction x geodesic segment
+  length (`follow_stored_geometry=True` is now the default), so
+  point -> KP -> point round-trips exactly. The old default followed the
+  spheroid arc for `point_at_kp` but the chord for `kp_at_point` — up to
+  ~57 m apart on a 60 km geographic leg.
+- **Routes are assembled one way**: `kp_geo_utils.ordered_route_geometry`
+  (SeqNo order when every feature has one, else layer order; touching legs
+  joined; never noded, re-ordered or reversed). The union/`mergeLines`
+  builders in KP Range CSV / Highlighter / Place KP Points (x3) / Chartlets
+  / A/C points / Seabed Length / KP Plotter / Depth Profile could re-order
+  or flip legs and give different KPs from the KP Mouse Tool.
+- **The only thing taken from an RPL is its start KP** (stated KP of its
+  first position). `RouteFrame(start_kp_km=...)` offsets every KP in and
+  out; the Burial Planner builds RPL routes only via
+  `rereference_qgis.rpl_route`.
+- **Stated KPs are checked, not used** (`kp_datum.check_route_kps`): below
+  1 m silent, 1–5 m info, 5 m+ warning on the Inputs tab; a document
+  chained on the map projection is recognised by comparing with planar
+  (UTM) chainage. Positions never change because of the check.
+- **Plans record their KP datum** (`params_json.kp_datum`). A plan stored
+  before start-KP support on an RPL that does not start at 0 is renumbered
+  once on open (constant shift, one change-log entry, undoable).
+- **Moving a plan to another RPL re-references it by seabed position**
+  (`plan_rereference.map_plan` through a geometry `KpMap`): scope, targets,
+  resolved no-data ranges, path adjustments, events (positions re-stamped),
+  sections (mapped, so tools/notes/conclusions stay), hazards, rule ranges,
+  ground/BAS rows (delivery `src_*` KPs kept) and the stored analysis
+  context — one change-log entry. "Keep KP numbers" remains available.
+  A newer Workbench revision of the plan's route is announced.
+- **Imports name their KP reference**: the Import plan wizard and the events
+  CSV import ask which Workbench RPL the file's KPs refer to (a planner
+  export's `# rpl_id` is pre-selected) and translate by seabed position;
+  *Register another RPL…* opens the Workbench import. The Workbench is the
+  RPL register — no second list per plan.
+- **Cartesian (grid) KP is one plugin-wide option, not a per-tool one.**
+  `kp_range_utils.make_kp_distance_area` honours the setting
+  (`SubseaCableTools/KP/distance_mode`, `grid_crs`); `GridDistanceArea`
+  measures planar distances in the grid CRS for geometries in any CRS
+  (grid = chosen CRS, else projected project CRS, else the UTM zone at the
+  route start), keeping WGS84 for bearings/projections. Only KP-producing
+  sites use it; bathymetry sampling, seabed length, transit measure and the
+  Workbench RPL editor stay geodesic. Burial plans store their mode in
+  `params_json.kp_datum` so the global switch never renumbers a plan;
+  switching a plan maps KPs vertex-by-vertex (same geometry) through the
+  plan re-reference. Worker copies go through `clone_distance_area` (a plain
+  `QgsDistanceArea(copy)` would silently fall back to geodesic).

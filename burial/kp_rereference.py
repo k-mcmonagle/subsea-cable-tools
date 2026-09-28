@@ -219,6 +219,10 @@ class KpMap:
             return value, []
         src, dst = self._src, self._dst
         flags: List[str] = []
+        if self.method == METHOD_SHIFT and src:
+            # A constant shift is exact everywhere: its two anchors only
+            # define the offset, not a trusted extent.
+            return value + (dst[0] - src[0]), []
         if len(src) == 1:
             return value + (dst[0] - src[0]), [FLAG_EXTRAPOLATED]
         if value <= src[0]:

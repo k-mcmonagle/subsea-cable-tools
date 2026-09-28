@@ -1225,7 +1225,10 @@ class RiskTab(QWidget):
         task = risk_scan.RiskScanTask(
             self.model.plan_id, jobs, route_geoms,
             QgsProject.instance().transformContext(), scope,
-            self.model.direction, self._scan_finished)
+            self.model.direction, self._scan_finished,
+            start_kp_km=(self.model.route.start_kp_km
+                         if self.model.route is not None else 0.0),
+            kp_mode=self.model.kp_mode())
         task.progressMessage.connect(self._set_transient)
         task.progressChanged.connect(
             lambda pct: self.progress.setValue(int(pct)))

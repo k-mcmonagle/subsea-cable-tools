@@ -39,7 +39,7 @@ from qgis.core import (QgsProcessing,
                        QgsDistanceArea,
                        QgsProcessingException)
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_FIELD_NUMERIC
-from ..kp_geo_utils import get_features_skip_invalid
+from ..kp_geo_utils import get_features_skip_invalid, ordered_route_geometry
 
 class PlaceKpPointsFromCsvAlgorithm(QgsProcessingAlgorithm):
     INPUT_TABLE = 'INPUT_TABLE'
@@ -266,7 +266,8 @@ class PlaceKpPointsFromCsvAlgorithm(QgsProcessingAlgorithm):
         geometries = [f.geometry() for f in line_features if f.hasGeometry() and not f.geometry().isEmpty()]
         if not geometries:
             raise QgsProcessingException(self.tr("Input line layer has no usable geometries."))
-        merged_geometry = QgsGeometry.unaryUnion(geometries)
+        # Shared route builder (SeqNo/layer order, no noding).
+        merged_geometry = ordered_route_geometry(line_features)
         
         if merged_geometry.isEmpty():
             raise QgsProcessingException(self.tr("Geometry is empty after merging features."))

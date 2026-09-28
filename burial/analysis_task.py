@@ -41,7 +41,7 @@ from qgis.core import (
 from qgis.PyQt.QtCore import pyqtSignal
 
 from ..kp_geo_utils import RouteFrame
-from ..kp_range_utils import make_distance_area
+from ..kp_range_utils import make_distance_area, make_kp_distance_area
 from ..workbench import rules_engine as eng
 from ..workbench import rules_inputs as ri
 from ..workbench import schema as wb_schema
@@ -449,8 +449,8 @@ class DepthSnapshot:
         for i, kp in enumerate(stations_km):
             if cancel and cancel(): raise ri.AcquisitionCancelled()
             center = route.point_at_kp(kp, clamp=True)
-            a = route.point_at_kp(max(0, kp-.005), clamp=True)
-            b = route.point_at_kp(min(route.total_length_km, kp+.005), clamp=True)
+            a = route.point_at_kp(max(route.start_kp_km, kp-.005), clamp=True)
+            b = route.point_at_kp(min(route.end_kp_km, kp+.005), clamp=True)
             pz = sz = peak = None
             if center is not None and a is not None and b is not None and distance.measureLine(a,b) > 1e-6:
                 bearing = distance.bearing(a,b) + math.pi/2
@@ -627,10 +627,17 @@ def _effective_config(rule_row: Dict, direction: int) -> Dict:
 
 
 def build_route_frame(lines_layer: QgsVectorLayer,
-                      project: Optional[QgsProject] = None
+                      project: Optional[QgsProject] = None,
+                      start_kp_km: float = 0.0,
+                      distance_mode: str = "ellipsoidal",
+                      grid_crs: str = ""
                       ) -> Tuple[RouteFrame, object]:
     """Clone a route (lines layer in Workbench RPL format) into a RouteFrame
-    over WGS84 geometries. Main thread only."""
+    over WGS84 geometries. Main thread only.
+
+    ``start_kp_km`` is the RPL's start KP (its first position's stated KP),
+    so plan KPs read like the RPL even when it does not start at 0; all
+    chainage beyond the start is measured (geodesic, WGS84)."""
     project = project or QgsProject.instance()
     ordered = []
     xform = None
@@ -662,13 +669,18 @@ def build_route_frame(lines_layer: QgsVectorLayer,
             "The route crosses the ±180° antimeridian, which the analysis "
             "geometry does not support — positions and intersections would "
             "be silently wrong. Split or shift the route first.")
-    distance = make_distance_area(WGS84, project.transformContext(), project=project)
+    # KP distance follows the *plan's* KP mode (geodesic by default; a plan
+    # created as Cartesian keeps grid chainage whatever the global setting).
+    distance = make_kp_distance_area(WGS84, project.transformContext(), project=project,
+                                     mode=distance_mode or "ellipsoidal",
+                                     grid_crs=grid_crs or "")
     # KP chainage remains ellipsoidal, but section/event geometry must follow
     # the RPL's stored line segments exactly. Great-circle interpolation
     # between sparse geographic vertices can otherwise render several metres
     # away from the source line.
     return RouteFrame.from_source(
-        geoms, distance, follow_stored_geometry=True), distance
+        geoms, distance, follow_stored_geometry=True,
+        start_kp_km=start_kp_km), distance
 
 
 def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
@@ -899,8 +911,8 @@ def _threshold_predicate(
         delta_km = ri.slope_half_window_km(config, slope_step_km)
         if delta_km is None:
             delta_km = max(float(work.depth_step_m or work.step_m), 1.0) / 1000.0
-        kp0 = max(0.0, kp - delta_km)
-        kp1 = min(route.total_length_km, kp + delta_km)
+        kp0 = max(route.start_kp_km, kp - delta_km)
+        kp1 = min(route.end_kp_km, kp + delta_km)
         d0 = depth_at(kp0)
         d1 = depth_at(kp1)
         if d0 is None or d1 is None:
@@ -1464,9 +1476,10 @@ class ProfileSamplingTask(QgsTask):
         if point is None:
             return None, None
         delta_km = max(self.step_m / 2000.0, 1e-4)
-        p0 = self.route.point_at_kp(max(kp - delta_km, 0.0), clamp=True)
+        p0 = self.route.point_at_kp(max(kp - delta_km, self.route.start_kp_km),
+                                    clamp=True)
         p1 = self.route.point_at_kp(
-            min(kp + delta_km, self.route.total_length_km), clamp=True)
+            min(kp + delta_km, self.route.end_kp_km), clamp=True)
         if p0 is None or p1 is None:
             return None, None
         try:

@@ -23,6 +23,12 @@ KP semantics
   Find Nearest KP behaviour for multi-feature RPLs.
 * Out-of-range KPs return ``None`` by default. Pass ``clamp=True`` to clamp
   to the route start/end.
+* One KP definition plugin-wide: geodesic (WGS84) segment lengths, with
+  positions interpolated along each segment as stored
+  (``follow_stored_geometry=True``), so point→KP→point round-trips exactly.
+  Routes are assembled with :func:`ordered_route_geometry` (SeqNo / layer
+  order, no noding). A :class:`RouteFrame` may start at a non-zero KP
+  (``start_kp_km``, an RPL's first position).
 """
 
 from __future__ import annotations
@@ -157,6 +163,65 @@ def _normalise_geoms(geoms) -> List[QgsGeometry]:
     return out2
 
 
+ORDER_FIELDS = ("SeqNo", "seqno", "SEQNO", "Seq", "seq")
+
+
+def ordered_route_features(features) -> list:
+    """Route features in chainage order: by an RPL ``SeqNo`` field when every
+    feature has one, else as given (layer order). Empty geometries dropped."""
+    feats = [f for f in features
+             if f.hasGeometry() and f.geometry() is not None and not f.geometry().isEmpty()]
+    if not feats:
+        return []
+    names = feats[0].fields().names() if hasattr(feats[0], "fields") else []
+    field = next((n for n in ORDER_FIELDS if n in names), None)
+    if field is None:
+        return feats
+    keyed = []
+    for index, feat in enumerate(feats):
+        try:
+            keyed.append((float(feat[field]), index, feat))
+        except (TypeError, ValueError, KeyError):
+            return feats   # incomplete numbering: keep layer order
+    keyed.sort(key=lambda t: (t[0], t[1]))
+    return [f for _k, _i, f in keyed]
+
+
+def ordered_route_geometry(items, join_tolerance: float = 1e-9) -> QgsGeometry:
+    """The plugin's one way to turn a multi-feature line layer into a route.
+
+    ``items`` are features (ordered via :func:`ordered_route_features`) or
+    geometries (kept in the given order). Parts are concatenated in that
+    order; a part that starts where the previous one ended is joined to it,
+    so RPL legs become one continuous line. Nothing is noded, re-ordered or
+    reversed — unlike ``unaryUnion`` / ``mergeLines`` — so KP along the
+    result equals :class:`RouteFrame` KP over the same features.
+    """
+    items = list(items or [])
+    if items and not isinstance(items[0], QgsGeometry):
+        geoms = [QgsGeometry(f.geometry()) for f in ordered_route_features(items)]
+    else:
+        geoms = _normalise_geoms(items)
+    lines: List[List[QgsPointXY]] = []
+    for geom in geoms:
+        for part in iter_line_parts(geom):
+            pts = [QgsPointXY(p) for p in part]
+            if len(pts) < 2:
+                continue
+            if lines:
+                last = lines[-1][-1]
+                if (abs(last.x() - pts[0].x()) <= join_tolerance
+                        and abs(last.y() - pts[0].y()) <= join_tolerance):
+                    lines[-1].extend(pts[1:])
+                    continue
+            lines.append(pts)
+    if not lines:
+        return QgsGeometry()
+    if len(lines) == 1:
+        return QgsGeometry.fromPolylineXY(lines[0])
+    return QgsGeometry.fromMultiPolylineXY(lines)
+
+
 def crosses_antimeridian(geoms_or_geom) -> bool:
     """True when any segment jumps more than 180° of longitude.
 
@@ -265,7 +330,7 @@ def point_at_kp(
     distance: QgsDistanceArea,
     *,
     clamp: bool = False,
-    follow_stored_geometry: bool = False,
+    follow_stored_geometry: bool = True,
 ) -> Optional[QgsPointXY]:
     """Return the point on the route at the given KP.
 
@@ -285,10 +350,12 @@ def point_at_kp(
         route start / end. When ``False`` (default), out-of-range returns
         ``None``.
     follow_stored_geometry:
-        Keep interpolated points on each segment as stored in its CRS while
-        still using ``distance`` for segment chainage. The default follows
-        the spheroid arc for geographic CRSes, preserving the established KP
-        behaviour used by processing tools.
+        ``True`` (default): interpolate along each segment as stored/drawn
+        (fraction of the segment x its geodesic length). This is the exact
+        inverse of ``kp_at_point`` and keeps points on the line QGIS draws.
+        ``False`` follows the spheroid arc instead; on a long geographic
+        segment that point is then off the drawn line and ``kp_at_point``
+        of it can differ by tens of metres (60 km leg: ~57 m).
     """
 
     try:
@@ -463,7 +530,7 @@ def extract_line_segment(
     end_kp_km: float,
     distance: QgsDistanceArea,
     *,
-    follow_stored_geometry: bool = False,
+    follow_stored_geometry: bool = True,
 ) -> Optional[QgsGeometry]:
     """Extract a line segment between two KPs along a single (multi)polyline.
 
@@ -636,7 +703,8 @@ class RouteFrame:
         geoms: Sequence[QgsGeometry],
         feature_lengths_m: Sequence[float],
         distance: QgsDistanceArea,
-        follow_stored_geometry: bool = False,
+        follow_stored_geometry: bool = True,
+        start_kp_km: float = 0.0,
     ) -> None:
         self._geoms: List[QgsGeometry] = list(geoms)
         self._feature_lengths_m: List[float] = list(feature_lengths_m)
@@ -649,6 +717,13 @@ class RouteFrame:
         self._total_m: float = running
         self._distance = distance
         self._follow_stored_geometry = bool(follow_stored_geometry)
+        # KP of the route's first vertex: an RPL may start at a non-zero KP.
+        # Chainage is still measured from the start; every KP in or out of
+        # this frame is ``start_kp_km + chainage``.
+        try:
+            self._start_kp_km = float(start_kp_km or 0.0)
+        except (TypeError, ValueError):
+            self._start_kp_km = 0.0
         # Lazy chainage/KP indexes may be built from either the main thread
         # or a background task; the lock closes the half-initialised window.
         self._chain_lock = threading.Lock()
@@ -665,7 +740,8 @@ class RouteFrame:
         target_crs: Optional[QgsCoordinateReferenceSystem] = None,
         source_crs: Optional[QgsCoordinateReferenceSystem] = None,
         project: Optional[QgsProject] = None,
-        follow_stored_geometry: bool = False,
+        follow_stored_geometry: bool = True,
+        start_kp_km: float = 0.0,
     ) -> "RouteFrame":
         """Build a ``RouteFrame`` from a feature source or iterable of geometries.
 
@@ -688,7 +764,7 @@ class RouteFrame:
             geoms = raw_geoms
 
         lengths = [measure_total_length_m(g, distance) for g in geoms]
-        return cls(geoms, lengths, distance, follow_stored_geometry)
+        return cls(geoms, lengths, distance, follow_stored_geometry, start_kp_km)
 
     # ----- properties -----
 
@@ -705,7 +781,22 @@ class RouteFrame:
         return self._total_m / 1000.0
 
     @property
+    def start_kp_km(self) -> float:
+        """KP of the route start (0 unless the RPL starts at another KP)."""
+        return self._start_kp_km
+
+    @property
+    def end_kp_km(self) -> float:
+        """KP of the route end: ``start_kp_km + total_length_km``."""
+        return self._start_kp_km + self._total_m / 1000.0
+
+    def clamp_kp(self, kp_km: float) -> float:
+        """``kp_km`` limited to ``[start_kp_km, end_kp_km]``."""
+        return min(max(float(kp_km), self.start_kp_km), self.end_kp_km)
+
+    @property
     def feature_offsets_m(self) -> List[float]:
+        """Chainage (m from the route start) where each feature begins."""
         return list(self._offsets_m)
 
     # ----- queries -----
@@ -762,7 +853,7 @@ class RouteFrame:
 
     def point_at_kp(self, kp_km: float, *, clamp: bool = False) -> Optional[QgsPointXY]:
         try:
-            target_m = float(kp_km) * 1000.0
+            target_m = (float(kp_km) - self._start_kp_km) * 1000.0
         except Exception:
             return None
         if target_m < 0.0:
@@ -833,7 +924,7 @@ class RouteFrame:
         except Exception:
             candidate_ids = []
         if not candidate_ids:
-            return kp_at_point(self._geoms, point_xy, self._distance)
+            return self._offset_hit(kp_at_point(self._geoms, point_xy, self._distance))
         qx, qy = float(query.x()), float(query.y())
         best_dist = float("inf")
         best_kp_m = 0.0
@@ -863,8 +954,15 @@ class RouteFrame:
                 best_feature = self._seg_feature[seg_id] \
                     if seg_id < len(self._seg_feature) else -1
         if best_snapped is None:
-            return kp_at_point(self._geoms, point_xy, self._distance)
-        return KPHit(best_kp_m / 1000.0, best_dist, best_snapped, best_feature)
+            return self._offset_hit(kp_at_point(self._geoms, point_xy, self._distance))
+        return KPHit(self._start_kp_km + best_kp_m / 1000.0, best_dist,
+                     best_snapped, best_feature)
+
+    def _offset_hit(self, hit: KPHit) -> KPHit:
+        if not self._start_kp_km:
+            return hit
+        return KPHit(hit.kp_km + self._start_kp_km, hit.dcc_m, hit.snapped_xy,
+                     hit.feature_index)
 
     def extract_segment(self, start_kp_km: float, end_kp_km: float) -> Optional[QgsGeometry]:
         """Extract a sub-line between two KPs across the whole route.
@@ -889,8 +987,8 @@ class RouteFrame:
         if s > e:
             s, e = e, s
 
-        start_m = s * 1000.0
-        end_m = e * 1000.0
+        start_m = (s - self._start_kp_km) * 1000.0
+        end_m = (e - self._start_kp_km) * 1000.0
         if end_m <= 0 or start_m >= self._total_m:
             return None
         self._ensure_chainage()

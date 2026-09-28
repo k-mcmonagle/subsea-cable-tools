@@ -366,7 +366,7 @@ def _fmt(kp: float) -> str:
 def build_plan(data_rows: Sequence[Sequence[str]], spec: ImportSpec,
                scope: Tuple[float, float], direction: int = 1,
                first_row_number: int = 2, tool_names: Optional[Dict[str, str]] = None,
-               ) -> ImportResult:
+               map_range=None) -> ImportResult:
     """Validate mapped rows and turn the burial ranges into plan events.
 
     * Rows missing a KP, or mapped to *Ignore*, are skipped (counted).
@@ -377,6 +377,9 @@ def build_plan(data_rows: Sequence[Sequence[str]], spec: ImportSpec,
       at the same KP, e.g. PLUP / Start PLB).
     * Gaps between burial ranges become skip sections when events are
       derived, so explicit skip rows only document intent.
+    * ``map_range(start, end) -> (start, end, flags)`` translates KPs quoted
+      on another RPL onto the plan route before anything else; flagged
+      rows (diverged / extrapolated stretches) are reported.
     """
     result = ImportResult()
     tool_names = tool_names or {}
@@ -393,6 +396,7 @@ def build_plan(data_rows: Sequence[Sequence[str]], spec: ImportSpec,
 
     clipped = 0
     outside = 0
+    flagged = []
     for offset, row in enumerate(data_rows):
         number = first_row_number + offset
         if not any((c or "").strip() for c in row):
@@ -408,6 +412,11 @@ def build_plan(data_rows: Sequence[Sequence[str]], spec: ImportSpec,
             result.warnings.append(f"Row {number}: no numeric start/end KP — skipped.")
             continue
         lo, hi = min(a, b), max(a, b)
+        if map_range is not None:
+            mapped_lo, mapped_hi, flags = map_range(lo, hi)
+            if flags:
+                flagged.append(f"row {number} ({', '.join(flags)})")
+            lo, hi = sorted((round(mapped_lo, 6), round(mapped_hi, 6)))
         if hi - lo <= _KP_TOL:
             result.skipped_rows += 1
             result.warnings.append(f"Row {number}: zero-length range at KP {_fmt(lo)} — skipped.")
@@ -425,6 +434,11 @@ def build_plan(data_rows: Sequence[Sequence[str]], spec: ImportSpec,
             tool_id = spec.tool_map.get(cell(row, c_action), "")
         result.ranges.append(ImportRange(number, lo, hi, action, tool_id, cell(row, c_notes)))
 
+    if flagged:
+        result.warnings.append(
+            f"{len(flagged)} row(s) were translated across stretches where the two "
+            f"routes differ — check them: {', '.join(flagged[:8])}"
+            + (" …" if len(flagged) > 8 else ""))
     if outside:
         result.warnings.append(
             f"{outside} range(s) lie wholly outside the plan scope "
