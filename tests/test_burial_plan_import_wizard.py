@@ -117,6 +117,97 @@ def test_overlay_import(temp: str) -> bool:
     return _result("wizard: overlay replaces only the covered KPs and keeps the rest", bool(ok), str(burial))
 
 
+def _workbench_rpl(temp: str, protection=None):
+    """A registered Workbench RPL along the test route (lon 0, lat 50 → 50.06)
+    whose events carry the plan: PLDN, a crossing, PLUP / Start PLB, End PLB.
+    With ``protection`` (one value per segment) the events are left blank
+    and the plan is in the segments' ProtectionMethod instead."""
+    from ..rpl_import.model import ImportedRpl, ImportPoint, ImportSegment
+    from ..workbench.rpl_import_service import (CommitRequest, commit_import,
+                                                make_wgs84_distance_area, reconcile_model,
+                                                to_rpl_model)
+    from ..workbench.store import WorkbenchStore
+    store = WorkbenchStore(os.path.join(temp, "wb.gpkg"))
+    store.migrate()
+    events = ["BMH", "PL-DN", "Crossing C-12", "PLUP / Start PLB", "A/C", "End PLB", "RPL end"]
+    remarks = ["", "Start of plough burial", "", "", "", "surface lay to end", ""]
+    if protection is not None:
+        events = ["BMH", "", "", "", "A/C", "", "RPL end"]
+        remarks = [""] * len(events)
+    doc = ImportedRpl(sheet="RPL")
+    for i, (event, remark) in enumerate(zip(events, remarks)):
+        doc.points.append(ImportPoint(seq=i, source_row=5 + i, pos_no=i + 1, event=event,
+                                      remarks=remark, lat=50.0 + 0.01 * i, lon=0.0,
+                                      dist_cum_km=1.112 * i))
+    for i in range(len(events) - 1):
+        doc.segments.append(ImportSegment(
+            seq=i, source_row=6 + i,
+            protection_method=protection[i] if protection is not None else ""))
+    rpl_model, _ = to_rpl_model(doc, source_file="rpl.xlsx")
+    reconcile_model(rpl_model, make_wgs84_distance_area())
+    result = commit_import(store, rpl_model, CommitRequest(route_name="S01"))
+    return store, result.rpl_id
+
+
+def test_rpl_protection_import(temp: str) -> bool:
+    from ..burial.import_plan_wizard import MODE_PROTECTION, SOURCE_RPL, ImportPlanWizard, _load_map
+    folder = os.path.join(temp, "rpl_prot")
+    os.makedirs(folder, exist_ok=True)
+    model = _model(folder)
+    protection = ["Surface laid", "Plough 1.0m", "Plough 1.0m", "PLB", "PLB", "Surface laid"]
+    model.workbench_store, rpl_id = _workbench_rpl(folder, protection)
+    wizard = ImportPlanWizard(model, None, source_kind=SOURCE_RPL)
+    page = wizard.rpl
+    page.initializePage()
+    page.picker.reload(select=rpl_id)
+    page.load()
+    kp = [round(r.kp, 3) for r in page.rows]
+    # No boundary events on this RPL, so the page picks the protection column itself.
+    mode_ok = page.mode() == MODE_PROTECTION and page.protection_box.isVisibleTo(page)
+    values_ok = [r.protection for r in page.rows] == protection + [""]
+    wizard.review.initializePage()
+    ok = wizard.commit()
+    burial = _burial(model)
+    ok = ok and mode_ok and values_ok
+    ok = ok and burial == [(kp[1], kp[3], "t_pl"), (kp[3], kp[5], "t_tr")]
+    notes = sorted(s.get("notes") or "" for s in model.sections
+                   if s.get("kind") == schema.SECTION_BURIAL)
+    ok = ok and notes == ["Protection: PLB", "Protection: Plough 1.0m"]
+    ok = ok and _load_map("protectionValues").get("plough 1.0m") == "plough"
+    return _result("wizard: plan from the RPL's protection method column (auto-picked)",
+                   bool(ok), f"mode={page.mode()} kp={kp} burial={burial} notes={notes}")
+
+
+def test_rpl_events_import(temp: str) -> bool:
+    from ..burial.import_plan_wizard import SOURCE_RPL, ImportPlanWizard
+    folder = os.path.join(temp, "rpl")
+    os.makedirs(folder, exist_ok=True)
+    model = _model(folder)
+    model.update_plan({"scope_start_kp": 0.0, "scope_end_kp": 6.672}, reason="scope")
+    model.workbench_store, rpl_id = _workbench_rpl(folder)
+    wizard = ImportPlanWizard(model, None, source_kind=SOURCE_RPL)
+    page = wizard.rpl
+    page.initializePage()
+    page.picker.reload(select=rpl_id)
+    page.load()
+    placed = [r.kp for r in page.rows]
+    offsets_ok = all(r.offset_m is not None and r.offset_m < 1.0 for r in page.rows)
+    tools_ok = page.tool_map()["plough"] == "t_pl" and page.tool_map()["trencher"] == "t_tr"
+    crossing = page.walk.issues.get(2, [])
+    wizard.review.initializePage()
+    complete = wizard.review.isComplete()
+    ok = wizard.commit()
+    burial = _burial(model)
+    kp = [round(k, 3) for k in placed]
+    ok = ok and complete and offsets_ok and tools_ok and len(page.rows) == 7
+    ok = ok and not page.swap.isChecked() and any("Crossing" in i.text for i in crossing)
+    ok = ok and [(b[0], b[1]) for b in burial] == [(kp[1], kp[3]), (kp[3], kp[5])]
+    ok = ok and [b[2] for b in burial] == ["t_pl", "t_tr"]
+    ok = ok and model.undo_last_builder_edit() is not None and not model.events
+    return _result("wizard: plan from RPL events placed by position, transition, tools, undo",
+                   bool(ok), f"kp={kp} burial={burial} tools={page.tool_map()}")
+
+
 def run_all():
     from qgis.PyQt.QtCore import QSettings
     results = []
@@ -127,7 +218,8 @@ def run_all():
         QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, temp)
         os.makedirs(os.path.join(temp, "overlay"), exist_ok=True)
         try:
-            for test in (test_replace_import, test_overlay_import):
+            for test in (test_replace_import, test_overlay_import, test_rpl_events_import,
+                         test_rpl_protection_import):
                 try:
                     results.append(test(temp))
                 except Exception as exc:  # report, keep going

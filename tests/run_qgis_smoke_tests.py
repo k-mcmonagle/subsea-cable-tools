@@ -159,6 +159,7 @@ CHECKS = [
     ('burial planner generation (pure)', 'test_burial_generation'),
     ('burial planner IO + import scan (pure)', 'test_burial_io'),
     ('burial planner plan import (pure)', 'test_burial_plan_import'),
+    ('burial planner plan from RPL events (pure)', 'test_burial_rpl_plan_import'),
     ('burial planner Import plan wizard', 'test_burial_plan_import_wizard'),
     ('burial planner multi-tool plans (transitions, labels)', 'test_burial_multitool'),
     ('burial planner targets + analysis currency (pure)', 'test_burial_targets_state'),

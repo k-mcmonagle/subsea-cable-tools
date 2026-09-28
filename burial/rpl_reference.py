@@ -65,6 +65,88 @@ def kp_transform(model, rpl_id: str):
     return kp_map.map_range, kp_map
 
 
+def rpl_event_rows(model, rpl_id: str):
+    """``(rows, label)``: every position of a registered RPL as
+    :class:`rpl_plan_import.RplRow`, placed on the plan route by seabed
+    position (so another revision or route translates correctly).
+
+    ``rpl_id`` "" is the plan's own RPL. Raises ValueError.
+    """
+    from qgis.core import (QgsCoordinateReferenceSystem, QgsCoordinateTransform,
+                           QgsPointXY)
+    from ..workbench.rpl_layer_io import _attr
+    from .rereference_qgis import rpl_label
+    from .rpl_plan_import import RplRow
+    store = getattr(model, "workbench_store", None)
+    if store is None:
+        raise ValueError("Open the Cable Workbench: its RPL register holds the RPLs "
+                         "to import from.")
+    target = rpl_id or str(getattr(model, "resolved_rpl_id", "") or "")
+    if not target:
+        raise ValueError("This plan's route is not an RPL in the Workbench register. "
+                         "Choose a registered RPL.")
+    if model.route is None:
+        raise ValueError("The plan has no route to place the RPL's events on.")
+    rpl = store.get_rpl(target)
+    if rpl is None:
+        raise ValueError("The selected RPL is no longer in the Workbench.")
+    layer = store.open_layer(rpl.get("points_layer") or "")
+    if layer is None or not layer.isValid():
+        raise ValueError(f"The positions of '{rpl_label(rpl)}' could not be opened.")
+    wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
+    xform = None
+    if layer.crs() != wgs84:
+        xform = QgsCoordinateTransform(layer.crs(), wgs84, QgsProject.instance())
+
+    def number(value, kind):
+        try:
+            return kind(value) if value is not None and str(value).strip() != "" else None
+        except (TypeError, ValueError):
+            return None
+
+    raw = []
+    for order, feat in enumerate(layer.getFeatures()):
+        geom = feat.geometry()
+        point = None
+        if geom is not None and not geom.isEmpty():
+            point = QgsPointXY(geom.asPoint())
+            if xform is not None:
+                try:
+                    point = xform.transform(point)
+                except Exception:
+                    point = None
+        seq = number(_attr(feat, "SeqNo"), int)
+        raw.append((seq if seq is not None else order, order, feat, point))
+    raw.sort(key=lambda r: (r[0], r[1]))
+    rows = []
+    for index, (_seq, _order, feat, point) in enumerate(raw):
+        row = RplRow(seq=index, pos_no=number(_attr(feat, "PosNo"), int),
+                     event=str(_attr(feat, "Event") or "").strip(),
+                     remarks=str(_attr(feat, "Remarks") or "").strip(),
+                     stated_kp=number(_attr(feat, "DistCumulative"), float))
+        if point is not None:
+            hit = model.route.kp_at_point(point)
+            if hit is not None and hit.feature_index >= 0:
+                row.kp = round(float(hit.kp_km), 6)
+                row.offset_m = float(hit.dcc_m)
+        rows.append(row)
+    if not rows:
+        raise ValueError(f"'{rpl_label(rpl)}' has no positions.")
+    # Segment k (SeqNo order) joins positions k and k + 1: its protection
+    # method rides on row k.
+    lines = store.open_layer(rpl.get("lines_layer") or "")
+    if lines is not None and lines.isValid() and "ProtectionMethod" in lines.fields().names():
+        segments = []
+        for order, feat in enumerate(lines.getFeatures()):
+            seq = number(_attr(feat, "SeqNo"), int)
+            segments.append((seq if seq is not None else order, order,
+                             str(_attr(feat, "ProtectionMethod") or "").strip()))
+        segments.sort(key=lambda s: (s[0], s[1]))
+        for index, (_seq, _order, value) in enumerate(segments[:len(rows) - 1]):
+            rows[index].protection = value
+    return rows, rpl_label(rpl)
+
+
 class RplReferencePicker(QWidget):
     """"KPs referenced to: [RPL ▾]" with a *Register another RPL…* entry."""
 

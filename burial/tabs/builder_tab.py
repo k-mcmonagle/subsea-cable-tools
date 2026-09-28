@@ -222,13 +222,20 @@ class BuilderTab(QWidget):
             "so it can be rolled back from Review && Export.")
         self.fresh_button.clicked.connect(self._regenerate_fresh)
         run_row.addWidget(self.fresh_button)
-        self.import_button = QPushButton("Import plan…")
+        self.import_button = QPushButton("Import plan")
         self.import_button.setToolTip(
-            "Import an existing burial plan from a CSV or Excel KP-range "
-            "table: map the columns (Start/End KP, Action, Tool, Notes), "
-            "say which values mean Bury or Skip, then replace the plan or "
-            "overlay just the KP ranges the file covers. One undoable edit.")
-        self.import_button.clicked.connect(self._import_plan)
+            "Import an existing burial plan, then replace the plan or overlay "
+            "just the KP ranges it covers (one undoable edit):\n"
+            "• From a KP-range table — CSV or Excel with Start/End KP, Action, "
+            "Tool, Notes columns.\n"
+            "• From an RPL — its PLDN / PLUP, Start / End PLB and skip events, "
+            "or its per-segment protection method, placed on this route by position.")
+        import_menu = QMenu(self.import_button)
+        import_menu.addAction("From a KP-range table (CSV / Excel)…",
+                              lambda: self._import_plan())
+        import_menu.addAction("From an RPL (PLDN / PLUP events or protection method)…",
+                              lambda: self._import_plan_rpl())
+        self.import_button.setMenu(import_menu)
         run_row.addWidget(self.import_button)
         self.cancel_button = QPushButton("Stop")
         self.cancel_button.setToolTip(
@@ -1452,11 +1459,15 @@ class BuilderTab(QWidget):
         except ValueError as exc:
             QMessageBox.warning(self, "Burial Planner", str(exc))
 
-    def _import_plan(self) -> None:
+    def _import_plan_rpl(self) -> None:
+        from ..import_plan_wizard import SOURCE_RPL
+        self._import_plan(SOURCE_RPL)
+
+    def _import_plan(self, source_kind: str = "") -> None:
         if not self.model.plan:
             return
-        from ..import_plan_wizard import ImportPlanWizard
-        wizard = ImportPlanWizard(self.model, self)
+        from ..import_plan_wizard import SOURCE_TABLE, ImportPlanWizard
+        wizard = ImportPlanWizard(self.model, self, source_kind=source_kind or SOURCE_TABLE)
         qt_exec(wizard)
         if wizard.imported:
             count = sum(1 for s in self.model.sections

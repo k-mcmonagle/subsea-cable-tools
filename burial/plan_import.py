@@ -445,7 +445,13 @@ def build_plan(data_rows: Sequence[Sequence[str]], spec: ImportSpec,
             f"KP {_fmt(scope_lo)}–{_fmt(scope_hi)} and were left out.")
     if clipped:
         result.warnings.append(f"{clipped} range(s) were clipped to the plan scope.")
+    return finalise(result, direction)
 
+
+def finalise(result: ImportResult, direction: int = 1) -> ImportResult:
+    """Order ``result.ranges``, reject overlaps, merge touching burial
+    ranges (same tool) or count tool transitions (different tools), and
+    derive the START/END events. Shared by every plan importer."""
     result.ranges.sort(key=lambda r: (r.start_kp, r.end_kp))
     for prev, cur in zip(result.ranges, result.ranges[1:]):
         if cur.start_kp < prev.end_kp - _KP_TOL:
