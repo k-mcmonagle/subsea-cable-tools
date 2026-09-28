@@ -536,6 +536,7 @@ def test_bathymetry_dialog_registers_input() -> bool:
     dialog.deleteLater()
     config = json.loads(row["config_json"])
     ok = ok and row["role"] == burial_schema.INPUT_ROLE_BATHY
+    ok = ok and row["layer_name"] == "Contours minor, Contours major"
     ok = ok and config["mode"] == MODE_CONTOURS
     ok = ok and [c["depth_field"] for c in config["contour_layers"]] == [
         "depth_m", "elev"]
@@ -559,8 +560,17 @@ def test_bathymetry_dialog_registers_input() -> bool:
              for r in range(tab.inputs_table.rowCount())]
     ok = ok and roles == ["Bathymetry"]
     ok = ok and "Contours (2 layer(s))" in tab.bathy_summary.text()
+    # The register row names both contour layers, not only the first...
+    ok = ok and tab.inputs_table.item(0, 1).text() == \
+        "Contours minor, Contours major"
+    ok = ok and tab.inputs_table.item(0, 2).text().startswith("✓")
+    # ...and flags the second one going missing.
+    QgsProject.instance().removeMapLayer(major.id())
+    tab._refresh_inputs()
+    ok = ok and tab.inputs_table.item(0, 2).text() == "✗ missing"
+    ok = ok and "not in project" in tab.inputs_table.item(0, 1).text()
     tab.deleteLater()
-    for layer in (minor, major, points):
+    for layer in (minor, points):
         QgsProject.instance().removeMapLayer(layer.id())
     return _result("Bathymetry dialog: contour slots, depth-field guess, "
                    "register details, reopen, listed as an input", ok)

@@ -724,6 +724,51 @@ def test_cross_offset_uses_contour_crossings() -> bool:
                    ok, f"{len(interior)} interior stations")
 
 
+def test_major_and_minor_contours_merge_into_one_profile() -> bool:
+    """Both configured contour layers feed the profile, not just the first:
+    a minor contour between two major ones must set the mid-route depth."""
+    from ..workbench.depth_service import DepthSourceConfig
+
+    project = QgsProject.instance()
+    route, _da = _route()  # due north along lon 0, lat 50 -> 50.2
+
+    def _contours(name, lines):
+        layer = QgsVectorLayer("LineString?crs=EPSG:4326&field=depth:double",
+                               name, "memory")
+        for lat, depth in lines:
+            feat = QgsFeature(layer.fields())
+            feat.setGeometry(QgsGeometry.fromWkt(
+                f"LINESTRING(-0.05 {lat}, 0.05 {lat})"))
+            feat.setAttributes([depth])
+            layer.dataProvider().addFeature(feat)
+        project.addMapLayer(layer)
+        return layer
+
+    major = _contours("major", [(50.02, 100.0), (50.18, 1000.0)])
+    minor = _contours("minor", [(50.10, 300.0)])
+
+    def _mid_depth(layers):
+        config = DepthSourceConfig({
+            "mode": 2, "contour_search_radius_m": 500.0,
+            "contour_layers": [{"layer_id": l.id(), "depth_field": "depth"}
+                               for l in layers]})
+        snapshot = analysis_task.DepthSnapshot(config, project)
+        if not snapshot.prepare():
+            return None
+        mid = route.total_length_km / 2.0
+        samples = snapshot.profile_samples(route, [mid - 0.5, mid, mid + 0.5])
+        return samples[1][1]
+
+    both = _mid_depth([major, minor])
+    major_only = _mid_depth([major])
+    ok = (both is not None and abs(both - 300.0) < 1.0
+          and major_only is not None and abs(major_only - 550.0) < 10.0)
+    for layer in (major, minor):
+        project.removeMapLayer(layer.id())
+    return _result("major + minor contour layers merge into one profile", ok,
+                   f"both={both} major_only={major_only}")
+
+
 def test_profile_widget_axes_crosshair_toggles() -> bool:
     """Depth/slope plots: aligned axes, no SI-prefixed KP, mirrored crosshair,
     per-series toggles, adjustable splitter."""
@@ -1883,6 +1928,7 @@ def run_all() -> list:
         test_route_frame_chainage_matches_walk(),
         test_profile_cross_offset_sampling(),
         test_cross_offset_uses_contour_crossings(),
+        test_major_and_minor_contours_merge_into_one_profile(),
         test_profile_widget_axes_crosshair_toggles(),
         test_profile_widget_measurements(),
         test_analysis_reuses_stored_depth_samples(),

@@ -434,8 +434,10 @@ class BathymetryDialog(QDialog):
                         "contour_layers": [], "contour_search_radius_m": 0.0,
                         "auto_resample": True}
         primary = None
+        names: List[str] = []
         if mode == MODE_RASTER and self._raster is not None:
             primary = self._raster
+            names.append(self._raster.name())
             config["raster_layer_ids"] = [self._raster.id()]
             # Sources ride along so a removed-and-re-added layer (new id)
             # is found again instead of silently dropping the bathymetry.
@@ -446,6 +448,7 @@ class BathymetryDialog(QDialog):
                 if slot.layer is None:
                     continue
                 primary = primary or slot.layer
+                names.append(slot.layer.name())
                 config["contour_layers"].append({
                     "layer_id": slot.layer.id(),
                     "source": slot.layer.source(),
@@ -455,7 +458,9 @@ class BathymetryDialog(QDialog):
         row = dict(self._row)
         row.update({
             "role": schema.INPUT_ROLE_BATHY,
-            "layer_name": primary.name() if primary is not None else "",
+            # Every layer is named (the register, report and CSV show this);
+            # source and id stay the first layer's — config_json holds all.
+            "layer_name": ", ".join(names),
             "layer_source": primary.source() if primary is not None else "",
             "layer_id_hint": primary.id() if primary is not None else "",
             "config_json": json.dumps(config),

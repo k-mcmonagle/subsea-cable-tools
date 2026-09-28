@@ -699,13 +699,20 @@ class InputsTab(QWidget):
                 state, detail, layer = self.model.input_status(row)
             except Exception as exc:  # never let one bad row break the tab
                 state, detail, layer = "missing", str(exc), None
-            counts[state] = counts.get(state, 0) + 1
             stored_name = row.get("layer_name") or ""
             live_name = layer.name() if layer is not None else ""
             name = live_name or stored_name
             users = usage.get(str(row.get("input_id") or ""), [])
+            source_tip = row.get("layer_source") or ""
             if row.get("role") == schema.INPUT_ROLE_BATHY:
                 users = ["Bathymetry profile (the plan's depth source)"] + users
+                # One row can hold two contour layers (e.g. major + minor):
+                # name and judge them all, not just the first.
+                bathy = self._bathy_register_cells()
+                if bathy is not None:
+                    name, source_tip, state, detail = bathy
+                    live_name = stored_name = ""
+            counts[state] = counts.get(state, 0) + 1
             values = [
                 schema.INPUT_ROLE_LABELS.get(row.get("role") or "",
                                              row.get("role") or ""),
@@ -721,7 +728,7 @@ class InputsTab(QWidget):
                 if j == 0:
                     item.setData(ITEM_DATA_USER_ROLE, row.get("input_id"))
                 if j == 1:
-                    tip = row.get("layer_source") or ""
+                    tip = source_tip
                     if live_name and stored_name and live_name != stored_name:
                         tip = (f"Registered as '{stored_name}', now named "
                                f"'{live_name}'.\n") + tip
@@ -933,6 +940,43 @@ class InputsTab(QWidget):
             if row.get("role") == schema.INPUT_ROLE_BATHY:
                 return row
         return None
+
+    def _bathy_register_cells(self):
+        """``(name, source tooltip, state, detail)`` for the bathymetry
+        register row, covering every configured layer (both contour layers,
+        not only the first). None when no layer is configured."""
+        config = self.model.depth_config()
+        project = QgsProject.instance()
+        if config.raster_layer_ids:
+            entries = [(layer_id, "") for layer_id in config.raster_layer_ids]
+        else:
+            entries = [(e.get("layer_id") or "", e.get("depth_field") or "")
+                       for e in config.contour_layers]
+        if not entries:
+            return None
+        names, tips, missing = [], [], 0
+        for number, (layer_id, field) in enumerate(entries, start=1):
+            layer = project.mapLayer(layer_id)
+            if layer is None:
+                missing += 1
+                names.append(f"⚠ layer {number} not in project")
+                continue
+            names.append(layer.name())
+            tips.append(f"{layer.name()}"
+                        + (f" [depth field: {field}]" if field else "")
+                        + f"\n{layer.source()}")
+        if missing:
+            state = "missing"
+            detail = (f"{missing} of {len(entries)} configured bathymetry "
+                      "layer(s) are not in the project — re-add them (found "
+                      "again by source) or Configure bathymetry…")
+        elif self.model.depth_relinks:
+            state = "relinked"
+            detail = ("relinked by source: " + ", ".join(self.model.depth_relinks))
+        else:
+            state = "ok"
+            detail = ", ".join(names)
+        return ", ".join(names), "\n\n".join(tips), state, detail
 
     def _configure_bathy(self) -> None:
         if not self.model.plan:
