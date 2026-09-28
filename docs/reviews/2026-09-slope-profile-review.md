@@ -1,5 +1,7 @@
 # Slope and profile review — 8 September 2026
 
+**Status: implemented (Sep 2026); line references are historical.**
+
 Implementation follow-up: the improvements below have now been implemented. See README.md, “Slope methodology” and “KP Mouse quick profile”, for the final behaviour and controls. Validation: 141 pure checks passed with and without NumPy, plus 51 targeted QGIS 3.40 integration checks. The offscreen QGIS/Qt renderer emitted QVariant warnings; plot, measurement, export and lifecycle assertions passed. A live QGIS 4 session and real-survey comparison were not available. The remainder records the original review findings.
 
 Scope: current working-tree implementation of KP Mouse quick profiles, Depth Profile, Burial Planner, shared slope mathematics, KP-range summary, and XYZ import/MBES merge. This is a review, not an implementation change. Existing working-tree modifications were left intact.

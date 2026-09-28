@@ -2,73 +2,36 @@
 name=Subsea Cable Tools
 qgisMinimumVersion=3.22
 qgisMaximumVersion=4.99
+supportsQt6=True
 description=Tools to support working with subsea cable data in QGIS.
 version=1.9.0
 author=Kieran McMonagle
 email=kieran.mcmonagle@globalmarine.group
 
-about=Subsea Cable Tools is a QGIS Processing Plugin developed to support working with subsea cable data in QGIS.
+about=Tools for subsea telecom and power cable route engineering in QGIS.
+  KP (chainage) tools, including a live KP mouse tool and plugin-wide KP settings; depth and slope profiles from MBES rasters or contours; RPL import and a Cable Route Workbench for RPL revisions, cable systems and assemblies; a Burial Planner (beta); a Cable Lay Simulator (beta) and catenary calculator; cable lay data import with a QC and analysis Explorer; and a scenario Planner (beta).
+  A Processing provider adds KP-range, RPL, bathymetry (MBES, GeoMedia MDB) and utility algorithms.
+  Beta tools are under active development: check their outputs against your own data and methods before operational use.
 
 tracker=https://github.com/k-mcmonagle/subsea-cable-tools/issues
 repository=https://github.com/k-mcmonagle/subsea-cable-tools
 
 hasProcessingProvider=yes
 
-# changelog
-changelog=Version 1.9.0:
-  - NEW: Burial Planner (beta) — a dockable workflow that resolves an ordered stack of exclusion criteria (depth/slope thresholds, crossings/proximity, seabed-soils polygons, KP-range tables, manual ranges, and a generic data-coverage check) into burial sections, skips, and Insufficient Information ranges, with a synced profile pane, an append-only undoable change log, and CSV/HTML report export. Beta: sanity-check outputs against your own methods before operational use.
-  - NEW: Installation Paths — generates a planning-grade burial-tool path from every RPL course change (tangent fillets or forward-only Dubins pass-through), with depth-banded turning radius, a vessel registry with turn checking, manual path adjustments, and a KP-vs-deviation plot.
-  - NEW: .pthmdb path-file import — reads GeoMedia path databases directly (no Access/ODBC install needed) via both a Processing tool and a Cable Route Workbench import route, including optional assembly extraction and bathymetry profile import.
-  - Workbench: RPL points now classify as assembly, geographic, or both (user-editable rules), revision selection no longer guesses a "latest," and RPL import gains a guided wizard with per-worksheet detection, saved mapping profiles, and a rollback-safe commit with a durable import audit.
-  - One slope convention plugin-wide: every tool now reports along-route/side slope with the same sign and datum handling, backed by a shared, headless-tested `slope_utils` module; the KP Mouse live profile and Depth Profile tools no longer fabricate slope across missing data or raster seams.
-  - MBES tools: true per-cell Bin Average gridding, per-axis grid-spacing detection, multi-file XYZ import with exact cell registration, and a raster merge that always keeps the finest input resolution.
-  - Import MDB: bundled pure-Python Jet/Access reader (no pyodbc/Access driver needed), decodes all GeoMedia geometry BLOB variants including GeoMedia text/label features, fixes a worker-subprocess deadlock on large discovery listings, and reports per-table outcomes instead of failing silently.
-  - Processing tools no longer abort on a layer containing an invalid (e.g. zero-length or null) geometry — KP tools and 19 other algorithms now skip such features instead of erroring or silently shortening the route.
-  - Planner: cable quantity tracking (loaded/laid/recovered, cable onboard), a Reports window (fuel ROB, breakdowns, progress S-curve, plan-vs-actual variance), task import from MS Project/CSV, duplicate tasks/groups, and a milestones/key-dates report.
-  - Cable Lay Simulator (3D): a focused BU Lowering Tool dialog, a BU-datum integration editor for describing branching-unit make-up in one place, and quick-model fixes for bed tension, touchdown continuity, and force-balance convergence.
-  - This is a large beta feature set — please sanity-check Burial Planner and Installation Paths outputs against your own methods before operational use. See CHANGELOG.md for the full list.
-Version 1.8.0:
-  - NEW: Planner (beta) — dockable spatial scenario planning with ordered, map-linked tasks, resource lanes, predecessor/lag scheduling, and simulated vessel playback over route geometry.
-  - Multi-resource planning: independent vessel start offsets, cross-resource dependencies, selectable marker colours, and MS Project-style indented/collapsible summary groups.
-  - Undo/redo for task, outline, ordering, link, import, sketch, merge, and deletion changes, including Planner-owned geometry.
-  - Precise route/point sketching with optional point/vertex and line-segment snapping, WGS84 coordinate entry, and existing-route KP entry.
-  - Spatial planning UX: place points or draw snapping multi-vertex routes, create tasks per drawn leg/waypoint, see measured distance/speed in the task table, merge adjacent task routes, and retain independent planner-owned point/line layers in the project GeoPackage.
-  - Playback labels follow each resource marker by default, with user-selectable task, resource, progress, time, and speed/distance content.
-  - Geodesy fix: Planner distances remain ellipsoidal across geographic/projected CRSs while playback markers and progress bands now remain on the exact planned feature.
-  - RPL import: whole or partial KP range from Workbench/project layers, with per-segment or operational grouping and cable-type default lay speeds.
-  - Scenarios can be created, renamed, duplicated independently, and deleted; each has its own resources and persists in a separate per-project planner GeoPackage.
-  - Task plans copy directly to the MS Project Entry table as tab-delimited 24/7 elapsed-hour tasks. No new dependencies.
-Version 1.7.0:
-  - NEW: Cable Lay Simulator (3D), beta — the next-generation catenary tool (V3). Interactive 3D view (orbit/zoom/pan, software-rendered, works over RDP), synchronized Profile and Plan views, and three modes: Static hang (V2 physics generalised to 3D bathymetry with current drag; single span, held branching unit at a chosen depth, or held final bight at a chosen apex depth), Steady lay (ship speed + pay-out solved in the vessel frame with hydrodynamic drag, validated against Zajac 1957 closed forms shown live as "quick answers"), and Operation simulation (quasi-static time stepping with a timeline scrubber).
-  - Operation scenarios: Branching-unit deployment (trunk + two pre-laid legs joined at the BU, per-leg tensions and touchdown), Final bight lay-down (bight lowered from a stepping vessel on an auto-released rope), and transient Straight lay.
-  - Hydrodynamic drag throughout (Morison-type, per-segment diameter/Cd, depth-varying current profile), Coulomb seabed friction on 3D bathymetry (flat/slope/profile/QGIS raster sampling), V2-compatible assembly JSON with new hydro columns, chute capstan-friction readout, MBR checking, CSV/3D-DXF export and results-to-map memory layers.
-  - Engineering honesty: every mode documents assumptions and validation status in catenary/v3/V3_MODEL_NOTES.md; results panes carry convergence diagnostics and warnings. Validated against closed-form catenary, Zajac 1957 (critical angle, top-tension theorem, cross-current offsets), the V2 drape solver, and physical invariants (automated tests). NOT yet verified against commercial lay software or field data — treat as planning-grade.
-  - Removed the deprecated Catenary Calculator (Legacy V1) toolbar action (deprecation notice since 1.6). Catenary Calculator V2 is unchanged and remains the recommended 2D tool.
-  - No new dependencies: NumPy + bundled pyqtgraph + Qt only.
-Version 1.6.3:
-  - Catenary Calculator V2 (UI only, no calculation changes): fixed the dialog layout on QGIS 3 / Qt5, where the left input panel was capped too narrow and the splitter could not be dragged right far enough to show all inputs — the assembly button row and longer field labels were clipped with no way to reveal them (QGIS 4 / Qt6 was unaffected). The panel now keeps a minimum width and shows a horizontal scrollbar instead of truncating content, and the dialog opens slightly larger with a wider default left share.
-  - Catenary Calculator V2: the Results text box and the plot are now separated by a vertical splitter, so the Results panel can be enlarged or shrunk (previously it was pinned near its minimum height). Both panes keep a minimum height so neither collapses.
-Version 1.6.2:
-  - Security-scan compliance only, no functional change from 1.6.1: corrected the placement of Bandit "# nosec" suppressions on the dynamically-built Microsoft Access SQL (table/column identifiers are validated and bracket-quoted; row values use parameter placeholders) and annotated the vendored pyqtgraph SVG exporter's internal XML parsing, so the QGIS plugin repository's automated security scan passes.
-Version 1.6.1:
-  - This is a large jump from the previously published version, adding many new tools, algorithms and features in one step. It is published as a work in progress — please sanity-check and double-check results against your own data and established methods, and do not rely on the output uncritically.
-  - Import MDB (ODBC path handling): normalises Windows MDB paths before connect and uses a driver-compatible DBQ connection string, fixing "HY000 / -1044 Not a valid file name" failures seen on some Microsoft Access ODBC driver builds.
-  - Import MDB (geometry inference): in worker split mode, multi-vertex features are now emitted as LineString based on actual vertex shape rather than being forced to Point by unreliable source metadata; true point and polygon imports are preserved.
-  - Added focused regression tests for MDB worker geometry inference across point/line/polygon/ambiguous metadata cases.
-Version 1.6.0:
-  - New "Cable Lay Data Import" group of Processing algorithms for building a GeoPackage of cable lay data: Create Cable Lay GeoPackage (sets up all the empty canonical layers), plus importers for Cable Lay CSV, Event Log, Slack Log (lines), Body Log, 3D Model Solutions, As-Laid and Plough Data.
-  - GeoPackage-centric workflow: each importer accepts multiple files at once and writes to its fixed canonical layer (cable_lay, slack_logs, ...). The destination is either an existing layer picked from a dropdown (e.g. created by Create Cable Lay GeoPackage) or a GeoPackage file to create/append to. Layer names are prefixed with the GeoPackage file name (e.g. ProjectX_cable_lay) for clean grouping in the layer tree. Re-running grows that layer and removes duplicates on a per-type key, so data arriving daily/weekly builds up cleanly and re-importing a file is safe. A combined layer exports to CSV with QGIS's built-in Export.
-  - Shared, dependency-free parsing helpers (degrees/decimal-minutes to decimal degrees, day-count time to ISO timestamp, numeric type inference, merge/dedupe). No new third-party dependencies.
-  - See CHANGELOG.md for the full list.
-Version 1.5.1:
-  - Catenary Calculator V2: added sloped / profiled seabed support (tangent touchdown on a depth profile), convergence and seabed-penetration reporting, distributed buoyancy, and a fuller seabed plot. Bottom Tension input is now the actual tension at the touchdown (T_TDP), identical to before on a flat seabed.
-  - Distance/KP measurement consolidated through a single helper that uses the project ellipsoid (with a WGS84 fallback when unset). Adds an Ellipsoidal/Cartesian distance-mode option to KP-emitting algorithms (default Ellipsoidal; no behaviour change).
-  - Geodesic interpolation: point_at_kp / extract_line_segment now follow the great circle on geographic CRSes instead of linearly interpolating in lon/lat. KP Mouse Tool range ring drawn as a true geodesic circle.
-  - CRS handling: KP Plotter, Find Nearest KP and Place KP Points (raster sampling) auto-reproject mismatched inputs with feedback warnings; Translate KP Between RPLs gives a clearer same-CRS error.
-  - QGIS 4.0 / Qt6 compatibility: PyQt shim used throughout, compatibility aliases added for Qt/QGIS enum changes, qgisMaximumVersion=4.99 declared. Catenary calculators, KP Plotter and Depth Profile now use vendored pyqtgraph instead of requiring matplotlib.
-  - Various fixes: RPL Route Comparison ellipsoid fallback, narrowed bare except clauses, Dynamic Buffer group label, dock-widget cleanup. Catenary Calculator v1 marked Legacy. Import Bathy MDB renamed to Import MDB (`import_mdb` algorithm id).
-  - See CHANGELOG.md for the full list.
-tags=subsea, cable, telecoms, mapping, gis, qgis, lrs, kp, offshore, engineering, bathymetry
+# changelog: latest releases only; the full history is in CHANGELOG.md
+changelog=
+  1.9.0
+  - New Burial Planner (beta): exclusion criteria over route and survey data, a stored bathymetry and slope profile, burial tools, risk checks, installation paths and an HTML report. Check outputs against your own methods before operational use.
+  - Cable Route Workbench: guided RPL import (Excel/CSV, route lines or points, .pthmdb path files), cable systems with physical make-up and schematics, and editable event classification.
+  - One slope sign convention in every tool (positive = shoaling with increasing KP). KP Range Depth + Slope Summary slope field names have changed.
+  - Import MDB works without an Access driver or pyodbc and imports GeoMedia text labels. New Import Path File (.pthmdb) and Place Outline Along Route (KP) tools.
+  - MBES: multi-file XYZ import, per-cell bin averaging, and merges that keep the finest resolution.
+  - Planner: fuel and cable tracking, reports, advanced scheduling, baselines and actuals, and task import. New BU Lowering Tool (beta).
+  - Processing tools no longer abort on zero-length or null geometries.
+  1.8.0
+  - New Cable Route Workbench (RPL Manager, assemblies, system topology, route suitability assessment) and Planner (beta).
+  Full changelog: https://github.com/k-mcmonagle/subsea-cable-tools/blob/main/CHANGELOG.md
+tags=subsea, cable, telecoms, power cable, offshore, engineering, kp, lrs, rpl, bathymetry, mbes, burial, catenary, cable lay, mapping, gis, qgis
 
 homepage=https://github.com/k-mcmonagle/subsea-cable-tools
 category=Vector

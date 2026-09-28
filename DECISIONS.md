@@ -1,8 +1,14 @@
 # Burial Planner (beta) — implementation decisions
 
-Deviations from and judgement calls on `burial_planner_spec.md` (v0.3), one
-line of rationale each, so they can be reviewed alongside the code. Spec
-section references in brackets.
+Deviations from and judgement calls on the Burial Planner design
+specification (`burial_planner_spec.md`, v0.3), one line of rationale each,
+so they can be reviewed alongside the code. Spec section references in
+brackets.
+
+> **The v0.3 specification is not in this repository.** This file is the
+> authoritative record of how the Burial Planner is meant to behave; the
+> `[§n]` references and "the spec" below point to that external document
+> and are kept for traceability only. Record new design decisions here.
 
 ## Deviations from the spec
 
