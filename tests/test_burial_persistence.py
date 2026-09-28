@@ -597,6 +597,15 @@ def test_profile_overlay_filters_and_hazards() -> bool:
     widget._apply_insufficient_filter()
     ranges = [(a, b) for a, b, _l in widget._regions["insufficient"].ranges()]
     ok = ok and ranges == [(5.0, 6.0)]
+    # Exclusion readout names the criteria, the dominant one first.
+    from ..workbench.rules_engine import RangeVerdict
+    ctx.excluded = [
+        RangeVerdict(3.0, 4.0, "excluded", 3, ["cross", "depth"], "depth"),
+        RangeVerdict(7.0, 7.5, "excluded", 3, ["gone"], "gone")]
+    widget.set_overlays(ctx, {"cross": "Cross slope", "depth": "Depth"})
+    labels = widget.overlay_labels_at(3.5)
+    ok = ok and "Exclusion Area — Depth, Cross slope" in labels
+    ok = ok and "Exclusion Area" in widget.overlay_labels_at(7.2)
     # Hiding an overlay kind removes it from the readout too.
     ctx.excluded = []
     widget._overlay_visible["insufficient"] = False

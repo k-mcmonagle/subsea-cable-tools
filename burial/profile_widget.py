@@ -1205,7 +1205,7 @@ class BurialProfileWidget(QWidget):
         self._overlay_rule_names = dict(rule_names or {})
         context = self._overlay_context
         self._regions["excluded"].set_ranges(
-            (v.start_km, v.end_km, "Exclusion Area")
+            (v.start_km, v.end_km, self._exclusion_label(v))
             for v in context.excluded)
         self._regions["screening"].set_ranges(
             (v.start_km, v.end_km, "Screening Criterion — flags for assessment")
@@ -1215,6 +1215,21 @@ class BurialProfileWidget(QWidget):
              f"Constraint Influence Zone of {z.rule_name}")
             for z in context.influence)
         self._apply_insufficient_filter()
+
+    def _exclusion_label(self, verdict: eng.RangeVerdict) -> str:
+        """``Exclusion Area — <rules>``: the criteria covering the range,
+        the one that set the exclusion first."""
+        rule_ids = list(verdict.fired_rule_ids or [])
+        if verdict.dominant_rule_id:
+            rule_ids = [verdict.dominant_rule_id] + [
+                rid for rid in rule_ids if rid != verdict.dominant_rule_id]
+        names: List[str] = []
+        for rule_id in rule_ids:
+            name = self._overlay_rule_names.get(str(rule_id), "")
+            if name and name not in names:
+                names.append(name)
+        return "Exclusion Area — " + ", ".join(names) if names \
+            else "Exclusion Area"
 
     def insufficient_sources(self) -> List[Tuple[str, str, float]]:
         """``(key, label, km)`` of the criteria behind the displayed
