@@ -143,7 +143,8 @@ _VERTICAL = getattr(Qt, "Orientation", Qt).Vertical
 class SectionRangeDialog(QDialog):
     """Explicit range for inserting an opposite-kind section."""
 
-    def __init__(self, section: Dict, kind_label: str, parent=None):
+    def __init__(self, section: Dict, kind_label: str, parent=None,
+                 note_text: Optional[str] = None):
         super().__init__(parent)
         self.setWindowTitle("Split section / insert range")
         start = float(section.get("start_kp") or 0.0)
@@ -153,9 +154,9 @@ class SectionRangeDialog(QDialog):
         centre = (start + end) / 2.0
 
         layout = QVBoxLayout(self)
-        note = QLabel(
+        note = QLabel(note_text or (
             f"Insert {kind_label} inside the selected section. Two editable "
-            "boundary events will be created at the entered KPs.")
+            "boundary events will be created at the entered KPs."))
         note.setWordWrap(True)
         layout.addWidget(note)
         form = QFormLayout()
@@ -221,6 +222,14 @@ class BuilderTab(QWidget):
             "so it can be rolled back from Review && Export.")
         self.fresh_button.clicked.connect(self._regenerate_fresh)
         run_row.addWidget(self.fresh_button)
+        self.import_button = QPushButton("Import plan…")
+        self.import_button.setToolTip(
+            "Import an existing burial plan from a CSV or Excel KP-range "
+            "table: map the columns (Start/End KP, Action, Tool, Notes), "
+            "say which values mean Bury or Skip, then replace the plan or "
+            "overlay just the KP ranges the file covers. One undoable edit.")
+        self.import_button.clicked.connect(self._import_plan)
+        run_row.addWidget(self.import_button)
         self.cancel_button = QPushButton("Stop")
         self.cancel_button.setToolTip(
             "Stop the running analysis. Criteria that already finished stay "
@@ -509,6 +518,7 @@ class BuilderTab(QWidget):
     def analysis_started(self) -> None:
         self.generate_button.setEnabled(False)
         self.fresh_button.setEnabled(False)
+        self.import_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.progress.setVisible(True)
         self.progress.setValue(0)
@@ -522,6 +532,7 @@ class BuilderTab(QWidget):
     def analysis_finished(self, message: str = "") -> None:
         self.generate_button.setEnabled(bool(self.model.plan))
         self.fresh_button.setEnabled(bool(self.model.plan))
+        self.import_button.setEnabled(bool(self.model.plan))
         self.cancel_button.setEnabled(False)
         self.progress.setVisible(False)
         if message:
@@ -559,7 +570,8 @@ class BuilderTab(QWidget):
             self.run_status.setText("")
         self._loading = True
         try:
-            method = self.model.method
+            method = self.model.label_method
+            event_labels = self.model.event_labels()
             if not self._min_section_dirty:
                 # Never clobber a typed-but-unapplied minimum from an
                 # unrelated refresh (e.g. confirming or nudging an event).
@@ -570,6 +582,8 @@ class BuilderTab(QWidget):
                 self.add_type_combo.addItem(ev.event_label(event_type, method), event_type)
             self.generate_button.setEnabled(bool(self.model.plan))
             self.fresh_button.setEnabled(bool(self.model.plan))
+            self.import_button.setEnabled(bool(self.model.plan)
+                                          and not self.cancel_button.isEnabled())
 
             events = self.model.events
             status_colors = _status_colors()
@@ -586,7 +600,8 @@ class BuilderTab(QWidget):
                 for i, event in enumerate(events):
                     values = [
                         str(int(event.get("seq") or 0)),
-                        ev.event_label(event.get("event_type") or "", method),
+                        event_labels.get(str(event.get("event_id") or ""))
+                        or ev.event_label(event.get("event_type") or "", method),
                         schema.format_kp(event.get("kp")),
                         self._format_rkp(event.get("kp"), total_km),
                         f"{event.get('lat'):.7f}" if event.get("lat") is not None else "",
@@ -780,8 +795,8 @@ class BuilderTab(QWidget):
         try:
             sections = self.model.sections
             refs = schema.section_refs(sections, self.model.direction,
-                                       self.model.method)
-            ref_legend = schema.section_ref_legend(self.model.method)
+                                       self.model.label_method)
+            ref_legend = schema.section_ref_legend(self.model.label_method, sections)
             self._rebuild_boundary_index()
             self._rebuild_sections_table(sections, refs, ref_legend)
             self._apply_filter(self.sections_table, self.sections_filter)
@@ -812,7 +827,8 @@ class BuilderTab(QWidget):
                 end_lat, end_lon = self._position_text(end_kp)
                 values = [
                     refs.get(str(section_id or ""), ""),
-                    self._kind_label(kind or ""),
+                    schema.section_kind_label(kind or "",
+                                              self.model.section_method(section)),
                     schema.format_kp(start_kp),
                     schema.format_kp(end_kp),
                     self._format_rkp(start_kp, total_km),
@@ -984,7 +1000,12 @@ class BuilderTab(QWidget):
                                     field, value)
 
     def _kind_label(self, kind: str) -> str:
-        return schema.section_kind_label(kind, self.model.method)
+        return schema.section_kind_label(kind, self.model.label_method)
+
+    def _event_label(self, event: Dict) -> str:
+        """Label from the tool of the section the event bounds."""
+        return (self.model.event_labels().get(str(event.get("event_id") or ""))
+                or ev.event_label(event.get("event_type") or "", self.model.label_method))
 
     def _reason_text(self, section: Dict) -> str:
         try:
@@ -1106,7 +1127,7 @@ class BuilderTab(QWidget):
         count = len(self._selected_event_ids())
         menu = QMenu(self)
         go_action = menu.addAction(
-            f"Go to {ev.event_label(event.get('event_type') or '', self.model.method)} "
+            f"Go to {self._event_label(event)} "
             f"at KP {schema.format_kp(event.get('kp'))}")
         scope_action = menu.addAction("Show full plan scope")
         menu.addSeparator()
@@ -1185,6 +1206,13 @@ class BuilderTab(QWidget):
         tool_menu.setEnabled(any(
             s.get("kind") == schema.SECTION_BURIAL
             for s in self.model.sections if s.get("section_id") in wanted))
+        range_tool_action = menu.addAction("Set tool for KP range…")
+        range_tool_action.setToolTip(
+            "Give part of this burial section another tool (e.g. Plough → PLB → "
+            "Plough): inserts tool transitions (PLUP / Start PLB at one KP, no "
+            "skip) at the range ends.")
+        range_tool_action.setEnabled(
+            selected_count == 1 and section.get("kind") == schema.SECTION_BURIAL)
         notes_action = menu.addAction(f"Set notes{suffix}…")
         final_action = menu.addAction(f"Mark final{suffix}")
         candidate_action = menu.addAction(f"Mark candidate{suffix}")
@@ -1221,7 +1249,7 @@ class BuilderTab(QWidget):
         all_ii = bool(wanted) and all(
             s.get("kind") == schema.SECTION_INSUFFICIENT
             for s in self.model.sections if s.get("section_id") in wanted)
-        method = self.model.method
+        method = self.model.label_method
         resolve_skip_action = menu.addAction(
             f"Resolve as {schema.section_kind_label(schema.SECTION_SKIP, method)}"
             f"{suffix}…")
@@ -1251,6 +1279,8 @@ class BuilderTab(QWidget):
             self._apply_section_field("skip_handling", skip_actions[chosen])
         elif chosen in tool_actions:
             self._apply_section_tool(*tool_actions[chosen])
+        elif chosen == range_tool_action:
+            self._set_tool_for_range(section)
         elif chosen == notes_action:
             text, ok = QInputDialog.getText(
                 self, "Set notes",
@@ -1317,8 +1347,7 @@ class BuilderTab(QWidget):
         plan = self.model.plan
         lo = float(plan.get("scope_start_kp") or 0.0)
         hi = float(plan.get("scope_end_kp") or 0.0)
-        label = ev.event_label(event.get("event_type") or "",
-                               self.model.method)
+        label = self._event_label(event)
         dialog = ui_helpers.MoveEventDialog(
             label, float(event.get("kp") or 0.0), float(new_kp),
             lo=lo, hi=hi, parent=self)
@@ -1422,6 +1451,18 @@ class BuilderTab(QWidget):
         except ValueError as exc:
             QMessageBox.warning(self, "Burial Planner", str(exc))
 
+    def _import_plan(self) -> None:
+        if not self.model.plan:
+            return
+        from ..import_plan_wizard import ImportPlanWizard
+        wizard = ImportPlanWizard(self.model, self)
+        qt_exec(wizard)
+        if wizard.imported:
+            count = sum(1 for s in self.model.sections
+                        if s.get("kind") == schema.SECTION_BURIAL)
+            self.run_status.setText(
+                f"Imported plan: {count} burial section(s). Ctrl+Z undoes the import.")
+
     def _undo_last_edit(self) -> None:
         entry = self.model.undo_last_builder_edit()
         if entry is None:
@@ -1488,10 +1529,54 @@ class BuilderTab(QWidget):
 
         QTimer.singleShot(0, apply)
 
+    def _set_tool_for_range(self, section: Dict) -> None:
+        """Assign a tool to part of a burial section via tool transitions."""
+        if section.get("kind") != schema.SECTION_BURIAL:
+            return
+        choices = [("Plan default", "")]
+        for tool in self.model.tools:
+            method = schema.normalise_method(tool.get("tool_type") or "")
+            type_text = schema.METHOD_LABELS.get(method, method)
+            choices.append((f"{tool.get('name') or '?'}  [{type_text}]",
+                            tool.get("tool_id") or ""))
+        if len(choices) == 1:
+            QMessageBox.information(
+                self, "Burial Planner",
+                "Register burial tools on the Tools tab first (e.g. a plough "
+                "and an ROV/trencher for PLB).")
+            return
+        dialog = SectionRangeDialog(
+            section, "", self,
+            note_text="KP range to give another tool. A tool transition (e.g. "
+                      "PLUP and Start PLB at the same KP, no skip) is created at "
+                      "each end that lies inside the section.")
+        dialog.setWindowTitle("Set tool for KP range")
+        if qt_exec(dialog) != DIALOG_ACCEPTED:
+            return
+        start_kp, end_kp = dialog.range_kp()
+        labels = [text for text, _tool in choices]
+        current = next((i for i, (_t, tid) in enumerate(choices)
+                        if tid and tid != (section.get("tool_id") or "")), 0)
+        label, ok = QInputDialog.getItem(
+            self, "Set tool for KP range",
+            f"Tool for KP {schema.format_kp(start_kp)}-{schema.format_kp(end_kp)}:",
+            labels, current, False)
+        if not ok:
+            return
+        tool_id = choices[labels.index(label)][1]
+        reason = self._maybe_reason("Set tool for KP range")
+        if reason is None:
+            return
+        try:
+            self.model.set_tool_for_range(section.get("section_id") or "",
+                                          start_kp, end_kp, tool_id, "", reason)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Burial Planner", str(exc))
+
     def _split_section(self) -> None:
         ids = self._selected_section_ids()
         if len(ids) != 1:
-            method = self.model.method
+            method = self.model.label_method
             QMessageBox.information(
                 self, "Burial Planner",
                 f"Select one "
@@ -1512,7 +1597,7 @@ class BuilderTab(QWidget):
                          if section.get("kind") == schema.SECTION_BURIAL
                          else schema.SECTION_BURIAL)
         inserted_label = \
-            f"a {schema.section_kind_label(inserted_kind, self.model.method)}"
+            f"a {schema.section_kind_label(inserted_kind, self.model.label_method)}"
         dialog = SectionRangeDialog(section, inserted_label, self)
         if qt_exec(dialog) != DIALOG_ACCEPTED:
             return
@@ -1531,7 +1616,7 @@ class BuilderTab(QWidget):
         selected = [section for section in self.model.sections
                     if section.get("section_id") in set(ids)]
         if len(selected) < 2:
-            method = self.model.method
+            method = self.model.label_method
             QMessageBox.information(
                 self, "Burial Planner",
                 f"Select at least two "
@@ -1553,8 +1638,8 @@ class BuilderTab(QWidget):
                 self, "Burial Planner", "Selected sections must be the same kind.")
             return
         kind_label = self._kind_label(next(iter(target_kinds)) or "")
-        start_label = ev.event_label(schema.EVENT_BURIAL_START, self.model.method)
-        end_label = ev.event_label(schema.EVENT_BURIAL_END, self.model.method)
+        start_label = ev.event_label(schema.EVENT_BURIAL_START, self.model.label_method)
+        end_label = ev.event_label(schema.EVENT_BURIAL_END, self.model.label_method)
         message = (
             f"Merge {len(selected)} selected rows into one {kind_label}? "
             f"The intervening {start_label}/{end_label} boundaries will be "
@@ -1615,7 +1700,7 @@ class BuilderTab(QWidget):
         except ValueError as exc:
             QMessageBox.warning(self, "Burial Planner", str(exc))
             return
-        method = self.model.method
+        method = self.model.label_method
         kind_label = self._kind_label(target_kind)
         lo, hi = plan.span
         refs = schema.section_refs(self.model.sections, self.model.direction,
@@ -1695,9 +1780,9 @@ class BuilderTab(QWidget):
                 "log.")
         else:
             start_label = ev.event_label(schema.EVENT_BURIAL_START,
-                                         self.model.method)
+                                         self.model.label_method)
             end_label = ev.event_label(schema.EVENT_BURIAL_END,
-                                       self.model.method)
+                                       self.model.label_method)
             message = (
                 f"Delete the {kind_label} {span}?\n\n"
                 f"Its {start_label}/{end_label} boundary events are removed "
@@ -1730,7 +1815,7 @@ class BuilderTab(QWidget):
                 self, "Burial Planner",
                 "Select one or more Insufficient Information sections.")
             return
-        method = self.model.method
+        method = self.model.label_method
         kind_label = self._kind_label(as_kind)
         total_km = sum(float(s.get("length_km") or 0.0) for s in sections)
         spans = ", ".join(

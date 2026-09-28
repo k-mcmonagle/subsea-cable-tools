@@ -102,10 +102,19 @@ def test_section_refs_and_csv() -> bool:
     # Direction -1 numbers from the high-KP end (travel order).
     rev = schema.section_refs(sections, direction=-1, method="plough")
     ok = ok and rev["s5"] == "PS-01" and rev["s1"] == "PS-03"
-    # Legacy rov_jet aliases to trencher (TS codes); unknown methods fall
-    # back to the generic burial-section code.
+    # Legacy rov_jet aliases to trencher (PB = PLB codes); unknown methods
+    # fall back to the generic burial-section code.
     trench = schema.section_refs(sections, direction=1, method="rov_jet")
-    ok = ok and trench["s1"] == "TS-01" and trench["s2"] == "SK-01"
+    ok = ok and trench["s1"] == "PB-01" and trench["s2"] == "SK-01"
+    # A burial section's own tool type picks its code in a mixed plan.
+    mixed = [dict(s) for s in sections]
+    mixed[2]["method"] = schema.METHOD_TRENCHER
+    mixed_refs = schema.section_refs(mixed, direction=1, method="plough")
+    ok = ok and mixed_refs["s1"] == "PS-01" and mixed_refs["s3"] == "PB-01" \
+        and mixed_refs["s5"] == "PS-02"
+    ok = ok and "PB = PLB Section" in schema.section_ref_legend("plough", mixed)
+    ok = ok and io_csv.normalise_event_type("Start  PLB") == schema.EVENT_BURIAL_START
+    ok = ok and io_csv.normalise_event_type("end_plb") == schema.EVENT_BURIAL_END
     generic = schema.section_refs(sections, direction=1, method="")
     ok = ok and generic["s1"] == "BS-01" and generic["s2"] == "SK-01"
     # The sections CSV carries the ref as its first column.

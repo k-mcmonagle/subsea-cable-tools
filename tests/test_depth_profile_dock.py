@@ -335,6 +335,125 @@ def test_selected_only(h: _Harness) -> bool:
                    f"length={d.line_length}")
 
 
+def _route_kp_of_x(h: _Harness, x: float) -> float:
+    """True KP (km) on dp_route (straight, eastward from _X0) at easting x."""
+    return (x - _X0) / h.scale / 1000.0
+
+
+def test_kp_axis_round_ticks(h: _Harness) -> bool:
+    """Line-distance mode: ticks on round KPs with 3 dp labels."""
+    from ..kp_axis_item import KPAxisItem
+    d = h.dock
+    h.configure()
+    d.kp_axis_combo.setCurrentIndex(d.kp_axis_combo.findData("line"))
+    h.generate()
+    axis = d.figure.get_axes()[0].plot_item.getAxis("bottom")
+    levels = axis.tickValues(0.0344, 0.9344, 600)
+    positions = levels[0][1] if levels else []
+    labels = axis.tickStrings(positions, 1.0, levels[0][0]) if levels else []
+    ok = isinstance(axis, KPAxisItem) and axis.mode == "linear" and len(positions) >= 3
+    ok = ok and all(abs(p / levels[0][0] - round(p / levels[0][0])) < 1e-9 for p in positions)
+    ok = ok and all(len(s.split(".")[1]) == 3 for s in labels)
+    return _result("profile-line KP axis: round intervals, 3 dp labels", ok, f"{labels}")
+
+
+def test_route_kp_axis_drawn_line(h: _Harness) -> bool:
+    """A drawn diagonal line labels X with the nearest KP on the route.
+
+    Each tick's label must equal the route KP at that tick's true position.
+    """
+    from qgis.core import QgsPointXY
+    d = h.dock
+    h.configure()
+    a, b = (_X0 + 100.0, _Y0 - 200.0), (_X0 + 900.0, _Y0 + 200.0)
+    d.temp_drawn_points = [QgsPointXY(*a), QgsPointXY(*b)]
+    d.use_drawn_chk.setChecked(True)
+    d.kp_axis_combo.setCurrentIndex(d.kp_axis_combo.findData("route"))
+    d.kp_ref_combo.setCurrentIndex(d.kp_ref_combo.findData(h.route.id()))
+    # Drawn lines live in the project CRS.
+    old_crs = h.project.crs()
+    h.project.setCrs(h.route.crs())
+    try:
+        h.generate()
+        axes = d.figure.get_axes()
+        axis = axes[0].plot_item.getAxis("bottom")
+        end_km = d.kp_values[-1]
+        levels = axis.tickValues(0.0, end_km, 600)
+        positions = levels[0][1] if levels else []
+        labels = axis.tickStrings(positions, 1.0, levels[0][0]) if levels else []
+        worst = 0.0
+        for pos, label in zip(positions, labels):
+            frac = pos / end_km
+            x = a[0] + frac * (b[0] - a[0])
+            worst = max(worst, abs(float(label) - _route_kp_of_x(h, x)))
+        values = [float(s) for s in labels]
+        steps = {round(v2 - v1, 6) for v1, v2 in zip(values, values[1:])}
+        ok = axis.mode == "mapped" and len(positions) >= 3 and len(steps) == 1
+        ok = ok and steps.pop() in (0.05, 0.1, 0.25) and worst < 0.0005
+        ok = ok and "Nearest KP on dp_route" in axes[-1].plot_item.getAxis("bottom").labelText
+        # Tooltip reports the route KP, not only the distance along the line.
+        from ..plot_widget import PlotMouseEvent
+        d.show_tooltip(PlotMouseEvent("motion_notify_event", axes[0], positions[1], 120.0))
+        ok = ok and d.canvas.toolTip().startswith("Route KP: ")
+    finally:
+        h.project.setCrs(old_crs)
+        d.use_drawn_chk.setChecked(False)
+        d.kp_axis_combo.setCurrentIndex(d.kp_axis_combo.findData("line"))
+    return _result("drawn line: X labelled with nearest route KP at round values (accurate)", ok,
+                   f"labels={labels} worst={worst * 1000:.2f} m")
+
+
+def test_kp_mouse_window_cursor_sync(h: _Harness) -> bool:
+    """KP Mouse profile: round route-KP ticks and a plot cursor that emits
+    the matching range-line point for the map marker (and back)."""
+    from qgis.core import QgsGeometry, QgsPointXY
+    from qgis.PyQt.QtWidgets import QApplication
+    from ..kp_geo_utils import RouteFrame
+    from ..kp_range_utils import make_distance_area
+    from ..maptools.kp_depth_utils import DepthSampler
+    from ..maptools.kp_depth_profile_window import KPDepthProfileWindow
+    crs = h.route.crs()
+    da = make_distance_area(crs, h.project.transformContext(), project=h.project)
+    frame = RouteFrame.from_source([QgsGeometry(f.geometry()) for f in h.route.getFeatures()], da)
+    window = KPDepthProfileWindow(None)
+    window.kp_check.blockSignals(True); window.kp_check.setChecked(False); window.kp_check.blockSignals(False)
+    emitted = []
+    window.cursorMoved.connect(emitted.append)
+    try:
+        window.configure(DepthSampler(crs, [(h.fine, "")]), da, frame)
+        window.show()
+        origin, target = QgsPointXY(_X0 + 344.0, _Y0 + 50.0), QgsPointXY(_X0 + 944.0, _Y0 - 50.0)
+        window.schedule(origin, target)
+        window._timer.stop(); window._refresh()
+        window.kp_check.blockSignals(True); window.kp_check.setChecked(True); window.kp_check.blockSignals(False)
+        window._redraw()
+        QApplication.processEvents()
+        axis = window.depth_axis
+        length = window._profile["length_m"]
+        levels = axis.tickValues(0.0, length, 700)
+        positions = levels[0][1] if levels else []
+        labels = axis.tickStrings(positions, 1.0, levels[0][0]) if levels else []
+        worst = 0.0
+        for pos, label in zip(positions, labels):
+            x = origin.x() + pos / length * (target.x() - origin.x())
+            worst = max(worst, abs(float(label) - _route_kp_of_x(h, x)))
+        ok = axis.mode == "mapped" and len(positions) >= 3 and worst < 0.0005
+        ok = ok and all(round(float(s) * 1000) % 50 == 0 for s in labels)
+        # Plot → map: the cursor emits the range-line point at that distance.
+        window.show_cursor_at_distance(length / 2.0)
+        mid = emitted[-1] if emitted else None
+        ok = ok and mid is not None and abs(mid.x() - (_X0 + 644.0)) < 1e-6 and abs(mid.y() - _Y0) < 1e-6
+        ok = ok and all(line.isVisible() for line in window._cursor_lines)
+        ok = ok and "KP " in window.cursor_label.text() and "Depth " in window.cursor_label.text()
+        window.hide_cursor()
+        ok = ok and emitted[-1] is None and not any(line.isVisible() for line in window._cursor_lines)
+    finally:
+        window.cleanup()
+        QApplication.processEvents()
+    return _result("KP Mouse profile: round route-KP ticks + plot cursor mirrored to the map", ok,
+                   f"labels={labels} worst={worst * 1000:.2f} m")
+
+
 def test_csv_export(h: _Harness) -> bool:
     from qgis.PyQt.QtWidgets import QFileDialog
     d = h.dock
@@ -367,7 +486,8 @@ def run_all() -> List[bool]:
         try:
             for test in (test_raster_depth_profile, test_dual_and_slope_only, test_reverse_kp_hover,
                          test_measurements, test_multi_raster_series, test_contour_profile,
-                         test_selected_only, test_csv_export):
+                         test_selected_only, test_kp_axis_round_ticks, test_route_kp_axis_drawn_line,
+                         test_kp_mouse_window_cursor_sync, test_csv_export):
                 try:
                     results.append(test(harness))
                 except Exception as exc:  # report, keep going

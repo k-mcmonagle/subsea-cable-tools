@@ -603,3 +603,33 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   *which* criterion lacked data and filter by it; changing what the plan
   treats as Insufficient Information remains a Plan Builder decision
   (resolve as skip/burial), keeping the audit trail in the change log.
+
+## Multi-tool plans (no schema change)
+
+- **Labels follow each section's tool, not the plan**: this supersedes the
+  v6 note that labels resolve from the plan method. A burial section's
+  `method` (its tool's type) picks its event labels, section code and kind
+  label; sections without a tool use the plan default tool's type
+  (`tools.plan_label_method`), then the stored plan method, then plough.
+  Plans with no per-section tools therefore look exactly as before.
+- **Vocabulary kept deliberately small**: ploughs PLDN/PLUP (PS); every
+  post-lay burial tool — Trencher/ROV and MFE — Start PLB/End PLB (PB);
+  Inspection Start/End Inspection (IN). Skips and Insufficient Information
+  are tool-neutral. Stored event types stay generic
+  (`BURIAL_START`/`BURIAL_END`), so no event rewrite or migration is needed;
+  `tool_type` and `bp_section.method` were already free text.
+- **Tool transitions are single points**: continuous burial that changes
+  tool is an END and a START at the same KP. `events.travel_key` sorts END
+  before START at equal KP so alternation stays valid and the zero-length
+  skip between them is dropped by `build_sections`. A transition moves as
+  one boundary (the partner event follows) and may not cross another
+  boundary. Planned overlaps/handover lengths are a later refinement.
+- **New plans no longer ask for a method**: the stored method is only the
+  fallback vocabulary (plough). New exclusion rules are stamped `"[]"` (all
+  tools); existing plans' rule filtering is unchanged. Generate still
+  evaluates one method per run — automatic tool choice is future work.
+- **Merging across a transition keeps the first section's tool** (travel
+  order); moving a boundary re-applies tools by position, because
+  overlap carry-over cannot choose between two parents.
+- **Installation Paths stay single-tool**: they use the default tool's
+  turning radius; a plan with other tool types asks for confirmation first.

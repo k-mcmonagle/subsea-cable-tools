@@ -1206,6 +1206,20 @@ class PathsTab(QWidget):
                 "The selected tool configuration needs a minimum turning "
                 "radius greater than zero.")
             return
+        # Multi-tool plans: the path still follows one tool's radius. Say so
+        # rather than silently applying the default tool to PLB sections.
+        other = sorted({
+            schema.METHOD_LABELS.get(m, m) for m in (
+                self.model.section_method(s) for s in self.model.sections
+                if s.get("kind") == schema.SECTION_BURIAL)
+            if m != schema.normalise_method(tool.get("tool_type") or "")})
+        if other and QMessageBox.question(
+                self, "Installation Paths",
+                f"This plan also has {', '.join(other)} sections. The installation "
+                f"path uses the default tool ({tool.get('name') or '?'}) and its "
+                f"turning radius for the whole route.\n\nGenerate anyway?",
+                MESSAGE_BOX_YES | MESSAGE_BOX_NO, MESSAGE_BOX_NO) != MESSAGE_BOX_YES:
+            return
         if not self._apply_settings():
             return
         path_config = self.model.path_config()

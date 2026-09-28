@@ -39,8 +39,10 @@ class PlanTab(QWidget):
         self.description_edit = QLineEdit()
         self.method_label = QLabel("—")
         self.method_label.setToolTip(
-            "Chosen when the plan is created; tools of a different type can "
-            "still be assigned per section in the Plan Builder.")
+            "Tool types used by the plan's burial sections (the default tool "
+            "applies where a section has none). Assign tools per section in "
+            "the Plan Builder: ploughs label PLDN/PLUP, trenchers and MFEs "
+            "Start/End PLB, inspection Start/End Inspection.")
         self.rpl_label = QLabel("—")
         self.rpl_label.setToolTip("The plan's route — set on the Inputs tab.")
         self.rpl_revision_label = QLabel("—")
@@ -57,7 +59,7 @@ class PlanTab(QWidget):
             "Assumptions, review-basis notes, references…")
         form.addRow("Name:", self.name_edit)
         form.addRow("Description:", self.description_edit)
-        form.addRow("Method:", self.method_label)
+        form.addRow("Tools in plan:", self.method_label)
         # Default burial tool: sections inherit this unless overridden in
         # the Plan Builder. Registered on the Burial Tools tab.
         self.tool_combo = QComboBox()
@@ -112,6 +114,7 @@ class PlanTab(QWidget):
         # Registry changes refresh only the tool combos: a full refresh()
         # would clobber unsaved name/description/notes edits.
         model.toolsChanged.connect(self._on_tools_changed)
+        model.sectionsChanged.connect(self._refresh_method_label)
         self.refresh()
 
     def refresh(self) -> None:
@@ -135,8 +138,7 @@ class PlanTab(QWidget):
             if not same_plan:
                 self.save_status.setText("")
             self._loaded_plan_id = plan_id
-            self.method_label.setText(schema.METHOD_LABELS.get(
-                schema.normalise_method(plan.get("method") or ""), "—"))
+            self._refresh_method_label()
             self._refresh_tool_combos()
             self.rpl_label.setText(plan.get("rpl_name") or "—")
             self.rpl_revision_label.setText(plan.get("rpl_revision") or "—")
@@ -144,6 +146,18 @@ class PlanTab(QWidget):
             self.status_label.setText(plan.get("status") or "draft")
         finally:
             self._loading = False
+
+    def _refresh_method_label(self) -> None:
+        methods = []
+        for section in self.model.sections or []:
+            if section.get("kind") == schema.SECTION_BURIAL:
+                method = self.model.section_method(section)
+                if method not in methods:
+                    methods.append(method)
+        if not methods and self.model.plan:
+            methods = [self.model.label_method]
+        self.method_label.setText(", ".join(
+            schema.METHOD_LABELS.get(m, m) for m in methods) or "—")
 
     def _mark_dirty(self, *_args) -> None:
         if not self._loading:

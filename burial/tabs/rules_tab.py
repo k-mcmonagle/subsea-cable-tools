@@ -1779,7 +1779,8 @@ class RulesTab(QWidget):
             "risk_level": 0,
             "criterion_class": schema.CRITERION_PROJECT,
             "source_ref": "",
-            "methods_json": json.dumps([self.model.method]),
+            # New rules apply to every tool type ("[]"): plans mix tools.
+            "methods_json": "[]",
             "config_json": json.dumps(preset or {}),
             "notes": "",
         }

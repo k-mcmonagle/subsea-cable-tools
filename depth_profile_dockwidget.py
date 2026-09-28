@@ -73,6 +73,7 @@ class DepthProfileDockWidget(QDockWidget):
         self.marker = None
         self.vertical_line = None
         self.vertical_line2 = None  # for dual plot
+        self._route_kp = None  # nearest-KP mapping onto a reference route
         self.canvas_cid = None
         self._right_click_cid = None
         self._tooltip_cid = None
@@ -320,6 +321,32 @@ class DepthProfileDockWidget(QDockWidget):
         plot_row.addWidget(self.slope_unit_combo)
         plot_row.addStretch()
         form_layout.addRow(plot_row)
+
+        # X-axis KP labelling: distance along the profile line itself, or the
+        # nearest KP on a reference route (drawn lines, cross-sections).
+        kp_row = QHBoxLayout()
+        kp_row.addWidget(QLabel("X-axis KP:"))
+        self.kp_axis_combo = QComboBox()
+        self.kp_axis_combo.addItem("Distance along profile line", "line")
+        self.kp_axis_combo.addItem("Nearest KP on route", "route")
+        self.kp_axis_combo.setToolTip(
+            "Distance along profile line: the profile's own chainage (KP 0 = first vertex).\n"
+            "Nearest KP on route: ticks at round KPs of the chosen route, placed where the\n"
+            "profile line's nearest route KP crosses them. Spacing, slopes and measurements\n"
+            "stay distance along the profile line; a line across the route can revisit KPs.")
+        mode_idx = self.kp_axis_combo.findData(self.settings.value("DepthProfile/kp_axis_mode", "line"))
+        self.kp_axis_combo.setCurrentIndex(max(0, mode_idx))
+        kp_row.addWidget(self.kp_axis_combo)
+        self.kp_ref_combo = QComboBox()
+        self.kp_ref_combo.setMinimumWidth(120)
+        self.kp_ref_combo.setToolTip("Route line layer whose KP labels the X axis")
+        kp_row.addWidget(self.kp_ref_combo)
+        self.kp_ref_selected_chk = QCheckBox("Selected only")
+        self.kp_ref_selected_chk.setToolTip("Use only the selected features of the KP route layer")
+        self.kp_ref_selected_chk.setChecked(bool(self.settings.value("DepthProfile/kp_ref_selected_only", False, type=bool)))
+        kp_row.addWidget(self.kp_ref_selected_chk)
+        kp_row.addStretch()
+        form_layout.addRow(kp_row)
         
         # Checkboxes row
         checkboxes_row = QHBoxLayout()
@@ -508,6 +535,7 @@ class DepthProfileDockWidget(QDockWidget):
         self.draw_line_btn.clicked.connect(self.activate_temp_line_tool)
         self.clear_drawn_btn.clicked.connect(self.clear_drawn_line)
         self.use_drawn_chk.toggled.connect(self.update_enable_states)
+        self.kp_axis_combo.currentIndexChanged.connect(self.update_enable_states)
         # DXF export
         self.export_dxf_btn.clicked.connect(self.export_dxf)
         # CSV export
@@ -613,15 +641,18 @@ class DepthProfileDockWidget(QDockWidget):
             return
 
         prev_line = self.line_layer_combo.currentData()
+        prev_kp_ref = self.kp_ref_combo.currentData() or self.settings.value("DepthProfile/kp_ref_layer", "")
         prev_rasters = set(self._get_selected_raster_layer_ids())
         prev_contour = self.contour_layer_combo.currentData()
         prev_contour2 = self.contour_layer_combo2.currentData()
         self.line_layer_combo.blockSignals(True)
+        self.kp_ref_combo.blockSignals(True)
         self.raster_layer_list.blockSignals(True)
         self.contour_layer_combo.blockSignals(True)
         self.contour_layer_combo2.blockSignals(True)
         try:
             self.line_layer_combo.clear()
+            self.kp_ref_combo.clear()
             self.raster_layer_list.clear()
             self.contour_layer_combo.clear()
             self.contour_layer_combo2.clear()
@@ -631,6 +662,7 @@ class DepthProfileDockWidget(QDockWidget):
             for layer in QgsProject.instance().mapLayers().values():
                 if isinstance(layer, QgsVectorLayer) and layer.geometryType() == GEOMETRY_LINE:
                     self.line_layer_combo.addItem(layer.name(), layer.id())
+                    self.kp_ref_combo.addItem(layer.name(), layer.id())
                 if isinstance(layer, QgsRasterLayer):
                     item = QListWidgetItem(layer.name())
                     item.setData(Qt.ItemDataRole.UserRole, layer.id())
@@ -642,6 +674,7 @@ class DepthProfileDockWidget(QDockWidget):
                     self.contour_layer_combo2.addItem(layer.name(), layer.id())
         finally:
             self.line_layer_combo.blockSignals(False)
+            self.kp_ref_combo.blockSignals(False)
             self.raster_layer_list.blockSignals(False)
             self.contour_layer_combo.blockSignals(False)
             self.contour_layer_combo2.blockSignals(False)
@@ -650,6 +683,10 @@ class DepthProfileDockWidget(QDockWidget):
             idx = self.line_layer_combo.findData(prev_line)
             if idx != -1:
                 self.line_layer_combo.setCurrentIndex(idx)
+        if prev_kp_ref:
+            idx = self.kp_ref_combo.findData(prev_kp_ref)
+            if idx != -1:
+                self.kp_ref_combo.setCurrentIndex(idx)
         # If nothing selected, default to first raster (previous behavior: single selection)
         if not self._get_selected_raster_layer_ids() and self.raster_layer_list.count() > 0:
             try:
@@ -734,6 +771,9 @@ class DepthProfileDockWidget(QDockWidget):
             self.variable_combo.setEnabled(not dual)
         if getattr(self, 'slope_unit_combo', None):
             self.slope_unit_combo.setEnabled(dual)
+        route_kp = self.kp_axis_combo.currentData() == "route"
+        self.kp_ref_combo.setEnabled(route_kp)
+        self.kp_ref_selected_chk.setEnabled(route_kp)
         # Drawn line usage controls & UX
         want_drawn = self.use_drawn_chk.isChecked()
         has_drawn = bool(self.temp_drawn_points)
@@ -1099,6 +1139,85 @@ class DepthProfileDockWidget(QDockWidget):
             return list(line_layer.getSelectedFeatures(request))
         return list(line_layer.getFeatures(request))
 
+    def _build_route_kp(self):
+        """Nearest-KP mapping of the profile line onto the chosen KP route.
+
+        Returns a :class:`kp_axis.KPCrossings` over *plotted* X in metres
+        (Reverse KP already applied), or None when the axis shows the
+        profile line's own distance or no usable route is selected.
+        """
+        if self.kp_axis_combo.currentData() != "route" or not self.kp_values:
+            return None
+        project = QgsProject.instance()
+        layer = project.mapLayer(self.kp_ref_combo.currentData() or "")
+        if not isinstance(layer, QgsVectorLayer) or layer.geometryType() != GEOMETRY_LINE:
+            self.iface.messageBar().pushMessage(
+                "Depth Profile", "Choose a route line layer for 'Nearest KP on route'.",
+                level=MESSAGE_WARNING, duration=6)
+            return None
+        features = (layer.getSelectedFeatures() if self.kp_ref_selected_chk.isChecked()
+                    else layer.getFeatures())
+        geoms = [QgsGeometry(f.geometry()) for f in features
+                 if f.hasGeometry() and not f.geometry().isEmpty()]
+        if not geoms:
+            self.iface.messageBar().pushMessage(
+                "Depth Profile", "The KP route layer has no (selected) line features.",
+                level=MESSAGE_WARNING, duration=6)
+            return None
+        from .kp_axis import KPCrossings
+        from .kp_geo_utils import RouteFrame
+        # Cached in the profile line's CRS so both share one distance area.
+        frame = RouteFrame.from_source(geoms, self.distance_area, target_crs=self.current_line_crs,
+                                       source_crs=layer.sourceCrs(), project=project)
+        end_m = self.kp_values[-1] * 1000.0
+        reverse = self.reverse_kp_chk.isChecked()
+
+        def route_kp(x_m):
+            point = self._interpolate_point(end_m - x_m if reverse else x_m)
+            if point is None or point.isEmpty():
+                return None
+            hit = frame.kp_at_point(point.asPoint())
+            return hit.kp_km if hit.snapped_xy is not None else None
+
+        samples = 240
+        xs = [end_m * i / samples for i in range(samples + 1)]
+        crossings = KPCrossings(xs, [route_kp(x) for x in xs], refine=route_kp)
+        if not crossings:
+            return None
+        crossings.route_name = layer.name()
+        crossings.route_kp = route_kp
+        return crossings
+
+    def _apply_kp_axes(self):
+        """Round-KP ticks (3 dp) on every plot's X axis.
+
+        Linear mode for the profile line's own KP; mapped mode for the
+        nearest KP on a reference route.
+        """
+        from .kp_axis_item import KPAxisItem
+        crossings = self._route_kp
+        axes = self.figure.get_axes()
+        for i, ax in enumerate(axes):
+            plot_item = getattr(ax, 'plot_item', None)
+            if plot_item is None:
+                continue
+            old = plot_item.getAxis('bottom')
+            if not isinstance(old, KPAxisItem):
+                grid, label, units = old.grid, old.labelText, old.labelUnits
+                axis = KPAxisItem()
+                plot_item.setAxisItems({'bottom': axis})
+                axis.setGrid(grid)
+                if label:
+                    plot_item.setLabel('bottom', label, units=units or None)
+            axis = plot_item.getAxis('bottom')
+            if crossings:
+                axis.set_mapped(crossings, metres_per_unit=1000.0)
+                if i == len(axes) - 1:
+                    plot_item.setLabel('bottom', "Nearest KP on %s (km) — spacing along profile line"
+                                       % crossings.route_name)
+            else:
+                axis.set_linear(1.0)
+
     def _display_kp(self):
         """Plotted X (km) per station: KP, re-numbered from the end if Reverse KP."""
         if self.reverse_kp_chk.isChecked() and self.kp_values:
@@ -1134,6 +1253,14 @@ class DepthProfileDockWidget(QDockWidget):
             self.measure.action.setChecked(False)
         for axis in self.figure.get_axes():
             self._add_context_actions(axis)
+        self._route_kp = None
+        if x_vals:
+            try:
+                self._route_kp = self._build_route_kp()
+            except Exception as e:
+                self.iface.messageBar().pushMessage(
+                    "Depth Profile", f"Route KP labels failed: {e}", level=MESSAGE_WARNING, duration=6)
+        self._apply_kp_axes()
         self._apply_aspect()
         self._update_measure_controls()
         self._update_plot_status(message)
@@ -1245,6 +1372,9 @@ class DepthProfileDockWidget(QDockWidget):
             self.settings.setValue("DepthProfile/auto_limit_samples", self.auto_limit_chk.isChecked())
         if hasattr(self, 'max_samples_spin'):
             self.settings.setValue("DepthProfile/max_samples", self.max_samples_spin.value())
+        self.settings.setValue("DepthProfile/kp_axis_mode", self.kp_axis_combo.currentData())
+        self.settings.setValue("DepthProfile/kp_ref_layer", self.kp_ref_combo.currentData() or "")
+        self.settings.setValue("DepthProfile/kp_ref_selected_only", self.kp_ref_selected_chk.isChecked())
 
     def _plot_depth_series(self, ax, x_vals, single_label='Depth (m)'):
         """Draw the depth curve(s) on ax.
@@ -2402,7 +2532,12 @@ class DepthProfileDockWidget(QDockWidget):
         slope_p = self.slope_pct[idx] if idx < len(self.slope_pct) else None
         side_d = self.side_slope_deg[idx] if (self.side_slope_deg and idx < len(self.side_slope_deg)) else None
         side_p = self.side_slope_pct[idx] if (self.side_slope_pct and idx < len(self.side_slope_pct)) else None
-        lines = [f"KP: {self._plot_x[idx]:.3f}"]
+        route_kp = self._route_kp.route_kp(self._plot_x[idx] * 1000.0) if self._route_kp else None
+        if self._route_kp:
+            lines = [f"Route KP: {route_kp:.3f}" if route_kp is not None else "Route KP: —",
+                     f"Along line: {self._plot_x[idx]:.3f} km"]
+        else:
+            lines = [f"KP: {self._plot_x[idx]:.3f}"]
         if depth is not None: lines.append(f"Depth: {depth:.2f}")
         if slope_d is not None: lines.append(f"Slope°: {slope_d:.2f}")
         if slope_p is not None: lines.append(f"Slope%: {slope_p:.2f}")
@@ -2516,6 +2651,7 @@ class DepthProfileDockWidget(QDockWidget):
             except Exception: pass
         self.vertical_line = None
         self.vertical_line2 = None
+        self._route_kp = None
         self.kp_values = []
         self.depth_values = []
         self.depth_source_ids = []

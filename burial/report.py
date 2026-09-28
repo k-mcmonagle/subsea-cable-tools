@@ -265,7 +265,15 @@ def build_report_html(plan: Dict,
                       bas_rows: Optional[Sequence[Dict]] = None,
                       bas_columns: Optional[Sequence[Dict]] = None) -> str:
     """Assemble the full report; pure formatting, no QGIS access."""
-    method = schema.normalise_method(plan.get("method") or "")
+    # Sections without their own tool use the plan default tool's type.
+    method = tools_mod.plan_label_method(plan, tools or [])
+    plan_methods = []
+    for section in sections:
+        if section.get("kind") == schema.SECTION_BURIAL:
+            m = ev.section_method(section, method)
+            if m not in plan_methods:
+                plan_methods.append(m)
+    event_label_map = ev.event_labels(list(events), list(sections), method)
     status = plan.get("status") or ""
     now = now_utc or schema.utc_now_iso()
     scope_start = float(plan.get("scope_start_kp") or 0.0)
@@ -296,7 +304,8 @@ def build_report_html(plan: Dict,
     default_tool_text = tools_mod.tool_display(
         tools or [], default_tool_id, default_config_id)
     meta = [
-        ("Method", schema.METHOD_LABELS.get(method, method)),
+        ("Tools in plan", ", ".join(schema.METHOD_LABELS.get(m, m)
+                                    for m in (plan_methods or [method]))),
         ("Default burial tool", default_tool_text or "—"),
         ("RPL", f"{plan.get('rpl_name') or '—'}"
                 + (f" ({plan.get('rpl_revision')})" if plan.get("rpl_revision") else "")),
@@ -490,7 +499,7 @@ def build_report_html(plan: Dict,
     parts.append("<h2>Sections</h2>")
     section_refs = schema.section_refs(
         sections, int(plan.get("direction") or 1), method)
-    parts.append(f"<p class='muted'>{_esc(schema.section_ref_legend(method))}"
+    parts.append(f"<p class='muted'>{_esc(schema.section_ref_legend(method, sections))}"
                  "</p>")
     section_rows = []
     for section in sections:
@@ -498,7 +507,7 @@ def build_report_html(plan: Dict,
         section_rows.append((
             _esc(section_refs.get(str(section.get("section_id") or ""), "")),
             f"<span class='kind-{_esc(kind)}'>"
-            f"{_esc(section_kind_label(kind, method))}</span>",
+            f"{_esc(section_kind_label(kind, ev.section_method(section, method)))}</span>",
             _kp(section.get("start_kp")), _kp(section.get("end_kp")),
             _num(section.get("length_km"), 3),
             _esc(section.get("state")),
@@ -522,7 +531,8 @@ def build_report_html(plan: Dict,
     for event in events:
         event_rows.append((
             str(int(event.get("seq") or 0)),
-            ev.event_label(event.get("event_type") or "", method),
+            event_label_map.get(str(event.get("event_id") or ""))
+            or ev.event_label(event.get("event_type") or "", method),
             _kp(event.get("kp")),
             _num(event.get("lat"), 7), _num(event.get("lon"), 7),
             _num(event.get("depth_m"), 1),

@@ -3,34 +3,31 @@ from __future__ import annotations
 import math
 
 import pyqtgraph as pg
-from qgis.PyQt.QtCore import QSettings, QTimer, Qt, pyqtSignal
+from qgis.PyQt.QtCore import QEvent, QSettings, QTimer, Qt, pyqtSignal
 from qgis.PyQt.QtWidgets import (QCheckBox, QDialog, QHBoxLayout, QLabel,
     QVBoxLayout, QPushButton, QComboBox, QDoubleSpinBox, QFileDialog, QMessageBox, QWidget)
+from ..kp_axis import KPCrossings, format_kp
+from ..kp_axis_item import KPAxisItem
 from ..qgis_compat import WINDOW_HINT_CLOSE, WINDOW_HINT_TITLE, WINDOW_TYPE_TOOL
-from ..slope_utils import is_finite
+from ..slope_utils import interpolate_covered, is_finite
 from .kp_profile_math import merged_contour_crossings, profile_slope_series
 from .profile_measure_controller import HINT, ProfileMeasureController
 from .profile_measurements import UNITS, write_profile_csv
 
 _COLORS = ['#1565c0', '#c05a10', '#238443', '#8e44ad', '#b22222']
-
-
-class ProfileAxis(pg.AxisItem):
-    """KP labels retain physical profile-distance spacing and measurements."""
-    def __init__(self, window):
-        self.window = window
-        super().__init__(orientation='bottom')
-
-    def tickStrings(self, values, scale, spacing):
-        window = self.window
-        if window.kp_check.isChecked():
-            kps = [window._kp_at_distance(v / UNITS[window.x_units.currentText()]) for v in values]
-            return ['' if kp is None else '%.4f' % kp for kp in kps]
-        return super().tickStrings(values, scale, spacing)
+# Nearest-KP samples along the range line; tick positions are then polished
+# against the route itself, so labels are exact rather than interpolated.
+_KP_SAMPLES = 160
+_CURSOR_PEN = pg.mkPen('#d81b60', width=1, style=Qt.PenStyle.DashLine)
+_CURSOR_HINT = 'Hover the plot to mark the position on the map.'
 
 
 class KPDepthProfileWindow(QDialog):
     frozenChanged = pyqtSignal(bool)
+    # Plot cursor position on the range line (project-CRS QgsPointXY), or
+    # None when the cursor leaves the plots. The map tool mirrors it with a
+    # marker so plot and map stay aligned.
+    cursorMoved = pyqtSignal(object)
 
     def __init__(self, parent=None, unit='m'):
         super().__init__(parent)
@@ -42,6 +39,8 @@ class KPDepthProfileWindow(QDialog):
         self._pending = self._sampler = self._distance_area = None
         self._profile = None
         self._route_frame = None
+        self._kp_crossings = None
+        self._cursor_m = None
         self._series = []
         self._settings = QSettings('SubseaCableTools', 'KPMouseTool')
         self._timer = QTimer(self); self._timer.setSingleShot(True)
@@ -62,7 +61,10 @@ class KPDepthProfileWindow(QDialog):
         self.x_units = QComboBox(); self.x_units.addItems(list(UNITS)); self.x_units.setCurrentText('m')
         self.z_units = QComboBox(); self.z_units.addItems(['m', 'ft']); row.addWidget(QLabel('Horizontal:')); row.addWidget(self.x_units)
         self.kp_check = QCheckBox('Route KP labels'); self.kp_check.setEnabled(False)
-        self.kp_check.setToolTip('Nearest route KP in km at each tick. Spacing and X measurements remain distance along the range line; cross-route lines can repeat KPs.')
+        self.kp_check.setChecked(self._settings.value('profileRouteKpLabels', False, type=bool))
+        self.kp_check.setToolTip("Ticks at round route KPs (…0.100, 0.250, 0.500, 1.000…) placed where the range "
+                                 "line's nearest route KP crosses them, labelled to 3 dp. Spacing and X measurements "
+                                 "remain distance along the range line; a line across the route can revisit KPs.")
         row.addWidget(self.kp_check)
         row.addWidget(QLabel('Vertical:')); row.addWidget(self.z_units)
         self.invert_check = QCheckBox('Deeper downward'); self.invert_check.setChecked(True)
@@ -74,7 +76,12 @@ class KPDepthProfileWindow(QDialog):
         row.addWidget(self.scale_check)
         self.plot_container = QWidget(); plots = QVBoxLayout(self.plot_container); plots.setContentsMargins(0,0,0,0)
         layout.addWidget(self.plot_container, 1)
-        self.depth_widget = pg.PlotWidget(background='w', axisItems={'bottom': ProfileAxis(self)}); self.slope_widget = pg.PlotWidget(background='w', axisItems={'bottom': ProfileAxis(self)})
+        self.cursor_label = QLabel(_CURSOR_HINT)
+        self.cursor_label.setStyleSheet('color: #555;')
+        layout.addWidget(self.cursor_label)
+        self.depth_axis, self.slope_axis = KPAxisItem(), KPAxisItem()
+        self.depth_widget = pg.PlotWidget(background='w', axisItems={'bottom': self.depth_axis})
+        self.slope_widget = pg.PlotWidget(background='w', axisItems={'bottom': self.slope_axis})
         plots.addWidget(self.depth_widget, 3); plots.addWidget(self.slope_widget, 2)
         self.depth_item = self.depth_widget.getPlotItem(); self.slope_item = self.slope_widget.getPlotItem()
         self.slope_widget.setXLink(self.depth_widget)
@@ -83,6 +90,15 @@ class KPDepthProfileWindow(QDialog):
             item.getAxis('bottom').enableAutoSIPrefix(False)
             item.getAxis('left').enableAutoSIPrefix(False)
         self._legend = self.depth_item.addLegend()
+        # Synchronised cursor: one dashed line per plot, mirrored on the map.
+        self._cursor_lines = []
+        for _item in (self.depth_item, self.slope_item):
+            line = pg.InfiniteLine(angle=90, movable=False, pen=_CURSOR_PEN)
+            line.setZValue(50); line.hide()
+            self._cursor_lines.append(line)
+        for widget in (self.depth_widget, self.slope_widget):
+            widget.scene().sigMouseMoved.connect(self._on_plot_hover)
+            widget.installEventFilter(self)
         self.measure = ProfileMeasureController(
             self, plot_factors=lambda: (UNITS[self.x_units.currentText()], UNITS[self.z_units.currentText()]),
             text_units=lambda: (self.x_units.currentText(), self.z_units.currentText()),
@@ -111,6 +127,7 @@ class KPDepthProfileWindow(QDialog):
         for signal in (self.x_units.currentTextChanged, self.z_units.currentTextChanged,
                        self.invert_check.toggled, self.shade_check.toggled, self.kp_check.toggled, self.scale_check.toggled):
             signal.connect(self._redraw)
+        self.kp_check.toggled.connect(lambda on: self._settings.setValue('profileRouteKpLabels', bool(on)))
         from qgis.PyQt.QtGui import QKeySequence
         try:
             from qgis.PyQt.QtGui import QShortcut
@@ -127,16 +144,39 @@ class KPDepthProfileWindow(QDialog):
         self._route_frame = route_frame
         self.kp_check.setEnabled(route_frame is not None)
 
-    def _kp_at_distance(self, distance_m):
+    def point_at_distance(self, distance_m):
+        """Project-CRS point ``distance_m`` along the current range line.
+
+        Same linear parameterisation the depth sampler uses, so the map
+        marker sits exactly on the sampled station.
+        """
         profile = self._profile or {}
         length = profile.get('length_m', 0)
         endpoints = profile.get('endpoints')
-        if self._route_frame is None or not endpoints or length <= 0 or not 0 <= distance_m <= length:
+        if not endpoints or length <= 0 or not 0 <= distance_m <= length:
             return None
         from qgis.core import QgsPointXY
-        a,b = endpoints; t = distance_m / length
-        hit = self._route_frame.kp_at_point(QgsPointXY(a[0]+t*(b[0]-a[0]), a[1]+t*(b[1]-a[1])))
+        a, b = endpoints; t = distance_m / length
+        return QgsPointXY(a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]))
+
+    def _kp_at_distance(self, distance_m):
+        if self._route_frame is None:
+            return None
+        point = self.point_at_distance(distance_m)
+        if point is None:
+            return None
+        hit = self._route_frame.kp_at_point(point)
         return hit.kp_km if hit.snapped_xy is not None else None
+
+    def _crossings(self):
+        """Nearest-KP samples along the range line (built on first use)."""
+        if self._kp_crossings is None and self._route_frame is not None and self._profile:
+            length = self._profile.get('length_m', 0)
+            if length > 0:
+                xs = [length * i / _KP_SAMPLES for i in range(_KP_SAMPLES + 1)]
+                self._kp_crossings = KPCrossings(xs, [self._kp_at_distance(x) for x in xs],
+                                                 refine=self._kp_at_distance)
+        return self._kp_crossings
 
     def schedule(self, origin, target):
         if self.frozen or self.user_closed:
@@ -167,10 +207,12 @@ class KPDepthProfileWindow(QDialog):
         try:
             self._profile = self._sampler.profile(origin, target, self._distance_area)
             self._profile['endpoints'] = [(origin.x(), origin.y()), (target.x(), target.y())]
+            self._kp_crossings = None
             self.measure.reset()
             self._redraw()
         except Exception as exc:
             self._profile = None
+            self._kp_crossings = None
             self._redraw()
             self.status_label.setText('Depth sampling failed: ' + str(exc))
 
@@ -181,16 +223,23 @@ class KPDepthProfileWindow(QDialog):
 
     def _redraw(self, *_):
         self.depth_item.clear(); self.slope_item.clear(); self._legend.clear()
-        for item in (self.depth_item, self.slope_item):
-            axis = item.getAxis("bottom"); axis.picture = None; axis.update()
+        for item, line in zip((self.depth_item, self.slope_item), self._cursor_lines):
+            item.addItem(line, ignoreBounds=True)
         self._series = []
         xf, zf = UNITS[self.x_units.currentText()], UNITS[self.z_units.currentText()]
+        crossings = self._crossings() if self.kp_check.isChecked() else None
+        for axis in (self.depth_axis, self.slope_axis):
+            if crossings:
+                axis.set_mapped(crossings, metres_per_unit=1.0 / xf)
+            else:
+                axis.set_plain()
         self.depth_item.setLabel('left', 'Depth, positive down', units=self.z_units.currentText())
         self.depth_item.vb.invertY(self.invert_check.isChecked())
         self.depth_item.vb.setAspectLocked(self.scale_check.isChecked(), ratio=zf/xf)
         self.slope_item.setLabel('left', 'Slope (+ = shoaling)', units='°')
         self.slope_item.setLabel('bottom', 'Nearest route KP (km) — spacing along range line' if self.kp_check.isChecked() else 'Distance from origin', units=None if self.kp_check.isChecked() else self.x_units.currentText())
         if not self._profile:
+            self.hide_cursor()
             return
         profile = dict(self._profile)
         profile['rasters'] = [dict(s) for s in profile.get('rasters', [])]
@@ -225,7 +274,71 @@ class KPDepthProfileWindow(QDialog):
         kwargs = {'fillLevel':0, 'brush':pg.mkBrush(90, 100, 120, 40)} if self.shade_check.isChecked() else {}
         self.slope_item.plot(sx, sy, pen=pg.mkPen('#444444', width=2), connect='finite', antialias=True, **kwargs)
         self.measure.set_series(self._series)
+        if self._cursor_m is not None:
+            # Units or data changed under a parked cursor: redraw it in place.
+            self.show_cursor_at_distance(self._cursor_m, emit=False)
         self._update_status()
+
+    # ------------------------------------------------------------ cursor sync
+    def _on_plot_hover(self, scene_pos):
+        for item in (self.depth_item, self.slope_item):
+            if item.vb.sceneBoundingRect().contains(scene_pos):
+                x = item.vb.mapSceneToView(scene_pos).x()
+                self.show_cursor_at_distance(x / UNITS[self.x_units.currentText()])
+                return
+        self.hide_cursor()
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.Leave and obj in (self.depth_widget, self.slope_widget):
+            self.hide_cursor()
+        return super().eventFilter(obj, event)
+
+    def show_cursor_at_distance(self, distance_m, emit=True):
+        """Show the plot cursor ``distance_m`` along the range line.
+
+        Called on plot hover (``emit`` → the map marker follows) and by the
+        map tool while the pointer tracks a frozen range line on the map.
+        """
+        length = (self._profile or {}).get('length_m', 0)
+        if not self._profile or length <= 0 or distance_m is None \
+                or not -1e-9 <= distance_m <= length + 1e-9:
+            self.hide_cursor(emit)
+            return
+        distance_m = min(max(distance_m, 0.0), length)
+        self._cursor_m = distance_m
+        x = distance_m * UNITS[self.x_units.currentText()]
+        for line in self._cursor_lines:
+            line.setValue(x); line.show()
+        self.cursor_label.setText(self._cursor_text(distance_m))
+        if emit:
+            self.cursorMoved.emit(self.point_at_distance(distance_m))
+
+    def hide_cursor(self, emit=True):
+        was_shown = self._cursor_m is not None
+        self._cursor_m = None
+        for line in self._cursor_lines:
+            line.hide()
+        self.cursor_label.setText(_CURSOR_HINT)
+        if emit and was_shown:
+            self.cursorMoved.emit(None)
+
+    def _cursor_text(self, distance_m):
+        xu, zu = self.x_units.currentText(), self.z_units.currentText()
+        xf, zf = UNITS[xu], UNITS[zu]
+        parts = ['Range %.2f %s' % (distance_m * xf, xu)]
+        kp = self._kp_at_distance(distance_m)
+        if kp is not None:
+            parts.append('KP ' + format_kp(kp))
+        for series in self._series:
+            z = interpolate_covered(series['x'], series['y'], distance_m)
+            if is_finite(z):
+                name = series['name'] if len(self._series) > 1 else 'Depth'
+                parts.append('%s %.2f %s' % (name, z * zf, zu))
+        if self._slopes_x:
+            slope = interpolate_covered(self._slopes_x, self._slopes, distance_m)
+            if is_finite(slope):
+                parts.append('Slope %.2f°' % slope)
+        return '  |  '.join(parts)
 
     def _measure_mode(self, checked):
         if checked:
@@ -285,7 +398,8 @@ class KPDepthProfileWindow(QDialog):
         else: super().keyPressEvent(event)
 
     def clear_profile(self):
-        self._timer.stop(); self._pending = None; self._profile = None
+        self.hide_cursor()
+        self._timer.stop(); self._pending = None; self._profile = None; self._kp_crossings = None
         self._working_profile = None; self._slopes_x = []; self._slopes = []
         self.clear_measurements(); self.set_frozen(False); self._redraw()
 
@@ -295,6 +409,7 @@ class KPDepthProfileWindow(QDialog):
         super().showEvent(event)
 
     def hideEvent(self,event):
+        self.hide_cursor()
         self._timer.stop(); self._pending = None
         self._settings.setValue('profileWindowGeometry',self.saveGeometry())
         super().hideEvent(event)

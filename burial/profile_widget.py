@@ -1569,10 +1569,12 @@ class BurialProfileWidget(QWidget):
         self._show_all_insufficient()
         self._apply_overlay_visibility()
 
-    def set_events(self, events: List[Dict], method: str, editable: bool = False) -> None:
+    def set_events(self, events: List[Dict], method: str, editable: bool = False,
+                   labels: Optional[Dict[str, str]] = None) -> None:
         """Event markers: one painted item normally; draggable lines in
         edit mode (the profile drag toggle), where per-event handles are
-        the point."""
+        the point. ``labels`` ({event_id: text}) gives per-section tool
+        labels (PLDN/PLUP, Start/End PLB); ``method`` is the fallback."""
         item = self.plot.getPlotItem()
         for line in self._event_lines:
             item.removeItem(line)
@@ -1595,7 +1597,7 @@ class BurialProfileWidget(QWidget):
                 color = QColor("#1b7f3b")
             style = _PEN_STYLE.SolidLine if status == schema.EVENT_STATUS_CONFIRMED \
                 else _PEN_STYLE.DashLine
-            label = ev.event_label(event.get("event_type") or "", method)
+            label = (labels or {}).get(str(event.get("event_id") or ""))                 or ev.event_label(event.get("event_type") or "", method)
             marker = "▼" if is_start else "▲"
             text = f"{marker} {label} {schema.format_kp(kp)}"
             pen = pg.mkPen(color, width=2, style=style)

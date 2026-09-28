@@ -40,11 +40,14 @@ def _section(sid, kind, start, end):
 def test_labels() -> bool:
     ok = ev.event_label(START, schema.METHOD_PLOUGH) == "PLDN"
     ok = ok and ev.event_label(END, schema.METHOD_PLOUGH) == "PLUP"
-    ok = ok and ev.event_label(START, schema.METHOD_TRENCHER) == "TRENCH_START"
-    ok = ok and ev.event_label(END, schema.METHOD_TRENCHER) == "TRENCH_END"
+    # Every post-lay burial tool reads Start/End PLB (kept deliberately simple).
+    ok = ok and ev.event_label(START, schema.METHOD_TRENCHER) == "Start PLB"
+    ok = ok and ev.event_label(END, schema.METHOD_TRENCHER) == "End PLB"
+    ok = ok and ev.event_label(START, schema.METHOD_MFE) == "Start PLB"
+    ok = ok and ev.event_label(END, schema.METHOD_INSPECTION) == "End Inspection"
     # Legacy rov_jet plans resolve through the alias to the trencher labels.
-    ok = ok and ev.event_label(START, schema.METHOD_ROV_JET) == "TRENCH_START"
-    ok = ok and ev.event_label(END, schema.METHOD_ROV_JET) == "TRENCH_END"
+    ok = ok and ev.event_label(START, schema.METHOD_ROV_JET) == "Start PLB"
+    ok = ok and ev.event_label(END, schema.METHOD_ROV_JET) == "End PLB"
     return _result("per-method event labels", ok)
 
 
@@ -582,9 +585,46 @@ def test_merge_span_moves_and_creates_edge_events() -> bool:
                    "locked aborts, direction -1", ok)
 
 
+def test_tool_transitions() -> bool:
+    """Plough → PLB → Plough with no skips: END + START share each KP."""
+    events = [_event("s1", 0.0, START), _event("t1s", 4.0, START), _event("t1e", 4.0, END),
+              _event("t2e", 6.0, END), _event("t2s", 6.0, START), _event("e3", 9.0, END)]
+    ordered = ev.sort_events([dict(e) for e in events], 1)
+    order = [e["event_id"] for e in ordered]
+    ok = order == ["s1", "t1e", "t1s", "t2e", "t2s", "e3"]
+    ok = ok and ev.validate_events(events, 0.0, 10.0, 1, "plough").ok
+    # Decreasing-KP plans: the transition END still sorts before its START.
+    rev = [_event("a", 9.0, START), _event("b", 6.0, END), _event("c", 6.0, START),
+           _event("d", 2.0, END)]
+    ok = ok and [e["event_id"] for e in ev.sort_events(rev, -1)] == ["a", "b", "c", "d"]
+    ok = ok and ev.validate_events(rev, 0.0, 10.0, -1, "plough").ok
+    # A move carries the transition partner along (no gap, no overlap).
+    ok = ok and ev.transition_partner(events, "t1s")["event_id"] == "t1e"
+    ok = ok and ev.transition_partner(events, "s1") is None
+    ok = ok and ev.check_move(events, "t1s", 5.0, 0.0, 10.0, 1, "plough") is None
+    ok = ok and ev.check_move(events, "t1s", 6.5, 0.0, 10.0, 1, "plough") is not None
+    # Labels come from each section's tool: PLUP then Start PLB at KP 4.
+    sections = [
+        {"section_id": "a", "kind": schema.SECTION_BURIAL, "method": "",
+         "start_event_id": "s1", "end_event_id": "t1e"},
+        {"section_id": "b", "kind": schema.SECTION_BURIAL, "method": schema.METHOD_TRENCHER,
+         "start_event_id": "t1s", "end_event_id": "t2e"},
+        {"section_id": "c", "kind": schema.SECTION_BURIAL, "method": schema.METHOD_PLOUGH,
+         "start_event_id": "t2s", "end_event_id": "e3"}]
+    labels = ev.event_labels(events, sections, schema.METHOD_PLOUGH)
+    ok = ok and [labels[i] for i in order] == ["PLDN", "PLUP", "Start PLB", "End PLB", "PLDN", "PLUP"]
+    # Move notes coalesce even when the label changed between moves.
+    note = ev.upsert_move_note("", "PLUP", 4.0, 4.2)
+    note = ev.upsert_move_note(note, "Start PLB", 4.2, 4.5)
+    ok = ok and note.count("moved KP") == 1 and "4.000→4.500" in note
+    return _result("tool transitions: order, validation, partner moves, per-tool labels, notes",
+                   ok, f"{order} {labels}")
+
+
 def run_all() -> list:
     return [
         test_labels(),
+        test_tool_transitions(),
         test_merge_span_explicit_target(),
         test_merge_span_moves_and_creates_edge_events(),
         test_ordering_and_seq(),

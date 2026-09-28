@@ -67,8 +67,12 @@ def metadata_lines(plan: Dict, generation_id: str = "") -> List[str]:
     ]
 
 
-def events_csv(plan: Dict, events: Sequence[Dict], generation_id: str = "") -> str:
-    method = schema.normalise_method(plan.get("method") or "")
+def events_csv(plan: Dict, events: Sequence[Dict], generation_id: str = "",
+               sections: Sequence[Dict] = (), tools: Sequence[Dict] = ()) -> str:
+    """Events CSV; ``label`` follows each event's section tool (PLDN/PLUP for
+    ploughs, Start/End PLB for trenchers and MFEs) when ``sections`` are given."""
+    method = tools_mod.plan_label_method(plan, tools)
+    labels = ev.event_labels(list(events), list(sections), method)
     buf = io.StringIO()
     for line in metadata_lines(plan, generation_id):
         buf.write(line + "\r\n")
@@ -78,7 +82,8 @@ def events_csv(plan: Dict, events: Sequence[Dict], generation_id: str = "") -> s
         writer.writerow([
             int(event.get("seq") or 0),
             event.get("event_type") or "",
-            ev.event_label(event.get("event_type") or "", method),
+            labels.get(str(event.get("event_id") or ""))
+            or ev.event_label(event.get("event_type") or "", method),
             schema.format_kp(event.get("kp")),
             _fmt(event.get("lat"), 7),
             _fmt(event.get("lon"), 7),
@@ -163,7 +168,7 @@ def sections_csv(plan: Dict, sections: Sequence[Dict], generation_id: str = "",
     writer = csv.writer(buf, lineterminator="\r\n")
     writer.writerow(SECTION_COLUMNS)
     refs = schema.section_refs(sections, int(plan.get("direction") or 1),
-                               plan.get("method") or "")
+                               tools_mod.plan_label_method(plan, tools))
     target_default = target_depth.plan_default(plan)
     target_ranges = target_depth.plan_ranges(plan)
     for section in sections:
@@ -298,11 +303,20 @@ _TYPE_ALIASES = {
     "trench_stop": schema.EVENT_BURIAL_END,
     "start": schema.EVENT_BURIAL_START,
     "end": schema.EVENT_BURIAL_END,
+    # Post-lay burial / inspection vocabulary (multi-tool plans).
+    "start plb": schema.EVENT_BURIAL_START,
+    "end plb": schema.EVENT_BURIAL_END,
+    "start_plb": schema.EVENT_BURIAL_START,
+    "end_plb": schema.EVENT_BURIAL_END,
+    "plb start": schema.EVENT_BURIAL_START,
+    "plb end": schema.EVENT_BURIAL_END,
+    "start inspection": schema.EVENT_BURIAL_START,
+    "end inspection": schema.EVENT_BURIAL_END,
 }
 
 
 def normalise_event_type(text: str) -> Optional[str]:
-    return _TYPE_ALIASES.get((text or "").strip().lower())
+    return _TYPE_ALIASES.get(" ".join((text or "").strip().lower().split()))
 
 
 def parse_events_csv(text: str, client_proposal: bool = False) -> List[Dict]:
@@ -370,7 +384,7 @@ def parse_events_list_csv(text: str, client_proposal: bool = False) -> List[Dict
         note = row[2] if len(row) > 2 else ""
         if kp is None or event_type is None:
             raise ImportError_(f"Row {n}: expected numeric KP and an event type "
-                               "(PLDN/PLUP, JET_START/JET_STOP, "
+                               "(PLDN/PLUP, Start PLB/End PLB, JET_START/JET_STOP, "
                                "TRENCH_START/TRENCH_END, START/END).")
         out.append(_event(kp, event_type, source, note))
     if not out:

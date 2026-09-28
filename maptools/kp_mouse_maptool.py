@@ -173,6 +173,13 @@ class KPMouseMapTool(QgsMapTool):
         self.rangeBearingOriginMarker.setIconSize(10)
         self.rangeBearingOriginMarker.setPenWidth(2)
         self.rangeBearingOriginMarker.hide()
+        # Mirrors the depth-profile plot cursor on the range line.
+        self.profileCursorMarker = QgsVertexMarker(self.canvas)
+        self.profileCursorMarker.setColor(QColor(216, 27, 96))
+        self.profileCursorMarker.setIconType(QgsVertexMarker.ICON_CIRCLE)
+        self.profileCursorMarker.setIconSize(12)
+        self.profileCursorMarker.setPenWidth(3)
+        self.profileCursorMarker.hide()
 
     def set_layer(self, layer):
         """Set the layer and recalculate geometries for the tool."""
@@ -393,6 +400,8 @@ class KPMouseMapTool(QgsMapTool):
         elif self.range_bearing_origin is None:
             # Clear any existing range/bearing graphics if user cleared origin
             self._clear_range_bearing_graphics()
+        if profile_frozen and not self._track_frozen_range_line(mousePoint, window):
+            window.hide_cursor()
 
         # Show the standard, transient tooltip immediately (with augmented message if any)
         QToolTip.showText(self.last_global_pos, self.last_message, self.canvas)
@@ -1064,6 +1073,7 @@ class KPMouseMapTool(QgsMapTool):
             from ..kp_geo_utils import RouteFrame
             frame = RouteFrame.from_source([QgsGeometry(g) for g in self.features_geoms], self.distanceArea)
             window.configure(sampler, self.distanceArea, frame)
+            window.cursorMoved.connect(self._on_profile_cursor)
             self.depth_profile_window = window
         return self.depth_profile_window
 
@@ -1108,6 +1118,43 @@ class KPMouseMapTool(QgsMapTool):
                 self.depth_profile_window.hide()
             except Exception:
                 pass
+
+    def _on_profile_cursor(self, point):
+        """Mirror the profile plot cursor with a marker on the range line."""
+        marker = self.profileCursorMarker
+        if marker is None or _sip_isdeleted(marker):
+            return
+        if point is None:
+            marker.hide()
+            return
+        marker.setCenter(QgsPointXY(point))
+        marker.show()
+
+    def _track_frozen_range_line(self, mouse_point: QgsPointXY, window) -> bool:
+        """Drive the frozen profile's cursor from the map pointer.
+
+        When the pointer is within a few pixels of the frozen range line,
+        its projection onto the line becomes the plot cursor (and marker).
+        Returns True while tracking.
+        """
+        endpoints = (window._profile or {}).get('endpoints')
+        length = (window._profile or {}).get('length_m', 0)
+        if not endpoints or length <= 0:
+            return False
+        (ax, ay), (bx, by) = endpoints
+        dx, dy = bx - ax, by - ay
+        planar_sq = dx * dx + dy * dy
+        if planar_sq <= 0:
+            return False
+        t = ((mouse_point.x() - ax) * dx + (mouse_point.y() - ay) * dy) / planar_sq
+        if not 0.0 <= t <= 1.0:
+            return False
+        px, py = ax + t * dx, ay + t * dy
+        units_per_px = self.canvas.mapUnitsPerPixel() or 1.0
+        if math.hypot(mouse_point.x() - px, mouse_point.y() - py) / units_per_px > 12.0:
+            return False
+        window.show_cursor_at_distance(t * length)
+        return True
 
     def _update_profile_window(self, mouse_point: QgsPointXY):
         window = self.depth_profile_window
@@ -1392,6 +1439,14 @@ class KPMouseMapTool(QgsMapTool):
         except Exception:
             pass
         self.rangeBearingOriginMarker = None
+        try:
+            marker = getattr(self, 'profileCursorMarker', None)
+            if marker is not None and not _sip_isdeleted(marker):
+                marker.hide()
+                marker.deleteLater()
+        except Exception:
+            pass
+        self.profileCursorMarker = None
         self.range_bearing_origin = None
         if getattr(self, 'depth_profile_window', None) is not None:
             try:

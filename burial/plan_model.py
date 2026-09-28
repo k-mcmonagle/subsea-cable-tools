@@ -53,6 +53,7 @@ _BUILDER_UNDO_ACTIONS = {
     change_log.ACTION_RESOLVE_INSUFFICIENT,
     change_log.ACTION_SET_CONCLUSION,
     change_log.ACTION_EDIT_SECTION,
+    change_log.ACTION_IMPORT,
 }
 
 
@@ -157,6 +158,19 @@ class PlanModel(QObject):
     @property
     def direction(self) -> int:
         return int(self.plan.get("direction") or 1)
+
+    @property
+    def label_method(self) -> str:
+        """Vocabulary for sections without their own tool (plan default tool
+        type, else the plan method). Burial sections with a tool use its type."""
+        return tools.plan_label_method(self.plan, self.tools)
+
+    def event_labels(self) -> Dict[str, str]:
+        """``{event_id: label}`` — PLDN/PLUP, Start/End PLB… per section tool."""
+        return ev.event_labels(self.events, self.sections, self.label_method)
+
+    def section_method(self, section: Dict) -> str:
+        return ev.section_method(section, self.label_method)
 
     def gen_params(self, params_json: Optional[Dict] = None) -> generation.GenParams:
         stored = params_json
@@ -1748,7 +1762,9 @@ class PlanModel(QObject):
                                    new_events: List[Dict], reason: str,
                                    note_specs: Optional[List[Tuple[
                                        float, Callable[[str], str]]]] = None,
-                                   dismiss: Optional[List[Tuple]] = None
+                                   dismiss: Optional[List[Tuple]] = None,
+                                   section_patch: Optional[Callable[
+                                       [List[Dict]], Dict[str, Dict]]] = None
                                    ) -> bool:
         """One logged, store-written event mutation + derived section rebuild.
 
@@ -1771,6 +1787,10 @@ class PlanModel(QObject):
         range keeps its skip/burial state after reopening the plan and
         across later Generate runs, and the change-log entry rolls all of
         it back.
+
+        ``section_patch(new_sections) -> {section_id: updates}`` sets fields
+        on the re-derived sections before they are saved (plan import uses
+        it to stamp per-section tools and notes in the same logged edit).
         """
         before = {
             schema.TABLE_EVENT: [dict(e) for e in self.events],
@@ -1819,6 +1839,12 @@ class PlanModel(QObject):
                     continue
                 if lo - tol <= float(kp) <= hi + tol:
                     section["notes"] = apply_fn(section.get("notes") or "")
+        if section_patch is not None:
+            patches = section_patch(new_sections) or {}
+            for section in new_sections:
+                updates = patches.get(str(section.get("section_id") or ""))
+                if updates:
+                    section.update(self._normalised_section_updates(updates))
 
         if dismiss_intervals:
             if gen_before:
@@ -1961,16 +1987,25 @@ class PlanModel(QObject):
         if message:
             raise ValueError(message)
         old_kp = float(target.get("kp") or 0.0)
-        label = ev.event_label(target.get("event_type") or "", self.method)
+        labels = self.event_labels()
+        label = labels.get(event_id) or ev.event_label(
+            target.get("event_type") or "", self.label_method)
+        # A tool transition (END + START at one KP) moves as one boundary.
+        partner = ev.transition_partner(self.events, event_id)
+        if partner is not None and int(partner.get("locked") or 0):
+            raise ValueError("This boundary is a tool transition and its partner "
+                             "event is locked — unlock it first.")
+        partner_id = partner.get("event_id") if partner is not None else None
         # "moved" is the confirmation dialog's fallback, not a real reason.
         note_reason = "" if reason in ("", "moved") else reason
         moved = []
         for event in self.events:
             copy = dict(event)
-            if copy.get("event_id") == event_id:
+            if copy.get("event_id") and copy.get("event_id") in (event_id, partner_id):
                 copy["kp"] = float(new_kp)
                 copy["notes"] = ev.upsert_move_note(
-                    copy.get("notes") or "", label, old_kp, new_kp,
+                    copy.get("notes") or "",
+                    labels.get(copy.get("event_id")) or label, old_kp, new_kp,
                     note_reason)
                 self._stamp_position(copy)
             moved.append(copy)
@@ -1981,7 +2016,34 @@ class PlanModel(QObject):
                            existing, label, old_kp, new_kp, note_reason))]
         return self._write_events_and_sections(change_log.ACTION_MOVE_EVENT,
                                                event_id, moved, reason,
-                                               note_specs)
+                                               note_specs,
+                                               section_patch=self._tool_patch_by_position())
+
+    def _tool_patch_by_position(self) -> Callable[[List[Dict]], Dict[str, Dict]]:
+        """Keep each burial section's tool across a boundary move.
+
+        Moving a tool transition resizes two sections that each overlap
+        both old ones, where overlap carry-over gives up; the tool of the
+        old burial section containing each new section's midpoint wins.
+        """
+        old = [(float(s.get("start_kp") or 0.0), float(s.get("end_kp") or 0.0),
+                {"tool_id": s.get("tool_id") or "",
+                 "tool_config_id": s.get("tool_config_id") or "",
+                 "method": s.get("method") or ""})
+               for s in self.sections if s.get("kind") == schema.SECTION_BURIAL]
+
+        def patch(sections):
+            out = {}
+            for section in sections:
+                if section.get("kind") != schema.SECTION_BURIAL:
+                    continue
+                mid = (float(section.get("start_kp") or 0.0)
+                       + float(section.get("end_kp") or 0.0)) / 2.0
+                hit = next((fields for lo, hi, fields in old if lo <= mid <= hi), None)
+                if hit is not None and (section.get("tool_id") or "") != hit["tool_id"]:
+                    out[str(section.get("section_id") or "")] = dict(hit)
+            return out
+        return patch
 
     def delete_event(self, event_id: str, reason: str = "") -> bool:
         return self.delete_events([event_id], reason)
@@ -2067,23 +2129,54 @@ class PlanModel(QObject):
             change_log.ACTION_IMPORT, label, candidate,
             "client proposal" if client_proposal else "")
 
+    def import_plan(self, new_events: List[Dict], label: str,
+                    section_patch: Optional[Callable[[List[Dict]], Dict[str, Dict]]] = None,
+                    reason: str = "") -> bool:
+        """Replace the plan's events with ``new_events`` as one undoable import.
+
+        Unlike :meth:`import_events` (which appends), the caller supplies the
+        complete event list — the import wizard builds it for both *replace*
+        and *overlay* modes. ``section_patch`` stamps tools/notes on the
+        derived sections in the same change-log entry.
+        """
+        lo, hi = self._scope_bounds()
+        prepared = []
+        for event in new_events:
+            copy = dict(event)
+            copy["plan_id"] = self.plan_id
+            if copy.get("lat") is None or copy.get("lon") is None:
+                self._stamp_position(copy)
+            prepared.append(copy)
+        result = ev.validate_events(prepared, lo, hi, self.direction, self.method)
+        if result.errors:
+            raise ValueError(result.errors[0])
+        return self._write_events_and_sections(
+            change_log.ACTION_IMPORT, label, prepared, reason,
+            section_patch=section_patch)
+
     # -- section operations --------------------------------------------------
+    def _normalised_section_updates(self, updates: Dict) -> Dict:
+        """Apply the per-section tool invariant to an update dict."""
+        if "tool_id" not in updates:
+            return updates
+        # Model-level invariant for every writer (combo, import, bulk
+        # edit): changing the tool clears a configuration that belonged
+        # to the previous tool and stamps the section method with the
+        # tool's type ("" = inherit the plan default/method).
+        updates = dict(updates)
+        tool = tools.tool_by_id(self.tools, updates.get("tool_id") or "")
+        updates.setdefault("tool_config_id", "")
+        updates["method"] = schema.normalise_method(
+            (tool or {}).get("tool_type") or "")
+        return updates
+
     def update_section(self, section_id: str, updates: Dict,
                        action: str = change_log.ACTION_SET_CONCLUSION) -> bool:
         before_rows = [dict(s) for s in self.sections
                        if s.get("section_id") == section_id]
         if not before_rows:
             return False
-        if "tool_id" in updates:
-            # Model-level invariant for every writer (combo, import, bulk
-            # edit): changing the tool clears a configuration that belonged
-            # to the previous tool and stamps the section method with the
-            # tool's type ("" = inherit the plan default/method).
-            updates = dict(updates)
-            tool = tools.tool_by_id(self.tools, updates.get("tool_id") or "")
-            updates.setdefault("tool_config_id", "")
-            updates["method"] = schema.normalise_method(
-                (tool or {}).get("tool_type") or "")
+        updates = self._normalised_section_updates(updates)
         updated = []
         for section in self.sections:
             copy = dict(section)
@@ -2240,10 +2333,89 @@ class PlanModel(QObject):
         resolve_kind = (generation.RESOLVE_BURIAL
                         if kind == schema.SECTION_BURIAL
                         else generation.RESOLVE_SKIP)
+        patch = None
+        if kind == schema.SECTION_BURIAL:
+            # Merging across a tool transition: the merged section keeps the
+            # tool of the first selected burial section in travel order
+            # (carry-over alone drops it when two parents overlap).
+            burial = sorted((s for s in selected if s.get("kind") == schema.SECTION_BURIAL),
+                            key=lambda s: float(s.get("start_kp") or 0.0),
+                            reverse=self.direction < 0)
+            first = burial[0] if burial else {}
+            keep = {"tool_id": first.get("tool_id") or "",
+                    "tool_config_id": first.get("tool_config_id") or "",
+                    "method": first.get("method") or ""}
+            mid = (span_lo + span_hi) / 2.0
+
+            def patch(sections):
+                return {str(s.get("section_id") or ""): dict(keep) for s in sections
+                        if s.get("kind") == schema.SECTION_BURIAL
+                        and float(s.get("start_kp") or 0.0) <= mid
+                        <= float(s.get("end_kp") or 0.0)}
         return self._write_events_and_sections(
             change_log.ACTION_MERGE_SECTIONS, ",".join(section_ids),
             remaining, reason, note_specs,
-            dismiss=[(a, b, resolve_kind) for a, b in dismissed] or None)
+            dismiss=[(a, b, resolve_kind) for a, b in dismissed] or None,
+            section_patch=patch)
+
+    def set_tool_for_range(self, section_id: str, start_kp: float, end_kp: float,
+                           tool_id: str, tool_config_id: str = "",
+                           reason: str = "") -> bool:
+        """Give part of a burial section another tool (Plough → PLB → Plough).
+
+        Inserts a tool transition (END + START at one KP, no skip) at each
+        end of ``start_kp``–``end_kp`` that lies inside the section, then
+        assigns ``tool_id`` to the middle piece; the outer pieces keep the
+        section's tool. One undoable edit.
+        """
+        section = next((s for s in self.sections
+                        if s.get("section_id") == section_id), None)
+        if section is None:
+            raise ValueError("Section not found.")
+        if section.get("kind") != schema.SECTION_BURIAL:
+            raise ValueError("Only burial sections carry a tool.")
+        s_lo = float(section.get("start_kp") or 0.0)
+        s_hi = float(section.get("end_kp") or 0.0)
+        a, b = sorted((float(start_kp), float(end_kp)))
+        a, b = max(a, s_lo), min(b, s_hi)
+        if b - a < 0.001:
+            raise ValueError("The KP range must lie inside the section and be at "
+                             "least 1 m long.")
+        new_events = [dict(e) for e in self.events]
+        for kp in (a, b):
+            if not s_lo + 0.0005 < kp < s_hi - 0.0005:
+                continue
+            for event_type in (schema.EVENT_BURIAL_END, schema.EVENT_BURIAL_START):
+                event = {
+                    "event_id": schema.new_id(), "plan_id": self.plan_id,
+                    "generation_id": "", "seq": 0, "event_type": event_type,
+                    "kp": round(kp, 6), "end_kp": None, "lat": None, "lon": None,
+                    "depth_m": None, "source": schema.EVENT_SOURCE_MANUAL,
+                    "status": schema.EVENT_STATUS_CANDIDATE, "locked": 0,
+                    "notes": ""}
+                self._stamp_position(event)
+                new_events.append(event)
+        lo, hi = self._scope_bounds()
+        result = ev.validate_events(new_events, lo, hi, self.direction, self.method)
+        if result.errors:
+            raise ValueError(result.errors[0])
+        updates = {"tool_id": tool_id or "", "tool_config_id": tool_config_id or ""}
+        mid = (a + b) / 2.0
+
+        def patch(sections):
+            return {str(s.get("section_id") or ""): dict(updates) for s in sections
+                    if s.get("kind") == schema.SECTION_BURIAL
+                    and float(s.get("start_kp") or 0.0) <= mid
+                    <= float(s.get("end_kp") or 0.0)}
+
+        tool = tools.tool_by_id(self.tools, tool_id or "")
+        text = (f"Tool {tool.get('name') if tool else 'plan default'} set for KP "
+                f"{schema.format_kp(a)}-{schema.format_kp(b)}")
+        audit = ev.audit_note(text, reason)
+        note_specs = [(mid, lambda existing: ev.append_note(existing, audit))]
+        return self._write_events_and_sections(
+            change_log.ACTION_EDIT_SECTION, section_id, new_events, reason,
+            note_specs, section_patch=patch)
 
     def preview_merge_span(self, section_ids: List[str], target_kind: str
                            ) -> ev.SpanMerge:
@@ -2661,7 +2833,8 @@ class PlanModel(QObject):
     def export_events_csv(self) -> str:
         active = self.store.active_generation(self.plan_id) or {}
         return io_csv.events_csv(self.plan, self.events,
-                                 active.get("generation_id") or "")
+                                 active.get("generation_id") or "",
+                                 self.sections, self.tools)
 
     def export_sections_csv(self) -> str:
         active = self.store.active_generation(self.plan_id) or {}

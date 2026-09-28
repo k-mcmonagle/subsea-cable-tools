@@ -278,7 +278,8 @@ class BurialPlannerDock(QDockWidget):
             type=bool)))
         self.profile_drag_toggle.setToolTip(
             "When enabled, unlocked burial start/end lines (PLDN/PLUP, "
-            "TRENCH_START/TRENCH_END…) can be dragged on the profile. "
+            "Start/End PLB…) can be dragged on the profile; a tool "
+            "transition (PLUP / Start PLB at one KP) moves as one. "
             "A confirmation shows the exact KP (editable) with an optional "
             "reason; moves can be undone with Ctrl+Z in Plan Builder.")
         self.profile_drag_toggle.toggled.connect(self._profile_drag_toggled)
@@ -726,13 +727,10 @@ class BurialPlannerDock(QDockWidget):
         name, ok = QInputDialog.getText(self, "New burial plan", "Name:")
         if not ok or not name.strip():
             return
-        labels = [schema.METHOD_LABELS[m] for m in schema.METHODS]
-        label, ok = QInputDialog.getItem(self, "New burial plan", "Method:",
-                                         labels, 0, False)
-        if not ok:
-            return
-        method = schema.METHODS[labels.index(label)]
-        plan_id = self.model.create_plan(name.strip(), method)
+        # Plans are tool-agnostic: each burial section takes its tool (and
+        # labels) from the Tools registry. The stored method is only the
+        # fallback vocabulary for sections without a tool.
+        plan_id = self.model.create_plan(name.strip(), schema.METHOD_PLOUGH)
         if plan_id:
             self.refresh_plans(plan_id)
 
@@ -1326,8 +1324,9 @@ class BurialPlannerDock(QDockWidget):
 
     def _refresh_profile_events(self) -> None:
         self.profile.set_events(
-            self.model.events, self.model.method,
-            editable=self.profile_drag_toggle.isChecked())
+            self.model.events, self.model.label_method,
+            editable=self.profile_drag_toggle.isChecked(),
+            labels=self.model.event_labels())
 
     def _refresh_profile_sections(self) -> None:
         self.profile.set_sections(self.model.sections)

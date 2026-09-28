@@ -75,12 +75,22 @@ METHOD_TRENCHER = "trencher"
 # Legacy id: ROV jet trenching folded into the single Trencher method
 # (schema v7). Kept as a constant so old data/exports keep resolving.
 METHOD_ROV_JET = "rov_jet"
-METHODS: List[str] = [METHOD_PLOUGH, METHOD_TRENCHER]  # enum open by design
+# Post-lay tools and inspection (multi-tool plans). Sections carry their
+# tool's type, so one plan can mix Plough, PLB (trencher / MFE) and
+# Inspection ranges; the plan method is only the default.
+METHOD_MFE = "mfe"
+METHOD_INSPECTION = "inspection"
+METHODS: List[str] = [METHOD_PLOUGH, METHOD_TRENCHER, METHOD_MFE,
+                      METHOD_INSPECTION]  # enum open by design
 
 METHOD_LABELS: Dict[str, str] = {
     METHOD_PLOUGH: "Plough",
-    METHOD_TRENCHER: "Trencher",
+    METHOD_TRENCHER: "Trencher / ROV",
+    METHOD_MFE: "Mass Flow Excavator",
+    METHOD_INSPECTION: "Inspection",
 }
+# Methods that bury in a post-lay pass (labelled Start PLB / End PLB).
+PLB_METHODS = (METHOD_TRENCHER, METHOD_MFE)
 
 # Method ids seen in older data / the Workbench Assessment tool, mapped to
 # the Burial Planner vocabulary. Workbench DEFAULT_ASSESSMENT_METHODS uses
@@ -90,6 +100,10 @@ METHOD_LABELS: Dict[str, str] = {
 _METHOD_ALIASES: Dict[str, str] = {
     "jet": METHOD_TRENCHER,
     METHOD_ROV_JET: METHOD_TRENCHER,
+    "rov": METHOD_TRENCHER,
+    "plb": METHOD_TRENCHER,
+    "mass_flow": METHOD_MFE,
+    "mass flow excavator": METHOD_MFE,
 }
 
 
@@ -248,9 +262,19 @@ METHOD_EVENT_LABELS: Dict[str, Dict[str, str]] = {
         EVENT_BURIAL_START: "PLDN",
         EVENT_BURIAL_END: "PLUP",
     },
+    # Every post-lay burial tool shares the PLB vocabulary (kept simple on
+    # purpose: PLDN/PLUP for ploughs, Start/End PLB for everything else).
     METHOD_TRENCHER: {
-        EVENT_BURIAL_START: "TRENCH_START",
-        EVENT_BURIAL_END: "TRENCH_END",
+        EVENT_BURIAL_START: "Start PLB",
+        EVENT_BURIAL_END: "End PLB",
+    },
+    METHOD_MFE: {
+        EVENT_BURIAL_START: "Start PLB",
+        EVENT_BURIAL_END: "End PLB",
+    },
+    METHOD_INSPECTION: {
+        EVENT_BURIAL_START: "Start Inspection",
+        EVENT_BURIAL_END: "End Inspection",
     },
 }
 
@@ -340,7 +364,17 @@ _SECTION_REF_CODES_BY_METHOD: Dict[str, Dict[str, str]] = {
         SECTION_INSUFFICIENT: "II",
     },
     METHOD_TRENCHER: {
-        SECTION_BURIAL: "TS",
+        SECTION_BURIAL: "PB",
+        SECTION_SKIP: "SK",
+        SECTION_INSUFFICIENT: "II",
+    },
+    METHOD_MFE: {
+        SECTION_BURIAL: "PB",
+        SECTION_SKIP: "SK",
+        SECTION_INSUFFICIENT: "II",
+    },
+    METHOD_INSPECTION: {
+        SECTION_BURIAL: "IN",
         SECTION_SKIP: "SK",
         SECTION_INSUFFICIENT: "II",
     },
@@ -361,8 +395,18 @@ _SECTION_KIND_LABELS_BY_METHOD: Dict[str, Dict[str, str]] = {
         SECTION_INSUFFICIENT: "Insufficient Information",
     },
     METHOD_TRENCHER: {
-        SECTION_BURIAL: "Candidate Trench Section",
-        SECTION_SKIP: "Trench Skip",
+        SECTION_BURIAL: "PLB Section",
+        SECTION_SKIP: "Skip",
+        SECTION_INSUFFICIENT: "Insufficient Information",
+    },
+    METHOD_MFE: {
+        SECTION_BURIAL: "PLB Section (MFE)",
+        SECTION_SKIP: "Skip",
+        SECTION_INSUFFICIENT: "Insufficient Information",
+    },
+    METHOD_INSPECTION: {
+        SECTION_BURIAL: "Inspection Section",
+        SECTION_SKIP: "Skip",
         SECTION_INSUFFICIENT: "Insufficient Information",
     },
 }
@@ -382,10 +426,25 @@ def section_ref_code(kind: str, method: str = "") -> str:
     return codes.get(kind or "", "XX")
 
 
-def section_ref_legend(method: str = "") -> str:
-    """One-line legend for UI tooltips and report footnotes."""
-    parts = [f"{section_ref_code(kind, method)} = {section_kind_label(kind, method)}"
-             for kind in (SECTION_BURIAL, SECTION_SKIP, SECTION_INSUFFICIENT)]
+def section_ref_legend(method: str = "", sections=None) -> str:
+    """One-line legend for UI tooltips and report footnotes.
+
+    With ``sections``, burial codes are listed for every tool type in use
+    (e.g. "PS = Candidate Plough Section, PB = PLB Section, SK = …").
+    """
+    burial_methods = [normalise_method(method)]
+    for section in sections or []:
+        if section.get("kind") == SECTION_BURIAL:
+            m = normalise_method(section.get("method") or "")
+            if m and m not in burial_methods:
+                burial_methods.append(m)
+    parts = []
+    for m in burial_methods:
+        text = f"{section_ref_code(SECTION_BURIAL, m)} = {section_kind_label(SECTION_BURIAL, m)}"
+        if text not in parts:
+            parts.append(text)
+    parts += [f"{section_ref_code(kind, method)} = {section_kind_label(kind, method)}"
+              for kind in (SECTION_SKIP, SECTION_INSUFFICIENT)]
     return ", ".join(parts) + " — numbered in travel order"
 
 
@@ -410,7 +469,12 @@ def section_refs(sections, direction: int = 1, method: str = "") -> Dict[str, st
     counters: Dict[str, int] = {}
     refs: Dict[str, str] = {}
     for section in ordered:
-        code = section_ref_code(section.get("kind") or "", method)
+        # Burial sections are coded by their own tool (PS plough, PB PLB,
+        # IN inspection); skips and II by the plan default.
+        section_method = method
+        if section.get("kind") == SECTION_BURIAL:
+            section_method = normalise_method(section.get("method") or "") or method
+        code = section_ref_code(section.get("kind") or "", section_method)
         counters[code] = counters.get(code, 0) + 1
         refs[str(section.get("section_id") or "")] = \
             f"{code}-{counters[code]:02d}"

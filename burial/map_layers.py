@@ -473,7 +473,9 @@ def write_plan_layers(store, plan: Dict, sections: Sequence[Dict],
     when their rows are passed (None skips them, as for hazards).
     """
     wanted = set(parts) if parts is not None else set(ALL_PLAN_LAYER_PARTS)
-    method = plan.get("method") or ""
+    # Sections without their own tool use the plan default tool's type.
+    method = tools_mod.plan_label_method(plan, tools or [])
+    event_label_map = ev.event_labels(events or [], sections or [], method)
     base_args = (plan.get("name") or "plan", plan.get("rev_label") or "",
                  plan.get("plan_id") or "")
     sections_name = schema.sections_layer_name(*base_args)
@@ -520,7 +522,8 @@ def write_plan_layers(store, plan: Dict, sections: Sequence[Dict],
             "plan_id": event.get("plan_id") or "",
             "seq": int(event.get("seq") or 0),
             "event_type": event.get("event_type") or "",
-            "label": ev.event_label(event.get("event_type") or "", method),
+            "label": event_label_map.get(str(event.get("event_id") or ""))
+            or ev.event_label(event.get("event_type") or "", method),
             "kp": event.get("kp"),
             "lat": event.get("lat"),
             "lon": event.get("lon"),

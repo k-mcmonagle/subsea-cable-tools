@@ -43,18 +43,28 @@ def _tool(tool_id="t1", name="Plough X", tool_type=schema.METHOD_PLOUGH,
 
 
 def test_trencher_vocabulary() -> bool:
-    ok = schema.METHOD_TRENCHER in schema.METHODS
+    ok = all(m in schema.METHODS for m in (schema.METHOD_TRENCHER, schema.METHOD_MFE,
+                                            schema.METHOD_INSPECTION))
     ok = ok and ev.event_label(schema.EVENT_BURIAL_START,
-                               schema.METHOD_TRENCHER) == "TRENCH_START"
+                               schema.METHOD_TRENCHER) == "Start PLB"
     ok = ok and ev.event_label(schema.EVENT_BURIAL_END,
-                               schema.METHOD_TRENCHER) == "TRENCH_END"
+                               schema.METHOD_TRENCHER) == "End PLB"
     ok = ok and schema.section_ref_code(
-        schema.SECTION_BURIAL, schema.METHOD_TRENCHER) == "TS"
+        schema.SECTION_BURIAL, schema.METHOD_TRENCHER) == "PB"
+    ok = ok and schema.section_ref_code(
+        schema.SECTION_BURIAL, schema.METHOD_INSPECTION) == "IN"
     ok = ok and schema.section_kind_label(
-        schema.SECTION_BURIAL, schema.METHOD_TRENCHER) == "Candidate Trench Section"
-    ok = ok and "TS = Candidate Trench Section" in \
+        schema.SECTION_BURIAL, schema.METHOD_TRENCHER) == "PLB Section"
+    ok = ok and "PB = PLB Section" in \
         schema.section_ref_legend(schema.METHOD_TRENCHER)
-    return _result("trencher method vocabulary", ok)
+    ok = ok and schema.normalise_method("ROV") == schema.METHOD_TRENCHER
+    ok = ok and schema.normalise_method("mass flow excavator") == schema.METHOD_MFE
+    # Labels without a section tool follow the plan default tool's type.
+    plan = {"method": "plough", "params_json": '{"tool_id": "t_mfe"}'}
+    ok = ok and tools_mod.plan_label_method(
+        plan, [{"tool_id": "t_mfe", "tool_type": "mfe"}]) == schema.METHOD_MFE
+    ok = ok and tools_mod.plan_label_method({"method": ""}, []) == schema.METHOD_PLOUGH
+    return _result("PLB / MFE / Inspection vocabulary and default label method", ok)
 
 
 def test_plough_vocabulary_unchanged() -> bool:
@@ -77,8 +87,8 @@ def test_method_alias_normalisation() -> bool:
     ok = ok and schema.normalise_methods(
         ["plough", "jet", "rov_jet", ""]) == \
         [schema.METHOD_PLOUGH, schema.METHOD_TRENCHER]
-    ok = ok and schema.METHODS == [schema.METHOD_PLOUGH,
-                                   schema.METHOD_TRENCHER]
+    ok = ok and schema.METHODS == [schema.METHOD_PLOUGH, schema.METHOD_TRENCHER,
+                                   schema.METHOD_MFE, schema.METHOD_INSPECTION]
     return _result("method alias normalisation (jet/rov_jet -> trencher)", ok)
 
 

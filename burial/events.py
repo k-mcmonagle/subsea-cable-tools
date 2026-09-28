@@ -47,16 +47,83 @@ def is_end(event: Dict) -> bool:
 
 
 def travel_key(direction: int):
-    """Sort key placing events in travel order for the given direction."""
+    """Sort key placing events in travel order for the given direction.
+
+    At a shared KP an END sorts before a START: that is a tool transition
+    (e.g. PLUP 4.800 then Start PLB 4.800), one section handing over to
+    the next with no skip between them.
+    """
     sign = -1.0 if int(direction or 1) < 0 else 1.0
 
-    def key(event: Dict) -> float:
+    def key(event: Dict):
         try:
-            return sign * float(event.get("kp") or 0.0)
+            kp = sign * float(event.get("kp") or 0.0)
         except (TypeError, ValueError):
-            return 0.0
+            kp = 0.0
+        rank = 0 if is_end(event) else (1 if is_start(event) else 2)
+        return (round(kp, 6), rank)
 
     return key
+
+
+def transition_partner(events: List[Dict], event_id: str) -> Optional[Dict]:
+    """The opposite boundary event sharing ``event_id``'s KP, if any.
+
+    A START and an END at the same KP form a tool transition; editing one
+    without the other would open a gap or an overlap, so moves carry both.
+    """
+    target = next((e for e in events if e.get("event_id") == event_id), None)
+    if target is None or not (is_start(target) or is_end(target)):
+        return None
+    try:
+        kp = float(target.get("kp"))
+    except (TypeError, ValueError):
+        return None
+    for event in events:
+        if event is target or event.get("event_id") == event_id:
+            continue
+        if (is_start(event) if is_end(target) else is_end(event)):
+            try:
+                if abs(float(event.get("kp")) - kp) <= _BOUNDARY_TOL:
+                    return event
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def section_method(section: Dict, default_method: str) -> str:
+    """Effective method of a section: its tool's type for burial sections,
+    else the plan default (skips and II have no tool)."""
+    if section.get("kind") == schema.SECTION_BURIAL:
+        method = schema.normalise_method(section.get("method") or "")
+        if method:
+            return method
+    return schema.normalise_method(default_method or "")
+
+
+def event_labels(events: List[Dict], sections: List[Dict],
+                 default_method: str) -> Dict[str, str]:
+    """``{event_id: label}`` using the tool of the section each event bounds.
+
+    A START takes the method of the burial section it opens and an END of
+    the one it closes, so a transition reads "PLUP" then "Start PLB".
+    Events not attached to a section fall back to the plan default.
+    """
+    by_event: Dict[str, str] = {}
+    for section in sections or []:
+        if section.get("kind") != schema.SECTION_BURIAL:
+            continue
+        method = section_method(section, default_method)
+        for key in ("start_event_id", "end_event_id"):
+            event_id = str(section.get(key) or "")
+            if event_id:
+                by_event[event_id] = method
+    out: Dict[str, str] = {}
+    for event in events or []:
+        event_id = str(event.get("event_id") or "")
+        out[event_id] = event_label(event.get("event_type") or "",
+                                    by_event.get(event_id, default_method))
+    return out
 
 
 def sort_events(events: List[Dict], direction: int) -> List[Dict]:
@@ -165,11 +232,32 @@ def check_move(events: List[Dict], event_id: str, new_kp: float,
     """
     moved: List[Dict] = []
     found = False
+    partner = transition_partner(events, event_id)
+    partner_id = partner.get("event_id") if partner is not None else None
+    if partner is not None:
+        # A transition stays between its neighbours: crossing another
+        # boundary would still alternate but hand the tools' stretches over.
+        old_kp = float(partner.get("kp") or 0.0)
+        lo, hi = sorted((old_kp, float(new_kp)))
+        for event in events:
+            if event.get("event_id") in (event_id, partner_id):
+                continue
+            if not (is_start(event) or is_end(event)):
+                continue
+            try:
+                kp = float(event.get("kp"))
+            except (TypeError, ValueError):
+                continue
+            if lo - _KP_TOL <= kp <= hi + _KP_TOL:
+                return (f"The tool transition cannot move past the "
+                        f"{event_label(event.get('event_type') or '', method)} at KP "
+                        f"{schema.format_kp(kp)}.")
     for event in events:
         copy = dict(event)
-        if copy.get("event_id") == event_id:
+        if copy.get("event_id") == event_id or (
+                partner_id and copy.get("event_id") == partner_id):
             copy["kp"] = float(new_kp)
-            found = True
+            found = found or copy.get("event_id") == event_id
         moved.append(copy)
     if not found:
         return "Event not found."
@@ -630,8 +718,10 @@ def upsert_move_note(existing: str, label: str, old_kp, new_kp,
     old_text = schema.format_kp(old_kp)
     new_text = schema.format_kp(new_kp)
     origin = old_text
+    # Any label: a section's tool (and so its label) may change between
+    # moves, and the chain must still coalesce into one note.
     pattern = re.compile(
-        r"\[" + re.escape(label) + r" moved KP (\d+(?:\.\d+)?)→"
+        r"\[[^\[\]]+? moved KP (\d+(?:\.\d+)?)→"
         + re.escape(old_text) + r"(?::[^\]]*)?\]")
     match = pattern.search(existing)
     if match:

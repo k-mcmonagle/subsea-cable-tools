@@ -122,6 +122,18 @@ def plan_default_config(plan: Optional[Dict], tools: Sequence[Dict]
     return tool, config_by_id(tool, config_id)
 
 
+def plan_label_method(plan: Optional[Dict], tools: Sequence[Dict]) -> str:
+    """Method whose vocabulary labels sections without their own tool.
+
+    The plan default tool's type when one is set (a plan whose default is a
+    trencher reads Start/End PLB), else the stored plan method, else plough.
+    """
+    tool = tool_by_id(tools, plan_default_tool(plan)[0])
+    method = schema.normalise_method((tool or {}).get("tool_type") or "")
+    return (method or schema.normalise_method((plan or {}).get("method") or "")
+            or schema.METHOD_PLOUGH)
+
+
 def section_tool_display(section: Dict, plan: Optional[Dict],
                          tools: Sequence[Dict]) -> str:
     """The effective tool text for one section ("" when nothing is set).
