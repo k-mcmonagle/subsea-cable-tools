@@ -13,7 +13,7 @@ from qgis.PyQt.QtWidgets import QMenu, QToolButton
 
 from qgis.core import QgsApplication
 
-from .qgis_compat import QAction, TOOLBUTTON_POPUP_MODE_INSTANT
+from .qgis_compat import LAYER_VECTOR, QAction, TOOLBUTTON_POPUP_MODE_INSTANT
 
 # Load Qt resources
 from .resources import *
@@ -222,6 +222,23 @@ class SubseaCableTools:
         self.iface.addPluginToMenu(self.menu, self.kp_settings_action)
         self.actions.append(self.kp_settings_action)
 
+        # Save the selected layers (e.g. an MDB import's temporary layers)
+        # into one GeoPackage; also offered on the Layers panel context menu.
+        self.save_layers_gpkg_action = QAction(
+            QgsApplication.getThemeIcon("/mActionFileSave.svg"), "Save Layers to GeoPackage…",
+            self.iface.mainWindow() if hasattr(self.iface, 'mainWindow') else None)
+        self.save_layers_gpkg_action.setToolTip(
+            "Save the layers selected in the Layers panel into one GeoPackage "
+            "and point the project layers at it.")
+        self.save_layers_gpkg_action.triggered.connect(self.save_layers_to_gpkg)
+        self.iface.addPluginToMenu(self.menu, self.save_layers_gpkg_action)
+        self.actions.append(self.save_layers_gpkg_action)
+        try:
+            self.iface.addCustomActionForLayerType(
+                self.save_layers_gpkg_action, "", LAYER_VECTOR, True)
+        except Exception:
+            pass
+
         self._add_experimental_toolbar_menu()
 
         # Re-add / repair Cable Route Workbench and Burial Planner layers
@@ -381,8 +398,17 @@ class SubseaCableTools:
             except Exception:
                 pass
 
+    def save_layers_to_gpkg(self):
+        from .save_layers_to_gpkg import run_save_layers_dialog
+        run_save_layers_dialog(self.iface)
+
     def unload(self):
         """Remove the plugin menu items and icons from QGIS GUI and clean up all resources."""
+        if getattr(self, 'save_layers_gpkg_action', None):
+            try:
+                self.iface.removeCustomActionForLayerType(self.save_layers_gpkg_action)
+            except Exception:
+                pass
         # Unregister the processing provider
         if hasattr(self, 'kpProvider') and self.kpProvider:
             QgsApplication.processingRegistry().removeProvider(self.kpProvider)

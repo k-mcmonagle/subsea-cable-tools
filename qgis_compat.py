@@ -4,7 +4,7 @@
 from qgis.PyQt.QtCore import QMetaType, Qt
 from qgis.PyQt.QtGui import QCursor
 from qgis.PyQt.QtWidgets import (
-    QAbstractItemView, QDialog, QDialogButtonBox, QHeaderView, QMessageBox,
+    QAbstractItemView, QDialog, QDialogButtonBox, QFileDialog, QHeaderView, QMessageBox,
     QSizePolicy, QToolButton,
 )
 
@@ -186,6 +186,8 @@ HEADER_RESIZE_MODE_CONTENTS = _scoped_member(QHeaderView, "ResizeMode", "ResizeT
 
 MESSAGEBOX_YES = _scoped_member(QMessageBox, "StandardButton", "Yes")
 MESSAGEBOX_NO = _scoped_member(QMessageBox, "StandardButton", "No")
+
+FILE_DIALOG_DONT_CONFIRM_OVERWRITE = _scoped_member(QFileDialog, "Option", "DontConfirmOverwrite")
 
 TOOLBUTTON_POPUP_MODE_MENU_BUTTON = _scoped_member(
     QToolButton,

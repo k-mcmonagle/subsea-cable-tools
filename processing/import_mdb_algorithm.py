@@ -27,6 +27,7 @@ from qgis.core import (
     QgsProcessingAlgorithm,
     QgsProcessingParameterMultipleLayers,
     QgsProcessingParameterCrs,
+    QgsProcessingParameterFile,
     QgsProcessingOutputMultipleLayers,
     QgsVectorLayer,
     QgsField,
@@ -46,6 +47,12 @@ from ..qgis_compat import (
 )
 from .geomedia_blob import decode_geometry_blob, parse_blob  # noqa: F401 - re-exported for callers/tests
 from .mdb_odbc_worker import GRAPHIC_TYPE_CODE, find_candidate_geometry_fields
+from ..gpkg_writer import (  # noqa: F401 - resolve_gpkg_field_names re-exported for tests
+    gpkg_layer_uri,
+    gpkg_table_name,
+    resolve_gpkg_field_names,
+    write_layer_to_gpkg,
+)
 
 
 ACCESS_ODBC_DRIVER_NAME = "Microsoft Access Driver (*.mdb, *.accdb)"
@@ -579,54 +586,8 @@ def is_closed(vertices, tol=1e-6):
     return abs(x0 - xn) <= tol and abs(y0 - yn) <= tol
 
 
-class _MdbFieldValueConverter(QgsVectorFileWriter.FieldValueConverter):
-    def __init__(self, renamed_fields):
-        super().__init__()
-        self._renamed_fields = renamed_fields
-
-    def fieldDefinition(self, field):
-        output_field = QgsField(field)
-        output_field.setName(self._renamed_fields.get(field.name(), field.name()))
-        return output_field
-
-    def convert(self, field_index, value):
-        return value
-
-
-def resolve_gpkg_field_names(source_fields):
-    """Return ``(renamed, reserved)`` for GeoPackage-safe field names.
-
-    GeoPackage column names are case-insensitive, so a source ``Depth`` column
-    and the derived ``depth`` attribute collide and the whole table fails to be
-    created. First occurrences keep their name — source attributes are listed
-    before derived ones — and later collisions are suffixed. ``fid`` is always
-    renamed because it is the GeoPackage primary key.
-    """
-    reserved = set()
-    deferred = []
-    for field in source_fields:
-        name = field.name()
-        key = name.casefold()
-        if key == "fid" or key in reserved:
-            deferred.append(name)
-            continue
-        reserved.add(key)
-
-    renamed = {}
-    for name in deferred:
-        base = "source_fid" if name.casefold() == "fid" else name
-        candidate = base
-        suffix = 2
-        while candidate.casefold() in reserved:
-            candidate = f"{base}_{suffix}"
-            suffix += 1
-        reserved.add(candidate.casefold())
-        renamed[name] = candidate
-    return renamed, reserved
-
-
-def _write_to_temporary_gpkg(source_layer, layer_name, source_crs, context, feedback):
-    """Stream a worker layer to an indexed, session-managed GeoPackage.
+def _write_mdb_layer(source_layer, layer_name, source_crs, gpkg_path, table_name, context, feedback):
+    """Write a worker layer as ``table_name`` in ``gpkg_path`` and open it.
 
     ``source_crs`` is *assigned* to the incoming CRS-less GeoJSON layer. No
     coordinate transform is performed; MDB coordinates are written unchanged.
@@ -634,55 +595,40 @@ def _write_to_temporary_gpkg(source_layer, layer_name, source_crs, context, feed
     if source_crs and source_crs.isValid():
         source_layer.setCrs(source_crs)
 
-    gpkg_path = processing_generate_temp_filename(
-        _safe_temp_stem(layer_name) + ".gpkg",
-        context,
+    error, renamed_fields = write_layer_to_gpkg(
+        source_layer,
+        gpkg_path,
+        table_name,
+        context.transformContext(),
+        feedback=feedback,
+        fid_name="__subsea_fid",
     )
-    storage_layer_name = _safe_temp_stem(layer_name)
-    options = QgsVectorFileWriter.SaveVectorOptions()
-    options.driverName = "GPKG"
-    options.layerName = storage_layer_name
-
-    renamed_fields, reserved_names = resolve_gpkg_field_names(list(source_layer.fields()))
     if renamed_fields:
         feedback.pushInfo(
             "  Renamed for GeoPackage (column names are case-insensitive): "
             + ", ".join(f"{old} -> {new}" for old, new in sorted(renamed_fields.items()))
         )
-
-    fid_name = "__subsea_fid"
-    suffix = 2
-    while fid_name.casefold() in reserved_names:
-        fid_name = f"__subsea_fid_{suffix}"
-        suffix += 1
-    field_converter = _MdbFieldValueConverter(renamed_fields)
-    options.fieldValueConverter = field_converter
-    options.layerOptions = ["SPATIAL_INDEX=YES", f"FID={fid_name}"]
-    if hasattr(options, "feedback"):
-        options.feedback = feedback
-
-    result = QgsVectorFileWriter.writeAsVectorFormatV3(
-        source_layer,
-        gpkg_path,
-        context.transformContext(),
-        options,
-    )
-    writer_error = result[0] if isinstance(result, tuple) else result
-    error_message = result[1] if isinstance(result, tuple) and len(result) > 1 else ""
-    error_scope = getattr(QgsVectorFileWriter, "WriterError", QgsVectorFileWriter)
-    if writer_error != getattr(error_scope, "NoError"):
-        feedback.reportError(f"Could not create disk-backed layer {layer_name}: {error_message}")
+    if error:
+        feedback.reportError(f"Could not create disk-backed layer {layer_name}: {error}")
         return None
 
-    layer = QgsVectorLayer(
-        f"{gpkg_path}|layername={storage_layer_name}",
-        layer_name,
-        "ogr",
-    )
+    layer = QgsVectorLayer(gpkg_layer_uri(gpkg_path, table_name), layer_name, "ogr")
     if not layer.isValid():
         feedback.reportError(f"Could not open disk-backed layer {layer_name}")
         return None
     return layer
+
+
+def _write_to_temporary_gpkg(source_layer, layer_name, source_crs, context, feedback):
+    """Stream a worker layer to an indexed, session-managed GeoPackage."""
+    gpkg_path = processing_generate_temp_filename(
+        _safe_temp_stem(layer_name) + ".gpkg",
+        context,
+    )
+    return _write_mdb_layer(
+        source_layer, layer_name, source_crs, gpkg_path,
+        _safe_temp_stem(layer_name), context, feedback,
+    )
 
 
 class ImportMdbAlgorithm(QgsProcessingAlgorithm):
@@ -691,6 +637,7 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
     # working. It has only ever assigned the CRS of the MDB coordinates.
     SOURCE_CRS = 'TARGET_CRS'
     TARGET_CRS = SOURCE_CRS
+    OUTPUT_FOLDER = 'OUTPUT_FOLDER'
     OUTPUT_LAYERS = 'OUTPUT_LAYERS'
 
     #: Geometry types loaded without SUBSEA_MDB_LOAD_ALL_GEOMS=1.
@@ -710,6 +657,12 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
             self.SOURCE_CRS,
             self.tr('Source CRS / CRS of coordinates in MDB'),
             optional=False,
+        ))
+        self.addParameter(QgsProcessingParameterFile(
+            self.OUTPUT_FOLDER,
+            self.tr('Save to GeoPackages in folder (one per MDB; leave empty for temporary layers)'),
+            behavior=QgsProcessingParameterFile.Folder,
+            optional=True,
         ))
         self.addOutput(QgsProcessingOutputMultipleLayers(self.OUTPUT_LAYERS, self.tr('Imported Layers')))
 
@@ -860,11 +813,16 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
         if not normalized_files:
             raise QgsProcessingException("Select at least one MDB or ACCDB file.")
 
+        output_folder = (self.parameterAsFile(parameters, self.OUTPUT_FOLDER, context) or '').strip()
+        output_gpkgs = self._output_gpkg_paths(normalized_files, output_folder)
+
         total_input_bytes = sum(os.path.getsize(path) for path in normalized_files)
         feedback.pushInfo(
             f"Selected {len(normalized_files)} database(s), "
             f"{total_input_bytes / (1024 * 1024):.1f} MB total. "
-            "Outputs are stored as disk-backed temporary GeoPackages to limit RAM use."
+            + (f"Saving one GeoPackage per database in {os.path.abspath(output_folder)}."
+               if output_folder else
+               "Outputs are stored as disk-backed temporary GeoPackages to limit RAM use.")
         )
 
         isolate = os.environ.get('SUBSEA_MDB_NO_SUBPROCESS', '0') not in {'1', 'true', 'True'}
@@ -899,6 +857,7 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
                     load_all_geoms=load_all_geoms,
                     max_features=max_features,
                     schema_discovery=schema_discovery,
+                    output_gpkg=output_gpkgs.get(mdb_file, ''),
                 )
             except Exception as exc:  # noqa: BLE001 - one bad file must not kill the batch
                 if feedback.isCanceled():
@@ -922,6 +881,33 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
         feedback.setProgress(100)
         return {self.OUTPUT_LAYERS: output_layers}
 
+    @staticmethod
+    def _output_gpkg_paths(mdb_files, output_folder):
+        """Map each MDB to ``<folder>/<mdb name>.gpkg`` ({} when not saving).
+
+        Databases that share a file name (from different folders) get a
+        numbered suffix instead of writing into the same GeoPackage.
+        """
+        if not output_folder:
+            return {}
+        output_folder = os.path.abspath(output_folder)
+        try:
+            os.makedirs(output_folder, exist_ok=True)
+        except OSError as exc:
+            raise QgsProcessingException(f"Cannot create output folder {output_folder}: {exc}")
+        paths = {}
+        used = set()
+        for mdb_file in mdb_files:
+            stem = os.path.splitext(os.path.basename(mdb_file))[0]
+            candidate = stem
+            suffix = 2
+            while candidate.casefold() in used:
+                candidate = f"{stem}_{suffix}"
+                suffix += 1
+            used.add(candidate.casefold())
+            paths[mdb_file] = os.path.join(output_folder, candidate + '.gpkg')
+        return paths
+
     def _process_mdb_file(
         self,
         mdb_file,
@@ -933,6 +919,7 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
         load_all_geoms,
         max_features,
         schema_discovery=False,
+        output_gpkg='',
     ):
         file_name = os.path.basename(mdb_file)
         file_ref = os.path.splitext(file_name)[0]
@@ -1003,6 +990,18 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException(
                 "No valid CRS provided. Set the Source CRS of the coordinates in the MDB.")
 
+        if output_gpkg:
+            feedback.pushInfo(f"Saving layers to {output_gpkg}")
+        saved_tables = []
+
+        def _save(source_layer, layer_name, table_label):
+            if not output_gpkg:
+                return _write_to_temporary_gpkg(source_layer, layer_name, source_crs, context, feedback)
+            table = gpkg_table_name(table_label, saved_tables)
+            saved_tables.append(table)
+            return _write_mdb_layer(
+                source_layer, layer_name, source_crs, output_gpkg, table, context, feedback)
+
         output_layers = {}
         table_count = len(feature_tables)
         for table_index, (table_name, (geom_field_name, geometry_type_code)) in enumerate(
@@ -1066,13 +1065,7 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
                     if not src_layer.isValid():
                         feedback.reportError(f'Skipping {layer_name}: output layer invalid')
                         continue
-                    layer = _write_to_temporary_gpkg(
-                        src_layer,
-                        layer_name,
-                        source_crs,
-                        context,
-                        feedback,
-                    )
+                    layer = _save(src_layer, layer_name, table_label)
                     if layer is None:
                         continue
 
@@ -1095,6 +1088,10 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
                 # IMPORTANT: Do NOT add layers directly to QgsProject from a processing algorithm.
                 # Algorithms may run in a background thread and direct project mutations can crash QGIS.
                 layer_name = f"{file_ref} - {table_name}"
+                if output_gpkg:
+                    mem_layer = _save(mem_layer, layer_name, table_name)
+                    if mem_layer is None:
+                        continue
                 self._register_output_layer(context, mem_layer, layer_name, file_name)
                 output_layers[f"{output_namespace}::{table_name}"] = mem_layer.id()
 
@@ -1210,7 +1207,7 @@ class ImportMdbAlgorithm(QgsProcessingAlgorithm):
     def shortHelpString(self):
         return self.tr("""<h3>Import MDB (Experimental)</h3>
 <p><b><font color="red">Warning:</font> This tool is experimental and may not work with all GeoMedia-formatted MDB files. Use with caution.</b></p>
-<p>This tool imports feature tables from one or more Microsoft Access Database (.mdb or .accdb) files, typically created by Intergraph GeoMedia, into QGIS as new temporary layers. It is not limited to bathymetry &ndash; any GeoMedia feature class (contours, seabed classifications, survey points, infrastructure polygons, etc.) can be loaded.</p>
+<p>This tool imports feature tables from one or more Microsoft Access Database (.mdb or .accdb) files, typically created by Intergraph GeoMedia, into QGIS as new layers &ndash; temporary by default, or saved as one GeoPackage per MDB. It is not limited to bathymetry &ndash; any GeoMedia feature class (contours, seabed classifications, survey points, infrastructure polygons, etc.) can be loaded.</p>
 
 <h4>How it Works</h4>
 <p>The tool connects to the MDB file and looks for a <code>GFeatures</code> table to identify the feature classes within the database. For each feature class found, it reads the geometry from a binary (BLOB) field and creates a corresponding QGIS layer. Setting <code>SUBSEA_MDB_SCHEMA_DISCOVERY=1</code> additionally inspects every physical table so that populated tables missing from <code>GFeatures</code> can be offered when they carry strong spatial evidence (a GeoMedia geometry field or a recognised coordinate pair); metadata, lookup and companion <code>*_Name</code>/<code>*_Text</code> tables are reported but never loaded as geometry layers. That extra pass costs a table-definition parse per table, so it is off by default.</p>
@@ -1240,11 +1237,12 @@ Text features additionally carry:
 <ul>
     <li><b>Input MDB File(s):</b> Add one or more GeoMedia MDB/ACCDB files. The picker supports selecting several files at once.</li>
   <li><b>Source CRS / CRS of coordinates in MDB:</b> You <b>must</b> manually select the Coordinate Reference System (CRS) that the coordinates in the MDB are stored in. The tool cannot detect it. This CRS is <i>assigned</i> to the imported layers &mdash; no reprojection is performed &mdash; so providing the wrong CRS will result in misplaced data.</li>
+  <li><b>Save to GeoPackages in folder (optional):</b> Choose a folder to save each MDB as one GeoPackage there, named after the MDB (e.g. <code>Survey_A.mdb</code> &rarr; <code>Survey_A.gpkg</code>), with one table per feature class and geometry type. The loaded layers point at those GeoPackages, so there is nothing left to make permanent. If the GeoPackage already exists, tables of the same name are replaced and any other tables are kept. Leave empty to load temporary layers as before.</li>
 </ul>
 
 <h4>Outputs</h4>
 <ul>
-    <li><b>Imported Layers:</b> The tool creates an indexed temporary GeoPackage layer for each feature table and geometry type successfully imported. Layer names are prefixed with the source file reference, and on QGIS 3.32 or newer each file's layers are placed in a group named after that file. For example, a table containing both line and polygon features will produce separate layers.</li>
+    <li><b>Imported Layers:</b> The tool creates an indexed temporary GeoPackage layer for each feature table and geometry type successfully imported. Layer names are prefixed with the source file reference, and on QGIS 3.32 or newer each file's layers are placed in a group named after that file. For example, a table containing both line and polygon features will produce separate layers. With an output folder set, the layers are saved in one GeoPackage per MDB instead of temporary files.</li>
 </ul>
 
 <h4>Known Limitations & Troubleshooting</h4>

@@ -135,6 +135,7 @@ CHECKS = [
     ('cable lay management ops', 'test_cable_lay_manage'),
     ('cable lay project data file ops', 'test_cable_lay_gpkg_ops'),
     ('MDB import algorithm', 'test_mdb_import_algorithm'),
+    ('save layers to GeoPackage', 'test_save_layers_to_gpkg'),
     ('workbench store', 'test_workbench_store'),
     ('workbench route lineage', 'test_workbench_lineage'),
     ('workbench RPL engine', 'test_rpl_engine'),
