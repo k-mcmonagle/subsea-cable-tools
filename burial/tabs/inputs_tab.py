@@ -1169,7 +1169,7 @@ class InputsTab(QWidget):
     def _table_targets(self) -> List[Dict]:
         rows = []
         for row in range(self.target_table.rowCount()):
-            def cell(column: int) -> str:
+            def cell(column: int, row: int = row) -> str:
                 item = self.target_table.item(row, column)
                 return item.text().strip() if item is not None else ""
 

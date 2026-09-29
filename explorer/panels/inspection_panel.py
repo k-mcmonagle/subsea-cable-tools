@@ -14,7 +14,7 @@ map, double-clicking focuses the map and every plot on it.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import numpy as np
 

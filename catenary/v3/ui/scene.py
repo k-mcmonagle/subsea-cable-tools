@@ -13,7 +13,7 @@ negative down. Bed elevations are negative.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Tuple
 
 try:
     import numpy as np

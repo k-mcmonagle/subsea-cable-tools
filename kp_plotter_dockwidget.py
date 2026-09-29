@@ -1,6 +1,6 @@
 from qgis.PyQt.QtWidgets import QDockWidget, QVBoxLayout, QWidget, QComboBox, QLabel, QListWidget, QPushButton, QListWidgetItem, QTabWidget, QHBoxLayout, QCheckBox, QGroupBox, QRadioButton, QButtonGroup
 from qgis.PyQt.QtCore import Qt
-from qgis.core import QgsProject, QgsVectorLayer, QgsWkbTypes, QgsGeometry, QgsPointXY, QgsDistanceArea, QgsCoordinateTransform, QgsCsException
+from qgis.core import QgsProject, QgsVectorLayer, QgsGeometry, QgsPointXY, QgsCoordinateTransform, QgsCsException
 from .qgis_compat import SELECTION_MODE_EXTENDED, GEOMETRY_LINE, GEOMETRY_NULL
 from qgis.gui import QgsVertexMarker
 from .kp_range_utils import make_kp_distance_area
@@ -10,7 +10,6 @@ from .plugin_log import log_exception, log_info
 import bisect
 import logging
 import math
-import numpy as np
 
 class KpPlotterDockWidget(QDockWidget):
     """

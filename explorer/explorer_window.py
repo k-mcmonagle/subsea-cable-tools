@@ -31,7 +31,6 @@ from qgis.PyQt.QtWidgets import (
     QProgressDialog,
     QTabWidget,
     QToolBar,
-    QWidget,
 )
 from qgis.core import QgsApplication, QgsProject
 

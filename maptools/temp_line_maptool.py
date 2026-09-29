@@ -1,7 +1,7 @@
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QColor
 from qgis.gui import QgsMapTool, QgsRubberBand
-from qgis.core import QgsWkbTypes, QgsPointXY
+from qgis.core import QgsPointXY
 from ..qgis_compat import GEOMETRY_LINE
 from ..plugin_log import log_exception
 from .canvas_items import remove_canvas_item

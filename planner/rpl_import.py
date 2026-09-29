@@ -287,7 +287,7 @@ class RplImportDialog(QDialog):
         speeds = self._speed_map()
         mode = self.group_combo.currentData()
         drafts = []
-        for index, group in enumerate(self._groups(), start=1):
+        for group in self._groups():
             geometry = _join_geometries([segment.geometry for segment in group])
             if geometry is None or geometry.isEmpty():
                 continue

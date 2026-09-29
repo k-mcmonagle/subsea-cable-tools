@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (

@@ -50,7 +50,7 @@ from ..qgis_compat import GEOMETRY_LINE, GEOMETRY_POINT, GEOMETRY_POLYGON
 from ..workbench import rules_inputs as ri
 from ..workbench.rules_inputs import _filter_expression, _load_features_wgs84
 from ..workbench.rules_engine import Interval
-from . import attribute_rules, risk, schema
+from . import attribute_rules, risk
 
 WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
 

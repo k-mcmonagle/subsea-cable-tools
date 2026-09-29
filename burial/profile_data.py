@@ -40,7 +40,6 @@ except ImportError:  # pragma: no cover
     _np = None
 
 from . import schema
-from ..slope_utils import windowed_slope_series as _shared_windowed_slope
 from ..slope_utils import supported_slopes, interpolate_covered, is_finite
 
 Sample = Tuple[float, Optional[float]]

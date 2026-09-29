@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from qgis.PyQt.QtCore import QCoreApplication
 from .algorithm_base import SubseaCableAlgorithm
@@ -32,7 +32,6 @@ from qgis.core import (
     QgsFields,
     QgsField,
     QgsGeometry,
-    QgsPoint,
     QgsPointXY,
     QgsProcessing,
     QgsProcessingException,
@@ -41,7 +40,6 @@ from qgis.core import (
     QgsProcessingParameterFeatureSource,
     QgsProcessingParameterNumber,
     QgsProcessingParameterMultipleLayers,
-    QgsProject,
     QgsSpatialIndex,
     QgsWkbTypes,
 )

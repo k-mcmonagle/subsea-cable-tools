@@ -9,7 +9,6 @@ bearing helper. Pure Python + NumPy; no QGIS imports.
 from __future__ import annotations
 
 import importlib.util
-import math
 from pathlib import Path
 import sys
 

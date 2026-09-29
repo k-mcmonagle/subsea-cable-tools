@@ -40,14 +40,12 @@ from qgis.core import (
     QgsRectangle,
     QgsSpatialIndex,
     QgsVectorLayer,
-    QgsWkbTypes,
 )
 from ..qgis_compat import FIELD_TYPE_DOUBLE, GEOMETRY_LINE, GEOMETRY_POINT, PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE
 from ..bathymetry_sampling import RasterSampler, expand_rasters, normalise_depth, layer_options, metres_per_unit
 from ..slope_utils import (
     supported_slopes, clean_crossings, interpolate_covered, cross_profile_metrics,
-    datum_sign as shared_datum_sign, interval_slope_series, ols_slope,
-    windowed_slope_series,
+    ols_slope,
 )
 from ..kp_geo_utils import get_features_skip_invalid
 from ..plugin_log import log_exception

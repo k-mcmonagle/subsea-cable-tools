@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import List, Optional, Sequence, Tuple
+from typing import Optional, Sequence
 
 import numpy as np
 

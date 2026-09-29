@@ -22,7 +22,7 @@ from qgis.core import (
     QgsVectorLayer,
 )
 
-from ..burial import analysis_state, generation, map_layers
+from ..burial import generation, map_layers
 from ..burial import schema as burial_schema
 from ..burial.plan_model import PlanModel
 from ..burial.store import BurialStore

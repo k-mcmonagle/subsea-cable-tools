@@ -62,7 +62,6 @@ from .catenary_solver import (
     FlatSeabed,
     PlanarSlopeSeabed,
     PolylineSeabed,
-    _parse_components,
 )
 from .drape_solver import three_point_radii
 
@@ -3054,7 +3053,6 @@ class CatenaryCalculatorV2Dialog(QDialog):
         # When the automatic seabed drape ran (Profile mode), its bed-resolved
         # geometry is what gets drawn — the raw single-span curve through a
         # seabed high spot is never shown.
-        drape_active = self._active_drape_result(calc) is not None
         calc = self._display_geometry(calc)
 
         if calc.x is None or calc.y is None:
@@ -3354,7 +3352,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 # modeled cable (internal x = x_internal[0]: the TDP for a
                 # single span, the end of the drape tail when draped).
                 x_seabed_start = float(x_internal[0])
-                n_pts = max(2, int(min(600, max(2, seabed_len / max(ds_step := float(self.ds_step.value()), 0.25)))))
+                n_pts = max(2, int(min(600, max(2, seabed_len / max(float(self.ds_step.value()), 0.25)))))
                 xs_physical = np.linspace(x_seabed_start, x_seabed_start - seabed_len, n_pts)
                 xs = xs_physical - x_origin_offset
                 ys = np.array([self._seabed_depth_at_plot_x(calc, float(xp)) for xp in xs])

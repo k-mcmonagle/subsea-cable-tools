@@ -332,7 +332,7 @@ def parse_events_csv(text: str, client_proposal: bool = False) -> List[Dict]:
     source = schema.EVENT_SOURCE_CLIENT if client_proposal else schema.EVENT_SOURCE_IMPORT
     out: List[Dict] = []
     for row in rows[1:]:
-        def cell(name: str) -> str:
+        def cell(name: str, row: List[str] = row) -> str:
             i = idx.get(name)
             return row[i] if i is not None and i < len(row) else ""
         event_type = normalise_event_type(cell("event_type")) \

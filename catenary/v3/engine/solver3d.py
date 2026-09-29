@@ -33,11 +33,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence
 
 import numpy as np
 
-from .cable_system import CableSystem, Chain
+from .cable_system import CableSystem
 
 
 @dataclass
@@ -288,7 +288,7 @@ def solve_system(
 
     # Loop-invariant per-chain quantities, hoisted out of the iteration loop.
     inv = []
-    for ci, ch in enumerate(chains):
+    for ch in chains:
         qa_eff = np.where(ch.qa != 0.0, ch.qa, ch.qw)
         d = {
             "w_sub": ch.qw * ch.L0,
@@ -309,7 +309,7 @@ def solve_system(
         inv.append(d)
     free = ~fixed
 
-    for outer in range(int(n_outer)):
+    for _outer in range(int(n_outer)):
         v[:] = 0.0
         ke_prev = 0.0
         converged = False

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 

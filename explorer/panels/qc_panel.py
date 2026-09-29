@@ -7,7 +7,6 @@ Check parameter editors are generated automatically from each check's
 
 from __future__ import annotations
 
-import os
 import uuid
 from datetime import datetime
 from typing import Dict, List
@@ -34,7 +33,6 @@ from qgis.PyQt.QtWidgets import (
 from qgis.core import QgsApplication
 
 from ...qgis_compat import (
-    EDIT_TRIGGER_DOUBLE_CLICKED,
     EDIT_TRIGGER_NONE,
     HEADER_RESIZE_MODE_STRETCH,
     MESSAGEBOX_NO,

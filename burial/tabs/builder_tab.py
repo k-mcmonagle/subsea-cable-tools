@@ -12,7 +12,7 @@ import json
 from typing import Dict, List, Optional
 
 from qgis.PyQt.QtCore import QSettings, Qt
-from qgis.PyQt.QtGui import QBrush, QColor, QKeySequence
+from qgis.PyQt.QtGui import QBrush, QKeySequence
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
     QComboBox,

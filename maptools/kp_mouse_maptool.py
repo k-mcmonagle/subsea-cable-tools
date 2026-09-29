@@ -19,12 +19,12 @@ from qgis.PyQt.QtWidgets import (QMessageBox, QToolTip,
                                  QComboBox, QLabel, QDialogButtonBox,
                                  QToolButton, QMenu, QCheckBox, QLineEdit, QHBoxLayout, QPushButton,
                                  QTableWidget, QTableWidgetItem)
-from qgis.core import (QgsWkbTypes, QgsGeometry, QgsProject, QgsDistanceArea,
+from qgis.core import (QgsGeometry, QgsProject, QgsDistanceArea,
                        QgsPointXY, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
                        QgsCsException, QgsFeatureRequest,
-                       Qgis, QgsVectorLayer, QgsField, QgsFeature)
+                       QgsVectorLayer, QgsField, QgsFeature)
 from qgis.gui import QgsMapTool, QgsRubberBand, QgsVertexMarker
-from ..qgis_compat import QAction, DIALOG_ACCEPTED, qt_exec, DISTANCE_METERS, FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_LONG_LONG, FIELD_TYPE_STRING, GEOMETRY_LINE, GEOMETRY_POINT, GEOMETRY_POLYGON, LAYER_RASTER, LAYER_VECTOR, MESSAGE_CRITICAL, MESSAGE_INFO, MESSAGE_SUCCESS, MESSAGE_WARNING, TOOLBUTTON_POPUP_MODE_MENU_BUTTON, BUTTON_BOX_OK, BUTTON_BOX_CANCEL, BUTTON_BOX_CLOSE, BUTTON_BOX_ACCEPT_ROLE, get_event_global_pos, ITEM_DATA_USER_ROLE, ITEM_FLAG_EDITABLE, ITEM_FLAG_USER_CHECKABLE, CHECK_STATE_CHECKED, CHECK_STATE_UNCHECKED, SELECTION_MODE_NONE, HEADER_RESIZE_MODE_STRETCH
+from ..qgis_compat import QAction, DIALOG_ACCEPTED, qt_exec, FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_LONG_LONG, FIELD_TYPE_STRING, GEOMETRY_LINE, GEOMETRY_POINT, GEOMETRY_POLYGON, LAYER_RASTER, LAYER_VECTOR, MESSAGE_CRITICAL, MESSAGE_INFO, MESSAGE_SUCCESS, MESSAGE_WARNING, TOOLBUTTON_POPUP_MODE_MENU_BUTTON, BUTTON_BOX_OK, BUTTON_BOX_CANCEL, BUTTON_BOX_ACCEPT_ROLE, get_event_global_pos, ITEM_DATA_USER_ROLE, ITEM_FLAG_EDITABLE, ITEM_FLAG_USER_CHECKABLE, CHECK_STATE_CHECKED, CHECK_STATE_UNCHECKED, SELECTION_MODE_NONE, HEADER_RESIZE_MODE_STRETCH
 import math
 
 from ..kp_geo_utils import KPHit, RouteFrame, geometry_is_finite, ordered_route_features

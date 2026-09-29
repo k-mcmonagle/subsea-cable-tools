@@ -22,13 +22,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from qgis.core import (
     QgsCoordinateReferenceSystem,
-    QgsPointXY,
     QgsProject,
-    QgsRasterLayer,
-    QgsVectorLayer,
 )
 
-from ..processing import depth_sampling
 
 WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
 

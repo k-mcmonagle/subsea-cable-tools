@@ -10,7 +10,7 @@ the plan's units when *Apply* is pressed.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from qgis.PyQt.QtCore import QSettings, Qt
 from qgis.PyQt.QtGui import QBrush, QColor
@@ -320,7 +320,7 @@ class GroundTab(QWidget):
 
     def _fill_row(self, row: int, unit: Dict) -> None:
         by_code = ground_model.class_lookup(self.model.ground_classes)
-        for col, (header, key, kind) in enumerate(_COLUMNS):
+        for col, (_header, key, kind) in enumerate(_COLUMNS):
             value = unit.get(key)
             item = QTableWidgetItem()
             flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable

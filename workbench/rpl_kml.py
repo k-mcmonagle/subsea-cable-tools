@@ -158,18 +158,18 @@ def build_kml(model, rpl_name: str = "RPL",
     parts: List[str] = []
     parts.append('<?xml version="1.0" encoding="UTF-8"?>')
     parts.append('<kml xmlns="http://www.opengis.net/kml/2.2">')
-    parts.append(f'  <Document>')
+    parts.append('  <Document>')
     parts.append(f'    <name>{escape(name)}</name>')
     parts.append(f'    <description>{escape("Cable Route Workbench RPL export")}</description>')
-    parts.append(f'    <Style id="routeStyle">')
-    parts.append(f'      <LineStyle><color>ff0066ff</color><width>3</width></LineStyle>')
-    parts.append(f'    </Style>')
-    parts.append(f'    <Style id="legStyle">')
-    parts.append(f'      <LineStyle><color>ff00aaff</color><width>2</width></LineStyle>')
-    parts.append(f'    </Style>')
-    parts.append(f'    <Style id="pointStyle">')
-    parts.append(f'      <IconStyle><scale>0.8</scale></IconStyle>')
-    parts.append(f'    </Style>')
+    parts.append('    <Style id="routeStyle">')
+    parts.append('      <LineStyle><color>ff0066ff</color><width>3</width></LineStyle>')
+    parts.append('    </Style>')
+    parts.append('    <Style id="legStyle">')
+    parts.append('      <LineStyle><color>ff00aaff</color><width>2</width></LineStyle>')
+    parts.append('    </Style>')
+    parts.append('    <Style id="pointStyle">')
+    parts.append('      <IconStyle><scale>0.8</scale></IconStyle>')
+    parts.append('    </Style>')
 
     # Whole-route line ------------------------------------------------------
     route_coords = [(p.lon, p.lat) for p in model.points]

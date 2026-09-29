@@ -422,9 +422,10 @@ class SubseaCableTools:
         _quietly("unloading the KP Mouse Tool", self._unload_kp_mouse_tool)
         _quietly("unloading Transit Measure", self._unload_transit_measure_tool)
         for attr, methods in self._DOCKS:
-            _quietly(f"closing {attr}", lambda: self._teardown_dock(attr, methods))
+            _quietly(f"closing {attr}",
+                     lambda attr=attr, methods=methods: self._teardown_dock(attr, methods))
         for attr in self._WINDOWS:
-            _quietly(f"closing {attr}", lambda: self._teardown_window(attr))
+            _quietly(f"closing {attr}", lambda attr=attr: self._teardown_window(attr))
         # Safety net for tools the docks/windows set on the canvas themselves.
         _quietly("releasing the canvas map tool", self._unset_plugin_map_tool)
         _quietly("removing the Experimental toolbar button", self._remove_experimental_toolbar)
@@ -446,7 +447,7 @@ class SubseaCableTools:
         hooks, self._project_hooks = self._project_hooks, []
         for slot in hooks:
             _quietly("disconnecting projectRead",
-                     lambda: self.iface.projectRead.disconnect(slot))
+                     lambda slot=slot: self.iface.projectRead.disconnect(slot))
 
     def _release_map_tool(self, tool):
         """Unset ``tool`` if it is the canvas's active map tool."""
@@ -526,10 +527,11 @@ class SubseaCableTools:
             if is_deleted(action):
                 continue
             _quietly("removing a plugin menu entry",
-                     lambda: self.iface.removePluginMenu(self.menu, action))
-            _quietly("removing a toolbar icon", lambda: self.iface.removeToolBarIcon(action))
+                     lambda action=action: self.iface.removePluginMenu(self.menu, action))
+            _quietly("removing a toolbar icon",
+                     lambda action=action: self.iface.removeToolBarIcon(action))
             # Parented to the main window, so it would outlive the plugin.
-            _quietly("deleting an action", lambda: action.deleteLater())
+            _quietly("deleting an action", lambda action=action: action.deleteLater())
         for attr in self._ACTION_ATTRS:
             setattr(self, attr, None)
 

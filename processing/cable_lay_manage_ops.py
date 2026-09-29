@@ -25,7 +25,7 @@ import sqlite3
 import struct
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Set, Tuple
 
 from qgis.core import QgsFeatureRequest, QgsVectorLayer
 
@@ -36,6 +36,8 @@ from . import cable_lay_parsers as clp
 # numpy is imported inside the gap functions only: this module is loaded at
 # QGIS start-up (via the Recompute ISO Time algorithm) and numpy is slow to
 # import.
+if TYPE_CHECKING:  # annotations only
+    import numpy as np
 
 # Raw day-count time columns used by the importers, in preference order.
 RAW_TIME_FIELDS = ("Time", "Event Time", "Lay Time")

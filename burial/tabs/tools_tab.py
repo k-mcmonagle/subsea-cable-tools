@@ -229,7 +229,7 @@ class ToolDialog(QDialog):
     def _configs(self) -> List[Dict]:
         configs: List[Dict] = []
         for row in range(self.configs_table.rowCount()):
-            def cell(column: int) -> str:
+            def cell(column: int, row: int = row) -> str:
                 item = self.configs_table.item(row, column)
                 return (item.text() if item is not None else "").strip()
 

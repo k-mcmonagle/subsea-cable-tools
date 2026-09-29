@@ -35,8 +35,6 @@ from qgis.core import (
     QgsProcessingParameterString,
     QgsRectangle,
     QgsUnitTypes,
-    QgsWkbTypes,
-    QgsDistanceArea,
     QgsPrintLayout,
     QgsLayoutItemMap,
     QgsLayoutItemScaleBar,

@@ -96,7 +96,7 @@ def validate_ranges(value, route_length_km: Optional[float] = None
                             f"the route ({route_lo:.3f}–{route_hi:.3f}).")
         rows.append((start, end, index))
     rows.sort()
-    for (s1, e1, i1), (s2, e2, i2) in zip(rows, rows[1:]):
+    for (_s1, e1, i1), (s2, e2, i2) in zip(rows, rows[1:]):
         if s2 < e1 - _TOL_KM:
             problems.append(f"Rows {i1} and {i2} overlap (KP {s2:.3f}–"
                             f"{min(e1, e2):.3f}) — a KP can have only one "

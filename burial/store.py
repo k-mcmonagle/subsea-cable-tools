@@ -17,7 +17,7 @@ import os
 import shutil
 import sqlite3
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence
 
 from qgis.core import QgsCoordinateTransformContext, QgsProject, QgsVectorLayer
 

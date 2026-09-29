@@ -38,7 +38,7 @@ from .model import (
     SF_BEARING, SF_BURIAL, SF_CABLE_CODE, SF_CABLE_DIST, SF_CABLE_TYPE,
     SF_DATE_INSTALLED, SF_DIST, SF_EEZ, SF_FIBER_PAIR, SF_LAY_DIRECTION,
     SF_LAY_VESSEL, SF_PROTECTION, SF_SLACK, SF_TARGET_BURIAL, SF_TERRITORIAL,
-    extra_field_name, normalise_header_text, slack_to_percent, to_km, to_m,
+    extra_field_name, slack_to_percent, to_km, to_m,
 )
 from .reader import SourceGrid
 

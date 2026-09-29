@@ -14,9 +14,6 @@ from qgis.core import (QgsProcessing,
                        QgsProcessingParameterNumber,
                        QgsProcessingParameterString,
                        QgsFeature,
-                       QgsGeometry,
-                       QgsPoint,
-                       QgsDistanceArea,
                        QgsField,
                        QgsFields)
 from .algorithm_base import SubseaCableAlgorithm
@@ -114,11 +111,6 @@ class KPRangeHighlighterAlgorithm(SubseaCableAlgorithm):
         # Shared route builder (SeqNo/layer order, no noding).
         combined_geom = ordered_route_geometry(list(get_features_skip_invalid(source)))
 
-        if combined_geom.isEmpty() or not combined_geom.isMultipart():
-            line_parts = [combined_geom.asPolyline()]
-        else:
-            line_parts = combined_geom.asMultiPolyline()
-
         distance_mode = read_distance_mode(self, parameters, context)
         try:
             distance_calculator = make_distance_area(
@@ -128,10 +120,7 @@ class KPRangeHighlighterAlgorithm(SubseaCableAlgorithm):
         except ValueError as exc:
             raise QgsProcessingException(str(exc))
 
-        # Convert KP to meters
-        start_kp_m = start_kp * 1000
-        end_kp_m = end_kp * 1000
-
+        # extract_line_segment takes KPs in km (it converts to metres itself).
         seg_geom = extract_line_segment(combined_geom, start_kp, end_kp, distance_calculator)
         if seg_geom and not seg_geom.isEmpty():
             new_feature = QgsFeature(fields)

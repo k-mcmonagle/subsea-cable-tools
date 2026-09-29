@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import json
-from typing import Dict, List
+from typing import Dict
 
 from qgis.PyQt.QtCore import Qt, QTimer
 from qgis.PyQt.QtWidgets import (

@@ -25,11 +25,10 @@ from qgis.core import (QgsProcessing,
                        QgsFields,
                        QgsField,
                        QgsWkbTypes,
-                       QgsDistanceArea,
                        QgsProcessingException,
                        QgsCoordinateReferenceSystem,
                        QgsCoordinateTransform)
-from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, GEOMETRY_LINE, PROCESSING_NUMBER_DOUBLE
+from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_NUMBER_DOUBLE
 from ..kp_geo_utils import get_features_skip_invalid, ordered_route_geometry
 
 
@@ -418,7 +417,6 @@ class PlaceSingleKpPointAlgorithm(SubseaCableAlgorithm):
             matches the requested magnitude in meters.
             """
 
-            import math
 
             dx = float(seg_p2.x() - seg_p1.x())
             dy = float(seg_p2.y() - seg_p1.y())
@@ -469,7 +467,6 @@ class PlaceSingleKpPointAlgorithm(SubseaCableAlgorithm):
 
         def _solve_along_dir_in_project(base_pt: QgsPointXY, dir_x: float, dir_y: float, target_m: float) -> QgsPointXY:
             """Move from base_pt along (dir_x, dir_y) in project CRS such that measureLine(base, moved) == target_m."""
-            import math
 
             if target_m <= 0.0:
                 return QgsPointXY(float(base_pt.x()), float(base_pt.y()))

@@ -10,8 +10,6 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
-import bisect
-import math
 
 from ..slope_utils import (  # noqa: F401  (re-exported API)
     auto_half_window_m, contiguous_runs, interval_slope_series, supported_slopes, clean_crossings, terrace_baseline_m,

@@ -30,7 +30,6 @@ from qgis.core import (
     QgsField,
     QgsGeometry,
     QgsLineString,
-    QgsPoint,
     QgsPointXY,
     QgsWkbTypes,
 )

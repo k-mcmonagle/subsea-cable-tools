@@ -37,7 +37,7 @@ import bisect
 import logging
 import math
 import threading
-from typing import Iterable, Iterator, List, NamedTuple, Optional, Sequence, Union
+from typing import Iterable, Iterator, List, NamedTuple, Optional, Sequence
 
 from qgis.core import (
     QgsCoordinateReferenceSystem,

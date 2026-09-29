@@ -85,7 +85,7 @@ def compare_stated_kps(measured_km: Sequence[Optional[float]],
         return check
     check.start_kp_km = float(pairs[0][2])
     worst = 0.0
-    for i, m, s in pairs:
+    for _i, m, s in pairs:
         diff = abs(float(s) - float(m)) * 1000.0
         if diff > worst:
             worst, check.worst_kp_km = diff, float(m)

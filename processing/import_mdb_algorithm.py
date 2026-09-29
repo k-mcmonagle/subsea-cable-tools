@@ -34,9 +34,7 @@ from qgis.core import (
     QgsFeature,
     QgsGeometry,
     QgsProcessingException,
-    QgsCoordinateReferenceSystem,
     QgsProcessingContext,
-    QgsVectorFileWriter,
 )
 from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import (

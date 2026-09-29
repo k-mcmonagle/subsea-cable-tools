@@ -63,7 +63,6 @@ from .kp_bars import (
     STATUS_COLORS,
     VerdictStrip,
 )
-from .rules_engine import Interval
 from .selection_bus import selection_bus
 
 FIRE_COL = 2  # index of the fire-bar column in the rule table

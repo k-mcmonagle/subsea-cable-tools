@@ -2150,11 +2150,11 @@ class LaySimulatorDialog(QDialog):
         rows = []
         t = self.sched_table
         for r in range(t.rowCount()):
-            def txt(c):
+            def txt(c, r=r):
                 it = t.item(r, c)
                 return it.text().strip() if it is not None and it.text() else ""
 
-            def num(c, default=0.0):
+            def num(c, default=0.0, r=r):
                 v = _of(t.item(r, c))
                 return float(v) if v is not None else default
 
@@ -2475,7 +2475,7 @@ class LaySimulatorDialog(QDialog):
             r = self.asm_table.rowCount()
             self.asm_table.insertRow(r)
             is_body = str(entry.get("type", "segment")).lower() == "body"
-            def put(col, val):
+            def put(col, val, r=r):
                 self.asm_table.setItem(r, col, QTableWidgetItem("" if val in (None, "") else str(val)))
             put(COL_TYPE, "Body" if is_body else "Segment")
             put(COL_NAME, entry.get("name", ""))

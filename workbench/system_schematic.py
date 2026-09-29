@@ -380,7 +380,7 @@ class SystemSchematicWidget(QGraphicsView):
         entry = self._port_index.get(port_id)
         if entry is None:
             return
-        component, port = entry["component"], entry["port"]
+        component = entry["component"]
         component_id = component.get("component_id") or ""
         if entry.get("open"):
             if not self._pending_port_id:
@@ -1015,7 +1015,7 @@ def _endpoint_node(graph, components, member_ids, nodes, route_component,
         nodes.setdefault(node_id, {
             "label": _short(event or "Joint", 24), "node_type": "joint", "kind": "connection",
             "subject_id": str(connection_id),
-            "tooltip": (f"Direct cable-segment connection"
+            "tooltip": ("Direct cable-segment connection"
                         + (f" at “{event}”" if event else "")
                         + "\nRight-click to disconnect"),
         })

@@ -1176,7 +1176,6 @@ class WorkbenchDock(QDockWidget):
         if not self.assembly_panel.extract_from_rpl_id(rpl_id):
             return
         assembly = self.assembly_panel.assembly
-        fit_id = None
         placement_id = None
         if assembly is not None:
             rpl = self._store().get_rpl(rpl_id) or {}
@@ -1185,7 +1184,7 @@ class WorkbenchDock(QDockWidget):
                 placement_id = self._store().add_makeup_assembly(
                     route_id, assembly.assembly_id)
             self.rpl_panel.select_rpl(rpl_id)
-            fit_id = self.rpl_panel.fit_assembly_to_current(assembly.assembly_id)
+            self.rpl_panel.fit_assembly_to_current(assembly.assembly_id)
         self.refresh_tree()
         if placement_id is not None:
             self._select_ref((KIND_PLACEMENT, placement_id))

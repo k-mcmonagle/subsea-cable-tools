@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 from typing import Dict, List, Tuple
 
-from ..workbench.schema import gpkg_folder_for, new_id, sanitize_slug, utc_now_iso
+from ..workbench.schema import gpkg_folder_for, new_id, sanitize_slug, utc_now_iso  # noqa: F401 - new_id/utc_now_iso re-exported for planner modules
 
 SCHEMA_VERSION = 8
 

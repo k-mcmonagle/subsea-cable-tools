@@ -9,13 +9,12 @@ These helpers are used by both Processing algorithms and UI tools
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Sequence, Union
+from typing import Optional
 
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransformContext,
     QgsDistanceArea,
-    QgsGeometry,
     QgsProject,
 )
 
@@ -222,7 +221,6 @@ class GridDistanceArea(QgsDistanceArea):
                    for p, q in zip(points, points[1:]))
 
     def measureLength(self, geometry):  # noqa: N802
-        from .kp_geo_utils import iter_line_parts
         return sum(self.measureLine(list(part)) for part in iter_line_parts(geometry))
 
 

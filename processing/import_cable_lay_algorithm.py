@@ -7,7 +7,6 @@ Import cable lay position CSV data to a GeoPackage point layer.
 
 from __future__ import annotations
 
-import csv
 import os
 from typing import Dict, List, Tuple
 

@@ -312,7 +312,6 @@ def leg_solution(p_top: "np.ndarray", anchor_xy: Tuple[float, float],
         _H, s, _T = tangent_catenary(D, h, w)
         return t + s - L
 
-    h0 = max(0.05, h_of(min(R, L)))
     if closure(0.0) > 0.0:
         # Too short to touch down tangentially: free span to the anchor.
         cat = two_point_catenary(p_top, np.array([ax, ay, anchor_z]), L, w,
@@ -459,15 +458,13 @@ def leg_solution_frozen(p_top: "np.ndarray", path_pts: "np.ndarray",
     # overshoot tangency (path segments may be longer than ds); the surplus
     # branch then lays the excess back in fine steps, so the walk settles
     # inside the +/- 0.5*ds band around tangency.
-    pooled = False
     max_iter = int(abs(s_free) / max(ds, 0.1)) + 2 * len(pts) + 64
     for _ in range(max_iter):
         tdp = pts[-1]
         D, h, H, s_tan, chord = geom(tdp)
         if s_free > s_tan + 0.5 * ds:
             if D <= max(ds, 1e-6):
-                pooled = True     # no horizontal room: surplus hangs slack
-                break
+                break             # no horizontal room: surplus hangs slack
             u = (p_top[:2] - tdp[:2]) / D
             step = min(ds, s_free - s_tan)
             nx, ny = tdp[0] + u[0] * step, tdp[1] + u[1] * step

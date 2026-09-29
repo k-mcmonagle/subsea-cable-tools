@@ -167,7 +167,7 @@ class RegisterRPLAlgorithm(SubseaCableAlgorithm):
             return (2, index)
 
         points: List[RplPoint] = []
-        for i, (_, feature) in enumerate(sorted(enumerate(point_features), key=point_sort_key)):
+        for _, feature in sorted(enumerate(point_features), key=point_sort_key):
             geom = feature.geometry()
             if geom is None or geom.isEmpty():
                 continue
@@ -190,7 +190,7 @@ class RegisterRPLAlgorithm(SubseaCableAlgorithm):
             ))
 
         segments: List[RplSegment] = []
-        for i, (_, feature) in enumerate(sorted(enumerate(line_features), key=line_sort_key)):
+        for _, feature in sorted(enumerate(line_features), key=line_sort_key):
             attrs = {
                 f.name(): _value(feature, f.name())
                 for f in feature.fields()

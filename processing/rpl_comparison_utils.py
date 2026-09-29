@@ -34,7 +34,6 @@ from typing import Optional, Tuple
 from qgis.core import (
     QgsGeometry,
     QgsPointXY,
-    QgsWkbTypes,
 )
 from ..qgis_compat import GEOMETRY_POINT
 

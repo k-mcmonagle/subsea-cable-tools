@@ -90,7 +90,7 @@ def templates_from_csv_text(text: str) -> Tuple[List[Dict], List[str]]:
                     % ", ".join(TEMPLATE_FIELDS)]
     templates, warnings = [], []
     for line_number, row in enumerate(reader, start=2):
-        def cell(key):
+        def cell(key, row=row):
             return str(row.get(headers.get(key, ""), "") or "").strip()
 
         name = cell("name")

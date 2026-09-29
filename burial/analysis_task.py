@@ -50,7 +50,7 @@ from ..workbench import rules_inputs as ri
 from ..workbench import schema as wb_schema
 from ..workbench.depth_service import DepthSourceConfig
 from ..bathymetry_sampling import RasterSampler, expand_rasters, layer_options, normalise_depth
-from ..slope_utils import cross_profile_metrics, clean_crossings, interpolate_covered, is_finite
+from ..slope_utils import cross_profile_metrics, clean_crossings, interpolate_covered
 from ..workbench.rules_engine import Interval
 from . import generation, map_layers, profile_data, schema
 
@@ -605,7 +605,7 @@ class DepthSnapshot:
             pz = sz = peak = None
             if center is not None and a is not None and b is not None and distance.measureLine(a,b) > 1e-6:
                 bearing = distance.bearing(a,b) + math.pi/2
-                def offset(t):
+                def offset(t, center=center, bearing=bearing):
                     return distance.computeSpheroidProject(center, abs(t), bearing if t >= 0 else bearing+math.pi)
                 candidates = []
                 if raster_xs is not None:

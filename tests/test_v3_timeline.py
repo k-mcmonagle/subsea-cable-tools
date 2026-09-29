@@ -10,7 +10,6 @@ steady-lay approach) — the underlying solver accuracy is covered by
 from __future__ import annotations
 
 import importlib.util
-import math
 from pathlib import Path
 import sys
 import types

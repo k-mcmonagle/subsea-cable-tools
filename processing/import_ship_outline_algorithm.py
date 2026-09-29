@@ -13,8 +13,6 @@ from qgis.core import (
     QgsProcessingParameterEnum,
     QgsProcessingParameterNumber,
     QgsProcessingParameterFeatureSink,
-    QgsProcessingParameterPoint,
-    QgsProcessingParameterString,
     QgsProcessingParameterCrs,
     QgsVectorLayer,
     QgsFeature,
@@ -198,7 +196,6 @@ This tool imports a ship outline from a DXF file and creates a polygon or polyli
         )
 
         # Transform and merge features
-        from math import radians, cos, sin
         geoms = []
         total = max(dxf_layer.featureCount(), 1)
         for index, feat in enumerate(dxf_layer.getFeatures()):

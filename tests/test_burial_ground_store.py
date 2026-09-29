@@ -342,7 +342,7 @@ def test_overlay_layers() -> bool:
     ok = ok and abs(float(by_start[0.0]["req_dol_m"]) - 1.5) < 1e-9 \
         and by_start[5.0]["soil"] == "Clay"
     ok = ok and abs(float(by_start[5.0]["end_kp"]) - 40.0) < 1e-6   # attribute keeps the row's KP
-    ok = ok and not bas.geometryOptions() is None
+    ok = ok and bas.geometryOptions() is not None
     # Adding a column reshapes the layer (field map healed in place).
     bas_id = bas.id()
     ok = ok and model.save_bas_columns(cols + [{"key": "risk", "label": "Risk", "kind": "text"}])

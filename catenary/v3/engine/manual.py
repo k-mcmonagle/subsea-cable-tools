@@ -29,9 +29,8 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, field
 import math
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 
 from .timeline import (
     Attachment,

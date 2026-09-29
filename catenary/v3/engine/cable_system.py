@@ -325,7 +325,7 @@ class AssemblyMapper:
         out["clamped"] = clamped_lo | clamped_hi
         pc = np.clip(pos, starts[0], ends[-1] - 1e-9)
         idx = np.clip(np.searchsorted(ends, pc, side="right"), 0, len(self._segments) - 1)
-        for k, (a, b, seg, seg_index) in enumerate(self._segments):
+        for k, (_a, _b, seg, seg_index) in enumerate(self._segments):
             sel = idx == k
             if not np.any(sel):
                 continue

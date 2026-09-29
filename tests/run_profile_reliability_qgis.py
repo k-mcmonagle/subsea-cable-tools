@@ -110,7 +110,9 @@ with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
     assert any(v is not None for v in window._slopes)
     from qgis.PyQt.QtCore import Qt
     class Click:
-        def __init__(self,x,z): self.p=window.depth_item.vb.mapViewToScene(__import__('qgis.PyQt.QtCore',fromlist=['QPointF']).QPointF(x,z))
+        # Bound now: the teardown below deletes ``window``.
+        vb = window.depth_item.vb
+        def __init__(self,x,z): self.p=self.vb.mapViewToScene(__import__('qgis.PyQt.QtCore',fromlist=['QPointF']).QPointF(x,z))
         def scenePos(self): return self.p
         def button(self): return Qt.MouseButton.LeftButton
         def accept(self): pass
@@ -222,7 +224,7 @@ with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
     window.close(); QApplication.processEvents(); assert window.user_closed and not window._timer.isActive()
     window.cleanup(); QApplication.processEvents()
     project.removeMapLayer(layer.id())
-    del window, depth, sampler, layer, sources, task, snapshot
+    del Click, window, depth, sampler, layer, sources, task, snapshot
     import gc
     gc.collect()
     print('[PASS] QGIS bilinear plane, no extrapolation, quick profile freeze/units/PNG/close')

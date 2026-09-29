@@ -14,7 +14,6 @@ clipboard — paste straight into Catenary Calculator V2 / Cable Lay Simulator.
 
 from __future__ import annotations
 
-import json
 import os
 from typing import Dict, List, Optional
 
@@ -705,10 +704,6 @@ class AssemblyManagerPanel(QWidget):
         if not fits:
             return
         fit_row = fits[0]
-        try:
-            params = json.loads(fit_row.get("params_json") or "{}")
-        except ValueError:
-            params = {}
         starts = self.assembly.cable_dist_starts_m()
         if not (0 <= item_index < len(starts)):
             return

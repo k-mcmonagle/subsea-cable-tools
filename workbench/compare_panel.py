@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import csv
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from qgis.PyQt.QtCore import Qt, pyqtSignal
 from qgis.PyQt.QtGui import QBrush, QColor

@@ -27,9 +27,8 @@ from qgis.PyQt.QtWidgets import (
 from qgis.PyQt.QtGui import QColor
 
 from qgis.core import (
-    QgsProject, QgsPointXY, QgsDistanceArea, QgsWkbTypes,
-    QgsGeometry, QgsVectorLayer, QgsFeature, QgsFields,
-    QgsField, QgsUnitTypes, Qgis, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
+    QgsProject, QgsPointXY, QgsGeometry, QgsVectorLayer, QgsFeature, QgsFields,
+    QgsField, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
     QgsFillSymbol, QgsSingleSymbolRenderer, QgsCsException
 )
 from ..qgis_compat import DISTANCE_METERS, FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_STRING, GEOMETRY_LINE, GEOMETRY_POINT, GEOMETRY_POLYGON, MESSAGE_INFO
@@ -520,7 +519,6 @@ class TransitMeasureDialog(QDialog):
         if self.points[idx] == new_pt:
             return
         
-        old_pt = self.points[idx]
         self.points[idx] = new_pt
         
         # Update the point rubber band
@@ -766,7 +764,6 @@ class TransitMeasureDialog(QDialog):
         self.waypoints_table.insertRow(row)
         if cum_m is None:
             cum_m = sum(self.distances_m[:wp_id]) if wp_id <= len(self.distances_m) else sum(self.distances_m)
-        factor = self._distance_factor()
         unit = self._time_unit()
         speed_mps = self._speed_mps()
         cum_t_s = cum_m / speed_mps if speed_mps > 0 else 0
@@ -997,7 +994,6 @@ class TransitMeasureDialog(QDialog):
                     headers = [tr("WP ID"), tr("Latitude"), tr("Longitude"), tr("Bearing To Next"), tr("Dist To Next"), tr("Cum Dist"), tr("Cum Time")]
                     writer.writerow(headers)
                     # Write data rows
-                    factor = self._distance_factor()
                     unit = self._time_unit()
                     speed_mps = self._speed_mps()
                     cum_m = 0.0

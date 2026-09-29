@@ -13,19 +13,14 @@ from qgis.core import (
     QgsProcessingParameterField,
     QgsProcessingParameterNumber,
     QgsProcessingParameterVectorLayer,
-    QgsProcessingParameterEnum,
-    QgsProcessingParameterCrs,
     QgsFeature,
     QgsFields,
-    QgsField,
     QgsGeometry,
-    QgsWkbTypes,
     QgsCoordinateTransform,
     QgsPointXY
 )
 from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import GEOMETRY_LINE, PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE, PROCESSING_NUMBER_INTEGER
-import os
 from ..kp_geo_utils import get_features_skip_invalid
 
 class PlaceShipOutlinesAlgorithm(SubseaCableAlgorithm):

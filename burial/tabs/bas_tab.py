@@ -319,7 +319,7 @@ class BasTab(QWidget):
         return f"Stored value: {raw}" if raw.strip() != shown.strip() else ""
 
     def _fill_row(self, index: int, row: Dict) -> None:
-        for col, (header, key, kind) in enumerate(self._specs):
+        for col, (_header, key, kind) in enumerate(self._specs):
             text = self._cell_text(row, key, kind)
             item = QTableWidgetItem(text)
             if kind == bas_model.KIND_NUMBER:

@@ -10,7 +10,6 @@ optimisations must not change. End-to-end accuracy is gated separately by
 from __future__ import annotations
 
 import importlib.util
-import math
 from pathlib import Path
 import sys
 import types

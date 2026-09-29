@@ -8,7 +8,6 @@ spans, summaries and the hazards CSV export.
 
 from __future__ import annotations
 
-import json
 
 from ..burial import attribute_rules, io_csv, risk, schema
 

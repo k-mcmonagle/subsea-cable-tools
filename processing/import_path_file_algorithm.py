@@ -182,14 +182,14 @@ class ImportPathFileAlgorithm(SubseaCableAlgorithm):
             def _point_geometry(row):
                 return QgsGeometry.fromPointXY(QgsPointXY(row["x"], row["y"]))
 
-            def _add(layer, name):
+            def _add(layer, name, crs=crs, stem=stem):
                 disk = _write_to_temporary_gpkg(layer, name, crs, context, feedback)
                 if disk is None:
                     return
                 ImportMdbAlgorithm._register_output_layer(context, disk, name, stem)
                 output_layers.append(disk.id())
 
-            def _with_kp_km(rows, kp_field):
+            def _with_kp_km(rows, kp_field, kp_unit=kp_unit):
                 enriched = []
                 for row in rows:
                     row = dict(row)
@@ -217,7 +217,7 @@ class ImportPathFileAlgorithm(SubseaCableAlgorithm):
             route_layer = _build_layer(
                 f"LineString?crs={crs_def}", f"{stem} - Route", route_rows,
                 _attribute_columns(route_rows),
-                lambda _row: QgsGeometry.fromPolylineXY(
+                lambda _row, data=data: QgsGeometry.fromPolylineXY(
                     [QgsPointXY(x, y) for x, y, _z in data.route_vertices]))
             _add(route_layer, f"{stem} - Route")
 

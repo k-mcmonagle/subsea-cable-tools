@@ -13,7 +13,7 @@ exporters share one builder and it stays unit-testable.
 
 from __future__ import annotations
 
-from typing import Dict, List, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 ROW_POINT = "point"
 ROW_LEG = "leg"

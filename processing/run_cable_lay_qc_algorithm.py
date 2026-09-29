@@ -14,7 +14,6 @@ The heavy lifting (gap / duplicate / precision detection) lives in
 
 from __future__ import annotations
 
-import json
 import os
 import uuid
 from datetime import datetime
@@ -31,7 +30,6 @@ from qgis.core import (
     QgsProcessingParameterFeatureSink,
     QgsProcessingParameterField,
     QgsProcessingParameterNumber,
-    QgsProcessingParameterString,
     QgsProcessingParameterVectorLayer,
     QgsWkbTypes,
 )

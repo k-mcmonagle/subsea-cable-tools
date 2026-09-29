@@ -52,7 +52,7 @@ def local_frame_transforms(origin_map_xy: Tuple[float, float], crs_authid: str):
     frame and the CRS ``crs_authid``. All local -> map placement must go
     through these — adding metres to map coordinates directly is wrong in
     geographic or non-metre CRSs."""
-    from qgis.core import QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject
+    from qgis.core import QgsCoordinateReferenceSystem, QgsProject
 
     map_crs = QgsCoordinateReferenceSystem(crs_authid)
     if not map_crs.isValid():

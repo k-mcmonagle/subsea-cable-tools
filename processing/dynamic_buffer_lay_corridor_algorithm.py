@@ -30,7 +30,6 @@ from qgis.core import (
     QgsProcessingParameterField,
     QgsProcessingParameterMultipleLayers,
     QgsProcessingParameterNumber,
-    QgsProcessingParameterString,
     QgsProcessingParameterVectorLayer,
     QgsProcessingParameterFeatureSource,
     QgsProcessingParameterFeatureSink,

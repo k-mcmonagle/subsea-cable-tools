@@ -370,7 +370,7 @@ def solve_drape(
     L0_rest = np.full(n_seg, L0)
     n_outer = 5
 
-    for outer in range(n_outer):
+    for _outer in range(n_outer):
         v[:] = 0.0
         ke_prev = 0.0
         converged = False

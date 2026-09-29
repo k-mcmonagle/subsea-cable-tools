@@ -31,7 +31,7 @@ from .model import (
     SF_LAY_VESSEL, SF_PROTECTION, SF_SLACK, SF_TARGET_BURIAL, SF_TERRITORIAL,
     header_signature, normalise_header_text,
 )
-from .parser import parse_point_coords, row_has_coords
+from .parser import row_has_coords
 from .reader import SourceGrid
 
 MAX_HEADER_ROWS = 12          # header block search depth above the data start

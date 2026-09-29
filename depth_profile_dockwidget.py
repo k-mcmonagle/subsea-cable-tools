@@ -1,6 +1,6 @@
 from qgis.PyQt.QtWidgets import (
     QDockWidget, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
-    QSpinBox, QCheckBox, QFileDialog, QTabWidget, QFormLayout, QSizePolicy, QProgressBar,
+    QSpinBox, QCheckBox, QFileDialog, QTabWidget, QFormLayout, QProgressBar,
     QListWidget, QListWidgetItem, QDoubleSpinBox, QInputDialog, QToolButton
 )
 from qgis.PyQt.QtCore import Qt, QSettings, QTimer

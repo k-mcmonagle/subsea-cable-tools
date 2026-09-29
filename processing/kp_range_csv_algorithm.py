@@ -19,7 +19,7 @@ from __future__ import annotations
 import csv
 import io
 import re
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Tuple
 
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (QgsProcessing,
@@ -34,8 +34,7 @@ from qgis.core import (QgsProcessing,
                        QgsGeometry,
                        QgsFields,
                        QgsField,
-                       QgsWkbTypes,
-                       QgsDistanceArea)
+                       QgsWkbTypes)
 from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import (
     FIELD_TYPE_DOUBLE,

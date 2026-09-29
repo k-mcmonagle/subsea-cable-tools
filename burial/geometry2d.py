@@ -14,7 +14,7 @@ Unit-tested headless in ``tests/test_burial_tools.py``.
 from __future__ import annotations
 
 from math import atan2, cos, degrees, hypot, radians, sin
-from typing import Iterable, List, Sequence, Tuple
+from typing import Iterable, List, Tuple
 
 Point = Tuple[float, float]
 

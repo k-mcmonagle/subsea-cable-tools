@@ -23,15 +23,12 @@ from qgis.core import (
     QgsFeatureSink,
     QgsProcessingParameterFeatureSource,
     QgsProcessingParameterFeatureSink,
-    QgsProcessingParameterBoolean,
     QgsProcessingException,
     QgsFeature,
     QgsFields,
     QgsField,
     QgsGeometry,
-    QgsPointXY,
-    QgsWkbTypes,
-    QgsProject
+    QgsWkbTypes
 )
 from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, GEOMETRY_POINT

@@ -21,7 +21,7 @@ falls back to the scenario defaults.
 from __future__ import annotations
 
 import json
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 try:
     from qgis.PyQt.QtCore import Qt, pyqtSignal

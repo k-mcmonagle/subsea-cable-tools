@@ -10,7 +10,7 @@ import os
 import traceback
 
 from qgis.PyQt.QtGui import QIcon
-from qgis.core import QgsProcessingProvider, QgsMessageLog, Qgis
+from qgis.core import QgsProcessingProvider, QgsMessageLog
 from ..qgis_compat import MESSAGE_INFO, MESSAGE_WARNING
 
 _PLUGIN_ICON = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'icon.png')

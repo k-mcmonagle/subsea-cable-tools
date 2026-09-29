@@ -16,11 +16,11 @@ timeline scrubber.
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .views2d import _ShimHolder, make_canvas
+from .views2d import make_canvas
 
 try:
     from qgis.PyQt.QtWidgets import (

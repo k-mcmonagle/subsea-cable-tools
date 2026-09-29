@@ -990,7 +990,7 @@ class View3DWidget(QWidget):
 
     def _draw_hud(self, painter: QtGui.QPainter) -> None:
         painter.setRenderHint(_RENDER_HINT.Antialiasing, True)
-        w, h = self.width(), self.height()
+        w = self.width()
         title = str(getattr(self._scene, "title", "") or "") if self._scene is not None else ""
         if title:
             font = painter.font()

@@ -17,7 +17,7 @@ The output layer is automatically named with a '_Area_Listing' suffix based on t
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from qgis.PyQt.QtCore import QCoreApplication
 from .algorithm_base import SubseaCableAlgorithm
@@ -32,7 +32,6 @@ from qgis.core import (
     QgsFields,
     QgsField,
     QgsGeometry,
-    QgsPoint,
     QgsPointXY,
     QgsProcessing,
     QgsProcessingException,
@@ -40,7 +39,6 @@ from qgis.core import (
     QgsProcessingParameterFeatureSink,
     QgsProcessingParameterFeatureSource,
     QgsProcessingParameterMultipleLayers,
-    QgsProject,
     QgsSpatialIndex,
     QgsWkbTypes,
 )

@@ -21,7 +21,6 @@ Strategy (pragmatic, engineering-grade):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import math
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -217,8 +216,8 @@ def optimize_bu_schedule(
         if progress is not None:
             base = (rounds - 1) / float(max_rounds)
             span = 1.0 / float(max_rounds)
-            sub_progress = (lambda f, lbl, _b=base, _s=span:
-                            progress(_b + _s * f, f"preview {rounds}: {lbl}"))
+            sub_progress = (lambda f, lbl, _b=base, _s=span, _r=rounds:
+                            progress(_b + _s * f, f"preview {_r}: {lbl}"))
         make_sim = sim_factory or OperationSimulator
         res = make_sim(scn, bathy, opts).run(sub_progress)
         landing = _landing_xy(res)

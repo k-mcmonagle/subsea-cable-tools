@@ -747,7 +747,7 @@ def build_report_html(plan: Dict,
         parts.append("<p class='meta'>" + "<br>".join([
             f"<b>Generation:</b> {_esc(str(generation.get('generation_id') or '')[:8])}",
             f"<b>Run (UTC):</b> {_esc(generation.get('run_utc'))}",
-            f"<b>Parameters:</b> " + _esc(", ".join(
+            "<b>Parameters:</b> " + _esc(", ".join(
                 f"{k}={v}" for k, v in sorted(params.items()))),
             f"<b>Input fingerprints recorded:</b> {len(fingerprints)}",
         ]) + "</p>")

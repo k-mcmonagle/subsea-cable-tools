@@ -200,7 +200,6 @@ def test_ridge_profile_matches_2d_drape_solver():
     c = res3d.chains[0]
     _assert_close(c.top_tension_kN, res2d.top_tension_kN, 0.02, "ridge top tension")
     # Same contact topology: cable rests on the ridge in both models.
-    contact2d = res2d.contact
     n_spans_2d = len(res2d.spans)
     n_spans_3d = len(c.spans)
     assert n_spans_3d == n_spans_2d, f"span count {n_spans_3d} vs {n_spans_2d}"

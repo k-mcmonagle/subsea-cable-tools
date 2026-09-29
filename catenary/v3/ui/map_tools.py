@@ -17,7 +17,7 @@ project CRS; ``origin_map_xy`` translates local -> map.
 from __future__ import annotations
 
 import math
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 

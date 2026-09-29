@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Standalone checks for MS Project clipboard TSV generation."""
 
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from ..planner.msproject_export import build_msp_tsv
 from ..planner.timeline_engine import TaskSpec, compute_schedule

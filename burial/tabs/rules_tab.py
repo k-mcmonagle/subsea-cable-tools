@@ -32,7 +32,6 @@ from qgis.PyQt.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
-    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,

@@ -18,7 +18,6 @@ import types
 from typing import List
 
 from qgis.core import (
-    Qgis,
     QgsApplication,
     QgsFeature,
     QgsField,

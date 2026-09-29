@@ -32,11 +32,9 @@ from qgis.core import (QgsProcessing,
                        QgsProcessingParameterString,
                        QgsFeature,
                        QgsGeometry,
-                       QgsPointXY,
                        QgsFields,
                        QgsField,
                        QgsWkbTypes,
-                       QgsDistanceArea,
                        QgsProcessingException)
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_FIELD_NUMERIC
 from ..kp_geo_utils import RouteFrame, get_features_skip_invalid, ordered_route_geometry

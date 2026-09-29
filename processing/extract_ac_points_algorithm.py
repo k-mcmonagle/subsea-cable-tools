@@ -22,13 +22,11 @@ from qgis.core import (QgsProcessing,
                        QgsProcessingParameterFeatureSink,
                        QgsFeature,
                        QgsGeometry,
-                       QgsPointXY,
                        QgsFields,
                        QgsField,
                        QgsWkbTypes,
-                       QgsDistanceArea,
                        QgsProcessingLayerPostProcessorInterface)
-from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, GEOMETRY_LINE, PROCESSING_NUMBER_DOUBLE
+from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_NUMBER_DOUBLE
 from ..kp_geo_utils import get_features_skip_invalid, ordered_route_geometry
 
 class ExtractACPointsAlgorithm(SubseaCableAlgorithm):

@@ -13,8 +13,7 @@ from qgis.core import (
     QgsPointXY,
     QgsWkbTypes,
     QgsProcessingException,
-    QgsFeatureSink,
-    QgsDistanceArea
+    QgsFeatureSink
 )
 from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_NUMBER_DOUBLE

@@ -33,7 +33,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence
 from urllib.parse import quote
 
 from ..plugin_log import log_warning

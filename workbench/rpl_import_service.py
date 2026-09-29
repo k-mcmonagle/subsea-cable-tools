@@ -22,7 +22,6 @@ change to ``RPL_FIELDS`` that downstream readers would notice.
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -38,7 +37,7 @@ from ..rpl_import.model import (
     SEVERITY_ERROR, SEVERITY_INFO,
 )
 from . import schema
-from .rpl_engine import RplModel, RplPoint, RplSegment, recompute, SlackMode
+from .rpl_engine import RplModel, RplPoint, RplSegment
 from .rpl_layer_io import model_rows_for_layers
 from .store import WorkbenchStore
 

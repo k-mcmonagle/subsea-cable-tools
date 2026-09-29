@@ -15,16 +15,12 @@ from typing import List, Optional, Sequence, Tuple
 
 from qgis.PyQt.QtCore import QCoreApplication
 from .algorithm_base import SubseaCableAlgorithm
-from ..kp_range_utils import make_distance_area
 from qgis.core import (
     QgsCoordinateTransform,
-    QgsDistanceArea,
     QgsFeature,
-    QgsFeatureRequest,
     QgsFeatureSink,
     QgsFields,
     QgsField,
-    QgsGeometry,
     QgsPointXY,
     QgsProcessing,
     QgsProcessingException,
@@ -36,7 +32,6 @@ from qgis.core import (
     QgsProcessingParameterMultipleLayers,
     QgsProcessingParameterNumber,
     QgsProcessingParameterVectorLayer,
-    QgsProject,
     QgsRasterLayer,
     QgsVectorLayer,
     QgsWkbTypes,
@@ -396,7 +391,7 @@ class AddDepthToPointLayerAlgorithm(SubseaCableAlgorithm):
             if output_mode == 1 and raster_field_map:
                 # Map raster names to values so we can fill per-raster fields.
                 raster_values_by_name = {name: val for name, val in raster_all}
-                for fld, (raster, _transform) in raster_field_map:
+                for _fld, (raster, _transform) in raster_field_map:
                     attrs.append(raster_values_by_name.get(raster.name()))
 
             out_feat.setAttributes(attrs)

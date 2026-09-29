@@ -16,7 +16,6 @@ from qgis.core import (
 from qgis.gui import QgsMapCanvas, QgsMapTool
 
 from ..planner.map_overlay import PlannerMapOverlay
-from ..planner import schema
 from ..planner.planner_dock import PlannerDock, ResourceDialog, SketchTasksDialog, _simulation_label
 from ..planner.sketch_tool import SketchSession, _parse_lat_lon
 from ..planner.spatial_tasks import _join_connected, _reversed_geometry

@@ -13,10 +13,11 @@ try:
 except ImportError:  # pragma: no cover - PyQt6
     QVariant = None
 
+# Re-exported: modules import QAction from here (QtGui in Qt6, QtWidgets in Qt5).
 try:
-    from qgis.PyQt.QtGui import QAction
+    from qgis.PyQt.QtGui import QAction  # noqa: F401
 except ImportError:  # pragma: no cover - QGIS 3 / Qt5
-    from qgis.PyQt.QtWidgets import QAction
+    from qgis.PyQt.QtWidgets import QAction  # noqa: F401
 
 try:
     from qgis.PyQt import sip as _sip

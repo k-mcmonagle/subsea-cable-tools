@@ -90,7 +90,7 @@ The quick profile reports detected terraces, the actual averaging length and a w
 
 ### Dependencies
 
-The plugin vendors `openpyxl`, `pyqtgraph`, `et_xmlfile`, `access_parser`, `construct` and `tabulate` under `lib/`, added to `sys.path` only when missing from the host QGIS Python. End users do not need to install pip packages for typical workflows; plugin plotting tools use the vendored `pyqtgraph` backend.
+The plugin vendors `openpyxl`, `pyqtgraph`, `et_xmlfile`, `access_parser`, `construct` and `tabulate` under `lib/` (versions and licences in `lib/VENDORED.md`). The folder is appended to `sys.path` as a fallback, so copies that ship with the host QGIS Python take precedence. End users do not need to install pip packages for typical workflows; plugin plotting tools use the vendored `pyqtgraph` backend.
 
 The MDB import works out of the box on any platform via the vendored pure-Python `access_parser` reader. If a particular file cannot be read that way, it falls back to ODBC, which requires Windows + the Microsoft Access Database Engine ODBC driver and `pyodbc` available to the QGIS Python.
 

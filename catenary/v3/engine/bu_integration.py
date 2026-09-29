@@ -30,7 +30,7 @@ Users of this module never handle those conversions; they ask for
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .cable_system import (
     AssemblyItem,

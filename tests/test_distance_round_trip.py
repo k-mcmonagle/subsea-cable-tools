@@ -96,7 +96,6 @@ def test_cartesian_on_geographic_rejected() -> bool:
     route. The result must be metres (close to geodesic), never degrees.
     """
 
-    from qgis.core import QgsPointXY
     from ..kp_range_utils import GridDistanceArea
     da = make_distance_area(QgsCoordinateReferenceSystem("EPSG:4326"), mode="cartesian")
     geo = make_distance_area(QgsCoordinateReferenceSystem("EPSG:4326"))

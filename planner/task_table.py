@@ -26,7 +26,7 @@ from . import operation_types, schema
 from .feature_ref import shared_owner_task_id, shared_reference
 from .timeline_engine import (
     KNOT_M_PER_HOUR, TaskSpec, compute_cable, compute_fuel, compute_schedule,
-    parse_speed_profile, profile_duration_hours, resolve_speed_profile,
+    parse_speed_profile, resolve_speed_profile,
 )
 
 LINK_KEYS = ("layer_id", "layer_source", "layer_name", "feature_id",
@@ -657,7 +657,6 @@ class TaskTableWidget(QTableWidget):
         indices = self._include_summary_descendants(indices)
         self.checkpoint()
         now = schema.utc_now_iso()
-        block_ids = {str(self.rows[index].get("task_id") or "") for index in indices}
         last_original_id = next(
             (str(self.rows[index].get("task_id") or "")
              for index in reversed(indices) if not self._is_summary(index)), "")

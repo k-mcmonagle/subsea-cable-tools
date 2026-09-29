@@ -23,7 +23,6 @@ import os
 
 from qgis.PyQt.QtCore import QCoreApplication, QSettings
 from qgis.core import (
-    QgsProcessing,
     QgsProcessingParameterFile,
     QgsProcessingParameterString,
     QgsProcessingParameterNumber,
@@ -943,7 +942,7 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
             line_sink.addFeature(feat_line, QgsFeatureSink.FastInsert)
 
         # Provide summary information
-        feedback.pushInfo(f"RPL import completed successfully:")
+        feedback.pushInfo("RPL import completed successfully:")
         feedback.pushInfo(f"- Points processed: {len(point_list)}")
         feedback.pushInfo(f"- Lines processed: {len(line_list)}")
         feedback.pushInfo(f"- Last row processed: {start_row + processed - 1}")
