@@ -9,6 +9,7 @@ computation to :mod:`solve_controller` on a worker thread. No physics here.
 from __future__ import annotations
 
 import json
+import logging
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -24,6 +25,7 @@ try:
         QSplitter, QStackedWidget, QTabWidget, QTableWidget, QTableWidgetItem,
         QTextEdit, QToolButton, QVBoxLayout, QWidget,
     )
+    from ....plugin_log import log_exception
     from ....qgis_compat import (
         HEADER_RESIZE_MODE_FIXED,
         HEADER_RESIZE_MODE_INTERACTIVE,
@@ -31,7 +33,9 @@ try:
         SIZE_POLICY_PREFERRED,
         qt_exec,
     )
-except Exception:  # pragma: no cover - standalone testing
+except ImportError as exc:  # pragma: no cover - standalone testing without QGIS
+    if exc.name != "qgis":
+        raise  # QGIS is there: a real error — never pull PyQt5 into a Qt6 process
     from PyQt5 import QtCore, QtGui
     from PyQt5.QtCore import Qt, QSettings
     from PyQt5.QtWidgets import (
@@ -52,6 +56,9 @@ except Exception:  # pragma: no cover - standalone testing
         exec_method = getattr(obj, "exec", None) or getattr(obj, "exec_")
         return exec_method(*args, **kwargs)
 
+    def log_exception(message, level=logging.WARNING):
+        logging.getLogger("subsea_cable_tools").log(level, message, exc_info=True)
+
 from .integration_editor import BUIntegrationEditor
 from .results_panel import render_results_html
 from .scene import compass_to_math_deg
@@ -61,6 +68,21 @@ from .views2d import PlanView, ProfileView
 
 _ORIENT = getattr(Qt, "Orientation", Qt)
 _ARROW = getattr(Qt, "ArrowType", Qt)
+_CURSOR = getattr(Qt, "CursorShape", Qt)
+
+# Worker modes the Solve button can restart mid-run (operation, optimise and
+# plan runs are long and only stop via Cancel).
+_RESTARTABLE_MODES = ("static", "steady")
+# Bounded wait for a running solve when the dialog is shut down.
+_SHUTDOWN_WAIT_MS = 3000
+
+
+def _event_global_y(event) -> int:
+    """Global y of a mouse event (Qt6 ``globalPosition``, Qt5 ``globalY``)."""
+    position = getattr(event, "globalPosition", None)
+    if position is not None:
+        return int(position().y())
+    return int(event.globalY())
 
 MODES = [("static", "Static hang"), ("steady", "Steady lay"), ("operation", "Operation simulation")]
 SOLVE_MODES = [
@@ -117,12 +139,12 @@ class _TableResizeGrip(QWidget):
         self._press_y = None
         self._start_h = 0
         self.setFixedHeight(11)
-        self.setCursor(Qt.SizeVerCursor)
+        self.setCursor(_CURSOR.SizeVerCursor)
         self.setToolTip("Drag to resize the table height")
 
     def paintEvent(self, _e):
+        p = QtGui.QPainter(self)
         try:
-            p = QtGui.QPainter(self)
             w = self.width()
             cy = self.height() // 2
             p.setPen(QtGui.QColor(150, 150, 150))
@@ -130,24 +152,19 @@ class _TableResizeGrip(QWidget):
                 cx = w // 2 + dx
                 p.drawLine(cx, cy - 1, cx + 3, cy - 1)
                 p.drawLine(cx, cy + 1, cx + 3, cy + 1)
-            p.end()
         except Exception:
-            pass
+            log_exception("Lay simulator: table grip paint failed", level=logging.DEBUG)
+        finally:
+            p.end()
 
     def mousePressEvent(self, e):
-        try:
-            self._press_y = e.globalY()
-        except Exception:
-            self._press_y = int(e.globalPosition().y())
+        self._press_y = _event_global_y(e)
         self._start_h = self._table.height()
 
     def mouseMoveEvent(self, e):
         if self._press_y is None:
             return
-        try:
-            gy = e.globalY()
-        except Exception:
-            gy = int(e.globalPosition().y())
+        gy = _event_global_y(e)
         new_h = max(self._min_h, self._start_h + (gy - self._press_y))
         self._table._manual_height = True
         self._table.setMinimumHeight(new_h)
@@ -173,8 +190,12 @@ class LaySimulatorDialog(QDialog):
         self._registry: List[Tuple[str, QWidget]] = []
         self._collapsibles: Dict[str, Tuple[QToolButton, QWidget]] = {}
         self._initializing = True
+        self._shut_down = False
+        # The running solve; set until its thread has ENDED (QThread.finished),
+        # not merely until its result arrived — see _on_worker_finished.
         self._worker: Optional[SolveWorker] = None
-        self._pending: bool = False
+        self._pending: bool = False                   # re-solve queued behind it
+        self._got_result = False                      # its result was delivered
         self._last_out: Optional[RunOutput] = None
         self._grid_bathy: Optional[dict] = None       # sampled raster grid cfg
         self._grid_origin: Optional[dict] = None      # map origin/crs for export
@@ -460,8 +481,8 @@ class LaySimulatorDialog(QDialog):
         """Add a draggable resize handle directly beneath ``table``."""
         try:
             layout.addWidget(_TableResizeGrip(table))
-        except Exception:
-            pass
+        except Exception:  # a missing grip must not stop the dialog opening
+            log_exception("Lay simulator: could not add a table resize grip")
 
     def _fit_columns(self, table: QTableWidget, padding: int = 18,
                      min_w: int = 44, max_w: int = 340):
@@ -480,7 +501,7 @@ class LaySimulatorDialog(QDialog):
             for line in (htext or "").split("\n"):
                 try:
                     lw = fm.horizontalAdvance(line)
-                except Exception:
+                except AttributeError:  # Qt < 5.11
                     lw = fm.width(line)
                 hw = max(hw, lw)
             try:
@@ -1751,6 +1772,8 @@ class LaySimulatorDialog(QDialog):
             self._solve_origin = self._origin_for_map()
             self._scene_origin = self._solve_origin
         except Exception:
+            log_exception("Lay simulator: could not fix the map origin for "
+                          "the manual session")
             self._scene_origin = None
         self._manual_bed = None
         self._manual_snaps = []
@@ -1912,12 +1935,13 @@ class LaySimulatorDialog(QDialog):
                                  title=f"Manual — {action_label}")
             self._show_scene(scene, preserve=True)
         except Exception:
-            pass
+            log_exception("Lay simulator: manual step not drawn; the views "
+                          "show the previous state")
         try:
             self.timeseries_view.set_snapshots(self._manual_snaps)
             self.timeseries_view.set_time(float(snap.t_s))
         except Exception:
-            pass
+            log_exception("Lay simulator: manual time series not updated")
         self._manual_update_readouts()
         self._manual_refresh_counts()
         if record:
@@ -2662,26 +2686,32 @@ class LaySimulatorDialog(QDialog):
             self._solve_now()
 
     def _solve_now(self):
-        if self._initializing:
+        if self._initializing or self._shut_down:
             return
         cfg = self.build_config()
         if cfg.mode == "operation":
             self._set_dirty(True)  # operations only run via the button
             return
-        if self._worker is not None and self._worker.isRunning():
-            self._pending = True
+        if self._worker is not None:
+            # Still busy (its result may already be shown). A static/steady
+            # solve of inputs edited since it started is superseded: cancel
+            # it and solve the latest inputs once its thread has ended.
+            if self._dirty and self._worker.cfg.mode in _RESTARTABLE_MODES:
+                self._pending = True
+                self._worker.cancel()
+                self.dirty_label.setText("Restarting with the latest inputs...")
             return
         self._start_worker(cfg)
 
     def _run_operation(self):
-        if self._worker is not None and self._worker.isRunning():
+        if self._worker is not None:
             return
         self.op_progress.setValue(0)
         self._start_worker(self.build_config())
 
     def _optimize_clicked(self):
         """Run the deployment-schedule optimiser (bu_full scenario only)."""
-        if self._worker is not None and self._worker.isRunning():
+        if self._worker is not None:
             return
         cfg = self.build_config()
         if cfg.scenario != "bu_full" or cfg.mode != "operation":
@@ -2697,7 +2727,7 @@ class LaySimulatorDialog(QDialog):
     def _plan_clicked(self):
         """Derive the lowering schedule from the per-leg TDP tension targets
         (bu_full scenario only; quick analytic planner)."""
-        if self._worker is not None and self._worker.isRunning():
+        if self._worker is not None:
             return
         cfg = self.build_config()
         if cfg.scenario != "bu_full" or cfg.mode != "operation":
@@ -2725,22 +2755,37 @@ class LaySimulatorDialog(QDialog):
         try:
             self._solve_origin = self._origin_for_map()
         except Exception:
+            log_exception("Lay simulator: could not capture the map origin "
+                          "for this solve; the overlay uses the current one")
             self._solve_origin = None
         self._set_dirty(False)
-        self._worker = SolveWorker(cfg, self)
-        self._worker.finishedWith.connect(self._on_solved)
-        self._worker.progressed.connect(self._on_progress)
-        self.cancel_btn.setEnabled(True)
-        self.run_btn.setEnabled(False)
+        self._got_result = False
+        worker = SolveWorker(cfg, self)
+        worker.finishedWith.connect(self._on_solved)
+        worker.progressed.connect(self._on_progress)
+        worker.finished.connect(self._on_worker_finished)
+        self._worker = worker
+        self._set_busy(True)
         if cfg.mode in ("operation", "optimize"):
             self.op_progress.setRange(0, 100)
             self.op_progress.setValue(0)
         else:
             self.op_progress.setRange(0, 0)  # indeterminate while relaxing
         self.results.setHtml("<i>Solving...</i>")
-        self._worker.start()
+        worker.start()
+
+    def _set_busy(self, busy: bool):
+        """Controls for idle / running. While a static or steady solve runs,
+        Solve stays enabled so edited inputs can restart it."""
+        restartable = (busy and self._worker is not None
+                       and self._worker.cfg.mode in _RESTARTABLE_MODES)
+        self.run_btn.setEnabled(not busy or restartable)
+        self.cancel_btn.setEnabled(busy)
+        for b in (self.btn_optimize, self.btn_plan):
+            b.setEnabled(not busy)
 
     def _cancel_worker(self):
+        self._pending = False          # Cancel also drops a queued re-solve
         if self._worker is not None:
             self._worker.cancel()
             self.dirty_label.setText("Cancelling...")
@@ -2761,21 +2806,22 @@ class LaySimulatorDialog(QDialog):
             self.scrub_label.setText(label)
 
     def _on_solved(self, out: RunOutput):
-        self.run_btn.setEnabled(True)
-        self.cancel_btn.setEnabled(False)
+        """Show a finished solve. Emitted from inside the worker's run(), so
+        the thread may still be running: the controls and any queued
+        re-solve are handled by _on_worker_finished once it has ended."""
+        self._got_result = True
+        if self._pending or self._shut_down:
+            return  # superseded by edited inputs (re-solved when the thread ends)
         if self.op_progress.maximum() == 0:
             self.op_progress.setRange(0, 100)
             self.op_progress.setValue(0)
-        if not self._dirty:
-            self.dirty_label.setText("")
-        if out.error == "cancelled":
-            self._set_dirty(True)
+        # Re-assert the stale-inputs indicator: progress readouts overwrite
+        # the label during the run, and inputs edited meanwhile make this
+        # result stale on arrival.
+        self._set_dirty(self._dirty or out.error == "cancelled")
         self._last_out = out
         self.results.setHtml(render_results_html(out))
         if out.error:
-            if self._pending:
-                self._pending = False
-                self._solve_now()
             return
         self._scene_origin = self._solve_origin
 
@@ -2786,6 +2832,7 @@ class LaySimulatorDialog(QDialog):
             bathy = bathymetry_from_dict(self.build_config().bathymetry)
             self.profile_view.set_bathy_lookup(bathy.depth_at)
         except Exception:
+            log_exception("Lay simulator: no seabed line for the profile view")
             self.profile_view.set_bathy_lookup(None)
 
         if out.mode in ("optimize", "plan"):
@@ -2832,9 +2879,25 @@ class LaySimulatorDialog(QDialog):
             self._show_scene(out.scene, preserve=True)
             self.timeseries_view.clear()
 
+    def _on_worker_finished(self):
+        """The solve thread has ended (its result, if any, reached
+        _on_solved first). Release the worker — it deletes itself — restore
+        the controls and run a queued re-solve of the latest inputs."""
+        self._worker = None
+        if self._shut_down:
+            return
+        self._set_busy(False)
+        if self.op_progress.maximum() == 0:
+            self.op_progress.setRange(0, 100)
+            self.op_progress.setValue(0)
         if self._pending:
             self._pending = False
             self._solve_now()
+        elif not self._got_result:
+            # run() reports every Exception as an error output, so this
+            # only happens if the thread died some other way.
+            self.results.setHtml("<i>The solve ended without a result.</i>")
+            self._set_dirty(True)
 
     def _on_scrub(self, i: int):
         out = self._last_out
@@ -3056,7 +3119,8 @@ class LaySimulatorDialog(QDialog):
                 if di >= 0:
                     self.op_quality.setCurrentIndex(di)
         except Exception:
-            pass
+            log_exception("Lay simulator: could not update the model-quality "
+                          "choices", level=logging.DEBUG)
         if hasattr(self, "bf_run_mode"):
             self._on_bf_run_mode()
         self._update_config_visibility()
@@ -3071,7 +3135,7 @@ class LaySimulatorDialog(QDialog):
             for lid, name in list_raster_layers():
                 self.raster_combo.addItem(name, lid)
         except Exception:
-            pass
+            log_exception("Lay simulator: could not list the project's raster layers")
         if self.raster_combo.count() == 0:
             self.raster_combo.addItem("(no raster layers)", "")
 
@@ -3179,7 +3243,8 @@ class LaySimulatorDialog(QDialog):
 
                 crs = QgsProject.instance().crs().authid() or crs
             except Exception:
-                pass
+                log_exception("Lay simulator: project CRS unavailable; "
+                              f"georeferencing assumes {crs}")
         if self._grid_origin:
             return tuple(self._grid_origin["origin_map_xy"]), self._grid_origin["crs_authid"]
         if self._picked_centre is not None:
@@ -3189,7 +3254,8 @@ class LaySimulatorDialog(QDialog):
                 c = self.iface.mapCanvas().center()
                 origin = (c.x(), c.y())
             except Exception:
-                pass
+                log_exception("Lay simulator: map canvas centre unavailable; "
+                              "origin defaults to (0, 0)")
         return origin, crs
 
     # ------------------------------------------------- map picking / overlay
@@ -3198,6 +3264,7 @@ class LaySimulatorDialog(QDialog):
         try:
             return self.iface.mapCanvas() if self.iface is not None else None
         except Exception:
+            log_exception("Lay simulator: map canvas unavailable", level=logging.DEBUG)
             return None
 
     def _start_pick(self, n_points: int, on_done, prompts=None):
@@ -3220,7 +3287,8 @@ class LaySimulatorDialog(QDialog):
             try:
                 self._pick_tool.cancel()
             except Exception:
-                pass
+                log_exception("Lay simulator: previous map pick not cancelled "
+                              "cleanly", level=logging.DEBUG)
             self._pick_tool = None
         # Keep the window open but ghosted and behind QGIS so the canvas is
         # clickable and the user keeps their bearings.
@@ -3258,6 +3326,8 @@ class LaySimulatorDialog(QDialog):
             pass
 
     def _restore_after_pick(self):
+        if self._shut_down:
+            return  # a pick cancelled by shutdown(): don't re-raise the window
         try:
             self.setWindowOpacity(1.0)
         except Exception:
@@ -3315,6 +3385,8 @@ class LaySimulatorDialog(QDialog):
             _origin, crs = self._origin_for_map()
             return map_points_to_local(pts, pts[0], crs)
         except Exception:
+            log_exception("Lay simulator: picks not converted to a metric "
+                          "frame; bearings and distances use raw map units")
             x0, y0 = pts[0]
             return [(x - x0, y - y0) for x, y in pts]
 
@@ -3429,6 +3501,8 @@ class LaySimulatorDialog(QDialog):
                 mid = local_points_to_map(
                     [((ax + bx) / 2.0, (ay + by) / 2.0)], pts[0], crs)[0]
             except Exception:
+                log_exception("Lay simulator: bight midpoint taken in raw "
+                              "map units")
                 mid = ((pts[0][0] + pts[1][0]) / 2.0, (pts[0][1] + pts[1][1]) / 2.0)
             self._set_local_origin(mid)
 
@@ -3438,6 +3512,8 @@ class LaySimulatorDialog(QDialog):
         ))
 
     def _refresh_map_overlay(self, *_a):
+        if self._shut_down:
+            return
         canvas = self._map_canvas()
         if canvas is None:
             return
@@ -3457,15 +3533,16 @@ class LaySimulatorDialog(QDialog):
             origin, crs = (self._scene_origin if self._scene_origin
                            else self._origin_for_map())
             self._map_overlay.update(scene, origin, crs)
-        except Exception:
-            pass  # overlay is best-effort; never break the solve flow
+        except Exception:  # best-effort; never break the solve flow
+            log_exception("Lay simulator: map overlay not drawn")
 
     def _clear_map_overlay(self):
         if self._map_overlay is not None:
             try:
                 self._map_overlay.clear()
             except Exception:
-                pass
+                log_exception("Lay simulator: map overlay not cleared",
+                              level=logging.DEBUG)
         if getattr(self, "show_on_map", None) is not None and self.show_on_map.isChecked():
             self.show_on_map.setChecked(False)
 
@@ -3474,17 +3551,43 @@ class LaySimulatorDialog(QDialog):
             try:
                 self._pick_tool.cancel()
             except Exception:
-                pass
+                log_exception("Lay simulator: map pick not cancelled cleanly",
+                              level=logging.DEBUG)
             self._pick_tool = None
         if self._map_overlay is not None:
             try:
                 self._map_overlay.clear()
             except Exception:
-                pass
+                log_exception("Lay simulator: map overlay not cleared",
+                              level=logging.DEBUG)
 
     def reject(self):
         self._cleanup_map_artifacts()
         super().reject()
+
+    def shutdown(self):
+        """Tear the dialog down for plugin unload; safe to call repeatedly.
+
+        Stops a running solve (cancel, then a bounded wait — a solve that
+        outlives it finishes detached, see SolveWorker.stop), cancels a map
+        pick, removes the canvas overlay and closes the dialog (saving the
+        inputs, as a normal close does). The caller then drops its
+        reference and calls deleteLater()."""
+        if self._shut_down:
+            return
+        self._shut_down = True
+        self._pending = False
+        self._play_timer.stop()
+        worker, self._worker = self._worker, None
+        if worker is not None:
+            try:
+                worker.finished.disconnect(self._on_worker_finished)
+            except TypeError:  # not connected
+                pass
+            worker.stop(_SHUTDOWN_WAIT_MS)
+        self._cleanup_map_artifacts()
+        self._map_overlay = None
+        self.close()
 
     # ------------------------------------------------------------- export
 
@@ -3622,7 +3725,7 @@ class LaySimulatorDialog(QDialog):
                     w.setChecked(str(val) in ("1", "true", "True"))
                 elif isinstance(w, QLineEdit):
                     w.setText(str(val))
-            except Exception:
+            except (TypeError, ValueError):  # unreadable stored value: keep default
                 pass
         raw = self.settings.value("assembly_json")
         if raw:
@@ -3639,7 +3742,8 @@ class LaySimulatorDialog(QDialog):
                     self.current_table.setItem(r, 1, QTableWidgetItem(str(row.get("speed_mps", 0))))
                     self.current_table.setItem(r, 2, QTableWidgetItem(str(row.get("direction_deg", 0))))
             except Exception:
-                pass
+                log_exception("Lay simulator: saved current profile could not be "
+                              "fully restored — check 'Current vs depth'")
         raw = self.settings.value("profile_json")
         if raw:
             try:
@@ -3649,7 +3753,8 @@ class LaySimulatorDialog(QDialog):
                     self.profile_table.setItem(r, 0, QTableWidgetItem(str(d)))
                     self.profile_table.setItem(r, 1, QTableWidgetItem(str(z)))
             except Exception:
-                pass
+                log_exception("Lay simulator: saved depth profile could not be "
+                              "fully restored — check the profile table")
         raw = self.settings.value("schedule_json")
         if raw:
             try:
@@ -3658,14 +3763,16 @@ class LaySimulatorDialog(QDialog):
                     # Stored rows are engine-frame (math degrees).
                     self._schedule_to_table(rows, course_is_compass=False)
             except Exception:
-                pass
+                log_exception("Lay simulator: saved phase schedule could not be "
+                              "restored")
         raw = self.settings.value("joints_json")
         if raw:
             try:
                 for line, label, s_m in json.loads(str(raw)):
                     self._joint_add_row(line=line, label=label, s_m=s_m)
             except Exception:
-                pass
+                log_exception("Lay simulator: saved named joints could not be "
+                              "fully restored")
         raw = self.settings.value("bu_integration_json")
         if raw:
             self.integration_editor.set_from_json(str(raw))
@@ -3729,7 +3836,8 @@ class LaySimulatorDialog(QDialog):
             self.view3d.set_z_exaggeration(float(self.zex.value()))
             self.view3d.set_cable_color_mode(self.color_mode.currentData())
         except Exception:
-            pass
+            log_exception("Lay simulator: 3D display options not applied",
+                          level=logging.DEBUG)
 
     def _save_settings(self):
         for key, w in self._registry:
@@ -3761,7 +3869,7 @@ class LaySimulatorDialog(QDialog):
             self.settings.setValue("schedule_json",
                                    json.dumps(self._schedule_from_table()))
         except Exception:
-            pass
+            log_exception("Lay simulator: phase schedule not saved")
         try:
             joints = []
             for r in range(self.joints_table.rowCount()):
@@ -3770,12 +3878,12 @@ class LaySimulatorDialog(QDialog):
                                _s(self.joints_table.item(r, 2))])
             self.settings.setValue("joints_json", json.dumps(joints))
         except Exception:
-            pass
+            log_exception("Lay simulator: named joints not saved")
         try:
             self.settings.setValue("bu_integration_json",
                                    self.integration_editor.to_json())
         except Exception:
-            pass
+            log_exception("Lay simulator: BU integration not saved")
 
     def closeEvent(self, event):  # noqa: N802 - Qt API
         self._save_settings()

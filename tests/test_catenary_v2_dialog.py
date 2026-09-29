@@ -225,6 +225,58 @@ def test_bending_toggle_controls_drape_EI_and_reporting():
     assert "Bending stiffness: EI" in dlg.results.toHtml()
 
 
+def test_non_numeric_cells_are_reported_not_dropped_silently():
+    """A typo in an assembly cell used to become 0 (dropping the segment)
+    and a bad profile row vanished, both without a word."""
+    dlg = _make_dialog()
+    dlg._on_asm_add_segment()
+    row = dlg.assembly_table.rowCount() - 1
+    dlg.assembly_table.item(row, dlg.ASM_COL_LENGTH).setText("12o")
+    dlg.update_plot()
+    text = dlg.results.toPlainText()
+    assert "'12o' is not a number" in text, text[-600:]
+
+    dlg._load_seabed_csv_text("0,120\n400,130\n900,140")
+    dlg.seabed_profile_table.item(1, 1).setText("13O")
+    dlg.seabed_mode.setCurrentIndex(2)  # Profile
+    dlg.update_plot()
+    text = dlg.results.toPlainText()
+    assert "Seabed profile row 2 ignored" in text, text[-600:]
+    # Blank cells still mean "use the default" and are not reported.
+    assert "'' is not a number" not in text
+
+
+def test_shutdown_stops_timers_and_is_idempotent():
+    import shutil
+    import tempfile
+
+    from qgis.PyQt.QtCore import QSettings
+
+    folder = tempfile.mkdtemp(prefix="sct_v2_settings_")
+    try:
+        dlg = _make_dialog()
+        # Closing saves the inputs: keep them out of the user's profile.
+        ini = getattr(QSettings, "Format", QSettings).IniFormat
+        dlg.settings = QSettings(f"{folder}/v2.ini", ini)
+        dlg.update_plot()
+        calc = dlg._last_calc
+        assert calc is not None
+        dlg.schedule_update_plot()
+        assert dlg._update_timer.isActive()
+        dlg.shutdown()
+        assert not dlg._update_timer.isActive()
+        assert not dlg._assembly_json_timer.isActive()
+        assert dlg._plot_click_cid is None and dlg._crosshair_cid is None
+        assert dlg.settings.value("water_depth") is not None, "inputs not saved on close"
+        dlg.shutdown()                      # idempotent
+        dlg.update_plot()                   # a late timer tick is ignored
+        assert dlg._last_calc is calc
+        dlg.settings.sync()
+        dlg.deleteLater()
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 def run_all() -> List[str]:
     if QApplication.instance() is None:
         print("[SKIP] dialog tests need a GUI-enabled QApplication")
@@ -238,6 +290,8 @@ def run_all() -> List[str]:
         test_assembly_friction_column_maps_to_mu_array,
         test_mbr_violation_raises_banner,
         test_bending_toggle_controls_drape_EI_and_reporting,
+        test_non_numeric_cells_are_reported_not_dropped_silently,
+        test_shutdown_stops_timers_and_is_idempotent,
     ]
     for test in tests:
         try:

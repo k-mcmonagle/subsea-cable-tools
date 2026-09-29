@@ -28,14 +28,17 @@ def _load_shim():
     back to loading ``plot_widget.py`` from the plugin root by path."""
     from importlib import import_module
 
-    try:
-        # Same shim the V2 dialog uses. __package__ is e.g.
-        # 'subsea_cable_tools.catenary.v3.ui' -> plugin root package.
-        parent_pkg = __package__.rsplit(".", 3)[0] if __package__ else ""
-        if parent_pkg and parent_pkg != __package__:
+    # Same shim the V2 dialog uses. __package__ is e.g.
+    # 'subsea_cable_tools.catenary.v3.ui' -> plugin root package.
+    parent_pkg = __package__.rsplit(".", 3)[0] if __package__ else ""
+    if parent_pkg and parent_pkg != __package__:
+        try:
             return import_module(parent_pkg + ".plot_widget")
-    except Exception:
-        pass
+        except ModuleNotFoundError as exc:
+            # Only a package without the shim (standalone tests) falls back;
+            # a real import error inside plot_widget must surface.
+            if exc.name not in (parent_pkg, parent_pkg + ".plot_widget"):
+                raise
     import importlib.util
     import os
     import sys

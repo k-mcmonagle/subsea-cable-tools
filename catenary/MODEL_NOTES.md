@@ -7,8 +7,8 @@ appropriate for a given task.
 
 > **Status / validation.** The calculation cores are validated against
 > closed-form catenary solutions and internal consistency identities by the
-> automated test suites (`tests/test_simple_catenary.py`,
-> `tests/test_catenary_solver.py`). They have **not** been independently
+> automated test suites (`tests/test_catenary_solver.py`,
+> `tests/test_drape_solver.py`, `tests/test_v3_solver3d.py`). They have **not** been independently
 > verified against commercial lay-simulation software (e.g. OrcaFlex)
 > or against measured field data. Treat results as planning-grade
 > estimates, not engineering sign-off values, until such a comparison has been
@@ -47,10 +47,11 @@ the vessel chute:
 
 ---
 
-## Catenary Calculator (Legacy V1) — `simple_catenary.py`
+## Closed-form reference (former Legacy V1 calculator)
 
-Closed-form uniform catenary. Exact identities used (`a = H/q`,
-`h` = water depth):
+The V1 calculator and its closed-form core (`simple_catenary.py`) have been
+removed; the uniform-catenary identities below remain the references the V2
+and V3 test suites check against (`a = H/q`, `h` = water depth):
 
 | Quantity | Formula |
 |---|---|
@@ -232,7 +233,7 @@ section of the drape as well as the suspended spans.
 
 | Capability | Status | Notes |
 |---|---|---|
-| 2D static single-span catenary (flat bed) | **Supported** | V1 closed form; V2 numerical. Validated against closed form to <0.02 m on standard cases. |
+| 2D static single-span catenary (flat bed) | **Supported** | V2 numerical (closed form as the test reference). Validated against closed form to <0.02 m on standard cases. |
 | Chute/quadrant geometry | **Supported (V2)** | Quarter-circle wrap model. |
 | Multi-segment cable + repeaters/bodies | **Supported (V2)** | Static point loads only; min-radius output is not meaningful at point-load kinks (warned). |
 | Discrete & distributed buoyancy | **Supported (V2)** | Negative point loads, negative legacy components, and negative assembly-segment weights all act as buoyancy. |

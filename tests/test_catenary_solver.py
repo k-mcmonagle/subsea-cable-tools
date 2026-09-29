@@ -484,6 +484,32 @@ def test_clean_flat_solve_reports_converged_and_no_penetration():
     assert d.min_seabed_clearance_m >= -0.5
 
 
+def test_skipped_clearance_check_is_reported():
+    """If the bed cannot be sampled for the clearance check, the
+    below-seabed detection is off — that must show up as a warning rather
+    than as a clean 'no penetration' result."""
+    cfg = _base_config(seabed=FlatSeabed(100.0), S_guess_m=700.0, ds_m=1.0)
+    calc = CatenarySystemCalculator(cfg)
+    real_check = calc._compute_seabed_clearance
+
+    class _Unsampleable:
+        def depth_at(self, x_world):
+            raise RuntimeError("no bathymetry here")
+
+    def broken_check():
+        saved, calc.seabed = calc.seabed, _Unsampleable()
+        try:
+            return real_check()
+        finally:
+            calc.seabed = saved
+
+    calc._compute_seabed_clearance = broken_check
+    calc.solve()
+    assert calc.seabed_clearance_m is None
+    assert any("Seabed clearance check did not run" in w for w in calc.diagnostics.warnings), \
+        calc.diagnostics.warnings
+
+
 def test_seabed_high_spot_is_detected_as_penetration():
     """When a shallow ridge sits between the chute and the nominal touchdown,
     the self-consistent single-span solution dips through the crest. The solver
@@ -670,6 +696,7 @@ def run_all() -> List[str]:
         test_bottom_tension_input_is_actual_tension_at_tdp_on_slope,
         test_buoyant_component_allows_negative_effective_weight,
         test_clean_flat_solve_reports_converged_and_no_penetration,
+        test_skipped_clearance_check_is_reported,
         test_seabed_high_spot_is_detected_as_penetration,
         test_zero_weight_assembly_segment_warns_about_fallback,
         test_buoyant_assembly_segment_reduces_vertical_force,

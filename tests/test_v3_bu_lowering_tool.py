@@ -3,12 +3,14 @@
 dialog's config plumbing.
 
 The wrap tests are pure NumPy (scene.py has no Qt imports). The dialog and
-run tests follow test_v3_integration_ui: headless PyQt5 (offscreen), skipped
-cleanly when Qt is not importable.
+run tests follow test_v3_integration_ui: headless (offscreen) on QGIS's Qt
+binding, or plain PyQt5 without QGIS; skipped cleanly when Qt is not
+importable.
 """
 
 from __future__ import annotations
 
+import importlib
 import math
 import os
 from pathlib import Path
@@ -17,21 +19,40 @@ import sys
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from catenary.v3.ui.scene import wrap_cable_over_sheave  # noqa: E402  (no Qt)
 
+def _catenary_package() -> str:
+    """The catenary package's import name: through the registered plugin
+    package under a test runner (so imports relative to the plugin root
+    resolve), else the plugin root on sys.path (standalone run)."""
+    if __package__ and "." in __package__:
+        return __package__.rsplit(".", 1)[0] + ".catenary"
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    return "catenary"
+
+
+_CAT = _catenary_package()
+wrap_cable_over_sheave = importlib.import_module(
+    _CAT + ".v3.ui.scene").wrap_cable_over_sheave            # no Qt
+
+# QGIS's binding first: a QGIS 4 Python also ships PyQt5, which is a
+# different Qt from the plugin's — mixing them in one process breaks.
 try:
-    from PyQt5.QtWidgets import QApplication
+    from qgis.PyQt.QtWidgets import QApplication
     HAVE_QT = True
-except Exception:
-    HAVE_QT = False
+except ImportError:
+    try:
+        from PyQt5.QtWidgets import QApplication
+        HAVE_QT = True
+    except ImportError:
+        HAVE_QT = False
 
 if HAVE_QT:
     APP = QApplication.instance() or QApplication([])
-    from catenary.v3.engine import bu_integration as bi
-    from catenary.v3.ui import solve_controller as sc
+    bi = importlib.import_module(_CAT + ".v3.engine.bu_integration")
+    sc = importlib.import_module(_CAT + ".v3.ui.solve_controller")
 
 
 # ---------------------------------------------------------------------------
@@ -203,17 +224,21 @@ def test_quick_run_lands_the_bu_and_wraps_the_trunk_over_the_sheave():
 
 
 def test_bu_lowering_dialog_builds_a_lowering_only_config():
-    """Full dialog construction needs the QGIS plot shim — covered by
-    tests/test_qgis_compat_widgets.py in the QGIS smoke run; here it runs
-    only when qgis is importable."""
+    """Full dialog construction needs QGIS (the plot shim and the plugin
+    package for its relative imports) — also covered by
+    tests/test_qgis_compat_widgets.py in the QGIS smoke run."""
     if not HAVE_QT:
         return
     try:
         import qgis  # noqa: F401
-    except Exception:
+    except ImportError:
         print("      (skipped: needs QGIS for the plot shim)")
         return
-    from catenary.v3.ui.bu_lowering_dialog import BULoweringDialog
+    if _CAT == "catenary":
+        print("      (skipped: run through a test runner — needs the plugin package)")
+        return
+    BULoweringDialog = importlib.import_module(
+        _CAT + ".v3.ui.bu_lowering_dialog").BULoweringDialog
 
     dlg = BULoweringDialog(None, iface=None)
     try:

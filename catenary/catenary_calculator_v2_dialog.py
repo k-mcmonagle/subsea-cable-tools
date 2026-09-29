@@ -27,6 +27,7 @@ Plot convention:
 
 from __future__ import annotations
 
+import logging
 from typing import Any, List, Optional, Tuple
 
 from qgis.PyQt.QtWidgets import (
@@ -37,6 +38,7 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.PyQt.QtCore import Qt, QSettings, QTimer
 from qgis.PyQt.QtGui import QColor
+from ..plugin_log import log_exception, log_warning
 from ..qgis_compat import (
     EDIT_TRIGGER_DOUBLE_CLICKED,
     EDIT_TRIGGER_EDIT_KEY_PRESSED,
@@ -62,10 +64,11 @@ from .catenary_solver import (
     PolylineSeabed,
     _parse_components,
 )
+from .drape_solver import three_point_radii
 
 try:
     import numpy as np
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover
     np = None
 import math
 import json
@@ -118,6 +121,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._shut_down = False
         if np is None:
             QMessageBox.critical(
                 self,
@@ -154,6 +158,9 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self._hover_cache = {}
         self._last_hover_signature = None
         self._collapsible_sections = {}
+        # Table cells that could not be read as numbers during the current
+        # solve (listed under Warnings instead of being silently dropped).
+        self._input_problems: List[str] = []
 
         # Debounce heavy recalculations while editing.
         self._update_timer = QTimer(self)
@@ -182,8 +189,36 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self._update_timer.start(delay_ms)
 
     def closeEvent(self, a0):
-        self.save_user_settings()
+        if hasattr(self, "settings"):  # not built when NumPy was missing
+            self.save_user_settings()
         super().closeEvent(a0)
+
+    def shutdown(self):
+        """Tear the dialog down for plugin unload; safe to call repeatedly.
+
+        Stops the debounce timers (so no solve fires into a dialog being
+        deleted), drops the plot's mouse callbacks and closes the dialog
+        (saving the inputs, as a normal close does). The caller then drops
+        its reference and calls deleteLater()."""
+        if self._shut_down:
+            return
+        self._shut_down = True
+        for timer in (getattr(self, "_update_timer", None),
+                      getattr(self, "_assembly_json_timer", None)):
+            if timer is not None:
+                timer.stop()
+        canvas = getattr(self, "canvas", None)
+        if canvas is not None:
+            for cid in (self._crosshair_cid, self._plot_click_cid):
+                if cid is not None:
+                    try:
+                        canvas.mpl_disconnect(cid)
+                    except Exception:
+                        log_exception("Catenary V2: plot callback not disconnected",
+                                      level=logging.DEBUG)
+            self._crosshair_cid = None
+            self._plot_click_cid = None
+        self.close()
 
     def _fit_initial_size_to_screen(self):
         min_w = 820
@@ -266,7 +301,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             self.settings.setValue("seabed_end_condition", self.seabed_end_condition.currentIndex())
             self.settings.setValue("on_bed_extra_len", self.on_bed_extra_len.value())
         except Exception:
-            pass
+            log_exception("Catenary V2: seabed settings not saved")
 
         # Cable bending properties
         try:
@@ -274,7 +309,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             self.settings.setValue("bending_stiffness_knm2", self.bending_stiffness.value())
             self.settings.setValue("min_bend_radius_m", self.min_bend_radius.value())
         except Exception:
-            pass
+            log_exception("Catenary V2: bending settings not saved")
 
         self.settings.setValue("weight_water", self._fallback_q_water_npm)
         self.settings.setValue("weight_air", self._fallback_q_air_npm)
@@ -312,7 +347,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 return default
             try:
                 return float(val)
-            except Exception:
+            except (TypeError, ValueError):
                 return default
 
         def _get_int(key, default=None):
@@ -321,7 +356,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 return default
             try:
                 return int(val)
-            except Exception:
+            except (TypeError, ValueError):
                 return default
 
         if (v := _get_float("water_depth")) is not None:
@@ -379,14 +414,15 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 for row in rows:
                     try:
                         x, d = float(row[0]), float(row[1])
-                    except Exception:
+                    except (TypeError, ValueError, IndexError):
                         continue
                     r = self.seabed_profile_table.rowCount()
                     self.seabed_profile_table.insertRow(r)
                     self.seabed_profile_table.setItem(r, 0, QTableWidgetItem(f"{x:g}"))
                     self.seabed_profile_table.setItem(r, 1, QTableWidgetItem(f"{d:g}"))
             except Exception:
-                pass
+                log_exception("Catenary V2: saved seabed profile could not be "
+                              "restored — check the profile table")
             finally:
                 try:
                     self.seabed_profile_table.blockSignals(False)
@@ -1162,6 +1198,8 @@ class CatenaryCalculatorV2Dialog(QDialog):
             try:
                 D_eff = float(seabed.depth_at(0.0))
             except Exception:
+                log_exception("Catenary V2: seabed depth at the chute unavailable; "
+                              "the Water Depth input is used instead")
                 D_eff = D
 
             cfg = {
@@ -1233,6 +1271,9 @@ class CatenaryCalculatorV2Dialog(QDialog):
     # ---- Main update
 
     def update_plot(self):
+        if self._shut_down:
+            return  # a queued/debounced solve after plugin unload
+        self._input_problems = []
         cfg = self.get_config()
         if not cfg:
             self.figure.clear()
@@ -1269,7 +1310,9 @@ class CatenaryCalculatorV2Dialog(QDialog):
             self._plot(calc)
 
         except Exception as e:
-            # Keep errors readable in the results pane.
+            # Keep errors readable in the results pane; the traceback goes to
+            # the debug log (most failures here are rejected inputs).
+            log_exception("Catenary V2: solve failed", level=logging.DEBUG)
             msg = str(e)
             msg = msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             msg = msg.replace("\n", "<br>")
@@ -1334,12 +1377,12 @@ class CatenaryCalculatorV2Dialog(QDialog):
                     f"TDP slope {float(tdp_slope):+.2f}°, "
                     f"TDP at {float(tdp_x_world):.2f} m from chute"
                 )
-            except Exception:
+            except (TypeError, ValueError):  # TDP geometry not available
                 pass
 
         assembly: List[AssemblyItem] = calc.cfg.get("assembly", [])
         asm_seg_total = sum(max(0.0, it.length_m) for it in assembly if it.kind == "segment") if assembly else 0.0
-        warn_lines: List[str] = []
+        warn_lines: List[str] = list(self._input_problems)
         if assembly and calc.S_total is not None:
             # S_total includes chute-contact + free-span. Assembly segments are defined from chute top down.
             # If assembly is shorter than S_total, remaining length uses internal fallback weights.
@@ -1387,7 +1430,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
         def add_radius_check(radius_m: float, source: str, segment: Optional[AssemblyItem] = None, mbr_override: Optional[float] = None) -> None:
             try:
                 r_val = float(radius_m)
-            except Exception:
+            except (TypeError, ValueError):
                 return
             if not math.isfinite(r_val):
                 return
@@ -1671,7 +1714,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             return "N/A"
         try:
             numeric = float(value)
-        except Exception:
+        except (TypeError, ValueError):
             return "N/A"
         if not math.isfinite(numeric):
             return "N/A"
@@ -1862,10 +1905,18 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 if not xs or not ds:
                     continue
                 rows.append((float(xs), float(ds)))
-            except Exception:
-                continue
+            except ValueError:
+                self._note_input_problem(
+                    f"Seabed profile row {r + 1} ignored: '{xs}' / '{ds}' "
+                    "is not a pair of numbers.")
         rows.sort(key=lambda t: t[0])
         return rows
+
+    def _note_input_problem(self, message: str) -> None:
+        """Record an unreadable input for the Warnings list of this solve."""
+        problems = getattr(self, "_input_problems", None)
+        if problems is not None and message not in problems:
+            problems.append(message)
 
     def _build_seabed_profile(self, default_depth: float):
         """Construct a SeabedProfile instance from the current dialog state."""
@@ -1967,7 +2018,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             if value is not None:
                 try:
                     return max(0.0, float(value))
-                except Exception:
+                except (TypeError, ValueError):
                     pass
         return max(0.0, float(self.bending_stiffness.value()))
 
@@ -1977,7 +2028,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             if value is not None:
                 try:
                     return max(0.0, float(value))
-                except Exception:
+                except (TypeError, ValueError):
                     pass
         return max(0.0, float(self.min_bend_radius.value()))
 
@@ -2045,7 +2096,8 @@ class CatenaryCalculatorV2Dialog(QDialog):
             return
         try:
             from .drape_solver import solve_drape
-        except Exception as exc:
+        except ImportError as exc:
+            log_exception("Catenary V2: drape solver import failed")
             self._drape_error = f"drape solver unavailable: {exc}"
             return
 
@@ -2075,6 +2127,8 @@ class CatenaryCalculatorV2Dialog(QDialog):
         try:
             alpha = float(seabed.slope_at(tdp_x))
         except Exception:
+            log_exception("Catenary V2: seabed slope at the TDP unavailable; "
+                          "the drape anchor assumes a level bed")
             alpha = 0.0
         anchor_x = tdp_x + extra * max(0.2, math.cos(alpha)) * 0.98
         anchor = (anchor_x, -float(seabed.depth_at(anchor_x))) if anchored else None
@@ -2122,7 +2176,8 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 initial_shape=(init_x, init_y),
                 EI_Nm2=EI_Nm2,
             )
-        except Exception as exc:
+        except Exception as exc:  # reported under Results; traceback to the debug log
+            log_exception("Catenary V2: seabed drape failed", level=logging.DEBUG)
             self._drape_error = str(exc)
             return
         finally:
@@ -2140,21 +2195,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
     @staticmethod
     def _radius_array(x: "np.ndarray", y: "np.ndarray") -> "np.ndarray":
         """Three-point bend radius per node (inf at the ends / straight runs)."""
-        n = len(x)
-        r = np.full(n, np.inf)
-        if n < 3:
-            return r
-        ax, ay = x[:-2], y[:-2]
-        bx, by = x[1:-1], y[1:-1]
-        cx, cy = x[2:], y[2:]
-        a = np.hypot(bx - ax, by - ay)
-        b = np.hypot(cx - bx, cy - by)
-        c = np.hypot(cx - ax, cy - ay)
-        area2 = np.abs((bx - ax) * (cy - ay) - (by - ay) * (cx - ax))
-        with np.errstate(divide="ignore", invalid="ignore"):
-            rr = np.where(area2 > 1e-12, a * b * c / (2.0 * area2), np.inf)
-        r[1:-1] = rr
-        return r
+        return three_point_radii(x, y)
 
     def _single_span_radius_array(self, calc: CatenarySystemCalculator) -> "np.ndarray":
         """Analytical local bend radius for the flexible single-span solve.
@@ -2180,6 +2221,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
         comps: List[Component] = calc.cfg.get("components", []) or []
         H = max(abs(float(calc.H_N)), 1e-12)
         out = np.full(len(s_arr), np.inf)
+        failed = np.zeros(len(s_arr), dtype=bool)
         for i, s_val in enumerate(s_arr):
             try:
                 q = calc._q_effective(float(y_arr[i]), float(s_val), S_free, Lc, assembly, comps)
@@ -2187,7 +2229,15 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 if denom > 1e-12:
                     out[i] = float(t_arr[i] * t_arr[i] / denom)
             except Exception:
-                pass
+                failed[i] = True
+        if failed.any():
+            # An infinite radius here would silently pass the MBR check:
+            # fall back to the polyline geometry at those nodes instead.
+            log_warning(f"Catenary V2: analytical bend radius failed at {int(failed.sum())} "
+                        "node(s); the plotted geometry's radius is used there")
+            if calc.x is not None and len(calc.x) == len(out):
+                geo = self._radius_array(np.asarray(calc.x, dtype=float), y_arr)
+                out[failed] = geo[failed]
         return out
 
     @staticmethod
@@ -2200,7 +2250,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 return max(0.0, float(default_EI_kNm2))
             try:
                 return max(0.0, float(raw))
-            except Exception:
+            except (TypeError, ValueError):
                 return max(0.0, float(default_EI_kNm2))
 
         EI_left = val(left)
@@ -2296,6 +2346,8 @@ class CatenaryCalculatorV2Dialog(QDialog):
             try:
                 return self._make_display_calc(calc, res)
             except Exception:
+                log_exception("Catenary V2: drape geometry not displayable; "
+                              "showing the single-span solution")
                 return calc
         return calc
 
@@ -2346,7 +2398,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 continue
             try:
                 rows.append((float(parts[0]), float(parts[1])))
-            except Exception:
+            except ValueError:  # header / comment line
                 continue
         try:
             self.seabed_profile_table.blockSignals(True)
@@ -3149,7 +3201,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
                         label="Cable below seabed",
                     )
             except Exception:
-                pass
+                log_exception("Catenary V2: 'cable below seabed' markers not drawn")
 
         marker_size = 16
 
@@ -3793,7 +3845,8 @@ class CatenaryCalculatorV2Dialog(QDialog):
             return default
         try:
             return float(item.text())
-        except Exception:
+        except ValueError:
+            self._note_bad_cell(table, row, col, item.text(), f"treated as {default:g}")
             return default
 
     def _table_get_str(self, table: QTableWidget, row: int, col: int, default: str = "") -> str:
@@ -3813,8 +3866,19 @@ class CatenaryCalculatorV2Dialog(QDialog):
             return None
         try:
             return float(text)
-        except Exception:
+        except ValueError:
+            self._note_bad_cell(table, row, col, text, "treated as blank (default applies)")
             return None
+
+    def _note_bad_cell(self, table: QTableWidget, row: int, col: int, text: str, effect: str) -> None:
+        """Report a non-numeric table cell under this solve's Warnings."""
+        text = str(text).strip()
+        if not text:
+            return  # blank means "use the default" — not a problem
+        header = table.horizontalHeaderItem(col)
+        column = " ".join(header.text().split()) if header is not None else f"column {col + 1}"
+        self._note_input_problem(
+            f"Assembly row {row + 1}, {column}: '{text}' is not a number — {effect}.")
 
     # ---- Assembly table helpers
 
@@ -3997,7 +4061,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 data = data.get("assembly", [])
             if not isinstance(data, list):
                 return False
-        except Exception:
+        except (TypeError, ValueError):
             return False
         self.assembly_table.blockSignals(True)
         try:
@@ -4035,7 +4099,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
                 if key in entry:
                     try:
                         return f"{float(entry.get(key)):.12g}"
-                    except Exception:
+                    except (TypeError, ValueError):
                         return f"{float(default):.12g}"
             return f"{float(default):.12g}"
 
@@ -4061,7 +4125,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             if key in entry and entry.get(key) is not None:
                 try:
                     mu_text = f"{float(entry.get(key)):.12g}"
-                except Exception:
+                except (TypeError, ValueError):
                     mu_text = ""
                 break
 
@@ -4070,7 +4134,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             if key in entry and entry.get(key) is not None:
                 try:
                     EI_text = f"{float(entry.get(key)):.12g}"
-                except Exception:
+                except (TypeError, ValueError):
                     EI_text = ""
                 break
 
@@ -4079,7 +4143,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             if key in entry and entry.get(key) is not None:
                 try:
                     mbr_text = f"{float(entry.get(key)):.12g}"
-                except Exception:
+                except (TypeError, ValueError):
                     mbr_text = ""
                 break
 
@@ -4148,7 +4212,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
             return ""
         try:
             _ = int(s[1:], 16)
-        except Exception:
+        except ValueError:
             return ""
         return s.lower()
 

@@ -59,6 +59,8 @@ class PointSequenceTool:
     def _clicked(self, point, button) -> None:
         from qgis.PyQt.QtCore import Qt
 
+        if self._done:
+            return
         right = getattr(getattr(Qt, "MouseButton", Qt), "RightButton")
         if button == right:
             self._finish(cancelled=True)
@@ -97,8 +99,11 @@ class PointSequenceTool:
         self._markers = []
         if restore:
             try:
-                self._canvas.setMapTool(self._prev_tool)
-            except Exception:
+                if self._prev_tool is not None:
+                    self._canvas.setMapTool(self._prev_tool)
+                else:  # no tool to go back to: at least stop collecting clicks
+                    self._canvas.unsetMapTool(self._tool)
+            except RuntimeError:  # canvas / previous tool already deleted
                 pass
         if cancelled:
             if self._on_cancel is not None:

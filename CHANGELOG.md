@@ -98,6 +98,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Compare Design vs As-Laid Routes:** the cross-track sign now follows the documented convention (+ starboard, − port); earlier versions reported it reversed, so **re-run comparisons made with an earlier version** if you rely on the sign (magnitudes are unchanged).
 - **Calculate Seabed Length:** much faster on long routes; contours with Z values or in another CRS are used, and the gap between parts of a multi-part route no longer counts as seabed.
 - **Processing tools:** long-running tools can be cancelled and report progress, tools warn when features or contours are skipped instead of silently leaving them out, and every tool's *Help* opens the documentation.
+- **Cable Lay Simulator:** table resize grips work on QGIS 4; after editing inputs during a solve, *Solve* restarts on the latest inputs, and results from outdated inputs are always marked stale.
+- **Catenary Calculator V2:** non-numeric assembly or seabed-profile cells are listed under *Warnings* instead of silently becoming zero, and the minimum bend radius check no longer passes by default where a radius cannot be computed.
 <!-- audit-2026-09 entries -->
 
 ## [1.9.0] - 2026-08-29

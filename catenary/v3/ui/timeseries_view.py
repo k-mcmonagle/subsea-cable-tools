@@ -27,13 +27,15 @@ try:
         QCheckBox, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout,
         QWidget,
     )
-except Exception:  # pragma: no cover - standalone testing
+except ImportError as exc:  # pragma: no cover - standalone testing without QGIS
+    if exc.name != "qgis":
+        raise  # QGIS is there: a real error — never pull PyQt5 into a Qt6 process
     try:
         from PyQt5.QtWidgets import (
             QCheckBox, QHBoxLayout, QLabel, QPushButton, QSizePolicy,
             QVBoxLayout, QWidget,
         )
-    except Exception:  # pragma: no cover - no Qt at all (pure-helper tests)
+    except ImportError:  # pragma: no cover - no Qt at all (pure-helper tests)
         QWidget = None  # type: ignore
 
 # Same palette as the plot shim's ``get_tab10_color`` (kept local so the

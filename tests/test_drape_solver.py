@@ -317,6 +317,27 @@ def test_query_helpers():
     assert 0.5 * a < r < 2.0 * a, f"radius at near-TDP {r:.0f} m vs a={a:.0f} m"
 
 
+def test_vectorised_radii_match_the_scalar_helper():
+    """three_point_radii (shared with the V2 dialog's MBR check) must agree
+    with the solver's per-node three-point radius, ends and straight runs
+    included."""
+    t = np.linspace(0.0, 3.0, 40)
+    x = 50.0 * np.cos(t)
+    y = 30.0 * np.sin(t)
+    x[10:15] = np.linspace(x[10], x[10] + 4.0, 5)       # a straight run
+    y[10:15] = y[10]
+    radii = dr.three_point_radii(x, y)
+    assert radii.shape == x.shape
+    for i in range(len(x)):
+        want = dr._three_point_radius(x, y, i)
+        got = float(radii[i])
+        if math.isinf(want):
+            assert math.isinf(got), (i, got)
+        else:
+            _assert_close(f"radius[{i}]", got, want, 1e-9 * max(1.0, want))
+    assert all(math.isinf(float(r)) for r in dr.three_point_radii([0.0, 1.0], [0.0, 1.0]))
+
+
 def run_all() -> List[str]:
     failures: List[str] = []
     tests: List[Callable[[], None]] = [
@@ -330,6 +351,7 @@ def run_all() -> List[str]:
         test_bending_stiffness_telecom_matches_flexible,
         test_bending_stiffness_stiff_cable_converges,
         test_query_helpers,
+        test_vectorised_radii_match_the_scalar_helper,
     ]
     for test in tests:
         try:

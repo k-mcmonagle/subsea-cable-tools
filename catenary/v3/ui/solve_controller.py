@@ -18,9 +18,18 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 try:
-    from qgis.PyQt.QtCore import QThread, pyqtSignal
-except Exception:  # pragma: no cover - standalone tests
-    from PyQt5.QtCore import QThread, pyqtSignal
+    from qgis.PyQt.QtCore import QCoreApplication, QThread, pyqtSignal
+except ImportError as exc:  # pragma: no cover - standalone engine tests without QGIS
+    if exc.name != "qgis":
+        raise  # QGIS is there: a real error — never pull PyQt5 into a Qt6 process
+    from PyQt5.QtCore import QCoreApplication, QThread, pyqtSignal
+
+try:
+    from ....plugin_log import log_warning
+except ImportError:  # loaded outside the plugin package (standalone tests)
+    import logging
+
+    log_warning = logging.getLogger("subsea_cable_tools").warning
 
 from ..engine import bathymetry as bathy_mod
 from ..engine import cable_system as cs
@@ -1471,7 +1480,14 @@ def _quick_facts(inp: sl.SteadyLayInput, H_c: float, V: float, depth: float) -> 
 # ---------------------------------------------------------------------------
 
 class SolveWorker(QThread):
-    """Runs one solve; emits ``finishedWith(RunOutput)``."""
+    """Runs one solve; emits ``finishedWith(RunOutput)``.
+
+    ``finishedWith`` is emitted from inside :meth:`run`, so the thread may
+    still be running when the dialog handles it; the dialog treats the worker
+    as busy until ``QThread.finished``. The worker then deletes itself
+    (``finished`` -> ``deleteLater``), so owners must drop their reference in
+    their ``finished`` handler and not touch the object afterwards.
+    """
 
     finishedWith = pyqtSignal(object)
     progressed = pyqtSignal(float, str)
@@ -1480,9 +1496,37 @@ class SolveWorker(QThread):
         super().__init__(parent)
         self.cfg = cfg
         self._cancel = False
+        self.finished.connect(self.deleteLater)
 
     def cancel(self):
         self._cancel = True
+
+    def stop(self, timeout_ms: int = 3000) -> bool:
+        """Cancel, cut the result signals and wait up to ``timeout_ms``.
+
+        For shutting a dialog down: ``finishedWith`` / ``progressed`` are
+        disconnected so a late result never reaches it. Returns True when the
+        thread has ended. A solve that outlives the timeout (the solver only
+        polls the cancel flag between iterations) is re-parented to the
+        application so it can finish and delete itself — Qt aborts the
+        process if a running QThread is destroyed along with its dialog.
+        """
+        self.cancel()
+        for signal in (self.finishedWith, self.progressed):
+            try:
+                signal.disconnect()
+            except TypeError:  # nothing connected
+                pass
+        if self.wait(int(timeout_ms)):
+            return True
+        app = QCoreApplication.instance()
+        if app is not None:
+            self.setParent(app)
+        log_warning(
+            f"Lay simulator: a {self.cfg.mode} solve did not stop within "
+            f"{int(timeout_ms)} ms; it will finish in the background and its "
+            "result will be discarded.")
+        return False
 
     def _progress(self, frac: float, label: str) -> bool:
         self.progressed.emit(float(frac), str(label))

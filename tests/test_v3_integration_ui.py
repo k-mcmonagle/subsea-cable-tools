@@ -2,40 +2,61 @@
 """UI wiring for the BU integration: editor round-trip and the config ->
 scenario path of the lowering scenario.
 
-Runs headless on plain PyQt5 (offscreen platform); skipped cleanly when Qt
-is not importable. The heavy dialog itself is not instantiated — the editor
-widget and the solve_controller build path are exercised directly, which is
-where all the datum conversions live.
+Runs headless (offscreen platform) on QGIS's Qt binding, or on plain PyQt5
+without QGIS; skipped cleanly when Qt is not importable. The heavy dialog
+itself is not instantiated — the editor widget and the solve_controller
+build path are exercised directly, which is where all the datum conversions
+live.
 """
 
 from __future__ import annotations
 
+import importlib
 import math
 import os
 from pathlib import Path
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+# QGIS's binding first: a QGIS 4 Python also ships PyQt5, which is a
+# different Qt from the plugin's — mixing them in one process breaks.
 try:
-    from PyQt5.QtWidgets import QApplication
+    from qgis.PyQt.QtWidgets import QApplication
     HAVE_QT = True
-except Exception:
-    HAVE_QT = False
+except ImportError:
+    try:
+        from PyQt5.QtWidgets import QApplication
+        HAVE_QT = True
+    except ImportError:
+        HAVE_QT = False
+
+
+def _catenary_package() -> str:
+    """The catenary package's import name: through the registered plugin
+    package under a test runner (so imports relative to the plugin root
+    resolve), else the plugin root on sys.path (standalone run)."""
+    if __package__ and "." in __package__:
+        return __package__.rsplit(".", 1)[0] + ".catenary"
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    return "catenary"
+
 
 if HAVE_QT:
     APP = QApplication.instance() or QApplication([])
-    from catenary.v3.engine import bathymetry as bath
-    from catenary.v3.engine import bu_integration as bi
-    from catenary.v3.engine import cable_system as cs
-    from catenary.v3.engine.quick_bu import QuickOperationSimulator
-    from catenary.v3.ui import solve_controller as sc
-    from catenary.v3.ui.integration_editor import (
-        BUIntegrationEditor, KIND_CABLE, KIND_JOINT, KIND_REST, COL_KIND,
-        COL_LEN, COL_NAME,
-    )
+    _CAT = _catenary_package()
+    bath = importlib.import_module(_CAT + ".v3.engine.bathymetry")
+    bi = importlib.import_module(_CAT + ".v3.engine.bu_integration")
+    cs = importlib.import_module(_CAT + ".v3.engine.cable_system")
+    QuickOperationSimulator = importlib.import_module(
+        _CAT + ".v3.engine.quick_bu").QuickOperationSimulator
+    sc = importlib.import_module(_CAT + ".v3.ui.solve_controller")
+    _ie = importlib.import_module(_CAT + ".v3.ui.integration_editor")
+    BUIntegrationEditor = _ie.BUIntegrationEditor
+    KIND_CABLE, KIND_JOINT, KIND_REST = _ie.KIND_CABLE, _ie.KIND_JOINT, _ie.KIND_REST
+    COL_KIND, COL_LEN, COL_NAME = _ie.COL_KIND, _ie.COL_LEN, _ie.COL_NAME
 
 
 def sample_dict() -> dict:
@@ -81,8 +102,7 @@ def test_editor_keeps_the_rest_row_last_and_positions_live():
     # Live from-BU positions: the default 90 m tail puts the joint at 90.
     page.refresh_positions()
     joint_row = kinds.index(KIND_JOINT)
-    from catenary.v3.ui.integration_editor import COL_FROM_BU
-    assert page.table.item(joint_row, COL_FROM_BU).text() == "at 90"
+    assert page.table.item(joint_row, _ie.COL_FROM_BU).text() == "at 90"
     # And the makeup is still valid.
     assert bi.BranchMakeup.from_dict(page.to_makeup_dict()).problems("leg1") == []
 

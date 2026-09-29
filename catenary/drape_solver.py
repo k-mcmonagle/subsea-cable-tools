@@ -56,7 +56,7 @@ from typing import List, Optional, Sequence, Tuple, Union
 
 try:
     import numpy as np
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover
     np = None
 
 
@@ -116,6 +116,29 @@ def _three_point_radius(x: "np.ndarray", y: "np.ndarray", i: int) -> float:
     if area2 < 1e-12:
         return float("inf")
     return float(a * b * c / (2.0 * area2))
+
+
+def three_point_radii(x: "np.ndarray", y: "np.ndarray") -> "np.ndarray":
+    """Vectorised :func:`_three_point_radius` for every node of a 2D
+    polyline: circumradius through each node and its neighbours, ``inf`` at
+    the ends and on straight runs."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    n = len(x)
+    r = np.full(n, np.inf)
+    if n < 3:
+        return r
+    ax, ay = x[:-2], y[:-2]
+    bx, by = x[1:-1], y[1:-1]
+    cx, cy = x[2:], y[2:]
+    a = np.hypot(bx - ax, by - ay)
+    b = np.hypot(cx - bx, cy - by)
+    c = np.hypot(cx - ax, cy - ay)
+    area2 = np.abs((bx - ax) * (cy - ay) - (by - ay) * (cx - ax))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rr = np.where(area2 > 1e-12, a * b * c / (2.0 * area2), np.inf)
+    r[1:-1] = rr
+    return r
 
 
 def solve_drape(

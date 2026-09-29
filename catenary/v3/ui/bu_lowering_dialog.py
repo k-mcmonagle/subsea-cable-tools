@@ -18,6 +18,7 @@ main simulator.
 from __future__ import annotations
 
 import json
+import logging
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -33,11 +34,14 @@ try:
         QTableWidget, QTableWidgetItem, QTextEdit, QToolButton, QVBoxLayout,
         QWidget,
     )
+    from ....plugin_log import log_exception
     from ....qgis_compat import (
         HEADER_RESIZE_MODE_FIXED,
         HEADER_RESIZE_MODE_INTERACTIVE,
     )
-except Exception:  # pragma: no cover - standalone testing
+except ImportError as exc:  # pragma: no cover - standalone testing without QGIS
+    if exc.name != "qgis":
+        raise  # QGIS is there: a real error — never pull PyQt5 into a Qt6 process
     from PyQt5 import QtCore, QtGui
     from PyQt5.QtCore import Qt, QSettings
     from PyQt5.QtWidgets import (
@@ -51,6 +55,9 @@ except Exception:  # pragma: no cover - standalone testing
     HEADER_RESIZE_MODE_FIXED = _RESIZE_MODE.Fixed
     HEADER_RESIZE_MODE_INTERACTIVE = _RESIZE_MODE.Interactive
 
+    def log_exception(message, level=logging.WARNING):
+        logging.getLogger("subsea_cable_tools").log(level, message, exc_info=True)
+
 from .integration_editor import BUIntegrationEditor
 from .results_panel import render_results_html
 from .solve_controller import RunOutput, SolveWorker, V3Config
@@ -61,6 +68,8 @@ _ORIENT = getattr(Qt, "Orientation", Qt)
 _ARROW = getattr(Qt, "ArrowType", Qt)
 
 KMH = 1.0 / 3.6      # km/h -> m/s
+# Bounded wait for a running simulation when the dialog is shut down.
+_SHUTDOWN_WAIT_MS = 3000
 
 
 def _f(item, default: float = 0.0) -> float:
@@ -97,7 +106,11 @@ class BULoweringDialog(QDialog):
         self._registry: List[Tuple[str, QWidget]] = []
         self._collapsibles: Dict[str, Tuple[QToolButton, QWidget]] = {}
         self._initializing = True
+        self._shut_down = False
+        # The running simulation; set until its thread has ENDED
+        # (QThread.finished), not merely until its result arrived.
         self._worker: Optional[SolveWorker] = None
+        self._got_result = False                      # its result was delivered
         self._last_out: Optional[RunOutput] = None
         self._last_scene = None
         self._grid_bathy: Optional[dict] = None       # sampled raster grid cfg
@@ -884,7 +897,7 @@ class BULoweringDialog(QDialog):
         self._run_with_quality("full")
 
     def _run_with_quality(self, quality: str):
-        if self._worker is not None and self._worker.isRunning():
+        if self._worker is not None or self._shut_down:
             return
         probs = self.integration_editor.problems()
         if probs:
@@ -899,18 +912,26 @@ class BULoweringDialog(QDialog):
         try:
             self._solve_origin = self._origin_for_map()
         except Exception:
+            log_exception("BU lowering: could not capture the map origin for "
+                          "this run; the overlay uses the current one")
             self._solve_origin = None
         self._set_dirty(False)
-        self._worker = SolveWorker(cfg, self)
-        self._worker.finishedWith.connect(self._on_solved)
-        self._worker.progressed.connect(self._on_progress)
-        self.cancel_btn.setEnabled(True)
-        self.run_btn.setEnabled(False)
-        self.verify_btn.setEnabled(False)
+        self._got_result = False
+        worker = SolveWorker(cfg, self)
+        worker.finishedWith.connect(self._on_solved)
+        worker.progressed.connect(self._on_progress)
+        worker.finished.connect(self._on_worker_finished)
+        self._worker = worker
+        self._set_busy(True)
         self.op_progress.setRange(0, 100)
         self.op_progress.setValue(0)
         self.results.setHtml("<i>Running...</i>")
-        self._worker.start()
+        worker.start()
+
+    def _set_busy(self, busy: bool):
+        self.cancel_btn.setEnabled(busy)
+        self.run_btn.setEnabled(not busy)
+        self.verify_btn.setEnabled(not busy)
 
     def _cancel_worker(self):
         if self._worker is not None:
@@ -931,16 +952,19 @@ class BULoweringDialog(QDialog):
             self.scrub_label.setText(label)
 
     def _on_solved(self, out: RunOutput):
-        self.run_btn.setEnabled(True)
-        self.verify_btn.setEnabled(True)
-        self.cancel_btn.setEnabled(False)
+        """Show a finished run. Emitted from inside the worker's run(), so
+        the thread may still be running; _on_worker_finished restores the
+        controls once it has ended."""
+        self._got_result = True
+        if self._shut_down:
+            return  # a result queued just before shutdown()
         if self.op_progress.maximum() == 0:
             self.op_progress.setRange(0, 100)
             self.op_progress.setValue(0)
-        if not self._dirty:
-            self.dirty_label.setText("")
-        if out.error == "cancelled":
-            self._set_dirty(True)
+        # Re-assert the stale-inputs indicator: progress readouts overwrite
+        # the label during the run, and inputs edited meanwhile make this
+        # result stale on arrival.
+        self._set_dirty(self._dirty or out.error == "cancelled")
         self._last_out = out
         self.results.setHtml(render_results_html(out))
         if out.error:
@@ -953,6 +977,7 @@ class BULoweringDialog(QDialog):
             bathy = bathymetry_from_dict(self._bathy_cfg())
             self.profile_view.set_bathy_lookup(bathy.depth_at)
         except Exception:
+            log_exception("BU lowering: no seabed line for the profile view")
             self.profile_view.set_bathy_lookup(None)
 
         if out.snapshots:
@@ -970,6 +995,23 @@ class BULoweringDialog(QDialog):
             self.scrub_widget.setVisible(False)
             self._show_scene(out.scene, preserve=True)
             self.timeseries_view.clear()
+
+    def _on_worker_finished(self):
+        """The run's thread has ended (its result, if any, reached
+        _on_solved first): release the worker — it deletes itself — and
+        restore the controls."""
+        self._worker = None
+        if self._shut_down:
+            return
+        self._set_busy(False)
+        if self.op_progress.maximum() == 0:
+            self.op_progress.setRange(0, 100)
+            self.op_progress.setValue(0)
+        if not self._got_result:
+            # run() reports every Exception as an error output, so this
+            # only happens if the thread died some other way.
+            self.results.setHtml("<i>The run ended without a result.</i>")
+            self._set_dirty(True)
 
     def _on_scrub(self, i: int):
         out = self._last_out
@@ -1040,7 +1082,7 @@ class BULoweringDialog(QDialog):
             for lid, name in list_raster_layers():
                 self.raster_combo.addItem(name, lid)
         except Exception:
-            pass
+            log_exception("BU lowering: could not list the project's raster layers")
         if self.raster_combo.count() == 0:
             self.raster_combo.addItem("(no raster layers)", "")
 
@@ -1135,7 +1177,8 @@ class BULoweringDialog(QDialog):
 
                 crs = QgsProject.instance().crs().authid() or crs
             except Exception:
-                pass
+                log_exception("BU lowering: project CRS unavailable; "
+                              f"georeferencing assumes {crs}")
         if self._grid_origin:
             return tuple(self._grid_origin["origin_map_xy"]), self._grid_origin["crs_authid"]
         if self._picked_centre is not None:
@@ -1145,7 +1188,8 @@ class BULoweringDialog(QDialog):
                 c = self.iface.mapCanvas().center()
                 origin = (c.x(), c.y())
             except Exception:
-                pass
+                log_exception("BU lowering: map canvas centre unavailable; "
+                              "origin defaults to (0, 0)")
         return origin, crs
 
     # ------------------------------------------------- map picking / overlay
@@ -1207,6 +1251,8 @@ class BULoweringDialog(QDialog):
             pass
 
     def _restore_after_pick(self):
+        if self._shut_down:
+            return  # a pick cancelled by shutdown(): don't re-raise the window
         try:
             self.setWindowOpacity(1.0)
         except Exception:
@@ -1267,6 +1313,8 @@ class BULoweringDialog(QDialog):
             _origin, crs = self._origin_for_map()
             return map_points_to_local(pts, pts[0], crs)
         except Exception:
+            log_exception("BU lowering: picks not converted to a metric "
+                          "frame; bearings and distances use raw map units")
             x0, y0 = pts[0]
             return [(x - x0, y - y0) for x, y in pts]
 
@@ -1348,6 +1396,8 @@ class BULoweringDialog(QDialog):
         return [list(e1), list(e2)]
 
     def _refresh_map_overlay(self, *_a):
+        if self._shut_down:
+            return
         canvas = self._map_canvas()
         if canvas is None:
             return
@@ -1365,15 +1415,16 @@ class BULoweringDialog(QDialog):
             origin, crs = (self._scene_origin if self._scene_origin
                            else self._origin_for_map())
             self._map_overlay.update(scene, origin, crs)
-        except Exception:
-            pass  # overlay is best-effort; never break the run flow
+        except Exception:  # best-effort; never break the run flow
+            log_exception("BU lowering: map overlay not drawn")
 
     def _clear_map_overlay(self):
         if self._map_overlay is not None:
             try:
                 self._map_overlay.clear()
             except Exception:
-                pass
+                log_exception("BU lowering: map overlay not cleared",
+                              level=logging.DEBUG)
         if getattr(self, "show_on_map", None) is not None and self.show_on_map.isChecked():
             self.show_on_map.setChecked(False)
 
@@ -1382,17 +1433,42 @@ class BULoweringDialog(QDialog):
             try:
                 self._pick_tool.cancel()
             except Exception:
-                pass
+                log_exception("BU lowering: map pick not cancelled cleanly",
+                              level=logging.DEBUG)
             self._pick_tool = None
         if self._map_overlay is not None:
             try:
                 self._map_overlay.clear()
             except Exception:
-                pass
+                log_exception("BU lowering: map overlay not cleared",
+                              level=logging.DEBUG)
 
     def reject(self):
         self._cleanup_map_artifacts()
         super().reject()
+
+    def shutdown(self):
+        """Tear the dialog down for plugin unload; safe to call repeatedly.
+
+        Stops a running simulation (cancel, then a bounded wait — one that
+        outlives it finishes detached, see SolveWorker.stop), cancels a map
+        pick, removes the canvas overlay and closes the dialog (saving the
+        inputs, as a normal close does). The caller then drops its
+        reference and calls deleteLater()."""
+        if self._shut_down:
+            return
+        self._shut_down = True
+        self._play_timer.stop()
+        worker, self._worker = self._worker, None
+        if worker is not None:
+            try:
+                worker.finished.disconnect(self._on_worker_finished)
+            except TypeError:  # not connected
+                pass
+            worker.stop(_SHUTDOWN_WAIT_MS)
+        self._cleanup_map_artifacts()
+        self._map_overlay = None
+        self.close()
 
     # ------------------------------------------------------------- export
 
@@ -1521,7 +1597,7 @@ class BULoweringDialog(QDialog):
                     w.setChecked(str(val) in ("1", "true", "True"))
                 elif isinstance(w, QLineEdit):
                     w.setText(str(val))
-            except Exception:
+            except (TypeError, ValueError):  # unreadable stored value: keep default
                 pass
         raw = self.settings.value("profile_json")
         if raw:
@@ -1532,7 +1608,8 @@ class BULoweringDialog(QDialog):
                     self.profile_table.setItem(r, 0, QTableWidgetItem(str(d)))
                     self.profile_table.setItem(r, 1, QTableWidgetItem(str(z)))
             except Exception:
-                pass
+                log_exception("BU lowering: saved depth profile could not be "
+                              "fully restored — check the profile table")
         raw = self.settings.value("bu_integration_json")
         if raw:
             self.integration_editor.set_from_json(str(raw))
@@ -1579,7 +1656,7 @@ class BULoweringDialog(QDialog):
             self.settings.setValue("bu_integration_json",
                                    self.integration_editor.to_json())
         except Exception:
-            pass
+            log_exception("BU lowering: BU integration not saved")
 
     def closeEvent(self, event):  # noqa: N802 - Qt API
         self._save_settings()

@@ -24,7 +24,9 @@ try:
     from qgis.PyQt import QtCore, QtGui
     from qgis.PyQt.QtCore import Qt, pyqtSignal
     from qgis.PyQt.QtWidgets import QToolButton, QWidget
-except Exception:  # pragma: no cover - standalone (non-QGIS) use
+except ImportError as exc:  # pragma: no cover - standalone use without QGIS
+    if exc.name != "qgis":
+        raise  # QGIS is there: a real error — never pull PyQt5 into a Qt6 process
     from PyQt5 import QtCore, QtGui
     from PyQt5.QtCore import Qt, pyqtSignal
     from PyQt5.QtWidgets import QToolButton, QWidget

@@ -366,6 +366,7 @@ class CatenarySystemCalculator:
         self.seabed_clearance_m: Optional[np.ndarray] = None
         self.min_seabed_clearance_m: Optional[float] = None
         self.seabed_penetration: bool = False
+        self._clearance_error: Optional[str] = None  # why the clearance check did not run
         self._touchdown_advance_iterations: int = 0
         self._touchdown_advanced_m: float = 0.0
 
@@ -1012,6 +1013,11 @@ class CatenarySystemCalculator:
             self.diagnostics.tdp_consistency_residual_m = float(tdp_residual_m)
             self.diagnostics.tdp_consistent = bool(tdp_consistent)
             self.diagnostics.tdp_fallback_bisection = bool(used_bisection_fallback)
+            if self._clearance_error:
+                self.diagnostics.warnings.append(
+                    f"Seabed clearance check did not run ({self._clearance_error}); a "
+                    "cable passing below the seabed would not be flagged."
+                )
             if used_bisection_fallback:
                 self.diagnostics.warnings.append(
                     "Touchdown position required the robust bisection fallback (the fixed-point "
@@ -1526,6 +1532,7 @@ class CatenarySystemCalculator:
         the deepest penetration (reported to the caller for plotting; the
         touchdown itself is never relocated — see ``solve``).
         """
+        self._clearance_error = None
         if self.x is None or self.y is None:
             self.seabed_clearance_m = None
             self.min_seabed_clearance_m = None
@@ -1539,7 +1546,10 @@ class CatenarySystemCalculator:
                 [float(self.seabed.depth_at(float(xw))) for xw in x_world],
                 dtype=float,
             )
-        except Exception:
+        except Exception as exc:
+            # solve() turns this into a diagnostics warning: without it the
+            # below-seabed check would be silently off.
+            self._clearance_error = f"{type(exc).__name__}: {exc}"
             self.seabed_clearance_m = None
             self.min_seabed_clearance_m = None
             self.seabed_penetration = False

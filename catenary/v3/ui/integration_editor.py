@@ -29,7 +29,9 @@ try:
         QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel, QPushButton,
         QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
     )
-except Exception:  # pragma: no cover - standalone testing
+except ImportError as exc:  # pragma: no cover - standalone testing without QGIS
+    if exc.name != "qgis":
+        raise  # QGIS is there: a real error — never pull PyQt5 into a Qt6 process
     from PyQt5.QtCore import Qt, pyqtSignal
     from PyQt5.QtWidgets import (
         QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel, QPushButton,
@@ -38,6 +40,13 @@ except Exception:  # pragma: no cover - standalone testing
 
 from ..engine import bu_integration as bi
 from ..engine import cable_system as cs
+
+try:
+    from ....plugin_log import log_warning
+except ImportError:  # loaded outside the plugin package (standalone tests)
+    import logging
+
+    log_warning = logging.getLogger("subsea_cable_tools").warning
 
 _ITEM_FLAGS = getattr(Qt, "ItemFlag", Qt)
 
@@ -387,4 +396,8 @@ class BUIntegrationEditor(QWidget):
         try:
             self.set_from_dict(json.loads(raw) if raw else {})
         except Exception:
+            # Saved make-up unreadable: fall back to the defaults, but say so
+            # — the user's joints/counts are otherwise lost silently.
+            log_warning("Lay simulator: saved BU integration could not be "
+                        "restored; the default make-up is shown")
             self.set_from_dict({})
