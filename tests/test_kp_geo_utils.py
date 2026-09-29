@@ -364,6 +364,18 @@ def test_routeframe_extract_matches_walking_slice() -> bool:
             ok = False
             detail.append(f"{start_km:.3f}-{end_km:.3f}: {len(a)} vs "
                           f"{len(dedup)} vertices")
+    # A range end a rounding error past a vertex (as a different geodesic
+    # library computes it) ends on that vertex: no sub-micrometre segment.
+    vertex_50 = (float(points[50].split()[0]), float(points[50].split()[1]))
+    for nudge_km in (1e-10, -1e-10):
+        pts = iter_line_parts(rf.extract_segment(total_km * 0.1, vertex_kp + nudge_km))[0]
+        ends_on_vertex = (pts[-1].x(), pts[-1].y()) == vertex_50
+        shortest_m = min(da.measureLine(QgsPointXY(a), QgsPointXY(b))
+                         for a, b in zip(pts, pts[1:]))
+        if not ends_on_vertex or shortest_m < 1e-3:
+            ok = False
+            detail.append(f"nudge {nudge_km:+g} km: ends_on_vertex={ends_on_vertex} "
+                          f"shortest={shortest_m:.3g} m")
     # Ends coincide with point_at_kp (shared chainage index).
     sub = rf.extract_segment(total_km * 0.4, total_km * 0.6)
     pts = iter_line_parts(sub)[0]

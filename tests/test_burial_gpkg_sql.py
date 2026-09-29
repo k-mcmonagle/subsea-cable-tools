@@ -305,6 +305,10 @@ def test_readonly_file_opens_without_wal() -> bool:
         conn.commit()
         conn.close()
         os.chmod(path, stat.S_IREAD)
+        if os.access(path, os.W_OK):
+            # e.g. running as root (CI containers): permissions don't apply.
+            return _result("read-only file opens through SQL without WAL", True,
+                           "skipped - this user can write read-only files")
         conn = gpkg_sql.connect(path)
         ok = len(gpkg_sql.read_rows(conn, "bp_event")) == 1
         try:

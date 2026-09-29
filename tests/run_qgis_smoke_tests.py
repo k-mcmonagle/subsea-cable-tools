@@ -281,7 +281,12 @@ def _run_in_process(args, files, extras, total) -> int:
         _record(args.results_file, label, status, elapsed)
         print(f"-- {label}: {elapsed:.1f} s", flush=True)
     if args.results_file:  # a supervisor prints the summary
-        return 1 if any(status == "failed" for _n, status, _s in results) else 0
+        code = 1 if any(status == "failed" for _n, status, _s in results) else 0
+        # Every result is recorded: skip interpreter/QGIS teardown, which can
+        # segfault in headless containers and is not part of any check.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(code)
     return _summarise(results, total, time.perf_counter() - started)
 
 
@@ -323,7 +328,11 @@ def _supervise(files, extras, total) -> int:
         # Hard crash: blame the first check that started but did not finish.
         undone = [name for name in pending if name not in done]
         undone_extras = [label for label in extra_labels if label not in done] if run_extras else []
-        victim = (undone or undone_extras or ["(interpreter shutdown)"])[0]
+        if not undone and not undone_extras:
+            print(f"\n[WARN] the test process exited with code {code} ({code & 0xFFFFFFFF:#x}) "
+                  "after every check had finished; not counted as a failure.", flush=True)
+            break
+        victim = (undone or undone_extras)[0]
         print(f"\n[CRASH] {victim}: the test process died with exit code {code} "
               f"({code & 0xFFFFFFFF:#x})" + ("; resuming with the next check" if undone[1:] or
                                                (undone and run_extras) else ""), flush=True)

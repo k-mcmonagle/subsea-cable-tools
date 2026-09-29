@@ -82,7 +82,17 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
+      # Without git, actions/checkout downloads GitHub's source archive, which
+      # honours .gitattributes export-ignore and so leaves out tests/.
+      - name: Ensure git is available
+        run: |
+          if ! command -v git >/dev/null 2>&1; then
+            apt-get update -qq && apt-get install -y -qq --no-install-recommends git ca-certificates
+          fi
+          git --version
       - uses: actions/checkout@v7
+      - name: Check the checkout includes the tests
+        run: test -f tests/run_qgis_smoke_tests.py || { echo "tests/ missing from the checkout (archive download?)"; exit 1; }
       - name: Versions
         run: |
           python3 -c "from qgis.core import Qgis; print('QGIS', Qgis.QGIS_VERSION)"

@@ -111,8 +111,11 @@ def test_plan_skips_editing_and_same_file_layers_and_keeps_other_tables():
 
 def test_mdb_output_paths_are_one_per_database():
     temp_dir = tempfile.mkdtemp()
+    # Same file name (differing only in case) from two folders, built with
+    # the host's separator so the check also runs on Linux.
     paths = ImportMdbAlgorithm._output_gpkg_paths(
-        [r"C:\a\Survey.mdb", r"C:\b\survey.mdb", r"C:\a\Other.accdb"], temp_dir)
+        [os.path.join("a", "Survey.mdb"), os.path.join("b", "survey.mdb"),
+         os.path.join("a", "Other.accdb")], temp_dir)
     names = [os.path.basename(p) for p in paths.values()]
     ok = (
         names == ["Survey.gpkg", "survey_2.gpkg", "Other.gpkg"]

@@ -783,6 +783,10 @@ def reproject_geoms_to(
 # ---------------------------------------------------------------------------
 
 
+# Chainage tolerance for treating a KP range end as landing on a vertex.
+_VERTEX_SNAP_M = 1e-6
+
+
 class RouteFrame:
     """A cached view of a multi-feature line layer for KP lookups.
 
@@ -1200,8 +1204,23 @@ class RouteFrame:
         last = bisect.bisect_left(seg_end, end_m)
         first = min(first, len(segs) - 1)
         last = min(last, len(segs) - 1)
+        # A range end within a micrometre of a vertex is that vertex. Without
+        # this, a KP that is a vertex's chainage up to rounding (which differs
+        # between geodesic libraries) adds a sub-micrometre segment beside
+        # the vertex.
+        if last > 0 and end_m - seg_end[last - 1] <= _VERTEX_SNAP_M:
+            last -= 1
+            end_m = seg_end[last]
+        if first < last and seg_end[first] - start_m <= _VERTEX_SNAP_M:
+            first += 1
+            start_m = seg_end[first - 1]
 
         def interp(p1, p2, along_m, seg_len):
+            # Within the snap tolerance of either vertex: the stored vertex.
+            if along_m <= _VERTEX_SNAP_M:
+                return p1
+            if along_m >= seg_len - _VERTEX_SNAP_M:
+                return p2
             point = (_interpolate_on_stored_segment(p1, p2, along_m, seg_len)
                      if self._follow_stored_geometry else
                      _interpolate_on_segment(p1, p2, self._distance,
