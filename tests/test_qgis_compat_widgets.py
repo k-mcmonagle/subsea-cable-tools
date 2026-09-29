@@ -265,9 +265,12 @@ def test_burial_profile_true_scale_toggle():
 
 def test_lay_simulator_tables_construct():
     dialog = LaySimulatorDialog()
-    assert dialog.windowTitle()
-    dialog.close()
-    dialog.deleteLater()
+    try:
+        assert dialog.windowTitle()
+    finally:
+        dialog._save_settings = lambda: None     # don't write user settings
+        dialog.close()
+        dialog.deleteLater()
 
 
 def test_bu_lowering_tool_constructs_and_builds_config():

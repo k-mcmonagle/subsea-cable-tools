@@ -239,6 +239,10 @@ def main(argv=None) -> int:
 
     if not args.in_process:
         return _supervise(files, extras, total)
+    # A hard crash (access violation, Qt abort) then prints the Python stack
+    # of every thread before the process dies, so [CRASH] reports say where.
+    import faulthandler
+    faulthandler.enable(file=sys.__stderr__, all_threads=True)
     return _run_in_process(args, files, extras, total)
 
 

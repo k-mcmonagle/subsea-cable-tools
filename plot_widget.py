@@ -247,7 +247,10 @@ class PyQtGraphCanvas(QWidget):
             item = self._layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
-                widget.setParent(None)
+                # Hide rather than setParent(None): keeping the Qt parent keeps
+                # Qt ownership until the deferred delete, so Python's cyclic GC
+                # can never destroy the plot while one of its events is running.
+                widget.hide()
                 widget.deleteLater()
 
     def ensure_axis(self, rows: int, cols: int, index: int, sharex: Optional["PyQtGraphAxis"] = None) -> "PyQtGraphAxis":

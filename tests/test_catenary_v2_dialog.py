@@ -11,7 +11,6 @@ Requires a GUI-enabled Q(gs)Application (widgets cannot be created with
 
 from __future__ import annotations
 
-import math
 from typing import Callable, List
 
 import numpy as np
@@ -25,10 +24,50 @@ def _result(name: str, ok: bool, detail: str = "") -> bool:
     return ok
 
 
+# Every dialog a test makes, torn down by _dispose_dialogs() after each test.
+# Left to the garbage collector, a dialog keeps its queued solves (the
+# constructor's singleShot and the debounce timer) pending into whichever
+# module next runs the event loop, and a cyclic GC then frees it at an
+# arbitrary point - on QGIS 3.40 / PyQt5 even inside its own plot title's
+# layout event, which aborts the test process.
+_DIALOGS: list = []
+
+
+def _dispose_dialogs() -> None:
+    """Shut down, delete and collect every dialog made so far."""
+    import gc
+    import shutil
+    import tempfile
+
+    from qgis.PyQt.QtCore import QCoreApplication, QEvent, QSettings
+
+    from ..qgis_compat import is_deleted
+
+    folder = tempfile.mkdtemp(prefix="sct_v2_settings_")
+    try:
+        ini = getattr(QSettings, "Format", QSettings).IniFormat
+        for dlg in _DIALOGS:
+            if is_deleted(dlg):
+                continue
+            # Closing saves the inputs: keep them out of the user's profile.
+            dlg.settings = QSettings(f"{folder}/v2.ini", ini)
+            dlg.shutdown()  # stops the debounce timers, drops plot callbacks, closes
+            dlg.deleteLater()
+        # Queued update_plot ticks now find the dialogs shut down; the
+        # deferred deletes run here while the list still holds the wrappers.
+        QCoreApplication.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        _DIALOGS.clear()
+        gc.collect()
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 def _make_dialog():
     from ..catenary.catenary_calculator_v2_dialog import CatenaryCalculatorV2Dialog
 
     dlg = CatenaryCalculatorV2Dialog()
+    _DIALOGS.append(dlg)
     # Force a known configuration regardless of any persisted user settings.
     dlg.water_depth.setValue(120.0)
     dlg.chute_exit_height.setValue(0.0)
@@ -300,6 +339,8 @@ def run_all() -> List[str]:
         except Exception as exc:  # pragma: no cover
             _result(test.__name__, False, repr(exc))
             failures.append(test.__name__)
+        finally:
+            _dispose_dialogs()
     print(f"\n{len(failures)} failure(s)." if failures else "\nAll checks passed.")
     return failures
 
