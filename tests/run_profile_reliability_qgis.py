@@ -51,7 +51,6 @@ with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
     from subsea_cable_tools.workbench.depth_service import DepthSourceConfig
     from subsea_cable_tools.kp_geo_utils import RouteFrame
     from subsea_cable_tools.processing.kp_range_depth_slope_summary_algorithm import KPRangeDepthSlopeSummaryAlgorithm
-    from subsea_cable_tools.depth_profile_dockwidget import DepthProfileDockWidget
     from qgis.core import QgsProcessingContext
     project = QgsProject.instance(); project.addMapLayer(layer)
     wgs = QgsCoordinateReferenceSystem('EPSG:4326')
@@ -68,41 +67,9 @@ with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
     context=QgsProcessingContext(); context.setProject(project)
     sources=KPRangeDepthSlopeSummaryAlgorithm._prepare_raster_sources(layer.crs(),[layer],context)
     assert abs(KPRangeDepthSlopeSummaryAlgorithm._sample_rasters_at_point(QgsPointXY(500100,5999900),sources)-114.25)<1e-6
-    from types import SimpleNamespace
-    from qgis.PyQt.QtWidgets import QMainWindow
-    from qgis.gui import QgsMapCanvas, QgsMessageBar
-    root=QMainWindow(); canvas=QgsMapCanvas(); bar=QgsMessageBar()
-    iface=SimpleNamespace(mainWindow=lambda:root,mapCanvas=lambda:canvas,messageBar=lambda:bar)
-    dock=DepthProfileDockWidget(iface)
-    dock.current_line_crs=layer.crs(); dock.distance_area=da
-    dock.line_parts=[[QgsPointXY(500050,5999900),QgsPointXY(500240,5999900)]]
-    dock.line_length=da.measureLine(*dock.line_parts[0])
-    dock.kp_values=[i/1000 for i in range(0,181,10)]
-    dock.depth_values=[109.25+i*.1 for i in range(0,181,10)]
-    dock.depth_source_ids=['a']*10+['b']*9; dock.depth_cell_m=[10]*19
-    dock._build_route_stationing_cache()
-    dock.slope_window_spin.setValue(0)
-    dock._compute_slopes()
-    assert len(dock.slope_deg)==len(dock.kp_values) and dock.slope_deg[10] is None
-    dock._compute_seabed_length()
-    assert abs(dock.seabed_covered_m-170)<1e-6
-    dock.depth_source_ids=['a']*19
-    dock._get_selected_raster_layers=lambda:[layer]
-    dock.side_slope_search_spin.setValue(20)
-    dock._compute_side_slopes_with_progress()
-    assert any(v is not None for v in dock.side_slope_deg)
-    assert any(v is not None for v in dock.side_local_max_deg)
-    dock._compute_slopes()
-    from qgis.PyQt.QtWidgets import QFileDialog
-    saved_dialog=QFileDialog.getSaveFileName
-    try:
-        QFileDialog.getSaveFileName=lambda *a,**k:(str(Path(temp)/'depth.csv'),'')
-        dock.export_csv()
-    finally:
-        QFileDialog.getSaveFileName=saved_dialog
-    assert 'SlopeBaseline' in (Path(temp)/'depth.csv').read_text()
-    dock.close(); dock.deleteLater(); root.close(); canvas.close()
-    print('[PASS] Depth Profile station alignment, covered seabed length, transverse metrics and CSV')
+    # Depth Profile station alignment, covered seabed length, transverse
+    # metrics and CSV are covered by tests/test_depth_profile_core.py
+    # (golden outputs of the pre-refactor dock) and test_depth_profile_dock.
     print('[PASS] Burial sampling/provenance/transverse profiles and Processing use the same native sampler')
     # Contours with genuine transverse brackets recover a known plane.
     from qgis.core import QgsVectorLayer, QgsFeature
@@ -166,7 +133,8 @@ with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
     kp = window._kp_at_distance(50)
     assert kp is not None and .099 < kp < .101
     labels = window.slope_item.getAxis('bottom').tickStrings([50],1,10)
-    assert labels == ['%.4f' % kp]
+    from subsea_cable_tools.kp_axis import format_kp
+    assert labels == [format_kp(kp)]
     assert window._kp_at_distance(-1) is None
     assert len(window.measure.measurements)==1
     assert abs(window.measure.measurements[0]['metrics']['width_m']-50)<1e-6

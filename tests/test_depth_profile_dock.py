@@ -18,6 +18,8 @@ import tempfile
 from types import SimpleNamespace
 from typing import List
 
+REQUIRES_QGIS = True
+
 _X0, _Y0 = 500000.0, 6000000.0
 _GRAD = 0.05
 
@@ -46,6 +48,48 @@ def _make_raster(path: str, pixel: float) -> None:
     band.WriteArray(np.tile(100.0 + _GRAD * (centres - _X0), (height, 1)).astype(np.float32))
     band.SetNoDataValue(-9999)
     ds = None
+
+
+def wait_for_generation(dock, timeout: float = 60.0) -> bool:
+    """Pump events until the dock's background run (and any superseded
+    ones) have finished and been applied. False on timeout."""
+    import time
+    from qgis.PyQt.QtCore import QCoreApplication
+    end = time.monotonic() + timeout
+    while dock.is_generating() or dock._live_tasks:
+        if time.monotonic() > end:
+            return False
+        QCoreApplication.processEvents()
+        time.sleep(0.002)
+    QCoreApplication.processEvents()
+    return True
+
+
+class _Gate:
+    """Holds DepthProfileTask workers at the start of run_profile until
+    released, so cancel/supersede checks do not race the worker."""
+
+    def __init__(self):
+        import threading
+        from .. import depth_profile_core as core
+        self.core = core
+        self.event = threading.Event()
+        self._run = core.run_profile
+
+    def __enter__(self):
+        run, event = self._run, self.event
+
+        def gated(request, cancel=None, progress=None):
+            event.wait(20)
+            return run(request, cancel=cancel, progress=progress)
+
+        self.core.run_profile = gated
+        return self
+
+    def __exit__(self, *exc):
+        self.event.set()
+        self.core.run_profile = self._run
+        return False
 
 
 class _Harness:
@@ -153,6 +197,7 @@ class _Harness:
     def generate(self):
         from qgis.PyQt.QtWidgets import QApplication
         self.dock.generate_profile()
+        wait_for_generation(self.dock)
         QApplication.processEvents()
 
     def close(self):
@@ -183,18 +228,20 @@ def test_raster_depth_profile(h: _Harness) -> bool:
     h.configure()
     h.generate()
     d = h.dock
-    depths_ok = bool(d.kp_values) and all(
-        v is not None and abs(v - _depth_at(kp * 1000 * h.scale)) < 1e-3 for kp, v in zip(d.kp_values, d.depth_values))
-    slopes = [v for v in d.slope_deg if v is not None]
+    p = d.profile
+    depths_ok = bool(p.kp_values) and all(
+        v is not None and abs(v - _depth_at(kp * 1000 * h.scale)) < 1e-3 for kp, v in zip(p.kp_values, p.depth_values))
+    slopes = [v for v in p.slope_deg if v is not None]
     expected_deg = math.degrees(math.atan(_GRAD * h.scale))
     slope_ok = bool(slopes) and all(abs(v + expected_deg) < 1e-3 for v in slopes)
-    expected_seabed = math.hypot(d.line_length, _GRAD * 1000.0)
-    seabed_ok = abs(d.seabed_length - expected_seabed) < 0.01
+    expected_seabed = math.hypot(p.route.line_length, _GRAD * 1000.0)
+    seabed_ok = abs(p.seabed_length - expected_seabed) < 0.01
     plotted = len(d.figure.get_axes()) == 1 and d._depth_axis is not None
     summary = "max |slope| 2.86°" in d.plot_status_label.text()
-    return _result("raster depth profile generates and plots (field crash regression)",
-                   depths_ok and slope_ok and seabed_ok and plotted and summary,
-                   f"stations={len(d.kp_values)} seabed={d.seabed_length:.3f} (expected {expected_seabed:.3f})")
+    idle = not d.is_generating() and d.progress_bar.isHidden() and d.cancel_btn.isHidden()
+    return _result("raster depth profile generates (background task) and plots (field crash regression)",
+                   depths_ok and slope_ok and seabed_ok and plotted and summary and idle,
+                   f"stations={len(p.kp_values)} seabed={p.seabed_length:.3f} (expected {expected_seabed:.3f})")
 
 
 def test_dual_and_slope_only(h: _Harness) -> bool:
@@ -219,13 +266,14 @@ def test_reverse_kp_hover(h: _Harness) -> bool:
     d.on_mouse_move(PlotMouseEvent("motion_notify_event", axis, 0.0, 120.0))
     centre = d.marker.center() if d.marker else None
     # Displayed KP 0 with Reverse KP is the route END: marker must be there.
-    ok = idx == len(d.kp_values) - 1 and centre is not None and abs(centre.x() - (_X0 + 1000)) < 1e-6
+    kp_values = d.profile.kp_values
+    ok = idx == len(kp_values) - 1 and centre is not None and abs(centre.x() - (_X0 + 1000)) < 1e-6
     ok = ok and abs(d.vertical_line.get_xdata()[0]) < 1e-9
     d.on_mouse_move(PlotMouseEvent("motion_notify_event", axis, 0.25, 120.0))
     idx = d._station_for_plot_x(0.25)
     # Displayed KP 0.25 from the end is ~750 m from the start.
-    ok = ok and abs(d.kp_values[idx] * 1000 - 750) <= 5.0
-    ok = ok and abs(d.marker.center().x() - (_X0 + d.kp_values[idx] * 1000 * h.scale)) < 1e-6
+    ok = ok and abs(kp_values[idx] * 1000 - 750) <= 5.0
+    ok = ok and abs(d.marker.center().x() - (_X0 + kp_values[idx] * 1000 * h.scale)) < 1e-6
     d.clear_plot()
     from qgis.gui import QgsVertexMarker
     leftovers = [i for i in h.canvas.scene().items() if isinstance(i, QgsVertexMarker)]
@@ -287,7 +335,7 @@ def test_measurements(h: _Harness) -> bool:
     export_ok = "from_kp_km" in text and len(text.strip().splitlines()) == 3 and os.path.getsize(png_path) > 0
 
     m.action.setChecked(False)
-    d.generate_profile()  # new data discards old measurements
+    h.generate()  # new data discards old measurements
     reset_ok = not m.measurements and not m.table.isVisibleTo(d)
     return _result("measure on the depth plot: snapped metrics, clicks, VE lock, CSV/PNG export, reset",
                    ok and click_ok and ve_ok and export_ok and reset_ok,
@@ -299,7 +347,7 @@ def test_multi_raster_series(h: _Harness) -> bool:
     h.configure(rasters=("fine", "coarse"), per_raster=True)
     h.generate()
     names = [s["name"] for s in d.measure.series]
-    ok = len(d.raster_series) == 2 and len(names) == 3 and names[0].startswith("Composite")
+    ok = len(d.profile.raster_series) == 2 and len(names) == 3 and names[0].startswith("Composite")
     return _result("per-raster plotting offers composite + each raster as measurement lines", ok, str(names))
 
 
@@ -307,32 +355,34 @@ def test_contour_profile(h: _Harness) -> bool:
     d = h.dock
     h.configure(source="Contours")
     h.generate()
-    ok = len(d.kp_values) == 21 and all(abs(v - _depth_at(kp * 1000 * h.scale)) < 1e-6
-                                         for kp, v in zip(d.kp_values, d.depth_values))
-    slopes = [v for v in d.slope_deg if v is not None]
+    p = d.profile
+    ok = len(p.kp_values) == 21 and all(abs(v - _depth_at(kp * 1000 * h.scale)) < 1e-6
+                                         for kp, v in zip(p.kp_values, p.depth_values))
+    slopes = [v for v in p.slope_deg if v is not None]
     expected_deg = math.degrees(math.atan(_GRAD * h.scale))
     ok = ok and bool(slopes) and all(abs(v + expected_deg) < 1e-3 for v in slopes)
     ok = ok and d._depth_axis is not None
     return _result("contour profile: exact crossings, KP by vectorised projection, plotted", ok,
-                   f"crossings={len(d.kp_values)}")
+                   f"crossings={len(p.kp_values)}")
 
 
 def test_selected_only(h: _Harness) -> bool:
     d = h.dock
     h.configure(route=h.routes)
     h.generate()
-    both = len(d.line_parts) == 2  # unselected: both routes, flagged as disconnected parts
+    both = len(d.profile.route.line_parts) == 2  # unselected: both routes, flagged as disconnected parts
     spur = [f.id() for f in h.routes.getFeatures() if f["name"] == "spur"]
     h.routes.selectByIds(spur)
     h.configure(selected_only=True, route=h.routes)
     h.generate()
-    ok = both and abs(d.line_length * h.scale - 500.0) < 0.05 and abs(d.kp_values[-1] * 1000 - d.line_length) < 1e-6
+    length = d.profile.route.line_length
+    ok = both and abs(length * h.scale - 500.0) < 0.05 and abs(d.profile.kp_values[-1] * 1000 - length) < 1e-6
     h.routes.removeSelection()
     h.generate()
-    empty_ok = d._status_msg == "No selected route features" and not d.kp_values
+    empty_ok = d._status_msg == "No selected route features" and not d.profile.kp_values
     h.configure(selected_only=False)
     return _result("'Selected only' profiles just the selected route feature", ok and empty_ok,
-                   f"length={d.line_length}")
+                   f"length={length}")
 
 
 def _route_kp_of_x(h: _Harness, x: float) -> float:
@@ -377,7 +427,7 @@ def test_route_kp_axis_drawn_line(h: _Harness) -> bool:
         h.generate()
         axes = d.figure.get_axes()
         axis = axes[0].plot_item.getAxis("bottom")
-        end_km = d.kp_values[-1]
+        end_km = d.profile.kp_values[-1]
         levels = axis.tickValues(0.0, end_km, 600)
         positions = levels[0][1] if levels else []
         labels = axis.tickStrings(positions, 1.0, levels[0][0]) if levels else []
@@ -468,11 +518,90 @@ def test_csv_export(h: _Harness) -> bool:
         QFileDialog.getSaveFileName = saved
     rows = open(path, encoding="utf-8").read().strip().splitlines()
     first = rows[1].split(",") if len(rows) > 1 else []
-    seabed_sum = sum(d.segment_seabed_length)
-    ok = len(rows) == len(d.kp_values) and first and first[2] and first[3]
-    ok = ok and abs(seabed_sum - d.seabed_length) < 1e-6
+    seabed_sum = sum(s.seabed_length for s in d.profile.segments())
+    ok = len(rows) == len(d.profile.kp_values) and first and first[2] and first[3]
+    ok = ok and abs(seabed_sum - d.profile.seabed_length) < 1e-6
     return _result("segment CSV: lat/lon computed at export, segment seabed sums to total", bool(ok),
                    f"rows={len(rows)} lat={first[2] if first else None}")
+
+
+def test_superseded_run_ignored(h: _Harness) -> bool:
+    """Generating again while a run is in flight: only the newest applies."""
+    d = h.dock
+    with _Gate() as gate:
+        h.configure(source="Contours")
+        d.generate_profile()
+        # (isHidden: the Setup tab itself may be behind the plot tab)
+        busy = d.is_generating() and not d.progress_bar.isHidden() and not d.cancel_btn.isHidden()
+        first = d._task
+        h.configure()  # raster
+        d.generate_profile()
+        superseded = first is not d._task and first.isCanceled()
+        gate.event.set()
+        done = wait_for_generation(d)
+    p = d.profile
+    # Raster stations carry the supplying raster; contour stations do not.
+    ok = busy and superseded and done and len(p.kp_values) > 21 and any(p.depth_source_ids)
+    ok = ok and d.progress_bar.isHidden() and d._depth_axis is not None
+    return _result("a superseded background run is cancelled and its result ignored", ok,
+                   f"busy={busy} superseded={superseded} stations={len(p.kp_values)}")
+
+
+def test_cancel_button(h: _Harness) -> bool:
+    """Cancel during the along-route pass leaves no profile and says so."""
+    d = h.dock
+    h.configure()
+    with _Gate() as gate:
+        d.generate_profile()
+        d._cancel_clicked()
+        gate.event.set()
+        done = wait_for_generation(d)
+    status = d.plot_status_label.text()
+    stations = len(d.profile.kp_values)
+    ok = done and not stations and status == "Profile generation cancelled"
+    ok = ok and not d.is_generating() and d.cancel_btn.isHidden()
+    h.generate()  # and the dock still works afterwards
+    ok = ok and bool(d.profile.kp_values)
+    return _result("Cancel stops a background run: no profile, status says cancelled", ok,
+                   f"done={done} stations={stations} status={status!r}")
+
+
+def test_unload_and_close_cancel(h: _Harness) -> bool:
+    """clear_plot, shutdown (the plugin's unload hook) and closing the dock
+    cancel a run in flight; its result never reaches the dock. shutdown also
+    removes map items, disconnects project signals and is idempotent."""
+    from qgis.core import QgsPointXY
+    from qgis.gui import QgsRubberBand
+    from ..qgis_compat import GEOMETRY_LINE
+    d = h.dock
+    h.configure()
+    results = []
+    for stop in (d.clear_plot, d.shutdown, d.close):
+        rubber = None
+        if stop == d.shutdown:
+            rubber = d.temp_line_rubber = QgsRubberBand(h.canvas, GEOMETRY_LINE)
+            rubber.addPoint(QgsPointXY(_X0, _Y0))
+        with _Gate() as gate:
+            d.generate_profile()
+            task = d._task
+            stop()
+            cancelled = task.isCanceled()  # read now: the manager deletes finished tasks
+            gate.event.set()
+            done = wait_for_generation(d)
+        ok = done and cancelled and not d.profile.kp_values and not d.is_generating()
+        if stop == d.shutdown:
+            d.shutdown()  # idempotent
+            ok = ok and d.temp_line_rubber is None and rubber.scene() is None
+            ok = ok and not d._project_signals_connected and d.marker is None
+            d.hide()  # showing again re-arms the dock
+        results.append(ok)
+        if stop != d.clear_plot:
+            d.show()
+            d.populate_layer_combos()
+    ok = all(results) and d._project_signals_connected and not d._shut_down
+    h.generate()
+    ok = ok and bool(d.profile.kp_values)
+    return _result("clear_plot, shutdown (unload) and dock close cancel a running generation", ok, str(results))
 
 
 def run_all() -> List[bool]:
@@ -487,7 +616,8 @@ def run_all() -> List[bool]:
             for test in (test_raster_depth_profile, test_dual_and_slope_only, test_reverse_kp_hover,
                          test_measurements, test_multi_raster_series, test_contour_profile,
                          test_selected_only, test_kp_axis_round_ticks, test_route_kp_axis_drawn_line,
-                         test_kp_mouse_window_cursor_sync, test_csv_export):
+                         test_kp_mouse_window_cursor_sync, test_csv_export, test_superseded_run_ignored,
+                         test_cancel_button, test_unload_and_close_cancel):
                 try:
                     results.append(test(harness))
                 except Exception as exc:  # report, keep going

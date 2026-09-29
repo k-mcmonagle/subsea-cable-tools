@@ -88,6 +88,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Burial Planner — plan files:** opening or checking an ordinary GeoPackage no longer changes or locks it, plan files on network shares no longer use a journal mode that is unsafe there, and creating or renaming a plan always records its change-log entry.
 - **Burial Planner — deleting a plan** now also removes its ground-model and BAS rows.
 - **Burial Planner — window:** closing and reopening the panel keeps it in step with the current project, and results from an analysis stopped by closing the panel are no longer applied.
+- **Depth Profile:** profiles and side slopes are computed in the background with a progress bar and *Cancel*, so QGIS stays responsive on long routes (results are unchanged); raster files are no longer locked after a profile, and skipped samples or contours are reported instead of silently left blank.
 <!-- audit-2026-09 entries -->
 
 ## [1.9.0] - 2026-08-29
