@@ -29,6 +29,7 @@ from .gpkg_writer import (
     stored_field_indexes,
     write_layer_to_gpkg,
 )
+from .plugin_log import log_exception
 from .qgis_compat import (
     FILE_DIALOG_DONT_CONFIRM_OVERWRITE,
     MESSAGE_SUCCESS,
@@ -118,17 +119,24 @@ def save_layers(plan, gpkg_path, transform_context, relink=True, feedback=None):
             layer_feedback.progressChanged.connect(
                 lambda p, i=index: feedback.setProgress((i + p / 100.0) * 100.0 / len(todo)))
             feedback.canceled.connect(layer_feedback.cancel)
-        indexes = stored_field_indexes(layer)
-        error, entry.renamed_fields = write_layer_to_gpkg(
-            layer,
-            gpkg_path,
-            entry.table,
-            transform_context,
-            feedback=layer_feedback,
-            attributes=None if len(indexes) == layer.fields().count() else indexes,
-        )
-        if feedback is not None:
-            feedback.canceled.disconnect(layer_feedback.cancel)
+        try:
+            indexes = stored_field_indexes(layer)
+            error, entry.renamed_fields = write_layer_to_gpkg(
+                layer,
+                gpkg_path,
+                entry.table,
+                transform_context,
+                feedback=layer_feedback,
+                attributes=None if len(indexes) == layer.fields().count() else indexes,
+            )
+        except Exception as exc:
+            # One failing layer must not abort the batch: the layers already
+            # saved (and re-pointed) are still reported.
+            log_exception(f"{TITLE}: writing '{layer.name()}' failed")
+            error = str(exc) or type(exc).__name__
+        finally:
+            if feedback is not None:
+                feedback.canceled.disconnect(layer_feedback.cancel)
         if error:
             entry.error = error
             continue

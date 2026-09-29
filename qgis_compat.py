@@ -18,6 +18,11 @@ try:
 except ImportError:  # pragma: no cover - QGIS 3 / Qt5
     from qgis.PyQt.QtWidgets import QAction
 
+try:
+    from qgis.PyQt import sip as _sip
+except ImportError:  # pragma: no cover - old PyQt5 builds without the shim
+    import sip as _sip
+
 from qgis.core import (
     Qgis,
     QgsMapLayer,
@@ -138,6 +143,20 @@ def symbol_layer_property(name: str):
         if legacy is not None and hasattr(legacy, candidate):
             return getattr(legacy, candidate)
     return None
+
+
+def is_deleted(obj) -> bool:
+    """True when ``obj`` wraps a Qt object whose C++ side has been destroyed.
+
+    ``None`` and objects that are not sip wrappers count as not deleted, so
+    callers can guard any attribute with it.
+    """
+    if obj is None:
+        return False
+    try:
+        return _sip.isdeleted(obj)
+    except TypeError:
+        return False
 
 
 def qt_exec(obj, *args, **kwargs):

@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!-- Cable Lay Data Explorer: inspecting a data trace. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1c365c"/>
+      <stop offset="1" stop-color="#36597a"/>
+    </linearGradient>
+  </defs>
+  <rect x="1" y="1" width="22" height="22" rx="4.5" fill="url(#bg)"/>
+  <circle cx="10.5" cy="10.5" r="5.5" fill="none" stroke="#e3ecf5" stroke-width="1.6"/>
+  <line x1="14.6" y1="14.6" x2="18.6" y2="18.6" stroke="#e3ecf5" stroke-width="2.4" stroke-linecap="round"/>
+  <polyline points="7.4,12.2 9.4,9.6 11.4,11.6 13.6,8.6" fill="none" stroke="#f5a623" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

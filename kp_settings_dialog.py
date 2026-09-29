@@ -10,6 +10,7 @@ from qgis.PyQt.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox, QGroupBox
 from .kp_range_utils import (KP_MODE_CARTESIAN, KP_MODE_GEODESIC, describe_kp_mode,
                              kp_distance_mode, kp_grid_crs_setting,
                              set_kp_distance_settings)
+from .plugin_log import log_exception
 from .qgis_compat import BUTTON_BOX_CANCEL, BUTTON_BOX_OK, qt_exec
 
 
@@ -45,6 +46,8 @@ class KpSettingsDialog(QDialog):
             from qgis.gui import QgsProjectionSelectionWidget
             self.crs_widget = QgsProjectionSelectionWidget()
         except Exception:  # pragma: no cover - GUI unavailable
+            log_exception("KP settings: CRS picker unavailable; a specific grid "
+                          "CRS cannot be chosen")
             self.crs_widget = None
         if self.crs_widget is not None:
             inner.addWidget(self.crs_widget)

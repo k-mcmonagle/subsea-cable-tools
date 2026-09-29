@@ -24,6 +24,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **Icons:** distinct toolbar and menu icons for the Cable Route Workbench, Planner, Burial Planner, Cable Lay Data Explorer and KP settings.
 - **KP settings:** new *Subsea Cable Tools ▸ KP settings…* switches KP measurement plugin-wide between Geodesic (WGS84, the default) and Cartesian grid distances (a chosen CRS, else the project CRS when projected, else the route's UTM zone), so Cartesian KP now works for routes in any CRS.
 - **Burial Planner — KPs tied to the RPL:**
   - Plans on an RPL that starts at a non-zero KP now use that start KP, and the Inputs tab warns when the RPL's printed KPs differ from the measured KPs (it recognises RPLs chained on a grid).
@@ -100,6 +101,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Processing tools:** long-running tools can be cancelled and report progress, tools warn when features or contours are skipped instead of silently leaving them out, and every tool's *Help* opens the documentation.
 - **Cable Lay Simulator:** table resize grips work on QGIS 4; after editing inputs during a solve, *Solve* restarts on the latest inputs, and results from outdated inputs are always marked stale.
 - **Catenary Calculator V2:** non-numeric assembly or seabed-profile cells are listed under *Warnings* instead of silently becoming zero, and the minimum bend radius check no longer passes by default where a radius cannot be computed.
+- **KP Mouse Tool:** much smoother on long routes; it now reads exactly the same KP as every other tool (previously it could differ by centimetres to metres inside long legs) and chains RPL legs in SeqNo order like the other tools.
+- **KP Plotter:** hovering the plot no longer re-renders the whole map on every mouse move.
+- **Raster sampling:** rasters are read in cached tiles with identical values, and raster files are no longer locked after a background analysis.
+- **Plugin reload:** unloading or reloading the plugin stops running solves and tasks, removes every map marker, rubber band, menu entry and toolbar button, and releases the plugin's map tools.
+- **Bundled libraries** no longer override copies already installed with QGIS (for example openpyxl on QGIS 3.40), for this plugin or any other.
+- **Tools that fail to open** now always say why, with details in the *Subsea Cable Tools* tab of the Log Messages panel.
 <!-- audit-2026-09 entries -->
 
 ## [1.9.0] - 2026-08-29

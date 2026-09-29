@@ -12,6 +12,8 @@ from contextlib import closing
 
 from qgis.core import Qgis, QgsField, QgsFields, QgsVectorFileWriter
 
+from .plugin_log import log_exception
+
 
 class RenamingFieldConverter(QgsVectorFileWriter.FieldValueConverter):
     """Renames fields on write; values pass through unchanged."""
@@ -81,6 +83,9 @@ def gpkg_table_names(gpkg_path):
         with closing(sqlite3.connect(f"file:{gpkg_path}?mode=ro", uri=True)) as conn:
             return [row[0] for row in conn.execute("SELECT table_name FROM gpkg_contents")]
     except sqlite3.Error:
+        # Callers use this to warn before replacing tables; say why they can't.
+        log_exception(f"Could not list the tables in {gpkg_path}; existing "
+                      "tables of the same name may be replaced without a prompt")
         return []
 
 
