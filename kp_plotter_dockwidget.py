@@ -1,20 +1,15 @@
 from qgis.PyQt.QtWidgets import QDockWidget, QVBoxLayout, QWidget, QComboBox, QLabel, QListWidget, QPushButton, QListWidgetItem, QTabWidget, QHBoxLayout, QCheckBox, QGroupBox, QRadioButton, QButtonGroup
 from qgis.PyQt.QtCore import Qt
-from qgis.core import QgsProject, QgsVectorLayer, QgsWkbTypes, QgsGeometry, QgsPointXY, QgsDistanceArea, QgsCoordinateTransform
+from qgis.core import QgsProject, QgsVectorLayer, QgsWkbTypes, QgsGeometry, QgsPointXY, QgsDistanceArea, QgsCoordinateTransform, QgsCsException
 from .qgis_compat import SELECTION_MODE_EXTENDED, GEOMETRY_LINE, GEOMETRY_NULL
 from qgis.gui import QgsVertexMarker
 from .kp_range_utils import make_kp_distance_area
-try:  # Safe sip import for deleted checks
-    from qgis.PyQt import sip  # type: ignore
-    _sip_isdeleted = sip.isdeleted
-except Exception:  # pragma: no cover
-    try:
-        import sip  # type: ignore
-        _sip_isdeleted = sip.isdeleted
-    except Exception:
-        def _sip_isdeleted(_obj):
-            return False
+from .maptools.canvas_items import remove_canvas_item
 from .plot_widget import Figure, FigureCanvas, NavigationToolbar
+from .plugin_log import log_exception, log_info
+import bisect
+import logging
+import math
 import numpy as np
 
 class KpPlotterDockWidget(QDockWidget):
@@ -460,6 +455,7 @@ class KpPlotterDockWidget(QDockWidget):
 
         # For interpolation, get all parts as polylines
         self.line_parts = merged_geometry.asMultiPolyline() if merged_geometry.isMultipart() else [merged_geometry.asPolyline()]
+        self._build_stationing()
 
         table_layer = QgsProject.instance().mapLayer(table_layer_id)
         if not table_layer or not isinstance(table_layer, QgsVectorLayer):
@@ -470,18 +466,25 @@ class KpPlotterDockWidget(QDockWidget):
         # Extract data efficiently
         kp_values = []
         series = {field: [] for field in data_fields}
+        skipped = 0
         for feat in table_layer.getFeatures():
             try:
                 kp = float(feat[kp_field])
-            except Exception:
+            except (TypeError, ValueError):
+                kp = float('nan')
+            if not math.isfinite(kp):  # NULL / text / NaN KP: nowhere to plot it
+                skipped += 1
                 continue
             kp_values.append(kp)
             for field in data_fields:
                 try:
                     val = float(feat[field])
-                except Exception:
+                except (TypeError, ValueError):
                     val = None
                 series[field].append(val)
+        if skipped:
+            log_info(f"KP Plotter: {skipped} row(s) of '{table_layer.name()}' have no "
+                     f"numeric KP in '{kp_field}' and are not plotted.")
 
         if not kp_values or not any(series.values()):
             ax.set_title("No valid data to plot.")
@@ -494,6 +497,9 @@ class KpPlotterDockWidget(QDockWidget):
         if self.reverse_kp_checkbox.isChecked():
             zipped = list(reversed(zipped))
         self.kp_sorted = [row[0] for row in zipped]  # Store for snapping
+        # Sorted copy + original positions: nearest-KP lookups by bisect.
+        self._kp_order = sorted(range(len(self.kp_sorted)), key=self.kp_sorted.__getitem__)
+        self._kp_ascending = [self.kp_sorted[i] for i in self._kp_order]
 
         # Separate fields by axis assignment
         primary_fields = [field for field in data_fields if self.get_axis_assignment(field) == 'primary']
@@ -591,15 +597,11 @@ class KpPlotterDockWidget(QDockWidget):
             self.canvas.setToolTip("")
             return
         mouse_x = event.xdata
-        min_dist = float('inf')
-        idx_closest = None
-        for i, x in enumerate(xdata):
-            if x is None:
-                continue
-            dist = abs(mouse_x - x)
-            if dist < min_dist:
-                min_dist = dist
-                idx_closest = i
+        idx_closest = self._nearest_kp_index(mouse_x) if mouse_x is not None else None
+        if idx_closest is None or idx_closest >= len(xdata):
+            self.canvas.setToolTip("")
+            return
+        min_dist = abs(mouse_x - xdata[idx_closest])
         # Only show tooltip if close enough
         if idx_closest is None or min_dist > 0.05 * (ax.get_xlim()[1] - ax.get_xlim()[0]):
             self.canvas.setToolTip("")
@@ -668,7 +670,7 @@ class KpPlotterDockWidget(QDockWidget):
         # Snap to nearest KP value
         if not hasattr(self, 'kp_sorted') or not self.kp_sorted:
             return
-        nearest_kp = min(self.kp_sorted, key=lambda x: abs(x - mouse_kp))
+        nearest_kp = self.kp_sorted[self._nearest_kp_index(mouse_kp)]
         # Interpolate point on line
         if not hasattr(self, 'merged_geometry') or not hasattr(self, 'line_parts') or not self.line_parts:
             return
@@ -676,15 +678,10 @@ class KpPlotterDockWidget(QDockWidget):
         point_geom = self.interpolate_point_along_line(distance_m)
         if point_geom is None or point_geom.isEmpty():
             return
-        point = point_geom.asPoint()
-        # Reproject the interpolated point (in line layer CRS) to project CRS
-        # before centring the map canvas.
-        xform = getattr(self, 'line_to_project_xform', None)
-        if xform is not None:
-            try:
-                point = xform.transform(point)
-            except Exception:
-                pass
+        point = self._to_canvas(point_geom.asPoint())
+        if point is None:
+            log_info(f"KP Plotter: KP {nearest_kp:.3f} could not be transformed to the map CRS.")
+            return
         # Zoom map canvas to this point
         canvas = self.iface.mapCanvas()
         canvas.setCenter(point)
@@ -694,12 +691,15 @@ class KpPlotterDockWidget(QDockWidget):
         canvas.refresh()
 
     def on_mouse_move(self, event):
-        """Handle mouse movement on the plot, snapping to nearest KP value."""
+        """Handle mouse movement on the plot, snapping to nearest KP value.
+
+        The map marker is a canvas item that repaints itself: no canvas
+        refresh here (that re-rendered every layer on each mouse move).
+        """
         # Hide marker and crosshair if mouse leaves plot area
         if not event.inaxes:
             if self.marker and self.marker.isVisible():
                 self.marker.hide()
-                self.iface.mapCanvas().refresh()
             if self.vertical_line and self.vertical_line.get_visible():
                 self.vertical_line.set_visible(False)
                 self.canvas.draw_idle()
@@ -719,9 +719,56 @@ class KpPlotterDockWidget(QDockWidget):
         if mouse_kp is None:
             return
         # Snap to nearest KP value
-        nearest_kp = min(self.kp_sorted, key=lambda x: abs(x - mouse_kp))
+        nearest_kp = self.kp_sorted[self._nearest_kp_index(mouse_kp)]
         self.update_crosshair(nearest_kp)
         self.update_map_marker(nearest_kp)
+
+    def _nearest_kp_index(self, x):
+        """Index in ``kp_sorted`` of the KP nearest ``x`` (bisect, O(log n)).
+
+        Same answer as the linear scan it replaces: on equal distances the
+        entry that comes first in ``kp_sorted`` wins.
+        """
+        values = getattr(self, '_kp_ascending', None)
+        order = getattr(self, '_kp_order', None)
+        if not values:
+            return None
+        pos = bisect.bisect_left(values, x)
+        best = None
+        for value in {values[i] for i in (pos - 1, pos) if 0 <= i < len(values)}:
+            # First position of this value in kp_sorted: stable sort keeps
+            # equal KPs in their original order.
+            index = order[bisect.bisect_left(values, value)]
+            key = (abs(value - x), index)
+            if best is None or key < best[0]:
+                best = (key, index)
+        return best[1]
+
+    def _build_stationing(self):
+        """Cumulative measured segment ends along ``line_parts`` (built once
+        per plot), so a KP -> point lookup is a bisect, not a walk."""
+        self._seg_starts, self._seg_ends, self._segs = [], [], []
+        cumulative = 0.0
+        for part in self.line_parts:
+            for i in range(len(part) - 1):
+                p1, p2 = part[i], part[i + 1]
+                segment_length = self.distance_area.measureLine(p1, p2)
+                self._seg_starts.append(cumulative)
+                cumulative += segment_length
+                self._seg_ends.append(cumulative)
+                self._segs.append((p1, p2, segment_length))
+
+    def _to_canvas(self, point):
+        """Line-CRS point in the map CRS, or ``None`` if it can't be transformed."""
+        xform = getattr(self, 'line_to_project_xform', None)
+        if xform is None:
+            return point
+        try:
+            return xform.transform(point)
+        except QgsCsException:
+            log_exception("KP Plotter: point could not be transformed to the map CRS",
+                          level=logging.DEBUG)
+            return None
 
     def update_crosshair(self, kp):
         """Update the vertical line on the plot."""
@@ -748,21 +795,18 @@ class KpPlotterDockWidget(QDockWidget):
             last_point = last_part[-1]
             return QgsGeometry.fromPointXY(last_point)
 
-        cumulative_length = 0.0
-        for part in self.line_parts:
-            for i in range(len(part) - 1):
-                p1, p2 = part[i], part[i+1]
-                segment_length = self.distance_area.measureLine(p1, p2)
-                if cumulative_length + segment_length >= distance_m:
-                    dist_into_segment = distance_m - cumulative_length
-                    ratio = dist_into_segment / segment_length if segment_length > 0 else 0
-                    x = p1.x() + ratio * (p2.x() - p1.x())
-                    y = p1.y() + ratio * (p2.y() - p1.y())
-                    interp_xy = QgsPointXY(x, y)
-                    return QgsGeometry.fromPointXY(interp_xy)
-                cumulative_length += segment_length
-        # If not found (should not happen)
-        return None
+        # First segment whose end reaches distance_m (the walk this replaces).
+        if getattr(self, '_seg_ends', None) is None:
+            self._build_stationing()
+        index = bisect.bisect_left(self._seg_ends, distance_m)
+        if index >= len(self._segs):
+            return None  # rounding past the last segment end
+        p1, p2, segment_length = self._segs[index]
+        dist_into_segment = distance_m - self._seg_starts[index]
+        ratio = dist_into_segment / segment_length if segment_length > 0 else 0
+        x = p1.x() + ratio * (p2.x() - p1.x())
+        y = p1.y() + ratio * (p2.y() - p1.y())
+        return QgsGeometry.fromPointXY(QgsPointXY(x, y))
 
     def update_map_marker(self, kp):
         """Update the marker on the map canvas using merged geometry."""
@@ -776,39 +820,29 @@ class KpPlotterDockWidget(QDockWidget):
         if not (0 <= distance_m <= self.line_length):
             if self.marker and self.marker.isVisible():
                 self.marker.hide()
-                self.iface.mapCanvas().refresh()
             return
 
-        # Create marker on first valid move and add it to the scene
+        # Create marker on first valid move (a canvas item adds itself to
+        # the canvas scene and repaints itself when moved).
         if not self.marker:
             self.marker = QgsVertexMarker(self.iface.mapCanvas())
             self.marker.setColor(Qt.GlobalColor.red)
             self.marker.setIconSize(12)
             self.marker.setIconType(QgsVertexMarker.ICON_CROSS)
             self.marker.setPenWidth(3)
-            self.iface.mapCanvas().scene().addItem(self.marker)
-
-        if not self.marker.isVisible():
-            self.marker.show()
 
         point_on_line = self.interpolate_point_along_line(distance_m)
-        if point_on_line is None or point_on_line.isEmpty():
-            if self.marker.isVisible():
-                self.marker.hide()
-                self.iface.mapCanvas().refresh()
-            return
-
-        marker_point = point_on_line.asPoint()
         # Reproject from line layer CRS to project CRS so the marker lands
         # correctly even when the layers use different CRSes.
-        xform = getattr(self, 'line_to_project_xform', None)
-        if xform is not None:
-            try:
-                marker_point = xform.transform(marker_point)
-            except Exception:
-                pass
+        marker_point = (self._to_canvas(point_on_line.asPoint())
+                        if point_on_line is not None and not point_on_line.isEmpty() else None)
+        if marker_point is None:
+            if self.marker.isVisible():
+                self.marker.hide()
+            return
         self.marker.setCenter(marker_point)
-        self.iface.mapCanvas().refresh()
+        if not self.marker.isVisible():
+            self.marker.show()
 
     def cleanup_plot_and_marker(self):
         """Clear plot and safely release marker without forcing scene removals.
@@ -821,23 +855,10 @@ class KpPlotterDockWidget(QDockWidget):
         self.disconnect_canvas_events()
         self.disable_tooltips()
 
-        if self.marker:
-            try:
-                if not _sip_isdeleted(self.marker):
-                    try:
-                        self.marker.hide()
-                    except Exception:
-                        pass
-                    try:
-                        self.marker.deleteLater()
-                    except Exception:
-                        pass
-            finally:
-                self.marker = None
-            try:
-                self.iface.mapCanvas().refresh()
-            except Exception:
-                pass
+        # QgsVertexMarker has no deleteLater() on QGIS 3 (the old call failed
+        # silently and left the marker in the scene): detach it instead.
+        remove_canvas_item(self.marker)
+        self.marker = None
 
         # Clear plot figure (kept alive until full close cleanup)
         if getattr(self, 'figure', None):
@@ -868,15 +889,19 @@ class KpPlotterDockWidget(QDockWidget):
     def closeEvent(self, event):
         """Handle the widget being closed."""
         self.save_user_settings()
+        self.shutdown()
+        super().closeEvent(event)
+
+    def shutdown(self):
+        """Full teardown for close and plugin unload (safe to call again):
+        disconnect the plot and project signals and remove the map marker."""
         self.cleanup_plot_and_marker()
         # Only do full plot cleanup when actually closing
         self.cleanup_matplotlib_resources_on_close()
-        # Safely disconnect the signal
         try:
             self.iface.projectRead.disconnect(self.populate_layer_combos)
-        except TypeError:
-            pass  # Signal was not connected
-        super().closeEvent(event)
+        except (TypeError, RuntimeError):
+            pass  # not connected (already shut down)
 
     def cleanup_matplotlib_resources_on_close(self):
         """Clean up plot resources completely when closing the widget."""

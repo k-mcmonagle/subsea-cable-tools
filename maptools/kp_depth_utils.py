@@ -11,16 +11,17 @@ line-crossing points.
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Dict, List, Optional, Tuple
 
 from qgis.core import (
-    QgsCoordinateTransform, QgsGeometry, QgsPointXY, QgsProject,
-    QgsSpatialIndex,
+    QgsCoordinateTransform, QgsCsException, QgsGeometry, QgsPointXY, QgsProject,
 )
 
 from ..bathymetry_sampling import RasterSampler, expand_rasters, layer_options, normalise_depth
-from ..kp_range_utils import make_distance_area
+from ..kp_geo_utils import stored_geometry_index
+from ..plugin_log import log_exception
 from ..qgis_compat import GEOMETRY_LINE, LAYER_RASTER, LAYER_VECTOR
 
 # Ceiling on live-profile stations: enough that a 25 km line over a 100 m
@@ -35,7 +36,7 @@ def is_depth_capable_layer(layer) -> bool:
             return True
         return (layer.type() == LAYER_VECTOR
                 and layer.geometryType() == GEOMETRY_LINE)
-    except Exception:
+    except (AttributeError, RuntimeError):  # not a layer / deleted wrapper
         return False
 
 
@@ -106,7 +107,10 @@ class DepthSampler:
         field_index = layer.fields().lookupField(field)
         if field_index < 0:
             return
-        index = QgsSpatialIndex(layer.getFeatures())
+        # Stored geometries: nearestNeighbor then ranks contours by true
+        # distance, not bounding box (a long contour whose box contains the
+        # point used to beat the contour actually beside it).
+        index = stored_geometry_index(layer.getFeatures())
         self._contours.append({
             "name": layer.name(), "layer": layer, "field_index": field_index,
             "options": layer_options(layer),
@@ -123,9 +127,23 @@ class DepthSampler:
         if transform is not None:
             try:
                 sample_point = transform.transform(sample_point)
-            except Exception:
+            except QgsCsException:  # outside the raster CRS's valid area
                 return None
         return src['sampler'].sample(sample_point, method)
+
+    def _sample_raster_many(self, src, points, method=None) -> List[Optional[float]]:
+        """``_sample_raster`` for many points through the batch sampler."""
+        transform = src.get("transform")
+        if transform is None:
+            return src['sampler'].sample_many(points, method)
+        # Points that cannot be transformed are sampled at NaN -> None.
+        projected = []
+        for point in points:
+            try:
+                projected.append(transform.transform(QgsPointXY(point)))
+            except QgsCsException:
+                projected.append(QgsPointXY(float("nan"), float("nan")))
+        return src['sampler'].sample_many(projected, method)
 
     def _contour_value(self, src, feature_id) -> Optional[float]:
         try:
@@ -141,12 +159,9 @@ class DepthSampler:
         if transform is not None:
             try:
                 sample_point = transform.transform(sample_point)
-            except Exception:
+            except QgsCsException:
                 return None
-        try:
-            nearest = src["index"].nearestNeighbor(sample_point, 1)
-        except Exception:
-            return None
+        nearest = src["index"].nearestNeighbor(sample_point, 1)
         if not nearest:
             return None
         return self._contour_value(src, nearest[0])
@@ -184,7 +199,10 @@ class DepthSampler:
             raise ValueError("; ".join(self.errors))
         try:
             length_m = float(distance_area.measureLine(start, end))
-        except Exception:
+        except QgsCsException:
+            # Planar map units: only metres on a metric CRS — say so.
+            log_exception("KP depth profile: range line could not be measured; "
+                          "using its planar length in map units")
             length_m = math.hypot(end.x() - start.x(), end.y() - start.y())
         pixel_size_m = self.finest_pixel_size_m()
         result = {"length_m": length_m, "pixel_size_m": pixel_size_m,
@@ -202,15 +220,16 @@ class DepthSampler:
             stations.append((fraction * length_m, QgsPointXY(
                 start.x() + fraction * (end.x() - start.x()),
                 start.y() + fraction * (end.y() - start.y()))))
+        station_points = [point for _dist, point in stations]
         for src in self._rasters:
-            values = [self._sample_raster(src, point) for _dist, point in stations]
+            values = self._sample_raster_many(src, station_points)
             if any(value is not None for value in values):
                 pixel_area = src.get("pixel_area")
                 result["rasters"].append({
                     "name": src["name"], "source_id": src["source_id"],
                     "sampling": src["options"].get("sampling"), "datum": src["options"].get("datum"),
                     "x": [dist for dist, _point in stations], "y": values,
-                    "raw_y": [self._sample_raster(src, pt, "nearest") for _x, pt in stations],
+                    "raw_y": self._sample_raster_many(src, station_points, "nearest"),
                     "pixel_size_m": (math.sqrt(pixel_area)
                                      if pixel_area else None)})
         if self._contours:
@@ -232,36 +251,32 @@ class DepthSampler:
         if transform is not None:
             try:
                 query_line.transform(transform)
-            except Exception:
+            except QgsCsException:
+                log_exception("KP depth profile: range line could not be transformed "
+                              "to contour layer %s" % src["name"], level=logging.DEBUG)
                 return []
-        try:
-            candidate_ids = src["index"].intersects(query_line.boundingBox())
-        except Exception:
-            return []
+        candidate_ids = src["index"].intersects(query_line.boundingBox())
         crossings: List[Tuple[float, float]] = []
         back = src.get("back_transform")
         for feature_id in candidate_ids[:500]:
             value = self._contour_value(src, feature_id)
             if value is None:
                 continue
-            try:
+            # The index stores geometries; fall back to the provider if not.
+            geometry = src["index"].geometry(feature_id)
+            if geometry is None or geometry.isEmpty():
                 geometry = src["layer"].getFeature(feature_id).geometry()
-                if geometry is None or geometry.isEmpty():
-                    continue
-                intersection = query_line.intersection(geometry)
-            except Exception:
+            if geometry is None or geometry.isEmpty():
                 continue
+            intersection = query_line.intersection(geometry)
             if intersection is None or intersection.isEmpty():
                 continue
             for point in _geometry_points(intersection):
-                if back is not None:
-                    try:
-                        point = back.transform(point)
-                    except Exception:
-                        continue
                 try:
+                    if back is not None:
+                        point = back.transform(point)
                     distance = float(distance_area.measureLine(start, point))
-                except Exception:
+                except QgsCsException:
                     continue
                 crossings.append((distance, value))
         return crossings

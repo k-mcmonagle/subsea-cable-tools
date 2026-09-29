@@ -14,6 +14,7 @@ measurement as a memory layer with attributes including distance, duration & s
 from __future__ import annotations
 
 import csv
+import logging
 import math
 from typing import List, Optional
 
@@ -29,9 +30,12 @@ from qgis.core import (
     QgsProject, QgsPointXY, QgsDistanceArea, QgsWkbTypes,
     QgsGeometry, QgsVectorLayer, QgsFeature, QgsFields,
     QgsField, QgsUnitTypes, Qgis, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
-    QgsFillSymbol, QgsSingleSymbolRenderer
+    QgsFillSymbol, QgsSingleSymbolRenderer, QgsCsException
 )
 from ..qgis_compat import DISTANCE_METERS, FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_STRING, GEOMETRY_LINE, GEOMETRY_POINT, GEOMETRY_POLYGON, MESSAGE_INFO
+from ..kp_geo_utils import geometry_is_finite
+from ..plugin_log import log_exception
+from .canvas_items import _sip_isdeleted, remove_canvas_item
 from qgis.gui import QgsMapTool, QgsVertexMarker, QgsRubberBand
 
 
@@ -104,14 +108,30 @@ class TransitMeasureTool(QgsMapTool):
         self.selected_waypoint_idx = None
         self.is_dragging = False
         # Clean up when tool is deactivated (switched away)
-        if self.dialog:
-            try:
-                self.dialog._cleanup_rubber_bands()
-                self.dialog.close()
-                self.dialog.deleteLater()
-            except Exception:
-                pass
-            self.dialog = None
+        self._dispose_dialog()
+        super().deactivate()
+
+    def cleanup(self):
+        """Release everything the tool put on the canvas (plugin unload).
+
+        Closes and deletes the dialog, and removes its rubber bands and the
+        snap marker from the map canvas scene. Safe to call more than once,
+        and after the tool was deactivated.
+        """
+        self.remove_vertex_marker()
+        self.selected_waypoint_idx = None
+        self.is_dragging = False
+        self._dispose_dialog()
+
+    def _dispose_dialog(self):
+        dialog, self.dialog = self.dialog, None
+        if dialog is None or _sip_isdeleted(dialog):
+            return
+        # The rubber bands belong to the canvas scene, not the dialog, so
+        # deleting the dialog alone left them (empty) in the scene.
+        dialog.remove_canvas_items()
+        dialog.close()
+        dialog.deleteLater()
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key.Key_Escape,):
@@ -217,9 +237,8 @@ class TransitMeasureTool(QgsMapTool):
             return self.toMapCoordinates(qpoint)
 
     def remove_vertex_marker(self):
-        if self.vertex_marker is not None:
-            self.canvas.scene().removeItem(self.vertex_marker)
-            self.vertex_marker = None
+        remove_canvas_item(self.vertex_marker)
+        self.vertex_marker = None
 
     def _get_waypoint_at_position(self, pt: QgsPointXY, tolerance_pixels: int = 10) -> Optional[int]:
         """Get the index of the waypoint at the given position within tolerance."""
@@ -1105,33 +1124,32 @@ class TransitMeasureDialog(QDialog):
         QgsProject.instance().addMapLayer(layer)
         self.iface.messageBar().pushMessage("", tr("Quick buffer layer added."), level=MESSAGE_INFO, duration=4)
 
-    def _cleanup_rubber_bands(self):
-        """Clean up all rubber band objects and clear drawing from map."""
-        try:
-            if hasattr(self, 'point_rb') and self.point_rb is not None:
-                self.point_rb.reset(GEOMETRY_POINT)
-        except Exception:
-            pass
-        try:
-            if hasattr(self, 'line_rb') and self.line_rb is not None:
-                self.line_rb.reset(GEOMETRY_LINE)
-        except Exception:
-            pass
-        try:
-            if hasattr(self, 'temp_rb') and self.temp_rb is not None:
-                self.temp_rb.reset(GEOMETRY_LINE)
-        except Exception:
-            pass
-        try:
-            if hasattr(self, 'highlight_rb') and self.highlight_rb is not None:
-                self.highlight_rb.reset(GEOMETRY_POINT)
-        except Exception:
-            pass
+    def _rubber_bands(self):
+        """``[(band, geometry type)]`` for every rubber band the dialog made."""
+        bands = [(getattr(self, 'point_rb', None), GEOMETRY_POINT),
+                 (getattr(self, 'line_rb', None), GEOMETRY_LINE),
+                 (getattr(self, 'temp_rb', None), GEOMETRY_LINE),
+                 (getattr(self, 'highlight_rb', None), GEOMETRY_POINT),
+                 (getattr(self, 'buffer_rb', None), GEOMETRY_POLYGON)]
+        return [(band, kind) for band, kind in bands
+                if band is not None and not _sip_isdeleted(band)]
 
-        try:
-            self._reset_buffer_rb()
-        except Exception:
-            pass
+    def _cleanup_rubber_bands(self):
+        """Clear the drawing from the map (the bands stay for reuse)."""
+        for band, kind in self._rubber_bands():
+            band.reset(kind)
+
+    def remove_canvas_items(self):
+        """Take every rubber band off the canvas for good (tool teardown).
+
+        Safe to call twice; the dialog must not draw afterwards.
+        """
+        for band, _kind in self._rubber_bands():
+            remove_canvas_item(band)
+        self.point_rb = self.line_rb = self.temp_rb = None
+        self.buffer_rb = None
+        if hasattr(self, 'highlight_rb'):
+            del self.highlight_rb
 
     def _ensure_buffer_rb(self) -> QgsRubberBand:
         if self.buffer_rb is None:
@@ -1218,8 +1236,12 @@ class TransitMeasureDialog(QDialog):
                 to_src = QgsCoordinateTransform(target_crs, src_crs, proj.transformContext())
                 buf.transform(to_src)
 
-            return buf
-        except Exception:
+            # transform() writes inf (no exception) outside a CRS's domain.
+            return buf if geometry_is_finite(buf) else None
+        except QgsCsException:
+            # Runs on every mouse move while drawing: debug-level only.
+            log_exception("Transit Measure: buffer preview could not be transformed",
+                          level=logging.DEBUG)
             return None
 
     def _is_project_units_meters(self, crs: QgsCoordinateReferenceSystem) -> bool:
@@ -1229,6 +1251,7 @@ class TransitMeasureDialog(QDialog):
             return False
 
     def _utm_crs_for_geom(self, geom: QgsGeometry) -> Optional[QgsCoordinateReferenceSystem]:
+        # A failed transform means no UTM zone: the preview is skipped.
         try:
             wgs84 = QgsCoordinateReferenceSystem('EPSG:4326')
             proj = QgsProject.instance()
@@ -1245,7 +1268,7 @@ class TransitMeasureDialog(QDialog):
             zone = max(1, min(60, zone))
             epsg = (32600 + zone) if lat >= 0 else (32700 + zone)
             return QgsCoordinateReferenceSystem(f'EPSG:{epsg}')
-        except Exception:
+        except QgsCsException:
             return None
 
     def _update_buffer_preview(self, include_motion: bool, motion_pt: Optional[QgsPointXY] = None):
@@ -1264,15 +1287,13 @@ class TransitMeasureDialog(QDialog):
 
             rb = self._ensure_buffer_rb()
             rb.setToGeometry(poly, None)
-        except Exception:
+        except Exception:  # noqa: BLE001 - never break drawing over a preview
+            log_exception("Transit Measure: buffer preview failed", level=logging.DEBUG)
             self._reset_buffer_rb()
 
     def closeEvent(self, evt):
         """Handle dialog close event - hide dialog and clear drawing without destroying it."""
-        try:
-            self._cleanup_rubber_bands()
-        except Exception:
-            pass
+        self._cleanup_rubber_bands()
 
         # Important: ignore the close so the dialog instance stays reusable.
         # (Toolbar action can then re-show it reliably.)
@@ -1282,10 +1303,7 @@ class TransitMeasureDialog(QDialog):
 
     def reject(self):
         """Handle dialog rejection (X button) - same as close."""
-        try:
-            self._cleanup_rubber_bands()
-        except Exception:
-            pass
+        self._cleanup_rubber_bands()
 
         self.hide()
 

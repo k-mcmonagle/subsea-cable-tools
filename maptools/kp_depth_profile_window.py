@@ -1,5 +1,6 @@
 """Live/frozen depth profiles with repeatable measurements and snapshot exports."""
 from __future__ import annotations
+import logging
 import math
 
 import pyqtgraph as pg
@@ -7,6 +8,7 @@ from qgis.PyQt.QtCore import QEvent, QSettings, QTimer, Qt, pyqtSignal
 from qgis.PyQt.QtWidgets import (QCheckBox, QDialog, QHBoxLayout, QLabel,
     QVBoxLayout, QPushButton, QComboBox, QDoubleSpinBox, QFileDialog, QMessageBox, QWidget)
 from ..kp_axis import KPCrossings, format_kp
+from ..plugin_log import log_exception
 from ..kp_axis_item import KPAxisItem
 from ..qgis_compat import WINDOW_HINT_CLOSE, WINDOW_HINT_TITLE, WINDOW_TYPE_TOOL
 from ..slope_utils import interpolate_covered, is_finite
@@ -210,7 +212,8 @@ class KPDepthProfileWindow(QDialog):
             self._kp_crossings = None
             self.measure.reset()
             self._redraw()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - shown in the window; traceback in the debug log
+            log_exception('KP depth profile: sampling failed', level=logging.DEBUG)
             self._profile = None
             self._kp_crossings = None
             self._redraw()

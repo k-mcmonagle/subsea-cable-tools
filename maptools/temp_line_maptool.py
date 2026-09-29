@@ -3,6 +3,8 @@ from qgis.PyQt.QtGui import QColor
 from qgis.gui import QgsMapTool, QgsRubberBand
 from qgis.core import QgsWkbTypes, QgsPointXY
 from ..qgis_compat import GEOMETRY_LINE
+from ..plugin_log import log_exception
+from .canvas_items import remove_canvas_item
 
 
 class TempLineMapTool(QgsMapTool):
@@ -107,8 +109,8 @@ class TempLineMapTool(QgsMapTool):
         if self._finished_cb and self._points:
             try:
                 self._finished_cb(self._points)
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001 - the tool must still tear down
+                log_exception("Depth Profile: using the drawn line failed")
         try:
             self.iface.messageBar().pushMessage(
                 "Depth Profile",
@@ -130,8 +132,8 @@ class TempLineMapTool(QgsMapTool):
         if self._canceled_cb:
             try:
                 self._canceled_cb()
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001 - the tool must still tear down
+                log_exception("Depth Profile: cancelling the drawn line failed")
         try:
             self.iface.messageBar().pushMessage(
                 "Depth Profile",
@@ -151,22 +153,9 @@ class TempLineMapTool(QgsMapTool):
         if not self._active:
             return
         self._active = False
-        try:
-            if self._rubber:
-                try:
-                    self._rubber.reset(GEOMETRY_LINE)
-                except Exception:
-                    pass
-                try:
-                    self._rubber.hide()
-                except Exception:
-                    pass
-                try:
-                    self._rubber.deleteLater()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        # Detach from the canvas scene: on QGIS 3 the rubber band has no
+        # deleteLater(), so the old call silently left it in the scene.
+        remove_canvas_item(self._rubber)
         self._rubber = None
         self._points = []
         self._has_preview = False

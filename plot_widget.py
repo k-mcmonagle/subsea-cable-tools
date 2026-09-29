@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import importlib
 import os
@@ -13,6 +14,8 @@ from qgis.PyQt import QtCore, QtGui, QtSvg
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QPainterPath
 from qgis.PyQt.QtWidgets import QFileDialog, QGraphicsPathItem, QHBoxLayout, QPushButton, QVBoxLayout, QWidget
+
+from .plugin_log import log_exception
 
 
 _PEN_STYLE = getattr(Qt, "PenStyle", Qt)
@@ -231,6 +234,7 @@ class PyQtGraphCanvas(QWidget):
         self.figure = figure
         self.figure.canvas = self
         self._callbacks: Dict[int, Tuple[str, Callable[[PlotMouseEvent], None]]] = {}
+        self._failed_callbacks: set = set()
         self._next_callback_id = 1
         self._connected_scene_ids = set()
         self._layout = QVBoxLayout(self)
@@ -316,13 +320,19 @@ class PyQtGraphCanvas(QWidget):
         self._emit("button_press_event", event)
 
     def _emit(self, event_name: str, event: PlotMouseEvent):
-        for registered_name, callback in list(self._callbacks.values()):
+        for callback_id, (registered_name, callback) in list(self._callbacks.items()):
             if registered_name != event_name:
                 continue
             try:
                 callback(event)
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001 - one broken handler must not stop the rest
+                # Mouse handlers run per event: warn once per handler, then
+                # debug only, so a broken plot interaction is visible without
+                # flooding the log.
+                level = logging.DEBUG if callback_id in self._failed_callbacks else logging.WARNING
+                self._failed_callbacks.add(callback_id)
+                log_exception(f"Plot: {event_name} handler {getattr(callback, '__qualname__', callback)} failed",
+                              level=level)
 
     def mpl_connect(self, event_name: str, callback: Callable[[PlotMouseEvent], None]) -> int:
         callback_id = self._next_callback_id

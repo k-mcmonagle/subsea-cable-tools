@@ -32,6 +32,7 @@ from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsCoordinateTransformContext,
+    QgsDistanceArea,
     QgsGeometry,
     QgsPointXY,
     QgsProject,
@@ -525,6 +526,157 @@ def test_geodesic_interpolation_projected_unchanged() -> bool:
     )
 
 
+class _BrokenSegmentDistance(QgsDistanceArea):
+    """Geodesic distance area that cannot measure the segment starting at
+    ``bad_x`` (raises, or returns NaN) — a stand-in for a transform failure."""
+
+    def __init__(self, bad_x: float, mode: str):
+        super().__init__()
+        self.setSourceCrs(QgsCoordinateReferenceSystem("EPSG:4326"),
+                          QgsCoordinateTransformContext())
+        self.setEllipsoid("WGS84")
+        self._bad_x, self._mode = bad_x, mode
+
+    def measureLine(self, *args):  # noqa: N802 (Qt API name)
+        if len(args) == 2 and abs(float(args[0].x()) - self._bad_x) < 1e-12:
+            if self._mode == "raise":
+                raise RuntimeError("segment cannot be transformed")
+            return float("nan")
+        return super().measureLine(*args)
+
+
+def test_point_at_kp_unmeasurable_segment_is_not_skipped() -> bool:
+    """A segment that cannot be measured used to be skipped (``continue``),
+    shifting every later KP onto the wrong segment, and a NaN length made
+    every later KP None. Now KPs before it are exact, KPs at/after it are
+    None (with or without clamp) and a warning is logged."""
+    geom = _line("LINESTRING(0 0, 0.1 0, 0.2 0, 0.3 0)")   # ~11.1 km legs
+    good = _da_geog()
+    details = []
+    ok = True
+    for mode in ("raise", "nan"):
+        broken = _BrokenSegmentDistance(0.1, mode)
+        before = point_at_kp(geom, 5.0, broken)
+        expected = point_at_kp(geom, 5.0, good)
+        inside = point_at_kp(geom, 15.0, broken)          # on the broken leg
+        after = point_at_kp(geom, 25.0, broken)           # beyond it
+        clamped = point_at_kp(geom, 99.0, broken, clamp=True)
+        case = (before is not None and expected is not None
+                and abs(before.x() - expected.x()) < 1e-12
+                and inside is None and after is None and clamped is None)
+        details.append(f"{mode}: before={before is not None} inside={inside} after={after} clamp={clamped}")
+        ok = ok and case
+    # The chainage index behaves the same (NaN length: from_source measures
+    # the route without raising, the index stops at the broken leg).
+    frame = RouteFrame([geom], [0.0], _BrokenSegmentDistance(0.1, "nan"))
+    frame_before = frame.point_at_kp(5.0)
+    frame_ok = (frame_before is not None and frame.point_at_kp(25.0) is None
+                and frame.point_at_kp(99.0, clamp=True) is None)
+    details.append(f"RouteFrame ok={frame_ok}")
+    return _result("point_at_kp: unmeasurable segment -> None, never a shifted point",
+                   ok and frame_ok, "; ".join(details))
+
+
+def test_nan_kp_returns_none() -> bool:
+    """NaN used to bisect to index 0 in RouteFrame and come back as the
+    route start; the walking function returned the end with clamp."""
+    geom = _line(_GEOG_SINGLE)
+    da = _da_geog()
+    frame = RouteFrame.from_source([geom], da)
+    nan = float("nan")
+    ok = (point_at_kp(geom, nan, da) is None and point_at_kp(geom, nan, da, clamp=True) is None
+          and frame.point_at_kp(nan) is None and frame.point_at_kp(nan, clamp=True) is None
+          and frame.point_at_kp(float("inf"), clamp=True) is not None)
+    return _result("NaN KP -> None (inf still clamps)", ok)
+
+
+def test_routeframe_nearest_is_true_nearest_not_bbox() -> bool:
+    """15 long diagonal legs whose bounding boxes all contain the query
+    point, plus a short leg 50 m away: a bounding-box index offered only
+    the diagonals as its 12 candidates, so kp_at_point snapped ~460 m away.
+    The geometry-storing index finds the short leg, like the full walk."""
+    crs = QgsCoordinateReferenceSystem("EPSG:32631")
+    da = make_distance_area(crs, QgsCoordinateTransformContext(), mode="cartesian")
+    x0, y0 = 500000.0, 5000000.0
+    geoms = [QgsGeometry.fromPolylineXY([QgsPointXY(x0, y0 - 10 * k),
+                                         QgsPointXY(x0 + 1000, y0 + 1000 - 10 * k)])
+             for k in range(15)]
+    geoms.append(QgsGeometry.fromPolylineXY([QgsPointXY(x0 + 880, y0 + 50),
+                                             QgsPointXY(x0 + 920, y0 + 50)]))
+    query = QgsPointXY(x0 + 900, y0 + 100)
+    frame = RouteFrame.from_source(geoms, da)
+    hit = frame.kp_at_point(query)
+    walk = kp_at_point(geoms, query, da)
+    ok = (hit.snapped_xy is not None and abs(hit.dcc_m - 50.0) < 1e-6
+          and abs(hit.kp_km - walk.kp_km) < 1e-9 and hit.feature_index == 15)
+    return _result("RouteFrame.kp_at_point: true nearest segment, not bbox nearest", ok,
+                   f"dcc={hit.dcc_m:.3f} m (walk {walk.dcc_m:.3f} m) feature={hit.feature_index}")
+
+
+def test_routeframe_nearest_exact_under_geodesic_metric() -> bool:
+    """At 70°N a degree of longitude is ~38 km but a degree of latitude
+    ~111 km: 15 short E-W legs just north of the point are nearer in planar
+    degrees than the N-S leg to the east, yet geodesically farther. The 12
+    planar-nearest candidates alone miss the true nearest; the search must
+    widen until nothing unseen can be nearer."""
+    da = _da_geog()
+    lon0, lat0 = 0.0, 70.0
+    geoms = [QgsGeometry.fromPolylineXY([QgsPointXY(lon0 - 0.004, lat0 + dy),
+                                         QgsPointXY(lon0 + 0.004, lat0 + dy)])
+             for dy in [0.02 + 0.001 * i for i in range(15)]]
+    geoms.append(QgsGeometry.fromPolylineXY([QgsPointXY(lon0 + 0.05, lat0 - 0.01),
+                                             QgsPointXY(lon0 + 0.05, lat0 + 0.01)]))
+    query = QgsPointXY(lon0, lat0)
+    frame = RouteFrame.from_source(geoms, da)
+    hit = frame.kp_at_point(query)
+    walk = kp_at_point(geoms, query, da)
+    ok = (hit.feature_index == 15 and abs(hit.dcc_m - walk.dcc_m) < 1e-6
+          and abs(hit.kp_km - walk.kp_km) < 1e-9)
+    return _result("RouteFrame.kp_at_point exact under the geodesic metric (70°N)", ok,
+                   f"dcc={hit.dcc_m:.1f} m (walk {walk.dcc_m:.1f} m) feature={hit.feature_index}")
+
+
+def test_reproject_context_and_strict() -> bool:
+    """An explicit transform context gives the project path's result; an
+    untransformable geometry raises with strict=True and is skipped (and
+    logged) otherwise."""
+    src = QgsCoordinateReferenceSystem("EPSG:4326")
+    dst = QgsCoordinateReferenceSystem("EPSG:32631")
+    good = _line("LINESTRING(2 50, 3 51)")
+    via_project = list(reproject_geoms_to([good], src, dst))
+    via_context = list(reproject_geoms_to([good], src, dst,
+                                          transform_context=QgsCoordinateTransformContext()))
+    same = (len(via_project) == len(via_context) == 1
+            and via_project[0].asWkt(3) == via_context[0].asWkt(3))
+    bad = _line("LINESTRING(2 50, 3 95)")      # latitude 95: not transformable
+    mercator = QgsCoordinateReferenceSystem("EPSG:3857")
+    skipped = list(reproject_geoms_to([bad, good], src, mercator))
+    # QGIS writes inf for latitude 95 instead of raising: still a failure.
+    try:
+        list(reproject_geoms_to([bad], src, mercator, strict=True))
+        raised = False
+    except ValueError:
+        raised = True
+    ok = same and raised and len(skipped) == 1
+    return _result("reproject_geoms_to: transform context, strict raises, default skips", ok,
+                   f"same={same} strict_raised={raised} kept={len(skipped)}")
+
+
+def test_stored_geometry_index_nearest() -> bool:
+    """The shared helper ranks by geometry distance on QGIS 3 and 4."""
+    from qgis.core import QgsFeature
+    from ..kp_geo_utils import stored_geometry_index
+    index = stored_geometry_index()
+    for fid, wkt in ((1, "LINESTRING(0 0, 1000 1000)"), (2, "LINESTRING(880 50, 920 50)")):
+        feat = QgsFeature(fid)
+        feat.setGeometry(QgsGeometry.fromWkt(wkt))
+        index.addFeature(feat)
+    nearest = index.nearestNeighbor(QgsPointXY(900, 100), 1)
+    stored = index.geometry(2)
+    ok = nearest == [2] and stored is not None and not stored.isEmpty()
+    return _result("stored_geometry_index: nearest by geometry, geometries kept", ok, str(nearest))
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -550,6 +702,12 @@ def run_all() -> List[bool]:
         test_rplcomparator_ellipsoid_fallback(),
         test_geodesic_interpolation_long_geographic_segment(),
         test_geodesic_interpolation_projected_unchanged(),
+        test_point_at_kp_unmeasurable_segment_is_not_skipped(),
+        test_nan_kp_returns_none(),
+        test_routeframe_nearest_is_true_nearest_not_bbox(),
+        test_routeframe_nearest_exact_under_geodesic_metric(),
+        test_reproject_context_and_strict(),
+        test_stored_geometry_index_nearest(),
     ]
     print("")
     print(f"{sum(results)}/{len(results)} passed")

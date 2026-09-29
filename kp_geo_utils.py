@@ -34,6 +34,7 @@ KP semantics
 from __future__ import annotations
 
 import bisect
+import logging
 import math
 import threading
 from typing import Iterable, Iterator, List, NamedTuple, Optional, Sequence, Union
@@ -41,12 +42,17 @@ from typing import Iterable, Iterator, List, NamedTuple, Optional, Sequence, Uni
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
+    QgsCoordinateTransformContext,
     QgsDistanceArea,
     QgsFeatureSource,
     QgsGeometry,
     QgsPointXY,
     QgsProject,
+    QgsRectangle,
+    QgsSpatialIndex,
 )
+
+from .plugin_log import log_exception, log_warning
 
 
 # ---------------------------------------------------------------------------
@@ -98,12 +104,12 @@ def iter_line_parts(line_geometry: QgsGeometry) -> List[List]:
     if line_geometry.isMultipart():
         try:
             return list(line_geometry.asMultiPolyline())
-        except Exception:
+        except (TypeError, ValueError):  # not a line geometry
             return []
 
     try:
         return [line_geometry.asPolyline()]
-    except Exception:
+    except (TypeError, ValueError):  # not a line geometry
         return []
 
 
@@ -222,6 +228,81 @@ def ordered_route_geometry(items, join_tolerance: float = 1e-9) -> QgsGeometry:
     return QgsGeometry.fromMultiPolylineXY(lines)
 
 
+def geometry_is_finite(geometry: QgsGeometry) -> bool:
+    """True when every coordinate of ``geometry`` is finite.
+
+    ``QgsGeometry.transform`` does not raise for points outside the target
+    CRS's domain (QGIS 3.40 / 4.0): it reports success and writes ``inf``.
+    Check the result with this before trusting a transformed geometry.
+    """
+    box = geometry.boundingBox()
+    return all(math.isfinite(v) for v in (box.xMinimum(), box.yMinimum(),
+                                          box.xMaximum(), box.yMaximum()))
+
+
+def stored_geometry_index(features=None) -> QgsSpatialIndex:
+    """A ``QgsSpatialIndex`` that keeps each feature's geometry.
+
+    A plain index only holds bounding boxes, so ``nearestNeighbor`` ranks by
+    *bounding-box* distance: a long diagonal line whose box contains the
+    query point beats a much closer short line, and a "nearest contour" or
+    "nearest route segment" can be the wrong one. With stored geometries the
+    ranking uses the true geometry distance. ``features`` may be a feature
+    iterator (e.g. ``layer.getFeatures()``) or ``None`` for an empty index
+    to fill with ``addFeature``.
+    """
+    scope = getattr(QgsSpatialIndex, "Flag", QgsSpatialIndex)
+    flag = getattr(scope, "FlagStoreFeatureGeometries")
+    if features is None:
+        return QgsSpatialIndex(flag)
+    return QgsSpatialIndex(features, None, flag)
+
+
+_UNMEASURABLE_WARNED: set = set()
+
+
+def _warn_unmeasurable_segment(p1, p2, detail: str) -> None:
+    """Log (once per segment) that a route segment could not be measured.
+
+    Chainage after such a segment is unknowable: skipping it would silently
+    shift every later KP, so callers stop there and report instead.
+    """
+    try:
+        key = (round(float(p1.x()), 9), round(float(p1.y()), 9),
+               round(float(p2.x()), 9), round(float(p2.y()), 9))
+    except (TypeError, ValueError, AttributeError):
+        key = (repr(p1), repr(p2))
+    if key in _UNMEASURABLE_WARNED:
+        return
+    if len(_UNMEASURABLE_WARNED) > 1000:
+        _UNMEASURABLE_WARNED.clear()
+    _UNMEASURABLE_WARNED.add(key)
+    log_warning(
+        "KP: route segment (%s) -> (%s) could not be measured (%s); KPs beyond "
+        "it are undefined and are not reported." % (
+            _xy_text(p1), _xy_text(p2), detail))
+
+
+def _xy_text(point) -> str:
+    try:
+        return "%.8f, %.8f" % (float(point.x()), float(point.y()))
+    except (TypeError, ValueError, AttributeError):
+        return repr(point)
+
+
+def _measure_segment_m(distance: QgsDistanceArea, p1, p2) -> Optional[float]:
+    """Length (m) of ``p1 -> p2``, or ``None`` (warned) if it can't be measured."""
+    try:
+        seg_len = float(distance.measureLine(p1, p2))
+    except Exception as exc:  # noqa: BLE001 - QgsCsException et al.
+        _warn_unmeasurable_segment(p1, p2, "%s: %s" % (type(exc).__name__, exc))
+        return None
+    if not math.isfinite(seg_len):
+        _warn_unmeasurable_segment(p1, p2, "length %r" % seg_len)
+        return None
+    return seg_len
+
+
 def crosses_antimeridian(geoms_or_geom) -> bool:
     """True when any segment jumps more than 180° of longitude.
 
@@ -293,8 +374,9 @@ def _interpolate_on_segment(
             az = float(distance.bearing(p1_xy, p2_xy))
             pt = distance.computeSpheroidProject(p1_xy, float(target_dist_m), az)
             return QgsPointXY(pt)
-        except Exception:
-            pass
+        except Exception:  # noqa: BLE001 - documented linear fallback
+            log_exception("KP: spheroid interpolation failed; interpolating linearly",
+                          level=logging.DEBUG)
 
     ratio = (target_dist_m / seg_len_m) if seg_len_m > 0 else 0.0
     x = float(p1.x()) + ratio * (float(p2.x()) - float(p1.x()))
@@ -356,11 +438,18 @@ def point_at_kp(
         ``False`` follows the spheroid arc instead; on a long geographic
         segment that point is then off the drawn line and ``kp_at_point``
         of it can differ by tens of metres (60 km leg: ~57 m).
+
+    A segment that cannot be measured (transform failure, NaN length) makes
+    every KP at or beyond it undefined: ``None`` is returned (even with
+    ``clamp``) and a warning is logged, instead of skipping the segment and
+    silently shifting every later position.
     """
 
     try:
         target_m = float(kp_km) * 1000.0
-    except Exception:
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(target_m):
         return None
 
     geoms = _normalise_geoms(geoms_or_geom)
@@ -385,10 +474,9 @@ def point_at_kp(
             for i in range(len(part) - 1):
                 p1 = part[i]
                 p2 = part[i + 1]
-                try:
-                    seg_len = float(distance.measureLine(p1, p2))
-                except Exception:
-                    continue
+                seg_len = _measure_segment_m(distance, p1, p2)
+                if seg_len is None:
+                    return None
                 if seg_len <= 0:
                     continue
 
@@ -640,17 +728,21 @@ def reproject_geoms_to(
     source_crs: QgsCoordinateReferenceSystem,
     target_crs: QgsCoordinateReferenceSystem,
     project: Optional[QgsProject] = None,
+    transform_context: Optional[QgsCoordinateTransformContext] = None,
+    strict: bool = False,
 ) -> Iterator[QgsGeometry]:
     """Yield copies of ``geoms`` reprojected from ``source_crs`` to ``target_crs``.
 
     Geometries are copied before transformation (the input is not mutated).
     When the two CRSes are equal, geometries are yielded unchanged (still as
-    copies). Geometries that fail to transform are skipped silently — caller
-    is responsible for any user feedback.
+    copies). The transform uses ``transform_context`` when given (callers on
+    worker threads, e.g. a Processing context's), else ``project``'s, else
+    the current project's. A geometry that fails to transform (an exception,
+    or non-finite coordinates — QGIS writes ``inf`` rather than raising)
+    raises ``ValueError`` with ``strict``; otherwise it is skipped with a
+    logged warning (in a route, every KP after a skipped feature shifts) —
+    the caller is responsible for any user feedback.
     """
-
-    if project is None:
-        project = QgsProject.instance()
 
     if source_crs == target_crs:
         for g in geoms:
@@ -658,14 +750,30 @@ def reproject_geoms_to(
                 yield QgsGeometry(g)
         return
 
-    xform = QgsCoordinateTransform(source_crs, target_crs, project)
-    for g in geoms:
+    if transform_context is not None:
+        xform = QgsCoordinateTransform(source_crs, target_crs, transform_context)
+    else:
+        xform = QgsCoordinateTransform(source_crs, target_crs,
+                                       project if project is not None else QgsProject.instance())
+    for index, g in enumerate(geoms):
         if g is None or g.isEmpty():
             continue
         copy = QgsGeometry(g)
+        message = "KP: geometry %d could not be transformed from %s to %s" % (
+            index, source_crs.authid(), target_crs.authid())
         try:
             copy.transform(xform)
-        except Exception:
+            failed = not geometry_is_finite(copy)
+        except Exception:  # noqa: BLE001 - QgsCsException
+            if strict:
+                raise ValueError(message)
+            log_exception(message + " and is left out; KPs after it are shifted")
+            continue
+        if failed:
+            if strict:
+                raise ValueError(message + " (coordinates outside the target CRS)")
+            log_warning(message + " (coordinates outside the target CRS) and is left "
+                        "out; KPs after it are shifted")
             continue
         yield copy
 
@@ -742,11 +850,13 @@ class RouteFrame:
         project: Optional[QgsProject] = None,
         follow_stored_geometry: bool = True,
         start_kp_km: float = 0.0,
+        transform_context: Optional[QgsCoordinateTransformContext] = None,
     ) -> "RouteFrame":
         """Build a ``RouteFrame`` from a feature source or iterable of geometries.
 
         When ``target_crs`` is given and differs from ``source_crs`` (inferred
-        from the source when possible), geometries are reprojected up front.
+        from the source when possible), geometries are reprojected up front,
+        with ``transform_context`` when given (see :func:`reproject_geoms_to`).
         """
 
         # Resolve source CRS for reprojection, if any.
@@ -759,7 +869,8 @@ class RouteFrame:
         raw_geoms = _normalise_geoms(source)
 
         if target_crs is not None and source_crs is not None and source_crs != target_crs:
-            geoms = list(reproject_geoms_to(raw_geoms, source_crs, target_crs, project))
+            geoms = list(reproject_geoms_to(raw_geoms, source_crs, target_crs, project,
+                                            transform_context=transform_context))
         else:
             geoms = raw_geoms
 
@@ -810,6 +921,10 @@ class RouteFrame:
         one full walk, after which each lookup is a bisect. Same segments,
         same ``measureLine`` calls in the same order, so cumulative chainage
         is identical to the walking implementation.
+
+        A segment that cannot be measured ends the index there (warned):
+        chainage beyond it is unknowable, and skipping it would shift every
+        later KP. KPs past that point are then out of range.
         """
         if getattr(self, "_seg_end_m", None) is not None:
             return
@@ -822,6 +937,7 @@ class RouteFrame:
             cumulative = 0.0
             first_point: Optional[QgsPointXY] = None
             last_point: Optional[QgsPointXY] = None
+            broken = False
             for feature_index, geom in enumerate(self._geoms):
                 for part in iter_line_parts(geom):
                     if len(part) < 2:
@@ -831,10 +947,10 @@ class RouteFrame:
                     for i in range(len(part) - 1):
                         p1 = part[i]
                         p2 = part[i + 1]
-                        try:
-                            seg_len = float(self._distance.measureLine(p1, p2))
-                        except Exception:
-                            continue
+                        seg_len = _measure_segment_m(self._distance, p1, p2)
+                        if seg_len is None:
+                            broken = True
+                            break
                         if seg_len <= 0:
                             continue
                         segs.append((p1, p2, seg_len, cumulative))
@@ -842,9 +958,14 @@ class RouteFrame:
                         cumulative += seg_len
                         seg_end.append(cumulative)
                         last_point = QgsPointXY(p2)
+                    if broken:
+                        break
+                if broken:
+                    break
             self._segs = segs
             self._seg_feature = seg_feature
             self._chain_total_m = cumulative
+            self._chain_broken = broken
             self._chain_first = first_point
             self._chain_last = last_point
             # The guard attribute is assigned last so a concurrent reader
@@ -854,7 +975,10 @@ class RouteFrame:
     def point_at_kp(self, kp_km: float, *, clamp: bool = False) -> Optional[QgsPointXY]:
         try:
             target_m = (float(kp_km) - self._start_kp_km) * 1000.0
-        except Exception:
+        except (TypeError, ValueError):
+            return None
+        if math.isnan(target_m):
+            # NaN used to bisect to index 0 and come back as the route start.
             return None
         if target_m < 0.0:
             if not clamp:
@@ -864,7 +988,9 @@ class RouteFrame:
         if not self._segs:
             return None
         if target_m > self._chain_total_m:
-            if clamp:
+            # Past an unmeasurable segment the KP has no position; clamping
+            # to the last measured vertex would report a wrong one.
+            if clamp and not self._chain_broken:
                 return (self._chain_last if self._chain_last is not None
                         else self._chain_first)
             return None
@@ -886,6 +1012,11 @@ class RouteFrame:
         contour profiles and risk scans quadratic. One segment index turns
         each query into a k-nearest lookup plus a handful of exact
         projections; KP still comes from the same ellipsoidal chainage.
+
+        The index stores segment geometries so ``nearestNeighbor`` ranks by
+        true (planar) segment distance. A bounding-box index ranked long
+        diagonal legs whose box contains the query first, and with enough
+        of them the truly nearest segment fell outside the 12 candidates.
         """
         if self._kp_index is not None:
             return
@@ -893,16 +1024,30 @@ class RouteFrame:
         with self._chain_lock:
             if self._kp_index is not None:
                 return
-            from qgis.core import QgsFeature, QgsSpatialIndex
+            from qgis.core import QgsFeature
 
-            index = QgsSpatialIndex()
+            index = stored_geometry_index()
             for seg_id, (p1, p2, _len, _cum) in enumerate(self._segs):
                 feat = QgsFeature()
                 feat.setId(seg_id)
                 feat.setGeometry(QgsGeometry.fromPolylineXY(
                     [QgsPointXY(p1), QgsPointXY(p2)]))
                 index.addFeature(feat)
+            # Metric-scale cells for exact nearest searches: 1/256 of the
+            # route extent (the scale changes little across one).
+            xs = [float(p.x()) for seg in self._segs for p in seg[:2]]
+            ys = [float(p.y()) for seg in self._segs for p in seg[:2]]
+            span = max(max(xs) - min(xs), max(ys) - min(ys)) if xs else 0.0
+            self._scale_cell = span / 256.0 if span > 0 else 1.0
+            self._scale_cache = {}
             self._kp_index = index
+
+    def build_indexes(self) -> "RouteFrame":
+        """Build the chainage and segment indexes now instead of on the
+        first query (e.g. before interactive use, so the first mouse move
+        does not pay for a whole-route walk). Returns ``self``."""
+        self._ensure_kp_index()
+        return self
 
     def kp_at_point(self, point_xy: QgsPointXY) -> KPHit:
         """Nearest KP on the route (indexed; same chainage as point_at_kp).
@@ -912,6 +1057,14 @@ class RouteFrame:
         the geodesically closest wins — the same snapped point and partial
         chainage (planar fraction × ellipsoidal segment length) the walking
         implementation produced, without walking every vertex per call.
+
+        The search is exact under the measured metric: the index ranks by
+        planar distance, but the DCC is measured (geodesic on a geographic
+        CRS, where a degree of longitude is short at high latitude), so a
+        planar-farther segment can be nearer. When the planar candidates do
+        not already settle it, every segment within the planar radius that
+        could still be nearer (best distance / the smallest local metres per
+        map unit) is examined too.
         """
         if point_xy is None:
             return KPHit(0.0, float("inf"), None, -1)
@@ -919,44 +1072,86 @@ class RouteFrame:
         if not self._segs:
             return KPHit(0.0, float("inf"), None, -1)
         query = QgsPointXY(point_xy)
+        qx, qy = float(query.x()), float(query.y())
+        total = len(self._segs)
         try:
             candidate_ids = self._kp_index.nearestNeighbor(query, 12)
-        except Exception:
+        except Exception:  # noqa: BLE001 - the walk below is exact
             candidate_ids = []
         if not candidate_ids:
             return self._offset_hit(kp_at_point(self._geoms, point_xy, self._distance))
-        qx, qy = float(query.x()), float(query.y())
-        best_dist = float("inf")
-        best_kp_m = 0.0
-        best_snapped: Optional[QgsPointXY] = None
-        best_feature = -1
-        for seg_id in candidate_ids:
-            if seg_id < 0 or seg_id >= len(self._segs):
-                continue
+        # best = [dist, kp_m, snapped, feature]
+        best = [float("inf"), 0.0, None, -1]
+
+        def consider(seg_id, planar_limit=None):
+            """Planar distance to segment ``seg_id``; measure it if it can win."""
+            if seg_id < 0 or seg_id >= total:
+                return 0.0
             p1, p2, seg_len, cum_start = self._segs[seg_id]
             x1, y1 = float(p1.x()), float(p1.y())
-            x2, y2 = float(p2.x()), float(p2.y())
-            dx, dy = x2 - x1, y2 - y1
+            dx, dy = float(p2.x()) - x1, float(p2.y()) - y1
             planar_sq = dx * dx + dy * dy
             if planar_sq <= 0.0:
-                continue
-            t = ((qx - x1) * dx + (qy - y1) * dy) / planar_sq
-            t = max(0.0, min(1.0, t))
-            snapped = QgsPointXY(x1 + t * dx, y1 + t * dy)
+                return 0.0
+            t = max(0.0, min(1.0, ((qx - x1) * dx + (qy - y1) * dy) / planar_sq))
+            sx, sy = x1 + t * dx, y1 + t * dy
+            planar = math.hypot(qx - sx, qy - sy)
+            if planar_limit is not None and planar > planar_limit:
+                return planar
+            snapped = QgsPointXY(sx, sy)
             try:
                 dist = float(self._distance.measureLine(query, snapped))
-            except Exception:
-                continue
-            if dist < best_dist:
-                best_dist = dist
-                best_kp_m = cum_start + t * seg_len
-                best_snapped = snapped
-                best_feature = self._seg_feature[seg_id] \
-                    if seg_id < len(self._seg_feature) else -1
-        if best_snapped is None:
+            except Exception:  # noqa: BLE001 - unmeasurable candidate
+                return planar
+            if dist < best[0]:
+                feature = self._seg_feature[seg_id] if seg_id < len(self._seg_feature) else -1
+                best[:] = [dist, cum_start + t * seg_len, snapped, feature]
+            return planar
+
+        farthest_planar = max(consider(seg_id) for seg_id in candidate_ids)
+        if best[2] is not None and len(candidate_ids) < total:
+            scale = self._local_metres_per_unit(query)
+            if scale is not None and scale * farthest_planar < best[0]:
+                # Any segment measured nearer than the best so far lies
+                # within this planar radius: examine all of them once.
+                radius = best[0] / scale
+                seen = set(candidate_ids)
+                rect = QgsRectangle(qx - radius, qy - radius, qx + radius, qy + radius)
+                for seg_id in self._kp_index.intersects(rect):
+                    if seg_id not in seen:
+                        consider(seg_id, radius)
+        if best[2] is None:
             return self._offset_hit(kp_at_point(self._geoms, point_xy, self._distance))
-        return KPHit(self._start_kp_km + best_kp_m / 1000.0, best_dist,
-                     best_snapped, best_feature)
+        return KPHit(self._start_kp_km + best[1] / 1000.0, best[0], best[2], best[3])
+
+    def _local_metres_per_unit(self, query: QgsPointXY) -> Optional[float]:
+        """Smallest measured metres per map unit near ``query`` (eight
+        directions, 10 % margin), cached per small cell of the route extent
+        so repeated queries (mouse moves, scans along the route) reuse it.
+        ``None`` when it cannot be measured (the planar candidates stand)."""
+        cell = self._scale_cell
+        key = (math.floor(query.x() / cell), math.floor(query.y() / cell))
+        if key in self._scale_cache:
+            return self._scale_cache[key]
+        centre = QgsPointXY((key[0] + 0.5) * cell, (key[1] + 0.5) * cell)
+        scales = []
+        for i in range(8):
+            angle = math.pi * i / 4.0
+            probe = QgsPointXY(centre.x() + cell * math.cos(angle),
+                               centre.y() + cell * math.sin(angle))
+            try:
+                metres = float(self._distance.measureLine(centre, probe))
+            except Exception:  # noqa: BLE001 - e.g. probe beyond the CRS bounds
+                metres = float("nan")
+            if not (math.isfinite(metres) and metres > 0.0):
+                scales = []
+                break
+            scales.append(metres / cell)
+        scale = 0.9 * min(scales) if scales else None
+        if len(self._scale_cache) > 4096:
+            self._scale_cache.clear()
+        self._scale_cache[key] = scale
+        return scale
 
     def _offset_hit(self, hit: KPHit) -> KPHit:
         if not self._start_kp_km:
