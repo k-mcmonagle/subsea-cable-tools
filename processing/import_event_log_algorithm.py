@@ -153,6 +153,7 @@ column for traceability.</p>
                 )
             else:
                 row[clp.WKT_KEY] = None
+            row["event_file"] = source_name
             rows.append(row)
 
         if skipped:

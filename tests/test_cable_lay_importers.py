@@ -26,6 +26,7 @@ from ..processing import cable_lay_parsers as clp
 from ..processing.create_cable_lay_geopackage_algorithm import CreateCableLayGeoPackageAlgorithm
 from ..processing.import_body_log_algorithm import ImportBodyLogAlgorithm
 from ..processing.import_cable_lay_algorithm import ImportCableLayAlgorithm
+from ..processing.import_event_log_algorithm import ImportEventLogAlgorithm
 from ..processing.import_plough_data_algorithm import ImportPloughDataAlgorithm
 from ..processing.import_slack_log_algorithm import ImportSlackLogAlgorithm
 
@@ -69,6 +70,12 @@ _CABLE_LAY_FILE = (
     '"1,14:00:00","17 09.7399N","169 30.1234W",0.000\n'
     '"1,14:00:01","17 09.8000N","169 30.2000W",0.025\n'
     '"1,14:00:02","17 09.9000N","169 30.3000W",0.050\n'
+)
+
+_EVENT_FILE = (
+    "Time,Event,Latitude,Longitude\n"
+    '"1,14:00:00",Start lay,"17 09.7399N","169 30.1234W"\n'
+    '"1,14:05:00",Body over,"17 09.8000N","169 30.2000W"\n'
 )
 
 
@@ -270,6 +277,31 @@ def test_multi_file_and_append_dedupe() -> bool:
     )
 
 
+def test_event_log_records_source_file() -> bool:
+    """Every event row carries its file name in ``event_file``.
+
+    The dedupe key is (ISO_Time, event_file): with the column left empty, a
+    second log sharing timestamps with the first was dropped as duplicates,
+    and the Manage tool could not list or remove events by source file.
+    """
+    name = "event_log records event_file"
+    a = _write_temp("sct_test_events_a.csv", _EVENT_FILE)
+    b = _write_temp("sct_test_events_b.csv", _EVENT_FILE)
+    gpkg = _fresh_gpkg("sct_test_events.gpkg")
+    extra = {"START_DATE": "2024-01-01"}
+    try:
+        layer = _run(ImportEventLogAlgorithm(), [a, b], gpkg, extra)
+        files = sorted(str(f["event_file"]) for f in layer.getFeatures()) if layer else []
+        # Re-importing the same files must still deduplicate.
+        again = _run(ImportEventLogAlgorithm(), [a, b], gpkg, extra)
+        count_again = again.featureCount() if again else None
+    except Exception as exc:
+        return _result(name, False, repr(exc))
+    expected = sorted([os.path.basename(a)] * 2 + [os.path.basename(b)] * 2)
+    ok = files == expected and count_again == 4
+    return _result(name, ok, f"event_file={files} re-run count={count_again} (expected 4)")
+
+
 def test_target_layer_dropdown_append() -> bool:
     """Selecting an existing GeoPackage layer (the dropdown path) appends to it."""
     a = _write_temp("sct_test_tgt_a.csv", _PLOUGH_FILE)
@@ -315,6 +347,7 @@ def run_all() -> List[bool]:
         test_body_importer(),
         test_cable_lay_importer(),
         test_multi_file_and_append_dedupe(),
+        test_event_log_records_source_file(),
         test_target_layer_dropdown_append(),
     ]
     print("")

@@ -107,6 +107,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Plugin reload:** unloading or reloading the plugin stops running solves and tasks, removes every map marker, rubber band, menu entry and toolbar button, and releases the plugin's map tools.
 - **Bundled libraries** no longer override copies already installed with QGIS (for example openpyxl on QGIS 3.40), for this plugin or any other.
 - **Tools that fail to open** now always say why, with details in the *Subsea Cable Tools* tab of the Log Messages panel.
+- **Import Event Log:** each event now records the file it came from, so a second event log with overlapping times is no longer dropped as duplicates, and Cable Lay Data Explorer can manage event-log rows by source file.
 <!-- audit-2026-09 entries -->
 
 ## [1.9.0] - 2026-08-29
