@@ -1,0 +1,55 @@
+name: Release
+
+# Pushing a version tag (e.g. `git tag v1.9.1 && git push origin v1.9.1`)
+# builds the plugin zip with scripts/build_release.py - which refuses a tag
+# whose name differs from metadata.txt's version - and attaches it to a
+# draft GitHub Release (created if missing). Review the draft, publish it,
+# and upload the same zip to plugins.qgis.org by hand.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag or commit to package (a dry run: the zip is uploaded as a workflow artifact only)"
+        required: true
+        default: "HEAD"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: QGIS 3/4 compatibility scan
+        run: python tests/check_qgis_compat.py
+      - name: Build plugin zip
+        id: build
+        run: python scripts/build_release.py "${{ github.event_name == 'push' && github.ref_name || inputs.ref }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: plugin-zip
+          path: ${{ steps.build.outputs.zip }}
+          if-no-files-found: error
+      - name: Attach to a draft GitHub Release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          ZIP: ${{ steps.build.outputs.zip }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --verify-tag --title "Version ${TAG#v}" \
+              --notes "Plugin zip for QGIS. See CHANGELOG.md for the changes in ${TAG#v}."
+          fi
+          gh release upload "$TAG" "$ZIP" --clobber

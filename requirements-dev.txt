@@ -1,0 +1,11 @@
+# Development / CI tooling. Not needed to run the plugin (QGIS provides the
+# runtime; third-party runtime packages are vendored under lib/).
+#
+#   python -m pip install -r requirements-dev.txt
+#
+# The QGIS integration suite runs in a QGIS Python instead:
+#   <QGIS python> tests/run_qgis_smoke_tests.py
+numpy            # exercises the vectorised paths of the pure suites
+pytest>=7.4      # optional: `pytest tests/` (tests/conftest.py); the runners need no pytest
+ruff==0.16.9     # keep in step with .pre-commit-config.yaml
+pre-commit

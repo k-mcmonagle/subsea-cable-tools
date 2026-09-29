@@ -1,0 +1,29 @@
+# Install once:  python -m pip install -r requirements-dev.txt && pre-commit install
+# Run by hand:   pre-commit run --all-files
+#
+# Mirrors the CI lint gates. ruff-format is deliberately not enabled: most
+# files do not follow it and adopting it would rewrite ~57k lines.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.9  # keep in step with requirements-dev.txt
+    hooks:
+      - id: ruff-check
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+        exclude: ^lib/
+
+  - repo: local
+    hooks:
+      - id: qgis-compat
+        name: QGIS 3/4 compatibility check
+        entry: python tests/check_qgis_compat.py
+        language: system
+        pass_filenames: false
+        types: [python]

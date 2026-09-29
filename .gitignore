@@ -90,8 +90,11 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-# Dev/maintenance scripts (not shipped with QGIS plugin release)
-scripts/
+# Dev/maintenance scripts are tracked (scripts/build_release.py) but left out
+# of the release zip via .gitattributes export-ignore. Keep personal,
+# machine-specific helpers under scripts/local/ or name them *.local.*
+scripts/local/
+scripts/*.local.*
 
 # AI agent tool artifacts (not shipped with plugin)
 .agents/
@@ -99,3 +102,7 @@ scripts/
 
 # ref folders
 ref/
+
+# Test / tooling by-products
+symbology-style.db
+.ruff_cache/

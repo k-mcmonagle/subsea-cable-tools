@@ -10,8 +10,11 @@ spec's no-new-dependencies gate.
 from __future__ import annotations
 
 import ast
+import importlib.util
 import json
+import os
 import sys
+import sysconfig
 from pathlib import Path
 
 from ..burial import change_log, io_csv, schema
@@ -243,18 +246,27 @@ def test_change_log_delta() -> bool:
     return _result("change-log delta snapshots (changed rows only, invertible)", ok)
 
 
+def _is_stdlib(name: str) -> bool:
+    """Python < 3.10 (no ``sys.stdlib_module_names``): a module is stdlib when
+    it is built in or resolves inside the interpreter's stdlib folder (not
+    site-packages)."""
+    if name in sys.builtin_module_names:
+        return True
+    try:
+        spec = importlib.util.find_spec(name)
+    except (ImportError, ValueError):
+        return False
+    origin = getattr(spec, "origin", None) if spec else None
+    if origin in (None, "built-in", "frozen"):
+        return spec is not None
+    stdlib_dir = os.path.normcase(os.path.realpath(sysconfig.get_paths()["stdlib"]))
+    path = os.path.normcase(os.path.realpath(origin))
+    return path.startswith(stdlib_dir + os.sep) and "site-packages" not in path
+
+
 def test_import_scan() -> bool:
     """No imports outside qgis/NumPy/vendored/stdlib/relative in burial/."""
     stdlib = set(getattr(sys, "stdlib_module_names", ()))
-    if not stdlib:  # Python < 3.10 (QGIS 3.x): static fallback
-        stdlib = {
-            "__future__", "abc", "ast", "base64", "bisect", "collections",
-            "contextlib", "copy", "csv", "dataclasses", "datetime", "enum", "functools",
-            "getpass", "hashlib", "html", "importlib", "io", "itertools",
-            "json", "math", "os", "pathlib", "random", "re", "shutil",
-            "sqlite3", "string", "sys", "tempfile", "time", "traceback", "typing",
-            "uuid", "warnings",
-        }
     offenders = []
     targets = sorted((PLUGIN_DIR / "burial").rglob("*.py"))
     targets.append(PLUGIN_DIR / "workbench" / "kp_bars.py")
@@ -271,7 +283,8 @@ def test_import_scan() -> bool:
                     names = [node.module]
             for name in names:
                 top = name.split(".")[0]
-                if top in _ALLOWED_TOP_LEVEL or top in stdlib or top == "sip":
+                if (top in _ALLOWED_TOP_LEVEL or top == "sip"
+                        or (top in stdlib if stdlib else _is_stdlib(top))):
                     continue
                 offenders.append(f"{path.relative_to(PLUGIN_DIR)}: {name}")
     ok = not offenders

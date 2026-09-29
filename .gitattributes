@@ -1,0 +1,33 @@
+# Release packaging: paths marked export-ignore are left out of `git archive`,
+# and therefore out of the QGIS plugin zip built by scripts/build_release.py.
+# The zip ships runtime files only (+ README, LICENSE, CHANGELOG, metadata).
+# Line-ending attributes are deliberately not set here.
+
+# Repository / CI / tooling
+.gitattributes              export-ignore
+.gitignore                  export-ignore
+.github/                    export-ignore
+.pre-commit-config.yaml     export-ignore
+pyproject.toml              export-ignore
+requirements-dev.txt        export-ignore
+scripts/                    export-ignore
+.agents/                    export-ignore
+.codex/                     export-ignore
+
+# Tests (incl. benchmark data) and local reference data
+tests/                      export-ignore
+ref/                        export-ignore
+
+# Developer documentation (README.md, LICENSE and CHANGELOG.md do ship)
+docs/                       export-ignore
+DECISIONS.md                export-ignore
+catenary/**/*.md            export-ignore
+catenary/catenary_calc_ref.txt export-ignore
+
+# Vendored pyqtgraph: application-icon images, only loaded by pyqtgraph's
+# mkQApp() when pyqtgraph creates its own QApplication - never inside QGIS.
+lib/pyqtgraph/icons/peegee/ export-ignore
+
+# Never shipped (and never tracked)
+__pycache__/                export-ignore
+*.pyc                       export-ignore

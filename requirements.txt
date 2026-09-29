@@ -1,9 +1,12 @@
-# These libraries are vendored under ./lib/ and added to sys.path at plugin
-# load time, so end users do not need to install anything. This file is kept
-# only for development / CI environments that want to install matching versions
-# (e.g. for running the tests outside of QGIS).
-openpyxl
-pyqtgraph>=0.12.0
-# et_xmlfile is a runtime dependency of openpyxl >= 3.1 and is also vendored
-# under ./lib/ so the plugin works offline.
-et_xmlfile
+# Runtime third-party packages. They are VENDORED under ./lib/ and added to
+# sys.path at plugin load time (only when the host Python lacks them), so end
+# users install nothing. lib/ is authoritative - these pins mirror it
+# (versions from lib/*.dist-info; see lib/VENDORED.md for licences and why
+# each is vendored). Use this file only for dev/CI environments that want
+# matching versions outside QGIS. When re-vendoring, update both.
+openpyxl==3.1.5
+et_xmlfile==2.0.0        # runtime dependency of openpyxl >= 3.1
+pyqtgraph==0.13.7
+access_parser==0.0.6     # pure-Python .mdb reader (Import MDB, Path file import)
+construct==2.10.70       # dependency of access_parser
+tabulate==0.10.0         # dependency of access_parser

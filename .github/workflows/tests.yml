@@ -1,26 +1,102 @@
-name: Pure test suites
+name: Tests
 
-# The QGIS-free calculation suites (slope math, burial generation/events/IO,
-# rules engine, RPL import core, ...). The QGIS/GDAL integration suites need
-# a QGIS install and run locally via tests/run_qgis_smoke_tests.py.
+# lint       - QGIS 3/4 compatibility scan + ruff (enforced rules in pyproject.toml)
+# pure-tests - every QGIS-free test module on plain Python (3.9 = oldest QGIS
+#              Python, 3.12 = current), discovered automatically
+# qgis-tests - the full smoke suite (every test module + provider/plugin
+#              checks) inside the official qgis/qgis images, Qt5 and Qt6
 
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
-  pure-tests:
+  lint:
+    name: Lint + QGIS compatibility scan
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install tooling
+        run: python -m pip install -r requirements-dev.txt
+      - name: QGIS 3/4 compatibility scan
+        run: python tests/check_qgis_compat.py
+      - name: Ruff (enforced rules)
+        run: ruff check . --output-format=github
+      - name: Ruff report-only rules (never fails)
+        run: ruff check . --select BLE001,S110,B904,UP,I --statistics --exit-zero
+
+  pure-tests:
+    name: Pure suites (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.9", "3.12"]
+    env:
+      PYTHONIOENCODING: utf-8
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install NumPy (exercises the vectorised paths)
-        run: pip install numpy
-      - name: Run pure suites (NumPy)
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install NumPy + test tooling
+        run: python -m pip install -r requirements-dev.txt
+      - name: Run pure suites (every QGIS-free tests/test_*.py)
         run: python tests/run_pure_tests.py
+      - name: pytest collection still works (tests/conftest.py)
+        run: python -m pytest tests --collect-only -q
+
+  qgis-tests:
+    name: QGIS ${{ matrix.qgis }} smoke suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.40 / 4.0: the versions also verified locally before release.
+        # ltr / stable: floating tags - what users install today (3.44 LTR and
+        # 4.2 at the time of writing); they catch API drift early.
+        qgis: ["3.40", "ltr", "4.0", "stable"]
+    container:
+      image: qgis/qgis:${{ matrix.qgis }}
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Versions
+        run: |
+          python3 -c "from qgis.core import Qgis; print('QGIS', Qgis.QGIS_VERSION)"
+          python3 -c "import sys, numpy; print('Python', sys.version.split()[0], '/ NumPy', numpy.__version__)"
+      - name: List discovered checks
+        run: python3 tests/run_qgis_smoke_tests.py --list
+      - name: Run the QGIS smoke suite
+        shell: bash
+        run: |
+          # The package is registered as `subsea_cable_tools` from this
+          # checkout by the runner itself; the folder name does not matter.
+          if command -v xvfb-run >/dev/null 2>&1; then
+            xvfb-run -a -s "-screen 0 1600x1200x24" python3 tests/run_qgis_smoke_tests.py
+          else
+            echo "xvfb-run not found - falling back to QT_QPA_PLATFORM=offscreen"
+            QT_QPA_PLATFORM=offscreen python3 tests/run_qgis_smoke_tests.py
+          fi

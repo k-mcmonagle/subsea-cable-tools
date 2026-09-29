@@ -1,0 +1,55 @@
+# Development tooling configuration only. The plugin is not a pip package:
+# QGIS loads it from its folder (metadata.txt), and its third-party
+# dependencies are vendored under lib/ (see lib/VENDORED.md).
+
+# --------------------------------------------------------------------------
+# Ruff - `ruff check .` is enforced in CI; `ruff format` is NOT (the code
+# base does not follow it; adopting it would rewrite most files).
+# --------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py39"          # QGIS 3.22-3.28 ship Python 3.9 on Windows
+line-length = 120
+extend-exclude = [
+    "lib",                        # vendored third-party packages
+    "i18n",
+    "ref",                        # local, gitignored reference data
+    ".agents",
+    ".codex",
+    "dist",
+]
+
+[tool.ruff.lint]
+# Enforced set: real errors and bug-prone patterns only.
+select = [
+    "E9",                         # syntax errors
+    "F",                          # pyflakes: undefined/unused names, redefinitions, f-string bugs
+    "B",                          # flake8-bugbear
+    "E711", "E712", "E713", "E714", "E721", "E722",  # None/True/type comparisons, bare except
+    "W605",                       # invalid escape sequence
+    "PLE",                        # pylint errors
+]
+ignore = [
+    "B008",   # call in default argument: `parent=QModelIndex()` is idiomatic Qt
+    "B009",   # getattr() with a constant: deliberate Qt5/Qt6 enum-scope shims
+    "B010",   # setattr() with a constant: same
+    "B904",   # `raise ... from` inside except: reported, not enforced (see CI report step)
+]
+# Report-only rules (CI prints their counts without failing):
+#   BLE001 blind except, S110 try-except-pass, B904, UP (pyupgrade), I (isort)
+# e.g. `ruff check . --select BLE001,S110,B904,UP,I --statistics --exit-zero`
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B011", "B017", "B018"]        # assert False / assertRaises(Exception) / bare expressions
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["qgis.PyQt.QtCore.QModelIndex", "qgis.PyQt.QtGui.QColor"]
+
+# --------------------------------------------------------------------------
+# pytest - optional; the reference runners are tests/run_pure_tests.py and
+# tests/run_qgis_smoke_tests.py. tests/conftest.py adapts the modules.
+# --------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-p no:cacheprovider --import-mode=importlib"
