@@ -654,11 +654,13 @@ class BurialPlannerDock(QDockWidget):
         self.plan_combo.setToolTip(
             f"Method: {method_text}" if method_text else "")
         status = plan.get("status") or ""
+        if status == schema.PLAN_STATUS_STALE:  # legacy / read-only plan
+            status = schema.PLAN_STATUS_DRAFT
         self.status_badge.setText(status)
         self.status_badge.setStyleSheet(ui_helpers.badge_style(status))
         self.status_badge.setToolTip(
-            ("Plan status. " + f"Method: {method_text}.") if method_text
-            else "Plan status.")
+            "Plan lifecycle status. Bathymetry and analysis results show "
+            "their own currency on their respective tabs.")
         self.status_badge.setVisible(bool(status and plan))
         self._refresh_tab_badges()
         self.gpkg_button.setToolTip(self.store.gpkg_path)
@@ -1250,6 +1252,7 @@ class BurialPlannerDock(QDockWidget):
                 "Wait for the running analysis to finish (or stop it) "
                 "before resampling the profile.")
             return
+        self.model.invalidate_depth_cache()
         config = self.model.depth_config()
         if not config.is_configured():
             return
@@ -1269,7 +1272,6 @@ class BurialPlannerDock(QDockWidget):
         # replaced on disk mid-run (no model signal fires), the stored
         # profile must not claim currency against data its samples never
         # came from.
-        self.model.invalidate_depth_cache()
         self._profile_identity = self.model.profile_identity()
         # DepthSnapshot only clones providers/feature sources here.  Contour
         # iteration, indexing and all route sampling happen inside QgsTask.
@@ -1365,8 +1367,14 @@ class BurialPlannerDock(QDockWidget):
             kps=task.kps, depths=task.depths,
             source_ids=task.source_ids, cell_sizes_m=task.cell_sizes_m, cross_max_deg=task.cross_max_deg,
             port_depths=task.port_depths, stbd_depths=task.stbd_depths)
-        self.model.save_profile(profile)
-        self._display_stored_profile(profile, params)
+        if not self.model.save_profile(profile):
+            message = "Profile sampling finished, but saving failed — stored profile unchanged."
+            self.profile_status.setText(message)
+            self.profile_tab.set_runtime_status(message)
+            return
+        self.model.invalidate_depth_cache()
+        self._display_stored_profile(
+            profile, params, reasons=self.model.profile_stale_reasons())
 
     def _refresh_profile_overlays(self) -> None:
         self.profile.set_overlays(self.model.display_context(),

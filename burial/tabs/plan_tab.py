@@ -51,9 +51,8 @@ class PlanTab(QWidget):
         self.rev_label = QLabel("—")
         self.status_label = QLabel("—")
         self.status_label.setToolTip(
-            "draft while being edited; stale when the route, scope or "
-            "inputs changed after the last generation; issued when locked "
-            "for release.")
+            "Plan lifecycle status. Bathymetry and analysis results show "
+            "their own currency on their respective tabs.")
         self.notes_edit = QPlainTextEdit()
         self.notes_edit.setPlaceholderText(
             "Assumptions, review-basis notes, references…")
@@ -103,10 +102,11 @@ class PlanTab(QWidget):
         self.notes_edit.textChanged.connect(self._notes_changed)
 
         self.hint = QLabel(
-            "Create or open a plan with the selector above, register the RPL "
-            "and survey inputs on Inputs, build the reusable depth/slope data "
-            "on Bathymetry Profile, configure the Exclusion stack, then "
-            "generate candidate sections in Plan Builder.")
+            "Create or open a plan, then set its route and scope on Inputs. "
+            "In Plan Builder, import from an RPL or a CSV/Excel KP-range table, "
+            "build manually with Add event, or generate candidates from the "
+            "Exclusion stack. Bathymetry Profile supplies reusable depth/slope "
+            "data for any of these workflows.")
         self.hint.setWordWrap(True)
         layout.addWidget(self.hint)
 
@@ -143,7 +143,9 @@ class PlanTab(QWidget):
             self.rpl_label.setText(plan.get("rpl_name") or "—")
             self.rpl_revision_label.setText(plan.get("rpl_revision") or "—")
             self.rev_label.setText(plan.get("rev_label") or "—")
-            self.status_label.setText(plan.get("status") or "draft")
+            status = plan.get("status") or schema.PLAN_STATUS_DRAFT
+            self.status_label.setText(
+                schema.PLAN_STATUS_DRAFT if status == schema.PLAN_STATUS_STALE else status)
         finally:
             self._loading = False
 

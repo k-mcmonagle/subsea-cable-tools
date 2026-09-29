@@ -251,7 +251,7 @@ class PlanModel(QObject):
         self._load_route()
         self._sync_kp_datum()
         self._load_analysis()
-        self._check_stale()
+        self._normalise_plan_status()
         self.planChanged.emit()
         self.inputsChanged.emit()
         self.rulesChanged.emit()
@@ -512,7 +512,6 @@ class PlanModel(QObject):
         if report is None:
             self._load_route()
             return None
-        self.mark_stale()
         return report
 
     def _plan_has_kp_data(self) -> bool:
@@ -696,7 +695,6 @@ class PlanModel(QObject):
             self.plan = previous_plan
             self._load_route()
             return None
-        self.mark_stale()
         return report
 
     def _resolve_workbench_rpl(self):
@@ -733,39 +731,26 @@ class PlanModel(QObject):
                 rpl, getattr(self.workbench_store, "gpkg_path", ""))
         return self.plan.get("rpl_fingerprint") or ""
 
-    def _check_stale(self) -> None:
-        """Mark the plan stale when the RPL changed since it was anchored."""
-        stored = map_layers.rpl_fingerprint_core(self.plan.get("rpl_fingerprint") or "")
-        current = map_layers.rpl_fingerprint_core(self.current_rpl_fingerprint())
-        if stored and current and stored != current \
-                and self.plan.get("status") != schema.PLAN_STATUS_STALE:
-            self.plan["status"] = schema.PLAN_STATUS_STALE
-            self._store_write("update the plan status", self.store.save_plan, self.plan)
+    def _normalise_plan_status(self) -> None:
+        """Retire the old blanket stale flag; each result tracks its own inputs.
 
-    def _has_derived_state(self) -> bool:
-        """Whether the plan carries results computed from its current inputs.
-
-        A duplicated plan has events/sections but no generation rows (those
-        are deliberately not copied), so checking active_generation alone
-        left duplicates unable to ever show as stale.
+        This is a compatibility cleanup, not a review or a new route anchor.
+        Existing events, sections and calculation snapshots remain untouched.
         """
-        try:
-            return bool(self.store.active_generation(self.plan_id)
-                        or self.store.list_events(self.plan_id)
-                        or self.store.list_sections(self.plan_id))
-        except Exception:
-            # Answering "no KP data" means a route change keeps the stored
-            # KP numbers instead of re-referencing them.
-            log_exception("Burial Planner: could not read the plan's events "
-                          "and sections")
-            return False
-
-    def mark_stale(self) -> None:
-        if self.plan and self.plan.get("status") != schema.PLAN_STATUS_STALE \
-                and self._has_derived_state():
-            self.plan["status"] = schema.PLAN_STATUS_STALE
-            self._store_write("update the plan status", self.store.save_plan, self.plan)
-            self.planChanged.emit()
+        if not self.plan:
+            return
+        updated = dict(self.plan)
+        if updated.get("status") == schema.PLAN_STATUS_STALE:
+            updated["status"] = schema.PLAN_STATUS_DRAFT
+        params = analysis_state.decode_json(updated.get("params_json"), {})
+        if "plan_stale_reasons" in params:
+            params.pop("plan_stale_reasons")
+            updated["params_json"] = json.dumps(params)
+        if updated != self.plan:
+            ok, _ = self._store_write("update the legacy plan status",
+                                      self.store.save_plan, updated)
+            if ok:
+                self.plan = updated
 
     # -- route identity ------------------------------------------------------
     def route_geometry_fingerprint(self) -> str:
@@ -1570,7 +1555,7 @@ class PlanModel(QObject):
             self.plan = before
             return False
         self.logChanged.emit()
-        changed_keys = set(updates)
+        changed_keys = {key for key in updates if before.get(key) != self.plan.get(key)}
         if (before.get("name"), before.get("rev_label")) != (
                 self.plan.get("name"), self.plan.get("rev_label")):
             # The spatial layer names embed the plan name and revision:
@@ -1586,9 +1571,6 @@ class PlanModel(QObject):
             # The ground overlay's target-depth ribbon and its clipping
             # window follow these plan values.
             self.refresh_layers(parts=("ground",))
-        if {"scope_start_kp", "scope_end_kp", "direction", "rpl_id",
-            "rpl_gpkg_path"} & changed_keys:
-            self.mark_stale()
         if self.path_result and ({
                 "scope_start_kp", "scope_end_kp", "direction", "rpl_id",
                 "rpl_gpkg_path", "params_json", "name", "rev_label",
@@ -1605,8 +1587,8 @@ class PlanModel(QObject):
         Bathymetry preparation, exclusion analysis and candidate generation
         deliberately expose different parts of ``params_json``. Each tab must
         preserve the values owned by the others when it applies its settings.
-        ``stale=False`` is for parameters that do not affect generation
-        results (e.g. the default burial tool).
+        ``stale`` is retained for caller compatibility. Currency belongs to
+        the individual calculated results, not to the authored plan.
         """
         if not self.plan:
             return False
@@ -1616,11 +1598,11 @@ class PlanModel(QObject):
             stored = {}
         if not isinstance(stored, dict):
             stored = {}
+        if all(key in stored and stored[key] == value for key, value in updates.items()):
+            return True
         stored.update(updates)
         saved = self.update_plan(
             {"params_json": json.dumps(stored)}, reason=reason)
-        if saved and stale:
-            self.mark_stale()
         return saved
 
     # -- inputs / rules ------------------------------------------------------
@@ -1641,7 +1623,6 @@ class PlanModel(QObject):
         ok, _ = self._store_transaction("save the input", write)
         if not ok:
             return False
-        self.mark_stale()
         if self.path_result:
             self.refresh_path_layers()
             self.pathsChanged.emit()
@@ -1700,7 +1681,6 @@ class PlanModel(QObject):
         ok, _ = self._store_transaction("register the inputs", write)
         if not ok:
             return False
-        self.mark_stale()
         if self.path_result:
             self.refresh_path_layers()
             self.pathsChanged.emit()
@@ -1828,7 +1808,6 @@ class PlanModel(QObject):
         ok, _ = self._store_transaction("delete the input", write)
         if not ok:
             return False
-        self.mark_stale()
         if self.path_result:
             self.refresh_path_layers()
             self.pathsChanged.emit()
@@ -1851,7 +1830,6 @@ class PlanModel(QObject):
         ok, _ = self._store_transaction("save the rules", write)
         if not ok:
             return False
-        self.mark_stale()
         self.rulesChanged.emit()
         self.logChanged.emit()
         return True
@@ -3127,6 +3105,8 @@ class PlanModel(QObject):
             self.events = self.store.list_events(self.plan_id)
             self.sections = self.store.list_sections(self.plan_id)
             self.plan["status"] = schema.PLAN_STATUS_DRAFT
+            stored_params.pop("plan_stale_reasons", None)
+            self.plan["params_json"] = json.dumps(stored_params)
             self.plan["rpl_fingerprint"] = self.current_rpl_fingerprint()
             self.store.save_plan(self.plan)
             deactivated = [dict(row, active=0) for row in previously_active]
