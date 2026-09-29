@@ -18,6 +18,7 @@ import re
 from typing import List, Optional, Tuple
 
 from qgis.PyQt.QtCore import QCoreApplication
+from .algorithm_base import SubseaCableAlgorithm
 from ..kp_range_utils import (
     make_distance_area,
     add_distance_mode_parameter,
@@ -25,7 +26,6 @@ from ..kp_range_utils import (
 )
 from qgis.core import (QgsProcessing,
                        QgsFeatureSink,
-                       QgsProcessingAlgorithm,
                        QgsProcessingParameterFeatureSource,
                        QgsProcessingParameterFeatureSink,
                        QgsProcessingParameterField,
@@ -39,9 +39,9 @@ from qgis.core import (QgsProcessing,
                        QgsDistanceArea,
                        QgsProcessingException)
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_FIELD_NUMERIC
-from ..kp_geo_utils import get_features_skip_invalid, ordered_route_geometry
+from ..kp_geo_utils import RouteFrame, get_features_skip_invalid, ordered_route_geometry
 
-class PlaceKpPointsFromCsvAlgorithm(QgsProcessingAlgorithm):
+class PlaceKpPointsFromCsvAlgorithm(SubseaCableAlgorithm):
     INPUT_TABLE = 'INPUT_TABLE'
     INPUT_LINE = 'INPUT_LINE'
     KP_FIELD = 'KP_FIELD'
@@ -281,35 +281,18 @@ class PlaceKpPointsFromCsvAlgorithm(QgsProcessingAlgorithm):
         except ValueError as exc:
             raise QgsProcessingException(str(exc))
 
-        total_length_m = distance_calculator.measureLength(merged_geometry)
+        # One indexed route for all rows (the shared KP definition): each KP
+        # is a bisect instead of a geodesic re-walk of the whole line.
+        route = RouteFrame.from_source(merged_geometry, distance_calculator)
+        total_length_m = route.total_length_m
         if total_length_m == 0:
             raise QgsProcessingException(self.tr("Line has no length."))
 
-        line_parts = merged_geometry.asMultiPolyline() if merged_geometry.isMultipart() else [merged_geometry.asPolyline()]
-
-
         def _place_point_at_kp(kp_val: float) -> Optional[QgsGeometry]:
-            kp_dist_m = kp_val * 1000.0
-            if kp_dist_m > total_length_m:
-                return None
-
-            cumulative_length = 0.0
-            for part in line_parts:
-                for i in range(len(part) - 1):
-                    p1, p2 = part[i], part[i + 1]
-                    segment_length = float(distance_calculator.measureLine(p1, p2))
-                    if segment_length <= 0:
-                        continue
-
-                    if cumulative_length + segment_length >= kp_dist_m:
-                        dist_into_segment = kp_dist_m - cumulative_length
-                        ratio = dist_into_segment / segment_length
-                        x = p1.x() + ratio * (p2.x() - p1.x())
-                        y = p1.y() + ratio * (p2.y() - p1.y())
-                        return QgsGeometry.fromPointXY(QgsPointXY(x, y))
-
-                    cumulative_length += segment_length
-            return None
+            # None outside 0..route length (a negative KP used to be
+            # extrapolated backwards off the start of the line).
+            point = route.point_at_kp(kp_val)
+            return QgsGeometry.fromPointXY(point) if point is not None else None
 
         points_placed = 0
         if use_pasted:
@@ -321,7 +304,7 @@ class PlaceKpPointsFromCsvAlgorithm(QgsProcessingAlgorithm):
                 point_geom = _place_point_at_kp(kp_val)
                 if point_geom is None:
                     feedback.reportError(
-                        f"KP value {kp_val} is beyond the line's total length of {total_length_m/1000:.3f} km, or could not be placed. Skipping."
+                        f"KP value {kp_val} is outside the line (0 to {total_length_m/1000:.3f} km). Skipping."
                     )
                     continue
 
@@ -356,7 +339,7 @@ class PlaceKpPointsFromCsvAlgorithm(QgsProcessingAlgorithm):
                 point_geom = _place_point_at_kp(kp_val)
                 if point_geom is None:
                     feedback.reportError(
-                        f"KP value {kp_val} is beyond the line's total length of {total_length_m/1000:.3f} km, or could not be placed. Skipping."
+                        f"KP value {kp_val} is outside the line (0 to {total_length_m/1000:.3f} km). Skipping."
                     )
                     continue
 

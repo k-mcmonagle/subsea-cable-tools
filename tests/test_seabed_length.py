@@ -4,19 +4,33 @@ Runs against a synthetic planar-slope GeoTIFF so the 3D length has a known
 closed form: for a straight route on a constant slope m (dz per metre of
 plan distance), seabed_length = plan_length * sqrt(1 + m^2).
 
+Also: a long, dense route against an independent reference computation
+(the per-station re-walk this replaced was O(stations x vertices)); contour
+mode with PointZ crossings (3D contours used to be dropped) and with the
+contours in another CRS (they used to be intersected unprojected); and a
+multi-part route, whose gap between parts is not seabed.
+
 Requires the QGIS API (run via tests/run_qgis_smoke_tests.py).
 """
 
 from __future__ import annotations
 
+import bisect
 import math
 import os
+import struct
 import tempfile
+import time
 from typing import List
 
 from qgis.core import (
+    QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform,
     QgsFeature,
+    QgsField,
     QgsGeometry,
+    QgsLineString,
+    QgsPoint,
     QgsPointXY,
     QgsProcessingContext,
     QgsProcessingFeedback,
@@ -25,6 +39,8 @@ from qgis.core import (
     QgsVectorLayer,
 )
 
+from ..kp_range_utils import make_distance_area
+from ..qgis_compat import FIELD_TYPE_DOUBLE
 from ..processing.seabed_length_algorithm import SeabedLengthAlgorithm
 
 
@@ -43,11 +59,28 @@ _X0, _Y0 = 500000.0, 4000000.0
 _ROUTE_LEN = 2000.0  # metres of planar northing
 
 
+_TEMP_DIR = []
+
+
+def _temp_path(name: str) -> str:
+    """A path in this process's own temp folder.
+
+    A fixed name in the shared temp folder clashed with other test processes
+    (and with layers of earlier tests) holding the same GeoTIFF open, which
+    Windows refuses to overwrite.
+    """
+    if not _TEMP_DIR:
+        _TEMP_DIR.append(tempfile.mkdtemp(prefix="sct_seabed_"))
+    return os.path.join(_TEMP_DIR[0], name)
+
+
 def _make_slope_raster() -> str:
-    """Write a GeoTIFF where depth = _DEPTH0 + _SLOPE * (y - _Y0)."""
+    """Write a GeoTIFF where depth = _DEPTH0 + _SLOPE * (y - _Y0) (once per run)."""
     from osgeo import gdal, osr
 
-    path = os.path.join(tempfile.gettempdir(), "sct_test_slope_bathy.tif")
+    path = _temp_path("slope_bathy.tif")
+    if os.path.exists(path):
+        return path
     pixel = 10.0
     pad = 200.0
     width = int((2 * pad + 200.0) / pixel)            # 200 m wide strip
@@ -178,10 +211,208 @@ def test_kp_interval_output_mode_runs() -> bool:
     return _result("seabed length KP-interval mode", ok, detail)
 
 
+def _run_on(route: QgsVectorLayer, params_extra: dict) -> List[QgsFeature]:
+    alg = SeabedLengthAlgorithm()
+    alg.initAlgorithm()
+    context = QgsProcessingContext()
+    context.setProject(QgsProject.instance())
+    params = {
+        "INPUT_LINE": route,
+        "BATHY_TYPE": 0,
+        "SAMPLING_INTERVAL": 10,
+        "SENSITIVITY_ANALYSIS": False,
+        "SENSITIVITY_INTERVALS": "1,5,10",
+        "OUTPUT_INTERVALS": False,
+        "KP_INTERVAL": 1,
+        "OUTPUT": "memory:",
+    }
+    params.update(params_extra)
+    results = alg.processAlgorithm(params, context, QgsProcessingFeedback())
+    return list(context.getMapLayer(results["OUTPUT"]).getFeatures())
+
+
+# --- long route ------------------------------------------------------------
+
+_LONG_KM = 60.0
+_LONG_PIXEL = 50.0
+
+
+def _long_depth(x, y):
+    return 1500.0 + 40.0 * math.sin((x - _X0) / 700.0) + 25.0 * math.cos((y - _Y0) / 450.0)
+
+
+def _make_long_raster() -> str:
+    from osgeo import gdal, osr
+
+    path = _temp_path("long_bathy.tif")
+    x_min, y_max = _X0 - 1000.0, _Y0 + 3000.0
+    width = int((_LONG_KM * 1000.0 + 2000.0) / _LONG_PIXEL)
+    height = int(6000.0 / _LONG_PIXEL)
+    ds = gdal.GetDriverByName("GTiff").Create(path, width, height, 1, gdal.GDT_Float32)
+    ds.SetGeoTransform([x_min, _LONG_PIXEL, 0.0, y_max, 0.0, -_LONG_PIXEL])
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(32631)
+    ds.SetProjection(srs.ExportToWkt())
+    band = ds.GetRasterBand(1)
+    for row in range(height):
+        yc = y_max - (row + 0.5) * _LONG_PIXEL
+        values = [_long_depth(x_min + (col + 0.5) * _LONG_PIXEL, yc) for col in range(width)]
+        band.WriteRaster(0, row, width, 1, struct.pack(f"{width}f", *values))
+    band.FlushCache()
+    ds = None
+    return path
+
+
+def _reference_seabed_length(points, raster, interval_m) -> float:
+    """Independent re-implementation of the documented method.
+
+    Stations every ``interval_m`` of geodesic chainage from the start plus
+    the last vertex, each interpolated along its stored segment; depth from
+    band 1; seabed = sum of sqrt(chord^2 + dz^2) between valid stations.
+    """
+    distance = make_distance_area(QgsCoordinateReferenceSystem("EPSG:32631"))
+    cumulative = [0.0]
+    for a, b in zip(points[:-1], points[1:]):
+        cumulative.append(cumulative[-1] + distance.measureLine(a, b))
+    total = cumulative[-1]
+    provider = raster.dataProvider()
+
+    def depth(pt):
+        value, ok = provider.sample(pt, 1)
+        return float(value) if ok else None
+
+    stations = []
+    k = 0
+    while k * interval_m <= total:
+        d = k * interval_m
+        j = max(1, bisect.bisect_left(cumulative, d))
+        seg = cumulative[j] - cumulative[j - 1]
+        r = (d - cumulative[j - 1]) / seg
+        a, b = points[j - 1], points[j]
+        stations.append(QgsPointXY(a.x() + r * (b.x() - a.x()), a.y() + r * (b.y() - a.y())))
+        k += 1
+    if stations[-1] != points[-1]:
+        stations.append(points[-1])
+    samples = [(p, depth(p)) for p in stations]
+    valid = [(p, z) for p, z in samples if z is not None]
+    return sum(math.hypot(distance.measureLine(p0, p1), z1 - z0)
+               for (p0, z0), (p1, z1) in zip(valid[:-1], valid[1:]))
+
+
+def test_long_route_matches_reference() -> bool:
+    raster = QgsRasterLayer(_make_long_raster(), "long_bathy")
+    if not raster.isValid():
+        return _result("seabed length: long route vs reference", False, "raster failed to load")
+    # 60 km zig-zag route, one vertex every 100 m (601 vertices).
+    points = [QgsPointXY(_X0 + i * 100.0, _Y0 + 120.0 * math.sin(i / 7.0))
+              for i in range(int(_LONG_KM * 10) + 1)]
+    route = QgsVectorLayer("LineString?crs=EPSG:32631", "long_route", "memory")
+    feat = QgsFeature()
+    feat.setGeometry(QgsGeometry.fromPolylineXY(points))
+    route.dataProvider().addFeatures([feat])
+
+    started = time.perf_counter()
+    feats = _run_on(route, {"INPUT_RASTER": raster, "SAMPLING_INTERVAL": 10})
+    elapsed = time.perf_counter() - started
+    expected = _reference_seabed_length(points, raster, 10)
+    got = float(feats[0]["seabed_length_m"]) if feats else float("nan")
+    ok = bool(feats) and abs(got - expected) <= 1e-6 * expected
+    return _result("seabed length: 60 km, 601-vertex route matches reference computation", ok,
+                   f"seabed={got:.3f} reference={expected:.3f} ({elapsed:.2f} s)")
+
+
+# --- contour mode ----------------------------------------------------------
+
+_ZIGZAG_DZ = 20.0
+
+
+def _contour_layer(crs: str = "EPSG:32631", z: bool = False) -> QgsVectorLayer:
+    """East-west contours every 100 m of northing, depth alternating 100/120 m.
+
+    The alternating depth makes the seabed length depend on every crossing:
+    dropping them (as the old code did for PointZ intersections) collapses
+    it to the plan length.
+    """
+    kind = "LineStringZ" if z else "LineString"
+    layer = QgsVectorLayer(f"{kind}?crs={crs}", "contours", "memory")
+    layer.dataProvider().addAttributes([QgsField("depth", FIELD_TYPE_DOUBLE)])
+    layer.updateFields()
+    to_crs = None
+    if crs != "EPSG:32631":
+        to_crs = QgsCoordinateTransform(QgsCoordinateReferenceSystem("EPSG:32631"),
+                                        QgsCoordinateReferenceSystem(crs), QgsProject.instance())
+    feats = []
+    for k in range(0, 21):
+        y = _Y0 + k * 100.0
+        depth = 100.0 + (_ZIGZAG_DZ if k % 2 else 0.0)
+        xy = [QgsPointXY(_X0 - 500.0 + j * 100.0, y) for j in range(11)]
+        if to_crs is not None:
+            xy = [to_crs.transform(p) for p in xy]
+        feat = QgsFeature(layer.fields())
+        if z:
+            feat.setGeometry(QgsGeometry(QgsLineString([QgsPoint(p.x(), p.y(), -depth) for p in xy])))
+        else:
+            feat.setGeometry(QgsGeometry.fromPolylineXY(xy))
+        feat.setAttributes([depth])
+        feats.append(feat)
+    layer.dataProvider().addFeatures(feats)
+    return layer
+
+
+def _contour_run(contours) -> float:
+    feats = _run_on(_make_route_layer(), {
+        "BATHY_TYPE": 1, "INPUT_CONTOURS": contours, "DEPTH_FIELD": "depth"})
+    return float(feats[0]["seabed_length_m"]) if feats else float("nan")
+
+
+def test_contour_modes() -> bool:
+    """2D, 3D (PointZ crossings) and other-CRS contours give the same length."""
+    plain = _contour_run(_contour_layer())
+    three_d = _contour_run(_contour_layer(z=True))
+    other_crs = _contour_run(_contour_layer(crs="EPSG:4326"))
+    # 20 x 100 m steps each rising/falling 20 m (plan metres are geodesic,
+    # ~0.04% longer than UTM grid metres).
+    expected = 20 * math.hypot(100.0 * 1.0004, _ZIGZAG_DZ)
+    ok = (abs(plain - expected) < 1.0
+          and abs(three_d - plain) < 1e-6
+          and abs(other_crs - plain) < 1e-3 * plain)
+    return _result("seabed length: contours 2D / PointZ / other CRS agree", ok,
+                   f"2D={plain:.3f} Z={three_d:.3f} EPSG:4326={other_crs:.3f} expected~{expected:.1f}")
+
+
+def test_multipart_route_skips_gap() -> bool:
+    """Two disjoint parts: seabed length is the sum of the parts, not the gap."""
+    raster = QgsRasterLayer(_make_slope_raster(), "bathy")
+    route = QgsVectorLayer("LineString?crs=EPSG:32631", "two_parts", "memory")
+    parts = [
+        [QgsPointXY(_X0, _Y0), QgsPointXY(_X0, _Y0 + 800.0)],
+        [QgsPointXY(_X0 + 50.0, _Y0 + 1200.0), QgsPointXY(_X0 + 50.0, _Y0 + 2000.0)],
+    ]
+    feats = []
+    for part in parts:
+        feat = QgsFeature()
+        feat.setGeometry(QgsGeometry.fromPolylineXY(part))
+        feats.append(feat)
+    route.dataProvider().addFeatures(feats)
+    out = _run_on(route, {"INPUT_RASTER": raster})
+    ok = bool(out)
+    detail = ""
+    if ok:
+        plan = float(out[0]["plan_length_m"])
+        seabed = float(out[0]["seabed_length_m"])
+        expected_ratio = math.sqrt(1.0 + _SLOPE * _SLOPE)
+        ok = abs(plan - 1600.0) < 2.0 and abs(seabed / plan - expected_ratio) < 5e-4
+        detail = f"plan={plan:.2f} seabed={seabed:.2f} ratio={seabed / plan:.6f}"
+    return _result("seabed length: multi-part route excludes the gap", ok, detail)
+
+
 def run_all() -> List[bool]:
     results = [
         test_planar_slope_matches_closed_form(),
         test_kp_interval_output_mode_runs(),
+        test_long_route_matches_reference(),
+        test_contour_modes(),
+        test_multipart_route_skips_gap(),
     ]
     print("")
     print(f"{sum(results)}/{len(results)} passed")

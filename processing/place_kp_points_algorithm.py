@@ -1,5 +1,4 @@
 from qgis.core import (
-    QgsProcessingAlgorithm,
     QgsProcessingParameterFeatureSource,
     QgsProcessingParameterRasterLayer,
     QgsProcessingParameterNumber,
@@ -17,6 +16,7 @@ from qgis.core import (
     QgsFeatureSink,
     QgsDistanceArea
 )
+from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_NUMBER_DOUBLE
 from qgis.PyQt.QtCore import QCoreApplication
 from ..kp_range_utils import (
@@ -26,7 +26,7 @@ from ..kp_range_utils import (
 )
 from ..kp_geo_utils import get_features_skip_invalid, ordered_route_geometry
 
-class PlaceKpPointsAlgorithm(QgsProcessingAlgorithm):
+class PlaceKpPointsAlgorithm(SubseaCableAlgorithm):
     """
     This algorithm places points along a line layer at specified regular intervals.
     """
@@ -112,7 +112,7 @@ class PlaceKpPointsAlgorithm(QgsProcessingAlgorithm):
                 "Line layer and raster layer use different CRSes; sample points will be reprojected to the raster CRS."
             ))
             line_to_raster_xform = QgsCoordinateTransform(
-                line_layer.sourceCrs(), raster_layer.crs(), context.project()
+                line_layer.sourceCrs(), raster_layer.crs(), context.transformContext()
             )
 
         intervals_to_process = []

@@ -7,12 +7,16 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import bisect
+import logging
 import math
 
 from qgis.PyQt.QtCore import QCoreApplication
+from .algorithm_base import SubseaCableAlgorithm
 from ..kp_range_utils import make_distance_area
 from qgis.core import (
     QgsCoordinateTransform,
+    QgsCoordinateTransformContext,
+    QgsCsException,
     QgsDistanceArea,
     QgsFeature,
     QgsFeatureRequest,
@@ -22,7 +26,6 @@ from qgis.core import (
     QgsGeometry,
     QgsPointXY,
     QgsProcessing,
-    QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingParameterBoolean,
     QgsProcessingParameterEnum,
@@ -32,7 +35,6 @@ from qgis.core import (
     QgsProcessingParameterMultipleLayers,
     QgsProcessingParameterNumber,
     QgsProcessingParameterVectorLayer,
-    QgsProject,
     QgsRasterDataProvider,
     QgsRasterLayer,
     QgsRectangle,
@@ -48,6 +50,7 @@ from ..slope_utils import (
     windowed_slope_series,
 )
 from ..kp_geo_utils import get_features_skip_invalid
+from ..plugin_log import log_exception
 
 
 @dataclass(frozen=True)
@@ -60,7 +63,7 @@ class _RasterSource:
     sampler: object = None
 
 
-class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
+class KPRangeDepthSlopeSummaryAlgorithm(SubseaCableAlgorithm):
     """Summarise depth + slope statistics per KP-range feature.
 
     For each input line feature (a KP range segment), the algorithm samples depth along
@@ -263,7 +266,6 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
         depth_field1 = self.parameterAsString(parameters, self.CONTOUR_DEPTH_FIELD_1, context) or ''
         contour2 = self.parameterAsVectorLayer(parameters, self.CONTOUR_LAYER_2, context)
         depth_field2 = self.parameterAsString(parameters, self.CONTOUR_DEPTH_FIELD_2, context) or ''
-        interpolate_contours = bool(self.parameterAsBool(parameters, self.INTERPOLATE_CONTOURS, context))
 
         sample_interval_m = float(self.parameterAsDouble(parameters, self.SAMPLE_INTERVAL_M, context))
         adaptive_interval = bool(self.parameterAsBool(parameters, self.ADAPTIVE_INTERVAL, context))
@@ -314,7 +316,22 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
         contour_index: Optional[QgsSpatialIndex] = None
         contour_data: Optional[Dict[int, Tuple[QgsGeometry, float]]] = None
         if depth_source_mode == 2:
-            contour_index, contour_data = self._build_combined_contour_index(line_crs, contour_layers, contour_fields)
+            contour_index, contour_data, skipped = self._build_combined_contour_index(
+                line_crs, contour_layers, contour_fields, context.transformContext())
+            # Every skipped contour is missing from every profile below, so
+            # the summary would be built on partial data: say so.
+            if skipped['transform']:
+                feedback.pushWarning(self.tr(
+                    '{n} contour feature(s) could not be reprojected into the KP range '
+                    'layer CRS and were left out of the depth and slope statistics.'
+                ).format(n=skipped['transform']))
+            if skipped['depth']:
+                feedback.pushWarning(self.tr(
+                    '{n} contour feature(s) have no usable depth value and were left '
+                    'out of the depth and slope statistics.').format(n=skipped['depth']))
+            if not contour_data:
+                feedback.reportError(self.tr(
+                    'No usable contour features: depth and slope fields will be empty.'))
 
         # Output fields: copy inputs, then append stats (ensure uniqueness)
         out_fields = QgsFields(source.fields())
@@ -354,6 +371,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
 
         features = list(get_features_skip_invalid(source))
         total = len(features)
+        side_slope_failures = 0
         for idx, feat in enumerate(features):
             if feedback.isCanceled():
                 break
@@ -381,11 +399,8 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
                 contour_profile = self._build_contour_profile_for_feature(
                     parts,
                     distance_area,
-                    line_crs,
-                    contour_layers,
-                    contour_fields,
-                    interpolate_contours,
-                    feedback,
+                    contour_index,
+                    contour_data,
                 )
 
             # Sample along the line parts
@@ -452,6 +467,9 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
                             side_search_m,
                         )
                     except Exception:
+                        side_slope_failures += 1
+                        if side_slope_failures == 1:
+                            log_exception('KP range summary: side slope failed at a station')
                         side_deg = None
                     station_side_slope_deg.append(side_deg)
 
@@ -524,6 +542,11 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
             if total > 0:
                 feedback.setProgress(int((idx + 1) * 100 / total))
 
+        if side_slope_failures:
+            feedback.pushWarning(self.tr(
+                'Side slope could not be computed at {n} station(s); the side slope '
+                'statistics exclude them (details in the Subsea Cable Tools log).'
+            ).format(n=side_slope_failures))
         return {self.OUTPUT: dest_id}
 
     # --------------------------- Raster helpers ---------------------------
@@ -541,10 +564,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
             raster_crs = raster_layer.crs()
             transform = None
             if raster_crs != line_crs:
-                try:
-                    transform = QgsCoordinateTransform(line_crs, raster_crs, QgsProject.instance())
-                except Exception:
-                    continue
+                transform = QgsCoordinateTransform(line_crs, raster_crs, context.transformContext())
 
             nodata = None
             try:
@@ -581,11 +601,15 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
         for src in raster_sources:
             try:
                 point = src.transform.transform(point_xy_line_crs) if src.transform else point_xy_line_crs
+            except QgsCsException:
+                continue  # outside this raster's CRS domain: no data here
+            try:
                 value = src.sampler.sample(point)
-                if value is not None:
-                    return value, src
             except Exception:
+                log_exception('KP range summary: raster sample failed', level=logging.DEBUG)
                 continue
+            if value is not None:
+                return value, src
         return None, None
 
     @staticmethod
@@ -609,141 +633,126 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
         line_crs,
         contour_layers: Sequence[QgsVectorLayer],
         depth_fields: Sequence[str],
-    ) -> Tuple[Optional[QgsSpatialIndex], Optional[Dict[int, Tuple[QgsGeometry, float]]]]:
+        transform_context=None,
+    ) -> Tuple[Optional[QgsSpatialIndex], Optional[Dict[int, Tuple[QgsGeometry, float]]], Dict[str, int]]:
+        """Every usable contour, reprojected into the line CRS, in one index.
+
+        Built once per run and shared by the along-route profiles and the
+        side-slope transects. Returns ``(index, data, skipped)`` where
+        ``skipped`` counts features left out because they could not be
+        reprojected (``'transform'``) or have no usable depth (``'depth'``).
+        """
+        skipped = {'transform': 0, 'depth': 0}
         if not contour_layers:
-            return None, None
+            return None, None, skipped
 
         index = QgsSpatialIndex()
         data: Dict[int, Tuple[QgsGeometry, float]] = {}
         next_id = 1
 
         for layer_idx, layer in enumerate(contour_layers):
-            options = layer_options(layer)
             if not layer:
                 continue
+            options = layer_options(layer)
             depth_field = depth_fields[layer_idx] if layer_idx < len(depth_fields) else ''
             if not depth_field:
                 continue
 
             transform = None
             if layer.crs() != line_crs:
-                try:
-                    transform = QgsCoordinateTransform(layer.crs(), line_crs, QgsProject.instance())
-                except Exception:
-                    transform = None
+                transform = QgsCoordinateTransform(
+                    layer.crs(), line_crs,
+                    transform_context if transform_context is not None else QgsCoordinateTransformContext())
 
             for feat in layer.getFeatures(QgsFeatureRequest()):
+                geom = feat.geometry()
+                if geom is None or geom.isEmpty():
+                    continue
                 try:
-                    geom = feat.geometry()
-                    if geom is None or geom.isEmpty():
-                        continue
-                    if transform is not None:
-                        geom = QgsGeometry(geom)
+                    zf = normalise_depth(feat[depth_field], options)
+                except (KeyError, TypeError, ValueError):
+                    zf = None
+                if zf is None:
+                    skipped['depth'] += 1
+                    continue
+                if transform is not None:
+                    geom = QgsGeometry(geom)
+                    try:
                         geom.transform(transform)
-                    z = feat[depth_field]
-                    if z is None:
+                    except QgsCsException:
+                        skipped['transform'] += 1
                         continue
-                    zf = normalise_depth(z, options)
-                    if zf is None: continue
-                except Exception:
-                    continue
 
-                try:
-                    f = QgsFeature()
-                    f.setId(next_id)
-                    f.setGeometry(geom)
-                    index.addFeature(f)
-                    data[next_id] = (geom, zf)
-                    next_id += 1
-                except Exception:
-                    continue
+                f = QgsFeature()
+                f.setId(next_id)
+                f.setGeometry(geom)
+                index.addFeature(f)
+                data[next_id] = (geom, zf)
+                next_id += 1
 
         if not data:
-            return None, None
-        return index, data
+            return None, None, skipped
+        return index, data, skipped
 
     def _build_contour_profile_for_feature(
         self,
         parts: Sequence[Sequence[QgsPointXY]],
         distance_area: QgsDistanceArea,
-        line_crs,
-        contour_layers: Sequence[QgsVectorLayer],
-        depth_fields: Sequence[str],
-        interpolate: bool,
-        feedback,
+        contour_index: Optional[QgsSpatialIndex],
+        contour_data: Optional[Dict[int, Tuple[QgsGeometry, float]]],
     ) -> Optional[List[Tuple[float, float]]]:
-        # Collect intersections along the feature geometry
-        try:
-            if len(parts) == 1:
-                route_geom = QgsGeometry.fromPolylineXY(list(parts[0]))
-            else:
-                route_geom = QgsGeometry.collectGeometry([QgsGeometry.fromPolylineXY(list(p)) for p in parts])
-        except Exception:
+        """(chainage m, depth) of every contour crossing along the feature.
+
+        Candidates come from the run's contour index (already in the line
+        CRS), so a feature no longer scans and reprojects every contour.
+        """
+        if contour_index is None or not contour_data:
+            return None
+        if len(parts) == 1:
+            route_geom = QgsGeometry.fromPolylineXY(list(parts[0]))
+        else:
+            route_geom = QgsGeometry.collectGeometry([QgsGeometry.fromPolylineXY(list(p)) for p in parts])
+        if route_geom is None or route_geom.isEmpty():
             return None
 
         hits: List[Tuple[float, float]] = []
-        request = QgsFeatureRequest()
-        for layer_idx, contour_layer in enumerate(contour_layers):
-            options = layer_options(contour_layer)
-            if feedback.isCanceled():
-                return None
-            depth_field = depth_fields[layer_idx] if layer_idx < len(depth_fields) else ''
-            if not depth_field:
+        for cid in contour_index.intersects(route_geom.boundingBox()):
+            item = contour_data.get(cid)
+            if not item:
                 continue
-
-            transform = None
-            if contour_layer.crs() != line_crs:
-                try:
-                    transform = QgsCoordinateTransform(contour_layer.crs(), line_crs, QgsProject.instance())
-                except Exception:
-                    transform = None
-
-            for feat in contour_layer.getFeatures(request):
-                geom = feat.geometry()
-                if geom is None or geom.isEmpty():
+            geom, zf = item
+            for p in self._intersection_points(route_geom.intersection(geom)):
+                d_m = self._measure_along_parts_m(parts, p, distance_area)
+                if d_m is None:
                     continue
-                if transform is not None:
-                    try:
-                        geom = QgsGeometry(geom)
-                        geom.transform(transform)
-                    except Exception:
-                        continue
-                try:
-                    zf = normalise_depth(feat[depth_field], options)
-                    if zf is None: continue
-                except Exception:
-                    continue
-
-                try:
-                    inter = route_geom.intersection(geom)
-                except Exception:
-                    continue
-                if inter is None or inter.isEmpty():
-                    continue
-
-                pts: List[QgsPointXY] = []
-                try:
-                    if inter.type() == GEOMETRY_POINT:
-                        pts = [QgsPointXY(p) for p in (inter.asMultiPoint() if inter.isMultipart() else [inter.asPoint()])]
-                    elif inter.type() == GEOMETRY_LINE:
-                        if inter.isMultipart():
-                            for pl in inter.asMultiPolyline():
-                                pts.extend(QgsPointXY(p) for p in pl)
-                        else:
-                            pts.extend(QgsPointXY(p) for p in inter.asPolyline())
-                except Exception:
-                    pts = []
-
-                for p in pts:
-                    d_m = self._measure_along_parts_m(parts, p, distance_area)
-                    if d_m is None:
-                        continue
-                    hits.append((float(d_m), float(zf)))
+                hits.append((float(d_m), float(zf)))
 
         if not hits:
             return None
 
         return clean_crossings(hits)
+
+    @staticmethod
+    def _intersection_points(inter: Optional[QgsGeometry]) -> List[QgsPointXY]:
+        """Crossing points of an intersection result.
+
+        Points as they are; for a coincident stretch, its vertices; a
+        GeometryCollection (e.g. a crossing plus an overlap) part by part.
+        """
+        if inter is None or inter.isEmpty():
+            return []
+        if inter.type() == GEOMETRY_POINT:
+            return [QgsPointXY(p) for p in (inter.asMultiPoint() if inter.isMultipart() else [inter.asPoint()])]
+        if inter.type() == GEOMETRY_LINE:
+            if inter.isMultipart():
+                return [QgsPointXY(p) for pl in inter.asMultiPolyline() for p in pl]
+            return [QgsPointXY(p) for p in inter.asPolyline()]
+        if inter.isMultipart():
+            points: List[QgsPointXY] = []
+            for part in inter.asGeometryCollection():
+                points.extend(KPRangeDepthSlopeSummaryAlgorithm._intersection_points(part))
+            return points
+        return []
 
     @staticmethod
     def _sample_contour_profile_at_distance(profile: Sequence[Tuple[float, float]], distance_m: float) -> Optional[float]:
@@ -867,26 +876,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(QgsProcessingAlgorithm):
             if not item:
                 continue
             geom, depth = item
-            try:
-                inter = transect.intersection(geom)
-            except Exception:
-                continue
-            if inter is None or inter.isEmpty():
-                continue
-
-            points: List[QgsPointXY] = []
-            try:
-                if inter.type() == GEOMETRY_POINT:
-                    pts = inter.asMultiPoint() if inter.isMultipart() else [inter.asPoint()]
-                    points = [QgsPointXY(p) for p in pts]
-                elif inter.type() == GEOMETRY_LINE:
-                    if inter.isMultipart():
-                        for pl in inter.asMultiPolyline():
-                            points.extend(QgsPointXY(p) for p in pl)
-                    else:
-                        points.extend(QgsPointXY(p) for p in inter.asPolyline())
-            except Exception:
-                points = []
+            points = KPRangeDepthSlopeSummaryAlgorithm._intersection_points(transect.intersection(geom))
 
             for p in points:
                 try:

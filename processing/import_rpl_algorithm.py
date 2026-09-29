@@ -22,7 +22,6 @@ import os
 
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
-    QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingParameterBoolean,
     QgsProcessingParameterEnum,
@@ -32,6 +31,7 @@ from qgis.core import (
     QgsProject,
 )
 
+from .algorithm_base import SubseaCableAlgorithm
 from ..rpl_import import model as im
 from ..rpl_import import detect as idetect
 from ..rpl_import import parser as iparser
@@ -49,7 +49,7 @@ from ..workbench.store import (
 )
 
 
-class ImportRPLAlgorithm(QgsProcessingAlgorithm):
+class ImportRPLAlgorithm(SubseaCableAlgorithm):
     INPUT_FILE = "INPUT_FILE"
     SHEET = "SHEET"
     PROFILE_JSON = "PROFILE_JSON"
@@ -143,6 +143,10 @@ class ImportRPLAlgorithm(QgsProcessingAlgorithm):
             for topic, reason in sorted(result.reasons.items()):
                 feedback.pushInfo(f"[detect] {topic}: {reason}")
 
+        feedback.setProgress(20)
+        if feedback.isCanceled():
+            return {}
+
         # -- read + parse ---------------------------------------------------
         try:
             grid = ireader.load_grid(
@@ -183,6 +187,12 @@ class ImportRPLAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException(self.tr(
                 "%d warning(s) present and 'Accept warnings' is unchecked."
                 % len(warnings)))
+
+        feedback.setProgress(60)
+        # Last point where cancelling leaves the workbench untouched (the
+        # commit below is all-or-nothing).
+        if feedback.isCanceled():
+            return {}
 
         # -- build + commit -------------------------------------------------
         model, conv = to_rpl_model(doc, source_file=os.path.basename(path))
@@ -227,6 +237,7 @@ class ImportRPLAlgorithm(QgsProcessingAlgorithm):
         except CommitError as exc:
             raise QgsProcessingException(str(exc))
 
+        feedback.setProgress(100)
         feedback.pushInfo(self.tr(
             f"Registered '{result.registered_name}' "
             f"({len(model.points)} positions, {len(model.segments)} "

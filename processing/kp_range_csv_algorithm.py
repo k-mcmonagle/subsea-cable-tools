@@ -25,7 +25,6 @@ from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (QgsProcessing,
                        QgsFeatureSink,
                        QgsProcessingException,
-                       QgsProcessingAlgorithm,
                        QgsProcessingParameterFeatureSource,
                        QgsProcessingParameterFeatureSink,
                        QgsProcessingParameterField,
@@ -37,6 +36,7 @@ from qgis.core import (QgsProcessing,
                        QgsField,
                        QgsWkbTypes,
                        QgsDistanceArea)
+from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import (
     FIELD_TYPE_DOUBLE,
     FIELD_TYPE_STRING,
@@ -45,15 +45,13 @@ from ..qgis_compat import (
 )
 
 from ..kp_range_utils import (
-    extract_line_segment,
     make_distance_area,
-    measure_total_length_m,
     add_distance_mode_parameter,
     read_distance_mode,
 )
-from ..kp_geo_utils import get_features_skip_invalid, ordered_route_geometry, point_at_kp
+from ..kp_geo_utils import RouteFrame, get_features_skip_invalid, ordered_route_geometry
 
-class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
+class KPRangeCSVAlgorithm(SubseaCableAlgorithm):
     INPUT_LAYER = 'INPUT_LAYER'
     INPUT_LINE = 'INPUT_LINE'
     START_KP_FIELD = 'START_KP_FIELD'
@@ -344,13 +342,12 @@ class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
         counts = {'ranges': 0, 'points': 0, 'skipped': 0}
 
         # Combine all features from the line layer into a single geometry
-        geometries = [f.geometry() for f in get_features_skip_invalid(source)
-                      if f.hasGeometry() and not f.geometry().isEmpty()]
-        if not geometries:
+        line_features = list(get_features_skip_invalid(source))
+        if not any(f.hasGeometry() and not f.geometry().isEmpty() for f in line_features):
             return {self.OUTPUT: dest_id, self.OUTPUT_POINTS: point_dest_id}
 
         # Shared route builder (SeqNo/layer order, no noding).
-        combined_geom = ordered_route_geometry(list(get_features_skip_invalid(source)))
+        combined_geom = ordered_route_geometry(line_features)
 
         if combined_geom.isEmpty():
             feedback.pushInfo("Input line layer is empty or invalid.")
@@ -365,8 +362,10 @@ class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
         except ValueError as exc:
             raise QgsProcessingException(str(exc))
 
-        # Pre-calculate the total length of the line
-        total_length = float(measure_total_length_m(combined_geom, distance_calculator))
+        # One indexed route for every row: each lookup is a bisect instead of
+        # a geodesic re-walk of the whole line (was O(rows x vertices)).
+        route = RouteFrame.from_source(combined_geom, distance_calculator)
+        total_length = float(route.total_length_m)
         feedback.pushInfo(f"Total length of dissolved input line: {total_length} meters")
 
         def emit(start_kp, end_kp, carried, source_table_name):
@@ -395,7 +394,7 @@ class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
                     counts['skipped'] += 1
                     return
                 kp = (start_kp + end_kp) / 2.0
-                point_xy = point_at_kp(combined_geom, kp, distance_calculator, clamp=True)
+                point_xy = route.point_at_kp(kp, clamp=True)
                 if point_xy is None:
                     feedback.reportError(f"Could not place a point at KP {kp}. Skipping.")
                     counts['skipped'] += 1
@@ -407,7 +406,7 @@ class KPRangeCSVAlgorithm(QgsProcessingAlgorithm):
                 counts['points'] += 1
                 return
 
-            seg_geom = extract_line_segment(combined_geom, start_kp, end_kp, distance_calculator)
+            seg_geom = route.extract_segment(start_kp, end_kp)
             if seg_geom and not seg_geom.isEmpty():
                 feat = QgsFeature(fields)
                 feat.setGeometry(seg_geom)

@@ -20,16 +20,10 @@ __copyright__ = '(C) 2024 by Kieran McMonagle'
 __revision__ = '$Format:%H$'
 
 import os
-import sys
-plugin_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-lib_dir = os.path.join(plugin_dir, 'lib')
-if os.path.isdir(lib_dir) and lib_dir not in sys.path:
-    sys.path.insert(0, lib_dir)
 
 from qgis.PyQt.QtCore import QCoreApplication, QSettings
 from qgis.core import (
     QgsProcessing,
-    QgsProcessingAlgorithm,
     QgsProcessingParameterFile,
     QgsProcessingParameterString,
     QgsProcessingParameterNumber,
@@ -45,10 +39,12 @@ from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsProcessingLayerPostProcessorInterface
 )
+from .algorithm_base import SubseaCableAlgorithm, deprecated_flag
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_STRING, PROCESSING_NUMBER_INTEGER
 
 try:
-    # openpyxl is bundled under plugin lib/ but may also be available in QGIS python
+    # openpyxl may come from QGIS's Python or from the plugin's bundled lib/
+    # (put on sys.path by the plugin package __init__ when needed).
     from openpyxl import load_workbook
 except Exception:
     load_workbook = None
@@ -78,7 +74,7 @@ def is_valid_col_letter(letter):
         return True
     return all('A' <= ch <= 'Z' for ch in s.upper())
 
-class ImportExcelRPLAlgorithm(QgsProcessingAlgorithm):
+class ImportExcelRPLAlgorithm(SubseaCableAlgorithm):
     """
     A QGIS Processing Algorithm that:
       - Prompts the user for an Excel file, sheet name, start row and optionally an end row.
@@ -140,7 +136,13 @@ class ImportExcelRPLAlgorithm(QgsProcessingAlgorithm):
         return 'importexcelrpl'
 
     def displayName(self):
-        return self.tr('Import Excel RPL')
+        return self.tr('Import Excel RPL (legacy, deprecated)')
+
+    def flags(self):
+        # Deprecated: hidden from the toolbox, still runnable by name
+        # ('subsea_cable_processing:importexcelrpl') in existing models and
+        # scripts. The replacement is the rpl_import-based Workbench import.
+        return super().flags() | deprecated_flag()
 
     def group(self):
         # Place this algorithm in the "RPL Tools" group
@@ -484,6 +486,12 @@ This pattern continues until the 'Data End Row' is reached or the end of the she
         )
 
     def processAlgorithm(self, parameters, context, feedback):
+        feedback.pushWarning(
+            "Import Excel RPL is deprecated and will be removed in a future release. "
+            "Use 'Import RPL to Workbench (auto-detect)' (Processing) or the Cable "
+            "Route Workbench's 'Import RPL...' wizard: both detect the layout, "
+            "coordinates and columns automatically and validate the RPL.")
+
         # Retrieve inputs
         excel_file = self.parameterAsFile(parameters, self.INPUT_EXCEL, context)
         sheet_name = self.parameterAsString(parameters, self.INPUT_SHEET, context)

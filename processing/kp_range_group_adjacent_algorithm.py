@@ -38,7 +38,6 @@ from qgis.core import (
     QgsFields,
     QgsGeometry,
     QgsProcessing,
-    QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingParameterBoolean,
     QgsProcessingParameterEnum,
@@ -49,6 +48,7 @@ from qgis.core import (
     QgsSettings,
     QgsWkbTypes,
 )
+from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import PROCESSING_FIELD_ANY, PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE
 from ..kp_geo_utils import get_features_skip_invalid
 
@@ -62,7 +62,7 @@ class _Row:
     geom: Optional[QgsGeometry]
 
 
-class KPRangeGroupAdjacentAlgorithm(QgsProcessingAlgorithm):
+class KPRangeGroupAdjacentAlgorithm(SubseaCableAlgorithm):
     INPUT = 'INPUT'
     START_FIELD = 'START_FIELD'
     END_FIELD = 'END_FIELD'

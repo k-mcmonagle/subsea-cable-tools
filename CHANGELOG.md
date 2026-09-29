@@ -70,6 +70,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **KP Plotter:** the reverse option now reads *Table KPs are reverse KPs*.
 - **Depth Profile:** right-click ▸ *Centre map on this KP* replaces panning the map on every right-click.
 
+### Deprecated
+
+- **Import Excel RPL (legacy):** hidden from the toolbox in favour of *Import RPL*; existing models that use it keep working unchanged.
+
 ### Removed
 
 - **Depth Profile:** the *Interpolate Between Contours* option, which had no effect (exact crossings are always used).
@@ -89,6 +93,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Burial Planner — deleting a plan** now also removes its ground-model and BAS rows.
 - **Burial Planner — window:** closing and reopening the panel keeps it in step with the current project, and results from an analysis stopped by closing the panel are no longer applied.
 - **Depth Profile:** profiles and side slopes are computed in the background with a progress bar and *Cancel*, so QGIS stays responsive on long routes (results are unchanged); raster files are no longer locked after a profile, and skipped samples or contours are reported instead of silently left blank.
+- **Identify RPL Crossing Points / Identify RPL Area Listing:** no longer crash when an intersection mixes points and lines.
+- **Add Depth to Point Layer / Dynamic Buffer Lay Corridor:** depths are now found from contour layers in latitude/longitude (previously every lookup silently returned no depth).
+- **Compare Design vs As-Laid Routes:** the cross-track sign now follows the documented convention (+ starboard, − port); earlier versions reported it reversed, so **re-run comparisons made with an earlier version** if you rely on the sign (magnitudes are unchanged).
+- **Calculate Seabed Length:** much faster on long routes; contours with Z values or in another CRS are used, and the gap between parts of a multi-part route no longer counts as seabed.
+- **Processing tools:** long-running tools can be cancelled and report progress, tools warn when features or contours are skipped instead of silently leaving them out, and every tool's *Help* opens the documentation.
 <!-- audit-2026-09 entries -->
 
 ## [1.9.0] - 2026-08-29

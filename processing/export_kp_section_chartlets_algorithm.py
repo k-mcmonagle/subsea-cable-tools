@@ -24,7 +24,6 @@ from qgis.core import (
     QgsGeometry,
     QgsMapLayer,
     QgsProcessing,
-    QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingParameterDistance,
     QgsProcessingParameterFeatureSource,
@@ -46,6 +45,7 @@ from qgis.core import (
     QgsLayoutSize,
     QgsLayoutExporter,
 )
+from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE, PROCESSING_NUMBER_INTEGER
 
 from ..kp_range_utils import extract_line_segment, make_kp_distance_area, measure_total_length_m
@@ -89,7 +89,7 @@ def _expand_extent_to_aspect(extent: QgsRectangle, width_px: int, height_px: int
         return QgsRectangle(cx - half_w, extent.yMinimum(), cx + half_w, extent.yMaximum())
 
 
-class ExportKPSectionChartletsAlgorithm(QgsProcessingAlgorithm):
+class ExportKPSectionChartletsAlgorithm(SubseaCableAlgorithm):
     RANGES = 'RANGES'
     START_KP_FIELD = 'START_KP_FIELD'
     END_KP_FIELD = 'END_KP_FIELD'

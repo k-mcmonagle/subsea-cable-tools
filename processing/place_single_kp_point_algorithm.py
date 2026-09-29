@@ -6,6 +6,7 @@ This tool places a single KP point along a route.
 """
 
 from qgis.PyQt.QtCore import QCoreApplication, QSettings
+from .algorithm_base import SubseaCableAlgorithm
 from ..kp_range_utils import (
     make_distance_area,
     add_distance_mode_parameter,
@@ -13,7 +14,6 @@ from ..kp_range_utils import (
 )
 from qgis.core import (QgsProcessing,
                        QgsFeatureSink,
-                       QgsProcessingAlgorithm,
                        QgsProcessingParameterFeatureSource,
                        QgsProcessingParameterBoolean,
                        QgsProcessingParameterEnum,
@@ -55,7 +55,7 @@ def _make_local_aeqd_crs(lat: float, lon: float) -> QgsCoordinateReferenceSystem
 
     return QgsCoordinateReferenceSystem('EPSG:3857')
 
-class PlaceSingleKpPointAlgorithm(QgsProcessingAlgorithm):
+class PlaceSingleKpPointAlgorithm(SubseaCableAlgorithm):
     INPUT_LINE = 'INPUT_LINE'
     KP_VALUE = 'KP_VALUE'
     DCC_VALUE = 'DCC_VALUE'
@@ -231,12 +231,17 @@ class PlaceSingleKpPointAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException(self.invalidSourceError(parameters, self.INPUT_LINE))
 
         source_crs = line_layer.sourceCrs()
-        project_crs = context.project().crs()
+        project = context.project()
+        project_crs = project.crs() if project is not None else QgsCoordinateReferenceSystem()
+        if not project_crs.isValid():
+            # Headless runs have no project CRS: work in the layer CRS.
+            project_crs = source_crs
         wgs84 = QgsCoordinateReferenceSystem('EPSG:4326')
-        to_wgs84 = QgsCoordinateTransform(source_crs, wgs84, context.project())
+        transform_context = context.transformContext()
+        to_wgs84 = QgsCoordinateTransform(source_crs, wgs84, transform_context)
 
-        src_to_project = QgsCoordinateTransform(source_crs, project_crs, context.project())
-        project_to_src = QgsCoordinateTransform(project_crs, source_crs, context.project())
+        src_to_project = QgsCoordinateTransform(source_crs, project_crs, transform_context)
+        project_to_src = QgsCoordinateTransform(project_crs, source_crs, transform_context)
 
         output_fields = QgsFields()
         output_fields.append(QgsField('source_line', FIELD_TYPE_STRING))
@@ -358,6 +363,8 @@ class PlaceSingleKpPointAlgorithm(QgsProcessingAlgorithm):
             if len(part) < 2:
                 continue
             for i in range(len(part) - 1):
+                if i % 1000 == 0 and feedback.isCanceled():
+                    return {self.OUTPUT: dest_id}
                 p1, p2 = part[i], part[i + 1]
 
                 # Geodesic segment length (meters)

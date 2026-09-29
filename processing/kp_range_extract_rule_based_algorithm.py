@@ -34,7 +34,6 @@ from qgis.core import (
     QgsGeometry,
     QgsPointXY,
     QgsProcessing,
-    QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingParameterBoolean,
     QgsProcessingParameterFeatureSink,
@@ -43,6 +42,7 @@ from qgis.core import (
     QgsProcessingParameterNumber,
     QgsWkbTypes,
 )
+from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_FIELD_ANY, PROCESSING_NUMBER_DOUBLE
 
 from ..kp_range_utils import (
@@ -62,7 +62,7 @@ class _Range:
     attrs: Dict[str, Any]
 
 
-class ExtractKPRangesRuleBasedAlgorithm(QgsProcessingAlgorithm):
+class ExtractKPRangesRuleBasedAlgorithm(SubseaCableAlgorithm):
     INPUT_RPL = 'INPUT_RPL'
 
     CATEGORY_FIELD = 'CATEGORY_FIELD'

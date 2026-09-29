@@ -17,6 +17,7 @@ import subprocess
 import sys
 import hashlib
 import time
+from contextlib import closing
 try:
     import pyodbc
 except Exception:  # pragma: no cover
@@ -24,7 +25,6 @@ except Exception:  # pragma: no cover
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessing,
-    QgsProcessingAlgorithm,
     QgsProcessingParameterMultipleLayers,
     QgsProcessingParameterCrs,
     QgsProcessingParameterFile,
@@ -38,6 +38,7 @@ from qgis.core import (
     QgsProcessingContext,
     QgsVectorFileWriter,
 )
+from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import (
     FIELD_TYPE_DOUBLE,
     FIELD_TYPE_INT,
@@ -198,7 +199,13 @@ def create_wkt(geom_type, vertices):
 
 
 def get_feature_tables(mdb_file, feedback):
-    """Retrieves feature tables and their geometry fields, handling variations in GFeatures."""
+    """Retrieves feature tables and their geometry fields, handling variations in GFeatures.
+
+    The ODBC helpers wrap the connection in ``contextlib.closing``: pyodbc's
+    own ``with connect(...)`` only commits/rolls back and leaves the
+    connection (and Access's ``.ldb`` lock file) open until garbage
+    collection. They only read, so no commit is needed.
+    """
     try:
         _require_access_odbc_driver(feedback)
     except QgsProcessingException as e:
@@ -207,7 +214,7 @@ def get_feature_tables(mdb_file, feedback):
     feature_tables = {}
     conn_str = _access_connection_string(mdb_file)
     try:
-        with pyodbc.connect(conn_str) as conn:
+        with closing(pyodbc.connect(conn_str)) as conn:
             cursor = conn.cursor()
             available_tables = [table_info.table_name for table_info in cursor.tables()]
             feedback.pushInfo(f"Available tables in MDB: {available_tables}")
@@ -285,7 +292,7 @@ def get_attribute_fields(mdb_file, table_name, feedback):
     attribute_fields = {}
     conn_str = _access_connection_string(mdb_file)
     try:
-        with pyodbc.connect(conn_str) as conn:
+        with closing(pyodbc.connect(conn_str)) as conn:
             cursor = conn.cursor()
             available_tables = [table_info.table_name for table_info in cursor.tables()]
             feedback.pushInfo(f"Available tables in MDB: {available_tables}")
@@ -387,7 +394,7 @@ def import_table_as_memory_layer(mdb_file, table_name, geom_field_name, geometry
 
     conn_str = _access_connection_string(mdb_file)
     try:
-        with pyodbc.connect(conn_str) as conn:
+        with closing(pyodbc.connect(conn_str)) as conn:
             cursor = conn.cursor()
             if not geom_field_name and geometry_type_code == GRAPHIC_TYPE_CODE:
                 # Text classes leave PrimaryGeometryFieldName empty in
@@ -631,7 +638,7 @@ def _write_to_temporary_gpkg(source_layer, layer_name, source_crs, context, feed
     )
 
 
-class ImportMdbAlgorithm(QgsProcessingAlgorithm):
+class ImportMdbAlgorithm(SubseaCableAlgorithm):
     INPUT_MDB = 'INPUT_MDB'
     # The stored key stays 'TARGET_CRS' so existing models and scripts keep
     # working. It has only ever assigned the CRS of the MDB coordinates.

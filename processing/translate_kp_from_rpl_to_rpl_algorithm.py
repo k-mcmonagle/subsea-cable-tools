@@ -17,18 +17,10 @@ Typical workflow:
          populated.
 """
 
-import os
-import sys
-plugin_dir = os.path.dirname(os.path.dirname(__file__))
-lib_dir = os.path.join(plugin_dir, 'lib')
-if lib_dir not in sys.path:
-    sys.path.insert(0, lib_dir)
-
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessing,
     QgsFeatureSink,
-    QgsProcessingAlgorithm,
     QgsProcessingParameterFeatureSource,
     QgsProcessingParameterFeatureSink,
     QgsProcessingParameterBoolean,
@@ -41,13 +33,14 @@ from qgis.core import (
     QgsWkbTypes,
     QgsProject
 )
+from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, GEOMETRY_POINT
 
 from .rpl_comparison_utils import RPLComparator
 from ..kp_geo_utils import get_features_skip_invalid
 
 
-class TranslateKPFromRPLToRPLAlgorithm(QgsProcessingAlgorithm):
+class TranslateKPFromRPLToRPLAlgorithm(SubseaCableAlgorithm):
     """
     Translate KP values from source RPL to target RPL using spatial proximity matching.
     
@@ -151,6 +144,10 @@ class TranslateKPFromRPLToRPLAlgorithm(QgsProcessingAlgorithm):
                 self.tr(f'Failed to initialize RPL Comparator: {str(e)}')
             )
 
+        if comparator.total_source_length_m <= 0:
+            raise QgsProcessingException(
+                self.tr('The source line layer has no usable line geometry.'))
+
         source_line_name = source_line.name()
 
         # Process each target point feature
@@ -170,10 +167,11 @@ class TranslateKPFromRPLToRPLAlgorithm(QgsProcessingAlgorithm):
             point_xy = point_geom.asPoint()
 
             try:
-                # Calculate KP on the design (source) route for this target point
-                design_kp = comparator.calculate_kp_to_point(point_xy, source=True)
-                # Distance Cross Course (perpendicular distance from the point to design route)
-                design_dcc = comparator.distance_cross_course(point_xy, source=True)
+                # KP on the design (source) route for this target point and the
+                # Distance Cross Course to it, from one nearest-point lookup.
+                hit = comparator.nearest_kp_hit(point_xy, source=True)
+                design_kp = hit.kp_km
+                design_dcc = hit.dcc_m
 
                 # Create output feature (keep original geometry)
                 out_feat = QgsFeature(output_fields)
@@ -195,7 +193,8 @@ class TranslateKPFromRPLToRPLAlgorithm(QgsProcessingAlgorithm):
                 features_skipped += 1
                 continue
 
-            feedback.setProgress(int((features_processed + features_skipped) / total_features * 100))
+            if total_features > 0:
+                feedback.setProgress(int((features_processed + features_skipped) / total_features * 100))
 
         # Report results
         feedback.pushInfo(

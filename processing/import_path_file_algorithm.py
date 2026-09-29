@@ -25,7 +25,6 @@ from qgis.core import (
     QgsGeometry,
     QgsPointXY,
     QgsProcessing,
-    QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingOutputMultipleLayers,
     QgsProcessingParameterCrs,
@@ -33,6 +32,7 @@ from qgis.core import (
     QgsVectorLayer,
 )
 
+from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import (
     FIELD_TYPE_DOUBLE,
     FIELD_TYPE_INT,
@@ -101,7 +101,7 @@ def _attribute_columns(rows, skip=("x", "y", "z", "vertices")):
     return [(name, [row.get(name) for row in rows]) for name in names]
 
 
-class ImportPathFileAlgorithm(QgsProcessingAlgorithm):
+class ImportPathFileAlgorithm(SubseaCableAlgorithm):
     INPUT_FILES = 'INPUT_FILES'
     CRS_OVERRIDE = 'CRS_OVERRIDE'
     OUTPUT_LAYERS = 'OUTPUT_LAYERS'

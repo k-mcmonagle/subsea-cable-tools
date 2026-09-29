@@ -8,7 +8,6 @@ This tool highlights KP ranges along a path.
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (QgsProcessing,
                        QgsFeatureSink,
-                       QgsProcessingAlgorithm,
                        QgsProcessingException,
                        QgsProcessingParameterFeatureSource,
                        QgsProcessingParameterFeatureSink,
@@ -20,6 +19,7 @@ from qgis.core import (QgsProcessing,
                        QgsDistanceArea,
                        QgsField,
                        QgsFields)
+from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_NUMBER_DOUBLE
 
 from ..kp_range_utils import (
@@ -30,7 +30,7 @@ from ..kp_range_utils import (
 )
 from ..kp_geo_utils import get_features_skip_invalid, ordered_route_geometry
 
-class KPRangeHighlighterAlgorithm(QgsProcessingAlgorithm):
+class KPRangeHighlighterAlgorithm(SubseaCableAlgorithm):
     """
     This algorithm highlights sections of an RPL line based on user-defined
     Kilometer Points (KPs).

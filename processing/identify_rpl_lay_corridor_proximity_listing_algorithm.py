@@ -43,18 +43,17 @@ from qgis.core import (
     QgsGeometry,
     QgsPointXY,
     QgsProcessing,
-    QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingLayerPostProcessorInterface,
     QgsProcessingParameterBoolean,
     QgsProcessingParameterFeatureSink,
     QgsProcessingParameterFeatureSource,
     QgsProcessingParameterMultipleLayers,
-    QgsProject,
     QgsSpatialIndex,
     QgsVectorLayer,
     QgsWkbTypes,
 )
+from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_STRING, GEOMETRY_LINE, GEOMETRY_POINT, GEOMETRY_POLYGON
 
 from .rpl_comparison_utils import RPLComparator
@@ -96,7 +95,7 @@ def _json_safe(value: Any) -> Any:
         return None
 
 
-class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
+class IdentifyRPLLayCorridorProximityListingAlgorithm(SubseaCableAlgorithm):
     INPUT_RPL = 'INPUT_RPL'
     INPUT_LAY_CORRIDOR = 'INPUT_LAY_CORRIDOR'
     INPUT_POINTS = 'INPUT_POINTS'
@@ -311,11 +310,7 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
 
         # Coordinate transform for lat/lon output (from output CRS)
         wgs84 = QgsCoordinateReferenceSystem('EPSG:4326')
-        try:
-            to_wgs84 = QgsCoordinateTransform(out_crs, wgs84, context.transformContext())
-        except Exception:
-            # Fallback: try project-based transform context
-            to_wgs84 = QgsCoordinateTransform(out_crs, wgs84, QgsProject.instance())
+        to_wgs84 = QgsCoordinateTransform(out_crs, wgs84, context.transformContext())
 
         corridor_index = QgsSpatialIndex()
         corridor_geoms: Dict[int, QgsGeometry] = {}
@@ -343,14 +338,11 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
                 corridor_union = next(iter(corridor_geoms.values())) if corridor_geoms else QgsGeometry()
 
         # Transform from output CRS to RPL CRS for KP/DCC on clipped geometries.
-        try:
-            out_to_rpl = (
-                None
-                if out_crs == rpl_crs
-                else QgsCoordinateTransform(out_crs, rpl_crs, context.transformContext())
-            )
-        except Exception:
-            out_to_rpl = None if out_crs == rpl_crs else QgsCoordinateTransform(out_crs, rpl_crs, QgsProject.instance())
+        out_to_rpl = (
+            None
+            if out_crs == rpl_crs
+            else QgsCoordinateTransform(out_crs, rpl_crs, context.transformContext())
+        )
 
         # KP/DCC calculator on RPL (in RPL CRS)
         try:
@@ -493,23 +485,16 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(QgsProcessingAlgorithm):
 
                 layer_crs = _layer_crs_or_fallback(lyr, label)
 
-                try:
-                    to_out = (
-                        None
-                        if layer_crs == out_crs
-                        else QgsCoordinateTransform(layer_crs, out_crs, context.transformContext())
-                    )
-                except Exception:
-                    to_out = QgsCoordinateTransform(layer_crs, out_crs, QgsProject.instance())
-
-                try:
-                    to_rpl = (
-                        None
-                        if layer_crs == rpl_crs
-                        else QgsCoordinateTransform(layer_crs, rpl_crs, context.transformContext())
-                    )
-                except Exception:
-                    to_rpl = QgsCoordinateTransform(layer_crs, rpl_crs, QgsProject.instance())
+                to_out = (
+                    None
+                    if layer_crs == out_crs
+                    else QgsCoordinateTransform(layer_crs, out_crs, context.transformContext())
+                )
+                to_rpl = (
+                    None
+                    if layer_crs == rpl_crs
+                    else QgsCoordinateTransform(layer_crs, rpl_crs, context.transformContext())
+                )
 
                 for feat in lyr.getFeatures():
                     if feedback.isCanceled():

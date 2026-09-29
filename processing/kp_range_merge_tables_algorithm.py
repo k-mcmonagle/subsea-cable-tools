@@ -29,7 +29,6 @@ from qgis.core import (
     QgsFields,
     QgsField,
     QgsProcessing,
-    QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingParameterBoolean,
     QgsProcessingParameterEnum,
@@ -41,6 +40,7 @@ from qgis.core import (
     QgsSettings,
     QgsWkbTypes,
 )
+from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, PROCESSING_FIELD_ANY, PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE
 from ..kp_geo_utils import get_features_skip_invalid
 
@@ -117,7 +117,7 @@ class _RangeSelector:
         return first_entry[-1]
 
 
-class KPRangeMergeTablesAlgorithm(QgsProcessingAlgorithm):
+class KPRangeMergeTablesAlgorithm(SubseaCableAlgorithm):
     INPUT_A = 'INPUT_A'
     A_START_FIELD = 'A_START_FIELD'
     A_END_FIELD = 'A_END_FIELD'

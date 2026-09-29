@@ -8,7 +8,6 @@ This tool plots line segments from a table layer with start and end lat/lon colu
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessing,
-    QgsProcessingAlgorithm,
     QgsProcessingParameterFeatureSource,
     QgsProcessingParameterField,
     QgsProcessingParameterBoolean,
@@ -25,10 +24,11 @@ from qgis.core import (
     QgsFeatureSink,
     QgsProcessingContext
 )
+from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import FIELD_TYPE_STRING, PROCESSING_FIELD_NUMERIC
 from ..kp_geo_utils import get_features_skip_invalid
 
-class PlotLineSegmentsFromTableAlgorithm(QgsProcessingAlgorithm):
+class PlotLineSegmentsFromTableAlgorithm(SubseaCableAlgorithm):
     INPUT_TABLE = 'INPUT_TABLE'
     START_LAT_FIELD = 'START_LAT_FIELD'
     START_LON_FIELD = 'START_LON_FIELD'
@@ -118,7 +118,7 @@ class PlotLineSegmentsFromTableAlgorithm(QgsProcessingAlgorithm):
         wgs84_crs = QgsCoordinateReferenceSystem('EPSG:4326')
         source_crs = table_layer.sourceCrs()
         if source_crs != wgs84_crs:
-            transform = QgsCoordinateTransform(source_crs, wgs84_crs, context.project())
+            transform = QgsCoordinateTransform(source_crs, wgs84_crs, context.transformContext())
         else:
             transform = None
 

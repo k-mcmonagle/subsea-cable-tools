@@ -7,6 +7,7 @@ This tool extracts Alter Course (A/C) points from an RPL line layer.
 
 import math
 from qgis.PyQt.QtCore import QCoreApplication
+from .algorithm_base import SubseaCableAlgorithm
 from ..kp_range_utils import (
     make_distance_area,
     add_distance_mode_parameter,
@@ -14,7 +15,6 @@ from ..kp_range_utils import (
 )
 from qgis.core import (QgsProcessing,
                        QgsFeatureSink,
-                       QgsProcessingAlgorithm,
                        QgsProcessingException,
                        QgsProcessingParameterFeatureSource,
                        QgsProcessingParameterNumber,
@@ -31,7 +31,7 @@ from qgis.core import (QgsProcessing,
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, GEOMETRY_LINE, PROCESSING_NUMBER_DOUBLE
 from ..kp_geo_utils import get_features_skip_invalid, ordered_route_geometry
 
-class ExtractACPointsAlgorithm(QgsProcessingAlgorithm):
+class ExtractACPointsAlgorithm(SubseaCableAlgorithm):
     INPUT_RPL = 'INPUT_RPL'
     MIN_AC_DEG = 'MIN_AC_DEG'
     BIN_EDGES_DEG = 'BIN_EDGES_DEG'

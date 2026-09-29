@@ -26,6 +26,7 @@ from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
+    QgsCsException,
     QgsFeature,
     QgsFeatureRequest,
     QgsFeatureSink,
@@ -33,17 +34,16 @@ from qgis.core import (
     QgsField,
     QgsGeometry,
     QgsProcessing,
-    QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingParameterBoolean,
     QgsProcessingParameterCrs,
     QgsProcessingParameterFeatureSink,
     QgsProcessingParameterFeatureSource,
     QgsProcessingParameterMultipleLayers,
-    QgsProject,
     QgsVectorLayer,
     QgsWkbTypes,
 )
+from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import FIELD_TYPE_LONG_LONG, FIELD_TYPE_STRING, GEOMETRY_LINE, GEOMETRY_POLYGON
 
 
@@ -69,7 +69,7 @@ def _unique_field_name(existing: Set[str], base: str) -> str:
         i += 1
 
 
-class ExtractLinesIntersectingPolygonsAlgorithm(QgsProcessingAlgorithm):
+class ExtractLinesIntersectingPolygonsAlgorithm(SubseaCableAlgorithm):
     INPUT_POLYGONS = 'INPUT_POLYGONS'
     INPUT_LINES = 'INPUT_LINES'
     TRIM_TO_POLYGONS = 'TRIM_TO_POLYGONS'
@@ -166,13 +166,11 @@ class ExtractLinesIntersectingPolygonsAlgorithm(QgsProcessingAlgorithm):
 
         poly_to_work: Optional[QgsCoordinateTransform]
         if poly_crs is not None and poly_crs.isValid() and poly_crs != work_crs:
-            try:
-                poly_to_work = QgsCoordinateTransform(poly_crs, work_crs, context.transformContext())
-            except Exception:
-                poly_to_work = QgsCoordinateTransform(poly_crs, work_crs, QgsProject.instance())
+            poly_to_work = QgsCoordinateTransform(poly_crs, work_crs, context.transformContext())
         else:
             poly_to_work = None
 
+        skipped_polygons = 0
         for feat in polygon_layer.getFeatures(QgsFeatureRequest().setSubsetOfAttributes([])):
             if feedback.isCanceled():
                 break
@@ -183,19 +181,29 @@ class ExtractLinesIntersectingPolygonsAlgorithm(QgsProcessingAlgorithm):
             if poly_to_work is not None:
                 try:
                     geom_work.transform(poly_to_work)
-                except Exception:
+                except QgsCsException:
+                    skipped_polygons += 1
                     continue
             poly_geoms_work.append(geom_work)
+        if skipped_polygons:
+            feedback.pushWarning(self.tr(
+                '{n} polygon(s) could not be reprojected to the working CRS and were '
+                'ignored; lines crossing only those polygons are not extracted.'
+            ).format(n=skipped_polygons))
 
         if not poly_geoms_work:
             feedback.pushInfo(self.tr('Polygon layer has no valid geometry; output will be empty.'))
 
-        try:
-            polygons_union_work = (
-                QgsGeometry.unaryUnion(poly_geoms_work) if len(poly_geoms_work) > 1 else (poly_geoms_work[0] if poly_geoms_work else QgsGeometry())
-            )
-        except Exception:
-            polygons_union_work = poly_geoms_work[0] if poly_geoms_work else QgsGeometry()
+        polygons_union_work = (
+            QgsGeometry.unaryUnion(poly_geoms_work) if len(poly_geoms_work) > 1 else (poly_geoms_work[0] if poly_geoms_work else QgsGeometry())
+        )
+        if len(poly_geoms_work) > 1 and (polygons_union_work is None or polygons_union_work.isEmpty()):
+            # GEOS could not union (e.g. invalid polygons). Test against every
+            # polygon rather than silently keeping only the first one.
+            feedback.pushWarning(self.tr(
+                'The polygons could not be merged (invalid geometry?); testing '
+                'against each polygon as a collection instead.'))
+            polygons_union_work = QgsGeometry.collectGeometry(poly_geoms_work)
 
         # Output fields: union of all input line fields
         out_fields = QgsFields()
@@ -246,10 +254,7 @@ class ExtractLinesIntersectingPolygonsAlgorithm(QgsProcessingAlgorithm):
         # Prepare transforms
         work_to_out: Optional[QgsCoordinateTransform]
         if work_crs != out_crs:
-            try:
-                work_to_out = QgsCoordinateTransform(work_crs, out_crs, context.transformContext())
-            except Exception:
-                work_to_out = QgsCoordinateTransform(work_crs, out_crs, QgsProject.instance())
+            work_to_out = QgsCoordinateTransform(work_crs, out_crs, context.transformContext())
         else:
             work_to_out = None
 
@@ -271,10 +276,7 @@ class ExtractLinesIntersectingPolygonsAlgorithm(QgsProcessingAlgorithm):
 
             line_to_work: Optional[QgsCoordinateTransform]
             if layer_crs != work_crs:
-                try:
-                    line_to_work = QgsCoordinateTransform(layer_crs, work_crs, context.transformContext())
-                except Exception:
-                    line_to_work = QgsCoordinateTransform(layer_crs, work_crs, QgsProject.instance())
+                line_to_work = QgsCoordinateTransform(layer_crs, work_crs, context.transformContext())
             else:
                 line_to_work = None
 

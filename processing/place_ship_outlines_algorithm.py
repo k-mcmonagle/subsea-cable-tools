@@ -8,7 +8,6 @@ Place a ship outline geometry at each point in a point layer, rotated to a headi
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessing,
-    QgsProcessingAlgorithm,
     QgsProcessingParameterFeatureSource,
     QgsProcessingParameterFeatureSink,
     QgsProcessingParameterField,
@@ -22,14 +21,14 @@ from qgis.core import (
     QgsGeometry,
     QgsWkbTypes,
     QgsCoordinateTransform,
-    QgsProject,
     QgsPointXY
 )
+from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import GEOMETRY_LINE, PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE, PROCESSING_NUMBER_INTEGER
 import os
 from ..kp_geo_utils import get_features_skip_invalid
 
-class PlaceShipOutlinesAlgorithm(QgsProcessingAlgorithm):
+class PlaceShipOutlinesAlgorithm(SubseaCableAlgorithm):
     SHIP_OUTLINE = 'SHIP_OUTLINE'
     POINTS = 'POINTS'
     HEADING_FIELD = 'HEADING_FIELD'
@@ -179,7 +178,7 @@ This tool places a ship outline geometry at each point in a point layer, with op
         # Prepare transformation if needed
         point_crs = point_source.sourceCrs()
         if point_crs != output_crs:
-            transform = QgsCoordinateTransform(point_crs, output_crs, QgsProject.instance())
+            transform = QgsCoordinateTransform(point_crs, output_crs, context.transformContext())
         else:
             transform = None
 
@@ -192,9 +191,12 @@ This tool places a ship outline geometry at each point in a point layer, with op
         outline_attrs = outline_features[0].attributes() if outline_features else []
     # Removed unused outline_field_names variable
 
+        total = point_source.featureCount()
         for i, point_feat in enumerate(get_features_skip_invalid(point_source)):
             if feedback.isCanceled():
                 break
+            if total > 0:
+                feedback.setProgress(int(100 * i / total))
             # Skip points based on interval (place at 0-based indices 0, interval, 2*interval, ...)
             if point_interval > 1 and (i % point_interval) != 0:
                 continue

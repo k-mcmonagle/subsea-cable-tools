@@ -155,11 +155,49 @@ def test_table_layer_input() -> bool:
     return _result("table-layer input handles positions too", ok)
 
 
+def test_indexed_route_matches_free_functions() -> bool:
+    """One indexed RouteFrame per run gives the same output as the per-row
+    walkers it replaced (kp_geo_utils.extract_line_segment / point_at_kp)."""
+    from ..kp_geo_utils import extract_line_segment, point_at_kp
+    from ..kp_range_utils import make_distance_area
+
+    vertices = [QgsPointXY(0.002 * i, _LAT + 0.0015 * ((i * 7) % 5)) for i in range(60)]
+    layer = QgsVectorLayer("LineString?crs=EPSG:4326", "zigzag", "memory")
+    feature = QgsFeature()
+    feature.setGeometry(QgsGeometry.fromPolylineXY(vertices))
+    layer.dataProvider().addFeatures([feature])
+    QgsProject.instance().addMapLayer(layer)
+    rows = ["Start\tEnd\tLabel"] + [f"{0.23 * k:.3f}\t{0.23 * k + 0.61:.3f}\tR{k}" for k in range(30)]
+    rows += [f"{0.5 * k:.3f}\t{0.5 * k:.3f}\tP{k}" for k in range(1, 15)]
+    ranges, points = _run({"INPUT_LINE": layer, "PASTED_RANGES": "\n".join(rows)})
+    ok = ranges is not None and points is not None
+    worst = 0.0
+    if ok:
+        geom = QgsGeometry.fromPolylineXY(vertices)
+        distance = make_distance_area(layer.crs())
+        for feat in ranges.getFeatures():
+            expected = extract_line_segment(geom, feat["start_kp"], feat["end_kp"], distance)
+            got = feat.geometry().asPolyline()
+            want = expected.asPolyline()
+            ok = ok and len(got) == len(want)
+            for a, b in zip(got, want):
+                worst = max(worst, abs(a.x() - b.x()), abs(a.y() - b.y()))
+        for feat in points.getFeatures():
+            expected = point_at_kp(geom, feat["start_kp"], distance, clamp=True)
+            got = feat.geometry().asPoint()
+            worst = max(worst, abs(got.x() - expected.x()), abs(got.y() - expected.y()))
+        ok = ok and ranges.featureCount() == 30 and points.featureCount() == 14 and worst < 1e-9
+    QgsProject.instance().removeMapLayer(layer.id())
+    return _result("indexed route gives the same ranges/points as the old walkers", ok,
+                   f"max coordinate difference {worst:.2e} deg")
+
+
 def run_all():
     return [
         test_equal_kps_become_points(),
         test_point_tolerance(),
         test_table_layer_input(),
+        test_indexed_route_matches_free_functions(),
     ]
 
 

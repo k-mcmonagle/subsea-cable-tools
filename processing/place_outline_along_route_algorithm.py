@@ -11,25 +11,26 @@ so grid convergence is handled implicitly.
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform,
+    QgsCsException,
     QgsFeature,
     QgsField,
     QgsFields,
     QgsGeometry,
     QgsProcessing,
-    QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingParameterFeatureSink,
     QgsProcessingParameterFeatureSource,
     QgsProcessingParameterNumber,
     QgsProcessingParameterString,
     QgsProcessingParameterVectorLayer,
-    QgsProject,
     QgsWkbTypes,
 )
 
+from .algorithm_base import SubseaCableAlgorithm
 from ..burial import footprint
 from ..burial import geometry2d
-from ..kp_geo_utils import RouteFrame
+from ..kp_geo_utils import RouteFrame, get_features_skip_invalid
 from ..kp_range_utils import make_kp_distance_area
 from ..qgis_compat import (
     FIELD_TYPE_DOUBLE,
@@ -40,7 +41,7 @@ from ..qgis_compat import (
 _WGS84 = "EPSG:4326"
 
 
-class PlaceOutlineAlongRouteAlgorithm(QgsProcessingAlgorithm):
+class PlaceOutlineAlongRouteAlgorithm(SubseaCableAlgorithm):
     OUTLINE = "OUTLINE"
     ROUTE = "ROUTE"
     KPS = "KPS"
@@ -158,13 +159,26 @@ in EPSG:4326 with kp / heading_deg / source attributes.
         # KP-tools convention, so KPs here match the rest of the plugin.
         wgs84 = QgsCoordinateReferenceSystem(_WGS84)
         distance = make_kp_distance_area(
-            wgs84, context.transformContext(),
-            project=context.project() or QgsProject.instance())
+            wgs84, context.transformContext(), project=context.project())
+        # Reproject with the run's transform context (not the project
+        # singleton, which must not be touched from the worker thread).
+        to_wgs84 = QgsCoordinateTransform(
+            route_source.sourceCrs(), wgs84, context.transformContext())
+        route_geoms = []
+        for feat in get_features_skip_invalid(route_source):
+            geom = feat.geometry()
+            if geom is None or geom.isEmpty():
+                continue
+            geom = QgsGeometry(geom)
+            try:
+                geom.transform(to_wgs84)
+            except QgsCsException as exc:
+                raise QgsProcessingException(
+                    f"The route could not be reprojected to WGS84: {exc}")
+            route_geoms.append(geom)
         try:
             route = RouteFrame.from_source(
-                route_source, distance, target_crs=wgs84,
-                project=context.project() or QgsProject.instance(),
-                follow_stored_geometry=True)
+                route_geoms, distance, follow_stored_geometry=True)
         except Exception as exc:
             raise QgsProcessingException(
                 f"The route could not be prepared: {exc}")

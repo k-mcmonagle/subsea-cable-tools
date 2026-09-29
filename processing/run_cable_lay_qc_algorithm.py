@@ -25,7 +25,6 @@ from qgis.core import (
     QgsFeatureSink,
     QgsGeometry,
     QgsProcessing,
-    QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingParameterBoolean,
     QgsProcessingParameterEnum,
@@ -37,6 +36,7 @@ from qgis.core import (
     QgsWkbTypes,
 )
 
+from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import (
     PROCESSING_FIELD_ANY,
     PROCESSING_NUMBER_DOUBLE,
@@ -47,7 +47,7 @@ from ..laydata.qc_checks import ALL_CHECKS
 from . import cable_lay_parsers as clp
 
 
-class RunCableLayQcAlgorithm(QgsProcessingAlgorithm):
+class RunCableLayQcAlgorithm(SubseaCableAlgorithm):
     INPUT = "INPUT"
     CHECKS = "CHECKS"
     EXPECTED_INTERVAL = "EXPECTED_INTERVAL"
@@ -240,7 +240,15 @@ repeatable workflow that travels with the project.</p>
             checks.append((check_cls(), params_by_id.get(check_cls.check_id)))
 
         runner = QcRunner(dataset)
-        findings = runner.run(checks)
+        # Checks run one after another: report progress per check (first 80%)
+        # and stop between checks when the user cancels.
+        findings = runner.run(
+            checks,
+            progress=lambda done, total, _check_id: feedback.setProgress(80.0 * done / max(total, 1)),
+            is_canceled=feedback.isCanceled,
+        )
+        if feedback.isCanceled():
+            return {}
         feedback.pushInfo(self.tr("QC produced {n} finding(s).").format(n=len(findings)))
 
         run_id = uuid.uuid4().hex[:12]
@@ -258,7 +266,10 @@ repeatable workflow that travels with the project.</p>
             layer.crs() if layer.crs().isValid() else None,
         )
         if sink is not None:
-            for row in rows:
+            for index, row in enumerate(rows):
+                if feedback.isCanceled():
+                    return {}
+                feedback.setProgress(80.0 + 20.0 * index / max(len(rows), 1))
                 feature = QgsFeature(fields)
                 for i, field in enumerate(fields):
                     feature.setAttribute(i, row.get(field.name()))

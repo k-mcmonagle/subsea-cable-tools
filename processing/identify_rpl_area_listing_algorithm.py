@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from qgis.PyQt.QtCore import QCoreApplication
+from .algorithm_base import SubseaCableAlgorithm
 from ..kp_range_utils import make_kp_distance_area
 from qgis.core import (
     QgsCoordinateReferenceSystem,
@@ -34,7 +35,6 @@ from qgis.core import (
     QgsPoint,
     QgsPointXY,
     QgsProcessing,
-    QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingLayerPostProcessorInterface,
     QgsProcessingParameterFeatureSink,
@@ -134,13 +134,14 @@ def _extract_lines(geom: QgsGeometry) -> List[QgsGeometry]:
         except Exception:
             return []
 
-    if QgsWkbTypes.isGeometryCollection(geom.wkbType()):
+    # A route that runs through an area and also touches its boundary comes
+    # back as a GeometryCollection (lines + points). QgsWkbTypes has no
+    # isGeometryCollection(), so recurse into the parts of any multi-part
+    # result instead; asGeometryCollection() yields single-part geometries.
+    if geom.isMultipart():
         out: List[QgsGeometry] = []
-        try:
-            for part in geom.asGeometryCollection():
-                out.extend(_extract_lines(part))
-        except Exception:
-            return []
+        for part in geom.asGeometryCollection():
+            out.extend(_extract_lines(part))
         return out
 
     return []
@@ -256,7 +257,7 @@ def _endpoints_xy(line_geom: QgsGeometry) -> Optional[Tuple[QgsPointXY, QgsPoint
     return best[1], best[2]
 
 
-class IdentifyRPLAreaListingAlgorithm(QgsProcessingAlgorithm):
+class IdentifyRPLAreaListingAlgorithm(SubseaCableAlgorithm):
     INPUT_RPL = 'INPUT_RPL'
     INPUT_AREAS = 'INPUT_AREAS'
     OUTPUT = 'OUTPUT'
@@ -363,6 +364,7 @@ class IdentifyRPLAreaListingAlgorithm(QgsProcessingAlgorithm):
 
         total = len(rpl_infos)
         written = 0
+        skipped_areas = 0
 
         for idx, info in enumerate(rpl_infos):
             if feedback.isCanceled():
@@ -406,12 +408,11 @@ class IdentifyRPLAreaListingAlgorithm(QgsProcessingAlgorithm):
 
                     try:
                         area_geom.transform(to_rpl)
-                    except Exception:
-                        continue
-
-                    try:
                         inter = rpl_geom.intersection(area_geom)
                     except Exception:
+                        # A skipped area means route sections missing from
+                        # the listing: count it and say so below.
+                        skipped_areas += 1
                         continue
 
                     line_parts = _extract_lines(inter)
@@ -493,6 +494,11 @@ class IdentifyRPLAreaListingAlgorithm(QgsProcessingAlgorithm):
                         written += 1
 
         feedback.pushInfo(f"Created {written} segment(s) from polygon intersections.")
+        if skipped_areas:
+            feedback.pushWarning(
+                f"{skipped_areas} area feature(s) could not be reprojected into the "
+                "RPL CRS or intersected with it and were skipped; route sections "
+                "inside them are missing from the listing.")
 
         # Dynamic output naming
         self.renamer = Renamer(f"{rpl_layer_name}_Area_Listing")

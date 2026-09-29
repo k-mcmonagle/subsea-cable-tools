@@ -8,7 +8,7 @@ Import a ship outline from a DXF file, with user-defined scale, rotation, and CR
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessing,
-    QgsProcessingAlgorithm,
+    QgsProcessingException,
     QgsProcessingParameterFile,
     QgsProcessingParameterEnum,
     QgsProcessingParameterNumber,
@@ -27,6 +27,7 @@ from qgis.core import (
     QgsPointXY,
     QgsProcessingLayerPostProcessorInterface
 )
+from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, GEOMETRY_LINE, PROCESSING_NUMBER_DOUBLE
 import os
 
@@ -38,7 +39,7 @@ class Renamer(QgsProcessingLayerPostProcessorInterface):
     def postProcessLayer(self, layer, context, feedback):
         layer.setName(self.name)
 
-class ImportShipOutlineAlgorithm(QgsProcessingAlgorithm):
+class ImportShipOutlineAlgorithm(SubseaCableAlgorithm):
     INPUT_DXF = 'INPUT_DXF'
     SCALE = 'SCALE'
     ROTATION = 'ROTATION'
@@ -168,7 +169,7 @@ This tool imports a ship outline from a DXF file and creates a polygon or polyli
         # Load the DXF as a temporary layer
         dxf_layer = QgsVectorLayer(dxf_path, 'ship_outline', 'ogr')
         if not dxf_layer.isValid():
-            raise Exception('Failed to load DXF file.')
+            raise QgsProcessingException('Failed to load DXF file.')
 
         # Reproject features if DXF CRS is different from output CRS
         dxf_crs = dxf_layer.crs() if dxf_layer.crs().isValid() else QgsCoordinateReferenceSystem('EPSG:3857')
@@ -199,7 +200,11 @@ This tool imports a ship outline from a DXF file and creates a polygon or polyli
         # Transform and merge features
         from math import radians, cos, sin
         geoms = []
-        for feat in dxf_layer.getFeatures():
+        total = max(dxf_layer.featureCount(), 1)
+        for index, feat in enumerate(dxf_layer.getFeatures()):
+            if feedback.isCanceled():
+                return {}
+            feedback.setProgress(50.0 * index / total)
             geom = feat.geometry()
             if geom.isEmpty():
                 continue
@@ -210,11 +215,14 @@ This tool imports a ship outline from a DXF file and creates a polygon or polyli
             geoms.append(geom)
 
         if not geoms:
-            raise Exception('No valid geometry in DXF file.')
+            raise QgsProcessingException('No valid geometry in DXF file.')
 
         # Merge all geometries into one
         merged_geom = geoms[0]
-        for g in geoms[1:]:
+        for index, g in enumerate(geoms[1:], start=1):
+            if feedback.isCanceled():
+                return {}
+            feedback.setProgress(50.0 + 50.0 * index / len(geoms))
             merged_geom = merged_geom.combine(g)
 
         out_feat = QgsFeature(fields)

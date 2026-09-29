@@ -3,13 +3,17 @@
 
 from __future__ import annotations
 
+import bisect
 from typing import List, Optional, Sequence, Tuple
 
 from qgis.PyQt.QtCore import QCoreApplication
+from .algorithm_base import SubseaCableAlgorithm
 from ..kp_range_utils import make_distance_area
 from qgis.core import (
     QgsCoordinateTransform,
+    QgsCoordinateTransformContext,
     QgsCoordinateReferenceSystem,
+    QgsCsException,
     QgsDistanceArea,
     QgsFeature,
     QgsFeatureSink,
@@ -20,7 +24,6 @@ from qgis.core import (
     QgsPointXY,
     QgsFeatureRequest,
     QgsProcessing,
-    QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingParameterBoolean,
     QgsProcessingParameterEnum,
@@ -31,7 +34,6 @@ from qgis.core import (
     QgsProcessingParameterVectorLayer,
     QgsProcessingParameterFeatureSource,
     QgsProcessingParameterFeatureSink,
-    QgsProject,
     QgsRasterLayer,
     QgsVectorLayer,
     QgsWkbTypes,
@@ -41,7 +43,7 @@ from . import depth_sampling
 from ..kp_geo_utils import get_features_skip_invalid
 
 
-class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
+class DynamicBufferLayCorridorAlgorithm(SubseaCableAlgorithm):
     """Creates a buffer (lay corridor) around a route line.
 
     Corridor width can be fixed (classic buffer) or dynamic based on sampled water depth.
@@ -327,9 +329,14 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
         # We therefore do sampling + buffering in a projected working CRS (meters), then transform results back.
         features_preview = list(get_features_skip_invalid(source, QgsFeatureRequest().setLimit(1)))
         preview_geom = features_preview[0].geometry() if features_preview else None
-        working_crs = self._select_working_crs(source_crs, preview_geom)
-        to_working = QgsCoordinateTransform(source_crs, working_crs, QgsProject.instance()) if working_crs != source_crs else None
-        to_source = QgsCoordinateTransform(working_crs, source_crs, QgsProject.instance()) if working_crs != source_crs else None
+        transform_context = context.transformContext()
+        working_crs = self._select_working_crs(source_crs, preview_geom, transform_context)
+        if working_crs != source_crs and working_crs.authid() == 'EPSG:3857':
+            feedback.pushWarning(self.tr(
+                'Could not choose a UTM zone for the route; buffering in Web Mercator, '
+                'where buffer distances grow away from the equator.'))
+        to_working = QgsCoordinateTransform(source_crs, working_crs, transform_context) if working_crs != source_crs else None
+        to_source = QgsCoordinateTransform(working_crs, source_crs, transform_context) if working_crs != source_crs else None
 
         # Distance calculator in working CRS
         distance_area = make_distance_area(
@@ -352,12 +359,17 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
         )
 
         # Build depth samplers
-        raster_samplers = self._build_raster_samplers(raster_layers, source_crs)
+        raster_samplers = self._build_raster_samplers(raster_layers, source_crs, transform_context)
         contour_samplers = self._build_contour_samplers(
             [contour_layer_1, contour_layer_2],
             [contour_depth_field_1, contour_depth_field_2],
             source_crs,
-        )
+            transform_context,
+            context.project(),
+        ) if mode == 1 else []
+        # Stations that could not be taken back to the source CRS are sampled
+        # as "no depth" (missing-depth buffer) rather than in the wrong CRS.
+        untransformed_stations = 0
 
         # Collect per-feature corridor geometries (for dissolve)
         corridor_geoms: List[QgsGeometry] = []
@@ -406,22 +418,26 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
                 # Pre-sample depth at stations
                 station_depths: List[Optional[float]] = []
                 for pt in sampled:
+                    if feedback.isCanceled():
+                        break
                     depth = None
                     if mode == 1:
                         pt_source = pt
                         if to_source is not None:
                             try:
                                 pt_source = to_source.transform(pt)
-                            except Exception:
-                                pt_source = pt
-                        depth = self._sample_depth(
-                            pt_source,
-                            depth_source_mode,
-                            raster_samplers,
-                            contour_samplers,
-                            contour_search_radius_m,
-                            context,
-                        )
+                            except QgsCsException:
+                                pt_source = None
+                                untransformed_stations += 1
+                        if pt_source is not None:
+                            depth = self._sample_depth(
+                                pt_source,
+                                depth_source_mode,
+                                raster_samplers,
+                                contour_samplers,
+                                contour_search_radius_m,
+                                context,
+                            )
                         if depth is not None and use_abs_depth:
                             depth = abs(float(depth))
                     station_depths.append(depth)
@@ -429,6 +445,8 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
                         depth_samples_total += 1
                         if depth is not None:
                             depth_samples_ok += 1
+                if feedback.isCanceled():
+                    break
 
                 # Buffer each small segment
                 for i in range(len(sampled) - 1):
@@ -454,16 +472,18 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
                             if to_source is not None:
                                 try:
                                     mid_source = to_source.transform(mid)
-                                except Exception:
-                                    mid_source = mid
-                            depth_mid = self._sample_depth(
-                                mid_source,
-                                depth_source_mode,
-                                raster_samplers,
-                                contour_samplers,
-                                contour_search_radius_m,
-                                context,
-                            )
+                                except QgsCsException:
+                                    mid_source = None
+                                    untransformed_stations += 1
+                            if mid_source is not None:
+                                depth_mid = self._sample_depth(
+                                    mid_source,
+                                    depth_source_mode,
+                                    raster_samplers,
+                                    contour_samplers,
+                                    contour_search_radius_m,
+                                    context,
+                                )
                             if depth_mid is not None and use_abs_depth:
                                 depth_mid = abs(float(depth_mid))
 
@@ -524,6 +544,10 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
                 out.setGeometry(self._as_multipolygon(merged))
                 sink.addFeature(out, QgsFeatureSink.FastInsert)
 
+        if untransformed_stations:
+            feedback.pushWarning(self.tr(
+                '{n} sample station(s) could not be transformed back to the input CRS; '
+                'they were treated as missing depth.').format(n=untransformed_stations))
         feedback.setProgress(100)
         return {self.OUTPUT: dest_id}
 
@@ -633,10 +657,23 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
         if total_length_m <= 0:
             return list(points)
 
+        # Measure every segment once, then bisect per station: re-walking the
+        # part for each station made long, densely sampled routes quadratic.
+        segs: List[Tuple[QgsPointXY, QgsPointXY, float, float]] = []
+        seg_end: List[float] = []
+        cumulative = 0.0
+        for i in range(len(points) - 1):
+            seg = distance_area.measureLine(points[i], points[i + 1])
+            if seg <= 0:
+                continue
+            segs.append((points[i], points[i + 1], cumulative, seg))
+            cumulative += seg
+            seg_end.append(cumulative)
+
         sampled: List[QgsPointXY] = []
         dist = 0.0
         while dist <= total_length_m:
-            pt = DynamicBufferLayCorridorAlgorithm._interpolate_point_along_points(points, dist, distance_area)
+            pt = DynamicBufferLayCorridorAlgorithm._interpolate_from_segments(points, segs, seg_end, dist)
             if pt is not None:
                 if not sampled or pt != sampled[-1]:
                     sampled.append(pt)
@@ -649,51 +686,53 @@ class DynamicBufferLayCorridorAlgorithm(QgsProcessingAlgorithm):
         return sampled
 
     @staticmethod
-    def _interpolate_point_along_points(
+    def _interpolate_from_segments(
         points: Sequence[QgsPointXY],
+        segs: Sequence[Tuple[QgsPointXY, QgsPointXY, float, float]],
+        seg_end: Sequence[float],
         distance_m: float,
-        distance_area: QgsDistanceArea,
     ) -> Optional[QgsPointXY]:
+        """Point ``distance_m`` along ``points`` from pre-measured segments.
+
+        ``segs`` holds ``(p0, p1, chainage at p0, length)`` for every
+        positive-length segment and ``seg_end`` the chainage at each p1.
+        """
         if not points:
             return None
         if distance_m <= 0:
             return points[0]
-
-        cumulative = 0.0
-        for i in range(len(points) - 1):
-            p0 = points[i]
-            p1 = points[i + 1]
-            seg = distance_area.measureLine(p0, p1)
-            if seg <= 0:
-                continue
-            if cumulative + seg >= distance_m:
-                r = (distance_m - cumulative) / seg
-                return QgsPointXY(p0.x() + r * (p1.x() - p0.x()), p0.y() + r * (p1.y() - p0.y()))
-            cumulative += seg
-
-        return points[-1]
+        j = bisect.bisect_left(seg_end, distance_m)
+        if j >= len(segs):
+            return points[-1]
+        p0, p1, cumulative, seg = segs[j]
+        r = (distance_m - cumulative) / seg
+        return QgsPointXY(p0.x() + r * (p1.x() - p0.x()), p0.y() + r * (p1.y() - p0.y()))
 
     @staticmethod
     def _build_raster_samplers(
         rasters: Sequence[QgsRasterLayer],
         line_crs,
+        transform_context=None,
     ) -> List[Tuple[QgsRasterLayer, Optional[QgsCoordinateTransform]]]:
-        return depth_sampling.build_raster_samplers(rasters, line_crs)
+        return depth_sampling.build_raster_samplers(rasters, line_crs, transform_context)
 
     @staticmethod
     def _build_contour_samplers(
         contour_layers: Sequence[Optional[QgsVectorLayer]],
         depth_fields: Sequence[str],
         line_crs,
-    ) -> List[Tuple[QgsVectorLayer, str, Optional[QgsCoordinateTransform]]]:
-        return depth_sampling.build_contour_samplers(contour_layers, depth_fields, line_crs)
+        transform_context=None,
+        project=None,
+    ) -> List[depth_sampling.ContourSampler]:
+        return depth_sampling.build_contour_samplers(
+            contour_layers, depth_fields, line_crs, transform_context, project)
 
     @staticmethod
     def _sample_depth(
         point: QgsPointXY,
         depth_source_mode: int,
         raster_samplers: Sequence[Tuple[QgsRasterLayer, Optional[QgsCoordinateTransform]]],
-        contour_samplers: Sequence[Tuple[QgsVectorLayer, str, Optional[QgsCoordinateTransform]]],
+        contour_samplers: Sequence[depth_sampling.ContourSampler],
         contour_search_radius_m: float,
         context,
     ) -> Optional[float]:
@@ -741,6 +780,7 @@ Missing depth handling:
     def _select_working_crs(
         source_crs: QgsCoordinateReferenceSystem,
         preview_geom: Optional[QgsGeometry],
+        transform_context=None,
     ) -> QgsCoordinateReferenceSystem:
         """Pick a projected CRS suitable for meter-based buffering.
 
@@ -753,8 +793,10 @@ Missing depth handling:
 
         # Try to determine UTM zone using transformation to WGS84
         wgs84 = QgsCoordinateReferenceSystem('EPSG:4326')
+        if transform_context is None:
+            transform_context = QgsCoordinateTransformContext()
         try:
-            to_wgs = QgsCoordinateTransform(source_crs, wgs84, QgsProject.instance())
+            to_wgs = QgsCoordinateTransform(source_crs, wgs84, transform_context)
             if preview_geom and not preview_geom.isEmpty():
                 c = preview_geom.centroid().asPoint() if not preview_geom.centroid().isEmpty() else None
                 src_pt = QgsPointXY(c) if c is not None else QgsPointXY(0.0, 0.0)
@@ -770,8 +812,8 @@ Missing depth handling:
             utm = QgsCoordinateReferenceSystem(f'EPSG:{epsg}')
             if utm.isValid():
                 return utm
-        except Exception:
-            pass
+        except QgsCsException:
+            pass  # reported by the caller when Web Mercator is used
 
         # Robust fallback: meters, global
         merc = QgsCoordinateReferenceSystem('EPSG:3857')

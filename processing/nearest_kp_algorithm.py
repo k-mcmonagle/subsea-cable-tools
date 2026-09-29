@@ -9,11 +9,11 @@ NearestKP identifies the nearest KP on specified paths for each point feature in
  attributes.
 
  Note:
- Both input layers (Points and Paths) must use the same Coordinate Reference System (CRS).
- This ensures accurate distance and bearing calculations.
+ Points in a different CRS are reprojected to the Paths CRS for measurement.
 """
 
 from qgis.PyQt.QtCore import QCoreApplication
+from .algorithm_base import SubseaCableAlgorithm
 from ..kp_range_utils import (
     make_distance_area,
     add_distance_mode_parameter,
@@ -22,28 +22,27 @@ from ..kp_range_utils import (
 from qgis.core import (
     QgsProcessing,
     QgsFeatureSink,
-    QgsProcessingAlgorithm,
+    QgsProcessingException,
     QgsProcessingParameterFeatureSource,
     QgsProcessingParameterFeatureSink,
     QgsProcessingParameterBoolean,
     QgsCoordinateTransform,
+    QgsCsException,
     QgsFeature,
     QgsGeometry,
     QgsPointXY,
-    QgsDistanceArea,
     QgsField,
     QgsWkbTypes,
-    QgsProject,
     QgsFields,
-    QgsVectorLayer
 )
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_STRING
 
 import math
-from ..kp_geo_utils import get_features_skip_invalid
+from ..kp_geo_utils import RouteFrame, get_features_skip_invalid, ordered_route_features
+from .rpl_comparison_utils import signed_dcc
 
 
-class NearestKPAlgorithm(QgsProcessingAlgorithm):
+class NearestKPAlgorithm(SubseaCableAlgorithm):
     """
     NearestKP Algorithm.
 
@@ -53,8 +52,7 @@ class NearestKPAlgorithm(QgsProcessingAlgorithm):
     that places a point directly on the path, carrying the attributes of the input points and additional range and bearing information.
 
     Note:
-    Both input layers (Points and Paths) must use the same Coordinate Reference System (CRS).
-    This ensures accurate distance and bearing calculations.
+    Points in a different CRS are reprojected to the Paths CRS for measurement.
     """
 
     # Constants used to refer to parameters and outputs.
@@ -155,7 +153,7 @@ class NearestKPAlgorithm(QgsProcessingAlgorithm):
                     paths_crs=paths_crs.authid() or paths_crs.description(),
                 )
             )
-            points_to_paths_xform = QgsCoordinateTransform(points_crs, paths_crs, context.project())
+            points_to_paths_xform = QgsCoordinateTransform(points_crs, paths_crs, context.transformContext())
 
         # Get the name of the input paths layer for kp_ref
         paths_layer_name = paths_layer.name()
@@ -206,22 +204,14 @@ class NearestKPAlgorithm(QgsProcessingAlgorithm):
         except ValueError as exc:
             raise QgsProcessingException(str(exc))
 
-        # Cache path features/geometries once (avoids re-iterating provider for every point)
-        # and compute cumulative offsets so KP is relative to the whole input RPL layer
-        # (matching KP Mouse Map Tool behaviour for multi-feature RPLs).
-        path_features = list(get_features_skip_invalid(paths_source))
-        path_geoms = []
-        path_ids = []
-        path_offsets_m = []
-        cumulative_m = 0.0
-        for path_feature in path_features:
-            geom = path_feature.geometry()
-            if geom is None or geom.isEmpty():
-                continue
-            path_geoms.append(geom)
-            path_ids.append(path_feature.id())
-            path_offsets_m.append(cumulative_m)
-            cumulative_m += float(distance_calculator.measureLength(geom))
+        # One indexed route over the path features in chainage order (SeqNo,
+        # else layer order), so KP is continuous across a multi-feature RPL
+        # and uses the plugin's single KP definition (kp_geo_utils.RouteFrame).
+        path_features = ordered_route_features(get_features_skip_invalid(paths_source))
+        path_ids = [f.id() for f in path_features]
+        route = RouteFrame.from_source(
+            [QgsGeometry(f.geometry()) for f in path_features], distance_calculator)
+        path_geoms = route.geometries
 
         total_features = points_source.featureCount()
         processed_features = 0
@@ -241,7 +231,7 @@ class NearestKPAlgorithm(QgsProcessingAlgorithm):
             if points_to_paths_xform is not None:
                 try:
                     measure_point_geom.transform(points_to_paths_xform)
-                except Exception:
+                except QgsCsException:
                     feedback.pushWarning(
                         self.tr('Failed to reproject point id={fid} to Paths CRS; skipping.').format(
                             fid=point_feature.id()
@@ -249,35 +239,18 @@ class NearestKPAlgorithm(QgsProcessingAlgorithm):
                     )
                     continue
 
-            point_xy = measure_point_geom.asPoint()
-            
-            nearest_dist = float('inf')
-            nearest_dist_signed = None
-            nearest_pt_geom = None
-            nearest_path_id = None
-            nearest_kp = None
-            nearest_path_geom = None
-
-            # Iterate through cached paths to find the nearest point
-            for idx, path_geom in enumerate(path_geoms):
-                # Improved segment-by-segment approach to find the truly nearest point
-                result = self.find_nearest_point_on_path(
-                    path_geom,
-                    QgsPointXY(point_xy),
-                    distance_calculator,
-                    base_distance_m=path_offsets_m[idx],
-                )
-
-                if result['distance'] < nearest_dist:
-                    nearest_dist = result['distance']
-                    nearest_dist_signed = result.get('distance_signed', result['distance'])
-                    nearest_pt_geom = result['point_geometry']
-                    nearest_path_id = path_ids[idx]
-                    nearest_kp = result['kp']
-                    nearest_path_geom = path_geom
+            point_xy = QgsPointXY(measure_point_geom.asPoint())
+            hit = route.kp_at_point(point_xy)
 
             # If a nearest point is found, create new features in both output layers
-            if nearest_pt_geom:
+            if hit.snapped_xy is not None:
+                nearest_path_id = path_ids[hit.feature_index]
+                nearest_kp = hit.kp_km
+                nearest_dist = hit.dcc_m
+                nearest_dist_signed = signed_dcc(
+                    path_geoms[hit.feature_index], point_xy, hit.snapped_xy, hit.dcc_m)
+                snapped_xy = QgsPointXY(hit.snapped_xy)
+
                 # === Create Output Point Feature ===
                 new_point_feature = QgsFeature()
                 new_point_feature.setGeometry(point_geom)
@@ -287,7 +260,7 @@ class NearestKPAlgorithm(QgsProcessingAlgorithm):
 
                 # Append new attributes: path_id, distance, kp, kp_ref
                 attrs.append(nearest_path_id)
-                attrs.append(round(float(nearest_dist_signed if nearest_dist_signed is not None else nearest_dist), 3))  # Signed DCC (m)
+                attrs.append(round(float(nearest_dist_signed), 3))  # Signed DCC (m)
                 attrs.append(round(nearest_kp, 3))    # Rounded to 3 decimal places
                 attrs.append(paths_layer_name)        # kp_ref
 
@@ -295,10 +268,7 @@ class NearestKPAlgorithm(QgsProcessingAlgorithm):
                 points_sink.addFeature(new_point_feature, QgsFeatureSink.FastInsert)
 
                 # === Create Output Line Feature ===
-                line_geom = QgsGeometry.fromPolylineXY([
-                    QgsPointXY(point_xy),
-                    nearest_pt_geom.asPoint()
-                ])
+                line_geom = QgsGeometry.fromPolylineXY([point_xy, snapped_xy])
                 new_line_feature = QgsFeature()
                 new_line_feature.setGeometry(line_geom)
 
@@ -306,7 +276,7 @@ class NearestKPAlgorithm(QgsProcessingAlgorithm):
                 line_attrs = [
                     point_feature.id(),
                     nearest_path_id,
-                    round(float(nearest_dist_signed if nearest_dist_signed is not None else nearest_dist), 3),
+                    round(float(nearest_dist_signed), 3),
                     round(nearest_kp, 3),
                     paths_layer_name
                 ]
@@ -316,24 +286,16 @@ class NearestKPAlgorithm(QgsProcessingAlgorithm):
                 # === Create Point on Line Feature (if requested) ===
                 if add_point_on_line and point_on_line_sink:
                     new_polin_feature = QgsFeature()
-                    new_polin_feature.setGeometry(nearest_pt_geom)
+                    new_polin_feature.setGeometry(QgsGeometry.fromPointXY(snapped_xy))
 
                     # Prepare attributes: copy all original attributes
                     polin_attrs = point_feature.attributes()
 
-                    # Calculate range and bearing
-                    original_point = point_xy
-                    point_on_line = nearest_pt_geom.asPoint()
-
-                    # Calculate range (distance back to original point in meters)
-                    # Range is always positive (absolute distance)
+                    # Range is always positive (absolute distance back to the point, m)
                     range_to_target = float(nearest_dist)
 
                     # Calculate bearing (absolute bearing clockwise from north as 0 degrees)
-                    bearing_to_target = self.calculate_bearing(
-                        QgsPointXY(point_on_line),
-                        QgsPointXY(original_point)
-                    )
+                    bearing_to_target = self.calculate_bearing(snapped_xy, point_xy)
                     bearing_to_target = round(bearing_to_target, 3)  # Rounded to 3 decimal places
 
                     # Append kp_ref, range, bearing, and kp_km
@@ -364,14 +326,16 @@ class NearestKPAlgorithm(QgsProcessingAlgorithm):
     def shortHelpString(self):
         return self.tr("""<p>This tool identifies the nearest Kilometer Point (KP) on a line layer for each point in a point layer. It produces a new point layer with KP and distance attributes, a line layer connecting points to their nearest location on the line, and an optional snapped point layer.</p>
 
-<p><b>Important:</b> Both input layers must have the same Coordinate Reference System (CRS) to ensure accurate distance calculations. The tool will show an error and stop if the CRSs do not match.</p>
+<p><b>CRS:</b> points in a different CRS from the line layer are reprojected to the line layer's CRS for measurement; the output points keep their own CRS.</p>
+
+<p><b>KP and DCC:</b> KP is continuous across a multi-feature line layer (features in SeqNo order when the layer has one, otherwise layer order), measured with the plugin's shared KP definition. <i>distance_to_path_m</i> is signed: positive to starboard (right of increasing KP), negative to port.</p>
 
 <p><b>Instructions:</b></p>
 
 <p><b>1. Select Input Layers:</b><ul>
 <li><b>Input Points Layer:</b> Choose the point layer for which you want to find the nearest KP.</li>
 <li><b>Input Paths Layer:</b> Select the line layer representing the network or route.</li>
-<li>Ensure both layers share the same Coordinate Reference System (CRS) for accurate calculations.</li></ul></p>
+</ul></p>
 
 <p><b>2. Configure Outputs:</b><ul>
 <li><b>Output Points Layer:</b> A new point layer will be created with all original attributes plus fields for <i>path_id</i>, <i>distance_to_path_m</i>, <i>kp_km</i>, and <i>kp_ref</i>.</li>
@@ -380,154 +344,8 @@ class NearestKPAlgorithm(QgsProcessingAlgorithm):
 
 <p><b>3. Run:</b> Execute the tool.</p>
 
-<p><b>Note:</b> The tool performs a segment-by-segment analysis to ensure it finds the true nearest point, even on complex, multi-part line geometries.</p>
+<p><b>Note:</b> The nearest point is found segment by segment (spatially indexed), so it is the true nearest point even on complex, multi-part line geometries.</p>
 """)
-
-    def find_nearest_point_on_path(self, path_geom, point_xy, distance_calculator, base_distance_m: float = 0.0):
-        """
-        Find the nearest point on a path to the given point using a segment-by-segment approach.
-        
-        Parameters:
-            path_geom (QgsGeometry): The path geometry
-            point_xy (QgsPointXY): The point to find the nearest point to
-            distance_calculator (QgsDistanceArea): Distance calculator for accurate measurements
-            
-        Returns:
-            dict: A dictionary containing the nearest point geometry, the distance, and the KP value
-        """
-        min_distance = float('inf')
-        nearest_point = None
-        best_kp_m = float(base_distance_m) if base_distance_m is not None else 0.0
-        best_signed_distance = None
-        
-        # Get all the points that make up the path (handling multi-part geometries)
-        all_points = []
-        if path_geom.isMultipart():
-            lines = path_geom.asMultiPolyline()
-            for line in lines:
-                all_points.append(line)
-        else:
-            all_points = [path_geom.asPolyline()]
-        
-        # Walk segments once, tracking cumulative distance along the geometry.
-        # This correctly handles multipart polylines and avoids the "part index" bug.
-        cumulative_distance_m = 0.0
-        for line in all_points:
-            if len(line) < 2:
-                continue
-            for i in range(len(line) - 1):
-                segment_start = line[i]
-                segment_end = line[i + 1]
-
-                segment_length = float(distance_calculator.measureLine(segment_start, segment_end))
-                if segment_length <= 0:
-                    continue
-
-                segment_geom = QgsGeometry.fromPolylineXY([segment_start, segment_end])
-                nearest_on_segment = segment_geom.nearestPoint(QgsGeometry.fromPointXY(point_xy))
-                if nearest_on_segment.isEmpty():
-                    cumulative_distance_m += segment_length
-                    continue
-
-                nearest_on_segment_xy = nearest_on_segment.asPoint()
-                distance = float(distance_calculator.measureLine(point_xy, nearest_on_segment_xy))
-
-                if distance < min_distance:
-                    min_distance = distance
-                    nearest_point = nearest_on_segment
-                    distance_along_segment = float(
-                        distance_calculator.measureLine(segment_start, nearest_on_segment_xy)
-                    )
-                    if distance_along_segment < 0:
-                        distance_along_segment = 0.0
-                    if distance_along_segment > segment_length:
-                        distance_along_segment = segment_length
-
-                    best_kp_m = float(base_distance_m) + cumulative_distance_m + distance_along_segment
-
-                    # Signed distance (port/stbd) relative to the direction of ascending KP
-                    # Segment direction = segment_start -> segment_end.
-                    # Using 2D cross product: cross(v, w) > 0 means point is left of the segment.
-                    v_x = float(segment_end.x() - segment_start.x())
-                    v_y = float(segment_end.y() - segment_start.y())
-                    w_x = float(point_xy.x() - nearest_on_segment_xy.x())
-                    w_y = float(point_xy.y() - nearest_on_segment_xy.y())
-                    cross = (v_x * w_y) - (v_y * w_x)
-                    if abs(cross) < 1e-12:
-                        best_signed_distance = 0.0
-                    elif cross > 0:
-                        # Left/port side => negative
-                        best_signed_distance = -abs(min_distance)
-                    else:
-                        # Right/stbd side => positive
-                        best_signed_distance = abs(min_distance)
-
-                cumulative_distance_m += segment_length
-
-        # Convert to kilometers
-        kp = best_kp_m / 1000.0
-        
-        return {
-            'point_geometry': nearest_point,
-            'distance': min_distance,
-            'distance_signed': best_signed_distance if best_signed_distance is not None else min_distance,
-            'kp': kp
-        }
-
-    def calculate_kp(self, line_geom, nearest_pt_geom, distance_calculator):
-        """
-        Calculate the linear reference distance along the line geometry from the start to the nearest point.
-
-        Parameters:
-            line_geom (QgsGeometry): The geometry of the line.
-            nearest_pt_geom (QgsGeometry): The geometry of the nearest point on the line.
-            distance_calculator (QgsDistanceArea): Initialized QgsDistanceArea object.
-
-        Returns:
-            float: Distance in kilometers from the start of the line to the nearest point.
-        """
-        if line_geom.isEmpty() or nearest_pt_geom.isEmpty():
-            return 0.0
-
-        # Extract the QgsPoint from the nearest point geometry
-        nearest_pt = nearest_pt_geom.asPoint()
-        nearest_pt_xy = QgsPointXY(nearest_pt.x(), nearest_pt.y())
-
-        # Initialize cumulative distance
-        cumulative_distance = 0.0
-
-        # Handle multipart geometries
-        if line_geom.isMultipart():
-            lines = line_geom.asMultiPolyline()
-        else:
-            lines = [line_geom.asPolyline()]
-
-        for line_part in lines:
-            for i in range(len(line_part) - 1):
-                p1 = line_part[i]
-                p2 = line_part[i + 1]
-                segment_start = QgsPointXY(p1.x(), p1.y())
-                segment_end = QgsPointXY(p2.x(), p2.y())
-
-                # Create a QgsGeometry for the current segment
-                segment_geom = QgsGeometry.fromPolylineXY([segment_start, segment_end])
-
-                # Calculate the distance from the segment to the nearest point
-                distance_to_nearest = segment_geom.distance(QgsGeometry.fromPointXY(nearest_pt_xy))
-
-                if distance_to_nearest < 1e-6:
-                    # Nearest point lies on this segment
-                    # Calculate partial distance along the segment to the nearest point
-                    partial_length = distance_calculator.measureLine(segment_start, nearest_pt_xy)
-                    cumulative_distance += partial_length
-                    return cumulative_distance / 1000.0  # Convert meters to kilometers
-                else:
-                    # Add the full length of the segment to the cumulative distance
-                    segment_length = distance_calculator.measureLine(segment_start, segment_end)
-                    cumulative_distance += segment_length
-
-        # If the nearest point was not found on any segment, return the total length
-        return cumulative_distance / 1000.0  # Convert meters to kilometers
 
     def calculate_bearing(self, pointA, pointB):
         """

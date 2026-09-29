@@ -14,11 +14,13 @@ Output includes:
 """
 
 from __future__ import annotations
+import logging
 import math
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from qgis.PyQt.QtCore import QCoreApplication
+from .algorithm_base import SubseaCableAlgorithm
 from ..kp_range_utils import make_kp_distance_area
 from qgis.core import (
     QgsCoordinateReferenceSystem,
@@ -33,7 +35,6 @@ from qgis.core import (
     QgsPoint,
     QgsPointXY,
     QgsProcessing,
-    QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingLayerPostProcessorInterface,
     QgsProcessingParameterFeatureSink,
@@ -46,6 +47,7 @@ from qgis.core import (
 )
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_LONG_LONG, FIELD_TYPE_STRING, GEOMETRY_POINT, PROCESSING_NUMBER_DOUBLE
 from ..kp_geo_utils import get_features_skip_invalid
+from ..plugin_log import log_exception, log_warning
 
 
 @dataclass(frozen=True)
@@ -267,9 +269,12 @@ def _make_local_aeqd_crs(lat: float, lon: float) -> QgsCoordinateReferenceSystem
                 if ok and crs.isValid():
                     return crs
             except Exception:
-                pass
+                log_exception(f"Crossing buffers: {method_name} failed", level=logging.DEBUG)
 
-    # Fallback (less accurate globally, but meters-based)
+    # Fallback (less accurate globally, but meters-based): buffer distances
+    # are then stretched by 1/cos(latitude), so say so.
+    log_warning("Crossing buffers: could not create a local AEQD CRS; buffering in "
+                "EPSG:3857, where distances grow with latitude.")
     return QgsCoordinateReferenceSystem('EPSG:3857')
 
 
@@ -425,21 +430,21 @@ def _extract_points(geom: QgsGeometry) -> List[QgsPointXY]:
         except Exception:
             return []
 
-    # Geometry collections can include points.
-    if QgsWkbTypes.isGeometryCollection(geom.wkbType()):
+    # A crossing plus an overlapping stretch comes back as a
+    # GeometryCollection (points + lines). QgsWkbTypes has no
+    # isGeometryCollection(), so recurse into the parts of any multi-part
+    # result instead; asGeometryCollection() yields single-part geometries.
+    if geom.isMultipart():
         points: List[QgsPointXY] = []
-        try:
-            for part in geom.asGeometryCollection():
-                points.extend(_extract_points(part))
-        except Exception:
-            return []
+        for part in geom.asGeometryCollection():
+            points.extend(_extract_points(part))
         return points
 
     # For line/polygon intersections (overlaps), treat as "not a crossing".
     return []
 
 
-class IdentifyRPLCrossingPointsAlgorithm(QgsProcessingAlgorithm):
+class IdentifyRPLCrossingPointsAlgorithm(SubseaCableAlgorithm):
     INPUT_RPL = 'INPUT_RPL'
     INPUT_ASSETS = 'INPUT_ASSETS'
     OUTPUT = 'OUTPUT'
@@ -612,6 +617,7 @@ class IdentifyRPLCrossingPointsAlgorithm(QgsProcessingAlgorithm):
 
         total = len(rpl_infos)
         written = 0
+        skipped_assets = 0
         seen: set[Tuple[str, int, float, float]] = set()
 
         for idx, info in enumerate(rpl_infos):
@@ -657,13 +663,11 @@ class IdentifyRPLCrossingPointsAlgorithm(QgsProcessingAlgorithm):
                     # Transform asset geometry into RPL CRS
                     try:
                         asset_geom.transform(to_rpl)
-                    except Exception:
-                        continue
-
-                    # Compute intersections
-                    try:
                         inter = rpl_geom.intersection(asset_geom)
                     except Exception:
+                        # A skipped asset means crossings missing from the
+                        # listing: count it and say so below.
+                        skipped_assets += 1
                         continue
 
                     points = _extract_points(inter)
@@ -779,6 +783,11 @@ class IdentifyRPLCrossingPointsAlgorithm(QgsProcessingAlgorithm):
                                 feedback.pushWarning('Failed to create buffer polygon for a crossing.')
 
         feedback.pushInfo(f"Identified {written} crossing point(s).")
+        if skipped_assets:
+            feedback.pushWarning(
+                f"{skipped_assets} asset feature(s) could not be reprojected into the "
+                "RPL CRS or intersected with it and were skipped; any crossings with "
+                "them are missing from the listing.")
 
         # Dynamic output naming
         self.renamer = Renamer(f"{rpl_layer_name}_CX_Listing")

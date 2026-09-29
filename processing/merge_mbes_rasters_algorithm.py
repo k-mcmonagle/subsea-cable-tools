@@ -14,20 +14,19 @@ import os
 import uuid
 from qgis.core import (
     QgsApplication,
-    QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingParameterBoolean,
     QgsProcessingParameterEnum,
     QgsProcessingParameterMultipleLayers,
     QgsProcessingParameterRasterDestination,
-    QgsProcessingUtils,
     QgsRasterLayer,
 )
-from ..qgis_compat import PROCESSING_SOURCE_RASTER
+from .algorithm_base import SubseaCableAlgorithm, gdal_creation_options
+from ..qgis_compat import PROCESSING_SOURCE_RASTER, processing_temp_folder
 from qgis import processing
 
 
-class MergeMBESRastersAlgorithm(QgsProcessingAlgorithm):
+class MergeMBESRastersAlgorithm(SubseaCableAlgorithm):
     """Mosaic MBES rasters, preserving the finest resolution and NoData."""
 
     INPUTS = 'INPUTS'
@@ -141,7 +140,7 @@ class MergeMBESRastersAlgorithm(QgsProcessingAlgorithm):
 
         # --- build the VRT mosaic at the highest resolution ---
         vrt_path = os.path.join(
-            QgsProcessingUtils.tempFolder(), f'mbes_merge_{uuid.uuid4().hex[:8]}.vrt')
+            processing_temp_folder(context), f'mbes_merge_{uuid.uuid4().hex[:8]}.vrt')
         result = processing.run('gdal:buildvirtualraster', {
             'INPUT': input_files,
             'RESOLUTION': 1,          # highest — never degrade a fine grid
@@ -154,7 +153,7 @@ class MergeMBESRastersAlgorithm(QgsProcessingAlgorithm):
             'RESAMPLING': 1 if resampling == 1 else 0,
             'SRC_NODATA': None,       # respect each file's own NoData metadata
             'OUTPUT': vrt_path,
-        }, context=context, feedback=feedback)
+        }, context=context, feedback=feedback, is_child_algorithm=True)
         if not result or not result.get('OUTPUT'):
             raise QgsProcessingException('Raster merge (buildvirtualraster) failed. '
                                          'Check the processing log for more details.')
@@ -164,9 +163,9 @@ class MergeMBESRastersAlgorithm(QgsProcessingAlgorithm):
         result2 = processing.run('gdal:translate', {
             'INPUT': result['OUTPUT'],
             'OUTPUT': final_output,
-            'OPTIONS': options,
+            **gdal_creation_options('gdal:translate', options),
             'DATA_TYPE': 0,           # keep the source data type
-        }, context=context, feedback=feedback)
+        }, context=context, feedback=feedback, is_child_algorithm=True)
         if not result2 or not result2.get('OUTPUT'):
             raise QgsProcessingException('Writing the merged raster (gdal:translate) failed. '
                                          'Check the processing log for more details.')

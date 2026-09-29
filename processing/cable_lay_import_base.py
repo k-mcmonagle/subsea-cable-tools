@@ -31,7 +31,6 @@ from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsFields,
     QgsProcessing,
-    QgsProcessingAlgorithm,
     QgsProcessingContext,
     QgsProcessingException,
     QgsProcessingOutputVectorLayer,
@@ -43,10 +42,11 @@ from qgis.core import (
     QgsWkbTypes,
 )
 
+from .algorithm_base import SubseaCableAlgorithm
 from . import cable_lay_parsers as clp
 
 
-class CableLayImportAlgorithm(QgsProcessingAlgorithm):
+class CableLayImportAlgorithm(SubseaCableAlgorithm):
     """Common scaffolding for the cable-lay file importers."""
 
     INPUT = "INPUT"

@@ -23,7 +23,6 @@ from typing import Dict, List, Optional
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessing,
-    QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingParameterBoolean,
     QgsProcessingParameterEnum,
@@ -34,6 +33,7 @@ from qgis.core import (
     QgsWkbTypes,
 )
 
+from .algorithm_base import SubseaCableAlgorithm
 from ..workbench import schema
 from ..workbench.rpl_engine import RplModel, RplPoint, RplSegment, derive_slack, validate
 from ..workbench.rpl_layer_io import model_rows_for_layers
@@ -98,7 +98,7 @@ def _split_trailing_rev_label(name: str):
     return (match.group("route").strip(), f"Rev {number.group(0)}" if number else match.group("label"))
 
 
-class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
+class RegisterRPLAlgorithm(SubseaCableAlgorithm):
     INPUT_POINTS = "INPUT_POINTS"
     INPUT_LINES = "INPUT_LINES"
     RPL_NAME = "RPL_NAME"
@@ -263,6 +263,9 @@ class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
 
         point_features = list(get_features_skip_invalid(points_source))
         line_features = list(get_features_skip_invalid(lines_source))
+        feedback.setProgress(20)
+        if feedback.isCanceled():
+            return {}
         model = self.build_model(point_features, line_features)
 
         for warning in self.check_pairing(model, line_features):
@@ -276,6 +279,11 @@ class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
         if derived:
             feedback.pushInfo(self.tr(
                 f"Derived slack for {derived} point-to-point legs from cable distances."))
+
+        feedback.setProgress(40)
+        # Last point where cancelling leaves the workbench untouched.
+        if feedback.isCanceled():
+            return {}
 
         store = WorkbenchStore(gpkg_path, context.transformContext())
         store.migrate()
@@ -335,7 +343,9 @@ class RegisterRPLAlgorithm(QgsProcessingAlgorithm):
         point_specs = self._specs_with_extras(schema.RPL_POINT_FIELDS, rows["points"])
         line_specs = self._specs_with_extras(schema.RPL_LINE_FIELDS, rows["lines"])
         store.write_spatial_layer(points_layer_name, point_specs, QgsWkbTypes.Point, rows["points"])
+        feedback.setProgress(65)
         store.write_spatial_layer(lines_layer_name, line_specs, QgsWkbTypes.LineString, rows["lines"])
+        feedback.setProgress(90)
 
         store.save_rpl({
             "rpl_id": rpl_id,

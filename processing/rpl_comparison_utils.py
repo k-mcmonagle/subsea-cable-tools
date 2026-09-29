@@ -23,7 +23,13 @@ Implementation note (1.6):
     silently fell back to planar measurements when the project ellipsoid was
     unset; the new path applies the same WGS84 fallback that 1.5.1 introduced
     elsewhere.
+
+    Routes are assembled like every other KP tool's: features in SeqNo order
+    when the layer has one (``kp_geo_utils.ordered_route_features``), else
+    layer order.
 """
+
+from typing import Optional, Tuple
 
 from qgis.core import (
     QgsGeometry,
@@ -32,8 +38,36 @@ from qgis.core import (
 )
 from ..qgis_compat import GEOMETRY_POINT
 
-from ..kp_geo_utils import RouteFrame
+from ..kp_geo_utils import KPHit, RouteFrame, get_features_skip_invalid, ordered_route_features
 from ..kp_range_utils import make_kp_distance_area
+
+
+def route_geometries(line_layer):
+    """The route's feature geometries in chainage order (SeqNo, else layer order)."""
+    return [QgsGeometry(f.geometry())
+            for f in ordered_route_features(get_features_skip_invalid(line_layer))]
+
+
+def signed_dcc(line_geom: QgsGeometry, point_xy: QgsPointXY,
+               snapped_xy: QgsPointXY, dcc_m: float) -> float:
+    """``dcc_m`` signed by side: + starboard (right of increasing KP), - port.
+
+    The side is taken from the route segment that holds ``snapped_xy`` (the
+    point's nearest point on ``line_geom``): the 2D cross product of the
+    segment direction with the offset ``snapped -> point``. 0 when the point
+    is on the line.
+    """
+    _sqr_dist, _closest, after_vertex, _left_of = line_geom.closestSegmentWithContext(
+        QgsPointXY(snapped_xy))
+    if after_vertex < 1:
+        return float(dcc_m)
+    p1 = line_geom.vertexAt(after_vertex - 1)
+    p2 = line_geom.vertexAt(after_vertex)
+    cross = ((p2.x() - p1.x()) * (point_xy.y() - snapped_xy.y())
+             - (p2.y() - p1.y()) * (point_xy.x() - snapped_xy.x()))
+    if abs(cross) < 1e-12:
+        return 0.0
+    return -abs(float(dcc_m)) if cross > 0 else abs(float(dcc_m))
 
 
 class RPLComparator:
@@ -72,14 +106,17 @@ class RPLComparator:
             crs, transform_context, project=project
         )
 
-        # Build cached route frames over each layer. RouteFrame iterates the
-        # provider once and caches geometries + cumulative offsets.
+        # Build cached route frames over each layer (one when both sides are
+        # the same layer). RouteFrame caches geometries + cumulative offsets.
         self._source_frame = RouteFrame.from_source(
-            source_line_layer, self.distance_calculator
+            route_geometries(source_line_layer), self.distance_calculator
         )
-        self._target_frame = RouteFrame.from_source(
-            target_line_layer, self.distance_calculator
-        )
+        if target_line_layer is source_line_layer:
+            self._target_frame = self._source_frame
+        else:
+            self._target_frame = RouteFrame.from_source(
+                route_geometries(target_line_layer), self.distance_calculator
+            )
 
         # Back-compat attributes (callers in rpl_route_comparison_algorithm
         # iterate ``comparator.source_geoms`` directly).
@@ -147,6 +184,23 @@ class RPLComparator:
             return {"point": None, "distance": float("inf")}
         hit = self._frame(source).kp_at_point(QgsPointXY(point_xy))
         return {"point": hit.snapped_xy, "distance": hit.dcc_m}
+
+    def nearest_kp_hit(self, point_xy, source=True) -> KPHit:
+        """The full nearest-KP result (KP, DCC, snapped point, feature index)."""
+        return self._frame(source).kp_at_point(QgsPointXY(point_xy))
+
+    def signed_offset(self, point_xy, source=True) -> Tuple[KPHit, Optional[float]]:
+        """Nearest-KP hit on a line plus the signed DCC (m) of ``point_xy``.
+
+        Sign: + starboard (right of the direction of increasing KP), - port.
+        The DCC is ``None`` when the line has no usable geometry.
+        """
+        hit = self._frame(source).kp_at_point(QgsPointXY(point_xy))
+        if hit.snapped_xy is None:
+            return hit, None
+        geoms = self.source_geoms if source else self.target_geoms
+        return hit, signed_dcc(geoms[hit.feature_index], QgsPointXY(point_xy),
+                               hit.snapped_xy, hit.dcc_m)
 
     def distance_cross_course(self, point_xy, source=True):
         """

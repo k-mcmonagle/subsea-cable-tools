@@ -6,10 +6,14 @@ This provider loads processing algorithms for Subsea Cable Tools.
 """
 
 import importlib
+import os
 import traceback
 
+from qgis.PyQt.QtGui import QIcon
 from qgis.core import QgsProcessingProvider, QgsMessageLog, Qgis
 from ..qgis_compat import MESSAGE_INFO, MESSAGE_WARNING
+
+_PLUGIN_ICON = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'icon.png')
 
 
 class SubseaCableProcessingProvider(QgsProcessingProvider):
@@ -114,15 +118,17 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
 
     def icon(self):
         """
-        Returns a QIcon for the provider.
+        Returns a QIcon for the provider (the plugin icon).
         """
+        if os.path.isfile(_PLUGIN_ICON):
+            return QIcon(_PLUGIN_ICON)
         return QgsProcessingProvider.icon(self)
 
     def longName(self):
         """
         Returns a longer version of the provider name.
         """
-        return self.name()
+        return self.tr('Subsea Cable Tools (RPL, KP, bathymetry and cable lay)')
 
     def tr(self, string):
         from qgis.PyQt.QtCore import QCoreApplication

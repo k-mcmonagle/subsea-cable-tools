@@ -9,17 +9,17 @@ from __future__ import annotations
 
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
-    QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingOutputMultipleLayers,
     QgsProcessingParameterFileDestination,
     QgsVectorLayer,
 )
 
+from .algorithm_base import SubseaCableAlgorithm
 from . import cable_lay_parsers as clp
 
 
-class CreateCableLayGeoPackageAlgorithm(QgsProcessingAlgorithm):
+class CreateCableLayGeoPackageAlgorithm(SubseaCableAlgorithm):
     """Sets up a GeoPackage with the standard, empty cable-lay layers ready to fill."""
 
     GEOPACKAGE = "GEOPACKAGE"
@@ -123,7 +123,10 @@ left untouched (their data is preserved) and only missing layers are added.</p>
 
         created = []
         ordered_layers = []  # (layer_name, uri) in display order
-        for layer_type in ordered_types:
+        for index, layer_type in enumerate(ordered_types):
+            if feedback.isCanceled():
+                break
+            feedback.setProgress(100.0 * index / len(ordered_types))
             wkb_type, specs = schemas[layer_type]
             layer_name = clp.prefixed_layer_name(gpkg_path, layer_type)
             uri = clp.gpkg_layer_uri(gpkg_path, layer_name)

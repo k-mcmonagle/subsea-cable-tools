@@ -11,7 +11,6 @@ from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsApplication,
     QgsProcessing,
-    QgsProcessingAlgorithm,
     QgsProcessingContext,
     QgsProcessingException,
     QgsProcessingParameterBoolean,
@@ -20,12 +19,12 @@ from qgis.core import (
     QgsProcessingParameterFolderDestination,
     QgsProcessingParameterMultipleLayers,
     QgsProcessingParameterNumber,
-    QgsProcessingUtils,
     QgsRectangle,
 )
+from .algorithm_base import SubseaCableAlgorithm, gdal_creation_options
 from ..qgis_compat import (
     PROCESSING_NUMBER_DOUBLE, PROCESSING_NUMBER_INTEGER,
-    PROCESSING_SOURCE_FILE,
+    PROCESSING_SOURCE_FILE, processing_temp_folder,
 )
 from qgis import processing
 try:
@@ -148,7 +147,7 @@ def bin_average_grid(xs, ys, zs, grid_x, grid_y, x_min, y_max,
     return grid.reshape(height, width)
 
 
-class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
+class CreateMBESRasterFromXYZAlgorithm(SubseaCableAlgorithm):
     """One raster per XYZ file, native resolution preserved per file."""
 
     INPUT_XYZ = 'INPUT_XYZ'
@@ -283,7 +282,7 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
 
         if output_folder == QgsProcessing.TEMPORARY_OUTPUT:
             output_folder = os.path.join(
-                QgsProcessingUtils.tempFolder(), 'xyz_rasters_' + uuid.uuid4().hex[:8])
+                processing_temp_folder(context), 'xyz_rasters_' + uuid.uuid4().hex[:8])
         os.makedirs(output_folder, exist_ok=True)
 
         required = {
@@ -445,7 +444,7 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
             max_distance = grid_mean * 3
             feedback.pushInfo(f'Using auto IDW search radius: {max_distance:.4f}')
 
-        temp_folder = QgsProcessingUtils.tempFolder()
+        temp_folder = processing_temp_folder(context)
         token = uuid.uuid4().hex[:8]
         temp_csv_path = None
         vrt_path = None
@@ -493,7 +492,7 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
                     'INIT': -9999.0,
                     'DATA_TYPE': 5,           # Float32
                     'OUTPUT': output_raster_path,
-                }, context=context, feedback=feedback)
+                }, context=context, feedback=feedback, is_child_algorithm=True)
             elif method_index == self.METHOD_AVERAGE:
                 result = self._run_average(
                     data, grid_x, grid_y, extent, width, height, target_crs,
@@ -522,7 +521,7 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
                     'ITERATIONS': 0,
                     'NO_MASK': False,
                     'OUTPUT': fill_path,
-                }, context=context, feedback=feedback)
+                }, context=context, feedback=feedback, is_child_algorithm=True)
                 if not fill_result or not fill_result.get('OUTPUT'):
                     raise QgsProcessingException(
                         f'Gap filling (gdal:fillnodata) failed for {os.path.basename(xyz_path)}.')
@@ -538,9 +537,10 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
                 result2 = processing.run('gdal:translate', {
                     'INPUT': result['OUTPUT'],
                     'OUTPUT': final_output,
-                    'OPTIONS': 'COMPRESS=LZW|TILED=YES|BIGTIFF=IF_SAFER',
+                    **gdal_creation_options(
+                        'gdal:translate', 'COMPRESS=LZW|TILED=YES|BIGTIFF=IF_SAFER'),
                     'DATA_TYPE': 0,           # keep source type (Float32)
-                }, context=context, feedback=feedback)
+                }, context=context, feedback=feedback, is_child_algorithm=True)
                 if not result2 or not result2.get('OUTPUT'):
                     raise QgsProcessingException(
                         f'Compression (gdal:translate) failed for {os.path.basename(xyz_path)}.')
@@ -595,7 +595,7 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
                 'DATA_TYPE': 5,           # Float32
                 'EXTRA': self._grid_extra(extent, width, height),
                 'OUTPUT': output_raster_path,
-            }, context=context, feedback=feedback)
+            }, context=context, feedback=feedback, is_child_algorithm=True)
         feedback.pushInfo('Using IDW interpolation (gdal:gridinversedistance)...')
         return processing.run('gdal:gridinversedistance', {
             'INPUT': vrt_path,
@@ -610,7 +610,7 @@ class CreateMBESRasterFromXYZAlgorithm(QgsProcessingAlgorithm):
             'DATA_TYPE': 5,               # Float32
             'EXTRA': self._grid_extra(extent, width, height),
             'OUTPUT': output_raster_path,
-        }, context=context, feedback=feedback)
+        }, context=context, feedback=feedback, is_child_algorithm=True)
 
     def _run_average(self, data, grid_x, grid_y, extent, width, height,
                      target_crs, output_raster_path, feedback):

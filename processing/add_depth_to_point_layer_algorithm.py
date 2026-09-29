@@ -14,6 +14,7 @@ import re
 from typing import List, Optional, Sequence, Tuple
 
 from qgis.PyQt.QtCore import QCoreApplication
+from .algorithm_base import SubseaCableAlgorithm
 from ..kp_range_utils import make_distance_area
 from qgis.core import (
     QgsCoordinateTransform,
@@ -26,7 +27,6 @@ from qgis.core import (
     QgsGeometry,
     QgsPointXY,
     QgsProcessing,
-    QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingParameterBoolean,
     QgsProcessingParameterEnum,
@@ -46,7 +46,7 @@ from . import depth_sampling
 from ..kp_geo_utils import get_features_skip_invalid
 
 
-class AddDepthToPointLayerAlgorithm(QgsProcessingAlgorithm):
+class AddDepthToPointLayerAlgorithm(SubseaCableAlgorithm):
     INPUT = 'INPUT'
     DEPTH_SOURCE = 'DEPTH_SOURCE'
 
@@ -87,16 +87,20 @@ class AddDepthToPointLayerAlgorithm(QgsProcessingAlgorithm):
     def _build_raster_samplers(
         rasters: Sequence[QgsRasterLayer],
         points_crs,
+        transform_context=None,
     ) -> List[Tuple[QgsRasterLayer, Optional[QgsCoordinateTransform]]]:
-        return depth_sampling.build_raster_samplers(rasters, points_crs)
+        return depth_sampling.build_raster_samplers(rasters, points_crs, transform_context)
 
     @staticmethod
     def _build_contour_samplers(
         contour_layers: Sequence[Optional[QgsVectorLayer]],
         depth_fields: Sequence[str],
         points_crs,
-    ) -> List[Tuple[QgsVectorLayer, str, Optional[QgsCoordinateTransform]]]:
-        return depth_sampling.build_contour_samplers(contour_layers, depth_fields, points_crs)
+        transform_context=None,
+        project=None,
+    ) -> List[depth_sampling.ContourSampler]:
+        return depth_sampling.build_contour_samplers(
+            contour_layers, depth_fields, points_crs, transform_context, project)
 
     @staticmethod
     def _sample_rasters(
@@ -110,7 +114,7 @@ class AddDepthToPointLayerAlgorithm(QgsProcessingAlgorithm):
     @staticmethod
     def _sample_contours(
         point: QgsPointXY,
-        contour_samplers: Sequence[Tuple[QgsVectorLayer, str, Optional[QgsCoordinateTransform]]],
+        contour_samplers: Sequence[depth_sampling.ContourSampler],
         search_radius_m: float,
         context,
     ) -> Tuple[Optional[float], Optional[str], Optional[float]]:
@@ -269,11 +273,14 @@ class AddDepthToPointLayerAlgorithm(QgsProcessingAlgorithm):
 
         points_crs = source.sourceCrs()
 
-        raster_samplers = self._build_raster_samplers(raster_layers, points_crs)
+        raster_samplers = self._build_raster_samplers(
+            raster_layers, points_crs, context.transformContext())
         contour_samplers = self._build_contour_samplers(
             [contour_layer_1, contour_layer_2],
             [contour_depth_field_1, contour_depth_field_2],
             points_crs,
+            context.transformContext(),
+            context.project(),
         )
 
         used_field_names = set([f.name() for f in source.fields()])
