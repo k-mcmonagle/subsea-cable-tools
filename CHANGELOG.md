@@ -70,6 +70,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Cable Lay Data Explorer:** importing into an existing layer appends instead of rewriting the table; gap analysis and the Manage tab are much faster on large datasets; Manage edits run in the background with a cancellable progress dialog; the Manage tab comes first and *Table layer* is now *Active layer*.
 - **KP Plotter:** the reverse option now reads *Table KPs are reverse KPs*.
 - **Depth Profile:** right-click ▸ *Centre map on this KP* replaces panning the map on every right-click.
+- **Depth Profile:** profiles and side slopes are computed in the background with a progress bar and *Cancel*, so QGIS stays responsive on long routes (results are unchanged); raster files are no longer locked after a profile, and skipped samples or contours are reported instead of silently left blank.
+- **Calculate Seabed Length:** much faster on long routes; contours with Z values or in another CRS are used, and the gap between parts of a multi-part route no longer counts as seabed.
+- **Processing tools:** long-running tools can be cancelled and report progress, tools warn when features or contours are skipped instead of silently leaving them out, and every tool's *Help* opens the documentation.
+- **KP Mouse Tool:** much smoother on long routes; it now reads exactly the same KP as every other tool (previously it could differ by centimetres to metres inside long legs) and chains RPL legs in SeqNo order like the other tools.
+- **KP Plotter:** hovering the plot no longer re-renders the whole map on every mouse move.
+- **Raster sampling:** rasters are read in cached tiles with identical values, and raster files are no longer locked after a background analysis.
+- **Bundled libraries** no longer override copies already installed with QGIS (for example openpyxl on QGIS 3.40), for this plugin or any other.
 
 ### Deprecated
 
@@ -93,22 +100,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Burial Planner — plan files:** opening or checking an ordinary GeoPackage no longer changes or locks it, plan files on network shares no longer use a journal mode that is unsafe there, and creating or renaming a plan always records its change-log entry.
 - **Burial Planner — deleting a plan** now also removes its ground-model and BAS rows.
 - **Burial Planner — window:** closing and reopening the panel keeps it in step with the current project, and results from an analysis stopped by closing the panel are no longer applied.
-- **Depth Profile:** profiles and side slopes are computed in the background with a progress bar and *Cancel*, so QGIS stays responsive on long routes (results are unchanged); raster files are no longer locked after a profile, and skipped samples or contours are reported instead of silently left blank.
 - **Identify RPL Crossing Points / Identify RPL Area Listing:** no longer crash when an intersection mixes points and lines.
 - **Add Depth to Point Layer / Dynamic Buffer Lay Corridor:** depths are now found from contour layers in latitude/longitude (previously every lookup silently returned no depth).
 - **Compare Design vs As-Laid Routes:** the cross-track sign now follows the documented convention (+ starboard, − port); earlier versions reported it reversed, so **re-run comparisons made with an earlier version** if you rely on the sign (magnitudes are unchanged).
-- **Calculate Seabed Length:** much faster on long routes; contours with Z values or in another CRS are used, and the gap between parts of a multi-part route no longer counts as seabed.
-- **Processing tools:** long-running tools can be cancelled and report progress, tools warn when features or contours are skipped instead of silently leaving them out, and every tool's *Help* opens the documentation.
 - **Cable Lay Simulator:** table resize grips work on QGIS 4; after editing inputs during a solve, *Solve* restarts on the latest inputs, and results from outdated inputs are always marked stale.
 - **Catenary Calculator V2:** non-numeric assembly or seabed-profile cells are listed under *Warnings* instead of silently becoming zero, and the minimum bend radius check no longer passes by default where a radius cannot be computed.
-- **KP Mouse Tool:** much smoother on long routes; it now reads exactly the same KP as every other tool (previously it could differ by centimetres to metres inside long legs) and chains RPL legs in SeqNo order like the other tools.
-- **KP Plotter:** hovering the plot no longer re-renders the whole map on every mouse move.
-- **Raster sampling:** rasters are read in cached tiles with identical values, and raster files are no longer locked after a background analysis.
 - **Plugin reload:** unloading or reloading the plugin stops running solves and tasks, removes every map marker, rubber band, menu entry and toolbar button, and releases the plugin's map tools.
-- **Bundled libraries** no longer override copies already installed with QGIS (for example openpyxl on QGIS 3.40), for this plugin or any other.
 - **Tools that fail to open** now always say why, with details in the *Subsea Cable Tools* tab of the Log Messages panel.
 - **Import Event Log:** each event now records the file it came from, so a second event log with overlapping times is no longer dropped as duplicates, and Cable Lay Data Explorer can manage event-log rows by source file.
-<!-- audit-2026-09 entries -->
 
 ## [1.9.0] - 2026-08-29
 
