@@ -16,6 +16,7 @@ cache/staleness come from the normalised source + timestamp + feature count.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -26,6 +27,7 @@ from qgis.core import (
     QgsVectorLayer,
 )
 
+from ..plugin_log import log_exception, log_info
 from ..processing.cable_lay_parsers import WKT_KEY, gpkg_layer_uri
 from ..qgis_compat import WKB_LINESTRING, WKB_POINT
 from ..workbench.project_layers import layer_name_from_source, normalised_path
@@ -1081,15 +1083,13 @@ def _ensure_layer(project: QgsProject, gpkg_path: str, layer_name: str,
             try:
                 existing.setDataSource(gpkg_layer_uri(gpkg_path, layer_name),
                                        layer_name, "ogr")
-                from qgis.core import QgsMessageLog
-
-                from ..qgis_compat import MESSAGE_INFO
-                QgsMessageLog.logMessage(
-                    f"Rebuilt the stale field map of plan layer "
-                    f"'{layer_name}' (schema gained columns).",
-                    "Burial Planner", MESSAGE_INFO)
+                log_info(f"Burial Planner: rebuilt the stale field map of "
+                         f"plan layer '{layer_name}' (schema gained columns).")
             except Exception:
-                pass
+                # The layer keeps its stale field map: its style may not
+                # draw every feature until the project is reopened.
+                log_exception("Burial Planner: could not refresh the field "
+                              f"map of plan layer '{layer_name}'")
         if reload:
             existing.dataProvider().reloadData()
             existing.updateExtents()
@@ -1292,6 +1292,8 @@ def discover_gpkg_path(project: Optional[QgsProject] = None) -> Optional[str]:
         try:
             return BurialStore(path).exists()
         except Exception:
+            log_exception(f"Burial Planner: plan file not readable: {path}",
+                          level=logging.DEBUG)
             return False
 
     saved = project_gpkg_path(project)
@@ -1365,4 +1367,5 @@ def restore_burial_layers(project: Optional[QgsProject] = None) -> int:
                 touched += 1
         return touched
     except Exception:
+        log_exception("Burial Planner: repairing plan layers failed")
         return 0

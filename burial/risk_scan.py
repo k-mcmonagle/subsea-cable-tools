@@ -31,6 +31,7 @@ geodesic (``QgsDistanceArea``).
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -44,6 +45,7 @@ from qgis.core import (
 )
 from qgis.PyQt.QtCore import pyqtSignal
 
+from ..plugin_log import log_exception
 from ..qgis_compat import GEOMETRY_LINE, GEOMETRY_POINT, GEOMETRY_POLYGON
 from ..workbench import rules_inputs as ri
 from ..workbench.rules_inputs import _filter_expression, _load_features_wgs84
@@ -696,16 +698,8 @@ class RiskScanTask(QgsTask):
             import traceback
 
             self.error = traceback.format_exc(limit=3).strip().splitlines()[-1]
-            try:
-                from qgis.core import QgsMessageLog
-
-                from ..qgis_compat import MESSAGE_CRITICAL
-
-                QgsMessageLog.logMessage(
-                    "Risk scan failed\n" + traceback.format_exc(),
-                    "Burial Planner", MESSAGE_CRITICAL)
-            except Exception:
-                pass
+            log_exception("Burial Planner: risk scan failed",
+                          level=logging.ERROR)
             return False
 
     def finished(self, _ok: bool) -> None:
@@ -716,16 +710,5 @@ class RiskScanTask(QgsTask):
         except Exception:
             # Never crash QGIS from a completion callback; without this the
             # Run button stayed disabled forever after a handler error.
-            try:
-                import traceback
-
-                from qgis.core import QgsMessageLog
-
-                from ..qgis_compat import MESSAGE_CRITICAL
-
-                QgsMessageLog.logMessage(
-                    "Risk scan completion handler failed\n"
-                    + traceback.format_exc(), "Burial Planner",
-                    MESSAGE_CRITICAL)
-            except Exception:
-                pass
+            log_exception("Burial Planner: risk scan completion handler "
+                          "failed", level=logging.ERROR)

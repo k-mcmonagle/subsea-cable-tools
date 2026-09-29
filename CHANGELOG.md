@@ -85,6 +85,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Cable Route Workbench:** a style you saved is no longer overwritten when layers reload, the schematic toolbar no longer drifts while panning, crowded event labels are thinned, and the system schematic, tree and table agree on the latest revision.
 - **Cable Lay Data Explorer:** Manage edits no longer silently skip rows hidden by a map filter (a layer in edit mode is refused), plot hover no longer crashes on QGIS 4, duplicate checks treat `1` and `1.0` as equal, and the append message no longer miscounts.
 - **Import MDB:** UTF-16 text labels are no longer cut to their first letter, stray NUL characters are removed, geometry columns with unfamiliar names are recognised, and multi-part layers left out by default are reported with their feature count.
+- **Burial Planner — plan files:** opening or checking an ordinary GeoPackage no longer changes or locks it, plan files on network shares no longer use a journal mode that is unsafe there, and creating or renaming a plan always records its change-log entry.
+- **Burial Planner — deleting a plan** now also removes its ground-model and BAS rows.
+- **Burial Planner — window:** closing and reopening the panel keeps it in step with the current project, and results from an analysis stopped by closing the panel are no longer applied.
 <!-- audit-2026-09 entries -->
 
 ## [1.9.0] - 2026-08-29

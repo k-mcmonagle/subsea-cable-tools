@@ -22,6 +22,9 @@ Table overview:
 - bp_analysis    latest Exclusions recompute / Risk Profile run per plan
                  (derived display state + currency fingerprints)
 
+Plan-keyed tables are listed once in ``PLAN_CHILD_TABLES`` (delete /
+duplicate coverage).
+
 No engineering values are shipped here: criteria values, buffers and limits
 are user-entered, each with a source-reference field.
 """
@@ -809,6 +812,32 @@ TABLE_KEYS: Dict[str, str] = {
     TABLE_GROUND_CLASS: "class_id",
     TABLE_BAS_ROW: "row_id",
     TABLE_ANALYSIS: "analysis_id",
+}
+
+# Every registry table holding one plan's rows (a ``plan_id`` column), and
+# what Duplicate plan does with it. The single list both ``delete_plan`` and
+# ``duplicate_plan`` walk, so a new plan-keyed table cannot be forgotten by
+# one of them (tests check it against REGISTRY_TABLES). "copy" rows are
+# deep-copied with new ids; "fresh" rows describe the original's history or
+# a derived run keyed to its ids, so the copy starts without them. Order
+# matters for copying: a table comes after the tables it references (rules
+# and risk checks -> inputs, sections -> events, hazards -> risk checks).
+PLAN_TABLE_COPY = "copy"
+PLAN_TABLE_FRESH = "fresh"
+PLAN_CHILD_TABLES: Dict[str, str] = {
+    TABLE_INPUT: PLAN_TABLE_COPY,
+    TABLE_RULE: PLAN_TABLE_COPY,
+    TABLE_GENERATION: PLAN_TABLE_FRESH,   # the original's run history
+    TABLE_EVENT: PLAN_TABLE_COPY,
+    TABLE_SECTION: PLAN_TABLE_COPY,
+    TABLE_CHANGE_LOG: PLAN_TABLE_FRESH,   # the copy's history starts empty
+    TABLE_PROFILE: PLAN_TABLE_COPY,       # derived, but expensive to resample
+    TABLE_RISK_CHECK: PLAN_TABLE_COPY,
+    TABLE_HAZARD: PLAN_TABLE_COPY,
+    TABLE_PATH_RESULT: PLAN_TABLE_FRESH,  # derived; regenerated for the copy
+    TABLE_GROUND_UNIT: PLAN_TABLE_COPY,
+    TABLE_BAS_ROW: PLAN_TABLE_COPY,
+    TABLE_ANALYSIS: PLAN_TABLE_FRESH,     # fingerprints keyed to the original's rules
 }
 
 # Per-plan spatial layer schemas -------------------------------------------

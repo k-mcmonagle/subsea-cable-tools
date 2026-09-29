@@ -71,7 +71,8 @@ from ...workbench.kp_bars import (
 )
 from ...workbench.rules_engine import Interval
 from ...workbench import rules_engine as eng
-from .. import analysis_state, map_layers, risk, risk_scan, schema
+from .. import (analysis_state, analysis_task, map_layers, risk, risk_scan,
+                schema)
 from .. import ui_helpers
 from .attribute_widgets import (
     AttributeRulesTable,
@@ -1151,6 +1152,9 @@ class RiskTab(QWidget):
         if not self.model.plan:
             self._set_transient("Open a plan first.")
             return
+        if self._scan_task is not None \
+                and not analysis_task.task_is_active(self._scan_task):
+            self._scan_task = None  # ended without reporting back
         if self._scan_task is not None:
             self._set_transient("A scan is already running.")
             return
@@ -1255,14 +1259,19 @@ class RiskTab(QWidget):
         if task is not None:
             try:
                 task.cancel()
-            except Exception:
-                pass
+            except RuntimeError:
+                pass  # the task manager already deleted it
         self.run_button.setEnabled(bool(self.model.plan))
         self.stop_button.setEnabled(False)
         self.progress.setVisible(False)
 
     def _scan_finished(self, task) -> None:
         """Completion callback on the main thread."""
+        if task is not self._scan_task:
+            # Forgotten by shutdown() (dock closed / plugin unloaded): a
+            # scan that completed before its cancel took effect must not
+            # write hazards later, nor clear a newer scan's reference.
+            return
         self._scan_task = None
         self.run_button.setEnabled(True)
         self.stop_button.setEnabled(False)

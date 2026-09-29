@@ -26,6 +26,7 @@ from ..processing.cable_lay_parsers import (
     open_gpkg_layer,
     write_layer_to_gpkg,
 )
+from ..plugin_log import log_exception, log_warning
 from ..qgis_compat import WKB_NO_GEOMETRY
 from . import change_log, gpkg_sql, schema
 
@@ -69,46 +70,49 @@ class BurialStore:
         """The cached sqlite connection, or None when in legacy mode.
 
         Probed once per store: the registry must exist and be readable via
-        plain SQL. Mixing per-call fallbacks with open transactions could
-        deadlock against the writer, so the mode is decided per store, not
-        per call; ``ensure_created``/``migrate`` reset the probe after they
-        (re)create tables through the legacy writer.
+        plain SQL. The probe is read-only (``gpkg_sql.has_table``): the
+        cached connection switches the file to WAL for good, so it is only
+        opened once ``bp_meta`` confirms a plan registry. Mixing per-call
+        fallbacks with open transactions could deadlock against the writer,
+        so the mode is decided per store, not per call;
+        ``ensure_created``/``migrate`` reset the probe after they (re)create
+        tables through the legacy writer.
+
+        Legacy mode is a last resort for files sqlite3 cannot read at all
+        (read-only files still open through SQL). A lock held by another
+        session raises instead: falling back would make every later edit of
+        this store non-atomic because of one busy moment.
         """
         if self._sql_mode is False:
             return None
         if not os.path.exists(self.gpkg_path):
             return None  # not a failure — the file may be created later
         try:
-            conn = gpkg_sql.connect(self.gpkg_path)
             if self._sql_mode is None:
-                if not gpkg_sql.table_exists(conn, schema.TABLE_META):
-                    return None  # registry not created yet; re-probe later
+                if not gpkg_sql.has_table(self.gpkg_path, schema.TABLE_META):
+                    return None  # not a plan registry (yet); re-probe later
                 self._sql_mode = True
-            return conn
-        except sqlite3.Error:
-            self._log_sql_fallback("open")
+            return gpkg_sql.connect(self.gpkg_path)
+        except sqlite3.Error as exc:
+            if gpkg_sql.is_transient(exc):
+                raise
+            self._log_sql_fallback("open", exc)
             self._sql_mode = False
             return None
 
-    def _log_sql_fallback(self, action: str) -> None:
-        try:
-            from qgis.core import QgsMessageLog
-
-            from ..qgis_compat import MESSAGE_INFO
-
-            QgsMessageLog.logMessage(
-                f"Direct-SQL access failed ({action}); using the legacy "
-                f"writer for {os.path.basename(self.gpkg_path)}.",
-                "Burial Planner", MESSAGE_INFO)
-        except Exception:
-            pass
+    def _log_sql_fallback(self, action: str, exc: Exception) -> None:
+        log_warning(
+            f"Burial Planner: direct SQLite access failed ({action}: {exc}); "
+            f"using the legacy writer for {self.gpkg_path}. Edits that "
+            "touch several tables are not atomic in this mode.")
 
     @contextmanager
     def transaction(self):
         """Group several writes into one atomic commit (SQL mode).
 
         Legacy mode has no transactional writer; the context is then a
-        no-op, preserving the old per-call behaviour.
+        no-op. Its multi-table operations (delete / duplicate plan) order
+        their writes so an interruption leaves a retryable state instead.
         """
         conn = self._sql()
         if conn is None:
@@ -123,7 +127,21 @@ class BurialStore:
 
     # -- lifecycle ----------------------------------------------------------
     def exists(self) -> bool:
-        return os.path.exists(self.gpkg_path) and self._table_exists(schema.TABLE_META)
+        """Whether the file holds a plan registry.
+
+        A pure query: read-only and uncached, so checking an arbitrary
+        GeoPackage (Open existing plans, project-open layer repair) never
+        switches it to WAL, creates sidecar files or keeps it open.
+        """
+        if not os.path.exists(self.gpkg_path):
+            return False
+        if self._sql_mode is not False:
+            try:
+                return gpkg_sql.has_table(self.gpkg_path, schema.TABLE_META)
+            except sqlite3.Error as exc:
+                if gpkg_sql.is_transient(exc):
+                    raise
+        return open_gpkg_layer(self.gpkg_path, schema.TABLE_META) is not None
 
     def ensure_created(self) -> None:
         folder = os.path.dirname(os.path.abspath(self.gpkg_path))
@@ -173,6 +191,8 @@ class BurialStore:
             shutil.copy2(self.gpkg_path, target)
             return target
         except OSError:
+            log_exception(f"Burial Planner: could not back up the plan file "
+                          f"before '{label}': {target}")
             return None
 
     # -- generic table access ------------------------------------------------
@@ -180,11 +200,15 @@ class BurialStore:
         if not os.path.exists(self.gpkg_path):
             return False
         conn = self._sql()
-        if conn is not None:
-            try:
+        try:
+            if conn is not None:
                 return gpkg_sql.table_exists(conn, table)
-            except sqlite3.Error:
-                pass
+            if self._sql_mode is None:
+                # Not a registry yet: answer read-only (see exists()).
+                return gpkg_sql.has_table(self.gpkg_path, table)
+        except sqlite3.Error as exc:
+            if gpkg_sql.is_transient(exc):
+                raise
         return open_gpkg_layer(self.gpkg_path, table) is not None
 
     def read_table(self, table: str) -> List[Dict]:
@@ -285,7 +309,8 @@ class BurialStore:
                 if ok:
                     return
             except Exception:
-                pass
+                log_exception(f"Burial Planner: appending to {table} failed; "
+                              "rewriting the table instead")
         self.upsert_rows(table, prepared)
 
     # -- meta ----------------------------------------------------------------
@@ -294,8 +319,15 @@ class BurialStore:
                 for r in self.read_table(schema.TABLE_META) if r.get("key")}
 
     def write_meta(self, key: str, value: str) -> None:
+        row = {"key": key, "value": value}
+        conn = self._sql()
+        if conn is not None:
+            # Targeted and transactional: a failed whole-table rewrite of
+            # bp_meta would lose the marker that makes this a plan registry.
+            gpkg_sql.upsert_rows(conn, schema.TABLE_META, "key", [row])
+            return
         rows = [r for r in self.read_table(schema.TABLE_META) if r.get("key") != key]
-        rows.append({"key": key, "value": value})
+        rows.append(row)
         self._write_table_rows(schema.TABLE_META, schema.META_FIELDS, rows)
 
     def _get_by_key(self, table: str, key_column: str,
@@ -330,39 +362,40 @@ class BurialStore:
         return row["plan_id"]
 
     def delete_plan(self, plan_id: str) -> None:
-        """Remove the plan and all of its child rows (inputs, rules,
-        generations, events, sections, change log). Spatial layers stay in
-        the gpkg (they may be loaded in the project); callers remove them
-        from the layer tree and may overwrite them later."""
-        child_tables = (schema.TABLE_INPUT, schema.TABLE_RULE,
-                        schema.TABLE_GENERATION, schema.TABLE_EVENT,
-                        schema.TABLE_SECTION, schema.TABLE_CHANGE_LOG,
-                        schema.TABLE_PROFILE, schema.TABLE_RISK_CHECK,
-                        schema.TABLE_HAZARD, schema.TABLE_PATH_RESULT,
-                        schema.TABLE_ANALYSIS)
+        """Remove the plan and its rows in every plan-keyed table
+        (``schema.PLAN_CHILD_TABLES``). Spatial layers stay in the gpkg
+        (they may be loaded in the project); callers remove them from the
+        layer tree and may overwrite them later."""
         conn = self._sql()
         if conn is not None:
             # One atomic transaction: the plan can never be half-deleted.
             with gpkg_sql.transaction(conn):
-                gpkg_sql.delete_keys(conn, schema.TABLE_PLAN, "plan_id",
-                                     [plan_id])
-                for table in child_tables:
+                for table in schema.PLAN_CHILD_TABLES:
                     gpkg_sql.delete_where(conn, table, "plan_id = ?",
                                           (plan_id,))
+                gpkg_sql.delete_keys(conn, schema.TABLE_PLAN, "plan_id",
+                                     [plan_id])
         else:
+            # No transaction in legacy mode: children first, header last,
+            # so an interrupted delete leaves the plan listed and a second
+            # Delete finishes the job (never orphaned, invisible rows).
+            for table in schema.PLAN_CHILD_TABLES:
+                rows = self.read_table(table)
+                remaining = [r for r in rows if r.get("plan_id") != plan_id]
+                if len(remaining) != len(rows):
+                    self.write_table(table, remaining)
             self.delete_rows(schema.TABLE_PLAN, [plan_id])
-            for table in child_tables:
-                remaining = [r for r in self.read_table(table)
-                             if r.get("plan_id") != plan_id]
-                self.write_table(table, remaining)
         self._change_seq.pop(plan_id, None)
 
     def duplicate_plan(self, plan_id: str, new_name: str) -> str:
-        """Deep copy of inputs/rules/events/sections with new ids; the copy
-        records its lineage via ``supersedes_id``. Generations and the change
-        log start fresh (they describe the original's history, not the copy's).
+        """Deep copy of the plan's "copy" tables (``schema.PLAN_CHILD_TABLES``:
+        inputs, rules, events, sections, risk checks, hazards, ground model,
+        BAS rows, sampled profile) with new ids; the copy records its lineage
+        via ``supersedes_id``. Generations, the change log and derived run
+        state start fresh (they describe the original, not the copy).
         Commits atomically in SQL mode — a mid-copy failure can never leave
-        a half-duplicated plan behind."""
+        a half-duplicated plan behind; in legacy mode the plan header is
+        written last, so an interrupted copy never appears in the plan list."""
         plan = self.get_plan(plan_id)
         if plan is None:
             raise ValueError("Plan not found.")
@@ -372,6 +405,25 @@ class BurialStore:
     def _duplicate_plan_rows(self, plan_id: str, plan: Dict,
                              new_name: str) -> str:
         new_plan_id = schema.new_id()
+        # key column -> {old id: new id}, filled in PLAN_CHILD_TABLES order
+        # so later tables can re-point their references to earlier ones.
+        id_maps: Dict[str, Dict[str, str]] = {}
+        for table, mode in schema.PLAN_CHILD_TABLES.items():
+            if mode != schema.PLAN_TABLE_COPY:
+                continue
+            key = schema.TABLE_KEYS[table]
+            ids = id_maps.setdefault(key, {})
+            new_rows = []
+            for row in self.read_plan_table(table, plan_id):
+                new_row = dict(row)
+                new_row[key] = schema.new_id()
+                ids[str(row.get(key))] = new_row[key]
+                new_row["plan_id"] = new_plan_id
+                _repoint_copied_row(table, new_row, id_maps)
+                new_rows.append(new_row)
+            if new_rows:
+                self.upsert_rows(table, new_rows)
+
         now = schema.utc_now_iso()
         copy = dict(plan)
         copy.update({
@@ -383,112 +435,6 @@ class BurialStore:
             "modified_utc": now,
         })
         self.upsert_rows(schema.TABLE_PLAN, [copy])
-
-        input_id_map: Dict[str, str] = {}
-        new_inputs = []
-        for row in self.list_inputs(plan_id):
-            new_row = dict(row)
-            new_row["input_id"] = schema.new_id()
-            input_id_map[str(row.get("input_id"))] = new_row["input_id"]
-            new_row["plan_id"] = new_plan_id
-            new_inputs.append(new_row)
-        if new_inputs:
-            self.upsert_rows(schema.TABLE_INPUT, new_inputs)
-
-        new_rules = []
-        for row in self.list_rules(plan_id):
-            new_row = dict(row)
-            new_row["rule_id"] = schema.new_id()
-            new_row["plan_id"] = new_plan_id
-            # Re-point registered-input references inside the config payload.
-            try:
-                config = json.loads(new_row.get("config_json") or "{}")
-            except (ValueError, TypeError):
-                config = {}
-            if isinstance(config, dict) and config.get("input_id") in input_id_map:
-                config["input_id"] = input_id_map[config["input_id"]]
-                new_row["config_json"] = json.dumps(config)
-            new_rules.append(new_row)
-        if new_rules:
-            self.upsert_rows(schema.TABLE_RULE, new_rules)
-
-        new_events = []
-        event_id_map: Dict[str, str] = {}
-        for row in self.list_events(plan_id):
-            new_row = dict(row)
-            new_row["event_id"] = schema.new_id()
-            event_id_map[str(row.get("event_id"))] = new_row["event_id"]
-            new_row["plan_id"] = new_plan_id
-            new_row["generation_id"] = ""
-            new_events.append(new_row)
-        if new_events:
-            self.upsert_rows(schema.TABLE_EVENT, new_events)
-
-        new_sections = []
-        for row in self.list_sections(plan_id):
-            new_row = dict(row)
-            new_row["section_id"] = schema.new_id()
-            new_row["plan_id"] = new_plan_id
-            for col in ("start_event_id", "end_event_id"):
-                new_row[col] = event_id_map.get(str(row.get(col) or ""), "")
-            new_sections.append(new_row)
-        if new_sections:
-            self.upsert_rows(schema.TABLE_SECTION, new_sections)
-
-        check_id_map: Dict[str, str] = {}
-        new_checks = []
-        for row in self.list_risk_checks(plan_id):
-            new_row = dict(row)
-            new_row["check_id"] = schema.new_id()
-            check_id_map[str(row.get("check_id"))] = new_row["check_id"]
-            new_row["plan_id"] = new_plan_id
-            try:
-                config = json.loads(new_row.get("config_json") or "{}")
-            except (ValueError, TypeError):
-                config = {}
-            if isinstance(config, dict) and config.get("input_id") in input_id_map:
-                config["input_id"] = input_id_map[config["input_id"]]
-                new_row["config_json"] = json.dumps(config)
-            new_checks.append(new_row)
-        if new_checks:
-            self.upsert_rows(schema.TABLE_RISK_CHECK, new_checks)
-
-        new_hazards = []
-        for row in self.list_hazards(plan_id):
-            new_row = dict(row)
-            new_row["hazard_id"] = schema.new_id()
-            new_row["plan_id"] = new_plan_id
-            new_row["check_id"] = check_id_map.get(
-                str(row.get("check_id") or ""), "")
-            new_hazards.append(new_row)
-        if new_hazards:
-            self.upsert_rows(schema.TABLE_HAZARD, new_hazards)
-
-        new_units = []
-        for row in self.list_ground_units(plan_id):
-            new_row = dict(row)
-            new_row["unit_id"] = schema.new_id()
-            new_row["plan_id"] = new_plan_id
-            new_units.append(new_row)
-        if new_units:
-            self.upsert_rows(schema.TABLE_GROUND_UNIT, new_units)
-
-        new_bas = []
-        for row in self.list_bas_rows(plan_id):
-            new_row = dict(row)
-            new_row["row_id"] = schema.new_id()
-            new_row["plan_id"] = new_plan_id
-            new_bas.append(new_row)
-        if new_bas:
-            self.upsert_rows(schema.TABLE_BAS_ROW, new_bas)
-
-        # The sampled profile is derived but expensive — carry the copy over.
-        profile_row = self.get_plan_profile(plan_id)
-        if profile_row is not None:
-            profile_copy = dict(profile_row)
-            profile_copy["profile_id"] = schema.new_id()
-            profile_copy["plan_id"] = new_plan_id
-            self.upsert_rows(schema.TABLE_PROFILE, [profile_copy])
         return new_plan_id
 
     # -- inputs --------------------------------------------------------------
@@ -963,6 +909,30 @@ def _migrate_v6_to_v7(store: BurialStore) -> None:
 # Maps a starting schema version to the function upgrading it one step.
 MIGRATIONS: Dict[int, object] = {1: _migrate_v1_to_v2, 3: _migrate_v3_to_v4,
                                  5: _migrate_v5_to_v6, 6: _migrate_v6_to_v7}
+
+
+def _repoint_copied_row(table: str, row: Dict,
+                        id_maps: Dict[str, Dict[str, str]]) -> None:
+    """Re-point a duplicated row's references at the copy's new ids."""
+    if table in (schema.TABLE_RULE, schema.TABLE_RISK_CHECK):
+        # Registered-input references inside the config payload.
+        inputs = id_maps.get("input_id", {})
+        try:
+            config = json.loads(row.get("config_json") or "{}")
+        except (ValueError, TypeError):
+            config = {}
+        if isinstance(config, dict) and config.get("input_id") in inputs:
+            config["input_id"] = inputs[config["input_id"]]
+            row["config_json"] = json.dumps(config)
+    elif table == schema.TABLE_EVENT:
+        row["generation_id"] = ""  # generations are not copied
+    elif table == schema.TABLE_SECTION:
+        events = id_maps.get("event_id", {})
+        for col in ("start_event_id", "end_event_id"):
+            row[col] = events.get(str(row.get(col) or ""), "")
+    elif table == schema.TABLE_HAZARD:
+        row["check_id"] = id_maps.get("check_id", {}).get(
+            str(row.get("check_id") or ""), "")
 
 
 def _normalise_row(row: Dict) -> Dict:

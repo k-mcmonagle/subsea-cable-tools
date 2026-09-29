@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from qgis.core import QgsProject
 from qgis.PyQt.QtCore import QObject, QTimer, pyqtSignal
 
+from ..plugin_log import log_exception
 from ..workbench.depth_service import DepthService, DepthSourceConfig
 from ..workbench import rules_engine as eng
 from ..workbench.rules_engine import Interval
@@ -351,6 +353,8 @@ class PlanModel(QObject):
                             "Workbench RPL with the same name and revision "
                             "was matched; click Set route to save the relink.")
             except Exception:
+                log_exception("Burial Planner: the plan's Workbench RPL could "
+                              "not be opened")
                 lines_layer = None
         if lines_layer is None:
             # Fallback: a project line layer captured at plan creation.
@@ -383,6 +387,7 @@ class PlanModel(QObject):
                 from .. import kp_datum
                 self.kp_check = kp_datum.check_route_kps(self.route, self.rpl_positions)
             except Exception:
+                log_exception("Burial Planner: RPL KP check skipped")
                 self.kp_check = None
         if rpl_row is not None:
             self.newer_rpl = self._newer_revision(rpl_row)
@@ -411,6 +416,8 @@ class PlanModel(QObject):
         try:
             latest = self.workbench_store.latest_revision(route_id)
         except Exception:
+            log_exception("Burial Planner: newer-revision check failed",
+                          level=logging.DEBUG)
             return None
         if latest and str(latest.get("rpl_id") or "") != str(rpl.get("rpl_id") or ""):
             return latest
@@ -719,6 +726,8 @@ class PlanModel(QObject):
             try:
                 rpl, _matched_snapshot = self._resolve_workbench_rpl()
             except Exception:
+                log_exception("Burial Planner: RPL fingerprint lookup failed",
+                              level=logging.DEBUG)
                 rpl = None
             return map_layers.rpl_fingerprint(
                 rpl, getattr(self.workbench_store, "gpkg_path", ""))
@@ -745,6 +754,10 @@ class PlanModel(QObject):
                         or self.store.list_events(self.plan_id)
                         or self.store.list_sections(self.plan_id))
         except Exception:
+            # Answering "no KP data" means a route change keeps the stored
+            # KP numbers instead of re-referencing them.
+            log_exception("Burial Planner: could not read the plan's events "
+                          "and sections")
             return False
 
     def mark_stale(self) -> None:
@@ -770,6 +783,8 @@ class PlanModel(QObject):
                 self._route_geom_fp = map_layers.route_geometry_fingerprint(
                     self.route)
             except Exception:
+                log_exception("Burial Planner: route fingerprint failed",
+                              level=logging.DEBUG)
                 self._route_geom_fp = ""
         return self._route_geom_fp
 
@@ -807,6 +822,8 @@ class PlanModel(QObject):
         try:
             row = self.store.get_analysis(self.plan_id)
         except Exception:
+            log_exception("Burial Planner: stored analysis results could not "
+                          "be read")
             row = None
         if not row:
             return
@@ -901,6 +918,8 @@ class PlanModel(QObject):
                 active = self.store.active_generation(self.plan_id) \
                     if self.plan_id else None
             except Exception:
+                log_exception("Burial Planner: active generation not readable",
+                              level=logging.DEBUG)
                 active = None
             if active:
                 # Plans generated before bp_analysis existed: judge the
@@ -1096,6 +1115,8 @@ class PlanModel(QObject):
         try:
             info["cell"] = map_layers.min_raster_cell_size_m(project, config)
         except Exception:
+            log_exception("Burial Planner: raster cell size unavailable",
+                          level=logging.DEBUG)
             info["cell"] = None
         self._depth_info_cache = (key, now, info)
         return info
@@ -1516,11 +1537,18 @@ class PlanModel(QObject):
             plan["params_json"] = json.dumps({"kp_datum": {
                 "start_kp": 0.0, "rpl_id": plan["rpl_id"], "mode": KP_MODE_CARTESIAN,
                 "grid_crs": grid.authid() if grid is not None else ""}})
-        ok, plan_id = self._store_write("create the plan", self.store.save_plan, plan)
+
+        def write() -> str:
+            plan_id = self.store.save_plan(plan)
+            self.store.append_change(plan_id, change_log.ACTION_CREATE_PLAN,
+                                     plan_id, after={schema.TABLE_PLAN: [plan]})
+            return plan_id
+
+        # Header and its change-log row commit together: a plan must never
+        # exist without the entry that created it (or vice versa).
+        ok, plan_id = self._store_transaction("create the plan", write)
         if not ok:
             return None
-        self.store.append_change(plan_id, change_log.ACTION_CREATE_PLAN, plan_id,
-                                 after={schema.TABLE_PLAN: [plan]})
         self.load_plan(plan_id)
         return plan_id
 
@@ -1529,14 +1557,18 @@ class PlanModel(QObject):
             return False
         before = dict(self.plan)
         self.plan.update(updates)
-        ok, _ = self._store_write("save the plan", self.store.save_plan, self.plan)
+
+        def write() -> None:
+            self.store.save_plan(self.plan)
+            self.store.append_change(
+                self.plan_id, change_log.ACTION_EDIT_PLAN, self.plan_id,
+                before={schema.TABLE_PLAN: [before]},
+                after={schema.TABLE_PLAN: [dict(self.plan)]}, reason=reason)
+
+        ok, _ = self._store_transaction("save the plan", write)
         if not ok:
             self.plan = before
             return False
-        self.store.append_change(
-            self.plan_id, change_log.ACTION_EDIT_PLAN, self.plan_id,
-            before={schema.TABLE_PLAN: [before]},
-            after={schema.TABLE_PLAN: [dict(self.plan)]}, reason=reason)
         self.logChanged.emit()
         changed_keys = set(updates)
         if (before.get("name"), before.get("rev_label")) != (
@@ -1723,6 +1755,8 @@ class PlanModel(QObject):
         try:
             layer = map_layers.resolve_input_layer(project, row)
         except Exception:
+            log_exception("Burial Planner: input layer could not be resolved",
+                          level=logging.DEBUG)
             layer = None
         if layer is not None:
             return ("file", "not in the project — read from its file "
@@ -3190,6 +3224,10 @@ class PlanModel(QObject):
             self._flush_layer_refresh()
         else:
             self._layer_timer.start()
+
+    def flush_layer_refresh(self) -> None:
+        """Write a debounced layer refresh now (dock close / unload)."""
+        self._flush_layer_refresh()
 
     def _flush_layer_refresh(self) -> None:
         self._layer_timer.stop()

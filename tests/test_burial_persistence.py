@@ -712,6 +712,8 @@ def test_dock_builds_and_survives_project_reload() -> bool:
         plan_id = model.create_plan("Dock", "plough")
         model.save_rules([_rule("r1")])
         dock = burial_dock.BurialPlannerDock(_Iface())
+        # shutdown() saves the window mode: keep the tester's QSettings.
+        dock._save_window_state = lambda: None
         QCoreApplication.processEvents()
         ok = dock.model.plan_id == plan_id
         # Every tab refreshes without raising on a plan with no route.

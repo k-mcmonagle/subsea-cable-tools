@@ -15,6 +15,7 @@ progress and a working Stop (resumable) — QGIS stays usable throughout. No
 from __future__ import annotations
 
 import dataclasses
+import logging
 import math
 import os
 from typing import Dict, List, Optional
@@ -22,6 +23,7 @@ from typing import Dict, List, Optional
 from qgis.core import (
     QgsApplication,
     QgsCoordinateTransform,
+    QgsCsException,
     QgsGeometry,
     QgsPointXY,
     QgsProject,
@@ -52,15 +54,16 @@ try:
     from qgis.PyQt import sip
 
     _sip_isdeleted = sip.isdeleted
-except Exception:  # pragma: no cover
+except (ImportError, AttributeError):  # pragma: no cover
     try:
         import sip
 
         _sip_isdeleted = sip.isdeleted
-    except Exception:
+    except (ImportError, AttributeError):
         def _sip_isdeleted(_obj):
             return False
 
+from ..plugin_log import log_debug, log_exception, log_info, log_warning
 from ..qgis_compat import (
     GEOMETRY_LINE,
     MESSAGE_BOX_NO,
@@ -178,6 +181,13 @@ class BurialPlannerDock(QDockWidget):
         # Last highlighted (start, end) → canvas geometry: a row double-click
         # highlights on selection and again on go-to; slice the route once.
         self._highlight_cache = None
+        # Lifecycle: closing the window suspends (resume() on the next show
+        # undoes it — the plugin reuses this dock); shutdown() is the final
+        # teardown on plugin unload.
+        self._suspended = False
+        self._shutting_down = False
+        self._refresh_pending = False
+        self._project_hooks = []
         # GUI-thread stall diagnostics (stdlib faulthandler; see watchdog.py).
         self._watchdog = watchdog.StallWatchdog(parent=self)
 
@@ -346,24 +356,13 @@ class BurialPlannerDock(QDockWidget):
         if splitter_state is not None:
             try:
                 self.splitter.restoreState(splitter_state)
-            except Exception:
-                pass
+            except (TypeError, ValueError):
+                log_exception("Burial Planner: saved splitter layout ignored",
+                              level=logging.DEBUG)
         self.splitter.splitterMoved.connect(self._save_dock_splitter_state)
         outer.addWidget(self.splitter, 1)
         self.setWidget(container)
-        if self._watchdog.start():
-            try:
-                from qgis.core import QgsMessageLog
-
-                from ..qgis_compat import MESSAGE_INFO
-                QgsMessageLog.logMessage(
-                    "Stall watchdog armed: if QGIS stops responding for more "
-                    f"than {self._watchdog.threshold_s:g} s while the Burial "
-                    "Planner is open, all thread stacks are written to "
-                    f"{self._watchdog.log_path}",
-                    "Burial Planner", MESSAGE_INFO)
-            except Exception:
-                pass
+        self._arm_watchdog()
 
         self.model.planChanged.connect(self._refresh_strip)
         self.model.planChanged.connect(self._refresh_profile)
@@ -391,16 +390,8 @@ class BurialPlannerDock(QDockWidget):
         self._layers_timer.setSingleShot(True)
         self._layers_timer.setInterval(300)
         self._layers_timer.timeout.connect(self._project_layers_changed)
-        project = QgsProject.instance()
-        self._project_hooks = []
-        for signal, slot in ((project.readProject, self._project_reloaded),
-                             (project.layersAdded, self._schedule_layers_check),
-                             (project.layersRemoved, self._schedule_layers_check)):
-            try:
-                signal.connect(slot)
-                self._project_hooks.append((signal, slot))
-            except (AttributeError, TypeError, RuntimeError):
-                pass
+        self._install_project_hooks()
+        self._refresh_soon = ui_helpers.coalesced(self, self._refresh_if_pending)
 
         self.refresh_plans()
 
@@ -434,7 +425,10 @@ class BurialPlannerDock(QDockWidget):
                         f"side plan file instead:\n{fallback}")
                     return store, fallback, None
                 except Exception:
-                    pass
+                    # The first error is the one reported to the user.
+                    log_exception("Burial Planner: project-side fallback plan "
+                                  f"file not usable: {fallback}",
+                                  level=logging.DEBUG)
             return BurialStore(path), path, str(first_error)
 
     @staticmethod
@@ -451,7 +445,7 @@ class BurialPlannerDock(QDockWidget):
 
     def _switch_store(self, store: BurialStore, path: str) -> bool:
         """Switch the plan list to an already validated store."""
-        if self._task is not None:
+        if self._analysis_running():
             QMessageBox.warning(
                 self, "Burial Planner",
                 "An exclusion analysis is still running. Stop it and wait "
@@ -464,10 +458,7 @@ class BurialPlannerDock(QDockWidget):
                 "and wait for it to finish before changing the plan file.")
             return False
         self._cancel_profile_refresh(silent=True)
-        try:
-            self.store.close()  # checkpoint + release the old SQL handle
-        except Exception:
-            pass
+        self._close_store()  # checkpoint + release the old SQL handle
         self.store = store
         self.store_ready = True
         set_project_gpkg_path(path)
@@ -525,6 +516,9 @@ class BurialPlannerDock(QDockWidget):
                 try:
                     rpls = store.list_rpls()
                 except Exception:
+                    log_exception("Burial Planner: Workbench registry not "
+                                  f"readable, skipped: {path}",
+                                  level=logging.DEBUG)
                     continue
                 score = 5 if normal == discovered_norm else 0
                 if wanted_id and any(str(row.get("rpl_id") or "") == wanted_id
@@ -548,6 +542,9 @@ class BurialPlannerDock(QDockWidget):
                 wb_store_module.set_project_gpkg_path(chosen.gpkg_path)
             return chosen
         except Exception:
+            # Without the Workbench the plan's RPL route cannot load.
+            log_exception("Burial Planner: could not resolve the Workbench "
+                          "registry")
             return None
 
     def _on_store_error(self, message: str) -> None:
@@ -836,12 +833,58 @@ class BurialPlannerDock(QDockWidget):
                              keep_client=keep_client)
 
     def cancel_analysis(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
+        """Stop button: ask the running analysis to stop.
+
+        The reference is kept until the completion callback reports the
+        stop: the worker may still be finishing a step, and the route and
+        profile state it reads must not be shared with a new run meanwhile.
+        A task that has already ended is dropped at once
+        (``_analysis_running``), so nothing can stay stuck "running".
+        """
+        if not self._analysis_running():
+            return
+        self._task.cancel()
+        self.builder_tab.analysis_message("Stopping…")
+
+    def _analysis_running(self) -> bool:
+        """True while ``self._task`` is a live task; drops a stale one."""
+        if self._task is not None \
+                and not analysis_task.task_is_active(self._task):
+            # Ended without its completion callback reaching us (or it is
+            # still queued behind this call): never block later runs on it.
+            log_debug("Burial Planner: dropped an ended analysis task")
+            self._task = None
+            self._reset_analysis_ui("")
+        return self._task is not None
+
+    def _discard_analysis(self, message: str) -> None:
+        """Cancel and forget the running analysis (window close / unload).
+
+        Its late completion callback is then ignored (``_analysis_finished``
+        accepts only the current task), so a run that completed just before
+        the cancel took effect can no longer write into a closed store or
+        touch a deleted dock.
+        """
+        task, self._task = self._task, None
+        if task is None:
+            return
+        try:
+            task.cancel()
+        except RuntimeError:
+            pass  # the task manager already deleted it
+        self._reset_analysis_ui(message)
+
+    def _reset_analysis_ui(self, message: str) -> None:
+        for reset in (self.rules_tab.analysis_finished,
+                      lambda: self.builder_tab.analysis_finished(message)):
+            try:
+                reset()
+            except RuntimeError:
+                pass  # widgets already deleted (plugin unload)
 
     def _start_analysis(self, generate: bool, fresh: bool = False,
                         keep_client: bool = True) -> None:
-        if self._task is not None:
+        if self._analysis_running():
             self.builder_tab.analysis_message("An analysis is already running.")
             return
         if self._profile_task is not None:
@@ -941,11 +984,16 @@ class BurialPlannerDock(QDockWidget):
         QgsApplication.taskManager().addTask(self._task)
 
     def _analysis_finished(self, task: analysis_task.BurialAnalysisTask) -> None:
+        if task is not self._task:
+            # Discarded when the window closed / the plugin unloaded, or
+            # dropped as ended: its results belong to a state that is gone.
+            return
         self._task = None
         try:
             self.rules_tab.analysis_finished()
         except Exception:
-            pass  # must never block resetting the builder progress below
+            # Must never block resetting the builder progress below.
+            log_exception("Burial Planner: Exclusions tab reset failed")
         if getattr(self, "_task_plan_id", "") != self.model.plan_id:
             # The user switched plans (or plan files) while the analysis
             # ran — the results were built from the other plan's rules and
@@ -971,7 +1019,8 @@ class BurialPlannerDock(QDockWidget):
             QMessageBox.warning(
                 self, "Burial Planner",
                 "The analysis finished but its results could not be applied:\n"
-                f"{exc}\n\nDetails are in the QGIS message log (Burial Planner).")
+                f"{exc}\n\nDetails are in the QGIS message log "
+                "(Subsea Cable Tools).")
             raise
 
     def _apply_analysis_results(self,
@@ -1196,7 +1245,7 @@ class BurialPlannerDock(QDockWidget):
         """One background sampling pass over the scope (+ one-step margin)."""
         if not self.model.plan or self.model.route is None:
             return
-        if self._task is not None:
+        if self._analysis_running():
             self.profile_status.setText(
                 "Wait for the running analysis to finish (or stop it) "
                 "before resampling the profile.")
@@ -1268,11 +1317,17 @@ class BurialPlannerDock(QDockWidget):
     def _profile_finished(self, task: analysis_task.ProfileSamplingTask,
                           generation_id: int) -> None:
         if generation_id != self._profile_generation:
-            return
-        if self._profile_task is task:
-            self._profile_task = None
+            return  # superseded by a newer refresh, or discarded on close
         self.profile_progress.setVisible(False)
         self.profile_cancel.setVisible(False)
+        if self._profile_task is not task:
+            # Stopped by the user: samples finished before the stop took
+            # effect are not wanted either — the stored profile stays.
+            self.profile_status.setText(
+                "Profile sampling cancelled — stored samples unchanged.")
+            self.profile_tab.refresh()
+            return
+        self._profile_task = None
         if task.cancelled:
             self.profile_status.setText(
                 "Profile sampling cancelled — stored samples unchanged.")
@@ -1419,7 +1474,8 @@ class BurialPlannerDock(QDockWidget):
                 try:
                     on_finished()
                 except Exception:
-                    pass
+                    log_exception("Burial Planner: map-pick completion "
+                                  "callback failed")
 
         tool = KpPickTool(self.canvas, self.model.route, callback, restore)
         self._pick_tool = tool
@@ -1431,7 +1487,8 @@ class BurialPlannerDock(QDockWidget):
                 self.iface.messageBar().pushMessage(
                     "Burial Planner", prompt, MESSAGE_INFO, 4)
             except Exception:
-                pass
+                log_exception("Burial Planner: pick prompt not shown",
+                              level=logging.DEBUG)
         return True
 
     def pick_route_offset_on_map(self, callback, prompt: str = "",
@@ -1468,7 +1525,8 @@ class BurialPlannerDock(QDockWidget):
                 try:
                     on_finished()
                 except Exception:
-                    pass
+                    log_exception("Burial Planner: map-pick completion "
+                                  "callback failed")
 
         tool = RouteOffsetPickTool(self.canvas, self.model.route, callback,
                                    direction=self.model.direction,
@@ -1482,7 +1540,8 @@ class BurialPlannerDock(QDockWidget):
                 self.iface.messageBar().pushMessage(
                     "Burial Planner", prompt, MESSAGE_INFO, 6)
             except Exception:
-                pass
+                log_exception("Burial Planner: pick prompt not shown",
+                              level=logging.DEBUG)
         return True
 
     # -- map sync -------------------------------------------------------------
@@ -1512,7 +1571,9 @@ class BurialPlannerDock(QDockWidget):
             return None
         try:
             return self._canvas_transform().transform(point)
-        except Exception:
+        except QgsCsException:
+            log_exception("Burial Planner: KP marker transform failed",
+                          level=logging.DEBUG)
             return point
 
     def _ensure_marker(self):
@@ -1528,7 +1589,8 @@ class BurialPlannerDock(QDockWidget):
         try:
             self.ground_tab.sync_kp(kp)
         except Exception:
-            pass
+            log_exception("Burial Planner: ground plot hover sync failed",
+                          level=logging.DEBUG)
         point = self._canvas_point(kp)
         if point is None:
             return
@@ -1633,6 +1695,8 @@ class BurialPlannerDock(QDockWidget):
             geom, _heading = footprint.place_outline_at(
                 outline, *pose, target_crs=dest_crs)
         except Exception:
+            log_exception("Burial Planner: outline placement failed",
+                          level=logging.DEBUG)
             return None
         return None if geom is None or geom.isEmpty() else geom
 
@@ -1694,6 +1758,8 @@ class BurialPlannerDock(QDockWidget):
                             outline, self.model.route, kp,
                             target_crs=dest_crs)
                     except Exception:
+                        log_exception("Burial Planner: tool outline "
+                                      "placement failed", level=logging.DEBUG)
                         geom = None
                 if geom is not None and not geom.isEmpty():
                     geom_type = (GEOMETRY_LINE
@@ -1799,8 +1865,8 @@ class BurialPlannerDock(QDockWidget):
             self._canvas_inverse_cache = cached
         try:
             return cached[1].transform(map_point)
-        except Exception:
-            return None
+        except QgsCsException:
+            return None  # cursor outside the CRS's valid area
 
     def _snap_to_tool_path(self, wgs_point, points):
         """Nearest tool-path segment: ``(index, fraction)`` or ``None``.
@@ -1830,7 +1896,9 @@ class BurialPlannerDock(QDockWidget):
         try:
             sqr_dist, min_point, after_vertex, _side = \
                 geom.closestSegmentWithContext(probe)
-        except Exception:
+        except (TypeError, ValueError):
+            log_exception("Burial Planner: tool-path snap failed",
+                          level=logging.DEBUG)
             return None
         if sqr_dist < 0 or after_vertex <= 0:
             return None
@@ -1884,6 +1952,8 @@ class BurialPlannerDock(QDockWidget):
                         and math.isfinite(hit.dcc_m):
                     kp = float(hit.kp_km)
             except Exception:
+                log_exception("Burial Planner: cursor KP lookup failed",
+                              level=logging.DEBUG)
                 kp = None
         if tool_pose is None and kp is None:
             self._hide_footprint()
@@ -1916,8 +1986,9 @@ class BurialPlannerDock(QDockWidget):
                     QgsProject.instance())
                 geom = type(geom)(geom)
                 geom.transform(transform)
-            except Exception:
-                pass
+            except QgsCsException:
+                log_exception("Burial Planner: range highlight transform "
+                              "failed", level=logging.DEBUG)
             self._highlight_cache = (key, geom)
         if self._band is None or _sip_isdeleted(self._band):
             self._band = QgsRubberBand(self.canvas, GEOMETRY_LINE)
@@ -1960,7 +2031,9 @@ class BurialPlannerDock(QDockWidget):
             return
         try:
             geom = QgsGeometry.collectGeometry(parts)
-        except Exception:
+        except (TypeError, ValueError):
+            log_exception("Burial Planner: multi-range highlight fell back "
+                          "to the first range", level=logging.DEBUG)
             geom = parts[0]
         try:
             from qgis.core import QgsCoordinateReferenceSystem
@@ -1970,8 +2043,9 @@ class BurialPlannerDock(QDockWidget):
                 self.canvas.mapSettings().destinationCrs(),
                 QgsProject.instance())
             geom.transform(transform)
-        except Exception:
-            pass
+        except QgsCsException:
+            log_exception("Burial Planner: range highlight transform failed",
+                          level=logging.DEBUG)
         if self._band is None or _sip_isdeleted(self._band):
             self._band = QgsRubberBand(self.canvas, GEOMETRY_LINE)
             self._band.setColor(Qt.GlobalColor.yellow)
@@ -1996,7 +2070,7 @@ class BurialPlannerDock(QDockWidget):
                 QgsCoordinateReferenceSystem("EPSG:4326"),
                 self.canvas.mapSettings().destinationCrs(),
                 QgsProject.instance())
-        except Exception:
+        except QgsCsException:
             transform = None
         for start_kp, end_kp, color in spans:
             geom = self.model.route.extract_segment(float(start_kp),
@@ -2007,8 +2081,9 @@ class BurialPlannerDock(QDockWidget):
                 try:
                     geom = type(geom)(geom)
                     geom.transform(transform)
-                except Exception:
-                    pass
+                except QgsCsException:
+                    log_exception("Burial Planner: exclusion preview "
+                                  "transform failed", level=logging.DEBUG)
             band = QgsRubberBand(self.canvas, GEOMETRY_LINE)
             band.setColor(color)
             band.setWidth(6)
@@ -2095,8 +2170,9 @@ class BurialPlannerDock(QDockWidget):
                     else QgsUnitTypes.DistanceMeters, crs.mapUnits())
                 if factor and math.isfinite(factor) and factor > 0:
                     floor = 50.0 * factor
-        except Exception:
-            pass
+        except (AttributeError, RuntimeError, TypeError):
+            log_exception("Burial Planner: map-unit floor unavailable",
+                          level=logging.DEBUG)
         try:
             pixel_based = float(self.canvas.mapUnitsPerPixel()) * 40.0
         except (AttributeError, RuntimeError):
@@ -2138,8 +2214,9 @@ class BurialPlannerDock(QDockWidget):
             if geometry is not None:
                 try:
                     self.restoreGeometry(geometry)
-                except Exception:
-                    pass
+                except TypeError:
+                    log_exception("Burial Planner: saved window geometry "
+                                  "ignored", level=logging.DEBUG)
             else:
                 self.resize(1100, 750)
 
@@ -2149,8 +2226,9 @@ class BurialPlannerDock(QDockWidget):
             settings.setValue(_FLOATING_MODE_KEY, self.isFloating())
             if self.isFloating():
                 settings.setValue(_FLOATING_GEOMETRY_KEY, self.saveGeometry())
-        except Exception:
-            pass
+        except RuntimeError:  # window already deleted
+            log_exception("Burial Planner: window state not saved",
+                          level=logging.DEBUG)
 
     def _schedule_layers_check(self, *_args) -> None:
         self._layers_timer.start()  # coalesce a project load's burst
@@ -2166,7 +2244,7 @@ class BurialPlannerDock(QDockWidget):
     def _project_reloaded(self, *_args) -> None:
         """The project was (re)opened with this dock open: reopen the
         project's plan file and reload the plan against the new layers."""
-        if getattr(self, "_shutting_down", False):
+        if self._shutting_down or self._suspended:
             return
         plan_id = self.model.plan_id
         self.model.invalidate_depth_cache()
@@ -2179,16 +2257,14 @@ class BurialPlannerDock(QDockWidget):
 
     def refresh(self) -> None:
         """Re-read the current project's store on every open."""
+        self._refresh_pending = False
         saved_path = project_gpkg_path()
         path = saved_path or default_project_gpkg_path()
         if path != self.store.gpkg_path:
             store, path, error = self._open_store_with_recovery(
                 path, create_if_missing=not bool(saved_path))
             if not error:
-                try:
-                    self.store.close()
-                except Exception:
-                    pass
+                self._close_store()
                 self.store = store
                 self.store_ready = True
                 self.model.store = store
@@ -2208,15 +2284,102 @@ class BurialPlannerDock(QDockWidget):
             self.model.workbench_store = self.workbench_store()
         self.refresh_plans(self.model.plan_id)
 
-    def shutdown(self) -> None:
-        """Transient artefacts only — never deletes data or registry rows."""
-        self._shutting_down = True
-        for signal, slot in getattr(self, "_project_hooks", []):
+    # -- lifecycle -------------------------------------------------------------
+    # Closing the window (X, or unticking it under View > Panels) only hides
+    # a QDockWidget, and the plugin re-shows the same instance, so a close
+    # suspends: background work stops, project hooks and the stall watchdog
+    # are released, and resume() re-arms them on the next show. Plugin
+    # unload calls shutdown(): the same teardown, for good.
+    def _install_project_hooks(self) -> None:
+        """Follow project (re)loads and layer changes (idempotent)."""
+        if self._project_hooks:
+            return
+        project = QgsProject.instance()
+        for signal, slot in ((project.readProject, self._project_reloaded),
+                             (project.layersAdded, self._schedule_layers_check),
+                             (project.layersRemoved, self._schedule_layers_check)):
+            try:
+                signal.connect(slot)
+                self._project_hooks.append((signal, slot))
+            except (AttributeError, TypeError, RuntimeError):
+                log_exception("Burial Planner: cannot follow project changes")
+
+    def _remove_project_hooks(self) -> None:
+        hooks, self._project_hooks = self._project_hooks, []
+        for signal, slot in hooks:
             try:
                 signal.disconnect(slot)
             except (TypeError, RuntimeError):
-                pass
-        self._project_hooks = []
+                pass  # already disconnected, or the project is gone
+
+    def _arm_watchdog(self) -> None:
+        if self._watchdog.start():
+            log_info(
+                "Burial Planner: stall watchdog armed — if QGIS stops "
+                f"responding for more than {self._watchdog.threshold_s:g} s "
+                "while the Burial Planner is open, all thread stacks are "
+                f"written to {self._watchdog.log_path}")
+        else:
+            log_warning("Burial Planner: stall watchdog unavailable "
+                        f"({self._watchdog.error})")
+
+    def _close_store(self) -> None:
+        """Checkpoint the WAL and release the SQL handle (file unlocked)."""
+        try:
+            self.store.close()
+        except Exception:
+            # Committed data stays valid in the -wal sidecar.
+            log_exception("Burial Planner: closing the plan file failed")
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.resume()
+
+    def closeEvent(self, event) -> None:
+        self.suspend()  # saves the window state first
+        super().closeEvent(event)
+
+    def suspend(self) -> None:
+        """The window closed: stop background work, keep the dock for
+        reuse. Never deletes data or registry rows."""
+        if self._shutting_down or self._suspended:
+            return
+        self._suspended = True
+        self._stop_activity()
+
+    def resume(self) -> None:
+        """Re-arm what ``suspend`` stopped (idempotent; on every show).
+
+        Another project may have been opened while the window was closed:
+        the plan file is re-resolved once the event loop is back, unless
+        the plugin's own ``refresh()`` after ``show()`` did it first.
+        """
+        if self._shutting_down or not self._suspended:
+            return
+        self._suspended = False
+        self._install_project_hooks()
+        self._arm_watchdog()
+        self._refresh_pending = True
+        self._refresh_soon()
+
+    def _refresh_if_pending(self) -> None:
+        if self._refresh_pending and not (self._shutting_down
+                                          or self._suspended):
+            self.refresh()
+
+    def shutdown(self) -> None:
+        """Final teardown on plugin unload (the dock is deleted next).
+
+        Transient artefacts only — never deletes data or registry rows.
+        """
+        self._shutting_down = True
+        self._suspended = True
+        self._stop_activity()
+
+    def _stop_activity(self) -> None:
+        """Everything a closed or unloading dock must not keep running."""
+        self._remove_project_hooks()
+        self._refresh_pending = False
         try:
             self._layers_timer.stop()
         except (AttributeError, RuntimeError):
@@ -2226,26 +2389,34 @@ class BurialPlannerDock(QDockWidget):
             self._watchdog.stop()
         except (AttributeError, RuntimeError):
             pass
-        try:
-            self.cancel_analysis()
-        except (AttributeError, RuntimeError):
-            pass
+        self._discard_analysis(
+            "Stopped when the window closed — completed rules stay cached; "
+            "run again to resume.")
         try:
             self.paths_tab.shutdown()
         except (AttributeError, RuntimeError):
             pass
-        try:
-            self.store.close()  # checkpoint WAL + release the SQL handle
-        except Exception:
-            pass
-        try:
-            self._cancel_profile_refresh(silent=True)
-        except (AttributeError, RuntimeError):
-            pass
+        if self._profile_task is not None:
+            try:
+                self._cancel_profile_refresh(silent=True)
+                # Drop its late callback: nothing is saved from it.
+                self._profile_generation += 1
+                message = ("Profile sampling stopped when the window closed "
+                           "— stored samples unchanged.")
+                self.profile_status.setText(message)
+                self.profile_tab.set_runtime_status(message)
+            except (AttributeError, RuntimeError):
+                pass
         try:
             self.risk_tab.shutdown()
         except (AttributeError, RuntimeError):
             pass
+        try:
+            # A debounced map-layer write must not fire after an unload.
+            self.model.flush_layer_refresh()
+        except Exception:
+            log_exception("Burial Planner: pending plan-layer refresh failed")
+        self._close_store()  # checkpoint WAL + release the SQL handle
         pick_tool = self._pick_tool
         self._pick_tool = None
         if pick_tool is not None and self.canvas is not None:
@@ -2254,9 +2425,17 @@ class BurialPlannerDock(QDockWidget):
             except (AttributeError, RuntimeError):
                 pass
         # Follow-cursor overlay: detach the viewport watcher and stop the
-        # coalescing timer before the canvas items are removed.
+        # coalescing timer before the canvas items are removed. The toggle
+        # is unticked too (off by default each session), so a reopened
+        # window's menu matches the detached watcher.
         self._cursor_outline_enabled = False
         self._cursor_outline_pos = None
+        try:
+            blocked = self.cursor_outline_toggle.blockSignals(True)
+            self.cursor_outline_toggle.setChecked(False)
+            self.cursor_outline_toggle.blockSignals(blocked)
+        except (AttributeError, RuntimeError):
+            pass
         if self._cursor_outline_timer is not None:
             try:
                 self._cursor_outline_timer.stop()
@@ -2277,7 +2456,3 @@ class BurialPlannerDock(QDockWidget):
         self._exclusion_bands = []
         for item in items:
             _remove_canvas_item(item)
-
-    def closeEvent(self, event) -> None:
-        self.shutdown()  # saves the window state first
-        super().closeEvent(event)

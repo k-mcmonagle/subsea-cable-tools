@@ -183,6 +183,170 @@ def test_missing_column_becomes_null_extra_key_ignored() -> bool:
         _cleanup(path)
 
 
+def _journal_mode(path: str) -> str:
+    conn = sqlite3.connect(path)
+    try:
+        return str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+    finally:
+        conn.close()
+
+
+def _sidecars(path: str) -> list:
+    return [s for s in ("-wal", "-shm", "-journal")
+            if os.path.exists(path + s)]
+
+
+def test_readonly_probe_leaves_plain_file_untouched() -> bool:
+    """has_table() on an ordinary database: no WAL switch, no sidecars, no
+    cached connection and no handle left open (Windows file lock)."""
+    folder = tempfile.mkdtemp(prefix="gpkg_probe_")
+    path = os.path.join(folder, "plain #1 (copy).gpkg")  # URI-hostile name
+    try:
+        _make_db(path)
+        ok = gpkg_sql.has_table(path, "bp_event")
+        ok = ok and not gpkg_sql.has_table(path, "bp_meta")
+        ok = ok and not gpkg_sql.has_table(os.path.join(folder, "none.gpkg"),
+                                           "bp_meta")
+        mode = _journal_mode(path)
+        ok = ok and mode == "delete" and not _sidecars(path)
+        ok = ok and gpkg_sql._key(path) not in gpkg_sql._connections
+        moved = path + ".moved"
+        os.rename(path, moved)  # fails on Windows while a handle is open
+        os.rename(moved, path)
+        return _result("read-only probe leaves a plain file untouched", ok,
+                       f"mode={mode} sidecars={_sidecars(path)}")
+    finally:
+        _cleanup(path)
+
+
+def test_probe_uses_cached_connection() -> bool:
+    path = _fresh_db()
+    try:
+        conn = gpkg_sql.connect(path)
+        with gpkg_sql.transaction(conn):
+            conn.execute(
+                "CREATE TABLE bp_meta (fid INTEGER PRIMARY KEY, key TEXT)")
+            # Visible through the cached connection mid-transaction.
+            ok = gpkg_sql.has_table(path, "bp_meta")
+        return _result("probe answers through an open registry connection",
+                       ok)
+    finally:
+        _cleanup(path)
+
+
+def test_network_path_detection() -> bool:
+    if os.name != "nt":
+        return _result("UNC / long-path forms classified", True,
+                       "Windows-only path forms: skipped")
+    cases = {
+        "\\\\server\\share\\plans.gpkg": True,
+        "//server/share/plans.gpkg": True,
+        "\\\\?\\UNC\\server\\share\\plans.gpkg": True,
+        "\\\\?\\C:\\data\\plans.gpkg": False,
+        os.path.join(tempfile.gettempdir(), "plans.gpkg"): False,
+    }
+    got = {case: gpkg_sql.is_network_path(case) for case in cases}
+    ok = got == cases
+    uri = gpkg_sql._readonly_uri("\\\\server\\share\\a b.gpkg")
+    ok = ok and uri == "file:////server/share/a%20b.gpkg?mode=ro"
+    return _result("UNC / long-path forms classified; UNC read-only URI", ok,
+                   str({k: v for k, v in got.items() if cases[k] != v}))
+
+
+def test_network_share_uses_rollback_journal() -> bool:
+    """Files on a share never get WAL; one made WAL locally is switched
+    back when it is reopened there."""
+    path = _fresh_db()
+    original = gpkg_sql.is_network_path
+    try:
+        gpkg_sql.connect(path)  # local: WAL
+        gpkg_sql.close(path)
+        was = _journal_mode(path)
+        gpkg_sql.is_network_path = lambda _p: True
+        conn = gpkg_sql.connect(path)
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        sync = conn.execute("PRAGMA synchronous").fetchone()[0]
+        gpkg_sql.insert_rows(conn, "bp_event", [
+            {"event_id": "e", "plan_id": "p", "seq": 0, "kp": 0.0}])
+        ok = was == "wal" and str(mode).lower() == "delete" and int(sync) == 2
+        ok = ok and gpkg_sql.checkpoint(path, truncate=True)  # harmless no-op
+        ok = ok and len(gpkg_sql.read_rows(conn, "bp_event")) == 1
+        # A real UNC path when the admin share is reachable (skipped if not).
+        drive, rest = os.path.splitdrive(os.path.abspath(path))
+        unc = "\\\\localhost\\" + drive.rstrip(":") + "$" + rest
+        gpkg_sql.is_network_path = original
+        gpkg_sql.close(path)
+        detail = f"was={was} mode={mode} sync={sync}"
+        if os.name == "nt" and drive and os.path.exists(unc):
+            ok = ok and gpkg_sql.is_network_path(unc)
+            ok = ok and gpkg_sql.has_table(unc, "bp_event")
+            unc_conn = gpkg_sql.connect(unc)
+            unc_mode = unc_conn.execute("PRAGMA journal_mode").fetchone()[0]
+            gpkg_sql.close(unc)
+            ok = ok and str(unc_mode).lower() == "delete"
+            detail += f" unc={unc_mode}"
+        else:
+            detail += " (UNC admin share unavailable: skipped)"
+        return _result("network share keeps the rollback journal", ok, detail)
+    finally:
+        gpkg_sql.is_network_path = original
+        _cleanup(path)
+
+
+def test_readonly_file_opens_without_wal() -> bool:
+    """A read-only registry still opens through SQL: reads work, a write
+    fails cleanly instead of pushing the store into non-atomic legacy mode."""
+    import stat
+
+    path = _fresh_db()
+    try:
+        conn = sqlite3.connect(path)
+        conn.execute("INSERT INTO bp_event (event_id, plan_id) VALUES ('e', 'p')")
+        conn.commit()
+        conn.close()
+        os.chmod(path, stat.S_IREAD)
+        conn = gpkg_sql.connect(path)
+        ok = len(gpkg_sql.read_rows(conn, "bp_event")) == 1
+        try:
+            gpkg_sql.insert_rows(conn, "bp_event", [{"event_id": "x"}])
+            ok = False
+        except sqlite3.OperationalError as exc:
+            ok = ok and "readonly" in str(exc).replace(" ", "").lower()
+        ok = ok and not conn.in_transaction
+        gpkg_sql.close(path)
+        ok = ok and _journal_mode(path) == "delete"
+        return _result("read-only file opens through SQL without WAL", ok)
+    finally:
+        os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+        _cleanup(path)
+
+
+def test_lock_errors_are_transient() -> bool:
+    path = _fresh_db()
+    holder = sqlite3.connect(path)
+    try:
+        holder.execute("BEGIN EXCLUSIVE")
+        other = sqlite3.connect(path, timeout=0)
+        try:
+            other.execute("SELECT COUNT(*) FROM bp_event").fetchone()
+            busy = None
+        except sqlite3.OperationalError as exc:
+            busy = exc
+        finally:
+            other.close()
+        ok = busy is not None and gpkg_sql.is_transient(busy)
+        ok = ok and not gpkg_sql.is_transient(
+            sqlite3.OperationalError("no such table: bp_meta"))
+        ok = ok and not gpkg_sql.is_transient(
+            sqlite3.DatabaseError("file is not a database"))
+        return _result("lock/busy errors classified as transient", ok,
+                       str(busy))
+    finally:
+        holder.rollback()
+        holder.close()
+        _cleanup(path)
+
+
 def run_all() -> list:
     return [
         test_read_write_filtered(),
@@ -191,6 +355,12 @@ def run_all() -> list:
         test_transaction_atomicity(),
         test_wal_checkpoint_folds_sidecar(),
         test_missing_column_becomes_null_extra_key_ignored(),
+        test_readonly_probe_leaves_plain_file_untouched(),
+        test_probe_uses_cached_connection(),
+        test_network_path_detection(),
+        test_network_share_uses_rollback_journal(),
+        test_readonly_file_opens_without_wal(),
+        test_lock_errors_are_transient(),
     ]
 
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
@@ -29,6 +30,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
+    QgsCsException,
     QgsGeometry,
     QgsPointXY,
     QgsProject,
@@ -42,6 +44,7 @@ from qgis.PyQt.QtCore import pyqtSignal
 
 from ..kp_geo_utils import RouteFrame
 from ..kp_range_utils import make_distance_area, make_kp_distance_area
+from ..plugin_log import log_exception, log_warning
 from ..workbench import rules_engine as eng
 from ..workbench import rules_inputs as ri
 from ..workbench import schema as wb_schema
@@ -61,18 +64,8 @@ def _log_callback_failure(context: str) -> None:
     writes), so the guard that keeps QGIS alive must not also make the
     failure invisible: log the traceback to the QGIS message log.
     """
-    import traceback
-
-    try:
-        from qgis.core import QgsMessageLog
-
-        from ..qgis_compat import MESSAGE_CRITICAL
-
-        QgsMessageLog.logMessage(
-            f"{context}: completion handler failed\n{traceback.format_exc()}",
-            "Burial Planner", MESSAGE_CRITICAL)
-    except Exception:  # pragma: no cover — logging must never raise
-        pass
+    log_exception(f"{context}: completion handler failed",
+                  level=logging.ERROR)
 
 
 def _task_flag(name: str, default: int = 0):
@@ -81,6 +74,91 @@ def _task_flag(name: str, default: int = 0):
 
 
 _CAN_CANCEL = _task_flag("CanCancel")
+
+_TASK_STATUS = getattr(QgsTask, "TaskStatus", QgsTask)
+_TASK_ENDED = (_TASK_STATUS.Complete, _TASK_STATUS.Terminated)
+
+
+def task_is_active(task) -> bool:
+    """False once ``task`` has completed, been terminated or deleted.
+
+    Owners clear their task reference in the completion callback; this
+    lets them tell a live task from a stale reference whose callback never
+    reached them, so one lost callback cannot block every later run.
+    """
+    if task is None:
+        return False
+    try:
+        return task.status() not in _TASK_ENDED
+    except RuntimeError:  # the task manager already deleted it
+        return False
+
+
+# Cross-profile transects: only nodes this far apart are projected
+# geodesically (and transformed to each raster's CRS); the samples between
+# them are interpolated linearly in the raster CRS. The geodesic departs
+# from that chord by about S²·tan(lat)/8R — under 0.2 mm for S = 50 m even
+# at 85° latitude, far below any survey cell — while the per-sample
+# geodesic + PROJ calls it replaces (up to 2001 of each per station) were
+# the largest per-sample cost of the cross-offset pass on long routes.
+TRANSECT_NODE_SPACING_M = 50.0
+
+
+def transect_points(center: QgsPointXY, bearing: float, xs: List[float],
+                    distance, transform: Optional[QgsCoordinateTransform] = None,
+                    node_spacing_m: float = TRANSECT_NODE_SPACING_M
+                    ) -> List[Optional[QgsPointXY]]:
+    """Positions of signed offsets ``xs`` (metres; + along ``bearing``,
+    − opposite) on the geodesic through WGS84 ``center``, in the CRS of
+    ``transform`` (WGS84 when None). ``None`` where a node cannot be
+    transformed.
+
+    Equivalent (to well under a millimetre, see above) to projecting every
+    offset with ``distance.computeSpheroidProject`` and transforming it.
+    """
+    if not xs:
+        return []
+    half = max(abs(float(x)) for x in xs)
+    segments = max(1, int(math.ceil(half / max(node_spacing_m, 1e-3))))
+    step = half / segments if half > 0 else 1.0
+    geographic = transform is None \
+        or transform.destinationCrs().isGeographic()
+    nodes: List[Optional[Tuple[float, float]]] = []
+    for j in range(-segments, segments + 1):
+        t = j * step
+        if j == 0 or half <= 0:
+            point = QgsPointXY(center)
+        else:
+            point = distance.computeSpheroidProject(
+                center, abs(t), bearing if t > 0 else bearing + math.pi)
+        if transform is not None:
+            try:
+                point = transform.transform(point)
+            except QgsCsException:
+                nodes.append(None)
+                continue
+        nodes.append((point.x(), point.y()))
+    if geographic:
+        # Unwrap longitudes across the antimeridian so the chords stay short.
+        ref = next((n[0] for n in nodes if n is not None), 0.0)
+        nodes = [None if n is None else
+                 (n[0] + 360.0 * round((ref - n[0]) / 360.0), n[1])
+                 for n in nodes]
+    last = 2 * segments - 1
+    out: List[Optional[QgsPointXY]] = []
+    for x in xs:
+        u = (float(x) + half) / step
+        j = min(max(int(u), 0), last)
+        a, b = nodes[j], nodes[j + 1]
+        if a is None or b is None:
+            out.append(None)
+            continue
+        f = u - j
+        px = a[0] + f * (b[0] - a[0])
+        if geographic and not -180.0 <= px <= 180.0:
+            px = (px + 180.0) % 360.0 - 180.0
+        out.append(QgsPointXY(px, a[1] + f * (b[1] - a[1])))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +200,7 @@ class DepthSnapshot:
         self._raster_last: List[Optional[Tuple[Tuple[int, int], object]]] = \
             [None] * len(self._rasters)
         self._raster_miss = object()
+        self._failed_samplers: set = set()  # id(sampler), logged once each
 
         self._contours: List[Tuple[QgsGeometry, float]] = []
         self._contour_scaled_cache: Dict = {}
@@ -170,6 +249,7 @@ class DepthSnapshot:
         total = sum(max(int(s["feature_count"]), 1)
                     for s in self._contour_sources) or 1
         done = 0
+        dropped = 0
         for spec in self._contour_sources:
             xform = None
             if spec["crs"] != WGS84:
@@ -195,12 +275,17 @@ class DepthSnapshot:
                 if xform is not None:
                     try:
                         geom.transform(xform)
-                    except Exception:
+                    except QgsCsException:
+                        dropped += 1
                         continue
                 contour_feats.append((geom, value))
             done += count
             if progress is not None:
                 progress(done, total)
+        if dropped:
+            # A skipped contour widens the gap interpolated across.
+            log_warning(f"Burial Planner: {dropped} bathymetry contour(s) "
+                        "could not be transformed to WGS84 and were skipped")
         if contour_feats:
             self._contour_index = QgsSpatialIndex()
             for i, (geom, _value) in enumerate(contour_feats):
@@ -260,8 +345,12 @@ class DepthSnapshot:
         for sampler, transform in self._native_samplers:
             try:
                 pt = transform.transform(point) if transform else point
+            except QgsCsException:
+                continue  # outside the raster CRS's valid area: no data
+            try:
                 value = sampler.sample(pt)
             except Exception:
+                self._note_sample_failure(sampler)
                 continue
             if value is not None:
                 self.last_source, self.last_cell_m = sampler.source_id, sampler.cell_m
@@ -436,6 +525,61 @@ class DepthSnapshot:
             crossings.append((kp, depth))
         return crossings
 
+    def _sample_raster_transect(self, center, bearing, xs, distance):
+        """Raster samples at the signed offsets ``xs`` across one station.
+
+        Returns ``(zs, sources, cells)`` exactly as ``_sample_rasters`` at
+        every offset position would (the first raster with a value wins,
+        finest first), but each raster's positions come from
+        ``transect_points`` — a few geodesic projections and CRS transforms
+        per transect instead of one of each per sample — and each raster is
+        read in one batch (``RasterSampler.sample_many`` where available).
+        """
+        n = len(xs)
+        zs: List[Optional[float]] = [None] * n
+        sources: List[Optional[str]] = [None] * n
+        cells: List[Optional[float]] = [None] * n
+        pending = list(range(n))
+        for sampler, transform in self._native_samplers:
+            if not pending:
+                break
+            points = transect_points(center, bearing, xs, distance, transform)
+            todo = [idx for idx in pending if points[idx] is not None]
+            values = self._sample_points(sampler, [points[idx] for idx in todo])
+            for idx, value in zip(todo, values):
+                if value is not None:
+                    zs[idx] = value
+                    sources[idx] = sampler.source_id
+                    cells[idx] = sampler.cell_m
+            pending = [idx for idx in pending if zs[idx] is None]
+        return zs, sources, cells
+
+    def _sample_points(self, sampler, points) -> List[Optional[float]]:
+        """One raster's values at ``points`` in one pass where supported."""
+        batch = getattr(sampler, "sample_many", None)
+        if batch is not None:
+            try:
+                return list(batch(points))
+            except Exception:
+                self._note_sample_failure(sampler)  # retried point by point
+        values = []
+        for point in points:
+            try:
+                values.append(sampler.sample(point))
+            except Exception:
+                self._note_sample_failure(sampler)
+                values.append(None)
+        return values
+
+    def _note_sample_failure(self, sampler) -> None:
+        """Log a raster read failure once per raster (it reads as no data)."""
+        key = id(sampler)
+        if key not in self._failed_samplers:
+            self._failed_samplers.add(key)
+            log_exception("Burial Planner: bathymetry sampling failed on "
+                          f"{sampler.source_id} (logged once); samples it "
+                          "cannot return read as no data")
+
     def offset_profile_samples(self, route, stations_km, offset_m, distance,
                                cancel=None, progress=None):
         """Shared transverse profile method: supported tilt plus local peak.
@@ -446,6 +590,13 @@ class DepthSnapshot:
         """
         port, stbd, peaks = [], [], []
         n = len(stations_km)
+        raster_xs = None
+        if self.mode in (0, 1):
+            # One sample per finest native cell across the span (fixed for
+            # the whole run, so computed once).
+            cell = min((sam.cell_m for sam, _ in self._native_samplers), default=offset_m)
+            count = max(11, min(2001, int(math.ceil(2*offset_m/max(cell,.1)))+1))
+            raster_xs = [-offset_m + j*2*offset_m/(count-1) for j in range(count)]
         for i, kp in enumerate(stations_km):
             if cancel and cancel(): raise ri.AcquisitionCancelled()
             center = route.point_at_kp(kp, clamp=True)
@@ -457,15 +608,10 @@ class DepthSnapshot:
                 def offset(t):
                     return distance.computeSpheroidProject(center, abs(t), bearing if t >= 0 else bearing+math.pi)
                 candidates = []
-                if self.mode in (0, 1):
-                    cell = min((sam.cell_m for sam, _ in self._native_samplers), default=offset_m)
-                    count = max(11, min(2001, int(math.ceil(2*offset_m/max(cell,.1)))+1))
-                    xs = [-offset_m + j*2*offset_m/(count-1) for j in range(count)]
-                    zs, sources, cells = [], [], []
-                    for t in xs:
-                        zs.append(self._sample_rasters(offset(t)))
-                        sources.append(self.last_source); cells.append(self.last_cell_m)
-                    candidates.append(cross_profile_metrics(xs,zs,offset_m,True,cells,sources))
+                if raster_xs is not None:
+                    zs, sources, cells = self._sample_raster_transect(
+                        center, bearing, raster_xs, distance)
+                    candidates.append(cross_profile_metrics(raster_xs,zs,offset_m,True,cells,sources))
                 if self.mode in (0, 2) and not any(c[0] is not None for c in candidates):
                     crossings = self._polyline_crossings([-2*offset_m/1000, 2*offset_m/1000],
                                                         [offset(-2*offset_m),offset(2*offset_m)],cancel)
@@ -651,8 +797,11 @@ def build_route_frame(lines_layer: QgsVectorLayer,
         if xform is not None:
             try:
                 geom.transform(xform)
-            except Exception:
-                continue
+            except QgsCsException as exc:
+                # Dropping the part would silently shift every later KP.
+                raise ri.RuleInputError(
+                    "A route line could not be transformed to WGS84 "
+                    f"({exc}); check the route layer's CRS.") from exc
         try:
             seq = int(feat["SeqNo"])
         except (KeyError, TypeError, ValueError):

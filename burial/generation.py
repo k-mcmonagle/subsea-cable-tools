@@ -23,6 +23,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
+from ..plugin_log import log_warning
 from ..workbench import rules_engine as eng
 from ..workbench.rules_engine import Interval, Rule, RuleHit
 from . import events as ev
@@ -415,6 +416,7 @@ def refine_intervals(intervals: List[Interval], predicate: Callable[[float], boo
     rule must be discarded by the caller, never cached.
     """
     out: List[Interval] = []
+    failures: List[str] = []
     for iv in eng.normalize(intervals):
         if cancel is not None and cancel():
             raise RefinementCancelled()
@@ -427,8 +429,8 @@ def refine_intervals(intervals: List[Interval], predicate: Callable[[float], boo
             try:
                 if predicate(inside) and not predicate(outside):
                     start = refine_boundary(predicate, inside, outside, tol_km)
-            except Exception:
-                pass  # predicate failure -> keep the acquired boundary
+            except Exception as exc:  # keep the acquired boundary
+                failures.append(repr(exc))
 
         if end < domain.end_km - 1e-9:
             inside = end - inward
@@ -436,11 +438,16 @@ def refine_intervals(intervals: List[Interval], predicate: Callable[[float], boo
             try:
                 if predicate(inside) and not predicate(outside):
                     end = refine_boundary(predicate, inside, outside, tol_km)
-            except Exception:
-                pass
+            except Exception as exc:
+                failures.append(repr(exc))
 
         if end - start > 1e-9:
             out.append(Interval(start, end))
+    if failures:
+        # Those boundaries stay at the coarse acquisition step, not tol_km.
+        log_warning(f"Burial Planner: {len(failures)} exclusion boundary(ies) "
+                    "could not be refined and keep their coarse position "
+                    f"(first error: {failures[0]})")
     return eng.normalize(out)
 
 
