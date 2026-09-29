@@ -16,6 +16,7 @@ from typing import Dict, List, Optional
 from qgis.core import QgsProject, QgsTask, QgsVectorLayerFeatureSource
 
 from ..laydata import LayDataset
+from ..plugin_log import log_exception
 
 
 def _task_flag(name: str, default: int = 0):
@@ -78,5 +79,6 @@ class LayerLoadTask(QgsTask):
             self.setProgress(100.0)
             return True
         except Exception as exc:  # pragma: no cover - surfaced via taskTerminated
+            log_exception("Cable Lay Data Explorer: layer load failed")
             self.error = str(exc)
             return False

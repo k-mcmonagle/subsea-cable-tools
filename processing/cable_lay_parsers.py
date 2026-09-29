@@ -433,7 +433,9 @@ def write_rows(sink, fields: QgsFields, rows: List[Dict], feedback=None) -> int:
     """Write ``rows`` to a feature sink using ``fields`` as the schema.
 
     The reserved :data:`WKT_KEY` entry, when present and non-null, becomes the
-    feature geometry. Returns the number of features written.
+    feature geometry. Returns the number of features written. Raises
+    ``RuntimeError`` when the sink rejects a feature (a silently dropped row
+    would otherwise leave the output short).
     """
     written = 0
     for row in rows:
@@ -445,9 +447,25 @@ def write_rows(sink, fields: QgsFields, rows: List[Dict], feedback=None) -> int:
             geom = QgsGeometry.fromWkt(wkt)
             if geom is not None and not geom.isEmpty():
                 feature.setGeometry(geom)
-        sink.addFeature(feature)
+        if not sink.addFeature(feature):
+            raise RuntimeError(
+                f"Row {written + 1} could not be written: {_sink_error(sink) or 'unknown error'}")
         written += 1
     return written
+
+
+def _sink_error(sink) -> str:
+    """Best available error text of a feature sink / vector file writer."""
+    for name in ("errorMessage", "lastError"):
+        getter = getattr(sink, name, None)
+        if getter is not None:
+            try:
+                text = getter()
+            except (TypeError, RuntimeError):
+                continue
+            if text:
+                return str(text)
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -498,7 +516,13 @@ def write_layer_to_gpkg(
 
     Other layers in the GeoPackage are preserved (the file is created if it does
     not exist, otherwise only this layer is replaced). Returns the feature count.
-    Raises ``RuntimeError`` if the writer reports an error.
+    Raises ``RuntimeError`` if the writer reports an error, rejects a row, or
+    the layer does not read back with every row (the writer's final commit
+    happens in its destructor, which cannot report failure itself).
+
+    The layer is dropped and rewritten, so a failure part-way leaves it short
+    or empty: never use this for data that exists nowhere else (the
+    Workbench / Burial registries write their rows with SQL transactions).
     """
     options = QgsVectorFileWriter.SaveVectorOptions()
     options.driverName = "GPKG"
@@ -521,8 +545,19 @@ def write_layer_to_gpkg(
         message = writer.errorMessage()
         del writer
         raise RuntimeError(f"Could not write layer '{layer_name}' to {gpkg_path}: {message}")
-    written = write_rows(writer, fields, rows)
-    del writer  # flush to disk
+    try:
+        written = write_rows(writer, fields, rows)
+    except RuntimeError as exc:
+        del writer
+        raise RuntimeError(f"Could not write layer '{layer_name}' to {gpkg_path}: {exc}") from exc
+    del writer  # flush to disk (commits the writer's transaction)
+    check = open_gpkg_layer(gpkg_path, layer_name)
+    stored = check.featureCount() if check is not None else None
+    if stored is None or (stored >= 0 and stored != written):
+        raise RuntimeError(
+            f"Layer '{layer_name}' in {gpkg_path} did not save completely "
+            f"({written} row(s) written, {stored if stored is not None else 'no layer'} "
+            "read back). The disk may be full or the file locked.")
     return written
 
 

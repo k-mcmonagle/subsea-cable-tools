@@ -555,6 +555,240 @@ def test_vacuum() -> bool:
     return _result("vacuum_gpkg", ok, f"{before} -> {after} bytes")
 
 
+# ---------------------------------------------------------------------------
+# All-or-nothing edits (cancel / failure roll back everything)
+# ---------------------------------------------------------------------------
+_BIG_ROWS = 12000  # > two 5000-row batches, so a cancel lands mid-operation
+
+
+class _CancelAfter:
+    """Feedback whose ``isCanceled`` turns True on the n-th poll."""
+
+    def __init__(self, polls: int):
+        self.polls = polls
+        self.calls = 0
+        self.progress = []
+
+    def isCanceled(self) -> bool:  # noqa: N802 (QGIS feedback API)
+        self.calls += 1
+        return self.calls >= self.polls
+
+    def setProgress(self, value) -> None:  # noqa: N802
+        self.progress.append(value)
+
+
+def _big_layer(name: str):
+    """A cable_lay-shaped layer of _BIG_ROWS points written by the OGR writer."""
+    from ..qgis_compat import WKB_POINT
+
+    gpkg = _fresh_gpkg(name)
+    layer_name = clp.prefixed_layer_name(gpkg, "cable_lay")
+    specs = [("ISO_Time", "str"), ("Time", "str"), ("Lat_dd", "float"),
+             ("Lon_dd", "float"), ("source_file", "str")]
+    rows = []
+    for i in range(_BIG_ROWS):
+        day, rest = divmod(i, 86400)
+        hh, rest = divmod(rest, 3600)
+        mm, ss = divmod(rest, 60)
+        rows.append({
+            "Time": f"{day + 1},{hh:02d}:{mm:02d}:{ss:02d}",
+            "ISO_Time": f"2024-01-{day + 1:02d}T{hh:02d}:{mm:02d}:{ss:02d}",
+            "Lat_dd": 10.0, "Lon_dd": 20.0 + i * 1e-5,
+            "source_file": "big_a.csv" if i % 2 else "big_b.csv",
+            clp.WKT_KEY: f"POINT ({20.0 + i * 1e-5} 10.0)",
+        })
+    clp.write_layer_to_gpkg(gpkg, layer_name, clp.fields_from_specs(specs), WKB_POINT,
+                            rows, QgsProject.instance().transformContext())
+    return gpkg, layer_name, _open(gpkg, layer_name)
+
+
+def _snapshot(gpkg: str, layer_name: str, field: str) -> dict:
+    fresh = _open(gpkg, layer_name)
+    return {f.id(): (None if f[field] is None else str(f[field])) for f in fresh.getFeatures()}
+
+
+def test_recompute_large_commit() -> bool:
+    """Scan and batched updates interleave on one connection (> one batch)."""
+    name = "recompute commits every batch of a large layer"
+    try:
+        gpkg, layer_name, layer = _big_layer("sct_mgmt_big_ok.gpkg")
+        counts = ops.recompute_iso_time(layer, "2024-03-01", feedback=_CancelAfter(10 ** 9))
+        after = _snapshot(gpkg, layer_name, "ISO_Time")
+    except Exception as exc:
+        return _result(name, False, repr(exc))
+    ok = counts["updated"] == _BIG_ROWS and all(v.startswith("2024-03") for v in after.values())
+    ok = ok and layer.featureCount() == _BIG_ROWS
+    return _result(name, ok, f"counts={counts}")
+
+
+def test_recompute_cancel_rolls_back() -> bool:
+    """Regression: cancelling after a batch was flushed used to leave the
+    first 5,000 rows shifted and no audit entry, so a re-run double-shifted."""
+    name = "cancelled recompute changes nothing"
+    try:
+        gpkg, layer_name, layer = _big_layer("sct_mgmt_big_cancel.gpkg")
+        before = _snapshot(gpkg, layer_name, "ISO_Time")
+        feedback = _CancelAfter(2)  # first poll (row 5000) passes, second cancels
+        try:
+            ops.recompute_iso_time(layer, "2024-03-01", feedback=feedback)
+            raised = False
+        except ops.OperationCancelled:
+            raised = True
+        after = _snapshot(gpkg, layer_name, "ISO_Time")
+    except Exception as exc:
+        return _result(name, False, repr(exc))
+    changed = sum(1 for fid, value in after.items() if before.get(fid) != value)
+    ok = raised and changed == 0 and len(after) == _BIG_ROWS and feedback.calls >= 2
+    return _result(name, ok, f"raised={raised} rows changed={changed} polls={feedback.calls}")
+
+
+def test_shared_session_rolls_back_every_step() -> bool:
+    """Fix-start-date = recompute + dedupe + edit_log row in one session: a
+    cancel during the dedupe undoes the recompute and writes no log row."""
+    name = "shared session: later cancel undoes earlier steps and the log"
+    try:
+        gpkg, layer_name, layer = _big_layer("sct_mgmt_big_session.gpkg")
+        before = _snapshot(gpkg, layer_name, "ISO_Time")
+        ops.prepare_edit_log(layer)
+        feedback = _CancelAfter(10 ** 9)
+        try:
+            with ops.GpkgEditSession(layer) as session:
+                ops.recompute_iso_time(layer, "2024-03-01", feedback=feedback,
+                                       session=session)
+                feedback.polls = feedback.calls + 1  # cancel at the next poll
+                ops.dedupe_layer_in_place(layer, ["ISO_Time"], feedback=feedback,
+                                          session=session)
+                session.log_edit(ops.edit_log_row(layer_name, "recompute_iso_time",
+                                                  {}, 1, "never committed"))
+            raised = False
+        except ops.OperationCancelled:
+            raised = True
+        after = _snapshot(gpkg, layer_name, "ISO_Time")
+        log = _open(gpkg, clp.prefixed_layer_name(gpkg, "edit_log"))
+        log_rows = 0 if log is None else log.featureCount()
+    except Exception as exc:
+        return _result(name, False, repr(exc))
+    ok = raised and after == before and log_rows == 0
+    return _result(name, ok, f"raised={raised} unchanged={after == before} log_rows={log_rows}")
+
+
+def test_status_and_delete_cancel_roll_back() -> bool:
+    name = "cancelled status / delete change nothing (column add included)"
+    try:
+        gpkg, layer_name, layer = _big_layer("sct_mgmt_big_status.gpkg")
+        fids = [f.id() for f in layer.getFeatures()]
+        try:
+            ops.apply_status(layer, {fid: ops.STATUS_STANDBY for fid in fids},
+                             feedback=_CancelAfter(2))
+            status_raised = False
+        except ops.OperationCancelled:
+            status_raised = True
+        fresh = _open(gpkg, layer_name)
+        no_column = fresh.fields().indexOf(ops.STATUS_FIELD) < 0
+        try:
+            ops.delete_source_rows(layer, ["big_a.csv"], feedback=_CancelAfter(3))
+            delete_raised = False
+        except ops.OperationCancelled:
+            delete_raised = True
+        count = _open(gpkg, layer_name).featureCount()
+        # and the same edits succeed (and commit) without a cancel
+        changed = ops.set_source_status(layer, ops.STATUS_EXCLUDED, ["big_b.csv"])
+        deleted = ops.delete_source_rows(layer, ["big_a.csv"])
+        final = _open(gpkg, layer_name)
+        statuses = {str(f[ops.STATUS_FIELD]) for f in final.getFeatures()}
+    except Exception as exc:
+        return _result(name, False, repr(exc))
+    half = _BIG_ROWS // 2
+    ok = status_raised and no_column and delete_raised and count == _BIG_ROWS
+    ok = ok and changed == half and deleted == half and final.featureCount() == half
+    ok = ok and statuses == {ops.STATUS_EXCLUDED} and layer.featureCount() == half
+    return _result(name, ok, f"status_raised={status_raised} no_column={no_column} "
+                             f"delete_raised={delete_raised} count={count} statuses={statuses}")
+
+
+def test_manage_task_reports_cancel() -> bool:
+    """A cancelled ManageEditTask reports CANCELLED and leaves the data alone."""
+    from ..explorer.manage_task import CANCELLED, ManageEditTask
+
+    name = "ManageEditTask cancel -> nothing changed"
+    path = _write_temp("sct_mgmt_task.csv", _CABLE_LAY_FILE)
+    gpkg = _fresh_gpkg("sct_mgmt_task.gpkg")
+    try:
+        layer = _import([path], gpkg, "2024-01-01")
+        before = _iso_times(layer)
+        layer_name = clp.prefixed_layer_name(gpkg, "cable_lay")
+
+        def work(private_layer, feedback):
+            return ops.recompute_iso_time(private_layer, "2024-05-01", feedback=feedback)
+
+        task = ManageEditTask("Fix start date", gpkg, layer_name, work)
+        task.cancel()
+        ok_run = task.run()
+        after = _iso_times(_open(gpkg, layer_name))
+        done = ManageEditTask("Fix start date", gpkg, layer_name, work)
+        ok_done = done.run()
+    except Exception as exc:
+        return _result(name, False, repr(exc))
+    ok = (not ok_run and task.error == CANCELLED and after == before
+          and ok_done and done.result["updated"] == 3)
+    return _result(name, ok, f"run={ok_run} error={task.error!r} unchanged={after == before}")
+
+
+def test_fix_start_date_records_new_date() -> bool:
+    """End-to-end Fix start date: data, edit_log and the recorded start date
+    change together, so the dialog's 'previous date' can't double-shift."""
+    from ..explorer.panels import manage_panel as mp
+    from ..laydata import LayDataset
+
+    name = "Fix start date records the corrected start date"
+    path = _write_temp("sct_mgmt_fixpanel.csv", _CABLE_LAY_FILE)
+    gpkg = _fresh_gpkg("sct_mgmt_fixpanel.gpkg")
+
+    class _Dialog:
+        def __init__(self, parent, sources, recorded, row_count):
+            self.recorded = recorded
+            self.dedupe = type("C", (), {"isChecked": staticmethod(lambda: True)})()
+
+        def corrected_text(self):
+            return "2024-01-10"
+
+        def previous_text(self):
+            return self.recorded
+
+    saved = (mp._StartDateDialog, mp.qt_exec, mp.ManagePanel.run_async)
+    try:
+        layer = _import([path], gpkg, "2024-01-01")
+        mp._StartDateDialog, mp.qt_exec = _Dialog, (lambda *_a, **_k: True)
+        mp.ManagePanel.run_async = False
+        panel = mp.ManagePanel(_Controller(layer, gpkg))
+        panel.set_dataset(LayDataset.from_qgis_layer(layer))
+        panel.refresh_now()
+        before = panel._recorded_start_dates().get("sct_mgmt_fixpanel.csv")
+        panel.sources_table.selectRow(0)
+        panel.fix_start_date()
+        panel._recorded = None
+        recorded = panel._recorded_start_dates().get("sct_mgmt_fixpanel.csv")
+        times = _iso_times(_open(gpkg, clp.prefixed_layer_name(gpkg, "cable_lay")))
+        edit_log = _open(gpkg, clp.prefixed_layer_name(gpkg, "edit_log"))
+        operations = [] if edit_log is None else [str(f["operation"]) for f in edit_log.getFeatures()]
+    except Exception as exc:
+        return _result(name, False, repr(exc))
+    finally:
+        mp._StartDateDialog, mp.qt_exec, mp.ManagePanel.run_async = saved
+    ok = before == "2024-01-01" and recorded == "2024-01-10"
+    ok = ok and times[0] == "2024-01-10T14:00:00" and operations == ["recompute_iso_time"]
+    return _result(name, ok, f"recorded {before} -> {recorded}; log={operations}")
+
+
+def test_manage_ops_do_not_import_numpy() -> bool:
+    """cable_lay_manage_ops loads at QGIS start-up; numpy must stay lazy."""
+    name = "manage ops import without numpy"
+    with open(ops.__file__, encoding="utf-8") as handle:
+        top_level = [line for line in handle
+                     if line.startswith(("import numpy", "from numpy"))]
+    return _result(name, not top_level, f"top-level numpy imports: {top_level}")
+
+
 def run_all() -> List[bool]:
     results = [
         test_layer_type_for_name(),
@@ -571,6 +805,13 @@ def run_all() -> List[bool]:
         test_dataset_views(),
         test_gap_math_vectorised(),
         test_vacuum(),
+        test_recompute_large_commit(),
+        test_recompute_cancel_rolls_back(),
+        test_shared_session_rolls_back_every_step(),
+        test_status_and_delete_cancel_roll_back(),
+        test_manage_task_reports_cancel(),
+        test_fix_start_date_records_new_date(),
+        test_manage_ops_do_not_import_numpy(),
     ]
     print("")
     print(f"{sum(results)}/{len(results)} passed")

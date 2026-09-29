@@ -390,31 +390,31 @@ def assign_system_ids(store) -> Dict[str, str]:
         for cid in members:
             assignment[cid] = system_id
 
-    if new_system_rows:
-        store.upsert_rows(schema.TABLE_SYSTEM, new_system_rows)
-
     components = store.list_components()
-    components_changed = False
+    changed_components = []
     for component in components:
         resolved = assignment.get(component.get("component_id"), "")
         if (component.get("system_id") or "") != resolved:
             component["system_id"] = resolved
-            components_changed = True
-    if components_changed:
-        store.write_table(schema.TABLE_COMPONENT, components)
+            changed_components.append(component)
     route_systems = {
         component.get("subject_id"): component.get("system_id") or ""
         for component in components if component.get("kind") == "route"
     }
-    routes = store.list_routes()
-    routes_changed = False
-    if routes:
-        for route in routes:
-            if route.get("route_id") in route_systems:
-                resolved = route_systems[route.get("route_id")]
-                if (route.get("system_id") or "") != resolved:
-                    route["system_id"] = resolved
-                    routes_changed = True
-        if routes_changed:
-            store.write_table(schema.TABLE_ROUTE, routes)
+    changed_routes = []
+    for route in store.list_routes():
+        if route.get("route_id") in route_systems:
+            resolved = route_systems[route.get("route_id")]
+            if (route.get("system_id") or "") != resolved:
+                route["system_id"] = resolved
+                changed_routes.append(route)
+    # One transaction: new systems, component and route assignments land
+    # together or not at all.
+    with store.transaction():
+        if new_system_rows:
+            store.upsert_rows(schema.TABLE_SYSTEM, new_system_rows)
+        if changed_components:
+            store.upsert_rows(schema.TABLE_COMPONENT, changed_components)
+        if changed_routes:
+            store.upsert_rows(schema.TABLE_ROUTE, changed_routes)
     return assignment

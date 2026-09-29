@@ -36,6 +36,7 @@ from qgis.PyQt.QtWidgets import (
 )
 
 from ...plot_widget import Figure, FigureCanvas, NavigationToolbar, get_tab10_color
+from ...plugin_log import log_exception
 
 _MAX_PLOT_POINTS = 40000
 _X_RECORD_ORDER = "(record order)"
@@ -671,6 +672,7 @@ class PlotPanel(QWidget):
         try:
             events = self.controller.event_records()
         except Exception:
+            log_exception("Cable Lay Data Explorer: event overlay unavailable")
             events = []
         if not events:
             return

@@ -283,6 +283,132 @@ def test_run_assessment_end_to_end() -> bool:
     return _result("run_assessment end-to-end (depth exclusion)", ok, f"excluded={excl_km:.2f} km")
 
 
+# ---------------------------------------------------------------------------
+# Background assessment (QgsTask) and the panel's run lifecycle
+# ---------------------------------------------------------------------------
+def _mixed_rule_store():
+    """Store + RPL + a rule set touching every snapshot path (depth
+    threshold, point proximity, KP table, manual) and one broken rule."""
+    import json
+
+    store = WorkbenchStore(_tmp_gpkg(), QgsProject.instance().transformContext())
+    store.migrate()
+    rid = _build_rpl(store)
+    hazards = _add_layer("Point?crs=EPSG:4326", "task_hazards")
+    feat = QgsFeature(hazards.fields())
+    feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(0.001, 50.05)))
+    hazards.dataProvider().addFeature(feat)
+    table = _add_layer("None?field=start_kp:double&field=end_kp:double", "task_kp_table")
+    row = QgsFeature(table.fields())
+    row.setAttributes([7.0, 8.0])
+    table.dataProvider().addFeature(row)
+
+    def rule(name, kind, action, config, methods=("plough",)):
+        return {"name": name, "enabled": 1, "kind": kind, "action": action,
+                "risk_level": 2 if action == schema.RULE_ACTION_RISK else 0,
+                "methods_json": json.dumps(list(methods)), "config_json": json.dumps(config)}
+
+    rule_set_id = store.save_rule_set(
+        {"name": "mixed", "methods_json": json.dumps(["plough", "jet"])}, [
+            rule("Deep", schema.RULE_KIND_THRESHOLD, schema.RULE_ACTION_EXCLUDE,
+                 {"profile": "depth", "op": ">", "value": 950.0}),
+            rule("Hazard", schema.RULE_KIND_PROXIMITY, schema.RULE_ACTION_RISK,
+                 {"layer_id": hazards.id(), "distance_m": 250.0, "mode": "distance"},
+                 ("plough", "jet")),
+            rule("Table", schema.RULE_KIND_KP_TABLE, schema.RULE_ACTION_EXCLUDE,
+                 {"layer_id": table.id(), "start_field": "start_kp", "end_field": "end_kp"}),
+            rule("Manual", schema.RULE_KIND_MANUAL, schema.RULE_ACTION_RISK,
+                 {"ranges": [{"start_kp": 1.0, "end_kp": 2.0}]}, ("jet",)),
+            rule("Missing layer", schema.RULE_KIND_POLYGON, schema.RULE_ACTION_EXCLUDE,
+                 {"layer_id": "no-such-layer", "attribute": "SOIL"}),
+        ])
+    return store, rid, rule_set_id, [hazards, table]
+
+
+def _verdicts(result) -> dict:
+    return {method: [(round(v.start_km, 9), round(v.end_km, 9), v.status, v.risk_level)
+                     for v in verdicts]
+            for method, verdicts in result.per_method.items()}
+
+
+def test_assessment_task_matches_sync_run() -> bool:
+    name = "AssessmentTask (worker snapshot) == run_assessment"
+    store, rid, rule_set_id, layers = _mixed_rule_store()
+    try:
+        sync_result, _sampler = ri.run_assessment(store, rid, rule_set_id, sample_step_m=100.0)
+        work = ri.build_assessment_work(store, rid, rule_set_id, sample_step_m=100.0)
+        task = ri.AssessmentTask(work)
+        messages = []
+        task.progressMessage.connect(messages.append)
+        ran = task.run()
+        cancelled = ri.AssessmentTask(ri.build_assessment_work(
+            store, rid, rule_set_id, sample_step_m=100.0))
+        cancelled.cancel()
+        cancel_ran = cancelled.run()
+    finally:
+        for layer in layers:
+            QgsProject.instance().removeMapLayer(layer.id())
+    ok = ran and task.result is not None
+    ok = ok and _verdicts(task.result) == _verdicts(sync_result)
+    ok = ok and task.result.warnings == sync_result.warnings
+    ok = ok and len(sync_result.warnings) == 1 and "Missing layer" in sync_result.warnings[0]
+    ok = ok and any(v.status == "excluded" for v in task.result.per_method["plough"])
+    ok = ok and any(v.status == "risk" for v in task.result.per_method["jet"])
+    ok = ok and not cancel_ran and cancelled.cancelled and cancelled.result is None
+    return _result(name, ok, f"warnings={task.result.warnings if task.result else None} "
+                             f"messages={len(messages)}")
+
+
+def test_assessment_panel_background_run() -> bool:
+    """The panel runs in a QgsTask, a re-run supersedes the one in flight,
+    and a stale result is never shown or written."""
+    from qgis.PyQt.QtCore import QCoreApplication
+
+    from ..workbench.assessment_panel import AssessmentPanel
+
+    name = "assessment panel: background run, restart, stale results rejected"
+    store, rid, rule_set_id, layers = _mixed_rule_store()
+    try:
+        panel = AssessmentPanel(None)
+        panel._load_output_layer = lambda _name: None  # keep the project clean
+        assessment_id = store.save_assessment({
+            "rpl_id": rid, "rule_set_id": rule_set_id, "name": "Panel run",
+            "sample_step_m": 100.0, "min_range_km": 0.0, "status": ""})
+        panel.load_assessment(store, store.get_assessment(assessment_id))
+        panel.step_spin.setValue(100.0)
+
+        panel._run()
+        first = panel._task
+        panel._run()  # e.g. the debounce after a rule edit
+        second = panel._task
+        # (the first may already have finished on its worker thread; either
+        # way it no longer owns the panel)
+        superseded = first is not second and panel._task is second
+        deadline = time.time() + 60
+        while (panel.is_running() or panel._live_tasks) and time.time() < deadline:
+            QCoreApplication.processEvents()
+            time.sleep(0.01)
+        done = not panel.is_running() and not panel._live_tasks
+        stored = store.get_assessment(assessment_id) or {}
+        applied = panel.result is not None and stored.get("status") == "current"
+
+        # a late result from an old generation is ignored outright
+        panel.result = None
+        stale = ri.AssessmentTask(ri.build_assessment_work(
+            store, rid, rule_set_id, sample_step_m=100.0))
+        stale.run()
+        panel._task = stale
+        panel._on_task_finished(stale, panel._run_generation - 1)
+        stale_ignored = panel.result is None
+        panel._task = None
+    finally:
+        for layer in layers:
+            QgsProject.instance().removeMapLayer(layer.id())
+    ok = superseded and done and applied and stale_ignored
+    return _result(name, ok, f"superseded={superseded} done={done} applied={applied} "
+                             f"stale_ignored={stale_ignored}")
+
+
 def run_all() -> list:
     return [
         test_manual_and_kp_table(),
@@ -292,6 +418,8 @@ def run_all() -> list:
         test_migrate_framework(),
         test_store_rule_crud(),
         test_run_assessment_end_to_end(),
+        test_assessment_task_matches_sync_run(),
+        test_assessment_panel_background_run(),
     ]
 
 

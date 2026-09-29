@@ -4,26 +4,38 @@
 
 Canonical home for operations that *modify* already-imported cable-lay data
 (as opposed to :mod:`cable_lay_parsers`, which handles parsing and import).
-Used by the "Recompute ISO Time" processing algorithm and intended to back the
-Data Explorer's management UI as well, so both stay in sync.
+Used by the "Recompute ISO Time" processing algorithm and the Data Explorer's
+management UI, so both stay in sync.
 
-All edits go through the layer's data provider (``changeAttributeValues`` /
-``deleteFeatures``), i.e. SQLite UPDATE/DELETE under the hood — no full-table
-rewrite — so they stay fast and memory-light on multi-gigabyte GeoPackages.
+Every edit is all-or-nothing. The scan and the writes run on one SQLite
+connection inside a single ``BEGIN IMMEDIATE`` transaction
+(:class:`GpkgEditSession`) — targeted UPDATE/DELETE by fid, no table rewrite,
+streamed in batches so memory stays flat on multi-gigabyte GeoPackages — and
+commit once at the end. Cancelling (``feedback.isCanceled()``) or any error
+rolls the whole operation back and raises (:class:`OperationCancelled` for a
+cancel), so a half-applied start-date fix can never be re-run on top of
+itself. Several operations plus their ``edit_log`` audit row can share one
+session so they commit together.
 """
 
 from __future__ import annotations
 
 import os
+import sqlite3
+import struct
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-import numpy as np
-
 from qgis.core import QgsFeatureRequest, QgsVectorLayer
 
+from ..plugin_log import log_exception
 from ..qgis_compat import FEATURE_REQUEST_NO_GEOMETRY
 from . import cable_lay_parsers as clp
+
+# numpy is imported inside the gap functions only: this module is loaded at
+# QGIS start-up (via the Recompute ISO Time algorithm) and numpy is slow to
+# import.
 
 # Raw day-count time columns used by the importers, in preference order.
 RAW_TIME_FIELDS = ("Time", "Event Time", "Lay Time")
@@ -32,6 +44,17 @@ RAW_TIME_FIELDS = ("Time", "Event Time", "Lay Time")
 SOURCE_FIELDS = ("source_file", "event_file", "slack_file", "body_file")
 
 _BATCH_SIZE = 5000
+
+# Seconds a management edit waits for other connections (a map render, an
+# open attribute table) to release the GeoPackage before failing cleanly.
+_BUSY_TIMEOUT_S = 30.0
+
+
+class OperationCancelled(RuntimeError):
+    """The user cancelled a management edit; it was rolled back entirely."""
+
+    def __init__(self, message: str = "Cancelled - nothing was changed."):
+        super().__init__(message)
 
 
 def _no_geometry_flag():
@@ -58,11 +81,281 @@ def _canceled(feedback) -> bool:
     return feedback is not None and feedback.isCanceled()
 
 
-def _estimated_count(layer: QgsVectorLayer) -> int:
-    try:
-        return max(int(layer.featureCount()), 1)
-    except Exception:
-        return 1
+def _check_cancel(feedback) -> None:
+    if _canceled(feedback):
+        raise OperationCancelled()
+
+
+# ---------------------------------------------------------------------------
+# Transactional edit session
+# ---------------------------------------------------------------------------
+def _quote(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _gpkg_header(blob) -> Optional[Tuple[int, int, bool]]:
+    """(flags, envelope byte length, little-endian) of a GPKG geometry blob."""
+    if not isinstance(blob, (bytes, bytearray, memoryview)):
+        return None
+    blob = bytes(blob)
+    if len(blob) < 8 or blob[:2] != b"GP":
+        return None
+    flags = blob[3]
+    envelope = {0: 0, 1: 32, 2: 48, 3: 48, 4: 64}.get((flags >> 1) & 0x07)
+    if envelope is None:
+        return None
+    return flags, envelope, bool(flags & 0x01)
+
+
+def _st_isempty(blob):
+    header = _gpkg_header(blob)
+    if header is None:
+        return None
+    return 1 if header[0] & 0x10 else 0
+
+
+def _st_bound(position: int):
+    """ST_MinX/MaxX/MinY/MaxY over a GPKG blob (envelope, else a 2D point)."""
+    def bound(blob):
+        header = _gpkg_header(blob)
+        if header is None or header[0] & 0x10:
+            return None
+        blob = bytes(blob)
+        _flags, envelope, little = header
+        order = "<" if little else ">"
+        if envelope:
+            return struct.unpack_from(order + "d", blob, 8 + 8 * position)[0]
+        wkb = blob[8:]
+        if len(wkb) < 21:
+            raise ValueError("geometry bounds need an envelope")
+        wkb_order = "<" if wkb[0] == 1 else ">"
+        (geom_type,) = struct.unpack_from(wkb_order + "I", wkb, 1)
+        if geom_type % 1000 != 1:  # Point / PointZ / PointM / PointZM
+            raise ValueError("geometry bounds need an envelope")
+        x, y = struct.unpack_from(wkb_order + "dd", wkb, 5)
+        return (x, x, y, y)[position]
+    return bound
+
+
+def _register_gpkg_functions(conn: sqlite3.Connection) -> None:
+    """The ST_* functions GeoPackage R-tree triggers reference.
+
+    GDAL registers these on its own connections; plain sqlite3 must too, or
+    every UPDATE of a spatial table fails to prepare ("no such function:
+    ST_IsEmpty") even though attribute edits never fire those triggers.
+    """
+    conn.create_function("ST_IsEmpty", 1, _st_isempty)
+    for position, name in enumerate(("ST_MinX", "ST_MaxX", "ST_MinY", "ST_MaxY")):
+        conn.create_function(name, 1, _st_bound(position))
+
+
+def _layer_table(layer: QgsVectorLayer) -> Tuple[str, str]:
+    """(GeoPackage path, table name) behind an OGR layer."""
+    from qgis.core import QgsProviderRegistry
+
+    if layer is None or layer.providerType() != "ogr":
+        raise RuntimeError("Management edits need a GeoPackage layer.")
+    decoded = QgsProviderRegistry.instance().decodeUri("ogr", layer.source())
+    path = decoded.get("path") or ""
+    if not path.lower().endswith(".gpkg") or not os.path.exists(path):
+        raise RuntimeError("Management edits need a GeoPackage layer.")
+    table = decoded.get("layerName") or ""
+    if not table:
+        conn = sqlite3.connect(path, timeout=_BUSY_TIMEOUT_S)
+        try:
+            names = [r[0] for r in conn.execute(
+                "SELECT table_name FROM gpkg_contents "
+                "WHERE data_type IN ('features', 'attributes')")]
+        finally:
+            conn.close()
+        if len(names) != 1:
+            raise RuntimeError("Could not tell which GeoPackage table the layer uses.")
+        table = names[0]
+    return path, table
+
+
+class GpkgEditSession:
+    """One all-or-nothing edit of a cable-lay GeoPackage table.
+
+    ``with GpkgEditSession(layer) as session:`` opens a private SQLite
+    connection, begins an IMMEDIATE transaction and commits on a clean exit;
+    any exception — including :class:`OperationCancelled` — rolls back.
+    ``layer`` (normally a private layer opened on the table) is reloaded
+    after a commit so its fields and feature count are current. Pass the
+    session to several operations, and call :meth:`log_edit`, to commit them
+    together.
+    """
+
+    def __init__(self, layer: QgsVectorLayer):
+        self.layer = layer
+        self.gpkg_path, self.table = _layer_table(layer)
+        self.conn: Optional[sqlite3.Connection] = None
+        # Honour a provider filter like the old provider scan did (OGR hands
+        # a GeoPackage filter to SQLite verbatim, so it is valid SQL here).
+        self.where = (layer.subsetString() or "").strip()
+        if self.where.lower().startswith("select"):
+            raise RuntimeError("Clear the layer's SQL query filter before editing it here.")
+        self._columns: Optional[List[str]] = None
+        self._fid: Optional[str] = None
+
+    def __enter__(self) -> "GpkgEditSession":
+        conn = sqlite3.connect(self.gpkg_path, timeout=_BUSY_TIMEOUT_S)
+        try:
+            _register_gpkg_functions(conn)
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.Error as exc:
+            conn.close()
+            raise RuntimeError(
+                f"Could not start the edit ({exc}). Close other programs using "
+                "this GeoPackage and try again.") from exc
+        self.conn = conn
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        conn, self.conn = self.conn, None
+        committed = False
+        try:
+            if exc_type is None:
+                try:
+                    conn.commit()
+                    committed = True
+                except sqlite3.Error as error:
+                    conn.rollback()
+                    raise RuntimeError(f"Could not save the edit ({error}); "
+                                       "nothing was changed.") from error
+            else:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass  # closing the connection discards the transaction too
+        finally:
+            conn.close()
+            if committed:
+                self._reload_layer()
+        if isinstance(exc, sqlite3.Error):
+            raise RuntimeError(f"The edit failed ({exc}); nothing was changed.") from exc
+        return False
+
+    def _reload_layer(self) -> None:
+        try:
+            self.layer.reload()
+        except RuntimeError:
+            pass  # layer deleted meanwhile: nothing to refresh
+
+    # -- schema --------------------------------------------------------------
+    def columns(self) -> List[str]:
+        if self._columns is None:
+            info = self.conn.execute(f"PRAGMA table_info({_quote(self.table)})").fetchall()
+            self._columns = [str(row[1]) for row in info]
+            self._fid = next((str(row[1]) for row in info if row[5] == 1), "rowid")
+        return self._columns
+
+    def fid_column(self) -> str:
+        self.columns()
+        return self._fid
+
+    def ensure_text_column(self, name: str) -> None:
+        """Add a TEXT column in the transaction (rolled back with it)."""
+        if name.lower() in (c.lower() for c in self.columns()):
+            return
+        self.conn.execute(f"ALTER TABLE {_quote(self.table)} ADD COLUMN {_quote(name)} TEXT")
+        self._columns = None
+
+    # -- data ------------------------------------------------------------------
+    def _select(self, names: Sequence[str], with_fid: bool) -> str:
+        fid = _quote(self.fid_column())
+        cols = [fid] if with_fid else []
+        cols += [_quote(n) for n in names]
+        sql = f"SELECT {', '.join(cols)} FROM {_quote(self.table)}"
+        if self.where:
+            sql += f" WHERE ({self.where})"
+        return sql + f" ORDER BY {fid}"
+
+    def row_count(self) -> int:
+        """Table row count for progress (the maintained OGR count; >= 1)."""
+        try:
+            row = self.conn.execute(
+                "SELECT feature_count FROM gpkg_ogr_contents "
+                "WHERE lower(table_name) = lower(?)", (self.table,)).fetchone()
+            return max(int(row[0]), 1) if row and row[0] is not None else 1
+        except sqlite3.Error:
+            return 1
+
+    def sample(self, names: Sequence[str], limit: int) -> List[Tuple]:
+        """The first ``limit`` rows' ``names`` values (layer order)."""
+        return self.conn.execute(self._select(names, False) + " LIMIT ?",
+                                 (int(limit),)).fetchall()
+
+    def scan(self, names: Sequence[str]):
+        """Yield ``(fid, value, ...)`` for every row the layer shows.
+
+        Rows are streamed; edits through :meth:`update` / :meth:`delete`
+        may interleave (they only touch rows already yielded).
+        """
+        return self.conn.execute(self._select(names, True))
+
+    def update(self, column: str, values: Sequence[Tuple[object, int]]) -> None:
+        """``SET column = value WHERE fid = ?`` for ``(value, fid)`` pairs."""
+        if values:
+            self.conn.executemany(
+                f"UPDATE {_quote(self.table)} SET {_quote(column)} = ? "
+                f"WHERE {_quote(self.fid_column())} = ?", values)
+
+    def delete(self, fids: Sequence[int]) -> None:
+        fids = list(fids)
+        sql = (f"DELETE FROM {_quote(self.table)} "
+               f"WHERE {_quote(self.fid_column())} = ?")
+        for start in range(0, len(fids), _BATCH_SIZE):
+            self.conn.executemany(sql, [(f,) for f in fids[start:start + _BATCH_SIZE]])
+
+    def log_edit(self, row: Dict) -> None:
+        """Append an ``edit_log`` row inside this transaction.
+
+        The table must already exist — call :func:`prepare_edit_log` before
+        opening the session (creating a table needs the file unlocked).
+        """
+        table = clp.prefixed_layer_name(self.gpkg_path, "edit_log")
+        entry = dict(row)
+        entry.setdefault("edited_at", clp.now_iso())
+        names = [name for name, _type in clp.EDIT_LOG_SPECS if name in entry]
+        self.conn.execute(
+            f"INSERT INTO {_quote(table)} ({', '.join(_quote(n) for n in names)}) "
+            f"VALUES ({', '.join('?' for _n in names)})",
+            [entry[n] for n in names])
+
+
+def edit_log_row(layer_name: str, operation: str, params: Dict,
+                 rows_affected: int, details: str) -> Dict:
+    """An ``edit_log`` entry (for :meth:`GpkgEditSession.log_edit`)."""
+    import json
+
+    return {
+        "layer_name": layer_name,
+        "operation": operation,
+        "params_json": json.dumps(params, sort_keys=True),
+        "rows_affected": int(rows_affected),
+        "details": details,
+    }
+
+
+def prepare_edit_log(layer: QgsVectorLayer, transform_context=None) -> None:
+    """Create the ``edit_log`` table for ``layer``'s GeoPackage if absent.
+
+    Call before :class:`GpkgEditSession` when the session will log.
+    """
+    from qgis.core import QgsCoordinateTransformContext
+
+    path, _table = _layer_table(layer)
+    clp.ensure_management_layers(path, transform_context or QgsCoordinateTransformContext())
+
+
+@contextmanager
+def _session_for(layer: QgsVectorLayer, session: Optional[GpkgEditSession]):
+    if session is not None:
+        yield session
+        return
+    with GpkgEditSession(layer) as own:
+        yield own
 
 
 def check_not_editing(layer: QgsVectorLayer) -> None:
@@ -106,7 +399,9 @@ def reload_project_layers(gpkg_path: str, layer_name: Optional[str] = None, proj
             layer.reload()
             layer.triggerRepaint()
             reloaded += 1
-        except Exception:
+        except Exception:  # noqa: BLE001 - one stale layer must not stop the rest
+            log_exception(f"Could not reload '{layer.name()}' after editing {gpkg_path}; "
+                          "it may show stale data until the project is reopened")
             continue
     return reloaded
 
@@ -120,22 +415,30 @@ def source_field_for(layer: QgsVectorLayer) -> Optional[str]:
     return None
 
 
-def raw_time_field_for(layer: QgsVectorLayer, sample_size: int = 200) -> Optional[str]:
+def raw_time_field_for(layer: QgsVectorLayer, sample_size: int = 200,
+                       session: Optional["GpkgEditSession"] = None) -> Optional[str]:
     """The field holding the raw ``day,HH:MM:SS`` values, if one exists.
 
     Known importer column names are preferred; otherwise every string field is
     probed. A field qualifies when at least one sampled non-null value matches
-    the day-count pattern.
+    the day-count pattern. With ``session`` the sample is read through its
+    connection (another connection could be blocked by the open transaction).
     """
     names = [field.name() for field in layer.fields()]
     candidates = [c for c in RAW_TIME_FIELDS if c in names]
     candidates += [n for n in names if n not in candidates and n != "ISO_Time"]
 
+    if session is not None:  # layer-only (virtual) fields are not in the table
+        columns = {c.lower() for c in session.columns()}
+        candidates = [c for c in candidates if c.lower() in columns]
     samples: Dict[str, List] = {c: [] for c in candidates}
-    request = QgsFeatureRequest().setFlags(_no_geometry_flag()).setLimit(sample_size)
-    for feature in layer.getFeatures(request):
-        for candidate in candidates:
-            value = feature[candidate]
+    if session is not None:
+        rows = session.sample(candidates, sample_size) if candidates else []
+    else:
+        request = QgsFeatureRequest().setFlags(_no_geometry_flag()).setLimit(sample_size)
+        rows = ([feature[c] for c in candidates] for feature in layer.getFeatures(request))
+    for row in rows:
+        for candidate, value in zip(candidates, row):
             if value is not None and str(value).strip():
                 samples[candidate].append(value)
     for candidate in candidates:
@@ -179,6 +482,7 @@ def recompute_iso_time(
     old_start_date: str = "",
     source_files: Optional[Sequence[str]] = None,
     feedback=None,
+    session: Optional[GpkgEditSession] = None,
 ) -> Dict[str, int]:
     """Rewrite ``ISO_Time`` in place from the stored day-count time column.
 
@@ -191,21 +495,13 @@ def recompute_iso_time(
     Returns counts: ``examined``, ``updated``, ``unchanged``, ``skipped``
     (rows with neither a parseable raw time nor a shiftable ``ISO_Time``).
     Raises ``RuntimeError`` on a layer without ``ISO_Time``, without any usable
-    time source, or when the provider rejects the update.
+    time source, or when the update fails, and :class:`OperationCancelled`
+    when ``feedback`` is cancelled; either way nothing is changed (or, with a
+    shared ``session``, the whole session rolls back).
     """
     fields = layer.fields()
-    iso_idx = fields.indexOf("ISO_Time")
-    if iso_idx < 0:
+    if fields.indexOf("ISO_Time") < 0:
         raise RuntimeError("Layer has no ISO_Time field to recompute.")
-
-    raw_field = raw_time_field_for(layer)
-    delta = _day_delta(start_date, old_start_date)
-    if raw_field is None and delta is None:
-        raise RuntimeError(
-            "Layer has no day-count time column, and no previous start date was "
-            "given to shift the existing ISO_Time values by."
-        )
-
     source_field = source_field_for(layer)
     wanted: Optional[Set[str]] = set(source_files) if source_files is not None else None
     if wanted is not None and source_field is None:
@@ -213,58 +509,48 @@ def recompute_iso_time(
             "A source-file filter was given but the layer has no provenance "
             "(source_file) column."
         )
+    delta = _day_delta(start_date, old_start_date)
 
-    attr_names = ["ISO_Time"]
-    if raw_field:
-        attr_names.append(raw_field)
-    if source_field:
-        attr_names.append(source_field)
-    request = QgsFeatureRequest().setFlags(_no_geometry_flag())
-    request.setSubsetOfAttributes(attr_names, fields)
-
-    provider = layer.dataProvider()
     counts = {"examined": 0, "updated": 0, "unchanged": 0, "skipped": 0}
-    changes: Dict[int, Dict[int, object]] = {}
-    total = _estimated_count(layer)
-    scanned = 0
-
-    def flush():
-        if not changes:
-            return
-        if not provider.changeAttributeValues(dict(changes)):
+    with _session_for(layer, session) as edit:
+        raw_field = raw_time_field_for(layer, session=edit)
+        if raw_field is None and delta is None:
             raise RuntimeError(
-                f"Provider rejected the ISO_Time update: {provider.error().summary()}"
+                "Layer has no day-count time column, and no previous start date was "
+                "given to shift the existing ISO_Time values by."
             )
-        changes.clear()
+        names = ["ISO_Time", raw_field or "ISO_Time", source_field or "ISO_Time"]
+        total = edit.row_count()
+        changes: List[Tuple[str, int]] = []
+        for scanned, (fid, iso_value, raw_value, source_value) in enumerate(
+                edit.scan(names), 1):
+            if scanned % _BATCH_SIZE == 0:
+                _check_cancel(feedback)
+                _report(feedback, scanned, total)
+            if source_field and not _wanted(source_value, wanted):
+                continue
+            counts["examined"] += 1
+            current_str = _text(iso_value)
 
-    for feature in layer.getFeatures(request):
-        scanned += 1
-        if scanned % _BATCH_SIZE == 0:
-            if _canceled(feedback):
-                break
-            _report(feedback, scanned, total)
-        if source_field and not _wanted(feature[source_field], wanted):
-            continue
-        counts["examined"] += 1
-        current_str = _text(feature[iso_idx])
+            new_iso: Optional[str] = None
+            if raw_field:
+                new_iso = clp.iso_str(clp.parse_day_time(raw_value, start_date))
+            if new_iso is None and delta is not None:
+                new_iso = _shift_iso(current_str, delta)
 
-        new_iso: Optional[str] = None
-        if raw_field:
-            new_iso = clp.iso_str(clp.parse_day_time(feature[raw_field], start_date))
-        if new_iso is None and delta is not None:
-            new_iso = _shift_iso(current_str, delta)
-
-        if new_iso is None:
-            counts["skipped"] += 1
-            continue
-        if new_iso == current_str:
-            counts["unchanged"] += 1
-            continue
-        changes[feature.id()] = {iso_idx: new_iso}
-        counts["updated"] += 1
-        if len(changes) >= _BATCH_SIZE:
-            flush()
-    flush()
+            if new_iso is None:
+                counts["skipped"] += 1
+                continue
+            if new_iso == current_str:
+                counts["unchanged"] += 1
+                continue
+            changes.append((new_iso, fid))
+            counts["updated"] += 1
+            if len(changes) >= _BATCH_SIZE:
+                edit.update("ISO_Time", changes)
+                changes = []
+        _check_cancel(feedback)
+        edit.update("ISO_Time", changes)
     return counts
 
 
@@ -292,80 +578,66 @@ def dedupe_layer_in_place(
     key_fields: Sequence[str],
     source_files: Optional[Sequence[str]] = None,
     feedback=None,
+    session: Optional[GpkgEditSession] = None,
 ) -> int:
     """Delete rows duplicating an earlier row on ``key_fields`` (keep lowest fid).
 
-    Mirrors :func:`cable_lay_parsers.merge_and_dedupe` but works in place via
-    ``deleteFeatures`` instead of rewriting the table. Key fields missing from
+    Mirrors :func:`cable_lay_parsers.merge_and_dedupe` but works in place with
+    targeted deletes instead of rewriting the table. Key fields missing from
     the layer are treated as empty (matching the merge behaviour). Returns the
-    number of features deleted.
+    number of features deleted. All-or-nothing (see :func:`recompute_iso_time`).
     """
     fields = layer.fields()
     source_field = source_field_for(layer)
     wanted: Optional[Set[str]] = set(source_files) if source_files is not None else None
 
-    attr_names = [f for f in key_fields if fields.indexOf(f) >= 0]
-    if source_field and source_field not in attr_names:
-        attr_names.append(source_field)
-    request = QgsFeatureRequest().setFlags(_no_geometry_flag())
-    request.setSubsetOfAttributes(attr_names, fields)
-
-    seen: Set[Tuple] = set()
-    doomed: List[int] = []
-    total = _estimated_count(layer)
-    for scanned, feature in enumerate(layer.getFeatures(request), 1):
-        if scanned % _BATCH_SIZE == 0:
-            if _canceled(feedback):
-                return 0
-            _report(feedback, scanned, total)
-        if source_field and wanted is not None and not _wanted(feature[source_field], wanted):
-            continue
-        key = tuple(
-            "" if fields.indexOf(f) < 0 else clp.key_value(feature[f]) for f in key_fields
-        )
-        if key in seen:
-            doomed.append(feature.id())
-        else:
-            seen.add(key)
-    if not doomed:
-        return 0
-    _delete_fids(layer, doomed)
+    with _session_for(layer, session) as edit:
+        columns = {c.lower() for c in edit.columns()}
+        present = [f for f in key_fields if fields.indexOf(f) >= 0 and f.lower() in columns]
+        names = present + [source_field or (present[0] if present else "rowid")]
+        total = edit.row_count()
+        seen: Set[Tuple] = set()
+        doomed: List[int] = []
+        for scanned, row in enumerate(edit.scan(names), 1):
+            if scanned % _BATCH_SIZE == 0:
+                _check_cancel(feedback)
+                _report(feedback, scanned, total)
+            if source_field and wanted is not None and not _wanted(row[-1], wanted):
+                continue
+            values = dict(zip(present, row[1:]))
+            key = tuple(clp.key_value(values[f]) if f in values else "" for f in key_fields)
+            if key in seen:
+                doomed.append(row[0])
+            else:
+                seen.add(key)
+        _check_cancel(feedback)
+        edit.delete(doomed)
     return len(doomed)
 
 
-def _delete_fids(layer: QgsVectorLayer, fids: List[int]) -> None:
-    provider = layer.dataProvider()
-    for start in range(0, len(fids), _BATCH_SIZE):
-        if not provider.deleteFeatures(fids[start:start + _BATCH_SIZE]):
-            raise RuntimeError(
-                f"Provider rejected the delete: {provider.error().summary()}"
-            )
-
-
 def delete_source_rows(
-    layer: QgsVectorLayer, source_files: Sequence[str], feedback=None
+    layer: QgsVectorLayer, source_files: Sequence[str], feedback=None,
+    session: Optional[GpkgEditSession] = None,
 ) -> int:
     """Delete every row whose provenance column matches ``source_files``.
 
-    Returns the number of features deleted.
+    Returns the number of features deleted. All-or-nothing.
     """
     source_field = source_field_for(layer)
     if source_field is None:
         raise RuntimeError("Layer has no provenance (source_file) column.")
     wanted = set(source_files)
-    request = QgsFeatureRequest().setFlags(_no_geometry_flag())
-    request.setSubsetOfAttributes([source_field], layer.fields())
-    total = _estimated_count(layer)
-    doomed: List[int] = []
-    for scanned, feature in enumerate(layer.getFeatures(request), 1):
-        if scanned % _BATCH_SIZE == 0:
-            if _canceled(feedback):
-                return 0
-            _report(feedback, scanned, total)
-        if _wanted(feature[source_field], wanted):
-            doomed.append(feature.id())
-    if doomed:
-        _delete_fids(layer, doomed)
+    with _session_for(layer, session) as edit:
+        total = edit.row_count()
+        doomed: List[int] = []
+        for scanned, (fid, source_value) in enumerate(edit.scan([source_field]), 1):
+            if scanned % _BATCH_SIZE == 0:
+                _check_cancel(feedback)
+                _report(feedback, scanned, total)
+            if _wanted(source_value, wanted):
+                doomed.append(fid)
+        _check_cancel(feedback)
+        edit.delete(doomed)
     return len(doomed)
 
 
@@ -412,27 +684,30 @@ def ensure_status_field(layer: QgsVectorLayer) -> int:
     return idx
 
 
-def apply_status(layer: QgsVectorLayer, fid_to_status: Dict[int, str], feedback=None) -> int:
-    """Set ``record_status`` per feature id (batched). Returns rows changed."""
+def apply_status(layer: QgsVectorLayer, fid_to_status: Dict[int, str], feedback=None,
+                 session: Optional[GpkgEditSession] = None) -> int:
+    """Set ``record_status`` per feature id. Returns rows changed.
+
+    All-or-nothing: the ``record_status`` column (added if missing) and every
+    status land in one transaction, or none of them do.
+    """
     if not fid_to_status:
         return 0
-    idx = ensure_status_field(layer)
-    provider = layer.dataProvider()
     items = list(fid_to_status.items())
-    for start in range(0, len(items), _BATCH_SIZE):
-        if _canceled(feedback):
-            return start
-        batch = {fid: {idx: status} for fid, status in items[start:start + _BATCH_SIZE]}
-        if not provider.changeAttributeValues(batch):
-            raise RuntimeError(
-                f"Provider rejected the status update: {provider.error().summary()}"
-            )
-        _report(feedback, start + len(batch), len(items))
+    with _session_for(layer, session) as edit:
+        edit.ensure_text_column(STATUS_FIELD)
+        for start in range(0, len(items), _BATCH_SIZE):
+            _check_cancel(feedback)
+            batch = items[start:start + _BATCH_SIZE]
+            edit.update(STATUS_FIELD, [(status, fid) for fid, status in batch])
+            _report(feedback, start + len(batch), len(items))
+        _check_cancel(feedback)
     return len(items)
 
 
 def set_source_status(
-    layer: QgsVectorLayer, status: str, source_files: Sequence[str], feedback=None
+    layer: QgsVectorLayer, status: str, source_files: Sequence[str], feedback=None,
+    session: Optional[GpkgEditSession] = None,
 ) -> int:
     """Set ``record_status`` for every row of the given source file(s)."""
     if status not in RECORD_STATUSES:
@@ -440,20 +715,17 @@ def set_source_status(
     source_field = source_field_for(layer)
     if source_field is None:
         raise RuntimeError("Layer has no provenance (source_file) column.")
-    ensure_status_field(layer)
     wanted = set(source_files)
-    request = QgsFeatureRequest().setFlags(_no_geometry_flag())
-    request.setSubsetOfAttributes([source_field], layer.fields())
-    changes: Dict[int, str] = {}
-    total = _estimated_count(layer)
-    for scanned, feature in enumerate(layer.getFeatures(request), 1):
-        if scanned % _BATCH_SIZE == 0:
-            if _canceled(feedback):
-                return 0
-            _report(feedback, scanned, total)
-        if _wanted(feature[source_field], wanted):
-            changes[feature.id()] = status
-    return apply_status(layer, changes, feedback=feedback)
+    with _session_for(layer, session) as edit:
+        total = edit.row_count()
+        changes: Dict[int, str] = {}
+        for scanned, (fid, source_value) in enumerate(edit.scan([source_field]), 1):
+            if scanned % _BATCH_SIZE == 0:
+                _check_cancel(feedback)
+                _report(feedback, scanned, total)
+            if _wanted(source_value, wanted):
+                changes[fid] = status
+        return apply_status(layer, changes, feedback=feedback, session=edit)
 
 
 # ---------------------------------------------------------------------------
@@ -466,6 +738,8 @@ def find_gaps_in_epochs(
     are more than ``threshold_s`` seconds apart. Non-finite values are ignored.
     Vectorised: one sort plus one diff, whatever the row count.
     """
+    import numpy as np
+
     arr = np.asarray(epochs, dtype=float)
     clean = np.sort(arr[np.isfinite(arr)])
     if clean.size < 2:
@@ -476,13 +750,15 @@ def find_gaps_in_epochs(
 
 def gap_index_for_epochs(
     epochs: Sequence[float], gaps: Sequence[Tuple[float, float]]
-) -> np.ndarray:
+) -> "np.ndarray":
     """Index (into ``gaps``) of the gap each epoch falls strictly inside, or -1.
 
     ``np.searchsorted`` on the gap starts, so the cost is O(n log g) instead
     of the O(n * g) of testing every epoch against every gap - the difference
     between a sub-second and a multi-second click on a million-row layer.
     """
+    import numpy as np
+
     arr = np.asarray(epochs, dtype=float)
     out = np.full(arr.shape, -1, dtype=np.int64)
     if arr.size == 0 or not len(gaps):
@@ -525,6 +801,8 @@ def count_in_gaps(
     """How many of ``epochs`` fall inside each gap (same order as ``gaps``)."""
     if not len(gaps):
         return []
+    import numpy as np
+
     indices = gap_index_for_epochs(epochs, gaps)
     hits = indices[indices >= 0]
     return np.bincount(hits, minlength=len(gaps)).tolist()

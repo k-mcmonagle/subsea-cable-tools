@@ -2,10 +2,24 @@
 """WorkbenchStore — GeoPackage persistence for the Cable Route Workbench.
 
 Wraps a single per-project GeoPackage holding the registry tables declared in
-schema.py plus the per-RPL spatial layers. Registry tables are small and are
-never loaded into the QGIS project, so they are read/written whole (the
-spatial RPL layers, which ARE loaded, are only ever edited through QGIS edit
-buffers — see rpl_layer_io.py).
+schema.py plus the per-RPL spatial layers. The spatial RPL layers are loaded
+into the QGIS project and are only ever edited through QGIS edit buffers (see
+rpl_layer_io.py).
+
+Registry tables are geometryless and never loaded into the project. They are
+created through the QGIS vector-file writer (so the GeoPackage metadata is
+exactly what OGR expects) but every *row* write is plain SQL inside a SQLite
+transaction (``BEGIN IMMEDIATE``): targeted delete/insert by key, never a
+drop-and-rewrite of the table. A failed write — disk full, file locked, a
+value that cannot be stored — rolls back and raises ``WorkbenchStoreError``,
+leaving the file exactly as it was. Multi-table operations (deleting an
+assembly with its items, fits and topology; a migration step) run in one
+transaction via :meth:`WorkbenchStore.transaction`, so they are all-or-nothing.
+
+Connections are opened per operation (and per transaction), never cached, so
+the store is safe to use from a Processing worker thread and holds no file
+handle between calls. The file's journal mode is left alone (no forced WAL:
+Workbench files often live on network shares, where WAL is unsafe).
 
 Also enforces the CRA-core topology invariants on wb_component/wb_port/
 wb_connection (see validate_topology).
@@ -14,9 +28,12 @@ wb_connection (see validate_topology).
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
+import sqlite3
+from contextlib import contextmanager
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from qgis.core import (
@@ -25,6 +42,8 @@ from qgis.core import (
     QgsVectorLayer,
 )
 
+from ..burial import gpkg_sql
+from ..plugin_log import log_exception, log_warning
 from ..processing.cable_lay_parsers import (
     WKT_KEY,
     fields_from_specs,
@@ -42,9 +61,21 @@ from . import schema
 PROJECT_SCOPE = "SubseaCableTools"
 PROJECT_KEY_GPKG = "workbench_gpkg"
 
+# Seconds a registry write waits for another connection (a QGIS render of the
+# RPL layers, a second QGIS) to release the file before failing cleanly.
+_BUSY_TIMEOUT_S = 15.0
+
+# Column types used when a legacy registry table gains a newer schema column;
+# the same declarations OGR writes for the ``fields_from_specs`` types.
+_SQL_TYPES = {"str": "TEXT", "float": "REAL", "int": "INTEGER"}
+
 
 class WorkbenchReadOnlyError(ValueError):
     """Raised when code tries to mutate an issued workbench entity."""
+
+
+class WorkbenchStoreError(RuntimeError):
+    """A registry write failed and was rolled back; the file is unchanged."""
 
 
 def project_gpkg_path(project: Optional[QgsProject] = None) -> Optional[str]:
@@ -70,16 +101,24 @@ class WorkbenchStore:
     def __init__(self, gpkg_path: str, transform_context: Optional[QgsCoordinateTransformContext] = None):
         self.gpkg_path = gpkg_path
         self.transform_context = transform_context or QgsProject.instance().transformContext()
-        # Registry tables are small but opening an OGR layer for every lookup
-        # is not. One Workbench screen used to reopen wb_rpl dozens of times.
-        # Keep a per-store read-through cache; every mutator below refreshes it.
+        # Registry tables are small, but one Workbench screen reads wb_rpl
+        # dozens of times. Keep a per-store read-through cache; every write
+        # drops the tables it touched, and a rolled-back transaction drops
+        # everything (reads inside it may have seen uncommitted rows).
         self._table_cache: Dict[str, List[Dict]] = {}
         self._table_exists_cache: Dict[str, bool] = {}
+        # Open transaction's connection (None outside ``transaction()``).
+        self._tx_conn: Optional[sqlite3.Connection] = None
+        # Tables whose live columns already cover the current schema.
+        self._columns_synced: set = set()
+        self._registry_ready = False
 
     def clear_cache(self) -> None:
         """Forget registry reads, e.g. after an external Processing run."""
         self._table_cache.clear()
         self._table_exists_cache.clear()
+        self._columns_synced.clear()
+        self._registry_ready = False
 
     # -- lifecycle ----------------------------------------------------------
     def exists(self) -> bool:
@@ -87,15 +126,14 @@ class WorkbenchStore:
 
     def ensure_created(self) -> None:
         """Create any missing registry tables (idempotent)."""
-        for table, specs in schema.REGISTRY_TABLES.items():
-            if not self._table_exists(table):
-                self._write_table_rows(table, specs, [])
-        meta = self.read_meta()
-        if "schema_version" not in meta:
-            self.write_meta("schema_version", str(schema.SCHEMA_VERSION))
-            self.write_meta("created_utc", schema.utc_now_iso())
-        if not self.read_table(schema.TABLE_EVENT_RULE):
-            self.seed_default_event_rules()
+        self._create_missing_tables()
+        with self.transaction():
+            meta = self.read_meta()
+            if "schema_version" not in meta:
+                self.write_meta("schema_version", str(schema.SCHEMA_VERSION))
+                self.write_meta("created_utc", schema.utc_now_iso())
+            if not self.read_table(schema.TABLE_EVENT_RULE):
+                self.seed_default_event_rules()
 
     def migrate(self) -> None:
         """Upgrade the gpkg to the current SCHEMA_VERSION, one step at a time.
@@ -103,29 +141,199 @@ class WorkbenchStore:
         ``ensure_created`` first adds any tables missing from the declared
         schema (so a pre-v2 gpkg gains the new registry tables), then each
         registered migrator runs in order, backing the file up before every
-        step and advancing the stamped ``schema_version``.
+        step. A step and its ``schema_version`` stamp commit together, so an
+        interrupted migration resumes at the step that failed.
         """
         self.ensure_created()
         current = int(self.read_meta().get("schema_version", str(schema.SCHEMA_VERSION)))
         while current < schema.SCHEMA_VERSION:
             self.backup_before(f"migrate_v{current}")
             migrator = MIGRATIONS.get(current)
-            if migrator is not None:
-                migrator(self)
+            with self.transaction():
+                if migrator is not None:
+                    migrator(self)
+                self.write_meta("schema_version", str(current + 1))
             current += 1
-            self.write_meta("schema_version", str(current))
 
     def backup_before(self, label: str) -> Optional[str]:
-        """Copy the gpkg aside before a structural change. Returns the copy path."""
+        """Copy the gpkg aside before a structural change. Returns the copy path.
+
+        Uses SQLite's online backup so the copy is complete even when QGIS
+        has the file in WAL mode with frames not yet checkpointed (a plain
+        file copy would silently miss them); falls back to a file copy.
+        """
         if not os.path.exists(self.gpkg_path):
             return None
         stem, ext = os.path.splitext(self.gpkg_path)
         target = f"{stem}.{schema.sanitize_slug(label)}.bak{ext}"
         try:
+            source = self._connect()
+            try:
+                dest = sqlite3.connect(target)
+                try:
+                    source.backup(dest)
+                finally:
+                    dest.close()
+            finally:
+                source.close()
+            return target
+        except sqlite3.Error:
+            log_exception(f"Workbench: SQLite backup of {self.gpkg_path} failed; "
+                          "falling back to a file copy")
+        try:
             shutil.copy2(self.gpkg_path, target)
             return target
         except OSError:
+            log_exception(f"Workbench: could not back up {self.gpkg_path} to {target}")
             return None
+
+    # -- SQLite access -------------------------------------------------------
+    def _connect(self) -> sqlite3.Connection:
+        # sqlite3.connect would silently create an empty file.
+        if not os.path.exists(self.gpkg_path):
+            raise sqlite3.OperationalError(f"No such file: {self.gpkg_path}")
+        conn = sqlite3.connect(self.gpkg_path, timeout=_BUSY_TIMEOUT_S)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    @contextmanager
+    def _reading(self):
+        """The open transaction's connection, else a short-lived one."""
+        if self._tx_conn is not None:
+            yield self._tx_conn
+            return
+        conn = self._connect()
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    def transaction(self):
+        """Group registry writes into one atomic commit.
+
+        Nested calls join the outermost transaction. Any exception rolls the
+        whole group back and clears the read cache; SQLite failures are
+        re-raised as :class:`WorkbenchStoreError`. Reads inside the block see
+        its uncommitted writes. Spatial layers (OGR writes) must not be
+        written inside a transaction: they would wait on its lock. Missing
+        registry tables are created first, as the old writer did on demand.
+        """
+        return self._transaction(create_missing=True)
+
+    @contextmanager
+    def _transaction(self, create_missing: bool):
+        if self._tx_conn is not None:
+            yield
+            return
+        if create_missing:
+            self._create_missing_tables()
+        try:
+            conn = self._connect()
+        except sqlite3.Error as exc:
+            raise self._write_failed(exc) from exc
+        self._tx_conn = conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            yield
+            conn.commit()
+        except BaseException as exc:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            self.clear_cache()
+            if isinstance(exc, sqlite3.Error):
+                raise self._write_failed(exc) from exc
+            if isinstance(exc, WorkbenchStoreError):
+                log_warning(f"Workbench: registry write rolled back: {exc}")
+            raise
+        finally:
+            self._tx_conn = None
+            conn.close()
+
+    def _write_failed(self, exc: BaseException) -> WorkbenchStoreError:
+        log_exception(f"Workbench: registry write to {self.gpkg_path} failed and was rolled back")
+        return WorkbenchStoreError(
+            f"Could not save to the Workbench GeoPackage "
+            f"'{os.path.basename(self.gpkg_path)}' ({exc}). Nothing was changed; "
+            "close other programs using the file and try again.")
+
+    def _create_missing_tables(self) -> None:
+        """Create absent registry tables through the OGR writer.
+
+        Runs outside any transaction (the writer needs the file unlocked).
+        Creating an absent table can never overwrite data; an existing table
+        is never touched here.
+        """
+        if self._registry_ready:
+            return
+        if self._tx_conn is not None:
+            raise RuntimeError("Registry tables cannot be created inside a transaction.")
+        existing = set()
+        if os.path.exists(self.gpkg_path):
+            try:
+                with self._reading() as conn:
+                    existing = {str(r[0]) for r in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'")}
+            except sqlite3.Error:
+                existing = {t for t in schema.REGISTRY_TABLES
+                            if open_gpkg_layer(self.gpkg_path, t) is not None}
+        for table, specs in schema.REGISTRY_TABLES.items():
+            if table not in existing:
+                self._create_table(table, specs)
+        self._registry_ready = True
+
+    def _create_table(self, table: str, specs) -> None:
+        if self._tx_conn is not None:
+            raise RuntimeError(f"Table '{table}' cannot be created inside a transaction.")
+        write_layer_to_gpkg(self.gpkg_path, table, fields_from_specs(specs),
+                            WKB_NO_GEOMETRY, [], self.transform_context)
+        self._table_exists_cache[table] = True
+
+    def _sync_columns(self, conn: sqlite3.Connection, table: str, specs) -> None:
+        """Add schema columns a legacy table lacks (the old writer recreated
+        the whole table with the current fields; SQL writes cannot)."""
+        registry = specs is schema.REGISTRY_TABLES.get(table)
+        if registry and table in self._columns_synced:
+            return
+        live = {name.lower() for name in gpkg_sql.table_columns(conn, table)}
+        if not live and not gpkg_sql.table_exists(conn, table):
+            raise sqlite3.OperationalError(f"no such table: {table}")
+        for name, type_str in specs:
+            if name.lower() not in live:
+                conn.execute(
+                    f"ALTER TABLE {gpkg_sql.quote_ident(table)} ADD COLUMN "
+                    f"{gpkg_sql.quote_ident(name)} {_SQL_TYPES.get(type_str, 'TEXT')}")
+        if registry:
+            self._columns_synced.add(table)
+
+    @contextmanager
+    def _writing(self, table: str, specs=None, create_missing: bool = True):
+        """Transaction connection for writing ``table`` (schema-synced)."""
+        specs = specs if specs is not None else schema.REGISTRY_TABLES[table]
+        with self._transaction(create_missing):
+            conn = self._tx_conn
+            self._sync_columns(conn, table, specs)
+            self._table_cache.pop(table, None)
+            yield conn
+            self._table_cache.pop(table, None)
+            self._table_exists_cache[table] = True
+
+    def _prepare(self, table: str, rows: Sequence[Dict], specs=None) -> List[Dict]:
+        specs = specs if specs is not None else schema.REGISTRY_TABLES[table]
+        types = dict(specs)
+        prepared = []
+        for row in rows:
+            out = {}
+            for name, value in row.items():
+                if name == WKT_KEY:
+                    continue
+                if name in types:
+                    out[name] = _coerce_value(value, types[name], table, name)
+                else:
+                    out[name] = _plain_value(value)
+            prepared.append(out)
+        return prepared
 
     # -- generic table access ------------------------------------------------
     def _table_exists(self, table: str) -> bool:
@@ -133,64 +341,104 @@ class WorkbenchStore:
             return self._table_exists_cache[table]
         if not os.path.exists(self.gpkg_path):
             return False
-        exists = open_gpkg_layer(self.gpkg_path, table) is not None
+        try:
+            with self._reading() as conn:
+                exists = gpkg_sql.table_exists(conn, table)
+        except sqlite3.Error:
+            if self._tx_conn is not None:
+                raise
+            log_exception(f"Workbench: SQLite probe of {self.gpkg_path} failed; using OGR")
+            exists = open_gpkg_layer(self.gpkg_path, table) is not None
         self._table_exists_cache[table] = exists
         return exists
 
     def read_table(self, table: str) -> List[Dict]:
         if table in self._table_cache:
             return [dict(row) for row in self._table_cache[table]]
-        layer = open_gpkg_layer(self.gpkg_path, table)
-        if layer is None:
+        if not self._table_exists(table):
             return []
-        names = [f.name() for f in layer.fields() if f.name().lower() != "fid"]
-        rows: List[Dict] = []
-        for feature in layer.getFeatures():
-            rows.append(_normalise_row({name: feature[name] for name in names}))
+        try:
+            with self._reading() as conn:
+                rows = gpkg_sql.read_rows(conn, table)
+        except sqlite3.Error:
+            if self._tx_conn is not None:
+                raise
+            log_exception(f"Workbench: SQLite read of {table} failed; using OGR")
+            layer = open_gpkg_layer(self.gpkg_path, table)
+            if layer is None:
+                return []
+            names = [f.name() for f in layer.fields() if f.name().lower() != "fid"]
+            rows = [_normalise_row({name: feature[name] for name in names})
+                    for feature in layer.getFeatures()]
         self._table_cache[table] = [dict(row) for row in rows]
-        self._table_exists_cache[table] = True
         return [dict(row) for row in rows]
 
     def write_table(self, table: str, rows: Sequence[Dict]) -> None:
-        specs = schema.REGISTRY_TABLES[table]
-        self._write_table_rows(table, specs, list(rows))
+        """Replace every row of a registry table (one transaction)."""
+        prepared = self._prepare(table, rows)
+        with self._writing(table) as conn:
+            gpkg_sql.delete_where(conn, table, "1 = 1")
+            gpkg_sql.insert_rows(conn, table, prepared)
 
     def _write_table_rows(self, table: str, specs, rows: List[Dict]) -> None:
-        fields = fields_from_specs(specs)
-        write_layer_to_gpkg(
-            self.gpkg_path,
-            table,
-            fields,
-            WKB_NO_GEOMETRY,
-            rows,
-            self.transform_context,
-        )
-        self._table_cache[table] = [dict(row) for row in rows]
-        self._table_exists_cache[table] = True
+        """Replace a table's rows, creating it with ``specs`` when absent.
+
+        Used for tables outside the current schema declaration (and by tests
+        to build legacy-schema fixtures); the rows are written with SQL.
+        """
+        if not self._table_exists(table):
+            self._create_table(table, specs)
+        prepared = self._prepare(table, rows, specs)
+        with self._writing(table, specs, create_missing=False) as conn:
+            gpkg_sql.delete_where(conn, table, "1 = 1")
+            gpkg_sql.insert_rows(conn, table, prepared)
 
     def upsert_rows(self, table: str, rows: Sequence[Dict]) -> None:
         """Insert or replace rows by the table's primary key."""
         key = schema.TABLE_KEYS[table]
-        existing = self.read_table(table)
-        incoming = {str(r[key]): r for r in rows}
-        merged = [r for r in existing if str(r.get(key)) not in incoming]
-        merged.extend(rows)
-        self.write_table(table, merged)
+        rows = list(rows)
+        if not rows:
+            return
+        keys = [str(r[key]) for r in rows]
+        prepared = self._prepare(table, rows)
+        with self._writing(table) as conn:
+            gpkg_sql.delete_keys(conn, table, key, keys)
+            gpkg_sql.insert_rows(conn, table, prepared)
 
     def delete_rows(self, table: str, keys: Sequence[str]) -> None:
-        key_field = schema.TABLE_KEYS[table]
-        drop = {str(k) for k in keys}
-        remaining = [r for r in self.read_table(table) if str(r.get(key_field)) not in drop]
-        self.write_table(table, remaining)
+        keys = [str(k) for k in keys]
+        if not keys:
+            return
+        with self._writing(table) as conn:
+            gpkg_sql.delete_keys(conn, table, schema.TABLE_KEYS[table], keys)
+
+    def _delete_where(self, table: str, column: str, value) -> None:
+        """Delete every row whose ``column`` equals ``value``."""
+        with self._writing(table) as conn:
+            gpkg_sql.delete_where(conn, table, gpkg_sql.quote_ident(column) + " = ?",
+                                  (value,))
+
+    def _replace_where(self, table: str, column: str, value, rows: Sequence[Dict]) -> None:
+        """Replace the rows whose ``column`` equals ``value`` with ``rows``."""
+        prepared = self._prepare(table, rows)
+        with self._writing(table) as conn:
+            gpkg_sql.delete_where(conn, table, gpkg_sql.quote_ident(column) + " = ?",
+                                  (value,))
+            gpkg_sql.insert_rows(conn, table, prepared)
 
     # -- meta -----------------------------------------------------------------
     def read_meta(self) -> Dict[str, str]:
         return {r["key"]: r["value"] for r in self.read_table(schema.TABLE_META) if r.get("key")}
 
     def write_meta(self, key: str, value: str) -> None:
-        rows = [r for r in self.read_table(schema.TABLE_META) if r.get("key") != key]
-        rows.append({"key": key, "value": value})
-        self._write_table_rows(schema.TABLE_META, schema.META_FIELDS, rows)
+        prepared = self._prepare(schema.TABLE_META, [{"key": key, "value": value}],
+                                 schema.META_FIELDS)
+        with self._writing(schema.TABLE_META, schema.META_FIELDS) as conn:
+            gpkg_sql.delete_where(conn, schema.TABLE_META, '"key" = ?', (key,))
+            gpkg_sql.insert_rows(conn, schema.TABLE_META, prepared)
+
+    def delete_meta(self, key: str) -> None:
+        self._delete_where(schema.TABLE_META, "key", key)
 
     # -- routes ---------------------------------------------------------------
     def list_routes(self) -> List[Dict]:
@@ -206,20 +454,21 @@ class WorkbenchStore:
                      notes: str = "") -> str:
         now = schema.utc_now_iso()
         route_id = schema.new_id()
-        self.upsert_rows(schema.TABLE_ROUTE, [{
-            "route_id": route_id,
-            "name": name,
-            "system_id": system_id or "",
-            "description": description or "",
-            "created_utc": now,
-            "modified_utc": now,
-            "notes": notes or "",
-        }])
-        self.save_component({
-            "component_id": schema.new_id(), "kind": "route",
-            "subject_id": route_id, "name": name,
-            "system_id": system_id or "",
-        }, port_labels=["A", "B"])
+        with self.transaction():
+            self.upsert_rows(schema.TABLE_ROUTE, [{
+                "route_id": route_id,
+                "name": name,
+                "system_id": system_id or "",
+                "description": description or "",
+                "created_utc": now,
+                "modified_utc": now,
+                "notes": notes or "",
+            }])
+            self.save_component({
+                "component_id": schema.new_id(), "kind": "route",
+                "subject_id": route_id, "name": name,
+                "system_id": system_id or "",
+            }, port_labels=["A", "B"])
         return route_id
 
     def save_route(self, row: Dict) -> None:
@@ -227,20 +476,22 @@ class WorkbenchStore:
         row.setdefault("route_id", schema.new_id())
         row.setdefault("created_utc", schema.utc_now_iso())
         row["modified_utc"] = schema.utc_now_iso()
-        self.upsert_rows(schema.TABLE_ROUTE, [row])
-        component = self.component_for_segment(row["route_id"])
-        if component is not None:
-            component["name"] = row.get("name") or component.get("name") or "Cable segment"
-            component["system_id"] = row.get("system_id") or ""
-            self.save_component(component)
+        with self.transaction():
+            self.upsert_rows(schema.TABLE_ROUTE, [row])
+            component = self.component_for_segment(row["route_id"])
+            if component is not None:
+                component["name"] = row.get("name") or component.get("name") or "Cable segment"
+                component["system_id"] = row.get("system_id") or ""
+                self.save_component(component)
 
     def delete_route(self, route_id: str) -> None:
         if self.revisions_of_route(route_id):
             raise ValueError("Cannot delete a route while it still has RPL revisions.")
-        for makeup in self.list_makeups(route_id):
-            self.delete_makeup(makeup.get("makeup_id") or "")
-        self._delete_components_for_subject(route_id)
-        self.delete_rows(schema.TABLE_ROUTE, [route_id])
+        with self.transaction():
+            for makeup in self.list_makeups(route_id):
+                self.delete_makeup(makeup.get("makeup_id") or "")
+            self._delete_components_for_subject(route_id)
+            self.delete_rows(schema.TABLE_ROUTE, [route_id])
 
     def assign_route_to_system(self, route_id: str, system_id: str = "") -> None:
         row = self.get_route(route_id)
@@ -310,10 +561,6 @@ class WorkbenchStore:
         header.setdefault("supersedes_id", "")
         header.setdefault("issued_utc", "")
         header["modified_utc"] = schema.utc_now_iso()
-        self.upsert_rows(schema.TABLE_ASSEMBLY, [header])
-        others = [
-            r for r in self.read_table(schema.TABLE_ASSEMBLY_ITEM) if r.get("assembly_id") != assembly_id
-        ]
         normalised = []
         for seq, item in enumerate(items):
             item = dict(item)
@@ -321,7 +568,10 @@ class WorkbenchStore:
             item["seq"] = seq
             item.setdefault("item_id", schema.new_id())
             normalised.append(item)
-        self.write_table(schema.TABLE_ASSEMBLY_ITEM, others + normalised)
+        with self.transaction():
+            self.upsert_rows(schema.TABLE_ASSEMBLY, [header])
+            self._replace_where(schema.TABLE_ASSEMBLY_ITEM, "assembly_id", assembly_id,
+                                normalised)
 
     def delete_assembly(self, assembly_id: str) -> None:
         placements = [
@@ -331,16 +581,13 @@ class WorkbenchStore:
         if placements:
             raise ValueError(
                 "Cannot delete an assembly while it is used in a cable-segment make-up.")
-        self.delete_rows(schema.TABLE_ASSEMBLY, [assembly_id])
-        remaining = [
-            r for r in self.read_table(schema.TABLE_ASSEMBLY_ITEM) if r.get("assembly_id") != assembly_id
-        ]
-        self.write_table(schema.TABLE_ASSEMBLY_ITEM, remaining)
-        # cascade: fits and topology component referencing this assembly
-        fit_ids = [r["fit_id"] for r in self.read_table(schema.TABLE_FIT) if r.get("assembly_id") == assembly_id]
-        if fit_ids:
-            self.delete_rows(schema.TABLE_FIT, fit_ids)
-        self._delete_components_for_subject(assembly_id)
+        # One transaction: the assembly can never be left half-deleted.
+        with self.transaction():
+            self.delete_rows(schema.TABLE_ASSEMBLY, [assembly_id])
+            self._delete_where(schema.TABLE_ASSEMBLY_ITEM, "assembly_id", assembly_id)
+            # cascade: fits and topology component referencing this assembly
+            self._delete_where(schema.TABLE_FIT, "assembly_id", assembly_id)
+            self._delete_components_for_subject(assembly_id)
 
     # -- RPLs -------------------------------------------------------------------
     def list_rpls(self) -> List[Dict]:
@@ -357,14 +604,15 @@ class WorkbenchStore:
         merged.update(dict(row))
         row = merged
         row.setdefault("created_utc", schema.utc_now_iso())
-        if not row.get("route_id"):
-            row["route_id"] = self.create_route(row.get("name") or "Route")
-        row.setdefault("rev_label", schema.next_rev_label([]))
-        row.setdefault("status", schema.STATUS_DRAFT)
-        row.setdefault("supersedes_id", "")
-        row.setdefault("issued_utc", "")
-        row["modified_utc"] = schema.utc_now_iso()
-        self.upsert_rows(schema.TABLE_RPL, [row])
+        with self.transaction():
+            if not row.get("route_id"):
+                row["route_id"] = self.create_route(row.get("name") or "Route")
+            row.setdefault("rev_label", schema.next_rev_label([]))
+            row.setdefault("status", schema.STATUS_DRAFT)
+            row.setdefault("supersedes_id", "")
+            row.setdefault("issued_utc", "")
+            row["modified_utc"] = schema.utc_now_iso()
+            self.upsert_rows(schema.TABLE_RPL, [row])
 
     def delete_rpl(self, rpl_id: str) -> None:
         """Remove the registry row, its fits, and its topology component.
@@ -373,13 +621,12 @@ class WorkbenchStore:
         the project); callers should remove them from the layer tree and may
         recreate/overwrite them later.
         """
-        self.delete_rows(schema.TABLE_RPL, [rpl_id])
-        fit_ids = [r["fit_id"] for r in self.read_table(schema.TABLE_FIT) if r.get("rpl_id") == rpl_id]
-        if fit_ids:
-            self.delete_rows(schema.TABLE_FIT, fit_ids)
-        for assessment in self.list_assessments(rpl_id):
-            self.delete_assessment(assessment["assessment_id"])
-        self._delete_components_for_subject(rpl_id)
+        with self.transaction():
+            self.delete_rows(schema.TABLE_RPL, [rpl_id])
+            self._delete_where(schema.TABLE_FIT, "rpl_id", rpl_id)
+            for assessment in self.list_assessments(rpl_id):
+                self.delete_assessment(assessment["assessment_id"])
+            self._delete_components_for_subject(rpl_id)
 
     def rpl_depth_config(self, rpl_id: str) -> Dict:
         row = self.get_rpl(rpl_id)
@@ -395,19 +642,21 @@ class WorkbenchStore:
         if old is None:
             raise ValueError("RPL not found.")
         route_id = old.get("route_id")
-        if not route_id or self.get_route(route_id) is None:
-            route_id = self.create_route(old.get("name") or "Route")
-            old["route_id"] = route_id
-            self.write_table(schema.TABLE_RPL, [
-                old if r.get("rpl_id") == rpl_id else r
-                for r in self.read_table(schema.TABLE_RPL)
-            ])
-        route = self.get_route(route_id) or {"name": old.get("name") or "Route"}
+        route = self.get_route(route_id) if route_id else None
+        # A revision whose cable segment is missing (damaged store) gets a
+        # new segment, created with the revision below; until then the old
+        # revision is that segment's only member.
+        repair_route = route is None
+        if repair_route:
+            route = {"name": old.get("name") or "Route"}
+            revisions = [old]
+        else:
+            revisions = self.revisions_of_route(route_id)
         if not rev_label:
-            rev_label = schema.next_rev_label(self.revisions_of_route(route_id))
+            rev_label = schema.next_rev_label(revisions)
         wanted = rev_label.strip().lower()
         if any((r.get("rev_label") or "").strip().lower() == wanted
-               for r in self.revisions_of_route(route_id)):
+               for r in revisions):
             raise ValueError(
                 f"Revision label '{rev_label}' already exists for this cable "
                 "segment. Choose a different label.")
@@ -421,38 +670,68 @@ class WorkbenchStore:
         lines_layer = schema.unique_layer_name(
             existing_layers, schema.rpl_lines_layer_name(new_name))
 
-        self.copy_spatial_layer(old.get("points_layer") or "", points_layer, {"rpl_id": new_id})
-        self.copy_spatial_layer(old.get("lines_layer") or "", lines_layer, {"rpl_id": new_id})
+        # Spatial copies are OGR writes, so they go first, outside the
+        # registry transaction; the registry row is the commit point.
+        copied_layers: List[str] = []
+        try:
+            self.copy_spatial_layer(old.get("points_layer") or "", points_layer,
+                                    {"rpl_id": new_id})
+            copied_layers.append(points_layer)
+            self.copy_spatial_layer(old.get("lines_layer") or "", lines_layer,
+                                    {"rpl_id": new_id})
+            copied_layers.append(lines_layer)
 
-        now = schema.utc_now_iso()
-        new_row = dict(old)
-        new_row.update({
-            "rpl_id": new_id,
-            "name": new_name,
-            "route_id": route_id,
-            "rev_label": rev_label,
-            "status": schema.STATUS_DRAFT,
-            "supersedes_id": rpl_id,
-            "issued_utc": "",
-            "points_layer": points_layer,
-            "lines_layer": lines_layer,
-            "created_utc": now,
-            "modified_utc": now,
-        })
-        self.upsert_rows(schema.TABLE_RPL, [new_row])
+            now = schema.utc_now_iso()
+            with self.transaction():
+                if repair_route:
+                    route_id = self.create_route(old.get("name") or "Route")
+                    repaired = dict(old)
+                    repaired["route_id"] = route_id
+                    self.upsert_rows(schema.TABLE_RPL, [repaired])
+                new_row = dict(old)
+                new_row.update({
+                    "rpl_id": new_id,
+                    "name": new_name,
+                    "route_id": route_id,
+                    "rev_label": rev_label,
+                    "status": schema.STATUS_DRAFT,
+                    "supersedes_id": rpl_id,
+                    "issued_utc": "",
+                    "points_layer": points_layer,
+                    "lines_layer": lines_layer,
+                    "created_utc": now,
+                    "modified_utc": now,
+                })
+                self.upsert_rows(schema.TABLE_RPL, [new_row])
 
-        fit_rows = []
-        for fit in self.list_fits(rpl_id=rpl_id):
-            copied = dict(fit)
-            copied["fit_id"] = schema.new_id()
-            copied["rpl_id"] = new_id
-            copied["created_utc"] = now
-            fit_rows.append(copied)
-        if fit_rows:
-            self.upsert_rows(schema.TABLE_FIT, fit_rows)
+                fit_rows = []
+                for fit in self.list_fits(rpl_id=rpl_id):
+                    copied = dict(fit)
+                    copied["fit_id"] = schema.new_id()
+                    copied["rpl_id"] = new_id
+                    copied["created_utc"] = now
+                    fit_rows.append(copied)
+                if fit_rows:
+                    self.upsert_rows(schema.TABLE_FIT, fit_rows)
 
-        self.ensure_segment_component(route_id)
+                self.ensure_segment_component(route_id)
+        except Exception:
+            self._drop_spatial_layers(copied_layers)
+            raise
         return new_id
+
+    def _drop_spatial_layers(self, layer_names: Sequence[str]) -> None:
+        """Best-effort removal of spatial layers staged by a failed operation."""
+        if not layer_names:
+            return
+        from .rpl_import_service import delete_gpkg_layer
+
+        for layer_name in layer_names:
+            try:
+                if not delete_gpkg_layer(self.gpkg_path, layer_name):
+                    log_warning(f"Workbench: could not remove staged layer '{layer_name}'")
+            except Exception:
+                log_exception(f"Workbench: could not remove staged layer '{layer_name}'")
 
     def new_assembly_revision(self, assembly_id: str, rev_label: Optional[str] = None) -> str:
         header, items = self.get_assembly(assembly_id)
@@ -519,20 +798,15 @@ class WorkbenchStore:
 
     def _set_status(self, table: str, row_id: str, status: str) -> None:
         key = schema.TABLE_KEYS[table]
-        rows = self.read_table(table)
-        now = schema.utc_now_iso()
-        changed = False
-        for row in rows:
-            if row.get(key) == row_id:
-                row["status"] = status
-                row["issued_utc"] = now if status == schema.STATUS_ISSUED else ""
-                if "modified_utc" in row:
-                    row["modified_utc"] = now
-                changed = True
-                break
-        if not changed:
+        row = next((r for r in self.read_table(table) if r.get(key) == row_id), None)
+        if row is None:
             raise ValueError("Entity not found.")
-        self.write_table(table, rows)
+        now = schema.utc_now_iso()
+        row["status"] = status
+        row["issued_utc"] = now if status == schema.STATUS_ISSUED else ""
+        if "modified_utc" in row:
+            row["modified_utc"] = now
+        self.upsert_rows(table, [row])
 
     # -- fits ---------------------------------------------------------------------
     def list_fits(self, rpl_id: Optional[str] = None, assembly_id: Optional[str] = None) -> List[Dict]:
@@ -595,12 +869,7 @@ class WorkbenchStore:
         merged.setdefault("created_utc", schema.utc_now_iso())
         merged.setdefault("notes", "")
         merged["modified_utc"] = schema.utc_now_iso()
-        self.upsert_rows(schema.TABLE_MAKEUP, [merged])
 
-        others = [
-            row for row in self.read_table(schema.TABLE_MAKEUP_ITEM)
-            if row.get("makeup_id") != makeup_id
-        ]
         normalised = []
         for seq, source in enumerate(items):
             row = dict(source)
@@ -616,7 +885,9 @@ class WorkbenchStore:
             row.setdefault("params_json", "{}")
             row.setdefault("notes", "")
             normalised.append(row)
-        self.write_table(schema.TABLE_MAKEUP_ITEM, others + normalised)
+        with self.transaction():
+            self.upsert_rows(schema.TABLE_MAKEUP, [merged])
+            self._replace_where(schema.TABLE_MAKEUP_ITEM, "makeup_id", makeup_id, normalised)
         return makeup_id
 
     def ensure_makeup(self, route_id: str) -> Tuple[Dict, List[Dict]]:
@@ -638,24 +909,25 @@ class WorkbenchStore:
         assembly, _rows = self.get_assembly(assembly_id)
         if assembly is None:
             raise ValueError("Assembly not found.")
-        header, items = self.ensure_makeup(route_id)
-        placements = [item for item in items if item.get("kind") == "assembly"]
-        if placements:
+        with self.transaction():
+            header, items = self.ensure_makeup(route_id)
+            placements = [item for item in items if item.get("kind") == "assembly"]
+            if placements:
+                items.append({
+                    "makeup_item_id": schema.new_id(), "kind": "joint",
+                    "name": f"Joint J{len(placements):02d}", "direction": 1,
+                    "params_json": "{}", "notes": "",
+                })
+            item_id = schema.new_id()
             items.append({
-                "makeup_item_id": schema.new_id(), "kind": "joint",
-                "name": f"Joint J{len(placements):02d}", "direction": 1,
+                "makeup_item_id": item_id, "kind": "assembly",
+                "assembly_id": assembly_id,
+                "name": assembly.get("name") or "Assembly",
+                "direction": 1 if int(direction or 1) >= 0 else -1,
+                "use_start_m": None, "use_end_m": None,
                 "params_json": "{}", "notes": "",
             })
-        item_id = schema.new_id()
-        items.append({
-            "makeup_item_id": item_id, "kind": "assembly",
-            "assembly_id": assembly_id,
-            "name": assembly.get("name") or "Assembly",
-            "direction": 1 if int(direction or 1) >= 0 else -1,
-            "use_start_m": None, "use_end_m": None,
-            "params_json": "{}", "notes": "",
-        })
-        self.save_makeup(header, items)
+            self.save_makeup(header, items)
         return item_id
 
     def delete_makeup_item(self, makeup_item_id: str) -> None:
@@ -708,12 +980,9 @@ class WorkbenchStore:
         return self.save_makeup(header, copies)
 
     def delete_makeup(self, makeup_id: str) -> None:
-        self.delete_rows(schema.TABLE_MAKEUP, [makeup_id])
-        remaining = [
-            row for row in self.read_table(schema.TABLE_MAKEUP_ITEM)
-            if row.get("makeup_id") != makeup_id
-        ]
-        self.write_table(schema.TABLE_MAKEUP_ITEM, remaining)
+        with self.transaction():
+            self.delete_rows(schema.TABLE_MAKEUP, [makeup_id])
+            self._delete_where(schema.TABLE_MAKEUP_ITEM, "makeup_id", makeup_id)
 
     # -- event rules ------------------------------------------------------------
     def list_event_rules(self) -> List[Dict]:
@@ -769,8 +1038,6 @@ class WorkbenchStore:
         rule_set_id = header["rule_set_id"]
         header.setdefault("created_utc", schema.utc_now_iso())
         header["modified_utc"] = schema.utc_now_iso()
-        self.upsert_rows(schema.TABLE_RULE_SET, [header])
-        others = [r for r in self.read_table(schema.TABLE_RULE) if r.get("rule_set_id") != rule_set_id]
         normalised = []
         for seq, rule in enumerate(rules):
             rule = dict(rule)
@@ -778,13 +1045,15 @@ class WorkbenchStore:
             rule["seq"] = seq
             rule.setdefault("rule_id", schema.new_id())
             normalised.append(rule)
-        self.write_table(schema.TABLE_RULE, others + normalised)
+        with self.transaction():
+            self.upsert_rows(schema.TABLE_RULE_SET, [header])
+            self._replace_where(schema.TABLE_RULE, "rule_set_id", rule_set_id, normalised)
         return rule_set_id
 
     def delete_rule_set(self, rule_set_id: str) -> None:
-        self.delete_rows(schema.TABLE_RULE_SET, [rule_set_id])
-        remaining = [r for r in self.read_table(schema.TABLE_RULE) if r.get("rule_set_id") != rule_set_id]
-        self.write_table(schema.TABLE_RULE, remaining)
+        with self.transaction():
+            self.delete_rows(schema.TABLE_RULE_SET, [rule_set_id])
+            self._delete_where(schema.TABLE_RULE, "rule_set_id", rule_set_id)
 
     def seed_default_rule_set(self) -> str:
         """Create the default 'Burial Assessment' template. Returns its id."""
@@ -834,12 +1103,9 @@ class WorkbenchStore:
         return row["assessment_id"]
 
     def delete_assessment(self, assessment_id: str) -> None:
-        self.delete_rows(schema.TABLE_ASSESSMENT, [assessment_id])
-        remaining = [
-            r for r in self.read_table(schema.TABLE_ASSESSMENT_RANGE)
-            if r.get("assessment_id") != assessment_id
-        ]
-        self.write_table(schema.TABLE_ASSESSMENT_RANGE, remaining)
+        with self.transaction():
+            self.delete_rows(schema.TABLE_ASSESSMENT, [assessment_id])
+            self._delete_where(schema.TABLE_ASSESSMENT_RANGE, "assessment_id", assessment_id)
 
     def list_assessment_ranges(self, assessment_id: str) -> List[Dict]:
         rows = [
@@ -851,28 +1117,24 @@ class WorkbenchStore:
 
     def save_assessment_ranges(self, assessment_id: str, rows: Sequence[Dict]) -> None:
         """Replace all stored ranges for one assessment."""
-        others = [
-            r for r in self.read_table(schema.TABLE_ASSESSMENT_RANGE)
-            if r.get("assessment_id") != assessment_id
-        ]
         normalised = []
         for row in rows:
             row = dict(row)
             row["assessment_id"] = assessment_id
             row.setdefault("range_id", schema.new_id())
             normalised.append(row)
-        self.write_table(schema.TABLE_ASSESSMENT_RANGE, others + normalised)
+        self._replace_where(schema.TABLE_ASSESSMENT_RANGE, "assessment_id", assessment_id,
+                            normalised)
 
     def mark_assessments_stale(self, rpl_id: str) -> None:
         """Flag every current assessment of an RPL as stale (RPL changed)."""
-        rows = self.read_table(schema.TABLE_ASSESSMENT)
-        changed = False
-        for row in rows:
+        changed = []
+        for row in self.read_table(schema.TABLE_ASSESSMENT):
             if row.get("rpl_id") == rpl_id and row.get("status") == "current":
                 row["status"] = "stale"
-                changed = True
+                changed.append(row)
         if changed:
-            self.write_table(schema.TABLE_ASSESSMENT, rows)
+            self.upsert_rows(schema.TABLE_ASSESSMENT, changed)
 
     # -- topology (CRA core) -----------------------------------------------------
     def list_components(self) -> List[Dict]:
@@ -905,30 +1167,31 @@ class WorkbenchStore:
         # wb_system is shared by the manual route grouping and the topology
         # assignment cache. Clear manual route references; topology code may
         # recreate derived rows later if the port graph still needs them.
-        routes = self.read_table(schema.TABLE_ROUTE)
-        changed = False
-        for route in routes:
+        changed = []
+        for route in self.read_table(schema.TABLE_ROUTE):
             if route.get("system_id") == system_id:
                 route["system_id"] = ""
-                changed = True
-        if changed:
-            self.write_table(schema.TABLE_ROUTE, routes)
-        self.delete_rows(schema.TABLE_SYSTEM, [system_id])
+                changed.append(route)
+        with self.transaction():
+            if changed:
+                self.upsert_rows(schema.TABLE_ROUTE, changed)
+            self.delete_rows(schema.TABLE_SYSTEM, [system_id])
 
     def save_component(self, row: Dict, port_labels: Sequence[str] = ()) -> str:
         """Upsert a component; optionally create its ports if it has none."""
         row = dict(row)
         row.setdefault("component_id", schema.new_id())
-        self.upsert_rows(schema.TABLE_COMPONENT, [row])
         component_id = row["component_id"]
-        if port_labels:
-            existing = [p for p in self.list_ports() if p.get("component_id") == component_id]
-            if not existing:
-                ports = [
-                    {"port_id": schema.new_id(), "component_id": component_id, "label": label}
-                    for label in port_labels
-                ]
-                self.upsert_rows(schema.TABLE_PORT, ports)
+        with self.transaction():
+            self.upsert_rows(schema.TABLE_COMPONENT, [row])
+            if port_labels:
+                existing = [p for p in self.list_ports() if p.get("component_id") == component_id]
+                if not existing:
+                    ports = [
+                        {"port_id": schema.new_id(), "component_id": component_id, "label": label}
+                        for label in port_labels
+                    ]
+                    self.upsert_rows(schema.TABLE_PORT, ports)
         return component_id
 
     def add_port(self, component_id: str, label: str = "") -> str:
@@ -1014,22 +1277,24 @@ class WorkbenchStore:
 
     def delete_component(self, component_id: str) -> None:
         port_ids = [p["port_id"] for p in self.list_ports() if p.get("component_id") == component_id]
-        if port_ids:
-            port_set = set(port_ids)
-            conn_ids = [
-                c["connection_id"]
-                for c in self.list_connections()
-                if c.get("port_a_id") in port_set or c.get("port_b_id") in port_set
-            ]
-            if conn_ids:
-                self.delete_rows(schema.TABLE_CONNECTION, conn_ids)
-            self.delete_rows(schema.TABLE_PORT, port_ids)
-        self.delete_rows(schema.TABLE_COMPONENT, [component_id])
+        with self.transaction():
+            if port_ids:
+                port_set = set(port_ids)
+                conn_ids = [
+                    c["connection_id"]
+                    for c in self.list_connections()
+                    if c.get("port_a_id") in port_set or c.get("port_b_id") in port_set
+                ]
+                if conn_ids:
+                    self.delete_rows(schema.TABLE_CONNECTION, conn_ids)
+                self.delete_rows(schema.TABLE_PORT, port_ids)
+            self.delete_rows(schema.TABLE_COMPONENT, [component_id])
 
     def _delete_components_for_subject(self, subject_id: str) -> None:
-        for component in self.list_components():
-            if component.get("subject_id") == subject_id:
-                self.delete_component(component["component_id"])
+        with self.transaction():
+            for component in self.list_components():
+                if component.get("subject_id") == subject_id:
+                    self.delete_component(component["component_id"])
 
     def connect_ports(self, port_a_id: str, port_b_id: str) -> str:
         """Create a connection, enforcing the CRA core invariants."""
@@ -1118,6 +1383,10 @@ class WorkbenchStore:
     # -- spatial layers ------------------------------------------------------------
     def write_spatial_layer(self, layer_name: str, field_specs, wkb_type, rows: List[Dict]) -> int:
         """Create/overwrite a spatial layer (EPSG:4326) from row dicts with WKT_KEY geometry."""
+        if self._tx_conn is not None:
+            # The OGR writer would wait on the transaction's lock until it
+            # timed out; write spatial layers before or after the registry.
+            raise RuntimeError("Spatial layers cannot be written inside a registry transaction.")
         fields = fields_from_specs(field_specs)
         return write_layer_to_gpkg(
             self.gpkg_path, layer_name, fields, wkb_type, rows, self.transform_context
@@ -1135,14 +1404,19 @@ def _migrate_1_to_2(store: "WorkbenchStore") -> None:
     only needs to guarantee they exist; it deliberately does not touch existing
     rows. Kept explicit so the migration framework has a real first step.
     """
-    for table in (
-        schema.TABLE_RULE_SET,
-        schema.TABLE_RULE,
-        schema.TABLE_ASSESSMENT,
-        schema.TABLE_ASSESSMENT_RANGE,
-    ):
-        if not store._table_exists(table):
-            store._write_table_rows(table, schema.REGISTRY_TABLES[table], [])
+    missing = [
+        table for table in (
+            schema.TABLE_RULE_SET,
+            schema.TABLE_RULE,
+            schema.TABLE_ASSESSMENT,
+            schema.TABLE_ASSESSMENT_RANGE,
+        )
+        if not store._table_exists(table)
+    ]
+    if missing:
+        # Migrators run inside a transaction and cannot create tables;
+        # ensure_created always has by now, so this is a broken store.
+        raise WorkbenchStoreError(f"Registry tables missing after creation: {missing}")
 
 
 def _migrate_2_to_3(store: "WorkbenchStore") -> None:
@@ -1364,18 +1638,63 @@ def _finding(rule_id: str, severity: str, message: str, object_type: str, object
 
 def _normalise_row(row: Dict) -> Dict:
     """Convert QVariant-ish NULLs to plain None for dict-level comparisons."""
-    out = {}
-    for key, value in row.items():
-        if value is None:
-            out[key] = None
-            continue
-        # PyQt may hand back a QVariant for NULL attribute values.
-        type_name = type(value).__name__
-        if type_name == "QVariant":
-            out[key] = None if not value.isValid() or value.isNull() else value.value()
-        else:
-            out[key] = value
-    return out
+    return {key: _plain_value(value) for key, value in row.items()}
+
+
+def _plain_value(value):
+    """Unwrap a PyQt QVariant (NULL -> None); other values pass through."""
+    if value is None:
+        return None
+    # PyQt may hand back a QVariant for NULL attribute values.
+    if type(value).__name__ == "QVariant":
+        return None if not value.isValid() or value.isNull() else value.value()
+    return value
+
+
+def _coerce_value(value, type_str: str, table: str, name: str):
+    """A row value converted to its declared registry type for SQLite.
+
+    Mirrors what the OGR writer stored (ints for ``int``, floats for
+    ``float``, text for ``str``; blank numeric text is NULL) but refuses
+    values it cannot represent instead of silently writing 0 or dropping the
+    row, so a bad value aborts the write before anything changes.
+    """
+    value = _plain_value(value)
+    if value is None:
+        return None
+    try:
+        if type_str == "str":
+            if isinstance(value, str):
+                return value
+            if isinstance(value, bool):
+                return "true" if value else "false"
+            if isinstance(value, (int, float)):
+                return str(value)
+        elif type_str == "float":
+            if isinstance(value, str):
+                value = value.strip()
+                if not value:
+                    return None
+            return float(value)
+        elif type_str == "int":
+            if isinstance(value, str):
+                value = value.strip()
+                if not value:
+                    return None
+                try:
+                    return int(value)
+                except ValueError:
+                    value = float(value)
+            if isinstance(value, (bool, int)):
+                return int(value)
+            number = float(value)
+            if math.isfinite(number):
+                return int(math.floor(number + 0.5))
+    except (TypeError, ValueError, OverflowError):
+        pass
+    raise WorkbenchStoreError(
+        f"Cannot store {value!r} ({type(value).__name__}) in the {type_str} "
+        f"field '{name}' of {table}. Nothing was changed.")
 
 
 WKT = WKT_KEY  # re-export: geometry key used in spatial row dicts

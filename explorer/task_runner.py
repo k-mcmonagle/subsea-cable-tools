@@ -22,6 +22,8 @@ from qgis.PyQt.QtCore import QObject, Qt
 from qgis.PyQt.QtWidgets import QMessageBox, QProgressDialog
 from qgis.core import QgsApplication, QgsTask
 
+from ..plugin_log import log_exception
+
 _WINDOW_MODAL = getattr(getattr(Qt, "WindowModality", Qt), "WindowModal")
 
 
@@ -55,7 +57,8 @@ class CallableTask(QgsTask):
     def run(self) -> bool:  # worker thread
         try:
             self.result = self._work(self)
-        except Exception as exc:
+        except Exception as exc:  # reported via taskTerminated; keep the traceback
+            log_exception(f"Cable Lay Data Explorer: '{self.description()}' failed")
             self.error = str(exc) or exc.__class__.__name__
             return False
         if self.isCanceled():
@@ -104,6 +107,7 @@ class TaskRunner(QObject):
             try:
                 result = work(_InlineFeedback())
             except Exception as exc:
+                log_exception("Cable Lay Data Explorer: background work failed")
                 self._report_error(on_error, str(exc) or exc.__class__.__name__)
                 return True
             finish(result)

@@ -28,10 +28,45 @@ Slack semantics: ``cable_km = dist_km * (1 + slack_pct / 100)`` per segment.
 from __future__ import annotations
 
 import enum
+import math
+from bisect import bisect_left
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from qgis.core import QgsDistanceArea, QgsPointXY
+
+# Bumped whenever a position's coordinates or cumulative distances change
+# (or a model's point list is edited in place), so the cached KP lookup
+# arrays below are never used stale. See ``_kp_index``.
+_EPOCH = 0
+_INDEXED_FIELDS = frozenset(("lat", "lon", "dist_cum_km", "cable_dist_cum_km"))
+
+
+def _bump_epoch() -> None:
+    global _EPOCH
+    _EPOCH += 1
+
+
+class _PointList(list):
+    """``RplModel.points``: a list that invalidates cached KP lookups on
+    any in-place edit (insert/pop/replace/reorder)."""
+
+
+def _invalidating(name: str):
+    base = getattr(list, name)
+
+    def method(self, *args, **kwargs):
+        _bump_epoch()
+        return base(self, *args, **kwargs)
+
+    method.__name__ = name
+    return method
+
+
+for _name in ("__setitem__", "__delitem__", "__iadd__", "__imul__", "append",
+              "extend", "insert", "pop", "remove", "clear", "sort", "reverse"):
+    setattr(_PointList, _name, _invalidating(_name))
+del _name
 
 
 class SlackMode(enum.Enum):
@@ -57,6 +92,11 @@ class RplPoint:
     cable_dist_cum_km: Optional[float] = None
     depth_m: Optional[float] = None
     attrs: Dict = field(default_factory=dict)
+
+    def __setattr__(self, name, value):
+        if name in _INDEXED_FIELDS:
+            _bump_epoch()
+        object.__setattr__(self, name, value)
 
 
 @dataclass
@@ -105,6 +145,8 @@ class RplModel:
                 f"RplModel needs len(points)-1 segments "
                 f"(got {len(self.points)} points, {len(self.segments)} segments)"
             )
+        if not isinstance(self.points, _PointList):
+            self.points = _PointList(self.points)
 
     def copy(self) -> "RplModel":
         return RplModel(
@@ -411,13 +453,138 @@ def _renumber(model: RplModel) -> None:
 
 # ---------------------------------------------------------------------------
 # KP / cable-distance conversions
+#
+# The lookups below are called per assembly item / per repaint / per profile
+# station, so a linear walk made them O(items x positions). They bisect the
+# cumulative arrays instead, cached on the model and rebuilt whenever a
+# position's coordinates or cumulative distances change (``_EPOCH``). Results
+# are identical to the original walk: whenever the arrays are not a clean
+# non-decreasing series (missing values, NaN, out-of-order document values)
+# or the query is not finite, the original ``_*_scan`` walk answers instead.
 # ---------------------------------------------------------------------------
+class _KpIndex:
+    __slots__ = ("points", "epoch", "kps", "cables", "kps_sorted", "cables_sorted")
+
+    def __init__(self, points, epoch: int):
+        self.points = points
+        self.epoch = epoch
+        self.kps = [p.dist_cum_km for p in points]
+        self.cables = [p.cable_dist_cum_km for p in points]
+        self.kps_sorted = _non_decreasing(self.kps)
+        self.cables_sorted = _non_decreasing(self.cables)
+
+
+def _non_decreasing(values: List[Optional[float]]) -> bool:
+    if len(values) < 2 or any(v is None for v in values):
+        return False
+    try:
+        return all(a <= b for a, b in zip(values, values[1:]))
+    except TypeError:
+        return False
+
+
+def _kp_index(model: RplModel) -> _KpIndex:
+    points = model.points
+    index = getattr(model, "_kp_index_cache", None)
+    if index is not None and index.points is points and index.epoch == _EPOCH:
+        return index
+    index = _KpIndex(points, _EPOCH)
+    if isinstance(points, _PointList):  # plain lists cannot report edits
+        object.__setattr__(model, "_kp_index_cache", index)
+    return index
+
+
+def _finite(value) -> bool:
+    try:
+        return math.isfinite(value)
+    except TypeError:
+        return False
+
+
+def _segment_at(values: List[float], x: float) -> int:
+    """First segment ``i`` with ``x <= values[i + 1]`` (x within range)."""
+    return bisect_left(values, x, 1, len(values)) - 1
+
+
 def kp_of_point(model: RplModel, idx: int) -> Optional[float]:
     return model.points[idx].dist_cum_km
 
 
 def cable_dist_from_kp(model: RplModel, kp_km: float) -> Optional[float]:
     """Cable distance (km) at route KP, piecewise-linear via per-segment slack."""
+    index = _kp_index(model)
+    if not index.kps_sorted or not _finite(kp_km):
+        return _cable_dist_from_kp_scan(model, kp_km)
+    kps = index.kps
+    if kp_km < kps[0] or kp_km > kps[-1]:
+        return None
+    i = _segment_at(kps, kp_km)
+    pts = model.points
+    k0, k1 = kps[i], kps[i + 1]
+    c0, c1 = pts[i].cable_dist_cum_km or 0.0, pts[i + 1].cable_dist_cum_km or 0.0
+    if k1 - k0 <= 0:
+        return c0
+    t = (kp_km - k0) / (k1 - k0)
+    return c0 + t * (c1 - c0)
+
+
+def kp_from_cable_dist(model: RplModel, cable_km: float) -> Optional[float]:
+    """Route KP at a cable distance (km) — inverse of :func:`cable_dist_from_kp`."""
+    index = _kp_index(model)
+    if not index.cables_sorted or not _finite(cable_km):
+        return _kp_from_cable_dist_scan(model, cable_km)
+    cables = index.cables
+    if cable_km < cables[0] or cable_km > cables[-1]:
+        return None
+    i = _segment_at(cables, cable_km)
+    pts = model.points
+    c0, c1 = cables[i], cables[i + 1]
+    k0, k1 = pts[i].dist_cum_km or 0.0, pts[i + 1].dist_cum_km or 0.0
+    if c1 - c0 <= 0:
+        return k0
+    t = (cable_km - c0) / (c1 - c0)
+    return k0 + t * (k1 - k0)
+
+
+def point_at_kp(model: RplModel, kp_km: float, da: QgsDistanceArea) -> Optional[Tuple[float, float]]:
+    """(lat, lon) at route KP, interpolated linearly within the segment.
+
+    Good to well under a metre for typical RPL segment lengths; UI callers
+    with a RouteFrame available may prefer its geodesic interpolation.
+    """
+    index = _kp_index(model)
+    if not index.kps_sorted or not _finite(kp_km):
+        return _point_at_kp_scan(model, kp_km)
+    kps = index.kps
+    if kp_km < kps[0] or kp_km > kps[-1]:
+        return None
+    i = _segment_at(kps, kp_km)
+    pts = model.points
+    k0, k1 = kps[i], kps[i + 1]
+    if k1 - k0 <= 0:
+        return (pts[i].lat, pts[i].lon)
+    t = (kp_km - k0) / (k1 - k0)
+    lat = pts[i].lat + t * (pts[i + 1].lat - pts[i].lat)
+    lon = pts[i].lon + t * (pts[i + 1].lon - pts[i].lon)
+    return (lat, lon)
+
+
+def bearing_at_kp(model: RplModel, kp_km: float) -> Optional[float]:
+    """Forward route bearing (deg) of the segment containing KP."""
+    index = _kp_index(model)
+    if not index.kps_sorted or not _finite(kp_km):
+        return _bearing_at_kp_scan(model, kp_km)
+    kps = index.kps
+    if kp_km < kps[0]:
+        return None
+    # Past the end, the walk falls through to the last segment.
+    i = len(kps) - 2 if kp_km > kps[-1] else _segment_at(kps, kp_km)
+    return model.segments[i].bearing_deg
+
+
+# Original linear walks: the reference semantics, and the fallback for
+# arrays the bisection cannot trust.
+def _cable_dist_from_kp_scan(model: RplModel, kp_km: float) -> Optional[float]:
     pts = model.points
     if not pts or pts[0].dist_cum_km is None:
         return None
@@ -437,8 +604,7 @@ def cable_dist_from_kp(model: RplModel, kp_km: float) -> Optional[float]:
     return None
 
 
-def kp_from_cable_dist(model: RplModel, cable_km: float) -> Optional[float]:
-    """Route KP at a cable distance (km) — inverse of :func:`cable_dist_from_kp`."""
+def _kp_from_cable_dist_scan(model: RplModel, cable_km: float) -> Optional[float]:
     pts = model.points
     if not pts or pts[0].cable_dist_cum_km is None:
         return None
@@ -458,12 +624,7 @@ def kp_from_cable_dist(model: RplModel, cable_km: float) -> Optional[float]:
     return None
 
 
-def point_at_kp(model: RplModel, kp_km: float, da: QgsDistanceArea) -> Optional[Tuple[float, float]]:
-    """(lat, lon) at route KP, interpolated linearly within the segment.
-
-    Good to well under a metre for typical RPL segment lengths; UI callers
-    with a RouteFrame available may prefer its geodesic interpolation.
-    """
+def _point_at_kp_scan(model: RplModel, kp_km: float) -> Optional[Tuple[float, float]]:
     pts = model.points
     if not pts or pts[0].dist_cum_km is None:
         return None
@@ -484,8 +645,7 @@ def point_at_kp(model: RplModel, kp_km: float, da: QgsDistanceArea) -> Optional[
     return None
 
 
-def bearing_at_kp(model: RplModel, kp_km: float) -> Optional[float]:
-    """Forward route bearing (deg) of the segment containing KP."""
+def _bearing_at_kp_scan(model: RplModel, kp_km: float) -> Optional[float]:
     pts = model.points
     if not pts:
         return None

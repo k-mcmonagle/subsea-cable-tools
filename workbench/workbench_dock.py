@@ -9,6 +9,7 @@ are managed in a secondary catalogue and placed into one or more segments.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Dict, Optional
 
@@ -32,6 +33,7 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.core import QgsProject, QgsVectorLayer
 
+from ..plugin_log import log_exception
 from ..qgis_compat import (
     WINDOW_HINT_CLOSE,
     WINDOW_HINT_CUSTOMIZE,
@@ -228,8 +230,9 @@ class WorkbenchDock(QDockWidget):
             if geometry is not None:
                 try:
                     self.restoreGeometry(geometry)
-                except Exception:
-                    pass
+                except (TypeError, RuntimeError):  # unreadable saved geometry
+                    log_exception("Workbench: saved window geometry ignored",
+                                  level=logging.DEBUG)
             else:
                 self.resize(1200, 780)
 
@@ -239,8 +242,8 @@ class WorkbenchDock(QDockWidget):
             settings.setValue(_FLOATING_MODE_KEY, self.isFloating())
             if self.isFloating():
                 settings.setValue(_FLOATING_GEOMETRY_KEY, self.saveGeometry())
-        except Exception:
-            pass
+        except RuntimeError:  # dock already being destroyed
+            log_exception("Workbench: window state not saved", level=logging.DEBUG)
 
     # ------------------------------------------------------ layer sync --
     def _project_sync_signal_slots(self):
@@ -261,15 +264,17 @@ class WorkbenchDock(QDockWidget):
         for obj, signal_name, slot in self._project_sync_signal_slots():
             try:
                 getattr(obj, signal_name).connect(slot)
-            except Exception:
-                pass
+            except (AttributeError, TypeError, RuntimeError):
+                # The Workbench would silently stop tracking layer removal /
+                # project switches: record why.
+                log_exception(f"Workbench: cannot follow the project's {signal_name} signal")
 
     def _disconnect_project_layer_sync(self):
         for obj, signal_name, slot in self._project_sync_signal_slots():
             try:
                 getattr(obj, signal_name).disconnect(slot)
-            except Exception:
-                pass
+            except (AttributeError, TypeError, RuntimeError):
+                pass  # never connected, or the sender is already gone
 
     def _on_project_teardown_starts(self, *_args):
         # The project is being cleared (close / open another project): every
@@ -308,8 +313,8 @@ class WorkbenchDock(QDockWidget):
             elif hasattr(item, "id"):
                 try:
                     removed_ids.add(item.id())
-                except Exception:
-                    pass
+                except RuntimeError:
+                    pass  # layer object already deleted
         return all_ids <= removed_ids
 
     def _on_project_layers_will_be_removed(self, *args):
@@ -433,6 +438,7 @@ class WorkbenchDock(QDockWidget):
             if self.assessment_panel.assessment else None
         )
         if current_assessment_id in removed_assessment_ids:
+            self.assessment_panel.abandon_run()
             self.assessment_panel.assessment = None
             self.assessment_panel.rpl_id = None
             if self.stack.currentWidget() is self.assessment_panel:
@@ -487,6 +493,7 @@ class WorkbenchDock(QDockWidget):
         try:
             count = len(store.list_rpls()) if rpl_count is None else int(rpl_count)
         except Exception:
+            log_exception(f"Workbench: could not read the registry in {store.gpkg_path}")
             count = 0
         suffix = "RPL" if count == 1 else "RPLs"
         self.store_label.setText(f"{os.path.basename(store.gpkg_path)} ({count} {suffix})")
@@ -1561,7 +1568,8 @@ class WorkbenchDock(QDockWidget):
                 canvas.mapSettings().destinationCrs(),
                 QgsProject.instance().transformContext())
             point = transform.transform(QgsPointXY(float(longitude), float(latitude)))
-        except Exception:
+        except Exception:  # QgsCsException / bad coordinate: just don't pan
+            log_exception("Workbench: could not centre on the position", level=logging.DEBUG)
             return
         canvas.setCenter(point)
         canvas.refresh()
@@ -1827,12 +1835,14 @@ class WorkbenchDock(QDockWidget):
 
     def closeEvent(self, event):
         self._save_window_state()
+        self.assessment_panel.abandon_run()
         self.rpl_panel.closeEvent(event)
         super().closeEvent(event)
 
     def shutdown(self):
         """Detach from project signals before the plugin unloads the dock."""
         self._save_window_state()  # unload may bypass closeEvent
+        self.assessment_panel.abandon_run()
         self._disconnect_project_layer_sync()
 
 

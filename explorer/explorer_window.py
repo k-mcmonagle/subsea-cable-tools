@@ -35,6 +35,7 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.core import QgsApplication, QgsProject
 
+from ..plugin_log import log_exception
 from ..qgis_compat import QAction
 from .layer_select_dialog import LayerSelectDialog
 from .layer_loader import LayerLoadTask, build_spec
@@ -401,6 +402,8 @@ class CableLayExplorerWindow(QMainWindow):
                 if layer is not None and hasattr(layer, "fields"):
                     specs.append(build_spec(layer))
         except Exception:
+            log_exception("Cable Lay Data Explorer: background load unavailable; "
+                          "loading on the main thread")
             specs = None
         if not specs:
             # Fall back to a synchronous load if the async path is unavailable.
@@ -893,7 +896,9 @@ class CableLayExplorerWindow(QMainWindow):
         if layer is not None:
             try:
                 layer.selectionChanged.connect(self._on_map_selection_changed)
-            except Exception:
+            except (TypeError, RuntimeError):
+                log_exception("Cable Lay Data Explorer: map selection will not follow "
+                              f"'{layer.name()}'")
                 self._selection_layer = None
 
     def _on_map_selection_changed(self, selected, _deselected, _clear_and_select) -> None:

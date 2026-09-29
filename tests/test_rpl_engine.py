@@ -194,6 +194,217 @@ def test_event_to_event_sections() -> bool:
     return _result("RPL sections are derived between event positions", ok)
 
 
+# ---------------------------------------------------------------------------
+# Indexed KP lookups vs the original linear walks
+# ---------------------------------------------------------------------------
+# Verbatim copies of the pre-bisection implementations: the reference the
+# indexed lookups must reproduce exactly (same value, same None, same error).
+def _old_cable_dist_from_kp(model, kp_km):
+    pts = model.points
+    if not pts or pts[0].dist_cum_km is None:
+        return None
+    if kp_km < pts[0].dist_cum_km or kp_km > pts[-1].dist_cum_km:
+        return None
+    for i in range(len(pts) - 1):
+        k0, k1 = pts[i].dist_cum_km, pts[i + 1].dist_cum_km
+        if k0 is None or k1 is None:
+            return None
+        if kp_km <= k1 or i == len(pts) - 2:
+            c0, c1 = pts[i].cable_dist_cum_km or 0.0, pts[i + 1].cable_dist_cum_km or 0.0
+            if k1 - k0 <= 0:
+                return c0
+            t = (kp_km - k0) / (k1 - k0)
+            if 0.0 <= t <= 1.0:
+                return c0 + t * (c1 - c0)
+    return None
+
+
+def _old_kp_from_cable_dist(model, cable_km):
+    pts = model.points
+    if not pts or pts[0].cable_dist_cum_km is None:
+        return None
+    if cable_km < pts[0].cable_dist_cum_km or cable_km > pts[-1].cable_dist_cum_km:
+        return None
+    for i in range(len(pts) - 1):
+        c0, c1 = pts[i].cable_dist_cum_km, pts[i + 1].cable_dist_cum_km
+        if c0 is None or c1 is None:
+            return None
+        if cable_km <= c1 or i == len(pts) - 2:
+            k0, k1 = pts[i].dist_cum_km or 0.0, pts[i + 1].dist_cum_km or 0.0
+            if c1 - c0 <= 0:
+                return k0
+            t = (cable_km - c0) / (c1 - c0)
+            if 0.0 <= t <= 1.0:
+                return k0 + t * (k1 - k0)
+    return None
+
+
+def _old_point_at_kp(model, kp_km, da=None):
+    pts = model.points
+    if not pts or pts[0].dist_cum_km is None:
+        return None
+    if kp_km < pts[0].dist_cum_km or kp_km > pts[-1].dist_cum_km:
+        return None
+    for i in range(len(pts) - 1):
+        k0, k1 = pts[i].dist_cum_km, pts[i + 1].dist_cum_km
+        if k0 is None or k1 is None:
+            return None
+        if kp_km <= k1 or i == len(pts) - 2:
+            if k1 - k0 <= 0:
+                return (pts[i].lat, pts[i].lon)
+            t = (kp_km - k0) / (k1 - k0)
+            if 0.0 <= t <= 1.0:
+                lat = pts[i].lat + t * (pts[i + 1].lat - pts[i].lat)
+                lon = pts[i].lon + t * (pts[i + 1].lon - pts[i].lon)
+                return (lat, lon)
+    return None
+
+
+def _old_bearing_at_kp(model, kp_km):
+    pts = model.points
+    if not pts:
+        return None
+    for i in range(len(pts) - 1):
+        k0, k1 = pts[i].dist_cum_km, pts[i + 1].dist_cum_km
+        if k0 is None or k1 is None:
+            return None
+        if kp_km <= k1 or i == len(pts) - 2:
+            if kp_km >= k0:
+                return model.segments[i].bearing_deg
+    return None
+
+
+def _outcome(fn, *args):
+    try:
+        return ("ok", fn(*args))
+    except Exception as exc:  # noqa: BLE001 - the error type is the result
+        return ("error", type(exc).__name__)
+
+
+def _same(a, b) -> bool:
+    if a == b:
+        return True
+
+    def nan_eq(x, y):
+        return x == y or (isinstance(x, float) and isinstance(y, float) and x != x and y != y)
+
+    if a[0] == b[0] == "ok" and isinstance(a[1], tuple) and isinstance(b[1], tuple):
+        return len(a[1]) == len(b[1]) and all(nan_eq(x, y) for x, y in zip(a[1], b[1]))
+    return a[0] == b[0] == "ok" and nan_eq(a[1], b[1])
+
+
+_PAIRS = (
+    ("cable_dist_from_kp", eng.cable_dist_from_kp, _old_cable_dist_from_kp),
+    ("kp_from_cable_dist", eng.kp_from_cable_dist, _old_kp_from_cable_dist),
+    ("point_at_kp", lambda m, x: eng.point_at_kp(m, x, None), _old_point_at_kp),
+    ("bearing_at_kp", eng.bearing_at_kp, _old_bearing_at_kp),
+)
+
+
+def _random_series(rng, n):
+    """Mostly clean cumulative series, with the anomalies the fallback must
+    catch: repeated values (zero-length legs), None, NaN and disorder."""
+    value = rng.uniform(-5.0, 5.0)
+    series = []
+    for _ in range(n):
+        series.append(value)
+        roll = rng.random()
+        value += 0.0 if roll < 0.15 else rng.uniform(0.0, 3.0)
+    roll = rng.random()
+    if series and roll < 0.08:
+        series[rng.randrange(n)] = None
+    elif series and roll < 0.12:
+        series[rng.randrange(n)] = float("nan")
+    elif len(series) > 1 and roll < 0.18:
+        i = rng.randrange(n - 1)
+        series[i], series[i + 1] = series[i + 1], series[i] + 0.5
+    return series
+
+
+def _random_model(rng) -> RplModel:
+    n = rng.randint(1, 25)
+    kps = _random_series(rng, n)
+    cables = _random_series(rng, n)
+    points = [
+        RplPoint(seq=i, pos_no=i + 1, event="", lat=rng.uniform(-60, 60),
+                 lon=rng.uniform(-170, 170), dist_cum_km=kps[i],
+                 cable_dist_cum_km=cables[i])
+        for i in range(n)
+    ]
+    segments = [RplSegment(seq=i, bearing_deg=rng.uniform(0, 360)) for i in range(n - 1)]
+    return RplModel(points=points, segments=segments)
+
+
+def _queries(rng, model):
+    values = [v for p in model.points for v in (p.dist_cum_km, p.cable_dist_cum_km)
+              if isinstance(v, float) and v == v]
+    out = [0, float("nan"), float("inf"), float("-inf")]
+    out.extend(values)  # exact vertex hits
+    lo = min(values) if values else -1.0
+    hi = max(values) if values else 1.0
+    out.extend(rng.uniform(lo - 2.0, hi + 2.0) for _ in range(40))
+    return out
+
+
+def _compare(model, queries):
+    for name, new, old in _PAIRS:
+        for q in queries:
+            a, b = _outcome(new, model, q), _outcome(old, model, q)
+            if not _same(a, b):
+                return f"{name}({q!r}) new={a} old={b} kps={[p.dist_cum_km for p in model.points]}"
+    return ""
+
+
+def test_indexed_lookups_match_linear_walk() -> bool:
+    import random
+
+    rng = random.Random(20260928)
+    mismatch = ""
+    for _ in range(400):
+        model = _random_model(rng)
+        mismatch = _compare(model, _queries(rng, model))
+        if mismatch:
+            break
+    return _result("indexed KP lookups == original linear walk (randomised)",
+                   not mismatch, mismatch)
+
+
+def test_indexed_lookups_follow_model_edits() -> bool:
+    """The cached arrays are rebuilt after every kind of model edit."""
+    import random
+
+    rng = random.Random(7)
+    da = _da()
+    model = _model(8)
+    eng.recompute(model, da)
+    queries = _queries(rng, model)
+    problems = []
+
+    def check(label):
+        eng.cable_dist_from_kp(model, 1.0)  # (re)build the cache first
+        mismatch = _compare(model, queries)
+        if mismatch:
+            problems.append(f"{label}: {mismatch}")
+
+    check("initial")
+    eng.move_point(model, 3, 50.05, 0.02, da)
+    check("move_point")
+    eng.insert_point(model, 2, 50.025, 0.0, da)
+    check("insert_point")
+    eng.delete_point(model, 5, da)
+    check("delete_point")
+    model.points[4].dist_cum_km += 0.25
+    check("attribute edit")
+    model.points[1], model.points[2] = model.points[2], model.points[1]
+    check("in-place swap")
+    model.points.reverse()
+    check("reverse")
+    model.points = list(model.points)  # replaced by a plain list
+    model.points[0].cable_dist_cum_km = -1.0
+    check("plain list")
+    return _result("indexed KP lookups follow model edits", not problems, "; ".join(problems))
+
+
 def run_all() -> list:
     return [
         test_recompute_hold_slack(),
@@ -205,6 +416,8 @@ def run_all() -> list:
         test_apply_depths_and_validate(),
         test_derive_slack(),
         test_event_to_event_sections(),
+        test_indexed_lookups_match_linear_walk(),
+        test_indexed_lookups_follow_model_edits(),
     ]
 
 

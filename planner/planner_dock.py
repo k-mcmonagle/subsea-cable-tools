@@ -6,6 +6,7 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timedelta
 import json
+import logging
 import os
 
 from qgis.PyQt.QtCore import QDateTime, QSettings, Qt
@@ -25,6 +26,7 @@ from qgis.core import (
 )
 from qgis.gui import QgsMapLayerComboBox
 
+from ..plugin_log import log_exception
 from ..qgis_compat import (
     BUTTON_BOX_CANCEL, BUTTON_BOX_OK, DIALOG_ACCEPTED, ITEM_DATA_USER_ROLE,
     ITEM_FLAG_EDITABLE,
@@ -170,8 +172,11 @@ class PlannerDock(QDockWidget):
                 if signal is not None:
                     try:
                         signal.connect(handler)
-                    except Exception:
-                        pass
+                    except (TypeError, RuntimeError):
+                        # Without it, direct edits of this layer would not
+                        # refresh the schedule: say so instead of hiding it.
+                        log_exception(f"Planner: cannot follow {signal_name} "
+                                      f"of layer '{layer.name()}'")
         self.sim.timeChanged.connect(self._simulation_time_changed)
         self.sim.playingChanged.connect(self.play_btn.setChecked)
         self.topLevelChanged.connect(self._top_level_changed)
@@ -191,6 +196,7 @@ class PlannerDock(QDockWidget):
             store.migrate()
             return store, path, ""
         except Exception as exc:
+            log_exception(f"Planner: could not open or migrate {path}")
             error = str(exc)
         fallback = default_project_gpkg_path()
         if not os.path.exists(path) and os.path.normcase(fallback) != os.path.normcase(path):
@@ -770,6 +776,7 @@ class PlannerDock(QDockWidget):
         except Exception as exc:
             # Keep editing usable (changes stay in the table) and report once
             # rather than raising out of an itemChanged slot on every keystroke.
+            log_exception(f"Planner: could not save the plan to {self.store.gpkg_path}")
             if not self._save_error:
                 self._save_error = True
                 self.iface.messageBar().pushMessage(
@@ -964,6 +971,7 @@ class PlannerDock(QDockWidget):
                 notes=owner.get("notes") or "", source_kind="drawn",
                 source_ref={"shared_point": True})
         except Exception as exc:
+            log_exception("Planner: could not store the shared point")
             self.iface.messageBar().pushMessage(
                 "Planner", "Could not store the shared point: %s" % exc,
                 level=MESSAGE_CRITICAL, duration=8)
@@ -1124,6 +1132,7 @@ class PlannerDock(QDockWidget):
                 speed_knots=task.get("speed_knots"), duration_hours=task.get("duration_hours"),
                 notes=task.get("notes") or "", source_kind=source_kind, source_ref=source_ref)
         except Exception as exc:
+            log_exception("Planner: could not store the sketched geometry")
             self.iface.messageBar().pushMessage(
                 "Planner", "Could not store the sketched geometry: %s" % exc,
                 level=MESSAGE_CRITICAL, duration=8)
@@ -1337,6 +1346,7 @@ class PlannerDock(QDockWidget):
                                       "point", 0.0, waypoint["duration_hours"],
                                       {"waypoint": index + 2})
         except Exception as exc:
+            log_exception("Planner: sketch stopped early")
             self.iface.messageBar().pushMessage(
                 "Planner", "Sketch stopped early — could not store task geometry: %s" % exc,
                 level=MESSAGE_CRITICAL, duration=8)
@@ -1381,6 +1391,7 @@ class PlannerDock(QDockWidget):
                 previous_id = task["task_id"]
                 sequence += 1
         except Exception as exc:
+            log_exception("Planner: task import stopped early")
             self.iface.messageBar().pushMessage(
                 "Planner", "Import stopped early — could not store task geometry: %s" % exc,
                 level=MESSAGE_CRITICAL, duration=8)
@@ -1396,8 +1407,8 @@ class PlannerDock(QDockWidget):
         if resolved is not None:
             try:
                 self.canvas.flashFeatureIds(resolved.layer, [resolved.feature.id()])
-            except Exception:
-                pass
+            except RuntimeError:  # layer removed meanwhile: nothing to flash
+                log_exception("Planner: could not flash the task feature", level=logging.DEBUG)
 
     def _zoom_to_task(self, task_id):
         task = self.task_table.row_by_id(task_id)
@@ -1427,6 +1438,7 @@ class PlannerDock(QDockWidget):
             self.canvas.refresh()
             self.canvas.flashFeatureIds(resolved.layer, [resolved.feature.id()])
         except Exception:
+            log_exception("Planner: could not zoom to the task geometry", level=logging.DEBUG)
             self.iface.messageBar().pushMessage(
                 "Planner", "Could not zoom to the task geometry.",
                 level=MESSAGE_WARNING, duration=4)

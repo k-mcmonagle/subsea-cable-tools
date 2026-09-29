@@ -21,6 +21,7 @@ from typing import Dict, List, Optional
 
 from qgis.core import QgsProject, QgsVectorLayer
 from qgis.gui import QgsFieldComboBox, QgsMapLayerComboBox
+from qgis.PyQt import sip
 from qgis.PyQt.QtCore import Qt, QTimer, pyqtSignal
 from qgis.PyQt.QtGui import QBrush, QColor
 from qgis.PyQt.QtWidgets import (
@@ -39,7 +40,6 @@ from qgis.PyQt.QtWidgets import (
     QLineEdit,
     QMenu,
     QMessageBox,
-    QProgressDialog,
     QPushButton,
     QSpinBox,
     QTableWidget,
@@ -49,6 +49,7 @@ from qgis.PyQt.QtWidgets import (
     QWidget,
 )
 
+from ..plugin_log import log_exception
 from ..qgis_compat import (
     DIALOG_ACCEPTED,
     MAP_LAYER_FILTER_POLYGON,
@@ -306,6 +307,9 @@ class AssessmentPanel(QWidget):
         self.result = None
         self.sampler = None
         self._loading = False
+        self._task = None
+        self._live_tasks = set()
+        self._run_generation = 0
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -338,7 +342,7 @@ class AssessmentPanel(QWidget):
         header.addWidget(self.step_spin)
         header.addStretch(1)
         self.run_btn = QPushButton("Run assessment")
-        self.run_btn.clicked.connect(self._run)
+        self.run_btn.clicked.connect(self._on_run_clicked)
         header.addWidget(self.run_btn)
         layout.addLayout(header)
 
@@ -426,9 +430,12 @@ class AssessmentPanel(QWidget):
 
     # ------------------------------------------------------------- loading --
     def set_store(self, store):
+        if store is not self.store:
+            self.abandon_run()
         self.store = store
 
     def new_assessment(self, store, rpl_id: str):
+        self.abandon_run()
         self.store = store
         self.rpl_id = rpl_id
         rpl = store.get_rpl(rpl_id) or {}
@@ -450,6 +457,7 @@ class AssessmentPanel(QWidget):
         self.assessments_changed.emit()
 
     def load_assessment(self, store, assessment_row: Dict):
+        self.abandon_run()
         self.store = store
         self.assessment = dict(assessment_row)
         self.rpl_id = assessment_row.get("rpl_id")
@@ -645,39 +653,111 @@ class AssessmentPanel(QWidget):
         return True
 
     # --------------------------------------------------------------- run --
+    # Runs are QgsTasks over a main-thread snapshot of the inputs, so the UI
+    # stays live while a long route is sampled. A new run (button, or the
+    # debounce after a rule edit) cancels the one in flight; each run carries
+    # a generation number and only the newest run's result is ever shown or
+    # written, so a slow, superseded run can never overwrite a newer one.
     def _maybe_rerun(self):
-        if self.result is not None:
+        if self.result is not None or self._task is not None:
             self._debounce.start()
+
+    def _on_run_clicked(self):
+        if self._task is not None:
+            self.cancel_run()
+        else:
+            self._run()
+
+    def is_running(self) -> bool:
+        return self._task is not None
+
+    def cancel_run(self):
+        """Cancel the run in flight (its result will be ignored)."""
+        self.abandon_run()
+        self.status_label.setText("Assessment cancelled.")
+
+    def abandon_run(self):
+        """Stop any pending/in-flight run and mark its result stale."""
+        self._debounce.stop()
+        task, self._task = self._task, None
+        self._run_generation += 1  # whatever it returns is now stale
+        if task is not None:
+            try:
+                task.cancel()
+            except RuntimeError:
+                pass  # already finished and deleted by the task manager
+        self._set_running(False)
+
+    def _set_running(self, running: bool):
+        self.run_btn.setText("Cancel assessment" if running else "Run assessment")
 
     def _run(self):
         if not self._ensure_ready() or not self.rpl_id:
             return
+        self._debounce.stop()
         self.assessment["sample_step_m"] = self.step_spin.value()
-        self.store.save_assessment(self.assessment)
-        progress = QProgressDialog("Running assessment…", None, 0, 0, self)
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.show()
-
-        def _tick(msg):
-            progress.setLabelText(msg)
-            from qgis.PyQt.QtWidgets import QApplication
-            QApplication.processEvents()
-
         try:
-            result, sampler = rules_inputs.run_assessment(
+            self.store.save_assessment(self.assessment)
+            work = rules_inputs.build_assessment_work(
                 self.store, self.rpl_id, self.assessment["rule_set_id"],
                 sample_step_m=self.step_spin.value(),
                 min_range_km=float(self.assessment.get("min_range_km") or 0.0),
-                project=QgsProject.instance(), progress=_tick,
+                project=QgsProject.instance(),
             )
         except Exception as exc:
-            progress.close()
+            log_exception("Workbench assessment could not start")
             QMessageBox.critical(self, "Assessment failed", str(exc))
             return
+        self.abandon_run()  # a superseded run's result is rejected as stale
+        generation = self._run_generation
+        task = rules_inputs.AssessmentTask(work)
+        # Bound to this run: a superseded task reports to a stale generation.
+        task.progressMessage.connect(
+            lambda message, g=generation: self._on_task_progress(g, message))
+        task.taskCompleted.connect(lambda t=task, g=generation: self._on_task_finished(t, g))
+        task.taskTerminated.connect(lambda t=task, g=generation: self._on_task_finished(t, g))
+        self._live_tasks.add(task)  # keep the Python wrapper alive until it ends
+        self._task = task
+        self._set_running(True)
+        self.status_label.setText("Running assessment…")
+        manager = self.task_manager()
+        if manager is None:  # no application task manager: run inline
+            task.run()
+            self._on_task_finished(task, generation)
+        else:
+            manager.addTask(task)
+
+    @staticmethod
+    def task_manager():
+        from qgis.core import QgsApplication
+
+        return QgsApplication.taskManager()
+
+    def _on_task_progress(self, generation: int, message: str):
+        if generation == self._run_generation and not sip.isdeleted(self):
+            self.status_label.setText(message)
+
+    def _on_task_finished(self, task, generation: int):
+        self._live_tasks.discard(task)
+        if generation != self._run_generation or task is not self._task:
+            return  # superseded or cancelled run: never show or write it
+        self._task = None
+        if sip.isdeleted(self):
+            return  # the dock closed while the task ran
+        self._set_running(False)
+        if task.cancelled:
+            self.status_label.setText("Assessment cancelled.")
+        elif task.result is None:
+            QMessageBox.critical(self, "Assessment failed",
+                                 task.error or "The assessment did not complete.")
+        else:
+            self._apply_result(task.result, task.sampler)
+
+    def _apply_result(self, result, sampler):
         self.result = result
         self.sampler = sampler
         rule_names = {r["rule_id"]: r.get("name") or r["rule_id"] for r in self.rules}
+        write_error = ""
         try:
             layer_name = assessment_output.write_assessment_ranges(
                 self.store, self.assessment, result, sampler.route, rule_names)
@@ -685,16 +765,16 @@ class AssessmentPanel(QWidget):
             self._refresh_status_chip()
             self._load_output_layer(layer_name)
         except Exception as exc:
-            self.status_label.setText(f"Ranges computed but layer write failed: {exc}")
-        progress.close()
+            log_exception("Workbench assessment: ranges computed but could not be saved")
+            write_error = f"Ranges computed but not saved: {exc}"
 
         self._rebuild_rule_table()
         self._refresh_overview()
         self._refresh_results()
         warn = f"  ⚠ {len(result.warnings)} warning(s)" if result.warnings else ""
-        self.status_label.setText(
-            "  ·  ".join(result.warnings) if result.warnings
-            else f"Assessment current — {self._domain_km():.2f} km route.{warn}")
+        text = ("  ·  ".join(result.warnings) if result.warnings
+                else f"Assessment current — {self._domain_km():.2f} km route.{warn}")
+        self.status_label.setText(f"{write_error}  ·  {text}" if write_error else text)
         self.assessments_changed.emit()
 
     # ----------------------------------------------------------- display --

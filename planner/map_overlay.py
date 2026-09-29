@@ -14,11 +14,29 @@ class PlannerMapOverlay:
     def __init__(self, canvas):
         self.canvas = canvas
         self._items = {}
-        self.canvas.extentsChanged.connect(self._reposition_labels)
+        # extentsChanged is only needed while labels exist: connected with
+        # the first canvas item, disconnected by clear() so a closed planner
+        # leaves no slot on the (long-lived) map canvas.
+        self._extents_connected = False
+
+    def _connect_extents(self):
+        if not self._extents_connected:
+            self.canvas.extentsChanged.connect(self._reposition_labels)
+            self._extents_connected = True
+
+    def _disconnect_extents(self):
+        if not self._extents_connected:
+            return
+        self._extents_connected = False
+        try:
+            self.canvas.extentsChanged.disconnect(self._reposition_labels)
+        except (TypeError, RuntimeError):
+            pass  # already disconnected, or the canvas is being destroyed
 
     def _resource_items(self, resource_id, color_hex):
         if resource_id in self._items:
             return self._items[resource_id]
+        self._connect_extents()
         remaining = QgsRubberBand(self.canvas, GEOMETRY_LINE)
         remaining.setColor(QColor("#888888"))
         remaining.setWidth(3)
@@ -122,13 +140,21 @@ class PlannerMapOverlay:
                 self._position_label(label)
 
     def clear(self):
-        scene = self.canvas.scene()
-        for completed, remaining, marker, label in self._items.values():
-            scene.removeItem(completed)
-            scene.removeItem(remaining)
-            scene.removeItem(marker)
-            scene.removeItem(label)
+        """Remove every canvas item and stop tracking extents (idempotent)."""
+        self._disconnect_extents()
+        items = list(self._items.values())
         self._items.clear()
+        if not items:
+            return
+        try:
+            scene = self.canvas.scene()
+            for completed, remaining, marker, label in items:
+                scene.removeItem(completed)
+                scene.removeItem(remaining)
+                scene.removeItem(marker)
+                scene.removeItem(label)
+        except RuntimeError:
+            pass  # canvas already deleted (QGIS shutting down): items went with it
 
 
 class _PlannerLabelItem(QGraphicsTextItem):

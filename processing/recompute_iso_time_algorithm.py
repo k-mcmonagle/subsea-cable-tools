@@ -8,14 +8,12 @@ the wrong Project Start Date was used at import.
 
 from __future__ import annotations
 
-import json
 import re
 from typing import List, Optional
 
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessing,
-    QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingParameterBoolean,
     QgsProcessingParameterString,
@@ -23,11 +21,12 @@ from qgis.core import (
     QgsProviderRegistry,
 )
 
+from .algorithm_base import SubseaCableAlgorithm
 from . import cable_lay_manage_ops as ops
 from . import cable_lay_parsers as clp
 
 
-class RecomputeIsoTimeAlgorithm(QgsProcessingAlgorithm):
+class RecomputeIsoTimeAlgorithm(SubseaCableAlgorithm):
     """Recompute ISO_Time from the stored day-count times, in place."""
 
     TARGET_LAYER = "TARGET_LAYER"
@@ -159,14 +158,45 @@ travels with the data.</p>
                 )
             )
 
+        layer_type = ops.layer_type_for_name(layer_name)
+        key_fields = clp.dedupe_key_for(layer_type or "")
+        # One transaction: the recompute, the optional dedupe and the edit-log
+        # entry commit together, so a cancelled or failed run changes nothing
+        # (and never leaves shifted times without their audit row).
         try:
-            counts = ops.recompute_iso_time(
-                layer,
-                start_date,
-                old_start_date=old_start_date,
-                source_files=source_files,
-                feedback=feedback,
-            )
+            ops.prepare_edit_log(layer, context.transformContext())
+            with ops.GpkgEditSession(layer) as session:
+                counts = ops.recompute_iso_time(
+                    layer,
+                    start_date,
+                    old_start_date=old_start_date,
+                    source_files=source_files,
+                    feedback=feedback,
+                    session=session,
+                )
+                duplicates = 0
+                if dedupe:
+                    duplicates = ops.dedupe_layer_in_place(
+                        layer, key_fields, source_files=source_files,
+                        feedback=feedback, session=session,
+                    )
+                session.log_edit(ops.edit_log_row(
+                    layer_name,
+                    "recompute_iso_time",
+                    {
+                        "start_date": start_date,
+                        "old_start_date": old_start_date,
+                        "source_files": source_files,
+                        "dedupe": dedupe,
+                        "duplicates_removed": duplicates,
+                    },
+                    counts["updated"] + duplicates,
+                    f"updated={counts['updated']} unchanged={counts['unchanged']} "
+                    f"skipped={counts['skipped']} duplicates_removed={duplicates}",
+                ))
+        except ops.OperationCancelled:
+            feedback.pushInfo(self.tr("Cancelled - nothing was changed."))
+            return {"UPDATED": 0, "UNCHANGED": 0, "SKIPPED": 0, "DUPLICATES_REMOVED": 0}
         except RuntimeError as exc:
             raise QgsProcessingException(str(exc))
 
@@ -176,51 +206,11 @@ travels with the data.</p>
                 "correct, {skipped} skipped (no parseable time)."
             ).format(**counts)
         )
-
-        duplicates = 0
-        if dedupe:
-            layer_type = ops.layer_type_for_name(layer_name)
-            key_fields = clp.dedupe_key_for(layer_type or "")
-            try:
-                duplicates = ops.dedupe_layer_in_place(
-                    layer, key_fields, source_files=source_files, feedback=feedback
+        if duplicates:
+            feedback.pushInfo(
+                self.tr("Removed {n} duplicate row(s) (key: {key}).").format(
+                    n=duplicates, key=", ".join(key_fields)
                 )
-            except RuntimeError as exc:
-                raise QgsProcessingException(str(exc))
-            if duplicates:
-                feedback.pushInfo(
-                    self.tr("Removed {n} duplicate row(s) (key: {key}).").format(
-                        n=duplicates, key=", ".join(key_fields)
-                    )
-                )
-
-        try:
-            clp.log_edit(
-                gpkg_path,
-                context.transformContext(),
-                {
-                    "layer_name": layer_name,
-                    "operation": "recompute_iso_time",
-                    "params_json": json.dumps(
-                        {
-                            "start_date": start_date,
-                            "old_start_date": old_start_date,
-                            "source_files": source_files,
-                            "dedupe": dedupe,
-                            "duplicates_removed": duplicates,
-                        },
-                        sort_keys=True,
-                    ),
-                    "rows_affected": counts["updated"] + duplicates,
-                    "details": (
-                        f"updated={counts['updated']} unchanged={counts['unchanged']} "
-                        f"skipped={counts['skipped']} duplicates_removed={duplicates}"
-                    ),
-                },
-            )
-        except Exception as exc:  # logging must never abort the fix itself
-            feedback.pushWarning(
-                self.tr("Could not write to the edit log: {error}").format(error=exc)
             )
 
         self._refresh_paths = (gpkg_path, layer_name)

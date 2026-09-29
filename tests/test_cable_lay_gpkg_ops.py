@@ -381,6 +381,44 @@ def test_manage_import_summary() -> bool:
     return _result(name, ok, f"summary={summary!r} recent={recent} none_enabled={none_enabled}")
 
 
+def test_layer_writer_reports_rejected_rows() -> bool:
+    """write_rows used to ignore addFeature()'s result, so a rejected row
+    vanished and the layer silently came out short."""
+    name = "layer writer raises on rejected rows, verifies the count"
+
+    class _RejectingSink:
+        def __init__(self):
+            self.added = 0
+
+        def addFeature(self, _feature):  # noqa: N802 (QgsFeatureSink API)
+            self.added += 1
+            return self.added < 3
+
+        def lastError(self):  # noqa: N802
+            return "simulated disk full"
+
+    fields = clp.fields_from_specs([("name", "str"), ("value", "float")])
+    rows = [{"name": f"r{i}", "value": float(i)} for i in range(5)]
+    try:
+        clp.write_rows(_RejectingSink(), fields, rows)
+        raised = ""
+    except RuntimeError as exc:
+        raised = str(exc)
+    ok = "Row 3" in raised and "simulated disk full" in raised
+
+    from ..qgis_compat import WKB_NO_GEOMETRY
+
+    gpkg = _fresh_gpkg("sct_writer_count.gpkg")
+    try:
+        written = clp.write_layer_to_gpkg(gpkg, "rows", fields, WKB_NO_GEOMETRY, rows,
+                                          QgsProject.instance().transformContext())
+        layer = clp.open_gpkg_layer(gpkg, "rows")
+        ok = ok and written == 5 and layer is not None and layer.featureCount() == 5
+    except Exception as exc:
+        return _result(name, False, repr(exc))
+    return _result(name, ok, raised)
+
+
 def run_all() -> List[bool]:
     results = [
         test_create_and_inventory(),
@@ -392,6 +430,7 @@ def run_all() -> List[bool]:
         test_discover(),
         test_project_panel_smoke(),
         test_manage_import_summary(),
+        test_layer_writer_reports_rejected_rows(),
     ]
     print("")
     print(f"{sum(results)}/{len(results)} passed")

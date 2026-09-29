@@ -28,6 +28,7 @@ from qgis.core import (
     QgsVectorLayer,
 )
 
+from ..plugin_log import log_warning
 from ..processing.cable_lay_parsers import WKT_KEY, fields_from_specs
 
 # RPL schema mirrors processing/import_excel_rpl_algorithm.py output layers.
@@ -100,14 +101,20 @@ def path_points(dataset) -> List[Tuple[float, float, int]]:
 def cumulative_m(points, distance) -> List[float]:
     """Cumulative geodesic distance (m) at each path vertex."""
     cum = [0.0]
+    failed = 0
     for i in range(1, len(points)):
         p0 = QgsPointXY(points[i - 1][0], points[i - 1][1])
         p1 = QgsPointXY(points[i][0], points[i][1])
         try:
             step = distance.measureLine(p0, p1)
-        except Exception:
+        except Exception:  # noqa: BLE001 - counted and reported below
             step = 0.0
+            failed += 1
         cum.append(cum[-1] + step)
+    if failed:
+        # Each failure shortens every downstream cumulative distance.
+        log_warning(f"Cable Lay Data Explorer: {failed} path step(s) could not be "
+                    "measured and count as 0 m in the cumulative distance")
     return cum
 
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from qgis.core import (
@@ -28,13 +29,17 @@ from qgis.core import (
     QgsPointXY,
     QgsProject,
     QgsSpatialIndex,
+    QgsTask,
     QgsVectorLayer,
+    QgsVectorLayerFeatureSource,
 )
+from qgis.PyQt.QtCore import pyqtSignal
 from qgis.PyQt.QtGui import QTransform
 
 from ..burial import attribute_rules
 from ..kp_geo_utils import RouteFrame
 from ..kp_range_utils import make_kp_distance_area
+from ..plugin_log import log_exception
 from ..qgis_compat import (
     GEOMETRY_POINT,
     GEOMETRY_POLYGON,
@@ -44,7 +49,7 @@ from ..qgis_compat import (
 )
 from . import rules_engine as eng
 from . import schema
-from .depth_service import DepthService, DepthSourceConfig
+from .depth_service import DepthSourceConfig
 from .rules_engine import Interval, Rule, RuleHit
 
 WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
@@ -91,7 +96,6 @@ class RouteSampler:
         self.end_km = self.start_km + self.total_km
         self.scope = scope
         self.step_km = step_km  # regular sampling step (slope half-window)
-        self._depth_series_cache: Dict[str, List[Tuple[float, float]]] = {}
 
     @property
     def domain(self) -> Interval:
@@ -110,38 +114,7 @@ class RouteSampler:
     def for_rpl(cls, store, rpl_id: str, project: Optional[QgsProject] = None,
                 sample_step_m: float = 50.0,
                 scope: Optional[Interval] = None) -> "RouteSampler":
-        project = project or QgsProject.instance()
-        rpl = store.get_rpl(rpl_id)
-        if not rpl:
-            raise RuleInputError(f"RPL {rpl_id} not found in the workbench store.")
-        lines_layer = store.open_layer(rpl.get("lines_layer") or "")
-        if lines_layer is None or not lines_layer.isValid():
-            raise RuleInputError("RPL route (lines) layer could not be opened.")
-
-        ordered = []
-        for feat in lines_layer.getFeatures():
-            geom = feat.geometry()
-            if geom is None or geom.isEmpty():
-                continue
-            try:
-                seq = int(feat["SeqNo"])
-            except (KeyError, TypeError, ValueError):
-                seq = len(ordered)
-            ordered.append((seq, QgsGeometry(geom)))
-        ordered.sort(key=lambda t: t[0])
-        geoms = [g for _, g in ordered]
-        if not geoms:
-            raise RuleInputError("RPL route has no usable line geometry.")
-        from ..kp_geo_utils import crosses_antimeridian
-
-        if crosses_antimeridian(geoms):
-            raise RuleInputError(
-                "the route crosses the ±180° antimeridian, which the "
-                "assessment geometry does not support — positions and "
-                "intersections would be silently wrong")
-
-        distance = make_kp_distance_area(WGS84, project.transformContext())
-        route = RouteFrame.from_source(geoms, distance)
+        route, distance = route_for_rpl(store, rpl_id, project)
         return cls.from_route(route, distance, sample_step_m, scope)
 
     @classmethod
@@ -156,6 +129,48 @@ class RouteSampler:
         coords = [route.point_at_kp(kp, clamp=True) for kp in stations]
         return cls(route, stations, coords, distance, scope,
                    step_km=max(float(sample_step_m), 1.0) / 1000.0)
+
+
+def route_for_rpl(store, rpl_id: str, project: Optional[QgsProject] = None
+                  ) -> Tuple[RouteFrame, object]:
+    """(RouteFrame over cloned WGS84 geometries, distance area) of an RPL.
+
+    Main thread (reads the store and the RPL lines layer); the returned
+    route owns its geometries, so a worker thread may sample it.
+    """
+    project = project or QgsProject.instance()
+    rpl = store.get_rpl(rpl_id)
+    if not rpl:
+        raise RuleInputError(f"RPL {rpl_id} not found in the workbench store.")
+    lines_layer = store.open_layer(rpl.get("lines_layer") or "")
+    if lines_layer is None or not lines_layer.isValid():
+        raise RuleInputError("RPL route (lines) layer could not be opened.")
+
+    ordered = []
+    for feat in lines_layer.getFeatures():
+        geom = feat.geometry()
+        if geom is None or geom.isEmpty():
+            continue
+        try:
+            seq = int(feat["SeqNo"])
+        except (KeyError, TypeError, ValueError):
+            seq = len(ordered)
+        ordered.append((seq, QgsGeometry(geom)))
+    ordered.sort(key=lambda t: t[0])
+    geoms = [g for _, g in ordered]
+    if not geoms:
+        raise RuleInputError("RPL route has no usable line geometry.")
+    from ..kp_geo_utils import crosses_antimeridian
+
+    if crosses_antimeridian(geoms):
+        raise RuleInputError(
+            "the route crosses the ±180° antimeridian, which the "
+            "assessment geometry does not support — positions and "
+            "intersections would be silently wrong")
+
+    distance = make_kp_distance_area(WGS84, project.transformContext())
+    route = RouteFrame.from_source(geoms, distance)
+    return route, distance
 
 
 def _build_stations(route: RouteFrame, sample_step_m: float,
@@ -356,65 +371,108 @@ def _filter_expression(expr_text: str):
 # ---------------------------------------------------------------------------
 
 
-def _depth_series(sampler: RouteSampler, store, rpl_id: str, project: QgsProject
-                  ) -> List[Tuple[float, float]]:
-    """(kp, depth-magnitude m) along the route. Prefers a configured bathy
-    source; falls back to interpolating the RPL points' ApproxDepth."""
-    config = DepthSourceConfig(store.rpl_depth_config(rpl_id))
-    service = DepthService(config, project)
-    series: List[Tuple[float, float]] = []
-    if service.is_available():
-        snapshot = service._snapshot
-        snapshot.prepare()
-        series = snapshot.profile_samples(sampler.route, sampler.stations_km)
-        sampler._depth_metadata = {'sources': snapshot.profile_sources, 'cells': snapshot.profile_cells}
-    if not series:
-        series = _rpl_depth_series(store, rpl_id, sampler.route)
-    if not series:
-        raise RuleInputError("no depth source configured and RPL has no ApproxDepth values.")
-    return series
+class DepthInputs:
+    """Depth source for threshold rules, captured on the main thread.
+
+    Holds a thread-safe :class:`~burial.analysis_task.DepthSnapshot` of the
+    RPL's configured bathymetry plus the RPL positions' ApproxDepth values
+    (the fallback), so :meth:`series` can run on a worker thread without
+    touching the store, the project or a live layer.
+    """
+
+    def __init__(self, snapshot, rpl_points: List[Tuple[float, float, Optional[QgsPointXY]]]):
+        self.snapshot = snapshot
+        # (stated KP, depth, WGS84 position or None) per RPL position
+        self.rpl_points = rpl_points
+        self._series: Optional[List[Tuple[float, float]]] = None
+        self._series_sampler = None
+
+    @classmethod
+    def capture(cls, store, rpl_id: str, project: QgsProject) -> "DepthInputs":
+        """Main thread: snapshot the depth sources of one RPL."""
+        from ..burial.analysis_task import DepthSnapshot
+
+        config = DepthSourceConfig(store.rpl_depth_config(rpl_id))
+        return cls(DepthSnapshot(config, project), _rpl_depth_points(store, rpl_id))
+
+    def series(self, sampler: RouteSampler,
+               cancel: Optional[Callable[[], bool]] = None) -> List[Tuple[float, float]]:
+        """(kp, depth-magnitude m) along the route; computed once per sampler.
+
+        Prefers the configured bathymetry; falls back to interpolating the
+        RPL points' ApproxDepth.
+        """
+        if self._series is not None and self._series_sampler is sampler:
+            return self._series
+        series: List[Tuple[float, float]] = []
+        snapshot = self.snapshot
+        if snapshot is not None and snapshot.is_available():
+            if not snapshot.prepare(cancel=cancel):
+                raise AcquisitionCancelled()
+            series = snapshot.profile_samples(sampler.route, sampler.stations_km,
+                                              cancel=cancel)
+            sampler._depth_metadata = {'sources': snapshot.profile_sources,
+                                       'cells': snapshot.profile_cells}
+        if not series:
+            series = _rpl_depth_series_from_points(self.rpl_points, sampler.route)
+        if not series:
+            raise RuleInputError("no depth source configured and RPL has no ApproxDepth values.")
+        self._series, self._series_sampler = series, sampler
+        return series
 
 
-def _rpl_depth_series(store, rpl_id: str, route=None) -> List[Tuple[float, float]]:
-    """RPL ApproxDepth keyed by KP. With ``route`` (the sampler's WGS84
-    RouteFrame) each position's KP is *measured* on the route, the same KP
-    the stations use; the stated DistCumulative is only a fallback."""
+def _rpl_depth_points(store, rpl_id: str) -> List[Tuple[float, float, Optional[QgsPointXY]]]:
+    """Main thread: (stated KP, depth, WGS84 point) of each RPL position."""
     rpl = store.get_rpl(rpl_id)
     if not rpl:
         return []
     points = store.open_layer(rpl.get("points_layer") or "")
     if points is None or not points.isValid():
         return []
-    out: List[Tuple[float, float]] = []
     xform = None
-    if route is not None and points.crs() != WGS84:
-        from qgis.core import QgsCoordinateTransform
+    if points.crs() != WGS84:
         xform = QgsCoordinateTransform(points.crs(), WGS84, QgsProject.instance())
+    out: List[Tuple[float, float, Optional[QgsPointXY]]] = []
     for feat in points.getFeatures():
         try:
             kp = float(feat["DistCumulative"])
-            depth = feat["ApproxDepth"]
+            depth = float(feat["ApproxDepth"])
         except (KeyError, TypeError, ValueError):
-            continue
+            continue  # no KP, or no/non-numeric depth (NULL included)
+        position = None
         geom = feat.geometry()
-        if route is not None and geom is not None and not geom.isEmpty():
+        if geom is not None and not geom.isEmpty():
             try:
-                point = QgsPointXY(geom.asPoint())
+                position = QgsPointXY(geom.asPoint())
                 if xform is not None:
-                    point = xform.transform(point)
-                hit = route.kp_at_point(point)
+                    position = xform.transform(position)
+            except Exception:  # noqa: BLE001 - non-point geometry: use stated KP
+                position = None
+        out.append((kp, depth, position))
+    return out
+
+
+def _rpl_depth_series_from_points(points, route=None) -> List[Tuple[float, float]]:
+    """RPL ApproxDepth keyed by KP. With ``route`` (the sampler's WGS84
+    RouteFrame) each position's KP is *measured* on the route, the same KP
+    the stations use; the stated DistCumulative is only a fallback."""
+    out: List[Tuple[float, float]] = []
+    for kp, depth, position in points:
+        if route is not None and position is not None:
+            try:
+                hit = route.kp_at_point(position)
                 if hit.snapped_xy is not None:
                     kp = hit.kp_km
-            except Exception:
+            except Exception:  # noqa: BLE001 - keep the stated KP
                 pass
-        if depth is None:
-            continue
-        try:
-            out.append((kp, abs(float(depth))))
-        except (TypeError, ValueError):
-            continue
+        out.append((kp, abs(depth)))
     out.sort()
     return out
+
+
+def _rpl_depth_series(store, rpl_id: str, route=None) -> List[Tuple[float, float]]:
+    """RPL ApproxDepth keyed by KP (see :func:`_rpl_depth_series_from_points`)."""
+    return _rpl_depth_series_from_points(_rpl_depth_points(store, rpl_id), route)
 
 
 def slope_half_window_km(config: Dict, step_km: Optional[float]) -> Optional[float]:
@@ -537,17 +595,12 @@ def threshold_intervals(depth_series: List[Tuple[float, float]], config: Dict,
                                       abs_value=bool(config.get("abs", False)))
 
 
-def _acquire_threshold(sampler, store, rpl_id, config, project) -> List[Interval]:
+def _acquire_threshold(sampler, depth: DepthInputs, config,
+                       cancel: Optional[Callable[[], bool]] = None) -> List[Interval]:
     # One route walk per run, not per rule: several threshold rules (depth +
     # slope limits) share the same stations, and each walk costs a provider
-    # sample per station.
-    cache = getattr(sampler, "_depth_series_cache", None)
-    if cache is not None and rpl_id in cache:
-        depth_series = cache[rpl_id]
-    else:
-        depth_series = _depth_series(sampler, store, rpl_id, project)
-        if cache is not None:
-            cache[rpl_id] = depth_series
+    # sample per station (DepthInputs caches the series per sampler).
+    depth_series = depth.series(sampler, cancel)
     prepared = None
     if (config.get('profile') or '').lower() == 'slope':
         from ..burial.profile_data import long_slope_series
@@ -909,52 +962,171 @@ def _scope_intervals(config: Dict) -> Optional[List[Interval]]:
     return out or None
 
 
-def acquire_hits(sampler: RouteSampler, store, rpl_id: str, rule_rows: Sequence[Dict],
-                 project: QgsProject, progress: ProgressFn = None
-                 ) -> Tuple[List[RuleHit], List[str]]:
+@dataclass
+class RuleWork:
+    """One rule, resolved on the main thread into worker-safe inputs."""
+
+    row: Dict
+    rule: Rule
+    config: Dict
+    error: str = ""                       # input problem found on the main thread
+    geom_type: object = None
+    layer_snapshot: Optional[Dict] = None  # feature source + CRS for index rules
+    table_snapshot: Optional[Dict] = None  # feature source + fields for KP tables
+
+
+def _snapshot_layer(layer: QgsVectorLayer, project: QgsProject) -> Dict:
+    return {
+        "source": QgsVectorLayerFeatureSource(layer),
+        "crs": layer.crs(),
+        "transform_context": project.transformContext(),
+        "feature_count": max(int(layer.featureCount()), 0),
+    }
+
+
+def build_rule_work(row: Dict, project: QgsProject) -> RuleWork:
+    """Main thread: parse a rule row and snapshot the layer it reads."""
+    try:
+        config = json.loads(row.get("config_json") or "{}")
+    except (ValueError, TypeError):
+        config = {}
+    work = RuleWork(row=row, rule=_rule_from_row(row), config=config)
+    kind = work.rule.kind
+    if kind in (schema.RULE_KIND_PROXIMITY, schema.RULE_KIND_POLYGON,
+                schema.RULE_KIND_KP_TABLE):
+        try:
+            layer = _resolve_layer(project, config)
+            snapshot = _snapshot_layer(layer, project)
+        except RuleInputError as exc:
+            work.error = str(exc)
+            return work
+        if kind == schema.RULE_KIND_KP_TABLE:
+            snapshot["fields"] = [f.name() for f in layer.fields()]
+            work.table_snapshot = snapshot
+        else:
+            work.layer_snapshot = snapshot
+            work.geom_type = layer.geometryType()
+    return work
+
+
+def _table_rows(snapshot: Dict, config: Dict,
+                cancel: Optional[Callable[[], bool]] = None) -> List[Dict]:
+    expr, ctx = _filter_expression(config.get("filter_expression", ""))
+    names = snapshot.get("fields") or []
+    rows: List[Dict] = []
+    for i, feat in enumerate(snapshot["source"].getFeatures()):
+        if cancel is not None and i % 500 == 0 and cancel():
+            raise AcquisitionCancelled()
+        if expr is not None:
+            ctx.setFeature(feat)
+            if not bool(expr.evaluate(ctx)):
+                continue
+        rows.append({name: feat[name] for name in names})
+    return rows
+
+
+def _acquire_rule(sampler: RouteSampler, work: RuleWork, depth: Optional[DepthInputs],
+                  cancel: Optional[Callable[[], bool]] = None) -> List[Interval]:
+    """Worker-safe acquisition of one rule from its snapshot."""
+    if work.error:
+        raise RuleInputError(work.error)
+    kind, config = work.rule.kind, work.config
+    if kind == schema.RULE_KIND_THRESHOLD:
+        if depth is None:
+            raise RuleInputError("no depth source was captured for this run.")
+        return _acquire_threshold(sampler, depth, config, cancel)
+    if kind in (schema.RULE_KIND_PROXIMITY, schema.RULE_KIND_POLYGON):
+        snap = work.layer_snapshot
+        index, feats = _load_features_wgs84_from_source(
+            snap["source"], snap["crs"], snap["transform_context"], cancel=cancel,
+            feature_count=snap.get("feature_count", 0))
+        if kind == schema.RULE_KIND_PROXIMITY:
+            return proximity_intervals(sampler, index, feats, work.geom_type, config,
+                                       cancel=cancel)
+        return polygon_class_intervals(sampler, index, feats, config, cancel=cancel)
+    if kind == schema.RULE_KIND_KP_TABLE:
+        rows = _table_rows(work.table_snapshot, config, cancel)
+        return kp_table_intervals(rows, config, sampler.domain)
+    if kind == schema.RULE_KIND_MANUAL:
+        return _acquire_manual(sampler, config)
+    raise _UnknownRuleKind()
+
+
+class _UnknownRuleKind(Exception):
+    pass
+
+
+def acquire_rule_hits(sampler: RouteSampler, rules: Sequence[RuleWork],
+                      depth: Optional[DepthInputs], progress: ProgressFn = None,
+                      cancel: Optional[Callable[[], bool]] = None
+                      ) -> Tuple[List[RuleHit], List[str]]:
+    """Evaluate prepared rules (thread-safe: snapshots only).
+
+    A rule whose inputs fail becomes a warning and fires nowhere; only a
+    cancel (``AcquisitionCancelled``) aborts the run.
+    """
     hits: List[RuleHit] = []
     warnings: List[str] = []
-    for row in rule_rows:
-        rule = _rule_from_row(row)
-        try:
-            config = json.loads(row.get("config_json") or "{}")
-        except (ValueError, TypeError):
-            config = {}
+    for work in rules:
+        if cancel is not None and cancel():
+            raise AcquisitionCancelled()
+        rule = work.rule
         if progress:
             progress(f"Evaluating rule: {rule.name}")
         intervals: List[Interval] = []
         try:
-            if rule.kind == schema.RULE_KIND_THRESHOLD:
-                intervals = _acquire_threshold(sampler, store, rpl_id, config, project)
-            elif rule.kind == schema.RULE_KIND_PROXIMITY:
-                intervals = _acquire_proximity(sampler, config, project)
-            elif rule.kind == schema.RULE_KIND_POLYGON:
-                intervals = _acquire_polygon_class(sampler, config, project)
-            elif rule.kind == schema.RULE_KIND_KP_TABLE:
-                intervals = _acquire_kp_table(sampler, config, project)
-            elif rule.kind == schema.RULE_KIND_MANUAL:
-                intervals = _acquire_manual(sampler, config)
-            else:
-                warnings.append(f"Rule '{rule.name}': unknown kind '{rule.kind}' — skipped.")
+            intervals = _acquire_rule(sampler, work, depth, cancel)
+        except AcquisitionCancelled:
+            raise
+        except _UnknownRuleKind:
+            warnings.append(f"Rule '{rule.name}': unknown kind '{rule.kind}' — skipped.")
+            intervals = []
         except RuleInputError as exc:
             warnings.append(f"Rule '{rule.name}': {exc} — skipped.")
             intervals = []
         except Exception as exc:  # never let one rule crash the run
+            log_exception(f"Workbench assessment: rule '{rule.name}' failed")
             warnings.append(f"Rule '{rule.name}': unexpected error ({exc}) — skipped.")
             intervals = []
 
-        scope = _scope_intervals(config)
+        scope = _scope_intervals(work.config)
         if scope is not None:
             intervals = eng.intersect_intervals(intervals, scope)
         hits.append(RuleHit(rule, intervals))
     return hits, warnings
 
 
-def run_assessment(store, rpl_id: str, rule_set_id: str, *, sample_step_m: float = 50.0,
-                   min_range_km: float = 0.0, project: Optional[QgsProject] = None,
-                   progress: ProgressFn = None
-                   ) -> Tuple[eng.AssessmentResult, RouteSampler]:
-    """Sample the route, evaluate the rule stack, return (result, sampler)."""
+def acquire_hits(sampler: RouteSampler, store, rpl_id: str, rule_rows: Sequence[Dict],
+                 project: QgsProject, progress: ProgressFn = None
+                 ) -> Tuple[List[RuleHit], List[str]]:
+    """Main-thread convenience: snapshot ``rule_rows`` and evaluate them."""
+    rules = [build_rule_work(row, project) for row in rule_rows]
+    depth = None
+    if any(work.rule.kind == schema.RULE_KIND_THRESHOLD for work in rules):
+        depth = DepthInputs.capture(store, rpl_id, project)
+    return acquire_rule_hits(sampler, rules, depth, progress)
+
+
+@dataclass
+class AssessmentWork:
+    """Everything one assessment run needs, captured on the main thread."""
+
+    route: RouteFrame
+    distance: object
+    methods: List[str]
+    rules: List[RuleWork]
+    depth: Optional[DepthInputs]
+    sample_step_m: float = 50.0
+    min_range_km: float = 0.0
+
+
+def build_assessment_work(store, rpl_id: str, rule_set_id: str, *,
+                          sample_step_m: float = 50.0, min_range_km: float = 0.0,
+                          project: Optional[QgsProject] = None) -> AssessmentWork:
+    """Main thread: read the store and snapshot every input of a run.
+
+    Raises ``RuleInputError`` when the rule set or the RPL route is unusable.
+    """
     project = project or QgsProject.instance()
     rule_set = store.get_rule_set(rule_set_id)
     if not rule_set:
@@ -966,13 +1138,80 @@ def run_assessment(store, rpl_id: str, rule_set_id: str, *, sample_step_m: float
     if not methods:
         methods = list(schema.DEFAULT_ASSESSMENT_METHODS)
 
-    sampler = RouteSampler.for_rpl(store, rpl_id, project, sample_step_m)
-    rule_rows = store.list_rules(rule_set_id)
-    hits, warnings = acquire_hits(sampler, store, rpl_id, rule_rows, project, progress)
+    route, distance = route_for_rpl(store, rpl_id, project)
+    rules = [build_rule_work(row, project) for row in store.list_rules(rule_set_id)]
+    depth = None
+    if any(work.rule.kind == schema.RULE_KIND_THRESHOLD for work in rules):
+        depth = DepthInputs.capture(store, rpl_id, project)
+    return AssessmentWork(route=route, distance=distance, methods=methods, rules=rules,
+                          depth=depth, sample_step_m=sample_step_m,
+                          min_range_km=min_range_km)
 
-    result = eng.evaluate(sampler.domain, methods, hits, min_range_km=min_range_km)
+
+def execute_assessment(work: AssessmentWork, progress: ProgressFn = None,
+                       cancel: Optional[Callable[[], bool]] = None
+                       ) -> Tuple[eng.AssessmentResult, RouteSampler]:
+    """Sample the route, evaluate the rule stack (thread-safe)."""
+    if progress:
+        progress("Building route stations…")
+    sampler = RouteSampler.from_route(work.route, work.distance, work.sample_step_m)
+    hits, warnings = acquire_rule_hits(sampler, work.rules, work.depth, progress, cancel)
+    if cancel is not None and cancel():
+        raise AcquisitionCancelled()
+    result = eng.evaluate(sampler.domain, work.methods, hits, min_range_km=work.min_range_km)
     result.warnings = warnings
     return result, sampler
+
+
+def run_assessment(store, rpl_id: str, rule_set_id: str, *, sample_step_m: float = 50.0,
+                   min_range_km: float = 0.0, project: Optional[QgsProject] = None,
+                   progress: ProgressFn = None
+                   ) -> Tuple[eng.AssessmentResult, RouteSampler]:
+    """Sample the route, evaluate the rule stack, return (result, sampler).
+
+    Synchronous; the Workbench panel runs the same two steps through
+    :class:`AssessmentTask` so the UI stays responsive.
+    """
+    work = build_assessment_work(store, rpl_id, rule_set_id, sample_step_m=sample_step_m,
+                                 min_range_km=min_range_km, project=project)
+    return execute_assessment(work, progress=progress)
+
+
+def _task_flag(name: str, default: int = 0):
+    enum = getattr(QgsTask, "Flag", QgsTask)
+    return getattr(enum, name, default)
+
+
+class AssessmentTask(QgsTask):
+    """Runs :func:`execute_assessment` on a worker thread.
+
+    ``result`` / ``sampler`` are set on success; ``error`` holds the message
+    of a failure; ``cancelled`` marks a cancel. ``progressMessage`` is queued
+    to the main thread. The completion signals are the caller's to handle.
+    """
+
+    progressMessage = pyqtSignal(str)
+
+    def __init__(self, work: AssessmentWork, description: str = "Workbench assessment"):
+        super().__init__(description, _task_flag("CanCancel"))
+        self.work = work
+        self.result: Optional[eng.AssessmentResult] = None
+        self.sampler: Optional[RouteSampler] = None
+        self.error: Optional[str] = None
+        self.cancelled = False
+
+    def run(self) -> bool:  # worker thread
+        try:
+            self.result, self.sampler = execute_assessment(
+                self.work, progress=self.progressMessage.emit, cancel=self.isCanceled)
+        except AcquisitionCancelled:
+            self.cancelled = True
+            return False
+        except Exception as exc:  # reported to the user by the panel
+            log_exception("Workbench assessment failed")
+            self.error = str(exc) or exc.__class__.__name__
+            return False
+        return True
 
 
 # ---------------------------------------------------------------------------

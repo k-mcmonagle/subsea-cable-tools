@@ -360,16 +360,18 @@ def commit_import(store: WorkbenchStore, model: RplModel,
                   request: CommitRequest) -> CommitResult:
     """Register the imported model as a new Workbench RPL revision.
 
-    Write order stages everything reversible first and makes the registry row
-    the commit point:
+    Write order stages everything reversible first and makes the registry
+    transaction the commit point:
 
-    1. spatial layers (unique staged names)
-    2. wb_meta audit row
-    3. stable cable-segment topology component + endpoint ports
-    4. wb_rpl registry row  <- the revision "exists" only after this
+    1. spatial layers (unique staged names; OGR writes, outside the
+       transaction)
+    2. one registry transaction: new cable segment (if any), wb_meta audit
+       row, stable cable-segment topology component + endpoint ports and the
+       wb_rpl registry row  <- the revision "exists" only after this commits
 
-    Any exception before step 4 completes triggers cleanup of steps 1-3.
-    Never overwrites an issued revision (labels are checked up front).
+    A failure in step 2 rolls the whole registry change back; either failure
+    then removes the staged spatial layers. Never overwrites an issued
+    revision (labels are checked up front).
     """
     if len(model.points) < 2 or len(model.segments) != len(model.points) - 1:
         raise CommitError("Model is not consistent (positions/legs mismatch).")
@@ -398,7 +400,7 @@ def commit_import(store: WorkbenchStore, model: RplModel,
         supersedes_id = latest.get("rpl_id") if latest else ""
         created_route = False
     else:
-        route_id = store.create_route(route_name)
+        route_id = ""  # created inside the registry transaction below
         rev_label = (request.rev_label or "").strip() or "Rev 1"
         created_route = True
 
@@ -416,9 +418,6 @@ def commit_import(store: WorkbenchStore, model: RplModel,
         existing_layers, schema.rpl_lines_layer_name(registered_name))
 
     staged_layers: List[str] = []
-    staged_meta_key: Optional[str] = None
-    existing_component = store.component_for_segment(route_id)
-    staged_component: Optional[str] = None
     try:
         rows = model_rows_for_layers(model, rpl_id, request.source_file)
         point_specs = _specs_with_extras(schema.RPL_POINT_FIELDS, rows["points"])
@@ -431,38 +430,40 @@ def commit_import(store: WorkbenchStore, model: RplModel,
                                   rows["lines"])
         staged_layers.append(lines_layer)
 
-        audit = dict(request.audit or {})
-        audit.setdefault("imported_utc", schema.utc_now_iso())
-        audit["registered_name"] = registered_name
-        audit["route_id"] = route_id
-        audit["rev_label"] = rev_label
-        staged_meta_key = IMPORT_AUDIT_META_PREFIX + rpl_id
-        store.write_meta(staged_meta_key, json.dumps(audit, sort_keys=True))
+        with store.transaction():
+            if created_route:
+                route_id = store.create_route(route_name)
 
-        segment_component = store.ensure_segment_component(route_id)
-        if existing_component is None and not created_route:
-            staged_component = segment_component
+            audit = dict(request.audit or {})
+            audit.setdefault("imported_utc", schema.utc_now_iso())
+            audit["registered_name"] = registered_name
+            audit["route_id"] = route_id
+            audit["rev_label"] = rev_label
+            store.write_meta(IMPORT_AUDIT_META_PREFIX + rpl_id,
+                             json.dumps(audit, sort_keys=True))
 
-        store.save_rpl({
-            "rpl_id": rpl_id,
-            "name": registered_name,
-            "kind": kind,
-            "points_layer": points_layer,
-            "lines_layer": lines_layer,
-            "source_file": request.source_file or "",
-            "slack_mode": slack_mode,
-            "depth_source_config": "",
-            "route_id": route_id,
-            "rev_label": rev_label,
-            "status": schema.STATUS_DRAFT,
-            "supersedes_id": supersedes_id,
-            "issued_utc": "",
-            "notes": request.notes or "",
-        })
+            store.ensure_segment_component(route_id)
+
+            store.save_rpl({
+                "rpl_id": rpl_id,
+                "name": registered_name,
+                "kind": kind,
+                "points_layer": points_layer,
+                "lines_layer": lines_layer,
+                "source_file": request.source_file or "",
+                "slack_mode": slack_mode,
+                "depth_source_config": "",
+                "route_id": route_id,
+                "rev_label": rev_label,
+                "status": schema.STATUS_DRAFT,
+                "supersedes_id": supersedes_id,
+                "issued_utc": "",
+                "notes": request.notes or "",
+            })
     except Exception as exc:
-        _cleanup_staged(store, staged_layers, staged_meta_key,
-                        staged_component,
-                        route_id if created_route else None)
+        # The registry transaction (if it started) has rolled back; only
+        # the staged spatial layers remain to be removed.
+        _cleanup_staged(store, staged_layers)
         if isinstance(exc, CommitError):
             raise
         raise CommitError(f"Import failed and was rolled back: {exc}") from exc
@@ -473,32 +474,13 @@ def commit_import(store: WorkbenchStore, model: RplModel,
         lines_layer=lines_layer, gpkg_path=store.gpkg_path)
 
 
-def _cleanup_staged(store: WorkbenchStore, staged_layers: List[str],
-                    meta_key: Optional[str], component_id: Optional[str],
-                    created_route_id: Optional[str]) -> None:
-    """Best-effort removal of every artefact staged by a failed commit."""
-    for layer_name in staged_layers:
-        try:
-            delete_gpkg_layer(store.gpkg_path, layer_name)
-        except Exception:
-            pass
-    if meta_key:
-        try:
-            rows = [r for r in store.read_table(schema.TABLE_META)
-                    if r.get("key") != meta_key]
-            store._write_table_rows(schema.TABLE_META, schema.META_FIELDS, rows)
-        except Exception:
-            pass
-    if component_id:
-        try:
-            store.delete_component(component_id)
-        except Exception:
-            pass
-    if created_route_id:
-        try:
-            store.delete_route(created_route_id)
-        except Exception:
-            pass
+def _cleanup_staged(store: WorkbenchStore, staged_layers: List[str]) -> None:
+    """Best-effort removal of the spatial layers staged by a failed commit.
+
+    Registry rows need no cleanup: they are written in one transaction that
+    rolls back as a whole.
+    """
+    store._drop_spatial_layers(staged_layers)
 
 
 def read_import_audit(store: WorkbenchStore, rpl_id: str) -> Dict:

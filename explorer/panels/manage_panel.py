@@ -7,7 +7,8 @@ date recorded in ``import_log`` and the record-status breakdown; actions fix a
 wrong start date (in place, via :mod:`processing.cable_lay_manage_ops`), set
 the curation status, remove a file's rows, fill primary gaps from a secondary
 source, filter the map to active rows, and compact the GeoPackage. Every
-operation is recorded in the ``edit_log`` table.
+operation is recorded in the ``edit_log`` table, in the same transaction as
+the edit itself, so the log and the data can never disagree.
 
 Design notes
 ------------
@@ -20,7 +21,8 @@ Design notes
   :class:`~explorer.manage_task.ManageEditTask` against a private layer on
   the same GeoPackage table (immune to the project layer's provider filter),
   with a cancellable progress dialog, and the project layer is reloaded
-  afterwards.
+  afterwards. Each edit is one transaction: Cancel (or an error) leaves the
+  file untouched.
 * This panel always receives the *full* dataset (every record status), even
   when the Explorer's "Active rows only" view is on for the other panels, so
   standby / excluded rows stay manageable.
@@ -72,10 +74,11 @@ from ...qgis_compat import (
     SELECTION_MODE_EXTENDED,
     qt_exec,
 )
+from ...plugin_log import log_exception
 from ...processing import cable_lay_gpkg_ops as gops
 from ...processing import cable_lay_manage_ops as ops
 from ...processing import cable_lay_parsers as clp
-from ..manage_task import ManageEditTask, run_edit_sync
+from ..manage_task import CANCELLED, ManageEditTask, run_edit_sync
 
 _EPOCH = datetime(1970, 1, 1)
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -153,7 +156,8 @@ class _StartDateDialog(QDialog):
 
         note = QLabel(
             "This edits the GeoPackage directly and is recorded in its edit_log. "
-            "It cannot be undone except by running the fix again with the old date."
+            "It cannot be undone except by running the fix again with the old date "
+            "(cancelling part-way changes nothing)."
         )
         note.setWordWrap(True)
         form.addRow(note)
@@ -773,7 +777,13 @@ class ManagePanel(QWidget):
         self.status_label.setText(summary)
 
     def _recorded_start_dates(self) -> Dict[str, str]:
-        """Latest import_log start date per source file (cached per dataset)."""
+        """Start date each source file's ISO_Time currently reflects.
+
+        The latest of its import_log start date and any later committed
+        "Fix start date" (edit_log ``recompute_iso_time``), so the dialog
+        offers the date actually in the data and a fix is never re-applied
+        on top of itself. Cached per dataset.
+        """
         if self._recorded is not None:
             return self._recorded
         self._recorded = {}
@@ -781,12 +791,10 @@ class ManagePanel(QWidget):
         name = self._physical_layer_name()
         if not gpkg_path or not name:
             return self._recorded
-        log = clp.open_gpkg_layer(gpkg_path, clp.prefixed_layer_name(gpkg_path, "import_log"))
-        if log is None:
-            return self._recorded
         latest: Dict[str, Tuple[str, str]] = {}
+        log = clp.open_gpkg_layer(gpkg_path, clp.prefixed_layer_name(gpkg_path, "import_log"))
         try:
-            for feature in log.getFeatures():
+            for feature in (log.getFeatures() if log is not None else []):
                 if str(feature["layer_name"]) != name:
                     continue
                 source = str(feature["source_file"])
@@ -794,8 +802,25 @@ class ManagePanel(QWidget):
                 start = str(feature["start_date"] or "")
                 if source not in latest or stamp >= latest[source][0]:
                     latest[source] = (stamp, start)
-        except Exception:
+        except (KeyError, RuntimeError):
+            log_exception("Manage panel: import_log unreadable; start dates unknown")
             return self._recorded
+        edits = clp.open_gpkg_layer(gpkg_path, clp.prefixed_layer_name(gpkg_path, "edit_log"))
+        try:
+            for feature in (edits.getFeatures() if edits is not None else []):
+                if (str(feature["layer_name"]) != name
+                        or str(feature["operation"]) != "recompute_iso_time"):
+                    continue
+                params = json.loads(str(feature["params_json"] or "{}"))
+                start = str(params.get("start_date") or "")
+                stamp = str(feature["edited_at"] or "")
+                sources = params.get("source_files")
+                for source in (sources if sources is not None else list(latest)):
+                    # A fix commits after its imports, so it wins a same-second tie.
+                    if start and (source not in latest or stamp >= latest[source][0]):
+                        latest[source] = (stamp, start)
+        except (KeyError, RuntimeError, ValueError, AttributeError):
+            log_exception("Manage panel: edit_log unreadable; start-date fixes ignored")
         self._recorded = {source: start for source, (_stamp, start) in latest.items()}
         return self._recorded
 
@@ -829,7 +854,8 @@ class ManagePanel(QWidget):
             try:
                 result = run_edit_sync(gpkg_path, layer_name, work)
             except Exception as exc:
-                QMessageBox.critical(self, description, str(exc))
+                log_exception(f"Cable Lay Data Explorer: '{description}' failed")
+                QMessageBox.critical(self, description, f"{exc}\n\nNothing was changed.")
                 return
             finish(result)
             return
@@ -870,15 +896,12 @@ class ManagePanel(QWidget):
         description = task.description() if task is not None else "Manage"
         error = getattr(task, "error", None) or "The edit did not complete."
         self._teardown_edit()
-        if error == "Cancelled.":
-            self.status_label.setText(f"{description}: cancelled (rows already written stay written).")
+        # Edits are one transaction each: a cancel or failure rolled
+        # everything back, so there is nothing to reload.
+        if error == CANCELLED:
+            self.status_label.setText(f"{description}: cancelled - nothing was changed.")
         else:
-            QMessageBox.critical(self, description, error)
-        # Whatever was written before the failure must be reflected.
-        bundle = self._gpkg_bundle()
-        if bundle is not None:
-            ops.reload_project_layers(bundle[1], bundle[2])
-        self.controller.reload_dataset()
+            QMessageBox.critical(self, description, f"{error}\n\nNothing was changed.")
 
     def _teardown_edit(self) -> None:
         if self._edit_progress is not None:
@@ -920,37 +943,45 @@ class ManagePanel(QWidget):
         dedupe = dialog.dedupe.isChecked()
         key_fields = clp.dedupe_key_for(ops.layer_type_for_name(name) or "")
 
+        context = self.controller.transform_context()
+
         def work(private_layer, feedback):
-            counts = ops.recompute_iso_time(
-                private_layer, corrected, old_start_date=previous,
-                source_files=sources, feedback=feedback,
-            )
-            duplicates = 0
-            if dedupe and not (feedback is not None and feedback.isCanceled()):
-                duplicates = ops.dedupe_layer_in_place(
-                    private_layer, key_fields, source_files=sources, feedback=feedback
+            # Recompute, dedupe and the edit_log entry commit together: a
+            # cancelled or failed fix leaves ISO_Time and the log untouched,
+            # so it can simply be run again.
+            ops.prepare_edit_log(private_layer, context)
+            with ops.GpkgEditSession(private_layer) as session:
+                counts = ops.recompute_iso_time(
+                    private_layer, corrected, old_start_date=previous,
+                    source_files=sources, feedback=feedback, session=session,
                 )
+                duplicates = 0
+                if dedupe:
+                    duplicates = ops.dedupe_layer_in_place(
+                        private_layer, key_fields, source_files=sources,
+                        feedback=feedback, session=session,
+                    )
+                session.log_edit(ops.edit_log_row(
+                    name, "recompute_iso_time",
+                    {
+                        "start_date": corrected, "old_start_date": previous,
+                        "source_files": sources, "dedupe": dedupe,
+                        "duplicates_removed": duplicates,
+                    },
+                    counts["updated"] + duplicates,
+                    f"updated={counts['updated']} unchanged={counts['unchanged']} "
+                    f"skipped={counts['skipped']} duplicates_removed={duplicates}",
+                ))
             return {
                 "counts": counts, "duplicates": duplicates, "gpkg_path": gpkg_path,
-                "name": name, "corrected": corrected, "previous": previous,
-                "sources": sources, "dedupe": dedupe,
+                "name": name,
             }
 
         self._start_edit("Fix start date", gpkg_path, name, work, self._finish_fix_start_date)
 
     def _finish_fix_start_date(self, result: Dict) -> None:
         counts, duplicates = result["counts"], result["duplicates"]
-        self._after_edit(
-            result["gpkg_path"], result["name"], "recompute_iso_time",
-            {
-                "start_date": result["corrected"], "old_start_date": result["previous"],
-                "source_files": result["sources"], "dedupe": result["dedupe"],
-                "duplicates_removed": duplicates,
-            },
-            counts["updated"] + duplicates,
-            f"updated={counts['updated']} unchanged={counts['unchanged']} "
-            f"skipped={counts['skipped']} duplicates_removed={duplicates}",
-        )
+        self._after_edit(result["gpkg_path"], result["name"])
         text = (
             f"ISO_Time recomputed: {counts['updated']:,} updated, "
             f"{counts['unchanged']:,} already correct, {duplicates:,} duplicate(s) removed."
@@ -973,20 +1004,24 @@ class ManagePanel(QWidget):
             return
         status = self.status_combo.currentText()
 
+        context = self.controller.transform_context()
+
         def work(private_layer, feedback):
-            changed = ops.set_source_status(private_layer, status, sources, feedback=feedback)
+            ops.prepare_edit_log(private_layer, context)
+            with ops.GpkgEditSession(private_layer) as session:
+                changed = ops.set_source_status(
+                    private_layer, status, sources, feedback=feedback, session=session)
+                session.log_edit(ops.edit_log_row(
+                    name, "set_record_status", {"status": status, "source_files": sources},
+                    changed, f"{changed} row(s) set to {status}"))
             return {"changed": changed, "gpkg_path": gpkg_path, "name": name,
-                    "status": status, "sources": sources}
+                    "status": status}
 
         self._start_edit("Set status", gpkg_path, name, work, self._finish_set_status)
 
     def _finish_set_status(self, result: Dict) -> None:
         changed, status = result["changed"], result["status"]
-        self._after_edit(
-            result["gpkg_path"], result["name"], "set_record_status",
-            {"status": status, "source_files": result["sources"]}, changed,
-            f"{changed} row(s) set to {status}",
-        )
+        self._after_edit(result["gpkg_path"], result["name"])
         self.status_label.setText(f"{changed:,} row(s) set to '{status}'.")
 
     def remove_sources(self) -> None:
@@ -1010,18 +1045,23 @@ class ManagePanel(QWidget):
         if answer != MESSAGEBOX_YES:
             return
 
+        context = self.controller.transform_context()
+
         def work(private_layer, feedback):
-            deleted = ops.delete_source_rows(private_layer, sources, feedback=feedback)
-            return {"deleted": deleted, "gpkg_path": gpkg_path, "name": name, "sources": sources}
+            ops.prepare_edit_log(private_layer, context)
+            with ops.GpkgEditSession(private_layer) as session:
+                deleted = ops.delete_source_rows(
+                    private_layer, sources, feedback=feedback, session=session)
+                session.log_edit(ops.edit_log_row(
+                    name, "delete_source_rows", {"source_files": sources},
+                    deleted, f"{deleted} row(s) deleted"))
+            return {"deleted": deleted, "gpkg_path": gpkg_path, "name": name}
 
         self._start_edit("Remove rows", gpkg_path, name, work, self._finish_remove_sources)
 
     def _finish_remove_sources(self, result: Dict) -> None:
         deleted = result["deleted"]
-        self._after_edit(
-            result["gpkg_path"], result["name"], "delete_source_rows",
-            {"source_files": result["sources"]}, deleted, f"{deleted} row(s) deleted",
-        )
+        self._after_edit(result["gpkg_path"], result["name"])
         self.status_label.setText(
             f"Deleted {deleted:,} row(s). Use 'Compact GeoPackage' to reclaim the space."
         )
@@ -1233,28 +1273,33 @@ class ManagePanel(QWidget):
         }
         activated = int(sum(1 for s in fid_to_status.values() if s == ops.STATUS_ACTIVE))
 
+        context = self.controller.transform_context()
+
         def work(private_layer, feedback):
-            changed = ops.apply_status(private_layer, fid_to_status, feedback=feedback)
+            ops.prepare_edit_log(private_layer, context)
+            with ops.GpkgEditSession(private_layer) as session:
+                changed = ops.apply_status(
+                    private_layer, fid_to_status, feedback=feedback, session=session)
+                session.log_edit(ops.edit_log_row(
+                    name, "gap_fill",
+                    {
+                        "primary": primary, "secondary": secondary,
+                        "threshold_s": threshold, "gaps": len(gaps),
+                    },
+                    changed,
+                    f"{len(gaps)} gap(s); {activated} secondary row(s) activated, "
+                    f"{changed - activated} set to standby",
+                ))
             return {
                 "changed": changed, "activated": activated, "gpkg_path": gpkg_path,
-                "name": name, "primary": primary, "secondary": secondary,
-                "threshold": threshold, "gaps": len(gaps),
+                "name": name, "secondary": secondary, "gaps": len(gaps),
             }
 
         self._start_edit("Apply gap fill", gpkg_path, name, work, self._finish_gap_fill)
 
     def _finish_gap_fill(self, result: Dict) -> None:
         changed, activated = result["changed"], result["activated"]
-        self._after_edit(
-            result["gpkg_path"], result["name"], "gap_fill",
-            {
-                "primary": result["primary"], "secondary": result["secondary"],
-                "threshold_s": result["threshold"], "gaps": result["gaps"],
-            },
-            changed,
-            f"{result['gaps']} gap(s); {activated} secondary row(s) activated, "
-            f"{changed - activated} set to standby",
-        )
+        self._after_edit(result["gpkg_path"], result["name"])
         self.status_label.setText(
             f"Gap fill applied: {activated:,} row(s) from '{result['secondary']}' activated "
             f"across {result['gaps']} gap(s); {changed - activated:,} set to standby."
@@ -1301,24 +1346,8 @@ class ManagePanel(QWidget):
         table.setSortingEnabled(True)
 
     # -- shared post-edit plumbing ----------------------------------------
-    def _after_edit(
-        self, gpkg_path: str, layer_name: str, operation: str,
-        params: Dict, rows_affected: int, details: str,
-    ) -> None:
-        try:
-            clp.log_edit(
-                gpkg_path,
-                self.controller.transform_context(),
-                {
-                    "layer_name": layer_name,
-                    "operation": operation,
-                    "params_json": json.dumps(params, sort_keys=True),
-                    "rows_affected": int(rows_affected),
-                    "details": details,
-                },
-            )
-        except Exception:
-            self.status_label.setText("Warning: could not write to the edit log.")
+    def _after_edit(self, gpkg_path: str, layer_name: str) -> None:
+        """Refresh after a committed edit (its edit_log row committed with it)."""
         # The edit went through a private connection: make the project layer
         # (and any other loaded copy of the table) see the new rows / fields.
         ops.reload_project_layers(gpkg_path, layer_name)

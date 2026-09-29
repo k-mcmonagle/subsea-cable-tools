@@ -8,6 +8,7 @@ from typing import List, Optional, Sequence
 from qgis.core import QgsTask
 
 from ..laydata import QcRunner
+from ..plugin_log import log_exception
 
 
 def _task_flag(name: str, default: int = 0):
@@ -44,5 +45,6 @@ class QcRunTask(QgsTask):
             self.setProgress(100.0)
             return not self.isCanceled()
         except Exception as exc:  # pragma: no cover
+            log_exception("Cable Lay Data Explorer: QC run failed")
             self.error = str(exc)
             return False

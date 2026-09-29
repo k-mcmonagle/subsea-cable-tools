@@ -36,6 +36,7 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.core import QgsProject, QgsPointXY, QgsCoordinateReferenceSystem
 
+from ...plugin_log import log_exception, log_warning
 from ...qgis_compat import (
     EDIT_TRIGGER_DOUBLE_CLICKED,
     GEOMETRY_LINE,
@@ -310,12 +311,14 @@ class InspectionPanel(QWidget):
                 route_layer, distance, target_crs=crs4326, project=QgsProject.instance()
             )
         except Exception as exc:  # pragma: no cover - geometry/CRS failure
+            log_exception("Cable Lay Data Explorer: DCC route could not be built")
             self.status_label.setText(f"DCC route error: {exc}")
             return []
 
         out: List[dict] = []
         lon = dataset.lon
         lat = dataset.lat
+        unchecked = 0
         for source_row in range(dataset.row_count):
             x = lon[source_row]
             y = lat[source_row]
@@ -323,13 +326,18 @@ class InspectionPanel(QWidget):
                 continue
             try:
                 hit = route.kp_at_point(QgsPointXY(float(x), float(y)))
-            except Exception:
+            except Exception:  # noqa: BLE001 - counted and reported below
+                unchecked += 1
                 continue
             dcc = abs(hit.dcc_m)
             if dcc > threshold:
                 out.append(self._make_finding(f"off-line > {threshold:g} m", source_row, dcc))
                 if len(out) >= budget:
                     break
+        if unchecked:
+            # A record that could not be projected is neither passed nor flagged.
+            log_warning(f"Cable Lay Data Explorer: {unchecked} record(s) could not be "
+                        "projected onto the route; their DCC was not checked")
         return out
 
     def _make_finding(self, label: str, source_row: int, value: float) -> dict:

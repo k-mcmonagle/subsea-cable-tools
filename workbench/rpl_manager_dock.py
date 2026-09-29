@@ -13,6 +13,7 @@ Also hosts the Systems tab (CRA-style topology) and the Fit Assembly action.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Dict, List, Optional
 
@@ -52,6 +53,7 @@ from qgis.core import (
 )
 
 from ..kp_range_utils import make_distance_area
+from ..plugin_log import log_exception
 from ..qgis_compat import (
     CONTEXT_MENU_POLICY_CUSTOM,
     DIALOG_ACCEPTED,
@@ -75,6 +77,7 @@ from .rpl_summary import invalidate_rpl_summary, rpl_summary
 from .readonly import make_readonly_banner
 from .store import (
     WorkbenchReadOnlyError,
+    WorkbenchStoreError,
     WorkbenchStore,
     default_project_gpkg_path,
     project_gpkg_path,
@@ -547,7 +550,9 @@ class RplManagerPanel(QWidget):
             if self.store is not None and self.store.exists():
                 return am.EventClassifier(self.store.list_event_rules())
         except Exception:
-            pass
+            # Falling back silently would classify events with rules the user
+            # did not choose: leave a trace of why.
+            log_exception("Workbench: event rules unreadable; using the default rules")
         return am.EventClassifier.with_defaults()
 
     def _populate_points_table(self, model: RplModel):
@@ -867,19 +872,25 @@ class RplManagerPanel(QWidget):
             try:
                 from .layer_style import refresh_line_categories
                 refresh_line_categories(self.sync.lines_layer)
-            except Exception:
-                pass
+            except Exception:  # styling only
+                log_exception("Workbench: line categories not refreshed", level=logging.DEBUG)
             if self.current_rpl:
                 self.current_rpl["slack_mode"] = self.slack_mode().value
                 try:
-                    self.store.save_rpl(self.current_rpl)
-                    # the route changed underneath any assessments of this RPL
-                    self.store.mark_assessments_stale(self.current_rpl.get("rpl_id"))
+                    with self.store.transaction():
+                        self.store.save_rpl(self.current_rpl)
+                        # the route changed underneath any assessments of this RPL
+                        self.store.mark_assessments_stale(self.current_rpl.get("rpl_id"))
                     refreshed = self._refresh_stored_fits()
                     if refreshed:
                         self._set_status(f"Saved. {refreshed} fit layer set(s) refreshed.")
                 except WorkbenchReadOnlyError as exc:
                     self.iface.messageBar().pushWarning("RPL read-only", str(exc))
+                except WorkbenchStoreError as exc:
+                    self._set_status("Positions saved; registry not updated — see message.")
+                    self.iface.messageBar().pushWarning(
+                        "RPL saved", "The positions were saved, but the Workbench registry "
+                        f"could not be updated (assessments not marked stale): {exc}")
         else:
             self._set_status("Save failed — see message log.")
         self.sync.begin_session()
@@ -961,8 +972,8 @@ class RplManagerPanel(QWidget):
         )
         try:
             extent = transform.transformBoundingBox(extent)
-        except Exception:
-            pass
+        except Exception:  # QgsCsException: zoom to the untransformed box
+            log_exception("Workbench: RPL extent not transformed", level=logging.DEBUG)
         extent.scale(1.1)
         canvas.setExtent(extent)
         canvas.refresh()
@@ -1045,7 +1056,8 @@ class RplManagerPanel(QWidget):
                 box = QgsCoordinateTransform(
                     layer.crs(), target_crs, QgsProject.instance()
                 ).transformBoundingBox(box)
-            except Exception:
+            except Exception:  # QgsCsException: leave this layer out of the zoom
+                log_exception("Workbench: layer extent not transformed", level=logging.DEBUG)
                 continue
             extent.combineExtentWith(box)
         if extent.isNull():
@@ -1373,11 +1385,10 @@ class RplManagerPanel(QWidget):
         name, ok = QInputDialog.getText(self, "Rename system", "System name:", text=item.text(0))
         if not ok or not name.strip():
             return
-        rows = self.store.list_systems()
+        rows = [row for row in self.store.list_systems() if row.get("system_id") == data[1]]
         for row in rows:
-            if row.get("system_id") == data[1]:
-                row["name"] = name.strip()
-        self.store.write_table(schema.TABLE_SYSTEM, rows)
+            row["name"] = name.strip()
+        self.store.upsert_rows(schema.TABLE_SYSTEM, rows)
         self._refresh_systems_tree()
 
     def _on_system_item_activated(self, item, _column):
@@ -1647,7 +1658,8 @@ class RplManagerPanel(QWidget):
             WGS84, canvas.mapSettings().destinationCrs(), QgsProject.instance())
         try:
             pt = transform.transform(lon, lat)
-        except Exception:
+        except Exception:  # QgsCsException: nothing to mark
+            log_exception("Workbench: position not transformed", level=logging.DEBUG)
             return
         marker = QgsVertexMarker(canvas)
         marker.setIconSize(18)

@@ -82,7 +82,9 @@ def write_assessment_ranges(store, assessment_row: Dict, result: AssessmentResul
                 WKT_KEY: geom.asWkt(),
             })
 
-    store.save_assessment_ranges(assessment_id, registry_rows)
+    # The spatial layer (an OGR write) goes first; the ranges and the
+    # "current" stamp then commit together, so a failure never leaves an
+    # assessment marked current over missing or partial ranges.
     if spatial_rows:
         store.write_spatial_layer(
             layer_name, RANGE_LAYER_FIELDS, WKB_LINESTRING, spatial_rows)
@@ -91,7 +93,9 @@ def write_assessment_ranges(store, assessment_row: Dict, result: AssessmentResul
     assessment_row["ranges_layer"] = layer_name
     assessment_row["status"] = "current"
     assessment_row["run_utc"] = schema.utc_now_iso()
-    store.save_assessment(assessment_row)
+    with store.transaction():
+        store.save_assessment_ranges(assessment_id, registry_rows)
+        store.save_assessment(assessment_row)
     return layer_name
 
 
