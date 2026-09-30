@@ -161,7 +161,7 @@ brackets.
   (positive slope = shoaling/up-slope with KP); the task swaps down/up-slope
   limits when direction is B→A, and the cache key includes direction only for
   signed-slope rules ("direction where relevant", §14.4). This sign
-  convention is plugin-wide (see README "Slope methodology"): the KP
+  convention is plugin-wide (see docs/KP_AND_BATHYMETRY.md): the KP
   Mouse profile, Depth Profile default and KP Range Depth + Slope Summary
   all report +ve = up-slope, datum-normalised; side slope +ve = deeper to
   starboard (vehicle leans to starboard).

@@ -13,7 +13,7 @@ identity is per layer (source + content stamp + conventions), so reopening
 the project, editing another table in the same GeoPackage or relabelling
 the RPL no longer invalidates a correctly sampled profile.
 
-Slope conventions (plugin-wide, see README "Slope methodology"):
+Slope conventions (plugin-wide, see docs/KP_AND_BATHYMETRY.md):
 
 - longitudinal: signed, positive = shoaling with increasing KP (up-slope);
 - cross: signed, positive = deeper to starboard of the direction of

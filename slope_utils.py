@@ -5,7 +5,7 @@ One home for the slope calculations that were previously duplicated across
 the KP Mouse live profile, the Depth Profile tool, the KP Range Depth + Slope
 Summary algorithm, the Burial Planner and the Workbench rules engine.
 
-Plugin-wide conventions (README "Slope methodology"):
+Plugin-wide conventions (docs/KP_AND_BATHYMETRY.md):
 
 - Slope is measured **along the profile line** in degrees:
   ``atan2(Δup, Δchainage)``. Positive = shoaling with increasing
