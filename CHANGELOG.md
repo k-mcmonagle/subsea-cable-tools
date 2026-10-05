@@ -24,6 +24,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **Burial Planner — Exclusions:** a KP range table criterion now reports rows it cannot read (wrong start/end fields, empty or non-numeric KPs) and ranges outside the scope, instead of silently firing nowhere.
+
 - **Burial Planner profile:** show the route extent before scope is applied and use three-decimal KP tick labels on bathymetry and slope plots, avoiding scientific notation on an empty profile.
 
 - **KP displays:** show KPs to three decimal places (1 m), keeping precise Full route bounds internally when applying scope.
@@ -35,6 +37,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - **Ground Model:** numeric depth profiles from mapped investigation tables, separate polygon/KP assignments, stable colour controls, missing-data flags and source inspection alongside soil classes.
+
+- **Burial Planner — Risk Profile:** new *KP-range table* check registers each row of a start/end KP table, with or without geometry (e.g. a desktop-study hazard list), as a hazard over its KP range, with Low/Medium/High risk from its text or numeric attributes or a default.
+
+- **Burial Planner — KP-range tables:** Exclusions criteria and Risk Profile checks record the RPL their KPs are quoted on and the KP unit (km or m). KPs on another RPL are translated to the plan's route by seabed position, and stretches the translation cannot trust are listed in the analysis and scan messages; existing criteria are read on the plan's RPL and ask you to confirm it.
 
 - **Burial Planner:** Acquired Data, Assessment and Reporting tabs are in development and shown disabled; Planning and all its subtabs are unchanged.
 

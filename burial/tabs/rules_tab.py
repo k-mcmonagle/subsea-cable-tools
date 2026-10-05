@@ -206,10 +206,13 @@ def _normalised_methods_json(methods_json) -> str:
 class RuleEditorDialog(QDialog):
     """Edit one bp_rule row (kind fixed at creation)."""
 
-    def __init__(self, rule: Dict, inputs: List[Dict], method: str, parent=None):
+    def __init__(self, rule: Dict, inputs: List[Dict], method: str, parent=None,
+                 model=None):
         super().__init__(parent)
         self.rule = dict(rule)
         self.inputs = inputs
+        # The plan model, for the KP-range table's reference RPL picker.
+        self.model = model
         kind = self.rule.get("kind") or ""
         try:
             self.config = json.loads(self.rule.get("config_json") or "{}")
@@ -380,6 +383,16 @@ class RuleEditorDialog(QDialog):
                     self, "Burial Planner",
                     f"The {label} does not parse: {problem}")
                 return
+        if hasattr(self, "kp_table_form"):
+            layer = resolve_input_layer(
+                self.inputs, self.input_combo.currentData() or "")
+            problems = self.kp_table_form.problems(layer)
+            if not (self.input_combo.currentData() or ""):
+                problems.insert(0, "Pick the registered input holding the "
+                                   "KP ranges (Inputs tab).")
+            if problems:
+                QMessageBox.warning(self, "Burial Planner", " ".join(problems))
+                return
         if hasattr(self, "ranges_table"):
             bad_ranges = self.ranges_table.invalid_rows()
             if bad_ranges:
@@ -538,12 +551,11 @@ class RuleEditorDialog(QDialog):
         elif kind == wb_schema.RULE_KIND_POLYGON:
             self._build_polygon_form(form, config)
         elif kind == wb_schema.RULE_KIND_KP_TABLE:
+            from .kp_table_form import KpTableForm
             self.input_combo = self._input_combo()
             form.addRow("Input:", self.input_combo)
-            self.start_field_edit = self._field_combo("start_field", "start_kp")
-            self.end_field_edit = self._field_combo("end_field", "end_kp")
-            form.addRow("Start KP field:", self.start_field_edit)
-            form.addRow("End KP field:", self.end_field_edit)
+            self.kp_table_form = KpTableForm(form, config, self.model)
+            self._layer_widgets.extend(self.kp_table_form.widgets())
             self.filter_edit = self._expression_edit("filter_expression")
             form.addRow("Feature filter:", self.filter_edit)
         elif kind == wb_schema.RULE_KIND_MANUAL:
@@ -911,8 +923,7 @@ class RuleEditorDialog(QDialog):
                        else "route_buffer_m"] = corridor_value
         elif kind == wb_schema.RULE_KIND_KP_TABLE:
             config["input_id"] = self.input_combo.currentData() or ""
-            config["start_field"] = self.start_field_edit.text().strip() or "start_kp"
-            config["end_field"] = self.end_field_edit.text().strip() or "end_kp"
+            self.kp_table_form.apply(config)
             config["filter_expression"] = self.filter_edit.text().strip()
         elif kind == wb_schema.RULE_KIND_MANUAL:
             config["ranges"] = _parse_scope(self.ranges_edit.text())
@@ -1783,7 +1794,8 @@ class RulesTab(QWidget):
             "config_json": json.dumps(preset or {}),
             "notes": "",
         }
-        dialog = RuleEditorDialog(rule, self.model.inputs, self.model.method, self)
+        dialog = RuleEditorDialog(rule, self.model.inputs, self.model.method, self,
+                                  model=self.model)
         if qt_exec(dialog) == DIALOG_ACCEPTED:
             rules = list(self.model.rules) + [dialog.result_rule()]
             self.model.save_rules(rules, target_id=rule["rule_id"])
@@ -1794,7 +1806,7 @@ class RulesTab(QWidget):
         if index < 0 or index >= len(self.model.rules):
             return
         dialog = RuleEditorDialog(self.model.rules[index], self.model.inputs,
-                                  self.model.method, self)
+                                  self.model.method, self, model=self.model)
         if qt_exec(dialog) == DIALOG_ACCEPTED:
             rules = list(self.model.rules)
             rules[index] = dialog.result_rule()

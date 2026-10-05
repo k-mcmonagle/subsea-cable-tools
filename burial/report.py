@@ -189,8 +189,11 @@ def rule_condition_text(rule: Dict) -> str:
         elif corridor_mode == "wd" and config.get("route_buffer_wd"):
             parts.append(f"within {config['route_buffer_wd']} ×WD of route")
     elif kind == wb_schema.RULE_KIND_KP_TABLE:
+        from . import kp_table
         parts.append(f"fields {config.get('start_field') or 'start_kp'}/"
-                     f"{config.get('end_field') or 'end_kp'}")
+                     f"{config.get('end_field') or 'end_kp'} "
+                     f"({kp_table.unit(config)})")
+        parts.append(f"KPs on {kp_table.reference_text(config)}")
         if config.get("filter_expression"):
             parts.append(f"filter: {config['filter_expression']}")
     elif kind == wb_schema.RULE_KIND_MANUAL:

@@ -65,6 +65,133 @@ def kp_transform(model, rpl_id: str):
     return kp_map.map_range, kp_map
 
 
+def plan_rpl_label(model) -> str:
+    """Readable name of the plan's own route reference."""
+    label = model.plan.get("rpl_name") or "route"
+    if model.plan.get("rpl_revision"):
+        label += f" — {model.plan.get('rpl_revision')}"
+    if not str(getattr(model, "resolved_rpl_id", "") or ""):
+        label += " (plan route, not a registered RPL)"
+    return label
+
+
+def table_reference(model, picker_rpl_id: str) -> Tuple[str, str, Optional[float]]:
+    """``(rpl_id, label, start_kp)`` to store for KP data quoted on the picked RPL.
+
+    "This plan's RPL" is stored as the plan's resolved RPL id, never as
+    "", so the data stays tied to the RPL it was quoted against when the
+    plan later moves to another revision. "" is stored only when the plan
+    route is not a registered RPL. ``start_kp`` is that RPL's start KP now,
+    so a later renumbering of its start can be corrected for.
+    """
+    if picker_rpl_id:
+        from .rereference_qgis import rpl_label, rpl_route
+        store = getattr(model, "workbench_store", None)
+        rpl = store.get_rpl(picker_rpl_id) if store is not None else None
+        if rpl is None:
+            return picker_rpl_id, picker_rpl_id, None
+        try:
+            route, _distance, _positions = rpl_route(
+                store, rpl, QgsProject.instance(), model.kp_mode())
+            start = float(route.start_kp_km)
+        except ValueError:
+            start = None
+        return picker_rpl_id, rpl_label(rpl), start
+    route = getattr(model, "route", None)
+    start = float(route.start_kp_km) if route is not None else None
+    return (str(getattr(model, "resolved_rpl_id", "") or ""),
+            plan_rpl_label(model), start)
+
+
+def table_kp_map(model, config: Dict, cache: Optional[Dict] = None):
+    """``(map_range or None, notes)`` placing a KP table's ranges on the plan.
+
+    ``map_range(start, end) -> (start, end, flags)``; ``None`` means the
+    table's KPs are already plan KPs. A config with no recorded reference is
+    read on the plan's RPL and a note asks for it to be confirmed. When the
+    reference RPL's start KP has changed since the table was referenced,
+    the quoted KPs are shifted by that change first. Raises ValueError when
+    the reference RPL cannot be translated (e.g. deleted from the Workbench).
+    """
+    from . import kp_table
+    from .kp_rereference import KpMap
+    notes: List[str] = []
+    if kp_table.KP_REF_KEY not in config:
+        notes.append("its KP reference RPL is not recorded — KPs are read "
+                     "as quoted on this plan's RPL; edit it to confirm")
+        return None, notes
+    ref = str(config.get(kp_table.KP_REF_KEY) or "")
+    label = kp_table.reference_text(config)
+    plan_rpl = str(getattr(model, "resolved_rpl_id", "") or "")
+    if not ref or ref == plan_rpl:
+        kp_map, start_now = None, getattr(model.route, "start_kp_km", None)
+    else:
+        key = ("rpl", ref)
+        if cache is not None and key in cache:
+            kp_map, start_now = cache[key]
+        else:
+            from .rereference_qgis import geometry_map, rpl_label, rpl_route
+            store = getattr(model, "workbench_store", None)
+            if store is None or model.route is None:
+                raise ValueError("the plan route and the Cable Workbench are "
+                                 "needed to translate KPs from another RPL")
+            rpl = store.get_rpl(ref)
+            if rpl is None:
+                raise ValueError(f"{label} is no longer in the Workbench — "
+                                 "re-register it or choose the table's RPL again")
+            src_route, _distance, _positions = rpl_route(
+                store, rpl, QgsProject.instance(), model.kp_mode())
+            kp_map = geometry_map(
+                src_route, model.route, source_label=rpl_label(rpl),
+                target_label=model.plan.get("rpl_name") or "plan route")
+            start_now = float(src_route.start_kp_km)
+            if cache is not None:
+                cache[key] = (kp_map, start_now)
+        notes.append(f"KPs translated from {label} to this plan's route by "
+                     "seabed position")
+    shift = 0.0
+    recorded = config.get(kp_table.KP_REF_START_KEY)
+    if recorded is not None and start_now is not None:
+        shift = float(start_now) - float(recorded)
+    if abs(shift) <= 5e-7:
+        return (kp_map.map_range if kp_map is not None else None), notes
+    notes.append(f"{label} now starts at KP {float(start_now):.3f} (was "
+                 f"{float(recorded):.3f} when the table was referenced); "
+                 f"quoted KPs shifted by {shift * 1000.0:+.1f} m")
+    if kp_map is None:
+        return KpMap.shift(shift).map_range, notes
+
+    def map_range(start, end, _m=kp_map, _d=shift):
+        return _m.map_range(float(start) + _d, float(end) + _d)
+    return map_range, notes
+
+
+def make_table_picker(model, config: Dict, parent=None) -> "RplReferencePicker":
+    """A picker showing the config's stored reference.
+
+    A stored RPL that is no longer offered (deleted from the Workbench)
+    stays selected as an explicit entry instead of silently falling back
+    to the plan's RPL.
+    """
+    from . import kp_table
+    picker = RplReferencePicker(model, parent)
+    if kp_table.KP_REF_KEY not in config:
+        return picker
+    ref = str(config.get(kp_table.KP_REF_KEY) or "")
+    plan_rpl = str(getattr(model, "resolved_rpl_id", "") or "")
+    if not ref or ref == plan_rpl:
+        return picker
+    index = picker.combo.findData(ref)
+    if index < 0:
+        picker.combo.insertItem(
+            picker.combo.count() - 1,
+            f"{kp_table.reference_text(config)} (not in the Workbench)", ref)
+        index = picker.combo.findData(ref)
+    picker.combo.setCurrentIndex(index)
+    picker._last = ref
+    return picker
+
+
 def rpl_event_rows(model, rpl_id: str):
     """``(rows, label)``: every position of a registered RPL as
     :class:`rpl_plan_import.RplRow`, placed on the plan route by seabed

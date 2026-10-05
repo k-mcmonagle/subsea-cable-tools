@@ -691,3 +691,31 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   switching a plan maps KPs vertex-by-vertex (same geometry) through the
   plan re-reference. Worker copies go through `clone_distance_area` (a plain
   `QgsDistanceArea(copy)` would silently fall back to geodesic).
+
+## KP-range tables and their reference RPL (October 2026)
+
+- A KP-range table (start/end KP fields, geometry optional) is read by the
+  Exclusions `kp_range_table` criterion and the Risk Profile `kp_table` check.
+  Both configs record `kp_rpl_id`, a readable `kp_rpl_label`, the RPL's start
+  KP when referenced (`kp_rpl_start_kp`) and `kp_unit` (km or m). "This
+  plan's RPL" is stored as the plan's resolved RPL id, not "", so the table
+  stays tied to the revision it was quoted on when the plan moves; "" is
+  stored only for a plan route that is not a registered RPL.
+- The table's rows are never rewritten. Each read translates them onto the
+  plan route: identity on the plan's RPL, otherwise a geometry `KpMap` from
+  the reference RPL (`rpl_reference.table_kp_map`). A change in the reference
+  RPL's start KP since it was recorded shifts the quoted KPs first. Flagged
+  translations (gap, extrapolated, stretched, reversed) are listed by quoted
+  KP in the analysis warnings (persisted with the analysis) and scan messages.
+- Rows with missing fields or non-numeric KPs are counted and reported, not
+  skipped silently. Text with a decimal comma or units is rejected rather
+  than guessed ("12,345" is ambiguous).
+- Exclusion tables are read on the main thread (small, and translation needs
+  the model); the translated ranges' digest joins the cache key, so a changed
+  translation re-acquires the rule. A criterion saved before references were
+  recorded is read on the plan's RPL with a note, and moving the plan to
+  another RPL stamps it with the RPL it was implicitly using.
+- Risk rows become hazards over their translated range (clipped to the
+  scope), keyed `row:<feature id>` for review carry-over, with the quoted
+  range and reference kept in the hazard's attributes. Risk comes from the
+  attribute rules or the default; proximity bands do not apply.

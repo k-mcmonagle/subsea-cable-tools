@@ -52,7 +52,7 @@ from ..workbench.depth_service import DepthSourceConfig
 from ..bathymetry_sampling import RasterSampler, expand_rasters, layer_options, normalise_depth
 from ..slope_utils import cross_profile_metrics, clean_crossings, interpolate_covered
 from ..workbench.rules_engine import Interval
-from . import generation, map_layers, profile_data, schema
+from . import generation, kp_table, map_layers, profile_data, schema
 
 WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
 
@@ -712,6 +712,11 @@ class RuleWork:
     # worker, cancellable — it used to freeze the UI before the task began.
     layer_snapshot: Optional[Dict] = None
     table_snapshot: Optional[Dict] = None
+    # KP-range tables are read and placed on the plan route on the main
+    # thread (they are small, and the RPL translation needs the model):
+    # plan-route (start, end) km pairs, plus notes for the analysis log.
+    table_ranges: Optional[List[Tuple[float, float]]] = None
+    notes: List[str] = field(default_factory=list)
     error: str = ""
 
 
@@ -747,6 +752,7 @@ class RuleResult:
     nodata: List[Interval] = field(default_factory=list)
     error: str = ""
     from_cache: bool = False
+    notes: List[str] = field(default_factory=list)
 
 
 def _effective_config(rule_row: Dict, direction: int) -> Dict:
@@ -841,8 +847,14 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
                depth_samples: Optional[List[Tuple[float, Optional[float]]]] = None,
                depth_step_m: Optional[float] = None,
                cross_profile: Optional[Dict] = None,
+               kp_reference: Optional[Callable[[Dict], Tuple[object, List[str]]]] = None,
                ) -> Tuple["AnalysisWork", List[str]]:
-    """Snapshot everything the task needs (main thread). Returns (work, warnings)."""
+    """Snapshot everything the task needs (main thread). Returns (work, warnings).
+
+    ``kp_reference(config) -> (map_range or None, notes)`` places a KP-range
+    table's ranges on the plan route (``rpl_reference.table_kp_map``);
+    without it the table's KPs are read as plan KPs.
+    """
     project = project or QgsProject.instance()
     warnings: List[str] = []
     inputs_by_id = {str(r.get("input_id")): r for r in inputs}
@@ -904,6 +916,9 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
                 rule_work.error = "input layer could not be resolved"
             else:
                 input_fp = map_layers.layer_fingerprint(layer)
+                if rule_work.kind == wb_schema.RULE_KIND_KP_TABLE:
+                    input_fp += "|" + _prepare_kp_table(
+                        rule_work, layer, params, kp_reference)
                 if rule_work.kind == wb_schema.RULE_KIND_POLYGON and \
                         (rule_work.config.get("route_buffer_mode") or "").lower() == "wd":
                     if depth is None or not depth.is_available():
@@ -952,7 +967,8 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
         cached = cache.get(rule_work.cache_key)
         if cached is not None and not rule_work.error:
             rule_work.cached = cached
-        elif not rule_work.error and needs_layer and layer is not None:
+        elif not rule_work.error and needs_layer and layer is not None \
+                and rule_work.table_ranges is None:
             # Snapshot only (cheap): the feature read, reprojection and
             # index build run inside the task with cancellation, instead of
             # freezing the UI here for large constraint layers.
@@ -979,6 +995,46 @@ def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],
                 f"Rule '{row.get('name') or rule_work.kind}': {rule_work.error} — skipped.")
         work.rules.append(rule_work)
     return work, warnings
+
+
+def _prepare_kp_table(rule_work: "RuleWork", layer: QgsVectorLayer,
+                      params: generation.GenParams,
+                      kp_reference: Optional[Callable]) -> str:
+    """Read a KP-range table onto the plan route (main thread).
+
+    Sets ``table_ranges`` and ``notes`` (or ``error``) on ``rule_work`` and
+    returns a fingerprint of the translated ranges for the cache key, so a
+    changed reference RPL or translation re-acquires the rule.
+    """
+    config = rule_work.config
+    name = rule_work.rule_row.get("name") or "KP range table"
+    expr, ctx = ri.filter_expression(config.get("filter_expression", ""))
+    names = [f.name() for f in layer.fields()]
+    rows = []
+    for feat in layer.getFeatures():
+        if expr is not None:
+            ctx.setFeature(feat)
+            if not bool(expr.evaluate(ctx)):
+                continue
+        rows.append((str(feat.id()), {n: feat[n] for n in names}))
+    ranges, notes = kp_table.read_ranges(rows, config)
+    map_range = None
+    if kp_reference is not None:
+        try:
+            map_range, ref_notes = kp_reference(config)
+        except ValueError as exc:
+            rule_work.error = f"KP reference RPL: {exc}"
+            return ""
+        notes = ref_notes + notes
+    kp_table.translate(ranges, map_range)
+    notes += kp_table.flag_notes(ranges)
+    scope = params.scope
+    notes += kp_table.scope_note(ranges, min(scope.start_km, scope.end_km),
+                                 max(scope.start_km, scope.end_km))
+    rule_work.table_ranges = [(r.lo, r.hi) for r in ranges]
+    rule_work.notes = [f"Rule '{name}': {note}." for note in notes]
+    return (f"ref={config.get(kp_table.KP_REF_KEY, '')}"
+            f"|{kp_table.fingerprint(ranges)}")
 
 
 # ---------------------------------------------------------------------------
@@ -1285,6 +1341,7 @@ class BurialAnalysisTask(QgsTask):
                 def sub_progress(fraction: float, _base=base, _span=span) -> None:
                     self.setProgress(_base + _span * min(max(fraction, 0.0), 1.0))
 
+                result.notes = list(rule_work.notes)
                 if rule_work.error:
                     result.error = rule_work.error
                 elif rule_work.cached is not None:
@@ -1524,8 +1581,13 @@ class BurialAnalysisTask(QgsTask):
                 predicate = _geometry_predicate(work, rule_work,
                                                 depth_at=depth_at)
         elif kind == wb_schema.RULE_KIND_KP_TABLE:
-            intervals = ri.kp_table_intervals(
-                rule_work.table_rows or [], config, sampler.scope_domain)
+            if rule_work.table_ranges is not None:
+                intervals = eng.clip_intervals(
+                    [Interval(a, b) for a, b in rule_work.table_ranges],
+                    sampler.scope_domain)
+            else:
+                intervals = ri.kp_table_intervals(
+                    rule_work.table_rows or [], config, sampler.scope_domain)
         elif kind == wb_schema.RULE_KIND_MANUAL:
             intervals = ri.acquire_manual(sampler, config)
         elif kind == schema.RULE_KIND_COVERAGE:

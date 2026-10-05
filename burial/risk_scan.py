@@ -15,7 +15,14 @@ Offsets are signed by the side of the route in the direction of travel:
 positive to starboard, negative to port (falling back to positive when the
 local bearing cannot be resolved). Risk bands apply to the magnitude.
 
-A second check kind, ``route_turns``, scans the route geometry itself for
+A KP-range table check (``kp_table``) reads a registered input with start
+and end KP fields, usually a table without geometry such as a desktop study
+hazard list. Each row becomes a hazard over its KP range, translated from
+the RPL the table's KPs are quoted on (``kp_table``,
+``rpl_reference.table_kp_map``). Risk comes from the attribute rules or the
+check's default, never from proximity.
+
+A further check kind, ``route_turns``, scans the route geometry itself for
 alter-courses: each vertex's course change is computed exactly like the
 "Extract A/C Points" processing algorithm (signed ``alter_course``,
 ``turn_abs`` magnitude, small changes ignorable) and risk comes from the
@@ -50,12 +57,14 @@ from ..qgis_compat import GEOMETRY_LINE, GEOMETRY_POINT, GEOMETRY_POLYGON
 from ..workbench import rules_inputs as ri
 from ..workbench.rules_inputs import _filter_expression, _load_features_wgs84
 from ..workbench.rules_engine import Interval
-from . import attribute_rules, risk
+from . import attribute_rules, kp_table, risk
 
 WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
 
 CHECK_KIND_FEATURES = "features"
 CHECK_KIND_ROUTE_TURNS = "route_turns"
+CHECK_KIND_KP_TABLE = "kp_table"
+CHECK_KINDS = (CHECK_KIND_FEATURES, CHECK_KIND_ROUTE_TURNS, CHECK_KIND_KP_TABLE)
 
 # One check yielding more interactions than this almost always means the
 # search distance or filter is far too wide, and a register this size makes
@@ -83,8 +92,7 @@ class RiskScanError(ValueError):
 
 def check_kind(config: Dict) -> str:
     kind = (config.get("kind") or "").strip()
-    return kind if kind in (CHECK_KIND_FEATURES, CHECK_KIND_ROUTE_TURNS) \
-        else CHECK_KIND_FEATURES
+    return kind if kind in CHECK_KINDS else CHECK_KIND_FEATURES
 
 
 def _expanded_rect(rect: QgsRectangle, radius_m: float) -> QgsRectangle:
@@ -342,9 +350,138 @@ def snapshot_check_features(check_row: Dict, layer, route_geom: QgsGeometry,
     return out
 
 
+def snapshot_kp_table(check_row: Dict, layer,
+                      kp_reference: Optional[Callable] = None
+                      ) -> Tuple[List[Dict], List[str]]:
+    """Read a KP-range table check onto the plan route (main thread).
+
+    Returns ``(entries, notes)``: one thread-safe entry per readable row,
+    its range already translated from the table's reference RPL by
+    ``kp_reference(config) -> (map_range or None, notes)``. Rows that cannot
+    be read are counted into ``notes``. Raises RiskScanError when the input
+    or its reference RPL is unusable.
+    """
+    config = risk.check_config(check_row)
+    check_name = check_row.get("name") or "check"
+    if layer is None or not layer.isValid():
+        raise RiskScanError(
+            f"Check '{check_name}': the input layer could not be opened.")
+    expr, ctx = _filter_expression(config.get("filter_expression", ""))
+    label_attribute = (config.get("label_attribute") or "").strip()
+    risk_attribute = (config.get("attribute") or "").strip()
+    start_field, end_field = kp_table.fields(config)
+    rule_expressions = [
+        _filter_expression(text) for text in
+        attribute_rules.expression_texts(config.get("attribute_rules") or [])]
+    names = set(layer.fields().names())
+    wanted = [n for n in (label_attribute, risk_attribute, start_field, end_field)
+              if n and n in names]
+    rows: List[Tuple[str, Dict]] = []
+    extras: Dict[str, Tuple[List[bool], str]] = {}
+    layer_name = layer.name()
+    for feat in layer.getFeatures():
+        if expr is not None:
+            ctx.setFeature(feat)
+            if not bool(expr.evaluate(ctx)):
+                continue
+        attributes = {n: feat[n] for n in wanted}
+        hits: List[bool] = []
+        for rule_expr, rule_ctx in rule_expressions:
+            if rule_expr is None:
+                hits.append(False)
+                continue
+            rule_ctx.setFeature(feat)
+            try:
+                hits.append(bool(rule_expr.evaluate(rule_ctx)))
+            except Exception:
+                hits.append(False)
+        ref = str(feat.id())
+        label = ""
+        if label_attribute:
+            value = attributes.get(label_attribute)
+            if not attribute_rules.is_null(value) and str(value).strip():
+                label = str(value).strip()
+        extras[ref] = (hits, label or f"{layer_name} row {ref}")
+        rows.append((ref, attributes))
+    ranges, notes = kp_table.read_ranges(rows, config)
+    map_range = None
+    if kp_reference is not None:
+        try:
+            map_range, ref_notes = kp_reference(config)
+        except ValueError as exc:
+            raise RiskScanError(
+                f"Check '{check_name}': KP reference RPL: {exc}") from exc
+        notes = ref_notes + notes
+    kp_table.translate(ranges, map_range)
+    notes += kp_table.flag_notes(ranges)
+    reference = kp_table.reference_text(config)
+    attributes_by_ref = dict(rows)
+    entries = []
+    for item in ranges:
+        hits, label = extras[item.ref]
+        attributes = {k: v for k, v in attributes_by_ref[item.ref].items()
+                      if k in (label_attribute, risk_attribute)}
+        quoted = (f"KP {min(item.source_start, item.source_end):.3f}–"
+                  f"{max(item.source_start, item.source_end):.3f} on {reference}")
+        if item.flags:
+            quoted += f" ({', '.join(item.flags)}: check)"
+        entries.append({"fid": item.ref, "label": label, "attrs": attributes,
+                        "expression_hits": hits, "lo": item.lo, "hi": item.hi,
+                        "quoted": quoted})
+    return entries, [f"Check '{check_name}': {note}." for note in notes]
+
+
 # ---------------------------------------------------------------------------
 # Worker-safe scans
 # ---------------------------------------------------------------------------
+
+
+def scan_kp_table(plan_id: str, check_row: Dict, entries: List[Dict], route,
+                  scope: Optional[Interval] = None
+                  ) -> Tuple[List[Dict], List[str]]:
+    """Hazards from a snapshotted KP-range table (thread-safe).
+
+    Ranges are already on the plan route. Each row in scope becomes one
+    hazard, clipped to the scope; risk comes from the attribute rules or
+    the default (no proximity). The quoted range and its reference RPL are
+    kept with the hazard's attributes.
+    """
+    config = risk.check_config(check_row)
+    check_id = str(check_row.get("check_id") or "")
+    check_name = check_row.get("name") or "check"
+    lo_bound, hi_bound = route.start_kp_km, route.end_kp_km
+    if scope is not None:
+        lo_bound = max(lo_bound, min(scope.start_km, scope.end_km))
+        hi_bound = min(hi_bound, max(scope.start_km, scope.end_km))
+    hazards: List[Dict] = []
+    warnings: List[str] = []
+    outside = 0
+    for entry in entries:
+        lo, hi = entry["lo"], entry["hi"]
+        if hi < lo_bound - 1e-9 or lo > hi_bound + 1e-9:
+            outside += 1
+            continue
+        if len(hazards) >= MAX_HAZARDS_PER_CHECK:
+            warnings.append(
+                f"Check '{check_name}' hit the {MAX_HAZARDS_PER_CHECK}-hazard "
+                "cap — add a feature filter.")
+            break
+        lo, hi = max(lo, lo_bound), min(hi, hi_bound)
+        auto = risk.evaluate_risk(config, None, entry["attrs"],
+                                  entry.get("expression_hits"))
+        mid = route.point_at_kp((lo + hi) / 2.0, clamp=True)
+        attributes = dict(entry["attrs"])
+        attributes["Quoted KP"] = entry["quoted"]
+        hazards.append(risk.new_hazard_row(
+            plan_id, check_id, f"row:{entry['fid']}", entry["label"],
+            lo, hi, 0.0, False, None,
+            mid.y() if mid else None, mid.x() if mid else None, auto,
+            attributes))
+    if entries and outside == len(entries):
+        warnings.append(
+            f"Check '{check_name}': none of its {len(entries)} range(s) "
+            "overlap the plan scope — check the KP unit and reference RPL.")
+    return risk.sort_hazards(hazards), warnings
 
 
 def scan_snapshot(plan_id: str, check_row: Dict, features: List[Dict],
@@ -680,6 +817,10 @@ class RiskScanTask(QgsTask):
                         self.plan_id, check_row, route, distance,
                         scope=self.scope, direction=self.direction,
                         cancel=self.isCanceled)
+                elif check_kind(config) == CHECK_KIND_KP_TABLE:
+                    found, warnings = scan_kp_table(
+                        self.plan_id, check_row, features or [], route,
+                        scope=self.scope)
                 else:
                     found, warnings = scan_snapshot(
                         self.plan_id, check_row, features or [], route,

@@ -11,7 +11,8 @@ Everything KP-bearing is covered:
   ranges, installation-path adjustments;
 * events and sections (sections are mapped, not re-derived, so conclusions,
   tools and notes stay attached);
-* hazards; exclusion-rule manual ranges and KP scopes;
+* hazards; exclusion-rule manual ranges and KP scopes (KP-range table
+  criteria keep their table and record the RPL its KPs are quoted on);
 * ground-model units and BAS rows (their ``src_*`` delivery KPs are left
   untouched — they record where the data came from);
 * the active generation's stored analysis context.
@@ -27,6 +28,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from . import kp_table
 from .kp_rereference import KpMap
 
 
@@ -225,6 +227,17 @@ def map_plan(kp_map: KpMap, plan: Dict, events: Sequence[Dict],
                 config[key] = _map_range_dicts(m, config[key],
                                                f"Rule '{rule.get('name') or ''}'")
                 changed = True
+        # A KP-range table's rows live in its input layer and are
+        # translated when read, from the RPL recorded here. A table saved
+        # before references were recorded was read on the plan's RPL, so
+        # record that RPL before the plan leaves it.
+        if rule.get("kind") == "kp_range_table" and kp_table.KP_REF_KEY not in config:
+            config[kp_table.KP_REF_KEY] = str(plan.get("rpl_id") or "")
+            label = plan.get("rpl_name") or "previous route"
+            if plan.get("rpl_revision"):
+                label += f" — {plan.get('rpl_revision')}"
+            config[kp_table.KP_REF_LABEL_KEY] = label
+            changed = True
         if changed:
             rule["config_json"] = json.dumps(config)
         new_rules.append(rule)

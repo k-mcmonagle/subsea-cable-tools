@@ -977,7 +977,8 @@ class BurialPlannerDock(QDockWidget):
             self.model.rules, self.model.inputs, self.model.depth_config(),
             params, self.model.acq_cache, self.model.current_rpl_fingerprint(),
             depth_samples=depth_samples, depth_step_m=depth_step_m,
-            cross_profile=cross_profile)
+            cross_profile=cross_profile,
+            kp_reference=self._kp_reference_resolver())
         if warnings:
             self.builder_tab.analysis_message("  ·  ".join(warnings))
         self._generate_after_analysis = generate
@@ -1042,6 +1043,14 @@ class BurialPlannerDock(QDockWidget):
                 "(Subsea Cable Tools).")
             raise
 
+    def _kp_reference_resolver(self):
+        """``config -> (map_range or None, notes)`` for KP-range tables,
+        caching one translation per reference RPL for this run."""
+        from .rpl_reference import table_kp_map
+        cache: Dict = {}
+        model = self.model
+        return lambda config: table_kp_map(model, config, cache)
+
     def _apply_analysis_results(self,
                                 task: analysis_task.BurialAnalysisTask) -> None:
         # The parameters snapshotted when the work was built — not a fresh
@@ -1057,6 +1066,10 @@ class BurialPlannerDock(QDockWidget):
 
         resolved, influence, nodata, warnings = generation.resolve_stack(
             params, acquisitions, depth_at=self.model.depth_at_kp)
+        # KP-table reference/translation notes (and unreadable rows) are
+        # part of the analysis record, not just a transient status line.
+        warnings = list(warnings) + [note for result in task.results
+                                     for note in result.notes]
         verdicts = resolved.per_method.get(params.method, [])
         # Per-rule bars show the resolved footprint (resolved.rule_hits) —
         # extension buffers included — so what fires on screen is what

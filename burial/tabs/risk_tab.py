@@ -113,10 +113,13 @@ _MAX_TABLE_ROWS = 2000
 class CheckEditorDialog(QDialog):
     """Edit one bp_risk_check row."""
 
-    def __init__(self, check: Dict, inputs: List[Dict], parent=None):
+    def __init__(self, check: Dict, inputs: List[Dict], parent=None,
+                 model=None):
         super().__init__(parent)
         self.check = dict(check)
         self.inputs = inputs
+        # The plan model, for a KP-range table's reference RPL picker.
+        self.model = model
         config = risk.check_config(self.check)
         self.setWindowTitle("Risk check")
         self.setMinimumWidth(520)
@@ -129,13 +132,18 @@ class CheckEditorDialog(QDialog):
         self.kind_combo = QComboBox()
         self.kind_combo.addItem("Features near the route (layer)",
                                 risk_scan.CHECK_KIND_FEATURES)
+        self.kind_combo.addItem("KP-range table (start/end KP rows)",
+                                risk_scan.CHECK_KIND_KP_TABLE)
         self.kind_combo.addItem("Route alter courses (course change)",
                                 risk_scan.CHECK_KIND_ROUTE_TURNS)
         self.kind_combo.setCurrentIndex(max(0, self.kind_combo.findData(
             risk_scan.check_kind(config))))
         self.kind_combo.currentIndexChanged.connect(self._sync_kind)
         self.kind_combo.setToolTip(
-            "Feature checks scan a registered input layer. The alter-course "
+            "Feature checks scan a registered input layer. A KP-range "
+            "table check registers each row of a table (with or without "
+            "geometry) over its start-end KP, quoted on a chosen RPL. "
+            "The alter-course "
             "check scans the route geometry itself: each A/C's course "
             "change (as in the Extract A/C Points algorithm) is assessed "
             "against the rules below — flag turns your burial tool cannot "
@@ -177,6 +185,13 @@ class CheckEditorDialog(QDialog):
             "attribute naming each feature (e.g. Name, ContactID)")
         form.addRow("Label attribute:", self.label_edit)
         layout.addLayout(form)
+
+        # KP-range tables: start/end fields, unit and reference RPL.
+        from .kp_table_form import KpTableForm
+        self.kp_group = QGroupBox("KP ranges")
+        kp_form = QFormLayout(self.kp_group)
+        self.kp_table_form = KpTableForm(kp_form, config, model)
+        layout.addWidget(self.kp_group)
 
         # Alter-course mode is deliberately simple: one threshold, one risk
         # level (set below). Main consequence of a sharp A/C is the burial
@@ -283,7 +298,8 @@ class CheckEditorDialog(QDialog):
         layer = resolve_input_layer(self.inputs,
                                     self.input_combo.currentData() or "")
         for widget in (self.attribute_edit, self.label_edit,
-                       self.filter_edit, self.rules_table):
+                       self.filter_edit, self.rules_table,
+                       *self.kp_table_form.widgets()):
             widget.set_layer(layer)
 
     def _accept(self) -> None:
@@ -302,6 +318,13 @@ class CheckEditorDialog(QDialog):
                     "without one the check is skipped at scan time. "
                     "Register layers on the Inputs tab first.")
                 return
+            if self.kind_combo.currentData() == risk_scan.CHECK_KIND_KP_TABLE:
+                layer = resolve_input_layer(
+                    self.inputs, self.input_combo.currentData() or "")
+                problems = self.kp_table_form.problems(layer)
+                if problems:
+                    QMessageBox.warning(self, "Burial Planner", " ".join(problems))
+                    return
             filter_problem = expression_problem(self.filter_edit.text())
             if filter_problem:
                 QMessageBox.warning(
@@ -329,18 +352,21 @@ class CheckEditorDialog(QDialog):
 
     def _sync_kind(self) -> None:
         turns = self.kind_combo.currentData() == risk_scan.CHECK_KIND_ROUTE_TURNS
+        table = self.kind_combo.currentData() == risk_scan.CHECK_KIND_KP_TABLE
         self.turns_group.setVisible(turns)
-        self.bands_group.setVisible(not turns)
+        self.kp_group.setVisible(table)
+        self.bands_group.setVisible(not turns and not table)
         self.attr_group.setVisible(not turns)
-        for widget in (self.input_combo, self.distance_spin,
-                       self.filter_edit, self.label_edit):
+        for widget in (self.input_combo, self.filter_edit, self.label_edit):
             widget.setEnabled(not turns)
+        self.distance_spin.setEnabled(not turns and not table)
         risk_label = self.tail_form.labelForField(self.default_combo)
         if risk_label is not None:
             risk_label.setText("Risk for flagged A/Cs:" if turns
                                else "Risk when nothing fires:")
         self.default_combo.setToolTip(
             "Every flagged A/C is recorded at this level." if turns else
+            "Applied to a row when no attribute rule fires." if table else
             "Applied when a feature is inside the search distance but no "
             "band or attribute rule fires.")
         if turns and not self.name_edit.text().strip():
@@ -353,11 +379,23 @@ class CheckEditorDialog(QDialog):
             or risk_scan.CHECK_KIND_FEATURES,
             "default_risk": self.default_combo.currentData() or "",
         }
+        table = self.kind_combo.currentData() == risk_scan.CHECK_KIND_KP_TABLE
         if turns:
             # Simple by design: every A/C at or above the threshold becomes
             # a hazard at default_risk. (Older configs with turn_abs
             # attribute rules keep scanning unchanged until re-saved here.)
             config["min_course_change_deg"] = self.min_cc_spin.value()
+        elif table:
+            config.update({
+                "input_id": self.input_combo.currentData() or "",
+                "filter_expression": self.filter_edit.text().strip(),
+                "label_attribute": self.label_edit.text().strip(),
+                "attribute": self.attribute_edit.text().strip(),
+            })
+            self.kp_table_form.apply(config)
+            rules = self.rules_table.rules()
+            if rules:
+                config["attribute_rules"] = rules
         else:
             config.update({
                 "input_id": self.input_combo.currentData() or "",
@@ -372,7 +410,8 @@ class CheckEditorDialog(QDialog):
             rules = self.rules_table.rules()
             if rules:
                 config["attribute_rules"] = rules
-        default_name = "A/C course change" if turns else "Risk check"
+        default_name = ("A/C course change" if turns
+                        else "KP-range hazards" if table else "Risk check")
         check = dict(self.check)
         check.update({
             "name": self.name_edit.text().strip() or default_name,
@@ -861,12 +900,15 @@ class RiskTab(QWidget):
                         > 5e-4)
             angle = hazard.get("crossing_angle_deg")
             level = hazard.get("risk") or ""
+            # KP-table rows have a range, not a measured offset.
+            from_table = str(hazard.get("feature_ref") or "").startswith("row:")
             values = [
                 "" if use_combos else schema.RISK_LABELS.get(level, ""),
                 "" if use_combos else schema.HAZARD_STATUS_LABELS.get(
                     hazard.get("status") or "", ""),
                 schema.format_kp(hazard.get("kp")),
                 schema.format_kp(end_kp) if is_range else "",
+                "" if from_table else
                 (f"{float(hazard.get('offset_m') or 0.0):+.1f}"
                  if not int(hazard.get("crossing") or 0) else "0.0"),
                 "✕" if int(hazard.get("crossing") or 0) else "",
@@ -1080,7 +1122,8 @@ class RiskTab(QWidget):
             "source_ref": "",
             "notes": "",
         }
-        dialog = CheckEditorDialog(check, self.model.inputs, self)
+        dialog = CheckEditorDialog(check, self.model.inputs, self,
+                                   model=self.model)
         if qt_exec(dialog) == DIALOG_ACCEPTED:
             checks = list(self.model.risk_checks) + [dialog.result_check()]
             self.model.save_risk_checks(checks, target_id=check["check_id"])
@@ -1090,7 +1133,7 @@ class RiskTab(QWidget):
         if index < 0 or index >= len(self.model.risk_checks):
             return
         dialog = CheckEditorDialog(self.model.risk_checks[index],
-                                   self.model.inputs, self)
+                                   self.model.inputs, self, model=self.model)
         if qt_exec(dialog) == DIALOG_ACCEPTED:
             checks = list(self.model.risk_checks)
             checks[index] = dialog.result_check()
@@ -1187,6 +1230,12 @@ class RiskTab(QWidget):
         # Load + index each distinct input layer once, however many checks
         # scan it (previously once per check).
         layer_cache: Dict[str, tuple] = {}
+        # KP-range tables: one RPL translation per reference RPL.
+        from ..rpl_reference import table_kp_map
+        translations: Dict = {}
+
+        def kp_reference(config: Dict):
+            return table_kp_map(self.model, config, translations)
         for check in checks:
             config = risk.check_config(check)
             if risk_scan.check_kind(config) == risk_scan.CHECK_KIND_ROUTE_TURNS:
@@ -1200,6 +1249,16 @@ class RiskTab(QWidget):
                 continue
             layer = map_layers.resolve_input_layer(
                 QgsProject.instance(), input_row)
+            if risk_scan.check_kind(config) == risk_scan.CHECK_KIND_KP_TABLE:
+                try:
+                    entries, notes = risk_scan.snapshot_kp_table(
+                        check, layer, kp_reference)
+                except risk_scan.RiskScanError as exc:
+                    warnings.append(str(exc))
+                    continue
+                warnings.extend(notes)
+                jobs.append((dict(check), entries))
+                continue
             try:
                 preloaded = None
                 layer_key = layer.id() if layer is not None else ""
