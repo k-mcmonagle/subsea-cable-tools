@@ -1,14 +1,15 @@
-"""Numeric investigation profiles and route coverage, independent of QGIS.
+"""Numeric ground datasets: depth profiles, live KP placement, colour classes.
 
-Source measurements never contain KPs. Assignments name investigations, so
-one profile can be used over several disconnected intervals or several plans.
-Depth support is explicit: point samples have bounded cells, never a linear
+Pure python (no QGIS). A dataset holds one variable (e.g. CPT su) for many
+investigations. Measurements never contain KPs: a separate KP-range or
+polygon layer, read live, says where along the route each investigation
+applies, so one profile can cover several disconnected intervals. Depth
+support is explicit: point samples get a bounded cell, never a linear
 interpolation or extrapolation across missing measurements.
 """
 from __future__ import annotations
 
 import bisect
-import json
 import math
 import re
 import uuid
@@ -19,8 +20,9 @@ from . import attribute_rules
 
 MISSING = {"", "na", "n/a", "null", "none", "nan", "-", "nodata"}
 
-ROLE_LABELS = {"source_id": "investigation ID", "depth": "depth", "start_kp": "start KP",
-               "end_kp": "end KP"}
+ROLE_LABELS = {"source_id": "investigation ID", "depth": "depth", "base": "depth base",
+               "value": "value"}
+COLOUR_MODES = ("continuous", "bands", "classes")
 
 
 def compact(text):
@@ -30,7 +32,7 @@ def compact(text):
 
 def number(value, *, optional=False, decimal_comma=False, missing=()):
     text = str(value if value is not None else "").strip()
-    if text.casefold() in MISSING | {str(v).casefold() for v in missing}:
+    if text.casefold() in MISSING | {str(v).strip().casefold() for v in missing if str(v).strip()}:
         if optional:
             return None
         raise ValueError("required number is missing")
@@ -42,30 +44,41 @@ def number(value, *, optional=False, decimal_comma=False, missing=()):
     return result
 
 
-def import_profiles(rows, mapping, *, variables=(), variable="", units="",
-                    depth_scale=1.0, sample_support=0.02, decimal_comma=False,
-                    missing=(), provenance=None):
-    """Import wide columns ``[(column, variable, units)]`` or long-form rows.
+# -- measurements ----------------------------------------------------------------
+def column_indices(headers, columns):
+    """``{role: index}`` from ``{role: header name}``; unknown names raise."""
+    out = {}
+    for role, name in (columns or {}).items():
+        if not name:
+            continue
+        if name not in headers:
+            raise ValueError(f"The source has no column named '{name}' "
+                             f"(the {ROLE_LABELS.get(role, role)} column).")
+        out[role] = headers.index(name)
+    return out
 
-    ``mapping`` maps roles to zero-based columns: source_id, depth, base
-    (optional interval bottom), variable/value/units (long format), flags.
-    Bad rows reject the import with row numbers; missing values are retained.
-    Point support is capped by sample_support and neighbouring midpoints.
+
+def import_profiles(rows, mapping, *, dataset_id="", variable="", units="", depth_scale=1.0,
+                    sample_support=0.02, decimal_comma=False, missing=(), provenance=None):
+    """One profile per investigation from ``rows`` (header row excluded).
+
+    ``mapping`` maps roles to zero-based columns: source_id, depth, value and
+    optionally base (interval bottom). Bad rows reject the import with their
+    row number; blank or missing-coded values stay missing, never zero. Point
+    support is capped by ``sample_support`` and neighbouring midpoints.
     """
     if not math.isfinite(depth_scale) or depth_scale <= 0:
         raise ValueError("Depth scale must be positive.")
     if not math.isfinite(sample_support) or sample_support <= 0:
         raise ValueError("Point sample support must be positive (metres).")
-    for role in ("source_id", "depth"):
+    for role in ("source_id", "depth", "value"):
         if mapping.get(role) is None:
-            raise ValueError(f"Map the {ROLE_LABELS.get(role, role)} column.")
-    if not variables and mapping.get("value") is None:
-        raise ValueError("Map a value column or select wide-format variables.")
+            raise ValueError(f"Choose the {ROLE_LABELS[role]} column.")
     grouped = defaultdict(list)
 
-    def cell(row, role, default=""):
+    def cell(row, role):
         index = mapping.get(role)
-        return str(row[index]).strip() if index is not None and index < len(row) else default
+        return str(row[index]).strip() if index is not None and index < len(row) else ""
 
     for line, row in enumerate(rows, 1):
         if not any(str(v).strip() for v in row):
@@ -79,28 +92,19 @@ def import_profiles(rows, mapping, *, variables=(), variable="", units="",
                     if mapping.get("base") is not None else None)
             if depth < 0 or (base is not None and base <= depth):
                 raise ValueError("depth must be nonnegative and base deeper than top")
-            values = ([(name, unit, row[col] if col < len(row) else "")
-                       for col, name, unit in variables] if variables else
-                      [(cell(row, "variable", variable), cell(row, "units", units), cell(row, "value"))])
-            for name, unit, raw in values:
-                name, unit = name.strip(), unit.strip()
-                if not name:
-                    raise ValueError("variable name is missing")
-                value = number(raw, optional=True, decimal_comma=decimal_comma, missing=missing)
-                flags = cell(row, "flags")
-                if value is None:
-                    flags = "; ".join(filter(None, (flags, "missing")))
-                grouped[source, name, unit].append({
-                    "depth": depth, "top": depth, "base": base, "value": value,
-                    "flags": flags, "row": line})
+            value = number(cell(row, "value"), optional=True, decimal_comma=decimal_comma,
+                           missing=missing)
+            grouped[source].append({"depth": depth, "top": depth, "base": base, "value": value,
+                                    "flags": "" if value is not None else "missing", "row": line})
         except (ValueError, TypeError) as exc:
             raise ValueError(f"Data row {line}: {exc}") from exc
     profiles = []
-    for (source, name, unit), samples in sorted(grouped.items()):
+    for source, samples in sorted(grouped.items()):
         samples.sort(key=lambda s: s["depth"])
         for i, sample in enumerate(samples):
             if i and sample["depth"] == samples[i - 1]["depth"]:
-                raise ValueError(f"{source} / {name}: duplicate depth {sample['depth']:g} m")
+                raise ValueError(f"{source}: depth {sample['depth']:g} m appears twice "
+                                 f"(data rows {samples[i - 1]['row']} and {sample['row']})")
             if sample["base"] is None:
                 depth = sample["depth"]
                 sample["top"] = max(0, depth - sample_support / 2,
@@ -109,51 +113,76 @@ def import_profiles(rows, mapping, *, variables=(), variable="", units="",
                                      (depth + samples[i + 1]["depth"]) / 2
                                      if i + 1 < len(samples) else math.inf)
             if i and sample["top"] < samples[i - 1]["base"] - 1e-10:
-                raise ValueError(f"{source} / {name}: overlapping depth intervals")
-        identity = json.dumps([source, name, unit], ensure_ascii=False)
+                raise ValueError(f"{source}: depth intervals overlap near {sample['top']:g} m")
+        identity = f"{dataset_id}␟{source}"
         profiles.append({"profile_id": str(uuid.uuid5(uuid.NAMESPACE_URL, identity)),
-                         "source_id": source, "variable": name, "units": unit,
+                         "source_id": source, "variable": variable, "units": units,
                          "samples": samples, "provenance": dict(provenance or {})})
     if not profiles:
-        raise ValueError("No profiles found.")
+        raise ValueError("The table has no data rows.")
     return profiles
 
 
-def import_assignments(rows, mapping, kp_map=None, *, kp_scale=1.0, decimal_comma=False,
-                       source_ref=""):
-    for role in ("source_id", "start_kp", "end_kp"):
-        if mapping.get(role) is None:
-            raise ValueError(f"Map the {ROLE_LABELS.get(role, role)} column.")
-    result = []
-    for line, row in enumerate(rows, 1):
-        try:
-            source = str(row[mapping["source_id"]]).strip()
-            a = number(row[mapping["start_kp"]], decimal_comma=decimal_comma) * kp_scale
-            b = number(row[mapping["end_kp"]], decimal_comma=decimal_comma) * kp_scale
-            if not source or b <= a:
-                raise ValueError("ID is required and end KP must exceed start KP")
-            start, end, flags = kp_map.map_range(a, b) if kp_map else (a, b, [])
-            if end <= start:
-                raise ValueError("KP mapping collapses or reverses the interval")
-            result.append({"source_id": source, "start_kp": start, "end_kp": end,
-                           "src_start_kp": a, "src_end_kp": b, "source_ref": source_ref,
-                           "flags": "; ".join(flags)})
-        except (ValueError, IndexError, TypeError) as exc:
-            raise ValueError(f"Assignment row {line}: {exc}") from exc
-    return result
+def profile_stats(profile):
+    """Per-investigation numbers for checks: depth range, counts, value range."""
+    samples = profile["samples"]
+    values = [s["value"] for s in samples if s["value"] is not None]
+    base = max((s["base"] for s in samples if math.isfinite(s["base"])), default=None)
+    return {"samples": len(samples), "missing": len(samples) - len(values),
+            "top": min((s["top"] for s in samples), default=None), "base": base,
+            "min": min(values) if values else None, "max": max(values) if values else None}
+
+
+def summary_text(profiles, units=""):
+    if not profiles:
+        return "No investigations."
+    stats = [profile_stats(p) for p in profiles]
+    samples = sum(s["samples"] for s in stats)
+    missing = sum(s["missing"] for s in stats)
+    lows = [s["min"] for s in stats if s["min"] is not None]
+    highs = [s["max"] for s in stats if s["max"] is not None]
+    base = max((s["base"] for s in stats if s["base"] is not None), default=0)
+    text = (f"{len(profiles)} investigation(s), {samples} depth sample(s) "
+            f"({missing} missing), depth 0–{base:g} m")
+    if lows:
+        text += f", values {min(lows):g}–{max(highs):g} {units}".rstrip()
+    return text
+
+
+# -- placement along the route ----------------------------------------------------
+def ranges_to_assignments(ranges, ids, source_ref=""):
+    """Assignments from translated ``kp_table.KpRange`` items.
+
+    ``ids`` maps a range's ``ref`` to its investigation ID ("" = missing).
+    Returns ``(assignments, notes)``; rows without an ID are counted.
+    """
+    out, unnamed = [], 0
+    for item in ranges:
+        source = str(ids.get(item.ref) or "").strip()
+        if not source:
+            unnamed += 1
+            continue
+        if item.hi <= item.lo:
+            continue
+        out.append({"source_id": source, "start_kp": item.lo, "end_kp": item.hi,
+                    "src_start_kp": min(item.source_start, item.source_end),
+                    "src_end_kp": max(item.source_start, item.source_end),
+                    "flags": ", ".join(item.flags), "source_ref": source_ref})
+    notes = [f"{unnamed} KP range row(s) have no investigation ID and were skipped"] if unnamed else []
+    return out, notes
 
 
 def coverage_runs(assignments):
     """Sweep into disjoint runs; keep every conflicting assignment visible.
 
     Adjacent boundaries are half open. Overlaps are ambiguous even when IDs
-    match; silently choosing the last polygon would conceal a data problem.
+    match; silently choosing one range would conceal a data problem.
     """
     events = defaultdict(lambda: [[], []])
     for i, row in enumerate(assignments):
         a, b = row["start_kp"], row["end_kp"]
         if not (math.isfinite(a) and math.isfinite(b) and b > a):
-            raise ValueError("Assignment intervals must be finite and increasing.")
+            raise ValueError("KP ranges must be finite and increasing.")
         events[a][1].append(i)
         events[b][0].append(i)
     active, runs, previous = set(), [], None
@@ -167,28 +196,67 @@ def coverage_runs(assignments):
     return runs
 
 
-def assignment_issues(assignments, profiles, bounds=None):
-    sources = {p["source_id"] for p in profiles}
-    issues = []
+def unmatched_ids(ids, known):
+    """IDs with no imported profile, each with a near match when one exists."""
+    folded = {compact(k): k for k in known}
+    out = []
+    for source in sorted(set(ids) - set(known)):
+        near = folded.get(compact(source))
+        out.append(f"{source} (did you mean {near}?)" if near else source)
+    return out
+
+
+def check_dataset(profiles, assignments, bounds=None, scope=None):
+    """``(rows, notes)``: one row per investigation and route-level findings.
+
+    Rows carry the profile statistics and the KP ranges the investigation is
+    placed on. Notes list unmatched IDs both ways, ranges beyond the route,
+    overlaps and the share of the scope that is covered.
+    """
+    by_source = defaultdict(list)
     for row in assignments:
-        if row["source_id"] not in sources:
-            issues.append(f"Unmatched ID: {row['source_id']}")
-        if bounds and (row["start_kp"] < bounds[0] or row["end_kp"] > bounds[1]):
-            issues.append(f"{row['source_id']}: assignment extends beyond the selected route")
-    for a, b, active in coverage_runs(assignments):
-        if len(active) > 1:
-            issues.append(f"Overlap KP {a:.3f}–{b:.3f}: " + ", ".join(assignments[i]["source_id"] for i in active))
-    assigned = {r["source_id"] for r in assignments}
-    issues.extend(f"Unassigned profile: {s}" for s in sorted(sources - assigned))
-    return list(dict.fromkeys(issues))
+        by_source[row["source_id"]].append(row)
+    rows = []
+    for profile in sorted(profiles, key=lambda p: p["source_id"]):
+        placed = sorted(by_source.get(profile["source_id"], []), key=lambda r: r["start_kp"])
+        stats = profile_stats(profile)
+        rows.append(dict(stats, source_id=profile["source_id"],
+                         ranges=[(r["start_kp"], r["end_kp"]) for r in placed],
+                         status="placed" if placed else "no KP range"))
+    notes = []
+    known = {p["source_id"] for p in profiles}
+    missing = unmatched_ids(by_source, known)
+    if missing:
+        notes.append(f"{len(missing)} KP range ID(s) have no measurements: " + ", ".join(missing[:12])
+                     + (" …" if len(missing) > 12 else ""))
+    unplaced = [r["source_id"] for r in rows if not r["ranges"]]
+    if unplaced:
+        notes.append(f"{len(unplaced)} investigation(s) have no KP range: " + ", ".join(unplaced[:12])
+                     + (" …" if len(unplaced) > 12 else ""))
+    if bounds:
+        beyond = sorted({r["source_id"] for r in assignments
+                         if r["start_kp"] < bounds[0] - 1e-9 or r["end_kp"] > bounds[1] + 1e-9})
+        if beyond:
+            notes.append("KP ranges extend beyond the route: " + ", ".join(beyond[:12]))
+    runs = coverage_runs(assignments)
+    overlaps = [(a, b, active) for a, b, active in runs if len(active) > 1]
+    if overlaps:
+        shown = "; ".join(f"KP {a:.3f}–{b:.3f} ({', '.join(assignments[i]['source_id'] for i in active)})"
+                          for a, b, active in overlaps[:6])
+        notes.append(f"{len(overlaps)} overlapping stretch(es), drawn amber with no value chosen: " + shown)
+    if scope and scope[1] > scope[0]:
+        lo, hi = scope
+        covered = sum(max(0.0, min(b, hi) - max(a, lo)) for a, b, _active in runs)
+        notes.append(f"KP ranges cover {covered:.3f} of {hi - lo:.3f} km of the plan scope "
+                     f"({100 * covered / (hi - lo):.0f}%).")
+    return rows, notes
 
 
 class ProfileIndex:
     """Bisected queries over route runs and measured depth supports."""
-    def __init__(self, profiles, assignments, variable):
+    def __init__(self, profiles, assignments):
         self.assignments = assignments
-        self.profiles = {p["source_id"]: p for p in profiles
-                         if (p["variable"], p["units"]) == tuple(variable)}
+        self.profiles = {p["source_id"]: p for p in profiles}
         self.runs = coverage_runs(assignments)
         self.starts = [r[0] for r in self.runs]
         self.depths = {source: [s["top"] for s in p["samples"]] for source, p in self.profiles.items()}
@@ -210,14 +278,54 @@ class ProfileIndex:
                 for j in self.runs[i][2]]
 
     def limits(self):
-        # Full assigned dataset, independent of viewport and depth limits.
-        assigned = {a["source_id"] for a in self.assignments}
-        values = [s["value"] for source, p in self.profiles.items() if source in assigned
+        # Every placed measurement, independent of viewport and depth limits.
+        placed = {a["source_id"] for a in self.assignments}
+        values = [s["value"] for source, p in self.profiles.items() if source in placed
                   for s in p["samples"] if s["value"] is not None]
         if not values:
             return 0.0, 1.0
         lo, hi = min(values), max(values)
         return (lo, hi) if hi > lo else (lo - max(abs(lo) * .01, .5), hi + max(abs(hi) * .01, .5))
+
+    def cells(self, classes=None, name="value"):
+        """Every plotted cell, for export: KP run × depth sample.
+
+        Overlapping stretches list each investigation with status "overlap";
+        missing values keep an empty value and status "missing".
+        """
+        out = []
+        for a, b, active in self.runs:
+            for j in active:
+                assignment = self.assignments[j]
+                profile = self.profiles.get(assignment["source_id"])
+                if profile is None:
+                    out.append({"source_id": assignment["source_id"], "kp_from": a, "kp_to": b,
+                                "depth_top_m": None, "depth_base_m": None, "value": None,
+                                "class": "", "status": "no measurements"})
+                    continue
+                for sample in profile["samples"]:
+                    item = class_of(sample["value"], classes) if classes else None
+                    status = "overlap" if len(active) > 1 else ("missing" if sample["value"] is None else "ok")
+                    out.append({"source_id": assignment["source_id"], "kp_from": a, "kp_to": b,
+                                "depth_top_m": sample["top"],
+                                "depth_base_m": sample["base"] if math.isfinite(sample["base"]) else None,
+                                "value": sample["value"],
+                                "class": class_label(item, name) if item else "",
+                                "status": status})
+        return out
+
+
+# -- colours -----------------------------------------------------------------------
+def colour_settings(colours):
+    """Display colours with defaults: mode, ramp, bands, limits, classes."""
+    colours = dict(colours or {})
+    mode = colours.get("mode")
+    return {"mode": mode if mode in COLOUR_MODES else "continuous",
+            "ramp": colours.get("ramp") or "Viridis",
+            "bands": max(2, int(colours.get("bands") or 5)),
+            "auto": bool(colours.get("auto", True)),
+            "min": float(colours.get("min") or 0.0), "max": float(colours.get("max") or 1.0),
+            "classes": list(colours.get("classes") or [])}
 
 
 def normalise_classes(rows):
@@ -234,10 +342,10 @@ def normalise_classes(rows):
                 "max_inclusive": bool(row.get("max_inclusive", True))}
         for key in ("min", "max"):
             if item[key] is not None:
-                number = attribute_rules.to_number(item[key])
-                if number is None:
+                value = attribute_rules.to_number(item[key])
+                if value is None:
                     raise ValueError(f"Class {n}: '{item[key]}' is not a number.")
-                item[key] = number
+                item[key] = value
         if item["min"] is None and item["max"] is None:
             raise ValueError(f"Class {n}: enter a From or To value.")
         problem = attribute_rules.validate_rule(item)
@@ -251,6 +359,17 @@ def normalise_classes(rows):
     if not out:
         raise ValueError("Add at least one class.")
     return out
+
+
+def display_classes(colours):
+    """Validated classes when the colours use custom classes, else None."""
+    settings = colour_settings(colours)
+    if settings["mode"] != "classes" or not settings["classes"]:
+        return None
+    try:
+        return normalise_classes(settings["classes"])
+    except ValueError:
+        return None
 
 
 def classes_from_breaks(breaks, colours):
@@ -297,7 +416,6 @@ def class_coverage(classes, name="value"):
     for (lo, hi), row in ordered:
         if lo[0] > reach[0] or (lo[0] == reach[0] and not lo[1] and not reach[1]):
             if not (lo[0] == -math.inf and reach[0] == -math.inf):
-                # Uncovered between the reach and this lower bound.
                 gaps.append(text((reach[0], not reach[1]), (lo[0], not lo[1])))
         elif reach_row is not None and (lo[0] < reach[0] or (lo[0] == reach[0] and lo[1] and reach[1])):
             overlaps.append(f"rows {reach_row} and {row}")
@@ -311,36 +429,3 @@ def class_coverage(classes, name="value"):
     if overlaps:
         notes.append("Overlapping " + "; ".join(overlaps) + ": the first matching row's colour is used.")
     return notes
-
-
-def scheme_key(variable):
-    return json.dumps(list(variable or ["", ""]), ensure_ascii=False)
-
-
-def display_mode(settings):
-    """Colour mode of saved display settings; older plans stored only bands."""
-    mode = settings.get("colour_mode")
-    if mode in ("continuous", "bands", "classes"):
-        return mode
-    return "bands" if (settings.get("bands") or 0) >= 2 else "continuous"
-
-
-def display_classes(settings):
-    """The selected variable's classes when classes are shown, else None."""
-    if display_mode(settings) != "classes":
-        return None
-    scheme = (settings.get("class_schemes") or {}).get(scheme_key(settings.get("variable")))
-    try:
-        return normalise_classes(scheme) if scheme else None
-    except ValueError:
-        return None
-
-
-def unmatched_ids(ids, known):
-    """IDs with no imported profile, each with a near match when one exists."""
-    folded = {compact(k): k for k in known}
-    out = []
-    for source in sorted(set(ids) - set(known)):
-        near = folded.get(compact(source))
-        out.append(f"{source} (did you mean {near}?)" if near else source)
-    return out

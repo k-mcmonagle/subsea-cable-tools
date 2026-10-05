@@ -1,156 +1,112 @@
-# Numeric Ground Model profiles
+# Numeric Ground Model datasets
 
-Open **Burial Planner → Planning → Ground Model**, and select **Numeric properties**.
-The existing **Soil classes** view and editing tools remain available. Only the
-top-level Acquired Data, Assessment and Reporting tabs are disabled while they
-are under development.
+Open **Burial Planner → Planning → Ground Model** and set **Display** to
+**Numeric datasets**. A numeric dataset draws one measured quantity — for
+example CPT undrained shear strength — by KP along the route and depth below
+seabed, coloured by value. The **Soil classes** view and its tools are
+unchanged.
 
-The workflow has three steps, matching the numbered buttons:
+A dataset has three parts, one tab each in the **Add…** / **Edit…** dialog:
 
-1. **Import profiles…**: one table of depth/value rows for all investigations.
-2. **Assign KP ranges…**: a table or QGIS layer naming where along the route each
-   investigation applies (or **Assign by polygons…**).
-3. Choose the variable, depth range and **Colours**: a continuous ramp, equal
-   bands, or **Custom classes** with value ranges and colours you define.
+1. **Measurements**: a table of depth readings for all investigations.
+2. **KP ranges**: a layer saying where along the route each investigation applies.
+3. **Colours**: a continuous ramp, equal bands, or your own value classes.
 
-## 1. Import investigation measurements
+Datasets are shared by every plan in the project, like soil classes. Each plan
+remembers which dataset it shows and its depth window. Dataset edits are not
+part of a plan's history, so a plan rollback does not undo them.
 
-Choose **Import profiles…** and either a CSV, TSV, delimited text, XLSX or XLSM
-file or a layer/table already loaded in QGIS. Select the worksheet and header
-row, then map each column using the preview. Nothing is mapped from column
-names: you choose every column. A mapped column stays selected when you change
-the header row or worksheet and the same header is still present. The line
-above the **Import** button checks the mapping as you change it and reports the
-number of investigations, variables and depth samples (or the first problem
-found). Identifiers are trimmed and matched exactly, including case and leading
-zeros. Map a quality/flags column only when its values mark exceptions: every
-cell with a non-blank flag is hatched.
+## 1. Measurements
 
-A long-format file can contain several investigations and variables:
+Choose a CSV, TSV, delimited text, XLSX or XLSM file, or a layer/table already
+loaded in QGIS. Pick the worksheet and header row, then choose four columns
+using the preview. Nothing is chosen for you from the column names:
 
-```csv
-Investigation,Depth,Property,Value,Units,Quality
-CPT-01,0.00,su,15,kPa,
-CPT-01,0.02,su,18,kPa,partial
-CPT-01,0.04,su,,kPa,missing reading
-CPT-02,0.00,su,25,kPa,
-```
+| Item | What to choose |
+|---|---|
+| Investigation ID | The column naming each investigation (e.g. the CPT number). |
+| Depth (or interval top) | Depth below seabed of each reading, or the top of its interval. |
+| Interval base | Only when each reading covers a depth interval; otherwise leave *(single depths)*. |
+| Value | The measured value. |
 
-Map Investigation → Investigation ID, Depth → Depth, Property → Variable,
-Value → Value, Units → Units, and Quality → Quality / coverage flags. For a
-single-variable file, leave Variable and Units unmapped and type their names
-in the two text boxes (for example `su` and `kPa`).
+Enter the **Variable** name and **Units** at the top of the dialog (for
+example the symbol and unit used in your report). They label the legend, hover
+and class names. Each dataset holds one variable; to show another quantity from
+the same table, add a second dataset from the same file with a different Value
+column.
 
-For a wide table, select **Wide format / multiple value columns**, tick each
-measurement column and enter its variable name and unit:
+- **Depth unit** converts m, cm or mm to metres.
+- **Single-depth reading thickness** applies only without an interval base: each
+  reading is drawn this thick at most, clipped halfway to its neighbours. Set it
+  to the reading spacing. Larger gaps stay blank; nothing is interpolated.
+- Blank cells, `NA`-style text and any **missing-value codes** you list stay
+  missing (grey), never zero.
+- Two readings at the same depth, overlapping intervals, a negative depth or
+  text in a number column stop the import with the data row number.
 
-```csv
-TestID,Depth_cm,ConeResistance,SleeveFriction
-BH-01,0,2.1,45
-BH-01,2,2.3,48
-```
+The line under the form checks your choices as you make them, for example
+`✓ 350 investigation(s), 105000 depth sample(s) (420 missing), depth 0–3 m,
+values 0.4–310 kPa`, or names the first problem.
 
-Map TestID and Depth_cm, choose depth units **cm**, then include ConeResistance
-as `qc / MPa` and SleeveFriction as `fs / kPa`. Different units remain separate
-selections: the tool does not silently combine or convert numeric values.
-Depth units m, cm and mm are converted to metres below seabed. Depth must be
-nonnegative. Select comma decimals for such deliveries; additional missing
-tokens, such as `-9999;-999`, are separated by semicolons.
+Measurements are copied into the project's burial GeoPackage when you save.
+The dataset remembers the source and your column choices. If the source file
+or layer changes afterwards, the status line says so, and **Reload** re-reads
+it with the same choices (a renamed column is reported rather than guessed).
+IDs are matched exactly, including case, spaces and leading zeros.
 
-For interval measurements, map both Depth / interval top and Interval base.
-Otherwise, each point has bounded depth support: the **Point sample support**
-setting is the maximum full thickness in metres (default 0.02 m), clipped at
-neighbouring sample midpoints and at the seabed. Set it to the delivered sample
-spacing. Larger gaps remain blank. No linear interpolation or extension to the
-next investigation is performed. Duplicate depths, overlapping depth intervals,
-invalid numbers and missing IDs reject the import with a row/source diagnostic.
-Blank/NA/nonfinite measurement values remain missing, never zero.
+## 2. KP ranges
 
-Measurements are saved inside the project's burial GeoPackage, independent of
-route assignments. Reimporting the same ID, variable and unit replaces that
-profile **for every plan using it**; other profiles remain untouched. Use a
-distinct investigation ID for a separate revision you want to retain. File,
-worksheet, mapping, depth support and flags remain available in source inspection.
-Shared source replacements are not undone by rolling back an individual plan.
+Choose how investigations are placed along the route:
 
-## 2. Assign investigations to route intervals
+- **KP-range layer or table**: any loaded layer or table with an ID field and
+  start/end KP fields (geometry is not used). Choose the KP unit and the RPL
+  the KPs are quoted on, as for the Exclusions and Risk Profile KP-range tables.
+  KPs on another RPL are translated onto the plan's route by seabed position;
+  flagged translations are listed.
+- **Polygon layer**: each polygon's ID applies where the route crosses it.
+  Holes and repeated crossings give separate ranges.
 
-Assignments are saved separately for each plan. Importing measurements alone
-does not guess where they apply. Choose either:
+The layer is **read live**: editing it in QGIS (including uncommitted edits)
+updates the plot without re-importing. An investigation may have several
+disconnected ranges. Ranges that overlap are drawn amber and no value is chosen.
+The check line lists IDs in the layer that have no measurements, with a near
+match where only case, spaces or punctuation differ.
 
-- **Assign by polygons…**: select a QGIS polygon layer and its investigation ID
-  field. The layer is transformed into the selected route's CRS; every route
-  crossing is measured using that route's KP distance model and start datum.
-  Holes, repeated crossings and disconnected route parts retain separate intervals.
-  Empty/invalid geometry rejects assignment. Polygons without IDs or route
-  crossings are reported. These are saved assignment snapshots; rerun assignment
-  after editing the polygon layer.
-- **Assign KP ranges…**: map investigation ID, start KP and end KP from a
-  CSV/TSV/Excel table or from any loaded QGIS layer or table (geometry is not
-  used). Choose km or m and specify the source KP reference using
-  the existing current-route / RPL revision / constant shift / matched-pairs
-  controls. The check line lists IDs with no imported profile and suggests a
-  near match where only case, spaces or punctuation differ. Delivered KPs and
-  mapping flags are retained.
+## 3. Colours
 
-```csv
-Investigation,FromKP,ToKP
-CPT-01,10.000,11.500
-CPT-01,12.000,12.500
-CPT-02,12.500,14.000
-```
+- **Continuous ramp** or **Equal bands** (2–32 bands), with limits from all
+  placed measurements or limits you enter.
+- **Custom classes**: rows edited like the Exclusions value ranges: **From**
+  with ≥ or >, **To** with < or ≤, either side blank for an open-ended class.
+  Rows are checked in order and the first matching row's colour is used.
+  **Create classes** turns break values into classes (below the first break,
+  ≥ lower and < upper between breaks, and above the last), coloured from the
+  chosen ramp; adjust the bounds and double-click a colour to change it. The
+  summary lists each class with its number and share of samples, samples
+  outside every class (drawn dark grey), uncovered ranges and overlapping rows.
 
-Each assignment operation replaces the plan's complete assignment table. Repeated
-IDs are allowed over disconnected intervals. **Review assignments…** lists all
-intervals, delivery references, unmatched IDs, unassigned sources, out-of-route
-intervals and overlapping assignments. Overlaps (including repeated IDs) are
-drawn as amber hatching; no investigation wins silently. Adjacent intervals
-share a boundary without overlapping. Assignments are half-open at their ends.
+## Reading and checking the plot
 
-Plan duplication copies assignments and display settings while sharing the
-original measurements. Assignment/display edits use the normal plan history.
-Changing the route with **keep seabed positions** re-references assignments along
-with the other plan data, retaining the original delivered KPs and new mapping
-flags. **Keep KP numbers** retains their numbers, as for the other plan data.
+KP runs horizontally and depth increases downward; the KP axis follows the
+bathymetry view and the dashed line is the target burial depth. Set the depth
+window with **Depth from / to** and **Apply depth**.
 
-## 3. Read the numeric view
+- Colour: a reading. Grey: a missing reading. Dark grey: outside every class.
+- Amber hatching: overlapping KP ranges. Blank: no KP range, or no reading at that depth.
 
-Select a variable/unit pair, depth limits and one of three **Colours** modes:
+Hover reports the investigation, its KP range, the value, class and the depth
+the reading is drawn over. Click a range to plot that investigation's readings
+with their source rows.
 
-- **Continuous ramp** or **Equal bands** (2–32 equal-width bands). Automatic
-  colour limits use all measured values for the selected variable in assigned
-  investigations, independent of the visible KP/depth window. Manual limits clip
-  colours at the chosen endpoints.
-- **Custom classes**: value ranges with a colour each, edited with the same
-  rows as the Exclusions value ranges: **From** with ≥ or >, **To** with < or ≤,
-  either side blank for an open-ended class. Rows are checked in order and the
-  first matching row's colour is used. **Create classes** turns a list of break
-  values into one class below the first break, one between each pair (≥ lower,
-  < upper) and one above the last, coloured from the chosen ramp; adjust the
-  bounds and double-click a colour to change it. A summary under the table lists
-  each class with its number and share of assigned samples, values outside every
-  class (drawn dark grey), uncovered ranges and overlapping rows. Each variable
-  keeps its own classes, and the legend and hover readout name the class.
+- **Check…** lists every investigation (depth range, samples, missing, min,
+  max, KP ranges on this route) with route findings: IDs without measurements,
+  investigations without a KP range, ranges beyond the route, overlaps and the
+  share of the plan scope covered. **Export this table…** saves it as CSV.
+- **Export cells…** writes every plotted cell (investigation, KP from/to,
+  depth top/base, value, class, status) to CSV for an independent check.
+- **Remove…** deletes the dataset and its stored measurements from the
+  project; the source file and KP layer are not touched. Plans that showed it
+  are listed first.
 
-Use **Apply display** after editing depth or manual colour limits. Settings are
-saved with the plan; panning and zooming never change the colour scale.
-
-KP runs horizontally and depth increases downward. KP remains linked to the
-existing bathymetry view, and the dashed target burial-depth line follows the
-plan's default and KP-range targets.
-
-- Blank: no route assignment or no measured depth support.
-- Grey: missing measurement or no matching source/variable.
-- Hatching: retained quality/partial flags; amber hatching marks route overlap.
-
-Hover reports source ID, sample depth, value, units, depth support, assignment
-coverage and flags. Click an assigned interval or use **Inspect source…** to
-open the original measurements and their depth plot, including nulls and flags.
-Overlapping assignments expose each source without choosing a value.
-
-Rendering uses a single graphics item with cached source strips sampled at
-screen-pixel centres; work scales with visible sources and screen height rather
-than one graphics object per measurement. Features finer than a pixel require
-depth zoom to inspect. Hover and the source table always query the original
-measurements. Numeric imports are a display/inspection capability; they do not
-alter soil classes or automatically derive burial design conclusions.
+Numeric datasets are for display and checking; they do not change soil
+classes or feed burial analysis.

@@ -89,7 +89,7 @@ class GroundTab(QWidget):
 
         intro = QLabel(
             "Ground conditions by KP and depth below seabed. Select soil classes "
-            "or numeric investigation profiles. The KP axis follows bathymetry; "
+            "or a numeric dataset (e.g. CPT results). The KP axis follows bathymetry; "
             "the dashed line shows target burial depth.")
         intro.setWordWrap(True)
         intro.setStyleSheet(ui_helpers.hint_style())
@@ -98,7 +98,7 @@ class GroundTab(QWidget):
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("Display:"))
         self.display_mode = QComboBox()
-        self.display_mode.addItems(["Soil classes", "Numeric properties"])
+        self.display_mode.addItems(["Soil classes", "Numeric datasets"])
         mode_row.addWidget(self.display_mode)
         mode_row.addStretch()
         layout.addLayout(mode_row)
@@ -240,7 +240,7 @@ class GroundTab(QWidget):
         self.numeric.setVisible(index == 1)
         self.soil_table_pane.setVisible(index == 0)
         self.plot_hint.setText(
-            "Hover for source ID, depth, value, units and coverage; click an assigned interval to inspect its source profile."
+            "Hover for investigation, depth, value and class; click a KP range to plot that investigation's readings."
             if index else "Hover for KP / depth / unit; click to select the soil unit and go to that KP.")
         for widget in (self.import_button, self.export_button, self.rereference_button,
                        self.classes_button, self.show_map, self.status_label):

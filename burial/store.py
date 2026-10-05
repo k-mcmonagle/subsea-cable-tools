@@ -656,22 +656,63 @@ class BurialStore:
         self._replace_plan_rows(schema.TABLE_SECTION, plan_id, normalised)
 
     # -- ground model --------------------------------------------------------
-    def list_numeric_profiles(self) -> List[Dict]:
+    def list_ground_datasets(self) -> List[Dict]:
+        """Numeric datasets (project-scoped), ``config`` decoded."""
+        datasets = []
+        for row in self.read_table(schema.TABLE_GROUND_DATASET):
+            try:
+                row["config"] = json.loads(row.pop("config_json") or "{}")
+            except ValueError:
+                row["config"] = {}
+            datasets.append(row)
+        datasets.sort(key=lambda r: (int(r.get("seq") or 0), str(r.get("name") or "").casefold()))
+        return datasets
+
+    def save_ground_dataset(self, dataset: Dict, profiles=None) -> str:
+        """Insert or update one dataset; ``profiles`` (when given) replace its
+        measurements. Call inside a transaction so both land together."""
+        row = {key: dataset.get(key) for key in ("dataset_id", "name", "variable", "units", "seq")}
+        row["dataset_id"] = row["dataset_id"] or schema.new_id()
+        row["seq"] = int(row.get("seq") or 0)
+        row["config_json"] = json.dumps(dataset.get("config") or {}, allow_nan=False)
+        row["updated_utc"] = schema.utc_now_iso()
+        self.upsert_rows(schema.TABLE_GROUND_DATASET, [row])
+        if profiles is not None:
+            self.replace_numeric_profiles(row["dataset_id"], profiles)
+        return row["dataset_id"]
+
+    def delete_ground_dataset(self, dataset_id: str) -> None:
+        """Remove a dataset and its measurements (call inside a transaction)."""
+        self.replace_numeric_profiles(dataset_id, [])
+        self.delete_rows(schema.TABLE_GROUND_DATASET, [dataset_id])
+
+    def list_numeric_profiles(self, dataset_id: Optional[str] = None) -> List[Dict]:
         profiles = []
         for row in self.read_table(schema.TABLE_GROUND_PROFILE):
+            if dataset_id is not None and str(row.get("dataset_id") or "") != dataset_id:
+                continue
             row["samples"] = json.loads(row.pop("samples_json") or "[]")
             row["provenance"] = json.loads(row.pop("provenance_json") or "{}")
             profiles.append(row)
         return profiles
 
-    def save_numeric_profiles(self, profiles) -> None:
+    def replace_numeric_profiles(self, dataset_id: str, profiles) -> None:
+        """Replace every measurement of one dataset (atomic in SQL mode)."""
         rows = []
         for profile in profiles:
             row = {key: profile[key] for key in ("profile_id", "source_id", "variable", "units")}
+            row["dataset_id"] = dataset_id
             row["samples_json"] = json.dumps(profile["samples"], allow_nan=False)
             row["provenance_json"] = json.dumps(profile.get("provenance", {}), allow_nan=False)
             rows.append(row)
-        self.upsert_rows(schema.TABLE_GROUND_PROFILE, rows)
+        conn = self._sql()
+        if conn is not None:
+            gpkg_sql.replace_where(conn, schema.TABLE_GROUND_PROFILE, "dataset_id = ?",
+                                   (dataset_id,), rows)
+            return
+        kept = [r for r in self.read_table(schema.TABLE_GROUND_PROFILE)
+                if str(r.get("dataset_id") or "") != dataset_id]
+        self.write_table(schema.TABLE_GROUND_PROFILE, kept + rows)
 
     def list_ground_units(self, plan_id: str) -> List[Dict]:
         rows = self.read_plan_table(schema.TABLE_GROUND_UNIT, plan_id)
@@ -923,9 +964,31 @@ def _migrate_v6_to_v7(store: BurialStore) -> None:
                                 rule_rows)
 
 
+def _migrate_v11_to_v12(store: BurialStore) -> None:
+    """Group numeric profiles imported before datasets into one dataset per
+    variable/unit, so they can be inspected and removed; their KP ranges must
+    be chosen again (the earlier per-plan assignment copies are not live)."""
+    rows = store.read_table(schema.TABLE_GROUND_PROFILE)
+    datasets: Dict[tuple, Dict] = {}
+    for row in rows:
+        if row.get("dataset_id"):
+            continue
+        key = (str(row.get("variable") or ""), str(row.get("units") or ""))
+        if key not in datasets:
+            label = f"{key[0]} ({key[1] or 'unitless'})"
+            datasets[key] = {"dataset_id": schema.new_id(), "name": f"{label} — earlier import",
+                             "variable": key[0], "units": key[1], "seq": len(datasets),
+                             "config": {"legacy": True}}
+        row["dataset_id"] = datasets[key]["dataset_id"]
+    store._write_table_rows(schema.TABLE_GROUND_PROFILE, schema.GROUND_PROFILE_FIELDS, rows)
+    for dataset in datasets.values():
+        store.save_ground_dataset(dataset)
+
+
 # Maps a starting schema version to the function upgrading it one step.
 MIGRATIONS: Dict[int, object] = {1: _migrate_v1_to_v2, 3: _migrate_v3_to_v4,
-                                 5: _migrate_v5_to_v6, 6: _migrate_v6_to_v7}
+                                 5: _migrate_v5_to_v6, 6: _migrate_v6_to_v7,
+                                 11: _migrate_v11_to_v12}
 
 
 def _repoint_copied_row(table: str, row: Dict,

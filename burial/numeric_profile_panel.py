@@ -1,148 +1,112 @@
-"""Numeric Ground Model controls; source data and plan assignments stay separate."""
+"""Numeric Ground Model controls: choose, define, check and remove datasets.
+
+Datasets are project-scoped (shared by every plan, like soil classes and
+not part of a plan's history). A plan stores only which dataset it shows and
+its depth window. KP placement is read live from the dataset's layer on every
+refresh, so edits to that layer show without re-importing.
+"""
 import json
 
-from qgis.core import QgsProject
 from qgis.PyQt.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
-    QFormLayout, QHBoxLayout, QLabel, QMessageBox, QPushButton,
-    QSpinBox, QTableView, QVBoxLayout, QWidget,
+    QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel, QMessageBox, QPushButton,
+    QVBoxLayout, QWidget,
 )
 
-from ..qgis_compat import BUTTON_BOX_CANCEL, BUTTON_BOX_OK, DIALOG_ACCEPTED, qt_exec
-from . import numeric_profiles as numeric
-from .numeric_profile_dialogs import ColourClassesDialog, NumericImportDialog, RowsModel, source_dialog
-from .numeric_profile_geometry import polygon_assignments
-from .numeric_profile_plot import RAMPS
-
-COLOUR_MODES = (("continuous", "Continuous ramp"), ("bands", "Equal bands"), ("classes", "Custom classes"))
+from ..qgis_compat import DIALOG_ACCEPTED, MESSAGEBOX_NO, MESSAGEBOX_YES, qt_exec
+from . import numeric_datasets as sources, numeric_profiles as numeric, ui_helpers
+from .numeric_profile_dialogs import DatasetDialog, check_dialog, export_csv, source_dialog
 
 
 class NumericProfilePanel(QWidget):
     def __init__(self, model, dock, plot, parent=None):
         super().__init__(parent)
         self.model, self.dock, self.plot = model, dock, plot
-        self.profiles = []
+        self.datasets, self.profiles, self.assignments, self.notes = [], [], [], []
         self.state = {}
         self.active = False
-        self._loaded = False
+        self._profiles_key = None
+        self._watched = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         row = QHBoxLayout()
-        for label, callback in (("1. Import profiles…", self._import_profiles),
-                                ("2. Assign KP ranges…", self._import_assignments),
-                                ("Assign by polygons…", self._polygons),
-                                ("Review assignments…", self._review),
-                                ("Inspect source…", self._inspect)):
+        self.dataset = QComboBox()
+        self.dataset.setMinimumWidth(220)
+        self.dataset.setToolTip("Numeric datasets are shared by every plan in this project.")
+        row.addWidget(QLabel("Dataset"))
+        row.addWidget(self.dataset, 1)
+        self.buttons = {}
+        for key, label, tip, callback in (
+                ("add", "Add…", "Define a dataset: measurements, KP ranges and colours.", self._add),
+                ("edit", "Edit…", "Change the dataset's measurements, KP ranges or colours.", self._edit),
+                ("reload", "Reload", "Re-read the measurements from their source with the saved choices.",
+                 self._reload),
+                ("remove", "Remove…", "Delete the dataset and its measurements from this project.", self._remove),
+                ("check", "Check…", "Per-investigation table and coverage findings.", self._check),
+                ("export", "Export cells…", "Write every plotted cell (KP, depth, value, class) to CSV.",
+                 self._export)):
             button = QPushButton(label)
+            button.setToolTip(tip)
             button.clicked.connect(callback)
+            self.buttons[key] = button
             row.addWidget(button)
         layout.addLayout(row)
-        controls = QHBoxLayout()
-        self.variable = QComboBox()
-        self.variable.setMinimumWidth(120)
-        self.ramp = QComboBox()
-        self.ramp.addItems(list(RAMPS))
-        self.auto_colour = QCheckBox("Auto colour limits")
-        self.auto_colour.setChecked(True)
-        self.colour_min, self.colour_max = self._spin(-1e12, 1e12, 0), self._spin(-1e12, 1e12, 1)
-        self.depth_min, self.depth_max = self._spin(0, 1e6, 0), self._spin(0, 1e6, 3)
-        self.bands = QSpinBox()
-        self.bands.setRange(2, 32)
-        self.bands.setValue(5)
-        self.bands.setToolTip("Number of equal-width colour bands between the colour limits")
-        self.colour_mode = QComboBox()
-        for key, label in COLOUR_MODES:
-            self.colour_mode.addItem(label, key)
-        self.colour_mode.setToolTip("Custom classes: value ranges and colours you define")
-        self.edit_classes = QPushButton("Edit classes…")
-        self.edit_classes.clicked.connect(self._edit_classes)
-        self.ramp_label, self.bands_label = QLabel("Ramp"), QLabel("Bands")
-        for label, widget in (("Variable", self.variable), ("Depth from", self.depth_min),
-                              ("to (m)", self.depth_max), ("Colours", self.colour_mode)):
-            controls.addWidget(QLabel(label))
-            controls.addWidget(widget)
-        for widget in (self.ramp_label, self.ramp, self.bands_label, self.bands, self.edit_classes):
-            controls.addWidget(widget)
-        controls.addStretch()
-        layout.addLayout(controls)
-        limits_row = QHBoxLayout()
-        self.limit_widgets = (self.auto_colour, QLabel("Colour min"), self.colour_min,
-                              QLabel("max"), self.colour_max)
-        for widget in self.limit_widgets:
-            limits_row.addWidget(widget)
-        apply = QPushButton("Apply display")
-        apply.clicked.connect(self._apply_display)
-        limits_row.addWidget(apply)
-        limits_row.addStretch()
-        layout.addLayout(limits_row)
+        depth_row = QHBoxLayout()
+        self.depth_min, self.depth_max = self._spin(0), self._spin(3)
+        for widget in (QLabel("Depth from"), self.depth_min, QLabel("to"), self.depth_max, QLabel("m")):
+            depth_row.addWidget(widget)
+        apply = QPushButton("Apply depth")
+        apply.clicked.connect(self._apply_depth)
+        depth_row.addWidget(apply)
+        depth_row.addStretch()
+        layout.addLayout(depth_row)
         self.status = QLabel()
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
-        self.variable.currentIndexChanged.connect(self._apply_display)
-        self.ramp.currentIndexChanged.connect(self._apply_display)
-        self.auto_colour.toggled.connect(self._apply_display)
-        self.bands.valueChanged.connect(self._apply_display)
-        self.colour_mode.currentIndexChanged.connect(self._mode_changed)
+        self._refresh_soon = ui_helpers.coalesced(self, self.render, 300)
+        self.dataset.currentIndexChanged.connect(self._dataset_chosen)
         self.plot.profileClicked.connect(self.inspect_source)
 
     @staticmethod
-    def _spin(lo, hi, value):
+    def _spin(value):
         spin = QDoubleSpinBox()
-        spin.setDecimals(4)
-        spin.setRange(lo, hi)
+        spin.setDecimals(2)
+        spin.setRange(0, 1e5)
         spin.setValue(value)
+        spin.setSuffix("")
         spin.setKeyboardTracking(False)
         return spin
 
-    def reload_sources(self):
-        self.refresh(reload_sources=True)
+    # -- state -------------------------------------------------------------------
+    def selected(self):
+        dataset_id = self.dataset.currentData()
+        return next((d for d in self.datasets if d["dataset_id"] == dataset_id), None)
 
-    def refresh(self, reload_sources=False):
-        if not self._loaded or reload_sources:
-            self.profiles = self.model.store.list_numeric_profiles()
-            self._loaded = True
+    def reload_sources(self):
+        self._profiles_key = None
+        self.refresh()
+
+    def refresh(self):
+        self.datasets = self.model.store.list_ground_datasets()
         try:
             params = json.loads((self.model.plan or {}).get("params_json") or "{}")
         except (ValueError, TypeError):
             params = {}
         state = params.get("numeric_ground", {}) if isinstance(params, dict) else {}
         self.state = state if isinstance(state, dict) else {}
-        settings = self.state.get("display", {})
         self.setEnabled(bool(self.model.plan))
-        self.variable.blockSignals(True)
-        self.variable.clear()
-        for name, unit in sorted({(p["variable"], p["units"]) for p in self.profiles}):
-            self.variable.addItem(f"{name} ({unit or 'unitless'})", [name, unit])
-        selected = self.variable.findData(settings.get("variable"))
-        if selected >= 0:
-            self.variable.setCurrentIndex(selected)
-        self.variable.blockSignals(False)
-        for key, widget, default in (("depth_min", self.depth_min, 0), ("depth_max", self.depth_max, 3),
-                                     ("colour_min", self.colour_min, 0), ("colour_max", self.colour_max, 1)):
+        wanted = self.state.get("dataset_id") or self.dataset.currentData()
+        self.dataset.blockSignals(True)
+        self.dataset.clear()
+        for dataset in self.datasets:
+            self.dataset.addItem(f"{dataset['name']} — {dataset['variable']} ({dataset['units'] or 'unitless'})",
+                                 dataset["dataset_id"])
+        self.dataset.setCurrentIndex(max(0, self.dataset.findData(wanted)))
+        self.dataset.blockSignals(False)
+        for key, widget, default in (("depth_min", self.depth_min, 0), ("depth_max", self.depth_max, 3)):
             widget.blockSignals(True)
-            widget.setValue(settings.get(key, default))
+            widget.setValue(float(self.state.get(key, default)))
             widget.blockSignals(False)
-        self.bands.blockSignals(True)
-        self.bands.setValue(max(2, settings.get("bands") or 5))
-        self.bands.blockSignals(False)
-        self.colour_mode.blockSignals(True)
-        self.colour_mode.setCurrentIndex(self.colour_mode.findData(numeric.display_mode(settings)))
-        self.colour_mode.blockSignals(False)
-        self.ramp.blockSignals(True)
-        self.ramp.setCurrentText(settings.get("ramp", "Viridis"))
-        self.ramp.blockSignals(False)
-        self.auto_colour.blockSignals(True)
-        self.auto_colour.setChecked(settings.get("auto_colour", True))
-        self.auto_colour.blockSignals(False)
         self.render()
-
-    def settings(self):
-        return {"variable": self.variable.currentData() or ["", ""],
-                "ramp": self.ramp.currentText(), "auto_colour": self.auto_colour.isChecked(),
-                "colour_min": self.colour_min.value(), "colour_max": self.colour_max.value(),
-                "depth_min": self.depth_min.value(), "depth_max": self.depth_max.value(),
-                "bands": self.bands.value(), "colour_mode": self.colour_mode.currentData(),
-                "class_schemes": dict(self.state.get("display", {}).get("class_schemes") or {})}
 
     def _save(self, updates, reason):
         state = dict(self.state)
@@ -153,188 +117,214 @@ class NumericProfilePanel(QWidget):
             return True
         return False
 
-    def _apply_display(self, *_args):
-        if not self.model.plan:
-            return
-        settings = self.settings()
-        if settings["depth_max"] <= settings["depth_min"]:
-            self.status.setText("Depth maximum must exceed the minimum; display settings have not been saved.")
-            return
-        if not settings["auto_colour"] and settings["colour_max"] <= settings["colour_min"]:
-            self.status.setText("Colour maximum must exceed the minimum; display settings have not been saved.")
-            return
-        self._save({"display": settings}, "Numeric ground display")
+    def _dataset_chosen(self, *_args):
+        if self.model.plan:
+            self._save({"dataset_id": self.dataset.currentData() or ""}, "Ground model dataset")
 
-    def _scheme(self):
-        key = numeric.scheme_key(self.variable.currentData())
-        return (self.state.get("display", {}).get("class_schemes") or {}).get(key) or []
-
-    def _mode_changed(self, *_args):
-        if self.colour_mode.currentData() == "classes" and not self._scheme() and self.variable.currentData():
-            # First use for this variable: define the classes straight away.
-            if not self._edit_classes():
-                previous = numeric.display_mode(self.state.get("display", {}))
-                self.colour_mode.blockSignals(True)
-                self.colour_mode.setCurrentIndex(self.colour_mode.findData(previous))
-                self.colour_mode.blockSignals(False)
-                self._update_controls()
+    def _apply_depth(self):
+        if self.depth_max.value() <= self.depth_min.value():
+            self.status.setText("The depth 'to' must be greater than 'from'; not applied.")
             return
-        self._apply_display()
+        self._save({"depth_min": self.depth_min.value(), "depth_max": self.depth_max.value()},
+                   "Ground model depth window")
 
-    def _edit_classes(self):
-        variable = self.variable.currentData()
-        if not variable or not self.model.plan:
-            return False
-        assigned = {a["source_id"] for a in self.state.get("assignments", [])}
-        values = [s["value"] for p in self.profiles if p["source_id"] in assigned
-                  and [p["variable"], p["units"]] == list(variable) for s in p["samples"]]
-        dialog = ColourClassesDialog(variable, self._scheme(), values, self)
-        if qt_exec(dialog) != DIALOG_ACCEPTED:
-            return False
-        settings = self.settings()
-        settings["class_schemes"][numeric.scheme_key(variable)] = dialog.classes
-        settings["colour_mode"] = "classes"
-        self.colour_mode.blockSignals(True)
-        self.colour_mode.setCurrentIndex(self.colour_mode.findData("classes"))
-        self.colour_mode.blockSignals(False)
-        return self._save({"display": settings}, "Numeric ground colour classes")
+    # Edits (live, during an edit session), commits, rollbacks and provider reloads.
+    _LAYER_SIGNALS = ("featureAdded", "featureDeleted", "attributeValueChanged", "geometryChanged",
+                      "afterCommitChanges", "afterRollBack", "dataChanged")
 
-    def _update_controls(self):
-        mode = self.colour_mode.currentData()
-        for widget in (self.ramp_label, self.ramp):
-            widget.setVisible(mode != "classes")
-        for widget in (self.bands_label, self.bands):
-            widget.setVisible(mode == "bands")
-        self.edit_classes.setVisible(mode == "classes")
-        for widget in self.limit_widgets:
-            widget.setVisible(mode != "classes")
+    def _watch(self, layer):
+        """Refresh when the placement layer's features change (live link)."""
+        if layer is self._watched:
+            return
+        for name in self._LAYER_SIGNALS if self._watched is not None else ():
+            try:
+                getattr(self._watched, name).disconnect(self._refresh_soon)
+            except (TypeError, RuntimeError, AttributeError):
+                pass
+        self._watched = layer
+        for name in self._LAYER_SIGNALS if layer is not None else ():
+            signal = getattr(layer, name, None)
+            if signal is not None:
+                signal.connect(self._refresh_soon)
+
+    def _load(self, dataset):
+        """Measurements (cached per dataset version) and live placement."""
+        key = (dataset["dataset_id"], dataset.get("updated_utc")) if dataset else None
+        if key != self._profiles_key:
+            self.profiles = self.model.store.list_numeric_profiles(dataset["dataset_id"]) if dataset else []
+            self._profiles_key = key
+        self.assignments, self.notes, layer = [], [], None
+        if dataset is None:
+            self._watch(None)
+            return
+        placement = (dataset.get("config") or {}).get("placement") or {}
+        try:
+            self.assignments, self.notes, layer = sources.read_placement(self.model, placement)
+        except (ValueError, RuntimeError) as exc:
+            self.notes = [str(exc)]
+        self._watch(layer)
+        changed = sources.source_changed(dataset)
+        if changed:
+            self.notes.insert(0, changed)
 
     def render(self):
-        assignments = self.state.get("assignments", [])
-        route = self.model.route
-        bounds = (route.start_kp_km, route.end_kp_km) if route else None
-        issues = numeric.assignment_issues(assignments, self.profiles, bounds)
-        issues += self.state.get("assignment_warnings", [])
-        text = f"{len(self.profiles)} source variable profile(s); {len(assignments)} assignment interval(s)."
-        if not self.profiles:
-            text = "Step 1: import profiles (CSV/XLSX file or a loaded layer) with an ID, depth and value column."
-        elif not assignments:
-            text += " Step 2: assign the investigations to KP ranges (from a table/layer or polygons)."
-        if self.colour_mode.currentData() == "classes" and self.variable.currentData() and not self._scheme():
-            text += " No colour classes for this variable yet: use Edit classes…."
-        if issues:
-            text += " " + "; ".join(issues[:4])
-            if len(issues) > 4:
-                text += f" (+{len(issues) - 4} more; Review assignments)"
+        dataset = self.selected()
+        for key in ("edit", "reload", "remove", "check", "export"):
+            self.buttons[key].setEnabled(dataset is not None)
+        self.buttons["add"].setEnabled(bool(self.model.plan))
+        self._load(dataset)
+        if dataset is None:
+            self.status.setText("No numeric dataset yet. Add… defines one: a measurements table "
+                                "(ID, depth, value), the layer giving each ID's KP range, and colours.")
+            if self.active:
+                self.plot.set_numeric(numeric.ProfileIndex([], []), self.display_settings(None))
+            return
+        ids = {a["source_id"] for a in self.assignments}
+        known = {p["source_id"] for p in self.profiles}
+        text = (f"{len(self.profiles)} investigation(s) from "
+                f"{sources.source_label(((dataset.get('config') or {}).get('measurements') or {}).get('source') or {})}; "
+                f"{len(self.assignments)} KP range(s), {len(ids & known)} placed.")
+        problems = list(self.notes)
+        unmatched = numeric.unmatched_ids(ids, known)
+        if unmatched:
+            problems.append(f"{len(unmatched)} KP range ID(s) without measurements")
+        unplaced = len(known - ids)
+        if unplaced and self.assignments:
+            problems.append(f"{unplaced} investigation(s) without a KP range")
+        if problems:
+            text += " ⚠ " + "; ".join(problems[:3]) + (" — Check… lists all" if len(problems) > 3 or unmatched
+                                                         or unplaced else "")
         self.status.setText(text)
-        self._update_controls()
-        self.colour_min.setEnabled(not self.auto_colour.isChecked())
-        self.colour_max.setEnabled(not self.auto_colour.isChecked())
         if self.active:
-            settings = dict(self.state.get("display", self.settings()))
-            if self.variable.findData(settings.get("variable")) < 0:
-                settings["variable"] = self.variable.currentData() or ["", ""]
-            index = numeric.ProfileIndex(self.profiles, assignments, settings.get("variable", self.variable.currentData() or ["", ""]))
-            if settings.get("auto_colour", True):
-                lo, hi = index.limits()
-                self.colour_min.setValue(lo)
-                self.colour_max.setValue(hi)
-            self.plot.set_numeric(index, settings)
+            try:
+                index = numeric.ProfileIndex(self.profiles, self.assignments)
+            except ValueError as exc:
+                self.status.setText(text + f" ✗ {exc}")
+                index = numeric.ProfileIndex(self.profiles, [])
+            self.plot.set_numeric(index, self.display_settings(dataset))
 
-    def _import_profiles(self):
-        dialog = NumericImportDialog(self.model, self.dock, parent=self)
-        if qt_exec(dialog) != DIALOG_ACCEPTED:
-            return
-        profiles = dialog.result_rows
-        # Shared project measurements, like soil classes and tools, are not
-        # rolled back by a plan's history (another plan may use them).
-        ok, _ = self.model._store_transaction(
-            "import numeric profiles", lambda: self.model.store.save_numeric_profiles(profiles))
+    def display_settings(self, dataset):
+        dataset = dataset or {}
+        return {"name": dataset.get("name") or "", "variable": dataset.get("variable") or "",
+                "units": dataset.get("units") or "",
+                "depth_min": float(self.state.get("depth_min", 0)), "depth_max": float(self.state.get("depth_max", 3)),
+                "colours": (dataset.get("config") or {}).get("colours") or {}}
+
+    # -- dataset actions -----------------------------------------------------------
+    def _write(self, action, func):
+        # Shared project data, like soil classes and tools: not rolled back
+        # by a plan's history (another plan may show the same dataset).
+        ok, result = self.model._store_transaction(action, func)
         if ok:
+            self._profiles_key = None
             self.model.groundChanged.emit()
+        return ok, result
 
-    def _import_assignments(self):
-        dialog = NumericImportDialog(self.model, self.dock, assignments=True,
-                                     known_ids={p["source_id"] for p in self.profiles}, parent=self)
-        if qt_exec(dialog) == DIALOG_ACCEPTED:
-            self._save({"assignments": dialog.result_rows, "assignment_warnings": []}, "Assign numeric ground profiles by KP table")
+    def _add(self):
+        self._open_dialog(None)
 
-    def _polygons(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Assign investigations by polygons")
-        layout = QVBoxLayout(dialog)
-        note = QLabel("Replace this plan's assignments with each polygon's route crossings. "
-                      "IDs must match the imported profiles. Overlaps and unmatched IDs are retained and flagged.")
-        note.setWordWrap(True)
-        layout.addWidget(note)
-        form = QFormLayout()
-        layers, field = QComboBox(), QComboBox()
-        for layer in QgsProject.instance().mapLayers().values():
-            if hasattr(layer, "geometryType") and layer.geometryType() == 2:
-                layers.addItem(layer.name(), layer.id())
+    def _edit(self):
+        dataset = self.selected()
+        if dataset is not None:
+            self._open_dialog(dataset)
 
-        def fields(*_args):
-            field.clear()
-            layer = QgsProject.instance().mapLayer(layers.currentData())
-            if layer is not None:
-                field.addItems(layer.fields().names())
-
-        layers.currentIndexChanged.connect(fields)
-        fields()
-        form.addRow("Polygon layer", layers)
-        form.addRow("Investigation ID", field)
-        layout.addLayout(form)
-        buttons = QDialogButtonBox(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-        if qt_exec(dialog) != DIALOG_ACCEPTED:
+    def _open_dialog(self, dataset):
+        profiles = self.model.store.list_numeric_profiles(dataset["dataset_id"]) if dataset else []
+        dialog = DatasetDialog(self.model, dataset, profiles, self)
+        if qt_exec(dialog) != DIALOG_ACCEPTED or dialog.result() is None:
             return
-        layer = QgsProject.instance().mapLayer(layers.currentData())
-        if layer is None:
+        self.save_dataset(*dialog.result())
+
+    def save_dataset(self, dataset, profiles):
+        if not any(d["dataset_id"] == dataset["dataset_id"] for d in self.datasets):
+            dataset = dict(dataset, seq=len(self.datasets))
+        ok, dataset_id = self._write("save numeric dataset",
+                                     lambda: self.model.store.save_ground_dataset(dataset, profiles))
+        if ok:
+            self._save({"dataset_id": dataset_id}, "Ground model dataset")
+        return ok
+
+    def _reload(self):
+        dataset = self.selected()
+        if dataset is None:
             return
         try:
-            rows, warnings = polygon_assignments(self.model.route, layer, field.currentText())
-        except (ValueError, RuntimeError) as exc:
-            QMessageBox.warning(self, "Polygon assignment", str(exc))
+            profiles, config = sources.reload_measurements(dataset)
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Reload measurements", str(exc))
             return
-        self._save({"assignments": rows, "assignment_warnings": warnings}, "Assign numeric profiles by polygon")
-        if warnings:
-            QMessageBox.information(self, "Polygon assignment", "\n".join(warnings[:30]))
+        before = numeric.summary_text(self.profiles, dataset.get("units"))
+        ok, _ = self._write("reload numeric dataset",
+                            lambda: self.model.store.save_ground_dataset(dict(dataset, config=config), profiles))
+        if ok:
+            QMessageBox.information(self, "Reload measurements",
+                                    f"Before: {before}.\nNow: {numeric.summary_text(profiles, dataset.get('units'))}.")
 
-    def _review(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Numeric ground assignments")
-        dialog.resize(850, 550)
-        layout = QVBoxLayout(dialog)
+    def _remove(self):
+        dataset = self.selected()
+        if dataset is None:
+            return
+        users = []
+        for plan in self.model.store.list_plans():
+            try:
+                params = json.loads(plan.get("params_json") or "{}")
+            except (ValueError, TypeError):
+                continue
+            if (params.get("numeric_ground") or {}).get("dataset_id") == dataset["dataset_id"]:
+                users.append(plan.get("name") or plan.get("plan_id"))
+        text = (f"Delete the dataset '{dataset['name']}' and its {len(self.profiles)} investigation(s) "
+                "from this project? The source file and KP layer are not touched.")
+        if users:
+            text += "\n\nPlans showing it: " + ", ".join(users)
+        if QMessageBox.question(self, "Remove dataset", text, MESSAGEBOX_YES | MESSAGEBOX_NO) != MESSAGEBOX_YES:
+            return
+        self.remove_dataset(dataset["dataset_id"])
+
+    def remove_dataset(self, dataset_id):
+        ok, _ = self._write("remove numeric dataset", lambda: self.model.store.delete_ground_dataset(dataset_id))
+        if ok and self.state.get("dataset_id") == dataset_id:
+            self._save({"dataset_id": ""}, "Ground model dataset removed")
+        return ok
+
+    def _bounds(self):
         route = self.model.route
-        issues = numeric.assignment_issues(self.state.get("assignments", []), self.profiles,
-                                           (route.start_kp_km, route.end_kp_km) if route else None)
-        issues += self.state.get("assignment_warnings", [])
-        from qgis.PyQt.QtWidgets import QPlainTextEdit
-        notes = QPlainTextEdit("\n".join(issues) or "No assignment issues.")
-        notes.setReadOnly(True)
-        layout.addWidget(notes)
-        keys = ("source_id", "start_kp", "end_kp", "flags", "source_ref", "src_start_kp", "src_end_kp")
-        table = QTableView()
-        table_model = RowsModel(keys, [[f"{r[k]:.3f}" if k.endswith("_kp") and r.get(k) is not None else r.get(k, "")
-                                       for k in keys] for r in self.state.get("assignments", [])], table)
-        table.setModel(table_model)
-        layout.addWidget(table)
+        return (route.start_kp_km, route.end_kp_km) if route else None
+
+    def _scope(self):
+        scope = self.model.gen_params().scope
+        return (scope.start_km, scope.end_km) if scope else None
+
+    def _check(self):
+        dataset = self.selected()
+        if dataset is None:
+            return
+        dialog = check_dialog(dataset, self.profiles, self.assignments, self.notes, self._bounds(),
+                              self._scope(), self, on_open=self.inspect_source)
         qt_exec(dialog)
 
-    def _inspect(self):
-        from qgis.PyQt.QtWidgets import QInputDialog
-        sources = sorted({p["source_id"] for p in self.profiles})
-        if not sources:
-            return
-        source, ok = QInputDialog.getItem(self, "Inspect source", "Investigation", sources, 0, False)
-        if ok:
-            self.inspect_source(source)
+    def plotted_cells(self):
+        dataset = self.selected() or {}
+        classes = numeric.display_classes((dataset.get("config") or {}).get("colours"))
+        index = numeric.ProfileIndex(self.profiles, self.assignments)
+        units = dataset.get("units") or ""
+        headers = ["investigation", "kp_from", "kp_to", "depth_top_m", "depth_base_m",
+                   f"value_{units}" if units else "value", "class", "status"]
+        rows = [[c["source_id"], f"{c['kp_from']:.6f}", f"{c['kp_to']:.6f}",
+                 "" if c["depth_top_m"] is None else f"{c['depth_top_m']:g}",
+                 "" if c["depth_base_m"] is None else f"{c['depth_base_m']:g}",
+                 "" if c["value"] is None else f"{c['value']:g}", c["class"], c["status"]]
+                for c in index.cells(classes, dataset.get("variable") or "value")]
+        return headers, rows
+
+    def _export(self, path=None):
+        dataset = self.selected()
+        if dataset is None:
+            return ""
+        headers, rows = self.plotted_cells()
+        return export_csv(self, f"{dataset['name']} plotted cells.csv", headers, rows, path)
 
     def inspect_source(self, source):
         if not any(p["source_id"] == source for p in self.profiles):
-            QMessageBox.information(self, "Source profile", f"No imported profile matches {source}.")
+            QMessageBox.information(self, "Measurements", f"No measurements match {source}.")
             return
-        dialog = source_dialog(source, self.profiles, self)
-        qt_exec(dialog)
+        qt_exec(source_dialog(source, self.profiles, self))

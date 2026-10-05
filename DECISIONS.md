@@ -720,18 +720,47 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   range and reference kept in the hazard's attributes. Risk comes from the
   attribute rules or the default; proximity bands do not apply.
 
-## Numeric Ground Model colour classes and column mapping (October 2026)
+## Numeric Ground Model datasets (schema v12, October 2026)
 
-- Custom colour classes are `attribute_rules` ranges (`min`/`max` with
+- **A dataset is the unit the user manages**: one variable (e.g. CPT su) for
+  many investigations, with its measurements source, its placement layer and
+  its colours (`bp_ground_dataset`, project-scoped like soil classes and not
+  change-logged). Measurements live in `bp_ground_profile` keyed by
+  `dataset_id`, one row per investigation, and are replaced as a set in one
+  transaction; removing a dataset deletes them. A plan's
+  `params_json["numeric_ground"]` holds only `mode`, `dataset_id` and the depth
+  window, so duplicating or rolling back a plan never copies measurements.
+  The v11→v12 migration groups earlier imports into one dataset per
+  variable/unit, kept rather than dropped so they can be inspected and removed.
+- **Placement is read live, never copied**: a KP-range layer (start/end KP
+  fields, unit and the RPL they are quoted on, the same keys and translation as
+  the Exclusions/Risk KP-range tables via `kp_table` and
+  `rpl_reference.table_kp_map`) or a polygon layer crossed by the plan route.
+  It is re-read on every refresh and on the layer's edit/commit/rollback
+  signals (QGIS 4 does not emit `dataChanged` for edits), so a plan's RPL
+  change needs no re-reference step and the earlier per-plan assignment copies
+  are gone. The layer is found again by id, then source path, using the
+  registered-input keys (`layer_id_hint`, `layer_source`, `layer_name`); registered
+  inputs themselves are plan-scoped, so a shared dataset cannot reference one.
+- **Measurements are a copy with a fingerprint**: re-reading a large table on
+  every refresh would be slow and a moved file would empty the plot. The
+  source, header row and column choices *by header name* are stored, with the
+  source's mtime/size (file) or `layer_fingerprint` (layer); a change is
+  reported and *Reload* re-reads with the same choices, refusing a renamed
+  column instead of guessing.
+- **One import shape**: ID, depth (or interval top), optional interval base,
+  value. Long/wide formats, variable/unit columns and a flags column were
+  removed: a second variable from the same file is a second dataset. Nothing
+  is mapped from column names; the user chooses every column and the dialog's
+  check line reports the parsed result. Ranges, field names and units are
+  never suggested by the code.
+- **Colour classes** are `attribute_rules` ranges (`min`/`max` with
   `min_inclusive`/`max_inclusive`) plus `colour` and `label`, edited with the
   Exclusions value-range rows (`AttributeRulesTable`). Rows keep their order
-  and the first matching row wins, as for attribute rules; overlaps and
-  uncovered ranges are reported in the editor's summary, not rejected. Values
-  no class covers are drawn dark grey, distinct from missing (light grey).
-- Classes are saved per variable/unit in the plan's display settings
-  (`class_schemes`, keyed by the JSON `[variable, units]`), so switching
-  variable never applies one variable's classes to another.
-- The import and assignment dialogs do not guess roles, variables or units
-  from column names; the user maps every column. A mapped column is kept when
-  the header row or worksheet changes and the same header is still present.
-  Ranges, field names and units are never suggested by the code.
+  and the first matching row wins; overlaps and uncovered ranges are reported
+  in the summary, not rejected. Values no class covers are drawn dark grey,
+  distinct from missing (light grey).
+- **Trust through checks, not inference**: *Check…* tabulates every
+  investigation against its KP ranges and reports unmatched IDs both ways,
+  ranges beyond the route, overlaps and scope coverage; *Export cells…* writes
+  the plotted KP × depth cells so the plot can be reproduced outside QGIS.

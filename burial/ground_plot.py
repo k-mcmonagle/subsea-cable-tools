@@ -265,6 +265,11 @@ class GroundModelPlot(QWidget):
         self._fit_depth()
 
     def set_numeric(self, index=None, settings=None):
+        """Show a numeric dataset (``index``) or, with None, the soil units.
+
+        ``settings``: name, variable, units, depth_min/depth_max and the
+        dataset's ``colours`` (see ``numeric_profiles.colour_settings``).
+        """
         from . import numeric_profiles as numeric
         from .numeric_profile_plot import OUTSIDE_CLASSES, colour_table
         settings = settings or {}
@@ -276,31 +281,33 @@ class GroundModelPlot(QWidget):
         if index is None:
             self.set_units(self._units, list(self._classes_by_code.values()))
             return
-        limits = index.limits() if settings.get("auto_colour", True) else (
-            settings.get("colour_min", 0), settings.get("colour_max", 1))
-        mode = numeric.display_mode(settings)
-        ramp = settings.get("ramp", "Viridis")
-        bands = settings.get("bands", 0) if mode == "bands" else 0
-        classes = numeric.display_classes(settings)
+        colours = numeric.colour_settings(settings.get("colours"))
+        limits = index.limits() if colours["auto"] else (colours["min"], colours["max"])
+        bands = colours["bands"] if colours["mode"] == "bands" else 0
+        classes = numeric.display_classes(colours)
         self._numeric_classes = classes
-        self._numeric_item.set_profiles(index, limits, ramp, bands, classes)
+        self._numeric_item.set_profiles(index, limits, colours["ramp"], bands, classes)
         self._numeric_depth = (settings.get("depth_min", 0), settings.get("depth_max", 3))
         self._fit_depth()
-        variable = settings.get("variable", ["", ""])
-        notes = "Grey: missing; hatching: flagged; amber: assignment overlap; blank: no coverage"
+        variable, units = settings.get("variable") or "value", settings.get("units") or ""
+        title = f"<b>{_esc(settings.get('name') or variable)}</b> {_esc(variable)} ({_esc(units or 'unitless')})"
+        notes = "Grey: missing; amber: overlapping KP ranges; blank: no KP range or no reading"
+        if not index.profiles:
+            self.legend.setText("<span style='color:#777'>No numeric dataset selected.</span>")
+            return
         if classes:
             items = [f"<span style='color:{c['colour']}; font-size:15px'>■</span> "
-                     f"{_esc(numeric.class_label(c, variable[0]))}" for c in classes]
+                     f"{_esc(numeric.class_label(c, variable))}" for c in classes]
             items.append("<span style='color:#{:02x}{:02x}{:02x}; font-size:15px'>■</span> "
                          "outside classes".format(*OUTSIDE_CLASSES[:3]))
-            self.legend.setText(f"{_esc(variable[0])} ({_esc(variable[1])}) &nbsp; " + " &nbsp; ".join(items)
-                                + f" &nbsp; {notes}")
+            self.legend.setText(f"{title} &nbsp; " + " &nbsp; ".join(items) + f" &nbsp; {notes}")
             return
-        colors = colour_table(ramp, bands)
+        if colours["mode"] == "classes":
+            notes = "No valid colour classes — Edit… → Colours. " + notes
+        colors = colour_table(colours["ramp"], bands)
         swatches = "".join("<span style='background:#{:02x}{:02x}{:02x}'>&nbsp;</span>".format(*colors[i][:3])
                            for i in range(0, 256, 8))
-        self.legend.setText(f"{_esc(variable[0])} ({_esc(variable[1])}) &nbsp; "
-                            f"{limits[0]:g} {swatches} {limits[1]:g} &nbsp; {notes}")
+        self.legend.setText(f"{title} &nbsp; {limits[0]:g} {swatches} {limits[1]:g} &nbsp; {notes}")
 
     def set_scope(self, start_kp: float, end_kp: float) -> None:
         lo, hi = sorted((float(start_kp), float(end_kp)))
@@ -401,17 +408,17 @@ class GroundModelPlot(QWidget):
         if self._numeric_index is not None:
             hits = self._numeric_index.at(kp, depth)
             if not hits:
-                lines.append("Coverage: no route assignment")
+                lines.append("No KP range here")
             if len(hits) > 1:
-                lines.append("Coverage: overlapping assignments — no value selected")
+                lines.append("Overlapping KP ranges — no value chosen")
             for assignment, sample in hits:
                 source = assignment["source_id"]
                 profile = self._numeric_index.profiles.get(source)
-                lines.append(f"Source: {source}; KP {assignment['start_kp']:.3f}–{assignment['end_kp']:.3f}")
+                lines.append(f"{source}: KP range {assignment['start_kp']:.3f}–{assignment['end_kp']:.3f}")
                 if profile is None:
-                    lines.append("Coverage: unmatched ID or selected variable unavailable")
+                    lines.append("No measurements with this ID")
                 elif sample is None:
-                    lines.append(f"{profile['variable']}: missing {profile['units']}; Coverage: unmeasured depth")
+                    lines.append("No reading at this depth")
                 else:
                     value = "missing" if sample["value"] is None else f"{sample['value']:g}"
                     category = ""
@@ -421,10 +428,9 @@ class GroundModelPlot(QWidget):
                         category = f" [{class_label(hit_class, profile['variable']) if hit_class else 'outside classes'}]"
                     lines.append(f"{profile['variable']}: {value} {profile['units']}{category}; "
                                  f"sample depth {sample['depth']:g} m")
-                    lines.append(f"Coverage: {sample['top']:g}–{sample['base']:g} m; "
-                                 f"{sample['flags'] or 'measured'}")
+                    lines.append(f"Drawn {sample['top']:g}–{sample['base']:g} m")
                 if assignment.get("flags"):
-                    lines.append("Assignment: " + assignment["flags"])
+                    lines.append("KP translation: " + assignment["flags"])
             return "\n".join(lines)
         hit = self.unit_at(kp, depth) if depth >= 0 else None
         if hit is not None:

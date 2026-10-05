@@ -36,7 +36,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- **Ground Model:** numeric depth profiles from mapped investigation tables, separate polygon/KP assignments, stable colour controls, missing-data flags and source inspection alongside soil classes. Custom colour classes use the Exclusions range rows (≥ or >, < or ≤) with a per-class summary of samples, gaps and overlaps; profiles and KP assignments can come from loaded QGIS layers, with a live check of the column mapping.
+- **Ground Model:** numeric datasets (e.g. CPT undrained shear strength) drawn by KP and depth: measurements from a file or layer with the columns you choose, KP ranges read live from a KP-range or polygon layer (translated from the RPL they are quoted on), and a continuous ramp, equal bands or custom classes (≥ or >, < or ≤). Datasets are listed with Add, Edit, Reload, Remove, Check and Export cells. Profiles imported by earlier development builds become datasets named "… — earlier import"; choose their KP ranges again (Edit…).
 
 - **Burial Planner — Risk Profile:** new *KP-range table* check registers each row of a start/end KP table, with or without geometry (e.g. a desktop-study hazard list), as a hazard over its KP range, with Low/Medium/High risk from its text or numeric attributes or a default.
 

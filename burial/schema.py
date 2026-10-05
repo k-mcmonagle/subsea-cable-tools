@@ -42,7 +42,7 @@ from ..workbench.schema import (  # noqa: F401  (re-exported for the package)
     utc_now_iso,
 )
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 # Registry table names ------------------------------------------------------
 TABLE_META = "bp_meta"
@@ -62,6 +62,7 @@ TABLE_LAYBACK_PROFILE = "bp_layback_profile"
 TABLE_VESSEL = "bp_vessel"
 TABLE_GROUND_UNIT = "bp_ground_unit"
 TABLE_GROUND_PROFILE = "bp_ground_profile"
+TABLE_GROUND_DATASET = "bp_ground_dataset"
 TABLE_GROUND_CLASS = "bp_ground_class"
 TABLE_BAS_ROW = "bp_bas_row"
 TABLE_ANALYSIS = "bp_analysis"
@@ -712,9 +713,17 @@ GROUND_UNIT_FIELDS: List[FieldSpec] = [
     ("notes", "str"),
 ]
 
-# Project-scoped measurements. Route assignments live separately in plan params.
+# Project-scoped numeric datasets (one variable each, e.g. CPT su): where the
+# measurements came from, which layer places them along the route (read live),
+# and how they are coloured. Plans choose a dataset in their params.
+GROUND_DATASET_FIELDS: List[FieldSpec] = [
+    ("dataset_id", "str"), ("name", "str"), ("variable", "str"), ("units", "str"),
+    ("config_json", "str"), ("updated_utc", "str"), ("seq", "int"),
+]
+
+# A dataset's measurements: one row per investigation, samples as JSON.
 GROUND_PROFILE_FIELDS: List[FieldSpec] = [
-    ("profile_id", "str"), ("source_id", "str"), ("variable", "str"),
+    ("profile_id", "str"), ("dataset_id", "str"), ("source_id", "str"), ("variable", "str"),
     ("units", "str"), ("samples_json", "str"), ("provenance_json", "str"),
 ]
 
@@ -794,6 +803,7 @@ REGISTRY_TABLES: Dict[str, List[FieldSpec]] = {
     TABLE_VESSEL: VESSEL_FIELDS,
     TABLE_GROUND_UNIT: GROUND_UNIT_FIELDS,
     TABLE_GROUND_PROFILE: GROUND_PROFILE_FIELDS,
+    TABLE_GROUND_DATASET: GROUND_DATASET_FIELDS,
     TABLE_GROUND_CLASS: GROUND_CLASS_FIELDS,
     TABLE_BAS_ROW: BAS_ROW_FIELDS,
     TABLE_ANALYSIS: ANALYSIS_FIELDS,
@@ -818,6 +828,7 @@ TABLE_KEYS: Dict[str, str] = {
     TABLE_VESSEL: "vessel_id",
     TABLE_GROUND_UNIT: "unit_id",
     TABLE_GROUND_PROFILE: "profile_id",
+    TABLE_GROUND_DATASET: "dataset_id",
     TABLE_GROUND_CLASS: "class_id",
     TABLE_BAS_ROW: "row_id",
     TABLE_ANALYSIS: "analysis_id",

@@ -153,17 +153,8 @@ def map_plan(kp_map: KpMap, plan: Dict, events: Sequence[Dict],
     if lo is not None and hi is not None and (float(lo or 0.0) or float(hi or 0.0)):
         new_plan["scope_start_kp"], new_plan["scope_end_kp"] = m.pair(lo, hi, "Plan scope")
     params = _json(new_plan.get("params_json"), {})
-    numeric = params.get("numeric_ground")
-    if isinstance(numeric, dict):
-        assignments = []
-        for row in numeric.get("assignments", []):
-            row = dict(row)
-            a, b = row["start_kp"], row["end_kp"]
-            row["start_kp"], row["end_kp"] = m.pair(a, b, "Investigation " + row["source_id"])
-            _, _, flags = kp_map.map_range(a, b)
-            row["flags"] = "; ".join(filter(None, (row.get("flags", ""), ", ".join(flags))))
-            assignments.append(row)
-        numeric["assignments"] = assignments
+    # Numeric datasets read their KP ranges live, translated from the RPL the
+    # ranges are quoted on, so a plan's params hold no KPs to re-reference.
     if params.get("target_burial_ranges"):
         params["target_burial_ranges"] = _map_range_dicts(
             m, params["target_burial_ranges"], "Target depth range")
