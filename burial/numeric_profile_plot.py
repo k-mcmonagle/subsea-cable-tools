@@ -15,8 +15,47 @@ RAMPS = {
     "Viridis": ["#440154", "#3b528b", "#21918c", "#5ec962", "#fde725"],
     "Plasma": ["#0d0887", "#7e03a8", "#cc4778", "#f89540", "#f0f921"],
     "Blue–red": ["#2166ac", "#67a9cf", "#f7f7f7", "#ef8a62", "#b2182b"],
+    "Red–yellow–green": ["#d7191c", "#fdae61", "#ffffbf", "#a6d96a", "#1a9641"],
     "Greys": ["#f7f7f7", "#252525"],
 }
+
+
+_EPS = 1e-12  # as burial.attribute_rules
+# Values in a gap between custom classes: distinct from missing (light grey).
+OUTSIDE_CLASSES = (64, 64, 64, 255)
+
+
+def ramp_colours(ramp, count):
+    """``count`` hex colours spread along a ramp (for new custom classes)."""
+    table = colour_table(ramp)
+    picks = np.linspace(0, 255, count).round().astype(int) if count > 1 else [0]
+    return ["#{:02x}{:02x}{:02x}".format(*table[i][:3]) for i in picks]
+
+
+def class_arrays(classes):
+    """Bounds, bound inclusivity and RGBA rows, in class (row) order."""
+    lows = np.array([-np.inf if c["min"] is None else c["min"] for c in classes], dtype=float)
+    highs = np.array([np.inf if c["max"] is None else c["max"] for c in classes], dtype=float)
+    low_in = np.array([c["min_inclusive"] for c in classes], dtype=bool)
+    high_in = np.array([c["max_inclusive"] for c in classes], dtype=bool)
+    colours = np.array([QColor(c["colour"]).getRgb() for c in classes], dtype=np.uint8)
+    return lows, highs, low_in, high_in, colours
+
+
+def classify(values, arrays):
+    """RGBA per value; the first matching class wins (as attribute rules)."""
+    lows, highs, low_in, high_in, colours = arrays
+    result = np.empty((len(values), 4), dtype=np.uint8)
+    result[:] = OUTSIDE_CLASSES
+    pending = np.isfinite(values)
+    with np.errstate(invalid="ignore"):
+        for i in range(len(lows)):
+            above = values >= lows[i] - _EPS if low_in[i] else values > lows[i] + _EPS
+            below = values <= highs[i] + _EPS if high_in[i] else values < highs[i] - _EPS
+            hit = pending & above & below
+            result[hit] = colours[i]
+            pending &= ~hit
+    return result
 
 
 def colour_table(ramp, bands=0):
@@ -32,6 +71,7 @@ class NumericProfileItem(pg.GraphicsObject):
     def __init__(self):
         super().__init__()
         self.index = None
+        self.classes = None
         self._cache = {}
         self._depth_key = None
         self._arrays = {}
@@ -39,11 +79,12 @@ class NumericProfileItem(pg.GraphicsObject):
         self._conflict = QBrush(QColor("#d18b30"), style.DiagCrossPattern)
         self._missing = QBrush(QColor("#bbbbbb"), style.BDiagPattern)
 
-    def set_profiles(self, index, limits, ramp, bands):
+    def set_profiles(self, index, limits, ramp, bands, classes=None):
         self.prepareGeometryChange()
         self.index = index
         self.limits = limits
         self.lut = colour_table(ramp, bands)
+        self.classes = class_arrays(classes) if classes else None
         self._cache.clear()
         self._depth_key = None
         self._arrays = {}
@@ -73,9 +114,12 @@ class NumericProfileItem(pg.GraphicsObject):
         safe = np.maximum(indices, 0)
         covered = (indices >= 0) & (probes < ends[safe])
         measured = covered & np.isfinite(values[safe])
-        lo, hi = self.limits
-        normalized = np.nan_to_num((values[safe] - lo) / (hi - lo), nan=0.0)
-        colors = self.lut[np.clip(normalized * 255, 0, 255).astype(int)].copy()
+        if self.classes is not None:
+            colors = classify(values[safe], self.classes)
+        else:
+            lo, hi = self.limits
+            normalized = np.nan_to_num((values[safe] - lo) / (hi - lo), nan=0.0)
+            colors = self.lut[np.clip(normalized * 255, 0, 255).astype(int)].copy()
         colors[~measured] = (0, 0, 0, 0)
         colors[covered & ~measured] = (180, 180, 180, 255)
         # Retain partial/quality flags visibly without changing the value colour.

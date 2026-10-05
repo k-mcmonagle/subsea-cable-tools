@@ -20,6 +20,12 @@ from ..burial.tabs.ground_tab import GroundTab
 REQUIRES_QGIS = True
 
 
+def map_columns(dialog, **roles):
+    for role, column in roles.items():
+        combo = dialog.mapping[role]
+        combo.setCurrentIndex(combo.findData(column))
+
+
 class NumericQgisTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -170,6 +176,7 @@ class NumericQgisTests(unittest.TestCase):
         tab.numeric.auto_colour.setChecked(False)
         tab.numeric.colour_min.setValue(10)
         tab.numeric.colour_max.setValue(200)
+        tab.numeric.colour_mode.setCurrentIndex(tab.numeric.colour_mode.findData("bands"))
         tab.numeric.bands.setValue(4)
         tab.numeric._apply_display()
         tab.refresh()
@@ -180,7 +187,12 @@ class NumericQgisTests(unittest.TestCase):
             dialog = NumericImportDialog(self.model, Dock(), assignments=assignments)
             dialog.grid = [["ID", "depth", "su"], ["A", "0", "20"]]
             dialog._columns()
-            self.assertEqual(dialog.mapping["source_id"].currentData(), 0)
+            # Nothing is mapped from column names; the user's choice survives a reload.
+            self.assertEqual({c.currentData() for c in dialog.mapping.values()}, {None})
+            dialog.mapping["source_id"].setCurrentIndex(1)
+            dialog.grid = [["x", "ID", "depth"], ["0", "A", "0"]]
+            dialog._columns()
+            self.assertEqual(dialog.mapping["source_id"].currentData(), 1)
             dialog.close()
         dialog = source_dialog("A", self.profiles, tab)
         dialog.close()
@@ -195,6 +207,7 @@ class NumericQgisTests(unittest.TestCase):
         dialog = NumericImportDialog(self.model, Dock())
         dialog.path = str(path)
         dialog._reload()
+        map_columns(dialog, source_id=0, depth=1, value=2, units=3, flags=4)
         dialog.name.setText("su")
         dialog.decimal_comma.setChecked(True)
         dialog._accept()
@@ -204,6 +217,127 @@ class NumericQgisTests(unittest.TestCase):
         self.assertIsNone(profile["samples"][1]["value"])
         self.assertEqual(profile["provenance"]["mapping"]["depth"], 1)
         dialog.close()
+
+
+    def test_interval_table_import_and_live_check(self):
+        class Dock:
+            def workbench_store(self):
+                return None
+        dialog = NumericImportDialog(self.model, Dock())
+        dialog.grid = [["Hole", "Note", "From", "To", "Reading"],
+                       ["P1", "x", "0", "0.01", "3.5"],
+                       ["P1", "x", "0.01", "0.02", ""]]
+        dialog._columns()
+        self.assertEqual(dialog.name.text(), "")
+        map_columns(dialog, source_id=0, depth=2, base=3, value=4)
+        dialog.name.setText("v")
+        dialog.units.setText("u")
+        dialog._check()
+        self.assertIn("1 investigation(s); v (u); 2 depth sample(s), 1 missing", dialog.check.text())
+        dialog.mapping["depth"].setCurrentIndex(0)
+        dialog._check()
+        self.assertIn("✗ Map the depth column.", dialog.check.text())
+        map_columns(dialog, depth=2)
+        dialog._accept()
+        samples = dialog.result_rows[0]["samples"]
+        self.assertEqual((samples[0]["top"], samples[0]["base"], samples[0]["value"]), (0, .01, 3.5))
+        self.assertIsNone(samples[1]["value"])
+        dialog.close()
+
+    def test_assignments_from_loaded_layer_report_unknown_ids(self):
+        class Dock:
+            def workbench_store(self):
+                return None
+        layer = QgsVectorLayer("None?field=CPT:string&field=KP_From:double&field=KP_To:double",
+                               "CPT ranges", "memory")
+        features = []
+        for values in (["A", 10.0, 11.0], ["a ", 12.0, 13.0]):
+            feature = QgsFeature(layer.fields())
+            feature.setAttributes(values)
+            features.append(feature)
+        layer.dataProvider().addFeatures(features)
+        QgsProject.instance().addMapLayer(layer)
+        try:
+            dialog = NumericImportDialog(self.model, Dock(), assignments=True, known_ids={"A"})
+            dialog.layer.setCurrentIndex(dialog.layer.findData(layer.id()))
+            self.assertEqual(dialog.grid[0], ["CPT", "KP_From", "KP_To"])
+            map_columns(dialog, source_id=0, start_kp=1, end_kp=2)
+            dialog._check()
+            self.assertIn("2 KP range(s) for 2 investigation(s)", dialog.check.text())
+            self.assertIn("a (did you mean A?)", dialog.check.text())
+            dialog._accept()
+            self.assertEqual([(r["source_id"], r["start_kp"], r["end_kp"]) for r in dialog.result_rows],
+                             [("A", 10, 11), ("a", 12, 13)])
+            self.assertIn("layer CPT ranges", dialog.result_rows[0]["source_ref"])
+            dialog.close()
+        finally:
+            QgsProject.instance().removeMapLayer(layer.id())
+
+    def test_custom_colour_classes_render_legend_and_hover(self):
+        import numpy as np
+        from ..burial.numeric_profile_plot import class_arrays, classify
+        classes = n.normalise_classes([
+            {"max": 5, "max_inclusive": True, "colour": "#ff0000"},
+            {"min": 5, "max": 200, "min_inclusive": False, "max_inclusive": False, "colour": "#00ff00"},
+            {"min": 200, "min_inclusive": True, "colour": "#0000ff"}])
+        rgba = classify(np.array([0, 5, 5.5, 199.9, 250, np.nan]), class_arrays(classes))
+        self.assertEqual([tuple(int(v) for v in c[:3]) for c in rgba[:5]],
+                         [(255, 0, 0), (255, 0, 0), (0, 255, 0), (0, 255, 0), (0, 0, 255)])
+        plot = GroundModelPlot()
+        plot.resize(800, 350)
+        index = n.ProfileIndex(self.profiles, self.rows, ("su", "kPa"))
+        plot.set_numeric(index, {"variable": ["su", "kPa"], "depth_min": 0, "depth_max": .1,
+                                 "colour_mode": "classes",
+                                 "class_schemes": {n.scheme_key(["su", "kPa"]): classes}})
+        plot.plot.setXRange(10, 14)
+        plot.show()
+        QApplication.processEvents()
+        self.assertIn("200 ≤ su", plot.legend.text())
+        self.assertIn("[su ≤ 5]", plot._readout_text(10.5, 0))
+        self.assertIn("[200 ≤ su]", plot._readout_text(10.5, .04))
+        plot._numeric_item._cache.clear()
+        strip = plot._numeric_item._strip("A", 0, .1, 100)
+        self.assertEqual(strip.pixelColor(4, 2).name(), "#ff0000")
+        self.assertEqual(strip.pixelColor(4, 45).name(), "#0000ff")
+        plot.close()
+
+    def test_classes_dialog_reuses_range_rows_and_summarises(self):
+        from ..burial.numeric_profile_dialogs import ColourClassesDialog
+        dialog = ColourClassesDialog(["su", "kPa"], values=[1, 5, 5, 7, 50, None])
+        dialog.breaks.setText("5, 10")
+        dialog._from_breaks()
+        table = dialog.table
+        self.assertEqual(table.row_count(), 3)
+        self.assertIn("5 ≤ su &lt; 10</b> kPa — 3 sample(s), 60%", dialog.summary.text())
+        lower = table.table.cellWidget(1, table.col_lower)
+        lower.setCurrentIndex(lower.findData(False))
+        self.assertIn("No class covers su = 5", dialog.summary.text())
+        self.assertIn("Outside every class: 2 sample(s), 40%", dialog.summary.text())
+        dialog._accept()
+        self.assertEqual(dialog.classes[1]["min_inclusive"], False)
+        self.assertEqual(dialog.classes[1]["max_inclusive"], False)
+        self.assertTrue(all(c["colour"].startswith("#") for c in dialog.classes))
+        dialog.close()
+
+    def test_tab_custom_classes_mode(self):
+        class Dock:
+            def workbench_store(self):
+                return None
+        self.store.save_numeric_profiles(self.profiles)
+        classes = n.classes_from_breaks([1, 2, 3], ["#000001", "#000002", "#000003", "#000004"])
+        self.model.update_gen_params({"numeric_ground": {
+            "assignments": self.rows, "mode": 1,
+            "display": {"variable": ["su", "kPa"], "class_schemes": {n.scheme_key(["su", "kPa"]): classes}}}})
+        tab = GroundTab(self.model, Dock())
+        self.assertFalse(tab.numeric.edit_classes.isVisibleTo(tab.numeric))
+        tab.numeric.colour_mode.setCurrentIndex(tab.numeric.colour_mode.findData("classes"))
+        self.assertEqual(len(tab.plot._numeric_classes), 4)
+        self.assertTrue(tab.numeric.edit_classes.isVisibleTo(tab.numeric))
+        self.assertFalse(tab.numeric.ramp.isVisibleTo(tab.numeric))
+        display = json.loads(self.model.plan["params_json"])["numeric_ground"]["display"]
+        self.assertEqual(display["colour_mode"], "classes")
+        self.assertEqual(len(display["class_schemes"][n.scheme_key(["su", "kPa"])]), 4)
+        tab.close()
 
 
 if __name__ == "__main__":

@@ -169,6 +169,7 @@ class GroundModelPlot(QWidget):
         super().__init__(parent)
         self._numeric_index = None
         self._numeric_depth = None
+        self._numeric_classes = None
         self._units: List[Dict] = []
         self._classes_by_code: Dict[str, Dict] = {}
         self._scope = (0.0, 0.0)
@@ -264,28 +265,42 @@ class GroundModelPlot(QWidget):
         self._fit_depth()
 
     def set_numeric(self, index=None, settings=None):
-        from .numeric_profile_plot import colour_table
+        from . import numeric_profiles as numeric
+        from .numeric_profile_plot import OUTSIDE_CLASSES, colour_table
         settings = settings or {}
         self._numeric_index = index
         self._numeric_item.setVisible(index is not None)
         self._unit_item.setVisible(index is None)
         self._numeric_depth = None
+        self._numeric_classes = None
         if index is None:
             self.set_units(self._units, list(self._classes_by_code.values()))
             return
         limits = index.limits() if settings.get("auto_colour", True) else (
             settings.get("colour_min", 0), settings.get("colour_max", 1))
-        ramp, bands = settings.get("ramp", "Viridis"), settings.get("bands", 0)
-        self._numeric_item.set_profiles(index, limits, ramp, bands)
+        mode = numeric.display_mode(settings)
+        ramp = settings.get("ramp", "Viridis")
+        bands = settings.get("bands", 0) if mode == "bands" else 0
+        classes = numeric.display_classes(settings)
+        self._numeric_classes = classes
+        self._numeric_item.set_profiles(index, limits, ramp, bands, classes)
         self._numeric_depth = (settings.get("depth_min", 0), settings.get("depth_max", 3))
         self._fit_depth()
+        variable = settings.get("variable", ["", ""])
+        notes = "Grey: missing; hatching: flagged; amber: assignment overlap; blank: no coverage"
+        if classes:
+            items = [f"<span style='color:{c['colour']}; font-size:15px'>■</span> "
+                     f"{_esc(numeric.class_label(c, variable[0]))}" for c in classes]
+            items.append("<span style='color:#{:02x}{:02x}{:02x}; font-size:15px'>■</span> "
+                         "outside classes".format(*OUTSIDE_CLASSES[:3]))
+            self.legend.setText(f"{_esc(variable[0])} ({_esc(variable[1])}) &nbsp; " + " &nbsp; ".join(items)
+                                + f" &nbsp; {notes}")
+            return
         colors = colour_table(ramp, bands)
         swatches = "".join("<span style='background:#{:02x}{:02x}{:02x}'>&nbsp;</span>".format(*colors[i][:3])
                            for i in range(0, 256, 8))
-        variable = settings.get("variable", ["", ""])
         self.legend.setText(f"{_esc(variable[0])} ({_esc(variable[1])}) &nbsp; "
-                            f"{limits[0]:g} {swatches} {limits[1]:g} &nbsp; "
-                            "Grey: missing; hatching: flagged; amber: assignment overlap; blank: no coverage")
+                            f"{limits[0]:g} {swatches} {limits[1]:g} &nbsp; {notes}")
 
     def set_scope(self, start_kp: float, end_kp: float) -> None:
         lo, hi = sorted((float(start_kp), float(end_kp)))
@@ -399,7 +414,12 @@ class GroundModelPlot(QWidget):
                     lines.append(f"{profile['variable']}: missing {profile['units']}; Coverage: unmeasured depth")
                 else:
                     value = "missing" if sample["value"] is None else f"{sample['value']:g}"
-                    lines.append(f"{profile['variable']}: {value} {profile['units']}; "
+                    category = ""
+                    if self._numeric_classes and sample["value"] is not None:
+                        from .numeric_profiles import class_label, class_of
+                        hit_class = class_of(sample["value"], self._numeric_classes)
+                        category = f" [{class_label(hit_class, profile['variable']) if hit_class else 'outside classes'}]"
+                    lines.append(f"{profile['variable']}: {value} {profile['units']}{category}; "
                                  f"sample depth {sample['depth']:g} m")
                     lines.append(f"Coverage: {sample['top']:g}–{sample['base']:g} m; "
                                  f"{sample['flags'] or 'measured'}")

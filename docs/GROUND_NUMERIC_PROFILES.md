@@ -5,12 +5,26 @@ The existing **Soil classes** view and editing tools remain available. Only the
 top-level Acquired Data, Assessment and Reporting tabs are disabled while they
 are under development.
 
+The workflow has three steps, matching the numbered buttons:
+
+1. **Import profiles…**: one table of depth/value rows for all investigations.
+2. **Assign KP ranges…**: a table or QGIS layer naming where along the route each
+   investigation applies (or **Assign by polygons…**).
+3. Choose the variable, depth range and **Colours**: a continuous ramp, equal
+   bands, or **Custom classes** with value ranges and colours you define.
+
 ## 1. Import investigation measurements
 
-Choose **Import profiles…** and a CSV, TSV, delimited text, XLSX or XLSM file.
-Select the worksheet and header row, then use the preview and column selectors.
-Column names are suggestions only: map your own identifiers and variables.
-Identifiers are trimmed and matched exactly, including case and leading zeros.
+Choose **Import profiles…** and either a CSV, TSV, delimited text, XLSX or XLSM
+file or a layer/table already loaded in QGIS. Select the worksheet and header
+row, then map each column using the preview. Nothing is mapped from column
+names: you choose every column. A mapped column stays selected when you change
+the header row or worksheet and the same header is still present. The line
+above the **Import** button checks the mapping as you change it and reports the
+number of investigations, variables and depth samples (or the first problem
+found). Identifiers are trimmed and matched exactly, including case and leading
+zeros. Map a quality/flags column only when its values mark exceptions: every
+cell with a non-blank flag is hatched.
 
 A long-format file can contain several investigations and variables:
 
@@ -71,10 +85,13 @@ does not guess where they apply. Choose either:
   Empty/invalid geometry rejects assignment. Polygons without IDs or route
   crossings are reported. These are saved assignment snapshots; rerun assignment
   after editing the polygon layer.
-- **Assign by KP table…**: map investigation ID, start KP and end KP from a
-  CSV/TSV/Excel table. Choose km or m and specify the source KP reference using
+- **Assign KP ranges…**: map investigation ID, start KP and end KP from a
+  CSV/TSV/Excel table or from any loaded QGIS layer or table (geometry is not
+  used). Choose km or m and specify the source KP reference using
   the existing current-route / RPL revision / constant shift / matched-pairs
-  controls. Delivered KPs and mapping flags are retained.
+  controls. The check line lists IDs with no imported profile and suggests a
+  near match where only case, spaces or punctuation differ. Delivered KPs and
+  mapping flags are retained.
 
 ```csv
 Investigation,FromKP,ToKP
@@ -98,10 +115,23 @@ flags. **Keep KP numbers** retains their numbers, as for the other plan data.
 
 ## 3. Read the numeric view
 
-Select a variable/unit pair, depth limits, colour ramp and continuous colours
-or 2–32 equal-width discrete bands. Automatic colour limits use all measured
-values for the selected variable in assigned investigations, independent of the
-visible KP/depth window. Manual limits clip colours at the chosen endpoints.
+Select a variable/unit pair, depth limits and one of three **Colours** modes:
+
+- **Continuous ramp** or **Equal bands** (2–32 equal-width bands). Automatic
+  colour limits use all measured values for the selected variable in assigned
+  investigations, independent of the visible KP/depth window. Manual limits clip
+  colours at the chosen endpoints.
+- **Custom classes**: value ranges with a colour each, edited with the same
+  rows as the Exclusions value ranges: **From** with ≥ or >, **To** with < or ≤,
+  either side blank for an open-ended class. Rows are checked in order and the
+  first matching row's colour is used. **Create classes** turns a list of break
+  values into one class below the first break, one between each pair (≥ lower,
+  < upper) and one above the last, coloured from the chosen ramp; adjust the
+  bounds and double-click a colour to change it. A summary under the table lists
+  each class with its number and share of assigned samples, values outside every
+  class (drawn dark grey), uncovered ranges and overlapping rows. Each variable
+  keeps its own classes, and the legend and hover readout name the class.
+
 Use **Apply display** after editing depth or manual colour limits. Settings are
 saved with the plan; panning and zooming never change the colour scale.
 

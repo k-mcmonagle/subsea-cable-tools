@@ -10,11 +10,22 @@ from __future__ import annotations
 import bisect
 import json
 import math
+import re
 import uuid
 from collections import defaultdict
 
+from . import attribute_rules
+
 
 MISSING = {"", "na", "n/a", "null", "none", "nan", "-", "nodata"}
+
+ROLE_LABELS = {"source_id": "investigation ID", "depth": "depth", "start_kp": "start KP",
+               "end_kp": "end KP"}
+
+
+def compact(text):
+    """ID comparison key for near-match hints: no case, spaces or punctuation."""
+    return re.sub(r"[^a-z0-9]", "", str(text).casefold())
 
 
 def number(value, *, optional=False, decimal_comma=False, missing=()):
@@ -47,7 +58,7 @@ def import_profiles(rows, mapping, *, variables=(), variable="", units="",
         raise ValueError("Point sample support must be positive (metres).")
     for role in ("source_id", "depth"):
         if mapping.get(role) is None:
-            raise ValueError(f"Map the {role} column.")
+            raise ValueError(f"Map the {ROLE_LABELS.get(role, role)} column.")
     if not variables and mapping.get("value") is None:
         raise ValueError("Map a value column or select wide-format variables.")
     grouped = defaultdict(list)
@@ -112,7 +123,7 @@ def import_assignments(rows, mapping, kp_map=None, *, kp_scale=1.0, decimal_comm
                        source_ref=""):
     for role in ("source_id", "start_kp", "end_kp"):
         if mapping.get(role) is None:
-            raise ValueError(f"Map the {role} column.")
+            raise ValueError(f"Map the {ROLE_LABELS.get(role, role)} column.")
     result = []
     for line, row in enumerate(rows, 1):
         try:
@@ -207,3 +218,129 @@ class ProfileIndex:
             return 0.0, 1.0
         lo, hi = min(values), max(values)
         return (lo, hi) if hi > lo else (lo - max(abs(lo) * .01, .5), hi + max(abs(hi) * .01, .5))
+
+
+def normalise_classes(rows):
+    """Validated colour classes, in row order (the first matching row wins).
+
+    Each class is an ``attribute_rules`` range — ``min``/``max`` with
+    ``min_inclusive``/``max_inclusive`` (either side open) — plus a
+    ``colour`` and optional ``label``, as in the Exclusions value ranges.
+    """
+    out = []
+    for n, row in enumerate(rows, 1):
+        item = {"min": row.get("min"), "max": row.get("max"),
+                "min_inclusive": bool(row.get("min_inclusive", True)),
+                "max_inclusive": bool(row.get("max_inclusive", True))}
+        for key in ("min", "max"):
+            if item[key] is not None:
+                number = attribute_rules.to_number(item[key])
+                if number is None:
+                    raise ValueError(f"Class {n}: '{item[key]}' is not a number.")
+                item[key] = number
+        if item["min"] is None and item["max"] is None:
+            raise ValueError(f"Class {n}: enter a From or To value.")
+        problem = attribute_rules.validate_rule(item)
+        if problem:
+            raise ValueError(f"Class {n}: {problem}.")
+        colour = str(row.get("colour") or "")
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", colour):
+            raise ValueError(f"Class {n}: colour must be #rrggbb.")
+        item.update(colour=colour.lower(), label=str(row.get("label") or "").strip())
+        out.append(item)
+    if not out:
+        raise ValueError("Add at least one class.")
+    return out
+
+
+def classes_from_breaks(breaks, colours):
+    """Classes either side of the sorted, distinct ``breaks``: ≥ a … < b."""
+    edges = sorted(set(breaks))
+    if not edges:
+        raise ValueError("Enter at least one break value.")
+    bounds = list(zip([None] + edges, edges + [None]))
+    return [{"min": lo, "max": hi, "min_inclusive": True, "max_inclusive": False,
+             "colour": colours[i % len(colours)], "label": ""}
+            for i, (lo, hi) in enumerate(bounds)]
+
+
+def class_label(item, name="value"):
+    return item.get("label") or attribute_rules.describe_rule(item, name)
+
+
+def class_of(value, classes):
+    """The first class containing ``value``, or None (missing or uncovered)."""
+    if value is None:
+        return None
+    return attribute_rules.first_matching_rule(classes, value)
+
+
+def _edges(item):
+    lo = (-math.inf, False) if item["min"] is None else (item["min"], item["min_inclusive"])
+    hi = (math.inf, False) if item["max"] is None else (item["max"], item["max_inclusive"])
+    return lo, hi
+
+
+def class_coverage(classes, name="value"):
+    """Readable notes on value ranges no class covers, and overlapping rows."""
+    def text(lo, hi):
+        rule = {"min": None if lo[0] == -math.inf else lo[0], "max": None if hi[0] == math.inf else hi[0],
+                "min_inclusive": lo[1], "max_inclusive": hi[1]}
+        if rule["min"] is not None and rule["min"] == rule["max"]:
+            return f"{name} = {rule['min']:g}"
+        return attribute_rules.describe_rule(rule, name)
+
+    ordered = sorted(((_edges(c), i + 1) for i, c in enumerate(classes)),
+                     key=lambda e: (e[0][0][0], not e[0][0][1]))
+    gaps, overlaps = [], []
+    reach, reach_row = (-math.inf, False), None
+    for (lo, hi), row in ordered:
+        if lo[0] > reach[0] or (lo[0] == reach[0] and not lo[1] and not reach[1]):
+            if not (lo[0] == -math.inf and reach[0] == -math.inf):
+                # Uncovered between the reach and this lower bound.
+                gaps.append(text((reach[0], not reach[1]), (lo[0], not lo[1])))
+        elif reach_row is not None and (lo[0] < reach[0] or (lo[0] == reach[0] and lo[1] and reach[1])):
+            overlaps.append(f"rows {reach_row} and {row}")
+        if hi[0] > reach[0] or (hi[0] == reach[0] and hi[1] and not reach[1]):
+            reach, reach_row = hi, row
+    if reach[0] < math.inf:
+        gaps.append(text((reach[0], not reach[1]), (math.inf, False)))
+    notes = []
+    if gaps:
+        notes.append("No class covers " + "; ".join(gaps) + " (drawn dark grey).")
+    if overlaps:
+        notes.append("Overlapping " + "; ".join(overlaps) + ": the first matching row's colour is used.")
+    return notes
+
+
+def scheme_key(variable):
+    return json.dumps(list(variable or ["", ""]), ensure_ascii=False)
+
+
+def display_mode(settings):
+    """Colour mode of saved display settings; older plans stored only bands."""
+    mode = settings.get("colour_mode")
+    if mode in ("continuous", "bands", "classes"):
+        return mode
+    return "bands" if (settings.get("bands") or 0) >= 2 else "continuous"
+
+
+def display_classes(settings):
+    """The selected variable's classes when classes are shown, else None."""
+    if display_mode(settings) != "classes":
+        return None
+    scheme = (settings.get("class_schemes") or {}).get(scheme_key(settings.get("variable")))
+    try:
+        return normalise_classes(scheme) if scheme else None
+    except ValueError:
+        return None
+
+
+def unmatched_ids(ids, known):
+    """IDs with no imported profile, each with a near match when one exists."""
+    folded = {compact(k): k for k in known}
+    out = []
+    for source in sorted(set(ids) - set(known)):
+        near = folded.get(compact(source))
+        out.append(f"{source} (did you mean {near}?)" if near else source)
+    return out

@@ -101,6 +101,62 @@ class NumericProfilesTests(unittest.TestCase):
                 {"source_id": "B", "start_kp": 1, "end_kp": 2}]
         self.assertEqual(n.coverage_runs(rows), [(0, 1, (0,)), (1, 2, (1,))])
 
+    def test_custom_classes_bounds_first_match_and_labels(self):
+        classes = n.normalise_classes([
+            {"max": 5, "max_inclusive": False, "colour": "#FF0000", "label": "Band A"},
+            {"min": "5", "max": 10, "min_inclusive": True, "max_inclusive": False, "colour": "#ffff00"},
+            {"min": 10, "max": 200, "min_inclusive": True, "max_inclusive": True, "colour": "#00ff00"},
+            {"min": 200, "min_inclusive": False, "colour": "#ff0000"}])
+        self.assertEqual(classes[0]["colour"], "#ff0000")
+        self.assertEqual(n.class_of(-3, classes)["label"], "Band A")
+        self.assertEqual(n.class_of(5, classes)["min"], 5)
+        self.assertEqual(n.class_of(200, classes)["min"], 10)
+        self.assertEqual(n.class_of(200.5, classes)["min"], 200)
+        self.assertIsNone(n.class_of(None, classes))
+        self.assertEqual([n.class_label(c, "su") for c in classes],
+                         ["Band A", "5 ≤ su < 10", "10 ≤ su ≤ 200", "200 < su"])
+        self.assertEqual(n.class_coverage(classes, "su"), [])
+        # Rows are kept in order; the first matching row wins on overlap.
+        overlap = n.normalise_classes([{"min": 0, "max": 6, "colour": "#000001"},
+                                       {"min": 5, "max": 9, "colour": "#000002"}])
+        self.assertEqual(n.class_of(5.5, overlap)["colour"], "#000001")
+        self.assertEqual(n.class_coverage(overlap, "su"),
+                         ["No class covers su < 0; 9 < su (drawn dark grey).",
+                          "Overlapping rows 1 and 2: the first matching row's colour is used."])
+        for bad in ([], [{"min": 6, "max": 5, "colour": "#000000"}], [{"colour": "#000000"}],
+                    [{"min": "x", "max": 9, "colour": "#000000"}], [{"min": 0, "max": 9, "colour": "red"}]):
+            with self.assertRaises(ValueError):
+                n.normalise_classes(bad)
+
+    def test_class_coverage_gaps_and_touching_bounds(self):
+        def rows(*specs):
+            return n.normalise_classes([dict(zip(("min", "max", "min_inclusive", "max_inclusive"), spec),
+                                             colour="#000000") for spec in specs])
+        self.assertEqual(n.class_coverage(rows((None, 5, True, False), (5, None, True, True))), [])
+        self.assertEqual(n.class_coverage(rows((None, 5, True, False), (5, None, False, True))),
+                         ["No class covers value = 5 (drawn dark grey)."])
+        self.assertEqual(n.class_coverage(rows((None, 5, True, True), (5, None, True, True)))[0][:19],
+                         "Overlapping rows 1 ")
+        self.assertEqual(n.class_coverage(rows((None, 5, True, False), (7, None, True, True))),
+                         ["No class covers 5 ≤ value < 7 (drawn dark grey)."])
+
+    def test_classes_from_breaks_and_saved_display_modes(self):
+        classes = n.classes_from_breaks([30, 1, 4, 1], ["#a00000", "#b00000"])
+        self.assertEqual([(c["min"], c["max"]) for c in classes], [(None, 1), (1, 4), (4, 30), (30, None)])
+        self.assertEqual(classes[2]["colour"], "#a00000")
+        self.assertEqual(n.class_of(4, n.normalise_classes(classes))["min"], 4)
+        self.assertEqual(n.display_mode({"bands": 4}), "bands")
+        self.assertEqual(n.display_mode({"bands": 0}), "continuous")
+        settings = {"colour_mode": "classes", "variable": ["su", "kPa"],
+                    "class_schemes": {n.scheme_key(["su", "kPa"]): classes}}
+        self.assertEqual(len(n.display_classes(settings)), 4)
+        self.assertIsNone(n.display_classes(dict(settings, variable=["qc", "MPa"])))
+        self.assertIsNone(n.display_classes(dict(settings, colour_mode="continuous")))
+
+    def test_unmatched_ids_suggest_near_matches(self):
+        self.assertEqual(n.unmatched_ids(["CPT-01", "cpt 02", "X"], {"CPT-01", "CPT_02"}),
+                         ["X", "cpt 02 (did you mean CPT_02?)"])
+
 
 if __name__ == "__main__":
     unittest.main()
