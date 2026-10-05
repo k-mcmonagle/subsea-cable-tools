@@ -42,7 +42,7 @@ from ..workbench.schema import (  # noqa: F401  (re-exported for the package)
     utc_now_iso,
 )
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 # Registry table names ------------------------------------------------------
 TABLE_META = "bp_meta"
@@ -61,6 +61,7 @@ TABLE_PATH_RESULT = "bp_path_result"
 TABLE_LAYBACK_PROFILE = "bp_layback_profile"
 TABLE_VESSEL = "bp_vessel"
 TABLE_GROUND_UNIT = "bp_ground_unit"
+TABLE_GROUND_PROFILE = "bp_ground_profile"
 TABLE_GROUND_CLASS = "bp_ground_class"
 TABLE_BAS_ROW = "bp_bas_row"
 TABLE_ANALYSIS = "bp_analysis"
@@ -711,6 +712,12 @@ GROUND_UNIT_FIELDS: List[FieldSpec] = [
     ("notes", "str"),
 ]
 
+# Project-scoped measurements. Route assignments live separately in plan params.
+GROUND_PROFILE_FIELDS: List[FieldSpec] = [
+    ("profile_id", "str"), ("source_id", "str"), ("variable", "str"),
+    ("units", "str"), ("samples_json", "str"), ("provenance_json", "str"),
+]
+
 # Project-scoped soil-class vocabulary (colour + group per code).
 GROUND_CLASS_FIELDS: List[FieldSpec] = [
     ("class_id", "str"),
@@ -786,6 +793,7 @@ REGISTRY_TABLES: Dict[str, List[FieldSpec]] = {
     TABLE_LAYBACK_PROFILE: LAYBACK_PROFILE_FIELDS,
     TABLE_VESSEL: VESSEL_FIELDS,
     TABLE_GROUND_UNIT: GROUND_UNIT_FIELDS,
+    TABLE_GROUND_PROFILE: GROUND_PROFILE_FIELDS,
     TABLE_GROUND_CLASS: GROUND_CLASS_FIELDS,
     TABLE_BAS_ROW: BAS_ROW_FIELDS,
     TABLE_ANALYSIS: ANALYSIS_FIELDS,
@@ -809,6 +817,7 @@ TABLE_KEYS: Dict[str, str] = {
     TABLE_LAYBACK_PROFILE: "layback_id",
     TABLE_VESSEL: "vessel_id",
     TABLE_GROUND_UNIT: "unit_id",
+    TABLE_GROUND_PROFILE: "profile_id",
     TABLE_GROUND_CLASS: "class_id",
     TABLE_BAS_ROW: "row_id",
     TABLE_ANALYSIS: "analysis_id",

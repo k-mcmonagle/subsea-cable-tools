@@ -47,6 +47,7 @@ QT6_ENUMS_FILE = Path(__file__).resolve().with_name("qt6_unscoped_enums.json")
 IGNORE_PRAGMA = "qgis-compat: ignore"
 
 CHECKS = (
+    ("QSvgWidget from QtSvg (use qgis_compat)", re.compile(r"QtSvg\s+import\s+.*\bQSvgWidget\b")),
     ("Qt exec_", re.compile(r"\.exec_\(")),
     ("QAction from QtWidgets", re.compile(r"QtWidgets\s+import\s+.*\bQAction\b")),
     ("unscoped QDialog result", re.compile(r"QDialog\.Accepted")),

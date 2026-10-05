@@ -397,7 +397,10 @@ class BurialProfileWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.plot = pg.PlotWidget()
+        from ..kp_axis_item import KPAxisItem
+        kp_axis = KPAxisItem()
+        kp_axis.set_linear()
+        self.plot = pg.PlotWidget(axisItems={"bottom": kp_axis})
         self.plot.setBackground("w")
         # Right-click context menu: view-all, axis options, export (CSV/PNG/
         # SVG). kpClicked is emitted for left clicks only, so the menu and
@@ -419,7 +422,9 @@ class BurialProfileWidget(QWidget):
         # Slope panel: a second x-linked plot under the depth profile.
         # Longitudinal +ve = up-slope; cross +ve = deeper to starboard of
         # travel; absolute = combined gradient magnitude.
-        self.slope_plot = pg.PlotWidget()
+        slope_kp_axis = KPAxisItem()
+        slope_kp_axis.set_linear()
+        self.slope_plot = pg.PlotWidget(axisItems={"bottom": slope_kp_axis})
         self.slope_plot.setBackground("w")
         self.slope_plot.setMenuEnabled(True)
         self.slope_plot.setLabel("bottom", "KP", units="km")
@@ -1158,8 +1163,9 @@ class BurialProfileWidget(QWidget):
     def set_scope(self, start_kp: float, end_kp: float) -> None:
         lo, hi = min(start_kp, end_kp), max(start_kp, end_kp)
         self._scope = (lo, hi)
-        if hi > lo:
-            self.plot.setXRange(lo, hi, padding=0.02)
+        # Generation pads an unset scope by 1e-9 km. That numerical guard
+        # is not a useful viewport: keep an empty plot at a readable scale.
+        self.plot.setXRange(lo, hi if hi - lo > 1e-9 else lo + 1.0, padding=0.02)
         self._update_sea_level()
 
     def set_slope_window_m(self, step_m: float) -> None:
@@ -1651,8 +1657,7 @@ class BurialProfileWidget(QWidget):
                 return
 
     def clear(self) -> None:
-        self._scope = (0.0, 0.0)
-        self._update_sea_level()
+        self.set_scope(0.0, 0.0)
         self.set_profile([])
         self.set_overlays(generation.ResolutionContext())
         self.set_hazards([])
@@ -1717,7 +1722,9 @@ class BurialProfileWidget(QWidget):
 
     def reset_scope_view(self) -> None:
         lo, hi = self._scope
-        if hi > lo:
+        if hi - lo <= 1e-9:
+            self.plot.setXRange(lo, lo + 1.0, padding=0.02)
+        elif hi > lo:
             if self.true_scale():
                 self._fit_true_scale()
             else:

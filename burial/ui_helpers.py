@@ -55,6 +55,25 @@ except ImportError:  # pragma: no cover - very old bindings
         _sip = None
 
 
+class KpSpinBox(QDoubleSpinBox):
+    """Show metre-resolution KPs without rounding stored route endpoints."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDecimals(9)
+        self.setSingleStep(0.001)
+
+    def textFromValue(self, value):
+        return self.locale().toString(value, "f", 3)
+
+    def valueFromText(self, text):
+        value = super().valueFromText(text)
+        displayed = super().valueFromText(self.textFromValue(self.value()))
+        # Focus changes / Apply must not turn a precise Full route endpoint
+        # into its rounded label. A different entered KP remains an edit.
+        return self.value() if value == displayed else value
+
+
 def _sip_isdeleted(obj) -> bool:
     if _sip is None:
         return False

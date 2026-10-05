@@ -16,6 +16,7 @@ from qgis.PyQt.QtCore import QSettings, Qt
 from qgis.PyQt.QtGui import QBrush, QColor
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -42,6 +43,7 @@ from ...qgis_compat import (
 from .. import change_log, ground_model, schema, ui_helpers
 from ..ground_dialogs import ClassesDialog, GroundImportDialog, RereferenceDialog
 from ..ground_plot import GroundModelPlot
+from ..numeric_profile_panel import NumericProfilePanel
 
 _VERTICAL = getattr(Qt, "Orientation", Qt).Vertical
 _SETTINGS_ROOT = "SubseaCableTools/BurialPlanner"
@@ -86,14 +88,20 @@ class GroundTab(QWidget):
         layout.setContentsMargins(4, 4, 4, 4)
 
         intro = QLabel(
-            "Soil units along the route by depth below seabed. Import the "
-            "ground model from a CSV/XLSX table (stating which RPL revision "
-            "its KPs follow), or add and edit units here. The KP axis is "
-            "linked to the bathymetry profile below; the dashed line is the "
-            "plan's target burial depth.")
+            "Ground conditions by KP and depth below seabed. Select soil classes "
+            "or numeric investigation profiles. The KP axis follows bathymetry; "
+            "the dashed line shows target burial depth.")
         intro.setWordWrap(True)
         intro.setStyleSheet(ui_helpers.hint_style())
         layout.addWidget(intro)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Display:"))
+        self.display_mode = QComboBox()
+        self.display_mode.addItems(["Soil classes", "Numeric properties"])
+        mode_row.addWidget(self.display_mode)
+        mode_row.addStretch()
+        layout.addLayout(mode_row)
 
         toolbar = QHBoxLayout()
         self.import_button = QPushButton("Import…")
@@ -147,6 +155,7 @@ class GroundTab(QWidget):
         plot_layout.addWidget(self.plot_hint)
 
         table_pane = QWidget()
+        self.soil_table_pane = table_pane
         table_layout = QVBoxLayout(table_pane)
         table_layout.setContentsMargins(0, 0, 0, 0)
         edit_row = QHBoxLayout()
@@ -215,13 +224,44 @@ class GroundTab(QWidget):
                 f"{_SETTINGS_ROOT}/ground_splitter_state", self.splitter.saveState()))
         layout.addWidget(self.splitter, 1)
 
+        self.numeric = NumericProfilePanel(model, dock, self.plot, self)
+        layout.insertWidget(3, self.numeric)
+        self.numeric.hide()
+        self.display_mode.currentIndexChanged.connect(self._display_changed)
+        model.groundChanged.connect(self.numeric.reload_sources)
+
         refresh_soon = ui_helpers.coalesced(self, self.refresh)
         model.planChanged.connect(refresh_soon)
         model.groundChanged.connect(refresh_soon)
         self.refresh()
 
+    def _display_visibility(self, index):
+        self.numeric.active = index == 1
+        self.numeric.setVisible(index == 1)
+        self.soil_table_pane.setVisible(index == 0)
+        self.plot_hint.setText(
+            "Hover for source ID, depth, value, units and coverage; click an assigned interval to inspect its source profile."
+            if index else "Hover for KP / depth / unit; click to select the soil unit and go to that KP.")
+        for widget in (self.import_button, self.export_button, self.rereference_button,
+                       self.classes_button, self.show_map, self.status_label):
+            widget.setVisible(index == 0)
+        if not index and self.plot._numeric_index is not None:
+            self.plot.set_numeric(None)
+
+    def _display_changed(self, index):
+        self._display_visibility(index)
+        if self.model.plan:
+            self.numeric._save({"mode": index}, "Ground model display mode")
+        self._refresh_plot()
+
     # -- refresh ---------------------------------------------------------------
     def refresh(self) -> None:
+        self.numeric.refresh()
+        mode = self.numeric.state.get("mode", 0)
+        self.display_mode.blockSignals(True)
+        self.display_mode.setCurrentIndex(mode)
+        self.display_mode.blockSignals(False)
+        self._display_visibility(mode)
         plan_id = self.model.plan_id
         has_plan = bool(self.model.plan)
         for button in (self.import_button, self.export_button,
@@ -257,6 +297,7 @@ class GroundTab(QWidget):
         self.plot.set_scope(scope.start_km, scope.end_km)
         self.plot.set_target_runs(self.model.target_runs()
                                   if self.model.plan else [])
+        self.numeric.render()
 
     def _update_status(self) -> None:
         if not self._working:

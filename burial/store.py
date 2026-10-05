@@ -656,6 +656,23 @@ class BurialStore:
         self._replace_plan_rows(schema.TABLE_SECTION, plan_id, normalised)
 
     # -- ground model --------------------------------------------------------
+    def list_numeric_profiles(self) -> List[Dict]:
+        profiles = []
+        for row in self.read_table(schema.TABLE_GROUND_PROFILE):
+            row["samples"] = json.loads(row.pop("samples_json") or "[]")
+            row["provenance"] = json.loads(row.pop("provenance_json") or "{}")
+            profiles.append(row)
+        return profiles
+
+    def save_numeric_profiles(self, profiles) -> None:
+        rows = []
+        for profile in profiles:
+            row = {key: profile[key] for key in ("profile_id", "source_id", "variable", "units")}
+            row["samples_json"] = json.dumps(profile["samples"], allow_nan=False)
+            row["provenance_json"] = json.dumps(profile.get("provenance", {}), allow_nan=False)
+            rows.append(row)
+        self.upsert_rows(schema.TABLE_GROUND_PROFILE, rows)
+
     def list_ground_units(self, plan_id: str) -> List[Dict]:
         rows = self.read_plan_table(schema.TABLE_GROUND_UNIT, plan_id)
         rows.sort(key=lambda r: (int(r.get("seq") or 0),

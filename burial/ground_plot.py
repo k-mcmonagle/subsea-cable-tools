@@ -163,15 +163,21 @@ class GroundModelPlot(QWidget):
     kpHovered = pyqtSignal(float)
     kpClicked = pyqtSignal(float)
     unitClicked = pyqtSignal(str)
+    profileClicked = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._numeric_index = None
+        self._numeric_depth = None
         self._units: List[Dict] = []
         self._classes_by_code: Dict[str, Dict] = {}
         self._scope = (0.0, 0.0)
         self._target_m: Optional[float] = None
 
-        self.plot = pg.PlotWidget()
+        from ..kp_axis_item import KPAxisItem
+        kp_axis = KPAxisItem()
+        kp_axis.set_linear()
+        self.plot = pg.PlotWidget(axisItems={"bottom": kp_axis})
         self.plot.setBackground("w")
         self.plot.setMenuEnabled(True)
         self.plot.setLabel("bottom", "KP", units="km")
@@ -192,6 +198,12 @@ class GroundModelPlot(QWidget):
         self._unit_item = UnitPolygonItem()
         self._unit_item.setZValue(5)
         item.addItem(self._unit_item)
+
+        from .numeric_profile_plot import NumericProfileItem
+        self._numeric_item = NumericProfileItem()
+        self._numeric_item.setZValue(5)
+        self._numeric_item.setVisible(False)
+        item.addItem(self._numeric_item)
 
         self._seabed_line = pg.InfiniteLine(
             angle=0, pos=0.0, movable=False,
@@ -250,6 +262,30 @@ class GroundModelPlot(QWidget):
         self._unit_item.set_units(self._units, colors)
         self._update_legend(codes, colors)
         self._fit_depth()
+
+    def set_numeric(self, index=None, settings=None):
+        from .numeric_profile_plot import colour_table
+        settings = settings or {}
+        self._numeric_index = index
+        self._numeric_item.setVisible(index is not None)
+        self._unit_item.setVisible(index is None)
+        self._numeric_depth = None
+        if index is None:
+            self.set_units(self._units, list(self._classes_by_code.values()))
+            return
+        limits = index.limits() if settings.get("auto_colour", True) else (
+            settings.get("colour_min", 0), settings.get("colour_max", 1))
+        ramp, bands = settings.get("ramp", "Viridis"), settings.get("bands", 0)
+        self._numeric_item.set_profiles(index, limits, ramp, bands)
+        self._numeric_depth = (settings.get("depth_min", 0), settings.get("depth_max", 3))
+        self._fit_depth()
+        colors = colour_table(ramp, bands)
+        swatches = "".join("<span style='background:#{:02x}{:02x}{:02x}'>&nbsp;</span>".format(*colors[i][:3])
+                           for i in range(0, 256, 8))
+        variable = settings.get("variable", ["", ""])
+        self.legend.setText(f"{_esc(variable[0])} ({_esc(variable[1])}) &nbsp; "
+                            f"{limits[0]:g} {swatches} {limits[1]:g} &nbsp; "
+                            "Grey: missing; hatching: flagged; amber: assignment overlap; blank: no coverage")
 
     def set_scope(self, start_kp: float, end_kp: float) -> None:
         lo, hi = sorted((float(start_kp), float(end_kp)))
@@ -314,6 +350,9 @@ class GroundModelPlot(QWidget):
         self._readout.setVisible(False)
 
     def _fit_depth(self) -> None:
+        if self._numeric_depth is not None:
+            self.plot.getPlotItem().vb.setYRange(*self._numeric_depth, padding=0)
+            return
         deepest = max(self._unit_item.depth_extent, self._target_m or 0.0)
         span = max(deepest + _OPEN_EXTRA_M, _MIN_DEPTH_SPAN_M)
         self.plot.getPlotItem().vb.setYRange(0.0, span, padding=0.04)
@@ -344,6 +383,29 @@ class GroundModelPlot(QWidget):
 
     def _readout_text(self, kp: float, depth: float) -> str:
         lines = [f"KP {schema.format_kp(kp)}   {max(0.0, depth):.2f} m bsb"]
+        if self._numeric_index is not None:
+            hits = self._numeric_index.at(kp, depth)
+            if not hits:
+                lines.append("Coverage: no route assignment")
+            if len(hits) > 1:
+                lines.append("Coverage: overlapping assignments — no value selected")
+            for assignment, sample in hits:
+                source = assignment["source_id"]
+                profile = self._numeric_index.profiles.get(source)
+                lines.append(f"Source: {source}; KP {assignment['start_kp']:.3f}–{assignment['end_kp']:.3f}")
+                if profile is None:
+                    lines.append("Coverage: unmatched ID or selected variable unavailable")
+                elif sample is None:
+                    lines.append(f"{profile['variable']}: missing {profile['units']}; Coverage: unmeasured depth")
+                else:
+                    value = "missing" if sample["value"] is None else f"{sample['value']:g}"
+                    lines.append(f"{profile['variable']}: {value} {profile['units']}; "
+                                 f"sample depth {sample['depth']:g} m")
+                    lines.append(f"Coverage: {sample['top']:g}–{sample['base']:g} m; "
+                                 f"{sample['flags'] or 'measured'}")
+                if assignment.get("flags"):
+                    lines.append("Assignment: " + assignment["flags"])
+            return "\n".join(lines)
         hit = self.unit_at(kp, depth) if depth >= 0 else None
         if hit is not None:
             code = hit.get("soil_class") or "(unclassified)"
@@ -390,6 +452,12 @@ class GroundModelPlot(QWidget):
         if hit is None:
             return
         kp, depth = hit
+        if self._numeric_index is not None:
+            sources = list(dict.fromkeys(a["source_id"] for a, _s in self._numeric_index.at(kp, depth)))
+            for source in sources:
+                self.profileClicked.emit(source)
+            self.kpClicked.emit(kp)
+            return
         unit = self.unit_at(kp, depth)
         if unit is not None and unit.get("unit_id"):
             self.unitClicked.emit(str(unit["unit_id"]))

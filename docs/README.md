@@ -4,6 +4,8 @@ The top-level [README](../README.md) is the short introduction and tool list. Us
 
 ## Methods
 
+- [Numeric Ground Model profiles](GROUND_NUMERIC_PROFILES.md) — import mapping, source measurements, polygon/KP assignments, coverage and display settings.
+
 - [KP and bathymetry methods](KP_AND_BATHYMETRY.md) — KP distance, CRS, bathymetry sampling, slope and coverage conventions.
 
 ## Design records

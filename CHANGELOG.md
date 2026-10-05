@@ -22,7 +22,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **Burial Planner profile:** show the route extent before scope is applied and use three-decimal KP tick labels on bathymetry and slope plots, avoiding scientific notation on an empty profile.
+
+- **KP displays:** show KPs to three decimal places (1 m), keeping precise Full route bounds internally when applying scope.
+
+- **Burial Planner:** set ordinary project line layers, including temporary routes, without Workbench RPL fields; use their measured extents for Full route scope and retain short-route precision.
+
+- **Burial Planner on Qt6:** load the SVG report widget from its Qt6 module, including OSGeo4W builds without the QGIS wrapper, while retaining Qt5 compatibility.
+
 ### Added
+
+- **Ground Model:** numeric depth profiles from mapped investigation tables, separate polygon/KP assignments, stable colour controls, missing-data flags and source inspection alongside soil classes.
+
+- **Burial Planner:** Acquired Data, Assessment and Reporting tabs are in development and shown disabled; Planning and all its subtabs are unchanged.
 
 - **Icons:** distinct toolbar and menu icons for the Cable Route Workbench, Planner, Burial Planner, Cable Lay Data Explorer and KP settings.
 - **KP settings:** new *Subsea Cable Tools ▸ KP settings…* switches KP measurement plugin-wide between Geodesic (WGS84, the default) and Cartesian grid distances (a chosen CRS, else the project CRS when projected, else the route's UTM zone), so Cartesian KP now works for routes in any CRS.

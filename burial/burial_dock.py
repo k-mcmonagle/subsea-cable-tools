@@ -101,6 +101,8 @@ from .tabs.review_tab import ReviewTab
 from .tabs.risk_tab import RiskTab
 from .tabs.rules_tab import RulesTab
 from .tabs.tools_tab import ToolsTab
+from .operations_controller import OperationsController
+from .tabs.operations_tabs import AcquiredDataTab, AssessmentTab, ReportingTab
 
 _VERTICAL = getattr(Qt, "Orientation", Qt).Vertical
 
@@ -244,7 +246,21 @@ class BurialPlannerDock(QDockWidget):
             self.inputs_tab: "Inputs",
             self.profile_tab: "Bathymetry Profile",
         }
-        self.splitter.addWidget(self.tabs)
+        self.operations = OperationsController(self.model, self)
+        self.workflow_tabs = QTabWidget()
+        self.workflow_tabs.addTab(self.tabs, "Planning")
+        self.acquired_tab = AcquiredDataTab(self.operations, self)
+        self.assessment_tab = AssessmentTab(self.operations, self, self)
+        self.reporting_tab = ReportingTab(self.operations, self)
+        self.workflow_tabs.addTab(self.acquired_tab, "Acquired Data")
+        self.workflow_tabs.addTab(self.assessment_tab, "Assessment")
+        self.workflow_tabs.addTab(self.reporting_tab, "Reporting")
+        # These workflows remain under development; Planning stays available.
+        for tab in (self.acquired_tab, self.assessment_tab, self.reporting_tab):
+            index = self.workflow_tabs.indexOf(tab)
+            self.workflow_tabs.setTabEnabled(index, False)
+            self.workflow_tabs.setTabToolTip(index, "Under development")
+        self.splitter.addWidget(self.workflow_tabs)
 
         profile_pane = QWidget()
         profile_layout = QVBoxLayout(profile_pane)
@@ -346,6 +362,7 @@ class BurialPlannerDock(QDockWidget):
         self.profile.set_slope_visible(self.slope_toggle.isChecked())
         profile_layout.addWidget(self.profile, 1)
         self.splitter.addWidget(profile_pane)
+        self.workflow_tabs.currentChanged.connect(lambda index: profile_pane.setVisible(index == 0))
         self.splitter.setStretchFactor(0, 3)
         self.splitter.setStretchFactor(1, 1)
         # The tabs' size hints could otherwise squash the profile pane on
@@ -1150,7 +1167,12 @@ class BurialPlannerDock(QDockWidget):
             return
         params = self.model.gen_params()
         scope = params.scope
-        self.profile.set_scope(scope.start_km, scope.end_km)
+        if params.scope_end_kp > params.scope_start_kp:
+            self.profile.set_scope(scope.start_km, scope.end_km)
+        else:
+            # Preview the route until a scope is applied. Do not use the
+            # generation engine's epsilon-sized placeholder as a viewport.
+            self.profile.set_scope(self.model.route.start_kp_km, self.model.route.end_kp_km)
         # Replaced with the stored profile's actual resolution when it is
         # displayed. This fallback covers the empty/loading state.
         self.profile.set_slope_window_m(
@@ -2387,6 +2409,8 @@ class BurialPlannerDock(QDockWidget):
     def _stop_activity(self) -> None:
         """Everything a closed or unloading dock must not keep running."""
         self._remove_project_hooks()
+        if hasattr(self, "operations"):
+            self.operations.cancel()
         self._refresh_pending = False
         try:
             self._layers_timer.stop()

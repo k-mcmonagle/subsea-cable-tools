@@ -671,7 +671,7 @@ def _point_distance(a, b):
 
 def _kp_spin():
     spin = QDoubleSpinBox()
-    spin.setDecimals(4)
+    spin.setDecimals(3)
     spin.setRange(-1_000_000.0, 1_000_000.0)
     spin.setSuffix(" km")
     return spin

@@ -81,3 +81,5 @@ These are in **Plugins ▸ Subsea Cable Tools**. The main toolbar has **KP Mouse
 - **Save Layers to GeoPackage** — save selected project layers into one GeoPackage.
 
 The [KP and bathymetry methods](docs/KP_AND_BATHYMETRY.md) explain distance, depth and slope conventions. The [changelog](CHANGELOG.md) records releases. Contributions and [pull requests](https://github.com/k-mcmonagle/subsea-cable-tools/pulls) are welcome. Please report bugs and suggestions in the [issue tracker](https://github.com/k-mcmonagle/subsea-cable-tools/issues).
+
+Ground Model numeric profiles: see the [import and assignment workflow](docs/GROUND_NUMERIC_PROFILES.md) for CPT and other investigation data.

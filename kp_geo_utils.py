@@ -976,6 +976,15 @@ class RouteFrame:
             # that passes the unlocked fast check sees a complete index.
             self._seg_end_m = seg_end
 
+    def measured_segments(self):
+        """Yield stored segment endpoints and their KPs using this frame's datum
+        and distance model. Disconnected parts never gain a joining segment.
+        """
+        self._ensure_chainage()
+        for p1, p2, length, offset in self._segs:
+            yield (p1, p2, self.start_kp_km + offset / 1000.0,
+                   self.start_kp_km + (offset + length) / 1000.0)
+
     def point_at_kp(self, kp_km: float, *, clamp: bool = False) -> Optional[QgsPointXY]:
         try:
             target_m = (float(kp_km) - self._start_kp_km) * 1000.0

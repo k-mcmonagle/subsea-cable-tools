@@ -126,6 +126,9 @@ def test_close_reopen_rearms_hooks_and_follows_project() -> bool:
 
         dock.refresh = counting_refresh
         ok = len(dock._project_hooks) == 3 and dock._watchdog.active
+        ok = ok and dock.workflow_tabs.isTabEnabled(0)
+        ok = ok and all(not dock.workflow_tabs.isTabEnabled(i) for i in (1, 2, 3))
+        ok = ok and dock.tabs.isTabEnabled(dock.tabs.indexOf(dock.ground_tab))
         ok = ok and dock.model.plan_id == h.plan_id
         dock.cursor_outline_toggle.setChecked(True)
 

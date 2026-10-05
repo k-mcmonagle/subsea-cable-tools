@@ -251,7 +251,7 @@ class InputsTab(QWidget):
             "Workbench — the plan is anchored to its revision.")
         self.route_layer_radio = QRadioButton("Project line layer")
         self.route_layer_radio.setToolTip(
-            "Fallback: any project line layer in Workbench RPL format.")
+            "Any project line layer; Workbench RPL fields are not required.")
         self._route_source = QButtonGroup(self)
         self._route_source.addButton(self.route_workbench_radio, 0)
         self._route_source.addButton(self.route_layer_radio, 1)
@@ -283,8 +283,10 @@ class InputsTab(QWidget):
         self.fallback_combo = QgsMapLayerComboBox()
         self.fallback_combo.setFilters(layer_filters(MAP_LAYER_FILTER_LINE))
         self.fallback_combo.setToolTip(
-            "Any project line layer in Workbench RPL format. Registering the "
-            "route in the Workbench is recommended.")
+            "Any project line layer, including temporary layers. No RPL fields "
+            "are required. Features follow SeqNo when present, otherwise layer "
+            "order; vertices keep their stored direction. Save temporary layers "
+            "to retain their geometry after closing QGIS.")
         fallback_row.addWidget(self.fallback_combo, 1)
         self.route_pages.addWidget(layer_page)
         route_row = QHBoxLayout()
@@ -302,11 +304,10 @@ class InputsTab(QWidget):
         # -- scope + direction ------------------------------------------------
         scope_box = QGroupBox("Scope and direction")
         scope_form = QFormLayout(scope_box)
-        self.scope_start = QDoubleSpinBox()
-        self.scope_end = QDoubleSpinBox()
+        self.scope_start = ui_helpers.KpSpinBox()
+        self.scope_end = ui_helpers.KpSpinBox()
         for spin in (self.scope_start, self.scope_end):
-            spin.setDecimals(3)
-            spin.setRange(0.0, 100000.0)
+            spin.setRange(-100000.0, 100000.0)
             spin.setSuffix(" km")
             spin.setToolTip(
                 "Analysis and profile sampling are limited to this KP "
@@ -327,7 +328,7 @@ class InputsTab(QWidget):
         end_row.addWidget(self.scope_pick_end)
         self.full_route_button = QPushButton("Full route")
         self.full_route_button.setToolTip(
-            "Set the scope to the whole route (KP 0 to route end).")
+            "Fill the scope with the route's start and end KP, then Apply scope / direction.")
         self.full_route_button.clicked.connect(self._full_route)
         end_row.addWidget(self.full_route_button)
         scope_form.addRow("to KP:", end_row)
@@ -873,7 +874,19 @@ class InputsTab(QWidget):
         if layer is None:
             self._set_status("No line layer is selected.", "warn")
             return
-        if not self.model.update_plan({
+        # Validate before replacing the current route reference. Plain line
+        # layers have no required attributes; the shared builder handles them.
+        from ..analysis_task import build_route_frame
+        try:
+            mode, grid = self.model.kp_mode()
+            route, _distance = build_route_frame(
+                layer, QgsProject.instance(), distance_mode=mode, grid_crs=grid)
+            if route.total_length_m <= 0:
+                raise ValueError("The selected layer has no measurable route length.")
+        except Exception as exc:
+            self._set_status(f"Route was not changed: {exc}", "error")
+            return
+        if not self.model.change_route({
             "rpl_id": "",
             "rpl_name": layer.name(),
             "rpl_revision": "",
@@ -898,6 +911,7 @@ class InputsTab(QWidget):
             return
         self.scope_start.setValue(self.model.route.start_kp_km)
         self.scope_end.setValue(self.model.route.end_kp_km)
+        self._set_status("Full route selected. Click Apply scope / direction to save it.", "info")
 
     def _pick_scope_kp(self, spin, which: str) -> None:
         if self.dock is None:

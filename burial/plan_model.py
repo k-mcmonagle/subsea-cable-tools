@@ -362,8 +362,12 @@ class PlanModel(QObject):
             if source:
                 from qgis.core import QgsVectorLayer
 
-                candidate = QgsVectorLayer(source, "bp_route", "ogr")
-                if candidate.isValid():
+                # Use the project layer, including memory/virtual providers
+                # and current edits. Its URI is not necessarily an OGR file.
+                candidate = map_layers.find_layer_by_source(project, source, want_raster=False)
+                if candidate is None:
+                    candidate = QgsVectorLayer(source, "bp_route", "ogr")
+                if isinstance(candidate, QgsVectorLayer) and candidate.isValid() and candidate.geometryType() == 1:
                     lines_layer = candidate
         if lines_layer is None or not lines_layer.isValid():
             self.route_error = "The plan's route layer could not be opened."
@@ -1565,7 +1569,8 @@ class PlanModel(QObject):
             map_layers.remove_plan_layers(QgsProject.instance(),
                                           self.store.gpkg_path, before)
             self.refresh_layers(immediate=True)
-        if "rpl_id" in changed_keys or "rpl_gpkg_path" in changed_keys:
+        # Setting the same project layer again must also pick up edits or a relink.
+        if "rpl_id" in updates or "rpl_gpkg_path" in updates:
             self._load_route()
         if {"target_burial_m", "scope_start_kp", "scope_end_kp"} & changed_keys:
             # The ground overlay's target-depth ribbon and its clipping

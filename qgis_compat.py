@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Compatibility aliases for QGIS 3/Qt5 and QGIS 4/Qt6."""
 
-from qgis.PyQt.QtCore import QMetaType, Qt
+from qgis.PyQt.QtCore import QMetaType, Qt, QT_VERSION_STR
 from qgis.PyQt.QtGui import QCursor
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView, QDialog, QDialogButtonBox, QFileDialog, QHeaderView, QMessageBox,
@@ -18,6 +18,15 @@ try:
     from qgis.PyQt.QtGui import QAction  # noqa: F401
 except ImportError:  # pragma: no cover - QGIS 3 / Qt5
     from qgis.PyQt.QtWidgets import QAction  # noqa: F401
+
+# QSvgWidget moved out of QtSvg in Qt6; QSvgRenderer stays in QtSvg.
+try:
+    from qgis.PyQt.QtSvgWidgets import QSvgWidget  # noqa: F401
+except ImportError:  # some QGIS 4 builds omit the QtSvgWidgets shim
+    if QT_VERSION_STR.startswith("6."):
+        from PyQt6.QtSvgWidgets import QSvgWidget  # noqa: F401
+    else:
+        from qgis.PyQt.QtSvg import QSvgWidget  # noqa: F401
 
 try:
     from qgis.PyQt import sip as _sip

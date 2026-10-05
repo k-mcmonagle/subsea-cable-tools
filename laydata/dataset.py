@@ -12,7 +12,7 @@ Design notes
 * Records are loaded exactly once and kept as columns so bulk operations run in
   vectorised numpy rather than per-feature Python loops - important because raw
   lay data can run to hundreds of thousands of rows.
-* Time is stored as float "seconds since 1970-01-01" (naive, DST-free) so that
+* Time is stored as float "seconds since 1970-01-01" (UTC, DST-free) so that
   gap deltas are exact; the absolute base is irrelevant for QC.
 * The per-record *source reference* (``source_file`` / ``event_file`` /
   ``slack_file`` / ``body_file``) is auto-detected so gap/duplicate checks can
@@ -21,7 +21,7 @@ Design notes
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -47,10 +47,10 @@ RECORD_STATUS_FIELD = "record_status"
 
 
 def parse_iso_epoch(value) -> float:
-    """Parse an ISO-8601 timestamp to seconds since 1970-01-01 (naive).
+    """Parse an ISO-8601 timestamp to seconds since 1970-01-01 (UTC).
 
     Returns ``nan`` for empty / unparseable values. Differences between the
-    returned values are exact seconds (no timezone / DST distortion).
+    returned values are exact seconds (timezone offsets normalised to UTC).
     """
     if value is None:
         return np.nan
@@ -66,7 +66,7 @@ def parse_iso_epoch(value) -> float:
         except ValueError:
             return np.nan
     if dt.tzinfo is not None:
-        dt = dt.replace(tzinfo=None)
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
     return (dt - _EPOCH).total_seconds()
 
 
