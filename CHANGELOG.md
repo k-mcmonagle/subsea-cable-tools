@@ -24,6 +24,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **Cable Lay Data Explorer — Lay Assessment (beta - check outputs):** a new tab flags KP ranges of possible suspensions, loop risk (excess slack at zero tension, payout while stopped, touchdown moving back) and top / bottom tension above NOTS, NTTS or NPTS, from lay model solutions with the seabed from the lay model, an MBES raster or contours. Ranges link to the map and a new Seabed Profile showing where the cable rests, spans in red, a red/amber/green status bar and measurements.
+- **Cable Type Library:** keep cable and rope types (weights, CBL / NTTS / NOTS / NPTS, MBR, aliases) in a GeoPackage of your own, with CSV import and export (*Subsea Cable Tools ▸ Cable Type Library…*).
+
 - **Ground Model:** numeric datasets (e.g. CPT undrained shear strength) drawn by KP and depth: measurements from a file or layer with the columns you choose, KP ranges read live from a KP-range or polygon layer (translated from the RPL they are quoted on), and a continuous ramp, equal bands or custom classes (≥ or >, < or ≤). Datasets are listed with Add, Edit, Reload, Remove, Check and Export cells. Profiles imported by earlier development builds become datasets named "… — earlier import"; choose their KP ranges again (Edit…).
 
 - **Burial Planner — Risk Profile:** new *KP-range table* check registers each row of a start/end KP table, with or without geometry (e.g. a desktop-study hazard list), as a hazard over its KP range, with Low/Medium/High risk from its text or numeric attributes or a default.

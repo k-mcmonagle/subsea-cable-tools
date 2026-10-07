@@ -39,6 +39,7 @@ from ..qgis_compat import QAction
 from .layer_select_dialog import LayerSelectDialog
 from .layer_loader import LayerLoadTask, build_spec
 from .map_sync import MapSyncController
+from .panels.assessment_panel import AssessmentPanel
 from .panels.data_table_panel import DataTablePanel
 from .panels.inspection_panel import InspectionPanel
 from .panels.manage_panel import ManagePanel
@@ -115,12 +116,15 @@ class CableLayExplorerWindow(QMainWindow):
         self.inspection_panel = InspectionPanel(self)
         self.processing_panel = ProcessingPanel(self)
         self.manage_panel = ManagePanel(self)
+        self.assessment_panel = AssessmentPanel(self)
+        self._profile_dock: Optional[QDockWidget] = None
         self.analysis_tabs = QTabWidget()
         self.analysis_tabs.addTab(self.project_panel, "Project")
         self.analysis_tabs.addTab(self.manage_panel, "Manage")
         self.analysis_tabs.addTab(self.qc_panel, "QC")
         self.analysis_tabs.addTab(self.inspection_panel, "Inspection")
         self.analysis_tabs.addTab(self.processing_panel, "Processing")
+        self.analysis_tabs.addTab(self.assessment_panel, "Lay Assessment")
         self.qc_dock = QDockWidget("Analysis", self)
         self.qc_dock.setObjectName("AnalysisDock")
         self.qc_dock.setWidget(self.analysis_tabs)
@@ -523,6 +527,7 @@ class CableLayExplorerWindow(QMainWindow):
         self.qc_panel.set_dataset(active)
         self.inspection_panel.set_dataset(active)
         self.processing_panel.set_dataset(active)
+        self.assessment_panel.set_dataset(active)
         # Manage always works on the complete dataset (every record status).
         self.manage_panel.sync_active_only(self._active_only)
         self.manage_panel.set_dataset(self.full_dataset)
@@ -723,6 +728,9 @@ class CableLayExplorerWindow(QMainWindow):
             if panel is origin:
                 continue
             panel.set_hover(source_row)
+        profile = self.seabed_profile_panel(create=False)
+        if profile is not None and profile is not origin:
+            profile.set_hover(source_row)
         self._update_map_hover(source_row)
         self._update_status_readout(source_row)
 
@@ -770,6 +778,25 @@ class CableLayExplorerWindow(QMainWindow):
     def on_panel_replotted(self, panel) -> None:
         # View boxes are recreated on every replot, so re-establish the link.
         self._apply_x_lock()
+
+    # -- Lay Assessment seabed profile --------------------------------------
+    def seabed_profile_panel(self, create: bool = False):
+        """The Seabed Profile dock's panel (created and shown when ``create``)."""
+        if self._profile_dock is None:
+            if not create:
+                return None
+            from .panels.seabed_profile_panel import SeabedProfilePanel
+
+            dock = QDockWidget("Seabed Profile", self)
+            dock.setObjectName("SeabedProfileDock")
+            dock.setWidget(SeabedProfilePanel(self))
+            dock.topLevelChanged.connect(lambda floating, d=dock: self._on_dock_floated(d, floating))
+            self.addDockWidget(_DOCK_BOTTOM, dock)
+            self._profile_dock = dock
+        if create:
+            self._profile_dock.show()
+            self._profile_dock.raise_()
+        return self._profile_dock.widget()
 
     # -- renaming / floating docks -----------------------------------------
     def rename_panel(self, panel) -> None:
@@ -835,6 +862,9 @@ class CableLayExplorerWindow(QMainWindow):
             panel.unpin()
             panel.center_on_record(source_row)
             panel.set_hover(source_row, force=True)
+        profile = self.seabed_profile_panel(create=False)
+        if profile is not None:
+            profile.set_hover(source_row, force=True)
         self._last_hover_row = source_row
         self._update_map_hover(source_row)
         self._update_status_readout(source_row)
@@ -1149,6 +1179,7 @@ class CableLayExplorerWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._cancel_load()
+        self.assessment_panel.shutdown()
         self._save_state()
         self._connect_selection(None)
         self.map_sync.clear()
@@ -1162,6 +1193,10 @@ class CableLayExplorerWindow(QMainWindow):
             pass
         try:
             self.project_panel.detach_project_signals()
+        except Exception:
+            pass
+        try:
+            self.assessment_panel.shutdown()
         except Exception:
             pass
         try:

@@ -74,7 +74,8 @@ These are in **Plugins ▸ Subsea Cable Tools**. The main toolbar has **KP Mouse
 - **Cable Route Workbench** — manage cable systems, RPL revisions and assemblies.
 - **Planner** — build map-linked vessel and resource schedules.
 - **Burial Planner** — develop burial plans from routes and survey data.
-- **Cable Lay Data Explorer** — inspect and analyse imported lay records.
+- **Cable Lay Data Explorer** — inspect and analyse imported lay records; its *Lay Assessment* tab lists KP ranges of possible suspensions, loop risk and tension-limit exceedances, with a seabed profile of where the cable rests ([method](docs/LAY_ASSESSMENT.md)).
+- **Cable Type Library** — keep your cable and rope types (weights, NPTS / NOTS / NTTS / CBL, MBR) in a GeoPackage of your own.
 - **Cable Lay Simulator (3D)** — explore cable-lay and deployment scenarios.
 - **BU Lowering Tool (3D)** — explore branching-unit lowering scenarios.
 - **KP settings** — choose geodesic or grid-based KP measurement.

@@ -68,13 +68,15 @@ class SubseaCableTools:
         'catenary_calculator_v2_dialog',
         'lay_simulator_dialog',
         'bu_lowering_dialog',
+        'cable_library_dialog',
     )
     # Every action attribute set by initGui (all are also in self.actions).
     _ACTION_ATTRS = (
         'plotter_action', 'depth_profile_action', 'catenary_v2_action',
         'lay_simulator_action', 'bu_lowering_action', 'workbench_action',
         'planner_action', 'burial_action', 'transit_measure_action',
-        'explorer_action', 'kp_settings_action', 'save_layers_gpkg_action',
+        'explorer_action', 'cable_library_action', 'kp_settings_action',
+        'save_layers_gpkg_action',
     )
 
     def __init__(self, iface):
@@ -110,6 +112,7 @@ class SubseaCableTools:
         self.catenary_calculator_v2_dialog = None
         self.lay_simulator_dialog = None
         self.bu_lowering_dialog = None
+        self.cable_library_dialog = None
         for attr in self._ACTION_ATTRS:
             setattr(self, attr, None)
         self.experimental_menu = None
@@ -247,6 +250,13 @@ class SubseaCableTools:
         self.explorer_action = self.add_action(
             self._icon('lay_data_explorer_icon.svg'), "Cable Lay Data Explorer",
             self.show_cable_lay_explorer)
+
+        # User cable / rope type library (weights, tension limits)
+        self.cable_library_action = self.add_action(
+            QgsApplication.getThemeIcon("/mActionOpenTable.svg"), "Cable Type Library…",
+            self.show_cable_library,
+            tooltip="Your cable and rope types (weights, NPTS / NOTS / NTTS / CBL, MBR) "
+                    "in a GeoPackage, used by the Explorer's Lay Assessment.")
 
         # Plugin-wide KP distance setting (Geodesic WGS84 / Cartesian grid)
         self.kp_settings_action = self.add_action(
@@ -392,6 +402,20 @@ class SubseaCableTools:
         self.explorer_window.show()
         self.explorer_window.raise_()
         self.explorer_window.activateWindow()
+
+    def show_cable_library(self):
+        """Show the cable type library editor."""
+        if not _alive(self.cable_library_dialog):
+            try:
+                from .cable_library.dialog import CableLibraryDialog
+                self.cable_library_dialog = CableLibraryDialog(self._main_window())
+            except Exception:
+                self.cable_library_dialog = None
+                self._report_open_failure("Cable Type Library could not be opened.")
+                return
+        self.cable_library_dialog.show()
+        self.cable_library_dialog.raise_()
+        self.cable_library_dialog.activateWindow()
 
     def show_kp_settings(self):
         from .kp_settings_dialog import edit_global_kp_settings

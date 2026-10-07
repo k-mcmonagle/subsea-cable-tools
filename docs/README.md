@@ -10,6 +10,8 @@ The top-level [README](../README.md) is the short introduction and tool list. Us
 
 - [KP and bathymetry methods](KP_AND_BATHYMETRY.md) — KP distance, CRS, bathymetry sampling, slope and coverage conventions.
 
+- [Lay Assessment](LAY_ASSESSMENT.md) — suspension, loop-risk and tension checks on lay data; the seabed rest model and its validation.
+
 ## Design records
 
 - [DECISIONS.md](../DECISIONS.md) — Burial Planner implementation decisions and judgement calls. It is the authoritative record of intended behaviour; the v0.3 specification it cites is not in the repository.

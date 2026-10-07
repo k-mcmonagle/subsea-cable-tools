@@ -18,6 +18,7 @@ from qgis.core import (
     QgsCoordinateTransform,
     QgsPointXY,
     QgsProject,
+    QgsRectangle,
 )
 from qgis.gui import QgsRubberBand, QgsVertexMarker
 
@@ -109,6 +110,32 @@ class MapSyncController:
         if pan:
             mid = QgsPointXY((p1.x() + p2.x()) / 2.0, (p1.y() + p2.y()) / 2.0)
             self.canvas.setCenter(mid)
+            self.canvas.refresh()
+
+    def highlight_polyline(self, lonlat, zoom: bool = False) -> None:
+        """Highlight a WGS84 polyline (e.g. a KP range along the touchdown
+        track). ``zoom`` fits the map to it (with a margin); a single point
+        just pans."""
+        points = [p for p in (self._to_canvas(lon, lat) for lon, lat in lonlat) if p is not None]
+        self.rubber.reset(GEOMETRY_LINE)
+        if not points:
+            return
+        if len(points) == 1:
+            self.highlight_point(*lonlat[0], pan=zoom)
+            return
+        for i, point in enumerate(points):
+            self.rubber.addPoint(point, i == len(points) - 1)
+        self.marker.setCenter(points[0])
+        self.marker.show()
+        if zoom:
+            rect = QgsRectangle(points[0], points[0])
+            for point in points[1:]:
+                rect.combineExtentWith(point.x(), point.y())
+            if rect.width() > 0 or rect.height() > 0:
+                rect.scale(1.6)
+                self.canvas.setExtent(rect)
+            else:
+                self.canvas.setCenter(points[0])
             self.canvas.refresh()
 
     def hover_point(self, lon: float, lat: float) -> None:
