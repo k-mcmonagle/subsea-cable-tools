@@ -13,7 +13,7 @@ Find these in the QGIS Processing Toolbox under **Subsea Cable Tools**.
 - **Import RPL to Workbench (auto-detect)** — detect and import an Excel or CSV route position list.
 - **Import Excel RPL (legacy, deprecated)** — import an RPL with manual column mapping.
 - **Add RPL Layers to Workbench** — register existing RPL point and line layers.
-- **Compare Design vs As-Laid Routes** — calculate differences between two routes.
+- **Compare Design vs As-Laid Routes** — pair design and as-laid events (tolerating renamed or mistyped events) and report along-track, cross-course and radial offsets; the Workbench's *Compare RPLs ▸ Events* tab does the same interactively ([method](docs/RPL_EVENT_COMPARISON.md)).
 - **Translate KP Between RPLs (Points)** — transfer point KPs between route references.
 - **Extract A/C Points from RPL** — extract alter-course positions.
 - **Identify RPL Crossing Points** — locate route crossings.
@@ -50,7 +50,7 @@ Find these in the QGIS Processing Toolbox under **Subsea Cable Tools**.
 
 ### Bathymetry and other utilities
 
-- **Import MDB** — import GeoMedia Access feature classes.
+- **Import MDB** — import GeoMedia Access feature classes, with the CRS detected from the file.
 - **Import Path File (.pthmdb)** — import route and profile data from a path database.
 - **Create Raster from XYZ** — grid XYZ bathymetry files.
 - **Merge MBES Rasters** — combine bathymetry grids.

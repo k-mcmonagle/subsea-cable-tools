@@ -4,6 +4,8 @@ The top-level [README](../README.md) is the short introduction and tool list. Us
 
 ## Methods
 
+- [RPL event comparison](RPL_EVENT_COMPARISON.md) — pairing design and as-laid events, offset conventions, filters and the report.
+
 - [Numeric Ground Model datasets](GROUND_NUMERIC_PROFILES.md) — measurements, live KP ranges, colour classes, checks and export.
 
 - [KP and bathymetry methods](KP_AND_BATHYMETRY.md) — KP distance, CRS, bathymetry sampling, slope and coverage conventions.

@@ -22,18 +22,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-### Fixed
-
-- **Burial Planner — Exclusions:** a KP range table criterion now reports rows it cannot read (wrong start/end fields, empty or non-numeric KPs) and ranges outside the scope, instead of silently firing nowhere.
-
-- **Burial Planner profile:** show the route extent before scope is applied and use three-decimal KP tick labels on bathymetry and slope plots, avoiding scientific notation on an empty profile.
-
-- **KP displays:** show KPs to three decimal places (1 m), keeping precise Full route bounds internally when applying scope.
-
-- **Burial Planner:** set ordinary project line layers, including temporary routes, without Workbench RPL fields; use their measured extents for Full route scope and retain short-route precision.
-
-- **Burial Planner on Qt6:** load the SVG report widget from its Qt6 module, including OSGeo4W builds without the QGIS wrapper, while retaining Qt5 compatibility.
-
 ### Added
 
 - **Ground Model:** numeric datasets (e.g. CPT undrained shear strength) drawn by KP and depth: measurements from a file or layer with the columns you choose, KP ranges read live from a KP-range or polygon layer (translated from the RPL they are quoted on), and a continuous ramp, equal bands or custom classes (≥ or >, < or ≤). Datasets are listed with Add, Edit, Reload, Remove, Check and Export cells. Profiles imported by earlier development builds become datasets named "… — earlier import"; choose their KP ranges again (Edit…).
@@ -74,6 +62,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Recompute ISO Time (fix start date):** a new Cable Lay Data Import tool corrects a wrong project start date in place, without re-importing, and can remove the duplicates this reveals.
 - **Cable lay GeoPackages:** every import and management edit is recorded in `import_log` / `edit_log` tables inside the GeoPackage.
 - **KP Range Highlighter from CSV:** rows whose start and end KP are equal (or closer than a new threshold) are written to a second, point output instead of being dropped.
+- **Cable Route Workbench — Compare RPLs ▸ Events:** pair the events of any two RPLs side by side (e.g. design vs as-laid repeaters, joints or transitions). Names that differ by a typo or extra text are matched automatically, pairs worth checking are highlighted, and any pair can be changed from a dropdown; corrections are saved with the project.
+- **Cable Route Workbench — Compare RPLs ▸ Events:** filter by event type or text, set a target radius and read along-track, cross-course, radial and KP offsets with a live radial plot; export CSV, add offset lines to the map, or save an HTML report with summary statistics, a radial plot of all events, offsets along the route and one radial plot per event. *Compare with…* on an RPL opens the comparison in its own window, and either side can be any RPL in the project.
 
 ### Changed
 
@@ -97,6 +87,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **KP Plotter:** hovering the plot no longer re-renders the whole map on every mouse move.
 - **Raster sampling:** rasters are read in cached tiles with identical values, and raster files are no longer locked after a background analysis.
 - **Bundled libraries** no longer override copies already installed with QGIS (for example openpyxl on QGIS 3.40), for this plugin or any other.
+- **Import MDB:** the CRS is now read from each file's GeoMedia coordinate-system metadata (geographic WGS84 and WGS84 UTM zones are recognised). Every selected file is checked before anything is imported: if a CRS cannot be identified the tool stops straight away, says why, suggests the likely CRS and asks you to set it.
+- **Import MDB:** *Source CRS* is now optional and only fills in where detection fails; choose *Use the Source CRS: Always* to override the file. Existing models that set it now keep the file's own CRS when it can be read, with a warning naming any disagreement.
+- **Import MDB / Import Path File (.pthmdb):** a layer whose extent cannot fit its CRS (degrees labelled as metres, or the reverse) is reported after import. Path files also recognise WGS84 UTM storage and are all checked before any layer is created.
+- **Compare Design vs As-Laid Routes:** events are now paired by exact name, similar name or same type nearby, in route order (exact-names-only is still an option), with event-type and text filters, an optional as-laid KP field, a target radius and an optional HTML report. New output fields are appended; existing fields are unchanged.
 
 ### Deprecated
 
@@ -107,6 +101,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Depth Profile:** the *Interpolate Between Contours* option, which had no effect (exact crossings are always used).
 
 ### Fixed
+
+- **Burial Planner — Exclusions:** a KP range table criterion now reports rows it cannot read (wrong start/end fields, empty or non-numeric KPs) and ranges outside the scope, instead of silently firing nowhere.
+
+- **Burial Planner profile:** show the route extent before scope is applied and use three-decimal KP tick labels on bathymetry and slope plots, avoiding scientific notation on an empty profile.
+
+- **KP displays:** show KPs to three decimal places (1 m), keeping precise Full route bounds internally when applying scope.
+
+- **Burial Planner:** set ordinary project line layers, including temporary routes, without Workbench RPL fields; use their measured extents for Full route scope and retain short-route precision.
+
+- **Burial Planner on Qt6:** load the SVG report widget from its Qt6 module, including OSGeo4W builds without the QGIS wrapper, while retaining Qt5 compatibility.
 
 - **Burial Planner:** large imports and batch edits no longer freeze QGIS, the input register lists every configured bathymetry layer rather than only the first, and an error with empty layer groups is fixed.
 - **Burial Planner — KPs:** *Targets from RPL* and the RPL-depth fallback measure each position instead of using printed KPs, scope beyond the route is refused, moving the project folder no longer marks plans stale, and KP-range CSV imports work on plans laid against KP.
@@ -128,6 +132,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Plugin reload:** unloading or reloading the plugin stops running solves and tasks, removes every map marker, rubber band, menu entry and toolbar button, and releases the plugin's map tools.
 - **Tools that fail to open** now always say why, with details in the *Subsea Cable Tools* tab of the Log Messages panel.
 - **Import Event Log:** each event now records the file it came from, so a second event log with overlapping times is no longer dropped as duplicates, and Cable Lay Data Explorer can manage event-log rows by source file.
+- **Compare Design vs As-Laid Routes:** `bearing_deg` is now the true bearing; it was computed from raw coordinates and was wrong for layers in degrees away from the equator.
 
 ## [1.9.0] - 2026-08-29
 

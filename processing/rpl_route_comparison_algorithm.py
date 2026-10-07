@@ -5,10 +5,14 @@ RPL Route Comparison Algorithm
 Compares design vs as-laid routes by calculating position offsets for matching events.
 
 This algorithm:
-1. Takes design and as-laid RPL point layers
-2. Matches events between them (exact string matching, with manual review option)
-3. Calculates offsets: along-track, cross-track (DCC), and radial distance
-4. Outputs a line layer showing comparison results with offset fields
+1. Takes design and as-laid RPL point and line layers
+2. Pairs events between them with the workbench's event matcher
+   (workbench.event_compare): exact names, similar names (typos, appended
+   notes), same type nearby, in route order — or exact names only
+3. Calculates offsets on the design route: along-track, cross-track (DCC),
+   radial distance and bearing, plus KP differences
+4. Outputs a line layer (design -> as-laid per pair) and, optionally, the
+   same HTML report the workbench produces (radial plots per event)
 """
 
 __author__ = 'Kieran McMonagle'
@@ -19,10 +23,16 @@ import math
 
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
+    QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform,
     QgsProcessing,
     QgsProcessingParameterVectorLayer,
     QgsProcessingParameterField,
     QgsProcessingParameterFeatureSink,
+    QgsProcessingParameterEnum,
+    QgsProcessingParameterFileDestination,
+    QgsProcessingParameterNumber,
+    QgsProcessingParameterString,
     QgsProcessingException,
     QgsFeatureSink,
     QgsFeature,
@@ -34,11 +44,21 @@ from qgis.core import (
     QgsWkbTypes,
 )
 from .algorithm_base import SubseaCableAlgorithm
-from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_FIELD_NUMERIC
+from ..qgis_compat import (
+    FIELD_TYPE_DOUBLE,
+    FIELD_TYPE_STRING,
+    PROCESSING_FIELD_NUMERIC,
+    PROCESSING_NUMBER_DOUBLE,
+)
 
 from .rpl_comparison_utils import RPLComparator
 from ..kp_range_utils import make_kp_distance_area
 from ..kp_geo_utils import iter_line_parts
+from ..workbench import event_compare as ec
+from ..workbench import event_compare_report as ec_report
+
+MATCH_SMART = 0
+MATCH_EXACT = 1
 
 
 class RPLRouteComparisonAlgorithm(SubseaCableAlgorithm):
@@ -51,12 +71,20 @@ class RPLRouteComparisonAlgorithm(SubseaCableAlgorithm):
     DESIGN_EVENTS_FIELD = 'DESIGN_EVENTS_FIELD'
     DESIGN_KP_FIELD = 'DESIGN_KP_FIELD'
     DESIGN_LINES = 'DESIGN_LINES'
-    
+
     ASLAID_POINTS = 'ASLAID_POINTS'
     ASLAID_EVENTS_FIELD = 'ASLAID_EVENTS_FIELD'
+    ASLAID_KP_FIELD = 'ASLAID_KP_FIELD'
     ASLAID_LINES = 'ASLAID_LINES'
-    
+
+    MATCH_MODE = 'MATCH_MODE'
+    SEARCH_RADIUS = 'SEARCH_RADIUS'
+    EVENT_PRESET = 'EVENT_PRESET'
+    EVENT_FILTER = 'EVENT_FILTER'
+    TARGET_RADIUS = 'TARGET_RADIUS'
+
     OUTPUT_COMPARISON = 'OUTPUT_COMPARISON'
+    OUTPUT_REPORT = 'OUTPUT_REPORT'
 
     def tr(self, string):
         return QCoreApplication.translate('Processing', string)
@@ -79,64 +107,59 @@ class RPLRouteComparisonAlgorithm(SubseaCableAlgorithm):
     def shortHelpString(self):
         return self.tr("""
 <h3>Compare Design vs As-Laid Routes</h3>
-<p>This tool compares design and as-laid cable route positions by matching corresponding events 
-and calculating position offsets.</p>
+<p>Pairs the events of a design RPL with the events of an as-laid RPL (or any two RPLs) and
+measures where each event ended up relative to the design route.</p>
 
-<h4>How it Works</h4>
-<ol>
-  <li>Takes design and as-laid RPL point layers with corresponding event identifiers</li>
-  <li>Matches events between the two layers (exact string matching)</li>
-  <li>For each matched event pair, calculates three offset measurements:
-    <ul>
-      <li><b>Along-track offset:</b> Signed distance along the design route from design event to 
-          the perpendicular projection of the as-laid event
-        <ul>
-          <li><b>Positive (+):</b> As-laid event is ahead (further along route direction) than design</li>
-          <li><b>Negative (-):</b> As-laid event is behind (earlier along route direction) than design</li>
-        </ul>
-      </li>
-      <li><b>Cross-track offset (DCC):</b> Signed perpendicular distance from as-laid event to design route
-        <ul>
-          <li><b>Positive (+):</b> As-laid event is to Starboard (right) of design route when traveling forward</li>
-          <li><b>Negative (-):</b> As-laid event is to Port (left) of design route when traveling forward</li>
-        </ul>
-      </li>
-      <li><b>Radial distance:</b> Direct line distance between design and as-laid event positions (unsigned)</li>
-      <li><b>Bearing:</b> Compass bearing from design to as-laid event (0-360°, 0=North)</li>
-    </ul>
-  </li>
-  <li>Outputs a line layer with lines connecting corresponding events and offset attributes</li>
-</ol>
+<h4>Event matching</h4>
+<p><b>Smart (default):</b> as-laid event names often differ from the design ("RPT 12" vs
+"Repeater R12 S/N 4432", typos, appended notes). Pairs are found from:
+<ul>
+  <li><b>Exact names</b> (ignoring case, spaces and punctuation), used as anchors;</li>
+  <li><b>Similar names</b>: typos and extra text are tolerated, but a different number is not
+      (RPT 12 never pairs with RPT 13);</li>
+  <li><b>Same type nearby</b>: the event rules classify both sides (repeater, BU, joint, alter
+      course, ...) and a repeater only ever pairs with a repeater, within the search radius.</li>
+</ul>
+Pairs keep route order, so an extra or missing event does not shift every later pair, and an
+as-laid RPL recorded in the opposite direction is detected. Each output feature records how it
+was matched (<code>match_method</code>) and a confidence (<code>match_score</code>): check the
+<i>fuzzy</i> and <i>position</i> pairs. To review and correct pairs interactively, use the Cable
+Route Workbench: <i>Compare RPLs &gt; Events</i>.</p>
+<p><b>Exact names only:</b> the previous behaviour &mdash; only names that are identical (ignoring
+case, spaces and punctuation) and unique on both sides are paired.</p>
+
+<h4>Offsets (all in metres, on the ellipsoid)</h4>
+<ul>
+  <li><b>along_track_m:</b> along the design route from the design event to the as-laid event's
+      projection; + ahead (towards increasing KP), &minus; behind.</li>
+  <li><b>cross_track_m:</b> perpendicular distance from the design route; + starboard (right when
+      travelling forward), &minus; port.</li>
+  <li><b>radial_distance_m / bearing_deg:</b> straight distance and true bearing (0&ndash;360&deg;)
+      from design to as-laid.</li>
+  <li><b>kp_delta_m:</b> as-laid KP minus design KP (each RPL's own chainage).</li>
+</ul>
 
 <h4>Inputs</h4>
 <ul>
-  <li><b>Design RPL Points:</b> Point layer from design RPL (e.g., repeater events)</li>
-  <li><b>Design Events Field:</b> Field containing event identifiers in design points</li>
-  <li><b>Design KP/Distance Field (Optional):</b> Field containing cumulative distance or KP values (e.g., DistCumulative) for ordering results. If provided, this value will be included in the output layer.</li>
-  <li><b>Design RPL Lines:</b> Line layer from design RPL (route path)</li>
-  <li><b>As-Laid RPL Points:</b> Point layer from as-laid RPL</li>
-  <li><b>As-Laid Events Field:</b> Field containing event identifiers in as-laid points</li>
-  <li><b>As-Laid RPL Lines:</b> Line layer from as-laid RPL (route path)</li>
+  <li><b>Design / As-laid RPL Points and Lines</b> with their <b>Events</b> fields.</li>
+  <li><b>KP fields (optional):</b> each RPL's own KP (e.g. DistCumulative, km). Without them the KP
+      is measured along that RPL's route line.</li>
+  <li><b>Events to report:</b> a type preset (repeaters, cable bodies, transitions, everything but
+      alter courses, ...) and/or a text/regex filter. Matching always uses every event; the
+      filters only choose what is output.</li>
+  <li><b>Search radius:</b> how far apart differently named events may be and still be paired
+      (similar names may reach ten times this).</li>
+  <li><b>Target radius (optional):</b> events within this radial distance count as on target.</li>
+  <li><b>Report (optional):</b> an HTML report with summary statistics, a radial plot of all
+      reported events, offsets along the route and one radial plot per event.</li>
 </ul>
 
 <h4>Output</h4>
-<p><b>Comparison Result:</b> A line layer with one line per matched event pair. Each line connects 
-the design point to the as-laid point and includes the following attributes:
-<ul>
-  <li><b>design_layer:</b> Name of design points layer</li>
-  <li><b>aslaid_layer:</b> Name of as-laid points layer</li>
-  <li><b>design_event:</b> Design event name</li>
-  <li><b>aslaid_event:</b> As-laid event name</li>
-  <li><b>design_kp:</b> Design KP/cumulative distance value (if KP field provided)</li>
-  <li><b>along_track_m:</b> Signed along-track offset (+ ahead, - behind)</li>
-  <li><b>cross_track_m:</b> Signed cross-track offset (+ starboard, - port)</li>
-  <li><b>radial_distance_m:</b> Direct distance between event positions</li>
-  <li><b>bearing_deg:</b> Compass bearing from design to as-laid (0-360°)</li>
-  <li><b>design_depth:</b> Design event depth (if available)</li>
-  <li><b>aslaid_depth:</b> As-laid event depth (if available)</li>
-  <li><b>prev_ac_distance_m:</b> Distance in meters to the previous alter course (bearing change) along the route</li>
-  <li><b>next_ac_distance_m:</b> Distance in meters to the next alter course (bearing change) along the route</li>
-</ul>
+<p>A line layer with one line per pair, from the design to the as-laid event, with
+<code>design_layer, aslaid_layer, design_event, aslaid_event, design_kp, along_track_m,
+cross_track_m, radial_distance_m, bearing_deg, design_depth, aslaid_depth, prev_ac_distance_m,
+next_ac_distance_m</code> and the newer <code>aslaid_kp, kp_delta_m, match_method, match_score,
+event_type, within_target</code>.</p>
 """)
 
     def initAlgorithm(self, config=None):
@@ -172,7 +195,7 @@ the design point to the as-laid point and includes the following attributes:
                 types=[QgsProcessing.TypeVectorLine]
             )
         )
-        
+
         # As-laid RPL inputs
         self.addParameter(
             QgsProcessingParameterVectorLayer(
@@ -190,14 +213,49 @@ the design point to the as-laid point and includes the following attributes:
             )
         )
         self.addParameter(
+            QgsProcessingParameterField(
+                self.ASLAID_KP_FIELD,
+                self.tr('As-Laid KP/Distance Field (Optional)'),
+                parentLayerParameterName=self.ASLAID_POINTS,
+                type=PROCESSING_FIELD_NUMERIC,
+                optional=True
+            )
+        )
+        self.addParameter(
             QgsProcessingParameterVectorLayer(
                 self.ASLAID_LINES,
                 self.tr('As-Laid RPL Lines'),
                 types=[QgsProcessing.TypeVectorLine]
             )
         )
-        
-        # Output
+
+        # Matching and selection
+        self.addParameter(QgsProcessingParameterEnum(
+            self.MATCH_MODE, self.tr('Event matching'),
+            options=[self.tr('Smart: exact, similar names and same type nearby, in route order'),
+                     self.tr('Exact names only')],
+            defaultValue=MATCH_SMART,
+        ))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.SEARCH_RADIUS, self.tr('Search radius for differently named events (m)'),
+            type=PROCESSING_NUMBER_DOUBLE, minValue=1.0,
+            defaultValue=ec.DEFAULT_SEARCH_RADIUS_M,
+        ))
+        self.addParameter(QgsProcessingParameterEnum(
+            self.EVENT_PRESET, self.tr('Events to report'),
+            options=[self.tr(label) for _key, label, _inc, _exc in ec.FILTER_PRESETS],
+            defaultValue=0,
+        ))
+        self.addParameter(QgsProcessingParameterString(
+            self.EVENT_FILTER, self.tr('Event text filter (text or regex, optional)'),
+            optional=True,
+        ))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.TARGET_RADIUS, self.tr('Target radius (m, 0 = none)'),
+            type=PROCESSING_NUMBER_DOUBLE, minValue=0.0, defaultValue=0.0,
+        ))
+
+        # Outputs
         self.addParameter(
             QgsProcessingParameterFeatureSink(
                 self.OUTPUT_COMPARISON,
@@ -205,129 +263,82 @@ the design point to the as-laid point and includes the following attributes:
                 type=QgsProcessing.TypeVectorLine
             )
         )
+        self.addParameter(QgsProcessingParameterFileDestination(
+            self.OUTPUT_REPORT, self.tr('Comparison report (HTML)'),
+            fileFilter=self.tr('HTML files (*.html)'), optional=True,
+            createByDefault=False,
+        ))
 
     def processAlgorithm(self, parameters, context, feedback):
         """Main algorithm execution."""
-        # Get input layers and parameters
-        design_points_layer = self.parameterAsVectorLayer(
-            parameters, self.DESIGN_POINTS, context
-        )
-        design_events_field = self.parameterAsString(
-            parameters, self.DESIGN_EVENTS_FIELD, context
-        )
-        design_kp_field = self.parameterAsString(
-            parameters, self.DESIGN_KP_FIELD, context
-        )
-        design_lines_layer = self.parameterAsVectorLayer(
-            parameters, self.DESIGN_LINES, context
-        )
-        
-        aslaid_points_layer = self.parameterAsVectorLayer(
-            parameters, self.ASLAID_POINTS, context
-        )
-        aslaid_events_field = self.parameterAsString(
-            parameters, self.ASLAID_EVENTS_FIELD, context
-        )
-        aslaid_lines_layer = self.parameterAsVectorLayer(
-            parameters, self.ASLAID_LINES, context
-        )
-        
+        design_points_layer = self.parameterAsVectorLayer(parameters, self.DESIGN_POINTS, context)
+        design_events_field = self.parameterAsString(parameters, self.DESIGN_EVENTS_FIELD, context)
+        design_kp_field = self.parameterAsString(parameters, self.DESIGN_KP_FIELD, context)
+        design_lines_layer = self.parameterAsVectorLayer(parameters, self.DESIGN_LINES, context)
+
+        aslaid_points_layer = self.parameterAsVectorLayer(parameters, self.ASLAID_POINTS, context)
+        aslaid_events_field = self.parameterAsString(parameters, self.ASLAID_EVENTS_FIELD, context)
+        aslaid_kp_field = self.parameterAsString(parameters, self.ASLAID_KP_FIELD, context)
+        aslaid_lines_layer = self.parameterAsVectorLayer(parameters, self.ASLAID_LINES, context)
+
+        match_mode = self.parameterAsEnum(parameters, self.MATCH_MODE, context)
+        search_radius = self.parameterAsDouble(parameters, self.SEARCH_RADIUS, context) \
+            or ec.DEFAULT_SEARCH_RADIUS_M
+        preset_index = self.parameterAsEnum(parameters, self.EVENT_PRESET, context)
+        text_filter = (self.parameterAsString(parameters, self.EVENT_FILTER, context) or '').strip()
+        target_radius = self.parameterAsDouble(parameters, self.TARGET_RADIUS, context) or None
+        report_path = self.parameterAsFileOutput(parameters, self.OUTPUT_REPORT, context) \
+            if parameters.get(self.OUTPUT_REPORT) else ''
+
         # Validate inputs
         if design_points_layer is None or design_lines_layer is None:
-            raise QgsProcessingException(
-                self.tr('Design RPL layers not provided')
-            )
+            raise QgsProcessingException(self.tr('Design RPL layers not provided'))
         if aslaid_points_layer is None or aslaid_lines_layer is None:
-            raise QgsProcessingException(
-                self.tr('As-Laid RPL layers not provided')
-            )
-        
-        # Get field indices
+            raise QgsProcessingException(self.tr('As-Laid RPL layers not provided'))
+
         design_event_idx = design_points_layer.fields().lookupField(design_events_field)
         aslaid_event_idx = aslaid_points_layer.fields().lookupField(aslaid_events_field)
-        design_kp_idx = -1
-        
-        # Handle optional KP field
-        if design_kp_field:
-            design_kp_idx = design_points_layer.fields().lookupField(design_kp_field)
-            if design_kp_idx < 0:
-                feedback.pushWarning(
-                    self.tr(f'Design KP field "{design_kp_field}" not found, will skip KP values')
-                )
-        
         if design_event_idx < 0:
             raise QgsProcessingException(
-                self.tr(f'Design events field "{design_events_field}" not found')
-            )
+                self.tr(f'Design events field "{design_events_field}" not found'))
         if aslaid_event_idx < 0:
             raise QgsProcessingException(
-                self.tr(f'As-Laid events field "{aslaid_events_field}" not found')
-            )
-        
-        # Create CRS (use design CRS)
+                self.tr(f'As-Laid events field "{aslaid_events_field}" not found'))
+        design_kp_idx = self._optional_field(design_points_layer, design_kp_field, 'Design', feedback)
+        aslaid_kp_idx = self._optional_field(aslaid_points_layer, aslaid_kp_field, 'As-laid', feedback)
+
+        # All offsets are measured in the design CRS.
         crs = design_points_layer.crs()
-        
-        # Create output fields
+        for layer in (design_lines_layer, aslaid_points_layer, aslaid_lines_layer):
+            if layer.crs() != crs:
+                feedback.pushWarning(
+                    f'{layer.name()} is in {layer.crs().authid()} but the design points are in '
+                    f'{crs.authid()}; points are reprojected, route lines are assumed to share '
+                    'the design CRS.')
+
         output_fields = QgsFields()
-        output_fields.append(QgsField('design_layer', FIELD_TYPE_STRING))
-        output_fields.append(QgsField('aslaid_layer', FIELD_TYPE_STRING))
-        output_fields.append(QgsField('design_event', FIELD_TYPE_STRING))
-        output_fields.append(QgsField('aslaid_event', FIELD_TYPE_STRING))
-        output_fields.append(QgsField('design_kp', FIELD_TYPE_DOUBLE))
-        output_fields.append(QgsField('along_track_m', FIELD_TYPE_DOUBLE))
-        output_fields.append(QgsField('cross_track_m', FIELD_TYPE_DOUBLE))
-        output_fields.append(QgsField('radial_distance_m', FIELD_TYPE_DOUBLE))
-        output_fields.append(QgsField('bearing_deg', FIELD_TYPE_DOUBLE))
-        output_fields.append(QgsField('design_depth', FIELD_TYPE_DOUBLE))
-        output_fields.append(QgsField('aslaid_depth', FIELD_TYPE_DOUBLE))
-        output_fields.append(QgsField('prev_ac_distance_m', FIELD_TYPE_DOUBLE))
-        output_fields.append(QgsField('next_ac_distance_m', FIELD_TYPE_DOUBLE))
-        
-        # Create output sink
+        for name, field_type in (
+                ('design_layer', FIELD_TYPE_STRING), ('aslaid_layer', FIELD_TYPE_STRING),
+                ('design_event', FIELD_TYPE_STRING), ('aslaid_event', FIELD_TYPE_STRING),
+                ('design_kp', FIELD_TYPE_DOUBLE), ('along_track_m', FIELD_TYPE_DOUBLE),
+                ('cross_track_m', FIELD_TYPE_DOUBLE), ('radial_distance_m', FIELD_TYPE_DOUBLE),
+                ('bearing_deg', FIELD_TYPE_DOUBLE), ('design_depth', FIELD_TYPE_DOUBLE),
+                ('aslaid_depth', FIELD_TYPE_DOUBLE), ('prev_ac_distance_m', FIELD_TYPE_DOUBLE),
+                ('next_ac_distance_m', FIELD_TYPE_DOUBLE), ('aslaid_kp', FIELD_TYPE_DOUBLE),
+                ('kp_delta_m', FIELD_TYPE_DOUBLE), ('match_method', FIELD_TYPE_STRING),
+                ('match_score', FIELD_TYPE_DOUBLE), ('event_type', FIELD_TYPE_STRING),
+                ('within_target', FIELD_TYPE_STRING)):
+            output_fields.append(QgsField(name, field_type))
+
         (sink, dest_id) = self.parameterAsSink(
             parameters, self.OUTPUT_COMPARISON, context,
             output_fields, QgsWkbTypes.LineString, crs
         )
         if sink is None:
             raise QgsProcessingException(self.tr('Failed to create output layer'))
-        
-        # Step 1: Extract and match events
-        feedback.pushInfo('Matching events between design and as-laid RPLs...')
-        design_events_data = self._extract_events(design_points_layer, design_event_idx)
-        aslaid_events_data = self._extract_events(aslaid_points_layer, aslaid_event_idx)
-        
-        design_events = design_events_data['events']
-        aslaid_events = aslaid_events_data['events']
-        
-        match_result = self._match_events(design_events_data, aslaid_events_data)
-        matches = match_result['matches']
-        duplicates_design = match_result['duplicates_design']
-        duplicates_aslaid = match_result['duplicates_aslaid']
-        unmatched_design = match_result['unmatched_design']
-        unmatched_aslaid = match_result['unmatched_aslaid']
-        
-        # Report duplicates
-        if duplicates_design:
-            feedback.pushWarning(f'Design layer has duplicate events (case/whitespace variants): {", ".join(duplicates_design)} - omitting')
-        if duplicates_aslaid:
-            feedback.pushWarning(f'As-laid layer has duplicate events (case/whitespace variants): {", ".join(duplicates_aslaid)} - omitting')
-        
-        # Report unmatched
-        if unmatched_design:
-            feedback.pushWarning(f'Unmatched design events: {", ".join(unmatched_design)}')
-        if unmatched_aslaid:
-            feedback.pushWarning(f'Unmatched as-laid events: {", ".join(unmatched_aslaid)}')
-        
-        feedback.pushInfo(f'Matched {len(matches)} events (after duplicate/case-insensitive normalization)')
-        
-        # Step 2: Initialize comparator
+
         feedback.pushInfo('Initializing route comparator...')
         comparator = RPLComparator(design_lines_layer, aslaid_lines_layer, crs, context)
-        
-        # Step 3: Calculate offsets for each match
-        feedback.pushInfo('Calculating offsets for matched events...')
-        # Use the shared helper so the WGS84 fallback is applied when the
-        # project ellipsoid is unset (matches every other KP-emitting tool).
         try:
             distance_calc = make_kp_distance_area(
                 crs, context.transformContext(), project=context.project()
@@ -335,212 +346,246 @@ the design point to the as-laid point and includes the following attributes:
         except ValueError as exc:
             raise QgsProcessingException(str(exc))
         feedback.pushInfo(f'Using ellipsoid: {distance_calc.ellipsoid()}')
-        
-        # Step 2.5: Extract alter course KPs from design route
+
+        # Step 1: read events (route order) and pair them.
+        to_design = QgsCoordinateTransform(aslaid_points_layer.crs(), crs, context.transformContext())
+        to_wgs84 = QgsCoordinateTransform(crs, QgsCoordinateReferenceSystem('EPSG:4326'),
+                                          context.transformContext())
+        design_events, design_features = self._read_events(
+            design_points_layer, design_event_idx, design_kp_idx, comparator, True,
+            None, to_wgs84)
+        aslaid_events, aslaid_features = self._read_events(
+            aslaid_points_layer, aslaid_event_idx, aslaid_kp_idx, comparator, False,
+            to_design, to_wgs84)
+        feedback.pushInfo(
+            f'{len(design_events)} design and {len(aslaid_events)} as-laid events read.')
+
+        mapping = self._pair_events(design_events, aslaid_events, match_mode, search_radius, feedback)
+        if mapping.reversed:
+            feedback.pushWarning(
+                'The as-laid RPL runs in the opposite direction to the design: kp_delta_m '
+                'is left empty.')
+
+        # Step 2: alter courses on the design route (for AC proximity fields).
         feedback.pushInfo('Extracting alter courses from design route...')
         ac_kps = self._extract_ac_kps(comparator, design_lines_layer, distance_calc, feedback)
         feedback.pushInfo(f'Detected {len(ac_kps)} alter courses in design route')
-        
-        total = len(matches)
-        for idx, match in enumerate(matches):
+
+        # Step 3: offsets for every pair; the event filter chooses what is output.
+        preset_key = ec.FILTER_PRESETS[preset_index][0] if 0 <= preset_index < len(
+            ec.FILTER_PRESETS) else 'all'
+        event_filter = ec.EventFilter.preset(preset_key, text=text_filter, show_unmatched=True)
+        report_rows = []
+        pairs = sorted(mapping.pairs.items())
+        written = 0
+        for step, (design_index, (aslaid_index, how, score)) in enumerate(pairs):
             if feedback.isCanceled():
                 break
-            
-            design_event_name = match['design']
-            aslaid_event_name = match['aslaid']
-            design_feature = design_events[design_event_name]['feature']
-            aslaid_feature = aslaid_events[aslaid_event_name]['feature']
-            
-            design_point = design_feature.geometry().asPoint()
-            aslaid_point = aslaid_feature.geometry().asPoint()
+            design_event = design_events[design_index]
+            aslaid_event = aslaid_events[aslaid_index]
+            design_point = design_features[design_index]['point']
+            aslaid_point = aslaid_features[aslaid_index]['point']
 
-            design_point_xy = QgsPointXY(design_point.x(), design_point.y())
-            aslaid_point_xy = QgsPointXY(aslaid_point.x(), aslaid_point.y())
+            offsets = self._calculate_offsets(design_point, aslaid_point, comparator, distance_calc)
+            design_route_kp = offsets['design_kp']
+            east = north = None
+            if offsets['bearing'] is not None:
+                east = offsets['radial_distance'] * math.sin(math.radians(offsets['bearing']))
+                north = offsets['radial_distance'] * math.cos(math.radians(offsets['bearing']))
+            kp_delta = None
+            if not mapping.reversed and design_event.kp is not None and aslaid_event.kp is not None:
+                kp_delta = (aslaid_event.kp - design_event.kp) * 1000.0
+            depth_delta = None
+            if design_event.depth is not None and aslaid_event.depth is not None:
+                depth_delta = aslaid_event.depth - design_event.depth
+            row = ec.EventOffset(
+                a=design_event, b=aslaid_event, how=how, score=score,
+                along_m=offsets['along_track'], cross_m=offsets['cross_track'],
+                radial_m=offsets['radial_distance'], bearing_deg=offsets['bearing'],
+                east_m=east, north_m=north, kp_delta_m=kp_delta, depth_delta_m=depth_delta)
+            if not event_filter.accepts(row):
+                continue
+            report_rows.append(row)
 
-            # Calculate offsets (KP of the design point comes with them)
-            offsets = self._calculate_offsets(
-                design_point_xy, aslaid_point_xy, comparator, distance_calc
-            )
-            design_kp = offsets['design_kp']
+            prev_ac_kp = max((k for k in ac_kps if k < design_route_kp), default=None)
+            next_ac_kp = min((k for k in ac_kps if k > design_route_kp), default=None)
+            within = row.within(target_radius)
 
-            # Calculate AC proximities (exclude ACs at the same KP as the design point)
-            prev_ac_kp = max((k for k in ac_kps if k < design_kp), default=None)
-            next_ac_kp = min((k for k in ac_kps if k > design_kp), default=None)
-            prev_ac_distance = (design_kp - prev_ac_kp) * 1000 if prev_ac_kp is not None else None
-            next_ac_distance = (next_ac_kp - design_kp) * 1000 if next_ac_kp is not None else None
-
-            # Create output feature (line)
-            line = QgsLineString([design_point, aslaid_point])
             output_feature = QgsFeature(output_fields)
-            output_feature.setGeometry(QgsGeometry(line))
+            output_feature.setGeometry(QgsGeometry(QgsLineString(
+                [QgsPointXY(design_point), QgsPointXY(aslaid_point)])))
             output_feature['design_layer'] = design_points_layer.name()
             output_feature['aslaid_layer'] = aslaid_points_layer.name()
-            output_feature['design_event'] = design_event_name
-            output_feature['aslaid_event'] = aslaid_event_name
-            
-            # Add design KP if field was provided
+            output_feature['design_event'] = design_event.event
+            output_feature['aslaid_event'] = aslaid_event.event
             if design_kp_idx >= 0:
-                output_feature['design_kp'] = design_feature[design_kp_idx]
-            
+                output_feature['design_kp'] = design_features[design_index]['feature'][design_kp_idx]
             output_feature['along_track_m'] = offsets['along_track']
             output_feature['cross_track_m'] = offsets['cross_track']
             output_feature['radial_distance_m'] = offsets['radial_distance']
             output_feature['bearing_deg'] = offsets['bearing']
-            output_feature['design_depth'] = design_feature['ApproxDepth'] if 'ApproxDepth' in [f.name() for f in design_feature.fields()] else None
-            output_feature['aslaid_depth'] = aslaid_feature['ApproxDepth'] if 'ApproxDepth' in [f.name() for f in aslaid_feature.fields()] else None
-            output_feature['prev_ac_distance_m'] = prev_ac_distance
-            output_feature['next_ac_distance_m'] = next_ac_distance
-            
+            output_feature['design_depth'] = design_features[design_index]['depth']
+            output_feature['aslaid_depth'] = aslaid_features[aslaid_index]['depth']
+            output_feature['prev_ac_distance_m'] = (
+                (design_route_kp - prev_ac_kp) * 1000 if prev_ac_kp is not None else None)
+            output_feature['next_ac_distance_m'] = (
+                (next_ac_kp - design_route_kp) * 1000 if next_ac_kp is not None else None)
+            output_feature['aslaid_kp'] = aslaid_event.kp
+            output_feature['kp_delta_m'] = kp_delta
+            output_feature['match_method'] = how
+            output_feature['match_score'] = score
+            output_feature['event_type'] = design_event.type_text
+            output_feature['within_target'] = None if within is None else ('yes' if within else 'no')
             sink.addFeature(output_feature, QgsFeatureSink.FastInsert)
-            
-            feedback.setProgress(int((idx + 1) / total * 100))
-        
+            written += 1
+            feedback.setProgress(int((step + 1) / max(1, len(pairs)) * 100))
+
+        # Unmatched events in the selection, for the log and the report.
+        unmatched_design = [e for i, e in enumerate(design_events) if i not in mapping.pairs]
+        used_aslaid = {b for b, _h, _s in mapping.pairs.values()}
+        unmatched_aslaid = [e for i, e in enumerate(aslaid_events) if i not in used_aslaid]
+        for event in unmatched_design:
+            row = ec.EventOffset(a=event, b=None)
+            if event_filter.accepts(row):
+                report_rows.append(row)
+        for event in unmatched_aslaid:
+            row = ec.EventOffset(a=None, b=event)
+            if event_filter.accepts(row):
+                report_rows.append(row)
+        self._report_unmatched(unmatched_design, unmatched_aslaid, event_filter, feedback)
+
+        stats = ec.offset_stats(report_rows, target_radius)
+        feedback.pushInfo(ec.summary_text(stats))
+        counts = mapping.counts()
+        feedback.pushInfo(
+            f"Pairs: {counts.get(ec.HOW_EXACT, 0)} exact, {counts.get(ec.HOW_FUZZY, 0)} similar "
+            f"name, {counts.get(ec.HOW_POSITION, 0)} same type nearby; {written} written after "
+            "the event filter.")
+        if counts.get(ec.HOW_FUZZY, 0) or counts.get(ec.HOW_POSITION, 0):
+            feedback.pushWarning(
+                'Some pairs were matched by similar name or by position: check rows whose '
+                'match_method is "fuzzy" or "position".')
+
+        results = {self.OUTPUT_COMPARISON: dest_id}
+        if report_path:
+            report_rows.sort(key=ec._route_order_key)
+            page = ec_report.html_report(
+                report_rows, design_points_layer.name(), aslaid_points_layer.name(),
+                target_radius_m=target_radius,
+                selection_text=self._selection_text(preset_index, text_filter),
+                a_detail='design', b_detail='as-laid', reversed_b=mapping.reversed)
+            try:
+                with open(report_path, 'w', encoding='utf-8') as handle:
+                    handle.write(page)
+            except OSError as exc:
+                raise QgsProcessingException(f'Could not write the report: {exc}')
+            feedback.pushInfo(f'Report written to {report_path}')
+            results[self.OUTPUT_REPORT] = report_path
         feedback.pushInfo(f'Comparison complete. Output: {dest_id}')
-        return {self.OUTPUT_COMPARISON: dest_id}
+        return results
 
-    def _normalize_event_name(self, name):
-        """
-        Normalize event name for matching: lowercase and strip whitespace.
-        
-        Args:
-            name: Event name (string)
-        
-        Returns: Normalized name (lowercase, stripped whitespace)
-        """
+    # ----------------------------------------------------------- helpers --
+    def _optional_field(self, layer, name, label, feedback):
         if not name:
-            return ""
-        return str(name).strip().lower()
+            return -1
+        index = layer.fields().lookupField(name)
+        if index < 0:
+            feedback.pushWarning(self.tr(f'{label} KP field "{name}" not found, will skip KP values'))
+        return index
 
-    def _extract_events(self, layer, event_field_idx):
-        """
-        Extract event features from a point layer with duplicate detection.
-        
-        Returns dict: {
-            'events': {original_name: {'feature': QgsFeature, 'geometry': QgsPointXY}},
-            'normalized_map': {normalized_name: [original_names]},  # Track duplicates
-            'duplicates': [list of normalized names with multiple features]
-        }
-        """
-        events = {}
-        normalized_map = {}  # normalized_name -> list of original names
-        duplicates = []
-        
+    @staticmethod
+    def _value(feature, index):
+        if index < 0:
+            return None
+        value = feature[index]
+        if type(value).__name__ == 'QVariant':
+            value = None if not value.isValid() or value.isNull() else value.value()
+        return value
+
+    def _read_events(self, layer, event_idx, kp_idx, comparator, design, to_design, to_wgs84):
+        """EventInfo rows (route order) plus per-event feature/point/depth."""
+        depth_idx = layer.fields().lookupField('ApproxDepth')
+        records = []
         for feature in layer.getFeatures():
-            if feature.geometry().isEmpty():
+            geometry = feature.geometry()
+            if geometry is None or geometry.isEmpty():
                 continue
-            
-            event_name = feature[event_field_idx]
-            if not event_name:
+            text = self._value(feature, event_idx)
+            if text is None or not str(text).strip():
                 continue
-            
-            event_name_str = str(event_name)
-            normalized_name = self._normalize_event_name(event_name_str)
-            
-            # Store feature with original name
-            events[event_name_str] = {
-                'feature': feature,
-                'geometry': feature.geometry().asPoint(),
-                'normalized': normalized_name
-            }
-            
-            # Track normalized names to detect duplicates
-            if normalized_name not in normalized_map:
-                normalized_map[normalized_name] = []
-            normalized_map[normalized_name].append(event_name_str)
-        
-        # Identify duplicates (normalized names with multiple original names)
-        for normalized_name, original_names in normalized_map.items():
-            if len(original_names) > 1:
-                duplicates.append(normalized_name)
-        
-        return {
-            'events': events,
-            'normalized_map': normalized_map,
-            'duplicates': duplicates
-        }
+            point = QgsPointXY(geometry.asPoint())
+            if to_design is not None and to_design.isValid():
+                try:
+                    point = to_design.transform(point)
+                except Exception:  # noqa: BLE001 - unprojectable point: skip
+                    continue
+            if kp_idx >= 0:
+                kp = _float(self._value(feature, kp_idx))
+            else:
+                kp = comparator.calculate_kp_to_point(point, source=design)
+            try:
+                wgs = to_wgs84.transform(point)
+                lat, lon = wgs.y(), wgs.x()
+            except Exception:  # noqa: BLE001
+                lat = lon = None
+            route_kp = comparator.calculate_kp_to_point(point, source=design)
+            records.append({
+                'point': point, 'feature': feature, 'text': str(text).strip(), 'kp': kp,
+                'route_kp': route_kp, 'lat': lat, 'lon': lon,
+                'depth': _float(self._value(feature, depth_idx)),
+            })
+        records.sort(key=lambda r: (r['route_kp'] if r['route_kp'] is not None else math.inf))
+        points = [{'seq': i, 'event': r['text'], 'kp': r['kp'], 'lat': r['lat'], 'lon': r['lon'],
+                   'depth': r['depth']} for i, r in enumerate(records)]
+        return ec.extract_events(points), records
 
-    def _match_events(self, design_events_data, aslaid_events_data):
-        """
-        Match events between design and as-laid using normalized matching.
-        Omits matches where either side has duplicates.
-        
-        Args:
-            design_events_data: Output from _extract_events (design layer)
-            aslaid_events_data: Output from _extract_events (as-laid layer)
-        
-        Returns dict: {
-            'matches': [{'design': original_name, 'aslaid': original_name}, ...],
-            'duplicates_design': [list of normalized names with duplicates in design],
-            'duplicates_aslaid': [list of normalized names with duplicates in as-laid],
-            'unmatched_design': [list of original names with no match],
-            'unmatched_aslaid': [list of original names with no match]
-        }
-        """
-        design_events = design_events_data['events']
-        design_normalized_map = design_events_data['normalized_map']
-        design_duplicates = design_events_data['duplicates']
-        
-        aslaid_events = aslaid_events_data['events']
-        aslaid_normalized_map = aslaid_events_data['normalized_map']
-        aslaid_duplicates = aslaid_events_data['duplicates']
-        
-        matches = []
-        matched_design = set()
-        matched_aslaid = set()
-        
-        # Find matches based on normalized names
-        design_normalized_set = set(design_normalized_map.keys())
-        aslaid_normalized_set = set(aslaid_normalized_map.keys())
-        matching_normalized = design_normalized_set & aslaid_normalized_set
-        
-        for normalized_name in matching_normalized:
-            # Skip if either side has duplicates for this name
-            if normalized_name in design_duplicates or normalized_name in aslaid_duplicates:
-                continue
-            
-            # Get the single original names (duplicates already filtered)
-            design_original_names = design_normalized_map[normalized_name]
-            aslaid_original_names = aslaid_normalized_map[normalized_name]
-            
-            if len(design_original_names) == 1 and len(aslaid_original_names) == 1:
-                design_name = design_original_names[0]
-                aslaid_name = aslaid_original_names[0]
-                matches.append({'design': design_name, 'aslaid': aslaid_name})
-                matched_design.add(design_name)
-                matched_aslaid.add(aslaid_name)
-        
-        # Identify unmatched events
-        unmatched_design = set(design_events.keys()) - matched_design
-        unmatched_aslaid = set(aslaid_events.keys()) - matched_aslaid
-        
-        return {
-            'matches': matches,
-            'duplicates_design': design_duplicates,
-            'duplicates_aslaid': aslaid_duplicates,
-            'unmatched_design': unmatched_design,
-            'unmatched_aslaid': unmatched_aslaid
-        }
+    def _pair_events(self, design_events, aslaid_events, match_mode, search_radius, feedback):
+        if match_mode == MATCH_EXACT:
+            mapping = ec.EventMapping(list(design_events), list(aslaid_events))
+            for a, b, how in ec._exact_anchors(design_events, aslaid_events):
+                mapping.pairs[a] = (b, how, 1.0)
+            duplicates = self._duplicates(design_events) | self._duplicates(aslaid_events)
+            if duplicates:
+                feedback.pushWarning(
+                    'Event names that occur more than once are not paired in exact mode: '
+                    + ', '.join(sorted(duplicates)))
+            return mapping
+        return ec.EventMapping.suggest(
+            design_events, aslaid_events, ec.MatchOptions(search_radius_m=search_radius))
+
+    @staticmethod
+    def _duplicates(events):
+        seen, duplicated = set(), set()
+        for event in events:
+            key = ec.normalise_event(event.event)
+            if key in seen:
+                duplicated.add(event.event)
+            seen.add(key)
+        return duplicated
+
+    @staticmethod
+    def _report_unmatched(unmatched_design, unmatched_aslaid, event_filter, feedback):
+        def names(events, side):
+            kept = [e.event for e in events
+                    if event_filter.accepts(ec.EventOffset(a=e if side == 'a' else None,
+                                                           b=e if side == 'b' else None))]
+            return kept
+
+        design_names = names(unmatched_design, 'a')
+        aslaid_names = names(unmatched_aslaid, 'b')
+        if design_names:
+            feedback.pushWarning(f'Unmatched design events: {", ".join(design_names)}')
+        if aslaid_names:
+            feedback.pushWarning(f'Unmatched as-laid events: {", ".join(aslaid_names)}')
+
+    def _selection_text(self, preset_index, text_filter):
+        label = ec.FILTER_PRESETS[preset_index][1] if 0 <= preset_index < len(
+            ec.FILTER_PRESETS) else 'All events'
+        return label + (f", matching '{text_filter}'" if text_filter else '')
 
     def _measure_distance(self, point1, point2, distance_calc):
-        """
-        Measure distance between two QgsPointXY objects in meters.
-        
-        Uses QgsDistanceArea.measureLine() which:
-        - Returns meters when ellipsoid is properly configured
-        - Handles geographic CRS correctly via the ellipsoid
-        - Works with both geographic and projected CRS
-        
-        Args:
-            point1: QgsPointXY
-            point2: QgsPointXY
-            distance_calc: QgsDistanceArea (must have CRS and ellipsoid set)
-        
-        Returns: Distance in meters (float)
-        """
-        # measureLine returns distance in the units of the CRS
-        # With ellipsoid set, it returns meters
-        distance = distance_calc.measureLine(point1, point2)
-        return distance
+        """Ellipsoidal distance in metres between two points in the design CRS."""
+        return distance_calc.measureLine(point1, point2)
 
     def _calculate_offsets(self, design_point, aslaid_point, comparator, distance_calc):
         """
@@ -549,12 +594,6 @@ the design point to the as-laid point and includes the following attributes:
         Both along- and cross-track come from the design route's
         ``RouteFrame`` (via ``comparator``): the same KP definition as every
         other KP tool, so they agree with Nearest KP / the KP Mouse tool.
-
-        Args:
-            design_point: QgsPointXY - design event location
-            aslaid_point: QgsPointXY - as-laid event location
-            comparator: RPLComparator - design route is its source line
-            distance_calc: QgsDistanceArea - distance calculator
 
         Returns dict with 'design_kp', 'along_track', 'cross_track',
         'radial_distance', 'bearing'
@@ -565,9 +604,9 @@ the design point to the as-laid point and includes the following attributes:
         - cross_track: signed perpendicular distance in meters from the
           as-laid event to the design route (+ starboard, - port)
         - radial_distance: direct distance in meters
-        - bearing: compass bearing from design to as-laid in degrees (0-360)
+        - bearing: true bearing from design to as-laid in degrees (0-360),
+          None when the two points coincide
         """
-        # Radial distance: direct distance between points (using helper to ensure meters)
         radial = self._measure_distance(design_point, aslaid_point, distance_calc)
 
         design_hit = comparator.nearest_kp_hit(design_point, source=True)
@@ -578,8 +617,7 @@ the design point to the as-laid point and includes the following attributes:
             design_kp = design_hit.kp_km
             along_track = (aslaid_hit.kp_km - design_hit.kp_km) * 1000.0
 
-        # Bearing: compass bearing from design point to aslaid point (0-360 degrees)
-        bearing = self._calculate_bearing(design_point, aslaid_point)
+        bearing = self._calculate_bearing(design_point, aslaid_point, distance_calc)
 
         return {
             'design_kp': design_kp,
@@ -589,55 +627,37 @@ the design point to the as-laid point and includes the following attributes:
             'bearing': bearing
         }
 
-    def _calculate_bearing(self, from_point, to_point):
+    def _calculate_bearing(self, from_point, to_point, distance_calc=None):
+        """True bearing (degrees, 0-360, 0 = north) from one point to another.
+
+        Uses the ellipsoidal bearing of ``distance_calc`` (correct in
+        geographic and projected CRSs alike); without one, falls back to the
+        planar grid bearing.
         """
-        Calculate compass bearing from one point to another.
-        
-        Args:
-            from_point: QgsPointXY - starting point
-            to_point: QgsPointXY - destination point
-        
-        Returns: Bearing in degrees (0-360, where 0=North, 90=East, 180=South, 270=West)
-        """
-        import math
-        
-        # Calculate differences in coordinates
-        delta_lon = to_point.x() - from_point.x()
-        delta_lat = to_point.y() - from_point.y()
-        
-        # Calculate bearing using atan2
-        # Note: In geographic coordinates, X=longitude, Y=latitude
-        # Bearing formula: atan2(east, north) = atan2(delta_lon, delta_lat)
-        radians = math.atan2(delta_lon, delta_lat)
-        
-        # Convert to degrees
-        bearing = math.degrees(radians)
-        
-        # Normalize to 0-360 range
-        if bearing < 0:
-            bearing += 360.0
-        
-        return bearing
+        if (abs(to_point.x() - from_point.x()) < 1e-12
+                and abs(to_point.y() - from_point.y()) < 1e-12):
+            return None
+        if distance_calc is not None:
+            try:
+                radians = distance_calc.bearing(QgsPointXY(from_point), QgsPointXY(to_point))
+                return (math.degrees(radians) + 360.0) % 360.0
+            except Exception:  # noqa: BLE001 - fall back to the grid bearing
+                pass
+        radians = math.atan2(to_point.x() - from_point.x(), to_point.y() - from_point.y())
+        return (math.degrees(radians) + 360.0) % 360.0
 
     def _extract_ac_kps(self, comparator, lines_layer, distance_calc, feedback):
         """
         Extract alter course (AC) KP values from the design route.
-        ACs are points where the bearing changes significantly.
-        
-        Args:
-            comparator: RPLComparator instance
-            lines_layer: Design lines layer
-            distance_calc: QgsDistanceArea for bearing calculations
-            feedback: For debug output
-        
+        ACs are points where the bearing changes significantly (> 2 degrees).
+
         Returns:
             List of KP values (in km) for alter courses, sorted
         """
-        ac_kps = set()  # Use set to avoid duplicates
-        
+        ac_kps = set()
+
         feedback.pushInfo(f'Collected {len(comparator.source_geoms)} line geometries from design route')
 
-        # Sort geometries by KP of their starting point
         geom_list = []
         for geom in comparator.source_geoms:
             parts = [part for part in iter_line_parts(geom) if len(part) >= 2]
@@ -649,35 +669,25 @@ the design point to the as-laid point and includes the following attributes:
             kp = comparator.calculate_kp_to_point(first_point, source=True)
             geom_list.append((kp, first_point, last_point))
 
-        geom_list.sort(key=lambda x: x[0])  # Sort by start KP
+        geom_list.sort(key=lambda x: x[0])
 
-        feedback.pushInfo(f'Sorted {len(geom_list)} geometries by start KP')
-
-        # Check bearing changes between consecutive segments
         for i in range(len(geom_list) - 1):
-            kp1, p1, p2 = geom_list[i]
-            kp2, p3, p4 = geom_list[i+1]
-
-            # Get bearing of first segment
+            _kp1, p1, p2 = geom_list[i]
+            _kp2, p3, p4 = geom_list[i + 1]
             bearing1 = distance_calc.bearing(p1, p2)
-
-            # Get bearing of second segment
             bearing2 = distance_calc.bearing(p3, p4)
-
-            # Junction point KP (use end of first segment)
             junction_kp = comparator.calculate_kp_to_point(QgsPointXY(p2.x(), p2.y()), source=True)
-            
-            # Calculate bearing difference
             bearing_diff = abs(bearing1 - bearing2)
             bearing_diff = min(bearing_diff, 2 * math.pi - bearing_diff)
-            
-            # Debug: show first few
-            if i < 3:
-                feedback.pushInfo(f'Segment {i}: bearing1={math.degrees(bearing1):.1f}°, bearing2={math.degrees(bearing2):.1f}°, diff={math.degrees(bearing_diff):.3f}°')
-            
-            # Check for significant bearing change (more than 2 degrees)
             if bearing_diff > 0.0349:
                 ac_kps.add(junction_kp)
-        
-        return sorted(list(ac_kps))
 
+        return sorted(ac_kps)
+
+
+def _float(value):
+    try:
+        number = None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number is not None and math.isfinite(number) else None

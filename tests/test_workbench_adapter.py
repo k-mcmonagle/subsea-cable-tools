@@ -215,7 +215,7 @@ def test_guided_overviews_construct() -> bool:
     ok = ok and segment_panel.title.text() == "Guided segment"
     ok = ok and [segment_panel.views.tabText(i)
                  for i in range(segment_panel.views.count())] == [
-                     "Table", "Schematic", "Compare revisions"]
+                     "Table", "Schematic", "Compare RPLs"]
     # One revision only: the compare tab says so rather than comparing.
     ok = ok and segment_panel.compare.combo_a.count() == 1
     ok = ok and "fewer than two" in segment_panel.compare.summary.text()

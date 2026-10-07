@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Side-by-side comparison of two RPL revisions of one cable segment.
+"""Side-by-side comparison of two RPLs (revisions, or design vs as-laid).
 
-Pick any two revisions of the segment and the panel reports three things:
-the headline statistics with the change between them, the position-by-position
-mapping (what moved, what was renamed, what was added or dropped) and the same
-for the legs. The mapping itself lives in :mod:`rpl_compare`; this module is
-the table, the filter and the CSV export.
+Pick any two RPLs — this segment's revisions are listed first, then every
+other RPL in the project — and the panel reports four things: the event
+mapping with along-track / cross-course / radial offsets and a report
+(:mod:`event_compare_panel`), the headline statistics with the change between
+them, the position-by-position mapping (what moved, what was renamed, what
+was added or dropped) and the same for the legs. The mappings live in
+:mod:`event_compare` and :mod:`rpl_compare`; this module is the pickers, the
+tables, the filter and the CSV export.
 
 The comparison is only computed when the tab is actually shown, and only when
 the chosen pair changes, because it reads both revisions' layers in full.
@@ -20,12 +23,21 @@ from typing import Dict, List
 from qgis.PyQt.QtCore import Qt, pyqtSignal
 from qgis.PyQt.QtGui import QBrush, QColor
 from qgis.PyQt.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QHBoxLayout,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout,
     QHeaderView, QLabel, QMessageBox, QPushButton, QTabWidget, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from ..qgis_compat import (
+    WINDOW_HINT_CLOSE,
+    WINDOW_HINT_CUSTOMIZE,
+    WINDOW_HINT_MIN_MAX,
+    WINDOW_HINT_TITLE,
+    WINDOW_TYPE_WINDOW,
+)
+
 from . import schema
+from .event_compare_panel import EventComparisonWidget
 from .rpl_compare import (
     LEG_CHANGE_LABELS, STATUS_ADDED, STATUS_CHANGED, STATUS_REMOVED,
     STATUS_UNCHANGED, change_summary, compare_revisions, describe_changes,
@@ -50,6 +62,29 @@ HOW_LABELS = {
     "event": "same event",
     "aligned": "aligned",
 }
+
+KIND_AS_LAID = "as_laid"
+
+
+def default_pair(rows):
+    """``(rpl_a, rpl_b)`` to compare first from a segment's revisions
+    (oldest first): newest design against newest as-laid when both exist,
+    else the two newest revisions."""
+    as_laid = [r for r in rows if (r.get("kind") or "") == KIND_AS_LAID]
+    planned = [r for r in rows if (r.get("kind") or "") != KIND_AS_LAID]
+    if as_laid and planned:
+        return planned[-1].get("rpl_id") or "", as_laid[-1].get("rpl_id") or ""
+    if len(rows) >= 2:
+        return rows[-2].get("rpl_id") or "", rows[-1].get("rpl_id") or ""
+    return "", ""
+
+
+def _rpl_label(row, route_name=""):
+    label = row.get("rev_label") or row.get("name") or "Unlabelled"
+    kind = (row.get("kind") or "").replace("_", "-")
+    status = row.get("status") or schema.STATUS_DRAFT
+    prefix = f"{route_name} / " if route_name else ""
+    return f"{prefix}{label} · {kind or 'planned'} ({status})"
 
 
 class RevisionComparePanel(QWidget):
@@ -89,6 +124,12 @@ class RevisionComparePanel(QWidget):
         layout.addWidget(self.summary)
 
         self.tabs = QTabWidget()
+        self.events = EventComparisonWidget()
+        self.events.zoomRequested.connect(self.zoomRequested)
+        self.tabs.addTab(self.events, "Events")
+        self.tabs.setTabToolTip(
+            0, "Pair the events of A with B (e.g. design vs as-laid repeaters) and "
+               "measure along-track, cross-course and radial offsets.")
         self.stats_table = QTableWidget(0, 4)
         self.stats_table.setHorizontalHeaderLabels(["Measure", "A", "B", "Change"])
         _configure_table(self.stats_table)
@@ -115,7 +156,7 @@ class RevisionComparePanel(QWidget):
         layout.addWidget(self.tabs, 1)
 
         controls = QHBoxLayout()
-        self.changes_only = QCheckBox("Show changes only")
+        self.changes_only = QCheckBox("Show changes only (positions, legs)")
         self.changes_only.setChecked(True)
         self.changes_only.setToolTip(
             "Hide positions and legs that are identical in both revisions.")
@@ -129,40 +170,82 @@ class RevisionComparePanel(QWidget):
         layout.addLayout(controls)
 
     # ------------------------------------------------------------- load --
-    def load_segment(self, store, route_id: str) -> None:
-        """Point the panel at a segment; the comparison waits until shown."""
+    def load_segment(self, store, route_id: str, rpl_a: str = "", rpl_b: str = "") -> None:
+        """Point the panel at a segment; the comparison waits until shown.
+
+        The pickers list the segment's revisions (newest first) and then every
+        other RPL in the project, so design and as-laid RPLs held under
+        different segments can be compared too. ``rpl_a``/``rpl_b`` preselect
+        a pair; by default the newest design is compared with the newest
+        as-laid, else the two newest revisions.
+        """
         self._store = store
         self._route_id = route_id or ""
         self._comparison = None
         self._rendered_key = None
-        rows = []
-        if store is not None and route_id:
+        rows, others, route_names = [], [], {}
+        if store is not None:
             try:
-                rows = store.revisions_of_route(route_id)
+                rows = store.revisions_of_route(route_id) if route_id else []
+                own = {row.get("rpl_id") for row in rows}
+                others = [row for row in store.list_rpls() if row.get("rpl_id") not in own]
+                route_names = {route.get("route_id"): route.get("name") or ""
+                               for route in store.list_routes()}
             except Exception:
-                rows = []
+                rows, others = rows or [], []
         self._revisions = rows
+        others.sort(key=lambda row: (route_names.get(row.get("route_id"), "~"),
+                                     row.get("rev_label") or row.get("name") or ""))
         for combo in (self.combo_a, self.combo_b):
             combo.blockSignals(True)
             combo.clear()
             for row in reversed(rows):           # newest first
-                label = row.get("rev_label") or row.get("name") or "Unlabelled"
-                status = row.get("status") or schema.STATUS_DRAFT
-                combo.addItem(f"{label} ({status})", row.get("rpl_id") or "")
+                combo.addItem(_rpl_label(row), row.get("rpl_id") or "")
+            if rows and others:
+                combo.insertSeparator(combo.count())
+            for row in others:
+                combo.addItem(_rpl_label(row, route_names.get(row.get("route_id"), "")
+                                         or "(no segment)"), row.get("rpl_id") or "")
             combo.blockSignals(False)
-        # Default to the two newest: the pair an engineer nearly always wants.
-        if len(rows) >= 2:
-            self.combo_a.setCurrentIndex(1)
-            self.combo_b.setCurrentIndex(0)
+        default_a, default_b = default_pair(rows)
+        choice_a, choice_b = rpl_a or default_a, rpl_b or default_b
+        if choice_a and choice_a == choice_b:
+            # Keep the side the caller asked for; move the other one.
+            fixed = choice_b if (rpl_b and not rpl_a) else choice_a
+            pool = [default_a, default_b] + [self.combo_a.itemData(i)
+                                             for i in range(self.combo_a.count())]
+            other = next((rpl for rpl in pool if rpl and rpl != fixed), "")
+            if fixed == choice_b:
+                choice_a = other
+            else:
+                choice_b = other
+        self._select(self.combo_a, choice_a)
+        self._select(self.combo_b, choice_b)
         self._clear_tables()
-        if len(rows) < 2:
+        self.events.clear()
+        if len(rows) + len(others) < 2:
             self.summary.setText(
-                "This cable segment has fewer than two RPL revisions, so there "
-                "is nothing to compare yet.")
+                "The project has fewer than two RPLs, so there is nothing to compare yet.")
             self.export_btn.setEnabled(False)
         else:
-            self.summary.setText("Select two revisions to compare.")
+            self.summary.setText("Select two RPLs to compare.")
         self._refresh_if_visible()
+
+    def select_pair(self, rpl_a: str, rpl_b: str) -> None:
+        """Preselect A and B (either may be empty to keep the current choice)."""
+        for combo, rpl_id in ((self.combo_a, rpl_a), (self.combo_b, rpl_b)):
+            combo.blockSignals(True)
+            self._select(combo, rpl_id)
+            combo.blockSignals(False)
+        self._refresh_if_visible()
+
+    @staticmethod
+    def _select(combo, rpl_id):
+        if not rpl_id:
+            return
+        index = combo.findData(rpl_id)
+        if index >= 0:
+            combo.setCurrentIndex(index)
 
     def set_visible_tab(self, visible: bool) -> None:
         """Told by the owner whether this tab is on screen."""
@@ -194,7 +277,8 @@ class RevisionComparePanel(QWidget):
             self._comparison = None
             self._rendered_key = None
             self._clear_tables()
-            self.summary.setText("Pick two different revisions.")
+            self.events.clear()
+            self.summary.setText("Pick two different RPLs.")
             self.export_btn.setEnabled(False)
             return
         key = (rpl_a, rpl_b)
@@ -230,6 +314,14 @@ class RevisionComparePanel(QWidget):
             + change_summary(self._comparison))
         self.export_btn.setEnabled(True)
         self._populate_tables()
+        self.events.set_data(
+            points_a, points_b, key=f"{rpl_a}__{rpl_b}",
+            a_label=self._comparison.a_label, b_label=self._comparison.b_label,
+            classify=self._classifier(),
+            a_detail=" ".join(bit for bit in (
+                (row_a.get("kind") or "").replace("_", "-"), row_a.get("status") or "") if bit),
+            b_detail=" ".join(bit for bit in (
+                (row_b.get("kind") or "").replace("_", "-"), row_b.get("status") or "") if bit))
 
     def _classifier(self):
         from .assembly_model import EventClassifier
@@ -380,6 +472,22 @@ class RevisionComparePanel(QWidget):
             QMessageBox.warning(self, "Export comparison", str(exc))
             return
         QMessageBox.information(self, "Export comparison", f"Written to {path}")
+
+
+class RplCompareDialog(QDialog):
+    """The comparison in its own resizable, non-modal window."""
+
+    def __init__(self, store, route_id: str, rpl_a: str = "", rpl_b: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Compare RPLs")
+        self.setWindowFlags(WINDOW_TYPE_WINDOW | WINDOW_HINT_CUSTOMIZE | WINDOW_HINT_TITLE
+                            | WINDOW_HINT_MIN_MAX | WINDOW_HINT_CLOSE)
+        layout = QVBoxLayout(self)
+        self.panel = RevisionComparePanel(self)
+        layout.addWidget(self.panel)
+        self.panel.load_segment(store, route_id, rpl_a, rpl_b)
+        self.panel.set_visible_tab(True)
+        self.resize(1200, 760)
 
 
 # ---------------------------------------------------------------- helpers --

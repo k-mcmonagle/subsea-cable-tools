@@ -332,8 +332,9 @@ def test_workbench_compare_panel_constructs():
     panel = RevisionComparePanel()
     panel.load_segment(None, "")
     assert [panel.tabs.tabText(i) for i in range(panel.tabs.count())] == [
-        "Statistics", "Positions", "Legs"]
+        "Events", "Statistics", "Positions", "Legs"]
     assert not panel.export_btn.isEnabled()
+    assert not panel.events.report_btn.isEnabled()
     panel.set_visible_tab(True)          # nothing selected: must not raise
     panel.deleteLater()
 

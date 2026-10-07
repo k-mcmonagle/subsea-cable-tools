@@ -604,7 +604,7 @@ class SegmentOverviewPanel(QWidget):
         self.views.addTab(schematic_page, "Schematic")
         self.compare = RevisionComparePanel()
         self.compare.zoomRequested.connect(self.zoomToPositionRequested)
-        self.views.addTab(self.compare, "Compare revisions")
+        self.views.addTab(self.compare, "Compare RPLs")
         self.views.currentChanged.connect(self._view_changed)
         layout.addWidget(self.views, 1)
 

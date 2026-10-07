@@ -2,6 +2,7 @@
 """Focused QGIS-runtime checks for the MDB processing algorithm."""
 
 import os
+import math
 import tempfile
 import gc
 
@@ -16,11 +17,13 @@ from qgis.core import (
     QgsProcessingFeedback,
     QgsProcessingParameterMultipleLayers,
     QgsProject,
+    QgsRectangle,
     QgsVectorLayer,
     QgsVectorFileWriter,
 )
 
 from ..processing import import_mdb_algorithm as mdb_import
+from ..processing.geomedia_crs import analyse_coordinate_systems
 from ..processing.import_mdb_algorithm import ImportMdbAlgorithm
 
 
@@ -189,18 +192,151 @@ def test_merged_internal_ids_save_to_geopackage():
     return _result("merged duplicate internal IDs save with a fresh GeoPackage fid", ok)
 
 
+_WGS84_CS = {
+    "CSGUID": "{11111111-2222-3333-4444-555555555555}", "BaseStorageType": 1,
+    "Stor2CompMatrix1": math.pi / 180.0, "Stor2CompMatrix6": math.pi / 180.0,
+    "EquatorialRadius": 6378137.0, "InverseFlattening": 298.257223563, "GeodeticDatum": 17,
+}
+_UNKNOWN_CS = {
+    "CSGUID": "{99999999-8888-7777-6666-555555555555}", "BaseStorageType": 0,
+    "Stor2CompMatrix1": 1.0, "Stor2CompMatrix6": 1.0, "ProjAlgorithm": 12,
+    "EquatorialRadius": 6378388.0, "InverseFlattening": 297.0,
+}
+
+
+def _listing(cs_row, tables=("Table",)):
+    report = analyse_coordinate_systems([cs_row])
+    return {
+        "tables": {name: {"geom_field_name": "Geometry", "geometry_type_code": 1}
+                   for name in tables},
+        "non_spatial": [],
+        "crs": report.to_dict(),
+    }
+
+
+class _FakeImport(ImportMdbAlgorithm):
+    """Runs processAlgorithm with canned pre-flight listings per file."""
+
+    def __init__(self, files, listings=None, user_crs="EPSG:4326", force=False):
+        super().__init__()
+        self.files = files
+        self.listings = listings or {}
+        self.user_crs = user_crs
+        self.force = force
+        self.calls = []
+        self.assigned = {}
+        self.preflighted = []
+
+    def parameterAsFileList(self, parameters, name, context):
+        return self.files
+
+    def parameterAsCrs(self, parameters, name, context):
+        return QgsCoordinateReferenceSystem(self.user_crs or "")
+
+    def parameterAsEnum(self, parameters, name, context):
+        return self.CRS_MODE_FORCE if self.force else self.CRS_MODE_FALLBACK
+
+    def _preflight_file(self, mdb_file, feedback, isolate=True, schema_discovery=False):
+        self.preflighted.append(os.path.basename(mdb_file))
+        return self.listings.get(os.path.basename(mdb_file), _listing(_WGS84_CS))
+
+    def _process_mdb_file(self, mdb_file, target_crs, context, feedback, **options):
+        name = os.path.basename(mdb_file)
+        self.calls.append(name)
+        self.assigned[name] = {
+            table: crs.authid() for table, crs in (options.get("table_crs") or {}).items()}
+        self.assigned[name]["(default)"] = target_crs.authid() if target_crs else ""
+        return {f"{name}::Table": name}
+
+
+def _empty_files(temp_dir, *names):
+    paths = []
+    for name in names:
+        path = os.path.join(temp_dir, name)
+        open(path, "wb").close()
+        paths.append(path)
+    return paths
+
+
+def test_crs_detected_from_file_without_user_crs():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        files = _empty_files(temp_dir, "a.mdb")
+        algorithm = _FakeImport(files, user_crs=None)
+        algorithm.processAlgorithm({}, QgsProcessingContext(), _Feedback())
+    assigned = algorithm.assigned.get("a.mdb", {})
+    ok = assigned.get("Table") == "EPSG:4326" and assigned.get("(default)") == "EPSG:4326"
+    return _result("MDB CRS is auto-detected when no Source CRS is set", ok, str(assigned))
+
+
+def test_undetected_crs_fails_before_any_import():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        files = _empty_files(temp_dir, "good.mdb", "odd.mdb")
+        algorithm = _FakeImport(files, {"odd.mdb": _listing(_UNKNOWN_CS)}, user_crs=None)
+        message = ""
+        try:
+            algorithm.processAlgorithm({}, QgsProcessingContext(), _Feedback())
+        except QgsProcessingException as exc:
+            message = str(exc)
+    ok = (
+        algorithm.preflighted == ["good.mdb", "odd.mdb"]
+        and algorithm.calls == []                       # nothing imported
+        and "odd.mdb:" in message
+        and "Detected without problems: good.mdb" in message
+        and "could not be detected" in message
+        and "Source CRS" in message
+    )
+    return _result("undetectable MDB CRS stops the run before importing anything", ok, message)
+
+
+def test_user_crs_is_fallback_for_undetected_files_only():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        files = _empty_files(temp_dir, "good.mdb", "odd.mdb")
+        algorithm = _FakeImport(files, {"odd.mdb": _listing(_UNKNOWN_CS)}, user_crs="EPSG:23031")
+        feedback = _Feedback()
+        algorithm.processAlgorithm({}, QgsProcessingContext(), feedback)
+    ok = (
+        algorithm.calls == ["good.mdb", "odd.mdb"]
+        and algorithm.assigned["good.mdb"]["Table"] == "EPSG:4326"   # the file wins
+        and algorithm.assigned["odd.mdb"]["Table"] == "EPSG:23031"   # fallback
+    )
+    return _result("Source CRS fills in only where detection fails", ok, str(algorithm.assigned))
+
+
+def test_force_mode_ignores_file_crs():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        files = _empty_files(temp_dir, "good.mdb")
+        algorithm = _FakeImport(files, user_crs="EPSG:32631", force=True)
+        algorithm.processAlgorithm({}, QgsProcessingContext(), _Feedback())
+        force_without_crs = _FakeImport(files, user_crs=None, force=True)
+        refused = False
+        try:
+            force_without_crs.processAlgorithm({}, QgsProcessingContext(), _Feedback())
+        except QgsProcessingException:
+            refused = True
+    ok = (algorithm.assigned["good.mdb"]["(default)"] == "EPSG:32631"
+          and "Table" not in algorithm.assigned["good.mdb"] and refused)
+    return _result("'Always' mode assigns the Source CRS and requires one", ok,
+                   str(algorithm.assigned))
+
+
+def test_extent_crs_warning():
+    wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
+    utm31 = QgsCoordinateReferenceSystem("EPSG:32631")
+    degrees = QgsRectangle(2.0, 51.0, 3.0, 52.0)
+    metres = QgsRectangle(430000.0, 5650000.0, 500000.0, 5760000.0)
+    ok = (
+        mdb_import.extent_crs_warning(degrees, wgs84) == ""
+        and "cannot be longitude/latitude" in mdb_import.extent_crs_warning(metres, wgs84)
+        and mdb_import.extent_crs_warning(metres, utm31) == ""
+        and "look like degrees" in mdb_import.extent_crs_warning(degrees, utm31)
+    )
+    return _result("extent check flags a CRS that cannot fit the data", ok)
+
+
 def test_multi_file_dispatch_and_failure_isolation():
-    class FakeAlgorithm(ImportMdbAlgorithm):
+    class FakeAlgorithm(_FakeImport):
         def __init__(self, files):
-            super().__init__()
-            self.files = files
-            self.calls = []
-
-        def parameterAsFileList(self, parameters, name, context):
-            return self.files
-
-        def parameterAsCrs(self, parameters, name, context):
-            return QgsCoordinateReferenceSystem("EPSG:4326")
+            super().__init__(files)
 
         def _process_mdb_file(self, mdb_file, target_crs, context, feedback, **options):
             self.calls.append(os.path.basename(mdb_file))
@@ -411,6 +547,11 @@ def run_all():
         test_cancel_terminates_worker(),
         test_merged_internal_ids_save_to_geopackage(),
         test_multi_file_dispatch_and_failure_isolation(),
+        test_crs_detected_from_file_without_user_crs(),
+        test_undetected_crs_fails_before_any_import(),
+        test_user_crs_is_fallback_for_undetected_files_only(),
+        test_force_mode_ignores_file_crs(),
+        test_extent_crs_warning(),
         test_source_crs_parameter_wording(),
         test_worker_listing_envelope_and_legacy_shape(),
         test_multipoint_filtering_keeps_environment_behaviour(),

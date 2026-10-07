@@ -71,6 +71,7 @@ try:  # Running as a package module (QGIS, tests).
         iter_vertices,
         to_geojson_geometry,
     )
+    from .geomedia_crs import analyse_coordinate_systems
 except ImportError:  # Running as a bare subprocess script.
     _here = os.path.dirname(os.path.abspath(__file__))
     if _here not in sys.path:
@@ -83,6 +84,7 @@ except ImportError:  # Running as a bare subprocess script.
         iter_vertices,
         to_geojson_geometry,
     )
+    from geomedia_crs import analyse_coordinate_systems  # type: ignore[no-redef]
 
 ACCESS_ODBC_DRIVER_NAME = "Microsoft Access Driver (*.mdb, *.accdb)"
 
@@ -1204,6 +1206,59 @@ def list_feature_tables(mdb_path):
     )
 
 
+#: Small GeoMedia metadata tables that describe coordinate systems.
+_CRS_TABLES = ("GCoordSystem", "GeometryProperties", "FieldLookup")
+
+
+def read_coordinate_systems(mdb_path):
+    """Return the :class:`geomedia_crs.FileCrsReport` for a warehouse.
+
+    Reads only the three small metadata tables in ``_CRS_TABLES``, so it is
+    cheap enough to run on every file before any feature data is touched.
+    """
+    def _as_dicts(table):
+        col_names, rows = table
+        return [dict(zip(col_names, row)) for row in rows]
+
+    def _pure():
+        tables = _PureTables(mdb_path)
+        out = {}
+        for name in _CRS_TABLES:
+            actual = tables.find_table(name)
+            out[name] = _as_dicts(tables.read(actual)) if actual else []
+        return out
+
+    def _odbc():
+        with _connect(mdb_path) as conn:
+            cur = conn.cursor()
+            actual_names = {str(ti.table_name).upper(): str(ti.table_name)
+                            for ti in cur.tables()}
+            out = {}
+            for name in _CRS_TABLES:
+                actual = actual_names.get(name.upper())
+                if not actual:
+                    out[name] = []
+                    continue
+                cur.execute("SELECT * FROM " + _quote_access_identifier(actual))  # nosec B608
+                col_names = [desc[0] for desc in cur.description]
+                out[name] = [dict(zip(col_names, tuple(row))) for row in cur.fetchall()]
+            return out
+
+    tables = _run_with_backends(_pure, _odbc)
+    return analyse_coordinate_systems(
+        tables["GCoordSystem"], tables["GeometryProperties"], tables["FieldLookup"])
+
+
+def _coordinate_systems_payload(mdb_path):
+    """``read_coordinate_systems`` as JSON-ready data; never raises."""
+    try:
+        return read_coordinate_systems(mdb_path).to_dict()
+    except FileNotFoundError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a CRS read failure must not stop the listing
+        return {"error": sanitise_diagnostic(exc)}
+
+
 def export_table_to_geojson(mdb_path, table_name, geom_field_name, geometry_type_code,
                             out_path, max_features=0, split=False,
                             allow_xy_fallback=True, allow_secondary_geometry=True):
@@ -1249,7 +1304,9 @@ def main(argv=None):
         if args.mode == "list":
             include_schema = (
                 None if args.schema_discovery is None else args.schema_discovery == "1")
-            sys.stdout.write(json.dumps(discover_tables(args.mdb, include_schema)))
+            envelope = discover_tables(args.mdb, include_schema)
+            envelope["crs"] = _coordinate_systems_payload(args.mdb)
+            sys.stdout.write(json.dumps(envelope))
             return 0
 
         if args.mode == "export":

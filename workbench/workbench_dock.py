@@ -77,6 +77,7 @@ class WorkbenchDock(QDockWidget):
         self._teardown_muted = False
         self._pending_removed_workbench_layers = set()
         self._migrated_store_path = ""
+        self._compare_dialogs = set()   # open RplCompareDialogs (kept alive)
         self.setObjectName("CableRouteWorkbenchDock")
         self.setAllowedAreas(
             Qt.DockWidgetArea.LeftDockWidgetArea
@@ -974,8 +975,7 @@ class WorkbenchDock(QDockWidget):
             menu.addSeparator()
             menu.addAction("Fit assembly...", self._fit_selected_rpl)
             menu.addAction("New assessment...", self._new_assessment)
-            compare = menu.addAction("Compare with...")
-            compare.setEnabled(False)
+            menu.addAction("Compare with...", self._compare_selected_rpl)
             menu.addSeparator()
             menu.addAction("Delete RPL", self._delete_selected)
         elif ref[0] == KIND_ASSEMBLY:
@@ -1552,6 +1552,26 @@ class WorkbenchDock(QDockWidget):
         self.rpl_panel._save_revision_label()
         self._organise_layers()
         self.refresh_tree()
+
+    def _compare_selected_rpl(self):
+        """Open the RPL comparison (events, statistics, positions, legs) with
+        the selected RPL preselected; an as-laid RPL goes on the B side."""
+        store = self._store()
+        rpl_id = self._selected_rpl_id()
+        rpl = store.get_rpl(rpl_id) if store and rpl_id else None
+        if rpl is None:
+            QMessageBox.information(self, "Compare RPLs", "Select an RPL first.")
+            return
+        from .compare_panel import KIND_AS_LAID, RplCompareDialog
+
+        as_laid = (rpl.get("kind") or "") == KIND_AS_LAID
+        dialog = RplCompareDialog(
+            store, rpl.get("route_id") or "",
+            rpl_a="" if as_laid else rpl_id, rpl_b=rpl_id if as_laid else "", parent=self)
+        dialog.panel.zoomRequested.connect(self._zoom_to_position)
+        dialog.finished.connect(lambda _code, d=dialog: self._compare_dialogs.discard(d))
+        self._compare_dialogs.add(dialog)
+        dialog.show()
 
     def _zoom_to_position(self, latitude: float, longitude: float):
         """Centre the map on one WGS84 position (a comparison table row)."""

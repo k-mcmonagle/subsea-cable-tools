@@ -220,6 +220,55 @@ def test_route_comparison_offsets_and_signs() -> bool:
     return _result("route comparison: along/cross-track values and signs", ok, f"rows={rows}")
 
 
+def test_route_comparison_smart_matching_filter_and_report() -> bool:
+    """Renamed/typo'd as-laid repeaters pair by similar name; filter; report."""
+    import os
+    import tempfile
+
+    design_lines = _route_layer()
+    aslaid_lines = _layer("LineString", "aslaid_lines2", [
+        QgsGeometry.fromPolylineXY([_xy(0, -40), _xy(20000, -40)])])
+    fields = [QgsField("Event", FIELD_TYPE_STRING)]
+    design_pts = _layer("Point", "design_pts2", [
+        QgsGeometry.fromPointXY(_xy(5000, 0)), QgsGeometry.fromPointXY(_xy(8000, 0)),
+        QgsGeometry.fromPointXY(_xy(15000, 0))],
+        fields=fields, attrs=[["RPTR 1"], ["AC 1"], ["RPTR 2"]])
+    aslaid_pts = _layer("Point", "aslaid_pts2", [
+        QgsGeometry.fromPointXY(_xy(5025, -40)), QgsGeometry.fromPointXY(_xy(8000, 5)),
+        QgsGeometry.fromPointXY(_xy(12000, -40)), QgsGeometry.fromPointXY(_xy(14990, 60))],
+        fields=fields, attrs=[["Repeater 1 S/N 99"], ["AC 1"], ["JT 7"], ["RTPR 2"]])
+    report_path = os.path.join(tempfile.mkdtemp(prefix="sct_cmp_"), "report.html")
+    base = {
+        "DESIGN_POINTS": design_pts, "DESIGN_EVENTS_FIELD": "Event", "DESIGN_LINES": design_lines,
+        "ASLAID_POINTS": aslaid_pts, "ASLAID_EVENTS_FIELD": "Event", "ASLAID_LINES": aslaid_lines,
+        "EVENT_PRESET": 2, "TARGET_RADIUS": 50.0,            # 2 = repeaters
+    }
+    out = _run(RPLRouteComparisonAlgorithm(), dict(base, OUTPUT_REPORT=report_path),
+               ["OUTPUT_COMPARISON"])
+    exact = _run(RPLRouteComparisonAlgorithm(), dict(base, MATCH_MODE=1), ["OUTPUT_COMPARISON"])
+    ok = out is not None and out[0] is not None and exact is not None
+    rows = {}
+    if ok:
+        rows = {f["design_event"]: (f["aslaid_event"], f["match_method"], f["bearing_deg"],
+                                    f["within_target"], f["along_track_m"])
+                for f in out[0].getFeatures()}
+        r1 = rows.get("RPTR 1")
+        expected_bearing = math.degrees(math.atan2(25.0, -40.0)) % 360.0
+        ok = (set(rows) == {"RPTR 1", "RPTR 2"}                     # AC filtered out
+              and r1[0] == "Repeater 1 S/N 99" and r1[1] == "fuzzy"
+              and rows["RPTR 2"][0] == "RTPR 2"
+              and abs(r1[2] - expected_bearing) < 0.5               # ellipsoidal, not raw XY
+              and r1[3] == "yes" and rows["RPTR 2"][3] == "no"
+              and abs(r1[4] - 25.0) < 0.05
+              and exact[0].featureCount() == 0)
+        with open(report_path, encoding="utf-8") as handle:
+            page = handle.read()
+        ok = ok and page.count("<svg") >= 3 and "Repeater 1 S/N 99" in page
+    _cleanup(design_lines, aslaid_lines, design_pts, aslaid_pts)
+    return _result("route comparison: smart matching, event filter, bearing and report",
+                   ok, f"rows={rows}")
+
+
 def test_place_kp_points_from_csv() -> bool:
     route = _route_layer()
     pasted = "KP\tLabel\n2.5\ta\n12.25\tb\n-1\tbefore start\n25\tpast end"
@@ -248,6 +297,7 @@ def run_all() -> List[bool]:
         test_nearest_kp_seqno_order_and_crs(),
         test_translate_kp_matches_route_frame(),
         test_route_comparison_offsets_and_signs(),
+        test_route_comparison_smart_matching_filter_and_report(),
         test_place_kp_points_from_csv(),
     ]
 

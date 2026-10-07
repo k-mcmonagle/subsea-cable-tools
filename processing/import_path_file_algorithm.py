@@ -41,6 +41,7 @@ from ..qgis_compat import (
 from .import_mdb_algorithm import (
     ImportMdbAlgorithm,
     _write_to_temporary_gpkg,
+    extent_crs_warning,
 )
 from .pthmdb_reader import PathFileError, kp_to_km, read_path_file
 
@@ -141,33 +142,52 @@ class ImportPathFileAlgorithm(SubseaCableAlgorithm):
         if not normalized_files:
             raise QgsProcessingException("Select at least one .pthmdb path file.")
 
-        output_layers = []
-        for file_index, path in enumerate(normalized_files):
+        # Read and check every file first: path files are small, and an
+        # undetectable CRS should stop the run before any layer is built.
+        loaded = []
+        unresolved = []
+        for path in normalized_files:
             if feedback.isCanceled():
                 break
-            stem = os.path.splitext(os.path.basename(path))[0]
             feedback.pushInfo(f"Reading {os.path.basename(path)}...")
             try:
                 data = read_path_file(path)
             except PathFileError as exc:
                 raise QgsProcessingException(str(exc))
+            crs = None
+            if data.crs_auth_id:
+                crs = QgsCoordinateReferenceSystem(data.crs_auth_id)
+                if not crs.isValid():
+                    crs = None
+            if crs is None and not (crs_override and crs_override.isValid()):
+                unresolved.append(f"  • {os.path.basename(path)}: {data.crs_note}")
+            loaded.append((path, data, crs))
+        if unresolved:
+            raise QgsProcessingException(
+                "The coordinate reference system could not be detected for "
+                f"{len(unresolved)} of {len(normalized_files)} path file(s), so nothing was "
+                "imported:\n" + "\n".join(unresolved)
+                + "\nSet the 'CRS override' parameter to the CRS the coordinates are stored "
+                "in and run the tool again.")
+
+        output_layers = []
+        for file_index, (path, data, crs) in enumerate(loaded):
+            if feedback.isCanceled():
+                break
+            stem = os.path.splitext(os.path.basename(path))[0]
+            feedback.pushInfo(f"Importing {os.path.basename(path)}...")
 
             for warning in data.warnings:
                 feedback.pushWarning(f"  {warning}")
 
-            if data.crs_auth_id:
-                crs = QgsCoordinateReferenceSystem(data.crs_auth_id)
+            if crs is not None:
                 feedback.pushInfo(f"  CRS auto-detected: {data.crs_auth_id} "
                                   f"({data.crs_note})")
-            elif crs_override and crs_override.isValid():
+            else:
                 crs = crs_override
                 feedback.pushWarning(
                     f"  {data.crs_note}; using the CRS override "
                     f"({crs_override.authid()})")
-            else:
-                raise QgsProcessingException(
-                    f"{os.path.basename(path)}: {data.crs_note}. "
-                    "Set the CRS override parameter.")
 
             kp_unit = data.kp_unit
             feedback.pushInfo(
@@ -186,6 +206,11 @@ class ImportPathFileAlgorithm(SubseaCableAlgorithm):
                 disk = _write_to_temporary_gpkg(layer, name, crs, context, feedback)
                 if disk is None:
                     return
+                warning = extent_crs_warning(disk.extent(), crs, context.transformContext())
+                if warning:
+                    feedback.reportError(
+                        f"  Check the CRS of {name}: {warning}. Set the CRS override if the "
+                        "detected CRS is wrong.")
                 ImportMdbAlgorithm._register_output_layer(context, disk, name, stem)
                 output_layers.append(disk.id())
 
@@ -334,7 +359,7 @@ class ImportPathFileAlgorithm(SubseaCableAlgorithm):
 <p>Each file's layers are placed in a group named after the file, stored as indexed temporary GeoPackages. Every table in the file is accounted for: any populated table the tool does not recognise is named in the log with its row count, so nothing is dropped silently.</p>
 
 <h4>Coordinate system and units</h4>
-<p>The CRS is auto-detected from the file's GeoMedia <code>GCoordSystem</code> record; path files normally store geographic degrees on WGS84 (EPSG:4326). The <b>CRS override</b> parameter is only used when auto-detection fails. The KP unit (metres or kilometres) is verified against the geodesic length of the route.</p>
+<p>The CRS is auto-detected from the GeoMedia <code>GCoordSystem</code> record the path points reference; path files normally store geographic degrees on WGS84 (EPSG:4326), and WGS84 UTM storage is recognised too. Every selected file is checked before any layer is built: if a CRS cannot be identified with certainty the tool stops, explains why and asks for the <b>CRS override</b>, which is only used where auto-detection fails. Each layer's extent is checked against its CRS afterwards. The KP unit (metres or kilometres) is verified against the geodesic length of the route.</p>
 
 <h4>Prerequisites</h4>
 <p>None for typical files: the plugin's bundled pure-Python MDB reader is used, with an automatic ODBC fallback (Windows + Microsoft Access Database Engine + pyodbc) for unusual files.</p>

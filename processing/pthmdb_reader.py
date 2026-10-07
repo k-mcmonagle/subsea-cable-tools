@@ -18,9 +18,10 @@ cable path. The tables of interest:
     Optional KP/depth profile sampled from a bathymetry in the source application.
     Often empty; when populated it also names the source bathy table.
 ``GCoordSystem``
-    GeoMedia coordinate-system record. Path files store geographic
-    coordinates in degrees on WGS84, which this module verifies so callers
-    can default the CRS instead of demanding one from the user.
+    GeoMedia coordinate-system record(s). Path files normally store
+    geographic coordinates in degrees on WGS84; :mod:`geomedia_crs` resolves
+    the record PathPoints actually references (via GeometryProperties) so
+    callers can default the CRS instead of demanding one from the user.
 
 This module is deliberately QGIS-free so it can be exercised by the plain
 Python test suite; it reuses the backend dispatch (bundled ``access_parser``
@@ -36,6 +37,7 @@ import os
 try:  # Running as a package module (QGIS, tests).
     from . import mdb_odbc_worker as _worker
     from .geomedia_blob import decode_geometry_blob
+    from .geomedia_crs import analyse_coordinate_systems
 except ImportError:  # Running as a bare script.
     import sys
     _here = os.path.dirname(os.path.abspath(__file__))
@@ -43,6 +45,7 @@ except ImportError:  # Running as a bare script.
         sys.path.insert(0, _here)
     import mdb_odbc_worker as _worker  # type: ignore[no-redef]
     from geomedia_blob import decode_geometry_blob  # type: ignore[no-redef]
+    from geomedia_crs import analyse_coordinate_systems  # type: ignore[no-redef]
 
 
 PATH_FILE_EXTENSIONS = {".pthmdb"}
@@ -50,8 +53,8 @@ PATH_FILE_EXTENSIONS = {".pthmdb"}
 #: Tables read from the path database. Missing tables are tolerated; the
 #: reader only fails when PathPoints is absent or empty.
 _TABLES = ("PathPoints", "PathLines", "AssemblyPoints", "Profile",
-           "PathWidth", "SideSlopes", "GCoordSystem", "PathInfo",
-           "PathEditInfo")
+           "PathWidth", "SideSlopes", "GCoordSystem", "GeometryProperties",
+           "FieldLookup", "PathInfo", "PathEditInfo")
 
 #: GeoMedia framework/metadata tables: known, deliberately not imported, and
 #: excluded from the "unrecognised table" warning.
@@ -60,9 +63,6 @@ _METADATA_TABLES = frozenset({
     "ATTRIBUTEPROPERTIES", "FIELDLOOKUP", "MODIFICATIONLOG", "MODIFIEDTABLES",
 })
 
-# WGS84 defining parameters, as stored by GeoMedia.
-_WGS84_RADIUS = 6378137.0
-_WGS84_INV_FLATTENING = 298.257223563
 _DEG_TO_RAD = math.pi / 180.0
 _MEAN_EARTH_RADIUS_M = 6371008.8
 
@@ -82,8 +82,9 @@ class PathFileData:
         names; decoded coordinates are added as ``x``/``y``/``z`` (points)
         or ``vertices`` (a list of ``(x, y, z)`` tuples, lines).
     ``crs_auth_id``
-        ``"EPSG:4326"`` when GCoordSystem matches the usual path-file
-        degrees-on-WGS84 storage, else ``None`` (caller must ask the user).
+        The detected CRS (normally ``"EPSG:4326"``) when the GCoordSystem
+        record identifies it unambiguously, else ``None`` and ``crs_note``
+        says why (caller must ask the user).
     ``kp_unit``
         ``"m"`` or ``"km"`` when the PathPoints KP column agrees with the
         geodesic length of the decoded route, else ``None``.
@@ -233,29 +234,19 @@ def _decode_line_rows(rows, warnings):
     return out
 
 
-def _detect_crs(gcoordsystem_rows):
-    """Return ``(auth_id_or_none, note)`` from the GCoordSystem record."""
+def _detect_crs(gcoordsystem_rows, geometry_properties_rows=(),
+                field_lookup_rows=()):
+    """Return ``(auth_id_or_none, note)`` for the PathPoints geometry."""
     if not gcoordsystem_rows:
         return None, "no GCoordSystem table"
-    row = gcoordsystem_rows[0]
-
-    def _close(value, expected, tol):
-        try:
-            return abs(float(value) - expected) <= tol
-        except (TypeError, ValueError):
-            return False
-
-    stored_in_degrees = _close(_get(row, "Stor2CompMatrix1"), _DEG_TO_RAD, 1e-12)
-    wgs84_ellipsoid = (
-        _close(_get(row, "EquatorialRadius"), _WGS84_RADIUS, 0.5)
-        and _close(_get(row, "InverseFlattening"), _WGS84_INV_FLATTENING, 1e-4)
-    )
-    if stored_in_degrees and wgs84_ellipsoid:
-        return "EPSG:4326", "geographic degrees on WGS84 (from GCoordSystem)"
-    return None, (
-        "GCoordSystem does not match the usual path-file storage "
-        "(geographic degrees on WGS84); set the CRS manually"
-    )
+    report = analyse_coordinate_systems(
+        gcoordsystem_rows, geometry_properties_rows, field_lookup_rows)
+    detection = report.crs_for_table("PathPoints")
+    if detection is None:
+        return None, report.summary()
+    if detection.detected:
+        return detection.auth_id, f"{detection.description} (from GCoordSystem)"
+    return None, detection.explain() + "; set the CRS manually"
 
 
 def _geodesic_length_m(vertices):
@@ -388,8 +379,9 @@ def read_path_file(path):
             f"table '{name}' ({rows_text}) is not recognised and was not "
             "imported")
 
-    data.crs_auth_id, data.crs_note = _detect_crs(
-        _rows_as_dicts(tables["GCOORDSYSTEM"]) if "GCOORDSYSTEM" in tables else [])
+    data.crs_auth_id, data.crs_note = _detect_crs(*(
+        _rows_as_dicts(tables[name]) if name in tables else []
+        for name in ("GCOORDSYSTEM", "GEOMETRYPROPERTIES", "FIELDLOOKUP")))
     data.kp_unit = _detect_kp_unit(data.path_points, data.crs_auth_id, data.warnings)
 
     if "PATHINFO" in tables:

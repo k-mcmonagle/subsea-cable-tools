@@ -3,8 +3,10 @@
 """
 ImportMdbAlgorithm: Imports GeoMedia MDB feature tables into QGIS.
 This tool imports any GeoMedia MDB feature class (Point, LineString, Polygon,
-MultiPoint, 2D and 3D), not just bathymetric data. It relies on a user-provided
-CRS and adds 'depth' and 'source' attributes.
+MultiPoint, 2D and 3D), not just bathymetric data. The CRS is read from the
+warehouse's GCoordSystem metadata (see geomedia_crs); every file is checked
+before any table is imported, so an undetectable CRS stops the run early with
+a request to set it manually. Adds 'depth' and 'source' attributes.
 """
 
 import os
@@ -24,9 +26,13 @@ except Exception:  # pragma: no cover
     pyodbc = None
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
+    QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform,
+    QgsPointXY,
     QgsProcessing,
     QgsProcessingParameterMultipleLayers,
     QgsProcessingParameterCrs,
+    QgsProcessingParameterEnum,
     QgsProcessingParameterFile,
     QgsProcessingOutputMultipleLayers,
     QgsVectorLayer,
@@ -45,7 +51,12 @@ from ..qgis_compat import (
     processing_temp_folder,
 )
 from .geomedia_blob import decode_geometry_blob, parse_blob  # noqa: F401 - re-exported for callers/tests
-from .mdb_odbc_worker import GRAPHIC_TYPE_CODE, find_candidate_geometry_fields
+from .geomedia_crs import CrsDetection, FileCrsReport
+from .mdb_odbc_worker import (
+    GRAPHIC_TYPE_CODE,
+    find_candidate_geometry_fields,
+    read_coordinate_systems,
+)
 from ..gpkg_writer import (  # noqa: F401 - resolve_gpkg_field_names re-exported for tests
     gpkg_layer_uri,
     gpkg_table_name,
@@ -102,6 +113,14 @@ def _safe_temp_stem(name):
     cleaned = cleaned.strip("._") or "table"
     digest = hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:10]
     return f"{cleaned[:80]}_{digest}"
+
+
+def _name_list(names, limit=4):
+    """``"a, b, c +2 more"`` for log and error messages."""
+    names = [str(name) for name in names]
+    if len(names) <= limit:
+        return ", ".join(names)
+    return ", ".join(names[:limit]) + f" +{len(names) - limit} more"
 
 
 def _require_access_odbc_driver(feedback=None):
@@ -636,12 +655,58 @@ def _write_to_temporary_gpkg(source_layer, layer_name, source_crs, context, feed
     )
 
 
+def extent_crs_warning(extent, crs, transform_context=None):
+    """Return a message when ``extent`` cannot plausibly be in ``crs``, else "".
+
+    Catches a wrong CRS whichever way it was chosen (detected or set by the
+    user): projected metres labelled as degrees, degrees labelled as a
+    projected CRS, or data far outside the CRS's area of use.
+    """
+    if crs is None or not crs.isValid() or extent is None or extent.isNull():
+        return ""
+    values = (extent.xMinimum(), extent.yMinimum(), extent.xMaximum(), extent.yMaximum())
+    if not all(math.isfinite(v) for v in values):
+        return ""
+    x_min, y_min, x_max, y_max = values
+    looks_like_degrees = -180.5 <= x_min and x_max <= 360.5 and -90.5 <= y_min and y_max <= 90.5
+    if crs.isGeographic():
+        if not looks_like_degrees:
+            return (
+                f"coordinates span X {x_min:,.1f} to {x_max:,.1f}, Y {y_min:,.1f} to {y_max:,.1f}, "
+                f"which cannot be longitude/latitude degrees, but {crs.authid()} is geographic")
+        return ""
+    if looks_like_degrees and max(abs(v) for v in values) > 0:
+        return (
+            f"coordinates span X {x_min:.4f} to {x_max:.4f}, Y {y_min:.4f} to {y_max:.4f}, "
+            f"which look like degrees, but {crs.authid()} is a projected CRS")
+    bounds = crs.bounds()
+    if bounds is None or bounds.isNull() or bounds.isEmpty():
+        return ""
+    try:
+        to_wgs84 = QgsCoordinateTransform(
+            crs, QgsCoordinateReferenceSystem("EPSG:4326"),
+            transform_context if transform_context is not None else QgsProcessingContext().transformContext())
+        centre = to_wgs84.transform(QgsPointXY(extent.center()))
+    except Exception:  # noqa: BLE001 - an untransformable centre is itself suspicious
+        return f"the data centre cannot be transformed from {crs.authid()} to WGS84"
+    margin = 5.0
+    if not (bounds.xMinimum() - margin <= centre.x() <= bounds.xMaximum() + margin
+            and bounds.yMinimum() - margin <= centre.y() <= bounds.yMaximum() + margin):
+        return (
+            f"the data centre ({centre.y():.2f}, {centre.x():.2f} lat/lon) lies outside the "
+            f"area of use of {crs.authid()}")
+    return ""
+
+
 class ImportMdbAlgorithm(SubseaCableAlgorithm):
     INPUT_MDB = 'INPUT_MDB'
     # The stored key stays 'TARGET_CRS' so existing models and scripts keep
     # working. It has only ever assigned the CRS of the MDB coordinates.
     SOURCE_CRS = 'TARGET_CRS'
     TARGET_CRS = SOURCE_CRS
+    CRS_MODE = 'CRS_MODE'
+    CRS_MODE_FALLBACK = 0
+    CRS_MODE_FORCE = 1
     OUTPUT_FOLDER = 'OUTPUT_FOLDER'
     OUTPUT_LAYERS = 'OUTPUT_LAYERS'
 
@@ -660,8 +725,17 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
         ))
         self.addParameter(QgsProcessingParameterCrs(
             self.SOURCE_CRS,
-            self.tr('Source CRS / CRS of coordinates in MDB'),
-            optional=False,
+            self.tr('Source CRS of coordinates in MDB (leave empty to auto-detect)'),
+            optional=True,
+        ))
+        self.addParameter(QgsProcessingParameterEnum(
+            self.CRS_MODE,
+            self.tr('Use the Source CRS'),
+            options=[
+                self.tr('Only where the MDB coordinate system cannot be detected'),
+                self.tr('Always (ignore the coordinate system stored in the MDB)'),
+            ],
+            defaultValue=self.CRS_MODE_FALLBACK,
         ))
         self.addParameter(QgsProcessingParameterFile(
             self.OUTPUT_FOLDER,
@@ -796,10 +870,15 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
             )
 
         mdb_files = self.parameterAsFileList(parameters, self.INPUT_MDB, context)
-        source_crs = self.parameterAsCrs(parameters, self.SOURCE_CRS, context)
-        if not source_crs or not source_crs.isValid():
+        user_crs = self.parameterAsCrs(parameters, self.SOURCE_CRS, context)
+        if user_crs is None or not user_crs.isValid():
+            user_crs = None
+        force_crs = self.parameterAsEnum(parameters, self.CRS_MODE, context) == self.CRS_MODE_FORCE
+        if force_crs and user_crs is None:
             raise QgsProcessingException(
-                "No valid CRS provided. Set the Source CRS of the coordinates in the MDB.")
+                "'Use the Source CRS: Always' is selected but no Source CRS is set. "
+                "Choose the CRS of the coordinates in the MDB, or switch back to "
+                "auto-detection.")
 
         normalized_files = []
         seen_paths = set()
@@ -842,19 +921,52 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
 
         output_layers = {}
         failures = []
+
+        # Pre-flight: list every database and resolve its CRS before any
+        # feature data is read, so an undetectable CRS costs seconds, not the
+        # whole import.
+        plans = []
+        unresolved = []
         for file_index, mdb_file in enumerate(normalized_files, start=1):
             if feedback.isCanceled():
                 raise QgsProcessingException("MDB import canceled.")
             file_label = os.path.basename(mdb_file)
-            feedback.setProgress(int((file_index - 1) * 100 / len(normalized_files)))
             feedback.setProgressText(
-                f"Importing database {file_index} of {len(normalized_files)}: {file_label}"
+                f"Checking database {file_index} of {len(normalized_files)}: {file_label}")
+            try:
+                listing = self._preflight_file(
+                    mdb_file, feedback, isolate=isolate, schema_discovery=schema_discovery)
+                default_crs, table_crs, problem = self._resolve_file_crs(
+                    file_label, listing, user_crs, force_crs, feedback)
+            except Exception as exc:  # noqa: BLE001 - one bad file must not kill the batch
+                if feedback.isCanceled():
+                    raise QgsProcessingException("MDB import canceled.")
+                failures.append(f"{file_label}: {exc}")
+                feedback.reportError(failures[-1])
+                continue
+            if problem:
+                unresolved.append((file_label, problem))
+                continue
+            plans.append((mdb_file, listing, default_crs, table_crs))
+
+        if unresolved:
+            message = self._unresolved_crs_message(unresolved, plans, len(normalized_files))
+            feedback.reportError(message)
+            raise QgsProcessingException(message)
+
+        for file_index, (mdb_file, listing, default_crs, table_crs) in enumerate(plans, start=1):
+            if feedback.isCanceled():
+                raise QgsProcessingException("MDB import canceled.")
+            file_label = os.path.basename(mdb_file)
+            feedback.setProgress(int((file_index - 1) * 100 / len(plans)))
+            feedback.setProgressText(
+                f"Importing database {file_index} of {len(plans)}: {file_label}"
             )
-            feedback.pushInfo(f"Importing MDB {file_index} of {len(normalized_files)}: {file_label}")
+            feedback.pushInfo(f"Importing MDB {file_index} of {len(plans)}: {file_label}")
             try:
                 file_outputs = self._process_mdb_file(
                     mdb_file,
-                    source_crs,
+                    default_crs,
                     context,
                     feedback,
                     isolate=isolate,
@@ -863,6 +975,8 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
                     max_features=max_features,
                     schema_discovery=schema_discovery,
                     output_gpkg=output_gpkgs.get(mdb_file, ''),
+                    listing=listing,
+                    table_crs=table_crs,
                 )
             except Exception as exc:  # noqa: BLE001 - one bad file must not kill the batch
                 if feedback.isCanceled():
@@ -871,7 +985,7 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
                 feedback.reportError(failures[-1])
                 continue
             output_layers.update(file_outputs)
-            feedback.setProgress(int(file_index * 100 / len(normalized_files)))
+            feedback.setProgress(int(file_index * 100 / len(plans)))
 
         if not output_layers:
             detail = "; ".join(failures)
@@ -913,6 +1027,122 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
             paths[mdb_file] = os.path.join(output_folder, candidate + '.gpkg')
         return paths
 
+    def _preflight_file(self, mdb_file, feedback, isolate=True, schema_discovery=False):
+        """List a database's feature tables and read its coordinate systems.
+
+        Returns the worker's discovery envelope (``tables``, ``non_spatial``)
+        with a ``crs`` entry holding a :class:`FileCrsReport` as a dict. Only
+        GeoMedia metadata tables are read, never feature data.
+        """
+        if isolate:
+            listing = self._run_worker(
+                [
+                    '--mode', 'list',
+                    '--mdb', mdb_file,
+                    '--schema-discovery', '1' if schema_discovery else '0',
+                ],
+                feedback,
+            )
+            return listing if isinstance(listing, dict) else {}
+        _require_access_odbc_driver(feedback)
+        _test_mdb_connection(mdb_file, feedback=feedback)
+        tables = {
+            name: {'geom_field_name': geom_field, 'geometry_type_code': geometry_type}
+            for name, (geom_field, geometry_type) in get_feature_tables(mdb_file, feedback).items()
+        }
+        try:
+            crs = read_coordinate_systems(mdb_file).to_dict()
+        except Exception as exc:  # noqa: BLE001 - reported as an undetected CRS
+            crs = {'error': str(exc)}
+        return {'tables': tables, 'non_spatial': [], 'crs': crs}
+
+    def _resolve_file_crs(self, file_label, listing, user_crs, force_crs, feedback):
+        """Decide the CRS of every table in one database.
+
+        Returns ``(default_crs, {table: crs}, problem)``. ``problem`` is a
+        non-empty explanation when some table's CRS is undetectable and no
+        Source CRS was given to fall back on.
+        """
+        if force_crs:
+            feedback.pushInfo(
+                f"{file_label}: assigning the Source CRS {user_crs.authid()} to every table "
+                "(the coordinate system stored in the MDB is ignored).")
+            return user_crs, {}, ""
+
+        report = FileCrsReport.from_dict(listing.get('crs') if isinstance(listing, dict) else None)
+        tables, _non_spatial = self._read_listing(listing)
+        table_crs = {}
+        detected = {}       # auth id -> (description, [tables])
+        undetected = {}     # explanation -> [tables]
+        for table in tables:
+            detection = report.crs_for_table(table)
+            if detection is not None and detection.detected:
+                crs = QgsCoordinateReferenceSystem(detection.auth_id)
+                if crs.isValid():
+                    table_crs[table] = crs
+                    detected.setdefault(detection.auth_id, (detection.description, []))[1].append(table)
+                    continue
+                detection = CrsDetection(
+                    reason=f"{detection.auth_id} is not available in this QGIS installation")
+            reason = detection.explain() if detection is not None else report.summary()
+            undetected.setdefault(reason, []).append(table)
+
+        file_detection = report.file_crs()
+        default_crs = None
+        if file_detection is not None and file_detection.detected:
+            default_crs = QgsCoordinateReferenceSystem(file_detection.auth_id)
+            if not default_crs.isValid():
+                default_crs = None
+
+        if undetected and user_crs is None:
+            parts = []
+            for reason, names in undetected.items():
+                scope = "" if len(names) == len(tables) else f" (tables: {_name_list(names)})"
+                parts.append(reason + scope)
+            return None, {}, "; ".join(parts) or report.summary()
+
+        for auth_id, (description, names) in detected.items():
+            scope = ("all tables" if len(names) == len(tables)
+                     else f"{len(names)} of {len(tables)} tables")
+            feedback.pushInfo(
+                f"{file_label}: coordinate system {auth_id} ({description}), read from the "
+                f"MDB's GCoordSystem table, for {scope}. It is assigned as stored; no "
+                "reprojection is performed.")
+            if user_crs is not None and user_crs.authid() != auth_id:
+                feedback.pushWarning(
+                    f"{file_label}: the MDB says {auth_id} but the Source CRS is "
+                    f"{user_crs.authid()}; using the MDB's {auth_id}. Choose 'Use the Source "
+                    "CRS: Always' to override the file.")
+        for reason, names in undetected.items():
+            feedback.pushWarning(
+                f"{file_label}: coordinate system not detected for {_name_list(names)} "
+                f"({reason}); using the Source CRS {user_crs.authid()}.")
+            for table in names:
+                table_crs[table] = user_crs
+        if default_crs is None:
+            default_crs = user_crs
+        if not tables and default_crs is None:
+            return None, {}, report.summary()
+        return default_crs, table_crs, ""
+
+    @staticmethod
+    def _unresolved_crs_message(unresolved, plans, file_count):
+        lines = [
+            f"The coordinate reference system (CRS) could not be detected for "
+            f"{len(unresolved)} of {file_count} MDB file(s), so nothing was imported:"
+        ]
+        for file_label, problem in unresolved:
+            lines.append(f"  • {file_label}: {problem}")
+        lines.append(
+            "Set 'Source CRS of coordinates in MDB' to the CRS the coordinates are stored "
+            "in and run the tool again. It is only used where detection fails; files whose "
+            "CRS is detected keep their own.")
+        if plans:
+            lines.append(
+                "Detected without problems: "
+                + ", ".join(os.path.basename(plan[0]) for plan in plans) + ".")
+        return "\n".join(lines)
+
     def _process_mdb_file(
         self,
         mdb_file,
@@ -925,7 +1155,10 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
         max_features,
         schema_discovery=False,
         output_gpkg='',
+        listing=None,
+        table_crs=None,
     ):
+        table_crs = table_crs or {}
         file_name = os.path.basename(mdb_file)
         file_ref = os.path.splitext(file_name)[0]
         output_namespace = os.path.normcase(os.path.abspath(mdb_file))
@@ -952,14 +1185,9 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
                 temp_dir = os.path.dirname(temp_marker)
                 feedback.pushInfo(f'Using managed temp dir: {temp_dir}')
 
-            listing = self._run_worker(
-                [
-                    '--mode', 'list',
-                    '--mdb', mdb_file,
-                    '--schema-discovery', '1' if schema_discovery else '0',
-                ],
-                feedback,
-            )
+            if listing is None:
+                listing = self._preflight_file(
+                    mdb_file, feedback, isolate=True, schema_discovery=schema_discovery)
             discovered, non_spatial = self._read_listing(listing)
             self._report_non_spatial_tables(non_spatial, feedback)
             if not discovered:
@@ -979,33 +1207,48 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
             feedback.reportError(
                 'SUBSEA_MDB_NO_SUBPROCESS is enabled. Running ODBC reads in-process; this may crash QGIS.'
             )
-            _require_access_odbc_driver(feedback)
-            _test_mdb_connection(mdb_file, feedback=feedback)
-            feature_tables = get_feature_tables(mdb_file, feedback)
+            if listing is None:
+                listing = self._preflight_file(mdb_file, feedback, isolate=False)
+            discovered, _non_spatial = self._read_listing(listing)
+            feature_tables = {
+                name: (meta.get('geom_field_name'), meta.get('geometry_type_code'))
+                for name, meta in discovered.items()
+            }
 
         if not feature_tables:
             raise QgsProcessingException("No feature tables found in the MDB.")
 
-        if source_crs and source_crs.isValid():
-            feedback.pushInfo(
-                f"Assigning source CRS {source_crs.authid()} to the imported coordinates "
-                "(no reprojection is performed)."
-            )
-        else:
+        def _crs_for(table_name):
+            crs = table_crs.get(table_name) or source_crs
+            if crs is None or not crs.isValid():
+                raise QgsProcessingException(
+                    f"No CRS for table {table_name}. Set the Source CRS of the coordinates "
+                    "in the MDB.")
+            return crs
+
+        if source_crs is None and not table_crs:
             raise QgsProcessingException(
                 "No valid CRS provided. Set the Source CRS of the coordinates in the MDB.")
 
         if output_gpkg:
             feedback.pushInfo(f"Saving layers to {output_gpkg}")
         saved_tables = []
+        implausible = []
 
-        def _save(source_layer, layer_name, table_label):
+        def _save(source_layer, layer_name, table_label, table_name):
+            crs = _crs_for(table_name)
             if not output_gpkg:
-                return _write_to_temporary_gpkg(source_layer, layer_name, source_crs, context, feedback)
-            table = gpkg_table_name(table_label, saved_tables)
-            saved_tables.append(table)
-            return _write_mdb_layer(
-                source_layer, layer_name, source_crs, output_gpkg, table, context, feedback)
+                layer = _write_to_temporary_gpkg(source_layer, layer_name, crs, context, feedback)
+            else:
+                table = gpkg_table_name(table_label, saved_tables)
+                saved_tables.append(table)
+                layer = _write_mdb_layer(
+                    source_layer, layer_name, crs, output_gpkg, table, context, feedback)
+            if layer is not None:
+                warning = extent_crs_warning(layer.extent(), crs, context.transformContext())
+                if warning:
+                    implausible.append(f"{layer_name}: {warning}")
+            return layer
 
         output_layers = {}
         table_count = len(feature_tables)
@@ -1070,7 +1313,7 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
                     if not src_layer.isValid():
                         feedback.reportError(f'Skipping {layer_name}: output layer invalid')
                         continue
-                    layer = _save(src_layer, layer_name, table_label)
+                    layer = _save(src_layer, layer_name, table_label, table_name)
                     if layer is None:
                         continue
 
@@ -1083,7 +1326,7 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
                     table_name,
                     geom_field_name,
                     geometry_type_code,
-                    source_crs,
+                    _crs_for(table_name),
                     feedback,
                 )
                 if error:
@@ -1094,7 +1337,7 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
                 # Algorithms may run in a background thread and direct project mutations can crash QGIS.
                 layer_name = f"{file_ref} - {table_name}"
                 if output_gpkg:
-                    mem_layer = _save(mem_layer, layer_name, table_name)
+                    mem_layer = _save(mem_layer, layer_name, table_name, table_name)
                     if mem_layer is None:
                         continue
                 self._register_output_layer(context, mem_layer, layer_name, file_name)
@@ -1107,6 +1350,11 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
 
         if not output_layers:
             raise QgsProcessingException("No valid layers were imported from the MDB.")
+
+        for message in implausible:
+            feedback.reportError(
+                f"Check the CRS of {message}. The layer was imported, but it may be misplaced: "
+                "re-run with the correct 'Source CRS' and 'Use the Source CRS: Always'.")
 
         return output_layers
 
@@ -1241,7 +1489,8 @@ Text features additionally carry:
 <h4>Input Parameters</h4>
 <ul>
     <li><b>Input MDB File(s):</b> Add one or more GeoMedia MDB/ACCDB files. The picker supports selecting several files at once.</li>
-  <li><b>Source CRS / CRS of coordinates in MDB:</b> You <b>must</b> manually select the Coordinate Reference System (CRS) that the coordinates in the MDB are stored in. The tool cannot detect it. This CRS is <i>assigned</i> to the imported layers &mdash; no reprojection is performed &mdash; so providing the wrong CRS will result in misplaced data.</li>
+  <li><b>Source CRS of coordinates in MDB (optional):</b> Leave empty to auto-detect. The tool reads the GeoMedia <code>GCoordSystem</code> record that each table's geometry actually references (via <code>GeometryProperties</code>) and recognises geographic WGS84 (EPSG:4326) and WGS84 UTM zones. Every selected file is checked <i>before</i> anything is imported: if any file's CRS cannot be identified with certainty (another datum, an unrecognised projection, scaled storage), the tool stops straight away, explains why, suggests the likely CRS where it can, and asks you to set this parameter. The CRS is <i>assigned</i> to the imported layers &mdash; no reprojection is performed.</li>
+  <li><b>Use the Source CRS:</b> <i>Only where the MDB coordinate system cannot be detected</i> (default) uses the Source CRS as a fallback, warning if it disagrees with a detected CRS. <i>Always</i> assigns the Source CRS to every table and ignores the file's own metadata &mdash; use it when the metadata is known to be wrong.</li>
   <li><b>Save to GeoPackages in folder (optional):</b> Choose a folder to save each MDB as one GeoPackage there, named after the MDB (e.g. <code>Survey_A.mdb</code> &rarr; <code>Survey_A.gpkg</code>), with one table per feature class and geometry type. The loaded layers point at those GeoPackages, so there is nothing left to make permanent. If the GeoPackage already exists, tables of the same name are replaced and any other tables are kept. Leave empty to load temporary layers as before.</li>
 </ul>
 
@@ -1255,6 +1504,7 @@ Text features additionally carry:
   <li><b>BLOB Format:</b> GeoMedia point, polyline, polygon, boundary, collection and graphic-text BLOBs are supported. Other vendor-specific variants (for example arc primitives) are still reported as <code>parse_failed</code> rather than imported. Label rotation and alignment are kept as attributes; font and size are not. Geometry columns are recognised by name or, when the name is unfamiliar, by the GeoMedia BLOB signature in their content.</li>
   <li><b>Metadata Tables:</b> It relies on specific system tables like <code>GFeatures</code>, <code>FieldLookup</code>, and <code>AttributeProperties</code>. If these are missing or have an unexpected structure, only schema-based discovery is available.</li>
     <li><b>Large batches:</b> Temporary GeoPackages remain available for the QGIS session. If space is limited, change the temporary folder under Processing settings to a drive with more free space. Canceling Processing terminates the active MDB worker.</li>
+    <li><b>CRS check after import:</b> Each layer's extent is checked against its CRS (degrees labelled as a projected CRS, metres labelled as geographic, or data outside the CRS's area of use) and any mismatch is reported as an error so a wrong CRS is not missed.</li>
     <li><b>Errors:</b> Every attempted table reports row counts, BLOB-decoded counts and fallback counts in the Log Messages Panel. A populated table that yields no geometry is reported as an error, not silently skipped. Other tables and files continue importing where possible.</li>
   <li><b>Advanced options (env vars):</b>
     <ul>
