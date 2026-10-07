@@ -192,10 +192,12 @@ class AssessmentPanelTests(unittest.TestCase):
         spans = [f for f in self.panel._findings if f.check_id == "suspension"]
         self.assertTrue(spans, self.panel.status_label.text())
         self.assertTrue(all(f.kp_start > 0.49 for f in spans), [f.kp_start for f in spans])
-        terrain = [f for f in self.panel._findings if f.check_id == "terrain_slack"]
-        self.assertTrue(terrain and all(f.kp_start >= 0.4 for f in terrain), terrain)
-        # Sand waves: about 1.4 % more seabed than plan, so the 3 % slack half is clear.
-        self.assertFalse([f for f in terrain if f.kp_end <= 0.4])
+        short = [f for f in self.panel._findings if f.check_id == "length_balance"]
+        # Sand waves: about 1.4 % more seabed than plan, so the 3 % slack half is clear and
+        # the slack-free half is short of the seabed (pulled taut).
+        self.assertTrue(short and all(f.kp_start >= 0.45 for f in short), short)
+        self.assertTrue(model.shortfalls and model.balance_pct is not None)
+        self.assertGreater(model.smoothing_m, 0.0)  # auto smoothing (no EI in the library: 10 m)
         self.assertFalse(any(f.severity == Severity.ERROR and f.check_id == "top_tension"
                              for f in self.panel._findings))
         profile = self.controller.profile
@@ -221,10 +223,102 @@ class AssessmentPanelTests(unittest.TestCase):
         ids = {f.check_id for f in self.panel._findings}
         self.assertIn("laid_under_tension", ids)
         self.assertNotIn("suspension", ids)  # the lay model's own seabed is flat
-        self.assertIn("Slack vs seabed", self.panel.status_label.text())  # skipped with a reason
+        self.assertIn("Cable length vs seabed", self.panel.status_label.text())  # skipped with a reason
         laid = next(f for f in self.panel._findings if f.check_id == "laid_under_tension")
         self.assertAlmostEqual(laid.kp_start, 0.5, places=3)
         self.assertTrue(math.isclose(laid.value, 3.0))
+
+
+class CableTypeMappingTests(unittest.TestCase):
+    """Two manufacturers' LW in one library: an RPL / lay data "LW" must be mapped."""
+
+    ROWS = [dict(CABLE_ROW, name="Maker A LW", aliases="", generic_type="LW", npts_kn=20.0),
+            dict(CABLE_ROW, name="Maker B LW", aliases="", generic_type="LW", npts_kn=25.0),
+            dict(CABLE_ROW, name="Maker A SA", aliases="SA-1", generic_type="SA")]
+
+    def test_resolution_order(self):
+        rows = [library.clean_row(r) for r in self.ROWS]
+        self.assertEqual(library.resolve(rows, "LW"), (None, "ambiguous"))
+        self.assertEqual(library.resolve(rows, "sa 1")[1], "alias")
+        self.assertEqual(library.resolve(rows, "SA")[1], "generic")
+        self.assertEqual(library.resolve(rows, "maker b lw")[0]["name"], "Maker B LW")
+        row, how = library.resolve(rows, "lw", {"LW": "Maker B LW"})
+        self.assertEqual((row["name"], how), ("Maker B LW", "mapped"))
+        self.assertEqual(library.resolve(rows, "DA"), (None, "unknown"))
+        self.assertEqual(sorted(library.candidates(rows, "LW")), ["Maker A LW", "Maker B LW"])
+
+    def test_panel_reports_and_applies_mapping(self):
+        controller = _Controller()
+        panel = AssessmentPanel(controller)
+        try:
+            panel.persist = False
+            panel.synchronous = True
+            panel._type_mapping = {}
+            panel._library_rows = [library.clean_row(r) for r in self.ROWS]
+            panel.seabed_combo.setCurrentIndex(0)  # record checks only
+            panel.makeup_combo.setCurrentIndex(panel.makeup_combo.findData("data"))
+            panel.set_dataset(lay_dataset())
+            self.assertEqual(panel.mapping_table.rowCount(), 1)  # the one label: LW
+            panel.run()
+            self.assertIn("ambiguous", panel.status_label.text().lower())
+            self.assertTrue(all(p is None for p in panel._records.cable))
+            combo = panel._mapping_combos["LW"]
+            combo.setCurrentIndex(combo.findData("Maker B LW"))
+            self.assertEqual(panel._type_mapping, {"LW": "Maker B LW"})
+            panel.run()
+            self.assertTrue(all(p is not None and p.npts_kn == 25.0 for p in panel._records.cable))
+            self.assertNotIn("ambiguous", panel.status_label.text().lower())
+        finally:
+            panel.deleteLater()
+            if controller.profile is not None:
+                controller.profile.deleteLater()
+
+
+class WorkbenchMakeupTests(unittest.TestCase):
+    """Cable types by KP from a Workbench RPL and from a fitted assembly (in-memory)."""
+
+    def _model(self):
+        from ..workbench.rpl_engine import RplModel, RplPoint, RplSegment
+
+        kps = [0.0, 1.0, 2.0, 3.0]
+        cable = [0.0, 1.02, 2.04, 3.06]  # 2 % slack
+        points = [RplPoint(i, i + 1, "", 0.0, k / 111.32, k, c) for i, (k, c) in enumerate(zip(kps, cable))]
+        segments = [RplSegment(i, 90.0, 1.0, 2.0, 1.02, {"CableType": t}) for i, t in enumerate(["LW", "LW", "SA"])]
+        return RplModel(points, segments)
+
+    def _store(self):
+        model = self._model()
+
+        class _Store:
+            def list_fits(self, rpl_id=None, assembly_id=None):
+                return [{"fit_id": "f1", "assembly_id": "a1", "rpl_id": "r1", "anchor_kp_km": 0.0,
+                         "anchor_cable_dist_m": 0.0, "direction": 1}]
+
+            def get_assembly(self, assembly_id):
+                items = [{"item_id": "i1", "seq": 0, "kind": "section", "name": "LW", "length_m": 1530.0,
+                          "cable_type": "LW"},
+                         {"item_id": "i2", "seq": 1, "kind": "section", "name": "SA", "length_m": 1530.0,
+                          "cable_type": "SA"}]
+                return {"assembly_id": "a1", "name": "Test assembly"}, items
+
+        return _Store(), model
+
+    def test_rpl_and_fit_makeups(self):
+        from ..explorer import workbench_makeup as wm
+
+        store, model = self._store()
+        original = wm.load_model
+        wm.load_model = lambda _store, _rpl_id: model
+        try:
+            legs = wm.rpl_makeup(store, "r1")
+            self.assertEqual(legs.labels, ["LW", "SA"])
+            self.assertTrue(np.allclose(legs.boundaries(), [2.0]))
+            fitted = wm.fit_makeup(store, "f1")
+            # 1530 m of LW at 2 % slack lands over 1.5 km of route.
+            self.assertEqual(fitted.labels, ["LW", "SA"])
+            self.assertAlmostEqual(float(fitted.boundaries()[0]), 1.5, places=3)
+        finally:
+            wm.load_model = original
 
 
 class ExplorerWindowTests(unittest.TestCase):

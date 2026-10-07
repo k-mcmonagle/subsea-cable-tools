@@ -46,13 +46,15 @@ class CableLibraryDialog(QDialog):
         self._path = ""
         self._dirty = False
         self._loading = False
+        self._read_fingerprint: Optional[str] = None  # library content as last read / saved
 
         layout = QVBoxLayout(self)
         intro = QLabel(
             "Cable and rope properties used by the Cable Lay Data Explorer's lay checks. "
-            "The library is a GeoPackage on your computer; enter values from your own cable "
-            "specifications. Aliases let a type match the names used in lay data "
-            "(e.g. <i>LW, LWA</i>). Hover a column heading for its meaning.")
+            "The library is a GeoPackage you keep (it can be shared on a network drive); enter values "
+            "from your own cable specifications. Each project maps the labels in its RPLs and lay data "
+            "(e.g. <i>LW</i>) to a type here, so several manufacturers' LW cables can live side by side. "
+            "Hover a column heading for its meaning.")
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
@@ -109,6 +111,7 @@ class CableLibraryDialog(QDialog):
         if self._path:
             try:
                 rows = store.read_rows(self._path)
+                self._read_fingerprint = store.fingerprint(rows)
             except Exception as exc:
                 log_exception("Cable library: reading failed")
                 self.status.setText(f"Could not read the library: {exc}")
@@ -274,11 +277,24 @@ class CableLibraryDialog(QDialog):
             QMessageBox.warning(self, _TITLE, "Please fix:\n\n" + "\n".join(problems[:15]))
             return False
         try:
-            store.write_rows(self._path, rows)
+            try:
+                store.write_rows(self._path, rows, expected=self._read_fingerprint)
+            except store.ChangedElsewhere:
+                answer = QMessageBox.question(
+                    self, _TITLE,
+                    "The library was changed elsewhere (another user, project or QGIS window) since you "
+                    "opened it.\n\nYes: overwrite it with your version.\nNo: discard your edits and "
+                    "reload the current library.", MESSAGEBOX_YES | MESSAGEBOX_NO)
+                if answer != MESSAGEBOX_YES:
+                    self.set_path(self._path)
+                    self.status.setText("Reloaded the library as changed elsewhere; your edits were discarded.")
+                    return False
+                store.write_rows(self._path, rows)
         except Exception as exc:
             log_exception("Cable library: saving failed")
             QMessageBox.critical(self, _TITLE, f"Could not save the library:\n{exc}")
             return False
+        self._read_fingerprint = store.fingerprint(rows)
         self._set_dirty(False)
         notes = store.warnings_for(rows)
         self.status.setText(f"Saved {len(rows)} type(s)."

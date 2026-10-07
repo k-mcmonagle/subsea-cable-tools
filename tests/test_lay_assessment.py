@@ -207,29 +207,125 @@ def test_missing_inputs_reported() -> bool:
     return _report("checks without their inputs are skipped with a reason", ok, str(skipped))
 
 
-def test_model_seabed_and_terrain() -> bool:
-    # 1 km of lay over a seabed with 40 m-wavelength, 1.5 m sand waves; the
-    # lay model's touchdown depth is flat (it did not see the waves).
+def _waves(x, amplitude=1.5, wavelength=40.0):
+    return 1000.0 + amplitude * np.sin(2 * np.pi * x / wavelength)
+
+
+def test_friction_length_balance() -> bool:
+    # 1 km over 40 m / 1.5 m sand waves (1.4 % more seabed than plan) that the
+    # lay model did not see (flat touchdown depth). First half: 3 % slack;
+    # second half: no slack and no logged tension.
     n = 501
     kp = np.arange(n) * 0.002
-    ds = _dataset(n, **{"TD KP": list(kp), "TD_Lon_dd": list(kp / 111.32),
-                        "Bot.Tension": [0.0] * 250 + [3.0] * 251, "Inst.Bot.Sl": [0.0] * n})
-    rec = _records(ds)
+    slack = [3.0] * 250 + [0.0] * 251
+    rec = _records(_dataset(n, **{"TD KP": list(kp), "TD_Lon_dd": list(kp / 111.32),
+                                  "Bot.Tension": [0.0] * n, "Inst.Bot.Sl": slack}))
     x = np.arange(0.0, 1000.0 + 1.0, 1.0)
-    depth = 1000.0 + 1.5 * np.sin(2 * np.pi * x / 40.0)
-    model = la.model_seabed(x, x / 1000.0, depth, rec, rec.kp * 1000.0, 0.05, 0.3, 5.0)
-    spans_first = [s for s in model.spans if s.kp_end < 0.495]
-    spans_second = [s for s in model.spans if s.kp_start > 0.505]
-    ok = not spans_first and len(spans_second) >= 5
-    windows = la.terrain_shortfall(model, rec, rec.kp * 1000.0, 200.0)
-    flagged = la.terrain_findings(model, windows, {"shortfall_pct": 0.5})
-    ok = ok and len(windows) == 5 and flagged and flagged[0].value > 0.5
-    # Enough slack laid: no shortfall.
-    rec2 = _records(_dataset(n, **{"TD KP": list(kp), "Inst.Bot.Sl": [3.0] * n}))
-    windows2 = la.terrain_shortfall(model, rec2, rec2.kp * 1000.0, 200.0)
-    ok = ok and not la.terrain_findings(model, windows2, {"shortfall_pct": 0.5})
-    return _report("spans only where tensioned; terrain shortfall vs laid slack", ok,
-                   f"spans {len(spans_first)}/{len(spans_second)} windows {windows[:2]}")
+    friction = {"mu": 0.5, "max_reach_m": 1000.0, "shortfall_pct": 0.5}
+    model = la.model_seabed(x, x / 1000.0, _waves(x), rec, rec.kp * 1000.0, 0.05, 0.3, 5.0,
+                            smoothing_m=0.0, friction=friction)
+    # Overlapping friction windows merge: one taut stretch over the slack-free half.
+    ok = len(model.shortfalls) == 1 and model.shortfalls[0].kp_start > 0.45
+    ok = ok and model.shortfalls[0].tension_kn > 0.5 and model.shortfalls[0].feasible
+    ok = ok and not [sp for sp in model.spans if sp.kp_end < 0.45] and len(model.spans) >= 5
+    ok = ok and all(sp.source == "cable short of the seabed" for sp in model.spans)
+    # The pulled-taut shape uses the cable laid: zero balance at the solved tension.
+    found = la.length_findings(model, friction)
+    ok = ok and found and all(f.check_id == "length_balance" for f in found)
+    return _report("short cable is pulled taut and spans; slack-laid half conforms", ok,
+                   f"shortfalls={[(round(f.kp_start, 3), round(f.tension_kn, 3)) for f in model.shortfalls]}")
+
+
+def test_friction_keeps_slack_local() -> bool:
+    # 2 km: 6 % slack on the first km, none on the second, over sand waves.
+    # Overall the route has more cable than seabed (whole-route check: fine),
+    # but friction stops the first km's spare cable reaching the far end.
+    n = 1001
+    kp = np.arange(n) * 0.002
+    slack = [6.0] * 500 + [0.0] * 501
+    rec = _records(_dataset(n, **{"TD KP": list(kp), "TD_Lon_dd": list(kp / 111.32),
+                                  "Bot.Tension": [0.0] * n, "Inst.Bot.Sl": slack}))
+    x = np.arange(0.0, 2000.0 + 1.0, 1.0)
+    depth = _waves(x)
+    seabed = float(np.sum(np.hypot(np.diff(x), np.diff(depth))))
+    cable = float(np.sum(np.diff(x) * (1 + np.where(x[1:] <= 1000, 0.06, 0.0))))
+    model = la.model_seabed(x, x / 1000.0, depth, rec, rec.kp * 1000.0, 0.05, 0.3, 5.0, smoothing_m=0.0,
+                            friction={"mu": 0.5, "max_reach_m": 1000.0, "shortfall_pct": 0.5})
+    far = [f for f in model.shortfalls if f.kp_end > 1.5]
+    ok = cable > seabed and bool(far)
+    # Without friction limits (one 2 km reach) the surplus would cover it all.
+    lax = la.model_seabed(x, x / 1000.0, depth, rec, rec.kp * 1000.0, 0.05, 0.3, 5.0, smoothing_m=0.0,
+                          friction={"mu": 1e-6, "max_reach_m": 2000.0, "shortfall_pct": 0.5})
+    ok = ok and not [f for f in lax.shortfalls if f.kp_end > 1.5]
+    return _report("friction keeps slack local (whole-route length would hide the shortfall)", ok,
+                   f"cable {cable:.0f} vs seabed {seabed:.0f}; far shortfalls {len(far)}")
+
+
+def test_long_route_speed() -> bool:
+    # 20 km laid with no slack over sand waves the lay model did not see:
+    # one long short stretch, solved in friction-reach pieces.
+    n = 10001
+    kp = np.arange(n) * 0.002
+    rec = _records(_dataset(n, **{"TD KP": list(kp), "TD_Lon_dd": list(kp / 111.32),
+                                  "Bot.Tension": [0.0] * n, "Inst.Bot.Sl": [0.0] * n}))
+    x = np.arange(0.0, 20000.0 + 2.0, 2.0)
+    start = time.perf_counter()
+    model = la.model_seabed(x, x / 1000.0, _waves(x, wavelength=60.0), rec, rec.kp * 1000.0, 0.05, 0.3, 5.0,
+                            smoothing_m=None, friction={"mu": 0.5, "max_reach_m": 1000.0, "shortfall_pct": 0.5})
+    elapsed = time.perf_counter() - start
+    ok = elapsed < 60.0 and len(model.shortfalls) >= 1 and len(model.spans) > 50
+    return _report("20 km short of seabed models in reasonable time", ok,
+                   f"{elapsed:.1f} s, {len(model.spans)} spans, {len(model.shortfalls)} stretch(es)")
+
+
+def test_smoothing_and_conformity() -> bool:
+    x = np.arange(0.0, 500.0, 1.0)
+    rng = np.random.default_rng(3)
+    noisy = 1000.0 + rng.normal(0, 0.2, len(x))
+    smooth = la.smooth_profile(x, noisy, 10.0)
+    ok = np.nanstd(smooth) < 0.5 * np.nanstd(noisy)
+    noisy[100:110] = np.nan
+    smooth = la.smooth_profile(x, noisy, 10.0)
+    ok = ok and np.all(np.isnan(smooth[100:110])) and np.isfinite(smooth[:100]).all()
+    # 2 (EI / w)^(1/3): EI 2 kNm2, w 10 N/m -> 2 * 200^(1/3) = 11.7 m
+    ok = ok and abs(la.conformity_length_m(2.0, 10.0) - 2.0 * 200.0 ** (1 / 3)) < 1e-9
+    noise_len = float(np.sum(np.hypot(1.0, np.diff(1000.0 + rng.normal(0, 0.2, 500)))))
+    ok = ok and noise_len > 500 * 1.02  # why smoothing matters: noise alone adds > 2 % "seabed"
+    return _report("seabed smoothing (gaps kept) and conformity length", ok)
+
+
+def test_makeup_ranges() -> bool:
+    m = la.KpMakeup.from_ranges([(0.0, 1.0, "LW"), (1.0, 1.5, "LW"), (1.5, 3.0, "SA"), (3.0, 4.0, None)])
+    ok = m.labels == ["LW", "SA"] and list(m.label_at([0.2, 1.2, 2.0, 5.0])) == ["LW", "LW", "SA", None]
+    ok = ok and np.allclose(m.boundaries(), [1.5])
+    r = la.makeup_from_records(np.array([0.0, 0.1, 0.2, 0.3]), ["LW", "LW", "SA", "SA"])
+    ok = ok and r.labels == ["LW", "SA"] and abs(r.boundaries()[0] - 0.15) < 1e-9
+    return _report("cable makeup along KP", ok, str(m.labels))
+
+
+def test_joint_in_water_column() -> bool:
+    # Touchdown at KP 0.9 on LW, 1000 m deep, laying towards SA from KP 1.0.
+    # The hanging 1000 m is 100 m of LW (bottom) under 900 m of SA (30 N/m).
+    # Top tension 80 kN passes SA's NOTS (150) at the sheave, but the joint
+    # carries 80 - 30 x 900 / 1000 = 53 kN, above LW's NOTS (50).
+    lw = la.CableProps("LW", weight_water_kg_m=10.0 / la.G, nots_kn=50.0, ntts_kn=80.0, npts_kn=20.0)
+    sa = la.CableProps("SA", weight_water_kg_m=30.0 / la.G, nots_kn=150.0, ntts_kn=200.0, npts_kn=60.0)
+    n = 3
+    ds = _dataset(n, **{"TD KP": [0.880, 0.890, 0.900], "Meas.Top Tension": [80.0] * n,
+                        "Inst.Bot.Sl": [0.0] * n, "Layback": [0.0] * n, "TD_Lon_dd": [0.0] * n})
+    mapping = la.detect_roles(ds.field_names, ds.is_numeric_field)
+    rec = la.build_records(ds, mapping)
+    makeup = la.KpMakeup.from_ranges([(0.0, 1.0, "LW"), (1.0, 3.0, "SA")])
+    la.apply_makeup(rec, makeup, lambda label: {"LW": lw, "SA": sa}.get(label))
+    findings, _ = la.run_record_checks(rec, {"top_tension": {}})
+    ok = rec.labels == ["LW", "LW", "LW"] and rec.values["hang_transition"].all()
+    t = rec.get("hang_tension_kn")[2]
+    ok = ok and abs(t - 53.0) < 1.5 and rec.hang_labels[2] == "LW"
+    ok = ok and len(findings) == 1 and findings[0].severity == Severity.WARNING and "LW" in findings[0].message
+    # Hanging weight in the top-tension identity: mean of 100 m LW + 900 m SA.
+    ok = ok and abs(rec.get("hang_w_npm")[2] - 28.0) < 2.0
+    return _report("tension at a joint hanging in the water vs that cable's NOTS", ok,
+                   f"T={t:.1f} label={rec.hang_labels[2]} findings={[f.message for f in findings]}")
 
 
 def test_status_bins() -> bool:
@@ -276,7 +372,12 @@ def run_all() -> List[bool]:
         test_td_reversal(),
         test_build_records_units_and_flags(),
         test_missing_inputs_reported(),
-        test_model_seabed_and_terrain(),
+        test_friction_length_balance(),
+        test_friction_keeps_slack_local(),
+        test_long_route_speed(),
+        test_smoothing_and_conformity(),
+        test_makeup_ranges(),
+        test_joint_in_water_column(),
         test_status_bins(),
         test_track_vertices(),
         test_hull_speed(),

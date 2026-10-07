@@ -58,6 +58,8 @@ from qgis.core import (
 from qgis.gui import QgsFieldComboBox, QgsMapLayerComboBox
 
 from ... import depth_profile_core as dpc
+from .. import workbench_makeup
+from ..assessment_task import AssessmentTask
 from ...cable_library import store as library
 from ...kp_range_utils import make_distance_area
 from ...laydata import lay_assessment as la
@@ -93,6 +95,34 @@ _SEABED_CHOICES = (
 SEVERITY_TEXT = {Severity.ERROR: "Red", Severity.WARNING: "Amber", Severity.INFO: "Info"}
 SEVERITY_COLOUR = {Severity.ERROR: "#d32f2f", Severity.WARNING: "#ff9800", Severity.INFO: "#1f77b4"}
 _HEADERS = ["Level", "Check", "KP from", "KP to", "Length (m)", "Value", "Message"]
+MAKEUP_DATA = "data"
+MAKEUP_RPL = "rpl"
+MAKEUP_FIT = "fit"
+_MAKEUP_CHOICES = (
+    (MAKEUP_DATA, "Cable type column in the lay data"),
+    (MAKEUP_RPL, "Workbench RPL (cable type per leg)"),
+    (MAKEUP_FIT, "Workbench assembly fitted to an RPL"),
+)
+_HOW_TEXT = {"mapped": "project mapping", "name": "library name", "alias": "library alias",
+             "generic": "generic type", "ambiguous": "AMBIGUOUS: map it", "unknown": "not in library",
+             "none": ""}
+_SEABED_IDS = ("suspension", "length_balance")
+
+
+def seabed_job(records, enabled, x, kp, depth, record_x, smoothing):
+    """Seabed model and findings (worker safe: numpy only, no widgets)."""
+    if len(x) < 3 or not np.isfinite(depth).any():
+        return None, [], {cid: "too few seabed samples" for cid in _SEABED_IDS if cid in enabled}
+    susp = enabled.get("suspension") or la.default_params(la.check_by_id("suspension"))
+    friction = enabled.get("length_balance")
+    model = la.model_seabed(x, kp, depth, records, record_x, susp["zero_tension_kn"], susp["min_gap_m"],
+                            susp["min_length_m"], smoothing_m=smoothing, friction=friction)
+    findings: List[la.RangeFinding] = []
+    if "suspension" in enabled:
+        findings.extend(la.seabed_span_findings(model, enabled["suspension"]))
+    if friction is not None:
+        findings.extend(la.length_findings(model, friction, susp["zero_tension_kn"]))
+    return model, findings, {}
 
 
 class AssessmentPanel(QWidget):
@@ -116,7 +146,11 @@ class AssessmentPanel(QWidget):
         self._editors: Dict[str, Dict[str, QLineEdit]] = {}
         self._labels = {check.check_id: check.label for check in la.all_checks()}
         self._library_rows: List[Dict] = []
-        self._unmatched: set = set()
+        self._type_mapping: Dict[str, str] = {}       # label token -> library name (this project)
+        self._resolution: Dict[str, Tuple[Optional[str], str]] = {}  # label -> (library name, how)
+        self._makeup_cache: Dict[Tuple, la.KpMakeup] = {}
+        self._mapping_combos: Dict[str, QComboBox] = {}
+        self._notes: List[str] = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -184,6 +218,7 @@ class AssessmentPanel(QWidget):
 
         self._update_buttons()
         self._restore_settings()
+        self._type_mapping = library.project_mapping()
         self._refresh_cable_types()
 
     # -- construction -------------------------------------------------------
@@ -194,19 +229,46 @@ class AssessmentPanel(QWidget):
         self.library_label = QLabel("")
         self.library_label.setWordWrap(True)
         row.addWidget(self.library_label, 1)
-        library_btn = QPushButton("Cable library…")
-        library_btn.setToolTip("Create or edit your cable type library (weights, NPTS / NOTS / NTTS / CBL)")
+        library_btn = QPushButton("Cable library\u2026")
+        library_btn.setToolTip("Create or edit your cable type library (weights, NPTS / NOTS / NTTS / CBL, EI)")
         library_btn.clicked.connect(self.open_library)
         row.addWidget(library_btn)
         form.addRow(row)
+        self.makeup_combo = QComboBox()
+        for key, text in _MAKEUP_CHOICES:
+            self.makeup_combo.addItem(text, key)
+        self.makeup_combo.setToolTip(
+            "Where the cable type along the route comes from. It sets the cable at touchdown and the cable "
+            "hanging above it (tension limits and weight where a type change is in the water). Workbench "
+            "sources need the lay data's touchdown KPs quoted on that RPL.")
+        self.makeup_combo.currentIndexChanged.connect(self._on_makeup_source)
+        form.addRow("Cable types from", self.makeup_combo)
+        self.rpl_combo = QComboBox()
+        self.rpl_combo.currentIndexChanged.connect(self._on_rpl_changed)
+        self.rpl_label = QLabel("RPL")
+        form.addRow(self.rpl_label, self.rpl_combo)
+        self.fit_combo = QComboBox()
+        self.fit_combo.currentIndexChanged.connect(self._refresh_labels)
+        self.fit_label = QLabel("Fitted assembly")
+        form.addRow(self.fit_label, self.fit_combo)
+        self.mapping_table = QTableWidget(0, 3)
+        self.mapping_table.setHorizontalHeaderLabels(["Label", "Library type (this project)", "Matched by"])
+        self.mapping_table.setToolTip(
+            "Each cable type label found in the lay data or the Workbench source, and the library type it "
+            "means in this project (saved with the project). Leave (automatic) to match by library name, "
+            "a unique alias or a unique generic type; a label several library types could mean must be set.")
+        self.mapping_table.horizontalHeader().setSectionResizeMode(1, HEADER_RESIZE_MODE_STRETCH)
+        self.mapping_table.setEditTriggers(EDIT_TRIGGER_NONE)
+        self.mapping_table.setMaximumHeight(110)
+        form.addRow(self.mapping_table)
         self.cable_combo = QComboBox()
-        self.cable_combo.setToolTip("Used for every record, or for records whose cable type column "
-                                    "does not match a library name or alias.")
+        self.cable_combo.setToolTip("Used where no label is known, or a label matches no library type.")
         form.addRow("Default cable type", self.cable_combo)
         self.units_combo = QComboBox()
         self.units_combo.addItems(list(la.TENSION_UNITS))
         self.units_combo.setToolTip("Units of the tension columns in the data")
         form.addRow("Tension units in data", self.units_combo)
+        self._update_makeup_widgets()
         return group
 
     def _build_seabed_group(self) -> QGroupBox:
@@ -242,6 +304,13 @@ class AssessmentPanel(QWidget):
         self.interval_spin.setToolTip("Seabed sample spacing along the track (rasters and the lay model's "
                                       "depths; contours are used at their crossings)")
         form.addRow("Sample every", self.interval_spin)
+        self.smoothing_edit = QLineEdit()
+        self.smoothing_edit.setPlaceholderText("auto: the cable's conformity length")
+        self.smoothing_edit.setToolTip(
+            "The seabed is averaged over this length before the cable is rested on it: a cable cannot "
+            "follow features shorter than about 2 (EI / w)^(1/3) (from the library's bending stiffness, "
+            "10 m when unknown), and sounding noise would otherwise add seabed length. 0 = no smoothing.")
+        form.addRow("Seabed smoothing (m)", self.smoothing_edit)
         kp_row = QHBoxLayout()
         self.kp_from = QLineEdit()
         self.kp_from.setPlaceholderText("start")
@@ -311,6 +380,7 @@ class AssessmentPanel(QWidget):
                     combo.setCurrentIndex(index)
                     break
             combo.blockSignals(False)
+        self._refresh_labels()
 
     def _clear_results(self) -> None:
         """Forget results: their record indices belong to the previous dataset."""
@@ -365,6 +435,7 @@ class AssessmentPanel(QWidget):
         else:
             self.library_label.setText(f"{len(rows)} type(s) in {path}")
         self._library_rows = rows
+        self._refresh_labels()
 
     def open_library(self) -> None:
         from ...cable_library.dialog import CableLibraryDialog
@@ -378,17 +449,161 @@ class AssessmentPanel(QWidget):
         self._library_dialog.show()
         self._library_dialog.raise_()
 
+    # -- cable makeup and label mapping ---------------------------------------
+    def _update_makeup_widgets(self) -> None:
+        source = self.makeup_combo.currentData()
+        for widget in (self.rpl_combo, self.rpl_label):
+            widget.setVisible(source in (MAKEUP_RPL, MAKEUP_FIT))
+        for widget in (self.fit_combo, self.fit_label):
+            widget.setVisible(source == MAKEUP_FIT)
+
+    def _on_makeup_source(self, *_args) -> None:
+        self._update_makeup_widgets()
+        if self.makeup_combo.currentData() in (MAKEUP_RPL, MAKEUP_FIT):
+            self._fill_rpls()
+        self._refresh_labels()
+
+    def _fill_rpls(self) -> None:
+        store = workbench_makeup.open_store()
+        current = self.rpl_combo.currentData() or self._setting("makeup_rpl", "")
+        self.rpl_combo.blockSignals(True)
+        self.rpl_combo.clear()
+        if store is None:
+            self.rpl_combo.addItem("(no Workbench registry in this project)", "")
+        else:
+            for rpl_id, label in workbench_makeup.rpl_choices(store):
+                self.rpl_combo.addItem(label, rpl_id)
+        index = self.rpl_combo.findData(current)
+        if index >= 0:
+            self.rpl_combo.setCurrentIndex(index)
+        self.rpl_combo.blockSignals(False)
+        self._on_rpl_changed()
+
+    def _on_rpl_changed(self, *_args) -> None:
+        if self.makeup_combo.currentData() == MAKEUP_FIT:
+            store = workbench_makeup.open_store()
+            rpl_id = self.rpl_combo.currentData()
+            current = self.fit_combo.currentData() or self._setting("makeup_fit", "")
+            self.fit_combo.blockSignals(True)
+            self.fit_combo.clear()
+            if store is not None and rpl_id:
+                for fit_id, label in workbench_makeup.fit_choices(store, rpl_id):
+                    self.fit_combo.addItem(label, fit_id)
+            if self.fit_combo.count() == 0:
+                self.fit_combo.addItem("(no assembly fitted to this RPL)", "")
+            index = self.fit_combo.findData(current)
+            if index >= 0:
+                self.fit_combo.setCurrentIndex(index)
+            self.fit_combo.blockSignals(False)
+        self._refresh_labels()
+
+    def current_makeup(self) -> Optional[la.KpMakeup]:
+        """The Workbench makeup chosen (cached), None for the lay data column."""
+        source = self.makeup_combo.currentData()
+        if source == MAKEUP_DATA:
+            return None
+        key = (source, self.rpl_combo.currentData(), self.fit_combo.currentData())
+        if key not in self._makeup_cache:
+            if not key[1] or (source == MAKEUP_FIT and not key[2]):
+                raise ValueError("choose a Workbench RPL" + (" and fitted assembly" if source == MAKEUP_FIT else ""))
+            makeup = workbench_makeup.makeup_for(workbench_makeup.open_store(), source, key[1], key[2])
+            if makeup is None or makeup.empty:
+                raise ValueError("the Workbench source has no cable types")
+            self._makeup_cache = {key: makeup}
+        return self._makeup_cache[key]
+
+    def _labels_found(self) -> List[str]:
+        labels = set()
+        field = self._role_combos["cable_type"].currentData() if self._role_combos else None
+        if self._dataset is not None and field and self._dataset.has_field(field):
+            for value in set(self._dataset.raw(field).tolist()):
+                text = "" if value is None else str(value).strip()
+                if text and text != "NULL":
+                    labels.add(text)
+        try:
+            makeup = self.current_makeup()
+        except Exception:
+            makeup = None
+        if makeup is not None:
+            labels.update(makeup.labels)
+        return sorted(labels, key=library.type_token)
+
+    def _refresh_labels(self, *_args) -> None:
+        """Rebuild the label -> library type table (one row per distinct label token)."""
+        if not hasattr(self, "mapping_table"):
+            return
+        seen, labels = set(), []
+        for label in self._labels_found():
+            token = library.type_token(label)
+            if token and token not in seen:
+                seen.add(token)
+                labels.append(label)
+        names = [row["name"] for row in self._library_rows]
+        self.mapping_table.setRowCount(0)
+        self._mapping_combos = {}
+        for label in labels:
+            token = library.type_token(label)
+            r = self.mapping_table.rowCount()
+            self.mapping_table.insertRow(r)
+            self.mapping_table.setItem(r, 0, QTableWidgetItem(label))
+            combo = QComboBox()
+            combo.addItem("(automatic)", "")
+            options = library.candidates(self._library_rows, label)
+            for name in options + [n for n in names if n not in options]:
+                combo.addItem(name, name)
+            index = combo.findData(self._type_mapping.get(token, ""))
+            combo.setCurrentIndex(max(index, 0))
+            combo.currentIndexChanged.connect(lambda _i, t=token, c=combo: self._on_mapping_changed(t, c))
+            self.mapping_table.setCellWidget(r, 1, combo)
+            self._mapping_combos[token] = combo
+            self._update_how(token, label)
+        self.mapping_table.resizeColumnToContents(0)
+
+    def _update_how(self, token: str, label: str) -> None:
+        for r in range(self.mapping_table.rowCount()):
+            item = self.mapping_table.item(r, 0)
+            if item is not None and library.type_token(item.text()) == token:
+                row, how = library.resolve(self._library_rows, label, self._type_mapping)
+                text = _HOW_TEXT.get(how, how)
+                cell = QTableWidgetItem(text if row is None or how == "mapped" else f"{text}: {row['name']}")
+                if how in ("ambiguous", "unknown"):
+                    cell.setForeground(QColor(SEVERITY_COLOUR[Severity.ERROR if how == "ambiguous"
+                                                              else Severity.WARNING]))
+                self.mapping_table.setItem(r, 2, cell)
+
+    def _on_mapping_changed(self, token: str, combo: QComboBox) -> None:
+        name = combo.currentData()
+        if name:
+            self._type_mapping[token] = name
+        else:
+            self._type_mapping.pop(token, None)
+        if self.persist:
+            library.set_project_mapping(self._type_mapping)
+        label = next((self.mapping_table.item(r, 0).text() for r in range(self.mapping_table.rowCount())
+                      if library.type_token(self.mapping_table.item(r, 0).text()) == token), token)
+        self._update_how(token, label)
+
     def _cable_resolver(self):
         rows = self._library_rows
-        default = library.find_row(rows, self.cable_combo.currentData())
-        self._unmatched = set()
+        mapping = dict(self._type_mapping)
+        default = library.resolve(rows, self.cable_combo.currentData())[0]
+        self._resolution = {}
 
         def resolve(text):
-            row = library.find_row(rows, text)
-            if row is None and text:
-                self._unmatched.add(text)
+            row, how = library.resolve(rows, text, mapping)
+            if text:
+                self._resolution[str(text)] = (row["name"] if row else None, how)
             return library.to_props(row or default)
         return resolve
+
+    def _smoothing(self) -> Optional[float]:
+        text = self.smoothing_edit.text().strip().replace(",", ".")
+        if not text:
+            return None
+        try:
+            return max(float(text), 0.0)
+        except ValueError:
+            raise ValueError("Seabed smoothing: enter metres, or leave blank for automatic.")
 
     def _params(self, check: la.CheckDef) -> Dict[str, float]:
         params: Dict[str, float] = {}
@@ -429,65 +644,87 @@ class AssessmentPanel(QWidget):
             return
         if self._task is not None:
             return
+        notes: List[str] = []
         try:
             enabled = {check.check_id: self._params(check) for check in la.all_checks()
                        if self._check_boxes[check.check_id].isChecked()}
             window = self._kp_window()
-            records = la.build_records(self._dataset, self.mapping(), self.units_combo.currentText(),
-                                       self._cable_resolver())
+            smoothing = self._smoothing()
+            records = la.build_records(self._dataset, self.mapping(), self.units_combo.currentText())
         except ValueError as exc:
             self.status_label.setText(str(exc))
             return
         if records.n == 0:
             self.status_label.setText("No records with a KP to assess.")
             return
+        try:
+            makeup = self.current_makeup()
+        except Exception as exc:
+            makeup = None
+            notes.append(f"Cable types from the lay data only ({exc}).")
+        la.apply_makeup(records, makeup, self._cable_resolver())
         if self.persist:
             self._save_settings()
         findings, skipped = la.run_record_checks(records, enabled)
         self._records = records
+        self._notes = notes
         try:
             self._track = la.track_vertices(records)
         except ValueError:
             self._track = None
-        seabed_checks = [c for c in la.SEABED_CHECKS if c.check_id in enabled]
+        seabed = {cid: enabled[cid] for cid in _SEABED_IDS if cid in enabled}
         mode = self.seabed_combo.currentData()
-        if not seabed_checks or mode == SEABED_NONE:
-            for check in seabed_checks:
-                skipped[check.check_id] = "needs a seabed source"
-            self._finish(records, findings, skipped, None, window)
-            return
-        for check in seabed_checks:
-            missing = la.missing_inputs(check, records)
+        if seabed and mode == SEABED_NONE:
+            for cid in seabed:
+                skipped[cid] = "needs a seabed source"
+            seabed = {}
+        for cid in list(seabed):
+            missing = la.missing_inputs(la.check_by_id(cid), records)
             if missing:
-                skipped[check.check_id] = "needs " + ", ".join(missing)
-                enabled.pop(check.check_id)
-        if "suspension" not in enabled and "terrain_slack" not in enabled:
+                skipped[cid] = "needs " + ", ".join(missing)
+                seabed.pop(cid)
+        if mode == SEABED_LAY_MODEL and "length_balance" in seabed:
+            skipped["length_balance"] = "compares against bathymetry, not the lay model's own seabed"
+            seabed.pop("length_balance")
+        if "suspension" not in seabed and "length_balance" not in seabed:
             self._finish(records, findings, skipped, None, window)
             return
         if mode == SEABED_LAY_MODEL:
-            if "terrain_slack" in enabled:
-                skipped["terrain_slack"] = "compares against bathymetry, not the lay model's own seabed"
-                enabled.pop("terrain_slack")
             if not records.has("td_depth"):
                 skipped["suspension"] = "needs the touchdown water depth column"
                 self._finish(records, findings, skipped, None, window)
                 return
             x, kp, depth = self._lay_model_profile(records, window)
-            self._model_and_finish(records, findings, skipped, enabled, x, kp, depth,
-                                   records.kp * 1000.0, window)
-            return
-        try:
-            request, vertex_chainage, vertex_kp = self._seabed_request(records, mode, window)
-        except ValueError as exc:
-            for check in seabed_checks:
-                skipped.setdefault(check.check_id, str(exc))
-            self._finish(records, findings, skipped, None, window)
-            return
-        self._pending = (records, findings, skipped, enabled, vertex_chainage, vertex_kp, window)
+            record_x = records.kp * 1000.0
+
+            def work(_cancel, _progress):
+                return seabed_job(records, seabed, x, kp, depth, record_x, smoothing)
+        else:
+            try:
+                request, vertex_chainage, vertex_kp = self._seabed_request(records, mode, window)
+            except ValueError as exc:
+                for cid in seabed:
+                    skipped.setdefault(cid, str(exc))
+                self._finish(records, findings, skipped, None, window)
+                return
+
+            def work(cancel, progress):
+                result = dpc.run_profile(request, cancel=cancel,
+                                         progress=(lambda f: progress(0.7 * f)) if progress else None)
+                x = np.asarray(result.kp_values, dtype=float) * 1000.0
+                depth = np.array([np.nan if v is None else float(v) for v in result.depth_values])
+                if result.status and not np.isfinite(depth).any():
+                    return None, [], {cid: result.status for cid in seabed}
+                kp = la.chainage_to_kp(vertex_chainage, vertex_kp, x)
+                record_x = la.kp_to_chainage(vertex_chainage, vertex_kp, records.kp)
+                with np.errstate(invalid="ignore"):  # interp clamps; records off the track are not on it
+                    record_x[(records.kp < vertex_kp[0]) | (records.kp > vertex_kp[-1])] = np.nan
+                return seabed_job(records, seabed, x, kp, depth, record_x, smoothing)
+        self._pending = (records, findings, skipped, seabed, window)
         if self.synchronous:
-            self._apply_profile(dpc.run_profile(request))
+            self._apply_seabed(work(None, None))
             return
-        self._start_task(request)
+        self._start_task(work)
 
     def _lay_model_profile(self, records, window):
         step = float(self.interval_spin.value())
@@ -547,16 +784,16 @@ class AssessmentPanel(QWidget):
             raise ValueError(request.status)
         return request, chainage, kp
 
-    def _start_task(self, request) -> None:
+    def _start_task(self, work) -> None:
         self.run_button.setEnabled(False)
-        self.status_label.setText("Sampling the seabed along the touchdown track…")
-        self._progress = QProgressDialog("Sampling the seabed…", "Cancel", 0, 100, self)
+        self.status_label.setText("Modelling the cable on the seabed\u2026")
+        self._progress = QProgressDialog("Modelling the cable on the seabed\u2026", "Cancel", 0, 100, self)
         self._progress.setWindowTitle("Lay Assessment")
         self._progress.setWindowModality(_WINDOW_MODAL)
         self._progress.setMinimumDuration(0)
         self._progress.setAutoClose(False)
         self._progress.setAutoReset(False)
-        task = dpc.DepthProfileTask(request, self._on_task_finished, "Lay Assessment seabed")
+        task = AssessmentTask("Lay Assessment seabed", work, self._on_task_finished)
         self._task = task
         task.progressChanged.connect(lambda value: self._progress.setValue(int(value)) if self._progress else None)
         self._progress.canceled.connect(task.cancel)
@@ -564,8 +801,7 @@ class AssessmentPanel(QWidget):
         self._progress.show()
 
     def _on_task_finished(self, task) -> None:
-        result, error, cancelled = task.result, task.error, task.cancelled
-        task.request = None
+        payload, error, cancelled = task.result, task.error, task.cancelled
         self._task = None
         if self._progress is not None:
             self._progress.reset()
@@ -574,58 +810,16 @@ class AssessmentPanel(QWidget):
         self.run_button.setEnabled(True)
         if self._pending is None:  # shut down meanwhile
             return
-        if result is None:
-            records, findings, skipped, enabled, _c, _k, window = self._pending
-            reason = "cancelled" if cancelled else f"seabed sampling failed: {error}"
-            for check_id in ("suspension", "terrain_slack"):
-                if check_id in enabled:
-                    skipped[check_id] = reason
-            self._pending = None
-            self._finish(records, findings, skipped, None, window)
-            return
-        self._apply_profile(result)
+        if payload is None:
+            reason = "cancelled" if cancelled else f"seabed modelling failed: {error}"
+            payload = (None, [], {cid: reason for cid in self._pending[3]})
+        self._apply_seabed(payload)
 
-    def _apply_profile(self, result) -> None:
-        try:
-            self._apply_profile_result(result)
-        except Exception as exc:
-            log_exception("Lay Assessment: modelling the seabed failed")
-            self.status_label.setText(f"Assessment failed: {exc}")
-
-    def _apply_profile_result(self, result) -> None:
-        records, findings, skipped, enabled, vertex_chainage, vertex_kp, window = self._pending
+    def _apply_seabed(self, payload) -> None:
+        records, findings, skipped, _seabed, window = self._pending
         self._pending = None
-        x = np.asarray(result.kp_values, dtype=float) * 1000.0
-        depth = np.array([np.nan if v is None else float(v) for v in result.depth_values])
-        if result.status and not np.isfinite(depth).any():
-            for check_id in ("suspension", "terrain_slack"):
-                if check_id in enabled:
-                    skipped[check_id] = result.status
-            self._finish(records, findings, skipped, None, window)
-            return
-        kp = la.chainage_to_kp(vertex_chainage, vertex_kp, x)
-        record_x = la.kp_to_chainage(vertex_chainage, vertex_kp, records.kp)
-        with np.errstate(invalid="ignore"):  # interp clamps; records off the track are not on it
-            record_x[(records.kp < vertex_kp[0]) | (records.kp > vertex_kp[-1])] = np.nan
-        self._model_and_finish(records, findings, skipped, enabled, x, kp, depth, record_x, window)
-
-    def _model_and_finish(self, records, findings, skipped, enabled, x, kp, depth, record_x, window) -> None:
-        if len(x) < 3:
-            for check_id in ("suspension", "terrain_slack"):
-                if check_id in enabled:
-                    skipped[check_id] = "too few seabed samples"
-            self._finish(records, findings, skipped, None, window)
-            return
-        params = enabled.get("suspension") or la.default_params(la.check_by_id("suspension"))
-        model = la.model_seabed(x, kp, depth, records, record_x, params["zero_tension_kn"],
-                                params["min_gap_m"], params["min_length_m"])
-        seabed_findings: List[la.RangeFinding] = []
-        if "suspension" in enabled:
-            seabed_findings.extend(la.seabed_span_findings(model, enabled["suspension"]))
-        if "terrain_slack" in enabled:
-            terrain = enabled["terrain_slack"]
-            windows = la.terrain_shortfall(model, records, record_x, terrain["window_m"])
-            seabed_findings.extend(la.terrain_findings(model, windows, terrain))
+        model, seabed_findings, seabed_skipped = payload
+        skipped.update(seabed_skipped)
         self._finish(records, findings + seabed_findings, skipped, model, window)
 
     def _finish(self, records, findings, skipped, model, window) -> None:
@@ -642,9 +836,17 @@ class AssessmentPanel(QWidget):
             parts.append(f"Seabed: {len(model.spans)} modelled span(s).")
         if skipped:
             parts.append("Not run: " + "; ".join(f"{self._labels.get(k, k)} ({v})" for k, v in skipped.items()) + ".")
-        unmatched = sorted(self._unmatched)
-        if unmatched:
-            parts.append("Cable types not in the library (default used): " + ", ".join(unmatched[:8]) + ".")
+        if model is not None and model.shortfalls:
+            parts.append(f"{len(model.shortfalls)} stretch(es) where the laid cable is short of the seabed.")
+        problems = sorted(label for label, (_name, how) in self._resolution.items()
+                          if how in ("ambiguous", "unknown"))
+        if problems:
+            parts.append("Cable types not resolved (default used): "
+                         + ", ".join(f"{label} ({_HOW_TEXT[self._resolution[label][1]]})" for label in problems[:8])
+                         + ". Map them under Cable.")
+        if any(p is None for p in records.cable):
+            parts.append("Some records have no cable properties: set a default cable type.")
+        parts.extend(self._notes)
         if self._track is None:
             parts.append("No touchdown positions: ranges cannot be shown on the map.")
         elif not records.has("td_lat", "td_lon"):
@@ -835,6 +1037,10 @@ class AssessmentPanel(QWidget):
         settings.setValue(f"{_SETTINGS}/cable_type", self.cable_combo.currentData() or "")
         settings.setValue(f"{_SETTINGS}/seabed", self.seabed_combo.currentData())
         settings.setValue(f"{_SETTINGS}/interval", self.interval_spin.value())
+        settings.setValue(f"{_SETTINGS}/smoothing", self.smoothing_edit.text())
+        settings.setValue(f"{_SETTINGS}/makeup", self.makeup_combo.currentData())
+        settings.setValue(f"{_SETTINGS}/makeup_rpl", self.rpl_combo.currentData() or "")
+        settings.setValue(f"{_SETTINGS}/makeup_fit", self.fit_combo.currentData() or "")
         checks = {check.check_id: {"enabled": self._check_boxes[check.check_id].isChecked(),
                                    "params": {name: editor.text() for name, editor
                                               in self._editors[check.check_id].items()}}
@@ -853,6 +1059,9 @@ class AssessmentPanel(QWidget):
             self.interval_spin.setValue(int(self._setting("interval", 5)))
         except (TypeError, ValueError):
             pass
+        self.smoothing_edit.setText(str(self._setting("smoothing", "") or ""))
+        index = self.makeup_combo.findData(self._setting("makeup", MAKEUP_DATA))
+        self.makeup_combo.setCurrentIndex(max(index, 0))
         try:
             checks = json.loads(self._setting("checks", "{}") or "{}")
         except (TypeError, ValueError):

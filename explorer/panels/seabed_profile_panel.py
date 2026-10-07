@@ -7,7 +7,10 @@ Three linked rows sharing a KP axis:
   warning, red error, blue info, grey no data);
 * the depth profile: sampled seabed, the modelled cable (spans filled red)
   and the lay model's touchdown depths;
-* bottom tension (logged, and estimated from measured top tension).
+* bottom tension (logged, estimated from measured top tension, and the
+  tension the seabed model rests the cable at);
+* laid cable minus seabed length within friction reach (% of plan), when
+  the length check ran: below zero the cable is short and pulled taut.
 
 Two-click measurements reuse the depth tools' ProfileMeasureController.
 Hovering / clicking links to the Explorer's records and the map.
@@ -78,28 +81,36 @@ class SeabedProfilePanel(QWidget):
         self.status_plot = self.graphics.addPlot(row=0, col=0)
         self.depth_plot = self.graphics.addPlot(row=1, col=0)
         self.tension_plot = self.graphics.addPlot(row=2, col=0)
+        self.balance_plot = self.graphics.addPlot(row=3, col=0)
         layout_ci = self.graphics.ci.layout
         layout_ci.setRowStretchFactor(0, 1)
         layout_ci.setRowStretchFactor(1, 9)
         layout_ci.setRowStretchFactor(2, 3)
+        layout_ci.setRowStretchFactor(3, 3)
         self.status_plot.setMaximumHeight(42)
         self.status_plot.hideAxis("left")
         self.status_plot.hideAxis("bottom")
         self.status_plot.setMouseEnabled(x=True, y=False)
         self.status_plot.setYRange(0, 1, padding=0)
         self.status_plot.getAxis("left").setWidth(60)
-        for plot in (self.depth_plot, self.tension_plot):
+        for plot in (self.depth_plot, self.tension_plot, self.balance_plot):
             plot.showGrid(x=True, y=True, alpha=0.25)
             plot.getAxis("left").setWidth(60)
         self.depth_plot.invertY(True)
         self.depth_plot.setLabel("left", "Depth (m)")
         self.tension_plot.setLabel("left", "Bottom T (kN)")
-        self.tension_plot.setLabel("bottom", "KP (km)")
-        for plot in (self.depth_plot, self.tension_plot):
+        self.balance_plot.setLabel("left", "Cable - seabed (%)")
+        self.balance_plot.setLabel("bottom", "KP (km)")
+        self.balance_plot.addItem(pg.InfiniteLine(pos=0.0, angle=0, pen=pg.mkPen((120, 120, 120), width=1)))
+        self.balance_plot.setToolTip("Laid cable minus seabed length within the friction reach, % of plan "
+                                     "length. Below zero the cable is short of the seabed and pulled taut.")
+        self.balance_plot.hide()
+        for plot in (self.depth_plot, self.tension_plot, self.balance_plot):
             plot.addLegend(offset=(10, 5), labelTextColor=(40, 40, 40),
                            brush=pg.mkBrush(255, 255, 255, 210), pen=pg.mkPen(200, 200, 200))
         self.status_plot.setXLink(self.depth_plot)
         self.tension_plot.setXLink(self.depth_plot)
+        self.balance_plot.setXLink(self.depth_plot)
 
         self.info = QLabel("Run the Lay Assessment to see the seabed profile.")
         self.info.setWordWrap(True)
@@ -110,7 +121,7 @@ class SeabedProfilePanel(QWidget):
             lambda: self.measure.table.setVisible(bool(self.measure.measurements)))
 
         self._vlines = []
-        for plot in (self.depth_plot, self.tension_plot):
+        for plot in (self.depth_plot, self.tension_plot, self.balance_plot):
             line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen((120, 120, 120), width=1, style=_DASH))
             line.hide()
             plot.addItem(line, ignoreBounds=True)
@@ -166,6 +177,7 @@ class SeabedProfilePanel(QWidget):
             self._plot_status()
             series = self._plot_depth()
             self._plot_tension()
+            self._plot_balance()
             self.measure.set_series(series)
         except Exception:
             log_exception("Lay Assessment: drawing the seabed profile failed")
@@ -210,7 +222,13 @@ class SeabedProfilePanel(QWidget):
         records, model = self._records, self._model
         if model is not None:
             kp = model.kp_km
-            seabed = pg.PlotDataItem(kp, model.seabed_depth_m, pen=pg.mkPen(_SEABED, width=2), name="Seabed",
+            smoothed = model.raw_depth_m is not None and model.smoothing_m > 0
+            if smoothed:
+                self._add(self.depth_plot, pg.PlotDataItem(
+                    kp, model.raw_depth_m, pen=pg.mkPen((190, 160, 150), width=1), name="Seabed (sampled)",
+                    connect="finite"))
+            name = f"Seabed (smoothed {model.smoothing_m:.0f} m)" if smoothed else "Seabed"
+            seabed = pg.PlotDataItem(kp, model.seabed_depth_m, pen=pg.mkPen(_SEABED, width=2), name=name,
                                      connect="finite")
             cable = pg.PlotDataItem(kp, model.cable_depth_m, pen=pg.mkPen(_CABLE, width=1.5), name="Cable (model)",
                                     connect="finite")
@@ -254,12 +272,33 @@ class SeabedProfilePanel(QWidget):
                 self._add(self.tension_plot, pg.PlotDataItem(
                     kp, estimate, pen=pg.mkPen((0, 150, 136), width=1, style=_DASH),
                     name="From top tension", connect="finite"))
+        model = self._model
+        if model is not None and model.logged_tension_kn is not None:
+            raised = np.isfinite(model.tension_kn) & (model.tension_kn > np.nan_to_num(model.logged_tension_kn) + 1e-6)
+            if raised.any():
+                self._add(self.tension_plot, pg.PlotDataItem(
+                    model.kp_km, np.where(raised, model.tension_kn, np.nan), pen=pg.mkPen((211, 47, 47), width=2),
+                    name="Pulled taut (seabed model)", connect="finite"))
         npts = records.cable_array("npts_kn")
         finite = npts[np.isfinite(npts)]
         if finite.size and np.allclose(finite, finite[0]):
             line = pg.InfiniteLine(pos=float(finite[0]), angle=0, pen=pg.mkPen((211, 47, 47), width=1, style=_DASH),
                                    label="NPTS", labelOpts={"position": 0.03, "color": (211, 47, 47)})
             self._add(self.tension_plot, line)
+
+    def _plot_balance(self) -> None:
+        model = self._model
+        has = model is not None and model.balance_pct is not None and np.isfinite(model.balance_pct).any()
+        self.balance_plot.setVisible(bool(has))
+        if not has:
+            return
+        balance = model.balance_pct
+        self._add(self.balance_plot, pg.PlotDataItem(model.kp_km, balance, pen=pg.mkPen((90, 90, 90), width=1),
+                                                     name="Cable - seabed", connect="finite"))
+        short = np.where(balance < 0, balance, np.nan)
+        if np.isfinite(short).any():
+            self._add(self.balance_plot, pg.PlotDataItem(model.kp_km, short, pen=pg.mkPen((211, 47, 47), width=2),
+                                                         name="Short of seabed", connect="finite"))
 
     # -- navigation -----------------------------------------------------------
     def fit(self) -> None:
@@ -271,6 +310,7 @@ class SeabedProfilePanel(QWidget):
         self.depth_plot.setXRange(lo - pad, hi + pad, padding=0)
         self.depth_plot.enableAutoRange(axis="y")
         self.tension_plot.enableAutoRange(axis="y")
+        self.balance_plot.enableAutoRange(axis="y")
 
     def zoom_to(self, kp_start: float, kp_end: float) -> None:
         """Show a KP range with context either side, depth fitted to it."""
@@ -311,7 +351,7 @@ class SeabedProfilePanel(QWidget):
         return int(self._records.rows[self._record_order[i]])
 
     def _kp_at_scene(self, pos) -> Optional[float]:
-        for plot in (self.depth_plot, self.tension_plot):
+        for plot in (self.depth_plot, self.tension_plot, self.balance_plot):
             if plot.sceneBoundingRect().contains(pos):
                 return float(plot.vb.mapSceneToView(pos).x())
         return None

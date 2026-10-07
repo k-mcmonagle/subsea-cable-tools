@@ -5,24 +5,43 @@ The library is one attribute-only table, ``cable_types``, in a GeoPackage
 the user picks (remembered in QSettings). The table is created with the
 QGIS vector-file writer (so it is a valid GeoPackage layer that QGIS can
 open and edit too); rows are read and replaced with plain ``sqlite3`` in a
-single transaction. Matching a lay-data cable type to a library row uses
-the row's name and its comma-separated aliases, case-insensitively.
+single transaction, after checking nobody else changed them since they
+were read (the library can be shared between users and projects on a
+network drive).
+
+The library is shared, but which product an RPL's "LW" means is project
+specific (several manufacturers' LW cables can sit in one library). A label
+from lay data, an RPL or an assembly is therefore resolved in order:
+
+1. the project's mapping (``label -> library name``, stored in the QGIS
+   project);
+2. a library name equal to the label;
+3. the one library type listing the label among its aliases;
+4. the one library type whose generic type (LW, SA, DA ...) is the label.
+
+Several candidates at steps 3 or 4 make the label *ambiguous*: it must be
+mapped. Labels are compared as upper-case alphanumerics (``LW-P`` = ``lwp``).
 """
 
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import os
+import re
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from ..burial.gpkg_sql import _readonly_uri, has_table
 from ..laydata.lay_assessment import CableProps
 
 TABLE = "cable_types"
 SETTINGS_KEY = "SubseaCableTools/CableLibrary/path"
+PROJECT_SCOPE = "SubseaCableTools"
+PROJECT_MAPPING_KEY = "cable_type_mapping"
 CATEGORIES = ("cable", "rope")
 
 
@@ -37,7 +56,11 @@ class Column:
 COLUMNS: Sequence[Column] = (
     Column("name", "str", "Name", "Unique type name."),
     Column("category", "str", "Category", "cable or rope."),
-    Column("aliases", "str", "Aliases", "Other names used for this type in lay data or RPLs, comma separated."),
+    Column("manufacturer", "str", "Manufacturer"),
+    Column("generic_type", "str", "Generic type", "LW, LWP, SA, DA, RA ...: matches RPL / lay data labels when "
+                                                  "it is the only library type of that kind."),
+    Column("aliases", "str", "Aliases", "Other names used for this type in lay data or RPLs, comma separated. "
+                                        "A label shared by several types must be mapped per project."),
     Column("description", "str", "Description"),
     Column("diameter_mm", "float", "Diameter (mm)", "Outer diameter."),
     Column("weight_air_kg_m", "float", "Weight in air (kg/m)"),
@@ -50,6 +73,8 @@ COLUMNS: Sequence[Column] = (
     Column("npts_kn", "float", "NPTS (kN)", "Nominal permanent tensile strength: the cable's state after "
                                             "laying (residual tension on the seabed)."),
     Column("mbr_m", "float", "MBR (m)", "Minimum bend radius."),
+    Column("bending_stiffness_knm2", "float", "Bending stiffness EI (kNm²)",
+           "Sets the shortest seabed feature the cable can follow, 2 (EI / w)^(1/3)."),
     Column("notes", "str", "Notes"),
 )
 COLUMN_NAMES = [column.name for column in COLUMNS]
@@ -123,19 +148,55 @@ def warnings_for(rows: Sequence[Dict]) -> List[str]:
     return notes
 
 
+def type_token(text) -> str:
+    """Comparison form of a cable type label: upper-case alphanumerics."""
+    return re.sub(r"[^A-Z0-9]", "", str(text or "").upper())
+
+
+def _aliases(row: Dict) -> set:
+    return {type_token(a) for a in (row.get("aliases") or "").split(",") if a.strip()}
+
+
+def resolve(rows: Sequence[Dict], label: Optional[str],
+            mapping: Optional[Dict[str, str]] = None) -> Tuple[Optional[Dict], str]:
+    """``(row, how)`` for a label; ``how`` is mapped / name / alias / generic,
+    or ambiguous / unknown / none (no row)."""
+    token = type_token(label)
+    if not token:
+        return None, "none"
+    by_name = {type_token(row.get("name")): row for row in rows}
+    target = (mapping or {}).get(token)
+    if target:
+        row = by_name.get(type_token(target))
+        if row is not None:
+            return row, "mapped"
+    if token in by_name:
+        return by_name[token], "name"
+    aliased = [row for row in rows if token in _aliases(row)]
+    if len(aliased) == 1:
+        return aliased[0], "alias"
+    if len(aliased) > 1:
+        return None, "ambiguous"
+    generic = [row for row in rows if type_token(row.get("generic_type")) == token]
+    if len(generic) == 1:
+        return generic[0], "generic"
+    if len(generic) > 1:
+        return None, "ambiguous"
+    return None, "unknown"
+
+
+def candidates(rows: Sequence[Dict], label: Optional[str]) -> List[str]:
+    """Library names that could mean ``label`` (name, alias or generic type)."""
+    token = type_token(label)
+    if not token:
+        return []
+    return [row["name"] for row in rows
+            if token in (type_token(row.get("name")), type_token(row.get("generic_type"))) or token in _aliases(row)]
+
+
 def find_row(rows: Sequence[Dict], text: Optional[str]) -> Optional[Dict]:
-    """The row whose name or alias matches ``text`` (case-insensitive)."""
-    if not text:
-        return None
-    wanted = str(text).strip().lower()
-    for row in rows:
-        if (row.get("name") or "").strip().lower() == wanted:
-            return row
-    for row in rows:
-        aliases = [a.strip().lower() for a in (row.get("aliases") or "").split(",")]
-        if wanted in aliases:
-            return row
-    return None
+    """The row a label resolves to without a project mapping (None if ambiguous)."""
+    return resolve(rows, text)[0]
 
 
 def to_props(row: Optional[Dict]) -> Optional[CableProps]:
@@ -144,7 +205,13 @@ def to_props(row: Optional[Dict]) -> Optional[CableProps]:
     return CableProps(name=row.get("name") or "", weight_water_kg_m=row.get("weight_water_kg_m"),
                       weight_air_kg_m=row.get("weight_air_kg_m"), cbl_kn=row.get("cbl_kn"),
                       ntts_kn=row.get("ntts_kn"), nots_kn=row.get("nots_kn"), npts_kn=row.get("npts_kn"),
-                      mbr_m=row.get("mbr_m"))
+                      mbr_m=row.get("mbr_m"), bending_stiffness_knm2=row.get("bending_stiffness_knm2"))
+
+
+def fingerprint(rows: Sequence[Dict]) -> str:
+    """Content hash of the rows, to notice edits made elsewhere before saving."""
+    payload = json.dumps([clean_row(row) for row in rows], sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def read_csv(path: str) -> List[Dict]:
@@ -215,13 +282,23 @@ def read_rows(path: str) -> List[Dict]:
         return [clean_row(dict(zip(wanted, values))) for values in cursor.fetchall()]
 
 
-def write_rows(path: str, rows: Sequence[Dict]) -> None:
-    """Replace every row in one transaction (columns added to old files first)."""
+class ChangedElsewhere(RuntimeError):
+    """The library changed since it was read (another user, project or QGIS)."""
+
+
+def write_rows(path: str, rows: Sequence[Dict], expected: Optional[str] = None) -> None:
+    """Replace every row in one transaction (columns added to old files first).
+
+    With ``expected`` (the :func:`fingerprint` of the rows as read), raises
+    :class:`ChangedElsewhere` instead of overwriting someone else's edits.
+    """
     rows = [clean_row(row) for row in rows]
     problems = validate(rows)
     if problems:
         raise ValueError("\n".join(problems))
-    with closing(sqlite3.connect(path)) as conn:
+    if expected is not None and fingerprint(read_rows(path)) != expected:
+        raise ChangedElsewhere(f"{os.path.basename(path)} was changed elsewhere since it was opened.")
+    with closing(sqlite3.connect(path, timeout=10.0)) as conn:
         present = [r[1] for r in conn.execute(f'PRAGMA table_info("{TABLE}")')]
         if not present:
             raise ValueError(f"{path} has no '{TABLE}' table.")
@@ -250,6 +327,26 @@ def set_current_path(path: str) -> None:
     from qgis.PyQt.QtCore import QSettings
 
     QSettings().setValue(SETTINGS_KEY, path or "")
+
+
+def project_mapping() -> Dict[str, str]:
+    """``{label token: library name}`` saved in the current QGIS project."""
+    from qgis.core import QgsProject
+
+    raw, _ok = QgsProject.instance().readEntry(PROJECT_SCOPE, PROJECT_MAPPING_KEY, "{}")
+    try:
+        data = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return {type_token(k): str(v) for k, v in data.items() if type_token(k) and v}
+
+
+def set_project_mapping(mapping: Dict[str, str]) -> None:
+    """Store the mapping in the QGIS project (saved with the project file)."""
+    from qgis.core import QgsProject
+
+    clean = {type_token(k): v for k, v in mapping.items() if type_token(k) and v}
+    QgsProject.instance().writeEntry(PROJECT_SCOPE, PROJECT_MAPPING_KEY, json.dumps(clean, sort_keys=True))
 
 
 def load_current() -> List[Dict]:
