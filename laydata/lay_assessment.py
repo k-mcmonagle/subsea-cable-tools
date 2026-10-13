@@ -28,9 +28,16 @@ can draw cable from at most ``H / (mu w)`` either side. The laid cable is
 balanced against the seabed within that reach; where it is short, the
 tension that makes its rest shape use exactly the cable available is found
 (:func:`taut_tension_n`) and the cable rests at the higher of that and the
-logged tension. The seabed is smoothed over the cable's conformity length
-``2 (EI / w)^(1/3)``: shorter features are bridged by bending stiffness and
-would otherwise inflate the seabed length with sounding noise.
+logged tension. Lengths (seabed, and the lay model's seabed the slack is
+relative to) use profiles smoothed over the cable's conformity length
+``2 (EI / w)^(1/3)``, since sounding noise inflates length; the cable itself
+rests on a lightly filtered seabed that keeps the crests holding it up.
+
+At each end of a span the cable bears on the seabed: the reaction there,
+and the bend radius once bending stiffness spreads the turn over
+``sqrt(EI / H)``, are checked against the cable's MBR (:func:`span_supports`).
+:func:`allowable_tension_kn` gives the highest tension that keeps spans
+within the reporting limits along the route.
 
 The cable hanging in the water can span a change of cable type; the
 makeup along the route (:class:`KpMakeup`) gives the type at every height,
@@ -50,6 +57,25 @@ import numpy as np
 from .qc_base import ParamSpec, Severity
 
 G = 9.80665  # m/s^2: kgf -> N and kg/m -> N/m
+
+
+class Cancelled(Exception):
+    """Raised by a long calculation whose ``cancel()`` callback returned True."""
+
+
+def _check_cancel(cancel: Optional[Callable[[], bool]]) -> None:
+    if cancel is not None and cancel():
+        raise Cancelled()
+
+
+def _report(progress: Optional[Callable], fraction: float, text: Optional[str] = None) -> None:
+    """Call ``progress(fraction, text)``; plain ``progress(fraction)`` callbacks work too."""
+    if progress is None:
+        return
+    try:
+        progress(fraction, text)
+    except TypeError:
+        progress(fraction)
 
 # Tension unit conversions to kN.
 TENSION_UNITS: Dict[str, float] = {
@@ -196,6 +222,7 @@ class LayRecords:
     excluded: int = 0
     labels: List[Optional[str]] = field(default_factory=list)       # cable type label at touchdown
     hang_labels: List[Optional[str]] = field(default_factory=list)  # governing cable in the water
+    _cable_lookup: Optional[tuple] = field(default=None, repr=False, compare=False)
 
     @property
     def n(self) -> int:
@@ -208,11 +235,29 @@ class LayRecords:
         return self.values.get(key, np.full(self.n, np.nan))
 
     def cable_array(self, attribute: str) -> np.ndarray:
-        out = np.full(self.n, np.nan)
-        for i, props in enumerate(self.cable):
+        """Per-record cable property (nan where unknown)."""
+        index, distinct = self._cable_index()
+        values = np.array([_pos(getattr(props, attribute, None)) for props in distinct] + [math.nan])
+        return values[index]
+
+    def _cable_index(self) -> Tuple[np.ndarray, list]:
+        """Per record, an index into the distinct cables (-1 = none); cached
+        until ``cable`` is replaced."""
+        cached = self._cable_lookup
+        if cached is not None and cached[0] is self.cable and cached[1] == len(self.cable):
+            return cached[2], cached[3]
+        slots: Dict[int, int] = {}
+        distinct: list = []
+        index = np.full(self.n, -1, dtype=int)
+        for i, props in enumerate(self.cable[:self.n]):
             if props is not None:
-                out[i] = _pos(getattr(props, attribute, None))
-        return out
+                slot = slots.get(id(props))
+                if slot is None:
+                    slot = slots[id(props)] = len(distinct)
+                    distinct.append(props)
+                index[i] = slot
+        self._cable_lookup = (self.cable, len(self.cable), index, distinct)
+        return index, distinct
 
     def order(self) -> np.ndarray:
         """Indices in time order when timed, else KP order."""
@@ -418,10 +463,8 @@ def check_top_tension(records: LayRecords, params) -> List[RangeFinding]:
         level[(tension > nots) & np.isfinite(nots)] = 2
         level[(tension > ntts) & np.isfinite(ntts)] = 3
     kp = records.get("ship_kp") if records.has("ship_kp") else records.kp
-    worst = {}
 
     def threshold(i):
-        worst["label"] = labels[i] if i < len(labels) else None
         return float(ntts[i] if level[i] == 3 else nots[i])
 
     def describe(lvl, value):
@@ -690,13 +733,18 @@ class KpMakeup:
         out = np.full(kp.shape, None, dtype=object)
         if self.empty:
             return out
-        index = np.searchsorted(self.starts, kp, side="right") - 1
         tol = 1e-6
-        for i, (k, j) in enumerate(zip(kp, index)):
-            if np.isfinite(k) and j >= 0 and k <= self.ends[j] + tol:
-                out[i] = self.labels[j]
-            elif np.isfinite(k) and j + 1 < len(self.starts) and abs(self.starts[j + 1] - k) <= tol:
-                out[i] = self.labels[j + 1]
+        last = len(self.starts) - 1
+        index = np.searchsorted(self.starts, kp, side="right") - 1
+        here = np.clip(index, 0, last)
+        after = np.clip(index + 1, 0, last)
+        finite = np.isfinite(kp)
+        with np.errstate(invalid="ignore"):
+            inside = finite & (index >= 0) & (kp <= self.ends[here] + tol)
+            at_next = finite & ~inside & (index < last) & (np.abs(self.starts[after] - kp) <= tol)
+        labels = np.array(self.labels, dtype=object)
+        out[inside] = labels[here[inside]]
+        out[at_next] = labels[after[at_next]]
         return out
 
     def boundaries(self) -> np.ndarray:
@@ -838,15 +886,19 @@ def apply_makeup(records: "LayRecords", makeup: Optional[KpMakeup],
             dz = depth[i] / (samples - 1)
             below_top = np.concatenate((np.cumsum((0.5 * (w[1:] + w[:-1]) * dz)[::-1])[::-1], [0.0]))
             t = top[i] - ((w_air * h if np.isfinite(w_air) else 0.0) + below_top) / 1000.0
+            t[-1] = top[i]  # the sheave end carries the full measured tension
             nots = np.array([_pos(q.nots_kn) if q else np.nan for q in p])
             ntts = np.array([_pos(q.ntts_kn) if q else np.nan for q in p])
             with np.errstate(invalid="ignore", divide="ignore"):
-                ratio = np.where(np.isfinite(nots) & (nots > 0), t / nots, -np.inf)
-            j = int(np.argmax(ratio)) if np.isfinite(ratio).any() else len(t) - 1
-            # The sheave end carries the full measured tension.
-            j = j if ratio[j] > -np.inf else len(t) - 1
-            hang_t[i], hang_nots[i], hang_ntts[i], hang_label[i] = (
-                top[i] if j == len(t) - 1 else t[j], nots[j], ntts[j], labels[j])
+                r_ots = np.where(np.isfinite(nots) & (nots > 0), t / nots, -np.inf)
+                r_tts = np.where(np.isfinite(ntts) & (ntts > 0), t / ntts, -np.inf)
+            # Governing height: the worst level first (above NTTS, then above NOTS),
+            # then the highest ratio to that level's limit. Each limit is judged
+            # on its own, so an NTTS breach is never hidden by another type's NOTS.
+            level = np.where(r_tts > 1.0, 3, np.where(r_ots > 1.0, 2, 0))
+            score = np.where(level == 3, r_tts, r_ots)
+            j = int(np.lexsort((score, level))[-1])  # ties (no limits known): the sheave
+            hang_t[i], hang_nots[i], hang_ntts[i], hang_label[i] = t[j], nots[j], ntts[j], labels[j]
     records.values["hang_w_npm"] = hang_w
     records.values["hang_tension_kn"] = hang_t
     records.values["hang_nots_kn"] = hang_nots
@@ -923,11 +975,13 @@ def cable_rest_elevation(x_m: np.ndarray, seabed_elev_m: np.ndarray, curvature: 
     return y
 
 
-def smooth_profile(x_m: np.ndarray, values: np.ndarray, length_m: float) -> np.ndarray:
+def smooth_profile(x_m: np.ndarray, values: np.ndarray, length_m: float, symmetric: bool = False) -> np.ndarray:
     """Centred running mean over ``length_m`` within each run of finite values.
 
     Works on unevenly spaced stations (contour crossings) through the running
-    integral; windows shrink at run ends and gaps are never bridged.
+    integral; windows shrink at run ends and gaps are never bridged. With
+    ``symmetric`` a window near a run end shrinks on both sides (to the
+    distance to that end), so a straight line is kept exactly, ends included.
     """
     x = np.asarray(x_m, dtype=float)
     v = np.asarray(values, dtype=float)
@@ -941,8 +995,12 @@ def smooth_profile(x_m: np.ndarray, values: np.ndarray, length_m: float) -> np.n
             out[a] = vs[0]
             continue
         integral = np.concatenate(([0.0], np.cumsum(0.5 * (vs[1:] + vs[:-1]) * np.diff(xs))))
-        lo = np.clip(xs - half, xs[0], xs[-1])
-        hi = np.clip(xs + half, xs[0], xs[-1])
+        if symmetric:
+            h = np.minimum(half, np.minimum(xs - xs[0], xs[-1] - xs))
+            lo, hi = xs - h, xs + h
+        else:
+            lo = np.clip(xs - half, xs[0], xs[-1])
+            hi = np.clip(xs + half, xs[0], xs[-1])
         width = hi - lo
         with np.errstate(invalid="ignore", divide="ignore"):
             mean = (np.interp(hi, xs, integral) - np.interp(lo, xs, integral)) / width
@@ -1000,24 +1058,51 @@ def binned_min(x_query: np.ndarray, x_data: np.ndarray, values: np.ndarray) -> n
     return _binned(x_query, x_data, values, "min")
 
 
-def laid_cable_cumulative(record_x_m, slack_pct, td_depth_m) -> Tuple[np.ndarray, np.ndarray]:
-    """``(x, cumulative cable length)`` at the records, in chainage order.
+def _station_means(x_m: np.ndarray, record_x_m: np.ndarray, *values: np.ndarray) -> List[np.ndarray]:
+    """Mean of each record array per station cell (nan where a cell holds no record)."""
+    x = np.asarray(x_m, dtype=float)
+    edges = 0.5 * (x[1:] + x[:-1])
+    cell = np.searchsorted(edges, record_x_m, side="right")
+    counts = np.bincount(cell, minlength=len(x)).astype(float)
+    out = []
+    for v in values:
+        sums = np.bincount(cell, weights=v, minlength=len(x))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            out.append(np.where(counts > 0, sums / np.maximum(counts, 1.0), np.nan))
+    return out
+
+
+def laid_cable_cumulative(x_m, record_x_m, slack_pct, td_depth_m,
+                          smoothing_m: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
+    """``(x, cumulative cable laid)`` on the profile stations within the records' extent.
 
     Each step lays ``(1 + slack / 100)`` times its length over the lay model's
-    own seabed (touchdown depths): bottom slack is relative to that seabed.
+    own seabed (touchdown depths), since bottom slack is relative to that
+    seabed. The records are averaged per station and the lay model's seabed
+    is smoothed like the sampled seabed: chords between neighbouring records
+    would turn touchdown-depth noise into cable length (5 cm of noise at
+    0.5 m record spacing adds 1 %), hiding a shortfall.
     """
+    x = np.asarray(x_m, dtype=float)
     rx = np.asarray(record_x_m, dtype=float)
     slack = np.asarray(slack_pct, dtype=float)
     depth = np.abs(np.asarray(td_depth_m, dtype=float))
     ok = np.isfinite(rx) & np.isfinite(slack) & np.isfinite(depth)
-    order = np.argsort(rx[ok], kind="stable")
-    rx, slack, depth = rx[ok][order], slack[ok][order], depth[ok][order]
-    if rx.size < 2:
-        return rx, np.zeros(rx.size)
-    step = np.hypot(np.diff(rx), np.diff(depth)) * (1.0 + 0.5 * (slack[1:] + slack[:-1]) / 100.0)
-    cumulative = np.concatenate(([0.0], np.cumsum(step)))
-    keep = np.concatenate((np.diff(rx) > 0, [True]))  # one value per position for interpolation
-    return rx[keep], cumulative[keep]
+    if ok.sum() < 2 or len(x) < 2:
+        return np.array([]), np.array([])
+    rx, slack, depth = rx[ok], slack[ok], depth[ok]
+    slack_s, depth_s = _station_means(x, rx, slack, depth)
+    has = np.isfinite(slack_s)
+    inside = (x >= rx.min() - 1e-9) & (x <= rx.max() + 1e-9)
+    inside |= has
+    xs = x[inside]
+    if xs.size < 2:
+        return np.array([]), np.array([])
+    # Stations between records (sparser records than stations) take the neighbours' values.
+    slack_s = np.interp(xs, x[has], slack_s[has])
+    depth_s = smooth_profile(xs, np.interp(xs, x[has], depth_s[has]), smoothing_m)
+    step = np.hypot(np.diff(xs), np.diff(depth_s)) * (1.0 + 0.5 * (slack_s[1:] + slack_s[:-1]) / 100.0)
+    return xs, np.concatenate(([0.0], np.cumsum(step)))
 
 
 def seabed_cumulative(x_m, depth_m) -> Tuple[np.ndarray, np.ndarray]:
@@ -1059,31 +1144,36 @@ def length_balance_pct(x_m, seabed_cum, plan_cum, cable_x, cable_cum, half_windo
 
 def taut_tension_n(x_m, seabed_elev_m, w_npm, x0: float, x1: float, cable_x, cable_cum,
                    mu: float, min_reach_m: float, max_reach_m: float,
-                   cap_n: float = 2.0e6) -> Tuple[float, float, float, bool]:
+                   cap_n: float = 2.0e6) -> Tuple[float, float, float, bool, float]:
     """Tension that makes the cable's resting shape use exactly the cable laid.
 
     The shortfall between ``x0`` and ``x1`` draws on cable within the friction
     reach ``H / (mu w)`` either side, so the window grows with the tension.
     Bisection on ``H`` (the rest shape shortens as ``H`` grows). Returns
-    ``(H, a, b, feasible)``: ``feasible`` is False when even taut at
-    ``cap_n`` the cable cannot cover the seabed.
+    ``(H, a, b, feasible, reach)``: ``feasible`` is False when even taut at
+    ``cap_n`` the cable cannot cover the seabed; ``reach`` is the friction
+    reach either side at ``H`` (within the min / max reach).
     """
     x = np.asarray(x_m, dtype=float)
     s = np.asarray(seabed_elev_m, dtype=float)
     w = np.asarray(w_npm, dtype=float)
     lo_x, hi_x = max(x[0], cable_x[0]), min(x[-1], cable_x[-1])
+    i0, i1 = int(np.searchsorted(x, x0, side="left")), int(np.searchsorted(x, x1, side="right"))
+    w_here = w[i0:i1]
+    w_bar = float(np.nanmean(w_here)) if np.isfinite(w_here).any() else float(np.nanmean(w))
+
+    def reach_at(h):
+        return float(np.clip(h / (mu * w_bar), min_reach_m, max_reach_m)) if mu > 0 and w_bar > 0 \
+            else max_reach_m
 
     def window(h):
-        sel = (x >= x0) & (x <= x1)
-        w_bar = float(np.nanmean(w[sel])) if np.isfinite(w[sel]).any() else float(np.nanmean(w))
-        reach = float(np.clip(h / (mu * w_bar), min_reach_m, max_reach_m)) if mu > 0 and w_bar > 0 \
-            else max_reach_m
+        reach = reach_at(h)
         return max(x0 - reach, lo_x), min(x1 + reach, hi_x)
 
     def excess(h):
         a, b = window(h)
-        sel = (x >= a) & (x <= b)
-        xs, ss, ws = x[sel], s[sel], w[sel]
+        j0, j1 = int(np.searchsorted(x, a, side="left")), int(np.searchsorted(x, b, side="right"))
+        xs, ss, ws = x[j0:j1], s[j0:j1], w[j0:j1]
         if xs.size < 3:
             return -1.0
         y = cable_rest_elevation(xs, ss, np.where(np.isfinite(ws), ws, np.nanmean(ws)) / h)
@@ -1091,17 +1181,19 @@ def taut_tension_n(x_m, seabed_elev_m, w_npm, x0: float, x1: float, cable_x, cab
         shape = float(np.sum(np.hypot(np.diff(xs), np.diff(y))[seg]))
         covered = float(np.sum(np.diff(xs)[seg]))
         span = xs[-1] - xs[0]
-        laid = float(np.interp(b, cable_x, cable_cum) - np.interp(a, cable_x, cable_cum))
+        # Cable laid over exactly the stations the shape spans (not the window
+        # [a, b], up to two stations longer): otherwise short windows look slack.
+        laid = float(np.interp(xs[-1], cable_x, cable_cum) - np.interp(xs[0], cable_x, cable_cum))
         laid *= covered / span if span > 0 else 1.0
         return shape - laid
 
     h_lo, h_hi = 10.0, float(cap_n)
     if excess(h_lo) <= 0:
         a, b = window(0.0)
-        return 0.0, a, b, True
+        return 0.0, a, b, True, reach_at(0.0)
     if excess(h_hi) > 0:
         a, b = window(h_hi)
-        return h_hi, a, b, False
+        return h_hi, a, b, False, reach_at(h_hi)
     for _ in range(28):
         mid = math.sqrt(h_lo * h_hi)
         if excess(mid) > 0:
@@ -1111,7 +1203,26 @@ def taut_tension_n(x_m, seabed_elev_m, w_npm, x0: float, x1: float, cable_x, cab
         if h_hi / h_lo < 1.01:
             break
     a, b = window(h_hi)
-    return h_hi, a, b, True
+    return h_hi, a, b, True, reach_at(h_hi)
+
+
+@dataclass
+class Support:
+    """Where the cable bears on the seabed at the end of a free span."""
+
+    i0: int                     # first / last contact station
+    i1: int
+    kp: float
+    reaction_kn: float          # concentrated seabed reaction on the cable
+    bend_radius_m: float        # nan when the bending stiffness is unknown
+    moment_knm: float           # bending moment EI / R (nan without EI)
+    tension_kn: float
+    mbr_m: float = math.nan
+
+    @property
+    def below_mbr(self) -> bool:
+        return bool(np.isfinite(self.bend_radius_m) and np.isfinite(self.mbr_m)
+                    and self.bend_radius_m < self.mbr_m)
 
 
 @dataclass
@@ -1125,6 +1236,16 @@ class Span:
     kp_max_gap: float
     tension_kn: float
     source: str = "lay model"
+    supports: Tuple[int, ...] = ()          # indices into SeabedModel.supports
+    min_bend_radius_m: float = math.nan     # tightest bend at its supports
+    max_reaction_kn: float = math.nan
+    mbr_m: float = math.nan
+    allowable_kn: float = math.nan          # highest tension with no reportable span here
+
+    @property
+    def below_mbr(self) -> bool:
+        return bool(np.isfinite(self.min_bend_radius_m) and np.isfinite(self.mbr_m)
+                    and self.min_bend_radius_m < self.mbr_m)
 
 
 @dataclass
@@ -1166,23 +1287,199 @@ def find_spans(x_m: np.ndarray, kp_km: np.ndarray, gap_m: np.ndarray, tension_kn
     return out
 
 
+def span_supports(x_m, seabed_elev_m, cable_elev_m, tension_kn, w_npm, ei_knm2, mbr_m,
+                  spans: Sequence[Span], kp_km=None, contact_tol_m: float = 0.01) -> List[Support]:
+    """The seabed contact at each end of each span: reaction, bend radius and moment.
+
+    The cable bears on the seabed over a contact stretch (cable within
+    ``contact_tol_m`` of it), entering at slope ``tan a_in`` and leaving at
+    ``tan a_out``. Under horizontal tension ``H`` the seabed pushes up with
+    ``P = H (tan a_in - tan a_out)``, plus the weight of the cable resting
+    there when spans hang both sides (a crest). Bending stiffness spreads the
+    turn ``a_in - a_out`` over the bending length ``lambda = sqrt(EI / H)``
+    either side (a tensioned beam over a point support: ``M = P lambda / 2``),
+    so the bend radius is ``R = (L_contact + 2 lambda) / turn``; at each end of
+    the contact the turn within ``lambda`` is also checked, so a rounded crest
+    sharper than that spread is caught. Each span's ``supports``, tightest
+    bend radius and largest reaction are filled in.
+    """
+    x = np.asarray(x_m, dtype=float)
+    s = np.asarray(seabed_elev_m, dtype=float)
+    y = np.asarray(cable_elev_m, dtype=float)
+    kp = x / 1000.0 if kp_km is None else np.asarray(kp_km, dtype=float)
+    n = len(x)
+    out: List[Support] = []
+    if n < 3 or not spans:
+        return out
+    with np.errstate(invalid="ignore"):
+        gap = y - s
+        contact = np.isfinite(gap) & (gap <= contact_tol_m)
+    contact_idx = np.nonzero(contact)[0]
+    if contact_idx.size == 0:
+        return out
+    dx = np.diff(x)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        slope = np.diff(y) / dx
+    angle = np.arctan(slope)
+    mid = 0.5 * (x[1:] + x[:-1])
+    finite_angle = np.isfinite(angle)
+    mid_ok, angle_ok = mid[finite_angle], angle[finite_angle]
+
+    def angle_at(xq):
+        return float(np.interp(xq, mid_ok, angle_ok)) if mid_ok.size else math.nan
+
+    run_of = np.full(n, -1, dtype=int)
+    runs = _runs(contact)
+    for r, (a, b) in enumerate(runs):
+        run_of[a:b + 1] = r
+    made: Dict[int, int] = {}
+
+    def support_for(run: int) -> Optional[int]:
+        if run in made:
+            return made[run]
+        c0, c1 = runs[run]
+        h_kn = float(np.nanmax(tension_kn[c0:c1 + 1])) if np.isfinite(tension_kn[c0:c1 + 1]).any() else math.nan
+        if not np.isfinite(h_kn) or h_kn <= 0:
+            made[run] = None
+            return None
+        h_n = h_kn * 1000.0
+        tan_in = slope[c0 - 1] if c0 > 0 else math.nan
+        tan_out = slope[c1] if c1 < n - 1 else math.nan
+        free_both = c0 > 0 and c1 < n - 1 and not contact[c0 - 1] and not contact[c1 + 1]
+        contact_len = float(x[c1] - x[c0])
+        wv = w_npm[c0:c1 + 1]
+        w_here = float(np.nanmin(wv)) if np.isfinite(wv).any() else 0.0
+        reaction = h_n * (tan_in - tan_out) + (w_here * contact_len if free_both else 0.0)
+        ev = ei_knm2[c0:c1 + 1]
+        ei = float(np.nanmin(ev)) if np.isfinite(ev).any() else math.nan
+        radius = moment = math.nan
+        if np.isfinite(ei) and ei > 0:
+            lam = math.sqrt(ei * 1000.0 / h_n)
+            step = float(np.nanmedian(dx[max(c0 - 1, 0):min(c1 + 1, n - 1)])) if n > 1 else 1.0
+            half = max(lam, 0.5 * step)
+            # The whole turn over the contact plus the bending length either side ...
+            turn = angle_at(x[c0] - half) - angle_at(x[c1] + half)
+            curvature = turn / (contact_len + 2.0 * lam) if turn > 0 else 0.0
+            # ... and the turn within the bending length at each end of the contact.
+            for xe in (x[c0], x[c1]):
+                local = angle_at(xe - half) - angle_at(xe + half)
+                if local > 0:
+                    curvature = max(curvature, local / (2.0 * lam))
+            radius = 1.0 / curvature if curvature > 0 else math.inf
+            moment = ei * curvature
+        mv = mbr_m[c0:c1 + 1]
+        mbr = float(np.nanmax(mv)) if np.isfinite(mv).any() else math.nan
+        made[run] = len(out)
+        out.append(Support(int(c0), int(c1), float(kp[(c0 + c1) // 2]),
+                           reaction / 1000.0 if np.isfinite(reaction) else math.nan,
+                           radius, moment, h_kn, mbr))
+        return made[run]
+
+    for span in spans:
+        ids = []
+        left = int(np.searchsorted(contact_idx, span.i0, side="right")) - 1
+        right = int(np.searchsorted(contact_idx, span.i1, side="left"))
+        for pos in (left, right):
+            if 0 <= pos < contact_idx.size:
+                index = support_for(int(run_of[contact_idx[pos]]))
+                if index is not None and index not in ids:
+                    ids.append(index)
+        span.supports = tuple(ids)
+        chosen = [out[i] for i in ids]
+        radii = [sp.bend_radius_m for sp in chosen if np.isfinite(sp.bend_radius_m) or sp.bend_radius_m == math.inf]
+        span.min_bend_radius_m = float(min(radii)) if radii else math.nan
+        reactions = [sp.reaction_kn for sp in chosen if np.isfinite(sp.reaction_kn)]
+        span.max_reaction_kn = float(max(reactions)) if reactions else math.nan
+        mbrs = [sp.mbr_m for sp in chosen if np.isfinite(sp.mbr_m)]
+        span.mbr_m = float(max(mbrs)) if mbrs else math.nan
+    return out
+
+
+def allowable_tension_kn(x_m, seabed_elev_m, w_npm, min_gap_m: float = 0.3, min_length_m: float = 5.0,
+                         core_m: float = 250.0, margin_m: float = 150.0, lo_kn: float = 0.1,
+                         hi_kn: float = 100.0, cancel: Optional[Callable[[], bool]] = None,
+                         progress: Optional[Callable] = None) -> np.ndarray:
+    """Per station, the highest bottom tension that rests the cable with no
+    reportable span (higher than ``min_gap_m`` and longer than ``min_length_m``).
+
+    Solved by bisection in windows of ``core_m`` (padded ``margin_m`` either
+    side so spans across the window edge form). ``hi_kn`` where no span forms
+    even at ``hi_kn``; 0 where one forms at ``lo_kn`` already (a hollow too
+    deep and wide for any tension). The answer for planning a re-lay or a
+    remedial survey: lay at or below it to keep spans within the limits.
+    """
+    x = np.asarray(x_m, dtype=float)
+    s = np.asarray(seabed_elev_m, dtype=float)
+    w = np.asarray(w_npm, dtype=float)
+    out = np.full(len(x), np.nan)
+    ok = np.isfinite(x) & np.isfinite(s)
+    if ok.sum() < 3:
+        return out
+    w = np.where(np.isfinite(w), w, np.nanmean(w) if np.isfinite(w).any() else np.nan)
+    if not np.isfinite(w).any():
+        return out
+    cores = np.arange(x[ok][0], x[ok][-1] + core_m, core_m)
+    total = max(len(cores) - 1, 1)
+    for k in range(len(cores) - 1):
+        _check_cancel(cancel)
+        if k % 10 == 0:
+            _report(progress, k / total)
+        c0, c1 = cores[k], cores[k + 1]
+        k0, k1 = int(np.searchsorted(x, c0, side="left")), int(np.searchsorted(x, c1, side="left"))
+        if k + 2 == len(cores):
+            k1 = len(x)
+        j0, j1 = int(np.searchsorted(x, c0 - margin_m, side="left")), int(np.searchsorted(x, c1 + margin_m))
+        xs, ss, ws = x[j0:j1], s[j0:j1], w[j0:j1]
+        if k1 - k0 < 1 or np.isfinite(ss).sum() < 3:
+            continue
+
+        def spans_at(h_kn, xs=xs, ss=ss, ws=ws, c0=c0, c1=c1):
+            y = cable_rest_elevation(xs, ss, ws / (h_kn * 1000.0))
+            found = find_spans(xs, xs / 1000.0, y - ss, np.full(len(xs), h_kn), min_gap_m, min_length_m)
+            return any(xs[sp.i1] >= c0 and xs[sp.i0] < c1 for sp in found)
+
+        if not spans_at(hi_kn):
+            out[k0:k1] = hi_kn
+            continue
+        if spans_at(lo_kn):
+            out[k0:k1] = 0.0
+            continue
+        lo, hi = lo_kn, hi_kn
+        while hi / lo > 1.05:
+            mid = math.sqrt(lo * hi)
+            if spans_at(mid):
+                hi = mid
+            else:
+                lo = mid
+        out[k0:k1] = lo
+    _report(progress, 1.0)
+    return out
+
+
+AUTO_FILTER_M = 2.0  # default seabed noise filter the cable rests on (m): clean for ~10 cm noise
+
+
 @dataclass
 class SeabedModel:
     """Profile stations with the modelled cable (arrays per station)."""
 
     x_m: np.ndarray               # chainage along the touchdown track
     kp_km: np.ndarray
-    seabed_depth_m: np.ndarray    # smoothed seabed the cable rests on, positive down
+    seabed_depth_m: np.ndarray    # filtered seabed the cable rests on, positive down
     cable_depth_m: np.ndarray     # positive down
     tension_kn: np.ndarray        # tension the cable rests at
     w_npm: np.ndarray
-    raw_depth_m: Optional[np.ndarray] = None
+    raw_depth_m: Optional[np.ndarray] = None       # as sampled
+    length_depth_m: Optional[np.ndarray] = None    # smoothed over the conformity length (seabed length)
     logged_tension_kn: Optional[np.ndarray] = None
     balance_pct: Optional[np.ndarray] = None
     reach_m: Optional[np.ndarray] = None
+    allowable_kn: Optional[np.ndarray] = None
     smoothing_m: float = 0.0
+    filter_m: float = 0.0
     mu: float = math.nan
     spans: List[Span] = field(default_factory=list)
+    supports: List[Support] = field(default_factory=list)
     shortfalls: List[Shortfall] = field(default_factory=list)
 
     @property
@@ -1193,8 +1490,8 @@ class SeabedModel:
 def auto_smoothing_m(records: "LayRecords", spacing_m: float) -> float:
     """Conformity length of the most flexible cable present (min over types);
     10 m when no bending stiffness is known. Never below 3 stations."""
-    lengths = [conformity_length_m(p.bending_stiffness_knm2, p.w_water_npm)
-               for p in {id(p): p for p in records.cable if p is not None}.values()]
+    _index, distinct = records._cable_index()
+    lengths = [conformity_length_m(p.bending_stiffness_knm2, p.w_water_npm) for p in distinct]
     lengths = [v for v in lengths if np.isfinite(v)]
     value = min(lengths) if lengths else 10.0
     return max(value, 3.0 * spacing_m)
@@ -1202,11 +1499,17 @@ def auto_smoothing_m(records: "LayRecords", spacing_m: float) -> float:
 
 def model_seabed(x_m, kp_km, seabed_depth_m, records: "LayRecords", record_x_m: np.ndarray,
                  zero_tension_kn: float = 0.05, min_gap_m: float = 0.3, min_length_m: float = 5.0,
-                 smoothing_m: Optional[float] = 0.0, friction: Optional[Dict[str, float]] = None) -> SeabedModel:
+                 smoothing_m: Optional[float] = 0.0, friction: Optional[Dict[str, float]] = None,
+                 filter_m: Optional[float] = 0.0, allowable: bool = False,
+                 progress: Optional[Callable] = None,
+                 cancel: Optional[Callable[[], bool]] = None) -> SeabedModel:
     """Rest the cable on the seabed (see the module docstring).
 
-    * The seabed is smoothed over ``smoothing_m`` (None = the cable's
-      conformity length, :func:`auto_smoothing_m`).
+    * Two seabeds come from the sampled one. The cable rests on it filtered
+      over ``filter_m`` (None = :data:`AUTO_FILTER_M`), which removes
+      sounding noise but keeps the crests that hold the cable up. Seabed
+      *length* uses it smoothed over ``smoothing_m`` (None = the cable's
+      conformity length, :func:`auto_smoothing_m`), since noise adds length.
     * Each station rests at the highest logged bottom tension of the records
       depositing cable in it, with the lightest cable there (both
       conservative: more spans).
@@ -1215,10 +1518,17 @@ def model_seabed(x_m, kp_km, seabed_depth_m, records: "LayRecords", record_x_m: 
       against the seabed within the friction reach ``H / (mu w)``; where it
       is short, the tension that makes it cover the seabed
       (:func:`taut_tension_n`) is applied over that reach if higher.
+    * Each span's supports get a seabed reaction and bend radius
+      (:func:`span_supports`); with ``allowable`` the highest tension that
+      keeps spans within the reporting limits is found along the route.
+
+    ``progress(fraction, text)`` reports 0..1; ``cancel()`` is polled and
+    raises :class:`Cancelled`.
     """
     x = np.asarray(x_m, dtype=float)
     raw = np.asarray(seabed_depth_m, dtype=float)
     rx = np.asarray(record_x_m, dtype=float)
+    _report(progress, 0.0, "Preparing the seabed")
     spacing = float(np.nanmedian(np.diff(x))) if len(x) > 1 else 1.0
     step = float(np.nanmax(np.diff(x))) if len(x) > 1 else 0.0
     with np.errstate(invalid="ignore"):
@@ -1227,21 +1537,30 @@ def model_seabed(x_m, kp_km, seabed_depth_m, records: "LayRecords", record_x_m: 
     logged = binned_max(x, rx, records.get("bottom_tension"))
     w = binned_min(x, rx, records.cable_array("w_water_npm"))
     npts = binned_min(x, rx, records.cable_array("npts_kn"))
+    ei = binned_min(x, rx, records.cable_array("bending_stiffness_knm2"))
+    mbr = binned_max(x, rx, records.cable_array("mbr_m"))
     if smoothing_m is None:
         smoothing_m = auto_smoothing_m(records, spacing)
-    depth = smooth_profile(x, raw, smoothing_m)
+    if filter_m is None:
+        filter_m = AUTO_FILTER_M
+    length_depth = smooth_profile(x, raw, smoothing_m)
+    depth = smooth_profile(x, raw, filter_m)
     tension = np.where(np.isfinite(logged), logged, 0.0)
     source = np.where(tension > zero_tension_kn, 1, 0)
+    w_fill = np.where(np.isfinite(w), w, np.nanmean(w) if np.isfinite(w).any() else np.nan)
     model = SeabedModel(x, np.asarray(kp_km, dtype=float), depth, depth.copy(), tension, w,
-                        raw_depth_m=raw, logged_tension_kn=logged, smoothing_m=float(smoothing_m or 0.0))
+                        raw_depth_m=raw, length_depth_m=length_depth, logged_tension_kn=logged,
+                        smoothing_m=float(smoothing_m or 0.0), filter_m=float(filter_m or 0.0))
+    _check_cancel(cancel)
     if friction and records.has("bottom_slack", "td_depth") and np.isfinite(w).any():
+        _report(progress, 0.05, "Balancing laid cable against the seabed")
         mu = float(friction.get("mu", 0.5))
         max_reach = float(friction.get("max_reach_m", 1000.0))
         tolerance = float(friction.get("shortfall_pct", 0.5))
         min_reach = max(float(smoothing_m or 0.0), 3.0 * spacing)
-        cable_x, cable_cum = laid_cable_cumulative(rx, records.get("bottom_slack"), records.get("td_depth"))
-        seabed_cum, plan_cum = seabed_cumulative(x, depth)
-        w_fill = np.where(np.isfinite(w), w, np.nanmean(w))
+        cable_x, cable_cum = laid_cable_cumulative(x, rx, records.get("bottom_slack"), records.get("td_depth"),
+                                                   float(smoothing_m or 0.0))
+        seabed_cum, plan_cum = seabed_cumulative(x, length_depth)
         with np.errstate(invalid="ignore", divide="ignore"):
             reach = np.clip(tension * 1000.0 / (mu * w_fill), min_reach, max_reach) if mu > 0 \
                 else np.full(len(x), max_reach)
@@ -1260,19 +1579,24 @@ def model_seabed(x_m, kp_km, seabed_depth_m, records: "LayRecords", record_x_m: 
                 stop = min(max(stop, start), b)
                 runs.append((start, stop))
                 start = stop + 1
-        for a, b in runs:
-            h, wa, wb, feasible = taut_tension_n(x, -depth, w_fill, x[a], x[b], cable_x, cable_cum,
-                                                 mu, min_reach, max_reach)
+        for k, (a, b) in enumerate(runs):
+            _check_cancel(cancel)
+            _report(progress, 0.1 + 0.45 * k / len(runs), f"Pulling short stretches taut ({k + 1} of {len(runs)})")
+            h, wa, wb, feasible, reach_h = taut_tension_n(x, -length_depth, w_fill, x[a], x[b], cable_x, cable_cum,
+                                                          mu, min_reach, max_reach)
             if h / 1000.0 <= zero_tension_kn:
                 continue  # friction reach brings enough cable (or barely any tension): it conforms
             sel = (x >= wa) & (x <= wb)
             h_kn = h / 1000.0
-            raise_ = sel & (h_kn > tension)
-            tension = np.where(raise_, h_kn, tension)
+            # Friction takes mu w per metre off the tension away from the stretch.
+            outside = np.where(x < x[a], x[a] - x, np.where(x > x[b], x - x[b], 0.0))
+            pulled = h_kn - mu * w_fill * outside / 1000.0
+            raise_ = sel & (pulled > tension)
+            tension = np.where(raise_, pulled, tension)
             source = np.where(raise_, 2, source)
             item = Shortfall(
                 float(model.kp_km[a]), float(model.kp_km[b]), float(np.nanmin(balance[a:b + 1])), h_kn,
-                float(h / (mu * float(np.nanmean(w_fill[a:b + 1])))) if mu > 0 else max_reach, feasible,
+                reach_h, feasible,
                 float(np.nanmin(npts[a:b + 1])) if np.isfinite(npts[a:b + 1]).any() else math.nan)
             last = model.shortfalls[-1] if model.shortfalls else None
             if last is not None and x[a] <= window_end:
@@ -1287,13 +1611,33 @@ def model_seabed(x_m, kp_km, seabed_depth_m, records: "LayRecords", record_x_m: 
             else:
                 model.shortfalls.append(item)
             window_end = max(window_end, wb)
+    _check_cancel(cancel)
+    _report(progress, 0.55, "Resting the cable on the seabed")
     with np.errstate(divide="ignore", invalid="ignore"):
         curvature = np.where((tension > zero_tension_kn) & np.isfinite(w) & (w > 0),
                              w / (tension * 1000.0), np.inf)
     model.cable_depth_m = -cable_rest_elevation(x, -depth, curvature)
     model.tension_kn = tension
     model.spans = find_spans(x, model.kp_km, model.gap_m, tension, min_gap_m, min_length_m, source)
+    _report(progress, 0.62, "Bend radius and seabed reaction at span supports")
+    model.supports = span_supports(x, -depth, -model.cable_depth_m, tension, w_fill, ei, mbr, model.spans,
+                                   model.kp_km)
+    if allowable:
+        model.allowable_kn = allowable_tension_kn(
+            x, -depth, w_fill, min_gap_m, min_length_m, cancel=cancel,
+            progress=lambda f, *_: _report(progress, 0.65 + 0.35 * f,
+                                           "Finding the tension that keeps spans within limits"))
+        for span in model.spans:
+            values = model.allowable_kn[span.i0:span.i1 + 1]
+            span.allowable_kn = float(np.nanmin(values)) if np.isfinite(values).any() else math.nan
+    _report(progress, 1.0, "Seabed model done")
     return model
+
+
+def _radius_text(radius: float) -> str:
+    if radius == math.inf or radius > 1000.0:
+        return "over 1000 m"
+    return f"{radius:.1f} m"
 
 
 def seabed_span_findings(model: SeabedModel, params) -> List[RangeFinding]:
@@ -1301,14 +1645,30 @@ def seabed_span_findings(model: SeabedModel, params) -> List[RangeFinding]:
     red_length = float(params.get("red_length_m", 50.0))
     out = []
     for span in model.spans:
-        red = span.max_gap_m >= red_gap or span.length_m >= red_length
+        red = span.max_gap_m >= red_gap or span.length_m >= red_length or span.below_mbr
+        parts = [f"Modelled suspension {span.length_m:.0f} m long, up to {span.max_gap_m:.1f} m above the seabed "
+                 f"at {_fmt(span.tension_kn, 'kN', 2)} ({span.source})"]
+        if np.isfinite(span.min_bend_radius_m) or span.min_bend_radius_m == math.inf:
+            text = f"bend radius at its supports {_radius_text(span.min_bend_radius_m)}"
+            if span.below_mbr:
+                text += f", BELOW the {span.mbr_m:.1f} m MBR"
+            elif np.isfinite(span.mbr_m):
+                text += f" (MBR {span.mbr_m:.1f} m)"
+            parts.append(text)
+        if np.isfinite(span.max_reaction_kn):
+            parts.append(f"seabed reaction up to {span.max_reaction_kn:.2f} kN")
+        if np.isfinite(span.allowable_kn):
+            parts.append("spans here even at the lowest tension" if span.allowable_kn <= 0
+                         else f"no reportable span here below about {span.allowable_kn:.2f} kN")
+        extra = {"length_m": span.length_m, "kp_max_gap": span.kp_max_gap}
+        for key in ("min_bend_radius_m", "max_reaction_kn", "allowable_kn"):
+            value = getattr(span, key)
+            if np.isfinite(value):
+                extra[key] = float(value)
         out.append(RangeFinding(
             check_id="suspension", severity=Severity.ERROR if red else Severity.WARNING,
             kp_start=min(span.kp_start, span.kp_end), kp_end=max(span.kp_start, span.kp_end),
-            message=(f"Modelled suspension {span.length_m:.0f} m long, up to {span.max_gap_m:.1f} m "
-                     f"above the seabed at {_fmt(span.tension_kn, 'kN', 2)} ({span.source})"),
-            value=span.max_gap_m, threshold=red_gap, unit="m",
-            extra={"length_m": span.length_m, "kp_max_gap": span.kp_max_gap}))
+            message="; ".join(parts), value=span.max_gap_m, threshold=red_gap, unit="m", extra=extra))
     return out
 
 
@@ -1319,7 +1679,8 @@ def length_findings(model: SeabedModel, params, zero_tension_kn: float = 0.05) -
         over_npts = np.isfinite(item.npts_kn) and item.tension_kn > item.npts_kn
         severity = Severity.ERROR if (not item.feasible or over_npts) else Severity.WARNING
         if not item.feasible:
-            detail = "the cable cannot cover it even when taut: check the data"
+            detail = ("even fully taut the laid cable cannot cover it: check the bottom slack, the touchdown "
+                      "depths and the bathymetry datum")
         else:
             detail = (f"pulled taut to about {item.tension_kn:.2f} kN, drawing on cable within "
                       f"{item.reach_m:.0f} m by friction" + (" (above NPTS)" if over_npts else ""))
@@ -1345,14 +1706,15 @@ def length_findings(model: SeabedModel, params, zero_tension_kn: float = 0.05) -
 
 SEABED_CHECKS: Tuple[CheckDef, ...] = (
     CheckDef("suspension", "Suspensions (seabed model)",
-             "Rests the cable on the seabed at the logged bottom tension (raised where the laid cable "
-             "is short of the seabed, when the length check runs) with the cable's submerged weight; "
-             "flags where it spans clear of the seabed.",
+             "Rests the cable on the seabed at the logged bottom tension (raised where the laid cable is "
+             "short of the seabed, when the length check runs) with the cable's submerged weight, and flags "
+             "where it spans clear of the seabed. Each span reports the bend radius and seabed reaction at "
+             "its supports (red below the MBR) and the highest tension that would keep spans within the "
+             "limits there.",
              (ParamSpec("min_gap_m", "Report spans higher than (m)", "float", 0.3, minimum=0.0),
               ParamSpec("min_length_m", "...and longer than (m)", "float", 5.0, minimum=0.0),
               ParamSpec("red_gap_m", "Red when higher than (m)", "float", 1.0, minimum=0.0),
-              ParamSpec("red_length_m", "...or longer than (m)", "float", 50.0, minimum=0.0),
-              ParamSpec("zero_tension_kn", "Cable conforms below tension (kN)", "float", 0.05, minimum=0.0)),
+              ParamSpec("red_length_m", "...or longer than (m)", "float", 50.0, minimum=0.0)),
              ("bottom_tension",), ("weight_water_kg_m",), needs_seabed=True),
     CheckDef("length_balance", "Cable length vs seabed (friction)",
              "Laid cable (bottom slack over the lay model's seabed) against the sampled seabed within the "
@@ -1395,6 +1757,7 @@ def missing_inputs(check: CheckDef, records: LayRecords) -> List[str]:
 
 _CABLE_LABELS = {"weight_water_kg_m": "weight in water", "npts_kn": "NPTS", "nots_kn": "NOTS",
                  "ntts_kn": "NTTS", "cbl_kn": "CBL"}
+CABLE_LABELS = _CABLE_LABELS  # cable library attribute -> what the user calls it
 
 
 def run_record_checks(records: LayRecords, enabled: Dict[str, Dict[str, object]]) -> Tuple[List[RangeFinding], Dict[str, str]]:
@@ -1418,12 +1781,21 @@ def run_record_checks(records: LayRecords, enabled: Dict[str, Dict[str, object]]
 # ---------------------------------------------------------------------------
 # Track: chainage along the touchdown positions and KP mapping
 # ---------------------------------------------------------------------------
-def track_vertices(records: LayRecords, spacing_m: float = 2.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+TRACK_SMOOTHING_M = 25.0  # touchdown positions averaged over this much KP before sampling the seabed
+
+
+def track_vertices(records: LayRecords, spacing_m: float = 2.0,
+                   smoothing_m: float = TRACK_SMOOTHING_M) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """``(lon, lat, kp_km)`` of a touchdown track ordered by KP.
 
     Records are binned every ``spacing_m`` of KP and each bin's median
     position kept, so stops and back-and-forth jitter do not zig-zag the
-    track. Raises ValueError without positions.
+    track. The positions are then averaged over ``smoothing_m`` of KP
+    (symmetric windows: a straight track is unchanged, ends included):
+    lateral jitter of the lay model's touchdown across a side slope would
+    otherwise be sampled as seabed relief (1-2 m of jitter on a 10 degree
+    slope adds false spans and bend radii below the MBR). Raises ValueError
+    without positions.
     """
     if records.lat is None or records.lon is None:
         raise ValueError("The layer has no touchdown positions.")
@@ -1431,18 +1803,64 @@ def track_vertices(records: LayRecords, spacing_m: float = 2.0) -> Tuple[np.ndar
     if ok.sum() < 2:
         raise ValueError("Fewer than two records with a KP and a position.")
     kp = records.kp[ok]
-    lat = records.lat[ok]
-    lon = records.lon[ok]
     key = np.floor(kp * 1000.0 / max(spacing_m, 0.01)).astype(np.int64)
+    lon, lat, kp = bin_medians(key, records.lon[ok], records.lat[ok], kp)
+    if smoothing_m and smoothing_m > 0 and len(kp) > 2:
+        x = kp * 1000.0
+        lon = smooth_profile(x, lon, smoothing_m, symmetric=True)
+        lat = smooth_profile(x, lat, smoothing_m, symmetric=True)
+    return lon, lat, kp
+
+
+def record_spacing_m(records: LayRecords) -> float:
+    """Median KP step between neighbouring touchdown records (m), nan when unknown."""
+    kp = np.sort(records.kp[np.isfinite(records.kp)])
+    steps = np.diff(kp) * 1000.0
+    steps = steps[steps > 1e-6]
+    return float(np.median(steps)) if steps.size else math.nan
+
+
+def contour_interval_m(depths) -> float:
+    """The contour interval of a crossing profile: median step between its distinct levels."""
+    d = np.asarray([v for v in depths if v is not None], dtype=float)
+    d = np.unique(np.round(d[np.isfinite(d)], 3))
+    steps = np.diff(d)
+    steps = steps[steps > 1e-6]
+    return float(np.median(steps)) if steps.size else math.nan
+
+
+def bin_medians(key: np.ndarray, *arrays: np.ndarray) -> List[np.ndarray]:
+    """Median of each array per distinct integer ``key``, in ascending key order."""
+    key = np.asarray(key)
+    if key.size == 0:
+        return [np.array([]) for _ in arrays]
     order = np.argsort(key, kind="stable")
-    key, kp, lat, lon = key[order], kp[order], lat[order], lon[order]
-    starts = np.concatenate(([0], np.nonzero(np.diff(key))[0] + 1, [len(key)]))
-    out_lon, out_lat, out_kp = [], [], []
-    for a, b in zip(starts[:-1], starts[1:]):
-        out_lon.append(float(np.median(lon[a:b])))
-        out_lat.append(float(np.median(lat[a:b])))
-        out_kp.append(float(np.median(kp[a:b])))
-    return np.asarray(out_lon), np.asarray(out_lat), np.asarray(out_kp)
+    k = key[order]
+    starts = np.concatenate(([0], np.nonzero(np.diff(k))[0] + 1))
+    counts = np.diff(np.concatenate((starts, [len(k)])))
+    lo, hi = starts + (counts - 1) // 2, starts + counts // 2
+    out = []
+    for values in arrays:
+        v = np.asarray(values, dtype=float)[order]
+        v = v[np.lexsort((v, k))]  # sorted within each key; groups stay in place
+        out.append(0.5 * (v[lo] + v[hi]))
+    return out
+
+
+def lay_model_profile(records: LayRecords, step_m: float,
+                      window: Optional[Tuple[float, float]] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(x_m, kp_km, depth_m)`` of the lay model's own seabed: touchdown
+    depths binned every ``step_m`` of KP (median per bin)."""
+    kp = records.kp
+    depth = np.abs(records.get("td_depth"))
+    ok = np.isfinite(kp) & np.isfinite(depth)
+    if window is not None:
+        ok &= (kp >= window[0]) & (kp <= window[1])
+    if ok.sum() < 2:
+        return np.array([]), np.array([]), np.array([])
+    key = np.floor(kp[ok] * 1000.0 / max(float(step_m), 0.01)).astype(np.int64)
+    kp_bins, depth_bins = bin_medians(key, kp[ok], depth[ok])
+    return kp_bins * 1000.0, kp_bins, depth_bins
 
 
 def chainage_to_kp(vertex_chainage_m: np.ndarray, vertex_kp_km: np.ndarray, chainage_m) -> np.ndarray:

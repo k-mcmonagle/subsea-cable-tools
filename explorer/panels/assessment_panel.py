@@ -5,15 +5,19 @@ The tab maps the active layer's columns onto the roles the checks need
 (auto-detected, editable), picks the cable type from the cable library and,
 optionally, a seabed source: the lay model's own touchdown depths, or a
 raster / contour bathymetry sampled along the touchdown track with the
-Depth Profile engine (in a background task). Findings are KP ranges listed
-in a table; selecting one highlights it on the map and zooms the Seabed
-Profile dock. The method is in ``docs/LAY_ASSESSMENT.md``; the maths lives
-in :mod:`laydata.lay_assessment`.
+Depth Profile engine. A run reads the settings on the GUI thread, then does
+the work (cable makeup, record checks, seabed sampling and model) in a
+background task with progress in the tab and a Cancel button; the tab stays
+usable meanwhile, and a result whose settings changed is marked out of date.
+Findings are KP ranges listed in a table; selecting one highlights it on the
+map and zooms the Seabed Profile dock. The method is in
+``docs/LAY_ASSESSMENT.md``; the maths lives in :mod:`laydata.lay_assessment`.
 """
 
 from __future__ import annotations
 
 import csv
+import html
 import json
 import math
 from typing import Dict, List, Optional, Tuple
@@ -32,13 +36,14 @@ from qgis.PyQt.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
-    QProgressDialog,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSpinBox,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -79,8 +84,8 @@ from ...qgis_compat import (
 
 _SETTINGS = "SubseaCableTools/CableLayExplorer/Assessment"
 _USER_ROLE = getattr(getattr(Qt, "ItemDataRole", Qt), "UserRole")
-_WINDOW_MODAL = getattr(getattr(Qt, "WindowModality", Qt), "WindowModal")
 _VERTICAL = getattr(getattr(Qt, "Orientation", Qt), "Vertical")
+_RICH_TEXT = getattr(getattr(Qt, "TextFormat", Qt), "RichText")
 
 SEABED_NONE = "none"
 SEABED_LAY_MODEL = "lay_model"
@@ -107,22 +112,162 @@ _HOW_TEXT = {"mapped": "project mapping", "name": "library name", "alias": "libr
              "generic": "generic type", "ambiguous": "AMBIGUOUS: map it", "unknown": "not in library",
              "none": ""}
 _SEABED_IDS = ("suspension", "length_balance")
+_ZERO_TENSION_DEFAULT = 0.05
+CONTOUR_LENGTH_LIMIT_M = 0.5   # coarser contours understate seabed length too much for the length check
+COARSE_GRID_M = 1.0            # coarser grids blunt crests: bend radii at supports read high
+_AUTO_STEP_RANGE = (0.5, 50.0)  # lay-model seabed bin: the touchdown record spacing, within this
 
 
-def seabed_job(records, enabled, x, kp, depth, record_x, smoothing):
+def _metres(value: float) -> str:
+    return f"{value:.2g} m" if value < 10 else f"{value:.0f} m"
+
+
+def seabed_sampling_notes(mode, x_m, depth_m, kp_km, cells=None, sources=None, messages=(),
+                          auto: bool = True) -> Tuple[List[str], Optional[str]]:
+    """``(notes, length_check_skip_reason)`` on how the seabed was sampled.
+
+    Says what spacing was used and what the source cannot resolve: a grid
+    coarser than the cable's bending scale, contours (crests cut to the last
+    contour; too coarse for the length check above
+    :data:`CONTOUR_LENGTH_LIMIT_M`), rasters meeting along the route (a
+    vertical datum step there reads as relief), plus the Depth Profile
+    engine's own messages (spacing raised on long routes, partial coverage).
+    """
+    x = np.asarray(x_m, dtype=float)
+    depth = np.asarray(depth_m, dtype=float)
+    kp = np.asarray(kp_km, dtype=float)
+    notes: List[str] = []
+    skip = None
+    finite = np.isfinite(depth) & np.isfinite(x)
+    steps = np.diff(x[finite])
+    steps = steps[steps > 1e-6]
+    spacing = float(np.median(steps)) if steps.size else math.nan
+    if mode == SEABED_RASTER:
+        cell = np.array([c for c in (cells or []) if c is not None and np.isfinite(c) and c > 0], dtype=float)
+        if cell.size:
+            lo, hi = float(cell.min()), float(cell.max())
+            cell_text = _metres(lo) if hi - lo < 0.01 * hi else f"{_metres(lo)} to {_metres(hi)}"
+            if auto:
+                notes.append(f"Seabed sampled at the grid's cell size ({cell_text}).")
+            else:
+                notes.append(f"Seabed sampled every {_metres(spacing)} (grid cells {cell_text}).")
+                if np.isfinite(spacing) and spacing > 1.5 * lo:
+                    notes.append("Sampling coarser than the grid misses crests and shortens the seabed: "
+                                 "set Sample every to auto.")
+            if hi > COARSE_GRID_M * 1.05:  # a nominal 1 m grid in degrees reads 1.00x m
+                notes.append(f"Grid cells up to {_metres(hi)}: crests are blunted, so the bend radius at span "
+                             "supports reads high and can hide an MBR breach.")
+        if sources is not None and len(sources) == len(depth):
+            change = [i for i in range(1, len(sources)) if sources[i] is not None and sources[i - 1] is not None
+                      and sources[i] != sources[i - 1]]
+            if change:
+                where = ", ".join(f"{kp[i]:.3f}" for i in change[:5]) + (" …" if len(change) > 5 else "")
+                notes.append(f"The seabed comes from {len({s for s in sources if s})} rasters, meeting at KP "
+                             f"{where}: a vertical datum step where they meet reads as relief; check there.")
+    elif mode == SEABED_CONTOURS:
+        interval = la.contour_interval_m(depth)
+        if np.isfinite(interval):
+            notes.append(f"Contours every {_metres(interval)}: between crossings the seabed is a straight line, so "
+                         "crests are cut to the last contour and span heights, bend radii and seabed length are "
+                         "underestimated. Grid them, or use an MBES raster, for a firmer answer.")
+            if interval > CONTOUR_LENGTH_LIMIT_M + 1e-9:
+                skip = (f"contours every {_metres(interval)} understate the seabed length; grid them or use a "
+                        "raster")
+    elif mode == SEABED_LAY_MODEL and np.isfinite(spacing):
+        notes.append(f"Lay model seabed binned every {_metres(spacing)}"
+                     + (" (the touchdown record spacing)." if auto else "."))
+    for message in messages or ():
+        text = message[0] if isinstance(message, (tuple, list)) else str(message)
+        if text and text not in notes:
+            notes.append(str(text))
+    return notes, skip
+_INVALID_STYLE = "QLineEdit { border: 1px solid #d32f2f; }"
+_STALE_STYLE = "QLabel { background: #fff3cd; color: #6d4c00; padding: 3px; border-radius: 2px; }"
+_OPEN, _CLOSED = "▾", "▸"
+
+
+def seabed_job(records, enabled, x, kp, depth, record_x, smoothing, filter_m=None,
+               zero_tension_kn=_ZERO_TENSION_DEFAULT, progress=None, cancel=None):
     """Seabed model and findings (worker safe: numpy only, no widgets)."""
     if len(x) < 3 or not np.isfinite(depth).any():
         return None, [], {cid: "too few seabed samples" for cid in _SEABED_IDS if cid in enabled}
     susp = enabled.get("suspension") or la.default_params(la.check_by_id("suspension"))
     friction = enabled.get("length_balance")
-    model = la.model_seabed(x, kp, depth, records, record_x, susp["zero_tension_kn"], susp["min_gap_m"],
-                            susp["min_length_m"], smoothing_m=smoothing, friction=friction)
+    model = la.model_seabed(x, kp, depth, records, record_x, zero_tension_kn, susp["min_gap_m"],
+                            susp["min_length_m"], smoothing_m=smoothing, friction=friction, filter_m=filter_m,
+                            allowable="suspension" in enabled, progress=progress, cancel=cancel)
     findings: List[la.RangeFinding] = []
     if "suspension" in enabled:
         findings.extend(la.seabed_span_findings(model, enabled["suspension"]))
     if friction is not None:
-        findings.extend(la.length_findings(model, friction, susp["zero_tension_kn"]))
+        findings.extend(la.length_findings(model, friction, zero_tension_kn))
     return model, findings, {}
+
+
+def run_job(job: Dict, cancel=None, progress=None) -> Dict:
+    """The whole assessment from settings read on the GUI thread (worker safe).
+
+    ``job`` holds the records, makeup, resolver, enabled checks and the seabed
+    inputs (a prepared Depth Profile request for rasters / contours).
+    """
+    records = job["records"]
+    la._report(progress, 0.0, "Assigning cable types")
+    la.apply_makeup(records, job["makeup"], job["resolver"])
+    la._check_cancel(cancel)
+    la._report(progress, 0.04, "Running record checks")
+    findings, skipped = la.run_record_checks(records, job["enabled"])
+    skipped.update(job["skipped"])
+    seabed = dict(job["seabed"])
+    for cid in list(seabed):
+        missing = la.missing_inputs(la.check_by_id(cid), records)
+        if missing:
+            skipped[cid] = "needs " + ", ".join(missing)
+            seabed.pop(cid)
+    model = None
+    notes: List[str] = []
+    if seabed:
+        la._check_cancel(cancel)
+        mode = job["mode"]
+        auto = job["interval"] is None
+        base = 0.08
+        if mode == SEABED_LAY_MODEL:
+            step = job["interval"]
+            if step is None:
+                spacing = la.record_spacing_m(records)
+                step = float(np.clip(spacing, *_AUTO_STEP_RANGE)) if np.isfinite(spacing) else 2.0
+            x, kp, depth = la.lay_model_profile(records, step, job["window"])
+            record_x = records.kp * 1000.0
+            notes, _skip = seabed_sampling_notes(mode, x, depth, kp, auto=auto)
+        else:
+            request, vertex_chainage, vertex_kp = job["request"]
+            result = dpc.run_profile(request, cancel=cancel,
+                                     progress=lambda f: la._report(progress, base + 0.5 * f, "Sampling the seabed"))
+            base = 0.6
+            x = np.asarray(result.kp_values, dtype=float) * 1000.0
+            depth = np.array([np.nan if v is None else float(v) for v in result.depth_values])
+            if result.status and not np.isfinite(depth).any():
+                for cid in seabed:
+                    skipped[cid] = result.status
+                seabed = {}
+            kp = la.chainage_to_kp(vertex_chainage, vertex_kp, x)
+            record_x = la.kp_to_chainage(vertex_chainage, vertex_kp, records.kp)
+            with np.errstate(invalid="ignore"):  # interp clamps; records off the track are not on it
+                record_x[(records.kp < vertex_kp[0]) | (records.kp > vertex_kp[-1])] = np.nan
+            notes, skip = seabed_sampling_notes(
+                mode, x, depth, kp, cells=list(result.depth_cell_m or []) or None,
+                sources=list(result.depth_source_ids or []) or None, messages=result.messages, auto=auto)
+            if skip and "length_balance" in seabed:
+                skipped["length_balance"] = skip
+                seabed.pop("length_balance")
+        if seabed:
+            model, more, seabed_skipped = seabed_job(
+                records, seabed, x, kp, depth, record_x, job["smoothing"], job["filter"], job["zero_tension"],
+                progress=lambda f, text=None: la._report(progress, base + (1.0 - base) * f, text), cancel=cancel)
+            findings = findings + more
+            skipped.update(seabed_skipped)
+    la._report(progress, 1.0, "Done")
+    return {"records": records, "findings": findings, "skipped": skipped, "model": model,
+            "resolution": job["resolution"], "notes": notes}
 
 
 class AssessmentPanel(QWidget):
@@ -130,19 +275,21 @@ class AssessmentPanel(QWidget):
         super().__init__(parent)
         self.controller = controller
         self.persist = True        # False in tests: never touch the user's QSettings
-        self.synchronous = False   # True in tests: sample the seabed on this thread
+        self.synchronous = False   # True in tests: run on this thread
         self._dataset = None
         self._records: Optional[la.LayRecords] = None
         self._findings: List[la.RangeFinding] = []
         self._model: Optional[la.SeabedModel] = None
         self._track: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None
         self._task = None
-        self._progress = None
-        self._pending = None
+        self._dropped_tasks: List[AssessmentTask] = []
+        self._run_id = 0
+        self._result_signature: Optional[str] = None
         self._library_dialog = None
         self._map_layer_id: Optional[str] = None
         self._role_combos: Dict[str, QComboBox] = {}
-        self._check_boxes: Dict[str, QCheckBox] = {}
+        self._check_boxes: Dict[str, QGroupBox] = {}
+        self._ready_labels: Dict[str, QLabel] = {}
         self._editors: Dict[str, Dict[str, QLineEdit]] = {}
         self._labels = {check.check_id: check.label for check in la.all_checks()}
         self._library_rows: List[Dict] = []
@@ -151,6 +298,8 @@ class AssessmentPanel(QWidget):
         self._makeup_cache: Dict[Tuple, la.KpMakeup] = {}
         self._mapping_combos: Dict[str, QComboBox] = {}
         self._notes: List[str] = []
+        self._numeric: Dict[QLineEdit, Tuple[bool, Optional[float]]] = {}
+        self._building = True
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -168,9 +317,11 @@ class AssessmentPanel(QWidget):
                        "Results are KP ranges: select one to see it on the map and the Seabed Profile.")
         intro.setWordWrap(True)
         config_layout.addWidget(intro)
+        config_layout.addWidget(self._build_columns_group())
         config_layout.addWidget(self._build_cable_group())
         config_layout.addWidget(self._build_seabed_group())
-        config_layout.addWidget(self._build_columns_group())
+        checks_label = QLabel("<b>Checks</b> (tick to run; ▸ for thresholds)")
+        config_layout.addWidget(checks_label)
         for check in la.all_checks():
             config_layout.addWidget(self._build_check_group(check))
         config_layout.addStretch(1)
@@ -182,6 +333,7 @@ class AssessmentPanel(QWidget):
         results_layout.setContentsMargins(0, 0, 0, 0)
         buttons = QHBoxLayout()
         self.run_button = QPushButton("Run assessment")
+        self.run_button.setToolTip("Run the checks. They run in the background: keep working, or Cancel.")
         self.run_button.clicked.connect(self.run)
         buttons.addWidget(self.run_button)
         self.profile_button = QPushButton("Seabed profile")
@@ -196,9 +348,35 @@ class AssessmentPanel(QWidget):
         self.csv_button.clicked.connect(self.export_csv)
         buttons.addWidget(self.csv_button)
         results_layout.addLayout(buttons)
+        progress_row = QHBoxLayout()
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setTextVisible(True)
+        progress_row.addWidget(self.progress_bar, 1)
+        self.stage_label = QLabel("")
+        progress_row.addWidget(self.stage_label, 2)
+        results_layout.addLayout(progress_row)
+        self.progress_bar.hide()
+        self.stage_label.hide()
+        self.stale_label = QLabel("Settings changed since these results: Run assessment to update them.")
+        self.stale_label.setStyleSheet(_STALE_STYLE)
+        self.stale_label.setWordWrap(True)
+        self.stale_label.hide()
+        results_layout.addWidget(self.stale_label)
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
+        self.status_label.setTextFormat(_RICH_TEXT)
         results_layout.addWidget(self.status_label)
+        show_row = QHBoxLayout()
+        show_row.addWidget(QLabel("Show"))
+        self.show_combo = QComboBox()
+        self.show_combo.setToolTip("Show the ranges of one check only")
+        self.show_combo.currentIndexChanged.connect(self._apply_filter)
+        show_row.addWidget(self.show_combo, 1)
+        self.red_only = QCheckBox("Red only")
+        self.red_only.toggled.connect(self._apply_filter)
+        show_row.addWidget(self.red_only)
+        results_layout.addLayout(show_row)
 
         self.table = QTableWidget(0, len(_HEADERS))
         self.table.setHorizontalHeaderLabels(_HEADERS)
@@ -220,8 +398,73 @@ class AssessmentPanel(QWidget):
         self._restore_settings()
         self._type_mapping = library.project_mapping()
         self._refresh_cable_types()
+        self._building = False
+        self._connect_change_signals()
+        self._on_settings_changed()
 
     # -- construction -------------------------------------------------------
+    def _numeric_edit(self, text: str = "", placeholder: str = "", allow_blank: bool = True,
+                      minimum: Optional[float] = None) -> QLineEdit:
+        """A line edit for a number, outlined red while its text is not one."""
+        editor = QLineEdit(text)
+        if placeholder:
+            editor.setPlaceholderText(placeholder)
+        self._numeric[editor] = (allow_blank, minimum)
+        editor.textChanged.connect(lambda _t, e=editor: self._validate(e))
+        return editor
+
+    def _validate(self, editor: QLineEdit) -> bool:
+        allow_blank, minimum = self._numeric.get(editor, (True, None))
+        text = editor.text().strip().replace(",", ".")
+        ok = True
+        if not text:
+            ok = allow_blank
+        else:
+            try:
+                value = float(text)
+                ok = math.isfinite(value) and (minimum is None or value >= minimum)
+            except ValueError:
+                ok = False
+        editor.setStyleSheet("" if ok else _INVALID_STYLE)
+        return ok
+
+    @staticmethod
+    def _toggle_button(text: str, target: QWidget, expanded: bool = False) -> QToolButton:
+        button = QToolButton()
+        button.setCheckable(True)
+        button.setAutoRaise(True)
+
+        def apply(on):
+            target.setVisible(on)
+            button.setText(f"{_OPEN if on else _CLOSED} {text}")
+        button.toggled.connect(apply)
+        button.setChecked(expanded)
+        apply(expanded)
+        return button
+
+    def _build_columns_group(self) -> QGroupBox:
+        group = QGroupBox("Columns")
+        group.setToolTip("Which column holds each quantity. Detected from the column names; "
+                         "change any that are wrong, or set (none).")
+        outer = QVBoxLayout(group)
+        self.columns_summary = QLabel("")
+        self.columns_summary.setWordWrap(True)
+        outer.addWidget(self.columns_summary)
+        body = QWidget()
+        form = QFormLayout(body)
+        form.setContentsMargins(0, 0, 0, 0)
+        for role in la.ROLES:
+            combo = QComboBox()
+            combo.setToolTip(role.help)
+            label = QLabel(role.label)
+            label.setToolTip(role.help)
+            form.addRow(label, combo)
+            self._role_combos[role.key] = combo
+        self.columns_toggle = self._toggle_button("Show / change columns", body)
+        outer.addWidget(self.columns_toggle)
+        outer.addWidget(body)
+        return group
+
     def _build_cable_group(self) -> QGroupBox:
         group = QGroupBox("Cable")
         form = QFormLayout(group)
@@ -229,8 +472,9 @@ class AssessmentPanel(QWidget):
         self.library_label = QLabel("")
         self.library_label.setWordWrap(True)
         row.addWidget(self.library_label, 1)
-        library_btn = QPushButton("Cable library\u2026")
-        library_btn.setToolTip("Create or edit your cable type library (weights, NPTS / NOTS / NTTS / CBL, EI)")
+        library_btn = QPushButton("Cable library…")
+        library_btn.setToolTip("Create or edit your cable type library (weights, NPTS / NOTS / NTTS / CBL, "
+                               "MBR, EI)")
         library_btn.clicked.connect(self.open_library)
         row.addWidget(library_btn)
         form.addRow(row)
@@ -278,9 +522,9 @@ class AssessmentPanel(QWidget):
         for key, text in _SEABED_CHOICES:
             self.seabed_combo.addItem(text, key)
         self.seabed_combo.setToolTip(
-            "Seabed the cable is rested on for the Suspensions and Slack vs seabed checks. The lay "
-            "model's touchdown depths need no other data; bathymetry is sampled along the "
-            "touchdown track (grid XYZ soundings first with Create Raster from XYZ).")
+            "Seabed the cable is rested on for the Suspensions and Cable length vs seabed checks. The lay "
+            "model's touchdown depths need no other data; bathymetry is sampled along the touchdown track "
+            "(grid XYZ soundings first with Create Raster from XYZ).")
         self.seabed_combo.currentIndexChanged.connect(self._update_seabed_widgets)
         form.addRow("Seabed source", self.seabed_combo)
         self.raster_combo = QgsMapLayerComboBox()
@@ -298,24 +542,37 @@ class AssessmentPanel(QWidget):
         form.addRow(self.contour_field_label, self.contour_field)
         self.contour_combo.layerChanged.connect(self._on_contour_layer)
         self.interval_spin = QSpinBox()
-        self.interval_spin.setRange(1, 1000)
-        self.interval_spin.setValue(5)
+        self.interval_spin.setRange(0, 1000)
+        self.interval_spin.setSpecialValueText("auto")
+        self.interval_spin.setValue(0)
         self.interval_spin.setSuffix(" m")
-        self.interval_spin.setToolTip("Seabed sample spacing along the track (rasters and the lay model's "
-                                      "depths; contours are used at their crossings)")
-        form.addRow("Sample every", self.interval_spin)
-        self.smoothing_edit = QLineEdit()
-        self.smoothing_edit.setPlaceholderText("auto: the cable's conformity length")
+        self.interval_spin.setToolTip(
+            "Seabed sample spacing along the touchdown track. Auto (recommended): each raster at its own "
+            "cell size (at least 1 m), the lay model's depths at the touchdown record spacing. Coarser "
+            "sampling misses crests and shortens the seabed; finer adds nothing the grid does not hold. "
+            "Contours are always used at their crossings.")
+        self.interval_label = QLabel("Sample every")
+        form.addRow(self.interval_label, self.interval_spin)
+        self.filter_edit = self._numeric_edit(placeholder=f"auto: {la.AUTO_FILTER_M:g} m", minimum=0.0)
+        self.filter_edit.setToolTip(
+            "The cable rests on the sampled seabed averaged over this length: it removes sounding noise "
+            "(which would otherwise create false spans under tension) but keeps the crests that hold the "
+            f"cable up. Blank = {la.AUTO_FILTER_M:g} m, enough for about 10 cm of noise; 3 m for noisier "
+            "data; 0 = none.")
+        form.addRow("Seabed noise filter (m)", self.filter_edit)
+        self.smoothing_edit = self._numeric_edit(placeholder="auto: the cable's conformity length", minimum=0.0)
         self.smoothing_edit.setToolTip(
-            "The seabed is averaged over this length before the cable is rested on it: a cable cannot "
-            "follow features shorter than about 2 (EI / w)^(1/3) (from the library's bending stiffness, "
-            "10 m when unknown), and sounding noise would otherwise add seabed length. 0 = no smoothing.")
-        form.addRow("Seabed smoothing (m)", self.smoothing_edit)
+            "Seabed and lay-model lengths (the cable length check) use the seabed averaged over this length: "
+            "a cable cannot follow features shorter than about 2 (EI / w)^(1/3) (from the library's bending "
+            "stiffness, 10 m when unknown), and noise would otherwise add length. 0 = no smoothing.")
+        form.addRow("Smoothing for lengths (m)", self.smoothing_edit)
+        self.zero_edit = self._numeric_edit(f"{_ZERO_TENSION_DEFAULT:g}", minimum=0.0)
+        self.zero_edit.setToolTip("Below this bottom tension the cable lies on the seabed and follows it "
+                                  "(no spans); used by the suspension and length checks.")
+        form.addRow("Cable conforms below (kN)", self.zero_edit)
         kp_row = QHBoxLayout()
-        self.kp_from = QLineEdit()
-        self.kp_from.setPlaceholderText("start")
-        self.kp_to = QLineEdit()
-        self.kp_to.setPlaceholderText("end")
+        self.kp_from = self._numeric_edit(placeholder="start")
+        self.kp_to = self._numeric_edit(placeholder="end")
         kp_row.addWidget(self.kp_from)
         kp_row.addWidget(QLabel("to"))
         kp_row.addWidget(self.kp_to)
@@ -323,42 +580,68 @@ class AssessmentPanel(QWidget):
         self._update_seabed_widgets()
         return group
 
-    def _build_columns_group(self) -> QGroupBox:
-        group = QGroupBox("Columns (auto-detected)")
-        group.setToolTip("Which column holds each quantity. Detected from the column names; "
-                         "change any that are wrong, or set (none).")
-        form = QFormLayout(group)
-        for role in la.ROLES:
-            combo = QComboBox()
-            combo.setToolTip(role.help)
-            label = QLabel(role.label)
-            label.setToolTip(role.help)
-            form.addRow(label, combo)
-            self._role_combos[role.key] = combo
-        return group
-
     def _build_check_group(self, check: la.CheckDef) -> QGroupBox:
         group = QGroupBox(check.label)
+        group.setCheckable(True)
+        group.setChecked(check.default_enabled)
         group.setToolTip(check.description)
-        form = QFormLayout(group)
-        enable = QCheckBox("Enabled")
-        enable.setChecked(check.default_enabled)
-        enable.setToolTip(check.description)
-        self._check_boxes[check.check_id] = enable
-        form.addRow(enable)
+        self._check_boxes[check.check_id] = group
+        outer = QVBoxLayout(group)
+        outer.setContentsMargins(6, 2, 6, 2)
+        ready = QLabel("")
+        ready.setWordWrap(True)
+        self._ready_labels[check.check_id] = ready
+        body = QWidget()
+        form = QFormLayout(body)
+        form.setContentsMargins(0, 0, 0, 0)
+        description = QLabel(check.description)
+        description.setWordWrap(True)
+        form.addRow(description)
         self._editors[check.check_id] = {}
         for spec in check.params:
-            editor = QLineEdit("" if spec.default is None else f"{spec.default:g}")
+            editor = self._numeric_edit("" if spec.default is None else f"{spec.default:g}",
+                                        minimum=spec.minimum)
             if spec.help:
                 editor.setToolTip(spec.help)
             self._editors[check.check_id][spec.name] = editor
             form.addRow(spec.label, editor)
+        head = QHBoxLayout()
+        head.addWidget(ready, 1)
+        head.addWidget(self._toggle_button("Thresholds", body))
+        outer.addLayout(head)
+        outer.addWidget(body)
         return group
+
+    def _connect_change_signals(self) -> None:
+        """Every setting re-checks readiness and whether the shown results are out of date."""
+        changed = self._on_settings_changed
+        for combo in list(self._role_combos.values()) + [self.makeup_combo, self.rpl_combo, self.fit_combo,
+                                                          self.cable_combo, self.units_combo, self.seabed_combo]:
+            combo.currentIndexChanged.connect(changed)
+        for editor in self._numeric:
+            editor.textChanged.connect(changed)
+        for box in self._check_boxes.values():
+            box.toggled.connect(changed)
+        self.interval_spin.valueChanged.connect(changed)
+        self.raster_combo.layerChanged.connect(changed)
+        self.contour_combo.layerChanged.connect(changed)
+        self.contour_field.fieldChanged.connect(changed)
 
     # -- dataset / widgets ---------------------------------------------------
     def set_dataset(self, dataset) -> None:
         if dataset is self._dataset:
             return
+        if self._task is not None:
+            # The running assessment belongs to the previous layer: drop it. Python
+            # keeps a reference until it finishes (the task manager runs our run()).
+            self._run_id += 1
+            self._dropped_tasks.append(self._task)
+            try:
+                self._task.cancel()
+            except RuntimeError:
+                pass
+            self._task = None
+            self._set_running(False)
         self._dataset = dataset
         self._clear_results()
         names = list(dataset.field_names) if dataset is not None else []
@@ -380,18 +663,23 @@ class AssessmentPanel(QWidget):
                     combo.setCurrentIndex(index)
                     break
             combo.blockSignals(False)
+        if dataset is not None and not self.mapping().get("kp"):
+            self.columns_toggle.setChecked(True)  # nothing to run without a KP column: show the picks
         self._refresh_labels()
+        self._on_settings_changed()
 
     def _clear_results(self) -> None:
         """Forget results: their record indices belong to the previous dataset."""
-        if self._task is not None:
-            return  # the running assessment finishes on the data it started with
         self._records = None
         self._findings = []
         self._model = None
         self._track = None
+        self._result_signature = None
         self.table.setRowCount(0)
+        self.show_combo.clear()
+        self.status_label.setText("")
         self._update_buttons()
+        self._update_stale()
         panel = self._profile_panel(create=False)
         if panel is not None:
             panel.clear()
@@ -405,6 +693,9 @@ class AssessmentPanel(QWidget):
             widget.setVisible(mode == SEABED_RASTER)
         for widget in (self.contour_combo, self.contour_label, self.contour_field, self.contour_field_label):
             widget.setVisible(mode == SEABED_CONTOURS)
+        if hasattr(self, "interval_spin"):
+            for widget in (self.interval_spin, self.interval_label):
+                widget.setVisible(mode in (SEABED_RASTER, SEABED_LAY_MODEL))
 
     def _on_contour_layer(self, layer) -> None:
         self.contour_field.setLayer(layer)
@@ -419,6 +710,7 @@ class AssessmentPanel(QWidget):
         rows = library.load_current()
         path = library.current_path()
         current = self.cable_combo.currentText() or self._setting("cable_type", "")
+        self.cable_combo.blockSignals(True)
         self.cable_combo.clear()
         self.cable_combo.addItem("(none)", "")
         for row in rows:
@@ -428,6 +720,7 @@ class AssessmentPanel(QWidget):
             self.cable_combo.setCurrentIndex(index)
         elif len(rows) == 1:
             self.cable_combo.setCurrentIndex(1)
+        self.cable_combo.blockSignals(False)
         if not path:
             self.library_label.setText("No cable library yet: weights and tension limits come from it.")
         elif not library.is_library(path):
@@ -436,6 +729,7 @@ class AssessmentPanel(QWidget):
             self.library_label.setText(f"{len(rows)} type(s) in {path}")
         self._library_rows = rows
         self._refresh_labels()
+        self._on_settings_changed()
 
     def open_library(self) -> None:
         from ...cable_library.dialog import CableLibraryDialog
@@ -448,6 +742,87 @@ class AssessmentPanel(QWidget):
             self._library_dialog.set_path(library.current_path())
         self._library_dialog.show()
         self._library_dialog.raise_()
+
+    # -- readiness and out-of-date results ------------------------------------
+    def _on_settings_changed(self, *_args) -> None:
+        if self._building:
+            return
+        self._update_columns_summary()
+        self._update_readiness()
+        self._update_stale()
+
+    def _update_columns_summary(self) -> None:
+        mapping = self.mapping()
+        if self._dataset is None:
+            self.columns_summary.setText("Load a data layer to detect its columns.")
+            return
+        kp = mapping.get("kp")
+        unset = [role.label for role in la.ROLES if role.key not in mapping]
+        text = (f"{len(mapping)} of {len(la.ROLES)} set. KP (touchdown): "
+                + (f"<b>{html.escape(kp)}</b>" if kp else "<b style='color:#d32f2f'>not set</b>"))
+        self.columns_summary.setText(text)
+        self.columns_summary.setToolTip("Not set: " + ", ".join(unset) if unset else "All columns set.")
+
+    def _readiness(self, check: la.CheckDef) -> List[str]:
+        """What a check still needs, judged from the settings (no data read)."""
+        mapped = set(self.mapping())
+        needs = [la.ROLE_BY_KEY[key].label for key in check.needs if key not in mapped]
+        if "kp" not in mapped:
+            needs.insert(0, la.ROLE_BY_KEY["kp"].label)
+        if check.check_id == "td_reversal" and self._dataset is not None and self._dataset.time_epoch is None:
+            needs.append("time")
+        if check.check_id == "tension_consistency" and "top_tension_calc" not in mapped \
+                and not {"bottom_tension", "td_depth"} <= mapped:
+            needs.append("calculated top tension, or bottom tension + depth")
+        for attribute in check.needs_cable:
+            if not any(row.get(attribute) not in (None, "") for row in self._library_rows):
+                needs.append(f"{la.CABLE_LABELS.get(attribute, attribute)} in the cable library")
+        if check.needs_seabed:
+            mode = self.seabed_combo.currentData()
+            if mode == SEABED_NONE:
+                needs.append("a seabed source")
+            elif mode == SEABED_LAY_MODEL and check.check_id == "length_balance":
+                needs.append("bathymetry (it compares against the lay model's own seabed)")
+            elif mode == SEABED_RASTER and self.raster_combo.currentLayer() is None:
+                needs.append("a raster layer")
+            elif mode == SEABED_CONTOURS and (self.contour_combo.currentLayer() is None
+                                              or not self.contour_field.currentField()):
+                needs.append("a contour layer and its depth field")
+        return needs
+
+    def _update_readiness(self) -> None:
+        for check in la.all_checks():
+            label = self._ready_labels[check.check_id]
+            if not self._check_boxes[check.check_id].isChecked():
+                label.setText("<span style='color:#777'>Off</span>")
+                continue
+            needs = self._readiness(check)
+            if needs:
+                label.setText("<span style='color:#b26a00'>Needs " + html.escape(", ".join(needs)) + "</span>")
+            else:
+                label.setText("<span style='color:#2e7d32'>Ready</span>")
+
+    def _signature(self) -> str:
+        """The settings a result depends on, to tell when it is out of date."""
+        state = {
+            "mapping": self.mapping(), "units": self.units_combo.currentText(),
+            "cable": self.cable_combo.currentData(), "makeup": self.makeup_combo.currentData(),
+            "rpl": self.rpl_combo.currentData(), "fit": self.fit_combo.currentData(),
+            "types": self._type_mapping, "seabed": self.seabed_combo.currentData(),
+            "raster": self.raster_combo.currentLayer().id() if self.raster_combo.currentLayer() else None,
+            "contours": self.contour_combo.currentLayer().id() if self.contour_combo.currentLayer() else None,
+            "field": self.contour_field.currentField(), "interval": self.interval_spin.value(),
+            "edits": [e.text() for e in (self.filter_edit, self.smoothing_edit, self.zero_edit,
+                                         self.kp_from, self.kp_to)],
+            "checks": {cid: [box.isChecked()] + [e.text() for e in self._editors[cid].values()]
+                       for cid, box in self._check_boxes.items()},
+            "library": library.fingerprint(self._library_rows),
+        }
+        return json.dumps(state, sort_keys=True, default=str)
+
+    def _update_stale(self) -> None:
+        stale = self._result_signature is not None and self._signature() != self._result_signature
+        self.stale_label.setVisible(stale)
 
     # -- cable makeup and label mapping ---------------------------------------
     def _update_makeup_widgets(self) -> None:
@@ -582,28 +957,36 @@ class AssessmentPanel(QWidget):
         label = next((self.mapping_table.item(r, 0).text() for r in range(self.mapping_table.rowCount())
                       if library.type_token(self.mapping_table.item(r, 0).text()) == token), token)
         self._update_how(token, label)
+        self._on_settings_changed()
 
     def _cable_resolver(self):
-        rows = self._library_rows
+        """``(resolve, resolution)``: a worker-safe resolver and the dict it fills
+        with each label's (library name, how)."""
+        rows = list(self._library_rows)
         mapping = dict(self._type_mapping)
         default = library.resolve(rows, self.cable_combo.currentData())[0]
-        self._resolution = {}
+        resolution: Dict[str, Tuple[Optional[str], str]] = {}
 
         def resolve(text):
             row, how = library.resolve(rows, text, mapping)
             if text:
-                self._resolution[str(text)] = (row["name"] if row else None, how)
+                resolution[str(text)] = (row["name"] if row else None, how)
             return library.to_props(row or default)
-        return resolve
+        return resolve, resolution
+
+    @staticmethod
+    def _number(editor: QLineEdit, what: str, default=None, minimum: Optional[float] = 0.0) -> Optional[float]:
+        text = editor.text().strip().replace(",", ".")
+        if not text:
+            return default
+        try:
+            value = float(text)
+        except ValueError:
+            raise ValueError(f"{what}: enter a number, or leave blank.")
+        return value if minimum is None else max(value, minimum)
 
     def _smoothing(self) -> Optional[float]:
-        text = self.smoothing_edit.text().strip().replace(",", ".")
-        if not text:
-            return None
-        try:
-            return max(float(text), 0.0)
-        except ValueError:
-            raise ValueError("Seabed smoothing: enter metres, or leave blank for automatic.")
+        return self._number(self.smoothing_edit, "Smoothing for lengths")
 
     def _params(self, check: la.CheckDef) -> Dict[str, float]:
         params: Dict[str, float] = {}
@@ -616,11 +999,9 @@ class AssessmentPanel(QWidget):
         return params
 
     def _kp_window(self) -> Optional[Tuple[float, float]]:
-        def read(edit):
-            text = edit.text().strip().replace(",", ".")
-            return float(text) if text else None
         try:
-            lo, hi = read(self.kp_from), read(self.kp_to)
+            lo = self._number(self.kp_from, "Seabed KP range", minimum=None)
+            hi = self._number(self.kp_to, "Seabed KP range", minimum=None)
         except ValueError:
             raise ValueError("Seabed KP range: enter KPs in km, or leave blank.")
         if lo is None and hi is None:
@@ -635,14 +1016,23 @@ class AssessmentPanel(QWidget):
             self._run()
         except Exception as exc:  # never lose an error inside a Qt slot
             log_exception("Lay Assessment: run failed")
-            self.status_label.setText(f"Assessment failed: {exc}")
-            self.run_button.setEnabled(True)
+            self.status_label.setText(f"Assessment failed: {html.escape(str(exc))}")
+            self._set_running(False)
+
+    def cancel_run(self) -> None:
+        if self._task is not None:
+            self.stage_label.setText("Cancelling…")
+            try:
+                self._task.cancel()
+            except RuntimeError:
+                pass
 
     def _run(self) -> None:
+        if self._task is not None:
+            self.cancel_run()   # the button reads Cancel while a run is going
+            return
         if self._dataset is None:
             self.status_label.setText("Load a data layer first.")
-            return
-        if self._task is not None:
             return
         notes: List[str] = []
         try:
@@ -650,9 +1040,11 @@ class AssessmentPanel(QWidget):
                        if self._check_boxes[check.check_id].isChecked()}
             window = self._kp_window()
             smoothing = self._smoothing()
+            filter_m = self._number(self.filter_edit, "Seabed noise filter")
+            zero_tension = self._number(self.zero_edit, "Cable conforms below", _ZERO_TENSION_DEFAULT)
             records = la.build_records(self._dataset, self.mapping(), self.units_combo.currentText())
         except ValueError as exc:
-            self.status_label.setText(str(exc))
+            self.status_label.setText(html.escape(str(exc)))
             return
         if records.n == 0:
             self.status_label.setText("No records with a KP to assess.")
@@ -662,92 +1054,51 @@ class AssessmentPanel(QWidget):
         except Exception as exc:
             makeup = None
             notes.append(f"Cable types from the lay data only ({exc}).")
-        la.apply_makeup(records, makeup, self._cable_resolver())
+        resolver, resolution = self._cable_resolver()
         if self.persist:
             self._save_settings()
-        findings, skipped = la.run_record_checks(records, enabled)
-        self._records = records
-        self._notes = notes
         try:
-            self._track = la.track_vertices(records)
+            track = la.track_vertices(records)
         except ValueError:
-            self._track = None
+            track = None
+        skipped: Dict[str, str] = {}
         seabed = {cid: enabled[cid] for cid in _SEABED_IDS if cid in enabled}
         mode = self.seabed_combo.currentData()
         if seabed and mode == SEABED_NONE:
             for cid in seabed:
                 skipped[cid] = "needs a seabed source"
             seabed = {}
-        for cid in list(seabed):
-            missing = la.missing_inputs(la.check_by_id(cid), records)
-            if missing:
-                skipped[cid] = "needs " + ", ".join(missing)
-                seabed.pop(cid)
         if mode == SEABED_LAY_MODEL and "length_balance" in seabed:
             skipped["length_balance"] = "compares against bathymetry, not the lay model's own seabed"
             seabed.pop("length_balance")
-        if "suspension" not in seabed and "length_balance" not in seabed:
-            self._finish(records, findings, skipped, None, window)
-            return
-        if mode == SEABED_LAY_MODEL:
-            if not records.has("td_depth"):
-                skipped["suspension"] = "needs the touchdown water depth column"
-                self._finish(records, findings, skipped, None, window)
-                return
-            x, kp, depth = self._lay_model_profile(records, window)
-            record_x = records.kp * 1000.0
-
-            def work(_cancel, _progress):
-                return seabed_job(records, seabed, x, kp, depth, record_x, smoothing)
-        else:
+        if seabed and mode == SEABED_LAY_MODEL and not records.has("td_depth"):
+            for cid in seabed:
+                skipped[cid] = "needs the touchdown water depth column"
+            seabed = {}
+        request = None
+        if seabed and mode in (SEABED_RASTER, SEABED_CONTOURS):
             try:
-                request, vertex_chainage, vertex_kp = self._seabed_request(records, mode, window)
+                request = self._seabed_request(track, mode, window)
             except ValueError as exc:
                 for cid in seabed:
                     skipped.setdefault(cid, str(exc))
-                self._finish(records, findings, skipped, None, window)
-                return
-
-            def work(cancel, progress):
-                result = dpc.run_profile(request, cancel=cancel,
-                                         progress=(lambda f: progress(0.7 * f)) if progress else None)
-                x = np.asarray(result.kp_values, dtype=float) * 1000.0
-                depth = np.array([np.nan if v is None else float(v) for v in result.depth_values])
-                if result.status and not np.isfinite(depth).any():
-                    return None, [], {cid: result.status for cid in seabed}
-                kp = la.chainage_to_kp(vertex_chainage, vertex_kp, x)
-                record_x = la.kp_to_chainage(vertex_chainage, vertex_kp, records.kp)
-                with np.errstate(invalid="ignore"):  # interp clamps; records off the track are not on it
-                    record_x[(records.kp < vertex_kp[0]) | (records.kp > vertex_kp[-1])] = np.nan
-                return seabed_job(records, seabed, x, kp, depth, record_x, smoothing)
-        self._pending = (records, findings, skipped, seabed, window)
+                seabed = {}
+        job = {"records": records, "makeup": makeup, "resolver": resolver, "resolution": resolution,
+               "enabled": enabled, "skipped": skipped, "seabed": seabed, "mode": mode, "window": window,
+               "interval": float(self.interval_spin.value()) or None, "smoothing": smoothing, "filter": filter_m,
+               "zero_tension": zero_tension, "request": request}
+        self._run_id += 1
+        info = {"id": self._run_id, "dataset": self._dataset, "signature": self._signature(), "track": track,
+                "window": window, "notes": notes}
         if self.synchronous:
-            self._apply_seabed(work(None, None))
+            self._apply_result(info, run_job(job))
             return
-        self._start_task(work)
+        self._start_task(job, info)
 
-    def _lay_model_profile(self, records, window):
-        step = float(self.interval_spin.value())
-        kp = records.kp
-        depth = np.abs(records.get("td_depth"))
-        ok = np.isfinite(kp) & np.isfinite(depth)
-        if window is not None:
-            ok &= (kp >= window[0]) & (kp <= window[1])
-        kp, depth = kp[ok], depth[ok]
-        if kp.size < 2:
-            return np.array([]), np.array([]), np.array([])
-        key = np.floor(kp * 1000.0 / step).astype(np.int64)
-        order = np.argsort(key, kind="stable")
-        key, kp, depth = key[order], kp[order], depth[order]
-        starts = np.concatenate(([0], np.nonzero(np.diff(key))[0] + 1, [len(key)]))
-        kp_bins = np.array([np.median(kp[a:b]) for a, b in zip(starts[:-1], starts[1:])])
-        depth_bins = np.array([np.median(depth[a:b]) for a, b in zip(starts[:-1], starts[1:])])
-        return kp_bins * 1000.0, kp_bins, depth_bins
-
-    def _seabed_request(self, records, mode, window):
-        if self._track is None:
+    def _seabed_request(self, track, mode, window):
+        if track is None:
             raise ValueError("needs touchdown positions")
-        lon, lat, kp = self._track
+        lon, lat, kp = track
         if window is not None:
             margin = 0.05
             keep = (kp >= window[0] - margin) & (kp <= window[1] + margin)
@@ -766,9 +1117,11 @@ class AssessmentPanel(QWidget):
         points = [p for p, k in zip(points, keep) if k]
         chainage, kp = chainage[keep], kp[keep]
         route = dpc.RouteStationing([points], float(chainage[-1]), crs, distance)
+        spacing = int(self.interval_spin.value())
+        # Auto: each raster at its own cell size (the engine's adaptive step, at least 1 m).
         params = dpc.ProfileParams(mode=dpc.RASTER if mode == SEABED_RASTER else dpc.CONTOURS,
-                                   interval_m=int(self.interval_spin.value()), max_samples=200000,
-                                   per_raster=False)
+                                   interval_m=spacing or 1, adaptive=spacing == 0, adaptive_factor=1.0,
+                                   max_samples=200000, per_raster=False)
         if mode == SEABED_RASTER:
             layer = self.raster_combo.currentLayer()
             if not isinstance(layer, QgsRasterLayer):
@@ -784,43 +1137,54 @@ class AssessmentPanel(QWidget):
             raise ValueError(request.status)
         return request, chainage, kp
 
-    def _start_task(self, work) -> None:
-        self.run_button.setEnabled(False)
-        self.status_label.setText("Modelling the cable on the seabed\u2026")
-        self._progress = QProgressDialog("Modelling the cable on the seabed\u2026", "Cancel", 0, 100, self)
-        self._progress.setWindowTitle("Lay Assessment")
-        self._progress.setWindowModality(_WINDOW_MODAL)
-        self._progress.setMinimumDuration(0)
-        self._progress.setAutoClose(False)
-        self._progress.setAutoReset(False)
-        task = AssessmentTask("Lay Assessment seabed", work, self._on_task_finished)
+    def _set_running(self, running: bool) -> None:
+        self.run_button.setText("Cancel" if running else "Run assessment")
+        self.run_button.setToolTip("Stop this run; the results shown stay as they are." if running else
+                                   "Run the checks. They run in the background: keep working, or Cancel.")
+        self.progress_bar.setVisible(running)
+        self.stage_label.setVisible(running)
+        if running:
+            self.progress_bar.setValue(0)
+            self.stage_label.setText("Starting…")
+
+    def _start_task(self, job: Dict, info: Dict) -> None:
+        task = AssessmentTask("Lay Assessment", lambda cancel, progress: run_job(job, cancel, progress),
+                              self._on_task_finished)
+        task.info = info
         self._task = task
-        task.progressChanged.connect(lambda value: self._progress.setValue(int(value)) if self._progress else None)
-        self._progress.canceled.connect(task.cancel)
+        task.progressChanged.connect(lambda value: self.progress_bar.setValue(int(value)))
+        task.stageChanged.connect(self.stage_label.setText)
+        self._set_running(True)
+        if self._findings:
+            self.status_label.setText("Running in the background; the results below are from the previous run.")
         QgsApplication.taskManager().addTask(task)
-        self._progress.show()
 
     def _on_task_finished(self, task) -> None:
-        payload, error, cancelled = task.result, task.error, task.cancelled
-        self._task = None
-        if self._progress is not None:
-            self._progress.reset()
-            self._progress.deleteLater()
-            self._progress = None
-        self.run_button.setEnabled(True)
-        if self._pending is None:  # shut down meanwhile
+        if task is self._task:
+            self._task = None
+            self._set_running(False)
+        if task in self._dropped_tasks:
+            self._dropped_tasks.remove(task)
+        info = task.info or {}
+        if info.get("id") != self._run_id or info.get("dataset") is not self._dataset:
+            return  # superseded (another layer, or shut down): nothing to show
+        if task.cancelled:
+            self.status_label.setText("Cancelled." + (" The results below are from the previous run."
+                                                      if self._findings else ""))
             return
-        if payload is None:
-            reason = "cancelled" if cancelled else f"seabed modelling failed: {error}"
-            payload = (None, [], {cid: reason for cid in self._pending[3]})
-        self._apply_seabed(payload)
+        if task.result is None:
+            self.status_label.setText(f"Assessment failed: {html.escape(str(task.error))}")
+            return
+        self._apply_result(info, task.result)
 
-    def _apply_seabed(self, payload) -> None:
-        records, findings, skipped, _seabed, window = self._pending
-        self._pending = None
-        model, seabed_findings, seabed_skipped = payload
-        skipped.update(seabed_skipped)
-        self._finish(records, findings + seabed_findings, skipped, model, window)
+    def _apply_result(self, info: Dict, result: Dict) -> None:
+        self._records = result["records"]
+        self._track = info["track"]
+        self._notes = list(info["notes"]) + list(result.get("notes") or [])
+        self._resolution = result["resolution"]
+        self._result_signature = info["signature"]
+        self._finish(result["records"], result["findings"], result["skipped"], result["model"], info["window"])
+        self._update_stale()
 
     def _finish(self, records, findings, skipped, model, window) -> None:
         findings = sorted(findings, key=lambda f: (f.kp_start, -la.SEVERITY_LEVEL.get(f.severity, 0)))
@@ -829,29 +1193,36 @@ class AssessmentPanel(QWidget):
         self._populate()
         self._update_buttons()
         counts = {level: sum(1 for f in findings if f.severity == level) for level in SEVERITY_TEXT}
-        parts = [f"{len(findings)} range(s): {counts[Severity.ERROR]} red, {counts[Severity.WARNING]} amber, "
+        lines = [f"<b>{len(findings)} range(s)</b>: "
+                 f"<span style='color:{SEVERITY_COLOUR[Severity.ERROR]}'>{counts[Severity.ERROR]} red</span>, "
+                 f"<span style='color:{SEVERITY_COLOUR[Severity.WARNING]}'>{counts[Severity.WARNING]} amber</span>, "
                  f"{counts[Severity.INFO]} info, from {records.n:,} records"
                  + (f" ({records.excluded:,} left out: no KP or invalid)" if records.excluded else "") + "."]
         if model is not None:
-            parts.append(f"Seabed: {len(model.spans)} modelled span(s).")
+            text = f"Seabed: {len(model.spans)} modelled span(s)"
+            below = sum(1 for span in model.spans if span.below_mbr)
+            if below:
+                text += f", {below} bending below the MBR at a support"
+            if model.shortfalls:
+                text += f"; {len(model.shortfalls)} stretch(es) where the laid cable is short of the seabed"
+            lines.append(html.escape(text) + ".")
         if skipped:
-            parts.append("Not run: " + "; ".join(f"{self._labels.get(k, k)} ({v})" for k, v in skipped.items()) + ".")
-        if model is not None and model.shortfalls:
-            parts.append(f"{len(model.shortfalls)} stretch(es) where the laid cable is short of the seabed.")
+            lines.append("Not run: " + "; ".join(html.escape(f"{self._labels.get(k, k)} ({v})")
+                                                 for k, v in skipped.items()) + ".")
         problems = sorted(label for label, (_name, how) in self._resolution.items()
                           if how in ("ambiguous", "unknown"))
         if problems:
-            parts.append("Cable types not resolved (default used): "
-                         + ", ".join(f"{label} ({_HOW_TEXT[self._resolution[label][1]]})" for label in problems[:8])
-                         + ". Map them under Cable.")
+            lines.append(html.escape("Cable types not resolved (default used): "
+                                     + ", ".join(f"{label} ({_HOW_TEXT[self._resolution[label][1]]})"
+                                                 for label in problems[:8]) + ". Map them under Cable."))
         if any(p is None for p in records.cable):
-            parts.append("Some records have no cable properties: set a default cable type.")
-        parts.extend(self._notes)
+            lines.append("Some records have no cable properties: set a default cable type.")
+        lines.extend(html.escape(note) for note in self._notes)
         if self._track is None:
-            parts.append("No touchdown positions: ranges cannot be shown on the map.")
+            lines.append("No touchdown positions: ranges cannot be shown on the map.")
         elif not records.has("td_lat", "td_lon"):
-            parts.append("Touchdown position columns not set: the record positions were used.")
-        self.status_label.setText(" ".join(parts))
+            lines.append("Touchdown position columns not set: the record positions were used.")
+        self.status_label.setText("<br>".join(lines))
         panel = self._profile_panel(create=True)
         if panel is not None:
             panel.set_result(records, model, findings, window)
@@ -877,10 +1248,32 @@ class AssessmentPanel(QWidget):
                 if col == 0:
                     item.setData(_USER_ROLE, index)
                     item.setForeground(QColor(SEVERITY_COLOUR.get(finding.severity, "#000000")))
+                if col == len(cells) - 1:
+                    item.setToolTip(finding.message)
                 self.table.setItem(row, col, item)
         self.table.setSortingEnabled(True)
         self.table.sortItems(2, getattr(getattr(Qt, "SortOrder", Qt), "AscendingOrder"))  # by KP
         self.table.resizeColumnsToContents()
+        current = self.show_combo.currentData()
+        self.show_combo.blockSignals(True)
+        self.show_combo.clear()
+        self.show_combo.addItem(f"All checks ({len(self._findings)})", "")
+        for check in la.all_checks():
+            count = sum(1 for f in self._findings if f.check_id == check.check_id)
+            if count:
+                self.show_combo.addItem(f"{check.label} ({count})", check.check_id)
+        self.show_combo.setCurrentIndex(max(self.show_combo.findData(current), 0) if current else 0)
+        self.show_combo.blockSignals(False)
+        self._apply_filter()
+
+    def _apply_filter(self, *_args) -> None:
+        check_id = self.show_combo.currentData()
+        red = self.red_only.isChecked()
+        for row in range(self.table.rowCount()):
+            finding = self._finding_at(row)
+            hide = finding is not None and ((check_id and finding.check_id != check_id)
+                                            or (red and finding.severity != Severity.ERROR))
+            self.table.setRowHidden(row, bool(hide))
 
     def _finding_at(self, row: int) -> Optional[la.RangeFinding]:
         item = self.table.item(row, 0)
@@ -995,7 +1388,7 @@ class AssessmentPanel(QWidget):
         project.addMapLayer(layer)
         self._map_layer_id = layer.id()
         self.status_label.setText(f"Added {layer.featureCount()} range(s) to the map as a temporary layer "
-                                  "(right-click > Make Permanent to keep it).")
+                                  "(right-click &gt; Make Permanent to keep it).")
 
     def export_csv(self) -> None:
         if not self._findings:
@@ -1008,17 +1401,23 @@ class AssessmentPanel(QWidget):
         except OSError as exc:
             QMessageBox.critical(self, "Lay Assessment", f"Could not write the CSV:\n{exc}")
             return
-        self.status_label.setText(f"Exported {len(self._findings)} range(s) to {path}.")
+        self.status_label.setText(html.escape(f"Exported {len(self._findings)} range(s) to {path}."))
 
     def write_csv(self, path: str) -> None:
+        extras = ("min_bend_radius_m", "max_reaction_kn", "allowable_kn", "tension_kn", "reach_m")
         with open(path, "w", encoding="utf-8", newline="") as handle:
             writer = csv.writer(handle)
-            writer.writerow(["level", "check", "kp_start", "kp_end", "length_m", "value", "unit", "message"])
+            writer.writerow(["level", "check", "kp_start", "kp_end", "length_m", "value", "unit"]
+                            + list(extras) + ["message"])
             for f in self._findings:
+                more = []
+                for key in extras:
+                    value = f.extra.get(key)
+                    more.append("" if value is None or not np.isfinite(value) else f"{value:.3f}")
                 writer.writerow([SEVERITY_TEXT.get(f.severity), self._labels.get(f.check_id),
                                  f"{f.kp_start:.4f}", f"{f.kp_end:.4f}", f"{f.length_m:.1f}",
                                  "" if f.value is None or not np.isfinite(f.value) else f"{f.value:.3f}",
-                                 f.unit, f.message])
+                                 f.unit] + more + [f.message])
 
     # -- settings -----------------------------------------------------------
     def _setting(self, key: str, default=None):
@@ -1036,8 +1435,10 @@ class AssessmentPanel(QWidget):
         settings.setValue(f"{_SETTINGS}/units", self.units_combo.currentText())
         settings.setValue(f"{_SETTINGS}/cable_type", self.cable_combo.currentData() or "")
         settings.setValue(f"{_SETTINGS}/seabed", self.seabed_combo.currentData())
-        settings.setValue(f"{_SETTINGS}/interval", self.interval_spin.value())
+        settings.setValue(f"{_SETTINGS}/spacing", self.interval_spin.value())  # 0 = auto
         settings.setValue(f"{_SETTINGS}/smoothing", self.smoothing_edit.text())
+        settings.setValue(f"{_SETTINGS}/filter", self.filter_edit.text())
+        settings.setValue(f"{_SETTINGS}/zero_tension", self.zero_edit.text())
         settings.setValue(f"{_SETTINGS}/makeup", self.makeup_combo.currentData())
         settings.setValue(f"{_SETTINGS}/makeup_rpl", self.rpl_combo.currentData() or "")
         settings.setValue(f"{_SETTINGS}/makeup_fit", self.fit_combo.currentData() or "")
@@ -1056,10 +1457,13 @@ class AssessmentPanel(QWidget):
         index = self.seabed_combo.findData(seabed)
         self.seabed_combo.setCurrentIndex(index if index >= 0 else 1)
         try:
-            self.interval_spin.setValue(int(self._setting("interval", 5)))
+            # "spacing" (0 = auto) replaced "interval": earlier fixed spacings are not carried over.
+            self.interval_spin.setValue(int(self._setting("spacing", 0)))
         except (TypeError, ValueError):
             pass
         self.smoothing_edit.setText(str(self._setting("smoothing", "") or ""))
+        self.filter_edit.setText(str(self._setting("filter", "") or ""))
+        self.zero_edit.setText(str(self._setting("zero_tension", f"{_ZERO_TENSION_DEFAULT:g}") or ""))
         index = self.makeup_combo.findData(self._setting("makeup", MAKEUP_DATA))
         self.makeup_combo.setCurrentIndex(max(index, 0))
         try:
@@ -1075,6 +1479,7 @@ class AssessmentPanel(QWidget):
                         editor.setText(str(text))
 
     def shutdown(self) -> None:
+        self._run_id += 1  # a late result is not applied to a closing window
         if self._task is not None:
             try:
                 self._task.cancel()

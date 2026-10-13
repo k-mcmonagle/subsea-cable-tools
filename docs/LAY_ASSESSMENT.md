@@ -86,9 +86,11 @@ Where a type change hangs in the water, the cable is sampled along its length:
 
 - **Tension.** The tension at each height runs down from the measured top tension, losing `w · dz`
   per metre of depth (depth is proportional to cable length for the straight cable of slack lay).
-- **Limit checks.** The type with the highest tension / NOTS governs the top-tension limit check. For
-  example, an LW cable just below a joint to heavier armoured cable can be over its NOTS while the
-  armoured cable at the sheave is not.
+- **Limit checks.** Each height is judged against its own cable's limits. The worst governs: first
+  any cable above its NTTS, then any above its NOTS, then the highest ratio. For example, an LW cable
+  just below a joint to heavier armoured cable can be over its NOTS while the armoured cable at the
+  sheave is not, or the armoured cable can be over its NTTS at the sheave while the LW is only over
+  its NOTS. Each is reported at the level it reaches.
 - **Weight.** The top-tension identity below uses the mean weight of the hanging mix.
 
 ### Seabed source
@@ -96,7 +98,7 @@ Where a type change hangs in the water, the cable is sampled along its length:
 For the seabed checks:
 
 - *Lay model touchdown depth*: the lay model's own `TD Depth`, binned every *Sample every* metres of
-  KP. Nothing else is needed, but it only sees seabed relief at the lay model's resolution, so the
+  KP (by default the touchdown record spacing). Nothing else is needed, but it only sees seabed relief at the lay model's resolution, so the
   length check (which compares against independent bathymetry) does not run on it.
 - *Raster bathymetry*: an MBES grid. Grid XYZ soundings first with *Create Raster from XYZ*.
 - *Depth contours*: a line layer and its depth field, used at its crossings with the track.
@@ -104,9 +106,65 @@ For the seabed checks:
 Rasters and contours are sampled along the **touchdown track** with the Depth Profile engine, using
 the same datum handling, coverage rules and finest-raster-first order (see
 [KP and bathymetry methods](KP_AND_BATHYMETRY.md)). The track is built from the records' TD
-positions, ordered by KP and binned every 2 m, so stops and jitter do not zig-zag it. Plot positions
-are mapped back to the data's TD KP. *Seabed KP range* limits the seabed checks to a window, which is
-useful on long routes. All seabed work runs in a background task.
+positions, ordered by KP and binned every 2 m, so stops and jitter do not zig-zag it. The positions are
+then averaged over 25 m of KP, which keeps a straight track exactly. Plot positions are mapped back to
+the data's TD KP. *Seabed KP range* limits the seabed checks to a window, which is useful on long
+routes.
+
+#### What each seabed source can resolve
+
+The bend radius and reaction at span supports come from changes of seabed slope, so they are the
+most sensitive to how the seabed is sampled. A synthetic test (sand waves, rock ridges, a 2% slope,
+LW cable at 3 kN) compared each source with the true seabed:
+
+| Source | Gap under the cable (true 2.99 m) | Seabed length (true +1.05%) |
+|---|---|---|
+| 0.5–1 m grid, sampled at its cell size | 2.90–2.96 m | +1.03–1.05% |
+| 0.5 m grid, sampled every 5 m | 2.25 m | +0.82% |
+| 5 m grid | 1.8–2.4 m | +0.66–0.89% |
+| Contours every 0.5 m | 2.67 m | +0.81% |
+| Contours every 1 m | 2.37 m | +0.51% |
+| Contours every 2 m | 1.30 m (half the spans missed) | +0.20% |
+
+- **Rasters** are sampled at each grid's own cell size by default (*Sample every*: auto, at least
+  1 m). Coarser sampling misses crests and shortens the seabed; finer adds nothing the grid does not
+  hold.
+- **Coarse grids blunt crests.** On a 5 m grid the tightest bend radius at a support read 24–42 m
+  against a true 8.7 m. Above 1 m cells the status warns that an MBR breach can be hidden.
+- **Contours** are used at their crossings, with straight lines between, so crests are cut to the
+  last contour. The status gives the contour interval found. Above 0.5 m, the length check is not
+  run: it would understate the seabed length and hide short cable. Grid contours, or use an MBES
+  raster, for a firmer answer.
+- **Several rasters along the route.** The status lists the KPs where one raster meets the next.
+  A vertical datum step there reads as relief.
+- **Track jitter.** Lateral jitter of the touchdown position across a side slope is sampled as relief.
+  On a 10° slope, 2 m of jitter produced false bend radii below the MBR; the 25 m track averaging
+  removes it.
+- **Engine messages.** The Depth Profile engine's messages (sample spacing raised to stay under the
+  sample limit on a long route, partial coverage) are shown in the status.
+
+Seabed settings:
+
+| Setting | Default | Used for |
+|---|---|---|
+| *Sample every* | auto | Rasters: each grid at its own cell size (at least 1 m). Lay model: the touchdown record spacing. Contours always use their crossings. |
+| *Seabed noise filter* | 2 m | The seabed the cable **rests on**: a running mean that removes sounding noise but keeps the crests that hold the cable up. Use 3 m for noisier data (more than about 10 cm of noise), or 0 for none. |
+| *Smoothing for lengths* | the cable's conformity length | Seabed and lay-model **lengths** in the length check (below). |
+| *Cable conforms below* | 0.05 kN | Below this tension the cable lies on and follows the seabed. |
+
+### Running
+
+*Run assessment* reads the settings, then runs in the background. A progress bar and the current
+stage show in the tab (and in the QGIS task manager), and the button becomes **Cancel**. You can
+keep working in the Explorer meanwhile. The results shown stay until the new ones arrive; a
+cancelled run leaves them as they were.
+
+- **Out-of-date results.** If you change a setting after a run, a banner says the results no longer
+  match it until you run again.
+- **Changing layer.** A run whose layer changes meanwhile is dropped, never shown on the new layer.
+- **Readiness.** Each check says whether it is *Ready* or what it still *Needs* (a column, a library
+  value, a seabed source) before you run.
+- **Invalid entries.** A number box is outlined red while its text is not a number.
 
 ## Checks
 
@@ -164,20 +222,69 @@ seabed's hollows are sharper than `c`, the cable bridges them. Writing `Φ'' = c
 is the upper concave hull of `seabed − Φ`. This is a classic obstacle problem, solved exactly in one
 O(n) pass, so 100 km at 1 m resolution takes about a second.
 
-- **Smoothing.** The seabed is first averaged over the cable's **conformity length**,
-  `2 (EI / w)^(1/3)`, the bending length of a cable lying under its own weight. A cable cannot follow
-  shorter features, and sounding noise on them would otherwise add seabed length: 0.2 m of noise at
-  1 m spacing adds over 2%. The length comes from the library's bending stiffness, is 10 m when EI is
-  unknown, and can be set (*Seabed smoothing*, 0 = none).
+- **Which seabed.** The cable rests on the sampled seabed after the light *Seabed noise filter*
+  (default 2 m). This removes sounding noise, which under tension would otherwise make false spans
+  between noise peaks, but keeps the crests that hold the cable up. On a test with two sharp 2 m
+  ridges at 3 kN:
+
+  | Seabed the cable rests on | Gap under the cable |
+  |---|---|
+  | as sampled | 1.56 m |
+  | 2 m noise filter (default) | 1.25 m |
+  | 11 m conformity-length smoothing | 0.32 m |
+
+  With 10 cm of noise on a flat 1 m grid, the 2 m filter gives no reportable spans, and no filter
+  gives a few. The conformity-length smoothing is used only for lengths (next section).
 - **Tension.** `H` at each station is the highest logged bottom tension of the records depositing
   cable there, raised where the length check finds the cable short (below). `w` is the lightest cable
   there. Both choices are conservative: they give more spans.
-- **Conforming cable.** Stations below *Cable conforms below tension* (default 0.05 kN) lie on the
-  seabed and pin the cable.
+- **Conforming cable.** Stations below *Cable conforms below* (default 0.05 kN) lie on the seabed and
+  pin the cable.
 - **Reporting.** Spans are reported when higher than *Report spans higher than* (default 0.3 m)
-  **and** longer than *…and longer than* (default 5 m). They are red when higher than 1 m or longer
-  than 50 m. Each says whether its tension came from the lay model or from the cable being short.
+  **and** longer than *…and longer than* (default 5 m). They are red when higher than 1 m, longer
+  than 50 m, or bent below the MBR at a support (below). Each says whether its tension came from the
+  lay model or from the cable being short.
 - **Gaps.** Gaps in the bathymetry are never bridged.
+
+### Span supports: reaction, bend radius and MBR
+
+At each end of a span the cable bears on the seabed. It enters a contact at slope `tan α_in` and
+leaves at `tan α_out`, so the seabed pushes up with
+
+```
+P = H · (tan α_in − tan α_out)     (+ w · contact length on a crest with spans both sides)
+```
+
+Bending stiffness spreads that turn `α_in − α_out` over the bending length `λ = √(EI / H)` either
+side. For a tensioned beam over a point support, `M = P λ / 2`, so the cable's bend radius there is
+
+```
+R = (contact length + 2λ) / (α_in − α_out),      moment M = EI / R
+```
+
+The turn within `λ` of each end of the contact is also checked, so a rounded crest sharper than that
+spread is caught. A support bent below the cable's **MBR** (from the library) makes its spans red.
+Each span lists its tightest bend radius and largest reaction. The Seabed Profile marks supports
+with triangles (red below the MBR); hover one for its reaction, bend radius, moment and tension.
+Without EI in the library the reaction is still given, but not the bend radius.
+
+The unit test is a sharp 2 m crest on a flat seabed at 5 kN. The cable drapes over it as two
+parabolas tangent to the seabed `L = √(2h / c)` away. The reaction equals the weight of the two half
+spans, and the bend radius equals `2λ / turn`, both within a few per cent.
+
+### Tension that keeps spans within the limits
+
+For planning a lay, or judging how much tension the seabed tolerates, the model also finds, along
+the route, the **highest bottom tension at which no span would exceed the reporting limits**. It
+works in 250 m windows (padded 150 m either side so spans across a window edge form), by bisection
+between 0.1 and 100 kN.
+
+- The Seabed Profile's tension strip plots it as *Max for spans within limits*, against the logged
+  and pulled-taut tension.
+- Each span's message gives the value there.
+- Where no span forms even at 100 kN, the line is not drawn.
+- Where a span forms even at 0.1 kN (a hollow too deep and wide for any tension), the message says
+  so.
 
 ### Cable length vs seabed: friction keeps it local
 
@@ -188,21 +295,36 @@ metre. So a tension `H` can draw cable from at most the **friction reach** `ℓ 
 side:
 
 ```
-cable laid   = Σ (1 + slack/100) · √(Δx² + Δd_TD²)      records: slack is over the lay model's seabed
-seabed       = Σ √(Δx² + Δd²)                           smoothed sampled seabed
+cable laid   = Σ (1 + slack/100) · √(Δx² + Δd_TD²)      per station: slack is over the lay model's seabed
+seabed       = Σ √(Δx² + Δd²)                           sampled seabed
 balance %    = (cable laid − seabed) / plan · 100        within x ± ℓ(H)
 ```
 
-At near-zero tension the reach shrinks to the conformity length, so the comparison is local. Where
-the balance is below *Flag shortfall above* (default 0.5%), the laid cable is short of the seabed and
-must be pulled taut. The model then finds the tension at which the cable's rest shape uses exactly
-the cable laid within its reach. The window grows with the tension, so this is solved by bisection.
-The cable then rests at the higher of that tension and the logged one, and the suspension model draws
-its spans. Stretches whose friction windows overlap are reported as one.
+Both lengths are measured on the seabed stations, over profiles smoothed by *Smoothing for lengths*.
+That defaults to the cable's **conformity length** `2 (EI / w)^(1/3)`, the bending length of a cable
+lying under its own weight, which is 10 m when EI is unknown and never less than 3 stations.
+
+- **Seabed side.** Sounding noise adds length: 0.2 m of noise at 1 m spacing adds over 2%.
+- **Cable side.** Records are averaged per station first, and the lay model's touchdown depths
+  are smoothed the same way. Summed as chords between neighbouring records, touchdown-depth noise
+  turns into cable length. With records every 0.5 m, 5 cm of noise adds 1%, enough to hide a real
+  shortfall.
+
+At near-zero tension the reach shrinks to that length, so the comparison is local. Where the balance
+is below *Flag shortfall above* (default 0.5%), the laid cable is short of the seabed and must be
+pulled taut.
+
+1. **Find the tension.** The model finds the tension at which the cable's rest shape uses exactly
+   the cable laid within its reach. The window grows with the tension, so this is solved by
+   bisection, comparing the shape and the laid cable over exactly the same stations.
+2. **Apply it.** The cable rests at the higher of that tension and the logged one. Away from the
+   stretch, friction takes `μ · w` per metre off the pulled-taut tension. The suspension model then
+   draws the spans.
+3. **Report.** Stretches whose friction windows overlap are reported as one.
 
 The finding is red when that tension exceeds NPTS, or when the cable could not cover the seabed even
-fully taut, which points to a data problem. A surplus above *Flag surplus above* (default 8%) at zero
-tension is flagged as loop / snaking risk.
+fully taut, which points to a data problem (slack, touchdown depths or bathymetry datum). A surplus
+above *Flag surplus above* (default 8%) at zero tension is flagged as loop / snaking risk.
 
 The seabed friction coefficient `μ` (axial, default 0.5) depends on the soil and the cable's outer
 serving. A **higher** `μ` keeps cable more local, which is conservative for suspensions. *Longest
@@ -234,26 +356,35 @@ The unit tests check:
 - the mid-span sag against `w L² / 8H`;
 - that friction keeps slack local: a 2 km lay whose first half has spare cable but whose second half
   has none is flagged in the second half, although the route as a whole has more cable than seabed;
-- the tension at a joint hanging in the water.
+- that 5 cm of touchdown-depth noise does not change the shortfall or the spans;
+- that the taut stretches, and their tensions, do not depend on sampling the seabed every 1 m or 2 m;
+- that crests survive the noise filter, and that 10 cm of sounding noise makes no false spans;
+- the reaction and bend radius at a span support, and the tension that keeps spans within limits;
+- the tension at a joint hanging in the water, and an NTTS breach at the sheave beside a joint.
 
 ## Results
 
-- **Table:** level, check, KP from / to, length, worst value and a message. Click a row to highlight
-  the range along the touchdown track on the map and zoom the Seabed Profile to it. Double-click to
-  zoom the map and select the range's records in the table, map and plots.
+- **Table:** level, check, KP from / to, length, worst value and a message.
+  - *Show* limits it to one check, and *Red only* to red ranges.
+  - Click a row to highlight the range along the touchdown track on the map and zoom the Seabed
+    Profile to it.
+  - Double-click to zoom the map and select the range's records in the table, map and plots.
 - **Seabed Profile:**
   - a status bar (green clear, amber, red, blue info, grey no data);
-  - the sampled and smoothed seabed, the modelled cable with spans filled red, and the lay model's
-    touchdown depths;
-  - bottom tension: logged, estimated from top tension, where the cable is pulled taut, and NPTS;
+  - the sampled and filtered seabed, the modelled cable with spans filled red, span supports (red
+    below the MBR; hover for details) and the lay model's touchdown depths;
+  - bottom tension: logged, estimated from top tension, where the cable is pulled taut, the highest
+    tension that keeps spans within the limits, and NPTS;
   - the cable-vs-seabed balance.
 
   Hovering moves the shared crosshair. Click or double-click a point to go to the nearest record.
   *Measure* gives two-click length / height / angle / along-seabed measurements, snapped to the
-  seabed or the cable.
+  seabed or the cable. Long routes stay responsive: curves are drawn at screen resolution with peaks
+  kept.
 - **Add ranges to map:** a temporary line layer styled red / amber / blue. Use *Make Permanent* to
   keep it.
-- **Export CSV:** the table.
+- **Export CSV:** the table. For spans it adds the bend radius, reaction and allowable tension; for
+  taut stretches, the tension and friction reach.
 
 ## Assumptions and limits
 
@@ -261,9 +392,12 @@ The unit tests check:
   the TD position can be tens of metres from the cable's true position, so spans there are a risk
   indication, not a span list.
 - **2D small-slope model.**
-  - Bending stiffness enters only through the smoothing length.
-  - Within a span the tension is taken as constant, and friction's decay of the pulled-taut tension
-    away from a span is ignored (conservative).
+  - Bending stiffness enters through the length smoothing and the bend radius at supports. The span
+    shapes themselves are those of a cable with no bending stiffness: slightly long and deep, which
+    is conservative.
+  - Within a span the tension is taken as constant. A pulled-taut tension falls by friction `μ · w`
+    per metre away from its stretch.
+  - The bend radius at a support is the tensioned-beam estimate above, not a full beam solution.
   - Lateral movement and slope-wise sliding are not modelled.
   - The deposit tension is used as the residual tension, because seabed friction holds it in after
     lay.

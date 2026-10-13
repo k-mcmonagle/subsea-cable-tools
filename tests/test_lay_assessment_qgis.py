@@ -191,7 +191,10 @@ class AssessmentPanelTests(unittest.TestCase):
         self.assertIsNotNone(model, self.panel.status_label.text())
         spans = [f for f in self.panel._findings if f.check_id == "suspension"]
         self.assertTrue(spans, self.panel.status_label.text())
-        self.assertTrue(all(f.kp_start > 0.49 for f in spans), [f.kp_start for f in spans])
+        # The slack-free half is pulled taut; friction lets it draw on (and tension)
+        # the slack cable just before it, so a span may start a few tens of metres early.
+        self.assertTrue(all(f.kp_start > 0.45 for f in spans), [f.kp_start for f in spans])
+        self.assertTrue(any("bend radius" in f.message or "reaction" in f.message for f in spans))
         short = [f for f in self.panel._findings if f.check_id == "length_balance"]
         # Sand waves: about 1.4 % more seabed than plan, so the 3 % slack half is clear and
         # the slack-free half is short of the seabed (pulled taut).
@@ -216,6 +219,47 @@ class AssessmentPanelTests(unittest.TestCase):
         with open(csv_path, encoding="utf-8") as handle:
             self.assertEqual(len(handle.readlines()), len(self.panel._findings) + 1)
 
+    def test_raster_sampled_at_grid_cell_size(self):
+        raster = QgsRasterLayer(sand_wave_raster(self.folder), "sand waves")
+        QgsProject.instance().addMapLayer(raster)
+        self.addCleanup(QgsProject.instance().removeMapLayer, raster.id())
+        self.panel.seabed_combo.setCurrentIndex(self.panel.seabed_combo.findData(SEABED_RASTER))
+        self.panel.raster_combo.setLayer(raster)
+        self.panel.interval_spin.setValue(0)  # auto
+        self.panel.run()
+        model = self.panel._model
+        self.assertIsNotNone(model, self.panel.status_label.text())
+        spacing = float(np.median(np.diff(model.x_m)))
+        self.assertAlmostEqual(spacing, 1.0, delta=0.05)  # the grid's ~1 m cells
+        self.assertIn("cell size", self.panel.status_label.text())
+
+    def test_sampling_notes(self):
+        from ..explorer.panels.assessment_panel import SEABED_CONTOURS, seabed_sampling_notes
+
+        x = np.arange(0.0, 100.0, 1.0)
+        depth = np.full_like(x, 100.0)
+        sources = ["a"] * 50 + ["b"] * 50
+        notes, skip = seabed_sampling_notes(SEABED_RASTER, x, depth, x / 1000.0, cells=[0.5] * 50 + [5.0] * 50,
+                                            sources=sources, messages=[("Partial raster coverage", "W", 7)])
+        text = " ".join(notes)
+        self.assertIsNone(skip)
+        self.assertIn("0.5 m to 5 m", text)
+        self.assertIn("MBR", text)              # 5 m cells blunt crests
+        self.assertIn("KP 0.050", text)         # where the two rasters meet
+        self.assertIn("Partial raster coverage", text)
+        notes, skip = seabed_sampling_notes(SEABED_RASTER, x, depth, x / 1000.0, cells=[1.0] * 100, auto=False)
+        self.assertNotIn("MBR", " ".join(notes))
+        coarse = np.arange(0.0, 100.0, 5.0)
+        notes, _ = seabed_sampling_notes(SEABED_RASTER, coarse, np.full_like(coarse, 100.0), coarse / 1000.0,
+                                         cells=[1.0] * len(coarse), auto=False)
+        self.assertIn("auto", " ".join(notes))  # sampled coarser than the grid
+        levels = np.array([10.0, 11.0, 12.0, 11.0, 10.0])
+        notes, skip = seabed_sampling_notes(SEABED_CONTOURS, np.arange(5.0) * 20, levels, np.arange(5.0) / 50)
+        self.assertIn("Contours every 1 m", " ".join(notes))
+        self.assertIn("seabed length", skip)
+        _notes, skip = seabed_sampling_notes(SEABED_CONTOURS, np.arange(5.0) * 20, levels / 2, np.arange(5.0) / 50)
+        self.assertIsNone(skip)                 # 0.5 m contours: the length check still runs
+
     def test_lay_model_seabed_and_record_checks(self):
         self.panel.seabed_combo.setCurrentIndex(self.panel.seabed_combo.findData(SEABED_LAY_MODEL))
         self.panel.run()
@@ -227,6 +271,82 @@ class AssessmentPanelTests(unittest.TestCase):
         laid = next(f for f in self.panel._findings if f.check_id == "laid_under_tension")
         self.assertAlmostEqual(laid.kp_start, 0.5, places=3)
         self.assertTrue(math.isclose(laid.value, 3.0))
+
+
+def _wait(condition, timeout=60.0):
+    import time
+
+    from qgis.PyQt.QtCore import QCoreApplication
+
+    end = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > end:
+            raise AssertionError("timed out waiting for the background assessment")
+        QCoreApplication.processEvents()
+        time.sleep(0.01)
+
+
+class AssessmentBackgroundTests(unittest.TestCase):
+    """The run happens in a QgsTask: the tab stays usable, shows progress and can cancel."""
+
+    def setUp(self):
+        self.controller = _Controller()
+        self.panel = AssessmentPanel(self.controller)
+        self.panel.persist = False
+        self.panel._library_rows = [library.clean_row(CABLE_ROW)]
+        self.panel.cable_combo.addItem("Test LW", "Test LW")
+        self.panel.cable_combo.setCurrentIndex(self.panel.cable_combo.count() - 1)
+        self.panel.units_combo.setCurrentText("kN")
+        self.panel.seabed_combo.setCurrentIndex(self.panel.seabed_combo.findData(SEABED_LAY_MODEL))
+        self.panel.set_dataset(lay_dataset())
+
+    def tearDown(self):
+        self.panel.shutdown()
+        _wait(lambda: self.panel._task is None and not self.panel._dropped_tasks)
+        self.panel.deleteLater()
+        if self.controller.profile is not None:
+            self.controller.profile.deleteLater()
+
+    def test_background_run_and_out_of_date_results(self):
+        self.panel.run()
+        self.assertEqual(self.panel.run_button.text(), "Cancel")
+        self.assertFalse(self.panel.progress_bar.isHidden())
+        _wait(lambda: self.panel._task is None)
+        self.assertEqual(self.panel.run_button.text(), "Run assessment")
+        self.assertTrue(self.panel.progress_bar.isHidden())
+        self.assertTrue(self.panel._findings, self.panel.status_label.text())
+        self.assertTrue(self.panel.stale_label.isHidden())
+        editor = self.panel._editors["laid_under_tension"]["tension_kn"]
+        original = editor.text()
+        editor.setText("1.5")
+        self.assertFalse(self.panel.stale_label.isHidden())  # results no longer match the settings
+        editor.setText(original)
+        self.assertTrue(self.panel.stale_label.isHidden())
+        editor.setText("abc")
+        self.assertIn("border", editor.styleSheet())  # not a number: outlined
+        editor.setText(original)
+        self.assertEqual(editor.styleSheet(), "")
+
+    def test_cancel_and_layer_change_mid_run(self):
+        self.panel.run()
+        self.panel.run()  # the button reads Cancel while running
+        _wait(lambda: self.panel._task is None)
+        text = self.panel.status_label.text()
+        self.assertTrue("Cancelled" in text or self.panel._findings, text)
+        # A run whose layer is replaced meanwhile is dropped, never shown on the new layer.
+        self.panel.run()
+        self.panel.set_dataset(lay_dataset(301))
+        self.assertEqual(self.panel.run_button.text(), "Run assessment")
+        _wait(lambda: not self.panel._dropped_tasks)
+        self.assertIsNone(self.panel._records)
+        self.assertFalse(self.panel._findings)
+
+    def test_readiness_shown_per_check(self):
+        self.panel.seabed_combo.setCurrentIndex(self.panel.seabed_combo.findData("none"))
+        self.assertIn("seabed source", self.panel._ready_labels["suspension"].text())
+        self.assertIn("Ready", self.panel._ready_labels["laid_under_tension"].text())
+        self.panel._check_boxes["planned_slack"].setChecked(True)
+        self.assertIn("Planned bottom slack", self.panel._ready_labels["planned_slack"].text())
 
 
 class CableTypeMappingTests(unittest.TestCase):

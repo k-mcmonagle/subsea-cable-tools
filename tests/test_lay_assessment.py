@@ -7,6 +7,7 @@ Pure Python + numpy on synthetic data only. Each test returns True/False;
 
 from __future__ import annotations
 
+import math
 import time
 from typing import List
 
@@ -360,6 +361,203 @@ def test_hull_speed() -> bool:
     return _report("100 km at 1 m in a few seconds", ok, f"{elapsed:.2f} s")
 
 
+def _zero_slack_lay(km, record_m=0.5, depth_noise=0.0, slack=None, seed=0):
+    n = int(km * 1000 / record_m)
+    kp = np.arange(n) * record_m / 1000.0
+    rng = np.random.default_rng(seed)
+    slack = np.zeros(n) if slack is None else slack(kp)
+    columns = {"TD KP": list(kp), "Bot.Tension": [0.0] * n, "Inst.Bot.Sl": list(slack),
+               "TD Depth": list(1000.0 + rng.normal(0, depth_noise, n)) if depth_noise else [1000.0] * n,
+               "TD_Lat_dd": [0.0] * n, "TD_Lon_dd": list(kp / 111.32)}
+    return _records(LayDataset(columns))
+
+
+def _friction():
+    return {"mu": 0.5, "max_reach_m": 1000.0, "shortfall_pct": 0.5}
+
+
+def test_laid_cable_ignores_depth_noise() -> bool:
+    # No slack over 40 m / 1.5 m sand waves the lay model did not see: short of the
+    # seabed. 5 cm of touchdown-depth noise between 0.5 m records used to add 1 %
+    # of "cable" and hide the shortfall entirely.
+    x = np.arange(0.0, 3000.0, 2.0)
+    depth = _waves(x)
+    found = []
+    for noise in (0.0, 0.05):
+        rec = _zero_slack_lay(3.0, depth_noise=noise)
+        m = la.model_seabed(x, x / 1000.0, depth, rec, rec.kp * 1000.0, 0.05, 0.3, 5.0, smoothing_m=None,
+                            friction=_friction())
+        found.append((float(np.nanmedian(m.balance_pct)), len(m.shortfalls), len(m.spans)))
+    (clean_bal, clean_short, clean_spans), (noisy_bal, noisy_short, noisy_spans) = found
+    ok = clean_short >= 1 and noisy_short >= 1 and abs(clean_bal - noisy_bal) < 0.1
+    ok = ok and clean_spans > 20 and abs(noisy_spans - clean_spans) <= 0.1 * clean_spans
+    return _report("touchdown-depth noise does not add laid cable", ok, str(found))
+
+
+def test_taut_solver_station_spacing() -> bool:
+    # Short stretches near the threshold: the answer must not depend on whether the
+    # seabed is sampled every 1 m or 2 m (the laid cable was measured over the
+    # window, the shape over the stations inside it: short windows looked slack).
+    rec = _zero_slack_lay(10.0, slack=lambda kp: np.clip(0.9 + 0.6 * np.sin(kp * 1000 / 137.0), 0, None))
+    counts = []
+    for step in (2.0, 1.0):
+        x = np.arange(0.0, 10000.0, step)
+        m = la.model_seabed(x, x / 1000.0, _waves(x), rec, rec.kp * 1000.0, 0.05, 0.3, 5.0, smoothing_m=None,
+                            friction=_friction())
+        counts.append((len(m.shortfalls), round(float(np.median([s.tension_kn for s in m.shortfalls] or [0])), 2)))
+        if any(s.reach_m > 1000.0 + 1e-6 for s in m.shortfalls):
+            return _report("taut stretches independent of station spacing", False, "reach above the cap")
+    (n2, t2), (n1, t1) = counts
+    ok = n1 > 0 and abs(n2 - n1) <= max(1, 0.1 * n1) and abs(t2 - t1) <= 0.15 * max(t1, 1e-9)
+    return _report("taut stretches independent of station spacing (reach within cap)", ok, str(counts))
+
+
+def _ridges(x, height=2.0, slope=0.5, at=(150.0, 250.0), base=-1000.0):
+    seabed = np.full_like(x, base)
+    for c in at:
+        seabed = np.maximum(seabed, base + height - slope * np.abs(x - c))
+    return seabed
+
+
+def test_crests_hold_the_cable() -> bool:
+    # Two sharp 2 m rock ridges 100 m apart at 3 kN: 1.56 m gap on the raw seabed.
+    # Resting the cable on the seabed smoothed over the conformity length lowered
+    # the crests and hid most of it (0.32 m); the 2 m noise filter keeps 1.25 m.
+    x = np.arange(0.0, 400.0, 1.0)
+    depth = -_ridges(x)
+    n = 800
+    kp = np.arange(n) * 0.0005
+    rec = _records(LayDataset({"TD KP": list(kp), "Bot.Tension": [3.0] * n, "TD Depth": [1000.0] * n,
+                               "TD_Lat_dd": [0.0] * n, "TD_Lon_dd": list(kp / 111.32)}))
+    m = la.model_seabed(x, x / 1000.0, depth, rec, rec.kp * 1000.0, 0.05, 0.3, 5.0, smoothing_m=None,
+                        filter_m=None)
+    gap = float(np.nanmax(m.gap_m))
+    ok = gap > 1.2 and m.smoothing_m >= 10.0 and m.filter_m == la.AUTO_FILTER_M
+    ok = ok and m.spans and max(s.length_m for s in m.spans) >= 15.0
+    return _report("crests holding the cable survive the seabed filter", ok,
+                   f"gap {gap:.2f} m spans {[round(s.length_m) for s in m.spans]}")
+
+
+def test_noise_makes_no_false_spans() -> bool:
+    # Flat MBES seabed with 10 cm sounding noise at 1 m: no reportable span at 3 kN.
+    x = np.arange(0.0, 2000.0, 1.0)
+    depth = 1000.0 + np.random.default_rng(5).normal(0, 0.1, len(x))
+    n = 4000
+    kp = np.arange(n) * 0.0005
+    rec = _records(LayDataset({"TD KP": list(kp), "Bot.Tension": [3.0] * n, "TD Depth": [1000.0] * n,
+                               "TD_Lat_dd": [0.0] * n, "TD_Lon_dd": list(kp / 111.32)}))
+    m = la.model_seabed(x, x / 1000.0, depth, rec, rec.kp * 1000.0, 0.05, 0.3, 5.0, smoothing_m=None,
+                        filter_m=None)
+    return _report("sounding noise makes no false spans", not m.spans,
+                   f"{len(m.spans)} spans, max gap {np.nanmax(m.gap_m):.2f} m")
+
+
+def test_support_bend_radius_and_reaction() -> bool:
+    # A sharp 2 m crest on a flat seabed, H = 5 kN, w = 10 N/m: the cable drapes
+    # over it as two parabolas of curvature w/H, tangent to the seabed L = sqrt(2h/c)
+    # away, turning through 2 atan(cL) at the crest. Reaction = weight of the two
+    # half spans; bend radius 2 sqrt(EI/H) / turn.
+    x = np.arange(0.0, 400.0, 0.5)
+    seabed = _ridges(x, at=(200.0,))
+    h, ei = 5000.0, 2.0
+    c = W / h
+    y = la.cable_rest_elevation(x, seabed, np.full_like(x, c))
+    spans = la.find_spans(x, x / 1000.0, y - seabed, np.full_like(x, h / 1000.0), 0.3, 5.0)
+    supports = la.span_supports(x, seabed, y, np.full_like(x, h / 1000.0), np.full_like(x, W),
+                                np.full_like(x, ei), np.full_like(x, 8.0), spans)
+    half = math.sqrt(2 * 2.0 / c)
+    turn = 2 * math.atan(c * half)
+    radius = 2 * math.sqrt(ei * 1000.0 / h) / turn
+    crest = min(supports, key=lambda sp: abs(sp.kp - 0.2)) if supports else None
+    ok = len(spans) == 2 and crest is not None
+    ok = ok and abs(crest.reaction_kn - W * 2 * half / 1000.0) < 0.03 * W * 2 * half / 1000.0
+    ok = ok and abs(crest.bend_radius_m - radius) < 0.05 * radius and crest.below_mbr
+    ok = ok and all(s.below_mbr and abs(s.min_bend_radius_m - crest.bend_radius_m) < 1e-9 for s in spans)
+    findings = la.seabed_span_findings(la.SeabedModel(x, x / 1000, -seabed, -y, np.full_like(x, 5.0),
+                                                      np.full_like(x, W), spans=spans, supports=supports), {})
+    ok = ok and all(f.severity == Severity.ERROR and "MBR" in f.message for f in findings)
+    return _report("bend radius and reaction at a span support", ok,
+                   f"R={crest.bend_radius_m if crest else None} expected {radius:.2f}; "
+                   f"P={crest.reaction_kn if crest else None} expected {W * 2 * half / 1000:.3f}")
+
+
+def test_allowable_tension() -> bool:
+    # The highest tension with no reportable span: just below it the ridges are
+    # spanned within the limits, a little above it they are not.
+    x = np.arange(0.0, 400.0, 1.0)
+    seabed = _ridges(x, height=1.0, slope=0.1)
+    w = np.full_like(x, W)
+    allowable = la.allowable_tension_kn(x, seabed, w, 0.3, 5.0, core_m=400.0, margin_m=0.0)
+    value = float(np.nanmin(allowable))
+
+    def spans_at(t_kn):
+        y = la.cable_rest_elevation(x, seabed, w / (t_kn * 1000.0))
+        return la.find_spans(x, x / 1000.0, y - seabed, np.full_like(x, t_kn), 0.3, 5.0)
+    ok = 0.1 < value < 100.0 and not spans_at(0.95 * value) and spans_at(1.15 * value)
+    return _report("allowable tension keeps spans within the limits", ok, f"{value:.3f} kN")
+
+
+def test_ntts_breach_at_sheave_not_hidden() -> bool:
+    # A joint in the water: LW (low NOTS, high NTTS) below, SA above. SA at the sheave
+    # passes its NTTS while LW at the joint is "worse" against NOTS; the NTTS breach
+    # must still be reported red.
+    lw = la.CableProps("LW", weight_water_kg_m=10.0 / la.G, nots_kn=50.0, ntts_kn=300.0, npts_kn=20.0)
+    sa = la.CableProps("SA", weight_water_kg_m=30.0 / la.G, nots_kn=150.0, ntts_kn=160.0, npts_kn=60.0)
+    ds = _dataset(3, **{"TD KP": [0.880, 0.890, 0.900], "Meas.Top Tension": [170.0] * 3,
+                        "Inst.Bot.Sl": [0.0] * 3, "Layback": [0.0] * 3, "TD_Lon_dd": [0.0] * 3})
+    rec = la.build_records(ds, la.detect_roles(ds.field_names, ds.is_numeric_field))
+    la.apply_makeup(rec, la.KpMakeup.from_ranges([(0.0, 1.0, "LW"), (1.0, 3.0, "SA")]),
+                    lambda label: {"LW": lw, "SA": sa}.get(label))
+    findings, _ = la.run_record_checks(rec, {"top_tension": {}})
+    ok = len(findings) == 1 and findings[0].severity == Severity.ERROR and "SA" in findings[0].message
+    return _report("NTTS breach at the sheave is not hidden by NOTS at a joint", ok,
+                   str([(f.severity, f.message) for f in findings]))
+
+
+def test_progress_and_cancel() -> bool:
+    rec = _zero_slack_lay(2.0)
+    x = np.arange(0.0, 2000.0, 2.0)
+    seen = []
+    la.model_seabed(x, x / 1000.0, _waves(x), rec, rec.kp * 1000.0, smoothing_m=None, friction=_friction(),
+                    allowable=True, progress=lambda f, text=None: seen.append((f, text)))
+    fractions = [f for f, _ in seen]
+    ok = fractions and fractions[-1] == 1.0 and all(b >= a - 1e-9 for a, b in zip(fractions, fractions[1:]))
+    ok = ok and any(text and "taut" in text for _, text in seen)
+    try:
+        la.model_seabed(x, x / 1000.0, _waves(x), rec, rec.kp * 1000.0, friction=_friction(),
+                        cancel=lambda: True)
+        cancelled = False
+    except la.Cancelled:
+        cancelled = True
+    return _report("seabed model reports progress and can be cancelled", ok and cancelled,
+                   f"{len(seen)} reports, cancelled={cancelled}")
+
+
+def test_track_smoothing() -> bool:
+    # Lateral jitter of the touchdown is averaged out of the sampling track; a
+    # straight track (and its ends) is unchanged.
+    n = 2000
+    kp = np.arange(n) * 0.001
+    deg = 1.0 / 111320.0
+    jitter = np.random.default_rng(2).normal(0, 2.0, n) * deg
+    rec = _records(_dataset(n, **{"TD KP": list(kp), "TD_Lon_dd": list(kp * 1000 * deg),
+                                  "TD_Lat_dd": list(jitter)}))
+    lon, lat, kp_v = la.track_vertices(rec)
+    raw_lon, raw_lat, _ = la.track_vertices(rec, smoothing_m=0.0)
+    ok = np.std(lat) / deg < 0.4 * np.std(raw_lat) / deg
+    ok = ok and np.allclose(lon, raw_lon, atol=1e-12) and lon[0] == raw_lon[0] and lon[-1] == raw_lon[-1]
+    return _report("touchdown track smoothed across, unchanged along", ok,
+                   f"lateral std {np.std(raw_lat) / deg:.2f} -> {np.std(lat) / deg:.2f} m")
+
+
+def test_sampling_helpers() -> bool:
+    ok = abs(la.contour_interval_m([10.0, 10.5, 11.0, 10.5, 12.0, None]) - 0.5) < 1e-9
+    ok = ok and abs(la.contour_interval_m([20.0, 21.0, 22.0, 21.0]) - 1.0) < 1e-9
+    rec = _records(_dataset(50))
+    ok = ok and abs(la.record_spacing_m(rec) - 2.0) < 1e-9
+    return _report("contour interval and touchdown record spacing", ok)
+
+
 def run_all() -> List[bool]:
     results = [
         test_detect_roles(),
@@ -381,6 +579,16 @@ def run_all() -> List[bool]:
         test_status_bins(),
         test_track_vertices(),
         test_hull_speed(),
+        test_laid_cable_ignores_depth_noise(),
+        test_taut_solver_station_spacing(),
+        test_crests_hold_the_cable(),
+        test_noise_makes_no_false_spans(),
+        test_support_bend_radius_and_reaction(),
+        test_allowable_tension(),
+        test_ntts_breach_at_sheave_not_hidden(),
+        test_progress_and_cancel(),
+        test_track_smoothing(),
+        test_sampling_helpers(),
     ]
     print(f"\n{sum(results)}/{len(results)} lay assessment checks passed.")
     return results
