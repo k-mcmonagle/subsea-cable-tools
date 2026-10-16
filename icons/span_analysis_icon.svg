@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!-- Span & Slack Analysis: a cable spanning between two seabed crests. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1c365c"/>
+      <stop offset="1" stop-color="#36597a"/>
+    </linearGradient>
+  </defs>
+  <rect x="1" y="1" width="22" height="22" rx="4.5" fill="url(#bg)"/>
+  <path d="M1 17.5L5 15.8L7.2 11.2L9.4 16.6L12.5 19.2L15.6 16.4L17 12.2L19.4 15.4L23 16.6V18.5A4.5 4.5 0 0 1 18.5 23H5.5A4.5 4.5 0 0 1 1 18.5Z" fill="#8d6e63"/>
+  <path d="M7.2 11.2Q12.1 15.6 17 12.2Z" fill="#d32f2f" fill-opacity="0.75"/>
+  <path d="M1.8 17.2L5 15.8L7.2 11.2Q12.1 15.6 17 12.2L19.4 15.4L22.2 16.3" fill="none" stroke="#f5a623" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M5 6.5H19" stroke="#e3ecf5" stroke-width="1.2" stroke-linecap="round"/>
+  <path d="M12 4.6V8.4" stroke="#e3ecf5" stroke-width="1.2" stroke-linecap="round"/>
+</svg>

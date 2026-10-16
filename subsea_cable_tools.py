@@ -67,13 +67,14 @@ class SubseaCableTools:
         'explorer_window',
         'catenary_calculator_v2_dialog',
         'lay_simulator_dialog',
+        'span_analysis_dialog',
         'bu_lowering_dialog',
         'cable_library_dialog',
     )
     # Every action attribute set by initGui (all are also in self.actions).
     _ACTION_ATTRS = (
         'plotter_action', 'depth_profile_action', 'catenary_v2_action',
-        'lay_simulator_action', 'bu_lowering_action', 'workbench_action',
+        'lay_simulator_action', 'bu_lowering_action', 'span_analysis_action', 'workbench_action',
         'planner_action', 'burial_action', 'transit_measure_action',
         'explorer_action', 'cable_library_action', 'kp_settings_action',
         'save_layers_gpkg_action',
@@ -111,6 +112,7 @@ class SubseaCableTools:
         self.explorer_window = None
         self.catenary_calculator_v2_dialog = None
         self.lay_simulator_dialog = None
+        self.span_analysis_dialog = None
         self.bu_lowering_dialog = None
         self.cable_library_dialog = None
         for attr in self._ACTION_ATTRS:
@@ -222,6 +224,14 @@ class SubseaCableTools:
             tooltip="BU Lowering Tool (3D): lower a branching unit on its trunk "
                     "over two pre-laid legs — quick analytic model with a "
                     "full-solver verify (beta).")
+
+        # Span & Slack Analysis: plan a lay against spans and loops (2D)
+        self.span_analysis_action = self.add_action(
+            self._icon('span_analysis_icon.svg'), "Span & Slack Analysis",
+            self.show_span_analysis,
+            tooltip="Span & Slack Analysis: rest a cable on the seabed profile along "
+                    "a route, vary the bottom tension or slack, and see spans, "
+                    "loop risk, residual tension and friction effects (beta).")
 
         # Cable Route Workbench (assemblies + RPLs + systems in one dock)
         self.workbench_action = self.add_action(
@@ -335,7 +345,8 @@ class SubseaCableTools:
                 self.burial_action,
                 self.explorer_action,
                 self.lay_simulator_action,
-                self.bu_lowering_action):
+                self.bu_lowering_action,
+                self.span_analysis_action):
             self.experimental_menu.addAction(action)
         self.experimental_tool_button.setMenu(self.experimental_menu)
         self.experimental_toolbar_action = self.iface.addToolBarWidget(
@@ -387,6 +398,21 @@ class SubseaCableTools:
         self.bu_lowering_dialog.show()
         self.bu_lowering_dialog.raise_()
         self.bu_lowering_dialog.activateWindow()
+
+    def show_span_analysis(self):
+        """Show the Span & Slack Analysis window."""
+        if not _alive(self.span_analysis_dialog):
+            try:
+                from .span_analysis.dialog import SpanAnalysisDialog
+                self.span_analysis_dialog = SpanAnalysisDialog(self._main_window(), iface=self.iface)
+            except Exception:
+                self.span_analysis_dialog = None
+                self._report_open_failure(
+                    "Span & Slack Analysis could not be opened." + _PYQTGRAPH_HINT)
+                return
+        self.span_analysis_dialog.show()
+        self.span_analysis_dialog.raise_()
+        self.span_analysis_dialog.activateWindow()
 
     def show_cable_lay_explorer(self):
         """Show the standalone Cable Lay Data Explorer window."""

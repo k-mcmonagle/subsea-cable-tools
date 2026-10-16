@@ -23,9 +23,9 @@ from its name (for example `TD KP`, `Bot.Tension`, `Inst.Bot.Slack`, `Meas.Top T
   flag reads 0, no, false or invalid.
 - **Tension units** are set once for all tension columns (kN, tonne-force, kgf or lbf).
 - **Bottom slack** is the seabed slack in %, where 0 means the cable exactly follows the seabed
-  profile. This is the MakaiLay convention: when computed slack reaches zero the model reports
-  bottom tension instead.
-- **Bottom tension** in MakaiLay data is a *model* output, not a measurement. Top tension is the
+  profile. This is the usual lay-software convention: when computed slack reaches zero the model
+  reports bottom tension instead.
+- **Bottom tension** in lay-software logs is usually a *model* output, not a measurement. Top tension is the
   measured quantity. The *Top tension consistency* check compares the two.
 
 ### Cable library
@@ -240,10 +240,11 @@ O(n) pass, so 100 km at 1 m resolution takes about a second.
   there. Both choices are conservative: they give more spans.
 - **Conforming cable.** Stations below *Cable conforms below* (default 0.05 kN) lie on the seabed and
   pin the cable.
-- **Reporting.** Spans are reported when higher than *Report spans higher than* (default 0.3 m)
-  **and** longer than *…and longer than* (default 5 m). They are red when higher than 1 m, longer
-  than 50 m, or bent below the MBR at a support (below). Each says whether its tension came from the
-  lay model or from the cable being short.
+- **Reporting.** A span runs from lift-off to touchdown (the pipeline definition, DNV-RP-F105), the
+  same as in Span & Slack Analysis. It is reported when higher than *Report spans higher than*
+  (default 0.3 m) **and** longer than *…and longer than* (default 5 m). It is red when higher than
+  1 m, longer than 50 m, or bent below the MBR at a support (below). Each says whether its tension
+  came from the lay model or from the cable being short.
 - **Gaps.** Gaps in the bathymetry are never bridged.
 
 ### Span supports: reaction, bend radius and MBR
@@ -418,5 +419,6 @@ The unit tests check:
   (mechanical characteristics; definitions in ITU-T G.972).
 - E. E. Zajac, *Dynamics and kinematics of the laying and recovery of submarine cable*, Bell System
   Technical Journal, 1957.
-- Makai Ocean Engineering, MakaiLay documentation: bottom slack / bottom tension solutions; "too
-  little slack can lead to suspensions… too much can cause loops and eventually kinks".
+- L. Binda and R. Contro, *Unilateral contact problems for cables*, Engineering Structures 1(3),
+  1979: the rest-shape problem solved by the seabed model.
+- [Span & Slack Analysis](SPAN_ANALYSIS.md): the planning tool that shares this seabed engine.

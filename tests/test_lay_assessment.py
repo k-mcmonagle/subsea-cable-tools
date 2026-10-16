@@ -74,7 +74,7 @@ def test_detect_roles() -> bool:
                 "payout_speed": "Payout Spe", "valid_flag": "Solution Va", "td_lat": "TD_Lat_dd",
                 "td_lon": "TD_Lon_dd", "sheave_height": "Sheave He"}
     wrong = {k: (found.get(k), v) for k, v in expected.items() if found.get(k) != v}
-    return _report("roles detected from MakaiLay-style (truncated) headers", not wrong, str(wrong))
+    return _report("roles detected from lay-software-style (truncated) headers", not wrong, str(wrong))
 
 
 def test_span_sag_matches_catenary() -> bool:
@@ -438,6 +438,25 @@ def test_crests_hold_the_cable() -> bool:
                    f"gap {gap:.2f} m spans {[round(s.length_m) for s in m.spans]}")
 
 
+def test_span_length_lift_off_to_touchdown() -> bool:
+    # A single sharp 2 m crest at 5 kN, w = 10 N/m: a span either side runs from
+    # the crest to touchdown, sqrt(2 h H / w) = 44.7 m (the part higher than the
+    # 0.3 m reporting gap alone is only about 27 m). Same length as Span & Slack Analysis.
+    x = np.arange(0.0, 400.0, 0.5)
+    depth = -_ridges(x, at=(200.0,))
+    n = 800
+    kp = np.arange(n) * 0.0005
+    rec = _records(LayDataset({"TD KP": list(kp), "Bot.Tension": [5.0] * n, "TD Depth": [1000.0] * n,
+                               "TD_Lat_dd": [0.0] * n, "TD_Lon_dd": list(kp / 111.32)}))
+    m = la.model_seabed(x, x / 1000.0, depth, rec, rec.kp * 1000.0, 0.05, 0.3, 5.0, smoothing_m=None,
+                        filter_m=0.0)
+    expect = math.sqrt(2.0 * 2.0 * 5000.0 / W)
+    lengths = [s.length_m for s in m.spans]
+    ok = len(lengths) == 2 and all(abs(v - expect) < 0.04 * expect for v in lengths)
+    return _report("span length runs from lift-off to touchdown", ok,
+                   f"{[round(v, 1) for v in lengths]} vs {expect:.1f} m")
+
+
 def test_noise_makes_no_false_spans() -> bool:
     # Flat MBES seabed with 10 cm sounding noise at 1 m: no reportable span at 3 kN.
     x = np.arange(0.0, 2000.0, 1.0)
@@ -582,6 +601,7 @@ def run_all() -> List[bool]:
         test_laid_cable_ignores_depth_noise(),
         test_taut_solver_station_spacing(),
         test_crests_hold_the_cable(),
+        test_span_length_lift_off_to_touchdown(),
         test_noise_makes_no_false_spans(),
         test_support_bend_radius_and_reaction(),
         test_allowable_tension(),
