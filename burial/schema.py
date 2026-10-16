@@ -21,6 +21,10 @@ Table overview:
                  with per-tool configurations and an optional DXF footprint
 - bp_analysis    latest Exclusions recompute / Risk Profile run per plan
                  (derived display state + currency fingerprints)
+- bp_cpt_campaign / bp_cpt / bp_cpt_data
+                 project-scoped cone penetration tests imported from AGS
+                 files (+ an optional position/summary table): one row per
+                 import, one header row and one readings row per CPT
 
 Plan-keyed tables are listed once in ``PLAN_CHILD_TABLES`` (delete /
 duplicate coverage).
@@ -42,7 +46,7 @@ from ..workbench.schema import (  # noqa: F401  (re-exported for the package)
     utc_now_iso,
 )
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 # Registry table names ------------------------------------------------------
 TABLE_META = "bp_meta"
@@ -66,6 +70,9 @@ TABLE_GROUND_DATASET = "bp_ground_dataset"
 TABLE_GROUND_CLASS = "bp_ground_class"
 TABLE_BAS_ROW = "bp_bas_row"
 TABLE_ANALYSIS = "bp_analysis"
+TABLE_CPT_CAMPAIGN = "bp_cpt_campaign"
+TABLE_CPT = "bp_cpt"
+TABLE_CPT_DATA = "bp_cpt_data"
 
 FieldSpec = Tuple[str, str]
 
@@ -727,6 +734,57 @@ GROUND_PROFILE_FIELDS: List[FieldSpec] = [
     ("units", "str"), ("samples_json", "str"), ("provenance_json", "str"),
 ]
 
+# Cone penetration tests (schema v13), project-scoped like the numeric
+# datasets: a campaign is one import (AGS files + an optional position /
+# summary table, the choices made, the files' fingerprints and Input Data
+# Register details); each CPT keeps its position in WGS84 (KP is measured on
+# each plan's route when shown, never stored) and its readings as delivered,
+# in canonical units. Derived parameters are computed when shown from the
+# project's CPT settings (bp_meta "cpt_settings").
+CPT_CAMPAIGN_FIELDS: List[FieldSpec] = [
+    ("campaign_id", "str"),
+    ("name", "str"),
+    ("config_json", "str"),          # files, name rule, positions table + columns, CRS
+    ("originator", "str"),
+    ("revision", "str"),
+    ("status", "str"),               # current | superseded
+    ("received_utc", "str"),
+    ("quality", "str"),              # high | moderate | low | insufficient | ""
+    ("notes", "str"),
+    ("imported_utc", "str"),
+    ("seq", "int"),
+]
+
+CPT_FIELDS: List[FieldSpec] = [
+    ("cpt_id", "str"),
+    ("campaign_id", "str"),
+    ("name", "str"),                 # the CPT name used for matching and display
+    ("location_id", "str"),          # AGS LOCA_ID / HOLE_ID
+    ("test_ref", "str"),             # AGS SCPG_TESN (blank in AGS 3)
+    ("source_file", "str"),
+    ("ags_version", "str"),
+    ("lat", "float"),                # WGS84; NULL = no position
+    ("lon", "float"),
+    ("position_source", "str"),      # table | ags | ""
+    ("water_depth_m", "float"),
+    ("final_depth_m", "float"),      # penetration achieved
+    ("max_depth_m", "float"),        # deepest reading
+    ("readings", "int"),
+    ("max_qc_mpa", "float"),
+    ("tested", "str"),               # date/time text as delivered
+    ("summary", "str"),
+    ("termination", "str"),          # why the push stopped (CPTG_TERM / LOCA_TERM)
+    ("layers_json", "str"),          # stratigraphy: table horizons or AGS GEOL
+    ("meta_json", "str"),            # project/location/test rows, warnings, sources
+    ("seq", "int"),
+]
+
+CPT_DATA_FIELDS: List[FieldSpec] = [
+    ("cpt_id", "str"),
+    ("campaign_id", "str"),
+    ("readings_json", "str"),        # {"depth": [...], "channels": {...}, "units": {...}}
+]
+
 # Project-scoped soil-class vocabulary (colour + group per code).
 GROUND_CLASS_FIELDS: List[FieldSpec] = [
     ("class_id", "str"),
@@ -807,6 +865,9 @@ REGISTRY_TABLES: Dict[str, List[FieldSpec]] = {
     TABLE_GROUND_CLASS: GROUND_CLASS_FIELDS,
     TABLE_BAS_ROW: BAS_ROW_FIELDS,
     TABLE_ANALYSIS: ANALYSIS_FIELDS,
+    TABLE_CPT_CAMPAIGN: CPT_CAMPAIGN_FIELDS,
+    TABLE_CPT: CPT_FIELDS,
+    TABLE_CPT_DATA: CPT_DATA_FIELDS,
 }
 
 TABLE_KEYS: Dict[str, str] = {
@@ -832,6 +893,9 @@ TABLE_KEYS: Dict[str, str] = {
     TABLE_GROUND_CLASS: "class_id",
     TABLE_BAS_ROW: "row_id",
     TABLE_ANALYSIS: "analysis_id",
+    TABLE_CPT_CAMPAIGN: "campaign_id",
+    TABLE_CPT: "cpt_id",
+    TABLE_CPT_DATA: "cpt_id",
 }
 
 # Every registry table holding one plan's rows (a ``plan_id`` column), and
@@ -1029,6 +1093,28 @@ BAS_LAYER_TAIL_FIELDS: List[FieldSpec] = [
     ("src_rpl", "str"),
     ("rereference_flags", "str"),
     ("notes", "str"),
+]
+
+
+# CPT locations: one project-wide point layer (not per plan — KP depends on
+# the plan's route and is shown in the Ground Model tab instead).
+CPT_LAYER_NAME = "bp_cpt_locations"
+CPT_LAYER_FIELDS: List[FieldSpec] = [
+    ("cpt_id", "str"),
+    ("name", "str"),
+    ("campaign", "str"),
+    ("location_id", "str"),
+    ("water_depth_m", "float"),
+    ("final_depth_m", "float"),
+    ("max_depth_m", "float"),
+    ("readings", "int"),
+    ("max_qc_mpa", "float"),
+    ("tested", "str"),
+    ("summary", "str"),
+    ("termination", "str"),
+    ("source_file", "str"),
+    ("ags_version", "str"),
+    ("position_source", "str"),
 ]
 
 

@@ -12,6 +12,8 @@ Signals:
     kpHovered(float)        crosshair moved to this KP
     kpClicked(float)        left click at this KP
     unitClicked(str)        left click landed inside this unit (unit_id)
+    profileClicked(str)     left click on a numeric investigation (source id)
+    cptClicked(str)         left click on a CPT trace (cpt_id)
 """
 
 from __future__ import annotations
@@ -164,6 +166,7 @@ class GroundModelPlot(QWidget):
     kpClicked = pyqtSignal(float)
     unitClicked = pyqtSignal(str)
     profileClicked = pyqtSignal(str)
+    cptClicked = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -206,6 +209,14 @@ class GroundModelPlot(QWidget):
         self._numeric_item.setVisible(False)
         item.addItem(self._numeric_item)
 
+        from .cpt_plot import CptTraceItem
+        self._cpt_item = CptTraceItem()
+        self._cpt_item.setZValue(12)
+        self._cpt_item.setVisible(False)
+        item.addItem(self._cpt_item, ignoreBounds=True)
+        self._cpt_legend = ""
+        self._cpt_channel = ""
+
         self._seabed_line = pg.InfiniteLine(
             angle=0, pos=0.0, movable=False,
             pen=pg.mkPen((90, 90, 90), width=1.4))
@@ -239,11 +250,17 @@ class GroundModelPlot(QWidget):
         self.legend.setWordWrap(True)
         self.legend.setTextFormat(getattr(Qt, "TextFormat", Qt).RichText)
         self.legend.setContentsMargins(8, 2, 8, 0)
+        self.cpt_legend = QLabel("")
+        self.cpt_legend.setWordWrap(True)
+        self.cpt_legend.setTextFormat(getattr(Qt, "TextFormat", Qt).RichText)
+        self.cpt_legend.setContentsMargins(8, 0, 8, 0)
+        self.cpt_legend.setVisible(False)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(self.legend)
+        layout.addWidget(self.cpt_legend)
         layout.addWidget(self.plot, 1)
 
         self.plot.scene().sigMouseMoved.connect(self._mouse_moved)
@@ -308,6 +325,39 @@ class GroundModelPlot(QWidget):
         swatches = "".join("<span style='background:#{:02x}{:02x}{:02x}'>&nbsp;</span>".format(*colors[i][:3])
                            for i in range(0, 256, 8))
         self.legend.setText(f"{title} &nbsp; {limits[0]:g} {swatches} {limits[1]:g} &nbsp; {notes}")
+
+    def set_cpts(self, entries=None, full_scale: float = 1.0, channel: str = "qc",
+                 strip: bool = True) -> None:
+        """CPT traces over the units or numeric dataset (None/[] hides them).
+
+        ``entries`` come from ``cpt_plot.build_entries``; ``full_scale`` is
+        the ``channel`` value drawn at the full trace width.
+        """
+        from ..geotech import cpt as cpt_mod
+        entries = list(entries or [])
+        self._cpt_channel = channel
+        self._cpt_item.set_entries(entries, full_scale, strip=strip)
+        self._cpt_item.setVisible(bool(entries))
+        if entries:
+            unit = cpt_mod.channel_unit(channel)
+            label = cpt_mod.channel_label(channel, with_unit=False)
+            text = (f"<span style='color:#7a1f5c'><b>CPT traces</b></span> {_esc(label)}: "
+                    f"0–{full_scale:g} {_esc(unit)} across each trace; {len(entries)} CPT(s)")
+            if strip and any(e.get("zones") for e in entries):
+                from ..geotech.cpt import SBT_ZONES
+                swatches = " ".join(f"<span style='color:{colour}; font-size:14px'>■</span>{zone}"
+                                    for zone, (_l, colour) in SBT_ZONES.items())
+                text += f" &nbsp; SBTn strip: {swatches}"
+            self.cpt_legend.setText(text)
+        self.cpt_legend.setVisible(bool(entries))
+        self._fit_depth()
+
+    def set_selected_cpt(self, cpt_id: str) -> None:
+        self._cpt_item.set_selected(cpt_id)
+
+    def cpt_at(self, kp: float, depth: Optional[float] = None):
+        """The CPT entry whose trace is under ``kp`` (and ``depth``), or None."""
+        return self._cpt_item.hit(kp, depth) if self._cpt_item.isVisible() else None
 
     def set_scope(self, start_kp: float, end_kp: float) -> None:
         lo, hi = sorted((float(start_kp), float(end_kp)))
@@ -375,7 +425,8 @@ class GroundModelPlot(QWidget):
         if self._numeric_depth is not None:
             self.plot.getPlotItem().vb.setYRange(*self._numeric_depth, padding=0)
             return
-        deepest = max(self._unit_item.depth_extent, self._target_m or 0.0)
+        cpt_depth = self._cpt_item.depth_extent if self._cpt_item.isVisible() else 0.0
+        deepest = max(self._unit_item.depth_extent, self._target_m or 0.0, cpt_depth)
         span = max(deepest + _OPEN_EXTRA_M, _MIN_DEPTH_SPAN_M)
         self.plot.getPlotItem().vb.setYRange(0.0, span, padding=0.04)
 
@@ -403,7 +454,41 @@ class GroundModelPlot(QWidget):
     def unit_at(self, kp: float, depth_m: float) -> Optional[Dict]:
         return ground_model.unit_at(self._units, kp, depth_m)
 
+    def _cpt_lines(self, kp: float, depth: float) -> List[str]:
+        entry = self.cpt_at(kp, depth)
+        if entry is None:
+            return []
+        from ..geotech import cpt as cpt_mod
+        head = f"CPT {entry['name']} — KP {schema.format_kp(entry['kp'])}"
+        if entry.get("side"):
+            head += f" ({entry['side']})"
+        lines = [head]
+        index = self._cpt_item.reading_at(entry, depth)
+        if index is None:
+            lines.append("below the deepest reading")
+            return lines
+        reading_depth = entry["depths"][index]
+        zones = entry.get("zones") or []
+        zone = zones[index] if index < len(zones) else None
+        parts = []
+        for key in (self._cpt_channel, "qc", "fs", "su", "ic"):
+            series = entry["channels"].get(key)
+            if not series or key in [p[0] for p in parts]:
+                continue
+            value = series[index]
+            if value is not None:
+                parts.append((key, f"{cpt_mod.channel_symbol(key)} {value:.3g} {cpt_mod.channel_unit(key)}".strip()))
+        lines.append(f"{reading_depth:.2f} m: " + (", ".join(p[1] for p in parts) or "no reading"))
+        if zone in cpt_mod.SBT_ZONES:
+            lines.append(f"SBTn {zone}: {cpt_mod.SBT_ZONES[zone][0]}")
+        return lines
+
     def _readout_text(self, kp: float, depth: float) -> str:
+        text = self._ground_readout(kp, depth)
+        cpt_lines = self._cpt_lines(kp, depth)
+        return "\n".join([text] + cpt_lines) if cpt_lines else text
+
+    def _ground_readout(self, kp: float, depth: float) -> str:
         lines = [f"KP {schema.format_kp(kp)}   {max(0.0, depth):.2f} m bsb"]
         if self._numeric_index is not None:
             hits = self._numeric_index.at(kp, depth)
@@ -478,6 +563,11 @@ class GroundModelPlot(QWidget):
         if hit is None:
             return
         kp, depth = hit
+        cpt = self.cpt_at(kp, depth)
+        if cpt is not None:
+            self.cptClicked.emit(str(cpt["cpt_id"]))
+            self.kpClicked.emit(float(cpt["kp"]))
+            return
         if self._numeric_index is not None:
             sources = list(dict.fromkeys(a["source_id"] for a, _s in self._numeric_index.at(kp, depth)))
             for source in sources:

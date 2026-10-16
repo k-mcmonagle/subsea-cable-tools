@@ -90,6 +90,7 @@ class PlanModel(QObject):
     groundChanged = pyqtSignal()     # ground-model units and/or classes
     basChanged = pyqtSignal()        # BAS register rows and/or columns
     analysisChanged = pyqtSignal()   # persisted latest analysis results
+    cptsChanged = pyqtSignal()       # project-scoped CPT campaigns / settings
     logChanged = pyqtSignal()
     storeError = pyqtSignal(str)
 
@@ -1911,6 +1912,107 @@ class PlanModel(QObject):
         self.groundChanged.emit()
         self.logChanged.emit()
         return True
+
+    # -- cone penetration tests (project-scoped) -------------------------------
+    CPT_VIEW_DEFAULTS = {"show": True, "channel": "qc", "max_offset_m": 250.0,
+                         "half_range_m": 100.0, "full_scale": 0.0, "strip": True}
+
+    @property
+    def cpts(self):
+        """The cached CPT register of the current store."""
+        register = getattr(self, "_cpt_register", None)
+        if register is None or register.store is not self.store:
+            from .cpt_register import CptRegister
+            register = self._cpt_register = CptRegister(self.store)
+        return register
+
+    def cpt_settings(self) -> Dict:
+        """The project's CPT processing settings, defaults filled."""
+        from ..geotech import cpt as cpt_mod
+        try:
+            return cpt_mod.settings(self.store.cpt_settings())
+        except Exception:
+            log_exception("Burial Planner: CPT settings could not be read",
+                          level=logging.DEBUG)
+            return cpt_mod.settings()
+
+    def save_cpt_settings(self, values: Dict) -> bool:
+        ok, _ = self._store_write("save the CPT settings", self.store.save_cpt_settings, values)
+        if ok:
+            self.cptsChanged.emit()
+        return ok
+
+    def cpt_view(self) -> Dict:
+        """This plan's CPT display: traces on/off, channel, placement limits."""
+        try:
+            stored = json.loads(self.plan.get("params_json") or "{}").get("cpt") or {}
+        except (TypeError, ValueError, AttributeError):
+            stored = {}
+        view = dict(self.CPT_VIEW_DEFAULTS)
+        if isinstance(stored, dict):
+            view.update({k: v for k, v in stored.items() if k in view})
+        return view
+
+    def save_cpt_view(self, updates: Dict, reason: str = "CPT display") -> bool:
+        if not self.plan:
+            return False
+        view = self.cpt_view()
+        view.update(updates)
+        if self.update_gen_params({"cpt": view}, reason=reason, stale=False):
+            self.cptsChanged.emit()
+            return True
+        return False
+
+    def save_cpt_campaign(self, campaign: Dict, cpts: List[Dict],
+                          readings: Dict[str, Dict]) -> Optional[str]:
+        """Store one CPT import (replacing it when it exists) in one
+        transaction, then rewrite the CPT locations layer. Not plan history:
+        CPTs are shared by every plan, like the numeric datasets."""
+        try:
+            self.store.ensure_created()
+        except Exception as exc:
+            self.storeError.emit(f"Could not create the Burial Planner GeoPackage:\n{exc}")
+            return None
+        ok, campaign_id = self._store_transaction(
+            "save the CPTs", lambda: self.store.save_cpt_campaign(campaign, cpts, readings))
+        if not ok:
+            return None
+        self._after_cpts_changed()
+        return campaign_id
+
+    def delete_cpt_campaign(self, campaign_id: str) -> bool:
+        ok, _ = self._store_transaction(
+            "remove the CPTs", lambda: self.store.delete_cpt_campaign(campaign_id))
+        if ok:
+            self._after_cpts_changed()
+        return ok
+
+    def write_cpt_layer(self) -> bool:
+        """Rewrite the CPT locations layer from the register (after commits:
+        the layer writer cannot run inside the registry transaction)."""
+        from . import cpt_register
+        ok, _ = self._store_write(
+            "write the CPT locations layer",
+            lambda: cpt_register.write_layer(self.store, self.store.list_cpt_campaigns(),
+                                             self.store.list_cpts()))
+        if ok:
+            try:
+                from . import map_layers
+                layer = map_layers.find_layer(QgsProject.instance(), self.store.gpkg_path,
+                                              schema.CPT_LAYER_NAME)
+                if layer is not None:
+                    layer.dataProvider().reloadData()
+                    layer.updateExtents()
+                    layer.triggerRepaint()
+            except Exception:
+                log_exception("Burial Planner: the CPT locations layer was not reloaded",
+                              level=logging.DEBUG)
+        return ok
+
+    def _after_cpts_changed(self) -> None:
+        self.write_cpt_layer()
+        self.cpts.invalidate()
+        self.cptsChanged.emit()
 
     # -- BAS register --------------------------------------------------------
     def _load_bas_rows(self) -> None:

@@ -8,6 +8,8 @@ The top-level [README](../README.md) is the short introduction and tool list. Us
 
 - [Numeric Ground Model datasets](GROUND_NUMERIC_PROFILES.md) — measurements, live KP ranges, colour classes, checks and export.
 
+- [CPTs from AGS files](GEOTECHNICAL_CPT.md) — AGS 3 / AGS 4 CPT import with a position and summary table, placement along the route, traces, logs and the derived parameters.
+
 - [KP and bathymetry methods](KP_AND_BATHYMETRY.md) — KP distance, CRS, bathymetry sampling, slope and coverage conventions.
 
 - [Lay Assessment](LAY_ASSESSMENT.md) — suspension, loop-risk and tension checks on lay data; the seabed rest model and its validation.

@@ -714,6 +714,102 @@ class BurialStore:
                 if str(r.get("dataset_id") or "") != dataset_id]
         self.write_table(schema.TABLE_GROUND_PROFILE, kept + rows)
 
+    # -- cone penetration tests (project-scoped) -------------------------------
+    def list_cpt_campaigns(self) -> List[Dict]:
+        """CPT imports, ``config`` decoded, in import order."""
+        campaigns = []
+        for row in self.read_table(schema.TABLE_CPT_CAMPAIGN):
+            row["config"] = _json(row.pop("config_json", None), {})
+            campaigns.append(row)
+        campaigns.sort(key=lambda r: (int(r.get("seq") or 0), str(r.get("imported_utc") or "")))
+        return campaigns
+
+    def list_cpts(self, campaign_id: Optional[str] = None) -> List[Dict]:
+        """CPT header rows (no readings), ``layers``/``meta`` decoded."""
+        conn = self._sql()
+        if conn is not None and campaign_id is not None:
+            rows = gpkg_sql.read_rows(conn, schema.TABLE_CPT, "campaign_id = ?", (campaign_id,))
+        else:
+            rows = [r for r in self.read_table(schema.TABLE_CPT)
+                    if campaign_id is None or r.get("campaign_id") == campaign_id]
+        for row in rows:
+            row["layers"] = _json(row.pop("layers_json", None), [])
+            row["meta"] = _json(row.pop("meta_json", None), {})
+        rows.sort(key=lambda r: (str(r.get("campaign_id") or ""), int(r.get("seq") or 0)))
+        return rows
+
+    def cpt_readings(self, cpt_ids: Optional[Sequence[str]] = None) -> Dict[str, Dict]:
+        """``{cpt_id: readings}`` (depth, channels, units, headings)."""
+        wanted = None if cpt_ids is None else {str(i) for i in cpt_ids}
+        conn = self._sql()
+        if conn is not None and wanted is not None:
+            ids = sorted(wanted)
+            rows = []
+            for start in range(0, len(ids), 500):
+                chunk = ids[start:start + 500]
+                rows += gpkg_sql.read_rows(conn, schema.TABLE_CPT_DATA,
+                                           "cpt_id IN (" + ",".join("?" * len(chunk)) + ")", chunk)
+        else:
+            rows = self.read_table(schema.TABLE_CPT_DATA)
+        out = {}
+        for row in rows:
+            cpt_id = str(row.get("cpt_id") or "")
+            if wanted is not None and cpt_id not in wanted:
+                continue
+            out[cpt_id] = _json(row.get("readings_json"), {})
+        return out
+
+    def save_cpt_campaign(self, campaign: Dict, cpts: Sequence[Dict],
+                          readings: Dict[str, Dict]) -> str:
+        """Insert or replace one CPT import and all of its CPTs (call inside
+        a transaction so the campaign and its readings land together)."""
+        row = {key: campaign.get(key) for key, _type in schema.CPT_CAMPAIGN_FIELDS
+               if key != "config_json"}
+        row["campaign_id"] = row.get("campaign_id") or schema.new_id()
+        row["seq"] = int(row.get("seq") or 0)
+        row["imported_utc"] = row.get("imported_utc") or schema.utc_now_iso()
+        row["config_json"] = json.dumps(campaign.get("config") or {}, allow_nan=False)
+        campaign_id = row["campaign_id"]
+        header_rows, data_rows = [], []
+        for seq, cpt in enumerate(cpts):
+            header = {key: cpt.get(key) for key, _type in schema.CPT_FIELDS
+                      if key not in ("layers_json", "meta_json")}
+            header.update(campaign_id=campaign_id, seq=seq,
+                          layers_json=json.dumps(cpt.get("layers") or [], allow_nan=False),
+                          meta_json=json.dumps(cpt.get("meta") or {}, allow_nan=False))
+            header_rows.append(header)
+            data_rows.append({"cpt_id": header["cpt_id"], "campaign_id": campaign_id,
+                              "readings_json": json.dumps(readings.get(header["cpt_id"]) or {},
+                                                          allow_nan=False, separators=(",", ":"))})
+        self.upsert_rows(schema.TABLE_CPT_CAMPAIGN, [row])
+        conn = self._sql()
+        for table, rows in ((schema.TABLE_CPT, header_rows), (schema.TABLE_CPT_DATA, data_rows)):
+            if conn is not None:
+                gpkg_sql.replace_where(conn, table, "campaign_id = ?", (campaign_id,), rows)
+            else:
+                kept = [r for r in self.read_table(table) if r.get("campaign_id") != campaign_id]
+                self.write_table(table, kept + rows)
+        return campaign_id
+
+    def delete_cpt_campaign(self, campaign_id: str) -> None:
+        """Remove a CPT import and its CPTs (call inside a transaction)."""
+        conn = self._sql()
+        for table in (schema.TABLE_CPT_DATA, schema.TABLE_CPT):
+            if conn is not None:
+                gpkg_sql.delete_where(conn, table, "campaign_id = ?", (campaign_id,))
+            else:
+                self.write_table(table, [r for r in self.read_table(table)
+                                         if r.get("campaign_id") != campaign_id])
+        self.delete_rows(schema.TABLE_CPT_CAMPAIGN, [campaign_id])
+
+    def cpt_settings(self) -> Dict:
+        """The project's CPT processing settings (raw; see geotech.cpt.settings)."""
+        value = _json(self.read_meta().get("cpt_settings"), {})
+        return value if isinstance(value, dict) else {}
+
+    def save_cpt_settings(self, values: Dict) -> None:
+        self.write_meta("cpt_settings", json.dumps(values or {}, allow_nan=False))
+
     def list_ground_units(self, plan_id: str) -> List[Dict]:
         rows = self.read_plan_table(schema.TABLE_GROUND_UNIT, plan_id)
         rows.sort(key=lambda r: (int(r.get("seq") or 0),
@@ -986,6 +1082,7 @@ def _migrate_v11_to_v12(store: BurialStore) -> None:
 
 
 # Maps a starting schema version to the function upgrading it one step.
+# v12 -> v13 only adds the CPT tables, which ``ensure_created`` creates.
 MIGRATIONS: Dict[int, object] = {1: _migrate_v1_to_v2, 3: _migrate_v3_to_v4,
                                  5: _migrate_v5_to_v6, 6: _migrate_v6_to_v7,
                                  11: _migrate_v11_to_v12}
@@ -1013,6 +1110,16 @@ def _repoint_copied_row(table: str, row: Dict,
     elif table == schema.TABLE_HAZARD:
         row["check_id"] = id_maps.get("check_id", {}).get(
             str(row.get("check_id") or ""), "")
+
+
+def _json(text, default):
+    """Decoded JSON text, or ``default`` when blank or unreadable."""
+    if not text:
+        return default
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError):
+        return default
 
 
 def _normalise_row(row: Dict) -> Dict:

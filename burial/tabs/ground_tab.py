@@ -6,6 +6,10 @@ editable unit table. Units are imported from CSV/XLSX with column mapping
 and a stated KP reference (which RPL revision the document's KPs follow),
 or entered and edited here; edits are one logged, undoable replacement of
 the plan's units when *Apply* is pressed.
+
+The *Numeric datasets* display colours the plot by a measured value; the
+*CPTs* display manages cone penetration tests imported from AGS files.
+CPT traces can be drawn over any display.
 """
 
 from __future__ import annotations
@@ -42,6 +46,7 @@ from ...qgis_compat import (
 )
 from .. import change_log, ground_model, schema, ui_helpers
 from ..ground_dialogs import ClassesDialog, GroundImportDialog, RereferenceDialog
+from ..cpt_panel import CptPanel
 from ..ground_plot import GroundModelPlot
 from ..numeric_profile_panel import NumericProfilePanel
 
@@ -72,6 +77,7 @@ _DEFAULT_HIDDEN = ("Top @ end (m)", "Base @ end (m)", "Src start KP",
                    "Src end KP", "Src RPL", "Re-ref flags", "Notes")
 _COL_CLASS = 4
 _COL_CONFIDENCE = 7
+MODE_SOIL, MODE_NUMERIC, MODE_CPT = 0, 1, 2
 
 
 class GroundTab(QWidget):
@@ -88,9 +94,9 @@ class GroundTab(QWidget):
         layout.setContentsMargins(4, 4, 4, 4)
 
         intro = QLabel(
-            "Ground conditions by KP and depth below seabed. Select soil classes "
-            "or a numeric dataset (e.g. CPT results). The KP axis follows bathymetry; "
-            "the dashed line shows target burial depth.")
+            "Ground conditions by KP and depth below seabed: soil classes, a numeric "
+            "dataset, or CPTs imported from AGS files (drawn as traces at their KP). "
+            "The KP axis follows bathymetry; the dashed line shows target burial depth.")
         intro.setWordWrap(True)
         intro.setStyleSheet(ui_helpers.hint_style())
         layout.addWidget(intro)
@@ -98,8 +104,12 @@ class GroundTab(QWidget):
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("Display:"))
         self.display_mode = QComboBox()
-        self.display_mode.addItems(["Soil classes", "Numeric datasets"])
+        self.display_mode.addItems(["Soil classes", "Numeric datasets", "CPTs"])
+        self.display_mode.setToolTip("Soil classes: the plan's ground-model units. Numeric datasets: one "
+                                     "measured value coloured by KP and depth. CPTs: import and check "
+                                     "cone penetration tests (AGS 3 / AGS 4).")
         mode_row.addWidget(self.display_mode)
+        self._mode_row = mode_row
         mode_row.addStretch()
         layout.addLayout(mode_row)
 
@@ -156,7 +166,12 @@ class GroundTab(QWidget):
 
         table_pane = QWidget()
         self.soil_table_pane = table_pane
-        table_layout = QVBoxLayout(table_pane)
+        pane_layout = QVBoxLayout(table_pane)
+        pane_layout.setContentsMargins(0, 0, 0, 0)
+        self._pane_layout = pane_layout
+        self.soil_editor = QWidget()
+        pane_layout.addWidget(self.soil_editor, 1)
+        table_layout = QVBoxLayout(self.soil_editor)
         table_layout.setContentsMargins(0, 0, 0, 0)
         edit_row = QHBoxLayout()
         self.add_button = QPushButton("Add unit")
@@ -227,26 +242,44 @@ class GroundTab(QWidget):
         self.numeric = NumericProfilePanel(model, dock, self.plot, self)
         layout.insertWidget(3, self.numeric)
         self.numeric.hide()
+        self.cpts = CptPanel(model, dock, self.plot, self)
+        self._mode_row.insertWidget(2, self.cpts.overlay_controls)
+        self._pane_layout.addWidget(self.cpts, 1)
+        self.cpts.hide()
         self.display_mode.currentIndexChanged.connect(self._display_changed)
         model.groundChanged.connect(self.numeric.reload_sources)
+        cpts_signal = getattr(model, "cptsChanged", None)
+        if cpts_signal is not None:
+            cpts_signal.connect(self.numeric.reload_sources)
 
         refresh_soon = ui_helpers.coalesced(self, self.refresh)
         model.planChanged.connect(refresh_soon)
         model.groundChanged.connect(refresh_soon)
+        if cpts_signal is not None:
+            cpts_signal.connect(refresh_soon)
         self.refresh()
 
     def _display_visibility(self, index):
-        self.numeric.active = index == 1
-        self.numeric.setVisible(index == 1)
-        self.soil_table_pane.setVisible(index == 0)
-        self.plot_hint.setText(
-            "Hover for investigation, depth, value and class; click a KP range to plot that investigation's readings."
-            if index else "Hover for KP / depth / unit; click to select the soil unit and go to that KP.")
+        if index not in (MODE_SOIL, MODE_NUMERIC, MODE_CPT):
+            index = MODE_SOIL
+        self.numeric.active = index == MODE_NUMERIC
+        self.numeric.setVisible(index == MODE_NUMERIC)
+        self.cpts.setVisible(index == MODE_CPT)
+        self.soil_editor.setVisible(index == MODE_SOIL)
+        self.soil_table_pane.setVisible(index in (MODE_SOIL, MODE_CPT))
+        self.plot_hint.setText({
+            MODE_NUMERIC: "Hover for investigation, depth, value and class; click a KP range to plot that "
+                          "investigation's readings.",
+            MODE_CPT: "Hover a CPT trace for its values at that depth; click it for the CPT log. Select a "
+                      "CPT below to find it on the map and the profile.",
+        }.get(index, "Hover for KP / depth / unit; click to select the soil unit and go to that KP."))
         for widget in (self.import_button, self.export_button, self.rereference_button,
                        self.classes_button, self.show_map, self.status_label):
-            widget.setVisible(index == 0)
-        if not index and self.plot._numeric_index is not None:
+            widget.setVisible(index == MODE_SOIL)
+        if index != MODE_NUMERIC and self.plot._numeric_index is not None:
             self.plot.set_numeric(None)
+        if index == MODE_CPT:
+            self.cpts.ensure_map_layer()
 
     def _display_changed(self, index):
         self._display_visibility(index)
@@ -257,6 +290,7 @@ class GroundTab(QWidget):
     # -- refresh ---------------------------------------------------------------
     def refresh(self) -> None:
         self.numeric.refresh()
+        self.cpts.refresh()
         mode = self.numeric.state.get("mode", 0)
         self.display_mode.blockSignals(True)
         self.display_mode.setCurrentIndex(mode)
@@ -298,6 +332,7 @@ class GroundTab(QWidget):
         self.plot.set_target_runs(self.model.target_runs()
                                   if self.model.plan else [])
         self.numeric.render()
+        self.cpts.render()
 
     def _update_status(self) -> None:
         if not self._working:
@@ -745,6 +780,14 @@ class GroundTab(QWidget):
                 schema.ground_layer_name, self.show_map.isChecked())
         except Exception:
             pass
+
+    # -- CPT colour sections ---------------------------------------------------
+    def add_cpt_dataset(self, channel: str) -> None:
+        """Open a new numeric dataset from a CPT value, placed at the CPTs."""
+        if not self.model.plan:
+            return
+        self.display_mode.setCurrentIndex(MODE_NUMERIC)
+        self.numeric.add_cpt_dataset(channel)
 
     # -- plot sync -------------------------------------------------------------
     def _plot_hover(self, kp: float) -> None:

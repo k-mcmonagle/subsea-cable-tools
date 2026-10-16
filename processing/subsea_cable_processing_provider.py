@@ -86,6 +86,9 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
         # --- Cable Lay QC & Analysis ---
         safe_add('run_cable_lay_qc_algorithm', 'RunCableLayQcAlgorithm')
 
+        # --- Geotechnical ---
+        safe_add('import_ags_cpt_algorithm', 'ImportAgsCptAlgorithm')
+
         # --- MDB Tools ---
         safe_add('import_mdb_algorithm', 'ImportMdbAlgorithm')
         safe_add('import_path_file_algorithm', 'ImportPathFileAlgorithm')

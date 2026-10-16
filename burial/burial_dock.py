@@ -164,6 +164,7 @@ class BurialPlannerDock(QDockWidget):
         self._generate_fresh = False
         self._fresh_keep_client = True
         self._marker = None
+        self._cpt_marker = None
         self._band = None
         self._footprint_band = None
         self._vessel_band = None
@@ -1651,6 +1652,28 @@ class BurialPlannerDock(QDockWidget):
         marker.show()
         self._update_footprint(kp)
 
+    def flash_point(self, lon: float, lat: float) -> None:
+        """Ring a CPT (or any WGS84 position) on the map; pan to it when it
+        is outside the view."""
+        if self.canvas is None:
+            return
+        try:
+            point = self._canvas_transform().transform(QgsPointXY(float(lon), float(lat)))
+        except (QgsCsException, TypeError, ValueError):
+            log_exception("Burial Planner: CPT marker transform failed", level=logging.DEBUG)
+            return
+        if self._cpt_marker is None or _sip_isdeleted(self._cpt_marker):
+            self._cpt_marker = QgsVertexMarker(self.canvas)
+            self._cpt_marker.setColor(QColor("#7a1f5c"))
+            self._cpt_marker.setIconSize(18)
+            self._cpt_marker.setIconType(QgsVertexMarker.ICON_CIRCLE)
+            self._cpt_marker.setPenWidth(3)
+        self._cpt_marker.setCenter(point)
+        self._cpt_marker.show()
+        if not self.canvas.extent().contains(point):
+            self.canvas.setCenter(point)
+            self.canvas.refresh()
+
     # -- tool footprint overlay ----------------------------------------------
     def _footprint_toggled(self, checked: bool) -> None:
         QSettings().setValue(
@@ -2492,9 +2515,10 @@ class BurialPlannerDock(QDockWidget):
                 self.canvas.viewport().removeEventFilter(self)
             except (AttributeError, RuntimeError):
                 pass
-        items = (self._marker, self._band, self._footprint_band,
+        items = (self._marker, self._cpt_marker, self._band, self._footprint_band,
                  self._vessel_band) + tuple(self._exclusion_bands)
         self._marker = None
+        self._cpt_marker = None
         self._band = None
         self._footprint_band = None
         self._vessel_band = None

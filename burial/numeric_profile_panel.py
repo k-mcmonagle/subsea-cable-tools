@@ -163,7 +163,7 @@ class NumericProfilePanel(QWidget):
         except (ValueError, RuntimeError) as exc:
             self.notes = [str(exc)]
         self._watch(layer)
-        changed = sources.source_changed(dataset)
+        changed = sources.source_changed(dataset, self.model)
         if changed:
             self.notes.insert(0, changed)
 
@@ -228,12 +228,40 @@ class NumericProfilePanel(QWidget):
         if dataset is not None:
             self._open_dialog(dataset)
 
-    def _open_dialog(self, dataset):
+    def _open_dialog(self, dataset, prefill=None):
         profiles = self.model.store.list_numeric_profiles(dataset["dataset_id"]) if dataset else []
-        dialog = DatasetDialog(self.model, dataset, profiles, self)
+        dialog = DatasetDialog(self.model, dataset, profiles, self, prefill=prefill)
         if qt_exec(dialog) != DIALOG_ACCEPTED or dialog.result() is None:
             return
         self.save_dataset(*dialog.result())
+
+    def cpt_prefill(self, channel: str):
+        """A new dataset of one CPT value, placed at the CPT positions."""
+        from ..geotech import cpt as cpt_mod
+        from .numeric_profile_plot import ramp_colours
+        view = self.model.cpt_view() if self.model.plan else dict(self.model.CPT_VIEW_DEFAULTS)
+        symbol, unit = cpt_mod.channel_symbol(channel), cpt_mod.channel_unit(channel)
+        colours = {"mode": "continuous", "ramp": "Viridis", "auto": True}
+        terms = cpt_mod.SU_TERMS if channel in ("su", "su_low") else \
+            cpt_mod.QC_TERMS if channel in ("qc", "qt") else None
+        if terms:
+            # Standard strength (BS 5930) / density terms as editable classes.
+            palette = ramp_colours("Viridis", len(terms))
+            colours = {"mode": "classes", "ramp": "Viridis", "auto": True, "classes": [
+                {"min": lo, "max": hi, "min_inclusive": True, "max_inclusive": False,
+                 "colour": palette[i], "label": label} for i, (lo, hi, label) in enumerate(terms)]}
+        columns = dict(sources.CPT_COLUMNS, value=sources.cpt_value_header(channel))
+        return {"name": f"CPT {symbol}", "variable": symbol, "units": unit,
+                "config": {"measurements": {"source": {"kind": sources.SOURCE_CPT, "channel": channel,
+                                                       "interval_m": 0.05},
+                                            "header_row": 1, "columns": columns, "depth_scale": 1.0},
+                           "placement": {"kind": sources.PLACEMENT_CPT,
+                                         "max_offset_m": float(view["max_offset_m"]),
+                                         "half_range_m": float(view["half_range_m"])},
+                           "colours": colours}}
+
+    def add_cpt_dataset(self, channel: str) -> None:
+        self._open_dialog(None, prefill=self.cpt_prefill(channel))
 
     def save_dataset(self, dataset, profiles):
         if not any(d["dataset_id"] == dataset["dataset_id"] for d in self.datasets):
@@ -249,7 +277,7 @@ class NumericProfilePanel(QWidget):
         if dataset is None:
             return
         try:
-            profiles, config = sources.reload_measurements(dataset)
+            profiles, config = sources.reload_measurements(dataset, self.model)
         except (ValueError, OSError) as exc:
             QMessageBox.warning(self, "Reload measurements", str(exc))
             return

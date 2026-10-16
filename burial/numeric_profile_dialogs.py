@@ -1,9 +1,10 @@
 """Numeric dataset dialogs: define a dataset, check it, inspect a profile.
 
 One dialog defines a dataset in three tabs — Measurements (file or layer,
-four column choices), KP ranges (the layer read live to place them on the
-route) and Colours. Nothing is mapped from column names; every choice is the
-user's, and a check line under each tab reports the parsed result.
+four column choices, or a value of the project's CPTs), KP ranges (the layer
+read live to place them on the route, or the CPT positions) and Colours.
+Nothing is mapped from column names; every choice is the user's, and a
+check line under each tab reports the parsed result.
 """
 import csv
 import json
@@ -302,10 +303,12 @@ class ColoursWidget(QWidget):
 class DatasetDialog(QDialog):
     """Define or edit one numeric dataset (one variable, many investigations)."""
 
-    def __init__(self, model, dataset=None, profiles=(), parent=None):
+    def __init__(self, model, dataset=None, profiles=(), parent=None, prefill=None):
         super().__init__(parent)
         self.model = model
-        self.dataset = dict(dataset or {})
+        # ``prefill``: a new dataset with its choices already made (e.g. a
+        # CPT value placed at the CPT positions); still checked and editable.
+        self.dataset = dict(dataset or prefill or {})
         # A new dataset gets its id now: profile ids are derived from it.
         self.dataset.setdefault("dataset_id", schema.new_id())
         config = dict(self.dataset.get("config") or {})
@@ -350,6 +353,9 @@ class DatasetDialog(QDialog):
         self.variable.textChanged.connect(self._values_changed)
         self.units.textChanged.connect(self._values_changed)
         self._load_existing_source()
+        if prefill and self.grid:
+            self.measurements_dirty = True
+            self._check_measurements_soon()
         self._values_changed()
         self._check_placement_soon()
 
@@ -383,6 +389,28 @@ class DatasetDialog(QDialog):
         layer_row.addWidget(QLabel("or a loaded layer / table:"))
         layer_row.addWidget(self.layer, 1)
         layout.addLayout(layer_row)
+        cpt_row = QHBoxLayout()
+        self.cpt_channel = QComboBox()
+        self.cpt_channel.addItem("(none)", "")
+        from ..geotech import cpt as cpt_mod
+        for key in cpt_mod.TRACE_CHANNELS:
+            self.cpt_channel.addItem(cpt_mod.channel_label(key), key)
+        self.cpt_channel.setToolTip("A value of every CPT imported in this project (Ground Model ▸ CPTs), "
+                                    "measured or derived with the project's CPT settings.")
+        self.cpt_interval = QDoubleSpinBox()
+        self.cpt_interval.setDecimals(3)
+        self.cpt_interval.setRange(0.005, 5.0)
+        self.cpt_interval.setSingleStep(0.01)
+        self.cpt_interval.setSuffix(" m")
+        self.cpt_interval.setValue(float((self.measurements.get("source") or {}).get("interval_m") or 0.05))
+        self.cpt_interval.setToolTip("Readings are averaged over intervals of this depth (CPTs often "
+                                     "repeat a depth at 1 cm resolution); empty intervals stay blank.")
+        self.cpt_channel.currentIndexChanged.connect(self._cpt_chosen)
+        self.cpt_interval.valueChanged.connect(self._cpt_chosen)
+        for widget in (QLabel("or CPT values:"), self.cpt_channel, QLabel("averaged over"), self.cpt_interval):
+            cpt_row.addWidget(widget)
+        cpt_row.addStretch(1)
+        layout.addLayout(cpt_row)
         self.preview = QTableView()
         self.preview.setMaximumHeight(150)
         layout.addWidget(self.preview)
@@ -435,6 +463,13 @@ class DatasetDialog(QDialog):
                 self.measure_check.setText(f"Stored: {stored}. Choose the source to import them again.")
             return
         self.file_label.setText(sources.source_label(self.source))
+        if self.source.get("kind") == sources.SOURCE_CPT:
+            for widget in (self.cpt_channel, self.cpt_interval):
+                widget.blockSignals(True)
+            self.cpt_channel.setCurrentIndex(max(0, self.cpt_channel.findData(self.source.get("channel") or "")))
+            self.cpt_interval.setValue(float(self.source.get("interval_m") or 0.05))
+            for widget in (self.cpt_channel, self.cpt_interval):
+                widget.blockSignals(False)
         if self.source.get("kind") == "layer":
             index = self.layer.findData(self.source.get("layer_id_hint") or "")
             if index > 0:
@@ -442,7 +477,7 @@ class DatasetDialog(QDialog):
                 self.layer.setCurrentIndex(index)
                 self.layer.blockSignals(False)
         try:
-            self.grid, sheets = sources.read_source_grid(self.source)
+            self.grid, sheets = sources.read_source_grid(self.source, self.model)
         except (OSError, ValueError) as exc:
             self.measure_check.setText(f"Stored: {stored}. The source cannot be read ({exc}); "
                                        "choose it again to re-import.")
@@ -467,7 +502,48 @@ class DatasetDialog(QDialog):
             self.layer.blockSignals(True)
             self.layer.setCurrentIndex(0)
             self.layer.blockSignals(False)
+            self._clear_cpt_choice()
             self.use_file(path)
+
+    def _clear_cpt_choice(self):
+        self.cpt_channel.blockSignals(True)
+        self.cpt_channel.setCurrentIndex(0)
+        self.cpt_channel.blockSignals(False)
+
+    def _cpt_chosen(self, *_args):
+        channel = self.cpt_channel.currentData()
+        if not channel:
+            return
+        source = {"kind": sources.SOURCE_CPT, "channel": channel, "interval_m": self.cpt_interval.value()}
+        try:
+            grid, _sheets = sources.read_source_grid(source, self.model)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, self.windowTitle(), str(exc))
+            self._clear_cpt_choice()
+            return
+        self.layer.blockSignals(True)
+        self.layer.setCurrentIndex(0)
+        self.layer.blockSignals(False)
+        self.source, self.grid = source, grid
+        self._set_sheets([])
+        self.file_label.setText(sources.source_label(source))
+        self.header.blockSignals(True)
+        self.header.setValue(1)
+        self.header.blockSignals(False)
+        self._columns()
+        # The CPT table always has these columns: choose them.
+        for role, name in dict(sources.CPT_COLUMNS, value=sources.cpt_value_header(channel)).items():
+            combo = self.column[role]
+            combo.setCurrentIndex(max(0, combo.findData(self._headers.index(name))
+                                      if name in self._headers else 0))
+        self.depth_unit.setCurrentIndex(max(0, self.depth_unit.findData(1.0)))
+        from ..geotech import cpt as cpt_mod
+        if not self.variable.text().strip():
+            self.variable.setText(cpt_mod.channel_symbol(channel))
+        if not self.units.text().strip():
+            self.units.setText(cpt_mod.channel_unit(channel))
+        self.measurements_dirty = True
+        self._check_measurements_soon()
 
     def use_file(self, path, sheet=""):
         try:
@@ -491,6 +567,7 @@ class DatasetDialog(QDialog):
         layer = QgsProject.instance().mapLayer(self.layer.currentData() or "")
         if layer is None:
             return
+        self._clear_cpt_choice()
         try:
             self.grid = sources.layer_grid(layer)
         except ValueError as exc:
@@ -586,17 +663,40 @@ class DatasetDialog(QDialog):
         self.kind_group = QButtonGroup(self)
         self.kind_table = QRadioButton("KP-range layer or table (start and end KP fields)")
         self.kind_polygons = QRadioButton("Polygon layer (where the route crosses each polygon)")
-        for i, radio in enumerate((self.kind_table, self.kind_polygons)):
+        self.kind_cpt = QRadioButton("CPT positions on this plan's route")
+        self.kind_cpt.setToolTip("Each CPT applies around its KP on the route (Ground Model ▸ CPTs); "
+                                 "read live, so a moved route or a re-imported CPT needs no edit.")
+        for i, radio in enumerate((self.kind_table, self.kind_polygons, self.kind_cpt)):
             self.kind_group.addButton(radio, i)
             kinds.addWidget(radio)
         kinds.addStretch()
         layout.addLayout(kinds)
         form = QFormLayout()
+        self.place_form = form
         self.place_layer = QComboBox()
         form.addRow("Layer", self.place_layer)
         self.id_field = FieldCombo(self.placement.get("id_field") or "", "field holding the investigation ID")
         form.addRow("Investigation ID field", self.id_field)
         layout.addLayout(form)
+        self.cpt_box = QWidget()
+        cpt_form = QFormLayout(self.cpt_box)
+        cpt_form.setContentsMargins(0, 0, 0, 0)
+        self.cpt_offset = QDoubleSpinBox()
+        self.cpt_offset.setRange(0, 1e5)
+        self.cpt_offset.setSuffix(" m")
+        offset = self.placement.get("max_offset_m")
+        self.cpt_offset.setValue(250.0 if offset is None else float(offset))
+        self.cpt_offset.setToolTip("CPTs farther than this from the route are not used.")
+        self.cpt_half = QDoubleSpinBox()
+        self.cpt_half.setRange(0, 1e5)
+        self.cpt_half.setSuffix(" m")
+        half = self.placement.get("half_range_m")
+        self.cpt_half.setValue(100.0 if half is None else float(half))
+        self.cpt_half.setToolTip("Each CPT colours the route this far either side of its KP, never past "
+                                 "halfway to the next CPT; beyond that the plot stays blank.")
+        cpt_form.addRow("Use CPTs within", self.cpt_offset)
+        cpt_form.addRow("Each CPT represents up to", self.cpt_half)
+        layout.addWidget(self.cpt_box)
         self.kp_box = QWidget()
         kp_form = QFormLayout(self.kp_box)
         kp_form.setContentsMargins(0, 0, 0, 0)
@@ -605,8 +705,9 @@ class DatasetDialog(QDialog):
         self.place_check = _check_label()
         layout.addWidget(self.place_check)
         layout.addStretch()
-        polygons = self.placement.get("kind") == sources.PLACEMENT_POLYGONS
-        (self.kind_polygons if polygons else self.kind_table).setChecked(True)
+        kind = self.placement.get("kind")
+        (self.kind_cpt if kind == sources.PLACEMENT_CPT else self.kind_polygons
+         if kind == sources.PLACEMENT_POLYGONS else self.kind_table).setChecked(True)
         self._check_placement_soon = ui_helpers.coalesced(self, self._check_placement, 150)
         self._fill_place_layers()
         self.kind_group.buttonClicked.connect(self._kind_changed)
@@ -614,6 +715,8 @@ class DatasetDialog(QDialog):
         for widget in [self.id_field] + self.kp_form.widgets():
             widget.currentTextChanged.connect(self._check_placement_soon)
         self.kp_form.unit_combo.currentIndexChanged.connect(self._check_placement_soon)
+        self.cpt_offset.valueChanged.connect(self._check_placement_soon)
+        self.cpt_half.valueChanged.connect(self._check_placement_soon)
         if self.kp_form.picker is not None:
             self.kp_form.picker.combo.currentIndexChanged.connect(self._check_placement_soon)
         self._place_layer_changed()
@@ -630,6 +733,13 @@ class DatasetDialog(QDialog):
         self.place_layer.setCurrentIndex(max(0, self.place_layer.findData(current)))
         self.place_layer.blockSignals(False)
         self.kp_box.setVisible(self.kind_table.isChecked())
+        cpt = self.kind_cpt.isChecked()
+        self.cpt_box.setVisible(cpt)
+        for widget in (self.place_layer, self.id_field):
+            label = self.place_form.labelForField(widget)
+            for item in (widget, label):
+                if item is not None:
+                    item.setVisible(not cpt)
 
     def _kind_changed(self, *_args):
         self._fill_place_layers()
@@ -642,6 +752,9 @@ class DatasetDialog(QDialog):
         self._check_placement_soon()
 
     def placement_settings(self):
+        if self.kind_cpt.isChecked():
+            return {"kind": sources.PLACEMENT_CPT, "max_offset_m": self.cpt_offset.value(),
+                    "half_range_m": self.cpt_half.value()}
         layer = QgsProject.instance().mapLayer(self.place_layer.currentData() or "")
         if layer is None:
             return {}
@@ -696,7 +809,7 @@ class DatasetDialog(QDialog):
             if self.measurements_dirty or not self.stored_profiles:
                 profiles = self._parse()
                 measurements = self._measurement_settings()
-                measurements["fingerprint"] = sources.source_fingerprint(self.source)
+                measurements["fingerprint"] = sources.source_fingerprint(self.source, self.model)
             elif (row["variable"], row["units"]) != (self.dataset.get("variable"), self.dataset.get("units")):
                 profiles = [dict(p, variable=row["variable"], units=row["units"]) for p in self.stored_profiles]
             colours = self.colours.colours()

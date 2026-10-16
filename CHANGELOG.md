@@ -29,6 +29,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **Ground Model:** numeric datasets (e.g. CPT undrained shear strength) drawn by KP and depth: measurements from a file or layer with the columns you choose, KP ranges read live from a KP-range or polygon layer (translated from the RPL they are quoted on), and a continuous ramp, equal bands or custom classes (≥ or >, < or ≤). Datasets are listed with Add, Edit, Reload, Remove, Check and Export cells. Profiles imported by earlier development builds become datasets named "… — earlier import"; choose their KP ranges again (Edit…).
 
+- **Burial Planner — Ground Model CPTs (beta - check outputs):** import cone penetration tests from AGS 3 / AGS 4 files, joined by name to an optional position and summary table; CPTs near the route are drawn as traces at their KP, marked on the profile and map, and open as multi-track logs with a shared crosshair or colour the section by any measured or derived value. Plan GeoPackages are upgraded to schema 13 for the CPT tables (a backup is made first).
+- **Import AGS CPT Data:** a new *Geotechnical* Processing group reads AGS CPTs into a locations layer and readings and strata tables, with derived parameters (qt, Rf, Ic, SBTn zone, Su, Dr) as screening values.
+
 - **Burial Planner — Risk Profile:** new *KP-range table* check registers each row of a start/end KP table, with or without geometry (e.g. a desktop-study hazard list), as a hazard over its KP range, with Low/Medium/High risk from its text or numeric attributes or a default.
 
 - **Burial Planner — KP-range tables:** Exclusions criteria and Risk Profile checks record the RPL their KPs are quoted on and the KP unit (km or m). KPs on another RPL are translated to the plan's route by seabed position, and stretches the translation cannot trust are listed in the analysis and scan messages; existing criteria are read on the plan's RPL and ask you to confirm it.

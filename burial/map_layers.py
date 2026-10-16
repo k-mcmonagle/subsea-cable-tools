@@ -868,6 +868,105 @@ def apply_hazards_style(layer) -> None:
     layer.triggerRepaint()
 
 
+def apply_cpt_style(layer) -> None:
+    """CPT locations: a crossed circle (the usual CPT symbol), labelled with
+    the CPT name; identify shows name, water depth and penetration."""
+    try:
+        from qgis.core import (
+            QgsMarkerSymbol,
+            QgsPalLayerSettings,
+            QgsSingleSymbolRenderer,
+            QgsTextBufferSettings,
+            QgsTextFormat,
+            QgsVectorLayerSimpleLabeling,
+        )
+        from qgis.PyQt.QtGui import QColor
+    except ImportError:
+        return
+    if layer is None or not layer.isValid():
+        return
+    symbol = QgsMarkerSymbol.createSimple({
+        "name": "circle", "color": "255,255,255,230", "outline_color": "#7a1f5c",
+        "outline_width": "0.5", "size": "3.2"})
+    try:
+        from qgis.core import QgsSimpleMarkerSymbolLayer
+        cross = QgsSimpleMarkerSymbolLayer.create({
+            "name": "cross2", "color": "#7a1f5c", "outline_color": "#7a1f5c",
+            "outline_width": "0.45", "size": "2.6"})
+        symbol.appendSymbolLayer(cross)
+    except Exception:
+        pass
+    layer.setRenderer(QgsSingleSymbolRenderer(symbol))
+    try:
+        layer.setDisplayExpression(
+            "concat(\"name\", ' — water depth ', coalesce(format_number(\"water_depth_m\", 1), '?'),"
+            " ' m, penetration ', coalesce(format_number(coalesce(\"final_depth_m\", \"max_depth_m\"), 2), '?'), ' m')")
+    except Exception:
+        pass
+    try:
+        settings = QgsPalLayerSettings()
+        settings.fieldName = "name"
+        settings.isExpression = False
+        text_format = QgsTextFormat()
+        font = text_format.font()
+        font.setPointSize(8)
+        text_format.setFont(font)
+        text_format.setColor(QColor("#5a1645"))
+        buffer = QgsTextBufferSettings()
+        buffer.setEnabled(True)
+        buffer.setSize(0.8)
+        buffer.setColor(QColor(255, 255, 255, 220))
+        text_format.setBuffer(buffer)
+        settings.setFormat(text_format)
+        settings.dist = 1.2
+        layer.setLabeling(QgsVectorLayerSimpleLabeling(settings))
+        layer.setLabelsEnabled(True)
+    except Exception:
+        pass
+    layer.triggerRepaint()
+
+
+def ensure_cpt_layer(project: Optional[QgsProject], gpkg_path: str,
+                     visible: bool = True) -> Optional[QgsVectorLayer]:
+    """Find-or-add the project-wide CPT locations layer (Burial Planner group).
+
+    Not part of any plan's subgroup: CPTs are shared by every plan, so plan
+    switching never hides them (``set_active_plan_layers`` does not match it).
+    """
+    from ..processing.cable_lay_parsers import open_gpkg_layer
+    project = project or QgsProject.instance()
+    existing = find_layer(project, gpkg_path, schema.CPT_LAYER_NAME)
+    if existing is not None and existing.isValid():
+        return existing  # the user's layer-tree visibility is left alone
+    if open_gpkg_layer(gpkg_path, schema.CPT_LAYER_NAME) is None:
+        return None
+    layer = _ensure_layer(project, gpkg_path, schema.CPT_LAYER_NAME, apply_cpt_style,
+                          expected_fields=schema.CPT_LAYER_FIELDS, reload=True)
+    if layer is not None:
+        node = project.layerTreeRoot().findLayer(layer.id())
+        if node is not None:
+            try:
+                node.setItemVisibilityChecked(bool(visible))
+            except (AttributeError, RuntimeError):
+                pass
+    return layer
+
+
+def set_cpt_layer_visible(project: Optional[QgsProject], gpkg_path: str, visible: bool) -> None:
+    project = project or QgsProject.instance()
+    layer = find_layer(project, gpkg_path, schema.CPT_LAYER_NAME)
+    if layer is None:
+        if visible:
+            ensure_cpt_layer(project, gpkg_path, True)
+        return
+    node = project.layerTreeRoot().findLayer(layer.id())
+    if node is not None:
+        try:
+            node.setItemVisibilityChecked(bool(visible))
+        except (AttributeError, RuntimeError):
+            pass
+
+
 # -- project sync ------------------------------------------------------------
 
 
@@ -1271,6 +1370,13 @@ def _burial_layer_name(source: str) -> str:
     return ""
 
 
+def _cpt_layer_source(source: str) -> bool:
+    """Whether ``source`` names the CPT locations table of a GeoPackage."""
+    return any(part.partition("=")[0].lower() == "layername"
+               and part.partition("=")[2] == schema.CPT_LAYER_NAME
+               for part in str(source or "").split("|")[1:])
+
+
 def discover_gpkg_path(project: Optional[QgsProject] = None) -> Optional[str]:
     """Find the project's burial-plans GeoPackage without creating one.
 
@@ -1325,7 +1431,8 @@ def restore_burial_layers(project: Optional[QgsProject] = None) -> int:
         project = project or QgsProject.instance()
         broken = [layer for layer in project.mapLayers().values()
                   if isinstance(layer, QgsVectorLayer) and not layer.isValid()
-                  and _burial_layer_name(layer.source())]
+                  and (_burial_layer_name(layer.source())
+                       or _cpt_layer_source(layer.source()))]
         if not broken:
             return 0
         gpkg_path = discover_gpkg_path(project)
@@ -1336,7 +1443,7 @@ def restore_burial_layers(project: Optional[QgsProject] = None) -> int:
 
         touched = 0
         for layer in broken:
-            name = _burial_layer_name(layer.source())
+            name = _burial_layer_name(layer.source()) or schema.CPT_LAYER_NAME
             if open_gpkg_layer(gpkg_path, name) is None:
                 continue
             if repair_layer(layer, gpkg_path, name):
@@ -1357,6 +1464,8 @@ def restore_burial_layers(project: Optional[QgsProject] = None) -> int:
                     style_fn = apply_ground_style
                 elif name.endswith("_bas"):
                     style_fn = apply_bas_style
+                elif name == schema.CPT_LAYER_NAME:
+                    style_fn = apply_cpt_style
                 else:
                     style_fn = apply_events_style
                 style_fn(layer)

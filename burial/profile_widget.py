@@ -106,6 +106,7 @@ _OVERLAY_LABELS = (
     ("insufficient", "Insufficient Information", "#787878"),
     ("hazards", "Risk Profile hazards", "#8e44ad"),
     ("sections", "Plan outcome (section strip)", "#1b7f3b"),
+    ("cpts", "CPT locations", "#7a1f5c"),
 )
 # Key for Insufficient Information no criterion claims (e.g. contexts
 # stored before per-criterion no-data was recorded).
@@ -698,6 +699,14 @@ class BurialProfileWidget(QWidget):
         self._event_markers = EventMarkerItem()
         self._event_markers.setZValue(10)
         item.addItem(self._event_markers, ignoreBounds=True)
+        # CPTs near the route (Ground Model ▸ CPTs): a marker on the seabed
+        # at each CPT's KP; the readout names them.
+        self._cpts: List[Tuple[float, str]] = []
+        self._cpt_markers = pg.ScatterPlotItem(
+            symbol="t", size=11, pen=pg.mkPen("#ffffff", width=1.0),
+            brush=pg.mkBrush("#7a1f5c"))
+        self._cpt_markers.setZValue(11)
+        item.addItem(self._cpt_markers, ignoreBounds=True)
         self._series: List[Tuple[float, float]] = []
         self._series_ys: List[float] = []
         self._measurements: List[Dict] = []
@@ -1192,6 +1201,7 @@ class BurialProfileWidget(QWidget):
         self._series_xs = xs  # cached for the per-hover lookups
         self._series_ys = ys
         self._curve.setData(xs, ys, connect="finite")
+        self._place_cpt_markers()
         # Measurements belong to the profile they were placed on: a
         # different profile (resample, other plan) drops them, while the
         # empty-then-same redraw every refresh performs keeps them.
@@ -1416,12 +1426,37 @@ class BurialProfileWidget(QWidget):
             ranges.append((start, end, text, color))
         self._strip_band.set_ranges(ranges)
 
+    def set_cpts(self, points: List[Tuple[float, str]]) -> None:
+        """CPT markers: ``(kp, label)`` drawn on the seabed at each KP."""
+        self._cpts = sorted((float(kp), str(label)) for kp, label in points or [])
+        self._place_cpt_markers()
+
+    def _place_cpt_markers(self) -> None:
+        spots = []
+        if self._cpts and self._series_xs:
+            depths = [d for _x, d in self._series]
+            for kp, _label in self._cpts:
+                depth = interpolate_covered(self._series_xs, depths, kp)
+                if depth is not None:
+                    spots.append((kp, depth))
+        self._cpt_markers.setData([s[0] for s in spots], [s[1] for s in spots])
+        self._cpt_markers.setVisible(bool(spots) and self.overlay_visible("cpts"))
+
+    def cpt_labels_at(self, kp: float, pixels: float = 6.0) -> List[str]:
+        if not self._cpts or not self.overlay_visible("cpts"):
+            return []
+        try:
+            tolerance = abs(self.plot.getPlotItem().vb.viewPixelSize()[0]) * pixels
+        except Exception:
+            tolerance = 0.0
+        return [f"CPT {label}" for cpt_kp, label in self._cpts if abs(cpt_kp - kp) <= tolerance]
+
     def overlay_labels_at(self, kp: float) -> List[str]:
         """Overlay/section descriptions under a KP (the old region tooltips).
 
         Hidden overlays contribute nothing, so the readout matches the plot.
         """
-        labels: List[str] = []
+        labels: List[str] = list(self.cpt_labels_at(kp))
         for kind in ("excluded", "screening", "influence", "insufficient"):
             if not self._overlay_visible.get(kind, True):
                 continue
@@ -1491,6 +1526,9 @@ class BurialProfileWidget(QWidget):
         self._hazard_full.setVisible(hazards and full)
         self._hazard_vb.setVisible(hazards and not full)
         self._strip_vb.setVisible(self.overlay_visible("sections"))
+        cpts = getattr(self, "_cpt_markers", None)
+        if cpts is not None:
+            cpts.setVisible(self.overlay_visible("cpts") and bool(self._cpts))
         self._position_strip()
         self._sync_overlay_button()
 

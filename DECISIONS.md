@@ -764,3 +764,98 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   investigation against its KP ranges and reports unmatched IDs both ways,
   ranges beyond the route, overlaps and scope coverage; *Export cells…* writes
   the plotted KP × depth cells so the plot can be reproduced outside QGIS.
+
+## CPTs from AGS files (schema v13, October 2026)
+
+- **Home: Ground Model ▸ CPTs, project-scoped, not a registered input**:
+  CPTs are ground investigation data shared by every plan, like soil classes
+  and numeric datasets. Registered inputs are plan-scoped *layers* that
+  criteria read, so CPTs are not one. The import still carries the Input Data
+  Register details (originator, revision, status, received, quality, notes).
+  The generated `bp_cpt_locations` layer is an ordinary layer that can be
+  registered for a Risk Profile check.
+- **Import straight into the plan GeoPackage, not "load a layer, then
+  register"**: AGS files are not QGIS layers, and the positions often live in
+  a separate table, so a two-step path would need a manual join first and
+  would break when a layer is removed.
+  - The tables: `bp_cpt_campaign` (one import: files, choices, fingerprints),
+    `bp_cpt` (headers, summary columns) and `bp_cpt_data` (readings JSON,
+    loaded on demand), plus the point layer.
+  - Positions are stored in WGS84. KP and offset are measured on each plan's
+    route whenever shown, never stored, so moving a plan to another RPL needs
+    no re-referencing.
+  - A changed file is reported and *Reload* re-reads it with the same
+    choices, as for numeric datasets.
+  - The map layer is rewritten after the registry transaction commits; the
+    OGR writer cannot run inside the SQLite transaction (the file is locked).
+- **Own AGS reader (no dependency), all three CPT families**: STCN (AGS 3),
+  SCPG/SCPT/SCPP (AGS 4.0–4.1) and CPTG/CPTT/CPTP (AGS 4.2, which deprecates
+  SCPx).
+  - Group and heading names are normalised (no `*`, `**` or `?`).
+  - Parsing is line-based, because neither edition allows line breaks inside
+    values. A line whose field count is wrong is re-split on its quoted
+    commas, which recovers real files with an unescaped quote. AGS 3
+    `<CONT>`, heading continuation and continued `<UNITS>` rows are handled.
+  - Problems are warnings, not exceptions, except for a file that is not AGS.
+- **Units from the file, edition defaults otherwise**: canonical m / MPa (qc,
+  qt) / kPa (fs, u). A missing unit takes the edition's default (AGS 3 MN/m²
+  and kN/m², AGS 4 MPa) with a warning. An unknown pressure unit drops that
+  channel. An unknown depth unit rejects the file.
+- **AGS 3 pore pressure position is an explicit, per-import choice**: AGS 3
+  does not define STCN_PWP1/2/3 positions. PWP1 is read as u2 (standard
+  piezocone) unless the user chooses u1/u3, and the assumption is listed in
+  every test's warnings.
+- **CPT names are visible choices**: the default rule is the *file name* when
+  every file holds one location and the *location ID* otherwise. Generic IDs
+  such as `0001` made the location ID useless for joining. Pushes at one
+  location gain `#test`; a remaining duplicate gains ` (2)` with a note.
+  - Joining to the table is exact first, then optionally ignoring case,
+    spaces and punctuation, only when unambiguous and always reported.
+- **Table columns are the user's**: as for numeric datasets, nothing is mapped
+  from headers unless *Suggest columns from headers* is pressed.
+  - The header row starts at the fullest of the first rows, a visible and
+    editable starting point.
+  - Numbered horizon columns are chosen by their first member; the family is
+    found by the header stem.
+- **Derived values are computed when shown, never stored**: the readings stay
+  as delivered, and the project's CPT settings (bp_meta `cpt_settings`) apply
+  everywhere at once.
+  - The formulas follow Robertson & Cabal (2022), with Ic iterated to 1e-6 in
+    n. Readings are zeroed at the seabed by default; a 4.2 `CPTG_RLOC = S`
+    (deck) adds the water column.
+  - Su is a band (Nkt 15 and 20, the range AGS 4.2's CPTM example and
+    offshore practice use), for fine-grained readings by default. Dr uses
+    √(Qtn/350) for coarse-grained readings.
+  - Delivered values (qt, Rf, Bq, qnet, u0, SCPP / CPTP interpretation) are
+    kept for comparison, never overwritten.
+- **Placement without interpolation**: a CPT is used within a maximum offset
+  of the route. It represents up to a half range either side of its KP,
+  never past halfway to the next CPT, so ranges never overlap and gaps stay
+  blank. The settings are per plan, because offsets depend on the route.
+- **Fence-diagram traces, not interpolated sections, on the Ground Model
+  plot**: one painted item draws every CPT at its KP, with a trace width
+  fixed in screen pixels so traces read at any KP zoom, plus an SBTn strip.
+  Labels that would overlap are skipped. The colour *section* remains the
+  numeric-dataset path.
+  - A CPT value can become a numeric dataset: source kind `cpt`, binned to
+    depth intervals because CPTs repeat depths. The placement kind is
+    `cpt_points`, read live.
+  - Su and qc datasets start with BS 5930 strength terms or indicative qc
+    density terms as colour classes. This is a deliberate exception to "no
+    suggested ranges": they are published standard terms, shown and editable
+    before saving.
+- **The log window never removes plot items**: under QGIS 3.x's PyQt5,
+  removing any pyqtgraph item prints "unable to convert a QVariant back to a
+  Python object" (from GraphicsObject.itemChange; returning the value instead
+  of calling the base is not safe across the C++ boundary). The window builds
+  its tracks, curves, chart and painted strata/SBTn items once and updates
+  them with `setData`. Hidden tracks collapse to zero width.
+- **Not done yet (deliberately)**:
+  - CPT values do not feed Exclusions, BAS or Plan Builder.
+  - SBTn zones 1, 8 and 9 (which need the full chart region tests).
+  - Dissipation tests (SCDG/SCDT, CPDG/CPDT).
+  - Fence sections along arbitrary lines.
+  - A CPT section in the HTML report.
+  - The soil-class codes in some contractor summaries follow no published
+    scheme found; they are kept as text and coloured through the project
+    soil classes.

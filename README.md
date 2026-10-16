@@ -48,6 +48,10 @@ Find these in the QGIS Processing Toolbox under **Subsea Cable Tools**.
 - **Recompute ISO Time (fix start date)** — correct times after a start-date change.
 - **Run Cable Lay QC** — flag gaps, duplicates and other data issues.
 
+### Geotechnical
+
+- **Import AGS CPT Data** — read cone penetration tests from AGS 3 / AGS 4 files, optionally joined to a position and summary table, into a locations layer and readings and strata tables with derived parameters ([method](docs/GEOTECHNICAL_CPT.md)).
+
 ### Bathymetry and other utilities
 
 - **Import MDB** — import GeoMedia Access feature classes, with the CRS detected from the file.
@@ -83,4 +87,4 @@ These are in **Plugins ▸ Subsea Cable Tools**. The main toolbar has **KP Mouse
 
 The [KP and bathymetry methods](docs/KP_AND_BATHYMETRY.md) explain distance, depth and slope conventions. The [changelog](CHANGELOG.md) records releases. Contributions and [pull requests](https://github.com/k-mcmonagle/subsea-cable-tools/pulls) are welcome. Please report bugs and suggestions in the [issue tracker](https://github.com/k-mcmonagle/subsea-cable-tools/issues).
 
-Ground Model numeric datasets: see the [dataset workflow](docs/GROUND_NUMERIC_PROFILES.md) for CPT and other investigation data.
+Ground Model numeric datasets: see the [dataset workflow](docs/GROUND_NUMERIC_PROFILES.md) for investigation data in tables; CPTs delivered as AGS files are imported directly (see [CPTs from AGS files](docs/GEOTECHNICAL_CPT.md)).
