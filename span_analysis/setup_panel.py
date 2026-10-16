@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from qgis.PyQt.QtCore import Qt, pyqtSignal
+from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -65,10 +66,12 @@ _OPEN, _CLOSED = "▾", "▸"
 CABLE_LIBRARY = "library"
 CABLE_SECTIONS = "sections"
 CABLE_FIT = "fit"
+CABLE_RPL = "rpl"
 CABLE_MANUAL = "manual"
 CABLE_CHOICES = (
     (CABLE_LIBRARY, "One cable type (library)"),
     (CABLE_SECTIONS, "Cable types by KP (library)"),
+    (CABLE_RPL, "Workbench RPL cable type per leg (library)"),
     (CABLE_FIT, "Workbench assembly fitted to the RPL"),
     (CABLE_MANUAL, "Enter the cable properties"),
 )
@@ -266,6 +269,8 @@ class SetupPanel(QWidget):
         self._loading = True    # no change signals while the pane is built
         self._library_rows: List[Dict] = []
         self._workbench = None
+        self._mapping_labels: List[str] = []
+        self._rpl_cache: Dict = {}
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         self.route_section = Section("1  Route and KP", self._build_route(), True)
@@ -431,11 +436,14 @@ class SetupPanel(QWidget):
         self.features = EditTable([
             Col("kind", "Feature", "choice", "boulder", kinds),
             Col("kp", "KP", "float", None, tip="Centre KP (km)."),
-            Col("height", "Height (m)", "float", 1.0, tip="Boulder / berm: height above the seabed. Pipeline: top "
-                                                          "of pipe above the seabed."),
-            Col("length", "Length / OD (m)", "float", 2.0, tip="Boulder / berm: base length along the route. "
-                                                               "Pipeline: outside diameter (with coating)."),
-            Col("crest", "Crest (m)", "float", 0.0, tip="Berm / mattress: length of the flat top."),
+            Col("height", "Height / depth (m)", "float", 1.0,
+                tip="Boulder / berm: height above the seabed. Pipeline: top of pipe above the seabed. "
+                    "Depression: depth below the seabed."),
+            Col("length", "Length / OD (m)", "float", 2.0,
+                tip="Boulder / berm: base length along the route. Pipeline: outside diameter (with coating). "
+                    "Depression: width at the seabed."),
+            Col("crest", "Crest / bottom (m)", "float", 0.0,
+                tip="Berm / mattress: length of the flat top. Depression: width of the flat bottom."),
             Col("name", "Name", "text", ""),
         ], "Add feature", height=90)
         self.features.changed.connect(self._emit_changed)
@@ -475,8 +483,21 @@ class SetupPanel(QWidget):
         self.fit_combo = QComboBox()
         self.fit_combo.setToolTip("An assembly fitted to the RPL in the Workbench: its sections' cable types and "
                                   "its bodies land at KPs through the RPL's slack.")
-        self.fit_combo.currentIndexChanged.connect(self._emit_changed)
+        self.fit_combo.currentIndexChanged.connect(self._on_fit_changed)
         form.addRow("Assembly fit", self.fit_combo)
+        self.mapping_label = QLabel("Cable type labels in the Workbench and the library type each means in this "
+                                    "project (saved with the project; the Lay Assessment uses the same mapping). "
+                                    "Map a label that several library types could mean.")
+        self.mapping_label.setWordWrap(True)
+        self.mapping_label.setStyleSheet("color: #555;")
+        form.addRow(self.mapping_label)
+        self.mapping = QTableWidget(0, 3)
+        self.mapping.setHorizontalHeaderLabels(["Label", "Found by", "Library type (this project)"])
+        self.mapping.verticalHeader().setVisible(False)
+        self.mapping.horizontalHeader().setStretchLastSection(True)
+        self.mapping.setMinimumHeight(70)
+        self.mapping.setMaximumHeight(150)
+        form.addRow(self.mapping)
         self.manual = {
             "w_kg_m": _spin(0.0, 1000.0, 1.0, 3, 0.1, " kg/m", "Submerged weight per metre."),
             "ei_knm2": _spin(0.0, 100000.0, 1.0, 2, 0.5, " kN·m²", "Bending stiffness EI (0: unknown)."),
@@ -698,6 +719,8 @@ class SetupPanel(QWidget):
             self.cable_type.setCurrentIndex(max(index, 0))
             self.cable_sections.set_choices("type", names)
             self._refresh_rasters()
+            self._rpl_cache = {}
+            self.refresh_mapping()
         finally:
             self._loading = False
         self.update_status()
@@ -761,11 +784,81 @@ class SetupPanel(QWidget):
     def _on_route_changed(self, *_args) -> None:
         if self.sender() is self.rpl_combo:
             self._refresh_fits()
+            self.refresh_mapping()
         self._update_visibility()
         self._emit_changed()
 
     def _on_cable_source(self, *_args) -> None:
         self._update_visibility()
+        self.refresh_mapping()
+        self._emit_changed()
+
+    def _on_fit_changed(self, *_args) -> None:
+        self.refresh_mapping()
+        self._emit_changed()
+
+    # -- cable type mapping ----------------------------------------------------------------
+    def _labels(self) -> List[str]:
+        """Cable type labels of the chosen Workbench source (RPL legs or the fitted assembly)."""
+        cable = self.cable_source.currentData()
+        store = self._workbench
+        if store is None:
+            return []
+        try:
+            if cable == CABLE_FIT and self.fit_combo.currentData():
+                return sources.fit_labels(store, self.fit_combo.currentData())
+            if cable == CABLE_RPL and self.rpl_combo.currentData():
+                rpl_id = self.rpl_combo.currentData()
+                if self._rpl_cache.get("id") != rpl_id:
+                    self._rpl_cache = {"id": rpl_id, "model": sources.load_rpl_model(store, rpl_id)}
+                labels: List[str] = []
+                for _k0, _k1, label in sources.rpl_leg_labels(self._rpl_cache["model"]):
+                    if label not in labels:
+                        labels.append(label)
+                return labels
+        except Exception:
+            return []
+        return []
+
+    def _unmapped_labels(self) -> List[str]:
+        return [label for label in self._mapping_labels
+                if sources.resolve_label(self._library_rows, label)[0] is None]
+
+    def refresh_mapping(self) -> None:
+        """Rebuild the label -> library type table for the current Workbench source."""
+        labels = self._labels() if self.cable_source.currentData() in (CABLE_FIT, CABLE_RPL) else []
+        self._mapping_labels = labels
+        how_text = {"mapped": "project mapping", "name": "library name", "alias": "library alias",
+                    "generic": "generic type", "ambiguous": "AMBIGUOUS: choose a type",
+                    "unknown": "not in the library", "none": ""}
+        mapping = sources.project_mapping()
+        names = [row.get("name") for row in self._library_rows if row.get("name")]
+        self.mapping.setRowCount(len(labels))
+        for r, label in enumerate(labels):
+            row, how = sources.resolve_label(self._library_rows, label)
+            self.mapping.setItem(r, 0, QTableWidgetItem(label))
+            text = how_text.get(how, how)
+            if row is not None and how != "mapped":
+                text += f": {row.get('name')}"
+            found = QTableWidgetItem(text)
+            if row is None:
+                found.setForeground(QColor("#d32f2f"))
+            self.mapping.setItem(r, 1, found)
+            combo = QComboBox()
+            combo.addItem("(automatic)", None)
+            first = sources.candidates(self._library_rows, label)
+            for name in first + [n for n in names if n not in first]:
+                combo.addItem(name + ("  (candidate)" if name in first else ""), name)
+            current = mapping.get(_token(label))
+            index = combo.findData(current) if current else 0
+            combo.setCurrentIndex(max(index, 0))
+            combo.currentIndexChanged.connect(lambda _i, lab=label, c=combo: self._on_mapping(lab, c))
+            self.mapping.setCellWidget(r, 2, combo)
+        self.mapping.resizeColumnsToContents()
+
+    def _on_mapping(self, label: str, combo: QComboBox) -> None:
+        sources.set_mapping(label, combo.currentData())
+        self.refresh_mapping()
         self._emit_changed()
 
     def _update_visibility(self, *_args) -> None:
@@ -785,9 +878,11 @@ class SetupPanel(QWidget):
             (self.raster_list, on_map and seabed == SEABED_RASTER),
             (self.contour_row, on_map and seabed == SEABED_CONTOURS),
             (self.interval, on_map and seabed in (SEABED_RASTER, SEABED_CONTOURS)),
-            (self.type_row, cable in (CABLE_LIBRARY, CABLE_SECTIONS, CABLE_FIT)),
+            (self.type_row, cable in (CABLE_LIBRARY, CABLE_SECTIONS, CABLE_FIT, CABLE_RPL)),
             (self.cable_sections, cable == CABLE_SECTIONS),
             (self.fit_combo, cable == CABLE_FIT),
+            (self.mapping_label, cable in (CABLE_FIT, CABLE_RPL)),
+            (self.mapping, cable in (CABLE_FIT, CABLE_RPL)),
             (self.bodies_from_fit, cable == CABLE_FIT),
             (self.manual_box, cable == CABLE_MANUAL),
             (self.zones, zones), (self.friction_table, zones), (self.zones_label, zones), (self.table_label, zones),
@@ -797,7 +892,8 @@ class SetupPanel(QWidget):
         label = _form_label(self.type_row)
         if label is not None:
             label.setText({CABLE_LIBRARY: "Cable type", CABLE_SECTIONS: "Default cable type",
-                           CABLE_FIT: "Cable type outside the fit"}.get(cable, "Cable type"))
+                           CABLE_FIT: "Cable type outside the fit",
+                           CABLE_RPL: "Default cable type"}.get(cable, "Cable type"))
 
     # -- readiness -----------------------------------------------------------------------------
     def update_status(self) -> None:
@@ -832,7 +928,18 @@ class SetupPanel(QWidget):
             self.cable_section.set_status(f"{w:g} kg/m in water" if w > 0 else "Needs the weight in water", w > 0)
         elif cable == CABLE_FIT:
             ok = bool(self.fit_combo.currentData())
-            self.cable_section.set_status(self.fit_combo.currentText() if ok else "Needs a fitted assembly", ok)
+            unmapped = self._unmapped_labels()
+            text = self.fit_combo.currentText() if ok else "Needs a fitted assembly"
+            if ok and unmapped:
+                text += f"; map {', '.join(unmapped)}"
+            self.cable_section.set_status(text, ok and not unmapped)
+        elif cable == CABLE_RPL:
+            ok = bool(self.rpl_combo.currentData()) and self.route_source.currentData() == sources.ROUTE_RPL
+            unmapped = self._unmapped_labels()
+            text = "RPL cable types" if ok else "Needs a Workbench RPL route"
+            if ok and unmapped:
+                text += f"; map {', '.join(unmapped)}"
+            self.cable_section.set_status(text, ok and not unmapped)
         else:
             ok = bool(self.cable_type.currentData())
             self.cable_section.set_status(self.cable_type.currentText() if ok else "Needs a library cable type", ok)
@@ -1094,6 +1201,12 @@ class SetupPanel(QWidget):
         lines.append(f"Lay control: {self.control_section.status.text()}, laid towards "
                      f"{self.direction.currentText().lower()}")
         return lines
+
+
+def _token(label: str) -> str:
+    from ..cable_library.store import type_token
+
+    return type_token(label)
 
 
 def _form_label(widget: QWidget):

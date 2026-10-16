@@ -375,8 +375,10 @@ def fit_makeup(store, fit_id: str, rows: Sequence[Dict]) -> Tuple[List[pl.CableS
                 mbr_m=float(item.min_bend_radius_m) if item.min_bend_radius_m is not None else math.nan,
                 diameter_m=float(item.diameter_m) if item.diameter_m is not None else math.nan)
             if label:
-                warnings.append(f"Cable type '{label}' is not in the library ({how}): the assembly's own weight and "
-                                "stiffness are used, with no NPTS.")
+                reason = "matches several library types: map it in step 3" if how == "ambiguous" \
+                    else "is not in the library"
+                warnings.append(f"Assembly cable type '{label}' {reason}; its own weight and stiffness are used, "
+                                "with no NPTS.")
         sections.append(pl.CableSection(float(span.kp_start_km), float(span.kp_end_km), cable))
     bodies: List[pl.Body] = []
     for landing in result.bodies:
@@ -389,3 +391,97 @@ def fit_makeup(store, fit_id: str, rows: Sequence[Dict]) -> Tuple[List[pl.CableS
                               diameter_m=float(item.diameter_m) if item.diameter_m else math.nan,
                               kind=body_kind(item.name)))
     return sections, bodies, warnings
+
+
+# ---------------------------------------------------------------------------
+# Cable type labels (RPL legs, assembly sections) -> library types
+# ---------------------------------------------------------------------------
+def project_mapping() -> Dict[str, str]:
+    try:
+        return library.project_mapping()
+    except Exception:
+        return {}
+
+
+def set_mapping(label: str, library_name: Optional[str]) -> None:
+    """Map a label to a library type in this QGIS project (None: resolve automatically).
+
+    The same project mapping the Lay Assessment uses.
+    """
+    mapping = project_mapping()
+    token = library.type_token(label)
+    if not token:
+        return
+    if library_name:
+        mapping[token] = library_name
+    else:
+        mapping.pop(token, None)
+    library.set_project_mapping(mapping)
+
+
+def resolve_label(rows: Sequence[Dict], label: str) -> Tuple[Optional[Dict], str]:
+    return library.resolve(rows, label, project_mapping())
+
+
+def candidates(rows: Sequence[Dict], label: str) -> List[str]:
+    return library.candidates(rows, label)
+
+
+def rpl_leg_labels(model) -> List[Tuple[float, float, str]]:
+    """``[(kp0, kp1, cable type label)]`` per RPL leg with a ``CableType``."""
+    out = []
+    for i, segment in enumerate(model.segments):
+        label = (segment.attrs or {}).get("CableType")
+        k0, k1 = model.points[i].dist_cum_km, model.points[i + 1].dist_cum_km
+        text = None if label is None else str(label).strip()
+        if text and text.upper() != "NULL" and k0 is not None and k1 is not None:
+            out.append((float(k0), float(k1), text))
+    return out
+
+
+def fit_labels(store, fit_id: str) -> List[str]:
+    """Cable type labels of the sections of a fitted assembly, in order, without repeats."""
+    from ..workbench import assembly_model as am
+
+    fit = next((f for f in store.list_fits() if f.get("fit_id") == fit_id), None)
+    if fit is None:
+        return []
+    header, items = store.get_assembly(fit.get("assembly_id") or "")
+    if header is None:
+        return []
+    assembly = am.assembly_from_rows(header, items)
+    labels: List[str] = []
+    for item in assembly.items:
+        label = (item.cable_type or item.name or "").strip() if item.is_section else ""
+        if label and label not in labels:
+            labels.append(label)
+    return labels
+
+
+def rpl_makeup(model, rows: Sequence[Dict]) -> Tuple[List[pl.CableSection], List[str]]:
+    """Cable sections from the RPL's ``CableType`` per leg, resolved through the library.
+
+    Neighbouring legs of one label become one section. A label the library
+    cannot resolve (unknown, or ambiguous without a project mapping) is left
+    to the default cable type, with a note.
+    """
+    sections: List[pl.CableSection] = []
+    notes: List[str] = []
+    merged: List[List] = []
+    for k0, k1, label in rpl_leg_labels(model):
+        lo, hi = sorted((k0, k1))
+        if merged and merged[-1][2] == label and abs(merged[-1][1] - lo) < 1e-6:
+            merged[-1][1] = hi
+        else:
+            merged.append([lo, hi, label])
+    unresolved: Dict[str, str] = {}
+    for lo, hi, label in merged:
+        row, how = resolve_label(rows, label)
+        if row is None:
+            unresolved[label] = how
+            continue
+        sections.append(pl.CableSection(lo, hi, cable_type_from_row(row)))
+    for label, how in unresolved.items():
+        reason = "matches several library types: map it" if how == "ambiguous" else "is not in the library"
+        notes.append(f"RPL cable type '{label}' {reason}; the default cable type is used on its legs.")
+    return sections, notes

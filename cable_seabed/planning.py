@@ -299,6 +299,7 @@ class Stations:
     filter_m: float
     turns: List[Tuple[float, float]]
     notes: List[str]
+    features: List[SeabedFeature] = field(default_factory=list)
 
     @property
     def n(self) -> int:
@@ -415,7 +416,7 @@ def prepare(inputs: PlanningInputs) -> Stations:
         mu[i], mu_lat[i] = cache[key]
     return Stations(x, kp, raw + height, seabed, length_seabed, seabed + standoff, height, slope, w, w_cable,
                     ei, mbr, diam, npts, mu, mu_lat, index, body_index, soil, types, placements, spacing,
-                    smoothing, filter_m, list(prof.turns), notes)
+                    smoothing, filter_m, list(prof.turns), notes, [f for f in inputs.features if f.valid()])
 
 
 # ---------------------------------------------------------------------------

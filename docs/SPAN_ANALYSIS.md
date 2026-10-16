@@ -49,18 +49,25 @@ along the route.
 | Boulder | Half ellipse: height, base length |
 | Pipeline / cable crossing | Circle: top above the seabed, outside diameter |
 | Berm / mattress | Trapezoid: height, base length, crest length |
+| Depression (trough) | Inverted trapezoid: depth, width at the seabed, width at the bottom |
 
 The profile gains stations through each feature (length / 40, between 2 cm and 0.5 m).
 
 ### Cable and bodies
 
-There are four cable sources:
+There are five cable sources:
 
 - one library type;
 - library types by KP section;
-- a Workbench assembly fitted to the RPL: its sections and bodies land at KPs through the RPL slack, and its
-  cable types resolve through the library and the project mapping;
+- the RPL's cable type per leg (`CableType`);
+- a Workbench assembly fitted to the RPL: its sections and bodies land at KPs through the RPL slack;
 - properties you enter.
+
+Workbench labels such as "SA" resolve through the library in this order: the project mapping, a library name,
+an alias, then the one type with that generic type. Where several library types could mean a label, the
+mapping table in step 3 marks it *ambiguous*. Choose the type there. The mapping is saved in the QGIS project,
+and the Lay Assessment uses the same one. An unresolved RPL label uses the default cable type; an unresolved
+assembly label uses the assembly's own weight and stiffness, with no NPTS.
 
 The model uses each cable's submerged weight, EI, MBR, diameter and NPTS.
 
@@ -219,18 +226,20 @@ tool lists these values at each RPL vertex as information.
 
 ## Results and links
 
-- **Profile.** Five linked rows:
+- **Profile.** Five linked rows. Drag the handles between them to share the height.
   - a status bar (green, blue, amber, red, grey);
-  - the seabed and cable, with spans in red, supports (hover for the reaction and bend radius), bodies and the
-    detail cable;
+  - the seabed and cable. Spans are filled red or amber by level. Light grey marks cable clear of the seabed
+    but under the reporting limits (not reported). Also shown: supports (hover for the reaction and bend
+    radius), bodies (hover or click for their details; labels optional), the detail cable and sea level;
   - the residual and lay tension, NPTS, and the highest tension for spans within limits;
-  - slack laid, fill and used, with the surplus shaded;
+  - slack laid, fill and used, with the surplus shaded, and the RPL's planned slack per leg;
   - the seabed slope against the friction angle.
 
-  The previous run is shown dashed, so a change can be compared.
+  The previous run is shown dashed, so a change can be compared. View options: *True scale (1:1)*, *Sea level*,
+  *Reverse KP*, *Body labels*, and *Measure* (two-point lengths, heights and angles, as in the Depth Profile).
 - **Map.** Hovering moves a marker along the route. A click shows the KP on the map. *Pick KP on map* goes from the
   map to the profile. Findings and spans highlight their KP range.
-- **Tabs:**
+- **Tabs** (click a column heading to sort):
   - Findings;
   - Spans (with bodies in each span);
   - Bodies;
@@ -239,6 +248,22 @@ tool lists these values at each RPL vertex as information.
   - Summary (inputs, totals, notes).
 - **Export.** Findings, spans and the profile by station as CSV, and the plot as PNG. *Add to map* writes the
   findings as a line layer.
+
+## Examples
+
+*Examples* loads a synthetic case as a new scenario and runs it:
+
+- **Verification: flat seabed with a depression.** A trough 40 m wide and 2 m deep, with a light cable
+  (10 N/m). The Summary compares the model with the closed form (`cable_seabed.verification`):
+  - the sag is `s = w b² / 8T`;
+  - if `s < d`, one span `b` long, with gap `d - s` at the centre;
+  - if `s ≥ d`, two spans, each `sqrt(2 d T / w)` from the rim.
+
+  At 2 kN the cable bridges the trough. Below 1 kN it touches the bottom. The model's spans read up to about
+  `w d / 2T` shorter, because its tension falls by `w d` into the trough.
+- **Boulder on a flat seabed.**
+- **Pipeline crossing, armoured cable.** Use Detail (EI) on a span.
+- **Sand waves on a slope, with a repeater.**
 
 ## Storage
 
@@ -262,6 +287,7 @@ Unit tests (`tests/test_cable_seabed.py`, `tests/test_span_analysis_qgis.py`):
 | Friction on a 20° slope, mu 0.3: `w (sin − mu cos)` = 6.01 N/m | closed form | within 1%; laid up-slope it slides |
 | Friction anchor length `dT / (mu w)`; capstan `exp(mu dtheta)` | closed form | within 2% |
 | Boulder: spans either side of `sqrt(2 h T / w)` | closed form | within 1% |
+| Depression: one span `b` with gap `d - w b²/8T`, or two spans `sqrt(2 d T / w)` | closed form | within 3% |
 | Spans grow with tension | Binda & Contro 1979 | monotonic |
 | Rest shape against the plugin's drape solver (dynamic relaxation, large rotation) at its tension | independent solver | RMS 22 mm; gap within 10% |
 | Slack above the fill lies at zero tension with the surplus; below it is pulled taut with no surplus | model rule | yes |

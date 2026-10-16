@@ -15,25 +15,39 @@ For as-laid data, use the Lay Assessment in the Cable Lay Data Explorer. Both to
 synthetic seabed. Set a KP window to study part of a long route.</li>
 <li><b>Seabed.</b> Tick the MBES rasters (or choose contours). <i>Sample every: auto</i> samples each grid at its
 cell size. The noise filter (default 2 m) removes sounding noise but keeps crests. Add seabed features
-(boulder, pipeline crossing, berm or mattress) by KP if you need them.</li>
-<li><b>Cable and bodies.</b> Use a cable type from the Cable Type Library, types by KP section, or a Workbench
-assembly fitted to the RPL (its cable sections and bodies land at KPs through the RPL slack). Add repeaters,
-joints and branching units by KP: weight in water, rigid length and diameter.</li>
+(boulder, pipeline crossing, berm or mattress, depression) by KP if you need them.</li>
+<li><b>Cable and bodies.</b> Use a cable type from the Cable Type Library, types by KP section, the RPL's cable
+type per leg, or a Workbench assembly fitted to the RPL (its cable sections and bodies land at KPs through the
+RPL slack). Workbench labels such as "SA" resolve through the library: a project mapping, then a library name,
+alias or generic type. Where several library types could mean a label, the mapping table in step 3 says so:
+choose the type there. The mapping is saved in the QGIS project and the Lay Assessment uses the same one. Add
+repeaters, joints and branching units by KP: weight in water, rigid length and diameter.</li>
 <li><b>Friction.</b> One axial coefficient for the route, or soil zones by KP with a table of coefficients for each
 cable type (or body kind) and soil.</li>
 <li><b>Lay control.</b> Bottom tension (kN), bottom slack (% over the seabed), slack over the route (%, as in an
 RPL), or the RPL slack of each leg. Override the value by KP section. Set the lay direction.</li>
 <li><b>Run.</b> The first run samples the seabed (in the background). After that, a change to the lay control
 updates the results in about a second: move the slider and see the spans grow or shrink.</li>
-<li><b>Read the results.</b> The status bar shows the worst finding by KP. Click a finding or a span to zoom the
-profile and highlight it on the map. Hover the profile to move a marker along the route on the map. Use
-<i>Pick KP on map</i> to go from the map to the profile.</li>
+<li><b>Read the results.</b> The status bar shows the worst finding by KP. Spans are filled by level: red,
+amber, and light grey where the cable is clear of the seabed but under the reporting limits (not reported).
+Click a finding or a span to zoom the profile and highlight it on the map; click a column heading to sort a
+table. Hover the profile to move a marker along the route on the map; hover or click a body for its details.
+Use <i>Pick KP on map</i> to go from the map to the profile.</li>
+<li><b>Arrange the view.</b> Drag the handles between the rows to share the height. <i>True scale (1:1)</i>
+shows slopes and spans as they are; <i>Sea level</i> adds the water surface; <i>Reverse KP</i> runs KP from right
+to left; <i>Body labels</i> names the bodies. <i>Measure</i> gives two-point lengths, heights and angles,
+snapped to the seabed or the cable, as in the Depth Profile tool.</li>
 <li><b>Look closer.</b> <i>Detail (EI)</i> solves a span or the visible window with bending stiffness: bend radius,
 moment and seabed reaction along the cable. <i>Tension sweep</i> lays the cable at a range of bottom tensions and
 plots the span length against tension.</li>
 <li><b>Save.</b> Scenarios (all settings and the sampled seabed) save in the project's Span Analysis GeoPackage.
 <i>Add to map</i> writes the findings as a line layer. <i>Export</i> writes CSV files.</li>
 </ol>
+<p><b>Examples.</b> <i>Examples</i> loads a synthetic case and runs it. The first is a verification case: a flat
+seabed with a 40 m wide, 2 m deep depression and a light cable (10 N/m). The cable sags into the depression as a
+parabola with sag <i>w b&sup2; / 8T</i>. At 2 kN the sag (1 m) is less than the depth, so one span bridges the
+depression. Below 1 kN the cable touches the bottom, and two spans form, each <i>&radic;(2 d T / w)</i> from the
+rim. The Summary tab compares the model with these values. Move the tension and see the change.</p>
 
 <h3>The model</h3>
 <p><b>Rest shape.</b> A cable with tension <i>T</i> and submerged weight <i>w</i> per metre rests on a rigid

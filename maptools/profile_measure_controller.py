@@ -114,8 +114,9 @@ class ProfileMeasureController(QObject):
 
     def set_series(self, series):
         """Replace the measurable series: [{'name', 'x', 'y', 'sources'?}],
-        x ascending in metres, y metres positive down."""
-        self.series = list(series or [])
+        x ascending in metres, y metres positive down. Lists or numpy arrays
+        (stored as lists: the interpolation helpers test their truth value)."""
+        self.series = [self._as_lists(item) for item in (series or [])]
         previous = self.source_combo.currentText()
         self.source_combo.blockSignals(True)
         self.source_combo.clear()
@@ -272,6 +273,15 @@ class ProfileMeasureController(QObject):
             self.plot_item.vb.setMouseEnabled(x=True, y=True)
         self.refresh()
         self.modeChanged.emit(bool(checked))
+
+    @staticmethod
+    def _as_lists(item):
+        out = dict(item)
+        for key in ('x', 'y', 'sources'):
+            value = out.get(key)
+            if value is not None and not isinstance(value, list):
+                out[key] = list(value.tolist() if hasattr(value, 'tolist') else value)
+        return out
 
     @staticmethod
     def _snap(series, x):

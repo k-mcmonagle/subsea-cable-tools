@@ -55,6 +55,7 @@ from qgis.core import (
 from ..cable_seabed import planning as pl
 from ..cable_seabed.core import ERROR, INFO, WARNING, sub_progress
 from ..cable_seabed.profiles import SyntheticSeabed, read_profile_csv, synthetic_profile
+from ..cable_seabed.verification import depression_check
 from ..plugin_log import log_exception
 from ..qgis_compat import (
     MESSAGEBOX_NO,
@@ -69,8 +70,9 @@ from . import sources, store as span_store
 from .help import HELP_HTML
 from .map_link import KpPickTool, MapLink
 from .plot_panel import ProfilePlot
+from .examples import EXAMPLES, example_settings
 from .results_panel import ResultsPanel, summary_html
-from .setup_panel import CABLE_FIT, CABLE_SECTIONS, SetupPanel
+from .setup_panel import CABLE_FIT, CABLE_RPL, CABLE_SECTIONS, SetupPanel
 from .task import WorkTask
 
 TITLE = "Span & Slack Analysis"
@@ -233,6 +235,7 @@ class SpanAnalysisDialog(QDialog):
         self.plot.kpHovered.connect(self.map.hover_kp)
         self.plot.kpClicked.connect(lambda kp: self.map.show_kp(kp, pan="if_outside"))
         self.plot.kpDoubleClicked.connect(lambda kp: self.map.show_kp(kp, pan=True))
+        self.plot.bodyClicked.connect(self._on_body_clicked)
         self.results.findingSelected.connect(lambda f: self._show_range(f.kp_start, f.kp_end, False))
         self.results.findingActivated.connect(lambda f: self._show_range(f.kp_start, f.kp_end, True))
         self.results.rangeSelected.connect(lambda a, b: self._show_range(a, b, False))
@@ -274,7 +277,31 @@ class SpanAnalysisDialog(QDialog):
         menu.addAction("Show the file in its folder", self.show_store_folder)
         more.setMenu(menu)
         bar.addWidget(more)
+        examples = QToolButton()
+        examples.setText("Examples")
+        examples.setToolTip("Load a synthetic example, including a verification case with a closed-form answer.")
+        examples.setPopupMode(TOOLBUTTON_POPUP_MODE_INSTANT)
+        examples_menu = QMenu(examples)
+        for index, (title, tip, _builder) in enumerate(EXAMPLES):
+            action = examples_menu.addAction(title, lambda i=index: self.load_example(i))
+            action.setToolTip(tip)
+        examples_menu.setToolTipsVisible(True)
+        examples.setMenu(examples_menu)
+        bar.addWidget(examples)
         return bar
+
+    def load_example(self, index: int) -> None:
+        """Load a built-in example as a new, unsaved scenario and run it."""
+        if not self._confirm_discard():
+            return
+        self._scenario_id = None
+        self._profile, self._profile_key = None, ""
+        self._clear_results()
+        self.setup.apply_settings(example_settings(index))
+        self._dirty = False
+        self._refresh_scenarios(None)
+        self.status.setText(html.escape(EXAMPLES[index][1]))
+        self.run()
 
     def _open_store(self) -> None:
         path = span_store.project_gpkg_path() or span_store.default_gpkg_path()
@@ -575,6 +602,11 @@ class SpanAnalysisDialog(QDialog):
         cable = setup.default_cable()
         if cable_source == CABLE_SECTIONS:
             sections = setup.cable_sections_list()
+        elif cable_source == CABLE_RPL:
+            if self._rpl_model is None:
+                raise ValueError("RPL cable types need a Workbench RPL as the route.")
+            sections, rpl_notes = sources.rpl_makeup(self._rpl_model, setup.library_rows)
+            notes.extend(rpl_notes)
         elif cable_source == CABLE_FIT:
             fit_id = s["cable"]["fit_id"]
             if setup.workbench is None or not fit_id:
@@ -767,7 +799,7 @@ class SpanAnalysisDialog(QDialog):
         self.plot.set_detail(None)
         self.results.set_detail(None, None)
         notes = list(dict.fromkeys(self._notes + list(result.notes)))
-        self.results.set_result(result, summary_html(result, notes, self.setup.describe()))
+        self.results.set_result(result, summary_html(result, notes, self.setup.describe(), depression_check(result)))
         self._report(result, notes)
         self._update_buttons()
 
@@ -818,6 +850,11 @@ class SpanAnalysisDialog(QDialog):
     def _show_range(self, kp_a: float, kp_b: float, zoom_map: bool) -> None:
         self.plot.zoom_to(kp_a, kp_b)
         self.map.show_range(kp_a, kp_b, zoom=zoom_map)
+
+    def _on_body_clicked(self, index: int) -> None:
+        self.results.select_body(index)
+        if self._result is not None and 0 <= index < len(self._result.bodies):
+            self.map.show_kp(self._result.bodies[index].kp_km, pan="if_outside")
 
     def _toggle_pick(self, on: bool) -> None:
         if self.iface is None:
@@ -902,7 +939,7 @@ class SpanAnalysisDialog(QDialog):
     def export_png(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Save the plot", "", "PNG image (*.png)")
         if path:
-            self.plot.graphics.grab().save(path if path.lower().endswith(".png") else path + ".png")
+            self.plot.splitter.grab().save(path if path.lower().endswith(".png") else path + ".png")
 
     def _open_library(self) -> None:
         try:
@@ -931,6 +968,7 @@ class SpanAnalysisDialog(QDialog):
                 self.load_scenario(last)
 
     def _save_ui(self) -> None:
+        self.plot.persist = self._persist_ui
         if self._persist_ui:
             QSettings().setValue(f"{_SETTINGS}/splitter", self.splitter.saveState())
 

@@ -342,6 +342,24 @@ def test_pipe_crossing_detail() -> bool:
                    f"R min {detail.min_bend_radius_m:.1f} m")
 
 
+def test_depression_verification() -> bool:
+    """A 40 m wide, 2 m deep trough at 2 kN (sag 1 m: spans it) and 0.5 kN (sag 4 m: touches the bottom)."""
+    from ..cable_seabed.features import DEPRESSION
+    from ..cable_seabed.verification import depression_check
+
+    prof = _flat(1000.0, 0.25)
+    trough = SeabedFeature(DEPRESSION, 0.5, 2.0, 40.0, crest_m=38.0)
+    checks = []
+    for tension, spans in ((2.0, 1), (0.5, 2)):
+        result = pl.run(_inputs(prof, pl.LayControl(pl.TENSION, tension), features=[trough],
+                                criteria=pl.Criteria(allowable=False)))
+        check = depression_check(result)
+        checks.append(check is not None and check.ok and len(result.spans) == spans)
+    detail = "; ".join(f"{r.quantity} {r.closed_form:.3f} vs {r.model:.3f}" for r in check.rows) if check else ""
+    return _report("depression: closed form agrees in both regimes (spans the trough / touches the bottom)",
+                   all(checks), detail)
+
+
 def test_features_shape() -> bool:
     x = np.arange(0.0, 20.0001, 1.0)
     kp = x / 1000.0
@@ -392,6 +410,7 @@ def run_all() -> List[bool]:
         test_bodies(),
         test_alter_course_and_npts(),
         test_pipe_crossing_detail(),
+        test_depression_verification(),
         test_features_shape(),
         test_csv_profile(),
         test_long_route_speed(),

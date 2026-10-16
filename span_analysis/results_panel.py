@@ -30,6 +30,7 @@ from qgis.PyQt.QtWidgets import (
 )
 
 from ..cable_seabed import planning as pl
+from .plot_panel import DirectAxis
 from ..cable_seabed.core import ERROR, INFO, WARNING
 from ..qgis_compat import (
     EDIT_TRIGGER_NONE,
@@ -53,6 +54,10 @@ SWEEP_HEADERS = ["Bottom T (kN)", "Spans", "Red", "Total length (m)", "Longest (
                  "Min bend R (m)", "Below MBR", "Max residual T (kN)", "Above NPTS"]
 
 
+def _axes():
+    return {"left": DirectAxis("left"), "bottom": DirectAxis("bottom")}
+
+
 def _num(value, digits: int = 2) -> str:
     if value is None:
         return ""
@@ -67,6 +72,31 @@ def _num(value, digits: int = 2) -> str:
     return f"{v:.{digits}f}"
 
 
+_SORT_ROLE = int(getattr(_USER_ROLE, "value", _USER_ROLE)) + 1   # PyQt6 roles are enums
+
+
+class SortItem(QTableWidgetItem):
+    """A table cell that sorts numbers by value (and text as text)."""
+
+    def __lt__(self, other):
+        mine, theirs = self.data(_SORT_ROLE), other.data(_SORT_ROLE)
+        if isinstance(mine, float) and isinstance(theirs, float):
+            return mine < theirs
+        if isinstance(mine, float) != isinstance(theirs, float):
+            return isinstance(mine, float)   # numbers before blanks / text
+        return self.text().lower() < other.text().lower()
+
+
+def _sort_key(text: str):
+    cleaned = str(text).replace(",", "").split(" ")[0]
+    if cleaned == "∞":
+        return math.inf
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
 def _table(headers: Sequence[str]) -> QTableWidget:
     table = QTableWidget(0, len(headers))
     table.setHorizontalHeaderLabels(list(headers))
@@ -76,11 +106,16 @@ def _table(headers: Sequence[str]) -> QTableWidget:
     table.verticalHeader().setVisible(False)
     table.setAlternatingRowColors(True)
     table.horizontalHeader().setStretchLastSection(True)
+    table.horizontalHeader().setSortIndicatorShown(True)
+    table.setToolTip("Click a column heading to sort by it.")
     return table
 
 
 def _item(text, data=None, colour: Optional[str] = None) -> QTableWidgetItem:
-    item = QTableWidgetItem(str(text))
+    item = SortItem(str(text))
+    key = _sort_key(text)
+    if key is not None:
+        item.setData(_SORT_ROLE, float(key))
     if data is not None:
         item.setData(_USER_ROLE, data)
     if colour:
@@ -88,7 +123,12 @@ def _item(text, data=None, colour: Optional[str] = None) -> QTableWidgetItem:
     return item
 
 
-def _fill(table: QTableWidget, rows: List[List], payloads: Optional[List] = None) -> None:
+def _fill(table: QTableWidget, rows: List[List], payloads: Optional[List] = None,
+          after=None) -> None:
+    """Replace the rows (sorting off while filling); ``after(table, r)`` runs per row
+    before sorting is restored, so per-row data stays with its row."""
+    header = table.horizontalHeader()
+    column, order = header.sortIndicatorSection(), header.sortIndicatorOrder()
     table.setSortingEnabled(False)
     table.setRowCount(len(rows))
     for r, row in enumerate(rows):
@@ -97,7 +137,12 @@ def _fill(table: QTableWidget, rows: List[List], payloads: Optional[List] = None
             if isinstance(value, tuple):
                 value, colour = value
             table.setItem(r, c, _item(value, payloads[r] if (payloads is not None and c == 0) else None, colour))
+        if after is not None:
+            after(table, r)
     table.resizeColumnsToContents()
+    table.setSortingEnabled(True)
+    if 0 <= column < table.columnCount():
+        table.sortItems(column, order)
 
 
 class ResultsPanel(QTabWidget):
@@ -157,11 +202,12 @@ class ResultsPanel(QTabWidget):
                          pl.CHECK_LABELS.get(f.check_id, f.check_id), f"{f.kp_start:.3f}", f"{f.kp_end:.3f}",
                          _num(f.length_m, 0), (_num(f.value) + (f" {f.unit}" if f.unit else "")) if f.value is not None
                          else "", f.message])
-        _fill(self.findings_table, rows, shown)
-        for r, f in enumerate(shown):
-            item = self.findings_table.item(r, len(FINDING_HEADERS) - 1)
+        def tip(table, r):
+            item = table.item(r, len(FINDING_HEADERS) - 1)
             if item is not None:
-                item.setToolTip(f.message)
+                item.setToolTip(shown[r].message)
+
+        _fill(self.findings_table, rows, shown, tip)
         reds = sum(1 for f in self._findings if f.severity == ERROR)
         ambers = sum(1 for f in self._findings if f.severity == WARNING)
         self.findings_count.setText(f"{len(self._findings)} finding(s): {reds} red, {ambers} amber")
@@ -201,6 +247,18 @@ class ResultsPanel(QTabWidget):
         data = item.data(_USER_ROLE) if item is not None else None
         if isinstance(data, (tuple, list)) and len(data) == 2:
             self.rangeSelected.emit(float(data[0]), float(data[1]))
+
+    def select_body(self, index: int) -> None:
+        """Show body ``index`` (result order) in the Bodies tab."""
+        for r in range(self.bodies_table.rowCount()):
+            item = self.bodies_table.item(r, 1)
+            if item is not None and item.data(_USER_ROLE) == index:
+                self.setCurrentIndex(2)
+                self.bodies_table.blockSignals(True)
+                self.bodies_table.selectRow(r)
+                self.bodies_table.blockSignals(False)
+                self.bodies_table.scrollToItem(item)
+                return
 
     def selected_span(self) -> Optional[pl.Span]:
         rows = self.spans_table.selectionModel().selectedRows()
@@ -248,15 +306,15 @@ class ResultsPanel(QTabWidget):
         split = QSplitter(_HORIZONTAL)
         self.detail_graphics = pg.GraphicsLayoutWidget()
         self.detail_graphics.setBackground("w")
-        self.d_profile = self.detail_graphics.addPlot(row=0, col=0)
-        self.d_radius = self.detail_graphics.addPlot(row=1, col=0)
-        self.d_moment = self.detail_graphics.addPlot(row=2, col=0)
+        self.d_profile = self.detail_graphics.addPlot(row=0, col=0, axisItems=_axes())
+        self.d_radius = self.detail_graphics.addPlot(row=1, col=0, axisItems=_axes())
+        self.d_moment = self.detail_graphics.addPlot(row=2, col=0, axisItems=_axes())
         for plot in (self.d_profile, self.d_radius, self.d_moment):
             plot.showGrid(x=True, y=True, alpha=0.25)
             plot.getAxis("left").setWidth(64)
             plot.setAutoVisible(y=True)
             plot.addLegend(offset=(-5, 2), colCount=3, labelTextColor=(40, 40, 40), labelTextSize="8pt",
-                           brush=pg.mkBrush(255, 255, 255, 190), verSpacing=-6, horSpacing=12)
+                           brush=pg.mkBrush(255, 255, 255, 190), verSpacing=-2, horSpacing=22)
         self.d_profile.invertY(True)
         self.d_profile.hideAxis("bottom")
         self.d_radius.hideAxis("bottom")
@@ -360,13 +418,13 @@ class ResultsPanel(QTabWidget):
         split = QSplitter(_HORIZONTAL)
         self.sweep_graphics = pg.GraphicsLayoutWidget()
         self.sweep_graphics.setBackground("w")
-        self.s_length = self.sweep_graphics.addPlot(row=0, col=0)
-        self.s_gap = self.sweep_graphics.addPlot(row=1, col=0)
+        self.s_length = self.sweep_graphics.addPlot(row=0, col=0, axisItems=_axes())
+        self.s_gap = self.sweep_graphics.addPlot(row=1, col=0, axisItems=_axes())
         for plot in (self.s_length, self.s_gap):
             plot.showGrid(x=True, y=True, alpha=0.25)
             plot.getAxis("left").setWidth(64)
             plot.addLegend(offset=(5, 2), colCount=2, labelTextColor=(40, 40, 40), labelTextSize="8pt",
-                           brush=pg.mkBrush(255, 255, 255, 190), verSpacing=-6, horSpacing=12)
+                           brush=pg.mkBrush(255, 255, 255, 190), verSpacing=-2, horSpacing=22)
         self.s_gap.setXLink(self.s_length)
         self.s_length.hideAxis("bottom")
         for plot in (self.s_length, self.s_gap):
@@ -439,19 +497,26 @@ class ResultsPanel(QTabWidget):
                                   "yes" if b.in_span else "no", _num(b.tension_kn), _num(b.standoff_m, 3)])
                 half = max(b.body.length_m, 10.0) / 2000.0
                 body_payloads.append((b.kp_km - half, b.kp_km + half))
-        _fill(self.spans_table, span_rows, span_payloads)
-        for k in range(len(span_rows)):   # keep the span number for the detail model
-            item = self.spans_table.item(k, 1)
+        def number(table, r):   # keep the span number for the detail model
+            item = table.item(r, 1)
             if item is not None:
-                item.setData(_USER_ROLE, k)
-        _fill(self.bodies_table, body_rows, body_payloads)
+                item.setData(_USER_ROLE, r)
+
+        def body_index(table, r):
+            item = table.item(r, 1)
+            if item is not None:
+                item.setData(_USER_ROLE, r)
+
+        _fill(self.spans_table, span_rows, span_payloads, number)
+        _fill(self.bodies_table, body_rows, body_payloads, body_index)
         self.setTabText(1, f"Spans ({len(span_rows)})" if result is not None else "Spans")
         self.setTabText(2, f"Bodies ({len(body_rows)})" if result is not None else "Bodies")
         self.summary.setHtml(summary_html)
 
 
-def summary_html(result: pl.PlanningResult, notes: Sequence[str], setup_lines: Sequence[str]) -> str:
-    """The Summary tab: what was modelled and what came out."""
+def summary_html(result: pl.PlanningResult, notes: Sequence[str], setup_lines: Sequence[str],
+                 verification=None) -> str:
+    """The Summary tab: what was modelled and what came out (and a closed-form check when there is one)."""
     s = result.summary
     c = result.criteria
     esc = html.escape
@@ -475,6 +540,23 @@ def summary_html(result: pl.PlanningResult, notes: Sequence[str], setup_lines: S
     for key, value in rows:
         parts.append(f"<tr><td><b>{esc(key)}</b></td><td>{esc(value)}</td></tr>")
     parts.append("</table>")
+    if verification is not None:
+        colour = "#2e7d32" if verification.ok else "#d32f2f"
+        parts.append(f"<h4>Verification against the closed form</h4><p>{esc(verification.title)}: the cable "
+                     f"{esc(verification.regime)}. <span style='color:{colour}'><b>"
+                     f"{'Agrees' if verification.ok else 'Differs'}</b></span> within 3%.</p>")
+        parts.append("<table cellspacing='0' cellpadding='3' border='1' style='border-collapse:collapse'>"
+                     "<tr><th>Quantity</th><th>Closed form</th><th>Model</th><th>Difference</th></tr>")
+        for row in verification.rows:
+            diff = row.difference_pct
+            diff_text = "" if not math.isfinite(diff) else f"{diff:+.1f}%"
+            fmt = "{:.0f}" if row.unit == "" else "{:.3f}"
+            parts.append(f"<tr><td>{esc(row.quantity)}</td><td>{fmt.format(row.closed_form)} {esc(row.unit)}</td>"
+                         f"<td>{fmt.format(row.model)} {esc(row.unit)}</td><td>{diff_text}</td></tr>")
+        parts.append("</table><p><i>Closed form: the small-slope parabola at a constant tension (Binda &amp; Contro "
+                     "1979). The model uses the catenary curvature and lets the tension fall by w&middot;d into the "
+                     "trough (T - w y is constant in a span), so its sag reads slightly more and its spans slightly "
+                     "shorter, by up to about w d / 2T.</i></p>")
     if setup_lines:
         parts.append("<h4>Inputs</h4><ul>" + "".join(f"<li>{esc(line)}</li>" for line in setup_lines) + "</ul>")
     if notes:

@@ -1,30 +1,35 @@
 # -*- coding: utf-8 -*-
-"""The Span & Slack Analysis profile: five linked rows on one KP axis.
+"""The Span & Slack Analysis profile: linked rows on one KP axis, in a splitter.
 
 * status bar: the worst finding per KP (green clear, blue info, amber, red, grey no data);
-* profile: sampled seabed, the seabed the cable rests on, the modelled cable
-  with spans filled red, span supports (red below the MBR; hover for the
-  reaction and bend radius), bodies, and the detail model's cable;
+* profile: sampled seabed, the seabed the cable rests on, the modelled cable,
+  spans filled by level (red, amber; light grey where the cable is clear of
+  the seabed but under the reporting limits), span supports (red below the
+  MBR; hover for the reaction and bend radius), bodies (hover or click for
+  their details, optional labels), the detail model's cable and sea level;
 * tension: residual tension on the seabed, the lay (deposit) tension, NPTS and
   the highest tension that keeps spans within the limits;
-* slack: cable laid, the fill (seabed length over route length) and the
-  cable the rest shape uses, all as % over the route; the surplus is shaded;
+* slack: cable laid, the fill (seabed length over route length), the cable the
+  rest shape uses and the RPL's planned slack, all % over the route; the
+  surplus is shaded;
 * slope and friction: the seabed slope against the friction angle ``atan mu``.
 
-Items are built once and updated with ``setData`` (removing pyqtgraph items
-is slow on long routes and noisy under QGIS 3.40). Hover moves a shared
-crosshair and reports every value at that KP; the dialog links it to the map.
+Drag the splitter handles to share the height between rows. View options:
+true scale (1:1), sea level, reversed KP and body labels. Items are built once
+and updated with ``setData`` (removing pyqtgraph items is slow on long routes
+and noisy under QGIS 3.40). Hover moves a shared crosshair and reports every
+value at that KP; the dialog links it to the map.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Optional
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import pyqtgraph as pg
 
-from qgis.PyQt.QtCore import Qt, pyqtSignal
+from qgis.PyQt.QtCore import QRectF, QSettings, Qt, pyqtSignal
 from qgis.PyQt.QtGui import QPainterPath
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
@@ -32,31 +37,40 @@ from qgis.PyQt.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSplitter,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from ..cable_seabed import planning as pl
+from ..cable_seabed.core import runs
+from ..cable_seabed.spans import SPAN_END_TOL_M
 from ..maptools.profile_measure_controller import ProfileMeasureController
 from ..plugin_log import log_exception
 
 _DASH = getattr(getattr(Qt, "PenStyle", Qt), "DashLine")
 _DOT = getattr(getattr(Qt, "PenStyle", Qt), "DotLine")
+_VERTICAL = getattr(getattr(Qt, "Orientation", Qt), "Vertical")
+_SETTINGS = "SubseaCableTools/SpanAnalysis/plot"
 LEVEL_COLOURS = {-1: (200, 200, 200), 0: (76, 175, 80), 1: (31, 119, 180), 2: (255, 152, 0), 3: (211, 47, 47)}
 SEABED = (121, 85, 72)
 CABLE = (25, 70, 160)
-SPAN_FILL = (211, 47, 47, 150)
+RED_FILL = (211, 47, 47, 150)
+AMBER_FILL = (255, 152, 0, 140)
+CLEAR_FILL = (120, 120, 120, 55)
 SURPLUS_FILL = (76, 175, 80, 90)
 DETAIL = (123, 31, 162)
 PREVIOUS = (150, 150, 150)
+SEA = "#17becf"
+TRUE_SCALE_RATIO = 1000.0   # KP in km, depth in m
 
 
-def spans_path(kp: np.ndarray, top: np.ndarray, bottom: np.ndarray, spans) -> QPainterPath:
-    """One path with a closed polygon per span (cable above, seabed below)."""
+def runs_path(kp: np.ndarray, top: np.ndarray, bottom: np.ndarray, extents: Sequence[Tuple[int, int]]) -> QPainterPath:
+    """One path with a closed polygon per ``(i0, i1)`` run (cable above, seabed below)."""
     xs, ys, connect = [], [], []
-    for span in spans:
-        sl = slice(span.i0, span.i1 + 1)
+    for i0, i1 in extents:
+        sl = slice(i0, i1 + 1)
         k, t, b = kp[sl], top[sl], bottom[sl]
         ok = np.isfinite(k) & np.isfinite(t) & np.isfinite(b)
         if ok.sum() < 2:
@@ -72,6 +86,64 @@ def spans_path(kp: np.ndarray, top: np.ndarray, bottom: np.ndarray, spans) -> QP
     return pg.arrayToQPath(np.concatenate(xs), np.concatenate(ys), connect=np.concatenate(connect))
 
 
+_GLYPH = {"solid": "\u2501\u2501", "dash": "\u254d\u254d", "dot": "\u2508\u2508", "fill": "\u25a0",
+          "triangle": "\u25b2", "diamond": "\u25c6"}
+
+
+def _hex(colour) -> str:
+    if isinstance(colour, str):
+        return colour
+    return "#%02x%02x%02x" % tuple(int(c) for c in colour[:3])
+
+
+_LEGENDS = {
+    "depth": [("dash", SEA, "Sea level"), ("solid", (200, 175, 165), "Seabed (sampled)"), ("solid", SEABED, "Seabed"),
+              ("solid", CABLE, "Cable (rest shape)"), ("dash", PREVIOUS, "Previous run"),
+              ("solid", DETAIL, "Cable with EI (detail)"), ("fill", RED_FILL, "Span (red)"),
+              ("fill", AMBER_FILL, "Span (amber)"), ("fill", (170, 170, 170), "Clear of seabed, under the limits"),
+              ("triangle", (60, 60, 60), "Span support"), ("diamond", (255, 193, 7), "Body")],
+    "tension": [("solid", CABLE, "Residual (on the seabed)"), ("dash", (90, 90, 90), "Lay (touchdown)"),
+                ("dash", (211, 47, 47), "NPTS"), ("dot", (0, 137, 123), "Max for spans within limits"),
+                ("dash", PREVIOUS, "Previous run")],
+    "slack": [("solid", CABLE, "Laid"), ("solid", SEABED, "Fill (seabed)"), ("dash", (90, 90, 90), "Used by the cable"),
+              ("fill", SURPLUS_FILL, "Surplus"), ("dot", (233, 30, 99), "RPL slack (plan)")],
+    "slope": [("solid", SEABED, "Seabed slope"), ("dash", (230, 81, 0), "Friction angle atan(\u03bc)")],
+}
+
+
+def _legend_html(entries) -> str:
+    parts = []
+    for kind, colour, text in entries:
+        glyph = _GLYPH[kind]
+        parts.append(f"<span style='color:{_hex(colour)}; font-weight:bold'>{glyph}</span>&nbsp;{text}")
+    return "&nbsp;&nbsp;&nbsp;".join(parts)
+
+
+class DirectAxis(pg.AxisItem):
+    """An axis that paints straight to the screen.
+
+    pyqtgraph records an axis (ticks, labels, grid lines) in a QPicture and
+    replays it. Under Qt5 (QGIS 3) with display scaling a QPicture records at
+    the screen's logical DPI (e.g. 144 at 150 %) while the plot paints at 96, so
+    the replay shrank the axis and its grid to two thirds of the plot.
+    """
+
+    def paint(self, p, opt, widget):
+        p.save()
+        try:
+            if self.style["tickFont"]:
+                p.setFont(self.style["tickFont"])
+            specs = self.generateDrawSpecs(p)
+            if specs is not None:
+                self.drawPicture(p, *specs)
+        finally:
+            p.restore()
+
+
+def _plot_widget() -> "pg.PlotWidget":
+    return pg.PlotWidget(axisItems={"left": DirectAxis("left"), "bottom": DirectAxis("bottom")})
+
+
 def _tip(x, y, data):
     return data if isinstance(data, str) else f"KP {x:.3f}"
 
@@ -82,15 +154,25 @@ def _radius_text(radius: float) -> str:
     return "over 1000 m" if radius > 1000 else f"{radius:.1f} m"
 
 
+def _setting(key: str, default: bool) -> bool:
+    try:
+        return bool(QSettings().value(f"{_SETTINGS}/{key}", default, type=bool))
+    except Exception:
+        return default
+
+
 class ProfilePlot(QWidget):
     kpHovered = pyqtSignal(float)
     kpClicked = pyqtSignal(float)
     kpDoubleClicked = pyqtSignal(float)
+    bodyClicked = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.persist = True
         self._result: Optional[pl.PlanningResult] = None
         self._previous: Optional[pl.PlanningResult] = None
+        self._body_labels: List[pg.TextItem] = []
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
@@ -100,7 +182,8 @@ class ProfilePlot(QWidget):
         fit.clicked.connect(self.fit)
         bar.addWidget(fit)
         self.measure = ProfileMeasureController(self, plot_factors=lambda: (0.001, 1.0),
-                                                text_units=lambda: ("m", "m"), depth_down=lambda: True)
+                                                text_units=lambda: ("m", "m"), depth_down=lambda: True,
+                                                x_inverted=lambda: self.reverse_check.isChecked())
         self.measure.statusChanged.connect(lambda text: self.readout.setText(text))
         measure_btn = QToolButton()
         measure_btn.setDefaultAction(self.measure.action)
@@ -109,90 +192,165 @@ class ProfilePlot(QWidget):
         bar.addWidget(self.measure.source_combo)
         bar.addWidget(self.measure.delete_btn)
         bar.addWidget(self.measure.clear_btn)
+        bar.addStretch(1)
+        layout.addLayout(bar)
+
+        view = QHBoxLayout()
+        self.true_scale_check = QCheckBox("True scale (1:1)")
+        self.true_scale_check.setToolTip("Lock the depth and KP axes to the same scale (1 km along the route = "
+                                         "1000 m of depth), so slopes and spans show as they really are.")
+        self.sea_check = QCheckBox("Sea level (0 m)")
+        self.sea_check.setStyleSheet(f"color: {SEA}; font-weight: 600;")
+        self.sea_check.setToolTip("Show the water surface as a dashed line at 0 m. While shown, the full view "
+                                  "includes the surface; zoom in to see the seabed detail.")
+        self.reverse_check = QCheckBox("Reverse KP")
+        self.reverse_check.setToolTip("KP increasing from right to left (e.g. to match the lay direction).")
+        self.labels_check = QCheckBox("Body labels")
+        self.labels_check.setToolTip("Name each in-line body on the profile. Hover or click a body for its details.")
+        for check, key, default in ((self.true_scale_check, "true_scale", False), (self.sea_check, "sea_level", True),
+                                    (self.reverse_check, "reverse_kp", False), (self.labels_check, "body_labels", True)):
+            check.setChecked(_setting(key, default))
+            check.toggled.connect(lambda on, k=key: self._remember(k, on))
+            view.addWidget(check)
+        view.addSpacing(12)
         self.row_checks = {}
         for key, text, tip in (("tension", "Tension", "Residual and lay tension, NPTS, highest tension for spans "
                                                        "within limits."),
-                               ("slack", "Slack", "Cable laid, seabed fill and cable used by the rest shape, % over "
-                                                  "the route length."),
+                               ("slack", "Slack", "Cable laid, seabed fill, cable used by the rest shape and RPL "
+                                                  "planned slack, % over the route length."),
                                ("slope", "Slope / friction", "Seabed slope against the friction angle atan(mu): "
                                                              "steeper slopes slide.")):
             check = QCheckBox(text)
             check.setToolTip(tip)
-            check.setChecked(True)
+            check.setChecked(_setting(f"row_{key}", True))
             check.toggled.connect(self._update_rows)
-            bar.addWidget(check)
+            check.toggled.connect(lambda on, k=key: self._remember(f"row_{k}", on))
+            view.addWidget(check)
             self.row_checks[key] = check
         self.previous_check = QCheckBox("Previous run")
         self.previous_check.setToolTip("Show the previous run's cable and tension (dashed grey), to see the effect "
                                        "of a change.")
         self.previous_check.setChecked(True)
         self.previous_check.toggled.connect(self._update_previous)
-        bar.addWidget(self.previous_check)
-        bar.addStretch(1)
-        layout.addLayout(bar)
+        view.addWidget(self.previous_check)
+        self.legend_check = QCheckBox("Legends")
+        self.legend_check.setToolTip("Show the key above each row.")
+        self.legend_check.setChecked(_setting("legends", True))
+        self.legend_check.toggled.connect(lambda on: self._remember("legends", on))
+        view.addWidget(self.legend_check)
+        view.addStretch(1)
+        layout.addLayout(view)
 
-        self.graphics = pg.GraphicsLayoutWidget()
-        self.graphics.setBackground("w")
-        layout.addWidget(self.graphics, 1)
-        self.status_plot = self.graphics.addPlot(row=0, col=0)
-        self.depth_plot = self.graphics.addPlot(row=1, col=0)
-        self.tension_plot = self.graphics.addPlot(row=2, col=0)
-        self.slack_plot = self.graphics.addPlot(row=3, col=0)
-        self.slope_plot = self.graphics.addPlot(row=4, col=0)
-        ci = self.graphics.ci.layout
-        for row, stretch in enumerate((1, 9, 3, 3, 2)):
-            ci.setRowStretchFactor(row, stretch)
-        self.status_plot.setMaximumHeight(34)
-        self.status_plot.hideAxis("left")
+        self.splitter = QSplitter(_VERTICAL)
+        self.splitter.setChildrenCollapsible(False)
+        layout.addWidget(self.splitter, 1)
+        self.widgets = {}
+        self.rows = {}
+        self.captions = {}
+        for key in ("status", "depth", "tension", "slack", "slope"):
+            widget = _plot_widget()
+            widget.setBackground("w")
+            self.widgets[key] = widget
+            row = QWidget()
+            row_layout = QVBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(0)
+            if key != "status":
+                # The legend sits above the plot: it never hides data or overlaps its own text.
+                caption = QLabel(_legend_html(_LEGENDS[key]))
+                caption.setWordWrap(True)
+                caption.setStyleSheet("QLabel { background: white; color: #333; font-size: 8pt; "
+                                      "padding: 1px 4px 0px 68px; }")
+                row_layout.addWidget(caption)
+                self.captions[key] = caption
+            row_layout.addWidget(widget, 1)
+            self.rows[key] = row
+            self.splitter.addWidget(row)
+        self.status_plot = self.widgets["status"].getPlotItem()
+        self.depth_plot = self.widgets["depth"].getPlotItem()
+        self.tension_plot = self.widgets["tension"].getPlotItem()
+        self.slack_plot = self.widgets["slack"].getPlotItem()
+        self.slope_plot = self.widgets["slope"].getPlotItem()
+        self.rows["status"].setFixedHeight(26)
+        self.widgets["depth"].setMinimumHeight(120)
+        for key in ("tension", "slack", "slope"):
+            self.widgets[key].setMinimumHeight(60)
+        for index, stretch in enumerate((0, 5, 2, 2, 2)):
+            self.splitter.setStretchFactor(index, stretch)
+        self.splitter.setSizes([26, 440, 150, 150, 150])
+        try:
+            state = QSettings().value(f"{_SETTINGS}/splitter")
+            if state is not None:
+                self.splitter.restoreState(state)
+        except Exception:
+            pass
+        self.splitter.splitterMoved.connect(lambda *_: self._remember("splitter", None))
+
+        status_axis = self.status_plot.getAxis("left")
+        status_axis.setWidth(64)
+        status_axis.setStyle(showValues=False)
+        status_axis.setPen(pg.mkPen(None))
+        status_axis.setTicks([[], []])
         self.status_plot.hideAxis("bottom")
         self.status_plot.setMouseEnabled(x=True, y=False)
         self.status_plot.setYRange(0, 1, padding=0)
-        self.status_plot.getAxis("left").setWidth(64)
+        self.status_plot.hideButtons()
         self._data_plots = (self.depth_plot, self.tension_plot, self.slack_plot, self.slope_plot)
-        for plot, columns in zip(self._data_plots, (4, 5, 3, 2)):
+        for plot in self._data_plots:
             plot.showGrid(x=True, y=True, alpha=0.25)
             plot.getAxis("left").setWidth(64)
             plot.setAutoVisible(y=True)
-            # Compact legends along the top right, so they hide little of the data.
-            plot.addLegend(offset=(-5, 2), colCount=columns, labelTextColor=(40, 40, 40), labelTextSize="8pt",
-                           brush=pg.mkBrush(255, 255, 255, 190), pen=pg.mkPen(210, 210, 210),
-                           verSpacing=-6, horSpacing=12)
+            plot.hideButtons()
         self.depth_plot.invertY(True)
-        self.depth_plot.setLabel("left", "Depth (m)")
-        self.tension_plot.setLabel("left", "Tension (kN)")
-        self.slack_plot.setLabel("left", "Slack (%)")
-        self.slope_plot.setLabel("left", "Angle (°)")
-        self.slope_plot.setLabel("bottom", "KP (km)")
+        small = {"font-size": "11px"}   # pixels: point sizes scale with the screen DPI under Qt5
+        self.depth_plot.setLabel("left", "Depth (m)", **small)
+        self.tension_plot.setLabel("left", "T (kN)", **small)
+        self.slack_plot.setLabel("left", "Slack (%)", **small)
+        self.slope_plot.setLabel("left", "Angle (°)", **small)
         for plot in (self.status_plot,) + self._data_plots[1:]:
             plot.setXLink(self.depth_plot)
 
-        self.status_bars = pg.BarGraphItem(x0=[0.0], x1=[0.0], y0=[0.0], y1=[1.0], brushes=[pg.mkBrush(0, 0, 0, 0)],
-                                           pens=[pg.mkPen(None)])
-        self.status_plot.addItem(self.status_bars)
+        # One filled path per level. (BarGraphItem records its bars in a QPicture, which
+        # rounds KP-in-km rectangles to whole units under Qt5.)
+        self.status_paths = {}
+        for level, colour in LEVEL_COLOURS.items():
+            item = QGraphicsPathItem()
+            item.setBrush(pg.mkBrush(*colour))
+            item.setPen(pg.mkPen(None))
+            self.status_plot.addItem(item)
+            self.status_paths[level] = item
 
-        def curve(plot, colour, name=None, width=1.5, style=None):
+        def curve(plot, colour, name=None, width=1.5, style=None, fast=True):
             pen = pg.mkPen(colour, width=width) if style is None else pg.mkPen(colour, width=width, style=style)
             item = pg.PlotDataItem([], [], pen=pen, name=name, connect="finite")
             plot.addItem(item)
-            item.setDownsampling(auto=True, method="peak")
-            item.setClipToView(True)
+            if fast:
+                item.setDownsampling(auto=True, method="peak")
+                item.setClipToView(True)
             return item
 
+        self.sea_curve = curve(self.depth_plot, SEA, "Sea level", 1.5, _DASH, fast=False)
+        self.sea_curve.setZValue(3)
         self.raw_curve = curve(self.depth_plot, (200, 175, 165), "Seabed (sampled)", 1)
         self.seabed_curve = curve(self.depth_plot, SEABED, "Seabed", 2)
         self.cable_curve = curve(self.depth_plot, CABLE, "Cable (rest shape)", 1.5)
         self.prev_cable_curve = curve(self.depth_plot, PREVIOUS, "Cable (previous run)", 1, _DASH)
         self.detail_curve = curve(self.depth_plot, DETAIL, "Cable (detail, with EI)", 1.5)
-        self.span_fill = QGraphicsPathItem()
-        self.span_fill.setBrush(pg.mkBrush(*SPAN_FILL))
-        self.span_fill.setPen(pg.mkPen(None))
-        self.depth_plot.addItem(self.span_fill, ignoreBounds=True)
+        self.fills = {}
+        for key, brush in (("red", RED_FILL), ("amber", AMBER_FILL), ("clear", CLEAR_FILL)):
+            item = QGraphicsPathItem()
+            item.setBrush(pg.mkBrush(*brush))
+            item.setPen(pg.mkPen(None))
+            self.depth_plot.addItem(item, ignoreBounds=True)
+            self.fills[key] = item
         self.supports = pg.ScatterPlotItem([], [], size=7, symbol="t1", pen=pg.mkPen(None),
                                            brush=pg.mkBrush(60, 60, 60), hoverable=True, tip=_tip,
                                            name="Span supports")
         self.depth_plot.addItem(self.supports)
-        self.bodies = pg.ScatterPlotItem([], [], size=11, symbol="d", pen=pg.mkPen((30, 30, 30)),
+        self.bodies = pg.ScatterPlotItem([], [], size=12, symbol="d", pen=pg.mkPen((30, 30, 30)),
                                          brush=pg.mkBrush(255, 193, 7), hoverable=True, tip=_tip, name="Bodies")
+        self.bodies.setZValue(20)
+        self.bodies.sigClicked.connect(self._on_body_clicked)
         self.depth_plot.addItem(self.bodies)
 
         self.tension_curve = curve(self.tension_plot, CABLE, "Residual (on the seabed)", 1.5)
@@ -204,6 +362,7 @@ class ProfilePlot(QWidget):
         self.used_curve = curve(self.slack_plot, (90, 90, 90), "Used by the cable", 1, _DASH)
         self.laid_curve = curve(self.slack_plot, CABLE, "Laid", 1.5)
         self.fill_curve = curve(self.slack_plot, SEABED, "Fill (seabed)", 1.2)
+        self.plan_curve = curve(self.slack_plot, (233, 30, 99), "RPL slack (plan)", 1.2, _DOT, fast=False)
         self.surplus = pg.FillBetweenItem(self.used_curve, self.laid_curve, brush=pg.mkBrush(*SURPLUS_FILL))
         self.slack_plot.addItem(self.surplus)
         self.slack_plot.addItem(pg.InfiniteLine(pos=0.0, angle=0, pen=pg.mkPen((160, 160, 160), width=1)))
@@ -226,10 +385,30 @@ class ProfilePlot(QWidget):
         self.measure.table.hide()
         self.measure.measurementsChanged.connect(lambda: self.measure.table.setVisible(bool(self.measure.measurements)))
         self.measure.attach(self.depth_plot)
-        scene = self.graphics.scene()
-        scene.sigMouseMoved.connect(self._on_mouse_moved)
-        scene.sigMouseClicked.connect(self._on_mouse_clicked)
+        for key in ("depth", "tension", "slack", "slope"):
+            scene = self.widgets[key].scene()
+            scene.sigMouseMoved.connect(lambda pos, k=key: self._on_mouse_moved(k, pos))
+            scene.sigMouseClicked.connect(lambda event, k=key: self._on_mouse_clicked(k, event))
+        self.true_scale_check.toggled.connect(self._apply_true_scale)
+        self.sea_check.toggled.connect(self._update_sea)
+        self.reverse_check.toggled.connect(self._apply_reverse)
+        self.labels_check.toggled.connect(self._update_body_labels)
+        self.legend_check.toggled.connect(self._update_legends)
+        self._update_legends()
         self._update_rows()
+        self._apply_reverse(self.reverse_check.isChecked())
+
+    # -- settings --------------------------------------------------------------
+    def _remember(self, key: str, value) -> None:
+        if not self.persist:
+            return
+        try:
+            if key == "splitter":
+                QSettings().setValue(f"{_SETTINGS}/splitter", self.splitter.saveState())
+            else:
+                QSettings().setValue(f"{_SETTINGS}/{key}", bool(value))
+        except Exception:
+            pass
 
     # -- data ------------------------------------------------------------------
     def set_result(self, result: Optional[pl.PlanningResult], previous: Optional[pl.PlanningResult] = None,
@@ -253,30 +432,34 @@ class ProfilePlot(QWidget):
     def _draw(self) -> None:
         r = self._result
         if r is None:
-            for item in (self.raw_curve, self.seabed_curve, self.cable_curve, self.detail_curve,
+            for item in (self.raw_curve, self.seabed_curve, self.cable_curve, self.detail_curve, self.sea_curve,
                          self.tension_curve, self.deposit_curve, self.npts_curve, self.allowable_curve,
-                         self.used_curve, self.laid_curve, self.fill_curve, self.slope_curve, self.friction_curve):
+                         self.used_curve, self.laid_curve, self.fill_curve, self.plan_curve, self.slope_curve,
+                         self.friction_curve):
                 item.setData([], [])
-            self.span_fill.setPath(QPainterPath())
+            for item in self.fills.values():
+                item.setPath(QPainterPath())
             self.supports.setData([], [])
             self.bodies.setData([], [])
+            self._update_body_labels()
             self._clear_status()
             self.measure.set_series([])
-            self.readout.setText("Run the analysis to see the cable on the seabed.")
             self._update_previous()
+            self.readout.setText("Run the analysis to see the cable on the seabed.")
             return
         st = r.stations
         kp = st.kp_km
-        seabed_depth = -st.seabed_m
         cable_depth = -r.cable_m
-        filtered = st.filter_m > 0 or bool(np.any(st.feature_m > 0))
-        self.raw_curve.setData(kp, -st.raw_elev_m if filtered else np.full(len(kp), np.nan))
-        self.seabed_curve.setData(kp, -st.obstacle_m)
+        floor = -st.obstacle_m
+        shaped = st.filter_m > 0 or bool(np.any(st.feature_m != 0))
+        self.raw_curve.setData(kp, -st.raw_elev_m if shaped else np.full(len(kp), np.nan))
+        self.seabed_curve.setData(kp, floor)
         self.cable_curve.setData(kp, cable_depth)
         self.detail_curve.setData([], [])
-        self.span_fill.setPath(spans_path(kp, cable_depth, -st.obstacle_m, r.spans))
+        self._draw_fills(r, kp, cable_depth, floor)
         self._draw_supports(r)
         self._draw_bodies(r)
+        self._update_sea()
         self.tension_curve.setData(kp, r.tension_kn)
         self.deposit_curve.setData(kp, r.deposit_kn)
         self.npts_curve.setData(kp, st.npts_kn)
@@ -287,17 +470,49 @@ class ProfilePlot(QWidget):
         self.used_curve.setData(kp, r.shape_pct)
         self.laid_curve.setData(kp, r.laid_pct)
         self.fill_curve.setData(kp, r.fill_pct)
+        self._draw_plan(r)
         self.slope_curve.setData(kp, np.degrees(np.arctan(np.abs(st.slope))))
         self.friction_curve.setData(kp, np.degrees(np.arctan(st.mu)))
         self._draw_status(r)
         self._update_previous()
-        ok = np.isfinite(seabed_depth)
-        series = [{"name": "Seabed", "x": kp[ok] * 1000.0, "y": -st.obstacle_m[ok]}]
+        ok = np.isfinite(floor)
+        series = [{"name": "Seabed", "x": kp[ok] * 1000.0, "y": floor[ok]}]
         ok = np.isfinite(cable_depth)
         series.append({"name": "Cable", "x": kp[ok] * 1000.0, "y": cable_depth[ok]})
         self.measure.set_series(series)
-        self.readout.setText("Hover the profile for the values at a KP. Click a finding or a span to zoom to it; "
-                             "click the profile to show the KP on the map (double-click centres the map).")
+        self.readout.setText("Hover the profile for the values at a KP; hover or click a body for its details. Click "
+                             "a finding or a span to zoom to it; click the profile to show the KP on the map "
+                             "(double-click centres the map). Drag the handles between rows to resize them.")
+
+    def _draw_fills(self, r: pl.PlanningResult, kp, cable_depth, floor) -> None:
+        criteria = r.criteria
+        red, amber = [], []
+        for span in r.spans:
+            (red if pl._span_red(span, criteria) else amber).append((span.i0, span.i1))
+        with np.errstate(invalid="ignore"):
+            free = np.isfinite(r.gap_m) & (r.gap_m > SPAN_END_TOL_M)
+        reported = np.zeros(len(kp), dtype=bool)
+        for span in r.spans:
+            reported[span.i0:span.i1 + 1] = True
+        clear = [(max(a - 1, 0), min(b + 1, len(kp) - 1)) for a, b in runs(free & ~reported)]
+        self.fills["red"].setPath(runs_path(kp, cable_depth, floor, red))
+        self.fills["amber"].setPath(runs_path(kp, cable_depth, floor, amber))
+        self.fills["clear"].setPath(runs_path(kp, cable_depth, floor, clear))
+
+    def _draw_plan(self, r: pl.PlanningResult) -> None:
+        legs = list(r.control.legs or [])
+        if not legs:
+            self.plan_curve.setData([], [])
+            return
+        lo, hi = float(r.stations.kp_km[0]), float(r.stations.kp_km[-1])
+        xs, ys = [], []
+        for k0, k1, slack in sorted(legs):
+            a, b = max(min(k0, k1), lo), min(max(k0, k1), hi)
+            if b <= a:
+                continue
+            xs.extend([a, b, b])
+            ys.extend([slack, slack, np.nan])
+        self.plan_curve.setData(np.array(xs), np.array(ys))
 
     def _draw_status(self, r: pl.PlanningResult) -> None:
         kp = r.stations.kp_km
@@ -307,17 +522,20 @@ class ProfilePlot(QWidget):
         if not len(level):
             self._clear_status()
             return
-        # Equal neighbours collapse, so the bar is a handful of rectangles.
+        # Equal neighbours collapse, so each level is a handful of rectangles.
         change = np.nonzero(np.diff(level))[0] + 1
         starts = np.concatenate(([0], change))
         ends = np.concatenate((change, [len(level)]))
-        brushes = [pg.mkBrush(*LEVEL_COLOURS.get(int(level[s]), (200, 200, 200))) for s in starts]
-        self.status_bars.setOpts(x0=edges[starts], x1=edges[ends], y0=np.zeros(len(starts)),
-                                 y1=np.ones(len(starts)), brushes=brushes, pens=[pg.mkPen(None)] * len(starts))
+        paths = {key: QPainterPath() for key in self.status_paths}
+        for s, e in zip(starts, ends):
+            key = int(level[s]) if int(level[s]) in paths else -1
+            paths[key].addRect(QRectF(float(edges[s]), 0.0, float(edges[e] - edges[s]), 1.0))
+        for key, item in self.status_paths.items():
+            item.setPath(paths[key])
 
     def _clear_status(self) -> None:
-        self.status_bars.setOpts(x0=[0.0], x1=[0.0], y0=[0.0], y1=[1.0], brushes=[pg.mkBrush(0, 0, 0, 0)],
-                                 pens=[pg.mkPen(None)])
+        for item in self.status_paths.values():
+            item.setPath(QPainterPath())
 
     def _draw_supports(self, r: pl.PlanningResult) -> None:
         if not r.supports:
@@ -339,23 +557,77 @@ class ProfilePlot(QWidget):
             tips.append("\n".join(line for line in lines if line))
         self.supports.setData(np.array(kps), np.array(depths), brush=brushes, data=tips)
 
+    def body_text(self, index: int) -> str:
+        r = self._result
+        if r is None or not (0 <= index < len(r.bodies)):
+            return ""
+        b = r.bodies[index]
+        body = b.body
+        if b.max_gap_m > 0.005:
+            where = f"Clear of the seabed by up to {b.max_gap_m:.2f} m" + (" (in a span)" if b.in_span else "")
+        else:
+            where = "On the seabed" + (f" (housing standoff {b.standoff_m:.2f} m)" if b.standoff_m > 0 else "")
+        lines = [f"{body.name} ({body.kind}) at KP {b.kp_km:.3f}",
+                 f"Weight in water {body.weight_kn:.2f} kN, rigid length {body.length_m:.1f} m"
+                 + (f", diameter {body.diameter_m * 1000:.0f} mm" if math.isfinite(body.diameter_m) else ""),
+                 where, f"Tension {b.tension_kn:.2f} kN"]
+        return "\n".join(lines)
+
     def _draw_bodies(self, r: pl.PlanningResult) -> None:
         if not r.bodies:
             self.bodies.setData([], [])
+            self._update_body_labels()
             return
         st = r.stations
         kps, depths, tips = [], [], []
-        for b in r.bodies:
+        for k, b in enumerate(r.bodies):
             i = int(np.clip(np.searchsorted(st.kp_km, b.kp_km), 0, st.n - 1))
             kps.append(b.kp_km)
             depths.append(float(-r.cable_m[i]))
-            body = b.body
-            tips.append("\n".join([
-                f"{body.name} ({body.kind}) at KP {b.kp_km:.3f}",
-                f"Weight in water {body.weight_kn:.2f} kN, length {body.length_m:.1f} m",
-                f"Clear of the seabed by up to {b.max_gap_m:.2f} m" + (" (in a span)" if b.in_span else ""),
-                f"Tension {b.tension_kn:.2f} kN"]))
+            tips.append(self.body_text(k))
         self.bodies.setData(np.array(kps), np.array(depths), data=tips)
+        self._update_body_labels()
+
+    def _update_body_labels(self, *_args) -> None:
+        r = self._result
+        bodies = r.bodies if (r is not None and self.labels_check.isChecked()) else []
+        while len(self._body_labels) < len(bodies):
+            label = pg.TextItem("", color=(40, 40, 40), anchor=(0.5, 1.3))
+            font = label.textItem.font()
+            font.setPixelSize(11)
+            label.setFont(font)
+            label.setZValue(25)
+            self.depth_plot.addItem(label, ignoreBounds=True)
+            self._body_labels.append(label)
+        for k, label in enumerate(self._body_labels):
+            if k < len(bodies):
+                b = bodies[k]
+                st = r.stations
+                i = int(np.clip(np.searchsorted(st.kp_km, b.kp_km), 0, st.n - 1))
+                label.setText(b.body.name)
+                label.setPos(b.kp_km, float(-r.cable_m[i]))
+                label.setVisible(True)
+            else:
+                label.setVisible(False)
+
+    def _on_body_clicked(self, _item, points, *_args) -> None:
+        if points is None or not len(points):
+            return
+        index = int(points[0].index())
+        text = self.body_text(index)
+        if text:
+            self.readout.setText(text.replace("\n", "  |  "))
+        self.bodyClicked.emit(index)
+
+    def _update_sea(self, *_args) -> None:
+        r = self._result
+        if r is None or not self.sea_check.isChecked():
+            self.sea_curve.setData([], [])
+        else:
+            kp = r.stations.kp_km
+            self.sea_curve.setData([float(kp[0]), float(kp[-1])], [0.0, 0.0])
+        if self.true_scale_check.isChecked():
+            self._fit_true_scale()
 
     def _update_previous(self, *_args) -> None:
         prev = self._previous if self.previous_check.isChecked() else None
@@ -367,49 +639,106 @@ class ProfilePlot(QWidget):
         self.prev_tension_curve.setData(prev.stations.kp_km, prev.tension_kn)
 
     def _update_rows(self, *_args) -> None:
-        for key, plot in (("tension", self.tension_plot), ("slack", self.slack_plot), ("slope", self.slope_plot)):
-            visible = self.row_checks[key].isChecked()
-            plot.setVisible(visible)
-            plot.setMaximumHeight(16777215 if visible else 0)
+        shown = {key: self.row_checks[key].isChecked() for key in ("tension", "slack", "slope")}
+        for key, visible in shown.items():
+            self.rows[key].setVisible(visible)
         # The KP axis labels sit on the lowest visible row.
-        lowest = next((p for p in reversed(self._data_plots) if p.isVisible()), self.depth_plot)
+        lowest = self.depth_plot
+        for key, plot in (("tension", self.tension_plot), ("slack", self.slack_plot), ("slope", self.slope_plot)):
+            if shown[key]:
+                lowest = plot
         for plot in self._data_plots:
-            plot.showAxis("bottom", plot is lowest)
-            if plot is lowest:
-                plot.setLabel("bottom", "KP (km)")
+            show = plot is lowest
+            plot.showAxis("bottom", show)
+            if show:
+                plot.setLabel("bottom", "KP (km)", **{"font-size": "11px"})
+
+    def _update_legends(self, *_args) -> None:
+        for caption in self.captions.values():
+            caption.setVisible(self.legend_check.isChecked())
 
     # -- view --------------------------------------------------------------------
+    def _apply_reverse(self, on: bool) -> None:
+        for plot in (self.status_plot,) + self._data_plots:
+            plot.invertX(bool(on))
+        self.measure.refresh()
+
+    def _apply_true_scale(self, on: bool) -> None:
+        vb = self.depth_plot.vb
+        if on:
+            # Aspect locking and y auto-visible fight each other: the locked
+            # view derives its own y span from the KP window.
+            vb.setAutoVisible(y=False)
+            vb.enableAutoRange(y=False)
+            vb.setAspectLocked(True, ratio=TRUE_SCALE_RATIO)
+            self._fit_true_scale()
+        else:
+            vb.setAspectLocked(False)
+            vb.enableAutoRange(y=True)
+            vb.setAutoVisible(y=True)
+            self.fit()
+
+    def _fit_true_scale(self) -> None:
+        r = self._result
+        if r is None:
+            return
+        lo, hi = sorted(self.visible_kp())
+        kp = r.stations.kp_km
+        sel = (kp >= lo) & (kp <= hi)
+        depths = np.concatenate([-r.stations.obstacle_m[sel], -r.cable_m[sel]])
+        depths = depths[np.isfinite(depths)]
+        if not depths.size:
+            return
+        y_lo, y_hi = float(depths.min()), float(depths.max())
+        if self.sea_check.isChecked():
+            y_lo = min(y_lo, 0.0)
+        if y_hi <= y_lo:
+            y_hi = y_lo + 1.0
+        self.depth_plot.vb.setRange(xRange=(lo, hi), yRange=(y_lo, y_hi), padding=0.02)
+
+    def _auto_y(self) -> None:
+        for plot in self._data_plots:
+            if plot is self.depth_plot and self.true_scale_check.isChecked():
+                continue
+            plot.enableAutoRange(axis="y")
+
     def fit(self) -> None:
         r = self._result
         if r is None:
             return
         kp = r.stations.kp_km
         self.depth_plot.setXRange(float(kp[0]), float(kp[-1]), padding=0.01)
-        for plot in self._data_plots:
-            plot.enableAutoRange(axis="y")
+        if self.true_scale_check.isChecked():
+            self._fit_true_scale()
+        self._auto_y()
 
     def zoom_to(self, kp_a: float, kp_b: float) -> None:
         lo, hi = sorted((kp_a, kp_b))
         pad = max((hi - lo) * 0.75, 0.02)
         self.depth_plot.setXRange(lo - pad, hi + pad, padding=0)
-        for plot in self._data_plots:
-            plot.enableAutoRange(axis="y")
+        if self.true_scale_check.isChecked():
+            self._fit_true_scale()
+        self._auto_y()
 
     def visible_kp(self):
         lo, hi = self.depth_plot.viewRange()[0]
         return float(lo), float(hi)
 
     # -- hover / click ----------------------------------------------------------
-    def _kp_at(self, pos) -> Optional[float]:
-        for plot in self._data_plots:
-            if plot.isVisible() and plot.sceneBoundingRect().contains(pos):
-                return float(plot.vb.mapSceneToView(pos).x())
-        return None
+    def _plot_for(self, key: str):
+        return {"depth": self.depth_plot, "tension": self.tension_plot, "slack": self.slack_plot,
+                "slope": self.slope_plot}[key]
 
-    def _on_mouse_moved(self, pos) -> None:
+    def _kp_at(self, key: str, pos) -> Optional[float]:
+        plot = self._plot_for(key)
+        if not plot.vb.sceneBoundingRect().contains(pos):
+            return None
+        return float(plot.vb.mapSceneToView(pos).x())
+
+    def _on_mouse_moved(self, key: str, pos) -> None:
         if self._result is None or self.measure.active:
             return
-        kp = self._kp_at(pos)
+        kp = self._kp_at(key, pos)
         if kp is None:
             for line in self._vlines:
                 line.hide()
@@ -438,6 +767,13 @@ class ProfilePlot(QWidget):
         parts = [f"KP {st.kp_km[i]:.3f}", f"depth {-st.seabed_m[i]:.1f} m",
                  f"gap {gap:.2f} m" if gap > 0.005 else "on the seabed",
                  f"T {r.tension_kn[i]:.2f} kN (laid {r.deposit_kn[i]:.2f})"]
+        span = next(((k, s) for k, s in enumerate(r.spans) if s.i0 <= i <= s.i1), None)
+        if span is not None:
+            k, s = span
+            level = "red" if pl._span_red(s, r.criteria) else "amber"
+            parts.append(f"span {k + 1} ({level}): {s.length_m:.1f} m long, up to {s.max_gap_m:.2f} m high")
+        elif gap > SPAN_END_TOL_M:
+            parts.append("clear of the seabed, under the reporting limits")
         if math.isfinite(r.laid_pct[i]):
             parts.append(f"slack laid {r.laid_pct[i]:.2f}%, fill {r.fill_pct[i]:.2f}%, surplus {r.excess_pct[i]:.2f}%")
         parts.append(f"slope {math.degrees(math.atan(abs(st.slope[i]))):.1f}° (friction "
@@ -450,10 +786,10 @@ class ProfilePlot(QWidget):
             parts.append(st.soil[i])
         return "  |  ".join(parts)
 
-    def _on_mouse_clicked(self, event) -> None:
-        if self._result is None or self.measure.active:
+    def _on_mouse_clicked(self, key: str, event) -> None:
+        if self._result is None or self.measure.active or event.isAccepted():
             return
-        kp = self._kp_at(event.scenePos())
+        kp = self._kp_at(key, event.scenePos())
         if kp is None:
             return
         if event.double():

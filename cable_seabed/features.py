@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Seabed features added to a profile: boulder, pipeline (crossing) and berm.
+"""Seabed features added to a profile: boulder, pipeline (crossing), berm and depression.
 
-Each feature sits on the seabed at a KP and adds height above it. The
+Each feature sits on the seabed at a KP and adds height above it (a
+depression takes height away). The
 profile gains stations through the feature (every ``length / 40``, between
 2 cm and 0.5 m), so its shape is resolved at any route sampling. Used for
 studies such as a cable crossing an exposed pipeline or a boulder in the
@@ -19,8 +20,10 @@ import numpy as np
 BOULDER = "boulder"
 PIPE = "pipe"
 BERM = "berm"
-FEATURE_KINDS = (BOULDER, PIPE, BERM)
-FEATURE_LABELS = {BOULDER: "Boulder (rounded)", PIPE: "Pipeline / cable crossing", BERM: "Berm / mattress"}
+DEPRESSION = "depression"
+FEATURE_KINDS = (BOULDER, PIPE, BERM, DEPRESSION)
+FEATURE_LABELS = {BOULDER: "Boulder (rounded)", PIPE: "Pipeline / cable crossing", BERM: "Berm / mattress",
+                  DEPRESSION: "Depression (trough)"}
 
 
 @dataclass
@@ -31,7 +34,9 @@ class SeabedFeature:
     * pipe: a circle of outside diameter ``length_m`` whose top is
       ``height_m`` above the seabed (``height_m = length_m``: lying on the seabed);
     * berm: trapezoid (rock berm, mattress), ``height_m`` high, ``length_m``
-      at the base and ``crest_m`` on top.
+      at the base and ``crest_m`` on top;
+    * depression: an inverted trapezoid (a trough), ``height_m`` deep,
+      ``length_m`` wide at the seabed and ``crest_m`` wide at the bottom.
     """
 
     kind: str
@@ -68,12 +73,14 @@ class SeabedFeature:
             with np.errstate(invalid="ignore"):
                 top = centre + np.sqrt(np.clip(radius ** 2 - d ** 2, 0.0, None))
             out = np.where(inside, np.maximum(top, 0.0), 0.0)
-        elif self.kind == BERM:
+        elif self.kind in (BERM, DEPRESSION):
             crest = min(max(float(self.crest_m or 0.0), 0.0), 2.0 * half)
             flank = half - 0.5 * crest
             with np.errstate(invalid="ignore", divide="ignore"):
                 ramp = np.where(flank > 0, h * (half - d) / flank, h)
             out = np.where(d <= 0.5 * crest, h, np.where(inside, np.clip(ramp, 0.0, h), 0.0))
+            if self.kind == DEPRESSION:
+                out = -out
         return out
 
 
@@ -87,7 +94,8 @@ def apply_features(x_m: np.ndarray, kp_km: np.ndarray, features: Sequence[Seabed
 
     ``values`` (per-station arrays, e.g. depth) are interpolated onto the new
     stations; gaps (nan) stay gaps. Returns ``(x, kp, height, values)``; add
-    ``height`` to the seabed elevation (subtract from depth).
+    ``height`` to the seabed elevation (subtract from depth). Raised features
+    combine by their highest point, depressions by their lowest.
     """
     x = np.asarray(x_m, dtype=float)
     kp = np.asarray(kp_km, dtype=float)
@@ -120,8 +128,11 @@ def apply_features(x_m: np.ndarray, kp_km: np.ndarray, features: Sequence[Seabed
             exact = np.isin(new_x, x[finite])
             interp = np.where(bad & ~exact, np.nan, interp)
         out_values.append(interp)
-    height = np.zeros(len(new_x))
+    raised = np.zeros(len(new_x))
+    lowered = np.zeros(len(new_x))
     for feature in usable:
         centre = float(np.interp(feature.kp_km, kp, x))
-        height = np.maximum(height, feature.height_at(new_x - centre))
-    return new_x, new_kp, height, out_values
+        h = feature.height_at(new_x - centre)
+        raised = np.maximum(raised, h)
+        lowered = np.minimum(lowered, h)
+    return new_x, new_kp, raised + lowered, out_values

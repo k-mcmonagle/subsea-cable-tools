@@ -15,10 +15,13 @@ from typing import List
 
 from qgis.core import QgsFeature, QgsGeometry, QgsPointXY, QgsProject, QgsRasterLayer, QgsVectorLayer
 from qgis.gui import QgsMapCanvas
-from qgis.PyQt.QtCore import QCoreApplication
+from qgis.PyQt.QtCore import QCoreApplication, QPoint, QPointF, Qt
+from qgis.PyQt.QtTest import QTest
 
+from ..cable_library import store as library
 from ..cable_seabed import planning as pl
 from ..span_analysis import dialog as dlg
+from ..span_analysis import sources
 from ..span_analysis import store as span_store
 from ..span_analysis.setup_panel import CABLE_MANUAL
 from .test_lay_assessment_qgis import DEG_PER_M, sand_wave_raster
@@ -70,7 +73,111 @@ def _synthetic_settings():
 def _make_dialog():
     dialog = dlg.SpanAnalysisDialog(None, iface=_Iface())
     dialog._persist_ui = False
+    plot = dialog.plot
+    plot.persist = False   # never write the tester's QSettings
+    for check, on in ((plot.true_scale_check, False), (plot.reverse_check, False), (plot.sea_check, True),
+                      (plot.labels_check, True)):
+        check.setChecked(on)
     return dialog
+
+
+class _Point:
+    def __init__(self, index):
+        self._index = index
+
+    def index(self):
+        return self._index
+
+
+def test_ui_tools() -> List[bool]:
+    out = []
+    dialog = _make_dialog()
+    try:
+        dialog.resize(1500, 950)
+        dialog.show()
+        dialog.load_example(0)
+        _wait(lambda: dialog._task is None, 90.0)
+        summary = dialog.results.summary.toHtml()
+        out.append(_report("verification example: the Summary agrees with the closed form",
+                           dialog._result is not None and "Agrees" in summary))
+        plot = dialog.plot
+        for _ in range(10):
+            QCoreApplication.processEvents()
+        plot.zoom_to(0.47, 0.53)
+        for _ in range(10):
+            QCoreApplication.processEvents()
+        plot.measure.action.setChecked(True)
+        widget = plot.widgets["depth"]
+        vb = plot.depth_plot.vb
+        for kp in (0.475, 0.525):
+            view_pt = widget.mapFromScene(vb.mapViewToScene(QPointF(kp, 100.5)))
+            QTest.mouseClick(widget.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                             QPoint(int(view_pt.x()), int(view_pt.y())))
+            for _ in range(5):
+                QCoreApplication.processEvents()
+        out.append(_report("measure: two clicks on the depth plot make a measurement",
+                           len(plot.measure.measurements) == 1))
+        plot.measure.action.setChecked(False)
+        plot.true_scale_check.setChecked(True)
+        locked = plot.depth_plot.vb.state.get("aspectLocked")
+        plot.true_scale_check.setChecked(False)
+        plot.reverse_check.setChecked(True)
+        inverted = plot.status_plot.vb.state.get("xInverted") and plot.slope_plot.vb.state.get("xInverted")
+        plot.reverse_check.setChecked(False)
+        out.append(_report("true scale locks the aspect; reverse KP inverts every row",
+                           bool(locked) and bool(inverted) and not plot.depth_plot.vb.state.get("aspectLocked")))
+        dialog.load_example(3)
+        _wait(lambda: dialog._task is None, 120.0)
+        table = dialog.results.spans_table
+        table.sortItems(3, Qt.SortOrder.DescendingOrder)
+        lengths = [float(table.item(r, 3).text()) for r in range(table.rowCount())]
+        table.selectRow(0)
+        chosen = dialog.results.selected_span()
+        out.append(_report("spans sort by length (numbers, not text) and keep their span",
+                           len(lengths) > 3 and lengths == sorted(lengths, reverse=True)
+                           and chosen is not None and abs(chosen.length_m - lengths[0]) < 0.05))
+        plot._on_body_clicked(None, [_Point(0)])
+        rows = dialog.results.bodies_table.selectionModel().selectedRows()
+        out.append(_report("clicking a body shows it in the Bodies tab", dialog.results.currentIndex() == 2
+                           and len(rows) == 1 and "R1" in plot.readout.text()))
+    finally:
+        dialog.shutdown()
+        dialog.hide()
+        dialog.deleteLater()
+    return out
+
+
+class _Leg:
+    def __init__(self, label):
+        self.attrs = {"CableType": label}
+
+
+class _Pos:
+    def __init__(self, kp):
+        self.dist_cum_km = kp
+
+
+class _Model:
+    def __init__(self, labels):
+        self.points = [_Pos(float(k)) for k in range(len(labels) + 1)]
+        self.segments = [_Leg(label) for label in labels]
+
+
+def test_rpl_cable_mapping() -> List[bool]:
+    rows = [library.clean_row({"name": name, "category": "cable", "generic_type": generic,
+                               "weight_water_kg_m": weight, "npts_kn": 50.0})
+            for name, generic, weight in (("SA Alpha", "SA", 2.0), ("SA Beta", "SA", 3.0), ("LW Gamma", "LW", 0.5))]
+    model = _Model(["LW", "SA", "SA"])
+    try:
+        sections, notes = sources.rpl_makeup(model, rows)
+        ambiguous = len(sections) == 1 and sections[0].cable.name == "LW Gamma" and any("'SA'" in n for n in notes)
+        sources.set_mapping("SA", "SA Beta")
+        sections, notes = sources.rpl_makeup(model, rows)
+        mapped = (len(sections) == 2 and sections[1].cable.name == "SA Beta" and sections[1].kp_start == 1.0
+                  and sections[1].kp_end == 3.0 and not notes)
+    finally:
+        sources.set_mapping("SA", None)
+    return [_report("RPL cable types: an ambiguous 'SA' is reported, then resolves once mapped", ambiguous and mapped)]
 
 
 def test_synthetic_run_live_detail_sweep() -> List[bool]:
@@ -182,6 +289,7 @@ def test_raster_route_and_store() -> List[bool]:
 
 
 def run_all() -> List[bool]:
-    results = test_synthetic_run_live_detail_sweep() + test_raster_route_and_store()
+    results = (test_synthetic_run_live_detail_sweep() + test_raster_route_and_store() + test_ui_tools()
+               + test_rpl_cable_mapping())
     print(f"\n{sum(results)}/{len(results)} Span & Slack Analysis QGIS checks passed.")
     return results
