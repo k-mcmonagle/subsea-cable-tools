@@ -4,9 +4,11 @@ These notes describe how Subsea Cable Tools currently measures KP and derives de
 
 ## KP and coordinate reference systems
 
-- **Chainage:** The default KP distance is the sum of WGS84 ellipsoidal lengths between stored route vertices, independent of the QGIS project's ellipsoid setting. KPs are in kilometres. Multi-feature routes follow SeqNo or layer order; the plugin does not reorder or node their geometry. An RPL supplies its start KP; its stated intermediate KPs are checked against measured chainage rather than used to locate positions.
-- **Grid option:** **Subsea Cable Tools ▸ KP settings…** changes the plugin-wide distance mode to Cartesian measurement in a selected projected CRS. Without a selected CRS, it uses a projected CRS from the route or project settings, or a route UTM zone. Burial plans retain their own KP mode so that a global settings change does not renumber an existing plan. Confirm which distance convention the source RPL uses before comparing KPs.
-- **Geometry and CRS:** KP positions follow the route's stored segments. The tools measure against the geometry's layer CRS and transform inputs with different CRSs where supported; **Translate KP Between RPLs (Points)** requires matching layer CRSs. A CRS assignment or transformation error can affect every derived KP.
+The full definitions, assumptions and accuracy are in the [KP method statement](KP_METHOD.md). In short:
+
+- **Chainage:** KP is the start KP plus the sum of WGS84 geodesic lengths between consecutive route vertices, in kilometres, independent of the QGIS project's ellipsoid. Between vertices the route follows the geodesic, whatever CRS it is stored in. Multi-feature routes follow SeqNo or layer order; the plugin does not reorder or node their geometry. An RPL supplies its start KP; its stated intermediate KPs are checked against measured chainage rather than used to locate positions.
+- **Grid option:** **Subsea Cable Tools ▸ KP settings…** changes the plugin-wide distance mode to grid (Cartesian) distances in one projected CRS: the one selected, else the route's own projected CRS, else the project CRS, else the UTM zone at the route start. Between vertices the route is then straight in that grid. Grid KP is only valid inside the grid's area of use; tools warn when a route leaves it. Burial plans retain their own KP mode so that a global settings change does not renumber an existing plan.
+- **Geometry and CRS:** The tools transform inputs with different CRSs where supported; **Translate KP Between RPLs (Points)** requires matching layer CRSs. A CRS assignment or transformation error can affect every derived KP. Routes crossing ±180° are refused.
 
 ## Depth sources
 

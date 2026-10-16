@@ -629,6 +629,14 @@ class SpanAnalysisDialog(QDialog):
 
         # Cable makeup and bodies.
         notes: List[str] = []
+        self._kp_basis = ""
+        if route is not None:
+            try:
+                basis = route.stationing.kp_basis_notes()
+                self._kp_basis = " ".join(text for _level, text in basis)
+                notes.extend(text for level, text in basis if level == "warn")
+            except Exception:
+                log_exception("Span & Slack Analysis: KP basis check skipped")
         if route_source == sources.ROUTE_RPL and self._rpl_model is not None:
             kp_note = sources.rpl_kp_note(self._rpl_model)
             if kp_note:
@@ -920,7 +928,8 @@ class SpanAnalysisDialog(QDialog):
         self.results.set_detail(None, None)
         self._detail = None
         notes = list(dict.fromkeys(self._notes + list(result.notes)))
-        self.results.set_result(result, summary_html(result, notes, self.setup.describe(), depression_check(result)))
+        inputs = self.setup.describe() + ([self._kp_basis] if getattr(self, "_kp_basis", "") else [])
+        self.results.set_result(result, summary_html(result, notes, inputs, depression_check(result)))
         self._report(result, notes)
         self._update_buttons()
 

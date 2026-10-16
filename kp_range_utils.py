@@ -42,9 +42,9 @@ def make_distance_area(
         **WGS84** ellipsoid, always. KP is the plugin's shared reference
         frame (RPLs, the Workbench, the Burial Planner and every KP tool),
         so it must not change with a project measurement setting.
-        ``"cartesian"`` — planar measurements in the source CRS units. Only
-        meaningful when ``source_crs`` is projected; raises ``ValueError`` for
-        a geographic CRS.
+        ``"cartesian"`` — planar (grid) measurements in one projected CRS, chosen
+        by :func:`resolve_kp_grid`; a geographic source is measured in that
+        grid (:class:`GridDistanceArea`).
     project:
         Accepted for API compatibility; the ellipsoid is always WGS84.
     """
@@ -53,14 +53,12 @@ def make_distance_area(
         raise ValueError(f"Unknown distance mode: {mode!r}")
 
     if mode == "cartesian":
-        # Grid distances: the KP-settings grid CRS when one is chosen, else
-        # the source CRS when projected, else the project CRS / UTM zone.
-        # (Geographic sources used to raise here.)
-        fixed = resolve_grid_crs(kp_grid_crs_setting(), None) if kp_grid_crs_setting() else None
-        if fixed is not None and source_crs is not None and fixed != source_crs:
-            return GridDistanceArea(source_crs, transform_context, fixed)
-        if source_crs is not None and source_crs.isGeographic():
-            return GridDistanceArea(source_crs, transform_context, resolve_grid_crs("", project))
+        # Grid distances in one grid CRS, chosen by :func:`resolve_kp_grid`
+        # (KP settings, else the source CRS when projected, else the project
+        # CRS when projected, else the UTM zone at the route start).
+        grid, how = resolve_kp_grid(kp_grid_crs_setting(), source_crs, project)
+        if grid is None or source_crs is None or grid != source_crs:
+            return GridDistanceArea(source_crs, transform_context, grid, how)
 
     if transform_context is None:
         transform_context = QgsCoordinateTransformContext()
@@ -86,11 +84,13 @@ def make_distance_area(
 # Plugin-wide KP distance setting
 # ---------------------------------------------------------------------------
 #
-# KP is geodesic (WGS84) by default. Some RPLs are chained on the map
+# KP is geodesic (WGS84) by default. Some RPLs are chained on a map
 # projection instead, so the plugin offers one switch — Cartesian (grid) —
-# honoured by every KP-producing tool. Grid distances are planar in the
-# *grid CRS*: the chosen projected CRS, else the project CRS when it is
-# projected, else the UTM zone at the start of the route being measured.
+# honoured by every KP-producing tool. Grid distances are planar in one
+# *grid CRS* (:func:`resolve_kp_grid`): the CRS set in KP settings, else the
+# route's own CRS when projected, else the project CRS when projected, else
+# the UTM zone at the route start. Grid KP is only valid inside that CRS's
+# area of use; tools report where the route leaves it.
 
 KP_SETTINGS_GROUP = "SubseaCableTools/KP"
 KP_MODE_GEODESIC = "ellipsoidal"
@@ -135,32 +135,57 @@ def set_kp_distance_settings(mode: str, grid_crs: str = "") -> None:
     settings.setValue(f"{KP_SETTINGS_GROUP}/grid_crs", grid_crs or "")
 
 
-def resolve_grid_crs(grid_crs: str = "", project=None):
-    """The fixed grid CRS for Cartesian KP, or None (auto UTM per route)."""
+GRID_FROM_SETTING = "set in KP settings"
+GRID_FROM_ROUTE = "the route's own CRS"
+GRID_FROM_PROJECT = "the project CRS"
+GRID_FROM_UTM = "the UTM zone at the route start (chosen automatically)"
+
+
+def resolve_kp_grid(grid_crs: str = "", route_crs=None, project=None):
+    """``(grid CRS or None, how)`` for Cartesian (grid) KP.
+
+    One rule for every tool, most explicit first: a grid CRS given (KP
+    settings or the caller), else the route's own CRS when it is projected
+    (grid KP of a route drawn in a grid is chained in that grid), else the
+    project CRS when projected, else ``None``: the UTM zone at the route
+    start, chosen when the route is measured.
+    """
     if grid_crs:
         crs = QgsCoordinateReferenceSystem(grid_crs)
         if crs.isValid() and not crs.isGeographic():
-            return crs
+            return crs, GRID_FROM_SETTING
+    if route_crs is not None and route_crs.isValid() and not route_crs.isGeographic():
+        return route_crs, GRID_FROM_ROUTE
     try:
         from qgis.core import QgsProject
         project = project or QgsProject.instance()
         crs = project.crs()
         if crs.isValid() and not crs.isGeographic():
-            return crs
+            return crs, GRID_FROM_PROJECT
     except Exception:
         pass
-    return None
+    return None, GRID_FROM_UTM
+
+
+def resolve_grid_crs(grid_crs: str = "", project=None, route_crs=None):
+    """The fixed grid CRS for Cartesian KP, or None (auto UTM per route)."""
+    return resolve_kp_grid(grid_crs, route_crs, project)[0]
 
 
 def describe_kp_mode(mode: Optional[str] = None, grid_crs: Optional[str] = None) -> str:
-    """Short human description, e.g. 'Geodesic (WGS84)' / 'Cartesian (EPSG:32630)'."""
+    """Short human description, e.g. 'Geodesic (WGS84)' / 'Cartesian (grid EPSG:32630)'."""
     mode = mode or kp_distance_mode()
     if mode != KP_MODE_CARTESIAN:
         return "Geodesic (WGS84)"
-    crs = resolve_grid_crs(kp_grid_crs_setting() if grid_crs is None else grid_crs)
-    if crs is None:
-        return "Cartesian (grid, UTM zone of the route)"
-    return f"Cartesian (grid, {crs.authid() or crs.description()})"
+    grid = kp_grid_crs_setting() if grid_crs is None else grid_crs
+    if grid:
+        crs = QgsCoordinateReferenceSystem(grid)
+        if crs.isValid() and not crs.isGeographic():
+            return f"Cartesian (grid {crs.authid() or crs.description()}, valid inside its area of use)"
+    project = resolve_kp_grid("", None, None)[0]
+    rest = f"else the project CRS {project.authid()}" if project is not None else \
+        "else the UTM zone at the route start"
+    return f"Cartesian (grid: the route's own CRS when projected, {rest})"
 
 
 class GridDistanceArea(QgsDistanceArea):
@@ -172,14 +197,16 @@ class GridDistanceArea(QgsDistanceArea):
     zone is chosen from the first point measured (the route start).
     """
 
-    def __init__(self, source_crs, transform_context=None, grid_crs=None):
+    def __init__(self, source_crs, transform_context=None, grid_crs=None, how=""):
         super().__init__()
         if transform_context is None:
             transform_context = QgsCoordinateTransformContext()
         self._ctx = transform_context
         self._source = source_crs
         self._grid = grid_crs
+        self._how = how or (GRID_FROM_UTM if grid_crs is None else "")
         self._xform = None
+        self._back = None
         if source_crs is not None:
             self.setSourceCrs(source_crs, transform_context)
         self.setEllipsoid("WGS84")
@@ -191,10 +218,29 @@ class GridDistanceArea(QgsDistanceArea):
     def grid_crs(self):
         return self._grid
 
+    def grid_how(self) -> str:
+        """How the grid CRS was chosen (see :func:`resolve_kp_grid`)."""
+        return self._how
+
     def clone(self) -> "GridDistanceArea":
-        other = GridDistanceArea(self._source, self._ctx, self._grid)
+        other = GridDistanceArea(self._source, self._ctx, self._grid, self._how)
         other._xform = self._xform
         return other
+
+    def to_grid(self, point):
+        """``point`` (source CRS) in grid coordinates."""
+        return self._transform(point)
+
+    def from_grid(self, point):
+        """Grid coordinates back to the source CRS."""
+        from qgis.core import QgsCoordinateTransform, QgsPointXY
+        if self._xform is None:
+            raise ValueError("The grid is chosen when the route is first measured.")
+        if self._source == self._grid:
+            return QgsPointXY(point)
+        if self._back is None:
+            self._back = QgsCoordinateTransform(self._grid, self._source, self._ctx)
+        return self._back.transform(QgsPointXY(point))
 
     # -- measuring -------------------------------------------------------
     def _transform(self, point):
@@ -244,26 +290,52 @@ def make_kp_distance_area(
     project: Optional["QgsProject"] = None,
     mode: Optional[str] = None,
     grid_crs: Optional[str] = None,
+    route_crs: Optional[QgsCoordinateReferenceSystem] = None,
 ) -> QgsDistanceArea:
     """Distance area for **KP chainage**, honouring the plugin KP setting.
 
     ``mode`` / ``grid_crs`` override the plugin setting (a Burial Planner
     plan keeps its own so its KPs never change behind its back).
+    ``route_crs`` is the CRS the route is stored in when the geometries
+    measured are in another (e.g. the map CRS); it takes part in the grid
+    choice (:func:`resolve_kp_grid`). By default it is ``source_crs``.
     """
     mode = mode or kp_distance_mode()
     if mode != KP_MODE_CARTESIAN:
         return make_distance_area(source_crs, transform_context, project=project)
-    grid = resolve_grid_crs(kp_grid_crs_setting() if grid_crs is None else grid_crs, project)
+    grid, how = resolve_kp_grid(kp_grid_crs_setting() if grid_crs is None else grid_crs,
+                                source_crs if route_crs is None else route_crs, project)
     if grid is not None and source_crs is not None and grid == source_crs:
         return make_distance_area(source_crs, transform_context, mode=KP_MODE_CARTESIAN)
-    return GridDistanceArea(source_crs, transform_context, grid)
+    return GridDistanceArea(source_crs, transform_context, grid, how)
+
+
+def kp_basis_text(distance) -> str:
+    """The KP distance model in words, e.g. 'geodesic on the WGS84 ellipsoid' or
+    'grid (Cartesian) in EPSG:32630 WGS 84 / UTM zone 30N (the project CRS)'."""
+    if isinstance(distance, GridDistanceArea):
+        grid = distance.grid_crs()
+        name = f"{grid.authid()} {grid.description()}".strip() if grid is not None else "a UTM zone"
+        return f"grid (Cartesian) in {name} ({distance.grid_how()})"
+    try:
+        geodesic = distance.willUseEllipsoid()
+    except Exception:
+        geodesic = False
+    if geodesic:
+        return "geodesic on the WGS84 ellipsoid"
+    try:
+        crs = distance.sourceCrs()
+        name = f"{crs.authid()} {crs.description()}".strip()
+    except Exception:
+        name = "the layer CRS"
+    return f"grid (Cartesian) in {name} (the route's own CRS)"
 
 
 # Shared distance-mode parameter helpers for KP-emitting processing algorithms.
 DISTANCE_MODE_PARAM = "DISTANCE_MODE"
 DISTANCE_MODE_OPTIONS = (
     "Geodesic (WGS84 ellipsoid)",
-    "Cartesian (grid: KP-settings CRS, projected layer CRS, or UTM zone)",
+    "Cartesian (grid: KP-settings CRS, else the route's projected CRS, else the project CRS, else UTM zone)",
 )
 DISTANCE_MODE_VALUES = ("ellipsoidal", "cartesian")
 

@@ -329,20 +329,28 @@ def recompute(
                 seg.slack_pct = (seg.cable_dist_km / seg.dist_km - 1.0) * 100.0
         changed.segment_indices.add(i)
 
-    # cumulative cascade (always from the first affected point)
-    anchor_route = model.points[0].dist_cum_km or 0.0
-    anchor_cable = model.points[0].cable_dist_cum_km or 0.0
-    model.points[0].dist_cum_km = anchor_route
-    model.points[0].cable_dist_cum_km = anchor_cable
-    route = anchor_route
-    cable = anchor_cable
-    for i, seg in enumerate(model.segments):
+    # Cumulative cascade from the first affected leg. The positions before it
+    # keep their KPs (the document's, or earlier computed ones): re-summing
+    # stored, rounded leg lengths from the route start let rounding build up
+    # along a long route and moved KPs the edit never touched. The position
+    # at ``from_seg`` is unchanged by every edit; without a KP there the
+    # cascade starts at the route start, whose KP is the anchor (default 0).
+    first = min(start, n_seg)
+    base = model.points[first]
+    if first > 0 and (base.dist_cum_km is None or base.cable_dist_cum_km is None):
+        first = 0
+    if first == 0:
+        model.points[0].dist_cum_km = model.points[0].dist_cum_km or 0.0
+        model.points[0].cable_dist_cum_km = model.points[0].cable_dist_cum_km or 0.0
+    route = model.points[first].dist_cum_km
+    cable = model.points[first].cable_dist_cum_km
+    for i in range(first, n_seg):
+        seg = model.segments[i]
         route += seg.dist_km or 0.0
         cable += seg.cable_dist_km or 0.0
         point = model.points[i + 1]
-        if i >= start - 1:
-            if point.dist_cum_km != route or point.cable_dist_cum_km != cable:
-                changed.point_indices.add(i + 1)
+        if point.dist_cum_km != route or point.cable_dist_cum_km != cable:
+            changed.point_indices.add(i + 1)
         point.dist_cum_km = route
         point.cable_dist_cum_km = cable
     return changed

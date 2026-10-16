@@ -10,6 +10,7 @@ The top-level [README](../README.md) is the short introduction and tool list. Us
 
 - [CPTs from AGS files](GEOTECHNICAL_CPT.md) — AGS 3 / AGS 4 CPT import with a position and summary table, placement along the route, traces, logs and the derived parameters.
 
+- [KP method statement](KP_METHOD.md) — how KP is defined and calculated (geodesic and grid), assumptions, accuracy and matching other systems.
 - [KP and bathymetry methods](KP_AND_BATHYMETRY.md) — KP distance, CRS, bathymetry sampling, slope and coverage conventions.
 
 - [Lay Assessment](LAY_ASSESSMENT.md) — suspension, loop-risk and tension checks on lay data; the seabed rest model and its validation.

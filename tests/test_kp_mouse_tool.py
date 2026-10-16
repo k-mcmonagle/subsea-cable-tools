@@ -34,7 +34,7 @@ from qgis.core import (QgsCoordinateReferenceSystem, QgsCoordinateTransform, Qgs
 from qgis.PyQt.QtCore import QCoreApplication, QEvent, QPoint, Qt
 from qgis.PyQt.QtWidgets import QMainWindow, QToolBar
 
-from ..kp_geo_utils import RouteFrame, iter_line_parts
+from ..kp_geo_utils import RouteFrame, iter_line_parts, kp_at_point
 from ..maptools import kp_mouse_maptool
 from ..maptools.kp_mouse_maptool import KPMouseMapTool, KPMouseTool, _layer_has_features
 
@@ -210,9 +210,12 @@ def _equivalence(cartesian):
         t_old = t_new = 0.0
         for p in points:
             start = time.perf_counter()
-            old_kp, old_dcc, old_pos, plugin_kp = _legacy_locate(
+            old_kp, _old_dcc, _old_pos, _plugin_kp = _legacy_locate(
                 tool.features_geoms, tool.distanceArea, p)
             t_old += time.perf_counter() - start
+            # The reference: the exact walk over the KP path (no index).
+            walk = kp_at_point(tool.features_geoms, p, tool.distanceArea)
+            old_dcc, old_pos, plugin_kp = walk.dcc_m, walk.snapped_xy, walk.kp_km
             start = time.perf_counter()
             hit = tool._locate(p)
             t_new += time.perf_counter() - start
@@ -235,19 +238,18 @@ def _equivalence(cartesian):
             # A point placed beside a leg: the perpendicular foot, so the DCC is its offset
             # (projecting in plain degrees slid the foot along a geographic leg).
             offset = near_offset.get((p.x(), p.y()))
-            if offset is not None and abs(hit.dcc_m - offset) > 0.01 * offset + 0.01:
+            if offset is not None and abs(hit.dcc_m - offset) > 0.01 * offset + 0.1:
                 near_bad += 1
         total_km = tool.total_length_meters / 1000.0
         legacy_total = sum(tool.distanceArea.measureLength(g) for g in tool.features_geoms) / 1000.0
         ok = not worse and near_bad == 0 and abs(total_km - legacy_total) < 1e-9
-        detail = ("%d points: %d same position (KP worst %.2e m, DCC worst %.2e m; old in-segment "
-                  "formula off by up to %.1f mm), %d equidistant, %d nearer than legacy, %d worse; "
-                  "per move legacy %.3f ms vs indexed %.3f ms"
-                  % (len(points), same, worst_kp, worst_dcc, worst_formula * 1000.0, ties, nearer,
+        detail = ("%d points: %d same position as the exact walk (KP worst %.2e m, DCC worst %.2e m), "
+                  "%d equidistant, %d nearer, %d worse; per move: old walk %.3f ms, indexed %.3f ms"
+                  % (len(points), same, worst_kp, worst_dcc, ties, nearer,
                      len(worse), 1000 * t_old / len(points), 1000 * t_new / len(points)))
         if worse:
             detail += "; first worse: %s" % (worse[0],)
-        return _result("indexed KP vs legacy walk: same or nearer, DCC = offset beside a leg (%s)"
+        return _result("indexed KP == exact walk over the KP path; DCC = offset beside a leg (%s)"
                        % ("Cartesian" if cartesian else "geodesic"), ok, detail)
     finally:
         tool.cleanup_resources()

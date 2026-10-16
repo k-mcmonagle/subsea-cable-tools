@@ -208,7 +208,12 @@ def test_multipart_matches_multi_feature() -> bool:
 
 
 def test_ellipsoidal_vs_cartesian_on_projected_crs() -> bool:
-    """For a short projected line, ellipsoidal and cartesian midpoints should agree."""
+    """A 111 km north-south line in UTM 31N, 334 km west of its central meridian.
+
+    Geodesic KP: the midpoint is on the geodesic (the meridian at 0 deg,
+    a curve in this grid) at half the geodesic length. Grid KP: the planar
+    midpoint of the straight grid line. They are ~13 m apart here.
+    """
 
     geog_crs = QgsCoordinateReferenceSystem("EPSG:4326")
     proj_crs = QgsCoordinateReferenceSystem("EPSG:32631")
@@ -225,14 +230,18 @@ def test_ellipsoidal_vs_cartesian_on_projected_crs() -> bool:
 
     pt_ell = point_at_kp(geom, total_ell_km / 2.0, da_ell)
     pt_car = point_at_kp(geom, total_car_km / 2.0, da_car)
-    ok = (
-        pt_ell is not None
-        and pt_car is not None
-        and abs(pt_ell.x() - pt_car.x()) < 5.0
-        and abs(pt_ell.y() - pt_car.y()) < 5.0
-    )
+    back = QgsCoordinateTransform(proj_crs, geog_crs, QgsProject.instance())
+    ends = list(geom.vertices())
+    planar_mid = ((ends[0].x() + ends[-1].x()) / 2.0, (ends[0].y() + ends[-1].y()) / 2.0)
+    ok = pt_ell is not None and pt_car is not None
+    if ok:
+        on_meridian = abs(back.transform(pt_ell).x()) < 1e-7
+        half = abs(float(da_ell.measureLine(QgsPointXY(ends[0].x(), ends[0].y()), pt_ell))
+                   - total_ell_km * 500.0) < 0.01
+        planar = abs(pt_car.x() - planar_mid[0]) < 1e-6 and abs(pt_car.y() - planar_mid[1]) < 1e-6
+        ok = on_meridian and half and planar
     return _result(
-        "ellipsoidal vs cartesian midpoint parity (projected)",
+        "geodesic and grid midpoints on a projected route each follow their own path",
         ok,
         f"ell={pt_ell and (round(pt_ell.x(), 3), round(pt_ell.y(), 3))} car={pt_car and (round(pt_car.x(), 3), round(pt_car.y(), 3))}",
     )
@@ -465,28 +474,34 @@ def test_rplcomparator_ellipsoid_fallback() -> bool:
 def test_geodesic_interpolation_long_geographic_segment() -> bool:
     """Long east-west geographic segment (-30,60)-(30,60).
 
-    Default (``follow_stored_geometry=True``, the plugin's one KP rule): the
-    point at mid-KP lies on the segment as drawn, (0, 60), and KP -> point
-    -> KP round-trips exactly. Explicit ``follow_stored_geometry=False``
-    still follows the geodesic, which bows north to ~(0, 62.6).
+    The KP path is the geodesic (bowing north to ~63.4 N): the point at mid-KP
+    is the geodesic's midpoint and KP -> point -> KP round-trips. A frame
+    built with ``path=PATH_DRAWN`` (display playback) keeps the line as
+    drawn, (0, 60), with the same geodesic length.
     """
+    from ..kp_geo_utils import PATH_DRAWN
 
     geom = _line("LINESTRING(-30 60, 30 60)")
     da = _da_geog()
     total_km = measure_total_length_m(geom, da) / 1000.0
     mid = point_at_kp(geom, total_km / 2.0, da)
-    arc = point_at_kp(geom, total_km / 2.0, da, follow_stored_geometry=False)
-    if mid is None or arc is None:
+    start, end = QgsPointXY(-30.0, 60.0), QgsPointXY(30.0, 60.0)
+    reference = da.computeSpheroidProject(start, total_km * 500.0, da.bearing(start, end))
+    drawn = RouteFrame.from_source([geom], da, path=PATH_DRAWN)
+    drawn_mid = drawn.point_at_kp(total_km / 2.0)
+    if mid is None or drawn_mid is None:
         return _result("geodesic interpolation on long geographic segment", False, "None")
     back = kp_at_point(geom, mid, da).kp_km
-    ok = abs(mid.x()) < 1e-6 and abs(mid.y() - 60.0) < 1e-6
-    ok = ok and abs(back - total_km / 2.0) < 1e-6
-    ok = ok and abs(arc.x()) < 1e-3 and arc.y() - 60.0 > 1.0
+    off = float(da.measureLine(mid, reference))
+    ok = off < 0.01 and abs(back - total_km / 2.0) < 1e-6
+    ok = ok and abs(drawn_mid.x()) < 1e-6 and abs(drawn_mid.y() - 60.0) < 1e-6
+    ok = ok and abs(drawn.total_length_km - total_km) < 1e-9
     return _result(
-        "long geographic segment: default follows the drawn line and round-trips; "
-        "arc mode still available",
+        "long geographic segment: positions follow the geodesic and round-trip; a drawn-path frame "
+        "stays on the drawn line",
         ok,
-        f"mid=({mid.x():.6f}, {mid.y():.6f}) arc_y={arc.y():.3f} round_trip={abs(back - total_km / 2.0) * 1e6:.3f} mm",
+        f"mid=({mid.x():.6f}, {mid.y():.6f}) {off * 1000:.2f} mm from the geodesic; "
+        f"round_trip={abs(back - total_km / 2.0) * 1e6:.3f} mm",
     )
 
 

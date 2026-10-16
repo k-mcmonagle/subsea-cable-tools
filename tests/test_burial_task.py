@@ -319,7 +319,12 @@ def test_route_frame_builder() -> bool:
 
 
 def test_plan_route_follows_stored_geometry() -> bool:
-    """Generated plan geometry must sit on the RPL as drawn in QGIS."""
+    """Plan geometry sits where its KPs are: on the geodesic between RPL positions (the KP path).
+
+    A 1,100 km east-west leg at 60 N: the geodesic bows north of the line
+    straight in degrees; the midpoint is the geodesic's, and a slice's
+    vertices lie on it (a projected map draws the leg the same way).
+    """
     layer = QgsVectorLayer("LineString?crs=EPSG:4326&field=SeqNo:integer",
                            "sparse-route", "memory")
     feat = QgsFeature(layer.fields())
@@ -327,16 +332,18 @@ def test_plan_route_follows_stored_geometry() -> bool:
     feat.setAttributes([0])
     layer.dataProvider().addFeature(feat)
 
-    route, _da = analysis_task.build_route_frame(layer, QgsProject.instance())
+    route, da = analysis_task.build_route_frame(layer, QgsProject.instance())
+    start, end = QgsPointXY(-10.0, 60.0), QgsPointXY(10.0, 60.0)
+    reference = da.computeSpheroidProject(start, route.total_length_m / 2.0, da.bearing(start, end))
     midpoint = route.point_at_kp(route.total_length_km / 2.0, clamp=True)
     segment = route.extract_segment(route.total_length_km * 0.25,
                                     route.total_length_km * 0.75)
     vertices = list(segment.vertices()) if segment is not None else []
-    ok = midpoint is not None and abs(midpoint.y() - 60.0) < 1e-10
-    ok = ok and abs(midpoint.x()) < 1e-8
-    ok = ok and len(vertices) >= 2
-    ok = ok and all(abs(point.y() - 60.0) < 1e-10 for point in vertices)
-    return _result("plan route follows stored RPL geometry", ok)
+    off = float(da.measureLine(midpoint, reference)) if midpoint is not None else float("inf")
+    ok = off < 0.01 and midpoint.y() > 60.3 and abs(midpoint.x()) < 1e-6
+    ok = ok and len(vertices) > 2 and all(point.y() > 60.0 for point in vertices)
+    return _result("plan route follows the KP path (geodesic) between RPL positions", ok,
+                   f"midpoint {off * 1000:.2f} mm from the geodesic, at lat {midpoint.y():.3f}")
 
 
 def test_section_style_has_no_cartographic_offset() -> bool:

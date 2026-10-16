@@ -290,14 +290,26 @@ def _xy_text(point) -> str:
         return repr(point)
 
 
-def nearest_x_scale(distance: QgsDistanceArea, latitude: float) -> float:
-    """Weight of x in a nearest-point projection.
+WGS84_E2 = 0.0066943799901413165     # first eccentricity squared of the WGS84 ellipsoid
 
-    On a geographic route a degree of longitude is ``cos(latitude)`` of a
-    degree of latitude, so the perpendicular foot found in plain degrees
-    slides along the route (by about ``0.4 x`` the offset at 50 deg N, more
-    further north). Weighting x by ``cos(latitude)`` finds the measured
-    nearest point; 1 on a projected route.
+
+def metric_x_scale(latitude: float) -> float:
+    """Length of a degree of longitude over a degree of latitude at ``latitude`` on the
+    WGS84 ellipsoid: ``N cos(phi) / M = cos(phi) (1 - e2 sin2(phi)) / (1 - e2)``."""
+    phi = math.radians(min(abs(latitude), 89.9))
+    return max(math.cos(phi) * (1.0 - WGS84_E2 * math.sin(phi) ** 2) / (1.0 - WGS84_E2), 1e-3)
+
+
+def nearest_x_scale(distance: QgsDistanceArea, latitude: float) -> float:
+    """Weight of x in a nearest-point projection near ``latitude``.
+
+    On a geographic route a degree of longitude is shorter than a degree of
+    latitude (cos(latitude) on a sphere, and up to 0.7 % more on the
+    ellipsoid), so the perpendicular foot found in plain degrees slides
+    along the route: by about 0.4 x the offset at 50 deg N with no weight,
+    0.3 % of it with the spherical one. With :func:`metric_x_scale` at the
+    segment's latitude the foot is the measured nearest point (within about
+    0.1 m 1 km off the route, under 1 mm 100 m off). 1 on a projected route.
     """
     try:
         crs = distance.sourceCrs()
@@ -306,7 +318,7 @@ def nearest_x_scale(distance: QgsDistanceArea, latitude: float) -> float:
         geographic = False
     if not geographic or not math.isfinite(latitude):
         return 1.0
-    return max(math.cos(math.radians(min(abs(latitude), 89.9))), 1e-3)
+    return metric_x_scale(latitude)
 
 
 def segment_fraction(qx: float, qy: float, x1: float, y1: float, dx: float, dy: float,
@@ -346,6 +358,155 @@ def _measure_segment_m(distance: QgsDistanceArea, p1, p2) -> Optional[float]:
         _warn_unmeasurable_segment(p1, p2, "length %r" % seg_len)
         return None
     return seg_len
+
+
+# ---------------------------------------------------------------------------
+# The KP path between route vertices
+# ---------------------------------------------------------------------------
+#
+# One rule for every tool (see DECISIONS.md, "One KP definition"): between two
+# route vertices the route follows the path its KP is measured along -
+# the geodesic on the WGS84 ellipsoid for geodesic KP, the straight line in
+# the grid CRS for grid (Cartesian) KP - whatever CRS the line is stored in.
+# A segment whose path departs from the stored segment by more than
+# PATH_TOLERANCE_M at its midpoint gets points along the path about
+# PATH_STEP_M apart, so positions, nearest points and slices follow it to
+# within millimetres; the vertices, and the chainage at each, are unchanged.
+# RouteFrame(path=PATH_DRAWN) keeps the line as drawn instead (for display
+# playback that must stay on the drawn line, never for KP positions).
+
+PATH_STEP_M = 250.0
+PATH_TOLERANCE_M = 0.001
+PATH_KP = "kp"
+PATH_DRAWN = "drawn"
+
+
+class AntimeridianError(ValueError):
+    """A route crossing +/-180 deg of longitude (not supported)."""
+
+
+ANTIMERIDIAN_MESSAGE = (
+    "The route crosses the ±180° meridian, which the KP tools do not support: positions and "
+    "intersections on that leg would be wrong. Split the route at 180° and give the second part "
+    "the start KP of the split.")
+
+
+def kp_path_kind(distance) -> str:
+    """How a route runs between vertices for this KP distance: ``geodesic``,
+    ``grid`` (straight in the grid CRS) or ``straight`` (planar in the source CRS)."""
+    is_grid = getattr(distance, "is_grid", None)
+    if callable(is_grid) and is_grid():
+        return "grid"
+    try:
+        if distance.willUseEllipsoid():
+            return "geodesic"
+    except Exception:  # noqa: BLE001 - a plain planar distance area
+        pass
+    return "straight"
+
+
+def path_points(p1, p2, distance, length_m: Optional[float] = None,
+                step_m: float = PATH_STEP_M) -> List[QgsPointXY]:
+    """Points strictly between ``p1`` and ``p2`` (source CRS) on the KP path,
+    about ``step_m`` apart; empty when the segment is shorter or the path is
+    straight in the source CRS already."""
+    kind = kp_path_kind(distance)
+    if kind == "straight":
+        return []
+    if length_m is None:
+        length_m = _measure_segment_m(distance, p1, p2)
+    if length_m is None or not length_m > 0:
+        return []
+    a, b = QgsPointXY(p1), QgsPointXY(p2)
+    try:
+        # Where the path and the stored segment agree within the tolerance at
+        # their midpoints, the stored segment is the path.
+        if kind == "geodesic":
+            mid = [QgsPointXY(q) for chunk in distance.geodesicLine(a, b, length_m / 2.0, False) for q in chunk]
+            path_mid = mid[1] if len(mid) >= 3 else None    # rounding can add a point at the end
+        else:
+            ga, gb = distance.to_grid(a), distance.to_grid(b)
+            path_mid = distance.from_grid(QgsPointXY((ga.x() + gb.x()) / 2.0, (ga.y() + gb.y()) / 2.0))
+        chord_mid = QgsPointXY((a.x() + b.x()) / 2.0, (a.y() + b.y()) / 2.0)
+        if path_mid is None or float(distance.measureLine(path_mid, chord_mid)) <= PATH_TOLERANCE_M:
+            return []
+        if kind == "geodesic":
+            line = [QgsPointXY(q) for chunk in distance.geodesicLine(a, b, step_m, False) for q in chunk]
+            inner = line[1:-1]
+        else:
+            ga, gb = distance.to_grid(a), distance.to_grid(b)
+            count = int(math.ceil(length_m / step_m))
+            inner = [distance.from_grid(QgsPointXY(ga.x() + (gb.x() - ga.x()) * k / count,
+                                                   ga.y() + (gb.y() - ga.y()) * k / count))
+                     for k in range(1, count)]
+    except Exception:  # noqa: BLE001 - never silent: the stored segment is used
+        log_exception("KP: the path between two route vertices could not be computed; using the "
+                      "segment as stored", level=logging.WARNING)
+        return []
+    return [q for q in inner if math.isfinite(q.x()) and math.isfinite(q.y())]
+
+
+def kp_basis_notes(distance, parts, total_m: float):
+    """``[(level, text)]`` on the KP basis of a route (``level``: info / warn).
+
+    Always the distance model in words. For grid (Cartesian) KP also: where
+    route vertices lie outside the grid CRS's area of use (grid distances are
+    distorted there), and how far grid KP at the route end is from geodesic
+    KP (the grid scale factor). ``parts`` are the route's vertex lists in the
+    distance area's source CRS, ``total_m`` its KP length.
+    """
+    from qgis.core import QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject
+
+    from .kp_range_utils import is_grid_distance, kp_basis_text, make_distance_area
+
+    notes = [("info", "KP is " + kp_basis_text(distance) + ".")]
+    try:
+        source = distance.sourceCrs()
+    except Exception:  # noqa: BLE001
+        return notes
+    if is_grid_distance(distance):
+        grid = distance.grid_crs()
+    elif kp_path_kind(distance) == "straight" and source is not None and not source.isGeographic():
+        grid = source
+    else:
+        return notes
+    if grid is None:
+        return notes
+    try:
+        wgs = QgsCoordinateReferenceSystem("EPSG:4326")
+        context = QgsProject.instance().transformContext()
+        to_wgs = QgsCoordinateTransform(source, wgs, context)
+        vertices = [QgsPointXY(p) for part in parts for p in part]
+        lonlat = [to_wgs.transform(p) for p in vertices]
+        geodesic = make_distance_area(source, context)
+        geo_total = 0.0
+        for part in parts:
+            for a, b in zip(part[:-1], part[1:]):
+                geo_total += float(geodesic.measureLine(QgsPointXY(a), QgsPointXY(b)))
+        area = grid.bounds()
+    except Exception:  # noqa: BLE001 - the notes are a report, never a failure
+        log_exception("KP: the grid check could not be made", level=logging.DEBUG)
+        return notes
+    name = f"{grid.authid()} {grid.description()}".strip()
+    outside = [p for p in lonlat if area is not None and not area.isEmpty() and not area.contains(p)]
+    if outside:
+        notes.append(("warn", f"{len(outside)} of {len(lonlat)} route vertices lie outside the area of use of "
+                              f"{name}: grid distances there are distorted. Use geodesic KP, or a grid CRS "
+                              "that covers the whole route."))
+    if geo_total > 0:
+        diff = float(total_m) - geo_total
+        notes.append(("warn" if outside or abs(diff / geo_total) > 0.002 else "info",
+                      f"Grid KP at the route end is {diff:+,.1f} m ({diff / geo_total * 100.0:+.3f}%) from "
+                      "geodesic KP (the grid scale factor)."))
+    return notes
+
+
+def _is_geographic(distance) -> bool:
+    try:
+        crs = distance.sourceCrs()
+        return crs is not None and crs.isValid() and crs.isGeographic()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def crosses_antimeridian(geoms_or_geom) -> bool:
@@ -477,12 +638,9 @@ def point_at_kp(
         route start / end. When ``False`` (default), out-of-range returns
         ``None``.
     follow_stored_geometry:
-        ``True`` (default): interpolate along each segment as stored/drawn
-        (fraction of the segment x its geodesic length). This is the exact
-        inverse of ``kp_at_point`` and keeps points on the line QGIS draws.
-        ``False`` follows the spheroid arc instead; on a long geographic
-        segment that point is then off the drawn line and ``kp_at_point``
-        of it can differ by tens of metres (60 km leg: ~57 m).
+        Kept for compatibility, no longer used: positions follow the KP path
+        (the geodesic for geodesic KP, the grid line for grid KP; see
+        :func:`path_points`), the exact inverse of ``kp_at_point``.
 
     A segment that cannot be measured (transform failure, NaN length) makes
     every KP at or beyond it undefined: ``None`` is returned (even with
@@ -490,57 +648,23 @@ def point_at_kp(
     silently shifting every later position.
     """
 
-    try:
-        target_m = float(kp_km) * 1000.0
-    except (TypeError, ValueError):
-        return None
-    if math.isnan(target_m):
-        return None
-
     geoms = _normalise_geoms(geoms_or_geom)
     if not geoms:
         return None
+    return _frame_for(geoms, distance).point_at_kp(kp_km, clamp=clamp)
 
-    if target_m < 0.0:
-        if not clamp:
-            return None
-        target_m = 0.0
 
-    cumulative = 0.0
-    first_point: Optional[QgsPointXY] = None
-    last_point: Optional[QgsPointXY] = None
-
+def _frame_for(geoms, distance) -> "RouteFrame":
+    """A RouteFrame over ``geoms`` (lengths measured segment by segment, as its chainage)."""
+    lengths = []
     for geom in geoms:
+        total = 0.0
         for part in iter_line_parts(geom):
-            if len(part) < 2:
-                continue
-            if first_point is None:
-                first_point = QgsPointXY(part[0])
-            for i in range(len(part) - 1):
-                p1 = part[i]
-                p2 = part[i + 1]
-                seg_len = _measure_segment_m(distance, p1, p2)
-                if seg_len is None:
-                    return None
-                if seg_len <= 0:
-                    continue
-
-                next_cum = cumulative + seg_len
-                last_point = QgsPointXY(p2)
-
-                if target_m <= next_cum:
-                    if follow_stored_geometry:
-                        return _interpolate_on_stored_segment(
-                            p1, p2, target_m - cumulative, seg_len)
-                    return _interpolate_on_segment(
-                        p1, p2, distance, target_m - cumulative, seg_len)
-
-                cumulative = next_cum
-
-    # Past the end of the route.
-    if clamp:
-        return last_point if last_point is not None else first_point
-    return None
+            for a, b in zip(part[:-1], part[1:]):
+                seg = _measure_segment_m(distance, a, b)
+                total += seg if seg is not None else 0.0
+        lengths.append(total)
+    return RouteFrame(geoms, lengths, distance)
 
 
 def kp_at_point(
@@ -561,7 +685,13 @@ def kp_at_point(
     geoms = _normalise_geoms(geoms_or_geom)
     if not geoms or point_xy is None:
         return KPHit(0.0, float("inf"), None, -1)
+    # The exact walk over the KP path (no spatial index): the answer
+    # RouteFrame.kp_at_point gives, and its fallback.
+    return _frame_for(geoms, distance)._walk_nearest(QgsPointXY(point_xy))
 
+
+def _kp_at_point_stored(geoms, point_xy, distance) -> KPHit:
+    """The nearest KP over the segments as stored (no KP path); kept for reference."""
     point_geom = QgsGeometry.fromPointXY(QgsPointXY(point_xy))
     x_scale = nearest_x_scale(distance, float(point_xy.y()))
 
@@ -698,7 +828,14 @@ def extract_line_segment(
     end_m = end_kp_km * 1000.0
     if start_m < 0 or end_m < 0:
         return None
+    if line_geometry is None or line_geometry.isEmpty():
+        return None
+    # The KP path (geodesic or grid line), sliced as RouteFrame slices it.
+    return _frame_for([line_geometry], distance).extract_segment(start_kp_km, end_kp_km)
 
+
+def _extract_line_segment_stored(line_geometry, start_m, end_m, distance, follow_stored_geometry=True):
+    """The slice over the segments as stored (no KP path); kept for reference."""
     parts = iter_line_parts(line_geometry)
     if not parts:
         return None
@@ -869,8 +1006,11 @@ class RouteFrame:
         distance: QgsDistanceArea,
         follow_stored_geometry: bool = True,
         start_kp_km: float = 0.0,
+        path: str = PATH_KP,
     ) -> None:
         self._geoms: List[QgsGeometry] = list(geoms)
+        if _is_geographic(distance) and crosses_antimeridian(self._geoms):
+            raise AntimeridianError(ANTIMERIDIAN_MESSAGE)
         self._feature_lengths_m: List[float] = list(feature_lengths_m)
         # Cumulative offsets at the *start* of each feature.
         self._offsets_m: List[float] = []
@@ -881,6 +1021,9 @@ class RouteFrame:
         self._total_m: float = running
         self._distance = distance
         self._follow_stored_geometry = bool(follow_stored_geometry)
+        # PATH_KP: between vertices along the KP path (geodesic or grid line);
+        # PATH_DRAWN: the segments as stored, for display playback only.
+        self._path = PATH_DRAWN if path == PATH_DRAWN else PATH_KP
         # KP of the route's first vertex: an RPL may start at a non-zero KP.
         # Chainage is still measured from the start; every KP in or out of
         # this frame is ``start_kp_km + chainage``.
@@ -907,6 +1050,7 @@ class RouteFrame:
         follow_stored_geometry: bool = True,
         start_kp_km: float = 0.0,
         transform_context: Optional[QgsCoordinateTransformContext] = None,
+        path: str = PATH_KP,
     ) -> "RouteFrame":
         """Build a ``RouteFrame`` from a feature source or iterable of geometries.
 
@@ -931,7 +1075,7 @@ class RouteFrame:
             geoms = raw_geoms
 
         lengths = [measure_total_length_m(g, distance) for g in geoms]
-        return cls(geoms, lengths, distance, follow_stored_geometry, start_kp_km)
+        return cls(geoms, lengths, distance, follow_stored_geometry, start_kp_km, path)
 
     # ----- properties -----
 
@@ -1009,10 +1153,23 @@ class RouteFrame:
                             break
                         if seg_len <= 0:
                             continue
-                        segs.append((p1, p2, seg_len, cumulative))
-                        seg_feature.append(feature_index)
-                        cumulative += seg_len
-                        seg_end.append(cumulative)
+                        # Along the KP path: sub-segments whose lengths add up
+                        # to the vertex-to-vertex length exactly.
+                        inner = path_points(p1, p2, self._distance, seg_len) if self._path == PATH_KP else []
+                        chain = [p1] + inner + [p2]
+                        subs = [seg_len] if len(chain) == 2 else \
+                            [_measure_segment_m(self._distance, a, b) for a, b in zip(chain[:-1], chain[1:])]
+                        if any(v is None for v in subs) or not sum(subs) > 0:
+                            chain, subs = [p1, p2], [seg_len]
+                        scale = seg_len / sum(subs)
+                        for a, b, length in zip(chain[:-1], chain[1:], subs):
+                            length *= scale
+                            if length <= 0:
+                                continue
+                            segs.append((a, b, length, cumulative))
+                            seg_feature.append(feature_index)
+                            cumulative += length
+                            seg_end.append(cumulative)
                         last_point = QgsPointXY(p2)
                     if broken:
                         break
@@ -1063,11 +1220,8 @@ class RouteFrame:
         if index >= len(self._segs):
             index = len(self._segs) - 1
         p1, p2, seg_len, cum_start = self._segs[index]
-        if self._follow_stored_geometry:
-            return _interpolate_on_stored_segment(
-                p1, p2, target_m - cum_start, seg_len)
-        return _interpolate_on_segment(
-            p1, p2, self._distance, target_m - cum_start, seg_len)
+        # Sub-segments of the KP path are short: linear within them.
+        return _interpolate_on_stored_segment(p1, p2, target_m - cum_start, seg_len)
 
     def _ensure_kp_index(self) -> None:
         """Spatial index over route segments for nearest-KP queries.
@@ -1106,6 +1260,12 @@ class RouteFrame:
             self._scale_cell = span / 256.0 if span > 0 else 1.0
             self._scale_cache = {}
             self._kp_index = index
+
+    def kp_basis_notes(self):
+        """``[(level, text)]``: the KP basis, and for grid KP its validity (:func:`kp_basis_notes`)."""
+        self._ensure_chainage()
+        parts = [list(part) for geom in self._geoms for part in iter_line_parts(geom) if len(part) >= 2]
+        return kp_basis_notes(self._distance, parts, self._chain_total_m)
 
     def build_indexes(self) -> "RouteFrame":
         """Build the chainage and segment indexes now instead of on the
@@ -1146,7 +1306,7 @@ class RouteFrame:
         except Exception:  # noqa: BLE001 - the walk below is exact
             candidate_ids = []
         if not candidate_ids:
-            return self._offset_hit(kp_at_point(self._geoms, point_xy, self._distance))
+            return self._walk_nearest(query)
         # best = [dist, kp_m, snapped, feature]
         best = [float("inf"), 0.0, None, -1]
 
@@ -1166,7 +1326,7 @@ class RouteFrame:
             if planar_limit is not None and planar > planar_limit:
                 return planar
             if x_scale != 1.0:
-                t = segment_fraction(qx, qy, x1, y1, dx, dy, x_scale)
+                t = segment_fraction(qx, qy, x1, y1, dx, dy, nearest_x_scale(self._distance, y1 + 0.5 * dy))
                 sx, sy = x1 + t * dx, y1 + t * dy
             snapped = QgsPointXY(sx, sy)
             try:
@@ -1191,7 +1351,30 @@ class RouteFrame:
                     if seg_id not in seen:
                         consider(seg_id, radius)
         if best[2] is None:
-            return self._offset_hit(kp_at_point(self._geoms, point_xy, self._distance))
+            return self._walk_nearest(query)
+        return KPHit(self._start_kp_km + best[1] / 1000.0, best[0], best[2], best[3])
+
+    def _walk_nearest(self, query: QgsPointXY) -> KPHit:
+        """Nearest KP by an exact walk over every segment of the KP path (no index)."""
+        self._ensure_chainage()
+        qx, qy = float(query.x()), float(query.y())
+        x_scale = nearest_x_scale(self._distance, qy)
+        best = [float("inf"), 0.0, None, -1]
+        for seg_id, (p1, p2, seg_len, cum_start) in enumerate(self._segs):
+            x1, y1 = float(p1.x()), float(p1.y())
+            dx, dy = float(p2.x()) - x1, float(p2.y()) - y1
+            scale = nearest_x_scale(self._distance, y1 + 0.5 * dy) if x_scale != 1.0 else 1.0
+            t = segment_fraction(qx, qy, x1, y1, dx, dy, scale)
+            snapped = QgsPointXY(x1 + t * dx, y1 + t * dy)
+            try:
+                dist = float(self._distance.measureLine(query, snapped))
+            except Exception:  # noqa: BLE001 - unmeasurable candidate
+                continue
+            if dist < best[0]:
+                feature = self._seg_feature[seg_id] if seg_id < len(self._seg_feature) else -1
+                best = [dist, cum_start + t * seg_len, snapped, feature]
+        if best[2] is None:
+            return KPHit(0.0, float("inf"), None, -1)
         return KPHit(self._start_kp_km + best[1] / 1000.0, best[0], best[2], best[3])
 
     def _local_metres_per_unit(self, query: QgsPointXY) -> Optional[float]:
@@ -1287,10 +1470,8 @@ class RouteFrame:
                 return p1
             if along_m >= seg_len - _VERTEX_SNAP_M:
                 return p2
-            point = (_interpolate_on_stored_segment(p1, p2, along_m, seg_len)
-                     if self._follow_stored_geometry else
-                     _interpolate_on_segment(p1, p2, self._distance,
-                                             along_m, seg_len))
+            # Sub-segments of the KP path are short: linear within them.
+            point = _interpolate_on_stored_segment(p1, p2, along_m, seg_len)
             try:
                 return p1.__class__(point.x(), point.y())
             except Exception:

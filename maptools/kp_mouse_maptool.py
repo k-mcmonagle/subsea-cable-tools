@@ -72,7 +72,7 @@ def build_reference_route(layer, map_crs, use_cartesian: bool, start_kp_km=None)
     """
     distance = make_kp_distance_area(
         map_crs, QgsProject.instance().transformContext(),
-        mode=KP_MODE_CARTESIAN if use_cartesian else KP_MODE_GEODESIC)
+        mode=KP_MODE_CARTESIAN if use_cartesian else KP_MODE_GEODESIC, route_crs=layer.crs())
     transform = None
     if layer.crs() != map_crs:
         transform = QgsCoordinateTransform(layer.crs(), map_crs, QgsProject.instance())
@@ -245,6 +245,14 @@ class KPMouseMapTool(QgsMapTool):
         self.features_geoms = geoms
         self._route = route
         self.total_length_meters = route.total_length_m
+        try:
+            warnings = [text for level, text in route.kp_basis_notes() if level == "warn"]
+        except Exception:
+            log_exception("KP Mouse Tool: KP basis check skipped")
+            warnings = []
+        if warnings:
+            self.iface.messageBar().pushMessage("KP Mouse Tool", " ".join(warnings),
+                                                level=MESSAGE_WARNING, duration=10)
 
     def _on_map_crs_changed(self):
         """The cached route and transforms are in the old map CRS: rebuild.

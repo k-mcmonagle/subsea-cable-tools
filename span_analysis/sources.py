@@ -165,51 +165,19 @@ class RouteGeo:
         return RouteGeo(route, lo, self.name)
 
 
-GEODESIC_STEP_M = 250.0
-
-
-def geodesic_parts(parts, distance) -> List[List[QgsPointXY]]:
-    """Line parts in latitude / longitude with points every :data:`GEODESIC_STEP_M`
-    along the geodesic between their vertices.
-
-    KP is measured along the geodesic, and a projected (e.g. UTM) map draws a leg
-    along it, but a leg stored in degrees runs straight in degrees: mid-way along a
-    20 km leg at 57.5 N that is 14 m off, 350 m on a 100 km leg. With these points
-    every position, seabed sample and map marker follows the geodesic (within a few
-    mm); the vertices, and so their KPs, do not change.
-    """
-    out = []
-    for part in parts:
-        dense = [QgsPointXY(part[0])]
-        for p1, p2 in zip(part[:-1], part[1:]):
-            p1, p2 = QgsPointXY(p1), QgsPointXY(p2)
-            line = []
-            try:
-                if float(distance.measureLine(p1, p2)) > GEODESIC_STEP_M:
-                    line = [QgsPointXY(p) for chunk in distance.geodesicLine(p1, p2, GEODESIC_STEP_M, False)
-                            for p in chunk]
-            except Exception:
-                line = []
-            for p in line[1:-1]:     # the vertices themselves stay exact
-                if abs(p.x() - dense[-1].x()) > 1e-12 or abs(p.y() - dense[-1].y()) > 1e-12:
-                    dense.append(p)
-            dense.append(p2)
-        out.append(dense)
-    return out
-
-
 def route_from_rpl_model(model, name: str = "") -> RouteGeo:
     """A RouteGeo through the RPL's positions (WGS84), KP from the RPL's start KP.
 
     KP is measured (the plugin's KP setting: geodesic on WGS84 by default),
     never read from the RPL: only its start KP is taken (see ``kp_datum``).
-    Between positions the route follows the geodesic (:func:`geodesic_parts`).
+    Between positions the route follows the KP path (the geodesic, or the grid
+    line; ``kp_geo_utils.path_points``), as in every KP tool.
     """
     points = [QgsPointXY(float(p.lon), float(p.lat)) for p in model.points]
     if len(points) < 2:
         raise ValueError("The RPL has fewer than two positions.")
     distance = make_kp_distance_area(WGS84, QgsProject.instance().transformContext())
-    route, status = dpc.route_from_points(geodesic_parts([points], distance)[0], WGS84, distance)
+    route, status = dpc.route_from_points(points, WGS84, distance)
     if route is None:
         raise ValueError(status or "The RPL route could not be built.")
     return RouteGeo(route, model.start_kp_km(), name)
@@ -227,10 +195,6 @@ def route_from_layer(layer: QgsVectorLayer, selected_only: bool, start_kp: float
     route, status = dpc.route_from_features(features, layer.crs(), distance)
     if route is None or status:
         raise ValueError(status or "The route line could not be read.")
-    if layer.crs().isGeographic():
-        parts = geodesic_parts(route.line_parts, distance)
-        length = sum(float(distance.measureLine(a, b)) for part in parts for a, b in zip(part[:-1], part[1:]))
-        route = dpc.RouteStationing(parts, length, layer.crs(), distance)
     return RouteGeo(route, start_kp, layer.name())
 
 

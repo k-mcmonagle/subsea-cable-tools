@@ -644,12 +644,24 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
 
 - **KP is measured, never read from the RPL.** Every tool measures KP as
   geodesic chainage on **WGS84** (`make_distance_area` no longer follows
-  the project ellipsoid) along the route as stored: positions are
-  interpolated linearly along each segment, fraction x geodesic segment
-  length (`follow_stored_geometry=True` is now the default), so
-  point -> KP -> point round-trips exactly. The old default followed the
-  spheroid arc for `point_at_kp` but the chord for `kp_at_point` — up to
-  ~57 m apart on a 60 km geographic leg.
+  the project ellipsoid). The method statement is docs/KP_METHOD.md.
+- **Between vertices the route follows the KP path** (October 2026):
+  the geodesic for geodesic KP, the straight grid line for grid KP,
+  whatever CRS the line is stored in (`kp_geo_utils.path_points`). Where
+  the path departs from the stored segment by more than 1 mm at its
+  midpoint, `RouteFrame` and `RouteStationing` add a point every 250 m
+  along it (sub-segment lengths scaled to the vertex-to-vertex length, so
+  vertex KPs are exact); positions, nearest points and slices follow it and
+  point -> KP -> point round-trips. This replaces "linear along the stored
+  segment" (`follow_stored_geometry`, now ignored), which on a route in
+  latitude/longitude ran straight in degrees: 14 m off the geodesic mid-way
+  along a 20 km leg at 57.5 N, 350 m along 100 km, up to 1.8 km on 300 km
+  deep-water legs (KP of a point on the geodesic up to 500 m out). The
+  Burial Planner chose the stored line so plan geometry overlaid the RPL in
+  a map drawn in degrees; plan sections now sit where their KPs are, which
+  a projected map draws within 1 m. Only display playback keeps the drawn
+  line: `RouteFrame(path=PATH_DRAWN)` (Lay Planner transit). Two Depth
+  Profile goldens on a high-latitude degree route were regenerated.
 - **Routes are assembled one way**: `kp_geo_utils.ordered_route_geometry`
   (SeqNo order when every feature has one, else layer order; touching legs
   joined; never noded, re-ordered or reversed). The union/`mergeLines`
@@ -665,20 +677,33 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   chained on the map projection is recognised by comparing with planar
   (UTM) chainage. Positions never change because of the check.
 - **Nearest KP to a map position is the measured nearest point.** On a
-  geographic route the perpendicular foot is found with x weighted by
-  cos(latitude) (`kp_geo_utils.nearest_x_scale`, also in
-  `RouteStationing.measure_along`); in plain degrees it slid along the leg by
-  about 0.4 x the offset at 50 deg N and could pick the wrong leg at an alter
-  course. Points on the line, and projected routes, are unchanged. Positions
-  along a segment stay linear in the route CRS (as drawn).
-- **Span & Slack Analysis follows the geodesic between RPL positions.** Its
-  routes in latitude/longitude get a point every 250 m along the geodesic
-  (vertices and KPs unchanged), so samples and markers lie on the path KP
-  measures, which a projected (UTM) map draws to within 1 m even on 100 km
-  legs. Linear in degrees, the mid-leg offset is ~0.9 m on 5 km legs, 14 m on
-  20 km and 350 m on 100 km at 57.5 deg N. Other tools still interpolate in
-  degrees (`follow_stored_geometry`), which matches a map drawn in degrees but
-  not the geodesic; moving them is an open, app-wide decision.
+  geographic route the perpendicular foot is found with x weighted by the
+  ellipsoid's degree of longitude over latitude at each segment,
+  cos(phi)(1 - e2 sin2 phi)/(1 - e2) (`kp_geo_utils.metric_x_scale`, also in
+  `RouteStationing.measure_along`). In plain degrees the foot slid along the
+  leg by ~0.4 x the offset at 50 N and could pick the wrong leg at an alter
+  course; with cos(phi) alone (a sphere) by ~0.3 % of the offset. Accuracy:
+  under 2 mm 100 m off the route, ~0.1 m 1 km off. Points on the line are
+  unchanged.
+- **Grid (Cartesian) KP: one grid rule, reported and checked.**
+  `kp_range_utils.resolve_kp_grid`: the grid CRS set (KP settings or a
+  plan), else the route's own CRS when projected, else the project CRS when
+  projected, else the UTM zone at the route start ("chosen automatically").
+  Processing's distance-mode parameter and `make_kp_distance_area` used
+  different orders (layer vs project CRS first); they now share this one.
+  `kp_basis_notes` (RouteFrame / RouteStationing) state the basis, warn
+  when vertices lie outside the grid CRS's area of use, and give grid minus
+  geodesic KP at the route end. Grid KP is not refused outside the zone
+  (some RPLs are chained that way); it is flagged.
+- **Routes across +/-180 deg are refused** in RouteFrame and RouteStationing
+  (`AntimeridianError`, with the split-and-start-KP workaround). KP was
+  right, but positions on the crossing leg ran round the globe (16 000 km
+  off) and picks were ~50 km out; the Burial Planner and Workbench rules
+  already refused.
+- **Workbench RPL edits keep the KPs before the edit.** `rpl_engine.recompute`
+  cascades cumulative KPs from the position at the first edited leg; it
+  used to re-sum the stored (rounded) leg lengths from the route start, so
+  rounding built up along a long RPL and moved KPs the edit never touched.
 - **The KP Mouse Tool takes the RPL start KP** of a Workbench RPL lines layer
   (`kp_datum.lines_layer_start_kp`, by its `rpl_id`); other line layers start
   at 0.
@@ -701,8 +726,8 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   `kp_range_utils.make_kp_distance_area` honours the setting
   (`SubseaCableTools/KP/distance_mode`, `grid_crs`); `GridDistanceArea`
   measures planar distances in the grid CRS for geometries in any CRS
-  (grid = chosen CRS, else projected project CRS, else the UTM zone at the
-  route start), keeping WGS84 for bearings/projections. Only KP-producing
+  (grid chosen by `resolve_kp_grid`, see above), keeping WGS84 for
+  bearings/projections. Only KP-producing
   sites use it; bathymetry sampling, seabed length, transit measure and the
   Workbench RPL editor stay geodesic. Burial plans store their mode in
   `params_json.kp_datum` so the global switch never renumbers a plan;

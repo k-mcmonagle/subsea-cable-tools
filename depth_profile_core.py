@@ -101,6 +101,10 @@ class RouteStationing:
         self.distance_area = distance_area
         # Segment lengths in order (a clip of another route keeps that route's chainage).
         self._given_lengths = list(seg_lengths) if seg_lengths is not None else None
+        from .kp_geo_utils import ANTIMERIDIAN_MESSAGE, AntimeridianError, _is_geographic, crosses_antimeridian
+        if _is_geographic(distance_area) and crosses_antimeridian(
+                [QgsGeometry.fromPolylineXY([QgsPointXY(q) for q in part]) for part in line_parts if len(part) >= 2]):
+            raise AntimeridianError(ANTIMERIDIAN_MESSAGE)
         self._seg_starts = None
         self._seg_ends = None
         self._seg_lens = None
@@ -110,6 +114,8 @@ class RouteStationing:
         self._build_cache()
 
     def _build_cache(self):
+        from .kp_geo_utils import path_points
+
         starts, ends, lens, p1s, p2s = [], [], [], [], []
         planar = 0
         cum = 0.0
@@ -118,8 +124,22 @@ class RouteStationing:
             if not part or len(part) < 2:
                 continue
             for p1, p2 in zip(part[:-1], part[1:]):
+                if given is None:
+                    # Along the KP path (geodesic, or the grid line): sub-segments whose lengths
+                    # add up to the vertex-to-vertex length, as in kp_geo_utils.RouteFrame.
+                    sub = self._path_segments(p1, p2, path_points)
+                    if sub is not None:
+                        for a, b, length in sub:
+                            starts.append(cum)
+                            lens.append(length)
+                            p1s.append(a)
+                            p2s.append(b)
+                            cum += length
+                            ends.append(cum)
+                        continue
                 try:
-                    seg_len = float(next(given)) if given is not None else                         float(self.distance_area.measureLine(p1, p2))
+                    seg_len = (float(next(given)) if given is not None
+                               else float(self.distance_area.measureLine(p1, p2)))
                 except Exception:
                     # Planar length in CRS units: wrong on a geographic
                     # route, so never silent.
@@ -148,6 +168,29 @@ class RouteStationing:
         dy = np.array([p.y() for p in p2s], dtype=float) - y1
         self._seg_np = (x1, y1, dx, dy, dx * dx + dy * dy,
                         np.asarray(starts, dtype=float), np.asarray(lens, dtype=float))
+
+    def _path_segments(self, p1, p2, path_points):
+        """``[(a, b, length)]`` along the KP path between two vertices, or None to use the
+        segment as stored (short, straight, or not measurable)."""
+        try:
+            seg_len = float(self.distance_area.measureLine(p1, p2))
+        except Exception:
+            return None
+        if not math.isfinite(seg_len) or seg_len <= 0:
+            return None
+        inner = path_points(p1, p2, self.distance_area, seg_len)
+        if not inner:
+            return None
+        chain = [QgsPointXY(p1)] + inner + [QgsPointXY(p2)]
+        try:
+            subs = [float(self.distance_area.measureLine(a, b)) for a, b in zip(chain[:-1], chain[1:])]
+        except Exception:
+            return None
+        total = sum(subs)
+        if not (math.isfinite(total) and total > 0):
+            return None
+        scale = seg_len / total
+        return [(a, b, s * scale) for a, b, s in zip(chain[:-1], chain[1:], subs) if s > 0]
 
     def point_at(self, distance_m) -> Optional[QgsPointXY]:
         """Point (route CRS) at a chainage; the ends clamp."""
@@ -182,11 +225,14 @@ class RouteStationing:
         if self._seg_np is not None:
             x1, y1, dx, dy, _seg_sq, starts, lens = self._seg_np
             px, py = float(pt_xy.x()), float(pt_xy.y())
-            # On a geographic route x is weighted by cos(latitude): the
-            # measured nearest point, not the nearest in plain degrees.
+            # On a geographic route x is weighted by the ellipsoid's degree of
+            # longitude over latitude at each segment (kp_geo_utils.metric_x_scale):
+            # the measured nearest point, not the nearest in plain degrees.
             k = 1.0
             if self.crs is not None and self.crs.isValid() and self.crs.isGeographic():
-                k = max(math.cos(math.radians(min(abs(py), 89.9))), 1e-3)
+                e2 = 0.0066943799901413165
+                phi = np.radians(np.minimum(np.abs(y1 + 0.5 * dy), 89.9))
+                k = np.maximum(np.cos(phi) * (1.0 - e2 * np.sin(phi) ** 2) / (1.0 - e2), 1e-3)
             wx = dx * k
             t = np.clip(((px - x1) * k * wx + (py - y1) * dy) / (wx * wx + dy * dy), 0.0, 1.0)
             dist_sq = ((px - (x1 + t * dx)) * k) ** 2 + (py - (y1 + t * dy)) ** 2
@@ -220,6 +266,12 @@ class RouteStationing:
         if not self._seg_ends:
             return []
         return [float(v) for v in self._seg_starts] + [float(self._seg_ends[-1])]
+
+    def kp_basis_notes(self):
+        """``[(level, text)]``: the KP basis, and for grid KP its validity."""
+        from .kp_geo_utils import kp_basis_notes
+
+        return kp_basis_notes(self.distance_area, self.line_parts, self.line_length)
 
     def clip(self, start_m: float, end_m: float) -> Optional["RouteStationing"]:
         """The route between two chainages, with this route's chainage.

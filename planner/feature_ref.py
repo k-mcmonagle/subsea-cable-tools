@@ -9,7 +9,7 @@ from typing import Dict, Optional, Tuple
 
 from qgis.core import QgsFeatureRequest, QgsProject, QgsWkbTypes
 
-from ..kp_geo_utils import RouteFrame
+from ..kp_geo_utils import PATH_DRAWN, RouteFrame
 from ..kp_range_utils import make_kp_distance_area
 from ..qgis_compat import GEOMETRY_LINE, GEOMETRY_POINT
 
@@ -94,7 +94,7 @@ class FeatureReferenceResolver:
             frame = RouteFrame.from_source(
                 [resolved.feature.geometry()], distance, target_crs=target_crs,
                 source_crs=resolved.layer.crs(), project=self.project,
-                follow_stored_geometry=True,
+                follow_stored_geometry=True, path=PATH_DRAWN,   # playback stays on the drawn line
             )
         except Exception:
             # Degenerate/edited geometry must degrade to "unmeasured", not

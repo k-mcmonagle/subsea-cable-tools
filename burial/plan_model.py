@@ -411,6 +411,12 @@ class PlanModel(QObject):
         check = getattr(self, "kp_check", None)
         if check is not None and check.level != "ok":
             out.append((check.summary(), check.level))
+        route = getattr(self, "route", None)
+        if route is not None and hasattr(route, "kp_basis_notes"):
+            try:
+                out.extend((text, level) for level, text in route.kp_basis_notes() if level == "warn")
+            except Exception:
+                log_exception("Burial Planner: KP basis check skipped", level=logging.DEBUG)
         return out
 
     def _newer_revision(self, rpl: Dict) -> Optional[Dict]:

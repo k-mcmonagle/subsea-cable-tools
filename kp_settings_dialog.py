@@ -39,8 +39,10 @@ class KpSettingsDialog(QDialog):
         inner.addWidget(self.cartesian)
         self.fixed_crs = QCheckBox("Use a specific grid CRS")
         self.fixed_crs.setToolTip(
-            "Unticked: the project CRS when it is projected, otherwise the UTM "
-            "zone at the start of each route.")
+            "Unticked: the route's own CRS when it is projected, else the project CRS "
+            "when it is projected, else the UTM zone at the start of each route. Grid "
+            "KP is only valid inside the grid's area of use: tools warn when a route "
+            "leaves it.")
         inner.addWidget(self.fixed_crs)
         try:
             from qgis.gui import QgsProjectionSelectionWidget
