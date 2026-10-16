@@ -26,8 +26,12 @@ import numpy as np
 from qgis.PyQt.QtCore import QSettings, Qt, QTimer, QUrl
 from qgis.PyQt.QtGui import QColor, QDesktopServices
 from qgis.PyQt.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QFormLayout,
     QFileDialog,
     QHBoxLayout,
     QInputDialog,
@@ -58,6 +62,9 @@ from ..cable_seabed.profiles import SyntheticSeabed, read_profile_csv, synthetic
 from ..cable_seabed.verification import depression_check
 from ..plugin_log import log_exception
 from ..qgis_compat import (
+    BUTTON_BOX_CANCEL,
+    BUTTON_BOX_OK,
+    DIALOG_ACCEPTED,
     MESSAGEBOX_NO,
     MESSAGEBOX_YES,
     TOOLBUTTON_POPUP_MODE_INSTANT,
@@ -66,7 +73,7 @@ from ..qgis_compat import (
     WINDOW_TYPE_WINDOW,
     qt_exec,
 )
-from . import sources, store as span_store
+from . import dxf_io, sources, store as span_store
 from .help import HELP_HTML
 from .map_link import KpPickTool, MapLink
 from .plot_panel import ProfilePlot
@@ -84,6 +91,14 @@ _LEVEL_COLOURS = {ERROR: "#d32f2f", WARNING: "#ff9800", INFO: "#1f77b4"}
 _CANCEL_BUTTON = getattr(getattr(QMessageBox, "StandardButton", QMessageBox), "Cancel")
 _DISCARD_BUTTON = getattr(getattr(QMessageBox, "StandardButton", QMessageBox), "Discard")
 _SAVE_BUTTON = getattr(getattr(QMessageBox, "StandardButton", QMessageBox), "Save")
+
+
+_ROUTE_KEY = "|route:"
+
+
+def _base_key(key: str) -> str:
+    """A sampled-seabed key without its route fingerprint (the settings part)."""
+    return str(key or "").split(_ROUTE_KEY)[0]
 
 
 def _profile_dict(prof: pl.Profile) -> Dict:
@@ -105,7 +120,8 @@ def run_job(job: Dict, cancel=None, progress=None) -> Dict:
                       turns=list(job.get("turns") or []), notes=list(profile.get("notes") or []),
                       source=profile.get("source", ""))
     inputs = pl.PlanningInputs(prof, job["cable"], job["sections"], job["bodies"], job["features"], job["friction"],
-                               job["control"], job["criteria"], job["filter_m"], job["smoothing_m"])
+                               job["control"], job["criteria"], job["filter_m"], job["smoothing_m"],
+                               job.get("protection") or [])
     stations = pl.prepare(inputs)
     result = pl.solve(stations, inputs.control, inputs.criteria, cancel=cancel,
                       progress=sub_progress(progress, base, 1.0))
@@ -133,6 +149,7 @@ class SpanAnalysisDialog(QDialog):
         self._profile_key = ""
         self._profile_saved = True
         self._route: Optional[sources.RouteGeo] = None
+        self._detail = None
         self._rpl_model = None
         self._notes: List[str] = []
         self._store: Optional[span_store.SpanStore] = None
@@ -215,6 +232,7 @@ class SpanAnalysisDialog(QDialog):
         menu.addAction("Spans (CSV)…", lambda: self.export_csv("spans"))
         menu.addAction("Profile by station (CSV)…", lambda: self.export_csv("profile"))
         menu.addAction("Plot image (PNG)…", self.export_png)
+        menu.addAction("Scene and results (DXF)…", self.export_dxf)
         export.setMenu(menu)
         actions.addWidget(export)
         actions.addStretch(1)
@@ -232,15 +250,20 @@ class SpanAnalysisDialog(QDialog):
         self.setup.changed.connect(self._on_settings_changed)
         self.setup.controlChanged.connect(self._on_control_changed)
         self.setup.libraryRequested.connect(self._open_library)
+        self.setup.tensionFinderRequested.connect(self.results.show_find)
         self.plot.kpHovered.connect(self.map.hover_kp)
         self.plot.kpClicked.connect(lambda kp: self.map.show_kp(kp, pan="if_outside"))
         self.plot.kpDoubleClicked.connect(lambda kp: self.map.show_kp(kp, pan=True))
         self.plot.bodyClicked.connect(self._on_body_clicked)
+        self.plot.reverse_check.toggled.connect(self.results.set_reverse)
+        self.results.set_reverse(self.plot.reverse_check.isChecked())
         self.results.findingSelected.connect(lambda f: self._show_range(f.kp_start, f.kp_end, False))
         self.results.findingActivated.connect(lambda f: self._show_range(f.kp_start, f.kp_end, True))
         self.results.rangeSelected.connect(lambda a, b: self._show_range(a, b, False))
         self.results.detailRequested.connect(self.run_detail)
         self.results.sweepRequested.connect(self.run_sweep)
+        self.results.findRequested.connect(self.run_find)
+        self.results.useTension.connect(self._use_tension)
         self._live_timer = QTimer(self)
         self._live_timer.setSingleShot(True)
         self._live_timer.setInterval(250)
@@ -379,7 +402,7 @@ class SpanAnalysisDialog(QDialog):
             settings = self._store.settings_of(row)
             self.setup.apply_settings(settings)
             cached = self._store.load_profile(scenario_id)
-            if cached and cached.get("signature") == self.setup.profile_signature():
+            if cached and _base_key(cached.get("signature") or "") == self.setup.profile_signature():
                 self._profile, self._profile_key = cached, cached["signature"]
                 self._profile_saved = True
             else:
@@ -419,7 +442,7 @@ class SpanAnalysisDialog(QDialog):
                        "max_tension_kn": s.max_tension_kn}
         try:
             scenario_id = store.save_scenario(name, self.setup.settings(), scenario_id, summary)
-            if self._profile is not None and self._profile_key == self.setup.profile_signature():
+            if self._profile is not None and _base_key(self._profile_key) == self.setup.profile_signature():
                 store.save_profile(scenario_id, self._profile_key,
                                    {k: v for k, v in self._profile.items() if k != "signature"})
                 self._profile_saved = True
@@ -563,6 +586,9 @@ class SpanAnalysisDialog(QDialog):
                 hi = min(window[1], route.kp_range[1])
                 route = route.sub_route(lo, hi)
             job["turns"] = [t for t in full.turns() if route.kp_range[0] <= t[0] <= route.kp_range[1]]
+            # The sampled seabed belongs to this route geometry and KP setting: a moved vertex, another
+            # selection or KP mode changes the length, so the seabed is sampled again.
+            key += _ROUTE_KEY + f"{route.kp_range[0]:.6f},{route.length_m:.3f},{len(route.stationing.vertex_chainages())}"
         self._route = route
         if self._profile is not None and self._profile_key == key:
             job["profile"] = self._profile
@@ -571,6 +597,13 @@ class SpanAnalysisDialog(QDialog):
             if not path or not os.path.isfile(path):
                 raise ValueError("Choose the CSV profile file.")
             job["profile"] = _profile_dict(read_profile_csv(path))
+        elif route_source == sources.ROUTE_DXF:
+            path = s["route"]["dxf"]["path"]
+            if not path or not os.path.isfile(path):
+                raise ValueError("Choose the DXF profile drawing.")
+            if not setup.dxf_layer.currentData():
+                raise ValueError("Choose the DXF layer that holds the seabed line.")
+            job["profile"] = dxf_io.profile_from_dxf(path, setup.dxf_options())
         elif route_source == sources.ROUTE_SYNTHETIC:
             syn = s["route"]["synthetic"]
             spec = SyntheticSeabed(length_m=syn["length_m"], spacing_m=syn["spacing_m"], start_kp=syn["start_kp"],
@@ -596,6 +629,10 @@ class SpanAnalysisDialog(QDialog):
 
         # Cable makeup and bodies.
         notes: List[str] = []
+        if route_source == sources.ROUTE_RPL and self._rpl_model is not None:
+            kp_note = sources.rpl_kp_note(self._rpl_model)
+            if kp_note:
+                notes.append(kp_note)
         sections: List[pl.CableSection] = []
         bodies = setup.manual_bodies()
         cable_source = s["cable"]["source"]
@@ -628,6 +665,7 @@ class SpanAnalysisDialog(QDialog):
             raise ValueError("RPL slack per leg needs a Workbench RPL route with slack on its legs.")
         job.update({
             "cable": cable, "sections": sections, "bodies": bodies, "features": setup.features_list(),
+            "protection": setup.protection_list(),
             "friction": setup.friction(), "control": control, "criteria": setup.criteria(),
             "filter_m": float(s["seabed"]["filter_m"]), "smoothing_m": setup.smoothing_m(), "notes": notes,
         })
@@ -723,6 +761,70 @@ class SpanAnalysisDialog(QDialog):
                     lambda cancel, progress: {"sweep": pl.tension_sweep(stations, control, criteria, tensions,
                                                                         window, cancel, progress)}, {})
 
+    def run_find(self, request: Dict) -> None:
+        if self._stations is None or self._result is None:
+            self._set_status("Run the analysis first.", error=True)
+            return
+        if self._task is not None:
+            self._set_status("Wait for the current run to finish.", error=True)
+            return
+        stations = self._stations
+        control = self._result.control
+        criteria = self.setup.criteria()
+        key = request.get("target")
+        if key == "red":
+            target = pl.TensionTarget(red_only=True)
+            text = f"no red span (higher than {criteria.red_gap_m:g} m or longer than {criteria.red_length_m:g} m)"
+        elif key == "none":
+            target = pl.TensionTarget(0.0, 0.0)
+            text = "no span at all"
+        elif key == "custom":
+            target = pl.TensionTarget(float(request["gap_m"]), float(request["length_m"]))
+            text = f"no span higher than {target.gap_m:g} m and longer than {target.length_m:g} m"
+        else:
+            target = pl.TensionTarget(criteria.min_gap_m, criteria.min_length_m)
+            text = f"no span higher than {criteria.min_gap_m:g} m and longer than {criteria.min_length_m:g} m"
+        target.mbr = bool(request.get("mbr", True))
+        target.contact = bool(request.get("contact", True))
+        if target.mbr:
+            text += "; bends at supports within the MBR"
+        if target.contact and criteria.max_reaction_kn > 0:
+            text += f"; support reactions within {criteria.max_reaction_kn:g} kN"
+        kp = stations.kp_km
+        first, last = float(kp[0]), float(kp[-1])
+        scope = request.get("scope") or "all"
+        if scope == "view":
+            lo, hi = sorted(self.plot.visible_kp())
+            scopes = [("Visible part", max(lo, first), min(hi, last))]
+        elif scope == "sections":
+            sections = sorted(self.setup.control().sections, key=lambda sec: min(sec.kp_start, sec.kp_end))
+            if not sections:
+                self._set_status("Add lay control sections first (Lay control, By KP section).", error=True)
+                return
+            scopes = [(f"Section {k}", *sorted((sec.kp_start, sec.kp_end))) for k, sec in enumerate(sections, 1)]
+        else:
+            scopes = [("Whole profile", first, last)]
+        hi_kn = float(request.get("hi_kn") or 50.0)
+        self._start("find", "Span & Slack Analysis (find tension)",
+                    lambda cancel, progress: {"found": pl.find_tension(stations, control, criteria, target, scopes,
+                                                                       hi_kn, cancel=cancel, progress=progress)},
+                    {"scope": scope, "target": text})
+
+    def _use_tension(self, payload: Dict) -> None:
+        def down(value: float) -> float:
+            return max(math.floor(value / 0.05 + 1e-9) * 0.05, 0.05)
+
+        answers = payload.get("answers") or []
+        if not answers:
+            return
+        if payload.get("scope") == "sections":
+            self.setup.apply_tension(self.setup.value.value(),
+                                     [(a.kp_start, a.kp_end, down(a.tension_kn)) for a in answers])
+        else:
+            self.setup.apply_tension(down(answers[0].tension_kn))
+        self._set_status("Lay control set from the tension finder." + ("" if self.setup.live.isChecked() else
+                                                                      " Run to update the results."))
+
     def _start(self, kind: str, description: str, work, info: Dict) -> None:
         task = WorkTask(description, work, self._on_finished)
         task.info = info
@@ -744,6 +846,7 @@ class SpanAnalysisDialog(QDialog):
             self.stage.setText("Starting…")
         self.results.detail_button.setEnabled(not running)
         self.results.sweep_button.setEnabled(not running)
+        self.results.find_button.setEnabled(not running)
 
     def _on_finished(self, task: WorkTask) -> None:
         if task in self._dropped:
@@ -764,15 +867,32 @@ class SpanAnalysisDialog(QDialog):
             self._apply_run(task, kind)
         elif kind == "detail":
             detail = task.result["detail"]
+            self._detail = detail
             self.results.set_detail(detail, task.info.get("result"))
             self.plot.set_detail(detail)
-            self.results.setCurrentIndex(3)
+            self.results.setCurrentWidget(self.results.detail_page)
             self._set_status("Detail model done: the purple curve is the cable with bending stiffness.")
         elif kind == "sweep":
             rows = task.result["sweep"]
             self.results.set_sweep(rows)
-            self.results.setCurrentIndex(4)
+            self.results.setCurrentWidget(self.results.sweep_page)
             self._set_status(f"Tension sweep done ({len(rows)} tensions).")
+        elif kind == "find":
+            answers = task.result["found"]
+            info = task.info or {}
+            self.results.set_found(answers, info.get("scope", "all"), info.get("target", ""))
+            self.results.show_find()
+            if len(answers) == 1:
+                a = answers[0]
+                if a.tension_kn <= 0:
+                    text = "No tension meets the target: spans break it even at the lowest tension searched."
+                elif not a.limited:
+                    text = f"The target is met at every tension searched (up to {a.tension_kn:.1f} kN)."
+                else:
+                    text = f"Highest bottom tension within the target: {a.tension_kn:.2f} kN."
+            else:
+                text = f"Tension found for {len(answers)} sections."
+            self._set_status(text)
         if self._pending_live:
             self._pending_live = False
             self._run_live()
@@ -798,6 +918,7 @@ class SpanAnalysisDialog(QDialog):
         self.plot.set_result(result, self._previous, keep_view=(kind == "live"))
         self.plot.set_detail(None)
         self.results.set_detail(None, None)
+        self._detail = None
         notes = list(dict.fromkeys(self._notes + list(result.notes)))
         self.results.set_result(result, summary_html(result, notes, self.setup.describe(), depression_check(result)))
         self._report(result, notes)
@@ -835,6 +956,7 @@ class SpanAnalysisDialog(QDialog):
         self.results.set_result(None, "")
         self.results.set_detail(None, None)
         self.results.clear_sweep()
+        self.results.clear_found()
         self.map.clear()
         self._update_buttons()
         self._update_stale()
@@ -935,6 +1057,59 @@ class SpanAnalysisDialog(QDialog):
         except Exception as exc:
             log_exception("Span & Slack Analysis: CSV export failed")
             QMessageBox.warning(self, TITLE, f"Export failed:\n{exc}")
+
+    def export_dxf(self) -> None:
+        if self._result is None:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Export DXF")
+        form = QFormLayout(dialog)
+        window = QComboBox()
+        window.addItem("Whole profile", "all")
+        window.addItem("Visible part of the profile", "view")
+        form.addRow("KP range", window)
+        ve = QDoubleSpinBox()
+        ve.setRange(0.1, 1000.0)
+        ve.setValue(float(QSettings().value(f"{_SETTINGS}/dxf_ve", 10.0)))
+        ve.setToolTip("Y is the elevation times this (1 = true scale).")
+        form.addRow("Vertical exaggeration", ve)
+        text = QDoubleSpinBox()
+        text.setRange(0.0, 1000.0)
+        text.setSpecialValueText("auto")
+        text.setSuffix(" m")
+        form.addRow("Text height", text)
+        graphs = QCheckBox("Tension, slack and slope graphs below the profile")
+        graphs.setChecked(True)
+        form.addRow(graphs)
+        note = QLabel("Layers: SA_SEABED, SA_SEABED_SAMPLED, SA_CABLE, SA_CABLE_DETAIL, SA_SPAN_RED, SA_SPAN_AMBER, "
+                      "SA_CLEAR_UNDER_LIMITS, SA_SUPPORTS, SA_BODIES, SA_FEATURES, SA_SEA_LEVEL, SA_FRAME, SA_TEXT "
+                      "and one per graph curve. Units: metres; X = KP x 1000.")
+        note.setWordWrap(True)
+        form.addRow(note)
+        buttons = QDialogButtonBox(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if qt_exec(dialog) != DIALOG_ACCEPTED:
+            return
+        if self._persist_ui:
+            QSettings().setValue(f"{_SETTINGS}/dxf_ve", ve.value())
+        path, _ = QFileDialog.getSaveFileName(self, "Export DXF", "", "DXF (*.dxf)")
+        if not path:
+            return
+        if not path.lower().endswith(".dxf"):
+            path += ".dxf"
+        name = self.scenario_combo.currentText() if self._scenario_id else "unsaved scenario"
+        options = dxf_io.SceneOptions(self.plot.visible_kp() if window.currentData() == "view" else None,
+                                      ve.value(), graphs.isChecked(), text.value(),
+                                      f"Span & Slack Analysis - {name}")
+        try:
+            dxf_io.export_scene(self._result, path, options, self._detail)
+        except Exception as exc:
+            log_exception("Span & Slack Analysis: DXF export failed")
+            QMessageBox.warning(self, TITLE, f"DXF export failed:\n{exc}")
+            return
+        self._set_status(f"DXF written: {path}")
 
     def export_png(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Save the plot", "", "PNG image (*.png)")

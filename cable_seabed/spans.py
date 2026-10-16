@@ -39,6 +39,7 @@ class Support:
     moment_knm: float           # bending moment EI / R (nan without EI)
     tension_kn: float
     mbr_m: float = math.nan
+    crest: bool = False         # a short contact with spans both sides (else a touchdown / lift-off)
 
     @property
     def below_mbr(self) -> bool:
@@ -119,18 +120,22 @@ def find_spans(x_m: np.ndarray, kp_km: np.ndarray, gap_m: np.ndarray, tension_kn
 
 
 def span_supports(x_m, seabed_elev_m, cable_elev_m, tension_kn, w_npm, ei_knm2, mbr_m,
-                  spans: Sequence[Span], kp_km=None, contact_tol_m: float = 0.01) -> List[Support]:
+                  spans: Sequence[Span], kp_km=None, contact_tol_m: Optional[float] = None) -> List[Support]:
     """The seabed contact at each end of each span: reaction, bend radius and moment.
 
-    The cable bears on the seabed over a contact stretch (cable within
-    ``contact_tol_m`` of it), entering at slope ``tan a_in`` and leaving at
-    ``tan a_out``. Under horizontal tension ``H`` the seabed pushes up with
-    ``P = H (tan a_in - tan a_out)``, plus the weight of the cable resting
-    there when spans hang both sides (a crest). Bending stiffness spreads the
-    turn ``a_in - a_out`` over the bending length ``lambda = sqrt(EI / H)``
+    The cable bears on the seabed over contact stretches (cable within
+    ``contact_tol_m`` of it, by default :data:`SPAN_END_TOL_M`). A span's
+    support is the end of the stretch next to it: its touchdown or lift-off.
+    A short stretch with spans both sides (a crest, no longer than the
+    bending spread ``2 lambda``, ``lambda = sqrt(EI / H)``) is one support.
+    The cable enters at slope ``tan a_in`` and leaves at ``tan a_out``; under
+    horizontal tension ``H`` the seabed pushes up with ``P = H (tan a_in -
+    tan a_out)``, plus on a crest the weight of the cable resting there. A
+    touchdown where the cable meets the seabed tangentially has no
+    concentrated reaction. Bending stiffness spreads the turn over ``lambda``
     either side (a tensioned beam over a point support: ``M = P lambda / 2``),
-    so the bend radius is ``R = (L_contact + 2 lambda) / turn``; at each end of
-    the contact the turn within ``lambda`` is also checked, so a rounded crest
+    so the bend radius is ``R = (L_contact + 2 lambda) / turn``; the turn
+    within ``lambda`` of each contact end is also checked, so a rounded crest
     sharper than that spread is caught. Each span's ``supports``, tightest
     bend radius and largest reaction are filled in.
     """
@@ -138,13 +143,14 @@ def span_supports(x_m, seabed_elev_m, cable_elev_m, tension_kn, w_npm, ei_knm2, 
     s = np.asarray(seabed_elev_m, dtype=float)
     y = np.asarray(cable_elev_m, dtype=float)
     kp = x / 1000.0 if kp_km is None else np.asarray(kp_km, dtype=float)
+    tol = SPAN_END_TOL_M if contact_tol_m is None else max(float(contact_tol_m), SPAN_END_TOL_M)
     n = len(x)
     out: List[Support] = []
     if n < 3 or not spans:
         return out
     with np.errstate(invalid="ignore"):
         gap = y - s
-        contact = np.isfinite(gap) & (gap <= contact_tol_m)
+        contact = np.isfinite(gap) & (gap <= tol)
     contact_idx = np.nonzero(contact)[0]
     if contact_idx.size == 0:
         return out
@@ -163,30 +169,61 @@ def span_supports(x_m, seabed_elev_m, cable_elev_m, tension_kn, w_npm, ei_knm2, 
     contact_runs = runs(contact)
     for r, (a, b) in enumerate(contact_runs):
         run_of[a:b + 1] = r
-    made: Dict[int, int] = {}
 
-    def support_for(run: int) -> Optional[int]:
-        if run in made:
-            return made[run]
+    # The contact stretch at each end of each span, and the stretches with a span both sides.
+    ends: List[Tuple[int, int]] = []
+    span_after: Dict[int, bool] = {}      # stretch -> a span starts at its far end
+    span_before: Dict[int, bool] = {}     # stretch -> a span ends at its near end
+    for span in spans:
+        left = int(np.searchsorted(contact_idx, span.i0, side="right")) - 1
+        right = int(np.searchsorted(contact_idx, span.i1, side="left"))
+        run_l = int(run_of[contact_idx[left]]) if 0 <= left < contact_idx.size else -1
+        run_r = int(run_of[contact_idx[right]]) if 0 <= right < contact_idx.size else -1
+        ends.append((run_l, run_r))
+        if run_l >= 0:
+            span_after[run_l] = True
+        if run_r >= 0:
+            span_before[run_r] = True
+
+    def h_ei_lambda(c0: int, c1: int) -> Tuple[float, float, float]:
+        tv = tension_kn[c0:c1 + 1]
+        h_kn = float(np.nanmax(tv)) if np.isfinite(tv).any() else math.nan
+        ev = ei_knm2[c0:c1 + 1]
+        ei = float(np.nanmin(ev)) if np.isfinite(ev).any() else math.nan
+        lam = math.sqrt(ei / h_kn) if np.isfinite(ei) and ei > 0 and np.isfinite(h_kn) and h_kn > 0 else math.nan
+        return h_kn, ei, lam
+
+    def is_crest(run: int) -> bool:
+        if not (span_before.get(run) and span_after.get(run)):
+            return False
         c0, c1 = contact_runs[run]
-        h_kn = float(np.nanmax(tension_kn[c0:c1 + 1])) if np.isfinite(tension_kn[c0:c1 + 1]).any() else math.nan
+        _h, _ei, lam = h_ei_lambda(c0, c1)
+        step = float(np.nanmedian(dx[max(c0 - 1, 0):min(c1 + 1, n - 1)]))
+        return float(x[c1] - x[c0]) <= max(2.0 * lam if np.isfinite(lam) else 0.0, 3.0 * step)
+
+    made: Dict[Tuple[int, int, int], Optional[int]] = {}
+
+    def support_at(c0: int, c1: int, crest: bool) -> Optional[int]:
+        """A support over contact stations ``c0 .. c1`` (one station for a span end)."""
+        key = (c0, c1, int(crest))
+        if key in made:
+            return made[key]
+        h_kn, ei, lam = h_ei_lambda(c0, c1)
         if not np.isfinite(h_kn) or h_kn <= 0:
-            made[run] = None
+            made[key] = None
             return None
         h_n = h_kn * 1000.0
         tan_in = slope[c0 - 1] if c0 > 0 else math.nan
         tan_out = slope[c1] if c1 < n - 1 else math.nan
-        free_both = c0 > 0 and c1 < n - 1 and not contact[c0 - 1] and not contact[c1 + 1]
         contact_len = float(x[c1] - x[c0])
         wv = w_npm[c0:c1 + 1]
         w_here = float(np.nanmin(wv)) if np.isfinite(wv).any() else 0.0
-        reaction = h_n * (tan_in - tan_out) + (w_here * contact_len if free_both else 0.0)
-        ev = ei_knm2[c0:c1 + 1]
-        ei = float(np.nanmin(ev)) if np.isfinite(ev).any() else math.nan
+        reaction = h_n * (tan_in - tan_out) + (w_here * contact_len if crest else 0.0)
+        if np.isfinite(reaction):
+            reaction = max(reaction, 0.0)       # a tangent touchdown: no concentrated reaction
         radius = moment = math.nan
-        if np.isfinite(ei) and ei > 0:
-            lam = math.sqrt(ei * 1000.0 / h_n)
-            step = float(np.nanmedian(dx[max(c0 - 1, 0):min(c1 + 1, n - 1)])) if n > 1 else 1.0
+        if np.isfinite(lam):
+            step = float(np.nanmedian(dx[max(c0 - 1, 0):min(c1 + 1, n - 1)]))
             half = max(lam, 0.5 * step)
             # The whole turn over the contact plus the bending length either side ...
             turn = angle_at(x[c0] - half) - angle_at(x[c1] + half)
@@ -200,21 +237,25 @@ def span_supports(x_m, seabed_elev_m, cable_elev_m, tension_kn, w_npm, ei_knm2, 
             moment = ei * curvature
         mv = mbr_m[c0:c1 + 1]
         mbr = float(np.nanmax(mv)) if np.isfinite(mv).any() else math.nan
-        made[run] = len(out)
+        made[key] = len(out)
         out.append(Support(int(c0), int(c1), float(kp[(c0 + c1) // 2]),
                            reaction / 1000.0 if np.isfinite(reaction) else math.nan,
-                           radius, moment, h_kn, mbr))
-        return made[run]
+                           radius, moment, h_kn, mbr, crest))
+        return made[key]
 
-    for span in spans:
+    for span, (run_l, run_r) in zip(spans, ends):
         ids = []
-        left = int(np.searchsorted(contact_idx, span.i0, side="right")) - 1
-        right = int(np.searchsorted(contact_idx, span.i1, side="left"))
-        for position in (left, right):
-            if 0 <= position < contact_idx.size:
-                index = support_for(int(run_of[contact_idx[position]]))
-                if index is not None and index not in ids:
-                    ids.append(index)
+        for run, side in ((run_l, -1), (run_r, 1)):
+            if run < 0:
+                continue
+            c0, c1 = contact_runs[run]
+            if is_crest(run):
+                index = support_at(c0, c1, True)
+            else:
+                end = c1 if side < 0 else c0     # the stretch's end next to the span
+                index = support_at(end, end, False)
+            if index is not None and index not in ids:
+                ids.append(index)
         span.supports = tuple(ids)
         chosen = [out[i] for i in ids]
         radii = [sp.bend_radius_m for sp in chosen if np.isfinite(sp.bend_radius_m) or sp.bend_radius_m == math.inf]

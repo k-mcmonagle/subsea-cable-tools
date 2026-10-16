@@ -35,7 +35,7 @@ from ..cable_library import store as library
 from ..cable_seabed import planning as pl
 from ..cable_seabed.core import G
 from ..cable_seabed.sampling import SEABED_CONTOURS, SEABED_RASTER, seabed_sampling_notes
-from ..kp_range_utils import make_distance_area, make_kp_distance_area
+from ..kp_range_utils import make_kp_distance_area
 from ..plugin_log import log_exception
 
 WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
@@ -44,10 +44,12 @@ ROUTE_RPL = "rpl"
 ROUTE_LINE = "line"
 ROUTE_CSV = "csv"
 ROUTE_SYNTHETIC = "synthetic"
+ROUTE_DXF = "dxf"
 ROUTE_CHOICES = (
     (ROUTE_RPL, "Cable Route Workbench RPL"),
     (ROUTE_LINE, "Line layer"),
     (ROUTE_CSV, "Profile from a CSV file (no map)"),
+    (ROUTE_DXF, "Profile from a DXF drawing (no map)"),
     (ROUTE_SYNTHETIC, "Synthetic seabed (no map)"),
 )
 SEABED_RPL_DEPTH = "rpl_depth"
@@ -96,11 +98,14 @@ class RouteGeo:
         return float(point.x()), float(point.y())
 
     def polyline_lonlat(self, kp_a: float, kp_b: float, max_points: int = 400) -> List[Tuple[float, float]]:
+        """The route between two KPs, with its vertices (so alter courses are not cut)."""
         lo, hi = sorted((float(kp_a), float(kp_b)))
         lo, hi = max(lo, self.kp_range[0]), min(hi, self.kp_range[1])
         if hi < lo:
             return []
-        marks = list(np.linspace(lo, hi, max(2, min(max_points, int((hi - lo) * 1000.0) + 2))))
+        marks = np.linspace(lo, hi, max(2, min(max_points, int((hi - lo) * 1000.0) + 2)))
+        vertices = self.kp0 + np.asarray(self.stationing.vertex_chainages(), dtype=float) / 1000.0
+        marks = np.unique(np.concatenate((marks, vertices[(vertices > lo) & (vertices < hi)])))
         out = [self.lonlat_at_kp(k) for k in marks]
         return [p for p in out if p is not None]
 
@@ -144,45 +149,67 @@ class RouteGeo:
         return out
 
     def sub_route(self, kp_a: float, kp_b: float) -> "RouteGeo":
-        """The route between two KPs (for sampling a KP window)."""
+        """The route between two KPs (for sampling a KP window).
+
+        Cut from this route's own chainage, not measured again, so a KP in
+        the window is the same position as on the whole route; separate line
+        parts stay separate.
+        """
         lo, hi = sorted((float(kp_a), float(kp_b)))
         lo, hi = max(lo, self.kp_range[0]), min(hi, self.kp_range[1])
         if hi - lo < 0.001:
             raise ValueError("The KP window is shorter than 1 m.")
-        c0, c1 = (lo - self.kp0) * 1000.0, (hi - self.kp0) * 1000.0
-        points = [self.stationing.point_at(c0)]
-        chainage = 0.0
-        da = self.stationing.distance_area
-        for part in self.stationing.line_parts:
-            for p1, p2 in zip(part[:-1], part[1:]):
-                try:
-                    step = float(da.measureLine(p1, p2))
-                except Exception:
-                    step = math.hypot(p2.x() - p1.x(), p2.y() - p1.y())
-                chainage += step
-                if c0 < chainage < c1:
-                    points.append(QgsPointXY(p2))
-        points.append(self.stationing.point_at(c1))
-        clean = [points[0]]
-        for p in points[1:]:
-            if p is not None and (abs(p.x() - clean[-1].x()) > 1e-12 or abs(p.y() - clean[-1].y()) > 1e-12):
-                clean.append(p)
-        route, status = dpc.route_from_points(clean, self.stationing.crs, da)
+        route = self.stationing.clip((lo - self.kp0) * 1000.0, (hi - self.kp0) * 1000.0)
         if route is None:
-            raise ValueError(status or "The KP window could not be cut from the route.")
+            raise ValueError("The KP window could not be cut from the route.")
         return RouteGeo(route, lo, self.name)
+
+
+GEODESIC_STEP_M = 250.0
+
+
+def geodesic_parts(parts, distance) -> List[List[QgsPointXY]]:
+    """Line parts in latitude / longitude with points every :data:`GEODESIC_STEP_M`
+    along the geodesic between their vertices.
+
+    KP is measured along the geodesic, and a projected (e.g. UTM) map draws a leg
+    along it, but a leg stored in degrees runs straight in degrees: mid-way along a
+    20 km leg at 57.5 N that is 14 m off, 350 m on a 100 km leg. With these points
+    every position, seabed sample and map marker follows the geodesic (within a few
+    mm); the vertices, and so their KPs, do not change.
+    """
+    out = []
+    for part in parts:
+        dense = [QgsPointXY(part[0])]
+        for p1, p2 in zip(part[:-1], part[1:]):
+            p1, p2 = QgsPointXY(p1), QgsPointXY(p2)
+            line = []
+            try:
+                if float(distance.measureLine(p1, p2)) > GEODESIC_STEP_M:
+                    line = [QgsPointXY(p) for chunk in distance.geodesicLine(p1, p2, GEODESIC_STEP_M, False)
+                            for p in chunk]
+            except Exception:
+                line = []
+            for p in line[1:-1]:     # the vertices themselves stay exact
+                if abs(p.x() - dense[-1].x()) > 1e-12 or abs(p.y() - dense[-1].y()) > 1e-12:
+                    dense.append(p)
+            dense.append(p2)
+        out.append(dense)
+    return out
 
 
 def route_from_rpl_model(model, name: str = "") -> RouteGeo:
     """A RouteGeo through the RPL's positions (WGS84), KP from the RPL's start KP.
 
-    Geodesic (WGS84) distance, as the Workbench measures RPL KPs.
+    KP is measured (the plugin's KP setting: geodesic on WGS84 by default),
+    never read from the RPL: only its start KP is taken (see ``kp_datum``).
+    Between positions the route follows the geodesic (:func:`geodesic_parts`).
     """
     points = [QgsPointXY(float(p.lon), float(p.lat)) for p in model.points]
     if len(points) < 2:
         raise ValueError("The RPL has fewer than two positions.")
-    distance = make_distance_area(WGS84, QgsProject.instance().transformContext())
-    route, status = dpc.route_from_points(points, WGS84, distance)
+    distance = make_kp_distance_area(WGS84, QgsProject.instance().transformContext())
+    route, status = dpc.route_from_points(geodesic_parts([points], distance)[0], WGS84, distance)
     if route is None:
         raise ValueError(status or "The RPL route could not be built.")
     return RouteGeo(route, model.start_kp_km(), name)
@@ -200,6 +227,10 @@ def route_from_layer(layer: QgsVectorLayer, selected_only: bool, start_kp: float
     route, status = dpc.route_from_features(features, layer.crs(), distance)
     if route is None or status:
         raise ValueError(status or "The route line could not be read.")
+    if layer.crs().isGeographic():
+        parts = geodesic_parts(route.line_parts, distance)
+        length = sum(float(distance.measureLine(a, b)) for part in parts for a, b in zip(part[:-1], part[1:]))
+        route = dpc.RouteStationing(parts, length, layer.crs(), distance)
     return RouteGeo(route, start_kp, layer.name())
 
 
@@ -242,9 +273,54 @@ def sample_profile(request, kp0: float, mode: str, auto: bool, cancel=None, prog
             "depth_m": [None if not math.isfinite(v) else float(v) for v in depth], "notes": notes}
 
 
+def rpl_measured_kps(model) -> List[float]:
+    """Measured KP of each RPL position: the start KP plus the chainage along the
+    positions (as :func:`route_from_rpl_model` measures it)."""
+    points = [QgsPointXY(float(p.lon), float(p.lat)) for p in model.points]
+    distance = make_kp_distance_area(WGS84, QgsProject.instance().transformContext())
+    out, running = [model.start_kp_km()], 0.0
+    for a, b in zip(points[:-1], points[1:]):
+        try:
+            running += float(distance.measureLine(a, b))
+        except Exception:
+            log_exception("Span & Slack Analysis: an RPL leg could not be measured")
+        out.append(model.start_kp_km() + running / 1000.0)
+    return out
+
+
+def rpl_kp_mapper(model):
+    """``f(stated KP) -> measured KP``: the RPL's printed KPs (the datum of its legs and of
+    a fitted assembly) mapped through its positions, keeping the fraction along each leg."""
+    measured = np.asarray(rpl_measured_kps(model), dtype=float)
+    stated = np.array([np.nan if p.dist_cum_km is None else float(p.dist_cum_km) for p in model.points])
+    ok = np.isfinite(stated) & np.isfinite(measured)
+    ok &= np.concatenate(([True], np.diff(np.where(ok, stated, -np.inf)) > 0))   # increasing only
+    if ok.sum() < 2:
+        return lambda kp: kp
+    xs, ys = stated[ok], measured[ok]
+
+    def mapper(kp):
+        return float(np.interp(float(kp), xs, ys, left=ys[0] + (float(kp) - xs[0]),
+                               right=ys[-1] + (float(kp) - xs[-1])))
+
+    return mapper
+
+
+def rpl_kp_note(model) -> Optional[str]:
+    """A note when the RPL's printed KPs differ from the measured KPs by a metre or more."""
+    from ..kp_datum import compare_stated_kps
+
+    stated = [None if p.dist_cum_km is None else float(p.dist_cum_km) for p in model.points]
+    check = compare_stated_kps(rpl_measured_kps(model), stated)
+    if check.level == "ok":
+        return None
+    return (check.summary() + " Legs, cable types and an assembly fit are placed at the measured KPs of "
+            "the RPL positions.")
+
+
 def rpl_depth_profile(model, kp_lo: float, kp_hi: float, step_m: float = 5.0) -> Dict:
-    """The RPL's ApproxDepth interpolated by KP (a coarse fallback seabed)."""
-    kp = np.array([p.dist_cum_km if p.dist_cum_km is not None else np.nan for p in model.points], dtype=float)
+    """The RPL's ApproxDepth interpolated by (measured) KP (a coarse fallback seabed)."""
+    kp = np.asarray(rpl_measured_kps(model), dtype=float)
     depth = np.array([p.depth_m if p.depth_m is not None else np.nan for p in model.points], dtype=float)
     ok = np.isfinite(kp) & np.isfinite(depth)
     if ok.sum() < 2:
@@ -309,13 +385,13 @@ def load_rpl_model(store, rpl_id: str):
 
 
 def rpl_legs(model) -> List[Tuple[float, float, float]]:
-    """``[(kp0, kp1, slack %)]`` per RPL leg (legs without slack are left out)."""
+    """``[(kp0, kp1, slack %)]`` per RPL leg at measured KPs (legs without slack are left out)."""
+    kps = rpl_measured_kps(model)
     out = []
     for i, segment in enumerate(model.segments):
-        k0, k1 = model.points[i].dist_cum_km, model.points[i + 1].dist_cum_km
-        if k0 is None or k1 is None or segment.slack_pct is None:
+        if i + 1 >= len(kps) or segment.slack_pct is None:
             continue
-        out.append((float(k0), float(k1), float(segment.slack_pct)))
+        out.append((float(kps[i]), float(kps[i + 1]), float(segment.slack_pct)))
     return out
 
 
@@ -352,6 +428,7 @@ def fit_makeup(store, fit_id: str, rows: Sequence[Dict]) -> Tuple[List[pl.CableS
     anchor = FitAnchor(float(fit.get("anchor_kp_km") or 0.0), float(fit.get("anchor_cable_dist_m") or 0.0),
                        1 if int(fit.get("direction") or 1) >= 0 else -1)
     result = fit_assembly(assembly, model, anchor)
+    measured = rpl_kp_mapper(model)      # the fit works in the RPL's printed KPs
     mapping = {}
     try:
         mapping = library.project_mapping()
@@ -379,13 +456,13 @@ def fit_makeup(store, fit_id: str, rows: Sequence[Dict]) -> Tuple[List[pl.CableS
                     else "is not in the library"
                 warnings.append(f"Assembly cable type '{label}' {reason}; its own weight and stiffness are used, "
                                 "with no NPTS.")
-        sections.append(pl.CableSection(float(span.kp_start_km), float(span.kp_end_km), cable))
+        sections.append(pl.CableSection(measured(span.kp_start_km), measured(span.kp_end_km), cable))
     bodies: List[pl.Body] = []
     for landing in result.bodies:
         if landing.kp_km is None:
             continue
         item = landing.item
-        bodies.append(pl.Body(item.name or "Body", float(landing.kp_km),
+        bodies.append(pl.Body(item.name or "Body", measured(landing.kp_km),
                               length_m=float(item.length_m or 0.0),
                               weight_kn=float(item.point_load_kN or 0.0),
                               diameter_m=float(item.diameter_m) if item.diameter_m else math.nan,
@@ -428,14 +505,14 @@ def candidates(rows: Sequence[Dict], label: str) -> List[str]:
 
 
 def rpl_leg_labels(model) -> List[Tuple[float, float, str]]:
-    """``[(kp0, kp1, cable type label)]`` per RPL leg with a ``CableType``."""
+    """``[(kp0, kp1, cable type label)]`` per RPL leg with a ``CableType``, at measured KPs."""
+    kps = rpl_measured_kps(model)
     out = []
     for i, segment in enumerate(model.segments):
         label = (segment.attrs or {}).get("CableType")
-        k0, k1 = model.points[i].dist_cum_km, model.points[i + 1].dist_cum_km
         text = None if label is None else str(label).strip()
-        if text and text.upper() != "NULL" and k0 is not None and k1 is not None:
-            out.append((float(k0), float(k1), text))
+        if text and text.upper() != "NULL" and i + 1 < len(kps):
+            out.append((float(kps[i]), float(kps[i + 1]), text))
     return out
 
 

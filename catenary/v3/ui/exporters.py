@@ -273,7 +273,7 @@ def write_csv(path: str, header: List[str], rows: List[List]) -> None:
 # DXF (minimal hand-built ASCII, R12 style — matches the V2 writer approach)
 # ---------------------------------------------------------------------------
 
-# AutoCAD Color Index numbers for well-known layers and the cable cycle.
+# DXF colour index (ACI) numbers for well-known layers and the cable cycle.
 _ACI_SEABED = 8      # dark grey
 _ACI_MARKERS = 1     # red
 _ACI_VESSEL = 7      # white/black

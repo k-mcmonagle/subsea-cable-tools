@@ -18,14 +18,21 @@ and published cases (below). It is **not validated** against field data or other
 
 ### Route and KP
 
-- **A Cable Route Workbench RPL.** KP is measured along it from its start KP, as the Workbench does. Its alter
-  courses and its slack per leg are available.
+- **A Cable Route Workbench RPL.** KP is measured along it from its start KP (the plugin's KP setting: geodesic
+  on WGS84 by default), as every KP tool does. Its alter courses, its slack and cable type per leg, and an
+  assembly fitted to it sit at the measured KPs of its positions. The KPs printed in the RPL are checked, not
+  used: a note says when they differ by a metre or more. Between positions the route follows the geodesic (the
+  path KP is measured along, and the one a projected map draws), so on long legs the seabed is sampled on that
+  track, not on a line straight in degrees (14 m apart mid-way along a 20 km leg at 57°N).
 - **A line layer**, with the KP at its first vertex.
 - **A CSV profile.** Columns are `KP` (km) or `Chainage` (m), and `Depth` (m) or `Elevation` (m). There is no map
   link.
+- **A DXF profile drawing** (ASCII DXF; LINE, LWPOLYLINE and POLYLINE on one layer are joined). Set what X is
+  (chainage from a start KP, or KP in km or m), whether Y is elevation or depth, the drawing's vertical
+  exaggeration and a datum offset. There is no map link.
 - **A synthetic seabed**, for studies and training. Set the slope, the sand waves and the random roughness.
 
-A *KP window* limits the analysis to part of a long route.
+A *KP window* limits the analysis to part of a long route. It is cut from the route with the route's own KPs.
 
 ### Seabed
 
@@ -50,6 +57,15 @@ along the route.
 | Pipeline / cable crossing | Circle: top above the seabed, outside diameter |
 | Berm / mattress | Trapezoid: height, base length, crest length |
 | Depression (trough) | Inverted trapezoid: depth, width at the seabed, width at the bottom |
+| Other (custom shape) | Points `offset height` from the KP along the route, straight lines between; negative heights cut into the seabed |
+
+The features table is the collapsible *Additional features* group under *Seabed*. A rock berm of several slopes,
+a crossing with mattresses or a trench is a custom shape: type its points (`-10 0; -5.5 1.5; -2 1.8; 2 1.8;
+5.5 1.5; 10 0`), paste them, or take them from a DXF cross-section (*Shape from DXF*: heights above the straight
+line between the shape's ends, offsets from its middle, with a unit scale and vertical exaggeration). Several
+features combine: the highest point of the raised ones, the lowest of the depressions. All setup tables have
+*Paste* (tab-separated rows from a spreadsheet), *Import* and *Export* (CSV; a header of the column names, or
+the same column order).
 
 The profile gains stations through each feature (length / 40, between 2 cm and 0.5 m).
 
@@ -75,6 +91,17 @@ The model uses each cable's submerged weight, EI, MBR, diameter and NPTS.
 body adds its weight over its length. Its housing holds the cable either side off the seabed by half the
 difference in diameter.
 
+**Protection** (the collapsible *Protection* group: e.g. polymer half-shells or articulated pipe) has a KP range,
+an added weight in water, an outside diameter, an added EI and its own MBR, from its data sheet. Over its range it
+adds its weight to the cable's (span length goes as `sqrt(T / w)`, so a heavier cable spans less but bears harder
+on a crest), adds its EI when given, and sets the MBR to the larger of the cable's and its own. Its kind is a
+friction table key; with no row for it, the cable's friction applies. It shows as a grey band along the cable and on
+the DXF layer `SA_PROTECTION`.
+
+**Diameter.** The line is the underside of the cable: gaps are measured from the cable to the seabed. Diameter has
+little effect on spans for telecom cables (tens of mm). It sets a body's housing standoff and the outside of
+protection.
+
 ### Friction
 
 - **Default.** One axial and one lateral Coulomb coefficient (default 0.5).
@@ -93,7 +120,8 @@ al. 2024). Run a low, a best and a high value.
 - **The RPL slack of each leg.**
 
 You can override the value by KP section. Set the lay direction: friction holds the tension each stretch was laid
-at, so on slopes the result depends on it.
+at, so on slopes the result depends on it. *Find the highest tension within limits* opens the Find tension tab
+(see the model, section 7).
 
 ## The model
 
@@ -165,14 +193,27 @@ At tension `T` the cable follows a hollow only if the hollow's radius exceeds `T
   - it rises more than *Report spans higher than* (0.3 m), and
   - it is longer than *…and longer than* (5 m).
 
-  It is red when it is 1 m high, 50 m long, or below the MBR at a support. The Lay Assessment measures spans the
-  same way.
-- **Supports.** The reaction is `P = T dtheta`. The bend radius is about `2 lambda / dtheta`, with
-  `lambda = sqrt(EI / T)`. The moment is `dtheta / 2 * sqrt(EI T)`. These estimates are shared with the Lay
-  Assessment.
-- **Highest tension for spans within limits.** Bisection on a constant tension in 250 m windows. Spans only grow as
-  tension rises for a uniform cable on a frictionless seabed: the matrix of the discrete problem is a Minkowski
-  matrix (Binda & Contro 1979, after Cottle). So the bisection is well posed.
+  It is red when it is 1 m high, 50 m long, below the MBR at a support, or above the contact limit (when set).
+  The Lay Assessment measures spans the same way.
+- **Span ends.** Near a tangent touchdown the gap grows only as `w d² / 2T`, so the cable looks to touch well
+  before the exact touchdown (at 10 kN and 60 N/m it is within 5 cm of the seabed for the last 4 m). *Span ends
+  where the gap is under* (default 0: the exact touchdown, the pipeline definition) counts the cable as touching
+  within that gap. Each tangent end then moves in by about `sqrt(2 gap T / w)`, e.g. to compare with a survey's
+  gap detection limit. Both tools have this setting.
+- **Supports** sit where each span meets the seabed. A short contact with a span either side (a crest: no longer
+  than `2 lambda`, or three stations) is one support, which carries the turn of the cable and the weight of the
+  cable resting on it. Elsewhere the support is the end of the contact next to the span: where the span lands
+  tangentially (a touchdown on even seabed) there is no concentrated reaction. The reaction is `P = T dtheta`. The
+  bend radius is about `2 lambda / dtheta`, with `lambda = sqrt(EI / T)`. The moment is `dtheta / 2 * sqrt(EI T)`.
+  These estimates are shared with the Lay Assessment.
+- **Contact limit.** *Contact limit at a support* (default off) flags supports whose reaction is above it, and
+  makes their spans red. The reaction is a point load from the 2D model on a rigid seabed: compare it with the
+  crush rating of the cable (or its protection) over the bearing length its data sheet uses (often per 100 mm).
+  The detail model gives a closer value at a crossing.
+- **Highest tension for spans within limits.** Bisection on a constant tension in windows of 1/40 of the route
+  (25 to 250 m; one value per window). Spans only grow as tension rises for a uniform cable on a frictionless
+  seabed: the matrix of the discrete problem is a Minkowski matrix (Binda & Contro 1979, after Cottle). So the
+  bisection is well posed.
 
 ### 5. Detail model (bending stiffness)
 
@@ -204,6 +245,28 @@ sweep plots and tabulates:
 - the tightest bend;
 - whether the tension is above NPTS.
 
+### 7. Find tension
+
+The reverse question: the highest constant bottom tension that keeps the spans within a target, for the whole
+profile, the visible part, or each lay control section. Targets:
+
+- no reportable span (the reporting limits);
+- no red span;
+- no span at all;
+- no span higher than `h` and longer than `L`.
+
+Each can also require the bends at supports within the MBR and the reactions within the contact limit. Each
+tension is solved in full (friction, slopes, bodies, protection) on a geometric grid from just above the
+conformity tension to the search limit (default 50 kN), then bisected to about 2%. The answer is the highest
+tension below which every tension searched meets the target. Spans shorten as the tension falls, so the answer is
+a ceiling: lay at or below it. A cable always spans a pipeline it crosses: such spans are listed as remaining at the
+lowest tension. The floor of the tension window comes from the loop and slope checks, not from spans; to follow the
+seabed the cable needs at least the seabed fill as slack (listed per scope). *Use for the lay control* sets the
+answers (rounded down to 0.05 kN) as the bottom tension, or per section.
+
+Check: a 0.5 m pipeline crossed at a span limit of 8 m (armoured cable, 60 N/m) gives 3.93 kN; the ideal parabola
+`T = L² w / 2h` gives 3.84 kN (the model's spans are about 1% shorter over the pipe's round top).
+
 ### Alter courses
 
 The model is 2D. At an alter course, lateral friction holds the cable only on a turn radius of at least
@@ -221,6 +284,7 @@ tool lists these values at each RPL vertex as information.
 | Cable not held (slides) | amber (loop risk below) |
 | Loop risk (surplus slack ≥ 8% over the slack window at tension ≤ 0.1 kN) | amber |
 | Body clear of the seabed | amber |
+| Contact load at a support (above the contact limit, when set) | red |
 | Steep slope (small-slope model note, above 20°) | info |
 | Alter course (lateral) | info |
 
@@ -244,10 +308,14 @@ tool lists these values at each RPL vertex as information.
   - Spans (with bodies in each span);
   - Bodies;
   - Detail (EI);
+  - Find tension;
   - Tension sweep;
   - Summary (inputs, totals, notes).
-- **Export.** Findings, spans and the profile by station as CSV, and the plot as PNG. *Add to map* writes the
-  findings as a line layer.
+- **Export.** Findings, spans and the profile by station as CSV, the plot as PNG, and the scene as DXF (R12, metres,
+  X = KP × 1000, Y = elevation × a chosen vertical exaggeration). The DXF layers are `SA_SEABED`,
+  `SA_SEABED_SAMPLED`, `SA_CABLE`, `SA_CABLE_DETAIL`, `SA_SPAN_RED`, `SA_SPAN_AMBER`, `SA_CLEAR_UNDER_LIMITS`,
+  `SA_SUPPORTS`, `SA_BODIES`, `SA_PROTECTION`, `SA_FEATURES`, `SA_SEA_LEVEL`, `SA_FRAME` and `SA_TEXT`. The tension, slack and slope
+  graphs sit below the profile, with one layer per curve. *Add to map* writes the findings as a line layer.
 
 ## Examples
 
@@ -263,6 +331,9 @@ tool lists these values at each RPL vertex as information.
   `w d / 2T` shorter, because its tension falls by `w d` into the trough.
 - **Boulder on a flat seabed.**
 - **Pipeline crossing, armoured cable.** Use Detail (EI) on a span.
+- **Pipeline crossing with protection (illustrative values).** The same crossing with 40 m of articulated pipe
+  (45 kg/m in water, 150 mm, MBR 4 m; not product data): shorter spans, a larger reaction on the pipeline.
+- **Rock berm (custom shape), armoured cable.**
 - **Sand waves on a slope, with a repeater.**
 
 ## Storage

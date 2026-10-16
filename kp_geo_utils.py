@@ -290,6 +290,51 @@ def _xy_text(point) -> str:
         return repr(point)
 
 
+def nearest_x_scale(distance: QgsDistanceArea, latitude: float) -> float:
+    """Weight of x in a nearest-point projection.
+
+    On a geographic route a degree of longitude is ``cos(latitude)`` of a
+    degree of latitude, so the perpendicular foot found in plain degrees
+    slides along the route (by about ``0.4 x`` the offset at 50 deg N, more
+    further north). Weighting x by ``cos(latitude)`` finds the measured
+    nearest point; 1 on a projected route.
+    """
+    try:
+        crs = distance.sourceCrs()
+        geographic = crs is not None and crs.isValid() and crs.isGeographic()
+    except Exception:  # noqa: BLE001 - no CRS: planar
+        geographic = False
+    if not geographic or not math.isfinite(latitude):
+        return 1.0
+    return max(math.cos(math.radians(min(abs(latitude), 89.9))), 1e-3)
+
+
+def segment_fraction(qx: float, qy: float, x1: float, y1: float, dx: float, dy: float,
+                     x_scale: float = 1.0) -> float:
+    """Fraction (0..1) along a segment of the point nearest to ``(qx, qy)``,
+    with x weighted by ``x_scale`` (see :func:`nearest_x_scale`)."""
+    wx = dx * x_scale
+    denominator = wx * wx + dy * dy
+    if denominator <= 0.0:
+        return 0.0
+    return max(0.0, min(1.0, ((qx - x1) * x_scale * wx + (qy - y1) * dy) / denominator))
+
+
+def _nearest_on_geometry(geom: QgsGeometry, qx: float, qy: float, x_scale: float) -> Optional[QgsPointXY]:
+    """The point of ``geom`` nearest to ``(qx, qy)`` with x weighted by ``x_scale``."""
+    best, best_d2 = None, float("inf")
+    for part in iter_line_parts(geom):
+        for p1, p2 in zip(part[:-1], part[1:]):
+            x1, y1 = float(p1.x()), float(p1.y())
+            dx, dy = float(p2.x()) - x1, float(p2.y()) - y1
+            t = segment_fraction(qx, qy, x1, y1, dx, dy, x_scale)
+            sx, sy = x1 + t * dx, y1 + t * dy
+            d2 = ((qx - sx) * x_scale) ** 2 + (qy - sy) ** 2
+            if d2 < best_d2:
+                best, best_d2 = QgsPointXY(sx, sy), d2
+    return best
+
+
 def _measure_segment_m(distance: QgsDistanceArea, p1, p2) -> Optional[float]:
     """Length (m) of ``p1 -> p2``, or ``None`` (warned) if it can't be measured."""
     try:
@@ -518,6 +563,7 @@ def kp_at_point(
         return KPHit(0.0, float("inf"), None, -1)
 
     point_geom = QgsGeometry.fromPointXY(QgsPointXY(point_xy))
+    x_scale = nearest_x_scale(distance, float(point_xy.y()))
 
     # First pass: feature-level cumulative offsets and pick the closest feature.
     offsets_m: List[float] = []
@@ -530,13 +576,19 @@ def kp_at_point(
     best_dist = float("inf")
     best_snapped: Optional[QgsPointXY] = None
     for idx, geom in enumerate(geoms):
-        nearest_geom = geom.nearestPoint(point_geom)
-        if nearest_geom is None or nearest_geom.isEmpty():
-            continue
-        try:
-            snapped = QgsPointXY(nearest_geom.asPoint())
-        except Exception:
-            continue
+        if x_scale != 1.0:
+            # Geographic route: the measured nearest point, not the nearest in plain degrees.
+            snapped = _nearest_on_geometry(geom, float(point_xy.x()), float(point_xy.y()), x_scale)
+            if snapped is None:
+                continue
+        else:
+            nearest_geom = geom.nearestPoint(point_geom)
+            if nearest_geom is None or nearest_geom.isEmpty():
+                continue
+            try:
+                snapped = QgsPointXY(nearest_geom.asPoint())
+            except Exception:
+                continue
         try:
             d = float(distance.measureLine(QgsPointXY(point_xy), snapped))
         except Exception:
@@ -1066,8 +1118,9 @@ class RouteFrame:
         """Nearest KP on the route (indexed; same chainage as point_at_kp).
 
         Candidate segments come from the spatial index; each candidate gets
-        the exact planar projection and a geodesic ``measureLine`` DCC, and
-        the geodesically closest wins — the same snapped point and partial
+        the nearest-point projection (x weighted by cos(latitude) on a
+        geographic route, :func:`nearest_x_scale`) and a geodesic
+        ``measureLine`` DCC, and the geodesically closest wins — the same snapped point and partial
         chainage (planar fraction × ellipsoidal segment length) the walking
         implementation produced, without walking every vertex per call.
 
@@ -1086,6 +1139,7 @@ class RouteFrame:
             return KPHit(0.0, float("inf"), None, -1)
         query = QgsPointXY(point_xy)
         qx, qy = float(query.x()), float(query.y())
+        x_scale = nearest_x_scale(self._distance, qy)
         total = len(self._segs)
         try:
             candidate_ids = self._kp_index.nearestNeighbor(query, 12)
@@ -1108,9 +1162,12 @@ class RouteFrame:
                 return 0.0
             t = max(0.0, min(1.0, ((qx - x1) * dx + (qy - y1) * dy) / planar_sq))
             sx, sy = x1 + t * dx, y1 + t * dy
-            planar = math.hypot(qx - sx, qy - sy)
+            planar = math.hypot(qx - sx, qy - sy)      # a lower bound, for the search radius
             if planar_limit is not None and planar > planar_limit:
                 return planar
+            if x_scale != 1.0:
+                t = segment_fraction(qx, qy, x1, y1, dx, dy, x_scale)
+                sx, sy = x1 + t * dx, y1 + t * dy
             snapped = QgsPointXY(sx, sy)
             try:
                 dist = float(self._distance.measureLine(query, snapped))

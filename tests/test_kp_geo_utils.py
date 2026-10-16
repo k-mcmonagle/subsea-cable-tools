@@ -689,6 +689,30 @@ def test_stored_geometry_index_nearest() -> bool:
     return _result("stored_geometry_index: nearest by geometry, geometries kept", ok, str(nearest))
 
 
+def test_nearest_kp_geographic_matches_projected() -> bool:
+    """At 57.5 N a point 200 m off a 2 km NE leg: the KP on the WGS84 route is the
+    KP of the same point on the same leg in UTM. Projected in plain degrees, the
+    foot slid about 110 m along the leg (a degree of longitude is cos(lat) short)."""
+    wgs = QgsCoordinateReferenceSystem("EPSG:4326")
+    utm = QgsCoordinateReferenceSystem("EPSG:32630")
+    to_wgs = QgsCoordinateTransform(utm, wgs, QgsProject.instance())
+    a, b = QgsPointXY(500000.0, 6370000.0), QgsPointXY(501414.2, 6371414.2)
+    query = QgsPointXY(500707.1 - 141.42, 6370707.1 + 141.42)
+    leg_utm = QgsGeometry.fromPolylineXY([a, b])
+    leg_wgs = QgsGeometry.fromPolylineXY([to_wgs.transform(a), to_wgs.transform(b)])
+    da_wgs = make_distance_area(wgs, QgsCoordinateTransformContext())
+    da_utm = make_distance_area(utm, QgsCoordinateTransformContext())
+    projected = RouteFrame.from_source([leg_utm], da_utm).kp_at_point(query)
+    frame = RouteFrame.from_source([leg_wgs], da_wgs).kp_at_point(to_wgs.transform(query))
+    walk = kp_at_point([leg_wgs], to_wgs.transform(query), da_wgs)
+    along = abs(frame.kp_km - projected.kp_km) * 1000.0
+    ok = (along < 1.0 and abs(walk.kp_km - frame.kp_km) * 1000.0 < 0.01
+          and abs(frame.dcc_m - projected.dcc_m) < 1.0 and abs(projected.dcc_m - 200.0) < 1.0)
+    return _result("nearest KP on a geographic route matches the projected answer (57.5 N, 200 m off)", ok,
+                   f"{frame.kp_km * 1000:.1f} vs {projected.kp_km * 1000:.1f} m along; walk "
+                   f"{walk.kp_km * 1000:.1f} m; DCC {frame.dcc_m:.1f} vs {projected.dcc_m:.1f} m")
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -720,6 +744,7 @@ def run_all() -> List[bool]:
         test_routeframe_nearest_exact_under_geodesic_metric(),
         test_reproject_context_and_strict(),
         test_stored_geometry_index_nearest(),
+        test_nearest_kp_geographic_matches_projected(),
     ]
     print("")
     print(f"{sum(results)}/{len(results)} passed")

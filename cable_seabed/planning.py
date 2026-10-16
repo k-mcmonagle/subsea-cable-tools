@@ -29,7 +29,8 @@ KP). :func:`prepare` builds the stations once; :func:`solve` runs:
 
 :func:`detail_window` solves a KP window with bending stiffness
 (:mod:`cable_seabed.beam`); :func:`tension_sweep` repeats step 1-4 over a
-range of bottom tensions.
+range of bottom tensions; :func:`find_tension` finds the highest bottom
+tension that keeps the spans within a target.
 """
 
 from __future__ import annotations
@@ -123,6 +124,26 @@ class Body:
 
 
 @dataclass
+class Protection:
+    """Cable protection over a KP range (e.g. polymer half-shells or articulated pipe).
+
+    It adds its weight in water to the cable's, may add bending stiffness,
+    sets its own minimum bend (locking) radius when that is larger than the
+    cable's, and its outside diameter. ``kind`` is the friction table key; a
+    kind with no row there uses the cable's friction.
+    """
+
+    name: str
+    kp_start: float
+    kp_end: float
+    weight_npm: float = 0.0           # added submerged weight, N/m
+    diameter_m: float = math.nan      # outside diameter over the protection
+    ei_knm2: float = math.nan         # added bending stiffness
+    mbr_m: float = math.nan           # the protection's minimum bend radius
+    kind: str = "Protection"
+
+
+@dataclass
 class SoilZone:
     kp_start: float
     kp_end: float
@@ -151,6 +172,11 @@ class FrictionModel:
             if lo <= kp_km <= hi:
                 found = zone.soil
         return found
+
+    def has_item(self, item: str) -> bool:
+        """A table row names this cable type, body kind or protection kind."""
+        key = _key(item)
+        return bool(key) and any(_key(entry.item) == key for entry in self.table)
 
     def lookup(self, item: str, soil: str) -> Tuple[float, float]:
         """``(mu_axial, mu_lateral)``: exact item and soil first, then item on
@@ -222,6 +248,8 @@ class LayControl:
 class Criteria:
     min_gap_m: float = 0.3            # report spans higher than ...
     min_length_m: float = 5.0         # ... and longer than
+    touchdown_gap_m: float = 0.0      # a span ends where the gap falls to this (0: exact lift-off / touchdown)
+    max_reaction_kn: float = 0.0      # flag a support reaction above this (contact / crush; 0: off)
     red_gap_m: float = 1.0
     red_length_m: float = 50.0
     conform_below_kn: float = 0.05    # below this tension the cable follows the seabed
@@ -232,6 +260,11 @@ class Criteria:
     shortfall_pct: float = 0.1        # flag laid cable short of the seabed by more than this
     max_reach_m: float = 1000.0
     allowable: bool = True            # find the highest tension that keeps spans within limits
+
+
+def span_end_tol(criteria: Criteria) -> float:
+    """The gap (m) below which the cable counts as touching at a span's end."""
+    return max(float(criteria.touchdown_gap_m or 0.0), SPAN_END_TOL_M)
 
 
 @dataclass
@@ -258,6 +291,7 @@ class PlanningInputs:
     criteria: Criteria = field(default_factory=Criteria)
     filter_m: float = 2.0              # seabed noise filter the cable rests on
     smoothing_m: Optional[float] = None   # seabed smoothing for lengths (None: conformity length)
+    protection: List[Protection] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -281,8 +315,8 @@ class Stations:
     obstacle_m: np.ndarray            # seabed + body standoff
     feature_m: np.ndarray             # feature height above the seabed
     slope: np.ndarray                 # seabed slope dz/dx
-    w_npm: np.ndarray                 # cable + bodies
-    w_cable_npm: np.ndarray
+    w_npm: np.ndarray                 # cable + protection + bodies
+    w_cable_npm: np.ndarray           # cable + protection
     ei_knm2: np.ndarray
     mbr_m: np.ndarray
     diameter_m: np.ndarray
@@ -300,6 +334,8 @@ class Stations:
     turns: List[Tuple[float, float]]
     notes: List[str]
     features: List[SeabedFeature] = field(default_factory=list)
+    protection: List[Protection] = field(default_factory=list)
+    protection_index: Optional[np.ndarray] = None   # into protection (-1 none)
 
     @property
     def n(self) -> int:
@@ -354,6 +390,28 @@ def prepare(inputs: PlanningInputs) -> Stations:
     mbr = np.array([types[i].mbr_m for i in index], dtype=float)
     diam = np.array([types[i].diameter_m for i in index], dtype=float)
     npts = np.array([types[i].npts_kn for i in index], dtype=float)
+
+    # Protection: added weight and stiffness, its own MBR and outside diameter.
+    protection: List[Protection] = []
+    protection_index = np.full(n, -1, dtype=int)
+    for item in inputs.protection:
+        lo, hi = sorted((float(item.kp_start), float(item.kp_end)))
+        sel = (kp >= lo) & (kp <= hi)
+        if not sel.any():
+            notes.append(f"Protection '{item.name}' (KP {lo:.3f} to {hi:.3f}) is outside the profile; left out.")
+            continue
+        added = float(item.weight_npm) if math.isfinite(item.weight_npm) else 0.0
+        if np.any(w_cable[sel] + added <= 0.0):
+            raise ValueError(f"Protection '{item.name}' makes the cable float: the model needs a weight in water.")
+        protection_index[sel] = len(protection)
+        protection.append(item)
+        w_cable[sel] += added
+        if math.isfinite(item.ei_knm2) and item.ei_knm2 > 0:
+            ei[sel] = np.where(np.isfinite(ei[sel]), ei[sel], 0.0) + item.ei_knm2
+        if math.isfinite(item.mbr_m) and item.mbr_m > 0:
+            mbr[sel] = np.fmax(mbr[sel], item.mbr_m)
+        if math.isfinite(item.diameter_m) and item.diameter_m > 0:
+            diam[sel] = np.fmax(diam[sel], item.diameter_m)
 
     filter_m = max(float(inputs.filter_m or 0.0), 0.0)
     if inputs.smoothing_m is None:
@@ -410,13 +468,17 @@ def prepare(inputs: PlanningInputs) -> Stations:
     for i in range(n):
         j = body_index[i]
         item = inputs.bodies[j].kind if j >= 0 else types[index[i]].name
+        p = protection_index[i]
+        if j < 0 and p >= 0 and fr.has_item(protection[p].kind):
+            item = protection[p].kind
         key = (item, soil[i])
         if key not in cache:
             cache[key] = fr.lookup(item, soil[i])
         mu[i], mu_lat[i] = cache[key]
     return Stations(x, kp, raw + height, seabed, length_seabed, seabed + standoff, height, slope, w, w_cable,
                     ei, mbr, diam, npts, mu, mu_lat, index, body_index, soil, types, placements, spacing,
-                    smoothing, filter_m, list(prof.turns), notes, [f for f in inputs.features if f.valid()])
+                    smoothing, filter_m, list(prof.turns), notes, [f for f in inputs.features if f.valid()],
+                    protection, protection_index)
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +606,13 @@ def _range_runs(mask: np.ndarray, x: np.ndarray, merge_m: float = 20.0,
     return [(a, b) for a, b in out if x[b] - x[a] >= min_length_m]
 
 
+def allowable_window_m(length_m: float) -> float:
+    """Bisection window for the highest tension within limits: 1/40 of the
+    route, 25 to 250 m. One value covers a window, so a short, detailed
+    study needs short windows to keep the limit local to its feature."""
+    return min(250.0, max(25.0, length_m / 40.0))
+
+
 def solve(st: Stations, control: LayControl, criteria: Criteria, allowable: Optional[bool] = None,
           cancel: Optional[Callable[[], bool]] = None, progress: Optional[Callable] = None,
           allowable_kn: Optional[np.ndarray] = None) -> PlanningResult:
@@ -619,10 +688,10 @@ def solve(st: Stations, control: LayControl, criteria: Criteria, allowable: Opti
     # Spans and supports.
     report(progress, 0.62, "Spans and supports")
     gap = y - st.obstacle_m
+    end_tol = span_end_tol(criteria)
     spans = find_spans(x, kp, gap, tension, criteria.min_gap_m, criteria.min_length_m, source, SOURCE_NAMES,
-                       contact_tol_m=SPAN_END_TOL_M)
-    supports = span_supports(x, st.obstacle_m, y, tension, st.w_npm, st.ei_knm2, st.mbr_m, spans, kp,
-                             CONTACT_TOL_M)
+                       contact_tol_m=end_tol)
+    supports = span_supports(x, st.obstacle_m, y, tension, st.w_npm, st.ei_knm2, st.mbr_m, spans, kp, end_tol)
 
     # Slack: planned (laid), fill (seabed), used by the rest shape, surplus.
     y_len = _shape(st, tension, conform, cable_slope, st.length_seabed_m)
@@ -645,8 +714,9 @@ def solve(st: Stations, control: LayControl, criteria: Criteria, allowable: Opti
     if allowable_kn is None and (criteria.allowable if allowable is None else allowable):
         check_cancel(cancel)
         allowable_kn = allowable_tension_kn(
-            x, st.obstacle_m, st.w_npm, criteria.min_gap_m, criteria.min_length_m, cancel=cancel,
-            progress=sub_progress(progress, 0.65, 0.95), contact_tol_m=SPAN_END_TOL_M)
+            x, st.obstacle_m, st.w_npm, criteria.min_gap_m, criteria.min_length_m,
+            core_m=allowable_window_m(float(x[-1] - x[0])), cancel=cancel,
+            progress=sub_progress(progress, 0.65, 0.95), contact_tol_m=end_tol)
     if allowable_kn is not None:
         for span in spans:
             values = allowable_kn[span.i0:span.i1 + 1]
@@ -699,7 +769,13 @@ def run(inputs: PlanningInputs, cancel=None, progress=None) -> PlanningResult:
 # Findings
 # ---------------------------------------------------------------------------
 def _span_red(span: Span, criteria: Criteria) -> bool:
-    return span.max_gap_m >= criteria.red_gap_m or span.length_m >= criteria.red_length_m or span.below_mbr
+    return (span.max_gap_m >= criteria.red_gap_m or span.length_m >= criteria.red_length_m or span.below_mbr
+            or _over_contact(span.max_reaction_kn, criteria))
+
+
+def _over_contact(reaction_kn: float, criteria: Criteria) -> bool:
+    limit = float(criteria.max_reaction_kn or 0.0)
+    return limit > 0 and math.isfinite(reaction_kn) and reaction_kn > limit
 
 
 def _radius_text(radius: float) -> str:
@@ -726,7 +802,9 @@ def findings(result: PlanningResult) -> List[RangeFinding]:
                 text += f" (MBR {span.mbr_m:.1f} m)"
             parts.append(text)
         if np.isfinite(span.max_reaction_kn):
-            parts.append(f"seabed reaction up to {span.max_reaction_kn:.2f} kN")
+            parts.append(f"seabed reaction up to {span.max_reaction_kn:.2f} kN"
+                         + (f", ABOVE the {c.max_reaction_kn:g} kN contact limit"
+                            if _over_contact(span.max_reaction_kn, c) else ""))
         inside = [b.body.name for b in result.bodies if b.in_span and span.kp_start <= b.kp_km <= span.kp_end]
         if inside:
             parts.append("bodies in the span: " + ", ".join(inside))
@@ -741,6 +819,15 @@ def findings(result: PlanningResult) -> List[RangeFinding]:
         out.append(RangeFinding("span", ERROR if red else WARNING, min(span.kp_start, span.kp_end),
                                 max(span.kp_start, span.kp_end), "; ".join(parts), span.max_gap_m, c.red_gap_m,
                                 "m", extra=extra))
+
+    for sp in result.supports:
+        if _over_contact(sp.reaction_kn, c):
+            where = "on a crest" if sp.crest else "where a span meets the seabed"
+            out.append(RangeFinding(
+                "contact", ERROR, float(kp[sp.i0]), float(kp[sp.i1]),
+                f"Seabed reaction {sp.reaction_kn:.2f} kN {where}, above the {c.max_reaction_kn:g} kN contact "
+                "limit: check the crush rating of the cable (or its protection) over the bearing length",
+                sp.reaction_kn, c.max_reaction_kn, "kN"))
 
     with np.errstate(invalid="ignore"):
         over = np.isfinite(st.npts_kn) & (tension > st.npts_kn)
@@ -848,6 +935,7 @@ CHECK_LABELS = {
     "loop_risk": "Loop risk (surplus slack)",
     "body": "Body clear of the seabed",
     "steep": "Steep slope (model note)",
+    "contact": "Contact load at a support",
     "alter_course": "Alter course (lateral)",
 }
 
@@ -939,7 +1027,7 @@ def detail_window(result: PlanningResult, kp0: float, kp1: float, spacing_m: Opt
     kp_g = np.interp(xg, x, kp)
     mbr = st.mbr_m[nearest]
     spans = find_spans(xg, kp_g, beam.gap_m, t_g, result.criteria.min_gap_m, result.criteria.min_length_m,
-                       contact_tol_m=SPAN_END_TOL_M)
+                       contact_tol_m=span_end_tol(result.criteria))
     radius = np.where(rigid, np.inf, beam.bend_radius_m)
     moment = np.abs(beam.moment_nm) / 1000.0
     reach = int(max(3.0 * (lam if math.isfinite(lam) else 0.0), 2.0 * step) / step) + 1
@@ -1014,3 +1102,143 @@ def tension_sweep(st: Stations, control: LayControl, criteria: Criteria, tension
             float(np.nanmax(result.tension_kn)), result.summary.over_npts))
     report(progress, 1.0, "Sweep done")
     return rows
+
+
+@dataclass
+class TensionTarget:
+    """What :func:`find_tension` keeps the spans within.
+
+    A span breaks the target when it is higher than ``gap_m`` and longer than
+    ``length_m`` (with ``red_only``: when it is red by the criteria), when the
+    bend at a support is below the MBR (``mbr``), or when a support reaction is
+    above the criteria's contact limit (``contact``).
+    """
+
+    gap_m: float = 0.3
+    length_m: float = 5.0
+    red_only: bool = False
+    mbr: bool = True
+    contact: bool = True
+
+
+@dataclass
+class TensionAnswer:
+    name: str
+    kp_start: float
+    kp_end: float
+    tension_kn: float                 # highest constant bottom tension that meets the target (0: none)
+    limited: bool                     # False: met at every tension searched
+    governing: str = ""               # what breaks the target just above the answer
+    governing_kp: float = math.nan
+    remaining: List[Span] = field(default_factory=list)   # spans that break it even at the lowest tension
+    fill_pct: float = math.nan        # seabed over route in the scope: the slack to follow the seabed
+    note: str = ""
+
+
+def _breaks(span: Span, target: TensionTarget, criteria: Criteria) -> str:
+    """Why a span breaks the target ("" when it does not)."""
+    reasons = []
+    size = f"{span.length_m:.1f} m long, {span.max_gap_m:.2f} m high"
+    if target.red_only:
+        if span.max_gap_m >= criteria.red_gap_m or span.length_m >= criteria.red_length_m:
+            reasons.append(size + " (red)")
+    elif span.max_gap_m > target.gap_m and span.length_m > target.length_m:
+        reasons.append(size)
+    if target.mbr and span.below_mbr:
+        reasons.append(f"bend at a support below the {span.mbr_m:.1f} m MBR")
+    if target.contact and _over_contact(span.max_reaction_kn, criteria):
+        reasons.append(f"support reaction {span.max_reaction_kn:.2f} kN above the contact limit")
+    return "; ".join(reasons)
+
+
+def scope_fill_pct(st: Stations, kp0: float, kp1: float) -> float:
+    """Seabed length over route length in ``kp0 .. kp1`` (%): the slack the cable needs to follow the seabed."""
+    lo, hi = sorted((kp0, kp1))
+    sel = (st.kp_km >= lo) & (st.kp_km <= hi)
+    idx = np.nonzero(sel)[0]
+    if idx.size < 2:
+        return math.nan
+    x = st.x_m[idx[0]:idx[-1] + 1]
+    z = st.length_seabed_m[idx[0]:idx[-1] + 1]
+    ok = np.isfinite(z[1:]) & np.isfinite(z[:-1])
+    dx = np.diff(x)[ok]
+    route = float(dx.sum())
+    return (float(np.hypot(dx, np.diff(z)[ok]).sum()) / route - 1.0) * 100.0 if route > 0 else math.nan
+
+
+def find_tension(st: Stations, control: LayControl, criteria: Criteria, target: TensionTarget,
+                 scopes: Sequence[Tuple[str, float, float]], hi_kn: float = 50.0, lo_kn: Optional[float] = None,
+                 steps: int = 12, refine: int = 5, cancel=None, progress=None) -> List[TensionAnswer]:
+    """The highest constant bottom tension that keeps the spans of each scope within ``target``.
+
+    Spans only shorten as the tension falls (Binda & Contro 1979, for a
+    uniform cable on a frictionless seabed), so the answer is a ceiling: lay
+    at or below it. Each tension is solved in full (friction, slopes, bodies
+    and protection included) on a geometric grid from ``lo_kn`` to
+    ``hi_kn``, then bisected between the last grid tension that meets the
+    target (with every lower one meeting it too) and the next. A crossing
+    always spans: what remains at the lowest tension is reported, not hidden.
+    """
+    lo = max(float(lo_kn or 0.0), 2.0 * criteria_floor(criteria), 0.05)
+    hi = max(float(hi_kn), 1.5 * lo)
+    base = replace(criteria, allowable=False)
+    if not target.red_only:
+        base = replace(base, min_gap_m=min(criteria.min_gap_m, target.gap_m),
+                       min_length_m=min(criteria.min_length_m, target.length_m))
+    grid = [float(v) for v in np.geomspace(lo, hi, max(int(steps), 2))]
+    total = len(grid) + refine * len(scopes)
+    done = [0]
+
+    def evaluate(t_kn: float) -> List[List[Tuple[Span, str]]]:
+        check_cancel(cancel)
+        report(progress, done[0] / total, f"Bottom tension {t_kn:.2f} kN")
+        done[0] += 1
+        result = solve(st, LayControl(TENSION, t_kn, [], [], control.direction), base, allowable=False,
+                       cancel=cancel)
+        out = []
+        for _name, a, b in scopes:
+            lo_kp, hi_kp = sorted((a, b))
+            hits = [(s, _breaks(s, target, base)) for s in result.spans
+                    if max(s.kp_start, s.kp_end) >= lo_kp and min(s.kp_start, s.kp_end) <= hi_kp]
+            out.append([(s, why) for s, why in hits if why])
+        return out
+
+    table = [evaluate(t_kn) for t_kn in grid]
+    answers: List[TensionAnswer] = []
+    for j, (name, a, b) in enumerate(scopes):
+        meets = [not row[j] for row in table]
+        last = -1
+        for k, ok in enumerate(meets):
+            if not ok:
+                break
+            last = k
+        note = ""
+        if any(meets[k] for k in range(last + 2, len(meets))):
+            note = ("A higher tension meets the target again (slopes, friction or bodies): the answer is the "
+                    "highest tension below which every tension searched meets it.")
+        fill = scope_fill_pct(st, a, b)
+        if last < 0:
+            hits = table[0][j]
+            span, why = hits[0]
+            answers.append(TensionAnswer(
+                name, a, b, 0.0, True, f"KP {span.kp_start:.3f} to {span.kp_end:.3f}: {why} at {grid[0]:.2f} kN",
+                span.kp_max_gap, [s for s, _ in hits], fill, note))
+            continue
+        if last == len(grid) - 1:
+            answers.append(TensionAnswer(name, a, b, grid[-1], False, fill_pct=fill, note=note))
+            continue
+        good, bad = grid[last], grid[last + 1]
+        hits = table[last + 1][j]
+        for _ in range(refine):
+            mid = math.sqrt(good * bad)
+            verdict = evaluate(mid)[j]
+            if verdict:
+                bad, hits = mid, verdict
+            else:
+                good = mid
+        span, why = hits[0]
+        answers.append(TensionAnswer(
+            name, a, b, good, True, f"KP {span.kp_start:.3f} to {span.kp_end:.3f}: {why} at {bad:.2f} kN",
+            span.kp_max_gap, [], fill, note))
+    report(progress, 1.0, "Done")
+    return answers

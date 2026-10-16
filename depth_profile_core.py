@@ -94,11 +94,13 @@ class RouteStationing:
     for fast interpolation and vectorised point-to-route projection.
     """
 
-    def __init__(self, line_parts, line_length, crs, distance_area):
+    def __init__(self, line_parts, line_length, crs, distance_area, seg_lengths=None):
         self.line_parts = line_parts
         self.line_length = line_length
         self.crs = crs
         self.distance_area = distance_area
+        # Segment lengths in order (a clip of another route keeps that route's chainage).
+        self._given_lengths = list(seg_lengths) if seg_lengths is not None else None
         self._seg_starts = None
         self._seg_ends = None
         self._seg_lens = None
@@ -111,12 +113,13 @@ class RouteStationing:
         starts, ends, lens, p1s, p2s = [], [], [], [], []
         planar = 0
         cum = 0.0
+        given = iter(self._given_lengths) if self._given_lengths is not None else None
         for part in self.line_parts:
             if not part or len(part) < 2:
                 continue
             for p1, p2 in zip(part[:-1], part[1:]):
                 try:
-                    seg_len = float(self.distance_area.measureLine(p1, p2))
+                    seg_len = float(next(given)) if given is not None else                         float(self.distance_area.measureLine(p1, p2))
                 except Exception:
                     # Planar length in CRS units: wrong on a geographic
                     # route, so never silent.
@@ -177,10 +180,16 @@ class RouteStationing:
     def measure_along(self, pt_xy) -> Optional[float]:
         """Chainage (m) of the nearest point on the route to pt_xy (route CRS)."""
         if self._seg_np is not None:
-            x1, y1, dx, dy, seg_sq, starts, lens = self._seg_np
+            x1, y1, dx, dy, _seg_sq, starts, lens = self._seg_np
             px, py = float(pt_xy.x()), float(pt_xy.y())
-            t = np.clip(((px - x1) * dx + (py - y1) * dy) / seg_sq, 0.0, 1.0)
-            dist_sq = (px - (x1 + t * dx)) ** 2 + (py - (y1 + t * dy)) ** 2
+            # On a geographic route x is weighted by cos(latitude): the
+            # measured nearest point, not the nearest in plain degrees.
+            k = 1.0
+            if self.crs is not None and self.crs.isValid() and self.crs.isGeographic():
+                k = max(math.cos(math.radians(min(abs(py), 89.9))), 1e-3)
+            wx = dx * k
+            t = np.clip(((px - x1) * k * wx + (py - y1) * dy) / (wx * wx + dy * dy), 0.0, 1.0)
+            dist_sq = ((px - (x1 + t * dx)) * k) ** 2 + (py - (y1 + t * dy)) ** 2
             best = int(np.argmin(dist_sq))
             return float(starts[best] + t[best] * lens[best])
         # Walk segments accumulating length until the projection point.
@@ -205,6 +214,48 @@ class RouteStationing:
                     best_cum = cumulative + t_clamped * seg_len
                 cumulative += seg_len
         return best_cum
+
+    def vertex_chainages(self) -> List[float]:
+        """Chainage (m) of each vertex along the route, in order."""
+        if not self._seg_ends:
+            return []
+        return [float(v) for v in self._seg_starts] + [float(self._seg_ends[-1])]
+
+    def clip(self, start_m: float, end_m: float) -> Optional["RouteStationing"]:
+        """The route between two chainages, with this route's chainage.
+
+        Nothing is measured again: each clipped segment keeps its share of
+        this route's segment length, so a position in the clip is the same
+        position as here (``clip.point_at(d) == point_at(start_m + d)``), and
+        separate line parts stay separate (a gap is not counted).
+        """
+        if not self._seg_ends:
+            return None
+        start_m, end_m = max(0.0, float(start_m)), min(float(self.line_length), float(end_m))
+        if end_m <= start_m:
+            return None
+        parts, lengths, current, last = [], [], [], None
+        for s, length, p1, p2 in zip(self._seg_starts, self._seg_lens, self._seg_p1, self._seg_p2):
+            a, b = max(start_m, s), min(end_m, s + length)
+            if b <= a:
+                continue
+            f0, f1 = (a - s) / length, (b - s) / length
+            q1 = QgsPointXY(p1.x() + f0 * (p2.x() - p1.x()), p1.y() + f0 * (p2.y() - p1.y()))
+            q2 = QgsPointXY(p1.x() + f1 * (p2.x() - p1.x()), p1.y() + f1 * (p2.y() - p1.y()))
+            joined = last is not None and abs(q1.x() - last.x()) <= 1e-12 and abs(q1.y() - last.y()) <= 1e-12
+            if current and not joined:
+                parts.append(current)
+                current = []
+            if not current:
+                current = [q1]
+            current.append(q2)
+            lengths.append(b - a)
+            last = q2
+        if current:
+            parts.append(current)
+        if not lengths:
+            return None
+        return RouteStationing(parts, end_m - start_m, self.crs, self.distance_area, seg_lengths=lengths)
 
     def geometry(self) -> QgsGeometry:
         if len(self.line_parts) > 1:

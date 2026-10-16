@@ -282,7 +282,7 @@ class RplManagerPanel(QWidget):
         row3.addWidget(zoom_btn)
         export_kml_btn = QPushButton("Export KML…")
         export_kml_btn.setToolTip(
-            "Export this RPL to KML (Google Earth / GIS): the whole route line, "
+            "Export this RPL to KML (for GIS and globe viewers): the whole route line, "
             "one line per leg, and one point per position — every RPL attribute "
             "included."
         )

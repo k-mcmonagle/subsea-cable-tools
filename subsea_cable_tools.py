@@ -227,7 +227,7 @@ class SubseaCableTools:
 
         # Span & Slack Analysis: plan a lay against spans and loops (2D)
         self.span_analysis_action = self.add_action(
-            self._icon('span_analysis_icon.svg'), "Span & Slack Analysis",
+            self._icon('span_analysis_icon.svg'), "Span && Slack Analysis",  # && shows "&" in menus
             self.show_span_analysis,
             tooltip="Span & Slack Analysis: rest a cable on the seabed profile along "
                     "a route, vary the bottom tension or slack, and see spans, "

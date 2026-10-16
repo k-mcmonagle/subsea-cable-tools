@@ -664,6 +664,24 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   1 m silent, 1–5 m info, 5 m+ warning on the Inputs tab; a document
   chained on the map projection is recognised by comparing with planar
   (UTM) chainage. Positions never change because of the check.
+- **Nearest KP to a map position is the measured nearest point.** On a
+  geographic route the perpendicular foot is found with x weighted by
+  cos(latitude) (`kp_geo_utils.nearest_x_scale`, also in
+  `RouteStationing.measure_along`); in plain degrees it slid along the leg by
+  about 0.4 x the offset at 50 deg N and could pick the wrong leg at an alter
+  course. Points on the line, and projected routes, are unchanged. Positions
+  along a segment stay linear in the route CRS (as drawn).
+- **Span & Slack Analysis follows the geodesic between RPL positions.** Its
+  routes in latitude/longitude get a point every 250 m along the geodesic
+  (vertices and KPs unchanged), so samples and markers lie on the path KP
+  measures, which a projected (UTM) map draws to within 1 m even on 100 km
+  legs. Linear in degrees, the mid-leg offset is ~0.9 m on 5 km legs, 14 m on
+  20 km and 350 m on 100 km at 57.5 deg N. Other tools still interpolate in
+  degrees (`follow_stored_geometry`), which matches a map drawn in degrees but
+  not the geodesic; moving them is an open, app-wide decision.
+- **The KP Mouse Tool takes the RPL start KP** of a Workbench RPL lines layer
+  (`kp_datum.lines_layer_start_kp`, by its `rpl_id`); other line layers start
+  at 0.
 - **Plans record their KP datum** (`params_json.kp_datum`). A plan stored
   before start-KP support on an RPL that does not start at 0 is renumbered
   once on open (constant shift, one change-log entry, undoable).

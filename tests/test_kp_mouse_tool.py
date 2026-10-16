@@ -187,7 +187,7 @@ def _probe_points(layer, seed):
                                        a.y() + t * (b.y() - a.y()) + offset * ny / 111320.0)
                         points.append(p)
                         if t == 0.5 and abs(offset) <= 40.0:
-                            near.append(p)
+                            near.append((p, abs(offset)))
     rng = random.Random(seed)
     extent = layer.extent()
     for _ in range(300):
@@ -203,7 +203,7 @@ def _equivalence(cartesian):
     mm = 1e-3
     try:
         points, near = _probe_points(layer, 21 if cartesian else 20)
-        near_keys = {(p.x(), p.y()) for p in near}
+        near_offset = {(q.x(), q.y()): offset for q, offset in near}
         same = ties = nearer = 0
         worse, near_bad = [], 0
         worst_kp = worst_dcc = worst_formula = 0.0
@@ -232,7 +232,10 @@ def _equivalence(cartesian):
                 nearer += 1        # legacy ranked segments in planar degrees
             else:
                 worse.append(("dcc", p.x(), p.y(), old_dcc, hit.dcc_m))
-            if (p.x(), p.y()) in near_keys and not (abs(d_dcc) <= mm and moved <= mm):
+            # A point placed beside a leg: the perpendicular foot, so the DCC is its offset
+            # (projecting in plain degrees slid the foot along a geographic leg).
+            offset = near_offset.get((p.x(), p.y()))
+            if offset is not None and abs(hit.dcc_m - offset) > 0.01 * offset + 0.01:
                 near_bad += 1
         total_km = tool.total_length_meters / 1000.0
         legacy_total = sum(tool.distanceArea.measureLength(g) for g in tool.features_geoms) / 1000.0
@@ -244,8 +247,8 @@ def _equivalence(cartesian):
                      len(worse), 1000 * t_old / len(points), 1000 * t_new / len(points)))
         if worse:
             detail += "; first worse: %s" % (worse[0],)
-        return _result("indexed KP == legacy walk (%s)" % ("Cartesian" if cartesian else "geodesic"),
-                       ok, detail)
+        return _result("indexed KP vs legacy walk: same or nearer, DCC = offset beside a leg (%s)"
+                       % ("Cartesian" if cartesian else "geodesic"), ok, detail)
     finally:
         tool.cleanup_resources()
         iface.close()
@@ -480,6 +483,61 @@ def test_wrapper_menu_icon_and_unload():
         iface.close()
 
 
+def test_start_kp_from_workbench_rpl():
+    """A Workbench RPL lines layer starts at its RPL's start KP (stated KP of the first
+    position), as in the Burial Planner: KP, rKP and the Go to KP range all follow."""
+    from qgis.core import QgsField
+
+    from .. import kp_datum
+    from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_STRING
+
+    lines = QgsVectorLayer("LineString?crs=%s" % _WGS84, "rpl lines", "memory")
+    lines.dataProvider().addAttributes([QgsField("rpl_id", FIELD_TYPE_STRING), QgsField("SeqNo", FIELD_TYPE_INT)])
+    lines.updateFields()
+    feat = QgsFeature(lines.fields())
+    feat.setGeometry(QgsGeometry.fromWkt("LINESTRING(3.0 55.0, 3.02 55.005, 3.035 55.02)"))
+    feat.setAttributes(["r1", 1])
+    lines.dataProvider().addFeatures([feat])
+    points = QgsVectorLayer("Point?crs=%s" % _WGS84, "rpl points", "memory")
+    points.dataProvider().addAttributes([QgsField("SeqNo", FIELD_TYPE_INT),
+                                         QgsField("DistCumulative", FIELD_TYPE_DOUBLE)])
+    points.updateFields()
+    rows = []
+    for seq, (x, y, kp) in enumerate(((3.0, 55.0, 12.345), (3.02, 55.005, 13.7), (3.035, 55.02, 15.6))):
+        point = QgsFeature(points.fields())
+        point.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(x, y)))
+        point.setAttributes([seq, kp])
+        rows.append(point)
+    points.dataProvider().addFeatures(rows)
+
+    class _Store:
+        def get_rpl(self, rpl_id):
+            return {"rpl_id": rpl_id, "points_layer": "rpl_r1_points"} if rpl_id == "r1" else None
+
+        def open_layer(self, name):
+            return points if name == "rpl_r1_points" else None
+
+    found = kp_datum.lines_layer_start_kp(lines, _Store())
+    plain = kp_datum.lines_layer_start_kp(_layer(_FEATURES), _Store())
+    original = kp_datum.lines_layer_start_kp
+    kp_datum.lines_layer_start_kp = lambda layer, store=None: found
+    iface = _Iface()
+    tool = _tool(iface, lines)
+    try:
+        start = tool._locate(QgsPointXY(3.0, 55.0))
+        end = tool._locate(QgsPointXY(3.035, 55.02))
+        length_km = tool.total_length_meters / 1000.0
+        ok = (abs(found - 12.345) < 1e-12 and plain == 0.0 and start is not None and end is not None
+              and abs(start.kp_km - 12.345) < 1e-9 and abs(end.kp_km - (12.345 + length_km)) < 1e-9
+              and abs(tool._end_kp() - end.kp_km) < 1e-9)
+        detail = f"start {start.kp_km:.3f}, end {end.kp_km:.3f}, rKP at the start {tool._end_kp() - start.kp_km:.3f}"
+    finally:
+        kp_datum.lines_layer_start_kp = original
+        tool.cleanup_resources()
+        iface.close()
+    return _result("KP starts at the Workbench RPL's start KP; rKP from its end KP", ok, detail)
+
+
 def run_all():
     return [
         test_equivalence_geodesic(),
@@ -492,4 +550,5 @@ def run_all():
         test_cleanup_detaches_canvas_items(),
         test_layer_has_features(),
         test_wrapper_menu_icon_and_unload(),
+        test_start_kp_from_workbench_rpl(),
     ]

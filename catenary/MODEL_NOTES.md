@@ -9,7 +9,7 @@ appropriate for a given task.
 > closed-form catenary solutions and internal consistency identities by the
 > automated test suites (`tests/test_catenary_solver.py`,
 > `tests/test_drape_solver.py`, `tests/test_v3_solver3d.py`). They have **not** been independently
-> verified against commercial lay-simulation software (e.g. OrcaFlex)
+> verified against commercial lay-simulation software
 > or against measured field data. Treat results as planning-grade
 > estimates, not engineering sign-off values, until such a comparison has been
 > done for your cable and vessel configuration.

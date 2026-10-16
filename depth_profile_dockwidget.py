@@ -2078,7 +2078,7 @@ class DepthProfileDockWidget(QDockWidget):
             return
 
         # Unit scaling and DXF header units.
-        # AutoCAD INSUNITS: 4=millimeters, 6=meters
+        # DXF $INSUNITS: 4=millimeters, 6=meters
         if units_choice == "Millimeters":
             x_scale = 1_000_000.0  # KP (km) -> mm
             y_scale = 1_000.0      # depth (m) -> mm

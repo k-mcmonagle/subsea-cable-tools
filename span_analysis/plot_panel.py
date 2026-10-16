@@ -29,7 +29,7 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 import pyqtgraph as pg
 
-from qgis.PyQt.QtCore import QRectF, QSettings, Qt, pyqtSignal
+from qgis.PyQt.QtCore import QEvent, QRectF, QSettings, Qt, pyqtSignal
 from qgis.PyQt.QtGui import QPainterPath
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
@@ -45,7 +45,6 @@ from qgis.PyQt.QtWidgets import (
 
 from ..cable_seabed import planning as pl
 from ..cable_seabed.core import runs
-from ..cable_seabed.spans import SPAN_END_TOL_M
 from ..maptools.profile_measure_controller import ProfileMeasureController
 from ..plugin_log import log_exception
 
@@ -61,8 +60,10 @@ AMBER_FILL = (255, 152, 0, 140)
 CLEAR_FILL = (120, 120, 120, 55)
 SURPLUS_FILL = (76, 175, 80, 90)
 DETAIL = (123, 31, 162)
+PROTECTION = (96, 125, 139, 150)
 PREVIOUS = (150, 150, 150)
 SEA = "#17becf"
+_LEAVE = getattr(getattr(QEvent, "Type", QEvent), "Leave")
 TRUE_SCALE_RATIO = 1000.0   # KP in km, depth in m
 
 
@@ -98,10 +99,11 @@ def _hex(colour) -> str:
 
 _LEGENDS = {
     "depth": [("dash", SEA, "Sea level"), ("solid", (200, 175, 165), "Seabed (sampled)"), ("solid", SEABED, "Seabed"),
-              ("solid", CABLE, "Cable (rest shape)"), ("dash", PREVIOUS, "Previous run"),
+              ("solid", CABLE, "Cable (rest shape)"), ("fill", PROTECTION, "Protection"),
+              ("dash", PREVIOUS, "Previous run"),
               ("solid", DETAIL, "Cable with EI (detail)"), ("fill", RED_FILL, "Span (red)"),
               ("fill", AMBER_FILL, "Span (amber)"), ("fill", (170, 170, 170), "Clear of seabed, under the limits"),
-              ("triangle", (60, 60, 60), "Span support"), ("diamond", (255, 193, 7), "Body")],
+              ("triangle", (60, 60, 60), "Span support / end"), ("diamond", (255, 193, 7), "Body")],
     "tension": [("solid", CABLE, "Residual (on the seabed)"), ("dash", (90, 90, 90), "Lay (touchdown)"),
                 ("dash", (211, 47, 47), "NPTS"), ("dot", (0, 137, 123), "Max for spans within limits"),
                 ("dash", PREVIOUS, "Previous run")],
@@ -162,7 +164,7 @@ def _setting(key: str, default: bool) -> bool:
 
 
 class ProfilePlot(QWidget):
-    kpHovered = pyqtSignal(float)
+    kpHovered = pyqtSignal(float)    # nan: the cursor left the profile
     kpClicked = pyqtSignal(float)
     kpDoubleClicked = pyqtSignal(float)
     bodyClicked = pyqtSignal(int)
@@ -333,6 +335,7 @@ class ProfilePlot(QWidget):
         self.sea_curve.setZValue(3)
         self.raw_curve = curve(self.depth_plot, (200, 175, 165), "Seabed (sampled)", 1)
         self.seabed_curve = curve(self.depth_plot, SEABED, "Seabed", 2)
+        self.protection_curve = curve(self.depth_plot, PROTECTION, "Protection", 7, fast=False)
         self.cable_curve = curve(self.depth_plot, CABLE, "Cable (rest shape)", 1.5)
         self.prev_cable_curve = curve(self.depth_plot, PREVIOUS, "Cable (previous run)", 1, _DASH)
         self.detail_curve = curve(self.depth_plot, DETAIL, "Cable (detail, with EI)", 1.5)
@@ -371,7 +374,7 @@ class ProfilePlot(QWidget):
         self.friction_curve = curve(self.slope_plot, (230, 81, 0), "Friction angle", 1.2, _DASH)
 
         self._vlines = []
-        for plot in self._data_plots:
+        for plot in (self.status_plot,) + self._data_plots:
             line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen((120, 120, 120), width=1, style=_DASH))
             line.hide()
             plot.addItem(line, ignoreBounds=True)
@@ -389,6 +392,7 @@ class ProfilePlot(QWidget):
             scene = self.widgets[key].scene()
             scene.sigMouseMoved.connect(lambda pos, k=key: self._on_mouse_moved(k, pos))
             scene.sigMouseClicked.connect(lambda event, k=key: self._on_mouse_clicked(k, event))
+            self.widgets[key].installEventFilter(self)
         self.true_scale_check.toggled.connect(self._apply_true_scale)
         self.sea_check.toggled.connect(self._update_sea)
         self.reverse_check.toggled.connect(self._apply_reverse)
@@ -433,6 +437,7 @@ class ProfilePlot(QWidget):
         r = self._result
         if r is None:
             for item in (self.raw_curve, self.seabed_curve, self.cable_curve, self.detail_curve, self.sea_curve,
+                         self.protection_curve,
                          self.tension_curve, self.deposit_curve, self.npts_curve, self.allowable_curve,
                          self.used_curve, self.laid_curve, self.fill_curve, self.plan_curve, self.slope_curve,
                          self.friction_curve):
@@ -455,6 +460,11 @@ class ProfilePlot(QWidget):
         self.raw_curve.setData(kp, -st.raw_elev_m if shaped else np.full(len(kp), np.nan))
         self.seabed_curve.setData(kp, floor)
         self.cable_curve.setData(kp, cable_depth)
+        index = st.protection_index
+        if index is not None and np.any(index >= 0):
+            self.protection_curve.setData(kp, np.where(index >= 0, cable_depth, np.nan))
+        else:
+            self.protection_curve.setData([], [])
         self.detail_curve.setData([], [])
         self._draw_fills(r, kp, cable_depth, floor)
         self._draw_supports(r)
@@ -490,7 +500,7 @@ class ProfilePlot(QWidget):
         for span in r.spans:
             (red if pl._span_red(span, criteria) else amber).append((span.i0, span.i1))
         with np.errstate(invalid="ignore"):
-            free = np.isfinite(r.gap_m) & (r.gap_m > SPAN_END_TOL_M)
+            free = np.isfinite(r.gap_m) & (r.gap_m > pl.span_end_tol(criteria))
         reported = np.zeros(len(kp), dtype=bool)
         for span in r.spans:
             reported[span.i0:span.i1 + 1] = True
@@ -547,9 +557,20 @@ class ProfilePlot(QWidget):
             k = (sp.i0 + sp.i1) // 2
             kps.append(sp.kp)
             depths.append(float(-st.obstacle_m[k]))
-            brushes.append(pg.mkBrush(211, 47, 47) if sp.below_mbr else pg.mkBrush(60, 60, 60, 170))
-            lines = [f"Span support at KP {sp.kp:.3f}",
-                     f"Seabed reaction {sp.reaction_kn:.2f} kN" if math.isfinite(sp.reaction_kn) else "",
+            over = pl._over_contact(sp.reaction_kn, r.criteria)
+            brushes.append(pg.mkBrush(211, 47, 47) if (sp.below_mbr or over) else pg.mkBrush(60, 60, 60, 170))
+            if sp.crest:
+                head = f"Span support (crest) at KP {sp.kp:.3f}"
+            else:
+                head = f"Span end on the seabed (touchdown / lift-off) at KP {sp.kp:.3f}"
+            if not math.isfinite(sp.reaction_kn):
+                reaction = ""
+            elif sp.reaction_kn < 0.005 and not sp.crest:
+                reaction = "No concentrated reaction: the cable meets the seabed tangentially"
+            else:
+                reaction = f"Seabed reaction {sp.reaction_kn:.2f} kN" + (
+                    f", ABOVE the {r.criteria.max_reaction_kn:g} kN contact limit" if over else "")
+            lines = [head, reaction,
                      f"Bend radius {_radius_text(sp.bend_radius_m)}"
                      + (f" (MBR {sp.mbr_m:.1f} m)" if math.isfinite(sp.mbr_m) else ""),
                      f"Moment {sp.moment_knm:.2f} kNm" if math.isfinite(sp.moment_knm) else "",
@@ -588,9 +609,26 @@ class ProfilePlot(QWidget):
         self.bodies.setData(np.array(kps), np.array(depths), data=tips)
         self._update_body_labels()
 
-    def _update_body_labels(self, *_args) -> None:
+    def _labels(self) -> List[Tuple[str, float, float]]:
+        """Body and protection names with their KP and depth."""
         r = self._result
-        bodies = r.bodies if (r is not None and self.labels_check.isChecked()) else []
+        if r is None or not self.labels_check.isChecked():
+            return []
+        st = r.stations
+        out = []
+        for b in r.bodies:
+            i = int(np.clip(np.searchsorted(st.kp_km, b.kp_km), 0, st.n - 1))
+            out.append((b.body.name, b.kp_km, float(-r.cable_m[i])))
+        index = st.protection_index
+        for j, item in enumerate(st.protection):
+            idx = np.nonzero(index == j)[0] if index is not None else []
+            if len(idx):
+                i = int(idx[len(idx) // 2])
+                out.append((item.name, float(st.kp_km[i]), float(-r.cable_m[i])))
+        return out
+
+    def _update_body_labels(self, *_args) -> None:
+        bodies = self._labels()
         while len(self._body_labels) < len(bodies):
             label = pg.TextItem("", color=(40, 40, 40), anchor=(0.5, 1.3))
             font = label.textItem.font()
@@ -601,11 +639,9 @@ class ProfilePlot(QWidget):
             self._body_labels.append(label)
         for k, label in enumerate(self._body_labels):
             if k < len(bodies):
-                b = bodies[k]
-                st = r.stations
-                i = int(np.clip(np.searchsorted(st.kp_km, b.kp_km), 0, st.n - 1))
-                label.setText(b.body.name)
-                label.setPos(b.kp_km, float(-r.cable_m[i]))
+                text, kp, depth = bodies[k]
+                label.setText(text)
+                label.setPos(kp, depth)
                 label.setVisible(True)
             else:
                 label.setVisible(False)
@@ -735,29 +771,48 @@ class ProfilePlot(QWidget):
             return None
         return float(plot.vb.mapSceneToView(pos).x())
 
+    def eventFilter(self, watched, event):  # noqa: N802 (Qt API)
+        if event.type() == _LEAVE and watched in self.widgets.values():
+            self._end_hover()
+        return super().eventFilter(watched, event)
+
+    def _end_hover(self) -> None:
+        for line in self._vlines:
+            line.hide()
+        self.kpHovered.emit(math.nan)
+
     def _on_mouse_moved(self, key: str, pos) -> None:
         if self._result is None or self.measure.active:
             return
         kp = self._kp_at(key, pos)
         if kp is None:
-            for line in self._vlines:
-                line.hide()
+            self._end_hover()
             return
-        self.show_kp(kp)
-        self.kpHovered.emit(kp)
+        snapped = self.show_kp(kp)
+        if snapped is not None:
+            self.kpHovered.emit(snapped)     # the station the readout shows
 
-    def show_kp(self, kp: float) -> None:
+    def _station(self, kp: float) -> Optional[int]:
         r = self._result
         if r is None:
-            return
+            return None
         st = r.stations
         i = int(np.clip(np.searchsorted(st.kp_km, kp), 0, st.n - 1))
         if i > 0 and abs(st.kp_km[i - 1] - kp) < abs(st.kp_km[i] - kp):
             i -= 1
+        return i
+
+    def show_kp(self, kp: float) -> Optional[float]:
+        """Crosshair and readout at the station nearest ``kp``; returns that station's KP."""
+        i = self._station(kp)
+        if i is None:
+            return None
+        at = float(self._result.stations.kp_km[i])
         for line in self._vlines:
-            line.setPos(float(st.kp_km[i]))
+            line.setPos(at)
             line.show()
         self.readout.setText(self.describe(i))
+        return at
 
     def describe(self, i: int) -> str:
         r = self._result
@@ -772,7 +827,7 @@ class ProfilePlot(QWidget):
             k, s = span
             level = "red" if pl._span_red(s, r.criteria) else "amber"
             parts.append(f"span {k + 1} ({level}): {s.length_m:.1f} m long, up to {s.max_gap_m:.2f} m high")
-        elif gap > SPAN_END_TOL_M:
+        elif gap > pl.span_end_tol(r.criteria):
             parts.append("clear of the seabed, under the reporting limits")
         if math.isfinite(r.laid_pct[i]):
             parts.append(f"slack laid {r.laid_pct[i]:.2f}%, fill {r.fill_pct[i]:.2f}%, surplus {r.excess_pct[i]:.2f}%")
@@ -781,6 +836,10 @@ class ProfilePlot(QWidget):
         label = ""
         if st.body_index[i] >= 0:
             label = next((b.body.name for b in st.bodies if b.i0 <= i <= b.i1), "body")
+        index = st.protection_index
+        if index is not None and index[i] >= 0:
+            item = st.protection[int(index[i])]
+            label = (label or cable.name) + f" in {item.name} ({item.kind})"
         parts.append(label or cable.name)
         if st.soil[i]:
             parts.append(st.soil[i])
@@ -792,6 +851,8 @@ class ProfilePlot(QWidget):
         kp = self._kp_at(key, event.scenePos())
         if kp is None:
             return
+        i = self._station(kp)
+        kp = float(self._result.stations.kp_km[i]) if i is not None else kp
         if event.double():
             self.kpDoubleClicked.emit(kp)
         else:

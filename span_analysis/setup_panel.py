@@ -16,8 +16,11 @@ as JSON-ready data (stored per scenario).
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -58,7 +61,7 @@ from ..qgis_compat import (
     SELECTION_BEHAVIOR_SELECT_ROWS,
     layer_filters,
 )
-from . import sources
+from . import dxf_io, sources
 
 _HORIZONTAL = getattr(getattr(Qt, "Orientation", Qt), "Horizontal")
 _OPEN, _CLOSED = "▾", "▸"
@@ -91,14 +94,27 @@ class Col:
     tip: str = ""
 
 
+def bar_button(text: str, tip: str, slot) -> QToolButton:
+    """A compact text button for a row of table actions."""
+    button = QToolButton()
+    button.setText(text)
+    button.setToolButtonStyle(getattr(getattr(Qt, "ToolButtonStyle", Qt), "ToolButtonTextOnly"))
+    if tip:
+        button.setToolTip(tip)
+    button.clicked.connect(lambda *_: slot())
+    return button
+
+
 class EditTable(QWidget):
     """A small editable table with Add / Remove; rows are dicts keyed by column."""
 
     changed = pyqtSignal()
 
-    def __init__(self, cols: Sequence[Col], add_text: str = "Add", parent=None, height: int = 120):
+    def __init__(self, cols: Sequence[Col], add_text: str = "Add", parent=None, height: int = 120,
+                 io: bool = True, title: str = "table"):
         super().__init__(parent)
         self.cols = list(cols)
+        self.title = title
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.table = QTableWidget(0, len(self.cols))
@@ -113,15 +129,100 @@ class EditTable(QWidget):
         self.table.setMaximumHeight(height + 90)
         self.table.itemChanged.connect(lambda *_: self.changed.emit())
         layout.addWidget(self.table)
-        bar = QHBoxLayout()
-        self.add_button = QPushButton(add_text)
-        self.add_button.clicked.connect(lambda: self.add_row())
-        remove = QPushButton("Remove")
-        remove.clicked.connect(self.remove_selected)
-        bar.addWidget(self.add_button)
-        bar.addWidget(remove)
-        bar.addStretch(1)
-        layout.addLayout(bar)
+        # Tool buttons, not push buttons: the Windows style gives a push button
+        # at least 75 px, and five of them make the setup pane scroll sideways.
+        self.bar = QHBoxLayout()
+        self.bar.setSpacing(4)
+        self.add_button = bar_button(add_text, "", lambda: self.add_row())
+        self.bar.addWidget(self.add_button)
+        self.bar.addWidget(bar_button("Remove", "Remove the selected rows.", self.remove_selected))
+        if io:
+            for text, tip, slot in (
+                    ("Paste", "Add rows copied from a spreadsheet (tab separated, same column order, header "
+                              "optional).", self.paste),
+                    ("Import…", "Add rows from a CSV file (a header row of the column names, or the same order).",
+                     self.import_csv),
+                    ("Export…", "Save the rows to a CSV file.", self.export_csv)):
+                self.bar.addWidget(bar_button(text, tip, slot))
+        self.bar.addStretch(1)
+        layout.addLayout(self.bar)
+
+    # -- import / export / paste ------------------------------------------------------
+    def _value(self, col: "Col", text: str):
+        text = str(text or "").strip()
+        if col.kind == "float":
+            try:
+                return float(text.replace(",", ".")) if text else None
+            except ValueError:
+                return None
+        if col.kind == "choice":
+            low = text.lower()
+            for data, label in col.choices:
+                if str(data).lower() == low or str(label).lower() == low:
+                    return data
+        return text
+
+    def rows_from_records(self, records: Sequence[Sequence[str]]) -> List[Dict]:
+        """Rows from text records: a header of column keys or labels maps the columns, else their order."""
+        records = [list(r) for r in records if any(str(c).strip() for c in r)]
+        if not records:
+            return []
+        names = {_norm(c.key): i for i, c in enumerate(self.cols)}
+        names.update({_norm(c.label): i for i, c in enumerate(self.cols)})
+        first = [_norm(cell) for cell in records[0]]
+        matched = [names.get(cell) for cell in first]
+        if sum(m is not None for m in matched) >= max(1, len(first) // 2):
+            order, body = matched, records[1:]
+        else:
+            order, body = list(range(len(self.cols))), records
+        out = []
+        for record in body:
+            row = {}
+            for position, cell in enumerate(record):
+                index = order[position] if position < len(order) else None
+                if index is not None and index < len(self.cols):
+                    col = self.cols[index]
+                    row[col.key] = self._value(col, cell)
+            if row:
+                out.append(row)
+        return out
+
+    def add_rows(self, rows: Sequence[Dict]) -> None:
+        for row in rows:
+            self.add_row(row)
+
+    def paste(self) -> None:
+        from qgis.PyQt.QtWidgets import QApplication
+
+        text = QApplication.clipboard().text()
+        if "\t" in text:
+            records = [line.split("\t") for line in text.splitlines()]
+        else:
+            records = list(csv.reader(io.StringIO(text)))
+        self.add_rows(self.rows_from_records(records))
+
+    def import_csv(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, f"Import {self.title}", "", "CSV files (*.csv *.txt);;All files (*)")
+        if not path:
+            return
+        with open(path, newline="", encoding="utf-8-sig") as handle:
+            sample = handle.read(4096)
+            handle.seek(0)
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+            except csv.Error:
+                dialect = csv.excel
+            self.add_rows(self.rows_from_records(list(csv.reader(handle, dialect))))
+
+    def export_csv(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, f"Export {self.title}", "", "CSV files (*.csv)")
+        if not path:
+            return
+        with open(path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow([c.key for c in self.cols])
+            for row in self.rows():
+                writer.writerow(["" if row.get(c.key) is None else row.get(c.key) for c in self.cols])
 
     def _combo(self, col: Col, value) -> QComboBox:
         combo = QComboBox()
@@ -235,6 +336,10 @@ class Section(QWidget):
         self.status.setStyleSheet("color: #555;" if ok else "color: #d32f2f;")
 
 
+def _norm(text) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+
+
 def _spin(lo: float, hi: float, value: float, decimals: int = 2, step: float = 0.1, suffix: str = "",
           tip: str = "") -> QDoubleSpinBox:
     spin = QDoubleSpinBox()
@@ -263,6 +368,7 @@ class SetupPanel(QWidget):
     changed = pyqtSignal()           # any setting
     controlChanged = pyqtSignal()    # lay control only (live update)
     libraryRequested = pyqtSignal()
+    tensionFinderRequested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -333,6 +439,49 @@ class SetupPanel(QWidget):
         csv_layout.addWidget(self.csv_path, 1)
         csv_layout.addWidget(browse)
         form.addRow("CSV file", self.csv_row)
+        self.dxf_box = QWidget()
+        dxf_form = QFormLayout(self.dxf_box)
+        dxf_form.setContentsMargins(0, 0, 0, 0)
+        dxf_row = QWidget()
+        dxf_row_layout = QHBoxLayout(dxf_row)
+        dxf_row_layout.setContentsMargins(0, 0, 0, 0)
+        self.dxf_path = QLineEdit()
+        self.dxf_path.setPlaceholderText("A profile drawing: X along the route, Y elevation or depth")
+        dxf_browse = QToolButton()
+        dxf_browse.setText("…")
+        dxf_browse.clicked.connect(self._browse_dxf)
+        dxf_row_layout.addWidget(self.dxf_path, 1)
+        dxf_row_layout.addWidget(dxf_browse)
+        dxf_form.addRow("DXF file", dxf_row)
+        self.dxf_layer = QComboBox()
+        self.dxf_layer.setToolTip("The layer holding the seabed line (all its lines and polylines are joined).")
+        dxf_form.addRow("Layer", self.dxf_layer)
+        self.dxf_x = QComboBox()
+        for key, label in dxf_io.X_CHOICES:
+            self.dxf_x.addItem(label, key)
+        dxf_form.addRow("X axis", self.dxf_x)
+        self.dxf_start_kp = _spin(-100000.0, 100000.0, 0.0, 3, 0.1, " km", "KP at the profile's first point.")
+        dxf_form.addRow("Start KP", self.dxf_start_kp)
+        self.dxf_y = QComboBox()
+        for key, label in dxf_io.Y_CHOICES:
+            self.dxf_y.addItem(label, key)
+        dxf_form.addRow("Y axis", self.dxf_y)
+        self.dxf_ve = _spin(0.01, 1000.0, 1.0, 2, 1.0, "", "Vertical exaggeration of the drawing (removed).")
+        dxf_form.addRow("Vertical exaggeration", self.dxf_ve)
+        self.dxf_offset = _spin(-20000.0, 20000.0, 0.0, 2, 1.0, " m",
+                                "Added to the elevation (or depth) after the exaggeration is removed: the drawing's "
+                                "datum offset.")
+        dxf_form.addRow("Datum offset", self.dxf_offset)
+        self.dxf_message = QLabel("")
+        self.dxf_message.setWordWrap(True)
+        self.dxf_message.setStyleSheet("color: #d32f2f;")
+        dxf_form.addRow(self.dxf_message)
+        form.addRow(self.dxf_box)
+        self.dxf_path.editingFinished.connect(self._load_dxf_layers)
+        for widget in (self.dxf_layer, self.dxf_x, self.dxf_y):
+            widget.currentIndexChanged.connect(self._emit_changed)
+        for widget in (self.dxf_start_kp, self.dxf_ve, self.dxf_offset):
+            widget.valueChanged.connect(self._emit_changed)
         self.syn = {
             "length_m": _spin(10.0, 500000.0, 1000.0, 0, 100.0, " m"),
             "spacing_m": _spin(0.02, 50.0, 0.5, 2, 0.1, " m"),
@@ -379,6 +528,25 @@ class SetupPanel(QWidget):
         for edit in (self.csv_path, self.kp_from, self.kp_to):
             edit.textChanged.connect(self._emit_changed)
         return body
+
+    def _browse_dxf(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Seabed profile (DXF)", self.dxf_path.text(), "DXF (*.dxf)")
+        if path:
+            self.dxf_path.setText(path)
+            self._load_dxf_layers()
+
+    def _load_dxf_layers(self, current: str = "") -> None:
+        from .dxf_dialogs import fill_layers
+
+        self.dxf_layer.blockSignals(True)
+        self.dxf_message.setText(fill_layers(self.dxf_path.text().strip(), self.dxf_layer, current))
+        self.dxf_layer.blockSignals(False)
+        self._emit_changed()
+
+    def dxf_options(self):
+        return dxf_io.ProfileDxfOptions(self.dxf_layer.currentData() or "", self.dxf_x.currentData(),
+                                        self.dxf_start_kp.value(), self.dxf_y.currentData(), self.dxf_ve.value(),
+                                        self.dxf_offset.value())
 
     def _browse_csv(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Seabed profile (CSV)", self.csv_path.text(),
@@ -433,6 +601,9 @@ class SetupPanel(QWidget):
         self.smoothing.textChanged.connect(self._emit_changed)
         form.addRow("Smoothing for lengths", self.smoothing)
         kinds = [(k, FEATURE_LABELS[k]) for k in FEATURE_KINDS]
+        features_body = QWidget()
+        features_layout = QVBoxLayout(features_body)
+        features_layout.setContentsMargins(14, 0, 0, 0)
         self.features = EditTable([
             Col("kind", "Feature", "choice", "boulder", kinds),
             Col("kp", "KP", "float", None, tip="Centre KP (km)."),
@@ -444,13 +615,50 @@ class SetupPanel(QWidget):
                     "Depression: width at the seabed."),
             Col("crest", "Crest / bottom (m)", "float", 0.0,
                 tip="Berm / mattress: length of the flat top. Depression: width of the flat bottom."),
+            Col("shape", "Custom shape (m)", "text", "",
+                tip="Other (custom shape): points 'offset height' from the KP along the route, separated by ';', "
+                    "e.g. '-10 0; -5.5 1.5; -2 1.8; 2 1.8; 5.5 1.5; 10 0' for a rock berm. Straight lines between "
+                    "points; negative heights cut into the seabed. Height and length are not used."),
             Col("name", "Name", "text", ""),
-        ], "Add feature", height=90)
+        ], "Add feature", height=90, title="seabed features")
         self.features.changed.connect(self._emit_changed)
-        form.addRow(QLabel("Seabed features (added to the profile)"))
-        form.addRow(self.features)
+        note = QLabel("Features sit on the seabed at their KP. Several features combine (the highest point, or "
+                      "the lowest for depressions). For a complex shape such as a rock berm, choose Other and give "
+                      "its points, paste them from a spreadsheet, or take them from a DXF cross-section.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #555;")
+        features_layout.addWidget(note)
+        features_layout.addWidget(self.features)
+        dxf_shape = bar_button("Shape from DXF…", "Set the selected feature (or a new one) to a cross-section "
+                                                  "drawn in a DXF file.", self._shape_from_dxf)
+        shape_row = QHBoxLayout()
+        shape_row.addWidget(dxf_shape)
+        shape_row.addStretch(1)
+        features_layout.addLayout(shape_row)
+        self.features_section = Section("Additional features", features_body, False)
+        form.addRow(self.features_section)
         self.seabed_source.currentIndexChanged.connect(self._on_route_changed)
         return body
+
+    def _shape_from_dxf(self) -> None:
+        from .dxf_dialogs import DxfShapeDialog
+        from ..cable_seabed.features import format_shape
+        from ..qgis_compat import DIALOG_ACCEPTED, qt_exec
+
+        dialog = DxfShapeDialog(self)
+        if qt_exec(dialog) != DIALOG_ACCEPTED or not dialog.points:
+            return
+        table = self.features.table
+        rows = sorted({index.row() for index in table.selectedIndexes()})
+        if not rows:
+            self.features.add_row({"kind": "custom", "name": "DXF shape"})
+            rows = [table.rowCount() - 1]
+        row = rows[0]
+        combo = table.cellWidget(row, 0)
+        if combo is not None:
+            combo.setCurrentIndex(max(combo.findData("custom"), 0))
+        shape_col = next(i for i, c in enumerate(self.features.cols) if c.key == "shape")
+        table.setItem(row, shape_col, QTableWidgetItem(format_shape(dialog.points)))
 
     # -- cable --------------------------------------------------------------------------
     def _build_cable(self) -> QWidget:
@@ -477,7 +685,7 @@ class SetupPanel(QWidget):
         self.cable_sections = EditTable([
             Col("kp0", "KP from", "float"), Col("kp1", "KP to", "float"),
             Col("type", "Cable type", "choice", "", ()),
-        ], "Add section", height=80)
+        ], "Add section", height=80, title="cable sections")
         self.cable_sections.changed.connect(self._emit_changed)
         form.addRow(self.cable_sections)
         self.fit_combo = QComboBox()
@@ -531,10 +739,37 @@ class SetupPanel(QWidget):
             Col("weight", "Weight in water (kN)", "float", 3.0),
             Col("diameter", "Diameter (mm)", "float", 300.0, tip="Housing diameter: the cable either side is held "
                                                                  "off the seabed by half the difference."),
-        ], "Add body", height=80)
+        ], "Add body", height=80, title="bodies")
         self.bodies.changed.connect(self._emit_changed)
         form.addRow(QLabel("In-line bodies (in addition)"))
         form.addRow(self.bodies)
+        protection_body = QWidget()
+        protection_layout = QVBoxLayout(protection_body)
+        protection_layout.setContentsMargins(14, 0, 0, 0)
+        note = QLabel("Protection over a KP range (e.g. polymer half-shells or articulated pipe) adds its weight in "
+                      "water to the cable's, can add bending stiffness, and sets its own minimum bend radius where "
+                      "that is larger. Take the values from the protection's data sheet.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #555;")
+        protection_layout.addWidget(note)
+        self.protection = EditTable([
+            Col("name", "Name", "text", "Protection"),
+            Col("kind", "Kind", "text", "Shells", tip="Friction table key (e.g. Shells, Articulated pipe). With no "
+                                                      "row for it there, the cable's friction applies."),
+            Col("kp0", "KP from", "float"),
+            Col("kp1", "KP to", "float"),
+            Col("weight", "Added weight in water (kg/m)", "float", None),
+            Col("diameter", "Outside diameter (mm)", "float", None,
+                tip="Over the protection. Shown on the plot; a body's housing standoff is taken from it."),
+            Col("ei", "Added EI (kN·m²)", "float", None,
+                tip="Blank: no added stiffness (e.g. shells that turn on each other)."),
+            Col("mbr", "MBR (m)", "float", None,
+                tip="The protection's own minimum bend (locking) radius. Blank: the cable's."),
+        ], "Add protection", height=70, title="protection")
+        self.protection.changed.connect(self._emit_changed)
+        protection_layout.addWidget(self.protection)
+        self.protection_section = Section("Protection", protection_body, False)
+        form.addRow(self.protection_section)
         return body
 
     # -- friction ------------------------------------------------------------------------
@@ -557,13 +792,13 @@ class SetupPanel(QWidget):
         self.use_zones.toggled.connect(self._emit_changed)
         form.addRow(self.use_zones)
         self.zones = EditTable([Col("kp0", "KP from", "float"), Col("kp1", "KP to", "float"),
-                                Col("soil", "Soil", "text", "Sand")], "Add zone", height=70)
+                                Col("soil", "Soil", "text", "Sand")], "Add zone", height=70, title="soil zones")
         self.friction_table = EditTable([
-            Col("item", "Cable type / body kind", "text", "*", tip="A library cable type name or a body kind; * "
-                                                                   "for any."),
+            Col("item", "Cable type / body kind", "text", "*", tip="A library cable type name, a body kind or a "
+                                                                   "protection kind; * for any."),
             Col("soil", "Soil", "text", "Sand", tip="A soil name used in the zones; * for any."),
             Col("mu", "Axial μ", "float", 0.5), Col("mu_lat", "Lateral μ", "float", None),
-        ], "Add row", height=70)
+        ], "Add row", height=70, title="friction table")
         for table in (self.zones, self.friction_table):
             table.changed.connect(self._emit_changed)
         self.zones_label = QLabel("Soil zones by KP (the rest uses the values above)")
@@ -612,10 +847,14 @@ class SetupPanel(QWidget):
         modes = [(k, pl.MODE_LABELS[k]) for k in pl.MODES]
         self.control_sections = EditTable([Col("kp0", "KP from", "float"), Col("kp1", "KP to", "float"),
                                            Col("mode", "Control", "choice", pl.TENSION, modes),
-                                           Col("value", "Value", "float", 5.0)], "Add section", height=80)
+                                           Col("value", "Value", "float", 5.0)], "Add section", height=80, title="lay control sections")
         self.control_sections.changed.connect(self._emit_control)
         form.addRow(QLabel("By KP section (overrides the value above)"))
         form.addRow(self.control_sections)
+        finder = bar_button("Find the highest tension within limits…",
+                            "Search the bottom tension that keeps the spans within a target (Find tension tab).",
+                            self.tensionFinderRequested.emit)
+        form.addRow(finder)
         self._on_mode()
         return body
 
@@ -650,8 +889,10 @@ class SetupPanel(QWidget):
         self.crit = {
             "min_gap_m": _spin(0.0, 50.0, c.min_gap_m, 2, 0.05, " m"),
             "min_length_m": _spin(0.0, 1000.0, c.min_length_m, 1, 1.0, " m"),
+            "touchdown_gap_m": _spin(0.0, 1.0, c.touchdown_gap_m, 3, 0.01, " m"),
             "red_gap_m": _spin(0.0, 50.0, c.red_gap_m, 2, 0.1, " m"),
             "red_length_m": _spin(0.0, 5000.0, c.red_length_m, 1, 5.0, " m"),
+            "max_reaction_kn": _spin(0.0, 10000.0, c.max_reaction_kn, 2, 0.5, " kN"),
             "conform_below_kn": _spin(0.0, 10.0, c.conform_below_kn, 3, 0.01, " kN"),
             "loop_excess_pct": _spin(0.0, 100.0, c.loop_excess_pct, 1, 0.5, " %"),
             "loop_tension_kn": _spin(0.0, 10.0, c.loop_tension_kn, 2, 0.05, " kN"),
@@ -664,8 +905,19 @@ class SetupPanel(QWidget):
             "min_gap_m": ("Report spans higher than", "A span is reported when the cable rises this far above the "
                                                       "seabed. Its length runs from lift-off to touchdown."),
             "min_length_m": ("…and longer than", ""),
+            "touchdown_gap_m": ("Span ends where the gap is under",
+                                "Where a span starts and ends. 0: the model's exact lift-off and touchdown (the span "
+                                "length of pipeline practice, DNV-RP-F105). A larger value counts the cable as "
+                                "touching where it is within this gap of the seabed: shorter spans, e.g. to compare "
+                                "with a survey's gap detection limit. Near a touchdown the gap grows as w d² / 2T, so "
+                                "each end moves in by about √(2 gap T / w)."),
             "red_gap_m": ("Red when higher than", ""),
             "red_length_m": ("…or longer than", "Spans are also red where the bend at a support is below the MBR."),
+            "max_reaction_kn": ("Contact limit at a support",
+                                "Flag supports where the seabed pushes on the cable harder than this (and make their "
+                                "spans red). The reaction is a point load from the 2D model on a rigid seabed: compare "
+                                "it with the crush rating of the cable (or its protection) over the bearing length "
+                                "the data sheet uses (often per 100 mm). Detail (EI) gives a closer value. 0: off."),
             "conform_below_kn": ("Cable follows the seabed below", "Below this tension the cable lies on and "
                                                                    "follows the seabed."),
             "loop_excess_pct": ("Loop risk: surplus above", "Cable laid beyond what the seabed needs, over the "
@@ -678,6 +930,8 @@ class SetupPanel(QWidget):
             "max_slope_deg": ("Small-slope note above", "The rest shape uses a small-slope model (with a slope "
                                                         "correction); a note marks steeper seabed."),
         }
+        self.crit["touchdown_gap_m"].setSpecialValueText("exact (0 m)")
+        self.crit["max_reaction_kn"].setSpecialValueText("off")
         for key, spin in self.crit.items():
             label, tip = labels[key]
             if tip:
@@ -686,7 +940,8 @@ class SetupPanel(QWidget):
             form.addRow(label, spin)
         self.allowable = QCheckBox("Find the highest tension that keeps spans within limits")
         self.allowable.setChecked(True)
-        self.allowable.setToolTip("Bisection on a constant tension in 250 m windows (frictionless seabed).")
+        self.allowable.setToolTip("Bisection on a constant tension in windows of 1/40 of the route, 25 to 250 m "
+                                  "(frictionless seabed).")
         self.allowable.toggled.connect(self._emit_changed)
         form.addRow(self.allowable)
         return body
@@ -872,6 +1127,7 @@ class SetupPanel(QWidget):
             (self.line_row, route == sources.ROUTE_LINE),
             (self.line_start_kp, route == sources.ROUTE_LINE),
             (self.csv_row, route == sources.ROUTE_CSV),
+            (self.dxf_box, route == sources.ROUTE_DXF),
             (self.syn_box, route == sources.ROUTE_SYNTHETIC),
             (self.window_row, on_map),
             (self.seabed_source, on_map),
@@ -907,6 +1163,10 @@ class SetupPanel(QWidget):
         elif route == sources.ROUTE_CSV:
             ok = bool(self.csv_path.text().strip())
             self.route_section.set_status(self.csv_path.text().strip() if ok else "Needs a CSV file", ok)
+        elif route == sources.ROUTE_DXF:
+            ok = bool(self.dxf_path.text().strip()) and bool(self.dxf_layer.currentData())
+            self.route_section.set_status(f"DXF layer {self.dxf_layer.currentData()}" if ok
+                                          else "Needs a DXF file and layer", ok)
         else:
             self.route_section.set_status(f"Synthetic, {self.syn['length_m'].value():.0f} m", True)
         if route in (sources.ROUTE_RPL, sources.ROUTE_LINE):
@@ -920,8 +1180,11 @@ class SetupPanel(QWidget):
             else:
                 self.seabed_section.set_status("RPL approximate depth (coarse: no relief)", True)
         else:
-            self.seabed_section.set_status("From the profile" + (f", {len(self.features.rows())} feature(s)"
-                                                                 if self.features.rows() else ""), True)
+            self.seabed_section.set_status("From the profile", True)
+        count = len(self.features.rows())
+        self.features_section.set_status(f"{count} feature(s)" if count else "none", True)
+        if count and route in (sources.ROUTE_RPL, sources.ROUTE_LINE):
+            self.seabed_section.status.setText(self.seabed_section.status.text() + f", {count} feature(s)")
         cable = self.cable_source.currentData()
         if cable == CABLE_MANUAL:
             w = self.manual["w_kg_m"].value()
@@ -946,6 +1209,10 @@ class SetupPanel(QWidget):
         bodies = len(self.bodies.rows())
         if bodies:
             self.cable_section.status.setText(self.cable_section.status.text() + f", {bodies} body(ies)")
+        protected = len(self.protection.rows())
+        self.protection_section.set_status(f"{protected} range(s)" if protected else "none", True)
+        if protected:
+            self.cable_section.status.setText(self.cable_section.status.text() + f", {protected} protected range(s)")
         self.friction_section.set_status(f"μ {self.mu.value():.2f}" + (", soil zones" if self.use_zones.isChecked()
                                                                         else ""), True)
         mode = self.mode.currentData()
@@ -1029,14 +1296,27 @@ class SetupPanel(QWidget):
         return model
 
     def features_list(self):
-        from ..cable_seabed.features import SeabedFeature
+        """The seabed features (raises ValueError on a custom shape that does not read)."""
+        from ..cable_seabed.features import CUSTOM, SeabedFeature, parse_shape
 
         out = []
-        for row in self.features.rows():
-            if row.get("kp") is None or row.get("height") is None or row.get("length") is None:
+        for number, row in enumerate(self.features.rows(), start=1):
+            kind = row.get("kind") or "boulder"
+            if row.get("kp") is None:
                 continue
-            out.append(SeabedFeature(row.get("kind") or "boulder", row["kp"], row["height"], row["length"],
-                                     row.get("crest") or 0.0, row.get("name") or ""))
+            if kind == CUSTOM:
+                try:
+                    points = parse_shape(row.get("shape") or "")
+                except ValueError as exc:
+                    raise ValueError(f"Additional feature {number}: {exc}") from exc
+                if len(points) < 2:
+                    raise ValueError(f"Additional feature {number} (custom) needs at least two shape points.")
+                out.append(SeabedFeature(kind, row["kp"], 0.0, 0.0, 0.0, row.get("name") or "", points))
+                continue
+            if row.get("height") is None or row.get("length") is None:
+                continue
+            out.append(SeabedFeature(kind, row["kp"], row["height"], row["length"], row.get("crest") or 0.0,
+                                     row.get("name") or ""))
         return out
 
     def manual_bodies(self) -> List[pl.Body]:
@@ -1049,6 +1329,31 @@ class SetupPanel(QWidget):
                                row.get("weight") or 0.0, diameter / 1000.0 if diameter else math.nan,
                                row.get("kind") or "Body"))
         return out
+
+    def protection_list(self) -> List[pl.Protection]:
+        out = []
+        for row in self.protection.rows():
+            if row.get("kp0") is None or row.get("kp1") is None:
+                continue
+
+            def opt(key, scale=1.0, row=row):
+                value = row.get(key)
+                return float(value) * scale if value is not None and value > 0 else math.nan
+
+            out.append(pl.Protection(row.get("name") or "Protection", row["kp0"], row["kp1"],
+                                     weight_npm=float(row.get("weight") or 0.0) * 9.80665,
+                                     diameter_m=opt("diameter", 0.001), ei_knm2=opt("ei"), mbr_m=opt("mbr"),
+                                     kind=row.get("kind") or "Protection"))
+        return out
+
+    def apply_tension(self, value_kn: float, sections: Sequence[Tuple[float, float, float]] = ()) -> None:
+        """Lay at a bottom tension (from the tension finder); ``sections`` as (KP from, KP to, kN)."""
+        _set_combo(self.mode, pl.TENSION)
+        self.value.setValue(float(value_kn))
+        if sections:
+            self.control_sections.set_rows([{"kp0": a, "kp1": b, "mode": pl.TENSION, "value": v}
+                                            for a, b, v in sections])
+        self.update_status()
 
     def cable_sections_list(self) -> List[pl.CableSection]:
         out = []
@@ -1082,6 +1387,10 @@ class SetupPanel(QWidget):
                 "line_selected": self.line_selected.isChecked(),
                 "start_kp": self.line_start_kp.value(),
                 "csv_path": self.csv_path.text().strip(),
+                "dxf": {"path": self.dxf_path.text().strip(), "layer": self.dxf_layer.currentData(),
+                        "x_mode": self.dxf_x.currentData(), "start_kp": self.dxf_start_kp.value(),
+                        "y_mode": self.dxf_y.currentData(), "ve": self.dxf_ve.value(),
+                        "offset": self.dxf_offset.value()},
                 "synthetic": {**{k: w.value() for k, w in self.syn.items()}, "seed": self.syn_seed.value()},
                 "kp_from": self.kp_from.text().strip(),
                 "kp_to": self.kp_to.text().strip(),
@@ -1104,6 +1413,7 @@ class SetupPanel(QWidget):
                 "bodies_from_fit": self.bodies_from_fit.isChecked(),
                 "manual": {k: w.value() for k, w in self.manual.items()},
                 "bodies": self.bodies.rows(),
+                "protection": self.protection.rows(),
             },
             "friction": {
                 "mu": self.mu.value(), "mu_lat": self.mu_lat.value(), "zones_on": self.use_zones.isChecked(),
@@ -1132,6 +1442,17 @@ class SetupPanel(QWidget):
             self.line_selected.setChecked(bool(route.get("line_selected")))
             self.line_start_kp.setValue(float(route.get("start_kp") or 0.0))
             self.csv_path.setText(route.get("csv_path") or "")
+            dxf = route.get("dxf") or {}
+            self.dxf_path.setText(dxf.get("path") or "")
+            _set_combo(self.dxf_x, dxf.get("x_mode"))
+            _set_combo(self.dxf_y, dxf.get("y_mode"))
+            self.dxf_start_kp.setValue(float(dxf.get("start_kp") or 0.0))
+            self.dxf_ve.setValue(float(dxf.get("ve") or 1.0))
+            self.dxf_offset.setValue(float(dxf.get("offset") or 0.0))
+            if dxf.get("path"):
+                from .dxf_dialogs import fill_layers
+
+                self.dxf_message.setText(fill_layers(dxf["path"], self.dxf_layer, dxf.get("layer") or ""))
             syn = route.get("synthetic") or {}
             for key, widget in self.syn.items():
                 if key in syn:
@@ -1161,6 +1482,7 @@ class SetupPanel(QWidget):
                 if key in (cable.get("manual") or {}):
                     widget.setValue(float(cable["manual"][key]))
             self.bodies.set_rows(cable.get("bodies") or [])
+            self.protection.set_rows(cable.get("protection") or [])
             friction = s.get("friction", {})
             self.mu.setValue(float(friction.get("mu", pl.DEFAULT_MU)))
             self.mu_lat.setValue(float(friction.get("mu_lat", pl.DEFAULT_MU)))
@@ -1197,6 +1519,16 @@ class SetupPanel(QWidget):
         lines.append(route)
         lines.append(f"Seabed: {self.seabed_section.status.text()}; noise filter {self.filter_m.value():g} m")
         lines.append(f"Cable: {self.cable_section.status.text()}")
+        for item in self.protection_list():
+            parts = [f"+{item.weight_npm / 9.80665:g} kg/m in water"]
+            if math_ok(item.diameter_m):
+                parts.append(f"OD {item.diameter_m * 1000:g} mm")
+            if math_ok(item.ei_knm2):
+                parts.append(f"+EI {item.ei_knm2:g} kN·m²")
+            if math_ok(item.mbr_m):
+                parts.append(f"MBR {item.mbr_m:g} m")
+            lines.append(f"Protection {item.name} ({item.kind}), KP {item.kp_start:.3f} to {item.kp_end:.3f}: "
+                         + ", ".join(parts))
         lines.append(f"Friction: {self.friction_section.status.text()}")
         lines.append(f"Lay control: {self.control_section.status.text()}, laid towards "
                      f"{self.direction.currentText().lower()}")
@@ -1226,3 +1558,7 @@ def _set_combo(combo: QComboBox, data) -> None:
     index = combo.findData(data)
     if index >= 0:
         combo.setCurrentIndex(index)
+
+
+def math_ok(value) -> bool:
+    return value is not None and math.isfinite(value)

@@ -391,6 +391,85 @@ def test_long_route_speed() -> bool:
                    f"{took:.1f} s, {result.iterations} iterations, {len(result.spans)} spans")
 
 
+DA = pl.CableType("DA", w_npm=60.0, ei_knm2=20.0, mbr_m=2.0, diameter_m=0.05, npts_kn=60.0)
+
+
+def _crossing(tension=10.0, step=0.1, **kwargs):
+    """A 0.5 m pipeline on a flat seabed, armoured cable (60 N/m): spans sqrt(2 h T / w) either side."""
+    prof = _flat(400.0, step)
+    criteria = kwargs.pop("criteria", pl.Criteria(allowable=False))
+    return pl.run(_inputs(prof, pl.LayControl(pl.TENSION, tension), features=[SeabedFeature(PIPE, 0.2, 0.5, 0.5)],
+                          cable=DA, criteria=criteria, **kwargs))
+
+
+def test_supports_at_span_ends() -> bool:
+    """Supports sit where each span meets the seabed: the crest, and the tangent touchdowns (no reaction)."""
+    result = _crossing()
+    ends = sorted({round(s.kp_start, 4) for s in result.spans} | {round(s.kp_end, 4) for s in result.spans})
+    kps = sorted(round(sp.kp, 4) for sp in result.supports)
+    crest = [sp for sp in result.supports if sp.crest]
+    touch = [sp for sp in result.supports if not sp.crest]
+    weight = 60.0 * sum(s.length_m for s in result.spans) / 1000.0       # the crest carries both half spans
+    ok = len(result.supports) == 3 and all(abs(a - b) < 0.0005 for a, b in zip(kps, ends))         and len(crest) == 1 and abs(crest[0].kp - 0.2) < 0.0005 and _close(crest[0].reaction_kn, weight, 0.03)         and all(sp.reaction_kn < 0.01 for sp in touch)
+    return _report("span supports at the span ends: the crest (weight of both spans) and two touchdowns", ok,
+                   f"supports {kps}, span ends {ends}, crest P {crest[0].reaction_kn if crest else 0:.3f} kN "
+                   f"vs {weight:.3f}")
+
+
+def test_touchdown_gap() -> bool:
+    """A touchdown gap g moves each tangent span end in by sqrt(2 g T / w)."""
+    exact = _crossing()
+    gap = 0.05
+    cut = _crossing(criteria=pl.Criteria(allowable=False, touchdown_gap_m=gap))
+    shift = math.sqrt(2.0 * gap * 10000.0 / 60.0)
+    ok = len(cut.spans) == 2 and all(_close(a.length_m - b.length_m, shift, 0.08)
+                                     for a, b in zip(exact.spans, cut.spans))
+    return _report("touchdown gap shortens each span by sqrt(2 g T / w) at its tangent end", ok,
+                   f"{[round(s.length_m, 2) for s in exact.spans]} -> {[round(s.length_m, 2) for s in cut.spans]}, "
+                   f"expected -{shift:.2f} m")
+
+
+def test_find_tension() -> bool:
+    """No span over 8 m (higher than 0.3 m) at a crossing: T = L^2 w / 2h = 3.84 kN; none removes every span."""
+    st = pl.prepare(_inputs(_flat(400.0, 0.1), cable=DA, features=[SeabedFeature(PIPE, 0.2, 0.5, 0.5)]))
+    control = pl.LayControl(pl.TENSION, 10.0)
+    answer = pl.find_tension(st, control, pl.Criteria(allowable=False), pl.TensionTarget(0.3, 8.0, mbr=False),
+                             [("all", 0.0, 0.4), ("clear", 0.0, 0.1)])
+    expect = 8.0 ** 2 * 60.0 / (2.0 * 0.5) / 1000.0
+    found = answer[0].tension_kn
+    check = []
+    for t_kn in (found, found * 1.04):
+        r = pl.solve(st, pl.LayControl(pl.TENSION, t_kn), pl.Criteria(allowable=False))
+        check.append(max(s.length_m for s in r.spans))
+    none = pl.find_tension(st, control, pl.Criteria(allowable=False), pl.TensionTarget(0.0, 0.0, mbr=False),
+                           [("all", 0.0, 0.4)])[0]
+    ok = _close(found, expect, 0.04) and check[0] <= 8.0 < check[1] and answer[1].tension_kn == 50.0         and not answer[1].limited and none.tension_kn == 0.0 and len(none.remaining) == 2
+    return _report("find tension: highest tension within a span limit; a crossing always spans", ok,
+                   f"{found:.2f} kN vs {expect:.2f} (ideal parabola), longest {check[0]:.2f} / {check[1]:.2f} m")
+
+
+def test_protection() -> bool:
+    """Protection doubling the weight shortens the spans by 1/sqrt(2); its MBR and friction key apply."""
+    plain = _crossing()
+    item = pl.Protection("Shells", 0.17, 0.23, weight_npm=60.0, diameter_m=0.2, mbr_m=60.0, kind="Shells")
+    friction = pl.FrictionModel(0.5, 0.5, table=[pl.FrictionEntry("Shells", "*", 0.9)])
+    result = _crossing(protection=[item], friction=friction)
+    st = result.stations
+    inside = int(np.argmin(np.abs(st.kp_km - 0.2)))
+    ratio = np.mean([s.length_m for s in result.spans]) / np.mean([s.length_m for s in plain.spans])
+    ok = _close(ratio, 1.0 / math.sqrt(2.0), 0.04) and all(s.below_mbr for s in result.spans)         and st.w_npm[inside] == 120.0 and st.mu[inside] == 0.9 and st.mu[0] == 0.5         and st.protection_index[inside] == 0 and st.protection_index[0] == -1
+    return _report("protection: added weight, its own MBR and friction key over its KP range", ok,
+                   f"span ratio {ratio:.3f} vs {1 / math.sqrt(2):.3f}")
+
+
+def test_contact_limit() -> bool:
+    result = _crossing(criteria=pl.Criteria(allowable=False, max_reaction_kn=1.0))
+    contact = [f for f in result.findings if f.check_id == "contact"]
+    ok = len(contact) == 1 and abs(contact[0].kp_start - 0.2) < 0.001 and result.summary.red_spans == 2
+    return _report("contact limit flags the crest reaction and makes its spans red", ok,
+                   f"{len(contact)} finding(s), {result.summary.red_spans} red span(s)")
+
+
 def run_all() -> List[bool]:
     results = [
         test_point_load_sag(),
@@ -414,6 +493,11 @@ def run_all() -> List[bool]:
         test_features_shape(),
         test_csv_profile(),
         test_long_route_speed(),
+        test_supports_at_span_ends(),
+        test_touchdown_gap(),
+        test_find_tension(),
+        test_protection(),
+        test_contact_limit(),
     ]
     print(f"\n{sum(results)}/{len(results)} cable-on-seabed engine checks passed.")
     return results

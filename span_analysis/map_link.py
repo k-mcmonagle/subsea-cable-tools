@@ -4,6 +4,7 @@ and a map tool that picks a KP by clicking near the route."""
 
 from __future__ import annotations
 
+import math
 from typing import Callable, Optional
 
 from qgis.gui import QgsMapTool
@@ -26,7 +27,7 @@ class MapLink:
         self.clear()
 
     def hover_kp(self, kp: Optional[float]) -> None:
-        if self.sync is None or self.route is None or kp is None:
+        if self.sync is None or self.route is None or kp is None or not math.isfinite(kp):
             if self.sync is not None:
                 self.sync.clear_hover()
             return

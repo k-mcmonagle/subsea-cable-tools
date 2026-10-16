@@ -11,21 +11,30 @@ For as-laid data, use the Lay Assessment in the Cable Lay Data Explorer. Both to
 
 <h3>Workflow</h3>
 <ol>
-<li><b>Route and KP.</b> Select a Cable Route Workbench RPL, a line layer (with its start KP), a CSV profile, or a
-synthetic seabed. Set a KP window to study part of a long route.</li>
+<li><b>Route and KP.</b> Select a Cable Route Workbench RPL, a line layer (with its start KP), a CSV profile, a
+DXF profile drawing, or a synthetic seabed. For a DXF, choose the layer that holds the seabed line, what X is
+(chainage from a start KP, or KP in km or m), whether Y is elevation or depth, and the drawing's vertical
+exaggeration. Set a KP window to study part of a long route.</li>
 <li><b>Seabed.</b> Tick the MBES rasters (or choose contours). <i>Sample every: auto</i> samples each grid at its
-cell size. The noise filter (default 2 m) removes sounding noise but keeps crests. Add seabed features
-(boulder, pipeline crossing, berm or mattress, depression) by KP if you need them.</li>
+cell size. The noise filter (default 2 m) removes sounding noise but keeps crests. Under <i>Additional
+features</i>, add a boulder, a pipeline crossing, a berm or mattress, a depression, or any other shape by KP. For
+a complex shape such as a rock berm, choose <i>Other (custom shape)</i> and give its points as "offset height"
+pairs from the KP along the route (e.g. <i>-10 0; -5.5 1.5; -2 1.8; 2 1.8; 5.5 1.5; 10 0</i>), or take them from a
+DXF cross-section with <i>Shape from DXF</i>. Every table has <i>Paste</i> (from a spreadsheet), <i>Import</i> and
+<i>Export</i> (CSV).</li>
 <li><b>Cable and bodies.</b> Use a cable type from the Cable Type Library, types by KP section, the RPL's cable
 type per leg, or a Workbench assembly fitted to the RPL (its cable sections and bodies land at KPs through the
 RPL slack). Workbench labels such as "SA" resolve through the library: a project mapping, then a library name,
 alias or generic type. Where several library types could mean a label, the mapping table in step 3 says so:
 choose the type there. The mapping is saved in the QGIS project and the Lay Assessment uses the same one. Add
-repeaters, joints and branching units by KP: weight in water, rigid length and diameter.</li>
+repeaters, joints and branching units by KP: weight in water, rigid length and diameter. Under <i>Protection</i>,
+add protection over a KP range (e.g. polymer half-shells or articulated pipe): its added weight in water, outside
+diameter, added EI and its own MBR, from the protection's data sheet.</li>
 <li><b>Friction.</b> One axial coefficient for the route, or soil zones by KP with a table of coefficients for each
 cable type (or body kind) and soil.</li>
 <li><b>Lay control.</b> Bottom tension (kN), bottom slack (% over the seabed), slack over the route (%, as in an
-RPL), or the RPL slack of each leg. Override the value by KP section. Set the lay direction.</li>
+RPL), or the RPL slack of each leg. Override the value by KP section. Set the lay direction. <i>Find the highest
+tension within limits</i> opens the Find tension tab.</li>
 <li><b>Run.</b> The first run samples the seabed (in the background). After that, a change to the lay control
 updates the results in about a second: move the slider and see the spans grow or shrink.</li>
 <li><b>Read the results.</b> The status bar shows the worst finding by KP. Spans are filled by level: red,
@@ -38,10 +47,14 @@ shows slopes and spans as they are; <i>Sea level</i> adds the water surface; <i>
 to left; <i>Body labels</i> names the bodies. <i>Measure</i> gives two-point lengths, heights and angles,
 snapped to the seabed or the cable, as in the Depth Profile tool.</li>
 <li><b>Look closer.</b> <i>Detail (EI)</i> solves a span or the visible window with bending stiffness: bend radius,
-moment and seabed reaction along the cable. <i>Tension sweep</i> lays the cable at a range of bottom tensions and
-plots the span length against tension.</li>
+moment and seabed reaction along the cable. <i>Find tension</i> finds the highest bottom tension that keeps the
+spans within a target (see below); <i>Use for the lay control</i> sets it. <i>Tension sweep</i> lays the cable at a
+range of bottom tensions and plots the span length against tension.</li>
 <li><b>Save.</b> Scenarios (all settings and the sampled seabed) save in the project's Span Analysis GeoPackage.
-<i>Add to map</i> writes the findings as a line layer. <i>Export</i> writes CSV files.</li>
+<i>Add to map</i> writes the findings as a line layer. <i>Export</i> writes CSV files, a PNG of the plot, or a DXF
+of the scene: the seabed, the cable, spans by level, supports, bodies, features, sea level, the KP axis and the
+tension, slack and slope graphs, each on its own layer (SA_SEABED, SA_CABLE, SA_SPAN_RED ...), in metres with
+X = KP x 1000 and Y = elevation x the vertical exaggeration you choose.</li>
 </ol>
 <p><b>Examples.</b> <i>Examples</i> loads a synthetic case and runs it. The first is a verification case: a flat
 seabed with a 40 m wide, 2 m deep depression and a light cable (10 N/m). The cable sags into the depression as a
@@ -83,14 +96,32 @@ seabed (seabed length over route length, Zajac 1957). <i>Surplus</i> = laid &min
 tension from slack is very sensitive. About 0.02% of cable length can change it by 20%, so use tension control to
 plan against spans and slack control to plan against loops.</p>
 <p><b>Spans and supports.</b> A span runs from lift-off to touchdown. It is reported when it rises more than the
-reporting gap and is longer than the reporting length (defaults 0.3 m and 5 m, red at 1 m or 50 m or below the
-MBR). At each support the seabed reaction is <i>P = T &Delta;&theta;</i>. Bending stiffness spreads the turn over the
-bending length &lambda; = &radic;(<i>EI / T</i>), so the bend radius is about <i>2&lambda; / &Delta;&theta;</i> and the
-moment <i>(&Delta;&theta; / 2) &radic;(EI T)</i>. More tension gives fewer spans but a tighter bend at rock edges.</p>
+reporting gap and is longer than the reporting length (defaults 0.3 m and 5 m, red at 1 m or 50 m, below the
+MBR, or above the contact limit when you set one). Near a touchdown on a flat seabed the gap grows only as
+<i>w d&sup2; / 2T</i>, so the cable looks to touch well before the exact touchdown. <i>Span ends where the gap is
+under</i> (Reporting limits, default 0: the exact touchdown) counts the cable as touching within that gap: each
+end moves in by about &radic;(2 <i>gap T / w</i>), e.g. to compare with a survey's gap detection limit.</p>
+<p>The triangles mark where each span meets the seabed. On a crest (a short contact with a span either side, such as
+a pipeline or a boulder) one support carries the turn of the cable and the weight of the cable either side: the
+seabed reaction is <i>P = T &Delta;&theta;</i>. Where a span lands tangentially on the seabed (a touchdown) there is
+no concentrated reaction. Bending stiffness spreads the turn over the bending length &lambda; =
+&radic;(<i>EI / T</i>), so the bend radius is about <i>2&lambda; / &Delta;&theta;</i> and the moment
+<i>(&Delta;&theta; / 2) &radic;(EI T)</i>. More tension gives fewer spans but a tighter bend at rock edges.</p>
+<p><b>Contact (crush) load.</b> Set <i>Contact limit at a support</i> to flag supports where the seabed reaction is
+higher. The reaction is a point load from a 2D model on a rigid seabed. Compare it with the crush rating of the
+cable (or its protection) over the bearing length its data sheet uses (often per 100 mm). <i>Detail (EI)</i> gives a
+closer value at a crossing.</p>
 <p><b>Highest tension for spans within limits.</b> Along the route, the tool finds by bisection the highest constant
-tension at which no span exceeds the reporting limits. With a uniform cable, a constant tension and no friction,
-spans only grow as tension rises (the monotonicity result of Binda &amp; Contro 1979), so this value is well
-defined.</p>
+tension at which no span exceeds the reporting limits (the dotted curve on the tension plot; frictionless, in
+windows). With a uniform cable, a constant tension and no friction, spans only grow as tension rises (the
+monotonicity result of Binda &amp; Contro 1979), so this value is well defined.</p>
+<p><b>Find tension.</b> The Find tension tab answers the reverse question for the whole profile, the visible part, or
+each lay control section: the highest bottom tension that meets a target (no reportable span, no red span, no span
+at all, or no span higher than <i>h</i> and longer than <i>L</i>; optionally with the bends within the MBR and the
+reactions within the contact limit). Each tension is solved in full (friction, slopes, bodies, protection). Spans
+shorten as the tension falls, so the answer is a ceiling: lay at or below it. Some spans remain at any tension: a
+cable always spans a pipeline it crosses. The table lists them. The floor of the tension window comes from the loop
+and slope checks, not from spans; to follow the seabed the cable needs at least the seabed fill as slack.</p>
 <p><b>Detail model (EI).</b> The selected window is solved as a tensioned beam on the seabed:
 <i>EI y'''' - T y'' = -w + p</i>, with the same contact conditions. This is a linear complementarity problem
 (Maier &amp; Andreuzzi 1978), solved by a primal-dual active set method with a banded solver, with projected
@@ -99,6 +130,13 @@ default. Use it where EI matters: power cables (EI 10 to 100 kN&middot;m&sup2; o
 crossings and boulders. For light telecom cable &lambda; is well under a metre and the route model is enough.</p>
 <p><b>Bodies.</b> A body adds its weight over its length. Its housing holds the cable either side off the seabed
 by half the difference in diameter. Its friction coefficient comes from the friction table (body kind).</p>
+<p><b>Protection.</b> Over its KP range, protection adds its weight in water to the cable's (a heavier cable spans
+less but bears harder on a crest: span length goes as &radic;(<i>T / w</i>)), adds its EI when given, and sets
+the MBR to the larger of the cable's and its own. Its kind is a friction table key; with no row for it, the cable's
+friction applies. It shows as a grey band along the cable.</p>
+<p><b>Cable diameter.</b> The line is the underside of the cable, so the gap is measured from the cable to the
+seabed. Diameter has little effect on spans for telecom cables (tens of mm). It sets a body's housing standoff
+and the outside of protection.</p>
 <p><b>Scale.</b> The route model works at the survey resolution, for tens to hundreds of km. A boulder or a pipeline
 crossing is metres long: the tool adds stations through each seabed feature, and the detail model resolves the
 bending length. Use a KP window for local studies.</p>
@@ -115,6 +153,9 @@ seabed smoothed over the cable's conformity length 2(EI/w)<sup>1/3</sup>.</li>
 <li>Where two rasters meet, a datum step reads as relief.</li>
 <li>The cable will not lie exactly on the RPL. In deep water it can be tens of metres off. A span on the RPL line is a
 likelihood, not a certainty.</li>
+<li>Between RPL positions the route follows the geodesic, the path KP is measured along. A projected (e.g. UTM) map
+draws long legs the same way; a map drawn in degrees draws them straight in degrees, which on a long leg is a
+different line (14 m apart mid-way along a 20 km leg at 57&deg;N).</li>
 </ul>
 
 <h3>Assumptions and limits</h3>

@@ -391,12 +391,12 @@ def test_add_inputs_picker_and_model_batch() -> bool:
     dialog.stage_layers([lines, polys])
     ok = ok and dialog.ok_button.isEnabled()
     dialog.stage_table.selectAll()
-    dialog.bulk_originator.setText("Fugro")
+    dialog.bulk_originator.setText("Survey Contractor")
     dialog._apply_bulk()
     rows = dialog.result_rows()
     ok = ok and [r["role"] for r in rows] == [
         burial_schema.INPUT_ROLE_CROSSINGS_LINES, burial_schema.INPUT_ROLE_SOILS]
-    ok = ok and all(r["originator"] == "Fugro" for r in rows)
+    ok = ok and all(r["originator"] == "Survey Contractor" for r in rows)
     # A role that does not fit the geometry blocks OK.
     combo = dialog.stage_table.cellWidget(1, 1)
     combo.setCurrentIndex(combo.findData(
@@ -446,7 +446,7 @@ def test_inputs_dialog_lists_registered() -> bool:
     ok = model.save_inputs([
         {"role": burial_schema.INPUT_ROLE_CROSSINGS_LINES,
          "layer_name": lines.name(), "layer_source": lines.source(),
-         "layer_id_hint": lines.id(), "originator": "Fugro"},
+         "layer_id_hint": lines.id(), "originator": "Survey Contractor"},
         {"role": burial_schema.INPUT_ROLE_SOILS,
          "layer_name": polys.name(), "layer_source": polys.source(),
          "layer_id_hint": polys.id()},
@@ -481,7 +481,7 @@ def test_inputs_dialog_lists_registered() -> bool:
     removed = dialog.removed_input_ids()
     updated = [r for r in rows if r.get("input_id")]
     ok = ok and len(rows) == 2 and len(updated) == 1
-    ok = ok and updated[0]["revision"] == "B" and updated[0]["originator"] == "Fugro"
+    ok = ok and updated[0]["revision"] == "B" and updated[0]["originator"] == "Survey Contractor"
     ok = ok and len(removed) == 1
     dialog.deleteLater()
     log_before = len(store.list_change_log(reopened.plan_id))
@@ -530,7 +530,7 @@ def test_bathymetry_dialog_registers_input() -> bool:
     ok = ok and dialog.slots[0].field.currentField() == "depth_m"
     ok = ok and dialog.slots[1].field.currentField() == "elev"
     ok = ok and dialog.ok_button.isEnabled()
-    dialog.originator.setText("Fugro")
+    dialog.originator.setText("Survey Contractor")
     dialog.revision.setText("C")
     row = dialog.result_row()
     dialog.deleteLater()
@@ -547,12 +547,12 @@ def test_bathymetry_dialog_registers_input() -> bool:
 
     saved = next(r for r in model.inputs
                  if r["role"] == burial_schema.INPUT_ROLE_BATHY)
-    ok = ok and saved["originator"] == "Fugro" and saved["revision"] == "C"
+    ok = ok and saved["originator"] == "Survey Contractor" and saved["revision"] == "C"
     again = BathymetryDialog(saved, model.depth_config())
     ok = ok and again.contour_radio.isChecked()
     ok = ok and [s.layer.id() if s.layer else "" for s in again.slots] == [
         minor.id(), major.id()]
-    ok = ok and again.originator.text() == "Fugro"
+    ok = ok and again.originator.text() == "Survey Contractor"
     again.deleteLater()
 
     tab = InputsTab(model, lambda: None)

@@ -1021,6 +1021,7 @@ def model_seabed(x_m, kp_km, seabed_depth_m, records: "LayRecords", record_x_m: 
                  zero_tension_kn: float = 0.05, min_gap_m: float = 0.3, min_length_m: float = 5.0,
                  smoothing_m: Optional[float] = 0.0, friction: Optional[Dict[str, float]] = None,
                  filter_m: Optional[float] = 0.0, allowable: bool = False,
+                 touchdown_gap_m: float = 0.0,
                  progress: Optional[Callable] = None,
                  cancel: Optional[Callable[[], bool]] = None) -> SeabedModel:
     """Rest the cable on the seabed (see the module docstring).
@@ -1041,6 +1042,8 @@ def model_seabed(x_m, kp_km, seabed_depth_m, records: "LayRecords", record_x_m: 
     * Each span's supports get a seabed reaction and bend radius
       (:func:`span_supports`); with ``allowable`` the highest tension that
       keeps spans within the reporting limits is found along the route.
+    * A span runs from lift-off to touchdown; with ``touchdown_gap_m`` it ends
+      where the gap falls below that instead (as in Span & Slack Analysis).
 
     ``progress(fraction, text)`` reports 0..1; ``cancel()`` is polled and
     raises :class:`Cancelled`.
@@ -1093,17 +1096,18 @@ def model_seabed(x_m, kp_km, seabed_depth_m, records: "LayRecords", record_x_m: 
                              w / (tension * 1000.0), np.inf)
     model.cable_depth_m = -cable_rest_elevation(x, -depth, curvature)
     model.tension_kn = tension
+    end_tol = max(float(touchdown_gap_m or 0.0), SPAN_END_TOL_M)
     model.spans = find_spans(x, model.kp_km, model.gap_m, tension, min_gap_m, min_length_m, source,
-                             contact_tol_m=SPAN_END_TOL_M)
+                             contact_tol_m=end_tol)
     _report(progress, 0.62, "Bend radius and seabed reaction at span supports")
     model.supports = span_supports(x, -depth, -model.cable_depth_m, tension, w_fill, ei, mbr, model.spans,
-                                   model.kp_km)
+                                   model.kp_km, end_tol)
     if allowable:
         model.allowable_kn = allowable_tension_kn(
             x, -depth, w_fill, min_gap_m, min_length_m, cancel=cancel,
             progress=lambda f, *_: _report(progress, 0.65 + 0.35 * f,
                                            "Finding the tension that keeps spans within limits"),
-            contact_tol_m=SPAN_END_TOL_M)
+            contact_tol_m=end_tol)
         for span in model.spans:
             values = model.allowable_kn[span.i0:span.i1 + 1]
             span.allowable_kn = float(np.nanmin(values)) if np.isfinite(values).any() else math.nan
@@ -1190,6 +1194,10 @@ SEABED_CHECKS: Tuple[CheckDef, ...] = (
              "limits there.",
              (ParamSpec("min_gap_m", "Report spans higher than (m)", "float", 0.3, minimum=0.0),
               ParamSpec("min_length_m", "...and longer than (m)", "float", 5.0, minimum=0.0),
+              ParamSpec("touchdown_gap_m", "Span ends where the gap is under (m, 0 = exact)", "float", 0.0,
+                        minimum=0.0, help="Where a span starts and ends. 0: the model's exact lift-off and "
+                        "touchdown. A larger value counts the cable as touching within this gap of the seabed "
+                        "(shorter spans), e.g. to compare with a survey's gap detection limit."),
               ParamSpec("red_gap_m", "Red when higher than (m)", "float", 1.0, minimum=0.0),
               ParamSpec("red_length_m", "...or longer than (m)", "float", 50.0, minimum=0.0)),
              ("bottom_tension",), ("weight_water_kg_m",), needs_seabed=True),

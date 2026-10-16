@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Span & Slack Analysis results: findings, spans, bodies, detail model, tension sweep, summary."""
+"""Span & Slack Analysis results: findings, spans, bodies, detail model, find tension, tension sweep, summary."""
 
 from __future__ import annotations
 
@@ -50,6 +50,15 @@ BODY_HEADERS = ["Name", "Kind", "KP", "Weight (kN)", "Clear of seabed (m)", "In 
                 "Housing standoff (m)"]
 DETAIL_HEADERS = ["KP from", "KP to", "Length (m)", "Max gap (m)", "Min bend R (m)", "KP of min R", "MBR (m)",
                   "Max moment (kNm)", "Reaction start (kN)", "Reaction end (kN)"]
+FIND_HEADERS = ["Scope", "KP from", "KP to", "Highest tension (kN)", "Breaks the target first",
+                "Spans at the lowest tension", "Seabed fill (%)"]
+TARGETS = [
+    ("report", "No reportable span (the reporting limits)"),
+    ("red", "No red span (the red limits)"),
+    ("none", "No span at all"),
+    ("custom", "No span higher than … and longer than …"),
+]
+SCOPES = [("all", "Whole profile"), ("view", "Visible part of the profile"), ("sections", "Each lay control section")]
 SWEEP_HEADERS = ["Bottom T (kN)", "Spans", "Red", "Total length (m)", "Longest (m)", "Max gap (m)",
                  "Min bend R (m)", "Below MBR", "Max residual T (kN)", "Above NPTS"]
 
@@ -151,6 +160,8 @@ class ResultsPanel(QTabWidget):
     rangeSelected = pyqtSignal(float, float)
     detailRequested = pyqtSignal(float, float, float)
     sweepRequested = pyqtSignal(object)
+    findRequested = pyqtSignal(object)
+    useTension = pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -160,6 +171,7 @@ class ResultsPanel(QTabWidget):
         self._build_spans()
         self._build_bodies()
         self._build_detail()
+        self._build_find()
         self._build_sweep()
         self.summary = QTextBrowser()
         self.summary.setOpenExternalLinks(False)
@@ -337,6 +349,7 @@ class ResultsPanel(QTabWidget):
         split.addWidget(self.detail_table)
         split.setSizes([650, 350])
         layout.addWidget(split, 1)
+        self.detail_page = page
         self.addTab(page, "Detail (EI)")
 
     def _request_detail(self) -> None:
@@ -384,6 +397,135 @@ class ResultsPanel(QTabWidget):
         self.d_profile.enableAutoRange()
         self.d_radius.enableAutoRange()
         self.d_moment.enableAutoRange()
+
+    def set_reverse(self, on: bool) -> None:
+        """KP from right to left in the detail plots too (as on the profile)."""
+        for plot in (self.d_profile, self.d_radius, self.d_moment):
+            plot.invertX(bool(on))
+
+    # -- find tension --------------------------------------------------------------------------
+    def _build_find(self) -> None:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(2, 2, 2, 2)
+        intro = QLabel("The highest bottom tension that keeps the spans within a target. Spans shorten as the "
+                       "tension falls, so this is a ceiling: lay at or below it. Each tension is solved in full "
+                       "(friction, slopes, bodies and protection).")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        row = QHBoxLayout()
+        self.find_target = QComboBox()
+        for key, label in TARGETS:
+            self.find_target.addItem(label, key)
+        self.find_gap = QDoubleSpinBox()
+        self.find_length = QDoubleSpinBox()
+        for spin, value, suffix in ((self.find_gap, 0.3, " m high"), (self.find_length, 5.0, " m long")):
+            spin.setRange(0.0, 1000.0)
+            spin.setDecimals(2)
+            spin.setSuffix(suffix)
+            spin.setValue(value)
+        self.find_mbr = QCheckBox("bend at supports within the MBR")
+        self.find_mbr.setChecked(True)
+        self.find_contact = QCheckBox("support reaction within the contact limit")
+        self.find_contact.setChecked(True)
+        self.find_contact.setToolTip("Uses the contact limit in Reporting limits (when it is set).")
+        for label, widget in (("Target", self.find_target), (None, self.find_gap), (None, self.find_length),
+                              (None, self.find_mbr), (None, self.find_contact)):
+            if label:
+                row.addWidget(QLabel(label))
+            row.addWidget(widget)
+        row.addStretch(1)
+        layout.addLayout(row)
+        row = QHBoxLayout()
+        self.find_scope = QComboBox()
+        for key, label in SCOPES:
+            self.find_scope.addItem(label, key)
+        self.find_hi = QDoubleSpinBox()
+        self.find_hi.setRange(0.5, 1000.0)
+        self.find_hi.setDecimals(1)
+        self.find_hi.setSuffix(" kN")
+        self.find_hi.setValue(50.0)
+        self.find_hi.setToolTip("The search runs from just above the conformity tension to this.")
+        self.find_button = QPushButton("Find tension")
+        self.find_button.clicked.connect(self._request_find)
+        self.find_use = QPushButton("Use for the lay control")
+        self.find_use.setToolTip("Set the lay control to these bottom tensions (rounded down to 0.05 kN).")
+        self.find_use.setEnabled(False)
+        self.find_use.clicked.connect(self._use_found)
+        for label, widget in (("Over", self.find_scope), ("search up to", self.find_hi)):
+            row.addWidget(QLabel(label))
+            row.addWidget(widget)
+        row.addWidget(self.find_button)
+        row.addWidget(self.find_use)
+        row.addStretch(1)
+        layout.addLayout(row)
+        self.find_table = _table(FIND_HEADERS)
+        layout.addWidget(self.find_table, 1)
+        self.find_note = QLabel("")
+        self.find_note.setWordWrap(True)
+        layout.addWidget(self.find_note)
+        self.find_target.currentIndexChanged.connect(self._on_find_target)
+        self._found: List[pl.TensionAnswer] = []
+        self._found_scope = "all"
+        self._on_find_target()
+        self.find_page = page
+        self.addTab(page, "Find tension")
+
+    def _on_find_target(self, *_args) -> None:
+        custom = self.find_target.currentData() == "custom"
+        self.find_gap.setEnabled(custom)
+        self.find_length.setEnabled(custom)
+
+    def _request_find(self) -> None:
+        self.findRequested.emit({"target": self.find_target.currentData(), "gap_m": self.find_gap.value(),
+                                 "length_m": self.find_length.value(), "mbr": self.find_mbr.isChecked(),
+                                 "contact": self.find_contact.isChecked(), "scope": self.find_scope.currentData(),
+                                 "hi_kn": self.find_hi.value()})
+
+    def show_find(self) -> None:
+        self.setCurrentWidget(self.find_page)
+
+    def set_found(self, answers: Sequence[pl.TensionAnswer], scope: str = "all", target_text: str = "") -> None:
+        self._found = list(answers)
+        self._found_scope = scope
+        rows, payloads = [], []
+        for a in answers:
+            if a.tension_kn <= 0:
+                value = ("none", "#d32f2f")
+            elif not a.limited:
+                value = f"over {a.tension_kn:.1f}"
+            else:
+                value = _num(a.tension_kn)
+            remaining = ", ".join(f"{s.kp_start:.3f}–{s.kp_end:.3f}" for s in a.remaining[:6])
+            if len(a.remaining) > 6:
+                remaining += f" (+{len(a.remaining) - 6})"
+            rows.append([a.name, f"{a.kp_start:.3f}", f"{a.kp_end:.3f}", value,
+                         a.governing or ("met at every tension searched" if not a.limited else ""),
+                         remaining, _num(a.fill_pct, 3)])
+            payloads.append((a.kp_start, a.kp_end))
+        _fill(self.find_table, rows, payloads)
+        usable = [a for a in answers if a.tension_kn > 0]
+        self.find_use.setEnabled(bool(usable))
+        notes = []
+        if target_text:
+            notes.append(f"Target: {target_text}.")
+        if any(a.tension_kn <= 0 for a in answers):
+            notes.append("'none': spans break the target even at the lowest tension searched (e.g. a crossing "
+                         "always spans): change the target, the route or the seabed (e.g. a berm or a rock ramp).")
+        notes.extend(sorted({a.note for a in answers if a.note}))
+        if answers:
+            notes.append("Slack: to follow the seabed the cable needs at least the seabed fill over the route "
+                         "(last column), laid at near-zero tension. The floor of the tension window comes from "
+                         "the loop and slope checks (Findings), not from spans.")
+        self.find_note.setText(" ".join(notes))
+
+    def _use_found(self) -> None:
+        answers = [a for a in self._found if a.tension_kn > 0]
+        if answers:
+            self.useTension.emit({"scope": self._found_scope, "answers": answers})
+
+    def clear_found(self) -> None:
+        self.set_found([])
 
     # -- sweep -------------------------------------------------------------------------------
     def _build_sweep(self) -> None:
@@ -448,6 +590,7 @@ class ResultsPanel(QTabWidget):
                                  "tension rises (Binda & Contro 1979). Slopes, friction and bodies can bend that.")
         self.sweep_note.setWordWrap(True)
         layout.addWidget(self.sweep_note)
+        self.sweep_page = page
         self.addTab(page, "Tension sweep")
 
     def _request_sweep(self) -> None:
@@ -483,8 +626,7 @@ class ResultsPanel(QTabWidget):
         body_rows, body_payloads = [], []
         if result is not None:
             for k, s in enumerate(result.spans):
-                red = s.max_gap_m >= result.criteria.red_gap_m or s.length_m >= result.criteria.red_length_m \
-                    or s.below_mbr
+                red = pl._span_red(s, result.criteria)
                 bodies = ", ".join(b.body.name for b in result.bodies if b.in_span and s.kp_start <= b.kp_km <= s.kp_end)
                 span_rows.append([(str(k + 1), "#d32f2f" if red else None), f"{s.kp_start:.3f}", f"{s.kp_end:.3f}",
                                   _num(s.length_m, 1), _num(s.max_gap_m), f"{s.kp_max_gap:.3f}", _num(s.tension_kn),
@@ -532,8 +674,12 @@ def summary_html(result: pl.PlanningResult, notes: Sequence[str], setup_lines: S
         ("Largest support reaction", f"{s.max_reaction_kn:.2f} kN"),
         ("Residual tension", f"mean {s.mean_tension_kn:.2f} kN, max {s.max_tension_kn:.2f} kN"
                              + (" (above NPTS)" if s.over_npts else "")),
-        ("Reporting limits", f"spans higher than {c.min_gap_m:g} m and longer than {c.min_length_m:g} m; red at "
-                             f"{c.red_gap_m:g} m high, {c.red_length_m:g} m long, or below the MBR"),
+        ("Reporting limits", f"spans higher than {c.min_gap_m:g} m and longer than {c.min_length_m:g} m, from "
+                             + ("lift-off to touchdown" if c.touchdown_gap_m <= 0 else
+                                f"where the gap passes {c.touchdown_gap_m:g} m")
+                             + f"; red at {c.red_gap_m:g} m high, {c.red_length_m:g} m long, below the MBR"
+                             + (f", or a support reaction over {c.max_reaction_kn:g} kN" if c.max_reaction_kn > 0
+                                else "")),
         ("Model iterations", str(result.iterations)),
     ]
     parts = ["<h3>Span &amp; Slack Analysis</h3>", "<table cellspacing='0' cellpadding='3'>"]

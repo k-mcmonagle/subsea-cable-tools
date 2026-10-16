@@ -27,6 +27,7 @@ from qgis.gui import QgsMapTool, QgsRubberBand, QgsVertexMarker
 from ..qgis_compat import QAction, DIALOG_ACCEPTED, qt_exec, FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_LONG_LONG, FIELD_TYPE_STRING, GEOMETRY_LINE, GEOMETRY_POINT, GEOMETRY_POLYGON, LAYER_RASTER, LAYER_VECTOR, MESSAGE_CRITICAL, MESSAGE_INFO, MESSAGE_SUCCESS, MESSAGE_WARNING, TOOLBUTTON_POPUP_MODE_MENU_BUTTON, BUTTON_BOX_OK, BUTTON_BOX_CANCEL, BUTTON_BOX_ACCEPT_ROLE, get_event_global_pos, ITEM_DATA_USER_ROLE, ITEM_FLAG_EDITABLE, ITEM_FLAG_USER_CHECKABLE, CHECK_STATE_CHECKED, CHECK_STATE_UNCHECKED, SELECTION_MODE_NONE, HEADER_RESIZE_MODE_STRETCH
 import math
 
+from .. import kp_datum
 from ..kp_geo_utils import KPHit, RouteFrame, geometry_is_finite, ordered_route_features
 from ..kp_range_utils import (KP_MODE_CARTESIAN, KP_MODE_GEODESIC, describe_kp_mode,
                               kp_distance_mode, kp_grid_crs_setting, make_distance_area,
@@ -52,8 +53,12 @@ def _layer_has_features(layer) -> bool:
         return False
 
 
-def build_reference_route(layer, map_crs, use_cartesian: bool):
+def build_reference_route(layer, map_crs, use_cartesian: bool, start_kp_km=None):
     """KP route model of ``layer`` in ``map_crs`` for the KP Mouse tool.
+
+    KP starts at ``start_kp_km``; by default the RPL's start KP when ``layer``
+    is a Cable Route Workbench RPL lines layer (else 0), as in the Burial
+    Planner and Span & Slack Analysis.
 
     Returns ``(route, distance_area, geometries)``: the features' geometries
     in the plugin's route order (``ordered_route_features``: RPL ``SeqNo``
@@ -81,7 +86,8 @@ def build_reference_route(layer, map_crs, use_cartesian: bool):
             if not geometry_is_finite(geom):
                 raise ValueError("feature %s lies outside the map CRS" % feature.id())
         geoms.append(geom)
-    return RouteFrame.from_source(geoms, distance).build_indexes(), distance, geoms
+    start = kp_datum.lines_layer_start_kp(layer) if start_kp_km is None else float(start_kp_km)
+    return RouteFrame.from_source(geoms, distance, start_kp_km=start).build_indexes(), distance, geoms
 
 
 class KPMouseMapTool(QgsMapTool):
@@ -262,6 +268,12 @@ class KPMouseMapTool(QgsMapTool):
             self.depth_profile_window = None
         self._depth_sampler = None
 
+    def _end_kp(self) -> float:
+        """KP at the end of the reference line (rKP = end KP - KP)."""
+        if self._route is not None:
+            return float(self._route.end_kp_km)
+        return float(self.total_length_meters or 0.0) / 1000.0
+
     def _locate(self, map_point) -> Optional[KPHit]:
         """Nearest route position to ``map_point`` (map CRS), or ``None``.
 
@@ -334,7 +346,7 @@ class KPMouseMapTool(QgsMapTool):
         message = f"KP: {chainage_km:.3f}"
 
         if self.showReverseKP:
-            reverse_chainage_km = (self.total_length_meters / 1000.0) - chainage_km
+            reverse_chainage_km = self._end_kp() - chainage_km
             self.last_reverse_chainage = reverse_chainage_km
             message += f"\nrKP: {reverse_chainage_km:.3f}"
         else:
@@ -478,8 +490,8 @@ class KPMouseMapTool(QgsMapTool):
                 )
                 return
 
-            min_kp = 0.0
-            max_kp = float(self.total_length_meters) / 1000.0
+            min_kp = float(self._route.start_kp_km) if self._route is not None else 0.0
+            max_kp = self._end_kp()
             initial = float(self.last_chainage) if self.last_chainage is not None else None
 
             dialog = GoToKPDialog(self.iface.mainWindow(), min_kp, max_kp, initial_kp_km=initial)
@@ -523,7 +535,7 @@ class KPMouseMapTool(QgsMapTool):
             if self.copyIncludeRKP and self.total_length_meters and self.last_chainage is not None:
                 rkp_val = self.last_reverse_chainage
                 if rkp_val is None:
-                    rkp_val = (self.total_length_meters / 1000.0) - float(self.last_chainage)
+                    rkp_val = self._end_kp() - float(self.last_chainage)
                 parts.append(f"rKP {float(rkp_val):.3f}")
 
             # DCC
@@ -690,7 +702,7 @@ class KPMouseMapTool(QgsMapTool):
             if self.last_chainage is not None:
                 kp_val = float(self.last_chainage)
                 if self.total_length_meters:
-                    rkp_val = (self.total_length_meters / 1000.0) - kp_val
+                    rkp_val = self._end_kp() - kp_val
                 # DCC: 0 if snapped (nearest KP), else last perpendicular distance
                 if snapped_to_kp:
                     dcc_val = 0.0
@@ -1631,6 +1643,9 @@ class KPConfigDialog(QDialog):
             planar_line = "Length (cartesian): n/a (project CRS is geographic)"
 
         text = f"Length (ellipsoidal): {length_ell_km:.3f} km\n{planar_line}\nAC Count: {total_vertices}"
+        start_kp = kp_datum.lines_layer_start_kp(layer)
+        if start_kp:
+            text += f"\nStart KP (Workbench RPL): {start_kp:.3f}"
         if unmeasured:
             text += (f"\nWarning: {unmeasured} feature(s) could not be transformed to the "
                      "project CRS and are not included.")
@@ -2091,7 +2106,7 @@ class KPMouseTool:
         route = self._reference_route()
         if route is None:
             return None
-        return (0.0, max(0.0, route.total_length_km))
+        return (route.start_kp_km, max(route.start_kp_km, route.end_kp_km))
 
     def _point_at_kp_km(self, kp_km: float) -> Optional[QgsPointXY]:
         """Return the point on the reference line at the provided KP (km)."""

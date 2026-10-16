@@ -157,6 +157,38 @@ def start_kp_of(positions: Sequence[Tuple[object, Optional[float]]]) -> float:
         return 0.0
 
 
+def lines_layer_start_kp(layer, store=None) -> float:
+    """Start KP of a Cable Route Workbench RPL lines layer (0 for any other line layer).
+
+    The layer's ``rpl_id`` finds its RPL in the project's Workbench (``store``,
+    by default the project's); the start KP is the stated KP of the RPL's first
+    position (:func:`start_kp_of`), as the Burial Planner and Span & Slack
+    Analysis take it.
+    """
+    try:
+        if layer is None or not layer.isValid() or "rpl_id" not in layer.fields().names():
+            return 0.0
+        rpl_id = ""
+        for feature in layer.getFeatures():
+            value = feature["rpl_id"]
+            if value not in (None, "") and str(value).upper() != "NULL":
+                rpl_id = str(value)
+                break
+        if not rpl_id:
+            return 0.0
+        if store is None:
+            from .workbench.registry_access import open_store
+            store = open_store()
+        rpl = store.get_rpl(rpl_id) if store is not None else None
+        if not rpl:
+            return 0.0
+        return start_kp_of(rpl_positions(store.open_layer(rpl.get("points_layer") or "")))
+    except Exception:  # noqa: BLE001 - a KP display must not fail on a lookup
+        from .plugin_log import log_exception
+        log_exception("Start KP of an RPL lines layer could not be read; using 0")
+        return 0.0
+
+
 def check_route_kps(route, positions) -> KpCheck:
     """Compare an RPL's stated KPs with ``route`` (a WGS84 RouteFrame).
 

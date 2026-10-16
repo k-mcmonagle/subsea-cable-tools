@@ -135,7 +135,9 @@ def seabed_job(records, enabled, x, kp, depth, record_x, smoothing, filter_m=Non
     friction = enabled.get("length_balance")
     model = la.model_seabed(x, kp, depth, records, record_x, zero_tension_kn, susp["min_gap_m"],
                             susp["min_length_m"], smoothing_m=smoothing, friction=friction, filter_m=filter_m,
-                            allowable="suspension" in enabled, progress=progress, cancel=cancel)
+                            allowable="suspension" in enabled,
+                            touchdown_gap_m=float(susp.get("touchdown_gap_m") or 0.0), progress=progress,
+                            cancel=cancel)
     findings: List[la.RangeFinding] = []
     if "suspension" in enabled:
         findings.extend(la.seabed_span_findings(model, enabled["suspension"]))

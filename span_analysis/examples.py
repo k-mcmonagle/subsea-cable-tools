@@ -61,6 +61,24 @@ def crossing() -> Dict:
     return s
 
 
+def crossing_protected() -> Dict:
+    s = crossing()
+    s["seabed"]["features"][0]["name"] = "Pipeline crossing"
+    s["cable"]["protection"] = [{"name": "Articulated pipe", "kind": "Articulated pipe", "kp0": 0.18, "kp1": 0.22,
+                                 "weight": 45.0, "diameter": 150.0, "ei": None, "mbr": 4.0}]
+    return s
+
+
+def rock_berm() -> Dict:
+    s = _base(400.0, spacing_m=0.1)
+    s["seabed"]["features"] = [{"kind": "custom", "kp": 0.2, "height": 0.0, "length": 0.0, "crest": 0.0,
+                                "shape": "-10 0; -5.5 1.5; -2 1.8; 2 1.8; 5.5 1.5; 10 0",
+                                "name": "Rock berm over a crossing"}]
+    s["cable"]["manual"] = dict(_DA)
+    s["control"]["value"] = 10.0
+    return s
+
+
 def sand_waves() -> Dict:
     s = _base(3000.0, spacing_m=0.5, slope_deg=2.0, wave_height_m=1.2, wave_length_m=45.0, roughness_m=0.15)
     s["cable"]["bodies"] = [{"name": "R1", "kind": "Repeater", "kp": 2.1, "length": 4.0, "weight": 4.0,
@@ -79,6 +97,12 @@ EXAMPLES: List[Tuple[str, str, object]] = [
     ("Pipeline crossing, armoured cable",
      "A 0.5 m pipeline lying on the seabed, armoured cable (60 N/m, EI 20 kN·m²) at 10 kN. Use Detail (EI) on a "
      "span for the bend radius at the crossing.", crossing),
+    ("Pipeline crossing with protection (illustrative values)",
+     "The same crossing with 40 m of articulated pipe over the cable (45 kg/m in water, 150 mm, MBR 4 m: "
+     "illustrative values, not product data). The heavier cable spans less but bears harder on the pipeline: "
+     "compare the spans and the support reaction with the plain crossing.", crossing_protected),
+    ("Rock berm (custom shape), armoured cable",
+     "A 1.8 m rock berm 20 m wide, entered as a custom shape of six points, armoured cable at 10 kN.", rock_berm),
     ("Sand waves on a slope, with a repeater",
      "3 km of 1.2 m sand waves on a 2° slope with roughness, light cable and one repeater.", sand_waves),
 ]
