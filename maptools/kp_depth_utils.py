@@ -24,6 +24,9 @@ from ..kp_geo_utils import stored_geometry_index
 from ..plugin_log import log_exception
 from ..qgis_compat import GEOMETRY_LINE, LAYER_RASTER, LAYER_VECTOR
 
+# Raster providers that fetch over the network: never sampled on mouse hover.
+_REMOTE_PROVIDERS = frozenset({"wms", "wcs", "arcgismapserver", "arcgisfeatureserver"})
+
 # Ceiling on live-profile stations: enough that a 25 km line over a 100 m
 # grid still samples every cell, cheap enough (× number of rasters) to
 # re-run inside the 150 ms hover refresh without janking the canvas.
@@ -95,8 +98,12 @@ class DepthSampler:
         except Exception:
             nodata = None
         sampler = RasterSampler(layer)
+        try:
+            remote = str(provider.name()).lower() in _REMOTE_PROVIDERS
+        except Exception:  # noqa: BLE001 - treat an unknown provider as local
+            remote = False
         self._rasters.append({
-            "name": layer.name(), "provider": provider, "sampler": sampler,
+            "name": layer.name(), "provider": provider, "sampler": sampler, "remote": remote,
             "source_id": sampler.source_id, "options": sampler.options,
             "extent": layer.extent(), "transform": self._transform_to(layer.crs()),
             "nodata": nodata, "pixel_area": sampler.cell_m ** 2,
@@ -113,6 +120,7 @@ class DepthSampler:
         index = stored_geometry_index(layer.getFeatures())
         self._contours.append({
             "name": layer.name(), "layer": layer, "field_index": field_index,
+            "extent": layer.extent(),
             "options": layer_options(layer),
             "index": index, "transform": self._transform_to(layer.crs()),
             "back_transform": (
@@ -176,6 +184,37 @@ class DepthSampler:
             value = self._sample_contour(src, point)
             if value is not None:
                 return value
+        return None
+
+    def sample_point_detail(self, point: QgsPointXY, local_only: bool = False
+                            ) -> Optional[Tuple[float, str, str]]:
+        """``(depth, kind, layer name)`` at ``point``, or None where no source has data.
+
+        ``kind`` is ``raster`` (a grid value, best resolution first) or
+        ``contour`` (the nearest contour's value, only inside that contour
+        layer's extent, so a point far from the contours reads nothing).
+        ``local_only`` skips rasters fetched over the network (for hover).
+        """
+        for src in self._rasters:
+            if local_only and src.get("remote"):
+                continue
+            value = self._sample_raster(src, point)
+            if value is not None:
+                return float(value), "raster", src["name"]
+        for src in self._contours:
+            sample_point = QgsPointXY(point)
+            transform = src.get("transform")
+            if transform is not None:
+                try:
+                    sample_point = transform.transform(sample_point)
+                except QgsCsException:
+                    continue
+            extent = src.get("extent")
+            if extent is not None and not extent.isEmpty() and not extent.contains(sample_point):
+                continue
+            value = self._sample_contour(src, point)
+            if value is not None:
+                return float(value), "contour", src["name"]
         return None
 
     # -- profile sampling --------------------------------------------------

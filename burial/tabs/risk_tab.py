@@ -766,8 +766,8 @@ class RiskTab(QWidget):
             tip += f"\nLast scan: {when}."
         if state == analysis_state.STATE_CHANGED:
             text += " (out of date)"
-            tip += ("\nOut of date: the check's settings or input changed "
-                    "since its scan — run it again.")
+            tip += ("\nOut of date: the check's settings, its input or the plugin's KP "
+                    "method changed since its scan — run it again.")
         for warning in (run.get("warnings") or [])[:3]:
             tip += f"\n⚠ {warning}"
         return text, tip

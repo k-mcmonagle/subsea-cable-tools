@@ -41,10 +41,21 @@ _GLOBAL_LABELS = {
     "route": "the route geometry",
 }
 
+# Results computed before positions between route vertices followed the KP
+# path (the geodesic, or the grid line) are out of date on routes where that
+# path is more than KP_PATH_STALE_M from the line as stored.
+KP_PATH_LABEL = ("positions between route vertices, which now follow the KP path (the geodesic) "
+                 "instead of the line as stored")
+
 # Rule fields that change what a criterion evaluates to.
 _RULE_KEYS = ("kind", "action", "risk_level", "criterion_class",
               "methods_json", "config_json", "enabled")
 _CHECK_KEYS = ("config_json", "enabled")
+# The KP method risk hazards are placed with. 2: the KP of a feature beside the
+# route is its true nearest point on the ellipsoid (before, it could be tens of
+# metres along the route at high latitude), and positions between vertices
+# follow the KP path. Scans recorded before read "out of date".
+RISK_KP_METHOD = 2
 
 
 def canonical(value) -> str:
@@ -107,13 +118,19 @@ def check_fingerprint(check: Dict, inputs_by_id: Dict[str, Dict]) -> str:
     payload = {key: (_json_field(check.get(key)) if key.endswith("_json")
                      else check.get(key)) for key in _CHECK_KEYS}
     payload["inputs"] = _input_binding(config, inputs_by_id)
+    payload["kp_method"] = RISK_KP_METHOD
     return digest(payload)
 
 
-def global_fingerprint(params, route_fp: str = "") -> Dict[str, str]:
-    """Named components so a mismatch can say *what* changed."""
+def global_fingerprint(params, route_fp: str = "", kp_path: str = "") -> Dict[str, str]:
+    """Named components so a mismatch can say *what* changed.
+
+    ``kp_path`` (only present when non-empty) marks results computed along
+    the KP path on a route where it departs from the stored line; results
+    stored before it went in lack it (see :func:`compare_global`).
+    """
     scope = params.scope
-    return {
+    out = {
         "scope": f"{scope.start_km:.6f}-{scope.end_km:.6f}",
         "direction": str(1 if int(params.direction or 1) >= 0 else -1),
         "method": str(params.method or ""),
@@ -122,14 +139,17 @@ def global_fingerprint(params, route_fp: str = "") -> Dict[str, str]:
         "refine_tol_m": f"{float(params.refine_tol_m):.4f}",
         "route": route_fp or "",
     }
+    if kp_path:
+        out["kp_path"] = kp_path
+    return out
 
 
 def exclusion_fingerprints(params, rules: Sequence[Dict],
                            inputs: Sequence[Dict], route_fp: str = "",
-                           profile_stamp: str = "") -> Dict:
+                           profile_stamp: str = "", kp_path: str = "") -> Dict:
     by_id = {str(r.get("input_id") or ""): r for r in inputs or []}
     return {
-        "global": global_fingerprint(params, route_fp),
+        "global": global_fingerprint(params, route_fp, kp_path),
         "rules": {str(r.get("rule_id")): rule_fingerprint(r, by_id,
                                                           profile_stamp)
                   for r in rules or []},
@@ -150,6 +170,11 @@ def compare_global(stored: Optional[Dict], current: Dict) -> List[str]:
         new = str(current.get(key) or "")
         if old and new and old != new:
             reasons.append(label)
+    # Unlike the components above, a missing stored KP path counts: those
+    # results were computed along the line as stored.
+    new_path = str(current.get("kp_path") or "")
+    if new_path and str(stored.get("kp_path") or "") != new_path:
+        reasons.append(KP_PATH_LABEL)
     return reasons
 
 

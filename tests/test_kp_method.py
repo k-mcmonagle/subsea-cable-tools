@@ -318,6 +318,24 @@ def test_unmeasurable_segment_is_never_0_m() -> bool:
                    f"profile stopped {stopped_profile}, listing stopped {stopped_listing}, flagged {flagged}")
 
 
+def test_datum_transformation_reported() -> bool:
+    """A route on another datum names the transformation to WGS84 in its KP basis; a WGS84 grid route does not."""
+    ed50 = QgsCoordinateReferenceSystem("EPSG:23031")
+    utm = QgsCoordinateReferenceSystem("EPSG:32631")
+    line = QgsGeometry.fromPolylineXY([QgsPointXY(450000.0, 6200000.0), QgsPointXY(470000.0, 6215000.0)])
+    noted = RouteFrame.from_source([line], make_distance_area(ed50, CTX)).kp_basis_notes()
+    plain = RouteFrame.from_source([line], make_distance_area(utm, CTX)).kp_basis_notes()
+    # Reprojected to WGS84 first (as the Burial Planner does): the note follows the stored CRS.
+    reprojected = RouteFrame.from_source([line], make_distance_area(WGS, CTX), target_crs=WGS,
+                                         source_crs=ed50).kp_basis_notes()
+    datum = [text for _level, text in noted if "transformed to WGS84" in text]
+    ok = (len(datum) == 1 and "EPSG:23031" in datum[0]
+          and not any("transformed to WGS84" in text for _level, text in plain)
+          and any("transformed to WGS84" in text for _level, text in reprojected))
+    return _report("datum: the transformation to WGS84 is named for a route on another datum", ok,
+                   datum[0][:140] if datum else "no note")
+
+
 def run_all() -> List[bool]:
     results = [
         test_geodesic_kp_long_route(),
@@ -329,6 +347,7 @@ def run_all() -> List[bool]:
         test_workbench_position_on_geodesic(),
         test_layer_route_in_seqno_order(),
         test_unmeasurable_segment_is_never_0_m(),
+        test_datum_transformation_reported(),
     ]
     print(f"\n{sum(results)}/{len(results)} KP method checks passed.")
     return results

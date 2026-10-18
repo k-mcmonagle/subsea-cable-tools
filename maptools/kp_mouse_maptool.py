@@ -18,14 +18,15 @@ from qgis.PyQt.QtWidgets import (QMessageBox, QToolTip,
                                  QApplication, QDialog, QVBoxLayout,
                                  QComboBox, QLabel, QDialogButtonBox,
                                  QToolButton, QMenu, QCheckBox, QLineEdit, QHBoxLayout, QPushButton, QDoubleSpinBox,
-                                 QTableWidget, QTableWidgetItem)
+                                 QScrollArea, QWidget)
 from qgis.core import (QgsGeometry, QgsProject, QgsDistanceArea,
                        QgsPointXY, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
                        QgsCsException, QgsFeatureRequest,
                        QgsVectorLayer, QgsField, QgsFeature)
 from qgis.gui import QgsMapTool, QgsRubberBand, QgsVertexMarker
-from ..qgis_compat import QAction, DIALOG_ACCEPTED, qt_exec, FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_LONG_LONG, FIELD_TYPE_STRING, GEOMETRY_LINE, GEOMETRY_POINT, GEOMETRY_POLYGON, LAYER_RASTER, LAYER_VECTOR, MESSAGE_CRITICAL, MESSAGE_INFO, MESSAGE_SUCCESS, MESSAGE_WARNING, TOOLBUTTON_POPUP_MODE_MENU_BUTTON, BUTTON_BOX_OK, BUTTON_BOX_CANCEL, BUTTON_BOX_ACCEPT_ROLE, get_event_global_pos, ITEM_DATA_USER_ROLE, ITEM_FLAG_EDITABLE, ITEM_FLAG_USER_CHECKABLE, CHECK_STATE_CHECKED, CHECK_STATE_UNCHECKED, SELECTION_MODE_NONE, HEADER_RESIZE_MODE_STRETCH
+from ..qgis_compat import QAction, DIALOG_ACCEPTED, qt_exec, FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, GEOMETRY_LINE, GEOMETRY_POINT, GEOMETRY_POLYGON, LAYER_RASTER, LAYER_VECTOR, MESSAGE_CRITICAL, MESSAGE_INFO, MESSAGE_SUCCESS, MESSAGE_WARNING, TOOLBUTTON_POPUP_MODE_MENU_BUTTON, BUTTON_BOX_OK, BUTTON_BOX_CANCEL, BUTTON_BOX_ACCEPT_ROLE, get_event_global_pos
 import math
+import time
 
 from .. import kp_datum
 from ..kp_geo_utils import KPHit, RouteFrame, geometry_is_finite, ordered_route_features
@@ -115,6 +116,7 @@ class KPMouseMapTool(QgsMapTool):
         copyLatLonFormat="DD",
         copyLatLonStyle="LABELLED",
         start_kp_km=None,
+        showHoverDepth=True,
     ):
         super().__init__(canvas)
         self.canvas = canvas
@@ -132,6 +134,14 @@ class KPMouseMapTool(QgsMapTool):
         self.showDepthProfile = bool(showDepthProfile)
         self._depth_sampler = None
         self.depth_profile_window = None
+        # Depth at the cursor and at the KP while hovering (status bar and
+        # tooltip). Sampling that turns out slow is deferred until the mouse
+        # stops; a failure turns it off until the tool is set up again.
+        self.showHoverDepth = bool(showHoverDepth)
+        self._hover_depth_slow = False
+        self._hover_depth_off = False
+        self._hover_depth_pending = False
+        self.last_dcc_m = None
 
         # Right-click copy behaviour (KP is always included)
         self.copyIncludeRKP = bool(copyIncludeRKP)
@@ -279,6 +289,8 @@ class KPMouseMapTool(QgsMapTool):
             window.cleanup()
             self.depth_profile_window = None
         self._depth_sampler = None
+        self._hover_depth_slow = False
+        self._hover_depth_pending = False
 
     def _end_kp(self) -> float:
         """KP at the end of the reference line (rKP = end KP - KP)."""
@@ -368,6 +380,15 @@ class KPMouseMapTool(QgsMapTool):
             self.last_reverse_chainage = None
         
         message += f"\nDCC: {converted_distance:.2f} {self.measurementUnit}"
+        self.last_dcc_m = hit.dcc_m
+
+        # Depth at the cursor and at the KP: now, or when the mouse stops if
+        # sampling these layers is slow.
+        self._hover_depth_pending = self._hover_depth_enabled() and self._hover_depth_slow
+        if self._hover_depth_enabled() and not self._hover_depth_slow:
+            depth_lines = self._hover_depth_lines(mousePoint, closest_point_on_line, hit.dcc_m)
+            if depth_lines:
+                message += "\n" + "\n".join(depth_lines)
 
         self.iface.mainWindow().statusBar().showMessage(message.replace('\n', ' | '))
         
@@ -397,8 +418,63 @@ class KPMouseMapTool(QgsMapTool):
 
     def start_persistent_tooltip(self):
         """Called when the mouse stop timer fires. Starts the persistent tooltip timer."""
+        if self._hover_depth_pending:
+            # Slow depth sources: sample once the mouse has stopped.
+            self._hover_depth_pending = False
+            if self.last_mouse_point is not None and self.last_closest_point is not None:
+                lines = self._hover_depth_lines(self.last_mouse_point, self.last_closest_point,
+                                                self.last_dcc_m or 0.0, timed=False)
+                if lines and self.last_message:
+                    self.last_message += "\n" + "\n".join(lines)
+                    status = self.iface.mainWindow().statusBar()
+                    status.showMessage(status.currentMessage() + " | " + " | ".join(lines))
         if self.persistent_tooltip_timer is not None and self.last_message and self.last_global_pos:
             self.persistent_tooltip_timer.start(100)
+
+    # --- Depth while hovering ---
+    _HOVER_DEPTH_SLOW_S = 0.15
+
+    def _hover_depth_enabled(self) -> bool:
+        return bool(self.showDepth and self.showHoverDepth and self.depthSources and not self._hover_depth_off)
+
+    @staticmethod
+    def _depth_text(sample) -> str:
+        value, kind, _name = sample
+        return f"{value:.2f} m" + (" (nearest contour)" if kind == "contour" else "")
+
+    def _hover_depth_lines(self, mouse_point, kp_point, dcc_m, timed: bool = True):
+        """``["Depth at cursor: …", "Depth at KP: …"]`` where the depth layers have data.
+
+        The cursor's own depth is left out when it is on the route (DCC under
+        1 m). Rasters fetched over the network are not sampled. When one
+        sample takes longer than ``_HOVER_DEPTH_SLOW_S`` the depth is shown
+        only when the mouse stops; an error turns hover depth off (logged).
+        """
+        if not self._hover_depth_enabled():
+            return []
+        try:
+            sampler = self._get_depth_sampler()
+            if sampler is None or not sampler.has_sources():
+                return []
+            started = time.perf_counter()
+            lines = []
+            if dcc_m is not None and dcc_m >= 1.0:
+                at_cursor = sampler.sample_point_detail(QgsPointXY(mouse_point), local_only=True)
+                if at_cursor is not None:
+                    lines.append("Depth at cursor: " + self._depth_text(at_cursor))
+            at_kp = sampler.sample_point_detail(QgsPointXY(kp_point), local_only=True)
+            if at_kp is not None:
+                lines.append("Depth at KP: " + self._depth_text(at_kp))
+            if timed and time.perf_counter() - started > self._HOVER_DEPTH_SLOW_S:
+                self._hover_depth_slow = True
+                self.iface.messageBar().pushMessage(
+                    "KP Mouse Tool", "Depth sampling is slow for the chosen depth layers: depth is shown "
+                    "when the mouse stops.", level=MESSAGE_INFO, duration=6)
+            return lines
+        except Exception:  # noqa: BLE001 - hover depth must never break KP tracking
+            log_exception("KP Mouse Tool: depth while hovering failed; turned off until the tool is set up again")
+            self._hover_depth_off = True
+            return []
 
     def show_persistent_tooltip(self):
         """Called by the repeating timer to keep the tooltip visible."""
@@ -1381,10 +1457,18 @@ class KPConfigDialog(QDialog):
         copy_latlon_format="DD",
         copy_latlon_style="LABELLED",
         start_kp=None,
+        show_hover_depth=True,
     ):
         super().__init__(parent)
         self.setWindowTitle("Configure KP Mouse Tool")
-        layout = QVBoxLayout(self)
+        # Everything but the buttons scrolls, so the dialog fits small screens.
+        outer = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
 
         # Layer selection
         self.layer_label = QLabel("Select Reference Line Layer:")
@@ -1440,9 +1524,17 @@ class KPConfigDialog(QDialog):
         layout.addWidget(self.cartesian_checkbox)
 
         # Depth options
-        self.depth_checkbox = QCheckBox("Enable depth sampling (right-click menu)")
+        self.depth_checkbox = QCheckBox("Enable depth sampling (right-click menu, live profile)")
         self.depth_checkbox.setChecked(show_depth)
         layout.addWidget(self.depth_checkbox)
+        self.hover_depth_checkbox = QCheckBox(
+            "Show depth while hovering: at the cursor and at the KP (status bar and tooltip)")
+        self.hover_depth_checkbox.setToolTip(
+            "Samples the depth layers below at the mouse pointer and at its nearest point on the route. "
+            "Rasters are read at their native cells; contour lines give the nearest contour's depth. "
+            "Online rasters are not sampled, and if sampling is slow the depth appears when the mouse stops.")
+        self.hover_depth_checkbox.setChecked(bool(show_hover_depth))
+        layout.addWidget(self.hover_depth_checkbox)
 
         self.depth_layers_label = QLabel(
             "Depth layers (check to use; rasters and contour line layers can be "
@@ -1450,15 +1542,17 @@ class KPConfigDialog(QDialog):
             "where they overlap):")
         self.depth_layers_label.setWordWrap(True)
         layout.addWidget(self.depth_layers_label)
-        self.depth_table = QTableWidget(0, 2)
-        self.depth_table.setHorizontalHeaderLabels(["Layer", "Depth field (contours)"])
+        # Depth layers: rasters and line (contour) layers, searchable and sortable.
+        from .depth_source_table import DepthSourceTable
+        self.depth_layers = [
+            l for l in QgsProject.instance().mapLayers().values()
+            if (l.type() == LAYER_RASTER) or (l.type() == LAYER_VECTOR and l.geometryType() == GEOMETRY_LINE)
+        ]
+        self.depth_table = DepthSourceTable(self.depth_layers, depth_sources or [])
+        layout.addWidget(self.depth_table, 1)
         source_options_btn = QPushButton("Bathymetry source conventions…")
         from ..bathymetry_sampling import configure_layers
         source_options_btn.clicked.connect(lambda: configure_layers(self))
-        self.depth_table.verticalHeader().setVisible(False)
-        self.depth_table.setSelectionMode(SELECTION_MODE_NONE)
-        self.depth_table.setMinimumHeight(120)
-        layout.addWidget(self.depth_table)
         layout.addWidget(source_options_btn)
 
         self.profile_hint_label = QLabel(
@@ -1514,11 +1608,12 @@ class KPConfigDialog(QDialog):
         self.note_label.setWordWrap(True)
         layout.addWidget(self.note_label)
 
-        # Buttons
+        # Buttons (outside the scroll area)
         self.button_box = QDialogButtonBox(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
-        layout.addWidget(self.button_box)
+        outer.addWidget(self.button_box)
+        self._size_to_screen()
 
         self.line_layers = [
             l for l in QgsProject.instance().mapLayers().values()
@@ -1528,12 +1623,6 @@ class KPConfigDialog(QDialog):
         for layer in self.line_layers:
             self.layer_combo.addItem(layer.name(), layer.id())
 
-        # Depth layers: raster and vector line layers
-        self.depth_layers = [
-            l for l in QgsProject.instance().mapLayers().values()
-            if (l.type() == LAYER_RASTER) or (l.type() == LAYER_VECTOR and l.geometryType() == GEOMETRY_LINE)
-        ]
-        self._populate_depth_table(depth_sources or [])
 
         if current_layer:
             idx = self.layer_combo.findData(current_layer.id())
@@ -1565,55 +1654,24 @@ class KPConfigDialog(QDialog):
             if idx != -1:
                 self.copy_latlon_style_combo.setCurrentIndex(idx)
 
-    def _populate_depth_table(self, depth_sources):
-        """One row per candidate layer: checkable name + field combo for contours."""
-        selected = {str(layer_id): str(field or "")
-                    for layer_id, field in (depth_sources or [])}
-        self.depth_table.setRowCount(len(self.depth_layers))
-        for row, layer in enumerate(self.depth_layers):
-            is_vector = layer.type() == LAYER_VECTOR
-            kind = "contours" if is_vector else "raster"
-            item = QTableWidgetItem("%s (%s)" % (layer.name(), kind))
-            item.setFlags((item.flags() | ITEM_FLAG_USER_CHECKABLE) & ~ITEM_FLAG_EDITABLE)
-            item.setCheckState(CHECK_STATE_CHECKED if layer.id() in selected
-                               else CHECK_STATE_UNCHECKED)
-            item.setData(ITEM_DATA_USER_ROLE, layer.id())
-            self.depth_table.setItem(row, 0, item)
-            if is_vector:
-                combo = QComboBox()
-                for field in layer.fields():
-                    if field.type() in (FIELD_TYPE_INT, FIELD_TYPE_DOUBLE, FIELD_TYPE_LONG_LONG):
-                        combo.addItem(field.name())
-                wanted = selected.get(layer.id(), "")
-                if wanted:
-                    idx = combo.findText(wanted)
-                    if idx != -1:
-                        combo.setCurrentIndex(idx)
-                self.depth_table.setCellWidget(row, 1, combo)
-            else:
-                placeholder = QTableWidgetItem("—")
-                placeholder.setFlags(placeholder.flags() & ~ITEM_FLAG_EDITABLE)
-                self.depth_table.setItem(row, 1, placeholder)
+    def _size_to_screen(self):
+        """Open wide enough for the depth layer table, and tall but within the screen."""
+        width, height = 900, 820
         try:
-            self.depth_table.horizontalHeader().setSectionResizeMode(0, HEADER_RESIZE_MODE_STRETCH)
-        except Exception:
+            screen = self.screen() if hasattr(self, "screen") else None
+            if screen is None:
+                screen = QApplication.primaryScreen()
+            if screen is not None:
+                area = screen.availableGeometry()
+                width = min(width, int(area.width() * 0.9))
+                height = min(height, int(area.height() * 0.9))
+        except Exception:  # noqa: BLE001 - the defaults above
             pass
-        self.depth_table.resizeColumnToContents(1)
+        self.resize(max(width, 600), max(height, 480))
 
     def _selected_depth_sources(self):
         """Return [(layer_id, field)] for the checked rows."""
-        sources = []
-        for row in range(self.depth_table.rowCount()):
-            item = self.depth_table.item(row, 0)
-            if item is None or item.checkState() != CHECK_STATE_CHECKED:
-                continue
-            layer_id = item.data(ITEM_DATA_USER_ROLE)
-            if not layer_id:
-                continue
-            combo = self.depth_table.cellWidget(row, 1)
-            field = combo.currentText().strip() if isinstance(combo, QComboBox) else ""
-            sources.append((str(layer_id), field))
-        return sources
+        return self.depth_table.selected_sources()
 
     def update_metrics(self):
         layer_id = self.layer_combo.currentData()
@@ -1695,6 +1753,7 @@ class KPConfigDialog(QDialog):
     def update_depth_ui(self):
         """Enable the depth layer table/profile option with the main checkbox."""
         enabled = self.depth_checkbox.isChecked()
+        self.hover_depth_checkbox.setEnabled(enabled)
         self.depth_layers_label.setEnabled(enabled)
         self.depth_table.setEnabled(enabled)
         self.profile_hint_label.setEnabled(enabled)
@@ -1738,6 +1797,7 @@ class KPConfigDialog(QDialog):
         copy_latlon_format = self.copy_latlon_format_combo.currentData() or "DD"
         copy_latlon_style = self.copy_latlon_style_combo.currentData() or "LABELLED"
         self.start_kp = float(self.start_kp_spin.value())
+        self.show_hover_depth = self.hover_depth_checkbox.isChecked()
         return (
             layer,
             unit,
@@ -1864,6 +1924,7 @@ class KPMouseTool:
         # Depth sources as [(layer_id, field)]; resolved to live layers lazily.
         self.depthSourceRefs = []
         self.showDepthProfile = False
+        self.showHoverDepth = True
         # Right-click copy settings (KP is always included)
         self.copyIncludeRKP = False
         self.copyIncludeDCC = False
@@ -2032,6 +2093,7 @@ class KPMouseTool:
                 self.copyLatLonFormat,
                 self.copyLatLonStyle,
                 start_kp_km=self._start_kp_for(layer),
+                showHoverDepth=self.showHoverDepth,
             )
             self.iface.mapCanvas().setMapTool(self.mapTool)
         else:
@@ -2070,6 +2132,7 @@ class KPMouseTool:
             self.copyLatLonFormat,
             self.copyLatLonStyle,
             start_kp=self._start_kp_for(self._get_reference_layer()),
+            show_hover_depth=self.showHoverDepth,
         )
         if qt_exec(dialog):
             (
@@ -2095,6 +2158,7 @@ class KPMouseTool:
                     KP_MODE_CARTESIAN if use_cartesian else KP_MODE_GEODESIC,
                     kp_grid_crs_setting())
                 self.showDepth = show_depth
+                self.showHoverDepth = bool(getattr(dialog, "show_hover_depth", True))
                 self.depthSourceRefs = list(depth_sources or [])
                 self.copyIncludeRKP = bool(copy_include_rkp)
                 self.copyIncludeDCC = bool(copy_include_dcc)
@@ -2240,6 +2304,7 @@ class KPMouseTool:
         settings.setValue("showReverseKP", self.showReverseKP)
         settings.setValue("useCartesian", self.useCartesian)
         settings.setValue("showDepth", self.showDepth)
+        settings.setValue("showHoverDepth", self.showHoverDepth)
         settings.setValue("copyIncludeRKP", self.copyIncludeRKP)
         settings.setValue("copyIncludeDCC", self.copyIncludeDCC)
         settings.setValue("copyIncludeLatLon", self.copyIncludeLatLon)
@@ -2268,6 +2333,7 @@ class KPMouseTool:
         self.showReverseKP = settings.value("showReverseKP", False, type=bool)
         self.useCartesian = kp_distance_mode() == KP_MODE_CARTESIAN
         self.showDepth = settings.value("showDepth", False, type=bool)
+        self.showHoverDepth = settings.value("showHoverDepth", True, type=bool)
         # New clipboard settings (default: only KP)
         self.copyIncludeRKP = settings.value("copyIncludeRKP", False, type=bool)
         self.copyIncludeDCC = settings.value("copyIncludeDCC", False, type=bool)

@@ -27,6 +27,7 @@ Find these in the QGIS Processing Toolbox under **Subsea Cable Tools**.
 - **Place KP Points from CSV** — place points at KPs listed in a table.
 - **Place Single KP Point** — locate one KP on a route.
 - **Nearest KP** — find each point's closest route KP.
+- **Densify Route Along KP Path** — a display copy of a route that draws where its KPs lie in any map CRS.
 - **Add Depth to Point Layer** — sample bathymetry at existing points.
 - **KP Range Highlighter** — map specified route sections.
 - **KP Range Highlighter from CSV** — map sections listed in a CSV.

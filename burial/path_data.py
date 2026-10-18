@@ -197,7 +197,8 @@ def build_fingerprints(plan: Dict, route_fingerprint: str,
                        tool: Optional[Dict], config: Optional[Dict],
                        path_config: Dict,
                        layback_profile: Optional[Dict] = None,
-                       depth_fingerprint: str = "") -> Dict[str, str]:
+                       depth_fingerprint: str = "",
+                       kp_path: str = "") -> Dict[str, str]:
     radius_rules = sanitise_radius_rules(path_config.get("radius_rules"))
     tool_payload = {
         "algorithm": ALGORITHM_VERSION,
@@ -222,6 +223,10 @@ def build_fingerprints(plan: Dict, route_fingerprint: str,
     adjustments = sanitise_adjustments(path_config.get("adjustments"))
     if adjustments:
         tool_payload["adjustments"] = adjustments
+    # Likewise only where the KP path departs from the stored line: paths
+    # built along the stored line there are out of date.
+    if kp_path:
+        tool_payload["kp_path"] = kp_path
     tool_fp = digest(tool_payload)
     barge_payload = {
         "tool_path": tool_fp,

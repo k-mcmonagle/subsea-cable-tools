@@ -402,6 +402,29 @@ def kp_path_kind(distance) -> str:
     return "straight"
 
 
+def path_departure_m(p1, p2, distance, length_m: Optional[float] = None) -> float:
+    """How far (m) the KP path between two vertices is from the segment as stored,
+    at their midpoints (where a smooth bow is widest); 0 when they are the same."""
+    kind = kp_path_kind(distance)
+    if kind == "straight":
+        return 0.0
+    if length_m is None:
+        length_m = _measure_segment_m(distance, p1, p2)
+    if length_m is None or not length_m > 0:
+        return 0.0
+    a, b = QgsPointXY(p1), QgsPointXY(p2)
+    if kind == "geodesic":
+        mid = [QgsPointXY(q) for chunk in distance.geodesicLine(a, b, length_m / 2.0, False) for q in chunk]
+        path_mid = mid[1] if len(mid) >= 3 else None    # rounding can add a point at the end
+    else:
+        ga, gb = distance.to_grid(a), distance.to_grid(b)
+        path_mid = distance.from_grid(QgsPointXY((ga.x() + gb.x()) / 2.0, (ga.y() + gb.y()) / 2.0))
+    if path_mid is None:
+        return 0.0
+    chord_mid = QgsPointXY((a.x() + b.x()) / 2.0, (a.y() + b.y()) / 2.0)
+    return float(distance.measureLine(path_mid, chord_mid))
+
+
 def path_points(p1, p2, distance, length_m: Optional[float] = None,
                 step_m: float = PATH_STEP_M) -> List[QgsPointXY]:
     """Points strictly between ``p1`` and ``p2`` (source CRS) on the KP path,
@@ -418,14 +441,7 @@ def path_points(p1, p2, distance, length_m: Optional[float] = None,
     try:
         # Where the path and the stored segment agree within the tolerance at
         # their midpoints, the stored segment is the path.
-        if kind == "geodesic":
-            mid = [QgsPointXY(q) for chunk in distance.geodesicLine(a, b, length_m / 2.0, False) for q in chunk]
-            path_mid = mid[1] if len(mid) >= 3 else None    # rounding can add a point at the end
-        else:
-            ga, gb = distance.to_grid(a), distance.to_grid(b)
-            path_mid = distance.from_grid(QgsPointXY((ga.x() + gb.x()) / 2.0, (ga.y() + gb.y()) / 2.0))
-        chord_mid = QgsPointXY((a.x() + b.x()) / 2.0, (a.y() + b.y()) / 2.0)
-        if path_mid is None or float(distance.measureLine(path_mid, chord_mid)) <= PATH_TOLERANCE_M:
+        if path_departure_m(a, b, distance, length_m) <= PATH_TOLERANCE_M:
             return []
         if kind == "geodesic":
             line = [QgsPointXY(q) for chunk in distance.geodesicLine(a, b, step_m, False) for q in chunk]
@@ -443,13 +459,59 @@ def path_points(p1, p2, distance, length_m: Optional[float] = None,
     return [q for q in inner if math.isfinite(q.x()) and math.isfinite(q.y())]
 
 
-def kp_basis_notes(distance, parts, total_m: float):
+def datum_note(crs):
+    """``(level, text)`` naming the transformation from ``crs`` to WGS84, or None.
+
+    None when ``crs`` is on the WGS84 datum (geographic or projected). Else
+    the operation QGIS uses (the project's transformation settings) and its
+    stated accuracy; a ballpark (approximate) transformation is a warning,
+    since positions can then be metres out.
+    """
+    from qgis.core import QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject
+
+    def plain(name) -> str:
+        return str(name or "").replace(" (with axis order normalized for visualization)", "").strip()
+
+    try:
+        if crs is None or not crs.isValid() or crs.authid() == "EPSG:4326":
+            return None
+        geographic = crs.toGeographicCrs() if hasattr(crs, "toGeographicCrs") else None
+        if geographic is not None and geographic.isValid() and plain(geographic.description()) == "WGS 84":
+            return None
+        try:
+            ensemble = crs.datumEnsemble()
+            if ensemble.isValid() and str(ensemble.name()).startswith("World Geodetic System 1984"):
+                return None
+        except AttributeError:  # QGIS before 3.20
+            pass
+        transform = QgsCoordinateTransform(crs, QgsCoordinateReferenceSystem("EPSG:4326"),
+                                           QgsProject.instance().transformContext())
+        details = transform.instantiatedCoordinateOperationDetails()
+        operation = plain(getattr(details, "name", "") or getattr(details, "proj", ""))
+        accuracy = float(getattr(details, "accuracy", -1.0) or -1.0)
+    except Exception:  # noqa: BLE001 - a report, never a failure
+        log_exception("KP: the datum transformation could not be described", level=logging.DEBUG)
+        return None
+    datum = plain(geographic.description() if geographic is not None and geographic.isValid() else crs.description())
+    text = (f"The route is on {datum} ({crs.authid() or crs.description()}); KP uses its positions transformed "
+            f"to WGS84 with {operation or 'the default transformation'}")
+    text += f" (stated accuracy {accuracy:g} m)." if accuracy > 0 else " (accuracy not stated)."
+    if "ballpark" in operation.lower():
+        return ("warn", text + " That is an approximate transformation: positions can be several metres out. "
+                               "Choose a better one in Project > Properties > Transformations.")
+    return ("info", text)
+
+
+def kp_basis_notes(distance, parts, total_m: float, origin_crs=None):
     """``[(level, text)]`` on the KP basis of a route (``level``: info / warn).
 
-    Always the distance model in words. For grid (Cartesian) KP also: where
-    route vertices lie outside the grid CRS's area of use (grid distances are
-    distorted there), and how far grid KP at the route end is from geodesic
-    KP (the grid scale factor). ``parts`` are the route's vertex lists in the
+    Always the distance model in words. When the route is not on the WGS84
+    datum (``origin_crs``: the CRS the route was stored in, by default the
+    distance area's source CRS), the datum transformation used (see
+    :func:`datum_note`). For grid (Cartesian) KP also: where route vertices
+    lie outside the grid CRS's area of use (grid distances are distorted
+    there), and how far grid KP at the route end is from geodesic KP (the
+    grid scale factor). ``parts`` are the route's vertex lists in the
     distance area's source CRS, ``total_m`` its KP length.
     """
     from qgis.core import QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject
@@ -461,6 +523,9 @@ def kp_basis_notes(distance, parts, total_m: float):
         source = distance.sourceCrs()
     except Exception:  # noqa: BLE001
         return notes
+    note = datum_note(origin_crs if origin_crs is not None else source)
+    if note is not None:
+        notes.append(note)
     if is_grid_distance(distance):
         grid = distance.grid_crs()
     elif kp_path_kind(distance) == "straight" and source is not None and not source.isGeographic():
@@ -1072,7 +1137,10 @@ class RouteFrame:
             geoms = raw_geoms
 
         lengths = [measure_total_length_m(g, distance) for g in geoms]
-        return cls(geoms, lengths, distance, follow_stored_geometry, start_kp_km, path)
+        frame = cls(geoms, lengths, distance, follow_stored_geometry, start_kp_km, path)
+        # The CRS the route was stored in (for the datum note when it was reprojected).
+        frame._origin_crs = source_crs
+        return frame
 
     # ----- properties -----
 
@@ -1262,11 +1330,31 @@ class RouteFrame:
         """``[(level, text)]``: the KP basis, and for grid KP its validity (:func:`kp_basis_notes`)."""
         self._ensure_chainage()
         parts = [list(part) for geom in self._geoms for part in iter_line_parts(geom) if len(part) >= 2]
-        notes = kp_basis_notes(self._distance, parts, self._chain_total_m)
+        notes = kp_basis_notes(self._distance, parts, self._chain_total_m,
+                               origin_crs=getattr(self, "_origin_crs", None))
         if self._chain_broken:
             notes.insert(0, ("warn", f"KP could not be measured past KP {self._start_kp_km + self._chain_total_m / 1000.0:.3f}: a route segment "
                                      "there has no measurable length, so the route ends there for KP."))
         return notes
+
+    def max_path_departure_m(self) -> float:
+        """Largest distance (m) between the KP path and the line as stored, over
+        the route's segments (midpoint check, :func:`path_departure_m`); 0 for
+        ``PATH_DRAWN`` or where they coincide. Computed once."""
+        cached = getattr(self, "_max_path_departure", None)
+        if cached is not None:
+            return cached
+        worst = 0.0
+        if self._path == PATH_KP:
+            for geom in self._geoms:
+                for part in iter_line_parts(geom):
+                    for p1, p2 in zip(part[:-1], part[1:]):
+                        try:
+                            worst = max(worst, path_departure_m(p1, p2, self._distance))
+                        except Exception:  # noqa: BLE001 - that segment is used as stored
+                            continue
+        self._max_path_departure = worst
+        return worst
 
     def build_indexes(self) -> "RouteFrame":
         """Build the chainage and segment indexes now instead of on the

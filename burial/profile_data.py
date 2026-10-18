@@ -79,6 +79,8 @@ class PlanProfile:
     cell_sizes_m: List = field(default_factory=list)
     cross_max_deg: List = field(default_factory=list)
     calculation_version: int = 2
+    # The plan's KP path marker when sampled (plan_model.kp_path_component).
+    kp_path: str = ""
     # Memoised slope series per (half window, direction) — profiles can hold
     # hundreds of thousands of stations, so recomputing per refresh would
     # stall the UI. Not persisted.
@@ -164,7 +166,8 @@ class PlanProfile:
                       scope_start_kp: float = 0.0, scope_end_kp: float = 0.0,
                       cross_offset_m: float = 0.0,
                       step_m: Optional[float] = None,
-                      layer_names: Optional[Dict[str, str]] = None
+                      layer_names: Optional[Dict[str, str]] = None,
+                      kp_path: str = ""
                       ) -> List[str]:
         """Human reasons the stored samples no longer match (empty = current).
 
@@ -179,6 +182,9 @@ class PlanProfile:
         reasons: List[str] = []
         if self.calculation_version != 2:
             reasons.append("the sampling method was updated")
+        if kp_path and self.kp_path != kp_path:
+            reasons.append("positions between route vertices now follow the KP path (the geodesic); "
+                           "this profile was sampled along the line as stored")
         if self.route_geom_fingerprint and route_geom_fingerprint:
             if self.route_geom_fingerprint != route_geom_fingerprint:
                 reasons.append("the route geometry changed")
@@ -279,6 +285,7 @@ class PlanProfile:
     def to_row(self, plan_id: str, profile_id: str = "") -> Dict:
         params = {
             "calculation_version": self.calculation_version,
+            "kp_path": self.kp_path,
             "step_m": self.step_m,
             "cross_offset_m": self.cross_offset_m,
             "scope_start_kp": self.scope_start_kp,
@@ -362,6 +369,7 @@ class PlanProfile:
         layer_names = params.get("depth_layer_names")
         return cls(
             calculation_version=int(params.get("calculation_version") or 1),
+            kp_path=str(params.get("kp_path") or ""),
             source_ids=source_ids,
             cell_sizes_m=cell_sizes,
             cross_max_deg=samples.get("cross_max") or [],

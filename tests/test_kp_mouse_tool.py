@@ -20,6 +20,12 @@
   radius does not rebuild it.
 * The toolbar wrapper joins the plugin menu, uses the icon file, and its
   unload deletes the button and both actions (nothing left after reload).
+* Depth while hovering: depth at the cursor and at the KP from a raster,
+  nothing where there is no data, deferred to the mouse stop when sampling
+  is slow, and switched off (never raising) when sampling fails.
+* The configure dialog opens wide; its depth layer table suggests likely
+  bathymetry first, searches, filters by type, sorts on a column and keeps
+  contour field choices through filtering and sorting.
 """
 
 from __future__ import annotations
@@ -381,6 +387,193 @@ def test_canvas_move_event():
         iface.close()
 
 
+def _depth_raster(folder, name="hover depth"):
+    """A small EPSG:4326 depth grid over part of _FEATURES: depth = 50 + 0.1 x column."""
+    import numpy as np
+    from osgeo import gdal, osr
+    from qgis.core import QgsRasterLayer
+
+    from ..bathymetry_sampling import PREFIX
+    gdal.UseExceptions()
+    path = folder + "/" + "".join(ch if ch.isalnum() else "_" for ch in name) + ".tif"
+    rows, cols = 130, 150
+    array = (50.0 + 0.1 * np.mgrid[0:rows, 0:cols][1]).astype(np.float32)
+    ds = gdal.GetDriverByName("GTiff").Create(path, cols, rows, 1, gdal.GDT_Float32)
+    ds.SetGeoTransform((2.99, 0.001, 0, 55.11, 0, -0.001))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(4326)
+    ds.SetProjection(srs.ExportToWkt())
+    ds.GetRasterBand(1).WriteArray(array)
+    ds = None
+    layer = QgsRasterLayer(path, name)
+    layer.setCustomProperty(PREFIX + "vertical", "depth")
+    return layer
+
+
+def _move(tool, iface, pos):
+    from qgis.gui import QgsMapMouseEvent
+    event = QgsMapMouseEvent(iface.canvas, QEvent.Type.MouseMove, pos, Qt.MouseButton.NoButton,
+                             Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier)
+    tool.canvasMoveEvent(event)
+
+
+def test_hover_depth():
+    import shutil
+    import tempfile
+    folder = tempfile.mkdtemp(prefix="sct_hoverdepth_")
+    iface = _Iface()
+    layer = _layer(_FEATURES)
+    raster = _depth_raster(folder)
+    tool = KPMouseMapTool(iface.mapCanvas(), layer, iface, "m", True, False, True, [(raster, "")])
+    far = _depth_raster(folder, "far")
+    try:
+        iface.canvas.setExtent(layer.extent())
+        pos = QPoint(380, 280)
+        _move(tool, iface, pos)
+        mouse = tool.toMapCoordinates(pos)
+        hit = tool._locate(mouse)
+        sampler = tool._get_depth_sampler()
+        at_cursor = sampler.sample_point(QgsPointXY(mouse))
+        at_kp = sampler.sample_point(hit.snapped_xy)
+        status = iface.window.statusBar().currentMessage()
+        values_ok = (hit.dcc_m >= 1.0 and at_cursor is not None and at_kp is not None
+                     and "Depth at cursor: %.2f m" % at_cursor in tool.last_message
+                     and "Depth at KP: %.2f m" % at_kp in tool.last_message
+                     and "Depth at KP: %.2f m" % at_kp in status)
+        # No data where the grid does not reach: no depth lines, no error.
+        far.dataProvider()  # keep the layer alive
+        empty = KPMouseMapTool(iface.mapCanvas(), layer, iface, "m", True, False, True, [(raster, "")])
+        empty._depth_sampler = type("NoData", (), {
+            "has_sources": lambda self: True,
+            "sample_point_detail": lambda self, point, local_only=False: None})()
+        _move(empty, iface, pos)
+        no_data_ok = "Depth" not in empty.last_message and "KP:" in empty.last_message
+        empty.cleanup_resources()
+        # A failing sampler turns hover depth off; KP tracking carries on.
+        broken = KPMouseMapTool(iface.mapCanvas(), layer, iface, "m", True, False, True, [(raster, "")])
+
+        def fail(point, local_only=False):
+            raise RuntimeError("simulated read failure")
+
+        broken._get_depth_sampler().sample_point_detail = fail
+        _move(broken, iface, pos)
+        _move(broken, iface, QPoint(390, 290))
+        failure_ok = broken._hover_depth_off and "KP:" in broken.last_message and "Depth" not in broken.last_message
+        broken.cleanup_resources()
+        # A slow sampler defers depth until the mouse stops.
+        slow = KPMouseMapTool(iface.mapCanvas(), layer, iface, "m", True, False, True, [(raster, "")])
+        real = slow._get_depth_sampler().sample_point_detail
+
+        def sleepy(point, local_only=False):
+            time.sleep(0.1)
+            return real(point, local_only)
+
+        slow._get_depth_sampler().sample_point_detail = sleepy
+        _move(slow, iface, pos)
+        became_slow = slow._hover_depth_slow
+        _move(slow, iface, pos)
+        deferred = slow._hover_depth_pending and "Depth" not in slow.last_message
+        slow.start_persistent_tooltip()
+        shown_on_stop = "Depth at KP:" in slow.last_message
+        slow.cleanup_resources()
+        # Hover depth off: nothing sampled.
+        off = KPMouseMapTool(iface.mapCanvas(), layer, iface, "m", True, False, True, [(raster, "")],
+                             showHoverDepth=False)
+        _move(off, iface, pos)
+        off_ok = "Depth" not in off.last_message
+        off.cleanup_resources()
+        ok = values_ok and no_data_ok and failure_ok and became_slow and deferred and shown_on_stop and off_ok
+        return _result("hover depth: cursor and KP depths, no data, failure, slow source, off", ok,
+                       "values=%s no-data=%s failure=%s slow=%s/%s/%s off=%s (%s)"
+                       % (values_ok, no_data_ok, failure_ok, became_slow, deferred, shown_on_stop, off_ok,
+                          tool.last_message.replace("\n", " | ")))
+    finally:
+        tool.cleanup_resources()
+        iface.close()
+        del raster, far
+        import gc
+        gc.collect()
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def test_config_dialog_depth_table():
+    import shutil
+    import tempfile
+
+    from qgis.core import QgsField
+
+    from ..maptools.depth_source_table import (COL_FIELD, COL_LAYER, LAYER_ID_ROLE, looks_like_bathymetry)
+    from ..maptools.kp_mouse_maptool import KPConfigDialog
+    from ..qgis_compat import (CHECK_STATE_CHECKED, FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, ITEM_FLAG_USER_CHECKABLE,
+                               _scoped_member)
+
+    folder = tempfile.mkdtemp(prefix="sct_depthtable_")
+    project = QgsProject.instance()
+    mbes = _depth_raster(folder, "ZZ MBES grid 2024")
+    satellite = _depth_raster(folder, "ZZ Satellite image")
+    contours = QgsVectorLayer("LineString?crs=EPSG:4326", "ZZ Depth contours", "memory")
+    contours.dataProvider().addAttributes([QgsField("label", FIELD_TYPE_STRING), QgsField("elev", FIELD_TYPE_DOUBLE),
+                                           QgsField("depth", FIELD_TYPE_DOUBLE)])
+    contours.updateFields()
+    route = _layer(_FEATURES, "ZZ Cable route")
+    project.addMapLayers([mbes, satellite, contours, route])
+    dialog = None
+    try:
+        dialog = KPConfigDialog(None, current_layer=route, show_depth=True,
+                                depth_sources=[(satellite.id(), "")])
+        table = dialog.depth_table
+        ids = [table.model.item(r, COL_LAYER).data(LAYER_ID_ROLE) for r in range(table.model.rowCount())]
+        mine = [i for i in ids if i in (mbes.id(), satellite.id(), contours.id(), route.id())]
+        order_ok = mine == [satellite.id(), mbes.id(), contours.id(), route.id()]
+        row_of = {i: r for r, i in enumerate(ids)}
+        route_item = table.model.item(row_of[route.id()], COL_LAYER)
+        field_item = table.model.item(row_of[contours.id()], COL_FIELD)
+        guess_ok = field_item.text() == "depth" and not (route_item.flags() & ITEM_FLAG_USER_CHECKABLE)
+        # Choose "elev", then search, filter by type and sort: the choice stays.
+        field_item.setText("elev")
+        table.search.setText("zz depth")
+        search_ok = [table.filter.index(r, COL_LAYER).data() for r in range(table.filter.rowCount())] == \
+            ["ZZ Depth contours"]
+        table.check_shown.click()
+        table.search.setText("")
+        table.kind_combo.setCurrentIndex(table.kind_combo.findData("raster"))
+        kinds_ok = all(table.filter.index(r, 1).data() == "Raster" for r in range(table.filter.rowCount()))
+        table.kind_combo.setCurrentIndex(0)
+        table.view.sortByColumn(COL_LAYER, _scoped_member(Qt, "SortOrder", "DescendingOrder"))
+        names = [table.filter.index(r, COL_LAYER).data() for r in range(table.filter.rowCount())]
+        sort_ok = names == sorted(names, key=str.lower, reverse=True)
+        table.checked_only.setChecked(True)
+        checked_rows = table.filter.rowCount()
+        table.checked_only.setChecked(False)
+        table.suggested_order()
+        back_ok = table.filter.index(0, COL_LAYER).data(LAYER_ID_ROLE) == ids[0]
+        chosen = dialog._selected_depth_sources()
+        chosen_ok = (satellite.id(), "") in chosen and (contours.id(), "elev") in chosen and checked_rows == 2
+        state_ok = table.model.item(row_of[contours.id()], COL_LAYER).checkState() == CHECK_STATE_CHECKED
+        wide_ok = dialog.width() >= 600 and dialog.height() >= 480
+        dialog.hover_depth_checkbox.setChecked(False)
+        dialog.get_settings()
+        hover_ok = dialog.show_hover_depth is False
+        names_ok = (looks_like_bathymetry("MBES_2024") and looks_like_bathymetry("Bathymetry 5 m")
+                    and looks_like_bathymetry("DEM 5m") and looks_like_bathymetry("route_xyz")
+                    and not looks_like_bathymetry("Academic survey") and not looks_like_bathymetry("Zones")
+                    and not looks_like_bathymetry("Satellite image"))
+        ok = (order_ok and guess_ok and search_ok and kinds_ok and sort_ok and back_ok and chosen_ok
+              and state_ok and wide_ok and hover_ok and names_ok)
+        return _result("configure dialog: wide, depth table suggests, searches, filters, sorts, keeps fields", ok,
+                       "order=%s guess=%s search=%s kinds=%s sort=%s back=%s chosen=%s state=%s size=%dx%d "
+                       "hover=%s names=%s" % (order_ok, guess_ok, search_ok, kinds_ok, sort_ok, back_ok, chosen,
+                                              state_ok, dialog.width(), dialog.height(), hover_ok, names_ok))
+    finally:
+        if dialog is not None:
+            dialog.deleteLater()
+        project.removeMapLayers([mbes.id(), satellite.id(), contours.id(), route.id()])
+        QCoreApplication.processEvents()
+        import gc
+        gc.collect()
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 def test_range_ring_cached_and_unchanged():
     iface = _Iface("EPSG:3857")
     layer = _layer(_FEATURES)
@@ -582,4 +775,6 @@ def run_all():
         test_layer_has_features(),
         test_wrapper_menu_icon_and_unload(),
         test_start_kp_from_workbench_rpl(),
+        test_hover_depth(),
+        test_config_dialog_depth_table(),
     ]

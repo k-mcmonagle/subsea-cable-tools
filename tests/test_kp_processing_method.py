@@ -461,6 +461,115 @@ def test_nearest_kp() -> List[bool]:
             QgsProject.instance().removeMapLayer(layer.id())
 
 
+def _chord_offset_m(point: QgsPointXY, a: QgsPointXY, b: QgsPointXY) -> float:
+    """Distance (m) from ``point`` to the segment ``a``-``b`` drawn straight in degrees."""
+    da = _da()
+
+    def dist(t):
+        return float(da.measureLine(QgsPointXY(point),
+                                    QgsPointXY(a.x() + (b.x() - a.x()) * t, a.y() + (b.y() - a.y()) * t)))
+
+    lo, hi = 0.0, 1.0
+    g = (math.sqrt(5.0) - 1.0) / 2.0
+    for _ in range(60):
+        x1, x2 = hi - g * (hi - lo), lo + g * (hi - lo)
+        if dist(x1) < dist(x2):
+            hi = x2
+        else:
+            lo = x1
+    return dist((lo + hi) / 2.0)
+
+
+def test_densify_route_kp_path() -> List[bool]:
+    """The two legs stored second leg first (SeqNo order), start KP 12.345: the
+    output follows the geodesic, keeps every vertex, copies the attributes and
+    gives each feature its KPs on the whole route. A second layer whose fields
+    already use the names kp_from / KP_TO gets kp_from_2 / kp_to_2."""
+    import re
+
+    from ..processing.densify_route_kp_path_algorithm import DensifyRouteKpPathAlgorithm
+
+    layer = legs_layer()
+    try:
+        layers, log = run_algorithm(DensifyRouteKpPathAlgorithm(), {"INPUT": layer, "START_KP": START}, ["OUTPUT"])
+    finally:
+        _remove(layer)
+    if layers is None:
+        return [_report("Densify Route Along KP Path runs", False, " | ".join(log[-3:]))]
+    da = _da()
+    corners = [QgsPointXY(*c) for c in CORNERS]
+    legs = leg_lengths()
+    ends = [START, START + legs[0] / 1000.0, START + (legs[0] + legs[1]) / 1000.0]
+    rows = list(layers[0].getFeatures())
+    names = layers[0].fields().names()
+    lines = [row.geometry().asMultiPolyline() for row in rows]
+
+    ok_attrs = (names == ["SeqNo", "cls", "kp_from", "kp_to"]
+                and [(row["SeqNo"], row["cls"]) for row in rows] == [(1, "A"), (2, "B")])
+    ok_kp = len(rows) == 2 and all(
+        abs(row["kp_from"] - ends[i]) < 1e-6 and abs(row["kp_to"] - ends[i + 1]) < 1e-6
+        for i, row in enumerate(rows))
+    kp_detail = "; ".join(f"{row['kp_from']}-{row['kp_to']}" for row in rows) + \
+        f" vs {ends[0]:.6f}-{ends[1]:.6f}; {ends[1]:.6f}-{ends[2]:.6f}"
+
+    out_keys = {(p.x(), p.y()) for parts in lines for part in parts for p in part}
+    ok_vertices = (len(lines) == 2 and all(len(parts) == 1 for parts in lines)
+                   and all(parts[0][0] == corners[i] and parts[0][-1] == corners[i + 1]
+                           for i, parts in enumerate(lines))
+                   and all((c.x(), c.y()) in out_keys for c in corners))
+
+    added = [parts[0][1:-1] for parts in lines] if ok_vertices else [[], []]
+    added_points = [p for run in added for p in run]
+    worst = worst_off_route(added_points, step=10) if added_points else float("inf")
+    spacing = max((float(da.measureLine(p, q)) for parts in lines for p, q in zip(parts[0][:-1], parts[0][1:])),
+                  default=float("inf"))
+    length_err = max((abs(sum(float(da.measureLine(p, q)) for p, q in zip(parts[0][:-1], parts[0][1:])) - legs[i])
+                      for i, parts in enumerate(lines)), default=float("inf"))
+
+    # The reported largest distance from the line as stored, against a
+    # direct search on each leg straight in degrees.
+    expect_offset = max((_chord_offset_m(p, corners[i], corners[i + 1]) for i, run in enumerate(added) for p in run),
+                        default=0.0)
+    found = [float(m.group(1)) for line in log for m in [re.search(r"KP path is up to ([0-9.]+) m", line)] if m]
+    ok_offset = len(found) == 1 and abs(found[0] - expect_offset) < 0.1
+    ok_count = any(f"Added {len(added_points)} point(s)" in line for line in log)
+
+    clash = QgsVectorLayer("LineString?crs=EPSG:4326&field=kp_from:double&field=KP_TO:string", "clash", "memory")
+    feature = QgsFeature(clash.fields())
+    feature.setGeometry(QgsGeometry.fromPolylineXY(corners))
+    feature.setAttributes([1.5, "x"])
+    clash.dataProvider().addFeatures([feature])
+    _add(clash)
+    try:
+        clash_layers, clash_log = run_algorithm(DensifyRouteKpPathAlgorithm(), {"INPUT": clash}, ["OUTPUT"])
+    finally:
+        _remove(clash)
+    clash_row = next(clash_layers[0].getFeatures()) if clash_layers else None
+    ok_clash = (clash_row is not None
+                and clash_layers[0].fields().names() == ["kp_from", "KP_TO", "kp_from_2", "kp_to_2"]
+                and clash_row["kp_from"] == 1.5 and clash_row["KP_TO"] == "x"
+                and abs(clash_row["kp_from_2"]) < 1e-9 and abs(clash_row["kp_to_2"] - sum(legs) / 1000.0) < 1e-6)
+
+    return [
+        _report("Densify Route Along KP Path: one feature per leg in SeqNo order, attributes copied", ok_attrs,
+                f"{names}, {[(row['SeqNo'], row['cls']) for row in rows]}"),
+        _report("Densify Route Along KP Path: kp_from/kp_to = start KP + chainage at each feature's ends", ok_kp,
+                kp_detail),
+        _report("Densify Route Along KP Path: every input vertex kept, each feature from its first to last vertex",
+                ok_vertices, f"{[len(parts[0]) for parts in lines]} vertices"),
+        _report("Densify Route Along KP Path: added points lie on the geodesic, about 250 m apart",
+                len(added_points) > 400 and worst < 0.01 and spacing < 250.001,
+                f"{len(added_points)} points, furthest {worst * 1000:.2f} mm, largest step {spacing:.3f} m"),
+        _report("Densify Route Along KP Path: KP along the output = KP along the input (within 1 mm)",
+                length_err < 0.001, f"{length_err * 1000:.4f} mm"),
+        _report("Densify Route Along KP Path: the log states the points added and the largest offset",
+                ok_count and ok_offset, f"reported {found} m vs {expect_offset:.2f} m"),
+        _report("Densify Route Along KP Path: an input field called kp_from / KP_TO gives kp_from_2 / kp_to_2",
+                ok_clash, str(clash_layers[0].fields().names()) if clash_layers else " | ".join(clash_log[-3:])),
+        _report("Densify Route Along KP Path: the log states the KP basis and the start KP", _basis_logged(log)),
+    ]
+
+
 # --------------------------------------------------------------------------
 # KP Ranges
 # --------------------------------------------------------------------------
@@ -898,7 +1007,7 @@ def test_place_outline_along_route() -> List[bool]:
 def run_all() -> List[bool]:
     results: List[bool] = []
     for test in (test_place_kp_points, test_place_kp_points_from_csv, test_place_single_kp_point,
-                 test_place_single_kp_point_grid, test_nearest_kp,
+                 test_place_single_kp_point_grid, test_nearest_kp, test_densify_route_kp_path,
                  test_kp_range_highlighter, test_kp_range_csv, test_kp_range_rule_based,
                  test_kp_range_depth_slope_summary, test_extract_ac_points, test_crossing_points, test_area_listing,
                  test_corridor_proximity_listing, test_translate_kp, test_route_comparison,

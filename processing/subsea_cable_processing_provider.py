@@ -55,6 +55,7 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
 
         # --- KP Points ---
         safe_add('add_depth_to_point_layer_algorithm', 'AddDepthToPointLayerAlgorithm')
+        safe_add('densify_route_kp_path_algorithm', 'DensifyRouteKpPathAlgorithm')
         safe_add('nearest_kp_algorithm', 'NearestKPAlgorithm')
         safe_add('place_kp_points_algorithm', 'PlaceKpPointsAlgorithm')
         safe_add('place_kp_points_from_csv_algorithm', 'PlaceKpPointsFromCsvAlgorithm')

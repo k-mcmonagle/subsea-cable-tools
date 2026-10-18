@@ -726,6 +726,31 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   planar length in CRS units (degrees as metres on a geographic route) or
   0 m, shifting every later KP. RouteFrame keeps ending its index there and
   now reports it in `kp_basis_notes`.
+- **Burial results made before the KP path change are flagged, not
+  recomputed.** `PlanModel.kp_path_component` is `kp-path:<kind>` only when
+  the route's KP path is more than 1 m from the stored line somewhere
+  (`RouteFrame.max_path_departure_m`, midpoint check per leg). It joins the
+  exclusion global fingerprint (a stored run without it is reported out of
+  date, unlike other empty components), the profile identity and the tool
+  path fingerprint (only when non-empty), so short-leg routes keep their
+  digests and nothing flips on upgrade there. Risk checks carry
+  `RISK_KP_METHOD` unconditionally: the nearest-point fix moved hazard KPs
+  beside the route on every route, so every earlier scan reads out of date
+  once.
+- **Datum transformations are reported, not chosen.** `kp_geo_utils.datum_note`
+  names the operation QGIS uses from the route's CRS to WGS84 and its
+  stated accuracy (warning for a ballpark one); RouteFrame keeps the stored
+  CRS (`_origin_crs`) so a route reprojected first is still described. The
+  user's project transformation settings stay in charge.
+- **Display copies, not altered routes, for latitude/longitude maps.**
+  QGIS draws a layer straight in its CRS between vertices; *Densify Route
+  Along KP Path* writes a copy with the KP path's points (every 250 m where
+  it departs by more than 1 mm), leaving RPL data untouched.
+- **KP Mouse hover depth is best effort.** Depth at the cursor and at the
+  KP come from the configured sources (`DepthSampler.sample_point_detail`:
+  rasters by resolution, then the nearest contour only inside that layer's
+  extent). Network rasters are skipped; a sample slower than 150 ms defers
+  depth to the mouse stop; an error turns it off for that tool instance.
 - **A line layer passed as a feature source is read in route order**
   (`_normalise_geoms` through `ordered_route_features`), so
   `RouteFrame.from_source(layer)` (e.g. the Explorer's off-line check)

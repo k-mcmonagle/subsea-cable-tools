@@ -1399,6 +1399,7 @@ class BurialPlannerDock(QDockWidget):
             depth_layers=identity["depth_layers"],
             depth_signature=identity["depth_signature"],
             depth_layer_names=identity["depth_layer_names"],
+            kp_path=identity.get("kp_path", ""),
             sampled_utc=schema.utc_now_iso(),
             kps=task.kps, depths=task.depths,
             source_ids=task.source_ids, cell_sizes_m=task.cell_sizes_m, cross_max_deg=task.cross_max_deg,

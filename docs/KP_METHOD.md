@@ -64,7 +64,8 @@ Select it in **Subsea Cable Tools ▸ KP settings…** for an RPL that was chain
 - **Map display:**
   - A map in a projected CRS (for example the route's UTM zone) draws long legs within about 1 m of the geodesic.
   - A map in latitude/longitude draws them straight in degrees, so on long legs it does not show where the KPs
-    lie. Use a projected map CRS to inspect long legs.
+    lie. Use a projected map CRS to inspect long legs, or **Densify Route Along KP Path** (Processing, KP Points),
+    which writes a copy of the route with points along its KP path that draws where the KPs lie in any map CRS.
 - **Transit playback** in the Lay Planner deliberately follows the line as drawn. It keeps the geodesic length.
 - **Bearings** (KP Mouse Tool range/bearing, Place Single KP Point) are true bearings: the geodesic azimuth on
   WGS84, in degrees clockwise from true north. They are not grid bearings, so they differ from a bearing
@@ -107,7 +108,9 @@ Most routes start at KP 0. A route that starts elsewhere is always shown, and th
 ## 6. Assumptions and limits
 
 - **Positions:** taken as WGS84. Other datums are transformed with the QGIS project transformation settings.
-  The choice of datum transformation can move positions by up to about 1 m; leg lengths change by far less.
+  The choice of datum transformation can move positions by up to about 1 m; leg lengths change by far less. For
+  a route not on the WGS84 datum, the KP basis notes name the transformation used and its stated accuracy, and
+  warn when it is only approximate (a ballpark transformation, metres out).
 - **Heights:** not used. KP is horizontal distance on the ellipsoid. For the length over the seabed, see
   [KP and bathymetry methods](KP_AND_BATHYMETRY.md).
 - **±180° meridian:** routes that cross it are refused, because positions on the crossing leg would be wrong.

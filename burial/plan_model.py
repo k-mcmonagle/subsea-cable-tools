@@ -120,6 +120,7 @@ class PlanModel(QObject):
         self.analysis_context: Optional[generation.ResolutionContext] = None
         self.analysis_nodata: List[Interval] = []
         self._route_geom_fp = ""
+        self._kp_path_fp: Optional[str] = None
         self.route = None            # RouteFrame over the plan's RPL (WGS84)
         self.distance = None
         self.resolved_rpl_id = ""
@@ -298,6 +299,7 @@ class PlanModel(QObject):
         self.analysis_context = None
         self.analysis_nodata = []
         self._route_geom_fp = ""
+        self._kp_path_fp = None
         self.route = None
         self.resolved_rpl_id = ""
         self.route_notice = ""
@@ -336,6 +338,7 @@ class PlanModel(QObject):
         self.newer_rpl = None
         rpl_row = None
         self._route_geom_fp = ""
+        self._kp_path_fp = None
         self._segment_wkt_cache.clear()
         project = QgsProject.instance()
         lines_layer = None
@@ -784,6 +787,28 @@ class PlanModel(QObject):
                 self._route_geom_fp = ""
         return self._route_geom_fp
 
+    # Results computed along the line as stored go stale where the KP path is
+    # further than this from it (docs/KP_METHOD.md, section 3).
+    KP_PATH_STALE_M = 1.0
+
+    def kp_path_component(self) -> str:
+        """``kp-path:<kind>`` when the route's KP path (the geodesic, or the
+        grid line) is more than ``KP_PATH_STALE_M`` from the line as stored
+        anywhere, else ''. Results without this marker were computed along
+        the stored line, so they are reported stale on such routes only."""
+        if self.route is None:
+            return ""
+        if self._kp_path_fp is None:
+            try:
+                from ..kp_geo_utils import kp_path_kind
+                departure = float(self.route.max_path_departure_m())
+                self._kp_path_fp = (f"kp-path:{kp_path_kind(self.distance or self.route._distance)}"
+                                    if departure > self.KP_PATH_STALE_M else "")
+            except Exception:
+                log_exception("Burial Planner: KP path check failed", level=logging.DEBUG)
+                self._kp_path_fp = ""
+        return self._kp_path_fp
+
     # -- latest analysis results (bp_analysis) -------------------------------
     def _profile_stamp(self) -> str:
         profile = self.bathy_profile
@@ -799,7 +824,8 @@ class PlanModel(QObject):
             self.inputs if inputs is None else inputs,
             route_fp=self.route_geometry_fingerprint(),
             profile_stamp=(self._profile_stamp() if profile_stamp is None
-                           else profile_stamp))
+                           else profile_stamp),
+            kp_path=self.kp_path_component())
 
     def analysis_basis(self) -> Dict:
         """What a recompute is computed from, captured at launch."""
@@ -943,8 +969,11 @@ class PlanModel(QObject):
                     stored = analysis_state.exclusion_fingerprints(
                         gen_params, snapshot, self.inputs,
                         profile_stamp=self._profile_stamp())
-                    # The generation stored no route or profile identity.
+                    # The generation stored no route or profile identity
+                    # (nor when it ran relative to the KP path change).
                     stored["global"]["route"] = ""
+                    if current["global"].get("kp_path"):
+                        stored["global"]["kp_path"] = current["global"]["kp_path"]
                 except (TypeError, ValueError, AttributeError):
                     stored = None
                 status.update(source="generation",
@@ -1204,7 +1233,8 @@ class PlanModel(QObject):
                 # A changed target step (manual override, different raster
                 # cell, tighter analysis step) also warrants a resample.
                 step_m=self.resolve_profile_step_m(params),
-                layer_names=info.get("names"))
+                layer_names=info.get("names"),
+                kp_path=self.kp_path_component())
         except Exception as exc:  # never let a currency check break a refresh
             return [f"the currency check failed ({exc})"]
 
@@ -1225,6 +1255,7 @@ class PlanModel(QObject):
             "depth_layers": dict(info["layers"]),
             "depth_signature": info["signature"],
             "depth_layer_names": dict(info.get("names") or {}),
+            "kp_path": self.kp_path_component(),
         }
 
     def save_profile(self, profile: PlanProfile) -> bool:
@@ -1443,7 +1474,7 @@ class PlanModel(QObject):
                 depth_basis += "|live-sampling"
         return path_data.build_fingerprints(
             self.plan, self.current_rpl_fingerprint(), tool, tool_config,
-            config, layback, depth_basis)
+            config, layback, depth_basis, kp_path=self.kp_path_component())
 
     def path_state(self, config: Optional[Dict] = None) -> Dict[str, str]:
         state = path_data.result_state(
