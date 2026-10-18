@@ -165,6 +165,27 @@ class RouteGeo:
         return RouteGeo(route, lo, self.name)
 
 
+class StartKpModel:
+    """An RPL model whose start KP is set by the user (everything else from the RPL)."""
+
+    def __init__(self, model, start_kp_km: float):
+        self._model = model
+        self._start = float(start_kp_km)
+
+    def __getattr__(self, name):
+        return getattr(self._model, name)
+
+    def start_kp_km(self) -> float:
+        return self._start
+
+
+def with_start_kp(model, start_kp_km: Optional[float]):
+    """``model`` with the start KP set (``None``: the RPL's own)."""
+    if model is None or start_kp_km is None or abs(float(start_kp_km) - model.start_kp_km()) < 1e-12:
+        return model
+    return StartKpModel(getattr(model, "_model", model), start_kp_km)
+
+
 def route_from_rpl_model(model, name: str = "") -> RouteGeo:
     """A RouteGeo through the RPL's positions (WGS84), KP from the RPL's start KP.
 
@@ -371,7 +392,8 @@ def body_kind(name: str) -> str:
     return "Body"
 
 
-def fit_makeup(store, fit_id: str, rows: Sequence[Dict]) -> Tuple[List[pl.CableSection], List[pl.Body], List[str]]:
+def fit_makeup(store, fit_id: str, rows: Sequence[Dict],
+               start_kp_km: Optional[float] = None) -> Tuple[List[pl.CableSection], List[pl.Body], List[str]]:
     """Cable sections and bodies of a Workbench assembly fitted to an RPL, by KP.
 
     A section's cable type resolves through the cable library (project
@@ -392,7 +414,7 @@ def fit_makeup(store, fit_id: str, rows: Sequence[Dict]) -> Tuple[List[pl.CableS
     anchor = FitAnchor(float(fit.get("anchor_kp_km") or 0.0), float(fit.get("anchor_cable_dist_m") or 0.0),
                        1 if int(fit.get("direction") or 1) >= 0 else -1)
     result = fit_assembly(assembly, model, anchor)
-    measured = rpl_kp_mapper(model)      # the fit works in the RPL's printed KPs
+    measured = rpl_kp_mapper(with_start_kp(model, start_kp_km))      # the fit works in the RPL's printed KPs
     mapping = {}
     try:
         mapping = library.project_mapping()

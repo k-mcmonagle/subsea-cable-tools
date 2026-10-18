@@ -15,7 +15,8 @@ Each output includes:
 - Source layer name + feature id
 - JSON-encoded copy of all source attributes
 - Representative lat/lon in EPSG:4326
-- KP (km) and DCC (m) to the input RPL line (via existing RPLComparator logic)
+- KP (km) and DCC (m) to the input RPL line (via existing RPLComparator logic):
+  start KP + chainage, on the route's KP path (docs/KP_METHOD.md)
 - Reference to the input RPL layer name
 
 Output layers are automatically named using the Lay Corridor layer name (if provided)
@@ -56,7 +57,8 @@ from qgis.core import (
 from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_STRING, GEOMETRY_LINE, GEOMETRY_POINT, GEOMETRY_POLYGON
 
-from .rpl_comparison_utils import RPLComparator
+from .kp_common import START_KP_HELP, add_start_kp_parameter, read_start_kp, report_kp_basis
+from .rpl_comparison_utils import RPLComparator, kp_path_geometry
 
 
 def _safe_field_base_name(name: str) -> str:
@@ -184,6 +186,8 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(SubseaCableAlgorithm):
                 optional=True,
             )
         )
+
+        add_start_kp_parameter(self)
 
     def processAlgorithm(self, parameters, context, feedback):
         rpl_layer = self.parameterAsVectorLayer(parameters, self.INPUT_RPL, context)
@@ -344,28 +348,20 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(SubseaCableAlgorithm):
             else QgsCoordinateTransform(out_crs, rpl_crs, context.transformContext())
         )
 
-        # KP/DCC calculator on RPL (in RPL CRS)
+        # KP/DCC calculator on RPL (in RPL CRS), with the start KP.
+        start_kp = read_start_kp(self, parameters, context)
         try:
-            comparator = RPLComparator(rpl_layer, rpl_layer, rpl_crs, context)
+            comparator = RPLComparator(rpl_layer, rpl_layer, rpl_crs, context, source_start_kp_km=start_kp)
         except Exception as e:
             raise QgsProcessingException(self.tr(f'Failed to initialize RPL comparator: {str(e)}'))
+        report_kp_basis(feedback, comparator.source_frame, start_kp)
 
-        # Build a single geometry for RPL to support robust nearest-point logic for lines/polygons
-        rpl_geom_parts: List[QgsGeometry] = []
-        for feat in rpl_layer.getFeatures(QgsFeatureRequest().setSubsetOfAttributes([])):
-            geom = feat.geometry()
-            if geom is None or geom.isEmpty():
-                continue
-            rpl_geom_parts.append(QgsGeometry(geom))
-
-        if not rpl_geom_parts:
+        # The route as it runs between its vertices (its KP path: the
+        # geodesic, or the grid line), in route order: what features must
+        # intersect without a corridor, and what nearest points are taken on.
+        rpl_union = kp_path_geometry(comparator.source_frame)
+        if rpl_union is None or rpl_union.isEmpty():
             raise QgsProcessingException(self.tr('Input RPL layer has no line geometry.'))
-
-        try:
-            rpl_union = QgsGeometry.unaryUnion(rpl_geom_parts) if len(rpl_geom_parts) > 1 else rpl_geom_parts[0]
-        except Exception:
-            # Fallback: union can fail on some invalid geometries; just use first feature geometry.
-            rpl_union = rpl_geom_parts[0]
 
         rpl_name = rpl_layer.name()
 
@@ -693,7 +689,7 @@ class IdentifyRPLLayCorridorProximityListingAlgorithm(SubseaCableAlgorithm):
 Creates listing layers containing all provided point/line/polygon features which intersect either an input Lay Corridor polygon layer, or the input RPL line if no Lay Corridor is provided.
 
 **Inputs**
-- RPL Line Layer: reference route used to compute KP and DCC.
+- RPL Line Layer: reference route used to compute KP and DCC (in SeqNo order when every feature has one, else layer order). KP is start KP + chainage; without a Lay Corridor, features must intersect the route's KP path (between vertices along the geodesic, or the straight grid line for grid KP).
 - Lay Corridor Layer (optional): polygon bounds (typically created by the Dynamic Buffer tool). If not provided, intersection tests are performed against the RPL line itself.
 - Point Layer(s): optional point layer(s) to test.
 - Line Layer(s): optional line layer(s) to test.
@@ -722,7 +718,7 @@ Outputs are automatically named using the Lay Corridor layer name (if provided) 
 - _Line_Prox_Listing
 - _Area_Prox_Listing
 """
-        )
+        ) + "\n\n" + self.tr(START_KP_HELP)
 
     def tr(self, string):
         return QCoreApplication.translate('Processing', string)

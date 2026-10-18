@@ -307,8 +307,22 @@ class DepthProfileDockWidget(QDockWidget):
         self.kp_ref_selected_chk.setToolTip("Use only the selected features of the KP route layer")
         self.kp_ref_selected_chk.setChecked(bool(self.settings.value("DepthProfile/kp_ref_selected_only", False, type=bool)))
         kp_row.addWidget(self.kp_ref_selected_chk)
+        kp_row.addWidget(QLabel("Start KP"))
+        self.start_kp_spin = QDoubleSpinBox()
+        self.start_kp_spin.setRange(-100000.0, 100000.0)
+        self.start_kp_spin.setDecimals(3)
+        self.start_kp_spin.setSuffix(" km")
+        self.start_kp_spin.setToolTip(
+            "The KP at the first vertex of the route whose KP is on the X axis (the profile line, or the "
+            "KP route): 0 for most routes. Filled from a Cable Route Workbench RPL (its first position's "
+            "stated KP); check it. KP = start KP + chainage. Applies when you Generate and export.")
+        kp_row.addWidget(self.start_kp_spin)
         kp_row.addStretch()
         form_layout.addRow(kp_row)
+        self.start_kp_note = QLabel("")
+        self.start_kp_note.setWordWrap(True)
+        self.start_kp_note.setVisible(False)
+        form_layout.addRow(self.start_kp_note)
         
         # Checkboxes row
         checkboxes_row = QHBoxLayout()
@@ -509,6 +523,10 @@ class DepthProfileDockWidget(QDockWidget):
         self.clear_drawn_btn.clicked.connect(self.clear_drawn_line)
         self.use_drawn_chk.toggled.connect(self.update_enable_states)
         self.kp_axis_combo.currentIndexChanged.connect(self.update_enable_states)
+        for signal in (self.kp_axis_combo.currentIndexChanged, self.kp_ref_combo.currentIndexChanged,
+                       self.line_layer_combo.currentIndexChanged, self.use_drawn_chk.toggled):
+            signal.connect(self._prefill_start_kp)
+        self._prefill_start_kp()
         # DXF export
         self.export_dxf_btn.clicked.connect(self.export_dxf)
         # CSV export
@@ -1201,8 +1219,9 @@ class DepthProfileDockWidget(QDockWidget):
                 "Depth Profile", "Choose a route line layer for 'Nearest KP on route'.",
                 level=MESSAGE_WARNING, duration=6)
             return None
-        features = (layer.getSelectedFeatures() if self.kp_ref_selected_chk.isChecked()
-                    else layer.getFeatures())
+        from .kp_geo_utils import ordered_route_features
+        features = ordered_route_features(layer.getSelectedFeatures() if self.kp_ref_selected_chk.isChecked()
+                                          else layer.getFeatures())
         geoms = [QgsGeometry(f.geometry()) for f in features
                  if f.hasGeometry() and not f.geometry().isEmpty()]
         if not geoms:
@@ -1214,8 +1233,13 @@ class DepthProfileDockWidget(QDockWidget):
         from .kp_geo_utils import RouteFrame
         route = p.route
         # Cached in the profile line's CRS so both share one distance area.
-        frame = RouteFrame.from_source(geoms, route.distance_area, target_crs=route.crs,
-                                       source_crs=layer.sourceCrs(), project=project)
+        try:
+            frame = RouteFrame.from_source(geoms, route.distance_area, target_crs=route.crs,
+                                           source_crs=layer.sourceCrs(), project=project,
+                                           start_kp_km=self._kp_start())
+        except ValueError as exc:      # e.g. a route across +/-180
+            self.iface.messageBar().pushMessage("Depth Profile", str(exc), level=MESSAGE_WARNING, duration=8)
+            return None
         end_m = p.kp_values[-1] * 1000.0
         reverse = self.reverse_kp_chk.isChecked()
 
@@ -1264,13 +1288,38 @@ class DepthProfileDockWidget(QDockWidget):
             else:
                 axis.set_linear(1.0)
 
+    def _kp_start(self) -> float:
+        """The start KP (km) of the route whose KP is on the X axis."""
+        spin = getattr(self, "start_kp_spin", None)
+        return float(spin.value()) if spin is not None else 0.0
+
+    def _line_kp_start(self) -> float:
+        """Start KP added to the profile line's own KP ('Distance along profile line' axis)."""
+        return self._kp_start() if self.kp_axis_combo.currentData() != "route" else 0.0
+
+    def _prefill_start_kp(self, *_args):
+        """Fill the start KP from the route on the X axis: a Workbench RPL's start KP, else 0."""
+        from . import kp_datum
+        layer = None
+        if self.kp_axis_combo.currentData() == "route":
+            layer = QgsProject.instance().mapLayer(self.kp_ref_combo.currentData() or "")
+        elif not self.use_drawn_chk.isChecked():
+            layer = QgsProject.instance().mapLayer(self.line_layer_combo.currentData() or "")
+        detected = kp_datum.lines_layer_start_kp(layer) if isinstance(layer, QgsVectorLayer) else 0.0
+        self.start_kp_spin.setValue(detected)
+        self.start_kp_note.setText(
+            f"Start KP {detected:.3f} km: the Workbench RPL's first position. KP = start KP + chainage."
+            if detected else "")
+        self.start_kp_note.setVisible(bool(detected))
+
     def _display_kp(self):
-        """Plotted X (km) per station: KP, re-numbered from the end if Reverse KP."""
+        """Plotted X (km) per station: start KP + KP, re-numbered from the end if Reverse KP."""
         kp_values = self.profile.kp_values
         if self.reverse_kp_chk.isChecked() and kp_values:
             end = kp_values[-1]
             return [end - kp for kp in kp_values]
-        return list(kp_values)
+        start = self._line_kp_start()
+        return [start + kp for kp in kp_values] if start else list(kp_values)
 
     def _plot_side_slopes(self, ax, x_vals, degrees):
         """Overlay cross tilt / local max on a slope axis when enabled."""
@@ -2091,6 +2140,7 @@ class DepthProfileDockWidget(QDockWidget):
             units_hint = "m"
 
         # Build segments (skip None values)
+        line_start = self._line_kp_start()
         segments = []
         current_x = []
         current_y = []
@@ -2100,8 +2150,8 @@ class DepthProfileDockWidget(QDockWidget):
                     segments.append((current_x, current_y))
                     current_x, current_y = [], []
                 continue
-            # X: KP (km) -> selected units
-            current_x.append(float(kp) * float(x_scale))
+            # X: KP (km) -> selected units (start KP + chainage)
+            current_x.append((line_start + float(kp)) * float(x_scale))
             # Y: depth positive-down in data -> negative in CAD so seabed below 0
             current_y.append(-float(depth) * float(y_scale))
         if current_x:
@@ -2168,7 +2218,9 @@ class DepthProfileDockWidget(QDockWidget):
                 h_u = float(marker_height_m) * float(y_scale)
                 label_off_u = float(label_offset_m) * float(y_scale)
                 text_h_u = float(text_height_m) * float(y_scale)
-                kp = 0.0
+                # Round KPs from the start KP to the end (start KP + chainage).
+                kp = math.ceil(line_start / interval_km - 1e-9) * interval_km
+                max_kp_km += line_start
                 # Add a small epsilon to include the end marker if it falls exactly on interval.
                 while kp <= (max_kp_km + 1e-9):
                     x = kp * float(x_scale)
@@ -2222,7 +2274,7 @@ class DepthProfileDockWidget(QDockWidget):
 
             max_profile_kp_km = None
             try:
-                max_profile_kp_km = max(float(k) for k in p.kp_values if k is not None)
+                max_profile_kp_km = line_start + max(float(k) for k in p.kp_values if k is not None)
             except ValueError:
                 max_profile_kp_km = None
 
@@ -2235,7 +2287,8 @@ class DepthProfileDockWidget(QDockWidget):
                     if kp_km is None:
                         continue
                     # Skip events outside profile range
-                    if max_profile_kp_km is not None and (kp_km < -1e-9 or kp_km > (max_profile_kp_km + 1e-9)):
+                    if max_profile_kp_km is not None and (kp_km < line_start - 1e-9
+                                                          or kp_km > (max_profile_kp_km + 1e-9)):
                         continue
                     x = float(kp_km) * float(x_scale)
                     dxf_parts.extend(_dxf_line_entity(x, 0.0, x, h_u, layer="EVENT_MARK"))
@@ -2297,6 +2350,7 @@ class DepthProfileDockWidget(QDockWidget):
                 to_wgs = QgsCoordinateTransform(line_crs, QgsCoordinateReferenceSystem("EPSG:4326"),
                                                 QgsProject.instance())
             station_by_kp = {round(kp, 9): i for i, kp in enumerate(p.kp_values)}
+            line_start = self._line_kp_start()
             widths = p.slope_baseline_m or []
             peaks = p.side_local_max_deg or []
             sources = p.depth_source_ids or []
@@ -2324,7 +2378,8 @@ class DepthProfileDockWidget(QDockWidget):
                     index = station_by_kp.get(round(kp_to, 9))
                     seabed_len = seg.seabed_length
                     writer.writerow([
-                        fmt(kp_from), fmt(kp_to), fmt(lat_from, 6), fmt(lon_from, 6), fmt(lat_to, 6), fmt(lon_to, 6),
+                        fmt(line_start + kp_from), fmt(line_start + kp_to),
+                        fmt(lat_from, 6), fmt(lon_from, 6), fmt(lat_to, 6), fmt(lon_to, 6),
                         fmt(seg.depth_from), fmt(seg.depth_to),
                         fmt(seg.slope_deg), fmt(seg.slope_pct),
                         fmt(seg.side_slope_deg), fmt(seg.side_slope_pct),

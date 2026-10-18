@@ -38,7 +38,8 @@ from qgis.core import (
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_STRING
 
 import math
-from ..kp_geo_utils import RouteFrame, get_features_skip_invalid, ordered_route_features
+from ..kp_geo_utils import get_features_skip_invalid, ordered_route_features
+from .kp_common import START_KP_HELP, add_start_kp_parameter, build_route, read_start_kp, report_kp_basis
 from .rpl_comparison_utils import signed_dcc
 
 
@@ -120,6 +121,7 @@ class NearestKPAlgorithm(SubseaCableAlgorithm):
         )
 
         add_distance_mode_parameter(self)
+        add_start_kp_parameter(self)
 
     def processAlgorithm(self, parameters, context, feedback):
         """
@@ -209,8 +211,9 @@ class NearestKPAlgorithm(SubseaCableAlgorithm):
         # and uses the plugin's single KP definition (kp_geo_utils.RouteFrame).
         path_features = ordered_route_features(get_features_skip_invalid(paths_source))
         path_ids = [f.id() for f in path_features]
-        route = RouteFrame.from_source(
-            [QgsGeometry(f.geometry()) for f in path_features], distance_calculator)
+        start_kp = read_start_kp(self, parameters, context)
+        route = build_route([QgsGeometry(f.geometry()) for f in path_features], distance_calculator, start_kp)
+        report_kp_basis(feedback, route, start_kp)
         path_geoms = route.geometries
 
         total_features = points_source.featureCount()
@@ -344,8 +347,8 @@ class NearestKPAlgorithm(SubseaCableAlgorithm):
 
 <p><b>3. Run:</b> Execute the tool.</p>
 
-<p><b>Note:</b> The nearest point is found segment by segment (spatially indexed), so it is the true nearest point even on complex, multi-part line geometries.</p>
-""")
+<p><b>Note:</b> The nearest point is found segment by segment (spatially indexed), so it is the true nearest point even on complex, multi-part line geometries. On a route in latitude/longitude it is the nearest point on the ellipsoid, along the geodesic between the route's vertices.</p>
+""") + "<p>" + self.tr(START_KP_HELP) + "</p>"
 
     def calculate_bearing(self, pointA, pointB):
         """

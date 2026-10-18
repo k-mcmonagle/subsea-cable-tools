@@ -136,8 +136,10 @@ def test_lookups_match_linear_scans(iface, line, table):
                 new = dock.interpolate_point_along_line(d)
                 old = _legacy_interpolate(dock, d)
                 new_xy = new.asPoint() if new is not None else None
+                # The route now follows the geodesic between vertices (the KP path): on these
+                # 2-4 km legs at 55 N it is within ~0.4 m of the line straight in degrees.
                 if (old is None) != (new_xy is None) or (
-                        old is not None and (old.x() != new_xy.x() or old.y() != new_xy.y())):
+                        old is not None and dock.distance_area.measureLine(old, new_xy) > 1.0):
                     dist_bad += 1
             finite = len(dock.kp_sorted) == 12          # NULL / NaN KPs dropped
             ok = ok and idx_bad == 0 and dist_bad == 0 and finite
@@ -146,7 +148,21 @@ def test_lookups_match_linear_scans(iface, line, table):
         finally:
             dock.shutdown()
             dock.deleteLater()
-    return _result("bisect lookups == linear scans (duplicates, reverse, ends)", ok, "; ".join(detail))
+    # A start KP: table KPs are start KP + chainage; before the start the marker is hidden.
+    dock = _plotted_dock(iface, line, table)
+    try:
+        dock.start_kp_spin.setValue(10.0)
+        dock.plot_data()
+        first = dock.interpolate_point_along_line(10.0 * 1000).asPoint()
+        start_ok = abs(first.x() - 3.0) < 1e-9 and abs(first.y() - 55.0) < 1e-9
+        dock.update_map_marker(9.5)
+        start_ok = start_ok and (dock.marker is None or not dock.marker.isVisible())
+        ok = ok and start_ok
+        detail.append("start KP 10: first vertex %s" % start_ok)
+    finally:
+        dock.shutdown()
+        dock.deleteLater()
+    return _result("bisect lookups == linear scans (duplicates, reverse, ends); start KP", ok, "; ".join(detail))
 
 
 def test_hover_moves_marker_without_canvas_refresh(iface, line, table):

@@ -1030,6 +1030,18 @@ class _ReviewPage(QWizardPage):
         if doc.start_kp_km() is not None and doc.end_kp_km() is not None:
             bits.append(f"Stated KP {doc.start_kp_km():.3f} → "
                         f"{doc.end_kp_km():.3f} km.")
+        if doc.start_kp_km():
+            bits.append(f"<b>The RPL starts at KP {doc.start_kp_km():.3f}</b>: the plugin's KPs are this "
+                        "start KP + measured chainage.")
+        try:
+            from ..kp_datum import check_position_kps
+            check = check_position_kps([(p.lon, p.lat, p.dist_cum_km) for p in doc.points])
+            if check.compared >= 2:
+                colour = {"ok": "#2e7d32", "info": "#1f77b4", "warn": "#d32f2f"}.get(check.level, "#333")
+                bits.append(f"<span style='color:{colour}'>KP check: {check.summary()}</span>")
+        except Exception:
+            from ..plugin_log import log_exception
+            log_exception("RPL import: the stated KP check could not be made")
         if computed is not None:
             line = f"Computed geodesic length <b>{computed:.3f} km</b>"
             if stated_route is not None:

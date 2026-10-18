@@ -525,6 +525,35 @@ def test_csv_export(h: _Harness) -> bool:
                    f"rows={len(rows)} lat={first[2] if first else None}")
 
 
+def test_start_kp(h: _Harness) -> bool:
+    """A start KP offsets the plotted KP and the CSV KPs (KP = start KP + chainage); Reverse KP is unchanged."""
+    from qgis.PyQt.QtWidgets import QFileDialog
+    d = h.dock
+    h.configure()
+    d.start_kp_spin.setValue(12.345)
+    try:
+        h.generate()
+        shown = d._display_kp()
+        path = os.path.join(h.temp, "profile_start.csv")
+        saved = QFileDialog.getSaveFileName
+        try:
+            QFileDialog.getSaveFileName = lambda *a, **k: (path, "")
+            d.export_csv()
+        finally:
+            QFileDialog.getSaveFileName = saved
+        first = open(path, encoding="utf-8").read().strip().splitlines()[1].split(",")
+        kp = d.profile.kp_values
+        ok = abs(shown[0] - 12.345) < 1e-9 and abs(shown[-1] - (12.345 + kp[-1])) < 1e-9
+        ok = ok and abs(float(first[0]) - 12.345) < 0.0005
+        d.reverse_kp_chk.setChecked(True)
+        ok = ok and abs(d._display_kp()[-1]) < 1e-9
+    finally:
+        d.reverse_kp_chk.setChecked(False)
+        d.start_kp_spin.setValue(0.0)
+    return _result("start KP offsets the plotted and exported KP; Reverse KP still counts from the end", ok,
+                   f"first {shown[0] if shown else None}, CSV {first[0] if first else None}")
+
+
 def test_superseded_run_ignored(h: _Harness) -> bool:
     """Generating again while a run is in flight: only the newest applies."""
     d = h.dock
@@ -616,7 +645,7 @@ def run_all() -> List[bool]:
             for test in (test_raster_depth_profile, test_dual_and_slope_only, test_reverse_kp_hover,
                          test_measurements, test_multi_raster_series, test_contour_profile,
                          test_selected_only, test_kp_axis_round_ticks, test_route_kp_axis_drawn_line,
-                         test_kp_mouse_window_cursor_sync, test_csv_export, test_superseded_run_ignored,
+                         test_kp_mouse_window_cursor_sync, test_csv_export, test_start_kp, test_superseded_run_ignored,
                          test_cancel_button, test_unload_and_close_cancel):
                 try:
                     results.append(test(harness))

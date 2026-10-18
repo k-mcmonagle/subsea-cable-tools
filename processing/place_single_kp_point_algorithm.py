@@ -5,6 +5,8 @@ PlaceSingleKpPointAlgorithm
 This tool places a single KP point along a route.
 """
 
+import math
+
 from qgis.PyQt.QtCore import QCoreApplication, QSettings
 from .algorithm_base import SubseaCableAlgorithm
 from ..kp_range_utils import (
@@ -29,7 +31,8 @@ from qgis.core import (QgsProcessing,
                        QgsCoordinateReferenceSystem,
                        QgsCoordinateTransform)
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_NUMBER_DOUBLE
-from ..kp_geo_utils import get_features_skip_invalid, ordered_route_geometry
+from ..kp_geo_utils import get_features_skip_invalid, kp_path_kind, ordered_route_geometry
+from .kp_common import START_KP_HELP, add_start_kp_parameter, build_route, read_start_kp, report_kp_basis
 
 
 def _make_local_aeqd_crs(lat: float, lon: float) -> QgsCoordinateReferenceSystem:
@@ -191,6 +194,7 @@ class PlaceSingleKpPointAlgorithm(SubseaCableAlgorithm):
         )
 
         add_distance_mode_parameter(self)
+        add_start_kp_parameter(self)
 
     def processAlgorithm(self, parameters, context, feedback):
         line_layer = self.parameterAsSource(parameters, self.INPUT_LINE, context)
@@ -229,18 +233,14 @@ class PlaceSingleKpPointAlgorithm(SubseaCableAlgorithm):
         if line_layer is None:
             raise QgsProcessingException(self.invalidSourceError(parameters, self.INPUT_LINE))
 
+        # KP and DCC are measured in the route layer's CRS with the plugin's
+        # KP method (kp_geo_utils.RouteFrame): they never depend on the
+        # project CRS. Outputs stay in the route layer's CRS.
         source_crs = line_layer.sourceCrs()
-        project = context.project()
-        project_crs = project.crs() if project is not None else QgsCoordinateReferenceSystem()
-        if not project_crs.isValid():
-            # Headless runs have no project CRS: work in the layer CRS.
-            project_crs = source_crs
         wgs84 = QgsCoordinateReferenceSystem('EPSG:4326')
         transform_context = context.transformContext()
         to_wgs84 = QgsCoordinateTransform(source_crs, wgs84, transform_context)
-
-        src_to_project = QgsCoordinateTransform(source_crs, project_crs, transform_context)
-        project_to_src = QgsCoordinateTransform(project_crs, source_crs, transform_context)
+        from_wgs84 = QgsCoordinateTransform(wgs84, source_crs, transform_context)
 
         output_fields = QgsFields()
         output_fields.append(QgsField('source_line', FIELD_TYPE_STRING))
@@ -316,225 +316,136 @@ class PlaceSingleKpPointAlgorithm(SubseaCableAlgorithm):
 
         # Shared route builder (SeqNo/layer order, no noding or reversal).
         merged_geometry = ordered_route_geometry(line_features)
-        
+
         if merged_geometry.isEmpty():
             raise QgsProcessingException(self.tr("Geometry is empty after merging features."))
 
-        # Work in the project CRS to match the KP mouse tool's behaviour.
-        merged_project = QgsGeometry(merged_geometry)
-        merged_project.transform(src_to_project)
-        if merged_project.isEmpty():
-            raise QgsProcessingException(self.tr("Geometry became empty after transforming to project CRS."))
-
-        # KP distance is measured geodesically (ellipsoidal) by default, matching the KP mouse tool.
-        # User may opt for cartesian when the project CRS is projected.
+        # KP distance is geodesic (WGS84) by default; Cartesian (grid) when chosen.
         distance_mode = read_distance_mode(self, parameters, context)
         try:
             distance_calculator = make_distance_area(
-                project_crs, context.transformContext(),
+                source_crs, transform_context,
                 mode=distance_mode, project=context.project(),
             )
         except ValueError as exc:
             raise QgsProcessingException(str(exc))
 
-        total_length_m = float(distance_calculator.measureLength(merged_project))
-        if total_length_m <= 0.0:
+        start_kp = read_start_kp(self, parameters, context)
+        route = build_route([merged_geometry], distance_calculator, start_kp)
+        report_kp_basis(feedback, route, start_kp)
+        if route.total_length_m <= 0.0:
             raise QgsProcessingException(self.tr("Line has no length."))
 
-        kp_dist_m = kp_val * 1000
-        if kp_dist_m > total_length_m:
-            feedback.reportError(f"KP value {kp_val} is beyond the line's total length of {total_length_m/1000:.3f} km. Point not placed.")
+        # The position at the KP, on the KP path (start KP + chainage).
+        base_pt = route.point_at_kp(kp_val)
+        if base_pt is None:
+            feedback.reportError(
+                f"KP value {kp_val} is outside the line (KP {route.start_kp_km:.3f} to "
+                f"{route.end_kp_km:.3f} km). Point not placed.")
             return {self.OUTPUT: dest_id}
+        base_pt = QgsPointXY(base_pt)
 
-        # Locate the KP point and segment tangent in the project CRS.
-        line_parts = merged_project.asMultiPolyline() if merged_project.isMultipart() else [merged_project.asPolyline()]
-        if not line_parts or all(len(p) < 2 for p in line_parts):
-            raise QgsProcessingException(self.tr("Line geometry has insufficient vertices."))
-
-        cumulative_length = 0.0
-        point_found = False
-        base_x = None
-        base_y = None
-        seg_p1_proj = None
-        seg_p2_proj = None
-
-        for part in line_parts:
-            if len(part) < 2:
-                continue
-            for i in range(len(part) - 1):
-                if i % 1000 == 0 and feedback.isCanceled():
-                    return {self.OUTPUT: dest_id}
-                p1, p2 = part[i], part[i + 1]
-
-                # Geodesic segment length (meters)
-                segment_length = float(distance_calculator.measureLine(p1, p2))
-                if segment_length <= 0.0:
-                    continue
-
-                is_last_segment = (i == len(part) - 2)
-                within = (cumulative_length <= kp_dist_m < cumulative_length + segment_length)
-                at_end = is_last_segment and abs(kp_dist_m - (cumulative_length + segment_length)) <= 1e-6
-
-                if within or at_end:
-                    dist_into_segment = kp_dist_m - cumulative_length
-                    if at_end:
-                        dist_into_segment = segment_length
-                    ratio = dist_into_segment / segment_length
-
-                    # Interpolate along the actual stored segment in the source CRS.
-                    # This matches how KP is represented on the polyline itself.
-                    base_x = float(p1.x()) + ratio * float(p2.x() - p1.x())
-                    base_y = float(p1.y()) + ratio * float(p2.y() - p1.y())
-                    seg_p1_proj = QgsPointXY(p1)
-                    seg_p2_proj = QgsPointXY(p2)
-                    point_found = True
-                    break
-
-                cumulative_length += segment_length
-
-            if point_found:
-                break
-
-        if not point_found:
+        # Course at the KP: along the KP path just ahead (just behind at the
+        # route end). At a vertex this is the outgoing leg.
+        step_km = min(0.001, route.total_length_km / 2.0)
+        if kp_val + step_km <= route.end_kp_km:
+            course_from, course_to = base_pt, route.point_at_kp(kp_val + step_km)
+        else:
+            course_from, course_to = route.point_at_kp(max(route.start_kp_km, kp_val - step_km)), base_pt
+        if course_from is None or course_to is None or (
+                abs(course_to.x() - course_from.x()) <= 0.0 and abs(course_to.y() - course_from.y()) <= 0.0):
             feedback.reportError(self.tr(f"Could not place point at KP {kp_val}."), fatalError=True)
             return {self.OUTPUT: dest_id}
+        course_from, course_to = QgsPointXY(course_from), QgsPointXY(course_to)
 
-        if seg_p1_proj is None or seg_p2_proj is None or base_x is None or base_y is None:
-            raise QgsProcessingException(self.tr("Internal error locating KP segment."))
+        # WGS84 geodesics for the offset (geodesic KP) and for true bearings.
+        geodesic = make_distance_area(wgs84, transform_context)
 
-        base_pt_proj = QgsPointXY(float(base_x), float(base_y))
+        def _to_ll(point: QgsPointXY) -> QgsPointXY:
+            return QgsPointXY(point) if source_crs == wgs84 else QgsPointXY(to_wgs84.transform(QgsPointXY(point)))
 
-        def _solve_offset_perp_in_project(
-            base_pt: QgsPointXY,
-            seg_p1: QgsPointXY,
-            seg_p2: QgsPointXY,
-            signed_target_m: float,
-        ):
-            """Return (offset_pt, abs_distance_m) in project CRS.
+        def _from_ll(point: QgsPointXY) -> QgsPointXY:
+            return QgsPointXY(point) if source_crs == wgs84 else QgsPointXY(from_wgs84.transform(QgsPointXY(point)))
 
-            Constructs an offset point in the plane of the project CRS, perpendicular to the
-            segment direction, and solves for a scale so that geodesic distance(base, offset)
-            matches the requested magnitude in meters.
-            """
+        path_kind = kp_path_kind(distance_calculator)
+        if path_kind == "geodesic":
+            # The DCC runs along the geodesic perpendicular to the route at the
+            # KP (starboard = course + 90 deg), so the offset point's nearest
+            # point on the route is the KP position and its DCC is |DCC|.
+            base_ll = _to_ll(base_pt)
+            course = float(geodesic.bearing(_to_ll(course_from), _to_ll(course_to)))
 
+            def _offset(metres: float, side: float) -> QgsPointXY:
+                if metres <= 0.0:
+                    return QgsPointXY(base_pt)
+                return _from_ll(geodesic.computeSpheroidProject(base_ll, float(metres), course + side * math.pi / 2.0))
 
-            dx = float(seg_p2.x() - seg_p1.x())
-            dy = float(seg_p2.y() - seg_p1.y())
-            seg_len = (dx * dx + dy * dy) ** 0.5
+            def _measure(point_a: QgsPointXY, point_b: QgsPointXY) -> float:
+                return float(geodesic.measureLine(_to_ll(point_a), _to_ll(point_b)))
+        else:
+            # Grid / planar KP: the KP path is straight in the grid (or in the
+            # route CRS), so is the DCC, perpendicular to the route there.
+            if path_kind == "grid":
+                to_plane, from_plane = distance_calculator.to_grid, distance_calculator.from_grid
+            else:
+                def to_plane(point):
+                    return QgsPointXY(point)
+
+                def from_plane(point):
+                    return QgsPointXY(point)
+            plane_a, plane_b, plane_base = to_plane(course_from), to_plane(course_to), to_plane(base_pt)
+            dx = float(plane_b.x() - plane_a.x())
+            dy = float(plane_b.y() - plane_a.y())
+            seg_len = math.hypot(dx, dy)
             if seg_len <= 0.0:
                 raise QgsProcessingException(self.tr("Degenerate tangent segment encountered."))
-
             # Right normal (clockwise) for +ve DCC
-            nx = dy / seg_len
-            ny = -dx / seg_len
+            nx, ny = dy / seg_len, -dx / seg_len
 
-            target = abs(float(signed_target_m))
-            if target <= 0.0:
-                return QgsPointXY(float(base_pt.x()), float(base_pt.y())), 0.0
+            def _offset(metres: float, side: float) -> QgsPointXY:
+                target = abs(float(metres))
+                if target <= 0.0:
+                    return QgsPointXY(base_pt)
 
-            sign = 1.0 if float(signed_target_m) >= 0.0 else -1.0
+                def candidate(scale: float) -> QgsPointXY:
+                    return QgsPointXY(from_plane(QgsPointXY(
+                        float(plane_base.x()) + side * float(scale) * nx,
+                        float(plane_base.y()) + side * float(scale) * ny)))
 
-            def candidate(scale: float) -> QgsPointXY:
-                return QgsPointXY(
-                    float(base_pt.x()) + sign * float(scale) * nx,
-                    float(base_pt.y()) + sign * float(scale) * ny,
-                )
-
-            # Bracket the solution in CRS units.
-            lo = 0.0
-            hi = 1.0
-            dist_hi = float(distance_calculator.measureLine(base_pt, candidate(hi)))
-            while dist_hi < target and hi < 1e9:
-                hi *= 2.0
+                # Bracket, then bisect, so the measured distance is the target
+                # whatever the plane's units.
+                lo, hi = 0.0, 1.0
                 dist_hi = float(distance_calculator.measureLine(base_pt, candidate(hi)))
+                while dist_hi < target and hi < 1e9:
+                    hi *= 2.0
+                    dist_hi = float(distance_calculator.measureLine(base_pt, candidate(hi)))
+                if dist_hi < target:
+                    raise QgsProcessingException(self.tr("Failed to bracket the DCC distance."))
+                for _ in range(60):
+                    mid = (lo + hi) / 2.0
+                    if float(distance_calculator.measureLine(base_pt, candidate(mid))) < target:
+                        lo = mid
+                    else:
+                        hi = mid
+                return candidate(hi)
 
-            if dist_hi < target:
-                # Should never happen unless the distance calculator failed.
-                raise QgsProcessingException(self.tr("Failed to bracket DCC distance in project CRS."))
+            def _measure(point_a: QgsPointXY, point_b: QgsPointXY) -> float:
+                return float(distance_calculator.measureLine(point_a, point_b))
 
-            # Binary search for scale giving target distance.
-            for _ in range(40):
-                mid = (lo + hi) / 2.0
-                dist_mid = float(distance_calculator.measureLine(base_pt, candidate(mid)))
-                if dist_mid < target:
-                    lo = mid
-                else:
-                    hi = mid
+        def _true_bearing_deg(point_a: QgsPointXY, point_b: QgsPointXY) -> float:
+            """True bearing (deg clockwise from north) from point_a to point_b."""
+            a_ll, b_ll = _to_ll(point_a), _to_ll(point_b)
+            if abs(a_ll.x() - b_ll.x()) <= 0.0 and abs(a_ll.y() - b_ll.y()) <= 0.0:
+                return 0.0
+            return (math.degrees(float(geodesic.bearing(a_ll, b_ll))) + 360.0) % 360.0
 
-            offset_pt = candidate(hi)
-            dist = float(distance_calculator.measureLine(base_pt, offset_pt))
-            return offset_pt, dist
+        side = 1.0 if float(dcc_m) >= 0.0 else -1.0
+        offset_pt = _offset(abs(float(dcc_m)), side)
+        range_to_line_m = _measure(base_pt, offset_pt)
+        bearing_from_line_deg = round(_true_bearing_deg(base_pt, offset_pt), 3)
+        bearing_to_line_deg = round(_true_bearing_deg(offset_pt, base_pt), 3)
 
-        def _solve_along_dir_in_project(base_pt: QgsPointXY, dir_x: float, dir_y: float, target_m: float) -> QgsPointXY:
-            """Move from base_pt along (dir_x, dir_y) in project CRS such that measureLine(base, moved) == target_m."""
-
-            if target_m <= 0.0:
-                return QgsPointXY(float(base_pt.x()), float(base_pt.y()))
-
-            dlen = (float(dir_x) * float(dir_x) + float(dir_y) * float(dir_y)) ** 0.5
-            if dlen <= 0.0:
-                raise QgsProcessingException(self.tr("Cannot extend DCC line: zero direction vector."))
-
-            ux = float(dir_x) / dlen
-            uy = float(dir_y) / dlen
-
-            def candidate(scale: float) -> QgsPointXY:
-                return QgsPointXY(
-                    float(base_pt.x()) + float(scale) * ux,
-                    float(base_pt.y()) + float(scale) * uy,
-                )
-
-            lo = 0.0
-            hi = 1.0
-            dist_hi = float(distance_calculator.measureLine(base_pt, candidate(hi)))
-            while dist_hi < float(target_m) and hi < 1e9:
-                hi *= 2.0
-                dist_hi = float(distance_calculator.measureLine(base_pt, candidate(hi)))
-
-            for _ in range(40):
-                mid = (lo + hi) / 2.0
-                dist_mid = float(distance_calculator.measureLine(base_pt, candidate(mid)))
-                if dist_mid < float(target_m):
-                    lo = mid
-                else:
-                    hi = mid
-
-            return candidate(hi)
-
-        # Apply DCC offset in project CRS, tuned so geodesic distance matches the requested value.
-        offset_pt_proj, measured_range_m = _solve_offset_perp_in_project(
-            base_pt_proj,
-            seg_p1_proj,
-            seg_p2_proj,
-            float(dcc_m),
-        )
-
-        # Range/bearings in project CRS, matching the KP mouse tool conventions.
-        range_to_line_m = float(measured_range_m)
-
-        def _bearing_deg(pointA: QgsPointXY, pointB: QgsPointXY) -> float:
-            dx_b = float(pointB.x() - pointA.x())
-            dy_b = float(pointB.y() - pointA.y())
-            # Clockwise from north
-            import math
-            angle_rad = math.atan2(dx_b, dy_b)
-            angle_deg = math.degrees(angle_rad)
-            return (angle_deg + 360.0) % 360.0
-
-        bearing_from_line_deg = round(
-            _bearing_deg(QgsPointXY(float(base_pt_proj.x()), float(base_pt_proj.y())), QgsPointXY(float(offset_pt_proj.x()), float(offset_pt_proj.y()))),
-            3,
-        )
-        bearing_to_line_deg = round(
-            _bearing_deg(QgsPointXY(float(offset_pt_proj.x()), float(offset_pt_proj.y())), QgsPointXY(float(base_pt_proj.x()), float(base_pt_proj.y()))),
-            3,
-        )
-
-        # Transform base/offset back to the input layer CRS for output.
-        base_pt_src = project_to_src.transform(base_pt_proj)
-        offset_pt_src = project_to_src.transform(offset_pt_proj)
-
-        point_geom = QgsGeometry.fromPointXY(QgsPointXY(float(offset_pt_src.x()), float(offset_pt_src.y())))
+        point_geom = QgsGeometry.fromPointXY(QgsPointXY(float(offset_pt.x()), float(offset_pt.y())))
 
         transformed_geom = QgsGeometry(point_geom)
         transformed_geom.transform(to_wgs84)
@@ -559,7 +470,7 @@ class PlaceSingleKpPointAlgorithm(SubseaCableAlgorithm):
 
         # Optional: output the base point on the RPL at the same KP (DCC forced to 0).
         if add_point_on_rpl and point_on_rpl_sink is not None:
-            base_geom_src = QgsGeometry.fromPointXY(QgsPointXY(float(base_pt_src.x()), float(base_pt_src.y())))
+            base_geom_src = QgsGeometry.fromPointXY(QgsPointXY(float(base_pt.x()), float(base_pt.y())))
 
             base_geom_wgs = QgsGeometry(base_geom_src)
             base_geom_wgs.transform(to_wgs84)
@@ -586,29 +497,20 @@ class PlaceSingleKpPointAlgorithm(SubseaCableAlgorithm):
             out_pt_src = point_geom.asPoint()
             dcc_line_geom = QgsGeometry.fromPolylineXY([
                 QgsPointXY(float(out_pt_src.x()), float(out_pt_src.y())),
-                QgsPointXY(float(base_pt_src.x()), float(base_pt_src.y())),
+                QgsPointXY(float(base_pt.x()), float(base_pt.y())),
             ])
 
             # Optionally extend the DCC line past the RPL base point (other side).
             if extend_dcc_line and dcc_line_extend_m > 0.0:
-                # Direction from base -> offset in project CRS.
-                dir_x = float(offset_pt_proj.x() - base_pt_proj.x())
-                dir_y = float(offset_pt_proj.y() - base_pt_proj.y())
-                if abs(dir_x) <= 0.0 and abs(dir_y) <= 0.0:
+                if range_to_line_m <= 0.0:
                     feedback.pushInfo(self.tr("DCC is 0; cannot extend DCC line."))
                 else:
-                    # Extend from base in the opposite direction (past the RPL).
-                    ext_pt_proj = _solve_along_dir_in_project(
-                        base_pt_proj,
-                        -dir_x,
-                        -dir_y,
-                        float(dcc_line_extend_m),
-                    )
-                    ext_pt_src = project_to_src.transform(ext_pt_proj)
+                    # Extend from the base point to the other side of the route.
+                    ext_pt = _offset(float(dcc_line_extend_m), -side)
                     dcc_line_geom = QgsGeometry.fromPolylineXY([
                         QgsPointXY(float(out_pt_src.x()), float(out_pt_src.y())),
-                        QgsPointXY(float(base_pt_src.x()), float(base_pt_src.y())),
-                        QgsPointXY(float(ext_pt_src.x()), float(ext_pt_src.y())),
+                        QgsPointXY(float(base_pt.x()), float(base_pt.y())),
+                        QgsPointXY(float(ext_pt.x()), float(ext_pt.y())),
                     ])
 
             line_feat = QgsFeature(dcc_line_fields)
@@ -656,7 +558,7 @@ Positive DCC is to the right side of the line (increasing KP direction); negativ
 
 **Instructions:**
 
-1.  **Input Line Layer:** Choose the line layer on which you want to place the KP point. The tool will treat all lines in this layer as a single, continuous route.
+1.  **Input Line Layer:** Choose the line layer on which you want to place the KP point. The tool will treat all lines in this layer as a single, continuous route (in SeqNo order when every feature has one, else layer order).
 2.  **KP Value (Kilometers):** Enter the exact KP value where you want the point to be placed.
 3.  **Distance Cross Course (DCC):** Optional lateral offset from the route centerline.
 4.  **DCC Units:** Select the units for the DCC value (default is metres).
@@ -666,8 +568,8 @@ Positive DCC is to the right side of the line (increasing KP direction); negativ
 Enable **Extend DCC Line Past RPL** and set **DCC Line Extension Length** to extend that line beyond the route (past the base KP point) by the given amount.
 Enable **Add Point on RPL Output** to also create a point layer containing the on-route KP location (DCC forced to 0).
 
-**Note:** KP/DCC are calculated consistently with project CRS measurements.
-""")
+**Note:** KP and DCC follow the plugin's KP method in the route layer's own CRS, whatever the project CRS. The point at the KP lies on the route's KP path (between vertices along the geodesic, or the straight grid line for grid KP). The DCC offset is perpendicular to the route at that point: along the geodesic for geodesic KP, straight in the grid for grid KP. Bearings are true bearings (degrees clockwise from north).
+""") + "\n\n" + self.tr(START_KP_HELP)
 
     def name(self):
         return 'placesinglekppoint'

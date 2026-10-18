@@ -37,6 +37,25 @@ from ..qgis_compat import (
 )
 
 from . import schema
+
+
+def _geodesic_m(lat1, lon1, lat2, lon2):
+    """Distance (m) between two RPL positions on the WGS84 ellipsoid (the plugin's KP
+    distance), instead of the spherical default of the pure comparison."""
+    try:
+        from qgis.core import QgsCoordinateReferenceSystem, QgsPointXY
+
+        from ..kp_range_utils import make_distance_area
+        global _WGS84_DA
+        if _WGS84_DA is None:
+            _WGS84_DA = make_distance_area(QgsCoordinateReferenceSystem("EPSG:4326"))
+        return float(_WGS84_DA.measureLine(QgsPointXY(float(lon1), float(lat1)),
+                                           QgsPointXY(float(lon2), float(lat2))))
+    except (TypeError, ValueError):
+        return None
+
+
+_WGS84_DA = None
 from .event_compare_panel import EventComparisonWidget
 from .rpl_compare import (
     LEG_CHANGE_LABELS, STATUS_ADDED, STATUS_CHANGED, STATUS_REMOVED,
@@ -308,6 +327,7 @@ class RevisionComparePanel(QWidget):
             a_status=row_a.get("status") or schema.STATUS_DRAFT,
             b_status=row_b.get("status") or schema.STATUS_DRAFT,
             classify=self._classifier(),
+            distance_fn=_geodesic_m,
         )
         self.summary.setText(
             f"A = {self._comparison.a_label} → B = {self._comparison.b_label}. "

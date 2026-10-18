@@ -27,9 +27,13 @@ Implementation note (1.6):
     Routes are assembled like every other KP tool's: features in SeqNo order
     when the layer has one (``kp_geo_utils.ordered_route_features``), else
     layer order.
+
+    Each route may start at a non-zero KP (``source_start_kp_km`` /
+    ``target_start_kp_km``): every KP in or out is start KP + chainage
+    (docs/KP_METHOD.md).
 """
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from qgis.core import (
     QgsGeometry,
@@ -39,12 +43,47 @@ from ..qgis_compat import GEOMETRY_POINT
 
 from ..kp_geo_utils import KPHit, RouteFrame, get_features_skip_invalid, ordered_route_features
 from ..kp_range_utils import make_kp_distance_area
+from .kp_common import build_route
 
 
 def route_geometries(line_layer):
     """The route's feature geometries in chainage order (SeqNo, else layer order)."""
     return [QgsGeometry(f.geometry())
             for f in ordered_route_features(get_features_skip_invalid(line_layer))]
+
+
+def kp_path_geometry(route: RouteFrame) -> QgsGeometry:
+    """The route as it runs between its vertices: the KP path (docs/KP_METHOD.md).
+
+    A (multi)line in the route CRS through the stored vertices plus the KP
+    path's points between them (the geodesic, or the straight grid line), from
+    :meth:`RouteFrame.measured_segments`. Parts that do not touch stay separate
+    parts (no joining segment across a gap). Intersect this, not the stored
+    geometry, so crossings and area sections lie where the route's KPs are.
+    """
+    lines: List[List[QgsPointXY]] = []
+    for p1, p2, _kp1, _kp2 in route.measured_segments():
+        a, b = QgsPointXY(p1), QgsPointXY(p2)
+        if lines:
+            last = lines[-1][-1]
+            if abs(last.x() - a.x()) <= 1e-12 and abs(last.y() - a.y()) <= 1e-12:
+                lines[-1].append(b)
+                continue
+        lines.append([a, b])
+    if not lines:
+        return QgsGeometry()
+    if len(lines) == 1:
+        return QgsGeometry.fromPolylineXY(lines[0])
+    return QgsGeometry.fromMultiPolylineXY(lines)
+
+
+def feature_frames(route: RouteFrame, distance) -> List[RouteFrame]:
+    """One RouteFrame per feature of ``route``, each starting at the KP where
+    that feature starts on ``route`` (same distance model, same KP path), so a
+    KP found on one feature is that feature's KP on the whole route."""
+    start = route.start_kp_km
+    return [RouteFrame.from_source([QgsGeometry(geom)], distance, start_kp_km=start + offset / 1000.0)
+            for geom, offset in zip(route.geometries, route.feature_offsets_m)]
 
 
 def signed_dcc(line_geom: QgsGeometry, point_xy: QgsPointXY,
@@ -80,7 +119,8 @@ class RPLComparator:
     - Cross-reference point features between RPLs
     """
 
-    def __init__(self, source_line_layer, target_line_layer, crs, context):
+    def __init__(self, source_line_layer, target_line_layer, crs, context,
+                 source_start_kp_km: float = 0.0, target_start_kp_km: Optional[float] = None):
         """
         Initialize RPL comparator with two line layers.
 
@@ -89,6 +129,12 @@ class RPLComparator:
             target_line_layer: QgsVectorLayer (line geometry) - target RPL
             crs: QgsCoordinateReferenceSystem - shared CRS for both layers
             context: QgsProcessingContext - for coordinate transformations and ellipsoid info
+            source_start_kp_km: KP at the source route's first vertex (default 0)
+            target_start_kp_km: KP at the target route's first vertex (default:
+                the source start KP)
+
+        A route across +/-180 deg raises ``QgsProcessingException`` (see
+        :func:`kp_common.build_route`).
         """
         self.source_line_layer = source_line_layer
         self.target_line_layer = target_line_layer
@@ -106,15 +152,18 @@ class RPLComparator:
         )
 
         # Build cached route frames over each layer (one when both sides are
-        # the same layer). RouteFrame caches geometries + cumulative offsets.
-        self._source_frame = RouteFrame.from_source(
-            route_geometries(source_line_layer), self.distance_calculator
+        # the same layer with the same start KP). RouteFrame caches geometries
+        # + cumulative offsets and applies the start KP.
+        source_start = float(source_start_kp_km or 0.0)
+        target_start = source_start if target_start_kp_km is None else float(target_start_kp_km)
+        self._source_frame = build_route(
+            route_geometries(source_line_layer), self.distance_calculator, source_start
         )
-        if target_line_layer is source_line_layer:
+        if target_line_layer is source_line_layer and target_start == source_start:
             self._target_frame = self._source_frame
         else:
-            self._target_frame = RouteFrame.from_source(
-                route_geometries(target_line_layer), self.distance_calculator
+            self._target_frame = build_route(
+                route_geometries(target_line_layer), self.distance_calculator, target_start
             )
 
         # Back-compat attributes (callers in rpl_route_comparison_algorithm
@@ -135,6 +184,16 @@ class RPLComparator:
 
     def _frame(self, source: bool) -> RouteFrame:
         return self._source_frame if source else self._target_frame
+
+    @property
+    def source_frame(self) -> RouteFrame:
+        """The source route's RouteFrame (its KP path, start KP and KP basis)."""
+        return self._source_frame
+
+    @property
+    def target_frame(self) -> RouteFrame:
+        """The target route's RouteFrame."""
+        return self._target_frame
 
     # ------------------------------------------------------------------ public
 

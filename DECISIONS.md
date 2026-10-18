@@ -704,9 +704,32 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   cascades cumulative KPs from the position at the first edited leg; it
   used to re-sum the stored (rounded) leg lengths from the route start, so
   rounding built up along a long RPL and moved KPs the edit never touched.
-- **The KP Mouse Tool takes the RPL start KP** of a Workbench RPL lines layer
-  (`kp_datum.lines_layer_start_kp`, by its `rpl_id`); other line layers start
-  at 0.
+- **Start KP is stated, and always visible** (October 2026). Most RPLs start
+  at KP 0; detecting another start is useful, but the user must see it and
+  be able to change it. The KP Mouse Tool, Depth Profile, KP Plotter and
+  Span & Slack Analysis show a Start KP box, pre-filled from a Workbench RPL
+  lines layer (`kp_datum.lines_layer_start_kp`, by its `rpl_id`) with a note
+  when it is not 0; other line layers start at 0. Processing algorithms do
+  **not** detect it: a Start KP parameter (default 0, `processing/kp_common`)
+  makes the user check it, and the log states it with the KP basis. The RPL
+  import summary shows a non-zero start KP and the stated-KP check
+  (`kp_datum.check_position_kps`).
+- **Workbench positions at a document KP follow the geodesic**
+  (`rpl_engine._along_leg`): the fraction of the leg comes from the stated
+  KPs, the position from the geodesic between the two positions, so the
+  assembly fit and lay-simulation depth sampling sit on the KP path (straight
+  in degrees was 14 m off mid-way along 20 km at 57.5 N). Compare revisions
+  measures offsets on WGS84 (`compare_panel._geodesic_m`), not the sphere.
+- **A leg that cannot be measured is never 0 m.** RouteStationing (Depth
+  Profile, Span & Slack Analysis, Lay Assessment) and the Explorer's
+  interval listing / as-laid RPL raise with the leg named; they used a
+  planar length in CRS units (degrees as metres on a geographic route) or
+  0 m, shifting every later KP. RouteFrame keeps ending its index there and
+  now reports it in `kp_basis_notes`.
+- **A line layer passed as a feature source is read in route order**
+  (`_normalise_geoms` through `ordered_route_features`), so
+  `RouteFrame.from_source(layer)` (e.g. the Explorer's off-line check)
+  matches every other KP tool.
 - **Plans record their KP datum** (`params_json.kp_datum`). A plan stored
   before start-KP support on an RPL that does not start at 0 is renumbered
   once on open (constant shift, one change-log entry, undoable).

@@ -554,15 +554,29 @@ def kp_from_cable_dist(model: RplModel, cable_km: float) -> Optional[float]:
     return k0 + t * (k1 - k0)
 
 
-def point_at_kp(model: RplModel, kp_km: float, da: QgsDistanceArea) -> Optional[Tuple[float, float]]:
-    """(lat, lon) at route KP, interpolated linearly within the segment.
+def _along_leg(a, b, t: float, da: Optional[QgsDistanceArea]) -> Tuple[float, float]:
+    """(lat, lon) a fraction ``t`` of the way from RPL position ``a`` to ``b``, along the
+    geodesic (the KP path, docs/KP_METHOD.md); straight in degrees without a geodesic ``da``."""
+    if da is not None and 0.0 < t < 1.0:
+        try:
+            if da.willUseEllipsoid():
+                p1, p2 = QgsPointXY(a.lon, a.lat), QgsPointXY(b.lon, b.lat)
+                q = da.computeSpheroidProject(p1, t * float(da.measureLine(p1, p2)), da.bearing(p1, p2))
+                return (q.y(), q.x())
+        except Exception:  # noqa: BLE001 - linear below
+            pass
+    return (a.lat + t * (b.lat - a.lat), a.lon + t * (b.lon - a.lon))
 
-    Good to well under a metre for typical RPL segment lengths; UI callers
-    with a RouteFrame available may prefer its geodesic interpolation.
-    """
+
+def point_at_kp(model: RplModel, kp_km: float, da: QgsDistanceArea) -> Optional[Tuple[float, float]]:
+    """(lat, lon) at a KP of the RPL (its stated KPs): the fraction of the leg from
+    the stated KPs, the position along the geodesic between the two RPL positions
+    (where KP is measured, and where a projected map draws the leg). On a long
+    leg the line straight in degrees is far from it (14 m mid-way along 20 km
+    at 57.5 N)."""
     index = _kp_index(model)
     if not index.kps_sorted or not _finite(kp_km):
-        return _point_at_kp_scan(model, kp_km)
+        return _point_at_kp_scan(model, kp_km, da)
     kps = index.kps
     if kp_km < kps[0] or kp_km > kps[-1]:
         return None
@@ -572,9 +586,7 @@ def point_at_kp(model: RplModel, kp_km: float, da: QgsDistanceArea) -> Optional[
     if k1 - k0 <= 0:
         return (pts[i].lat, pts[i].lon)
     t = (kp_km - k0) / (k1 - k0)
-    lat = pts[i].lat + t * (pts[i + 1].lat - pts[i].lat)
-    lon = pts[i].lon + t * (pts[i + 1].lon - pts[i].lon)
-    return (lat, lon)
+    return _along_leg(pts[i], pts[i + 1], t, da)
 
 
 def bearing_at_kp(model: RplModel, kp_km: float) -> Optional[float]:
@@ -632,7 +644,8 @@ def _kp_from_cable_dist_scan(model: RplModel, cable_km: float) -> Optional[float
     return None
 
 
-def _point_at_kp_scan(model: RplModel, kp_km: float) -> Optional[Tuple[float, float]]:
+def _point_at_kp_scan(model: RplModel, kp_km: float, da: Optional[QgsDistanceArea] = None
+                      ) -> Optional[Tuple[float, float]]:
     pts = model.points
     if not pts or pts[0].dist_cum_km is None:
         return None
@@ -647,9 +660,7 @@ def _point_at_kp_scan(model: RplModel, kp_km: float) -> Optional[Tuple[float, fl
                 return (pts[i].lat, pts[i].lon)
             t = (kp_km - k0) / (k1 - k0)
             if 0.0 <= t <= 1.0:
-                lat = pts[i].lat + t * (pts[i + 1].lat - pts[i].lat)
-                lon = pts[i].lon + t * (pts[i + 1].lon - pts[i].lon)
-                return (lat, lon)
+                return _along_leg(pts[i], pts[i + 1], t, da)
     return None
 
 

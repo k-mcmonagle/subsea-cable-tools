@@ -48,7 +48,11 @@ from ..kp_range_utils import (
     add_distance_mode_parameter,
     read_distance_mode,
 )
-from ..kp_geo_utils import RouteFrame, get_features_skip_invalid, ordered_route_geometry
+from ..kp_geo_utils import get_features_skip_invalid, ordered_route_geometry
+from .kp_common import START_KP_HELP, add_start_kp_parameter, build_route, read_start_kp, report_kp_basis
+
+# A KP this close past either end of the route (km, 1 um) is still on it.
+_KP_END_TOLERANCE_KM = 1e-9
 
 class KPRangeCSVAlgorithm(SubseaCableAlgorithm):
     INPUT_LAYER = 'INPUT_LAYER'
@@ -272,6 +276,7 @@ class KPRangeCSVAlgorithm(SubseaCableAlgorithm):
         )
 
         add_distance_mode_parameter(self)
+        add_start_kp_parameter(self)
 
     def processAlgorithm(self, parameters, context, feedback):
         source = self.parameterAsSource(parameters, self.INPUT_LINE, context)
@@ -362,21 +367,28 @@ class KPRangeCSVAlgorithm(SubseaCableAlgorithm):
             raise QgsProcessingException(str(exc))
 
         # One indexed route for every row: each lookup is a bisect instead of
-        # a geodesic re-walk of the whole line (was O(rows x vertices)).
-        route = RouteFrame.from_source(combined_geom, distance_calculator)
+        # a geodesic re-walk of the whole line (was O(rows x vertices)). KPs
+        # are start KP + chainage; slices and points follow the KP path.
+        start_kp_route = read_start_kp(self, parameters, context)
+        route = build_route([combined_geom], distance_calculator, start_kp_route)
+        report_kp_basis(feedback, route, start_kp_route)
         total_length = float(route.total_length_m)
         feedback.pushInfo(f"Total length of dissolved input line: {total_length} meters")
+        first_kp = route.start_kp_km - _KP_END_TOLERANCE_KM
+        last_kp = route.end_kp_km + _KP_END_TOLERANCE_KM
 
         def emit(start_kp, end_kp, carried, source_table_name):
             """Write one row to the range sink, or to the point sink if it is one."""
-            if start_kp < 0 or end_kp < 0:
+            if start_kp < first_kp or end_kp < first_kp:
                 feedback.reportError(
-                    f"KP range {start_kp}-{end_kp} is before the start of the line. Skipping.")
+                    f"KP range {start_kp}-{end_kp} is before the start of the line "
+                    f"(KP {route.start_kp_km:.3f}). Skipping.")
                 counts['skipped'] += 1
                 return
-            if (start_kp * 1000) > total_length or (end_kp * 1000) > total_length:
+            if start_kp > last_kp or end_kp > last_kp:
                 feedback.reportError(
-                    f"KP range {start_kp}-{end_kp} exceeds total line length of {total_length/1000:.2f} km. Skipping."
+                    f"KP range {start_kp}-{end_kp} is past the end of the line "
+                    f"(KP {route.end_kp_km:.3f}). Skipping."
                 )
                 counts['skipped'] += 1
                 return
@@ -483,7 +495,11 @@ Raise 'Treat a range shorter than this as a point (m)' above 0 to send very shor
 2.  Paste into 'Paste KP ranges (Excel/CSV text)'.
 3.  Select the RPL line layer.
 4.  Run.
-""")
+
+Ranges and positions follow the route's KP path: between route vertices along the geodesic (or the straight grid \
+line for grid KP), not along the line as drawn in latitude/longitude. A range that starts before the start KP or \
+ends past the end of the route is reported and skipped.
+""") + "\n\n" + self.tr(START_KP_HELP)
 
     def name(self):
         return 'kp_range_csv_processor'

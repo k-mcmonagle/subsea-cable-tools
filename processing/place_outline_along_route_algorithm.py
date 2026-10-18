@@ -30,8 +30,9 @@ from qgis.core import (
 from .algorithm_base import SubseaCableAlgorithm
 from ..burial import footprint
 from ..burial import geometry2d
-from ..kp_geo_utils import RouteFrame, get_features_skip_invalid
+from ..kp_geo_utils import get_features_skip_invalid, ordered_route_features
 from ..kp_range_utils import make_kp_distance_area
+from .kp_common import START_KP_HELP, add_start_kp_parameter, build_route, read_start_kp, report_kp_basis
 from ..qgis_compat import (
     FIELD_TYPE_DOUBLE,
     FIELD_TYPE_STRING,
@@ -83,12 +84,16 @@ Outline (DXF)" produces.
 KP to End KP every Interval metres (leave the list empty to use the \
 series; set Interval to 0 for a single placement at Start KP).
 
-KP chainage is measured geodesically on the WGS84 ellipsoid, \
-matching the plugin's other KP tools. Each placement is \
+KP chainage is measured geodesically on the WGS84 ellipsoid (or on the \
+grid chosen in KP settings), matching the plugin's other KP tools: KP is \
+start KP + chainage, and each KP lies on the route's KP path (between \
+vertices along the geodesic, not along the line as drawn in latitude/longitude). \
+The route is assembled in SeqNo order when every feature has one, else in \
+layer order. Each placement is \
 done in the local UTM zone, so the outline stays metre-true and the \
 heading (written to the output) accounts for grid convergence. Output is \
 in EPSG:4326 with kp / heading_deg / source attributes.
-""")
+""") + "\n\n" + self.tr(START_KP_HELP)
 
     def initAlgorithm(self, config=None):
         self.addParameter(QgsProcessingParameterVectorLayer(
@@ -114,6 +119,7 @@ in EPSG:4326 with kp / heading_deg / source attributes.
             type=PROCESSING_NUMBER_DOUBLE, defaultValue=0.0))
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.OUTPUT, self.tr("Placed outlines")))
+        add_start_kp_parameter(self)
 
     def processAlgorithm(self, parameters, context, feedback):
         outline_layer = self.parameterAsVectorLayer(
@@ -158,30 +164,36 @@ in EPSG:4326 with kp / heading_deg / source attributes.
         # WGS84 route frame + ellipsoidal chainage: the Burial Planner /
         # KP-tools convention, so KPs here match the rest of the plugin.
         wgs84 = QgsCoordinateReferenceSystem(_WGS84)
+        # route_crs: for grid KP, the route's own CRS takes part in the grid
+        # choice (docs/KP_METHOD.md 2.2) although the frame is in WGS84.
         distance = make_kp_distance_area(
-            wgs84, context.transformContext(), project=context.project())
+            wgs84, context.transformContext(), project=context.project(),
+            route_crs=route_source.sourceCrs())
         # Reproject with the run's transform context (not the project
         # singleton, which must not be touched from the worker thread).
         to_wgs84 = QgsCoordinateTransform(
             route_source.sourceCrs(), wgs84, context.transformContext())
         route_geoms = []
-        for feat in get_features_skip_invalid(route_source):
-            geom = feat.geometry()
-            if geom is None or geom.isEmpty():
-                continue
-            geom = QgsGeometry(geom)
+        # Route features in chainage order (SeqNo when every feature has one,
+        # else layer order), never noded or re-ordered otherwise.
+        for feat in ordered_route_features(get_features_skip_invalid(route_source)):
+            geom = QgsGeometry(feat.geometry())
             try:
                 geom.transform(to_wgs84)
             except QgsCsException as exc:
                 raise QgsProcessingException(
                     f"The route could not be reprojected to WGS84: {exc}")
             route_geoms.append(geom)
+        # KPs are start KP + chainage; positions follow the KP path.
+        start_kp = read_start_kp(self, parameters, context)
         try:
-            route = RouteFrame.from_source(
-                route_geoms, distance, follow_stored_geometry=True)
+            route = build_route(route_geoms, distance, start_kp)
+        except QgsProcessingException:
+            raise
         except Exception as exc:
             raise QgsProcessingException(
                 f"The route could not be prepared: {exc}")
+        report_kp_basis(feedback, route, start_kp)
 
         fields = QgsFields()
         fields.append(QgsField("kp", FIELD_TYPE_DOUBLE))

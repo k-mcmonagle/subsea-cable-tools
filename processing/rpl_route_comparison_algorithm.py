@@ -52,6 +52,7 @@ from ..qgis_compat import (
 )
 
 from .rpl_comparison_utils import RPLComparator
+from .kp_common import START_KP_HELP, add_start_kp_parameter, read_start_kp, report_kp_basis
 from ..kp_range_utils import make_kp_distance_area
 from ..kp_geo_utils import iter_line_parts
 from ..workbench import event_compare as ec
@@ -85,6 +86,10 @@ class RPLRouteComparisonAlgorithm(SubseaCableAlgorithm):
 
     OUTPUT_COMPARISON = 'OUTPUT_COMPARISON'
     OUTPUT_REPORT = 'OUTPUT_REPORT'
+
+    # The design route's start KP is the standard START_KP; the as-laid
+    # route's defaults to it (both RPLs normally start at the same KP).
+    ASLAID_START_KP = 'ASLAID_START_KP'
 
     def tr(self, string):
         return QCoreApplication.translate('Processing', string)
@@ -150,6 +155,9 @@ case, spaces and punctuation) and unique on both sides are paired.</p>
   <li><b>Search radius:</b> how far apart differently named events may be and still be paired
       (similar names may reach ten times this).</li>
   <li><b>Target radius (optional):</b> events within this radial distance count as on target.</li>
+  <li><b>Start KP (km):</b> the KP at the design route's first vertex. <b>As-laid start KP</b>: the KP
+      at the as-laid route's first vertex; leave it blank to use the design start KP. They apply to
+      the KPs measured along each route (when no KP field is given) and to every KP derived from them.</li>
   <li><b>Report (optional):</b> an HTML report with summary statistics, a radial plot of all
       reported events, offsets along the route and one radial plot per event.</li>
 </ul>
@@ -160,7 +168,9 @@ case, spaces and punctuation) and unique on both sides are paired.</p>
 cross_track_m, radial_distance_m, bearing_deg, design_depth, aslaid_depth, prev_ac_distance_m,
 next_ac_distance_m</code> and the newer <code>aslaid_kp, kp_delta_m, match_method, match_score,
 event_type, within_target</code>.</p>
-""")
+<p>KPs measured along a route follow the plugin's KP method: start KP + chainage, on the route's KP path
+(between vertices along the geodesic, or the straight grid line for grid KP).</p>
+""") + "<p>" + self.tr(START_KP_HELP) + "</p>"
 
     def initAlgorithm(self, config=None):
         # Design RPL inputs
@@ -254,6 +264,12 @@ event_type, within_target</code>.</p>
             self.TARGET_RADIUS, self.tr('Target radius (m, 0 = none)'),
             type=PROCESSING_NUMBER_DOUBLE, minValue=0.0, defaultValue=0.0,
         ))
+        add_start_kp_parameter(self)
+        self.addParameter(QgsProcessingParameterNumber(
+            self.ASLAID_START_KP,
+            self.tr("As-laid start KP (km) — the KP at the as-laid route's first vertex (blank: the design start KP)"),
+            type=PROCESSING_NUMBER_DOUBLE, defaultValue=None, optional=True,
+        ))
 
         # Outputs
         self.addParameter(
@@ -338,14 +354,21 @@ event_type, within_target</code>.</p>
             raise QgsProcessingException(self.tr('Failed to create output layer'))
 
         feedback.pushInfo('Initializing route comparator...')
-        comparator = RPLComparator(design_lines_layer, aslaid_lines_layer, crs, context)
+        design_start_kp = read_start_kp(self, parameters, context)
+        aslaid_start_kp = (design_start_kp if parameters.get(self.ASLAID_START_KP) in (None, '')
+                           else read_start_kp(self, parameters, context, self.ASLAID_START_KP))
+        comparator = RPLComparator(design_lines_layer, aslaid_lines_layer, crs, context,
+                                   source_start_kp_km=design_start_kp,
+                                   target_start_kp_km=aslaid_start_kp)
+        report_kp_basis(feedback, comparator.source_frame, design_start_kp)
+        if aslaid_start_kp != design_start_kp:
+            feedback.pushInfo(f'As-laid route: start KP {aslaid_start_kp:.3f} km.')
         try:
             distance_calc = make_kp_distance_area(
                 crs, context.transformContext(), project=context.project()
             )
         except ValueError as exc:
             raise QgsProcessingException(str(exc))
-        feedback.pushInfo(f'Using ellipsoid: {distance_calc.ellipsoid()}')
 
         # Step 1: read events (route order) and pair them.
         to_design = QgsCoordinateTransform(aslaid_points_layer.crs(), crs, context.transformContext())

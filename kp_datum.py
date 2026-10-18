@@ -35,6 +35,7 @@ class KpCheck:
     grid_max_diff_m: Optional[float] = None   # same, vs planar (UTM) chainage
     grid_zone: str = ""
     messages: List[str] = field(default_factory=list)
+    basis: str = "geodesic on the WGS84 ellipsoid"   # how the measured KPs were measured
 
     @property
     def level(self) -> str:
@@ -62,8 +63,8 @@ class KpCheck:
             text += (f"They match grid (cartesian, {self.grid_zone}) distances "
                      f"to within {self.grid_max_diff_m:.1f} m, so the RPL was "
                      "probably chained on the map projection. ")
-        text += ("The plugin measures KP geodesically (WGS84) from the RPL start "
-                 "KP; the stated values are shown for reference only.")
+        text += (f"The plugin measures KP {self.basis} from the RPL start KP; the "
+                 "stated values are shown for reference only.")
         return text
 
 
@@ -157,6 +158,46 @@ def start_kp_of(positions: Sequence[Tuple[object, Optional[float]]]) -> float:
         return 0.0
 
 
+def check_position_kps(positions) -> KpCheck:
+    """Compare the stated KPs of RPL positions with measured KPs (pure geometry).
+
+    ``positions`` are ``[(lon, lat, stated KP km or None)]`` in route order.
+    Measured KP is the start KP (the first stated KP, else 0) plus the
+    geodesic (WGS84) chainage through the positions; the grid comparison is
+    planar chainage in the UTM zone of the middle position.
+    """
+    from qgis.core import (QgsCoordinateReferenceSystem, QgsCoordinateTransform,
+                           QgsCoordinateTransformContext, QgsPointXY, QgsProject)
+
+    from .kp_range_utils import make_distance_area
+
+    rows = [(QgsPointXY(float(lon), float(lat)), stated) for lon, lat, stated in positions
+            if lon is not None and lat is not None]
+    if len(rows) < 2:
+        return KpCheck(positions=len(rows))
+    start = start_kp_of(rows)
+    distance = make_distance_area(QgsCoordinateReferenceSystem("EPSG:4326"), QgsCoordinateTransformContext())
+    measured, running = [start], 0.0
+    for (a, _sa), (b, _sb) in zip(rows[:-1], rows[1:]):
+        running += float(distance.measureLine(a, b))
+        measured.append(start + running / 1000.0)
+    grid, zone = None, ""
+    try:
+        mid = rows[len(rows) // 2][0]
+        epsg = utm_epsg_for(mid.x(), mid.y())
+        zone = f"UTM EPSG:{epsg}"
+        xform = QgsCoordinateTransform(QgsCoordinateReferenceSystem("EPSG:4326"),
+                                       QgsCoordinateReferenceSystem(f"EPSG:{epsg}"), QgsProject.instance())
+        projected = [xform.transform(p) for p, _s in rows]
+        grid, total = [start], 0.0
+        for a, b in zip(projected, projected[1:]):
+            total += ((b.x() - a.x()) ** 2 + (b.y() - a.y()) ** 2) ** 0.5
+            grid.append(start + total / 1000.0)
+    except Exception:  # noqa: BLE001 - the grid comparison is optional
+        grid, zone = None, ""
+    return compare_stated_kps(measured, [s for _p, s in rows], grid, zone)
+
+
 def lines_layer_start_kp(layer, store=None) -> float:
     """Start KP of a Cable Route Workbench RPL lines layer (0 for any other line layer).
 
@@ -223,4 +264,10 @@ def check_route_kps(route, positions) -> KpCheck:
             grid.append(start + running / 1000.0)
     except Exception:
         grid, zone = None, ""
-    return compare_stated_kps(measured, stated, grid, zone)
+    check = compare_stated_kps(measured, stated, grid, zone)
+    try:
+        from .kp_range_utils import kp_basis_text
+        check.basis = kp_basis_text(route._distance)
+    except Exception:  # noqa: BLE001 - the default wording stands
+        pass
+    return check

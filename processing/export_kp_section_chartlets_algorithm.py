@@ -46,8 +46,9 @@ from qgis.core import (
 from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE, PROCESSING_NUMBER_INTEGER
 
-from ..kp_range_utils import extract_line_segment, make_kp_distance_area, measure_total_length_m
+from ..kp_range_utils import make_kp_distance_area
 from ..kp_geo_utils import get_features_skip_invalid, ordered_route_geometry
+from .kp_common import START_KP_HELP, add_start_kp_parameter, build_route, read_start_kp, report_kp_basis
 
 
 def _safe_filename(value: str) -> str:
@@ -138,10 +139,13 @@ Parameters:
 - **Extra distance along route (km)** expands the KP range in both directions when using KP extraction mode.
 - **Extra map margin** adds padding around the final extent (in the map units of the chosen destination CRS).
 
+In KP extraction mode each section is the slice of the route's KP path between its KPs (between vertices along \
+the geodesic, or the straight grid line for grid KP), clipped to the route's start and end KP.
+
 Output:
 - One PNG per feature saved to the chosen folder.
 """
-        )
+        ) + "\n\n" + self.tr(START_KP_HELP)
 
     def createInstance(self):
         return ExportKPSectionChartletsAlgorithm()
@@ -265,6 +269,7 @@ Output:
                 defaultValue=True
             )
         )
+        add_start_kp_parameter(self)
 
     def _resolve_dest_crs(
         self,
@@ -407,9 +412,7 @@ Output:
                 )
             )
 
-        rpl_geom = None
-        distance_calculator = None
-        total_length_km = None
+        route = None
         if rpl_source is not None:
             rpl_geom = self._dissolve_rpl_geometry(rpl_source, context, feedback)
             if rpl_geom is None:
@@ -418,8 +421,10 @@ Output:
             distance_calculator = make_kp_distance_area(
                 rpl_source.sourceCrs(), context.transformContext(), project=context.project()
             )
-            total_length_m = float(measure_total_length_m(rpl_geom, distance_calculator))
-            total_length_km = total_length_m / 1000.0
+            # KPs are start KP + chainage; sections are slices of the KP path.
+            start_kp_route = read_start_kp(self, parameters, context)
+            route = build_route([rpl_geom], distance_calculator, start_kp_route)
+            report_kp_basis(feedback, route, start_kp_route)
 
         start_field, end_field = self._kp_fields_or_guess(ranges_source, start_field_raw, end_field_raw)
 
@@ -491,12 +496,10 @@ Output:
                     skipped += 1
                     continue
                 start_kp, end_kp = kp_range
-                start_kp = max(0.0, start_kp - extra_along_km)
-                end_kp = end_kp + extra_along_km
-                if total_length_km is not None:
-                    end_kp = min(total_length_km, end_kp)
+                start_kp = max(route.start_kp_km, start_kp - extra_along_km)
+                end_kp = min(route.end_kp_km, end_kp + extra_along_km)
 
-                seg_geom = extract_line_segment(rpl_geom, start_kp, end_kp, distance_calculator)
+                seg_geom = route.extract_segment(start_kp, end_kp)
                 if seg_geom is None or seg_geom.isEmpty():
                     skipped += 1
                     continue

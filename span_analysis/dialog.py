@@ -574,7 +574,9 @@ class SpanAnalysisDialog(QDialog):
             rpl_id = s["route"]["rpl_id"]
             if store is None or not rpl_id:
                 raise ValueError("Choose a Workbench RPL (or another route source).")
-            self._rpl_model = sources.load_rpl_model(store, rpl_id)
+            # The start KP shown in the setup (the RPL's own unless changed).
+            self._rpl_model = sources.with_start_kp(sources.load_rpl_model(store, rpl_id),
+                                                    float(s["route"]["start_kp"]))
             route = sources.route_from_rpl_model(self._rpl_model, setup.rpl_combo.currentText())
         elif route_source == sources.ROUTE_LINE:
             route = sources.route_from_layer(setup.line_combo.currentLayer(), s["route"]["line_selected"],
@@ -656,7 +658,8 @@ class SpanAnalysisDialog(QDialog):
             fit_id = s["cable"]["fit_id"]
             if setup.workbench is None or not fit_id:
                 raise ValueError("Choose an assembly fitted to the RPL.")
-            sections, fit_bodies, warnings = sources.fit_makeup(setup.workbench, fit_id, setup.library_rows)
+            start = float(s["route"]["start_kp"]) if route_source == sources.ROUTE_RPL else None
+            sections, fit_bodies, warnings = sources.fit_makeup(setup.workbench, fit_id, setup.library_rows, start)
             notes.extend(warnings)
             if s["cable"]["bodies_from_fit"]:
                 bodies = fit_bodies + bodies

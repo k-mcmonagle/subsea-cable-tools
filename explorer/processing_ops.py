@@ -28,7 +28,6 @@ from qgis.core import (
     QgsVectorLayer,
 )
 
-from ..plugin_log import log_warning
 from ..processing.cable_lay_parsers import WKT_KEY, fields_from_specs
 
 # RPL schema mirrors processing/import_excel_rpl_algorithm.py output layers.
@@ -99,22 +98,24 @@ def path_points(dataset) -> List[Tuple[float, float, int]]:
 
 
 def cumulative_m(points, distance) -> List[float]:
-    """Cumulative geodesic distance (m) at each path vertex."""
+    """Cumulative geodesic distance (m) at each path vertex.
+
+    A step that cannot be measured stops the work (``ValueError``) rather than
+    counting as 0 m, which would shorten every distance after it.
+    """
     cum = [0.0]
-    failed = 0
     for i in range(1, len(points)):
         p0 = QgsPointXY(points[i - 1][0], points[i - 1][1])
         p1 = QgsPointXY(points[i][0], points[i][1])
         try:
-            step = distance.measureLine(p0, p1)
-        except Exception:  # noqa: BLE001 - counted and reported below
-            step = 0.0
-            failed += 1
+            step = float(distance.measureLine(p0, p1))
+        except Exception as exc:  # noqa: BLE001 - re-raised with the position
+            raise ValueError(f"The distance from record {points[i - 1][2]} to record {points[i][2]} "
+                             f"could not be measured: {exc}") from exc
+        if not math.isfinite(step):
+            raise ValueError(f"The distance from record {points[i - 1][2]} to record {points[i][2]} "
+                             "is not a number")
         cum.append(cum[-1] + step)
-    if failed:
-        # Each failure shortens every downstream cumulative distance.
-        log_warning(f"Cable Lay Data Explorer: {failed} path step(s) could not be "
-                    "measured and count as 0 m in the cumulative distance")
     return cum
 
 

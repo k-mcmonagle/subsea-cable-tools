@@ -398,7 +398,17 @@ def test_range_ring_cached_and_unchanged():
         first = tool._wgs84_transforms()
         cached = tool._wgs84_transforms() is first
         tool.range_bearing_origin = origin
-        range_m, _bearing = tool._compute_range_bearing(origin, mouse)
+        range_m, bearing = tool._compute_range_bearing(origin, mouse)
+        # True bearing: the WGS84 geodesic azimuth (Karney via pyproj when installed).
+        try:
+            import pyproj
+
+            azimuth = pyproj.Geod(ellps="WGS84").inv(3.05, 55.03, 3.08, 55.05)[0] % 360.0
+        except Exception:  # noqa: BLE001 - the QGIS spheroid as the reference
+            spheroid_ref = QgsDistanceArea()
+            spheroid_ref.setEllipsoid("WGS84")
+            azimuth = math.degrees(spheroid_ref.bearing(QgsPointXY(3.05, 55.03), QgsPointXY(3.08, 55.05))) % 360.0
+        true_bearing = abs(bearing - azimuth) < 1e-4
         calls = []
         real = tool._range_ring_geometry
         tool._range_ring_geometry = lambda *a, **k: calls.append(1) or real(*a, **k)
@@ -429,10 +439,11 @@ def test_range_ring_cached_and_unchanged():
             tool.total_length_meters - RouteFrame.from_source(
                 tool.features_geoms, tool.distanceArea).total_length_m) < 1e-9
         ok = cached and rebuilt_once and rebuilt_again and same_ring and line_ok \
-            and invalidated and rebuilt_route
-        return _result("range ring: cached transforms, legacy-identical ring, no rebuild at same radius",
-                       ok, "cached=%s rebuilt=%s/%s ring worst %.2e m, CRS change invalidates=%s"
-                       % (cached, rebuilt_once, rebuilt_again, worst, invalidated))
+            and invalidated and rebuilt_route and true_bearing
+        return _result("range ring: cached transforms, legacy-identical ring, no rebuild at same radius; "
+                       "true (geodesic) bearing",
+                       ok, "cached=%s rebuilt=%s/%s ring worst %.2e m, CRS change invalidates=%s, bearing %.5f vs %.5f"
+                       % (cached, rebuilt_once, rebuilt_again, worst, invalidated, bearing, azimuth))
     finally:
         tool.cleanup_resources()
         iface.close()
@@ -533,11 +544,29 @@ def test_start_kp_from_workbench_rpl():
               and abs(start.kp_km - 12.345) < 1e-9 and abs(end.kp_km - (12.345 + length_km)) < 1e-9
               and abs(tool._end_kp() - end.kp_km) < 1e-9)
         detail = f"start {start.kp_km:.3f}, end {end.kp_km:.3f}, rKP at the start {tool._end_kp() - start.kp_km:.3f}"
+        # A start KP set by the user overrides the RPL's.
+        given = KPMouseMapTool(iface.mapCanvas(), lines, iface, "m", True, False, start_kp_km=5.0)
+        try:
+            ok = ok and abs(given._locate(QgsPointXY(3.0, 55.0)).kp_km - 5.0) < 1e-9
+        finally:
+            given.cleanup_resources()
+        # The settings dialog fills the RPL's start KP for the layer and says so; a set value wins.
+        from ..maptools.kp_mouse_maptool import KPConfigDialog
+        QgsProject.instance().addMapLayer(lines)
+        try:
+            detected = KPConfigDialog(None, current_layer=lines)
+            kept = KPConfigDialog(None, current_layer=lines, start_kp=3.0)
+            ok = ok and abs(detected.start_kp_spin.value() - 12.345) < 1e-9 and "12.345" in                 detected.start_kp_note.text() and abs(kept.start_kp_spin.value() - 3.0) < 1e-9
+            detected.deleteLater()
+            kept.deleteLater()
+        finally:
+            QgsProject.instance().takeMapLayer(lines)    # keep the layer: the tool still uses it
     finally:
         kp_datum.lines_layer_start_kp = original
         tool.cleanup_resources()
         iface.close()
-    return _result("KP starts at the Workbench RPL's start KP; rKP from its end KP", ok, detail)
+    return _result("KP starts at the Workbench RPL's start KP (shown, and a set start KP wins); rKP from its end",
+                   ok, detail)
 
 
 def run_all():

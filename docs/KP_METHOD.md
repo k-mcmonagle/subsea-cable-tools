@@ -10,7 +10,7 @@ shared route model. Where a tool differs, this document says so.
 - **Chainage** is measured leg by leg between consecutive route vertices, with the distance model in section 2,
   and summed in route order.
 - **Route** is the line through the route vertices (RPL positions) in route order:
-  - SeqNo order when every feature has a SeqNo, else layer order;
+  - SeqNo order when every feature has a SeqNo, else layer order (wherever a tool reads a line layer);
   - legs that touch are joined;
   - the route is never noded, re-ordered or reversed.
 - **Start KP** is the KP at the first vertex. It is 0 unless it is given (section 4).
@@ -66,12 +66,23 @@ Select it in **Subsea Cable Tools ▸ KP settings…** for an RPL that was chain
   - A map in latitude/longitude draws them straight in degrees, so on long legs it does not show where the KPs
     lie. Use a projected map CRS to inspect long legs.
 - **Transit playback** in the Lay Planner deliberately follows the line as drawn. It keeps the geodesic length.
+- **Bearings** (KP Mouse Tool range/bearing, Place Single KP Point) are true bearings: the geodesic azimuth on
+  WGS84, in degrees clockwise from true north. They are not grid bearings, so they differ from a bearing
+  measured on a projected map by the grid convergence.
 
 ## 4. Start KP
 
-- An RPL from the Cable Route Workbench supplies its start KP: the stated KP of its first position (normally 0).
-- Tools show a start KP that is not 0, and the user can set it.
-- Processing algorithms take the start KP as a parameter (default 0). They do not read it from the data.
+Most routes start at KP 0. A route that starts elsewhere is always shown, and the user decides.
+
+- **From a Workbench RPL:** the start KP is the stated KP of the RPL's first position (normally 0). It is the only
+  KP taken from an RPL.
+- **Interactive tools** (KP Mouse Tool, Depth Profile, KP Plotter, Span & Slack Analysis):
+  - show a **Start KP** box;
+  - on a Workbench RPL lines layer it is pre-filled with the RPL's start KP, with a note when that is not 0;
+  - on any other line layer it is 0 until the user sets it.
+- **Processing algorithms** take a **Start KP** parameter (default 0). They never read it from the data. The log
+  states the start KP used and the KP basis.
+- **RPL import:** the summary says when the RPL does not start at KP 0.
 
 ## 5. KPs stated in an RPL
 
@@ -82,8 +93,12 @@ Select it in **Subsea Cable Tools ▸ KP settings…** for an RPL that was chain
   
   An RPL chained on a grid is recognised by comparing it with planar UTM chainage. The check never moves a
   position.
+- **When:** at RPL import (in the import summary), on the Burial Planner Inputs tab, and in Span & Slack Analysis.
 - **Use:** tools that compare RPL documents (Compare RPLs, Event Compare, the assembly fit) use the document's
   KPs. Tools that place or measure positions use measured KPs.
+- **Positions at a document KP** (assembly fit, lay simulation inputs) lie on the geodesic between the two RPL
+  positions either side, at the fraction of the leg given by the document's KPs. Compare revisions measures
+  position offsets geodesically on WGS84.
 - **Editing a Workbench RPL:**
   - legs from the edited one onwards are measured again (geodesic);
   - the cumulative KPs before the edit stay as they are, so rounding in the document's leg lengths cannot build
@@ -97,6 +112,10 @@ Select it in **Subsea Cable Tools ▸ KP settings…** for an RPL that was chain
   [KP and bathymetry methods](KP_AND_BATHYMETRY.md).
 - **±180° meridian:** routes that cross it are refused, because positions on the crossing leg would be wrong.
   Split the route at 180° and give the second part the start KP of the split.
+- **A leg that cannot be measured** (invalid coordinates, or a transformation that fails) is never counted as
+  0 m or as a planar length on another basis, because that would shift every KP after it:
+  - tools that build a profile or listing along the route stop and name the leg;
+  - the KP route model ends at that leg, and its KP basis notes say so (as a warning).
 - **Precision:** KP is calculated in double precision, in metres. Displays round to 0.001 km (1 m).
 - **Validation:** automated tests compare against an independent geodesic solver (Karney 2013) on synthetic
   routes:

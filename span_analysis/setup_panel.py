@@ -420,7 +420,9 @@ class SetupPanel(QWidget):
         self.line_combo = QgsMapLayerComboBox()
         self.line_combo.setFilters(layer_filters(MAP_LAYER_FILTER_LINE))
         self.line_selected = QCheckBox("Selected features only")
-        self.line_start_kp = _spin(-100000.0, 100000.0, 0.0, 3, 0.1, " km", "KP at the first vertex of the line.")
+        self.line_start_kp = _spin(-100000.0, 100000.0, 0.0, 3, 0.1, " km",
+                                   "KP at the route's first vertex. For a Workbench RPL it is filled from the RPL "
+                                   "(its first position's stated KP); check it. KP = start KP + chainage.")
         self.line_row = QWidget()
         line_layout = QHBoxLayout(self.line_row)
         line_layout.setContentsMargins(0, 0, 0, 0)
@@ -1040,8 +1042,31 @@ class SetupPanel(QWidget):
         if self.sender() is self.rpl_combo:
             self._refresh_fits()
             self.refresh_mapping()
+            self._prefill_rpl_start_kp()
+        elif self.sender() is self.route_source and self.route_source.currentData() == sources.ROUTE_RPL:
+            self._prefill_rpl_start_kp()
         self._update_visibility()
         self._emit_changed()
+
+    def rpl_model(self):
+        """The chosen Workbench RPL's model (cached), or None."""
+        store, rpl_id = self._workbench, self.rpl_combo.currentData()
+        if store is None or not rpl_id:
+            return None
+        if self._rpl_cache.get("id") != rpl_id:
+            try:
+                self._rpl_cache = {"id": rpl_id, "model": sources.load_rpl_model(store, rpl_id)}
+            except Exception:
+                return None
+        return self._rpl_cache.get("model")
+
+    def _prefill_rpl_start_kp(self) -> None:
+        """An RPL route starts at the RPL's start KP (its first position's stated KP) unless changed."""
+        if self._loading:
+            return
+        model = self.rpl_model()
+        if model is not None:
+            self.line_start_kp.setValue(float(model.start_kp_km()))
 
     def _on_cable_source(self, *_args) -> None:
         self._update_visibility()
@@ -1063,11 +1088,8 @@ class SetupPanel(QWidget):
             if cable == CABLE_FIT and self.fit_combo.currentData():
                 return sources.fit_labels(store, self.fit_combo.currentData())
             if cable == CABLE_RPL and self.rpl_combo.currentData():
-                rpl_id = self.rpl_combo.currentData()
-                if self._rpl_cache.get("id") != rpl_id:
-                    self._rpl_cache = {"id": rpl_id, "model": sources.load_rpl_model(store, rpl_id)}
                 labels: List[str] = []
-                for _k0, _k1, label in sources.rpl_leg_labels(self._rpl_cache["model"]):
+                for _k0, _k1, label in sources.rpl_leg_labels(self.rpl_model()):
                     if label not in labels:
                         labels.append(label)
                 return labels
@@ -1125,7 +1147,7 @@ class SetupPanel(QWidget):
         rows = (
             (self.rpl_row, route == sources.ROUTE_RPL),
             (self.line_row, route == sources.ROUTE_LINE),
-            (self.line_start_kp, route == sources.ROUTE_LINE),
+            (self.line_start_kp, route in (sources.ROUTE_LINE, sources.ROUTE_RPL)),
             (self.csv_row, route == sources.ROUTE_CSV),
             (self.dxf_box, route == sources.ROUTE_DXF),
             (self.syn_box, route == sources.ROUTE_SYNTHETIC),
@@ -1156,7 +1178,9 @@ class SetupPanel(QWidget):
         route = self.route_source.currentData()
         if route == sources.ROUTE_RPL:
             ok = bool(self.rpl_combo.currentData())
-            self.route_section.set_status(self.rpl_combo.currentText() if ok else "Needs a Workbench RPL", ok)
+            start = self.line_start_kp.value()
+            self.route_section.set_status((self.rpl_combo.currentText() + (f", start KP {start:.3f}" if start else ""))
+                                          if ok else "Needs a Workbench RPL", ok)
         elif route == sources.ROUTE_LINE:
             layer = self.line_combo.currentLayer()
             self.route_section.set_status(layer.name() if layer else "Needs a line layer", layer is not None)
@@ -1386,6 +1410,7 @@ class SetupPanel(QWidget):
                 "line_layer": line.id() if line else None,
                 "line_selected": self.line_selected.isChecked(),
                 "start_kp": self.line_start_kp.value(),
+                "start_kp_set": True,
                 "csv_path": self.csv_path.text().strip(),
                 "dxf": {"path": self.dxf_path.text().strip(), "layer": self.dxf_layer.currentData(),
                         "x_mode": self.dxf_x.currentData(), "start_kp": self.dxf_start_kp.value(),
@@ -1430,6 +1455,7 @@ class SetupPanel(QWidget):
     def apply_settings(self, s: Dict) -> None:
         if not s:
             return
+        rpl_start_from_rpl = False
         self._loading = True
         try:
             route = s.get("route", {})
@@ -1441,6 +1467,7 @@ class SetupPanel(QWidget):
                 self.line_combo.setLayer(layer)
             self.line_selected.setChecked(bool(route.get("line_selected")))
             self.line_start_kp.setValue(float(route.get("start_kp") or 0.0))
+            rpl_start_from_rpl = route.get("source") == sources.ROUTE_RPL and not route.get("start_kp_set")
             self.csv_path.setText(route.get("csv_path") or "")
             dxf = route.get("dxf") or {}
             self.dxf_path.setText(dxf.get("path") or "")
@@ -1502,6 +1529,9 @@ class SetupPanel(QWidget):
             self.allowable.setChecked(bool(crit.get("allowable", True)))
         finally:
             self._loading = False
+        if rpl_start_from_rpl:
+            # A scenario saved before the RPL start KP could be set: the RPL's own.
+            self._prefill_rpl_start_kp()
         self._on_mode()
         self._update_visibility()
         self.update_status()

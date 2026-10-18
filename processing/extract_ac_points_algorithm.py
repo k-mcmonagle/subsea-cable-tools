@@ -28,6 +28,7 @@ from qgis.core import (QgsProcessing,
                        QgsProcessingLayerPostProcessorInterface)
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_NUMBER_DOUBLE
 from ..kp_geo_utils import get_features_skip_invalid, ordered_route_geometry
+from .kp_common import START_KP_HELP, add_start_kp_parameter, build_route, read_start_kp, report_kp_basis
 
 class ExtractACPointsAlgorithm(SubseaCableAlgorithm):
     INPUT_RPL = 'INPUT_RPL'
@@ -71,6 +72,7 @@ class ExtractACPointsAlgorithm(SubseaCableAlgorithm):
         )
 
         add_distance_mode_parameter(self)
+        add_start_kp_parameter(self)
 
     @staticmethod
     def _parse_bin_edges(text: str):
@@ -142,6 +144,14 @@ class ExtractACPointsAlgorithm(SubseaCableAlgorithm):
             feedback.pushInfo("Input line layer is empty or invalid after merging.")
             return {self.OUTPUT: dest_id}
 
+        # The route's KP frame: start KP, KP basis, and the +/-180 deg check.
+        # A/C points are route vertices, whose KP is the start KP plus the leg
+        # lengths up to them (RouteFrame's chainage at its vertices); the KP
+        # path between vertices does not move them.
+        start_kp = read_start_kp(self, parameters, context)
+        route = build_route([merged_geom], distance_calculator, start_kp)
+        report_kp_basis(feedback, route, start_kp)
+
         # Extract points from the merged geometry
         if merged_geom.isMultipart():
             lines = merged_geom.asMultiPolyline()
@@ -201,7 +211,7 @@ class ExtractACPointsAlgorithm(SubseaCableAlgorithm):
                             if abs_turn < min_ac_deg:
                                 cumulative_dist += seg_len
                                 continue
-                            kp = (cumulative_dist + seg_len) / 1000.0
+                            kp = route.start_kp_km + (cumulative_dist + seg_len) / 1000.0
                             bin_label = self._bin_label(abs_turn, bin_edges)
                             feat = QgsFeature(fields)
                             feat.setGeometry(QgsGeometry.fromPointXY(p_curr))
@@ -251,14 +261,14 @@ You can optionally:
 
 **Output:**
 - A point layer containing the A/C points.
-- 'kp' field: The Kilometre Point along the line (in km).
+- 'kp' field: The Kilometre Point along the line (in km): start KP + chainage to the vertex.
 - 'alter_course' field: The turn angle in degrees (positive for right turns, negative for left turns).
 - 'turn_abs' field: Absolute value of 'alter_course' (degrees).
 - 'turn_bin' field: Optional bin label based on absolute A/C and provided bin edges.
 - 'source_layer' field: The name of the input RPL layer.
 
 The output layer is automatically named with an '_AC_Listing' suffix.
-""")
+""") + "\n\n" + self.tr(START_KP_HELP)
 
     def tr(self, string):
         return QCoreApplication.translate('Processing', string)

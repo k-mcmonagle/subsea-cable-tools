@@ -37,7 +37,8 @@ from qgis.core import (QgsProcessing,
                        QgsWkbTypes,
                        QgsProcessingException)
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_FIELD_NUMERIC
-from ..kp_geo_utils import RouteFrame, get_features_skip_invalid, ordered_route_geometry
+from ..kp_geo_utils import get_features_skip_invalid, ordered_route_geometry
+from .kp_common import START_KP_HELP, add_start_kp_parameter, build_route, read_start_kp, report_kp_basis
 
 class PlaceKpPointsFromCsvAlgorithm(SubseaCableAlgorithm):
     INPUT_TABLE = 'INPUT_TABLE'
@@ -205,6 +206,7 @@ class PlaceKpPointsFromCsvAlgorithm(SubseaCableAlgorithm):
         )
 
         add_distance_mode_parameter(self)
+        add_start_kp_parameter(self)
 
     def processAlgorithm(self, parameters, context, feedback):
         line_layer = self.parameterAsSource(parameters, self.INPUT_LINE, context)
@@ -280,14 +282,18 @@ class PlaceKpPointsFromCsvAlgorithm(SubseaCableAlgorithm):
             raise QgsProcessingException(str(exc))
 
         # One indexed route for all rows (the shared KP definition): each KP
-        # is a bisect instead of a geodesic re-walk of the whole line.
-        route = RouteFrame.from_source(merged_geometry, distance_calculator)
+        # is a bisect instead of a geodesic re-walk of the whole line. KPs are
+        # start KP + chainage, positions on the KP path between vertices.
+        start_kp = read_start_kp(self, parameters, context)
+        route = build_route([merged_geometry], distance_calculator, start_kp)
+        report_kp_basis(feedback, route, start_kp)
         total_length_m = route.total_length_m
         if total_length_m == 0:
             raise QgsProcessingException(self.tr("Line has no length."))
+        kp_span = f"KP {route.start_kp_km:.3f} to {route.end_kp_km:.3f} km"
 
         def _place_point_at_kp(kp_val: float) -> Optional[QgsGeometry]:
-            # None outside 0..route length (a negative KP used to be
+            # None outside start KP..end KP (a KP before the start used to be
             # extrapolated backwards off the start of the line).
             point = route.point_at_kp(kp_val)
             return QgsGeometry.fromPointXY(point) if point is not None else None
@@ -302,7 +308,7 @@ class PlaceKpPointsFromCsvAlgorithm(SubseaCableAlgorithm):
                 point_geom = _place_point_at_kp(kp_val)
                 if point_geom is None:
                     feedback.reportError(
-                        f"KP value {kp_val} is outside the line (0 to {total_length_m/1000:.3f} km). Skipping."
+                        f"KP value {kp_val} is outside the line ({kp_span}). Skipping."
                     )
                     continue
 
@@ -337,7 +343,7 @@ class PlaceKpPointsFromCsvAlgorithm(SubseaCableAlgorithm):
                 point_geom = _place_point_at_kp(kp_val)
                 if point_geom is None:
                     feedback.reportError(
-                        f"KP value {kp_val} is outside the line (0 to {total_length_m/1000:.3f} km). Skipping."
+                        f"KP value {kp_val} is outside the line ({kp_span}). Skipping."
                     )
                     continue
 
@@ -386,7 +392,11 @@ For pasted text, the first column is interpreted as KP (in km). Any other column
 2.  Paste into 'Paste KP points (Excel/CSV text)'.
 3.  Select the line layer route.
 4.  Run.
-""")
+
+Each point is placed on the route's KP path at its KP: between route vertices along the geodesic \
+(or the straight grid line for grid KP), not along the line as drawn in latitude/longitude. A KP \
+before the start KP or past the end of the route is reported and skipped.
+""") + "\n\n" + self.tr(START_KP_HELP)
 
     def name(self):
         return 'placekppointsfromcsv'

@@ -5,8 +5,8 @@ import shutil
 import tempfile
 import unittest
 
-from qgis.core import (QgsCoordinateReferenceSystem, QgsDistanceArea, QgsGeometry, QgsProcessingContext,
-                       QgsProcessingFeedback, QgsProject)
+from qgis.core import (QgsCoordinateReferenceSystem, QgsDistanceArea, QgsGeometry, QgsPointXY,
+                       QgsProcessingContext, QgsProcessingFeedback, QgsProject)
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.PyQt.QtWidgets import QApplication
 
@@ -117,9 +117,21 @@ class CptQgisTests(unittest.TestCase):
         rows, notes = cpt_register.place(self.model.route, built["cpts"], 250.0, 100.0)
         first, second = rows
         self.assertEqual((first["status"], second["status"]), ("placed", "placed"))
-        self.assertAlmostEqual(first["offset_m"], -18.5, delta=1.0)   # north of an eastward route: port
-        self.assertAlmostEqual(second["offset_m"], 18.5, delta=1.0)
-        self.assertEqual(cpt_register.side_text(first["offset_m"]), "19 m port")
+        # Offsets from the route's KP path: the geodesic from (0, 50) to (0.1, 50) runs ~1.2 m north of
+        # the parallel at mid-leg, so CP-1 (18.5 m north of it) is ~17.3 m off, CP-2 (south) ~19.7 m.
+        distance = self.model.route._distance
+        start, end = QgsPointXY(0.0, 50.0), QgsPointXY(0.1, 50.0)
+        length, azimuth = distance.measureLine(start, end), distance.bearing(start, end)
+        geodesic = [distance.computeSpheroidProject(start, length * i / 7200.0, azimuth) for i in range(7201)]
+
+        def off_geodesic(cpt):     # brute force: the nearest of points 1 m apart along the geodesic
+            return min(distance.measureLine(QgsPointXY(cpt["lon"], cpt["lat"]), q) for q in geodesic)
+
+        port, starboard = off_geodesic(one), off_geodesic(two)
+        self.assertAlmostEqual(first["offset_m"], -port, delta=0.05)   # north of an eastward route: port
+        self.assertAlmostEqual(second["offset_m"], starboard, delta=0.05)
+        self.assertGreater(starboard - port, 2.0)
+        self.assertEqual(cpt_register.side_text(first["offset_m"]), "17 m port")
         middle = (first["kp"] + second["kp"]) / 2
         self.assertAlmostEqual(first["end_kp"], min(middle, first["kp"] + 0.1))
         self.assertAlmostEqual(first["start_kp"], first["kp"] - 0.1)

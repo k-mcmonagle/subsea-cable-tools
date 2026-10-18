@@ -380,6 +380,13 @@ def test_kp_consistency() -> List[bool]:
     ok = ok and all(abs(mapper(planar[i]) - vertices[i]) < 1e-6 for i in range(4)) and "differ" in note
     out.append(_report("RPL legs and fits at measured KPs; printed KPs only noted", ok,
                        f"printed vs measured at the end {(planar[-1] - vertices[-1]) * 1000:+.1f} m"))
+    # A start KP set by the user moves the route, its legs and the fit mapping together.
+    moved = sources.with_start_kp(model, 10.0)
+    moved_route = sources.route_from_rpl_model(moved, "moved")
+    moved_legs = sources.rpl_legs(moved)
+    shift = 10.0 - 12.345
+    ok = abs(moved_route.kp_range[0] - 10.0) < 1e-12 and abs(moved_legs[0][0] - 10.0) < 1e-12         and abs(moved_legs[-1][1] - (vertices[-1] + shift)) < 1e-9         and abs(sources.rpl_kp_mapper(moved)(planar[1]) - (vertices[1] + shift)) < 1e-9
+    out.append(_report("an RPL start KP set by the user moves the route, legs and fit mapping", ok))
 
     # A line in two parts with a 500 m gap: the gap is not chainage, in a window either.
     parts = [[to_wgs.transform(QgsPointXY(500000.0, 6370000.0)), to_wgs.transform(QgsPointXY(503000.0, 6370000.0))],

@@ -11,7 +11,10 @@ QGIS spheroid functions):
 * Grid KP: straight in the grid between vertices, the planar sum at the
   end, and a warning when the route leaves the grid's area of use.
 * A route across +/-180 deg is refused with a clear message.
-* Editing a Workbench RPL keeps the KPs before the edit exactly.
+* Editing a Workbench RPL keeps the KPs before the edit exactly; its
+  positions at a KP lie on the geodesic; RPL comparison measures on WGS84.
+* A line layer becomes a route in SeqNo order wherever it is read.
+* A segment KP cannot measure stops (or ends) the chainage, never counts 0 m.
 """
 
 from __future__ import annotations
@@ -167,13 +170,14 @@ def test_antimeridian_refused() -> bool:
     pts = [QgsPointXY(178.0, -16.0), QgsPointXY(179.6, -16.2), QgsPointXY(-179.5, -16.4)]
     da = make_distance_area(WGS, CTX)
     refused = []
-    for build in (lambda: RouteFrame.from_source([QgsGeometry.fromPolylineXY(pts)], da),
-                  lambda: dpc.route_from_points(pts, WGS, da)):
-        try:
-            build()
-            refused.append(False)
-        except AntimeridianError as exc:
-            refused.append("180" in str(exc))
+    try:
+        RouteFrame.from_source([QgsGeometry.fromPolylineXY(pts)], da)
+        refused.append(False)
+    except AntimeridianError as exc:
+        refused.append("180" in str(exc))
+    # The Depth Profile builders return the reason as the route status (shown on the plot).
+    route, status = dpc.route_from_points(pts, WGS, da)
+    refused.append(route is None and "180" in (status or ""))
     return _report("a route across ±180° is refused with a clear message", all(refused) and len(refused) == 2)
 
 
@@ -198,6 +202,122 @@ def test_workbench_edit_keeps_earlier_kps() -> bool:
                    f"largest change before the edit {max(before) * 1e6:.3f} mm")
 
 
+def test_stated_kp_check_at_import() -> bool:
+    """RPL import check: stated KPs equal to geodesic chainage agree; stated grid KPs are recognised."""
+    from ..kp_datum import check_position_kps
+
+    utm = QgsCoordinateReferenceSystem("EPSG:32630")
+    to_wgs = QgsCoordinateTransform(utm, WGS, QgsProject.instance())
+    grid_pts = [QgsPointXY(480000.0 + 20000.0 * i, 6300000.0 + 15000.0 * (i % 2)) for i in range(8)]
+    lonlat = [to_wgs.transform(p) for p in grid_pts]
+    geodesic = [5.0]
+    for a, b in zip(lonlat[:-1], lonlat[1:]):
+        geodesic.append(geodesic[-1] + REF.inv((a.x(), a.y()), (b.x(), b.y()))[1] / 1000.0)
+    planar = [5.0]
+    for a, b in zip(grid_pts[:-1], grid_pts[1:]):
+        planar.append(planar[-1] + math.hypot(b.x() - a.x(), b.y() - a.y()) / 1000.0)
+    same = check_position_kps([(p.x(), p.y(), k) for p, k in zip(lonlat, geodesic)])
+    grid = check_position_kps([(p.x(), p.y(), k) for p, k in zip(lonlat, planar)])
+    ok = same.level == "ok" and same.max_diff_m < 0.01 and grid.level != "ok" and grid.looks_grid
+    return _report("RPL import KP check: geodesic KPs agree, grid-chained KPs are recognised", ok,
+                   f"geodesic {same.max_diff_m * 1000:.2f} mm; grid {grid.max_diff_m:.1f} m ({grid.summary()[:80]})")
+
+
+def test_workbench_position_on_geodesic() -> bool:
+    """A position at a KP inside a 20 km Workbench leg lies on the geodesic (not straight in degrees)."""
+    from ..workbench import rpl_engine as eng
+    from ..workbench.compare_panel import _geodesic_m
+    from ..workbench.rpl_engine import RplModel, RplPoint, RplSegment
+
+    da = make_distance_area(WGS, CTX)
+    a = (-6.0, 57.5)
+    b = REF.fwd(a, 60.0, 20000.0)
+    model = RplModel(points=[RplPoint(seq=0, pos_no=1, event="", lat=a[1], lon=a[0]),
+                             RplPoint(seq=1, pos_no=2, event="", lat=b[1], lon=b[0])],
+                     segments=[RplSegment(seq=0, slack_pct=1.0)])
+    eng.recompute(model, da)
+    worst = 0.0
+    for f in (0.1, 0.25, 0.5, 0.75, 0.9):
+        lat, lon = eng.point_at_kp(model, model.points[0].dist_cum_km + f * model.points[1].dist_cum_km, da)
+        on = REF.fwd(a, REF.inv(a, b)[0], f * REF.inv(a, b)[1])
+        worst = max(worst, REF.inv((lon, lat), on)[1])
+    straight = REF.inv(((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0), REF.fwd(a, REF.inv(a, b)[0], REF.inv(a, b)[1] / 2))[1]
+    compare = abs(_geodesic_m(a[1], a[0], b[1], b[0]) - REF.inv(a, b)[1])
+    ok = worst < 0.01 and straight > 1.0 and compare < 0.001
+    return _report("Workbench: position at a KP on the geodesic; RPL compare distance on WGS84", ok,
+                   f"worst {worst * 1000:.2f} mm (straight in degrees {straight:.1f} m); compare {compare * 1000:.3f} mm")
+
+
+def test_layer_route_in_seqno_order() -> bool:
+    """A lines layer whose features are stored out of order is still a route in SeqNo order."""
+    from qgis.core import QgsFeature, QgsField, QgsVectorLayer
+
+    from ..qgis_compat import FIELD_TYPE_INT
+
+    layer = QgsVectorLayer("LineString?crs=EPSG:4326", "legs", "memory")
+    layer.dataProvider().addAttributes([QgsField("SeqNo", FIELD_TYPE_INT)])
+    layer.updateFields()
+    legs = [(3, [(2.0, 50.0), (3.0, 50.0)]), (1, [(0.0, 50.0), (1.0, 50.0)]), (2, [(1.0, 50.0), (2.0, 50.0)])]
+    feats = []
+    for seq, coords in legs:
+        feat = QgsFeature(layer.fields())
+        feat.setGeometry(QgsGeometry.fromPolylineXY([QgsPointXY(*c) for c in coords]))
+        feat.setAttribute("SeqNo", seq)
+        feats.append(feat)
+    layer.dataProvider().addFeatures(feats)
+    route = RouteFrame.from_source(layer, make_distance_area(WGS, CTX))
+    first = route.point_at_kp(0.0)
+    kp_two = route.kp_at_point(QgsPointXY(2.0, 50.0)).kp_km
+    expected = (REF.inv((0.0, 50.0), (1.0, 50.0))[1] + REF.inv((1.0, 50.0), (2.0, 50.0))[1]) / 1000.0
+    ok = abs(first.x()) < 1e-9 and abs(kp_two - expected) < 1e-6
+    return _report("Route from a layer follows SeqNo, not storage order", ok,
+                   f"KP 0 at lon {first.x():.3f}; KP at lon 2 = {kp_two:.6f} (expected {expected:.6f})")
+
+
+class _FailingDistance:
+    """A geodesic distance area that cannot measure one segment (as an invalid transform would)."""
+
+    def __init__(self, bad_lon):
+        self._da = make_distance_area(WGS, CTX)
+        self._bad = bad_lon
+
+    def __getattr__(self, name):
+        return getattr(self._da, name)
+
+    def measureLine(self, a, b):  # noqa: N802 - the QgsDistanceArea name
+        if abs(a.x() - self._bad) < 1e-9:
+            raise RuntimeError("cannot measure")
+        return self._da.measureLine(a, b)
+
+
+def test_unmeasurable_segment_is_never_0_m() -> bool:
+    """A segment that cannot be measured stops the Depth Profile and Explorer chainage, and is
+    flagged by RouteFrame, instead of counting as 0 m (or a planar length)."""
+    from ..explorer.processing_ops import cumulative_m
+
+    points = [QgsPointXY(0.1 * i, 50.0) for i in range(6)]
+    bad = _FailingDistance(points[2].x())
+    station, status = dpc.route_from_points(points[:2], WGS, make_distance_area(WGS, CTX))
+    stopped_profile = False
+    try:
+        dpc.RouteStationing([points], 30000.0, WGS, bad)
+    except ValueError as exc:
+        stopped_profile = "segment 3" in str(exc)
+    stopped_listing = False
+    try:
+        cumulative_m([(p.x(), p.y(), i) for i, p in enumerate(points)], bad)
+    except ValueError as exc:
+        stopped_listing = "record 2" in str(exc)
+    frame = RouteFrame([QgsGeometry.fromPolylineXY(points)], [0.0], bad)
+    frame_kp = frame.kp_at_point(points[1]).kp_km
+    notes = frame.kp_basis_notes()
+    flagged = any(level == "warn" and "could not be measured" in text for level, text in notes)
+    ok = station is not None and status is None and stopped_profile and stopped_listing and flagged \
+        and abs(frame_kp - REF.inv((0.0, 50.0), (0.1, 50.0))[1] / 1000.0) < 1e-6
+    return _report("Unmeasurable segment: profile and listing stop, RouteFrame flags it", ok,
+                   f"profile stopped {stopped_profile}, listing stopped {stopped_listing}, flagged {flagged}")
+
+
 def run_all() -> List[bool]:
     results = [
         test_geodesic_kp_long_route(),
@@ -205,6 +325,10 @@ def run_all() -> List[bool]:
         test_grid_kp_outside_its_zone_is_flagged(),
         test_antimeridian_refused(),
         test_workbench_edit_keeps_earlier_kps(),
+        test_stated_kp_check_at_import(),
+        test_workbench_position_on_geodesic(),
+        test_layer_route_in_seqno_order(),
+        test_unmeasurable_segment_is_never_0_m(),
     ]
     print(f"\n{sum(results)}/{len(results)} KP method checks passed.")
     return results

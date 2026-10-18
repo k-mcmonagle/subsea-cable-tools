@@ -5,7 +5,8 @@
 Creates a point layer of crossings between an RPL line layer and one-or-more "Assets" line layers.
 
 Output includes:
-- KP (km) along the RPL (supports multi-feature RPL layers)
+- KP (km) along the RPL (supports multi-feature RPL layers): start KP + chainage,
+  with crossings found on the route's KP path (docs/KP_METHOD.md)
 - Lat/Lon (EPSG:4326) of each crossing point
 - Relative crossing angle (degrees, 0-180)
 - References to input layer names
@@ -25,7 +26,6 @@ from ..kp_range_utils import make_kp_distance_area
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
-    QgsDistanceArea,
     QgsFeature,
     QgsFeatureRequest,
     QgsFeatureSink,
@@ -44,15 +44,19 @@ from qgis.core import (
     QgsWkbTypes,
 )
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_LONG_LONG, FIELD_TYPE_STRING, GEOMETRY_POINT, PROCESSING_NUMBER_DOUBLE
-from ..kp_geo_utils import get_features_skip_invalid
+from ..kp_geo_utils import RouteFrame, get_features_skip_invalid, ordered_route_features
 from ..plugin_log import log_exception, log_warning
+from .kp_common import START_KP_HELP, add_start_kp_parameter, build_route, read_start_kp, report_kp_basis
+from .rpl_comparison_utils import feature_frames, kp_path_geometry
 
 
 @dataclass(frozen=True)
 class _RplGeomInfo:
+    """One RPL feature: its id, its RouteFrame (KPs on the whole route) and
+    its KP path geometry (what crossings are found on)."""
     fid: int
+    frame: RouteFrame
     geom: QgsGeometry
-    cumulative_base_m: float
 
 
 def _as_parts(line_geometry: QgsGeometry):
@@ -69,47 +73,6 @@ def _as_parts(line_geometry: QgsGeometry):
         return [line_geometry.asPolyline()]
     except Exception:
         return []
-
-
-def _kp_m_on_geom(
-    point_on_or_near_geom: QgsPointXY,
-    geom: QgsGeometry,
-    cumulative_base_m: float,
-    distance: QgsDistanceArea,
-    tolerance_m: float = 0.5,
-) -> float:
-    """KP in metres (incl. ``cumulative_base_m``) of the point on ``geom``
-    nearest ``point_on_or_near_geom``.
-
-    Uses the *nearest* segment (not the first within a tolerance, which
-    returned the earliest KP on looping or overlapping routes) and the
-    same partial-length rule as ``kp_geo_utils.RouteFrame``: planar
-    fraction along the segment x its geodesic length. ``tolerance_m`` is
-    kept for API compatibility.
-    """
-    target = QgsPointXY(point_on_or_near_geom)
-    qx, qy = float(target.x()), float(target.y())
-    cumulative = float(cumulative_base_m)
-    best = None  # (geodesic distance, kp_m)
-    for part in _as_parts(geom):
-        for i in range(len(part) - 1):
-            v1 = QgsPointXY(part[i])
-            v2 = QgsPointXY(part[i + 1])
-            seg_len = float(distance.measureLine(v1, v2))
-            if seg_len <= 0.0:
-                continue
-            dx, dy = v2.x() - v1.x(), v2.y() - v1.y()
-            planar_sq = dx * dx + dy * dy
-            t = 0.0 if planar_sq <= 0 else max(0.0, min(1.0, ((qx - v1.x()) * dx + (qy - v1.y()) * dy) / planar_sq))
-            foot = QgsPointXY(v1.x() + t * dx, v1.y() + t * dy)
-            try:
-                dist = float(distance.measureLine(target, foot))
-            except Exception:
-                continue
-            if best is None or dist < best[0]:
-                best = (dist, cumulative + t * seg_len)
-            cumulative += seg_len
-    return best[1] if best is not None else float(cumulative_base_m)
 
 
 def _distance_point_to_segment_sq(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
@@ -503,6 +466,8 @@ class IdentifyRPLCrossingPointsAlgorithm(SubseaCableAlgorithm):
             )
         )
 
+        add_start_kp_parameter(self)
+
     def processAlgorithm(self, parameters, context, feedback):
         rpl_source = self.parameterAsSource(parameters, self.INPUT_RPL, context)
         if rpl_source is None:
@@ -523,19 +488,22 @@ class IdentifyRPLCrossingPointsAlgorithm(SubseaCableAlgorithm):
             rpl_crs, context.transformContext(), project=context.project()
         )
 
-        # Pre-load RPL geometries in feature order and compute cumulative bases
+        # RPL features in route order (SeqNo when every feature has one, else
+        # layer order) as one route with the start KP. Each feature is
+        # searched on its own KP path (the geodesic, or the grid line, between
+        # vertices) and its crossings get that feature's KPs on the route.
+        rpl_features = ordered_route_features(get_features_skip_invalid(rpl_source))
+        if not rpl_features:
+            return {self.OUTPUT: None}
+        start_kp = read_start_kp(self, parameters, context)
+        route = build_route([QgsGeometry(f.geometry()) for f in rpl_features], distance_calculator, start_kp)
+        report_kp_basis(feedback, route, start_kp)
         rpl_infos: List[_RplGeomInfo] = []
-        cumulative_base_m = 0.0
-        for f in get_features_skip_invalid(rpl_source):
-            if feedback.isCanceled():
-                break
-            if not f.hasGeometry():
+        for feat, frame in zip(rpl_features, feature_frames(route, distance_calculator)):
+            path = kp_path_geometry(frame)
+            if path.isEmpty():
                 continue
-            g = QgsGeometry(f.geometry())
-            if g.isEmpty():
-                continue
-            rpl_infos.append(_RplGeomInfo(fid=f.id(), geom=g, cumulative_base_m=cumulative_base_m))
-            cumulative_base_m += float(distance_calculator.measureLength(g))
+            rpl_infos.append(_RplGeomInfo(fid=feat.id(), frame=frame, geom=path))
 
         if not rpl_infos:
             return {self.OUTPUT: None}
@@ -681,8 +649,9 @@ class IdentifyRPLCrossingPointsAlgorithm(SubseaCableAlgorithm):
                             continue
                         seen.add(key)
 
-                        kp_m = _kp_m_on_geom(pt_xy, rpl_geom, info.cumulative_base_m, distance_calculator)
-                        kp_km = kp_m / 1000.0
+                        # The crossing lies on this feature's KP path: its
+                        # KP there (start KP + chainage).
+                        kp_km = info.frame.kp_at_point(QgsPointXY(pt_xy)).kp_km
 
                         # lat/lon via transform (store as lon/lat)
                         try:
@@ -818,11 +787,11 @@ class IdentifyRPLCrossingPointsAlgorithm(SubseaCableAlgorithm):
 Creates a point layer at every intersection between an input RPL line layer and one-or-more asset line layers.
 
 **Inputs**
-- RPL Line Layer: The reference route (supports multi-feature RPL layers).
+- RPL Line Layer: The reference route (supports multi-feature RPL layers, in SeqNo order when every feature has one, else layer order).
 - Assets Line Layer(s): One or more line layers to test for crossings.
 
 **Output fields**
-- kp: KP along the RPL (km)
+- kp: KP along the RPL (km): start KP + chainage. Crossings are found on the route's KP path: between vertices along the geodesic (or the straight grid line for grid KP), not along the line as drawn in latitude/longitude.
 - lat/lon: crossing point coordinates in EPSG:4326
 - cross_ang: relative crossing angle between the two line segments (degrees, 0-180)
 - rpl_layer / asset_layer: input layer names
@@ -837,7 +806,7 @@ Buffering is done in a local meters-based CRS (AEQD) per-crossing for accurate d
 
 The output layer is automatically named with a '_CX_Listing' suffix based on the input RPL layer name.
 """
-        )
+        ) + "\n\n" + self.tr(START_KP_HELP)
 
     def tr(self, string):
         return QCoreApplication.translate('Processing', string)

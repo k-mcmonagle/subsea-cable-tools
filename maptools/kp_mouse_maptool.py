@@ -17,7 +17,7 @@ from qgis.PyQt.QtGui import QIcon, QColor, QCursor
 from qgis.PyQt.QtWidgets import (QMessageBox, QToolTip,
                                  QApplication, QDialog, QVBoxLayout,
                                  QComboBox, QLabel, QDialogButtonBox,
-                                 QToolButton, QMenu, QCheckBox, QLineEdit, QHBoxLayout, QPushButton,
+                                 QToolButton, QMenu, QCheckBox, QLineEdit, QHBoxLayout, QPushButton, QDoubleSpinBox,
                                  QTableWidget, QTableWidgetItem)
 from qgis.core import (QgsGeometry, QgsProject, QgsDistanceArea,
                        QgsPointXY, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
@@ -114,6 +114,7 @@ class KPMouseMapTool(QgsMapTool):
         copyIncludeLatLon=False,
         copyLatLonFormat="DD",
         copyLatLonStyle="LABELLED",
+        start_kp_km=None,
     ):
         super().__init__(canvas)
         self.canvas = canvas
@@ -122,6 +123,8 @@ class KPMouseMapTool(QgsMapTool):
         self.measurementUnit = measurementUnit
         self.showReverseKP = showReverseKP
         self.useCartesian = useCartesian
+        # KP at the reference line's first vertex: given, else the Workbench RPL's (0 otherwise).
+        self.startKp = None if start_kp_km is None else float(start_kp_km)
         self.showDepth = showDepth
         # Depth sources: [(layer, field)] — several rasters/contour sets can
         # cover different parts of a route. The sampler is built lazily.
@@ -229,7 +232,8 @@ class KPMouseMapTool(QgsMapTool):
                 map_crs, QgsProject.instance().transformContext(), mode=mode)
             return
         try:
-            route, distance, geoms = build_reference_route(self.layer, map_crs, self.useCartesian)
+            route, distance, geoms = build_reference_route(self.layer, map_crs, self.useCartesian,
+                                                           start_kp_km=self.startKp)
         except (QgsCsException, ValueError):
             log_exception("KP Mouse Tool: reference line could not be transformed/measured "
                           "in the map CRS")
@@ -352,6 +356,9 @@ class KPMouseMapTool(QgsMapTool):
         
         # Create a message and display it in the status bar and as a tooltip.
         message = f"KP: {chainage_km:.3f}"
+        start_kp = self._route.start_kp_km if self._route is not None else 0.0
+        if start_kp:
+            message += f" (start KP {start_kp:.3f})"
 
         if self.showReverseKP:
             reverse_chainage_km = self._end_kp() - chainage_km
@@ -1080,13 +1087,15 @@ class KPMouseMapTool(QgsMapTool):
         try:
             o_ll = self._to_wgs84(origin)
             t_ll = self._to_wgs84(target)
-            lat1 = math.radians(o_ll.y())
-            lat2 = math.radians(t_ll.y())
-            dlon = math.radians(t_ll.x() - o_ll.x())
-            x = math.sin(dlon) * math.cos(lat2)
-            y = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
-            bearing = math.degrees(math.atan2(x, y))
-            bearing = (bearing + 360.0) % 360.0
+            # True bearing: the geodesic azimuth on WGS84 (as Place Single KP
+            # Point reports); a spherical formula is up to ~0.2 deg out.
+            if getattr(self, "_wgs84_bearing_da", None) is None:
+                self._wgs84_bearing_da = make_distance_area(QgsCoordinateReferenceSystem("EPSG:4326"),
+                                                            QgsProject.instance().transformContext())
+            if o_ll == t_ll:
+                bearing = 0.0
+            else:
+                bearing = (math.degrees(self._wgs84_bearing_da.bearing(o_ll, t_ll)) + 360.0) % 360.0
             distance_m = self.distanceArea.measureLine(origin, target)
             return distance_m, bearing
         except QgsCsException:
@@ -1371,6 +1380,7 @@ class KPConfigDialog(QDialog):
         copy_include_latlon=False,
         copy_latlon_format="DD",
         copy_latlon_style="LABELLED",
+        start_kp=None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Configure KP Mouse Tool")
@@ -1387,6 +1397,24 @@ class KPConfigDialog(QDialog):
         self.metrics_text = QLabel("")
         layout.addWidget(self.metrics_label)
         layout.addWidget(self.metrics_text)
+
+        # Start KP: the KP at the reference line's first vertex.
+        start_row = QHBoxLayout()
+        start_row.addWidget(QLabel("Start KP (km):"))
+        self.start_kp_spin = QDoubleSpinBox()
+        self.start_kp_spin.setRange(-100000.0, 100000.0)
+        self.start_kp_spin.setDecimals(3)
+        self.start_kp_spin.setToolTip(
+            "The KP at the reference line's first vertex: 0 for most routes. For a Cable Route "
+            "Workbench RPL it is filled from the RPL (its first position's stated KP); check it "
+            "and change it if the route's KPs start elsewhere.")
+        start_row.addWidget(self.start_kp_spin)
+        start_row.addStretch(1)
+        layout.addLayout(start_row)
+        self.start_kp_note = QLabel("")
+        self.start_kp_note.setWordWrap(True)
+        layout.addWidget(self.start_kp_note)
+        self._given_start_kp = start_kp
 
         # Unit selection
         self.unit_label = QLabel("Select Measurement Unit:")
@@ -1518,9 +1546,11 @@ class KPConfigDialog(QDialog):
                 self.unit_combo.setCurrentIndex(idx)
 
         self.layer_combo.currentIndexChanged.connect(self.update_metrics)
+        self.layer_combo.currentIndexChanged.connect(self._update_start_kp)
         self.depth_checkbox.toggled.connect(self.update_depth_ui)
         self.copy_latlon_checkbox.toggled.connect(self.update_copy_ui)
         self.update_metrics()
+        self._update_start_kp(initial=True)
         self.update_depth_ui()
         self.update_copy_ui()
 
@@ -1676,6 +1706,24 @@ class KPConfigDialog(QDialog):
         self.copy_latlon_style_label.setEnabled(enabled)
         self.copy_latlon_style_combo.setEnabled(enabled)
 
+    def _update_start_kp(self, *_args, initial=False):
+        """Fill the start KP for the chosen layer: the value given (initially), else the
+        Workbench RPL's start KP, else 0; say where it came from."""
+        layer_id = self.layer_combo.currentData()
+        layer = QgsProject.instance().mapLayer(layer_id) if layer_id else None
+        detected = kp_datum.lines_layer_start_kp(layer) if layer is not None else 0.0
+        if initial and self._given_start_kp is not None:
+            value = float(self._given_start_kp)
+        else:
+            value = detected
+        self.start_kp_spin.setValue(value)
+        if detected:
+            self.start_kp_note.setText(
+                f"This layer is a Workbench RPL starting at KP {detected:.3f} (its first position's stated KP). "
+                "KPs read start KP + chainage.")
+        else:
+            self.start_kp_note.setText("KPs read start KP + chainage along the line (0 unless set).")
+
     def get_settings(self):
         layer_id = self.layer_combo.currentData()
         layer = QgsProject.instance().mapLayer(layer_id) if layer_id else None
@@ -1689,6 +1737,7 @@ class KPConfigDialog(QDialog):
         copy_include_latlon = self.copy_latlon_checkbox.isChecked()
         copy_latlon_format = self.copy_latlon_format_combo.currentData() or "DD"
         copy_latlon_style = self.copy_latlon_style_combo.currentData() or "LABELLED"
+        self.start_kp = float(self.start_kp_spin.value())
         return (
             layer,
             unit,
@@ -1982,6 +2031,7 @@ class KPMouseTool:
                 self.copyIncludeLatLon,
                 self.copyLatLonFormat,
                 self.copyLatLonStyle,
+                start_kp_km=self._start_kp_for(layer),
             )
             self.iface.mapCanvas().setMapTool(self.mapTool)
         else:
@@ -2019,6 +2069,7 @@ class KPMouseTool:
             self.copyIncludeLatLon,
             self.copyLatLonFormat,
             self.copyLatLonStyle,
+            start_kp=self._start_kp_for(self._get_reference_layer()),
         )
         if qt_exec(dialog):
             (
@@ -2050,6 +2101,7 @@ class KPMouseTool:
                 self.copyIncludeLatLon = bool(copy_include_latlon)
                 self.copyLatLonFormat = str(copy_latlon_format or "DD").upper()
                 self.copyLatLonStyle = str(copy_latlon_style or "LABELLED").upper()
+                self.startKp, self.startKpLayerId = float(dialog.start_kp), self._safe_layer_id(layer)
                 self.save_settings()
                 self.iface.messageBar().pushMessage(
                     "Success", f"KP Mouse Tool configured with layer '{layer.name()}'", level=MESSAGE_SUCCESS
@@ -2093,6 +2145,12 @@ class KPMouseTool:
             return
         self.actionGoToKP.setEnabled(self._reference_layer_ready())
 
+    def _start_kp_for(self, layer) -> Optional[float]:
+        """The start KP set for ``layer`` (None: detect it, as for a new layer)."""
+        if layer is None or self._safe_layer_id(layer) != getattr(self, "startKpLayerId", None):
+            return None
+        return getattr(self, "startKp", None)
+
     def _reference_route(self) -> Optional[RouteFrame]:
         """The reference line's KP route in the map CRS — built exactly as
         the map tool builds it, so Go to KP and the tooltip agree. ``None``
@@ -2102,7 +2160,8 @@ class KPMouseTool:
             return None
         try:
             route, _distance, _geoms = build_reference_route(
-                layer, self.iface.mapCanvas().mapSettings().destinationCrs(), self.useCartesian)
+                layer, self.iface.mapCanvas().mapSettings().destinationCrs(), self.useCartesian,
+                start_kp_km=self._start_kp_for(layer))
         except (QgsCsException, ValueError):
             log_exception("KP Mouse Tool: reference line could not be transformed to the map CRS")
             return None
@@ -2186,6 +2245,9 @@ class KPMouseTool:
         settings.setValue("copyIncludeLatLon", self.copyIncludeLatLon)
         settings.setValue("copyLatLonFormat", self.copyLatLonFormat)
         settings.setValue("copyLatLonStyle", self.copyLatLonStyle)
+        if getattr(self, "startKpLayerId", None):
+            settings.setValue("startKpKm", float(self.startKp))
+            settings.setValue("startKpLayerId", self.startKpLayerId)
         # showDepthProfile is written by the map tool's toggle (menu / D key),
         # not here, so a stale copy can never clobber the user's choice.
         import json
@@ -2213,6 +2275,11 @@ class KPMouseTool:
         self.copyLatLonFormat = str(settings.value("copyLatLonFormat", "DD") or "DD").upper()
         self.copyLatLonStyle = str(settings.value("copyLatLonStyle", "LABELLED") or "LABELLED").upper()
         self.showDepthProfile = settings.value("showDepthProfile", False, type=bool)
+        self.startKpLayerId = settings.value("startKpLayerId", None)
+        try:
+            self.startKp = float(settings.value("startKpKm", 0.0))
+        except (TypeError, ValueError):
+            self.startKp, self.startKpLayerId = 0.0, None
         self.depthSourceRefs = []
         raw_sources = settings.value("depthLayersJson", "")
         if raw_sources:

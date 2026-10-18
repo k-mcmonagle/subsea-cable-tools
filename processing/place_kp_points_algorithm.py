@@ -1,3 +1,5 @@
+import math
+
 from qgis.core import (
     QgsProcessingParameterFeatureSource,
     QgsProcessingParameterRasterLayer,
@@ -24,6 +26,7 @@ from ..kp_range_utils import (
     read_distance_mode,
 )
 from ..kp_geo_utils import get_features_skip_invalid, ordered_route_geometry
+from .kp_common import START_KP_HELP, add_start_kp_parameter, build_route, read_start_kp, report_kp_basis
 
 class PlaceKpPointsAlgorithm(SubseaCableAlgorithm):
     """
@@ -97,6 +100,7 @@ class PlaceKpPointsAlgorithm(SubseaCableAlgorithm):
         )
 
         add_distance_mode_parameter(self)
+        add_start_kp_parameter(self)
 
     def processAlgorithm(self, parameters, context, feedback):
         line_layer = self.parameterAsSource(parameters, self.INPUT_LINE, context)
@@ -187,93 +191,60 @@ class PlaceKpPointsAlgorithm(SubseaCableAlgorithm):
         except ValueError as exc:
             raise QgsProcessingException(str(exc))
 
-        total_length = distance_calculator.measureLength(merged_geometry)
-        total_length_km = round(total_length / 1000, 3)
+        start_kp = read_start_kp(self, parameters, context)
+        route = build_route([merged_geometry], distance_calculator, start_kp)
+        report_kp_basis(feedback, route, start_kp)
+        total_length = route.total_length_m
         if total_length == 0:
             feedback.pushInfo(self.tr("Line has no length."))
             return {self.OUTPUT: None}
+        end_kp = route.end_kp_km
 
-        line_parts = merged_geometry.asMultiPolyline() if merged_geometry.isMultipart() else [merged_geometry.asPolyline()]
-        
-        # Place point at the start of the line (KP 0)
-        start_point = line_parts[0][0]
-        feat = QgsFeature(fields)
-        feat.setGeometry(QgsGeometry.fromPointXY(start_point))
-        label = 'KP 0'
-        attributes = [source_line_name, label, 0.0, total_length_km, 0.0]
-        if raster_sampler:
-            sample_point = start_point
+        nulls = [0]
+
+        def depth_at(point):
+            if not raster_sampler:
+                return []
+            sample_point = point
             if line_to_raster_xform is not None:
                 try:
-                    sample_point = line_to_raster_xform.transform(start_point)
+                    sample_point = line_to_raster_xform.transform(point)
                 except Exception:
-                    sample_point = None
-            if sample_point is None:
-                attributes.append(None)
-                null_depth_count += 1
-            else:
-                depth_value, res = raster_sampler.sample(sample_point, 1)
-                if res:
-                    attributes.append(float(depth_value))
-                else:
-                    attributes.append(None)
-                    null_depth_count += 1
-        feat.setAttributes(attributes)
-        sink.addFeature(feat, QgsFeatureSink.FastInsert)
-        points_placed = 1
+                    nulls[0] += 1
+                    return [None]
+            depth_value, res = raster_sampler.sample(sample_point, 1)
+            if not res:
+                nulls[0] += 1
+            return [float(depth_value)] if res else [None]
 
+        def place(kp_val, label, interval_km):
+            point = route.point_at_kp(kp_val, clamp=True)
+            if point is None:
+                return 0
+            feat = QgsFeature(fields)
+            feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(point)))
+            attributes = [source_line_name, label, kp_val, round(end_kp - kp_val, 3), interval_km] + depth_at(point)
+            feat.setAttributes(attributes)
+            sink.addFeature(feat, QgsFeatureSink.FastInsert)
+            return 1
+
+        def kp_label(kp_val):
+            return f"KP {kp_val:.0f}" if float(kp_val).is_integer() else f"KP {round(kp_val, 6):g}"
+
+        # A point at the route start (the start KP), then at round KPs: multiples
+        # of each interval counted from KP 0, along the route's KP path.
+        points_placed = place(start_kp, kp_label(start_kp), 0.0)
         for interval_km in intervals_to_process:
-            interval_m = interval_km * 1000
-            cumulative_length = 0.0
-            next_kp_dist = interval_m
-
-            for part in line_parts:
-                for i in range(len(part) - 1):
-                    if feedback.isCanceled():
-                        return {self.OUTPUT: None}
-
-                    p1, p2 = part[i], part[i+1]
-                    segment_length = distance_calculator.measureLine(p1, p2)
-                    
-                    while next_kp_dist < cumulative_length + segment_length:
-                        dist_into_segment = next_kp_dist - cumulative_length
-                        ratio = dist_into_segment / segment_length if segment_length > 0 else 0
-                        
-                        x = p1.x() + ratio * (p2.x() - p1.x())
-                        y = p1.y() + ratio * (p2.y() - p1.y())
-                        point_geom = QgsGeometry.fromPointXY(QgsPointXY(x, y))
-                        
-                        feat = QgsFeature(fields)
-                        feat.setGeometry(point_geom)
-                        kp_val = next_kp_dist / 1000
-                        label = f'KP {kp_val:.0f}' if kp_val.is_integer() else f'KP {kp_val}'
-                        reverse_kp = round((total_length - next_kp_dist) / 1000, 3)
-                        attributes = [source_line_name, label, kp_val, reverse_kp, interval_km]
-                        if raster_sampler:
-                            point_xy = QgsPointXY(x, y)
-                            if line_to_raster_xform is not None:
-                                try:
-                                    point_xy = line_to_raster_xform.transform(point_xy)
-                                except Exception:
-                                    point_xy = None
-                            if point_xy is None:
-                                attributes.append(None)
-                                null_depth_count += 1
-                            else:
-                                depth_value, res = raster_sampler.sample(point_xy, 1)
-                                if res:
-                                    attributes.append(float(depth_value))
-                                else:
-                                    attributes.append(None)
-                                    null_depth_count += 1
-                        feat.setAttributes(attributes)
-                        sink.addFeature(feat, QgsFeatureSink.FastInsert)
-                        points_placed += 1
-
-                        next_kp_dist += interval_m
-                    
-                    cumulative_length += segment_length
-
+            k = math.floor(start_kp / interval_km + 1e-9) + 1
+            while True:
+                if feedback.isCanceled():
+                    return {self.OUTPUT: None}
+                kp_val = round(k * interval_km, 9)
+                if kp_val >= end_kp - 1e-9:
+                    break
+                points_placed += place(kp_val, kp_label(kp_val), interval_km)
+                k += 1
+        null_depth_count = nulls[0]
         if raster_sampler and null_depth_count > 0:
             feedback.pushWarning(self.tr(f"{null_depth_count} point(s) were outside the raster's extent and have been assigned null depth values."))
 
@@ -292,8 +263,8 @@ This tool places points at regular intervals along a line layer. If an optional 
     *   Check the boxes for standard intervals (1 km, 50 km, 100 km).
     *   You can select multiple standard intervals.
     *   Optionally, provide a **Custom Interval** in kilometers.
-4.  **Run:** Execute the tool. A new point layer will be created with points at each specified interval. The points will have attributes for KP, reverse KP, the interval distance, and depth (if a raster was provided).
-""")
+4.  **Run:** Execute the tool. A new point layer will be created with a point at the start KP and at each multiple of each interval (round KPs). The points will have attributes for KP, reverse KP (end KP - KP), the interval distance, and depth (if a raster was provided).
+""") + "\n\n" + self.tr(START_KP_HELP)
 
     def name(self):
         return 'placekppointsalongroute'

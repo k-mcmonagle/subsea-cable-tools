@@ -117,13 +117,14 @@ class RouteStationing:
         from .kp_geo_utils import path_points
 
         starts, ends, lens, p1s, p2s = [], [], [], [], []
-        planar = 0
         cum = 0.0
+        number = 0
         given = iter(self._given_lengths) if self._given_lengths is not None else None
         for part in self.line_parts:
             if not part or len(part) < 2:
                 continue
             for p1, p2 in zip(part[:-1], part[1:]):
+                number += 1
                 if given is None:
                     # Along the KP path (geodesic, or the grid line): sub-segments whose lengths
                     # add up to the vertex-to-vertex length, as in kp_geo_utils.RouteFrame.
@@ -140,13 +141,13 @@ class RouteStationing:
                 try:
                     seg_len = (float(next(given)) if given is not None
                                else float(self.distance_area.measureLine(p1, p2)))
-                except Exception:
-                    # Planar length in CRS units: wrong on a geographic
-                    # route, so never silent.
-                    if not planar:
-                        log_exception("Depth profile: KP segment length failed; using planar length")
-                    planar += 1
-                    seg_len = math.hypot(p2.x() - p1.x(), p2.y() - p1.y())
+                except Exception as exc:
+                    # No substitute length: one segment on another basis would shift every KP after it.
+                    raise ValueError(f"KP could not be measured along route segment {number} "
+                                     f"({p1.x():.6f}, {p1.y():.6f} to {p2.x():.6f}, {p2.y():.6f}): {exc}") from exc
+                if not math.isfinite(seg_len):
+                    raise ValueError(f"KP could not be measured along route segment {number} "
+                                     f"({p1.x():.6f}, {p1.y():.6f} to {p2.x():.6f}, {p2.y():.6f}): not a number")
                 if seg_len <= 0:
                     continue
                 starts.append(cum)
@@ -155,8 +156,6 @@ class RouteStationing:
                 p2s.append(QgsPointXY(p2.x(), p2.y()))
                 cum += seg_len
                 ends.append(cum)
-        if planar > 1:
-            log_warning(f"Depth profile: planar length used for {planar} route segment(s)")
         if not ends:
             return
         self._seg_starts, self._seg_ends, self._seg_lens = starts, ends, lens
@@ -345,10 +344,13 @@ def route_from_points(points, crs, distance_area):
     """Drawn line (route CRS points) -> ``(RouteStationing, status)``."""
     if len(points) < 2:
         return None, "Drawn line must have at least 2 points"
-    line_length = sum(distance_area.measureLine(a, b) for a, b in zip(points[:-1], points[1:]))
-    if line_length <= 0:
-        return None, "Drawn line length is zero"
-    return RouteStationing([list(points)], line_length, crs, distance_area), None
+    try:
+        line_length = sum(distance_area.measureLine(a, b) for a, b in zip(points[:-1], points[1:]))
+        if line_length <= 0:
+            return None, "Drawn line length is zero"
+        return RouteStationing([list(points)], line_length, crs, distance_area), None
+    except ValueError as exc:   # across +/-180 deg, or a segment KP cannot measure
+        return None, str(exc)
 
 
 def route_from_features(features, crs, distance_area):
@@ -371,7 +373,10 @@ def route_from_features(features, crs, distance_area):
     line_parts = [part for part in parts if len(part) >= 2]
     if not line_parts:
         return None, "Route geometry has no line segments"
-    route = RouteStationing(line_parts, distance_area.measureLength(merged), crs, distance_area)
+    try:
+        route = RouteStationing(line_parts, distance_area.measureLength(merged), crs, distance_area)
+    except ValueError as exc:   # across +/-180 deg, or a segment KP cannot measure
+        return None, str(exc)
     return route, ("Route length is zero" if route.line_length <= 0 else None)
 
 

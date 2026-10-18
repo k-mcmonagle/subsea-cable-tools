@@ -24,6 +24,8 @@ from .algorithm_base import SubseaCableAlgorithm
 from .depth_sampling import contour_feature_depth
 from ..kp_range_utils import make_distance_area
 from ..kp_geo_utils import RouteFrame, iter_line_parts, ordered_route_geometry
+from .kp_common import START_KP_HELP, add_start_kp_parameter, build_route, read_start_kp, report_kp_basis
+from .rpl_comparison_utils import kp_path_geometry
 from qgis.core import (
     QgsProcessing,
     QgsProcessingParameterVectorLayer,
@@ -163,7 +165,9 @@ class _SeabedSampler:
 
     Chainage comes from the plugin's KP machinery (``RouteFrame``): one
     geodesic walk per line, then a bisect per station (the old per-station
-    re-walk made long routes O(stations x vertices)).
+    re-walk made long routes O(stations x vertices)). Stations and contour
+    crossings lie on the route's KP path (the geodesic, or the grid line,
+    between vertices).
     """
 
     def __init__(self, distance_area: QgsDistanceArea, depth_source, feedback):
@@ -195,7 +199,7 @@ class _SeabedSampler:
 
     def _raster_samples(self, part_geom, points, interval_m):
         route = RouteFrame.from_source(part_geom, self._distance)
-        total_length = self._distance.measureLength(part_geom)
+        total_length = route.total_length_m
         samples = []
         station = 0
         while station * interval_m <= total_length:
@@ -221,7 +225,11 @@ class _SeabedSampler:
         route = RouteFrame.from_source(part_geom, self._distance)
         start, end = points[0], points[-1]
         ordered = [(start, self._source.depth(start), 0.0)]
-        for point, depth in self._source.crossings(part_geom):
+        # Contours cross the route where its KP path runs, not the line as drawn.
+        path_geom = kp_path_geometry(route)
+        if path_geom.isEmpty():
+            path_geom = part_geom
+        for point, depth in self._source.crossings(path_geom):
             ordered.append((point, depth, route.kp_at_point(point).kp_km * 1000.0))
         ordered.append((end, self._source.depth(end), route.total_length_m))
         ordered.sort(key=lambda sample: sample[2])
@@ -354,6 +362,8 @@ class SeabedLengthAlgorithm(SubseaCableAlgorithm):
             )
         )
 
+        add_start_kp_parameter(self)
+
     def processAlgorithm(self, parameters, context, feedback):
         line_layer = self.parameterAsVectorLayer(parameters, self.INPUT_LINE, context)
         if not line_layer:
@@ -419,6 +429,8 @@ class SeabedLengthAlgorithm(SubseaCableAlgorithm):
                     f"{depth_source.skipped_depth} contour feature(s) have no numeric value in "
                     f"'{depth_field}' and were ignored.")
         sampler = _SeabedSampler(distance_area, depth_source, feedback)
+        start_kp = read_start_kp(self, parameters, context)
+        basis_reported = False
 
         # Group features by route_id
         routes = {}
@@ -442,6 +454,13 @@ class SeabedLengthAlgorithm(SubseaCableAlgorithm):
             if not merged_geom or merged_geom.isEmpty():
                 continue
 
+            # The route's KP frame (start KP + chainage, KP path between
+            # vertices); a route across +/-180 deg stops the run here.
+            route = build_route([merged_geom], distance_area, start_kp)
+            if not basis_reported:
+                report_kp_basis(feedback, route, start_kp)
+                basis_reported = True
+
             # Calculate plan length
             plan_length = distance_area.measureLength(merged_geom)
 
@@ -461,16 +480,21 @@ class SeabedLengthAlgorithm(SubseaCableAlgorithm):
 
             if output_intervals:
                 # Output at regular KP intervals, each sampled along the
-                # route itself (not a chord between its end points).
-                route = RouteFrame.from_source(merged_geom, distance_area)
-                kp_interval_m = kp_interval_km * 1000
-                current_kp = 0.0
-                while current_kp < plan_length:
+                # route itself (not a chord between its end points): from the
+                # start KP to the next round KP (a multiple of the interval),
+                # then interval by interval to the end KP.
+                current_kp = route.start_kp_km
+                last_kp = route.end_kp_km
+                step = math.floor(current_kp / kp_interval_km + 1e-9) + 1
+                while current_kp < last_kp - 1e-9:
                     if feedback.isCanceled():
                         break
-                    end_kp = min(current_kp + kp_interval_m, plan_length)
+                    end_kp = min(step * kp_interval_km, last_kp)
+                    step += 1
+                    if end_kp <= current_kp + 1e-9:
+                        continue
 
-                    segment_geom = route.extract_segment(current_kp / 1000.0, end_kp / 1000.0)
+                    segment_geom = route.extract_segment(current_kp, end_kp)
                     if segment_geom and not segment_geom.isEmpty():
                         segment_plan_length = distance_area.measureLength(segment_geom)
                         segment_seabed_length, _ = sampler.seabed_length(segment_geom, sampling_interval)
@@ -478,8 +502,8 @@ class SeabedLengthAlgorithm(SubseaCableAlgorithm):
 
                         out_feature = QgsFeature(fields)
                         out_feature.setAttribute('route_id', route_id)
-                        out_feature.setAttribute('kp_start', current_kp / 1000)
-                        out_feature.setAttribute('kp_end', end_kp / 1000)
+                        out_feature.setAttribute('kp_start', current_kp)
+                        out_feature.setAttribute('kp_end', end_kp)
                         out_feature.setAttribute('segment_length_m', segment_plan_length)
                         out_feature.setAttribute('seabed_segment_length_m', segment_seabed_length)
                         out_feature.setAttribute('elongation_ratio', segment_elongation)
@@ -526,7 +550,9 @@ This tool calculates the seabed (3D) length of RPL routes by sampling bathymetry
 
 **Outputs:**
 - A point layer with seabed length results, including plan length, seabed length, elongation ratio, and coverage statistics. If enabled, outputs at regular KP intervals or sensitivity analysis results.
-""")
+
+Depths are sampled on the route's KP path: between route vertices along the geodesic, not along the line as drawn in latitude/longitude. KP intervals run from the start KP to the next round KP (a multiple of the interval), then interval by interval to the end of the route; with several routes (route_id) the start KP applies to each.
+""") + "\n\n" + self.tr(START_KP_HELP)
 
     def name(self):
         return 'seabedlength'

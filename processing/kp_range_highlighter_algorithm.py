@@ -20,12 +20,12 @@ from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_NUMBER_DOUBLE
 
 from ..kp_range_utils import (
-    extract_line_segment,
     make_distance_area,
     add_distance_mode_parameter,
     read_distance_mode,
 )
 from ..kp_geo_utils import get_features_skip_invalid, ordered_route_geometry
+from .kp_common import START_KP_HELP, add_start_kp_parameter, build_route, read_start_kp, report_kp_basis
 
 class KPRangeHighlighterAlgorithm(SubseaCableAlgorithm):
     """
@@ -38,6 +38,8 @@ class KPRangeHighlighterAlgorithm(SubseaCableAlgorithm):
     START_KP = 'START_KP'
     END_KP = 'END_KP'
     CUSTOM_LABEL = 'CUSTOM_LABEL'
+    # The route's start KP (START_KP is this tool's range start).
+    ROUTE_START_KP = 'ROUTE_START_KP'
 
     def initAlgorithm(self, config=None):
         # Input RPL line layer
@@ -52,7 +54,7 @@ class KPRangeHighlighterAlgorithm(SubseaCableAlgorithm):
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.START_KP,
-                self.tr('Start KP'),
+                self.tr('Range start KP'),
                 type=PROCESSING_NUMBER_DOUBLE,
                 defaultValue=0.0
             )
@@ -61,7 +63,7 @@ class KPRangeHighlighterAlgorithm(SubseaCableAlgorithm):
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.END_KP,
-                self.tr('End KP'),
+                self.tr('Range end KP'),
                 type=PROCESSING_NUMBER_DOUBLE,
                 defaultValue=1.0
             )
@@ -83,6 +85,7 @@ class KPRangeHighlighterAlgorithm(SubseaCableAlgorithm):
         )
 
         add_distance_mode_parameter(self)
+        add_start_kp_parameter(self, self.ROUTE_START_KP)
 
     def processAlgorithm(self, parameters, context, feedback):
         source = self.parameterAsSource(parameters, self.INPUT, context)
@@ -120,8 +123,20 @@ class KPRangeHighlighterAlgorithm(SubseaCableAlgorithm):
         except ValueError as exc:
             raise QgsProcessingException(str(exc))
 
-        # extract_line_segment takes KPs in km (it converts to metres itself).
-        seg_geom = extract_line_segment(combined_geom, start_kp, end_kp, distance_calculator)
+        # The slice of the route's KP path between the two KPs (start KP +
+        # chainage), clipped to the route.
+        route_start_kp = read_start_kp(self, parameters, context, self.ROUTE_START_KP)
+        route = build_route([combined_geom], distance_calculator, route_start_kp)
+        report_kp_basis(feedback, route, route_start_kp)
+        if min(start_kp, end_kp) < route.start_kp_km - 1e-9:
+            # As before for a KP below 0: a range before the route start is
+            # not highlighted (a range past the end is clipped to it).
+            feedback.pushWarning(
+                f"KP range {start_kp}-{end_kp} starts before the start of the route "
+                f"(KP {route.start_kp_km:.3f}); nothing highlighted.")
+            seg_geom = None
+        else:
+            seg_geom = route.extract_segment(start_kp, end_kp)
         if seg_geom and not seg_geom.isEmpty():
             new_feature = QgsFeature(fields)
             new_feature.setGeometry(seg_geom)
@@ -145,11 +160,14 @@ This tool highlights a specific section of a line layer based on start and end K
 
 1.  **Select Line Layer:** Choose the line layer you want to process from the 'Input RPL Line Layer' dropdown. The tool will automatically handle lines made of multiple segments.
 2.  **Enter KP Range:**
-    *   **Start KP:** Type the starting KP for the section you want to highlight.
-    *   **End KP:** Type the ending KP for the section.
+    *   **Range start KP:** Type the starting KP for the section you want to highlight.
+    *   **Range end KP:** Type the ending KP for the section.
 3.  **Add Label (Optional):** You can add a custom text label to the output feature. This is useful for identification.
 4.  **Run:** Execute the tool. The output will be a new line layer containing only the highlighted segment.
-""")
+
+The section follows the route's KP path: between route vertices along the geodesic (or the straight grid line for \
+grid KP), not along the line as drawn in latitude/longitude.
+""") + "\n\n" + self.tr(START_KP_HELP)
 
     def name(self):
         return 'kp_range_highlighter'

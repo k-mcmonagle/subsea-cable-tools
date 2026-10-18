@@ -1,4 +1,4 @@
-from qgis.PyQt.QtWidgets import QDockWidget, QVBoxLayout, QWidget, QComboBox, QLabel, QListWidget, QPushButton, QListWidgetItem, QTabWidget, QHBoxLayout, QCheckBox, QGroupBox, QRadioButton, QButtonGroup
+from qgis.PyQt.QtWidgets import QDockWidget, QVBoxLayout, QWidget, QComboBox, QLabel, QListWidget, QPushButton, QListWidgetItem, QTabWidget, QHBoxLayout, QCheckBox, QGroupBox, QRadioButton, QButtonGroup, QDoubleSpinBox
 from qgis.PyQt.QtCore import Qt
 from qgis.core import QgsProject, QgsVectorLayer, QgsGeometry, QgsPointXY, QgsCoordinateTransform, QgsCsException
 from .qgis_compat import SELECTION_MODE_EXTENDED, GEOMETRY_LINE, GEOMETRY_NULL
@@ -86,6 +86,21 @@ class KpPlotterDockWidget(QDockWidget):
             "the marker is placed at route length − KP. Leave unticked for normal KPs.")
         self.reverse_kp_checkbox.setChecked(False)
         self.right_col_layout.addWidget(self.reverse_kp_checkbox)
+        start_row = QHBoxLayout()
+        start_row.addWidget(QLabel("Start KP (km)"))
+        self.start_kp_spin = QDoubleSpinBox()
+        self.start_kp_spin.setRange(-100000.0, 100000.0)
+        self.start_kp_spin.setDecimals(3)
+        self.start_kp_spin.setToolTip(
+            "The KP at the reference line's first vertex: 0 for most routes. Filled from a Cable Route "
+            "Workbench RPL (its first position's stated KP); check it. A table KP is start KP + chainage.")
+        start_row.addWidget(self.start_kp_spin)
+        self.right_col_layout.addLayout(start_row)
+        self.start_kp_note = QLabel("")
+        self.start_kp_note.setWordWrap(True)
+        self.start_kp_note.setVisible(False)
+        self.right_col_layout.addWidget(self.start_kp_note)
+        self.line_layer_combo.currentIndexChanged.connect(self._prefill_start_kp)
         self.tooltip_checkbox = QCheckBox("Show Value Tooltips")
         self.tooltip_checkbox.setChecked(True)
         self.right_col_layout.addWidget(self.tooltip_checkbox)
@@ -448,13 +463,21 @@ class KpPlotterDockWidget(QDockWidget):
             self.canvas.draw()
             return
 
-        # Cache merged geometry and its total length
+        # Cache merged geometry; positions come from the shared route model
+        # (the KP path between vertices, the start KP), as in every KP tool.
+        from .kp_geo_utils import RouteFrame
+        try:
+            self.route = RouteFrame.from_source([merged_geometry], self.distance_area,
+                                                start_kp_km=float(self.start_kp_spin.value()))
+        except ValueError as exc:     # e.g. a route across +/-180
+            ax.set_title(str(exc))
+            self.canvas.draw()
+            return
         self.merged_geometry = merged_geometry
-        self.line_length = self.distance_area.measureLength(merged_geometry)
+        self.line_length = self.route.total_length_m
 
         # For interpolation, get all parts as polylines
         self.line_parts = merged_geometry.asMultiPolyline() if merged_geometry.isMultipart() else [merged_geometry.asPolyline()]
-        self._build_stationing()
 
         table_layer = QgsProject.instance().mapLayer(table_layer_id)
         if not table_layer or not isinstance(table_layer, QgsVectorLayer):
@@ -673,8 +696,7 @@ class KpPlotterDockWidget(QDockWidget):
         # Interpolate point on line
         if not hasattr(self, 'merged_geometry') or not hasattr(self, 'line_parts') or not self.line_parts:
             return
-        distance_m = nearest_kp * 1000
-        point_geom = self.interpolate_point_along_line(distance_m)
+        point_geom = self.interpolate_point_along_line(nearest_kp * 1000)
         if point_geom is None or point_geom.isEmpty():
             return
         point = self._to_canvas(point_geom.asPoint())
@@ -743,19 +765,22 @@ class KpPlotterDockWidget(QDockWidget):
                 best = (key, index)
         return best[1]
 
-    def _build_stationing(self):
-        """Cumulative measured segment ends along ``line_parts`` (built once
-        per plot), so a KP -> point lookup is a bisect, not a walk."""
-        self._seg_starts, self._seg_ends, self._segs = [], [], []
-        cumulative = 0.0
-        for part in self.line_parts:
-            for i in range(len(part) - 1):
-                p1, p2 = part[i], part[i + 1]
-                segment_length = self.distance_area.measureLine(p1, p2)
-                self._seg_starts.append(cumulative)
-                cumulative += segment_length
-                self._seg_ends.append(cumulative)
-                self._segs.append((p1, p2, segment_length))
+    def _prefill_start_kp(self, *_args):
+        """Fill the start KP from the reference line: a Workbench RPL's start KP, else 0."""
+        from . import kp_datum
+        layer = QgsProject.instance().mapLayer(self.line_layer_combo.currentData() or "")
+        detected = kp_datum.lines_layer_start_kp(layer) if isinstance(layer, QgsVectorLayer) else 0.0
+        self.start_kp_spin.setValue(detected)
+        self.start_kp_note.setText(
+            f"Start KP {detected:.3f} km: the Workbench RPL's first position." if detected else "")
+        self.start_kp_note.setVisible(bool(detected))
+
+    def _route_kp(self, table_kp):
+        """The route KP of a table KP (a reverse KP counts back from the end KP)."""
+        route = getattr(self, "route", None)
+        if route is None:
+            return None
+        return route.end_kp_km - table_kp if self.reverse_kp_checkbox.isChecked() else table_kp
 
     def _to_canvas(self, point):
         """Line-CRS point in the map CRS, or ``None`` if it can't be transformed."""
@@ -776,36 +801,13 @@ class KpPlotterDockWidget(QDockWidget):
             self.canvas.draw_idle()
 
     def interpolate_point_along_line(self, distance_m):
-        """Interpolate a point along the merged reference line at the given measured distance in meters (matches Place KP Points logic). Supports reverse KP."""
-        if not hasattr(self, 'merged_geometry') or not hasattr(self, 'line_parts') or not self.line_parts:
+        """The point on the reference line at a table KP of ``distance_m`` / 1000 km (start KP +
+        chainage; a reverse KP counts back from the end), along the route's KP path."""
+        if getattr(self, "route", None) is None:
             return None
-
-        # If reverse KP is checked, measure from the other end
-        if self.reverse_kp_checkbox.isChecked():
-            distance_m = self.line_length - distance_m
-
-        # Handle boundary cases
-        if distance_m <= 0:
-            first_point = self.line_parts[0][0]
-            return QgsGeometry.fromPointXY(first_point)
-
-        if distance_m >= self.line_length:
-            last_part = self.line_parts[-1]
-            last_point = last_part[-1]
-            return QgsGeometry.fromPointXY(last_point)
-
-        # First segment whose end reaches distance_m (the walk this replaces).
-        if getattr(self, '_seg_ends', None) is None:
-            self._build_stationing()
-        index = bisect.bisect_left(self._seg_ends, distance_m)
-        if index >= len(self._segs):
-            return None  # rounding past the last segment end
-        p1, p2, segment_length = self._segs[index]
-        dist_into_segment = distance_m - self._seg_starts[index]
-        ratio = dist_into_segment / segment_length if segment_length > 0 else 0
-        x = p1.x() + ratio * (p2.x() - p1.x())
-        y = p1.y() + ratio * (p2.y() - p1.y())
-        return QgsGeometry.fromPointXY(QgsPointXY(x, y))
+        route_kp = self._route_kp(distance_m / 1000.0)
+        point = self.route.point_at_kp(route_kp, clamp=True)
+        return QgsGeometry.fromPointXY(QgsPointXY(point)) if point is not None else None
 
     def update_map_marker(self, kp):
         """Update the marker on the map canvas using merged geometry."""
@@ -815,8 +817,10 @@ class KpPlotterDockWidget(QDockWidget):
         # Convert KP (kilometers) to meters for distance calculation
         distance_m = kp * 1000
 
-        # Do not proceed if the distance is outside the line's bounds
-        if not (0 <= distance_m <= self.line_length):
+        # Do not proceed if the KP is outside the route (start KP .. end KP)
+        route_kp = self._route_kp(kp)
+        route = getattr(self, "route", None)
+        if route is None or route_kp is None or not (route.start_kp_km - 1e-9 <= route_kp <= route.end_kp_km + 1e-9):
             if self.marker and self.marker.isVisible():
                 self.marker.hide()
             return
@@ -871,6 +875,7 @@ class KpPlotterDockWidget(QDockWidget):
         self.features_geoms = []
         self.segment_lengths = []
         self.line_length = 0
+        self.route = None
 
         if getattr(self, 'canvas', None):
             try:

@@ -149,19 +149,16 @@ def get_features_skip_invalid(source, request=None):
 
 
 def _normalise_geoms(geoms) -> List[QgsGeometry]:
-    """Accept a single geometry, an iterable, or a feature source."""
+    """Accept a single geometry, an iterable, or a feature source (whose
+    features are taken in route order, :func:`ordered_route_features`)."""
 
     if geoms is None:
         return []
     if isinstance(geoms, QgsGeometry):
         return [geoms]
     if isinstance(geoms, QgsFeatureSource):
-        out: List[QgsGeometry] = []
-        for feat in get_features_skip_invalid(geoms):
-            g = feat.geometry()
-            if g is not None and not g.isEmpty():
-                out.append(QgsGeometry(g))
-        return out
+        return [QgsGeometry(feat.geometry())
+                for feat in ordered_route_features(get_features_skip_invalid(geoms))]
     out2: List[QgsGeometry] = []
     for g in geoms:
         if g is not None and not g.isEmpty():
@@ -1265,7 +1262,11 @@ class RouteFrame:
         """``[(level, text)]``: the KP basis, and for grid KP its validity (:func:`kp_basis_notes`)."""
         self._ensure_chainage()
         parts = [list(part) for geom in self._geoms for part in iter_line_parts(geom) if len(part) >= 2]
-        return kp_basis_notes(self._distance, parts, self._chain_total_m)
+        notes = kp_basis_notes(self._distance, parts, self._chain_total_m)
+        if self._chain_broken:
+            notes.insert(0, ("warn", f"KP could not be measured past KP {self._start_kp_km + self._chain_total_m / 1000.0:.3f}: a route segment "
+                                     "there has no measurable length, so the route ends there for KP."))
+        return notes
 
     def build_indexes(self) -> "RouteFrame":
         """Build the chainage and segment indexes now instead of on the

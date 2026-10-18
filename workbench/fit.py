@@ -7,9 +7,11 @@ to route KP through the RPL's per-segment slack, and interpolates the
 position (and optionally depth) at that KP.
 
 Depends only on rpl_engine (pure) plus an optional position resolver and
-depth sampler injected by the caller, so it runs headless. UI callers pass a
-RouteFrame-backed ``point_at_kp_fn`` for geodesic interpolation and a
-DepthService-backed ``depth_fn``; tests use the engine's own interpolation.
+depth sampler injected by the caller, so it runs headless. KPs are the RPL's
+stated KPs; positions come from ``point_at_kp_fn`` when given, else from
+``rpl_engine.point_at_kp`` (the fraction of the leg from the stated KPs, along
+the geodesic between the RPL positions). Callers may pass a DepthService-backed
+``depth_fn``.
 """
 
 from __future__ import annotations

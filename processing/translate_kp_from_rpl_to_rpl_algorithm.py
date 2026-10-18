@@ -34,6 +34,7 @@ from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, GEOMETRY_POINT
 
 from .rpl_comparison_utils import RPLComparator
+from .kp_common import START_KP_HELP, add_start_kp_parameter, read_start_kp, report_kp_basis
 from ..kp_geo_utils import get_features_skip_invalid
 
 
@@ -86,6 +87,8 @@ class TranslateKPFromRPLToRPLAlgorithm(SubseaCableAlgorithm):
             )
         )
 
+        add_start_kp_parameter(self)
+
     def processAlgorithm(self, parameters, context, feedback):
         """Execute the algorithm."""
         
@@ -133,13 +136,16 @@ class TranslateKPFromRPLToRPLAlgorithm(SubseaCableAlgorithm):
             raise QgsProcessingException(self.invalidSinkError(parameters, self.OUTPUT_POINTS))
 
         # Initialize RPL comparator (we only need source_line geometries for design KP/DCC)
+        start_kp = read_start_kp(self, parameters, context)
         try:
             # Pass the same source_line for both parameters; comparator will have source geoms loaded
-            comparator = RPLComparator(source_line, source_line, target_points.sourceCrs(), context)
+            comparator = RPLComparator(source_line, source_line, target_points.sourceCrs(), context,
+                                       source_start_kp_km=start_kp)
         except Exception as e:
             raise QgsProcessingException(
                 self.tr(f'Failed to initialize RPL Comparator: {str(e)}')
             )
+        report_kp_basis(feedback, comparator.source_frame, start_kp)
 
         if comparator.total_source_length_m <= 0:
             raise QgsProcessingException(
@@ -230,11 +236,13 @@ class TranslateKPFromRPLToRPLAlgorithm(SubseaCableAlgorithm):
 
 <p><b>Outputs:</b> A copy of the target points with three new fields:</p>
 <ul>
-  <li><code>design_route_kp</code>: KP (km) on the source line, nearest to this point</li>
+  <li><code>design_route_kp</code>: KP (km) on the source line, nearest to this point: start KP + chainage to
+      the nearest point on the route's KP path (between vertices along the geodesic, or the straight grid
+      line for grid KP)</li>
   <li><code>design_route_dcc</code>: Distance Cross Course (m) — perpendicular distance to the source line</li>
   <li><code>design_route_ref</code>: Name of the source line layer (for reference)</li>
 </ul>
-""")
+""") + "<p>" + self.tr(START_KP_HELP) + "</p>"
 
     def tr(self, string):
         return QCoreApplication.translate('Processing', string)

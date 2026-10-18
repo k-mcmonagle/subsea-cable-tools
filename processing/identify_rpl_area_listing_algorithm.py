@@ -5,7 +5,8 @@
 Creates a line layer of route sections where an input RPL line intersects one-or-more polygon layers.
 
 Output includes:
-- Start/end KP (km) along the RPL (supports multi-feature RPL layers)
+- Start/end KP (km) along the RPL (supports multi-feature RPL layers): start KP +
+  chainage, with sections cut from the route's KP path (docs/KP_METHOD.md)
 - Start/end lat/lon (EPSG:4326) for each extracted segment endpoint
 - References to the input layer names and feature ids
 - Attributes of the polygon feature (as separate columns, unioned across selected polygon layers)
@@ -25,7 +26,6 @@ from ..kp_range_utils import make_kp_distance_area
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
-    QgsDistanceArea,
     QgsFeature,
     QgsFeatureRequest,
     QgsFeatureSink,
@@ -43,14 +43,18 @@ from qgis.core import (
     QgsWkbTypes,
 )
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_LONG_LONG, FIELD_TYPE_STRING, GEOMETRY_LINE
-from ..kp_geo_utils import get_features_skip_invalid
+from ..kp_geo_utils import RouteFrame, get_features_skip_invalid, ordered_route_features
+from .kp_common import START_KP_HELP, add_start_kp_parameter, build_route, read_start_kp, report_kp_basis
+from .rpl_comparison_utils import feature_frames, kp_path_geometry
 
 
 @dataclass(frozen=True)
 class _RplGeomInfo:
+    """One RPL feature: its id, its RouteFrame (KPs on the whole route) and
+    its KP path geometry (what the areas are intersected with)."""
     fid: int
+    frame: RouteFrame
     geom: QgsGeometry
-    cumulative_base_m: float
 
 
 def _as_parts(line_geometry: QgsGeometry):
@@ -67,47 +71,6 @@ def _as_parts(line_geometry: QgsGeometry):
         return [line_geometry.asPolyline()]
     except Exception:
         return []
-
-
-def _kp_m_on_geom(
-    point_on_or_near_geom: QgsPointXY,
-    geom: QgsGeometry,
-    cumulative_base_m: float,
-    distance: QgsDistanceArea,
-    tolerance_m: float = 0.5,
-) -> float:
-    """KP in metres (incl. ``cumulative_base_m``) of the point on ``geom``
-    nearest ``point_on_or_near_geom``.
-
-    Uses the *nearest* segment (not the first within a tolerance, which
-    returned the earliest KP on looping or overlapping routes) and the
-    same partial-length rule as ``kp_geo_utils.RouteFrame``: planar
-    fraction along the segment x its geodesic length. ``tolerance_m`` is
-    kept for API compatibility.
-    """
-    target = QgsPointXY(point_on_or_near_geom)
-    qx, qy = float(target.x()), float(target.y())
-    cumulative = float(cumulative_base_m)
-    best = None  # (geodesic distance, kp_m)
-    for part in _as_parts(geom):
-        for i in range(len(part) - 1):
-            v1 = QgsPointXY(part[i])
-            v2 = QgsPointXY(part[i + 1])
-            seg_len = float(distance.measureLine(v1, v2))
-            if seg_len <= 0.0:
-                continue
-            dx, dy = v2.x() - v1.x(), v2.y() - v1.y()
-            planar_sq = dx * dx + dy * dy
-            t = 0.0 if planar_sq <= 0 else max(0.0, min(1.0, ((qx - v1.x()) * dx + (qy - v1.y()) * dy) / planar_sq))
-            foot = QgsPointXY(v1.x() + t * dx, v1.y() + t * dy)
-            try:
-                dist = float(distance.measureLine(target, foot))
-            except Exception:
-                continue
-            if best is None or dist < best[0]:
-                best = (dist, cumulative + t * seg_len)
-            cumulative += seg_len
-    return best[1] if best is not None else float(cumulative_base_m)
 
 
 def _extract_lines(geom: QgsGeometry) -> List[QgsGeometry]:
@@ -284,6 +247,8 @@ class IdentifyRPLAreaListingAlgorithm(SubseaCableAlgorithm):
             )
         )
 
+        add_start_kp_parameter(self)
+
     def processAlgorithm(self, parameters, context, feedback):
         rpl_source = self.parameterAsSource(parameters, self.INPUT_RPL, context)
         if rpl_source is None:
@@ -303,18 +268,22 @@ class IdentifyRPLAreaListingAlgorithm(SubseaCableAlgorithm):
             rpl_crs, context.transformContext(), project=context.project()
         )
 
+        # RPL features in route order (SeqNo when every feature has one, else
+        # layer order) as one route with the start KP. Each feature's KP path
+        # (the geodesic, or the grid line, between vertices) is intersected
+        # with the areas and its sections get that feature's KPs on the route.
+        rpl_features = ordered_route_features(get_features_skip_invalid(rpl_source))
+        if not rpl_features:
+            return {self.OUTPUT: None}
+        start_kp = read_start_kp(self, parameters, context)
+        route = build_route([QgsGeometry(f.geometry()) for f in rpl_features], distance_calculator, start_kp)
+        report_kp_basis(feedback, route, start_kp)
         rpl_infos: List[_RplGeomInfo] = []
-        cumulative_base_m = 0.0
-        for f in get_features_skip_invalid(rpl_source):
-            if feedback.isCanceled():
-                break
-            if not f.hasGeometry():
+        for feat, frame in zip(rpl_features, feature_frames(route, distance_calculator)):
+            path = kp_path_geometry(frame)
+            if path.isEmpty():
                 continue
-            g = QgsGeometry(f.geometry())
-            if g.isEmpty():
-                continue
-            rpl_infos.append(_RplGeomInfo(fid=f.id(), geom=g, cumulative_base_m=cumulative_base_m))
-            cumulative_base_m += float(distance_calculator.measureLength(g))
+            rpl_infos.append(_RplGeomInfo(fid=feat.id(), frame=frame, geom=path))
 
         if not rpl_infos:
             return {self.OUTPUT: None}
@@ -443,16 +412,18 @@ class IdentifyRPLAreaListingAlgorithm(SubseaCableAlgorithm):
                             continue
 
                         a_xy, b_xy = endpoints
-                        kp_a_m = _kp_m_on_geom(a_xy, rpl_geom, info.cumulative_base_m, distance_calculator)
-                        kp_b_m = _kp_m_on_geom(b_xy, rpl_geom, info.cumulative_base_m, distance_calculator)
+                        # The section's ends lie on this feature's KP path:
+                        # their KPs there (start KP + chainage).
+                        kp_a_km = info.frame.kp_at_point(QgsPointXY(a_xy)).kp_km
+                        kp_b_km = info.frame.kp_at_point(QgsPointXY(b_xy)).kp_km
 
                         # Normalize so start = smaller KP
-                        if kp_a_m <= kp_b_m:
+                        if kp_a_km <= kp_b_km:
                             start_xy, end_xy = a_xy, b_xy
-                            start_kp_km, end_kp_km = kp_a_m / 1000.0, kp_b_m / 1000.0
+                            start_kp_km, end_kp_km = kp_a_km, kp_b_km
                         else:
                             start_xy, end_xy = b_xy, a_xy
-                            start_kp_km, end_kp_km = kp_b_m / 1000.0, kp_a_m / 1000.0
+                            start_kp_km, end_kp_km = kp_b_km, kp_a_km
 
                         # Start/end lat/lon
                         try:
@@ -522,11 +493,11 @@ class IdentifyRPLAreaListingAlgorithm(SubseaCableAlgorithm):
 Creates a line layer which highlights the sections of an input RPL route which pass through one-or-more polygon layers.
 
 **Inputs**
-- RPL Line Layer: The reference route (supports multi-feature RPL layers).
+- RPL Line Layer: The reference route (supports multi-feature RPL layers, in SeqNo order when every feature has one, else layer order).
 - Area Polygon Layer(s): One or more polygon layers to test for intersections.
 
 **Output fields**
-- start_kp/end_kp: KP range (km) for each extracted route segment
+- start_kp/end_kp: KP range (km) for each extracted route segment: start KP + chainage. Sections are cut from the route's KP path: between vertices along the geodesic (or the straight grid line for grid KP), not along the line as drawn in latitude/longitude.
 - start_lat/start_lon and end_lat/end_lon: segment endpoint coordinates in EPSG:4326
 - rpl_layer/area_layer: input layer names
 - rpl_fid/area_fid: input feature ids
@@ -534,7 +505,7 @@ Creates a line layer which highlights the sections of an input RPL route which p
 
 The output layer is automatically named with a '_Area_Listing' suffix based on the input RPL layer name.
 """
-        )
+        ) + "\n\n" + self.tr(START_KP_HELP)
 
     def tr(self, string):
         return QCoreApplication.translate('Processing', string)

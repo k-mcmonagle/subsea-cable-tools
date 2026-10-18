@@ -47,8 +47,10 @@ from ..slope_utils import (
     supported_slopes, clean_crossings, interpolate_covered, cross_profile_metrics,
     ols_slope,
 )
-from ..kp_geo_utils import get_features_skip_invalid
+from ..kp_geo_utils import RouteFrame, get_features_skip_invalid
 from ..plugin_log import log_exception
+from .kp_common import build_route
+from .rpl_comparison_utils import kp_path_geometry
 
 
 @dataclass(frozen=True)
@@ -65,7 +67,8 @@ class KPRangeDepthSlopeSummaryAlgorithm(SubseaCableAlgorithm):
     """Summarise depth + slope statistics per KP-range feature.
 
     For each input line feature (a KP range segment), the algorithm samples depth along
-    the feature at a fixed interval and computes:
+    the feature at a fixed interval (on its KP path: between vertices along the
+    geodesic, or the grid line; ``kp_geo_utils.RouteFrame``) and computes:
       - Depth min/max/avg
       - Along-track slope (deg) min/max/avg
       - Cross-track side-slope (deg) min/max/avg (+ve = down to starboard)
@@ -370,6 +373,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(SubseaCableAlgorithm):
         features = list(get_features_skip_invalid(source))
         total = len(features)
         side_slope_failures = 0
+        basis_reported = False
         for idx, feat in enumerate(features):
             if feedback.isCanceled():
                 break
@@ -391,12 +395,26 @@ class KPRangeDepthSlopeSummaryAlgorithm(SubseaCableAlgorithm):
                 sink.addFeature(out_feat, QgsFeatureSink.FastInsert)
                 continue
 
+            # One RouteFrame per part: chainage, stations and tangents follow
+            # the part's KP path (the plugin's KP method), each part on its
+            # own (no stationing across a gap between parts).
+            frames: List[RouteFrame] = []
+            for part_points in parts:
+                if len(part_points) < 2:
+                    continue
+                frame = build_route([QgsGeometry.fromPolylineXY(list(part_points))], distance_area)
+                if frame.total_length_m > 0:
+                    frames.append(frame)
+            if frames and not basis_reported:
+                basis_reported = True
+                for level, text in frames[0].kp_basis_notes():
+                    (feedback.pushWarning if level == 'warn' else feedback.pushInfo)(text)
+
             # Precompute contour depth profile for this feature (if contour mode)
             contour_profile: Optional[List[Tuple[float, float]]] = None
             if depth_source_mode == 2:
                 contour_profile = self._build_contour_profile_for_feature(
-                    parts,
-                    distance_area,
+                    frames,
                     contour_index,
                     contour_data,
                 )
@@ -416,20 +434,17 @@ class KPRangeDepthSlopeSummaryAlgorithm(SubseaCableAlgorithm):
 
             # Use a feature-global stationing (meters) so contour profiles and slope stats are consistent
             global_offset_m = 0.0
-            for part_points in parts:
-                # Geodesic segment lengths measured once per part; every
-                # station lookup is then a bisect instead of an O(vertices)
-                # re-measure of the whole part.
-                part_cum = self._cumulative_lengths(part_points, distance_area)
-                part_len = part_cum[-1] if part_cum else 0.0
-                if part_len <= 0:
-                    continue
+            for frame in frames:
+                # The part's RouteFrame measures it once; every station is
+                # then a bisect, on the KP path.
+                part_len = frame.total_length_m
 
                 dist_local = 0.0
                 while dist_local <= part_len + 1e-6:
-                    pt = self._interpolate_from_cumulative(part_points, part_cum, dist_local)
+                    pt = frame.point_at_kp(dist_local / 1000.0, clamp=True)
                     if pt is None:
                         break
+                    pt = QgsPointXY(pt)
                     dist_global = global_offset_m + dist_local
                     station_dist_m.append(dist_global)
                     station_xy.append(pt)
@@ -450,8 +465,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(SubseaCableAlgorithm):
                     side_deg = None
                     try:
                         side_deg = self._compute_side_slope_at_station(
-                            part_points,
-                            part_cum,
+                            frame,
                             part_len,
                             dist_local,
                             tangent_delta_m,
@@ -694,8 +708,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(SubseaCableAlgorithm):
 
     def _build_contour_profile_for_feature(
         self,
-        parts: Sequence[Sequence[QgsPointXY]],
-        distance_area: QgsDistanceArea,
+        frames: Sequence[RouteFrame],
         contour_index: Optional[QgsSpatialIndex],
         contour_data: Optional[Dict[int, Tuple[QgsGeometry, float]]],
     ) -> Optional[List[Tuple[float, float]]]:
@@ -703,27 +716,30 @@ class KPRangeDepthSlopeSummaryAlgorithm(SubseaCableAlgorithm):
 
         Candidates come from the run's contour index (already in the line
         CRS), so a feature no longer scans and reprojects every contour.
+        Crossings are found on each part's KP path and their chainage is the
+        part's (RouteFrame) chainage plus the length of the parts before it.
         """
-        if contour_index is None or not contour_data:
-            return None
-        if len(parts) == 1:
-            route_geom = QgsGeometry.fromPolylineXY(list(parts[0]))
-        else:
-            route_geom = QgsGeometry.collectGeometry([QgsGeometry.fromPolylineXY(list(p)) for p in parts])
-        if route_geom is None or route_geom.isEmpty():
+        if contour_index is None or not contour_data or not frames:
             return None
 
         hits: List[Tuple[float, float]] = []
-        for cid in contour_index.intersects(route_geom.boundingBox()):
-            item = contour_data.get(cid)
-            if not item:
+        offset_m = 0.0
+        for frame in frames:
+            path_geom = kp_path_geometry(frame)
+            if path_geom.isEmpty():
+                offset_m += frame.total_length_m
                 continue
-            geom, zf = item
-            for p in self._intersection_points(route_geom.intersection(geom)):
-                d_m = self._measure_along_parts_m(parts, p, distance_area)
-                if d_m is None:
+            for cid in contour_index.intersects(path_geom.boundingBox()):
+                item = contour_data.get(cid)
+                if not item:
                     continue
-                hits.append((float(d_m), float(zf)))
+                geom, zf = item
+                for p in self._intersection_points(path_geom.intersection(geom)):
+                    hit = frame.kp_at_point(QgsPointXY(p))
+                    if hit.snapped_xy is None:
+                        continue
+                    hits.append((offset_m + float(hit.kp_km) * 1000.0, float(zf)))
+            offset_m += frame.total_length_m
 
         if not hits:
             return None
@@ -759,8 +775,7 @@ class KPRangeDepthSlopeSummaryAlgorithm(SubseaCableAlgorithm):
 
     def _compute_side_slope_at_station(
         self,
-        part_points: Sequence[QgsPointXY],
-        part_cum: Sequence[float],
+        frame: RouteFrame,
         part_len_m: float,
         dist_m: float,
         tangent_delta_m: float,
@@ -773,11 +788,11 @@ class KPRangeDepthSlopeSummaryAlgorithm(SubseaCableAlgorithm):
         contour_data: Optional[Dict[int, Tuple[QgsGeometry, float]]],
         search_m: float,
     ) -> Optional[float]:
-        # Derive local tangent using points ahead/behind
+        # Derive local tangent using points ahead/behind on the KP path
         d0 = max(0.0, dist_m - tangent_delta_m)
         d1 = min(part_len_m, dist_m + tangent_delta_m)
-        g0 = self._interpolate_from_cumulative(part_points, part_cum, d0)
-        g1 = self._interpolate_from_cumulative(part_points, part_cum, d1)
+        g0 = frame.point_at_kp(d0 / 1000.0, clamp=True)
+        g1 = frame.point_at_kp(d1 / 1000.0, clamp=True)
         if g0 is None or g1 is None:
             return None
 
@@ -918,91 +933,6 @@ class KPRangeDepthSlopeSummaryAlgorithm(SubseaCableAlgorithm):
         except Exception:
             return []
 
-    @staticmethod
-    def _cumulative_lengths(points: Sequence[QgsPointXY],
-                            distance_area: QgsDistanceArea) -> List[float]:
-        """Cumulative geodesic distance (m) at each vertex; last = part length."""
-        if not points:
-            return []
-        cum = [0.0]
-        for p0, p1 in zip(points[:-1], points[1:]):
-            try:
-                seg = float(distance_area.measureLine(p0, p1))
-            except Exception:
-                seg = math.hypot(p1.x() - p0.x(), p1.y() - p0.y())
-            cum.append(cum[-1] + max(seg, 0.0))
-        return cum
-
-    @staticmethod
-    def _interpolate_from_cumulative(
-        points: Sequence[QgsPointXY],
-        cum: Sequence[float],
-        distance_m: float,
-    ) -> Optional[QgsPointXY]:
-        if not points or not cum:
-            return None
-        if distance_m <= 0:
-            return points[0]
-        if distance_m >= cum[-1]:
-            return points[-1]
-        j = bisect.bisect_left(cum, distance_m)
-        j = max(1, min(j, len(points) - 1))
-        seg = cum[j] - cum[j - 1]
-        if seg <= 0:
-            return points[j]
-        r = (distance_m - cum[j - 1]) / seg
-        p0, p1 = points[j - 1], points[j]
-        return QgsPointXY(p0.x() + r * (p1.x() - p0.x()), p0.y() + r * (p1.y() - p0.y()))
-
-    @staticmethod
-    def _measure_along_parts_m(
-        parts: Sequence[Sequence[QgsPointXY]],
-        point_xy: QgsPointXY,
-        distance_area: QgsDistanceArea,
-    ) -> Optional[float]:
-        cumulative = 0.0
-        best_dist_sq = None
-        best_along = None
-
-        px = float(point_xy.x())
-        py = float(point_xy.y())
-
-        for part in parts:
-            if not part or len(part) < 2:
-                continue
-            for p1, p2 in zip(part[:-1], part[1:]):
-                try:
-                    seg_len = float(distance_area.measureLine(p1, p2))
-                except Exception:
-                    seg_len = math.hypot(p2.x() - p1.x(), p2.y() - p1.y())
-                if seg_len <= 0:
-                    cumulative += seg_len
-                    continue
-
-                # Planar projection to get segment fraction; length comes from distance_area
-                dx = float(p2.x() - p1.x())
-                dy = float(p2.y() - p1.y())
-                seg_sq = dx * dx + dy * dy
-                if seg_sq <= 0:
-                    cumulative += seg_len
-                    continue
-
-                t = ((px - float(p1.x())) * dx + (py - float(p1.y())) * dy) / seg_sq
-                t_clamped = max(0.0, min(1.0, t))
-                proj_x = float(p1.x()) + t_clamped * dx
-                proj_y = float(p1.y()) + t_clamped * dy
-
-                dist_sq = (px - proj_x) ** 2 + (py - proj_y) ** 2
-                along = cumulative + t_clamped * seg_len
-
-                if best_dist_sq is None or dist_sq < best_dist_sq:
-                    best_dist_sq = dist_sq
-                    best_along = along
-
-                cumulative += seg_len
-
-        return best_along
-
     # --------------------------- Stats helpers ----------------------------
 
     @staticmethod
@@ -1084,6 +1014,7 @@ Optional (when enabled), reported as positive magnitudes:
 - side_port_max_deg (steepest fall to port)
 
 Notes:
+- Stations, tangents and contour crossings follow each feature's KP path: between vertices along the geodesic (as the plugin's KP tools do), not along the line as drawn in latitude/longitude.
 - Sign convention is plugin-wide: +ve along-route slope = shoaling (up-slope), +ve side slope = deeper to starboard (vehicle leans to starboard). This matches the KP Mouse profile, the Workbench/Burial Planner rules, and the Depth Profile tool's default. The seabed datum (positive-down depths vs negative elevations) is detected automatically per feature.
 - Adaptive sampling (Raster only): step = max(interval, factor × raster pixel size at each station).
 - Contour depths are always interpolated linearly between contour crossings along the KP range.

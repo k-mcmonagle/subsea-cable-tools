@@ -5,8 +5,9 @@
 MVP (simplified): Extract KP ranges by categorising an RPL line layer by a
 chosen attribute field, similar to QGIS 'Categorized' symbology.
 
-For each input RPL feature (in route order), the algorithm produces a KP range
-covering that feature and carries the chosen field value as the class.
+For each input RPL feature (in route order: SeqNo when every feature has one,
+else layer order), the algorithm produces a KP range covering that feature and
+carries the chosen field value as the class.
 Optionally merges adjacent ranges with the same class value.
 
 Outputs:
@@ -14,7 +15,7 @@ Outputs:
 - Optional extracted segment geometries for map preview/styling
 
 Notes:
-- KPs are in km.
+- KPs are in km: start KP + chainage (docs/KP_METHOD.md).
 - Boundaries occur at input feature boundaries (this is intentional for the MVP).
 """
 
@@ -25,14 +26,11 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
-    QgsDistanceArea,
     QgsFeature,
-    QgsFeatureRequest,
     QgsFeatureSink,
     QgsFields,
     QgsField,
     QgsGeometry,
-    QgsPointXY,
     QgsProcessing,
     QgsProcessingException,
     QgsProcessingParameterBoolean,
@@ -46,13 +44,12 @@ from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_STRING, PROCESSING_FIELD_ANY, PROCESSING_NUMBER_DOUBLE
 
 from ..kp_range_utils import (
-    extract_line_segment,
     make_distance_area,
-    measure_total_length_m,
     add_distance_mode_parameter,
     read_distance_mode,
 )
-from ..kp_geo_utils import get_features_skip_invalid
+from ..kp_geo_utils import RouteFrame, get_features_skip_invalid, ordered_route_features
+from .kp_common import START_KP_HELP, add_start_kp_parameter, build_route, read_start_kp, report_kp_basis
 
 
 @dataclass
@@ -150,6 +147,7 @@ class ExtractKPRangesRuleBasedAlgorithm(SubseaCableAlgorithm):
         )
 
         add_distance_mode_parameter(self)
+        add_start_kp_parameter(self)
 
     # --------------------------- Core ---------------------------
 
@@ -180,16 +178,18 @@ class ExtractKPRangesRuleBasedAlgorithm(SubseaCableAlgorithm):
         except ValueError as exc:
             raise QgsProcessingException(str(exc))
 
-        route_parts, per_feature_parts = self._collect_route_parts(rpl_source, feedback)
-        if not route_parts:
+        # Route features in chainage order (SeqNo when every feature has
+        # one, else layer order), one RouteFrame over them with the start KP:
+        # each feature's KP range is where it starts and ends on the route.
+        route_features = [f for f in ordered_route_features(get_features_skip_invalid(rpl_source))
+                          if self._has_line_parts(f.geometry())]
+        if not route_features:
             raise QgsProcessingException(self.tr('Input RPL has no valid line geometry.'))
 
-        route_geom = self._route_geometry_from_parts(route_parts)
-        if route_geom is None or route_geom.isEmpty():
-            raise QgsProcessingException(self.tr('Failed to build a route geometry from input RPL.'))
-
-        route_total_m = measure_total_length_m(route_geom, distance_area)
-        if route_total_m <= 0:
+        start_kp = read_start_kp(self, parameters, context)
+        route = build_route([QgsGeometry(f.geometry()) for f in route_features], distance_area, start_kp)
+        report_kp_basis(feedback, route, start_kp)
+        if route.total_length_m <= 0:
             raise QgsProcessingException(self.tr('Route length is zero.'))
 
         # Output fields (canonical; keep stable for downstream tools)
@@ -225,9 +225,9 @@ class ExtractKPRangesRuleBasedAlgorithm(SubseaCableAlgorithm):
         extracted_ranges: List[_Range] = []
 
         extracted_ranges = self._extract_categorized_ranges(
-            per_feature_parts,
+            route_features,
+            route,
             category_field,
-            distance_area,
             feedback,
         )
 
@@ -252,7 +252,9 @@ class ExtractKPRangesRuleBasedAlgorithm(SubseaCableAlgorithm):
             ranges_sink.addFeature(row, QgsFeatureSink.FastInsert)
 
             if segments_sink is not None:
-                seg_geom = extract_line_segment(route_geom, r.start_kp, r.end_kp, distance_area)
+                # The slice of the route's KP path (geodesic or grid line
+                # between vertices), as the other KP tools slice it.
+                seg_geom = route.extract_segment(r.start_kp, r.end_kp)
                 if seg_geom is None or seg_geom.isEmpty():
                     continue
                 seg_feat = QgsFeature(out_fields)
@@ -269,24 +271,23 @@ class ExtractKPRangesRuleBasedAlgorithm(SubseaCableAlgorithm):
 
     def _extract_categorized_ranges(
         self,
-        per_feature_parts: Sequence[Tuple[QgsFeature, List[List[QgsPointXY]]]],
+        route_features: Sequence[QgsFeature],
+        route: RouteFrame,
         category_field: str,
-        distance_area: QgsDistanceArea,
         feedback,
     ) -> List[_Range]:
+        """One range per route feature: from the KP where it starts on
+        ``route`` (start KP + chainage) to where it ends."""
         out: List[_Range] = []
-        base_m = 0.0
-        total = len(per_feature_parts)
+        total = len(route_features)
+        offsets = route.feature_offsets_m + [route.total_length_m]
 
-        for idx, (feat, _parts) in enumerate(per_feature_parts):
+        for idx, feat in enumerate(route_features):
             if feedback.isCanceled():
                 break
 
-            geom = feat.geometry()
-            if geom is None or geom.isEmpty():
-                continue
-
-            length_m = float(measure_total_length_m(geom, distance_area) or 0.0)
+            base_m = float(offsets[idx])
+            length_m = float(offsets[idx + 1]) - base_m
             if length_m <= 0:
                 continue
 
@@ -297,8 +298,8 @@ class ExtractKPRangesRuleBasedAlgorithm(SubseaCableAlgorithm):
 
             value_text = '<NULL>' if v is None else str(v)
 
-            start_kp = base_m / 1000.0
-            end_kp = (base_m + length_m) / 1000.0
+            start_kp = route.start_kp_km + base_m / 1000.0
+            end_kp = route.start_kp_km + (base_m + length_m) / 1000.0
             out.append(
                 _Range(
                     start_kp=float(start_kp),
@@ -310,7 +311,6 @@ class ExtractKPRangesRuleBasedAlgorithm(SubseaCableAlgorithm):
                 )
             )
 
-            base_m += length_m
             if total > 0:
                 feedback.setProgress(int((idx + 1) * 100 / total))
 
@@ -319,47 +319,16 @@ class ExtractKPRangesRuleBasedAlgorithm(SubseaCableAlgorithm):
     # --------------------------- Geometry helpers ---------------------------
 
     @staticmethod
-    def _as_line_parts(geom: QgsGeometry) -> List[List[QgsPointXY]]:
+    def _has_line_parts(geom: QgsGeometry) -> bool:
+        """True when ``geom`` is a (multi)line with at least one non-empty part."""
         if geom is None or geom.isEmpty():
-            return []
+            return False
         try:
             if geom.isMultipart():
-                parts = geom.asMultiPolyline()
-                return [[QgsPointXY(p) for p in part] for part in parts if part]
-            part = geom.asPolyline()
-            return [[QgsPointXY(p) for p in part]] if part else []
+                return any(part for part in geom.asMultiPolyline())
+            return bool(geom.asPolyline())
         except Exception:
-            return []
-
-    def _collect_route_parts(
-        self,
-        source,
-        feedback,
-    ) -> Tuple[List[List[QgsPointXY]], List[Tuple[QgsFeature, List[List[QgsPointXY]]]]]:
-        feats = list(get_features_skip_invalid(source, QgsFeatureRequest()))
-
-        route_parts: List[List[QgsPointXY]] = []
-        per_feature: List[Tuple[QgsFeature, List[List[QgsPointXY]]]] = []
-
-        for feat in feats:
-            if feedback.isCanceled():
-                break
-            geom = feat.geometry()
-            parts = self._as_line_parts(geom)
-            if not parts:
-                continue
-            per_feature.append((feat, parts))
-            route_parts.extend(parts)
-
-        return route_parts, per_feature
-
-    @staticmethod
-    def _route_geometry_from_parts(parts: Sequence[List[QgsPointXY]]) -> QgsGeometry:
-        if not parts:
-            return QgsGeometry()
-        if len(parts) == 1:
-            return QgsGeometry.fromPolylineXY(list(parts[0]))
-        return QgsGeometry.fromMultiPolylineXY([list(p) for p in parts])
+            return False
 
     @staticmethod
     def _merge_adjacent(ranges: Sequence[_Range], tol_km: float) -> List[_Range]:
@@ -419,13 +388,14 @@ Outputs
 - Optional KP range segments: extracted line geometries for map preview/styling
 
 Notes
-- KPs are in km.
+- KPs are in km: start KP + chainage along the route.
 - Boundaries occur at input feature boundaries.
+- Segment geometries follow the route's KP path: between vertices along the geodesic (or the straight grid line for grid KP).
 
 Route ordering
-- Uses the input layer feature order.
+- SeqNo order when every feature has a SeqNo, else the input layer feature order (never noded or re-ordered otherwise).
 """
-        )
+        ) + "\n\n" + self.tr(START_KP_HELP)
 
     def tr(self, string):
         return QCoreApplication.translate('Processing', string)

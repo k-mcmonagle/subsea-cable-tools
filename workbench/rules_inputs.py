@@ -169,7 +169,15 @@ def route_for_rpl(store, rpl_id: str, project: Optional[QgsProject] = None
             "intersections would be silently wrong")
 
     distance = make_kp_distance_area(WGS84, project.transformContext())
-    route = RouteFrame.from_source(geoms, distance)
+    # KP from the RPL's start KP (its first position's stated KP), as in the
+    # Burial Planner and the RPL panel, so a selected KP lands on the same place.
+    from .. import kp_datum
+
+    try:
+        start_kp = kp_datum.start_kp_of(kp_datum.rpl_positions(store.open_layer(rpl.get("points_layer") or "")))
+    except Exception:  # noqa: BLE001 - no points layer: KP from 0
+        start_kp = 0.0
+    route = RouteFrame.from_source(geoms, distance, start_kp_km=start_kp)
     return route, distance
 
 
