@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import tempfile
 import time
 from typing import List
@@ -545,9 +546,346 @@ def test_raster_route_and_store() -> List[bool]:
     return out
 
 
+def _utm_raster(folder: str) -> str:
+    """A small flat GeoTIFF in UTM 31N (about 10°N 3°E), well away from the test route."""
+    from osgeo import gdal, osr
+
+    path = os.path.join(folder, "far_utm.tif")
+    ds = gdal.GetDriverByName("GTiff").Create(path, 50, 50, 1, gdal.GDT_Float32)
+    ds.SetGeoTransform((500000.0, 1.0, 0.0, 1100050.0, 0.0, -1.0))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(32631)
+    ds.SetProjection(srs.ExportToWkt())
+    ds.GetRasterBand(1).WriteArray(np.full((50, 50), 500.0, dtype=np.float32))
+    ds.FlushCache()
+    ds = None
+    return path
+
+
+def _listed(dialog) -> dict:
+    """Raster list of the setup: layer id -> name."""
+    from ..qgis_compat import ITEM_DATA_USER_ROLE
+
+    rl = dialog.setup.raster_list
+    return {rl.item(i).data(ITEM_DATA_USER_ROLE): rl.item(i).text() for i in range(rl.count())}
+
+
+def test_follows_project() -> List[bool]:
+    """The window is kept when closed: it follows the project's layers, and another project's scenarios."""
+    from qgis.PyQt.QtGui import QShowEvent
+    from qgis.PyQt.QtXml import QDomDocument
+
+    out = []
+    folder = tempfile.mkdtemp()
+    project = QgsProject.instance()
+    gpkg_a = os.path.join(folder, "a", "span_analysis", "a_span_analysis.gpkg")
+    gpkg_b = os.path.join(folder, "b", "span_analysis", "b_span_analysis.gpkg")
+    span_store.set_project_gpkg_path(gpkg_a)
+    near_path = sand_wave_raster(folder)
+    line = QgsVectorLayer("LineString?crs=EPSG:4326", "route", "memory")
+    feature = QgsFeature()
+    feature.setGeometry(QgsGeometry.fromPolylineXY([QgsPointXY(0.0, 0.0), QgsPointXY(1000.0 * DEG_PER_M, 0.0)]))
+    line.dataProvider().addFeatures([feature])
+    project.addMapLayer(line)
+    dialog = _make_dialog()
+    added = [line.id()]
+    try:
+        near = QgsRasterLayer(near_path, "MBES on the route")
+        far = QgsRasterLayer(_utm_raster(folder), "MBES far away")
+        project.addMapLayers([near, far])
+        added += [near.id(), far.id()]
+        ok = _wait(lambda: {near.id(), far.id()} <= set(_listed(dialog)), 5.0)
+        out.append(_report("rasters added to the project appear in the open window", ok, str(_listed(dialog))))
+
+        near.setName("MBES renamed")
+        dialog.showEvent(QShowEvent())
+        dialog.showEvent(QShowEvent())   # the second show: the window was closed and opened again
+        ok = _wait(lambda: _listed(dialog).get(near.id()) == "MBES renamed", 5.0)
+        out.append(_report("opening the window again reads the layers again (a renamed raster)", ok))
+
+        setup = dialog.setup
+        setup.apply_settings({"route": {"source": "line", "line_layer": line.id(), "start_kp": 0.0},
+                              "seabed": {"source": "raster", "rasters": []}})
+        setup.tick_rasters_along_route()
+        out.append(_report("Along the route ticks only the raster the route crosses (one in UTM)",
+                           setup.checked_raster_ids() == [near.id()],
+                           f"{setup.checked_raster_ids()}; {setup.seabed_section.status.text()}"))
+
+        dialog._dirty = False
+        near_id, near_source = near.id(), near.source()
+        project.removeMapLayer(near_id)
+        ok = _wait(lambda: near_id not in _listed(dialog), 5.0)
+        out.append(_report("a ticked raster removed from the project leaves the list and marks a change",
+                           ok and setup.checked_raster_ids() == [] and dialog._dirty))
+
+        again = QgsRasterLayer(near_path, "MBES added again")
+        project.addMapLayer(again)
+        added.append(again.id())
+        _wait(lambda: again.id() in _listed(dialog), 5.0)
+        setup.apply_settings({"seabed": {"source": "raster", "rasters": [near_id], "raster_sources": [near_source]}})
+        out.append(_report("a scenario's raster added again (new layer id) is found by its file",
+                           setup.checked_raster_ids() == [again.id()] and not setup._wanted))
+        setup.apply_settings({"seabed": {"source": "raster", "rasters": [again.id(), "gone"],
+                                         "raster_sources": [near_source, os.path.join(folder, "gone.tif")]}})
+        kept = setup.settings()["seabed"]["rasters"]
+        status = setup.seabed_section.status.text()
+        out.append(_report("a scenario's raster not in the project is kept in the settings and named in the status",
+                           kept == [again.id(), "gone"] and "not in the project" in status, f"{kept}; {status}"))
+
+        settings_b = _synthetic_settings()
+        store_b = span_store.SpanStore(gpkg_b)
+        store_b.ensure_created()
+        b_id = store_b.save_scenario("B case", settings_b, None, {})
+        store_b.write_meta("last_scenario", b_id)
+        store_b.close()
+        dialog._dirty = False
+        span_store.set_project_gpkg_path(gpkg_b)
+        project.cleared.emit()
+        project.readProject.emit(QDomDocument())
+        ok = _wait(lambda: dialog._scenario_id == b_id, 5.0)
+        out.append(_report("another project opened: its scenario file and last scenario load",
+                           ok and dialog._store is not None and os.path.normcase(dialog._store.gpkg_path)
+                           == os.path.normcase(gpkg_b) and dialog.scenario_combo.currentText() == "B case"
+                           and not dialog._dirty, dialog.windowTitle()))
+
+        dialog.setup.value.setValue(7.0)
+        span_store.set_project_gpkg_path(gpkg_a)
+        project.cleared.emit()
+        project.addMapLayer(QgsRasterLayer(near_path, "loaded with the project"))   # layer events in between
+        added.append(project.mapLayersByName("loaded with the project")[0].id())
+        project.readProject.emit(QDomDocument())
+        ok = _wait(lambda: not dialog._project_timer.isActive() and not dialog._layers_timer.isActive(), 5.0)
+        out.append(_report("unsaved changes when a project opens: kept, unsaved, and said so",
+                           ok and dialog._scenario_id is None and dialog._dirty
+                           and abs(dialog.setup.value.value() - 7.0) < 1e-9 and "not saved" in dialog.status.text(),
+                           dialog.status.text()[:120]))
+    finally:
+        dialog.shutdown()
+        dialog.deleteLater()
+        project.removeMapLayers([i for i in added if project.mapLayer(i) is not None])
+        project.removeEntry(span_store.PROJECT_SCOPE, span_store.PROJECT_KEY_GPKG)
+    return out
+
+
+def test_plot_and_layout_controls() -> List[bool]:
+    """Plots menu, the A button, tooltip fields, the status bar, the view kept on Run, folds and tabs."""
+    from ..cable_seabed.core import ERROR
+    from ..span_analysis.plot_panel import DATA_ROWS
+
+    out = []
+    dialog = _make_dialog()
+    try:
+        dialog.load_example(_example("Sand waves"))
+        _wait(lambda: dialog._task is None, 120.0)
+        plot, results, setup = dialog.plot, dialog.results, dialog.setup
+        first, last = float(dialog._result.stations.kp_km[0]), float(dialog._result.stations.kp_km[-1])
+
+        plot.row_checks["slack"].setChecked(False)
+        plot.row_checks["status"].setChecked(False)
+        hidden = plot.rows["slack"].isHidden() and plot.rows["status"].isHidden()
+        for key in DATA_ROWS:
+            plot.row_checks[key].setChecked(False)
+        profile_back = plot.row_checks["depth"].isChecked() and not plot.rows["depth"].isHidden()
+        plot.default_view()
+        all_back = all(action.isChecked() for action in plot.row_checks.values()) and not any(
+            row.isHidden() for row in plot.rows.values())
+        out.append(_report("Plots menu: rows hide and show, the profile stays when every plot is unticked, Default "
+                           "view brings them back", hidden and profile_back and all_back))
+
+        plot.depth_plot.setXRange(1.0, 1.1, padding=0)
+        button = plot.depth_plot.autoBtn
+        button.clicked.emit(button)
+        lo, hi = plot.visible_kp()
+        out.append(_report("the A button is on and fits the whole profile",
+                           not plot.depth_plot.buttonsHidden and lo <= first + 1e-6 and hi >= last - 1e-6,
+                           f"{lo:.3f} to {hi:.3f}"))
+
+        st = dialog._result.stations
+        i = int(np.argmin(np.abs(st.kp_km - 1.1)))
+        for key, action in plot.tip_fields.items():
+            action.setChecked(key in ("kp", "tension", "slope"))
+        text = plot.tip_html(i, plot.tip_keys())
+        out.append(_report("tooltip shows the chosen fields only", "KP" in text and "Residual T" in text
+                           and "Slope" in text and "Seabed" not in text, text[:80]))
+        pos = plot.depth_plot.vb.mapViewToScene(QPointF(1.1, float(-dialog._result.cable_m[i])))
+        plot._show_tip("depth", pos, text)
+        shown = not plot.tip.isHidden()
+        plot._end_hover()
+        out.append(_report("tooltip opens beside the cursor and closes when the cursor leaves",
+                           shown and plot.tip.isHidden()))
+
+        red = next(f for f in dialog._result.findings if f.severity == ERROR and f.check_id == "span")
+        kp = 0.5 * (red.kp_start + red.kp_end)
+        segment = plot._segment_at(kp)
+        worst = plot.findings_at(kp)
+        out.append(_report("status bar: the stretch and the findings under the cursor, worst first",
+                           segment is not None and segment[2] == 3 and worst and worst[0].severity == ERROR,
+                           f"{segment}"))
+        plot.depth_plot.setXRange(first, first + 0.05, padding=0)
+        plot.statusClicked.emit(segment[0], segment[1], kp)
+        rows = results.findings_table.selectionModel().selectedRows()
+        selected = results._finding_at(rows[0].row()) if rows else None
+        lo, hi = plot.visible_kp()
+        out.append(_report("status bar click: the worst finding there is selected and shown",
+                           results.currentIndex() == 0 and selected is worst[0]
+                           and lo <= min(red.kp_start, red.kp_end) and hi >= max(red.kp_start, red.kp_end)))
+
+        plot.depth_plot.setXRange(1.0, 1.2, padding=0)
+        setup.live.setChecked(False)
+        setup.value.setValue(3.5)
+        dialog.run()
+        _wait(lambda: dialog._task is None, 60.0)
+        lo, hi = plot.visible_kp()
+        out.append(_report("Run keeps the zoomed view when the KPs are the same", abs(lo - 1.0) < 1e-9
+                           and abs(hi - 1.2) < 1e-9, f"{lo:.3f} to {hi:.3f}"))
+
+        folded = not (setup.bodies_section.button.isChecked() or setup.sampling_section.button.isChecked()
+                      or setup.control_sections_section.button.isChecked())
+        bodies = setup.bodies_section.status.text()
+        setup.apply_tension(3.0, [(0.0, 1.0, 2.0), (1.0, 3.0, 3.0)])
+        out.append(_report("advanced settings start folded with a count; tensions by section open their fold",
+                           folded and bodies == "1 body(ies)" and setup.control_sections_section.button.isChecked()
+                           and setup.control_sections_section.status.text() == "2 section(s)", bodies))
+
+        tabs = [re.sub(r" \(\d+\)$", "", results.tabText(k)) for k in range(results.count())]   # no counts
+        results.show_sweep()
+        out.append(_report("results tabs: findings first, then the tools; the sweep sits in Find tension",
+                           tabs == ["Findings", "Spans", "Bodies", "Summary", "Find tension", "Detail (EI)"]
+                           and results.currentWidget() is results.find_page
+                           and results.sweep_section.button.isChecked(), str(tabs)))
+    finally:
+        dialog.shutdown()
+        dialog.deleteLater()
+    return out
+
+
+def test_live_update_keeps_the_seabed_still() -> List[bool]:
+    """Zoomed on a feature, a change of tension moves the cable only: the profile's axes stay put."""
+    out = []
+    dialog = _make_dialog()
+    try:
+        dialog.resize(1500, 950)
+        dialog.show()
+        dialog.load_example(_example("Verification"))
+        _wait(lambda: dialog._task is None, 120.0)
+        plot, setup = dialog.plot, dialog.setup
+
+        def painted_range():
+            plot.widgets["depth"].grab()          # pyqtgraph re-fits auto-ranged axes as it paints
+            QCoreApplication.processEvents()
+            return [list(r) for r in plot.depth_plot.vb.viewRange()]
+
+        for true_scale in (False, True):
+            plot.true_scale_check.setChecked(true_scale)
+            plot.zoom_to(0.48, 0.52)             # as a click on the depression's finding does
+            before = painted_range()
+            for value in (0.6, 3.0):
+                setup.value.setValue(value)
+                _wait(lambda: not dialog._live_timer.isActive() and dialog._task is None, 30.0)
+            after = painted_range()
+            still = all(abs(a - b) < 1e-9 for ra, rb in zip(before, after) for a, b in zip(ra, rb))
+            out.append(_report("a live tension change keeps the profile's axes still ("
+                               + ("true scale" if true_scale else "free scale") + ")", still,
+                               f"{before} -> {after}"))
+        plot.true_scale_check.setChecked(False)
+    finally:
+        dialog.hide()
+        dialog.shutdown()
+        dialog.deleteLater()
+    return out
+
+
+def coarse_settings(spacing_m: float = 25.0):
+    """Rough synthetic seabed known only every ``spacing_m``, light cable at 10 kN."""
+    settings = _synthetic_settings()
+    settings["route"]["synthetic"].update({"length_m": 3000.0, "spacing_m": spacing_m, "roughness_m": 0.5,
+                                           "roughness_length_m": 30.0, "seed": 4})
+    settings["seabed"] = {"filter_m": 0.0, "filter_auto": True, "features": []}
+    settings["cable"]["bodies"] = []
+    settings["control"]["value"] = 10.0
+    return settings
+
+
+def test_data_resolution_in_the_window() -> List[bool]:
+    """Coarse data: indicative spans and a flagged stretch, said in the setup; Suit the data restores auto."""
+    out = []
+    dialog = _make_dialog()
+    try:
+        setup = dialog.setup
+        setup.apply_settings(coarse_settings(25.0))
+        dialog.run()
+        _wait(lambda: dialog._task is None, 120.0)
+        result = dialog._result
+        checks = {f.check_id for f in result.findings} if result else set()
+        note = setup.data_note.text()
+        ok = (result is not None and result.summary.indicative_spans > 0 and "data_resolution" in checks
+              and "span_indicative" in checks and "every 25 m" in note and "(auto)" in note
+              and "indicative" in dialog.status.text())
+        out.append(_report("coarse data: spans indicative, the stretch flagged, the data and filter stated", ok,
+                           f"{note} | {dialog.status.text()[:90]}"))
+        spans_text = [dialog.results.spans_table.item(r, 12).text() for r in range(dialog.results.spans_table.rowCount())]
+        out.append(_report("spans table says which spans the data resolves",
+                           any(t.startswith("no: needs 75 m") for t in spans_text), str(spans_text[:3])))
+
+        setup.interval.setValue(5)
+        setup.filter_auto.setChecked(False)
+        setup.filter_m.setValue(4.0)
+        setup.smoothing.setText("20")
+        setup.resolve.setValue(2.0)
+        setup.suit_the_data()
+        restored = (setup.interval.value() == 0 and setup.filter_auto.isChecked() and not setup.filter_m.isEnabled()
+                    and setup.smoothing.text() == "" and setup.resolve.value() == 3.0
+                    and setup.filter_setting() is None and setup.criteria().resolve_intervals == 3.0)
+        saved = setup.settings()["seabed"]
+        setup.apply_settings({"seabed": {"filter_m": 2.0}})       # a scenario from before the auto filter
+        old_kept = not setup.filter_auto.isChecked() and setup.filter_setting() == 2.0
+        out.append(_report("Suit the data restores the auto settings; older scenarios keep their filter",
+                           restored and saved.get("filter_auto") is True and old_kept))
+    finally:
+        dialog.shutdown()
+        dialog.deleteLater()
+    return out
+
+
+def test_setup_rows_leave_no_gaps() -> List[bool]:
+    """Hidden setup rows leave no gap (Qt 5 kept their spacing), and come back in their place."""
+    from ..span_analysis import sources as src
+
+    out = []
+    dialog = _make_dialog()
+    try:
+        dialog.resize(1500, 950)
+        dialog.show()
+        setup = dialog.setup
+        setup.apply_settings(_synthetic_settings())
+        QCoreApplication.processEvents()
+        spacing = setup.route_source.parentWidget().layout().verticalSpacing()
+        gap = setup.syn_box.geometry().top() - setup.route_source.geometry().bottom()
+        synthetic_ok = gap <= max(spacing, 6) + 8
+        setup.route_source.setCurrentIndex(setup.route_source.findData(src.ROUTE_LINE))
+        QCoreApplication.processEvents()
+        line, start, window = setup.line_row.geometry(), setup.line_start_kp.geometry(), setup.window_row.geometry()
+        order_ok = (setup.line_row.isVisible() and not setup.syn_box.isVisible()
+                    and setup.route_source.geometry().bottom() < line.top() < start.top() < window.top()
+                    and start.top() - line.bottom() <= max(spacing, 6) + 8)
+        setup.route_source.setCurrentIndex(setup.route_source.findData(src.ROUTE_SYNTHETIC))
+        QCoreApplication.processEvents()
+        back_ok = setup.syn_box.isVisible() and not setup.line_row.isVisible()
+        out.append(_report("hidden setup rows leave no gap and come back in order", synthetic_ok and order_ok
+                           and back_ok, f"gap under Route {gap} px (spacing {spacing}); line row {line.top()}, start "
+                           f"KP {start.top()}, window {window.top()}"))
+    finally:
+        dialog.hide()
+        dialog.shutdown()
+        dialog.deleteLater()
+    return out
+
+
 def run_all() -> List[bool]:
     results = (test_synthetic_run_live_detail_sweep() + test_raster_route_and_store() + test_ui_tools()
                + test_tables_and_dxf_route() + test_protection_and_find_tension() + test_kp_consistency()
-               + test_rpl_cable_mapping())
+               + test_rpl_cable_mapping() + test_follows_project() + test_plot_and_layout_controls()
+               + test_live_update_keeps_the_seabed_still() + test_setup_rows_leave_no_gaps()
+               + test_data_resolution_in_the_window())
     print(f"\n{sum(results)}/{len(results)} Span & Slack Analysis QGIS checks passed.")
     return results

@@ -31,6 +31,7 @@ from qgis.PyQt.QtWidgets import (
 
 from ..cable_seabed import planning as pl
 from .plot_panel import DirectAxis
+from .setup_panel import Section
 from ..cable_seabed.core import ERROR, INFO, WARNING
 from ..qgis_compat import (
     EDIT_TRIGGER_NONE,
@@ -45,7 +46,8 @@ SEVERITY_TEXT = {ERROR: "Red", WARNING: "Amber", INFO: "Info"}
 SEVERITY_COLOUR = {ERROR: "#d32f2f", WARNING: "#ff9800", INFO: "#1f77b4"}
 FINDING_HEADERS = ["Level", "Check", "KP from", "KP to", "Length (m)", "Value", "Message"]
 SPAN_HEADERS = ["#", "KP from", "KP to", "Length (m)", "Max gap (m)", "KP max gap", "Tension (kN)", "Tension from",
-                "Min bend R (m)", "MBR (m)", "Reaction (kN)", "Max T for limits (kN)", "Bodies"]
+                "Min bend R (m)", "MBR (m)", "Reaction (kN)", "Max T for limits (kN)", "Resolved by the data",
+                "Bodies"]
 BODY_HEADERS = ["Name", "Kind", "KP", "Weight (kN)", "Clear of seabed (m)", "In a span", "Tension (kN)",
                 "Housing standoff (m)"]
 DETAIL_HEADERS = ["KP from", "KP to", "Length (m)", "Max gap (m)", "Min bend R (m)", "KP of min R", "MBR (m)",
@@ -167,15 +169,15 @@ class ResultsPanel(QTabWidget):
         super().__init__(parent)
         self._result: Optional[pl.PlanningResult] = None
         self._findings: List = []
+        # What the run found first; then the tools that ask more of it.
         self._build_findings()
         self._build_spans()
         self._build_bodies()
-        self._build_detail()
-        self._build_find()
-        self._build_sweep()
         self.summary = QTextBrowser()
         self.summary.setOpenExternalLinks(False)
         self.addTab(self.summary, "Summary")
+        self._build_find()      # with the tension sweep
+        self._build_detail()
 
     # -- findings -------------------------------------------------------------------
     def _build_findings(self) -> None:
@@ -234,6 +236,18 @@ class ResultsPanel(QTabWidget):
             finding = self._finding_at(rows[0].row())
             if finding is not None:
                 self.findingSelected.emit(finding)
+
+    def select_finding(self, finding) -> bool:
+        """Show ``finding`` in the Findings tab (without moving the view: the caller does)."""
+        for r in range(self.findings_table.rowCount()):
+            if self._finding_at(r) is finding:
+                self.setCurrentIndex(0)
+                self.findings_table.blockSignals(True)
+                self.findings_table.selectRow(r)
+                self.findings_table.blockSignals(False)
+                self.findings_table.scrollToItem(self.findings_table.item(r, 0))
+                return True
+        return False
 
     def _on_finding_activated(self, row: int, _col: int) -> None:
         finding = self._finding_at(row)
@@ -318,6 +332,7 @@ class ResultsPanel(QTabWidget):
         split = QSplitter(_HORIZONTAL)
         self.detail_graphics = pg.GraphicsLayoutWidget()
         self.detail_graphics.setBackground("w")
+        self.detail_graphics.setAntialiasing(True)
         self.d_profile = self.detail_graphics.addPlot(row=0, col=0, axisItems=_axes())
         self.d_radius = self.detail_graphics.addPlot(row=1, col=0, axisItems=_axes())
         self.d_moment = self.detail_graphics.addPlot(row=2, col=0, axisItems=_axes())
@@ -337,13 +352,13 @@ class ResultsPanel(QTabWidget):
         self.d_moment.setLabel("bottom", "KP (km)")
         self.d_radius.setXLink(self.d_profile)
         self.d_moment.setXLink(self.d_profile)
-        self.d_seabed = self.d_profile.plot([], [], pen=pg.mkPen((121, 85, 72), width=2), name="Seabed")
-        self.d_cable = self.d_profile.plot([], [], pen=pg.mkPen((123, 31, 162), width=1.5), name="Cable (EI)")
-        self.d_route = self.d_profile.plot([], [], pen=pg.mkPen((25, 70, 160), width=1, style=_DASH),
+        self.d_seabed = self.d_profile.plot([], [], antialias=True, pen=pg.mkPen((121, 85, 72), width=2), name="Seabed")
+        self.d_cable = self.d_profile.plot([], [], antialias=True, pen=pg.mkPen((123, 31, 162), width=1.5), name="Cable (EI)")
+        self.d_route = self.d_profile.plot([], [], antialias=True, pen=pg.mkPen((25, 70, 160), width=1, style=_DASH),
                                            name="Cable (route model)")
-        self.d_r = self.d_radius.plot([], [], pen=pg.mkPen((123, 31, 162), width=1.5), name="Bend radius")
-        self.d_mbr = self.d_radius.plot([], [], pen=pg.mkPen((211, 47, 47), width=1, style=_DASH), name="MBR")
-        self.d_m = self.d_moment.plot([], [], pen=pg.mkPen((0, 137, 123), width=1.5), name="Moment")
+        self.d_r = self.d_radius.plot([], [], antialias=True, pen=pg.mkPen((123, 31, 162), width=1.5), name="Bend radius")
+        self.d_mbr = self.d_radius.plot([], [], antialias=True, pen=pg.mkPen((211, 47, 47), width=1, style=_DASH), name="MBR")
+        self.d_m = self.d_moment.plot([], [], antialias=True, pen=pg.mkPen((0, 137, 123), width=1.5), name="Moment")
         split.addWidget(self.detail_graphics)
         self.detail_table = _table(DETAIL_HEADERS)
         split.addWidget(self.detail_table)
@@ -460,6 +475,7 @@ class ResultsPanel(QTabWidget):
         row.addStretch(1)
         layout.addLayout(row)
         self.find_table = _table(FIND_HEADERS)
+        self.find_table.setMinimumHeight(80)
         layout.addWidget(self.find_table, 1)
         self.find_note = QLabel("")
         self.find_note.setWordWrap(True)
@@ -468,6 +484,11 @@ class ResultsPanel(QTabWidget):
         self._found: List[pl.TensionAnswer] = []
         self._found_scope = "all"
         self._on_find_target()
+        self.sweep_section = Section("Spans against tension (sweep)", self._build_sweep(), False)
+        self.sweep_section.set_status("lay the cable at a range of bottom tensions and plot the spans", True)
+        layout.addWidget(self.sweep_section)
+        self.sweep_section.button.toggled.connect(
+            lambda on: layout.setStretchFactor(self.sweep_section, 2 if on else 0))
         self.find_page = page
         self.addTab(page, "Find tension")
 
@@ -484,6 +505,10 @@ class ResultsPanel(QTabWidget):
 
     def show_find(self) -> None:
         self.setCurrentWidget(self.find_page)
+
+    def show_sweep(self) -> None:
+        self.setCurrentWidget(self.find_page)
+        self.sweep_section.button.setChecked(True)
 
     def set_found(self, answers: Sequence[pl.TensionAnswer], scope: str = "all", target_text: str = "") -> None:
         self._found = list(answers)
@@ -527,11 +552,11 @@ class ResultsPanel(QTabWidget):
     def clear_found(self) -> None:
         self.set_found([])
 
-    # -- sweep -------------------------------------------------------------------------------
-    def _build_sweep(self) -> None:
+    # -- sweep (in the Find tension tab) ---------------------------------------------------
+    def _build_sweep(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setContentsMargins(14, 0, 0, 0)
         form = QHBoxLayout()
         self.sweep_from = QDoubleSpinBox()
         self.sweep_to = QDoubleSpinBox()
@@ -560,6 +585,7 @@ class ResultsPanel(QTabWidget):
         split = QSplitter(_HORIZONTAL)
         self.sweep_graphics = pg.GraphicsLayoutWidget()
         self.sweep_graphics.setBackground("w")
+        self.sweep_graphics.setAntialiasing(True)
         self.s_length = self.sweep_graphics.addPlot(row=0, col=0, axisItems=_axes())
         self.s_gap = self.sweep_graphics.addPlot(row=1, col=0, axisItems=_axes())
         for plot in (self.s_length, self.s_gap):
@@ -575,11 +601,11 @@ class ResultsPanel(QTabWidget):
         self.s_gap.setLabel("left", "Max gap (m)")
         self.s_gap.setLabel("bottom", "Bottom tension (kN)")
         sym = {"symbol": "o", "symbolSize": 6}
-        self.s_total = self.s_length.plot([], [], pen=pg.mkPen((25, 70, 160), width=1.5), name="Total",
+        self.s_total = self.s_length.plot([], [], antialias=True, pen=pg.mkPen((25, 70, 160), width=1.5), name="Total",
                                           symbolBrush=(25, 70, 160), **sym)
-        self.s_longest = self.s_length.plot([], [], pen=pg.mkPen((211, 47, 47), width=1.5), name="Longest",
+        self.s_longest = self.s_length.plot([], [], antialias=True, pen=pg.mkPen((211, 47, 47), width=1.5), name="Longest",
                                             symbolBrush=(211, 47, 47), **sym)
-        self.s_maxgap = self.s_gap.plot([], [], pen=pg.mkPen((121, 85, 72), width=1.5), name="Max gap",
+        self.s_maxgap = self.s_gap.plot([], [], antialias=True, pen=pg.mkPen((121, 85, 72), width=1.5), name="Max gap",
                                         symbolBrush=(121, 85, 72), **sym)
         split.addWidget(self.sweep_graphics)
         self.sweep_table = _table(SWEEP_HEADERS)
@@ -590,8 +616,8 @@ class ResultsPanel(QTabWidget):
                                  "tension rises (Binda & Contro 1979). Slopes, friction and bodies can bend that.")
         self.sweep_note.setWordWrap(True)
         layout.addWidget(self.sweep_note)
-        self.sweep_page = page
-        self.addTab(page, "Tension sweep")
+        split.setMinimumHeight(180)
+        return page
 
     def _request_sweep(self) -> None:
         lo, hi = sorted((self.sweep_from.value(), self.sweep_to.value()))
@@ -626,12 +652,19 @@ class ResultsPanel(QTabWidget):
         body_rows, body_payloads = [], []
         if result is not None:
             for k, s in enumerate(result.spans):
-                red = pl._span_red(s, result.criteria)
+                level = pl.span_level(result, k)
                 bodies = ", ".join(b.body.name for b in result.bodies if b.in_span and s.kp_start <= b.kp_km <= s.kp_end)
-                span_rows.append([(str(k + 1), "#d32f2f" if red else None), f"{s.kp_start:.3f}", f"{s.kp_end:.3f}",
+                if level == "indicative":
+                    need = pl.span_resolution_m(result.stations, s, result.criteria)
+                    resolved = (f"no: needs {need:.0f} m", SEVERITY_COLOUR[INFO])
+                else:
+                    resolved = "yes"
+                number_colour = {"red": "#d32f2f", "indicative": SEVERITY_COLOUR[INFO]}.get(level)
+                span_rows.append([(str(k + 1), number_colour), f"{s.kp_start:.3f}", f"{s.kp_end:.3f}",
                                   _num(s.length_m, 1), _num(s.max_gap_m), f"{s.kp_max_gap:.3f}", _num(s.tension_kn),
                                   s.source, (_num(s.min_bend_radius_m, 1), "#d32f2f" if s.below_mbr else None),
-                                  _num(s.mbr_m, 1), _num(s.max_reaction_kn), _num(s.allowable_kn), bodies])
+                                  _num(s.mbr_m, 1), _num(s.max_reaction_kn), _num(s.allowable_kn), resolved,
+                                  bodies])
                 span_payloads.append((s.kp_start, s.kp_end))
             for b in result.bodies:
                 body_rows.append([b.body.name, b.body.kind, f"{b.kp_km:.3f}", _num(b.body.weight_kn),
@@ -656,6 +689,29 @@ class ResultsPanel(QTabWidget):
         self.summary.setHtml(summary_html)
 
 
+def _data_text(result: pl.PlanningResult) -> str:
+    """What the seabed data resolves, for the Summary."""
+    st, c = result.stations, result.criteria
+    if st.data_m is None or not np.isfinite(st.data_m).any():
+        return "not known"
+    lo, hi = float(np.nanmin(st.data_m)), float(np.nanmax(st.data_m))
+    every = f"every {lo:.2g} m" if hi - lo < 0.05 * hi else f"every {lo:.2g} to {hi:.2g} m"
+    parts = [every]
+    if math.isfinite(st.noise_m):
+        parts.append(f"point-to-point variation σ {st.noise_m:.2f} m")
+    parts.append(("noise filter " + (f"{st.filter_m:.2g} m" if st.filter_m > 0 else "none"))
+                 + (" (suited to the data)" if st.filter_auto else ""))
+    if c.resolve_intervals > 0:
+        parts.append(f"spans resolved from {c.resolve_intervals:g} data intervals "
+                     f"({c.resolve_intervals * lo:.2g} m" + (f" to {c.resolve_intervals * hi:.2g} m)" if hi > lo * 1.05
+                                                              else ")"))
+    else:
+        parts.append("resolution check off")
+    if st.spikes_kp:
+        parts.append(f"{len(st.spikes_kp)} possible flier(s)")
+    return "; ".join(parts)
+
+
 def summary_html(result: pl.PlanningResult, notes: Sequence[str], setup_lines: Sequence[str],
                  verification=None) -> str:
     """The Summary tab: what was modelled and what came out (and a closed-form check when there is one)."""
@@ -667,8 +723,11 @@ def summary_html(result: pl.PlanningResult, notes: Sequence[str], setup_lines: S
         ("Seabed length", f"{s.seabed_m:,.0f} m (fill {s.fill_pct:.3f}%)"),
         ("Cable laid", f"{s.cable_laid_m:,.0f} m (slack {s.laid_slack_pct:.3f}% over the route)"),
         ("Cable used by the rest shape", f"{s.cable_shape_m:,.0f} m"),
+        ("Seabed data", _data_text(result)),
         ("Spans", f"{s.spans} ({s.red_spans} red), {s.span_length_m:,.0f} m in total, longest "
-                  f"{s.longest_span_m:.1f} m, highest {s.max_gap_m:.2f} m"),
+                  f"{s.longest_span_m:.1f} m, highest {s.max_gap_m:.2f} m"
+                  + (f"; plus {s.indicative_spans} indicative, below the data's resolution"
+                     if s.indicative_spans else "")),
         ("Tightest bend at a support", "none" if s.min_bend_radius_m == math.inf else
          f"{s.min_bend_radius_m:.1f} m ({s.below_mbr} support(s) below the MBR)"),
         ("Largest support reaction", f"{s.max_reaction_kn:.2f} kN"),

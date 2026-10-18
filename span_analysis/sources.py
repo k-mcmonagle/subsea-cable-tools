@@ -24,6 +24,7 @@ import numpy as np
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
+    QgsGeometry,
     QgsPointXY,
     QgsProject,
     QgsRasterLayer,
@@ -34,7 +35,7 @@ from .. import depth_profile_core as dpc
 from ..cable_library import store as library
 from ..cable_seabed import planning as pl
 from ..cable_seabed.core import G
-from ..cable_seabed.sampling import SEABED_CONTOURS, SEABED_RASTER, seabed_sampling_notes
+from ..cable_seabed.sampling import SEABED_CONTOURS, SEABED_RASTER, SEABED_RPL, seabed_sampling_notes
 from ..kp_range_utils import make_kp_distance_area
 from ..plugin_log import log_exception
 
@@ -222,6 +223,47 @@ def route_from_layer(layer: QgsVectorLayer, selected_only: bool, start_kp: float
 # ---------------------------------------------------------------------------
 # Seabed
 # ---------------------------------------------------------------------------
+# Raster services that serve map images (basemaps, charts), never depths.
+_IMAGE_PROVIDERS = frozenset({"wms", "arcgismapserver"})
+
+
+def raster_layers(project: Optional[QgsProject] = None) -> List[QgsRasterLayer]:
+    """The project's rasters that can hold depths, in the Layers panel order."""
+    project = project or QgsProject.instance()
+    ordered = [node.layer() for node in project.layerTreeRoot().findLayers()]
+    out, seen = [], set()
+    for layer in ordered + list(project.mapLayers().values()):
+        if not isinstance(layer, QgsRasterLayer) or layer.id() in seen:
+            continue
+        seen.add(layer.id())
+        if layer.providerType() not in _IMAGE_PROVIDERS:
+            out.append(layer)
+    return out
+
+
+def rasters_crossed(route: RouteGeo, layers: Sequence[QgsRasterLayer]) -> List[str]:
+    """Ids of the rasters whose extent the route line crosses."""
+    crs = route.stationing.crs
+    parts = [[QgsPointXY(p) for p in part] for part in route.stationing.line_parts if len(part) >= 2]
+    if not parts:
+        return []
+    line = QgsGeometry.fromMultiPolylineXY(parts)
+    context = QgsProject.instance().transformContext()
+    out = []
+    for layer in layers:
+        extent = layer.extent()
+        try:
+            if crs is not None and crs.isValid() and layer.crs().isValid() and layer.crs() != crs:
+                # The raster's extent to the route's CRS: a long route may not fit the raster's projection.
+                extent = QgsCoordinateTransform(layer.crs(), crs, context).transformBoundingBox(extent)
+        except Exception:
+            log_exception(f"Span & Slack Analysis: extent of raster '{layer.name()}' not transformable")
+            continue
+        if not extent.isEmpty() and line.intersects(extent):
+            out.append(layer.id())
+    return out
+
+
 def build_seabed_request(route: RouteGeo, mode: str, rasters: Sequence[QgsRasterLayer],
                          contour: Optional[Tuple[QgsVectorLayer, str]], interval_m: int):
     """Main thread: the Depth Profile request (``interval_m`` 0 = each raster at its cell size)."""
@@ -254,8 +296,11 @@ def sample_profile(request, kp0: float, mode: str, auto: bool, cancel=None, prog
                                          cells=list(result.depth_cell_m or []) or None,
                                          sources=list(result.depth_source_ids or []) or None,
                                          messages=result.messages, auto=auto)
+    cells = list(result.depth_cell_m or [])
     return {"x_m": x.tolist(), "kp_km": (kp0 + x / 1000.0).tolist(),
-            "depth_m": [None if not math.isfinite(v) else float(v) for v in depth], "notes": notes}
+            "depth_m": [None if not math.isfinite(v) else float(v) for v in depth], "notes": notes,
+            "cell_m": [None if c is None or not math.isfinite(c) else float(c) for c in cells]
+            if len(cells) == len(x) else None, "kind": mode}
 
 
 def rpl_measured_kps(model) -> List[float]:
@@ -316,9 +361,13 @@ def rpl_depth_profile(model, kp_lo: float, kp_hi: float, step_m: float = 5.0) ->
     marks = np.linspace(lo, hi, count)
     values = np.interp(marks, kp, depth)
     x = (marks - lo) * 1000.0
+    # The data is the RPL positions: how far apart they are around each station.
+    leg = np.clip(np.searchsorted(kp, marks, side="right") - 1, 0, len(kp) - 2)
+    data_m = (kp[leg + 1] - kp[leg]) * 1000.0
     notes = ["Seabed from the RPL's approximate depths (straight lines between RPL positions): it holds no "
              "seabed relief between positions, so it cannot show spans. Use it only to check the setup."]
-    return {"x_m": x.tolist(), "kp_km": marks.tolist(), "depth_m": values.tolist(), "notes": notes}
+    return {"x_m": x.tolist(), "kp_km": marks.tolist(), "depth_m": values.tolist(), "notes": notes,
+            "data_m": data_m.tolist(), "kind": SEABED_RPL}
 
 
 # ---------------------------------------------------------------------------

@@ -950,3 +950,45 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   - The soil-class codes in some contractor summaries follow no published
     scheme found; they are kept as text and coloured through the project
     soil classes.
+
+## Span & Slack Analysis window (October 2026)
+
+- **The window follows the project.** The plugin keeps one window across
+  openings and projects, so it lists rasters again when layers are added or
+  removed, re-reads the Workbench, library and layers on each show, and on
+  opening another project switches to that project's scenario file and last
+  scenario. Unsaved settings are kept on screen (marked unsaved), never
+  written anywhere automatically.
+- **Scenarios store each raster's source with its layer id.** A raster
+  removed and added again (new id) is relinked by source; one not in the
+  project stays in the settings (so the cached seabed still matches) and is
+  named in the Seabed status.
+- **Antialiased lines, 1 px on the tension, slack and slope rows.** Qt
+  strokes antialiased lines wider than 1 px as polygons: on a 40 km rough
+  route (80,000 stations) dense curves took a full redraw from 70 to 350 ms.
+  Curves are thinned to one min/max pair per pixel and the secondary rows
+  drawn at 1 px (Qt's fast antialiased path): 35 ms. The profile keeps its
+  thicker seabed and cable lines (smooth, so cheap).
+- **A run keeps the zoomed view when its KP range is unchanged** (live
+  updates always did; the Run button fitted the whole profile). The *A*
+  button and *Fit* fit every row together.
+- **Spans the seabed data cannot resolve are indicative, not hidden.** A span
+  needs three data intervals (two to show a sag; each support placed only to
+  within half an interval). Shorter ones are drawn light blue and listed as
+  information, not counted as red or amber; spans at an entered feature or
+  body are exact. Stretches where three intervals exceed the reporting length
+  are flagged (amber beyond the red length), so coarse data never reads as
+  "no spans". The reporting limits are project criteria and are never
+  changed to suit the data. Find tension and the sweep still use every
+  modelled span.
+- **Auto noise filter from the measured variation, capped.** Robust sigma
+  from second differences; average `(4 sigma / gap)^2` intervals, at most two
+  intervals and half the reporting length. The cap matters: on 25 m data the
+  "variation" is relief, and an uncapped two-interval (50 m) mean erased every
+  span. Scenarios saved before keep their manual value.
+- **Fliers are listed, never removed.** Automatic despiking would also remove
+  real boulders a cell or two wide.
+- **Indicative spans are a light fill, not a hatch.** Qt 5 scales brush
+  patterns with the plot transform until they vanish.
+- **Hidden setup rows leave the form layout on Qt 5** (it keeps their spacing;
+  Qt 6.4+ uses setRowVisible).

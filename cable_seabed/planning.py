@@ -25,7 +25,10 @@ KP). :func:`prepare` builds the stations once; :func:`solve` runs:
    (planned, fill, used by the cable, surplus), and the highest tension that
    keeps spans within the reporting limits.
 5. **Findings** as KP ranges, with the same terms and levels as the Lay
-   Assessment.
+   Assessment. A span shorter than the seabed data can resolve
+   (:data:`cable_seabed.sampling.RESOLVE_INTERVALS` data intervals) is
+   indicative, not red or amber, and stretches where the data cannot resolve
+   spans as short as the reporting length are flagged.
 
 :func:`detail_window` solves a KP window with bending stiffness
 (:mod:`cable_seabed.beam`); :func:`tension_sweep` repeats step 1-4 over a
@@ -55,6 +58,18 @@ from .core import (
 )
 from .features import SeabedFeature, apply_features
 from .friction import friction_band, lay_history_tension, station_reactions
+from .sampling import (
+    MAX_FILTER_INTERVALS,
+    NOISE_TO_GAP,
+    RESOLVE_INTERVALS,
+    SEABED_CONTOURS,
+    SEABED_RPL,
+    auto_filter_m,
+    cell_noise_m,
+    data_points,
+    data_spacing_m,
+    spike_indices,
+)
 from .shape import Shortfall, cable_rest_elevation, conformity_length_m, pull_taut, smooth_profile
 from .spans import SPAN_END_TOL_M, Span, Support, allowable_tension_kn, find_spans, span_supports
 
@@ -260,6 +275,7 @@ class Criteria:
     shortfall_pct: float = 0.1        # flag laid cable short of the seabed by more than this
     max_reach_m: float = 1000.0
     allowable: bool = True            # find the highest tension that keeps spans within limits
+    resolve_intervals: float = RESOLVE_INTERVALS   # spans shorter than this many data intervals: indicative (0 off)
 
 
 def span_end_tol(criteria: Criteria) -> float:
@@ -277,6 +293,9 @@ class Profile:
     turns: List[Tuple[float, float]] = field(default_factory=list)   # alter courses (kp, heading change deg)
     notes: List[str] = field(default_factory=list)
     source: str = ""
+    cell_m: Optional[np.ndarray] = None   # raster cell size per station (None: not a raster)
+    data_m: Optional[np.ndarray] = None   # data spacing per station when the stations are not the data (RPL)
+    kind: str = ""                        # SEABED_* of cable_seabed.sampling ("" unknown: a profile)
 
 
 @dataclass
@@ -289,7 +308,7 @@ class PlanningInputs:
     friction: FrictionModel = field(default_factory=FrictionModel)
     control: LayControl = field(default_factory=LayControl)
     criteria: Criteria = field(default_factory=Criteria)
-    filter_m: float = 2.0              # seabed noise filter the cable rests on
+    filter_m: Optional[float] = 2.0    # seabed noise filter the cable rests on (None: suited to the data)
     smoothing_m: Optional[float] = None   # seabed smoothing for lengths (None: conformity length)
     protection: List[Protection] = field(default_factory=list)
 
@@ -336,6 +355,10 @@ class Stations:
     features: List[SeabedFeature] = field(default_factory=list)
     protection: List[Protection] = field(default_factory=list)
     protection_index: Optional[np.ndarray] = None   # into protection (-1 none)
+    data_m: Optional[np.ndarray] = None   # how far apart the seabed data is around each station (m)
+    noise_m: float = math.nan             # cell-to-cell variation of the data (robust standard deviation, m)
+    filter_auto: bool = False             # the noise filter was suited to the data
+    spikes_kp: List[float] = field(default_factory=list)   # possible fliers: single points above both neighbours
 
     @property
     def n(self) -> int:
@@ -362,7 +385,27 @@ def prepare(inputs: PlanningInputs) -> Stations:
     if np.any(np.diff(kp) < 0):
         raise ValueError("KP must increase with distance along the profile.")
     notes = list(prof.notes)
+
+    # What the data resolves (before features, which are exact): how far apart the seabed is known around
+    # each station, its cell-to-cell variation and single points standing above both neighbours.
+    def aligned(values) -> Optional[np.ndarray]:
+        if values is None or len(values) != len(ok):
+            return None
+        arr = np.array([np.nan if v is None else float(v) for v in values], dtype=float)
+        return arr[ok][order][keep]
+
+    given = aligned(prof.data_m)
+    data0 = given if given is not None else data_spacing_m(x, aligned(prof.cell_m))
+    data_typical = float(np.nanmedian(data0)) if np.isfinite(data0).any() else math.nan
+    noise = math.nan
+    spikes_kp: List[float] = []
+    if prof.kind not in (SEABED_CONTOURS, SEABED_RPL):   # contours and RPL depths are not point samples
+        noise = cell_noise_m(x, depth, data0)
+        px, pd = data_points(x, depth, data0)
+        spikes_kp = [float(np.interp(px[i], x, kp)) for i in spike_indices(px, pd, noise)]
+    x0 = x.copy()
     x, kp, height, (depth,) = apply_features(x, kp, inputs.features, depth)
+    data_m = np.interp(x, x0, data0) if len(x0) else np.full(len(x), np.nan)
     n = len(x)
     steps = np.diff(x)
     spacing = float(np.median(steps[steps > 0])) if (steps > 0).any() else 1.0
@@ -413,7 +456,36 @@ def prepare(inputs: PlanningInputs) -> Stations:
         if math.isfinite(item.diameter_m) and item.diameter_m > 0:
             diam[sel] = np.fmax(diam[sel], item.diameter_m)
 
-    filter_m = max(float(inputs.filter_m or 0.0), 0.0)
+    gap = float(inputs.criteria.min_gap_m)
+    if inputs.filter_m is None:
+        filter_m = auto_filter_m(data_typical, noise, gap, float(inputs.criteria.min_length_m))
+        if math.isfinite(noise):
+            if filter_m > 0:
+                why = f"{filter_m:.2g} m"
+            elif (NOISE_TO_GAP * noise / gap) ** 2 < 1.0:
+                why = "none needed"
+            else:   # too coarse to tell noise from relief: averaging would remove relief
+                why = (f"none, as the data is coarser than half the {inputs.criteria.min_length_m:g} m reporting "
+                       "length (its variation is relief, and its cells are already averages)")
+            notes.append(f"Noise filter suited to the data: {why} (data every {data_typical:.2g} m, point-to-point "
+                         f"variation σ {noise:.2f} m, against the {gap:g} m reporting gap).")
+    else:
+        filter_m = max(float(inputs.filter_m or 0.0), 0.0)
+    resolves = (inputs.criteria.resolve_intervals or 0.0) * data_typical <= inputs.criteria.min_length_m
+    if math.isfinite(noise) and math.isfinite(data_typical) and data_typical > 0 and gap > 0 and resolves:
+        # (On data too coarse for the reporting length the variation is relief; the resolution findings say so.)
+        residual = noise / math.sqrt(max(filter_m / data_typical, 1.0))
+        if NOISE_TO_GAP * residual > gap:
+            notes.append(f"The seabed varies by σ {noise:.2f} m from point to point (sounding noise or rough "
+                         f"ground), {residual:.2f} m after the noise filter: spans under about "
+                         f"{NOISE_TO_GAP * residual:.2f} m high may come from it. Check them against the soundings"
+                         + ("." if filter_m >= MAX_FILTER_INTERVALS * data_typical * 0.99
+                            else ", or set the noise filter to auto."))
+    if spikes_kp:
+        where = ", ".join(f"{k:.3f}" for k in spikes_kp[:6]) + (" …" if len(spikes_kp) > 6 else "")
+        notes.append(f"{len(spikes_kp)} single point(s) stand well above both neighbours (KP {where}): possible "
+                     "fliers in the soundings, or small objects. The cable can rest on each, with a span either "
+                     "side; check them in the survey data (nothing is removed).")
     if inputs.smoothing_m is None:
         lengths = [conformity_length_m(types[i].ei_knm2, types[i].w_npm) for i in used]
         lengths = [v for v in lengths if math.isfinite(v)]
@@ -478,7 +550,8 @@ def prepare(inputs: PlanningInputs) -> Stations:
     return Stations(x, kp, raw + height, seabed, length_seabed, seabed + standoff, height, slope, w, w_cable,
                     ei, mbr, diam, npts, mu, mu_lat, index, body_index, soil, types, placements, spacing,
                     smoothing, filter_m, list(prof.turns), notes, [f for f in inputs.features if f.valid()],
-                    protection, protection_index)
+                    protection, protection_index, data_m=data_m, noise_m=noise,
+                    filter_auto=inputs.filter_m is None, spikes_kp=spikes_kp)
 
 
 # ---------------------------------------------------------------------------
@@ -500,8 +573,9 @@ class Summary:
     seabed_m: float = 0.0
     cable_shape_m: float = 0.0
     cable_laid_m: float = 0.0
-    spans: int = 0
+    spans: int = 0                     # spans the seabed data resolves (the indicative ones are counted apart)
     red_spans: int = 0
+    indicative_spans: int = 0          # shorter than the seabed data resolves
     span_length_m: float = 0.0
     longest_span_m: float = 0.0
     max_gap_m: float = 0.0
@@ -546,6 +620,7 @@ class PlanningResult:
     summary: Summary
     iterations: int
     notes: List[str] = field(default_factory=list)
+    indicative: List[bool] = field(default_factory=list)   # per span: shorter than the seabed data resolves
 
     @property
     def gap_m(self) -> np.ndarray:
@@ -731,16 +806,19 @@ def solve(st: Stations, control: LayControl, criteria: Criteria, allowable: Opti
                                  float(np.nanmax(g)) if np.isfinite(g).any() else math.nan, in_span,
                                  placement.standoff_m, float(np.nanmax(tension[sl]))))
 
+    indicative = [span.length_m < span_resolution_m(st, span, criteria) for span in spans]
+    resolved = [span for span, below in zip(spans, indicative) if not below]
     summary = Summary()
     summary.route_m = float(d_route.sum())
     summary.seabed_m = float(d_seabed.sum())
     summary.cable_shape_m = float(d_shape.sum())
     summary.cable_laid_m = float(d_laid.sum())
-    summary.spans = len(spans)
-    summary.red_spans = sum(1 for span in spans if _span_red(span, criteria))
-    summary.span_length_m = float(sum(span.length_m for span in spans))
-    summary.longest_span_m = float(max((span.length_m for span in spans), default=0.0))
-    summary.max_gap_m = float(max((span.max_gap_m for span in spans), default=0.0))
+    summary.spans = len(resolved)
+    summary.red_spans = sum(1 for span in resolved if _span_red(span, criteria))
+    summary.indicative_spans = len(spans) - len(resolved)
+    summary.span_length_m = float(sum(span.length_m for span in resolved))
+    summary.longest_span_m = float(max((span.length_m for span in resolved), default=0.0))
+    summary.max_gap_m = float(max((span.max_gap_m for span in resolved), default=0.0))
     radii = [sp.bend_radius_m for sp in supports if not math.isnan(sp.bend_radius_m)]
     summary.min_bend_radius_m = float(min(radii)) if radii else math.inf
     summary.below_mbr = sum(1 for sp in supports if sp.below_mbr)
@@ -753,7 +831,7 @@ def solve(st: Stations, control: LayControl, criteria: Criteria, allowable: Opti
 
     result = PlanningResult(st, control, criteria, deposit, tension, source, y, unheld, reaction_npm, fill_pct,
                             shape_pct, laid_pct, excess_pct, bottom_slack_pct, allowable_kn, spans, supports,
-                            shortfalls, bodies, [], summary, iterations, notes)
+                            shortfalls, bodies, [], summary, iterations, notes, indicative)
     result.findings = findings(result)
     report(progress, 1.0, "Done")
     return result
@@ -773,6 +851,31 @@ def _span_red(span: Span, criteria: Criteria) -> bool:
             or _over_contact(span.max_reaction_kn, criteria))
 
 
+def span_resolution_m(st: Stations, span: Span, criteria: Criteria) -> float:
+    """The shortest span the seabed data resolves where ``span`` is (m), 0 when any is.
+
+    ``resolve_intervals`` times the coarsest data spacing over the span and the
+    stations either side. 0 where a seabed feature or an in-line body you
+    entered carries the span (they are exact), or with the check off.
+    """
+    k = float(criteria.resolve_intervals or 0.0)
+    if k <= 0 or st.data_m is None:
+        return 0.0
+    sl = slice(max(span.i0 - 1, 0), min(span.i1 + 2, st.n))
+    if np.any(st.feature_m[sl] != 0) or np.any(st.body_index[sl] >= 0):
+        return 0.0
+    spacing = st.data_m[sl]
+    spacing = spacing[np.isfinite(spacing)]
+    return k * float(spacing.max()) if spacing.size else 0.0
+
+
+def span_level(result: "PlanningResult", index: int) -> str:
+    """``red``, ``amber`` or ``indicative`` (shorter than the seabed data resolves) for span ``index``."""
+    if index < len(result.indicative) and result.indicative[index]:
+        return "indicative"
+    return "red" if _span_red(result.spans[index], result.criteria) else "amber"
+
+
 def _over_contact(reaction_kn: float, criteria: Criteria) -> bool:
     limit = float(criteria.max_reaction_kn or 0.0)
     return limit > 0 and math.isfinite(reaction_kn) and reaction_kn > limit
@@ -790,7 +893,17 @@ def findings(result: PlanningResult) -> List[RangeFinding]:
     tension = result.tension_kn
     out: List[RangeFinding] = []
 
-    for span in result.spans:
+    for index, span in enumerate(result.spans):
+        if index < len(result.indicative) and result.indicative[index]:
+            need = span_resolution_m(st, span, c)
+            out.append(RangeFinding(
+                "span_indicative", INFO, min(span.kp_start, span.kp_end), max(span.kp_start, span.kp_end),
+                f"Span {span.length_m:.0f} m long, up to {span.max_gap_m:.2f} m above the seabed at "
+                f"{span.tension_kn:.2f} kN: indicative only. The seabed data here is every "
+                f"{need / max(c.resolve_intervals, 1e-9):.2g} m, so spans shorter than about {need:.0f} m are not "
+                "resolved: it may be longer, shorter or absent. Confirm it with finer bathymetry.",
+                span.max_gap_m, c.red_gap_m, "m", extra={"length_m": span.length_m, "resolvable_m": need}))
+            continue
         red = _span_red(span, c)
         parts = [f"Span {span.length_m:.0f} m long, up to {span.max_gap_m:.2f} m above the seabed at "
                  f"{span.tension_kn:.2f} kN ({span.source})"]
@@ -819,6 +932,29 @@ def findings(result: PlanningResult) -> List[RangeFinding]:
         out.append(RangeFinding("span", ERROR if red else WARNING, min(span.kp_start, span.kp_end),
                                 max(span.kp_start, span.kp_end), "; ".join(parts), span.max_gap_m, c.red_gap_m,
                                 "m", extra=extra))
+
+    k = float(c.resolve_intervals or 0.0)
+    if k > 0 and st.data_m is not None:
+        need = k * st.data_m
+        with np.errstate(invalid="ignore"):
+            coarse = np.isfinite(st.seabed_m) & np.isfinite(need) & (st.feature_m == 0) & (need > c.min_length_m)
+            severe = coarse & (need > c.red_length_m)
+        for level, mask in ((WARNING, severe), (INFO, coarse & ~severe)):
+            for a, b in _range_runs(mask, x, merge_m=50.0):
+                spacing = st.data_m[a:b + 1]
+                lo, hi = float(np.nanmin(spacing)), float(np.nanmax(spacing))
+                every = f"{lo:.2g} m" if hi - lo < 0.05 * hi else f"{lo:.2g} to {hi:.2g} m"
+                shortest = k * hi
+                if level == WARNING:
+                    text = (f"Seabed data every {every} here: spans shorter than about {shortest:.0f} m cannot be "
+                            f"resolved, beyond the {c.red_length_m:g} m red length. Span risk here is not "
+                            "assessed: spans shown are indicative and others may be missed. Use finer bathymetry.")
+                else:
+                    text = (f"Seabed data every {every} here: spans shorter than about {shortest:.0f} m cannot be "
+                            f"resolved (you report from {c.min_length_m:g} m). Shorter spans shown are indicative, "
+                            "and some may be missed.")
+                out.append(RangeFinding("data_resolution", level, float(kp[a]), float(kp[b]), text, shortest,
+                                        c.min_length_m, "m", extra={"data_spacing_m": hi}))
 
     for sp in result.supports:
         if _over_contact(sp.reaction_kn, c):
@@ -937,6 +1073,8 @@ CHECK_LABELS = {
     "steep": "Steep slope (model note)",
     "contact": "Contact load at a support",
     "alter_course": "Alter course (lateral)",
+    "span_indicative": "Span below the data's resolution",
+    "data_resolution": "Seabed data too coarse",
 }
 
 

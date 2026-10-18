@@ -59,6 +59,7 @@ from qgis.core import (
 from ..cable_seabed import planning as pl
 from ..cable_seabed.core import ERROR, INFO, WARNING, sub_progress
 from ..cable_seabed.profiles import SyntheticSeabed, read_profile_csv, synthetic_profile
+from ..cable_seabed.sampling import SEABED_PROFILE, SEABED_SYNTHETIC
 from ..cable_seabed.verification import depression_check
 from ..plugin_log import log_exception
 from ..qgis_compat import (
@@ -101,10 +102,16 @@ def _base_key(key: str) -> str:
     return str(key or "").split(_ROUTE_KEY)[0]
 
 
-def _profile_dict(prof: pl.Profile) -> Dict:
+def _profile_dict(prof: pl.Profile, kind: str = "") -> Dict:
     return {"x_m": [float(v) for v in prof.x_m], "kp_km": [float(v) for v in prof.kp_km],
             "depth_m": [None if not math.isfinite(v) else float(v) for v in prof.depth_m],
-            "notes": list(prof.notes), "source": prof.source}
+            "notes": list(prof.notes), "source": prof.source, "kind": kind}
+
+
+def _optional_array(values) -> Optional[np.ndarray]:
+    if values is None:
+        return None
+    return np.array([np.nan if v is None else float(v) for v in values], dtype=float)
 
 
 def run_job(job: Dict, cancel=None, progress=None) -> Dict:
@@ -118,7 +125,8 @@ def run_job(job: Dict, cancel=None, progress=None) -> Dict:
     prof = pl.Profile(np.asarray(profile["x_m"], dtype=float), np.asarray(profile["kp_km"], dtype=float),
                       np.array([np.nan if v is None else float(v) for v in profile["depth_m"]]),
                       turns=list(job.get("turns") or []), notes=list(profile.get("notes") or []),
-                      source=profile.get("source", ""))
+                      source=profile.get("source", ""), cell_m=_optional_array(profile.get("cell_m")),
+                      data_m=_optional_array(profile.get("data_m")), kind=profile.get("kind") or "")
     inputs = pl.PlanningInputs(prof, job["cable"], job["sections"], job["bodies"], job["features"], job["friction"],
                                job["control"], job["criteria"], job["filter_m"], job["smoothing_m"],
                                job.get("protection") or [])
@@ -156,6 +164,9 @@ class SpanAnalysisDialog(QDialog):
         self._scenario_id: Optional[str] = None
         self._dirty = False
         self._loading = False
+        self._carry_dirty: Optional[bool] = None   # unsaved changes when the last project closed
+        self._project_hooks: List = []
+        self._shown_once = False
         canvas = iface.mapCanvas() if iface is not None else None
         self.map = MapLink(canvas)
         self._pick_tool = None
@@ -255,6 +266,7 @@ class SpanAnalysisDialog(QDialog):
         self.plot.kpClicked.connect(lambda kp: self.map.show_kp(kp, pan="if_outside"))
         self.plot.kpDoubleClicked.connect(lambda kp: self.map.show_kp(kp, pan=True))
         self.plot.bodyClicked.connect(self._on_body_clicked)
+        self.plot.statusClicked.connect(self._on_status_clicked)
         self.plot.reverse_check.toggled.connect(self.results.set_reverse)
         self.results.set_reverse(self.plot.reverse_check.isChecked())
         self.results.findingSelected.connect(lambda f: self._show_range(f.kp_start, f.kp_end, False))
@@ -268,9 +280,19 @@ class SpanAnalysisDialog(QDialog):
         self._live_timer.setSingleShot(True)
         self._live_timer.setInterval(250)
         self._live_timer.timeout.connect(self._run_live)
+        # Layers arrive one by one (e.g. dropping files on the map): list them once they stop.
+        self._layers_timer = QTimer(self)
+        self._layers_timer.setSingleShot(True)
+        self._layers_timer.setInterval(250)
+        self._layers_timer.timeout.connect(self.setup.refresh_layers)
+        self._project_timer = QTimer(self)
+        self._project_timer.setSingleShot(True)
+        self._project_timer.setInterval(0)
+        self._project_timer.timeout.connect(self._follow_project)
         self._open_store()
         self._restore_ui()
         self._update_buttons()
+        self._install_project_hooks()
 
     # ------------------------------------------------------------------------------
     # Scenarios and the GeoPackage
@@ -598,14 +620,14 @@ class SpanAnalysisDialog(QDialog):
             path = s["route"]["csv_path"]
             if not path or not os.path.isfile(path):
                 raise ValueError("Choose the CSV profile file.")
-            job["profile"] = _profile_dict(read_profile_csv(path))
+            job["profile"] = _profile_dict(read_profile_csv(path), SEABED_PROFILE)
         elif route_source == sources.ROUTE_DXF:
             path = s["route"]["dxf"]["path"]
             if not path or not os.path.isfile(path):
                 raise ValueError("Choose the DXF profile drawing.")
             if not setup.dxf_layer.currentData():
                 raise ValueError("Choose the DXF layer that holds the seabed line.")
-            job["profile"] = dxf_io.profile_from_dxf(path, setup.dxf_options())
+            job["profile"] = dict(dxf_io.profile_from_dxf(path, setup.dxf_options()), kind=SEABED_PROFILE)
         elif route_source == sources.ROUTE_SYNTHETIC:
             syn = s["route"]["synthetic"]
             spec = SyntheticSeabed(length_m=syn["length_m"], spacing_m=syn["spacing_m"], start_kp=syn["start_kp"],
@@ -613,7 +635,7 @@ class SpanAnalysisDialog(QDialog):
                                    wave_height_m=syn["wave_height_m"], wave_length_m=syn["wave_length_m"],
                                    roughness_m=syn["roughness_m"], roughness_length_m=syn["roughness_length_m"],
                                    seed=int(syn["seed"]))
-            job["profile"] = _profile_dict(synthetic_profile(spec))
+            job["profile"] = _profile_dict(synthetic_profile(spec), SEABED_SYNTHETIC)
         elif s["seabed"]["source"] == sources.SEABED_RPL_DEPTH:
             if self._rpl_model is None:
                 raise ValueError("The RPL approximate depth needs a Workbench RPL route.")
@@ -678,7 +700,7 @@ class SpanAnalysisDialog(QDialog):
             "cable": cable, "sections": sections, "bodies": bodies, "features": setup.features_list(),
             "protection": setup.protection_list(),
             "friction": setup.friction(), "control": control, "criteria": setup.criteria(),
-            "filter_m": float(s["seabed"]["filter_m"]), "smoothing_m": setup.smoothing_m(), "notes": notes,
+            "filter_m": setup.filter_setting(), "smoothing_m": setup.smoothing_m(), "notes": notes,
         })
         return job
 
@@ -886,7 +908,7 @@ class SpanAnalysisDialog(QDialog):
         elif kind == "sweep":
             rows = task.result["sweep"]
             self.results.set_sweep(rows)
-            self.results.setCurrentWidget(self.results.sweep_page)
+            self.results.show_sweep()
             self._set_status(f"Tension sweep done ({len(rows)} tensions).")
         elif kind == "find":
             answers = task.result["found"]
@@ -923,6 +945,7 @@ class SpanAnalysisDialog(QDialog):
                 self._save_profile_if_saved_scenario()
             self.map.set_route(info.get("route"))
             self._notes = list(info.get("notes") or [])
+            self.setup.show_data(self._stations)
         self._previous = self._result if self._result is not None else None
         self._result = result
         self._result_key = info.get("settings", "")
@@ -950,7 +973,9 @@ class SpanAnalysisDialog(QDialog):
         s = result.summary
         reds = sum(1 for f in result.findings if f.severity == ERROR)
         ambers = sum(1 for f in result.findings if f.severity == WARNING)
-        text = (f"{s.spans} span(s) ({s.red_spans} red), {s.span_length_m:,.0f} m in total; "
+        indicative = (f", plus {s.indicative_spans} indicative (below the data's resolution)"
+                      if s.indicative_spans else "")
+        text = (f"{s.spans} span(s) ({s.red_spans} red){indicative}, {s.span_length_m:,.0f} m in total; "
                 f"{reds} red and {ambers} amber finding(s). Residual tension up to {s.max_tension_kn:.2f} kN; "
                 f"cable laid {s.laid_slack_pct:.2f}% over the route (fill {s.fill_pct:.2f}%).")
         if notes:
@@ -984,6 +1009,16 @@ class SpanAnalysisDialog(QDialog):
     def _show_range(self, kp_a: float, kp_b: float, zoom_map: bool) -> None:
         self.plot.zoom_to(kp_a, kp_b)
         self.map.show_range(kp_a, kp_b, zoom=zoom_map)
+
+    def _on_status_clicked(self, kp_lo: float, kp_hi: float, kp: float) -> None:
+        """The status bar: go to the worst finding at the KP clicked (else to the stretch clicked)."""
+        findings = self.plot.findings_at(kp)
+        if findings:
+            finding = findings[0]
+            self.results.select_finding(finding)
+            self._show_range(finding.kp_start, finding.kp_end, False)
+        else:
+            self._show_range(kp_lo, kp_hi, False)
 
     def _on_body_clicked(self, index: int) -> None:
         self.results.select_body(index)
@@ -1094,6 +1129,7 @@ class SpanAnalysisDialog(QDialog):
         graphs.setChecked(True)
         form.addRow(graphs)
         note = QLabel("Layers: SA_SEABED, SA_SEABED_SAMPLED, SA_CABLE, SA_CABLE_DETAIL, SA_SPAN_RED, SA_SPAN_AMBER, "
+                      "SA_SPAN_INDICATIVE, "
                       "SA_CLEAR_UNDER_LIMITS, SA_SUPPORTS, SA_BODIES, SA_FEATURES, SA_SEA_LEVEL, SA_FRAME, SA_TEXT "
                       "and one per graph curve. Units: metres; X = KP x 1000.")
         note.setWordWrap(True)
@@ -1159,13 +1195,89 @@ class SpanAnalysisDialog(QDialog):
         if self._persist_ui:
             QSettings().setValue(f"{_SETTINGS}/splitter", self.splitter.saveState())
 
-    def shutdown(self) -> None:
-        """Stop work and remove map graphics (window close / plugin unload)."""
+    # The plugin keeps this window when it is closed, and across projects, so it
+    # follows the project: layers added or removed, another project opened, and
+    # (on each show) the Workbench and the library, which change elsewhere.
+    def _install_project_hooks(self) -> None:
+        project = QgsProject.instance()
+        for signal, slot in ((project.layersAdded, self._on_layers_event),
+                             (project.layersRemoved, self._on_layers_event),
+                             (project.cleared, self._leave_project),
+                             (project.readProject, self._on_project_read)):
+            try:
+                signal.connect(slot)
+                self._project_hooks.append((signal, slot))
+            except (AttributeError, TypeError, RuntimeError):
+                log_exception("Span & Slack Analysis: cannot follow project changes")
+
+    def _remove_project_hooks(self) -> None:
+        hooks, self._project_hooks = self._project_hooks, []
+        for signal, slot in hooks:
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass  # already disconnected, or the project is gone
+
+    def _on_layers_event(self, *_args) -> None:
+        self._layers_timer.start()
+
+    def _on_project_read(self, *_args) -> None:
+        self._project_timer.start()
+
+    def _cancel_work(self) -> None:
         self._live_timer.stop()
+        self._pending_live = False
         if self._task is not None:
             self._dropped.append(self._task)
             self._task.cancel()
             self._task = None
+            self._task_kind = ""
+            self._set_running(False)
+
+    def _leave_project(self, *_args) -> None:
+        """The project closed: its results, map graphics and scenario file go (the settings stay)."""
+        # Removing the project's layers can untick rasters: that is not a change by the user.
+        self._carry_dirty = self._dirty
+        self._cancel_work()
+        if self.pick_button.isChecked():
+            self.pick_button.setChecked(False)
+        if self._store is not None:
+            self._store.close()
+            self._store = None
+        self._scenario_id = None
+        self._profile, self._profile_key = None, ""
+        self.map.set_route(None)
+        self._clear_results()
+        self._refresh_scenarios(None)
+
+    def _follow_project(self) -> None:
+        """A project was opened: its scenario file and last scenario, its RPLs and layers."""
+        dirty = self._dirty if self._carry_dirty is None else self._carry_dirty
+        self._carry_dirty = None
+        self._open_store()
+        self.setup.refresh_sources()
+        last = self._store.read_meta().get("last_scenario") if self._store is not None else None
+        if not dirty and last and self.scenario_combo.findData(last) >= 0:
+            self.load_scenario(last)
+            return
+        self._dirty = dirty
+        self._update_title()
+        if dirty:
+            self._set_status("Another project was opened. The settings shown are not saved: Save keeps them as a "
+                             "scenario of this project.")
+
+    def showEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        super().showEvent(event)
+        if self._shown_once:
+            QTimer.singleShot(0, self.setup.refresh_sources)
+        self._shown_once = True
+
+    def shutdown(self) -> None:
+        """Stop work and remove map graphics (window close / plugin unload)."""
+        self._remove_project_hooks()
+        self._layers_timer.stop()
+        self._project_timer.stop()
+        self._cancel_work()
         if self._pick_tool is not None and self.iface is not None:
             self.iface.mapCanvas().unsetMapTool(self._pick_tool)
             self._pick_tool = None

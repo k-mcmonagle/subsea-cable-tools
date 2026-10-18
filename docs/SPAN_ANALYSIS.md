@@ -38,16 +38,35 @@ A *KP window* limits the analysis to part of a long route. It is cut from the ro
 
 The seabed is sampled along the route with the Depth Profile engine, the same as the Lay Assessment.
 
-- **Rasters.** Each grid is sampled at its own cell size, the finest first.
+- **Rasters.** Each grid is sampled at its own cell size, the finest first. The list follows the project's layers
+  (in the Layers panel order; web map layers are left out). *Along the route* ticks the rasters the route crosses
+  (within the KP window); *All* and *None* act on the rasters listed, and a search box appears when there are more
+  than eight. A scenario finds a raster removed and added again by its file, and the seabed status names any that
+  are not in the project.
 - **Contours.** The route's crossings are used.
 - **RPL approximate depth.** A coarse fallback that holds no relief.
 
 The status line repeats the Lay Assessment's sampling notes: coarse grids, contour interval, and rasters meeting
 along the route.
 
-- **Noise filter** (default 2 m). The running mean the cable rests on. It removes sounding noise and keeps crests.
+- **Noise filter** (auto by default). The running mean the cable rests on. It removes sounding noise and keeps
+  crests. Auto measures the data's point-to-point variation σ (a robust standard deviation from second differences:
+  `1.4826 median|Δ²z| / √6`, unmoved by sparse features) and averages `n = (4σ / gap)²` data intervals, so the
+  remaining noise is at most a quarter of the reporting gap; never more than two intervals or half the reporting
+  length (relief at the scale of the spans reported is kept), and none on data coarser than that (its variation is
+  relief, its cells already averages). Scenarios saved before auto keep their value.
 - **Smoothing for lengths.** Lengths use the seabed smoothed over the cable's conformity length
   `2 (EI / w)^(1/3)` (10 m without EI).
+- **What the data resolves.** The data spacing around each station is the raster's cell (or the sampling interval
+  where coarser), or the spacing of contour crossings, profile points or RPL positions. A span shorter than three data
+  intervals (*Spans need at least*, default 3: two to show a sag, and each support placed only to within half an
+  interval) is *indicative*: light blue, listed as information, not red or amber. Spans at a seabed feature or in-line
+  body you entered are exact. Where three intervals exceed the reporting length the stretch is flagged *Seabed data
+  too coarse* (information; amber where they exceed the red length: span risk there is not assessed). The reporting
+  limits are never changed for the data.
+- **Single-point peaks** standing 8 σ above both neighbours are listed by KP as possible fliers (or small objects);
+  nothing is removed.
+- **Suit the data** sets sampling, the noise filter and smoothing to auto and spans to three data intervals.
 
 **Seabed features.** Each feature sits on the seabed at a KP and adds height:
 
@@ -236,7 +255,7 @@ With EI the matrix is not a Minkowski matrix, so the monotonicity above is not g
 
 ### 6. Tension sweep
 
-The route is laid at a series of constant bottom tensions (friction and slopes included). For each tension the
+Under *Find tension*, *Spans against tension (sweep)* lays the route at a series of constant bottom tensions (friction and slopes included). For each tension the
 sweep plots and tabulates:
 
 - span count and total length;
@@ -287,6 +306,8 @@ tool lists these values at each RPL vertex as information.
 | Contact load at a support (above the contact limit, when set) | red |
 | Steep slope (small-slope model note, above 20°) | info |
 | Alter course (lateral) | info |
+| Span below the data's resolution (indicative) | info |
+| Seabed data too coarse for the reporting length | info; amber beyond the red length |
 
 ## Results and links
 
@@ -299,21 +320,26 @@ tool lists these values at each RPL vertex as information.
   - slack laid, fill and used, with the surplus shaded, and the RPL's planned slack per leg;
   - the seabed slope against the friction angle.
 
-  The previous run is shown dashed, so a change can be compared. View options: *True scale (1:1)*, *Sea level*,
-  *Reverse KP*, *Body labels*, and *Measure* (two-point lengths, heights and angles, as in the Depth Profile).
+  The previous run is shown dashed, so a change can be compared. *Fit*, or the *A* at the bottom left of a
+  zoomed plot, shows the whole profile; a run over the same KPs keeps the view where you zoomed it. *True scale
+  (1:1)* shows slopes and spans as they are. *Plots* shows or hides each row, the sea level, the previous run,
+  body labels and legends, reverses KP, and restores the *Default view*. *Tooltip* turns the tooltip at the cursor
+  on or off and chooses its fields (KP, seabed and cable depth, gap and span, residual and lay tension, the highest
+  tension for spans within limits, slack, slope and friction, cable type, soil); the line below the plots shows
+  everything. Hover the status bar for the findings at a KP (the stretch under the cursor is outlined) and click it
+  to go to the worst of them. *Measure* gives two-point lengths, heights and angles, as in the Depth Profile.
 - **Map.** Hovering moves a marker along the route. A click shows the KP on the map. *Pick KP on map* goes from the
   map to the profile. Findings and spans highlight their KP range.
 - **Tabs** (click a column heading to sort):
   - Findings;
   - Spans (with bodies in each span);
   - Bodies;
-  - Detail (EI);
-  - Find tension;
-  - Tension sweep;
-  - Summary (inputs, totals, notes).
+  - Summary (inputs, totals, notes);
+  - Find tension, with the tension sweep below it;
+  - Detail (EI).
 - **Export.** Findings, spans and the profile by station as CSV, the plot as PNG, and the scene as DXF (R12, metres,
   X = KP × 1000, Y = elevation × a chosen vertical exaggeration). The DXF layers are `SA_SEABED`,
-  `SA_SEABED_SAMPLED`, `SA_CABLE`, `SA_CABLE_DETAIL`, `SA_SPAN_RED`, `SA_SPAN_AMBER`, `SA_CLEAR_UNDER_LIMITS`,
+  `SA_SEABED_SAMPLED`, `SA_CABLE`, `SA_CABLE_DETAIL`, `SA_SPAN_RED`, `SA_SPAN_AMBER`, `SA_SPAN_INDICATIVE`, `SA_CLEAR_UNDER_LIMITS`,
   `SA_SUPPORTS`, `SA_BODIES`, `SA_PROTECTION`, `SA_FEATURES`, `SA_SEA_LEVEL`, `SA_FRAME` and `SA_TEXT`. The tension, slack and slope
   graphs sit below the profile, with one layer per curve. *Add to map* writes the findings as a line layer.
 

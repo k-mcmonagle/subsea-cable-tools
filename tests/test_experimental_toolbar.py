@@ -84,7 +84,7 @@ def test_experimental_actions_share_one_toolbar_dropdown():
             "Cable Lay Data Explorer",
             "Cable Lay Simulator (3D)",
             "BU Lowering Tool (3D)",
-            "Span && Slack Analysis",   # "&&" is a literal "&" in Qt menus
+            "Span && Slack Analysis (beta)",   # "&&" is a literal "&" in Qt menus
         ]
         menu_actions = [action for _menu, action in iface.plugin_menu_actions]
         assert all(action in menu_actions for action in experimental_actions)

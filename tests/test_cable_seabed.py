@@ -470,6 +470,62 @@ def test_contact_limit() -> bool:
                    f"{len(contact)} finding(s), {result.summary.red_spans} red span(s)")
 
 
+def test_data_noise_and_filter() -> bool:
+    """Point-to-point variation from known white noise; a lone peak is found but does not move it; auto filter."""
+    from ..cable_seabed.sampling import auto_filter_m, cell_noise_m, data_spacing_m, spike_indices
+
+    rng = np.random.default_rng(7)
+    x = np.arange(0.0, 3000.0, 1.0)
+    depth = 100.0 + 0.02 * x + rng.normal(0.0, 0.05, len(x))   # a slope plus sigma 0.05 m noise
+    sigma = cell_noise_m(x, depth)
+    spiked = depth.copy()
+    spiked[1500] -= 1.5                                       # one point 1.5 m shallower (a flier)
+    sigma_spiked = cell_noise_m(x, spiked)
+    found = spike_indices(x, spiked, sigma_spiked)
+    spacing = data_spacing_m(x, [5.0] * len(x))
+    filters = (auto_filter_m(1.0, 0.02, 0.3), auto_filter_m(1.0, 0.1, 0.3), auto_filter_m(1.0, 0.3, 0.3),
+               auto_filter_m(1.0, 0.3, 0.3, 3.0), auto_filter_m(25.0, 0.5, 0.3, 5.0))
+    ok = (_close(sigma, 0.05, 0.15) and _close(sigma_spiked, sigma, 0.05) and list(found) == [1500]
+          and np.allclose(spacing, 5.0) and filters[0] == 0.0 and _close(filters[1], (0.4 / 0.3) ** 2, 1e-6)
+          and filters[2] == 2.0 and filters[3] == 1.5 and filters[4] == 0.0)
+    return _report("data: point-to-point variation of white noise, a lone flier found, auto noise filter", ok,
+                   f"sigma {sigma:.3f} ({sigma_spiked:.3f} with a flier), peaks {list(found)}, filters {filters}")
+
+
+def test_spans_below_data_resolution() -> bool:
+    """On 25 m data short spans are indicative and the stretch is flagged; on 1 m data neither; features exact.
+
+    The same seabed both times (relief known every 25 m, the fine profile
+    interpolated from it): only how far apart the data is differs.
+    """
+    rng = np.random.default_rng(3)
+    xc = np.arange(0.0, 3000.0 + 12.5, 25.0)
+    dc = 100.0 + rng.normal(0.0, 0.5, len(xc))
+    xf = np.arange(0.0, 3000.0 + 0.5, 1.0)
+
+    def waves(step):
+        return pl.Profile(xc, xc / 1000.0, dc) if step > 1 else pl.Profile(xf, xf / 1000.0, np.interp(xf, xc, dc))
+
+    control = pl.LayControl(pl.TENSION, 10.0)
+    coarse = pl.run(_inputs(waves(25.0), control))
+    fine = pl.run(_inputs(waves(1.0), control))
+    need = 3.0 * 25.0
+    marks = [(s.length_m, flag) for s, flag in zip(coarse.spans, coarse.indicative)]
+    by_length = all(flag == (length < need) for length, flag in marks)
+    checks = {f.check_id: f.severity for f in coarse.findings}
+    flat = _flat(length=600.0, step=25.0)
+    boulder = pl.run(_inputs(flat, control, features=[SeabedFeature(BOULDER, 0.3, 1.0, 2.0)]))
+    off = pl.run(_inputs(waves(25.0), control, criteria=pl.Criteria(resolve_intervals=0.0)))
+    ok = (by_length and any(coarse.indicative) and checks.get("data_resolution") == pl.WARNING
+          and "span_indicative" in checks and coarse.summary.indicative_spans == sum(coarse.indicative)
+          and fine.spans and not any(fine.indicative)
+          and not any(f.check_id in ("data_resolution", "span_indicative") for f in fine.findings)
+          and len(boulder.spans) == 2 and not any(boulder.indicative) and not any(off.indicative))
+    return _report("data resolution: spans under 3 data intervals indicative, coarse stretch flagged, "
+                   "features exact", ok, f"coarse spans (length, indicative) {[(round(a), b) for a, b in marks][:6]}; "
+                   f"fine {len(fine.spans)} span(s)")
+
+
 def run_all() -> List[bool]:
     results = [
         test_point_load_sag(),
@@ -498,6 +554,8 @@ def run_all() -> List[bool]:
         test_find_tension(),
         test_protection(),
         test_contact_limit(),
+        test_data_noise_and_filter(),
+        test_spans_below_data_resolution(),
     ]
     print(f"\n{sum(results)}/{len(results)} cable-on-seabed engine checks passed.")
     return results

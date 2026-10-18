@@ -298,6 +298,7 @@ def export_scene(result, path: str, options: SceneOptions, detail=None) -> Dict[
         "seabed": w.layer("SA_SEABED", 34), "sampled": w.layer("SA_SEABED_SAMPLED", 8),
         "cable": w.layer("SA_CABLE", 5), "detail": w.layer("SA_CABLE_DETAIL", 6),
         "red": w.layer("SA_SPAN_RED", 1), "amber": w.layer("SA_SPAN_AMBER", 30),
+        "indicative": w.layer("SA_SPAN_INDICATIVE", 5),
         "clear": w.layer("SA_CLEAR_UNDER_LIMITS", 9), "supports": w.layer("SA_SUPPORTS", 7),
         "bodies": w.layer("SA_BODIES", 2), "features": w.layer("SA_FEATURES", 40),
         "sea": w.layer("SA_SEA_LEVEL", 4), "frame": w.layer("SA_FRAME", 7), "text": w.layer("SA_TEXT", 7),
@@ -332,11 +333,11 @@ def export_scene(result, path: str, options: SceneOptions, detail=None) -> Dict[
         a, b = max(span.i0, i0), min(span.i1, i1)
         ring = list(zip(x_all[a:b + 1], y_of(result.cable_m[a:b + 1]))) + \
             list(zip(x_all[a:b + 1][::-1], y_of(seabed[a:b + 1][::-1])))
-        level = "red" if pl._span_red(span, result.criteria) else "amber"
+        level = pl.span_level(result, k)
         w.polyline(ring, names[level], closed=True)
         top = int(np.argmin(np.abs(kp - span.kp_max_gap)))
-        w.text(x_all[top], y_of(result.cable_m[top]) + th, f"S{k + 1} {span.length_m:.1f} m, gap {span.max_gap_m:.2f} m",
-               th * 0.8, names["text"])
+        w.text(x_all[top], y_of(result.cable_m[top]) + th, f"S{k + 1} {span.length_m:.1f} m, gap {span.max_gap_m:.2f} m"
+               + (" (indicative)" if level == "indicative" else ""), th * 0.8, names["text"])
     with np.errstate(invalid="ignore"):
         free = np.isfinite(result.gap_m) & (result.gap_m > pl.span_end_tol(result.criteria)) & ~reported
     for a, b in runs(free):

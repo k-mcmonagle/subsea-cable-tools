@@ -20,10 +20,12 @@ import csv
 import io
 import json
 import math
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 from qgis.PyQt.QtCore import Qt, pyqtSignal
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
@@ -46,12 +48,13 @@ from qgis.PyQt.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from qgis.core import QgsProject, QgsRasterLayer
+from qgis.core import QgsProject
 from qgis.gui import QgsFieldComboBox, QgsMapLayerComboBox
 
 from ..cable_seabed import planning as pl
 from ..cable_seabed.features import FEATURE_KINDS, FEATURE_LABELS
-from ..cable_seabed.sampling import SEABED_CONTOURS, SEABED_RASTER
+from ..cable_seabed.sampling import RESOLVE_INTERVALS, SEABED_CONTOURS, SEABED_RASTER
+from ..maptools.depth_source_table import layer_group_path
 from ..qgis_compat import (
     CHECK_STATE_CHECKED,
     CHECK_STATE_UNCHECKED,
@@ -65,6 +68,7 @@ from . import dxf_io, sources
 
 _HORIZONTAL = getattr(getattr(Qt, "Orientation", Qt), "Horizontal")
 _OPEN, _CLOSED = "▾", "▸"
+_GROUP_ROLE = int(getattr(ITEM_DATA_USER_ROLE, "value", ITEM_DATA_USER_ROLE)) + 1   # PyQt6 roles are enums
 
 CABLE_LIBRARY = "library"
 CABLE_SECTIONS = "sections"
@@ -340,6 +344,11 @@ def _norm(text) -> str:
     return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
 
 
+def _source_key(source: str) -> str:
+    """A layer source for matching (file paths compare without case on Windows)."""
+    return os.path.normcase(str(source or "").strip())
+
+
 def _spin(lo: float, hi: float, value: float, decimals: int = 2, step: float = 0.1, suffix: str = "",
           tip: str = "") -> QDoubleSpinBox:
     spin = QDoubleSpinBox()
@@ -377,6 +386,7 @@ class SetupPanel(QWidget):
         self._workbench = None
         self._mapping_labels: List[str] = []
         self._rpl_cache: Dict = {}
+        self._wanted: Dict[str, str] = {}   # a scenario's rasters not in the project: layer id -> source
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         self.route_section = Section("1  Route and KP", self._build_route(), True)
@@ -409,7 +419,8 @@ class SetupPanel(QWidget):
                                   "its start KP, as the Workbench does.")
         refresh = QToolButton()
         refresh.setText("↻")
-        refresh.setToolTip("Reload the Workbench RPLs and fits.")
+        refresh.setToolTip("Reload the Workbench RPLs and fits, the cable library and the project's layers (also "
+                           "done each time the window opens).")
         refresh.clicked.connect(self.refresh_sources)
         rpl_row.addWidget(self.rpl_combo, 1)
         rpl_row.addWidget(refresh)
@@ -565,12 +576,35 @@ class SetupPanel(QWidget):
         for key, label in sources.SEABED_CHOICES:
             self.seabed_source.addItem(label, key)
         form.addRow("Seabed", self.seabed_source)
+        self.raster_search = QLineEdit()
+        self.raster_search.setPlaceholderText("Search rasters or groups…")
+        self.raster_search.setClearButtonEnabled(True)
+        self.raster_search.textChanged.connect(self._filter_rasters)
         self.raster_list = QListWidget()
-        self.raster_list.setMaximumHeight(90)
         self.raster_list.setToolTip("Tick the MBES grids to sample. Where several cover a station the finest is "
-                                    "used (as in the Depth Profile tool).")
-        self.raster_list.itemChanged.connect(self._emit_changed)
-        form.addRow("Rasters", self.raster_list)
+                                    "used (as in the Depth Profile tool). The list follows the project's layers.")
+        self.raster_list.itemChanged.connect(self._on_raster_ticked)
+        raster_bar = QHBoxLayout()
+        raster_bar.setSpacing(4)
+        raster_bar.addWidget(bar_button("Along the route", "Tick the rasters whose extent the route crosses (within "
+                                                           "the KP window) and untick the rest.",
+                                        self.tick_rasters_along_route))
+        raster_bar.addWidget(bar_button("All", "Tick every raster listed (the search narrows the list).",
+                                        lambda: self._set_raster_ticks(lambda _layer_id: True, shown_only=True)))
+        raster_bar.addWidget(bar_button("None", "Untick every raster listed (the search narrows the list).",
+                                        lambda: self._set_raster_ticks(lambda _layer_id: False, shown_only=True)))
+        raster_bar.addStretch(1)
+        self.raster_count = QLabel("")
+        self.raster_count.setStyleSheet("color: #555;")
+        raster_bar.addWidget(self.raster_count)
+        self.raster_box = QWidget()
+        raster_layout = QVBoxLayout(self.raster_box)
+        raster_layout.setContentsMargins(0, 0, 0, 0)
+        raster_layout.setSpacing(2)
+        raster_layout.addWidget(self.raster_search)
+        raster_layout.addWidget(self.raster_list)
+        raster_layout.addLayout(raster_bar)
+        form.addRow("Rasters", self.raster_box)
         self.contour_combo = QgsMapLayerComboBox()
         self.contour_combo.setFilters(layer_filters(MAP_LAYER_FILTER_LINE))
         self.contour_field = QgsFieldComboBox()
@@ -583,6 +617,9 @@ class SetupPanel(QWidget):
         contour.addWidget(self.contour_combo, 1)
         contour.addWidget(self.contour_field)
         form.addRow("Contours", self.contour_row)
+        sampling_body = QWidget()
+        sampling = QFormLayout(sampling_body)
+        sampling.setContentsMargins(14, 0, 0, 0)
         self.interval = QSpinBox()
         self.interval.setRange(0, 500)
         self.interval.setSpecialValueText("auto (grid cell size)")
@@ -590,18 +627,58 @@ class SetupPanel(QWidget):
         self.interval.setToolTip("Station spacing along the route. Auto samples each raster at its own cell size "
                                  "(at least 1 m): coarser sampling misses crests and shortens the seabed.")
         self.interval.valueChanged.connect(self._emit_changed)
-        form.addRow("Sample every", self.interval)
-        self.filter_m = _spin(0.0, 50.0, 2.0, 1, 0.5, " m",
+        sampling.addRow("Sample every", self.interval)
+        self.filter_m = _spin(0.0, 50.0, 2.0, 2, 0.5, " m",
                               "Running mean the cable rests on: removes sounding noise (which would make false "
                               "spans between noise peaks) but keeps the crests. 0 for clean or synthetic data.")
         self.filter_m.valueChanged.connect(self._emit_changed)
-        form.addRow("Noise filter", self.filter_m)
+        self.filter_auto = QCheckBox("auto")
+        self.filter_auto.setChecked(True)
+        self.filter_auto.setToolTip("Suit the filter to the data: average just enough data points that the "
+                                    "point-to-point variation measured in the data, once averaged, is at most a "
+                                    "quarter of the reporting gap, over at most two data intervals and half the "
+                                    "reporting length, so relief at the scale of the spans you report is kept. None "
+                                    "when the data is smooth enough, or coarser than that (its cells are already "
+                                    "averages). The run states the value used.")
+        self.filter_auto.toggled.connect(self._on_filter_auto)
+        filter_row = QWidget()
+        filter_layout = QHBoxLayout(filter_row)
+        filter_layout.setContentsMargins(0, 0, 0, 0)
+        filter_layout.addWidget(self.filter_auto)
+        filter_layout.addWidget(self.filter_m, 1)
+        sampling.addRow("Noise filter", filter_row)
         self.smoothing = QLineEdit()
         self.smoothing.setPlaceholderText("auto: the cable's conformity length 2 (EI/w)^(1/3)")
         self.smoothing.setToolTip("Smoothing of the seabed for lengths (fill and slack): noise adds length. "
                                   "Blank: the conformity length (10 m without EI).")
         self.smoothing.textChanged.connect(self._emit_changed)
-        form.addRow("Smoothing for lengths", self.smoothing)
+        sampling.addRow("Smoothing for lengths", self.smoothing)
+        self.resolve = _spin(0.0, 20.0, RESOLVE_INTERVALS, 1, 0.5, " data intervals",
+                             "A span needs at least this many intervals of the seabed data (raster cells, contour "
+                             "crossings, profile points) to be resolved: two to show a sag between its supports, "
+                             "and each support (a crest) is placed only to within half an interval. Shorter spans "
+                             "are indicative (light blue), not red or amber, and stretches where the data "
+                             "cannot resolve spans as short as the reporting length are flagged. Spans at a seabed "
+                             "feature or in-line body you entered are exact. 0: off.")
+        self.resolve.setSpecialValueText("off")
+        self.resolve.valueChanged.connect(self._emit_changed)
+        sampling.addRow("Spans need at least", self.resolve)
+        self.data_note = QLabel("")
+        self.data_note.setWordWrap(True)
+        self.data_note.setStyleSheet("color: #555;")
+        sampling.addRow(self.data_note)
+        suit = bar_button("Suit the data", "Sample every: auto, noise filter: auto, smoothing for lengths: auto, "
+                                           f"spans need {RESOLVE_INTERVALS:g} data intervals. The reporting limits "
+                                           "(your project's criteria) are not changed.", self.suit_the_data)
+        suit_row = QWidget()
+        suit_layout = QHBoxLayout(suit_row)
+        suit_layout.setContentsMargins(0, 0, 0, 0)
+        suit_layout.addWidget(suit)
+        suit_layout.addStretch(1)
+        sampling.addRow(suit_row)
+        self.sampling_section = Section("Sampling and filtering", sampling_body, False)
+        form.addRow(self.sampling_section)
+        self._on_filter_auto(True)
         kinds = [(k, FEATURE_LABELS[k]) for k in FEATURE_KINDS]
         features_body = QWidget()
         features_layout = QVBoxLayout(features_body)
@@ -661,6 +738,42 @@ class SetupPanel(QWidget):
             combo.setCurrentIndex(max(combo.findData("custom"), 0))
         shape_col = next(i for i, c in enumerate(self.features.cols) if c.key == "shape")
         table.setItem(row, shape_col, QTableWidgetItem(format_shape(dialog.points)))
+
+    def _on_filter_auto(self, on: bool) -> None:
+        self.filter_m.setEnabled(not on)
+        self._emit_changed()
+
+    def filter_setting(self) -> Optional[float]:
+        """The noise filter for the engine: None when it is suited to the data."""
+        return None if self.filter_auto.isChecked() else float(self.filter_m.value())
+
+    def suit_the_data(self) -> None:
+        """Sampling and filtering back to the settings suited to the data (the reporting limits stay)."""
+        self.interval.setValue(0)
+        self.filter_auto.setChecked(True)
+        self.smoothing.setText("")
+        self.resolve.setValue(RESOLVE_INTERVALS)
+        self.sampling_section.button.setChecked(True)
+        self._emit_changed()
+
+    def show_data(self, stations) -> None:
+        """After a run: what the seabed data resolves and the filter used (shown under the settings)."""
+        if stations is None or stations.data_m is None or not np.isfinite(stations.data_m).any():
+            self.data_note.setText("")
+            return
+        spacing = float(np.nanmedian(stations.data_m))
+        parts = [f"Last run: data every {spacing:.2g} m"]
+        if math.isfinite(stations.noise_m):
+            parts.append(f"point-to-point variation σ {stations.noise_m:.2f} m")
+        filtered = f"{stations.filter_m:.2g} m" if stations.filter_m > 0 else "none"
+        parts.append(f"noise filter {filtered}" + (" (auto)" if stations.filter_auto else ""))
+        if self.resolve.value() > 0:
+            parts.append(f"spans resolved from about {self.resolve.value() * spacing:.2g} m")
+        self.data_note.setText("; ".join(parts) + ".")
+        if stations.filter_auto:
+            self.filter_m.blockSignals(True)
+            self.filter_m.setValue(float(stations.filter_m))   # shows the value used (disabled while auto)
+            self.filter_m.blockSignals(False)
 
     # -- cable --------------------------------------------------------------------------
     def _build_cable(self) -> QWidget:
@@ -743,8 +856,17 @@ class SetupPanel(QWidget):
                                                                  "off the seabed by half the difference."),
         ], "Add body", height=80, title="bodies")
         self.bodies.changed.connect(self._emit_changed)
-        form.addRow(QLabel("In-line bodies (in addition)"))
-        form.addRow(self.bodies)
+        bodies_body = QWidget()
+        bodies_layout = QVBoxLayout(bodies_body)
+        bodies_layout.setContentsMargins(14, 0, 0, 0)
+        note = QLabel("Repeaters, joints and branching units by KP (in addition to a fitted assembly's): weight in "
+                      "water, rigid length and housing diameter.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #555;")
+        bodies_layout.addWidget(note)
+        bodies_layout.addWidget(self.bodies)
+        self.bodies_section = Section("In-line bodies", bodies_body, False)
+        form.addRow(self.bodies_section)
         protection_body = QWidget()
         protection_layout = QVBoxLayout(protection_body)
         protection_layout.setContentsMargins(14, 0, 0, 0)
@@ -851,8 +973,17 @@ class SetupPanel(QWidget):
                                            Col("mode", "Control", "choice", pl.TENSION, modes),
                                            Col("value", "Value", "float", 5.0)], "Add section", height=80, title="lay control sections")
         self.control_sections.changed.connect(self._emit_control)
-        form.addRow(QLabel("By KP section (overrides the value above)"))
-        form.addRow(self.control_sections)
+        sections_body = QWidget()
+        sections_layout = QVBoxLayout(sections_body)
+        sections_layout.setContentsMargins(14, 0, 0, 0)
+        note = QLabel("A tension or slack over a KP range, in place of the value above (e.g. less tension over "
+                      "rough ground).")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #555;")
+        sections_layout.addWidget(note)
+        sections_layout.addWidget(self.control_sections)
+        self.control_sections_section = Section("By KP section", sections_body, False)
+        form.addRow(self.control_sections_section)
         finder = bar_button("Find the highest tension within limits…",
                             "Search the bottom tension that keeps the spans within a target (Find tension tab).",
                             self.tensionFinderRequested.emit)
@@ -950,7 +1081,11 @@ class SetupPanel(QWidget):
 
     # -- sources ------------------------------------------------------------------------------
     def refresh_sources(self) -> None:
-        """Reload the Workbench RPLs and fits, the library types and the raster layers."""
+        """Reload the Workbench RPLs and fits, the library types and the raster layers.
+
+        Emits ``changed`` when that changes a setting (e.g. a ticked raster left the project).
+        """
+        before = json.dumps(self.settings(), sort_keys=True, default=str)
         self._loading = True
         try:
             self._workbench = sources.open_workbench()
@@ -980,7 +1115,19 @@ class SetupPanel(QWidget):
             self.refresh_mapping()
         finally:
             self._loading = False
-        self.update_status()
+        if json.dumps(self.settings(), sort_keys=True, default=str) != before:
+            self._emit_changed()
+        else:
+            self.update_status()
+
+    def refresh_layers(self) -> None:
+        """The project's layers changed: list its rasters again."""
+        before = sorted(self._raster_setting())
+        self._refresh_rasters()
+        if sorted(self._raster_setting()) != before:
+            self._emit_changed()
+        else:
+            self.update_status()
 
     def _refresh_fits(self) -> None:
         current = self.fit_combo.currentData()
@@ -994,19 +1141,113 @@ class SetupPanel(QWidget):
         index = self.fit_combo.findData(current)
         self.fit_combo.setCurrentIndex(max(index, 0))
 
-    def _refresh_rasters(self, checked: Optional[Sequence[str]] = None) -> None:
+    def _refresh_rasters(self, checked: Optional[Sequence[str]] = None,
+                         saved_sources: Optional[Sequence[str]] = None) -> None:
+        """List the project's rasters (Layers panel order), keeping the ticks.
+
+        ``checked`` / ``saved_sources``: a scenario's rasters, by layer id and
+        source. A raster removed and added again (a new layer id) is found by
+        its source; one not in the project is kept in the settings, and ticked
+        when it is added, until the ticks are changed.
+        """
         if checked is None:
             checked = self.checked_raster_ids()
+        else:
+            sources_ = list(saved_sources or [])
+            self._wanted = {str(i): str(sources_[n]) if n < len(sources_) else ""
+                            for n, i in enumerate(checked) if i}
+        ticked = set(checked)
+        by_source = {_source_key(s): i for i, s in self._wanted.items() if s}
         self.raster_list.blockSignals(True)
         self.raster_list.clear()
-        for layer in QgsProject.instance().mapLayers().values():
-            if isinstance(layer, QgsRasterLayer):
-                item = QListWidgetItem(layer.name())
-                item.setData(ITEM_DATA_USER_ROLE, layer.id())
-                item.setFlags(item.flags() | ITEM_FLAG_USER_CHECKABLE)
-                item.setCheckState(CHECK_STATE_CHECKED if layer.id() in checked else CHECK_STATE_UNCHECKED)
-                self.raster_list.addItem(item)
+        for layer in sources.raster_layers():
+            on = layer.id() in ticked or layer.id() in self._wanted
+            self._wanted.pop(layer.id(), None)
+            match = by_source.pop(_source_key(layer.source()), None)
+            if match is not None:
+                on = True
+                self._wanted.pop(match, None)
+            item = QListWidgetItem(layer.name())
+            item.setData(ITEM_DATA_USER_ROLE, layer.id())
+            group = layer_group_path(layer)
+            item.setData(_GROUP_ROLE, group.lower())
+            item.setToolTip("\n".join(t for t in (group, layer.publicSource()) if t))
+            item.setFlags(item.flags() | ITEM_FLAG_USER_CHECKABLE)
+            item.setCheckState(CHECK_STATE_CHECKED if on else CHECK_STATE_UNCHECKED)
+            self.raster_list.addItem(item)
         self.raster_list.blockSignals(False)
+        self._filter_rasters()
+
+    def _filter_rasters(self, *_args) -> None:
+        """Show the rasters the search matches; size the list to them (up to eight rows)."""
+        count = self.raster_list.count()
+        self.raster_search.setVisible(count > 8)
+        words = self.raster_search.text().lower().split() if count > 8 else []
+        shown = 0
+        for i in range(count):
+            item = self.raster_list.item(i)
+            text = f"{item.text().lower()} {item.data(_GROUP_ROLE) or ''}"
+            item.setHidden(not all(word in text for word in words))
+            shown += not item.isHidden()
+        row = self.raster_list.sizeHintForRow(0) if count else 18
+        self.raster_list.setFixedHeight(min(max(shown, 2), 8) * max(row, 14) + 2 * self.raster_list.frameWidth() + 2)
+        self._update_raster_count()
+
+    def _update_raster_count(self) -> None:
+        count = self.raster_list.count()
+        ticked = len(self.checked_raster_ids())
+        self.raster_count.setText(f"{ticked} of {count} ticked" if count else "no rasters in the project")
+
+    def _on_raster_ticked(self, *_args) -> None:
+        self._wanted = {}   # the user chose: a scenario's missing rasters are dropped
+        self._update_raster_count()
+        self._emit_changed()
+
+    def _set_raster_ticks(self, tick, shown_only: bool = False) -> None:
+        """Tick the listed rasters for which ``tick(layer_id)`` is true, untick the rest."""
+        self.raster_list.blockSignals(True)
+        for i in range(self.raster_list.count()):
+            item = self.raster_list.item(i)
+            if not (shown_only and item.isHidden()):
+                item.setCheckState(CHECK_STATE_CHECKED if tick(item.data(ITEM_DATA_USER_ROLE))
+                                   else CHECK_STATE_UNCHECKED)
+        self.raster_list.blockSignals(False)
+        self._on_raster_ticked()
+
+    def tick_rasters_along_route(self) -> None:
+        """Tick the rasters the route (within the KP window) crosses."""
+        try:
+            route = self.route_line()
+        except ValueError as exc:
+            self.seabed_section.set_status(str(exc), False)
+            return
+        listed = [QgsProject.instance().mapLayer(self.raster_list.item(i).data(ITEM_DATA_USER_ROLE))
+                  for i in range(self.raster_list.count())]
+        crossed = set(sources.rasters_crossed(route, [layer for layer in listed if layer is not None]))
+        self._set_raster_ticks(lambda layer_id: layer_id in crossed)
+        if crossed:
+            self.seabed_section.set_status(f"{len(crossed)} of {len(listed)} raster(s) cross the route", True)
+        else:
+            self.seabed_section.set_status("No raster crosses the route" + (" in the KP window"
+                                                                            if self.kp_window() else ""), False)
+
+    def route_line(self) -> sources.RouteGeo:
+        """The route on the map (an RPL or a line layer), cut to the KP window (raises ValueError)."""
+        source = self.route_source.currentData()
+        if source == sources.ROUTE_RPL:
+            model = self.rpl_model()
+            if model is None:
+                raise ValueError("Choose a Workbench RPL first.")
+            route = sources.route_from_rpl_model(sources.with_start_kp(model, self.line_start_kp.value()))
+        elif source == sources.ROUTE_LINE:
+            route = sources.route_from_layer(self.line_combo.currentLayer(), self.line_selected.isChecked(),
+                                             self.line_start_kp.value())
+        else:
+            raise ValueError("The route is not on the map.")
+        window = self.kp_window()
+        if window is not None:
+            route = route.sub_route(max(window[0], route.kp_range[0]), min(window[1], route.kp_range[1]))
+        return route
 
     def checked_raster_ids(self) -> List[str]:
         out = []
@@ -1015,6 +1256,15 @@ class SetupPanel(QWidget):
             if item.checkState() == CHECK_STATE_CHECKED:
                 out.append(item.data(ITEM_DATA_USER_ROLE))
         return out
+
+    def _raster_setting(self) -> List[str]:
+        """The rasters in the settings: the ticked ones, then a scenario's that are not in the project."""
+        ticked = self.checked_raster_ids()
+        return ticked + [i for i in self._wanted if i not in ticked]
+
+    def _raster_source(self, layer_id: str) -> str:
+        layer = QgsProject.instance().mapLayer(layer_id)
+        return layer.source() if layer is not None else self._wanted.get(layer_id, "")
 
     @property
     def workbench(self):
@@ -1153,7 +1403,7 @@ class SetupPanel(QWidget):
             (self.syn_box, route == sources.ROUTE_SYNTHETIC),
             (self.window_row, on_map),
             (self.seabed_source, on_map),
-            (self.raster_list, on_map and seabed == SEABED_RASTER),
+            (self.raster_box, on_map and seabed == SEABED_RASTER),
             (self.contour_row, on_map and seabed == SEABED_CONTOURS),
             (self.interval, on_map and seabed in (SEABED_RASTER, SEABED_CONTOURS)),
             (self.type_row, cable in (CABLE_LIBRARY, CABLE_SECTIONS, CABLE_FIT, CABLE_RPL)),
@@ -1197,7 +1447,11 @@ class SetupPanel(QWidget):
             seabed = self.seabed_source.currentData()
             if seabed == SEABED_RASTER:
                 n = len(self.checked_raster_ids())
-                self.seabed_section.set_status(f"{n} raster(s)" if n else "Tick one or more rasters", n > 0)
+                missing = len(self._wanted)
+                text = f"{n} raster(s)" if n else "Tick the rasters (Along the route ticks those it crosses)"
+                if missing:
+                    text += f"; {missing} raster(s) of this scenario not in the project"
+                self.seabed_section.set_status(text, n > 0 and not missing)
             elif seabed == SEABED_CONTOURS:
                 ok = self.contour_combo.currentLayer() is not None and bool(self.contour_field.currentField())
                 self.seabed_section.set_status("Contours" if ok else "Needs a contour layer and depth field", ok)
@@ -1205,6 +1459,22 @@ class SetupPanel(QWidget):
                 self.seabed_section.set_status("RPL approximate depth (coarse: no relief)", True)
         else:
             self.seabed_section.set_status("From the profile", True)
+        sampling = []
+        if route in (sources.ROUTE_RPL, sources.ROUTE_LINE) and \
+                self.seabed_source.currentData() in (SEABED_RASTER, SEABED_CONTOURS):
+            sampling.append("auto spacing" if self.interval.value() == 0 else f"every {self.interval.value()} m")
+        if self.filter_auto.isChecked():
+            sampling.append("noise filter auto")
+        else:
+            sampling.append(f"noise filter {self.filter_m.value():g} m" if self.filter_m.value() > 0
+                            else "no noise filter")
+        if self.resolve.value() > 0:
+            sampling.append(f"spans from {self.resolve.value():g} data intervals")
+        else:
+            sampling.append("resolution check off")
+        if self.smoothing_m() is not None:
+            sampling.append(f"smoothing {self.smoothing_m():g} m")
+        self.sampling_section.set_status(", ".join(sampling), True)
         count = len(self.features.rows())
         self.features_section.set_status(f"{count} feature(s)" if count else "none", True)
         if count and route in (sources.ROUTE_RPL, sources.ROUTE_LINE):
@@ -1231,6 +1501,7 @@ class SetupPanel(QWidget):
             ok = bool(self.cable_type.currentData())
             self.cable_section.set_status(self.cable_type.currentText() if ok else "Needs a library cable type", ok)
         bodies = len(self.bodies.rows())
+        self.bodies_section.set_status(f"{bodies} body(ies)" if bodies else "none", True)
         if bodies:
             self.cable_section.status.setText(self.cable_section.status.text() + f", {bodies} body(ies)")
         protected = len(self.protection.rows())
@@ -1242,6 +1513,7 @@ class SetupPanel(QWidget):
         mode = self.mode.currentData()
         unit = pl.MODE_UNITS[mode]
         sections = len(self.control_sections.rows())
+        self.control_sections_section.set_status(f"{sections} section(s)" if sections else "none", True)
         self.control_section.set_status(f"{pl.MODE_LABELS[mode].split(' (')[0]} {self.value.value():.2f} {unit}"
                                         + (f", {sections} section(s)" if sections else ""), True)
         self._update_cable_info()
@@ -1304,7 +1576,8 @@ class SetupPanel(QWidget):
 
     def criteria(self) -> pl.Criteria:
         values = {key: float(spin.value()) for key, spin in self.crit.items()}
-        return pl.Criteria(allowable=self.allowable.isChecked(), **values)
+        return pl.Criteria(allowable=self.allowable.isChecked(), resolve_intervals=float(self.resolve.value()),
+                           **values)
 
     def friction(self) -> pl.FrictionModel:
         model = pl.FrictionModel(float(self.mu.value()), float(self.mu_lat.value()))
@@ -1377,6 +1650,7 @@ class SetupPanel(QWidget):
         if sections:
             self.control_sections.set_rows([{"kp0": a, "kp1": b, "mode": pl.TENSION, "value": v}
                                             for a, b, v in sections])
+            self.control_sections_section.button.setChecked(True)   # show what was set
         self.update_status()
 
     def cable_sections_list(self) -> List[pl.CableSection]:
@@ -1402,6 +1676,7 @@ class SetupPanel(QWidget):
     def settings(self) -> Dict:
         line = self.line_combo.currentLayer()
         contour = self.contour_combo.currentLayer()
+        rasters = self._raster_setting()
         return {
             "version": 1,
             "route": {
@@ -1422,11 +1697,14 @@ class SetupPanel(QWidget):
             },
             "seabed": {
                 "source": self.seabed_source.currentData(),
-                "rasters": self.checked_raster_ids(),
+                "rasters": rasters,
+                "raster_sources": [self._raster_source(i) for i in rasters],
                 "contour_layer": contour.id() if contour else None,
                 "contour_field": self.contour_field.currentField(),
                 "interval": self.interval.value(),
                 "filter_m": self.filter_m.value(),
+                "filter_auto": self.filter_auto.isChecked(),
+                "resolve_intervals": self.resolve.value(),
                 "smoothing": self.smoothing.text().strip(),
                 "features": self.features.rows(),
             },
@@ -1489,7 +1767,7 @@ class SetupPanel(QWidget):
             self.kp_to.setText(route.get("kp_to") or "")
             seabed = s.get("seabed", {})
             _set_combo(self.seabed_source, seabed.get("source"))
-            self._refresh_rasters(seabed.get("rasters") or [])
+            self._refresh_rasters(seabed.get("rasters") or [], seabed.get("raster_sources") or [])
             contour = QgsProject.instance().mapLayer(seabed.get("contour_layer") or "")
             if contour is not None:
                 self.contour_combo.setLayer(contour)
@@ -1497,6 +1775,10 @@ class SetupPanel(QWidget):
                 self.contour_field.setField(seabed.get("contour_field") or "")
             self.interval.setValue(int(seabed.get("interval") or 0))
             self.filter_m.setValue(float(seabed.get("filter_m", 2.0)))
+            # Scenarios saved before the auto filter keep their value (results unchanged).
+            self.filter_auto.setChecked(bool(seabed.get("filter_auto", False)))
+            self.resolve.setValue(float(seabed.get("resolve_intervals", RESOLVE_INTERVALS)))
+            self.data_note.setText("")
             self.smoothing.setText(seabed.get("smoothing") or "")
             self.features.set_rows(seabed.get("features") or [])
             cable = s.get("cable", {})
@@ -1577,7 +1859,75 @@ def _form_label(widget: QWidget):
     return layout.labelForField(widget) if isinstance(layout, QFormLayout) else None
 
 
+_FORM_ROLE = getattr(QFormLayout, "ItemRole", QFormLayout)
+_ROLES = (_FORM_ROLE.LabelRole, _FORM_ROLE.FieldRole, _FORM_ROLE.SpanningRole)
+
+
+class _FormRows:
+    """The rows of a form, so a hidden row can leave it.
+
+    Qt 5 keeps the spacing of a form row whose widgets are hidden, so hiding
+    several rows left gaps in the setup pane (QGIS 3). Hidden rows are taken
+    out of the layout and put back in their place when shown. Every row holds
+    widgets (no layouts), so taking a row out never deletes anything.
+    """
+
+    def __init__(self, layout: QFormLayout):
+        self.layout = layout
+        self.rows = []
+        for r in range(layout.rowCount()):
+            parts = []
+            for role in _ROLES:
+                item = layout.itemAt(r, role)
+                parts.append(item.widget() if item is not None else None)
+            self.rows.append(tuple(parts))
+        self.hidden = set()
+
+    def set_visible(self, widget: QWidget, visible: bool) -> bool:
+        index = next((i for i, row in enumerate(self.rows) if any(part is widget for part in row)), None)
+        if index is None:
+            return False
+        if (index not in self.hidden) != bool(visible):
+            if visible:
+                self.hidden.discard(index)
+            else:
+                self.hidden.add(index)
+            self._rebuild()
+        return True
+
+    def _rebuild(self) -> None:
+        layout = self.layout
+        while layout.rowCount():
+            layout.takeRow(0)
+        for index, (label, value, span) in enumerate(self.rows):
+            shown = index not in self.hidden
+            for part in (label, value, span):
+                if part is not None:
+                    part.setVisible(shown)
+            if not shown:
+                continue
+            if span is not None:
+                layout.addRow(span)
+            elif label is not None:
+                layout.addRow(label, value)
+            elif value is not None:
+                layout.addRow(value)
+
+
 def _set_row_visible(widget: QWidget, visible: bool) -> None:
+    """Show or hide a form row (its label too), leaving no gap."""
+    parent = widget.parentWidget()
+    layout = parent.layout() if parent is not None else None
+    if isinstance(layout, QFormLayout):
+        if hasattr(layout, "setRowVisible"):      # Qt 6.4 and later
+            layout.setRowVisible(widget, bool(visible))
+            return
+        rows = getattr(layout, "_span_rows", None)
+        if rows is None:
+            rows = _FormRows(layout)
+            layout._span_rows = rows
+        if rows.set_visible(widget, visible):
+            return
     widget.setVisible(visible)
     label = _form_label(widget)
     if label is not None:

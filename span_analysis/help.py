@@ -15,9 +15,11 @@ For as-laid data, use the Lay Assessment in the Cable Lay Data Explorer. Both to
 DXF profile drawing, or a synthetic seabed. For a DXF, choose the layer that holds the seabed line, what X is
 (chainage from a start KP, or KP in km or m), whether Y is elevation or depth, and the drawing's vertical
 exaggeration. Set a KP window to study part of a long route.</li>
-<li><b>Seabed.</b> Tick the MBES rasters (or choose contours). <i>Sample every: auto</i> samples each grid at its
-cell size. The noise filter (default 2 m) removes sounding noise but keeps crests. Under <i>Additional
-features</i>, add a boulder, a pipeline crossing, a berm or mattress, a depression, or any other shape by KP. For
+<li><b>Seabed.</b> Tick the MBES rasters (or choose contours). The list follows the project's layers;
+<i>Along the route</i> ticks the rasters the route crosses, and a search box appears when there are many.
+Under <i>Sampling and filtering</i>, <i>Sample every: auto</i> samples each grid at its cell size, the noise
+filter (auto by default) removes sounding noise but keeps crests, and <i>Suit the data</i> puts these settings back
+to suit the data (see <i>Seabed data</i> below). Under <i>Additional features</i>, add a boulder, a pipeline crossing, a berm or mattress, a depression, or any other shape by KP. For
 a complex shape such as a rock berm, choose <i>Other (custom shape)</i> and give its points as "offset height"
 pairs from the KP along the route (e.g. <i>-10 0; -5.5 1.5; -2 1.8; 2 1.8; 5.5 1.5; 10 0</i>), or take them from a
 DXF cross-section with <i>Shape from DXF</i>. Every table has <i>Paste</i> (from a spreadsheet), <i>Import</i> and
@@ -26,30 +28,36 @@ DXF cross-section with <i>Shape from DXF</i>. Every table has <i>Paste</i> (from
 type per leg, or a Workbench assembly fitted to the RPL (its cable sections and bodies land at KPs through the
 RPL slack). Workbench labels such as "SA" resolve through the library: a project mapping, then a library name,
 alias or generic type. Where several library types could mean a label, the mapping table in step 3 says so:
-choose the type there. The mapping is saved in the QGIS project and the Lay Assessment uses the same one. Add
-repeaters, joints and branching units by KP: weight in water, rigid length and diameter. Under <i>Protection</i>,
+choose the type there. The mapping is saved in the QGIS project and the Lay Assessment uses the same one. Under
+<i>In-line bodies</i>, add repeaters, joints and branching units by KP: weight in water, rigid length and diameter.
+Under <i>Protection</i>,
 add protection over a KP range (e.g. polymer half-shells or articulated pipe): its added weight in water, outside
 diameter, added EI and its own MBR, from the protection's data sheet.</li>
 <li><b>Friction.</b> One axial coefficient for the route, or soil zones by KP with a table of coefficients for each
 cable type (or body kind) and soil.</li>
 <li><b>Lay control.</b> Bottom tension (kN), bottom slack (% over the seabed), slack over the route (%, as in an
-RPL), or the RPL slack of each leg. Override the value by KP section. Set the lay direction. <i>Find the highest
+RPL), or the RPL slack of each leg. Override the value over KP ranges under <i>By KP section</i>. Set the lay
+direction. <i>Find the highest
 tension within limits</i> opens the Find tension tab.</li>
 <li><b>Run.</b> The first run samples the seabed (in the background). After that, a change to the lay control
-updates the results in about a second: move the slider and see the spans grow or shrink.</li>
-<li><b>Read the results.</b> The status bar shows the worst finding by KP. Spans are filled by level: red,
+updates the results in about a second: move the slider and see the spans grow or shrink. The view stays where
+you zoomed it (a run over other KPs shows the whole profile).</li>
+<li><b>Read the results.</b> The status bar shows the worst finding by KP: hover it for the findings at a KP,
+click it to go to the worst of them. Spans are filled by level: red,
 amber, and light grey where the cable is clear of the seabed but under the reporting limits (not reported).
 Click a finding or a span to zoom the profile and highlight it on the map; click a column heading to sort a
 table. Hover the profile to move a marker along the route on the map; hover or click a body for its details.
 Use <i>Pick KP on map</i> to go from the map to the profile.</li>
-<li><b>Arrange the view.</b> Drag the handles between the rows to share the height. <i>True scale (1:1)</i>
-shows slopes and spans as they are; <i>Sea level</i> adds the water surface; <i>Reverse KP</i> runs KP from right
-to left; <i>Body labels</i> names the bodies. <i>Measure</i> gives two-point lengths, heights and angles,
-snapped to the seabed or the cable, as in the Depth Profile tool.</li>
+<li><b>Arrange the view.</b> Drag the handles between the rows to share the height. <i>Fit</i>, or the
+<i>A</i> at the bottom left of a zoomed plot, shows the whole profile. <i>True scale (1:1)</i> shows slopes and
+spans as they are. <i>Plots</i> shows or hides each plot, the sea level, the previous run, body labels and
+legends, reverses KP (right to left), and restores the <i>Default view</i>. <i>Tooltip</i> turns the tooltip at
+the cursor on or off and chooses what it shows (the line below the plots shows everything). <i>Measure</i> gives
+two-point lengths, heights and angles, snapped to the seabed or the cable, as in the Depth Profile tool.</li>
 <li><b>Look closer.</b> <i>Detail (EI)</i> solves a span or the visible window with bending stiffness: bend radius,
 moment and seabed reaction along the cable. <i>Find tension</i> finds the highest bottom tension that keeps the
-spans within a target (see below); <i>Use for the lay control</i> sets it. <i>Tension sweep</i> lays the cable at a
-range of bottom tensions and plots the span length against tension.</li>
+spans within a target (see below); <i>Use for the lay control</i> sets it. Below it, <i>Spans against tension
+(sweep)</i> lays the cable at a range of bottom tensions and plots the span length against tension.</li>
 <li><b>Save.</b> Scenarios (all settings and the sampled seabed) save in the project's Span Analysis GeoPackage.
 <i>Add to map</i> writes the findings as a line layer. <i>Export</i> writes CSV files, a PNG of the plot, or a DXF
 of the scene: the seabed, the cable, spans by level, supports, bodies, features, sea level, the KP axis and the
@@ -144,12 +152,33 @@ bending length. Use a KP window for local studies.</p>
 Lateral friction holds it only on a turn radius of at least <i>T / (&mu;<sub>lat</sub> w)</i>. The tool lists this
 radius at each RPL alter course (information only).</p>
 
-<h3>Seabed data: what limits the answer</h3>
+<h3>Seabed data: what it can resolve</h3>
+<p>The seabed data matters more than the mechanics: a span is only as real as the seabed under it. The tool works
+out how far apart the data is around each station (the raster's cell, or the spacing of contour crossings, profile
+points or RPL positions) and uses it three ways. Each rule can be changed under <i>Sampling and filtering</i>, and
+<i>Suit the data</i> puts them back.</p>
 <ul>
-<li>The seabed resolution matters more than the mechanics. Coarse grids blunt crests: on a 5 m grid the bend radius
-at a crest can read 3 to 5 times the true value. Contours cut crests to the last contour.</li>
-<li>Sounding noise adds false relief. The noise filter removes it from the seabed the cable rests on; lengths use the
-seabed smoothed over the cable's conformity length 2(EI/w)<sup>1/3</sup>.</li>
+<li><b>Spans the data resolves.</b> A span needs at least three data intervals: two to show a sag between its
+supports, and each support (a crest) is placed only to within half an interval. A shorter span is
+<i>indicative</i>: drawn light blue and listed as information, not red or amber, because it may be longer, shorter
+or absent. Spans at a seabed feature or in-line body you entered are exact and always assessed.</li>
+<li><b>Stretches the data cannot assess.</b> Where three data intervals are longer than your reporting length, the
+data cannot show the shortest spans you report; the stretch is flagged (information), and amber where they are
+longer than the red length too (spans there are not assessed: shorter ones may be missed). The reporting limits are
+your project's criteria and are never changed for the data.</li>
+<li><b>The noise filter (auto).</b> The tool measures the point-to-point variation of the data (a robust standard
+deviation from second differences, which sparse features such as a boulder do not move) and averages just enough
+data intervals that the remaining noise is at most a quarter of the reporting gap, so a noise peak rarely makes a
+reportable span. It never averages more than two data intervals or half the reporting length, so relief at the
+scale of the spans reported is kept. On data coarser than that the variation is relief, not noise, and the cells
+are already averages: no filter. The run states the value used.</li>
+<li><b>Single-point peaks.</b> A point standing well above both neighbours (8 standard deviations) may be a flier in
+the soundings or a small object; the cable can rest on it, with a span either side. The run lists their KPs.
+Nothing is removed (automatic despiking would also remove real boulders): check them in the survey data.</li>
+<li>Coarse grids also blunt crests: on a 5 m grid the bend radius at a crest can read 3 to 5 times the true value.
+Contours cut crests to the last contour.</li>
+<li>Lengths (fill and slack) use the seabed smoothed over the cable's conformity length 2(EI/w)<sup>1/3</sup>, as
+noise adds length.</li>
 <li>Where two rasters meet, a datum step reads as relief.</li>
 <li>The cable will not lie exactly on the RPL. In deep water it can be tens of metres off. A span on the RPL line is a
 likelihood, not a certainty.</li>
