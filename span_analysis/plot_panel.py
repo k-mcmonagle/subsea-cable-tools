@@ -33,11 +33,12 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pyqtgraph as pg
 
-from qgis.PyQt.QtCore import QEvent, QRectF, QSettings, Qt, pyqtSignal
+from qgis.PyQt.QtCore import QT_VERSION_STR, QEvent, QRectF, QSettings, Qt, pyqtSignal
 from qgis.PyQt.QtGui import QPainterPath
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
     QGraphicsPathItem,
+    QGraphicsView,
     QHBoxLayout,
     QLabel,
     QMenu,
@@ -60,6 +61,7 @@ _VERTICAL = getattr(getattr(Qt, "Orientation", Qt), "Vertical")
 _POINTING = getattr(getattr(Qt, "CursorShape", Qt), "PointingHandCursor")
 _NO_MOUSE = getattr(getattr(Qt, "WidgetAttribute", Qt), "WA_TransparentForMouseEvents")
 _RICH = getattr(getattr(Qt, "TextFormat", Qt), "RichText")
+_FULL_UPDATE = getattr(getattr(QGraphicsView, "ViewportUpdateMode", QGraphicsView), "FullViewportUpdate")
 _SETTINGS = "SubseaCableTools/SpanAnalysis/plot"
 STATUS_HEIGHT = 14
 _DEFAULT_SIZES = (STATUS_HEIGHT, 440, 150, 150, 150)
@@ -174,7 +176,15 @@ class DirectAxis(pg.AxisItem):
 
 
 def _plot_widget() -> "pg.PlotWidget":
-    return pg.PlotWidget(axisItems={"left": DirectAxis("left"), "bottom": DirectAxis("bottom")})
+    widget = pg.PlotWidget(axisItems={"left": DirectAxis("left"), "bottom": DirectAxis("bottom")})
+    if not QT_VERSION_STR.startswith("5."):
+        return widget
+    # Under Qt5 with fractional display scaling (e.g. 150 %), repainting only the
+    # changed strip rounds to whole device pixels and can miss the edge of a moved
+    # or hidden line: the hover crosshair left trails until the next pan. Repaint
+    # the whole view instead (as panning does).
+    widget.setViewportUpdateMode(_FULL_UPDATE)
+    return widget
 
 
 def _tip(x, y, data):
