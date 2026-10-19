@@ -160,6 +160,11 @@ class KPMouseMapTool(QgsMapTool):
         self._wgs84_xforms = None
         # (origin, range_m) of the range ring currently drawn.
         self._ring_key = None
+        # Route Comments: called as hook(kind, capture, data) to add a comment
+        # (set by the plugin; None hides the menu entries). A KP range being
+        # picked for a comment is a route_comments.capture.RangePicker.
+        self.comment_hook = None
+        self._comment_range = None
         self.recalculate_geometries()
         self.canvas.destinationCrsChanged.connect(self._on_map_crs_changed)
 
@@ -276,6 +281,7 @@ class KPMouseMapTool(QgsMapTool):
         """
         self._wgs84_crs = self._wgs84_xforms = None
         self._ring_key = None
+        self._cancel_comment_range(quiet=True)  # it holds the old route
         self.recalculate_geometries()
         if self.range_bearing_origin is not None:
             self.range_bearing_origin = None
@@ -350,6 +356,7 @@ class KPMouseMapTool(QgsMapTool):
         if hit is None or self.rubberBand is None or self.closestPointMarker is None:
             return
         closest_point_on_line = hit.snapped_xy
+        range_text = self._comment_range.update(hit.kp_km) if self._comment_range is not None else ""
 
         # Update the rubber band and marker (one redraw, not one per vertex).
         self.rubberBand.setToGeometry(
@@ -390,7 +397,8 @@ class KPMouseMapTool(QgsMapTool):
             if depth_lines:
                 message += "\n" + "\n".join(depth_lines)
 
-        self.iface.mainWindow().statusBar().showMessage(message.replace('\n', ' | '))
+        self.iface.mainWindow().statusBar().showMessage(
+            range_text or message.replace('\n', ' | '))
         
         # Store the message and position for the timers.
         self.last_message = message
@@ -490,6 +498,13 @@ class KPMouseMapTool(QgsMapTool):
         QToolTip.hideText()
 
     def canvasPressEvent(self, event):
+        if self._comment_range is not None:
+            # Picking a comment's KP range: left click ends it, right click cancels.
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._finish_comment_range(self.toMapCoordinates(event.pos()))
+            else:
+                self._cancel_comment_range()
+            return
         window = self.depth_profile_window
         if (window is not None and window.isVisible() and window.frozen
                 and window.pin_check.isChecked() and event.button() == Qt.MouseButton.LeftButton):
@@ -549,8 +564,13 @@ class KPMouseMapTool(QgsMapTool):
             else:
                 act_goto_kp = None
 
+            comment_actions = self._add_comment_menu(menu, click_point)
+
             chosen = qt_exec(menu, QCursor.pos())
             if not chosen:
+                return
+            if chosen in comment_actions:
+                comment_actions[chosen]()
                 return
 
             if chosen == act_place:
@@ -568,6 +588,70 @@ class KPMouseMapTool(QgsMapTool):
                 self._show_go_to_kp_dialog()
             elif act_copy and chosen == act_copy:
                 self._copy_kp_to_clipboard()
+
+    # --- Route Comments ---
+    def _add_comment_menu(self, menu, click_point) -> dict:
+        """Add the *Add Comment* submenu; returns ``{action: callback}``."""
+        if self.comment_hook is None or self._route is None or self.layer is None:
+            return {}
+        hit = self._locate(click_point)
+        if hit is None:
+            return {}
+        menu.addSeparator()
+        sub = menu.addMenu("Add Comment")
+        point_action = sub.addAction(f"At Nearest Route Point (KP {hit.kp_km:.3f})")
+        location_action = sub.addAction("At Cursor Location")
+        range_action = sub.addAction("Over KP Range...")
+        kp_km = float(hit.kp_km)
+        point = QgsPointXY(click_point)
+        return {
+            point_action: lambda: self._send_comment("route_point", {"kp_km": kp_km}),
+            location_action: lambda: self._send_comment("location", {"point": point}),
+            range_action: lambda: self._start_comment_range(kp_km),
+        }
+
+    def _comment_capture(self):
+        from ..route_comments.route_ref import CaptureRoute
+        return CaptureRoute(self.layer, self._route, self.distanceArea,
+                            QgsCoordinateReferenceSystem(self.canvas.mapSettings().destinationCrs()))
+
+    def _send_comment(self, kind: str, data: dict) -> None:
+        hook = self.comment_hook
+        if hook is None:
+            return
+        try:
+            hook(kind, self._comment_capture(), data)
+        except Exception as e:  # noqa: BLE001 - report any failure to the user
+            log_exception("KP Mouse Tool: adding a comment failed")
+            self.iface.messageBar().pushMessage("Route Comments", f"Could not add the comment: {e}",
+                                                level=MESSAGE_CRITICAL, duration=6)
+
+    def _start_comment_range(self, start_kp_km: float) -> None:
+        from ..route_comments.capture import RangePicker
+        self._cancel_comment_range(quiet=True)
+        self._comment_range = RangePicker(self.canvas, self._route, start_kp_km)
+        self.iface.mainWindow().statusBar().showMessage(self._comment_range.status_text())
+
+    def _finish_comment_range(self, map_point) -> None:
+        picker = self._comment_range
+        hit = self._locate(map_point)
+        if hit is not None:
+            picker.update(hit.kp_km)
+        kps = picker.kps()
+        if kps is None:
+            self.iface.mainWindow().statusBar().showMessage(
+                "Move along the route to the end of the range, then click (Esc cancels).", 4000)
+            return
+        self._cancel_comment_range(quiet=True)
+        self._send_comment("kp_range", {"kps": kps})
+
+    def _cancel_comment_range(self, quiet: bool = False) -> None:
+        picker, self._comment_range = getattr(self, "_comment_range", None), None
+        if picker is None:
+            return
+        picker.dispose()
+        if not quiet and self.iface and self.iface.mainWindow():
+            self.iface.mainWindow().statusBar().showMessage("Comment range cancelled.", 2000)
 
     def _show_go_to_kp_dialog(self):
         """Open the Go to KP dialog and pan canvas to the entered KP."""
@@ -1298,6 +1382,7 @@ class KPMouseMapTool(QgsMapTool):
             self.iface.messageBar().pushMessage("Error", msg, level=MESSAGE_CRITICAL, duration=4)
 
     def deactivate(self):
+        self._cancel_comment_range(quiet=True)
         if self.mouse_stop_timer is not None:
             self.mouse_stop_timer.stop()
         if self.persistent_tooltip_timer is not None:
@@ -1333,6 +1418,8 @@ class KPMouseMapTool(QgsMapTool):
                 timer.deleteLater()
             setattr(self, timer_attr, None)
         QToolTip.hideText()
+        self._cancel_comment_range(quiet=True)
+        self.comment_hook = None
         try:
             self.canvas.destinationCrsChanged.disconnect(self._on_map_crs_changed)
         except (TypeError, RuntimeError):  # already disconnected / canvas gone
@@ -1354,7 +1441,9 @@ class KPMouseMapTool(QgsMapTool):
         self.depthSources = []
 
     def keyPressEvent(self, event):  # type: ignore
-        if event.key() == Qt.Key.Key_Escape and self.range_bearing_origin is not None:
+        if event.key() == Qt.Key.Key_Escape and self._comment_range is not None:
+            self._cancel_comment_range()
+        elif event.key() == Qt.Key.Key_Escape and self.range_bearing_origin is not None:
             self.range_bearing_origin = None
             if self.rangeBearingOriginMarker is not None:
                 self.rangeBearingOriginMarker.hide()
@@ -1936,6 +2025,8 @@ class KPMouseTool:
         self.toolButtonMenu = None
         self.actionConfig = None
         self.actionGoToKP = None
+        # Route Comments hook(kind, capture, data); the plugin sets it.
+        self.comment_hook = None
         self.load_settings()
 
     def _safe_layer_id(self, layer) -> Optional[str]:
@@ -2044,6 +2135,7 @@ class KPMouseTool:
         self.actionGoToKP = None
 
         # Clean up references
+        self.comment_hook = None
         self.referenceLayer = None
         self.measurementUnit = None
         self.showReverseKP = None
@@ -2095,6 +2187,7 @@ class KPMouseTool:
                 start_kp_km=self._start_kp_for(layer),
                 showHoverDepth=self.showHoverDepth,
             )
+            self.mapTool.comment_hook = self.comment_hook
             self.iface.mapCanvas().setMapTool(self.mapTool)
         else:
             # Deactivating the tool

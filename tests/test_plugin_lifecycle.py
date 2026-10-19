@@ -353,9 +353,12 @@ def test_full_lifecycle(h: _Harness) -> bool:
         transit_dialog = transit.dialog
         plugin.show_plotter()
         plugin.show_depth_profile()
-        real_docks = [plugin.plotter_dock, plugin.depth_profile_dock]
+        plugin.show_route_comments()
+        real_docks = [plugin.plotter_dock, plugin.depth_profile_dock, plugin.route_comments_dock]
         if any(d is None for d in real_docks):
             problems.append("a real dock did not open")
+        if plugin.kp_mouse_tool.comment_hook != plugin._add_route_comment:
+            problems.append("the KP Mouse Tool has no Route Comments hook")
         fakes = {
             "workbench_dock": _FakeDock("Workbench"),
             "planner_dock": _FakeDock("Planner", fail_shutdown=True),

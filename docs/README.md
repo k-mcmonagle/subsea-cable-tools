@@ -15,6 +15,8 @@ The top-level [README](../README.md) is the short introduction and tool list. Us
 
 - [Lay Assessment](LAY_ASSESSMENT.md) — suspension, loop-risk and tension checks on lay data; the seabed rest model and its validation.
 
+- [Route Comments](ROUTE_COMMENTS.md) — capturing comments from the KP Mouse Tool, route references and their conditions, the register GeoPackage, import and export.
+
 - [Span & Slack Analysis](SPAN_ANALYSIS.md) — planning a lay against spans and loops: the shared cable-on-seabed engine (rest shape, friction and lay history, slack rule, detail model with EI), validation and references.
 
 ## Design records

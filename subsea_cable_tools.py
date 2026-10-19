@@ -60,6 +60,7 @@ class SubseaCableTools:
         ('workbench_dock', ('shutdown',)),
         ('planner_dock', ('shutdown',)),
         ('burial_dock', ('shutdown',)),
+        ('route_comments_dock', ('shutdown',)),
     )
     # Top-level tool windows: shutdown() stops their workers and removes their
     # map graphics; close() is the fallback for a window without one.
@@ -77,7 +78,7 @@ class SubseaCableTools:
         'lay_simulator_action', 'bu_lowering_action', 'span_analysis_action', 'workbench_action',
         'planner_action', 'burial_action', 'transit_measure_action',
         'explorer_action', 'cable_library_action', 'kp_settings_action',
-        'save_layers_gpkg_action',
+        'save_layers_gpkg_action', 'route_comments_action',
     )
 
     def __init__(self, iface):
@@ -109,6 +110,7 @@ class SubseaCableTools:
         self.workbench_dock = None
         self.planner_dock = None
         self.burial_dock = None
+        self.route_comments_dock = None
         self.explorer_window = None
         self.catenary_calculator_v2_dialog = None
         self.lay_simulator_dialog = None
@@ -199,6 +201,8 @@ class SubseaCableTools:
             self.kp_mouse_tool = KPMouseTool(self.iface, menu_name=self.menu)
         # Same (now translated) menu as the plugin's other entries.
         self.kp_mouse_tool.menu_name = self.menu
+        # Its right-click menu adds Route Comments.
+        self.kp_mouse_tool.comment_hook = self._add_route_comment
         self.kp_mouse_tool.initGui()
 
         self.plotter_action = self.add_action(
@@ -251,6 +255,13 @@ class SubseaCableTools:
             tooltip="Plan cable burial: exclusion criteria over route and survey "
                     "data, candidate sections, PLDN/PLUP events, synced "
                     "map/profile/tables.")
+
+        # Spatial comments on routes (captured from the KP Mouse Tool)
+        self.route_comments_action = self.add_action(
+            self._icon('route_comments_icon.svg'), "Route Comments",
+            self.show_route_comments,
+            tooltip="Route Comments: capture, review and export comments on routes "
+                    "(route points, KP ranges, map locations) in a comment register.")
 
         self.transit_measure_action = self.add_action(
             self._icon('transit_measure_icon.png'), "Transit Measure",
@@ -323,6 +334,15 @@ class SubseaCableTools:
         except Exception:
             log_exception("Burial Planner: restoring project layers failed")
 
+    def _comment_start_kp(self, layer):
+        """The start KP the KP Mouse Tool uses for ``layer`` (None: detect)."""
+        tool = self.kp_mouse_tool
+        return tool._start_kp_for(layer) if tool is not None else None
+
+    def _kp_reference_layer(self):
+        tool = self.kp_mouse_tool
+        return tool._get_reference_layer() if tool is not None else None
+
     def _add_experimental_toolbar_menu(self):
         """Add one toolbar dropdown for tools that are still experimental."""
         self.experimental_tool_button = QToolButton(self._main_window())
@@ -346,7 +366,8 @@ class SubseaCableTools:
                 self.explorer_action,
                 self.lay_simulator_action,
                 self.bu_lowering_action,
-                self.span_analysis_action):
+                self.span_analysis_action,
+                self.route_comments_action):
             self.experimental_menu.addAction(action)
         self.experimental_tool_button.setMenu(self.experimental_menu)
         self.experimental_toolbar_action = self.iface.addToolBarWidget(
@@ -668,6 +689,33 @@ class SubseaCableTools:
                 log_exception("Burial Planner: could not restore the saved window layout")
         self.burial_dock.show()
         self.burial_dock.refresh()
+
+    def show_route_comments(self):
+        """Show the Route Comments dock (single instance)."""
+        if not _alive(self.route_comments_dock):
+            try:
+                from .route_comments.dock import RouteCommentsDock
+                self.route_comments_dock = RouteCommentsDock(
+                    self.iface, start_kp_for=self._comment_start_kp,
+                    reference_layer=self._kp_reference_layer)
+            except Exception:
+                self.route_comments_dock = None
+                self._report_open_failure("Route Comments could not be opened.")
+                return None
+            self.iface.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.route_comments_dock)
+            try:
+                self.route_comments_dock.apply_saved_window_mode()
+            except Exception:
+                log_exception("Route Comments: could not restore the saved window layout")
+        self.route_comments_dock.show()
+        self.route_comments_dock.raise_()
+        return self.route_comments_dock
+
+    def _add_route_comment(self, kind, capture, data):
+        """KP Mouse Tool hook: add a comment at a route point, location or KP range."""
+        dock = self.show_route_comments()
+        if dock is not None:
+            dock.add_comment_from_capture(kind, capture, data)
 
     def activate_transit_measure_tool(self):
         if not _alive(self.transit_measure_tool):

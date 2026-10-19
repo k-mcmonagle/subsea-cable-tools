@@ -70,6 +70,7 @@ def test_experimental_actions_share_one_toolbar_dropdown():
             plugin.lay_simulator_action,
             plugin.bu_lowering_action,
             plugin.span_analysis_action,
+            plugin.route_comments_action,
         ]
         assert all(action not in iface.toolbar_icons
                    for action in experimental_actions)
@@ -85,6 +86,7 @@ def test_experimental_actions_share_one_toolbar_dropdown():
             "Cable Lay Simulator (3D)",
             "BU Lowering Tool (3D)",
             "Span && Slack Analysis (beta)",   # "&&" is a literal "&" in Qt menus
+            "Route Comments",
         ]
         menu_actions = [action for _menu, action in iface.plugin_menu_actions]
         assert all(action in menu_actions for action in experimental_actions)

@@ -71,7 +71,7 @@ Find these in the QGIS Processing Toolbox under **Subsea Cable Tools**.
 
 These are in **Plugins ▸ Subsea Cable Tools**. The main toolbar has **KP Mouse Tool**, **KP Plot**, **Depth Profile**, **Catenary Calculator V2** and **Transit Measure**; tools under active development are in its **Experimental** dropdown.
 
-- **KP Mouse Tool** — inspect live route KP and nearby depth on the map.
+- **KP Mouse Tool** — inspect live route KP and nearby depth on the map; right-click to add a route comment.
 - **KP Plot** — plot KP-indexed table values along a route.
 - **Depth Profile** — plot bathymetry and slope along a line.
 - **Catenary Calculator V2** — explore a two-dimensional static cable model.
@@ -81,6 +81,7 @@ These are in **Plugins ▸ Subsea Cable Tools**. The main toolbar has **KP Mouse
 - **Burial Planner** — develop burial plans from routes and survey data.
 - **Cable Lay Data Explorer** — inspect and analyse imported lay records; its *Lay Assessment* tab lists KP ranges of possible suspensions, loop risk and tension-limit exceedances, with a seabed profile of where the cable rests ([method](docs/LAY_ASSESSMENT.md)).
 - **Span & Slack Analysis (beta)** — rest a cable on the seabed along a route, vary the bottom tension or slack, and see spans, loop risk, residual tension and friction effects, with a bending-stiffness detail model and a tension sweep ([method](docs/SPAN_ANALYSIS.md)).
+- **Route Comments** — capture, search and export spatial comments on routes (route points, KP ranges, map locations) in a shared GeoPackage register, with replies, images and custom fields ([guide](docs/ROUTE_COMMENTS.md)).
 - **Cable Type Library** — keep your cable and rope types (weights, NPTS / NOTS / NTTS / CBL, MBR) in a GeoPackage of your own.
 - **Cable Lay Simulator (3D)** — explore cable-lay and deployment scenarios.
 - **BU Lowering Tool (3D)** — explore branching-unit lowering scenarios.
