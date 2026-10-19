@@ -881,11 +881,155 @@ def test_setup_rows_leave_no_gaps() -> List[bool]:
     return out
 
 
+def test_sections_open_full_height() -> List[bool]:
+    """A section opened inside a form whose rows were hidden and shown gets its full height.
+
+    Under Qt 5 the rebuilt form kept a section's closed height, so In-line
+    bodies, Protection and the Seabed subsections opened as a thin sliver.
+    """
+    from ..span_analysis.setup_panel import CABLE_FIT, CABLE_LIBRARY, Section
+
+    out = []
+    dialog = _make_dialog()
+    try:
+        dialog.resize(1500, 950)
+        dialog.show()
+        setup = dialog.setup
+        setup.apply_settings(_synthetic_settings())
+        for cable in (CABLE_FIT, CABLE_LIBRARY):   # hides and shows rows of the cable form
+            setup.cable_source.setCurrentIndex(setup.cable_source.findData(cable))
+            QCoreApplication.processEvents()
+        squashed = []
+        for section in setup.findChildren(Section):
+            if not section.button.isChecked():
+                section.button.click()
+            QCoreApplication.processEvents()
+        for _ in range(5):
+            QCoreApplication.processEvents()
+        for section in setup.findChildren(Section):
+            need = section.minimumSizeHint().height()
+            if section.isVisible() and section.height() < need - 2:
+                squashed.append(f"{section.title.strip()} {section.height()} of {need} px")
+        out.append(_report("every section opens at its full height", not squashed, "; ".join(squashed)))
+    finally:
+        dialog.hide()
+        dialog.shutdown()
+        dialog.deleteLater()
+    return out
+
+
+class _Drag:
+    """A pyqtgraph mouse drag (right button) for ViewBox.mouseDragEvent, in view-box coordinates."""
+
+    def __init__(self, start: QPointF, last: QPointF, pos: QPointF, first: bool):
+        self._start, self._last, self._pos, self._first = start, last, pos, first
+
+    def accept(self):
+        pass
+
+    def isStart(self):
+        return self._first
+
+    def isFinish(self):
+        return False
+
+    def button(self):
+        return Qt.MouseButton.RightButton
+
+    def pos(self):
+        return self._pos
+
+    def lastPos(self):
+        return self._last
+
+    def screenPos(self):
+        return self._pos
+
+    def lastScreenPos(self):
+        return self._last
+
+    def buttonDownPos(self, *_args):
+        return self._start
+
+
+def test_true_scale_stays_true() -> List[bool]:
+    """True scale holds through pan, zoom, Fit and redraws; a right-button stretch ends it; restored ticked, it locks."""
+    from ..span_analysis import plot_panel
+
+    out = []
+    dialog = _make_dialog()
+    try:
+        dialog.resize(1500, 950)
+        dialog.show()
+        dialog.load_example(_example("Sand waves"))
+        _wait(lambda: dialog._task is None, 120.0)
+        plot, setup = dialog.plot, dialog.setup
+        vb = plot.depth_plot.vb
+
+        def ratio() -> float:
+            for _ in range(3):
+                QCoreApplication.processEvents()
+            sx, sy = vb.viewPixelSize()      # km and m per pixel
+            return sx * plot_panel.TRUE_SCALE_RATIO / sy
+
+        plot.true_scale_check.setChecked(True)
+        ratios = {"ticked": ratio()}
+        vb.translateBy(x=0.2)
+        ratios["pan"] = ratio()
+        vb.scaleBy(x=0.5, y=1.0)              # the wheel on the KP axis
+        ratios["zoom KP"] = ratio()
+        vb.scaleBy(x=1.0, y=2.0)              # the wheel on the depth axis
+        ratios["zoom depth"] = ratio()
+        plot.fit()
+        ratios["Fit"] = ratio()
+        plot.zoom_to(1.0, 1.1)
+        ratios["zoom to a span"] = ratio()
+        plot.reverse_check.setChecked(True)
+        ratios["reverse KP"] = ratio()
+        plot.reverse_check.setChecked(False)
+        plot.row_checks["tension"].setChecked(False)
+        ratios["a row hidden"] = ratio()
+        plot.row_checks["tension"].setChecked(True)
+        setup.value.setValue(setup.value.value() + 0.5)   # a live re-run keeps the view
+        _wait(lambda: dialog._task is None, 60.0)
+        ratios["re-run"] = ratio()
+        off = {k: round(v, 3) for k, v in ratios.items() if abs(v - 1.0) > 0.02}
+        out.append(_report("true scale stays 1:1 through pan, zoom, Fit, Reverse KP, rows and a re-run",
+                           not off and plot.true_scale_check.isChecked(), f"off scale: {off}" if off else ""))
+
+        before = [list(r) for r in vb.viewRange()]
+        centre = vb.boundingRect().center()
+        vb.mouseDragEvent(_Drag(centre, centre, centre, True))
+        kept = all(abs(a - b) < 1e-9 for ra, rb in zip(before, vb.viewRange()) for a, b in zip(ra, rb))
+        unticked = not plot.true_scale_check.isChecked() and not vb.state["aspectLocked"]
+        vb.mouseDragEvent(_Drag(centre, centre, centre + QPointF(40.0, 0.0), False))   # stretch KP only
+        stretched = abs(ratio() - 1.0) > 0.05
+        out.append(_report("a right-button drag unticks true scale, keeps the view and stretches freely",
+                           unticked and kept and stretched, f"ratio after stretch {ratio():.2f}"))
+    finally:
+        dialog.hide()
+        dialog.shutdown()
+        dialog.deleteLater()
+
+    setting = plot_panel._setting
+    plot_panel._setting = lambda key, default: True if key == "true_scale" else setting(key, default)
+    try:
+        fresh = plot_panel.ProfilePlot()
+        fresh.persist = False
+        out.append(_report("true scale restored ticked from the last session also locks the axes",
+                           fresh.true_scale_check.isChecked() and bool(fresh.depth_plot.vb.state["aspectLocked"])))
+        fresh.deleteLater()
+    finally:
+        plot_panel._setting = setting
+    return out
+
+
 def run_all() -> List[bool]:
     results = (test_synthetic_run_live_detail_sweep() + test_raster_route_and_store() + test_ui_tools()
                + test_tables_and_dxf_route() + test_protection_and_find_tension() + test_kp_consistency()
                + test_rpl_cable_mapping() + test_follows_project() + test_plot_and_layout_controls()
                + test_live_update_keeps_the_seabed_still() + test_setup_rows_leave_no_gaps()
+               + test_sections_open_full_height() + test_true_scale_stays_true()
                + test_data_resolution_in_the_window())
     print(f"\n{sum(results)}/{len(results)} Span & Slack Analysis QGIS checks passed.")
     return results

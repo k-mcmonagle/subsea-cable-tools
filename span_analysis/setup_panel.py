@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+from qgis.PyQt import sip
 from qgis.PyQt.QtCore import Qt, pyqtSignal
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
@@ -1870,6 +1871,11 @@ class _FormRows:
     several rows left gaps in the setup pane (QGIS 3). Hidden rows are taken
     out of the layout and put back in their place when shown. Every row holds
     widgets (no layouts), so taking a row out never deletes anything.
+
+    The layout items taken out are deleted (not the widgets): a widget stays
+    tied to its first layout item while that item lives, and only that item
+    hears the widget's size change. A section opened in a rebuilt form then
+    kept its closed height, squashed into a sliver.
     """
 
     def __init__(self, layout: QFormLayout):
@@ -1898,7 +1904,10 @@ class _FormRows:
     def _rebuild(self) -> None:
         layout = self.layout
         while layout.rowCount():
-            layout.takeRow(0)
+            taken = layout.takeRow(0)
+            for item in (taken.labelItem, taken.fieldItem):
+                if item is not None:
+                    sip.delete(item)
         for index, (label, value, span) in enumerate(self.rows):
             shown = index not in self.hidden
             for part in (label, value, span):

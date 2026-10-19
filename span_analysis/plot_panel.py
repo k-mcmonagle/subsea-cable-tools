@@ -61,6 +61,7 @@ _VERTICAL = getattr(getattr(Qt, "Orientation", Qt), "Vertical")
 _POINTING = getattr(getattr(Qt, "CursorShape", Qt), "PointingHandCursor")
 _NO_MOUSE = getattr(getattr(Qt, "WidgetAttribute", Qt), "WA_TransparentForMouseEvents")
 _RICH = getattr(getattr(Qt, "TextFormat", Qt), "RichText")
+_RIGHT_BUTTON = getattr(getattr(Qt, "MouseButton", Qt), "RightButton")
 _FULL_UPDATE = getattr(getattr(QGraphicsView, "ViewportUpdateMode", QGraphicsView), "FullViewportUpdate")
 _SETTINGS = "SubseaCableTools/SpanAnalysis/plot"
 STATUS_HEIGHT = 14
@@ -175,8 +176,43 @@ class DirectAxis(pg.AxisItem):
             p.restore()
 
 
+class WrapLabel(QLabel):
+    """A word-wrapped label that keeps the height its wrapped text needs.
+
+    Layouts give a wrapping label one line's height as its minimum, so in a
+    smaller window a legend wrapped to two lines pushed its plot down and the
+    row cut the bottom of the plot off (the profile ran out of view).
+    """
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self.setWordWrap(True)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        super().resizeEvent(event)
+        need = self.heightForWidth(self.width())
+        if need > 0 and need != self.minimumHeight():
+            self.setMinimumHeight(need)
+
+
+class ProfileViewBox(pg.ViewBox):
+    """A view box that says when a right-button drag starts.
+
+    A right-button drag (in the plot or on an axis) stretches the axes
+    independently; the profile uses it to leave true scale.
+    """
+
+    stretchStarted = pyqtSignal()
+
+    def mouseDragEvent(self, ev, axis=None):  # noqa: N802 (Qt API)
+        if ev.isStart() and ev.button() == _RIGHT_BUTTON:
+            self.stretchStarted.emit()
+        super().mouseDragEvent(ev, axis)
+
+
 def _plot_widget() -> "pg.PlotWidget":
-    widget = pg.PlotWidget(axisItems={"left": DirectAxis("left"), "bottom": DirectAxis("bottom")})
+    widget = pg.PlotWidget(viewBox=ProfileViewBox(),
+                           axisItems={"left": DirectAxis("left"), "bottom": DirectAxis("bottom")})
     if not QT_VERSION_STR.startswith("5."):
         return widget
     # Under Qt5 with fractional display scaling (e.g. 150 %), repainting only the
@@ -222,10 +258,17 @@ class StayOpenMenu(QMenu):
         super().mouseReleaseEvent(event)
 
 
-def _menu_button(text: str, tip: str, menu: QMenu) -> QToolButton:
+def menu_button(text: str, tip: str, menu: QMenu) -> QToolButton:
+    """A button that opens ``menu`` on a click."""
     button = QToolButton()
+    if QT_VERSION_STR.startswith("5."):
+        # Qt5's Windows style draws the menu arrow over the end of the text
+        # ("Plots" read as "Plots,"): put a text arrow after it instead.
+        button.setStyleSheet("QToolButton::menu-indicator { image: none; width: 0px; }")
+        text += " ▾"
     button.setText(text)
-    button.setToolTip(tip)
+    if tip:
+        button.setToolTip(tip)
     button.setPopupMode(TOOLBUTTON_POPUP_MODE_INSTANT)
     button.setMenu(menu)
     return button
@@ -242,6 +285,7 @@ class ProfilePlot(QWidget):
         super().__init__(parent)
         self.persist = True
         self._holding_view = False      # a redraw that keeps the view (no re-fit)
+        self._stretching = False        # true scale ended by a right-button drag (keep the view)
         self._result: Optional[pl.PlanningResult] = None
         self._previous: Optional[pl.PlanningResult] = None
         self._body_labels: List[pg.TextItem] = []
@@ -255,7 +299,9 @@ class ProfilePlot(QWidget):
         bar.addWidget(fit)
         self.true_scale_check = QCheckBox("True scale (1:1)")
         self.true_scale_check.setToolTip("Lock the depth and KP axes to the same scale (1 km along the route = "
-                                         "1000 m of depth), so slopes and spans show as they really are.")
+                                         "1000 m of depth), so slopes and spans show as they really are. Panning "
+                                         "and zooming keep it; stretching an axis with a right-button drag turns "
+                                         "it off.")
         self.true_scale_check.setChecked(_setting("true_scale", False))
         self.true_scale_check.toggled.connect(lambda on: self._remember("true_scale", on))
         bar.addWidget(self.true_scale_check)
@@ -283,7 +329,7 @@ class ProfilePlot(QWidget):
         plots.addSeparator()
         plots.addAction("Default view", self.default_view).setToolTip("Every plot at its default height, and the "
                                                                       "whole profile.")
-        bar.addWidget(_menu_button("Plots", "Show or hide each plot, and what the profile shows.", plots))
+        bar.addWidget(menu_button("Plots", "Show or hide each plot, and what the profile shows.", plots))
 
         tips = StayOpenMenu(self)
         tips.setToolTipsVisible(True)
@@ -298,7 +344,7 @@ class ProfilePlot(QWidget):
             action.setChecked(key in chosen)
             action.toggled.connect(self._remember_tip_fields)
             self.tip_fields[key] = action
-        bar.addWidget(_menu_button("Tooltip", "Turn the tooltip at the cursor on or off, and choose what it shows.",
+        bar.addWidget(menu_button("Tooltip", "Turn the tooltip at the cursor on or off, and choose what it shows.",
                                    tips))
         bar.addSpacing(12)
 
@@ -334,8 +380,7 @@ class ProfilePlot(QWidget):
             row_layout.setSpacing(0)
             if key != "status":
                 # The legend sits above the plot: it never hides data or overlaps its own text.
-                caption = QLabel(_legend_html(_LEGENDS[key]))
-                caption.setWordWrap(True)
+                caption = WrapLabel(_legend_html(_LEGENDS[key]))
                 caption.setStyleSheet("QLabel { background: white; color: #333; font-size: 8pt; "
                                       "padding: 1px 4px 0px 68px; }")
                 row_layout.addWidget(caption)
@@ -350,7 +395,7 @@ class ProfilePlot(QWidget):
         self.slope_plot = self.widgets["slope"].getPlotItem()
         self.rows["status"].setFixedHeight(STATUS_HEIGHT)
         self.widgets["status"].viewport().setCursor(_POINTING)
-        self.widgets["depth"].setMinimumHeight(120)
+        self.widgets["depth"].setMinimumHeight(100)
         for key in ("tension", "slack", "slope"):
             self.widgets[key].setMinimumHeight(60)
         for index, stretch in enumerate((0, 5, 2, 2, 2)):
@@ -390,7 +435,7 @@ class ProfilePlot(QWidget):
         self.depth_plot.setLabel("left", "Depth (m)", **small)
         self.tension_plot.setLabel("left", "T (kN)", **small)
         self.slack_plot.setLabel("left", "Slack (%)", **small)
-        self.slope_plot.setLabel("left", "Angle (°)", **small)
+        self.slope_plot.setLabel("left", "θ (°)", **small)
         for plot in (self.status_plot,) + self._data_plots[1:]:
             plot.setXLink(self.depth_plot)
 
@@ -477,8 +522,7 @@ class ProfilePlot(QWidget):
             plot.addItem(line, ignoreBounds=True)
             self._vlines.append(line)
 
-        self.readout = QLabel("Run the analysis to see the cable on the seabed.")
-        self.readout.setWordWrap(True)
+        self.readout = WrapLabel("Run the analysis to see the cable on the seabed.")
         self.readout.setTextInteractionFlags(getattr(getattr(Qt, "TextInteractionFlag", Qt), "TextSelectableByMouse"))
         layout.addWidget(self.readout)
         layout.addWidget(self.measure.table)
@@ -502,6 +546,7 @@ class ProfilePlot(QWidget):
         self.tip.hide()
         self.tip_check.toggled.connect(lambda on: on or self.tip.hide())
         self.true_scale_check.toggled.connect(self._apply_true_scale)
+        self.depth_plot.vb.stretchStarted.connect(self._leave_true_scale)
         self.sea_check.toggled.connect(self._update_sea)
         self.reverse_check.toggled.connect(self._apply_reverse)
         self.labels_check.toggled.connect(self._update_body_labels)
@@ -509,6 +554,10 @@ class ProfilePlot(QWidget):
         self._update_legends()
         self._update_rows()
         self._apply_reverse(self.reverse_check.isChecked())
+        if self.true_scale_check.isChecked():
+            # Restored ticked from the last session: lock the axes too (the box was
+            # ticked over a plot that was not to scale).
+            self._apply_true_scale(True)
 
     # -- settings --------------------------------------------------------------
     def _toggle(self, menu: QMenu, text: str, tip: str, key: Optional[str], default: bool):
@@ -868,10 +917,29 @@ class ProfilePlot(QWidget):
             vb.setAspectLocked(True, ratio=TRUE_SCALE_RATIO)
             self._fit_true_scale()
         else:
+            view = vb.viewRange()
             vb.setAspectLocked(False)
-            vb.enableAutoRange(y=True)
             vb.setAutoVisible(y=True)
+            if self._stretching:
+                # The user is stretching an axis: keep the view under the mouse (unlocked,
+                # pyqtgraph would go back to the range asked for before the lock adjusted it).
+                vb.setRange(xRange=view[0], yRange=view[1], padding=0)
+                return
+            vb.enableAutoRange(y=True)
             self.fit()
+
+    def _leave_true_scale(self) -> None:
+        """A right-button drag stretches the axes apart: true scale ends, the view stays.
+
+        Pan, the wheel, a zoom box and Fit keep the locked 1:1 scale.
+        """
+        if not self.true_scale_check.isChecked():
+            return
+        self._stretching = True
+        try:
+            self.true_scale_check.setChecked(False)
+        finally:
+            self._stretching = False
 
     def _fit_true_scale(self) -> None:
         r = self._result

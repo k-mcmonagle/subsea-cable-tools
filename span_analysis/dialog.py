@@ -44,7 +44,6 @@ from qgis.PyQt.QtWidgets import (
     QSplitter,
     QTabWidget,
     QTextBrowser,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -68,7 +67,6 @@ from ..qgis_compat import (
     DIALOG_ACCEPTED,
     MESSAGEBOX_NO,
     MESSAGEBOX_YES,
-    TOOLBUTTON_POPUP_MODE_INSTANT,
     WINDOW_HINT_CLOSE,
     WINDOW_HINT_MIN_MAX,
     WINDOW_TYPE_WINDOW,
@@ -77,7 +75,7 @@ from ..qgis_compat import (
 from . import dxf_io, sources, store as span_store
 from .help import HELP_HTML
 from .map_link import KpPickTool, MapLink
-from .plot_panel import ProfilePlot
+from .plot_panel import ProfilePlot, menu_button
 from .examples import EXAMPLES, example_settings
 from .results_panel import ResultsPanel, summary_html
 from .setup_panel import CABLE_FIT, CABLE_RPL, CABLE_SECTIONS, SetupPanel
@@ -235,17 +233,13 @@ class SpanAnalysisDialog(QDialog):
                                    "GeoPackage and add it to the project.")
         self.map_button.clicked.connect(self.add_to_map)
         actions.addWidget(self.map_button)
-        export = QToolButton()
-        export.setText("Export")
-        export.setPopupMode(TOOLBUTTON_POPUP_MODE_INSTANT)
-        menu = QMenu(export)
+        menu = QMenu(self)
         menu.addAction("Findings (CSV)…", lambda: self.export_csv("findings"))
         menu.addAction("Spans (CSV)…", lambda: self.export_csv("spans"))
         menu.addAction("Profile by station (CSV)…", lambda: self.export_csv("profile"))
         menu.addAction("Plot image (PNG)…", self.export_png)
         menu.addAction("Scene and results (DXF)…", self.export_dxf)
-        export.setMenu(menu)
-        actions.addWidget(export)
+        actions.addWidget(menu_button("Export", "", menu))
         actions.addStretch(1)
         right_layout.addLayout(actions)
         self.vsplit = QSplitter(_VERTICAL)
@@ -308,10 +302,7 @@ class SpanAnalysisDialog(QDialog):
         self.save_button.setToolTip("Save the settings (and the sampled seabed) to this scenario.")
         self.save_button.clicked.connect(self.save_scenario)
         bar.addWidget(self.save_button)
-        more = QToolButton()
-        more.setText("…")
-        more.setPopupMode(TOOLBUTTON_POPUP_MODE_INSTANT)
-        menu = QMenu(more)
+        menu = QMenu(self)
         menu.addAction("New scenario", self.new_scenario)
         menu.addAction("Save as a new scenario…", lambda: self.save_scenario(as_new=True))
         menu.addAction("Rename scenario…", self.rename_scenario)
@@ -320,19 +311,14 @@ class SpanAnalysisDialog(QDialog):
         menu.addAction("Open another Span Analysis file…", self.open_store_file)
         menu.addAction("Start a new Span Analysis file…", self.new_store_file)
         menu.addAction("Show the file in its folder", self.show_store_folder)
-        more.setMenu(menu)
-        bar.addWidget(more)
-        examples = QToolButton()
-        examples.setText("Examples")
-        examples.setToolTip("Load a synthetic example, including a verification case with a closed-form answer.")
-        examples.setPopupMode(TOOLBUTTON_POPUP_MODE_INSTANT)
-        examples_menu = QMenu(examples)
+        bar.addWidget(menu_button("…", "", menu))
+        examples_menu = QMenu(self)
         for index, (title, tip, _builder) in enumerate(EXAMPLES):
             action = examples_menu.addAction(title, lambda i=index: self.load_example(i))
             action.setToolTip(tip)
         examples_menu.setToolTipsVisible(True)
-        examples.setMenu(examples_menu)
-        bar.addWidget(examples)
+        bar.addWidget(menu_button("Examples", "Load a synthetic example, including a verification case with a "
+                                  "closed-form answer.", examples_menu))
         return bar
 
     def load_example(self, index: int) -> None:

@@ -10,15 +10,17 @@ from typing import List, Optional, Sequence
 import numpy as np
 import pyqtgraph as pg
 
-from qgis.PyQt.QtCore import Qt, pyqtSignal
+from qgis.PyQt.QtCore import QTimer, Qt, pyqtSignal
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QTableWidget,
@@ -30,7 +32,7 @@ from qgis.PyQt.QtWidgets import (
 )
 
 from ..cable_seabed import planning as pl
-from .plot_panel import DirectAxis
+from .plot_panel import DirectAxis, WrapLabel
 from .setup_panel import Section
 from ..cable_seabed.core import ERROR, INFO, WARNING
 from ..qgis_compat import (
@@ -42,6 +44,7 @@ from ..qgis_compat import (
 _USER_ROLE = getattr(getattr(Qt, "ItemDataRole", Qt), "UserRole")
 _HORIZONTAL = getattr(getattr(Qt, "Orientation", Qt), "Horizontal")
 _DASH = getattr(getattr(Qt, "PenStyle", Qt), "DashLine")
+FRAME_NO_FRAME = getattr(getattr(QFrame, "Shape", QFrame), "NoFrame")
 SEVERITY_TEXT = {ERROR: "Red", WARNING: "Amber", INFO: "Info"}
 SEVERITY_COLOUR = {ERROR: "#d32f2f", WARNING: "#ff9800", INFO: "#1f77b4"}
 FINDING_HEADERS = ["Level", "Check", "KP from", "KP to", "Length (m)", "Value", "Message"]
@@ -154,6 +157,18 @@ def _fill(table: QTableWidget, rows: List[List], payloads: Optional[List] = None
     table.setSortingEnabled(True)
     if 0 <= column < table.columnCount():
         table.sortItems(column, order)
+
+
+class _FitLayout(QVBoxLayout):
+    """A page layout that fits a scroll area's height, scrolling only below its minimum.
+
+    A scroll area sizes a page that reports height-for-width (wrapped labels)
+    to its preferred height, so the page always scrolled and the stretch went
+    to the wrong row. Wrapped labels keep their height as :class:`WrapLabel`.
+    """
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802 (Qt API)
+        return False
 
 
 class ResultsPanel(QTabWidget):
@@ -421,12 +436,11 @@ class ResultsPanel(QTabWidget):
     # -- find tension --------------------------------------------------------------------------
     def _build_find(self) -> None:
         page = QWidget()
-        layout = QVBoxLayout(page)
+        layout = _FitLayout(page)
         layout.setContentsMargins(2, 2, 2, 2)
-        intro = QLabel("The highest bottom tension that keeps the spans within a target. Spans shorten as the "
-                       "tension falls, so this is a ceiling: lay at or below it. Each tension is solved in full "
-                       "(friction, slopes, bodies and protection).")
-        intro.setWordWrap(True)
+        intro = WrapLabel("The highest bottom tension that keeps the spans within a target. Spans shorten as the "
+                          "tension falls, so this is a ceiling: lay at or below it. Each tension is solved in full "
+                          "(friction, slopes, bodies and protection).")
         layout.addWidget(intro)
         row = QHBoxLayout()
         self.find_target = QComboBox()
@@ -444,11 +458,15 @@ class ResultsPanel(QTabWidget):
         self.find_contact = QCheckBox("support reaction within the contact limit")
         self.find_contact.setChecked(True)
         self.find_contact.setToolTip("Uses the contact limit in Reporting limits (when it is set).")
-        for label, widget in (("Target", self.find_target), (None, self.find_gap), (None, self.find_length),
-                              (None, self.find_mbr), (None, self.find_contact)):
+        for label, widget in (("Target", self.find_target), (None, self.find_gap), (None, self.find_length)):
             if label:
                 row.addWidget(QLabel(label))
             row.addWidget(widget)
+        row.addStretch(1)
+        layout.addLayout(row)
+        row = QHBoxLayout()    # a row of their own: beside the target they made the tab scroll sideways
+        row.addWidget(self.find_mbr)
+        row.addWidget(self.find_contact)
         row.addStretch(1)
         layout.addLayout(row)
         row = QHBoxLayout()
@@ -477,8 +495,8 @@ class ResultsPanel(QTabWidget):
         self.find_table = _table(FIND_HEADERS)
         self.find_table.setMinimumHeight(80)
         layout.addWidget(self.find_table, 1)
-        self.find_note = QLabel("")
-        self.find_note.setWordWrap(True)
+        self.find_note = WrapLabel("")
+        self.find_note.setVisible(False)
         layout.addWidget(self.find_note)
         self.find_target.currentIndexChanged.connect(self._on_find_target)
         self._found: List[pl.TensionAnswer] = []
@@ -489,8 +507,19 @@ class ResultsPanel(QTabWidget):
         layout.addWidget(self.sweep_section)
         self.sweep_section.button.toggled.connect(
             lambda on: layout.setStretchFactor(self.sweep_section, 2 if on else 0))
-        self.find_page = page
-        self.addTab(page, "Find tension")
+        self.sweep_section.button.toggled.connect(self._show_opened_sweep)
+        # The search, its table and the open sweep need more height than the results often have: scroll
+        # rather than squeeze them (the sweep's plots and note overlapped).
+        self.find_page = QScrollArea()
+        self.find_page.setWidgetResizable(True)
+        self.find_page.setFrameShape(FRAME_NO_FRAME)
+        self.find_page.setWidget(page)
+        self.addTab(self.find_page, "Find tension")
+
+    def _show_opened_sweep(self, on: bool) -> None:
+        """Scroll an opened sweep into view (below the search when the results are short)."""
+        if on:
+            QTimer.singleShot(0, lambda: self.find_page.ensureWidgetVisible(self.sweep_section.body, 0, 0))
 
     def _on_find_target(self, *_args) -> None:
         custom = self.find_target.currentData() == "custom"
@@ -543,6 +572,7 @@ class ResultsPanel(QTabWidget):
                          "(last column), laid at near-zero tension. The floor of the tension window comes from "
                          "the loop and slope checks (Findings), not from spans.")
         self.find_note.setText(" ".join(notes))
+        self.find_note.setVisible(bool(notes))
 
     def _use_found(self) -> None:
         answers = [a for a in self._found if a.tension_kn > 0]
@@ -597,8 +627,8 @@ class ResultsPanel(QTabWidget):
         self.s_length.hideAxis("bottom")
         for plot in (self.s_length, self.s_gap):
             plot.setLogMode(x=True)
-        self.s_length.setLabel("left", "Span length (m)")
-        self.s_gap.setLabel("left", "Max gap (m)")
+        self.s_length.setLabel("left", "Length (m)")   # short: the label must fit the plot's height
+        self.s_gap.setLabel("left", "Gap (m)")
         self.s_gap.setLabel("bottom", "Bottom tension (kN)")
         sym = {"symbol": "o", "symbolSize": 6}
         self.s_total = self.s_length.plot([], [], antialias=True, pen=pg.mkPen((25, 70, 160), width=1.5), name="Total",
@@ -612,11 +642,11 @@ class ResultsPanel(QTabWidget):
         split.addWidget(self.sweep_table)
         split.setSizes([550, 450])
         layout.addWidget(split, 1)
-        self.sweep_note = QLabel("With a uniform cable, a constant tension and no friction, spans only grow as the "
-                                 "tension rises (Binda & Contro 1979). Slopes, friction and bodies can bend that.")
-        self.sweep_note.setWordWrap(True)
+        self.sweep_note = WrapLabel("With a uniform cable, a constant tension and no friction, spans only grow as "
+                                    "the tension rises (Binda & Contro 1979). Slopes, friction and bodies can bend "
+                                    "that.")
         layout.addWidget(self.sweep_note)
-        split.setMinimumHeight(180)
+        split.setMinimumHeight(220)
         return page
 
     def _request_sweep(self) -> None:
