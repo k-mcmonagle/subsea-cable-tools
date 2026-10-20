@@ -18,7 +18,11 @@ style through two project variables (``@route_comments_closed``,
 
 Labels come in two tiers (:class:`LabelSettings`): the comment number at
 middle scales, and the fields the user picks (or any expression) when
-zoomed in further. Full text is never shown at small scales.
+zoomed in further. Full text is never shown at small scales. By default a
+label is a tag set a few millimetres off the comment with a leader line
+back to it (a range is anchored at the middle of its part in view); QGIS
+picks the free side, so tags stay clear of the comments and of each other,
+and comments needing attention win over closed ones where space is short.
 
 Overlapping or clustered comments stay reachable: :class:`CommentPickTool`
 lists every comment under the cursor, and selecting features on these
@@ -33,11 +37,13 @@ import os
 from dataclasses import asdict, dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-from qgis.core import (Qgis, QgsCategorizedSymbolRenderer, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
-                       QgsExpressionContextUtils, QgsFeatureRequest, QgsGeometry, QgsLineSymbol, QgsMarkerSymbol,
-                       QgsPalLayerSettings, QgsPointClusterRenderer, QgsPointXY, QgsProject, QgsRectangle,
-                       QgsRendererCategory, QgsRuleBasedLabeling, QgsSimpleLineSymbolLayer, QgsTextBackgroundSettings,
-                       QgsTextBufferSettings, QgsTextFormat, QgsUnitTypes, QgsVectorLayer)
+from qgis.core import (Qgis, QgsCallout, QgsCategorizedSymbolRenderer, QgsCoordinateReferenceSystem,
+                       QgsCoordinateTransform, QgsExpressionContextUtils, QgsFeatureRequest, QgsGeometry,
+                       QgsLineSymbol, QgsMarkerLineSymbolLayer, QgsMarkerSymbol, QgsPalLayerSettings,
+                       QgsPointClusterRenderer, QgsPointXY, QgsProject, QgsProperty, QgsRectangle,
+                       QgsRendererCategory, QgsRuleBasedLabeling, QgsSimpleLineCallout, QgsSimpleLineSymbolLayer,
+                       QgsTextBackgroundSettings, QgsTextBufferSettings, QgsTextFormat, QgsUnitTypes,
+                       QgsVectorLayer)
 from qgis.gui import QgsMapTool, QgsRubberBand
 from qgis.PyQt.QtCore import QSettings, QSizeF, pyqtSignal
 from qgis.PyQt.QtGui import QColor, QCursor, QFont
@@ -79,11 +85,10 @@ def _render_mm():
         return QgsUnitTypes.RenderMillimeters
 
 
-def _horizontal_placement():
-    try:
-        return Qgis.LabelPlacement.Horizontal
-    except AttributeError:  # QGIS < 3.26
-        return QgsPalLayerSettings.Horizontal
+def _scoped(parent, scope: str, name: str):
+    """``parent.scope.name`` (QGIS 4, scoped enums) or ``parent.name`` (QGIS 3)."""
+    holder = getattr(parent, scope, None)
+    return getattr(holder, name) if holder is not None and hasattr(holder, name) else getattr(parent, name)
 
 
 def highlight_color() -> QColor:
@@ -134,11 +139,40 @@ LABEL_PARTS = [  # key, menu text, expression
     ("comment", "Comment (shortened)", None),
 ]
 SEPARATORS = {"dot": " · ", "space": " ", "newline": "\\n"}
+STYLE_LEADER, STYLE_TAG = "leader", "tag"
+STYLES = {STYLE_LEADER: "Leader line to the comment", STYLE_TAG: "Tag beside the comment"}
+# Where a range's label points: the middle of the part of the range in view,
+# kept off the map edges when it can be (else the middle of the whole range,
+# also used where there is no map, e.g. a preview).
+_MIDDLE = "line_interpolate_point($geometry, length($geometry) / 2)"
+_INNER_VIEW = "buffer(@map_extent, -0.12 * min(bounds_width(@map_extent), bounds_height(@map_extent)))"
+RANGE_ANCHOR = (
+    f"CASE WHEN @map_extent IS NULL OR @map_crs IS NULL THEN {_MIDDLE} ELSE "
+    f"with_variable('rc_in', intersection($geometry, transform({_INNER_VIEW}, @map_crs, @layer_crs)), "
+    "with_variable('rc_part', if(is_empty_or_null(@rc_in), "
+    "intersection($geometry, transform(@map_extent, @map_crs, @layer_crs)), @rc_in), "
+    f"if(is_empty_or_null(@rc_part), {_MIDDLE}, line_interpolate_point(@rc_part, length(@rc_part) / 2)))) END")
+
+# The sides a range's tag tries first: across the range, by its direction
+# (degrees from north, on the map) where the label points.
+_MAP_GEOMETRY = "transform($geometry, @layer_crs, @map_crs)"
+_DEFAULT_POSITIONS = "'TR,TL,BR,BL,R,L,T,B'"
+RANGE_POSITIONS = (
+    f"CASE WHEN @map_crs IS NULL THEN {_DEFAULT_POSITIONS} ELSE "
+    f"with_variable('rc_g', {_MAP_GEOMETRY}, with_variable('rc_dir', "
+    f"line_interpolate_angle(@rc_g, line_locate_point(@rc_g, transform({RANGE_ANCHOR}, @layer_crs, @map_crs))) % 180, "
+    f"CASE WHEN @rc_dir IS NULL THEN {_DEFAULT_POSITIONS} "
+    "WHEN @rc_dir < 22.5 OR @rc_dir >= 157.5 THEN 'R,L,TR,BL,TL,BR' "
+    "WHEN @rc_dir < 67.5 THEN 'TL,BR,T,B,L,R' "
+    "WHEN @rc_dir < 112.5 THEN 'T,B,TL,BR,TR,BL' "
+    "ELSE 'TR,BL,T,B,R,L' END)) END")
+LEADER_COLOR = "70,70,70"
+TEXT_COLOR, CLOSED_TEXT_COLOR = "35,35,35", "125,125,125"
 
 
 @dataclass
 class LabelSettings:
-    """What the comment labels show, and from which scale."""
+    """What the comment labels show, from which scale, and how they look."""
     numbers: bool = True                 # the number tier (middle scales)
     number_scale: int = 100000           # numbers shown when zoomed in beyond 1:number_scale
     detail_scale: int = 20000            # details shown when zoomed in beyond 1:detail_scale
@@ -146,8 +180,10 @@ class LabelSettings:
     separator: str = "space"
     comment_chars: int = 40
     custom: str = ""                     # an expression used instead of ``parts``
-    size: float = 7.5
+    size: float = 8.0
     background: bool = True              # a white tag behind the text (else a halo)
+    style: str = STYLE_LEADER            # leader line to the comment, or a tag beside it
+    leader_mm: float = 8.0               # how far a leader sets the tag off the comment
 
     @classmethod
     def from_json(cls, text: str) -> "LabelSettings":
@@ -184,25 +220,80 @@ class LabelSettings:
         return f"array_to_string(array_filter(array({joined}), @element IS NOT NULL), '{sep}')"
 
 
-def _pal(expression: str, settings: LabelSettings, line: bool) -> QgsPalLayerSettings:
+def _around_point():
+    try:
+        return Qgis.LabelPlacement.OrderedPositionsAroundPoint
+    except AttributeError:  # QGIS < 3.26
+        return QgsPalLayerSettings.OrderedPositionsAroundPoint
+
+
+def _set_position_order(pal: QgsPalLayerSettings) -> None:
+    """Prefer the tag up and to the right, then the other diagonals, then the sides."""
+    names = ["TopRight", "TopLeft", "BottomRight", "BottomLeft", "MiddleRight", "MiddleLeft", "TopMiddle",
+             "BottomMiddle"]
+    try:
+        order = [getattr(Qgis.LabelPredefinedPointPosition, n) for n in names]
+    except AttributeError:  # QGIS < 3.26
+        order = [getattr(QgsPalLayerSettings, n) for n in names]
+    if hasattr(pal, "pointSettings"):
+        pal.pointSettings().setPredefinedPositionOrder(order)
+    else:  # QGIS < 3.38
+        pal.predefinedPositionOrder = order
+
+
+def _leader(line: bool) -> QgsSimpleLineCallout:
+    """A thin leader from the tag to the comment: to the edge of a point's
+    marker, or to a dot on a range."""
+    callout = QgsSimpleLineCallout()
+    symbol = QgsLineSymbol.createSimple({"line_color": LEADER_COLOR, "line_width": "0.3", "capstyle": "round"})
+    if line:
+        dot = QgsMarkerLineSymbolLayer.create({"placement": "lastvertex"})
+        dot.setSubSymbol(QgsMarkerSymbol.createSimple({"name": "circle", "size": "1.3", "color": LEADER_COLOR,
+                                                       "outline_color": "255,255,255", "outline_width": "0.2"}))
+        symbol.appendSymbolLayer(dot)
+    else:
+        callout.setOffsetFromAnchor(1.9)    # stop at the marker's edge
+    callout.setLineSymbol(symbol)
+    callout.setAnchorPoint(_scoped(QgsCallout, "AnchorPoint", "PointOnExterior"))
+    callout.setLabelAnchorPoint(_scoped(QgsCallout, "LabelAnchorPoint", "LabelPointOnExterior"))
+    callout.setEnabled(True)
+    return callout
+
+
+def _state_properties(pal: QgsPalLayerSettings, line: bool) -> None:
+    """Comments needing attention win where space is short; closed ones are
+    grey; a range's tag goes across the range rather than along it."""
+    props = pal.dataDefinedProperties()
+    if line:
+        props.setProperty(_scoped(QgsPalLayerSettings, "Property", "PredefinedPositionOrder"),
+                          QgsProperty.fromExpression(RANGE_POSITIONS))
+    state = f"({STATE_EXPRESSION})"
+    props.setProperty(_scoped(QgsPalLayerSettings, "Property", "Priority"), QgsProperty.fromExpression(
+        f"CASE WHEN {state} = '{STATE_ATTENTION}' THEN 9 WHEN {state} = '{STATE_CLOSED}' THEN 2 ELSE 6 END"))
+    props.setProperty(_scoped(QgsPalLayerSettings, "Property", "Color"), QgsProperty.fromExpression(
+        f"CASE WHEN {state} = '{STATE_CLOSED}' THEN '{CLOSED_TEXT_COLOR}' ELSE '{TEXT_COLOR}' END"))
+    pal.setDataDefinedProperties(props)
+
+
+def _pal(expression: str, settings: LabelSettings, line: bool, bold: bool = True) -> QgsPalLayerSettings:
     pal = QgsPalLayerSettings()
     pal.isExpression = True
     pal.fieldName = expression
     pal.enabled = True
     fmt = QgsTextFormat()
     font = QFont()
-    font.setBold(True)
+    font.setBold(bold)
     fmt.setFont(font)
     fmt.setSize(float(settings.size))
-    fmt.setColor(QColor(45, 45, 45))
+    fmt.setColor(QColor(*[int(v) for v in TEXT_COLOR.split(",")]))
     if settings.background:
         back = QgsTextBackgroundSettings()
         back.setEnabled(True)
-        back.setSize(QSizeF(1.0, 0.5))
-        back.setRadii(QSizeF(0.6, 0.6))
-        back.setFillColor(QColor(255, 255, 255, 225))
-        back.setStrokeColor(QColor(150, 150, 150))
-        back.setStrokeWidth(0.15)
+        back.setSize(QSizeF(1.2, 0.6))
+        back.setRadii(QSizeF(0.5, 0.5))
+        back.setFillColor(QColor(255, 255, 255, 235))
+        back.setStrokeColor(QColor(*[int(v) for v in LEADER_COLOR.split(",")]))
+        back.setStrokeWidth(0.2)
         fmt.setBackground(back)
     else:
         buffer = QgsTextBufferSettings()
@@ -211,13 +302,27 @@ def _pal(expression: str, settings: LabelSettings, line: bool) -> QgsPalLayerSet
         buffer.setColor(QColor(255, 255, 255))
         fmt.setBuffer(buffer)
     pal.setFormat(fmt)
-    pal.dist = 1.2
     try:
-        pal.autoWrapLength = 48
-    except AttributeError:  # very old QGIS
-        pass
-    if line:
-        pal.placement = _horizontal_placement()
+        pal.autoWrapLength = 32
+        pal.multilineAlign = Qgis.LabelMultiLineAlignment.Left
+    except AttributeError:  # QGIS < 3.26
+        pal.multilineAlign = QgsPalLayerSettings.MultiLeft
+    if line:   # label a range from a point on it, like a point comment
+        pal.geometryGeneratorEnabled = True
+        pal.geometryGenerator = RANGE_ANCHOR
+        pal.geometryGeneratorType = GEOMETRY_POINT
+    pal.placement = _around_point()
+    _set_position_order(pal)
+    if settings.style == STYLE_TAG:
+        pal.dist = 2.0
+    else:
+        pal.dist = max(1.0, float(settings.leader_mm))
+        pal.setCallout(_leader(line))
+    thinning = pal.thinningSettings()
+    if hasattr(thinning, "setLabelMarginDistance"):   # QGIS 3.42+: tags don't touch
+        thinning.setLabelMarginDistance(1.5)
+        thinning.setLabelMarginDistanceUnit(_render_mm())
+    _state_properties(pal, line)
     return pal
 
 
@@ -228,8 +333,8 @@ def build_labeling(settings: LabelSettings, line: bool) -> QgsRuleBasedLabeling:
     if settings.numbers and int(settings.number_scale) > detail:
         root.appendChild(QgsRuleBasedLabeling.Rule(_pal(LABEL_PARTS[0][2], settings, line), detail,
                                                    int(settings.number_scale), "", "Number"))
-    root.appendChild(QgsRuleBasedLabeling.Rule(_pal(settings.detail_expression(), settings, line), 0, detail, "",
-                                               "Details"))
+    root.appendChild(QgsRuleBasedLabeling.Rule(_pal(settings.detail_expression(), settings, line, bold=False), 0,
+                                               detail, "", "Details"))
     return QgsRuleBasedLabeling(root)
 
 
@@ -328,7 +433,7 @@ class CommentLayers:
         repoint, refilter and reload the existing ones (style untouched)."""
         _set_variable(self.project, VAR_CLOSED, _id_list(sorted(closed)))
         _set_variable(self.project, VAR_ATTENTION, _id_list(sorted(attention)))
-        out = []
+        out, created = [], []
         for kind in ("points", "ranges"):
             name = f"{TITLES[kind]} — {set_name}" if set_name else TITLES[kind]
             layer = self.find(kind)
@@ -344,6 +449,7 @@ class CommentLayers:
                 self.project.addMapLayer(layer, False)
                 self._group().insertLayer(0 if kind == "points" else 1, layer)
                 self.project.writeEntry(PROJECT_SCOPE, PROJECT_KEY_LAYER + kind, layer.id())
+                created.append(layer)
             else:
                 path = layer.source().split("|", 1)[0]
                 if not layer.isValid() or not _same_file(path, register_path):
@@ -359,6 +465,12 @@ class CommentLayers:
                 layer.triggerRepaint()
             layer.setReadOnly(True)
             out.append(layer)
+        # Opening the second layer on the register breaks the first one's own
+        # reader until it is reopened (GDAL "unable to open database file": no
+        # feature count, no extent, so Zoom to Layer does nothing).
+        for layer in created[:-1]:
+            layer.reload()
+            layer.updateExtents()
         return out
 
     def set_labels(self, on: bool) -> None:
@@ -480,12 +592,16 @@ def _circle_icon():
 
 
 class Highlight:
-    """Outline of the selected comments: a colour band with a white casing,
-    so it stands out over route lines and the layer's own symbols."""
+    """Outline of the selected comments in a colour with a white casing, so
+    it stands out over route lines and the layer's own symbols: a ring round
+    a point, a band along a range with a ring at each end."""
+
+    POINT_RING, END_RING = 18, 13
 
     def __init__(self, canvas):
         self.canvas = canvas
         self.bands: List[QgsRubberBand] = []
+        self._shown = 0
 
     def show(self, wkts: Sequence[str]) -> None:
         self.clear()
@@ -493,24 +609,37 @@ class Highlight:
         color = highlight_color()
         for wkt in wkts:
             geom = QgsGeometry.fromWkt(wkt or "")
-            if geom is None or geom.isNull():
+            if geom is None or geom.isNull() or geom.isEmpty():
                 continue
-            point = geom.type() == GEOMETRY_POINT
-            for casing in (True, False):
-                band = QgsRubberBand(self.canvas, GEOMETRY_POINT if point else GEOMETRY_LINE)
-                band.setColor(QColor(255, 255, 255, 230) if casing else color)
-                band.setWidth(7 if casing else 3)
-                if point:
-                    band.setIcon(_circle_icon())
-                    band.setIconSize(18)
-                    band.setFillColor(QColor(0, 0, 0, 0))
-                band.setToGeometry(geom, crs)
-                self.bands.append(band)
+            if geom.type() == GEOMETRY_POINT:
+                self._add(geom, crs, color, self.POINT_RING)
+            else:
+                self._add(geom, crs, color)
+                parts = geom.asMultiPolyline() if geom.isMultipart() else [geom.asPolyline()]
+                vertices = [p for part in parts for p in part]
+                if vertices:
+                    for end in (vertices[0], vertices[-1]):
+                        self._add(QgsGeometry.fromPointXY(end), crs, color, self.END_RING)
+            self._shown += 1
+
+    def _add(self, geom: QgsGeometry, crs, color: QColor, ring: int = 0) -> None:
+        """A casing band and a colour band: rings (``ring`` px) for points, lines otherwise."""
+        for casing in (True, False):
+            band = QgsRubberBand(self.canvas, GEOMETRY_POINT if ring else GEOMETRY_LINE)
+            band.setColor(QColor(255, 255, 255, 230) if casing else color)
+            band.setWidth(7 if casing else 3)
+            if ring:
+                band.setIcon(_circle_icon())
+                band.setIconSize(ring)
+                band.setFillColor(QColor(0, 0, 0, 0))
+            band.setToGeometry(geom, crs)
+            self.bands.append(band)
 
     def wkts_shown(self) -> int:
-        return len(self.bands) // 2
+        return self._shown
 
     def clear(self) -> None:
         for band in self.bands:
             remove_canvas_item(band)
         self.bands = []
+        self._shown = 0

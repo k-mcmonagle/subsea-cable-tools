@@ -849,6 +849,28 @@ class LabelDialog(QDialog):
         grid.addWidget(self.custom, row_index + 3, 0, 1, 2)
         layout.addWidget(box)
 
+        from .map_layers import STYLE_LEADER, STYLES
+        shape = QHBoxLayout()
+        self.style = QComboBox()
+        for key, text in STYLES.items():
+            self.style.addItem(text, key)
+        self.style.setCurrentIndex(max(0, self.style.findData(settings.style)))
+        self.leader = QDoubleSpinBox()
+        self.leader.setRange(2.0, 30.0)
+        self.leader.setSingleStep(1.0)
+        self.leader.setDecimals(1)
+        self.leader.setValue(float(settings.leader_mm))
+        self.leader.setSuffix(" mm")
+        self.leader.setToolTip("How far the tag sits from the comment; QGIS picks the side with room")
+        self.style.currentIndexChanged.connect(
+            lambda _i: self.leader.setEnabled(self.style.currentData() == STYLE_LEADER))
+        self.leader.setEnabled(self.style.currentData() == STYLE_LEADER)
+        shape.addWidget(QLabel("Style"))
+        shape.addWidget(self.style, 1)
+        shape.addWidget(QLabel("Leader"))
+        shape.addWidget(self.leader)
+        layout.addLayout(shape)
+
         look = QHBoxLayout()
         self.size = QDoubleSpinBox()
         self.size.setRange(5.0, 20.0)
@@ -904,7 +926,8 @@ class LabelDialog(QDialog):
             parts=[k for k, check in self.parts.items() if check.isChecked()],
             separator=self.separator.currentData(), comment_chars=self.chars.value(),
             custom=self.custom.expression() if custom and self.use_custom.isChecked() else "",
-            size=self.size.value(), background=self.background.isChecked())
+            size=self.size.value(), background=self.background.isChecked(),
+            style=self.style.currentData(), leader_mm=self.leader.value())
 
     def result_settings(self):
         return self._settings()

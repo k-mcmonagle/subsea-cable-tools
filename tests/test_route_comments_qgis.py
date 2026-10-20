@@ -340,8 +340,7 @@ def test_reference_conditions(folder):
 
 
 def _n(layer):
-    """Features in ``layer``, counted by reading them (QGIS's cached count of the
-    first of two filtered layers sharing one GeoPackage can come back -1)."""
+    """Features in ``layer``, counted by reading them (not QGIS's cached count)."""
     return sum(1 for _f in layer.getFeatures())
 
 
@@ -381,6 +380,9 @@ def test_dense_map_layers(folder):
         checks["two layers on the register"] = len(shown) == 2 and points.providerType() == "ogr" and \
             points.source().startswith(store.path) and points.readOnly()
         checks["filtered to the set"] = _n(points) == 300 and _n(ranges) == 1
+        # The first layer opened on a register used to lose its own reader when the second opened.
+        checks["count and extent of both layers"] = points.featureCount() == 300 and ranges.featureCount() == 1 \
+            and not points.extent().isNull() and not ranges.extent().isNull()
         checks["fast"] = elapsed < 3.0
         checks["clustered"] = isinstance(points.renderer(), QgsPointClusterRenderer)
         by_id = {f["comment_id"]: f for f in points.getFeatures()}
@@ -420,6 +422,8 @@ def test_dense_map_layers(folder):
         feature = next(ranges.getFeatures())
         from qgis.core import QgsExpression, QgsExpressionContext, QgsExpressionContextUtils
         context = QgsExpressionContext(QgsExpressionContextUtils.globalProjectLayerScopes(ranges))
+        checks["label expressions parse"] = not any(QgsExpression(e).hasParserError() for e in (
+            map_layers.RANGE_ANCHOR, map_layers.RANGE_POSITIONS, settings.detail_expression()))
         context.setFeature(feature)
         text = QgsExpression(settings.detail_expression()).evaluate(context)
         checks["label text"] = text == f"#{feature['ref_no']} · KP 1.000–2.000 · Closed · A range"
@@ -429,11 +433,44 @@ def test_dense_map_layers(folder):
         custom = map_layers.LabelSettings(custom="upper(\"status\")")
         checks["custom expression"] = QgsExpression(custom.detail_expression()).evaluate(context) == "CLOSED"
 
+        # Leader labels (the default): a callout on both tiers; a range is labelled from a
+        # point on its part in view, with the tag across the range.
+        tiers = [r.settings() for r in ranges.labeling().rootRule().children()]
+        checks["leader labels"] = map_layers.label_settings_of(ranges).style == map_layers.STYLE_LEADER and all(
+            s.callout() is not None and s.callout().enabled() and s.geometryGeneratorEnabled for s in tiers)
+        no_map = QgsExpression(map_layers.RANGE_ANCHOR).evaluate(context)   # e.g. a preview: the middle
+        checks["range anchor without a map"] = isinstance(no_map, QgsGeometry) and not no_map.isNull() and \
+            QgsExpression(map_layers.RANGE_POSITIONS).evaluate(context) == "TR,TL,BR,BL,R,L,T,B"
+        from qgis.core import QgsMapSettings
+        from qgis.PyQt.QtCore import QSize
+        view = QgsMapSettings()
+        view.setOutputSize(QSize(800, 600))
+        view.setDestinationCrs(QgsCoordinateReferenceSystem("EPSG:32631"))
+        to_map = QgsCoordinateTransform(QgsCoordinateReferenceSystem(WGS84), view.destinationCrs(),
+                                        QgsProject.instance())
+        view.setExtent(to_map.transformBoundingBox(QgsRectangle(3.012, 55.0, 3.03, 55.01)))   # east half
+        context.appendScope(QgsExpressionContextUtils.mapSettingsScope(view))
+        anchor = QgsExpression(map_layers.RANGE_ANCHOR).evaluate(context)
+        order = QgsExpression(map_layers.RANGE_POSITIONS).evaluate(context)
+        checks["range anchor in view, on the range"] = isinstance(anchor, QgsGeometry) and \
+            anchor.asPoint().x() > 3.012 and anchor.distance(feature.geometry()) < 1e-7
+        # The range runs ENE: its first choice must not be along it (top right / bottom left).
+        checks["range tag across the range"] = str(order).split(",")[0] not in ("TR", "BL")
+        if not (checks["range anchor in view, on the range"] and checks["range tag across the range"]):
+            print("  anchor:", anchor, "order:", order)
+        tag = map_layers.LabelSettings(style=map_layers.STYLE_TAG)
+        map_layers.apply_labels(layers.layers(), tag)
+        checks["tag style: no leader"] = map_layers.label_settings_of(points).style == map_layers.STYLE_TAG and \
+            all(r.settings().callout() is None or not r.settings().callout().enabled()
+                for r in points.labeling().rootRule().children())
+
         highlight = map_layers.Highlight(iface.canvas)
         highlight.show(["POINT(3.03 55.03)", "LINESTRING(3.0 55.0, 3.02 55.005)"])
         bands = list(highlight.bands)
+        shown = highlight.wkts_shown()
         highlight.clear()
-        checks["highlight with casing"] = len(bands) == 4 and all(b.scene() is None for b in bands)
+        checks["highlight: ring, band and range end rings"] = len(bands) == 8 and shown == 2 and \
+            all(b.scene() is None for b in bands)
     finally:
         layers.remove()
         store.close()
