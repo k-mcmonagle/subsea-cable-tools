@@ -6,7 +6,7 @@ map canvas, Plugins toolbar, plugin menus, dock area), so the checks see what
 QGIS would see: toolbar/menu entries, the layer-tree action, the processing
 provider, projectRead hooks, the active map tool, the translator, and the
 QObjects the plugin parents to the main window. Heavy tools (Workbench,
-Planner, Burial Planner, lay simulator dialogs) are stood in for by small
+Planner, Burial Planner, tool windows) are stood in for by small
 fakes that record the teardown calls unload() makes.
 
 Also covers the package bootstrap (vendored lib/ must not shadow host
@@ -368,8 +368,8 @@ def test_full_lifecycle(h: _Harness) -> bool:
             iface.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
             setattr(plugin, attr, dock)
         windows = {
-            "lay_simulator_dialog": _FakeToolWindow(iface.window),
-            "bu_lowering_dialog": _FakeLegacyWindow(iface.window),
+            "span_analysis_dialog": _FakeToolWindow(iface.window),
+            "cable_library_dialog": _FakeLegacyWindow(iface.window),
         }
         for attr, window in windows.items():
             window.show()

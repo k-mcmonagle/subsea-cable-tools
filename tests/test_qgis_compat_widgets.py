@@ -8,8 +8,6 @@ from qgis.PyQt.QtWidgets import QApplication
 from qgis.core import QgsProject
 from qgis.gui import QgsMapCanvas
 
-from ..catenary.v3.ui.bu_lowering_dialog import BULoweringDialog
-from ..catenary.v3.ui.dialog import LaySimulatorDialog
 from ..burial.tabs.attribute_widgets import AttributeRulesTable
 from ..burial.tabs.inputs_tab import InputsTab
 from ..burial.tabs.risk_tab import CheckEditorDialog
@@ -263,36 +261,6 @@ def test_burial_profile_true_scale_toggle():
     widget.deleteLater()
 
 
-def test_lay_simulator_tables_construct():
-    dialog = LaySimulatorDialog()
-    try:
-        assert dialog.windowTitle()
-    finally:
-        dialog._save_settings = lambda: None     # don't write user settings
-        dialog.close()
-        dialog.deleteLater()
-
-
-def test_bu_lowering_tool_constructs_and_builds_config():
-    dialog = BULoweringDialog()
-    try:
-        assert dialog.windowTitle()
-        # Own settings scope — never the main simulator's.
-        assert dialog.settings.applicationName() == "BULoweringTool"
-        cfg = dialog.build_config("quick")
-        assert cfg.mode == "operation"
-        assert cfg.scenario == "bu_deployment"
-        assert cfg.op["quality"] == "quick"
-        assert "integration" in cfg.op and cfg.op["integration"]["trunk"]["items"]
-        assert cfg.current_layers == []          # no drag inputs in this tool
-        assert cfg.chute_radius_m == float(dialog.sheave_radius.value())
-        assert dialog.build_config("full").op["quality"] == "full"
-    finally:
-        dialog._save_settings = lambda: None     # don't write user settings
-        dialog.close()
-        dialog.deleteLater()
-
-
 def test_cable_lay_explorer_panels_construct():
     class _Iface:
         def __init__(self):
@@ -350,8 +318,6 @@ def run_all():
             test_workbench_rule_layer_filters_construct,
             test_burial_attribute_rule_editors_round_trip,
             test_burial_profile_true_scale_toggle,
-            test_lay_simulator_tables_construct,
-            test_bu_lowering_tool_constructs_and_builds_config,
             test_cable_lay_explorer_panels_construct,
             test_workbench_cable_type_dialog_constructs,
             test_workbench_compare_panel_constructs):

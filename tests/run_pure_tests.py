@@ -11,8 +11,8 @@ import needs QGIS are reported as QGIS-only and left to
 state its category explicitly with ``REQUIRES_QGIS = True`` / ``False``;
 with ``False`` a QGIS-dependent import is a failure rather than a skip.
 
---fast skips the slow "lay" group (lay simulator test_v3_* and the catenary
-solvers); use it for changes outside catenary/ and the lay-simulator tools.
+--fast skips the slow "lay" group (the catenary solvers); use it for changes
+outside catenary/.
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ def _parse_args(argv):
     parser = argparse.ArgumentParser(description="Run the QGIS-free test suites.")
     parser.add_argument("modules", nargs="*", help="modules to run (default: every tests/test_*.py)")
     parser.add_argument("--fast", action="store_true",
-                        help="skip the slow 'lay' group (lay simulator test_v3_*, catenary solvers)")
+                        help="skip the slow 'lay' group (catenary solvers)")
     parser.add_argument("--skip", action="append", default=[], choices=harness.GROUPS, metavar="GROUP",
                         help="skip a group: core or lay (repeatable)")
     parser.add_argument("--only", action="append", default=[], choices=harness.GROUPS, metavar="GROUP",

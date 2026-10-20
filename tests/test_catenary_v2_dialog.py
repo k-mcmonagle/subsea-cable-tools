@@ -316,6 +316,104 @@ def test_shutdown_stops_timers_and_is_idempotent():
         shutil.rmtree(folder, ignore_errors=True)
 
 
+def _steady_tab(dlg, **over):
+    """The dialog's Steady Lay tab with known inputs (no current)."""
+    tab = dlg.steady_lay_tab
+    values = dict(w_water=1.5, w_air=0.0, diameter=40.0, cd_normal=1.2, cd_tangential=0.01,
+                  depth=1000.0, speed=4.0, bottom_tension=0.0, chute_height=5.0, rho_water=1025.0)
+    values.update(over)
+    tab.cable_type.setCurrentIndex(0)
+    tab.current_box.setChecked(False)
+    for name, value in values.items():
+        getattr(tab, name).setValue(value)
+    return tab
+
+
+def test_steady_lay_tab_solves_like_the_engine():
+    dlg = _make_dialog()
+    assert dlg.main_tabs.tabText(0) == "Catenary"
+    assert dlg.main_tabs.tabText(1) == "Steady Lay (beta)"
+    tab = _steady_tab(dlg, chute_height=0.0)
+    tab.solve()
+    res = tab._result
+    assert res is not None, "steady-lay solve failed"
+    # A slack lay runs straight at Zajac's critical angle up to the waterline.
+    assert abs(res.exit_angle_deg - res.critical_angle_deg) < 0.2, (
+        res.exit_angle_deg, res.critical_angle_deg)
+    text = tab.results.toPlainText()
+    assert f"{res.exit_angle_deg:.1f}°" in text and "Critical angle" in text, text
+    assert "slack lay" in text, text
+    # Above the waterline there is no drag: the cable sags towards the chute,
+    # so the angle there is steeper than at the waterline.
+    tab.chute_height.setValue(5.0)
+    tab.solve()
+    assert tab._result.exit_angle_deg > res.exit_angle_deg + 0.5, (
+        tab._result.exit_angle_deg, res.exit_angle_deg)
+    assert "Cable angle at the waterline" in tab.results.toPlainText()
+    # The sweep does not depend on the ship speed: reused when only it changes.
+    sweep = tab._sweep
+    assert sweep is not None and len(sweep.speed_mps) == tab._SWEEP_POINTS
+    tab.speed.setValue(5.0)
+    tab.solve()
+    assert tab._sweep is sweep, "a speed edit within the plotted range re-ran the sweep"
+    tab.depth.setValue(900.0)
+    tab.solve()
+    assert tab._sweep is not sweep, "the sweep was not re-run for a new depth"
+    # Bottom tension lifts the top tension by about T0 (Zajac's w*h theorem).
+    t_slack = tab._result.top_tension_N
+    tab.bottom_tension.setValue(5.0)
+    tab.solve()
+    lift = tab._result.top_tension_N - t_slack
+    assert abs(lift - 5000.0) < 250.0, lift
+    assert "Smallest bend radius" in tab.results.toPlainText(), tab.results.toPlainText()
+
+
+def test_steady_lay_current_sets_the_touchdown_downstream():
+    dlg = _make_dialog()
+    tab = _steady_tab(dlg, bottom_tension=2.0)
+    tab.current_box.setChecked(True)
+    tab.current_speed.setValue(1.0)
+    tab.current_depth.setValue(0.0)
+    tab.current_dir.setValue(90.0)          # towards starboard
+    tab.solve()
+    assert "to starboard of the ship's track" in tab.results.toPlainText()
+    tab.current_dir.setValue(270.0)         # towards port
+    tab.solve()
+    assert "to port of the ship's track" in tab.results.toPlainText()
+
+
+def test_steady_lay_reports_a_buoyant_cable():
+    dlg = _make_dialog()
+    tab = _steady_tab(dlg, w_water=0.0)
+    tab.solve()
+    assert tab._result is None
+    assert "must be positive" in tab.results.toPlainText()
+
+
+def test_steady_lay_settings_round_trip():
+    import shutil
+    import tempfile
+
+    from qgis.PyQt.QtCore import QSettings
+
+    folder = tempfile.mkdtemp(prefix="sct_v2_settings_")
+    try:
+        ini = getattr(QSettings, "Format", QSettings).IniFormat
+        settings = QSettings(f"{folder}/steady.ini", ini)
+        first = _steady_tab(_make_dialog(), depth=2500.0, speed=6.5, bottom_tension=3.0)
+        first.current_box.setChecked(True)
+        first.current_dir.setValue(45.0)
+        first.save_settings(settings)
+        second = _make_dialog().steady_lay_tab
+        second.restore_settings(settings)
+        assert second.depth.value() == 2500.0 and second.speed.value() == 6.5
+        assert second.bottom_tension.value() == 3.0 and second.current_dir.value() == 45.0
+        assert second.current_box.isChecked()
+        settings.sync()
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 def run_all() -> List[str]:
     if QApplication.instance() is None:
         print("[SKIP] dialog tests need a GUI-enabled QApplication")
@@ -331,6 +429,10 @@ def run_all() -> List[str]:
         test_bending_toggle_controls_drape_EI_and_reporting,
         test_non_numeric_cells_are_reported_not_dropped_silently,
         test_shutdown_stops_timers_and_is_idempotent,
+        test_steady_lay_tab_solves_like_the_engine,
+        test_steady_lay_current_sets_the_touchdown_downstream,
+        test_steady_lay_reports_a_buoyant_cable,
+        test_steady_lay_settings_round_trip,
     ]
     for test in tests:
         try:

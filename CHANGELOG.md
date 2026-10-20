@@ -75,6 +75,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Cable Route Workbench — Compare RPLs ▸ Events:** pair the events of any two RPLs side by side (e.g. design vs as-laid repeaters, joints or transitions). Names that differ by a typo or extra text are matched automatically, pairs worth checking are highlighted, and any pair can be changed from a dropdown; corrections are saved with the project.
 - **Cable Route Workbench — Compare RPLs ▸ Events:** filter by event type or text, set a target radius and read along-track, cross-course, radial and KP offsets with a live radial plot; export CSV, add offset lines to the map, or save an HTML report with summary statistics, a radial plot of all events, offsets along the route and one radial plot per event. *Compare with…* on an RPL opens the comparison in its own window, and either side can be any RPL in the project.
 
+- **Catenary Calculator V2 — Steady Lay (beta - check outputs):** a new tab gives the cable angle at the chute and waterline, layback, tensions and suspended length while laying a uniform cable at a steady ship speed, with drag from the ship's speed and any current (and the touchdown offset it causes), plus a plot of cable angle against ship speed and Zajac's closed-form checks. Weights and diameter can be filled from the Cable Type Library.
+
 ### Changed
 
 - **Cable Lay Data Explorer — Lay Assessment:** a span's length now runs from lift-off to touchdown, as in Span & Slack Analysis, not only over the part higher than the reporting gap. Spans read longer than before, more reach the 5 m reporting and 50 m red lengths, and the highest tension for spans within limits can be lower. *Span ends where the gap is under* (default 0, the exact touchdown) can count the cable as touching within a small gap, and the span support markers now sit where each span meets the seabed (they could sit far along the flat seabed).
@@ -117,6 +119,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Removed
 
 - **Depth Profile:** the *Interpolate Between Contours* option, which had no effect (exact crossings are always used).
+- **Cable Lay Simulator (3D) and BU Lowering Tool (3D):** removed from the Experimental menu. They worked in a local frame rather than on your routes, and their slack and residual-tension results were not reliable; a focused BU / final-splice deployment tool will replace them. Steady lay moves to the Catenary Calculator V2.
 
 ### Fixed
 
@@ -153,7 +156,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Identify RPL Crossing Points / Identify RPL Area Listing:** no longer crash when an intersection mixes points and lines.
 - **Add Depth to Point Layer / Dynamic Buffer Lay Corridor:** depths are now found from contour layers in latitude/longitude (previously every lookup silently returned no depth).
 - **Compare Design vs As-Laid Routes:** the cross-track sign now follows the documented convention (+ starboard, − port); earlier versions reported it reversed, so **re-run comparisons made with an earlier version** if you rely on the sign (magnitudes are unchanged).
-- **Cable Lay Simulator:** table resize grips work on QGIS 4; after editing inputs during a solve, *Solve* restarts on the latest inputs, and results from outdated inputs are always marked stale.
 - **Catenary Calculator V2:** non-numeric assembly or seabed-profile cells are listed under *Warnings* instead of silently becoming zero, and the minimum bend radius check no longer passes by default where a radius cannot be computed.
 - **Plugin reload:** unloading or reloading the plugin stops running solves and tasks, removes every map marker, rubber band, menu entry and toolbar button, and releases the plugin's map tools.
 - **Tools that fail to open** now always say why, with details in the *Subsea Cable Tools* tab of the Log Messages panel.

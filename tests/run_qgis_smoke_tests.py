@@ -10,8 +10,8 @@ the supported module styles). Two extra checks follow: the Processing
 provider registers every algorithm class under ``processing/*_algorithm.py``,
 and the main plugin module imports.
 
---fast skips the slow "lay" group (catenary V1/V2, drape, lay simulator
-test_v3_*). ``--list`` works on plain Python (no QGIS needed).
+--fast skips the slow "lay" group (catenary solvers and drape).
+``--list`` works on plain Python (no QGIS needed).
 
 The checks run in a child process that this script supervises: if a module
 hard-crashes the interpreter (access violation, abort in native code) it is
@@ -173,7 +173,7 @@ def _parse_args(argv):
         description="Run every test module plus the provider/plugin checks under QGIS.")
     parser.add_argument("modules", nargs="*", help="test modules to run (default: every tests/test_*.py)")
     parser.add_argument("--fast", action="store_true",
-                        help="skip the slow 'lay' group (catenary + lay simulator V1/V2/V3)")
+                        help="skip the slow 'lay' group (catenary solvers)")
     parser.add_argument("--skip", action="append", default=[], choices=GROUPS, metavar="GROUP",
                         help="skip a group: core or lay (repeatable)")
     parser.add_argument("--only", action="append", default=[], choices=GROUPS, metavar="GROUP",

@@ -8,7 +8,7 @@ appropriate for a given task.
 > **Status / validation.** The calculation cores are validated against
 > closed-form catenary solutions and internal consistency identities by the
 > automated test suites (`tests/test_catenary_solver.py`,
-> `tests/test_drape_solver.py`, `tests/test_v3_solver3d.py`). They have **not** been independently
+> `tests/test_drape_solver.py`, `tests/test_catenary_steady_lay.py`). They have **not** been independently
 > verified against commercial lay-simulation software
 > or against measured field data. Treat results as planning-grade
 > estimates, not engineering sign-off values, until such a comparison has been
@@ -29,7 +29,8 @@ the vessel chute:
   multi-span drape solver optionally models a finite EI (see below).
 * **No hydrodynamic loading**: no current drag, no vessel motion, no wave
   loading, no lay-speed effects. `H` is constant along the span only because
-  fluid forces are neglected.
+  fluid forces are neglected. (The separate *Steady Lay* tab, below, is the
+  drag model.)
 * Tangential touchdown: the cable leaves the seabed with zero bending moment,
   tangent to the local bed.
 * Units: SI internally (N, m); tensions reported in kN; weights entered in
@@ -51,7 +52,7 @@ the vessel chute:
 
 The V1 calculator and its closed-form core (`simple_catenary.py`) have been
 removed; the uniform-catenary identities below remain the references the V2
-and V3 test suites check against (`a = H/q`, `h` = water depth):
+and steady-lay test suites check against (`a = H/q`, `h` = water depth):
 
 | Quantity | Formula |
 |---|---|
@@ -229,6 +230,55 @@ section of the drape as well as the suspended spans.
 
 ---
 
+## Steady Lay tab (beta) — `steady_lay.py`
+
+The stationary shape of a cable laid at a constant ship speed, with pay-out
+equal to the ship speed (Zajac 1957's model; equations in
+[REFERENCE_DIGEST.md](REFERENCE_DIGEST.md) §1). In the ship's frame the
+shape does not change with time, so it is integrated (RK4, adaptive step)
+from the touchdown up to the chute:
+
+* **Forces:** submerged weight below the waterline, weight in air above it
+  (no drag in air); Morison drag on the apparent flow
+  `u_rel = current(z) − V_ship + V_c·t`, normal `½ρ C_Dn d |u_n| u_n` and
+  tangential `½ρ C_Dt π d |u_t| u_t`; the material-transport term
+  `T − ρ_c V_c²` (ρ_c = mass per metre, from the weight in air).
+* **Touchdown:** with bottom tension `T₀ > 0` the cable leaves the seabed
+  tangentially; with `T₀ = 0` (a slack lay) it lands on Zajac's straight line
+  at the critical angle `cos α = √(1 + (H/V)⁴/4) − (H/V)²/2`, where
+  `H = √(2w / (C_Dn ρ d))` is the cable's broadside sinking speed. Steady
+  positive slack corresponds to `T₀ = 0`; a sustained negative slack is a
+  transient (tension rising with time) this model does not represent.
+* **Current:** a uniform current from the surface down to a chosen depth, in
+  any direction relative to the lay course. A cross current moves the
+  touchdown downstream of the ship's track (reported as the touchdown offset).
+* **Outputs:** cable angle at the chute and at the waterline, tension at the
+  chute, layback, suspended length, the time a cable element takes from the
+  chute to the seabed, the bend radius of the suspended cable (`T₀ > 0`), the
+  touchdown offset, and the cable angle over a range of ship speeds.
+* **Closed-form checks shown beside the answer:** `H`, the critical angle,
+  the straight-line layback `h / tan α`, the top-tension theorem
+  `T = T₀ + w·h` (exact with no tangential drag), the extra pay-out that
+  keeps zero bottom tension going downslope (`V_c − V = H β / 2`, per degree)
+  and the upslope beyond which free spans form at this speed (`γ > H / V`).
+
+Checked by `tests/test_catenary_steady_lay.py`: the slack lay is a straight
+line at the critical angle (angle within 3 %, layback within 4 %), the
+top-tension theorem holds with normal drag (0.5 %), the `V = 0` case is the
+exact catenary (0.5 %), a cross current puts the touchdown downstream, and
+the speed sweep equals single solves.
+
+**Limits:** one uniform cable (no bodies or multi-segment assemblies); a flat
+seabed at the touchdown (the slope helpers are small-angle closed forms);
+steady state only — no accelerations, stops, pay-out changes or vessel
+motion; no bending stiffness (with `T₀ = 0` the bend where the cable lands
+is set by EI, which is not modelled); drag coefficients are inputs (about
+1.1 for a smooth sheath to 1.5 for rough served or armoured cable, Zajac
+1957) — calibrate them against stern angles from your own lay records
+(`α ≈ H / V` for small angles). Not validated against field data.
+
+---
+
 ## What is supported, partially supported, and not supported
 
 | Capability | Status | Notes |
@@ -244,7 +294,7 @@ section of the drape as well as the suspended spans.
 | End anchoring | **Supported (V2 drape)** | Anchored or free bottom end (free requires friction); set in Geometry (Profile mode). |
 | Point queries (T, angle, radius, clearance, contact) | **Supported (V2)** | Crosshair hover over the plotted line; covers the on-bed drape section too. |
 | 3D route geometry (out-of-plane lay, route curvature) | **Not supported** | Plane model only. KP/route tools are separate and geodesic-aware, but the catenary itself is 2D. |
-| Current / hydrodynamic drag | **Not supported** | `H = const` assumption breaks under drag; results in strong currents will be wrong, especially exit angle and TDP position. |
+| Current / hydrodynamic drag | **Steady Lay tab only** | The Catenary tab assumes `H = const`, which breaks under drag: results in strong currents will be wrong there, especially exit angle and TDP position. The Steady Lay tab models drag from ship speed and current for a uniform cable. |
 | Dynamic / transient lay simulation (vessel motion, pay-out rate, touchdown dynamics) | **Not supported** | Requires a time-domain FE/lumped-mass model — out of scope for this architecture. |
 | Buoy/mid-water arch systems, branching units as multi-leg systems | **Not supported** | Single span, single boundary at each end only. A branching unit can be approximated as a point load *only* if the other legs' tensions are known and resolved manually into a vertical force. |
 | Bending stiffness / minimum-bend-radius mechanics | **Partial (V2)** | Optional per-segment EI in the drape model (discrete moments with compliance-weighted segment transitions) plus a local per-segment MBR limit check covering chute, span/drape curvature and EI-smoothed body kinks. The single-span integrator itself remains flexible; for telecom-scale EI that is also the physically correct limit (λ = √(EI/T) ≪ 1 m). |
@@ -265,10 +315,11 @@ section of the drape as well as the suspended spans.
    buoyancy reacted at the surface; the drape solver's penalty machinery can
    host it.
 4. **3D static (route-plane decomposition)** (high effort): only worthwhile
-   together with current modelling. Planned as a V3.
-5. **Branching-unit deployments (multi-leg systems)** (high effort): the
-   drape solver's chain/contact machinery can host a Y-topology (three chains
-   sharing a junction node), but boundary conditions and the UI need design
-   work. Planned as a V3 item alongside drag and 3D.
+   together with current modelling.
+5. **Branching-unit and final-splice deployments (multi-leg systems)** (high
+   effort): planned as a separate, focused BU/FS deployment tool rather than
+   an extension of this calculator. (An earlier 3D lay simulator and BU
+   lowering tool were retired: they were not tied to the route, and their
+   slack and residual-tension results were not reliable.)
 6. **Dynamic lay simulation** (very high effort): not recommended as an
    extension of this code base; integrate with a dedicated tool instead.

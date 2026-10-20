@@ -3,18 +3,18 @@
 
 Pure Python + NumPy; no Qt/QGIS imports.
 
-Drag model (per unit length of cable, tangent ``t``):
+Drag model (per unit length of cable, tangent ``t``; applied in ``steady_lay``):
 
     u_rel = u_water(z) - v_cable
     u_t   = (u_rel . t) t;   u_n = u_rel - u_t
     f_n   = 0.5 * rho * Cd_n * d       * |u_n| * u_n
     f_t   = 0.5 * rho * Cd_t * pi * d  * |u_t| * u_t
 
-Closed forms from Zajac 1957 (see ``ref/REFERENCE_DIGEST.md``): hydrodynamic
-constant, critical angle, sloped-bed pay-out increments, the free-span
-suspension criterion and the snap-tension impedance. These are exposed both
-as quick answers in the UI and as validation anchors for the numerical
-solvers.
+Closed forms from Zajac 1957 (see ``catenary/REFERENCE_DIGEST.md``):
+hydrodynamic constant, critical angle, sloped-bed pay-out increments and the
+free-span suspension criterion. The Steady Lay tab shows them next to the
+numerical solve (``steady_lay``), and the tests use them as validation
+anchors.
 """
 
 from __future__ import annotations
@@ -135,47 +135,6 @@ def suspension_speed_limit_mps(H_mps: float, upslope_angle_rad: float) -> float:
     return H_mps / upslope_angle_rad
 
 
-def snap_tension_N(EA_N: float, rho_c_kgpm: float, dV_mps: float) -> float:
-    """Longitudinal snap tension for a sudden pay-out rate change dV:
-    T = sqrt(EA * rho_c) * dV (Zajac eq. 29, semi-infinite cable)."""
-    if EA_N <= 0 or rho_c_kgpm <= 0:
-        return 0.0
-    return math.sqrt(EA_N * rho_c_kgpm) * abs(dV_mps)
-
-
-def capstan_tension(T_N: float, mu: float, wrap_angle_rad: float, laying: bool = True) -> float:
-    """Tension on the machinery side of a chute/capstan: laying reduces the
-    tensioner load (friction helps hold), recovery increases it.
-    T_machine = T_outboard * exp(-mu*phi) laying, * exp(+mu*phi) recovery."""
-    sign = -1.0 if laying else 1.0
-    return T_N * math.exp(sign * mu * wrap_angle_rad)
-
-
 def top_tension_theorem_N(T0_N: float, q_water_npm: float, depth_m: float) -> float:
     """T_ship = T_0 + w*h — independent of the normal drag law (Zajac 21)."""
     return T0_N + q_water_npm * depth_m
-
-
-def slack_for_route(payout_speed_mps: float, ship_speed_mps: float) -> float:
-    """Slack fraction eps = (V_c - V)/V."""
-    if ship_speed_mps <= 0:
-        return 0.0
-    return (payout_speed_mps - ship_speed_mps) / ship_speed_mps
-
-
-def drag_force_per_length(u_rel: "np.ndarray", tangent: "np.ndarray",
-                          diameter_m, cd_normal, cd_tangential,
-                          rho: float = RHO_SEAWATER) -> "np.ndarray":
-    """Vectorised Morison drag per unit length. All inputs (n, 3)/(n,)."""
-    u_rel = np.atleast_2d(np.asarray(u_rel, dtype=float))
-    t = np.atleast_2d(np.asarray(tangent, dtype=float))
-    ut = np.einsum("ij,ij->i", u_rel, t)
-    u_t = ut[:, None] * t
-    u_n = u_rel - u_t
-    un_mag = np.linalg.norm(u_n, axis=1)
-    dia = np.asarray(diameter_m, dtype=float)
-    cdn = np.asarray(cd_normal, dtype=float)
-    cdt = np.asarray(cd_tangential, dtype=float)
-    f_n = (0.5 * rho * cdn * dia * un_mag)[:, None] * u_n
-    f_t = (0.5 * rho * cdt * math.pi * dia * np.abs(ut) * ut)[:, None] * t
-    return f_n + f_t

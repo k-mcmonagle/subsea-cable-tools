@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""WorkbenchV3Adapter — the contract the Cable Lay Simulator (catenary V3)
-consumes from the workbench.
+"""WorkbenchV3Adapter — route context from the workbench for lay and
+deployment tools (written for the retired 3D lay simulator; kept as the
+contract for the planned BU/FS deployment tool).
 
-Gives the simulator route context instead of a canvas-centred sandbox:
+Gives a tool route context instead of a canvas-centred sandbox:
 
 - list_rpls()                       registered routes to pick from
 - bathymetry_profile(...)           along-route depth profile around a KP
@@ -13,12 +14,9 @@ Gives the simulator route context instead of a canvas-centred sandbox:
 - push_results(...)                 KP-referenced result layer back into the
                                     workbench GeoPackage
 
-Assembly dicts use the exact V2 keys (type/name/length_m/q_water_npm/...)
-plus diameter_m / cd_normal / cd_tangential, so
-catenary.v3.ui.solve_controller.build_assembly consumes them unmodified.
-
-Wiring this into the V3 dialog is deliberately out of scope here; the class
-is self-contained so the dialog can adopt it in a later release.
+Assembly dicts use the exact Catenary Calculator V2 keys
+(type/name/length_m/q_water_npm/...) plus diameter_m / cd_normal /
+cd_tangential. The class is self-contained; no tool is wired to it yet.
 """
 
 from __future__ import annotations

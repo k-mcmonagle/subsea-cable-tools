@@ -67,8 +67,6 @@ def test_experimental_actions_share_one_toolbar_dropdown():
             plugin.planner_action,
             plugin.burial_action,
             plugin.explorer_action,
-            plugin.lay_simulator_action,
-            plugin.bu_lowering_action,
             plugin.span_analysis_action,
             plugin.route_comments_action,
         ]
@@ -83,8 +81,6 @@ def test_experimental_actions_share_one_toolbar_dropdown():
             "Planner",
             "Burial Planner (beta)",
             "Cable Lay Data Explorer",
-            "Cable Lay Simulator (3D)",
-            "BU Lowering Tool (3D)",
             "Span && Slack Analysis (beta)",   # "&&" is a literal "&" in Qt menus
             "Route Comments",
         ]

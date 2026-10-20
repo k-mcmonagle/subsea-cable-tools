@@ -9,7 +9,7 @@ JSON format.
 
 Import sources: catenary JSON (clipboard), extract from a registered RPL
 (with an event-classification review step). Export: catenary JSON to
-clipboard — paste straight into Catenary Calculator V2 / Cable Lay Simulator.
+clipboard — paste straight into Catenary Calculator V2.
 """
 
 from __future__ import annotations
@@ -598,8 +598,7 @@ class AssemblyManagerPanel(QWidget):
         QMessageBox.information(
             self, "Export",
             "Assembly JSON copied to the clipboard.\n\n"
-            "Paste it into the Catenary Calculator V2 assembly JSON box or the "
-            "Cable Lay Simulator assembly editor.")
+            "Paste it into the Catenary Calculator V2 assembly JSON box.")
 
     def extract_from_rpl_id(self, rpl_id: str) -> bool:
         """Run the extract workflow for a specific RPL (no picker).

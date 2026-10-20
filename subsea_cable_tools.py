@@ -67,15 +67,13 @@ class SubseaCableTools:
     _WINDOWS = (
         'explorer_window',
         'catenary_calculator_v2_dialog',
-        'lay_simulator_dialog',
         'span_analysis_dialog',
-        'bu_lowering_dialog',
         'cable_library_dialog',
     )
     # Every action attribute set by initGui (all are also in self.actions).
     _ACTION_ATTRS = (
         'plotter_action', 'depth_profile_action', 'catenary_v2_action',
-        'lay_simulator_action', 'bu_lowering_action', 'span_analysis_action', 'workbench_action',
+        'span_analysis_action', 'workbench_action',
         'planner_action', 'burial_action', 'transit_measure_action',
         'explorer_action', 'cable_library_action', 'kp_settings_action',
         'save_layers_gpkg_action', 'route_comments_action',
@@ -113,9 +111,7 @@ class SubseaCableTools:
         self.route_comments_dock = None
         self.explorer_window = None
         self.catenary_calculator_v2_dialog = None
-        self.lay_simulator_dialog = None
         self.span_analysis_dialog = None
-        self.bu_lowering_dialog = None
         self.cable_library_dialog = None
         for attr in self._ACTION_ATTRS:
             setattr(self, attr, None)
@@ -214,20 +210,10 @@ class SubseaCableTools:
         self.catenary_v2_action = self.add_action(
             self._icon('catenary_icon_v2.png', 'catenary_icon.png'),
             "Catenary Calculator V2", self.show_catenary_calculator_v2,
+            tooltip="Catenary Calculator V2: the suspended cable from the chute "
+                    "to touchdown, with a Steady Lay (beta) tab for the cable "
+                    "angle and layback at a given ship speed.",
             add_to_toolbar=True)
-
-        # Cable Lay Simulator (3D) — catenary V3
-        lay_icon = self._icon('lay_simulator_icon.png', 'catenary_icon_v2.png')
-        self.lay_simulator_action = self.add_action(
-            lay_icon, "Cable Lay Simulator (3D)", self.show_lay_simulator,
-            tooltip="Cable Lay Simulator (3D): static hang, steady lay with drag, "
-                    "and operation simulation (beta).")
-        # BU Lowering Tool — the lowering-only BU scenario as its own dialog
-        self.bu_lowering_action = self.add_action(
-            lay_icon, "BU Lowering Tool (3D)", self.show_bu_lowering,
-            tooltip="BU Lowering Tool (3D): lower a branching unit on its trunk "
-                    "over two pre-laid legs — quick analytic model with a "
-                    "full-solver verify (beta).")
 
         # Span & Slack Analysis: plan a lay against spans and loops (2D)
         self.span_analysis_action = self.add_action(
@@ -364,8 +350,6 @@ class SubseaCableTools:
                 self.planner_action,
                 self.burial_action,
                 self.explorer_action,
-                self.lay_simulator_action,
-                self.bu_lowering_action,
                 self.span_analysis_action,
                 self.route_comments_action):
             self.experimental_menu.addAction(action)
@@ -393,32 +377,6 @@ class SubseaCableTools:
         self.catenary_calculator_v2_dialog.show()
         self.catenary_calculator_v2_dialog.raise_()
         self.catenary_calculator_v2_dialog.activateWindow()
-
-    def show_lay_simulator(self):
-        if not _alive(self.lay_simulator_dialog):
-            try:
-                from .catenary.v3.ui.dialog import LaySimulatorDialog
-                self.lay_simulator_dialog = LaySimulatorDialog(self._main_window(), iface=self.iface)
-            except Exception:
-                self.lay_simulator_dialog = None
-                self._report_open_failure("Cable Lay Simulator (3D) could not be opened.")
-                return
-        self.lay_simulator_dialog.show()
-        self.lay_simulator_dialog.raise_()
-        self.lay_simulator_dialog.activateWindow()
-
-    def show_bu_lowering(self):
-        if not _alive(self.bu_lowering_dialog):
-            try:
-                from .catenary.v3.ui.bu_lowering_dialog import BULoweringDialog
-                self.bu_lowering_dialog = BULoweringDialog(self._main_window(), iface=self.iface)
-            except Exception:
-                self.bu_lowering_dialog = None
-                self._report_open_failure("BU Lowering Tool (3D) could not be opened.")
-                return
-        self.bu_lowering_dialog.show()
-        self.bu_lowering_dialog.raise_()
-        self.bu_lowering_dialog.activateWindow()
 
     def show_span_analysis(self):
         """Show the Span & Slack Analysis window."""

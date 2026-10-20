@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-"""Validation of the V3 steady-lay ODE model against Zajac 1957 closed forms
-and the closed-form catenary (V = 0 limit).
+"""Validation of the steady-lay ODE model (Catenary Calculator V2, Steady Lay
+tab) against Zajac 1957 closed forms and the closed-form catenary (V = 0 limit).
 
 Pure Python + NumPy; no QGIS imports.
 """
@@ -11,6 +11,7 @@ import importlib.util
 import math
 from pathlib import Path
 import sys
+import types
 
 import numpy as np
 
@@ -18,37 +19,20 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _load_engine():
-    mods = {}
+    """Load catenary/hydrodynamics.py and catenary/steady_lay.py without
+    importing the plugin package (steady_lay imports ``.hydrodynamics``)."""
+    pkg = types.ModuleType("sct_steady_lay_pkg")
+    pkg.__path__ = [str(ROOT / "catenary")]
+    sys.modules[pkg.__name__] = pkg
+    mods = []
     for m in ("hydrodynamics", "steady_lay"):
-        p = ROOT / "catenary" / "v3" / "engine" / f"{m}.py"
-        name = f"sct_v3_sl_{m}"
-        spec = importlib.util.spec_from_file_location(name, p)
-        mm = importlib.util.module_from_spec(spec)
-        # steady_lay does "from .hydrodynamics import ..." — pre-register.
-        if m == "steady_lay":
-            pkg = sys.modules.get("sct_v3_sl_pkg")
-            mm.__package__ = "sct_v3_sl_pkg"
-        sys.modules[name] = mm
-        mods[m] = (spec, mm)
-    # Build a lightweight package so the relative import resolves.
-    import types
-
-    pkg = types.ModuleType("sct_v3_sl_pkg")
-    pkg.__path__ = [str(ROOT / "catenary" / "v3" / "engine")]
-    sys.modules["sct_v3_sl_pkg"] = pkg
-    hyd_spec = importlib.util.spec_from_file_location(
-        "sct_v3_sl_pkg.hydrodynamics", ROOT / "catenary" / "v3" / "engine" / "hydrodynamics.py"
-    )
-    hyd = importlib.util.module_from_spec(hyd_spec)
-    sys.modules["sct_v3_sl_pkg.hydrodynamics"] = hyd
-    hyd_spec.loader.exec_module(hyd)
-    sl_spec = importlib.util.spec_from_file_location(
-        "sct_v3_sl_pkg.steady_lay", ROOT / "catenary" / "v3" / "engine" / "steady_lay.py"
-    )
-    sl = importlib.util.module_from_spec(sl_spec)
-    sys.modules["sct_v3_sl_pkg.steady_lay"] = sl
-    sl_spec.loader.exec_module(sl)
-    return hyd, sl
+        name = f"{pkg.__name__}.{m}"
+        spec = importlib.util.spec_from_file_location(name, ROOT / "catenary" / f"{m}.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        mods.append(mod)
+    return mods
 
 
 hyd, sl = _load_engine()
@@ -188,18 +172,38 @@ def test_payout_helpers():
     vlim = hyd.suspension_speed_limit_mps(H, math.radians(35.0))
     _assert_close(vlim, H / math.radians(35.0), 1e-9, "suspension speed limit")
     assert hyd.suspension_speed_limit_mps(H, 0.0) == float("inf")
-    # Capstan: laying reduces machine-side tension, recovery raises it.
-    T = 10000.0
-    assert hyd.capstan_tension(T, 0.3, math.radians(60.0), laying=True) < T
-    assert hyd.capstan_tension(T, 0.3, math.radians(60.0), laying=False) > T
-    # Snap tension impedance, Zajac cable No. 2 (twist-free EA = 1.2e6 lb).
-    # rho_c is the *in-air mass* per length (~1.3 lb/ft for type D — the
-    # 0.705 lb/ft in Table I is the submerged weight, not the mass).
-    EA = 1.2e6 * 4.4482216
-    rho_c = 1.3 * 0.45359 / 0.3048
-    imp = hyd.snap_tension_N(EA, rho_c, 1.0)
-    # Zajac: ~220 lbf per ft/s -> N per m/s: 220*4.448/0.3048 ~ 3210.
-    _assert_close(imp, 3210.0, 0.10, "snap impedance")
+
+
+def test_air_weight_adds_displaced_water():
+    """Weight in air = submerged weight + weight of the displaced water."""
+    d = 0.040
+    expect = 15.0 + 1025.0 * hyd.G * math.pi * d * d / 4.0
+    _assert_close(sl.air_weight_npm(15.0, d), expect, 1e-12, "air weight")
+    assert sl.air_weight_npm(15.0, 0.0) == 15.0
+
+
+def test_speed_sweep_slack_lay_follows_critical_angle():
+    """Zero bottom tension: every speed lands on Zajac's critical angle, the
+    angle falls and the layback grows with speed, and the input is untouched."""
+    inp = _telecom_input(T0_N=0.0, payout_speed_mps=None, ds_m=2000.0 / 150.0)
+    speeds = [1.0 * KNOT, 3.0 * KNOT, 6.0 * KNOT]
+    sweep = sl.speed_sweep(inp, speeds)
+    for a, c in zip(sweep.angle_deg, sweep.critical_angle_deg):
+        _assert_close(a, c, 0.03, "sweep angle vs critical angle")
+    assert np.all(np.diff(sweep.angle_deg) < 0)
+    assert np.all(np.diff(sweep.layback_m) > 0)
+    assert inp.ship_speed_mps == 6.0 * KNOT and inp.payout_speed_mps is None
+
+
+def test_speed_sweep_matches_single_solves():
+    """With bottom tension the sweep is the single solve at each speed."""
+    inp = _telecom_input(depth_m=150.0, q_water_npm=200.0, diameter_m=0.06,
+                         T0_N=5000.0, payout_speed_mps=None)
+    sweep = sl.speed_sweep(inp, [0.5 * KNOT, 2.0 * KNOT])
+    for v, a, t in zip(sweep.speed_mps, sweep.angle_deg, sweep.top_tension_N):
+        one = sl.integrate_steady_lay(sl.SteadyLayInput(**{**inp.__dict__, "ship_speed_mps": v}))
+        _assert_close(a, one.exit_angle_deg, 1e-9, "sweep angle")
+        _assert_close(t, one.top_tension_N, 1e-9, "sweep top tension")
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +222,9 @@ def run_all():
         test_solve_modes_roundtrip,
         test_cross_current_produces_lateral_offset,
         test_payout_helpers,
+        test_air_weight_adds_displaced_water,
+        test_speed_sweep_slack_lay_follows_critical_angle,
+        test_speed_sweep_matches_single_solves,
     ]
     for test in tests:
         try:

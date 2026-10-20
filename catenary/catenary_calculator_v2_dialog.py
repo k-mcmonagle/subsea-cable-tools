@@ -64,6 +64,7 @@ from .catenary_solver import (
     PolylineSeabed,
 )
 from .drape_solver import three_point_radii
+from .steady_lay_tab import SteadyLayTab
 
 try:
     import numpy as np
@@ -206,6 +207,9 @@ class CatenaryCalculatorV2Dialog(QDialog):
                       getattr(self, "_assembly_json_timer", None)):
             if timer is not None:
                 timer.stop()
+        steady = getattr(self, "steady_lay_tab", None)
+        if steady is not None:
+            steady.stop()
         canvas = getattr(self, "canvas", None)
         if canvas is not None:
             for cid in (self._crosshair_cid, self._plot_click_cid):
@@ -338,6 +342,11 @@ class CatenaryCalculatorV2Dialog(QDialog):
             button = section[0]
             self.settings.setValue(settings_key, bool(button.isChecked()))
         self.settings.remove("assembly_table_col_widths")
+        try:
+            self.settings.setValue("main_tab", self.main_tabs.currentIndex())
+            self.steady_lay_tab.save_settings(self.settings)
+        except Exception:
+            log_exception("Catenary V2: Steady Lay settings not saved")
 
     def restore_user_settings(self):
         def _get_float(key, default=None):
@@ -536,6 +545,13 @@ class CatenaryCalculatorV2Dialog(QDialog):
             self._set_collapsible_section_expanded(settings_key, self._settings_bool(self.settings.value(settings_key), False))
 
         self.assembly_table.resizeColumnsToContents()
+
+        try:
+            self.steady_lay_tab.restore_settings(self.settings)
+            if (v := _get_int("main_tab")) is not None:
+                self.main_tabs.setCurrentIndex(max(0, min(self.main_tabs.count() - 1, v)))
+        except Exception:
+            log_exception("Catenary V2: Steady Lay settings not restored")
 
     # ---- UI init
 
@@ -1051,7 +1067,16 @@ class CatenaryCalculatorV2Dialog(QDialog):
         # Open with the left panel wide enough to show all inputs (incl. the
         # assembly button row) without the user having to drag the divider.
         self.main_splitter.setSizes([560, 620])
-        main_layout.addWidget(self.main_splitter)
+
+        # Top-level tabs: the static catenary, and the steady lay (drag) model.
+        self.main_tabs = QTabWidget()
+        self.main_tabs.addTab(self.main_splitter, "Catenary")
+        self.steady_lay_tab = SteadyLayTab()
+        self.main_tabs.addTab(self.steady_lay_tab, "Steady Lay (beta)")
+        self.main_tabs.setTabToolTip(
+            1, "The cable while laying at a steady ship speed: angle, layback and "
+               "tensions with current drag (Zajac 1957).")
+        main_layout.addWidget(self.main_tabs)
 
         # signals
         for w in [

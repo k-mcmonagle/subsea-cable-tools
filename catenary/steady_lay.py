@@ -21,21 +21,21 @@ tension ``T0`` (bottom tension; >= a small positive floor — the ``T0 = 0``
 limit is Zajac's straight line at the critical angle, which the integration
 approaches smoothly). Integration stops at the chute elevation.
 
-This module cross-validates the general 3D DR solver and provides the fast
-"Steady lay" answer mode; closed-form identities from ``hydrodynamics``
-(critical angle, top-tension theorem) are natural checks on both.
+Used by the Catenary Calculator V2 *Steady Lay* tab. Closed-form identities
+from ``hydrodynamics`` (critical angle, top-tension theorem) check it.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import numpy as np
 
 from .hydrodynamics import (
     CurrentProfile,
+    G,
     RHO_SEAWATER,
     critical_angle_rad,
     hydrodynamic_constant,
@@ -123,11 +123,6 @@ def integrate_steady_lay(inp: SteadyLayInput) -> SteadyLayResult:
     # line); a tiny positive floor converges to the same shape.
     T_floor = max(1.0, 1e-4 * inp.q_water_npm * h)
     T = max(float(inp.T0_N), T_floor)
-    if inp.T0_N < T_floor:
-        warnings.append(
-            f"Bottom tension floored at {T_floor:.1f} N for integration; "
-            "the zero-tension limit is the straight-line critical-angle lay."
-        )
 
     cent = inp.rho_c_kgpm * vc * vc  # transport correction, N
 
@@ -356,3 +351,42 @@ def solve_steady_lay(inp: SteadyLayInput, mode: str = "bottom_tension",
             "unreachable with these inputs."
         )
     return res
+
+
+def air_weight_npm(q_water_npm: float, diameter_m: float,
+                   rho_water: float = RHO_SEAWATER) -> float:
+    """Weight in air per metre from the weight in water and the outer
+    diameter: the submerged weight plus the weight of the water displaced."""
+    return q_water_npm + rho_water * G * math.pi * diameter_m ** 2 / 4.0
+
+
+@dataclass
+class SpeedSweep:
+    """Steady-lay answers over a range of ship speeds (other inputs fixed)."""
+
+    speed_mps: "np.ndarray"
+    angle_deg: "np.ndarray"            # cable angle at the top end, from horizontal
+    layback_m: "np.ndarray"
+    top_tension_N: "np.ndarray"
+    critical_angle_deg: "np.ndarray"   # Zajac closed form (zero bottom tension)
+
+
+def speed_sweep(inp: SteadyLayInput, speeds_mps: Sequence[float]) -> SpeedSweep:
+    """Solve ``inp`` at each ship speed (pay-out equal to the ship speed).
+
+    ``inp`` itself is not changed. Each speed is an independent integration,
+    so pass a coarser ``inp.ds_m`` than a single solve needs when the sweep is
+    only drawn."""
+    speeds = np.asarray([max(0.0, float(v)) for v in speeds_mps], dtype=float)
+    H_c = hydrodynamic_constant(inp.q_water_npm, inp.diameter_m, inp.cd_normal, inp.rho_water)
+    angle = np.empty(len(speeds))
+    layback = np.empty(len(speeds))
+    top = np.empty(len(speeds))
+    crit = np.empty(len(speeds))
+    for i, v in enumerate(speeds):
+        res = integrate_steady_lay(replace(inp, ship_speed_mps=float(v), payout_speed_mps=None))
+        angle[i] = res.exit_angle_deg
+        layback[i] = res.layback_m
+        top[i] = res.top_tension_N
+        crit[i] = math.degrees(critical_angle_rad(H_c, float(v)))
+    return SpeedSweep(speeds, angle, layback, top, crit)

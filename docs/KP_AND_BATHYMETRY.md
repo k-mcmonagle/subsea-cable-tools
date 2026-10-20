@@ -33,6 +33,6 @@ The optional nearest-route-KP ruler labels a physical-distance axis with project
 
 ## Interpreting the results
 
-The sign conventions, unit conversions, gap handling and baseline calculations above are deliberate and have synthetic tests. The appropriate analysis width depends on the survey, the feature or equipment of interest, and the decision being made. No synthetic test establishes accuracy against an actual survey or another engineering workflow. Compare critical outputs with original survey data, known control cases and an independent method. See the [catenary model notes](../catenary/MODEL_NOTES.md) and [simulator model notes](../catenary/v3/V3_MODEL_NOTES.md) for those tools' separate assumptions.
+The sign conventions, unit conversions, gap handling and baseline calculations above are deliberate and have synthetic tests. The appropriate analysis width depends on the survey, the feature or equipment of interest, and the decision being made. No synthetic test establishes accuracy against an actual survey or another engineering workflow. Compare critical outputs with original survey data, known control cases and an independent method. See the [catenary model notes](../catenary/MODEL_NOTES.md) for that tool's separate assumptions.
 
 For background on why raster scale and units matter, see the [GDAL slope documentation](https://gdal.org/en/stable/programs/gdal_raster_slope.html) and [USGS bathymetric uncertainty example](https://pubs.usgs.gov/ds/514/uncertainty.html).

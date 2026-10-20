@@ -23,12 +23,10 @@ The top-level [README](../README.md) is the short introduction and tool list. Us
 
 - [DECISIONS.md](../DECISIONS.md) — Burial Planner implementation decisions and judgement calls. It is the authoritative record of intended behaviour; the v0.3 specification it cites is not in the repository.
 
-## Model notes (catenary and lay simulator)
+## Model notes (catenary)
 
-- [catenary/MODEL_NOTES.md](../catenary/MODEL_NOTES.md) — Catenary Calculator (V1/V2): model assumptions, equations and limits.
-- [catenary/v3/V3_MODEL_NOTES.md](../catenary/v3/V3_MODEL_NOTES.md) — Cable Lay Simulator (3D): assumptions and validation status.
-- [catenary/V3_PLAN.md](../catenary/V3_PLAN.md) — Cable Lay Simulator (3D): design and implementation plan.
-- [catenary/v3/REFERENCE_DIGEST.md](../catenary/v3/REFERENCE_DIGEST.md) — equations and constants distilled from the lay-physics references.
+- [catenary/MODEL_NOTES.md](../catenary/MODEL_NOTES.md) — Catenary Calculator V2 and its Steady Lay tab: model assumptions, equations and limits.
+- [catenary/REFERENCE_DIGEST.md](../catenary/REFERENCE_DIGEST.md) — equations and constants distilled from the lay-physics references.
 
 ## History
 

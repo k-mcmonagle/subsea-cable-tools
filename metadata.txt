@@ -9,7 +9,7 @@ author=Kieran McMonagle
 email=kieran.mcmonagle@globalmarine.group
 
 about=Tools for subsea telecom and power cable route engineering in QGIS.
-  KP (chainage) tools, including a live KP mouse tool and plugin-wide KP settings; depth and slope profiles from MBES rasters or contours; RPL import and a Cable Route Workbench for RPL revisions, cable systems and assemblies; a Burial Planner (beta); a Cable Lay Simulator (beta) and catenary calculator; cable lay data import with a QC and analysis Explorer; and a scenario Planner (beta).
+  KP (chainage) tools, including a live KP mouse tool and plugin-wide KP settings; depth and slope profiles from MBES rasters or contours; RPL import and a Cable Route Workbench for RPL revisions, cable systems and assemblies; a Burial Planner (beta); a catenary calculator with a steady-lay tab (beta); cable lay data import with a QC and analysis Explorer; and a scenario Planner (beta).
   A Processing provider adds KP-range, RPL, bathymetry (MBES, GeoMedia MDB) and utility algorithms.
   Beta tools are under active development: check their outputs against your own data and methods before operational use.
 

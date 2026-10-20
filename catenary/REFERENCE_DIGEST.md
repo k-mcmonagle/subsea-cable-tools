@@ -1,7 +1,8 @@
 # Reference Digest — Subsea Cable Lay Physics
 
 Working notes distilled from the documents in `ref/`, gathered while planning
-Catenary V3. Equations are transcribed in plain text; symbols follow each
+the lay models (the Catenary Calculator V2 *Steady Lay* tab implements
+Section 1's stationary model). Equations are transcribed in plain text; symbols follow each
 source. This file is a convenience digest — always check the source paper
 before relying on an equation in shipped code.
 
@@ -120,7 +121,7 @@ heading offset `tan(phi) = V_w sin(beta)/(V - V_w cos beta)` (50–51);
 closed-form touchdown offsets d (astern) and e (lateral) via a
 perturbation solution (52). Worked example: 6,000 ft depth, 6 kn ship,
 1 kn current over top 600 ft at 60 deg → lateral offset e = 253 ft.
-**These closed forms are the validation set for V3's 3-D drag solver.**
+**These closed forms are the validation set for a 3-D drag solver.**
 
 ### Appendix E — suspended cable / bight tension rise
 Cable caught (or held) at a point A while the ship steams on: solved as a
@@ -143,7 +144,7 @@ surface: the straight line is the only realistic zero-`T_0` laying shape.
   `C_D = 1.55`; `EA = 4e6 lb` (twist restrained) / `1.2e6 lb` (free);
   `H = 70 degree-knots`.
 - `H` is measurable at sea from the stern angle: `alpha_0 * V = H` —
-  treat H as a **per-cable calibration input** in V3.
+  treat H as a **per-cable calibration input**.
 
 ---
 
@@ -251,12 +252,12 @@ Most implementation-relevant pointers (with URLs in the docx):
 
 ---
 
-## Implications for V3 (summary)
+## Implications for the lay models (summary)
 
 1. **Steady lay with drag** is fully specified by Zajac: quadratic normal
    drag, `H = sqrt(2w/(C_D rho d))`, critical angle, `T_s = T_0 + w*h`,
-   slack ↔ bottom tension. These become closed-form cross-checks for the
-   3-D numerical engine, plus a fast "steady lay" answer mode.
+   slack ↔ bottom tension. These are the closed-form cross-checks for the
+   steady-lay solver (`catenary/steady_lay.py`).
 2. **Shallow water**: keep V2's in-air segment treatment (already have
    air/water split) — JMSE quantifies why it matters (MBR error up to 59%).
 3. **Chute friction** (capstan) is cheap to add and operationally critical.

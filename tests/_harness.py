@@ -10,9 +10,8 @@ Shared by ``tests/run_pure_tests.py``, ``tests/run_qgis_smoke_tests.py`` and
   one (returns a list of per-test booleans, a failure count, or a list of
   failure names). Otherwise its ``unittest.TestCase`` classes and pytest-style
   ``test_*`` functions are collected. A file with none of those fails loudly.
-* **Groups** - ``lay`` (slow catenary / lay-simulator suites: file names
-  ``test_v3_*``, ``test_catenary_*``, ``test_drape_*``, or ``TEST_GROUP =
-  "lay"``) and ``core`` (everything else); ``--fast`` skips ``lay``.
+* **Groups** - ``lay`` (slow catenary suites: file names
+  ``test_catenary_*``, ``test_drape_*``, or ``TEST_GROUP = "lay"``) and ``core`` (everything else); ``--fast`` skips ``lay``.
 * **Pure vs QGIS** - a module may declare ``REQUIRES_QGIS = True`` (or
   ``False``) at module level. Without the marker the pure runner imports the
   module with QGIS/Qt blocked: an import that needs QGIS classifies the module
@@ -54,11 +53,11 @@ TESTS_DIR = Path(__file__).resolve().parent
 PLUGIN_DIR = TESTS_DIR.parent
 PACKAGE_NAME = "subsea_cable_tools"
 
-# The slow "lay" group: catenary solvers and the lay simulator (V2/V3),
-# chosen by file-name pattern. `--fast` skips it; run it whenever catenary/
-# or the lay-simulator tools (or shared modules they import) change. A module
+# The slow "lay" group: the catenary solvers (V2 and steady lay), chosen by
+# file-name pattern. `--fast` skips it; run it whenever catenary/ (or shared
+# modules it imports) changes. A module
 # outside the pattern can opt in or out with `TEST_GROUP = "lay"` / "core".
-LAY_PREFIXES = ("test_v3_", "test_catenary_", "test_drape_")
+LAY_PREFIXES = ("test_catenary_", "test_drape_")
 GROUPS = ("core", "lay")
 
 # Top-level packages that only exist inside a QGIS Python.
