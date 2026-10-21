@@ -257,6 +257,7 @@ class SceneOptions:
     text_height_m: float = 0.0       # 0: auto (1% of the window length)
     title: str = ""
     max_vertices: int = 20000
+    slack_basis: str = "seabed"      # the slack graph over the seabed (bottom slack) or over the route
 
 
 def _nice_step(span: float, target: int = 10) -> float:
@@ -428,14 +429,26 @@ def export_scene(result, path: str, options: SceneOptions, detail=None) -> Dict[
         panel = max((y_top - y_bottom) * 0.6, length * 0.06, 10.0 * th)
         gap = 6.0 * th
         base = axis_y - 4.0 * th
+        def finite(values):   # the pull-taut search limit is not a tension (the cable is short)
+            values = np.asarray(values, dtype=float)
+            return np.where(values >= 0.999 * pl.TAUT_CAP_KN, np.nan, values)
+
+        if options.slack_basis == "route" or result.used_bottom_pct is None:
+            slack = ("SLACK", "Slack over the route (%)", [("LAID", result.laid_pct, 5), ("FILL", result.fill_pct, 34),
+                                                           ("USED", result.shape_pct, 8)])
+        else:
+            slack = ("SLACK", "Bottom slack, over the seabed (%)",
+                     [("LAID", result.bottom_slack_pct, 5),
+                      ("SEABED", np.where(np.isfinite(result.used_bottom_pct), 0.0, np.nan), 34),
+                      ("USED", result.used_bottom_pct, 8)])
         series = [
-            ("TENSION", "Tension (kN)", [("RESIDUAL", result.tension_kn, 5), ("LAY", result.deposit_kn, 8),
+            ("TENSION", "Tension (kN)", [("RESIDUAL", finite(result.tension_kn), 5),
+                                         ("LAY", finite(result.deposit_kn), 8),
                                          ("NPTS", st.npts_kn, 1),
                                          ("MAX_FOR_LIMITS", np.where(result.allowable_kn < 99.9, result.allowable_kn,
                                                                      np.nan) if result.allowable_kn is not None
                                           else np.full(st.n, np.nan), 3)]),
-            ("SLACK", "Slack over the route (%)", [("LAID", result.laid_pct, 5), ("FILL", result.fill_pct, 34),
-                                                   ("USED", result.shape_pct, 8)]),
+            slack,
             ("SLOPE", "Seabed slope and friction angle (deg)",
              [("SLOPE", np.degrees(np.arctan(np.abs(st.slope))), 34), ("FRICTION_ANGLE", np.degrees(np.arctan(st.mu)),
                                                                         30)]),

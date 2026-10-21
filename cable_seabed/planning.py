@@ -98,6 +98,17 @@ SOURCE_NAMES = {
 
 CONTACT_TOL_M = 0.01     # cable on the seabed (friction, span supports)
 DEFAULT_MU = 0.5
+# The highest tension a pull-taut search tries (cable_seabed.shape.taut_tension_n). A cable still short
+# of the seabed there has no finite tension (it is inextensible): such values are not tensions.
+TAUT_CAP_KN = 2000.0
+
+
+def unbounded(tension_kn) -> bool:
+    """True where a tension is the pull-taut search limit, not a tension (the cable is short)."""
+    try:
+        return float(tension_kn) >= 0.999 * TAUT_CAP_KN
+    except (TypeError, ValueError):
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +147,8 @@ class Body:
     weight_kn: float = 0.0            # submerged weight
     diameter_m: float = math.nan
     kind: str = "Body"                # friction table key (e.g. Repeater, Joint)
+    placement: str = ""               # how its KP was found (e.g. an assembly fit), for display
+    anchor_kp_km: float = math.nan    # KP of the fit anchor its position is reckoned from (nan: entered)
 
 
 @dataclass
@@ -359,6 +372,7 @@ class Stations:
     noise_m: float = math.nan             # cell-to-cell variation of the data (robust standard deviation, m)
     filter_auto: bool = False             # the noise filter was suited to the data
     spikes_kp: List[float] = field(default_factory=list)   # possible fliers: single points above both neighbours
+    body_kinds: List[str] = field(default_factory=list)    # kind of each input body (body_index points here)
 
     @property
     def n(self) -> int:
@@ -531,27 +545,46 @@ def prepare(inputs: PlanningInputs) -> Stations:
     if finite.sum() >= 2:
         slope[finite] = np.gradient(slope_seabed[finite], x[finite])
 
-    # Friction per station.
-    fr = inputs.friction
+    body_kinds = [b.kind for b in inputs.bodies]
+    soil, mu, mu_lat = station_friction(inputs.friction, kp, [t.name for t in types], index, body_kinds,
+                                        body_index, [p.kind for p in protection], protection_index)
+    return Stations(x, kp, raw + height, seabed, length_seabed, seabed + standoff, height, slope, w, w_cable,
+                    ei, mbr, diam, npts, mu, mu_lat, index, body_index, soil, types, placements, spacing,
+                    smoothing, filter_m, list(prof.turns), notes, [f for f in inputs.features if f.valid()],
+                    protection, protection_index, data_m=data_m, noise_m=noise,
+                    filter_auto=inputs.filter_m is None, spikes_kp=spikes_kp, body_kinds=body_kinds)
+
+
+def station_friction(fr: FrictionModel, kp: np.ndarray, type_names: Sequence[str], cable_index: np.ndarray,
+                     body_kinds: Sequence[str], body_index: np.ndarray, protection_kinds: Sequence[str],
+                     protection_index: Optional[np.ndarray]) -> Tuple[List[str], np.ndarray, np.ndarray]:
+    """``(soil, mu, mu_lateral)`` per station: a body's kind, else a protection kind the
+    table names, else the cable type, looked up on the station's soil."""
+    n = len(kp)
     soil = [fr.soil_at(float(k)) for k in kp] if fr.zones else [""] * n
     mu = np.empty(n)
     mu_lat = np.empty(n)
     cache: Dict[Tuple[str, str], Tuple[float, float]] = {}
     for i in range(n):
-        j = body_index[i]
-        item = inputs.bodies[j].kind if j >= 0 else types[index[i]].name
-        p = protection_index[i]
-        if j < 0 and p >= 0 and fr.has_item(protection[p].kind):
-            item = protection[p].kind
+        j = int(body_index[i])
+        item = body_kinds[j] if j >= 0 else type_names[int(cable_index[i])]
+        p = int(protection_index[i]) if protection_index is not None else -1
+        if j < 0 and p >= 0 and fr.has_item(protection_kinds[p]):
+            item = protection_kinds[p]
         key = (item, soil[i])
         if key not in cache:
             cache[key] = fr.lookup(item, soil[i])
         mu[i], mu_lat[i] = cache[key]
-    return Stations(x, kp, raw + height, seabed, length_seabed, seabed + standoff, height, slope, w, w_cable,
-                    ei, mbr, diam, npts, mu, mu_lat, index, body_index, soil, types, placements, spacing,
-                    smoothing, filter_m, list(prof.turns), notes, [f for f in inputs.features if f.valid()],
-                    protection, protection_index, data_m=data_m, noise_m=noise,
-                    filter_auto=inputs.filter_m is None, spikes_kp=spikes_kp)
+    return soil, mu, mu_lat
+
+
+def with_friction(st: Stations, friction: FrictionModel) -> Stations:
+    """``st`` with the friction (and soil zones) of ``friction``: the seabed, makeup and
+    bodies are kept, so a friction change solves again without preparing the stations."""
+    soil, mu, mu_lat = station_friction(friction, st.kp_km, [t.name for t in st.cable_types], st.cable_index,
+                                        st.body_kinds, st.body_index, [p.kind for p in st.protection],
+                                        st.protection_index)
+    return replace(st, soil=soil, mu=mu, mu_lateral=mu_lat)
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +627,11 @@ class Summary:
     def laid_slack_pct(self) -> float:
         return (self.cable_laid_m / self.route_m - 1.0) * 100.0 if self.route_m > 0 else math.nan
 
+    @property
+    def bottom_slack_pct(self) -> float:
+        """Cable laid over the seabed length (0: as long as the seabed it lies on)."""
+        return (self.cable_laid_m / self.seabed_m - 1.0) * 100.0 if self.seabed_m > 0 else math.nan
+
 
 @dataclass
 class PlanningResult:
@@ -621,6 +659,13 @@ class PlanningResult:
     iterations: int
     notes: List[str] = field(default_factory=list)
     indicative: List[bool] = field(default_factory=list)   # per span: shorter than the seabed data resolves
+    # Slack over the seabed (bottom slack, windowed as above): 0 where the cable lies on the seabed.
+    used_bottom_pct: Optional[np.ndarray] = None      # cable used by the rest shape over seabed (< 0: bridging)
+    surplus_bottom_pct: Optional[np.ndarray] = None   # laid minus used, over seabed
+    seabed_over_route: Optional[np.ndarray] = None    # windowed seabed length over route length
+    # Per span: seabed length minus cable length from lift-off to touchdown, as drawn (m): the extra
+    # cable it would take to follow the seabed there.
+    span_short_m: List[float] = field(default_factory=list)
 
     @property
     def gap_m(self) -> np.ndarray:
@@ -775,14 +820,19 @@ def solve(st: Stations, control: LayControl, criteria: Criteria, allowable: Opti
     d_laid = np.where(seg_tension, d_shape, d_laid_plan)
     window = max(float(criteria.slack_window_m), 2.0 * st.spacing_m)
     route_w = _windowed(x, d_route, window)
+    seabed_w = _windowed(x, d_seabed, window)
     with np.errstate(invalid="ignore", divide="ignore"):
-        fill_pct = (_windowed(x, d_seabed, window) / route_w - 1.0) * 100.0
+        fill_pct = (seabed_w / route_w - 1.0) * 100.0
         shape_pct = (_windowed(x, d_shape, window) / route_w - 1.0) * 100.0
         laid_pct = (_windowed(x, d_laid, window) / route_w - 1.0) * 100.0
         excess_pct = (_windowed(x, d_laid - d_shape, window) / route_w) * 100.0
-        bottom_slack_pct = (_windowed(x, d_laid, window) / _windowed(x, d_seabed, window) - 1.0) * 100.0
-    for arr in (fill_pct, shape_pct, laid_pct, excess_pct, bottom_slack_pct):
-        arr[~np.isfinite(route_w) | (route_w <= 0)] = np.nan
+        bottom_slack_pct = (_windowed(x, d_laid, window) / seabed_w - 1.0) * 100.0
+        used_bottom_pct = (_windowed(x, d_shape, window) / seabed_w - 1.0) * 100.0
+        surplus_bottom_pct = (_windowed(x, d_laid - d_shape, window) / seabed_w) * 100.0
+        seabed_over_route = seabed_w / route_w
+    for arr in (fill_pct, shape_pct, laid_pct, excess_pct, bottom_slack_pct, used_bottom_pct, surplus_bottom_pct,
+                seabed_over_route):
+        arr[~np.isfinite(route_w) | (route_w <= 0) | ~np.isfinite(seabed_w) | (seabed_w <= 0)] = np.nan
 
     if allowable_kn is not None and len(allowable_kn) != n:
         allowable_kn = None
@@ -829,9 +879,19 @@ def solve(st: Stations, control: LayControl, criteria: Criteria, allowable: Opti
     with np.errstate(invalid="ignore"):
         summary.over_npts = bool(np.any(np.isfinite(st.npts_kn) & (tension > st.npts_kn)))
 
+    span_short = []
+    for span in spans:
+        sl = slice(span.i0, span.i1 + 1)
+        xs, ys, zs = x[sl], y[sl], st.obstacle_m[sl]
+        ok = np.isfinite(ys[1:]) & np.isfinite(ys[:-1]) & np.isfinite(zs[1:]) & np.isfinite(zs[:-1])
+        dxs = np.diff(xs)
+        span_short.append(float(np.sum(np.hypot(dxs, np.diff(zs))[ok]) - np.sum(np.hypot(dxs, np.diff(ys))[ok])))
+
     result = PlanningResult(st, control, criteria, deposit, tension, source, y, unheld, reaction_npm, fill_pct,
                             shape_pct, laid_pct, excess_pct, bottom_slack_pct, allowable_kn, spans, supports,
-                            shortfalls, bodies, [], summary, iterations, notes, indicative)
+                            shortfalls, bodies, [], summary, iterations, notes, indicative,
+                            used_bottom_pct=used_bottom_pct, surplus_bottom_pct=surplus_bottom_pct,
+                            seabed_over_route=seabed_over_route, span_short_m=span_short)
     result.findings = findings(result)
     report(progress, 1.0, "Done")
     return result
@@ -905,8 +965,11 @@ def findings(result: PlanningResult) -> List[RangeFinding]:
                 span.max_gap_m, c.red_gap_m, "m", extra={"length_m": span.length_m, "resolvable_m": need}))
             continue
         red = _span_red(span, c)
-        parts = [f"Span {span.length_m:.0f} m long, up to {span.max_gap_m:.2f} m above the seabed at "
-                 f"{span.tension_kn:.2f} kN ({span.source})"]
+        if unbounded(span.tension_kn):
+            at = "with the cable pulled straight: no finite tension, the cable laid is shorter than the seabed"
+        else:
+            at = f"at {span.tension_kn:.2f} kN ({span.source})"
+        parts = [f"Span {span.length_m:.0f} m long, up to {span.max_gap_m:.2f} m above the seabed {at}"]
         if np.isfinite(span.min_bend_radius_m) or span.min_bend_radius_m == math.inf:
             text = f"bend radius at its supports {_radius_text(span.min_bend_radius_m)}"
             if span.below_mbr:
@@ -970,9 +1033,13 @@ def findings(result: PlanningResult) -> List[RangeFinding]:
     for a, b in _range_runs(over, x):
         peak = float(np.nanmax(tension[a:b + 1]))
         limit = float(np.nanmin(st.npts_kn[a:b + 1]))
-        out.append(RangeFinding("npts", ERROR, float(kp[a]), float(kp[b]),
-                                f"Residual tension up to {peak:.2f} kN, above the cable's NPTS of {limit:.1f} kN",
-                                peak, limit, "kN"))
+        if unbounded(peak):
+            text = (f"No finite tension: the cable laid here is shorter than the seabed even pulled straight (see "
+                    f"'Cable short of the seabed'), far above the cable's NPTS of {limit:.1f} kN")
+            peak = math.inf
+        else:
+            text = f"Residual tension up to {peak:.2f} kN, above the cable's NPTS of {limit:.1f} kN"
+        out.append(RangeFinding("npts", ERROR, float(kp[a]), float(kp[b]), text, peak, limit, "kN"))
 
     for item in result.shortfalls:
         over_npts = math.isfinite(item.npts_kn) and item.tension_kn > item.npts_kn
@@ -1041,7 +1108,7 @@ def findings(result: PlanningResult) -> List[RangeFinding]:
             continue
         i = int(np.clip(np.searchsorted(kp, turn_kp), 0, len(kp) - 1))
         t_kn = float(tension[i])
-        if t_kn <= c.conform_below_kn:
+        if t_kn <= c.conform_below_kn or unbounded(t_kn):
             continue
         w = float(st.w_npm[i])
         mu_l = float(st.mu_lateral[i])
@@ -1075,6 +1142,7 @@ CHECK_LABELS = {
     "alter_course": "Alter course (lateral)",
     "span_indicative": "Span below the data's resolution",
     "data_resolution": "Seabed data too coarse",
+    "event_check": "Event not in the model",
 }
 
 

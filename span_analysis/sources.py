@@ -493,15 +493,19 @@ def fit_makeup(store, fit_id: str, rows: Sequence[Dict],
                                 "with no NPTS.")
         sections.append(pl.CableSection(measured(span.kp_start_km), measured(span.kp_end_km), cable))
     bodies: List[pl.Body] = []
+    anchor_kp = measured(anchor.kp_km)
     for landing in result.bodies:
         if landing.kp_km is None:
             continue
         item = landing.item
+        from_anchor = abs(float(landing.cable_dist_m) - anchor.cable_dist_m)
+        placement = (f"Placed by the assembly fit {from_anchor:,.0f} m of cable from its anchor at KP "
+                     f"{anchor_kp:.3f}, through the RPL's planned slack")
         bodies.append(pl.Body(item.name or "Body", measured(landing.kp_km),
                               length_m=float(item.length_m or 0.0),
                               weight_kn=float(item.point_load_kN or 0.0),
                               diameter_m=float(item.diameter_m) if item.diameter_m else math.nan,
-                              kind=body_kind(item.name)))
+                              kind=body_kind(item.name), placement=placement, anchor_kp_km=anchor_kp))
     return sections, bodies, warnings
 
 

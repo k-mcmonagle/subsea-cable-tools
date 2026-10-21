@@ -992,6 +992,53 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   patterns with the plot transform until they vanish.
 - **Hidden setup rows leave the form layout on Qt 5** (it keeps their spacing;
   Qt 6.4+ uses setRowVisible).
+- **The Slack plot shows bottom slack by default** (laid over the seabed: 0
+  where the cable lies on it). Over the route (the RPL convention) a lying
+  cable sits at the fill, so a span read as positive slack (+0.07% at a
+  40 m suspension whose cable is 5.7% shorter than the seabed under it);
+  that basis stays as an option. Both are running windows (a length budget,
+  not the state at a point: part-way along a span a short window can hold
+  more cable than the flat floor under it), so the shortfall is shaded only
+  where the cable uses less than the seabed, and each span's shortfall in
+  metres (as drawn, no window) is in the Spans table.
+- **No finite tension is said, not drawn.** A cable laid shorter than the
+  seabed has no finite tension (inextensible); the pull-taut search limit
+  (2000 kN) is left out of the tension plot and replaced in findings,
+  readouts and exports.
+- **Friction is live too.** A friction change sets the friction on the kept
+  stations (``with_friction``) and solves again; the highest tension for
+  spans within limits is frictionless and is kept. Find tension and the
+  sweep say when the stations they ran on have changed since.
+- **Events are display only, at the analysis's KPs, never shifted.** RPL
+  events use the measured KPs of their positions; Route Comments and the
+  Burial Planner plan show only when made on the same RPL (or layer), start
+  KP and KP convention, on the route as it is now (comments: route length
+  within 1 m; plans: the RPL fingerprint they were generated on), else they
+  are left out and counted in the Events tab. An RPL event a modelled body
+  or seabed feature carries (within 50 m) is drawn once, as that item; RPL
+  repeaters, joints, BUs and equalisers and RPL or burial crossings the
+  model does not carry are information findings. Event text no Workbench
+  event rule matches is tried against common names (``RPT 12``, ``A/C 3``).
+- **Event labels sit in a lane above the profile, laid out in pixels.** One
+  painted item per row (lane, leaders, guides), labels on 1-4 rows that
+  never overlap (priority: the model, RPL bodies, crossings, comments and
+  markers, operations), a tick at every event and hover for the rest; the
+  lane is inside the profile's row so each leader runs on down to the cable.
+  Ranges are bars, labelled only where a stretch is wide enough.
+- **Own markers are Route Comments where the route is on the map** (they
+  are seen on the map and by others); scenario markers cover profiles with
+  no map route and quick notes, and are kept out of the keys that say the
+  results are current. The comment register and the burial file are watched
+  by file time: the register's own connection is shared in QGIS, so its
+  ``data_version`` misses the Route Comments dock's writes. The burial file
+  is read with plain SELECTs, its journal mode left as it is.
+- **Cable colour classes are fixed** (quarters of NPTS, kN bands, the loop
+  check's limits), never stretched to the data, so a colour keeps its
+  meaning as the lay control moves; red and amber stay with the findings.
+  No colouring by span severity (already filled), bend radius (the route
+  model has no EI) or reaction per metre (a point load over the station
+  spacing). Paths are built for the KPs in view, each pixel's highest and
+  lowest point kept.
 
 ## Tools across project changes (October 2026)
 

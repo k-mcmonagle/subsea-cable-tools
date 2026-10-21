@@ -834,6 +834,15 @@ class RouteCommentsDock(QDockWidget):
     def visible_ids(self) -> List[str]:
         return [self.proxy.data(self.proxy.index(row, 0), ID_ROLE) for row in range(self.proxy.rowCount())]
 
+    def show_comment(self, comment_id: str) -> bool:
+        """Select a comment (another tool asked); False when it is not in the set shown."""
+        if comment_id not in self.by_id:
+            self.reload()
+        if comment_id not in self.by_id:
+            return False
+        self._select_ids([comment_id])
+        return True
+
     def _select_ids(self, ids: List[str], scroll: bool = True) -> None:
         selection = QItemSelection()
         first = None

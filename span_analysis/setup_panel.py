@@ -351,6 +351,9 @@ def _source_key(source: str) -> str:
     return os.path.normcase(str(source or "").strip())
 
 
+MU_SLIDER_MAX = 1.5   # the friction slider's top (higher values are typed: rock can hold far more)
+
+
 def _spin(lo: float, hi: float, value: float, decimals: int = 2, step: float = 0.1, suffix: str = "",
           tip: str = "") -> QDoubleSpinBox:
     spin = QDoubleSpinBox()
@@ -378,6 +381,7 @@ def _opt_float(text: str) -> Optional[float]:
 class SetupPanel(QWidget):
     changed = pyqtSignal()           # any setting
     controlChanged = pyqtSignal()    # lay control only (live update)
+    frictionChanged = pyqtSignal()   # seabed friction only (live update: new friction on the same stations)
     libraryRequested = pyqtSignal()
     tensionFinderRequested = pyqtSignal()
 
@@ -909,14 +913,34 @@ class SetupPanel(QWidget):
                "axial resistance can be many times the interface friction (Griffiths et al. 2024). Run a low, "
                "best and high value. A higher value keeps cable more local and holds steeper slopes.")
         self.mu = _spin(0.0, 5.0, pl.DEFAULT_MU, 2, 0.05, "", tip)
-        self.mu_lat = _spin(0.0, 5.0, pl.DEFAULT_MU, 2, 0.05, "", "Lateral friction, for the alter-course check.")
-        for spin in (self.mu, self.mu_lat):
-            spin.valueChanged.connect(self._emit_changed)
-        form.addRow("Axial μ (all)", self.mu)
-        form.addRow("Lateral μ (all)", self.mu_lat)
+        self.mu_slider = QSlider(_HORIZONTAL)
+        self.mu_slider.setRange(0, int(round(MU_SLIDER_MAX * 100)))
+        self.mu_slider.setToolTip(tip + f" The slider covers 0 to {MU_SLIDER_MAX:g}; type a higher value.")
+        self.mu_slider.setValue(int(round(pl.DEFAULT_MU * 100)))
+        mu_row = QHBoxLayout()
+        mu_row.setContentsMargins(0, 0, 0, 0)
+        mu_row.addWidget(self.mu)
+        mu_row.addWidget(self.mu_slider, 1)
+        self.mu_row = QWidget()
+        self.mu_row.setLayout(mu_row)
+        self.mu_lat = _spin(0.0, 5.0, pl.DEFAULT_MU, 2, 0.05, "",
+                            "Lateral friction. Used only for the alter-course note (the turn radius the cable holds "
+                            "at its tension): the model is 2D, in the vertical plane along the route, and never "
+                            "moves the cable sideways.")
+        self.mu.valueChanged.connect(self._on_mu)
+        self.mu_slider.valueChanged.connect(lambda position: self.mu.setValue(position / 100.0))
+        self.mu_lat.valueChanged.connect(self._emit_friction)
+        form.addRow("Axial μ (all)", self.mu_row)
+        form.addRow("Lateral μ (alter-course note)", self.mu_lat)
+        # The same setting as the lay control's box: friction updates the results as it changes too.
+        self.live_friction = QCheckBox("Update the results as values change")
+        self.live_friction.setChecked(True)
+        self.live_friction.setToolTip("Solve again as μ, the soil zones or the friction table change (and the lay "
+                                      "control), without sampling the seabed again.")
+        form.addRow(self.live_friction)
         self.use_zones = QCheckBox("Soil zones and friction table")
         self.use_zones.toggled.connect(self._update_visibility)
-        self.use_zones.toggled.connect(self._emit_changed)
+        self.use_zones.toggled.connect(self._emit_friction)
         form.addRow(self.use_zones)
         self.zones = EditTable([Col("kp0", "KP from", "float"), Col("kp1", "KP to", "float"),
                                 Col("soil", "Soil", "text", "Sand")], "Add zone", height=70, title="soil zones")
@@ -927,7 +951,7 @@ class SetupPanel(QWidget):
             Col("mu", "Axial μ", "float", 0.5), Col("mu_lat", "Lateral μ", "float", None),
         ], "Add row", height=70, title="friction table")
         for table in (self.zones, self.friction_table):
-            table.changed.connect(self._emit_changed)
+            table.changed.connect(self._emit_friction)
         self.zones_label = QLabel("Soil zones by KP (the rest uses the values above)")
         self.table_label = QLabel("Friction by cable type / body kind and soil (most specific row wins)")
         form.addRow(self.zones_label)
@@ -961,9 +985,13 @@ class SetupPanel(QWidget):
         form.addRow("Value", self.value_row)
         self.value.valueChanged.connect(self._on_value)
         self.slider.valueChanged.connect(self._on_slider)
-        self.live = QCheckBox("Update the results as the value changes")
+        self.live = QCheckBox("Update the results as values change")
         self.live.setChecked(True)
+        self.live.setToolTip("Solve again as the lay control or the seabed friction changes, without sampling the "
+                             "seabed again (about a second).")
         form.addRow(self.live)
+        self.live.toggled.connect(self.live_friction.setChecked)
+        self.live_friction.toggled.connect(self.live.setChecked)
         self.direction = QComboBox()
         for key, label in DIRECTIONS:
             self.direction.addItem(label, key)
@@ -1015,6 +1043,12 @@ class SetupPanel(QWidget):
     def _on_slider(self, position: int) -> None:
         lo, hi = self._slider_range()
         self.value.setValue(lo + (hi - lo) * position / 1000.0)
+
+    def _on_mu(self, value: float) -> None:
+        self.mu_slider.blockSignals(True)
+        self.mu_slider.setValue(int(round(min(max(value, 0.0), MU_SLIDER_MAX) * 100)))
+        self.mu_slider.blockSignals(False)
+        self._emit_friction()
 
     # -- criteria ---------------------------------------------------------------------------
     def _build_criteria(self) -> QWidget:
@@ -1310,6 +1344,13 @@ class SetupPanel(QWidget):
         self.update_status()
         self.changed.emit()
         self.controlChanged.emit()
+
+    def _emit_friction(self, *_args) -> None:
+        if self._loading:
+            return
+        self.update_status()
+        self.changed.emit()
+        self.frictionChanged.emit()
 
     def _on_route_changed(self, *_args) -> None:
         if self.sender() is self.rpl_combo:

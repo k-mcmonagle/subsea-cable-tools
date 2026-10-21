@@ -25,6 +25,7 @@ from ..cable_seabed import planning as pl
 from ..span_analysis import dialog as dlg
 from ..span_analysis import sources
 from ..span_analysis import store as span_store
+from ..span_analysis.results_panel import SPAN_HEADERS
 from ..span_analysis.setup_panel import CABLE_MANUAL
 from .test_lay_assessment_qgis import DEG_PER_M, sand_wave_raster
 
@@ -78,8 +79,12 @@ def _make_dialog():
     plot = dialog.plot
     plot.persist = False   # never write the tester's QSettings
     for check, on in ((plot.true_scale_check, False), (plot.reverse_check, False), (plot.sea_check, True),
-                      (plot.labels_check, True)):
+                      (plot.leaders_check, True), (plot.guides_check, False), (plot.event_check_action, True)):
         check.setChecked(on)
+    for action in list(plot.event_sources.values()):
+        action.setChecked(True)
+    plot.slack_basis_actions["seabed"].setChecked(True)
+    plot.colour_actions["plain"].setChecked(True)
     return dialog
 
 
@@ -250,7 +255,7 @@ def test_protection_and_find_tension() -> List[bool]:
         result = dialog._result
         st = result.stations if result is not None else None
         drawn = dialog.plot.protection_curve.getData()[1]
-        labels = [text for text, _kp, _depth in dialog.plot._labels()]
+        labels = [e.label for e in dialog.plot.shown_events()]   # labelled on the events lane
         settings = dialog.setup.settings()
         ok = st is not None and len(st.protection) == 1 and np.isfinite(drawn).sum() > 10             and "Articulated pipe" in labels and settings["cable"]["protection"][0]["weight"] == 45.0
         out.append(_report("protection: in the stations, drawn on the cable, labelled and saved", ok))
@@ -798,7 +803,7 @@ def test_plot_and_layout_controls() -> List[bool]:
         tabs = [re.sub(r" \(\d+\)$", "", results.tabText(k)) for k in range(results.count())]   # no counts
         results.show_sweep()
         out.append(_report("results tabs: findings first, then the tools; the sweep sits in Find tension",
-                           tabs == ["Findings", "Spans", "Bodies", "Summary", "Find tension", "Detail (EI)"]
+                           tabs == ["Findings", "Spans", "Bodies", "Events", "Summary", "Find tension", "Detail (EI)"]
                            and results.currentWidget() is results.find_page
                            and results.sweep_section.button.isChecked(), str(tabs)))
     finally:
@@ -871,7 +876,9 @@ def test_data_resolution_in_the_window() -> List[bool]:
               and "indicative" in dialog.status.text())
         out.append(_report("coarse data: spans indicative, the stretch flagged, the data and filter stated", ok,
                            f"{note} | {dialog.status.text()[:90]}"))
-        spans_text = [dialog.results.spans_table.item(r, 12).text() for r in range(dialog.results.spans_table.rowCount())]
+        column = SPAN_HEADERS.index("Resolved by the data")
+        spans_text = [dialog.results.spans_table.item(r, column).text()
+                      for r in range(dialog.results.spans_table.rowCount())]
         out.append(_report("spans table says which spans the data resolves",
                            any(t.startswith("no: needs 75 m") for t in spans_text), str(spans_text[:3])))
 

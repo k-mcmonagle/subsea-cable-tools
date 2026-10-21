@@ -123,9 +123,16 @@ protection.
 
 ### Friction
 
-- **Default.** One axial and one lateral Coulomb coefficient (default 0.5).
+- **Default.** One axial and one lateral Coulomb coefficient (default 0.5). The axial μ has a slider (0 to 1.5;
+  type a higher value, e.g. on rock).
 - **Soil zones and friction table.** Add soil zones by KP. A table then gives coefficients by cable type or body
   kind and soil. `*` matches any. The most specific row wins.
+- **Update the results as values change** (on by default, the same setting as the lay control's): a change of
+  μ, the zones or the table solves again in about a second, without sampling the seabed again.
+
+The model is 2D, in the vertical plane along the route: the axial μ carries the lay history (residual tension,
+sliding on slopes, loop risk). **The lateral μ is used only for the alter-course note** (the turn radius the cable
+holds at its tension); nothing in the model moves the cable sideways.
 
 No published axial coefficient for cables on sand or clay was found. Pipeline guidance gives 0.6 on sand and 0.2
 on clay, laterally (DNV-RP-F109). On rock, axial resistance can be many times the interface friction (Griffiths et
@@ -160,6 +167,10 @@ The **fill** is the slack needed to follow the seabed: seabed length over route 
 
 Tension from slack is very sensitive: about 0.02% of cable length can change it by 20%. Plan against spans with
 tension control, and against loops with slack control.
+
+Where even pulled straight the cable laid is shorter than the seabed it must cover, it has **no finite tension**
+(the cable is inextensible). The findings, readouts and exports say so (a red finding, "unbounded" in the CSV),
+and the tension plot leaves a gap there rather than drawing the search limit.
 
 ### 2. Residual tension: lay history and Coulomb friction
 
@@ -308,32 +319,78 @@ tool lists these values at each RPL vertex as information.
 | Alter course (lateral) | info |
 | Span below the data's resolution (indicative) | info |
 | Seabed data too coarse for the reporting length | info; amber beyond the red length |
+| Event not in the model (an RPL repeater, joint, BU or equaliser with no body within 50 m; an RPL or burial-plan crossing with no seabed feature) | info |
 
 ## Results and links
 
 - **Profile.** Five linked rows. Drag the handles between them to share the height.
   - a status bar (green, blue, amber, red, grey);
-  - the seabed and cable. Spans are filled red or amber by level. Light grey marks cable clear of the seabed
-    but under the reporting limits (not reported). Also shown: supports (hover for the reaction and bend
-    radius), bodies (hover or click for their details; labels optional), the detail cable and sea level;
+  - the events lane (see *Events* below) and the seabed and cable. Spans are filled red or amber by level. Light
+    grey marks cable clear of the seabed but under the reporting limits (not reported). Also shown: supports
+    (hover for the reaction and bend radius), bodies (hover or click for their details), the detail cable and sea
+    level;
   - the residual and lay tension, NPTS, and the highest tension for spans within limits;
-  - slack laid, fill and used, with the surplus shaded, and the RPL's planned slack per leg;
+  - slack (see *Slack* below);
   - the seabed slope against the friction angle.
 
   The previous run is shown dashed, so a change can be compared. *Fit*, or the *A* at the bottom left of a
   zoomed plot, shows the whole profile; a run over the same KPs keeps the view where you zoomed it. *True scale
-  (1:1)* shows slopes and spans as they are. *Plots* shows or hides each row, the sea level, the previous run,
-  body labels and legends, reverses KP, and restores the *Default view*. *Tooltip* turns the tooltip at the cursor
-  on or off and chooses its fields (KP, seabed and cable depth, gap and span, residual and lay tension, the highest
-  tension for spans within limits, slack, slope and friction, cable type, soil); the line below the plots shows
-  everything. Hover the status bar for the findings at a KP (the stretch under the cursor is outlined) and click it
-  to go to the worst of them. *Measure* gives two-point lengths, heights and angles, as in the Depth Profile.
+  (1:1)* shows slopes and spans as they are. *Plots* shows or hides each row, the sea level, the previous run and
+  legends, chooses the slack basis and the cable colour, reverses KP, and restores the *Default view*. *Tooltip*
+  turns the tooltip at the cursor on or off and chooses its fields (KP, seabed and cable depth, gap and span,
+  residual and lay tension, the highest tension for spans within limits, slack, slope and friction, cable type,
+  soil); the line below the plots shows everything. Hover the status bar for the findings at a KP (the stretch
+  under the cursor is outlined) and click it to go to the worst of them. *Measure* gives two-point lengths,
+  heights and angles, as in the Depth Profile.
+- **Slack.** Cable laid and cable used by the rest shape, with the RPL's planned slack per leg, over a running
+  window (*Slack window*, 100 m by default, in Reporting limits). Lengths are on the seabed smoothed over the
+  cable's conformity length (the legend says both).
+  - **Over the seabed (bottom slack, the default).** 0 where the cable lies on the seabed. Below 0 the cable is
+    shorter than the seabed under it: it bridges it (spans), shaded brown. Above 0 it has surplus, shaded green.
+  - **Over the route** (as RPL slack is given). A cable lying on the seabed sits at the *fill* (the seabed length
+    over the route), not at 0: on undulating or sloping seabed a spanning cable still reads positive here.
+
+  The dashed amber line is the loop-risk threshold: where the laid cable passes it at zero tension, the loop check
+  flags. A window is a length budget, not the state at a point (part-way along a span a short window can hold
+  more cable than the flat floor under it): read spans from the profile, and each span's shortfall (how much
+  shorter the cable is than the seabed from lift-off to touchdown, as drawn) from the Spans table.
+- **Colour the cable by** (*Plots*), in fixed classes so a colour keeps its meaning as you change the lay control:
+  - *Slack state and loop risk*: held by tension; at zero tension with surplus under half the loop limit; with
+    surplus over half of it; loop risk (the loop check's limit); not held by friction (slides).
+  - *Tension (% of NPTS)*: quarters of NPTS and above NPTS (kN bands where a cable has no NPTS), zero shown grey.
+  - *What sets the tension*: the bottom tension, pulled taut (slack short of the seabed), raised by a slope, or
+    zero.
+
+  Span severity is not offered (spans are already filled), nor bend radius along the cable (the route model has
+  no bending stiffness: use Detail (EI)).
+- **Events.** A lane above the profile labels what happens where, at the analysis's KPs, with a leader down to
+  the cable (filled where the model carries it, hollow and dashed where it does not):
+  - *RPL events*: the analysed RPL's Event column (with its Remarks), sorted by the Workbench event rules into cable
+    bodies, crossings, operations (PLDN, PLUP, burial), alter courses (off by default) and others; text no rule
+    matches is tried against common names (RPT 12, A/C 3). An RPL event that a modelled body or seabed feature
+    carries (within 50 m) is drawn once, as that item;
+  - *In the model*: bodies, protection ranges and seabed features. A body from an assembly fit says how far it
+    moves for each 0.1% of slack laid differently from the RPL plan;
+  - *Route Comments* on the same route: points and KP ranges, closed ones optional (grey). Double-click one to open
+    it in Route Comments;
+  - *Burial plan*: the Burial Planner plan for the same RPL (the issued one, else the latest; *Events ▸ Burial plan*
+    chooses): PLDN / PLUP or start / end of burial, burial and skip sections, crossings and other hazards;
+  - *My markers*: saved with the scenario.
+
+  Comments and plans made on another RPL, start KP or KP convention, or on the route before it was edited, are
+  left out, never shifted; the Events tab says how many and why. Right-click the profile or the lane to add a
+  marker or a Route Comment at a KP (or over the KPs in view), or to edit or delete a marker. The *Events* menu
+  chooses the sources and groups, the labels (name, or name and KP; 1 to 4 rows), the leaders and faint lines
+  through the other plots, and whether RPL bodies and crossings are checked against the model. Labels never
+  overlap: an event without room keeps its tick, and hovering lists it. Route Comments and the burial plan are
+  read again when they change.
 - **Map.** Hovering moves a marker along the route. A click shows the KP on the map. *Pick KP on map* goes from the
   map to the profile. Findings and spans highlight their KP range.
 - **Tabs** (click a column heading to sort):
   - Findings;
-  - Spans (with bodies in each span);
+  - Spans (with bodies in each span, and how much shorter each is than the seabed under it);
   - Bodies;
+  - Events (source, type, KP, in the model or not, details; what was left out and why);
   - Summary (inputs, totals, notes);
   - Find tension, with the tension sweep below it;
   - Detail (EI).
@@ -341,7 +398,9 @@ tool lists these values at each RPL vertex as information.
   X = KP × 1000, Y = elevation × a chosen vertical exaggeration). The DXF layers are `SA_SEABED`,
   `SA_SEABED_SAMPLED`, `SA_CABLE`, `SA_CABLE_DETAIL`, `SA_SPAN_RED`, `SA_SPAN_AMBER`, `SA_SPAN_INDICATIVE`, `SA_CLEAR_UNDER_LIMITS`,
   `SA_SUPPORTS`, `SA_BODIES`, `SA_PROTECTION`, `SA_FEATURES`, `SA_SEA_LEVEL`, `SA_FRAME` and `SA_TEXT`. The tension, slack and slope
-  graphs sit below the profile, with one layer per curve. *Add to map* writes the findings as a line layer.
+  graphs sit below the profile, with one layer per curve (the slack graph on the basis the plot shows). The profile
+  CSV has the slack over the route (`fill_pct` ... `surplus_pct`) and over the seabed (`bottom_*`). *Add to map*
+  writes the findings as a line layer.
 
 ## Examples
 
@@ -367,12 +426,12 @@ tool lists these values at each RPL vertex as information.
 Scenarios save in one GeoPackage per project, by default `<project folder>/span_analysis/<project>_span_analysis.gpkg`.
 The path is kept in the project, and you can open another file or start a new one. Each scenario keeps:
 
-- all its settings (layers by id);
+- all its settings (layers by id) and its markers;
 - the sampled seabed, so it reopens without sampling again.
 
 ## Validation
 
-Unit tests (`tests/test_cable_seabed.py`, `tests/test_span_analysis_qgis.py`):
+Unit tests (`tests/test_cable_seabed.py`, `tests/test_span_analysis_qgis.py`, `tests/test_span_events.py`):
 
 | Case | Source | Result |
 |---|---|---|
@@ -388,6 +447,8 @@ Unit tests (`tests/test_cable_seabed.py`, `tests/test_span_analysis_qgis.py`):
 | Spans grow with tension | Binda & Contro 1979 | monotonic |
 | Rest shape against the plugin's drape solver (dynamic relaxation, large rotation) at its tension | independent solver | RMS 22 mm; gap within 10% |
 | Slack above the fill lies at zero tension with the surplus; below it is pulled taut with no surplus | model rule | yes |
+| A cable lying on the seabed has 0% bottom slack; over a 40 m trough it reads below 0 (−2.35% over 100 m) while over the route it reads +0.07% | definition | yes |
+| Friction set on prepared stations gives the same answer as preparing them with it (live update) | consistency | exact |
 
 ## Assumptions and limits
 

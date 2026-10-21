@@ -33,25 +33,35 @@ choose the type there. The mapping is saved in the QGIS project and the Lay Asse
 Under <i>Protection</i>,
 add protection over a KP range (e.g. polymer half-shells or articulated pipe): its added weight in water, outside
 diameter, added EI and its own MBR, from the protection's data sheet.</li>
-<li><b>Friction.</b> One axial coefficient for the route, or soil zones by KP with a table of coefficients for each
-cable type (or body kind) and soil.</li>
+<li><b>Friction.</b> One axial coefficient for the route (type it or use the slider), or soil zones by KP with a
+table of coefficients for each cable type (or body kind) and soil. The model is 2D: the lateral coefficient is used
+only for the alter-course note (the turn radius the cable holds); nothing moves the cable sideways.</li>
 <li><b>Lay control.</b> Bottom tension (kN), bottom slack (% over the seabed), slack over the route (%, as in an
 RPL), or the RPL slack of each leg. Override the value over KP ranges under <i>By KP section</i>. Set the lay
 direction. <i>Find the highest
 tension within limits</i> opens the Find tension tab.</li>
-<li><b>Run.</b> The first run samples the seabed (in the background). After that, a change to the lay control
-updates the results in about a second: move the slider and see the spans grow or shrink. The view stays where
-you zoomed it (a run over other KPs shows the whole profile).</li>
+<li><b>Run.</b> The first run samples the seabed (in the background). After that, a change to the lay control or
+the friction updates the results in about a second: move a slider and see the spans grow or shrink. The view stays
+where you zoomed it (a run over other KPs shows the whole profile).</li>
 <li><b>Read the results.</b> The status bar shows the worst finding by KP: hover it for the findings at a KP,
 click it to go to the worst of them. Spans are filled by level: red,
 amber, and light grey where the cable is clear of the seabed but under the reporting limits (not reported).
 Click a finding or a span to zoom the profile and highlight it on the map; click a column heading to sort a
 table. Hover the profile to move a marker along the route on the map; hover or click a body for its details.
 Use <i>Pick KP on map</i> to go from the map to the profile.</li>
+<li><b>Events.</b> The lane above the profile labels, with a leader down to the cable, the RPL's events (PLDN,
+repeaters, crossings...), what is in the model, Route Comments on this route, the Burial Planner plan for this RPL
+and your own markers, all at the analysis's KPs. A label is filled where the model carries the item, and hollow and
+dashed where it does not (an RPL repeater with no body in the model, a crossing with no seabed feature: these are
+also information findings). Comments and plans made on another RPL, start KP or KP convention are left out, never
+shifted: the Events tab says how many and why. Right-click the profile to add a marker or a Route Comment; hover a
+label for its details; double-click a comment to open it, or a marker to edit it. The <i>Events</i> menu chooses
+what shows and how it is labelled.</li>
 <li><b>Arrange the view.</b> Drag the handles between the rows to share the height. <i>Fit</i>, or the
 <i>A</i> at the bottom left of a zoomed plot, shows the whole profile. <i>True scale (1:1)</i> shows slopes and
-spans as they are. <i>Plots</i> shows or hides each plot, the sea level, the previous run, body labels and
-legends, reverses KP (right to left), and restores the <i>Default view</i>. <i>Tooltip</i> turns the tooltip at
+spans as they are. <i>Plots</i> shows or hides each plot, the sea level, the previous run and legends, chooses
+the slack basis and the cable colour (slack state and loop risk, tension as % of NPTS, or what sets the tension, in
+fixed classes), reverses KP (right to left), and restores the <i>Default view</i>. <i>Tooltip</i> turns the tooltip at
 the cursor on or off and chooses what it shows (the line below the plots shows everything). <i>Measure</i> gives
 two-point lengths, heights and angles, snapped to the seabed or the cable, as in the Depth Profile tool.</li>
 <li><b>Look closer.</b> <i>Detail (EI)</i> solves a span or the visible window with bending stiffness: bend radius,
@@ -102,7 +112,14 @@ pulled taut: the tool finds the tension at which the rest shape uses exactly the
 surplus, the tension is zero and the surplus is stored slack. The <i>fill</i> is the slack needed to follow the
 seabed (seabed length over route length, Zajac 1957). <i>Surplus</i> = laid &minus; used by the rest shape. Note:
 tension from slack is very sensitive. About 0.02% of cable length can change it by 20%, so use tension control to
-plan against spans and slack control to plan against loops.</p>
+plan against spans and slack control to plan against loops. Where the cable laid is shorter than the seabed even
+pulled straight, it has no finite tension: the tool says so rather than give a number.</p>
+<p><b>Reading the Slack plot.</b> By default it shows <i>bottom slack</i>: the cable over the seabed under it. 0 is
+a cable lying on the seabed; below 0 the cable is shorter than the seabed (it bridges it: spans, shaded brown);
+above 0 it has surplus (green), and the dashed amber line is where the loop check flags at zero tension. Over the
+route (the RPL convention, in <i>Plots</i>) a lying cable sits at the fill, not at 0, so a spanning cable can read
+positive there. Both are over a running window (a length budget, not the state at one point): read spans on the
+profile, and each span's shortfall in metres in the Spans table.</p>
 <p><b>Spans and supports.</b> A span runs from lift-off to touchdown. It is reported when it rises more than the
 reporting gap and is longer than the reporting length (defaults 0.3 m and 5 m, red at 1 m or 50 m, below the
 MBR, or above the contact limit when you set one). Near a touchdown on a flat seabed the gap grows only as

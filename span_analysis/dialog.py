@@ -2,14 +2,21 @@
 """Span & Slack Analysis: the tool window.
 
 Left: the setup steps and the Run button. Right: the profile (status bar,
-seabed and cable, tension, slack, slope and friction) above the results
-(findings, spans, bodies, the detail model, the tension sweep and a summary).
+events lane, seabed and cable, tension, slack, slope and friction) above the
+results (findings, spans, bodies, events, the detail model, the tension sweep
+and a summary).
 
 A run reads the setup on the GUI thread, then samples the seabed (the first
 time, or when the route or seabed changes) and solves the model in a
 background task. The stations are kept, so a change of the lay control (the
-slider) solves again in about a second ("live"). Scenarios save in the
-project's Span Analysis GeoPackage (:mod:`span_analysis.store`).
+slider) or of the friction solves again in about a second ("live").
+Scenarios save in the project's Span Analysis GeoPackage
+(:mod:`span_analysis.store`), with their markers.
+
+Events (:mod:`span_analysis.events`) come from the analysed RPL, the model,
+Route Comments, the Burial Planner and the scenario's markers. The comment
+register and the burial file are watched while the window is open, so the
+lane follows changes made in those tools.
 """
 
 from __future__ import annotations
@@ -27,6 +34,8 @@ from qgis.PyQt.QtCore import QSettings, Qt, QTimer, QUrl
 from qgis.PyQt.QtGui import QColor, QDesktopServices
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
+    QLineEdit,
+    QPlainTextEdit,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -72,7 +81,7 @@ from ..qgis_compat import (
     WINDOW_TYPE_WINDOW,
     qt_exec,
 )
-from . import dxf_io, sources, store as span_store
+from . import dxf_io, events as ev, sources, store as span_store
 from .help import HELP_HTML
 from .map_link import KpPickTool, MapLink
 from .plot_panel import ProfilePlot, menu_button
@@ -150,6 +159,8 @@ class SpanAnalysisDialog(QDialog):
         self._previous: Optional[pl.PlanningResult] = None
         self._stations = None
         self._stations_key = ""
+        self._stations_base_key = ""    # the stations' settings apart from the friction (live friction)
+        self._tools_key = ""            # the stations Find tension / the sweep last ran on
         self._result_key = ""
         self._profile: Optional[Dict] = None
         self._profile_key = ""
@@ -165,6 +176,17 @@ class SpanAnalysisDialog(QDialog):
         self._carry_dirty: Optional[bool] = None   # unsaved changes when the last project closed
         self._project_hooks: List = []
         self._shown_once = False
+        # Events: the route as other tools record theirs, what was read for it, and the scenario's markers.
+        self._markers: List[Dict] = []
+        self._route_identity: Optional[ev.RouteIdentity] = None
+        self._route_layer = None                  # the route's layer (Route Comments capture on it)
+        self._external_events: List[ev.ProfileEvent] = []
+        self._event_notes: List[str] = []
+        self._rpl_events = (None, [])             # (model, its events): read once per RPL model
+        self._burial_choice = ""
+        self._watch_stamp = None
+        self.comment_hook = None        # set by the plugin: Route Comments' capture, (kind, capture, data)
+        self.comment_open_hook = None   # set by the plugin: show a comment in Route Comments, (comment_id)
         canvas = iface.mapCanvas() if iface is not None else None
         self.map = MapLink(canvas)
         self._pick_tool = None
@@ -254,6 +276,7 @@ class SpanAnalysisDialog(QDialog):
 
         self.setup.changed.connect(self._on_settings_changed)
         self.setup.controlChanged.connect(self._on_control_changed)
+        self.setup.frictionChanged.connect(self._on_control_changed)
         self.setup.libraryRequested.connect(self._open_library)
         self.setup.tensionFinderRequested.connect(self.results.show_find)
         self.plot.kpHovered.connect(self.map.hover_kp)
@@ -261,6 +284,15 @@ class SpanAnalysisDialog(QDialog):
         self.plot.kpDoubleClicked.connect(lambda kp: self.map.show_kp(kp, pan=True))
         self.plot.bodyClicked.connect(self._on_body_clicked)
         self.plot.statusClicked.connect(self._on_status_clicked)
+        self.plot.can_comment = self._can_comment
+        self.plot.eventClicked.connect(self._on_event_clicked)
+        self.plot.eventActivated.connect(self._on_event_activated)
+        self.plot.eventsSettingsChanged.connect(self._refresh_events)
+        self.plot.eventsRefreshRequested.connect(self._refresh_events)
+        self.plot.markerRequested.connect(self.add_marker)
+        self.plot.markerEditRequested.connect(self.edit_marker)
+        self.plot.markerDeleteRequested.connect(self.delete_marker)
+        self.plot.commentRequested.connect(self.add_comment)
         self.plot.reverse_check.toggled.connect(self.results.set_reverse)
         self.results.set_reverse(self.plot.reverse_check.isChecked())
         self.results.findingSelected.connect(lambda f: self._show_range(f.kp_start, f.kp_end, False))
@@ -283,6 +315,10 @@ class SpanAnalysisDialog(QDialog):
         self._project_timer.setSingleShot(True)
         self._project_timer.setInterval(0)
         self._project_timer.timeout.connect(self._follow_project)
+        # The comment register and the burial file change in their own tools: look every few seconds.
+        self._events_timer = QTimer(self)
+        self._events_timer.setInterval(4000)
+        self._events_timer.timeout.connect(self._poll_events)
         self._open_store()
         self._restore_ui()
         self._update_buttons()
@@ -328,6 +364,7 @@ class SpanAnalysisDialog(QDialog):
         self._scenario_id = None
         self._profile, self._profile_key = None, ""
         self._clear_results()
+        self._markers = []
         self.setup.apply_settings(example_settings(index))
         self._dirty = False
         self._refresh_scenarios(None)
@@ -408,6 +445,7 @@ class SpanAnalysisDialog(QDialog):
         if scenario_id and self._store is not None:
             row = self._store.get_scenario(scenario_id)
             settings = self._store.settings_of(row)
+            self._markers = [dict(m) for m in (settings.pop("markers", None) or []) if isinstance(m, dict)]
             self.setup.apply_settings(settings)
             cached = self._store.load_profile(scenario_id)
             if cached and _base_key(cached.get("signature") or "") == self.setup.profile_signature():
@@ -449,7 +487,7 @@ class SpanAnalysisDialog(QDialog):
             summary = {"spans": s.spans, "red_spans": s.red_spans, "span_length_m": s.span_length_m,
                        "max_tension_kn": s.max_tension_kn}
         try:
-            scenario_id = store.save_scenario(name, self.setup.settings(), scenario_id, summary)
+            scenario_id = store.save_scenario(name, self._scenario_settings(), scenario_id, summary)
             if self._profile is not None and _base_key(self._profile_key) == self.setup.profile_signature():
                 store.save_profile(scenario_id, self._profile_key,
                                    {k: v for k, v in self._profile.items() if k != "signature"})
@@ -463,6 +501,14 @@ class SpanAnalysisDialog(QDialog):
         self._dirty = False
         self._refresh_scenarios(scenario_id)
         return True
+
+    def _scenario_settings(self) -> Dict:
+        """The settings saved with a scenario: the setup and the markers (display only: never part of
+        the keys that say whether the results are current)."""
+        settings = self.setup.settings()
+        if self._markers:
+            settings["markers"] = [dict(m) for m in self._markers]
+        return settings
 
     def rename_scenario(self) -> None:
         if not self._scenario_id or self._store is None:
@@ -542,9 +588,13 @@ class SpanAnalysisDialog(QDialog):
     # ------------------------------------------------------------------------------
     # Running
     # ------------------------------------------------------------------------------
-    def _stations_signature(self) -> str:
+    def _stations_signature(self, friction: bool = True) -> str:
+        """The settings the stations depend on (all but the lay control; without the friction too, the
+        part a live update keeps: friction is set on the stations again)."""
         s = self.setup.settings()
         s.pop("control", None)
+        if not friction:
+            s.pop("friction", None)
         s["criteria"] = {k: v for k, v in s["criteria"].items()}
         return json.dumps(s, sort_keys=True, default=str)
 
@@ -556,9 +606,10 @@ class SpanAnalysisDialog(QDialog):
         self._update_stale()
 
     def _on_control_changed(self) -> None:
+        """The lay control or the friction changed: solve again on the same seabed (live)."""
         if self._loading or not self.setup.live.isChecked():
             return
-        if self._stations is not None and self._stations_key == self._stations_signature():
+        if self._stations is not None and self._stations_base_key == self._stations_signature(friction=False):
             self._live_timer.start()
 
     def _update_stale(self) -> None:
@@ -566,6 +617,11 @@ class SpanAnalysisDialog(QDialog):
                                                                            default=str)
         live_pending = self._live_timer.isActive() or self._task_kind == "live"
         self.stale.setVisible(bool(stale and not live_pending))
+        tools_stale = (self._tools_key and self.results.has_tool_results()
+                       and self._tools_key != self._stations_signature())
+        self.results.set_tools_stale(
+            "The seabed, cable, friction or limits have changed since these were found: run them again."
+            if tools_stale else "")
 
     def _build_job(self) -> Dict:
         """Read the setup on the GUI thread into a worker-safe job (raises ValueError)."""
@@ -589,8 +645,13 @@ class SpanAnalysisDialog(QDialog):
         elif route_source == sources.ROUTE_LINE:
             route = sources.route_from_layer(setup.line_combo.currentLayer(), s["route"]["line_selected"],
                                              s["route"]["start_kp"])
+        self._route_identity, self._route_layer = None, None
         if route is not None:
             full = route
+            try:
+                self._route_identity, self._route_layer = self._identify_route(route_source, s, full)
+            except Exception:
+                log_exception("Span & Slack Analysis: the route's identity for events could not be read")
             if window is not None:
                 lo = max(window[0], route.kp_range[0])
                 hi = min(window[1], route.kp_range[1])
@@ -706,6 +767,7 @@ class SpanAnalysisDialog(QDialog):
             return
         info = {"settings": json.dumps(self.setup.settings(), sort_keys=True, default=str),
                 "stations_key": self._stations_signature(), "route": self._route, "notes": job["notes"],
+                "stations_base_key": self._stations_signature(friction=False),
                 "profile_key": job["profile_key"], "sampled": job["profile"] is None}
         self._start("run", "Span & Slack Analysis", lambda cancel, progress: run_job(job, cancel, progress), info)
 
@@ -716,7 +778,7 @@ class SpanAnalysisDialog(QDialog):
             self._task.cancel()
 
     def _run_live(self) -> None:
-        if self._stations is None or self._stations_key != self._stations_signature():
+        if self._stations is None or self._stations_base_key != self._stations_signature(friction=False):
             return
         if self._task is not None:
             if self._task_kind == "live":
@@ -727,13 +789,17 @@ class SpanAnalysisDialog(QDialog):
         legs = sources.rpl_legs(self._rpl_model) if self._rpl_model is not None else []
         control = self.setup.control(legs)
         criteria = self.setup.criteria()
+        # The highest tension for spans within limits is found on a frictionless seabed: it holds.
         allowable = self._result.allowable_kn if self._result is not None else None
+        key = self._stations_signature()
+        friction = self.setup.friction() if key != self._stations_key else None
 
         def work(cancel, progress):
-            return {"result": pl.solve(stations, control, criteria, allowable=False, cancel=cancel, progress=progress,
-                                       allowable_kn=allowable)}
+            st = pl.with_friction(stations, friction) if friction is not None else stations
+            return {"result": pl.solve(st, control, criteria, allowable=False, cancel=cancel, progress=progress,
+                                       allowable_kn=allowable), "stations": st}
 
-        info = {"settings": json.dumps(self.setup.settings(), sort_keys=True, default=str)}
+        info = {"settings": json.dumps(self.setup.settings(), sort_keys=True, default=str), "stations_key": key}
         self._start("live", "Span & Slack Analysis (update)", work, info)
 
     def run_detail(self, _a: float, _b: float, spacing: float) -> None:
@@ -772,6 +838,7 @@ class SpanAnalysisDialog(QDialog):
             self._set_status("Wait for the current run to finish.", error=True)
             return
         stations = self._stations
+        self._tools_key = self._stations_key
         control = self._result.control
         criteria = self.setup.criteria()
         window = self.plot.visible_kp() if request.get("window") == "view" else None
@@ -788,6 +855,7 @@ class SpanAnalysisDialog(QDialog):
             self._set_status("Wait for the current run to finish.", error=True)
             return
         stations = self._stations
+        self._tools_key = self._stations_key
         control = self._result.control
         criteria = self.setup.criteria()
         key = request.get("target")
@@ -924,6 +992,7 @@ class SpanAnalysisDialog(QDialog):
         if kind == "run":
             self._stations = out["stations"]
             self._stations_key = info.get("stations_key", "")
+            self._stations_base_key = info.get("stations_base_key", "")
             profile = out["profile"]
             self._profile, self._profile_key = profile, info.get("profile_key", "")
             if info.get("sampled"):
@@ -932,6 +1001,9 @@ class SpanAnalysisDialog(QDialog):
             self.map.set_route(info.get("route"))
             self._notes = list(info.get("notes") or [])
             self.setup.show_data(self._stations)
+        elif out.get("stations") is not None:     # live: the stations, with the friction now set
+            self._stations = out["stations"]
+            self._stations_key = info.get("stations_key", self._stations_key)
         self._previous = self._result if self._result is not None else None
         self._result = result
         self._result_key = info.get("settings", "")
@@ -942,8 +1014,320 @@ class SpanAnalysisDialog(QDialog):
         notes = list(dict.fromkeys(self._notes + list(result.notes)))
         inputs = self.setup.describe() + ([self._kp_basis] if getattr(self, "_kp_basis", "") else [])
         self.results.set_result(result, summary_html(result, notes, inputs, depression_check(result)))
+        if kind == "run":
+            self._refresh_events()
+        else:
+            self._compose_events()
         self._report(result, notes)
         self._update_buttons()
+        if not self._events_timer.isActive():
+            self._events_timer.start()
+
+    # ------------------------------------------------------------------------------
+    # Events
+    # ------------------------------------------------------------------------------
+    def _identify_route(self, route_source: str, s: Dict, full: sources.RouteGeo):
+        """The analysed route as Route Comments and the Burial Planner record theirs, and its layer."""
+        from ..kp_range_utils import KP_MODE_CARTESIAN, kp_distance_mode
+        from ..route_comments import route_ref
+
+        ident = ev.RouteIdentity(start_kp_km=float(full.kp0), length_m=float(full.length_m))
+        ident.kp_mode = "cartesian" if kp_distance_mode() == KP_MODE_CARTESIAN else "ellipsoidal"
+        layer = None
+        if route_source == sources.ROUTE_RPL:
+            ident.rpl_id = str(s["route"]["rpl_id"] or "")
+            layer = self._rpl_lines_layer(ident.rpl_id)
+        elif route_source == sources.ROUTE_LINE:
+            layer = self.setup.line_combo.currentLayer()
+            if layer is not None and not s["route"].get("line_selected"):
+                # A route made of selected features is not the route comments were made on.
+                ident.layer_id = layer.id()
+                ident.route_hash = route_ref.route_fingerprint(layer)
+                ident.rpl_id = str(route_ref.workbench_rpl_info(layer, self.setup.workbench).get("rpl_id") or "")
+            else:
+                layer = None
+        else:
+            return None, None
+        if layer is not None:
+            ident.convention = route_ref.current_convention(layer)
+            if ident.convention.startswith("grid:"):
+                ident.grid_crs = ident.convention.split(":", 1)[1]
+        return ident, layer
+
+    def _rpl_lines_layer(self, rpl_id: str):
+        """The RPL's lines layer: the project's copy when it is loaded, else the Workbench's own."""
+        store = self.setup.workbench
+        if store is None or not rpl_id:
+            return None
+        rpl = store.get_rpl(rpl_id) or {}
+        name = rpl.get("lines_layer")
+        if not name:
+            return None
+        path = os.path.normcase(os.path.abspath(store.gpkg_path))
+        for layer in QgsProject.instance().mapLayers().values():
+            if not isinstance(layer, QgsVectorLayer):
+                continue
+            source = layer.source()
+            head, _sep, rest = source.partition("|")
+            if head and os.path.normcase(os.path.abspath(head)) == path and \
+                    f"layername={name}".lower() in rest.lower().split("|"):
+                return layer
+        return store.open_layer(name)
+
+    def _classifier(self):
+        from ..workbench.assembly_model import EventClassifier
+
+        store = self.setup.workbench
+        try:
+            if store is not None and store.exists():
+                return EventClassifier(store.list_event_rules()).classify
+        except Exception:
+            log_exception("Span & Slack Analysis: the Workbench event rules could not be read")
+        return EventClassifier.with_defaults().classify
+
+    def _event_files(self) -> List[str]:
+        from ..burial.store import project_gpkg_path
+        from ..route_comments.map_layers import project_register
+
+        files = []
+        try:
+            files.append(project_register()[0] or "")
+        except Exception:
+            files.append("")
+        try:
+            files.append(project_gpkg_path() or "")
+        except Exception:
+            files.append("")
+        return files
+
+    def _event_files_stamp(self):
+        stamp = []
+        for path in self._event_files():
+            for name in (path, path + "-wal") if path else ():
+                try:
+                    info = os.stat(name)
+                    stamp.append((name, info.st_mtime_ns, info.st_size))
+                except OSError:
+                    stamp.append((name, None, None))
+        return tuple(stamp)
+
+    def _poll_events(self) -> None:
+        if self._result is None or not self.isVisible():
+            return
+        if self._event_files_stamp() != self._watch_stamp:
+            self._refresh_events()
+
+    def _refresh_events(self) -> None:
+        """Read the events again (RPL, comments, burial plan, markers) and draw them."""
+        events: List[ev.ProfileEvent] = []
+        notes: List[str] = []
+        ident = self._route_identity
+        model = self._rpl_model
+        if model is not None:
+            if self._rpl_events[0] is not model:
+                try:
+                    self._rpl_events = (model, ev.rpl_events(model, sources.rpl_measured_kps(model),
+                                                             self._classifier()))
+                except Exception:
+                    log_exception("Span & Slack Analysis: reading the RPL's events failed")
+                    self._rpl_events = (model, [])
+            events.extend(self._rpl_events[1])
+        settings = self.plot.event_settings()
+        if ident is not None:
+            from ..route_comments.map_layers import project_register
+
+            try:
+                rows, closed = ev.read_comment_rows(project_register()[0])
+                found, more = ev.comment_events(rows, ident, closed, settings["closed"])
+                events.extend(found)
+                notes.extend(more)
+            except Exception:
+                log_exception("Span & Slack Analysis: reading Route Comments failed")
+                notes.append("Route Comments could not be read.")
+        plans: List = []
+        plan = None
+        if ident is not None and ident.rpl_id:
+            from ..burial.store import project_gpkg_path
+
+            try:
+                data = ev.read_burial(project_gpkg_path() or "", ident.rpl_id)
+                plans = data["plans"]
+                plan = ev.choose_plan(plans, self._burial_choice)
+                if plan is not None:
+                    found, more = ev.burial_events(plan, data["events"].get(plan["plan_id"], []),
+                                                   data["sections"].get(plan["plan_id"], []),
+                                                   data["hazards"].get(plan["plan_id"], []), ident,
+                                                   self._rpl_fingerprint(ident.rpl_id))
+                    events.extend(found)
+                    notes.extend(more)
+                    if len(plans) > 1:
+                        notes.append(f"Burial plan shown: '{plan.get('name') or 'Plan'}', one of {len(plans)} for "
+                                     "this RPL (Events ▸ Burial plan chooses).")
+            except Exception:
+                log_exception("Span & Slack Analysis: reading the Burial Planner plan failed")
+                notes.append("The Burial Planner file could not be read.")
+        self.plot.set_burial_plans([(p["plan_id"], str(p.get("name") or "Plan")) for p in plans],
+                                   plan["plan_id"] if plan is not None else "", self._choose_burial_plan)
+        if self._route_identity is None and self._result is not None and self._route is None:
+            notes.append("This profile has no map route: RPL events, Route Comments and the burial plan do not "
+                         "apply (your markers do).")
+        events.extend(ev.marker_events(self._markers))
+        self._external_events, self._event_notes = events, notes
+        self._watch_stamp = self._event_files_stamp()
+        self._compose_events()
+
+    def _rpl_fingerprint(self, rpl_id: str) -> str:
+        try:
+            from ..burial.map_layers import rpl_fingerprint
+
+            store = self.setup.workbench
+            return rpl_fingerprint(store.get_rpl(rpl_id), store.gpkg_path) if store is not None else ""
+        except Exception:
+            log_exception("Span & Slack Analysis: the RPL fingerprint could not be read")
+            return ""
+
+    def _choose_burial_plan(self, plan_id: str) -> None:
+        self._burial_choice = plan_id
+        self._refresh_events()
+
+    def _compose_events(self) -> None:
+        """Match the events with the model, draw them, list them, and check them (findings)."""
+        r = self._result
+        model_events = ev.model_events(r) if r is not None else []
+        events = ev.match_model(model_events + self._external_events)
+        self.plot.set_events(events)
+        notes = list(self._event_notes)
+        if self.plot.events_outside():
+            notes.append(f"{self.plot.events_outside()} event(s) outside the analysed KPs.")
+        self.results.set_events(self.plot.shown_events(), notes)
+        if r is None:
+            return
+        kp = r.stations.kp_km
+        base = [f for f in r.findings if f.check_id != "event_check"]
+        checks = ev.check_findings(events, float(kp[0]), float(kp[-1])) \
+            if self.plot.event_settings()["check"] else []
+        rank = {INFO: 1, WARNING: 2, ERROR: 3}
+        findings = sorted(base + checks, key=lambda f: (f.kp_start, -rank.get(f.severity, 0)))
+        if [id(f) for f in findings] != [id(f) for f in r.findings]:
+            r.findings = findings
+            self.results.update_findings(findings)
+            self.plot.refresh_status()
+
+    def _can_comment(self) -> bool:
+        return self.comment_hook is not None and self._route_layer is not None and self._route_identity is not None
+
+    def add_comment(self, kp: float, kp_end=None) -> None:
+        """A Route Comment at a KP (or over a KP range) of the analysed route."""
+        if not self._can_comment():
+            return
+        from ..route_comments import model as cm
+        from ..route_comments.route_ref import CaptureRoute
+
+        layer = self._route_layer
+        try:
+            capture = CaptureRoute.from_layer(layer, layer.crs(), start_kp_km=self._route_identity.start_kp_km)
+            if kp_end is None:
+                self.comment_hook(cm.REF_ROUTE_POINT, capture, {"kp_km": float(kp)})
+            else:
+                self.comment_hook(cm.REF_KP_RANGE, capture, {"kps": (float(kp), float(kp_end))})
+        except Exception as exc:
+            log_exception("Span & Slack Analysis: adding a Route Comment failed")
+            self._set_status(f"Could not add the comment: {exc}", error=True)
+            return
+        self._refresh_events()
+
+    def _marker_dialog(self, marker: Dict) -> Optional[Dict]:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Marker")
+        form = QFormLayout(dialog)
+        kp = QDoubleSpinBox()
+        kp.setRange(-100000.0, 100000.0)
+        kp.setDecimals(3)
+        kp.setSuffix(" km")
+        kp.setValue(float(marker.get("kp") or 0.0))
+        form.addRow("KP", kp)
+        ranged = QCheckBox("Over a KP range, to")
+        kp_end = QDoubleSpinBox()
+        kp_end.setRange(-100000.0, 100000.0)
+        kp_end.setDecimals(3)
+        kp_end.setSuffix(" km")
+        has_end = marker.get("kp_end") not in (None, "")
+        kp_end.setValue(float(marker.get("kp_end")) if has_end else float(marker.get("kp") or 0.0) + 0.1)
+        ranged.setChecked(has_end)
+        kp_end.setEnabled(has_end)
+        ranged.toggled.connect(kp_end.setEnabled)
+        form.addRow(ranged, kp_end)
+        label = QLineEdit(str(marker.get("label") or ""))
+        label.setPlaceholderText("e.g. Rock outcrop, Proposed rock berm, Crossing TAT-14")
+        form.addRow("Label", label)
+        note = QPlainTextEdit(str(marker.get("note") or ""))
+        note.setPlaceholderText("Optional note (shown when you hover the marker)")
+        note.setFixedHeight(70)
+        form.addRow("Note", note)
+        hint = QLabel("Markers are saved with the scenario and show on the profile only. For a note others should "
+                      "see on the map, add a Route Comment instead (right-click the profile).")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("QLabel { color: #666; }")
+        form.addRow(hint)
+        buttons = QDialogButtonBox(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if qt_exec(dialog) != DIALOG_ACCEPTED:
+            return None
+        out = {"kp": round(kp.value(), 6), "label": label.text().strip() or "Marker",
+               "note": note.toPlainText().strip()}
+        if ranged.isChecked() and abs(kp_end.value() - kp.value()) > 1e-6:
+            out["kp_end"] = round(kp_end.value(), 6)
+        return out
+
+    def _markers_changed(self) -> None:
+        self._dirty = True
+        self._update_title()
+        self._refresh_events()
+
+    def add_marker(self, kp: float, kp_end=None) -> None:
+        marker = self._marker_dialog({"kp": kp, "kp_end": kp_end})
+        if marker is not None:
+            self._markers.append(marker)
+            self._markers_changed()
+
+    def edit_marker(self, index: int) -> None:
+        if not 0 <= index < len(self._markers):
+            return
+        marker = self._marker_dialog(self._markers[index])
+        if marker is not None:
+            self._markers[index] = marker
+            self._markers_changed()
+
+    def delete_marker(self, index: int) -> None:
+        if 0 <= index < len(self._markers):
+            del self._markers[index]
+            self._markers_changed()
+
+    def _on_event_clicked(self, event: ev.ProfileEvent) -> None:
+        if event.is_range:
+            self.map.show_range(event.lo, event.hi, zoom=False)
+        else:
+            self.map.show_kp(event.kp, pan="if_outside")
+        self.plot.readout.setText(event.detail.replace("\n", "  |  "))
+
+    def _on_event_activated(self, event: ev.ProfileEvent) -> None:
+        """A double-click: edit a marker, open a comment in Route Comments, else zoom to it."""
+        kind, _sep, ident = event.key.partition(":")
+        if kind == "marker":
+            try:
+                self.edit_marker(int(ident))
+            except ValueError:
+                pass
+            return
+        if kind == "comment" and self.comment_open_hook is not None:
+            try:
+                self.comment_open_hook(ident)
+            except Exception:
+                log_exception("Span & Slack Analysis: opening the comment failed")
+            return
+        self._show_range(event.lo - 0.02, event.hi + 0.02, False)
 
     def _save_profile_if_saved_scenario(self) -> None:
         if self._store is None or not self._scenario_id or self._profile is None:
@@ -962,8 +1346,11 @@ class SpanAnalysisDialog(QDialog):
         indicative = (f", plus {s.indicative_spans} indicative (below the data's resolution)"
                       if s.indicative_spans else "")
         text = (f"{s.spans} span(s) ({s.red_spans} red){indicative}, {s.span_length_m:,.0f} m in total; "
-                f"{reds} red and {ambers} amber finding(s). Residual tension up to {s.max_tension_kn:.2f} kN; "
-                f"cable laid {s.laid_slack_pct:.2f}% over the route (fill {s.fill_pct:.2f}%).")
+                f"{reds} red and {ambers} amber finding(s). Residual tension "
+                + ("unbounded where the cable is short of the seabed; " if pl.unbounded(s.max_tension_kn)
+                   else f"up to {s.max_tension_kn:.2f} kN; ") +
+                f"cable laid {s.bottom_slack_pct:+.2f}% over the seabed ({s.laid_slack_pct:.2f}% over the route, "
+                f"fill {s.fill_pct:.2f}%).")
         if notes:
             text += "<br><span style='color:#6d4c00'>" + "<br>".join(html.escape(n) for n in notes[:6]) + "</span>"
         self.status.setText(text)
@@ -980,6 +1367,8 @@ class SpanAnalysisDialog(QDialog):
         self.results.set_detail(None, None)
         self.results.clear_sweep()
         self.results.clear_found()
+        self._tools_key = ""
+        self._compose_events()
         self.map.clear()
         self._update_buttons()
         self._update_stale()
@@ -1136,7 +1525,7 @@ class SpanAnalysisDialog(QDialog):
         name = self.scenario_combo.currentText() if self._scenario_id else "unsaved scenario"
         options = dxf_io.SceneOptions(self.plot.visible_kp() if window.currentData() == "view" else None,
                                       ve.value(), graphs.isChecked(), text.value(),
-                                      f"Span & Slack Analysis - {name}")
+                                      f"Span & Slack Analysis - {name}", slack_basis=self.plot.slack_basis())
         try:
             dxf_io.export_scene(self._result, path, options, self._detail)
         except Exception as exc:
@@ -1238,6 +1627,11 @@ class SpanAnalysisDialog(QDialog):
             self._store.close()
             self._store = None
         self.setup.forget_project()
+        self._events_timer.stop()
+        self._route_identity, self._route_layer = None, None
+        self._external_events, self._event_notes = [], []
+        self._rpl_events = (None, [])
+        self._burial_choice = ""
         self._scenario_id = None
         self._profile, self._profile_key = None, ""
         self.map.set_route(None)
@@ -1271,6 +1665,7 @@ class SpanAnalysisDialog(QDialog):
         self._remove_project_hooks()
         self._layers_timer.stop()
         self._project_timer.stop()
+        self._events_timer.stop()
         self._cancel_work()
         if self._pick_tool is not None and self.iface is not None:
             self.iface.mapCanvas().unsetMapTool(self._pick_tool)
@@ -1318,27 +1713,40 @@ def write_csv(result: pl.PlanningResult, what: str, path: str) -> None:
                                  f"{f.kp_end:.4f}", f"{f.length_m:.1f}",
                                  "" if f.value is None else f"{f.value:.4g}", f.unit, f.message])
         elif what == "spans":
-            writer.writerow(["kp_from", "kp_to", "length_m", "max_gap_m", "kp_max_gap", "tension_kn", "tension_from",
-                             "min_bend_radius_m", "mbr_m", "max_reaction_kn", "allowable_kn"])
-            for s in result.spans:
+            writer.writerow(["kp_from", "kp_to", "length_m", "max_gap_m", "short_of_seabed_m", "kp_max_gap",
+                             "tension_kn", "tension_from", "min_bend_radius_m", "mbr_m", "max_reaction_kn",
+                             "allowable_kn"])
+            for k, s in enumerate(result.spans):
+                short = result.span_short_m[k] if k < len(result.span_short_m) else math.nan
                 writer.writerow([f"{s.kp_start:.4f}", f"{s.kp_end:.4f}", f"{s.length_m:.2f}", f"{s.max_gap_m:.3f}",
-                                 f"{s.kp_max_gap:.4f}", f"{s.tension_kn:.3f}", s.source,
+                                 _fmt(short, 3), f"{s.kp_max_gap:.4f}", _tension_csv(s.tension_kn), s.source,
                                  _fmt(s.min_bend_radius_m), _fmt(s.mbr_m), _fmt(s.max_reaction_kn),
                                  _fmt(s.allowable_kn)])
         else:
             st = result.stations
+            # Slack over the route (as an RPL: fill_pct ... surplus_pct) and over the seabed (bottom_*: 0 where
+            # the cable lies on the seabed), each over the slack window.
             writer.writerow(["kp_km", "seabed_depth_m", "cable_depth_m", "gap_m", "residual_tension_kn",
                              "lay_tension_kn", "allowable_kn", "fill_pct", "laid_pct", "used_pct", "surplus_pct",
+                             "bottom_laid_pct", "bottom_used_pct", "bottom_surplus_pct",
                              "slope_deg", "mu", "cable_type", "soil"])
             allowable = result.allowable_kn if result.allowable_kn is not None else np.full(st.n, np.nan)
+            nan = np.full(st.n, np.nan)
+            used_b = result.used_bottom_pct if result.used_bottom_pct is not None else nan
+            surplus_b = result.surplus_bottom_pct if result.surplus_bottom_pct is not None else nan
             for i in range(st.n):
                 writer.writerow([f"{st.kp_km[i]:.5f}", _fmt(-st.obstacle_m[i], 3), _fmt(-result.cable_m[i], 3),
-                                 _fmt(result.gap_m[i], 3), _fmt(result.tension_kn[i], 3),
-                                 _fmt(result.deposit_kn[i], 3), _fmt(allowable[i], 2), _fmt(result.fill_pct[i], 3),
-                                 _fmt(result.laid_pct[i], 3), _fmt(result.shape_pct[i], 3),
-                                 _fmt(result.excess_pct[i], 3),
+                                 _fmt(result.gap_m[i], 3), _tension_csv(result.tension_kn[i]),
+                                 _tension_csv(result.deposit_kn[i]), _fmt(allowable[i], 2),
+                                 _fmt(result.fill_pct[i], 3), _fmt(result.laid_pct[i], 3),
+                                 _fmt(result.shape_pct[i], 3), _fmt(result.excess_pct[i], 3),
+                                 _fmt(result.bottom_slack_pct[i], 3), _fmt(used_b[i], 3), _fmt(surplus_b[i], 3),
                                  _fmt(math.degrees(math.atan(st.slope[i])), 2), _fmt(st.mu[i], 3),
                                  st.cable_at(i).name, st.soil[i]])
+
+
+def _tension_csv(value) -> str:
+    return "unbounded" if pl.unbounded(value) else _fmt(value, 3)
 
 
 def _fmt(value, digits: int = 2) -> str:

@@ -384,6 +384,9 @@ class SubseaCableTools:
             try:
                 from .span_analysis.dialog import SpanAnalysisDialog
                 self.span_analysis_dialog = SpanAnalysisDialog(self._main_window(), iface=self.iface)
+                # Right-click the profile to comment on the route; double-click a comment to open it.
+                self.span_analysis_dialog.comment_hook = self._add_route_comment
+                self.span_analysis_dialog.comment_open_hook = self._show_route_comment
             except Exception:
                 self.span_analysis_dialog = None
                 self._report_open_failure(
@@ -674,6 +677,13 @@ class SubseaCableTools:
         dock = self.show_route_comments()
         if dock is not None:
             dock.add_comment_from_capture(kind, capture, data)
+
+    def _show_route_comment(self, comment_id):
+        """Span & Slack Analysis hook: show a comment in Route Comments."""
+        dock = self.show_route_comments()
+        if dock is not None and not dock.show_comment(comment_id):
+            self.iface.messageBar().pushInfo(
+                "Route Comments", "That comment is in another comment set: choose its set to see it.")
 
     def activate_transit_measure_tool(self):
         if not _alive(self.transit_measure_tool):

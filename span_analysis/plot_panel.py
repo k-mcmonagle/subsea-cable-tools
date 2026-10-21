@@ -9,9 +9,11 @@
   their details, optional labels), the detail model's cable and sea level;
 * tension: residual tension on the seabed, the lay (deposit) tension, NPTS and
   the highest tension that keeps spans within the limits;
-* slack: cable laid, the fill (seabed length over route length), the cable the
-  rest shape uses and the RPL's planned slack, all % over the route; the
-  surplus is shaded;
+* slack: cable laid and the cable the rest shape uses, with the RPL's planned
+  slack, as bottom slack (% over the seabed: 0 where the cable lies on it) or
+  % over the route as an RPL gives it (the seabed then sits at the fill); the
+  surplus and the shortfall (where the cable bridges the seabed) are shaded,
+  and the loop-risk threshold drawn;
 * slope and friction: the seabed slope against the friction angle ``atan mu``.
 
 Drag the splitter handles to share the height between rows. *Plots* shows or
@@ -32,8 +34,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pyqtgraph as pg
+from pyqtgraph.Qt import QtGui as _QtGui   # QActionGroup: QtWidgets in Qt 5, QtGui in Qt 6
 
-from qgis.PyQt.QtCore import QT_VERSION_STR, QEvent, QRectF, QSettings, Qt, pyqtSignal
+from qgis.PyQt.QtCore import QT_VERSION_STR, QEvent, QRectF, QSettings, Qt, QTimer, pyqtSignal
 from qgis.PyQt.QtGui import QPainterPath
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
@@ -54,6 +57,9 @@ from ..cable_seabed.core import ERROR, INFO, WARNING, runs
 from ..maptools.profile_measure_controller import ProfileMeasureController
 from ..plugin_log import log_exception
 from ..qgis_compat import TOOLBUTTON_POPUP_MODE_INSTANT
+from . import cable_colour as cc
+from . import events as ev
+from .event_lane import LABEL_NAME, LABEL_NAME_KP, EventGuideItem, EventLaneItem, EventLayer, EventLeaderItem
 
 _DASH = getattr(getattr(Qt, "PenStyle", Qt), "DashLine")
 _DOT = getattr(getattr(Qt, "PenStyle", Qt), "DotLine")
@@ -70,15 +76,15 @@ ROWS = (("status", "Status bar", "The worst finding along the route: red, amber,
                                  "grey (no seabed data). Hover for the findings at a KP; click to go to them."),
         ("depth", "Profile", "The seabed, the cable resting on it, spans, supports and bodies."),
         ("tension", "Tension", "Residual and lay tension, NPTS, highest tension for spans within limits."),
-        ("slack", "Slack", "Cable laid, seabed fill, cable used by the rest shape and RPL planned slack, % over the "
-                           "route length."),
+        ("slack", "Slack", "Cable laid and cable used by the rest shape, as bottom slack (% over the seabed) or % "
+                           "over the route (choose below)."),
         ("slope", "Slope / friction", "Seabed slope against the friction angle atan(mu): steeper slopes slide."))
 DATA_ROWS = ("depth", "tension", "slack", "slope")
 # What the tooltip at the cursor can show: (key, menu text, on by default).
 TIP_FIELDS = (("kp", "KP", True), ("depth", "Seabed depth", True), ("cable", "Cable depth", False),
               ("gap", "Gap and span", True), ("tension", "Residual tension", True), ("lay", "Lay tension", False),
               ("allowable", "Highest tension for spans within limits", False),
-              ("slack", "Slack (laid, fill, surplus)", False), ("slope", "Slope and friction", False),
+              ("slack", "Slack (laid, used, surplus)", False), ("slope", "Slope and friction", False),
               ("type", "Cable type, body or protection", False), ("soil", "Soil", False))
 LEVEL_NAMES = {-1: "No seabed data", 0: "Clear", 1: "Information", 2: "Amber", 3: "Red"}
 SEVERITY_NAMES = {ERROR: "Red", WARNING: "Amber", INFO: "Info"}
@@ -92,6 +98,8 @@ AMBER_FILL = (255, 152, 0, 140)
 CLEAR_FILL = (120, 120, 120, 55)
 INDICATIVE_FILL = (31, 119, 180, 70)   # spans shorter than the seabed data resolves: light blue
 SURPLUS_FILL = (76, 175, 80, 90)
+SHORT_FILL = (121, 85, 72, 70)       # cable shorter than the seabed under it (it bridges: spans)
+LOOP_LINE = (255, 152, 0)            # the loop-risk threshold (an amber finding above it)
 DETAIL = (123, 31, 162)
 PROTECTION = (96, 125, 139, 150)
 PREVIOUS = (150, 150, 150)
@@ -141,9 +149,25 @@ _LEGENDS = {
     "tension": [("solid", CABLE, "Residual (on the seabed)"), ("dash", (90, 90, 90), "Lay (touchdown)"),
                 ("dash", (211, 47, 47), "NPTS"), ("dot", (0, 137, 123), "Max for spans within limits"),
                 ("dash", PREVIOUS, "Previous run")],
-    "slack": [("solid", CABLE, "Laid"), ("solid", SEABED, "Fill (seabed)"), ("dash", (90, 90, 90), "Used by the cable"),
-              ("fill", SURPLUS_FILL, "Surplus"), ("dot", (233, 30, 99), "RPL slack (plan)")],
+    "slack": [],   # by basis: _SLACK_LEGENDS
     "slope": [("solid", SEABED, "Seabed slope"), ("dash", (230, 81, 0), "Friction angle atan(\u03bc)")],
+}
+SLACK_SEABED, SLACK_ROUTE = "seabed", "route"
+SLACK_BASES = ((SLACK_SEABED, "Slack over the seabed (bottom slack)",
+                "0 where the cable lies on the seabed; below 0 it is shorter than the seabed under it (it bridges: "
+                "spans), above 0 it has surplus."),
+               (SLACK_ROUTE, "Slack over the route (as an RPL)",
+                "Cable over the route's plan length, as RPL slack is given: a cable lying on the seabed sits at the "
+                "fill (the seabed length over the route), not at 0."))
+_SLACK_LEGENDS = {
+    SLACK_SEABED: [("solid", CABLE, "Laid"), ("dash", (90, 90, 90), "Used by the cable"),
+                   ("solid", SEABED, "Seabed (0)"), ("fill", SURPLUS_FILL, "Surplus"),
+                   ("fill", SHORT_FILL, "Short of the seabed (bridging)"), ("dash", LOOP_LINE, "Loop-risk threshold"),
+                   ("dot", (233, 30, 99), "RPL slack (plan)")],
+    SLACK_ROUTE: [("solid", CABLE, "Laid"), ("dash", (90, 90, 90), "Used by the cable"),
+                  ("solid", SEABED, "Fill (seabed)"), ("fill", SURPLUS_FILL, "Surplus"),
+                  ("fill", SHORT_FILL, "Short of the seabed (bridging)"), ("dash", LOOP_LINE, "Loop-risk threshold"),
+                  ("dot", (233, 30, 99), "RPL slack (plan)")],
 }
 
 
@@ -204,10 +228,43 @@ class ProfileViewBox(pg.ViewBox):
 
     stretchStarted = pyqtSignal()
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # ``extra_menu(kp, scene_pos)`` -> [(text, slot or None, enabled)]: actions put at the top of the
+        # right-click menu (None: a separator).
+        self.extra_menu = None
+        self._extra_actions = []
+
     def mouseDragEvent(self, ev, axis=None):  # noqa: N802 (Qt API)
         if ev.isStart() and ev.button() == _RIGHT_BUTTON:
             self.stretchStarted.emit()
         super().mouseDragEvent(ev, axis)
+
+    def raiseContextMenu(self, ev):  # noqa: N802 (pyqtgraph API)
+        menu = self.menu
+        for action in self._extra_actions:
+            menu.removeAction(action)
+        self._extra_actions = []
+        if self.extra_menu is not None and menu is not None:
+            try:
+                kp = float(self.mapSceneToView(ev.scenePos()).x())
+                items = self.extra_menu(kp, ev.scenePos())
+            except Exception:
+                log_exception("Span & Slack Analysis: building the profile menu failed")
+                items = []
+            first = menu.actions()[0] if menu.actions() else None
+            for text, slot, enabled in items + ([(None, None, True)] if items else []):
+                if text is None:
+                    action = menu.addSeparator()
+                else:
+                    action = menu.addAction(text)
+                    action.setEnabled(bool(enabled))
+                    if slot is not None:
+                        action.triggered.connect(lambda _checked=False, s=slot: s())
+                if first is not None:
+                    menu.insertAction(first, action)   # moves it to the top
+                self._extra_actions.append(action)
+        super().raiseContextMenu(ev)
 
 
 def _plot_widget() -> "pg.PlotWidget":
@@ -225,6 +282,36 @@ def _plot_widget() -> "pg.PlotWidget":
 
 def _tip(x, y, data):
     return data if isinstance(data, str) else f"KP {x:.3f}"
+
+
+def _single_shot(parent, msec: int, slot) -> QTimer:
+    timer = QTimer(parent)
+    timer.setSingleShot(True)
+    timer.setInterval(msec)
+    timer.timeout.connect(slot)
+    return timer
+
+
+def _finite_tension(values: np.ndarray) -> np.ndarray:
+    """Tensions with the pull-taut search limit (no finite tension) left out."""
+    values = np.asarray(values, dtype=float)
+    return np.where(values >= 0.999 * pl.TAUT_CAP_KN, np.nan, values)
+
+
+def _tension_text(value: float) -> str:
+    return "no finite tension (cable short of the seabed)" if pl.unbounded(value) else f"{value:.2f} kN"
+
+
+def body_placement_lines(body: pl.Body, kp_km: float) -> List[str]:
+    """How a body's KP was found, and how far it moves with the slack (fitted bodies)."""
+    if not body.placement:
+        return ["KP as entered"]
+    lines = [body.placement]
+    if math.isfinite(body.anchor_kp_km):
+        per_tenth = abs(kp_km - body.anchor_kp_km)   # km from the anchor -> m per 0.1% of slack
+        lines.append(f"Laid with 0.1% more or less slack than planned between the anchor and here, it lands "
+                     f"about {per_tenth:,.1f} m away")
+    return lines
 
 
 def _radius_text(radius: float) -> str:
@@ -280,6 +367,14 @@ class ProfilePlot(QWidget):
     kpDoubleClicked = pyqtSignal(float)
     bodyClicked = pyqtSignal(int)
     statusClicked = pyqtSignal(float, float, float)   # the status stretch (KP from, KP to) and the KP clicked
+    eventClicked = pyqtSignal(object)                 # a ProfileEvent clicked in the lane
+    eventActivated = pyqtSignal(object)               # ... double-clicked (open the comment, edit the marker)
+    eventsSettingsChanged = pyqtSignal()              # Events menu: what shows, or the check, changed
+    eventsRefreshRequested = pyqtSignal()
+    markerRequested = pyqtSignal(float, object)       # add a marker at KP (to KP or None)
+    markerEditRequested = pyqtSignal(int)
+    markerDeleteRequested = pyqtSignal(int)
+    commentRequested = pyqtSignal(float, object)      # add a Route Comment at KP (to KP or None)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -288,7 +383,14 @@ class ProfilePlot(QWidget):
         self._stretching = False        # true scale ended by a right-button drag (keep the view)
         self._result: Optional[pl.PlanningResult] = None
         self._previous: Optional[pl.PlanningResult] = None
-        self._body_labels: List[pg.TextItem] = []
+        self._all_events: List[ev.ProfileEvent] = []
+        self._shown_events: List[ev.ProfileEvent] = []
+        self._events_outside = 0
+        self.can_comment = lambda: False    # set by the window: Route Comments can take a comment on this route
+        self._colour_runs: List[Tuple[int, int, int]] = []
+        self._colour_legend: List[Tuple[Tuple[int, int, int], str]] = []
+        self._colour_classes: Optional[np.ndarray] = None
+        self._colour_note = ""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
@@ -321,15 +423,46 @@ class ProfilePlot(QWidget):
                                       "sea_level", True)
         self.previous_check = self._toggle(plots, "Previous run", "The previous run's cable and tension (dashed "
                                            "grey), to see the effect of a change.", None, True)
-        self.labels_check = self._toggle(plots, "Body labels", "Name each in-line body on the profile. Hover or "
-                                         "click a body for its details.", "body_labels", True)
         self.legend_check = self._toggle(plots, "Legends", "The key above each plot.", "legends", True)
         self.reverse_check = self._toggle(plots, "Reverse KP", "KP increasing from right to left (e.g. to match "
                                           "the lay direction).", "reverse_kp", False)
         plots.addSeparator()
+        basis = _setting_text("slack_basis", SLACK_SEABED)
+        self.slack_basis_actions: Dict[str, object] = {}
+        self._slack_group = _QtGui.QActionGroup(self)
+        self._slack_group.setExclusive(True)
+        for key, text, tip in SLACK_BASES:
+            action = plots.addAction(text)
+            action.setCheckable(True)
+            action.setToolTip(tip)
+            action.setChecked(key == basis)
+            self._slack_group.addAction(action)
+            self.slack_basis_actions[key] = action
+        if not any(a.isChecked() for a in self.slack_basis_actions.values()):
+            self.slack_basis_actions[SLACK_SEABED].setChecked(True)
+        plots.addSeparator()
+        colour = plots.addMenu("Colour the cable by")
+        colour.setToolTipsVisible(True)
+        chosen = _setting_text("cable_colour", cc.PLAIN)
+        self.colour_actions: Dict[str, object] = {}
+        self._colour_group = _QtGui.QActionGroup(self)
+        self._colour_group.setExclusive(True)
+        for key, text, tip in cc.MODES:
+            action = colour.addAction(text)
+            action.setCheckable(True)
+            action.setToolTip(tip)
+            action.setChecked(key == chosen)
+            self._colour_group.addAction(action)
+            self.colour_actions[key] = action
+        if not any(a.isChecked() for a in self.colour_actions.values()):
+            self.colour_actions[cc.PLAIN].setChecked(True)
+        plots.addSeparator()
         plots.addAction("Default view", self.default_view).setToolTip("Every plot at its default height, and the "
                                                                       "whole profile.")
         bar.addWidget(menu_button("Plots", "Show or hide each plot, and what the profile shows.", plots))
+        bar.addWidget(menu_button("Events", "What shows on the events lane above the profile: RPL events, what is "
+                                  "in the model, Route Comments, the burial plan and your markers.",
+                                  self._build_events_menu()))
 
         tips = StayOpenMenu(self)
         tips.setToolTipsVisible(True)
@@ -418,6 +551,38 @@ class ProfilePlot(QWidget):
         self.status_plot.setMouseEnabled(x=True, y=False)
         self.status_plot.setYRange(0, 1, padding=0)
         self.status_plot.hideButtons()
+
+        # The events lane: in the profile's row, between its legend and the plot, so each label's
+        # leader runs on down into the profile.
+        self.lane_widget = _plot_widget()
+        self.lane_widget.setBackground("w")
+        self.lane_widget.setAntialiasing(True)
+        self.lane_plot = self.lane_widget.getPlotItem()
+        lane_axis = self.lane_plot.getAxis("left")
+        lane_axis.setWidth(64)
+        lane_axis.setStyle(showValues=False)
+        lane_axis.setPen(pg.mkPen(None))
+        lane_axis.setTicks([[], []])
+        self.lane_plot.hideAxis("bottom")
+        self.lane_plot.setMouseEnabled(x=True, y=False)
+        self.lane_plot.setYRange(0, 1, padding=0)
+        self.lane_plot.hideButtons()
+        self.lane_plot.layout.setContentsMargins(1, 1, 1, 0)
+        self.depth_plot.layout.setContentsMargins(1, 0, 1, 1)
+        self.lane_widget.viewport().setCursor(_POINTING)
+        self.rows["depth"].layout().insertWidget(1, self.lane_widget)
+        self.event_layer = EventLayer(self.lane_plot.vb, self)
+        self.lane_item = EventLaneItem(self.event_layer)
+        self.lane_plot.addItem(self.lane_item, ignoreBounds=True)
+        self.leader_item = EventLeaderItem(self.event_layer)
+        self.leader_item.setZValue(15)
+        self.depth_plot.addItem(self.leader_item, ignoreBounds=True)
+        self.guide_items = []
+        for plot in (self.tension_plot, self.slack_plot, self.slope_plot):
+            guide = EventGuideItem(self.event_layer)
+            plot.addItem(guide, ignoreBounds=True)
+            self.guide_items.append(guide)
+        self.lane_widget.hide()
         self._data_plots = (self.depth_plot, self.tension_plot, self.slack_plot, self.slope_plot)
         for plot in self._data_plots:
             plot.showGrid(x=True, y=True, alpha=0.25)
@@ -436,7 +601,7 @@ class ProfilePlot(QWidget):
         self.tension_plot.setLabel("left", "T (kN)", **small)
         self.slack_plot.setLabel("left", "Slack (%)", **small)
         self.slope_plot.setLabel("left", "θ (°)", **small)
-        for plot in (self.status_plot,) + self._data_plots[1:]:
+        for plot in (self.status_plot, self.lane_plot) + self._data_plots[1:]:
             plot.setXLink(self.depth_plot)
 
         # One filled path per level. (BarGraphItem records its bars in a QPicture, which
@@ -494,6 +659,17 @@ class ProfilePlot(QWidget):
         self.bodies.setZValue(20)
         self.bodies.sigClicked.connect(self._on_body_clicked)
         self.depth_plot.addItem(self.bodies)
+        # The cable coloured by a quantity: one path per class over the plain cable, built for the KPs in
+        # view (thinned to the pixels, peaks kept) when the view moves.
+        self.colour_paths: List[QGraphicsPathItem] = []
+        for _k in range(cc.MAX_CLASSES):
+            item = QGraphicsPathItem()
+            item.setBrush(pg.mkBrush(None))
+            item.setZValue(5)
+            self.depth_plot.addItem(item, ignoreBounds=True)
+            self.colour_paths.append(item)
+        self._colour_timer = _single_shot(self, 40, self._draw_colour_paths)
+        self.depth_plot.vb.sigXRangeChanged.connect(lambda *_: self._colour_timer.start())
 
         self.tension_curve = curve(self.tension_plot, CABLE, "Residual (on the seabed)", 1)
         self.deposit_curve = curve(self.tension_plot, (90, 90, 90), "Lay (touchdown)", 1, _DASH)
@@ -507,7 +683,18 @@ class ProfilePlot(QWidget):
         self.plan_curve = curve(self.slack_plot, (233, 30, 99), "RPL slack (plan)", 1, _DOT, fast=False)
         self.surplus = pg.FillBetweenItem(self.used_curve, self.laid_curve, brush=pg.mkBrush(*SURPLUS_FILL))
         self.slack_plot.addItem(self.surplus)
+        # Where the cable uses less than the seabed under it (it bridges: spans). Only there: part-way along
+        # a span a short window can hold more cable than the flat floor under it.
+        self.short_fill = QGraphicsPathItem()
+        self.short_fill.setBrush(pg.mkBrush(*SHORT_FILL))
+        self.short_fill.setPen(pg.mkPen(None))
+        self.slack_plot.addItem(self.short_fill, ignoreBounds=True)
         self.slack_plot.addItem(pg.InfiniteLine(pos=0.0, angle=0, pen=pg.mkPen((160, 160, 160), width=1)))
+        # The loop-risk threshold: the surplus at which the loop check flags (at zero tension). Kept out of
+        # the auto range, so it shows only where the slack comes near it.
+        self.loop_curve = pg.PlotDataItem([], [], pen=pg.mkPen(LOOP_LINE, width=1, style=_DASH), connect="finite",
+                                          antialias=True)
+        self.slack_plot.addItem(self.loop_curve, ignoreBounds=True)
 
         self.slope_curve = curve(self.slope_plot, SEABED, "Seabed slope", 1)
         self.friction_curve = curve(self.slope_plot, (230, 81, 0), "Friction angle", 1, _DASH)
@@ -549,8 +736,19 @@ class ProfilePlot(QWidget):
         self.depth_plot.vb.stretchStarted.connect(self._leave_true_scale)
         self.sea_check.toggled.connect(self._update_sea)
         self.reverse_check.toggled.connect(self._apply_reverse)
-        self.labels_check.toggled.connect(self._update_body_labels)
         self.legend_check.toggled.connect(self._update_legends)
+        for action in self.slack_basis_actions.values():
+            action.toggled.connect(lambda on: on and self._on_slack_basis())
+        for action in self.colour_actions.values():
+            action.toggled.connect(lambda on: on and self._on_colour_mode())
+        lane_scene = self.lane_widget.scene()
+        lane_scene.sigMouseMoved.connect(self._on_lane_moved)
+        lane_scene.sigMouseClicked.connect(self._on_lane_clicked)
+        self.lane_widget.installEventFilter(self)
+        self.lane_plot.vb.extra_menu = self._context_actions
+        self.depth_plot.vb.extra_menu = self._context_actions
+        self.event_layer.changed.connect(self._update_lane_height)
+        self._update_slack_caption()
         self._update_legends()
         self._update_rows()
         self._apply_reverse(self.reverse_check.isChecked())
@@ -640,13 +838,16 @@ class ProfilePlot(QWidget):
                          self.protection_curve,
                          self.tension_curve, self.deposit_curve, self.npts_curve, self.allowable_curve,
                          self.used_curve, self.laid_curve, self.fill_curve, self.plan_curve, self.slope_curve,
-                         self.friction_curve):
+                         self.friction_curve, self.loop_curve):
                 item.setData([], [])
-            for item in self.fills.values():
+            for item in list(self.fills.values()) + [self.short_fill]:
                 item.setPath(QPainterPath())
+            self._update_slack_caption()
             self.supports.setData([], [])
             self.bodies.setData([], [])
-            self._update_body_labels()
+            self._all_events = []
+            self._apply_events()
+            self._update_colour()
             self._clear_status()
             self.measure.set_series([])
             self._update_previous()
@@ -670,20 +871,21 @@ class ProfilePlot(QWidget):
         self._draw_supports(r)
         self._draw_bodies(r)
         self._update_sea()
-        self.tension_curve.setData(kp, r.tension_kn)
-        self.deposit_curve.setData(kp, r.deposit_kn)
+        # A cable laid shorter than the seabed has no finite tension (the pull-taut search limit is not one):
+        # leave a gap, which the findings and the readout explain.
+        self.tension_curve.setData(kp, _finite_tension(r.tension_kn))
+        self.deposit_curve.setData(kp, _finite_tension(r.deposit_kn))
         self.npts_curve.setData(kp, st.npts_kn)
         if r.allowable_kn is not None:
             self.allowable_curve.setData(kp, np.where(r.allowable_kn < 99.9, r.allowable_kn, np.nan))
         else:
             self.allowable_curve.setData([], [])
-        self.used_curve.setData(kp, r.shape_pct)
-        self.laid_curve.setData(kp, r.laid_pct)
-        self.fill_curve.setData(kp, r.fill_pct)
-        self._draw_plan(r)
+        self._draw_slack(r)
         self.slope_curve.setData(kp, np.degrees(np.arctan(np.abs(st.slope))))
         self.friction_curve.setData(kp, np.degrees(np.arctan(st.mu)))
         self._draw_status(r)
+        self._apply_events()
+        self._update_colour()
         self._update_previous()
         ok = np.isfinite(floor)
         series = [{"name": "Seabed", "x": kp[ok] * 1000.0, "y": floor[ok]}]
@@ -709,20 +911,98 @@ class ProfilePlot(QWidget):
             self.fills[key].setPath(runs_path(kp, cable_depth, floor, extents))
         self.fills["clear"].setPath(runs_path(kp, cable_depth, floor, clear))
 
+    def slack_basis(self) -> str:
+        return next((key for key, action in self.slack_basis_actions.items() if action.isChecked()), SLACK_SEABED)
+
+    def slack_series(self, r: pl.PlanningResult) -> Dict[str, np.ndarray]:
+        """The slack row's curves on the chosen basis: ``laid``, ``used``, ``seabed`` (the
+        seabed's own line: 0, or the fill over the route), ``surplus`` and ``loop`` (threshold)."""
+        n = r.stations.n
+        loop = float(r.criteria.loop_excess_pct)
+        if self.slack_basis() == SLACK_ROUTE or r.used_bottom_pct is None:
+            seabed = r.fill_pct
+            out = {"laid": r.laid_pct, "used": r.shape_pct, "seabed": seabed, "surplus": r.excess_pct,
+                   # The loop check compares the surplus over the route with the threshold.
+                   "loop": r.shape_pct + loop if loop > 0 else np.full(n, np.nan)}
+        else:
+            seabed = np.where(np.isfinite(r.used_bottom_pct), 0.0, np.nan)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                loop_here = loop / r.seabed_over_route   # the same surplus, over the seabed length
+            out = {"laid": r.bottom_slack_pct, "used": r.used_bottom_pct, "seabed": seabed,
+                   "surplus": r.surplus_bottom_pct,
+                   "loop": r.used_bottom_pct + loop_here if loop > 0 else np.full(n, np.nan)}
+        return out
+
+    def _draw_slack(self, r: pl.PlanningResult) -> None:
+        series = self.slack_series(r)
+        kp = r.stations.kp_km
+        self.used_curve.setData(kp, series["used"])
+        self.laid_curve.setData(kp, series["laid"])
+        self.fill_curve.setData(kp, series["seabed"])
+        self.loop_curve.setData(kp, series["loop"])
+        with np.errstate(invalid="ignore"):
+            short = np.isfinite(series["used"]) & np.isfinite(series["seabed"]) \
+                & (series["used"] < series["seabed"] - 1e-6)
+        extents = [(max(a - 1, 0), min(b + 1, len(kp) - 1)) for a, b in runs(short)]
+        self.short_fill.setPath(runs_path(kp, series["seabed"], np.fmin(series["used"], series["seabed"]), extents))
+        self._draw_plan(r)
+        self._update_slack_caption()
+
     def _draw_plan(self, r: pl.PlanningResult) -> None:
         legs = list(r.control.legs or [])
         if not legs:
             self.plan_curve.setData([], [])
             return
-        lo, hi = float(r.stations.kp_km[0]), float(r.stations.kp_km[-1])
-        xs, ys = [], []
+        kp = r.stations.kp_km
+        lo, hi = float(kp[0]), float(kp[-1])
+        if self.slack_basis() == SLACK_ROUTE or r.seabed_over_route is None:
+            xs, ys = [], []
+            for k0, k1, slack in sorted(legs):
+                a, b = max(min(k0, k1), lo), min(max(k0, k1), hi)
+                if b <= a:
+                    continue
+                xs.extend([a, b, b])
+                ys.extend([slack, slack, np.nan])
+            self.plan_curve.setData(np.array(xs), np.array(ys))
+            return
+        # Over the seabed: the plan's cable over the seabed under it, (1 + s) route / seabed - 1.
+        plan = np.full(len(kp), np.nan)
         for k0, k1, slack in sorted(legs):
-            a, b = max(min(k0, k1), lo), min(max(k0, k1), hi)
-            if b <= a:
-                continue
-            xs.extend([a, b, b])
-            ys.extend([slack, slack, np.nan])
-        self.plan_curve.setData(np.array(xs), np.array(ys))
+            a, b = sorted((k0, k1))
+            sel = (kp >= a) & (kp < b)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                plan[sel] = ((1.0 + slack / 100.0) / r.seabed_over_route[sel] - 1.0) * 100.0
+        self.plan_curve.setData(kp, plan)
+
+    def _update_slack_caption(self) -> None:
+        basis = self.slack_basis()
+        caption = self.captions.get("slack")
+        if caption is None:
+            return
+        # The basis leads the legend (a longer axis title does not fit a short row).
+        text = (f"<b>{'Bottom slack, over the seabed' if basis == SLACK_SEABED else 'Slack over the route'}:</b>"
+                "&nbsp;&nbsp;" + _legend_html(_SLACK_LEGENDS[basis]))
+        r = self._result
+        if r is not None:
+            window = max(float(r.criteria.slack_window_m), 2.0 * r.stations.spacing_m)
+            text += (f"<br><span style='color:#666'>Over a {window:,.0f} m running window; lengths on the seabed "
+                     f"smoothed over {r.stations.smoothing_m:.0f} m (the cable's conformity length)."
+                     + (" Bottom slack: 0 = lying on the seabed." if basis == SLACK_SEABED else
+                        " A cable lying on the seabed sits at the fill.") + "</span>")
+        caption.setText(text)
+
+    def _on_slack_basis(self, *_args) -> None:
+        key = self.slack_basis()
+        if self.persist:
+            try:
+                QSettings().setValue(f"{_SETTINGS}/slack_basis", key)
+            except Exception:
+                pass
+        if self._result is not None:
+            self._draw_slack(self._result)
+            self.slack_plot.enableAutoRange(axis="y")
+        else:
+            self._update_slack_caption()
 
     def _draw_status(self, r: pl.PlanningResult) -> None:
         kp = r.stations.kp_km
@@ -746,6 +1026,11 @@ class ProfilePlot(QWidget):
                              np.asarray(level[starts], dtype=int))
         self._status_tol_km = bin_m / 2000.0
         self.status_hover.setPath(QPainterPath())
+
+    def refresh_status(self) -> None:
+        """Draw the status bar again (the findings changed)."""
+        if self._result is not None:
+            self._draw_status(self._result)
 
     def _clear_status(self) -> None:
         for item in self.status_paths.values():
@@ -780,7 +1065,7 @@ class ProfilePlot(QWidget):
                      f"Bend radius {_radius_text(sp.bend_radius_m)}"
                      + (f" (MBR {sp.mbr_m:.1f} m)" if math.isfinite(sp.mbr_m) else ""),
                      f"Moment {sp.moment_knm:.2f} kNm" if math.isfinite(sp.moment_knm) else "",
-                     f"Tension {sp.tension_kn:.2f} kN"]
+                     f"Tension {_tension_text(sp.tension_kn)}"]
             tips.append("\n".join(line for line in lines if line))
         self.supports.setData(np.array(kps), np.array(depths), brush=brushes, data=tips)
 
@@ -797,13 +1082,13 @@ class ProfilePlot(QWidget):
         lines = [f"{body.name} ({body.kind}) at KP {b.kp_km:.3f}",
                  f"Weight in water {body.weight_kn:.2f} kN, rigid length {body.length_m:.1f} m"
                  + (f", diameter {body.diameter_m * 1000:.0f} mm" if math.isfinite(body.diameter_m) else ""),
-                 where, f"Tension {b.tension_kn:.2f} kN"]
+                 where, f"Tension {_tension_text(b.tension_kn)}"]
+        lines.extend(body_placement_lines(body, b.kp_km))
         return "\n".join(lines)
 
     def _draw_bodies(self, r: pl.PlanningResult) -> None:
         if not r.bodies:
             self.bodies.setData([], [])
-            self._update_body_labels()
             return
         st = r.stations
         kps, depths, tips = [], [], []
@@ -813,44 +1098,305 @@ class ProfilePlot(QWidget):
             depths.append(float(-r.cable_m[i]))
             tips.append(self.body_text(k))
         self.bodies.setData(np.array(kps), np.array(depths), data=tips)
-        self._update_body_labels()
 
-    def _labels(self) -> List[Tuple[str, float, float]]:
-        """Body and protection names with their KP and depth."""
+    # -- events ------------------------------------------------------------------------------
+    def _build_events_menu(self) -> QMenu:
+        menu = StayOpenMenu(self)
+        menu.setToolTipsVisible(True)
+        menu.addSection("Show")
+        self.event_sources: Dict[str, object] = {}
+        for key, text, tip, on in ev.SOURCES:
+            self.event_sources[key] = self._toggle(menu, text, tip, f"events_src_{key}", on)
+        menu.addSection("RPL and burial events")
+        self.event_groups: Dict[str, object] = {}
+        for key, text, on in ev.GROUPS:
+            self.event_groups[key] = self._toggle(menu, text, "", f"events_grp_{key}", on)
+        self.closed_comments_check = self._toggle(menu, "Closed comments", "Show Route Comments with a closed status "
+                                                  "(in grey).", "events_closed", False)
+        menu.addSection("Labels")
+        mode = _setting_text("events_label", LABEL_NAME)
+        self._label_group = _QtGui.QActionGroup(self)
+        self.label_mode_actions: Dict[str, object] = {}
+        for key, text in ((LABEL_NAME, "Name"), (LABEL_NAME_KP, "Name and KP")):
+            action = menu.addAction(text)
+            action.setCheckable(True)
+            action.setChecked(key == mode)
+            self._label_group.addAction(action)
+            self.label_mode_actions[key] = action
+        if not any(a.isChecked() for a in self.label_mode_actions.values()):
+            self.label_mode_actions[LABEL_NAME].setChecked(True)
+        rows = menu.addMenu("Label rows")
+        tiers = _setting_text("events_rows", "2")
+        self._rows_group = _QtGui.QActionGroup(self)
+        self.label_row_actions: Dict[int, object] = {}
+        for count in (1, 2, 3, 4):
+            action = rows.addAction(f"{count} row" + ("s" if count > 1 else ""))
+            action.setCheckable(True)
+            action.setChecked(str(count) == tiers)
+            self._rows_group.addAction(action)
+            self.label_row_actions[count] = action
+        if not any(a.isChecked() for a in self.label_row_actions.values()):
+            self.label_row_actions[2].setChecked(True)
+        self.leaders_check = self._toggle(menu, "Leaders down to the cable", "Continue each label's leader down the "
+                                          "profile to the cable, with a mark there.", "events_leaders", True)
+        self.guides_check = self._toggle(menu, "Lines through the other plots", "Faint lines at each labelled event "
+                                         "on the tension, slack and slope plots.", "events_guides", False)
+        menu.addSeparator()
+        self.event_check_action = self._toggle(
+            menu, "Check RPL bodies and crossings against the model",
+            f"An information finding where the RPL lists a repeater, joint, BU or equaliser with no body in the "
+            f"model within {ev.MATCH_M:g} m, or the RPL or burial plan has a crossing with no seabed feature.",
+            "events_check", True)
+        self.burial_menu = menu.addMenu("Burial plan")
+        self.burial_menu.setEnabled(False)
+        menu.addSeparator()
+        menu.addAction("Add a marker in view…", lambda: self.markerRequested.emit(self._view_centre(), None))
+        menu.addAction("Refresh events", self.eventsRefreshRequested.emit)
+        for action in (list(self.event_sources.values()) + list(self.event_groups.values())
+                       + [self.closed_comments_check, self.event_check_action]):
+            action.toggled.connect(self._on_events_setting)
+        for action in list(self.label_mode_actions.values()) + list(self.label_row_actions.values()):
+            action.toggled.connect(lambda on: on and self._on_label_style())
+        self.leaders_check.toggled.connect(self._update_event_items)
+        self.guides_check.toggled.connect(self._update_event_items)
+        return menu
+
+    def _view_centre(self) -> float:
+        lo, hi = self.visible_kp()
+        return 0.5 * (lo + hi)
+
+    def _remember_text(self, key: str, value: str) -> None:
+        if self.persist:
+            try:
+                QSettings().setValue(f"{_SETTINGS}/{key}", value)
+            except Exception:
+                pass
+
+    def event_settings(self) -> Dict:
+        return {"sources": {k: a.isChecked() for k, a in self.event_sources.items()},
+                "groups": {k: a.isChecked() for k, a in self.event_groups.items()},
+                "closed": self.closed_comments_check.isChecked(), "check": self.event_check_action.isChecked()}
+
+    def _on_events_setting(self, *_args) -> None:
+        self._apply_events()
+        self.eventsSettingsChanged.emit()
+
+    def _on_label_style(self) -> None:
+        mode = next(k for k, a in self.label_mode_actions.items() if a.isChecked())
+        tiers = next(k for k, a in self.label_row_actions.items() if a.isChecked())
+        self._remember_text("events_label", mode)
+        self._remember_text("events_rows", str(tiers))
+        self.event_layer.set_style(tiers=tiers, label_mode=mode)
+
+    def set_burial_plans(self, plans: Sequence[Tuple[str, str]], current: str, choose) -> None:
+        """The Burial Planner plans for this RPL (``(plan_id, name)``), the one shown and ``choose(plan_id)``."""
+        self.burial_menu.clear()
+        self.burial_menu.setEnabled(len(plans) > 1)
+        group = _QtGui.QActionGroup(self.burial_menu)
+        group.setExclusive(True)
+        for plan_id, name in plans:
+            action = self.burial_menu.addAction(name)
+            action.setCheckable(True)
+            action.setChecked(plan_id == current)
+            group.addAction(action)
+            action.triggered.connect(lambda _c=False, p=plan_id: choose(p))
+        self.burial_menu.setTitle("Burial plan" + (f": {next((n for p, n in plans if p == current), '')}"
+                                                   if plans else ""))
+
+    def set_events(self, events: Sequence[ev.ProfileEvent]) -> None:
+        """Every event collected for the route (the Events menu chooses what shows)."""
+        self._all_events = list(events)
+        self._apply_events()
+
+    def shown_events(self) -> List[ev.ProfileEvent]:
+        return list(self._shown_events)
+
+    def events_outside(self) -> int:
+        return self._events_outside
+
+    def _apply_events(self) -> None:
         r = self._result
-        if r is None or not self.labels_check.isChecked():
-            return []
-        st = r.stations
-        out = []
-        for b in r.bodies:
-            i = int(np.clip(np.searchsorted(st.kp_km, b.kp_km), 0, st.n - 1))
-            out.append((b.body.name, b.kp_km, float(-r.cable_m[i])))
-        index = st.protection_index
-        for j, item in enumerate(st.protection):
-            idx = np.nonzero(index == j)[0] if index is not None else []
-            if len(idx):
-                i = int(idx[len(idx) // 2])
-                out.append((item.name, float(st.kp_km[i]), float(-r.cable_m[i])))
-        return out
+        if r is None:
+            shown, outside = [], 0
+        else:
+            kp = r.stations.kp_km
+            settings = self.event_settings()
+            shown, outside = ev.visible_events(self._all_events, settings["sources"], settings["groups"],
+                                               float(kp[0]), float(kp[-1]))
+        self._shown_events, self._events_outside = shown, outside
+        mode = next((k for k, a in self.label_mode_actions.items() if a.isChecked()), LABEL_NAME)
+        tiers = next((k for k, a in self.label_row_actions.items() if a.isChecked()), 2)
+        self.event_layer.tiers = tiers
+        self.event_layer.label_mode = mode
+        self.event_layer.set_events(shown)
+        self._update_event_items()
 
-    def _update_body_labels(self, *_args) -> None:
-        bodies = self._labels()
-        while len(self._body_labels) < len(bodies):
-            label = pg.TextItem("", color=(40, 40, 40), anchor=(0.5, 1.3))
-            font = label.textItem.font()
-            font.setPixelSize(11)
-            label.setFont(font)
-            label.setZValue(25)
-            self.depth_plot.addItem(label, ignoreBounds=True)
-            self._body_labels.append(label)
-        for k, label in enumerate(self._body_labels):
-            if k < len(bodies):
-                text, kp, depth = bodies[k]
-                label.setText(text)
-                label.setPos(kp, depth)
-                label.setVisible(True)
-            else:
-                label.setVisible(False)
+    def _update_lane_height(self) -> None:
+        show = bool(self.event_layer.events)
+        self.lane_widget.setFixedHeight(self.event_layer.lane_height())
+        self.lane_widget.setVisible(show)
+
+    def _update_event_items(self, *_args) -> None:
+        r = self._result
+        if r is not None and self.leaders_check.isChecked():
+            self.leader_item.set_cable(r.stations.kp_km, -r.cable_m)
+        else:
+            self.leader_item.set_cable(None, None)
+        for guide in self.guide_items:
+            guide.setVisible(self.guides_check.isChecked())
+            guide.update()
+        self.leader_item.update()
+
+    def _lane_point(self, scene_pos) -> Optional[Tuple[float, float, float]]:
+        """``(x from the lane's left, y, KP)`` of a scene position over the lane."""
+        vb = self.lane_plot.vb
+        rect = vb.sceneBoundingRect()
+        if not rect.contains(scene_pos):
+            return None
+        kp = float(vb.mapSceneToView(scene_pos).x())
+        return float(scene_pos.x() - rect.left()), float(scene_pos.y()), kp
+
+    def _events_at_scene(self, scene_pos) -> List[ev.ProfileEvent]:
+        point = self._lane_point(scene_pos)
+        if point is None:
+            return []
+        x, y, _kp = point
+        return self.event_layer.events_at(x, y, self.lane_plot.vb.sceneBoundingRect().top())
+
+    def _on_lane_moved(self, pos) -> None:
+        if self._result is None or self.measure.active:
+            return
+        point = self._lane_point(pos)
+        if point is None:
+            self._end_hover()
+            return
+        hits = self._events_at_scene(pos)
+        kp = hits[0].kp if hits else point[2]
+        for line in self._vlines:
+            line.setPos(kp)
+            line.show()
+        self.kpHovered.emit(kp)
+        if not hits:
+            self.tip.hide()
+            self.readout.setText(f"KP {point[2]:.3f}: no event here. Right-click to add a marker or a comment.")
+            return
+        blocks = [html.escape(e.detail).replace("\n", "<br>") for e in hits[:5]]
+        if len(hits) > 5:
+            blocks.append(f"and {len(hits) - 5} more")
+        self.readout.setText("  |  ".join(e.detail.split("\n")[0] for e in hits[:5]))
+        self._show_tip("events", pos, "<hr>".join(blocks))
+
+    def _on_lane_clicked(self, event) -> None:
+        if self._result is None or self.measure.active or event.isAccepted():
+            return
+        if event.button() == _RIGHT_BUTTON:
+            return
+        hits = self._events_at_scene(event.scenePos())
+        if not hits:
+            return
+        if event.double():
+            self.eventActivated.emit(hits[0])
+        else:
+            self.eventClicked.emit(hits[0])
+
+    def _context_actions(self, kp: float, scene_pos) -> List[Tuple[Optional[str], object, bool]]:
+        """Right-click on the profile or the lane: add a marker or a comment here; edit a marker under it."""
+        if self._result is None:
+            return []
+        st = self._result.stations
+        kp = float(min(max(kp, st.kp_km[0]), st.kp_km[-1]))
+        lo, hi = sorted(self.visible_kp())
+        lo, hi = max(lo, float(st.kp_km[0])), min(hi, float(st.kp_km[-1]))
+        comment = bool(self.can_comment())
+        items: List[Tuple[Optional[str], object, bool]] = [
+            (f"Add a marker at KP {kp:.3f}…", lambda: self.markerRequested.emit(kp, None), True),
+            (f"Add a Route Comment at KP {kp:.3f}…", lambda: self.commentRequested.emit(kp, None), comment),
+            (f"Add a Route Comment over the KPs in view ({lo:.3f} to {hi:.3f})…",
+             lambda: self.commentRequested.emit(lo, hi), comment)]
+        near = self._marker_near(kp, scene_pos)
+        if near is not None:
+            index, label = near
+            items += [(None, None, True), (f"Edit marker '{label}'…", lambda: self.markerEditRequested.emit(index), True),
+                      (f"Delete marker '{label}'", lambda: self.markerDeleteRequested.emit(index), True)]
+        return items
+
+    def _marker_near(self, kp: float, scene_pos) -> Optional[Tuple[int, str]]:
+        """The marker under a right-click (within a few pixels), as ``(index, label)``."""
+        lo, hi = self.visible_kp()
+        width = max(self.depth_plot.vb.sceneBoundingRect().width(), 1.0)
+        tol = abs(hi - lo) / width * 6.0
+        best = None
+        for e in self._shown_events:
+            if e.source != ev.SRC_MARKER:
+                continue
+            d = 0.0 if e.lo <= kp <= e.hi else min(abs(kp - e.lo), abs(kp - e.hi))
+            if d <= tol and (best is None or d < best[0]):
+                best = (d, e)
+        if best is None:
+            return None
+        try:
+            return int(best[1].key.split(":", 1)[1]), best[1].label
+        except (IndexError, ValueError):
+            return None
+
+    # -- cable colour --------------------------------------------------------------------------
+    def colour_mode(self) -> str:
+        return next((k for k, a in self.colour_actions.items() if a.isChecked()), cc.PLAIN)
+
+    def _on_colour_mode(self) -> None:
+        self._remember_text("cable_colour", self.colour_mode())
+        self._update_colour()
+
+    def _update_colour(self) -> None:
+        r = self._result
+        mode = self.colour_mode()
+        if r is None or mode == cc.PLAIN:
+            self._colour_runs, self._colour_legend, self._colour_classes, self._colour_note = [], [], None, ""
+        else:
+            classes, legend, note = cc.cable_classes(r, mode)
+            self._colour_classes, self._colour_legend, self._colour_note = classes, legend, note
+            self._colour_runs = cc.class_runs(classes)
+        for k, item in enumerate(self.colour_paths):
+            if k < len(self._colour_legend):
+                item.setPen(pg.mkPen(self._colour_legend[k][0], width=3.5))
+        self._draw_colour_paths()
+        self._update_depth_caption()
+
+    def _draw_colour_paths(self) -> None:
+        r = self._result
+        if r is None or not self._colour_runs:
+            for item in self.colour_paths:
+                item.setPath(QPainterPath())
+            return
+        lo, hi = sorted(self.visible_kp())
+        width = max(int(self.depth_plot.vb.sceneBoundingRect().width()), 50)
+        paths = cc.class_paths(r.stations.kp_km, -r.cable_m, self._colour_runs, lo, hi, width)
+        for k, item in enumerate(self.colour_paths):
+            xs, ys, connect = paths.get(k, ([], [], []))
+            item.setPath(pg.arrayToQPath(np.asarray(xs), np.asarray(ys), connect=np.asarray(connect, dtype=bool))
+                         if len(xs) > 1 else QPainterPath())
+
+    def colour_text(self, i: int) -> str:
+        """The cable's colour class at station ``i`` (empty when plain)."""
+        if self._colour_classes is None or not (0 <= i < len(self._colour_classes)):
+            return ""
+        k = int(self._colour_classes[i])
+        return self._colour_legend[k][1] if 0 <= k < len(self._colour_legend) else ""
+
+    def _update_depth_caption(self) -> None:
+        caption = self.captions.get("depth")
+        if caption is None:
+            return
+        text = _legend_html(_LEGENDS["depth"])
+        if self._colour_legend:
+            mode = next((t for k, t, _tip in cc.MODES if k == self.colour_mode()), "")
+            swatches = "&nbsp;&nbsp;&nbsp;".join(
+                f"<span style='color:{_hex(colour)}; font-weight:bold'>━━</span>&nbsp;{html.escape(label)}"
+                for colour, label in self._colour_legend)
+            text += f"<br><b>Cable colour: {html.escape(mode)}</b>&nbsp;&nbsp;{swatches}"
+            if self._colour_note:
+                text += f"<br><span style='color:#666'>{html.escape(self._colour_note)}</span>"
+        caption.setText(text)
 
     def _on_body_clicked(self, _item, points, *_args) -> None:
         if points is None or not len(points):
@@ -999,7 +1545,7 @@ class ProfilePlot(QWidget):
         return float(plot.vb.mapSceneToView(pos).x())
 
     def eventFilter(self, watched, event):  # noqa: N802 (Qt API)
-        if event.type() == _LEAVE and watched in self.widgets.values():
+        if event.type() == _LEAVE and (watched in self.widgets.values() or watched is self.lane_widget):
             self._end_hover()
         return super().eventFilter(watched, event)
 
@@ -1038,7 +1584,7 @@ class ProfilePlot(QWidget):
         if not text:
             self.tip.hide()
             return
-        widget = self.widgets[key]
+        widget = self.lane_widget if key == "events" else self.widgets[key]
         at = widget.viewport().mapTo(self, widget.mapFromScene(scene_pos))
         self.tip.setText(text)
         self.tip.adjustSize()
@@ -1135,26 +1681,49 @@ class ProfilePlot(QWidget):
         gap = float(r.gap_m[i])
         parts = [f"KP {st.kp_km[i]:.3f}", f"depth {-st.seabed_m[i]:.1f} m",
                  f"gap {gap:.2f} m" if gap > 0.005 else "on the seabed",
-                 f"T {r.tension_kn[i]:.2f} kN (laid {r.deposit_kn[i]:.2f})"]
+                 f"T {_tension_text(r.tension_kn[i])} (laid {_tension_text(r.deposit_kn[i])})"]
         span = self._span_at(i)
         if span is not None:
             k, s = span
             level = pl.span_level(r, k).replace("indicative", "indicative: below the data's resolution")
-            parts.append(f"span {k + 1} ({level}): {s.length_m:.1f} m long, up to {s.max_gap_m:.2f} m high")
+            parts.append(f"span {k + 1} ({level}): {s.length_m:.1f} m long, up to {s.max_gap_m:.2f} m high"
+                         + self._short_text(k))
         elif gap > pl.span_end_tol(r.criteria):
             parts.append("clear of the seabed, under the reporting limits")
-        if math.isfinite(r.laid_pct[i]):
-            parts.append(f"slack laid {r.laid_pct[i]:.2f}%, fill {r.fill_pct[i]:.2f}%, surplus {r.excess_pct[i]:.2f}%")
+        slack = self._slack_text(i)
+        if slack:
+            parts.append(slack)
         parts.append(f"slope {math.degrees(math.atan(abs(st.slope[i]))):.1f}° (friction "
                      f"{math.degrees(math.atan(st.mu[i])):.0f}°, μ {st.mu[i]:.2f})")
         parts.append(self._type_label(i))
         if st.soil[i]:
             parts.append(st.soil[i])
+        colour = self.colour_text(i)
+        if colour:
+            parts.append(f"cable colour: {colour}")
         return "  |  ".join(parts)
 
     def _span_at(self, i: int):
         """``(number from 0, span)`` of the reported span over station ``i``, or None."""
         return next(((k, s) for k, s in enumerate(self._result.spans) if s.i0 <= i <= s.i1), None)
+
+    def _short_text(self, k: int) -> str:
+        """``", 1.23 m shorter than the seabed under it"`` for span ``k`` (as drawn)."""
+        r = self._result
+        if r is None or k >= len(r.span_short_m) or not math.isfinite(r.span_short_m[k]):
+            return ""
+        return f", {r.span_short_m[k]:.2f} m shorter than the seabed under it"
+
+    def _slack_text(self, i: int) -> str:
+        r = self._result
+        series = self.slack_series(r)
+        laid, used, surplus = (float(series[key][i]) for key in ("laid", "used", "surplus"))
+        if not math.isfinite(laid):
+            return ""
+        if self.slack_basis() == SLACK_SEABED and r.used_bottom_pct is not None:
+            return f"bottom slack laid {laid:+.2f}%, used {used:+.2f}%, surplus {surplus:.2f}%"
+        return (f"slack over the route laid {laid:.2f}%, used {used:.2f}%, fill {r.fill_pct[i]:.2f}%, "
+                f"surplus {surplus:.2f}%")
 
     def _type_label(self, i: int) -> str:
         st = self._result.stations
@@ -1186,20 +1755,28 @@ class ProfilePlot(QWidget):
                     k, s = span
                     level = pl.span_level(r, k)
                     rows.append((f"Span {k + 1} ({level})", f"{s.length_m:.1f} m long, up to {s.max_gap_m:.2f} m"))
+                    if k < len(r.span_short_m) and math.isfinite(r.span_short_m[k]):
+                        rows.append(("Short of seabed", f"{r.span_short_m[k]:.2f} m over the span"))
                     rows.append(("Gap here", f"{gap:.2f} m"))
                 elif gap > pl.span_end_tol(r.criteria):
                     rows.append(("Gap", f"{gap:.2f} m (under the reporting limits)"))
                 else:
                     rows.append(("Gap", "on the seabed"))
             elif key == "tension":
-                rows.append(("Residual T", f"{r.tension_kn[i]:.2f} kN"))
+                rows.append(("Residual T", _tension_text(r.tension_kn[i])))
             elif key == "lay":
-                rows.append(("Lay T", f"{r.deposit_kn[i]:.2f} kN"))
+                rows.append(("Lay T", _tension_text(r.deposit_kn[i])))
             elif key == "allowable" and r.allowable_kn is not None and r.allowable_kn[i] < 99.9:
                 rows.append(("Highest T, spans in limits", f"{r.allowable_kn[i]:.2f} kN"))
-            elif key == "slack" and math.isfinite(r.laid_pct[i]):
-                rows.append(("Slack", f"laid {r.laid_pct[i]:.2f}%, fill {r.fill_pct[i]:.2f}%, "
-                                      f"surplus {r.excess_pct[i]:.2f}%"))
+            elif key == "slack":
+                series = self.slack_series(r)
+                laid, used, surplus = (float(series[k][i]) for k in ("laid", "used", "surplus"))
+                if math.isfinite(laid):
+                    if self.slack_basis() == SLACK_SEABED and r.used_bottom_pct is not None:
+                        rows.append(("Bottom slack", f"laid {laid:+.2f}%, used {used:+.2f}%, surplus {surplus:.2f}%"))
+                    else:
+                        rows.append(("Slack / route", f"laid {laid:.2f}%, used {used:.2f}%, fill "
+                                                      f"{r.fill_pct[i]:.2f}%, surplus {surplus:.2f}%"))
             elif key == "slope":
                 rows.append(("Slope", f"{math.degrees(math.atan(abs(st.slope[i]))):.1f}° (friction "
                                       f"{math.degrees(math.atan(st.mu[i])):.0f}°, μ {st.mu[i]:.2f})"))
@@ -1207,6 +1784,9 @@ class ProfilePlot(QWidget):
                 rows.append(("Cable", self._type_label(i)))
             elif key == "soil" and st.soil[i]:
                 rows.append(("Soil", st.soil[i]))
+        colour = self.colour_text(i)
+        if colour:
+            rows.append(("Cable colour", colour))
         return rows
 
     def tip_html(self, i: Optional[int], keys: Sequence[str]) -> str:

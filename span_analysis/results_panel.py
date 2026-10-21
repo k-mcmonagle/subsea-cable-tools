@@ -48,9 +48,11 @@ FRAME_NO_FRAME = getattr(getattr(QFrame, "Shape", QFrame), "NoFrame")
 SEVERITY_TEXT = {ERROR: "Red", WARNING: "Amber", INFO: "Info"}
 SEVERITY_COLOUR = {ERROR: "#d32f2f", WARNING: "#ff9800", INFO: "#1f77b4"}
 FINDING_HEADERS = ["Level", "Check", "KP from", "KP to", "Length (m)", "Value", "Message"]
-SPAN_HEADERS = ["#", "KP from", "KP to", "Length (m)", "Max gap (m)", "KP max gap", "Tension (kN)", "Tension from",
+SPAN_HEADERS = ["#", "KP from", "KP to", "Length (m)", "Max gap (m)", "Short of seabed (m)", "KP max gap", "Tension (kN)",
+                "Tension from",
                 "Min bend R (m)", "MBR (m)", "Reaction (kN)", "Max T for limits (kN)", "Resolved by the data",
                 "Bodies"]
+EVENT_HEADERS = ["Source", "Type", "KP", "KP to", "Label", "In the model", "Details"]
 BODY_HEADERS = ["Name", "Kind", "KP", "Weight (kN)", "Clear of seabed (m)", "In a span", "Tension (kN)",
                 "Housing standoff (m)"]
 DETAIL_HEADERS = ["KP from", "KP to", "Length (m)", "Max gap (m)", "Min bend R (m)", "KP of min R", "MBR (m)",
@@ -188,6 +190,7 @@ class ResultsPanel(QTabWidget):
         self._build_findings()
         self._build_spans()
         self._build_bodies()
+        self._build_events()
         self.summary = QTextBrowser()
         self.summary.setOpenExternalLinks(False)
         self.addTab(self.summary, "Summary")
@@ -279,6 +282,42 @@ class ResultsPanel(QTabWidget):
         self.bodies_table = _table(BODY_HEADERS)
         self.bodies_table.itemSelectionChanged.connect(lambda: self._emit_range(self.bodies_table))
         self.addTab(self.bodies_table, "Bodies")
+
+    def _build_events(self) -> None:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(2, 2, 2, 2)
+        self.events_table = _table(EVENT_HEADERS)
+        self.events_table.itemSelectionChanged.connect(lambda: self._emit_range(self.events_table))
+        layout.addWidget(self.events_table, 1)
+        self.events_note = WrapLabel("")
+        self.events_note.setStyleSheet("QLabel { color: #555; }")
+        layout.addWidget(self.events_note)
+        self.events_page = page
+        self.addTab(page, "Events")
+
+    def set_events(self, events: Sequence, notes: Sequence[str]) -> None:
+        """The events on the lane (with what was left out, and why, below)."""
+        from . import events as ev
+
+        rows, payloads = [], []
+        for e in events:
+            modelled = {True: "yes", False: ("no", SEVERITY_COLOUR[INFO]), None: ""}[e.modelled]
+            lines = e.detail.splitlines()
+            rows.append([ev.SOURCE_NAMES.get(e.source, e.source), ev.TYPE_LABELS.get(e.kind, e.kind or ""),
+                         f"{e.lo:.3f}", f"{e.hi:.3f}" if e.is_range else "", e.label, modelled,
+                         "; ".join(lines[1:])])
+            half = 0.0 if e.is_range else 0.01
+            payloads.append((e.lo - half, e.hi + half))
+        _fill(self.events_table, rows, payloads)
+        self.setTabText(self.indexOf(self.events_page), f"Events ({len(rows)})" if rows else "Events")
+        self.events_note.setText(" ".join(notes))
+        self.events_note.setVisible(bool(notes))
+
+    def update_findings(self, findings: Sequence) -> None:
+        """The findings again (the event checks changed; the rest of the result did not)."""
+        self._findings = list(findings)
+        self._populate_findings()
 
     def _emit_range(self, table: QTableWidget) -> None:
         rows = table.selectionModel().selectedRows()
@@ -442,6 +481,12 @@ class ResultsPanel(QTabWidget):
                           "tension falls, so this is a ceiling: lay at or below it. Each tension is solved in full "
                           "(friction, slopes, bodies and protection).")
         layout.addWidget(intro)
+        # Shown when the inputs behind the answers or the sweep (seabed, cable, friction, limits) changed.
+        self.tools_stale = WrapLabel("")
+        self.tools_stale.setStyleSheet("QLabel { background: #fff3cd; color: #6d4c00; padding: 3px; "
+                                       "border-radius: 2px; }")
+        self.tools_stale.setVisible(False)
+        layout.addWidget(self.tools_stale)
         row = QHBoxLayout()
         self.find_target = QComboBox()
         for key, label in TARGETS:
@@ -534,6 +579,14 @@ class ResultsPanel(QTabWidget):
 
     def show_find(self) -> None:
         self.setCurrentWidget(self.find_page)
+
+    def set_tools_stale(self, text: str) -> None:
+        """Say the answers and the sweep below came from other inputs ("" when they are current)."""
+        self.tools_stale.setText(text)
+        self.tools_stale.setVisible(bool(text))
+
+    def has_tool_results(self) -> bool:
+        return bool(self._found) or self.sweep_table.rowCount() > 0
 
     def show_sweep(self) -> None:
         self.setCurrentWidget(self.find_page)
@@ -690,8 +743,10 @@ class ResultsPanel(QTabWidget):
                 else:
                     resolved = "yes"
                 number_colour = {"red": "#d32f2f", "indicative": SEVERITY_COLOUR[INFO]}.get(level)
+                short = result.span_short_m[k] if k < len(result.span_short_m) else None
+                tension = "no finite T" if pl.unbounded(s.tension_kn) else _num(s.tension_kn)
                 span_rows.append([(str(k + 1), number_colour), f"{s.kp_start:.3f}", f"{s.kp_end:.3f}",
-                                  _num(s.length_m, 1), _num(s.max_gap_m), f"{s.kp_max_gap:.3f}", _num(s.tension_kn),
+                                  _num(s.length_m, 1), _num(s.max_gap_m), _num(short), f"{s.kp_max_gap:.3f}", tension,
                                   s.source, (_num(s.min_bend_radius_m, 1), "#d32f2f" if s.below_mbr else None),
                                   _num(s.mbr_m, 1), _num(s.max_reaction_kn), _num(s.allowable_kn), resolved,
                                   bodies])
@@ -751,7 +806,8 @@ def summary_html(result: pl.PlanningResult, notes: Sequence[str], setup_lines: S
     rows = [
         ("Route length (plan)", f"{s.route_m:,.0f} m"),
         ("Seabed length", f"{s.seabed_m:,.0f} m (fill {s.fill_pct:.3f}%)"),
-        ("Cable laid", f"{s.cable_laid_m:,.0f} m (slack {s.laid_slack_pct:.3f}% over the route)"),
+        ("Cable laid", f"{s.cable_laid_m:,.0f} m (bottom slack {s.bottom_slack_pct:+.3f}% over the seabed, "
+                       f"{s.laid_slack_pct:.3f}% over the route)"),
         ("Cable used by the rest shape", f"{s.cable_shape_m:,.0f} m"),
         ("Seabed data", _data_text(result)),
         ("Spans", f"{s.spans} ({s.red_spans} red), {s.span_length_m:,.0f} m in total, longest "
@@ -761,8 +817,9 @@ def summary_html(result: pl.PlanningResult, notes: Sequence[str], setup_lines: S
         ("Tightest bend at a support", "none" if s.min_bend_radius_m == math.inf else
          f"{s.min_bend_radius_m:.1f} m ({s.below_mbr} support(s) below the MBR)"),
         ("Largest support reaction", f"{s.max_reaction_kn:.2f} kN"),
-        ("Residual tension", f"mean {s.mean_tension_kn:.2f} kN, max {s.max_tension_kn:.2f} kN"
-                             + (" (above NPTS)" if s.over_npts else "")),
+        ("Residual tension", "no finite tension where the cable laid is shorter than the seabed (see Findings)"
+         if pl.unbounded(s.max_tension_kn) else f"mean {s.mean_tension_kn:.2f} kN, max {s.max_tension_kn:.2f} kN"
+                                                + (" (above NPTS)" if s.over_npts else "")),
         ("Reporting limits", f"spans higher than {c.min_gap_m:g} m and longer than {c.min_length_m:g} m, from "
                              + ("lift-off to touchdown" if c.touchdown_gap_m <= 0 else
                                 f"where the gap passes {c.touchdown_gap_m:g} m")
