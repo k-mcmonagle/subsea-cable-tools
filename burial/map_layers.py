@@ -28,7 +28,7 @@ from qgis.core import (
 )
 
 from ..plugin_log import log_exception, log_info
-from ..processing.cable_lay_parsers import WKT_KEY, gpkg_layer_uri
+from ..processing.cable_lay_parsers import WKT_KEY, gpkg_layer_uri, open_gpkg_layer
 from ..qgis_compat import WKB_LINESTRING, WKB_POINT
 from ..workbench.project_layers import layer_name_from_source, normalised_path
 from . import events as ev
@@ -933,7 +933,6 @@ def ensure_cpt_layer(project: Optional[QgsProject], gpkg_path: str,
     Not part of any plan's subgroup: CPTs are shared by every plan, so plan
     switching never hides them (``set_active_plan_layers`` does not match it).
     """
-    from ..processing.cable_lay_parsers import open_gpkg_layer
     project = project or QgsProject.instance()
     existing = find_layer(project, gpkg_path, schema.CPT_LAYER_NAME)
     if existing is not None and existing.isValid():
@@ -1161,6 +1160,9 @@ def _ensure_layer(project: QgsProject, gpkg_path: str, layer_name: str,
                   reload: bool = True,
                   plan: Optional[Dict] = None) -> Optional[QgsVectorLayer]:
     existing = find_layer(project, gpkg_path, layer_name)
+    if existing is None:
+        existing = _repair_moved_layer(project, gpkg_path, layer_name,
+                                       style_fn)
     if existing is not None and existing.isValid():
         if plan:
             # Pre-grouping projects keep working: a plan layer sitting flat
@@ -1221,6 +1223,51 @@ def _ensure_layer(project: QgsProject, gpkg_path: str, layer_name: str,
     layer.setCustomProperty(_STYLE_VERSION_PROPERTY, _STYLE_VERSION)
     _layer_id_cache[(normalised_path(gpkg_path), layer_name)] = layer.id()
     return layer
+
+
+def _repair_moved_layer(project: QgsProject, gpkg_path: str, layer_name: str,
+                        style_fn) -> Optional[QgsVectorLayer]:
+    """Repoint a broken project layer of this table instead of adding a twin.
+
+    A project opened from a moved folder keeps its plan layers, invalid, on
+    the old path. The dock resolves its plan file while the project is
+    still being read — before the plugin's ``projectRead`` repair — so
+    without this every plan layer was added a second time.
+    """
+    for layer in project.mapLayers().values():
+        if not isinstance(layer, QgsVectorLayer) or layer.isValid():
+            continue
+        source = layer.source()
+        name = _burial_layer_name(source) or (
+            schema.CPT_LAYER_NAME if _cpt_layer_source(source) else "")
+        if name != layer_name:
+            continue
+        from ..workbench.project_layers import repair_layer
+
+        if open_gpkg_layer(gpkg_path, layer_name) is None \
+                or not repair_layer(layer, gpkg_path, layer_name):
+            return None
+        style_fn(layer)
+        layer.setCustomProperty(_STYLE_VERSION_PROPERTY, _STYLE_VERSION)
+        try:
+            layer.setReadOnly(True)
+        except Exception:
+            pass
+        _layer_id_cache[(normalised_path(gpkg_path), layer_name)] = layer.id()
+        log_info(f"Burial Planner: repointed plan layer '{layer_name}' at "
+                 f"{gpkg_path}")
+        return layer
+    return None
+
+
+def project_has_store_layers(project: Optional[QgsProject],
+                             gpkg_path: str) -> bool:
+    """Whether any project layer reads from the plan file ``gpkg_path``."""
+    project = project or QgsProject.instance()
+    if not gpkg_path:
+        return False
+    return any(layer_name_from_source(layer.source(), gpkg_path)
+               for layer in project.mapLayers().values())
 
 
 def ensure_plan_layers(project: Optional[QgsProject], gpkg_path: str, plan: Dict,
@@ -1439,7 +1486,6 @@ def restore_burial_layers(project: Optional[QgsProject] = None) -> int:
         if not gpkg_path:
             return 0
         from ..workbench.project_layers import repair_layer
-        from ..processing.cable_lay_parsers import open_gpkg_layer
 
         touched = 0
         for layer in broken:

@@ -35,7 +35,7 @@ from . import map_layers, model
 from .dialogs import (SETTINGS, ChoicesDialog, CommentForm, ExportDialog, FieldsDialog, ImportDialog, LabelDialog,
                       NewCommentDialog, default_author, remember_author)
 from .route_ref import CaptureRoute, ReferenceChecker, location_without_route
-from .store import CommentStore, CommentStoreError, ConflictError, is_register
+from .store import CommentStore, CommentStoreError, ConflictError, attachments_dir_for, is_register
 from .widgets import (COND_COLORS, EDITABLE, ID_ROLE, CommentDelegate, CommentProxy, CommentTableModel, ThreadView,
                       readable_selection)
 
@@ -56,6 +56,17 @@ def default_register_path(project: Optional[QgsProject] = None) -> str:
     path = project.fileName()
     stem = os.path.splitext(os.path.basename(path))[0] if path else (sanitize_slug(project.title()) or "project")
     return os.path.join(gpkg_folder_for(path), f"{stem}_comments.gpkg")
+
+
+def unused_register_path(path: str) -> str:
+    """``path``, or ``<stem>_2.gpkg``, ``_3``… when that file or its attachments
+    folder is there already (every unsaved project shares one default name)."""
+    stem, ext = os.path.splitext(path)
+    candidate, n = path, 1
+    while os.path.exists(candidate) or os.path.exists(attachments_dir_for(candidate)):
+        n += 1
+        candidate = f"{stem}_{n}{ext}"
+    return candidate
 
 
 class RouteCommentsDock(QDockWidget):
@@ -426,19 +437,46 @@ class RouteCommentsDock(QDockWidget):
             QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(self.store.path)))
 
     def new_register(self) -> bool:
-        path, _f = QFileDialog.getSaveFileName(self, "New comment register", default_register_path(),
-                                               "GeoPackage (*.gpkg)")
-        if not path:
-            return False
-        if not path.lower().endswith(".gpkg"):
-            path += ".gpkg"
+        suggested = unused_register_path(default_register_path())
+        while True:
+            # The dialog never confirms an overwrite: a register is never
+            # replaced (other projects may use it), picking one is asked below.
+            path, _f = QFileDialog.getSaveFileName(self, "New comment register", suggested, "GeoPackage (*.gpkg)",
+                                                   options=QFileDialog.Option.DontConfirmOverwrite)
+            if not path:
+                return False
+            if not path.lower().endswith(".gpkg"):
+                path += ".gpkg"
+            existing = is_register(path)
+            if not existing:
+                break
+            choice = self._ask_existing_register(path)
+            if choice == "open":
+                break
+            if choice != "rename":
+                return False
+            suggested = unused_register_path(path)
         try:
-            store = CommentStore(path).open() if is_register(path) else CommentStore.create(path)
+            store = CommentStore(path).open() if existing else CommentStore.create(path)
         except CommentStoreError as exc:
             self._error("New register", exc)
             return False
         self._use_store(store)
         return True
+
+    def _ask_existing_register(self, path: str) -> str:
+        """``"open"``, ``"rename"`` or ``""`` (cancel) for an existing register picked as a new one."""
+        box = QMessageBox(QMessageBox.Icon.Question, "New comment register",
+                          f"{os.path.basename(path)} is already a comment register, with its own comments. "
+                          "A register is never overwritten.", parent=self)
+        rename = box.addButton("Choose another name…", QMessageBox.ButtonRole.AcceptRole)
+        existing = box.addButton("Open it", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(rename)
+        qt_exec(box)
+        if box.clickedButton() is rename:
+            return "rename"
+        return "open" if box.clickedButton() is existing else ""
 
     def open_register(self, path: Optional[str] = None) -> bool:
         if not path:

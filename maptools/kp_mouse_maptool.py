@@ -242,6 +242,10 @@ class KPMouseMapTool(QgsMapTool):
         self._route = None
         self.features_geoms = []
         self.total_length_meters = 0.0
+        if self.layer is not None and _sip_isdeleted(self.layer):
+            # Removed from the project (e.g. a new project): no route, rather
+            # than a RuntimeError on the next map CRS change.
+            self.layer = None
         if self.layer is None:
             self.distanceArea = make_kp_distance_area(
                 map_crs, QgsProject.instance().transformContext(), mode=mode)
@@ -282,7 +286,6 @@ class KPMouseMapTool(QgsMapTool):
         self._wgs84_crs = self._wgs84_xforms = None
         self._ring_key = None
         self._cancel_comment_range(quiet=True)  # it holds the old route
-        self.recalculate_geometries()
         if self.range_bearing_origin is not None:
             self.range_bearing_origin = None
             if self.rangeBearingOriginMarker is not None:
@@ -294,6 +297,28 @@ class KPMouseMapTool(QgsMapTool):
             # The profile window holds the old route and sampler CRS.
             window.cleanup()
             self.depth_profile_window = None
+        self._depth_sampler = None
+        self._hover_depth_slow = False
+        self._hover_depth_pending = False
+        # Last, so a failed rebuild cannot skip the resets above.
+        self.recalculate_geometries()
+
+    def drop_depth_layers(self, layer_ids) -> None:
+        """Forget depth sources among ``layer_ids`` (removed from the project).
+
+        The sampler and the live profile window hold those layers, so both
+        are released; the remaining sources are sampled afresh.
+        """
+        removed = set(layer_ids or [])
+        kept = [(layer, field) for layer, field in self.depthSources
+                if not _sip_isdeleted(layer) and layer.id() not in removed]
+        if len(kept) == len(self.depthSources):
+            return
+        self.depthSources = kept
+        window = self.depth_profile_window
+        if window is not None and not _sip_isdeleted(window):
+            window.cleanup()
+        self.depth_profile_window = None
         self._depth_sampler = None
         self._hover_depth_slow = False
         self._hover_depth_pending = False
@@ -2084,7 +2109,11 @@ class KPMouseTool:
         self.toolButtonAction = self.iface.addToolBarWidget(self.toolButton)
         self._update_go_to_kp_enabled()
 
-        QgsProject.instance().layersRemoved.connect(self._on_layers_removed)
+        project = QgsProject.instance()
+        project.layersRemoved.connect(self._on_layers_removed)
+        # New / Open / Close project: the tool's route, depth sampler and map
+        # graphics belong to the old project's layers.
+        project.aboutToBeCleared.connect(self._on_project_about_to_be_cleared)
 
         self.iface.addPluginToMenu(self.menu_name, self.actionConfig)
 
@@ -2097,16 +2126,15 @@ class KPMouseTool:
         reload. Safe to call twice.
         """
         iface = self.iface
-        if self.mapTool is not None:
-            if iface is not None and iface.mapCanvas().mapTool() == self.mapTool:
-                iface.mapCanvas().unsetMapTool(self.mapTool)
-            self.mapTool.cleanup_resources()
-            self.mapTool = None
+        self._dispose_map_tool()
 
-        try:
-            QgsProject.instance().layersRemoved.disconnect(self._on_layers_removed)
-        except TypeError:  # initGui never ran / already unloaded
-            pass
+        project = QgsProject.instance()
+        for signal, slot in ((project.layersRemoved, self._on_layers_removed),
+                             (project.aboutToBeCleared, self._on_project_about_to_be_cleared)):
+            try:
+                signal.disconnect(slot)
+            except TypeError:  # initGui never ran / already unloaded
+                pass
 
         button = self.toolButton
         if button is not None and not _sip_isdeleted(button):
@@ -2150,6 +2178,10 @@ class KPMouseTool:
                     "Info", "KP Mouse Tool: Please configure a reference layer.", level=MESSAGE_INFO
                 )
                 self.show_config_dialog()
+                if self.mapTool is not None or not self.toolButton.isChecked():
+                    # Accepting the dialog already turned the tool on (or
+                    # off): a second tool here was orphaned on the canvas.
+                    return
                 layer = self._get_reference_layer()
                 if not layer:
                     self.toolButton.setChecked(False)
@@ -2169,6 +2201,9 @@ class KPMouseTool:
                 "showDepthProfile", self.showDepthProfile, type=bool)
             # Pick up a change made in KP settings since the tool was set up.
             self.useCartesian = kp_distance_mode() == KP_MODE_CARTESIAN
+            # Reconfiguring while on replaces the tool: release the old one
+            # (it kept its canvas items and CRS hook alive as a canvas child).
+            self._dispose_map_tool()
             self.mapTool = KPMouseMapTool(
                 self.iface.mapCanvas(),
                 layer,
@@ -2190,15 +2225,41 @@ class KPMouseTool:
             self.mapTool.comment_hook = self.comment_hook
             self.iface.mapCanvas().setMapTool(self.mapTool)
         else:
-            # Deactivating the tool
-            if self.mapTool:
-                if self.iface.mapCanvas().mapTool() == self.mapTool:
-                    self.iface.mapCanvas().unsetMapTool(self.mapTool)
-                # Clean up the map tool resources
-                self.mapTool.cleanup_resources()
-                self.mapTool = None
-
+            self._dispose_map_tool()
             self._update_go_to_kp_enabled()
+
+    def _dispose_map_tool(self):
+        """Unset the map tool, release its resources and delete it.
+
+        A ``QgsMapTool`` is a child of the canvas: without ``deleteLater()``
+        every tool ever made stayed alive until QGIS exits.
+        """
+        tool, self.mapTool = self.mapTool, None
+        if tool is None or _sip_isdeleted(tool):
+            return
+        canvas = self.iface.mapCanvas() if self.iface is not None else None
+        try:
+            if canvas is not None and canvas.mapTool() == tool:
+                canvas.unsetMapTool(tool)
+        except RuntimeError:  # canvas already deleted (QGIS closing)
+            pass
+        tool.cleanup_resources()
+        tool.deleteLater()
+
+    def _turn_off(self):
+        """Switch the tool off as the toolbar button does (unchecked too)."""
+        button = self.toolButton
+        if button is not None and not _sip_isdeleted(button) and button.isChecked():
+            button.setChecked(False)  # -> toggle_tool(False)
+        self._dispose_map_tool()
+        self._update_go_to_kp_enabled()
+
+    def _on_project_about_to_be_cleared(self):
+        """New / Open / Close project: turn the tool off while the old layers
+        still exist. Its route, depth sampler, live profile and map graphics
+        all belong to the old project."""
+        self.referenceLayer = None
+        self._turn_off()
 
     def _resolve_depth_sources(self):
         """Resolve stored (layer_id, field) refs to live [(layer, field)] pairs."""
@@ -2279,6 +2340,14 @@ class KPMouseTool:
         if not layer_id or layer_id in set(layer_ids):
             # Removed, or the wrapper is already deleted.
             self.referenceLayer = None
+        tool = self.mapTool
+        if tool is not None:
+            if self.referenceLayer is None or tool.layer is None or _sip_isdeleted(tool.layer):
+                # The tool's route belongs to the removed line: it would keep
+                # showing KPs of a line no longer in the project.
+                self._turn_off()
+            else:
+                tool.drop_depth_layers(layer_ids)
         self._update_go_to_kp_enabled()
 
     def _reference_layer_ready(self) -> bool:

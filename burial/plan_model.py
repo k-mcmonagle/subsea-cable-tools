@@ -3349,11 +3349,15 @@ class PlanModel(QObject):
         else:
             self._layer_timer.start()
 
-    def flush_layer_refresh(self) -> None:
-        """Write a debounced layer refresh now (dock close / unload)."""
-        self._flush_layer_refresh()
+    def flush_layer_refresh(self, ensure: bool = True) -> None:
+        """Write a debounced layer refresh now (dock close / unload).
 
-    def _flush_layer_refresh(self) -> None:
+        ``ensure=False`` writes the plan file only and adds nothing to the
+        QGIS project — for a project that is being cleared.
+        """
+        self._flush_layer_refresh(ensure=ensure)
+
+    def _flush_layer_refresh(self, ensure: bool = True) -> None:
         self._layer_timer.stop()
         parts = sorted(self._pending_layer_parts)
         self._pending_layer_parts = set()
@@ -3371,9 +3375,10 @@ class PlanModel(QObject):
                 ground_units=self.ground_units,
                 ground_classes=self.ground_classes,
                 bas_rows=self.bas_rows, bas_columns=bas_columns)
-            map_layers.ensure_plan_layers(
-                QgsProject.instance(), self.store.gpkg_path, self.plan,
-                parts=parts, bas_fields=bas_model.layer_fields(bas_columns))
+            if ensure:
+                map_layers.ensure_plan_layers(
+                    QgsProject.instance(), self.store.gpkg_path, self.plan,
+                    parts=parts, bas_fields=bas_model.layer_fields(bas_columns))
         except Exception as exc:
             self.storeError.emit(f"Plan layers could not be refreshed: {exc}")
 

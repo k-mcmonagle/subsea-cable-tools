@@ -640,7 +640,7 @@ def test_follows_project() -> List[bool]:
         store_b.close()
         dialog._dirty = False
         span_store.set_project_gpkg_path(gpkg_b)
-        project.cleared.emit()
+        project.aboutToBeCleared.emit()
         project.readProject.emit(QDomDocument())
         ok = _wait(lambda: dialog._scenario_id == b_id, 5.0)
         out.append(_report("another project opened: its scenario file and last scenario load",
@@ -650,7 +650,7 @@ def test_follows_project() -> List[bool]:
 
         dialog.setup.value.setValue(7.0)
         span_store.set_project_gpkg_path(gpkg_a)
-        project.cleared.emit()
+        project.aboutToBeCleared.emit()
         project.addMapLayer(QgsRasterLayer(near_path, "loaded with the project"))   # layer events in between
         added.append(project.mapLayersByName("loaded with the project")[0].id())
         project.readProject.emit(QDomDocument())

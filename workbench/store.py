@@ -34,7 +34,7 @@ import re
 import shutil
 import sqlite3
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from qgis.core import (
     QgsCoordinateTransformContext,
@@ -112,6 +112,10 @@ class WorkbenchStore:
         # Tables whose live columns already cover the current schema.
         self._columns_synced: set = set()
         self._registry_ready = False
+        # Called with this store after every committed write transaction
+        # (None: nothing). The Workbench dock uses it to record the registry
+        # in the QGIS project on the first real write, never on a read.
+        self.after_commit: Optional[Callable[["WorkbenchStore"], None]] = None
 
     def clear_cache(self) -> None:
         """Forget registry reads, e.g. after an external Processing run."""
@@ -250,6 +254,26 @@ class WorkbenchStore:
         finally:
             self._tx_conn = None
             conn.close()
+        self._notify_commit()
+
+    def _notify_commit(self) -> None:
+        hook = self.after_commit
+        if hook is None:
+            return
+        try:
+            hook(self)
+        except Exception:
+            log_exception("Workbench: after-commit hook failed")
+
+    @contextmanager
+    def quiet_commits(self):
+        """Run housekeeping writes (migrations, id back-fills) without
+        calling :attr:`after_commit`: they are not the user's work."""
+        hook, self.after_commit = self.after_commit, None
+        try:
+            yield self
+        finally:
+            self.after_commit = hook
 
     def _write_failed(self, exc: BaseException) -> WorkbenchStoreError:
         log_exception(f"Workbench: registry write to {self.gpkg_path} failed and was rolled back")

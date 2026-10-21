@@ -15,7 +15,7 @@ clipboard — paste straight into Catenary Calculator V2.
 from __future__ import annotations
 
 import os
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from qgis.PyQt.QtCore import Qt, QSettings, pyqtSignal
 from qgis.PyQt.QtGui import QColor
@@ -84,6 +84,9 @@ class AssemblyManagerPanel(QWidget):
         self.embedded = embedded
         self.settings = QSettings()
         self.store: Optional[WorkbenchStore] = None
+        # Embedded in the Workbench dock: the dock resolves the registry so
+        # every panel works on the same one (see _open_store).
+        self.store_provider: Optional[Callable[[], Optional[WorkbenchStore]]] = None
         self.assembly: Optional[Assembly] = None
         self._current_header: Optional[Dict] = None
         self._loading = False
@@ -211,6 +214,9 @@ class AssemblyManagerPanel(QWidget):
 
     # --------------------------------------------------------------- store --
     def _open_store(self):
+        if self.store_provider is not None:
+            self.store = self.store_provider()
+            return
         path = project_gpkg_path() or default_project_gpkg_path()
         if (self.store is None
                 or os.path.normcase(os.path.abspath(self.store.gpkg_path))
@@ -302,6 +308,17 @@ class AssemblyManagerPanel(QWidget):
     def invalidate_rpl_cache(self):
         self._fit_model_key = None
         self._fit_model = None
+
+    def release_project(self):
+        """Forget the project being closed: its registry and the assembly on
+        show (opens and writes nothing)."""
+        self.store = None
+        self._fit_row = None
+        self.invalidate_rpl_cache()
+        self.assembly_list.blockSignals(True)
+        self.assembly_list.clear()
+        self.assembly_list.blockSignals(False)
+        self._on_assembly_selected(None)
 
     def _events_for_fit(self, fit_row: Dict, model=None) -> List[Dict]:
         """Map labelled RPL positions into the assembly's cable domain."""

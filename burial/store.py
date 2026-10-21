@@ -54,6 +54,9 @@ def default_project_gpkg_path(project: Optional[QgsProject] = None) -> str:
 class BurialStore:
     """CRUD access to one Burial Planner GeoPackage."""
 
+    # True only for the ``DetachedStore`` stand-in (no plan file open).
+    detached = False
+
     def __init__(self, gpkg_path: str,
                  transform_context: Optional[QgsCoordinateTransformContext] = None):
         self.gpkg_path = gpkg_path
@@ -958,6 +961,66 @@ class BurialStore:
 
     def open_layer(self, layer_name: str) -> Optional[QgsVectorLayer]:
         return open_gpkg_layer(self.gpkg_path, layer_name)
+
+
+class StoreUnavailableError(RuntimeError):
+    """A write reached the stand-in used while no plan file is open."""
+
+
+class DetachedStore(BurialStore):
+    """Stand-in while no plan file is open: the project was closed or is
+    being switched, or the saved plan file could not be opened.
+
+    Every read is empty and every write raises, and nothing ever touches the
+    disk — so a late refresh or a stray edit can neither reopen (and lock)
+    the previous project's file nor write into it. ``gpkg_path`` is only
+    shown to the user (the file that failed to open, or empty).
+    """
+
+    detached = True
+
+    def _sql(self):
+        return None
+
+    def close(self) -> None:
+        pass
+
+    def exists(self) -> bool:
+        return False
+
+    def ensure_created(self) -> None:
+        self._refuse()
+
+    def migrate(self) -> None:
+        self._refuse()
+
+    def backup_before(self, label: str) -> Optional[str]:
+        return None
+
+    def _table_exists(self, table: str) -> bool:
+        return False
+
+    def read_table(self, table: str) -> List[Dict]:
+        return []
+
+    def _write_table_rows(self, table: str, specs, rows: List[Dict]) -> None:
+        self._refuse()
+
+    def append_rows(self, table: str, rows: Sequence[Dict]) -> None:
+        self._refuse()
+
+    def write_spatial_layer(self, layer_name: str, field_specs, wkb_type,
+                            rows: List[Dict]) -> int:
+        self._refuse()
+
+    def open_layer(self, layer_name: str) -> Optional[QgsVectorLayer]:
+        return None
+
+    @staticmethod
+    def _refuse() -> None:
+        raise StoreUnavailableError(
+            "No Burial Planner plan file is open for this project. Use "
+            "Plan file → Open existing plans, or create a plan.")
 
 
 def _migrate_v1_to_v2(store: BurialStore) -> None:

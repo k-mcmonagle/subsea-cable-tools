@@ -180,13 +180,18 @@ class FeaturePickSession:
         self.canvas = canvas
         self.tool = None
         self.previous_tool = None
+        self._cancelled = None
 
-    def start(self, layer, callback):
+    def start(self, layer, callback, cancelled=None):
+        """Pick a feature of ``layer``; ``cancelled`` runs if the pick is
+        cancelled instead (e.g. the project is closing)."""
         self.cancel()
         self.previous_tool = self.canvas.mapTool()
         self.tool = QgsMapToolIdentifyFeature(self.canvas, layer)
+        self._cancelled = cancelled
 
         def identified(feature):
+            self._cancelled = None
             callback(layer, feature)
             self.cancel()
 
@@ -194,6 +199,7 @@ class FeaturePickSession:
         self.canvas.setMapTool(self.tool)
 
     def cancel(self):
+        cancelled, self._cancelled = self._cancelled, None
         if self.tool is not None and self.canvas.mapTool() is self.tool:
             if self.previous_tool is not None:
                 self.canvas.setMapTool(self.previous_tool)
@@ -201,3 +207,5 @@ class FeaturePickSession:
                 self.canvas.unsetMapTool(self.tool)
         self.tool = None
         self.previous_tool = None
+        if cancelled is not None:
+            cancelled()

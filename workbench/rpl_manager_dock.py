@@ -111,6 +111,20 @@ def _attribute_columns(keys, default_visible=None):
             for key in keys]
 
 
+def _same_path(a: Optional[str], b: Optional[str]) -> bool:
+    return bool(a) and bool(b) and (os.path.normcase(os.path.abspath(a))
+                                     == os.path.normcase(os.path.abspath(b)))
+
+
+def _remove_canvas_item(item) -> None:
+    try:
+        scene = item.scene()
+        if scene is not None:
+            scene.removeItem(item)
+    except RuntimeError:  # the canvas has gone
+        pass
+
+
 def _text(value) -> str:
     return "" if value is None else str(value)
 
@@ -164,6 +178,7 @@ class RplManagerPanel(QWidget):
         self._loading_tables = False
         self._table_dirty = {0, 1, 2}
         self._read_only = False
+        self._flash_markers = []  # position flashes still on the canvas
 
         self.da = make_distance_area(WGS84, QgsProject.instance().transformContext())
 
@@ -383,20 +398,68 @@ class RplManagerPanel(QWidget):
         # new default registry.
         expected = project_gpkg_path() or default_project_gpkg_path()
         if (self.store is not None
-                and os.path.normcase(os.path.abspath(self.store.gpkg_path))
-                == os.path.normcase(os.path.abspath(expected))
+                and _same_path(self.store.gpkg_path, expected)
                 and self.store.exists()):
             return
 
         from .project_layers import discover_gpkg_path
 
         path = discover_gpkg_path() or default_project_gpkg_path()
-        if (self.store is None
-                or os.path.normcase(os.path.abspath(self.store.gpkg_path))
-                != os.path.normcase(os.path.abspath(path))):
-            self.store = WorkbenchStore(path)
-        if self.store.exists():
+        if self.store is None or not _same_path(self.store.gpkg_path, path):
+            self.set_store(WorkbenchStore(path))
+        # A stale entry is corrected straight away: the project already uses
+        # the Workbench. A project without one (every new project, which
+        # shares the unsaved-project registry) only lists the registry until
+        # the user works in it - see _remember_store - so opening or starting
+        # a project never dirties it.
+        saved = project_gpkg_path()
+        if saved and self.store.exists() and not _same_path(saved, path):
             set_project_gpkg_path(path)
+
+    def set_store(self, store: Optional[WorkbenchStore]) -> None:
+        self.store = store
+        if store is not None:
+            store.after_commit = self._remember_store
+
+    def _remember_store(self, store: WorkbenchStore) -> None:
+        """The user wrote to the registry or loaded its layers: record it in
+        the project (a no-op once recorded)."""
+        if store is None or store is not self.store or not store.exists():
+            return
+        if not _same_path(project_gpkg_path(), store.gpkg_path):
+            set_project_gpkg_path(store.gpkg_path)
+
+    def release_canvas(self) -> None:
+        """Hand the map back: leave edit mode and remove position flashes."""
+        self._table_timer.stop()
+        self._pending_preview = None
+        self._preview_model = None
+        if self.edit_btn.isChecked():
+            self.edit_btn.setChecked(False)
+        markers, self._flash_markers = self._flash_markers, []
+        for marker in markers:
+            _remove_canvas_item(marker)
+
+    def release_project(self) -> None:
+        """Forget the project being closed (``aboutToBeCleared``).
+
+        Runs while its layers still exist; opens and writes nothing. The next
+        project's registry is resolved when the dock next asks for it.
+        """
+        self.release_canvas()
+        self.current_rpl = None
+        self.model = None
+        self.sync = None
+        self.set_store(None)
+        self.rpl_list.blockSignals(True)
+        self.rpl_list.clear()
+        self.rpl_list.blockSignals(False)
+        self.systems_tree.clear()
+        self.systems_status.setText("")
+        self.revision_edit.clear()
+        self._set_status("")
+        self.set_read_only(False)
+        self._refresh_tables()
 
     def refresh_rpl_list(self, rows=None):
         if rows is None:
@@ -416,7 +479,9 @@ class RplManagerPanel(QWidget):
             # restore without reloading (would discard the edit session)
             self.rpl_list.setCurrentRow(restore_row)
         self.rpl_list.blockSignals(False)
-        if restore_row < 0 and self.rpl_list.count():
+        if restore_row < 0 and self.rpl_list.count() and project_gpkg_path():
+            # Loading an RPL adds its layers to the project, so only a project
+            # that already uses the Workbench opens one unasked.
             self.rpl_list.setCurrentRow(0)
 
     # ------------------------------------------------------ RPL selection --
@@ -426,6 +491,10 @@ class RplManagerPanel(QWidget):
             if self.rpl_list.item(i).data(Qt.ItemDataRole.UserRole) == rpl_id:
                 if self.rpl_list.currentRow() != i:
                     self.rpl_list.setCurrentRow(i)
+                elif self.sync is None or (self.current_rpl or {}).get("rpl_id") != rpl_id:
+                    # Already the list's row but not loaded (its layers went
+                    # away, or the row was restored without loading).
+                    self._on_rpl_selected(self.rpl_list.item(i))
                 return
 
     def drop_dead_sync(self) -> None:
@@ -512,8 +581,13 @@ class RplManagerPanel(QWidget):
             return None
         from .project_layers import ensure_layer
 
-        return ensure_layer(QgsProject.instance(), self.store.gpkg_path, layer_name,
-                            store=self.store)
+        layer = ensure_layer(QgsProject.instance(), self.store.gpkg_path, layer_name,
+                             store=self.store)
+        if layer is not None:
+            # Its layers are in the project now, so the registry is this
+            # project's (restored with it when it is next opened).
+            self._remember_store(self.store)
+        return layer
 
     # ------------------------------------------------------------- tables --
     def _refresh_tables(self, model: Optional[RplModel] = None, mark_dirty: bool = True):
@@ -830,11 +904,16 @@ class RplManagerPanel(QWidget):
             self.sync.begin_session()
             self.iface.mapCanvas().setMapTool(self.edit_tool)
         else:
-            if self.edit_tool is not None and self.iface.mapCanvas().mapTool() is self.edit_tool:
-                if self._previous_map_tool is not None:
-                    self.iface.mapCanvas().setMapTool(self._previous_map_tool)
-                else:
-                    self.iface.mapCanvas().unsetMapTool(self.edit_tool)
+            canvas = self.iface.mapCanvas() if self.iface is not None else None
+            if self.edit_tool is not None and canvas is not None \
+                    and canvas.mapTool() is self.edit_tool:
+                try:
+                    if self._previous_map_tool is not None:
+                        canvas.setMapTool(self._previous_map_tool)
+                    else:
+                        canvas.unsetMapTool(self.edit_tool)
+                except RuntimeError:  # the previous tool has been deleted since
+                    canvas.unsetMapTool(self.edit_tool)
         self._update_edit_buttons()
 
     def _undo(self):
@@ -1670,7 +1749,13 @@ class RplManagerPanel(QWidget):
         if not canvas.extent().contains(pt):
             canvas.setCenter(pt)
             canvas.refresh()
-        QTimer.singleShot(1500, lambda: canvas.scene().removeItem(marker))
+        self._flash_markers.append(marker)
+        QTimer.singleShot(1500, lambda: self._end_flash(marker))
+
+    def _end_flash(self, marker) -> None:
+        if marker in self._flash_markers:
+            self._flash_markers.remove(marker)
+            _remove_canvas_item(marker)
 
     def _announce_point_selection(self):
         """Selected RPL position -> cable distance marker in the SLD."""

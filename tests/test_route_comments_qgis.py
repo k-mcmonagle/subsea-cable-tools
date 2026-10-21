@@ -766,6 +766,77 @@ def test_dock(folder):
                    not failed, ", ".join(failed))
 
 
+def test_new_register_in_a_new_project(folder):
+    """Every unsaved project suggests the same register name: New register…
+    in a new project starts an empty register instead of reopening the last
+    one (whose comments came back on the map); an existing register chosen
+    by name is never overwritten and only opened when asked."""
+    from qgis.PyQt.QtWidgets import QFileDialog
+    iface = _Iface()
+    project = QgsProject.instance()
+    default = os.path.join(folder, "unnamed_comments.gpkg")
+    calls, answers = [], {"paths": [], "choice": ""}
+
+    class _SaveDialog:
+        Option = QFileDialog.Option
+
+        @staticmethod
+        def getSaveFileName(_parent, _title, path, *_args, **kwargs):
+            calls.append((path, kwargs.get("options")))
+            return (answers["paths"].pop(0) if answers["paths"] else path), ""
+
+    patches = [(dock_module, "default_register_path", lambda *_a: default),
+               (dock_module, "QFileDialog", _SaveDialog),
+               (dock_module.RouteCommentsDock, "_ask_existing_register", lambda _self, _path: answers["choice"])]
+    saved = [(obj, name, getattr(obj, name)) for obj, name, _v in patches]
+    for obj, name, value in patches:
+        setattr(obj, name, value)
+    map_layers.set_project_register("", "")
+    canvas_items = len(iface.canvas.scene().items())
+    dock = dock_module.RouteCommentsDock(iface)
+    checks = {}
+    try:
+        checks["first register at the default"] = dock.new_register() and dock.store.path == default and \
+            calls[-1][1] == QFileDialog.Option.DontConfirmOverwrite
+        dock.store.add_comment(dock.set_row["set_id"], {"text": "old", "ref_kind": model.REF_LOCATION,
+                                                        "wkt": "POINT(3 55)"})
+        dock.reload()
+        dock._select_ids(dock.visible_ids())
+        checks["old comment on the map, highlighted"] = _n(dock.layers.find("points")) == 1 and \
+            len(iface.canvas.scene().items()) > canvas_items
+
+        project.clear()   # File > New
+        checks["new project: no register, layers or highlight"] = dock.store is None and \
+            not dock.layers.layers() and len(iface.canvas.scene().items()) == canvas_items and \
+            project.layerTreeRoot().findGroup(map_layers.GROUP_NAME) is None
+        fresh = os.path.join(folder, "unnamed_comments_2.gpkg")
+        checks["new register: a free name, empty"] = dock.new_register() and calls[-1][0] == fresh and \
+            dock.store.path == fresh and dock.comments == [] and _n(dock.layers.find("points")) == 0
+
+        project.clear()
+        answers.update(paths=[default], choice="")
+        checks["existing register picked, cancelled"] = not dock.new_register() and dock.store is None
+        answers.update(paths=[default, ""], choice="rename")
+        checks["choose another name: a free one offered"] = not dock.new_register() and \
+            calls[-1][0] == os.path.join(folder, "unnamed_comments_3.gpkg") and dock.store is None
+        answers.update(paths=[default], choice="open")
+        checks["open it: the old comments"] = dock.new_register() and dock.store.path == default and \
+            [c["text"] for c in dock.comments] == ["old"]
+    finally:
+        dock.shutdown()
+        dock.layers.remove()
+        dock.deleteLater()
+        for obj, name, value in saved:
+            setattr(obj, name, value)
+        project.clear()
+        map_layers.set_project_register("", "")
+        iface.close()
+        QCoreApplication.processEvents()
+    failed = [k for k, v in checks.items() if not v]
+    return _result("new register in a new project: never the last project's comments", not failed,
+                   ", ".join(failed))
+
+
 def test_convention_token_unmeasured_utm():
     """An automatic UTM grid is named once measured (as the KP Mouse Tool's is)."""
     layer = _route_layer()
@@ -814,6 +885,7 @@ def run_all():
                          lambda: test_reference_conditions(tempfile.mkdtemp(dir=temp)),
                          lambda: test_dense_map_layers(tempfile.mkdtemp(dir=temp)),
                          lambda: test_dock(tempfile.mkdtemp(dir=temp)),
+                         lambda: test_new_register_in_a_new_project(tempfile.mkdtemp(dir=temp)),
                          lambda: test_register_opens_as_gpkg_layer(tempfile.mkdtemp(dir=temp)),
                          test_convention_token_unmeasured_utm,
                          lambda: test_layers_saved_with_project(tempfile.mkdtemp(dir=temp))):

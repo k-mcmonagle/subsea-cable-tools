@@ -76,6 +76,17 @@ LABEL_OPTIONS = (
     ("speed_distance", "Speed and distance", False),
     ("fuel_rob", "Fuel ROB", False),
 )
+# Signals of the planner task layers the dock follows, and their handlers.
+_GEOMETRY_LAYER_SIGNALS = (
+    ("geometryChanged", "_planner_geometry_changed"),
+    ("editingStopped", "_planner_geometry_changed"),
+    ("featuresDeleted", "_planner_geometry_removed"),
+)
+
+
+def _refuse_closed_project_write():
+    """``before_write`` of a store whose project has closed."""
+    raise RuntimeError("The QGIS project changed: reopen the Planner to plan in it.")
 
 
 class _ElidedLabel(QLabel):
@@ -113,20 +124,18 @@ class PlannerDock(QDockWidget):
         self._save_error = False
         self._reports_window = None
         self.current_scenario_id = ""
-        path = project_gpkg_path() or default_project_gpkg_path()
-        self.store, path, error = self._open_store_with_recovery(path)
-        self.store_ready = not error
-        if not self.store_ready:
-            QMessageBox.warning(
-                None, "Planner",
-                "Could not open or migrate the planner GeoPackage:\n%s\n\n%s\n\n"
-                "Check the file is writable (not locked by another program or "
-                "cloud sync) and reopen the Planner." % (path, error))
-        if self.store_ready and not project_gpkg_path():
-            # Only remember a location we know we can write to.
-            set_project_gpkg_path(path)
-        self.geometry_layers = self.store.load_geometry_layers()
-        self.resolver = FeatureReferenceResolver(QgsProject.instance(), self.canvas, self.store)
+        # The dock follows the QGIS project: _attach_project binds it to the
+        # project's planner GeoPackage and _leave_project lets go of it. A
+        # project that has not used the Planner gets no file, layers or project
+        # entry until the user first saves something (_adopt_store).
+        self.store = None
+        self.store_ready = True
+        self._adopted = False
+        self._adopting = False
+        self._project_stale = False
+        self._project_hooks = []
+        self.geometry_layers = []
+        self.resolver = FeatureReferenceResolver(QgsProject.instance(), self.canvas, None)
         self.overlay = PlannerMapOverlay(self.canvas)
         self.pick_session = FeaturePickSession(self.canvas)
         self.sketch_session = SketchSession(
@@ -161,26 +170,166 @@ class PlannerDock(QDockWidget):
         self.task_table.advancedRequested.connect(self._edit_advanced_task)
         self.task_table.progressRequested.connect(self._update_progress)
         self.task_table.historyStateChanged.connect(self._history_state_changed)
+        self.sim.timeChanged.connect(self._simulation_time_changed)
+        self.sim.playingChanged.connect(self.play_btn.setChecked)
+        self.topLevelChanged.connect(self._top_level_changed)
+        self._attach_project()
+        self._install_project_hooks()
+
+    # -- following the QGIS project -------------------------------------------
+    def _install_project_hooks(self):
+        project = QgsProject.instance()
+        hooks = [(project.aboutToBeCleared, self._leave_project),
+                 (project.readProject, self._project_ready)]
+        new_project = getattr(self.iface, "newProjectCreated", None)  # stub ifaces lack it
+        if new_project is not None:
+            hooks.append((new_project, self._project_ready))
+        for signal, slot in hooks:
+            try:
+                signal.connect(slot)
+                self._project_hooks.append((signal, slot))
+            except (AttributeError, TypeError, RuntimeError):
+                log_exception("Planner: cannot follow project changes")
+
+    def _remove_project_hooks(self):
+        hooks, self._project_hooks = self._project_hooks, []
+        for signal, slot in hooks:
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass  # already disconnected, or QGIS is shutting down
+
+    def _attach_project(self):
+        """Bind the dock to the current project's planner GeoPackage.
+
+        A project with a planner entry opens (and migrates) its file. Any other
+        project only lists what is at the default location: nothing is
+        created, added or recorded until the user saves something.
+        """
+        self._project_stale = False
+        self._unfollow_geometry_layers()
+        path = project_gpkg_path()
+        if path:
+            store, path, error = self._open_store_with_recovery(path)
+            self.store_ready = not error
+            if error:
+                QMessageBox.warning(
+                    None, "Planner",
+                    "Could not open or migrate the planner GeoPackage:\n%s\n\n%s\n\n"
+                    "Check the file is writable (not locked by another program or "
+                    "cloud sync) and reopen the Planner." % (path, error))
+        else:
+            store = PlannerStore(default_project_gpkg_path())
+            self.store_ready = True
+        self._adopted = bool(path)
+        store.before_write = self._before_store_write
+        self.store = store
+        self.resolver.store = store
+        self.resolver.clear_cache()
+        if self._adopted:
+            self._follow_geometry_layers()
+        self.refresh_scenarios()
+
+    def _before_store_write(self):
+        """Runs before the store writes anything (see PlannerStore.before_write)."""
+        if not self._adopted and not self._adopting:
+            self._adopt_store()
+
+    def _adopt_store(self):
+        """First save in a project that has not used the Planner: create (or
+        migrate) the file, record it in the project and add the task layers."""
+        self._adopting = True
+        try:
+            _store, path, error = self._open_store_with_recovery(self.store.gpkg_path)
+            if error:
+                self.store_ready = False
+                raise RuntimeError(error)
+            # The same store object: a write may be under way on it.
+            self.store.gpkg_path = path
+            if project_gpkg_path() != path:
+                set_project_gpkg_path(path)
+            self._adopted = True
+            self.store_ready = True
+            self._follow_geometry_layers()
+        finally:
+            self._adopting = False
+
+    def _store_listable(self):
+        """Whether the store's content may be shown.
+
+        A file the project has not adopted is listed only when it already has
+        the current schema (an older one is migrated by the first save).
+        """
+        if self._project_stale or self.store is None:
+            return False
+        if self._adopted:
+            return True
+        try:
+            version = self.store.read_meta().get("schema_version")
+        except Exception:
+            return False
+        return str(version or "") == str(schema.SCHEMA_VERSION)
+
+    def _follow_geometry_layers(self):
+        """Add the task layers to the project and follow direct edits of them."""
+        self._unfollow_geometry_layers()
+        self.geometry_layers = self.store.load_geometry_layers()
         for layer in self.geometry_layers:
             # Editing the planner point/line layers directly (move a vertex,
             # commit, delete) must refresh the schedule and link indicators.
-            for signal_name, handler in (
-                    ("geometryChanged", self._planner_geometry_changed),
-                    ("editingStopped", self._planner_geometry_changed),
-                    ("featuresDeleted", self._planner_geometry_removed)):
+            for signal_name, handler_name in _GEOMETRY_LAYER_SIGNALS:
                 signal = getattr(layer, signal_name, None)
                 if signal is not None:
                     try:
-                        signal.connect(handler)
+                        signal.connect(getattr(self, handler_name))
                     except (TypeError, RuntimeError):
                         # Without it, direct edits of this layer would not
                         # refresh the schedule: say so instead of hiding it.
                         log_exception(f"Planner: cannot follow {signal_name} "
                                       f"of layer '{layer.name()}'")
-        self.sim.timeChanged.connect(self._simulation_time_changed)
-        self.sim.playingChanged.connect(self.play_btn.setChecked)
-        self.topLevelChanged.connect(self._top_level_changed)
-        self.refresh_scenarios()
+
+    def _unfollow_geometry_layers(self):
+        layers, self.geometry_layers = self.geometry_layers, []
+        for layer in layers:
+            for signal_name, handler_name in _GEOMETRY_LAYER_SIGNALS:
+                try:
+                    getattr(layer, signal_name).disconnect(getattr(self, handler_name))
+                except (AttributeError, TypeError, RuntimeError):
+                    pass  # layer already deleted, or the signal was never connected
+
+    def _leave_project(self):
+        """The project is closing (its layers still exist): drop all of its state."""
+        self._stop_activity()
+        self._project_stale = True
+        if self.store is not None:
+            # Until the dock follows the next project, nothing may write the
+            # closing project's file.
+            self.store.before_write = _refuse_closed_project_write
+        self._unfollow_geometry_layers()
+        self.resolver.clear_cache()
+        if self._reports_window is not None:
+            self._reports_window.hide()
+        self.current_scenario_id = ""
+        self._loading = True
+        try:
+            self.scenario_combo.clear()
+            self.task_table.set_plan(
+                [], [], datetime.now().replace(second=0, microsecond=0), "forward")
+        finally:
+            self._loading = False
+        self.totals_label.setText("")
+        self.status_label.setText("The project was closed")
+
+    def _project_ready(self, *_args):
+        """A project was opened or a new one started: follow it if shown
+        (a closed dock follows on its next show)."""
+        if self._project_stale and self.isVisible():
+            self._attach_project()
+
+    def _ensure_attached(self):
+        """A user action in a dock left behind by a closed project."""
+        if self._project_stale:
+            self._attach_project()
 
     def _open_store_with_recovery(self, path):
         """Open/migrate the planner GeoPackage, recovering from bad locations.
@@ -432,7 +581,7 @@ class PlannerDock(QDockWidget):
         return layout
 
     def refresh_scenarios(self, select_id=None):
-        scenarios = self.store.list_scenarios()
+        scenarios = self.store.list_scenarios() if self._store_listable() else []
         selected = select_id or self.current_scenario_id
         self._loading = True
         try:
@@ -502,6 +651,7 @@ class PlannerDock(QDockWidget):
         return True, result
 
     def _new_scenario(self):
+        self._ensure_attached()
         name, ok = QInputDialog.getText(self, "New planning scenario", "Name:")
         if not ok or not name.strip():
             return
@@ -839,6 +989,13 @@ class PlannerDock(QDockWidget):
         return rows
 
     def _edit_resources(self):
+        self._ensure_attached()
+        if not self._store_listable() and os.path.exists(self.store.gpkg_path):
+            # An older planner file this project has not used yet: adopt (and
+            # migrate) it first, so its resources are edited, not replaced.
+            if not self._store_write("open the planner file", self._adopt_store)[0]:
+                return
+            self.refresh_scenarios(self.current_scenario_id)
         dialog = ResourceDialog(self.store.list_resources(), self)
         if qt_exec(dialog) != DIALOG_ACCEPTED:
             return
@@ -1493,7 +1650,8 @@ class PlannerDock(QDockWidget):
         self.totals_label.setText("   |   ".join(parts))
 
     def _sync_spatial_attributes(self, result):
-        if not self.current_scenario_id:
+        # Not in a project that has not adopted the file: only a save does that.
+        if not self.current_scenario_id or not self._adopted or self._project_stale:
             return
         scheduled = {task.task_id: task for task in result.tasks}
         rows = []
@@ -1711,16 +1869,35 @@ class PlannerDock(QDockWidget):
             super().contextMenuEvent(event)
 
     def refresh(self):
-        self.refresh_scenarios(self.current_scenario_id)
+        if self._project_stale:
+            self._attach_project()
+        else:
+            self.refresh_scenarios(self.current_scenario_id)
 
-    def shutdown(self):
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Closed while another project was opened: follow it now. Only for a
+        # show the user caused; a spontaneous one (the main window restored)
+        # may arrive while a project is still being read.
+        if self._project_stale and not event.spontaneous():
+            self._attach_project()
+
+    def _stop_activity(self):
+        """Stop playback, end map picks and sketches, remove the map overlay."""
         self.sim.shutdown()
         self.pick_session.cancel()
         self.sketch_session.cancel(False)
         self.overlay.clear()
 
+    def shutdown(self):
+        """Plugin unload: stop everything and stop following the project."""
+        self._stop_activity()
+        self._remove_project_hooks()
+        self._unfollow_geometry_layers()
+
     def closeEvent(self, event):
-        self.shutdown()
+        # Closing only hides the dock: it keeps following the project.
+        self._stop_activity()
         super().closeEvent(event)
 
 
@@ -2809,7 +2986,8 @@ class FeatureLinkDialog(QDialog):
             self.reference = feature_reference(picked_layer, feature, label)
             self.accept()
 
-        self.pick_session.start(layer, picked)
+        # A pick cancelled from outside (the project closing) ends the hidden dialog.
+        self.pick_session.start(layer, picked, self.reject)
 
     def reject(self):
         self.pick_session.cancel()

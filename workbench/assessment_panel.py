@@ -433,6 +433,25 @@ class AssessmentPanel(QWidget):
             self.abandon_run()
         self.store = store
 
+    def release_project(self):
+        """Forget the project being closed: a run in flight is abandoned (its
+        result would land in the next project) and nothing stays on show."""
+        self.abandon_run()
+        self.store = None
+        self.assessment = None
+        self.rpl_id = None
+        self.rule_set = None
+        self.rules = []
+        self.result = None
+        self.sampler = None
+        self.name_label.setText("—")
+        self.status_label.setText("")
+        self.rpl_status_label.setVisible(False)
+        self._refresh_status_chip()
+        self._rebuild_rule_table()
+        self._refresh_overview()
+        self._refresh_results()
+
     def new_assessment(self, store, rpl_id: str):
         self.abandon_run()
         self.store = store

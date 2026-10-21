@@ -45,6 +45,14 @@ class PlannerStore:
                  transform_context: Optional[QgsCoordinateTransformContext] = None):
         self.gpkg_path = gpkg_path
         self.transform_context = transform_context or QgsProject.instance().transformContext()
+        # Optional callable run before anything is written. The Planner dock
+        # uses it to adopt the file into the project on the first save, and to
+        # refuse writes once the project has changed.
+        self.before_write = None
+
+    def _will_write(self) -> None:
+        if self.before_write is not None:
+            self.before_write()
 
     def exists(self) -> bool:
         return os.path.exists(self.gpkg_path) and self._table_exists(schema.TABLE_META)
@@ -102,12 +110,14 @@ class PlannerStore:
         self._write_table_rows(table, schema.REGISTRY_TABLES[table], list(rows))
 
     def _write_table_rows(self, table, specs, rows) -> None:
+        self._will_write()
         write_layer_to_gpkg(
             self.gpkg_path, table, fields_from_specs(specs), WKB_NO_GEOMETRY,
             rows, self.transform_context,
         )
 
     def upsert_rows(self, table: str, rows: Sequence[Dict]) -> None:
+        self._will_write()  # first: the rows merged below are read after any adoption
         key = schema.TABLE_KEYS[table]
         incoming = {str(row[key]): dict(row) for row in rows}
         merged = [row for row in self.read_table(table)
@@ -116,6 +126,7 @@ class PlannerStore:
         self.write_table(table, merged)
 
     def delete_rows(self, table: str, keys: Sequence[str]) -> None:
+        self._will_write()
         key = schema.TABLE_KEYS[table]
         dropped = {str(value) for value in keys}
         self.write_table(table, [row for row in self.read_table(table)
@@ -126,6 +137,7 @@ class PlannerStore:
                 if row.get("key")}
 
     def write_meta(self, key: str, value: str) -> None:
+        self._will_write()
         rows = [row for row in self.read_table(schema.TABLE_META) if row.get("key") != key]
         rows.append({"key": key, "value": value})
         self._write_table_rows(schema.TABLE_META, schema.META_FIELDS, rows)
@@ -170,6 +182,7 @@ class PlannerStore:
 
     def delete_scenario(self, scenario_id: str) -> None:
         """Delete a scenario and its tasks; project-level resources survive."""
+        self._will_write()
         task_ids = [row["task_id"] for row in self.list_tasks(scenario_id)]
         if task_ids:
             self.delete_task_geometries(task_ids)
@@ -181,6 +194,7 @@ class PlannerStore:
         return sorted(rows, key=lambda row: (int(row.get("seq") or 0), row.get("name") or ""))
 
     def save_resources(self, rows: Sequence[Dict]) -> None:
+        self._will_write()
         old_ids = [row["resource_id"] for row in self.list_resources()]
         if old_ids:
             self.delete_rows(schema.TABLE_RESOURCE, old_ids)
@@ -196,6 +210,7 @@ class PlannerStore:
 
     def remap_task_resources(self, valid_ids, default_id: str) -> bool:
         """Point tasks in every scenario at a surviving resource."""
+        self._will_write()
         valid = {str(value) for value in valid_ids}
         tasks = self.read_table(schema.TABLE_TASK)
         changed = False
@@ -222,6 +237,7 @@ class PlannerStore:
         sharer instead of being dropped). The caller should mirror those
         repairs into its in-memory rows.
         """
+        self._will_write()
         old_ids = [row["task_id"] for row in self.list_tasks(scenario_id)]
         retained = {str(row.get("task_id")) for row in rows if row.get("task_id")}
         removed = [task_id for task_id in old_ids if str(task_id) not in retained]
@@ -277,6 +293,7 @@ class PlannerStore:
         Returns the new owner's reference fields, or None when the old task
         has no stored geometry.
         """
+        self._will_write()
         found = self.get_task_geometry(str(old_task_id))
         if found is None:
             return None
@@ -313,6 +330,7 @@ class PlannerStore:
         }
 
     def duplicate_scenario(self, scenario_id: str, new_name: str) -> str:
+        self._will_write()
         original = self.get_scenario(scenario_id)
         if original is None:
             raise ValueError("Scenario not found.")
@@ -379,6 +397,7 @@ class PlannerStore:
 
     # -- planner-owned spatial task geometry -------------------------------
     def _create_spatial_table(self, table, specs, wkb_type) -> None:
+        self._will_write()
         crs = QgsProject.instance().crs()
         if crs is None or not crs.isValid():
             crs = QgsCoordinateReferenceSystem("EPSG:4326")
@@ -445,6 +464,7 @@ class PlannerStore:
         dropped = {str(task_id) for task_id in task_ids}
         if not dropped:
             return
+        self._will_write()
         for kind in ("point", "line"):
             layer = self.geometry_layer(kind)
             if layer is None:
@@ -468,6 +488,7 @@ class PlannerStore:
                           source_ref: Optional[Dict] = None) -> Dict:
         if kind not in ("point", "line"):
             raise ValueError("Planner geometry must be point or line.")
+        self._will_write()  # before the layer is added to the project below
         self.delete_task_geometries([task_id])
         layer = self.geometry_layer(kind, True)
         if layer is None:
@@ -511,6 +532,7 @@ class PlannerStore:
         }
 
     def sync_geometry_attributes(self, tasks: Sequence[Dict]) -> None:
+        self._will_write()
         by_id = {str(task.get("task_id")): task for task in tasks}
         now = schema.utc_now_iso()
         for kind in ("point", "line"):

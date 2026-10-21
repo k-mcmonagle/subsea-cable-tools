@@ -103,6 +103,12 @@ class CableLayExplorerWindow(QMainWindow):
         self._kp_field_cache: dict = {}
         self._plot_layout_mode = "Tabbed"
         self._lock_x = False
+        # Layers the Explorer had when the last project closed (ids, active):
+        # reloaded if that project is opened again, and kept as the saved
+        # session state while nothing is loaded.
+        self._released_layers: Tuple[List[str], Optional[str]] = ([], None)
+        self._restore_on_show = False
+        self._project_hooks: list = []
         self.settings = QSettings()
 
         self._build_toolbar()
@@ -139,6 +145,7 @@ class CableLayExplorerWindow(QMainWindow):
         self.populate_layers()
         self._restore_loaded_layers()
         self.project_panel.attach_project_signals()
+        self._connect_project_hooks()
 
     # -- project data file (Project tab / Manage > Import) ------------------
     def project_path(self) -> Optional[str]:
@@ -1152,10 +1159,13 @@ class CableLayExplorerWindow(QMainWindow):
         self.settings.setValue(f"{_SETTINGS_GROUP}/lock_x", self._lock_x)
         self.settings.setValue(f"{_SETTINGS_GROUP}/active_only", self._active_only)
         self.settings.setValue(f"{_SETTINGS_GROUP}/analysis_tab", self.analysis_tabs.currentIndex())
-        self.settings.setValue(
-            f"{_SETTINGS_GROUP}/loaded_layers", json.dumps(list(self._datasets.keys()))
-        )
-        self.settings.setValue(f"{_SETTINGS_GROUP}/active_layer", self._active_layer_id or "")
+        # QGIS clears the project before unloading plugins on exit: keep the
+        # layers it had so the next session can reload them.
+        loaded, active = list(self._datasets.keys()), self._active_layer_id
+        if not loaded:
+            loaded, active = self._released_layers
+        self.settings.setValue(f"{_SETTINGS_GROUP}/loaded_layers", json.dumps(list(loaded)))
+        self.settings.setValue(f"{_SETTINGS_GROUP}/active_layer", active or "")
 
     def _restore_loaded_layers(self) -> None:
         """Reload the layers that were loaded in a previous session, if present."""
@@ -1177,6 +1187,81 @@ class CableLayExplorerWindow(QMainWindow):
         self._pending_active = active if active in present else None
         self.set_loaded_layers(present)
 
+    # -- project changes ------------------------------------------------------
+    def _project_hook_slots(self) -> list:
+        pairs = [(QgsProject.instance(), "aboutToBeCleared", self._on_project_closing)]
+        for name in ("projectRead", "newProjectCreated"):
+            if hasattr(self.iface, name):
+                pairs.append((self.iface, name, self._on_project_ready))
+        return pairs
+
+    def _connect_project_hooks(self) -> None:
+        for obj, name, slot in self._project_hook_slots():
+            try:
+                getattr(obj, name).connect(slot)
+            except (AttributeError, TypeError, RuntimeError):
+                log_exception(f"Cable Lay Data Explorer: cannot follow the project's {name} signal")
+                continue
+            self._project_hooks.append((obj, name, slot))
+
+    def _disconnect_project_hooks(self) -> None:
+        hooks, self._project_hooks = self._project_hooks, []
+        for obj, name, slot in hooks:
+            try:
+                getattr(obj, name).disconnect(slot)
+            except (AttributeError, TypeError, RuntimeError):
+                pass  # the sender is already gone
+
+    def _on_project_closing(self) -> None:
+        """The project is being cleared (New, Close, or opening another) while
+        its layers still exist: drop every dataset, highlight and result that
+        came from it. Nothing is opened or written here; the next project's
+        data file is resolved once that project is ready."""
+        if self._datasets:
+            self._released_layers = (list(self._datasets.keys()), self._active_layer_id)
+        self._cancel_load()
+        # First, so no panel refresh below reads the old data file.
+        self.project_panel.release_project()
+        self.assessment_panel.release_project()
+        self.qc_panel.clear_findings()
+        self._clear_highlight()
+        self._connect_selection(None)
+        self._datasets.clear()
+        self._views.clear()
+        self._active_layer_id = None
+        self._pending_active = None
+        self._current_row = None
+        self._kp_field_cache = {}
+        self.populate_layers()
+        self._refresh_all()
+        self.statusBar().clearMessage()
+
+    def _on_project_ready(self, *_args) -> None:
+        """A project was opened or started: take its cable-type mapping and
+        data file, and reload the layers the Explorer had if this project has
+        them (reopened or reverted) - now if on screen, else on next show."""
+        self.assessment_panel.project_ready()
+        self.project_panel.project_ready()
+        self._restore_on_show = True
+        if self.isVisible():
+            self._restore_released_layers()
+
+    def _restore_released_layers(self) -> None:
+        self._restore_on_show = False
+        if self._datasets or self._load_task is not None:
+            return
+        layer_ids, active = self._released_layers
+        project = QgsProject.instance()
+        present = [i for i in layer_ids if project.mapLayer(i) is not None]
+        if present:
+            self._pending_active = active if active in present else None
+            self.set_loaded_layers(present)
+
+    def showEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        super().showEvent(event)
+        if self._restore_on_show:
+            self._restore_released_layers()
+
     def closeEvent(self, event) -> None:
         self._cancel_load()
         self.assessment_panel.shutdown()
@@ -1187,6 +1272,10 @@ class CableLayExplorerWindow(QMainWindow):
 
     def shutdown(self) -> None:
         """Full teardown for plugin unload: remove canvas graphics."""
+        try:
+            self._disconnect_project_hooks()
+        except Exception:
+            pass
         try:
             self._cancel_load()
         except Exception:

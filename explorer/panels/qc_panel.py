@@ -191,6 +191,13 @@ class QcPanel(QWidget):
                 params[name] = editor.text()
         return params
 
+    def clear_findings(self) -> None:
+        """Forget the findings (their records belong to a dataset now gone)."""
+        self._findings = []
+        self._populate_findings()
+        self.save_button.setEnabled(False)
+        self.status_label.setText("")
+
     # -- actions -----------------------------------------------------------
     def run_qc(self) -> None:
         if self._dataset is None:

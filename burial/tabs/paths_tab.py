@@ -1551,8 +1551,9 @@ class PathsTab(QWidget):
         finally:
             self._loading = False
 
-    def shutdown(self) -> None:
-        """Cancel and forget a running generation (dock close / unload).
+    def shutdown(self, reason: str = "when the window closed") -> None:
+        """Cancel and forget a running generation (dock close / unload /
+        project closed).
 
         The generation bump makes its late callback a no-op, so the UI is
         reset here — a reopened dock must not show a run in progress.
@@ -1569,8 +1570,8 @@ class PathsTab(QWidget):
         self.stop_button.setVisible(False)
         self.generate_button.setEnabled(True)
         self.status_label.setText(
-            "Path generation stopped when the window closed; the previous "
-            "result was retained.")
+            f"Path generation stopped {reason}; the previous result was "
+            "retained.")
 
     def is_running(self) -> bool:
         return self._task is not None

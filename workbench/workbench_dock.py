@@ -174,6 +174,7 @@ class WorkbenchDock(QDockWidget):
         # avoiding duplicate OGR reads, this means a save in one panel is
         # immediately visible when the entity tree refreshes.
         self.assembly_panel.store = self.rpl_panel.store
+        self.assembly_panel.store_provider = self._store
         self.assessment_panel.set_store(self.rpl_panel.store)
 
         splitter.addWidget(self.stack)
@@ -278,11 +279,16 @@ class WorkbenchDock(QDockWidget):
                 pass  # never connected, or the sender is already gone
 
     def _on_project_teardown_starts(self, *_args):
-        # The project is being cleared (close / open another project): every
-        # layer goes away, and that must NOT be treated as the user deleting
-        # workbench layers.
+        # The project is being cleared (New, Close, or opening another
+        # project): every layer goes away, and that must NOT be treated as the
+        # user deleting workbench layers.
         self._teardown_muted = True
         self._pending_removed_workbench_layers.clear()
+        # Its layers still exist: hand the map back and forget its registry
+        # now. Nothing is opened or written here; the next project's registry
+        # is resolved once that project is ready (projectRead /
+        # newProjectCreated). After Close the dock stays empty.
+        self._release_project()
 
     def _on_project_teardown_done(self, *_args):
         self._teardown_muted = False
@@ -290,10 +296,31 @@ class WorkbenchDock(QDockWidget):
 
     def _on_project_switched(self, *_args):
         # A different project is now active: drop any stale state and rebuild
-        # the tree from that project's workbench store.
+        # the tree from that project's workbench store. A project that has
+        # never used the Workbench only lists the registry found for it.
         self._teardown_muted = False
         self._pending_removed_workbench_layers.clear()
+        self._release_project()  # in case aboutToBeCleared was not seen
         self.refresh_tree()
+
+    def _release_project(self) -> None:
+        """Drop everything shown or held for the current project (idempotent):
+        runs, edit mode, the panels' registry and the open views."""
+        self.assessment_panel.release_project()
+        self.rpl_panel.release_project()
+        self.assembly_panel.release_project()
+        self.system_overview.load_system(None, "")
+        self.segment_overview.load_segment(None, "")
+        dialogs, self._compare_dialogs = list(self._compare_dialogs), set()
+        for dialog in dialogs:
+            dialog.close()
+            dialog.deleteLater()
+        self.tree.blockSignals(True)
+        self.tree.clear()
+        self.tree.blockSignals(False)
+        self.stack.setCurrentWidget(self.placeholder)
+        self._migrated_store_path = ""
+        self._update_store_label(None)
 
     @staticmethod
     def _is_project_teardown(args) -> bool:
@@ -478,11 +505,24 @@ class WorkbenchDock(QDockWidget):
         if store is not None and store.exists():
             path = os.path.normcase(os.path.abspath(store.gpkg_path))
             if path != self._migrated_store_path:
-                store.migrate()
                 from .system_topology import assign_system_ids
-                assign_system_ids(store)
+
+                # Housekeeping, not the user's work: it must not record the
+                # registry in a project that only lists it.
+                with store.quiet_commits():
+                    store.migrate()
+                    assign_system_ids(store)
                 self._migrated_store_path = path
+        self._share_store(store)
         return store
+
+    def _share_store(self, store) -> None:
+        """Point every embedded panel at the dock's registry (see __init__)."""
+        if self.assembly_panel.store is not store:
+            self.assembly_panel.store = store
+            self.assembly_panel.invalidate_rpl_cache()
+        if self.assessment_panel.store is not store:
+            self.assessment_panel.set_store(store)
 
     def _update_store_label(self, store, rpl_count=None):
         if store is None or not store.exists():
@@ -613,19 +653,10 @@ class WorkbenchDock(QDockWidget):
         from .store import set_project_gpkg_path
 
         set_project_gpkg_path(new_path)
-        self.rpl_panel.store = store
+        self._release_project()
+        self.rpl_panel.set_store(store)
         self._migrated_store_path = os.path.normcase(os.path.abspath(new_path))
-        if self.rpl_panel.edit_btn.isChecked():
-            self.rpl_panel.edit_btn.setChecked(False)
-        self.rpl_panel._on_rpl_selected(None)
-
-        self.assembly_panel.store = store
-        self.assembly_panel.set_fit_context(None)
-        self.assembly_panel._on_assembly_selected(None)
-        self.assessment_panel.set_store(store)
-        self.assessment_panel.assessment = None
-        self.assessment_panel.rpl_id = None
-        self.stack.setCurrentWidget(self.placeholder)
+        self._share_store(store)
 
         restore_workbench_layers(QgsProject.instance())
         self.refresh_tree()
@@ -642,7 +673,8 @@ class WorkbenchDock(QDockWidget):
             from .rpl_summary import invalidate_rpl_summary
             invalidate_rpl_summary()
             from .system_topology import assign_system_ids
-            assign_system_ids(store)
+            with store.quiet_commits():
+                assign_system_ids(store)
         rpl_rows = store.list_rpls() if store is not None and store.exists() else []
         self._update_store_label(store, len(rpl_rows))
         assemblies = {}
@@ -1064,7 +1096,7 @@ class WorkbenchDock(QDockWidget):
         """File the project's workbench layers under system / segment / revision."""
         from .project_layers import organise_workbench_layers
 
-        store = self.rpl_panel.store
+        store = self._store()
         if store is None or not store.exists():
             return 0
         return organise_workbench_layers(QgsProject.instance(), store)
@@ -1862,6 +1894,7 @@ class WorkbenchDock(QDockWidget):
         """Detach from project signals before the plugin unloads the dock."""
         self._save_window_state()  # unload may bypass closeEvent
         self.assessment_panel.abandon_run()
+        self.rpl_panel.release_canvas()
         self._disconnect_project_layer_sync()
 
 

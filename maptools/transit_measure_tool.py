@@ -77,6 +77,20 @@ class TransitMeasureTool(QgsMapTool):
         self.is_dragging = False
         self.edit_cursor = Qt.CursorShape.OpenHandCursor
         self.drag_cursor = Qt.CursorShape.ClosedHandCursor
+        # New / Open / Close project: the path belongs to the old project.
+        # Opening a project leaves a plugin map tool active, so without this
+        # the old path stayed drawn and new legs were measured in the old CRS.
+        QgsProject.instance().aboutToBeCleared.connect(self._on_project_about_to_be_cleared)
+
+    def _on_project_about_to_be_cleared(self):
+        """Turn the tool off; deactivate() disposes the dialog and its drawing."""
+        try:
+            if self.canvas.mapTool() is self:
+                self.canvas.unsetMapTool(self)
+        except RuntimeError:  # canvas already deleted (QGIS closing)
+            pass
+        self.remove_vertex_marker()
+        self._dispose_dialog()
 
     def activate(self):  # noqa: D401
         self.canvas.setCursor(Qt.CursorShape.CrossCursor)
@@ -113,14 +127,19 @@ class TransitMeasureTool(QgsMapTool):
     def cleanup(self):
         """Release everything the tool put on the canvas (plugin unload).
 
-        Closes and deletes the dialog, and removes its rubber bands and the
-        snap marker from the map canvas scene. Safe to call more than once,
-        and after the tool was deactivated.
+        Closes and deletes the dialog, removes its rubber bands and the snap
+        marker from the map canvas scene, and stops following project
+        changes. Safe to call more than once, and after the tool was
+        deactivated.
         """
         self.remove_vertex_marker()
         self.selected_waypoint_idx = None
         self.is_dragging = False
         self._dispose_dialog()
+        try:
+            QgsProject.instance().aboutToBeCleared.disconnect(self._on_project_about_to_be_cleared)
+        except TypeError:  # already disconnected
+            pass
 
     def _dispose_dialog(self):
         dialog, self.dialog = self.dialog, None
@@ -282,11 +301,8 @@ class TransitMeasureDialog(QDialog):
         self.original_point_color = QColor(255, 170, 0)
         self.highlight_color = QColor(255, 0, 0)
 
-        from ..kp_range_utils import make_distance_area
-        proj = QgsProject.instance()
-        self.da = make_distance_area(
-            proj.crs(), proj.transformContext(), project=proj
-        )
+        self.da = None
+        self._distance_area()
 
         self.point_rb = QgsRubberBand(self.canvas, GEOMETRY_POINT)
         self.point_rb.setColor(QColor(255, 170, 0))
@@ -673,10 +689,22 @@ class TransitMeasureDialog(QDialog):
         self.status_label.setStyleSheet("font-style: italic; color: #666;")
         self._update_totals()
 
+    def _distance_area(self):
+        """Distance calculator for the map canvas CRS the clicked points are
+        in, rebuilt when that CRS changes (a fixed project CRS read at
+        construction measured legs in the wrong CRS after a CRS change)."""
+        crs = self.canvas.mapSettings().destinationCrs()
+        if self.da is None or self.da.sourceCrs() != crs:
+            from ..kp_range_utils import make_distance_area
+            proj = QgsProject.instance()
+            self.da = make_distance_area(crs, proj.transformContext(), project=proj)
+        return self.da
+
     def _calc_segment(self, p1: QgsPointXY, p2: QgsPointXY):
-        dist = self.da.measureLine([p1, p2])
-        b_fwd = math.degrees(self.da.bearing(p1, p2))
-        b_rev = math.degrees(self.da.bearing(p2, p1))
+        da = self._distance_area()
+        dist = da.measureLine([p1, p2])
+        b_fwd = math.degrees(da.bearing(p1, p2))
+        b_rev = math.degrees(da.bearing(p2, p1))
         if b_fwd > 180:
             b_fwd -= 360
         if b_rev > 180:
@@ -855,11 +883,12 @@ class TransitMeasureDialog(QDialog):
         n = min(20, int(math.ceil(dist_m / 10000.0)))
         seg_len = dist_m / n
         pts = [p1]
-        bearing = self.da.bearing(p1, p2)
-        if hasattr(self.da, 'computeSpheroidProject'):
+        da = self._distance_area()
+        bearing = da.bearing(p1, p2)
+        if hasattr(da, 'computeSpheroidProject'):
             for i in range(1, n):
                 s = seg_len * i
-                inter = self.da.computeSpheroidProject(p1, s, bearing)
+                inter = da.computeSpheroidProject(p1, s, bearing)
                 pts.append(inter)
         else:
             for i in range(1, n):

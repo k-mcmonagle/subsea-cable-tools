@@ -49,8 +49,6 @@ class PlannerSketchTool(QgsMapTool):
         self.snap_enabled = True
         self.snap_vertices = True
         self.snap_segments = True
-        self._original_snapping_config = QgsSnappingConfig(
-            self.canvas.snappingUtils().config())
         self.set_snapping(True, True, True)
 
     def activate(self):
@@ -133,7 +131,9 @@ class PlannerSketchTool(QgsMapTool):
         self.snap_enabled = bool(enabled)
         self.snap_vertices = bool(vertices)
         self.snap_segments = bool(segments)
-        config = QgsSnappingConfig(self._original_snapping_config)
+        # Based on the project's current settings, never a copy kept from the
+        # start: its per-layer entries point at layers that may since be gone.
+        config = QgsSnappingConfig(QgsProject.instance().snappingConfig())
         active = self.snap_enabled and (self.snap_vertices or self.snap_segments)
         config.setEnabled(active)
         if active:
@@ -230,7 +230,10 @@ class PlannerSketchTool(QgsMapTool):
         return None
 
     def _cleanup(self):
-        self.canvas.snappingUtils().setConfig(self._original_snapping_config)
+        # The map canvas follows the project's snapping settings: hand it the
+        # project's current ones (another project may be open by now, and the
+        # user may have changed them while sketching).
+        self.canvas.snappingUtils().setConfig(QgsProject.instance().snappingConfig())
         scene = self.canvas.scene()
         for item in (self.point_band, self.line_band, self.motion_band, self.snap_marker):
             if item is not None:

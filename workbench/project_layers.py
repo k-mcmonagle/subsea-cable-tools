@@ -395,7 +395,10 @@ def discover_gpkg_path(project: Optional[QgsProject] = None) -> Optional[str]:
     Besides the saved entry and conventional filename, recover a registry
     moved with the QGIS project.  If there is exactly one valid Workbench
     GeoPackage beside the project we can select it unambiguously; if there are
-    several, leave the choice to the Workbench's *Open existing* action.
+    several, leave the choice to the Workbench's *Open existing* action. That
+    folder search is only for a project known to use the Workbench - it has a
+    (stale) entry, or layers read from a GeoPackage of that name - so another
+    project saved in the same folder never picks up its neighbour's registry.
     """
     project = project or QgsProject.instance()
     path = project_gpkg_path(project)
@@ -418,7 +421,8 @@ def discover_gpkg_path(project: Optional[QgsProject] = None) -> Optional[str]:
     if _is_workbench_gpkg(fallback):
         return fallback
 
-    if project_folder and os.path.isdir(project_folder):
+    layer_files = _layer_gpkg_names(project)
+    if project_folder and os.path.isdir(project_folder) and (path or layer_files):
         candidates = []
         try:
             names = os.listdir(project_folder)
@@ -428,12 +432,27 @@ def discover_gpkg_path(project: Optional[QgsProject] = None) -> Optional[str]:
             lowered = name.lower()
             if not lowered.endswith(".gpkg") or ".bak.gpkg" in lowered:
                 continue
+            if not path and os.path.normcase(name) not in layer_files:
+                continue
             candidate = os.path.join(project_folder, name)
             if _is_workbench_gpkg(candidate):
                 candidates.append(candidate)
         if len(candidates) == 1:
             return candidates[0]
     return None
+
+
+def _layer_gpkg_names(project: QgsProject) -> set:
+    """Normalised file names of the GeoPackages the project's vector layers
+    read (their folders may be stale after a move)."""
+    names = set()
+    for layer in project.mapLayers().values():
+        if not isinstance(layer, QgsVectorLayer):
+            continue
+        source = (layer.source() or "").split("|", 1)[0]
+        if source.lower().endswith(".gpkg"):
+            names.add(os.path.normcase(os.path.basename(source)))
+    return names
 
 
 def _is_workbench_gpkg(path: Optional[str]) -> bool:

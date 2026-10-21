@@ -181,7 +181,8 @@ class KpPlotterDockWidget(QDockWidget):
 
         self.populate_layer_combos()
         self.restore_user_settings()
-        self.iface.projectRead.connect(self.populate_layer_combos)
+        self._project_signals_connected = False
+        self._connect_project_signals()
 
         # Set default dock area to bottom if possible
         # This requires the main window reference from iface
@@ -192,6 +193,39 @@ class KpPlotterDockWidget(QDockWidget):
             main_win.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self)
         except Exception:
             pass  # Fallback if iface.mainWindow() is not available
+
+    def _connect_project_signals(self):
+        """Follow project changes (again after the dock was closed and reopened)."""
+        if self._project_signals_connected:
+            return
+        self.iface.projectRead.connect(self.populate_layer_combos)
+        new_project = getattr(self.iface, "newProjectCreated", None)
+        if new_project is not None:
+            new_project.connect(self.populate_layer_combos)
+        QgsProject.instance().aboutToBeCleared.connect(self._on_project_about_to_be_cleared)
+        self._project_signals_connected = True
+
+    def _disconnect_project_signals(self):
+        if not getattr(self, "_project_signals_connected", False):
+            return
+        self._project_signals_connected = False
+        for signal, slot in ((self.iface.projectRead, self.populate_layer_combos),
+                             (getattr(self.iface, "newProjectCreated", None), self.populate_layer_combos),
+                             (QgsProject.instance().aboutToBeCleared, self._on_project_about_to_be_cleared)):
+            if signal is None:
+                continue
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass  # not connected
+
+    def _on_project_about_to_be_cleared(self):
+        """New / Open / Close project: the plot, its map marker and the
+        listed layers belong to the old project. The lists are filled again
+        when the next project is ready (projectRead / newProjectCreated)."""
+        self.cleanup_plot_and_marker()
+        self.line_layer_combo.clear()
+        self.table_layer_combo.clear()
 
     def populate_layer_combos(self):
         """
@@ -870,12 +904,16 @@ class KpPlotterDockWidget(QDockWidget):
             except Exception:
                 pass
 
-        # Reset internal state containers
+        # Reset internal state containers (the cached route and plotted KPs:
+        # nothing may move a marker along a line of an earlier plot/project)
         self.vertical_line = None
         self.features_geoms = []
         self.segment_lengths = []
         self.line_length = 0
         self.route = None
+        self.line_parts = []
+        self.kp_sorted = []
+        self._kp_ascending = []
 
         if getattr(self, 'canvas', None):
             try:
@@ -888,8 +926,9 @@ class KpPlotterDockWidget(QDockWidget):
         Handle the widget being shown.
         """
         super().showEvent(event)
+        self._connect_project_signals()  # closing the dock disconnected them
         self.populate_layer_combos()
-        
+
     def closeEvent(self, event):
         """Handle the widget being closed."""
         self.save_user_settings()
@@ -902,10 +941,7 @@ class KpPlotterDockWidget(QDockWidget):
         self.cleanup_plot_and_marker()
         # Only do full plot cleanup when actually closing
         self.cleanup_matplotlib_resources_on_close()
-        try:
-            self.iface.projectRead.disconnect(self.populate_layer_combos)
-        except (TypeError, RuntimeError):
-            pass  # not connected (already shut down)
+        self._disconnect_project_signals()
 
     def cleanup_matplotlib_resources_on_close(self):
         """Clean up plot resources completely when closing the widget."""

@@ -86,6 +86,7 @@ from .plan_model import PlanModel
 from .profile_widget import BurialProfileWidget
 from .store import (
     BurialStore,
+    DetachedStore,
     default_project_gpkg_path,
     project_gpkg_path,
     set_project_gpkg_path,
@@ -121,6 +122,10 @@ def _mouse_event_pos(event):
 
 _FLOATING_GEOMETRY_KEY = "SubseaCableTools/BurialPlanner/floating_geometry"
 _FLOATING_MODE_KEY = "SubseaCableTools/BurialPlanner/floating"
+
+
+def _path_key(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path)) if path else ""
 
 
 def _remove_canvas_item(item) -> None:
@@ -191,6 +196,14 @@ class BurialPlannerDock(QDockWidget):
         self._shutting_down = False
         self._refresh_pending = False
         self._project_hooks = []
+        # Project switches (New / Close / Open) are followed even while the
+        # window is closed: see _leave_project. Released by shutdown() only.
+        self._lifecycle_hooks = []
+        # (plan file key, plan_id) open when the project was left: reopening
+        # the same project selects that plan again.
+        self._resume_selection = None
+        # The plan file that last failed to open (warned about once).
+        self._store_error_path = ""
         # GUI-thread stall diagnostics (stdlib faulthandler; see watchdog.py).
         self._watchdog = watchdog.StallWatchdog(parent=self)
 
@@ -200,6 +213,7 @@ class BurialPlannerDock(QDockWidget):
             path, create_if_missing=not bool(saved_path))
         self.store_ready = not error
         if not self.store_ready:
+            self._store_error_path = _path_key(path)
             QMessageBox.warning(None, "Burial Planner",
                                 "Could not open or migrate the Burial Planner "
                                 f"GeoPackage.\n{error}\n\nUse Plan file → Open "
@@ -409,8 +423,10 @@ class BurialPlannerDock(QDockWidget):
         self._layers_timer.setInterval(300)
         self._layers_timer.timeout.connect(self._project_layers_changed)
         self._install_project_hooks()
+        self._install_lifecycle_hooks()
         self._refresh_soon = ui_helpers.coalesced(self, self._refresh_if_pending)
 
+        self._apply_store_state()
         self.refresh_plans()
 
     # -- store lifecycle ------------------------------------------------------
@@ -447,7 +463,9 @@ class BurialPlannerDock(QDockWidget):
                     log_exception("Burial Planner: project-side fallback plan "
                                   f"file not usable: {fallback}",
                                   level=logging.DEBUG)
-            return BurialStore(path), path, str(first_error)
+            # Inert stand-in: nothing can be written anywhere until the user
+            # locates or creates a plan file.
+            return DetachedStore(path), path, str(first_error)
 
     @staticmethod
     def _open_existing_store(path: str):
@@ -476,14 +494,14 @@ class BurialPlannerDock(QDockWidget):
                 "and wait for it to finish before changing the plan file.")
             return False
         self._cancel_profile_refresh(silent=True)
-        self._close_store()  # checkpoint + release the old SQL handle
-        self.store = store
-        self.store_ready = True
-        set_project_gpkg_path(path)
-        self.model.store = store
-        self.model.refresh_tools()  # the registry is per GeoPackage
-        self.model.refresh_layback_profiles()
+        # Close the plan before the swap: a pending debounced layer write
+        # lands in the file it belongs to.
         self.model.close_plan()
+        self._remove_canvas_items()
+        self._close_store()  # checkpoint + release the old SQL handle
+        self._attach_store(store)
+        set_project_gpkg_path(path)
+        self.model.workbench_store = self.workbench_store()
         self.refresh_plans()
         return True
 
@@ -493,7 +511,14 @@ class BurialPlannerDock(QDockWidget):
 
         Prefer a registry containing the plan's exact RPL UUID, then a unique
         name+revision match, then the normal project/default Workbench path.
+
+        None while no plan file is open (project closed or being switched).
+        The project's Workbench entry is only rewritten in a project that
+        uses the Burial Planner: a project that never did must not be
+        changed (marked dirty) by merely opening this window.
         """
+        if not getattr(self, "store_ready", True):
+            return None
         try:
             plan = plan_hint or getattr(getattr(self, "model", None), "plan", {})
             configured = wb_store_module.project_gpkg_path()
@@ -556,7 +581,8 @@ class BurialPlannerDock(QDockWidget):
             if not valid:
                 return None
             _score, chosen = max(valid, key=lambda item: item[0])
-            if configured != chosen.gpkg_path:
+            in_use = getattr(self, "_project_uses_planner", None)
+            if configured != chosen.gpkg_path and (in_use is None or in_use()):
                 wb_store_module.set_project_gpkg_path(chosen.gpkg_path)
             return chosen
         except Exception:
@@ -575,7 +601,7 @@ class BurialPlannerDock(QDockWidget):
         self.plan_combo = QComboBox()
         self.plan_combo.setPlaceholderText(
             "No plans in this file — use Plan file… to open an existing file")
-        self.plan_combo.currentIndexChanged.connect(self._plan_selected)
+        self.plan_combo.currentIndexChanged.connect(self._plan_chosen)
         strip.addWidget(self.plan_combo, 1)
         # One compact menu instead of four buttons so the strip fits a
         # narrow (screen-share) dock width.
@@ -601,12 +627,19 @@ class BurialPlannerDock(QDockWidget):
         strip.addWidget(self.gpkg_button)
         return strip
 
-    def refresh_plans(self, select_id: str = "") -> None:
+    def refresh_plans(self, select_id: str = "", auto_select: bool = True) -> None:
+        """Re-list the plan file's plans and (re)select one.
+
+        ``auto_select=False`` lists without opening any plan unless
+        ``select_id`` names one: a project that has never used the Burial
+        Planner gets no plan layers until the user picks a plan.
+        """
         try:
             plans = self.store.list_plans() if self.store_ready else []
         except Exception as exc:
             plans = []
             self.store_ready = False
+            self._apply_store_state()
             QMessageBox.warning(
                 self, "Burial Planner",
                 "The selected plan file opened, but its plan registry could "
@@ -618,9 +651,28 @@ class BurialPlannerDock(QDockWidget):
             for plan in plans:
                 self.plan_combo.addItem(plan.get("name") or "Plan", plan.get("plan_id"))
             index = self.plan_combo.findData(selected)
-            self.plan_combo.setCurrentIndex(index if index >= 0 else (0 if plans else -1))
+            if index < 0:
+                index = 0 if plans and auto_select else -1
+            self.plan_combo.setCurrentIndex(index)
+            if plans:
+                placeholder = "Select a plan…"
+            elif self.store_ready:
+                placeholder = ("No plans in this file — use Plan file… to "
+                               "open an existing file")
+            else:
+                placeholder = ("No plan file open — Plan ▾ New… starts "
+                               "one, Plan file… opens one")
+            self.plan_combo.setPlaceholderText(placeholder)
         finally:
             self._loading = False
+        self._plan_selected()
+
+    def _plan_chosen(self, *_args) -> None:
+        """The user picked a plan in the selector."""
+        if self._loading:
+            return
+        if self.plan_combo.currentData():
+            self._adopt_project()
         self._plan_selected()
 
     def _plan_selected(self) -> None:
@@ -685,8 +737,11 @@ class BurialPlannerDock(QDockWidget):
         plan_count = self.plan_combo.count()
         state = ("unavailable" if not self.store_ready else
                  f"{plan_count} plan{'s' if plan_count != 1 else ''}")
-        self.gpkg_name.setText(
-            f"{os.path.basename(self.store.gpkg_path)} ({state})")
+        if self.store.gpkg_path:
+            self.gpkg_name.setText(
+                f"{os.path.basename(self.store.gpkg_path)} ({state})")
+        else:
+            self.gpkg_name.setText("No plan file")
         self.gpkg_name.setToolTip(self.store.gpkg_path)
         index = self.plan_combo.findData(self.model.plan_id)
         if index >= 0 and self.plan_combo.currentIndex() != index:
@@ -739,11 +794,16 @@ class BurialPlannerDock(QDockWidget):
         set_badge(self.profile_tab, warn_profile, tip)
 
     def _new_plan(self) -> None:
-        if not self.store_ready:
+        if not self.store_ready and project_gpkg_path():
+            # The project's saved plan file could not be opened (already
+            # reported): locate it, or create one, via Plan file….
             return
         name, ok = QInputDialog.getText(self, "New burial plan", "Name:")
         if not ok or not name.strip():
             return
+        if not self.store_ready and not self._create_project_store():
+            return
+        self._adopt_project()
         # Plans are tool-agnostic: each burial section takes its tool (and
         # labels) from the Tools registry. The stored method is only the
         # fallback vocabulary for sections without a tool.
@@ -2322,41 +2382,214 @@ class BurialPlannerDock(QDockWidget):
             self.model.workbench_store = self.workbench_store(self.model.plan)
             self.model.load_plan(plan_id)
 
+    def _project_created(self, *_args) -> None:
+        """Project > New with this dock open: resolve the new project's plan
+        file (opening a project is handled by ``readProject``)."""
+        if self._shutting_down or self._suspended:
+            return  # resolved on the next show
+        self.refresh()
+
     def refresh(self) -> None:
-        """Re-read the current project's store on every open."""
+        """Re-resolve the current project's plan file (every show, and once
+        a newly opened or created project is ready).
+
+        A project that has never used the Burial Planner (no saved plan
+        file, no layers from one) only gets its plans listed: no file is
+        created, no plan opened, no layer added and no project entry
+        written until the user acts (picks or creates a plan, or chooses a
+        plan file).
+        """
         self._refresh_pending = False
         saved_path = project_gpkg_path()
         path = saved_path or default_project_gpkg_path()
-        if path != self.store.gpkg_path:
-            store, path, error = self._open_store_with_recovery(
-                path, create_if_missing=not bool(saved_path))
-            if not error:
-                self._close_store()
-                self.store = store
-                self.store_ready = True
-                self.model.store = store
-                self.model.workbench_store = self.workbench_store()
-                self.model.refresh_tools()  # the registry is per GeoPackage
-                self.model.refresh_layback_profiles()
+        if not (self.store_ready
+                and _path_key(path) == _path_key(self.store.gpkg_path)):
+            # Close the plan first: a pending debounced layer write lands in
+            # the file it belongs to, and the Workbench is never resolved
+            # with the previous project's plan as the hint.
+            if self.model.plan:
                 self.model.close_plan()
+            self._remove_canvas_items()
+            self._close_store()
+            store, error_path, error = self._open_project_store(saved_path,
+                                                                path)
+            if store is not None:
+                self._attach_store(store)
             else:
-                self.store_ready = False
-                QMessageBox.warning(
-                    self, "Burial Planner",
-                    "Could not reopen the saved plan file. Use Plan file → "
-                    f"Open existing plans to locate it.\n\n{error}")
-        else:
-            # The Workbench may have been created or changed after this dock
-            # opened. Always refresh the read-only route/revision handle.
-            self.model.workbench_store = self.workbench_store()
-        self.refresh_plans(self.model.plan_id)
+                self._detach_store(error_path)
+                if error and _path_key(error_path) != self._store_error_path:
+                    QMessageBox.warning(
+                        self, "Burial Planner",
+                        "Could not reopen the saved plan file. Use Plan file "
+                        f"→ Open existing plans to locate it.\n\n{error}")
+                self._store_error_path = _path_key(error_path) if error else ""
+        # The Workbench may have been created or changed after this dock
+        # opened. Always refresh the read-only route/revision handle.
+        self.model.workbench_store = self.workbench_store()
+        select_id = self.model.plan_id
+        resume, self._resume_selection = self._resume_selection, None
+        if resume is not None and self.store_ready \
+                and resume[0] == _path_key(self.store.gpkg_path):
+            select_id = select_id or resume[1]
+        self.refresh_plans(select_id,
+                           auto_select=self._project_uses_planner())
+
+    def _open_project_store(self, saved_path: Optional[str], path: str):
+        """``(store, error_path, error)`` for the current project.
+
+        ``store`` is None when nothing could be opened: ``error`` explains a
+        saved plan file that failed; an empty ``error`` means the project
+        has no plan file yet (one is created on the first New plan).
+        """
+        if not saved_path:
+            try:
+                present = BurialStore(path).exists()  # read-only probe
+            except Exception:
+                log_exception("Burial Planner: default plan file not "
+                              f"readable: {path}", level=logging.DEBUG)
+                present = False
+            if not present:
+                return None, "", ""
+        store, path, error = self._open_store_with_recovery(
+            path, create_if_missing=False)
+        if error:
+            # A default file that is not a usable registry is left alone:
+            # this project never named it.
+            return (None, path, error) if saved_path else (None, "", "")
+        return store, path, ""
+
+    def _attach_store(self, store: BurialStore) -> None:
+        """Make ``store`` this dock's (and the model's) plan file."""
+        self.store = store
+        self.store_ready = True
+        self._store_error_path = ""
+        self.model.store = store
+        # The registries are per GeoPackage.
+        self.model.refresh_tools()
+        self.model.refresh_layback_profiles()
+        self.model.refresh_ground_classes()
+        self._apply_store_state()
+
+    def _detach_store(self, display_path: str = "") -> None:
+        """No plan file open: an inert stand-in that reads nothing and
+        refuses writes, so nothing can reach the previous project's file."""
+        self.store = DetachedStore(display_path)
+        self.store_ready = False
+        self.model.store = self.store
+        self.model.workbench_store = None
+        if self.model.plan:
+            # After the swap: the views it refreshes see no plan file (and
+            # resolve no Workbench) instead of the one being left.
+            self.model.close_plan()
+        self.model.refresh_tools()
+        self.model.refresh_layback_profiles()
+        self.model.refresh_ground_classes()
+        self._apply_store_state()
+
+    def _apply_store_state(self) -> None:
+        """The workflow is disabled while no plan file is open; the plan
+        strip stays usable (New plan, Plan file…)."""
+        self.workflow_tabs.setEnabled(bool(self.store_ready))
+
+    def _create_project_store(self) -> bool:
+        """Create (or open) the project's default plan file — on the user's
+        first New plan in a project without one."""
+        self._close_store()
+        store, path, error = self._open_store_with_recovery(
+            default_project_gpkg_path(), create_if_missing=True)
+        if error:
+            QMessageBox.warning(self, "Burial Planner",
+                                f"Could not create the plan file:\n{error}")
+            return False
+        self._attach_store(store)
+        set_project_gpkg_path(path)
+        self.model.workbench_store = self.workbench_store()
+        return True
+
+    def _project_uses_planner(self) -> bool:
+        """Whether the current project already works with the Burial
+        Planner: it names a plan file, or holds layers from this dock's."""
+        if project_gpkg_path():
+            return True
+        return bool(self.store_ready) and map_layers.project_has_store_layers(
+            QgsProject.instance(), self.store.gpkg_path)
+
+    def _adopt_project(self) -> None:
+        """The user started working with the open plan file in this
+        project: from now on the project uses the Burial Planner."""
+        if self.store_ready and not project_gpkg_path():
+            set_project_gpkg_path(self.store.gpkg_path)
+
+    def _leave_project(self, *_args) -> None:
+        """``aboutToBeCleared``: the project is being closed — New, Close,
+        or the start of opening another project — while its layers still
+        exist. Everything tied to it goes now: background runs, the pick
+        tool, map graphics, pending writes (into its own plan file), the
+        plan file handle and the open plan.
+
+        Nothing is added to the project, opened, created or written as a
+        project entry here: a read may follow, and the next project's plan
+        file is resolved once that project is ready (``readProject``,
+        ``newProjectCreated``, or the next show). After a Close the dock
+        stays inert. Runs while the window is closed too.
+        """
+        if self._shutting_down:
+            return
+        if self.store_ready and self.model.plan_id:
+            self._resume_selection = (_path_key(self.store.gpkg_path),
+                                      self.model.plan_id)
+        self._refresh_pending = False
+        try:
+            self._layers_timer.stop()
+        except (AttributeError, RuntimeError):
+            pass
+        self._stop_background_work("when the project closed")
+        self._release_pick_tool()
+        self._remove_canvas_items()
+        try:
+            # Debounced edits are written to the plan file they belong to;
+            # no layer is added to the project being cleared.
+            self.model.flush_layer_refresh(ensure=False)
+        except Exception:
+            log_exception("Burial Planner: pending plan-layer refresh failed")
+        self._close_store()
+        self._detach_store()  # also closes the plan
+        self._highlight_cache = None
+        self._canvas_transform_cache = None
+        self._canvas_inverse_cache = None
+        self.refresh_plans()  # empty selector
 
     # -- lifecycle -------------------------------------------------------------
     # Closing the window (X, or unticking it under View > Panels) only hides
     # a QDockWidget, and the plugin re-shows the same instance, so a close
     # suspends: background work stops, project hooks and the stall watchdog
     # are released, and resume() re-arms them on the next show. Plugin
-    # unload calls shutdown(): the same teardown, for good.
+    # unload calls shutdown(): the same teardown, for good. The lifecycle
+    # hooks (project closed / created) stay connected until shutdown.
+    def _install_lifecycle_hooks(self) -> None:
+        """Follow project New / Close / Open even while the window is closed
+        (idempotent)."""
+        if self._lifecycle_hooks:
+            return
+        pairs = [(QgsProject.instance().aboutToBeCleared, self._leave_project)]
+        created = getattr(self.iface, "newProjectCreated", None)
+        if created is not None:
+            pairs.append((created, self._project_created))
+        for signal, slot in pairs:
+            try:
+                signal.connect(slot)
+                self._lifecycle_hooks.append((signal, slot))
+            except (AttributeError, TypeError, RuntimeError):
+                log_exception("Burial Planner: cannot follow project switches")
+
+    def _remove_lifecycle_hooks(self) -> None:
+        hooks, self._lifecycle_hooks = self._lifecycle_hooks, []
+        for signal, slot in hooks:
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass  # already disconnected, or the sender is gone
+
     def _install_project_hooks(self) -> None:
         """Follow project (re)loads and layer changes (idempotent)."""
         if self._project_hooks:
@@ -2441,13 +2674,12 @@ class BurialPlannerDock(QDockWidget):
         """
         self._shutting_down = True
         self._suspended = True
+        self._remove_lifecycle_hooks()
         self._stop_activity()
 
     def _stop_activity(self) -> None:
         """Everything a closed or unloading dock must not keep running."""
         self._remove_project_hooks()
-        if hasattr(self, "operations"):
-            self.operations.cancel()
         self._refresh_pending = False
         try:
             self._layers_timer.stop()
@@ -2458,41 +2690,14 @@ class BurialPlannerDock(QDockWidget):
             self._watchdog.stop()
         except (AttributeError, RuntimeError):
             pass
-        self._discard_analysis(
-            "Stopped when the window closed — completed rules stay cached; "
-            "run again to resume.")
-        try:
-            self.paths_tab.shutdown()
-        except (AttributeError, RuntimeError):
-            pass
-        if self._profile_task is not None:
-            try:
-                self._cancel_profile_refresh(silent=True)
-                # Drop its late callback: nothing is saved from it.
-                self._profile_generation += 1
-                message = ("Profile sampling stopped when the window closed "
-                           "— stored samples unchanged.")
-                self.profile_status.setText(message)
-                self.profile_tab.set_runtime_status(message)
-            except (AttributeError, RuntimeError):
-                pass
-        try:
-            self.risk_tab.shutdown()
-        except (AttributeError, RuntimeError):
-            pass
+        self._stop_background_work("when the window closed")
         try:
             # A debounced map-layer write must not fire after an unload.
             self.model.flush_layer_refresh()
         except Exception:
             log_exception("Burial Planner: pending plan-layer refresh failed")
         self._close_store()  # checkpoint WAL + release the SQL handle
-        pick_tool = self._pick_tool
-        self._pick_tool = None
-        if pick_tool is not None and self.canvas is not None:
-            try:
-                self.canvas.unsetMapTool(pick_tool)
-            except (AttributeError, RuntimeError):
-                pass
+        self._release_pick_tool()
         # Follow-cursor overlay: detach the viewport watcher and stop the
         # coalescing timer before the canvas items are removed. The toggle
         # is unticked too (off by default each session), so a reopened
@@ -2516,6 +2721,50 @@ class BurialPlannerDock(QDockWidget):
                 self.canvas.viewport().removeEventFilter(self)
             except (AttributeError, RuntimeError):
                 pass
+        self._remove_canvas_items()
+
+    def _stop_background_work(self, reason: str) -> None:
+        """Cancel and forget every background run (window closed, project
+        closed, unload); their late callbacks are ignored."""
+        if hasattr(self, "operations"):
+            self.operations.cancel()
+        self._discard_analysis(
+            f"Stopped {reason} — completed rules stay cached; run again to "
+            "resume.")
+        try:
+            self.paths_tab.shutdown(reason)
+        except (AttributeError, RuntimeError):
+            pass
+        if self._profile_task is not None:
+            try:
+                self._cancel_profile_refresh(silent=True)
+                # Drop its late callback: nothing is saved from it.
+                self._profile_generation += 1
+                message = (f"Profile sampling stopped {reason} — stored "
+                           "samples unchanged.")
+                self.profile_status.setText(message)
+                self.profile_tab.set_runtime_status(message)
+            except (AttributeError, RuntimeError):
+                pass
+        try:
+            self.risk_tab.shutdown()
+        except (AttributeError, RuntimeError):
+            pass
+
+    def _release_pick_tool(self) -> None:
+        """Unset a map pick still waiting for a click (it holds the route)."""
+        pick_tool = self._pick_tool
+        self._pick_tool = None
+        if pick_tool is not None and self.canvas is not None:
+            try:
+                self.canvas.unsetMapTool(pick_tool)
+            except (AttributeError, RuntimeError):
+                pass
+
+    def _remove_canvas_items(self) -> None:
+        """Take every map graphic of this dock off the canvas; they are
+        recreated on demand. QGIS keeps plugin canvas items across a
+        project change, so they must go with the plan they belong to."""
         items = (self._marker, self._cpt_marker, self._band, self._footprint_band,
                  self._vessel_band) + tuple(self._exclusion_bands)
         self._marker = None

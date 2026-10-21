@@ -890,12 +890,16 @@ class AssessmentPanel(QWidget):
 
     def _on_mapping_changed(self, token: str, combo: QComboBox) -> None:
         name = combo.currentData()
+        # Merge into the mapping as the project holds it now (another tool may
+        # have changed it since it was read), never into an older copy.
+        mapping = library.project_mapping() if self.persist else dict(self._type_mapping)
         if name:
-            self._type_mapping[token] = name
+            mapping[token] = name
         else:
-            self._type_mapping.pop(token, None)
+            mapping.pop(token, None)
+        self._type_mapping = mapping
         if self.persist:
-            library.set_project_mapping(self._type_mapping)
+            library.set_project_mapping(mapping)
         label = next((self.mapping_table.item(r, 0).text() for r in range(self.mapping_table.rowCount())
                       if library.type_token(self.mapping_table.item(r, 0).text()) == token), token)
         self._update_how(token, label)
@@ -1419,6 +1423,29 @@ class AssessmentPanel(QWidget):
                     editor = self._editors[check_id].get(name)
                     if editor is not None:
                         editor.setText(str(text))
+
+    def release_project(self) -> None:
+        """The project is being cleared: forget what came from it - its
+        cable-type mapping and its Workbench makeup choices. Reads and writes
+        nothing; a run in flight is dropped when the dataset goes."""
+        self._type_mapping = {}
+        self._makeup_cache = {}
+        self._map_layer_id = None
+        for combo in (self.rpl_combo, self.fit_combo):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.blockSignals(False)
+
+    def project_ready(self) -> None:
+        """A project was opened or started: use its cable-type mapping and,
+        when the makeup comes from the Workbench, list that project's RPLs."""
+        self._type_mapping = library.project_mapping()
+        self._makeup_cache = {}
+        if self.makeup_combo.currentData() in (MAKEUP_RPL, MAKEUP_FIT):
+            self._fill_rpls()  # refreshes the label table too
+        else:
+            self._refresh_labels()
+        self._on_settings_changed()
 
     def shutdown(self) -> None:
         self._run_id += 1  # a late result is not applied to a closing window

@@ -73,7 +73,9 @@ class OperationsController(QObject):
                                  if self.model.route else ''})
 
     def refresh(self, *_args):
-        path = self.path
+        # No plan file open (project closed or being switched): read nothing,
+        # least of all the previous project's operations file.
+        path = '' if getattr(self.model.store, 'detached', False) else self.path
         context = self.context()
         changed_context = context != self._context or path != self._last_path
         if path != self._last_path:
@@ -82,7 +84,7 @@ class OperationsController(QObject):
             self.overrides = []
         self._last_path, self._context = path, context
         self.imports, self.revisions = [], []
-        if os.path.exists(path):
+        if path and os.path.exists(path):
             try:
                 self.imports = self.store().imports()
                 self.revisions = self.store().revisions()

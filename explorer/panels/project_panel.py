@@ -107,6 +107,9 @@ class ProjectPanel(QWidget):
         self._refresh_timer.setInterval(300)
         self._refresh_timer.timeout.connect(self.refresh)
         self._connected_project = None
+        # Set while the project is being cleared: layer changes then only mark
+        # the inventory stale (the next project is resolved when it is ready).
+        self._suspended = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -204,40 +207,61 @@ class ProjectPanel(QWidget):
         if self._connected_project is project:
             return
         self._connected_project = project
-        project.readProject.connect(self._on_project_changed)
-        project.cleared.connect(self._on_project_changed)
-        project.layersAdded.connect(self._on_layers_changed)
-        project.layersRemoved.connect(self._on_layers_changed)
+        for signal, slot in self._project_signal_slots(project):
+            signal.connect(slot)
 
     def detach_project_signals(self) -> None:
         project = self._connected_project
         self._connected_project = None
         if project is None:
             return
-        for signal, slot in (
-            (project.readProject, self._on_project_changed),
-            (project.cleared, self._on_project_changed),
-            (project.layersAdded, self._on_layers_changed),
-            (project.layersRemoved, self._on_layers_changed),
-        ):
+        for signal, slot in self._project_signal_slots(project):
             try:
                 signal.disconnect(slot)
             except (TypeError, RuntimeError):
                 pass
 
-    def _on_project_changed(self, *_args) -> None:
+    def _project_signal_slots(self, project):
+        return (
+            (project.aboutToBeCleared, self.release_project),
+            (project.cleared, self.release_project),
+            (project.readProject, self._on_project_changed),
+            (project.layersAdded, self._on_layers_changed),
+            (project.layersRemoved, self._on_layers_changed),
+        )
+
+    def release_project(self, *_args) -> None:
+        """The project is being cleared: forget its data file without touching
+        it. Nothing is scheduled here - a project read may follow, and a timer
+        could fire half way through it. The next project's file is resolved
+        on readProject / project_ready(), or when the panel is next shown."""
+        self._suspended = True
+        self._refresh_timer.stop()
+        self._path = None
+        self._inventory = None
+        self._note = ""
+        self._render_header()
+        self._populate()
+
+    def project_ready(self) -> None:
+        """A project was opened or started: resolve its data file."""
+        self._suspended = False
         self._path = None
         self._inventory = None
         self.refresh_soon()
 
+    def _on_project_changed(self, *_args) -> None:
+        self.project_ready()
+
     def _on_layers_changed(self, *_args) -> None:
-        if not self.isVisible():
-            self._inventory = None  # rescan when the tab is next shown
+        if self._suspended or not self.isVisible():
+            self._inventory = None  # rescan when ready / next shown
             return
         self.refresh_soon()
 
     def showEvent(self, event) -> None:  # noqa: N802 (Qt override)
         super().showEvent(event)
+        self._suspended = False
         if self._inventory is None:
             self.refresh_soon()
 
@@ -305,8 +329,12 @@ class ProjectPanel(QWidget):
             self.refresh_soon()
 
     def _on_scanned(self, result: Dict) -> None:
-        self._inventory = result
         self._set_actions_enabled(True)
+        if not gops.same_path((result or {}).get("path"), self._path):
+            # A scan of the previous project's file that ended after a switch.
+            self._populate()
+            return
+        self._inventory = result
         self._populate()
 
     def _on_scan_error(self, message: str) -> None:

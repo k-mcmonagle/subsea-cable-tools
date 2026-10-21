@@ -1121,6 +1121,11 @@ class SetupPanel(QWidget):
         else:
             self.update_status()
 
+    def forget_project(self) -> None:
+        """The project is closing: drop its Workbench (the next project's is read by refresh_sources)."""
+        self._workbench = None
+        self._rpl_cache = {}
+
     def refresh_layers(self) -> None:
         """The project's layers changed: list its rasters again."""
         before = sorted(self._raster_setting())

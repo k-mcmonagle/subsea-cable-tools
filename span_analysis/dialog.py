@@ -1182,14 +1182,20 @@ class SpanAnalysisDialog(QDialog):
             QSettings().setValue(f"{_SETTINGS}/splitter", self.splitter.saveState())
 
     # The plugin keeps this window when it is closed, and across projects, so it
-    # follows the project: layers added or removed, another project opened, and
-    # (on each show) the Workbench and the library, which change elsewhere.
+    # follows the project: layers added or removed, another project opened or a
+    # new one started, and (on each show) the Workbench and the library, which
+    # change elsewhere.
     def _install_project_hooks(self) -> None:
         project = QgsProject.instance()
-        for signal, slot in ((project.layersAdded, self._on_layers_event),
-                             (project.layersRemoved, self._on_layers_event),
-                             (project.cleared, self._leave_project),
-                             (project.readProject, self._on_project_read)):
+        hooks = [(project.layersAdded, self._on_layers_event),
+                 (project.layersRemoved, self._on_layers_event),
+                 (project.aboutToBeCleared, self._leave_project),
+                 (project.readProject, self._on_project_read)]
+        # Project > New is followed like an opened project (stub ifaces lack the signal).
+        new_project = getattr(self.iface, "newProjectCreated", None)
+        if new_project is not None:
+            hooks.append((new_project, self._on_project_read))
+        for signal, slot in hooks:
             try:
                 signal.connect(slot)
                 self._project_hooks.append((signal, slot))
@@ -1221,7 +1227,8 @@ class SpanAnalysisDialog(QDialog):
             self._set_running(False)
 
     def _leave_project(self, *_args) -> None:
-        """The project closed: its results, map graphics and scenario file go (the settings stay)."""
+        """The project is closing: its results, map graphics, scenario file and Workbench go (the
+        settings stay). Nothing is opened here: the next project's files are read once it is ready."""
         # Removing the project's layers can untick rasters: that is not a change by the user.
         self._carry_dirty = self._dirty
         self._cancel_work()
@@ -1230,6 +1237,7 @@ class SpanAnalysisDialog(QDialog):
         if self._store is not None:
             self._store.close()
             self._store = None
+        self.setup.forget_project()
         self._scenario_id = None
         self._profile, self._profile_key = None, ""
         self.map.set_route(None)

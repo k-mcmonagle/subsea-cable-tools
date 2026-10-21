@@ -566,7 +566,12 @@ class DepthProfileDockWidget(QDockWidget):
             self.iface.projectRead.connect(self.populate_layer_combos)
         except AttributeError:  # stub iface (tests) without projectRead
             log_exception("Depth profile: no projectRead signal", level=logging.DEBUG)
+        new_project = getattr(self.iface, "newProjectCreated", None)
+        if new_project is not None:
+            new_project.connect(self._on_new_project)
         proj = QgsProject.instance()
+        # New / Open / Close project: drop the old project's profile and drawing.
+        proj.aboutToBeCleared.connect(self._on_project_about_to_be_cleared)
         # A failed connection silently stops the layer lists refreshing.
         try:
             proj.layerWasAdded.connect(self.on_layer_event)
@@ -594,6 +599,14 @@ class DepthProfileDockWidget(QDockWidget):
         except Exception:
             pass
         try:
+            self.iface.newProjectCreated.disconnect(self._on_new_project)
+        except Exception:
+            pass
+        try:
+            QgsProject.instance().aboutToBeCleared.disconnect(self._on_project_about_to_be_cleared)
+        except Exception:
+            pass
+        try:
             QgsProject.instance().layerWasAdded.disconnect(self.on_layer_event)
         except Exception:
             pass
@@ -617,10 +630,29 @@ class DepthProfileDockWidget(QDockWidget):
         self._shut_down = False
         self._connect_project_signals()
         try:
+            self.update_enable_states()  # shutdown() discarded any drawn line
             self.schedule_layer_combo_refresh(delay_ms=0)
         except Exception:
             pass
         super().showEvent(event)
+
+    def _on_project_about_to_be_cleared(self):
+        """New / Open / Close project, while the old layers still exist: drop
+        everything that belongs to the old project — a running generation,
+        the plot, its measurements and map marker, the drawing tool and the
+        drawn line (its points are in the old project's CRS)."""
+        self.clear_plot()
+        self._depth_axis = None
+        self._set_hover_axis([])
+        self.measure.attach(None)
+        self._update_measure_controls()
+        self._release_temp_line_tool()
+        self._discard_drawn_line()
+        self.update_enable_states()
+
+    def _on_new_project(self):
+        """A new (empty) project is ready: list its layers."""
+        self.schedule_layer_combo_refresh(delay_ms=0)
 
     # ---------------------- UI population ----------------------
     def populate_layer_combos(self):
@@ -1797,13 +1829,29 @@ class DepthProfileDockWidget(QDockWidget):
         canvas.setMapTool(self.temp_line_tool)
 
     def clear_drawn_line(self):
-        self.temp_drawn_points = []
-        self.use_drawn_chk.setChecked(False)
+        self._discard_drawn_line()
         self.update_enable_states()
-        # remove persistent rubber band
+        self.iface.messageBar().pushMessage("Depth Profile", "Temporary line cleared", level=MESSAGE_INFO, duration=2)
+
+    def _discard_drawn_line(self):
+        """Forget the drawn line and take its rubber band off the map."""
+        self.temp_drawn_points = []
         self._remove_canvas_item(self.temp_line_rubber)
         self.temp_line_rubber = None
-        self.iface.messageBar().pushMessage("Depth Profile", "Temporary line cleared", level=MESSAGE_INFO, duration=2)
+        if not _sip_isdeleted(self.use_drawn_chk):
+            self.use_drawn_chk.setChecked(False)
+
+    def _release_temp_line_tool(self):
+        """Unset the line drawing tool if it is still on the canvas."""
+        tool, self.temp_line_tool = self.temp_line_tool, None
+        if tool is None:
+            return
+        try:
+            canvas = self.iface.mapCanvas()
+            if canvas.mapTool() is tool:
+                canvas.unsetMapTool(tool)  # its deactivate() removes its rubber band
+        except RuntimeError:  # canvas or tool already deleted
+            pass
 
     def keyPressEvent(self, event):
         # Escape cancels / leaves measuring; Delete removes a measurement.
@@ -1826,17 +1874,10 @@ class DepthProfileDockWidget(QDockWidget):
         self._closing = True
         self._pending_layer_refresh = False
         self.clear_plot()
-        # ensure temp line rubber removed
-        self._remove_canvas_item(self.temp_line_rubber)
-        self.temp_line_rubber = None
-        if self.temp_line_tool is not None:
-            try:
-                canvas = self.iface.mapCanvas()
-                if canvas.mapTool() is self.temp_line_tool:
-                    canvas.unsetMapTool(self.temp_line_tool)
-            except RuntimeError:  # canvas or tool already deleted
-                pass
-            self.temp_line_tool = None
+        # The drawn line goes with its rubber band: points kept without it
+        # were profiled invisibly later, even in another project's CRS.
+        self._discard_drawn_line()
+        self._release_temp_line_tool()
         self.measure.attach(None)
         self._disconnect_project_signals()
 

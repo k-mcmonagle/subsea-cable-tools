@@ -992,3 +992,25 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   patterns with the plot transform until they vanish.
 - **Hidden setup rows leave the form layout on Qt 5** (it keeps their spacing;
   Qt 6.4+ uses setRowVisible).
+
+## Tools across project changes (October 2026)
+
+- **Leave on `aboutToBeCleared`, follow on `readProject` /
+  `newProjectCreated`.** QGIS emits `aboutToBeCleared` for New, Close and at
+  the start of opening a project, while the old layers still exist, and never
+  removes a plugin's canvas items or (on Open) its active map tool. Every tool
+  drops the old project there: runs, timers, map tools, canvas items,
+  file handles, cached routes and panels; pending edits go to the file they
+  belong to. Nothing is opened, created, added or written as a project entry
+  in that handler or on `cleared`: a read follows, and the unavailable-layers
+  dialog can run the event loop in the middle of it. The next project's
+  files are resolved once it is ready (or on the next show); after a Close
+  the tools stay inert.
+- **A project that has not used a tool gets nothing from it until the user
+  works in it.** Every unsaved project shares one default file per tool in
+  the profile folder, so the Burial Planner, Planner and Workbench list what
+  is there but open no plan, scenario or RPL, add no layers and write no
+  project entry until the user picks or creates something. Projects that
+  already use a tool open as before. Route Comments never reuses a register
+  unasked: *New register* suggests a free name and asks before opening an
+  existing register (one is never overwritten).
