@@ -499,7 +499,9 @@ class _Reads:
                     acquired = _utc_seconds(f.get("acquired_utc"))
                     values = np.full(keep.size, np.nan if acquired is None else acquired)
                 if values is None:
-                    values = np.full(keep.size, np.nan)
+                    role = R.find(key.split(":", 1)[0])
+                    text = role is not None and role.kind == R.KIND_TEXT
+                    values = [""] * int(keep.size) if text else np.full(keep.size, np.nan)
                 if isinstance(values, list):
                     out[key].append([v for v, k in zip(values, keep) if k])
                 else:
@@ -570,10 +572,30 @@ class StoreReader(_Reads):
 
 # --------------------------------------------------------------------------- the store
 class AcquiredStore(_Reads):
-    """The burial data file (main thread only for writes)."""
+    """The burial data file: the main thread's cached connection, or a task's own (:meth:`for_task`)."""
 
     def __init__(self, path: str):
         self.path = os.path.abspath(path)
+        self._private: Optional[sqlite3.Connection] = None
+
+    @classmethod
+    def for_task(cls, path: str) -> "AcquiredStore":
+        """A store on a private connection, for writes from a background task (close it there)."""
+        store = cls(path)
+        if not is_data_store(store.path):
+            raise AcquiredStoreError(f"{os.path.basename(store.path)} is not a burial data file.")
+        try:
+            store._private = sqlite3.connect(store.path, timeout=30.0)
+        except sqlite3.Error as exc:
+            raise _friendly(exc, store.path, "open the burial data file") from exc
+        store._private.row_factory = sqlite3.Row
+        return store
+
+    @contextmanager
+    def batch(self, action: str):
+        """One transaction around several writes: all of them, or none (an exception rolls back)."""
+        with self._write(action) as conn:
+            yield conn
 
     @property
     def name(self) -> str:
@@ -624,10 +646,17 @@ class AcquiredStore(_Reads):
         return self
 
     def close(self) -> None:
+        if self._private is not None:
+            try:
+                self._private.close()
+            except sqlite3.Error:
+                pass
+            self._private = None
+            return
         close_connection(self.path)
 
     def _conn(self) -> sqlite3.Connection:
-        return connect(self.path)
+        return self._private if self._private is not None else connect(self.path)
 
     def data_version(self) -> int:
         """Changes when another connection (another QGIS or program) commits."""
@@ -829,6 +858,11 @@ class AcquiredStore(_Reads):
             new_id_ = self._insert_overlap(conn, row["dataset_id"], new, reason.strip())
             conn.execute(f"UPDATE {T_OVERLAP} SET superseded_by = ? WHERE overlap_id = ?", (new_id_, overlap_id))
         return new_id_
+
+    def record(self, action: str, dataset_id: Optional[str], detail: Dict) -> None:
+        """Note something done with the data (e.g. a KP check) in the history; nothing else changes."""
+        with self._write("record it in the history") as conn:
+            self._log(conn, action, dataset_id, dataset_id, detail)
 
     def set_file_status(self, file_id: str, status: str, reason: str) -> None:
         """Withdraw a file or bring a replaced one back (needs a reason)."""

@@ -243,6 +243,28 @@ class KpMap:
             flags.append(FLAG_GAP)
         return mapped, flags
 
+    def map_array(self, kps):
+        """``(mapped, extrapolated, gap)`` for a numpy array of KPs: :meth:`map_kp` for many at once."""
+        import numpy as np
+        values = np.asarray(kps, dtype=float)
+        none = np.zeros(values.shape, dtype=bool)
+        if self.is_identity:
+            return values.copy(), none, none.copy()
+        src, dst = np.asarray(self._src), np.asarray(self._dst)
+        if self.method == METHOD_SHIFT or len(src) == 1:
+            flagged = none.copy() if self.method == METHOD_SHIFT else np.isfinite(values)
+            return values + (dst[0] - src[0]), flagged, none.copy()
+        mapped = np.interp(values, src, dst)
+        below, above = values < src[0], values > src[-1]
+        mapped[below] = values[below] + (dst[0] - src[0])
+        mapped[above] = values[above] + (dst[-1] - src[-1])
+        extrapolated = (values < src[0] - _EPS_KM) | (values > src[-1] + _EPS_KM)
+        gap = none.copy()
+        inside = ~(below | above)
+        for lo, hi in self.gap_ranges:
+            gap |= inside & (values >= lo - _EPS_KM) & (values <= hi + _EPS_KM)
+        return mapped, extrapolated, gap
+
     def map_range(self, start_kp: float, end_kp: float,
                   stretch_tol: float = 0.10) -> Tuple[float, float, List[str]]:
         """Map both ends; flag stretched/compressed and collapsed ranges."""

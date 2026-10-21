@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """Rows of plots on one KP axis, in a splitter: the shared shape of a KP profile.
 
-* An optional **status bar** on top: a stretch per level (e.g. meets target,
-  below target, no data), one filled path per level. Hover outlines the
-  stretch; a click emits :attr:`KpRowStack.statusClicked`.
+* **Bands**: thin bars of coloured stretches, one filled path per level
+  (e.g. a status bar on top: meets target, below target, no data; a bar
+  naming which dataset governs). Hover outlines the stretch; a click emits
+  :attr:`KpRowStack.bandClicked` (and :attr:`KpRowStack.statusClicked` for
+  the status band made from ``levels``).
 * **Data rows**, each a plot with a legend line above it, all linked to the
   first row's KP axis; the KP labels sit on the lowest visible row. Rows
   share the height by dragging the splitter handles.
@@ -11,14 +13,15 @@
   :attr:`readout_provider` give the tooltip beside the cursor and the line
   below the plots for a KP. A click emits :attr:`KpRowStack.kpClicked`.
 * **Fit** and the *A* button show the whole extent; **Plots** shows or hides
-  each row and the legends, reverses KP, and restores the default view.
+  each row (and titled bands) and the legends, reverses KP, and restores
+  the default view.
 
 Items are built once and updated by the caller (``setData`` / ``setPath``):
 removing pyqtgraph items is slow on long routes and noisy under QGIS 3.40.
-Axes paint directly and the status bar is paths, so both draw correctly
-under Qt5 display scaling (see :mod:`.widgets`). Splitter sizes, row
-visibility, legends and reverse KP are remembered under
-``SubseaCableTools/<settings_key>`` unless ``persist`` is False (tests).
+Axes paint directly and bands are paths, so both draw correctly under Qt5
+display scaling (see :mod:`.widgets`). Splitter sizes, row visibility,
+legends and reverse KP are remembered under ``SubseaCableTools/<settings_key>``
+unless ``persist`` is False (tests).
 """
 
 from __future__ import annotations
@@ -44,7 +47,8 @@ _LEFT_BUTTON = getattr(getattr(Qt, "MouseButton", Qt), "LeftButton")
 _SELECTABLE = getattr(getattr(Qt, "TextInteractionFlag", Qt), "TextSelectableByMouse")
 _DASH = getattr(getattr(Qt, "PenStyle", Qt), "DashLine")
 _LEAVE = getattr(getattr(QEvent, "Type", QEvent), "Leave")
-STATUS_HEIGHT = 14
+STATUS = "status"
+BAND_HEIGHT = 14
 AXIS_WIDTH = 64
 _SMALL = {"font-size": "11px"}   # pixels: point sizes scale with the screen DPI under Qt5
 _TIP_STYLE = ("QLabel { background: rgba(255, 255, 255, 240); color: #222; border: 1px solid #9e9e9e; "
@@ -52,28 +56,39 @@ _TIP_STYLE = ("QLabel { background: rgba(255, 255, 255, 240); color: #222; borde
 _CAPTION_STYLE = (f"QLabel {{ background: white; color: #333; font-size: 11px; "
                   f"padding: 1px 4px 0px {AXIS_WIDTH + 4}px; }}")
 
+Levels = Sequence[Tuple[int, Tuple[int, int, int], str]]
+
+
+class _Band:
+    """One bar: its plot, a path per level, the hover outline and the merged stretches."""
+
+    def __init__(self, widget, plot, paths: Dict[int, QGraphicsPathItem], hover: QGraphicsPathItem,
+                 names: Dict[int, str]):
+        self.widget, self.plot, self.paths, self.hover, self.names = widget, plot, paths, hover, names
+        self.runs: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None
+
 
 class KpRowStack(QWidget):
     """Plots on one KP axis (see the module notes)."""
 
     kpHovered = pyqtSignal(float)                    # nan: the cursor left the plots
     kpClicked = pyqtSignal(float)
-    statusClicked = pyqtSignal(float, float, float)  # the stretch (KP from, KP to) and the KP clicked
+    statusClicked = pyqtSignal(float, float, float)  # the status stretch (KP from, KP to) and the KP clicked
+    bandClicked = pyqtSignal(str, float, float, float)
 
-    def __init__(self, settings_key: str, levels: Sequence[Tuple[int, Tuple[int, int, int], str]] = (),
-                 parent=None, persist: bool = True):
+    def __init__(self, settings_key: str, levels: Levels = (), parent=None, persist: bool = True):
         super().__init__(parent)
         self.settings_root = f"SubseaCableTools/{settings_key}"
         self.persist = persist
         self.tip_provider: Optional[Callable[[float], str]] = None
         self.readout_provider: Optional[Callable[[float], str]] = None
-        self.status_text: Optional[Callable[[float, float, int, float], str]] = None
-        self.level_names = {int(key): name for key, _colour, name in levels}
+        # band_text(band key, KP from, KP to, level, KP) -> text (lines split by "\n")
+        self.band_text: Optional[Callable[[str, float, float, int, float], str]] = None
         self._extent: Optional[Tuple[float, float]] = None
-        self._status_runs: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None
         self._default_sizes: List[int] = []
         self.widgets: Dict[str, pg.PlotWidget] = {}
         self.plots: Dict[str, pg.PlotItem] = {}
+        self.bands: Dict[str, _Band] = {}
         self.rows: Dict[str, QWidget] = {}
         self.captions: Dict[str, WrapLabel] = {}
         self.row_actions: Dict[str, object] = {}
@@ -113,15 +128,26 @@ class KpRowStack(QWidget):
         self.tip.hide()
 
         self.status_plot: Optional[pg.PlotItem] = None
-        self.status_paths: Dict[int, QGraphicsPathItem] = {}
         if levels:
-            self._add_status_row(levels)
+            self.status_plot = self.add_band(STATUS, levels)
         self.legend_action.toggled.connect(self._update_legends)
         self.reverse_action.toggled.connect(self._apply_reverse)
         self.splitter.splitterMoved.connect(lambda *_: self._remember("splitter", None))
 
+    @property
+    def status_paths(self) -> Dict[int, QGraphicsPathItem]:
+        return self.bands[STATUS].paths if STATUS in self.bands else {}
+
     # -- building ---------------------------------------------------------------
-    def _add_status_row(self, levels) -> None:
+    def _link(self, plot: pg.PlotItem) -> None:
+        if self._anchor is not None and plot is not self._anchor:
+            plot.setXLink(self._anchor)
+        plot.invertX(self.reverse_action.isChecked())
+
+    def add_band(self, key: str, levels: Levels, title: str = "", tip: str = "") -> pg.PlotItem:
+        """A bar of coloured stretches (shown in *Plots* as ``title`` when one is given)."""
+        if key in self.bands or key in self.plots:
+            raise ValueError(f"Row '{key}' already exists")
         widget = make_plot_widget()
         widget.setBackground("w")
         widget.setAntialiasing(True)
@@ -135,36 +161,44 @@ class KpRowStack(QWidget):
         plot.setMouseEnabled(x=True, y=False)
         plot.setYRange(0, 1, padding=0)
         plot.hideButtons()
-        for key, colour, _name in levels:
+        paths = {}
+        for level, colour, _name in levels:
             item = QGraphicsPathItem()
             item.setBrush(pg.mkBrush(*colour))
             item.setPen(pg.mkPen(None))
             plot.addItem(item)
-            self.status_paths[int(key)] = item
-        self.status_hover = QGraphicsPathItem()
-        self.status_hover.setPen(pg.mkPen((20, 20, 20), width=1.5))
-        self.status_hover.setZValue(10)
-        plot.addItem(self.status_hover, ignoreBounds=True)
+            paths[int(level)] = item
+        hover = QGraphicsPathItem()
+        hover.setPen(pg.mkPen((20, 20, 20), width=1.5))
+        hover.setZValue(10)
+        plot.addItem(hover, ignoreBounds=True)
         line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen((20, 20, 20), width=1.5))
         line.hide()
         plot.addItem(line, ignoreBounds=True)
         self._vlines.append(line)
         widget.viewport().setCursor(_POINTING)
-        widget.setFixedHeight(STATUS_HEIGHT)
-        widget.scene().sigMouseMoved.connect(self._on_status_moved)
-        widget.scene().sigMouseClicked.connect(self._on_status_clicked)
+        widget.setFixedHeight(BAND_HEIGHT)
+        if tip:
+            widget.setToolTip(tip)
+        widget.scene().sigMouseMoved.connect(lambda pos, k=key: self._on_band_moved(k, pos))
+        widget.scene().sigMouseClicked.connect(lambda event, k=key: self._on_band_clicked(k, event))
         widget.installEventFilter(self)
-        self.widgets["status"] = widget
-        self.status_plot = plot
-        self.rows["status"] = widget
+        self.widgets[key] = widget
+        self.bands[key] = _Band(widget, plot, paths, hover, {int(lv): name for lv, _c, name in levels})
+        self.rows[key] = widget
         self.splitter.addWidget(widget)
         self.splitter.setStretchFactor(self.splitter.count() - 1, 0)
-        self._default_sizes.append(STATUS_HEIGHT)
+        self._default_sizes.append(BAND_HEIGHT)
+        self._link(plot)
+        if title:
+            self._add_row_action(key, title, tip)
+        return plot
 
     def add_row(self, key: str, title: str, tip: str = "", y_label: str = "", invert_y: bool = False,
-                height: int = 150, min_height: int = 60, stretch: int = 2, legend: str = "") -> pg.PlotItem:
+                height: int = 150, min_height: int = 60, stretch: int = 2, legend: str = "",
+                visible: bool = True) -> pg.PlotItem:
         """A data row (shown in *Plots* as ``title``); returns its plot for the caller's items."""
-        if key in self.plots or key == "status":
+        if key in self.plots or key in self.bands:
             raise ValueError(f"Row '{key}' already exists")
         widget = make_plot_widget()
         widget.setBackground("w")
@@ -185,11 +219,9 @@ class KpRowStack(QWidget):
         plot.autoBtn.setToolTip("Show the whole extent")
         if self._anchor is None:
             self._anchor = plot
-            if self.status_plot is not None:
-                self.status_plot.setXLink(plot)
-        else:
-            plot.setXLink(self._anchor)
-        plot.invertX(self.reverse_action.isChecked())
+            for band in self.bands.values():
+                band.plot.setXLink(plot)
+        self._link(plot)
         line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen((120, 120, 120), width=1, style=_DASH))
         line.hide()
         plot.addItem(line, ignoreBounds=True)
@@ -212,15 +244,7 @@ class KpRowStack(QWidget):
         self.splitter.setStretchFactor(self.splitter.count() - 1, stretch)
         self._default_sizes.append(height)
         self.splitter.setSizes(list(self._default_sizes))
-
-        action = self.plots_menu.addAction(title)
-        self.plots_menu.insertAction(self._rows_end, action)
-        action.setCheckable(True)
-        action.setToolTip(tip)
-        action.setChecked(self._setting(f"row_{key}", True))
-        action.toggled.connect(lambda on, k=key: self._remember(f"row_{k}", on))
-        action.toggled.connect(self._update_rows)
-        self.row_actions[key] = action
+        self._add_row_action(key, title, tip, visible)
 
         scene = widget.scene()
         scene.sigMouseMoved.connect(lambda pos, k=key: self._on_mouse_moved(k, pos))
@@ -228,6 +252,17 @@ class KpRowStack(QWidget):
         widget.installEventFilter(self)
         self._update_rows()
         return plot
+
+    def _add_row_action(self, key: str, title: str, tip: str, visible: bool = True) -> None:
+        action = self.plots_menu.addAction(title)
+        self.plots_menu.insertAction(self._rows_end, action)
+        action.setCheckable(True)
+        action.setToolTip(tip)
+        action.setChecked(self._setting(f"row_{key}", visible))
+        action.toggled.connect(lambda on, k=key: self._remember(f"row_{k}", on))
+        action.toggled.connect(self._update_rows)
+        self.row_actions[key] = action
+        self._update_rows()
 
     def restore_layout(self) -> None:
         """Bring back the remembered splitter sizes (call once every row is added)."""
@@ -293,11 +328,13 @@ class KpRowStack(QWidget):
 
     # -- rows and view ----------------------------------------------------------------
     def visible_rows(self) -> List[str]:
-        return [key for key, action in self.row_actions.items() if action.isChecked()]
+        """Data rows shown (bands not included)."""
+        return [key for key, action in self.row_actions.items() if key in self.plots and action.isChecked()]
 
     def _update_rows(self, *_args) -> None:
-        if self.row_actions and not self.visible_rows():
-            next(iter(self.row_actions.values())).setChecked(True)   # at least one plot stays
+        data_actions = {k: a for k, a in self.row_actions.items() if k in self.plots}
+        if data_actions and not self.visible_rows():
+            next(iter(data_actions.values())).setChecked(True)   # at least one plot stays
             return
         for key, action in self.row_actions.items():
             self.rows[key].setVisible(action.isChecked())
@@ -314,7 +351,7 @@ class KpRowStack(QWidget):
             caption.setVisible(bool(caption.text()) and self.legend_action.isChecked())
 
     def _apply_reverse(self, on: bool) -> None:
-        for plot in list(self.plots.values()) + ([self.status_plot] if self.status_plot is not None else []):
+        for plot in list(self.plots.values()) + [band.plot for band in self.bands.values()]:
             plot.invertX(bool(on))
 
     def default_view(self) -> None:
@@ -354,31 +391,42 @@ class KpRowStack(QWidget):
         lo, hi = self._anchor.viewRange()[0]
         return float(lo), float(hi)
 
-    # -- status bar -------------------------------------------------------------------
-    def set_status(self, lo: np.ndarray, hi: np.ndarray, level: np.ndarray) -> None:
-        """Stretches ``lo..hi`` (km) at ``level``; empty arrays clear the bar."""
-        if self.status_plot is None:
+    # -- bands ---------------------------------------------------------------------------
+    def set_band(self, key: str, lo, hi, level) -> None:
+        """Stretches ``lo..hi`` (km) at ``level`` on band ``key``; empty arrays clear it."""
+        band = self.bands.get(key)
+        if band is None:
             return
         lo, hi, level = merge_runs(lo, hi, level)
-        paths = level_paths(lo, hi, level, self.status_paths)
-        for key, item in self.status_paths.items():
-            item.setPath(paths[key])
-        self._status_runs = (lo, hi, level) if lo.size else None
-        self.status_hover.setPath(QPainterPath())
+        paths = level_paths(lo, hi, level, band.paths)
+        for lv, item in band.paths.items():
+            item.setPath(paths[lv])
+        band.runs = (lo, hi, level) if lo.size else None
+        band.hover.setPath(QPainterPath())
 
-    def status_at(self, kp: float) -> Optional[Tuple[float, float, int]]:
-        """The stretch under ``kp``: (KP from, KP to, level), or None."""
-        if self._status_runs is None:
+    def band_at(self, key: str, kp: float) -> Optional[Tuple[float, float, int]]:
+        """The stretch of band ``key`` under ``kp``: (KP from, KP to, level), or None."""
+        band = self.bands.get(key)
+        if band is None or band.runs is None:
             return None
-        lo, hi, level = self._status_runs
+        lo, hi, level = band.runs
         j = int(np.searchsorted(lo, kp, side="right")) - 1
         if 0 <= j < lo.size and lo[j] <= kp <= hi[j]:
             return float(lo[j]), float(hi[j]), int(level[j])
         return None
 
+    def set_status(self, lo, hi, level) -> None:
+        self.set_band(STATUS, lo, hi, level)
+
+    def status_at(self, kp: float) -> Optional[Tuple[float, float, int]]:
+        return self.band_at(STATUS, kp)
+
     # -- hover and clicks --------------------------------------------------------------
+    def _plot_of(self, key: str) -> pg.PlotItem:
+        return self.bands[key].plot if key in self.bands else self.plots[key]
+
     def _kp_at(self, key: str, pos) -> Optional[float]:
-        plot = self.status_plot if key == "status" else self.plots[key]
+        plot = self._plot_of(key)
         if not plot.vb.sceneBoundingRect().contains(pos):
             return None
         return float(plot.vb.mapSceneToView(pos).x())
@@ -388,12 +436,15 @@ class KpRowStack(QWidget):
             self.end_hover()
         return super().eventFilter(watched, event)
 
+    def _clear_band_hover(self) -> None:
+        for band in self.bands.values():
+            band.hover.setPath(QPainterPath())
+
     def end_hover(self) -> None:
         for line in self._vlines:
             line.hide()
         self.tip.hide()
-        if self.status_plot is not None:
-            self.status_hover.setPath(QPainterPath())
+        self._clear_band_hover()
         self.kpHovered.emit(math.nan)
 
     def hover(self, kp: float, key: Optional[str] = None, scene_pos=None) -> None:
@@ -413,8 +464,7 @@ class KpRowStack(QWidget):
         if kp is None:
             self.end_hover()
             return
-        if self.status_plot is not None:
-            self.status_hover.setPath(QPainterPath())
+        self._clear_band_hover()
         self.hover(kp, key, pos)
 
     def _on_mouse_clicked(self, key: str, event) -> None:
@@ -424,34 +474,37 @@ class KpRowStack(QWidget):
         if kp is not None:
             self.kpClicked.emit(kp)
 
-    def _on_status_moved(self, pos) -> None:
-        kp = self._kp_at("status", pos)
-        stretch = self.status_at(kp) if kp is not None else None
+    def _on_band_moved(self, key: str, pos) -> None:
+        kp = self._kp_at(key, pos)
+        stretch = self.band_at(key, kp) if kp is not None else None
         if stretch is None:
             self.end_hover()
             return
         lo, hi, level = stretch
+        self._clear_band_hover()
         path = QPainterPath()
         path.addRect(QRectF(lo, 0.06, hi - lo, 0.88))
-        self.status_hover.setPath(path)
+        self.bands[key].hover.setPath(path)
         for line in self._vlines:
             line.setPos(kp)
             line.show()
-        if self.status_text is not None:
-            text = self.status_text(lo, hi, level, kp)
+        if self.band_text is not None:
+            text = self.band_text(key, lo, hi, level, kp)
         else:
-            text = f"KP {lo:.3f} to {hi:.3f}: {self.level_names.get(level, '')}"
+            text = f"KP {lo:.3f} to {hi:.3f}: {self.bands[key].names.get(level, '')}"
         self.readout.setText(text.replace("\n", "  |  "))
-        self._show_tip("status", pos, "<br>".join(html.escape(line) for line in text.split("\n")))
+        self._show_tip(key, pos, "<br>".join(html.escape(line) for line in text.split("\n")))
         self.kpHovered.emit(kp)
 
-    def _on_status_clicked(self, event) -> None:
+    def _on_band_clicked(self, key: str, event) -> None:
         if event.isAccepted() or event.button() != _LEFT_BUTTON:
             return
-        kp = self._kp_at("status", event.scenePos())
-        stretch = self.status_at(kp) if kp is not None else None
+        kp = self._kp_at(key, event.scenePos())
+        stretch = self.band_at(key, kp) if kp is not None else None
         if stretch is not None:
-            self.statusClicked.emit(stretch[0], stretch[1], kp)
+            self.bandClicked.emit(key, stretch[0], stretch[1], kp)
+            if key == STATUS:
+                self.statusClicked.emit(stretch[0], stretch[1], kp)
 
     def _show_tip(self, key: str, scene_pos, text: str) -> None:
         """The tooltip beside the cursor, kept inside the plots."""

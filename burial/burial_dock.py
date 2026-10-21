@@ -102,6 +102,9 @@ from .tabs.review_tab import ReviewTab
 from .tabs.risk_tab import RiskTab
 from .tabs.rules_tab import RulesTab
 from .tabs.tools_tab import ToolsTab
+from .acquired.controller import AcquiredController
+from .tabs.acquired_tab import AcquiredDataTab
+from .tabs.assessment_tab import AssessmentTab
 
 _VERTICAL = getattr(Qt, "Orientation", Qt).Vertical
 
@@ -261,12 +264,17 @@ class BurialPlannerDock(QDockWidget):
         }
         self.workflow_tabs = QTabWidget()
         self.workflow_tabs.addTab(self.tabs, "Planning")
-        # Acquired data, its assessment and reporting are being built
-        # (burial/acquired/); their tabs stay disabled placeholders until then.
-        for title in ("Acquired Data", "Assessment", "Reporting"):
-            index = self.workflow_tabs.addTab(QWidget(), title)
-            self.workflow_tabs.setTabEnabled(index, False)
-            self.workflow_tabs.setTabToolTip(index, "Under development")
+        # Acquired burial data (burial/acquired/): its own data file beside
+        # the plan file, assessed against the open plan's target depth.
+        self.acquired = AcquiredController(self.model, self)
+        self.acquired_tab = AcquiredDataTab(self.acquired, self.model, self)
+        self.assessment_tab = AssessmentTab(self.acquired, self.model, self)
+        self.workflow_tabs.addTab(self.acquired_tab, "Acquired Data")
+        self.workflow_tabs.addTab(self.assessment_tab, "Assessment")
+        # Burial graph reports are being built; the tab stays a placeholder.
+        index = self.workflow_tabs.addTab(QWidget(), "Reporting")
+        self.workflow_tabs.setTabEnabled(index, False)
+        self.workflow_tabs.setTabToolTip(index, "Under development")
         self.splitter.addWidget(self.workflow_tabs)
 
         profile_pane = QWidget()
@@ -2425,6 +2433,8 @@ class BurialPlannerDock(QDockWidget):
             select_id = select_id or resume[1]
         self.refresh_plans(select_id,
                            auto_select=self._project_uses_planner())
+        # The project's burial data file, if it names one (nothing is created).
+        self.acquired.follow_project()
 
     def _open_project_store(self, saved_path: Optional[str], path: str):
         """``(store, error_path, error)`` for the current project.
@@ -2546,6 +2556,7 @@ class BurialPlannerDock(QDockWidget):
             log_exception("Burial Planner: pending plan-layer refresh failed")
         self._close_store()
         self._detach_store()  # also closes the plan
+        self.acquired.leave_project()
         self._highlight_cache = None
         self._canvas_transform_cache = None
         self._canvas_inverse_cache = None
@@ -2689,6 +2700,12 @@ class BurialPlannerDock(QDockWidget):
         except Exception:
             log_exception("Burial Planner: pending plan-layer refresh failed")
         self._close_store()  # checkpoint WAL + release the SQL handle
+        try:
+            # Reopened from the project on the next show (refresh).
+            self.acquired.leave_project()
+            self.assessment_tab.shutdown()
+        except (AttributeError, RuntimeError):
+            pass
         self._release_pick_tool()
         # Follow-cursor overlay: detach the viewport watcher and stop the
         # coalescing timer before the canvas items are removed. The toggle
@@ -2718,6 +2735,10 @@ class BurialPlannerDock(QDockWidget):
     def _stop_background_work(self, reason: str) -> None:
         """Cancel and forget every background run (window closed, project
         closed, unload); their late callbacks are ignored."""
+        try:
+            self.acquired.cancel()
+        except (AttributeError, RuntimeError):
+            pass
         self._discard_analysis(
             f"Stopped {reason} — completed rules stay cached; run again to "
             "resume.")
