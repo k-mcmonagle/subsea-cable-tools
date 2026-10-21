@@ -2114,6 +2114,10 @@ class KPMouseTool:
         # New / Open / Close project: the tool's route, depth sampler and map
         # graphics belong to the old project's layers.
         project.aboutToBeCleared.connect(self._on_project_about_to_be_cleared)
+        # The button follows the canvas's map tool (stub canvases lack the signal).
+        map_tool_set = getattr(self.iface.mapCanvas(), "mapToolSet", None)
+        if map_tool_set is not None:
+            map_tool_set.connect(self._on_map_tool_set)
 
         self.iface.addPluginToMenu(self.menu_name, self.actionConfig)
 
@@ -2134,6 +2138,11 @@ class KPMouseTool:
             try:
                 signal.disconnect(slot)
             except TypeError:  # initGui never ran / already unloaded
+                pass
+        if iface is not None:
+            try:
+                iface.mapCanvas().mapToolSet.disconnect(self._on_map_tool_set)
+            except (AttributeError, TypeError, RuntimeError):  # never connected / canvas gone
                 pass
 
         button = self.toolButton
@@ -2260,6 +2269,21 @@ class KPMouseTool:
         all belong to the old project."""
         self.referenceLayer = None
         self._turn_off()
+
+    def _on_map_tool_set(self, new_tool, _old=None):
+        """Keep the button in step with the canvas, as QGIS's own map tool
+        buttons are: picking another map tool unticks it, and the KP tool
+        coming back (a tool that borrowed the canvas restoring it) ticks it
+        again. The tool is kept for that restore; clicking the button
+        builds a fresh one."""
+        tool, button = self.mapTool, self.toolButton
+        if tool is None or button is None or _sip_isdeleted(button):
+            return
+        active = new_tool is tool
+        if button.isChecked() != active:
+            button.blockSignals(True)
+            button.setChecked(active)
+            button.blockSignals(False)
 
     def _resolve_depth_sources(self):
         """Resolve stored (layer_id, field) refs to live [(layer, field)] pairs."""

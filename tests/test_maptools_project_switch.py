@@ -8,7 +8,8 @@ project itself on ``QgsProject.aboutToBeCleared``:
 * KP Mouse Tool: turned off (no RuntimeError from its CRS hook on the next
   map CRS change), its graphics, sampler and live profile released; removing
   its reference line turns it off too. Reconfiguring, toggling off and
-  unloading leave no orphaned map tool on the canvas.
+  unloading leave no orphaned map tool on the canvas. Its button follows
+  the canvas's map tool.
 * Transit Measure: disposed on Open; legs are measured in the map CRS.
 * Depth Profile and KP Plot docks: plot, map marker and drawn line gone,
   layer lists refreshed for the new project, hooks alive after the dock is
@@ -374,6 +375,48 @@ def test_kp_tool_no_orphans(iface, utm):
                    ok, "(tools, items) %s, errors %s" % (counts, errors))
 
 
+def test_kp_button_follows_map_tool(iface, utm):
+    """Picking another map tool unticks the button; a tool that borrowed the
+    canvas restoring the KP tool ticks it again; clicking the button after
+    another tool gives one working KP tool."""
+    from qgis.gui import QgsMapToolPan
+    layers = _open_project(iface, utm)
+    pan = QgsMapToolPan(iface.canvas)
+    problems = []
+    with _slot_errors() as errors:
+        with _kp_wrapper(iface) as wrapper:
+            button = wrapper.toolButton
+            tool, _window = _kp_tool_on(wrapper, layers, with_window=False)
+            iface.canvas.setMapTool(pan)
+            _pump()
+            if button.isChecked() or tool.closestPointMarker.isVisible():
+                problems.append("another tool: checked=%s marker shown=%s" % (
+                    button.isChecked(), tool.closestPointMarker.isVisible()))
+            iface.canvas.setMapTool(tool)              # handed back by a borrowing tool
+            _pump()
+            if not button.isChecked() or wrapper.mapTool is not tool:
+                problems.append("restored: checked=%s same tool=%s" % (
+                    button.isChecked(), wrapper.mapTool is tool))
+            iface.canvas.setMapTool(pan)
+            button.setChecked(True)                    # the user clicks the button again
+            _pump()
+            if not button.isChecked() or wrapper.mapTool is None \
+                    or iface.canvas.mapTool() is not wrapper.mapTool or _kp_tools_on_canvas(iface) != 1:
+                problems.append("clicked again: checked=%s active=%s tools=%d" % (
+                    button.isChecked(), iface.canvas.mapTool() is wrapper.mapTool,
+                    _kp_tools_on_canvas(iface)))
+            button.setChecked(False)
+            _pump()
+            if iface.canvas.mapTool() is not None or _kp_tools_on_canvas(iface):
+                problems.append("turned off: a KP tool is left")
+    pan.deleteLater()
+    _pump()
+    if errors:
+        problems.append("errors %s" % errors)
+    return _result("KP Mouse Tool: the button follows the canvas's map tool",
+                   not problems, "; ".join(problems))
+
+
 # -- Transit Measure -------------------------------------------------------------
 def test_transit_open_and_crs(iface, utm, mercator):
     """Open disposes the active tool's dialog and drawing; a leg drawn in the
@@ -604,6 +647,7 @@ def run_all():
         for test in (lambda: test_kp_tool_off_on_new_and_open(iface, utm, mercator),
                      lambda: test_kp_tool_layer_removed(iface, utm),
                      lambda: test_kp_tool_no_orphans(iface, utm),
+                     lambda: test_kp_button_follows_map_tool(iface, utm),
                      lambda: test_transit_open_and_crs(iface, utm, mercator),
                      lambda: test_depth_profile_dock(iface, utm, mercator),
                      lambda: test_kp_plot_dock(iface, utm, mercator)):

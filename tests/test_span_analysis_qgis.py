@@ -667,6 +667,54 @@ def test_follows_project() -> List[bool]:
     return out
 
 
+def test_close_drops_the_old_routes() -> List[bool]:
+    """After a Close the old project's RPLs and fits are not listed (the Workbench is gone); the same
+    project opened again gets its RPL and fit back."""
+    workbench = object()
+    patched = {"open_workbench": lambda: workbench,
+               "rpl_choices": lambda store: [("rpl-a", "Route A"), ("rpl-b", "Route B")] if store is workbench else [],
+               "fit_choices": lambda store, rpl_id: [("fit-b", "Fit on B")] if rpl_id == "rpl-b" else [],
+               "fit_labels": lambda store, fit_id: []}
+    originals = {name: getattr(sources, name) for name in patched}
+    for name, fn in patched.items():
+        setattr(sources, name, fn)
+    project = QgsProject.instance()
+    dialog = _make_dialog()
+    out = []
+
+    def listed():
+        return ([setup.rpl_combo.itemText(i) for i in range(setup.rpl_combo.count())],
+                setup.rpl_combo.currentData(), setup.fit_combo.currentData())
+
+    try:
+        setup = dialog.setup
+        setup.rpl_model = lambda: None    # no real Workbench behind the stub
+        setup.refresh_sources()
+        setup.rpl_combo.setCurrentIndex(setup.rpl_combo.findData("rpl-b"))
+        setup.fit_combo.setCurrentIndex(setup.fit_combo.findData("fit-b"))
+        before = listed()
+        sources.open_workbench = lambda: None    # Close: no project, no Workbench
+        project.aboutToBeCleared.emit()
+        closed = listed()
+        setup.refresh_sources()                  # the window shown again with no project
+        shown = listed()
+        nothing = ([setup.rpl_combo.itemText(0)], None, None)
+        out.append(_report("Close: the old project's RPL names and fits are no longer listed",
+                           before == (["Route A", "Route B"], "rpl-b", "fit-b") and closed == nothing
+                           and shown == nothing and "Route B" not in setup.route_section.status.text(),
+                           f"{before}; {closed}; {shown}"))
+        sources.open_workbench = lambda: workbench
+        setup.refresh_sources()
+        out.append(_report("the same project opened again: its RPL and fit are chosen again",
+                           listed() == (["Route A", "Route B"], "rpl-b", "fit-b"), str(listed())))
+    finally:
+        for name, fn in originals.items():
+            setattr(sources, name, fn)
+        dialog.shutdown()
+        dialog.deleteLater()
+    return out
+
+
 def test_plot_and_layout_controls() -> List[bool]:
     """Plots menu, the A button, tooltip fields, the status bar, the view kept on Run, folds and tabs."""
     from ..cable_seabed.core import ERROR
@@ -1027,7 +1075,8 @@ def test_true_scale_stays_true() -> List[bool]:
 def run_all() -> List[bool]:
     results = (test_synthetic_run_live_detail_sweep() + test_raster_route_and_store() + test_ui_tools()
                + test_tables_and_dxf_route() + test_protection_and_find_tension() + test_kp_consistency()
-               + test_rpl_cable_mapping() + test_follows_project() + test_plot_and_layout_controls()
+               + test_rpl_cable_mapping() + test_follows_project() + test_close_drops_the_old_routes()
+               + test_plot_and_layout_controls()
                + test_live_update_keeps_the_seabed_still() + test_setup_rows_leave_no_gaps()
                + test_sections_open_full_height() + test_true_scale_stays_true()
                + test_data_resolution_in_the_window())

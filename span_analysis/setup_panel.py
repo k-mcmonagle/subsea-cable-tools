@@ -70,6 +70,7 @@ from . import dxf_io, sources
 _HORIZONTAL = getattr(getattr(Qt, "Orientation", Qt), "Horizontal")
 _OPEN, _CLOSED = "▾", "▸"
 _GROUP_ROLE = int(getattr(ITEM_DATA_USER_ROLE, "value", ITEM_DATA_USER_ROLE)) + 1   # PyQt6 roles are enums
+_NO_RPLS = "(no Workbench RPLs in this project)"
 
 CABLE_LIBRARY = "library"
 CABLE_SECTIONS = "sections"
@@ -388,6 +389,7 @@ class SetupPanel(QWidget):
         self._mapping_labels: List[str] = []
         self._rpl_cache: Dict = {}
         self._wanted: Dict[str, str] = {}   # a scenario's rasters not in the project: layer id -> source
+        self._kept_rpl = (None, None)       # (RPL id, fit id) chosen when a project last closed
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         self.route_section = Section("1  Route and KP", self._build_route(), True)
@@ -1090,16 +1092,18 @@ class SetupPanel(QWidget):
         self._loading = True
         try:
             self._workbench = sources.open_workbench()
-            current = self.rpl_combo.currentData()
+            kept_rpl, kept_fit = self._kept_rpl
+            current = self.rpl_combo.currentData() or kept_rpl
+            current_fit = self.fit_combo.currentData() or kept_fit
             self.rpl_combo.clear()
             if self._workbench is not None:
                 for rpl_id, label in sources.rpl_choices(self._workbench):
                     self.rpl_combo.addItem(label, rpl_id)
             if self.rpl_combo.count() == 0:
-                self.rpl_combo.addItem("(no Workbench RPLs in this project)", None)
+                self.rpl_combo.addItem(_NO_RPLS, None)
             index = self.rpl_combo.findData(current)
             self.rpl_combo.setCurrentIndex(max(index, 0))
-            self._refresh_fits()
+            self._refresh_fits(current_fit)
             self._library_rows = sources.library_rows()
             names = [(row.get("name"), row.get("name")) for row in self._library_rows if row.get("name")]
             current_type = self.cable_type.currentData()
@@ -1122,9 +1126,22 @@ class SetupPanel(QWidget):
             self.update_status()
 
     def forget_project(self) -> None:
-        """The project is closing: drop its Workbench (the next project's is read by refresh_sources)."""
+        """The project is closing: drop its Workbench and the RPLs and fits listed from it, which
+        cannot be used any more. The next project's are listed by refresh_sources, which keeps
+        the choice when the same RPL is there (the same project opened again)."""
         self._workbench = None
         self._rpl_cache = {}
+        self._loading = True
+        try:
+            if self.rpl_combo.currentData():
+                self._kept_rpl = (self.rpl_combo.currentData(), self.fit_combo.currentData())
+            self.rpl_combo.clear()
+            self.rpl_combo.addItem(_NO_RPLS, None)
+            self._refresh_fits()
+            self.refresh_mapping()
+        finally:
+            self._loading = False
+        self.update_status()
 
     def refresh_layers(self) -> None:
         """The project's layers changed: list its rasters again."""
@@ -1135,8 +1152,8 @@ class SetupPanel(QWidget):
         else:
             self.update_status()
 
-    def _refresh_fits(self) -> None:
-        current = self.fit_combo.currentData()
+    def _refresh_fits(self, wanted=None) -> None:
+        current = wanted or self.fit_combo.currentData()
         self.fit_combo.clear()
         rpl_id = self.rpl_combo.currentData()
         if self._workbench is not None and rpl_id:
