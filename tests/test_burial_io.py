@@ -2,7 +2,7 @@
 """Checks for Burial Planner CSV IO + change-log inversion + import scan.
 
 Pure python. The import scan asserts the ``burial`` package (and the shared
-``kp_bars`` module) only imports qgis.PyQt / qgis.core / qgis.gui, NumPy,
+``kp_bars`` module and ``plotkit`` package) only imports qgis.PyQt / qgis.core / qgis.gui, NumPy,
 vendored ``lib/`` packages, the stdlib and plugin-relative modules — the
 spec's no-new-dependencies gate.
 """
@@ -270,6 +270,7 @@ def test_import_scan() -> bool:
     offenders = []
     targets = sorted((PLUGIN_DIR / "burial").rglob("*.py"))
     targets.append(PLUGIN_DIR / "workbench" / "kp_bars.py")
+    targets += sorted((PLUGIN_DIR / "plotkit").rglob("*.py"))
     for path in targets:
         tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path))
         for node in ast.walk(tree):

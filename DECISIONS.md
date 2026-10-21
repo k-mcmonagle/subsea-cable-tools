@@ -1061,3 +1061,15 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   already use a tool open as before. Route Comments never reuses a register
   unasked: *New register* suggests a free name and asks before opening an
   existing register (one is never overwritten).
+
+## Shared KP profile pieces (October 2026)
+
+- **`plotkit/` holds what KP profiles share.** Span & Slack's pieces that draw
+  correctly under QGIS 3 with display scaling (axes that paint directly,
+  filled stretches as single paths, a full-viewport repaint on Qt5, menus
+  that stay open while boxes are ticked) moved there unchanged, and Span &
+  Slack imports them. `KpRowStack` adds the common shape: a status bar, rows
+  on one KP axis in a splitter, crosshair, tooltip, Plots menu, fit and
+  reverse KP, with items built once and updated (removing pyqtgraph items is
+  slow and noisy under QGIS 3.40). New profiles build on it; moving the
+  existing ones is separate work.

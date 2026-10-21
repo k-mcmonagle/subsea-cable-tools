@@ -102,8 +102,6 @@ from .tabs.review_tab import ReviewTab
 from .tabs.risk_tab import RiskTab
 from .tabs.rules_tab import RulesTab
 from .tabs.tools_tab import ToolsTab
-from .operations_controller import OperationsController
-from .tabs.operations_tabs import AcquiredDataTab, AssessmentTab, ReportingTab
 
 _VERTICAL = getattr(Qt, "Orientation", Qt).Vertical
 
@@ -261,18 +259,12 @@ class BurialPlannerDock(QDockWidget):
             self.inputs_tab: "Inputs",
             self.profile_tab: "Bathymetry Profile",
         }
-        self.operations = OperationsController(self.model, self)
         self.workflow_tabs = QTabWidget()
         self.workflow_tabs.addTab(self.tabs, "Planning")
-        self.acquired_tab = AcquiredDataTab(self.operations, self)
-        self.assessment_tab = AssessmentTab(self.operations, self, self)
-        self.reporting_tab = ReportingTab(self.operations, self)
-        self.workflow_tabs.addTab(self.acquired_tab, "Acquired Data")
-        self.workflow_tabs.addTab(self.assessment_tab, "Assessment")
-        self.workflow_tabs.addTab(self.reporting_tab, "Reporting")
-        # These workflows remain under development; Planning stays available.
-        for tab in (self.acquired_tab, self.assessment_tab, self.reporting_tab):
-            index = self.workflow_tabs.indexOf(tab)
+        # Acquired data, its assessment and reporting are being built
+        # (burial/acquired/); their tabs stay disabled placeholders until then.
+        for title in ("Acquired Data", "Assessment", "Reporting"):
+            index = self.workflow_tabs.addTab(QWidget(), title)
             self.workflow_tabs.setTabEnabled(index, False)
             self.workflow_tabs.setTabToolTip(index, "Under development")
         self.splitter.addWidget(self.workflow_tabs)
@@ -2726,8 +2718,6 @@ class BurialPlannerDock(QDockWidget):
     def _stop_background_work(self, reason: str) -> None:
         """Cancel and forget every background run (window closed, project
         closed, unload); their late callbacks are ignored."""
-        if hasattr(self, "operations"):
-            self.operations.cancel()
         self._discard_analysis(
             f"Stopped {reason} — completed rules stay cached; run again to "
             "resume.")

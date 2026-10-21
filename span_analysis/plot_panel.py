@@ -36,12 +36,11 @@ import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtGui as _QtGui   # QActionGroup: QtWidgets in Qt 5, QtGui in Qt 6
 
-from qgis.PyQt.QtCore import QT_VERSION_STR, QEvent, QRectF, QSettings, Qt, QTimer, pyqtSignal
+from qgis.PyQt.QtCore import QEvent, QRectF, QSettings, Qt, QTimer, pyqtSignal
 from qgis.PyQt.QtGui import QPainterPath
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
     QGraphicsPathItem,
-    QGraphicsView,
     QHBoxLayout,
     QLabel,
     QMenu,
@@ -56,7 +55,9 @@ from ..cable_seabed import planning as pl
 from ..cable_seabed.core import ERROR, INFO, WARNING, runs
 from ..maptools.profile_measure_controller import ProfileMeasureController
 from ..plugin_log import log_exception
-from ..qgis_compat import TOOLBUTTON_POPUP_MODE_INSTANT
+from ..plotkit.widgets import (DirectAxis, ProfileViewBox, StayOpenMenu, WrapLabel,  # noqa: F401
+                               hex_colour as _hex, legend_html as _legend_html,
+                               make_plot_widget as _plot_widget, menu_button, runs_path)
 from . import cable_colour as cc
 from . import events as ev
 from .event_lane import LABEL_NAME, LABEL_NAME_KP, EventGuideItem, EventLaneItem, EventLayer, EventLeaderItem
@@ -68,7 +69,6 @@ _POINTING = getattr(getattr(Qt, "CursorShape", Qt), "PointingHandCursor")
 _NO_MOUSE = getattr(getattr(Qt, "WidgetAttribute", Qt), "WA_TransparentForMouseEvents")
 _RICH = getattr(getattr(Qt, "TextFormat", Qt), "RichText")
 _RIGHT_BUTTON = getattr(getattr(Qt, "MouseButton", Qt), "RightButton")
-_FULL_UPDATE = getattr(getattr(QGraphicsView, "ViewportUpdateMode", QGraphicsView), "FullViewportUpdate")
 _SETTINGS = "SubseaCableTools/SpanAnalysis/plot"
 STATUS_HEIGHT = 14
 _DEFAULT_SIZES = (STATUS_HEIGHT, 440, 150, 150, 150)
@@ -108,36 +108,6 @@ _LEAVE = getattr(getattr(QEvent, "Type", QEvent), "Leave")
 TRUE_SCALE_RATIO = 1000.0   # KP in km, depth in m
 
 
-def runs_path(kp: np.ndarray, top: np.ndarray, bottom: np.ndarray, extents: Sequence[Tuple[int, int]]) -> QPainterPath:
-    """One path with a closed polygon per ``(i0, i1)`` run (cable above, seabed below)."""
-    xs, ys, connect = [], [], []
-    for i0, i1 in extents:
-        sl = slice(i0, i1 + 1)
-        k, t, b = kp[sl], top[sl], bottom[sl]
-        ok = np.isfinite(k) & np.isfinite(t) & np.isfinite(b)
-        if ok.sum() < 2:
-            continue
-        k, t, b = k[ok], t[ok], b[ok]
-        xs.append(np.concatenate((k, k[::-1])))
-        ys.append(np.concatenate((t, b[::-1])))
-        link = np.ones(2 * len(k), dtype=bool)
-        link[-1] = False
-        connect.append(link)
-    if not xs:
-        return QPainterPath()
-    return pg.arrayToQPath(np.concatenate(xs), np.concatenate(ys), connect=np.concatenate(connect))
-
-
-_GLYPH = {"solid": "\u2501\u2501", "dash": "\u254d\u254d", "dot": "\u2508\u2508", "fill": "\u25a0",
-          "triangle": "\u25b2", "diamond": "\u25c6"}
-
-
-def _hex(colour) -> str:
-    if isinstance(colour, str):
-        return colour
-    return "#%02x%02x%02x" % tuple(int(c) for c in colour[:3])
-
-
 _LEGENDS = {
     "depth": [("dash", SEA, "Sea level"), ("solid", (200, 175, 165), "Seabed (sampled)"), ("solid", SEABED, "Seabed"),
               ("solid", CABLE, "Cable (rest shape)"), ("fill", PROTECTION, "Protection"),
@@ -169,115 +139,6 @@ _SLACK_LEGENDS = {
                   ("fill", SHORT_FILL, "Short of the seabed (bridging)"), ("dash", LOOP_LINE, "Loop-risk threshold"),
                   ("dot", (233, 30, 99), "RPL slack (plan)")],
 }
-
-
-def _legend_html(entries) -> str:
-    parts = []
-    for kind, colour, text in entries:
-        glyph = _GLYPH[kind]
-        parts.append(f"<span style='color:{_hex(colour)}; font-weight:bold'>{glyph}</span>&nbsp;{text}")
-    return "&nbsp;&nbsp;&nbsp;".join(parts)
-
-
-class DirectAxis(pg.AxisItem):
-    """An axis that paints straight to the screen.
-
-    pyqtgraph records an axis (ticks, labels, grid lines) in a QPicture and
-    replays it. Under Qt5 (QGIS 3) with display scaling a QPicture records at
-    the screen's logical DPI (e.g. 144 at 150 %) while the plot paints at 96, so
-    the replay shrank the axis and its grid to two thirds of the plot.
-    """
-
-    def paint(self, p, opt, widget):
-        p.save()
-        try:
-            if self.style["tickFont"]:
-                p.setFont(self.style["tickFont"])
-            specs = self.generateDrawSpecs(p)
-            if specs is not None:
-                self.drawPicture(p, *specs)
-        finally:
-            p.restore()
-
-
-class WrapLabel(QLabel):
-    """A word-wrapped label that keeps the height its wrapped text needs.
-
-    Layouts give a wrapping label one line's height as its minimum, so in a
-    smaller window a legend wrapped to two lines pushed its plot down and the
-    row cut the bottom of the plot off (the profile ran out of view).
-    """
-
-    def __init__(self, text: str = "", parent=None):
-        super().__init__(text, parent)
-        self.setWordWrap(True)
-
-    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt API)
-        super().resizeEvent(event)
-        need = self.heightForWidth(self.width())
-        if need > 0 and need != self.minimumHeight():
-            self.setMinimumHeight(need)
-
-
-class ProfileViewBox(pg.ViewBox):
-    """A view box that says when a right-button drag starts.
-
-    A right-button drag (in the plot or on an axis) stretches the axes
-    independently; the profile uses it to leave true scale.
-    """
-
-    stretchStarted = pyqtSignal()
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # ``extra_menu(kp, scene_pos)`` -> [(text, slot or None, enabled)]: actions put at the top of the
-        # right-click menu (None: a separator).
-        self.extra_menu = None
-        self._extra_actions = []
-
-    def mouseDragEvent(self, ev, axis=None):  # noqa: N802 (Qt API)
-        if ev.isStart() and ev.button() == _RIGHT_BUTTON:
-            self.stretchStarted.emit()
-        super().mouseDragEvent(ev, axis)
-
-    def raiseContextMenu(self, ev):  # noqa: N802 (pyqtgraph API)
-        menu = self.menu
-        for action in self._extra_actions:
-            menu.removeAction(action)
-        self._extra_actions = []
-        if self.extra_menu is not None and menu is not None:
-            try:
-                kp = float(self.mapSceneToView(ev.scenePos()).x())
-                items = self.extra_menu(kp, ev.scenePos())
-            except Exception:
-                log_exception("Span & Slack Analysis: building the profile menu failed")
-                items = []
-            first = menu.actions()[0] if menu.actions() else None
-            for text, slot, enabled in items + ([(None, None, True)] if items else []):
-                if text is None:
-                    action = menu.addSeparator()
-                else:
-                    action = menu.addAction(text)
-                    action.setEnabled(bool(enabled))
-                    if slot is not None:
-                        action.triggered.connect(lambda _checked=False, s=slot: s())
-                if first is not None:
-                    menu.insertAction(first, action)   # moves it to the top
-                self._extra_actions.append(action)
-        super().raiseContextMenu(ev)
-
-
-def _plot_widget() -> "pg.PlotWidget":
-    widget = pg.PlotWidget(viewBox=ProfileViewBox(),
-                           axisItems={"left": DirectAxis("left"), "bottom": DirectAxis("bottom")})
-    if not QT_VERSION_STR.startswith("5."):
-        return widget
-    # Under Qt5 with fractional display scaling (e.g. 150 %), repainting only the
-    # changed strip rounds to whole device pixels and can miss the edge of a moved
-    # or hidden line: the hover crosshair left trails until the next pan. Repaint
-    # the whole view instead (as panning does).
-    widget.setViewportUpdateMode(_FULL_UPDATE)
-    return widget
 
 
 def _tip(x, y, data):
@@ -332,33 +193,6 @@ def _setting_text(key: str, default: str) -> str:
         return str(QSettings().value(f"{_SETTINGS}/{key}", default, type=str))
     except Exception:
         return default
-
-
-class StayOpenMenu(QMenu):
-    """A menu that stays open while its check boxes are ticked (several in a row)."""
-
-    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 (Qt API)
-        action = self.activeAction()
-        if action is not None and action.isEnabled() and action.isCheckable():
-            action.trigger()
-            return
-        super().mouseReleaseEvent(event)
-
-
-def menu_button(text: str, tip: str, menu: QMenu) -> QToolButton:
-    """A button that opens ``menu`` on a click."""
-    button = QToolButton()
-    if QT_VERSION_STR.startswith("5."):
-        # Qt5's Windows style draws the menu arrow over the end of the text
-        # ("Plots" read as "Plots,"): put a text arrow after it instead.
-        button.setStyleSheet("QToolButton::menu-indicator { image: none; width: 0px; }")
-        text += " ▾"
-    button.setText(text)
-    if tip:
-        button.setToolTip(tip)
-    button.setPopupMode(TOOLBUTTON_POPUP_MODE_INSTANT)
-    button.setMenu(menu)
-    return button
 
 
 class ProfilePlot(QWidget):
