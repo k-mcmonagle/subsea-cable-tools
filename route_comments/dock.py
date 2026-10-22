@@ -1,25 +1,34 @@
 # -*- coding: utf-8 -*-
-"""The Route Comments dock: comment set, editable table, details and thread.
+"""The Route Comments dock: comment set, editable table, and the selected
+comment's thread (or details) beside its images.
+
+Layout: the table runs full width on top; below it a header strip (number,
+location, quick status and priority, previous / next, follow on the map)
+and the review panes, side by side when the dock is wide and stacked when
+it is narrow, the image pane shrinking when the comment has no image.
 
 Storage (``store``), route references (``route_ref``), the map display
-(``map_layers``) and the table/thread widgets (``widgets``) live elsewhere;
-this module wires them together.
+(``map_layers``), the table/thread widgets (``widgets``) and the image
+panel (``pictures``) live elsewhere; this module wires them together.
 """
 
 from __future__ import annotations
 
 import datetime as _dt
 import hashlib
+import json
 import os
 from typing import Callable, Dict, List, Optional
 
-from qgis.core import QgsApplication, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject
-from qgis.PyQt.QtCore import QItemSelection, QItemSelectionModel, QSettings, QSize, Qt, QTimer, QUrl
-from qgis.PyQt.QtGui import QDesktopServices, QIcon, QKeySequence, QPixmap
+from qgis.core import (QgsApplication, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsGeometry,
+                       QgsProject, QgsRectangle)
+from qgis.PyQt.QtCore import (QBuffer, QByteArray, QIODevice, QItemSelection, QItemSelectionModel, QSettings, Qt,
+                              QTimer, QUrl)
+from qgis.PyQt.QtGui import QDesktopServices, QIcon, QImage, QKeySequence
 from qgis.PyQt.QtWidgets import (QAbstractItemView, QApplication, QColorDialog, QComboBox, QDockWidget,
-                                 QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListView,
-                                 QListWidget, QListWidgetItem, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
-                                 QScrollArea, QSplitter, QTableView, QTabWidget, QToolButton, QVBoxLayout, QWidget)
+                                 QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMenu,
+                                 QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSplitter,
+                                 QTableView, QTabWidget, QToolButton, QVBoxLayout, QWidget)
 
 try:
     from qgis.PyQt.QtGui import QShortcut
@@ -34,15 +43,20 @@ from ..qgis_compat import (CONTEXT_MENU_POLICY_CUSTOM, MESSAGEBOX_NO, MESSAGEBOX
 from . import map_layers, model
 from .dialogs import (SETTINGS, ChoicesDialog, CommentForm, ExportDialog, FieldsDialog, ImportDialog, LabelDialog,
                       NewCommentDialog, default_author, remember_author)
+from .pictures import MAX_PIXELS, PicturePanel, ThumbnailCache, image_size, pictures_from_mime
 from .route_ref import CaptureRoute, ReferenceChecker, location_without_route
 from .store import CommentStore, CommentStoreError, ConflictError, attachments_dir_for, is_register
-from .widgets import (COND_COLORS, EDITABLE, ID_ROLE, CommentDelegate, CommentProxy, CommentTableModel, ThreadView,
-                      readable_selection)
+from .widgets import (COND_COLORS, EDITABLE, ID_ROLE, AdaptiveSplitter, CommentDelegate, CommentProxy,
+                      CommentTableModel, ThreadView, readable_selection)
 
 MAX_RECENT = 8
 POLL_MS = 4000
 FLOATING_KEY = f"{SETTINGS}/floating"
 GEOMETRY_KEY = f"{SETTINGS}/window_geometry"
+SPLIT_KEY = f"{SETTINGS}/split_table"           # table / review heights
+REVIEW_SPLIT_KEY = f"{SETTINGS}/split_review"   # thread / images, side by side and stacked
+FOLLOW_KEY = f"{SETTINGS}/follow_map"
+WRITE_ONLY = getattr(getattr(QIODevice, "OpenModeFlag", QIODevice), "WriteOnly")
 
 
 def _theme_icon(name: str) -> QIcon:
@@ -96,7 +110,9 @@ class RouteCommentsDock(QDockWidget):
         self._syncing = False
         self._connected_layers: List = []
         self._header_key = ""
-        self._thumbs: Dict[str, QIcon] = {}
+        self._from_map = False
+        self._thread_saving = False
+        self.thumb_cache = ThumbnailCache()
         self._build_ui()
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(POLL_MS)
@@ -248,43 +264,129 @@ class RouteCommentsDock(QDockWidget):
         self.table.setToolTip("Double-click a comment, status, priority, author, date, tags or custom field to "
                               "edit it in place; double-click a number or KP to zoom to it.")
         self.splitter.addWidget(self.table)
-        self.splitter.addWidget(self._build_editor())
-        self.splitter.setStretchFactor(0, 3)
-        self.splitter.setStretchFactor(1, 2)
+        self.splitter.addWidget(self._build_review())
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setStretchFactor(0, 2)
+        self.splitter.setStretchFactor(1, 3)
         outer.addWidget(self.splitter, 1)
 
         self.status = QLabel()
         self.status.setStyleSheet("color: palette(mid);")
         outer.addWidget(self.status)
         self.setWidget(body)
+        for keys, slot in (("Alt+Up", lambda: self.step(-1)), ("Alt+Down", lambda: self.step(1)),
+                           (QKeySequence.StandardKey.Paste, self.paste_image)):
+            # Text boxes keep Ctrl+V for text: they take the key before a shortcut.
+            QShortcut(QKeySequence(keys), body, activated=slot, context=Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._restore_splits()
         self._rebuild_filter_menu()
         self._update_enabled()
 
-    def _build_editor(self) -> QWidget:
+    def _build_review(self) -> QWidget:
+        """The selected comment: a header strip, then its thread (or details)
+        beside its images."""
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 2, 0, 0)
         layout.setSpacing(3)
+
+        head = QHBoxLayout()
+        head.setSpacing(3)
         self.editor_title = QLabel()
-        self.editor_title.setWordWrap(True)
+        self.editor_title.setTextFormat(Qt.TextFormat.RichText)
+        self.editor_title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.editor_title.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.editor_title)
+        head.addWidget(self.editor_title, 1)
+        self.quick_status = QComboBox()
+        self.quick_status.setToolTip("Status (saved at once)")
+        self.quick_status.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.quick_status.activated.connect(lambda _i: self._quick_set("status"))
+        self.quick_priority = QComboBox()
+        self.quick_priority.setToolTip("Priority (saved at once)")
+        self.quick_priority.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.quick_priority.activated.connect(lambda _i: self._quick_set("priority"))
+        head.addWidget(self.quick_status)
+        head.addWidget(self.quick_priority)
+        self.prev_button = QToolButton()
+        self.prev_button.setArrowType(Qt.ArrowType.UpArrow)
+        self.prev_button.setAutoRaise(True)
+        self.prev_button.setToolTip("Previous comment in the table (Alt+Up)")
+        self.prev_button.clicked.connect(lambda: self.step(-1))
+        self.next_button = QToolButton()
+        self.next_button.setArrowType(Qt.ArrowType.DownArrow)
+        self.next_button.setAutoRaise(True)
+        self.next_button.setToolTip("Next comment in the table (Alt+Down)")
+        self.next_button.clicked.connect(lambda: self.step(1))
+        self.follow_button = QToolButton()
+        self.follow_button.setIcon(_theme_icon("/mActionPanToSelected.svg"))
+        self.follow_button.setAutoRaise(True)
+        self.follow_button.setCheckable(True)
+        self.follow_button.setChecked(QSettings().value(FOLLOW_KEY, False, type=bool))
+        self.follow_button.setToolTip("Follow on the map: pan to each comment you select here, when it is "
+                                      "out of view")
+        self.follow_button.toggled.connect(lambda on: QSettings().setValue(FOLLOW_KEY, bool(on)))
+        for button in (self.prev_button, self.next_button, self.follow_button):
+            head.addWidget(button)
+        layout.addLayout(head)
         self.condition_label = QLabel()
         self.condition_label.setWordWrap(True)
         self.condition_label.hide()
         layout.addWidget(self.condition_label)
+
+        self.review_split = AdaptiveSplitter()
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
-        layout.addWidget(self.tabs, 1)
+        self.review_split.addWidget(self.tabs)
+        self.pictures = PicturePanel(self.thumb_cache)
+        self.pictures.add_requested.connect(self.add_images)
+        self.pictures.paste_requested.connect(self.paste_image)
+        self.pictures.files_dropped.connect(self.add_image_files)
+        self.pictures.image_dropped.connect(self.add_image_data)
+        self.pictures.remove_requested.connect(self.remove_image)
+        self.pictures.map_image_changed.connect(self.set_map_image)
+        self.pictures.open_requested.connect(self._open_file)
+        self.review_split.addWidget(self.pictures)
+        layout.addWidget(self.review_split, 1)
 
-        # Details
+        # Thread: the comment and its replies, and the reply box.
+        thread = QWidget()
+        thread_layout = QVBoxLayout(thread)
+        thread_layout.setContentsMargins(2, 4, 2, 2)
+        self.thread = ThreadView()
+        self.thread.delete_requested.connect(self.delete_reply)
+        self.thread.reply_edited.connect(self._save_thread_edit)
+        self.thread.comment_edited.connect(lambda text: self._save_thread_edit(None, text))
+        self.thread.comment_delete_requested.connect(self.delete_selected)
+        thread_layout.addWidget(self.thread, 1)
+        composer = QHBoxLayout()
+        self.reply_text = QPlainTextEdit()
+        self.reply_text.setPlaceholderText("Write a reply… (Ctrl+Enter sends)")
+        self.reply_text.setTabChangesFocus(True)
+        self.reply_text.setMaximumHeight(self.reply_text.fontMetrics().lineSpacing() * 3 + 14)
+        for keys in ("Ctrl+Return", "Ctrl+Enter"):
+            QShortcut(QKeySequence(keys), self.reply_text, activated=self.add_reply,
+                      context=Qt.ShortcutContext.WidgetShortcut)
+        self.reply_button = QPushButton("Send")
+        self.reply_button.clicked.connect(lambda: self.add_reply())
+        self.close_button = QPushButton("Send && close")
+        self.close_button.clicked.connect(self.send_and_toggle)
+        send = QVBoxLayout()
+        send.setSpacing(2)
+        send.addWidget(self.reply_button)
+        send.addWidget(self.close_button)
+        composer.addWidget(self.reply_text, 1)
+        composer.addLayout(send)
+        thread_layout.addLayout(composer)
+        self.tabs.addTab(thread, "Thread")
+
+        # Details: every field of the comment (status and priority are in the header).
         details = QScrollArea()
         details.setWidgetResizable(True)
         details.setFrameShape(QFrame.Shape.NoFrame)
         inner = QWidget()
         form_layout = QVBoxLayout(inner)
         form_layout.setContentsMargins(2, 4, 2, 0)
-        self.form = CommentForm(inner, text_lines=3)
+        self.form = CommentForm(inner, text_lines=3, show_state=False)
         self.form.changed.connect(self._on_form_changed)
         form_layout.addWidget(self.form)
         buttons = QHBoxLayout()
@@ -310,53 +412,30 @@ class RouteCommentsDock(QDockWidget):
         form_layout.addStretch(1)
         details.setWidget(inner)
         self.tabs.addTab(details, "Details")
-
-        # Thread
-        thread = QWidget()
-        thread_layout = QVBoxLayout(thread)
-        thread_layout.setContentsMargins(2, 4, 2, 2)
-        self.thread = ThreadView()
-        self.thread.delete_requested.connect(self.delete_reply)
-        thread_layout.addWidget(self.thread, 1)
-        composer = QHBoxLayout()
-        self.reply_text = QPlainTextEdit()
-        self.reply_text.setPlaceholderText("Write a reply… (Ctrl+Enter sends)")
-        self.reply_text.setTabChangesFocus(True)
-        self.reply_text.setMaximumHeight(self.reply_text.fontMetrics().lineSpacing() * 3 + 14)
-        for keys in ("Ctrl+Return", "Ctrl+Enter"):
-            QShortcut(QKeySequence(keys), self.reply_text, activated=self.add_reply,
-                      context=Qt.ShortcutContext.WidgetShortcut)
-        self.reply_button = QPushButton("Send")
-        self.reply_button.clicked.connect(self.add_reply)
-        composer.addWidget(self.reply_text, 1)
-        composer.addWidget(self.reply_button, 0, Qt.AlignmentFlag.AlignBottom)
-        thread_layout.addLayout(composer)
-        self.tabs.addTab(thread, "Thread")
-
-        # Images
-        images = QWidget()
-        images_layout = QVBoxLayout(images)
-        images_layout.setContentsMargins(2, 4, 2, 2)
-        self.images = QListWidget()
-        self.images.setViewMode(QListView.ViewMode.IconMode)
-        self.images.setIconSize(QSize(96, 96))
-        self.images.setResizeMode(QListView.ResizeMode.Adjust)
-        self.images.setMovement(QListView.Movement.Static)
-        self.images.setSpacing(4)
-        self.images.itemDoubleClicked.connect(self._open_image)
-        images_layout.addWidget(self.images, 1)
-        image_buttons = QHBoxLayout()
-        self.add_image_button = QPushButton("Add images…")
-        self.add_image_button.clicked.connect(self.add_images)
-        self.remove_image_button = QPushButton("Remove")
-        self.remove_image_button.clicked.connect(self.remove_image)
-        image_buttons.addWidget(self.add_image_button)
-        image_buttons.addWidget(self.remove_image_button)
-        image_buttons.addStretch(1)
-        images_layout.addLayout(image_buttons)
-        self.tabs.addTab(images, "Images")
         self.editor_panel = panel
         return panel
+
+    def _restore_splits(self) -> None:
+        sizes = QSettings().value(SPLIT_KEY)
+        try:
+            sizes = [int(v) for v in (sizes or [])]
+        except (TypeError, ValueError):
+            sizes = []
+        if len(sizes) == 2 and all(v > 0 for v in sizes):
+            self.splitter.setSizes(sizes)
+        else:
+            self.splitter.setSizes([240, 480])
+        try:
+            state = json.loads(str(QSettings().value(REVIEW_SPLIT_KEY, "") or "{}"))
+        except ValueError:
+            state = {}
+        self.review_split.restore(state)
+
+    def _save_splits(self) -> None:
+        sizes = self.splitter.sizes()
+        if len(sizes) == 2 and all(v > 0 for v in sizes):
+            QSettings().setValue(SPLIT_KEY, sizes)
+        QSettings().setValue(REVIEW_SPLIT_KEY, json.dumps(self.review_split.state()))
 
     # ------------------------------------------------------------------ window
     def apply_saved_window_mode(self) -> None:
@@ -383,6 +462,7 @@ class RouteCommentsDock(QDockWidget):
     def _save_window_state(self) -> None:
         if self.isFloating():
             QSettings().setValue(GEOMETRY_KEY, self.saveGeometry())
+        self._save_splits()
 
     # ------------------------------------------------------------------ register
     def _message(self, text: str, level=MESSAGE_INFO, duration: int = 4) -> None:
@@ -500,12 +580,14 @@ class RouteCommentsDock(QDockWidget):
         if self.store is not None:
             self.store.close()
         self.store = None
+        self.thumb_cache.clear()
         map_layers.set_project_register("", "")
         self._reload_sets()
 
     def _use_store(self, store: CommentStore, set_id: str = "") -> None:
         if self.store is not None and os.path.normcase(self.store.path) != os.path.normcase(store.path):
             self.store.close()
+            self.thumb_cache.clear()
         self.store = store
         self._remember(store.path)
         self.checker.clear()
@@ -518,6 +600,7 @@ class RouteCommentsDock(QDockWidget):
         self.current_id = None
         self._dirty = False
         self.checker.clear()
+        self.thumb_cache.clear()
         if path and is_register(path):
             try:
                 self._use_store(CommentStore(path).open(), set_id)
@@ -887,6 +970,8 @@ class RouteCommentsDock(QDockWidget):
             self.highlight.show([self.by_id[c].get("wkt") for c in ids[:200] if c in self.by_id])
         if new_current != self.current_id or new_current is None:
             self._show_comment(new_current)
+            if new_current is not None and not self._from_map and self.follow_button.isChecked():
+                self._follow(new_current)
         self._update_enabled()
         self._update_status()
 
@@ -898,7 +983,11 @@ class RouteCommentsDock(QDockWidget):
         if hidden:
             self._show_banner(f"{len(hidden)} selected comment(s) are hidden by the search or filters. "
                               "<a href='clear'>Clear filters</a>")
-        self._select_ids(ids)
+        self._from_map = True
+        try:
+            self._select_ids(ids)
+        finally:
+            self._from_map = False
 
     def _hidden(self, ids: List[str]) -> List[str]:
         """Those of ``ids`` in the set but filtered out of the table."""
@@ -986,7 +1075,6 @@ class RouteCommentsDock(QDockWidget):
         ids = self.selected_ids()
         if not ids or self.iface is None:
             return
-        from qgis.core import QgsGeometry, QgsRectangle
         rect = None
         for cid in ids:
             geom = QgsGeometry.fromWkt(self.by_id.get(cid, {}).get("wkt") or "")
@@ -1000,11 +1088,8 @@ class RouteCommentsDock(QDockWidget):
         if rect is None:
             return
         canvas = self.iface.mapCanvas()
-        xform = QgsCoordinateTransform(QgsCoordinateReferenceSystem("EPSG:4326"),
-                                       canvas.mapSettings().destinationCrs(), QgsProject.instance())
-        try:
-            box = xform.transformBoundingBox(rect)
-        except Exception:  # noqa: BLE001 - outside the map CRS
+        box = self._canvas_box(rect)
+        if box is None:
             return
         if box.width() <= 0 and box.height() <= 0:
             canvas.setCenter(box.center())
@@ -1012,6 +1097,54 @@ class RouteCommentsDock(QDockWidget):
             box.scale(1.4)
             canvas.setExtent(box)
         canvas.refresh()
+
+    def _canvas_box(self, rect: QgsRectangle) -> Optional[QgsRectangle]:
+        """``rect`` (EPSG:4326) in the map canvas CRS, or None."""
+        xform = QgsCoordinateTransform(QgsCoordinateReferenceSystem("EPSG:4326"),
+                                       self.iface.mapCanvas().mapSettings().destinationCrs(), QgsProject.instance())
+        try:
+            return xform.transformBoundingBox(rect)
+        except Exception:  # noqa: BLE001 - outside the map CRS
+            return None
+
+    def _follow(self, cid: str) -> None:
+        """Bring the comment into view when it is out of (or at the edge of) the map."""
+        if self.iface is None:
+            return
+        geom = QgsGeometry.fromWkt(self.by_id.get(cid, {}).get("wkt") or "")
+        if geom is None or geom.isNull():
+            return
+        box = self._canvas_box(geom.boundingBox())
+        if box is None:
+            return
+        canvas = self.iface.mapCanvas()
+        inner = QgsRectangle(canvas.extent())
+        inner.scale(0.8)
+        if inner.contains(box):
+            return
+        if box.width() > inner.width() or box.height() > inner.height():
+            box.scale(1.4)
+            canvas.setExtent(box)
+        else:
+            canvas.setCenter(box.center())
+        canvas.refresh()
+
+    def _current_row(self) -> int:
+        """The table row (as sorted and filtered) of the comment shown, or -1."""
+        if self.current_id is None or self.table.selectionModel() is None:
+            return -1
+        index = self.table.selectionModel().currentIndex()
+        return index.row() if index.isValid() and self.proxy.data(index, ID_ROLE) == self.current_id else -1
+
+    def step(self, delta: int) -> None:
+        """Select the previous / next comment in the table's order."""
+        count = self.proxy.rowCount()
+        if not count:
+            return
+        here = self._current_row()
+        row = here + delta if here >= 0 else (0 if delta > 0 else count - 1)
+        if 0 <= row < count:
+            self._select_ids([self.proxy.data(self.proxy.index(row, 0), ID_ROLE)])
 
     # ------------------------------------------------------------------ filters
     def _rebuild_filter_menu(self) -> None:
@@ -1098,7 +1231,19 @@ class RouteCommentsDock(QDockWidget):
             self._update_enabled()
 
     def _confirm_leave(self) -> bool:
-        """Save or discard unsaved edits before moving on (True: carry on)."""
+        """Save or discard unsaved edits (Details, or a message being edited
+        in the thread) before moving on (True: carry on)."""
+        pending = None if self._thread_saving else self.thread.pending_edit()
+        if pending is not None and self.current_id is not None:
+            what = "comment" if pending[0] is None else "reply"
+            answer = QMessageBox.question(self, "Route Comments", f"Save your edit to the {what}?",
+                                          QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard,
+                                          QMessageBox.StandardButton.Save)
+            if answer == QMessageBox.StandardButton.Save and not self._save_thread_edit(*pending):
+                return False
+            self.thread.cancel_edit()
+        elif self.thread.is_editing() and not self._thread_saving:
+            self.thread.cancel_edit()
         if not self._dirty or self.current_id is None:
             return True
         label = model.ref_label(self.by_id.get(self.current_id, {}).get("ref_no"))
@@ -1110,11 +1255,11 @@ class RouteCommentsDock(QDockWidget):
         self._dirty = False
         return True
 
-    def _show_comment(self, cid: Optional[str]) -> None:
+    def _show_comment(self, cid: Optional[str], keep_image: str = "") -> None:
+        same = cid is not None and cid == self.current_id
         self.current_id = cid
         self._dirty = False
         comment = self.by_id.get(cid) if cid else None
-        self.images.clear()
         if comment is None:
             n = len(self.selected_ids())
             self.editor_title.setText(f"{n} comments selected — right-click the table to set their status or "
@@ -1122,19 +1267,22 @@ class RouteCommentsDock(QDockWidget):
                                       "Select a comment, or add one from the KP Mouse Tool's right-click menu "
                                       "(Add Comment).")
             self.condition_label.hide()
+            self._set_quick(None)
             self.form.load({})
             self.form.setEnabled(False)
             self.thread.set_thread(None, [], "")
             self.info.setText("")
-            self.tabs.setTabText(1, "Thread")
-            self.tabs.setTabText(2, "Images")
+            self.tabs.setTabText(0, "Thread")
+            self.pictures.set_pictures([], False)
+            self.review_split.set_compact(True)
             self._loaded_version = None
             self._update_enabled()
             return
         self.form.setEnabled(True)
-        self.editor_title.setText(f"<b>{model.ref_label(comment.get('ref_no'))}</b> · "
-                                  f"{model.REF_LABELS.get(comment.get('ref_kind'), '')} · "
-                                  f"{model.location_text(comment)}")
+        title = (f"<b>{model.ref_label(comment.get('ref_no'))}</b> · "
+                 f"{model.REF_LABELS.get(comment.get('ref_kind'), '')} · {model.location_text(comment)}")
+        self.editor_title.setText(title)
+        self.editor_title.setToolTip(model.location_text(comment))
         code, notes = self.table_model.conditions.get(cid) or (model.COND_NONE, [])
         if code in (model.COND_CHANGED, model.COND_UNAVAILABLE, model.COND_SUPERSEDED):
             self.condition_label.setText(f"<span style='color:{COND_COLORS[code]}'><b>{model.COND_LABELS[code]}."
@@ -1142,41 +1290,58 @@ class RouteCommentsDock(QDockWidget):
             self.condition_label.show()
         else:
             self.condition_label.hide()
+        self._set_quick(comment)
         self.form.load(comment)
         self._loaded_version = comment.get("version")
         replies = self.replies.get(cid, [])
         self.thread.set_thread(comment, replies, default_author())
-        self.tabs.setTabText(1, f"Thread ({len(replies)})" if replies else "Thread")
+        self.tabs.setTabText(0, f"Thread ({len(replies)})" if replies else "Thread")
+        closed = str(comment.get("status") or "").casefold() in self.table_model.closed
+        target = model.first_status(CommentStore.statuses_of(self.set_row), closed=not closed)
+        self.close_button.setText("Send && reopen" if closed else "Send && close")
+        self.close_button.setToolTip(f"Send the reply (if any) and set the status to {target}" if target else
+                                     "The set has no status to change to (Set ▸ Statuses and priorities)")
+        self.close_button.setProperty("target_status", target)
         try:
             attachments = self.store.list_attachments(cid)
         except CommentStoreError as exc:
             self._error("Images", exc)
             attachments = []
-        for row in attachments:
-            path = self.store.attachment_path(row)
-            item = QListWidgetItem(self._thumb(path), row.get("original_name") or "")
-            item.setData(ID_ROLE, row.get("attachment_id"))
-            item.setData(ID_ROLE + 2, path)
-            item.setToolTip(f"{row.get('original_name')}\n{path}" + ("" if os.path.isfile(path)
-                                                                      else "\n(file missing)"))
-            self.images.addItem(item)
-        self.tabs.setTabText(2, f"Images ({len(attachments)})" if attachments else "Images")
+        shown = str(comment.get("map_image") or "")
+        items = [{"attachment_id": row.get("attachment_id"), "path": self.store.attachment_path(row),
+                  "name": row.get("original_name") or "", "on_map": bool(shown) and row.get("file_name") == shown}
+                 for row in attachments]
+        self.pictures.set_pictures(items, True, keep_image or (self.pictures.current_id() if same else ""))
+        self.review_split.set_compact(not items)
         self.info.setText(f"Created {str(comment.get('created_utc') or '')[:16].replace('T', ' ')} UTC · updated "
                           f"{str(comment.get('updated_utc') or '')[:16].replace('T', ' ')} UTC · "
                           f"{comment.get('kp_basis') or ''}<br>ID {comment.get('comment_id')}"
                           + (f" · external ID {comment.get('ext_id')}" if comment.get("ext_id") else ""))
         self._update_enabled()
 
-    def _thumb(self, path: str) -> QIcon:
-        icon = self._thumbs.get(path)
-        if icon is None:
-            pixmap = QPixmap(path)
-            if pixmap.isNull():
-                return _theme_icon("/mIconWarning.svg")
-            icon = QIcon(pixmap.scaled(96, 96, Qt.AspectRatioMode.KeepAspectRatio,
-                                       Qt.TransformationMode.SmoothTransformation))
-            self._thumbs[path] = icon
-        return icon
+    def _set_quick(self, comment: Optional[Dict]) -> None:
+        """The header's status and priority choices, showing ``comment``'s."""
+        for combo, key, choices in ((self.quick_status, "status", self.statuses()),
+                                    (self.quick_priority, "priority", self.priorities())):
+            combo.blockSignals(True)
+            combo.clear()
+            if comment is not None:
+                value = str(comment.get(key) or "")
+                # An empty or unlisted value is shown as it is, never as the first choice.
+                combo.addItems(([""] if not value else []) + list(choices)
+                               + ([value] if value and value not in choices else []))
+                combo.setCurrentIndex(max(0, combo.findText(value)))
+            combo.blockSignals(False)
+            combo.setEnabled(comment is not None)
+
+    def _quick_set(self, key: str) -> None:
+        combo = self.quick_status if key == "status" else self.quick_priority
+        cid = self.current_id
+        comment = self.by_id.get(cid) if cid else None
+        if comment is None or combo.currentText() == str(comment.get(key) or ""):
+            return
+        if self._inline_edit(cid, key, combo.currentText()) is None:
+            self._set_quick(self.by_id.get(cid))
 
     def save_current(self) -> bool:
         cid = self.current_id
@@ -1246,63 +1411,224 @@ class RouteCommentsDock(QDockWidget):
             self._dirty = True
             self._update_enabled()
 
-    def add_reply(self) -> None:
+    def add_reply(self, status_to: str = "") -> None:
+        """Send the reply; with ``status_to`` also set the comment's status (one save)."""
         text = self.reply_text.toPlainText().strip()
-        if not text or self.current_id is None:
+        if (not text and not status_to) or self.current_id is None or self.store is None:
+            return
+        if status_to and not self._confirm_leave():
             return
         try:
-            self.store.add_reply(self.current_id, default_author(), text)
+            self.store.add_reply(self.current_id, default_author(), text, status_to)
         except CommentStoreError as exc:
             self._error("Reply", exc)
             return
         self.reply_text.clear()
         self._keep_edits_and_reload()
-        self.tabs.setCurrentIndex(1)
+        self.tabs.setCurrentIndex(0)
+
+    def send_and_toggle(self) -> None:
+        """*Send & close* (or *Send & reopen* on a closed comment)."""
+        target = str(self.close_button.property("target_status") or "")
+        if target:
+            self.add_reply(status_to=target)
+
+    def _save_thread_edit(self, reply_id: Optional[str], text: str) -> bool:
+        """Save a message edited in the thread: the comment's text (``reply_id``
+        None, with the same check against changes made elsewhere as a table
+        edit) or a reply's. The edit stays open when it cannot be saved."""
+        cid = self.current_id
+        if cid is None or self.store is None:
+            return False
+        if reply_id is None and not str(text or "").strip():
+            QMessageBox.warning(self, "Route Comments", "A comment needs some text.")
+            return False
+        self._thread_saving = True
+        try:
+            if reply_id is None:
+                if self._inline_edit(cid, "text", text) is None:
+                    return False
+            else:
+                try:
+                    saved = self.store.update_reply(reply_id, text)
+                except CommentStoreError as exc:
+                    self._error("Reply", exc)
+                    return False
+                for reply in self.replies.get(cid, []):
+                    if reply.get("reply_id") == reply_id:
+                        reply.update(saved)
+                QTimer.singleShot(0, self._keep_edits_and_reload)
+        finally:
+            self._thread_saving = False
+        self.thread.cancel_edit()
+        return True
 
     def delete_reply(self, reply_id: str) -> None:
-        if QMessageBox.question(self, "Delete reply", "Delete this reply?", MESSAGEBOX_YES | MESSAGEBOX_NO,
-                                MESSAGEBOX_NO) != MESSAGEBOX_YES:
+        """Delete a reply. One that changed the status (*Send & close*) can
+        take that change with it, while the status is still the one it set."""
+        cid = self.current_id
+        replies = self.replies.get(cid, []) if cid else []
+        reply = next((r for r in replies if r.get("reply_id") == reply_id), None)
+        comment = self.by_id.get(cid) if cid else None
+        if reply is None or comment is None or self.store is None:
+            return
+        current = str(comment.get("status") or "")
+        restore = model.status_to_restore(reply, replies, current, CommentStore.statuses_of(self.set_row))
+        choice = self._ask_reply_delete(str(reply.get("status_to") or ""), restore, current)
+        if not choice:
             return
         try:
-            self.store.delete_reply(reply_id)
+            self.store.delete_reply(reply_id, restore if choice == "restore" else None)
         except CommentStoreError as exc:
             self._error("Delete reply", exc)
             return
         self._keep_edits_and_reload()
+
+    def _ask_reply_delete(self, status_to: str, restore: str, current: str) -> str:
+        """``"restore"`` (delete, status back to ``restore``), ``"keep"`` (delete,
+        status unchanged) or ``""`` (cancel)."""
+        if not status_to:
+            answer = QMessageBox.question(self, "Delete reply", "Delete this reply?", MESSAGEBOX_YES | MESSAGEBOX_NO,
+                                          MESSAGEBOX_NO)
+            return "keep" if answer == MESSAGEBOX_YES else ""
+        if not restore:
+            answer = QMessageBox.question(
+                self, "Delete reply", f"Delete this reply? It set the status to {status_to}; the status has changed "
+                f"since and stays {current}.", MESSAGEBOX_YES | MESSAGEBOX_NO, MESSAGEBOX_NO)
+            return "keep" if answer == MESSAGEBOX_YES else ""
+        box = QMessageBox(QMessageBox.Icon.Question, "Delete reply",
+                          f"This reply also set the status to {status_to}.", parent=self)
+        back = box.addButton(f"Delete it, status back to {restore}", QMessageBox.ButtonRole.AcceptRole)
+        keep = box.addButton(f"Delete it, keep {current}", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(back)
+        qt_exec(box)
+        if box.clickedButton() is back:
+            return "restore"
+        return "keep" if box.clickedButton() is keep else ""
+
+    def _reload_keeping_image(self, attachment_id: str) -> None:
+        self._keep_edits_and_reload()
+        if self.current_id is not None and attachment_id:
+            self._show_image(attachment_id)
+
+    def _show_image(self, attachment_id: str) -> None:
+        for row, item in enumerate(self.pictures.items):
+            if item.get("attachment_id") == attachment_id:
+                self.pictures.strip.setCurrentRow(row)
+                return
 
     def add_images(self) -> None:
         if self.current_id is None:
             return
         folder = str(QSettings().value(f"{SETTINGS}/image_dir", "") or "")
         paths, _f = QFileDialog.getOpenFileNames(
-            self, "Add images", folder, "Images (*.png *.jpg *.jpeg *.gif *.bmp *.tif *.tiff *.webp)")
+            self, "Add images", folder, "Images (" + " ".join("*" + e for e in model.IMAGE_EXTENSIONS) + ")")
         if not paths:
             return
         QSettings().setValue(f"{SETTINGS}/image_dir", os.path.dirname(paths[0]))
+        self.add_image_files(paths)
+
+    def add_image_files(self, paths: List[str]) -> None:
+        """Copy image files into the register for the selected comment (unreadable ones are left out)."""
+        if self.current_id is None or self.store is None:
+            return
+        good = [p for p in paths if model.is_image_name(p) and image_size(p).isValid()]
+        skipped = [os.path.basename(p) for p in paths if p not in good]
+        if skipped:
+            QMessageBox.warning(self, "Route Comments", "Not added (not a readable image): " + ", ".join(skipped))
+        if not good:
+            return
         try:
-            self.store.add_attachments(self.current_id, paths)
+            rows = self.store.add_attachments(self.current_id, good)
         except CommentStoreError as exc:
             self._error("Images", exc)
             return
-        self._keep_edits_and_reload()
+        self._reload_keeping_image(rows[-1]["attachment_id"])
 
-    def remove_image(self) -> None:
-        item = self.images.currentItem()
-        if item is None:
+    def add_image_data(self, image: QImage) -> None:
+        """Save an image (pasted or dropped as data) as a PNG in the register."""
+        if self.current_id is None or self.store is None or image is None or image.isNull():
             return
-        if QMessageBox.question(self, "Remove image", f"Remove {item.text()} from this comment (the copy in the "
-                                "register's attachments folder is deleted)?", MESSAGEBOX_YES | MESSAGEBOX_NO,
+        if image.width() * image.height() > MAX_PIXELS:
+            QMessageBox.warning(self, "Route Comments", "The image is too large to add.")
+            return
+        data = QByteArray()
+        buffer = QBuffer(data)
+        buffer.open(WRITE_ONLY)
+        image.save(buffer, "PNG")
+        buffer.close()
+        name = "Pasted image " + _dt.datetime.now().strftime("%Y-%m-%d %H%M%S") + ".png"
+        try:
+            row = self.store.add_image_bytes(self.current_id, bytes(data), name)
+        except CommentStoreError as exc:
+            self._error("Images", exc)
+            return
+        self._reload_keeping_image(row["attachment_id"])
+
+    def paste_image(self) -> None:
+        """Ctrl+V outside text boxes: add the clipboard's image (or image files)."""
+        if self.current_id is None:
+            self._message("Select one comment to paste an image into.")
+            return
+        paths, image = pictures_from_mime(QApplication.clipboard().mimeData())
+        if paths:
+            self.add_image_files(paths)
+        elif image is not None:
+            self.add_image_data(image)
+        else:
+            self._message("The clipboard holds no image.")
+
+    def remove_image(self, attachment_id: str) -> None:
+        item = next((i for i in self.pictures.items if i.get("attachment_id") == attachment_id), None)
+        if item is None or self.store is None:
+            return
+        if QMessageBox.question(self, "Remove image", f"Remove {item.get('name')} from this comment (the copy in "
+                                "the register's attachments folder is deleted)?", MESSAGEBOX_YES | MESSAGEBOX_NO,
                                 MESSAGEBOX_NO) != MESSAGEBOX_YES:
             return
         try:
-            self.store.delete_attachment(item.data(ID_ROLE))
+            self.store.delete_attachment(attachment_id)
         except CommentStoreError as exc:
             self._error("Remove image", exc)
             return
         self._keep_edits_and_reload()
 
-    def _open_image(self, item) -> None:
-        path = item.data(ID_ROLE + 2)
+    def set_map_image(self, attachment_id: str, on: bool) -> None:
+        """Show (or stop showing) an image in the comment's map label."""
+        if self.current_id is None or self.store is None:
+            return
+        try:
+            self.store.set_map_image(self.current_id, attachment_id if on else None)
+        except CommentStoreError as exc:
+            self._error("Map image", exc)
+            self._keep_edits_and_reload()
+            return
+        if on:
+            self._prepare_map_images()
+        self._reload_keeping_image(attachment_id)
+
+    def _prepare_map_images(self) -> None:
+        """Make sure an image chosen for the map can be seen: the map and its
+        labels on, labels that can hold images, and a word on the scale."""
+        if not self.act_show_map.isChecked():
+            self.act_show_map.setChecked(True)
+        if not self.act_labels.isChecked():
+            self.act_labels.setChecked(True)
+        layers = self.layers.layers()
+        settings = map_layers.label_settings_of(self.layers.find("points"))
+        if layers and (not settings.images or any(map_layers.labels_predate_images(x) for x in layers)):
+            answer = QMessageBox.question(
+                self, "Route Comments", "The comment labels are not set to show images. Update them now? This "
+                "replaces label changes made in Layer Properties (Label contents… sets them again).",
+                MESSAGEBOX_YES | MESSAGEBOX_NO, MESSAGEBOX_YES)
+            if answer == MESSAGEBOX_YES:
+                settings.images = True
+                map_layers.apply_labels(layers, settings, True)
+        if self.iface is not None and self.iface.mapCanvas().scale() > settings.detail_scale:
+            self._message(f"The image shows in the comment's label when zoomed in beyond 1:{settings.detail_scale:,}.")
+
+    def _open_file(self, path: str) -> None:
         if path and os.path.isfile(path):
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
@@ -1388,7 +1714,9 @@ class RouteCommentsDock(QDockWidget):
         self.reload(keep_selection=False)
         self._select_ids([c["comment_id"] for c in added])
         skipped = sum(1 for r in dialog.checked if not r.ok)
+        images = sum(int(c.get("attachment_count") or 0) for c in added)
         self._message(f"Imported {len(added)} comment(s) into '{self.set_row['name']}'"
+                      + (f" with {images} image(s)" if images else "")
                       + (f"; {skipped} row(s) skipped." if skipped else "."), MESSAGE_SUCCESS, 5)
 
     def export_comments(self) -> None:
@@ -1484,7 +1812,11 @@ class RouteCommentsDock(QDockWidget):
     def _on_picked(self, ids: List[str]) -> None:
         if self._hidden(ids):
             self.clear_filters()
-        self._select_ids(ids)
+        self._from_map = True
+        try:
+            self._select_ids(ids)
+        finally:
+            self._from_map = False
         if ids and not self.isVisible():
             self.show()
 
@@ -1512,7 +1844,7 @@ class RouteCommentsDock(QDockWidget):
         version = self.store.data_version()
         if version == self._data_version or version < 0:
             return
-        if self._dirty or self.table.state() == QAbstractItemView.State.EditingState:
+        if self._dirty or self.thread.is_editing() or self.table.state() == QAbstractItemView.State.EditingState:
             self._data_version = version
             self._show_banner("The register was changed elsewhere (another project or QGIS). Saving checks for "
                               "conflicts. <a href='reload'>Reload now</a> (discards your unsaved edits)")
@@ -1533,8 +1865,13 @@ class RouteCommentsDock(QDockWidget):
         self.save_button.setEnabled(has_comment and self._dirty)
         self.revert_button.setEnabled(has_comment and self._dirty)
         self.delete_button.setEnabled(bool(self.selected_ids()))
-        for widget in (self.reply_text, self.reply_button, self.add_image_button, self.remove_image_button):
+        for widget in (self.reply_text, self.reply_button):
             widget.setEnabled(has_comment)
+        self.close_button.setEnabled(has_comment and bool(self.close_button.property("target_status")))
+        count = self.proxy.rowCount() if has_set else 0
+        here = self._current_row()
+        self.prev_button.setEnabled(count > 0 and here != 0)
+        self.next_button.setEnabled(count > 0 and (here < 0 or here < count - 1))
 
     def showEvent(self, event):  # noqa: N802 - Qt API
         super().showEvent(event)
@@ -1575,6 +1912,8 @@ class RouteCommentsDock(QDockWidget):
             self.pick_tool = None
         if self.highlight is not None:
             self.highlight.clear()
+        self.pictures.shutdown()
+        self.thumb_cache.clear()
         if self.store is not None:
             self.store.close()
 

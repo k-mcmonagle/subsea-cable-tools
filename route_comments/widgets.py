@@ -1,15 +1,21 @@
 # -*- coding: utf-8 -*-
-"""Route Comments widgets: the comment table (model, filter, inline editors)
-and the reply thread."""
+"""Route Comments widgets: the comment table (model, filter, inline editors),
+the reply thread and the splitter that lays the thread beside the images."""
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from qgis.PyQt.QtCore import QAbstractTableModel, QDate, QModelIndex, QSortFilterProxyModel, Qt, pyqtSignal
-from qgis.PyQt.QtGui import QBrush, QColor, QIcon, QPainter, QPalette, QPixmap
+from qgis.PyQt.QtCore import QAbstractTableModel, QDate, QModelIndex, QSortFilterProxyModel, Qt, QTimer, pyqtSignal
+from qgis.PyQt.QtGui import QBrush, QColor, QIcon, QKeySequence, QPainter, QPalette, QPixmap
 from qgis.PyQt.QtWidgets import (QApplication, QComboBox, QDateEdit, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
-                                 QPlainTextEdit, QScrollArea, QSizePolicy, QStyledItemDelegate, QVBoxLayout, QWidget)
+                                 QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSplitter,
+                                 QStyledItemDelegate, QToolButton, QVBoxLayout, QWidget)
+
+try:
+    from qgis.PyQt.QtGui import QShortcut
+except ImportError:  # Qt5: QShortcut is in QtWidgets
+    from qgis.PyQt.QtWidgets import QShortcut
 
 from ..qgis_compat import CONTEXT_MENU_POLICY_CUSTOM, ITEM_FLAG_EDITABLE, qt_exec
 from . import model
@@ -22,7 +28,7 @@ BASE_COLUMNS = [  # key, label, shown by default
     ("ref", "No.", True), ("kp", "KP", True), ("text", "Comment", True), ("status", "Status", True),
     ("priority", "Priority", True), ("condition", "Reference", True), ("replies", "Replies", True),
     ("author", "Author", True), ("date", "Date", True),
-    ("kind", "Type", False), ("route", "Route", False), ("images", "Images", False),
+    ("kind", "Type", False), ("route", "Route", False), ("images", "Images", True),
     ("tags", "Tags", False), ("ext_id", "External ID", False), ("updated", "Updated", False),
 ]
 # Table column -> register column, for the columns edited in place.
@@ -311,26 +317,84 @@ class CommentDelegate(QStyledItemDelegate):
 
 # --------------------------------------------------------------------------- thread
 class _Bubble(QFrame):
-    def __init__(self, author: str, when: str, text: str, mine: bool, original: bool, parent=None):
+    """One message: the comment itself (``reply_id`` None) or a reply. Its
+    ``⋯`` button, or a right-click, offers copy, edit and delete; editing
+    puts a text box in place of the text (Ctrl+Enter saves, Esc cancels)."""
+
+    def __init__(self, reply_id: Optional[str], author: str, when: str, text: str, mine: bool, original: bool,
+                 status_to: str = "", edited: str = "", parent=None):
         super().__init__(parent)
+        self.reply_id = reply_id
+        self.original = original
+        self.text = text
+        self.status_to = status_to
+        self.editor: Optional[QPlainTextEdit] = None
         self.setObjectName("rcBubble")
         tint = "rgba(0, 120, 215, 0.13)" if mine else "rgba(128, 128, 128, 0.13)"
         edge = "border-left: 3px solid rgb(230, 120, 0);" if original else ""
         self.setStyleSheet(f"#rcBubble {{ background: {tint}; border-radius: 8px; {edge} }}")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(9, 5, 9, 6)
+        layout.setContentsMargins(9, 3, 3, 6)
         layout.setSpacing(1)
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(2)
         head = QLabel(f"<b>{_esc(author or '—')}</b>&nbsp;&nbsp;<span style='color:gray'>{_esc(when)}"
-                      + (" · comment" if original else "") + "</span>")
+                      + (" · comment" if original else "") + (" · edited" if edited else "") + "</span>")
         head.setTextFormat(Qt.TextFormat.RichText)
-        body = QLabel(text)
-        body.setWordWrap(True)
-        body.setTextFormat(Qt.TextFormat.PlainText)
-        body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(head)
-        layout.addWidget(body)
-        self.text = text
+        if edited:
+            head.setToolTip(f"Edited {str(edited)[:16].replace('T', ' ')} UTC")
+        self.more = QToolButton()
+        self.more.setText("⋯")
+        self.more.setAutoRaise(True)
+        self.more.setToolTip("Copy, edit or delete " + ("the comment" if original else "this reply"))
+        top.addWidget(head, 1)
+        top.addWidget(self.more, 0, Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(top)
+        self.body = QLabel(text)
+        self.body.setWordWrap(True)
+        self.body.setTextFormat(Qt.TextFormat.PlainText)
+        self.body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.body)
+        if not text:
+            # Only once it is in the bubble: showing a widget with no parent opens it as a window.
+            self.body.hide()
+        if status_to:
+            change = QLabel(f"<span style='color:gray'>Status → </span><b>{_esc(status_to)}</b>")
+            change.setTextFormat(Qt.TextFormat.RichText)
+            layout.addWidget(change)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+
+    def start_edit(self) -> QPlainTextEdit:
+        self.editor = QPlainTextEdit(self.text)
+        self.editor.setTabChangesFocus(True)
+        lines = self.editor.fontMetrics().lineSpacing()
+        rows = min(8, max(3, len(self.text.splitlines()) + 1 + len(self.text) // 70))   # the text, plus a line
+        self.editor.setFixedHeight(lines * rows + 12)
+        self.save_button = QPushButton("Save")
+        self.save_button.setToolTip("Save the edit (Ctrl+Enter)")
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setToolTip("Leave it as it was (Esc)")
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(self.cancel_button)
+        buttons.addWidget(self.save_button)
+        layout = self.layout()
+        layout.insertWidget(2, self.editor)
+        layout.insertLayout(3, buttons)
+        self.body.hide()
+        self.more.setEnabled(False)
+        cursor = self.editor.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End if hasattr(cursor, "MoveOperation") else cursor.End)
+        self.editor.setTextCursor(cursor)
+        self.editor.setFocus()
+        return self.editor
+
+    def edited_text(self) -> str:
+        return self.editor.toPlainText().strip() if self.editor is not None else self.text
+
+    def changed(self) -> bool:
+        return self.editor is not None and self.edited_text() != str(self.text or "").strip()
 
 
 def _esc(text: str) -> str:
@@ -339,9 +403,13 @@ def _esc(text: str) -> str:
 
 class ThreadView(QScrollArea):
     """The comment and its replies as a conversation, oldest first. The user's
-    own messages (by author name) sit on the right, others on the left."""
+    own messages (by author name) sit on the right, others on the left. Any
+    message can be copied, edited in place or deleted; the dock saves."""
 
-    delete_requested = pyqtSignal(str)
+    delete_requested = pyqtSignal(str)          # a reply
+    reply_edited = pyqtSignal(str, str)         # reply id, new text
+    comment_edited = pyqtSignal(str)            # the comment's new text
+    comment_delete_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -354,27 +422,36 @@ class ThreadView(QScrollArea):
         self._layout.addStretch(1)
         self.setWidget(self._body)
         self.bubbles: List[_Bubble] = []
+        self._data = (None, [], "")
+        self._editing: Optional[_Bubble] = None
+        self._to_end = False
+        self._scroll_to: Optional[int] = None
+        self.verticalScrollBar().rangeChanged.connect(self._range_changed)
 
     def clear(self) -> None:
         for bubble in self.bubbles:
             row = bubble.parentWidget()
             self._layout.removeWidget(row)
+            row.hide()          # deleted on the next turn of the event loop; not drawn meanwhile
             row.deleteLater()
         self.bubbles = []
+        self._editing = None
 
-    def set_thread(self, comment: Optional[Dict], replies: Sequence[Dict], me: str) -> None:
+    def set_thread(self, comment: Optional[Dict], replies: Sequence[Dict], me: str, keep_scroll: bool = False) -> None:
+        position = self.verticalScrollBar().value()
         self.clear()
+        self._data = (comment, list(replies), me)
         if comment is None:
             return
         me = (me or "").casefold()
         when = lambda iso: str(iso or "")[:16].replace("T", " ")  # noqa: E731
         items = [(None, comment.get("author") or "", comment.get("comment_date") or when(comment.get("created_utc")),
-                  comment.get("text") or "", True)]
-        items += [(r.get("reply_id"), r.get("author") or "", when(r.get("created_utc")), r.get("text") or "", False)
-                  for r in replies]
-        for reply_id, author, stamp, text, original in items:
+                  comment.get("text") or "", True, "", "")]
+        items += [(r.get("reply_id"), r.get("author") or "", when(r.get("created_utc")), r.get("text") or "", False,
+                   r.get("status_to") or "", r.get("edited_utc") or "") for r in replies]
+        for reply_id, author, stamp, text, original, status_to, edited in items:
             mine = bool(me) and author.casefold() == me and not original
-            bubble = _Bubble(author, stamp, text, mine, original)
+            bubble = _Bubble(reply_id, author, stamp, text, mine, original, status_to, edited)
             row = QWidget()
             line = QHBoxLayout(row)
             line.setContentsMargins(0, 0, 0, 0)
@@ -384,22 +461,178 @@ class ThreadView(QScrollArea):
             if not mine:
                 line.addStretch(1)
             bubble.setContextMenuPolicy(CONTEXT_MENU_POLICY_CUSTOM)
-            bubble.customContextMenuRequested.connect(
-                lambda pos, b=bubble, rid=reply_id: self._menu(b, rid, pos))
+            bubble.customContextMenuRequested.connect(lambda pos, b=bubble: self._menu(b, b.mapToGlobal(pos)))
+            bubble.more.clicked.connect(
+                lambda _checked=False, b=bubble: self._menu(b, b.more.mapToGlobal(b.more.rect().bottomLeft())))
             self._layout.insertWidget(self._layout.count() - 1, row)
             self.bubbles.append(bubble)
-        self.verticalScrollBar().rangeChanged.connect(self._scroll_to_end)
+        if keep_scroll:
+            self._to_end, self._scroll_to = False, position
+        else:
+            self._to_end, self._scroll_to = True, None   # the newest message in view once laid out
+            self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
 
-    def _scroll_to_end(self, _lo, hi) -> None:
-        self.verticalScrollBar().setValue(hi)
-        try:
-            self.verticalScrollBar().rangeChanged.disconnect(self._scroll_to_end)
-        except (TypeError, RuntimeError):
-            pass
+    def _range_changed(self, _lo, hi) -> None:
+        if self._to_end:
+            self.verticalScrollBar().setValue(hi)
+            self._to_end = False
+        elif self._scroll_to is not None:
+            self.verticalScrollBar().setValue(min(self._scroll_to, hi))
+            self._scroll_to = None
 
-    def _menu(self, bubble, reply_id, pos) -> None:
+    def _menu(self, bubble: _Bubble, global_pos) -> None:
         menu = QMenu(self)
         menu.addAction("Copy text", lambda: QApplication.clipboard().setText(bubble.text))
-        if reply_id:
-            menu.addAction("Delete reply…", lambda: self.delete_requested.emit(reply_id))
-        qt_exec(menu, bubble.mapToGlobal(pos))
+        if self._editing is None:
+            what = "comment" if bubble.original else "reply"
+            menu.addAction(f"Edit {what}", lambda: self.edit(bubble))
+            if bubble.original:
+                menu.addAction("Delete comment…", self.comment_delete_requested.emit)
+            else:
+                menu.addAction("Delete reply…", lambda: self.delete_requested.emit(bubble.reply_id))
+        qt_exec(menu, global_pos)
+        menu.deleteLater()
+
+    # -- editing in place --------------------------------------------------------------
+    def edit(self, bubble: _Bubble) -> None:
+        if self._editing is not None or bubble not in self.bubbles:
+            return
+        editor = bubble.start_edit()
+        self._editing = bubble
+        bubble.save_button.clicked.connect(self.finish_edit)
+        bubble.cancel_button.clicked.connect(self.cancel_edit)
+        for keys, slot in (("Ctrl+Return", self.finish_edit), ("Ctrl+Enter", self.finish_edit),
+                           ("Escape", self.cancel_edit)):
+            QShortcut(QKeySequence(keys), editor, activated=slot, context=Qt.ShortcutContext.WidgetShortcut)
+        self.ensureWidgetVisible(bubble)
+
+    def edit_reply(self, reply_id: Optional[str]) -> None:
+        """Start editing the comment (None) or a reply."""
+        bubble = next((b for b in self.bubbles if b.reply_id == reply_id), None)
+        if bubble is not None:
+            self.edit(bubble)
+
+    def is_editing(self) -> bool:
+        return self._editing is not None
+
+    def pending_edit(self) -> Optional[Tuple[Optional[str], str]]:
+        """``(reply id, or None for the comment, new text)`` when an open edit changed the text."""
+        bubble = self._editing
+        if bubble is None or not bubble.changed():
+            return None
+        return bubble.reply_id, bubble.edited_text()
+
+    def finish_edit(self) -> None:
+        """Ask the dock to save; the edit stays open until it reloads (so nothing is lost if it cannot)."""
+        bubble = self._editing
+        if bubble is None:
+            return
+        if not bubble.changed():
+            self.cancel_edit()
+        elif bubble.reply_id is None:
+            self.comment_edited.emit(bubble.edited_text())
+        else:
+            self.reply_edited.emit(bubble.reply_id, bubble.edited_text())
+
+    def cancel_edit(self) -> None:
+        if self._editing is None:
+            return
+        comment, replies, me = self._data
+        self.set_thread(comment, replies, me, keep_scroll=True)
+
+
+# --------------------------------------------------------------------------- layout
+QWIDGETSIZE_MAX = 16777215
+
+
+class AdaptiveSplitter(QSplitter):
+    """Two panes side by side when there is room, one above the other when
+    narrow (with a margin so it does not flap). The user's split is kept for
+    each way round; the second pane can be made compact (nothing to show)
+    and gets its room back when it has content again."""
+
+    def __init__(self, wide_px: int = 600, narrow_px: int = 540, compact_px: Sequence[int] = (230, 150),
+                 parent=None):
+        super().__init__(Qt.Orientation.Horizontal, parent)
+        self.wide_px, self.narrow_px = wide_px, narrow_px
+        self.compact_px = tuple(compact_px)      # (width side by side, height stacked)
+        self.preferred: Dict[str, List[int]] = {}
+        self.compact = False
+        self.setChildrenCollapsible(False)
+        self.splitterMoved.connect(self._moved)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(0)
+        self._timer.timeout.connect(self.adapt)
+
+    def side_by_side(self) -> bool:
+        return self.orientation() == Qt.Orientation.Horizontal
+
+    def _key(self) -> str:
+        return "h" if self.side_by_side() else "v"
+
+    def _moved(self, *_args) -> None:
+        if not self.compact:
+            self.preferred[self._key()] = self.sizes()
+
+    def resizeEvent(self, event):  # noqa: N802 - Qt API
+        super().resizeEvent(event)
+        self._timer.start()
+
+    def adapt(self) -> None:
+        """Turn to suit the width (after a resize)."""
+        width = self.width()
+        if self.side_by_side() and width < self.narrow_px:
+            self.setOrientation(Qt.Orientation.Vertical)
+        elif not self.side_by_side() and width >= self.wide_px:
+            self.setOrientation(Qt.Orientation.Horizontal)
+        else:
+            return
+        self._apply()
+
+    def set_compact(self, on: bool) -> None:
+        on = bool(on)
+        if on and not self.compact and all(size > 0 for size in self.sizes()):
+            self.preferred[self._key()] = self.sizes()
+        changed = on != self.compact
+        self.compact = on
+        if changed:
+            self._apply()
+
+    def _apply(self) -> None:
+        second = self.widget(1)
+        if second is None:
+            return
+        across = self.side_by_side()
+        if self.compact:
+            second.setMaximumWidth(self.compact_px[0] if across else QWIDGETSIZE_MAX)
+            second.setMaximumHeight(QWIDGETSIZE_MAX if across else self.compact_px[1])
+        else:
+            second.setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX)
+        total = sum(self.sizes()) or (self.width() if across else self.height())
+        if total <= 0:
+            return
+        if self.compact:
+            cap = min(self.compact_px[0 if across else 1], total // 2)
+            self.setSizes([total - cap, cap])
+            return
+        sizes = self.preferred.get(self._key())
+        if sizes and len(sizes) == 2 and sum(sizes) > 0:
+            first = int(round(total * sizes[0] / float(sum(sizes))))
+        else:
+            first = int(total * (0.55 if across else 0.6))
+        self.setSizes([first, total - first])
+
+    def state(self) -> Dict[str, List[int]]:
+        return {key: [int(v) for v in sizes] for key, sizes in self.preferred.items()}
+
+    def restore(self, state) -> None:
+        if isinstance(state, dict):
+            for key in ("h", "v"):
+                sizes = state.get(key)
+                if isinstance(sizes, (list, tuple)) and len(sizes) == 2:
+                    try:
+                        self.preferred[key] = [max(0, int(v)) for v in sizes]
+                    except (TypeError, ValueError):
+                        pass
+        self._apply()

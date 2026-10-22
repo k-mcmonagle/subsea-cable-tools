@@ -13,8 +13,14 @@ Tables (written with plain SQL in transactions; no QGIS needed):
 * ``rc_field``       per-set custom fields (text, number, date, yes/no, choice)
 * ``rc_comment``     comments; a GeoPackage feature table (geometry ``geom``
                      in EPSG:4326, Point or LineString) that QGIS can open
-* ``rc_reply``       chronological replies
-* ``rc_attachment``  image attachments (file in the attachments folder)
+* ``rc_reply``       chronological replies (``status_to``: the status the
+                     reply set, e.g. *Send & close*, ``status_from`` the one
+                     it replaced; ``edited_utc`` when its text was edited)
+* ``rc_attachment``  image attachments (file in the attachments folder);
+                     ``rc_comment.map_image`` names the one shown in the
+                     comment's map label
+
+Columns are only ever added, so a register opens in any version of the tool.
 
 Every comment has a stable UUID, created/updated timestamps and a
 ``version`` that each save increments: a save from an editor opened on an
@@ -42,7 +48,8 @@ from . import model
 SCHEMA_VERSION = 1
 SRS_ID = 4326
 ATTACHMENTS_SUFFIX = "_attachments"
-IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp")
+WINDOWS_MAX_PATH = 259          # longer file paths fail on Windows unless long paths are enabled
+IMAGE_EXTENSIONS = model.IMAGE_EXTENSIONS
 
 T_META, T_SET, T_FIELD, T_COMMENT, T_REPLY, T_ATTACH = (
     "rc_meta", "rc_set", "rc_field", "rc_comment", "rc_reply", "rc_attachment")
@@ -66,16 +73,20 @@ COMMENT_COLUMNS = [
     # The geometry in the CRS it was captured in (exact), besides ``geom`` (EPSG:4326).
     ("geom_crs", "TEXT"), ("geom_wkt", "TEXT"),
     ("created_utc", "TEXT"), ("updated_utc", "TEXT"), ("version", "INTEGER"),
+    # The attachment file shown in the comment's map label ('' or NULL: none).
+    ("map_image", "TEXT"),
 ]
 REPLY_COLUMNS = [("reply_id", "TEXT"), ("comment_id", "TEXT"), ("author", "TEXT"), ("text", "TEXT"),
-                 ("created_utc", "TEXT")]
+                 ("created_utc", "TEXT"), ("status_to", "TEXT"), ("status_from", "TEXT"), ("edited_utc", "TEXT")]
 ATTACH_COLUMNS = [("attachment_id", "TEXT"), ("comment_id", "TEXT"), ("file_name", "TEXT"),
                   ("original_name", "TEXT"), ("caption", "TEXT"), ("created_utc", "TEXT")]
 TABLES = {T_META: META_COLUMNS, T_SET: SET_COLUMNS, T_FIELD: FIELD_COLUMNS, T_COMMENT: COMMENT_COLUMNS,
           T_REPLY: REPLY_COLUMNS, T_ATTACH: ATTACH_COLUMNS}
 COMMENT_NAMES = [name for name, _t in COMMENT_COLUMNS]
-# Columns a save may change (identity, numbering and bookkeeping are the store's).
-EDITABLE = set(COMMENT_NAMES) - {"comment_id", "set_id", "ref_no", "created_utc", "updated_utc", "version"}
+# Columns a save may change (identity, numbering and bookkeeping are the store's;
+# the map image only through set_map_image, so it always names one of the comment's images).
+EDITABLE = set(COMMENT_NAMES) - {"comment_id", "set_id", "ref_no", "created_utc", "updated_utc", "version",
+                                 "map_image"}
 
 _Q = gpkg_sql.quote_ident
 
@@ -446,8 +457,15 @@ class CommentStore:
         return out
 
     # -- comments -----------------------------------------------------------------
+    def _select_list(self, table: str, specs, alias: str) -> str:
+        """``alias.column`` for each column; ``NULL AS column`` for one a register
+        made by an earlier version lacks (another tool may read it without
+        :meth:`open`, which adds the missing columns)."""
+        present = {str(r[1]) for r in self._read(f"PRAGMA table_info({_Q(table)})")}
+        return ", ".join(f"{alias}.{_Q(n)}" if n in present else f"NULL AS {_Q(n)}" for n, _t in specs)
+
     def _comment_select(self) -> str:
-        cols = ", ".join(f"c.{_Q(n)}" for n in COMMENT_NAMES)
+        cols = self._select_list(T_COMMENT, COMMENT_COLUMNS, "c")
         return (f"SELECT {cols}, c.geom AS geom, "
                 f"(SELECT COUNT(*) FROM {_Q(T_REPLY)} r WHERE r.comment_id = c.comment_id) AS reply_count, "
                 f"(SELECT COUNT(*) FROM {_Q(T_ATTACH)} a WHERE a.comment_id = c.comment_id) AS attachment_count "
@@ -482,9 +500,13 @@ class CommentStore:
 
     def add_comments(self, set_id: str, rows: Sequence[Dict]) -> List[Dict]:
         """Add comments in one transaction (all or none). Each needs ``text``,
-        ``ref_kind`` and ``wkt`` (EPSG:4326); a given ``comment_id`` must be new."""
+        ``ref_kind`` and ``wkt`` (EPSG:4326); a given ``comment_id`` must be new.
+        ``attach_paths`` (image files) are copied in and attached, the first
+        one shown on the map with ``attach_on_map``."""
         if self.get_set(set_id) is None:
             raise CommentStoreError("The comment set no longer exists.")
+        for values in rows:
+            _check_images(values.get("attach_paths") or ())
         now = utc_now_iso()
         prepared = []
         for values in rows:
@@ -498,8 +520,29 @@ class CommentStore:
             if blob is None:
                 raise CommentStoreError("The comment's location geometry is missing or invalid.")
             row.update(comment_id=str(values.get("comment_id") or new_id()), set_id=set_id,
-                       created_utc=values.get("created_utc") or now, updated_utc=now, version=1)
+                       created_utc=values.get("created_utc") or now, updated_utc=now, version=1, map_image="")
             prepared.append((row, blob))
+        staged: List[Dict] = []
+        written: List[str] = []
+        for (row, _blob), values in zip(prepared, rows):
+            paths = list(values.get("attach_paths") or ())
+            if not paths:
+                continue
+            attached, _files = self._stage(
+                [(p, os.path.splitext(p)[1].lower(), os.path.basename(p)) for p in paths], written)
+            for item in attached:
+                item["comment_id"] = row["comment_id"]
+            staged += attached
+            if values.get("attach_on_map"):
+                row["map_image"] = attached[0]["file_name"]
+        try:
+            self._insert_comments(set_id, prepared, staged)
+        except CommentStoreError:
+            self._remove_paths(written)
+            raise
+        return [self.get_comment(row["comment_id"]) for row, _blob in prepared]
+
+    def _insert_comments(self, set_id: str, prepared, attachments: Sequence[Dict]) -> None:
         with self._write("save the new comments") as conn:
             existing = {r[0] for r in conn.execute(f"SELECT comment_id FROM {_Q(T_COMMENT)}")}
             next_no = (conn.execute(f"SELECT MAX(ref_no) FROM {_Q(T_COMMENT)} WHERE set_id = ?",
@@ -514,8 +557,8 @@ class CommentStore:
                 conn.execute(f"INSERT INTO {_Q(T_COMMENT)} ({', '.join(_Q(n) for n in names)}) VALUES "
                              f"({', '.join('?' for _n in names)})",
                              [gpkg_sql._coerce(row.get(n)) for n in COMMENT_NAMES] + [blob])
+            _insert(conn, T_ATTACH, ATTACH_COLUMNS, attachments)
             _touch_contents(conn)
-        return [self.get_comment(row["comment_id"]) for row, _blob in prepared]
 
     def update_comment(self, comment_id: str, changes: Dict, expected_version: Optional[int] = None) -> Dict:
         """Save ``changes`` (editable columns, ``wkt``). With ``expected_version``,
@@ -565,12 +608,12 @@ class CommentStore:
 
     # -- replies --------------------------------------------------------------------
     def list_replies(self, comment_id: str) -> List[Dict]:
-        rows = self._read(f"SELECT {_cols(REPLY_COLUMNS)} FROM {_Q(T_REPLY)} WHERE comment_id = ? "
-                          "ORDER BY created_utc, fid", (comment_id,))
+        rows = self._read(f"SELECT {self._select_list(T_REPLY, REPLY_COLUMNS, 'r')} FROM {_Q(T_REPLY)} r "
+                          "WHERE r.comment_id = ? ORDER BY r.created_utc, r.fid", (comment_id,))
         return [dict(r) for r in rows]
 
     def replies_by_comment(self, set_id: Optional[str] = None) -> Dict[str, List[Dict]]:
-        sql = f"SELECT {', '.join('r.' + _Q(n) for n, _t in REPLY_COLUMNS)} FROM {_Q(T_REPLY)} r"
+        sql = f"SELECT {self._select_list(T_REPLY, REPLY_COLUMNS, 'r')} FROM {_Q(T_REPLY)} r"
         params: Tuple = ()
         if set_id is not None:
             sql += f" JOIN {_Q(T_COMMENT)} c ON c.comment_id = r.comment_id WHERE c.set_id = ?"
@@ -580,22 +623,60 @@ class CommentStore:
             out.setdefault(row["comment_id"], []).append(dict(row))
         return out
 
-    def add_reply(self, comment_id: str, author: str, text: str) -> Dict:
+    def add_reply(self, comment_id: str, author: str, text: str, status_to: str = "") -> Dict:
+        """A reply. With ``status_to`` the comment's status changes in the same
+        save (*Send & close*), and the reply needs no text."""
         text = str(text or "").strip()
-        if not text:
+        status_to = str(status_to or "").strip()
+        if not text and not status_to:
             raise CommentStoreError("A reply needs some text.")
+        now = utc_now_iso()
         row = {"reply_id": new_id(), "comment_id": comment_id, "author": str(author or "").strip(),
-               "text": text, "created_utc": utc_now_iso()}
+               "text": text, "created_utc": now, "status_to": status_to}
         with self._write("save the reply") as conn:
-            if conn.execute(f"SELECT 1 FROM {_Q(T_COMMENT)} WHERE comment_id = ?", (comment_id,)).fetchone() is None:
+            current = conn.execute(f"SELECT status FROM {_Q(T_COMMENT)} WHERE comment_id = ?",
+                                   (comment_id,)).fetchone()
+            if current is None:
                 raise ConflictError("The comment was deleted elsewhere; the reply was not saved.")
+            if status_to:
+                row["status_from"] = str(current[0] or "")
             _insert(conn, T_REPLY, REPLY_COLUMNS, [row])
-            self._touch(conn, comment_id)
+            if status_to:
+                conn.execute(f"UPDATE {_Q(T_COMMENT)} SET status = ?, updated_utc = ?, version = version + 1 "
+                             "WHERE comment_id = ?", (status_to, now, comment_id))
+                _touch_contents(conn)
+            else:
+                self._touch(conn, comment_id)
         return row
 
-    def delete_reply(self, reply_id: str) -> None:
+    def update_reply(self, reply_id: str, text: str) -> Dict:
+        """Change a reply's text (the status it set stays); it is marked edited."""
+        text = str(text or "").strip()
+        now = utc_now_iso()
+        with self._write("save the reply") as conn:
+            row = conn.execute(f"SELECT comment_id, status_to FROM {_Q(T_REPLY)} WHERE reply_id = ?",
+                               (reply_id,)).fetchone()
+            if row is None:
+                raise ConflictError("The reply was deleted elsewhere (another project or QGIS).")
+            if not text and not row["status_to"]:
+                raise CommentStoreError("A reply needs some text.")
+            conn.execute(f"UPDATE {_Q(T_REPLY)} SET text = ?, edited_utc = ? WHERE reply_id = ?", (text, now, reply_id))
+            self._touch(conn, row["comment_id"])
+        return dict(self._read(f"SELECT {self._select_list(T_REPLY, REPLY_COLUMNS, 'r')} FROM {_Q(T_REPLY)} r "
+                               "WHERE r.reply_id = ?", (reply_id,))[0])
+
+    def delete_reply(self, reply_id: str, set_status: Optional[str] = None) -> None:
+        """Delete a reply; with ``set_status`` also set its comment's status (one save),
+        e.g. back to what a deleted *Send & close* changed."""
         with self._write("delete the reply") as conn:
+            row = conn.execute(f"SELECT comment_id FROM {_Q(T_REPLY)} WHERE reply_id = ?", (reply_id,)).fetchone()
             conn.execute(f"DELETE FROM {_Q(T_REPLY)} WHERE reply_id = ?", (reply_id,))
+            if row is not None and set_status:
+                conn.execute(f"UPDATE {_Q(T_COMMENT)} SET status = ?, updated_utc = ?, version = version + 1 "
+                             "WHERE comment_id = ?", (str(set_status), utc_now_iso(), row["comment_id"]))
+                _touch_contents(conn)
+            elif row is not None:
+                self._touch(conn, row["comment_id"])
 
     # -- attachments ------------------------------------------------------------------
     def list_attachments(self, comment_id: str) -> List[Dict]:
@@ -606,43 +687,93 @@ class CommentStore:
     def attachment_path(self, row: Dict) -> str:
         return os.path.join(self.attachments_dir, os.path.basename(str(row.get("file_name") or "")))
 
-    def add_attachments(self, comment_id: str, paths: Sequence[str]) -> List[Dict]:
-        """Copy images into the attachments folder and record them (all or none)."""
-        for path in paths:
-            if os.path.splitext(path)[1].lower() not in IMAGE_EXTENSIONS:
-                raise CommentStoreError(f"{os.path.basename(path)} is not a supported image "
-                                        f"({', '.join(IMAGE_EXTENSIONS)}).")
-            if not os.path.isfile(path):
-                raise CommentStoreError(f"{path} does not exist.")
-        rows, copied = [], []
+    def add_attachments(self, comment_id: str, paths: Sequence[str],
+                        names: Optional[Sequence[str]] = None) -> List[Dict]:
+        """Copy images into the attachments folder and record them (all or
+        none); ``names`` are the names shown (default: the files' own)."""
+        _check_images(paths)
+        names = list(names or [])
+        return self._attach(comment_id, [(path, os.path.splitext(path)[1].lower(),
+                                          (names[i] if i < len(names) else "") or os.path.basename(path))
+                                         for i, path in enumerate(paths)])
+
+    def add_image_bytes(self, comment_id: str, data: bytes, name: str, extension: str = ".png") -> Dict:
+        """Record an image given as encoded bytes (e.g. pasted from the clipboard)."""
+        extension = str(extension or "").lower()
+        if extension not in IMAGE_EXTENSIONS or not data:
+            raise CommentStoreError("The pasted image could not be saved.")
+        return self._attach(comment_id, [(bytes(data), extension, str(name or "") or "Pasted image" + extension)])[0]
+
+    def _stage(self, items, written: List[str]) -> Tuple[List[Dict], List[str]]:
+        """Copy ``(source path or bytes, extension, name shown)`` items into the
+        attachments folder under new names: ``(rows without comment_id, files)``.
+        Every file started is added to ``written``; on failure they are removed."""
+        rows, files = [], []
         try:
             os.makedirs(self.attachments_dir, exist_ok=True)
-            for path in paths:
+            for source, extension, shown in items:
                 attachment_id = new_id()
-                file_name = attachment_id + os.path.splitext(path)[1].lower()
+                file_name = attachment_id + extension
                 target = os.path.join(self.attachments_dir, file_name)
-                shutil.copy2(path, target)
-                copied.append(target)
-                rows.append({"attachment_id": attachment_id, "comment_id": comment_id, "file_name": file_name,
-                             "original_name": os.path.basename(path), "caption": "", "created_utc": utc_now_iso()})
+                if os.name == "nt" and len(target) > WINDOWS_MAX_PATH:
+                    raise OSError(f"the path is too long for Windows ({len(target)} characters, at most "
+                                  f"{WINDOWS_MAX_PATH}); move the register to a folder with a shorter path")
+                written.append(target)
+                files.append(target)
+                if isinstance(source, (bytes, bytearray)):
+                    with open(target, "xb") as handle:
+                        handle.write(source)
+                else:
+                    shutil.copy2(source, target)
+                rows.append({"attachment_id": attachment_id, "file_name": file_name, "original_name": shown,
+                             "caption": "", "created_utc": utc_now_iso()})
+        except OSError as exc:
+            self._remove_paths(written)
+            raise CommentStoreError(f"Could not copy the image into {self.attachments_dir}: {exc}") from exc
+        return rows, files
+
+    def _attach(self, comment_id: str, items) -> List[Dict]:
+        written: List[str] = []
+        rows, _files = self._stage(items, written)
+        for row in rows:
+            row["comment_id"] = comment_id
+        try:
             with self._write("save the images") as conn:
                 if conn.execute(f"SELECT 1 FROM {_Q(T_COMMENT)} WHERE comment_id = ?",
                                 (comment_id,)).fetchone() is None:
                     raise ConflictError("The comment was deleted elsewhere; the images were not added.")
                 _insert(conn, T_ATTACH, ATTACH_COLUMNS, rows)
                 self._touch(conn, comment_id)
-        except OSError as exc:
-            self._remove_paths(copied)
-            raise CommentStoreError(f"Could not copy the image into {self.attachments_dir}: {exc}") from exc
         except CommentStoreError:
-            self._remove_paths(copied)
+            self._remove_paths(written)
             raise
         return rows
+
+    def set_map_image(self, comment_id: str, attachment_id: Optional[str]) -> None:
+        """Show one of the comment's images in its map label (``None``: none)."""
+        with self._write("save the map image") as conn:
+            name = ""
+            if attachment_id:
+                row = conn.execute(f"SELECT file_name FROM {_Q(T_ATTACH)} WHERE attachment_id = ? AND "
+                                   "comment_id = ?", (attachment_id, comment_id)).fetchone()
+                if row is None:
+                    raise ConflictError("The image was removed elsewhere (another project or QGIS).")
+                name = os.path.basename(str(row[0] or ""))
+            changed = conn.execute(f"UPDATE {_Q(T_COMMENT)} SET map_image = ?, updated_utc = ? WHERE comment_id = ?",
+                                   (name, utc_now_iso(), comment_id)).rowcount
+            if not changed:
+                raise ConflictError("The comment was deleted elsewhere (another project or QGIS).")
+            _touch_contents(conn)
 
     def delete_attachment(self, attachment_id: str) -> None:
         rows = self._read(f"SELECT file_name FROM {_Q(T_ATTACH)} WHERE attachment_id = ?", (attachment_id,))
         with self._write("remove the image") as conn:
             conn.execute(f"DELETE FROM {_Q(T_ATTACH)} WHERE attachment_id = ?", (attachment_id,))
+            for row in rows:
+                if row["file_name"]:
+                    conn.execute(f"UPDATE {_Q(T_COMMENT)} SET map_image = '' WHERE map_image = ?",
+                                 (row["file_name"],))
+            _touch_contents(conn)
         self._remove_files([r["file_name"] for r in rows])
 
     def _remove_files(self, file_names: Iterable[str]) -> None:
@@ -658,6 +789,15 @@ class CommentStore:
 
 
 # --------------------------------------------------------------------------- schema helpers
+def _check_images(paths: Iterable[str]) -> None:
+    for path in paths:
+        if os.path.splitext(path)[1].lower() not in IMAGE_EXTENSIONS:
+            raise CommentStoreError(f"{os.path.basename(path)} is not a supported image "
+                                    f"({', '.join(IMAGE_EXTENSIONS)}).")
+        if not os.path.isfile(path):
+            raise CommentStoreError(f"{path} does not exist.")
+
+
 def _cols(specs) -> str:
     return ", ".join(_Q(n) for n, _t in specs)
 

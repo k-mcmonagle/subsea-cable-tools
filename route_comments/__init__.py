@@ -9,6 +9,7 @@
                  on the plugin's KP services (QGIS core, no widgets)
 - ``map_layers`` the clustered map display, selection highlight and pick tool
 - ``capture``    the KP-range picker the KP Mouse Tool uses
+- ``pictures``   the image panel: viewer, thumbnails, add / paste / drop
 - ``dialogs`` / ``dock``  the user interface
 
 ``model`` and ``store`` import no QGIS so they are tested headlessly.

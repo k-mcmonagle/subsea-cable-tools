@@ -12,7 +12,7 @@ from qgis.core import QgsVectorLayer
 from qgis.gui import QgsMapLayerComboBox
 from qgis.PyQt.QtCore import QDate, QSettings, Qt, pyqtSignal
 from qgis.PyQt.QtGui import QKeySequence
-from qgis.PyQt.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox,
+from qgis.PyQt.QtWidgets import (QAbstractItemView, QAbstractSpinBox, QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox,
                                  QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
                                  QHeaderView, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QRadioButton,
                                  QSpinBox, QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout,
@@ -78,7 +78,7 @@ class CommentForm(QWidget):
 
     changed = pyqtSignal()
 
-    def __init__(self, parent=None, text_lines: int = 4):
+    def __init__(self, parent=None, text_lines: int = 4, show_state: bool = True):
         super().__init__(parent)
         self._fields: List[model.CustomField] = []
         self._custom_widgets: Dict[str, QWidget] = {}
@@ -104,10 +104,13 @@ class CommentForm(QWidget):
         self.priority.setEditable(True)
         self.author = QLineEdit()
         self.date = _date_edit(optional=True)
-        grid.addWidget(QLabel("Status"), 0, 0)
-        grid.addWidget(self.status, 0, 1)
-        grid.addWidget(QLabel("Priority"), 0, 2)
-        grid.addWidget(self.priority, 0, 3)
+        state = [QLabel("Status"), self.status, QLabel("Priority"), self.priority]
+        for col, widget in enumerate(state):
+            grid.addWidget(widget, 0, col)
+            if not show_state:
+                # The dock edits them in its header; values() still returns the loaded ones. (Never
+                # setVisible(True) here: the grid has no parent yet, so it would flash up as a window.)
+                widget.hide()
         grid.addWidget(QLabel("Author"), 1, 0)
         grid.addWidget(self.author, 1, 1)
         grid.addWidget(QLabel("Date"), 1, 2)
@@ -641,6 +644,21 @@ class ImportDialog(QDialog):
         self.targets = list(model.IMPORT_TARGETS) + [(f"cf:{f.field_id}", f.name) for f in self.fields]
         self._combos: Dict[str, QComboBox] = {}
 
+        images = QHBoxLayout()
+        self.image_folder = QLineEdit()
+        self.image_folder.setPlaceholderText("The file's own folder")
+        self.image_folder.setToolTip("Image files named without a folder in the image column are looked up here")
+        self.image_folder.editingFinished.connect(self._validate)
+        folder_button = QPushButton("Browse…")
+        folder_button.clicked.connect(self._browse_images)
+        self.images_on_map = QCheckBox("Show each comment's first image on the map")
+        self.images_on_map.setChecked(QSettings().value(f"{SETTINGS}/import_images_on_map", False, type=bool))
+        images.addWidget(QLabel("Image files from"))
+        images.addWidget(self.image_folder, 1)
+        images.addWidget(folder_button)
+        layout.addLayout(images)
+        layout.addWidget(self.images_on_map)
+
         self.preview = QTableWidget(0, 4)
         self.preview.setHorizontalHeaderLabels(["Row", "Import", "Comment", "Notes"])
         self.preview.verticalHeader().setVisible(False)
@@ -652,7 +670,9 @@ class ImportDialog(QDialog):
         layout.addWidget(self.summary)
         note = QLabel("Rows need comment text and a location: latitude and longitude (a map location), a KP (a "
                       "route point) or KP and KP to (a KP range) on the route chosen above. IDs already in the "
-                      "register, or repeated in the file, are skipped. Replies and images are not imported.")
+                      "register, or repeated in the file, are skipped. Image files named in an image column "
+                      "(several separated by ;) are copied into the register's attachments folder. Replies are "
+                      "not imported.")
         note.setWordWrap(True)
         note.setStyleSheet("color: palette(mid);")
         layout.addWidget(note)
@@ -671,6 +691,16 @@ class ImportDialog(QDialog):
         if path:
             QSettings().setValue(f"{SETTINGS}/import_dir", os.path.dirname(path))
             self.load_file(path)
+
+    def _browse_images(self) -> None:
+        start = self.image_folder.text() or os.path.dirname(self.path.text())
+        folder = QFileDialog.getExistingDirectory(self, "Image files from", start)
+        if folder:
+            self.image_folder.setText(folder)
+            self._validate()
+
+    def images_dir(self) -> str:
+        return self.image_folder.text().strip() or os.path.dirname(self.path.text())
 
     def load_file(self, path: str, sheet: Optional[str] = None) -> None:
         from .exchange import read_table
@@ -734,7 +764,8 @@ class ImportDialog(QDialog):
         kp_range = self.route_kp_range(layer) if layer is not None else None
         self.checked = model.validate_import(data, self.current_mapping(), self.fields, self.statuses,
                                              self.priorities, self.existing, kp_range, first_line=start + 1,
-                                             default_author=default_author(), default_date=today())
+                                             default_author=default_author(), default_date=today(),
+                                             image_folder=self.images_dir())
         self.preview.setRowCount(len(self.checked))
         for row, item in enumerate(self.checked):
             cells = [str(item.line), "Yes" if item.ok else "No", model.summary(item.values.get("text"), 60),
@@ -742,6 +773,9 @@ class ImportDialog(QDialog):
             for col, text in enumerate(cells):
                 self.preview.setItem(row, col, QTableWidgetItem(text))
         mapped = "text" in self.current_mapping()
+        has_images = "images" in self.current_mapping()
+        for widget in (self.image_folder, self.images_on_map):
+            widget.setEnabled(has_images)
         self.summary.setText(model.import_summary(self.checked) if self.rows else "Choose a file.")
         if self.rows and not mapped:
             self.summary.setText("Choose the column that holds the comment text.")
@@ -753,6 +787,10 @@ class ImportDialog(QDialog):
         except Exception as exc:  # noqa: BLE001 - shown in the dialog
             self.summary.setText(f"Could not place the comments: {exc}")
             return
+        on_map = self.images_on_map.isEnabled() and self.images_on_map.isChecked()
+        QSettings().setValue(f"{SETTINGS}/import_images_on_map", self.images_on_map.isChecked())
+        for row in self.result_rows:
+            row["attach_on_map"] = on_map
         super().accept()
 
 
@@ -791,8 +829,9 @@ class ExportDialog(QDialog):
 
 # --------------------------------------------------------------------------- labels
 class LabelDialog(QDialog):
-    """What comment labels show: numbers at middle scales, chosen fields (or
-    any expression) when zoomed in. Applied to both comment layers."""
+    """What comment labels show as the map zooms in: the number far out, then
+    a short line, then the chosen fields (or any expression) with the image.
+    Applied to both comment layers."""
 
     def __init__(self, parent, settings, layer=None):
         from qgis.gui import QgsExpressionLineEdit
@@ -801,17 +840,36 @@ class LabelDialog(QDialog):
         self.setWindowTitle("Comment labels")
         self.layer = layer
         layout = QVBoxLayout(self)
-        form = QFormLayout()
-        form.setVerticalSpacing(4)
-        self.numbers = QCheckBox("Show comment numbers when zoomed in beyond")
+        steps = QGroupBox("As you zoom in (each from the scale given)")
+        steps_grid = QGridLayout(steps)
+        steps_grid.setVerticalSpacing(4)
+        self.numbers = QCheckBox("Number (#12)")
         self.number_scale = self._scale_spin(settings.number_scale)
-        row = QHBoxLayout()
-        row.addWidget(self.numbers)
-        row.addWidget(self.number_scale)
-        form.addRow(row)
+        self.summary = QCheckBox("Number and the start of the comment")
+        self.summary_scale = self._scale_spin(settings.summary_scale)
+        self.summary_chars = QSpinBox()
+        self.summary_chars.setRange(5, 80)
+        self.summary_chars.setValue(int(settings.summary_chars))
+        self.summary_chars.setSuffix(" characters")
         self.detail_scale = self._scale_spin(settings.detail_scale)
-        form.addRow("Show details when zoomed in beyond", self.detail_scale)
-        layout.addLayout(form)
+        steps_grid.addWidget(self.numbers, 0, 0)
+        steps_grid.addWidget(self.number_scale, 0, 1)
+        steps_grid.addWidget(self.summary, 1, 0)
+        steps_grid.addWidget(self.summary_scale, 1, 1)
+        steps_grid.addWidget(self.summary_chars, 1, 2)
+        steps_grid.addWidget(QLabel("Details (below) and images"), 2, 0)
+        steps_grid.addWidget(self.detail_scale, 2, 1)
+        steps_grid.setColumnStretch(0, 1)
+        self.numbers.toggled.connect(self.number_scale.setEnabled)
+        self.summary.toggled.connect(self.summary_scale.setEnabled)
+        self.summary.toggled.connect(self.summary_chars.setEnabled)
+        for check in (self.numbers, self.summary):
+            check.toggled.connect(self._update)
+        for spin in (self.number_scale, self.summary_scale, self.detail_scale):
+            spin.valueChanged.connect(self._update)
+        steps.setToolTip("Labels grow as you zoom in. Where they would crowd, QGIS leaves some out, keeping "
+                         "comments that need attention first.")
+        layout.addWidget(steps)
 
         box = QGroupBox("Details")
         grid = QGridLayout(box)
@@ -884,6 +942,23 @@ class LabelDialog(QDialog):
         look.addStretch(1)
         look.addWidget(self.background)
         layout.addLayout(look)
+        pictures = QHBoxLayout()
+        self.images = QCheckBox("Show images chosen for the map in the detail tags,")
+        self.images.setToolTip("Each comment can show one of its images (Show on map, under the image in the "
+                               "dock) at the top of its tag, with the details below it")
+        self.images.setChecked(bool(settings.images))
+        self.image_mm = QDoubleSpinBox()
+        self.image_mm.setRange(8.0, 150.0)
+        self.image_mm.setSingleStep(5.0)
+        self.image_mm.setDecimals(0)
+        self.image_mm.setValue(float(settings.image_mm))
+        self.image_mm.setSuffix(" mm wide")
+        self.images.toggled.connect(self.image_mm.setEnabled)
+        self.image_mm.setEnabled(self.images.isChecked())
+        pictures.addWidget(self.images)
+        pictures.addWidget(self.image_mm)
+        pictures.addStretch(1)
+        layout.addLayout(pictures)
         self.example = QLabel()
         self.example.setWordWrap(True)
         self.example.setStyleSheet("color: palette(mid);")
@@ -893,18 +968,51 @@ class LabelDialog(QDialog):
         note.setWordWrap(True)
         note.setStyleSheet("color: palette(mid);")
         layout.addWidget(note)
-        buttons = QDialogButtonBox(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
+        restore = QDialogButtonBox.StandardButton.RestoreDefaults
+        buttons = QDialogButtonBox(BUTTON_BOX_OK | BUTTON_BOX_CANCEL | restore)
+        buttons.button(restore).setToolTip("Put every choice here back to the tool's defaults (applied on OK)")
+        buttons.button(restore).clicked.connect(self.restore_defaults)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
         self.numbers.setChecked(bool(settings.numbers))
+        self.number_scale.setEnabled(bool(settings.numbers))
+        self.summary.setChecked(bool(settings.summary))
+        self.summary_scale.setEnabled(bool(settings.summary))
+        self.summary_chars.setEnabled(bool(settings.summary))
         self._custom_toggled(self.use_custom.isChecked())
+
+    def restore_defaults(self) -> None:
+        from .map_layers import LabelSettings
+        default = LabelSettings()
+        self.numbers.setChecked(default.numbers)
+        self.number_scale.setValue(default.number_scale)
+        self.summary.setChecked(default.summary)
+        self.summary_scale.setValue(default.summary_scale)
+        self.summary_chars.setValue(int(default.summary_chars))
+        self.detail_scale.setValue(default.detail_scale)
+        for key, check in self.parts.items():
+            check.setChecked(key in default.parts)
+        self.separator.setCurrentIndex(max(0, self.separator.findData(default.separator)))
+        self.chars.setValue(int(default.comment_chars))
+        self.use_custom.setChecked(False)
+        self.custom.setExpression("")
+        self.style.setCurrentIndex(max(0, self.style.findData(default.style)))
+        self.leader.setValue(float(default.leader_mm))
+        self.size.setValue(float(default.size))
+        self.background.setChecked(default.background)
+        self.images.setChecked(default.images)
+        self.image_mm.setValue(float(default.image_mm))
+        self._update()
 
     @staticmethod
     def _scale_spin(value) -> QSpinBox:
         spin = QSpinBox()
         spin.setRange(100, 50000000)
-        spin.setSingleStep(5000)
+        try:   # steps in proportion to the scale (1:20,000 and 1:2,000,000 alike)
+            spin.setStepType(QAbstractSpinBox.StepType.AdaptiveDecimalStepType)
+        except AttributeError:
+            spin.setSingleStep(5000)
         spin.setPrefix("1:")
         spin.setGroupSeparatorShown(True)
         spin.setValue(int(value))
@@ -922,12 +1030,14 @@ class LabelDialog(QDialog):
         from .map_layers import LabelSettings
         return LabelSettings(
             numbers=self.numbers.isChecked(), number_scale=self.number_scale.value(),
-            detail_scale=self.detail_scale.value(),
+            summary=self.summary.isChecked(), summary_scale=self.summary_scale.value(),
+            summary_chars=self.summary_chars.value(), detail_scale=self.detail_scale.value(),
             parts=[k for k, check in self.parts.items() if check.isChecked()],
             separator=self.separator.currentData(), comment_chars=self.chars.value(),
             custom=self.custom.expression() if custom and self.use_custom.isChecked() else "",
             size=self.size.value(), background=self.background.isChecked(),
-            style=self.style.currentData(), leader_mm=self.leader.value())
+            style=self.style.currentData(), leader_mm=self.leader.value(),
+            images=self.images.isChecked(), image_mm=self.image_mm.value())
 
     def result_settings(self):
         return self._settings()
@@ -945,4 +1055,15 @@ class LabelDialog(QDialog):
                 value = expression.evaluate(context)
                 text = "Expression error: " + expression.evalErrorString() if expression.hasEvalError() \
                     else str(value if value is not None else "")
-        self.example.setText(("Example: " + text.replace("\n", " ⏎ ")) if text else "")
+        lines = [("Example: " + text.replace("\n", " ⏎ "))] if text else []
+        steps = self._settings(custom=False)
+        hidden = []
+        if steps.summary and steps.summary_scale <= steps.detail_scale:
+            hidden.append("the short line (set it further out than the details)")
+        inner = steps.summary_scale if steps.summary and steps.summary_scale > steps.detail_scale \
+            else steps.detail_scale
+        if steps.numbers and steps.number_scale <= inner:
+            hidden.append("the number (set it further out than the next step)")
+        if hidden:
+            lines.append("Not shown: " + "; ".join(hidden) + ".")
+        self.example.setText("\n".join(lines))

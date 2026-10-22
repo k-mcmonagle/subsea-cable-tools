@@ -22,6 +22,11 @@
   replies, image thumbnails, import with duplicate IDs and KPs on a route,
   export of visible rows and of the whole register (CSV and XLSX),
   external changes picked up.
+* Review panel: the thread beside the images (stacked when narrow, the
+  image pane small without images), images from files, a drop and the
+  clipboard, one drawn in the map label with the comment text escaped,
+  Send & close / reopen, quick status, previous / next with follow on the
+  map, images let go when the project closes.
 
 QSettings are redirected to a temporary folder.
 """
@@ -34,9 +39,9 @@ import sqlite3
 import tempfile
 import time
 
-from qgis.core import (QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsFeature, QgsGeometry,
-                       QgsPointClusterRenderer, QgsPointXY, QgsProject, QgsRectangle, QgsVectorFileWriter,
-                       QgsVectorLayer)
+from qgis.core import (QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsExpression, QgsExpressionContext,
+                       QgsExpressionContextUtils, QgsFeature, QgsGeometry, QgsPointClusterRenderer, QgsPointXY,
+                       QgsProject, QgsRectangle, QgsVectorFileWriter, QgsVectorLayer)
 from qgis.PyQt.QtCore import QCoreApplication, QEvent, QPoint, QSettings, Qt
 from qgis.PyQt.QtGui import QColor, QImage, QKeyEvent
 from qgis.PyQt.QtWidgets import QMainWindow, QMenu
@@ -390,8 +395,24 @@ def test_dense_map_layers(folder):
             and _state(points, by_id[added[2]["comment_id"]]) == "open" \
             and _state(ranges, next(ranges.getFeatures())) == "closed"
         rules = points.labeling().rootRule().children()
-        checks["two label tiers"] = [r.description() for r in rules] == ["Number", "Details"] and \
-            rules[0].minimumScale() == 100000 and rules[0].maximumScale() == 20000 and rules[1].minimumScale() == 20000
+        default = map_layers.LabelSettings()
+        scales = [(r.minimumScale(), r.maximumScale()) for r in rules]
+        checks["labels grow as you zoom in"] = [r.description() for r in rules] == ["Number", "Short", "Details"] \
+            and scales == [(2000000, 250000), (250000, 50000), (50000, 0)] and \
+            (default.number_scale, default.summary_scale, default.detail_scale) == (2000000, 250000, 50000)
+        short = QgsExpression(default.summary_expression())
+        context = QgsExpressionContext(QgsExpressionContextUtils.globalProjectLayerScopes(points))
+        context.setFeature(next(points.getFeatures()))
+        checks["short line"] = str(short.evaluate(context)).startswith("#") and len(str(short.evaluate(context))) <= 30
+        # Keep each labeling while reading its rules: they belong to it (a dropped temporary frees them).
+        older = map_layers.LabelSettings.from_json('{"numbers": true, "number_scale": 100000, "detail_scale": 20000}')
+        older_labeling = map_layers.build_labeling(older, False)
+        checks["labels set before keep their two steps"] = not older.summary and \
+            [r.description() for r in older_labeling.rootRule().children()] == ["Number", "Details"]
+        crossed = map_layers.LabelSettings(number_scale=100000, summary_scale=250000, detail_scale=20000)
+        crossed_labeling = map_layers.build_labeling(crossed, False)
+        checks["a step out of order is left out"] = \
+            [r.description() for r in crossed_labeling.rootRule().children()] == ["Short", "Details"]
         checks["in a group"] = QgsProject.instance().layerTreeRoot().findGroup(map_layers.GROUP_NAME) is not None
         iface.canvas.setExtent(QgsRectangle(3.02, 55.02, 3.04, 55.04))
         hits = map_layers.comments_at(iface.canvas, QgsPointXY(3.03, 55.03), layers.layers())
@@ -420,7 +441,6 @@ def test_dense_map_layers(folder):
                                             comment_chars=12)
         map_layers.apply_labels(layers.layers(), settings)
         feature = next(ranges.getFeatures())
-        from qgis.core import QgsExpression, QgsExpressionContext, QgsExpressionContextUtils
         context = QgsExpressionContext(QgsExpressionContextUtils.globalProjectLayerScopes(ranges))
         checks["label expressions parse"] = not any(QgsExpression(e).hasParserError() for e in (
             map_layers.RANGE_ANCHOR, map_layers.RANGE_POSITIONS, settings.detail_expression()))
@@ -656,9 +676,11 @@ def test_dock(folder):
         dock._select_ids([added["comment_id"]])
         dock.add_images()
         dock._select_ids([added["comment_id"]])
+        dock.pictures.flush()
         checks["thread: comment + reply"] = len(dock.thread.bubbles) == 2 and \
-            dock.tabs.tabText(1) == "Thread (1)" and dock.thread.bubbles[1].text == "Checked on the survey"
-        checks["thumbnail"] = dock.images.count() == 1 and not dock.images.item(0).icon().isNull()
+            dock.tabs.tabText(0) == "Thread (1)" and dock.thread.bubbles[1].text == "Checked on the survey"
+        checks["image shown"] = len(dock.pictures.items) == 1 and not dock.pictures.view.image.isNull() and \
+            not dock.pictures.strip.item(0).icon().isNull()
 
         # Import: KPs on the route, positions, duplicates.
         table = os.path.join(folder, "import.csv")
@@ -764,6 +786,349 @@ def test_dock(folder):
     failed = [k for k, v in checks.items() if not v]
     return _result("dock: table, columns, map sync, capture, save/conflict, replies, images, import, export",
                    not failed, ", ".join(failed))
+
+
+class _Clipboard:
+    def __init__(self, mime):
+        self.mime = mime
+
+    def mimeData(self):  # noqa: N802 - Qt API
+        return self.mime
+
+
+def _red_pixels(image):
+    count = 0
+    for x in range(0, image.width(), 2):
+        for y in range(0, image.height(), 2):
+            c = QColor(image.pixel(x, y))
+            if c.red() > 200 and c.green() < 60 and c.blue() < 60:
+                count += 1
+    return count
+
+
+def _render_comment(layer, wkt, scale=5000, size=500):
+    """The layer drawn around a comment at ``scale`` (96 dpi, Web Mercator)."""
+    from qgis.core import (QgsExpressionContext, QgsExpressionContextUtils, QgsMapRendererCustomPainterJob,
+                           QgsMapSettings)
+    from qgis.PyQt.QtCore import QSize
+    from qgis.PyQt.QtGui import QPainter
+    mercator = QgsCoordinateReferenceSystem("EPSG:3857")
+    xform = QgsCoordinateTransform(QgsCoordinateReferenceSystem(WGS84), mercator, QgsProject.instance())
+    centre = xform.transform(_pt(wkt))
+    half = size / 96.0 * 0.0254 * scale / 2.0
+    settings = QgsMapSettings()
+    settings.setLayers([layer])
+    settings.setDestinationCrs(mercator)
+    settings.setOutputDpi(96)
+    settings.setOutputSize(QSize(size, size))
+    settings.setExtent(QgsRectangle(centre.x() - half, centre.y() - half, centre.x() + half, centre.y() + half))
+    context = QgsExpressionContext()
+    context.appendScope(QgsExpressionContextUtils.globalScope())
+    context.appendScope(QgsExpressionContextUtils.projectScope(QgsProject.instance()))
+    settings.setExpressionContext(context)
+    image = QImage(size, size, QImage.Format.Format_ARGB32)
+    image.fill(QColor(255, 255, 255))
+    painter = QPainter(image)
+    job = QgsMapRendererCustomPainterJob(settings, painter)
+    job.start()
+    job.waitForFinished()
+    painter.end()
+    return image
+
+
+def test_review_panel(folder):
+    """The selected comment's thread beside its images: side by side when the
+    dock is wide, stacked when narrow, the image pane small without images.
+    Images come from files, a drop and the clipboard; one is drawn in the
+    comment's map label (the comment's own text escaped, labels made before
+    images updated on request). Send & close / reopen, quick status,
+    previous / next with follow on the map; the images are let go when the
+    project closes."""
+    from qgis.PyQt.QtCore import QMimeData
+    iface = _Iface("EPSG:3857")
+    layer = _route_layer()
+    QgsProject.instance().addMapLayer(layer)
+    register = os.path.join(folder, "review folder & co", "review.gpkg")
+    os.makedirs(os.path.dirname(register))
+    store = CommentStore.create(register)
+    set_id = store.list_sets()[0]["set_id"]
+    cap = CaptureRoute.from_layer(layer, layer.crs(), start_kp_km=START_KP, use_cartesian=False)
+    for i, kp in enumerate((1.0, 2.0, 3.0)):
+        store.add_comment(set_id, dict(cap.point_values(START_KP + kp), text=f"Review {i} <b>&</b> [x]",
+                                       status="Open"))
+    store.close()
+    map_layers.set_project_register(register, set_id)
+    asked = []
+    patches = [(dock_module.QMessageBox, "question",
+                staticmethod(lambda *a, **k: asked.append(a[2] if len(a) > 2 else "") or dock_module.MESSAGEBOX_YES)),
+               (dock_module.QMessageBox, "warning", staticmethod(lambda *a, **k: None))]
+    saved = [(obj, name, getattr(obj, name)) for obj, name, _v in patches]
+    for obj, name, value in patches:
+        setattr(obj, name, value)
+    dock = dock_module.RouteCommentsDock(iface, start_kp_for=lambda lyr: START_KP)
+    dock.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+    checks = {}
+
+    def settle():
+        for _i in range(3):
+            QCoreApplication.processEvents()
+
+    try:
+        iface.window.show()
+        dock.show()
+        dock.resize(1100, 820)
+        settle()
+        ids = dock.visible_ids()
+        dock._select_ids([ids[0]])
+        settle()
+        checks["side by side when wide"] = dock.review_split.side_by_side()
+        checks["no priority shown as none, not the first choice"] = dock.quick_priority.currentText() == "" and \
+            dock.quick_status.currentText() == "Open"
+        checks["no image: the image pane is small"] = dock.review_split.compact and \
+            dock.pictures.width() <= 240 and dock.tabs.width() > 600
+
+        # Files (an unreadable one is left out), then the clipboard, then a drop.
+        photo = _png(os.path.join(folder, "photo.png"))
+        fake = os.path.join(folder, "fake.png")
+        with open(fake, "wb") as handle:
+            handle.write(b"not an image")
+        dock.add_image_files([photo, fake])
+        dock.pictures.flush()
+        settle()
+        checks["file added and shown"] = len(dock.pictures.items) == 1 and not dock.pictures.view.image.isNull() \
+            and not dock.review_split.compact and dock.pictures.width() > 300
+        red = QImage(160, 80, QImage.Format.Format_RGB32)
+        red.fill(QColor(255, 0, 0))
+        mime = QMimeData()
+        mime.setImageData(red)
+        real_app = dock_module.QApplication
+
+        class _App:
+            @staticmethod
+            def clipboard():
+                return _Clipboard(mime)
+
+        dock_module.QApplication = _App
+        try:
+            dock.paste_image()
+        finally:
+            dock_module.QApplication = real_app
+        dock.pictures.flush()
+        items = dock.pictures.items
+        pasted = items[-1]["attachment_id"] if items else ""
+        checks["pasted image added and shown"] = len(items) == 2 and items[1]["name"].startswith("Pasted image") \
+            and dock.pictures.current_id() == pasted and dock.pictures.view.image.width() == 160
+        from qgis.PyQt.QtCore import QUrl
+        from ..route_comments.pictures import pictures_from_mime
+        drop = QMimeData()
+        drop.setUrls([QUrl.fromLocalFile(photo), QUrl.fromLocalFile(os.path.join(folder, "notes.txt"))])
+        paths, data = pictures_from_mime(drop)
+        dock.pictures.files_dropped.emit(paths)
+        checks["dropped file added"] = paths == [photo] and data is None and len(dock.pictures.items) == 3
+
+        # The pasted (red) image in the map label; the label predates images, so it is updated on request.
+        cid = dock.current_id
+        points = dock.layers.find("points")
+        old = map_layers.LabelSettings().to_json().replace('"images": true, ', "").replace('"image_mm": 30.0, ', "")
+        for lyr in dock.layers.layers():
+            lyr.setCustomProperty(map_layers.LABELS_PROP, old)
+        dock._show_image(pasted)
+        dock.pictures.on_map.setChecked(True)
+        settle()
+        comment = dock.by_id[cid]
+        checks["map image saved"] = bool(comment["map_image"]) and comment["map_image"].endswith(".png") \
+            and dock.pictures.on_map.isChecked() and dock.pictures.current_id() == pasted
+        checks["old labels updated when asked"] = any("not set to show images" in str(q) for q in asked) and \
+            not map_layers.labels_predate_images(points)
+        settings = map_layers.label_settings_of(points)
+        feature = next(f for f in points.getFeatures() if f["comment_id"] == cid)
+        context = QgsExpressionContext(QgsExpressionContextUtils.globalProjectLayerScopes(points))
+        context.setFeature(feature)
+        html = str(QgsExpression(settings.label_expression()).evaluate(context) or "")
+        checks["label HTML: image, text escaped"] = html.startswith('<div><img src="file:///') and \
+            "%20%26%20co" in html and comment["map_image"] in html and "&lt;b&gt;&amp;&lt;/b&gt;" in html \
+            and "<b>" not in html
+        image = _render_comment(points, comment["wkt"])
+        checks["image drawn in the map label"] = _red_pixels(image) > 300
+        image.save(os.path.join(folder, "label.png"))
+        dock.pictures.on_map.setChecked(False)
+        settle()
+        checks["map image off"] = (dock.by_id[cid]["map_image"] or "") == "" and \
+            _red_pixels(_render_comment(points, comment["wkt"])) == 0
+
+        # Send & close, then reopen with no text; quick status.
+        dock.reply_text.setPlainText("Done on site")
+        dock.send_and_toggle()
+        closed = dock.by_id[cid]["status"]
+        reopen_text = dock.close_button.text()
+        dock.send_and_toggle()
+        checks["send & close / reopen"] = closed == "Resolved" and reopen_text == "Send && reopen" and \
+            dock.by_id[cid]["status"] == "Open" and [b.status_to for b in dock.thread.bubbles[1:]] == \
+            ["Resolved", "Open"] and dock.thread.bubbles[1].text == "Done on site"
+        dock.quick_status.setCurrentText("In progress")
+        dock._quick_set("status")
+        settle()
+        checks["quick status saved"] = dock.store.get_comment(cid)["status"] == "In progress" and \
+            dock.quick_status.currentText() == "In progress"
+
+        # Edit and delete in the thread.
+        done = dock.replies[cid][0]["reply_id"]          # "Done on site", set Resolved
+        dock.thread.edit_reply(done)
+        dock.thread._editing.editor.setPlainText("Done on site, photo added")
+        dock.thread.finish_edit()
+        settle()
+        stored = next(r for r in dock.store.list_replies(cid) if r["reply_id"] == done)
+        checks["reply edited in place"] = stored["text"] == "Done on site, photo added" and \
+            bool(stored["edited_utc"]) and stored["status_to"] == "Resolved" and not dock.thread.is_editing() and \
+            dock.thread.bubbles[1].text == "Done on site, photo added"
+        dock.thread.edit_reply(None)
+        dock.thread._editing.editor.setPlainText("   ")
+        dock.thread.finish_edit()                        # refused: the edit stays open
+        empty_kept_open = dock.thread.is_editing()
+        dock.thread._editing.editor.setPlainText("Review 0, edited in the thread")
+        dock.thread.finish_edit()
+        settle()
+        checks["comment edited in the thread"] = empty_kept_open and not dock.thread.is_editing() and \
+            dock.store.get_comment(cid)["text"] == "Review 0, edited in the thread"
+        save_answer = staticmethod(lambda *a, **k: dock_module.QMessageBox.StandardButton.Save)
+        dock_module.QMessageBox.question = save_answer
+        dock.thread.edit_reply(done)
+        dock.thread._editing.editor.setPlainText("Left with an open edit")
+        dock._select_ids([ids[1]])
+        settle()
+        dock_module.QMessageBox.question = patches[0][2]
+        checks["open edit saved when leaving"] = dock.current_id == ids[1] and \
+            next(r for r in dock.store.list_replies(cid) if r["reply_id"] == done)["text"] == "Left with an open edit"
+        dock._select_ids([cid])
+        settle()
+        dock.send_and_toggle()                           # In progress -> Resolved
+        asked_delete = []
+        dock._ask_reply_delete = lambda to, back, now: asked_delete.append((to, back, now)) or "restore"
+        dock.delete_reply(dock.replies[cid][-1]["reply_id"])
+        settle()
+        checks["Send & close deleted, status back"] = asked_delete[-1] == ("Resolved", "In progress", "Resolved") \
+            and dock.by_id[cid]["status"] == "In progress"
+        dock.delete_reply(done)                          # an older status change: nothing to put back
+        settle()
+        checks["older status reply deleted, status kept"] = asked_delete[-1] == ("Resolved", "", "In progress") \
+            and dock.by_id[cid]["status"] == "In progress" and \
+            done not in [r["reply_id"] for r in dock.replies.get(cid, [])]
+        del dock._ask_reply_delete
+        dock._select_ids([ids[2]])
+        dock.thread.comment_delete_requested.emit()      # question patched to Yes
+        settle()
+        checks["comment deleted from the thread"] = ids[2] not in dock.by_id
+        ids = ids[:2]
+
+        # Previous / next, following the map.
+        dock._select_ids([ids[0]])
+        prev_at_first = dock.prev_button.isEnabled()
+        canvas = iface.canvas
+        canvas.setExtent(QgsRectangle(0, 0, 1000, 1000))   # far from the route
+        dock.follow_button.setChecked(True)
+        dock.step(1)
+        settle()
+        centre = QgsCoordinateTransform(QgsCoordinateReferenceSystem(WGS84), canvas.mapSettings().destinationCrs(),
+                                        QgsProject.instance()).transform(_pt(dock.by_id[ids[1]]["wkt"]))
+        checks["next comment, followed on the map"] = dock.current_id == ids[1] and not prev_at_first and \
+            canvas.extent().contains(centre)
+        dock.step(1)
+        dock.step(1)   # stays on the last
+        checks["stops at the last"] = dock.current_id == ids[-1] and not dock.next_button.isEnabled()
+        dock.follow_button.setChecked(False)
+
+        # Narrow: one above the other.
+        dock.resize(430, 820)
+        settle()
+        checks["stacked when narrow"] = not dock.review_split.side_by_side()
+        dock.resize(1100, 820)
+        settle()
+        checks["side by side again"] = dock.review_split.side_by_side()
+
+        # The project closes: images and thumbnails let go.
+        dock._select_ids([cid])
+        dock.pictures.flush()
+        had_thumbs = len(dock.thumb_cache) > 0
+        QgsProject.instance().clear()
+        settle()
+        checks["project closed: images let go"] = had_thumbs and len(dock.thumb_cache) == 0 and \
+            not dock.pictures.items and dock.pictures.view.image.isNull() and dock.store is None
+    finally:
+        dock.shutdown()
+        dock.layers.remove()
+        dock.deleteLater()
+        for obj, name, value in saved:
+            setattr(obj, name, value)
+        QgsProject.instance().clear()
+        map_layers.set_project_register("", "")
+        iface.close()
+        QCoreApplication.processEvents()
+    failed = [k for k, v in checks.items() if not v]
+    return _result("review panel: thread beside images, map image label, Send & close, step and follow",
+                   not failed, ", ".join(failed))
+
+
+def test_no_stray_windows(folder):
+    """Clicking between comments, editing in the thread and opening the new
+    comment form show no window of their own: a widget made visible before it
+    has a parent flashes up on screen as a little window."""
+    from qgis.PyQt.QtCore import QObject
+    from qgis.PyQt.QtWidgets import QApplication, QWidget
+
+    class _Shows(QObject):
+        def __init__(self):
+            super().__init__()
+            self.windows = []
+
+        def eventFilter(self, obj, event):  # noqa: N802 - Qt API
+            if event.type() == QEvent.Type.Show and isinstance(obj, QWidget) and obj.isWindow():
+                self.windows.append(f"{type(obj).__name__} {getattr(obj, 'text', lambda: '')()!r}"[:80])
+            return False
+
+    iface = _Iface()
+    layer = _route_layer()
+    QgsProject.instance().addMapLayer(layer)
+    register = os.path.join(folder, "stray.gpkg")
+    store = CommentStore.create(register)
+    set_id = store.list_sets()[0]["set_id"]
+    cap = CaptureRoute.from_layer(layer, layer.crs(), start_kp_km=START_KP, use_cartesian=False)
+    ids = []
+    for i in range(3):
+        cid = store.add_comment(set_id, dict(cap.point_values(START_KP + 1 + i), text=f"Comment {i}"))["comment_id"]
+        store.add_reply(cid, "A", f"Reply to {i}")
+        store.add_reply(cid, "B", "", status_to="Resolved")
+        ids.append(cid)
+    store.close()
+    map_layers.set_project_register(register, set_id)
+    dock = dock_module.RouteCommentsDock(iface, start_kp_for=lambda lyr: START_KP)
+    dock.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+    shows = _Shows()
+    try:
+        iface.window.show()
+        dock.show()
+        QCoreApplication.processEvents()
+        QApplication.instance().installEventFilter(shows)
+        for cid in ids + ids[::-1]:
+            dock._select_ids([cid])
+            QCoreApplication.processEvents()
+        dock.thread.edit_reply(dock.replies[ids[0]][0]["reply_id"])
+        dock.thread.cancel_edit()
+        values = cap.point_values(START_KP + 1.5)
+        form = dock_module.NewCommentDialog(dock, values, cap, dock.statuses(), dock.priorities(), dock.fields,
+                                            "Open", "Normal", "Comments")
+        QCoreApplication.processEvents()
+        form.deleteLater()
+    finally:
+        QApplication.instance().removeEventFilter(shows)
+        dock.shutdown()
+        dock.layers.remove()
+        dock.deleteLater()
+        QgsProject.instance().removeMapLayer(layer.id())
+        map_layers.set_project_register("", "")
+        iface.close()
+        QCoreApplication.processEvents()
+    return _result("no stray windows when clicking between comments or opening the comment form",
+                   not shows.windows, "; ".join(shows.windows[:6]))
 
 
 def test_new_register_in_a_new_project(folder):
@@ -885,6 +1250,8 @@ def run_all():
                          lambda: test_reference_conditions(tempfile.mkdtemp(dir=temp)),
                          lambda: test_dense_map_layers(tempfile.mkdtemp(dir=temp)),
                          lambda: test_dock(tempfile.mkdtemp(dir=temp)),
+                         lambda: test_review_panel(tempfile.mkdtemp(dir=temp)),
+                         lambda: test_no_stray_windows(tempfile.mkdtemp(dir=temp)),
                          lambda: test_new_register_in_a_new_project(tempfile.mkdtemp(dir=temp)),
                          lambda: test_register_opens_as_gpkg_layer(tempfile.mkdtemp(dir=temp)),
                          test_convention_token_unmeasured_utm,

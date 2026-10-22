@@ -1073,3 +1073,68 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   reverse KP, with items built once and updated (removing pyqtgraph items is
   slow and noisy under QGIS 3.40). New profiles build on it; moving the
   existing ones is separate work.
+
+## Route Comments review panel and map images (October 2026)
+
+- **Table on top, the comment below it.** The table runs full width; under
+  it a header strip (number, location, status and priority saved at once,
+  previous / next, follow on the map), then the thread (with a Details tab)
+  beside the comment's images. Below about 540 px wide the two stack, and
+  they go back side by side above 600 px, so they do not flap. The image
+  pane shrinks while the comment has no image and gets the user's split back
+  when it has one. Status and priority leave the Details form so there is
+  one place to change them.
+- **Images on the map are part of the label, not annotation items.** The
+  detail tag becomes HTML with the comment's chosen image (`map_image`) on
+  top, so it keeps the leader, the scale tiers, QGIS's placement clear of
+  other tags and the "read the register directly" rule. Annotation items
+  could be dragged, but would be a second copy of each comment to keep in
+  step and save in the project. The comment's own text is escaped (`&`,
+  `<`, `>`), so it is never read as markup and cannot load anything. The
+  image is named only by the register: a file name the label checks against
+  a generated-name pattern, inside the attachments folder given as a
+  percent-encoded file URL (`@route_comments_attachments`). QGIS 3.40 and
+  4.0 read an `<img>` width in points (measured at 96 and 300 dpi), the
+  height following the image. Image and text go in separate `<div>`s,
+  because QGIS keeps text after an inline image on the image's line, even
+  after a `<br>`. Labels made before images are updated only when the user
+  shows an image and agrees, because the default style is never rewritten
+  silently.
+- **Registers only gain columns.** `rc_comment.map_image` and
+  `rc_reply.status_to` are added when a register is opened. Reads select
+  NULL for a column an older register lacks, because Span & Slack reads
+  registers without opening them for writing. *Send & close* (or *Send &
+  reopen*) stores the reply and the new status in one transaction, and the
+  thread shows the change. Pictures named in an import column are copied in
+  with their comments, all or none.
+- **Images are read at the size they are shown.** `QImageReader` reduces
+  each image while decoding where the format allows (JPEG), and applies its
+  EXIF orientation. Images other than JPEG above 60 MP are not decoded, and
+  the viewer holds at most 3200 px on a side and one image at a time.
+  Thumbnails are made one per event-loop turn into a bounded cache, which is
+  emptied when the register changes, the project closes or the plugin
+  unloads. Drops and pastes take local files or image data only. *Follow on
+  the map* pans only when the comment is outside the middle 80 % of the
+  view.
+- **Messages are edited where they are read.** Every message in the thread
+  can be copied, edited in place or deleted, the comment itself included
+  (its text is saved with the same version check as a table edit). An edited
+  reply keeps the status it set and is marked edited (`edited_utc`). A failed
+  save leaves the edit open. Moving on with an open edit asks to save it, and
+  the 4-second refresh waits while an edit is open. A reply records the
+  status it replaced (`status_from`). Deleting the latest status-changing
+  reply, while the status is still the one it set, offers to put that status
+  back in the same save. Replies saved before `status_from` existed fall back
+  on the status an earlier reply set, else the set's first status of the
+  other kind.
+- **Labels grow as you zoom in.** Routes are reviewed at overview scales,
+  so by default the number shows from 1:2 000 000, the number with the
+  first 24 characters from 1:250 000, and the chosen details with the map
+  image from 1:50 000 (it used to be numbers from 1:100 000 and details from
+  1:20 000). Each step is a rule-based label with its own scale range, and a
+  step whose range is empty is left out. Where labels crowd, QGIS drops some
+  and keeps comments that need attention first. Labels saved before the
+  middle step existed read as two steps, so an older number range is not
+  hidden under the new short line. Layers keep their steps until *Restore
+  Defaults* in *Label contents…* is used, because the style is never
+  rewritten silently.

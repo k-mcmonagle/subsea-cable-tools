@@ -13,7 +13,11 @@
 * Statuses/priorities are free choices with defaults; custom values are
   coerced by type; search needs every word; filters combine.
 * Import validation: column guessing, KP/position rules, KP off the route,
-  duplicate IDs (in the register and within the file), UUIDs kept.
+  duplicate IDs (in the register and within the file), UUIDs kept; image
+  files named per row are copied in with their comments (all or none).
+* A comment can show one of its images on the map; *Send & close* replies
+  and sets the status in one save; registers of an earlier version read
+  without the new columns.
 * Export rows hold every documented column, including custom fields.
 """
 
@@ -202,6 +206,199 @@ def test_replies_and_attachments() -> bool:
     finally:
         store.close()
     return _result("replies in order; images copied beside the register and cleaned up", ok)
+
+
+def test_map_image_and_status_replies() -> bool:
+    """One of a comment's images can be shown on the map (cleared when that
+    image goes); a pasted image is saved from bytes; *Send & close* adds a
+    reply and sets the status in one save, with or without text."""
+    folder = _folder()
+    path = os.path.join(folder, "reg.gpkg")
+    image = os.path.join(folder, "survey photo.jpg")
+    with open(image, "wb") as handle:
+        handle.write(b"\xff\xd8\xff\xe0fake")
+    store = CommentStore.create(path)
+    try:
+        set_id = store.list_sets()[0]["set_id"]
+        comment = store.add_comment(set_id, _point())
+        other = store.add_comment(set_id, _point(lon=3.1))
+        cid = comment["comment_id"]
+        rows = store.add_attachments(cid, [image], names=["Shown name.jpg"])
+        pasted = store.add_image_bytes(cid, b"\x89PNG\r\n\x1a\npasted", "Pasted image 1.png")
+        store.set_map_image(cid, pasted["attachment_id"])
+        shown = store.get_comment(cid)["map_image"]
+        try:
+            store.set_map_image(other["comment_id"], rows[0]["attachment_id"])   # not that comment's image
+            foreign = False
+        except ConflictError:
+            foreign = True
+        try:
+            store.update_comment(cid, {"map_image": "../../elsewhere.png"})
+            not_editable = store.get_comment(cid)["map_image"] == shown
+        except CommentStoreError:
+            not_editable = False
+        store.delete_attachment(pasted["attachment_id"])
+        cleared = store.get_comment(cid)["map_image"] == ""
+        store.set_map_image(cid, rows[0]["attachment_id"])
+        store.set_map_image(cid, None)
+        version = store.get_comment(cid)["version"]
+        reply = store.add_reply(cid, "B", "Done on site", status_to="Closed")
+        status_only = store.add_reply(cid, "B", "", status_to="Open")
+        try:
+            store.add_reply(cid, "B", "  ")
+            empty_refused = False
+        except CommentStoreError:
+            empty_refused = True
+        after = store.get_comment(cid)
+        thread = store.list_replies(cid)
+        long_message = True
+        if os.name == "nt":   # an attachments path past Windows' limit gives a plain message, not "not found"
+            deep = os.path.join(folder, "d" * max(1, 225 - len(folder)))
+            far = CommentStore(os.path.join(deep, "r.gpkg"))
+            try:
+                far.add_image_bytes(cid, b"\x89PNG\r\n\x1a\nx", "x.png")
+                long_message = False
+            except CommentStoreError as exc:
+                long_message = "too long for Windows" in str(exc)
+        ok = (long_message and shown == pasted["file_name"] and pasted["file_name"].endswith(".png")
+              and os.path.isfile(store.attachment_path(rows[0])) and rows[0]["original_name"] == "Shown name.jpg"
+              and foreign and not_editable and cleared and store.get_comment(cid)["map_image"] == ""
+              and reply["status_to"] == "Closed" and after["status"] == "Open" and after["version"] == version + 2
+              and [r["status_to"] for r in thread] == ["Closed", "Open"] and status_only["text"] == ""
+              and empty_refused and model.first_status(None, closed=True) == "Resolved"
+              and model.first_status(None, closed=False) == "Open")
+    finally:
+        store.close()
+    return _result("map image per comment; pasted images; Send & close", ok)
+
+
+def test_reply_edit_and_delete() -> bool:
+    """Replies are edited (marked edited, the status they set kept) and deleted;
+    deleting the latest *Send & close* can put the status back, from the
+    status it replaced or, for replies saved before that was recorded, from
+    an earlier reply or the other kind of status."""
+    path = os.path.join(_folder(), "reg.gpkg")
+    store = CommentStore.create(path)
+    try:
+        set_id = store.list_sets()[0]["set_id"]
+        cid = store.add_comment(set_id, _point(status="In progress"))["comment_id"]
+        plain = store.add_reply(cid, "B", "First look")
+        close = store.add_reply(cid, "B", "Done", status_to="Resolved")
+        edited = store.update_reply(close["reply_id"], "Done, checked on site")
+        status_only = store.update_reply(close["reply_id"], "")   # a reply that set a status needs no text
+        try:
+            store.update_reply(plain["reply_id"], "  ")
+            empty_refused = False
+        except CommentStoreError:
+            empty_refused = True
+        replies = store.list_replies(cid)
+        latest = replies[-1]
+        restore = model.status_to_restore(latest, replies, "Resolved", None)
+        moved_on = model.status_to_restore(latest, replies, "Closed", None)
+        plain_restore = model.status_to_restore(replies[0], replies, "Resolved", None)
+        reopen = store.add_reply(cid, "C", "", status_to="Open")
+        replies = store.list_replies(cid)
+        not_latest = model.status_to_restore(replies[1], replies, "Resolved", None)
+        legacy_alone = model.status_to_restore({"reply_id": "x", "status_to": "Resolved"},
+                                               [{"reply_id": "x", "status_to": "Resolved"}], "Resolved", None)
+        legacy_reopen = model.status_to_restore(
+            {"reply_id": "y", "status_to": "Open"},
+            [{"reply_id": "x", "status_to": "Closed"}, {"reply_id": "y", "status_to": "Open"}], "open", None)
+        version = store.get_comment(cid)["version"]
+        store.delete_reply(reopen["reply_id"], set_status=reopen["status_from"])
+        after = store.get_comment(cid)
+        store.delete_reply(plain["reply_id"])
+        store.delete_reply("no-such-reply")
+        try:
+            store.update_reply(plain["reply_id"], "gone")
+            gone = False
+        except ConflictError:
+            gone = True
+        ok = (close["status_from"] == "In progress" and edited["text"] == "Done, checked on site"
+              and edited["edited_utc"] and edited["status_to"] == "Resolved" and status_only["text"] == ""
+              and empty_refused and restore == "In progress" and moved_on == "" and plain_restore == ""
+              and not_latest == "" and reopen["status_from"] == "Resolved" and legacy_alone == "Open"
+              and legacy_reopen == "Closed" and after["status"] == "Resolved" and after["version"] == version + 1
+              and [r["reply_id"] for r in store.list_replies(cid)] == [close["reply_id"]] and gone)
+    finally:
+        store.close()
+    return _result("replies edited and deleted; a deleted Send & close can put the status back", ok)
+
+
+def test_import_with_images_is_all_or_none() -> bool:
+    """Imported comments bring their image files (copied in, the first shown on
+    the map when asked); a failed import leaves no comments and no files."""
+    folder = _folder()
+    path = os.path.join(folder, "reg.gpkg")
+    pictures = os.path.join(folder, "pictures")
+    os.makedirs(pictures)
+    for name in ("a.png", "b.jpg"):
+        with open(os.path.join(pictures, name), "wb") as handle:
+            handle.write(b"img")
+    headers = ["Comment", "Latitude", "Longitude", "Picture"]
+    mapping = model.guess_mapping(headers)
+    rows = [["One", "55", "3", "a.png; b.jpg"], ["Two", "55.1", "3.1", os.path.join(pictures, "b.jpg")],
+            ["Three", "55.2", "3.2", "missing.png"], ["Four", "55.3", "3.3", "notes.txt"]]
+    checked = model.validate_import(rows, mapping, image_folder=pictures)
+    store = CommentStore.create(path)
+    try:
+        set_id = store.list_sets()[0]["set_id"]
+        values = []
+        for item in checked:
+            v = dict(item.values, ref_kind=model.REF_LOCATION, wkt=f"POINT({item.values['lon']} {item.values['lat']})",
+                     attach_on_map=True)
+            values.append(v)
+        uuid = "0190f000-0000-7000-8000-00000000abcd"   # the second row repeats the ID: nothing is kept
+        bad = [dict(values[0], comment_id=uuid), dict(values[1], comment_id=uuid)]
+        try:
+            store.add_comments(set_id, bad)
+            atomic = False
+        except CommentStoreError:
+            folder_left = os.listdir(store.attachments_dir) if os.path.isdir(store.attachments_dir) else []
+            atomic = not store.list_comments(set_id) and not folder_left
+        added = store.add_comments(set_id, values)
+        first = added[0]
+        names = [r["original_name"] for r in store.list_attachments(first["comment_id"])]
+        ok = (mapping.get("images") == 3 and all(r.ok for r in checked)
+              and len(checked[0].values["attach_paths"]) == 2 and "not found" in checked[2].warnings[0]
+              and "not an image" in checked[3].warnings[0] and "attach_paths" not in checked[2].values
+              and atomic and names == ["a.png", "b.jpg"] and first["attachment_count"] == 2
+              and first["map_image"] == store.list_attachments(first["comment_id"])[0]["file_name"]
+              and added[2]["map_image"] == "" and len(os.listdir(store.attachments_dir)) == 3)
+    finally:
+        store.close()
+    return _result("import with image files: copied in, shown on the map, all or none", ok)
+
+
+def test_older_register_read_without_open() -> bool:
+    """Another tool reads a register made by an earlier version without
+    opening it for writing: the new columns read as empty."""
+    path = os.path.join(_folder(), "reg.gpkg")
+    store = CommentStore.create(path)
+    cid = store.add_comment(store.list_sets()[0]["set_id"], _point())["comment_id"]
+    store.add_reply(cid, "B", "Old reply")
+    store.close()
+    conn = sqlite3.connect(path)
+    with conn:
+        conn.execute("ALTER TABLE rc_comment DROP COLUMN map_image")
+        conn.execute("ALTER TABLE rc_reply DROP COLUMN status_to")
+    conn.close()
+    reader = CommentStore(path)
+    try:
+        comments = reader.list_comments()
+        replies = reader.replies_by_comment()
+        ok = comments[0]["map_image"] is None and replies[cid][0]["status_to"] is None \
+            and replies[cid][0]["text"] == "Old reply"
+    finally:
+        store_module.close_connection(path)
+    reopened = CommentStore(path).open()
+    try:
+        ok = ok and reopened.get_comment(cid)["map_image"] is None
+        reopened.set_map_image(cid, None)
+        ok = ok and reopened.get_comment(cid)["map_image"] == ""
+    finally:
+        reopened.close()
+    return _result("an older register reads without the new columns, and gains them on open", ok)
 
 
 def test_custom_fields() -> bool:
@@ -457,6 +654,10 @@ def run_all() -> list:
         test_batch_is_atomic_and_validated(),
         test_versioned_save_and_second_connection(),
         test_replies_and_attachments(),
+        test_map_image_and_status_replies(),
+        test_reply_edit_and_delete(),
+        test_import_with_images_is_all_or_none(),
+        test_older_register_read_without_open(),
         test_custom_fields(),
         test_reopen_adds_missing_columns(),
         test_busy_register_message(),

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -78,6 +79,35 @@ def closed_statuses(statuses) -> set:
     return {s["name"].casefold() for s in normalise_statuses(statuses) if s.get("closed")}
 
 
+def first_status(statuses, closed: bool) -> str:
+    """The set's first closed (or first open) status: what *Send & close*
+    (or *Send & reopen*) sets. '' when the set has none of that kind."""
+    for status in normalise_statuses(statuses):
+        if bool(status.get("closed")) == closed:
+            return status["name"]
+    return ""
+
+
+def status_to_restore(reply: Dict, replies: Sequence[Dict], current_status: str, statuses) -> str:
+    """The status deleting ``reply`` should put back, or '' when it set none or
+    the status has moved on since (a later reply changed it, or it was changed
+    by hand). Replies saved before the previous status was recorded fall back
+    on the status an earlier reply set, else the set's first status of the
+    other kind (an undone *Send & close* reopens)."""
+    status_to = str(reply.get("status_to") or "")
+    if not status_to or str(current_status or "").casefold() != status_to.casefold():
+        return ""
+    changes = [r for r in replies if r.get("status_to")]
+    if changes and changes[-1].get("reply_id") != reply.get("reply_id"):
+        return ""
+    if reply.get("status_from"):
+        return str(reply["status_from"])
+    earlier = [r for r in changes if r.get("reply_id") != reply.get("reply_id")]
+    if earlier:
+        return str(earlier[-1]["status_to"])
+    return first_status(statuses, closed=status_to.casefold() not in closed_statuses(statuses))
+
+
 def default_priority(priorities) -> str:
     names = normalise_priorities(priorities)
     for name in names:
@@ -94,6 +124,32 @@ def match_choice(value, choices: Sequence[str]) -> Tuple[str, bool]:
         if choice.casefold() == text.casefold():
             return choice, True
     return text, False
+
+
+# --------------------------------------------------------------------------- images
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp")
+
+
+def is_image_name(name: str) -> bool:
+    return str(name or "").lower().endswith(IMAGE_EXTENSIONS)
+
+
+def split_image_names(cell) -> List[str]:
+    """File names or paths listed in one cell (``;``, ``|`` or one per line)."""
+    out = []
+    for part in re.split(r"[;|\r\n]+", str(cell or "")):
+        part = part.strip().strip('"').strip()
+        if part:
+            out.append(part)
+    return out
+
+
+def resolve_image(name: str, folder: str = "") -> str:
+    """``name`` as a full path: absolute as given, else inside ``folder``."""
+    path = os.path.expanduser(name)
+    if not os.path.isabs(path) and folder:
+        path = os.path.join(folder, path)
+    return os.path.normpath(path)
 
 
 # --------------------------------------------------------------------------- custom fields
@@ -445,6 +501,7 @@ def export_rows(comments: Sequence[Dict], set_names: Dict[str, str], fields_by_s
             "condition": COND_LABELS.get(conditions.get(c.get("comment_id"), ""), ""),
             "reply_count": len(thread),
             "replies": "\n".join(f"{(r.get('created_utc') or '')[:10]} {r.get('author') or ''}: {r.get('text') or ''}"
+                                 + (f" [status: {r['status_to']}]" if r.get("status_to") else "")
                                  for r in thread),
             "attachment_count": int(c.get("attachment_count") or 0), "wkt": c.get("wkt") or "",
             "created_utc": c.get("created_utc") or "", "updated_utc": c.get("updated_utc") or "",
@@ -463,7 +520,7 @@ def export_rows(comments: Sequence[Dict], set_names: Dict[str, str], fields_by_s
 IMPORT_TARGETS = [
     ("ext_id", "ID"), ("text", "Comment"), ("status", "Status"), ("priority", "Priority"),
     ("author", "Author"), ("comment_date", "Date"), ("tags", "Tags"), ("kp_km", "KP"),
-    ("kp_end_km", "KP to"), ("lat", "Latitude"), ("lon", "Longitude"),
+    ("kp_end_km", "KP to"), ("lat", "Latitude"), ("lon", "Longitude"), ("images", "Image file(s)"),
 ]
 _GUESSES = {
     "ext_id": ("comment id", "id", "ref", "reference", "no", "number", "item", "comment no"),
@@ -478,6 +535,8 @@ _GUESSES = {
     "kp_end_km": ("kp to", "end kp", "kp end", "to kp", "kp2"),
     "lat": ("lat", "latitude", "y lat"),
     "lon": ("lon", "long", "longitude", "lng", "x lon"),
+    "images": ("image", "images", "image file", "image files", "picture", "pictures", "photo", "photos",
+               "attachment", "attachments"),
 }
 
 
@@ -533,7 +592,7 @@ def _uuid_like(text: str) -> bool:
 def validate_import(data_rows: Sequence[Sequence], mapping: Dict[str, int], fields: Sequence[CustomField] = (),
                     statuses=None, priorities=None, existing_ids: Iterable[str] = (),
                     kp_range: Optional[Tuple[float, float]] = None, first_line: int = 2,
-                    default_author: str = "", default_date: str = "") -> List[ImportRow]:
+                    default_author: str = "", default_date: str = "", image_folder: str = "") -> List[ImportRow]:
     """Check every data row and turn it into comment values.
 
     A row needs comment text and a location: latitude and longitude (a map
@@ -544,7 +603,9 @@ def validate_import(data_rows: Sequence[Sequence], mapping: Dict[str, int], fiel
     in the file, is a duplicate and the row is not imported. An ID that is a
     comment UUID (e.g. from an export) keeps that UUID; any other ID is kept
     as the comment's external ID. Unknown statuses/priorities are kept and
-    reported.
+    reported. Image files named in the image column (absolute, or inside
+    ``image_folder``; several separated by ``;``) go in ``attach_paths``; a
+    missing or unsupported one is noted and the comment imported without it.
     """
     status_list = status_names(statuses)
     priority_list = normalise_priorities(priorities)
@@ -660,6 +721,18 @@ def validate_import(data_rows: Sequence[Sequence], mapping: Dict[str, int], fiel
             if value is not None:
                 custom[fld.field_id] = value
         values["custom_json"] = dump_custom(custom)
+
+        paths = []
+        for name in split_image_names(cell(row, "images")):
+            path = resolve_image(name, image_folder)
+            if not is_image_name(path):
+                item.warnings.append(f"'{name}' is not an image ({', '.join(IMAGE_EXTENSIONS)}); left out")
+            elif not os.path.isfile(path):
+                item.warnings.append(f"image '{name}' not found; left out")
+            elif path not in paths:
+                paths.append(path)
+        if paths:
+            values["attach_paths"] = paths
         out.append(item)
     return out
 

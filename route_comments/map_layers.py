@@ -16,13 +16,19 @@ clustered. Which comments are closed or need attention is passed to the
 style through two project variables (``@route_comments_closed``,
 ``@route_comments_attention``), so the plugin never has to rewrite it.
 
-Labels come in two tiers (:class:`LabelSettings`): the comment number at
-middle scales, and the fields the user picks (or any expression) when
-zoomed in further. Full text is never shown at small scales. By default a
+Labels grow as the map zooms in (:class:`LabelSettings`): the comment
+number far out, then the number with the start of the comment, then the
+fields the user picks (or any expression) with the comment's map image.
+Each step has its own scale and can be left out. By default a
 label is a tag set a few millimetres off the comment with a leader line
 back to it (a range is anchored at the middle of its part in view); QGIS
 picks the free side, so tags stay clear of the comments and of each other,
 and comments needing attention win over closed ones where space is short.
+A comment can show one of its images at the top of its detail tag: the
+label is HTML (QGIS draws ``<img>``), with the comment's own text escaped
+so it is never read as markup, and the image named only by the register
+(``map_image``, a file name checked by pattern) inside the attachments
+folder (the ``@route_comments_attachments`` project variable, a file URL).
 
 Overlapping or clustered comments stay reachable: :class:`CommentPickTool`
 lists every comment under the cursor, and selecting features on these
@@ -45,12 +51,13 @@ from qgis.core import (Qgis, QgsCallout, QgsCategorizedSymbolRenderer, QgsCoordi
                        QgsTextBackgroundSettings, QgsTextBufferSettings, QgsTextFormat, QgsUnitTypes,
                        QgsVectorLayer)
 from qgis.gui import QgsMapTool, QgsRubberBand
-from qgis.PyQt.QtCore import QSettings, QSizeF, pyqtSignal
+from qgis.PyQt.QtCore import QSettings, QSizeF, QUrl, pyqtSignal
 from qgis.PyQt.QtGui import QColor, QCursor, QFont
 from qgis.PyQt.QtWidgets import QMenu
 
 from ..maptools.canvas_items import remove_canvas_item
 from ..qgis_compat import FEATURE_REQUEST_NO_GEOMETRY, GEOMETRY_LINE, GEOMETRY_POINT, qt_exec
+from .store import attachments_dir_for
 
 LAYER_PROP = "subsea_cable_tools/route_comments"          # "points" | "ranges"
 LABELS_PROP = "subsea_cable_tools/route_comments_labels"   # LabelSettings JSON
@@ -61,6 +68,7 @@ PROJECT_KEY_SET = "route_comments_set"
 PROJECT_KEY_LAYER = "route_comments_layer_"                 # + kind: the layer id
 VAR_CLOSED = "route_comments_closed"
 VAR_ATTENTION = "route_comments_attention"
+VAR_ATTACHMENTS = "route_comments_attachments"                # file URL of the attachments folder
 TABLE = "rc_comment"
 WGS84 = "EPSG:4326"
 TITLES = {"points": "Comments", "ranges": "Comment ranges"}
@@ -119,6 +127,14 @@ def _set_variable(project: QgsProject, name: str, value: str) -> None:
         QgsExpressionContextUtils.setProjectVariable(project, name, value)
 
 
+def attachments_url(register_path: str) -> str:
+    """The register's attachments folder as a file URL, percent-encoded (no
+    spaces, quotes or ampersands left to escape inside a label's HTML)."""
+    encoded = _scoped(QUrl, "ComponentFormattingOption", "FullyEncoded")
+    url = QUrl.fromLocalFile(attachments_dir_for(register_path)).toString(encoded)
+    return url.replace("&", "%26").replace("'", "%27").replace('"', "%22")
+
+
 def _id_list(values: Iterable[str]) -> str:
     items = [str(v) for v in values if v]
     return "|" + "|".join(items) + "|" if items else ""
@@ -168,14 +184,38 @@ RANGE_POSITIONS = (
     "ELSE 'TR,BL,T,B,R,L' END)) END")
 LEADER_COLOR = "70,70,70"
 TEXT_COLOR, CLOSED_TEXT_COLOR = "35,35,35", "125,125,125"
+# A map image is one of the register's own attachment files: a generated name, nothing else.
+IMAGE_NAME_PATTERN = "(?i)^[a-z0-9_-]+[.](png|jpe?g|gif|bmp|tiff?|webp)$"
+_MAP_IMAGE = "coalesce(attribute(@feature, 'map_image'), '')"   # NULL where a layer predates the column
+PT_PER_MM = 72.0 / 25.4
+
+
+def html_text(expression: str) -> str:
+    """``expression``'s value as HTML text: ``&``, ``<`` and ``>`` escaped, new lines as ``<br>``."""
+    out = f"coalesce(to_string({expression}), '')"
+    for char, entity in (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;")):
+        out = f"replace({out}, '{char}', '{entity}')"
+    return f"replace({out}, '\\n', '<br>')"
+
+
+def image_html(width_mm: float) -> str:
+    """An ``<img>`` of the comment's map image ``width_mm`` wide (height by its
+    shape), or '' when it has none. QGIS reads an HTML image width in points."""
+    width = max(1, int(round(float(width_mm) * PT_PER_MM)))
+    return (f"CASE WHEN @{VAR_ATTACHMENTS} IS NOT NULL AND regexp_match({_MAP_IMAGE}, '{IMAGE_NAME_PATTERN}') > 0 "
+            f"THEN '<img src=\"' || @{VAR_ATTACHMENTS} || '/' || {_MAP_IMAGE} || '\" width=\"{width}\">' "
+            "ELSE '' END")
 
 
 @dataclass
 class LabelSettings:
     """What the comment labels show, from which scale, and how they look."""
-    numbers: bool = True                 # the number tier (middle scales)
-    number_scale: int = 100000           # numbers shown when zoomed in beyond 1:number_scale
-    detail_scale: int = 20000            # details shown when zoomed in beyond 1:detail_scale
+    numbers: bool = True                 # the number alone, far out
+    number_scale: int = 2000000          # ... shown when zoomed in beyond 1:number_scale
+    summary: bool = True                 # then the number and the start of the comment
+    summary_scale: int = 250000          # ... shown when zoomed in beyond 1:summary_scale
+    summary_chars: int = 24              # ... that many characters of the comment
+    detail_scale: int = 50000            # then the details (and image) beyond 1:detail_scale
     parts: List[str] = field(default_factory=lambda: ["number", "comment"])
     separator: str = "space"
     comment_chars: int = 40
@@ -184,6 +224,8 @@ class LabelSettings:
     background: bool = True              # a white tag behind the text (else a halo)
     style: str = STYLE_LEADER            # leader line to the comment, or a tag beside it
     leader_mm: float = 8.0               # how far a leader sets the tag off the comment
+    images: bool = True                  # a comment's chosen image at the top of its detail tag
+    image_mm: float = 30.0               # that image's width on the map
 
     @classmethod
     def from_json(cls, text: str) -> "LabelSettings":
@@ -192,6 +234,8 @@ class LabelSettings:
         except (TypeError, ValueError):
             data = {}
         known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
+        if data and "summary" not in data:
+            known["summary"] = False   # labels set before the middle step keep their two steps
         try:
             return cls(**known)
         except TypeError:
@@ -200,8 +244,8 @@ class LabelSettings:
     def to_json(self) -> str:
         return json.dumps(asdict(self), sort_keys=True)
 
-    def comment_expression(self) -> str:
-        n = max(5, int(self.comment_chars))
+    def comment_expression(self, chars: Optional[int] = None) -> str:
+        n = max(5, int(self.comment_chars if chars is None else chars))
         first = "regexp_substr(\"text\", '^[^\\n]*')"
         return (f"CASE WHEN length({first}) > {n} THEN left({first}, {n - 1}) || '…' "
                 f"ELSE {first} END")
@@ -218,6 +262,21 @@ class LabelSettings:
         sep = SEPARATORS.get(self.separator, " ")
         joined = ", ".join(f"nullif({p}, '')" for p in parts)
         return f"array_to_string(array_filter(array({joined}), @element IS NOT NULL), '{sep}')"
+
+    def summary_expression(self) -> str:
+        """The middle step: ``#12 Boulder field close t…``."""
+        return f"{LABEL_PARTS[0][2]} || ' ' || coalesce({self.comment_expression(self.summary_chars)}, '')"
+
+    def label_expression(self) -> str:
+        """The detail label: :meth:`detail_expression`, or as HTML under the
+        comment's map image when images are on."""
+        if not self.images:
+            return self.detail_expression()
+        # Blocks, not <br>: QGIS keeps text after an inline image on the image's line.
+        return (f"with_variable('rc_text', {html_text(self.detail_expression())}, "
+                f"with_variable('rc_image', {image_html(self.image_mm)}, "
+                "CASE WHEN @rc_image = '' THEN @rc_text ELSE '<div>' || @rc_image || '</div>' || "
+                "CASE WHEN @rc_text <> '' THEN '<div>' || @rc_text || '</div>' ELSE '' END END))")
 
 
 def _around_point():
@@ -275,12 +334,14 @@ def _state_properties(pal: QgsPalLayerSettings, line: bool) -> None:
     pal.setDataDefinedProperties(props)
 
 
-def _pal(expression: str, settings: LabelSettings, line: bool, bold: bool = True) -> QgsPalLayerSettings:
+def _pal(expression: str, settings: LabelSettings, line: bool, bold: bool = True,
+         html: bool = False) -> QgsPalLayerSettings:
     pal = QgsPalLayerSettings()
     pal.isExpression = True
     pal.fieldName = expression
     pal.enabled = True
     fmt = QgsTextFormat()
+    fmt.setAllowHtmlFormatting(html)
     font = QFont()
     font.setBold(bold)
     fmt.setFont(font)
@@ -327,14 +388,24 @@ def _pal(expression: str, settings: LabelSettings, line: bool, bold: bool = True
 
 
 def build_labeling(settings: LabelSettings, line: bool) -> QgsRuleBasedLabeling:
-    """Rule-based labels: numbers at middle scales, details when zoomed in."""
+    """Rule-based labels that grow as the map zooms in: the number far out,
+    then a short line, then the details (each step taking over from the last;
+    a step whose range is empty is left out)."""
     root = QgsRuleBasedLabeling.Rule(None)
     detail = max(1, int(settings.detail_scale))
-    if settings.numbers and int(settings.number_scale) > detail:
-        root.appendChild(QgsRuleBasedLabeling.Rule(_pal(LABEL_PARTS[0][2], settings, line), detail,
-                                                   int(settings.number_scale), "", "Number"))
-    root.appendChild(QgsRuleBasedLabeling.Rule(_pal(settings.detail_expression(), settings, line, bold=False), 0,
-                                               detail, "", "Details"))
+    rules = []
+    inner = detail
+    if settings.summary and int(settings.summary_scale) > detail:
+        rules.append(QgsRuleBasedLabeling.Rule(_pal(settings.summary_expression(), settings, line, bold=False),
+                                               detail, int(settings.summary_scale), "", "Short"))
+        inner = int(settings.summary_scale)
+    if settings.numbers and int(settings.number_scale) > inner:
+        rules.insert(0, QgsRuleBasedLabeling.Rule(_pal(LABEL_PARTS[0][2], settings, line), inner,
+                                                  int(settings.number_scale), "", "Number"))
+    rules.append(QgsRuleBasedLabeling.Rule(_pal(settings.label_expression(), settings, line, bold=False,
+                                                html=settings.images), 0, detail, "", "Details"))
+    for rule in rules:
+        root.appendChild(rule)
     return QgsRuleBasedLabeling(root)
 
 
@@ -348,6 +419,12 @@ def apply_labels(layers: Sequence[QgsVectorLayer], settings: LabelSettings, on: 
 
 def label_settings_of(layer: Optional[QgsVectorLayer]) -> LabelSettings:
     return LabelSettings.from_json(str(layer.customProperty(LABELS_PROP, "") or "")) if layer else LabelSettings()
+
+
+def labels_predate_images(layer: Optional[QgsVectorLayer]) -> bool:
+    """Whether the layer's labels were last set by a version without map images."""
+    raw = str(layer.customProperty(LABELS_PROP, "") or "") if layer is not None else ""
+    return bool(raw) and '"images"' not in raw
 
 
 # --------------------------------------------------------------------------- default style
@@ -433,6 +510,7 @@ class CommentLayers:
         repoint, refilter and reload the existing ones (style untouched)."""
         _set_variable(self.project, VAR_CLOSED, _id_list(sorted(closed)))
         _set_variable(self.project, VAR_ATTENTION, _id_list(sorted(attention)))
+        _set_variable(self.project, VAR_ATTACHMENTS, attachments_url(register_path))
         out, created = [], []
         for kind in ("points", "ranges"):
             name = f"{TITLES[kind]} — {set_name}" if set_name else TITLES[kind]
