@@ -30,7 +30,7 @@ from typing import Dict, List, Optional, Set
 import numpy as np
 import pyqtgraph as pg
 
-from qgis.PyQt.QtCore import QSettings, Qt, QTimer
+from qgis.PyQt.QtCore import QSettings, Qt, QTimer, pyqtSignal
 from qgis.PyQt.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -55,24 +55,19 @@ from ..acquired import bins as B
 from ..acquired import roles as R
 from ..acquired.controller import dataset_kp_map
 from ..acquired.help import show_help
+from ..acquired import style as S
 from ..acquired.store import StoreReader
 from ..ui_helpers import hint_style, status_style
 
 _DASH = getattr(getattr(Qt, "PenStyle", Qt), "DashLine")
 _SETTINGS = "SubseaCableTools/BurialPlanner/assessment"
-DATASET_COLOURS = [(31, 119, 180), (255, 127, 14), (44, 160, 44), (148, 103, 189), (140, 86, 75),
-                   (227, 119, 194), (127, 127, 127), (188, 189, 34), (23, 190, 207)]
-GOVERNING = (13, 52, 120)
-TARGET = (0, 128, 0)
-BELOW_FILL = (211, 47, 47, 110)
-STATUS_LEVELS = [(B.STATUS_MEETS, (76, 175, 80), "Meets target"), (B.STATUS_BELOW, (211, 47, 47), "Below target"),
-                 (B.STATUS_NO_DATA, (200, 200, 200), "No data"), (B.STATUS_NO_TARGET, (144, 202, 249), "No target")]
+DATASET_COLOURS = S.DATASET_COLOURS
+GOVERNING = S.GOVERNING
+TARGET = S.TARGET
+BELOW_FILL = S.BELOW_FILL
+STATUS_LEVELS = S.STATUS_LEVELS
 MAX_DATASETS = len(DATASET_COLOURS)
 LISTING_PREVIEW = 2000
-
-
-def _faint(colour, alpha: int = 110):
-    return (*colour[:3], alpha)
 
 
 def _breaks(x: np.ndarray, y: np.ndarray, gap_km: float):
@@ -93,6 +88,8 @@ def _setting(key: str, default: float) -> float:
 
 
 class AssessmentTab(QWidget):
+    resultChanged = pyqtSignal()        # a new assessment, or none (empty_message says why)
+
     def __init__(self, controller, model, dock=None, parent=None, persist: bool = True):
         super().__init__(parent)
         self.controller = controller
@@ -100,6 +97,8 @@ class AssessmentTab(QWidget):
         self.dock = dock
         self.persist = persist
         self.result: Optional[A.Assessment] = None
+        self.empty_message = ""
+        self._wanted = False
         self._unchecked: Set[str] = set()
         self._datasets: List[Dict] = []
         self._dirty = True
@@ -281,7 +280,10 @@ class AssessmentTab(QWidget):
     def _busy_changed(self, busy: bool) -> None:
         if not busy and self._pending:
             self._pending = False
-            self.request_build()
+            if self._wanted and not self.isVisible():
+                self.build_now()
+            else:
+                self.request_build()
 
     def request_build(self, *_args) -> None:
         self._dirty = True
@@ -346,13 +348,20 @@ class AssessmentTab(QWidget):
                 continue
         return list(dict.fromkeys(keys))
 
-    def _build(self) -> None:
-        if not self.isVisible():
+    def build_now(self) -> None:
+        """Assess now even when the tab is not shown (the Reporting tab needs a result)."""
+        self._wanted = True
+        self._timer.stop()
+        self._build(force=True)
+
+    def _build(self, force: bool = False) -> None:
+        if not (force or self.isVisible()):
             return
         if self.controller.busy:
             self._pending = True
             self.state.setText("Waiting for the running task…")
             return
+        self._wanted = False
         request = self._request()
         if request is None:
             self._dirty = False
@@ -382,10 +391,13 @@ class AssessmentTab(QWidget):
             self._draw()
         except Exception:
             log_exception("Burial Planner: drawing the assessment failed")
+        self.resultChanged.emit()
 
     # -- drawing -------------------------------------------------------------------------
     def _show_empty(self, message: str) -> None:
         self.result = None
+        self.empty_message = message
+        self.resultChanged.emit()
         self.summary.setText(message)
         self.summary.setStyleSheet(status_style("warn"))
         self.notes.setText("")
@@ -427,7 +439,7 @@ class AssessmentTab(QWidget):
             x = series.kp[order]
             gap = max(series.binset.bridge_m, 1.0) / 1000.0
             bx, by = _breaks(x, series.dol[order], gap)
-            self._curve("dol", k, _faint(colour)).setData(bx, by)
+            self._curve("dol", k, S.faint(colour)).setData(bx, by)
             used["dol"] += 1
             legend.append(("solid", colour, series.spec.name))
             for key, row in ((R.WATER_DEPTH, "wd"), (R.PITCH, "pitch"), (R.ROLL, "roll")):

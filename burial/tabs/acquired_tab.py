@@ -42,6 +42,7 @@ from qgis.PyQt.QtWidgets import (
     QWidget,
 )
 
+from ...plotkit.widgets import entries_button
 from ...plugin_log import log_exception
 from ...qgis_compat import (BUTTON_BOX_CANCEL, BUTTON_BOX_CLOSE, BUTTON_BOX_OK, DIALOG_ACCEPTED, EDIT_TRIGGER_NONE,
                             SELECTION_BEHAVIOR_SELECT_ROWS, SELECTION_MODE_SINGLE, qt_exec)
@@ -51,7 +52,7 @@ from ..acquired.assessment import utc_text
 from ..acquired.help import show_help
 from ..acquired.import_wizard import ImportWizard, show_rejected
 from ..acquired.store import KINDS, AcquiredStoreError
-from ..ui_helpers import hint_style, menu_tool_button, status_style
+from ..ui_helpers import hint_style, status_style
 
 _USER = getattr(getattr(Qt, "ItemDataRole", Qt), "UserRole")
 _HORIZONTAL = getattr(getattr(Qt, "Orientation", Qt), "Horizontal")
@@ -78,9 +79,9 @@ class AcquiredDataTab(QWidget):
         self.file_label.setTextInteractionFlags(getattr(getattr(Qt, "TextInteractionFlag", Qt),
                                                         "TextSelectableByMouse"))
         top.addWidget(self.file_label, 1)
-        top.addWidget(menu_tool_button("Data file ▾", [("Open another data file…", self._open_file),
-                                                       ("Start a new data file…", self._new_file)],
-                                       "The burial data file this project uses (beside the plan file)."))
+        top.addWidget(entries_button("Data file", "The burial data file this project uses (beside the plan file).",
+                                     [("Open another data file…", self._open_file),
+                                      ("Start a new data file…", self._new_file)]))
         help_button = QPushButton("Help")
         help_button.clicked.connect(lambda: show_help(self))
         top.addWidget(help_button)
@@ -102,10 +103,10 @@ class AcquiredDataTab(QWidget):
         self.add_button.setToolTip("Import deliveries: into an existing dataset or a new one.")
         self.add_button.clicked.connect(lambda: self.add_data(None))
         buttons.addWidget(self.add_button)
-        self.dataset_menu = menu_tool_button("Dataset ▾", [
+        self.dataset_menu = entries_button("Dataset", "Rename, reorder or archive the selected dataset.", [
             ("Rename…", self._rename), ("Change type…", self._change_type), None,
             ("Move up", lambda: self._move(-1)), ("Move down", lambda: self._move(1)), None,
-            ("Archive…", self._archive)], "Rename, reorder or archive the selected dataset.")
+            ("Archive…", self._archive)])
         buttons.addWidget(self.dataset_menu)
         buttons.addStretch(1)
         left_layout.addLayout(buttons)
@@ -134,10 +135,10 @@ class AcquiredDataTab(QWidget):
         self.overlaps_button.setToolTip("Where this dataset's deliveries overlap in time, and the rule for each.")
         self.overlaps_button.clicked.connect(self._overlaps)
         actions.addWidget(self.overlaps_button)
-        self.file_menu = menu_tool_button("File ▾", [
+        self.file_menu = entries_button("File", "The selected file.", [
             ("Save the original as delivered…", self._save_original), ("Rejected rows…", self._show_rejected),
             None, ("Withdraw…", lambda: self._set_status("withdrawn")),
-            ("Restore…", lambda: self._set_status("current"))], "The selected file.")
+            ("Restore…", lambda: self._set_status("current"))])
         actions.addWidget(self.file_menu)
         self.check_button = QPushButton("Check KPs")
         self.check_button.setToolTip("Compare the delivered KPs with the records' positions on the RPL they refer "

@@ -200,6 +200,26 @@ class StayOpenMenu(QMenu):
         super().mouseReleaseEvent(event)
 
 
+def action_menu(entries, parent=None) -> QMenu:
+    """A menu from ``(label, slot)`` pairs (``None`` for a separator)."""
+    menu = QMenu(parent)
+    for entry in entries:
+        if entry is None:
+            menu.addSeparator()
+        else:
+            label, slot = entry
+            menu.addAction(label).triggered.connect(lambda _checked=False, s=slot: s())
+    return menu
+
+
+def entries_button(text: str, tip: str, entries) -> QToolButton:
+    """:func:`menu_button` over :func:`action_menu` entries; the button owns its menu."""
+    menu = action_menu(entries)
+    button = menu_button(text, tip, menu)
+    menu.setParent(button, menu.windowFlags())
+    return button
+
+
 def menu_button(text: str, tip: str, menu: QMenu) -> QToolButton:
     """A button that opens ``menu`` on a click."""
     button = QToolButton()

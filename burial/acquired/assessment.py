@@ -140,7 +140,14 @@ def _runs_from_bins(selection: B.Selection, level: np.ndarray, gaps: Sequence[Tu
         inside = (hi > a) & (lo < b)
         lo, hi, lv = np.maximum(lo[inside], a), np.minimum(hi[inside], b), lv[inside]
     order = np.argsort(lo, kind="stable")
-    return lo[order], hi[order], lv[order]
+    lo, hi, lv = lo[order], hi[order], lv[order]
+    if not lo.size:
+        return lo, hi, lv
+    # Touching stretches of one level become one (a bar is a handful of stretches, not one per metre).
+    new = np.r_[True, (lv[1:] != lv[:-1]) | (lo[1:] > hi[:-1] + 1e-9)]
+    starts = np.flatnonzero(new)
+    ends = np.r_[starts[1:], lo.size] - 1
+    return lo[starts], hi[ends], lv[starts]
 
 
 def build(reader, request: Request, cancelled: Optional[Callable[[], bool]] = None,

@@ -52,6 +52,19 @@ first in Acquired Data), or choose <i>Worst case</i>. The bar under the plot sho
 line and time behind it; the map marks the KP. Click a below-target range to zoom to it. The listing gives one
 row per 1, 5 or 10 m: the shallowest (or mean) DOL there and the record behind it.</p>
 
+<h4>Reporting: burial graphs</h4>
+<p>The Reporting tab lays the current assessment (the datasets, rule and range chosen in the Assessment tab) out
+on pages: a title block with your fields, the panels you choose (status bar, DOL with the target, the
+governing-dataset bar, any channel such as water depth or tension) with their heights and axis limits, a KP axis,
+and a footer naming the data, the route, the rule and who made the report when. Pages follow the route a set
+length at a time and repeat a little of the previous page. Optional summary pages give the key figures, every
+below-target range and each plan section; a data-sources page lists every file behind the graph with its
+checksum. The preview is the same drawing as the PDF.</p>
+<p>Titles and fields can use tokens: {project}, {plan}, {rpl}, {rpl_rev}, {datasets}, {mode}, {target}, {date},
+{kp_start}, {kp_end}, {range_start}, {range_end}, {page}, {pages}. Save a template in the project (each save is a
+version) or export it to a file for other projects. <i>Export</i> writes a vector PDF, a PNG or SVG per page (an
+SVG can go into a QGIS print layout), or the listing behind the graph as CSV.</p>
+
 <h4>KPs</h4>
 <p>KPs are used as delivered when they refer to the plan's RPL. KPs quoted on another RPL (an earlier revision,
 the as-laid RPL) are moved onto the plan's route by seabed position, and the assessment says so.

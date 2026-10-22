@@ -18,6 +18,7 @@ no QGIS needed):
 * ``ba_overlap``  overlap decisions between files of a dataset; changing a
                   rule adds a row and marks the old one superseded
 * ``ba_log``      what was done, by whom, when and why
+* ``ba_template`` burial graph report templates (a changed template is a new version)
 
 Rows are only ever added, apart from statuses; every change writes a
 ``ba_log`` row in the same transaction. Columns are stored as compressed
@@ -67,8 +68,9 @@ KIND_TRENCHER, KIND_SURVEY, KIND_OTHER = "trencher", "survey", "other"
 KINDS = {KIND_TRENCHER: "Trencher / plough log", KIND_SURVEY: "Burial survey", KIND_OTHER: "Other"}
 MEASURE_DOL = {"kind": "dol", "reference": "msbl", "units": "m", "positive": "down"}
 
-T_META, T_DATASET, T_PROFILE, T_FILE, T_CHUNK, T_ARRAY, T_OVERLAP, T_LOG = (
-    "ba_meta", "ba_dataset", "ba_profile", "ba_file", "ba_chunk", "ba_array", "ba_overlap", "ba_log")
+T_META, T_DATASET, T_PROFILE, T_FILE, T_CHUNK, T_ARRAY, T_OVERLAP, T_LOG, T_TEMPLATE = (
+    "ba_meta", "ba_dataset", "ba_profile", "ba_file", "ba_chunk", "ba_array", "ba_overlap", "ba_log",
+    "ba_template")
 
 _TABLES: Dict[str, str] = {
     T_META: "key TEXT PRIMARY KEY, value TEXT",
@@ -91,6 +93,8 @@ _TABLES: Dict[str, str] = {
                 "reason TEXT, author TEXT, created_utc TEXT, superseded_by TEXT"),
     T_LOG: ("log_id INTEGER PRIMARY KEY AUTOINCREMENT, created_utc TEXT, author TEXT, action TEXT, "
             "dataset_id TEXT, target_id TEXT, detail_json TEXT"),
+    T_TEMPLATE: ("template_id TEXT PRIMARY KEY, name TEXT NOT NULL, version INTEGER NOT NULL, template_json TEXT, "
+                 "fingerprint TEXT, created_utc TEXT, author TEXT"),
 }
 _INDEXES = (
     f"CREATE INDEX IF NOT EXISTS ba_file_dataset ON {T_FILE} (dataset_id, seq)",
@@ -370,6 +374,18 @@ class _Reads:
         for row in rows:
             latest[row["name"]] = row
         return list(latest.values())
+
+    # report templates
+    def list_templates(self) -> List[Dict]:
+        """The latest version of each saved report template: ``{template_id, name, version, template}``."""
+        latest: Dict[str, Dict] = {}
+        for row in self._read(f"SELECT * FROM {T_TEMPLATE} ORDER BY name COLLATE NOCASE, version"):
+            latest[row["name"]] = dict(row)
+        out = []
+        for row in latest.values():
+            row["template"] = _json(row.pop("template_json", None), {})
+            out.append(row)
+        return out
 
     # files
     def list_files(self, dataset_id: str, include_inactive: bool = True) -> List[Dict]:
@@ -748,6 +764,26 @@ class AcquiredStore(_Reads):
                          (profile_id, name, version, P.to_json(clean), fingerprint, utc_now_iso(), current_user()))
             self._log(conn, "save_profile", None, profile_id, {"name": name, "version": version})
         return profile_id
+
+    def save_template(self, name: str, template: Dict) -> str:
+        """The id of ``template`` under ``name``: the latest version if unchanged, else a new version."""
+        from . import report_template as RT
+        name = str(name or "").strip() or "Burial graph"
+        clean = RT.normalise(template)
+        clean["name"] = name
+        fingerprint = hashlib.sha256(RT.fingerprint_text(clean).encode("utf-8")).hexdigest()
+        rows = self._read(f"SELECT template_id, version, fingerprint FROM {T_TEMPLATE} WHERE name = ? "
+                          "ORDER BY version DESC LIMIT 1", (name,))
+        if rows and rows[0]["fingerprint"] == fingerprint:
+            return rows[0]["template_id"]
+        version = rows[0]["version"] + 1 if rows else 1
+        template_id = new_id()
+        with self._write("save the report template") as conn:
+            conn.execute(f"INSERT INTO {T_TEMPLATE} (template_id, name, version, template_json, fingerprint, "
+                         "created_utc, author) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                         (template_id, name, version, RT.to_json(clean), fingerprint, utc_now_iso(), current_user()))
+            self._log(conn, "save_template", None, template_id, {"name": name, "version": version})
+        return template_id
 
     # files
     def add_file(self, dataset_id: str, prepared: PreparedFile, profile_id: Optional[str] = None,

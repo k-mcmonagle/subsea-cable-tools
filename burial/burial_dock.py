@@ -105,6 +105,7 @@ from .tabs.tools_tab import ToolsTab
 from .acquired.controller import AcquiredController
 from .tabs.acquired_tab import AcquiredDataTab
 from .tabs.assessment_tab import AssessmentTab
+from .tabs.reporting_tab import ReportingTab
 
 _VERTICAL = getattr(Qt, "Orientation", Qt).Vertical
 
@@ -269,12 +270,10 @@ class BurialPlannerDock(QDockWidget):
         self.acquired = AcquiredController(self.model, self)
         self.acquired_tab = AcquiredDataTab(self.acquired, self.model, self)
         self.assessment_tab = AssessmentTab(self.acquired, self.model, self)
+        self.reporting_tab = ReportingTab(self.acquired, self.model, self.assessment_tab, self)
         self.workflow_tabs.addTab(self.acquired_tab, "Acquired Data")
         self.workflow_tabs.addTab(self.assessment_tab, "Assessment")
-        # Burial graph reports are being built; the tab stays a placeholder.
-        index = self.workflow_tabs.addTab(QWidget(), "Reporting")
-        self.workflow_tabs.setTabEnabled(index, False)
-        self.workflow_tabs.setTabToolTip(index, "Under development")
+        self.workflow_tabs.addTab(self.reporting_tab, "Reporting")
         self.splitter.addWidget(self.workflow_tabs)
 
         profile_pane = QWidget()
@@ -2704,6 +2703,7 @@ class BurialPlannerDock(QDockWidget):
             # Reopened from the project on the next show (refresh).
             self.acquired.leave_project()
             self.assessment_tab.shutdown()
+            self.reporting_tab.shutdown()
         except (AttributeError, RuntimeError):
             pass
         self._release_pick_tool()
