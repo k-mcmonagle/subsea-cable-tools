@@ -7,7 +7,8 @@
 3. Cable and bodies: one library type, library types by KP, or a Workbench
    assembly fitted to the RPL; in-line bodies by KP.
 4. Friction: one coefficient, or soil zones by KP with a cable / body x soil table.
-5. Lay control: bottom tension or slack, by KP section, and the lay direction.
+5. Lay control: bottom tension or slack, by KP section, and the lay direction;
+   sections can hold the cable (buried by a plough, or pinned at an anchor).
 6. Criteria: the reporting limits (the Lay Assessment's defaults).
 
 :meth:`SetupPanel.settings` / :meth:`apply_settings` round-trip everything
@@ -85,6 +86,14 @@ CABLE_CHOICES = (
     (CABLE_MANUAL, "Enter the cable properties"),
 )
 DIRECTIONS = ((1, "Increasing KP"), (-1, "Decreasing KP"))
+# Short labels for the lay control sections table (its Control column is narrow).
+SECTION_MODE_LABELS = {
+    pl.TENSION: "Tension (kN)",
+    pl.BOTTOM_SLACK: "Bottom slack (%)",
+    pl.ROUTE_SLACK: "Route slack (%)",
+    pl.RPL_LEGS: "RPL leg slack",
+    pl.HELD: "Held (kN)",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +393,7 @@ class SetupPanel(QWidget):
     frictionChanged = pyqtSignal()   # seabed friction only (live update: new friction on the same stations)
     libraryRequested = pyqtSignal()
     tensionFinderRequested = pyqtSignal()
+    holdsRequested = pyqtSignal()    # fill held sections from the RPL's burial events or the burial plan
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -400,7 +410,7 @@ class SetupPanel(QWidget):
         self.seabed_section = Section("2  Seabed", self._build_seabed(), True)
         self.cable_section = Section("3  Cable and bodies", self._build_cable(), True)
         self.friction_section = Section("4  Seabed friction", self._build_friction())
-        self.control_section = Section("5  Lay control (tension / slack)", self._build_control(), True)
+        self.control_section = Section("5  Lay control (tension / slack / holds)", self._build_control(), True)
         self.criteria_section = Section("6  Reporting limits", self._build_criteria())
         for section in (self.route_section, self.seabed_section, self.cable_section, self.friction_section,
                         self.control_section, self.criteria_section):
@@ -999,20 +1009,40 @@ class SetupPanel(QWidget):
                                   "laid at, so on slopes the result depends on it.")
         self.direction.currentIndexChanged.connect(self._emit_control)
         form.addRow("Lay direction", self.direction)
-        modes = [(k, pl.MODE_LABELS[k]) for k in pl.MODES]
-        self.control_sections = EditTable([Col("kp0", "KP from", "float"), Col("kp1", "KP to", "float"),
-                                           Col("mode", "Control", "choice", pl.TENSION, modes),
-                                           Col("value", "Value", "float", 5.0)], "Add section", height=80, title="lay control sections")
+        modes = [(k, SECTION_MODE_LABELS[k]) for k in pl.SECTION_MODES]
+        self.control_sections = EditTable(
+            [Col("kp0", "KP from", "float"), Col("kp1", "KP to", "float"),
+             Col("mode", "Control", "choice", pl.TENSION, modes,
+                 "Bottom tension or slack, as above; or Held: the cable is held there (buried by a plough, "
+                 "clamped or anchored)."),
+             Col("value", "Value", "float", 5.0, tip="kN for a tension or a hold (the tension it is laid and held "
+                                                      "at, e.g. the plough tension at PLDN); % for slack."),
+             Col("name", "Name", "text", "", tip="Optional, e.g. Plough 1 or First-end anchor: shown on the "
+                                                 "profile and in the Holds tab.")],
+            "Add section", height=80, title="lay control sections")
+        metrics = self.control_sections.table.fontMetrics()
+        for column, sample in enumerate(("KP from", "KP from", "Bottom slack (%)", "Value")):
+            # Sized to their content, so all five columns fit the pane (a combo needs room for its arrow).
+            pad = 40 if column == 2 else 16
+            self.control_sections.table.setColumnWidth(column, metrics.horizontalAdvance(sample) + pad)
         self.control_sections.changed.connect(self._emit_control)
+        holds_row = QHBoxLayout()
+        holds_row.addWidget(bar_button("Hold plough sections…", "Add held sections over the plough (PLDN to PLUP) "
+                                       "sections of the RPL's events or of the Burial Planner plan, at a tension "
+                                       "you choose.", self.holdsRequested.emit))
+        holds_row.addStretch(1)
         sections_body = QWidget()
         sections_layout = QVBoxLayout(sections_body)
         sections_layout.setContentsMargins(14, 0, 0, 0)
         note = QLabel("A tension or slack over a KP range, in place of the value above (e.g. less tension over "
-                      "rough ground).")
+                      "rough ground). <b>Held</b>: the cable is held over the range, e.g. buried by a plough (KP to "
+                      "= KP from for a point, e.g. an anchor). It is laid at the tension in Value, which pulls back "
+                      "on the cable laid before it; it does not span or slide, and nothing passes through it.")
         note.setWordWrap(True)
         note.setStyleSheet("color: #555;")
         sections_layout.addWidget(note)
         sections_layout.addWidget(self.control_sections)
+        sections_layout.addLayout(holds_row)
         self.control_sections_section = Section("By KP section", sections_body, False)
         form.addRow(self.control_sections_section)
         finder = bar_button("Find the highest tension within limits…",
@@ -1576,10 +1606,13 @@ class SetupPanel(QWidget):
                                                                         else ""), True)
         mode = self.mode.currentData()
         unit = pl.MODE_UNITS[mode]
-        sections = len(self.control_sections.rows())
-        self.control_sections_section.set_status(f"{sections} section(s)" if sections else "none", True)
+        rows = self.control_sections.rows()
+        sections = len(rows)
+        held = sum(1 for row in rows if row.get("mode") == pl.HELD)
+        text = f"{sections} section(s)" + (f", {held} held" if held else "")
+        self.control_sections_section.set_status(text if sections else "none", True)
         self.control_section.set_status(f"{pl.MODE_LABELS[mode].split(' (')[0]} {self.value.value():.2f} {unit}"
-                                        + (f", {sections} section(s)" if sections else ""), True)
+                                        + (f", {text}" if sections else ""), True)
         self._update_cable_info()
 
     def _update_cable_info(self) -> None:
@@ -1634,7 +1667,8 @@ class SetupPanel(QWidget):
         for row in self.control_sections.rows():
             if row.get("kp0") is None or row.get("kp1") is None or row.get("value") is None:
                 continue
-            sections.append(pl.ControlSection(row["kp0"], row["kp1"], row.get("mode") or pl.TENSION, row["value"]))
+            sections.append(pl.ControlSection(row["kp0"], row["kp1"], row.get("mode") or pl.TENSION, row["value"],
+                                              str(row.get("name") or "").strip()))
         return pl.LayControl(self.mode.currentData(), float(self.value.value()), sections, list(legs),
                              int(self.direction.currentData() or 1))
 
@@ -1708,13 +1742,22 @@ class SetupPanel(QWidget):
         return out
 
     def apply_tension(self, value_kn: float, sections: Sequence[Tuple[float, float, float]] = ()) -> None:
-        """Lay at a bottom tension (from the tension finder); ``sections`` as (KP from, KP to, kN)."""
+        """Lay at a bottom tension (from the tension finder); ``sections`` as (KP from, KP to, kN).
+        Held sections are kept."""
         _set_combo(self.mode, pl.TENSION)
         self.value.setValue(float(value_kn))
         if sections:
-            self.control_sections.set_rows([{"kp0": a, "kp1": b, "mode": pl.TENSION, "value": v}
-                                            for a, b, v in sections])
+            held = [row for row in self.control_sections.rows() if row.get("mode") == pl.HELD]
+            self.control_sections.set_rows(held + [{"kp0": a, "kp1": b, "mode": pl.TENSION, "value": v}
+                                                   for a, b, v in sections])
             self.control_sections_section.button.setChecked(True)   # show what was set
+        self.update_status()
+
+    def add_holds(self, rows: Sequence[Dict], replace: bool = True) -> None:
+        """Add held sections (``kp0``, ``kp1``, ``value``, ``name``); ``replace`` the held ones there."""
+        kept = [row for row in self.control_sections.rows() if not (replace and row.get("mode") == pl.HELD)]
+        self.control_sections.set_rows(kept + [dict(row, mode=pl.HELD) for row in rows])
+        self.control_sections_section.button.setChecked(True)   # show what was added
         self.update_status()
 
     def cable_sections_list(self) -> List[pl.CableSection]:
@@ -1908,6 +1951,13 @@ class SetupPanel(QWidget):
         lines.append(f"Friction: {self.friction_section.status.text()}")
         lines.append(f"Lay control: {self.control_section.status.text()}, laid towards "
                      f"{self.direction.currentText().lower()}")
+        holds = self.control().holds()
+        for section in holds[:12]:
+            lo, hi = sorted((section.kp_start, section.kp_end))
+            where = f"KP {lo:.3f}" if hi - lo < 1e-9 else f"KP {lo:.3f} to {hi:.3f}"
+            lines.append(f"Held{' ' + section.name if section.name else ''}: {where} at {section.value:g} kN")
+        if len(holds) > 12:
+            lines.append(f"… and {len(holds) - 12} more held section(s)")
         return lines
 
 

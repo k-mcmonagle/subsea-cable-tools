@@ -87,6 +87,17 @@ def sand_waves() -> Dict:
     return s
 
 
+def plough_holds() -> Dict:
+    s = _base(4000.0, spacing_m=0.5, wave_height_m=0.8, wave_length_m=40.0)
+    s["cable"]["manual"] = dict(_DA)
+    s["control"]["value"] = 1.0
+    s["control"]["sections"] = [
+        {"kp0": 0.0, "kp1": 0.0, "mode": pl.HELD, "value": 1.0, "name": "First-end anchor"},
+        {"kp0": 0.6, "kp1": 1.4, "mode": pl.HELD, "value": 25.0, "name": "Plough 1"},
+        {"kp0": 2.4, "kp1": 3.2, "mode": pl.HELD, "value": 25.0, "name": "Plough 2"}]
+    return s
+
+
 EXAMPLES: List[Tuple[str, str, object]] = [
     ("Verification: flat seabed with a depression",
      "A 40 m wide, 2 m deep trough in a flat seabed, light cable (10 N/m). The Summary compares the model with "
@@ -105,6 +116,11 @@ EXAMPLES: List[Tuple[str, str, object]] = [
      "A 1.8 m rock berm 20 m wide, entered as a custom shape of six points, armoured cable at 10 kN.", rock_berm),
     ("Sand waves on a slope, with a repeater",
      "3 km of 1.2 m sand waves on a 2° slope with roughness, light cable and one repeater.", sand_waves),
+    ("Plough sections and a first-end anchor (illustrative values)",
+     "Surface lay at 1 kN over sand waves, armoured cable, with two plough sections held at 25 kN (the tension "
+     "at PLDN) and the first end anchored at KP 0 (Lay control, By KP section). Each PLDN tension pulls back on "
+     "the cable laid before it and bridges the sand-wave troughs there (Plots, Cable colour: What sets the "
+     "tension); the anchor takes what reaches it. The Holds tab lists what each hold carries.", plough_holds),
 ]
 
 

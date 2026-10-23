@@ -37,8 +37,10 @@ diameter, added EI and its own MBR, from the protection's data sheet.</li>
 table of coefficients for each cable type (or body kind) and soil. The model is 2D: the lateral coefficient is used
 only for the alter-course note (the turn radius the cable holds); nothing moves the cable sideways.</li>
 <li><b>Lay control.</b> Bottom tension (kN), bottom slack (% over the seabed), slack over the route (%, as in an
-RPL), or the RPL slack of each leg. Override the value over KP ranges under <i>By KP section</i>. Set the lay
-direction. <i>Find the highest
+RPL), or the RPL slack of each leg. Override the value over KP ranges under <i>By KP section</i>, where
+<i>Held</i> holds the cable over a range (buried by a plough) or at a point (an anchor: KP to = KP from), at the
+tension in Value. <i>Hold plough sections</i> adds them from the RPL's PLDN / PLUP events or the Burial Planner
+plan. Set the lay direction. <i>Find the highest
 tension within limits</i> opens the Find tension tab.</li>
 <li><b>Run.</b> The first run samples the seabed (in the background). After that, a change to the lay control or
 the friction updates the results in about a second: move a slider and see the spans grow or shrink. The view stays
@@ -70,7 +72,7 @@ spans within a target (see below); <i>Use for the lay control</i> sets it. Below
 (sweep)</i> lays the cable at a range of bottom tensions and plots the span length against tension.</li>
 <li><b>Save.</b> Scenarios (all settings and the sampled seabed) save in the project's Span Analysis GeoPackage.
 <i>Add to map</i> writes the findings as a line layer. <i>Export</i> writes CSV files, a PNG of the plot, or a DXF
-of the scene: the seabed, the cable, spans by level, supports, bodies, features, sea level, the KP axis and the
+of the scene: the seabed, the cable, spans by level, supports, bodies, holds, features, sea level, the KP axis and the
 tension, slack and slope graphs, each on its own layer (SA_SEABED, SA_CABLE, SA_SPAN_RED ...), in metres with
 X = KP x 1000 and Y = elevation x the vertical exaggeration you choose.</li>
 </ol>
@@ -105,7 +107,20 @@ below (loop risk);</li>
 <li>over a crest the tension can change by up to a factor e<sup>&mu;&Delta;&theta;</sup> (capstan).</li>
 </ul>
 <p>Friction makes the result depend on the lay direction and history. The tool gives one consistent answer for the
-lay direction you set.</p>
+lay direction you set. Both ends of the profile sit on the seabed. The end laid first keeps the tension it was laid
+at, or what a later touchdown pulls it to, as if held by the cable beyond it or an anchor; the end laid last is the
+current touchdown.</p>
+<p><b>Holds (buried or pinned).</b> A lay control section set to <i>Held</i> holds the cable: buried by a plough
+from PLDN to PLUP, clamped, or at an anchor (a point). It is laid at the tension in its Value (e.g. the tension at the
+plough as it goes down), and like any touchdown that tension pulls back on the cable laid before it, falling by
+&mu;<i>w</i> per metre: 25 kN against 1 kN of surface lay reaches back (25 &minus; 1) / &mu;<i>w</i>, 800 m for
+60 N/m at &mu; 0.5. Spans there are labelled <i>pulled back by a hold</i>. Then the held cable follows the seabed (no
+span) and does not slide, and the touchdowns after it do not reach back through it: the cable laid after starts
+afresh at its own lay control. Slack sections next to a hold do not draw cable from it. The Holds tab gives, for each
+hold, the free cable's tension either side, the net axial load it carries (an anchor's load), how far its pull-back
+reaches, and the upward pull of the free cable leaving it, which the burial or anchor must resist (no soil
+resistance is modelled: compare it with the uplift resistance of the burial). The tension finder and the sweep keep
+the holds as set, and the detail model keeps held nodes on the seabed.</p>
 <p><b>Slack and tension: one rule.</b> Tension and surplus cable are never both positive. With slack control the
 cable laid is compared with the seabed it must cover, within the friction reach. Where the cable is short, it is
 pulled taut: the tool finds the tension at which the rest shape uses exactly the cable laid. Where there is
@@ -208,7 +223,8 @@ different line (14 m apart mid-way along a 20 km leg at 57&deg;N).</li>
 <ul>
 <li>2D, static, after lay. No current, no vessel motion, no lay dynamics, no lateral movement (except the
 alter-course note).</li>
-<li>Rigid seabed: no embedment or self-burial.</li>
+<li>Rigid seabed: no embedment or self-burial. A hold is rigid and fixed: the soil's own resistance (axial and
+uplift) is not modelled.</li>
 <li>Inextensible cable. Constant tension along a span except for the weight term <i>w &Delta;y</i>.</li>
 <li>Small-slope shape with a slope correction. A note marks slopes steeper than 20&deg;.</li>
 <li>Coulomb friction, the same static and sliding coefficient. Values for cables are uncertain: run a range.</li>

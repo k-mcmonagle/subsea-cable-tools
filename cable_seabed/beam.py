@@ -165,14 +165,16 @@ def solve_tensioned_beam(x_m: np.ndarray, obstacle_m: np.ndarray, w_npm: np.ndar
                          ei_nm2: np.ndarray, loads_n: Optional[np.ndarray] = None,
                          y_ends: Optional[Tuple[float, float, float, float]] = None,
                          y_start: Optional[np.ndarray] = None, max_iter: int = 100,
-                         cancel=None) -> BeamResult:
+                         cancel=None, pinned: Optional[np.ndarray] = None) -> BeamResult:
     """Rest a tensioned beam on the seabed (see the module docstring).
 
     ``x_m`` uniform, ascending; per node: ``obstacle_m`` seabed elevation,
     ``w_npm`` submerged weight, ``h_n`` horizontal tension, ``ei_nm2``
     bending stiffness, ``loads_n`` point loads (N, down). The two first and
     two last nodes are held at ``y_ends`` (default: on the seabed).
-    ``y_start`` is an initial shape (for the first active set).
+    ``y_start`` is an initial shape (for the first active set). ``pinned``
+    nodes stay on the seabed (bilateral contact: buried or anchored); their
+    reaction may be negative (the seabed holds the cable down).
     """
     x = np.asarray(x_m, dtype=float)
     g = np.asarray(obstacle_m, dtype=float)
@@ -203,10 +205,11 @@ def solve_tensioned_beam(x_m: np.ndarray, obstacle_m: np.ndarray, w_npm: np.ndar
     gf = g[free]
     qq = _matvec(fd0, fd1, fd2, gf) + kfc + f[free]
     m = len(gf)
+    held = np.zeros(m, dtype=bool) if pinned is None else np.asarray(pinned, dtype=bool)[free]
     if y_start is not None:
-        active = (np.asarray(y_start, dtype=float)[free] - gf) <= 1e-6
+        active = ((np.asarray(y_start, dtype=float)[free] - gf) <= 1e-6) | held
     else:
-        active = np.zeros(m, dtype=bool)
+        active = held.copy()
     scale = float(np.median(fd0)) if m else 1.0
     tol_u = 1e-9
     tol_p = 1e-9 * max(scale, 1.0) * max(h, 1e-3)
@@ -228,7 +231,7 @@ def solve_tensioned_beam(x_m: np.ndarray, obstacle_m: np.ndarray, w_npm: np.ndar
         u = penta_solve(a0, a1, a2, rhs)
         u[active] = 0.0
         p = _matvec(fd0, fd1, fd2, u) + qq
-        new_active = np.where(active, p > -tol_p, u < -tol_u)
+        new_active = np.where(active, p > -tol_p, u < -tol_u) | held
         if np.array_equal(new_active, active):
             converged = True
             break
@@ -239,7 +242,7 @@ def solve_tensioned_beam(x_m: np.ndarray, obstacle_m: np.ndarray, w_npm: np.ndar
         active = new_active
     if not converged:
         method = "projected SOR"
-        u = np.maximum(u, 0.0)
+        u = np.where(held, 0.0, np.maximum(u, 0.0))
         omega = 1.6
         colours = [np.arange(c, m, 3) for c in range(3)]
         for sweep in range(20000):
@@ -247,10 +250,10 @@ def solve_tensioned_beam(x_m: np.ndarray, obstacle_m: np.ndarray, w_npm: np.ndar
                 check_cancel(cancel)
             for idx in colours:
                 r = _matvec(fd0, fd1, fd2, u) + qq
-                u[idx] = np.maximum(0.0, u[idx] - omega * r[idx] / fd0[idx])
+                u[idx] = np.where(held[idx], 0.0, np.maximum(0.0, u[idx] - omega * r[idx] / fd0[idx]))
             if sweep % 20 == 0:
                 p = _matvec(fd0, fd1, fd2, u) + qq
-                worst = np.max(np.where(u > tol_u, np.abs(p), np.maximum(-p, 0.0)))
+                worst = np.max(np.where(held, 0.0, np.where(u > tol_u, np.abs(p), np.maximum(-p, 0.0))))
                 if worst <= 1e-6 * max(float(np.max(np.abs(f))), 1.0):
                     converged = True
                     break
@@ -258,7 +261,10 @@ def solve_tensioned_beam(x_m: np.ndarray, obstacle_m: np.ndarray, w_npm: np.ndar
     y = y_fixed.copy()
     y[free] = gf + u
     full = _matvec(d0, d1, d2, y) + f
-    reaction = np.where(fixed, np.nan, np.maximum(full, 0.0))
+    hold_down = np.zeros(n, dtype=bool)
+    if pinned is not None:
+        hold_down = np.asarray(pinned, dtype=bool) & free
+    reaction = np.where(fixed, np.nan, np.where(hold_down, full, np.maximum(full, 0.0)))
     curvature = np.zeros(n)
     curvature[1:-1] = (y[:-2] - 2.0 * y[1:-1] + y[2:]) / h ** 2
     return BeamResult(x, g, y, reaction, hn, ei, curvature, converged, iterations, method, h)

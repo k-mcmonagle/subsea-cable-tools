@@ -6,7 +6,7 @@ Sources, each placed at the measured KP the analysis uses:
 * the analysed RPL's events (``Event`` and ``Remarks`` of its positions),
   sorted by the Workbench event rules into cable bodies, crossings,
   operations (PLDN, PLUP, burial), alter courses and the rest;
-* what is in the model: bodies, protection and seabed features;
+* what is in the model: bodies, protection, holds and seabed features;
 * Route Comments on the same route (points and KP ranges);
 * the Burial Planner plan for the same RPL (PLDN / PLUP or start / end of
   burial, burial and skip sections, crossings and other hazards);
@@ -38,8 +38,8 @@ from ..cable_seabed.core import INFO, RangeFinding
 SRC_RPL, SRC_MODEL, SRC_COMMENT, SRC_BURIAL, SRC_MARKER = "rpl", "model", "comment", "burial", "marker"
 SOURCES = (
     (SRC_RPL, "RPL events", "The analysed RPL's events (Event column), sorted by the Workbench event rules.", True),
-    (SRC_MODEL, "In the model (bodies, protection, features)", "What the analysis models: bodies, protection "
-     "ranges and seabed features.", True),
+    (SRC_MODEL, "In the model (bodies, protection, holds, features)", "What the analysis models: bodies, "
+     "protection ranges, held sections and seabed features.", True),
     (SRC_COMMENT, "Route Comments", "Comments on this route from the project's comment register.", True),
     (SRC_BURIAL, "Burial plan", "PLDN / PLUP, burial and skip sections and crossings from the Burial Planner plan "
      "for this RPL.", True),
@@ -63,7 +63,7 @@ CHECKED_BODIES = frozenset({"repeater", "bu", "equaliser", "joint"})
 TYPE_LABELS = {
     "repeater": "Repeater", "bu": "Branching unit", "equaliser": "Equaliser", "joint": "Joint",
     "bmh": "Beach manhole", "transition": "Transition", "crossing": "Crossing", "route_branch": "Route branch",
-    "operations": "Operations", "alter_course": "Alter course", "water_depth": "Water depth mark",
+    "operations": "Operations", "alter_course": "Alter course", "hold": "Held (buried or pinned)", "water_depth": "Water depth mark",
     "boundary": "Boundary", "other": "Event",
 }
 MATCH_M = 50.0          # an RPL event within this of a modelled item is that item
@@ -73,7 +73,7 @@ COLOURS = {
     GROUP_BODIES: (150, 105, 0), GROUP_CROSSINGS: (0, 121, 107), GROUP_OPERATIONS: (57, 73, 171),
     GROUP_ALTER: (117, 117, 117), GROUP_OTHER: (80, 80, 80),
     "comment": (21, 101, 192), "comment_closed": (150, 150, 150), "marker": (173, 20, 87),
-    "feature": (121, 85, 72), "protection": (96, 125, 139),
+    "feature": (121, 85, 72), "protection": (96, 125, 139), "hold": (78, 52, 46),
     "burial": (46, 125, 50), "skip": (141, 110, 99), "insufficient_info": (150, 150, 150),
 }
 # Labels go to the lane in this order (lower first): what is in the model, then the RPL's bodies ...
@@ -185,7 +185,7 @@ def rpl_events(model, measured_kps: Sequence[float], classify: Callable) -> List
 
 
 def model_events(result) -> List[ProfileEvent]:
-    """Bodies, protection and seabed features of a result (all in the model)."""
+    """Bodies, protection, holds and seabed features of a result (all in the model)."""
     out: List[ProfileEvent] = []
     st = result.stations
     for k, b in enumerate(result.bodies):
@@ -208,6 +208,11 @@ def model_events(result) -> List[ProfileEvent]:
         out.append(ProfileEvent(lo, hi, SRC_MODEL, "protection", item.name,
                                 f"{item.name} ({item.kind}), in the model\nKP {lo:.3f} to {hi:.3f}",
                                 COLOURS["protection"], 40, "protection", modelled=True, key=f"protection:{j}"))
+    for j, hold in enumerate(getattr(result, "holds", None) or []):
+        where = _kp_text(hold.kp_start) if hold.point else f"KP {hold.kp_start:.3f} to {hold.kp_end:.3f}"
+        out.append(ProfileEvent(hold.kp_start, None if hold.point else hold.kp_end, SRC_MODEL, "hold", hold.name,
+                                f"{hold.name}: held (buried or pinned), in the model\n{where}\n"
+                                + hold_text(hold), COLOURS["hold"], 6, "hold", modelled=True, key=f"hold:{j}"))
     for j, feature in enumerate(st.features):
         a, b = feature.extent_m
         lo, hi = feature.kp_km + a / 1000.0, feature.kp_km + b / 1000.0
@@ -216,6 +221,23 @@ def model_events(result) -> List[ProfileEvent]:
                                 f"{_kp_text(feature.kp_km)}, from KP {lo:.3f} to {hi:.3f}",
                                 COLOURS["feature"], 8, feature.kind, modelled=True, key=f"feature:{j}"))
     return out
+
+
+def hold_text(hold) -> str:
+    """What a hold carries, in lines (lay order: before, then after)."""
+    lines = [f"Laid and held at {hold.held_kn:.2f} kN"]
+    sides = []
+    for label, value in (("laid before it", hold.before_kn), ("laid after it", hold.after_kn)):
+        if math.isfinite(value):
+            sides.append(f"{value:.2f} kN {label}")
+    if sides:
+        lines.append("Free cable: " + ", ".join(sides) + f"; net axial load {hold.load_kn:.2f} kN")
+    if hold.pulled_m > 0:
+        lines.append(f"Its tension pulls back on the cable laid before it over {hold.pulled_m:,.0f} m")
+    if hold.uplift_kn > 0.005:
+        lines.append(f"The free cable leaving it pulls up with {hold.uplift_kn:.2f} kN at KP {hold.uplift_kp:.3f}: "
+                     "the hold (burial or anchor) must hold it down")
+    return "\n".join(lines)
 
 
 def marker_events(markers: Sequence[Dict]) -> List[ProfileEvent]:
@@ -389,13 +411,8 @@ def choose_plan(plans: Sequence[Dict], wanted: str = "") -> Optional[Dict]:
     return max(pool, key=lambda p: str(p.get("modified_utc") or ""))
 
 
-def burial_events(plan: Dict, events: Sequence[Dict], sections: Sequence[Dict], hazards: Sequence[Dict],
-                  route: RouteIdentity, current_fingerprint: str = "") -> Tuple[List[ProfileEvent], List[str]]:
-    """One Burial Planner plan's events, sections and hazards, when it shares the analysis's KP basis."""
-    from ..burial import events as bev
-    from ..burial import schema as bs
-
-    name = str(plan.get("name") or "Burial plan")
+def burial_plan_reasons(plan: Dict, route: RouteIdentity, current_fingerprint: str = "") -> List[str]:
+    """Why a Burial Planner plan's KPs do not match the analysis's ([] when they do)."""
     datum = plan.get("_datum") or {}
     start = datum.get("start_kp")
     mode = "cartesian" if datum.get("mode") == "cartesian" else "ellipsoidal"
@@ -413,6 +430,17 @@ def burial_events(plan: Dict, events: Sequence[Dict], sections: Sequence[Dict], 
         core = "|".join(snapshot.split("|")[:3])
         if core != "|".join(current_fingerprint.split("|")[:3]):
             reasons.append("the RPL has been edited since its events were made")
+    return reasons
+
+
+def burial_events(plan: Dict, events: Sequence[Dict], sections: Sequence[Dict], hazards: Sequence[Dict],
+                  route: RouteIdentity, current_fingerprint: str = "") -> Tuple[List[ProfileEvent], List[str]]:
+    """One Burial Planner plan's events, sections and hazards, when it shares the analysis's KP basis."""
+    from ..burial import events as bev
+    from ..burial import schema as bs
+
+    name = str(plan.get("name") or "Burial plan")
+    reasons = burial_plan_reasons(plan, route, current_fingerprint)
     if reasons:
         return [], [f"Burial plan '{name}' is not shown: " + "; ".join(reasons) + ". Open it in the Burial Planner "
                     "to bring it up to date."]

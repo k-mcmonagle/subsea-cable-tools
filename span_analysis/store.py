@@ -36,7 +36,9 @@ from ..workbench.schema import gpkg_folder_for, new_id, sanitize_slug, utc_now_i
 PROJECT_SCOPE = "SubseaCableTools"
 PROJECT_KEY_GPKG = "span_analysis_gpkg"
 FOLDER_NAME = "span_analysis"
-SCHEMA_VERSION = 1
+# 2: lay control sections can hold the cable (mode "held", with a name). A version 1 build would lay a held
+#    section as route slack and keep it so when saving, so it must not open the file (schema_guard).
+SCHEMA_VERSION = 2
 
 TABLE_META = "sa_meta"
 TABLE_SCENARIO = "sa_scenario"
@@ -102,6 +104,9 @@ class SpanStore:
         if "schema_version" not in meta:
             self.write_meta("schema_version", str(SCHEMA_VERSION))
             self.write_meta("created_utc", utc_now_iso())
+        elif _as_int(meta.get("schema_version")) < SCHEMA_VERSION:
+            # Nothing to convert: version 1 scenarios read unchanged (no held sections).
+            self.write_meta("schema_version", str(SCHEMA_VERSION))
 
     def close(self) -> None:
         gpkg_sql.close(self.gpkg_path)
@@ -185,6 +190,13 @@ class SpanStore:
         write_layer_to_gpkg(self.gpkg_path, name, fields_from_specs(RESULT_FIELDS), WKB_LINESTRING, list(rows),
                             QgsProject.instance().transformContext())
         return name
+
+
+def _as_int(value) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return 0
 
 
 __all__ = ["SpanStore", "WKT_KEY", "default_gpkg_path", "project_gpkg_path", "set_project_gpkg_path"]

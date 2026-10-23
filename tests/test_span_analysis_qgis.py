@@ -800,7 +800,9 @@ def test_plot_and_layout_controls() -> List[bool]:
                            folded and bodies == "1 body(ies)" and setup.control_sections_section.button.isChecked()
                            and setup.control_sections_section.status.text() == "2 section(s)", bodies))
 
-        tabs = [re.sub(r" \(\d+\)$", "", results.tabText(k)) for k in range(results.count())]   # no counts
+        # Holds shows only with held sections (Qt 5.15 and later hide it; earlier Qt keeps it).
+        shown = getattr(results, "isTabVisible", None) or (lambda k: results.tabText(k) != "Holds")
+        tabs = [re.sub(r" \(\d+\)$", "", results.tabText(k)) for k in range(results.count()) if shown(k)]   # no counts
         results.show_sweep()
         out.append(_report("results tabs: findings first, then the tools; the sweep sits in Find tension",
                            tabs == ["Findings", "Spans", "Bodies", "Events", "Summary", "Find tension", "Detail (EI)"]
@@ -1079,6 +1081,128 @@ def test_true_scale_stays_true() -> List[bool]:
     return out
 
 
+class _HoldPos:
+    def __init__(self, number, event):
+        self.pos_no = number
+        self.event = event
+        self.attrs = {}
+
+
+class _HoldRpl:
+    """An RPL as the burial reader sees it: positions with events (no geometry needed)."""
+
+    def __init__(self, events):
+        self.points = [_HoldPos(k + 1, text) for k, text in enumerate(events)]
+        self.segments = []
+
+
+def test_holds_in_the_window() -> List[bool]:
+    """Held sections: lay control rows, the Holds tab, the profile, events, exports, the finder and the store."""
+    from ..span_analysis import dxf_io, holds
+
+    out = []
+    folder = tempfile.mkdtemp()
+    dialog = _make_dialog()
+    try:
+        dialog.load_example(_example("Plough sections"))
+        _wait(lambda: dialog._task is None, 120.0)
+        r = dialog._result
+        names = [h.name for h in r.holds] if r is not None else []
+        anchor = r.holds[0] if names else None
+        pulled = [s for s in (r.spans if r else []) if s.source == pl.SOURCE_NAMES[pl.SOURCE_PULLED]]
+        out.append(_report("example: plough sections pull back on the cable before them; the anchor takes the rest",
+                           names == ["First-end anchor", "Plough 1", "Plough 2"] and anchor.point
+                           and 1.0 < anchor.load_kn < 25.0 and len(pulled) > 0,
+                           f"anchor {anchor.load_kn if anchor else math.nan:.2f} kN, {len(pulled)} pulled span(s)"))
+        settings = _synthetic_settings()
+        hold_row = {"kp0": 0.25, "kp1": 0.35, "mode": pl.HELD, "value": 10.0, "name": "Plough 1"}
+        settings["control"]["sections"] = [dict(hold_row), {"kp0": 0.0, "kp1": 0.2, "mode": pl.TENSION,
+                                                            "value": 3.0}]
+        dialog.setup.apply_settings(settings)
+        dialog.run()
+        _wait(lambda: dialog._task is None, 90.0)
+        r = dialog._result
+        hold = r.holds[0] if r is not None and r.holds else None
+        free = [s for s in (r.spans if r else []) if s.kp_end > 0.25 and s.kp_start < 0.35]
+        out.append(_report("a held section (boulder under it): held at its tension, no span inside",
+                           hold is not None and hold.name == "Plough 1" and abs(hold.held_kn - 10.0) < 1e-9
+                           and not free and r.held is not None and int(r.held.sum()) > 100))
+        saved = dialog.setup.settings()["control"]["sections"]
+        out.append(_report("held row saved with its mode and name", saved[0].get("mode") == pl.HELD
+                           and saved[0].get("name") == "Plough 1" and saved[1].get("name") == ""))
+        results = dialog.results
+        visible = getattr(results, "isTabVisible", lambda _i: True)(results.indexOf(results.holds_page))
+        drawn = np.isfinite(dialog.plot.held_curve.getData()[1]).sum()
+        ends = len(dialog.plot.hold_ends.data)
+        labels = [e.label for e in dialog.plot.shown_events()]
+        out.append(_report("Holds tab, band and ends on the profile, label on the events lane",
+                           visible and results.holds_table.rowCount() == 1 and drawn > 100 and ends == 2
+                           and "Plough 1" in labels, f"{drawn} band points, {ends} ends"))
+        scene = os.path.join(folder, "holds.dxf")
+        dxf_io.export_scene(r, scene, dxf_io.SceneOptions(vertical_exaggeration=10.0))
+        profile_csv = os.path.join(folder, "profile.csv")
+        dlg.write_csv(r, "profile", profile_csv)
+        with open(profile_csv, encoding="utf-8") as handle:
+            header = handle.readline().strip().split(",")
+        out.append(_report("DXF has SA_HOLDS; the profile CSV says what sets the tension and what is held",
+                           "SA_HOLDS" in dxf_io.read_polylines(scene) and header[-2:] == ["tension_from", "held"]))
+        rows = [dict(hold_row, value=2.0), {"kp0": 0.0, "kp1": 0.2, "mode": pl.TENSION, "value": 3.0}]
+        dialog.setup.control_sections.set_rows(rows)
+        _wait(lambda: not dialog._live_timer.isActive() and dialog._task is None, 60.0)
+        held_kn = dialog._result.holds[0].held_kn if dialog._result and dialog._result.holds else math.nan
+        out.append(_report("a hold's tension updates live", abs(held_kn - 2.0) < 1e-9, f"{held_kn:.2f} kN"))
+        dialog.setup.apply_tension(4.0, [(0.0, 0.2, 2.5)])
+        kept = dialog.setup.settings()["control"]["sections"]
+        out.append(_report("the tension finder's sections keep the held ones",
+                           [row["mode"] for row in kept] == [pl.HELD, pl.TENSION] and kept[1]["value"] == 2.5))
+        captured = {}
+        original = dialog._start
+        dialog._start = lambda kind, description, work, info: captured.update(kind=kind, work=work)
+        try:
+            dialog.run_find({"target": "report", "scope": "sections", "mbr": False})
+        finally:
+            dialog._start = original
+        answers = captured["work"](lambda: False, None)["found"] if "work" in captured else []
+        out.append(_report("'each lay control section' leaves out the held ones",
+                           [a.name for a in answers] == ["Section 1"] and abs(answers[0].kp_end - 0.2) < 1e-9))
+    finally:
+        dialog.shutdown()
+        dialog.deleteLater()
+
+    # Burial sections to hold: from RPL events (paired in the lay direction) and from a Burial Planner plan.
+    model = _HoldRpl(["", "PLDN", "", "PLUP", "Start PLB", "End PLB", "PLDN", "PLUP"])
+    kps = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+    ranges, _notes = holds.rpl_burial_ranges(model, kps, 1)
+    rows = holds.hold_rows(ranges, [holds.PLOUGH, holds.BURIAL], 25.0)
+    out.append(_report("RPL PLDN / PLUP events give plough sections to hold (post-lay burial left out)",
+                       [(row["kp0"], row["kp1"], row["name"]) for row in rows]
+                       == [(1.0, 3.0, "Plough 1"), (6.0, 7.0, "Plough 2")]
+                       and any(r.tool == holds.TRENCHER for r in ranges) and rows[0]["value"] == 25.0))
+    plan = {"name": "P", "method": "plough"}
+    sections = [{"kind": "burial", "start_kp": 2.0, "end_kp": 1.0, "method": ""},
+                {"kind": "skip", "start_kp": 2.0, "end_kp": 3.0},
+                {"kind": "burial", "start_kp": 3.0, "end_kp": 4.0, "method": "trencher"}]
+    plan_ranges = holds.plan_burial_ranges(plan, sections)
+    dialog_box = holds.HoldsDialog(None, [("plan", "Burial Planner plan 'P'", plan_ranges, [])], [], 12.0, (0.0, 10.0))
+    try:
+        chosen = dialog_box.rows()
+        out.append(_report("burial plan sections: the plough ones held by default, at the tension chosen",
+                           [(row["kp0"], row["kp1"], row["value"]) for row in chosen] == [(1.0, 2.0, 12.0)]
+                           and dialog_box.buttons.button(dlg.BUTTON_BOX_OK).isEnabled()))
+    finally:
+        dialog_box.deleteLater()
+
+    path = os.path.join(folder, "old_span.gpkg")
+    store = span_store.SpanStore(path)
+    store.ensure_created()
+    store.write_meta("schema_version", "1")
+    store.ensure_created()
+    out.append(_report("a version 1 Span file is stamped version 2 when opened",
+                       store.read_meta().get("schema_version") == str(span_store.SCHEMA_VERSION) == "2"))
+    store.close()
+    return out
+
+
 def run_all() -> List[bool]:
     results = (test_synthetic_run_live_detail_sweep() + test_raster_route_and_store() + test_ui_tools()
                + test_tables_and_dxf_route() + test_protection_and_find_tension() + test_kp_consistency()
@@ -1086,6 +1210,6 @@ def run_all() -> List[bool]:
                + test_plot_and_layout_controls()
                + test_live_update_keeps_the_seabed_still() + test_setup_rows_leave_no_gaps()
                + test_sections_open_full_height() + test_true_scale_stays_true()
-               + test_data_resolution_in_the_window())
+               + test_data_resolution_in_the_window() + test_holds_in_the_window())
     print(f"\n{sum(results)}/{len(results)} Span & Slack Analysis QGIS checks passed.")
     return results

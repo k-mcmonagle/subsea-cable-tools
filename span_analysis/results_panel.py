@@ -55,6 +55,8 @@ SPAN_HEADERS = ["#", "KP from", "KP to", "Length (m)", "Max gap (m)", "Short of 
 EVENT_HEADERS = ["Source", "Type", "KP", "KP to", "Label", "In the model", "Details"]
 BODY_HEADERS = ["Name", "Kind", "KP", "Weight (kN)", "Clear of seabed (m)", "In a span", "Tension (kN)",
                 "Housing standoff (m)"]
+HOLD_HEADERS = ["Name", "KP from", "KP to", "Held at (kN)", "Cable laid before (kN)", "Cable laid after (kN)",
+                "Net axial load (kN)", "Pulls back over (m)", "Pull-up at an end (kN)", "KP of pull-up"]
 DETAIL_HEADERS = ["KP from", "KP to", "Length (m)", "Max gap (m)", "Min bend R (m)", "KP of min R", "MBR (m)",
                   "Max moment (kNm)", "Reaction start (kN)", "Reaction end (kN)"]
 FIND_HEADERS = ["Scope", "KP from", "KP to", "Highest tension (kN)", "Breaks the target first",
@@ -190,6 +192,7 @@ class ResultsPanel(QTabWidget):
         self._build_findings()
         self._build_spans()
         self._build_bodies()
+        self._build_holds()
         self._build_events()
         self.summary = QTextBrowser()
         self.summary.setOpenExternalLinks(False)
@@ -282,6 +285,30 @@ class ResultsPanel(QTabWidget):
         self.bodies_table = _table(BODY_HEADERS)
         self.bodies_table.itemSelectionChanged.connect(lambda: self._emit_range(self.bodies_table))
         self.addTab(self.bodies_table, "Bodies")
+
+    def _build_holds(self) -> None:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(2, 2, 2, 2)
+        self.holds_table = _table(HOLD_HEADERS)
+        self.holds_table.horizontalHeader().setSortIndicator(1, getattr(getattr(Qt, "SortOrder", Qt), "AscendingOrder"))
+        self.holds_table.itemSelectionChanged.connect(lambda: self._emit_range(self.holds_table))
+        layout.addWidget(self.holds_table, 1)
+        note = WrapLabel("Each hold (Lay control, Held) is laid at its own tension, which pulls back on the cable "
+                         "laid before it, falling by μ w per metre; then it neither spans nor slides, and later "
+                         "touchdowns do not reach through it. The net axial load is the difference between the "
+                         "free cable either side (a side beyond the profile counts as zero). A pull-up is the free "
+                         "cable turning up out of the hold: the burial or anchor must hold it down.")
+        note.setStyleSheet("QLabel { color: #555; }")
+        layout.addWidget(note)
+        self.holds_page = page
+        self.addTab(page, "Holds")
+        self._show_tab(page, False)
+
+    def _show_tab(self, page: QWidget, on: bool) -> None:
+        setter = getattr(self, "setTabVisible", None)     # Qt 5.15 and later
+        if setter is not None:
+            setter(self.indexOf(page), on)
 
     def _build_events(self) -> None:
         page = QWidget()
@@ -767,8 +794,19 @@ class ResultsPanel(QTabWidget):
             if item is not None:
                 item.setData(_USER_ROLE, r)
 
+        hold_rows, hold_payloads = [], []
+        for h in (result.holds if result is not None else []):
+            hold_rows.append([h.name, f"{h.kp_start:.3f}", f"{h.kp_end:.3f}", _num(h.held_kn), _num(h.before_kn),
+                              _num(h.after_kn), _num(h.load_kn), _num(h.pulled_m, 0) if h.pulled_m > 0 else "",
+                              _num(h.uplift_kn) if h.uplift_kn > 0.005 else "",
+                              f"{h.uplift_kp:.3f}" if h.uplift_kn > 0.005 else ""])
+            pad = 0.005 if h.point else 0.0
+            hold_payloads.append((h.kp_start - h.pulled_m / 1000.0 - pad, h.kp_end + h.pulled_m / 1000.0 + pad))
         _fill(self.spans_table, span_rows, span_payloads, number)
         _fill(self.bodies_table, body_rows, body_payloads, body_index)
+        _fill(self.holds_table, hold_rows, hold_payloads)
+        self._show_tab(self.holds_page, bool(hold_rows))
+        self.setTabText(self.indexOf(self.holds_page), f"Holds ({len(hold_rows)})" if hold_rows else "Holds")
         self.setTabText(1, f"Spans ({len(span_rows)})" if result is not None else "Spans")
         self.setTabText(2, f"Bodies ({len(body_rows)})" if result is not None else "Bodies")
         self.summary.setHtml(summary_html)
@@ -828,6 +866,13 @@ def summary_html(result: pl.PlanningResult, notes: Sequence[str], setup_lines: S
                                 else "")),
         ("Model iterations", str(result.iterations)),
     ]
+    if result.holds:
+        held_m = float(np.sum(np.diff(result.stations.x_m)[result.held[:-1] & result.held[1:]]))
+        loads = max(h.load_kn for h in result.holds)
+        reach = max(h.pulled_m for h in result.holds)
+        rows.insert(-2, ("Held (buried or pinned)",
+                         f"{len(result.holds)} hold(s), {held_m:,.0f} m of cable; largest net axial load "
+                         f"{loads:.2f} kN" + (f"; pull-back up to {reach:,.0f} m before a hold" if reach > 0 else "")))
     parts = ["<h3>Span &amp; Slack Analysis</h3>", "<table cellspacing='0' cellpadding='3'>"]
     for key, value in rows:
         parts.append(f"<tr><td><b>{esc(key)}</b></td><td>{esc(value)}</td></tr>")

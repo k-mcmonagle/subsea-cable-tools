@@ -149,6 +149,15 @@ You can override the value by KP section. Set the lay direction: friction holds 
 at, so on slopes the result depends on it. *Find the highest tension within limits* opens the Find tension tab
 (see the model, section 7).
 
+A section can also **hold** the cable (*Control*: *Held*, Value in kN): buried by a plough from PLDN to PLUP,
+clamped, or at an anchor (a point: *KP to* = *KP from*). It is laid at its Value, e.g. the tension at the plough as
+it goes down (see the model, section 2a). *Name* (optional, e.g. *Plough 1*) labels it on the profile and in the
+Holds tab. *Hold plough sections…* adds held sections in one go, from the RPL's burial events (PLDN / PLUP, Start /
+End burial and other phrasings, read as the Burial Planner's *Import plan* reads them, in the lay direction; or its
+ProtectionMethod column) or from the Burial Planner plan for the RPL when it shares the analysis's KPs, at a
+tension you choose. Ploughs (and burial with no tool named) are held by default; post-lay burial (PLB, MFE) is not,
+as the cable lies on the seabed as laid until it is buried.
+
 ## The model
 
 ### 1. Deposit tension: one rule for slack and tension
@@ -194,6 +203,30 @@ direction. It gives:
 
 Long routes march on at most 20,000 nodes. The band is integrated exactly between nodes, and the frictionless
 part (`w dy`) is restored between them.
+
+**The ends of the profile.** Both ends sit on the seabed (the rest shape is fixed there). The end laid first keeps the
+tension it was laid at, or what a later touchdown pulls it to, as if held by the cable beyond it or an anchor: nothing
+slides off it. The end laid last is the current touchdown.
+
+### 2a. Holds: buried or pinned cable
+
+A held section (lay control *Held*) is laid at its own tension. Like any touchdown, that tension pulls back on the
+cable laid before it, falling by `mu w` per metre (reach `(T_hold - T_lay) / (mu w)`: 25 kN against 1 kN of surface
+lay reaches 800 m back for 60 N/m at `mu` 0.5). Spans there are labelled *pulled back by a hold*. Then the held cable:
+
+- follows the seabed: the rest shape is pinned to the seabed over the hold, so it does not span, and a span can start
+  at its end (e.g. at PLUP);
+- does not slide: friction grips the hold, and the segment after it in the lay direction, so later touchdowns do not
+  reach back through it. The cable laid after it starts afresh at its own lay control;
+- gives no cable to a slack section next to it: the pull-taut windows end at a hold.
+
+For each hold the Holds tab gives the free cable's tension on the side laid before and the side laid after, the net
+axial load it carries (their difference: an anchor's load; a side beyond the profile counts as zero), how far its
+pull-back reaches, and the **pull-up** at its ends: where the free cable turns up out of the hold (e.g. a PLUP at
+the foot of a rise), `P = H dtheta - w dx`, which the burial or anchor must resist. No soil resistance is modelled:
+compare the pull-up with the uplift resistance of the burial. The tension finder and the sweep keep the holds as
+set, and the detail model keeps held nodes on the seabed (bilateral contact). The highest tension for spans within
+limits is not given over a hold.
 
 ### 3. Rest shape: the unilateral contact problem
 
@@ -330,6 +363,8 @@ tool lists these values at each RPL vertex as information.
     (hover for the reaction and bend radius), bodies (hover or click for their details), the detail cable and sea
     level;
   - the residual and lay tension, NPTS, and the highest tension for spans within limits;
+  - held sections show as a dark band along the cable, with a square at each end (one for a point hold): hover it
+    for what the hold carries;
   - slack (see *Slack* below);
   - the seabed slope against the friction angle.
 
@@ -359,7 +394,7 @@ tool lists these values at each RPL vertex as information.
     surplus over half of it; loop risk (the loop check's limit); not held by friction (slides).
   - *Tension (% of NPTS)*: quarters of NPTS and above NPTS (kN bands where a cable has no NPTS), zero shown grey.
   - *What sets the tension*: the bottom tension, pulled taut (slack short of the seabed), raised by a slope, or
-    zero.
+    zero; with holds, also held and pulled back by a hold.
 
   Span severity is not offered (spans are already filled), nor bend radius along the cable (the route model has
   no bending stiffness: use Detail (EI)).
@@ -390,6 +425,7 @@ tool lists these values at each RPL vertex as information.
   - Findings;
   - Spans (with bodies in each span, and how much shorter each is than the seabed under it);
   - Bodies;
+  - Holds (when the lay control holds the cable);
   - Events (source, type, KP, in the model or not, details; what was left out and why);
   - Summary (inputs, totals, notes);
   - Find tension, with the tension sweep below it;
@@ -397,9 +433,10 @@ tool lists these values at each RPL vertex as information.
 - **Export.** Findings, spans and the profile by station as CSV, the plot as PNG, and the scene as DXF (R12, metres,
   X = KP × 1000, Y = elevation × a chosen vertical exaggeration). The DXF layers are `SA_SEABED`,
   `SA_SEABED_SAMPLED`, `SA_CABLE`, `SA_CABLE_DETAIL`, `SA_SPAN_RED`, `SA_SPAN_AMBER`, `SA_SPAN_INDICATIVE`, `SA_CLEAR_UNDER_LIMITS`,
-  `SA_SUPPORTS`, `SA_BODIES`, `SA_PROTECTION`, `SA_FEATURES`, `SA_SEA_LEVEL`, `SA_FRAME` and `SA_TEXT`. The tension, slack and slope
+  `SA_SUPPORTS`, `SA_BODIES`, `SA_PROTECTION`, `SA_HOLDS`, `SA_FEATURES`, `SA_SEA_LEVEL`, `SA_FRAME` and `SA_TEXT`. The tension, slack and slope
   graphs sit below the profile, with one layer per curve (the slack graph on the basis the plot shows). The profile
-  CSV has the slack over the route (`fill_pct` ... `surplus_pct`) and over the seabed (`bottom_*`). *Add to map*
+  CSV has the slack over the route (`fill_pct` ... `surplus_pct`) and over the seabed (`bottom_*`), what sets the
+tension (`tension_from`) and whether the station is held (`held`). *Add to map*
   writes the findings as a line layer.
 
 ## Examples
@@ -420,6 +457,9 @@ tool lists these values at each RPL vertex as information.
   (45 kg/m in water, 150 mm, MBR 4 m; not product data): shorter spans, a larger reaction on the pipeline.
 - **Rock berm (custom shape), armoured cable.**
 - **Sand waves on a slope, with a repeater.**
+- **Plough sections and a first-end anchor (illustrative values).** Surface lay at 1 kN, armoured cable, two plough
+  sections held at 25 kN and the first end anchored at KP 0: each PLDN tension pulls back on the cable laid before
+  it and bridges sand-wave troughs there; the anchor takes what reaches it (Holds tab).
 
 ## Storage
 
@@ -449,12 +489,17 @@ Unit tests (`tests/test_cable_seabed.py`, `tests/test_span_analysis_qgis.py`, `t
 | Slack above the fill lies at zero tension with the surplus; below it is pulled taut with no surplus | model rule | yes |
 | A cable lying on the seabed has 0% bottom slack; over a 40 m trough it reads below 0 (−2.35% over 100 m) while over the route it reads +0.07% | definition | yes |
 | Friction set on prepared stations gives the same answer as preparing them with it (live update) | consistency | exact |
+| A hold at 25 kN after 1 kN of lay pulls back `mu w` per metre, 800 m (60 N/m, `mu` 0.5); nothing passes it; both lay directions | closed form | within 1% (reach within 2%) |
+| Cable leaving a hold up a 1:10 ramp at 5 kN: pull-up `H s - w dx` | closed form | 0.438 kN, exact |
+| An anchor holds the cable laid before it from a later 25 kN section 200 m on: load `25 - 1 - mu w 199 m` | closed form | 18.03 kN, exact |
+| No span inside a hold; the sweep and the tension finder keep holds; the detail model stays on the seabed in a hold | model rule | yes |
 
 ## Assumptions and limits
 
 - 2D, static, after lay. No current, vessel motion or lay dynamics. No lateral movement, except the alter-course
   note.
-- Rigid seabed: no embedment or self-burial.
+- Rigid seabed: no embedment or self-burial. A hold is rigid and fixed: the soil's axial and uplift resistance is
+  not modelled.
 - Inextensible cable.
 - Small-slope shape with a slope correction. Lengths are exact.
 - Coulomb friction with one coefficient for static and sliding.

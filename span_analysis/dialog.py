@@ -186,6 +186,7 @@ class SpanAnalysisDialog(QDialog):
         self._rpl_events = (None, [])             # (model, its events): read once per RPL model
         self._burial_choice = ""
         self._watch_stamp = None
+        self._hold_kn: Optional[float] = None    # the tension last used to hold burial sections
         self.comment_hook = None        # set by the plugin: Route Comments' capture, (kind, capture, data)
         self.comment_open_hook = None   # set by the plugin: show a comment in Route Comments, (comment_id)
         canvas = iface.mapCanvas() if iface is not None else None
@@ -280,6 +281,7 @@ class SpanAnalysisDialog(QDialog):
         self.setup.frictionChanged.connect(self._on_control_changed)
         self.setup.libraryRequested.connect(self._open_library)
         self.setup.tensionFinderRequested.connect(self.results.show_find)
+        self.setup.holdsRequested.connect(self.hold_burial_sections)
         self.plot.kpHovered.connect(self.map.hover_kp)
         self.plot.kpClicked.connect(lambda kp: self.map.show_kp(kp, pan="if_outside"))
         self.plot.kpDoubleClicked.connect(lambda kp: self.map.show_kp(kp, pan=True))
@@ -894,9 +896,12 @@ class SpanAnalysisDialog(QDialog):
             lo, hi = sorted(self.plot.visible_kp())
             scopes = [("Visible part", max(lo, first), min(hi, last))]
         elif scope == "sections":
-            sections = sorted(self.setup.control().sections, key=lambda sec: min(sec.kp_start, sec.kp_end))
+            # A held section does not span: its tension is not searched (it stays as set).
+            sections = sorted((sec for sec in self.setup.control().sections if sec.mode != pl.HELD),
+                              key=lambda sec: min(sec.kp_start, sec.kp_end))
             if not sections:
-                self._set_status("Add lay control sections first (Lay control, By KP section).", error=True)
+                self._set_status("Add lay control sections (other than held ones) first (Lay control, By KP "
+                                 "section).", error=True)
                 return
             scopes = [(f"Section {k}", *sorted((sec.kp_start, sec.kp_end))) for k, sec in enumerate(sections, 1)]
         else:
@@ -921,6 +926,66 @@ class SpanAnalysisDialog(QDialog):
             self.setup.apply_tension(down(answers[0].tension_kn))
         self._set_status("Lay control set from the tension finder." + ("" if self.setup.live.isChecked() else
                                                                       " Run to update the results."))
+
+    def hold_burial_sections(self) -> None:
+        """Add held sections over the burial sections of the RPL's events or of the Burial Planner plan."""
+        from . import holds
+
+        setup = self.setup
+        direction = int(setup.direction.currentData() or 1)
+        found, unavailable = [], []
+        model = None
+        if setup.route_source.currentData() == sources.ROUTE_RPL and setup.workbench is not None \
+                and setup.rpl_combo.currentData():
+            try:
+                model = sources.with_start_kp(sources.load_rpl_model(setup.workbench, setup.rpl_combo.currentData()),
+                                              float(setup.line_start_kp.value()))
+                ranges, notes = holds.rpl_burial_ranges(model, sources.rpl_measured_kps(model), direction)
+                found.append(("rpl", f"RPL events: {setup.rpl_combo.currentText()}", ranges, notes))
+            except Exception:
+                log_exception("Span & Slack Analysis: reading the RPL's burial events failed")
+                unavailable.append("The RPL's events could not be read.")
+        else:
+            unavailable.append("RPL events need a Workbench RPL as the route.")
+        ident = self._route_identity
+        if model is not None and ident is not None and ident.rpl_id == setup.rpl_combo.currentData():
+            from ..burial.store import project_gpkg_path
+
+            try:
+                data = ev.read_burial(project_gpkg_path() or "", ident.rpl_id)
+                plan = ev.choose_plan(data["plans"], self._burial_choice)
+                if plan is None:
+                    unavailable.append("No Burial Planner plan for this RPL.")
+                else:
+                    name = str(plan.get("name") or "Plan")
+                    reasons = ev.burial_plan_reasons(plan, ident, self._rpl_fingerprint(ident.rpl_id))
+                    if reasons:
+                        unavailable.append(f"Burial plan '{name}' is not offered: " + "; ".join(reasons) + ".")
+                    else:
+                        found.append(("plan", f"Burial Planner plan '{name}'",
+                                      holds.plan_burial_ranges(plan, data["sections"].get(plan["plan_id"], [])), []))
+            except Exception:
+                log_exception("Span & Slack Analysis: reading the Burial Planner plan failed")
+                unavailable.append("The Burial Planner file could not be read.")
+        elif model is not None:
+            unavailable.append("Run the analysis to offer the Burial Planner plan for this RPL.")
+        if not found:
+            self._set_status("No burial sections to hold: " + " ".join(unavailable) + " Add held sections in the "
+                             "table instead (Control: Held).", error=True)
+            return
+        kp_range = None
+        if self._stations is not None:
+            kp_range = (float(self._stations.kp_km[0]), float(self._stations.kp_km[-1]))
+        tension = self._hold_kn if self._hold_kn is not None else (
+            setup.value.value() if setup.mode.currentData() == pl.TENSION else 5.0)
+        dialog = holds.HoldsDialog(self, found, unavailable, tension, kp_range)
+        if qt_exec(dialog) != DIALOG_ACCEPTED:
+            return
+        rows = dialog.rows()
+        self._hold_kn = dialog.tension.value()
+        setup.add_holds(rows, dialog.replace.isChecked())
+        self._set_status(f"{len(rows)} held section(s) added to the lay control." + (
+            "" if setup.live.isChecked() and self._result is not None else " Run to see them."))
 
     def _start(self, kind: str, description: str, work, info: Dict) -> None:
         task = WorkTask(description, work, self._on_finished)
@@ -1739,8 +1804,10 @@ def write_csv(result: pl.PlanningResult, what: str, path: str) -> None:
             writer.writerow(["kp_km", "seabed_depth_m", "cable_depth_m", "gap_m", "residual_tension_kn",
                              "lay_tension_kn", "allowable_kn", "fill_pct", "laid_pct", "used_pct", "surplus_pct",
                              "bottom_laid_pct", "bottom_used_pct", "bottom_surplus_pct",
-                             "slope_deg", "mu", "cable_type", "soil"])
-            allowable = result.allowable_kn if result.allowable_kn is not None else np.full(st.n, np.nan)
+                             "slope_deg", "mu", "cable_type", "soil", "tension_from", "held"])
+            shown = pl.allowable_shown(result)
+            allowable = shown if shown is not None else np.full(st.n, np.nan)
+            held = result.held if result.held is not None else np.zeros(st.n, dtype=bool)
             nan = np.full(st.n, np.nan)
             used_b = result.used_bottom_pct if result.used_bottom_pct is not None else nan
             surplus_b = result.surplus_bottom_pct if result.surplus_bottom_pct is not None else nan
@@ -1752,7 +1819,8 @@ def write_csv(result: pl.PlanningResult, what: str, path: str) -> None:
                                  _fmt(result.shape_pct[i], 3), _fmt(result.excess_pct[i], 3),
                                  _fmt(result.bottom_slack_pct[i], 3), _fmt(used_b[i], 3), _fmt(surplus_b[i], 3),
                                  _fmt(math.degrees(math.atan(st.slope[i])), 2), _fmt(st.mu[i], 3),
-                                 st.cable_at(i).name, st.soil[i]])
+                                 st.cable_at(i).name, st.soil[i], pl.SOURCE_NAMES.get(int(result.source[i]), ""),
+                                 1 if held[i] else 0])
 
 
 def _tension_csv(value) -> str:

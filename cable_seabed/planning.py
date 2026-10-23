@@ -30,6 +30,16 @@ KP). :func:`prepare` builds the stations once; :func:`solve` runs:
    indicative, not red or amber, and stretches where the data cannot resolve
    spans as short as the reporting length are flagged.
 
+**Holds.** A lay control section can hold the cable (``HELD``: buried by a
+plough, clamped, or at an anchor; a point holds the nearest station). It is
+laid at its own tension (e.g. the plough tension at PLDN), which pulls back
+on the cable laid before it as any touchdown does; then it neither spans (the
+rest shape is pinned to the seabed there) nor slides (friction grips it, and
+the segment after it in the lay direction, so later touchdowns do not reach
+back through it). :class:`HoldResult` gives the tension either side, the net
+axial load it carries, how far its pull-back reaches and the upward pull of
+the free cable leaving it (the hold must hold it down).
+
 :func:`detail_window` solves a KP window with bending stiffness
 (:mod:`cable_seabed.beam`); :func:`tension_sweep` repeats step 1-4 over a
 range of bottom tensions; :func:`find_tension` finds the highest bottom
@@ -86,15 +96,25 @@ MODE_LABELS = {
     RPL_LEGS: "RPL slack per leg",
 }
 MODE_UNITS = {TENSION: "kN", BOTTOM_SLACK: "%", ROUTE_SLACK: "%", RPL_LEGS: "%"}
+# A section only: the cable is held over its KP range (or at a point) at a tension.
+HELD = "held"
+SECTION_MODES = MODES + (HELD,)
+MODE_LABELS[HELD] = "Held: buried or pinned (kN)"
+MODE_UNITS[HELD] = "kN"
 
 # Where a station's tension comes from (span "source").
-SOURCE_ZERO, SOURCE_LAID, SOURCE_TAUT, SOURCE_SLOPE = 0, 1, 2, 3
+SOURCE_ZERO, SOURCE_LAID, SOURCE_TAUT, SOURCE_SLOPE, SOURCE_HELD, SOURCE_PULLED = 0, 1, 2, 3, 4, 5
 SOURCE_NAMES = {
     SOURCE_ZERO: "laid at zero tension",
     SOURCE_LAID: "lay tension",
     SOURCE_TAUT: "cable short of the seabed",
     SOURCE_SLOPE: "tension held on a slope",
+    SOURCE_HELD: "held (buried or pinned)",
+    SOURCE_PULLED: "pulled back by a hold",
 }
+# Friction capacity (N) of a segment a hold grips: far above any tension, so nothing passes through it,
+# yet small enough that the running sums of the band keep their precision.
+HOLD_GRIP_N = 1.0e9
 
 CONTACT_TOL_M = 0.01     # cable on the seabed (friction, span supports)
 DEFAULT_MU = 0.5
@@ -237,6 +257,18 @@ class ControlSection:
     kp_end: float
     mode: str
     value: float
+    name: str = ""
+
+
+def section_stations(section: ControlSection, kp_km: np.ndarray) -> np.ndarray:
+    """Stations a section covers. A hold at a point (or shorter than the station
+    spacing) holds the station nearest it, when it is on the profile."""
+    kp = np.asarray(kp_km, dtype=float)
+    lo, hi = sorted((float(section.kp_start), float(section.kp_end)))
+    sel = (kp >= lo) & (kp <= hi)
+    if section.mode == HELD and not sel.any() and len(kp) and kp[0] <= hi and lo <= kp[-1]:
+        sel[int(np.argmin(np.abs(kp - 0.5 * (lo + hi))))] = True
+    return sel
 
 
 @dataclass
@@ -246,6 +278,10 @@ class LayControl:
     sections: List[ControlSection] = field(default_factory=list)
     legs: List[Tuple[float, float, float]] = field(default_factory=list)   # RPL (kp0, kp1, slack %)
     direction: int = 1                 # +1 laid towards increasing KP
+
+    def holds(self) -> List[ControlSection]:
+        """The sections that hold the cable (buried or pinned)."""
+        return [section for section in self.sections if section.mode == HELD]
 
     def arrays(self, kp_km: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Per station ``(mode, value)``; RPL legs become route slack."""
@@ -259,8 +295,7 @@ class LayControl:
                 sel = (kp >= lo) & (kp <= hi)
                 value[sel] = slack
         for section in self.sections:
-            lo, hi = sorted((section.kp_start, section.kp_end))
-            sel = (kp >= lo) & (kp <= hi)
+            sel = section_stations(section, kp)
             if section.mode == RPL_LEGS:
                 mode[sel] = ROUTE_SLACK
                 for k0, k1, slack in self.legs:
@@ -601,6 +636,28 @@ class BodyResult:
 
 
 @dataclass
+class HoldResult:
+    """A hold as modelled: the stations it holds and what it carries."""
+
+    name: str
+    kp_start: float                   # first and last held station
+    kp_end: float
+    i0: int
+    i1: int
+    held_kn: float                    # the tension it is laid and held at
+    before_kn: float = math.nan       # free cable next to it on the side laid before (nan: none in the profile)
+    after_kn: float = math.nan        # ... on the side laid after
+    load_kn: float = 0.0              # net axial load it carries: the difference between the two
+    pulled_m: float = 0.0             # cable laid before it whose tension its own tension raised (pull-back)
+    uplift_kn: float = 0.0            # largest upward pull of the free cable at its ends (it must hold it down)
+    uplift_kp: float = math.nan
+
+    @property
+    def point(self) -> bool:
+        return self.i0 == self.i1
+
+
+@dataclass
 class Summary:
     route_m: float = 0.0
     seabed_m: float = 0.0
@@ -666,6 +723,8 @@ class PlanningResult:
     # Per span: seabed length minus cable length from lift-off to touchdown, as drawn (m): the extra
     # cable it would take to follow the seabed there.
     span_short_m: List[float] = field(default_factory=list)
+    held: Optional[np.ndarray] = None                 # stations a hold holds (None: no hold)
+    holds: List[HoldResult] = field(default_factory=list)
 
     @property
     def gap_m(self) -> np.ndarray:
@@ -685,17 +744,88 @@ class PlanningResult:
 # Solve
 # ---------------------------------------------------------------------------
 def _curvature(st: Stations, tension_kn: np.ndarray, conform_kn: float,
-               cable_slope: Optional[np.ndarray] = None) -> np.ndarray:
+               cable_slope: Optional[np.ndarray] = None, pinned: Optional[np.ndarray] = None) -> np.ndarray:
     """Allowed free-span curvature ``w / (T cos^2 phi)`` (the catenary's, with ``phi`` the
-    cable's slope angle; ``w / T`` without a slope)."""
+    cable's slope angle; ``w / T`` without a slope). Infinite (the cable is pinned to the
+    seabed) below the conformity tension and at ``pinned`` stations."""
     cos2 = 1.0 if cable_slope is None else 1.0 / (1.0 + cable_slope ** 2)
     with np.errstate(divide="ignore", invalid="ignore"):
-        return np.where(tension_kn > conform_kn, st.w_npm / (tension_kn * 1000.0 * cos2), np.inf)
+        out = np.where(tension_kn > conform_kn, st.w_npm / (tension_kn * 1000.0 * cos2), np.inf)
+    return out if pinned is None else np.where(pinned, np.inf, out)
 
 
-def _shape(st: Stations, tension_kn: np.ndarray, conform_kn: float, cable_slope=None, surface=None) -> np.ndarray:
+def _shape(st: Stations, tension_kn: np.ndarray, conform_kn: float, cable_slope=None, surface=None,
+           pinned: Optional[np.ndarray] = None) -> np.ndarray:
     base = st.obstacle_m if surface is None else surface
-    return cable_rest_elevation(st.x_m, base, _curvature(st, tension_kn, conform_kn, cable_slope))
+    return cable_rest_elevation(st.x_m, base, _curvature(st, tension_kn, conform_kn, cable_slope, pinned))
+
+
+def gripped_segments(held: np.ndarray, direction: int) -> np.ndarray:
+    """Segments a hold grips: those inside it, and the one after it in the lay direction
+    (later touchdowns do not reach back through it). The segment before it stays free: the
+    tension the hold is laid at pulls back on the cable laid before, as any touchdown does."""
+    held = np.asarray(held, dtype=bool)
+    inside = held[:-1] & held[1:]
+    after = (held[:-1] & ~held[1:]) if direction >= 0 else (~held[:-1] & held[1:])
+    return inside | after
+
+
+def _end_uplift_n(x: np.ndarray, y: np.ndarray, w: np.ndarray, h_n: np.ndarray, held: np.ndarray,
+                  e: int) -> float:
+    """Upward pull (N) of the cable turning up out of a hold at station ``e``: the
+    tension of the free cable times its upward turn, less the weight carried there."""
+    n = len(x)
+    if e <= 0 or e >= n - 1 or not (np.isfinite(y[e - 1]) and np.isfinite(y[e]) and np.isfinite(y[e + 1])):
+        return 0.0
+    turn = (y[e + 1] - y[e]) / (x[e + 1] - x[e]) - (y[e] - y[e - 1]) / (x[e] - x[e - 1])
+    free = [h_n[j] for j in (e - 1, e + 1) if not held[j]]
+    if not free or turn <= 0:
+        return 0.0
+    pull = float(np.mean(free)) * turn - float(w[e]) * 0.5 * (x[e + 1] - x[e - 1])
+    return max(pull, 0.0)
+
+
+def _hold_results(control: LayControl, st: Stations, held: np.ndarray, deposit: np.ndarray,
+                  tension: np.ndarray, pulled: np.ndarray, y: np.ndarray, h_n: np.ndarray) -> List[HoldResult]:
+    x, kp, n = st.x_m, st.kp_km, st.n
+    later = 1 if control.direction >= 0 else -1          # index step towards the cable laid after
+    out: List[HoldResult] = []
+    for number, section in enumerate(control.holds(), start=1):
+        idx = np.nonzero(section_stations(section, kp) & held)[0]
+        if not idx.size:
+            continue
+        i0, i1 = int(idx[0]), int(idx[-1])
+        entry, leave = (i0, i1) if later > 0 else (i1, i0)
+
+        def side(j: int) -> float:
+            return float(tension[j]) if 0 <= j < n and not held[j] else math.nan
+
+        before, after = side(entry - later), side(leave + later)
+        load = abs((0.0 if math.isnan(after) else after) - (0.0 if math.isnan(before) else before))
+        reach = 0.0
+        j = entry - later
+        while 0 <= j < n and pulled[j]:
+            j -= later
+        last = j + later
+        if last != entry:
+            reach = abs(float(x[entry] - x[last]))
+        uplift, at = 0.0, math.nan
+        for e in sorted({i0, i1}):
+            value = _end_uplift_n(x, y, st.w_npm, h_n, held, e) / 1000.0
+            if value > uplift:
+                uplift, at = value, float(kp[e])
+        out.append(HoldResult(section.name or f"Hold {number}", float(kp[i0]), float(kp[i1]), i0, i1,
+                              float(deposit[entry]), before, after, load, reach, uplift, at))
+    return sorted(out, key=lambda h: h.kp_start)
+
+
+def allowable_shown(result: "PlanningResult") -> Optional[np.ndarray]:
+    """The highest tension for spans within limits, left out where the cable is held (it cannot span)."""
+    if result.allowable_kn is None:
+        return None
+    if result.held is None or not np.any(result.held):
+        return result.allowable_kn
+    return np.where(result.held, np.nan, result.allowable_kn)
 
 
 def _slope_of(x: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -747,16 +877,20 @@ def solve(st: Stations, control: LayControl, criteria: Criteria, allowable: Opti
     conform = float(criteria.conform_below_kn)
     report(progress, 0.0, "Deposit tension")
     mode, value = control.arrays(kp)
-    tension_mode = mode == TENSION
+    held = mode == HELD
+    any_held = bool(held.any())
+    pinned = held if any_held else None
+    tension_mode = (mode == TENSION) | held
     deposit = np.where(tension_mode, np.maximum(value, 0.0), 0.0)
     source = np.where(tension_mode & (deposit > conform), SOURCE_LAID, SOURCE_ZERO).astype(int)
+    source = np.where(held, SOURCE_HELD, source)
     dx = np.diff(x)
     seg_ok = np.isfinite(st.length_seabed_m[1:]) & np.isfinite(st.length_seabed_m[:-1])
     d_seabed = np.where(seg_ok, np.hypot(dx, np.where(seg_ok, np.diff(st.length_seabed_m), 0.0)), 0.0)
     d_route = np.where(seg_ok, dx, 0.0)
     seg_mode = mode[:-1]
     seg_value = 0.5 * (value[1:] + value[:-1])
-    seg_tension = seg_mode == TENSION
+    seg_tension = (seg_mode == TENSION) | (seg_mode == HELD)
     d_laid_plan = np.where(seg_mode == BOTTOM_SLACK, d_seabed * (1.0 + seg_value / 100.0),
                            np.where(seg_tension, d_seabed, d_route * (1.0 + seg_value / 100.0)))
     shortfalls: List[Shortfall] = []
@@ -770,10 +904,11 @@ def solve(st: Stations, control: LayControl, criteria: Criteria, allowable: Opti
         deposit, source, _balance, _reach, shortfalls = pull_taut(
             x, kp, st.length_seabed_m, st.w_npm, deposit, source, x, cable_cum, mu_bar, criteria.max_reach_m,
             criteria.shortfall_pct, min_reach, st.npts_kn, conform, cancel=cancel,
-            progress=sub_progress(progress, 0.02, 0.3))
+            progress=sub_progress(progress, 0.02, 0.3), held=pinned)
 
     # Residual tension and rest shape, iterated (friction is carried by the shape's reactions).
     # The catenary curvature uses the cable's own slope, from the previous shape.
+    grip = gripped_segments(held, control.direction) if any_held else None
     tension = deposit.copy()
     unheld = np.zeros(n, dtype=bool)
     reaction = np.zeros(n)
@@ -782,13 +917,16 @@ def solve(st: Stations, control: LayControl, criteria: Criteria, allowable: Opti
     for iterations in range(1, 7):
         check_cancel(cancel)
         report(progress, 0.3 + 0.05 * iterations, "Residual tension (friction) and rest shape")
-        y = _shape(st, tension, conform, cable_slope)
+        y = _shape(st, tension, conform, cable_slope, pinned=pinned)
         previous = cable_slope
         cable_slope = _slope_of(x, y)
         contact = np.isfinite(y) & ((y - st.obstacle_m) <= CONTACT_TOL_M)
         h_n = tension * 1000.0 / np.sqrt(1.0 + cable_slope ** 2)
         reaction = station_reactions(x, y, st.w_npm, h_n, contact)
         lower, upper, gravity = friction_band(x, y, st.w_npm, st.mu, reaction)
+        if grip is not None:
+            lower = np.where(grip, gravity - HOLD_GRIP_N, lower)
+            upper = np.where(grip, gravity + HOLD_GRIP_N, upper)
         new, unheld = lay_history_tension(deposit * 1000.0, lower, upper, gravity, control.direction)
         new = new / 1000.0
         change = float(np.nanmax(np.abs(new - tension))) if n else 0.0
@@ -796,10 +934,21 @@ def solve(st: Stations, control: LayControl, criteria: Criteria, allowable: Opti
         tension = new
         if change < 0.005 + 0.002 * float(np.nanmax(tension) if n else 0.0) and turn < 0.01:
             break
-    y = _shape(st, tension, conform, cable_slope)
+    y = _shape(st, tension, conform, cable_slope, pinned=pinned)
+    unheld = unheld & ~held
     raised = tension > deposit + np.maximum(0.1, 0.05 * deposit)
-    source = np.where(raised, SOURCE_SLOPE, source)
-    source = np.where((tension <= conform) & (source != SOURCE_TAUT), SOURCE_ZERO, source)
+    source = np.where(raised & ~held, SOURCE_SLOPE, source)
+    source = np.where((tension <= conform) & (source != SOURCE_TAUT) & ~held, SOURCE_ZERO, source)
+    # The cable laid just before a hold whose tension the hold's own raised (e.g. at PLDN).
+    pulled = np.zeros(n, dtype=bool)
+    if any_held:
+        later = 1 if control.direction >= 0 else -1
+        for a, b in runs(held):
+            j = (a if later > 0 else b) - later
+            while 0 <= j < n and raised[j] and not held[j]:
+                pulled[j] = True
+                j -= later
+        source = np.where(pulled & (source != SOURCE_TAUT), SOURCE_PULLED, source)
     trib = np.empty(n)
     trib[0], trib[-1] = 0.5 * dx[0], 0.5 * dx[-1]
     trib[1:-1] = 0.5 * (dx[1:] + dx[:-1])
@@ -814,7 +963,7 @@ def solve(st: Stations, control: LayControl, criteria: Criteria, allowable: Opti
     supports = span_supports(x, st.obstacle_m, y, tension, st.w_npm, st.ei_knm2, st.mbr_m, spans, kp, end_tol)
 
     # Slack: planned (laid), fill (seabed), used by the rest shape, surplus.
-    y_len = _shape(st, tension, conform, cable_slope, st.length_seabed_m)
+    y_len = _shape(st, tension, conform, cable_slope, st.length_seabed_m, pinned=pinned)
     len_ok = seg_ok & np.isfinite(y_len[1:]) & np.isfinite(y_len[:-1])
     d_shape = np.where(len_ok, np.hypot(dx, np.where(len_ok, np.diff(y_len), 0.0)), 0.0)
     d_laid = np.where(seg_tension, d_shape, d_laid_plan)
@@ -887,11 +1036,16 @@ def solve(st: Stations, control: LayControl, criteria: Criteria, allowable: Opti
         dxs = np.diff(xs)
         span_short.append(float(np.sum(np.hypot(dxs, np.diff(zs))[ok]) - np.sum(np.hypot(dxs, np.diff(ys))[ok])))
 
+    holds: List[HoldResult] = []
+    if any_held:
+        h_final = tension * 1000.0 / np.sqrt(1.0 + _slope_of(x, y) ** 2)
+        holds = _hold_results(control, st, held, deposit, tension, pulled, y, h_final)
     result = PlanningResult(st, control, criteria, deposit, tension, source, y, unheld, reaction_npm, fill_pct,
                             shape_pct, laid_pct, excess_pct, bottom_slack_pct, allowable_kn, spans, supports,
                             shortfalls, bodies, [], summary, iterations, notes, indicative,
                             used_bottom_pct=used_bottom_pct, surplus_bottom_pct=surplus_bottom_pct,
-                            seabed_over_route=seabed_over_route, span_short_m=span_short)
+                            seabed_over_route=seabed_over_route, span_short_m=span_short,
+                            held=held if any_held else None, holds=holds)
     result.findings = findings(result)
     report(progress, 1.0, "Done")
     return result
@@ -1056,7 +1210,8 @@ def findings(result: PlanningResult) -> List[RangeFinding]:
                                 -c.shortfall_pct, "%", extra={"tension_kn": item.tension_kn,
                                                               "reach_m": item.reach_m}))
 
-    contact = np.isfinite(result.gap_m) & (result.gap_m <= CONTACT_TOL_M)
+    free = np.ones(st.n, dtype=bool) if result.held is None else ~result.held   # a hold neither slides nor spans
+    contact = np.isfinite(result.gap_m) & (result.gap_m <= CONTACT_TOL_M) & free
     with np.errstate(invalid="ignore"):
         steep = contact & (np.abs(st.slope) > st.mu)
     for a, b in _range_runs(steep, x, merge_m=20.0, min_length_m=2.0):
@@ -1094,7 +1249,7 @@ def findings(result: PlanningResult) -> List[RangeFinding]:
                 + (" in a span" if b.in_span else ""), b.max_gap_m, c.min_gap_m, "m"))
 
     with np.errstate(invalid="ignore"):
-        steep_model = np.degrees(np.arctan(np.abs(st.slope))) > c.max_slope_deg
+        steep_model = (np.degrees(np.arctan(np.abs(st.slope))) > c.max_slope_deg) & free
     for a, b in _range_runs(steep_model, x, merge_m=50.0, min_length_m=2.0):
         slope_deg = float(np.degrees(np.arctan(np.nanmax(np.abs(st.slope[a:b + 1])))))
         out.append(RangeFinding(
@@ -1186,7 +1341,7 @@ def detail_window(result: PlanningResult, kp0: float, kp1: float, spacing_m: Opt
 
     The residual tension and makeup come from the route model; the window's
     ends are held at the route model's shape. Bodies are stiff (rigid)
-    elements.
+    elements; held stations (holds) stay on the seabed.
     """
     st = result.stations
     x, kp = st.x_m, st.kp_km
@@ -1227,7 +1382,16 @@ def detail_window(result: PlanningResult, kp0: float, kp1: float, spacing_m: Opt
     ei = np.where(rigid, RIGID_EI_NM2, ei)
     y_start = np.interp(xg, x, result.cable_m)
     ends = (y_start[0], y_start[1], y_start[-2], y_start[-1])
-    beam = solve_tensioned_beam(xg, obstacle, w, h_n, ei, y_ends=ends, y_start=y_start, cancel=cancel)
+    pinned = None
+    if result.held is not None:
+        # Every node between two held stations; a point hold pins the nodes nearest it.
+        held = result.held
+        point = held.copy()
+        point[1:] &= ~held[:-1]
+        point[:-1] &= ~held[1:]
+        pinned = (np.interp(xg, x, held.astype(float)) >= 1.0 - 1e-9) | point[nearest]
+    beam = solve_tensioned_beam(xg, obstacle, w, h_n, ei, y_ends=ends, y_start=y_start, cancel=cancel,
+                                pinned=pinned)
     if not beam.converged:
         notes.append(f"The contact solver did not fully converge ({beam.method}, {beam.iterations} iterations).")
     kp_g = np.interp(xg, x, kp)
@@ -1280,7 +1444,8 @@ def tension_sweep(st: Stations, control: LayControl, criteria: Criteria, tension
                   progress=None) -> List[SweepRow]:
     """Spans against a constant bottom tension (friction and slopes included).
 
-    With a uniform cable on a frictionless seabed the span set only grows
+    The holds of ``control`` stay as they are, at their own tensions. With a
+    uniform cable on a frictionless seabed the span set only grows
     as the tension rises (Binda & Contro 1979); slopes, friction and bodies
     can bend that, so each tension is solved in full.
     """
@@ -1290,8 +1455,8 @@ def tension_sweep(st: Stations, control: LayControl, criteria: Criteria, tension
     for k, t in enumerate(tensions_kn):
         check_cancel(cancel)
         report(progress, k / total, f"Bottom tension {t:.2f} kN ({k + 1} of {total})")
-        result = solve(st, LayControl(TENSION, float(t), [], [], control.direction), base, allowable=False,
-                       cancel=cancel)
+        result = solve(st, LayControl(TENSION, float(t), control.holds(), [], control.direction), base,
+                       allowable=False, cancel=cancel)
         spans = result.spans
         supports = result.supports
         if kp_window is not None:
@@ -1384,6 +1549,8 @@ def find_tension(st: Stations, control: LayControl, criteria: Criteria, target: 
     ``hi_kn``, then bisected between the last grid tension that meets the
     target (with every lower one meeting it too) and the next. A crossing
     always spans: what remains at the lowest tension is reported, not hidden.
+    The holds of ``control`` stay as they are, at their own tensions (a hold
+    laid at a high tension can make spans before it at any lay tension).
     """
     lo = max(float(lo_kn or 0.0), 2.0 * criteria_floor(criteria), 0.05)
     hi = max(float(hi_kn), 1.5 * lo)
@@ -1399,8 +1566,8 @@ def find_tension(st: Stations, control: LayControl, criteria: Criteria, target: 
         check_cancel(cancel)
         report(progress, done[0] / total, f"Bottom tension {t_kn:.2f} kN")
         done[0] += 1
-        result = solve(st, LayControl(TENSION, t_kn, [], [], control.direction), base, allowable=False,
-                       cancel=cancel)
+        result = solve(st, LayControl(TENSION, t_kn, control.holds(), [], control.direction), base,
+                       allowable=False, cancel=cancel)
         out = []
         for _name, a, b in scopes:
             lo_kp, hi_kp = sorted((a, b))

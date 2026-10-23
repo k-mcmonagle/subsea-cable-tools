@@ -526,6 +526,118 @@ def test_spans_below_data_resolution() -> bool:
                    f"fine {len(fine.spans)} span(s)")
 
 
+# ---------------------------------------------------------------------------
+# Holds (buried or pinned sections)
+# ---------------------------------------------------------------------------
+def _plough(direction=1, hold_kn=25.0, lay_kn=1.0, **kwargs):
+    """A plough section KP 1.5 to 2.0 held at the PLDN tension, surface lay either side (armoured, 60 N/m)."""
+    hold = pl.ControlSection(1.5, 2.0, pl.HELD, hold_kn, "Plough 1")
+    control = pl.LayControl(pl.TENSION, lay_kn, [hold] + kwargs.pop("sections", []), [], direction)
+    return pl.run(_inputs(kwargs.pop("profile", None) or _flat(3000.0, 1.0), control, cable=DA,
+                          criteria=pl.Criteria(allowable=False), **kwargs))
+
+
+def test_hold_pull_back() -> bool:
+    """A hold laid at 25 kN after surface lay at 1 kN: its tension pulls back on the cable laid before,
+    falling by mu w per metre, (25 - 1) / (mu w) = 800 m; nothing passes through it to the cable laid
+    after. Both lay directions."""
+    out = []
+    for direction in (1, -1):
+        r = _plough(direction)
+        x, t = r.stations.x_m, r.tension_kn
+        hold = r.holds[0]
+        entry, leave = (1500.0, 2000.0) if direction > 0 else (2000.0, 1500.0)
+        d = 200.0
+        expect = 25.0 - 0.5 * 60.0 * d / 1000.0
+        back = float(np.interp(entry - direction * d, x, t))
+        beyond = float(np.interp(entry - direction * 900.0, x, t))
+        after = float(np.interp(leave + direction * 100.0, x, t))
+        inside = t[r.held]
+        out.append(_close(back, expect, 0.01) and _close(beyond, 1.0, 0.01) and _close(after, 1.0, 0.01)
+                   and np.allclose(inside, 25.0) and _close(hold.pulled_m, 800.0, 0.02)
+                   and _close(hold.before_kn, 25.0, 0.01) and _close(hold.after_kn, 1.0, 0.01)
+                   and _close(hold.load_kn, 24.0, 0.02) and hold.name == "Plough 1"
+                   and r.source[int(np.searchsorted(x, entry - direction * d))] == pl.SOURCE_PULLED)
+        detail = f"{back:.2f} kN {d:.0f} m back vs {expect:.2f}; reach {hold.pulled_m:.0f} m vs 800; after {after:.2f}"
+    return _report("hold: its tension pulls back on the cable laid before (mu w per metre), not on the cable "
+                   "laid after; both lay directions", all(out), detail)
+
+
+def test_hold_no_spans_inside() -> bool:
+    """A boulder inside a hold makes no span (the cable is buried over it); one outside spans as before."""
+    rocks = [SeabedFeature(BOULDER, 0.5, 1.0, 2.0), SeabedFeature(BOULDER, 1.75, 1.0, 2.0)]
+    free = pl.run(_inputs(_flat(3000.0, 0.5), pl.LayControl(pl.TENSION, 5.0), cable=DA, features=rocks,
+                          criteria=pl.Criteria(allowable=False)))
+    held = _plough(hold_kn=5.0, lay_kn=5.0, features=rocks, profile=_flat(3000.0, 0.5))
+    gap = held.gap_m[held.held]
+    ok = len(free.spans) == 4 and len(held.spans) == 2 and all(s.kp_end < 1.5 for s in held.spans) \
+        and float(np.nanmax(np.abs(gap))) < 1e-6
+    return _report("hold: no span inside it (it follows the seabed); spans outside unchanged", ok,
+                   f"{len(free.spans)} span(s) free, {len(held.spans)} with the hold")
+
+
+def test_hold_end_uplift() -> bool:
+    """Cable leaving a hold up a 1:10 ramp at 5 kN: the hold takes the turn, P = H s - w dx = 0.44 kN."""
+    x = np.arange(0.0, 3000.5, 1.0)
+    depth = 100.0 - np.clip(x - 2000.0, 0.0, 100.0) * 0.1
+    r = _plough(hold_kn=5.0, lay_kn=5.0, profile=pl.Profile(x, x / 1000.0, depth))
+    hold = r.holds[0]
+    expect = (5000.0 / math.sqrt(1.01) * 0.1 - 60.0 * 1.0) / 1000.0
+    flat = _plough(hold_kn=5.0, lay_kn=5.0).holds[0]
+    ok = _close(hold.uplift_kn, expect, 0.03) and abs(hold.uplift_kp - 2.0) < 1e-6 and flat.uplift_kn == 0.0
+    return _report("hold end: upward pull of the free cable turning up out of it", ok,
+                   f"{hold.uplift_kn:.3f} kN vs {expect:.3f}")
+
+
+def test_point_hold_anchor() -> bool:
+    """An anchor at KP 1.0 holds the cable laid before it from a later 25 kN section at KP 1.2:
+    behind it 1 kN stays; the anchor carries 25 - 1 - mu w 200 m = 18.0 kN."""
+    anchor = pl.ControlSection(1.0, 1.0, pl.HELD, 1.0, "Anchor")
+    pull = pl.ControlSection(1.2, 3.0, pl.TENSION, 25.0)
+    r = pl.run(_inputs(_flat(3000.0, 1.0), pl.LayControl(pl.TENSION, 1.0, [anchor, pull]), cable=DA,
+                       criteria=pl.Criteria(allowable=False)))
+    free = pl.run(_inputs(_flat(3000.0, 1.0), pl.LayControl(pl.TENSION, 1.0, [pull]), cable=DA,
+                          criteria=pl.Criteria(allowable=False)))
+    x = r.stations.x_m
+    hold = r.holds[0]
+    expect = 25.0 - 0.5 * 60.0 * 199.0 / 1000.0 - 1.0
+    behind = float(np.interp(900.0, x, r.tension_kn))
+    without = float(np.interp(900.0, x, free.tension_kn))
+    ok = hold.point and int(r.held.sum()) == 1 and _close(behind, 1.0, 0.01) and without > 5.0 \
+        and _close(hold.load_kn, expect, 0.01)
+    return _report("point hold (anchor): holds the cable laid before it; carries the tension difference", ok,
+                   f"behind {behind:.2f} kN (free {without:.2f}); load {hold.load_kn:.2f} vs {expect:.2f} kN")
+
+
+def test_hold_sweep_and_detail() -> bool:
+    """Tension sweep and find tension keep the holds; the detail model keeps held nodes on the seabed."""
+    rocks = [SeabedFeature(BOULDER, 0.5, 1.0, 2.0), SeabedFeature(BOULDER, 1.75, 1.0, 2.0)]
+    r = _plough(hold_kn=5.0, lay_kn=5.0, features=rocks, profile=_flat(3000.0, 0.5))
+    rows = pl.tension_sweep(r.stations, r.control, pl.Criteria(allowable=False), [1.0, 5.0, 10.0])
+    answer = pl.find_tension(r.stations, r.control, pl.Criteria(allowable=False),
+                             pl.TensionTarget(0.3, 5.0, mbr=False), [("all", 0.0, 3.0)], 20.0, steps=4, refine=2)
+    detail = pl.detail_window(r, 1.70, 1.80)
+    pinned_gap = detail.beam.gap_m[(detail.kp_km > 1.71) & (detail.kp_km < 1.79)]
+    ok = all(row.spans == 2 for row in rows) and answer[0].tension_kn > 0 \
+        and float(np.max(np.abs(pinned_gap))) < 1e-6
+    return _report("holds kept by the sweep and the tension finder; detail model pinned in a hold", ok,
+                   f"spans per tension {[row.spans for row in rows]}; found {answer[0].tension_kn:.2f} kN")
+
+
+def test_hold_with_slack() -> bool:
+    """Slack short of the seabed next to a hold: pulled taut without drawing on (or raising) the hold."""
+    spec = SyntheticSeabed(length_m=3000.0, spacing_m=1.0, wave_height_m=2.0, wave_length_m=40.0)
+    prof = synthetic_profile(spec)
+    plain = pl.run(_inputs(prof, pl.LayControl(pl.ROUTE_SLACK, 0.0), criteria=pl.Criteria(allowable=False)))
+    hold = pl.ControlSection(1.5, 3.0, pl.HELD, 0.5)
+    r = pl.run(_inputs(prof, pl.LayControl(pl.ROUTE_SLACK, 0.0, [hold]), criteria=pl.Criteria(allowable=False)))
+    ok = np.allclose(r.tension_kn[r.held], 0.5) and r.shortfalls \
+        and all(item.kp_end < 1.5 for item in r.shortfalls) and plain.shortfalls
+    return _report("slack next to a hold: pulled taut on its own side; the hold keeps its tension", bool(ok),
+                   f"{len(r.shortfalls)} short stretch(es), last ends at KP "
+                   f"{max((s.kp_end for s in r.shortfalls), default=math.nan):.3f}")
+
+
 def run_all() -> List[bool]:
     results = [
         test_point_load_sag(),
@@ -556,6 +668,12 @@ def run_all() -> List[bool]:
         test_contact_limit(),
         test_data_noise_and_filter(),
         test_spans_below_data_resolution(),
+        test_hold_pull_back(),
+        test_hold_no_spans_inside(),
+        test_hold_end_uplift(),
+        test_point_hold_anchor(),
+        test_hold_sweep_and_detail(),
+        test_hold_with_slack(),
     ]
     print(f"\n{sum(results)}/{len(results)} cable-on-seabed engine checks passed.")
     return results

@@ -1182,3 +1182,40 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   - Burial plan layers are restyled only when their style is older.
   - A rollback over a change that also touched a table this version does
     not know is refused, instead of half done and recorded as complete.
+
+## Span & Slack holds: buried or pinned cable (October 2026)
+
+- **A hold is a lay control mode, not a separate constraints table.** A
+  plough section is a lay operation with a tension, so one row (KP range,
+  *Held*, the tension at PLDN, a name) says it all and sits in sequence with
+  the surface lay rows around it. A point (KP to = KP from) holds the
+  nearest station: an anchor. *Hold plough sections* fills rows from the
+  RPL's burial events (read by the Burial Planner's RPL import, in the lay
+  direction) or the Burial Planner plan when it shares the analysis's KPs.
+  Post-lay burial (PLB, MFE) is not held by default: the cable lies on the
+  seabed as laid until it is buried.
+- **The hold's tension pulls back; nothing passes through it.** Its stations
+  are laid at its tension like any touchdown, so the first held station (in
+  lay order) clamps the cable laid before into the friction band: the
+  PLDN pull-back, `mu w` per metre. Segments inside the hold and the one
+  after it in the lay direction get a friction capacity of 1e9 N (gripped):
+  later touchdowns do not reach back through it. 1e9 N is far above any
+  tension yet keeps the band's running sums precise. Gripping the segment
+  before it as well would have lost the pull-back, the point of the feature.
+- **Pinned in the rest shape, bilateral in the detail model.** Held stations
+  have infinite allowed curvature, which `cable_rest_elevation` already
+  treats as anchors; the beam keeps held nodes active (reaction may be
+  negative). Pull-taut windows for slack sections end at a hold, and held
+  stations are never raised by them.
+- **Pull-up only at a hold's ends, no soil resistance yet.** The free
+  cable's tension times its upward turn, less the weight there: where the
+  free cable leaves the trench (PLUP into a rise). Inside a hold the tension
+  a buried cable keeps behind the share is not known, so uplift there would
+  be noise; comparing with an uplift resistance (DNV-RP-F110 style) is the
+  next step, with embedment and crest cut-through.
+- **The highest tension for spans within limits is found without holds**
+  (it is cached across live updates and depends only on the stations) and is
+  not shown over a hold; next to a hold it is conservative.
+- **Span store schema 2.** A version 1 build would lay a held row as route
+  slack and keep it so when saving, so it must refuse the file. Version 1
+  files are stamped 2 on open; there is nothing to convert.

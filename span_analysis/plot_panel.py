@@ -6,7 +6,9 @@
   spans filled by level (red, amber; light grey where the cable is clear of
   the seabed but under the reporting limits), span supports (red below the
   MBR; hover for the reaction and bend radius), bodies (hover or click for
-  their details, optional labels), the detail model's cable and sea level;
+  their details, optional labels), held sections (a dark band, squares at
+  their ends: hover for what they carry), the detail model's cable and sea
+  level;
 * tension: residual tension on the seabed, the lay (deposit) tension, NPTS and
   the highest tension that keeps spans within the limits;
 * slack: cable laid and the cable the rest shape uses, with the RPL's planned
@@ -85,7 +87,7 @@ TIP_FIELDS = (("kp", "KP", True), ("depth", "Seabed depth", True), ("cable", "Ca
               ("gap", "Gap and span", True), ("tension", "Residual tension", True), ("lay", "Lay tension", False),
               ("allowable", "Highest tension for spans within limits", False),
               ("slack", "Slack (laid, used, surplus)", False), ("slope", "Slope and friction", False),
-              ("type", "Cable type, body or protection", False), ("soil", "Soil", False))
+              ("type", "Cable type, body, protection or hold", False), ("soil", "Soil", False))
 LEVEL_NAMES = {-1: "No seabed data", 0: "Clear", 1: "Information", 2: "Amber", 3: "Red"}
 SEVERITY_NAMES = {ERROR: "Red", WARNING: "Amber", INFO: "Info"}
 _TIP_STYLE = ("QLabel { background: rgba(255, 255, 255, 240); color: #222; border: 1px solid #9e9e9e; "
@@ -102,6 +104,7 @@ SHORT_FILL = (121, 85, 72, 70)       # cable shorter than the seabed under it (i
 LOOP_LINE = (255, 152, 0)            # the loop-risk threshold (an amber finding above it)
 DETAIL = (123, 31, 162)
 PROTECTION = (96, 125, 139, 150)
+HELD = (78, 52, 46, 170)             # held (buried or pinned) sections
 PREVIOUS = (150, 150, 150)
 SEA = "#17becf"
 _LEAVE = getattr(getattr(QEvent, "Type", QEvent), "Leave")
@@ -111,6 +114,7 @@ TRUE_SCALE_RATIO = 1000.0   # KP in km, depth in m
 _LEGENDS = {
     "depth": [("dash", SEA, "Sea level"), ("solid", (200, 175, 165), "Seabed (sampled)"), ("solid", SEABED, "Seabed"),
               ("solid", CABLE, "Cable (rest shape)"), ("fill", PROTECTION, "Protection"),
+              ("fill", HELD, "Held (buried or pinned)"),
               ("dash", PREVIOUS, "Previous run"),
               ("solid", DETAIL, "Cable with EI (detail)"), ("fill", RED_FILL, "Span (red)"),
               ("fill", AMBER_FILL, "Span (amber)"), ("fill", INDICATIVE_FILL, "Span below the data's resolution"),
@@ -471,6 +475,12 @@ class ProfilePlot(QWidget):
         self.raw_curve = curve(self.depth_plot, (200, 175, 165), "Seabed (sampled)", 1)
         self.seabed_curve = curve(self.depth_plot, SEABED, "Seabed", 2)
         self.protection_curve = curve(self.depth_plot, PROTECTION, "Protection", 7, fast=False)
+        self.held_curve = curve(self.depth_plot, HELD, "Held (buried or pinned)", 5, fast=False)
+        self.hold_ends = pg.ScatterPlotItem([], [], size=9, symbol="s", pen=pg.mkPen((30, 30, 30)),
+                                            brush=pg.mkBrush(*HELD[:3]), hoverable=True, tip=_tip,
+                                            name="Hold ends")
+        self.hold_ends.setZValue(19)
+        self.depth_plot.addItem(self.hold_ends)
         self.cable_curve = curve(self.depth_plot, CABLE, "Cable (rest shape)", 1.5)
         self.prev_cable_curve = curve(self.depth_plot, PREVIOUS, "Cable (previous run)", 1, _DASH)
         self.detail_curve = curve(self.depth_plot, DETAIL, "Cable (detail, with EI)", 1.5)
@@ -669,7 +679,7 @@ class ProfilePlot(QWidget):
         r = self._result
         if r is None:
             for item in (self.raw_curve, self.seabed_curve, self.cable_curve, self.detail_curve, self.sea_curve,
-                         self.protection_curve,
+                         self.protection_curve, self.held_curve,
                          self.tension_curve, self.deposit_curve, self.npts_curve, self.allowable_curve,
                          self.used_curve, self.laid_curve, self.fill_curve, self.plan_curve, self.slope_curve,
                          self.friction_curve, self.loop_curve):
@@ -679,6 +689,7 @@ class ProfilePlot(QWidget):
             self._update_slack_caption()
             self.supports.setData([], [])
             self.bodies.setData([], [])
+            self.hold_ends.setData([], [])
             self._all_events = []
             self._apply_events()
             self._update_colour()
@@ -700,6 +711,7 @@ class ProfilePlot(QWidget):
             self.protection_curve.setData(kp, np.where(index >= 0, cable_depth, np.nan))
         else:
             self.protection_curve.setData([], [])
+        self._draw_holds(r, kp, cable_depth)
         self.detail_curve.setData([], [])
         self._draw_fills(r, kp, cable_depth, floor)
         self._draw_supports(r)
@@ -710,8 +722,9 @@ class ProfilePlot(QWidget):
         self.tension_curve.setData(kp, _finite_tension(r.tension_kn))
         self.deposit_curve.setData(kp, _finite_tension(r.deposit_kn))
         self.npts_curve.setData(kp, st.npts_kn)
-        if r.allowable_kn is not None:
-            self.allowable_curve.setData(kp, np.where(r.allowable_kn < 99.9, r.allowable_kn, np.nan))
+        allowable = pl.allowable_shown(r)
+        if allowable is not None:
+            self.allowable_curve.setData(kp, np.where(allowable < 99.9, allowable, np.nan))
         else:
             self.allowable_curve.setData([], [])
         self._draw_slack(r)
@@ -902,6 +915,24 @@ class ProfilePlot(QWidget):
                      f"Tension {_tension_text(sp.tension_kn)}"]
             tips.append("\n".join(line for line in lines if line))
         self.supports.setData(np.array(kps), np.array(depths), brush=brushes, data=tips)
+
+    def _draw_holds(self, r: pl.PlanningResult, kp: np.ndarray, cable_depth: np.ndarray) -> None:
+        """Held sections: a band along the cable, a square at each end (one for a point)."""
+        if r.held is None or not r.holds:
+            self.held_curve.setData([], [])
+            self.hold_ends.setData([], [])
+            return
+        self.held_curve.setData(kp, np.where(r.held, cable_depth, np.nan))
+        kps, depths, tips = [], [], []
+        for hold in r.holds:
+            where = (f"at KP {hold.kp_start:.3f}" if hold.point
+                     else f"KP {hold.kp_start:.3f} to {hold.kp_end:.3f}")
+            text = f"{hold.name}: held (buried or pinned), {where}\n" + ev.hold_text(hold)
+            for i in sorted({hold.i0, hold.i1}):
+                kps.append(float(kp[i]))
+                depths.append(float(cable_depth[i]))
+                tips.append(text)
+        self.hold_ends.setData(np.array(kps), np.array(depths), data=tips)
 
     def body_text(self, index: int) -> str:
         r = self._result
@@ -1568,7 +1599,16 @@ class ProfilePlot(QWidget):
         if index is not None and index[i] >= 0:
             item = st.protection[int(index[i])]
             label = (label or st.cable_at(i).name) + f" in {item.name} ({item.kind})"
+        hold = self._hold_at(i)
+        if hold is not None:
+            label = (label or st.cable_at(i).name) + f", held: {hold.name}"
         return label or st.cable_at(i).name
+
+    def _hold_at(self, i: int):
+        r = self._result
+        if r is None or r.held is None or not r.held[i]:
+            return None
+        return next((h for h in r.holds if h.i0 <= i <= h.i1), None)
 
     def tip_rows(self, i: int, keys: Sequence[str]) -> List[Tuple[str, str]]:
         """``(label, value)`` rows of the tooltip at station ``i`` for the chosen fields."""
@@ -1600,7 +1640,7 @@ class ProfilePlot(QWidget):
                 rows.append(("Residual T", _tension_text(r.tension_kn[i])))
             elif key == "lay":
                 rows.append(("Lay T", _tension_text(r.deposit_kn[i])))
-            elif key == "allowable" and r.allowable_kn is not None and r.allowable_kn[i] < 99.9:
+            elif key == "allowable" and pl.allowable_shown(r) is not None and pl.allowable_shown(r)[i] < 99.9:
                 rows.append(("Highest T, spans in limits", f"{r.allowable_kn[i]:.2f} kN"))
             elif key == "slack":
                 series = self.slack_series(r)

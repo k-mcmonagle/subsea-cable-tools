@@ -150,18 +150,24 @@ def seabed_cumulative(x_m, depth_m) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def length_balance_pct(x_m, seabed_cum, plan_cum, cable_x, cable_cum, half_window_m,
-                       min_coverage: float = 0.8) -> np.ndarray:
+                       min_coverage: float = 0.8, lo_m=None, hi_m=None) -> np.ndarray:
     """Laid cable minus seabed length within ``x +- half_window``, % of plan.
 
     Positive: more cable than the seabed needs (surplus); negative: the cable
     is short of the seabed it has to cover. nan without enough data.
+    ``lo_m`` / ``hi_m`` (per station, optional) end the window where cable
+    cannot be drawn from (a hold).
     """
     x = np.asarray(x_m, dtype=float)
     out = np.full(len(x), np.nan)
     if cable_x.size < 2 or x.size < 2:
         return out
-    lo_limit = max(x[0], cable_x[0])
-    hi_limit = min(x[-1], cable_x[-1])
+    lo_limit = np.full(len(x), max(x[0], cable_x[0]))
+    hi_limit = np.full(len(x), min(x[-1], cable_x[-1]))
+    if lo_m is not None:
+        lo_limit = np.minimum(np.maximum(lo_limit, lo_m), x)
+    if hi_m is not None:
+        hi_limit = np.maximum(np.minimum(hi_limit, hi_m), x)
     a = np.clip(x - half_window_m, lo_limit, hi_limit)
     b = np.clip(x + half_window_m, lo_limit, hi_limit)
     plan = b - a
@@ -177,7 +183,8 @@ def length_balance_pct(x_m, seabed_cum, plan_cum, cable_x, cable_cum, half_windo
 
 def taut_tension_n(x_m, seabed_elev_m, w_npm, x0: float, x1: float, cable_x, cable_cum,
                    mu: float, min_reach_m: float, max_reach_m: float,
-                   cap_n: float = 2.0e6) -> Tuple[float, float, float, bool, float]:
+                   cap_n: float = 2.0e6, held=None, lo_m: float = -math.inf,
+                   hi_m: float = math.inf) -> Tuple[float, float, float, bool, float]:
     """Tension that makes the cable's resting shape use exactly the cable laid.
 
     The shortfall between ``x0`` and ``x1`` draws on cable within the friction
@@ -185,12 +192,15 @@ def taut_tension_n(x_m, seabed_elev_m, w_npm, x0: float, x1: float, cable_x, cab
     Bisection on ``H`` (the rest shape shortens as ``H`` grows). Returns
     ``(H, a, b, feasible, reach)``: ``feasible`` is False when even taut at
     ``cap_n`` the cable cannot cover the seabed; ``reach`` is the friction
-    reach either side at ``H`` (within the min / max reach).
+    reach either side at ``H`` (within the min / max reach). ``held``
+    stations (per station, optional) follow the seabed, and the window ends
+    at ``lo_m`` / ``hi_m`` (a hold: no cable is drawn through it).
     """
     x = np.asarray(x_m, dtype=float)
     s = np.asarray(seabed_elev_m, dtype=float)
     w = np.asarray(w_npm, dtype=float)
-    lo_x, hi_x = max(x[0], cable_x[0]), min(x[-1], cable_x[-1])
+    pinned = None if held is None else np.asarray(held, dtype=bool)
+    lo_x, hi_x = max(x[0], cable_x[0], lo_m), min(x[-1], cable_x[-1], hi_m)
     i0, i1 = int(np.searchsorted(x, x0, side="left")), int(np.searchsorted(x, x1, side="right"))
     w_here = w[i0:i1]
     w_bar = float(np.nanmean(w_here)) if np.isfinite(w_here).any() else float(np.nanmean(w))
@@ -209,7 +219,10 @@ def taut_tension_n(x_m, seabed_elev_m, w_npm, x0: float, x1: float, cable_x, cab
         xs, ss, ws = x[j0:j1], s[j0:j1], w[j0:j1]
         if xs.size < 3:
             return -1.0
-        y = cable_rest_elevation(xs, ss, np.where(np.isfinite(ws), ws, np.nanmean(ws)) / h)
+        curvature = np.where(np.isfinite(ws), ws, np.nanmean(ws)) / h
+        if pinned is not None:
+            curvature = np.where(pinned[j0:j1], np.inf, curvature)
+        y = cable_rest_elevation(xs, ss, curvature)
         seg = np.isfinite(y[1:]) & np.isfinite(y[:-1])
         shape = float(np.sum(np.hypot(np.diff(xs), np.diff(y))[seg]))
         covered = float(np.sum(np.diff(xs)[seg]))
@@ -242,8 +255,8 @@ def taut_tension_n(x_m, seabed_elev_m, w_npm, x0: float, x1: float, cable_x, cab
 def pull_taut(x_m, kp_km, length_elev_m, w_npm, tension_kn, source, cable_x, cable_cum,
               mu: float, max_reach_m: float, shortfall_pct: float, min_reach_m: float,
               npts_kn=None, zero_tension_kn: float = 0.05,
-              cancel: Optional[Callable[[], bool]] = None, progress: Optional[Callable] = None
-              ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Shortfall]]:
+              cancel: Optional[Callable[[], bool]] = None, progress: Optional[Callable] = None,
+              held=None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Shortfall]]:
     """Raise the tension where the laid cable is short of the seabed.
 
     ``length_elev_m`` is the seabed used for lengths (elevation or depth: only
@@ -255,9 +268,10 @@ def pull_taut(x_m, kp_km, length_elev_m, w_npm, tension_kn, source, cable_x, cab
     ``min_reach_m .. max_reach_m``); where it is short by more than
     ``shortfall_pct`` the tension that makes the cable cover the seabed
     (:func:`taut_tension_n`) is applied over that reach if higher, falling by
-    ``mu w`` per metre away from the stretch. Returns ``(tension_kn, source,
-    balance_pct, reach_m, shortfalls)``. ``progress(fraction, text)`` runs
-    0..1 over the short stretches.
+    ``mu w`` per metre away from the stretch. ``held`` stations (a hold,
+    optional) give no cable and keep their tension: the windows end at them.
+    Returns ``(tension_kn, source, balance_pct, reach_m, shortfalls)``.
+    ``progress(fraction, text)`` runs 0..1 over the short stretches.
     """
     x = np.asarray(x_m, dtype=float)
     kp = np.asarray(kp_km, dtype=float)
@@ -267,13 +281,17 @@ def pull_taut(x_m, kp_km, length_elev_m, w_npm, tension_kn, source, cable_x, cab
     source = np.asarray(source).copy()
     npts = np.full(len(x), np.nan) if npts_kn is None else np.asarray(npts_kn, dtype=float)
     seabed_cum, plan_cum = seabed_cumulative(x, length_elev)
+    held = np.zeros(len(x), dtype=bool) if held is None else np.asarray(held, dtype=bool)
+    # The nearest held station at or before / after each station: cable is not drawn through it.
+    hold_lo = np.maximum.accumulate(np.where(held, x, -np.inf)) if held.any() else None
+    hold_hi = np.minimum.accumulate(np.where(held, x, np.inf)[::-1])[::-1] if held.any() else None
     with np.errstate(invalid="ignore", divide="ignore"):
         reach = np.clip(tension * 1000.0 / (mu * w_fill), min_reach_m, max_reach_m) if mu > 0 \
             else np.full(len(x), max_reach_m)
-    balance = length_balance_pct(x, seabed_cum, plan_cum, cable_x, cable_cum, reach)
+    balance = length_balance_pct(x, seabed_cum, plan_cum, cable_x, cable_cum, reach, lo_m=hold_lo, hi_m=hold_hi)
     shortfalls: List[Shortfall] = []
     with np.errstate(invalid="ignore"):
-        short = np.isfinite(balance) & (balance < -shortfall_pct)
+        short = np.isfinite(balance) & (balance < -shortfall_pct) & ~held
     window_end = -math.inf
     pieces = []
     for a, b in runs(short):
@@ -288,8 +306,11 @@ def pull_taut(x_m, kp_km, length_elev_m, w_npm, tension_kn, source, cable_x, cab
     for k, (a, b) in enumerate(pieces):
         check_cancel(cancel)
         report(progress, k / len(pieces), f"Pulling short stretches taut ({k + 1} of {len(pieces)})")
+        limits = {}
+        if hold_lo is not None:
+            limits = {"held": held, "lo_m": float(hold_lo[a]), "hi_m": float(hold_hi[b])}
         h, wa, wb, feasible, reach_h = taut_tension_n(x, -length_elev, w_fill, x[a], x[b], cable_x, cable_cum,
-                                                      mu, min_reach_m, max_reach_m)
+                                                      mu, min_reach_m, max_reach_m, **limits)
         if h / 1000.0 <= zero_tension_kn:
             continue  # friction reach brings enough cable (or barely any tension): it conforms
         sel = (x >= wa) & (x <= wb)
@@ -297,7 +318,7 @@ def pull_taut(x_m, kp_km, length_elev_m, w_npm, tension_kn, source, cable_x, cab
         # Friction takes mu w per metre off the tension away from the stretch.
         outside = np.where(x < x[a], x[a] - x, np.where(x > x[b], x - x[b], 0.0))
         pulled = h_kn - mu * w_fill * outside / 1000.0
-        raise_ = sel & (pulled > tension)
+        raise_ = sel & (pulled > tension) & ~held
         tension = np.where(raise_, pulled, tension)
         source = np.where(raise_, 2, source)
         item = Shortfall(

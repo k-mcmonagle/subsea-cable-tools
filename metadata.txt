@@ -4,12 +4,12 @@ qgisMinimumVersion=3.22
 qgisMaximumVersion=4.99
 supportsQt6=True
 description=Tools to support working with subsea cable data in QGIS.
-version=1.9.0
+version=2.0.0
 author=Kieran McMonagle
 email=kieran.mcmonagle@globalmarine.group
 
 about=Tools for subsea telecom and power cable route engineering in QGIS.
-  KP (chainage) tools, including a live KP mouse tool and plugin-wide KP settings; depth and slope profiles from MBES rasters or contours; RPL import and a Cable Route Workbench for RPL revisions, cable systems and assemblies; a Burial Planner (beta); a catenary calculator with a steady-lay tab (beta); cable lay data import with a QC and analysis Explorer; and a scenario Planner (beta).
+  KP (chainage) tools, including a live KP mouse tool and plugin-wide KP settings; depth and slope profiles from MBES rasters or contours; RPL import and a Cable Route Workbench for RPL revisions, cable systems and assemblies; a Burial Planner (beta); Span & Slack Analysis (beta) for planned lays; Route Comments; a shared Cable Type Library; a catenary calculator with a steady-lay tab (beta); cable lay data import with a QC and analysis Explorer and a Lay Assessment (beta); and a scenario Planner (beta).
   A Processing provider adds KP-range, RPL, bathymetry (MBES, GeoMedia MDB) and utility algorithms.
   Beta tools are under active development: check their outputs against your own data and methods before operational use.
 
@@ -20,6 +20,14 @@ hasProcessingProvider=yes
 
 # changelog: latest releases only; the full history is in CHANGELOG.md
 changelog=
+  2.0.0
+  - New Span & Slack Analysis (beta): a planned cable on the seabed along an RPL, with tension or slack by section and held (buried or pinned) sections; spans, supports, residual tension and loop risk. Check outputs against your own methods.
+  - New Route Comments (spatial comments on routes in a shared register), Cable Type Library and Ground Model (numeric datasets, AGS CPT import).
+  - Burial Planner (beta): Acquired Data, Assessment and Reporting tabs, multi-tool plans, plan import from an RPL or a table, and KP re-referencing.
+  - Cable Lay Data Explorer: new Lay Assessment (beta) for spans, loop risk and tension limits.
+  - KP is now geodesic on WGS84 (or a grid set in KP settings) in every tool, with a start KP: KPs and results can differ from 1.9.0.
+  - Files saved by a newer version of the plugin are refused, untouched: upgrade a team together.
+  - Removed: the experimental 3D Cable Lay Simulator and BU Lowering Tool.
   1.9.0
   - New Burial Planner (beta): exclusion criteria over route and survey data, a stored bathymetry and slope profile, burial tools, risk checks, installation paths and an HTML report. Check outputs against your own methods before operational use.
   - Cable Route Workbench: guided RPL import (Excel/CSV, route lines or points, .pthmdb path files), cable systems with physical make-up and schematics, and editable event classification.
@@ -28,8 +36,6 @@ changelog=
   - MBES: multi-file XYZ import, per-cell bin averaging, and merges that keep the finest resolution.
   - Planner: fuel and cable tracking, reports, advanced scheduling, baselines and actuals, and task import. New BU Lowering Tool (beta).
   - Processing tools no longer abort on zero-length or null geometries.
-  1.8.0
-  - New Cable Route Workbench (RPL Manager, assemblies, system topology, route suitability assessment) and Planner (beta).
   Full changelog: https://github.com/k-mcmonagle/subsea-cable-tools/blob/main/CHANGELOG.md
 tags=subsea, cable, telecoms, power cable, offshore, engineering, kp, lrs, rpl, bathymetry, mbes, burial, catenary, cable lay, mapping, gis, qgis
 

@@ -10,7 +10,7 @@ the findings, except tension above NPTS (a red finding itself).
   not held by friction (slides).
 * **Tension**: % of NPTS in quarters (kN bands where a cable has no NPTS).
 * **What sets the tension**: the lay tension, pulled taut (slack short of
-  the seabed), raised by a slope, or zero.
+  the seabed), raised by a slope, pulled back by a hold, held, or zero.
 
 :func:`class_paths` builds one polyline set per class for the KPs in view,
 thinned to the pixels with each pixel's highest and lowest point kept.
@@ -32,7 +32,7 @@ MODES = (
     (TENSION, "Tension (% of NPTS)", "Residual tension in fixed bands: quarters of NPTS, or kN where a cable has "
      "no NPTS."),
     (SOURCE, "What sets the tension", "The lay tension, pulled taut (slack short of the seabed), raised by a slope, "
-     "or zero."),
+     "pulled back by a hold, held (buried or pinned), or zero."),
 )
 MAX_CLASSES = 8
 Colour = Tuple[int, int, int]
@@ -97,6 +97,9 @@ def cable_classes(result: pl.PlanningResult, mode: str) -> Tuple[np.ndarray, Lis
                  (pl.SOURCE_TAUT, (194, 24, 91), "Pulled taut: the slack laid is short of the seabed"),
                  (pl.SOURCE_SLOPE, (142, 36, 170), "Raised by a slope (friction holds it)"),
                  (pl.SOURCE_ZERO, (56, 142, 60), "At zero tension (lying slack)")]
+        if result.held is not None:
+            order += [(pl.SOURCE_PULLED, (245, 124, 0), "Pulled back by a hold's tension"),
+                      (pl.SOURCE_HELD, (78, 52, 46), "Held (buried or pinned)")]
         legend = [(colour, label) for _s, colour, label in order]
         source = np.asarray(result.source, dtype=int)
         for k, (value, _colour, _label) in enumerate(order):

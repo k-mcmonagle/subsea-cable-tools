@@ -303,7 +303,7 @@ def export_scene(result, path: str, options: SceneOptions, detail=None) -> Dict[
         "clear": w.layer("SA_CLEAR_UNDER_LIMITS", 9), "supports": w.layer("SA_SUPPORTS", 7),
         "bodies": w.layer("SA_BODIES", 2), "features": w.layer("SA_FEATURES", 40),
         "sea": w.layer("SA_SEA_LEVEL", 4), "frame": w.layer("SA_FRAME", 7), "text": w.layer("SA_TEXT", 7),
-        "protection": w.layer("SA_PROTECTION", 140),
+        "protection": w.layer("SA_PROTECTION", 140), "holds": w.layer("SA_HOLDS", 32),
     }
     keep = idx[_thin(len(idx), options.max_vertices)]
 
@@ -390,6 +390,21 @@ def export_scene(result, path: str, options: SceneOptions, detail=None) -> Dict[
             mid = (a + b) // 2
             w.text(x_all[mid], y_of(result.cable_m[mid] + od) + th * 0.5, f"{item.name} ({item.kind})", th * 0.7,
                    names["protection"], align=1)
+    for hold in getattr(result, "holds", []) or []:
+        a, b = max(hold.i0, i0), min(hold.i1, i1)
+        if b < a:
+            continue
+        if b > a:
+            part = np.arange(a, b + 1)
+            part = part[_thin(len(part), options.max_vertices)]
+            w.polyline(zip(x_all[part], y_of(result.cable_m[part])), names["holds"])
+        for end in sorted({a, b}):      # a square at each end (one for a point hold)
+            x, y = x_all[end], y_of(result.cable_m[end])
+            h = th * 0.4
+            w.polyline([(x - h, y - h), (x + h, y - h), (x + h, y + h), (x - h, y + h)], names["holds"], closed=True)
+        mid = (a + b) // 2
+        w.text(x_all[mid], y_of(result.cable_m[mid]) - th * 1.5, f"{hold.name} (held, {hold.held_kn:g} kN)",
+               th * 0.7, names["holds"], align=1)
     for feature in getattr(st, "features", []) or []:
         if not (lo - 0.01 <= feature.kp_km <= hi + 0.01):
             continue
@@ -441,13 +456,13 @@ def export_scene(result, path: str, options: SceneOptions, detail=None) -> Dict[
                      [("LAID", result.bottom_slack_pct, 5),
                       ("SEABED", np.where(np.isfinite(result.used_bottom_pct), 0.0, np.nan), 34),
                       ("USED", result.used_bottom_pct, 8)])
+        allowable = pl.allowable_shown(result)
         series = [
             ("TENSION", "Tension (kN)", [("RESIDUAL", finite(result.tension_kn), 5),
                                          ("LAY", finite(result.deposit_kn), 8),
                                          ("NPTS", st.npts_kn, 1),
-                                         ("MAX_FOR_LIMITS", np.where(result.allowable_kn < 99.9, result.allowable_kn,
-                                                                     np.nan) if result.allowable_kn is not None
-                                          else np.full(st.n, np.nan), 3)]),
+                                         ("MAX_FOR_LIMITS", np.where(allowable < 99.9, allowable, np.nan)
+                                          if allowable is not None else np.full(st.n, np.nan), 3)]),
             slack,
             ("SLOPE", "Seabed slope and friction angle (deg)",
              [("SLOPE", np.degrees(np.arctan(np.abs(st.slope))), 34), ("FRICTION_ANGLE", np.degrees(np.arctan(st.mu)),
