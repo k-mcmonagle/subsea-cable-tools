@@ -149,18 +149,19 @@ You can override the value by KP section. Set the lay direction: friction holds 
 at, so on slopes the result depends on it. *Find the highest tension within limits* opens the Find tension tab
 (see the model, section 7).
 
-A section can also **hold** the cable (*Control*: *Held*, Value in kN), for any reason: over a KP range (buried,
-e.g. from PLDN to PLUP, or clamped), laid at its Value (e.g. the tension at PLDN), or at a point (*KP to* = *KP
-from*: an anchor, which needs no Value). See the model, section 2a. *Name* (optional, e.g. *Burial 1* or
-*First-end anchor*) labels it on the profile and in the Holds tab. A hold up to 10 m beyond an end of the profile
-holds that end; one further out is left out, and the run says so.
+A section can also **pin** the cable (*Control*: *Pinned*, Value in kN): fix it in place, for any reason. Over a KP
+range (buried, e.g. from PLDN to PLUP, or clamped) it is laid at its Value (e.g. the tension at PLDN; blank: the lay
+tension there). At a point (*KP to* = *KP from*) it is an anchor, which needs no Value: its tension is the pull of the
+cable on it, to compare with the anchor's holding capacity. See the model, section 2a. *Name* (optional, e.g.
+*Burial 1* or *First-end anchor*) labels it on the profile and in the Pinned tab. A pinned section up to 10 m beyond
+an end of the profile pins that end; one further out is left out, and the run says so.
 
-*Holds from burial…* gives a quick first set to edit in the table: held sections over the burial already planned,
-from the RPL's burial events (PLDN / PLUP, Start / End burial and other phrasings, read as the Burial Planner's
-*Import plan* reads them, in the lay direction; or its ProtectionMethod column) or from the Burial Planner plan for
-the RPL when it shares the analysis's KPs, at a tension you choose. Burial as the cable is laid (plough, or burial
-with no tool named) is held by default; post-lay burial (PLB, MFE) is not, as the cable lies on the seabed as laid
-until it is buried.
+*Pin burial sections…* gives a quick first set to edit in the table: pinned sections over the burial already
+planned, from the RPL's burial events (PLDN / PLUP, Start / End burial and other phrasings, read as the Burial
+Planner's *Import plan* reads them, in the lay direction; or its ProtectionMethod column) or from the Burial Planner
+plan for the RPL when it shares the analysis's KPs, at a tension you choose. Burial as the cable is laid (plough, or
+burial with no tool named) is pinned by default; post-lay burial (PLB, MFE) is not, as the cable lies on the seabed
+as laid until it is buried.
 
 ## The model
 
@@ -212,36 +213,38 @@ part (`w dy`) is restored between them.
 tension it was laid at, or what a later touchdown pulls it to, as if held by the cable beyond it or an anchor: nothing
 slides off it. The end laid last is the current touchdown.
 
-### 2a. Holds: buried or pinned cable
+### 2a. Pinned sections: buried or anchored cable
 
 The lay is followed touchdown by touchdown in the lay direction (laid towards decreasing KP, from right to left on
-the plot), so each hold acts on the cable laid before it and is untouched by the cable laid after it.
+the plot), so each pinned section acts on the cable laid before it and is untouched by the cable laid after it.
 
-A held range (lay control *Held*) is laid at its own tension. Like any touchdown, that tension pulls back on the
-cable laid before it, falling by `mu w` per metre (reach `(T_hold - T_lay) / (mu w)`: 25 kN against 1 kN of surface
-lay reaches 800 m back for 60 N/m at `mu` 0.5). Spans there are labelled *pulled back by a hold*. Then the held cable:
+A pinned range (lay control *Pinned*) is laid at its own tension. Like any touchdown, that tension pulls back on the
+cable laid before it, falling by `mu w` per metre (reach `(T_pinned - T_lay) / (mu w)`: 25 kN against 1 kN of surface
+lay reaches 800 m back for 60 N/m at `mu` 0.5). Spans there are labelled *pulled back by a pinned section*. Then the
+pinned cable:
 
-- follows the seabed: the rest shape is pinned to the seabed over the hold, so it does not span, and a span can start
-  at its end (e.g. at PLUP);
-- does not slide: friction grips the hold, and the segment after it in the lay direction, so later touchdowns do not
-  reach back through it. The cable laid after it starts afresh at its own lay control;
-- gives no cable to a slack section next to it: the pull-taut windows end at a hold.
+- follows the seabed: the rest shape is pinned to the seabed over the range, so it does not span, and a span can
+  start at its end (e.g. at PLUP);
+- does not slide: friction grips the range, and the segment after it in the lay direction, so later touchdowns do
+  not reach back through it. Its far end acts as an anchor for the cable laid after it: that cable starts afresh at
+  its own lay control, and a later, higher tension pulls up to the end and stops there;
+- gives no cable to a slack section next to it: the pull-taut windows end at a pinned section.
 
-A hold at a point is an **anchor**: it holds and does not pull. The touchdowns laid after it pull on it (friction
-takes `mu w` per metre off the pull on the way), nothing passes it to the cable laid before it, and its tension is
-that of the cable pulling on it. Example: laid towards decreasing KP from an anchor, 1 kN of surface lay and then
-PLDN at 25 kN 600 m on, on a flat seabed (60 N/m, `mu` 0.5): the cable between rises from 7 kN at the anchor to
-25 kN at the PLDN, and the anchor carries 7 kN (less over sand waves, whose crests take more by friction). An
-anchor at the end of the profile laid first changes no tension, as that end is always held (as by the cable
-beyond it), but gives its load.
+A pinned point is an **anchor**: it holds and does not pull, so its Value is not used. The touchdowns laid after it
+pull on it (friction takes `mu w` per metre off the pull on the way), nothing passes it to the cable laid before it,
+and its tension is that of the cable pulling on it: compare it with the anchor's holding capacity. Example: laid
+towards decreasing KP from an anchor, 1 kN of surface lay and then PLDN at 25 kN 600 m on, on a flat seabed (60 N/m,
+`mu` 0.5): the cable between rises from 7 kN at the anchor to 25 kN at the PLDN, and the anchor carries 7 kN (less
+over sand waves, whose crests take more by friction). An anchor at the end of the profile laid first changes no
+tension, as that end is always held (as by the cable beyond it), but gives its load.
 
-For each hold the Holds tab gives the free cable's tension on the side laid before and the side laid after, the net
-axial load it carries (their difference: an anchor's load; a side beyond the profile counts as zero), how far its
-pull-back reaches, and the **pull-up** at its ends: where the free cable turns up out of the hold (e.g. a PLUP at
-the foot of a rise), `P = H dtheta - w dx`, which the burial or anchor must resist. No soil resistance is modelled:
-compare the pull-up with the uplift resistance of the burial. The tension finder and the sweep keep the holds as
-set, and the detail model keeps held nodes on the seabed (bilateral contact). The highest tension for spans within
-limits is not given over a hold.
+For each pinned section the Pinned tab gives its tension (for an anchor, the pull on it), the free cable's tension on
+the side laid before and the side laid after, the net axial load it carries (their difference; a side beyond the
+profile counts as zero), how far its pull-back reaches, and the **pull-up** at its ends: where the free cable turns
+up out of it (e.g. a PLUP at the foot of a rise), `P = H dtheta - w dx`, which the burial or anchor must resist. No
+soil resistance is modelled: compare the pull-up with the uplift resistance of the burial. The tension finder and the
+sweep keep the pinned sections as set, and the detail model keeps their nodes on the seabed (bilateral contact). The
+highest tension for spans within limits is not given over a pinned section.
 
 ### 3. Rest shape: the unilateral contact problem
 
@@ -378,8 +381,8 @@ tool lists these values at each RPL vertex as information.
     (hover for the reaction and bend radius), bodies (hover or click for their details), the detail cable and sea
     level;
   - the residual and lay tension, NPTS, and the highest tension for spans within limits;
-  - held sections show as a dark band along the cable, with a square at each end (one for a point hold): hover it
-    for what the hold carries;
+  - pinned sections show as a dark band along the cable, with a square at each end (one for an anchor): hover it
+    for what it carries;
   - slack (see *Slack* below);
   - the seabed slope against the friction angle.
 
@@ -409,7 +412,7 @@ tool lists these values at each RPL vertex as information.
     surplus over half of it; loop risk (the loop check's limit); not held by friction (slides).
   - *Tension (% of NPTS)*: quarters of NPTS and above NPTS (kN bands where a cable has no NPTS), zero shown grey.
   - *What sets the tension*: the bottom tension, pulled taut (slack short of the seabed), raised by a slope, or
-    zero; with holds, also held and pulled back by a hold.
+    zero; with pinned sections, also pinned and pulled back by a pinned section.
 
   Span severity is not offered (spans are already filled), nor bend radius along the cable (the route model has
   no bending stiffness: use Detail (EI)).
@@ -440,7 +443,7 @@ tool lists these values at each RPL vertex as information.
   - Findings;
   - Spans (with bodies in each span, and how much shorter each is than the seabed under it);
   - Bodies;
-  - Holds (when the lay control holds the cable);
+  - Pinned (when the lay control pins the cable);
   - Events (source, type, KP, in the model or not, details; what was left out and why);
   - Summary (inputs, totals, notes);
   - Find tension, with the tension sweep below it;
@@ -448,10 +451,10 @@ tool lists these values at each RPL vertex as information.
 - **Export.** Findings, spans and the profile by station as CSV, the plot as PNG, and the scene as DXF (R12, metres,
   X = KP × 1000, Y = elevation × a chosen vertical exaggeration). The DXF layers are `SA_SEABED`,
   `SA_SEABED_SAMPLED`, `SA_CABLE`, `SA_CABLE_DETAIL`, `SA_SPAN_RED`, `SA_SPAN_AMBER`, `SA_SPAN_INDICATIVE`, `SA_CLEAR_UNDER_LIMITS`,
-  `SA_SUPPORTS`, `SA_BODIES`, `SA_PROTECTION`, `SA_HOLDS`, `SA_FEATURES`, `SA_SEA_LEVEL`, `SA_FRAME` and `SA_TEXT`. The tension, slack and slope
+  `SA_SUPPORTS`, `SA_BODIES`, `SA_PROTECTION`, `SA_PINNED`, `SA_FEATURES`, `SA_SEA_LEVEL`, `SA_FRAME` and `SA_TEXT`. The tension, slack and slope
   graphs sit below the profile, with one layer per curve (the slack graph on the basis the plot shows). The profile
   CSV has the slack over the route (`fill_pct` ... `surplus_pct`) and over the seabed (`bottom_*`), what sets the
-tension (`tension_from`) and whether the station is held (`held`). *Add to map*
+tension (`tension_from`) and whether the station is pinned (`pinned`). *Add to map*
   writes the findings as a line layer.
 
 ## Examples
@@ -473,9 +476,9 @@ tension (`tension_from`) and whether the station is held (`held`). *Add to map*
 - **Rock berm (custom shape), armoured cable.**
 - **Sand waves on a slope, with a repeater.**
 - **Burial sections and a first-end anchor (illustrative values).** Laid towards decreasing KP from an anchor at
-  the right-hand end, armoured cable, surface lay at 1 kN and two burial sections held at 25 kN (the tension at
+  the right-hand end, armoured cable, surface lay at 1 kN and two burial sections pinned at 25 kN (the tension at
   PLDN): each PLDN tension pulls back on the cable laid before it and bridges sand-wave troughs there; the anchor
-  takes what reaches it (Holds tab).
+  takes what reaches it (Pinned tab).
 
 ## Storage
 
@@ -505,17 +508,18 @@ Unit tests (`tests/test_cable_seabed.py`, `tests/test_span_analysis_qgis.py`, `t
 | Slack above the fill lies at zero tension with the surplus; below it is pulled taut with no surplus | model rule | yes |
 | A cable lying on the seabed has 0% bottom slack; over a 40 m trough it reads below 0 (−2.35% over 100 m) while over the route it reads +0.07% | definition | yes |
 | Friction set on prepared stations gives the same answer as preparing them with it (live update) | consistency | exact |
-| A hold at 25 kN after 1 kN of lay pulls back `mu w` per metre, 800 m (60 N/m, `mu` 0.5); nothing passes it; both lay directions | closed form | within 1% (reach within 2%) |
-| Cable leaving a hold up a 1:10 ramp at 5 kN: pull-up `H s - w dx` | closed form | 0.438 kN, exact |
-| An anchor holds the cable laid before it from a later 25 kN section 200 m on: load `25 - 1 - mu w 199 m`; its tension is the cable's at it | closed form | 18.03 kN, exact |
+| A section pinned at 25 kN after 1 kN of lay pulls back `mu w` per metre, 800 m (60 N/m, `mu` 0.5); nothing passes it; both lay directions | closed form | within 1% (reach within 2%) |
+| Cable leaving a pinned section up a 1:10 ramp at 5 kN: pull-up `H s - w dx` | closed form | 0.438 kN, exact |
+| An anchor holds the cable laid before it from a later 25 kN section 200 m on: load `25 - 1 - mu w 199 m`; its tension is the cable's at it; its Value is not used | closed form | 18.03 kN, exact |
+| The far end of a pinned section does the same for the cable laid after it | closed form | 18.03 kN, exact |
 | Laid towards decreasing KP from an anchor, PLDN at 25 kN 600 m on: the anchor carries `25 - mu w 600 m` | closed form | 7.00 kN, exact |
-| No span inside a hold; the sweep and the tension finder keep holds; the detail model stays on the seabed in a hold | model rule | yes |
+| No span inside a pinned section; the sweep and the tension finder keep them; the detail model stays on the seabed there | model rule | yes |
 
 ## Assumptions and limits
 
 - 2D, static, after lay. No current, vessel motion or lay dynamics. No lateral movement, except the alter-course
   note.
-- Rigid seabed: no embedment or self-burial. A hold is rigid and fixed: the soil's axial and uplift resistance is
+- Rigid seabed: no embedment or self-burial. A pinned section is rigidly fixed: the soil's axial and uplift resistance is
   not modelled.
 - Inextensible cable.
 - Small-slope shape with a slope correction. Lengths are exact.

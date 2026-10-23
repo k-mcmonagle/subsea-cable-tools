@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Held sections from the burial on the route: the RPL's events or the Burial Planner plan.
+"""Pinned sections from the burial on the route: the RPL's events or the Burial Planner plan.
 
-Where the cable is buried as it is laid (a plough, PLDN to PLUP) it is held:
-the lay control's *Held* mode, which can hold the cable for any reason
-(burial, a clamp, an anchor). These helpers give a quick first set of held
-sections from the burial already planned, to edit in the table:
+Where the cable is buried as it is laid (a plough, PLDN to PLUP) it is
+pinned: the lay control's *Pinned* mode, which can pin the cable for any
+reason (burial, a clamp, an anchor). These helpers give a quick first set of
+pinned sections from the burial already planned, to edit in the table:
 
 * :func:`rpl_burial_ranges` reads the RPL's boundary events (PLDN / PLUP,
   Start / End PLB, Start / End burial … in many phrasings) with the Burial
@@ -46,8 +46,8 @@ TOOLS = (
     (PLOUGH, "Plough", True, "Simultaneous lay and burial: the cable is buried as it is laid (PLDN to PLUP)."),
     (BURIAL, "Burial, tool not stated", True, "Start / End burial with no tool named (often a plough)."),
     (TRENCHER, "PLB / trencher", False, "Post-lay burial: the cable lies on the seabed as laid and is buried "
-                                        "later, so it is not held during lay."),
-    (MFE, "MFE", False, "Mass flow excavation, after lay: not held during lay."),
+                                        "later, so it is not pinned during lay."),
+    (MFE, "MFE", False, "Mass flow excavation, after lay: not pinned during lay."),
 )
 TOOL_LABELS = {key: label for key, label, _on, _tip in TOOLS}
 TOOL_NAMES = {PLOUGH: "Plough", BURIAL: "Burial", TRENCHER: "PLB", MFE: "MFE"}
@@ -145,18 +145,18 @@ def hold_rows(ranges: Sequence[BurialRange], tools: Sequence[str], tension_kn: f
 
 
 class HoldsDialog(QDialog):
-    """Choose where the held sections come from, which tools hold the cable, and the tension."""
+    """Choose where the pinned sections come from, which tools pin the cable, and the tension."""
 
     def __init__(self, parent=None, sources: Sequence[Tuple[str, str, List[BurialRange], List[str]]] = (),
                  unavailable: Sequence[str] = (), tension_kn: float = 5.0,
                  kp_range: Optional[Tuple[float, float]] = None):
         """``sources``: ``(key, label, ranges, notes)``; ``unavailable``: why a source is not offered."""
         super().__init__(parent)
-        self.setWindowTitle("Holds from burial")
+        self.setWindowTitle("Pin burial sections")
         self.sources = list(sources)
         self.kp_range = kp_range
         layout = QVBoxLayout(self)
-        intro = QLabel("Hold the cable over the burial sections already planned, e.g. from PLDN to PLUP where it "
+        intro = QLabel("Pin the cable over the burial sections already planned, e.g. from PLDN to PLUP where it "
                        "is buried as it is laid. Each section is laid at the tension below (where it starts, e.g. "
                        "at PLDN), which pulls back on the cable laid before it; then it neither spans nor slides. "
                        "Edit the rows in the table afterwards.")
@@ -179,17 +179,17 @@ class HoldsDialog(QDialog):
             tools_layout.addWidget(box)
             self.tools[key] = box
         tools_layout.addStretch(1)
-        form.addRow("Hold", tools)
+        form.addRow("Pin", tools)
         self.tension = QDoubleSpinBox()
         self.tension.setRange(0.0, 1000.0)
         self.tension.setDecimals(2)
         self.tension.setSingleStep(0.5)
         self.tension.setSuffix(" kN")
         self.tension.setValue(float(tension_kn))
-        self.tension.setToolTip("The tension each section is laid and held at, e.g. the cable tension at PLDN. "
+        self.tension.setToolTip("The tension each section is laid and pinned at, e.g. the cable tension at PLDN. "
                                 "Edit each row afterwards for different values.")
-        form.addRow("Held at", self.tension)
-        self.replace = QCheckBox("Replace the held sections already in the table")
+        form.addRow("Pinned at", self.tension)
+        self.replace = QCheckBox("Replace the pinned sections already in the table")
         self.replace.setChecked(True)
         form.addRow(self.replace)
         layout.addLayout(form)
@@ -232,10 +232,10 @@ class HoldsDialog(QDialog):
             other = sorted({TOOL_LABELS[r.tool] for r in ranges if r.tool not in self.chosen_tools()})
             text = "No section of the tools ticked" + (" in the analysed KPs" if self.kp_range else "") + "."
             if other:
-                text += f" Found: {', '.join(other)} (not held during lay unless ticked)."
+                text += f" Found: {', '.join(other)} (not pinned during lay unless ticked)."
         else:
             shown = ", ".join(f"{row['name']} KP {row['kp0']:.3f}–{row['kp1']:.3f}" for row in rows[:6])
-            text = f"{len(rows)} section(s) to hold: {shown}" + (" …" if len(rows) > 6 else "") + "."
+            text = f"{len(rows)} section(s) to pin: {shown}" + (" …" if len(rows) > 6 else "") + "."
         self.found.setText(" ".join([text] + list(notes)))
         ok = self.buttons.button(BUTTON_BOX_OK)
         if ok is not None:

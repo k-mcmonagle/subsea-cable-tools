@@ -55,7 +55,7 @@ SPAN_HEADERS = ["#", "KP from", "KP to", "Length (m)", "Max gap (m)", "Short of 
 EVENT_HEADERS = ["Source", "Type", "KP", "KP to", "Label", "In the model", "Details"]
 BODY_HEADERS = ["Name", "Kind", "KP", "Weight (kN)", "Clear of seabed (m)", "In a span", "Tension (kN)",
                 "Housing standoff (m)"]
-HOLD_HEADERS = ["Name", "KP from", "KP to", "Held at (kN)", "Cable laid before (kN)", "Cable laid after (kN)",
+HOLD_HEADERS = ["Name", "KP from", "KP to", "Tension (kN)", "Cable laid before (kN)", "Cable laid after (kN)",
                 "Net axial load (kN)", "Pulls back over (m)", "Pull-up at an end (kN)", "KP of pull-up"]
 DETAIL_HEADERS = ["KP from", "KP to", "Length (m)", "Max gap (m)", "Min bend R (m)", "KP of min R", "MBR (m)",
                   "Max moment (kNm)", "Reaction start (kN)", "Reaction end (kN)"]
@@ -294,17 +294,17 @@ class ResultsPanel(QTabWidget):
         self.holds_table.horizontalHeader().setSortIndicator(1, getattr(getattr(Qt, "SortOrder", Qt), "AscendingOrder"))
         self.holds_table.itemSelectionChanged.connect(lambda: self._emit_range(self.holds_table))
         layout.addWidget(self.holds_table, 1)
-        note = WrapLabel("Each held range (Lay control, Held) is laid at its own tension, which pulls back on the "
-                         "cable laid before it, falling by μ w per metre; then it neither spans nor slides, and later "
-                         "touchdowns do not reach through it. An anchor (a point) is held at the tension of the "
-                         "cable pulling on it. Before and after are in lay order. The net axial load is the "
-                         "difference between the free cable either side (a side beyond the profile counts as zero). "
-                         "A pull-up is the free cable turning up out of the hold: the burial or anchor must hold it "
-                         "down.")
+        note = WrapLabel("Tension: a pinned range (Lay control, Pinned) is laid at it, and it pulls back on the "
+                         "cable laid before it, falling by μ w per metre; then the range neither spans nor slides, "
+                         "and its far end acts as an anchor for the cable laid after it. For an anchor (a point) it "
+                         "is the pull of the cable on it: compare it with the anchor's holding capacity. Before and "
+                         "after are in lay order. The net axial load is the difference between the free cable either "
+                         "side (a side beyond the profile counts as zero). A pull-up is the free cable turning up "
+                         "out of the pinned section: the burial or anchor must hold it down.")
         note.setStyleSheet("QLabel { color: #555; }")
         layout.addWidget(note)
         self.holds_page = page
-        self.addTab(page, "Holds")
+        self.addTab(page, "Pinned")
         self._show_tab(page, False)
 
     def _show_tab(self, page: QWidget, on: bool) -> None:
@@ -808,7 +808,7 @@ class ResultsPanel(QTabWidget):
         _fill(self.bodies_table, body_rows, body_payloads, body_index)
         _fill(self.holds_table, hold_rows, hold_payloads)
         self._show_tab(self.holds_page, bool(hold_rows))
-        self.setTabText(self.indexOf(self.holds_page), f"Holds ({len(hold_rows)})" if hold_rows else "Holds")
+        self.setTabText(self.indexOf(self.holds_page), f"Pinned ({len(hold_rows)})" if hold_rows else "Pinned")
         self.setTabText(1, f"Spans ({len(span_rows)})" if result is not None else "Spans")
         self.setTabText(2, f"Bodies ({len(body_rows)})" if result is not None else "Bodies")
         self.summary.setHtml(summary_html)
@@ -872,9 +872,9 @@ def summary_html(result: pl.PlanningResult, notes: Sequence[str], setup_lines: S
         held_m = float(np.sum(np.diff(result.stations.x_m)[result.held[:-1] & result.held[1:]]))
         loads = max(h.load_kn for h in result.holds)
         reach = max(h.pulled_m for h in result.holds)
-        rows.insert(-2, ("Held (buried or pinned)",
-                         f"{len(result.holds)} hold(s), {held_m:,.0f} m of cable; largest net axial load "
-                         f"{loads:.2f} kN" + (f"; pull-back up to {reach:,.0f} m before a hold" if reach > 0 else "")))
+        rows.insert(-2, ("Pinned (buried or anchored)",
+                         f"{len(result.holds)} pinned section(s), {held_m:,.0f} m of cable; largest net axial load "
+                         f"{loads:.2f} kN" + (f"; pull-back up to {reach:,.0f} m before one" if reach > 0 else "")))
     parts = ["<h3>Span &amp; Slack Analysis</h3>", "<table cellspacing='0' cellpadding='3'>"]
     for key, value in rows:
         parts.append(f"<tr><td><b>{esc(key)}</b></td><td>{esc(value)}</td></tr>")

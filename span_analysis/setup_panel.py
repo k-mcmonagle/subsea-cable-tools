@@ -92,7 +92,7 @@ SECTION_MODE_LABELS = {
     pl.BOTTOM_SLACK: "Bottom slack (%)",
     pl.ROUTE_SLACK: "Route slack (%)",
     pl.RPL_LEGS: "RPL leg slack",
-    pl.HELD: "Held (kN)",
+    pl.HELD: "Pinned (kN)",
 }
 
 
@@ -410,7 +410,7 @@ class SetupPanel(QWidget):
         self.seabed_section = Section("2  Seabed", self._build_seabed(), True)
         self.cable_section = Section("3  Cable and bodies", self._build_cable(), True)
         self.friction_section = Section("4  Seabed friction", self._build_friction())
-        self.control_section = Section("5  Lay control (tension / slack / holds)", self._build_control(), True)
+        self.control_section = Section("5  Lay control (tension / slack / pinned)", self._build_control(), True)
         self.criteria_section = Section("6  Reporting limits", self._build_criteria())
         for section in (self.route_section, self.seabed_section, self.cable_section, self.friction_section,
                         self.control_section, self.criteria_section):
@@ -1013,14 +1013,14 @@ class SetupPanel(QWidget):
         self.control_sections = EditTable(
             [Col("kp0", "KP from", "float"), Col("kp1", "KP to", "float"),
              Col("mode", "Control", "choice", pl.TENSION, modes,
-                 "Bottom tension or slack, as above; or Held: the cable is held there (buried, clamped, or "
-                 "at a point: an anchor)."),
-             Col("value", "Value", "float", 5.0, tip="kN for a tension; % for slack. Held over a range: the "
-                                                      "tension it is laid and held at, e.g. at PLDN (blank: 0). "
-                                                      "An anchor (a point) takes the tension of the cable that "
-                                                      "pulls on it: leave it blank."),
+                 "Bottom tension or slack, as above; or Pinned: the cable is fixed in place there (buried, "
+                 "clamped, or at a point: an anchor)."),
+             Col("value", "Value", "float", 5.0, tip="kN for a tension; % for slack. Pinned over a range: the "
+                                                      "tension it is laid and pinned at, e.g. at PLDN (blank: the "
+                                                      "lay tension there). An anchor (a point) needs none: it "
+                                                      "takes the tension of the cable that pulls on it."),
              Col("name", "Name", "text", "", tip="Optional, e.g. Burial 1 or First-end anchor: shown on the "
-                                                 "profile and in the Holds tab.")],
+                                                 "profile and in the Pinned tab.")],
             "Add section", height=80, title="lay control sections")
         metrics = self.control_sections.table.fontMetrics()
         for column, sample in enumerate(("KP from", "KP from", "Bottom slack (%)", "Value")):
@@ -1029,8 +1029,8 @@ class SetupPanel(QWidget):
             self.control_sections.table.setColumnWidth(column, metrics.horizontalAdvance(sample) + pad)
         self.control_sections.changed.connect(self._emit_control)
         holds_row = QHBoxLayout()
-        holds_row.addWidget(bar_button("Holds from burial…", "Add held sections over the burial sections of the "
-                                       "RPL's events (e.g. PLDN to PLUP) or of the Burial Planner plan, at a "
+        holds_row.addWidget(bar_button("Pin burial sections…", "Add pinned sections over the burial sections of "
+                                       "the RPL's events (e.g. PLDN to PLUP) or of the Burial Planner plan, at a "
                                        "tension you choose; edit them in the table afterwards.",
                                        self.holdsRequested.emit))
         holds_row.addStretch(1)
@@ -1038,10 +1038,11 @@ class SetupPanel(QWidget):
         sections_layout = QVBoxLayout(sections_body)
         sections_layout.setContentsMargins(14, 0, 0, 0)
         note = QLabel("A tension or slack over a KP range, in place of the value above (e.g. less tension over "
-                      "rough ground). <b>Held</b>: the cable is held over the range, e.g. buried or clamped. It "
-                      "is laid at the tension in Value (e.g. at PLDN), which pulls back on the cable laid before "
-                      "it; it does not span or slide, and nothing passes through it. KP to = KP from holds a "
-                      "point, e.g. an anchor: it takes the tension of the cable that pulls on it.")
+                      "rough ground). <b>Pinned</b>: the cable is fixed in place over the range, e.g. buried or "
+                      "clamped: it does not span or slide, and nothing passes through it. It is laid at the "
+                      "tension in Value (e.g. at PLDN; blank: the lay tension), which pulls back on the cable laid "
+                      "before it; its far end acts as an anchor for the cable laid after it. KP to = KP from pins "
+                      "a point, e.g. an anchor: it takes the tension of the cable that pulls on it.")
         note.setWordWrap(True)
         note.setStyleSheet("color: #555;")
         sections_layout.addWidget(note)
@@ -1613,7 +1614,7 @@ class SetupPanel(QWidget):
         rows = self.control_sections.rows()
         sections = len(rows)
         held = sum(1 for row in rows if row.get("mode") == pl.HELD)
-        text = f"{sections} section(s)" + (f", {held} held" if held else "")
+        text = f"{sections} section(s)" + (f", {held} pinned" if held else "")
         self.control_sections_section.set_status(text if sections else "none", True)
         self.control_section.set_status(f"{pl.MODE_LABELS[mode].split(' (')[0]} {self.value.value():.2f} {unit}"
                                         + (f", {text}" if sections else ""), True)
@@ -1672,7 +1673,7 @@ class SetupPanel(QWidget):
             mode = row.get("mode") or pl.TENSION
             value = row.get("value")
             if value is None and mode == pl.HELD:
-                value = 0.0      # an anchor needs none (it takes the tension pulling on it)
+                value = math.nan      # pinned at the lay tension there (an anchor needs none)
             if row.get("kp0") is None or row.get("kp1") is None or value is None:
                 continue
             sections.append(pl.ControlSection(row["kp0"], row["kp1"], mode, value,
@@ -1762,7 +1763,7 @@ class SetupPanel(QWidget):
         self.update_status()
 
     def add_holds(self, rows: Sequence[Dict], replace: bool = True) -> None:
-        """Add held sections (``kp0``, ``kp1``, ``value``, ``name``); ``replace`` the held ones there."""
+        """Add pinned sections (``kp0``, ``kp1``, ``value``, ``name``); ``replace`` the pinned ones there."""
         kept = [row for row in self.control_sections.rows() if not (replace and row.get("mode") == pl.HELD)]
         self.control_sections.set_rows(kept + [dict(row, mode=pl.HELD) for row in rows])
         self.control_sections_section.button.setChecked(True)   # show what was added
@@ -1963,9 +1964,15 @@ class SetupPanel(QWidget):
         for section in holds[:12]:
             lo, hi = sorted((section.kp_start, section.kp_end))
             where = f"KP {lo:.3f}" if hi - lo < 1e-9 else f"KP {lo:.3f} to {hi:.3f}"
-            lines.append(f"Held{' ' + section.name if section.name else ''}: {where} at {section.value:g} kN")
+            if hi - lo < 1e-9:
+                at = "an anchor"
+            elif math.isfinite(section.value):
+                at = f"at {section.value:g} kN"
+            else:
+                at = "at the lay tension"
+            lines.append(f"Pinned{' ' + section.name if section.name else ''}: {where}, {at}")
         if len(holds) > 12:
-            lines.append(f"… and {len(holds) - 12} more held section(s)")
+            lines.append(f"… and {len(holds) - 12} more pinned section(s)")
         return lines
 
 

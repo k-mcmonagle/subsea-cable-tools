@@ -30,15 +30,17 @@ KP). :func:`prepare` builds the stations once; :func:`solve` runs:
    indicative, not red or amber, and stretches where the data cannot resolve
    spans as short as the reporting length are flagged.
 
-**Holds.** A lay control section can hold the cable (``HELD``): over a KP
-range (buried, e.g. from PLDN to PLUP, or clamped) or at a point (an anchor:
-the nearest station). A range is laid at its own tension (e.g. the tension
-at PLDN), which pulls back on the cable laid before it as any touchdown
+**Pinned sections (holds).** A lay control section can pin the cable
+(``HELD``, shown as *Pinned*): over a KP range (buried, e.g. from PLDN to
+PLUP, or clamped) or at a point (an anchor: the nearest station). A range is
+laid at its own tension (e.g. the tension at PLDN; blank: the lay tension
+there), which pulls back on the cable laid before it as any touchdown
 does; then it neither spans (the rest shape is pinned to the seabed there)
 nor slides (friction grips it, and the segment after it in the lay
-direction, so later touchdowns do not reach back through it). A point holds
-and does not pull: later touchdowns pull on it, and nothing passes it to the
-cable laid before it, so its tension is the cable's at the anchor.
+direction, so later touchdowns do not reach back through it: its end acts
+as an anchor for the cable laid after it). A point holds and does not pull
+(its value is not used): later touchdowns pull on it, and nothing passes it
+to the cable laid before it, so its tension is the cable's at the anchor.
 :class:`HoldResult` gives the tension either side, the net axial load it
 carries, how far its pull-back reaches and the upward pull of the free
 cable leaving it (the hold must hold it down).
@@ -102,7 +104,7 @@ MODE_UNITS = {TENSION: "kN", BOTTOM_SLACK: "%", ROUTE_SLACK: "%", RPL_LEGS: "%"}
 # A section only: the cable is held over its KP range (or at a point) at a tension.
 HELD = "held"
 SECTION_MODES = MODES + (HELD,)
-MODE_LABELS[HELD] = "Held: buried or pinned (kN)"
+MODE_LABELS[HELD] = "Pinned: buried, clamped or anchored (kN)"
 MODE_UNITS[HELD] = "kN"
 
 # Where a station's tension comes from (span "source").
@@ -112,8 +114,8 @@ SOURCE_NAMES = {
     SOURCE_LAID: "lay tension",
     SOURCE_TAUT: "cable short of the seabed",
     SOURCE_SLOPE: "tension held on a slope",
-    SOURCE_HELD: "held (buried or pinned)",
-    SOURCE_PULLED: "pulled back by a hold",
+    SOURCE_HELD: "pinned (buried or anchored)",
+    SOURCE_PULLED: "pulled back by a pinned section",
 }
 # Friction capacity (N) of a segment a hold grips: far above any tension, so nothing passes through it,
 # yet small enough that the running sums of the band keep their precision.
@@ -287,7 +289,7 @@ class LayControl:
     direction: int = 1                 # +1 laid towards increasing KP
 
     def holds(self) -> List[ControlSection]:
-        """The sections that hold the cable (buried or pinned)."""
+        """The sections that pin the cable (buried, clamped or anchored)."""
         return [section for section in self.sections if section.mode == HELD]
 
     def arrays(self, kp_km: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -303,7 +305,16 @@ class LayControl:
                 value[sel] = slack
         for section in self.sections:
             sel = section_stations(section, kp)
-            if section.mode == RPL_LEGS:
+            if section.mode == HELD:
+                given = float(section.value) if section.value is not None else math.nan
+                if not math.isfinite(given) or int(sel.sum()) == 1:
+                    # No tension of its own (blank, or a point: an anchor only takes the pull):
+                    # pinned at the lay control's tension there (0 where it lays slack).
+                    value[sel] = np.where(mode[sel] == TENSION, value[sel], 0.0)
+                else:
+                    value[sel] = given
+                mode[sel] = HELD
+            elif section.mode == RPL_LEGS:
                 mode[sel] = ROUTE_SLACK
                 for k0, k1, slack in self.legs:
                     a, b = sorted((k0, k1))
@@ -844,7 +855,7 @@ def _hold_results(control: LayControl, st: Stations, held: np.ndarray, deposit: 
                 uplift, at = value, float(kp[e])
         # A range holds at the tension it is laid at; an anchor at the tension of the cable pulling on it.
         held_kn = float(tension[i0]) if i0 == i1 else float(deposit[entry])
-        out.append(HoldResult(section.name or f"Hold {number}", float(kp[i0]), float(kp[i1]), i0, i1,
+        out.append(HoldResult(section.name or f"Pin {number}", float(kp[i0]), float(kp[i1]), i0, i1,
                               held_kn, before, after, load, reach, uplift, at))
     return sorted(out, key=lambda h: h.kp_start)
 
@@ -929,7 +940,7 @@ def solve(st: Stations, control: LayControl, criteria: Criteria, allowable: Opti
         if not section_stations(section, kp).any():
             lo, hi = sorted((float(section.kp_start), float(section.kp_end)))
             where = f"KP {lo:.3f}" if hi - lo < 1e-9 else f"KP {lo:.3f} to {hi:.3f}"
-            notes.append(f"Held section '{section.name or f'Hold {number}'}' ({where}) is outside the analysed KPs "
+            notes.append(f"Pinned section '{section.name or f'Pin {number}'}' ({where}) is outside the analysed KPs "
                          f"({kp[0]:.3f} to {kp[-1]:.3f}): left out.")
     if (~tension_mode).any():
         check_cancel(cancel)

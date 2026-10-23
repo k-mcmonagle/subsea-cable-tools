@@ -6,7 +6,7 @@ Sources, each placed at the measured KP the analysis uses:
 * the analysed RPL's events (``Event`` and ``Remarks`` of its positions),
   sorted by the Workbench event rules into cable bodies, crossings,
   operations (PLDN, PLUP, burial), alter courses and the rest;
-* what is in the model: bodies, protection, holds and seabed features;
+* what is in the model: bodies, protection, pinned sections and seabed features;
 * Route Comments on the same route (points and KP ranges);
 * the Burial Planner plan for the same RPL (PLDN / PLUP or start / end of
   burial, burial and skip sections, crossings and other hazards);
@@ -38,8 +38,8 @@ from ..cable_seabed.core import INFO, RangeFinding
 SRC_RPL, SRC_MODEL, SRC_COMMENT, SRC_BURIAL, SRC_MARKER = "rpl", "model", "comment", "burial", "marker"
 SOURCES = (
     (SRC_RPL, "RPL events", "The analysed RPL's events (Event column), sorted by the Workbench event rules.", True),
-    (SRC_MODEL, "In the model (bodies, protection, holds, features)", "What the analysis models: bodies, "
-     "protection ranges, held sections and seabed features.", True),
+    (SRC_MODEL, "In the model (bodies, protection, pinned, features)", "What the analysis models: bodies, "
+     "protection ranges, pinned sections and seabed features.", True),
     (SRC_COMMENT, "Route Comments", "Comments on this route from the project's comment register.", True),
     (SRC_BURIAL, "Burial plan", "PLDN / PLUP, burial and skip sections and crossings from the Burial Planner plan "
      "for this RPL.", True),
@@ -63,7 +63,7 @@ CHECKED_BODIES = frozenset({"repeater", "bu", "equaliser", "joint"})
 TYPE_LABELS = {
     "repeater": "Repeater", "bu": "Branching unit", "equaliser": "Equaliser", "joint": "Joint",
     "bmh": "Beach manhole", "transition": "Transition", "crossing": "Crossing", "route_branch": "Route branch",
-    "operations": "Operations", "alter_course": "Alter course", "hold": "Held (buried or pinned)", "water_depth": "Water depth mark",
+    "operations": "Operations", "alter_course": "Alter course", "hold": "Pinned (buried or anchored)", "water_depth": "Water depth mark",
     "boundary": "Boundary", "other": "Event",
 }
 MATCH_M = 50.0          # an RPL event within this of a modelled item is that item
@@ -185,7 +185,7 @@ def rpl_events(model, measured_kps: Sequence[float], classify: Callable) -> List
 
 
 def model_events(result) -> List[ProfileEvent]:
-    """Bodies, protection, holds and seabed features of a result (all in the model)."""
+    """Bodies, protection, pinned sections and seabed features of a result (all in the model)."""
     out: List[ProfileEvent] = []
     st = result.stations
     for k, b in enumerate(result.bodies):
@@ -211,7 +211,7 @@ def model_events(result) -> List[ProfileEvent]:
     for j, hold in enumerate(getattr(result, "holds", None) or []):
         where = _kp_text(hold.kp_start) if hold.point else f"KP {hold.kp_start:.3f} to {hold.kp_end:.3f}"
         out.append(ProfileEvent(hold.kp_start, None if hold.point else hold.kp_end, SRC_MODEL, "hold", hold.name,
-                                f"{hold.name}: held (buried or pinned), in the model\n{where}\n"
+                                f"{hold.name}: pinned (buried or anchored), in the model\n{where}\n"
                                 + hold_text(hold), COLOURS["hold"], 6, "hold", modelled=True, key=f"hold:{j}"))
     for j, feature in enumerate(st.features):
         a, b = feature.extent_m
@@ -224,8 +224,9 @@ def model_events(result) -> List[ProfileEvent]:
 
 
 def hold_text(hold) -> str:
-    """What a hold carries, in lines (lay order: before, then after)."""
-    lines = [f"Laid and held at {hold.held_kn:.2f} kN"]
+    """What a pinned section carries, in lines (lay order: before, then after)."""
+    lines = [f"Anchor: the cable pulls on it with {hold.held_kn:.2f} kN" if hold.point
+             else f"Laid and pinned at {hold.held_kn:.2f} kN"]
     sides = []
     for label, value in (("laid before it", hold.before_kn), ("laid after it", hold.after_kn)):
         if math.isfinite(value):
@@ -236,7 +237,7 @@ def hold_text(hold) -> str:
         lines.append(f"Its tension pulls back on the cable laid before it over {hold.pulled_m:,.0f} m")
     if hold.uplift_kn > 0.005:
         lines.append(f"The free cable leaving it pulls up with {hold.uplift_kn:.2f} kN at KP {hold.uplift_kp:.3f}: "
-                     "the hold (burial or anchor) must hold it down")
+                     "the burial or anchor must hold it down")
     return "\n".join(lines)
 
 

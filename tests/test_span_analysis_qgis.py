@@ -800,8 +800,8 @@ def test_plot_and_layout_controls() -> List[bool]:
                            folded and bodies == "1 body(ies)" and setup.control_sections_section.button.isChecked()
                            and setup.control_sections_section.status.text() == "2 section(s)", bodies))
 
-        # Holds shows only with held sections (Qt 5.15 and later hide it; earlier Qt keeps it).
-        shown = getattr(results, "isTabVisible", None) or (lambda k: results.tabText(k) != "Holds")
+        # Pinned shows only with pinned sections (Qt 5.15 and later hide it; earlier Qt keeps it).
+        shown = getattr(results, "isTabVisible", None) or (lambda k: results.tabText(k) != "Pinned")
         tabs = [re.sub(r" \(\d+\)$", "", results.tabText(k)) for k in range(results.count()) if shown(k)]   # no counts
         results.show_sweep()
         out.append(_report("results tabs: findings first, then the tools; the sweep sits in Find tension",
@@ -1097,7 +1097,7 @@ class _HoldRpl:
 
 
 def test_holds_in_the_window() -> List[bool]:
-    """Held sections: lay control rows, the Holds tab, the profile, events, exports, the finder and the store."""
+    """Pinned sections: lay control rows, the Pinned tab, the profile, events, exports, the finder and the store."""
     from ..span_analysis import dxf_io, holds
 
     out = []
@@ -1138,7 +1138,7 @@ def test_holds_in_the_window() -> List[bool]:
         drawn = np.isfinite(dialog.plot.held_curve.getData()[1]).sum()
         ends = len(dialog.plot.hold_ends.data)
         labels = [e.label for e in dialog.plot.shown_events()]
-        out.append(_report("Holds tab, band and ends on the profile, label on the events lane",
+        out.append(_report("Pinned tab, band and ends on the profile, label on the events lane",
                            visible and results.holds_table.rowCount() == 1 and drawn > 100 and ends == 2
                            and "Plough 1" in labels, f"{drawn} band points, {ends} ends"))
         scene = os.path.join(folder, "holds.dxf")
@@ -1147,8 +1147,8 @@ def test_holds_in_the_window() -> List[bool]:
         dlg.write_csv(r, "profile", profile_csv)
         with open(profile_csv, encoding="utf-8") as handle:
             header = handle.readline().strip().split(",")
-        out.append(_report("DXF has SA_HOLDS; the profile CSV says what sets the tension and what is held",
-                           "SA_HOLDS" in dxf_io.read_polylines(scene) and header[-2:] == ["tension_from", "held"]))
+        out.append(_report("DXF has SA_PINNED; the profile CSV says what sets the tension and what is pinned",
+                           "SA_PINNED" in dxf_io.read_polylines(scene) and header[-2:] == ["tension_from", "pinned"]))
         rows = [dict(hold_row, value=2.0), {"kp0": 0.0, "kp1": 0.2, "mode": pl.TENSION, "value": 3.0}]
         dialog.setup.control_sections.set_rows(rows)
         _wait(lambda: not dialog._live_timer.isActive() and dialog._task is None, 60.0)

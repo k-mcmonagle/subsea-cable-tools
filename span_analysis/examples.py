@@ -119,9 +119,9 @@ EXAMPLES: List[Tuple[str, str, object]] = [
      "3 km of 1.2 m sand waves on a 2° slope with roughness, light cable and one repeater.", sand_waves),
     ("Burial sections and a first-end anchor (illustrative values)",
      "Laid towards decreasing KP (right to left) from an anchor at KP 4, armoured cable over sand waves: surface "
-     "lay at 1 kN and two burial sections held at 25 kN, the tension at PLDN (Lay control, By KP section). Each "
+     "lay at 1 kN and two burial sections pinned at 25 kN, the tension at PLDN (Lay control, By KP section). Each "
      "PLDN tension pulls back on the cable laid before it and bridges the sand-wave troughs there (Plots, Cable "
-     "colour: What sets the tension); the anchor takes what reaches it. The Holds tab lists what each hold "
+     "colour: What sets the tension); the anchor takes what reaches it. The Pinned tab lists what each one "
      "carries.", burial_holds),
 ]
 

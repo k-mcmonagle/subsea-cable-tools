@@ -527,7 +527,7 @@ def test_spans_below_data_resolution() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Holds (buried or pinned sections)
+# Pinned sections (holds: buried or anchored)
 # ---------------------------------------------------------------------------
 def _plough(direction=1, hold_kn=25.0, lay_kn=1.0, **kwargs):
     """A plough section KP 1.5 to 2.0 held at the PLDN tension, surface lay either side (armoured, 60 N/m)."""
@@ -609,6 +609,32 @@ def test_point_hold_anchor() -> bool:
     return _report("point hold (anchor): holds the cable laid before it, at the tension pulling on it; carries "
                    "the difference", ok, f"behind {behind:.2f} kN (free {without:.2f}); at it {hold.held_kn:.2f} vs "
                    f"{at_anchor:.2f}; load {hold.load_kn:.2f} vs {expect:.2f} kN")
+
+
+def test_pinned_end_acts_as_anchor() -> bool:
+    """The end of a pinned range (e.g. PLUP) acts on the cable laid after it as an anchor does: a 25 kN
+    section laid 200 m on pulls up to it (19.03 kN there) and stops; inside, the range keeps the 1 kN it was
+    pinned at (blank Value: the lay tension); it carries 18.03 kN, as the anchor in the test above. An
+    anchor's Value is not used."""
+    pinned = pl.ControlSection(1.0, 1.5, pl.HELD, math.nan, "Pinned")
+    pull = pl.ControlSection(1.7, 3.0, pl.TENSION, 25.0)
+    r = pl.run(_inputs(_flat(3000.0, 1.0), pl.LayControl(pl.TENSION, 1.0, [pinned, pull]), cable=DA,
+                       criteria=pl.Criteria(allowable=False)))
+    hold = r.holds[0]
+    x, t = r.stations.x_m, r.tension_kn
+    inside = t[r.held]
+    anchors = []
+    for value in (0.0, 50.0):     # a Value on an anchor changes nothing
+        anchor = pl.ControlSection(1.0, 1.0, pl.HELD, value, "Anchor")
+        a = pl.run(_inputs(_flat(3000.0, 1.0), pl.LayControl(pl.TENSION, 1.0, [anchor, pull]), cable=DA,
+                           criteria=pl.Criteria(allowable=False)))
+        anchors.append(a.tension_kn)
+    ok = np.allclose(inside, 1.0) and _close(float(np.interp(1501.0, x, t)), 19.03, 0.01) \
+        and _close(float(np.interp(900.0, x, t)), 1.0, 0.01) and _close(hold.load_kn, 18.03, 0.01) \
+        and hold.held_kn == 1.0 and np.allclose(anchors[0], anchors[1])
+    return _report("the end of a pinned range acts as an anchor for the cable laid after it; an anchor's Value "
+                   "is not used", ok, f"after it {hold.after_kn:.2f} kN, load {hold.load_kn:.2f} kN, pinned at "
+                   f"{hold.held_kn:.2f} kN")
 
 
 def test_descending_anchor_and_burials() -> bool:
@@ -703,6 +729,7 @@ def run_all() -> List[bool]:
         test_hold_no_spans_inside(),
         test_hold_end_uplift(),
         test_point_hold_anchor(),
+        test_pinned_end_acts_as_anchor(),
         test_descending_anchor_and_burials(),
         test_hold_sweep_and_detail(),
         test_hold_with_slack(),

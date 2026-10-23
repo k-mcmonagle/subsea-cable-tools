@@ -6,7 +6,7 @@
   spans filled by level (red, amber; light grey where the cable is clear of
   the seabed but under the reporting limits), span supports (red below the
   MBR; hover for the reaction and bend radius), bodies (hover or click for
-  their details, optional labels), held sections (a dark band, squares at
+  their details, optional labels), pinned sections (a dark band, squares at
   their ends: hover for what they carry), the detail model's cable and sea
   level;
 * tension: residual tension on the seabed, the lay (deposit) tension, NPTS and
@@ -87,7 +87,7 @@ TIP_FIELDS = (("kp", "KP", True), ("depth", "Seabed depth", True), ("cable", "Ca
               ("gap", "Gap and span", True), ("tension", "Residual tension", True), ("lay", "Lay tension", False),
               ("allowable", "Highest tension for spans within limits", False),
               ("slack", "Slack (laid, used, surplus)", False), ("slope", "Slope and friction", False),
-              ("type", "Cable type, body, protection or hold", False), ("soil", "Soil", False))
+              ("type", "Cable type, body, protection or pin", False), ("soil", "Soil", False))
 LEVEL_NAMES = {-1: "No seabed data", 0: "Clear", 1: "Information", 2: "Amber", 3: "Red"}
 SEVERITY_NAMES = {ERROR: "Red", WARNING: "Amber", INFO: "Info"}
 _TIP_STYLE = ("QLabel { background: rgba(255, 255, 255, 240); color: #222; border: 1px solid #9e9e9e; "
@@ -114,7 +114,7 @@ TRUE_SCALE_RATIO = 1000.0   # KP in km, depth in m
 _LEGENDS = {
     "depth": [("dash", SEA, "Sea level"), ("solid", (200, 175, 165), "Seabed (sampled)"), ("solid", SEABED, "Seabed"),
               ("solid", CABLE, "Cable (rest shape)"), ("fill", PROTECTION, "Protection"),
-              ("fill", HELD, "Held (buried or pinned)"),
+              ("fill", HELD, "Pinned (buried or anchored)"),
               ("dash", PREVIOUS, "Previous run"),
               ("solid", DETAIL, "Cable with EI (detail)"), ("fill", RED_FILL, "Span (red)"),
               ("fill", AMBER_FILL, "Span (amber)"), ("fill", INDICATIVE_FILL, "Span below the data's resolution"),
@@ -475,10 +475,10 @@ class ProfilePlot(QWidget):
         self.raw_curve = curve(self.depth_plot, (200, 175, 165), "Seabed (sampled)", 1)
         self.seabed_curve = curve(self.depth_plot, SEABED, "Seabed", 2)
         self.protection_curve = curve(self.depth_plot, PROTECTION, "Protection", 7, fast=False)
-        self.held_curve = curve(self.depth_plot, HELD, "Held (buried or pinned)", 5, fast=False)
+        self.held_curve = curve(self.depth_plot, HELD, "Pinned (buried or anchored)", 5, fast=False)
         self.hold_ends = pg.ScatterPlotItem([], [], size=9, symbol="s", pen=pg.mkPen((30, 30, 30)),
                                             brush=pg.mkBrush(*HELD[:3]), hoverable=True, tip=_tip,
-                                            name="Hold ends")
+                                            name="Pinned ends")
         self.hold_ends.setZValue(19)
         self.depth_plot.addItem(self.hold_ends)
         self.cable_curve = curve(self.depth_plot, CABLE, "Cable (rest shape)", 1.5)
@@ -917,7 +917,7 @@ class ProfilePlot(QWidget):
         self.supports.setData(np.array(kps), np.array(depths), brush=brushes, data=tips)
 
     def _draw_holds(self, r: pl.PlanningResult, kp: np.ndarray, cable_depth: np.ndarray) -> None:
-        """Held sections: a band along the cable, a square at each end (one for a point)."""
+        """Pinned sections: a band along the cable, a square at each end (one for an anchor)."""
         if r.held is None or not r.holds:
             self.held_curve.setData([], [])
             self.hold_ends.setData([], [])
@@ -927,7 +927,7 @@ class ProfilePlot(QWidget):
         for hold in r.holds:
             where = (f"at KP {hold.kp_start:.3f}" if hold.point
                      else f"KP {hold.kp_start:.3f} to {hold.kp_end:.3f}")
-            text = f"{hold.name}: held (buried or pinned), {where}\n" + ev.hold_text(hold)
+            text = f"{hold.name}: pinned (buried or anchored), {where}\n" + ev.hold_text(hold)
             for i in sorted({hold.i0, hold.i1}):
                 kps.append(float(kp[i]))
                 depths.append(float(cable_depth[i]))
@@ -1601,7 +1601,7 @@ class ProfilePlot(QWidget):
             label = (label or st.cable_at(i).name) + f" in {item.name} ({item.kind})"
         hold = self._hold_at(i)
         if hold is not None:
-            label = (label or st.cable_at(i).name) + f", held: {hold.name}"
+            label = (label or st.cable_at(i).name) + f", pinned: {hold.name}"
         return label or st.cable_at(i).name
 
     def _hold_at(self, i: int):

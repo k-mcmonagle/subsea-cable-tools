@@ -303,7 +303,7 @@ def export_scene(result, path: str, options: SceneOptions, detail=None) -> Dict[
         "clear": w.layer("SA_CLEAR_UNDER_LIMITS", 9), "supports": w.layer("SA_SUPPORTS", 7),
         "bodies": w.layer("SA_BODIES", 2), "features": w.layer("SA_FEATURES", 40),
         "sea": w.layer("SA_SEA_LEVEL", 4), "frame": w.layer("SA_FRAME", 7), "text": w.layer("SA_TEXT", 7),
-        "protection": w.layer("SA_PROTECTION", 140), "holds": w.layer("SA_HOLDS", 32),
+        "protection": w.layer("SA_PROTECTION", 140), "holds": w.layer("SA_PINNED", 32),
     }
     keep = idx[_thin(len(idx), options.max_vertices)]
 
@@ -403,7 +403,7 @@ def export_scene(result, path: str, options: SceneOptions, detail=None) -> Dict[
             h = th * 0.4
             w.polyline([(x - h, y - h), (x + h, y - h), (x + h, y + h), (x - h, y + h)], names["holds"], closed=True)
         mid = (a + b) // 2
-        w.text(x_all[mid], y_of(result.cable_m[mid]) - th * 1.5, f"{hold.name} (held, {hold.held_kn:g} kN)",
+        w.text(x_all[mid], y_of(result.cable_m[mid]) - th * 1.5, f"{hold.name} (pinned, {hold.held_kn:.3g} kN)",
                th * 0.7, names["holds"], align=1)
     for feature in getattr(st, "features", []) or []:
         if not (lo - 0.01 <= feature.kp_km <= hi + 0.01):

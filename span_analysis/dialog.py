@@ -896,11 +896,11 @@ class SpanAnalysisDialog(QDialog):
             lo, hi = sorted(self.plot.visible_kp())
             scopes = [("Visible part", max(lo, first), min(hi, last))]
         elif scope == "sections":
-            # A held section does not span: its tension is not searched (it stays as set).
+            # A pinned section does not span: its tension is not searched (it stays as set).
             sections = sorted((sec for sec in self.setup.control().sections if sec.mode != pl.HELD),
                               key=lambda sec: min(sec.kp_start, sec.kp_end))
             if not sections:
-                self._set_status("Add lay control sections (other than held ones) first (Lay control, By KP "
+                self._set_status("Add lay control sections (other than pinned ones) first (Lay control, By KP "
                                  "section).", error=True)
                 return
             scopes = [(f"Section {k}", *sorted((sec.kp_start, sec.kp_end))) for k, sec in enumerate(sections, 1)]
@@ -928,7 +928,7 @@ class SpanAnalysisDialog(QDialog):
                                                                       " Run to update the results."))
 
     def hold_burial_sections(self) -> None:
-        """Add held sections over the burial sections of the RPL's events or of the Burial Planner plan
+        """Add pinned sections over the burial sections of the RPL's events or of the Burial Planner plan
         (a quick first set, edited in the table afterwards)."""
         from . import holds
 
@@ -971,8 +971,8 @@ class SpanAnalysisDialog(QDialog):
         elif model is not None:
             unavailable.append("Run the analysis to offer the Burial Planner plan for this RPL.")
         if not found:
-            self._set_status("No burial sections to hold: " + " ".join(unavailable) + " Add held sections in the "
-                             "table instead (Control: Held).", error=True)
+            self._set_status("No burial sections to pin: " + " ".join(unavailable) + " Add pinned sections in the "
+                             "table instead (Control: Pinned).", error=True)
             return
         kp_range = None
         if self._stations is not None:
@@ -985,7 +985,7 @@ class SpanAnalysisDialog(QDialog):
         rows = dialog.rows()
         self._hold_kn = dialog.tension.value()
         setup.add_holds(rows, dialog.replace.isChecked())
-        self._set_status(f"{len(rows)} held section(s) added to the lay control." + (
+        self._set_status(f"{len(rows)} pinned section(s) added to the lay control." + (
             "" if setup.live.isChecked() and self._result is not None else " Run to see them."))
 
     def _start(self, kind: str, description: str, work, info: Dict) -> None:
@@ -1805,7 +1805,7 @@ def write_csv(result: pl.PlanningResult, what: str, path: str) -> None:
             writer.writerow(["kp_km", "seabed_depth_m", "cable_depth_m", "gap_m", "residual_tension_kn",
                              "lay_tension_kn", "allowable_kn", "fill_pct", "laid_pct", "used_pct", "surplus_pct",
                              "bottom_laid_pct", "bottom_used_pct", "bottom_surplus_pct",
-                             "slope_deg", "mu", "cable_type", "soil", "tension_from", "held"])
+                             "slope_deg", "mu", "cable_type", "soil", "tension_from", "pinned"])
             shown = pl.allowable_shown(result)
             allowable = shown if shown is not None else np.full(st.n, np.nan)
             held = result.held if result.held is not None else np.zeros(st.n, dtype=bool)

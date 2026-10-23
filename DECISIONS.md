@@ -1205,12 +1205,21 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   later touchdowns do not reach back through it. 1e9 N is far above any
   tension yet keeps the band's running sums precise. Gripping the segment
   before it as well would have lost the pull-back, the point of the feature.
+- **Shown as *Pinned*.** The user thinks of it as pinning (fixed in place:
+  no lifting, no sliding). Strictly a pin is free to rotate and a buried
+  length is clamped, but the route model has no bending stiffness, so they
+  are the same here (the detail model keeps every pinned node on the
+  seabed). Code and the saved mode key keep "held" / holds (no schema change).
+  A range left blank is pinned at the lay tension there (no extra pull). The
+  far end of a pinned range acts on the cable laid after it exactly as an
+  anchor does (tested: the same 18.03 kN).
 - **An anchor holds and does not pull.** For a point the grip is on the
   segment before it (lay order), not after: later touchdowns pull on the
   anchor station, so it shows the tension of the cable at the anchor (first
   built with the after-side grip, it showed its own Value, 1 kN, beside a
-  6.4 kN pull). Its Value is optional (blank: 0). An anchor at the end laid
-  first changes no tension (that end was always held) but gives its load.
+  6.4 kN pull). Its Value is not used. An anchor at the end laid first
+  changes no tension (that end was always held) but gives its load, which
+  the user compares with the anchor's holding capacity.
 - **Pinned in the rest shape, bilateral in the detail model.** Held stations
   have infinite allowed curvature, which `cable_rest_elevation` already
   treats as anchors; the beam keeps held nodes active (reaction may be

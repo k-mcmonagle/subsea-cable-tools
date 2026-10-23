@@ -21,7 +21,7 @@ hasProcessingProvider=yes
 # changelog: latest releases only; the full history is in CHANGELOG.md
 changelog=
   2.0.0
-  - New Span & Slack Analysis (beta): a planned cable on the seabed along an RPL, with tension or slack by section and held (buried or pinned) sections; spans, supports, residual tension and loop risk. Check outputs against your own methods.
+  - New Span & Slack Analysis (beta): a planned cable on the seabed along an RPL, with tension or slack by section and pinned (buried or anchored) sections; spans, supports, residual tension and loop risk. Check outputs against your own methods.
   - New Route Comments (spatial comments on routes in a shared register), Cable Type Library and Ground Model (numeric datasets, AGS CPT import).
   - Burial Planner (beta): Acquired Data, Assessment and Reporting tabs, multi-tool plans, plan import from an RPL or a table, and KP re-referencing.
   - Cable Lay Data Explorer: new Lay Assessment (beta) for spans, loop risk and tension limits.
