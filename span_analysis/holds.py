@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """Held sections from the burial on the route: the RPL's events or the Burial Planner plan.
 
-A plough buries the cable as it is laid (PLDN to PLUP), so over a plough
-section the cable is held: the lay control's *Held* mode. These helpers
-find the burial sections:
+Where the cable is buried as it is laid (a plough, PLDN to PLUP) it is held:
+the lay control's *Held* mode, which can hold the cable for any reason
+(burial, a clamp, an anchor). These helpers give a quick first set of held
+sections from the burial already planned, to edit in the table:
 
 * :func:`rpl_burial_ranges` reads the RPL's boundary events (PLDN / PLUP,
   Start / End PLB, Start / End burial … in many phrasings) with the Burial
@@ -151,13 +152,14 @@ class HoldsDialog(QDialog):
                  kp_range: Optional[Tuple[float, float]] = None):
         """``sources``: ``(key, label, ranges, notes)``; ``unavailable``: why a source is not offered."""
         super().__init__(parent)
-        self.setWindowTitle("Hold plough sections")
+        self.setWindowTitle("Holds from burial")
         self.sources = list(sources)
         self.kp_range = kp_range
         layout = QVBoxLayout(self)
-        intro = QLabel("Hold the cable over the burial sections of the route: a plough buries it as it is laid "
-                       "(PLDN to PLUP). Each section is laid at the tension below, which pulls back on the cable "
-                       "laid before it; then it neither spans nor slides.")
+        intro = QLabel("Hold the cable over the burial sections already planned, e.g. from PLDN to PLUP where it "
+                       "is buried as it is laid. Each section is laid at the tension below (where it starts, e.g. "
+                       "at PLDN), which pulls back on the cable laid before it; then it neither spans nor slides. "
+                       "Edit the rows in the table afterwards.")
         intro.setWordWrap(True)
         layout.addWidget(intro)
         form = QFormLayout()
@@ -184,8 +186,8 @@ class HoldsDialog(QDialog):
         self.tension.setSingleStep(0.5)
         self.tension.setSuffix(" kN")
         self.tension.setValue(float(tension_kn))
-        self.tension.setToolTip("The tension each section is laid and held at: the cable tension at the plough "
-                                "as it goes down (PLDN). Edit each row afterwards for different values.")
+        self.tension.setToolTip("The tension each section is laid and held at, e.g. the cable tension at PLDN. "
+                                "Edit each row afterwards for different values.")
         form.addRow("Held at", self.tension)
         self.replace = QCheckBox("Replace the held sections already in the table")
         self.replace.setChecked(True)

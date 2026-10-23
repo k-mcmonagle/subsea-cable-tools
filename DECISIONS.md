@@ -1188,10 +1188,13 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
 - **A hold is a lay control mode, not a separate constraints table.** A
   plough section is a lay operation with a tension, so one row (KP range,
   *Held*, the tension at PLDN, a name) says it all and sits in sequence with
-  the surface lay rows around it. A point (KP to = KP from) holds the
-  nearest station: an anchor. *Hold plough sections* fills rows from the
-  RPL's burial events (read by the Burial Planner's RPL import, in the lay
-  direction) or the Burial Planner plan when it shares the analysis's KPs.
+  the surface lay rows around it. The wording stays generic (held: buried,
+  clamped or anchored), as a hold serves any burial or other reason. A point
+  (KP to = KP from) holds the nearest station: an anchor; a hold up to 10 m
+  beyond an end of the profile holds that end, one further out is left out
+  with a note. *Holds from burial* gives a first set from the RPL's burial
+  events (read by the Burial Planner's RPL import, in the lay direction) or
+  the Burial Planner plan when it shares the analysis's KPs.
   Post-lay burial (PLB, MFE) is not held by default: the cable lies on the
   seabed as laid until it is buried.
 - **The hold's tension pulls back; nothing passes through it.** Its stations
@@ -1202,6 +1205,12 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   later touchdowns do not reach back through it. 1e9 N is far above any
   tension yet keeps the band's running sums precise. Gripping the segment
   before it as well would have lost the pull-back, the point of the feature.
+- **An anchor holds and does not pull.** For a point the grip is on the
+  segment before it (lay order), not after: later touchdowns pull on the
+  anchor station, so it shows the tension of the cable at the anchor (first
+  built with the after-side grip, it showed its own Value, 1 kN, beside a
+  6.4 kN pull). Its Value is optional (blank: 0). An anchor at the end laid
+  first changes no tension (that end was always held) but gives its load.
 - **Pinned in the rest shape, bilateral in the detail model.** Held stations
   have infinite allowed curvature, which `cable_rest_elevation` already
   treats as anchors; the beam keeps held nodes active (reaction may be

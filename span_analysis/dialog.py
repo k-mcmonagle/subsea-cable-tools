@@ -928,7 +928,8 @@ class SpanAnalysisDialog(QDialog):
                                                                       " Run to update the results."))
 
     def hold_burial_sections(self) -> None:
-        """Add held sections over the burial sections of the RPL's events or of the Burial Planner plan."""
+        """Add held sections over the burial sections of the RPL's events or of the Burial Planner plan
+        (a quick first set, edited in the table afterwards)."""
         from . import holds
 
         setup = self.setup

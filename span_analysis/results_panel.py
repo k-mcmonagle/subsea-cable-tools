@@ -294,11 +294,13 @@ class ResultsPanel(QTabWidget):
         self.holds_table.horizontalHeader().setSortIndicator(1, getattr(getattr(Qt, "SortOrder", Qt), "AscendingOrder"))
         self.holds_table.itemSelectionChanged.connect(lambda: self._emit_range(self.holds_table))
         layout.addWidget(self.holds_table, 1)
-        note = WrapLabel("Each hold (Lay control, Held) is laid at its own tension, which pulls back on the cable "
-                         "laid before it, falling by μ w per metre; then it neither spans nor slides, and later "
-                         "touchdowns do not reach through it. The net axial load is the difference between the "
-                         "free cable either side (a side beyond the profile counts as zero). A pull-up is the free "
-                         "cable turning up out of the hold: the burial or anchor must hold it down.")
+        note = WrapLabel("Each held range (Lay control, Held) is laid at its own tension, which pulls back on the "
+                         "cable laid before it, falling by μ w per metre; then it neither spans nor slides, and later "
+                         "touchdowns do not reach through it. An anchor (a point) is held at the tension of the "
+                         "cable pulling on it. Before and after are in lay order. The net axial load is the "
+                         "difference between the free cable either side (a side beyond the profile counts as zero). "
+                         "A pull-up is the free cable turning up out of the hold: the burial or anchor must hold it "
+                         "down.")
         note.setStyleSheet("QLabel { color: #555; }")
         layout.addWidget(note)
         self.holds_page = page

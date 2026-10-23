@@ -149,14 +149,18 @@ You can override the value by KP section. Set the lay direction: friction holds 
 at, so on slopes the result depends on it. *Find the highest tension within limits* opens the Find tension tab
 (see the model, section 7).
 
-A section can also **hold** the cable (*Control*: *Held*, Value in kN): buried by a plough from PLDN to PLUP,
-clamped, or at an anchor (a point: *KP to* = *KP from*). It is laid at its Value, e.g. the tension at the plough as
-it goes down (see the model, section 2a). *Name* (optional, e.g. *Plough 1*) labels it on the profile and in the
-Holds tab. *Hold plough sections…* adds held sections in one go, from the RPL's burial events (PLDN / PLUP, Start /
-End burial and other phrasings, read as the Burial Planner's *Import plan* reads them, in the lay direction; or its
-ProtectionMethod column) or from the Burial Planner plan for the RPL when it shares the analysis's KPs, at a
-tension you choose. Ploughs (and burial with no tool named) are held by default; post-lay burial (PLB, MFE) is not,
-as the cable lies on the seabed as laid until it is buried.
+A section can also **hold** the cable (*Control*: *Held*, Value in kN), for any reason: over a KP range (buried,
+e.g. from PLDN to PLUP, or clamped), laid at its Value (e.g. the tension at PLDN), or at a point (*KP to* = *KP
+from*: an anchor, which needs no Value). See the model, section 2a. *Name* (optional, e.g. *Burial 1* or
+*First-end anchor*) labels it on the profile and in the Holds tab. A hold up to 10 m beyond an end of the profile
+holds that end; one further out is left out, and the run says so.
+
+*Holds from burial…* gives a quick first set to edit in the table: held sections over the burial already planned,
+from the RPL's burial events (PLDN / PLUP, Start / End burial and other phrasings, read as the Burial Planner's
+*Import plan* reads them, in the lay direction; or its ProtectionMethod column) or from the Burial Planner plan for
+the RPL when it shares the analysis's KPs, at a tension you choose. Burial as the cable is laid (plough, or burial
+with no tool named) is held by default; post-lay burial (PLB, MFE) is not, as the cable lies on the seabed as laid
+until it is buried.
 
 ## The model
 
@@ -210,7 +214,10 @@ slides off it. The end laid last is the current touchdown.
 
 ### 2a. Holds: buried or pinned cable
 
-A held section (lay control *Held*) is laid at its own tension. Like any touchdown, that tension pulls back on the
+The lay is followed touchdown by touchdown in the lay direction (laid towards decreasing KP, from right to left on
+the plot), so each hold acts on the cable laid before it and is untouched by the cable laid after it.
+
+A held range (lay control *Held*) is laid at its own tension. Like any touchdown, that tension pulls back on the
 cable laid before it, falling by `mu w` per metre (reach `(T_hold - T_lay) / (mu w)`: 25 kN against 1 kN of surface
 lay reaches 800 m back for 60 N/m at `mu` 0.5). Spans there are labelled *pulled back by a hold*. Then the held cable:
 
@@ -219,6 +226,14 @@ lay reaches 800 m back for 60 N/m at `mu` 0.5). Spans there are labelled *pulled
 - does not slide: friction grips the hold, and the segment after it in the lay direction, so later touchdowns do not
   reach back through it. The cable laid after it starts afresh at its own lay control;
 - gives no cable to a slack section next to it: the pull-taut windows end at a hold.
+
+A hold at a point is an **anchor**: it holds and does not pull. The touchdowns laid after it pull on it (friction
+takes `mu w` per metre off the pull on the way), nothing passes it to the cable laid before it, and its tension is
+that of the cable pulling on it. Example: laid towards decreasing KP from an anchor, 1 kN of surface lay and then
+PLDN at 25 kN 600 m on, on a flat seabed (60 N/m, `mu` 0.5): the cable between rises from 7 kN at the anchor to
+25 kN at the PLDN, and the anchor carries 7 kN (less over sand waves, whose crests take more by friction). An
+anchor at the end of the profile laid first changes no tension, as that end is always held (as by the cable
+beyond it), but gives its load.
 
 For each hold the Holds tab gives the free cable's tension on the side laid before and the side laid after, the net
 axial load it carries (their difference: an anchor's load; a side beyond the profile counts as zero), how far its
@@ -457,9 +472,10 @@ tension (`tension_from`) and whether the station is held (`held`). *Add to map*
   (45 kg/m in water, 150 mm, MBR 4 m; not product data): shorter spans, a larger reaction on the pipeline.
 - **Rock berm (custom shape), armoured cable.**
 - **Sand waves on a slope, with a repeater.**
-- **Plough sections and a first-end anchor (illustrative values).** Surface lay at 1 kN, armoured cable, two plough
-  sections held at 25 kN and the first end anchored at KP 0: each PLDN tension pulls back on the cable laid before
-  it and bridges sand-wave troughs there; the anchor takes what reaches it (Holds tab).
+- **Burial sections and a first-end anchor (illustrative values).** Laid towards decreasing KP from an anchor at
+  the right-hand end, armoured cable, surface lay at 1 kN and two burial sections held at 25 kN (the tension at
+  PLDN): each PLDN tension pulls back on the cable laid before it and bridges sand-wave troughs there; the anchor
+  takes what reaches it (Holds tab).
 
 ## Storage
 
@@ -491,7 +507,8 @@ Unit tests (`tests/test_cable_seabed.py`, `tests/test_span_analysis_qgis.py`, `t
 | Friction set on prepared stations gives the same answer as preparing them with it (live update) | consistency | exact |
 | A hold at 25 kN after 1 kN of lay pulls back `mu w` per metre, 800 m (60 N/m, `mu` 0.5); nothing passes it; both lay directions | closed form | within 1% (reach within 2%) |
 | Cable leaving a hold up a 1:10 ramp at 5 kN: pull-up `H s - w dx` | closed form | 0.438 kN, exact |
-| An anchor holds the cable laid before it from a later 25 kN section 200 m on: load `25 - 1 - mu w 199 m` | closed form | 18.03 kN, exact |
+| An anchor holds the cable laid before it from a later 25 kN section 200 m on: load `25 - 1 - mu w 199 m`; its tension is the cable's at it | closed form | 18.03 kN, exact |
+| Laid towards decreasing KP from an anchor, PLDN at 25 kN 600 m on: the anchor carries `25 - mu w 600 m` | closed form | 7.00 kN, exact |
 | No span inside a hold; the sweep and the tension finder keep holds; the detail model stays on the seabed in a hold | model rule | yes |
 
 ## Assumptions and limits

@@ -38,9 +38,9 @@ table of coefficients for each cable type (or body kind) and soil. The model is 
 only for the alter-course note (the turn radius the cable holds); nothing moves the cable sideways.</li>
 <li><b>Lay control.</b> Bottom tension (kN), bottom slack (% over the seabed), slack over the route (%, as in an
 RPL), or the RPL slack of each leg. Override the value over KP ranges under <i>By KP section</i>, where
-<i>Held</i> holds the cable over a range (buried by a plough) or at a point (an anchor: KP to = KP from), at the
-tension in Value. <i>Hold plough sections</i> adds them from the RPL's PLDN / PLUP events or the Burial Planner
-plan. Set the lay direction. <i>Find the highest
+<i>Held</i> holds the cable over a range (buried or clamped, laid at the tension in Value) or at a point (an
+anchor: KP to = KP from). <i>Holds from burial</i> adds a first set from the RPL's burial events (PLDN / PLUP and
+others) or the Burial Planner plan, to edit in the table. Set the lay direction. <i>Find the highest
 tension within limits</i> opens the Find tension tab.</li>
 <li><b>Run.</b> The first run samples the seabed (in the background). After that, a change to the lay control or
 the friction updates the results in about a second: move a slider and see the spans grow or shrink. The view stays
@@ -110,9 +110,9 @@ below (loop risk);</li>
 lay direction you set. Both ends of the profile sit on the seabed. The end laid first keeps the tension it was laid
 at, or what a later touchdown pulls it to, as if held by the cable beyond it or an anchor; the end laid last is the
 current touchdown.</p>
-<p><b>Holds (buried or pinned).</b> A lay control section set to <i>Held</i> holds the cable: buried by a plough
-from PLDN to PLUP, clamped, or at an anchor (a point). It is laid at the tension in its Value (e.g. the tension at the
-plough as it goes down), and like any touchdown that tension pulls back on the cable laid before it, falling by
+<p><b>Holds (buried or pinned).</b> A lay control section set to <i>Held</i> holds the cable over a KP range:
+buried (e.g. from PLDN to PLUP), clamped, or for any other reason. It is laid at the tension in its Value (e.g. the
+tension at PLDN), and like any touchdown that tension pulls back on the cable laid before it, falling by
 &mu;<i>w</i> per metre: 25 kN against 1 kN of surface lay reaches back (25 &minus; 1) / &mu;<i>w</i>, 800 m for
 60 N/m at &mu; 0.5. Spans there are labelled <i>pulled back by a hold</i>. Then the held cable follows the seabed (no
 span) and does not slide, and the touchdowns after it do not reach back through it: the cable laid after starts
@@ -121,6 +121,11 @@ hold, the free cable's tension either side, the net axial load it carries (an an
 reaches, and the upward pull of the free cable leaving it, which the burial or anchor must resist (no soil
 resistance is modelled: compare it with the uplift resistance of the burial). The tension finder and the sweep keep
 the holds as set, and the detail model keeps held nodes on the seabed.</p>
+<p><b>Anchors.</b> A hold at a point (KP to = KP from) is an anchor: it holds and does not pull. The touchdowns
+laid after it pull on it (friction takes &mu;<i>w</i> per metre off the pull on the way), nothing passes it to the
+cable laid before it, and its tension is that of the cable pulling on it (its Value is not needed). An anchor at the
+end of the profile laid first changes no tension: that end is always held (as by the cable beyond it), and the
+anchor gives its load. Laid towards decreasing KP, that end is the right-hand one.</p>
 <p><b>Slack and tension: one rule.</b> Tension and surplus cable are never both positive. With slack control the
 cable laid is compared with the seabed it must cover, within the friction reach. Where the cable is short, it is
 pulled taut: the tool finds the tension at which the rest shape uses exactly the cable laid. Where there is

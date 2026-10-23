@@ -30,15 +30,18 @@ KP). :func:`prepare` builds the stations once; :func:`solve` runs:
    indicative, not red or amber, and stretches where the data cannot resolve
    spans as short as the reporting length are flagged.
 
-**Holds.** A lay control section can hold the cable (``HELD``: buried by a
-plough, clamped, or at an anchor; a point holds the nearest station). It is
-laid at its own tension (e.g. the plough tension at PLDN), which pulls back
-on the cable laid before it as any touchdown does; then it neither spans (the
-rest shape is pinned to the seabed there) nor slides (friction grips it, and
-the segment after it in the lay direction, so later touchdowns do not reach
-back through it). :class:`HoldResult` gives the tension either side, the net
-axial load it carries, how far its pull-back reaches and the upward pull of
-the free cable leaving it (the hold must hold it down).
+**Holds.** A lay control section can hold the cable (``HELD``): over a KP
+range (buried, e.g. from PLDN to PLUP, or clamped) or at a point (an anchor:
+the nearest station). A range is laid at its own tension (e.g. the tension
+at PLDN), which pulls back on the cable laid before it as any touchdown
+does; then it neither spans (the rest shape is pinned to the seabed there)
+nor slides (friction grips it, and the segment after it in the lay
+direction, so later touchdowns do not reach back through it). A point holds
+and does not pull: later touchdowns pull on it, and nothing passes it to the
+cable laid before it, so its tension is the cable's at the anchor.
+:class:`HoldResult` gives the tension either side, the net axial load it
+carries, how far its pull-back reaches and the upward pull of the free
+cable leaving it (the hold must hold it down).
 
 :func:`detail_window` solves a KP window with bending stiffness
 (:mod:`cable_seabed.beam`); :func:`tension_sweep` repeats step 1-4 over a
@@ -115,6 +118,8 @@ SOURCE_NAMES = {
 # Friction capacity (N) of a segment a hold grips: far above any tension, so nothing passes through it,
 # yet small enough that the running sums of the band keep their precision.
 HOLD_GRIP_N = 1.0e9
+# A hold up to this far beyond an end of the profile holds that end (a KP typed for the end of the route).
+HOLD_SNAP_KM = 0.01
 
 CONTACT_TOL_M = 0.01     # cable on the seabed (friction, span supports)
 DEFAULT_MU = 0.5
@@ -262,11 +267,13 @@ class ControlSection:
 
 def section_stations(section: ControlSection, kp_km: np.ndarray) -> np.ndarray:
     """Stations a section covers. A hold at a point (or shorter than the station
-    spacing) holds the station nearest it, when it is on the profile."""
+    spacing) holds the station nearest it, when it is on the profile or within
+    :data:`HOLD_SNAP_KM` beyond an end (a KP typed for the end of the route)."""
     kp = np.asarray(kp_km, dtype=float)
     lo, hi = sorted((float(section.kp_start), float(section.kp_end)))
     sel = (kp >= lo) & (kp <= hi)
-    if section.mode == HELD and not sel.any() and len(kp) and kp[0] <= hi and lo <= kp[-1]:
+    if section.mode == HELD and not sel.any() and len(kp) \
+            and kp[0] - HOLD_SNAP_KM <= hi and lo <= kp[-1] + HOLD_SNAP_KM:
         sel[int(np.argmin(np.abs(kp - 0.5 * (lo + hi))))] = True
     return sel
 
@@ -760,14 +767,35 @@ def _shape(st: Stations, tension_kn: np.ndarray, conform_kn: float, cable_slope=
     return cable_rest_elevation(st.x_m, base, _curvature(st, tension_kn, conform_kn, cable_slope, pinned))
 
 
-def gripped_segments(held: np.ndarray, direction: int) -> np.ndarray:
-    """Segments a hold grips: those inside it, and the one after it in the lay direction
-    (later touchdowns do not reach back through it). The segment before it stays free: the
-    tension the hold is laid at pulls back on the cable laid before, as any touchdown does."""
+def point_holds(held: np.ndarray) -> np.ndarray:
+    """Held stations with no held neighbour: holds at a point (anchors)."""
     held = np.asarray(held, dtype=bool)
+    point = held.copy()
+    point[1:] &= ~held[:-1]
+    point[:-1] &= ~held[1:]
+    return point
+
+
+def gripped_segments(held: np.ndarray, direction: int) -> np.ndarray:
+    """Segments a hold grips (nothing passes them).
+
+    A range: the segments inside it, and the one after it in the lay direction
+    (later touchdowns do not reach back through it). The segment before it
+    stays free: the tension the range is laid at pulls back on the cable laid
+    before, as any touchdown does (e.g. at PLDN). A point (an anchor) holds
+    and does not pull: the segment before it is gripped, the one after it is
+    free, so later touchdowns pull on the anchor and stop there.
+    """
+    held = np.asarray(held, dtype=bool)
+    point = point_holds(held)
     inside = held[:-1] & held[1:]
-    after = (held[:-1] & ~held[1:]) if direction >= 0 else (~held[:-1] & held[1:])
-    return inside | after
+    if direction >= 0:
+        after = held[:-1] & ~held[1:] & ~point[:-1]
+        before = ~held[:-1] & point[1:]
+    else:
+        after = ~held[:-1] & held[1:] & ~point[1:]
+        before = point[:-1] & ~held[1:]
+    return inside | after | before
 
 
 def _end_uplift_n(x: np.ndarray, y: np.ndarray, w: np.ndarray, h_n: np.ndarray, held: np.ndarray,
@@ -814,8 +842,10 @@ def _hold_results(control: LayControl, st: Stations, held: np.ndarray, deposit: 
             value = _end_uplift_n(x, y, st.w_npm, h_n, held, e) / 1000.0
             if value > uplift:
                 uplift, at = value, float(kp[e])
+        # A range holds at the tension it is laid at; an anchor at the tension of the cable pulling on it.
+        held_kn = float(tension[i0]) if i0 == i1 else float(deposit[entry])
         out.append(HoldResult(section.name or f"Hold {number}", float(kp[i0]), float(kp[i1]), i0, i1,
-                              float(deposit[entry]), before, after, load, reach, uplift, at))
+                              held_kn, before, after, load, reach, uplift, at))
     return sorted(out, key=lambda h: h.kp_start)
 
 
@@ -895,6 +925,12 @@ def solve(st: Stations, control: LayControl, criteria: Criteria, allowable: Opti
                            np.where(seg_tension, d_seabed, d_route * (1.0 + seg_value / 100.0)))
     shortfalls: List[Shortfall] = []
     notes: List[str] = list(st.notes)
+    for number, section in enumerate(control.holds(), start=1):
+        if not section_stations(section, kp).any():
+            lo, hi = sorted((float(section.kp_start), float(section.kp_end)))
+            where = f"KP {lo:.3f}" if hi - lo < 1e-9 else f"KP {lo:.3f} to {hi:.3f}"
+            notes.append(f"Held section '{section.name or f'Hold {number}'}' ({where}) is outside the analysed KPs "
+                         f"({kp[0]:.3f} to {kp[-1]:.3f}): left out.")
     if (~tension_mode).any():
         check_cancel(cancel)
         cable_cum = np.concatenate(([0.0], np.cumsum(d_laid_plan)))
@@ -944,6 +980,8 @@ def solve(st: Stations, control: LayControl, criteria: Criteria, allowable: Opti
     if any_held:
         later = 1 if control.direction >= 0 else -1
         for a, b in runs(held):
+            if a == b:
+                continue      # an anchor holds; it does not pull
             j = (a if later > 0 else b) - later
             while 0 <= j < n and raised[j] and not held[j]:
                 pulled[j] = True

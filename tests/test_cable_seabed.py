@@ -601,12 +601,43 @@ def test_point_hold_anchor() -> bool:
     x = r.stations.x_m
     hold = r.holds[0]
     expect = 25.0 - 0.5 * 60.0 * 199.0 / 1000.0 - 1.0
+    at_anchor = 25.0 - 0.5 * 60.0 * 200.0 / 1000.0
     behind = float(np.interp(900.0, x, r.tension_kn))
     without = float(np.interp(900.0, x, free.tension_kn))
     ok = hold.point and int(r.held.sum()) == 1 and _close(behind, 1.0, 0.01) and without > 5.0 \
-        and _close(hold.load_kn, expect, 0.01)
-    return _report("point hold (anchor): holds the cable laid before it; carries the tension difference", ok,
-                   f"behind {behind:.2f} kN (free {without:.2f}); load {hold.load_kn:.2f} vs {expect:.2f} kN")
+        and _close(hold.load_kn, expect, 0.01) and _close(hold.held_kn, at_anchor, 0.01)
+    return _report("point hold (anchor): holds the cable laid before it, at the tension pulling on it; carries "
+                   "the difference", ok, f"behind {behind:.2f} kN (free {without:.2f}); at it {hold.held_kn:.2f} vs "
+                   f"{at_anchor:.2f}; load {hold.load_kn:.2f} vs {expect:.2f} kN")
+
+
+def test_descending_anchor_and_burials() -> bool:
+    """Laid towards decreasing KP from an anchor at the right-hand end: 1 kN of surface lay, a burial section
+    KP 2.6-3.4 held at 25 kN (PLDN at KP 3.4), 1 kN, another at KP 0.6-1.4. Right to left: the anchor carries
+    25 - mu w 600 m = 7 kN, the cable rises to 25 kN at each PLDN, and is 1 kN again after each PLUP. An anchor
+    typed 5 m beyond the end holds the end; one 50 m beyond is left out, with a note."""
+    def run(anchor_kp):
+        sections = [pl.ControlSection(anchor_kp, anchor_kp, pl.HELD, 0.0, "Anchor"),
+                    pl.ControlSection(2.6, 3.4, pl.HELD, 25.0, "Burial 1"),
+                    pl.ControlSection(0.6, 1.4, pl.HELD, 25.0, "Burial 2")]
+        return pl.run(_inputs(_flat(4000.0, 1.0), pl.LayControl(pl.TENSION, 1.0, sections, [], -1), cable=DA,
+                              criteria=pl.Criteria(allowable=False)))
+
+    r = run(4.0)
+    x, t = r.stations.x_m, r.tension_kn
+
+    def at(kp_km):
+        return float(np.interp(kp_km * 1000.0, x, t))
+
+    anchor = next(h for h in r.holds if h.name == "Anchor")
+    expect = {4.0: 7.0, 3.7: 16.0, 3.0: 25.0, 2.5: 1.0, 1.8: 13.0, 1.0: 25.0, 0.3: 1.0}
+    got = {k: at(k) for k in expect}
+    snapped, missed = run(4.005), run(4.05)
+    ok = all(_close(got[k], v, 0.01) for k, v in expect.items()) and _close(anchor.load_kn, 7.0, 0.01) \
+        and _close(anchor.held_kn, 7.0, 0.01) and len(snapped.holds) == 3 \
+        and len(missed.holds) == 2 and any("'Anchor'" in note and "left out" in note for note in missed.notes)
+    return _report("laid right to left from an anchor: each PLDN pulls back to the anchor, PLUP back to 1 kN", ok,
+                   ", ".join(f"KP {k} {v:.2f}" for k, v in got.items()))
 
 
 def test_hold_sweep_and_detail() -> bool:
@@ -672,6 +703,7 @@ def run_all() -> List[bool]:
         test_hold_no_spans_inside(),
         test_hold_end_uplift(),
         test_point_hold_anchor(),
+        test_descending_anchor_and_burials(),
         test_hold_sweep_and_detail(),
         test_hold_with_slack(),
     ]

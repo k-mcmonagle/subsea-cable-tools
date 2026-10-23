@@ -8,7 +8,7 @@
    assembly fitted to the RPL; in-line bodies by KP.
 4. Friction: one coefficient, or soil zones by KP with a cable / body x soil table.
 5. Lay control: bottom tension or slack, by KP section, and the lay direction;
-   sections can hold the cable (buried by a plough, or pinned at an anchor).
+   sections can hold the cable (buried, clamped, or pinned at an anchor).
 6. Criteria: the reporting limits (the Lay Assessment's defaults).
 
 :meth:`SetupPanel.settings` / :meth:`apply_settings` round-trip everything
@@ -1013,11 +1013,13 @@ class SetupPanel(QWidget):
         self.control_sections = EditTable(
             [Col("kp0", "KP from", "float"), Col("kp1", "KP to", "float"),
              Col("mode", "Control", "choice", pl.TENSION, modes,
-                 "Bottom tension or slack, as above; or Held: the cable is held there (buried by a plough, "
-                 "clamped or anchored)."),
-             Col("value", "Value", "float", 5.0, tip="kN for a tension or a hold (the tension it is laid and held "
-                                                      "at, e.g. the plough tension at PLDN); % for slack."),
-             Col("name", "Name", "text", "", tip="Optional, e.g. Plough 1 or First-end anchor: shown on the "
+                 "Bottom tension or slack, as above; or Held: the cable is held there (buried, clamped, or "
+                 "at a point: an anchor)."),
+             Col("value", "Value", "float", 5.0, tip="kN for a tension; % for slack. Held over a range: the "
+                                                      "tension it is laid and held at, e.g. at PLDN (blank: 0). "
+                                                      "An anchor (a point) takes the tension of the cable that "
+                                                      "pulls on it: leave it blank."),
+             Col("name", "Name", "text", "", tip="Optional, e.g. Burial 1 or First-end anchor: shown on the "
                                                  "profile and in the Holds tab.")],
             "Add section", height=80, title="lay control sections")
         metrics = self.control_sections.table.fontMetrics()
@@ -1027,17 +1029,19 @@ class SetupPanel(QWidget):
             self.control_sections.table.setColumnWidth(column, metrics.horizontalAdvance(sample) + pad)
         self.control_sections.changed.connect(self._emit_control)
         holds_row = QHBoxLayout()
-        holds_row.addWidget(bar_button("Hold plough sections…", "Add held sections over the plough (PLDN to PLUP) "
-                                       "sections of the RPL's events or of the Burial Planner plan, at a tension "
-                                       "you choose.", self.holdsRequested.emit))
+        holds_row.addWidget(bar_button("Holds from burial…", "Add held sections over the burial sections of the "
+                                       "RPL's events (e.g. PLDN to PLUP) or of the Burial Planner plan, at a "
+                                       "tension you choose; edit them in the table afterwards.",
+                                       self.holdsRequested.emit))
         holds_row.addStretch(1)
         sections_body = QWidget()
         sections_layout = QVBoxLayout(sections_body)
         sections_layout.setContentsMargins(14, 0, 0, 0)
         note = QLabel("A tension or slack over a KP range, in place of the value above (e.g. less tension over "
-                      "rough ground). <b>Held</b>: the cable is held over the range, e.g. buried by a plough (KP to "
-                      "= KP from for a point, e.g. an anchor). It is laid at the tension in Value, which pulls back "
-                      "on the cable laid before it; it does not span or slide, and nothing passes through it.")
+                      "rough ground). <b>Held</b>: the cable is held over the range, e.g. buried or clamped. It "
+                      "is laid at the tension in Value (e.g. at PLDN), which pulls back on the cable laid before "
+                      "it; it does not span or slide, and nothing passes through it. KP to = KP from holds a "
+                      "point, e.g. an anchor: it takes the tension of the cable that pulls on it.")
         note.setWordWrap(True)
         note.setStyleSheet("color: #555;")
         sections_layout.addWidget(note)
@@ -1665,9 +1669,13 @@ class SetupPanel(QWidget):
     def control(self, legs: Sequence[Tuple[float, float, float]] = ()) -> pl.LayControl:
         sections = []
         for row in self.control_sections.rows():
-            if row.get("kp0") is None or row.get("kp1") is None or row.get("value") is None:
+            mode = row.get("mode") or pl.TENSION
+            value = row.get("value")
+            if value is None and mode == pl.HELD:
+                value = 0.0      # an anchor needs none (it takes the tension pulling on it)
+            if row.get("kp0") is None or row.get("kp1") is None or value is None:
                 continue
-            sections.append(pl.ControlSection(row["kp0"], row["kp1"], row.get("mode") or pl.TENSION, row["value"],
+            sections.append(pl.ControlSection(row["kp0"], row["kp1"], mode, value,
                                               str(row.get("name") or "").strip()))
         return pl.LayControl(self.mode.currentData(), float(self.value.value()), sections, list(legs),
                              int(self.direction.currentData() or 1))

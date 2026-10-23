@@ -1104,15 +1104,18 @@ def test_holds_in_the_window() -> List[bool]:
     folder = tempfile.mkdtemp()
     dialog = _make_dialog()
     try:
-        dialog.load_example(_example("Plough sections"))
+        dialog.load_example(_example("Burial sections"))
         _wait(lambda: dialog._task is None, 120.0)
         r = dialog._result
         names = [h.name for h in r.holds] if r is not None else []
-        anchor = r.holds[0] if names else None
+        anchor = r.holds[-1] if names else None
         pulled = [s for s in (r.spans if r else []) if s.source == pl.SOURCE_NAMES[pl.SOURCE_PULLED]]
-        out.append(_report("example: plough sections pull back on the cable before them; the anchor takes the rest",
-                           names == ["First-end anchor", "Plough 1", "Plough 2"] and anchor.point
-                           and 1.0 < anchor.load_kn < 25.0 and len(pulled) > 0,
+        out.append(_report("example (laid right to left): burial sections pull back on the cable laid before them; "
+                           "the anchor takes the rest",
+                           names == ["Burial 2", "Burial 1", "First-end anchor"] and anchor.point
+                           # 7 kN on a flat seabed; sand-wave crests take more by friction (capstan)
+                           and 5.0 < anchor.load_kn <= 7.05 and abs(anchor.held_kn - anchor.load_kn) < 0.1
+                           and len(pulled) > 0,
                            f"anchor {anchor.load_kn if anchor else math.nan:.2f} kN, {len(pulled)} pulled span(s)"))
         settings = _synthetic_settings()
         hold_row = {"kp0": 0.25, "kp1": 0.35, "mode": pl.HELD, "value": 10.0, "name": "Plough 1"}
