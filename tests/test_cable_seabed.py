@@ -666,6 +666,85 @@ def test_descending_anchor_and_burials() -> bool:
                    ", ".join(f"KP {k} {v:.2f}" for k, v in got.items()))
 
 
+def test_long_route_hold_pull_back() -> bool:
+    """A synthetic 45 km scope retains the entry pull when the march reduces its grid.
+
+    Burial at 25 kN follows 1 kN surface lay. At 60 N/m and mu 0.5,
+    200 m back must carry 19 kN. All positions and seabed data are synthetic.
+    Both directions and several grid alignments must preserve the boundary.
+    """
+    checks, details = [], []
+    for step in (0.5, 1.0, 2.0):
+        x = np.arange(0.0, 45013.0 + 1e-7, step)
+        kp = 100.0 + x / 1000.0
+        profile = pl.Profile(x, kp, np.full(len(x), 100.0))
+        for direction in (-1, 1):
+            burial = pl.ControlSection(140.122, 137.572, pl.HELD, 25.0, "Burial")
+            anchor_kp = float(kp[-1] if direction < 0 else kp[0])
+            anchor = pl.ControlSection(anchor_kp, anchor_kp, pl.HELD, math.nan, "Anchor")
+            control = pl.LayControl(pl.TENSION, 1.0, [anchor, burial], [], direction)
+            r = pl.run(_inputs(profile, control, cable=DA, criteria=pl.Criteria(allowable=False)))
+            idx = np.flatnonzero(pl.section_stations(burial, kp))
+            entry, leave = (int(idx[0]), int(idx[-1])) if direction > 0 else (int(idx[-1]), int(idx[0]))
+            back = float(np.interp(x[entry] - direction * 200.0, x, r.tension_kn))
+            beyond = float(np.interp(x[entry] - direction * 900.0, x, r.tension_kn))
+            after = float(np.interp(x[leave] + direction * 100.0, x, r.tension_kn))
+            first = float(r.tension_kn[entry - direction])
+            checks.append(abs(back - 19.0) < 0.01 and abs(first - (25.0 - 0.03 * step)) < 0.01
+                          and abs(beyond - 1.0) < 0.01 and abs(after - 1.0) < 0.01
+                          and np.allclose(r.tension_kn[idx], 25.0, atol=0.001))
+            details.append(f"{step:g} m / {direction:+d}: {back:.2f} kN")
+    return _report("long route: a pinned range pulls back across its entry, both directions and grid alignments",
+                   all(checks), "; ".join(details))
+
+
+def test_long_route_point_anchor() -> bool:
+    """An interior point anchor must take a later pull and shield the cable before it on a reduced grid."""
+    checks, details = [], []
+    for direction in (-1, 1):
+        anchor_x = 12203.0 if direction < 0 else 9797.0
+        anchor = pl.ControlSection(anchor_x / 1000.0, anchor_x / 1000.0, pl.HELD, math.nan, "Anchor")
+        burial = pl.ControlSection(10.0, 12.0, pl.HELD, 25.0, "Burial")
+        control = pl.LayControl(pl.TENSION, 1.0, [anchor, burial], [], direction)
+        r = pl.run(_inputs(_flat(25010.0, 1.0), control, cable=DA, criteria=pl.Criteria(allowable=False)))
+        at = int(anchor_x)
+        expected = 25.0 - 0.03 * 203.0
+        checks.append(abs(r.tension_kn[at] - expected) < 0.01
+                      and abs(r.tension_kn[at - direction] - 1.0) < 0.01
+                      and abs(r.tension_kn[at + direction] - (expected + 0.03)) < 0.01)
+        details.append(f"{direction:+d}: anchor {r.tension_kn[at]:.2f}, behind {r.tension_kn[at - direction]:.2f} kN")
+    return _report("long route: a point anchor takes the pull without leaking it behind", all(checks),
+                   "; ".join(details))
+
+
+def test_long_route_hold_spans_dip() -> bool:
+    """A dip just before burial must see the pull even when the analysed scope is long."""
+    x = np.arange(0.0, 45014.0, 1.0)
+    kp = 100.0 + x / 1000.0
+    depth = 100.0 + 2.0 * np.maximum(1.0 - ((x - 40222.0) / 20.0) ** 2, 0.0)
+    sections = [pl.ControlSection(145.013, 145.013, pl.HELD, math.nan, "Anchor"),
+                pl.ControlSection(140.122, 137.572, pl.HELD, 25.0, "Burial")]
+    control = pl.LayControl(pl.TENSION, 1.0, sections, [], -1)
+
+    def run(mask):
+        return pl.run(_inputs(pl.Profile(x[mask], kp[mask], depth[mask]), control, cable=DA,
+                              criteria=pl.Criteria(allowable=False)))
+
+    long = run(np.ones(len(x), dtype=bool))
+    short = run(kp >= 136.0)    # Same dip and pins, but no reduction of the march grid.
+    window = (kp >= 140.14) & (kp <= 140.34)
+    expected_gap = np.interp(kp[window], short.stations.kp_km, short.gap_m)
+    expected_tension = np.interp(kp[window], short.stations.kp_km, short.tension_kn)
+    gap = float(np.max(long.gap_m[window]))
+    # The reduced grid interpolates concentrated crest friction over a few
+    # stations: allow 2% locally in tension, while checking the span geometry.
+    ok = (gap > 1.0 and np.max(np.abs(long.gap_m[window] - expected_gap)) < 0.02
+          and np.allclose(long.tension_kn[window], expected_tension, rtol=0.02, atol=0.01)
+          and any(s.kp_start > 140.122 and s.max_gap_m > 1.0 for s in long.spans))
+    return _report("long scope preserves the span over a dip beside the pin", bool(ok),
+                   f"gap {gap:.3f} m, short scope {float(np.max(expected_gap)):.3f} m")
+
+
 def test_hold_sweep_and_detail() -> bool:
     """Tension sweep and find tension keep the holds; the detail model keeps held nodes on the seabed."""
     rocks = [SeabedFeature(BOULDER, 0.5, 1.0, 2.0), SeabedFeature(BOULDER, 1.75, 1.0, 2.0)]
@@ -731,6 +810,9 @@ def run_all() -> List[bool]:
         test_point_hold_anchor(),
         test_pinned_end_acts_as_anchor(),
         test_descending_anchor_and_burials(),
+        test_long_route_hold_pull_back(),
+        test_long_route_point_anchor(),
+        test_long_route_hold_spans_dip(),
         test_hold_sweep_and_detail(),
         test_hold_with_slack(),
     ]

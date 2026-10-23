@@ -206,8 +206,9 @@ direction. It gives:
   and slack collects below (loop risk).
 - **Crests.** The tension changes by up to `exp(mu dtheta)` over a crest (capstan).
 
-Long routes march on at most 20,000 nodes. The band is integrated exactly between nodes, and the frictionless
-part (`w dy`) is restored between them.
+Long routes march on a reduced grid targeting 20,000 nodes, retaining extra stations on both sides of every
+pinned boundary so the entry pull and the restraint are kept distinct. The band is integrated exactly between
+nodes, and the frictionless part (`w dy`) is restored between them.
 
 **The ends of the profile.** Both ends sit on the seabed (the rest shape is fixed there). The end laid first keeps the
 tension it was laid at, or what a later touchdown pulls it to, as if held by the cable beyond it or an anchor: nothing

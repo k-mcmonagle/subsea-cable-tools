@@ -91,7 +91,8 @@ def friction_band(x_m: np.ndarray, y_m: np.ndarray, w_npm: np.ndarray, mu: np.nd
 
 def lay_history_tension(deposit_n: np.ndarray, lower_n: np.ndarray, upper_n: np.ndarray,
                         gravity_n: Optional[np.ndarray] = None, direction: int = 1,
-                        max_nodes: int = 20000) -> Tuple[np.ndarray, np.ndarray]:
+                        max_nodes: int = 20000,
+                        keep_nodes: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
     """Residual tension (N) after laying in ``direction`` (+1: increasing index).
 
     ``deposit_n`` is the tension at touchdown per station; ``lower_n`` /
@@ -100,9 +101,13 @@ def lay_history_tension(deposit_n: np.ndarray, lower_n: np.ndarray, upper_n: np.
     would need a negative tension to hold the cable (it slides and slack
     collects).
 
-    Long routes march on at most ``max_nodes`` nodes with the band integrated
-    exactly between them; between nodes the frictionless part (``gravity_n``,
-    per segment) is restored, so spans keep ``T - w y`` constant.
+    Long routes march on a reduced grid targeting ``max_nodes``, plus every
+    station marked in the optional boolean mask ``keep_nodes``. Retain both
+    sides of hold boundaries: integrating a gripped segment into the first
+    touchdown of a hold would stop its pull reaching the free cable.
+    The band is integrated exactly between nodes; between them the
+    frictionless part (``gravity_n``, per segment) is restored, so spans keep
+    ``T - w y`` constant.
     """
     td = np.asarray(deposit_n, dtype=float)
     lo = np.asarray(lower_n, dtype=float)
@@ -110,10 +115,14 @@ def lay_history_tension(deposit_n: np.ndarray, lower_n: np.ndarray, upper_n: np.
     n = len(td)
     if n == 0:
         return np.array([]), np.array([], dtype=bool)
+    keep = None if keep_nodes is None else np.asarray(keep_nodes, dtype=bool)
+    if keep is not None and keep.shape != td.shape:
+        raise ValueError("keep_nodes must have one value per station.")
     grav = np.zeros(max(n - 1, 0)) if gravity_n is None else np.asarray(gravity_n, dtype=float)
     td = np.where(np.isfinite(td), td, 0.0)
     if direction < 0:
-        tension, unheld = lay_history_tension(td[::-1], -hi[::-1], -lo[::-1], -grav[::-1], 1, max_nodes)
+        tension, unheld = lay_history_tension(td[::-1], -hi[::-1], -lo[::-1], -grav[::-1], 1, max_nodes,
+                                             None if keep is None else keep[::-1])
         return tension[::-1].copy(), unheld[::-1].copy()
     a_cum = np.concatenate(([0.0], np.cumsum(lo)))
     b_cum = np.concatenate(([0.0], np.cumsum(hi)))
@@ -122,6 +131,8 @@ def lay_history_tension(deposit_n: np.ndarray, lower_n: np.ndarray, upper_n: np.
     nodes = np.arange(0, n, stride)
     if nodes[-1] != n - 1:
         nodes = np.append(nodes, n - 1)
+    if stride > 1 and keep is not None:
+        nodes = np.union1d(nodes, np.flatnonzero(keep))
     ac, bc, tdc = a_cum[nodes], b_cum[nodes], td[nodes]
     k_count = len(nodes)
     t = np.zeros(k_count)

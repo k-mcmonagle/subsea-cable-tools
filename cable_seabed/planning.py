@@ -956,6 +956,15 @@ def solve(st: Stations, control: LayControl, criteria: Criteria, allowable: Opti
     # Residual tension and rest shape, iterated (friction is carried by the shape's reactions).
     # The catenary curvature uses the cable's own slope, from the previous shape.
     grip = gripped_segments(held, control.direction) if any_held else None
+    hold_boundaries = None
+    if any_held:
+        # Keep the first/last held stations and their free neighbours in the
+        # long-route march. Skipping the entry station folds an internal grip
+        # into the entry pull and wrongly isolates the cable laid before it.
+        boundary = held[1:] != held[:-1]
+        hold_boundaries = np.zeros(n, dtype=bool)
+        hold_boundaries[:-1] |= boundary
+        hold_boundaries[1:] |= boundary
     tension = deposit.copy()
     unheld = np.zeros(n, dtype=bool)
     reaction = np.zeros(n)
@@ -974,7 +983,8 @@ def solve(st: Stations, control: LayControl, criteria: Criteria, allowable: Opti
         if grip is not None:
             lower = np.where(grip, gravity - HOLD_GRIP_N, lower)
             upper = np.where(grip, gravity + HOLD_GRIP_N, upper)
-        new, unheld = lay_history_tension(deposit * 1000.0, lower, upper, gravity, control.direction)
+        new, unheld = lay_history_tension(deposit * 1000.0, lower, upper, gravity, control.direction,
+                                         keep_nodes=hold_boundaries)
         new = new / 1000.0
         change = float(np.nanmax(np.abs(new - tension))) if n else 0.0
         turn = float(np.max(np.abs(cable_slope - previous))) if previous is not None else math.inf
