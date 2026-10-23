@@ -64,6 +64,7 @@ except (ImportError, AttributeError):  # pragma: no cover
             return False
 
 from ..plugin_log import log_debug, log_exception, log_info, log_warning
+from ..schema_guard import NewerVersionError
 from ..qgis_compat import (
     GEOMETRY_LINE,
     MESSAGE_BOX_NO,
@@ -204,8 +205,10 @@ class BurialPlannerDock(QDockWidget):
         # (plan file key, plan_id) open when the project was left: reopening
         # the same project selects that plan again.
         self._resume_selection = None
-        # The plan file that last failed to open (warned about once).
+        # The plan file that last failed to open (warned about once), and
+        # whether it failed for being from a newer plugin version.
         self._store_error_path = ""
+        self._store_error_newer = False
         # GUI-thread stall diagnostics (stdlib faulthandler; see watchdog.py).
         self._watchdog = watchdog.StallWatchdog(parent=self)
 
@@ -217,6 +220,7 @@ class BurialPlannerDock(QDockWidget):
         if not self.store_ready:
             self._store_error_path = _path_key(path)
             QMessageBox.warning(None, "Burial Planner",
+                                error if self._store_error_newer else
                                 "Could not open or migrate the Burial Planner "
                                 f"GeoPackage.\n{error}\n\nUse Plan file → Open "
                                 "existing plans to locate the original file.")
@@ -433,6 +437,7 @@ class BurialPlannerDock(QDockWidget):
                                   create_if_missing: bool = True):
         """Open the project store without silently replacing lost plans."""
         self._store_recovery_note = ""
+        self._store_error_newer = False
         try:
             store = BurialStore(path)
             if not create_if_missing and not store.exists():
@@ -441,6 +446,11 @@ class BurialPlannerDock(QDockWidget):
                     "Burial Planner GeoPackage.")
             store.migrate()
             return store, path, None
+        except NewerVersionError as exc:
+            # The file is there and fine, just newer: never swap another
+            # plan file into the (shared) project in its place.
+            self._store_error_newer = True
+            return DetachedStore(path), path, str(exc)
         except Exception as first_error:
             fallback = default_project_gpkg_path()
             same_path = (os.path.normcase(os.path.abspath(fallback)) ==
@@ -2419,6 +2429,7 @@ class BurialPlannerDock(QDockWidget):
                 if error and _path_key(error_path) != self._store_error_path:
                     QMessageBox.warning(
                         self, "Burial Planner",
+                        error if self._store_error_newer else
                         "Could not reopen the saved plan file. Use Plan file "
                         f"→ Open existing plans to locate it.\n\n{error}")
                 self._store_error_path = _path_key(error_path) if error else ""

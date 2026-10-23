@@ -26,6 +26,7 @@ from ..processing.cable_lay_parsers import (
     open_gpkg_layer,
     write_layer_to_gpkg,
 )
+from .. import schema_guard
 from ..plugin_log import log_exception, log_warning
 from ..qgis_compat import WKB_NO_GEOMETRY
 from . import change_log, gpkg_sql, schema
@@ -163,7 +164,14 @@ class BurialStore:
             self.write_meta("created_utc", schema.utc_now_iso())
 
     def migrate(self) -> None:
-        """Upgrade to the current SCHEMA_VERSION step-wise, backup before each."""
+        """Upgrade to the current SCHEMA_VERSION step-wise, backup before each.
+
+        A file from a newer plugin version raises
+        :class:`~..schema_guard.NewerVersionError` before anything is written.
+        """
+        if self.exists():
+            schema_guard.check(self.read_meta(), schema.SCHEMA_VERSION,
+                               f"The plan file {os.path.basename(self.gpkg_path)}")
         self.ensure_created()
         current = int(self.read_meta().get("schema_version", str(schema.SCHEMA_VERSION)))
         while current < schema.SCHEMA_VERSION:

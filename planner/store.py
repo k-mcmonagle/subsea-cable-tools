@@ -13,6 +13,7 @@ from qgis.core import (
     QgsFeature, QgsGeometry, QgsProject, QgsVectorFileWriter, QgsVectorLayer,
 )
 
+from .. import schema_guard
 from ..processing.cable_lay_parsers import fields_from_specs, open_gpkg_layer, write_layer_to_gpkg
 from ..qgis_compat import (
     VECTOR_WRITER_NO_ERROR, VECTOR_WRITER_OVERWRITE_FILE,
@@ -49,8 +50,28 @@ class PlannerStore:
         # uses it to adopt the file into the project on the first save, and to
         # refuse writes once the project has changed.
         self.before_write = None
+        # The file (normalised path) last found writable by this version.
+        self._version_ok = ""
+
+    def newer_version_message(self) -> str:
+        """Why this version must not write the file: '' when it may (see schema_guard)."""
+        key = os.path.normcase(os.path.abspath(self.gpkg_path))
+        if key == self._version_ok or not self.exists():
+            return ""
+        message = schema_guard.newer_version_message(
+            self.read_meta(), schema.SCHEMA_VERSION, f"The planner file {os.path.basename(self.gpkg_path)}")
+        if not message:
+            self._version_ok = key
+        return message
+
+    def _refuse_newer(self) -> None:
+        message = self.newer_version_message()
+        if message:
+            raise schema_guard.NewerVersionError(message)
 
     def _will_write(self) -> None:
+        # Every write rewrites whole tables with this version's columns.
+        self._refuse_newer()
         if self.before_write is not None:
             self.before_write()
 
@@ -74,6 +95,7 @@ class PlannerStore:
             self.write_meta("created_utc", schema.utc_now_iso())
 
     def migrate(self) -> None:
+        self._refuse_newer()
         self.ensure_created()
         current = int(self.read_meta().get("schema_version", schema.SCHEMA_VERSION))
         while current < schema.SCHEMA_VERSION:

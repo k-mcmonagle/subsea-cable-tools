@@ -57,7 +57,7 @@ from qgis.PyQt.QtWidgets import QMenu
 
 from ..maptools.canvas_items import remove_canvas_item
 from ..qgis_compat import FEATURE_REQUEST_NO_GEOMETRY, GEOMETRY_LINE, GEOMETRY_POINT, qt_exec
-from .store import attachments_dir_for
+from .store import attachments_dir_for, is_register
 
 LAYER_PROP = "subsea_cable_tools/route_comments"          # "points" | "ranges"
 LABELS_PROP = "subsea_cable_tools/route_comments_labels"   # LabelSettings JSON
@@ -496,6 +496,16 @@ class CommentLayers:
 
     def layers(self) -> List[QgsVectorLayer]:
         return [layer for layer in (self.find("points"), self.find("ranges")) if layer is not None]
+
+    def register_path(self) -> str:
+        """The register the comment layers read, as QGIS resolved it against
+        the project ('' when none): found where another user's saved path
+        (drive letter, share name) is not."""
+        for layer in self.layers():
+            path = layer.source().split("|", 1)[0]
+            if is_register(path):
+                return path
+        return ""
 
     def _group(self):
         root = self.project.layerTreeRoot()

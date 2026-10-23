@@ -59,6 +59,9 @@ ACTION_ADD_HAZARD = "add_hazard"
 ACTION_EDIT_HAZARD = "edit_hazard"
 ACTION_DELETE_HAZARD = "delete_hazard"
 
+# Payload keys that are not tables (a rollback records what it undid).
+_BOOKKEEPING_KEYS = {"undone_change_ids"}
+
 TableRows = Dict[str, List[Dict]]
 
 
@@ -177,7 +180,9 @@ def rollback_operations(entries: List[Dict], target_change_id: str
 
     ``entries`` is the plan's full log. Returns (ops, undone_entries) with
     entries inverted newest-first down to and including the target. Raises
-    ValueError if the target is not in the log.
+    ValueError if the target is not in the log, or if an entry to undo also
+    changed a table this version does not know (a newer version's): undoing
+    only part of it would be recorded as undoing all of it.
     """
     ordered = sorted(entries, key=lambda e: int(e.get("seq") or 0))
     try:
@@ -186,6 +191,14 @@ def rollback_operations(entries: List[Dict], target_change_id: str
     except StopIteration:
         raise ValueError("Change-log entry not found.")
     undone = list(reversed(ordered[target_index:]))
+    unknown = sorted({table for entry in undone
+                      for payload in (entry.get("before_json"), entry.get("after_json"))
+                      for table in _load(payload or "")
+                      if table not in schema.TABLE_KEYS and table not in _BOOKKEEPING_KEYS})
+    if unknown:
+        raise ValueError("This change cannot be undone by this version of Subsea Cable Tools: it also "
+                         f"changed data that a newer version keeps ({', '.join(unknown)}). Update the "
+                         "plugin to undo it.")
     ops: List[Tuple[str, str, object]] = []
     for entry in undone:
         ops.extend(invert_entry(entry))

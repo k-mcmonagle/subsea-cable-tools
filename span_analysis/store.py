@@ -27,6 +27,7 @@ from typing import Dict, List, Optional, Sequence
 
 from qgis.core import QgsProject
 
+from .. import schema_guard
 from ..burial import gpkg_sql
 from ..processing.cable_lay_parsers import WKT_KEY, fields_from_specs, write_layer_to_gpkg
 from ..qgis_compat import WKB_LINESTRING, WKB_NO_GEOMETRY
@@ -84,6 +85,11 @@ class SpanStore:
         return os.path.exists(self.gpkg_path) and gpkg_sql.has_table(self.gpkg_path, TABLE_META)
 
     def ensure_created(self) -> None:
+        """Create what is missing (every open goes through here); a file from a
+        newer plugin version raises :class:`NewerVersionError` untouched."""
+        if self.exists():
+            schema_guard.check(self.read_meta(), SCHEMA_VERSION,
+                               f"The Span Analysis file {os.path.basename(self.gpkg_path)}")
         folder = os.path.dirname(os.path.abspath(self.gpkg_path))
         if folder and not os.path.isdir(folder):
             os.makedirs(folder)

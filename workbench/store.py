@@ -42,6 +42,7 @@ from qgis.core import (
     QgsVectorLayer,
 )
 
+from .. import schema_guard
 from ..burial import gpkg_sql
 from ..plugin_log import log_exception, log_warning
 from ..processing.cable_lay_parsers import (
@@ -78,6 +79,10 @@ class WorkbenchStoreError(RuntimeError):
     """A registry write failed and was rolled back; the file is unchanged."""
 
 
+class WorkbenchNewerError(WorkbenchStoreError, schema_guard.NewerVersionError):
+    """The registry was written by a newer plugin version: nothing is written to it."""
+
+
 def project_gpkg_path(project: Optional[QgsProject] = None) -> Optional[str]:
     """Workbench GeoPackage path stored in the QGIS project, if any."""
     project = project or QgsProject.instance()
@@ -112,6 +117,8 @@ class WorkbenchStore:
         # Tables whose live columns already cover the current schema.
         self._columns_synced: set = set()
         self._registry_ready = False
+        # The file (normalised path) last found writable by this version.
+        self._version_ok = ""
         # Called with this store after every committed write transaction
         # (None: nothing). The Workbench dock uses it to record the registry
         # in the QGIS project on the first real write, never on a read.
@@ -123,10 +130,27 @@ class WorkbenchStore:
         self._table_exists_cache.clear()
         self._columns_synced.clear()
         self._registry_ready = False
+        self._version_ok = ""
 
     # -- lifecycle ----------------------------------------------------------
     def exists(self) -> bool:
         return os.path.exists(self.gpkg_path) and self._table_exists(schema.TABLE_META)
+
+    def newer_version_message(self) -> str:
+        """Why this version must not write the registry: '' when it may (see schema_guard)."""
+        key = os.path.normcase(os.path.abspath(self.gpkg_path))
+        if key == self._version_ok or not self.exists():
+            return ""
+        message = schema_guard.newer_version_message(
+            self.read_meta(), schema.SCHEMA_VERSION, f"The Workbench file {os.path.basename(self.gpkg_path)}")
+        if not message:
+            self._version_ok = key
+        return message
+
+    def _refuse_newer(self) -> None:
+        message = self.newer_version_message()
+        if message:
+            raise WorkbenchNewerError(message)
 
     def ensure_created(self) -> None:
         """Create any missing registry tables (idempotent)."""
@@ -146,8 +170,11 @@ class WorkbenchStore:
         schema (so a pre-v2 gpkg gains the new registry tables), then each
         registered migrator runs in order, backing the file up before every
         step. A step and its ``schema_version`` stamp commit together, so an
-        interrupted migration resumes at the step that failed.
+        interrupted migration resumes at the step that failed. A registry
+        from a newer plugin version raises :class:`WorkbenchNewerError`
+        before anything is written.
         """
+        self._refuse_newer()
         self.ensure_created()
         current = int(self.read_meta().get("schema_version", str(schema.SCHEMA_VERSION)))
         while current < schema.SCHEMA_VERSION:
@@ -229,6 +256,7 @@ class WorkbenchStore:
         if self._tx_conn is not None:
             yield
             return
+        self._refuse_newer()
         if create_missing:
             self._create_missing_tables()
         try:

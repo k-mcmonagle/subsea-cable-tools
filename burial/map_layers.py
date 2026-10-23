@@ -1129,6 +1129,14 @@ def _prune_empty_plan_group(project: QgsProject, plan: Dict) -> None:
 _STYLE_VERSION = "1"
 _STYLE_VERSION_PROPERTY = "bp_style_version"
 
+
+def _style_outdated(layer) -> bool:
+    """The layer's style predates this version's (or carries none)."""
+    try:
+        return int(str(layer.customProperty(_STYLE_VERSION_PROPERTY, "") or 0)) < int(_STYLE_VERSION)
+    except ValueError:
+        return True
+
 # (normalised gpkg path, layer name) -> map layer id. Avoids scanning every
 # project layer three times per refresh.
 _layer_id_cache: Dict[Tuple[str, str], str] = {}
@@ -1197,9 +1205,10 @@ def _ensure_layer(project: QgsProject, gpkg_path: str, layer_name: str,
         # Tool-owned presentation layers: reapply the style only when the
         # styling code changed (or the field map was rebuilt), so style
         # fixes still reach layers saved in old projects without paying a
-        # renderer + labelling rebuild and repaint per edit.
-        if fields_stale or str(existing.customProperty(
-                _STYLE_VERSION_PROPERTY, "")) != _STYLE_VERSION:
+        # renderer + labelling rebuild and repaint per edit. A newer plugin
+        # version's style is left alone (no restyling back and forth when
+        # users of two versions share the project).
+        if fields_stale or _style_outdated(existing):
             style_fn(existing)
             existing.setCustomProperty(_STYLE_VERSION_PROPERTY,
                                        _STYLE_VERSION)

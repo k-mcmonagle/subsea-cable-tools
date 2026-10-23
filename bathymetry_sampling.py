@@ -12,7 +12,7 @@ from collections import OrderedDict
 from qgis.core import QgsPointXY, QgsRasterLayer, QgsProject, QgsRectangle, QgsUnitTypes
 from qgis.PyQt import sip
 from .kp_range_utils import make_distance_area
-from .plugin_log import log_debug, log_exception, log_info
+from .plugin_log import log_debug, log_exception, log_info, log_warning
 from .slope_utils import is_finite
 from .qgis_compat import DISTANCE_METERS
 
@@ -63,11 +63,33 @@ def layer_options(layer):
              ('sampling', 'bilinear'), ('native_cell_m', 0.0)]}
 
 
+UNIT_FACTORS = {'m': 1.0, 'ft': 0.3048}
+VERTICALS = ('auto', 'depth', 'elevation')
+_unknown_logged = set()
+
+
+def _unknown_convention(key, value):
+    """A unit or vertical convention set by a newer plugin version: logged
+    once, and its values read as no data rather than as wrong depths."""
+    if (key, value) not in _unknown_logged:
+        _unknown_logged.add((key, value))
+        log_warning('Bathymetry sampling: %s %r is not known to this plugin version (set by a newer one?); '
+                 'its values are left out. Update the plugin, or set the layer\'s conventions again.'
+                 % (key, value))
+    return None
+
+
 def normalise_depth(value, options):
     if not is_finite(value):
         return None
-    v = float(value) * {'m': 1.0, 'ft': 0.3048}.get(options.get('units'), 1.0)
-    convention = options.get('vertical', 'auto')
+    units = options.get('units') or 'm'
+    factor = UNIT_FACTORS.get(units)
+    if factor is None:
+        return _unknown_convention('Z unit', units)
+    v = float(value) * factor
+    convention = options.get('vertical') or 'auto'
+    if convention not in VERTICALS:
+        return _unknown_convention('vertical convention', convention)
     if convention == 'auto':
         # Infer once per source, never fold every individual value with abs().
         convention = options.setdefault('_inferred_vertical', 'elevation' if v < 0 else 'depth')
@@ -101,6 +123,27 @@ def metres_per_unit(crs):
     return QgsUnitTypes.fromUnitToUnitFactor(crs.mapUnits(), DISTANCE_METERS)
 
 
+MANIFEST_VERSION = 2   # the .sources.json format Merge MBES Rasters writes
+
+
+def _manifest_sources(data, manifest):
+    """The source records of a mosaic's manifest; ValueError (which the
+    profile tools report) when it is unreadable or from a newer version."""
+    try:
+        version = int(data.get('version') or MANIFEST_VERSION)
+        records = list(data['sources'])
+        readable = all(isinstance(r, dict) and r.get('path') and isinstance(r.get('options', {}), dict)
+                       for r in records)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        readable = False
+    if not readable:
+        raise ValueError('Unreadable MBES source manifest: ' + manifest)
+    if version > MANIFEST_VERSION:
+        raise ValueError('The MBES source manifest %s was written by a newer version of Subsea Cable '
+                         'Tools; update the plugin to sample this mosaic.' % manifest)
+    return records
+
+
 def expand_rasters(layers, seen=None, transform_context=None):
     """New mosaics carry a sidecar; engineering reads their native sources.
 
@@ -120,7 +163,7 @@ def expand_rasters(layers, seen=None, transform_context=None):
         if canonical in seen:
             raise ValueError('Circular MBES source manifest: ' + path)
         with open(manifest, encoding='utf-8') as stream:
-            records = json.load(stream)['sources']
+            records = _manifest_sources(json.load(stream), manifest)
         children = []
         overrides = {key[len(PREFIX):]: layer.customProperty(key)
                      for key in layer.customPropertyKeys() if key.startswith(PREFIX)}
@@ -494,6 +537,9 @@ def configure_layers(parent, layers=None):
             combo = QComboBox()
             for label, value in entries:
                 combo.addItem(label, value)
+            if opts[key] and combo.findData(opts[key]) < 0:
+                # Set by a newer plugin version: kept unless changed here.
+                combo.addItem('%s (newer plugin version)' % opts[key], opts[key])
             combo.setCurrentIndex(max(0, combo.findData(opts[key])))
             table.setCellWidget(row, col, combo)
         table.setItem(row, 3, QTableWidgetItem(str(opts['datum'])))

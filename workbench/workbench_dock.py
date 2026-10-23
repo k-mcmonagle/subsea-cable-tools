@@ -46,7 +46,7 @@ from .assessment_panel import AssessmentPanel
 from .overview_panels import SegmentOverviewPanel, SystemOverviewPanel
 from .rpl_manager_dock import RplManagerPanel
 from . import schema
-from .store import WorkbenchStore
+from .store import WorkbenchNewerError, WorkbenchStore
 
 KIND_ASSEMBLY = "assembly"
 KIND_RPL = "rpl"
@@ -77,6 +77,7 @@ class WorkbenchDock(QDockWidget):
         self._teardown_muted = False
         self._pending_removed_workbench_layers = set()
         self._migrated_store_path = ""
+        self._newer_store_warned = ""   # registry from a newer plugin version, said once
         self._compare_dialogs = set()   # open RplCompareDialogs (kept alive)
         self.setObjectName("CableRouteWorkbenchDock")
         self.setAllowedAreas(
@@ -509,10 +510,16 @@ class WorkbenchDock(QDockWidget):
 
                 # Housekeeping, not the user's work: it must not record the
                 # registry in a project that only lists it.
-                with store.quiet_commits():
-                    store.migrate()
-                    assign_system_ids(store)
-                self._migrated_store_path = path
+                try:
+                    with store.quiet_commits():
+                        store.migrate()
+                        assign_system_ids(store)
+                    self._migrated_store_path = path
+                except WorkbenchNewerError as exc:
+                    # Listed but never written (the store refuses writes).
+                    if path != self._newer_store_warned:
+                        self._newer_store_warned = path
+                        QMessageBox.warning(self, "Cable Route Workbench", str(exc))
         self._share_store(store)
         return store
 
@@ -672,9 +679,10 @@ class WorkbenchDock(QDockWidget):
             store.clear_cache()
             from .rpl_summary import invalidate_rpl_summary
             invalidate_rpl_summary()
-            from .system_topology import assign_system_ids
-            with store.quiet_commits():
-                assign_system_ids(store)
+            if not store.newer_version_message():
+                from .system_topology import assign_system_ids
+                with store.quiet_commits():
+                    assign_system_ids(store)
         rpl_rows = store.list_rpls() if store is not None and store.exists() else []
         self._update_store_label(store, len(rpl_rows))
         assemblies = {}

@@ -95,6 +95,15 @@ def format_scope(ranges: List[Dict]) -> str:
                      for r in ranges or [] if "start_kp" in r and "end_kp" in r)
 
 
+def _select_text(combo: QComboBox, value, default: str) -> None:
+    """Select ``value``, listing it first when this version does not offer it:
+    a newer version's choice is kept on OK, never silently replaced."""
+    text = str(value) if value not in (None, "") else default
+    if combo.findText(text) < 0:
+        combo.addItem(text)
+    combo.setCurrentText(text)
+
+
 class RuleEditorDialog(QDialog):
     """Edit one rule. Kind is fixed at creation; complexity comes from stacking."""
 
@@ -105,6 +114,8 @@ class RuleEditorDialog(QDialog):
         self.setWindowTitle(f"Rule — {schema_kind_label(self.rule.get('kind'))}")
         self.setMinimumWidth(420)
         config = _load_json(self.rule.get("config_json"), {})
+        # Settings the form does not show (a newer version's) are kept on OK.
+        self._stored_config = dict(config) if isinstance(config, dict) else {}
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -116,7 +127,7 @@ class RuleEditorDialog(QDialog):
         self.action_combo = QComboBox()
         self.action_combo.addItems([schema.RULE_ACTION_EXCLUDE, schema.RULE_ACTION_RISK,
                                     schema.RULE_ACTION_ALLOW])
-        self.action_combo.setCurrentText(self.rule.get("action") or schema.RULE_ACTION_EXCLUDE)
+        _select_text(self.action_combo, self.rule.get("action"), schema.RULE_ACTION_EXCLUDE)
         self.action_combo.currentTextChanged.connect(self._sync_risk)
         form.addRow("Action", self.action_combo)
 
@@ -166,10 +177,10 @@ class RuleEditorDialog(QDialog):
         if kind == schema.RULE_KIND_THRESHOLD:
             self.profile_combo = QComboBox()
             self.profile_combo.addItems(["depth", "slope"])
-            self.profile_combo.setCurrentText(config.get("profile", "depth"))
+            _select_text(self.profile_combo, config.get("profile"), "depth")
             self.op_combo = QComboBox()
             self.op_combo.addItems([">", ">=", "<", "<=", "between"])
-            self.op_combo.setCurrentText(config.get("op", ">"))
+            _select_text(self.op_combo, config.get("op"), ">")
             self.value_spin = QDoubleSpinBox()
             self.value_spin.setRange(-12000.0, 12000.0)
             self.value_spin.setDecimals(2)
@@ -191,7 +202,7 @@ class RuleEditorDialog(QDialog):
             self.dist_spin.setValue(float(config.get("distance_m", 250.0)))
             self.mode_combo = QComboBox()
             self.mode_combo.addItems(["distance", "intersect"])
-            self.mode_combo.setCurrentText(config.get("mode", "distance"))
+            _select_text(self.mode_combo, config.get("mode"), "distance")
             self.filter_edit = QLineEdit(config.get("filter_expression", ""))
             self.kind_form.addRow("Hazard layer", self.layer_combo)
             self.kind_form.addRow("Distance (m)", self.dist_spin)
@@ -233,43 +244,44 @@ class RuleEditorDialog(QDialog):
 
     def result(self) -> Dict:
         kind = self.rule.get("kind")
-        config: Dict = {}
+        config: Dict = dict(self._stored_config)
+        config.pop("scope_ranges", None)
         if kind == schema.RULE_KIND_THRESHOLD:
-            config = {
+            config.update({
                 "profile": self.profile_combo.currentText(),
                 "op": self.op_combo.currentText(),
                 "value": self.value_spin.value(),
                 "value2": self.value2_spin.value() if self.op_combo.currentText() == "between" else None,
                 "abs": False,
-            }
+            })
         elif kind == schema.RULE_KIND_PROXIMITY:
             layer = self.layer_combo.currentLayer()
-            config = {
+            config.update({
                 "layer_id": layer.id() if layer else "",
                 "layer_source": layer.source() if layer else "",
                 "distance_m": self.dist_spin.value(),
                 "mode": self.mode_combo.currentText(),
                 "filter_expression": self.filter_edit.text().strip(),
-            }
+            })
         elif kind == schema.RULE_KIND_POLYGON:
             layer = self.layer_combo.currentLayer()
-            config = {
+            config.update({
                 "layer_id": layer.id() if layer else "",
                 "layer_source": layer.source() if layer else "",
                 "attribute": self.field_combo.currentField(),
                 "match_values": [v.strip() for v in self.values_edit.text().split(",") if v.strip()],
-            }
+            })
         elif kind == schema.RULE_KIND_KP_TABLE:
             layer = self.layer_combo.currentLayer()
-            config = {
+            config.update({
                 "layer_id": layer.id() if layer else "",
                 "layer_source": layer.source() if layer else "",
                 "start_field": self.start_field.currentField(),
                 "end_field": self.end_field.currentField(),
                 "filter_expression": self.filter_edit.text().strip(),
-            }
+            })
         elif kind == schema.RULE_KIND_MANUAL:
-            config = {"ranges": parse_scope(self.ranges_edit.text())}
+            config["ranges"] = parse_scope(self.ranges_edit.text())
 
         scope = parse_scope(self.scope_edit.text())
         if scope:

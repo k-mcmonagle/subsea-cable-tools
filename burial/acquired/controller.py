@@ -44,6 +44,7 @@ class AcquiredController(QObject):
         self.store: Optional[AcquiredStore] = None
         self.path: Optional[str] = None
         self.state = location.STATE_NONE
+        self.error = ""   # why the project's data file did not open (shown in the tab)
         self._task: Optional[WorkTask] = None
         self._generation = 0
         self._stage = ""
@@ -53,12 +54,12 @@ class AcquiredController(QObject):
         """Open the current project's data file, if it names one (creates nothing)."""
         self._release()
         path, state = location.resolve()
-        self.path, self.state = path, state
+        self.path, self.state, self.error = path, state, ""
         if state == location.STATE_OK:
             try:
                 self.store = AcquiredStore(path).open()
             except AcquiredStoreError as exc:
-                self.state = location.STATE_INVALID
+                self.state, self.error = location.STATE_INVALID, str(exc)
                 log_exception(f"Burial Planner: burial data file not opened: {exc}")
         self.changed.emit()
 
@@ -67,7 +68,7 @@ class AcquiredController(QObject):
         self.cancel()
         self._generation += 1
         self._release()
-        self.path, self.state = None, location.STATE_NONE
+        self.path, self.state, self.error = None, location.STATE_NONE, ""
         self.changed.emit()
 
     def _release(self) -> None:

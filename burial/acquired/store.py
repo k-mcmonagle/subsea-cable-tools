@@ -50,6 +50,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from ... import schema_guard
 from .. import gpkg_sql
 from ..change_log import current_user
 from ...workbench.schema import new_id, utc_now_iso
@@ -649,12 +650,11 @@ class AcquiredStore(_Reads):
             with gpkg_sql.transaction(conn):
                 _create_tables(conn)
                 meta = {r["key"]: r["value"] for r in conn.execute(f"SELECT key, value FROM {T_META}")}
-                version = int(meta.get("schema_version") or 0)
-                if version > SCHEMA_VERSION:
-                    raise AcquiredStoreError(
-                        f"{os.path.basename(self.path)} was written by a newer version of the plugin "
-                        f"(schema {version}); update the plugin to open it.")
-                if not version:
+                newer = schema_guard.newer_version_message(
+                    meta, SCHEMA_VERSION, f"The burial data file {os.path.basename(self.path)}")
+                if newer:
+                    raise AcquiredStoreError(newer)
+                if not meta.get("schema_version"):
                     self._set_meta(conn, "schema_version", str(SCHEMA_VERSION))
                     self._set_meta(conn, "created_utc", utc_now_iso())
         except sqlite3.Error as exc:

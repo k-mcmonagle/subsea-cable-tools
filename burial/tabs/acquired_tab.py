@@ -15,6 +15,7 @@ The tab reads nothing while a background task writes the file.
 
 from __future__ import annotations
 
+import html
 import os
 from typing import Dict, List, Optional
 
@@ -204,8 +205,8 @@ class AcquiredDataTab(QWidget):
             self.file_label.setText(f"<span style='{status_style('error')}'>The project's burial data file is "
                                     f"missing: {controller.path}</span> Use Data file ▾ to find it.")
         elif controller.state == location.STATE_INVALID:
-            self.file_label.setText(f"<span style='{status_style('error')}'>{controller.path} is not a burial "
-                                    "data file.</span>")
+            why = controller.error or f"{controller.path} is not a burial data file."
+            self.file_label.setText(f"<span style='{status_style('error')}'>{html.escape(why)}</span>")
         else:
             try:
                 where = controller.default_path()

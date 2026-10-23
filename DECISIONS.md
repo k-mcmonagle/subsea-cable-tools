@@ -1138,3 +1138,47 @@ Assessment behaviour untouched (test_rules_engine / test_rules_inputs). The inte
   hidden under the new short line. Layers keep their steps until *Restore
   Defaults* in *Label contents…* is used, because the style is never
   rewritten silently.
+
+## Files from a newer plugin version (October 2026)
+
+- **A file stamped with a newer schema is refused, untouched.** A team can
+  share one project while its members run different plugin versions. Before
+  this release no store compared its file's `schema_version` with its own,
+  so an older version wrote into a newer file. The Planner rewrites whole
+  tables with its own columns, and the other stores rebuild rows and JSON
+  from the keys they know, so the newer version's data was lost and the
+  stamp still claimed it was there. The Burial Planner, Planner, Workbench,
+  Route Comments, Span & Slack and burial data stores now refuse such a file
+  when it is opened, before any table, column, backup or stamp is written
+  (`schema_guard`). The message names the file and asks for the plugin
+  update, and the rest of the project keeps working. The Planner and
+  Workbench also refuse every write to it. The Burial Planner and Planner
+  never fall back to another file or offer to move it. Released versions up
+  to 1.9.0 have no such check, so teams should upgrade together.
+- **Bump the schema when an older version would mishandle the change.**
+  Examples: rewrites that would drop new data, a kind, mode or unit the
+  older code would read as something else, or rows that must stay
+  consistent. When older versions keep the change intact (a nullable
+  column they carry through, a rule kind they skip with a warning), the
+  newer version can write `min_compatible_version`. That key is the oldest
+  schema that may still open the file, and older versions then keep
+  working with it.
+- **Shared project state survives a user who cannot use it.** Route Comments
+  takes its map layers out of the project only when the user hides them,
+  closes the register or deletes its last set. Before, a colleague whose
+  share is mapped to another drive letter, who has no access, who runs an
+  older version or who keeps the map off removed them on open, along with
+  their style. The saved register path is absolute; when it does not resolve,
+  the register is opened through the comment layer's own source, which QGIS
+  resolves against the project.
+- **Values a version does not know are kept or left out, never replaced.**
+  - A Cable Library save keeps columns it does not know, matched by type
+    name.
+  - The bathymetry conventions dialog lists a newer value instead of
+    resetting it to the first choice. Sampling reads an unknown unit or
+    vertical convention as no data, not as metres or depth, and a newer
+    mosaic manifest is an error.
+  - The Workbench rule editor keeps settings and choices it does not show.
+  - Burial plan layers are restyled only when their style is older.
+  - A rollback over a change that also touched a table this version does
+    not know is refused, instead of half done and recorded as complete.

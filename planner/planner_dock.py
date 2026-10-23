@@ -27,6 +27,7 @@ from qgis.core import (
 from qgis.gui import QgsMapLayerComboBox
 
 from ..plugin_log import log_exception
+from ..schema_guard import NewerVersionError
 from ..qgis_compat import (
     BUTTON_BOX_CANCEL, BUTTON_BOX_OK, DIALOG_ACCEPTED, ITEM_DATA_USER_ROLE,
     ITEM_FLAG_EDITABLE,
@@ -214,7 +215,7 @@ class PlannerDock(QDockWidget):
             self.store_ready = not error
             if error:
                 QMessageBox.warning(
-                    None, "Planner",
+                    None, "Planner", store.newer_version_message() or
                     "Could not open or migrate the planner GeoPackage:\n%s\n\n%s\n\n"
                     "Check the file is writable (not locked by another program or "
                     "cloud sync) and reopen the Planner." % (path, error))
@@ -262,6 +263,8 @@ class PlannerDock(QDockWidget):
         """
         if self._project_stale or self.store is None:
             return False
+        if self.store.newer_version_message():
+            return False  # from a newer plugin version: said once when opened
         if self._adopted:
             return True
         try:
@@ -344,6 +347,9 @@ class PlannerDock(QDockWidget):
             store = PlannerStore(path)
             store.migrate()
             return store, path, ""
+        except NewerVersionError as exc:
+            # The file is fine, just newer: no other location is offered.
+            return PlannerStore(path), path, str(exc)
         except Exception as exc:
             log_exception(f"Planner: could not open or migrate {path}")
             error = str(exc)
@@ -638,6 +644,9 @@ class PlannerDock(QDockWidget):
         """Run a store write, reporting failures instead of raising into a slot."""
         try:
             result = func(*args, **kwargs)
+        except NewerVersionError as exc:
+            QMessageBox.warning(self, "Planner", str(exc))
+            return False, None
         except Exception as exc:
             self.store_ready = False
             QMessageBox.warning(

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import hashlib
+import html
 import json
 import os
 from typing import Callable, Dict, List, Optional
@@ -601,18 +602,24 @@ class RouteCommentsDock(QDockWidget):
         self._dirty = False
         self.checker.clear()
         self.thumb_cache.clear()
+        if path and not is_register(path):
+            path = self.layers.register_path() or path
+        problem = ""
         if path and is_register(path):
             try:
                 self._use_store(CommentStore(path).open(), set_id)
                 return
-            except CommentStoreError:
+            except CommentStoreError as exc:
                 log_exception("Route Comments: the project's comment register could not be opened")
+                problem = str(exc)
         if self.store is not None:
             self.store.close()
         self.store = None
         self._reload_sets()
-        if path:
-            self._show_banner(f"This project's comment register was not found: {path}. "
+        if problem:
+            self._show_banner(html.escape(problem))
+        elif path:
+            self._show_banner(f"This project's comment register was not found: {html.escape(path)}. "
                               "<a href='open'>Open register…</a> (the comment layers will be pointed at it)")
 
     def ensure_register(self) -> bool:
@@ -732,6 +739,8 @@ class RouteCommentsDock(QDockWidget):
             return
         self.set_row = None
         self._reload_sets()
+        if self.set_row is None:   # that was the last set: nothing left to show
+            self._refresh_map(remove=True)
 
     def edit_fields(self) -> None:
         if self.set_row is None:
@@ -793,10 +802,19 @@ class RouteCommentsDock(QDockWidget):
         self._message(f"Route references checked: {attention} comment(s) need attention." if attention else
                       "Route references checked: all unchanged.")
 
-    def _refresh_map(self) -> None:
+    def _refresh_map(self, remove: bool = False) -> None:
+        """Show the current set on the map.
+
+        The comment layers belong to the (often shared) project, so they are
+        taken out only when ``remove`` (the user hid them or deleted the
+        last set), never because this user keeps the map off, has no
+        register open or cannot reach it (another drive mapping, no access,
+        a newer plugin version's register).
+        """
         if not self.act_show_map.isChecked() or self.set_row is None or self.store is None:
             self._disconnect_layers()
-            self.layers.remove()
+            if remove:
+                self.layers.remove()
             if self.highlight:
                 self.highlight.clear()
             return
@@ -827,7 +845,7 @@ class RouteCommentsDock(QDockWidget):
 
     def _toggle_map(self, on: bool) -> None:
         QSettings().setValue(f"{SETTINGS}/show_map", bool(on))
-        self._refresh_map()
+        self._refresh_map(remove=not on)
 
     def _toggle_labels(self, on: bool) -> None:
         QSettings().setValue(f"{SETTINGS}/labels", bool(on))
@@ -1821,9 +1839,9 @@ class RouteCommentsDock(QDockWidget):
             self.show()
 
     # ------------------------------------------------------------------ misc
-    def _show_banner(self, html: str) -> None:
-        self.banner.setText(html)
-        self.banner.setVisible(bool(html))
+    def _show_banner(self, markup: str) -> None:
+        self.banner.setText(markup)
+        self.banner.setVisible(bool(markup))
 
     def _banner_link(self, link: str) -> None:
         if link == "new":

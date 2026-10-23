@@ -291,6 +291,8 @@ def write_rows(path: str, rows: Sequence[Dict], expected: Optional[str] = None) 
 
     With ``expected`` (the :func:`fingerprint` of the rows as read), raises
     :class:`ChangedElsewhere` instead of overwriting someone else's edits.
+    Columns this version does not know (added by a newer one) keep their
+    values, matched by type name; a renamed type loses them.
     """
     rows = [clean_row(row) for row in rows]
     problems = validate(rows)
@@ -307,11 +309,20 @@ def write_rows(path: str, rows: Sequence[Dict], expected: Optional[str] = None) 
                 if column.name not in present:
                     kind = "REAL" if column.kind == "float" else "TEXT"
                     conn.execute(f'ALTER TABLE "{TABLE}" ADD COLUMN "{column.name}" {kind}')
+            extra = [name for name in present if name not in COLUMN_NAMES and name.lower() != "fid"]
+            kept: Dict[str, tuple] = {}
+            if extra:
+                quoted = ", ".join(f'"{name}"' for name in ["name"] + extra)
+                for values in conn.execute(f'SELECT {quoted} FROM "{TABLE}"'):
+                    kept.setdefault(str(values[0] or "").strip().lower(), tuple(values[1:]))
             conn.execute(f'DELETE FROM "{TABLE}"')
-            placeholders = ", ".join("?" for _ in COLUMN_NAMES)
-            names = ", ".join(f'"{name}"' for name in COLUMN_NAMES)
+            written = COLUMN_NAMES + extra
+            placeholders = ", ".join("?" for _ in written)
+            names = ", ".join(f'"{name}"' for name in written)
+            blank = (None,) * len(extra)
             conn.executemany(f'INSERT INTO "{TABLE}" ({names}) VALUES ({placeholders})',
-                             [[row.get(name) for name in COLUMN_NAMES] for row in rows])
+                             [[row.get(name) for name in COLUMN_NAMES]
+                              + list(kept.get(row["name"].lower(), blank)) for row in rows])
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +349,9 @@ def project_mapping() -> Dict[str, str]:
         data = json.loads(raw or "{}")
     except (TypeError, ValueError):
         return {}
-    return {type_token(k): str(v) for k, v in data.items() if type_token(k) and v}
+    if not isinstance(data, dict):  # not this version's format: no mapping rather than an error
+        return {}
+    return {type_token(k): v for k, v in data.items() if type_token(k) and v and isinstance(v, str)}
 
 
 def set_project_mapping(mapping: Dict[str, str]) -> None:

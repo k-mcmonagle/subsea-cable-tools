@@ -173,11 +173,11 @@ class MergeMBESRastersAlgorithm(SubseaCableAlgorithm):
             os.remove(vrt_path)
         except OSError:
             pass
-        from ..bathymetry_sampling import layer_options, expand_rasters
+        from ..bathymetry_sampling import MANIFEST_VERSION, layer_options, expand_rasters
         native = expand_rasters(raster_layers)
         manifest_path = str(result2['OUTPUT']) + '.sources.json'
         with open(manifest_path, 'w', encoding='utf-8') as stream:
-            json.dump({'version': 2, 'analysis_priority': 'finest native first',
+            json.dump({'version': MANIFEST_VERSION, 'analysis_priority': 'finest native first',
                        'sources': [{'path': os.path.abspath(layer.source().split('|')[0]),
                                     'name': layer.name(), 'options': layer_options(layer)}
                                    for layer in native]}, stream, indent=2)

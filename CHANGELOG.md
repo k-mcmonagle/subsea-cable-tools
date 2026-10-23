@@ -111,6 +111,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Import MDB:** *Source CRS* is now optional and only fills in where detection fails; choose *Use the Source CRS: Always* to override the file. Existing models that set it now keep the file's own CRS when it can be read, with a warning naming any disagreement.
 - **Import MDB / Import Path File (.pthmdb):** a layer whose extent cannot fit its CRS (degrees labelled as metres, or the reverse) is reported after import. Path files also recognise WGS84 UTM storage and are all checked before any layer is created.
 - **Compare Design vs As-Laid Routes:** events are now paired by exact name, similar name or same type nearby, in route order (exact-names-only is still an option), with event-type and text filters, an optional as-laid KP field, a target radius and an optional HTML report. New output fields are appended; existing fields are unchanged.
+- **Mixed plugin versions (Burial Planner, Planner, Cable Route Workbench, Route Comments, Span & Slack Analysis, burial data files):** a file saved by a newer version of the plugin is now refused with a message asking for the update, and left untouched, instead of being written to and losing what the newer version added. Versions up to 1.9.0 cannot tell, so upgrade everyone who shares a project together.
 
 ### Deprecated
 
@@ -169,6 +170,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Planner:** ending a sketch restores the current project's snapping settings, not those of the project open when the sketch began (which could crash QGIS 4).
 - **Cable Lay Data Explorer — Lay Assessment:** the cable-type mapping follows the open project; the previous project's mapping was used, and could be written into the new project.
 - **Burial Planner:** opening a moved project with the window open no longer adds every plan layer a second time.
+- **Route Comments:** opening a shared project no longer takes the comment layers out of it when the register cannot be opened (another drive letter, no access, a newer plugin version) or the map is turned off; a register saved under another drive letter is found through the layers.
+- **Cable Type Library:** saving keeps the columns a newer plugin version added to the library.
+- **Bathymetry source conventions:** OK no longer resets, on every layer, a vertical convention, unit or sampling set by a newer plugin version; values in a unit or convention this version does not know are left out rather than read as metres of depth.
+- **Cable Route Workbench — rules:** editing a rule keeps the settings and choices the editor does not show.
+- **Burial Planner:** plan layers keep a newer plugin version's style, a rollback over a change made with a newer version is refused rather than half done, and the Acquired Data tab says why the burial data file could not be opened.
 
 ## [1.9.0] - 2026-08-29
 

@@ -70,6 +70,7 @@ from ..cable_seabed.profiles import SyntheticSeabed, read_profile_csv, synthetic
 from ..cable_seabed.sampling import SEABED_PROFILE, SEABED_SYNTHETIC
 from ..cable_seabed.verification import depression_check
 from ..plugin_log import log_exception
+from ..schema_guard import NewerVersionError
 from ..qgis_compat import (
     BUTTON_BOX_CANCEL,
     BUTTON_BOX_OK,
@@ -374,14 +375,20 @@ class SpanAnalysisDialog(QDialog):
     def _open_store(self) -> None:
         path = span_store.project_gpkg_path() or span_store.default_gpkg_path()
         store = span_store.SpanStore(path)
+        newer = ""
         try:
             if store.exists():
                 store.ensure_created()
                 self._store = store
+        except NewerVersionError as exc:
+            newer = str(exc)
+            self._store = None
         except Exception:
             log_exception("Span & Slack Analysis: opening the scenario file failed")
             self._store = None
         self._refresh_scenarios()
+        if newer:
+            self._set_status(newer, error=True)
 
     def _ensure_store(self) -> Optional[span_store.SpanStore]:
         if self._store is not None:
@@ -390,6 +397,9 @@ class SpanAnalysisDialog(QDialog):
         try:
             store = span_store.SpanStore(path)
             store.ensure_created()
+        except NewerVersionError as exc:
+            QMessageBox.warning(self, TITLE, str(exc))
+            return None
         except Exception as exc:
             log_exception("Span & Slack Analysis: creating the scenario file failed")
             QMessageBox.warning(self, TITLE, f"Could not create the scenario file:\n{path}\n\n{exc}")

@@ -21,6 +21,9 @@ Tables (written with plain SQL in transactions; no QGIS needed):
                      comment's map label
 
 Columns are only ever added, so a register opens in any version of the tool.
+A change that older versions could not keep intact would raise
+``SCHEMA_VERSION``, and versions that predate it then refuse the register
+(:mod:`schema_guard`) instead of writing to it.
 
 Every comment has a stable UUID, created/updated timestamps and a
 ``version`` that each save increments: a save from an editor opened on an
@@ -41,6 +44,7 @@ import struct
 from contextlib import contextmanager
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from .. import schema_guard
 from ..burial import gpkg_sql
 from ..workbench.schema import new_id, utc_now_iso
 from . import model
@@ -308,12 +312,22 @@ class CommentStore:
         return store
 
     def open(self) -> "CommentStore":
-        """Open an existing register, adding tables/columns a newer version uses."""
+        """Open an existing register, adding tables/columns a newer version uses.
+
+        A register from a newer plugin version (see :mod:`schema_guard`) is
+        refused before anything is written.
+        """
         if not is_register(self.path):
             raise CommentStoreError(f"{os.path.basename(self.path)} is not a comment register.")
         try:
             conn = self._conn()
             with gpkg_sql.transaction(conn):
+                if gpkg_sql.table_exists(conn, T_META):
+                    meta = {r["key"]: r["value"] for r in conn.execute(f"SELECT key, value FROM {_Q(T_META)}")}
+                    newer = schema_guard.newer_version_message(
+                        meta, SCHEMA_VERSION, f"The comment register {os.path.basename(self.path)}")
+                    if newer:
+                        raise CommentStoreError(newer)
                 _create_tables(conn)
                 meta = {r["key"]: r["value"] for r in conn.execute(f"SELECT key, value FROM {_Q(T_META)}")}
                 if "schema_version" not in meta:
