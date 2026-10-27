@@ -544,6 +544,29 @@ def test_choices_search_filters() -> bool:
     return _result("choices, search (every word) and filters", not failed, ", ".join(failed))
 
 
+def test_table_kp_parser() -> bool:
+    point = {"ref_kind": model.REF_ROUTE_POINT, "kp_km": 12.3456789}
+    section = {"ref_kind": model.REF_KP_RANGE, "kp_km": -1.2345678, "kp_end_km": 2.3456789}
+    assert model.parse_kp_edit(point, "12.346") == (point["kp_km"], None)
+    assert model.parse_kp_edit(point, "0") == (0, None)
+    for text in ("-1.235 – 2.346", "-1.235 - 2.346", "-1.235 to 2.346", "-1.235—2.346"):
+        assert model.parse_kp_edit(section, text) == (section["kp_km"], section["kp_end_km"])
+    assert model.parse_kp_edit(section, "-2--1") == (-2, -1)
+    assert model.parse_kp_edit(section, "3.000 to 1.000") == (3, 1)
+    for bad in ("nan", "inf", "-inf", "", "one", "12.3456", "12,345", "12 34", "1e3", "9" * 400):
+        try:
+            model.parse_kp_edit(point, bad)
+            raise AssertionError(f"Accepted invalid KP {bad}")
+        except ValueError:
+            pass
+    try:
+        model.parse_kp_edit({"ref_kind": model.REF_LOCATION}, "12.000")
+        raise AssertionError("Accepted an edit to a derived nearest KP")
+    except ValueError:
+        pass
+    return _result("table KPs: point/range syntax, signed KPs, finite values and preserved precision", True)
+
+
 def test_parsers() -> bool:
     checks = {
         "dd": model.parse_coordinate("-12.5", True) == -12.5,
@@ -664,6 +687,7 @@ def run_all() -> list:
         test_register_is_not_wal(),
         test_choices_search_filters(),
         test_parsers(),
+        test_table_kp_parser(),
         test_import_validation(),
         test_export_rows(),
     ]

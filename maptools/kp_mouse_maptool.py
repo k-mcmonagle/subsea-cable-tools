@@ -54,7 +54,7 @@ def _layer_has_features(layer) -> bool:
         return False
 
 
-def build_reference_route(layer, map_crs, use_cartesian: bool, start_kp_km=None):
+def build_reference_route(layer, map_crs, use_cartesian: bool, start_kp_km=None, *, grid_crs=None):
     """KP route model of ``layer`` in ``map_crs`` for the KP Mouse tool.
 
     KP starts at ``start_kp_km``; by default the RPL's start KP when ``layer``
@@ -66,14 +66,15 @@ def build_reference_route(layer, map_crs, use_cartesian: bool, start_kp_km=None)
     when every feature has one, else layer order — the order the Processing
     tools and the KP Plotter use), transformed to the map CRS, and a
     :class:`RouteFrame` over them measured with the plugin-wide KP distance
-    (geodesic, or Cartesian grid). KP is continuous across features in that
+    (geodesic, or Cartesian grid). ``grid_crs`` can pin a saved grid without
+    changing the plugin settings. KP is continuous across features in that
     order; features without geometry add no length. Raises
     ``QgsCsException`` or ``ValueError`` when a feature cannot be
     transformed or measured — skipping it would shift every later KP.
     """
     distance = make_kp_distance_area(
         map_crs, QgsProject.instance().transformContext(),
-        mode=KP_MODE_CARTESIAN if use_cartesian else KP_MODE_GEODESIC, route_crs=layer.crs())
+        mode=KP_MODE_CARTESIAN if use_cartesian else KP_MODE_GEODESIC, route_crs=layer.crs(), grid_crs=grid_crs)
     transform = None
     if layer.crs() != map_crs:
         transform = QgsCoordinateTransform(layer.crs(), map_crs, QgsProject.instance())

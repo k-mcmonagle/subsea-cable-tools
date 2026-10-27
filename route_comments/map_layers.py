@@ -51,7 +51,7 @@ from qgis.core import (Qgis, QgsCallout, QgsCategorizedSymbolRenderer, QgsCoordi
                        QgsTextBackgroundSettings, QgsTextBufferSettings, QgsTextFormat, QgsUnitTypes,
                        QgsVectorLayer)
 from qgis.gui import QgsMapTool, QgsRubberBand
-from qgis.PyQt.QtCore import QSettings, QSizeF, QUrl, pyqtSignal
+from qgis.PyQt.QtCore import QSettings, QSizeF, Qt, QUrl, pyqtSignal
 from qgis.PyQt.QtGui import QColor, QCursor, QFont
 from qgis.PyQt.QtWidgets import QMenu
 
@@ -686,15 +686,17 @@ class Highlight:
 
     POINT_RING, END_RING = 18, 13
 
-    def __init__(self, canvas):
+    def __init__(self, canvas, color=None, dashed=False):
         self.canvas = canvas
+        self.color = color
+        self.dashed = dashed
         self.bands: List[QgsRubberBand] = []
         self._shown = 0
 
     def show(self, wkts: Sequence[str]) -> None:
         self.clear()
         crs = QgsCoordinateReferenceSystem(WGS84)
-        color = highlight_color()
+        color = self.color if self.color is not None else highlight_color()
         for wkt in wkts:
             geom = QgsGeometry.fromWkt(wkt or "")
             if geom is None or geom.isNull() or geom.isEmpty():
@@ -716,6 +718,8 @@ class Highlight:
             band = QgsRubberBand(self.canvas, GEOMETRY_POINT if ring else GEOMETRY_LINE)
             band.setColor(QColor(255, 255, 255, 230) if casing else color)
             band.setWidth(7 if casing else 3)
+            if self.dashed and not ring:
+                band.setLineStyle(Qt.PenStyle.DashLine)
             if ring:
                 band.setIcon(_circle_icon())
                 band.setIconSize(ring)

@@ -22,6 +22,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Improved
+
+- **Route Comments — KP editing:** KP values use 3 decimal places (1 m), and table KPs can be edited with route validation and an old/new confirmation; derived nearest KPs open coordinate editing instead. New-comment forms, position dialogs and table KP edits preview unsaved points and ranges in blue on the map, with **Zoom to preview** in the dialogs; untouched position precision, existing registers and saved table layouts are preserved.
+
+- **Route Comments:** edit an existing comment's KP, KP range or map coordinates through **Details ▸ Edit position…** or the table's right-click menu. Saving updates its map geometry and labels automatically; map locations also recalculate their nearest KP and distance off route. Edits keep the saved KP basis, untouched coordinate precision, IDs, replies and images, with no register schema changes or new dependencies. Changed or unavailable routes and concurrent comment edits are checked before saving.
+
 ## [2.0.0] - 2026-10-23
 
 ### Added

@@ -8,9 +8,9 @@ import getpass
 import os
 from typing import Callable, Dict, List, Optional, Sequence
 
-from qgis.core import QgsVectorLayer
+from qgis.core import QgsGeometry, QgsVectorLayer
 from qgis.gui import QgsMapLayerComboBox
-from qgis.PyQt.QtCore import QDate, QSettings, Qt, pyqtSignal
+from qgis.PyQt.QtCore import QDate, QSettings, Qt, QTimer, pyqtSignal
 from qgis.PyQt.QtGui import QKeySequence
 from qgis.PyQt.QtWidgets import (QAbstractItemView, QAbstractSpinBox, QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox,
                                  QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
@@ -24,9 +24,11 @@ except ImportError:  # Qt5: QShortcut is in QtWidgets
     from qgis.PyQt.QtWidgets import QShortcut
 
 from ..qgis_compat import (BUTTON_BOX_CANCEL, BUTTON_BOX_OK, CHECK_STATE_CHECKED, CHECK_STATE_UNCHECKED,
-                           ITEM_FLAG_EDITABLE, ITEM_FLAG_USER_CHECKABLE, MAP_LAYER_FILTER_LINE,
+                           GEOMETRY_POINT, ITEM_FLAG_EDITABLE, ITEM_FLAG_USER_CHECKABLE, MAP_LAYER_FILTER_LINE,
                            SELECTION_BEHAVIOR_SELECT_ROWS, SELECTION_MODE_SINGLE)
 from . import model
+from .route_ref import POSITION_COLUMNS
+from .preview import PositionPreview, PreviewControls
 
 SETTINGS = "SubseaCableTools/route_comments"
 NO_DATE = QDate(1900, 1, 1)
@@ -270,12 +272,13 @@ class NewCommentDialog(QDialog):
     """Quick entry: location (editable), then the comment. Ctrl+Enter saves."""
 
     def __init__(self, parent, values: Dict, capture, statuses: Sequence[str], priorities: Sequence[str],
-                 fields: Sequence[model.CustomField], default_status: str, default_prio: str, set_name: str):
+                 fields: Sequence[model.CustomField], default_status: str, default_prio: str, set_name: str, *, canvas=None):
         super().__init__(parent)
         self.setWindowTitle(f"New comment — {set_name}" if set_name else "New comment")
         self.capture = capture
         self.kind = values.get("ref_kind")
         self.initial = dict(values)
+        self.map_preview = PositionPreview(canvas, self) if canvas is not None else None
         layout = QVBoxLayout(self)
 
         box = QGroupBox(model.REF_LABELS.get(self.kind, "Location"))
@@ -284,10 +287,10 @@ class NewCommentDialog(QDialog):
         lo, hi = capture.start_kp_km, capture.end_kp_km
         self.kp = self.kp_end = self.lat = self.lon = None
         if self.kind in (model.REF_ROUTE_POINT, model.REF_KP_RANGE):
-            self.kp = self._kp_spin(lo, hi, values.get("kp_km"))
+            self.kp = self._kp_spin(-1e9, 1e9, values.get("kp_km"))
             form.addRow("KP from" if self.kind == model.REF_KP_RANGE else "KP", self.kp)
             if self.kind == model.REF_KP_RANGE:
-                self.kp_end = self._kp_spin(lo, hi, values.get("kp_end_km"))
+                self.kp_end = self._kp_spin(-1e9, 1e9, values.get("kp_end_km"))
                 form.addRow("KP to", self.kp_end)
         else:
             self.lat = self._deg_spin(90.0, values.get("lat"))
@@ -300,14 +303,18 @@ class NewCommentDialog(QDialog):
             self.near = QLabel()
             self.near.setWordWrap(True)
             form.addRow("Nearest KP", self.near)
-            self.lat.valueChanged.connect(self._update_near)
-            self.lon.valueChanged.connect(self._update_near)
+        self.editors = {key: spin for key, spin in (("kp_km", self.kp), ("kp_end_km", self.kp_end),
+                                                   ("lat", self.lat), ("lon", self.lon)) if spin is not None}
+        self._displayed = {key: spin.value() for key, spin in self.editors.items()}
         route = QLabel(f"{model.route_text(values) or values.get('route_name') or ''}  ·  KP start "
                        f"{lo:.3f}, end {hi:.3f}  ·  {values.get('kp_basis') or ''}")
         route.setWordWrap(True)
         route.setStyleSheet("color: palette(mid);")
         form.addRow("Route", route)
         layout.addWidget(box)
+        if self.map_preview is not None:
+            self.preview_controls = PreviewControls(self.map_preview, self)
+            layout.addWidget(self.preview_controls)
 
         self.form = CommentForm(self)
         self.form.set_choices(statuses, priorities)
@@ -330,6 +337,10 @@ class NewCommentDialog(QDialog):
         layout.addWidget(buttons)
         for keys in ("Ctrl+Return", "Ctrl+Enter"):
             QShortcut(QKeySequence(keys), self, activated=self.accept)
+        for spin in self.editors.values():
+            spin.setKeyboardTracking(True)
+            spin.valueChanged.connect(self._update_near)
+            spin.lineEdit().textChanged.connect(self._check_preview_input)
         self._update_near()
         self.resize(460, self.sizeHint().height())
         self.form.text.setFocus()
@@ -353,34 +364,42 @@ class NewCommentDialog(QDialog):
         spin.setValue(float(value) if value is not None else 0.0)
         return spin
 
+    def _check_preview_input(self, *_args) -> None:
+        if self.map_preview is not None:
+            if any(not spin.hasAcceptableInput() for spin in self.editors.values()):
+                self.map_preview.clear()
+            elif not self.map_preview.valid:
+                QTimer.singleShot(0, self._update_near)
+
     def _update_near(self, *_args) -> None:
-        if self.lat is None:
-            return
         try:
             values = self.location_values()
+            if self.map_preview is not None:
+                self.map_preview.show(values.get("wkt"))
+            if self.lat is None:
+                return
             if values.get("kp_km") is None:
                 self.near.setText("—")
             else:
                 self.near.setText(f"KP {values['kp_km']:.3f}, {values.get('dcc_m') or 0.0:,.0f} m off route "
                                   "(kept apart from the position)")
         except Exception as exc:  # noqa: BLE001 - shown in the dialog
-            self.near.setText(str(exc))
+            if self.map_preview is not None:
+                self.map_preview.clear()
+            if self.lat is not None:
+                self.near.setText(str(exc))
 
     def location_values(self) -> Dict:
         """The reference columns for the location as now entered."""
-        if self.kind == model.REF_ROUTE_POINT:
-            if abs(self.kp.value() - float(self.initial.get("kp_km") or 0.0)) < 5e-7:
-                return dict(self.initial)
-            return self.capture.point_values(self.kp.value())
-        if self.kind == model.REF_KP_RANGE:
-            if abs(self.kp.value() - float(self.initial.get("kp_km") or 0.0)) < 5e-7 and \
-                    abs(self.kp_end.value() - float(self.initial.get("kp_end_km") or 0.0)) < 5e-7:
-                return dict(self.initial)
-            return self.capture.range_values(self.kp.value(), self.kp_end.value())
-        if abs(self.lat.value() - float(self.initial.get("lat") or 0.0)) < 5e-9 and \
-                abs(self.lon.value() - float(self.initial.get("lon") or 0.0)) < 5e-9:
+        if any(not spin.hasAcceptableInput() for spin in self.editors.values()):
+            raise ValueError("Enter a valid value in each position field.")
+        if all(spin.value() == self._displayed[key] for key, spin in self.editors.items()):
             return dict(self.initial)
-        return self.capture.location_from_wgs84(self.lat.value(), self.lon.value())
+        values = {key: self.initial.get(key) if spin.value() == self._displayed[key] else spin.value()
+                  for key, spin in self.editors.items()}
+        if self.kind in (model.REF_ROUTE_POINT, model.REF_KP_RANGE):
+            return self.capture.values_at_kps(self.kind, values["kp_km"], values.get("kp_end_km"))
+        return self.capture.location_from_wgs84(values["lat"], values["lon"])
 
     def result_values(self) -> Dict:
         values = self.location_values()
@@ -388,6 +407,8 @@ class NewCommentDialog(QDialog):
         return values
 
     def accept(self) -> None:
+        for spin in self.editors.values():
+            spin.interpretText()
         problems = self.form.problems()
         if not problems:
             try:
@@ -400,6 +421,144 @@ class NewCommentDialog(QDialog):
             return
         remember_author(self.form.author.text().strip())
         QSettings().setValue(f"{SETTINGS}/new_more", self.form.more_button.isChecked())
+        super().accept()
+
+
+# --------------------------------------------------------------------------- edit position
+class EditPositionDialog(QDialog):
+    """Edit only a comment's location; geometry and KPs are saved together."""
+
+    def __init__(self, parent, comment: Dict, capture, *, canvas=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Edit position — {model.ref_label(comment.get('ref_no'))}")
+        self.initial = dict(comment)
+        self.map_preview = PositionPreview(canvas, self) if canvas is not None else None
+        self.capture = capture
+        self.kind = comment.get("ref_kind")
+        self.editors = {}
+        layout = QVBoxLayout(self)
+        box = QGroupBox(model.REF_LABELS.get(self.kind, "Location"))
+        form = QFormLayout(box)
+        if self.kind in (model.REF_ROUTE_POINT, model.REF_KP_RANGE):
+            if capture is None:
+                raise ValueError("The comment's route is needed to edit its KPs.")
+            for key, label in (("kp_km", "KP from" if self.kind == model.REF_KP_RANGE else "KP"),
+                               ("kp_end_km", "KP to")):
+                if key == "kp_end_km" and self.kind != model.REF_KP_RANGE:
+                    continue
+                # Validate against the exact route bounds below, rather than
+                # silently clamping input (or rounding a saved endpoint).
+                spin = NewCommentDialog._kp_spin(-1e9, 1e9, comment.get(key))
+                self.editors[key] = spin
+                form.addRow(label, spin)
+        elif self.kind == model.REF_LOCATION:
+            # Earlier/imported records may have geometry but no lat/lon columns.
+            geom = QgsGeometry.fromWkt(comment.get("wkt") or "")
+            if not geom.isEmpty() and geom.type() == GEOMETRY_POINT:
+                point = geom.asPoint()
+                for key, value in (("lat", point.y()), ("lon", point.x())):
+                    if self.initial.get(key) is None:
+                        self.initial[key] = value
+            for key, label, limit in (("lat", "Latitude", 90.0), ("lon", "Longitude", 180.0)):
+                spin = NewCommentDialog._deg_spin(limit, self.initial.get(key))
+                self.editors[key] = spin
+                form.addRow(label, spin)
+        else:
+            raise ValueError("This comment has an unsupported location type.")
+        self._displayed = {key: spin.value() for key, spin in self.editors.items()}
+        if capture is not None:
+            route = QLabel(f"{model.route_text(comment) or capture.layer.name()} · "
+                           f"KP {capture.start_kp_km:.3f} to {capture.end_kp_km:.3f} · "
+                           f"{capture.identity().get('kp_basis') or ''}")
+            route.setWordWrap(True)
+            form.addRow("Route", route)
+        layout.addWidget(box)
+        self.preview = QLabel()
+        self.preview.setWordWrap(True)
+        layout.addWidget(self.preview)
+        if self.map_preview is not None:
+            self.preview_controls = PreviewControls(self.map_preview, self)
+            layout.addWidget(self.preview_controls)
+        note = QLabel("Save position updates the comment on the map automatically.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.error = QLabel()
+        self.error.setStyleSheet("color: #b00020;")
+        self.error.setWordWrap(True)
+        self.error.hide()
+        layout.addWidget(self.error)
+        self.buttons = QDialogButtonBox(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
+        self.buttons.button(BUTTON_BOX_OK).setText("Save position")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        for spin in self.editors.values():
+            spin.setKeyboardTracking(True)
+            spin.valueChanged.connect(self._update_preview)
+            spin.lineEdit().textChanged.connect(self._check_preview_input)
+        self._update_preview()
+        self.resize(460, self.sizeHint().height())
+
+    def result_values(self) -> Dict:
+        """Only location columns; an untouched form produces no write at all.
+
+        Keep original precision for each untouched value, including the other
+        end of a range or the other coordinate of a map location.
+        """
+        if any(not spin.hasAcceptableInput() for spin in self.editors.values()):
+            raise ValueError("Enter a valid value in each position field.")
+        if all(spin.value() == self._displayed[key] for key, spin in self.editors.items()):
+            return {}
+        values = {key: self.initial.get(key) if spin.value() == self._displayed[key] else spin.value()
+                  for key, spin in self.editors.items()}
+        if any(value is None for value in values.values()):
+            raise ValueError("The comment is missing a position value. Enter both values before saving.")
+        if self.kind in (model.REF_ROUTE_POINT, model.REF_KP_RANGE):
+            result = self.capture.values_at_kps(self.kind, values["kp_km"], values.get("kp_end_km"))
+        elif self.capture is not None:
+            result = self.capture.location_from_wgs84(values["lat"], values["lon"])
+        else:
+            from .route_ref import location_without_route
+            result = location_without_route(values["lat"], values["lon"])
+        return {key: result[key] for key in POSITION_COLUMNS}
+
+    def _check_preview_input(self, *_args) -> None:
+        if self.map_preview is not None:
+            if any(not spin.hasAcceptableInput() for spin in self.editors.values()):
+                self.map_preview.clear()
+            elif not self.map_preview.valid:
+                QTimer.singleShot(0, self._update_preview)
+
+    def _update_preview(self, *_args) -> None:
+        try:
+            values = self.result_values() or self.initial
+        except ValueError as exc:
+            if self.map_preview is not None:
+                self.map_preview.clear()
+            self.preview.clear()
+            self.error.setText(str(exc))
+            self.error.show()
+            self.buttons.button(BUTTON_BOX_OK).setEnabled(False)
+            return
+        self.error.hide()
+        self.buttons.button(BUTTON_BOX_OK).setEnabled(True)
+        text = model.location_text(values)
+        if self.kind in (model.REF_ROUTE_POINT, model.REF_KP_RANGE) and \
+                values.get("lat") is not None and values.get("lon") is not None:
+            text += f" · {'Start: ' if self.kind == model.REF_KP_RANGE else ''}{values['lat']:.6f}, {values['lon']:.6f}"
+        self.preview.setText(text)
+        if self.map_preview is not None:
+            self.map_preview.show(values.get("wkt"))
+
+    def accept(self) -> None:
+        for spin in self.editors.values():
+            spin.interpretText()
+        try:
+            self.result_values()
+        except ValueError as exc:
+            self.error.setText(str(exc))
+            self.error.show()
+            return
         super().accept()
 
 

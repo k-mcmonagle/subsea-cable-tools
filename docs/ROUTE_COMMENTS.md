@@ -10,7 +10,7 @@ With the **KP Mouse Tool** on, right-click the map and choose **Add Comment**:
 - **At Cursor Location** keeps the position you clicked. Its nearest KP and distance off the route are recorded separately, so the actual position is never moved onto the route.
 - **Over KP Range…** fixes the start at the nearest KP. Move along the route (the section is previewed) and click the end. **Esc** or a right-click cancels.
 
-A short form opens with the author, today's date, the first status and the default priority already filled in, plus the location (KP, KP range, or latitude/longitude), which you can edit. Type the comment and press **Ctrl+Enter**. Tags and the set's custom fields are under **More fields**.
+A short form opens with the author, today's date, the first status and the default priority already filled in, plus the location (KP, KP range, or latitude/longitude), which you can edit. The proposed position is previewed on the map as you change it; **Zoom to preview** brings it into view. Type the comment and press **Ctrl+Enter**. Tags and the set's custom fields are under **More fields**.
 
 The KP Mouse Tool's other right-click entries are unchanged.
 
@@ -21,7 +21,7 @@ The KP Mouse Tool's other right-click entries are unchanged.
 - **Register button**: create a register, open one, recent registers, show the folder.
 - **Set combo / Set menu**: switch comment sets. You can also create, rename or delete a set, edit its custom fields (text, number, date, yes/no, choice), and edit its status and priority choices. Statuses marked *counts as closed* are drawn grey and can be hidden.
 - **Search** matches every word typed against the text, replies, number (`#12`), author, tags, route and custom values. **Filter** narrows by status, priority, reference condition and type.
-- **Table** (across the top): click a header to sort. Right-click a header to show or hide columns or reset them. Column order, widths, visibility and sort are remembered. Double-click (or F2) the comment, status, priority, author, date, tags, external ID or a custom field to edit it in place; it is saved straight away, with the same check against changes made elsewhere as **Save**. Double-click a number or KP to zoom to it. Right-click rows to zoom to them, set their status or priority, copy their IDs or delete them.
+- **Table** (across the top): click a header to sort. Right-click a header to show or hide columns or reset them. Column order, widths, visibility and sort are remembered. Double-click (or F2) the comment, status, priority, author, date, tags, external ID or a custom field to edit it in place; it is saved straight away, with the same check against changes made elsewhere as **Save**. Double-click a number to zoom to it. Double-click a KP (or press F2) to edit a route point or range, with a confirmation before it moves. A map location's **~** nearest KP is calculated from its position: double-click it to edit its coordinates. Right-click rows to zoom to them, set their status or priority, copy their IDs or delete them.
 
 Below the table is the selected comment. Drag the bar between them to share the height.
 
@@ -29,6 +29,32 @@ Below the table is the selected comment. Drag the bar between them to share the 
 - **Thread**: the comment and its replies as a conversation, oldest first, with your own replies on the right. Type a reply and press **Send** (Ctrl+Enter). **Send & close** sends the reply (if you typed one) and sets the set's first closed status. On a closed comment the same button is **Send & reopen**. The thread shows each status change. Each message has a **⋯** button (or right-click it) to copy, edit or delete it. **Edit** opens the text in place: **Save** (Ctrl+Enter) or **Cancel** (Esc). An edited reply is marked *edited*. Editing a reply that changed the status keeps that change. Editing the comment itself works like editing its text in the table. If you move to another comment with an edit still open, you are asked whether to save it. Deleting the comment from the thread deletes it with its replies and images, as **Delete…** does. Deleting a reply that changed the status (*Send & close*) asks whether to put the status back. That is offered while the status is still the one the reply set and no later reply has changed it.
 - **Details**: every other field of the comment. Edit it and **Save** (Ctrl+S).
 - **Images**: the comment's images, beside the thread when the dock is wide and under it when it is narrow. The pane is small while the comment has no image. Zoom with the mouse wheel, drag to pan, and right-click to fit or show the image at actual size. Double-click opens it in your image viewer. When there are several images, the thumbnails and arrows switch between them. Add images with **Add…**, by dropping image files on the pane, or with **Paste** (**Ctrl+V** anywhere outside a text box), for example a screenshot. **Show on map** puts the image in the comment's map label (see below).
+
+## Editing a position
+
+KPs are shown in kilometres to **3 decimal places (0.001 km = 1 m)**. Stored positions keep their original precision unless you change them.
+
+While typing in a KP cell or changing a position in a dialog, a **blue overlay** previews the unsaved position: a ring for a point, or a dashed section with rings at both range ends. Invalid or incomplete input hides the preview. The saved comment stays at its current position until you confirm or save; cancelling clears the preview. The new-comment and position dialogs include **Zoom to preview** (centres a point at the current scale, or fits the whole range). Typing does not pan or zoom the map automatically. Move the dialog aside if it covers the preview.
+
+For a quick KP edit, **double-click the KP cell** or select it and press **F2**:
+
+- A route point takes one KP, for example `12.345`.
+- A range takes both ends, for example `12.345 – 13.456`. A hyphen or `to` also works, including with negative KPs.
+- Press **Enter** or leave the cell to review the proposed move. The confirmation shows the old and new KPs; choose **Yes** to update the position and map, or **No** to keep it. **Esc** cancels typing. An unchanged value needs no confirmation and does not move the comment.
+- Text, missing range ends, extra decimal places, non-finite numbers, zero-length ranges and KPs outside the route are rejected. Reversed range ends are put in route order before confirmation. You can use the route limits shown in the position dialog.
+- A map location's **~** nearest KP is calculated from its coordinates and cannot be typed over. Double-click it to open the coordinate editor instead.
+
+For the full position form, select a comment and choose **Details ▸ Edit position…**, or right-click its table row and choose **Edit position…**:
+
+- **Route point:** change the KP to move the comment along its route.
+- **KP range:** change either end; the section follows the route between those KPs. Reversed endpoints are put in route order. A zero-length range or a KP outside the route cannot be saved.
+- **Map location:** change latitude or longitude. The comment keeps that position and its nearest KP and distance off route update automatically. Locations imported without a route can also be moved by coordinates.
+
+These editing rules apply whether the comment came from the KP Mouse Tool, the Span & Slack Analysis profile or a CSV/Excel import. New comments keep the exact captured point, range endpoints or map coordinates when you accept their displayed values without changing them. Editing text, replies, status, priority, images or custom fields leaves the position alone.
+
+**Save position** updates the geometry, table, map and labels together. **Cancel** leaves the saved position unchanged. Opening the form without changing a value preserves its full stored precision, including an untouched end of a range. Replies, images, IDs and other comment fields are kept.
+
+Position edits use the comment's saved start KP, measurement convention and route revision, even if the current KP settings differ. The original route must be available and its geometry unchanged; restore it first if it has changed or is missing. A newer Workbench revision is not substituted. A concurrent change to the comment is reported without overwriting it; reload before trying again. Existing registers need no schema changes for position editing.
 
 ## On the map
 

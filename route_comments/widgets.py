@@ -95,7 +95,9 @@ class CommentTableModel(QAbstractTableModel):
     def field_for(self, key: str) -> Optional[model.CustomField]:
         return next((f for f in self.fields if f"cf:{f.field_id}" == key), None)
 
-    def is_editable(self, key: str) -> bool:
+    def is_editable(self, key: str, comment: Optional[Dict] = None) -> bool:
+        if key == "kp":
+            return comment is None or comment.get("ref_kind") in (model.REF_ROUTE_POINT, model.REF_KP_RANGE)
         return key in EDITABLE or key.startswith("cf:")
 
     def rowCount(self, parent=QModelIndex()):  # noqa: N802 - Qt API
@@ -153,6 +155,8 @@ class CommentTableModel(QAbstractTableModel):
 
     def edit_value(self, comment: Dict, key: str):
         """The value an in-place editor starts from."""
+        if key == "kp":
+            return model.kp_text(comment)
         if key.startswith("cf:"):
             return model.load_custom(comment).get(key[3:])
         return comment.get(EDITABLE.get(key, key))
@@ -178,7 +182,11 @@ class CommentTableModel(QAbstractTableModel):
             if key == "text":
                 return str(comment.get("text") or "")
             if key == "kp":
-                return model.location_text(comment)
+                help_text = ("Nearest KP is calculated from the map position. Double-click to edit coordinates, "
+                             "or use Edit position…." if comment.get("ref_kind") == model.REF_LOCATION else
+                             "Double-click or press F2 to edit KP in km (0.001 km = 1 m). "
+                             "For a range, enter both ends, e.g. 12.345 – 13.456. You will confirm the move.")
+                return model.location_text(comment) + "\n" + help_text
         if role == Qt.ItemDataRole.ForegroundRole and str(comment.get("status") or "").casefold() in self.closed:
             return QBrush(QColor(130, 130, 130))
         if role == Qt.ItemDataRole.TextAlignmentRole and key in ("ref", "kp", "replies", "images"):
@@ -187,7 +195,8 @@ class CommentTableModel(QAbstractTableModel):
 
     def flags(self, index):
         flags = super().flags(index)
-        if index.isValid() and self.is_editable(self.key(index.column())):
+        if index.isValid() and index.row() < len(self.comments) and \
+                self.is_editable(self.key(index.column()), self.comments[index.row()]):
             flags |= ITEM_FLAG_EDITABLE
         return flags
 
@@ -196,13 +205,18 @@ class CommentTableModel(QAbstractTableModel):
             return False
         comment = self.comments[index.row()]
         key = self.key(index.column())
-        if value == self.edit_value(comment, key):
+        if not self.is_editable(key, comment) or value == self.edit_value(comment, key):
             return False
-        saved = self.edit_handler(comment.get("comment_id"), key, value)
+        cid = comment.get("comment_id")
+        saved = self.edit_handler(cid, key, value)
         if saved is None:
             return False
-        self.comments[index.row()] = saved
-        self.dataChanged.emit(self.index(index.row(), 0), self.index(index.row(), len(self.columns) - 1))
+        # Saving pending Details/thread edits or a confirmation can run an event
+        # loop and reload/reorder the model. Find the comment again by its ID.
+        row = self.row_of(cid)
+        if row >= 0:
+            self.comments[row] = saved
+            self.dataChanged.emit(self.index(row, 0), self.index(row, len(self.columns) - 1))
         return True
 
     def row_of(self, comment_id: str) -> int:
@@ -233,6 +247,9 @@ class CommentProxy(QSortFilterProxyModel):
 class CommentDelegate(QStyledItemDelegate):
     """In-place editors: choice lists for status, priority and choice fields,
     a date picker for dates, several lines for the comment text."""
+
+    kp_edit_started = pyqtSignal(str, object)
+    kp_edit_finished = pyqtSignal(object)
 
     def __init__(self, table_model: CommentTableModel, parent=None):
         super().__init__(parent)
@@ -271,7 +288,17 @@ class CommentDelegate(QStyledItemDelegate):
             edit = QPlainTextEdit(parent)
             edit.setTabChangesFocus(True)
             return edit
-        return QLineEdit(parent)
+        edit = QLineEdit(parent)
+        if key == "kp":
+            edit.setPlaceholderText("12.345 or 12.345 – 13.456")
+            edit.setToolTip("KP in km, to 3 decimal places (1 m). For a range, enter both ends separated by – or to. "
+                            "The map previews valid KPs as you type. Enter confirms the move; Esc cancels.")
+            self.kp_edit_started.emit(str(index.data(ID_ROLE)), edit)
+        return edit
+
+    def destroyEditor(self, editor, index):  # noqa: N802 - Qt API
+        self.kp_edit_finished.emit(editor)
+        super().destroyEditor(editor, index)
 
     def setEditorData(self, editor, index):  # noqa: N802 - Qt API
         value = index.data(Qt.ItemDataRole.EditRole)
@@ -309,6 +336,8 @@ class CommentDelegate(QStyledItemDelegate):
 
     def updateEditorGeometry(self, editor, option, index):  # noqa: N802 - Qt API
         rect = option.rect
+        if self._key(index) == "kp":
+            rect.setWidth(max(rect.width(), 220))
         if isinstance(editor, QPlainTextEdit):
             rect.setHeight(max(rect.height(), editor.fontMetrics().lineSpacing() * 5 + 10))
             rect.setWidth(max(rect.width(), 280))

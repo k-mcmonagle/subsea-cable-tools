@@ -42,10 +42,11 @@ from ..qgis_compat import (CONTEXT_MENU_POLICY_CUSTOM, MESSAGEBOX_NO, MESSAGEBOX
                            WINDOW_HINT_CLOSE, WINDOW_HINT_CUSTOMIZE, WINDOW_HINT_MIN_MAX, WINDOW_HINT_TITLE,
                            WINDOW_TYPE_WINDOW, qt_exec)
 from . import map_layers, model
-from .dialogs import (SETTINGS, ChoicesDialog, CommentForm, ExportDialog, FieldsDialog, ImportDialog, LabelDialog,
-                      NewCommentDialog, default_author, remember_author)
+from .dialogs import (SETTINGS, ChoicesDialog, CommentForm, EditPositionDialog, ExportDialog, FieldsDialog, ImportDialog,
+                      LabelDialog, NewCommentDialog, default_author, remember_author)
+from .preview import PositionPreview, TableKpPreview
 from .pictures import MAX_PIXELS, PicturePanel, ThumbnailCache, image_size, pictures_from_mime
-from .route_ref import CaptureRoute, ReferenceChecker, location_without_route
+from .route_ref import POSITION_COLUMNS, CaptureRoute, ReferenceChecker, location_without_route
 from .store import CommentStore, CommentStoreError, ConflictError, attachments_dir_for, is_register
 from .widgets import (COND_COLORS, EDITABLE, ID_ROLE, AdaptiveSplitter, CommentDelegate, CommentProxy,
                       CommentTableModel, ThreadView, readable_selection)
@@ -104,6 +105,7 @@ class RouteCommentsDock(QDockWidget):
         self.layers = map_layers.CommentLayers()
         self.highlight = map_layers.Highlight(iface.mapCanvas()) if iface else None
         self.pick_tool = None
+        self._kp_preview = None
         self.current_id: Optional[str] = None
         self._loaded_version = None
         self._data_version = None
@@ -113,6 +115,7 @@ class RouteCommentsDock(QDockWidget):
         self._header_key = ""
         self._from_map = False
         self._thread_saving = False
+        self._editing_position = False
         self.thumb_cache = ThumbnailCache()
         self._build_ui()
         self._poll_timer = QTimer(self)
@@ -238,7 +241,10 @@ class RouteCommentsDock(QDockWidget):
         self.proxy.setSourceModel(self.table_model)
         self.table = QTableView()
         self.table.setModel(self.proxy)
-        self.table.setItemDelegate(CommentDelegate(self.table_model, self.table))
+        delegate = CommentDelegate(self.table_model, self.table)
+        delegate.kp_edit_started.connect(self._start_kp_preview)
+        delegate.kp_edit_finished.connect(self._stop_kp_preview)
+        self.table.setItemDelegate(delegate)
         self.table.setSortingEnabled(True)
         self.table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
         self.table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
@@ -262,8 +268,9 @@ class RouteCommentsDock(QDockWidget):
         self.table.customContextMenuRequested.connect(self._table_menu)
         self.table.selectionModel().selectionChanged.connect(self._on_table_selection)
         self.table.doubleClicked.connect(self._on_double_click)
-        self.table.setToolTip("Double-click a comment, status, priority, author, date, tags or custom field to "
-                              "edit it in place; double-click a number or KP to zoom to it.")
+        self.table.setToolTip("Double-click or press F2 to edit a KP, comment or other editable field. "
+                              "KP changes ask for confirmation. Double-click a ~ nearest KP to edit coordinates, "
+                              "or a comment number to zoom to it.")
         self.splitter.addWidget(self.table)
         self.splitter.addWidget(self._build_review())
         self.splitter.setChildrenCollapsible(False)
@@ -389,6 +396,10 @@ class RouteCommentsDock(QDockWidget):
         form_layout.setContentsMargins(2, 4, 2, 0)
         self.form = CommentForm(inner, text_lines=3, show_state=False)
         self.form.changed.connect(self._on_form_changed)
+        self.position_button = QPushButton("Edit position…")
+        self.position_button.setToolTip("Change the KP, KP range or map coordinates and update the map")
+        self.position_button.clicked.connect(self.edit_position)
+        form_layout.addWidget(self.position_button)
         form_layout.addWidget(self.form)
         buttons = QHBoxLayout()
         self.save_button = QPushButton("Save")
@@ -596,6 +607,7 @@ class RouteCommentsDock(QDockWidget):
 
     def _on_project_changed(self, *_args) -> None:
         """Open the register the project names (or none)."""
+        self._close_previews()
         self._disconnect_layers()
         path, set_id = map_layers.project_register()
         self.current_id = None
@@ -772,6 +784,7 @@ class RouteCommentsDock(QDockWidget):
     # ------------------------------------------------------------------ data
     def reload(self, keep_selection: bool = True) -> None:
         """Read the set from the register, re-check references, refresh table and map."""
+        self._stop_kp_preview()
         selected = self.selected_ids() if keep_selection else []
         self.comments, self.replies = [], {}
         if self.store is not None and self.set_row is not None:
@@ -1018,11 +1031,16 @@ class RouteCommentsDock(QDockWidget):
 
     def _on_double_click(self, index) -> None:
         key = self.table_model.key(self.proxy.mapToSource(index).column())
-        if not self.table_model.is_editable(key):
+        comment = self.by_id.get(index.data(ID_ROLE), {})
+        if key == "kp" and comment.get("ref_kind") == model.REF_LOCATION:
+            self.edit_position()
+        elif not self.table_model.is_editable(key, comment):
             self.zoom_to_selected()
 
     def _inline_edit(self, cid: str, key: str, value) -> Optional[Dict]:
         """Save one cell edited in the table (with the same conflict check as Save)."""
+        if key == "kp":
+            return self._inline_kp_edit(cid, value)
         comment = self.by_id.get(cid)
         if comment is None or self.store is None:
             return None
@@ -1056,12 +1074,86 @@ class RouteCommentsDock(QDockWidget):
         QTimer.singleShot(0, self.reload)   # map, search text, details (not inside the editor's commit)
         return saved
 
+    def _start_kp_preview(self, cid, editor):
+        self._stop_kp_preview()
+        comment = self.by_id.get(cid)
+        if self.iface is None or comment is None:
+            return
+        try:
+            capture = self.checker.capture_for_edit(comment)
+            self._kp_preview = TableKpPreview(self.iface.mapCanvas(), editor, comment, capture)
+        except (ValueError, RuntimeError) as exc:
+            editor.setToolTip(f"Map preview unavailable: {exc}")
+
+    def _stop_kp_preview(self, editor=None):
+        session = self._kp_preview
+        if session is not None and (editor is None or session.editor is editor):
+            session.dispose()
+            self._kp_preview = None
+
+    def _close_previews(self):
+        self._stop_kp_preview()
+        for preview in self.findChildren(PositionPreview):
+            preview.dispose()
+
+    def _inline_kp_edit(self, cid: str, value) -> Optional[Dict]:
+        """Validate a table KP edit, confirm the move, and save geometry atomically."""
+        store = self.store
+        comment = dict(self.by_id.get(cid, {}))
+        if store is None or not comment or self._editing_position:
+            return None
+        self._editing_position = True
+        try:
+            kp, end = model.parse_kp_edit(comment, value)
+            if (kp, end) == (comment.get("kp_km"), comment.get("kp_end_km")):
+                return None
+            capture = self.checker.capture_for_edit(comment)
+            proposed = capture.values_at_kps(comment["ref_kind"], kp, end)
+            if (proposed["kp_km"], proposed["kp_end_km"]) == (comment.get("kp_km"), comment.get("kp_end_km")):
+                return None
+            if self._kp_preview is not None and self._kp_preview.comment.get("comment_id") == cid:
+                self._kp_preview.show_values(proposed)
+            answer = QMessageBox.question(
+                self, "Move route comment",
+                f"Move comment {model.ref_label(comment.get('ref_no'))}?\n\n"
+                f"From: {model.location_text(comment)}\nTo: {model.location_text(proposed)}\n\n"
+                "The map position and labels will update. The comment's route and KP convention stay the same.",
+                MESSAGEBOX_YES | MESSAGEBOX_NO, MESSAGEBOX_NO)
+            if answer != MESSAGEBOX_YES or self.store is not store:
+                return None
+            pending = cid == self.current_id and (self._dirty or self.thread.is_editing())
+            if pending and not self._confirm_leave():
+                return None
+            if self.store is not store:
+                return None
+            if pending:
+                # Our own Details/thread save may advance the row version. A
+                # position changed elsewhere must still invalidate this move.
+                current = self.by_id.get(cid, comment)
+                if any(current.get(key) != comment.get(key) for key in POSITION_COLUMNS):
+                    raise ConflictError("The comment's position changed elsewhere. Reload before editing its KP.")
+                comment = dict(current)
+            self.checker.capture_for_edit(comment)
+            changes = {key: proposed[key] for key in POSITION_COLUMNS}
+            saved = store.update_comment(cid, changes, expected_version=comment.get("version") or 0)
+        except (ValueError, CommentStoreError) as exc:
+            self._error("Edit KP", exc)
+            return None
+        finally:
+            self._editing_position = False
+        self.by_id[cid] = saved
+        self.checker.clear()
+        QTimer.singleShot(0, self.reload)  # Commit the table editor before refreshing the map and details.
+        return saved
+
     def _table_menu(self, pos) -> None:
         ids = self.selected_ids()
         if not ids:
             return
         menu = QMenu(self)
         menu.addAction(_theme_icon("/mActionZoomToSelected.svg"), "Zoom to", self.zoom_to_selected)
+        if len(ids) == 1:
+            menu.addAction("Edit position…", self.edit_position)
         status_menu = menu.addMenu("Set status")
         for name in self.statuses():
             status_menu.addAction(name, lambda n=name: self.bulk_update({"status": n}))
@@ -1392,6 +1484,46 @@ class RouteCommentsDock(QDockWidget):
         self._message(f"Comment {model.ref_label(saved.get('ref_no'))} saved.", MESSAGE_SUCCESS, 2)
         return True
 
+    def edit_position(self) -> bool:
+        """Move one comment with its saved route basis, then refresh map and labels."""
+        if self.current_id is None or self.store is None or not self._confirm_leave():
+            return False
+        cid, store = self.current_id, self.store
+        comment = dict(self.by_id.get(cid, {}))
+        if not comment:
+            return False
+        self._show_comment(cid)  # Reflect any Details/thread edits saved or discarded above.
+        dialog = None
+        self._editing_position = True
+        try:
+            capture = self.checker.capture_for_edit(comment)
+            dialog = EditPositionDialog(self, comment, capture,
+                                        canvas=self.iface.mapCanvas() if self.iface else None)
+            if not qt_exec(dialog):
+                return False
+            changes = dialog.result_values()
+            if not changes:
+                return True
+            if self.store is not store or self.current_id != cid:
+                return False  # The project/register changed while the dialog was open.
+            self.checker.capture_for_edit(comment)  # Recheck the route before writing.
+            saved = store.update_comment(cid, changes, expected_version=comment.get("version") or 0)
+        except (ValueError, CommentStoreError) as exc:
+            self._error("Edit position", exc)
+            return False
+        finally:
+            self._editing_position = False
+            if dialog is not None:
+                if dialog.map_preview is not None:
+                    dialog.map_preview.dispose()
+                dialog.deleteLater()
+        self.checker.clear()
+        self.reload()
+        if self.follow_button.isChecked():
+            self._follow(cid)
+        self._message(f"Position of comment {model.ref_label(saved.get('ref_no'))} saved.", MESSAGE_SUCCESS, 2)
+        return True
+
     def revert_current(self) -> None:
         self._dirty = False
         self._show_comment(self.current_id)
@@ -1668,14 +1800,18 @@ class RouteCommentsDock(QDockWidget):
         statuses, priorities = self.statuses(), self.priorities()
         dialog = NewCommentDialog(self, values, capture, statuses, priorities, self.fields,
                                   statuses[0] if statuses else "", model.default_priority(priorities),
-                                  self.set_row["name"])
-        if not qt_exec(dialog):
-            return None
+                                  self.set_row["name"], canvas=self.iface.mapCanvas() if self.iface else None)
         try:
+            if not qt_exec(dialog):
+                return None
             comment = self.store.add_comment(self.set_row["set_id"], dialog.result_values())
         except CommentStoreError as exc:
             self._error("New comment", exc)
             return None
+        finally:
+            if dialog.map_preview is not None:
+                dialog.map_preview.dispose()
+            dialog.deleteLater()
         self.checker.clear()  # the routes may have been edited since the last check
         self.reload()
         self._select_ids([comment["comment_id"]])
@@ -1857,7 +1993,7 @@ class RouteCommentsDock(QDockWidget):
 
     def _poll(self) -> None:
         """Pick up changes another project or QGIS committed to the register."""
-        if self.store is None or not self.isVisible():
+        if self.store is None or not self.isVisible() or self._editing_position:
             return
         version = self.store.data_version()
         if version == self._data_version or version < 0:
@@ -1880,6 +2016,7 @@ class RouteCommentsDock(QDockWidget):
             action.setEnabled(has_set)
         self.act_import.setEnabled(self.store is not None)
         self.set_combo.setEnabled(self.store is not None)
+        self.position_button.setEnabled(has_comment)
         self.save_button.setEnabled(has_comment and self._dirty)
         self.revert_button.setEnabled(has_comment and self._dirty)
         self.delete_button.setEnabled(bool(self.selected_ids()))
@@ -1897,6 +2034,7 @@ class RouteCommentsDock(QDockWidget):
             self._poll_timer.start()
 
     def hideEvent(self, event):  # noqa: N802 - Qt API
+        self._close_previews()
         self._poll_timer.stop()
         self._save_window_state()
         super().hideEvent(event)
@@ -1905,6 +2043,7 @@ class RouteCommentsDock(QDockWidget):
         """Plugin unload: stop timers, release the map tool and canvas items,
         disconnect from the project and close the register (the map layers
         stay in the project: they read the register directly)."""
+        self._close_previews()
         self._save_window_state()
         self._poll_timer.stop()
         self._header_timer.stop()

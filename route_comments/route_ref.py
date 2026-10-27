@@ -22,6 +22,7 @@ or cannot be found is flagged, and keeps the position and KPs it was made with.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
@@ -40,6 +41,7 @@ from . import model
 WGS84 = "EPSG:4326"
 # Start KPs differing by less than this are the same (KPs are shown to 1 m).
 START_KP_TOL_KM = 0.0005
+POSITION_COLUMNS = ("ref_kind", "kp_km", "kp_end_km", "dcc_m", "lat", "lon", "wkt", "geom_wkt", "geom_crs")
 
 
 # --------------------------------------------------------------------------- identity
@@ -164,7 +166,8 @@ class CaptureRoute:
     _identity: Optional[Dict] = field(default=None, repr=False)
 
     @classmethod
-    def from_layer(cls, layer, crs=None, start_kp_km=None, use_cartesian: Optional[bool] = None) -> "CaptureRoute":
+    def from_layer(cls, layer, crs=None, start_kp_km=None, use_cartesian: Optional[bool] = None,
+                   *, grid_crs=None) -> "CaptureRoute":
         """Build the KP Mouse Tool's route model of ``layer`` (in ``crs``,
         default the layer CRS). Raises ``ValueError`` when it cannot be measured."""
         from ..maptools.kp_mouse_maptool import build_reference_route
@@ -173,7 +176,8 @@ class CaptureRoute:
         if use_cartesian is None:
             use_cartesian = kp_distance_mode() == KP_MODE_CARTESIAN
         try:
-            route, distance, _geoms = build_reference_route(layer, crs, use_cartesian, start_kp_km=start_kp_km)
+            route, distance, _geoms = build_reference_route(layer, crs, use_cartesian, start_kp_km=start_kp_km,
+                                                           grid_crs=grid_crs)
         except QgsCsException as exc:
             raise ValueError(f"The route could not be transformed: {exc}") from exc
         if route.total_length_m <= 0:
@@ -231,6 +235,30 @@ class CaptureRoute:
         values.update(self._geometry_columns(QgsGeometry.fromPointXY(QgsPointXY(point))))
         return values
 
+    def values_at_kps(self, kind: str, kp_km: float, kp_end_km: Optional[float] = None) -> Dict:
+        """Validate user-entered KPs before calculating a point or range.
+
+        An endpoint rounded just outside the route at display precision (1 m)
+        is accepted at that endpoint. Other out-of-route values are rejected.
+        """
+        if kind not in (model.REF_ROUTE_POINT, model.REF_KP_RANGE):
+            raise ValueError("Only route points and KP ranges can be positioned by KP.")
+        kps = [kp_km, kp_end_km] if kind == model.REF_KP_RANGE else [kp_km]
+        checked = []
+        for value in kps:
+            if value is None or not math.isfinite(float(value)):
+                raise ValueError("Enter a finite KP for each end of the comment.")
+            value = float(value)
+            if not self.start_kp_km <= value <= self.end_kp_km:
+                for bound in (self.start_kp_km, self.end_kp_km):
+                    if value == float(f"{bound:.3f}"):
+                        value = bound
+                        break
+                else:
+                    raise ValueError(f"KPs must be between {self.start_kp_km:.3f} and {self.end_kp_km:.3f} km.")
+            checked.append(value)
+        return self.range_values(*checked) if kind == model.REF_KP_RANGE else self.point_values(checked[0])
+
     def nearest(self, point_xy) -> Tuple[float, float, Optional[QgsPointXY]]:
         """``(kp_km, dcc_m, snapped point)`` nearest ``point_xy`` (``crs``)."""
         hit = self.route.kp_at_point(QgsPointXY(point_xy))
@@ -265,8 +293,13 @@ class CaptureRoute:
         """A free location given in latitude/longitude."""
         point = QgsPointXY(float(lon), float(lat))
         if self.crs.authid() != WGS84:
-            point = QgsCoordinateTransform(QgsCoordinateReferenceSystem(WGS84), self.crs,
-                                           QgsProject.instance()).transform(point)
+            try:
+                point = QgsCoordinateTransform(QgsCoordinateReferenceSystem(WGS84), self.crs,
+                                               QgsProject.instance()).transform(point)
+            except QgsCsException as exc:
+                raise ValueError(f"The position could not be transformed to the route CRS: {exc}") from exc
+        if not (math.isfinite(point.x()) and math.isfinite(point.y())):
+            raise ValueError("The position lies outside the route CRS.")
         return self.location_values(point)
 
 
@@ -355,6 +388,43 @@ class ReferenceChecker:
             if layer.isValid():
                 return layer, "file"
         return None, ""
+
+    def capture_for_edit(self, comment: Dict) -> Optional[CaptureRoute]:
+        """Resolve the original route and KP basis for an explicit position edit.
+
+        Never transfer a comment to changed geometry or the current reference
+        layer. Old, unreferenced map locations can still be edited by position.
+        """
+        linked = any(comment.get(k) for k in ("route_hash", "route_layer_id", "route_source", "rpl_id"))
+        if not linked and comment.get("ref_kind") == model.REF_LOCATION:
+            return None
+        layer, _how = self._find_layer(comment)
+        if layer is None:
+            raise ValueError("The comment's route is unavailable. Restore its original route to edit the position.")
+        if comment.get("route_hash") and route_fingerprint(layer) != comment["route_hash"]:
+            raise ValueError("The comment's route geometry has changed. Restore its original route to edit the "
+                             "position using the saved KPs.")
+        token = comment.get("kp_convention") or ""
+        use_cartesian, grid_crs = None, None
+        if token == "geodesic:WGS84":
+            use_cartesian = False
+        elif token.startswith("grid:"):
+            use_cartesian = True
+            grid_crs = token.split(":", 1)[1]
+            grid = QgsCoordinateReferenceSystem(grid_crs)
+            if not grid.isValid() or grid.isGeographic():
+                raise ValueError("The comment's saved KP grid cannot be restored: " + token)
+        elif token:
+            raise ValueError("The comment's saved KP convention cannot be restored: " + token)
+        # Use the capture CRS too: nearest-point calculations must match capture.
+        crs = QgsCoordinateReferenceSystem(comment.get("geom_crs") or "")
+        if not crs.isValid():
+            crs = layer.crs()
+        capture = CaptureRoute.from_layer(layer, crs, start_kp_km=comment.get("start_kp_km"),
+                                          use_cartesian=use_cartesian, grid_crs=grid_crs)
+        if token and capture.identity()["kp_convention"] != token:
+            raise ValueError("The comment's saved KP convention could not be restored.")
+        return capture
 
     def route_state(self, comment: Dict) -> RouteState:
         key = (comment.get("route_layer_id") or "", _norm_source(comment.get("route_source") or ""),

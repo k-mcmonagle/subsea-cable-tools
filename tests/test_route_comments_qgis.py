@@ -663,7 +663,8 @@ def test_dock(folder):
             model.load_custom(stored) == {dock.fields[0].field_id: "Geotech"}
         checks["editable columns only"] = bool(dock.table_model.flags(dock.table_model.index(0, 2))
                                                & Qt.ItemFlag.ItemIsEditable) and \
-            not bool(dock.table_model.flags(dock.table_model.index(0, 1)) & Qt.ItemFlag.ItemIsEditable)
+            bool(dock.table_model.flags(dock.table_model.index(0, 1)) & Qt.ItemFlag.ItemIsEditable) and \
+            not bool(dock.table_model.flags(dock.table_model.index(0, 0)) & Qt.ItemFlag.ItemIsEditable)
         dock.proxy.setData(cell(cid, "text"), "   ", Qt.ItemDataRole.EditRole)
         checks["empty text refused"] = dock.store.get_comment(cid)["text"] == "From another project"
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -368,6 +369,32 @@ def kp_text(comment: Dict, places: int = 3) -> str:
     elif comment.get("ref_kind") == REF_LOCATION:
         text = "~" + text
     return text
+
+
+def parse_kp_edit(comment: Dict, text: str) -> Tuple[float, Optional[float]]:
+    """Read a table KP or KP range in km, keeping untouched stored precision."""
+    kind = comment.get("ref_kind")
+    if kind not in (REF_ROUTE_POINT, REF_KP_RANGE):
+        raise ValueError("A map location's nearest KP is calculated from its coordinates. "
+                         "Use Edit position to change latitude and longitude.")
+    number = r"[+-]?(?:[0-9]+(?:\.[0-9]{0,3})?|\.[0-9]{1,3})"
+    pattern = f"({number})"
+    if kind == REF_KP_RANGE:
+        pattern += rf"\s*(?:–|—|-|to)\s*({number})"
+    match = re.fullmatch(pattern, str(text).strip(), re.IGNORECASE)
+    hint = "two KPs, for example 12.345 – 13.456" if kind == REF_KP_RANGE else "one KP, for example 12.345"
+    if match is None:
+        raise ValueError(f"Enter {hint}, in km with up to 3 decimal places (1 m).")
+    values = []
+    for key, raw in zip(("kp_km", "kp_end_km"), match.groups()):
+        value = float(raw)
+        if not math.isfinite(value):
+            raise ValueError("KPs must be finite numbers in km.")
+        initial = comment.get(key)
+        if initial is not None and value == float(f"{float(initial):.3f}"):
+            value = float(initial)
+        values.append(value)
+    return values[0], values[1] if len(values) > 1 else None
 
 
 def route_text(comment: Dict) -> str:
