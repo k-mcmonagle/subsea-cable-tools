@@ -22,6 +22,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **Burial Planner — Ground Model horizons (beta - check outputs):** import interpreted horizons from 2D DXF sections, calibrate their KP and depth references, and show, rename, recolour or edit their vertices over the ground plot. Horizons are saved with the plan without changing soil classes or burial calculations; check the import preview and reference warnings before use.
+
 ### Improved
 
 - **Route Comments — KP editing:** KP values use 3 decimal places (1 m), and table KPs can be edited with route validation and an old/new confirmation; derived nearest KPs open coordinate editing instead. New-comment forms, position dialogs and table KP edits preview unsaved points and ranges in blue on the map, with **Zoom to preview** in the dialogs; untouched position precision, existing registers and saved table layouts are preserved.

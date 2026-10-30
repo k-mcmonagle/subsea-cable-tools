@@ -27,7 +27,7 @@ from qgis.PyQt.QtCore import QPointF, QRectF, Qt, pyqtSignal
 from qgis.PyQt.QtGui import QColor, QPolygonF
 from qgis.PyQt.QtWidgets import QLabel, QVBoxLayout, QWidget
 
-from . import ground_model, schema
+from . import ground_model, horizons, schema
 
 _PEN_STYLE = getattr(Qt, "PenStyle", Qt)
 _MOUSE_LEFT = getattr(Qt, "MouseButton", Qt).LeftButton
@@ -177,6 +177,11 @@ class GroundModelPlot(QWidget):
         self._classes_by_code: Dict[str, Dict] = {}
         self._scope = (0.0, 0.0)
         self._target_m: Optional[float] = None
+        self._horizons = []
+        self._horizon_items = []
+        self._horizon_pool = []
+        self._horizon_index = []
+        self._horizon_extent = (0.0, 0.0)
 
         from ..kp_axis_item import KPAxisItem
         kp_axis = KPAxisItem()
@@ -261,6 +266,11 @@ class GroundModelPlot(QWidget):
         layout.setSpacing(0)
         layout.addWidget(self.legend)
         layout.addWidget(self.cpt_legend)
+        self.horizon_legend = QLabel()
+        self.horizon_legend.setWordWrap(True)
+        self.horizon_legend.setContentsMargins(8, 0, 8, 0)
+        self.horizon_legend.hide()
+        layout.addWidget(self.horizon_legend)
         layout.addWidget(self.plot, 1)
 
         self.plot.scene().sigMouseMoved.connect(self._mouse_moved)
@@ -279,6 +289,47 @@ class GroundModelPlot(QWidget):
                   for code in codes}
         self._unit_item.set_units(self._units, colors)
         self._update_legend(codes, colors)
+        self._fit_depth()
+
+    def set_horizons(self, rows) -> None:
+        """Independent overlays; one plot item per horizon, NaNs between parts."""
+        visible = [row for row in rows if row.get("visible", True)]
+        if visible == self._horizons:
+            return
+        import copy
+        self._horizons = copy.deepcopy(visible)
+        # Reuse graphics objects: detaching PlotDataItem from a scene raises
+        # QVariant conversion errors on some QGIS 3 / PyQt5 builds.
+        for item in self._horizon_pool:
+            item.setData([], [])
+            item.hide()
+        self._horizon_items = []
+        self._horizon_index = []
+        low, high = 0.0, 0.0
+        labels = []
+        for index, row in enumerate(visible):
+            colour = QColor(row.get("colour") or "#9c27b0")
+            if not colour.isValid():
+                colour = QColor("#9c27b0")
+            xs, ys = horizons.plot_arrays(row["segments"])
+            if index == len(self._horizon_pool):
+                item = self.plot.plot([], [], connect="finite")
+                item.setZValue(10)
+                self._horizon_pool.append(item)
+            item = self._horizon_pool[index]
+            item.setPen(pg.mkPen(colour, width=2))
+            item.setData(xs, ys, connect="finite")
+            item.show()
+            self._horizon_items.append(item)
+            for segment in row["segments"]:
+                low = min(low, min(p[1] for p in segment))
+                high = max(high, max(p[1] for p in segment))
+                self._horizon_index.append((row["name"], segment, [p[0] for p in segment]))
+            labels.append(f"<span style='color:{colour.name()}'>&#9473;</span> {_esc(row['name'])}")
+        self._horizon_extent = (low, high)
+        self.horizon_legend.setText(" &nbsp; ".join(labels[:12])
+                                   + (f" &nbsp; +{len(labels) - 12} horizons" if len(labels) > 12 else ""))
+        self.horizon_legend.setVisible(bool(labels))
         self._fit_depth()
 
     def set_numeric(self, index=None, settings=None):
@@ -417,18 +468,23 @@ class GroundModelPlot(QWidget):
         self._unit_item.set_selected(unit_id)
 
     def clear(self) -> None:
+        self.set_horizons([])
         self.set_units([], [])
         self._vline.setVisible(False)
         self._readout.setVisible(False)
 
     def _fit_depth(self) -> None:
         if self._numeric_depth is not None:
-            self.plot.getPlotItem().vb.setYRange(*self._numeric_depth, padding=0)
+            lo, hi = self._numeric_depth
+            if self._horizons:
+                lo, hi = min(lo, self._horizon_extent[0]), max(hi, self._horizon_extent[1])
+            self.plot.getPlotItem().vb.setYRange(lo, hi, padding=0)
             return
         cpt_depth = self._cpt_item.depth_extent if self._cpt_item.isVisible() else 0.0
-        deepest = max(self._unit_item.depth_extent, self._target_m or 0.0, cpt_depth)
+        deepest = max(self._unit_item.depth_extent, self._target_m or 0.0, cpt_depth,
+                      self._horizon_extent[1])
         span = max(deepest + _OPEN_EXTRA_M, _MIN_DEPTH_SPAN_M)
-        self.plot.getPlotItem().vb.setYRange(0.0, span, padding=0.04)
+        self.plot.getPlotItem().vb.setYRange(self._horizon_extent[0], span, padding=0.04)
 
     def _update_legend(self, codes: List[str], colors: Dict[str, str]) -> None:
         if not codes:
@@ -486,6 +542,12 @@ class GroundModelPlot(QWidget):
     def _readout_text(self, kp: float, depth: float) -> str:
         text = self._ground_readout(kp, depth)
         cpt_lines = self._cpt_lines(kp, depth)
+        tolerance = abs(self.plot.viewRange()[1][1] - self.plot.viewRange()[1][0]) * 0.025
+        for name, segment, xs in self._horizon_index:
+            if xs[0] <= kp <= xs[-1]:
+                value = horizons.interpolate(segment, xs, kp)
+                if abs(value - depth) <= tolerance:
+                    cpt_lines.append(f"{name}: {value:.3f} m below seabed")
         return "\n".join([text] + cpt_lines) if cpt_lines else text
 
     def _ground_readout(self, kp: float, depth: float) -> str:

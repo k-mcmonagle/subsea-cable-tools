@@ -44,7 +44,7 @@ from ...qgis_compat import (
     SELECTION_MODE_EXTENDED,
     qt_exec,
 )
-from .. import change_log, ground_model, schema, ui_helpers
+from .. import change_log, ground_model, horizons, schema, ui_helpers
 from ..ground_dialogs import ClassesDialog, GroundImportDialog, RereferenceDialog
 from ..cpt_panel import CptPanel
 from ..ground_plot import GroundModelPlot
@@ -89,6 +89,8 @@ class GroundTab(QWidget):
         self._dirty = False
         self._loaded_plan_id = ""
         self._working: List[Dict] = []
+        self._horizon_params = None
+        self._horizon_rows = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -110,6 +112,13 @@ class GroundTab(QWidget):
                                      "cone penetration tests (AGS 3 / AGS 4).")
         mode_row.addWidget(self.display_mode)
         self._mode_row = mode_row
+        self.horizons_button = QPushButton("Horizons…")
+        self.horizons_button.setToolTip("Import, show and edit interpreted sub-bottom horizons from DXF sections.")
+        self.horizons_button.clicked.connect(self._manage_horizons)
+        mode_row.addWidget(self.horizons_button)
+        self.horizon_status = QLabel()
+        self.horizon_status.setWordWrap(True)
+        mode_row.addWidget(self.horizon_status)
         mode_row.addStretch()
         layout.addLayout(mode_row)
 
@@ -301,7 +310,7 @@ class GroundTab(QWidget):
         for button in (self.import_button, self.export_button,
                        self.rereference_button, self.add_button,
                        self.duplicate_button, self.remove_button,
-                       self.split_button, self.apply_button, self.revert_button):
+                       self.split_button, self.apply_button, self.revert_button, self.horizons_button):
             button.setEnabled(has_plan)
         self.classes_button.setEnabled(True)
         if not has_plan:
@@ -310,6 +319,9 @@ class GroundTab(QWidget):
             self._loaded_plan_id = ""
             self._rebuild_table()
             self.plot.clear()
+            self.horizon_status.clear()
+            self._horizon_params = None
+            self._horizon_rows = []
             self._set_status("No plan selected.")
             return
         if self._dirty and plan_id == self._loaded_plan_id:
@@ -333,6 +345,47 @@ class GroundTab(QWidget):
                                   if self.model.plan else [])
         self.numeric.render()
         self.cpts.render()
+        self._refresh_horizons()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Sampling happens on another tab; refresh reference notices on return.
+        self._refresh_horizons()
+
+    def _manage_horizons(self):
+        from ..horizon_dialogs import HorizonsDialog
+        try:
+            dialog = HorizonsDialog(self.model, self.dock, self)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Sub-bottom horizons", str(exc))
+            return
+        if qt_exec(dialog) == DIALOG_ACCEPTED:
+            self._refresh_horizons()
+
+    def _refresh_horizons(self):
+        from ..horizon_dialogs import reference_notice, route_reference
+        try:
+            params = self.model.plan.get("params_json") or "{}"
+            if params != self._horizon_params:
+                rows = horizons.plan_rows(self.model.plan)
+                self._horizon_rows, self._horizon_params = rows, params
+            route = route_reference(self.model) if self._horizon_rows else None
+            rows, notices = [], []
+            for row in self._horizon_rows:
+                notice = reference_notice(row, self.model, route)
+                if notice:
+                    notices.append(f"{row['name']}: {notice}")
+                # A changed route/KP datum must not display picks at wrong KPs.
+                if (row.get("source") or {}).get("route") == route:
+                    rows.append(row)
+            self.plot.set_horizons(rows)
+            self.horizon_status.setText(f"{len(self._horizon_rows)} horizon(s)" + (" — check reference" if notices else "")
+                                        if self._horizon_rows else "")
+            self.horizon_status.setToolTip("\n".join(notices))
+        except ValueError as exc:
+            self.plot.set_horizons([])
+            self.horizon_status.setText("Horizons unavailable")
+            self.horizon_status.setToolTip(str(exc))
 
     def _update_status(self) -> None:
         if not self._working:
@@ -807,5 +860,5 @@ class GroundTab(QWidget):
 
     def sync_kp(self, kp: float) -> None:
         """Mirror the profile crosshair (called by the dock)."""
-        if self._working:
+        if self._working or self._horizon_rows:
             self.plot.show_kp(kp, 0.0)

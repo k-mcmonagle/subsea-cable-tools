@@ -6,6 +6,8 @@ The top-level [README](../README.md) is the short introduction and tool list. Us
 
 - [RPL event comparison](RPL_EVENT_COMPARISON.md) — pairing design and as-laid events, offset conventions, filters and the report.
 
+- [Sub-bottom horizons](SUBBOTTOM_HORIZONS.md) — DXF section import, coordinate calibration, overlays and editing.
+
 - [Numeric Ground Model datasets](GROUND_NUMERIC_PROFILES.md) — measurements, live KP ranges, colour classes, checks and export.
 
 - [CPTs from AGS files](GEOTECHNICAL_CPT.md) — AGS 3 / AGS 4 CPT import with a position and summary table, placement along the route, traces, logs and the derived parameters.
