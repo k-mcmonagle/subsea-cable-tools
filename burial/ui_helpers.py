@@ -22,7 +22,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from qgis.PyQt.QtCore import QObject, Qt
+from qgis.PyQt.QtCore import QEvent, QObject, QSettings, Qt, QTimer
 from qgis.PyQt.QtGui import QColor, QPalette
 from qgis.PyQt.QtWidgets import (
     QApplication,
@@ -42,6 +42,7 @@ from qgis.PyQt.QtWidgets import (
 from ..qgis_compat import (
     BUTTON_BOX_CANCEL,
     BUTTON_BOX_OK,
+    HEADER_RESIZE_MODE_INTERACTIVE,
     ITEM_DATA_USER_ROLE,
     TOOLBUTTON_POPUP_MODE_INSTANT,
 )
@@ -330,6 +331,75 @@ def coalesced(parent, fn: Callable, interval_ms: int = 0) -> Callable:
 
     trigger._timer = timer  # keep a reference alive with the slot
     return trigger
+
+
+class ContentSizedColumn(QObject):
+    """Fit a name column by default, with a persistent draggable divider.
+
+    Double-clicking the divider restores automatic fitting. Leave room
+    for the adjacent route bar even when a criterion has a long caption.
+    Owned timers and bound slots keep callbacks within the table lifetime.
+    """
+
+    def __init__(self, table, column: int, bar_column: int, settings_key: str):
+        super().__init__(table)
+        self.table = table
+        self.column = column
+        self.bar_column = bar_column
+        self.settings_key = settings_key
+        self._fitting = False
+        try:
+            self._width = max(0, int(QSettings().value(settings_key, 0)))
+        except (TypeError, ValueError):
+            self._width = 0
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(column, HEADER_RESIZE_MODE_INTERACTIVE)
+        if self._width:
+            header.resizeSection(column, self._width)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.fit)
+        header.sectionResized.connect(self._resized)
+        header.sectionHandleDoubleClicked.connect(self._reset)
+        table.viewport().installEventFilter(self)
+        table.setWordWrap(False)
+
+    def eventFilter(self, watched, event):
+        if event.type() in (QEvent.Type.Resize, QEvent.Type.Show) and not self._width:
+            self._timer.start(0)
+        return super().eventFilter(watched, event)
+
+    def fit(self) -> None:
+        if self._width or self._fitting:
+            return
+        self._fitting = True
+        try:
+            table = self.table
+            table.resizeColumnToContents(self.column)
+            others = sum(table.columnWidth(c) for c in range(table.columnCount())
+                         if c not in (self.column, self.bar_column)
+                         and not table.isColumnHidden(c))
+            available = table.viewport().width() - others - 160
+            minimum = table.horizontalHeader().sectionSizeHint(self.column)
+            table.setColumnWidth(self.column,
+                                 max(minimum, min(table.columnWidth(self.column), available)))
+        finally:
+            self._fitting = False
+
+    def _resized(self, column, _old, width) -> None:
+        if self._fitting:
+            return
+        if column == self.column:
+            self._width = width
+            QSettings().setValue(self.settings_key, width)
+        elif column != self.bar_column and not self._width:
+            self._timer.start(0)
+
+    def _reset(self, column) -> None:
+        if column == self.column:
+            self._width = 0
+            QSettings().remove(self.settings_key)
+            self._timer.start(0)
 
 
 def _column_labels(table) -> List[str]:

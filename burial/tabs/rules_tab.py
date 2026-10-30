@@ -73,7 +73,7 @@ from ...workbench.kp_bars import (
     intervals_by_distance,
 )
 from ...workbench.rules_engine import STATUS_EXCLUDED, STATUS_RISK
-from .. import analysis_state, change_log, generation, profile_data, schema
+from .. import analysis_state, change_log, coverage, generation, profile_data, schema
 from .. import ui_helpers
 from .attribute_widgets import (
     AttributeRulesTable,
@@ -1086,9 +1086,9 @@ class RulesTab(QWidget):
         self.overview.kpClicked.connect(self.dock.goto_kp)
         layout.addWidget(self.overview)
 
-        self.rule_table = QTableWidget(0, 4)
+        self.rule_table = QTableWidget(0, 5)
         self.rule_table.setHorizontalHeaderLabels(
-            ["On", "Criterion", "Excluded sections", "Coverage"])
+            ["On", "Criterion", "Excluded sections", "Total affected", "Sole exclusion"])
         criterion_header = self.rule_table.horizontalHeaderItem(1)
         if criterion_header is not None:
             criterion_header.setToolTip(_BADGE_LEGEND)
@@ -1105,17 +1105,30 @@ class RulesTab(QWidget):
                                         self._fire_delegate,
                                         self._fire_tooltip)
         header = self.rule_table.horizontalHeader()
-        # On/Coverage size to their contents so "12.345 km · 12.34 %" is
-        # never clipped; the name and the bar share the remaining width.
         header.setSectionResizeMode(0, HEADER_RESIZE_MODE_CONTENTS)
-        header.setSectionResizeMode(1, HEADER_RESIZE_MODE_STRETCH)
         header.setSectionResizeMode(FIRE_COL, HEADER_RESIZE_MODE_STRETCH)
         header.setSectionResizeMode(3, HEADER_RESIZE_MODE_CONTENTS)
+        header.setSectionResizeMode(4, HEADER_RESIZE_MODE_CONTENTS)
+        ui_helpers.enable_column_menu(
+            self.rule_table, "SubseaCableTools/BurialPlanner/rules_coverage_columns",
+            always_visible=(0, 1, FIRE_COL))
+        self._name_column = ui_helpers.ContentSizedColumn(
+            self.rule_table, 1, FIRE_COL,
+            "SubseaCableTools/BurialPlanner/rules_name_width")
+        header.setToolTip(
+            "Drag the divider after Criterion to resize; double-click it to fit "
+            "the names again. Right-click to show or hide coverage columns.")
+        self.rule_table.horizontalHeaderItem(4).setToolTip(
+            "Length and percentage of the plan scope covered by this criterion "
+            "and no other enabled exclusion criterion for this burial method. "
+            "Includes extension buffers and respects resolved allow exceptions; excludes "
+            "added slivers and plan-generation constraints. Screening and missing-data checks "
+            "do not exclude and do not subtract from this figure.")
         coverage_header = self.rule_table.horizontalHeaderItem(3)
         if coverage_header is not None:
             coverage_header.setToolTip(
                 "Length and share of the scope where the criterion fired "
-                "(resolved, extension buffers included). \"no data\" is the "
+                "(extension buffers included, overlaps counted for each criterion). \"no data\" is the "
                 "length it could not evaluate (Insufficient Information).")
         self.rule_table.itemChanged.connect(self._on_item_changed)
         self.rule_table.doubleClicked.connect(lambda _index: self._edit_rule())
@@ -1324,6 +1337,32 @@ class RulesTab(QWidget):
                 "source": "none", "rule_state": {}, "reasons": []}
             self._analysis_status = status
             everything_stale = bool(status.get("reasons"))
+            applicable = [r for r in rules if int(r.get("enabled") or 0)
+                          and coverage.applies_to_method(r, params.method)]
+            exclusion_ids = {str(r.get("rule_id")) for r in applicable
+                             if coverage.is_exclusion(r)}
+            # Allow exceptions can remove exclusions. Compare the original
+            # footprints, but count sole coverage only where still excluded.
+            has_allow = any(r.get("action") == wb_schema.RULE_ACTION_ALLOW for r in applicable)
+            excluded = ([(v.start_km, v.end_km) for v in self._current_verdicts()
+                         if v.status == STATUS_EXCLUDED] if has_allow else None)
+            exclusive = coverage.route_coverage(
+                {rid: rule_hits.get(rid, []) for rid in exclusion_ids}, scope,
+                unique_within=excluded)
+            relevant_ids = set(exclusion_ids)
+            mask_current = True
+            if has_allow:
+                # A disabled/deleted exclusion may previously have reasserted
+                # a range after an allow exception; its old verdict is unsafe.
+                relevant_ids.update(str(r.get("rule_id")) for r in rules
+                                    if coverage.applies_to_method(r, params.method)
+                                    and (coverage.is_exclusion(r)
+                                         or r.get("action") == wb_schema.RULE_ACTION_ALLOW))
+                mask_current = not (set(rule_hits) - {str(r.get("rule_id")) for r in rules})
+            unique_current = not everything_stale and mask_current and all(
+                status["rule_state"].get(rid) == analysis_state.STATE_CURRENT
+                for rid in relevant_ids)
+            totals = coverage.route_coverage(rule_hits, scope)
             for i, rule in enumerate(rules):
                 on_item = QTableWidgetItem()
                 on_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
@@ -1347,7 +1386,7 @@ class RulesTab(QWidget):
                         text += "  — flags for assessment, does not exclude"
                 name_item = QTableWidgetItem(text)
                 name_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-                tooltip = f"{schema.CRITERION_LABELS.get(rule.get('criterion_class') or '', '')}"
+                tooltip = text + "\n" + schema.CRITERION_LABELS.get(rule.get('criterion_class') or '', '')
                 if rule.get("source_ref"):
                     tooltip += f"\nSource: {rule.get('source_ref')}"
                 name_item.setToolTip(tooltip.strip())
@@ -1376,7 +1415,7 @@ class RulesTab(QWidget):
                                    {"stale": stale, "nodata": nodata}))
                 self.rule_table.setItem(i, FIRE_COL, fire_item)
 
-                covered = sum(e - s for s, e in intervals)
+                covered = totals.get(rule_id, coverage.Coverage()).total_km
                 pct = 100.0 * covered / domain_km if domain_km > 0 else 0.0
                 missing = sum(e - s for s, e in nodata)
                 evaluated = state in (analysis_state.STATE_CURRENT,
@@ -1414,6 +1453,33 @@ class RulesTab(QWidget):
                     coverage_item.setToolTip(coverage_tip)
                 coverage_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
                 self.rule_table.setItem(i, 3, coverage_item)
+
+                if not int(rule.get("enabled") or 0):
+                    unique_text, unique_tip = "off", "Disabled — not part of the comparison."
+                elif not coverage.is_exclusion(rule):
+                    unique_text, unique_tip = "n/a", "This criterion does not exclude route sections."
+                elif rule_id not in exclusion_ids:
+                    unique_text, unique_tip = "n/a", "This criterion does not apply to the current burial method."
+                elif not unique_current:
+                    unique_text = "—"
+                    unique_tip = ("Recompute to compare all enabled exclusion criteria: "
+                                  "at least one result is missing or out of date. A change "
+                                  "to another criterion can change this one's sole contribution.")
+                else:
+                    contribution = exclusive[rule_id]
+                    unique_text = coverage.length_label(contribution.unique_km, domain_km)
+                    unique_tip = (
+                        f"Sole exclusion: {unique_text} of the plan scope.\n"
+                        f"Overlap with other exclusions or cleared by allow exceptions: "
+                        f"{max(0.0, contribution.total_km - contribution.unique_km):.3f} km.\n"
+                        "Compares enabled exclusion footprints for this burial method, "
+                        "including extensions, with allow exceptions respected. Sliver merging, other plan constraints "
+                        "or missing data may still prevent burial here.")
+                unique_item = QTableWidgetItem(unique_text)
+                unique_item.setToolTip(unique_tip)
+                unique_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                self.rule_table.setItem(i, 4, unique_item)
+            self._name_column.fit()
             self._refresh_overview()
             self._refresh_resolved()
             self._refresh_status_line()

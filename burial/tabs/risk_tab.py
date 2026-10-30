@@ -71,7 +71,7 @@ from ...workbench.kp_bars import (
 )
 from ...workbench.rules_engine import Interval
 from ...workbench import rules_engine as eng
-from .. import (analysis_state, analysis_task, map_layers, risk, risk_scan,
+from .. import (analysis_state, analysis_task, coverage, map_layers, risk, risk_scan,
                 schema)
 from .. import ui_helpers
 from .attribute_widgets import (
@@ -83,7 +83,7 @@ from .attribute_widgets import (
 )
 
 _CHECK_FIRE_COL = 2
-_CHECK_COLUMNS = ["On", "Check", "Findings", "Hazards · extent"]
+_CHECK_COLUMNS = ["On", "Check", "Findings", "Hazards · total extent", "Unique extent"]
 _CHECK_COUNT_COL = 3
 
 _HAZARD_COLUMNS = ["Risk", "Status", "KP", "End KP", "Offset (m)", "X-ing",
@@ -537,16 +537,32 @@ class RiskTab(QWidget):
                                         self._fire_tooltip)
         header = self.check_table.horizontalHeader()
         header.setSectionResizeMode(0, HEADER_RESIZE_MODE_CONTENTS)
-        header.setSectionResizeMode(1, HEADER_RESIZE_MODE_STRETCH)
         header.setSectionResizeMode(_CHECK_FIRE_COL, HEADER_RESIZE_MODE_STRETCH)
         header.setSectionResizeMode(_CHECK_COUNT_COL,
                                     HEADER_RESIZE_MODE_CONTENTS)
+        header.setSectionResizeMode(4, HEADER_RESIZE_MODE_CONTENTS)
+        ui_helpers.enable_column_menu(
+            self.check_table, "SubseaCableTools/BurialPlanner/risk_coverage_columns",
+            always_visible=(0, 1, _CHECK_FIRE_COL))
+        self._name_column = ui_helpers.ContentSizedColumn(
+            self.check_table, 1, _CHECK_FIRE_COL,
+            "SubseaCableTools/BurialPlanner/risk_name_width")
+        header.setToolTip(
+            "Drag the divider after Check to resize; double-click it to fit the "
+            "names again. Right-click to show or hide coverage columns.")
+        self.check_table.horizontalHeaderItem(4).setToolTip(
+            "Length and percentage of the plan scope covered only by this check's "
+            "hazards, compared with other enabled checks. This is hazard coverage, "
+            "not an exclusion or a risk score. Uses the displayed extent, including "
+            "±25 m around point and very short hazards. Manual hazards without "
+            "a check are not part of this comparison.")
         count_header = self.check_table.horizontalHeaderItem(_CHECK_COUNT_COL)
         if count_header is not None:
             count_header.setToolTip(
                 "Hazards found by the check's last scan, and the length and "
-                "share of the scope they cover (range hazards at their true "
-                "extent; point hazards as the ±25 m drawn on the bar).")
+                "share of the plan scope they cover, including overlaps with "
+                "other checks. Uses the displayed extent clipped to the scope "
+                "(±25 m around point and very short hazards).")
         self.check_table.itemChanged.connect(self._on_check_item_changed)
         self.check_table.doubleClicked.connect(lambda _i: self._edit_check())
         self.check_table.setContextMenuPolicy(CONTEXT_MENU_POLICY_CUSTOM)
@@ -684,6 +700,17 @@ class RiskTab(QWidget):
             run_state = self.model.risk_status() if has_plan else {}
             self._run_state = run_state
             domain_km = scope.length_km if has_plan else 0.0
+            spans_by_check = {
+                str(c.get("check_id") or ""): [(s, e) for s, e, _level in
+                    risk.hazard_spans(by_check.get(str(c.get("check_id") or ""), []))]
+                for c in checks}
+            enabled_ids = {str(c.get("check_id") or "") for c in checks
+                           if int(c.get("enabled") or 0)}
+            exclusive = coverage.route_coverage(
+                {cid: spans_by_check[cid] for cid in enabled_ids}, scope)
+            unique_current = all(
+                (run_state.get(cid) or {}).get("state") == analysis_state.STATE_CURRENT
+                for cid in enabled_ids)
 
             self._checks_view = ui_helpers.preserve_table_view(
                 self.check_table)
@@ -703,17 +730,17 @@ class RiskTab(QWidget):
                 name_item = QTableWidgetItem(check.get("name") or "")
                 name_item.setFlags(Qt.ItemFlag.ItemIsEnabled
                                    | Qt.ItemFlag.ItemIsSelectable)
-                if check.get("source_ref"):
-                    name_item.setToolTip(f"Source: {check.get('source_ref')}")
+                name_item.setToolTip((check.get("name") or "") + (
+                    f"\nSource: {check.get('source_ref')}" if check.get("source_ref") else ""))
                 self.check_table.setItem(i, 1, name_item)
 
                 found = by_check.get(str(check.get("check_id") or ""), [])
                 worst = schema.RISK_UNASSIGNED
                 for hazard in found:
                     worst = risk.risk_max(worst, hazard.get("risk") or "")
-                intervals = [(s, e) for s, e, _level in
-                             risk.hazard_spans(found)]
                 check_id = str(check.get("check_id") or "")
+                intervals = [(iv.start_km, iv.end_km) for iv in eng.clip_intervals(
+                    [Interval(s, e) for s, e in spans_by_check[check_id]], scope)]
                 run = run_state.get(check_id) or {}
                 state = run.get("state", analysis_state.STATE_NEW)
                 stale = bool(found) and state == analysis_state.STATE_CHANGED
@@ -734,7 +761,28 @@ class RiskTab(QWidget):
                 count_item.setFlags(Qt.ItemFlag.ItemIsEnabled
                                     | Qt.ItemFlag.ItemIsSelectable)
                 self.check_table.setItem(i, _CHECK_COUNT_COL, count_item)
+                if check_id not in enabled_ids:
+                    unique_text, unique_tip = "off", "Disabled — not part of the comparison."
+                elif not unique_current:
+                    unique_text = "—"
+                    unique_tip = ("Run all enabled checks to compare their coverage: "
+                                  "at least one scan is missing or out of date.")
+                else:
+                    contribution = exclusive[check_id]
+                    unique_text = coverage.length_label(contribution.unique_km, domain_km)
+                    unique_tip = (
+                        f"Covered only by this check: {unique_text} of the plan scope.\n"
+                        f"Also covered by other enabled checks: "
+                        f"{max(0.0, contribution.total_km - contribution.unique_km):.3f} km.\n"
+                        "Hazard coverage, not excluded route. Uses displayed extents "
+                        "(±25 m around point and very short hazards), clipped to the scope; "
+                        "manual hazards without a check are not compared.")
+                unique_item = QTableWidgetItem(unique_text)
+                unique_item.setToolTip(unique_tip)
+                unique_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                self.check_table.setItem(i, 4, unique_item)
             self._checks_view.__exit__(None, None, None)
+            self._name_column.fit()
 
             self._refresh_hazards()
             self._refresh_overview(scope)
