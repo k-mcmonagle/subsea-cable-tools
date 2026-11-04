@@ -31,10 +31,12 @@ from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsCsException,
+    QgsFeature,
     QgsGeometry,
     QgsPointXY,
     QgsProject,
     QgsRasterLayer,
+    QgsRectangle,
     QgsSpatialIndex,
     QgsTask,
     QgsVectorLayer,
@@ -188,11 +190,48 @@ class DepthSnapshot:
         self.last_source = None
         self.last_cell_m = None
         layers = [project.mapLayer(layer_id) for layer_id in config.raster_layer_ids]
-        for layer in expand_rasters([l for l in layers if isinstance(l, QgsRasterLayer) and l.isValid()]):
-            sampler = RasterSampler(layer, self.band, clone=True)
+        layers = [layer for layer in layers if isinstance(layer, QgsRasterLayer) and layer.isValid()]
+        finest_first = getattr(config, "raster_priority", "finest") != "listed"
+        if finest_first and getattr(config, "raster_acquired_dates", None):
+            from datetime import date
+            from .map_layers import source_identity
+            dates = {}
+            for source, acquired in config.raster_acquired_dates.items():
+                try:
+                    dates[source_identity(source)] = date.fromisoformat(acquired).toordinal()
+                except (ValueError, TypeError):
+                    pass  # unknown dates never acquire an invented priority
+            # expand_rasters sorts by native resolution stably, so recency
+            # only wins ties; undated sources retain their relative order.
+            layers.sort(key=lambda layer: dates.get(source_identity(layer.source()), 0), reverse=True)
+        layers = expand_rasters(layers, sort_by_resolution=finest_first)
+        # Bound the total tile budget, rather than allowing every survey a
+        # separate 32 MiB cache (hundreds of sources otherwise consume GiB).
+        cache_bytes = min(32 * 1024 * 1024, (128 * 1024 * 1024) // max(1, len(layers)))
+        self._raster_index = QgsSpatialIndex()
+        self._unindexed_rasters = []
+        for layer in layers:
+            sampler = RasterSampler(layer, self.band, clone=True, cache_bytes=cache_bytes)
             transform = QgsCoordinateTransform(WGS84, layer.crs(), project) if layer.crs() != WGS84 else None
+            index = len(self._native_samplers)
             self._native_samplers.append((sampler, transform))
             self._rasters.append((sampler.provider, transform, None))
+            # Only candidate surveys need a CRS transform for each station.
+            # Uncertain/global bounds remain candidates so indexing cannot
+            # discard data around the antimeridian or a projection limit.
+            try:
+                bounds = (QgsCoordinateTransform(layer.crs(), WGS84, project)
+                          .transformBoundingBox(layer.extent()) if transform else QgsRectangle(layer.extent()))
+                if not bounds.isFinite() or bounds.width() > 180 or bounds.isEmpty():
+                    self._unindexed_rasters.append(index)
+                else:
+                    bounds.grow(1e-6)
+                    feature = QgsFeature(index)
+                    feature.setGeometry(QgsGeometry.fromRect(bounds))
+                    if not self._raster_index.addFeature(feature):
+                        self._unindexed_rasters.append(index)
+            except QgsCsException:
+                self._unindexed_rasters.append(index)
         # Last sampled cell per raster: consecutive stations finer than the
         # raster grid re-read the same cell, so memoising the previous cell
         # removes up to ~95% of the GDAL round-trips at fine profile steps.
@@ -340,9 +379,17 @@ class DepthSnapshot:
             return best
         return None
 
+    def _raster_candidates(self, bounds):
+        index = getattr(self, "_raster_index", None)
+        if index is None or bounds is None or bounds.width() > 180:
+            return self._native_samplers
+        indices = sorted(set(index.intersects(bounds)) | set(self._unindexed_rasters))
+        return [self._native_samplers[i] for i in indices]
+
     def _sample_rasters(self, point: QgsPointXY) -> Optional[float]:
         self.last_source = self.last_cell_m = None
-        for sampler, transform in self._native_samplers:
+        bounds = QgsRectangle(point.x(), point.y(), point.x(), point.y())
+        for sampler, transform in self._raster_candidates(bounds):
             try:
                 pt = transform.transform(point) if transform else point
             except QgsCsException:
@@ -540,7 +587,13 @@ class DepthSnapshot:
         sources: List[Optional[str]] = [None] * n
         cells: List[Optional[float]] = [None] * n
         pending = list(range(n))
-        for sampler, transform in self._native_samplers:
+        bounds = None
+        if getattr(self, "_raster_index", None) is not None and len(xs):
+            points = [p for p in transect_points(center, bearing, xs, distance, None) if p is not None]
+            if points:
+                bounds = QgsRectangle(min(p.x() for p in points), min(p.y() for p in points),
+                                      max(p.x() for p in points), max(p.y() for p in points))
+        for sampler, transform in self._raster_candidates(bounds):
             if not pending:
                 break
             points = transect_points(center, bearing, xs, distance, transform)

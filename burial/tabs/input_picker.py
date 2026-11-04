@@ -31,7 +31,6 @@ from qgis.PyQt.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
-    QTableWidget,
     QTableWidgetItem,
     QTreeWidget,
     QTreeWidgetItem,
@@ -39,6 +38,7 @@ from qgis.PyQt.QtWidgets import (
     QWidget,
     QCheckBox,
 )
+from ...table_widgets import ResizableTableWidget as QTableWidget
 
 from ...qgis_compat import (
     BUTTON_BOX_CANCEL,

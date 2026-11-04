@@ -22,6 +22,8 @@ settings or input changed since its scan is marked out of date.
 
 from __future__ import annotations
 
+from ...table_widgets import ResizableTableWidget
+
 import json
 from typing import Dict, List, Optional
 
@@ -623,7 +625,7 @@ class RiskTab(QWidget):
         export_button.clicked.connect(self._export_csv)
         register_header.addWidget(export_button)
         hazards_layout.addLayout(register_header)
-        self.hazard_table = QTableWidget(0, len(_HAZARD_COLUMNS))
+        self.hazard_table = ResizableTableWidget(0, len(_HAZARD_COLUMNS))
         self.hazard_table.setHorizontalHeaderLabels(_HAZARD_COLUMNS)
         offset_header = self.hazard_table.horizontalHeaderItem(4)
         if offset_header is not None:

@@ -401,6 +401,12 @@ class DepthProfileDockWidget(QDockWidget):
             "Lock the depth plot's aspect: 1 = true scale (1 m across = 1 m down), 10 = depths drawn 10× taller.\n"
             "Free lets both axes zoom independently. Measurements always use true distances.")
         view_row.addWidget(self.ve_spin)
+        self.true_scale_chk = QCheckBox("1:1 True scale")
+        self.true_scale_chk.setToolTip("Show one metre along the route at the same scale as one metre of depth.")
+        self.true_scale_chk.setChecked(self.ve_spin.value() == 1.0)
+        self._previous_ve = self.ve_spin.value() if self.ve_spin.value() != 1.0 else 0.0
+        self.true_scale_chk.toggled.connect(self._toggle_true_scale)
+        view_row.addWidget(self.true_scale_chk)
         self.save_png_btn = QPushButton("Save PNG…")
         self.save_png_btn.setToolTip("Save the plots, including measurements, as a PNG image")
         view_row.addWidget(self.save_png_btn)
@@ -1427,18 +1433,30 @@ class DepthProfileDockWidget(QDockWidget):
             action = menu.addAction("Centre map on this KP")
             action.triggered.connect(self._centre_map_on_context_station)
 
+    def _toggle_true_scale(self, checked):
+        if checked:
+            self._previous_ve = self.ve_spin.value()
+            self.ve_spin.setValue(1.0)
+        else:
+            self.ve_spin.setValue(self._previous_ve if self._previous_ve != 1.0 else 0.0)
+
     def _apply_aspect(self, *args):
+        ve = float(self.ve_spin.value())
+        if ve != 1.0:
+            self._previous_ve = ve
+        self.true_scale_chk.blockSignals(True)
+        self.true_scale_chk.setChecked(ve == 1.0)
+        self.true_scale_chk.blockSignals(False)
+        self.settings.setValue("DepthProfile/vertical_exaggeration", ve)
         ax = self._depth_axis
         if ax is None or _sip_isdeleted(ax.plot_item):
             return
-        ve = float(self.ve_spin.value())
         vb = ax.plot_item.vb
         if ve > 0:
             # ratio = x-scale / y-scale in pixels per plot unit; X is km, Y m.
             vb.setAspectLocked(True, ratio=1.0 / (ve * 0.001))
         else:
             vb.setAspectLocked(False)
-        self.settings.setValue("DepthProfile/vertical_exaggeration", ve)
 
     def _on_measure_mode(self, checked):
         if checked and self._depth_axis is None:

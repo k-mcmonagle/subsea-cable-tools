@@ -10,6 +10,7 @@ a tiled GeoTIFF, so depth values pass through untouched.
 
 from qgis.PyQt.QtCore import QCoreApplication
 import json
+import math
 import os
 import uuid
 from qgis.core import (
@@ -20,6 +21,7 @@ from qgis.core import (
     QgsProcessingParameterMultipleLayers,
     QgsProcessingParameterRasterDestination,
     QgsRasterLayer,
+    QgsRectangle,
 )
 from .algorithm_base import SubseaCableAlgorithm, gdal_creation_options
 from ..qgis_compat import PROCESSING_SOURCE_RASTER, processing_temp_folder
@@ -33,6 +35,8 @@ class MergeMBESRastersAlgorithm(SubseaCableAlgorithm):
     OUTPUT = 'OUTPUT'
     COMPRESS = 'COMPRESS'
     RESAMPLING = 'RESAMPLING'
+    VIRTUAL = 'VIRTUAL'
+    ALLOW_LARGE = 'ALLOW_LARGE'
 
     def initAlgorithm(self, config=None):
         self.addParameter(
@@ -67,6 +71,11 @@ class MergeMBESRastersAlgorithm(SubseaCableAlgorithm):
             )
         )
 
+        self.addParameter(QgsProcessingParameterBoolean(
+            self.VIRTUAL, self.tr('Create a virtual mosaic (.vrt) referencing the original files'), defaultValue=False))
+        self.addParameter(QgsProcessingParameterBoolean(
+            self.ALLOW_LARGE, self.tr('Allow a physical mosaic exceeding one billion cells'), defaultValue=False))
+
     def processAlgorithm(self, parameters, context, feedback):
         def alg_available(algorithm_id: str) -> bool:
             try:
@@ -88,11 +97,23 @@ class MergeMBESRastersAlgorithm(SubseaCableAlgorithm):
         final_output = self.parameterAsOutputLayer(parameters, self.OUTPUT, context)
         compress = self.parameterAsBool(parameters, self.COMPRESS, context)
         resampling = int(self.parameterAsEnum(parameters, self.RESAMPLING, context))
+        virtual = self.parameterAsBool(parameters, self.VIRTUAL, context)
+        if virtual and not final_output.lower().endswith('.vrt'):
+            # QGIS's temporary raster destination normally has a .tif suffix.
+            if str(parameters.get(self.OUTPUT, '')).upper() == 'TEMPORARY_OUTPUT':
+                final_output = os.path.splitext(final_output)[0] + '.vrt'
+            else:
+                raise QgsProcessingException('For a virtual mosaic, choose an output filename ending in .vrt.')
+        if not virtual and final_output.lower().endswith('.vrt'):
+            raise QgsProcessingException('Enable Create a virtual mosaic when saving to .vrt.')
 
         # --- validate inputs: files, one CRS, note resolutions and NoData ---
         input_files = []
         crs_by_layer = {}
         finest = None
+        finest_x = finest_y = None
+        bounds = QgsRectangle()
+        valid_layers = []
         coarsest = None
         for lyr in raster_layers:
             if not isinstance(lyr, QgsRasterLayer) or not lyr.isValid():
@@ -100,9 +121,15 @@ class MergeMBESRastersAlgorithm(SubseaCableAlgorithm):
                 continue
             source = lyr.source().split('|')[0]
             input_files.append(source)
+            valid_layers.append(lyr)
+            bounds.combineExtentWith(lyr.extent())
             crs_by_layer[lyr.name()] = lyr.crs().authid() or lyr.crs().toWkt()
             res_x = abs(lyr.rasterUnitsPerPixelX())
             res_y = abs(lyr.rasterUnitsPerPixelY())
+            if res_x <= 0 or res_y <= 0:
+                raise QgsProcessingException(f'{lyr.name()} has no usable native pixel size.')
+            finest_x = min(finest_x, res_x) if finest_x is not None else res_x
+            finest_y = min(finest_y, res_y) if finest_y is not None else res_y
             finest = min(finest, res_x, res_y) if finest is not None else min(res_x, res_y)
             coarsest = max(coarsest, res_x, res_y) if coarsest is not None else max(res_x, res_y)
             provider = lyr.dataProvider()
@@ -124,6 +151,16 @@ class MergeMBESRastersAlgorithm(SubseaCableAlgorithm):
                 'All input rasters must share one CRS — merging mixed CRS would '
                 f'misplace data. Found: {detail}. Reproject first (gdal:warpreproject).')
 
+        cells = math.ceil(bounds.width() / finest_x) * math.ceil(bounds.height() / finest_y)
+        feedback.pushInfo(f'Full mosaic grid: approximately {cells:,} cells including gaps '
+                          f'({cells * 4 / 1024 ** 3:.1f} GiB for one uncompressed Float32 band).')
+        if not virtual and cells > 1_000_000_000 and not self.parameterAsBool(parameters, self.ALLOW_LARGE, context):
+            raise QgsProcessingException(
+                'The finest-resolution mosaic exceeds one billion cells. Use a virtual mosaic (.vrt), '
+                'sample the source rasters directly in Burial Planner, or explicitly enable Allow a physical '
+                'mosaic exceeding one billion cells after checking disk space.')
+        if feedback.isCanceled():
+            return {}
         feedback.pushInfo(
             f'Merging {len(input_files)} rasters at the finest input resolution '
             f'({finest:g} units/pixel). Where tiles overlap, later-listed inputs win.')
@@ -139,7 +176,7 @@ class MergeMBESRastersAlgorithm(SubseaCableAlgorithm):
                 'datum agreement; verify overlaps before relying on seam areas.')
 
         # --- build the VRT mosaic at the highest resolution ---
-        vrt_path = os.path.join(
+        vrt_path = final_output if virtual else os.path.join(
             processing_temp_folder(context), f'mbes_merge_{uuid.uuid4().hex[:8]}.vrt')
         result = processing.run('gdal:buildvirtualraster', {
             'INPUT': input_files,
@@ -158,23 +195,29 @@ class MergeMBESRastersAlgorithm(SubseaCableAlgorithm):
             raise QgsProcessingException('Raster merge (buildvirtualraster) failed. '
                                          'Check the processing log for more details.')
 
-        # --- materialise to GeoTIFF ---
-        options = 'COMPRESS=LZW|TILED=YES|BIGTIFF=IF_SAFER' if compress else 'TILED=YES|BIGTIFF=IF_SAFER'
-        result2 = processing.run('gdal:translate', {
-            'INPUT': result['OUTPUT'],
-            'OUTPUT': final_output,
-            **gdal_creation_options('gdal:translate', options),
-            'DATA_TYPE': 0,           # keep the source data type
-        }, context=context, feedback=feedback, is_child_algorithm=True)
-        if not result2 or not result2.get('OUTPUT'):
-            raise QgsProcessingException('Writing the merged raster (gdal:translate) failed. '
-                                         'Check the processing log for more details.')
-        try:
-            os.remove(vrt_path)
-        except OSError:
-            pass
+        if feedback.isCanceled():
+            return {}
+        if virtual:
+            result2 = result
+        else:
+            # --- materialise to GeoTIFF ---
+            options = 'COMPRESS=LZW|TILED=YES|BIGTIFF=IF_SAFER' if compress else 'TILED=YES|BIGTIFF=IF_SAFER'
+            result2 = processing.run('gdal:translate', {
+                'INPUT': result['OUTPUT'],
+                'OUTPUT': final_output,
+                **gdal_creation_options('gdal:translate', options),
+                'EXTRA': '--config GDAL_CACHEMAX 256',
+                'DATA_TYPE': 0,           # keep the source data type
+            }, context=context, feedback=feedback, is_child_algorithm=True)
+            if not result2 or not result2.get('OUTPUT'):
+                raise QgsProcessingException('Writing the merged raster (gdal:translate) failed. '
+                                             'Check the processing log for more details.')
+            try:
+                os.remove(vrt_path)
+            except OSError:
+                pass
         from ..bathymetry_sampling import MANIFEST_VERSION, layer_options, expand_rasters
-        native = expand_rasters(raster_layers)
+        native = expand_rasters(valid_layers)
         manifest_path = str(result2['OUTPUT']) + '.sources.json'
         with open(manifest_path, 'w', encoding='utf-8') as stream:
             json.dump({'version': MANIFEST_VERSION, 'analysis_priority': 'finest native first',
@@ -186,7 +229,8 @@ class MergeMBESRastersAlgorithm(SubseaCableAlgorithm):
                           'Temporary processing files may be deleted; save source grids permanently '
                           'and rerun the merge for a reusable result. Profile overlaps use finest native '
                           'resolution first, which can differ from the displayed mosaic overlap order.')
-        feedback.pushInfo('Merge complete. Output pixel size matches the finest input; '
+        feedback.pushInfo('Virtual mosaic created; keep the source files at their current paths.' if virtual else
+                          'Merge complete. Output pixel size matches the finest input; '
                           'coarser areas retain their original information resolution.')
         return {self.OUTPUT: result2['OUTPUT']}
 
@@ -213,7 +257,8 @@ class MergeMBESRastersAlgorithm(SubseaCableAlgorithm):
   <li>Select two or more raster layers (e.g. from <i>Create Raster from XYZ</i>).</li>
   <li>All inputs must share one CRS; mixed CRS is refused with a clear message.</li>
   <li>Each file's own NoData value is respected, so gaps stay transparent; where tiles overlap, later-listed inputs take priority.</li>
-  <li>The output is a tiled GeoTIFF; LZW compression is lossless.</li>
+  <li>Choose a virtual mosaic and a .vrt filename for large collections: source files stay separate and pixels are read on demand. Keep the source files at their current paths. This can be processed by GDAL/QGIS like a raster, but a whole-grid operation still processes the full grid.</li>
+  <li>Physical output is a tiled GeoTIFF; LZW compression is lossless. Large grids require explicit opt-in; the estimated cell count includes gaps between surveys.</li>
   <li>For fast display of large mosaics, build pyramids afterwards (right-click the layer → Properties → Pyramids, or gdaladdo).</li>
 </ul>
 <p><b>Engineering note:</b> the mosaic is a display/profiling surface. Upsampled cells from coarser tiles carry no extra information, per-cell source provenance is lost, and overlapping tiles are not checked for vertical-datum agreement — refer engineering analyses (and seam checks) to the source grids, which the profile tools can consume directly as multiple layers.</p>

@@ -8,6 +8,7 @@ check line under each tab reports the parsed result.
 """
 import csv
 import json
+import math
 import re
 
 import pyqtgraph as pg
@@ -21,9 +22,11 @@ from qgis.PyQt.QtWidgets import (
     QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from ..qgis_compat import BUTTON_BOX_CANCEL, BUTTON_BOX_OK, HEADER_RESIZE_MODE_STRETCH
+from ..qgis_compat import BUTTON_BOX_CANCEL, BUTTON_BOX_OK, DIALOG_ACCEPTED, HEADER_RESIZE_MODE_STRETCH, qt_exec
+from ..table_widgets import ResizableTableWidget
 from . import kp_table, numeric_datasets as sources, numeric_profiles as numeric, schema, ui_helpers
 from .numeric_profile_plot import RAMPS, ramp_colours
+from .cpt_soil_controls import CptSoilControls
 from .plan_import import read_grid
 from .tabs.attribute_widgets import AttributeRulesTable, FieldCombo
 from .tabs.kp_table_form import KpTableForm
@@ -306,6 +309,7 @@ class DatasetDialog(QDialog):
     def __init__(self, model, dataset=None, profiles=(), parent=None, prefill=None):
         super().__init__(parent)
         self.model = model
+        self._opened_plan_id = (model.plan or {}).get("plan_id")
         # ``prefill``: a new dataset with its choices already made (e.g. a
         # CPT value placed at the CPT positions); still checked and editable.
         self.dataset = dict(dataset or prefill or {})
@@ -358,6 +362,20 @@ class DatasetDialog(QDialog):
             self._check_measurements_soon()
         self._values_changed()
         self._check_placement_soon()
+        self.model.planChanged.connect(self._plan_changed)
+
+    def _plan_changed(self):
+        if (self.model.plan or {}).get("plan_id") != self._opened_plan_id:
+            self.reject()
+
+    def done(self, code):
+        for name in ("_check_measurements_soon", "_check_placement_soon"):
+            callback = getattr(self, name, None)
+            if callback is not None:
+                callback._timer.stop()
+        if hasattr(self, "soil_controls"):
+            self.soil_controls.dispose()
+        super().done(code)
 
     # -- measurements ------------------------------------------------------------
     def _measurements_tab(self):
@@ -514,7 +532,8 @@ class DatasetDialog(QDialog):
         channel = self.cpt_channel.currentData()
         if not channel:
             return
-        source = {"kind": sources.SOURCE_CPT, "channel": channel, "interval_m": self.cpt_interval.value()}
+        source = {"kind": sources.SOURCE_CPT, "channel": channel, "interval_m": self.cpt_interval.value(),
+                  "clip_tested_depth": True}
         try:
             grid, _sheets = sources.read_source_grid(source, self.model)
         except (OSError, ValueError) as exc:
@@ -656,9 +675,8 @@ class DatasetDialog(QDialog):
     def _placement_tab(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.addWidget(_hint(
-            "Where each investigation applies along the route. The layer is read live: edits to it "
-            "update the plot (no re-import). Its IDs must match the measurement IDs exactly."))
+        self.placement_hint = _hint("")
+        layout.addWidget(self.placement_hint)
         kinds = QHBoxLayout()
         self.kind_group = QButtonGroup(self)
         self.kind_table = QRadioButton("KP-range layer or table (start and end KP fields)")
@@ -696,6 +714,17 @@ class DatasetDialog(QDialog):
                                  "halfway to the next CPT; beyond that the plot stays blank.")
         cpt_form.addRow("Use CPTs within", self.cpt_offset)
         cpt_form.addRow("Each CPT represents up to", self.cpt_half)
+        self._cpt_limits = dict(self.placement.get("cpt_limits") or {})
+        limits_button = QPushButton("Individual CPT limits…")
+        limits_button.clicked.connect(self._edit_cpt_limits)
+        cpt_form.addRow(limits_button)
+        self.soil_controls = CptSoilControls(self.placement.get("soil_constraint"), self)
+        cpt_form.addRow(self.soil_controls)
+        cpt_form.addRow(_hint("Nearest CPT along KP, split at midpoints and capped by the influence distance. "
+                             "This is a screening assumption, not an interpreted geological boundary. "
+                             "Distances are re-applied to the CPT positions when the route changes. "
+                             "Depth-bin averages do not fill gaps between tests; new CPT datasets stop at tested depth. "
+                             "Su uses the project's CPT derivation settings; review Nkt and soil applicability."))
         layout.addWidget(self.cpt_box)
         self.kp_box = QWidget()
         kp_form = QFormLayout(self.kp_box)
@@ -709,6 +738,7 @@ class DatasetDialog(QDialog):
         (self.kind_cpt if kind == sources.PLACEMENT_CPT else self.kind_polygons
          if kind == sources.PLACEMENT_POLYGONS else self.kind_table).setChecked(True)
         self._check_placement_soon = ui_helpers.coalesced(self, self._check_placement, 150)
+        self.soil_controls.changed.connect(self._check_placement_soon)
         self._fill_place_layers()
         self.kind_group.buttonClicked.connect(self._kind_changed)
         self.place_layer.currentIndexChanged.connect(self._place_layer_changed)
@@ -722,6 +752,71 @@ class DatasetDialog(QDialog):
         self._place_layer_changed()
         return page
 
+    def _edit_cpt_limits(self):
+        from .cpt_register import place
+        cpts, names = sources._cpt_selection(self.model, self.placement.get("campaign_ids"))
+        rows, _notes = place(getattr(self.model, "route", None), cpts,
+                             self.cpt_offset.value(), self.cpt_half.value())
+        dialog = QDialog(self)
+        dialog.setWindowTitle("CPT influence limits")
+        dialog.resize(780, 440)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(_hint("Blank uses the general influence limit. Individual distances can shorten "
+                               "a range but never cross its midpoint boundary. Unchecking Use leaves a gap; "
+                               "neighbours do not expand into it. Before/after follow increasing KP."))
+        table = ResizableTableWidget(len(rows), 6)
+        table.setHorizontalHeaderLabels(["Use", "CPT", "KP (km)", "Offset (m)", "Before (m)", "After (m)"])
+        flag = getattr(Qt, "ItemFlag", Qt)
+        state = getattr(Qt, "CheckState", Qt)
+        for i, row in enumerate(rows):
+            limits = self._cpt_limits.get(row["cpt_id"]) or {}
+            use = QTableWidgetItem()
+            use.setFlags(flag.ItemIsEnabled | flag.ItemIsUserCheckable | flag.ItemIsSelectable)
+            use.setCheckState(state.Unchecked if limits.get("exclude") else state.Checked)
+            table.setItem(i, 0, use)
+            for col, text in enumerate((names.get(row["cpt_id"], row["name"]),
+                                        "" if row["kp"] is None else f"{row['kp']:.3f}",
+                                        "" if row["offset_m"] is None else f"{row['offset_m']:.1f}"), 1):
+                item = QTableWidgetItem(text)
+                item.setFlags(item.flags() & ~flag.ItemIsEditable)
+                table.setItem(i, col, item)
+            for col, key in ((4, "before_m"), (5, "after_m")):
+                value = limits.get(key)
+                table.setItem(i, col, QTableWidgetItem("" if value is None else f"{value:g}"))
+        layout.addWidget(table)
+        buttons = QDialogButtonBox(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
+        layout.addWidget(buttons)
+        result = {}
+
+        def accept():
+            updated = {key: value for key, value in self._cpt_limits.items()
+                       if key not in {row["cpt_id"] for row in rows}}
+            try:
+                for i, row in enumerate(rows):
+                    limit = {}
+                    if table.item(i, 0).checkState() != state.Checked:
+                        limit["exclude"] = True
+                    for col, key in ((4, "before_m"), (5, "after_m")):
+                        text = table.item(i, col).text().strip()
+                        if text:
+                            value = numeric.number(text)
+                            if not math.isfinite(value) or value < 0:
+                                raise ValueError("Influence distances must be finite and nonnegative.")
+                            limit[key] = value
+                    if limit:
+                        updated[row["cpt_id"]] = limit
+            except ValueError as exc:
+                QMessageBox.warning(dialog, "CPT influence limits", str(exc))
+                return
+            result.update(updated)
+            dialog.accept()
+
+        buttons.accepted.connect(accept)
+        buttons.rejected.connect(dialog.reject)
+        if qt_exec(dialog) == DIALOG_ACCEPTED:
+            self._cpt_limits = result
+            self._check_placement_soon()
+
     def _fill_place_layers(self):
         stored = sources.resolve_layer(self.placement.get("layer"))
         current = self.place_layer.currentData() or (stored.id() if stored is not None else "")
@@ -734,6 +829,12 @@ class DatasetDialog(QDialog):
         self.place_layer.blockSignals(False)
         self.kp_box.setVisible(self.kind_table.isChecked())
         cpt = self.kind_cpt.isChecked()
+        self.placement_hint.setText(
+            "CPT positions are measured on this plan's route. Optional soil mapping limits their lateral "
+            "influence using its unit/class field; no investigation IDs are needed in the soil layer."
+            if cpt else
+            "Where each investigation applies along the route. The layer is read live: edits to it "
+            "update the plot (no re-import). Its IDs must match the measurement IDs exactly.")
         self.cpt_box.setVisible(cpt)
         for widget in (self.place_layer, self.id_field):
             label = self.place_form.labelForField(widget)
@@ -754,7 +855,11 @@ class DatasetDialog(QDialog):
     def placement_settings(self):
         if self.kind_cpt.isChecked():
             return {"kind": sources.PLACEMENT_CPT, "max_offset_m": self.cpt_offset.value(),
-                    "half_range_m": self.cpt_half.value()}
+                    "half_range_m": self.cpt_half.value(),
+                    **({"cpt_limits": self._cpt_limits} if self._cpt_limits else {}),
+                    **({"campaign_ids": self.placement["campaign_ids"]} if self.placement.get("campaign_ids") else {}),
+                    **({"soil_constraint": self.soil_controls.settings()}
+                       if self.soil_controls.enabled.isChecked() or self.soil_controls.settings()["layer"] else {})}
         layer = QgsProject.instance().mapLayer(self.place_layer.currentData() or "")
         if layer is None:
             return {}
@@ -801,6 +906,13 @@ class DatasetDialog(QDialog):
 
     def _accept(self):
         try:
+            if not self.model.plan or (self.model.plan or {}).get("plan_id") != self._opened_plan_id:
+                self.reject()
+                return
+            placement = self.placement_settings()
+            soil = placement.get("soil_constraint") or {}
+            if soil.get("enabled") and (not soil.get("layer") or not soil.get("unit_field")):
+                raise ValueError("Choose the soil polygon layer and its unit/class field, or turn off soil constraints.")
             row = self._dataset_row()
             if not row["name"] or not row["variable"]:
                 raise ValueError("Enter a dataset name and a variable name.")
@@ -818,7 +930,7 @@ class DatasetDialog(QDialog):
             return
         config = dict(self.dataset.get("config") or {})
         config.pop("legacy", None)
-        config.update(measurements=measurements, placement=self.placement_settings(), colours=colours)
+        config.update(measurements=measurements, placement=placement, colours=colours)
         self._result = (dict(self.dataset, **row, config=config), profiles)
         self.accept()
 

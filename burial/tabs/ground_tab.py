@@ -29,11 +29,11 @@ from qgis.PyQt.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
-    QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
+from ...table_widgets import ResizableTableWidget as QTableWidget
 
 from ...qgis_compat import (
     DIALOG_ACCEPTED,
@@ -111,6 +111,11 @@ class GroundTab(QWidget):
                                      "measured value coloured by KP and depth. CPTs: import and check "
                                      "cone penetration tests (AGS 3 / AGS 4).")
         mode_row.addWidget(self.display_mode)
+        self.strength_button = QPushButton("CPT strength section…")
+        self.strength_button.setToolTip("Create a Su section with editable 0–5, 5–10, 10–200 and ≥200 kPa colours. "
+                                        "Review the CPT derivation settings and influence limits before saving.")
+        self.strength_button.clicked.connect(lambda: self.add_cpt_dataset("su", strength_preset=True))
+        mode_row.addWidget(self.strength_button)
         self._mode_row = mode_row
         self.horizons_button = QPushButton("Horizons…")
         self.horizons_button.setToolTip("Import, show and edit interpreted sub-bottom horizons from DXF sections.")
@@ -835,12 +840,12 @@ class GroundTab(QWidget):
             pass
 
     # -- CPT colour sections ---------------------------------------------------
-    def add_cpt_dataset(self, channel: str) -> None:
+    def add_cpt_dataset(self, channel: str, strength_preset: bool = False) -> None:
         """Open a new numeric dataset from a CPT value, placed at the CPTs."""
         if not self.model.plan:
             return
         self.display_mode.setCurrentIndex(MODE_NUMERIC)
-        self.numeric.add_cpt_dataset(channel)
+        self.numeric.add_cpt_dataset(channel, strength_preset)
 
     # -- plot sync -------------------------------------------------------------
     def _plot_hover(self, kp: float) -> None:

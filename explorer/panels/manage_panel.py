@@ -54,12 +54,12 @@ from qgis.PyQt.QtWidgets import (
     QMessageBox,
     QProgressDialog,
     QPushButton,
-    QTableWidget,
     QTableWidgetItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
+from ...table_widgets import ResizableTableWidget as QTableWidget
 from qgis.core import QgsApplication, QgsProviderRegistry
 
 from ...qgis_compat import (

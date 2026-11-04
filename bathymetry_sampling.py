@@ -144,7 +144,7 @@ def _manifest_sources(data, manifest):
     return records
 
 
-def expand_rasters(layers, seen=None, transform_context=None):
+def expand_rasters(layers, seen=None, transform_context=None, sort_by_resolution=True):
     """New mosaics carry a sidecar; engineering reads their native sources.
 
     A missing native file fails explicitly rather than trusting upsampled
@@ -174,9 +174,9 @@ def expand_rasters(layers, seen=None, transform_context=None):
             for key, value in {**record.get('options', {}), **overrides}.items():
                 child.setCustomProperty(PREFIX + key, value)
             children.append(child)
-        out.extend(expand_rasters(children, seen | {canonical}, transform_context))
-    # Stable finest-first across all consumers. Canonical URI is provenance.
-    return sorted(out, key=lambda layer: native_cell_m(layer, transform_context))
+        out.extend(expand_rasters(children, seen | {canonical}, transform_context, sort_by_resolution))
+    # Sorting is stable: listed order breaks ties between equal resolutions.
+    return sorted(out, key=lambda layer: native_cell_m(layer, transform_context)) if sort_by_resolution else out
 
 
 class RasterSampler:

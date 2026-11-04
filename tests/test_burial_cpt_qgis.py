@@ -40,11 +40,11 @@ _TABLE = "\n".join([
     ""])
 
 
-def route():
+def route(start_kp=10):
     distance = QgsDistanceArea()
     distance.setSourceCrs(QgsCoordinateReferenceSystem("EPSG:4326"), QgsProject.instance().transformContext())
     distance.setEllipsoid("WGS84")
-    return RouteFrame.from_source([QgsGeometry.fromWkt("LINESTRING(0 50, 0.1 50)")], distance, start_kp_km=10)
+    return RouteFrame.from_source([QgsGeometry.fromWkt("LINESTRING(0 50, 0.1 50)")], distance, start_kp_km=start_kp)
 
 
 class Dock:
@@ -206,6 +206,12 @@ class CptQgisTests(unittest.TestCase):
         self.assertEqual((window.current, window.compare), (entries[0]["cpt_id"], [entries[1]["cpt_id"]]))
         self.assertIn("qc", window._track_plots)
         self.assertIn("CP-2", window.readout_text(1.0))
+        from unittest.mock import patch
+        original_channels = window.channels
+        for zones in ([], [None], [3]):
+            with patch.object(window, "channels", side_effect=lambda key: dict(original_channels(key), zone=zones)):
+                window.redraw()
+        window.redraw()
         headers, rows = window.table_rows()
         self.assertEqual(len(rows), 202)
         self.assertIn("Su — Undrained shear strength (kPa)", headers)
@@ -254,6 +260,54 @@ class CptQgisTests(unittest.TestCase):
         assignments, _notes, layer = sources.read_placement(self.model, dict(stored["config"]["placement"],
                                                                              max_offset_m=5.0))
         self.assertEqual((assignments, layer), ([], None))
+
+    def test_strength_preset_and_individual_limits_follow_route_kp(self):
+        from ..burial import numeric_profiles as numeric
+        campaign, built = self.campaign()
+        self.model.save_cpt_campaign(campaign, built["cpts"], built["readings"])
+        tab = GroundTab(self.model, Dock())
+        self.windows.append(tab)
+        prefill = tab.numeric.cpt_prefill("su", strength_preset=True)
+        classes = numeric.normalise_classes(prefill["config"]["colours"]["classes"])
+        self.assertEqual([numeric.class_of(v, classes)["colour"].lower() for v in (0, 4.9, 5, 10, 199.9, 200)],
+                         ["#ff0000", "#ff0000", "#ffff00", "#00aa00", "#00aa00", "#ff0000"])
+        self.assertIsNone(numeric.class_of(None, classes))
+        grid = sources.cpt_grid(self.model, prefill["config"]["measurements"]["source"])
+        self.assertLessEqual(max(float(row[2]) for row in grid[1:]), 2.0)
+        cpts = self.model.cpts.active_cpts()
+        rows, _ = cpt_register.place(self.model.route, cpts, 250, 1000)
+        first, second = sorted(rows, key=lambda r: r["kp"])
+        placement = dict(prefill["config"]["placement"], half_range_m=1000, cpt_limits={
+            first["cpt_id"]: {"before_m": 20, "after_m": 30}, second["cpt_id"]: {"exclude": True}})
+        assignments, notes = sources.cpt_assignments(self.model, placement)
+        self.assertEqual(len(assignments), 1)
+        self.assertAlmostEqual(assignments[0]["start_kp"], first["kp"] - .020)
+        self.assertAlmostEqual(assignments[0]["end_kp"], first["kp"] + .030)
+        self.model.route = route(start_kp=30)
+        moved, _ = sources.cpt_assignments(self.model, placement)
+        self.assertAlmostEqual(moved[0]["start_kp"], assignments[0]["start_kp"] + 20)
+        self.assertAlmostEqual(moved[0]["end_kp"], assignments[0]["end_kp"] + 20)
+        # Editing/saving keeps the optional limits and old datasets remain valid.
+        prefill["config"]["placement"] = placement
+        dialog = DatasetDialog(self.model, None, [], tab, prefill=prefill)
+        self.windows.append(dialog)
+        self.assertEqual(dialog.placement_settings()["cpt_limits"], placement["cpt_limits"])
+        from unittest.mock import patch
+        from qgis.PyQt.QtWidgets import QDialogButtonBox
+        from ..burial import numeric_profile_dialogs
+        from ..qgis_compat import BUTTON_BOX_OK, DIALOG_ACCEPTED
+        from ..table_widgets import ResizableTableWidget
+
+        def edit_limits(window):
+            table = window.findChild(ResizableTableWidget)
+            row = next(i for i in range(table.rowCount()) if table.item(i, 1).text() == first["name"])
+            table.item(row, 4).setText("25")
+            window.findChild(QDialogButtonBox).button(BUTTON_BOX_OK).click()
+            return DIALOG_ACCEPTED
+
+        with patch.object(numeric_profile_dialogs, "qt_exec", side_effect=edit_limits):
+            dialog._edit_cpt_limits()
+        self.assertEqual(dialog.placement_settings()["cpt_limits"][first["cpt_id"]]["before_m"], 25)
 
     def test_superseded_imports_and_shared_names(self):
         campaign, built = self.campaign()

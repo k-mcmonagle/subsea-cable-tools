@@ -15,8 +15,9 @@ from qgis.PyQt.QtGui import QKeySequence
 from qgis.PyQt.QtWidgets import (QAbstractItemView, QAbstractSpinBox, QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox,
                                  QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
                                  QHeaderView, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QRadioButton,
-                                 QSpinBox, QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout,
+                                 QSpinBox, QTableWidgetItem, QToolButton, QVBoxLayout,
                                  QWidget)
+from ..table_widgets import ResizableTableWidget as QTableWidget
 
 try:
     from qgis.PyQt.QtGui import QShortcut

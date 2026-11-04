@@ -20,8 +20,9 @@ from contextlib import contextmanager
 from typing import Callable, List, Optional, Sequence, Set, Tuple
 
 from qgis.PyQt.QtCore import Qt
-from qgis.PyQt.QtWidgets import (QAbstractItemView, QApplication, QTableWidget,
-                                 QTableWidgetItem)
+from qgis.PyQt.QtWidgets import QAbstractItemView, QApplication, QTableWidgetItem
+
+from ..table_widgets import ResizableTableWidget as QTableWidget
 
 _KEY = getattr(Qt, "Key", Qt)
 _MOD = getattr(Qt, "KeyboardModifier", Qt)

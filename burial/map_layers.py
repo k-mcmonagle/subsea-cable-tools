@@ -16,6 +16,7 @@ cache/staleness come from the normalised source + timestamp + feature count.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -329,11 +330,17 @@ def depth_config_signature(depth_config) -> str:
     import json
 
     fields = [str(e.get("depth_field") or "") for e in depth_config.contour_layers]
-    return "|".join([str(depth_config.mode), str(depth_config.raster_band),
-                     json.dumps(fields)])
+    signature = "|".join([str(depth_config.mode), str(depth_config.raster_band), json.dumps(fields)])
+    if getattr(depth_config, "raster_priority", "finest") == "listed":
+        signature += "|listed"
+    dates = getattr(depth_config, "raster_acquired_dates", {})
+    if dates:
+        signature += "|acquired=" + json.dumps({source_identity(key): value for key, value in dates.items()}, sort_keys=True)
+    return signature
 
 
-def depth_config_fingerprint(project: Optional[QgsProject], depth_config) -> str:
+def depth_config_fingerprint(project: Optional[QgsProject], depth_config,
+                             layer_fingerprints: Optional[Dict[str, str]] = None) -> str:
     """Combined content fingerprint of every configured bathymetry layer.
 
     One formula shared by threshold-rule cache keys, installation paths and
@@ -342,9 +349,17 @@ def depth_config_fingerprint(project: Optional[QgsProject], depth_config) -> str
     """
     from ..bathymetry_sampling import VERSION
 
-    layers = depth_layer_fingerprints(project, depth_config)
+    layers = depth_layer_fingerprints(project, depth_config) if layer_fingerprints is None else layer_fingerprints
+    order = []
+    if len(depth_config.raster_layer_ids) > 1:
+        # First source wins (also the tie-break for equal resolutions).
+        # Persist source identities, not session-dependent QGIS layer IDs.
+        project = project or QgsProject.instance()
+        order = ["raster-order=" + json.dumps([
+            layer_identity(project.mapLayer(layer_id)) or "missing:" + layer_id
+            for layer_id in depth_config.raster_layer_ids])]
     return "|".join([DEPTH_FP_VERSION, VERSION,
-                     depth_config_signature(depth_config)] +
+                     depth_config_signature(depth_config)] + order +
                     [f"{key}={value}" for key, value in sorted(layers.items())])
 
 
@@ -353,6 +368,9 @@ def legacy_depth_config_fingerprint(project: Optional[QgsProject],
     """The v1 fingerprint — only to recognise profiles sampled before v2
     as current (so upgrading does not mark every stored profile stale).
     Never raises."""
+    if (getattr(depth_config, "raster_priority", "finest") != "finest"
+            or getattr(depth_config, "raster_acquired_dates", {})):
+        return ""  # legacy fingerprints cannot attest to a new priority rule
     try:
         return _legacy_depth_config_fingerprint(project, depth_config)
     except Exception:

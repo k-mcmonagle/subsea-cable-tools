@@ -34,11 +34,11 @@ from qgis.PyQt.QtWidgets import (
     QPushButton,
     QRadioButton,
     QStackedWidget,
-    QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
+from ..table_widgets import ResizableTableWidget as QTableWidget
 
 from ..qgis_compat import (
     BUTTON_BOX_CANCEL,

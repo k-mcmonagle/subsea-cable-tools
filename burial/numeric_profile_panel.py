@@ -7,6 +7,8 @@ refresh, so edits to that layer show without re-importing.
 """
 import json
 
+from qgis.core import QgsProject
+
 from qgis.PyQt.QtWidgets import (
     QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel, QMessageBox, QPushButton,
     QVBoxLayout, QWidget,
@@ -63,6 +65,11 @@ class NumericProfilePanel(QWidget):
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
         self._refresh_soon = ui_helpers.coalesced(self, self.render, 300)
+        # Bound QObject slots disconnect on widget destruction; a free timer
+        # closure connected to a long-lived layer can outlive its C++ timer.
+        project = QgsProject.instance()
+        project.layersAdded.connect(self._queue_refresh)
+        project.layersRemoved.connect(self._queue_refresh)
         self.dataset.currentIndexChanged.connect(self._dataset_chosen)
         self.plot.profileClicked.connect(self.inspect_source)
 
@@ -86,7 +93,7 @@ class NumericProfilePanel(QWidget):
         self.refresh()
 
     def refresh(self):
-        self.datasets = self.model.store.list_ground_datasets()
+        self.datasets = self.model.store.list_ground_datasets() if self.model.plan else []
         try:
             params = json.loads((self.model.plan or {}).get("params_json") or "{}")
         except (ValueError, TypeError):
@@ -130,7 +137,10 @@ class NumericProfilePanel(QWidget):
 
     # Edits (live, during an edit session), commits, rollbacks and provider reloads.
     _LAYER_SIGNALS = ("featureAdded", "featureDeleted", "attributeValueChanged", "geometryChanged",
-                      "afterCommitChanges", "afterRollBack", "dataChanged")
+                      "afterCommitChanges", "afterRollBack", "dataChanged", "updatedFields", "destroyed")
+
+    def _queue_refresh(self, *_args):
+        self._refresh_soon()
 
     def _watch(self, layer):
         """Refresh when the placement layer's features change (live link)."""
@@ -138,14 +148,14 @@ class NumericProfilePanel(QWidget):
             return
         for name in self._LAYER_SIGNALS if self._watched is not None else ():
             try:
-                getattr(self._watched, name).disconnect(self._refresh_soon)
+                getattr(self._watched, name).disconnect(self._queue_refresh)
             except (TypeError, RuntimeError, AttributeError):
                 pass
         self._watched = layer
         for name in self._LAYER_SIGNALS if layer is not None else ():
             signal = getattr(layer, name, None)
             if signal is not None:
-                signal.connect(self._refresh_soon)
+                signal.connect(self._queue_refresh)
 
     def _load(self, dataset):
         """Measurements (cached per dataset version) and live placement."""
@@ -168,6 +178,15 @@ class NumericProfilePanel(QWidget):
             self.notes.insert(0, changed)
 
     def render(self):
+        if not self.model.plan:
+            self._refresh_soon._timer.stop()
+            self._watch(None)
+            self.profiles, self.assignments, self.notes = [], [], []
+            self._profiles_key = None
+            self.status.setText("Open a plan to view its ground model.")
+            if self.active:
+                self.plot.set_numeric(numeric.ProfileIndex([], []), self.display_settings(None))
+            return
         dataset = self.selected()
         for key in ("edit", "reload", "remove", "check", "export"):
             self.buttons[key].setEnabled(dataset is not None)
@@ -184,6 +203,14 @@ class NumericProfilePanel(QWidget):
         text = (f"{len(self.profiles)} investigation(s) from "
                 f"{sources.source_label(((dataset.get('config') or {}).get('measurements') or {}).get('source') or {})}; "
                 f"{len(self.assignments)} KP range(s), {len(ids & known)} placed.")
+        placement = (dataset.get("config") or {}).get("placement") or {}
+        if placement.get("kind") == sources.PLACEMENT_CPT:
+            if (placement.get("soil_constraint") or {}).get("enabled"):
+                text += " Mapped soil constraints enabled."
+            half = placement.get("half_range_m", 100)
+            text += (f" Midpoint projection, limited to {float(half):g} m either side of each CPT; "
+                     "per-CPT limits may shorten this. No interpolation between CPTs. "
+                     "Colours are screening bands, not burial feasibility.")
         problems = list(self.notes)
         unmatched = numeric.unmatched_ids(ids, known)
         if unmatched:
@@ -231,11 +258,14 @@ class NumericProfilePanel(QWidget):
     def _open_dialog(self, dataset, prefill=None):
         profiles = self.model.store.list_numeric_profiles(dataset["dataset_id"]) if dataset else []
         dialog = DatasetDialog(self.model, dataset, profiles, self, prefill=prefill)
-        if qt_exec(dialog) != DIALOG_ACCEPTED or dialog.result() is None:
-            return
-        self.save_dataset(*dialog.result())
+        try:
+            if qt_exec(dialog) != DIALOG_ACCEPTED or dialog.result() is None or not self.model.plan:
+                return
+            self.save_dataset(*dialog.result())
+        finally:
+            dialog.deleteLater()
 
-    def cpt_prefill(self, channel: str):
+    def cpt_prefill(self, channel: str, strength_preset: bool = False):
         """A new dataset of one CPT value, placed at the CPT positions."""
         from ..geotech import cpt as cpt_mod
         from .numeric_profile_plot import ramp_colours
@@ -250,18 +280,27 @@ class NumericProfilePanel(QWidget):
             colours = {"mode": "classes", "ramp": "Viridis", "auto": True, "classes": [
                 {"min": lo, "max": hi, "min_inclusive": True, "max_inclusive": False,
                  "colour": palette[i], "label": label} for i, (lo, hi, label) in enumerate(terms)]}
+        if strength_preset and channel in ("su", "su_low"):
+            # User-editable screening bands, not standard soil classifications
+            # or a claim that green implies a particular tool can bury here.
+            colours = {"mode": "classes", "classes": [
+                {"min": lo, "max": hi, "min_inclusive": True, "max_inclusive": False,
+                 "colour": colour, "label": label}
+                for lo, hi, colour, label in (
+                    (0, 5, "#ff0000", "0–<5"), (5, 10, "#ffff00", "5–<10"),
+                    (10, 200, "#00aa00", "10–<200"), (200, None, "#ff0000", "≥200"))]}
         columns = dict(sources.CPT_COLUMNS, value=sources.cpt_value_header(channel))
         return {"name": f"CPT {symbol}", "variable": symbol, "units": unit,
                 "config": {"measurements": {"source": {"kind": sources.SOURCE_CPT, "channel": channel,
-                                                       "interval_m": 0.05},
+                                                       "interval_m": 0.05, "clip_tested_depth": True},
                                             "header_row": 1, "columns": columns, "depth_scale": 1.0},
                            "placement": {"kind": sources.PLACEMENT_CPT,
                                          "max_offset_m": float(view["max_offset_m"]),
                                          "half_range_m": float(view["half_range_m"])},
                            "colours": colours}}
 
-    def add_cpt_dataset(self, channel: str) -> None:
-        self._open_dialog(None, prefill=self.cpt_prefill(channel))
+    def add_cpt_dataset(self, channel: str, strength_preset: bool = False) -> None:
+        self._open_dialog(None, prefill=self.cpt_prefill(channel, strength_preset))
 
     def save_dataset(self, dataset, profiles):
         if not any(d["dataset_id"] == dataset["dataset_id"] for d in self.datasets):

@@ -5,7 +5,7 @@ from qgis.core import (QgsCoordinateTransform, QgsFeature, QgsGeometry, QgsPoint
 from ..kp_geo_utils import iter_line_parts
 
 
-def polygon_assignments(route, layer, id_field):
+def polygon_assignments(route, layer, id_field, include_empty=False):
     if route is None:
         raise ValueError("Select a route before assigning profiles.")
     if id_field not in layer.fields().names():
@@ -25,7 +25,8 @@ def polygon_assignments(route, layer, id_field):
         source = "" if value is None or str(value) == "NULL" else str(value).strip()
         if not source:
             warnings.append(f"Polygon {feature.id()}: missing investigation ID")
-            continue
+            if not include_empty:
+                continue
         polygon = QgsGeometry(feature.geometry())
         if polygon.isEmpty() or not polygon.isGeosValid():
             raise ValueError(f"Polygon {feature.id()} ({source}) has empty or invalid geometry.")

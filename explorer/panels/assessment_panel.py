@@ -41,12 +41,12 @@ from qgis.PyQt.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QSplitter,
-    QTableWidget,
     QTableWidgetItem,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
+from ...table_widgets import ResizableTableWidget as QTableWidget
 from qgis.core import (
     QgsApplication,
     QgsCoordinateReferenceSystem,

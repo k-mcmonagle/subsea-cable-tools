@@ -39,12 +39,12 @@ from qgis.PyQt.QtWidgets import (
     QMenu,
     QPushButton,
     QSplitter,
-    QTableWidget,
     QTableWidgetItem,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
+from ..table_widgets import ResizableTableWidget as QTableWidget
 
 try:
     from qgis.PyQt.QtGui import QShortcut
@@ -107,6 +107,7 @@ _OVERLAY_LABELS = (
     ("hazards", "Risk Profile hazards", "#8e44ad"),
     ("sections", "Plan outcome (section strip)", "#1b7f3b"),
     ("cpts", "CPT locations", "#7a1f5c"),
+    ("events", "Planned burial events (PLDN / PLUP)", "#1b7f3b"),
 )
 # Key for Insufficient Information no criterion claims (e.g. contexts
 # stored before per-criterion no-data was recorded).
@@ -1529,6 +1530,9 @@ class BurialProfileWidget(QWidget):
         cpts = getattr(self, "_cpt_markers", None)
         if cpts is not None:
             cpts.setVisible(self.overlay_visible("cpts") and bool(self._cpts))
+        self._event_markers.setVisible(self.overlay_visible("events"))
+        for line in self._event_lines:
+            line.setVisible(self.overlay_visible("events"))
         self._position_strip()
         self._sync_overlay_button()
 
@@ -1682,6 +1686,7 @@ class BurialProfileWidget(QWidget):
             item.addItem(line, ignoreBounds=True)
             self._event_lines.append(line)
         self._event_markers.set_events(painted)
+        self._apply_overlay_visibility()
 
     def revert_event_line(self, event_id: str) -> None:
         """Snap a dragged line back after a rejected move."""

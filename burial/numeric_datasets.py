@@ -20,10 +20,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from typing import Dict, List, Optional, Tuple
 
-from qgis.core import QgsProject, QgsVectorLayer
+from qgis.core import QgsCsException, QgsProject, QgsVectorLayer
 
 from . import kp_table, map_layers, numeric_profiles as numeric
 from .plan_import import read_grid
@@ -50,14 +51,17 @@ def attribute_text(value) -> str:
 def layer_ref(layer) -> Dict:
     """How a dataset finds a layer again (the registered-input keys)."""
     return {"layer_id_hint": layer.id(), "layer_source": layer.source(),
-            "layer_name": layer.name()}
+            "layer_name": layer.name(), "layer_provider": layer.providerType()}
 
 
 def resolve_layer(ref: Optional[Dict]):
     if not ref:
         return None
     try:
-        layer = map_layers.resolve_input_layer(QgsProject.instance(), ref)
+        project = QgsProject.instance()
+        if ref.get("layer_provider") == "memory" and project.mapLayer(ref.get("layer_id_hint") or "") is None:
+            return None  # a memory URI cannot reopen its former feature data
+        layer = map_layers.resolve_input_layer(project, ref)
     except Exception:
         return None
     return layer if isinstance(layer, QgsVectorLayer) and layer.isValid() else None
@@ -104,7 +108,13 @@ def cpt_grid(model, source: Dict) -> List[List[str]]:
     for cpt in cpts:
         data = model.cpts.channels(cpt, settings)
         values = data.get(channel) or []
+        measured = [z for z in data["depth"] if z is not None and math.isfinite(z) and z >= 0]
+        shallow, deepest = (min(measured), max(measured)) if measured else (0.0, 0.0)
         for top, base, mean in cpt_mod.bin_profile(data["depth"], values, interval):
+            if source.get("clip_tested_depth") and measured:
+                top, base = max(top, shallow), min(base, deepest)
+                if base <= top:
+                    continue
             grid.append([names[cpt["cpt_id"]], f"{top:g}", f"{base:g}",
                          "" if mean is None else repr(float(mean))])
     if len(grid) == 1:
@@ -143,7 +153,10 @@ def source_fingerprint(source: Dict, model=None) -> str:
         ids = set(source.get("campaign_ids") or [])
         key = [(c.get("campaign_id"), c.get("imported_utc")) for c in register.campaigns
                if not ids or c.get("campaign_id") in ids]
-        text = json.dumps([key, sorted(model.cpt_settings().items())], sort_keys=True, default=str)
+        basis = [key, sorted(model.cpt_settings().items())]
+        if source.get("clip_tested_depth"):
+            basis.append("clip-tested-depth")
+        text = json.dumps(basis, sort_keys=True, default=str)
         return "cpt:" + hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
     if source.get("kind") == "layer":
         return map_layers.layer_fingerprint(resolve_layer(source))
@@ -229,7 +242,15 @@ def read_placement(model, placement: Dict, cache: Optional[Dict] = None
     if not kind:
         return [], ["no KP ranges chosen yet — use Edit… → KP ranges"], None
     if kind == PLACEMENT_CPT:
-        return cpt_assignments(model, placement) + (None,)
+        soil = placement.get("soil_constraint") or {}
+        layer = resolve_layer(soil.get("layer")) if soil.get("enabled") else None
+        try:
+            rows, notes = cpt_assignments(model, placement, soil_layer=layer)
+        except (ValueError, RuntimeError, QgsCsException) as exc:
+            # Keep watching a loaded but currently invalid source, so fixing
+            # its fields/geometries restores the view without reopening it.
+            return [], [str(exc)], layer
+        return rows, notes, layer
     layer = resolve_layer(placement.get("layer"))
     if layer is None:
         name = (placement.get("layer") or {}).get("layer_name") or "?"
@@ -258,7 +279,7 @@ def read_placement(model, placement: Dict, cache: Optional[Dict] = None
     return assignments, notes + more, layer
 
 
-def cpt_assignments(model, placement: Dict) -> Tuple[List[Dict], List[str]]:
+def cpt_assignments(model, placement: Dict, soil_layer=None) -> Tuple[List[Dict], List[str]]:
     """KP ranges of the CPTs on the plan's route (``cpt_register.place``)."""
     from .cpt_register import place
     route = getattr(model, "route", None)
@@ -268,8 +289,33 @@ def cpt_assignments(model, placement: Dict) -> Tuple[List[Dict], List[str]]:
     offset, half = placement.get("max_offset_m"), placement.get("half_range_m")
     rows, notes = place(route, cpts, 250.0 if offset is None else float(offset),
                         100.0 if half is None else float(half))
+    limits = placement.get("cpt_limits") or {}
+    unknown = set(limits) - {r["cpt_id"] for r in rows}
+    if unknown:
+        notes.append(f"{len(unknown)} saved CPT influence limit(s) have no matching CPT in the current imports")
+    for row in rows:
+        limit = limits.get(row["cpt_id"]) or {}
+        if limit.get("exclude"):
+            row["status"] = "excluded by user"
+        if row["status"] != "placed":
+            continue
+        for key, direction, bound in (("before_m", -1, "start_kp"), ("after_m", 1, "end_kp")):
+            if limit.get(key) is not None:
+                value = float(limit[key])
+                if not math.isfinite(value) or value < 0:
+                    raise ValueError(f"{row['name']}: CPT influence distances must be finite and nonnegative")
+                edge = row["kp"] + direction * value / 1000.0
+                row[bound] = max(row[bound], edge) if direction < 0 else min(row[bound], edge)
     out = [{"source_id": names.get(r["cpt_id"], r["name"]), "start_kp": r["start_kp"], "end_kp": r["end_kp"],
             "src_start_kp": r["start_kp"], "src_end_kp": r["end_kp"], "flags": "",
             "source_ref": "CPT positions on this plan's route"}
            for r in rows if r["status"] == "placed" and r["end_kp"] > r["start_kp"]]
+    soil = placement.get("soil_constraint") or {}
+    if soil.get("enabled"):
+        from .cpt_soil import constrain_cpts
+        layer = soil_layer if soil_layer is not None else resolve_layer(soil.get("layer"))
+        out, more = constrain_cpts(route, layer, soil.get("unit_field") or "", out,
+                                  {names[c["cpt_id"]]: c for c in cpts},
+                                  {names[r["cpt_id"]]: r["kp"] for r in rows})
+        notes.extend(more)
     return out, notes

@@ -17,11 +17,11 @@ from qgis.PyQt.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
-    QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
+from ...table_widgets import ResizableTableWidget as QTableWidget
 
 from ...qgis_compat import (
     HEADER_RESIZE_MODE_STRETCH,

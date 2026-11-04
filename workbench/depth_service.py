@@ -35,6 +35,10 @@ class DepthSourceConfig:
         self.mode = int(data.get("mode", 0))
         self.raster_layer_ids: List[str] = list(data.get("raster_layer_ids", []))
         self.raster_band = int(data.get("raster_band", 1))
+        # Legacy plans retain finest-native-first selection. In listed mode,
+        # the first valid sample wins; users can put a newer survey first.
+        self.raster_priority = "listed" if data.get("raster_priority") == "listed" else "finest"
+        self.raster_acquired_dates: Dict[str, str] = dict(data.get("raster_acquired_dates") or {})
         self.contour_layers: List[Dict] = list(data.get("contour_layers", []))
         self.contour_search_radius_m = float(data.get("contour_search_radius_m", 0.0))
         self.auto_resample = bool(data.get("auto_resample", True))
@@ -44,6 +48,8 @@ class DepthSourceConfig:
             "mode": self.mode,
             "raster_layer_ids": self.raster_layer_ids,
             "raster_band": self.raster_band,
+            **({"raster_priority": "listed"} if self.raster_priority == "listed" else {}),
+            **({"raster_acquired_dates": self.raster_acquired_dates} if self.raster_acquired_dates else {}),
             "contour_layers": self.contour_layers,
             "contour_search_radius_m": self.contour_search_radius_m,
             "auto_resample": self.auto_resample,

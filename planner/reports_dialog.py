@@ -16,9 +16,10 @@ import pyqtgraph as pg
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog,
     QHBoxLayout, QInputDialog, QLabel, QListWidget, QListWidgetItem,
-    QMessageBox, QPushButton, QSplitter, QTableWidget, QTableWidgetItem,
+    QMessageBox, QPushButton, QSplitter, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
+from ..table_widgets import ResizableTableWidget as QTableWidget
 from qgis.PyQt.QtCore import Qt
 
 from ..qgis_compat import (

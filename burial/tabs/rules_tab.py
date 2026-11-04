@@ -17,6 +17,8 @@ drawn faded with a dashed outline and marked "(out of date)".
 
 from __future__ import annotations
 
+from ...table_widgets import ResizableTableWidget
+
 import json
 from typing import Dict, List, Optional
 
@@ -691,7 +693,7 @@ class RuleEditorDialog(QDialog):
             self.up_spin.setValue(float(config.get("upslope_max_deg")))
         form.addRow("Down-slope limit:", self.down_spin)
         form.addRow("Up-slope limit:", self.up_spin)
-        self.bands_table = QTableWidget(0, 5)
+        self.bands_table = ResizableTableWidget(0, 5)
         self.bands_table.setHorizontalHeaderLabels(
             ["Min WD (m)", "Max WD (m)", "Limit (°)",
              "Down-slope limit (°)", "Up-slope limit (°)"])
@@ -1002,7 +1004,7 @@ class ExcludedSectionsDialog(QDialog):
         self.rule_names = rule_names
 
         layout = QVBoxLayout(self)
-        self.table = QTableWidget(len(self.verdicts), len(self._COLUMNS))
+        self.table = ResizableTableWidget(len(self.verdicts), len(self._COLUMNS))
         self.table.setHorizontalHeaderLabels(self._COLUMNS)
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
@@ -1171,7 +1173,7 @@ class RulesTab(QWidget):
         resolved_export.clicked.connect(self._export_resolved_csv)
         resolved_header.addWidget(resolved_export)
         resolved_layout.addLayout(resolved_header)
-        self.resolved_table = QTableWidget(0, len(_RESOLVED_COLUMNS))
+        self.resolved_table = ResizableTableWidget(0, len(_RESOLVED_COLUMNS))
         self.resolved_table.setHorizontalHeaderLabels(_RESOLVED_COLUMNS)
         self.resolved_table.verticalHeader().setVisible(False)
         self.resolved_table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)

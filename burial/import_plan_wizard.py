@@ -28,9 +28,10 @@ from qgis.PyQt.QtWidgets import (
     QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox,
     QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton,
-    QRadioButton, QSpinBox, QTableWidget, QTableWidgetItem, QToolButton,
+    QRadioButton, QSpinBox, QTableWidgetItem, QToolButton,
     QVBoxLayout, QWizard, QWizardPage,
 )
+from ..table_widgets import ResizableTableWidget as QTableWidget
 
 from . import plan_import as pi
 from . import rpl_plan_import as rpi

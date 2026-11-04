@@ -40,11 +40,11 @@ from qgis.PyQt.QtWidgets import (
     QRadioButton,
     QScrollArea,
     QStackedWidget,
-    QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
+from ...table_widgets import ResizableTableWidget as QTableWidget
 
 from ...qgis_compat import (
     DIALOG_ACCEPTED,

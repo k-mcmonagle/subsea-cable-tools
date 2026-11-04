@@ -1126,15 +1126,10 @@ class PlanModel(QObject):
             return cached[2]
         project = QgsProject.instance()
         layers = map_layers.depth_layer_fingerprints(project, config)
-        from ..bathymetry_sampling import VERSION
-
         info = {
             "layers": layers,
             "signature": map_layers.depth_config_signature(config),
-            "fingerprint": "|".join(
-                [map_layers.DEPTH_FP_VERSION, VERSION,
-                 map_layers.depth_config_signature(config)]
-                + [f"{k}={v}" for k, v in sorted(layers.items())]),
+            "fingerprint": map_layers.depth_config_fingerprint(project, config, layers),
             "names": map_layers.depth_layer_names(project, config),
         }
         try:

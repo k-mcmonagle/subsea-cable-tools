@@ -39,12 +39,12 @@ from qgis.PyQt.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSplitter,
-    QTableWidget,
     QTableWidgetItem,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
+from ...table_widgets import ResizableTableWidget as QTableWidget
 
 from ...plotkit.widgets import entries_button
 from ...plugin_log import log_exception

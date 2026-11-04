@@ -39,12 +39,12 @@ from qgis.PyQt.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
-    QTableWidget,
     QTableWidgetItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
+from ...table_widgets import ResizableTableWidget as QTableWidget
 
 from ...plotkit.row_stack import KpRowStack
 from ...plotkit.widgets import StayOpenMenu, legend_html, menu_button, runs_path

@@ -26,12 +26,12 @@ from qgis.PyQt.QtWidgets import (
     QHBoxLayout,
     QLineEdit,
     QPushButton,
-    QTableWidget,
     QTableWidgetItem,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
+from ...table_widgets import ResizableTableWidget as QTableWidget
 
 from ...qgis_compat import (
     DIALOG_ACCEPTED,

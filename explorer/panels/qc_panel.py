@@ -25,11 +25,11 @@ from qgis.PyQt.QtWidgets import (
     QProgressDialog,
     QScrollArea,
     QSplitter,
-    QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
+from ...table_widgets import ResizableTableWidget as QTableWidget
 from qgis.core import QgsApplication
 
 from ...qgis_compat import (

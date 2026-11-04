@@ -154,6 +154,11 @@ class ZoneStripItem(pg.GraphicsObject):
         self._deepest = 1.0
 
     def set_zones(self, depths: Sequence[float], zones: Sequence[Optional[int]]) -> None:
+        # Classification is optional (e.g. qc-only imports), and older or
+        # incomplete logs may contain fewer zones than depth readings. Keep
+        # those depths uncoloured; never extrapolate the last known zone.
+        zones = list(zones[:len(depths)])
+        zones.extend([None] * (len(depths) - len(zones)))
         runs = []
         start = 0
         for i in range(1, len(depths) + 1):

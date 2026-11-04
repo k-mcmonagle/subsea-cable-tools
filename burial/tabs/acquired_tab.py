@@ -37,11 +37,11 @@ from qgis.PyQt.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSplitter,
-    QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
+from ...table_widgets import ResizableTableWidget as QTableWidget
 
 from ...plotkit.widgets import entries_button
 from ...plugin_log import log_exception

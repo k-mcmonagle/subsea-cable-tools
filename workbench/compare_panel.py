@@ -24,9 +24,9 @@ from qgis.PyQt.QtCore import Qt, pyqtSignal
 from qgis.PyQt.QtGui import QBrush, QColor
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout,
-    QHeaderView, QLabel, QMessageBox, QPushButton, QTabWidget, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+    QHeaderView, QLabel, QMessageBox, QPushButton, QTabWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
+from ..table_widgets import ResizableTableWidget as QTableWidget
 
 from ..qgis_compat import (
     WINDOW_HINT_CLOSE,

@@ -33,9 +33,10 @@ from qgis.PyQt.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout,
     QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton,
-    QSizePolicy, QSpinBox, QSplitter, QTableView, QTableWidget, QTreeWidget,
+    QSizePolicy, QSpinBox, QSplitter, QTableView, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout, QWizard, QWizardPage, QWidget,
 )
+from ..table_widgets import ResizableTableWidget as QTableWidget
 
 from ..rpl_import import model as im
 from ..rpl_import import detect as idetect

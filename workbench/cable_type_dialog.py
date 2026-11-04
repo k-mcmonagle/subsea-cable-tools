@@ -20,9 +20,9 @@ from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QBrush, QColor
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView, QColorDialog, QDialog, QDialogButtonBox, QHBoxLayout,
-    QHeaderView, QInputDialog, QLabel, QMessageBox, QPushButton, QTableWidget,
-    QTableWidgetItem, QVBoxLayout,
+    QHeaderView, QInputDialog, QLabel, QMessageBox, QPushButton, QTableWidgetItem, QVBoxLayout,
 )
+from ..table_widgets import ResizableTableWidget as QTableWidget
 
 from ..qgis_compat import DIALOG_ACCEPTED, MESSAGEBOX_YES, qt_exec
 from . import layer_style

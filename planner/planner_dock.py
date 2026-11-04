@@ -16,9 +16,10 @@ from qgis.PyQt.QtWidgets import (
     QDialogButtonBox, QDoubleSpinBox,
     QDockWidget, QFileDialog, QFormLayout, QHBoxLayout, QInputDialog, QLabel,
     QMessageBox,
-    QLineEdit, QMenu, QPushButton, QSlider, QTableWidget, QTableWidgetItem,
+    QLineEdit, QMenu, QPushButton, QSlider, QTableWidgetItem,
     QTextEdit, QVBoxLayout, QWidget,
 )
+from ..table_widgets import ResizableTableWidget as QTableWidget
 from qgis.core import (
     QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsExpression,
     QgsExpressionContext,

@@ -5,7 +5,7 @@ The same two-pane pattern as the Inputs dialog (``input_picker``): the left
 pane lists the project layers that can serve as the chosen source type
 (raster layers, or line layers for depth contours) with a search box and
 the Layers-panel group each sits in; the right pane holds the plan's
-source — one raster and its band, or up to two contour layers each with
+source — native-resolution rasters and their band, or up to two contour layers each with
 its depth field — plus the Input Data Register details every input
 carries. OK returns the input row (role ``bathymetry``) for the caller to
 save; the configuration JSON matches what ``DepthSourceConfig`` reads.
@@ -14,6 +14,7 @@ save; the configuration JSON matches what ``DepthSourceConfig`` reads.
 from __future__ import annotations
 
 import json
+from datetime import date
 from typing import Dict, List, Optional
 
 from qgis.core import QgsProject, QgsRasterLayer, QgsVectorLayer
@@ -36,6 +37,7 @@ from qgis.PyQt.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStackedWidget,
+    QStyledItemDelegate,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -48,7 +50,8 @@ from ...qgis_compat import (
     ITEM_DATA_USER_ROLE,
     SELECTION_MODE_EXTENDED,
 )
-from .. import schema, ui_helpers
+from .. import map_layers, schema, ui_helpers
+from ...bathymetry_sampling import native_cell_m
 from .input_picker import (
     GEOM_LINE,
     _QUALITIES,
@@ -75,6 +78,11 @@ def guess_depth_field(names: List[str]) -> str:
         if low in ("z", "d"):
             return name
     return ""
+
+
+class _DateDelegate(QStyledItemDelegate):
+    def createEditor(self, parent, option, index):
+        return super().createEditor(parent, option, index) if index.column() == 2 else None
 
 
 class _ContourSlot:
@@ -112,9 +120,12 @@ class BathymetryDialog(QDialog):
         model's ``DepthSourceConfig`` (layer ids relinked by source)."""
         super().__init__(parent)
         self.setWindowTitle("Bathymetry source")
-        self.resize(1000, 560)
+        self.resize(1050, 720)
         self._row = dict(row or {})
         self._layers: Dict[str, object] = {}
+        self._rasters = []
+        self._raster_dates = {}
+        self._missing_rasters = []
         try:
             config = json.loads(self._row.get("config_json") or "{}")
         except (TypeError, ValueError):
@@ -125,8 +136,8 @@ class BathymetryDialog(QDialog):
 
         layout = QVBoxLayout(self)
         intro = QLabel(
-            "Choose the bathymetry this plan's profile is sampled from — one "
-            "raster, or up to two depth-contour line layers (e.g. minor and "
+            "Choose the bathymetry this plan's profile is sampled from — one or more "
+            "rasters, or up to two depth-contour line layers (e.g. minor and "
             "major contours, merged into one profile). Workbench RPL depth "
             "sources are not inherited. Pick layers on the left and add "
             "them; set the register details on the right.")
@@ -167,6 +178,7 @@ class BathymetryDialog(QDialog):
         self.layer_tree.setColumnCount(2)
         self.layer_tree.setHeaderLabels(["Layer", "Group"])
         self.layer_tree.setRootIsDecorated(False)
+        self.layer_tree.header().setStretchLastSection(False)
         self.layer_tree.setSelectionMode(SELECTION_MODE_EXTENDED)
         self.layer_tree.setSortingEnabled(True)
         self.layer_tree.sortByColumn(0, getattr(Qt, "SortOrder", Qt).AscendingOrder)
@@ -193,7 +205,9 @@ class BathymetryDialog(QDialog):
         right_layout.addWidget(QLabel("<b>Plan bathymetry</b>"))
         self.pages = QStackedWidget()
         raster_page = QWidget()
-        raster_form = QFormLayout(raster_page)
+        raster_layout = QVBoxLayout(raster_page)
+        raster_form = QFormLayout()
+        raster_layout.addLayout(raster_form)
         raster_row = QHBoxLayout()
         self.raster_label = QLabel("—")
         self.raster_label.setWordWrap(True)
@@ -201,10 +215,42 @@ class BathymetryDialog(QDialog):
         self.raster_clear = QPushButton("Clear")
         self.raster_clear.clicked.connect(lambda: self._set_raster(None))
         raster_row.addWidget(self.raster_clear)
-        raster_form.addRow("Raster:", raster_row)
+        raster_form.addRow("Rasters:", raster_row)
+        self.raster_tree = QTreeWidget()
+        self.raster_tree.setHeaderLabels(["Priority / survey", "Native cell (m)", "Acquired (YYYY-MM-DD)"])
+        self.raster_tree.header().setStretchLastSection(False)
+        self.raster_tree.setItemDelegate(_DateDelegate(self.raster_tree))
+        self.raster_tree.itemChanged.connect(self._raster_date_changed)
+        self.raster_tree.setRootIsDecorated(False)
+        self.raster_tree.setSelectionMode(SELECTION_MODE_EXTENDED)
+        self.raster_tree.setMinimumHeight(100)
+        raster_layout.addWidget(self.raster_tree, 1)
+        order_row = QHBoxLayout()
+        for label, callback in (("Move up", lambda: self._move_raster(-1)),
+                                ("Move down", lambda: self._move_raster(1)),
+                                ("Remove selected", self._remove_rasters)):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            order_row.addWidget(button)
+        raster_layout.addLayout(order_row)
+        raster_options = QFormLayout()
+        raster_layout.addLayout(raster_options)
+        self.raster_priority = QComboBox()
+        self.raster_priority.addItem("Finest resolution, then newest acquired date", "finest")
+        self.raster_priority.addItem("Listed order (top first)", "listed")
+        raster_options.addRow("Overlap priority:", self.raster_priority)
+        note = QLabel("Native grids are sampled directly, with NoData falling through to the next source. "
+                      "Double-click an acquisition date to edit it. Dates break resolution ties; "
+                      "undated sources follow dated ones, then listed order breaks remaining ties. "
+                      "Listed order can override resolution to prefer a newer, coarser survey. "
+                      "Acquisition dates are not inferred from filenames or file timestamps. "
+                      "Check that surveys use compatible vertical datums. "
+                      "Profile spacing and slope windows still control the detail in derived results.")
+        note.setWordWrap(True)
+        raster_layout.addWidget(note)
         self.raster_band = QSpinBox()
         self.raster_band.setRange(1, 99)
-        raster_form.addRow("Band:", self.raster_band)
+        raster_options.addRow("Band:", self.raster_band)
         self.pages.addWidget(raster_page)
         contour_page = QWidget()
         contour_form = QFormLayout(contour_page)
@@ -226,7 +272,7 @@ class BathymetryDialog(QDialog):
             "are interpolated between the actual route crossings.")
         contour_form.addRow("Contour search radius:", self.search_radius)
         self.pages.addWidget(contour_page)
-        right_layout.addWidget(self.pages)
+        right_layout.addWidget(self.pages, 1)
 
         register = QGroupBox("Register details")
         register_form = QFormLayout(register)
@@ -263,6 +309,7 @@ class BathymetryDialog(QDialog):
         layout.addWidget(buttons)
         self.ok_button = buttons.button(BUTTON_BOX_OK)
         self.ok_button.setText("Apply source")
+        self.raster_band.valueChanged.connect(self._sync_ok)
 
         self._populate(project)
         self._load(config, resolved, project)
@@ -288,7 +335,15 @@ class BathymetryDialog(QDialog):
             mode = MODE_CONTOURS if contours and not raster_ids else MODE_RASTER
         (self.contour_radio if mode == MODE_CONTOURS
          else self.raster_radio).setChecked(True)
-        self._set_raster(project.mapLayer(raster_ids[0]) if raster_ids else None)
+        self._rasters = [project.mapLayer(layer_id) for layer_id in raster_ids
+                         if isinstance(project.mapLayer(layer_id), QgsRasterLayer)]
+        self._missing_rasters = [layer_id for layer_id in raster_ids if project.mapLayer(layer_id) is None]
+        saved_dates = {map_layers.source_identity(key): value
+                       for key, value in (config.get("raster_acquired_dates") or {}).items()}
+        self._raster_dates = {layer.source(): saved_dates.get(map_layers.layer_identity(layer), "")
+                              for layer in self._rasters}
+        self._sync_rasters()
+        self.raster_priority.setCurrentIndex(1 if config.get("raster_priority") == "listed" else 0)
         self.raster_band.setValue(int(config.get("raster_band") or 1))
         for slot, entry in zip(self.slots, contours):
             layer = project.mapLayer(entry.get("layer_id") or "")
@@ -299,12 +354,58 @@ class BathymetryDialog(QDialog):
             float(config.get("contour_search_radius_m") or 500.0))
 
     def _set_raster(self, layer) -> None:
-        self._raster = layer
-        self.raster_label.setText(layer.name() if layer is not None else "—")
-        self.raster_label.setToolTip(layer.source() if layer is not None else "")
-        self.raster_clear.setEnabled(layer is not None)
+        self._rasters = [layer] if layer is not None else []
+        self._raster_dates = {}
+        self._missing_rasters = []
+        self._sync_rasters()
+
+    def _sync_rasters(self, selected=None) -> None:
+        self._raster = self._rasters[0] if self._rasters else None
+        self.raster_label.setText(f"{len(self._rasters)} selected" if self._rasters else "—")
+        self.raster_clear.setEnabled(bool(self._rasters or self._missing_rasters))
+        self.raster_tree.blockSignals(True)
+        self.raster_tree.clear()
+        for layer in self._rasters:
+            item = QTreeWidgetItem([layer.name(), f"{native_cell_m(layer):g}",
+                                    self._raster_dates.get(layer.source(), "")])
+            item.setFlags(item.flags() | getattr(Qt, "ItemFlag", Qt).ItemIsEditable)
+            item.setToolTip(2, "Survey acquisition date (YYYY-MM-DD); leave blank if unknown.")
+            item.setData(0, ITEM_DATA_USER_ROLE, layer.id())
+            item.setToolTip(0, layer.source())
+            self.raster_tree.addTopLevelItem(item)
+            item.setSelected(layer.id() in (selected or []))
+        self.raster_tree.resizeColumnToContents(0)
+        self.raster_tree.resizeColumnToContents(1)
+        self.raster_tree.resizeColumnToContents(2)
+        self.raster_tree.blockSignals(False)
         if hasattr(self, "ok_button"):
             self._slots_changed()
+
+    def _raster_date_changed(self, item, column):
+        if column != 2:
+            return
+        layer = self._layers.get(item.data(0, ITEM_DATA_USER_ROLE))
+        if layer is not None:
+            self._raster_dates[layer.source()] = item.text(2).strip()
+            self._sync_ok()
+
+    def _selected_raster_ids(self):
+        return {item.data(0, ITEM_DATA_USER_ROLE) for item in self.raster_tree.selectedItems()}
+
+    def _remove_rasters(self):
+        selected = self._selected_raster_ids()
+        self._rasters = [layer for layer in self._rasters if layer.id() not in selected]
+        self._sync_rasters()
+
+    def _move_raster(self, direction):
+        selected = self._selected_raster_ids()
+        indices = range(len(self._rasters)) if direction < 0 else range(len(self._rasters) - 1, -1, -1)
+        for i in indices:
+            j = i + direction
+            if (self._rasters[i].id() in selected and 0 <= j < len(self._rasters)
+                    and self._rasters[j].id() not in selected):
+                self._rasters[i], self._rasters[j] = self._rasters[j], self._rasters[i]
+        self._sync_rasters(selected)
 
     def _slots_changed(self) -> None:
         self._apply_filter()
@@ -333,8 +434,8 @@ class BathymetryDialog(QDialog):
 
     def _in_use(self) -> set:
         ids = set()
-        if self.mode() == MODE_RASTER and self._raster is not None:
-            ids.add(self._raster.id())
+        if self.mode() == MODE_RASTER:
+            ids.update(layer.id() for layer in self._rasters)
         if self.mode() == MODE_CONTOURS:
             ids.update(s.layer.id() for s in self.slots if s.layer is not None)
         return ids
@@ -372,16 +473,16 @@ class BathymetryDialog(QDialog):
         self.use_layers([l for l in layers if l is not None])
 
     def use_layers(self, layers) -> None:
-        """Put layers into the right pane: a raster replaces the raster; line
-        layers fill the empty contour slots in order."""
+        """Add rasters without duplicates; lines fill empty contour slots."""
         if not layers:
             return
         if self.mode() == MODE_RASTER:
-            self._set_raster(layers[0])
-            if len(layers) > 1:
-                self.problem_label.setText(
-                    "A raster source uses one layer — the first selected "
-                    "was used.")
+            used = {layer.id() for layer in self._rasters}
+            for layer in layers:
+                if isinstance(layer, QgsRasterLayer) and layer.isValid() and layer.id() not in used:
+                    self._rasters.append(layer)
+                    used.add(layer.id())
+            self._sync_rasters()
         else:
             left_over = 0
             for layer in layers:
@@ -400,7 +501,21 @@ class BathymetryDialog(QDialog):
     # -- validation / result -------------------------------------------------------
     def problems(self) -> List[str]:
         if self.mode() == MODE_RASTER:
-            return [] if self._raster is not None else ["Add a raster layer."]
+            if self._missing_rasters:
+                return ["Some saved rasters are unavailable. Restore them in the project, or Clear and select the sources again."]
+            if not self._rasters:
+                return ["Add a raster layer."]
+            problems = [f"{layer.name()} has no band {self.raster_band.value()}."
+                        for layer in self._rasters if layer.bandCount() < self.raster_band.value()]
+            for layer in self._rasters:
+                text = self._raster_dates.get(layer.source(), "")
+                if text:
+                    try:
+                        if date.fromisoformat(text).isoformat() != text:
+                            raise ValueError("date format")
+                    except ValueError:
+                        problems.append(f"{layer.name()}: enter the acquisition date as YYYY-MM-DD, or leave blank.")
+            return problems
         used = [s for s in self.slots if s.layer is not None]
         if not used:
             return ["Add at least one contour layer."]
@@ -435,14 +550,20 @@ class BathymetryDialog(QDialog):
                         "auto_resample": True}
         primary = None
         names: List[str] = []
-        if mode == MODE_RASTER and self._raster is not None:
-            primary = self._raster
-            names.append(self._raster.name())
-            config["raster_layer_ids"] = [self._raster.id()]
+        if mode == MODE_RASTER and self._rasters:
+            primary = self._rasters[0]
+            names.extend(layer.name() for layer in self._rasters)
+            config["raster_layer_ids"] = [layer.id() for layer in self._rasters]
+            if self.raster_priority.currentData() == "listed":
+                config["raster_priority"] = "listed"
             # Sources ride along so a removed-and-re-added layer (new id)
             # is found again instead of silently dropping the bathymetry.
-            config["raster_sources"] = [self._raster.source()]
+            config["raster_sources"] = [layer.source() for layer in self._rasters]
             config["raster_band"] = self.raster_band.value()
+            dates = {layer.source(): self._raster_dates[layer.source()] for layer in self._rasters
+                     if self._raster_dates.get(layer.source())}
+            if dates:
+                config["raster_acquired_dates"] = dates
         if mode == MODE_CONTOURS:
             for slot in self.slots:
                 if slot.layer is None:

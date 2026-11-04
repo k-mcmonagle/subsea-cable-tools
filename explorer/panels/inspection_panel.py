@@ -29,11 +29,11 @@ from qgis.PyQt.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSplitter,
-    QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
+from ...table_widgets import ResizableTableWidget as QTableWidget
 from qgis.core import QgsProject, QgsPointXY, QgsCoordinateReferenceSystem
 
 from ...plugin_log import log_exception, log_warning

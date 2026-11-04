@@ -7,9 +7,9 @@ from qgis.PyQt.QtCore import Qt, pyqtSignal
 from qgis.PyQt.QtGui import QBrush, QColor
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView, QComboBox, QHBoxLayout, QHeaderView, QInputDialog,
-    QLabel, QMessageBox, QPushButton, QTabWidget, QTableWidget,
-    QTableWidgetItem, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QLabel, QMessageBox, QPushButton, QTabWidget, QTableWidgetItem, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
+from ..table_widgets import ResizableTableWidget as QTableWidget
 
 from . import schema
 from .compare_panel import RevisionComparePanel

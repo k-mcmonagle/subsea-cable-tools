@@ -316,10 +316,15 @@ def test_measurements(h: _Harness) -> bool:
     click_ok = preview_ok and bool(clicked) and abs(clicked["width_m"] - 200) < 0.5 \
         and abs(clicked["depth_change_m"] - 10) < 0.05
 
+    d.ve_spin.setValue(12.0)
+    d.true_scale_chk.setChecked(True)
+    ve_ok = d.ve_spin.value() == 1.0 and abs(vb.state["aspectLocked"] - 1000.0) < 1e-6
+    d.true_scale_chk.setChecked(False)
+    ve_ok = ve_ok and d.ve_spin.value() == 12.0
     d.ve_spin.setValue(1.0)
-    ve_ok = abs(vb.state["aspectLocked"] - 1000.0) < 1e-6
+    ve_ok = ve_ok and d.true_scale_chk.isChecked()
     d.ve_spin.setValue(0)
-    ve_ok = ve_ok and vb.state["aspectLocked"] is False
+    ve_ok = ve_ok and not d.true_scale_chk.isChecked() and vb.state["aspectLocked"] is False
 
     saved = QFileDialog.getSaveFileName
     csv_path = os.path.join(h.temp, "measure.csv")

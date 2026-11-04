@@ -42,12 +42,12 @@ from qgis.PyQt.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSpinBox,
-    QTableWidget,
     QTableWidgetItem,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
+from ..table_widgets import ResizableTableWidget as QTableWidget
 
 from ..plugin_log import log_exception
 from ..qgis_compat import (

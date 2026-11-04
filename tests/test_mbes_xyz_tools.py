@@ -209,6 +209,13 @@ def test_multifile_create_and_merge() -> bool:
     _, gap = _sample(merged_path, 500016.0, 6000015.0)
     ok = ok and (gap is None or gap <= -9998.0 or math.isnan(gap))
     detail += f"; merged: {merged.rasterUnitsPerPixelX():g} m/px"
+    virtual_path = os.path.join(folder, "virtual.vrt")
+    virtual_result = processing.run(merge, {
+        "INPUTS": [lyr_coarse, lyr_fine], "OUTPUT": virtual_path, "VIRTUAL": True,
+    }, context=context, feedback=feedback)
+    virtual, virtual_a = _sample(virtual_result["OUTPUT"], 500003.0, 6000002.0)
+    ok = ok and virtual is not None and abs(virtual_a - merged_a) < 1e-6
+    ok = ok and os.path.getsize(virtual_path) < 100000 and os.path.exists(virtual_path + '.sources.json')
     project.removeMapLayers([lyr_coarse.id(), lyr_fine.id()])
     return _result("multi-file create + merge keeps per-file resolution", ok, detail)
 

@@ -27,11 +27,11 @@ from qgis.PyQt.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
-    QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
+from ..table_widgets import ResizableTableWidget as QTableWidget
 
 from ..geotech import cpt as cpt_mod
 from ..qgis_compat import (

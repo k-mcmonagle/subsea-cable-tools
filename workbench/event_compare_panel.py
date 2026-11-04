@@ -26,8 +26,9 @@ from qgis.PyQt.QtGui import QBrush, QColor, QDesktopServices
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QSplitter,
-    QStyledItemDelegate, QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
+    QStyledItemDelegate, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
+from ..table_widgets import ResizableTableWidget as QTableWidget
 
 from ..qgis_compat import (
     EDIT_TRIGGER_DOUBLE_CLICKED,
