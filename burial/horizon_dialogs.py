@@ -3,17 +3,17 @@
 
 from __future__ import annotations
 
-import copy
 import os
 
 import pyqtgraph as pg
+from qgis.core import QgsApplication, QgsProject
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
     QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
-    QPlainTextEdit, QPushButton, QSplitter, QTabWidget, QVBoxLayout, QWidget,
+    QPlainTextEdit, QProgressBar, QPushButton, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from ..qgis_compat import (
@@ -23,6 +23,7 @@ from ..qgis_compat import (
 from . import horizons, schema
 from .ground_dialogs import KpReferenceWidget
 from .ground_plot import GroundModelPlot
+from .horizon_task import HorizonTask
 
 
 def route_reference(model):
@@ -66,6 +67,9 @@ class HorizonImportDialog(QDialog):
         self.model, self.dock = model, dock
         self.rows, self.drawing = [], None
         self._raw_items = []
+        self._task = None
+        self._closed = False
+        self._preview_context = None
         self._loading = False
         self._plan_id = model.plan_id
         self._route = route_reference(model)
@@ -75,7 +79,7 @@ class HorizonImportDialog(QDialog):
         file_row = QHBoxLayout()
         self.path = QLineEdit()
         self.path.setReadOnly(True)
-        browse = QPushButton("Open DXF…")
+        browse = self.browse_button = QPushButton("Open DXF…")
         browse.clicked.connect(self._browse)
         file_row.addWidget(self.path, 1)
         file_row.addWidget(browse)
@@ -160,8 +164,18 @@ class HorizonImportDialog(QDialog):
         self.message.setMaximumHeight(105)
         self.message.setPlainText("Open a DXF, select layers and check coordinates, then Preview.")
         layout.addWidget(self.message)
+        progress_row = QHBoxLayout()
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.hide()
+        self.cancel_work = QPushButton("Cancel loading")
+        self.cancel_work.clicked.connect(self._cancel_work)
+        self.cancel_work.hide()
+        progress_row.addWidget(self.progress, 1)
+        progress_row.addWidget(self.cancel_work)
+        layout.addLayout(progress_row)
         buttons_row = QHBoxLayout()
-        preview = QPushButton("Preview")
+        preview = self.preview_button = QPushButton("Preview")
         preview.clicked.connect(self._preview)
         buttons_row.addWidget(preview)
         buttons_row.addStretch()
@@ -184,11 +198,80 @@ class HorizonImportDialog(QDialog):
         self.kp_ref.group.buttonClicked.connect(self._invalidate)
         self.vertical_ref.currentIndexChanged.connect(self._reference_changed)
         self._reference_changed()
+        model.planChanged.connect(self._check_plan)
+        QgsProject.instance().cleared.connect(self.reject)
+
+    def _check_plan(self):
+        if self.model.plan_id != self._plan_id or route_reference(self.model) != self._route:
+            self.reject()
+
+    def done(self, result):
+        self._closed = True
+        self._cancel_work()
+        super().done(result)
+
+    def _cancel_work(self):
+        if self._task is not None:
+            self._task.cancel()
+            self.cancel_work.setEnabled(False)
+            self.message.setPlainText("Cancelling… No changes have been saved.")
+
+    def _busy(self, busy):
+        self.tabs.setEnabled(not busy)
+        self.browse_button.setEnabled(not busy)
+        self.preview_button.setEnabled(not busy)
+        self.progress.setVisible(busy)
+        self.cancel_work.setVisible(busy)
+        self.cancel_work.setEnabled(busy)
+        if busy:
+            self.progress.setValue(0)
+            self.import_button.setEnabled(False)
+
+    def _start_task(self, label, operation, kind):
+        if self._task is not None or self._closed:
+            return
+        self._task_kind = kind
+        task = self._task = HorizonTask(label, operation)
+        task.completed.connect(self._completed)
+        task.progressChanged.connect(self._progress_changed)
+        task.message.connect(self._progress_message)
+        self.destroyed.connect(task.owner_destroyed)
+        self._busy(True)
+        self.message.setPlainText(label)
+        QgsApplication.taskManager().addTask(task)
+
+    def _progress_changed(self, value):
+        if self.sender() is self._task and not self._closed:
+            self.progress.setValue(round(value))
+
+    def _progress_message(self, message):
+        if self.sender() is self._task and not self._closed and self.cancel_work.isEnabled():
+            self.message.setPlainText(message)
+
+    def _completed(self, result, error, cancelled):
+        if self.sender() is not self._task:
+            return
+        self._task = None
+        if self._closed:
+            return
+        self._busy(False)
+        self._check_plan()
+        if self._closed:
+            return
+        if cancelled or error:
+            self.message.setPlainText("Cancelled. No changes have been saved." if cancelled else error)
+            return
+        if self._task_kind == "read":
+            self._loaded(result)
+        else:
+            self._show_preview(result)
 
     def _reference_changed(self, *_args):
         self.datum_box.setEnabled(self.vertical_ref.currentData() == "datum")
 
     def _invalidate(self, *_args):
+        if self._task is not None:
+            self._cancel_work()
         self.rows = []
         self.import_button.setEnabled(False)
         if not self._loading:
@@ -201,16 +284,17 @@ class HorizonImportDialog(QDialog):
             self.load_file(path)
 
     def load_file(self, path):
+        if self._task is not None or self._closed:
+            return
         self._invalidate()
         self.drawing = None
         self.layers.clear()
         self._draw_raw()
         self.path.setText(path)
-        try:
-            drawing = horizons.read_dxf(path)
-        except (OSError, ValueError) as exc:
-            self.message.setPlainText(str(exc))
-            return
+        self.cancel_work.setText("Cancel loading")
+        self._start_task("Reading DXF…", lambda progress: horizons.read_dxf(path, progress), "read")
+
+    def _loaded(self, drawing):
         self.drawing = drawing
         self._loading = True
         self.seabed.clear()
@@ -227,7 +311,8 @@ class HorizonImportDialog(QDialog):
             control.setCurrentIndex(max(0, control.findData(factor)))
         hint = (f"Header units suggest {self.x_units.currentText().lower()}; check each axis."
                 if drawing["units"] in horizons.DXF_UNITS else "Drawing units unspecified/unsupported; set both axes explicitly.")
-        self.file_note.setText(f"{len(drawing['layers'])} supported layers. {hint} Tick horizon layers; gaps stay separate.")
+        self.file_note.setText(f"{len(drawing['layers'])} supported layers, {drawing['vertex_count']:,} vertices. "
+                               f"{hint} Tick horizon layers; gaps stay separate.")
         self._loading = False
         self.message.setPlainText("\n".join(drawing["warnings"]) or "Select horizon layers, then check coordinates and Preview.")
         self._draw_raw()
@@ -255,8 +340,10 @@ class HorizonImportDialog(QDialog):
                 if i == len(self._raw_items):
                     self._raw_items.append(self.raw_plot.plot([], [], connect="finite"))
                 item = self._raw_items[i]
-                item.setPen(pg.mkPen(colour, width=1.5))
-                item.setData(x, y, connect="finite")
+                # Thin, non-antialiased lines avoid Qt stroking hundreds of
+                # thousands of dense bends; no vertices or gaps are removed.
+                item.setPen(pg.mkPen(colour, width=1 if len(x) > 10000 else 1.5))
+                item.setData(x, y, connect="finite", antialias=False)
                 item.show()
             self.raw_plot.autoRange()
 
@@ -269,6 +356,8 @@ class HorizonImportDialog(QDialog):
             reference=self.vertical_ref.currentData(), datum=self.datum.text().strip())
 
     def _preview(self):
+        if self._task is not None or self._closed:
+            return
         self._invalidate()
         try:
             if self.model.plan_id != self._plan_id or route_reference(self.model) != self._route:
@@ -278,45 +367,88 @@ class HorizonImportDialog(QDialog):
             options = self._options()
             kp_map = self.kp_ref.build_map()
             reference = None
+            reference_entities = None
             source = {"file": os.path.basename(self.path.text()), "imported_utc": schema.utc_now_iso(),
-                      "route": self._route, "source_rpl": self.kp_ref.source_label()}
+                      "route": self._route, "source_rpl": self.kp_ref.source_label(),
+                      "import_id": schema.new_id(), "sha256": self.drawing["sha256"],
+                      "size_bytes": self.drawing["size_bytes"]}
             if options.reference == "datum":
                 if not self.datum_confirm.isChecked():
                     raise ValueError("Check and confirm the shared vertical datum before converting depths.")
                 layer = self.seabed.currentData()
                 source["seabed"] = layer or "Plan bathymetry"
                 if layer is not None:
-                    reference = [horizons.remap_segment(options.transform(e["points"]), kp_map)
-                                 for e in self.drawing["layers"][layer]]
+                    reference_entities = self.drawing["layers"][layer]
                 else:
                     profile = self.model.bathy_profile
                     if profile is None or self.model.profile_stale_reasons():
                         raise ValueError("Sample current plan bathymetry first, or select a seabed layer in the DXF.")
-                    reference = horizons.reference_segments(profile)
+                    # Snapshot only the arrays consumed by the worker.
+                    from types import SimpleNamespace
+                    reference = SimpleNamespace(kps=list(profile.kps), depths=list(profile.depths),
+                                                source_ids=list(profile.source_ids or []))
                     source["profile_sampled_utc"] = profile.sampled_utc
-            rows, warnings = horizons.build_horizons(
-                self.drawing, self._selected(), options, kp_map, reference, source)
-            scope = self.model.gen_params().scope
-            lo = min(s[0][0] for row in rows for s in row["segments"])
-            hi = max(s[-1][0] for row in rows for s in row["segments"])
-            if scope.length_km > 0 and (lo < scope.start_km or hi > scope.end_km):
-                warnings.append("Some horizon KPs are outside the plan scope; check units, origin and KP reference.")
-            self.preview_plot.set_horizons(rows)
-            self.preview_plot.set_target_runs(self.model.target_runs())
-            self.preview_plot.plot.setXRange(lo, hi, padding=0.03)
-            self.message.setPlainText(f"{len(rows)} horizon(s), KP {lo:.6f}–{hi:.6f}. Depths are metres below seabed.\n"
-                                      + kp_map.diagnostics.summary() + "\n" + "\n".join(warnings))
-            self.rows = rows
-            self.import_button.setEnabled(True)
-            self.tabs.setCurrentIndex(3)
+            drawing, selected = self.drawing, self._selected()
+            if not selected:
+                raise ValueError("Tick at least one horizon layer first.")
+            # Captures are plain geometry/numeric values, never self or QObjects.
+            def convert(progress):
+                ref = reference
+                def reference_progress(_percent, _message):
+                    progress(None, "Preparing seabed reference…")
+                if reference_entities is not None:
+                    anchor_xs = [a[0] for a in kp_map.anchors]
+                    ref = [horizons.remap_segment(options.transform(e["points"], reference_progress),
+                                                 kp_map, reference_progress, anchor_xs)
+                           for e in reference_entities]
+                elif ref is not None:
+                    ref = horizons.reference_segments(ref, reference_progress)
+                return horizons.build_horizons(drawing, selected, options, kp_map, ref, source, progress)
+
+            self._preview_context = source, kp_map.diagnostics.summary()
+            self.cancel_work.setText("Cancel conversion")
+            self._start_task("Converting horizons…", convert, "convert")
         except (ValueError, OSError) as exc:
             self.message.setPlainText(str(exc))
 
+    def _show_preview(self, result):
+        source, diagnostics = self._preview_context
+        if source.get("profile_sampled_utc") is not None and (
+                self.model.bathy_profile is None or self.model.profile_stale_reasons()
+                or self.model.bathy_profile.sampled_utc != source["profile_sampled_utc"]):
+            self.message.setPlainText("Seabed profile changed during conversion. Preview again.")
+            return
+        rows, warnings = result
+        lo = min(s[0][0] for row in rows for s in row["segments"])
+        hi = max(s[-1][0] for row in rows for s in row["segments"])
+        scope_lo = float(self.model.plan.get("scope_start_kp") or 0)
+        scope_hi = float(self.model.plan.get("scope_end_kp") or 0)
+        if scope_hi > scope_lo and (lo < scope_lo or hi > scope_hi):
+            warnings.append("Some horizon KPs are outside the plan scope; check units, origin and KP reference.")
+        self.preview_plot.set_horizons(rows)
+        self.preview_plot.set_target_runs(self.model.target_runs())
+        self.preview_plot.plot.setXRange(lo, hi, padding=0.03)
+        self.message.setPlainText(f"{len(rows)} horizon(s), KP {lo:.6f}–{hi:.6f}. Depths are metres below seabed.\n"
+                                  + diagnostics + "\n" + "\n".join(warnings))
+        self.rows = rows
+        self.import_button.setEnabled(True)
+        self.tabs.setCurrentIndex(3)
+
     def _accept(self):
-        # Recompute from current controls/reference; never accept an obsolete preview.
-        self._preview()
-        if self.rows:
-            self.accept()
+        self._check_plan()
+        if self._closed or self._task is not None or not self.rows:
+            return
+        # Control changes invalidate rows. Check external reference changes too,
+        # without repeating a potentially long conversion on the GUI thread.
+        notice = reference_notice(self.rows[0], self.model)
+        if (self.rows[0]["source"].get("profile_sampled_utc") is not None
+                and self.model.profile_stale_reasons()):
+            notice = "Seabed profile is stale. Sample it again before importing."
+        if notice:
+            self._invalidate()
+            self.message.setPlainText(notice)
+            return
+        self.accept()
 
 
 class HorizonsDialog(QDialog):
@@ -325,15 +457,17 @@ class HorizonsDialog(QDialog):
     def __init__(self, model, dock, parent=None):
         super().__init__(parent)
         self.model, self.dock = model, dock
-        self.rows = copy.deepcopy(horizons.plan_rows(model.plan))
-        self._initial = copy.deepcopy(self.rows)
+        # All edits replace segments; immutable vertex arrays need not be copied
+        # several times just to open a large imported section.
+        self._initial = horizons.plan_rows(model.plan)
+        self.rows = [dict(row) for row in self._initial]
         self._plan_id, self._route = model.plan_id, route_reference(model)
         self._loading = False
         self.setWindowTitle("Sub-bottom horizons")
         self.resize(1000, 700)
         layout = QVBoxLayout(self)
         toolbar = QHBoxLayout()
-        for label, callback in (("Import DXF…", self._import), ("Remove selected", self._remove),
+        for label, callback in (("Add DXF…", self._import), ("Remove selected", self._remove),
                                 ("Colour…", self._colour), ("Edit vertices…", self._edit_vertices)):
             button = QPushButton(label)
             button.clicked.connect(callback)
@@ -360,7 +494,8 @@ class HorizonsDialog(QDialog):
         split.addWidget(self.plot)
         split.setStretchFactor(1, 2)
         layout.addWidget(split, 1)
-        hint = QLabel("Tick horizons to show them over any Ground Model display. Edits are saved with Apply; "
+        hint = QLabel("Add DXF appends horizons; repeat to combine files, with coordinates checked for each file. "
+                      "Tick horizons to show them over any Ground Model display. Edits are saved with Apply; "
                       "Cancel discards this dialog's changes. Undo saved edits in Review & Export → change log.")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -370,6 +505,17 @@ class HorizonsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
         self._rebuild()
+        model.planChanged.connect(self._check_plan)
+        QgsProject.instance().cleared.connect(self.reject)
+
+    def _check_plan(self):
+        if self.model.plan_id != self._plan_id or route_reference(self.model) != self._route:
+            self.reject()
+
+    def done(self, result):
+        for dialog in self.findChildren(HorizonImportDialog):
+            dialog.reject()
+        super().done(result)
 
     def _rebuild(self, index=0):
         self._loading = True
@@ -422,15 +568,18 @@ class HorizonsDialog(QDialog):
 
     def _import(self):
         dialog = HorizonImportDialog(self.model, self.dock, self)
-        if qt_exec(dialog) == DIALOG_ACCEPTED:
-            combined = self.rows + dialog.rows
-            try:
-                horizons.validate_rows(combined)
-            except ValueError as exc:
-                QMessageBox.warning(self, "Horizon import", str(exc))
-                return
-            self.rows = combined
-            self._rebuild(len(self.rows) - len(dialog.rows))
+        try:
+            if qt_exec(dialog) == DIALOG_ACCEPTED:
+                combined = self.rows + dialog.rows
+                try:
+                    horizons.validate_rows(combined)
+                except ValueError as exc:
+                    QMessageBox.warning(self, "Horizon import", str(exc))
+                    return
+                self.rows = combined
+                self._rebuild(len(self.rows) - len(dialog.rows))
+        finally:
+            dialog.deleteLater()
 
     def _remove(self):
         index = self.list.currentRow()
@@ -451,6 +600,10 @@ class HorizonsDialog(QDialog):
         if index < 0:
             return
         row = self.rows[index]
+        if sum(len(s) for s in row["segments"]) > horizons.MAX_TEXT_EDIT_POINTS:
+            QMessageBox.information(self, "Edit horizon", "This horizon is too large for the text editor. "
+                                    "All imported vertices are retained. Edit the source DXF and re-import it to change picks.")
+            return
         dialog = QDialog(self)
         dialog.setWindowTitle(f"Edit horizon — {row['name']}")
         dialog.resize(550, 550)

@@ -195,13 +195,31 @@ class PlanModel(QObject):
     def section_method(self, section: Dict) -> str:
         return ev.section_method(section, self.label_method)
 
+    def _display_settings(self) -> Dict:
+        """Read-only small settings, cached by the exact saved JSON.
+
+        Dense DXF geometry lives in the same legacy JSON. Re-decoding all of
+        it for each KP/target/display getter stalls the GUI. Cache only the
+        small settings; never duplicate the horizon geometry in this cache.
+        Writers continue to decode the full document and preserve every key.
+        """
+        raw = self.plan.get("params_json") or "{}"
+        if raw != getattr(self, "_display_settings_raw", None):
+            try:
+                settings = json.loads(raw)
+            except (TypeError, ValueError):
+                settings = {}
+            if not isinstance(settings, dict):
+                settings = {}
+            settings.pop("subbottom_horizons", None)
+            self._display_settings_cache = settings
+            self._display_settings_raw = raw
+        return self._display_settings_cache
+
     def gen_params(self, params_json: Optional[Dict] = None) -> generation.GenParams:
         stored = params_json
         if stored is None:
-            try:
-                stored = json.loads(self.plan.get("params_json") or "{}")
-            except (ValueError, TypeError):
-                stored = {}
+            stored = self._display_settings()
         stored = stored or {}
         # ``refine_tol_m`` has never been user-editable. Treat the former
         # fixed 1 m value as the current fixed default so existing plans gain
@@ -285,6 +303,8 @@ class PlanModel(QObject):
     def close_plan(self) -> None:
         self._flush_layer_refresh()  # keep a pending write, not drop it
         self.plan = {}
+        self._display_settings_raw = None
+        self._display_settings_cache = {}
         self.inputs = []
         self.rules = []
         self.events = []
@@ -440,10 +460,7 @@ class PlanModel(QObject):
     # -- KP datum ------------------------------------------------------------
     def kp_datum_start(self) -> Optional[float]:
         """Start KP the plan's stored KPs are numbered from (None = legacy)."""
-        try:
-            params = json.loads(self.plan.get("params_json") or "{}")
-        except (TypeError, ValueError):
-            return None
+        params = self._display_settings()
         datum = params.get("kp_datum") if isinstance(params, dict) else None
         if isinstance(datum, dict) and datum.get("start_kp") is not None:
             try:
@@ -460,7 +477,8 @@ class PlanModel(QObject):
         existing plan. Plans without one are geodesic — how they were made.
         """
         try:
-            params = json.loads((plan_row or self.plan or {}).get("params_json") or "{}")
+            params = (self._display_settings() if not plan_row or plan_row is self.plan
+                      else json.loads(plan_row.get("params_json") or "{}"))
         except (TypeError, ValueError):
             params = {}
         datum = params.get("kp_datum") if isinstance(params, dict) else None
@@ -1796,7 +1814,7 @@ class PlanModel(QObject):
 
     # -- target burial depth ---------------------------------------------------
     def target_ranges(self) -> List[Dict]:
-        return target_depth.plan_ranges(self.plan)
+        return target_depth.normalise_ranges(self._display_settings().get(target_depth.PARAMS_KEY))
 
     def target_default(self) -> Optional[float]:
         return target_depth.plan_default(self.plan)
@@ -1977,7 +1995,7 @@ class PlanModel(QObject):
     def cpt_view(self) -> Dict:
         """This plan's CPT display: traces on/off, channel, placement limits."""
         try:
-            stored = json.loads(self.plan.get("params_json") or "{}").get("cpt") or {}
+            stored = self._display_settings().get("cpt") or {}
         except (TypeError, ValueError, AttributeError):
             stored = {}
         view = dict(self.CPT_VIEW_DEFAULTS)

@@ -364,8 +364,11 @@ class GroundTab(QWidget):
         except ValueError as exc:
             QMessageBox.warning(self, "Sub-bottom horizons", str(exc))
             return
-        if qt_exec(dialog) == DIALOG_ACCEPTED:
-            self._refresh_horizons()
+        try:
+            if qt_exec(dialog) == DIALOG_ACCEPTED:
+                self._refresh_horizons()
+        finally:
+            dialog.deleteLater()
 
     def _refresh_horizons(self):
         from ..horizon_dialogs import reference_notice, route_reference

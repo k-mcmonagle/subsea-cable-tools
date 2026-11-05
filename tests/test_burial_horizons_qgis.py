@@ -9,10 +9,12 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
+import threading
 import unittest
 from unittest.mock import patch
 
-from qgis.PyQt.QtCore import QCoreApplication, QEvent
+from qgis.PyQt.QtCore import QCoreApplication, QEvent, QTimer
 from qgis.PyQt.QtWidgets import QDialogButtonBox, QMessageBox, QPlainTextEdit
 
 from ..burial import horizon_dialogs, horizons as h, schema
@@ -21,6 +23,7 @@ from ..burial.plan_model import PlanModel
 from ..burial.profile_data import PlanProfile
 from ..burial.store import BurialStore
 from ..burial.tabs.ground_tab import GroundTab
+from ..burial.tabs.inputs_tab import InputsTab
 from ..qgis_compat import BUTTON_BOX_OK, CHECK_STATE_CHECKED, CHECK_STATE_UNCHECKED, DIALOG_ACCEPTED
 from .test_burial_horizons import dxf, line
 
@@ -37,6 +40,9 @@ class Dock:
 
 class HorizonQgisTests(unittest.TestCase):
     def setUp(self):
+        self.callback_errors = []
+        self._exception_hook = sys.excepthook
+        sys.excepthook = lambda *args: self.callback_errors.append(args)
         # OGR can retain pooled handles on Windows: let OS temp cleanup own them.
         self.folder = tempfile.mkdtemp(prefix="bp_horizons_")
         self.store = BurialStore(os.path.join(self.folder, "plans.gpkg"))
@@ -61,17 +67,28 @@ class HorizonQgisTests(unittest.TestCase):
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         QCoreApplication.processEvents()
         self.store.close()
+        sys.excepthook = self._exception_hook
+        self.assertFalse(self.callback_errors, str(self.callback_errors))
 
     def widget(self, cls):
         widget = cls(self.model, Dock())
         self.widgets.append(widget)
         return widget
 
+    def wait_for(self, dialog, timeout=20):
+        deadline = time.monotonic() + timeout
+        while dialog._task is not None and time.monotonic() < deadline:
+            QCoreApplication.processEvents()
+            time.sleep(0.005)
+        self.assertIsNone(dialog._task, "Horizon background work did not finish")
+
     def imported(self):
         dialog = self.widget(HorizonImportDialog)
         dialog.load_file(self.path)
+        self.wait_for(dialog)
         dialog.layers.item(0).setCheckState(CHECK_STATE_CHECKED)
         dialog._preview()
+        self.wait_for(dialog)
         self.assertTrue(dialog.import_button.isEnabled(), dialog.message.toPlainText())
         return dialog
 
@@ -131,10 +148,12 @@ class HorizonQgisTests(unittest.TestCase):
         self.assertFalse(dialog.import_button.isEnabled())
         self.assertEqual(dialog.rows, [])
         dialog._preview()
+        self.wait_for(dialog)
         self.assertEqual(dialog.rows[0]["segments"][0][0], [2, 2])
         dialog.kp_ref.radio_shift.setChecked(True)
         dialog.kp_ref.shift_spin.setValue(0.25)
         dialog._preview()
+        self.wait_for(dialog)
         self.assertEqual(dialog.rows[0]["segments"][0][0], [2.25, 2])
         dialog.load_file(os.path.join(self.folder, "missing.dxf"))
         self.assertFalse(dialog.import_button.isEnabled())
@@ -201,6 +220,7 @@ class HorizonQgisTests(unittest.TestCase):
             for value in (1, 2, 3):
                 dialog.kp_origin.setValue(value)
                 dialog._preview()
+                self.wait_for(dialog)
                 dialog.layers.item(0).setCheckState(CHECK_STATE_UNCHECKED)
                 dialog.layers.item(0).setCheckState(CHECK_STATE_CHECKED)
             dialog.preview_plot.clear()
@@ -208,6 +228,7 @@ class HorizonQgisTests(unittest.TestCase):
             self.assertTrue(all(not item.isVisible() and item.xData is None
                                 for item in dialog.preview_plot._horizon_pool))
             dialog.load_file(self.path)
+            self.wait_for(dialog)
         finally:
             sys.excepthook = original
         self.assertFalse(errors, str(errors))
@@ -221,9 +242,11 @@ class HorizonQgisTests(unittest.TestCase):
         dialog.datum.setText("MSL")
         dialog.seabed.setCurrentIndex(dialog.seabed.findData("SEABED"))
         dialog._preview()
+        self.wait_for(dialog)
         self.assertFalse(dialog.import_button.isEnabled())
         dialog.datum_confirm.setChecked(True)
         dialog._preview()
+        self.wait_for(dialog)
         self.assertTrue(dialog.import_button.isEnabled(), dialog.message.toPlainText())
         self.assertEqual(dialog.rows[0]["segments"], [[[0, 3], [10, 3]]])
 
@@ -261,12 +284,14 @@ class HorizonQgisTests(unittest.TestCase):
         dialog.datum.setText("MSL")
         dialog.datum_confirm.setChecked(True)
         dialog._preview()
+        self.wait_for(dialog)
         self.assertTrue(dialog.import_button.isEnabled(), dialog.message.toPlainText())
         self.assertEqual(dialog.rows[0]["segments"], [[[0, 3], [2, 3]], [[6, 2], [8, 2], [10, 2]]])
         self.assertEqual(dialog.rows[0]["source"]["profile_sampled_utc"], "test sample")
         self.assertIn("missing seabed", dialog.message.toPlainText())
         self.model.profile_stale_reasons = lambda: ["raster changed"]
         dialog._preview()
+        self.wait_for(dialog)
         self.assertFalse(dialog.import_button.isEnabled())
 
     def test_route_change_hides_picks_and_reference_change_is_flagged(self):
@@ -305,6 +330,163 @@ class HorizonQgisTests(unittest.TestCase):
         self.assertEqual(self.model.plan, before)
         self.assertEqual(self.store.get_plan(self.model.plan_id), before)
         self.assertEqual(self.store.list_change_log(self.model.plan_id), log)
+
+    def test_display_settings_cache_invalidates_without_losing_horizons(self):
+        rows = self.imported().rows
+        self.model.update_gen_params({h.PARAMS_KEY: {"version": 1, "rows": rows},
+            "kp_datum": {"start_kp": 4, "mode": "cartesian", "grid_crs": "EPSG:32631"},
+            "target_burial_ranges": [{"start_kp": 2, "end_kp": 3, "depth_m": 2.5}],
+            "cpt": {"max_offset_m": 200}})
+        self.assertEqual(self.model.kp_datum_start(), 4)
+        self.assertEqual(self.model.kp_mode(), ("cartesian", "EPSG:32631"))
+        self.assertEqual(self.model.target_ranges()[0]["depth_m"], 2.5)
+        self.assertNotIn(h.PARAMS_KEY, self.model._display_settings())
+        self.assertEqual(h.plan_rows(self.model.plan), rows)
+        cache = self.model._display_settings()
+        self.assertIs(self.model._display_settings(), cache)
+        self.model.update_gen_params({"min_section_km": 0.8})
+        self.assertEqual(self.model.gen_params().min_section_km, 0.8)
+        self.assertIsNot(self.model._display_settings(), cache)
+        self.assertEqual(h.plan_rows(self.model.plan), rows)
+        self.model.close_plan()
+        self.assertEqual(self.model.target_ranges(), [])
+        self.assertEqual(self.model.kp_mode(), ("ellipsoidal", ""))
+
+    def test_horizon_cursor_keeps_overlapping_segments_and_gaps(self):
+        plot = self.widget(HorizonsDialog).plot
+        plot.set_horizons([dict(name="A", colour="#ff0000", segments=[[[0, 1], [10, 1]], [[20, 1], [21, 1]]]),
+                           dict(name="B", colour="#00ff00", segments=[[[1, 1], [2, 1]]])])
+        self.assertIn("A:", plot._readout_text(1.5, 1))
+        self.assertIn("B:", plot._readout_text(1.5, 1))
+        self.assertIn("A:", plot._readout_text(3, 1))
+        self.assertNotIn("B:", plot._readout_text(3, 1))
+        self.assertNotIn("A:", plot._readout_text(15, 1))
+        plot.set_horizons([])
+        self.assertNotIn("A:", plot._readout_text(1.5, 1))
+
+    def test_background_cancel_close_plan_switch_and_reopen(self):
+        before = self.store.get_plan(self.model.plan_id)
+        for action in ("cancel", "close", "switch"):
+            entered = threading.Event()
+            dialog = self.widget(HorizonImportDialog)
+
+            def slow_read(path, progress):
+                entered.set()
+                while True:
+                    progress(10, "Reading test data")
+                    time.sleep(0.005)
+
+            ticks = []
+            timer = QTimer()
+            timer.timeout.connect(lambda: ticks.append(1))
+            timer.start(5)
+            with patch.object(h, "read_dxf", side_effect=slow_read):
+                dialog.load_file(self.path)
+                deadline = time.monotonic() + 5
+                while (not entered.is_set() or len(ticks) < 3) and time.monotonic() < deadline:
+                    QCoreApplication.processEvents()
+                    time.sleep(0.005)
+                self.assertTrue(entered.is_set())
+                self.assertGreaterEqual(len(ticks), 3, "GUI event loop was blocked")
+                if action == "cancel":
+                    dialog._cancel_work()
+                elif action == "close":
+                    dialog.reject()
+                else:
+                    self.model.close_plan()
+                self.wait_for(dialog)
+            timer.stop()
+            self.assertFalse(dialog.rows)
+            if action == "switch":
+                self.model.load_plan(before["plan_id"])
+            self.assertEqual(self.store.get_plan(before["plan_id"]), before)
+        self.assertTrue(self.imported().rows)
+
+    def test_destroyed_importer_cancels_without_late_callback(self):
+        from qgis.core import QgsApplication
+        entered = threading.Event()
+        exited = threading.Event()
+        dialog = HorizonImportDialog(self.model, Dock())
+
+        def slow_read(path, progress):
+            entered.set()
+            try:
+                while True:
+                    progress(10, "Reading test data")
+                    time.sleep(0.005)
+            finally:
+                exited.set()
+
+        with patch.object(h, "read_dxf", side_effect=slow_read):
+            dialog.load_file(self.path)
+            self.assertTrue(entered.wait(5))
+            dialog.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            deadline = time.monotonic() + 5
+            while QgsApplication.taskManager().activeTasks() and time.monotonic() < deadline:
+                QCoreApplication.processEvents()
+                time.sleep(0.005)
+            self.assertTrue(exited.is_set())
+        self.assertTrue(self.imported().rows)
+
+    def test_conversion_cancel_discards_result_and_accept_rechecks_reference(self):
+        dialog = self.imported()
+        original = h.build_horizons
+
+        def cancel_in_conversion(*args):
+            raise h.Cancelled()
+
+        # Actual cancel button owns the cancellation state, including a task
+        # that completes just before the event is delivered.
+        with patch.object(h, "build_horizons", side_effect=cancel_in_conversion):
+            dialog._preview()
+            dialog._cancel_work()
+            self.wait_for(dialog)
+        self.assertFalse(dialog.rows)
+        self.assertFalse(dialog.import_button.isEnabled())
+        with patch.object(h, "build_horizons", wraps=original):
+            dialog._preview()
+            self.wait_for(dialog)
+        self.model.plan = self.model._set_kp_datum(self.model.plan, 2)
+        dialog._accept()
+        self.assertNotEqual(dialog.result(), DIALOG_ACCEPTED)
+
+    def test_multiple_files_and_import_register_survive_reopen_and_removal(self):
+        manager = self.widget(HorizonsDialog)
+        first = self.imported().rows
+        other_path = os.path.join(self.folder, "second.dxf")
+        with open(other_path, "w", encoding="utf-8") as handle:
+            handle.write(dxf(line("H1", 0, 5, 10000, 6)))
+        second = self.widget(HorizonImportDialog)
+        second.load_file(other_path)
+        self.wait_for(second)
+        second.layers.item(0).setCheckState(CHECK_STATE_CHECKED)
+        second._preview()
+        self.wait_for(second)
+        manager.rows = first + second.rows
+        manager._save()
+        self.assertEqual(len(self.widget(HorizonsDialog).rows), 2)
+        campaign = dict(campaign_id=schema.new_id(), name="Example survey", status="current",
+                        config={"files": [{"path": "example.ags"}]}, imported_utc=schema.utc_now_iso())
+        self.assertTrue(self.model.save_cpt_campaign(campaign, [], {}))
+        tab = InputsTab(self.model, lambda: None)
+        self.widgets.append(tab)
+        def names():
+            return [tab.inputs_table.item(i, 1).text() for i in range(tab.inputs_table.rowCount())]
+        self.assertCountEqual(names(), ["section.dxf", "second.dxf", "Example survey"])
+        tab.inputs_table.selectRow(0)
+        self.assertFalse(tab.edit_input_button.isEnabled())
+        self.assertFalse(tab.remove_input_button.isEnabled())
+        self.model.load_plan(self.model.plan_id)
+        tab.refresh()
+        self.assertEqual(len(names()), 3)
+        self.model.update_gen_params({h.PARAMS_KEY: {"version": 1, "rows": second.rows}})
+        self.model.delete_cpt_campaign(campaign["campaign_id"])
+        tab._refresh_inputs()
+        self.assertEqual(names(), ["second.dxf"])
+        self.model.close_plan()
+        tab._refresh_inputs()
+        self.assertEqual(names(), [])
 
     def test_concurrent_horizon_edit_refused(self):
         dialog = self.widget(HorizonsDialog)

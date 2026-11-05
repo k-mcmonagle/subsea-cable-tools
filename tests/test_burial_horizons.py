@@ -3,11 +3,13 @@
 import copy
 import json
 import math
+import hashlib
+from unittest.mock import PropertyMock, patch
 import tempfile
 import unittest
 from pathlib import Path
 
-from ..burial import horizons as h
+from ..burial import horizons as h, imported_inputs
 from ..burial.kp_rereference import KpMap
 from ..burial.profile_data import PlanProfile
 
@@ -101,6 +103,16 @@ class HorizonsTests(unittest.TestCase):
         mapping = KpMap.from_anchors([(0, 0), (1, 2), (2, 3)])
         self.assertEqual(h.remap_segment([[0, 0], [2, 4]], mapping), [[0, 0], [2, 2], [3, 4]])
 
+    def test_many_entities_only_use_anchors_inside_each_segment(self):
+        mapping = KpMap.from_anchors([(i, i * 2) for i in range(1000)])
+        drawing = self.read(dxf(line("H", 100500, 1, 102500, 5) + line("H", 200500, 2, 201500, 4)))
+        with patch.object(KpMap, "anchors", new_callable=PropertyMock,
+                          return_value=mapping.anchors) as anchors:
+            rows, _ = h.build_horizons(drawing, ["H"], h.ImportOptions(), mapping)
+            self.assertEqual(anchors.call_count, 2)  # one index, one saved KP-map record
+        self.assertEqual(rows[0]["segments"], [[[201, 1], [202, 2], [204, 4], [205, 5]],
+                                              [[401, 2], [402, 3], [403, 4]]])
+
     def test_datum_conversion_follows_seabed_bends_and_gaps(self):
         horizon = [[[0, 43], [10, 43]]]
         seabed = [[[1, 40], [2, 39], [3, 40]], [[7, 40], [8, 41]]]
@@ -137,12 +149,93 @@ class HorizonsTests(unittest.TestCase):
         self.assertEqual(h.plan_rows(plan), rows)
         self.assertEqual(plan, original)
 
+    def test_large_polyline_keeps_every_vertex_and_progress_and_fingerprint(self):
+        count = 60_001
+        coords = "".join(f"10\n{i}\n20\n{1 + i % 7}\n" for i in range(count))
+        text = dxf(f"0\nLWPOLYLINE\n8\nLarge\n90\n{count}\n" + coords)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "large.dxf"
+            path.write_bytes(text.encode("utf-8"))
+            updates = []
+            drawing = h.read_dxf(path, lambda p, m: updates.append(p) if p is not None else None)
+            self.assertEqual(drawing["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+        self.assertEqual(drawing["vertex_count"], count)
+        self.assertGreater(len(updates), 10)
+        self.assertEqual(updates, sorted(updates))
+        self.assertEqual(updates[-1], 100)
+        rows, _ = h.build_horizons(drawing, ["Large"], h.ImportOptions(), KpMap.shift(2))
+        self.assertEqual(len(rows[0]["segments"][0]), count)
+        self.assertEqual(rows[0]["segments"][0][-1], [62.0, 1 + (count - 1) % 7])
+        self.assertEqual(len(rows[0]["source_segments"][0]["points"]), count)
+        self.assertEqual(h.plan_rows({"params_json": json.dumps({h.PARAMS_KEY: {"version": 1, "rows": rows}})}), rows)
+
+    def test_cancel_inside_large_entity_and_conversion_leaves_no_result(self):
+        coords = "".join(f"10\n{i}\n20\n1\n" for i in range(10_000))
+        text = dxf("0\nLWPOLYLINE\n8\nH\n90\n10000\n" + coords)
+        calls = []
+        def cancel(percent, message):
+            calls.append(percent)
+            if len(calls) == 3:
+                raise h.Cancelled()
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "cancel.dxf"
+            path.write_text(text)
+            with self.assertRaises(h.Cancelled):
+                h.read_dxf(path, cancel)
+            drawing = h.read_dxf(path)
+        calls.clear()
+        original = copy.deepcopy(drawing)
+        with self.assertRaises(h.Cancelled):
+            h.build_horizons(drawing, ["H"], h.ImportOptions(), KpMap.identity(), progress=cancel)
+        self.assertEqual(drawing, original)
+
+    def test_budgets_reject_before_unbounded_expansion(self):
+        with patch.object(h, "MAX_POINTS", 4):
+            with self.assertRaisesRegex(ValueError, "memory budget"):
+                self.read(dxf(line("H", 0, 0, 1, 1) * 3))
+            with self.assertRaisesRegex(ValueError, "memory budget"):
+                self.read(dxf("0\nPOLYLINE\n8\nH\n" + "0\nVERTEX\n10\n0\n20\n1\n" * 5))
+        with self.assertRaisesRegex(ValueError, "excessively long"):
+            self.read("0\n" + "x" * 65537 + "\n")
+        drawing = self.read(dxf(line("H", 0, 0, 1000, 1)))
+        rows, _ = h.build_horizons(drawing, ["H"], h.ImportOptions(), KpMap.identity())
+        more = copy.deepcopy(rows[0])
+        more["id"] = "different"
+        with patch.object(h, "MAX_POINTS", 3):
+            with self.assertRaisesRegex(ValueError, "plan memory budget"):
+                h.validate_rows(rows + [more])
+            with self.assertRaisesRegex(ValueError, "memory budget"):
+                h.build_horizons(drawing, ["H", "H"], h.ImportOptions(), KpMap.identity())
+
+    def test_input_register_older_imports_and_superseded_campaigns(self):
+        drawing = self.read(dxf(line("H1", 0, 1, 1000, 2) + line("H2", 0, 3, 1000, 4)))
+        rows, _ = h.build_horizons(drawing, ["H1", "H2"], h.ImportOptions(), KpMap.identity(),
+                                  source={"file": "example.dxf", "imported_utc": "example date"})
+        entries = imported_inputs.horizon_inputs(rows)
+        self.assertEqual(len(entries), 1)
+        self.assertIn("2 horizon(s)", entries[0]["register_detail"])
+        self.assertEqual(entries[0]["register_state"], "stored")
+        self.assertNotIn("input_id", entries[0])
+        self.assertEqual(imported_inputs.horizon_inputs(rows, lambda row: "Route changed")[0]["register_state"], "check")
+        campaigns = [dict(campaign_id="old", name="Survey", status="superseded", config_json="bad")]
+        entries = imported_inputs.cpt_inputs(campaigns, [{"campaign_id": "old"}])
+        self.assertEqual(entries[0]["register_users"], [])
+        self.assertEqual(entries[0]["register_state"], "superseded")
+        self.assertIn("1 CPT(s)", entries[0]["register_detail"])
+
     def test_optional_state_and_future_formats(self):
         self.assertEqual(h.plan_rows({"params_json": '{"min_section_km":0.1}'}), [])
         self.assertEqual(h.plan_rows({}), [])
         for payload in ("bad", "[]", json.dumps({h.PARAMS_KEY: {"version": 2, "rows": []}})):
             with self.assertRaises(ValueError):
                 h.plan_rows({"params_json": payload})
+
+    def test_saved_coordinate_strings_are_rejected_before_plotting(self):
+        drawing = self.read(dxf(line("H", 0, 1, 1000, 2)))
+        rows, _ = h.build_horizons(drawing, ["H"], h.ImportOptions(), KpMap.identity())
+        rows[0]["segments"][0][0][0] = "0"
+        with self.assertRaisesRegex(ValueError, "numeric pairs"):
+            h.validate_rows(rows)
 
     def test_vertex_editor_keeps_segments_and_validates(self):
         self.assertEqual(h.parse_vertices("0, 1\n1, 2\n\n3, 2\n4, 1"),

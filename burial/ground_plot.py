@@ -18,6 +18,7 @@ Signals:
 
 from __future__ import annotations
 
+import bisect
 import math
 from typing import Dict, List, Optional, Tuple
 
@@ -181,6 +182,8 @@ class GroundModelPlot(QWidget):
         self._horizon_items = []
         self._horizon_pool = []
         self._horizon_index = []
+        self._horizon_starts = []
+        self._horizon_ends = []
         self._horizon_extent = (0.0, 0.0)
 
         from ..kp_axis_item import KPAxisItem
@@ -293,11 +296,12 @@ class GroundModelPlot(QWidget):
 
     def set_horizons(self, rows) -> None:
         """Independent overlays; one plot item per horizon, NaNs between parts."""
-        visible = [row for row in rows if row.get("visible", True)]
+        # Plot only working geometry, never duplicate the original DXF payload.
+        visible = [{k: row.get(k) for k in ("name", "colour", "segments")}
+                   for row in rows if row.get("visible", True)]
         if visible == self._horizons:
             return
-        import copy
-        self._horizons = copy.deepcopy(visible)
+        self._horizons = visible
         # Reuse graphics objects: detaching PlotDataItem from a scene raises
         # QVariant conversion errors on some QGIS 3 / PyQt5 builds.
         for item in self._horizon_pool:
@@ -305,6 +309,8 @@ class GroundModelPlot(QWidget):
             item.hide()
         self._horizon_items = []
         self._horizon_index = []
+        self._horizon_starts = []
+        self._horizon_ends = []
         low, high = 0.0, 0.0
         labels = []
         for index, row in enumerate(visible):
@@ -317,8 +323,8 @@ class GroundModelPlot(QWidget):
                 item.setZValue(10)
                 self._horizon_pool.append(item)
             item = self._horizon_pool[index]
-            item.setPen(pg.mkPen(colour, width=2))
-            item.setData(xs, ys, connect="finite")
+            item.setPen(pg.mkPen(colour, width=1 if len(xs) > 10000 else 2))
+            item.setData(xs, ys, connect="finite", antialias=False)
             item.show()
             self._horizon_items.append(item)
             for segment in row["segments"]:
@@ -326,6 +332,12 @@ class GroundModelPlot(QWidget):
                 high = max(high, max(p[1] for p in segment))
                 self._horizon_index.append((row["name"], segment, [p[0] for p in segment]))
             labels.append(f"<span style='color:{colour.name()}'>&#9473;</span> {_esc(row['name'])}")
+        self._horizon_index.sort(key=lambda entry: entry[2][0])
+        end = float("-inf")
+        for _name, _segment, xs in self._horizon_index:
+            end = max(end, xs[-1])
+            self._horizon_starts.append(xs[0])
+            self._horizon_ends.append(end)
         self._horizon_extent = (low, high)
         self.horizon_legend.setText(" &nbsp; ".join(labels[:12])
                                    + (f" &nbsp; +{len(labels) - 12} horizons" if len(labels) > 12 else ""))
@@ -543,7 +555,10 @@ class GroundModelPlot(QWidget):
         text = self._ground_readout(kp, depth)
         cpt_lines = self._cpt_lines(kp, depth)
         tolerance = abs(self.plot.viewRange()[1][1] - self.plot.viewRange()[1][0]) * 0.025
-        for name, segment, xs in self._horizon_index:
+        i = bisect.bisect_right(self._horizon_starts, kp) - 1
+        while i >= 0 and self._horizon_ends[i] >= kp:
+            name, segment, xs = self._horizon_index[i]
+            i -= 1
             if xs[0] <= kp <= xs[-1]:
                 value = horizons.interpolate(segment, xs, kp)
                 if abs(value - depth) <= tolerance:

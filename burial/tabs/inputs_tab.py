@@ -75,7 +75,7 @@ _ROLE_FILTERS = {
     schema.INPUT_ROLE_OTHER: (MAP_LAYER_FILTER_VECTOR,),
 }
 
-_INPUT_COLUMNS = ["Role", "Layer", "Status", "Used by", "Originator",
+_INPUT_COLUMNS = ["Role", "Layer / import", "Status", "Used by", "Originator",
                   "Revision", "Quality"]
 _TARGET_COLUMNS = ["Start KP", "End KP", "Target (m)", "Notes"]
 _STATUS_TEXT = {
@@ -83,6 +83,9 @@ _STATUS_TEXT = {
     "relinked": "✓ matched by source",
     "file": "⚠ not in project",
     "missing": "✗ missing",
+    "stored": "✓ stored import",
+    "superseded": "Superseded",
+    "check": "⚠ check reference",
 }
 
 
@@ -502,6 +505,11 @@ class InputsTab(QWidget):
         button_row.addWidget(self.remove_input_button)
         button_row.addStretch(1)
         inputs_layout.addLayout(button_row)
+        imported_hint = QLabel("Saved DXF horizons and CPT campaigns also appear here. "
+                              "Manage these imports in Ground Model → Horizons / CPTs.")
+        imported_hint.setWordWrap(True)
+        imported_hint.setStyleSheet(ui_helpers.hint_style())
+        inputs_layout.addWidget(imported_hint)
         layout.addWidget(inputs_box, 1)
 
         # One status line for the whole tab (route, scope and bathymetry
@@ -525,12 +533,13 @@ class InputsTab(QWidget):
         model.planChanged.connect(self.refresh)
         # Coalesced: input status can open layer files, and a project load
         # or a burst of rule toggles must cost one refresh, not dozens.
-        inputs_soon = ui_helpers.coalesced(self, self._refresh_inputs)
+        self._inputs_soon = ui_helpers.coalesced(self, self._refresh_inputs)
+        inputs_soon = self._queue_inputs_refresh
         model.inputsChanged.connect(inputs_soon)
         model.inputsChanged.connect(self._refresh_bathy_notice)
         # "Used by" follows the criteria and checks (optional on
         # lightweight models).
-        for name in ("rulesChanged", "riskChanged"):
+        for name in ("rulesChanged", "riskChanged", "cptsChanged"):
             signal = getattr(model, name, None)
             if signal is not None:
                 signal.connect(inputs_soon)
@@ -686,24 +695,59 @@ class InputsTab(QWidget):
         else:
             self._apply_rpl()
 
+    def _queue_inputs_refresh(self):
+        self._inputs_soon()
+
+    def _stored_imports(self):
+        if not self.model.plan:
+            self._stored_import_key = None
+            self._stored_horizon_inputs = []
+            return []
+        from .. import horizons, imported_inputs
+        from ..horizon_dialogs import reference_notice, route_reference
+
+        params = self.model.plan.get("params_json")
+        route = route_reference(self.model) if hasattr(self.model, "route_geometry_fingerprint") else None
+        profile = getattr(self.model, "bathy_profile", None)
+        key = (params, route, getattr(profile, "sampled_utc", None))
+        if key != getattr(self, "_stored_import_key", None):
+            try:
+                rows = horizons.plan_rows(self.model.plan)
+                self._stored_horizon_inputs = imported_inputs.horizon_inputs(
+                    rows, lambda row: reference_notice(row, self.model, route))
+            except ValueError as exc:
+                self._stored_horizon_inputs = [dict(role="DXF horizons", layer_name="Saved horizons",
+                    register_state="check", register_detail=str(exc), register_users=[])]
+            self._stored_import_key = key
+        out = list(self._stored_horizon_inputs)
+        register = getattr(self.model, "cpts", None)
+        if register is not None:
+            register.refresh()
+            out.extend(imported_inputs.cpt_inputs(register.campaigns, register.cpts))
+        return out
+
     def _refresh_inputs(self) -> None:
-        rows = list(self.model.inputs)
+        rows = list(self.model.inputs) if self.model.plan else []
         rows.sort(key=lambda r: (schema.INPUT_ROLES.index(r.get("role"))
                                  if r.get("role") in schema.INPUT_ROLES else 99,
                                  (r.get("layer_name") or "").lower()))
+        rows.extend(self._stored_imports())
         usage = self.model.input_usage() if self.model.plan else {}
         counts = {"ok": 0, "relinked": 0, "file": 0, "missing": 0}
         flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
         self.inputs_table.setRowCount(len(rows))
         for i, row in enumerate(rows):
             try:
-                state, detail, layer = self.model.input_status(row)
+                if "register_state" in row:
+                    state, detail, layer = row["register_state"], row["register_detail"], None
+                else:
+                    state, detail, layer = self.model.input_status(row)
             except Exception as exc:  # never let one bad row break the tab
                 state, detail, layer = "missing", str(exc), None
             stored_name = row.get("layer_name") or ""
             live_name = layer.name() if layer is not None else ""
             name = live_name or stored_name
-            users = usage.get(str(row.get("input_id") or ""), [])
+            users = row.get("register_users", usage.get(str(row.get("input_id") or ""), []))
             source_tip = row.get("layer_source") or ""
             if row.get("role") == schema.INPUT_ROLE_BATHY:
                 users = ["Bathymetry profile (the plan's depth source)"] + users
@@ -736,14 +780,14 @@ class InputsTab(QWidget):
                     item.setToolTip(tip)
                 if j == 2:
                     item.setToolTip(detail)
-                    if state in ("file", "missing"):
+                    if state in ("file", "missing", "check"):
                         item.setForeground(ui_helpers.qcolor(
                             "error" if state == "missing" else "warn"))
                 if j == 3:
                     item.setToolTip("\n".join(users) if users else
                                     "Not used by any criterion or check.")
                 self.inputs_table.setItem(i, j, item)
-        bad = counts.get("missing", 0) + counts.get("file", 0)
+        bad = counts.get("missing", 0) + counts.get("file", 0) + counts.get("check", 0)
         text = f"{len(rows)} input(s)"
         if bad:
             text += f" — {bad} need attention"
