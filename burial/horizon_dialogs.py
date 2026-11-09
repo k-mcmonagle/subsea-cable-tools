@@ -20,7 +20,8 @@ from ..qgis_compat import (
     BUTTON_BOX_CANCEL, BUTTON_BOX_OK, CHECK_STATE_CHECKED, CHECK_STATE_UNCHECKED,
     DIALOG_ACCEPTED, ITEM_FLAG_USER_CHECKABLE, qt_exec,
 )
-from . import horizons, schema
+from . import dxf_annotations, horizons, schema
+from .annotation_overlay import AnnotationOverlay
 from .ground_dialogs import KpReferenceWidget
 from .ground_plot import GroundModelPlot
 from .horizon_task import HorizonTask
@@ -36,7 +37,7 @@ def route_reference(model):
 def reference_notice(row, model, route=None):
     source = row.get("source") or {}
     if source.get("route") != (route if route is not None else route_reference(model)):
-        return "Route/KP reference changed; re-import this horizon for the current route."
+        return "Route/KP reference changed; re-import this overlay for the current route."
     sampled = source.get("profile_sampled_utc")
     if sampled is not None:
         profile = model.bathy_profile
@@ -66,6 +67,7 @@ class HorizonImportDialog(QDialog):
         super().__init__(parent)
         self.model, self.dock = model, dock
         self.rows, self.drawing = [], None
+        self.annotations = []
         self._raw_items = []
         self._task = None
         self._closed = False
@@ -73,7 +75,7 @@ class HorizonImportDialog(QDialog):
         self._loading = False
         self._plan_id = model.plan_id
         self._route = route_reference(model)
-        self.setWindowTitle("Import sub-bottom horizons — DXF section")
+        self.setWindowTitle("Import DXF horizons and labels")
         self.resize(1000, 760)
         layout = QVBoxLayout(self)
         file_row = QHBoxLayout()
@@ -95,13 +97,31 @@ class HorizonImportDialog(QDialog):
         split = QSplitter(getattr(Qt, "Orientation", Qt).Horizontal)
         self.layers = QListWidget()
         self.layers.itemChanged.connect(self._selection_changed)
-        split.addWidget(self.layers)
+        layer_panel = QWidget()
+        layer_layout = QVBoxLayout(layer_panel)
+        layer_layout.addWidget(QLabel("Horizon layers"))
+        layer_layout.addWidget(self.layers, 1)
+        self.import_labels = QCheckBox("Import labels (annotations only)")
+        self.import_labels.setToolTip("Import selected TEXT/MTEXT layers as plain, upright labels. "
+                                      "They do not create soil classes or ground-model units.")
+        self.import_labels.toggled.connect(self._selection_changed)
+        layer_layout.addWidget(self.import_labels)
+        self.label_layers = QListWidget()
+        self.label_layers.setEnabled(False)
+        self.import_labels.toggled.connect(self.label_layers.setEnabled)
+        self.label_layers.itemChanged.connect(self._selection_changed)
+        layer_layout.addWidget(self.label_layers, 1)
+        split.addWidget(layer_panel)
         self.raw_plot = pg.PlotWidget(background="w")
         self.raw_plot.setLabel("bottom", "Drawing X")
         self.raw_plot.setLabel("left", "Drawing Y")
+        self.raw_annotations = AnnotationOverlay(self.raw_plot)
+        self.raw_label_notice = QLabel()
+        self.raw_annotations.noticeChanged.connect(self.raw_label_notice.setText)
         split.addWidget(self.raw_plot)
         split.setStretchFactor(1, 2)
         drawing_layout.addWidget(split, 1)
+        drawing_layout.addWidget(self.raw_label_notice)
         self.tabs.addTab(drawing_page, "1. Drawing & layers")
 
         coords = QWidget()
@@ -111,6 +131,7 @@ class HorizonImportDialog(QDialog):
         form = QFormLayout(horizontal)
         self.x_units = _units()
         self.x_scale = _spin(1, True)
+        self.x_scale.setToolTip("Metres × 10 means 10 m per drawing X unit. Keep 1 if coordinates are already metres.")
         self.x_origin = _spin()
         self.kp_origin = _spin()
         self.reverse = QCheckBox("KP decreases as drawing X increases")
@@ -128,6 +149,7 @@ class HorizonImportDialog(QDialog):
         self.y_origin = _spin()
         self.y_offset = _spin()
         self.exaggeration = _spin(1, True)
+        self.exaggeration.setToolTip("Divides Y after converting units. With Metres, 0.1 gives 10 m per drawing Y unit.")
         self.positive_up = QCheckBox("Y increases upwards (elevations)")
         for label, control in (("Reference:", self.vertical_ref), ("Y units:", self.y_units),
                                ("Drawing Y origin:", self.y_origin), ("Depth at Y origin (m, +down):", self.y_offset),
@@ -273,10 +295,12 @@ class HorizonImportDialog(QDialog):
         if self._task is not None:
             self._cancel_work()
         self.rows = []
+        self.annotations = []
         self.import_button.setEnabled(False)
         if not self._loading:
             self.message.setPlainText("Settings changed — Preview again before importing.")
             self.preview_plot.set_horizons([])
+            self.preview_plot.set_annotations([])
 
     def _browse(self):
         path, _ = QFileDialog.getOpenFileName(self, "Import interpreted horizons", "", "DXF section (*.dxf)")
@@ -289,6 +313,7 @@ class HorizonImportDialog(QDialog):
         self._invalidate()
         self.drawing = None
         self.layers.clear()
+        self.label_layers.clear()
         self._draw_raw()
         self.path.setText(path)
         self.cancel_work.setText("Cancel loading")
@@ -306,13 +331,19 @@ class HorizonImportDialog(QDialog):
             item.setToolTip(f"{len(entities)} separate segment(s), {sum(len(e['points']) for e in entities):,} vertices")
             self.layers.addItem(item)
             self.seabed.addItem(f"DXF layer: {name}", name)
+        for name, labels in sorted(drawing.get("annotations", {}).items()):
+            item = QListWidgetItem(name)
+            item.setFlags(item.flags() | ITEM_FLAG_USER_CHECKABLE)
+            item.setCheckState(CHECK_STATE_UNCHECKED)
+            item.setToolTip(f"{len(labels):,} annotation(s). Display only; no soil interpretation.")
+            self.label_layers.addItem(item)
         factor = horizons.DXF_UNITS.get(drawing["units"], 1.0)
         for control in (self.x_units, self.y_units):
             control.setCurrentIndex(max(0, control.findData(factor)))
         hint = (f"Header units suggest {self.x_units.currentText().lower()}; check each axis."
                 if drawing["units"] in horizons.DXF_UNITS else "Drawing units unspecified/unsupported; set both axes explicitly.")
         self.file_note.setText(f"{len(drawing['layers'])} supported layers, {drawing['vertex_count']:,} vertices. "
-                               f"{hint} Tick horizon layers; gaps stay separate.")
+                               f"{len(drawing.get('annotations', {}))} text layer(s). {hint} Tick layers to import.")
         self._loading = False
         self.message.setPlainText("\n".join(drawing["warnings"]) or "Select horizon layers, then check coordinates and Preview.")
         self._draw_raw()
@@ -327,12 +358,20 @@ class HorizonImportDialog(QDialog):
         return [self.layers.item(i).text() for i in range(self.layers.count())
                 if self.layers.item(i).checkState() == CHECK_STATE_CHECKED]
 
+    def _selected_labels(self):
+        return [self.label_layers.item(i).text() for i in range(self.label_layers.count())
+                if self.import_labels.isChecked() and self.label_layers.item(i).checkState() == CHECK_STATE_CHECKED]
+
     def _draw_raw(self):
         # Keep and reuse the items (QGIS 3's Qt5 can fail on scene removal).
         for item in self._raw_items:
             item.setData([], [])
             item.hide()
+        raw_groups = []
         if self.drawing:
+            for name in self._selected_labels():
+                raw_groups.append(dict(labels=[dict(label, kp=label["point"][0], depth=label["point"][1])
+                                                for label in self.drawing["annotations"][name]]))
             selected = set(self._selected())
             for i, (name, entities) in enumerate(sorted(self.drawing["layers"].items())):
                 colour = horizons.COLOURS[i % len(horizons.COLOURS)] if name in selected else "#cccccc"
@@ -346,6 +385,16 @@ class HorizonImportDialog(QDialog):
                 item.setData(x, y, connect="finite", antialias=False)
                 item.show()
             self.raw_plot.autoRange()
+            if raw_groups:
+                points = [label for group in raw_groups for label in group["labels"]]
+                xs, ys = [p["kp"] for p in points], [p["depth"] for p in points]
+                if self.drawing["layers"]:
+                    xr, yr = self.raw_plot.viewRange()
+                    xs.extend(xr)
+                    ys.extend(yr)
+                self.raw_plot.setXRange(min(xs), max(xs), padding=0.05)
+                self.raw_plot.setYRange(min(ys), max(ys), padding=0.05)
+        self.raw_annotations.set_groups(raw_groups)
 
     def _options(self):
         return horizons.ImportOptions(
@@ -389,8 +438,9 @@ class HorizonImportDialog(QDialog):
                                                 source_ids=list(profile.source_ids or []))
                     source["profile_sampled_utc"] = profile.sampled_utc
             drawing, selected = self.drawing, self._selected()
-            if not selected:
-                raise ValueError("Tick at least one horizon layer first.")
+            selected_labels = self._selected_labels()
+            if not selected and not selected_labels:
+                raise ValueError("Tick at least one horizon layer or enable and select a text layer first.")
             # Captures are plain geometry/numeric values, never self or QObjects.
             def convert(progress):
                 ref = reference
@@ -403,7 +453,17 @@ class HorizonImportDialog(QDialog):
                            for e in reference_entities]
                 elif ref is not None:
                     ref = horizons.reference_segments(ref, reference_progress)
-                return horizons.build_horizons(drawing, selected, options, kp_map, ref, source, progress)
+                def horizon_progress(percent, message):
+                    progress(None if percent is None else percent * (0.85 if selected_labels else 1), message)
+                def label_progress(percent, message):
+                    progress(85 + percent * 0.15 if selected else percent, message)
+                rows, warnings = (horizons.build_horizons(drawing, selected, options, kp_map, ref, source, horizon_progress)
+                                  if selected else ([], list(drawing["warnings"])))
+                annotations, notices = dxf_annotations.build(
+                    drawing, selected_labels, options, kp_map, ref, source, label_progress)
+                if not rows and not annotations:
+                    raise ValueError("No usable horizons or annotations. " + "\n".join(warnings + notices))
+                return rows, annotations, warnings + notices
 
             self._preview_context = source, kp_map.diagnostics.summary()
             self.cancel_work.setText("Cancel conversion")
@@ -418,30 +478,36 @@ class HorizonImportDialog(QDialog):
                 or self.model.bathy_profile.sampled_utc != source["profile_sampled_utc"]):
             self.message.setPlainText("Seabed profile changed during conversion. Preview again.")
             return
-        rows, warnings = result
-        lo = min(s[0][0] for row in rows for s in row["segments"])
-        hi = max(s[-1][0] for row in rows for s in row["segments"])
+        rows, annotations, warnings = result
+        endpoints = [kp for row in rows for s in row["segments"] for kp in (s[0][0], s[-1][0])]
+        endpoints.extend(label["kp"] for group in annotations for label in group["labels"])
+        lo, hi = min(endpoints), max(endpoints)
         scope_lo = float(self.model.plan.get("scope_start_kp") or 0)
         scope_hi = float(self.model.plan.get("scope_end_kp") or 0)
         if scope_hi > scope_lo and (lo < scope_lo or hi > scope_hi):
             warnings.append("Some horizon KPs are outside the plan scope; check units, origin and KP reference.")
         self.preview_plot.set_horizons(rows)
+        self.preview_plot.set_annotations(annotations)
         self.preview_plot.set_target_runs(self.model.target_runs())
         self.preview_plot.plot.setXRange(lo, hi, padding=0.03)
         self.message.setPlainText(f"{len(rows)} horizon(s), KP {lo:.6f}–{hi:.6f}. Depths are metres below seabed.\n"
                                   + diagnostics + "\n" + "\n".join(warnings))
-        self.rows = rows
+        if annotations:
+            self.message.appendPlainText(f"{sum(len(g['labels']) for g in annotations)} annotation(s). "
+                "Plain upright text at converted anchor points; CAD fonts/rotation are not reproduced. No soil interpretation.")
+        self.rows, self.annotations = rows, annotations
         self.import_button.setEnabled(True)
         self.tabs.setCurrentIndex(3)
 
     def _accept(self):
         self._check_plan()
-        if self._closed or self._task is not None or not self.rows:
+        if self._closed or self._task is not None or not (self.rows or self.annotations):
             return
         # Control changes invalidate rows. Check external reference changes too,
         # without repeating a potentially long conversion on the GUI thread.
-        notice = reference_notice(self.rows[0], self.model)
-        if (self.rows[0]["source"].get("profile_sampled_utc") is not None
+        first = (self.rows + self.annotations)[0]
+        notice = reference_notice(first, self.model)
+        if (first["source"].get("profile_sampled_utc") is not None
                 and self.model.profile_stale_reasons()):
             notice = "Seabed profile is stale. Sample it again before importing."
         if notice:
@@ -461,9 +527,11 @@ class HorizonsDialog(QDialog):
         # several times just to open a large imported section.
         self._initial = horizons.plan_rows(model.plan)
         self.rows = [dict(row) for row in self._initial]
+        self._annotations_initial = dxf_annotations.plan_state(model.plan)
+        self.annotations = [dict(group) for group in self._annotations_initial["groups"]]
         self._plan_id, self._route = model.plan_id, route_reference(model)
         self._loading = False
-        self.setWindowTitle("Sub-bottom horizons")
+        self.setWindowTitle("Sub-bottom horizons and labels")
         self.resize(1000, 700)
         layout = QVBoxLayout(self)
         toolbar = QHBoxLayout()
@@ -472,7 +540,14 @@ class HorizonsDialog(QDialog):
             button = QPushButton(label)
             button.clicked.connect(callback)
             toolbar.addWidget(button)
+            if label == "Edit vertices…":
+                self.edit_vertices_button = button
         toolbar.addStretch()
+        self.show_labels = QCheckBox("Show labels")
+        self.show_labels.setChecked(self._annotations_initial.get("visible", True))
+        self.show_labels.setToolTip("Show imported DXF annotations. Saved with this plan; no soil interpretation.")
+        self.show_labels.toggled.connect(self._render)
+        toolbar.addWidget(self.show_labels)
         layout.addLayout(toolbar)
         split = QSplitter(getattr(Qt, "Orientation", Qt).Horizontal)
         left = QWidget()
@@ -494,7 +569,7 @@ class HorizonsDialog(QDialog):
         split.addWidget(self.plot)
         split.setStretchFactor(1, 2)
         layout.addWidget(split, 1)
-        hint = QLabel("Add DXF appends horizons; repeat to combine files, with coordinates checked for each file. "
+        hint = QLabel("Add DXF appends horizons and labels; repeat to combine files, with coordinates checked for each file. "
                       "Tick horizons to show them over any Ground Model display. Edits are saved with Apply; "
                       "Cancel discards this dialog's changes. Undo saved edits in Review & Export → change log.")
         hint.setWordWrap(True)
@@ -520,26 +595,33 @@ class HorizonsDialog(QDialog):
     def _rebuild(self, index=0):
         self._loading = True
         self.list.clear()
-        for row in self.rows:
-            item = QListWidgetItem(row["name"])
+        for row in self.rows + self.annotations:
+            item = QListWidgetItem(("Labels — " if "labels" in row else "") + row["name"])
             item.setFlags(item.flags() | ITEM_FLAG_USER_CHECKABLE)
             item.setCheckState(CHECK_STATE_CHECKED if row.get("visible", True) else CHECK_STATE_UNCHECKED)
             item.setForeground(QColor(row["colour"]))
             self.list.addItem(item)
         self._loading = False
-        self.list.setCurrentRow(min(index, len(self.rows) - 1))
+        self.list.setCurrentRow(min(index, len(self.rows) + len(self.annotations) - 1))
+        self.show_labels.setEnabled(bool(self.annotations))
         self._selected()
         self._render()
 
-    def _selected(self, *_args):
+    def _selected_row(self):
         index = self.list.currentRow()
-        row = self.rows[index] if 0 <= index < len(self.rows) else None
+        entries = self.rows + self.annotations
+        return entries[index] if 0 <= index < len(entries) else None
+
+    def _selected(self, *_args):
+        row = self._selected_row()
+        self.edit_vertices_button.setEnabled(row is not None and "labels" not in row)
         self.name.setEnabled(row is not None)
         self.name.setText(row["name"] if row else "")
         if row:
             source = row.get("source") or {}
-            self.details.setText(f"{source.get('file', '')}\n{len(row['segments'])} segment(s)\n"
-                                 + reference_notice(row, self.model))
+            detail = (f"{len(row['labels'])} annotation(s); display only" if "labels" in row
+                      else f"{len(row['segments'])} segment(s)")
+            self.details.setText(f"{source.get('file', '')}\n{detail}\n" + reference_notice(row, self.model))
         else:
             self.details.setText("Import a DXF section to add interpreted horizons.")
 
@@ -547,6 +629,9 @@ class HorizonsDialog(QDialog):
         self.plot.set_units(self.model.ground_units, self.model.ground_classes)
         route = route_reference(self.model)
         self.plot.set_horizons([row for row in self.rows if (row.get("source") or {}).get("route") == route])
+        self.plot.set_annotations([row for row in self.annotations
+                                   if (row.get("source") or {}).get("route") == route]
+                                  if self.show_labels.isChecked() else [])
         self.plot.set_target_runs(self.model.target_runs())
         scope = self.model.gen_params().scope
         if scope.length_km > 0:
@@ -554,15 +639,16 @@ class HorizonsDialog(QDialog):
 
     def _visibility(self, item):
         if not self._loading:
-            self.rows[self.list.row(item)]["visible"] = item.checkState() == CHECK_STATE_CHECKED
+            (self.rows + self.annotations)[self.list.row(item)]["visible"] = item.checkState() == CHECK_STATE_CHECKED
             self._render()
 
     def _rename(self):
         index = self.list.currentRow()
-        if index >= 0 and self.name.text().strip():
-            self.rows[index]["name"] = self.name.text().strip()
+        row = self._selected_row()
+        if row is not None and self.name.text().strip():
+            row["name"] = self.name.text().strip()
             self._loading = True
-            self.list.item(index).setText(self.rows[index]["name"])
+            self.list.item(index).setText(("Labels — " if "labels" in row else "") + row["name"])
             self._loading = False
             self._render()
 
@@ -571,33 +657,40 @@ class HorizonsDialog(QDialog):
         try:
             if qt_exec(dialog) == DIALOG_ACCEPTED:
                 combined = self.rows + dialog.rows
+                combined_annotations = self.annotations + dialog.annotations
                 try:
                     horizons.validate_rows(combined)
+                    dxf_annotations.validate(combined_annotations)
                 except ValueError as exc:
                     QMessageBox.warning(self, "Horizon import", str(exc))
                     return
-                self.rows = combined
-                self._rebuild(len(self.rows) - len(dialog.rows))
+                index = len(self.rows) if dialog.rows else len(combined) + len(self.annotations)
+                self.rows, self.annotations = combined, combined_annotations
+                self._rebuild(index)
         finally:
             dialog.deleteLater()
 
     def _remove(self):
         index = self.list.currentRow()
         if index >= 0:
-            self.rows.pop(index)
+            if index < len(self.rows):
+                self.rows.pop(index)
+            else:
+                self.annotations.pop(index - len(self.rows))
             self._rebuild(index)
 
     def _colour(self):
         index = self.list.currentRow()
-        if index >= 0:
-            colour = QColorDialog.getColor(QColor(self.rows[index]["colour"]), self, "Horizon colour")
+        row = self._selected_row()
+        if row is not None:
+            colour = QColorDialog.getColor(QColor(row["colour"]), self, "Overlay colour")
             if colour.isValid():
-                self.rows[index]["colour"] = colour.name()
+                row["colour"] = colour.name()
                 self._rebuild(index)
 
     def _edit_vertices(self):
         index = self.list.currentRow()
-        if index < 0:
+        if index < 0 or index >= len(self.rows):
             return
         row = self.rows[index]
         if sum(len(s) for s in row["segments"]) > horizons.MAX_TEXT_EDIT_POINTS:
@@ -643,10 +736,18 @@ class HorizonsDialog(QDialog):
                 raise ValueError("The active plan or route changed; close and reopen Horizons before saving.")
             if horizons.plan_rows(self.model.plan) != self._initial:
                 raise ValueError("Saved horizons changed while this dialog was open; reopen it before editing.")
+            if dxf_annotations.plan_state(self.model.plan) != self._annotations_initial:
+                raise ValueError("Saved annotations changed while this dialog was open; reopen it before editing.")
             horizons.validate_rows(self.rows)
-            if self.rows != self._initial and not self.model.update_gen_params(
-                    {horizons.PARAMS_KEY: {"version": 1, "rows": self.rows}},
-                    reason="Edit sub-bottom horizons", stale=False):
+            dxf_annotations.validate(self.annotations)
+            annotations = dict(self._annotations_initial, groups=self.annotations, visible=self.show_labels.isChecked())
+            updates = {}
+            if self.rows != self._initial:
+                updates[horizons.PARAMS_KEY] = {"version": 1, "rows": self.rows}
+            if annotations != self._annotations_initial:
+                updates[dxf_annotations.PARAMS_KEY] = annotations
+            if updates and not self.model.update_gen_params(
+                    updates, reason="Edit sub-bottom horizons and annotations", stale=False):
                 return
         except ValueError as exc:
             QMessageBox.warning(self, "Save horizons", str(exc))

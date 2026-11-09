@@ -9,6 +9,7 @@ Disconnected entities are never joined, sorted together or averaged.
 from __future__ import annotations
 
 import bisect
+import codecs
 import hashlib
 import json
 import math
@@ -16,7 +17,7 @@ import os
 from collections import Counter
 from dataclasses import asdict, dataclass
 
-from . import schema
+from . import dxf_annotations, schema
 
 PARAMS_KEY = "subbottom_horizons"
 # Memory budgets, not DXF format limits. Preserve all accepted vertices.
@@ -77,7 +78,9 @@ def read_dxf(path, progress=None):
         raise ValueError(f"DXF exceeds the {MAX_FILE_BYTES // (1024 * 1024)} MiB safety budget.")
     digest = hashlib.sha256()
     checkpoint(progress, message="Reading DXF…")
-    layers, skipped = {}, Counter()
+    layers, annotations, skipped = {}, {}, Counter()
+    annotation_count = annotation_chars = 0
+    encoding = "utf-8"
     units = 0
     section = ""
     polyline = None
@@ -128,10 +131,28 @@ def read_dxf(path, progress=None):
         if len(layers) > MAX_HORIZONS:
             raise ValueError(f"DXF exceeds {MAX_HORIZONS} section layers; export just the interpreted horizons.")
 
+    def add_annotation(kind, attrs):
+        nonlocal annotation_count, annotation_chars
+        layer = dict(attrs).get(8, "0")
+        try:
+            entity = dxf_annotations.read_entity(kind, attrs)
+            if entity is None:
+                return
+            if (annotation_count >= dxf_annotations.MAX_LABELS
+                    or annotation_chars + len(entity["raw_text"]) > dxf_annotations.MAX_TOTAL_TEXT
+                    or (layer not in annotations and len(annotations) >= dxf_annotations.MAX_GROUPS)):
+                raise ValueError("annotation memory budget exceeded; remaining labels omitted")
+            annotations.setdefault(layer, []).append(entity)
+            annotation_count += 1
+            annotation_chars += len(entity["raw_text"])
+        except (KeyError, ValueError, TypeError, OverflowError) as exc:
+            skipped[f"{layer}: {kind} — {exc}"] += 1
+
     def records(handle):
         kind, attrs = "", []
         pairs, consumed, coordinates = 0, 0, 0
-        retained = {2, 5, 8, 9, 10, 11, 20, 21, 30, 31, 38, 39, 42, 67, 70, 90, 210, 220, 230}
+        retained = {1, 2, 3, 5, 8, 9, 10, 11, 20, 21, 30, 31, 38, 39, 42, 67, 70,
+                    71, 72, 73, 75, 90, 210, 220, 230}
         while True:
             # Limit a single corrupt line before allocating unbounded memory.
             line = handle.readline(65537)
@@ -153,7 +174,9 @@ def read_dxf(path, progress=None):
                 code = int(line[3:] if line.startswith(b"\xef\xbb\xbf") else line)
             except ValueError as exc:
                 raise ValueError("Expected an ASCII DXF group code.") from exc
-            value = value.decode("utf-8", errors="replace").strip()
+            value = value.decode(encoding, errors="replace").rstrip("\r\n")
+            if code not in (1, 3):
+                value = value.strip()
             if code == 0:
                 yield kind, attrs
                 kind, attrs, coordinates = value, [], 0
@@ -173,6 +196,15 @@ def read_dxf(path, progress=None):
             if kind == "SECTION":
                 section = dict(attrs).get(2, "")
                 if section == "HEADER":
+                    header = {value: attrs[i + 1][1] for i, (code, value) in enumerate(attrs[:-1]) if code == 9}
+                    page = header.get("$DWGCODEPAGE", "")
+                    if page.startswith("ANSI_") and header.get("$ACADVER", "") < "AC1021":
+                        candidate = "cp" + page[5:]
+                        try:
+                            codecs.lookup(candidate)
+                            encoding = candidate
+                        except LookupError:
+                            skipped["unsupported DXF text code page"] += 1
                     for i, pair in enumerate(attrs[:-1]):
                         if pair == (9, "$INSUNITS"):
                             try:
@@ -200,7 +232,10 @@ def read_dxf(path, progress=None):
                 polyline = (attrs, [])
             elif kind in ("LINE", "LWPOLYLINE"):
                 add(kind, attrs)
-            elif kind in ("ARC", "CIRCLE", "SPLINE", "ELLIPSE", "INSERT", "HATCH", "3DFACE"):
+            elif kind in ("TEXT", "MTEXT"):
+                add_annotation(kind, attrs)
+            elif kind in ("ARC", "CIRCLE", "SPLINE", "ELLIPSE", "INSERT", "HATCH", "3DFACE",
+                          "ATTRIB", "ATTDEF", "MULTILEADER", "DIMENSION"):
                 skipped[f"{dict(attrs).get(8, '0')}: unsupported {kind}"] += 1
     final_stat = os.stat(path)
     if (original_stat.st_size, original_stat.st_mtime_ns) != (final_stat.st_size, final_stat.st_mtime_ns):
@@ -208,10 +243,10 @@ def read_dxf(path, progress=None):
     if polyline is not None:
         skipped["POLYLINE missing SEQEND"] += 1
     warnings = [f"{n} × {reason}" for reason, n in skipped.items()]
-    if not layers:
-        raise ValueError("No supported 2D section lines found. " + "; ".join(warnings[:5]))
+    if not layers and not annotations:
+        raise ValueError("No supported 2D section lines or annotations found. " + "; ".join(warnings[:5]))
     checkpoint(progress, percent=100, message=f"Read {count:,} vertices")
-    return {"layers": layers, "units": units, "warnings": warnings,
+    return {"layers": layers, "annotations": annotations, "units": units, "warnings": warnings,
             "vertex_count": count, "sha256": digest.hexdigest(), "size_bytes": size}
 
 
@@ -230,7 +265,7 @@ class ImportOptions:
     reference: str = "seabed"  # seabed | datum
     datum: str = ""
 
-    def transform(self, points, progress=None):
+    def _factors(self):
         for value in (self.x_unit_m, self.x_scale, self.y_unit_m, self.exaggeration):
             if _number(value) <= 0:
                 raise ValueError("Units, scale and exaggeration must be greater than zero.")
@@ -240,6 +275,16 @@ class ImportOptions:
             raise ValueError("Name the shared vertical datum (for example MSL or LAT).")
         sx = (-1 if self.reverse_x else 1) * self.x_unit_m * self.x_scale / 1000.0
         sy = (-1 if self.positive_up else 1) * self.y_unit_m / self.exaggeration
+        return sx, sy
+
+    def transform_point(self, point):
+        sx, sy = self._factors()
+        x, y = point
+        return [_number(self.kp_origin + (_number(x) - self.x_origin) * sx),
+                _number(self.depth_offset_m + (_number(y) - self.y_origin) * sy)]
+
+    def transform(self, points, progress=None):
+        sx, sy = self._factors()
         out = []
         for i, (x, y) in enumerate(_points(points, progress)):
             checkpoint(progress, i, 100 * i / max(1, len(points)))

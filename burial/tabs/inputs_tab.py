@@ -505,7 +505,7 @@ class InputsTab(QWidget):
         button_row.addWidget(self.remove_input_button)
         button_row.addStretch(1)
         inputs_layout.addLayout(button_row)
-        imported_hint = QLabel("Saved DXF horizons and CPT campaigns also appear here. "
+        imported_hint = QLabel("Saved DXF imports and CPT campaigns also appear here. "
                               "Manage these imports in Ground Model → Horizons / CPTs.")
         imported_hint.setWordWrap(True)
         imported_hint.setStyleSheet(ui_helpers.hint_style())
@@ -703,7 +703,7 @@ class InputsTab(QWidget):
             self._stored_import_key = None
             self._stored_horizon_inputs = []
             return []
-        from .. import horizons, imported_inputs
+        from .. import dxf_annotations, horizons, imported_inputs
         from ..horizon_dialogs import reference_notice, route_reference
 
         params = self.model.plan.get("params_json")
@@ -714,7 +714,8 @@ class InputsTab(QWidget):
             try:
                 rows = horizons.plan_rows(self.model.plan)
                 self._stored_horizon_inputs = imported_inputs.horizon_inputs(
-                    rows, lambda row: reference_notice(row, self.model, route))
+                    rows, lambda row: reference_notice(row, self.model, route),
+                    annotations=dxf_annotations.plan_state(self.model.plan)["groups"])
             except ValueError as exc:
                 self._stored_horizon_inputs = [dict(role="DXF horizons", layer_name="Saved horizons",
                     register_state="check", register_detail=str(exc), register_users=[])]

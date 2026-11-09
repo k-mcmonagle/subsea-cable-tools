@@ -29,6 +29,7 @@ from qgis.PyQt.QtGui import QColor, QPolygonF
 from qgis.PyQt.QtWidgets import QLabel, QVBoxLayout, QWidget
 
 from . import ground_model, horizons, schema
+from .annotation_overlay import AnnotationOverlay
 
 _PEN_STYLE = getattr(Qt, "PenStyle", Qt)
 _MOUSE_LEFT = getattr(Qt, "MouseButton", Qt).LeftButton
@@ -273,6 +274,11 @@ class GroundModelPlot(QWidget):
         self.horizon_legend.setWordWrap(True)
         self.horizon_legend.setContentsMargins(8, 0, 8, 0)
         self.horizon_legend.hide()
+        self.annotation_notice = QLabel()
+        self.annotation_notice.setWordWrap(True)
+        self.annotations = AnnotationOverlay(self.plot)
+        self.annotations.noticeChanged.connect(self.annotation_notice.setText)
+        layout.addWidget(self.annotation_notice)
         layout.addWidget(self.horizon_legend)
         layout.addWidget(self.plot, 1)
 
@@ -292,6 +298,10 @@ class GroundModelPlot(QWidget):
                   for code in codes}
         self._unit_item.set_units(self._units, colors)
         self._update_legend(codes, colors)
+        self._fit_depth()
+
+    def set_annotations(self, groups) -> None:
+        self.annotations.set_groups(groups)
         self._fit_depth()
 
     def set_horizons(self, rows) -> None:
@@ -480,12 +490,14 @@ class GroundModelPlot(QWidget):
         self._unit_item.set_selected(unit_id)
 
     def clear(self) -> None:
+        self.set_annotations([])
         self.set_horizons([])
         self.set_units([], [])
         self._vline.setVisible(False)
         self._readout.setVisible(False)
 
     def _fit_depth(self) -> None:
+        annotation_lo, annotation_hi = self.annotations.extent
         if self._numeric_depth is not None:
             lo, hi = self._numeric_depth
             if self._horizons:
@@ -494,9 +506,9 @@ class GroundModelPlot(QWidget):
             return
         cpt_depth = self._cpt_item.depth_extent if self._cpt_item.isVisible() else 0.0
         deepest = max(self._unit_item.depth_extent, self._target_m or 0.0, cpt_depth,
-                      self._horizon_extent[1])
+                      self._horizon_extent[1], annotation_hi)
         span = max(deepest + _OPEN_EXTRA_M, _MIN_DEPTH_SPAN_M)
-        self.plot.getPlotItem().vb.setYRange(self._horizon_extent[0], span, padding=0.04)
+        self.plot.getPlotItem().vb.setYRange(min(self._horizon_extent[0], annotation_lo), span, padding=0.04)
 
     def _update_legend(self, codes: List[str], colors: Dict[str, str]) -> None:
         if not codes:

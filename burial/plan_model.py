@@ -212,6 +212,7 @@ class PlanModel(QObject):
             if not isinstance(settings, dict):
                 settings = {}
             settings.pop("subbottom_horizons", None)
+            settings.pop("subbottom_annotations", None)
             self._display_settings_cache = settings
             self._display_settings_raw = raw
         return self._display_settings_cache
