@@ -26,7 +26,10 @@ For a single-KP field, leave **End KP field** empty. Input can be a point layer,
 KP-field mode deliberately ignores geometry, including missing geometry.
 
 For pasted input, choose **Pasted KP list**, then explicitly choose **Single KPs** or **Start / end KP ranges**.
-One record goes on each line. Set **Pasted list has a header row** when appropriate. Examples:
+One record goes on each line. **Pasted header row** defaults to automatic detection of common headings
+such as `KP`, `KP (km)`, `Start KP` / `End KP` and `KP From` / `KP To`. Header names become output column
+names, including labels and grouping columns. Choose **First row is a header** for custom headings,
+or **No header row** to treat every row as data. Examples:
 
 ```text
 1.250
@@ -43,8 +46,9 @@ start,end,group
 
 Equal range endpoints become points. Negative KPs and `12+345` notation are supported. Use decimal points
 and no thousands separators. Columns can be tab, comma, semicolon, pipe or whitespace separated; use CSV
-quotes for labels containing commas. Additional columns are preserved. Header/type choices are explicit so
-an invalid first row is not mistaken for a header, or a numeric point label for an end KP. Bad rows stay in Results.
+quotes for labels containing commas. Additional columns are preserved. Automatic header detection only recognises
+KP headings; arbitrary invalid first rows stay in Results. Point/range type remains explicit so a numeric point
+label is not mistaken for an end KP. Saved scripts using the previous `HEADER` boolean remain supported.
 
 Choose **Geometry projected onto old RPL** when the positions or line shapes are authoritative and no KP fields
 are available. It derives KPs from single points or single-part line endpoints on the old route. It also samples
@@ -76,6 +80,18 @@ return-projection KP error, status and flags. `input_id` identifies the input fe
 | `invalid` | Invalid/missing KP, out-of-extent KP, unsupported geometry or calculation failure; reason retained. |
 
 Optional original-geometry output retains all processed rows, including review/invalid rows.
+
+### Empty point or range outputs
+
+The Processing log reports the number of features written to each requested map output, counts of accepted,
+review and invalid rows, and the reasons rows were excluded. If no rows were accepted it also shows a warning
+directing you to `translation_status` and `translation_flags` in the results table.
+
+- A range-only list normally leaves the point output empty, and a single-KP list leaves the range output empty.
+- Rows marked `review` have candidate translated KPs, but are deliberately withheld from new-route map outputs.
+  Check their separation, length-change and return-projection diagnostics against the actual route revisions.
+- Rows marked `invalid` could not be translated; check their reason, pasted list type, KP values and route extent.
+- One invalid row (including an unrecognised header) does **not** prevent other valid rows from producing geometry.
 
 Default checks sample every 50 m and at KP-path vertices, including both boundaries:
 

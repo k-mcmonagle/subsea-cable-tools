@@ -18,6 +18,19 @@ from ..qgis_compat import FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_STRING
 REQUIRES_QGIS = True
 
 
+class TranslationFeedback(QgsProcessingFeedback):
+    def __init__(self):
+        super().__init__()
+        self.messages = []
+        self.warnings = []
+
+    def pushInfo(self, message):
+        self.messages.append(message)
+
+    def pushWarning(self, message):
+        self.warnings.append(message)
+
+
 class TranslationQgisTests(unittest.TestCase):
     def setUp(self):
         self.layers = []
@@ -59,7 +72,8 @@ class TranslationQgisTests(unittest.TestCase):
             params[key] = 'memory:'
         valid, error = algorithm.checkParameterValues(params, context)
         self.assertTrue(valid, error)
-        results = algorithm.processAlgorithm(params, context, QgsProcessingFeedback())
+        self.feedback = TranslationFeedback()
+        results = algorithm.processAlgorithm(params, context, self.feedback)
         return {key: context.takeResultLayer(results[key]) for key in outputs}
 
     def translate(self, **kwargs):
@@ -76,6 +90,35 @@ class TranslationQgisTests(unittest.TestCase):
         self.assertAlmostEqual(rows[0]['new_start_kp'], 6, places=8)
         self.assertEqual(out['POINTS'].featureCount(), 2)
         self.assertEqual(out['RANGES'].featureCount(), 0)
+
+    def test_automatic_headers_create_geometry_and_retain_labels(self):
+        out = self.translate(PASTE='KP,Label\n1,First\n3,Second')
+        self.assertEqual(out['POINTS'].featureCount(), 2)
+        self.assertEqual([f['Label'] for f in out['POINTS'].getFeatures()], ['First', 'Second'])
+        self.assertTrue(any('Detected pasted header' in m for m in self.feedback.messages))
+        out = self.translate(PASTE_TYPE=1, PASTE='KP From\tKP To\tGroup\n1\t2\tSand\n3\t3\tCrossing')
+        self.assertEqual(out['RANGES'].featureCount(), 1)
+        self.assertEqual(out['POINTS'].featureCount(), 1)
+        self.assertEqual(next(out['RANGES'].getFeatures())['Group'], 'Sand')
+        self.assertEqual(out['RESULTS'].featureCount(), 2)
+
+    def test_invalid_first_row_does_not_suppress_later_geometry(self):
+        out = self.translate(PASTE_TYPE=1, HEADER_MODE=2, PASTE='Start KP,End KP\n1,2\n3,3')
+        self.assertEqual(out['RANGES'].featureCount(), 1)
+        self.assertEqual(out['POINTS'].featureCount(), 1)
+        self.assertEqual([f['translation_status'] for f in out['RESULTS'].getFeatures()],
+                         ['invalid', 'accepted', 'accepted'])
+
+    def test_empty_geometry_outputs_report_review_and_invalid_reasons(self):
+        self.new = self.route([(0, 100), (10000, 100)])
+        out = self.translate(PASTE='KP\n1\nbad')
+        self.assertEqual(out['POINTS'].featureCount(), 0)
+        self.assertEqual(out['RANGES'].featureCount(), 0)
+        self.assertEqual(out['RESULTS'].featureCount(), 2)
+        self.assertTrue(any('1 row(s) need review and 1 are invalid' in m for m in self.feedback.warnings))
+        self.assertTrue(any('offset_exceeded' in m for m in self.feedback.warnings))
+        self.assertTrue(any('KP must be a number' in m for m in self.feedback.warnings))
+        self.assertTrue(any('Point geometry output: 0' in m for m in self.feedback.messages))
 
     def test_algorithm_run_validation_and_negative_start(self):
         algorithm = TranslateKPValuesAlgorithm()

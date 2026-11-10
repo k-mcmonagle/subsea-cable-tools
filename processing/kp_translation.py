@@ -25,13 +25,26 @@ def parse_kp(value):
     return value
 
 
-def pasted_rows(text, ranges=False, header=False):
+def _kp_heading(value, end=False):
+    """Recognise KP headings, not arbitrary text that happens to be invalid data."""
+    value = re.sub(r'\([^)]*\)|\[[^]]*\]', '', value.casefold())
+    value = re.sub(r'[^a-z0-9]', '', value)
+    if value.endswith('km'):
+        value = value[:-2]
+    if end:
+        return value in {'end', 'to', 'endkp', 'kpend', 'tokp', 'kpto', 'endchainage', 'chainageend'}
+    return value in {'kp', 'chainage', 'start', 'from', 'startkp', 'kpstart', 'fromkp', 'kpfrom',
+                     'startchainage', 'chainagestart', 'kilometrepoint', 'kilometerpoint'}
+
+
+def pasted_rows(text, ranges=False, header=None, *, details=None):
     """Return column names and raw rows, retaining malformed data for review.
 
-    Explicit header/type choices avoid silently dropping the first invalid row
-    or interpreting a point's numeric label as the end of a range.
+    header=None detects recognised KP headings; True/False force header/no header.
+    Invalid first rows are retained unless they match the expected KP headings.
+    Point/range type stays explicit so a numeric label is never an end KP.
     """
-    text = text.strip()
+    text = text.lstrip('\ufeff').strip()
     if not text:
         raise ValueError("Paste at least one KP or range")
     first = text.splitlines()[0]
@@ -39,7 +52,17 @@ def pasted_rows(text, ranges=False, header=False):
     rows = ([list(map(str.strip, r)) for r in csv.reader(io.StringIO(text), delimiter=delimiter)]
             if delimiter else [r.split() for r in text.splitlines()])
     rows = [r for r in rows if any(r)]
-    names = rows.pop(0) if header else []
+    if not rows:
+        raise ValueError('Paste at least one KP or range')
+    # A one-column point heading can contain spaces without being extra columns.
+    if delimiter is None and not ranges and _kp_heading(first):
+        rows[0] = [first]
+    detected = (_kp_heading(rows[0][0]) and
+                (not ranges or (len(rows[0]) > 1 and _kp_heading(rows[0][1], end=True))))
+    use_header = detected if header is None else header
+    names = rows.pop(0) if use_header else []
+    if details is not None:
+        details.update(header_used=use_header, header_detected=header is None and detected)
     if not rows:
         raise ValueError("No data rows after the header")
     width = max(2 if ranges else 1, len(names), max(map(len, rows)))

@@ -26,6 +26,28 @@ class TranslationInputTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             pasted_rows('KP', header=True)
 
+    def test_automatic_headers_preserve_names(self):
+        for heading in ['KP', 'KP (km)', 'Chainage', 'KP [km]']:
+            details = {}
+            names, rows = pasted_rows(heading + '\n1\n2', details=details)
+            self.assertEqual(names, [heading])
+            self.assertEqual(rows, [['1'], ['2']])
+            self.assertTrue(details['header_detected'])
+        for heading in ['Start KP,End KP,Group', 'KP From,KP To,Group', 'start_kp,end_kp,Group']:
+            names, rows = pasted_rows(heading + '\n1,2,Sand', ranges=True)
+            self.assertEqual(names, heading.split(','))
+            self.assertEqual(rows, [['1', '2', 'Sand']])
+
+    def test_header_override_and_bad_first_rows(self):
+        self.assertEqual(pasted_rows('KP\n1', header=False)[1], [['KP'], ['1']])
+        self.assertEqual(pasted_rows('Custom heading\n1', header=True)[1][0][0], '1')
+        self.assertEqual(pasted_rows('bad,2\n1,2', ranges=True)[1], [['bad', '2'], ['1', '2']])
+        self.assertEqual(pasted_rows('1,123\n2,456')[1], [['1', '123'], ['2', '456']])
+        with self.assertRaises(ValueError):
+            pasted_rows(',\n,', ranges=True)
+        with self.assertRaises(ValueError):
+            pasted_rows('KP')
+
     def test_samples_keep_exact_boundaries_and_vertices(self):
         self.assertEqual(sample_kps(2, 1, 500, [1.3]), [2, 1.5, 1.3, 1])
         self.assertEqual(sample_kps(1, 1, 50), [1])

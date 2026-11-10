@@ -1,12 +1,13 @@
 """Translate point and range KPs using the shared route model."""
 
 import math
+from collections import Counter
 
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
-    QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsFeature, QgsFeatureSink,
+    Qgis, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsFeature, QgsFeatureSink,
     QgsField, QgsFields, QgsGeometry, QgsPointXY, QgsProcessing, QgsProcessingException,
-    QgsProcessingParameterBoolean, QgsProcessingParameterCrs, QgsProcessingParameterEnum,
+    QgsProcessingParameterBoolean, QgsProcessingParameterCrs, QgsProcessingParameterDefinition, QgsProcessingParameterEnum,
     QgsProcessingParameterFeatureSink, QgsProcessingParameterFeatureSource,
     QgsProcessingParameterField, QgsProcessingParameterNumber, QgsProcessingParameterString,
     QgsWkbTypes,
@@ -69,8 +70,17 @@ class TranslateKPValuesAlgorithm(SubseaCableAlgorithm):
             multiLine=True, optional=True))
         self.addParameter(QgsProcessingParameterEnum(
             'PASTE_TYPE', 'Pasted list type', options=['Single KPs', 'Start / end KP ranges'], defaultValue=0))
-        self.addParameter(QgsProcessingParameterBoolean(
-            'HEADER', 'Pasted list has a header row', defaultValue=False))
+        self.addParameter(QgsProcessingParameterEnum(
+            'HEADER_MODE', 'Pasted header row', options=[
+                'Auto-detect KP column headings', 'First row is a header', 'No header row'], defaultValue=0))
+        # Retain the old boolean for saved models/scripts without cluttering the dialog.
+        legacy_header = QgsProcessingParameterBoolean('HEADER', 'Legacy pasted header setting', defaultValue=False)
+        try:
+            hidden = Qgis.ProcessingParameterFlag.Hidden
+        except AttributeError:
+            hidden = QgsProcessingParameterDefinition.FlagHidden
+        legacy_header.setFlags(legacy_header.flags() | hidden)
+        self.addParameter(legacy_header)
         for key, label, default, minimum in [
             ('MAX_OFFSET', 'Maximum route separation / geometry offset (m)', 25, 0),
             ('STEP', 'Diagnostic sample spacing (m)', 50, 1),
@@ -171,11 +181,22 @@ class TranslateKPValuesAlgorithm(SubseaCableAlgorithm):
             raise QgsProcessingException('Geometry mode requires a point or line layer with a valid CRS')
         ranges = self.parameterAsEnum(parameters, 'PASTE_TYPE', context) == 1
         if mode == 1:
+            header_mode = self.parameterAsEnum(parameters, 'HEADER_MODE', context)
+            header = {0: None, 1: True, 2: False}[header_mode]
+            if 'HEADER_MODE' not in parameters and 'HEADER' in parameters:
+                header = self.parameterAsBool(parameters, 'HEADER', context)
+            details = {}
             try:
                 headers, rows = pasted_rows(self.parameterAsString(parameters, 'PASTE', context), ranges,
-                                            self.parameterAsBool(parameters, 'HEADER', context))
+                                            header, details=details)
             except ValueError as exc:
                 raise QgsProcessingException(str(exc)) from exc
+            if details['header_used']:
+                feedback.pushInfo(('Detected' if details['header_detected'] else 'Using') +
+                                  ' pasted header row; column names retained: ' + ', '.join(headers))
+            else:
+                feedback.pushInfo('No pasted header row used; every nonblank row will be processed as data.')
+            feedback.pushInfo(f'Pasted input: {len(rows)} data row(s), ' + ('KP ranges.' if ranges else 'single KPs.'))
             original_fields = QgsFields()
             for i, header in enumerate(headers):
                 name = header or f'column_{i + 1}'
@@ -231,6 +252,8 @@ class TranslateKPValuesAlgorithm(SubseaCableAlgorithm):
                 raise QgsProcessingException(f'Could not write {key} output')
 
         totals = {'accepted': 0, 'review': 0, 'invalid': 0}
+        reasons = Counter()
+        written = Counter()
         for index, (record_id, attrs, feature) in enumerate(records):
             if feedback.isCanceled():
                 break
@@ -291,15 +314,32 @@ class TranslateKPValuesAlgorithm(SubseaCableAlgorithm):
                 flags.append(str(exc))
             data.update(translation_status=status, translation_flags='; '.join(dict.fromkeys(flags)))
             totals[status] += 1
+            if status != 'accepted':
+                reasons.update(list(dict.fromkeys(flags)))
             out_attrs = list(attrs) + [data.get(key) for key in names]
             write('RESULTS', out_attrs)
             if feature is not None:
                 write('ORIGINAL', out_attrs, feature.geometry())
             if status == 'accepted':
-                write('POINTS' if a == b else 'RANGES', out_attrs, output_geom)
+                output = 'POINTS' if a == b else 'RANGES'
+                write(output, out_attrs, output_geom)
+                if output in sinks:
+                    written[output] += 1
             if count > 0:
                 feedback.setProgress(100 * (index + 1) / count)
         feedback.pushInfo(', '.join(f'{number} {status}' for status, number in totals.items()))
+        for output, label in [('POINTS', 'Point'), ('RANGES', 'Range')]:
+            if output in sinks:
+                feedback.pushInfo(f'{label} geometry output: {written[output]} feature(s).')
+        for reason, number in reasons.most_common():
+            feedback.pushWarning(f'{number} row(s): {reason}')
+        if not totals['accepted'] and sum(totals.values()):
+            feedback.pushWarning(
+                'No accepted rows: new-route point/range layers have no features. '
+                f"{totals['review']} row(s) need review and {totals['invalid']} are invalid. "
+                f"Open Translation results and inspect {names['translation_status']} and "
+                f"{names['translation_flags']}. Review rows are deliberately excluded from geometry outputs; "
+                'an invalid row does not prevent other valid rows from being processed.')
         feedback.pushInfo('Diagnostics are sampled; accepted means no configured check failed, not proven revision correspondence.')
         return results
 
@@ -345,13 +385,20 @@ class TranslateKPValuesAlgorithm(SubseaCableAlgorithm):
         <p><b>Paste:</b> select Single KPs or Start/end ranges. Use one row per record,
         separated by tabs, commas, semicolons or whitespace. Decimal kilometres and
         12+345 notation are accepted; use a decimal point, not decimal commas or thousands
-        separators. Extra columns are retained. Select the header checkbox explicitly.
+        separators. Extra columns are retained. Common KP, Start KP / End KP and
+        KP From / KP To headings are detected automatically and retained as column names.
+        Set Pasted header row to First row is a header for custom headings, or No header
+        row to force every row to be treated as data. An invalid first row does not
+        prevent subsequent valid rows from producing geometry.
         In range mode, equal endpoints produce a point.</p>
         <p><b>Outputs:</b> Results contains every row, original attributes, old/new KPs,
         endpoint DCC, sampled maximum DCC, length change, return KP error and status.
         Accepted points/ranges are rebuilt on the new RPL; rows needing review are
         retained only in Results and optional Original geometry output. Existing fields
-        are never overwritten; conflicting result names receive suffixes.</p>
+        are never overwritten; conflicting result names receive suffixes. The log reports
+        feature counts and exclusion reasons. If both map outputs are empty, check
+        translation_status and translation_flags in Results: all rows may be invalid
+        or held for review. A range-only list normally leaves the points output empty.</p>
         <p><b>Checks:</b> route separation (default 25 m), length change (10%), return
         projection KP mismatch (1 m), reversed/collapsed ranges, non-monotone mapping,
         jumps greater than five times the source sample interval, and off-route snaps
