@@ -617,6 +617,8 @@ class BurialPlannerDock(QDockWidget):
         file_menu = QMenu(self.gpkg_button)
         file_menu.addAction("Open existing plans…", self._pick_gpkg)
         file_menu.addAction("Create new plan file…", self._new_gpkg)
+        file_menu.addSeparator()
+        file_menu.addAction("Check / recover GeoPackages…", self._check_geopackages)
         self.gpkg_button.setMenu(file_menu)
         strip.addWidget(self.gpkg_button)
         return strip
@@ -853,6 +855,11 @@ class BurialPlannerDock(QDockWidget):
             return
         self.model.close_plan()
         self.refresh_plans()
+
+    def _check_geopackages(self) -> None:
+        from .geopackage_health_dialog import GeoPackageHealthDialog
+        dialog = GeoPackageHealthDialog(self.store.gpkg_path, self)
+        dialog.exec()
 
     def _pick_gpkg(self) -> None:
         """Open the plan registry contained in an existing GeoPackage."""
@@ -1140,14 +1147,19 @@ class BurialPlannerDock(QDockWidget):
                        in resolved.rule_hits.items()},
             rule_nodata=generation.rule_nodata_map(acquisitions,
                                                    params.scope))
-        self.model.save_analysis(analysis_context, list(nodata), params,
+        saved = self.model.save_analysis(analysis_context, list(nodata), params,
                                  task_rules, message, warnings,
                                  basis=getattr(self, "_task_basis", None))
         self.rules_tab.set_results(message)
         self._refresh_profile_overlays()
 
+        if not saved:
+            self.rules_tab.set_results(message + "\nNOT SAVED — these results exist only in this session.")
+            self.builder_tab.analysis_finished("Exclusions computed but NOT SAVED. Generation stopped.")
+            return
+
         if not self._generate_after_analysis:
-            self.builder_tab.analysis_finished("Exclusions recomputed.")
+            self.builder_tab.analysis_finished("Exclusions recomputed and saved.")
             return
 
         # Full generation on the acquired (and refined) intervals. A fresh

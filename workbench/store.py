@@ -31,10 +31,11 @@ import json
 import math
 import os
 import re
-import shutil
 import sqlite3
 from contextlib import contextmanager
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+from ..geopackage_health import migration_snapshot
 
 from qgis.core import (
     QgsCoordinateTransformContext,
@@ -169,19 +170,25 @@ class WorkbenchStore:
     def migrate(self) -> None:
         """Upgrade the gpkg to the current SCHEMA_VERSION, one step at a time.
 
-        ``ensure_created`` first adds any tables missing from the declared
-        schema (so a pre-v2 gpkg gains the new registry tables), then each
-        registered migrator runs in order, backing the file up before every
-        step. A step and its ``schema_version`` stamp commit together, so an
+        A checked snapshot is required before creating missing tables, then
+        each registered migrator runs in order with a snapshot before every
+        subsequent step. A step and its ``schema_version`` stamp commit together, so an
         interrupted migration resumes at the step that failed. A registry
         from a newer plugin version raises :class:`WorkbenchNewerError`
         before anything is written.
         """
         self._refuse_newer()
+        meta = self.read_meta() if self.exists() else {}
+        current = int(meta.get("schema_version", schema.SCHEMA_VERSION))
+        if current < schema.SCHEMA_VERSION:
+            if not self.backup_before(f"migrate_v{current}"):
+                raise OSError("The migration was stopped because no checked backup was created.")
         self.ensure_created()
-        current = int(self.read_meta().get("schema_version", str(schema.SCHEMA_VERSION)))
+        first = current
         while current < schema.SCHEMA_VERSION:
-            self.backup_before(f"migrate_v{current}")
+            if current != first:
+                if not self.backup_before(f"migrate_v{current}"):
+                    raise OSError("The migration was stopped because no checked backup was created.")
             migrator = MIGRATIONS.get(current)
             with self.transaction():
                 if migrator is not None:
@@ -190,38 +197,12 @@ class WorkbenchStore:
             current += 1
 
     def backup_before(self, label: str) -> Optional[str]:
-        """Copy the gpkg aside before a structural change. Returns the copy path.
-
-        Uses SQLite's online backup so the copy is complete even when QGIS
-        has the file in WAL mode with frames not yet checkpointed (a plain
-        file copy would silently miss them); falls back to a file copy.
-        """
         if not os.path.exists(self.gpkg_path):
             return None
-        stem, ext = os.path.splitext(self.gpkg_path)
-        target = f"{stem}.{schema.sanitize_slug(label)}.bak{ext}"
-        try:
-            source = self._connect()
-            try:
-                dest = sqlite3.connect(target)
-                try:
-                    source.backup(dest)
-                finally:
-                    dest.close()
-            finally:
-                source.close()
-            return target
-        except sqlite3.Error:
-            log_exception(f"Workbench: SQLite backup of {self.gpkg_path} failed; "
-                          "falling back to a file copy")
-        try:
-            shutil.copy2(self.gpkg_path, target)
-            return target
-        except OSError:
-            log_exception(f"Workbench: could not back up {self.gpkg_path} to {target}")
-            return None
+        # Never fall back to a raw copy of a live SQLite file. Failure must
+        # stop the migration, and an existing backup must stay untouched.
+        return migration_snapshot(self.gpkg_path, schema.sanitize_slug(label))
 
-    # -- SQLite access -------------------------------------------------------
     def _connect(self) -> sqlite3.Connection:
         # sqlite3.connect would silently create an empty file.
         if not os.path.exists(self.gpkg_path):

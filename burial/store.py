@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import sqlite3
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Sequence
+
+from ..geopackage_health import migration_snapshot
 
 from qgis.core import QgsCoordinateTransformContext, QgsProject, QgsVectorLayer
 
@@ -101,7 +102,7 @@ class BurialStore:
                 self._sql_mode = True
             return gpkg_sql.connect(self.gpkg_path)
         except sqlite3.Error as exc:
-            if gpkg_sql.is_transient(exc):
+            if gpkg_sql.is_transient(exc) or gpkg_sql.is_corruption(exc):
                 raise
             self._log_sql_fallback("open", exc)
             self._sql_mode = False
@@ -146,7 +147,7 @@ class BurialStore:
             try:
                 return gpkg_sql.has_table(self.gpkg_path, schema.TABLE_META)
             except sqlite3.Error as exc:
-                if gpkg_sql.is_transient(exc):
+                if gpkg_sql.is_transient(exc) or gpkg_sql.is_corruption(exc):
                     raise
         return open_gpkg_layer(self.gpkg_path, schema.TABLE_META) is not None
 
@@ -175,10 +176,17 @@ class BurialStore:
         if self.exists():
             schema_guard.check(self.read_meta(), schema.SCHEMA_VERSION,
                                f"The plan file {os.path.basename(self.gpkg_path)}")
+        meta = self.read_meta() if self.exists() else {}
+        current = int(meta.get("schema_version", schema.SCHEMA_VERSION))
+        if current < schema.SCHEMA_VERSION:
+            if not self.backup_before(f"migrate_v{current}"):
+                raise OSError("The migration was stopped because no checked backup was created.")
         self.ensure_created()
-        current = int(self.read_meta().get("schema_version", str(schema.SCHEMA_VERSION)))
+        first = current
         while current < schema.SCHEMA_VERSION:
-            self.backup_before(f"migrate_v{current}")
+            if current != first:
+                if not self.backup_before(f"migrate_v{current}"):
+                    raise OSError("The migration was stopped because no checked backup was created.")
             migrator = MIGRATIONS.get(current)
             if migrator is not None:
                 migrator(self)
@@ -190,24 +198,9 @@ class BurialStore:
     def backup_before(self, label: str) -> Optional[str]:
         if not os.path.exists(self.gpkg_path):
             return None
-        # Fold any WAL content into the main file first so the copied
-        # .gpkg is complete without its -wal/-shm sidecars.
-        complete = gpkg_sql.checkpoint(self.gpkg_path, truncate=True)
-        stem, ext = os.path.splitext(self.gpkg_path)
-        target = f"{stem}.{schema.sanitize_slug(label)}.bak{ext}"
-        if not complete and gpkg_sql.backup_to(self.gpkg_path, target):
-            # A concurrent reader (e.g. a plan layer loaded in the project
-            # with its attribute table open) blocked the checkpoint; a
-            # plain file copy would silently miss the frames still in the
-            # -wal sidecar, so snapshot through the SQLite backup API.
-            return target
-        try:
-            shutil.copy2(self.gpkg_path, target)
-            return target
-        except OSError:
-            log_exception(f"Burial Planner: could not back up the plan file "
-                          f"before '{label}': {target}")
-            return None
+        # Never fall back to a raw copy of a live SQLite file. Failure must
+        # stop the migration, and an existing backup must stay untouched.
+        return migration_snapshot(self.gpkg_path, schema.sanitize_slug(label))
 
     # -- generic table access ------------------------------------------------
     def _table_exists(self, table: str) -> bool:
@@ -221,7 +214,7 @@ class BurialStore:
                 # Not a registry yet: answer read-only (see exists()).
                 return gpkg_sql.has_table(self.gpkg_path, table)
         except sqlite3.Error as exc:
-            if gpkg_sql.is_transient(exc):
+            if gpkg_sql.is_transient(exc) or gpkg_sql.is_corruption(exc):
                 raise
         return open_gpkg_layer(self.gpkg_path, table) is not None
 

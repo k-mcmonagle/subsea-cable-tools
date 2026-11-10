@@ -5,8 +5,9 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 from typing import Dict, List, Optional, Sequence
+
+from ..geopackage_health import migration_snapshot
 
 from qgis.core import (
     QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsCoordinateTransformContext,
@@ -99,10 +100,17 @@ class PlannerStore:
 
     def migrate(self) -> None:
         self._refuse_newer()
+        meta = self.read_meta() if self.exists() else {}
+        current = int(meta.get("schema_version", schema.SCHEMA_VERSION))
+        if current < schema.SCHEMA_VERSION:
+            if not self.backup_before("migrate_v%s" % current):
+                raise OSError("The migration was stopped because no checked backup was created.")
         self.ensure_created()
-        current = int(self.read_meta().get("schema_version", schema.SCHEMA_VERSION))
+        first = current
         while current < schema.SCHEMA_VERSION:
-            self.backup_before("migrate_v%s" % current)
+            if current != first:
+                if not self.backup_before("migrate_v%s" % current):
+                    raise OSError("The migration was stopped because no checked backup was created.")
             migrator = MIGRATIONS.get(current)
             if migrator is not None:
                 migrator(self)
@@ -112,13 +120,9 @@ class PlannerStore:
     def backup_before(self, label: str) -> Optional[str]:
         if not os.path.exists(self.gpkg_path):
             return None
-        stem, ext = os.path.splitext(self.gpkg_path)
-        target = "%s.%s.bak%s" % (stem, schema.sanitize_slug(label), ext)
-        try:
-            shutil.copy2(self.gpkg_path, target)
-            return target
-        except OSError:
-            return None
+        # Never fall back to a raw copy of a live SQLite file. Failure must
+        # stop the migration, and an existing backup must stay untouched.
+        return migration_snapshot(self.gpkg_path, schema.sanitize_slug(label))
 
     def _table_exists(self, table: str) -> bool:
         return os.path.exists(self.gpkg_path) and open_gpkg_layer(self.gpkg_path, table) is not None

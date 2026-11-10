@@ -20,6 +20,8 @@ Signals:
 
 from __future__ import annotations
 
+from ..geopackage_health import is_corruption
+
 import dataclasses
 import json
 import logging
@@ -153,9 +155,16 @@ class PlanModel(QObject):
         try:
             result = func(*args, **kwargs)
         except Exception as exc:
+            help_text = (
+                "\n\nSQLite reports corruption. This operation was not saved. "
+                "Keep this file and its sidecars; do not replace it with an older copy. "
+                "Use Plan file → Check / recover GeoPackages to compare saved copies "
+                "and try recovery into a new file. For synced folders, close QGIS on "
+                "both machines and pause sync before copying or recovery."
+                if is_corruption(exc) else "")
             self.storeError.emit(
                 f"Could not {action}: the Burial Planner GeoPackage could not "
-                f"be written.\n{self.store.gpkg_path}\n\n{exc}")
+                f"be written.\n{self.store.gpkg_path}\n\n{exc}{help_text}")
             return False, None
         return True, result
 
@@ -916,6 +925,7 @@ class PlanModel(QObject):
             return False
         run_utc = schema.utc_now_iso()
         row = dict(self.analysis_row or {})
+        row.pop("_unsaved", None)
         row.update({"plan_id": self.plan_id})
         row.update(analysis_state.encode_exclusions(
             generation.context_dict(context),
@@ -954,6 +964,8 @@ class PlanModel(QObject):
                           run_utc=str(row.get("run_utc") or ""),
                           message=str(row.get("message") or ""),
                           warnings=list(payload.get("warnings") or []))
+            if row.get("_unsaved"):
+                status["warnings"].insert(0, "NOT SAVED — these exclusion results exist only in this session.")
         else:
             active = None
             try:

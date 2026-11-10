@@ -99,3 +99,35 @@ These are in **Plugins ▸ Subsea Cable Tools**. The main toolbar has **KP Mouse
 The [KP and bathymetry methods](docs/KP_AND_BATHYMETRY.md) explain distance, depth and slope conventions. The [changelog](CHANGELOG.md) records releases. Contributions and [pull requests](https://github.com/k-mcmonagle/subsea-cable-tools/pulls) are welcome. Please report bugs and suggestions in the [issue tracker](https://github.com/k-mcmonagle/subsea-cable-tools/issues).
 
 Ground Model numeric datasets: see the [dataset workflow](docs/GROUND_NUMERIC_PROFILES.md) for investigation data in tables; CPTs delivered as AGS files are imported directly (see [CPTs from AGS files](docs/GEOTECHNICAL_CPT.md)).
+## Damaged or conflicting Burial Planner files
+
+If SQLite reports **database disk image is malformed**, the affected write failed.
+Exclusion results can remain visible in the current session without being saved;
+the planner marks them **NOT SAVED** and stops generation after that failure.
+Other edits may have reached the file, so keep every candidate copy.
+
+For OneDrive / SharePoint conflicts, close QGIS on all editing machines and pause
+sync before copying or recovering files. Preserve each GeoPackage together with
+any matching `-wal`, `-shm` and `-journal` files; do not delete those sidecars or
+replace a recent backup-named file with an older original based on its name.
+
+Use **Burial Planner → Plan file… → Check / recover GeoPackages…** to select
+copies and compare SQLite integrity, saved plan names and modification times,
+change-log times, and stored row counts. File timestamps alone cannot establish
+which copy has the intended work. Damaged files can produce incomplete summaries.
+The check is available even when a plan file cannot be opened.
+
+**Create checked copy…** makes a new SQLite snapshot including committed WAL
+data. **Try index repair in a new copy…** also rebuilds indexes in that copy and
+keeps the output only if its SQLite integrity check passes. This can fix some
+index damage; it cannot salvage unreadable table pages, merge conflicting edits,
+or recover changes that never saved. Review the recovered plans before adopting
+the new file using **Open existing plans…**. A passing SQLite check does not
+validate every geometry, external source link, or plan decision.
+
+Starting a new file is a reasonable alternative when rebuilding is easier.
+Keep working GeoPackages in an unsynced local folder with one editor at a time.
+Hand off checked snapshots after closing QGIS; cloud file sync does not coordinate
+concurrent database edits. Burial Planner, Workbench and Planner migrations now
+require checked SQLite snapshots before changing an older schema, preserve
+existing backups, and stop if a backup fails.

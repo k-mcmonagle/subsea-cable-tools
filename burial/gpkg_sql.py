@@ -12,9 +12,9 @@ transactions.
 No QGIS imports (``plugin_log`` falls back to stdlib logging) so the
 behaviour is unit-testable headlessly. Connections are cached per file with
 ``journal_mode=WAL`` and ``synchronous=NORMAL`` (network shares excepted,
-below); ``checkpoint(truncate=True)`` folds the WAL back
-into the main file before backups/copies so a copied ``.gpkg`` is complete
-without its sidecar files.
+below). Backups always use the SQLite backup API and validate the new
+file; a checkpoint alone cannot make a later raw copy safe while other
+connections can still write.
 
 The journal mode is persisted in the database file, so ``connect`` is only
 for files already confirmed as plan registries (or being created as one):
@@ -37,6 +37,7 @@ from typing import Dict, List, Optional, Sequence
 from urllib.parse import quote
 
 from ..plugin_log import log_warning
+from ..geopackage_health import checked_snapshot, is_corruption
 
 _connections: Dict[str, sqlite3.Connection] = {}
 
@@ -109,7 +110,9 @@ def has_table(path: str, table: str) -> bool:
     if conn is not None:
         try:
             return table_exists(conn, table)
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            if is_corruption(exc):
+                raise
             pass  # stale cached handle: answer from a fresh read below
     if not os.path.exists(path):
         return False
@@ -177,7 +180,7 @@ def _configure_journal(conn: sqlite3.Connection, path: str) -> None:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
     except sqlite3.OperationalError as exc:
-        if is_transient(exc):
+        if is_transient(exc) or is_corruption(exc):
             raise
         # Read-only file or folder: WAL cannot be switched on, but reads
         # work and a write fails cleanly with a "readonly database" error.
@@ -188,14 +191,13 @@ def _configure_journal(conn: sqlite3.Connection, path: str) -> None:
 def checkpoint(path: str, truncate: bool = False) -> bool:
     """Fold the WAL into the main database file (best effort).
 
-    Returns True when the WAL is known to be fully folded (or there is no
-    cached connection, so no WAL of ours to fold); False when a concurrent
-    reader blocked the checkpoint and frames remain in the ``-wal`` sidecar
-    — a plain file copy of the main database would then miss those frames.
+    Returns True when the WAL is fully folded at this instant (or absent).
+    False means frames may remain in the ``-wal`` sidecar. Neither result
+    authorises a raw file copy while other connections can still write.
     """
     conn = _connections.get(_key(path))
     if conn is None:
-        return True
+        return not os.path.exists(path + "-wal")
     mode = "TRUNCATE" if truncate else "PASSIVE"
     try:
         row = conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
@@ -211,27 +213,11 @@ def checkpoint(path: str, truncate: bool = False) -> bool:
 
 
 def backup_to(path: str, target: str) -> bool:
-    """Consistent snapshot via the SQLite backup API (WAL-safe).
-
-    Used when a checkpoint could not fully fold the WAL: the backup API
-    reads through the live connection, so the copy includes every
-    committed transaction regardless of sidecar state.
-    """
-    conn = _connections.get(_key(path))
-    if conn is None:
-        return False
+    """WAL-safe, checked snapshot; refuses to overwrite existing output."""
     try:
-        dest = sqlite3.connect(target)
-        try:
-            conn.backup(dest)
-        finally:
-            dest.close()
+        checked_snapshot(path, target)
         return True
-    except sqlite3.Error:
-        try:
-            os.remove(target)  # never leave a half-written backup behind
-        except OSError:
-            pass
+    except (sqlite3.Error, OSError, TimeoutError):
         return False
 
 
@@ -281,10 +267,10 @@ def transaction(conn: sqlite3.Connection):
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
+        conn.commit()
     except Exception:
         conn.rollback()
         raise
-    conn.commit()
 
 
 def read_rows(conn: sqlite3.Connection, table: str,
