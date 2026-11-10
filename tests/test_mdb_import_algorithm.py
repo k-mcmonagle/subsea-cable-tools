@@ -5,6 +5,7 @@ import os
 import math
 import tempfile
 import gc
+import json
 
 from qgis.core import (
     QgsCoordinateReferenceSystem,
@@ -539,8 +540,93 @@ def test_table_summary_reports_secondary_geometry():
     return _result("summary reports secondary geometry columns", ok, summary)
 
 
+def test_conversion_isolated_end_to_end():
+    """Exercise the actual child interpreter, writer and parent layer loading."""
+    class SyntheticImport(ImportMdbAlgorithm):
+        def _run_worker(self, args, feedback, **kwargs):
+            if args[:2] == ['--mode', 'export']:
+                path = args[args.index('--out') + 1] + '.geojson'
+                with open(path, 'w', encoding='utf-8') as handle:
+                    json.dump({'type': 'FeatureCollection', 'features': [{
+                        'type': 'Feature',
+                        'geometry': {'type': 'Point', 'coordinates': [500100, 5600100, -12]},
+                        'properties': {'Depth': 12, 'depth': 34, 'fid': 9, 'label': 'café',
+                                       'label_text': 'Café 12°\nmarker 😀',
+                                       'label_rotation': 35.0, 'label_alignment': 9},
+                    }]}, handle)
+                return {'outputs': {'Point': path}, 'feature_counts': {'Point': 1}}
+            return super()._run_worker(args, feedback, **kwargs)
+
+    with tempfile.TemporaryDirectory() as folder:
+        mdb = os.path.join(folder, 'synthetic.mdb')
+        with open(mdb, 'wb'):
+            pass
+        context = QgsProcessingContext()
+        feedback = _Feedback()
+        results = SyntheticImport()._process_mdb_file(
+            mdb, QgsCoordinateReferenceSystem('EPSG:32631'), context, feedback,
+            isolate=True, keep_temp=False, load_all_geoms=False, max_features=0,
+            listing={'tables': {'Soundings': {'geom_field_name': 'Geometry',
+                                             'geometry_type_code': 1}}})
+        layer = context.temporaryLayerStore().mapLayer(next(iter(results.values())))
+        feature = next(layer.getFeatures())
+        ok = (layer.isValid() and layer.featureCount() == 1
+              and layer.crs().authid() == 'EPSG:32631'
+              and feature['Depth'] == 12 and feature['depth_2'] == 34
+              and feature['source_fid'] == 9 and feature['label'] == 'café'
+              and feature['label_text'] == 'Café 12°\nmarker 😀'
+              and feature['label_rotation'] == 35.0 and feature['label_alignment'] == 9
+              and feature.geometry().asPoint().x() == 500100)
+    return _result('GeoJSON conversion runs in a child and preserves attributes/CRS', ok)
+
+
+def test_native_worker_crash_is_reported():
+    class CrashedProcess:
+        returncode = -1073741819  # Windows access violation
+
+        def communicate(self, timeout=None):
+            return '', ''
+
+    original = mdb_import.subprocess.Popen
+    mdb_import.subprocess.Popen = lambda *args, **kwargs: CrashedProcess()
+    try:
+        try:
+            ImportMdbAlgorithm()._run_worker([], _Feedback(), worker_script='mdb_convert_worker.py')
+        except QgsProcessingException as exc:
+            ok = '-1073741819' in str(exc)
+        else:
+            ok = False
+    finally:
+        mdb_import.subprocess.Popen = original
+    return _result('native conversion crash becomes a Processing error', ok)
+
+
+def test_unsafe_in_process_setting_is_refused():
+    previous = os.environ.get('SUBSEA_MDB_NO_SUBPROCESS')
+    os.environ['SUBSEA_MDB_NO_SUBPROCESS'] = '1'
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            files = _empty_files(folder, 'synthetic.mdb')
+            algorithm = _FakeImport(files, {}, user_crs='EPSG:4326')
+            try:
+                algorithm.processAlgorithm({}, QgsProcessingContext(), _Feedback())
+            except QgsProcessingException as exc:
+                ok = 'SUBSEA_MDB_NO_SUBPROCESS' in str(exc) and not algorithm.preflighted
+            else:
+                ok = False
+    finally:
+        if previous is None:
+            os.environ.pop('SUBSEA_MDB_NO_SUBPROCESS', None)
+        else:
+            os.environ['SUBSEA_MDB_NO_SUBPROCESS'] = previous
+    return _result('unsafe in-process setting is refused before reading an MDB', ok)
+
+
 def run_all():
     return [
+        test_conversion_isolated_end_to_end(),
+        test_native_worker_crash_is_reported(),
+        test_unsafe_in_process_setting_is_refused(),
         test_multi_file_parameter(),
         test_output_layer_details(),
         test_isolated_output_is_disk_backed(),

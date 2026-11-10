@@ -320,9 +320,13 @@ def classify_table(table_name, col_names=(), in_gfeatures=False):
         return "metadata"
     if in_gfeatures:
         return "feature"
+    # Annotation suffixes alone do not make a table non-spatial: many
+    # unregistered *_Text / *_Name tables have their own text geometry.
+    if find_candidate_geometry_fields(col_names):
+        return "spatial_candidate"
     if upper.endswith(_COMPANION_SUFFIXES):
         return "companion"
-    if find_candidate_geometry_fields(col_names) or find_candidate_coordinate_pair(col_names):
+    if find_candidate_coordinate_pair(col_names):
         return "spatial_candidate"
     return "non_spatial"
 
@@ -995,6 +999,19 @@ def _write_rows_to_geojson(mdb_path, table_name, col_names, rows,
     output at all, so the caller never has to infer failure from a missing file.
     """
     col_names = list(col_names)
+    # Resolve once for the entire table, including source columns whose value
+    # is null on a particular row. Never overwrite an existing gm_* column.
+    reserved = {name.casefold() for name in col_names}
+    label_fields = {}
+    for name in ("label_text", "label_rotation", "label_alignment", "label_rtf"):
+        candidate = name if name.casefold() not in reserved else "gm_" + name
+        base = candidate
+        suffix = 2
+        while candidate.casefold() in reserved:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        reserved.add(candidate.casefold())
+        label_fields[name] = candidate
     rows = iter(rows)
     # Look at the first rows to recognise BLOB columns by content; they are
     # replayed ahead of the rest, so nothing is consumed.
@@ -1138,9 +1155,7 @@ def _write_rows_to_geojson(mdb_path, table_name, col_names, rows,
             props["source"] = source_name
             props["geometry_source"] = geometry_source
             for key, value in (label_props or {}).items():
-                if key in props:
-                    key = "gm_" + key
-                props[key] = value
+                props[label_fields[key]] = value
 
             feature = {"type": "Feature", "geometry": geometry, "properties": props}
             if not sink.write(str(kind), feature):

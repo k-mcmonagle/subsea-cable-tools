@@ -26,6 +26,7 @@ except Exception:  # pragma: no cover
     pyodbc = None
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
+    QgsApplication,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsPointXY,
@@ -745,8 +746,8 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
         ))
         self.addOutput(QgsProcessingOutputMultipleLayers(self.OUTPUT_LAYERS, self.tr('Imported Layers')))
 
-    def _run_worker(self, args, feedback, timeout=600):
-        worker_path = os.path.join(os.path.dirname(__file__), 'mdb_odbc_worker.py')
+    def _run_worker(self, args, feedback, timeout=600, worker_script='mdb_odbc_worker.py'):
+        worker_path = os.path.join(os.path.dirname(__file__), worker_script)
 
         # In QGIS on Windows, sys.executable is often qgis-bin.exe (NOT a Python interpreter).
         # Prefer the bundled python3.exe / python.exe next to qgis-bin.exe.
@@ -767,10 +768,11 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
                 python_exe = c
                 break
         if not python_exe:
-            # Fallback: last resort (may still be qgis-bin.exe)
-            python_exe = sys.executable
+            raise QgsProcessingException(
+                'No Python interpreter found for the MDB worker. Set '
+                'QGIS_PYTHON_EXECUTABLE to the Python executable bundled with QGIS.')
 
-        cmd = [python_exe, '-u', worker_path] + args
+        cmd = [python_exe, '-u', '-X', 'faulthandler', worker_path] + args
         feedback.pushInfo('Running MDB worker: ' + ' '.join(cmd))
         if feedback.isCanceled():
             raise QgsProcessingException('MDB import canceled.')
@@ -780,6 +782,9 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
+                env=dict(os.environ, PYTHONIOENCODING='utf-8'),
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
             )
             deadline = None if not timeout else time.monotonic() + timeout
@@ -836,8 +841,10 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
             msg = (stderr or stdout or '').strip()
             if not msg:
                 msg = (
-                    f"MDB worker failed with exit code {process.returncode}. "
-                    "This often indicates a native ODBC/Access driver crash or bitness mismatch."
+                    f"MDB worker {worker_script} failed with exit code {process.returncode} "
+                    f"(0x{process.returncode & 0xffffffff:08X}). "
+                    "The child process may have crashed in a native library or run out of memory. "
+                    "The import was stopped; check the current table in the Processing log."
                 )
             raise QgsProcessingException(msg)
 
@@ -910,6 +917,10 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
         )
 
         isolate = os.environ.get('SUBSEA_MDB_NO_SUBPROCESS', '0') not in {'1', 'true', 'True'}
+        if not isolate:
+            raise QgsProcessingException(
+                'SUBSEA_MDB_NO_SUBPROCESS disables crash protection. Remove this '
+                'environment setting and restart QGIS before importing MDB files.')
         keep_temp = os.environ.get('SUBSEA_MDB_KEEP_TEMP', '0') in {'1', 'true', 'True'}
         load_all_geoms = os.environ.get('SUBSEA_MDB_LOAD_ALL_GEOMS', '0') in {'1', 'true', 'True'}
         schema_discovery = os.environ.get('SUBSEA_MDB_SCHEMA_DISCOVERY', '0') in {'1', 'true', 'True'}
@@ -1309,13 +1320,31 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
                     if len(outputs) > 1:
                         table_label = f"{table_name} ({geom_type_name})"
                     layer_name = f"{file_ref} - {table_label}"
-                    src_layer = QgsVectorLayer(path, layer_name, 'ogr')
-                    if not src_layer.isValid():
-                        feedback.reportError(f'Skipping {layer_name}: output layer invalid')
-                        continue
-                    layer = _save(src_layer, layer_name, table_label, table_name)
-                    if layer is None:
-                        continue
+                    crs = _crs_for(table_name)
+                    if output_gpkg:
+                        gpkg_path = output_gpkg
+                        table = gpkg_table_name(table_label, saved_tables)
+                        saved_tables.append(table)
+                    else:
+                        table = _safe_temp_stem(layer_name)
+                        gpkg_path = processing_generate_temp_filename(table + '.gpkg', context)
+                    feedback.pushInfo(f'  Converting {layer_name} to GeoPackage in a separate process')
+                    conversion = self._run_worker(
+                        ['--input', path, '--output', gpkg_path, '--table', table,
+                         '--crs', crs.toWkt(), '--prefix', QgsApplication.prefixPath()],
+                        feedback, worker_script='mdb_convert_worker.py')
+                    renamed = (conversion or {}).get('renamed_fields', {})
+                    if renamed:
+                        feedback.pushInfo('  Renamed for GeoPackage: ' + ', '.join(
+                            f'{old} -> {new}' for old, new in sorted(renamed.items())))
+                    # Only the completed GeoPackage enters the QGIS process. Raw
+                    # GeoJSON parsing and native writer callbacks stay isolated.
+                    layer = QgsVectorLayer(gpkg_layer_uri(gpkg_path, table), layer_name, 'ogr')
+                    if not layer.isValid():
+                        raise QgsProcessingException(f'Could not open converted layer {layer_name}')
+                    warning = extent_crs_warning(layer.extent(), crs, context.transformContext())
+                    if warning:
+                        implausible.append(f'{layer_name}: {warning}')
 
                     self._register_output_layer(context, layer, layer_name, file_name)
                     output_layers[f"{output_namespace}::{table_name}::{geom_type_name}"] = layer.id()
@@ -1472,7 +1501,7 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
     <li><b>source:</b> The filename of the source MDB file for per-feature traceability.</li>
     <li><b>geometry_source:</b> <code>blob</code> when the geometry came from the GeoMedia BLOB, or <code>xy_fallback</code> when it was built from a coordinate pair.</li>
 </ul>
-Text features additionally carry:
+Text features additionally carry (existing source fields are preserved; conflicting generated names gain a <code>gm_</code> prefix and, if needed, a numeric suffix):
 <ul>
   <li><b>label_text:</b> the label string (plain text; rich-text labels are converted, with the original kept in <b>label_rtf</b>).</li>
   <li><b>label_rotation:</b> GeoMedia's label angle in degrees counter-clockwise. QGIS rotates labels clockwise, so use <code>-"label_rotation"</code> as the data-defined label rotation.</li>
@@ -1484,7 +1513,7 @@ Text features additionally carry:
 <h4>Prerequisites</h4>
 <p><b>None for typical files:</b> the plugin bundles a pure-Python MDB reader, so the tool works out of the box on Windows, macOS, and Linux &mdash; no Microsoft Access Database Engine, ODBC driver, or pyodbc installation is needed.</p>
 <p>If the bundled reader cannot handle a particular file (for example a password-protected or unusual Jet variant), the tool automatically falls back to ODBC, which requires Windows with the <b>Microsoft Access Database Engine</b> driver and <code>pyodbc</code> installed in the QGIS Python environment.</p>
-<p><b>Stability note:</b> Each MDB is read sequentially in a separate, cancellable subprocess. Results are converted to indexed, disk-backed temporary GeoPackages instead of being copied into RAM. Progress shows the current database and table. Large batches can still take time and require temporary disk space; the tool checks for practical free-space headroom before each file.</p>
+<p><b>Stability note:</b> MDB reading and GeoJSON-to-GeoPackage conversion run sequentially in separate, cancellable subprocesses. Results are converted to indexed, disk-backed temporary GeoPackages instead of being copied into RAM. Progress shows the current database and table. Large batches can still take time and require temporary disk space; the tool checks for practical free-space headroom before each file.</p>
 
 <h4>Input Parameters</h4>
 <ul>
@@ -1512,7 +1541,7 @@ Text features additionally carry:
       <li><code>SUBSEA_MDB_MAX_FEATURES=N</code> &ndash; limits rows per table</li>
       <li><code>SUBSEA_MDB_LOAD_ALL_GEOMS=1</code> &ndash; also loads MultiPoint and other multi-part layers (default loads LineString, Polygon, and Point)</li>
       <li><code>SUBSEA_MDB_SCHEMA_DISCOVERY=1</code> &ndash; also inspects physical tables missing from <code>GFeatures</code> (slower; <code>SUBSEA_MDB_SCHEMA_BUDGET=N</code> caps the inspection at N seconds, default 30)</li>
-      <li><code>SUBSEA_MDB_NO_SUBPROCESS=1</code> &ndash; forces in-process ODBC (not recommended; may crash QGIS)</li>
+      <li><code>SUBSEA_MDB_NO_SUBPROCESS=1</code> &ndash; no longer supported; remove this setting to enable crash protection</li>
     </ul>
   </li>
 </ul>

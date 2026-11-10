@@ -230,8 +230,8 @@ def rtf_to_text(rtf):
                 skip, unicode_fallback = stack.pop()
             continue
         # A \uN character is followed by fallback characters for old readers.
-        if pending_fallback and (literal or hex_code):
-            if hex_code:
+        if pending_fallback and (literal or hex_code or symbol in ('\\', '{', '}', '~', '-')):
+            if hex_code or symbol:
                 pending_fallback -= 1
                 continue
             dropped = min(pending_fallback, len(literal))
@@ -243,7 +243,7 @@ def rtf_to_text(rtf):
             if word in _RTF_SKIPPED_DESTINATIONS:
                 skip = True
             elif word == "uc":
-                unicode_fallback = int(arg or 1)
+                unicode_fallback = max(0, int(arg or 1))
             elif word == "u":
                 if not skip and arg:
                     out.append(chr(int(arg) & 0xFFFF))
@@ -268,7 +268,12 @@ def rtf_to_text(rtf):
             out.append(bytes([int(hex_code, 16)]).decode("cp1252", "replace"))
         elif literal:
             out.append(literal)
-    return "".join(out).strip()
+    # RTF Unicode escapes represent UTF-16 code units. Combine surrogate
+    # pairs before UTF-8/JSON export; malformed lone units become replacement
+    # characters rather than aborting the whole table. Escaped NULs must not
+    # reach GDAL's C strings either.
+    return ("".join(out).encode("utf-16-le", "surrogatepass")
+            .decode("utf-16-le", "replace").replace("\x00", "").strip())
 
 
 def is_rtf(text):
