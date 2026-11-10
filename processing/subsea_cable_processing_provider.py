@@ -72,6 +72,7 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
         safe_add('rpl_route_comparison_algorithm', 'RPLRouteComparisonAlgorithm')
         safe_add('seabed_length_algorithm', 'SeabedLengthAlgorithm')
         safe_add('translate_kp_from_rpl_to_rpl_algorithm', 'TranslateKPFromRPLToRPLAlgorithm')
+        safe_add('translate_kp_values_algorithm', 'TranslateKPValuesAlgorithm')
 
         # --- Cable Lay Data Import ---
         safe_add('create_cable_lay_geopackage_algorithm', 'CreateCableLayGeoPackageAlgorithm')

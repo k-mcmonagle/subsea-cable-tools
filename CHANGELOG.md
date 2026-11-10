@@ -24,6 +24,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **Translate KPs and Ranges Between RPLs:** translate KP fields, non-spatial tables, pasted lists or point/line geometry, preserving attributes and reporting ranges that need review; optionally rebuild accepted points and ranges on the new route. Available in Processing and from the KP Mouse Tool's right-click menu; numeric inputs must use the selected old route's measured KP basis.
+
 - **Burial Planner — Ground Model horizons (beta - check outputs):** import interpreted horizons from 2D DXF sections, calibrate their KP and depth references, and show, rename, recolour or edit their vertices over the ground plot. Horizons are saved with the plan without changing soil classes or burial calculations; check the import preview and reference warnings before use.
 
 ### Improved

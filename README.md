@@ -25,6 +25,7 @@ Find these in the QGIS Processing Toolbox under **Subsea Cable Tools**.
 - **Add RPL Layers to Workbench** — register existing RPL point and line layers.
 - **Compare Design vs As-Laid Routes** — pair design and as-laid events (tolerating renamed or mistyped events) and report along-track, cross-course and radial offsets; the Workbench's *Compare RPLs ▸ Events* tab does the same interactively ([method](docs/RPL_EVENT_COMPARISON.md)).
 - **Translate KP Between RPLs (Points)** — transfer point KPs between route references.
+- **Translate KPs and Ranges Between RPLs** — translate KP fields, tables, pasted lists or point/line geometry; retain source attributes and review flags, with optional points/ranges on the new route ([guide](docs/KP_TRANSLATION.md)).
 - **Extract A/C Points from RPL** — extract alter-course positions.
 - **Identify RPL Crossing Points** — locate route crossings.
 - **Identify RPL Area Listing** — list areas crossed by a route.

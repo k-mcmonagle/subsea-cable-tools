@@ -590,6 +590,8 @@ class KPMouseMapTool(QgsMapTool):
             else:
                 act_goto_kp = None
 
+            act_translate = menu.addAction("Translate KPs to Another RPL...")
+            act_translate.setEnabled(self._route is not None and self.layer is not None)
             comment_actions = self._add_comment_menu(menu, click_point)
 
             chosen = qt_exec(menu, QCursor.pos())
@@ -614,6 +616,27 @@ class KPMouseMapTool(QgsMapTool):
                 self._show_go_to_kp_dialog()
             elif act_copy and chosen == act_copy:
                 self._copy_kp_to_clipboard()
+            elif chosen == act_translate:
+                self._show_kp_translation(click_point)
+
+    def _show_kp_translation(self, click_point):
+        """Open the shared Processing tool using this mouse tool's KP basis."""
+        if self._route is None or self.layer is None:
+            return
+        from qgis import processing
+        parameters = {
+            "OLD": self.layer.id(), "OLD_START": self._route.start_kp_km,
+            "OLD_MODE": 1 if self.useCartesian else 0, "INPUT_MODE": 1,
+        }
+        if self.useCartesian:
+            distance = self.distanceArea
+            grid = distance.grid_crs() if hasattr(distance, "grid_crs") else distance.sourceCrs()
+            if grid is not None and grid.isValid():
+                parameters["OLD_GRID"] = grid.authid() or grid.toWkt()
+        hit = self._locate(click_point)
+        if hit is not None:
+            parameters["PASTE"] = repr(hit.kp_km)
+        processing.execAlgorithmDialog("subsea_cable_processing:translate_kp_values", parameters)
 
     # --- Route Comments ---
     def _add_comment_menu(self, menu, click_point) -> dict:
