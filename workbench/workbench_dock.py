@@ -168,6 +168,8 @@ class WorkbenchDock(QDockWidget):
         self.stack.addWidget(self.rpl_panel)
         self.assembly_panel = AssemblyManagerPanel(iface, embedded=True)
         self.stack.addWidget(self.assembly_panel)
+        self.assembly_panel.ensure_store_file = self._ensure_workbench_file
+        self.rpl_panel.ensure_store_file = self._ensure_workbench_file
         self.assessment_panel = AssessmentPanel(iface, embedded=True)
         self.stack.addWidget(self.assessment_panel)
 
@@ -570,30 +572,32 @@ class WorkbenchDock(QDockWidget):
     def _create_new_workbench(self):
         if not self._can_switch_workbench():
             return
-        path, _selected_filter = QFileDialog.getSaveFileName(
-            self,
-            "Create Cable Route Workbench",
-            self._workbench_dialog_folder(),
-            "GeoPackage (*.gpkg)",
-        )
+        from ..project_storage import choose_new_gpkg
+        from .store import default_project_gpkg_path
+
+        path = choose_new_gpkg(self, "Create Cable Route Workbench",
+                               default_project_gpkg_path(prefer_existing=False))
         if not path:
-            return
-        if not path.lower().endswith(".gpkg"):
-            path += ".gpkg"
-        if os.path.exists(path):
-            QMessageBox.warning(
-                self,
-                "Create Workbench",
-                "That file already exists. Use 'Open existing Workbench...' to open it, "
-                "or choose a new filename.",
-            )
-            return
+            return False
         try:
             store = self._prepare_workbench(path, create=True)
         except Exception as exc:
             QMessageBox.warning(self, "Create Workbench", f"Could not create the Workbench:\n{exc}")
-            return
-        self._switch_workbench(store)
+            return False
+        return self._switch_workbench(store)
+
+    def _ensure_workbench_file(self):
+        """First write chooses a file; a missing saved file must be located."""
+        from .store import project_gpkg_path
+
+        store = self._store()
+        if store is not None and store.exists():
+            return True
+        if project_gpkg_path():
+            QMessageBox.information(self, "Cable Route Workbench", "The saved Workbench file is unavailable. "
+                                    "Use File → Open existing Workbench to select its new location.")
+            return False
+        return bool(self._create_new_workbench())
 
     @staticmethod
     def _prepare_workbench(path: str, create: bool = False):
@@ -637,6 +641,10 @@ class WorkbenchDock(QDockWidget):
         old_store = self.rpl_panel.store
         old_path = old_store.gpkg_path if old_store is not None else ""
         new_path = store.gpkg_path
+        from ..project_storage import repair_project_layers, stored_project_path
+        project = QgsProject.instance()
+        previous = stored_project_path(project, "workbench_gpkg") or old_path
+        repair_project_layers(project, previous, new_path)
 
         # Remove only layers registered by the old Workbench, and mute the
         # normal layer-removal synchroniser so switching files never deletes
@@ -1044,6 +1052,8 @@ class WorkbenchDock(QDockWidget):
 
     # ---------------------------------------------------------- actions --
     def _new_route(self):
+        if not self._ensure_workbench_file():
+            return
         store = self._store()
         if store is None:
             return
@@ -1061,6 +1071,8 @@ class WorkbenchDock(QDockWidget):
         self._select_ref((KIND_ROUTE, route_id))
 
     def _new_system(self):
+        if not self._ensure_workbench_file():
+            return
         store = self._store()
         if store is None:
             return
@@ -1074,6 +1086,8 @@ class WorkbenchDock(QDockWidget):
         self._select_ref((KIND_SYSTEM, system_id))
 
     def _new_assembly(self):
+        if not self._ensure_workbench_file():
+            return
         self.assembly_panel.browser.setVisible(True)
         self.stack.setCurrentWidget(self.assembly_panel)
         self.assembly_panel._new_assembly()
@@ -1233,6 +1247,8 @@ class WorkbenchDock(QDockWidget):
 
     def _import_rpl(self):
         """Open the guided Import RPL wizard from the workbench tree."""
+        if not self._ensure_workbench_file():
+            return
         self.stack.setCurrentWidget(self.rpl_panel)
         store = self._store()
         route_id = self._selected_route_id()
@@ -1245,6 +1261,8 @@ class WorkbenchDock(QDockWidget):
 
     def _import_rpl_from_line(self):
         """Register a bare route line or point sequence as an RPL revision."""
+        if not self._ensure_workbench_file():
+            return
         store = self._store()
         if store is None:
             QMessageBox.information(
@@ -1271,6 +1289,8 @@ class WorkbenchDock(QDockWidget):
 
     def _import_path_file(self):
         """Import a path file (.pthmdb) as an RPL revision."""
+        if not self._ensure_workbench_file():
+            return
         store = self._store()
         if store is None:
             QMessageBox.information(
@@ -1391,6 +1411,8 @@ class WorkbenchDock(QDockWidget):
             self._open_topology_for_system(system_id)
 
     def _register_rpl(self):
+        if not self._ensure_workbench_file():
+            return
         self.stack.setCurrentWidget(self.rpl_panel)
         self.rpl_panel._run_register_algorithm(self._register_rpl_defaults())
         self.refresh_tree()

@@ -188,7 +188,6 @@ class BurialPlannerDock(QDockWidget):
         self._cursor_outline_enabled = False
         self._cursor_outline_pos = None
         self._cursor_outline_timer = None
-        self._store_recovery_note = ""
         # Last highlighted (start, end) → canvas geometry: a row double-click
         # highlights on selection and again on go-to; slice the route once.
         self._highlight_cache = None
@@ -214,21 +213,23 @@ class BurialPlannerDock(QDockWidget):
 
         saved_path = project_gpkg_path()
         path = saved_path or default_project_gpkg_path()
-        self.store, path, error = self._open_store_with_recovery(
-            path, create_if_missing=not bool(saved_path))
-        self.store_ready = not error
-        if not self.store_ready:
+        if not saved_path and not os.path.isfile(path):
+            self.store, error = DetachedStore(path), None
+        else:
+            self.store, path, error = self._open_store_with_recovery(path, create_if_missing=False)
+        self.store_ready = not error and not self.store.detached
+        if error and os.path.isfile(path):
             self._store_error_path = _path_key(path)
             QMessageBox.warning(None, "Burial Planner",
                                 error if self._store_error_newer else
                                 "Could not open or migrate the Burial Planner "
                                 f"GeoPackage.\n{error}\n\nUse Plan file → Open "
                                 "existing plans to locate the original file.")
-        elif not saved_path:
+        elif saved_path and self.store_ready:
+            from ..project_storage import repair_project_layers, stored_project_path
+            project = QgsProject.instance()
+            repair_project_layers(project, stored_project_path(project, "burial_gpkg"), path)
             set_project_gpkg_path(path)
-        elif self._store_recovery_note:
-            QMessageBox.warning(None, "Burial Planner",
-                                self._store_recovery_note)
 
         self.model = PlanModel(self.store, self.workbench_store())
         self.model.storeError.connect(self._on_store_error)
@@ -434,9 +435,8 @@ class BurialPlannerDock(QDockWidget):
 
     # -- store lifecycle ------------------------------------------------------
     def _open_store_with_recovery(self, path: str,
-                                  create_if_missing: bool = True):
+                                  create_if_missing: bool = False):
         """Open the project store without silently replacing lost plans."""
-        self._store_recovery_note = ""
         self._store_error_newer = False
         try:
             store = BurialStore(path)
@@ -452,28 +452,8 @@ class BurialPlannerDock(QDockWidget):
             self._store_error_newer = True
             return DetachedStore(path), path, str(exc)
         except Exception as first_error:
-            fallback = default_project_gpkg_path()
-            same_path = (os.path.normcase(os.path.abspath(fallback)) ==
-                         os.path.normcase(os.path.abspath(path)))
-            if not same_path:
-                try:
-                    store = BurialStore(fallback)
-                    if not store.exists():
-                        raise ValueError("No existing fallback plan file.")
-                    store.migrate()
-                    set_project_gpkg_path(fallback)
-                    self._store_recovery_note = (
-                        "The plan file saved in this QGIS project could not "
-                        f"be opened:\n{path}\n\nOpened the existing project-"
-                        f"side plan file instead:\n{fallback}")
-                    return store, fallback, None
-                except Exception:
-                    # The first error is the one reported to the user.
-                    log_exception("Burial Planner: project-side fallback plan "
-                                  f"file not usable: {fallback}",
-                                  level=logging.DEBUG)
-            # Inert stand-in: nothing can be written anywhere until the user
-            # locates or creates a plan file.
+            # A missing saved file stays disconnected until Open existing.
+            # Never replace it with an empty file or a different default.
             return DetachedStore(path), path, str(first_error)
 
     @staticmethod
@@ -502,6 +482,10 @@ class BurialPlannerDock(QDockWidget):
                 "Installation path generation is still running. Stop it "
                 "and wait for it to finish before changing the plan file.")
             return False
+        from ..project_storage import repair_project_layers, stored_project_path
+        project = QgsProject.instance()
+        previous = stored_project_path(project, "burial_gpkg") or self.store.gpkg_path
+        selected = self.model.plan_id
         self._cancel_profile_refresh(silent=True)
         # Close the plan before the swap: a pending debounced layer write
         # lands in the file it belongs to.
@@ -509,9 +493,10 @@ class BurialPlannerDock(QDockWidget):
         self._remove_canvas_items()
         self._close_store()  # checkpoint + release the old SQL handle
         self._attach_store(store)
+        repair_project_layers(project, previous, path)
         set_project_gpkg_path(path)
         self.model.workbench_store = self.workbench_store()
-        self.refresh_plans()
+        self.refresh_plans(selected)
         return True
 
     def workbench_store(self, plan_hint: Optional[Dict] = None
@@ -669,8 +654,9 @@ class BurialPlannerDock(QDockWidget):
                 placeholder = ("No plans in this file — use Plan file… to "
                                "open an existing file")
             else:
-                placeholder = ("No plan file open — Plan ▾ New… starts "
-                               "one, Plan file… opens one")
+                placeholder = ("Plan file unavailable — Plan file… → Open existing plans"
+                               if project_gpkg_path() else
+                               "No plan file open — Plan ▾ New… starts one, Plan file… opens one")
             self.plan_combo.setPlaceholderText(placeholder)
         finally:
             self._loading = False
@@ -750,7 +736,7 @@ class BurialPlannerDock(QDockWidget):
             self.gpkg_name.setText(
                 f"{os.path.basename(self.store.gpkg_path)} ({state})")
         else:
-            self.gpkg_name.setText("No plan file")
+            self.gpkg_name.setText("Locate plan file…" if project_gpkg_path() else "No plan file")
         self.gpkg_name.setToolTip(self.store.gpkg_path)
         index = self.plan_combo.findData(self.model.plan_id)
         if index >= 0 and self.plan_combo.currentIndex() != index:
@@ -804,8 +790,9 @@ class BurialPlannerDock(QDockWidget):
 
     def _new_plan(self) -> None:
         if not self.store_ready and project_gpkg_path():
-            # The project's saved plan file could not be opened (already
-            # reported): locate it, or create one, via Plan file….
+            QMessageBox.information(self, "Burial Planner", "The saved plan file is unavailable. "
+                                    "Use Plan file → Open existing plans to select its new location, "
+                                    "or Create new plan file for a separate set of plans.")
             return
         name, ok = QInputDialog.getText(self, "New burial plan", "Name:")
         if not ok or not name.strip():
@@ -884,30 +871,21 @@ class BurialPlannerDock(QDockWidget):
             return
         self._switch_store(store, path)
 
-    def _new_gpkg(self) -> None:
+    def _new_gpkg(self) -> bool:
         """Create a fresh registry without overwriting an existing file."""
-        start = os.path.dirname(self.store.gpkg_path) or self.store.gpkg_path
-        path, _filter = QFileDialog.getSaveFileName(
-            self, "Create new Burial Planner plan file", start,
-            "GeoPackage (*.gpkg)")
+        from ..project_storage import choose_new_gpkg
+
+        path = choose_new_gpkg(self, "Create new Burial Planner plan file",
+                               default_project_gpkg_path(prefer_existing=False))
         if not path:
-            return
-        if not path.lower().endswith(".gpkg"):
-            path += ".gpkg"
-        if os.path.exists(path):
-            QMessageBox.warning(
-                self, "Burial Planner",
-                "That file already exists. Use Plan file → Open existing "
-                "plans to open it, or choose a new filename.")
-            return
+            return False
         try:
             store = BurialStore(path)
             store.migrate()
         except Exception as exc:
-            QMessageBox.warning(self, "Burial Planner",
-                                f"Could not create the plan file:\n{exc}")
-            return
-        self._switch_store(store, path)
+            QMessageBox.warning(self, "Burial Planner", f"Could not create the plan file:\n{exc}")
+            return False
+        return self._switch_store(store, path)
 
     # -- analysis orchestration -----------------------------------------------
     def request_analysis(self) -> None:
@@ -2426,7 +2404,7 @@ class BurialPlannerDock(QDockWidget):
                 self._attach_store(store)
             else:
                 self._detach_store(error_path)
-                if error and _path_key(error_path) != self._store_error_path:
+                if error and os.path.isfile(error_path) and _path_key(error_path) != self._store_error_path:
                     QMessageBox.warning(
                         self, "Burial Planner",
                         error if self._store_error_newer else
@@ -2472,6 +2450,9 @@ class BurialPlannerDock(QDockWidget):
 
     def _attach_store(self, store: BurialStore) -> None:
         """Make ``store`` this dock's (and the model's) plan file."""
+        from ..project_storage import repair_project_layers, stored_project_path
+        project = QgsProject.instance()
+        repair_project_layers(project, stored_project_path(project, "burial_gpkg"), store.gpkg_path)
         self.store = store
         self.store_ready = True
         self._store_error_path = ""
@@ -2504,19 +2485,8 @@ class BurialPlannerDock(QDockWidget):
         self.workflow_tabs.setEnabled(bool(self.store_ready))
 
     def _create_project_store(self) -> bool:
-        """Create (or open) the project's default plan file — on the user's
-        first New plan in a project without one."""
-        self._close_store()
-        store, path, error = self._open_store_with_recovery(
-            default_project_gpkg_path(), create_if_missing=True)
-        if error:
-            QMessageBox.warning(self, "Burial Planner",
-                                f"Could not create the plan file:\n{error}")
-            return False
-        self._attach_store(store)
-        set_project_gpkg_path(path)
-        self.model.workbench_store = self.workbench_store()
-        return True
+        """Ask for the first plan file; subsequent plans use the open file."""
+        return bool(self._new_gpkg())
 
     def _project_uses_planner(self) -> bool:
         """Whether the current project already works with the Burial

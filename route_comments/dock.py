@@ -66,12 +66,13 @@ def _theme_icon(name: str) -> QIcon:
 
 
 def default_register_path(project: Optional[QgsProject] = None) -> str:
-    """``<project folder>/<project>_comments.gpkg`` (plugin folder when unsaved)."""
+    """Suggest ``<project folder>/route_comments/<project>_comments.gpkg``."""
+    from ..project_storage import default_gpkg_path
     from ..workbench.schema import gpkg_folder_for, sanitize_slug
+
     project = project or QgsProject.instance()
-    path = project.fileName()
-    stem = os.path.splitext(os.path.basename(path))[0] if path else (sanitize_slug(project.title()) or "project")
-    return os.path.join(gpkg_folder_for(path), f"{stem}_comments.gpkg")
+    return default_gpkg_path(project.fileName(), project.title(), "route_comments", "comments",
+                             gpkg_folder_for, sanitize_slug, prefer_existing=False)
 
 
 def unused_register_path(path: str) -> str:
@@ -530,6 +531,10 @@ class RouteCommentsDock(QDockWidget):
 
     def new_register(self) -> bool:
         suggested = unused_register_path(default_register_path())
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(suggested)), exist_ok=True)
+        except OSError:
+            pass
         while True:
             # The dialog never confirms an overwrite: a register is never
             # replaced (other projects may use it), picking one is asked below.
@@ -581,6 +586,9 @@ class RouteCommentsDock(QDockWidget):
         except CommentStoreError as exc:
             self._error("Open register", exc)
             return False
+        from ..project_storage import repair_project_layers, stored_project_path
+        project = QgsProject.instance()
+        repair_project_layers(project, stored_project_path(project, "route_comments_register"), path)
         self._use_store(store)
         return True
 
@@ -701,7 +709,8 @@ class RouteCommentsDock(QDockWidget):
                               "<a href='open'>Open register…</a> Add comments from the KP Mouse Tool's "
                               "right-click menu.")
         else:
-            self._show_banner("")
+            self._show_banner("This register's image folder is missing. Move its _attachments folder beside "
+                              "the GeoPackage as well." if self.store.attachments_folder_missing() else "")
 
     def statuses(self) -> List[str]:
         return model.status_names(CommentStore.statuses_of(self.set_row))

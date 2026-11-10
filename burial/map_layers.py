@@ -56,7 +56,8 @@ def resolve_input_layer(project: Optional[QgsProject], input_row: Dict
         layer = project.mapLayer(hint)
         if layer is not None and layer.isValid():
             return layer
-    source = input_row.get("layer_source") or ""
+    from ..project_storage import resolve_source
+    source = resolve_source(project, input_row.get("layer_source") or "")
     if source:
         want = normalised_path(source.split("|")[0])
         for layer in project.mapLayers().values():
@@ -213,10 +214,11 @@ def find_layer_by_source(project: Optional[QgsProject], source: str,
                          want_raster: Optional[bool] = None
                          ) -> Optional[QgsMapLayer]:
     """A valid project layer with the same source identity, if any."""
-    wanted = source_identity(source)
+    project = project or QgsProject.instance()
+    from ..project_storage import resolve_source
+    wanted = source_identity(resolve_source(project, source))
     if not wanted:
         return None
-    project = project or QgsProject.instance()
     for layer in project.mapLayers().values():
         if want_raster is not None and (
                 isinstance(layer, QgsRasterLayer) != want_raster):
@@ -1479,12 +1481,8 @@ def discover_gpkg_path(project: Optional[QgsProject] = None) -> Optional[str]:
     saved = project_gpkg_path(project)
     if is_store(saved):
         return saved
-    project_file = project.fileName() or ""
-    folder = os.path.dirname(os.path.abspath(project_file)) if project_file else ""
-    if saved and folder:
-        relocated = os.path.join(folder, os.path.basename(saved))
-        if is_store(relocated):
-            return relocated
+    if saved:
+        return None
     fallback = default_project_gpkg_path(project)
     if is_store(fallback):
         return fallback
@@ -1514,8 +1512,11 @@ def restore_burial_layers(project: Optional[QgsProject] = None) -> int:
             return 0
         from ..workbench.project_layers import repair_layer
 
-        touched = 0
+        from ..project_storage import repair_project_layers, stored_project_path
+        touched = repair_project_layers(project, stored_project_path(project, "burial_gpkg"), gpkg_path)
         for layer in broken:
+            if layer.isValid():
+                continue
             name = _burial_layer_name(layer.source()) or schema.CPT_LAYER_NAME
             if open_gpkg_layer(gpkg_path, name) is None:
                 continue

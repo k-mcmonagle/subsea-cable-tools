@@ -96,6 +96,7 @@ class SubseaCableTools:
         self.actions = []
         self.menu = self.tr(u'&Subsea Cable Tools')
         self._project_hooks = []
+        self._storage_path_preprocessor = None
 
         # Components (initGui() recreates them if unload() released them)
         self.kp_mouse_tool = KPMouseTool(self.iface, menu_name=self.menu)
@@ -181,6 +182,9 @@ class SubseaCableTools:
     def initGui(self):
         """Create the menu entries and toolbar icons inside the QGIS GUI."""
         self._install_translator()
+        if self._storage_path_preprocessor is None:
+            from .project_storage import install_path_preprocessor
+            self._storage_path_preprocessor = install_path_preprocessor()
         self.menu = self.tr(u'&Subsea Cable Tools')
 
         # Register the processing provider (adds your algorithms to the Processing Toolbox)
@@ -476,6 +480,10 @@ class SubseaCableTools:
             QgsApplication.processingRegistry().removeProvider(provider)
 
     def _disconnect_project_hooks(self):
+        if self._storage_path_preprocessor is not None:
+            from qgis.core import QgsPathResolver
+            QgsPathResolver.removePathPreprocessor(self._storage_path_preprocessor)
+            self._storage_path_preprocessor = None
         hooks, self._project_hooks = self._project_hooks, []
         for slot in hooks:
             _quietly("disconnecting projectRead",

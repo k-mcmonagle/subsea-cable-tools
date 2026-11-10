@@ -404,7 +404,7 @@ class RplManagerPanel(QWidget):
 
         from .project_layers import discover_gpkg_path
 
-        path = discover_gpkg_path() or default_project_gpkg_path()
+        path = discover_gpkg_path() or project_gpkg_path() or default_project_gpkg_path()
         if self.store is None or not _same_path(self.store.gpkg_path, path):
             self.set_store(WorkbenchStore(path))
         # A stale entry is corrected straight away: the project already uses
@@ -1172,6 +1172,8 @@ class RplManagerPanel(QWidget):
 
     def _run_import_wizard(self, route_name: str = "", system_id: str = ""):
         """Open the guided Import RPL wizard (detection -> review -> commit)."""
+        if not getattr(self, "ensure_store_file", lambda: True)():
+            return
         try:
             from .rpl_import_wizard import RplImportWizard
 
@@ -1200,6 +1202,8 @@ class RplManagerPanel(QWidget):
                 self, "Import RPL", f"Could not open the import wizard:\n{exc}")
 
     def _run_register_algorithm(self, initial_parameters=None):
+        if not getattr(self, "ensure_store_file", lambda: True)():
+            return
         try:
             import processing
 

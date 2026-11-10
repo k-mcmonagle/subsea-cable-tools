@@ -86,18 +86,21 @@ class WorkbenchNewerError(WorkbenchStoreError, schema_guard.NewerVersionError):
 def project_gpkg_path(project: Optional[QgsProject] = None) -> Optional[str]:
     """Workbench GeoPackage path stored in the QGIS project, if any."""
     project = project or QgsProject.instance()
-    value, ok = project.readEntry(PROJECT_SCOPE, PROJECT_KEY_GPKG, "")
-    return value if ok and value else None
+    from ..project_storage import read_project_path
+
+    return read_project_path(project, PROJECT_KEY_GPKG, "workbench")
 
 
 def set_project_gpkg_path(path: str, project: Optional[QgsProject] = None) -> None:
     project = project or QgsProject.instance()
-    project.writeEntry(PROJECT_SCOPE, PROJECT_KEY_GPKG, path)
+    from ..project_storage import write_project_path
+
+    write_project_path(project, PROJECT_KEY_GPKG, path)
 
 
-def default_project_gpkg_path(project: Optional[QgsProject] = None) -> str:
+def default_project_gpkg_path(project: Optional[QgsProject] = None, prefer_existing: bool = True) -> str:
     project = project or QgsProject.instance()
-    return schema.default_gpkg_path(project.fileName(), project.title())
+    return schema.default_gpkg_path(project.fileName(), project.title(), prefer_existing)
 
 
 class WorkbenchStore:
@@ -321,6 +324,7 @@ class WorkbenchStore:
             return
         if self._tx_conn is not None:
             raise RuntimeError("Registry tables cannot be created inside a transaction.")
+        os.makedirs(os.path.dirname(os.path.abspath(self.gpkg_path)), exist_ok=True)
         existing = set()
         if os.path.exists(self.gpkg_path):
             try:

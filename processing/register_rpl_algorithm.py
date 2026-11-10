@@ -259,7 +259,12 @@ class RegisterRPLAlgorithm(SubseaCableAlgorithm):
 
         gpkg_path = (self.parameterAsString(parameters, self.GPKG_PATH, context) or "").strip()
         if not gpkg_path or gpkg_path.lower() in ("temporary_output", "temporary output"):
-            gpkg_path = project_gpkg_path(context.project()) or default_project_gpkg_path(context.project())
+            saved_path = project_gpkg_path(context.project())
+            if saved_path and not os.path.isfile(saved_path):
+                raise QgsProcessingException(self.tr(
+                    "The project's Workbench file is unavailable. Open the Cable Route Workbench "
+                    "and use File → Open existing Workbench to select its new location."))
+            gpkg_path = saved_path or default_project_gpkg_path(context.project())
 
         point_features = list(get_features_skip_invalid(points_source))
         line_features = list(get_features_skip_invalid(lines_source))
@@ -466,7 +471,7 @@ Adds an RPL point + line layer pair already loaded in the project (for example t
 - Uses Cable segment name as the stable route identity and creates one RPL revision under it.
 - Uses the supplied RPL revision label, or the next available Rev N label when left blank.
 - Names the registered RPL revision as cable segment + revision label, for example "S013 Rev 2".
-- Copies both layers into the workbench GeoPackage (default: <project>_workbench.gpkg beside the project file) and records the RPL revision in the registry.
+- Copies both layers into the workbench GeoPackage (default: workbench/<project>_workbench.gpkg beneath the project folder) and records the RPL revision in the registry.
 - Reuses the cable segment's system-topology endpoints A and B across every RPL revision, so the segment can be connected to joints or branching units without rewiring revisions.
 
 Use the RPL Manager dock to browse, edit, and fit assemblies onto registered RPLs.

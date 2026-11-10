@@ -383,7 +383,8 @@ class PlanModel(QObject):
                 lines_layer = None
         if lines_layer is None:
             # Fallback: a project line layer captured at plan creation.
-            source = self.plan.get("rpl_gpkg_path") or ""
+            from ..project_storage import resolve_source
+            source = resolve_source(project, self.plan.get("rpl_gpkg_path") or "")
             if source:
                 from qgis.core import QgsVectorLayer
 

@@ -149,11 +149,11 @@ def test_discovers_unique_custom_named_registry() -> bool:
     set_project_gpkg_path(os.path.join(folder, "missing", "old_workbench.gpkg"), project)
 
     found = project_layers.discover_gpkg_path(project)
-    ok = os.path.normcase(os.path.abspath(found or "")) == os.path.normcase(
-        os.path.abspath(store.gpkg_path)
-    )
+    # A different custom-named file is not a replacement for a missing
+    # explicit registry, even when it is the only other one in this folder.
+    ok = found is None and store.exists()
     project.clear()
-    return _result("discover unique custom-named Workbench", ok, found or "not found")
+    return _result("missing explicit Workbench requires user selection", ok, found or "not found")
 
 
 def test_discovery_does_not_guess_between_registries() -> bool:

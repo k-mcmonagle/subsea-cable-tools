@@ -392,13 +392,11 @@ def ensure_rpl_layers(project: Optional[QgsProject], gpkg_path: str, rpl_row: Di
 def discover_gpkg_path(project: Optional[QgsProject] = None) -> Optional[str]:
     """Find the project's existing Workbench registry without creating one.
 
-    Besides the saved entry and conventional filename, recover a registry
-    moved with the QGIS project.  If there is exactly one valid Workbench
-    GeoPackage beside the project we can select it unambiguously; if there are
-    several, leave the choice to the Workbench's *Open existing* action. That
-    folder search is only for a project known to use the Workbench - it has a
-    (stale) entry, or layers read from a GeoPackage of that name - so another
-    project saved in the same folder never picks up its neighbour's registry.
+    The saved path reader recovers a missing file by the same filename in
+    workbench/ or beside the project. Ambiguous copies and missing explicit
+    files require Open existing. Without an entry, use the conventional
+    default or a registry whose filename is already named by project layers;
+    never adopt another project's custom-named registry.
     """
     project = project or QgsProject.instance()
     path = project_gpkg_path(project)
@@ -408,21 +406,16 @@ def discover_gpkg_path(project: Optional[QgsProject] = None) -> Optional[str]:
     project_file = project.fileName() or ""
     project_folder = os.path.dirname(os.path.abspath(project_file)) if project_file else ""
 
-    # Absolute project entries commonly go stale when a project folder is
-    # copied to another computer.  First try the same basename beside the
-    # newly opened project, which remains deterministic even if the folder
-    # contains several registries.
-    if path and project_folder:
-        relocated = os.path.join(project_folder, os.path.basename(path))
-        if _is_workbench_gpkg(relocated):
-            return relocated
-
+    # A missing explicit file must not silently select a different registry.
+    # The shared path reader already checks the same filename in workbench/.
+    if path:
+        return None
     fallback = default_project_gpkg_path(project)
     if _is_workbench_gpkg(fallback):
         return fallback
 
     layer_files = _layer_gpkg_names(project)
-    if project_folder and os.path.isdir(project_folder) and (path or layer_files):
+    if project_folder and os.path.isdir(project_folder) and layer_files:
         candidates = []
         try:
             names = os.listdir(project_folder)
@@ -432,7 +425,7 @@ def discover_gpkg_path(project: Optional[QgsProject] = None) -> Optional[str]:
             lowered = name.lower()
             if not lowered.endswith(".gpkg") or ".bak.gpkg" in lowered:
                 continue
-            if not path and os.path.normcase(name) not in layer_files:
+            if os.path.normcase(name) not in layer_files:
                 continue
             candidate = os.path.join(project_folder, name)
             if _is_workbench_gpkg(candidate):
@@ -485,7 +478,8 @@ def restore_workbench_layers(project: Optional[QgsProject] = None) -> int:
         if not store.exists():
             return 0
 
-        touched = 0
+        from ..project_storage import repair_project_layers, stored_project_path
+        touched = repair_project_layers(project, stored_project_path(project, "workbench_gpkg"), gpkg_path)
         placements = build_placements(store)
 
         # Pass 1: repair broken workbench layers already in the project.

@@ -98,27 +98,32 @@ def same_path(a: Optional[str], b: Optional[str]) -> bool:
 def project_gpkg_path(project: Optional[QgsProject] = None) -> Optional[str]:
     """The cable-lay data file remembered in the QGIS project, if any."""
     project = project or QgsProject.instance()
-    value, ok = project.readEntry(PROJECT_SCOPE, PROJECT_KEY_GPKG, "")
-    return value if ok and value else None
+    from ..project_storage import read_project_path
+
+    return read_project_path(project, PROJECT_KEY_GPKG, "cable_lay")
 
 
 def set_project_gpkg_path(path: Optional[str], project: Optional[QgsProject] = None) -> None:
     project = project or QgsProject.instance()
     if path:
-        project.writeEntry(PROJECT_SCOPE, PROJECT_KEY_GPKG, os.path.abspath(path))
+        from ..project_storage import write_project_path
+
+        write_project_path(project, PROJECT_KEY_GPKG, path)
     else:
         project.removeEntry(PROJECT_SCOPE, PROJECT_KEY_GPKG)
 
 
-def default_project_gpkg_path(project: Optional[QgsProject] = None) -> Optional[str]:
-    """``<project stem>_cable_lay.gpkg`` beside the project file (None if unsaved)."""
+def default_project_gpkg_path(project: Optional[QgsProject] = None, prefer_existing: bool = True) -> Optional[str]:
+    """Suggest ``cable_lay/<project stem>_cable_lay.gpkg`` (None if unsaved)."""
     project = project or QgsProject.instance()
     project_file = project.fileName() or ""
     if not project_file:
         return None
-    folder = os.path.dirname(os.path.abspath(project_file))
-    stem = os.path.splitext(os.path.basename(project_file))[0] or "project"
-    return os.path.join(folder, f"{stem}_cable_lay.gpkg")
+    from ..project_storage import default_gpkg_path
+    from ..workbench.schema import sanitize_slug
+
+    return default_gpkg_path(project_file, project.title(), "cable_lay", "cable_lay",
+                             lambda path: os.path.dirname(os.path.abspath(path)), sanitize_slug, prefer_existing)
 
 
 # ---------------------------------------------------------------------------
@@ -551,16 +556,6 @@ def discover_gpkg_path(project: Optional[QgsProject] = None) -> Tuple[Optional[s
     if saved and is_geopackage(saved):
         return saved, ""
 
-    project_file = project.fileName() or ""
-    folder = os.path.dirname(os.path.abspath(project_file)) if project_file else ""
-    if saved and folder:
-        relocated = os.path.join(folder, os.path.basename(saved))
-        if is_geopackage(relocated):
-            return relocated, (
-                "The data file saved in this project was not found at\n"
-                f"{saved}\n\nUsing the copy beside the project instead:\n{relocated}"
-            )
-
     # A file the user already has loaded: pick the one serving most types.
     candidates: Dict[str, Tuple[int, str]] = {}  # norm path -> (type count, path)
     for layer in project.mapLayers().values():
@@ -586,15 +581,9 @@ def discover_gpkg_path(project: Optional[QgsProject] = None) -> Tuple[Optional[s
             )
         return best, note
 
+    if saved:
+        return None, f"The data file saved in this project was not found:\n{saved}\nUse Open to select its new location."
     default = default_project_gpkg_path(project)
     if default and is_geopackage(default):
-        note = ""
-        if saved:
-            note = (
-                "The data file saved in this project was not found at\n"
-                f"{saved}\n\nUsing the project-side data file instead:\n{default}"
-            )
-        return default, note
-    if saved:
-        return None, f"The data file saved in this project was not found:\n{saved}"
+        return default, ""
     return None, ""

@@ -557,17 +557,12 @@ def gpkg_folder_for(project_path: str) -> str:
     return unsaved_project_folder()
 
 
-def default_gpkg_path(project_path: str, project_title: str = "") -> str:
-    """Default workbench GeoPackage path beside the project file."""
-    if project_path:
-        stem = os.path.splitext(os.path.basename(project_path))[0]
-        # Keep pointing at an existing file even if the folder probe fails now.
-        beside = os.path.join(os.path.dirname(project_path), f"{stem}_workbench.gpkg")
-        if os.path.exists(beside):
-            return beside
-    else:
-        stem = sanitize_slug(project_title) if project_title else "project"
-    return os.path.join(gpkg_folder_for(project_path), f"{stem}_workbench.gpkg")
+def default_gpkg_path(project_path: str, project_title: str = "", prefer_existing: bool = True) -> str:
+    """Suggest the workbench subfolder; existing legacy defaults remain usable."""
+    from ..project_storage import default_gpkg_path as storage_path
+
+    return storage_path(project_path, project_title, "workbench", "workbench",
+                        gpkg_folder_for, sanitize_slug, prefer_existing)
 
 
 def new_id() -> str:

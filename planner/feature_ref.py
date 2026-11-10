@@ -53,7 +53,8 @@ class FeatureReferenceResolver:
         layer_id = _get(ref, "layer_id")
         layer = self.project.mapLayer(layer_id) if layer_id else None
         if layer is None:
-            source = _get(ref, "layer_source")
+            from ..project_storage import resolve_source
+            source = resolve_source(self.project, _get(ref, "layer_source"))
             for candidate in self.project.mapLayers().values():
                 try:
                     if source and candidate.source() == source:

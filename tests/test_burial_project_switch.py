@@ -428,7 +428,7 @@ def test_failed_reopen_writes_nothing(root: str) -> bool:
         _pump(0.2)
         ok = state == (False, True, False, False, [])
         ok = ok and not _read(gpkg, BurialStore.list_tools) and not _open(gpkg)
-        ok = ok and warned >= 1 and len(env.warnings) == warned + 1
+        ok = ok and warned == 0 and len(env.warnings) == 1
         # (+1: the refused tool write is reported, the reopen is not)
         ok = ok and "lost_plans.gpkg" in dock.gpkg_name.text()
         return _result("a plan file that fails to reopen leaves the dock "

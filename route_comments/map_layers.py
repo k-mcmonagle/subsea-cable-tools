@@ -108,7 +108,9 @@ def highlight_color() -> QColor:
 def project_register(project: Optional[QgsProject] = None) -> Tuple[str, str]:
     """``(register path, set_id)`` saved in the project ('' when none)."""
     project = project or QgsProject.instance()
-    path, _ok = project.readEntry(PROJECT_SCOPE, PROJECT_KEY_REGISTER, "")
+    from ..project_storage import read_project_path
+
+    path = read_project_path(project, PROJECT_KEY_REGISTER, "route_comments")
     set_id, _ok = project.readEntry(PROJECT_SCOPE, PROJECT_KEY_SET, "")
     return str(path or ""), str(set_id or "")
 
@@ -116,7 +118,9 @@ def project_register(project: Optional[QgsProject] = None) -> Tuple[str, str]:
 def set_project_register(path: str, set_id: str = "", project: Optional[QgsProject] = None) -> None:
     project = project or QgsProject.instance()
     if project_register(project) != (path or "", set_id or ""):
-        project.writeEntry(PROJECT_SCOPE, PROJECT_KEY_REGISTER, path or "")
+        from ..project_storage import write_project_path
+
+        write_project_path(project, PROJECT_KEY_REGISTER, path or "")
         project.writeEntry(PROJECT_SCOPE, PROJECT_KEY_SET, set_id or "")
 
 

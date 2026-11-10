@@ -28,17 +28,20 @@ PROJECT_KEY_GPKG = "planner_gpkg"
 
 def project_gpkg_path(project: Optional[QgsProject] = None) -> Optional[str]:
     project = project or QgsProject.instance()
-    value, ok = project.readEntry(PROJECT_SCOPE, PROJECT_KEY_GPKG, "")
-    return value if ok and value else None
+    from ..project_storage import read_project_path
+
+    return read_project_path(project, PROJECT_KEY_GPKG, "planner")
 
 
 def set_project_gpkg_path(path: str, project: Optional[QgsProject] = None) -> None:
-    (project or QgsProject.instance()).writeEntry(PROJECT_SCOPE, PROJECT_KEY_GPKG, path)
+    from ..project_storage import write_project_path
+
+    write_project_path(project or QgsProject.instance(), PROJECT_KEY_GPKG, path)
 
 
-def default_project_gpkg_path(project: Optional[QgsProject] = None) -> str:
+def default_project_gpkg_path(project: Optional[QgsProject] = None, prefer_existing: bool = True) -> str:
     project = project or QgsProject.instance()
-    return schema.default_gpkg_path(project.fileName(), project.title())
+    return schema.default_gpkg_path(project.fileName(), project.title(), prefer_existing)
 
 
 class PlannerStore:

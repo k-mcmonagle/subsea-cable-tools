@@ -301,7 +301,7 @@ def test_first_write_records_the_registry(folder) -> bool:
         store = dock._store()
         ok = ok and store is not None and not store.exists()
         store.create_route("Route One")  # creates the registry and commits
-        expected = os.path.join(project_folder, "plain_workbench.gpkg")
+        expected = os.path.join(project_folder, "workbench", "plain_workbench.gpkg")
         ok = ok and _same(project_gpkg_path(project), expected)
     finally:
         _close(dock)

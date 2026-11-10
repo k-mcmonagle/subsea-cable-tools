@@ -4,6 +4,14 @@ Subsea Cable Tools is a personal, experimental QGIS plugin for subsea telecom an
 
 **Check all outputs against source data and independent methods before using them for engineering or operational decisions.** Features are still being developed and may contain errors.
 
+## GeoPackage locations
+
+New project files suggest a subfolder beside the saved QGIS project: `burial_plans/`, `workbench/`, `planner/`, `span_analysis/`, `cable_lay/` or `route_comments/`. Choose another location in the file dialog if needed. Additional plans or scenarios use the already open GeoPackage. Existing files stay in their current locations; the plugin does not move or copy them. The cable type library keeps its shared, user-selected location.
+
+To reorganise an existing project, close QGIS, move the GeoPackages, then reopen the project. Keeping each filename and using the suggested subfolder allows automatic recovery of recognised files. For another folder or a renamed file, open the relevant tool and use **Plan file → Open existing plans** (Burial Planner), **File → Open existing Workbench**, or the tool's **Open** action. Matching broken layers are repaired in place, keeping their IDs and styles. If QGIS shows its unavailable-layer dialog for another folder, keep the unavailable layers so the tool can relink them. Save the QGIS project after relinking. A missing saved file is not replaced with a new empty database, and ambiguous matches require you to choose the file.
+
+Move a Route Comments register's `<filename>_attachments` folder alongside its GeoPackage so its images remain available. For an unsaved QGIS project, file suggestions use a writable QGIS profile folder instead.
+
 ## Processing algorithms
 
 Find these in the QGIS Processing Toolbox under **Subsea Cable Tools**.

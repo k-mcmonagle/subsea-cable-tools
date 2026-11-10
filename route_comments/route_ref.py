@@ -364,7 +364,9 @@ class ReferenceChecker:
     # -- finding the route -------------------------------------------------------
     def _find_layer(self, comment: Dict) -> Tuple[Optional[QgsVectorLayer], str]:
         layer_id = comment.get("route_layer_id") or ""
-        source = _norm_source(comment.get("route_source") or "")
+        from ..project_storage import resolve_source
+        resolved_source = resolve_source(self.project, comment.get("route_source") or "")
+        source = _norm_source(resolved_source)
         layer = self.project.mapLayer(layer_id) if layer_id else None
         if isinstance(layer, QgsVectorLayer) and layer.isValid() and \
                 (not source or _norm_source(layer.source()) == source):
@@ -382,9 +384,9 @@ class ReferenceChecker:
                 layer = store.open_layer(rpl.get("lines_layer"))
                 if layer is not None and layer.isValid():
                     return layer, "workbench"
-        path = _source_path(comment.get("route_source") or "")
+        path = _source_path(resolved_source)
         if comment.get("route_provider") == "ogr" and path and os.path.isfile(path):
-            layer = QgsVectorLayer(comment.get("route_source"), comment.get("route_name") or "route", "ogr")
+            layer = QgsVectorLayer(resolved_source, comment.get("route_name") or "route", "ogr")
             if layer.isValid():
                 return layer, "file"
         return None, ""

@@ -391,11 +391,22 @@ class SpanAnalysisDialog(QDialog):
         self._refresh_scenarios()
         if newer:
             self._set_status(newer, error=True)
+        elif span_store.project_gpkg_path() and self._store is None:
+            self._set_status("Scenario file unavailable. Use File → Open to select its new location.", error=True)
 
     def _ensure_store(self) -> Optional[span_store.SpanStore]:
         if self._store is not None:
             return self._store
-        path = span_store.project_gpkg_path() or span_store.default_gpkg_path()
+        saved = span_store.project_gpkg_path()
+        path = saved or span_store.default_gpkg_path()
+        if saved and not os.path.isfile(saved):
+            self._set_status("Scenario file unavailable. Use File → Open to select its new location.", error=True)
+            return None
+        if not saved and not os.path.isfile(path):
+            from ..project_storage import choose_new_gpkg
+            path = choose_new_gpkg(self, "New Span Analysis file", span_store.default_gpkg_path(prefer_existing=False))
+            if not path:
+                return None
         try:
             store = span_store.SpanStore(path)
             store.ensure_created()
@@ -563,8 +574,8 @@ class SpanAnalysisDialog(QDialog):
     def new_store_file(self) -> None:
         if not self._confirm_discard():
             return
-        path, _ = QFileDialog.getSaveFileName(self, "New Span Analysis file", self._store_folder(),
-                                              "GeoPackage (*.gpkg)")
+        from ..project_storage import choose_new_gpkg
+        path = choose_new_gpkg(self, "New Span Analysis file", span_store.default_gpkg_path(prefer_existing=False))
         if not path:
             return
         if not path.lower().endswith(".gpkg"):
@@ -578,6 +589,9 @@ class SpanAnalysisDialog(QDialog):
         self._switch_store(store)
 
     def _switch_store(self, store: span_store.SpanStore) -> None:
+        from ..project_storage import repair_project_layers, stored_project_path
+        project = QgsProject.instance()
+        repair_project_layers(project, stored_project_path(project, "span_analysis_gpkg"), store.gpkg_path)
         if self._store is not None:
             self._store.close()
         self._store = store

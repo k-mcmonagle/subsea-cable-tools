@@ -214,7 +214,7 @@ class PlannerDock(QDockWidget):
         if path:
             store, path, error = self._open_store_with_recovery(path)
             self.store_ready = not error
-            if error:
+            if error and os.path.isfile(path):
                 QMessageBox.warning(
                     None, "Planner", store.newer_version_message() or
                     "Could not open or migrate the planner GeoPackage:\n%s\n\n%s\n\n"
@@ -228,12 +228,21 @@ class PlannerDock(QDockWidget):
         self.store = store
         self.resolver.store = store
         self.resolver.clear_cache()
-        if self._adopted:
+        if path and self.store_ready:
+            from ..project_storage import repair_project_layers, stored_project_path
+            project = QgsProject.instance()
+            repair_project_layers(project, stored_project_path(project, "planner_gpkg"), path)
+            set_project_gpkg_path(path)
+        if self._adopted and self.store_ready:
             self._follow_geometry_layers()
         self.refresh_scenarios()
+        if path and not self.store_ready:
+            self.status_label.setText("Planner file unavailable — Plan file → Open existing")
 
     def _before_store_write(self):
         """Runs before the store writes anything (see PlannerStore.before_write)."""
+        if not self.store_ready and not self._adopting:
+            raise ValueError("The saved Planner file is unavailable. Use Plan file → Open existing.")
         if not self._adopted and not self._adopting:
             self._adopt_store()
 
@@ -242,7 +251,14 @@ class PlannerDock(QDockWidget):
         migrate) the file, record it in the project and add the task layers."""
         self._adopting = True
         try:
-            _store, path, error = self._open_store_with_recovery(self.store.gpkg_path)
+            from ..project_storage import FileSelectionCancelled, choose_new_gpkg
+            path = self.store.gpkg_path
+            create = not self.store.exists()
+            if create:
+                path = choose_new_gpkg(self, "Create new Planner file", default_project_gpkg_path(prefer_existing=False))
+                if not path:
+                    raise FileSelectionCancelled()
+            _store, path, error = self._open_store_with_recovery(path, create_if_missing=create)
             if error:
                 self.store_ready = False
                 raise RuntimeError(error)
@@ -335,58 +351,48 @@ class PlannerDock(QDockWidget):
         if self._project_stale:
             self._attach_project()
 
-    def _open_store_with_recovery(self, path):
-        """Open/migrate the planner GeoPackage, recovering from bad locations.
-
-        Returns ``(store, path, error)`` where ``error`` is "" on success.
-        A remembered path can be unusable on another machine (missing drive, or
-        the old CWD-based default under C:\\WINDOWS\\system32); fall back to the
-        current default when there is no file there to lose, and finally let
-        the user pick a writable location instead of dead-ending.
-        """
+    def _open_store_with_recovery(self, path, create_if_missing=False):
+        """A saved missing file stays disconnected until the user locates it."""
+        store = PlannerStore(path)
+        if not create_if_missing and not store.exists():
+            return store, path, "Planner file unavailable. Use Plan file → Open existing to select its new location."
         try:
-            store = PlannerStore(path)
             store.migrate()
             return store, path, ""
         except NewerVersionError as exc:
-            # The file is fine, just newer: no other location is offered.
-            return PlannerStore(path), path, str(exc)
+            return store, path, str(exc)
         except Exception as exc:
-            log_exception(f"Planner: could not open or migrate {path}")
-            error = str(exc)
-        fallback = default_project_gpkg_path()
-        if not os.path.exists(path) and os.path.normcase(fallback) != os.path.normcase(path):
-            try:
-                store = PlannerStore(fallback)
-                store.migrate()
-                set_project_gpkg_path(fallback)
-                return store, fallback, ""
-            except Exception as exc:
-                error = str(exc)
-                path = fallback
-        while True:
-            answer = QMessageBox.question(
-                None, "Planner",
-                "Could not open or migrate the planner GeoPackage:\n%s\n\n%s\n\n"
-                "Choose a different file or folder for it now?" % (path, error),
-                MESSAGE_BOX_YES | MESSAGE_BOX_NO, MESSAGE_BOX_YES)
-            if answer != MESSAGE_BOX_YES:
-                break
-            suggested = os.path.join(
-                os.path.dirname(fallback), os.path.basename(path) or "project_planner.gpkg")
-            new_path, _filter = QFileDialog.getSaveFileName(
-                None, "Planner GeoPackage", suggested, "GeoPackage (*.gpkg)")
-            if not new_path:
-                break
-            try:
-                store = PlannerStore(new_path)
-                store.migrate()
-                set_project_gpkg_path(new_path)
-                return store, new_path, ""
-            except Exception as exc:
-                error = str(exc)
-                path = new_path
-        return PlannerStore(path), path, error or "Unknown error."
+            return store, path, str(exc)
+
+    def _open_planner_file(self):
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "Open existing Planner file", os.path.dirname(self.store.gpkg_path), "GeoPackage (*.gpkg)")
+        if not path:
+            return
+        store, path, error = self._open_store_with_recovery(path)
+        if error:
+            QMessageBox.warning(self, "Planner", error)
+            return
+        from ..project_storage import repair_project_layers, stored_project_path
+        project = QgsProject.instance()
+        self._stop_activity()
+        self._unfollow_geometry_layers()
+        repair_project_layers(project, stored_project_path(project, "planner_gpkg"), path)
+        set_project_gpkg_path(path)
+        self._attach_project()
+
+    def _new_planner_file(self):
+        from ..project_storage import choose_new_gpkg
+        path = choose_new_gpkg(self, "Create new Planner file", default_project_gpkg_path(prefer_existing=False))
+        if not path:
+            return
+        _store, path, error = self._open_store_with_recovery(path, create_if_missing=True)
+        if error:
+            QMessageBox.warning(self, "Planner", error)
+            return
+        self._stop_activity()
+        set_project_gpkg_path(path)
+        self._attach_project()
 
     def _build_scenario_bar(self):
         layout = QHBoxLayout()
@@ -394,6 +400,12 @@ class PlannerDock(QDockWidget):
         self.scenario_combo = QComboBox()
         self.scenario_combo.currentIndexChanged.connect(self._scenario_selected)
         layout.addWidget(self.scenario_combo, 1)
+        file_button = QPushButton("Plan file…")
+        file_menu = QMenu(file_button)
+        file_menu.addAction("Open existing…", self._open_planner_file)
+        file_menu.addAction("Create new…", self._new_planner_file)
+        file_button.setMenu(file_menu)
+        layout.addWidget(file_button)
         for label, slot in (("New", self._new_scenario), ("Rename", self._rename_scenario),
                             ("Duplicate", self._duplicate_scenario), ("Delete", self._delete_scenario)):
             button = QPushButton(label)
@@ -643,8 +655,11 @@ class PlannerDock(QDockWidget):
 
     def _store_write(self, action, func, *args, **kwargs):
         """Run a store write, reporting failures instead of raising into a slot."""
+        from ..project_storage import FileSelectionCancelled
         try:
             result = func(*args, **kwargs)
+        except FileSelectionCancelled:
+            return False, None
         except NewerVersionError as exc:
             QMessageBox.warning(self, "Planner", str(exc))
             return False, None
@@ -653,8 +668,8 @@ class PlannerDock(QDockWidget):
             QMessageBox.warning(
                 self, "Planner",
                 "Could not %s: the planner GeoPackage could not be written.\n%s\n\n"
-                "%s\n\nSave the QGIS project (the planner file is created beside "
-                "it) or pick a writable location, then reopen the Planner."
+                "%s\n\nUse Plan file → Open existing to locate a moved file, "
+                "or Create new to choose a writable location."
                 % (action, self.store.gpkg_path, exc))
             return False, None
         self.store_ready = True

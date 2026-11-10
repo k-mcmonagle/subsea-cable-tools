@@ -693,6 +693,11 @@ class CommentStore:
                 self._touch(conn, row["comment_id"])
 
     # -- attachments ------------------------------------------------------------------
+    def attachments_folder_missing(self) -> bool:
+        """A manually moved register has images but its companion folder is absent."""
+        return (not os.path.isdir(self.attachments_dir)
+                and self._conn().execute(f"SELECT 1 FROM {_Q(T_ATTACH)} LIMIT 1").fetchone() is not None)
+
     def list_attachments(self, comment_id: str) -> List[Dict]:
         rows = self._read(f"SELECT {_cols(ATTACH_COLUMNS)} FROM {_Q(T_ATTACH)} WHERE comment_id = ? "
                           "ORDER BY created_utc, fid", (comment_id,))

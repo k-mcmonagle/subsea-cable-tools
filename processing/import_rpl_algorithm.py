@@ -206,8 +206,12 @@ class ImportRPLAlgorithm(SubseaCableAlgorithm):
             parameters, self.GPKG_PATH, context) or "").strip()
         if not gpkg_path or gpkg_path.lower() in ("temporary_output",
                                                   "temporary output"):
-            gpkg_path = (project_gpkg_path(context.project())
-                         or default_project_gpkg_path(context.project()))
+            saved_path = project_gpkg_path(context.project())
+            if saved_path and not os.path.isfile(saved_path):
+                raise QgsProcessingException(self.tr(
+                    "The project's Workbench file is unavailable. Open the Cable Route Workbench "
+                    "and use File → Open existing Workbench to select its new location."))
+            gpkg_path = saved_path or default_project_gpkg_path(context.project())
 
         try:
             fingerprint = ireader.file_fingerprint(path)

@@ -499,7 +499,11 @@ class ProjectPanel(QWidget):
     def new_file(self) -> None:
         if self._refuse_if_busy():
             return
-        suggested = gops.default_project_gpkg_path() or os.path.join(self._start_dir(), "cable_lay.gpkg")
+        suggested = gops.default_project_gpkg_path(prefer_existing=False) or os.path.join(self._start_dir(), "cable_lay.gpkg")
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(suggested)), exist_ok=True)
+        except OSError:
+            pass
         args = [self, "New cable-lay data file", suggested, _FILE_FILTER]
         if _DONT_CONFIRM_OVERWRITE is not None:
             path, _ = QFileDialog.getSaveFileName(*args, options=_DONT_CONFIRM_OVERWRITE)
@@ -584,6 +588,9 @@ class ProjectPanel(QWidget):
             gops.set_project_gpkg_path(path)
             self.add_missing_layers()
             return
+        from ...project_storage import repair_project_layers, stored_project_path
+        project = QgsProject.instance()
+        repair_project_layers(project, stored_project_path(project, "cable_lay_gpkg") or self._path, path)
         self._path = path
         gops.set_project_gpkg_path(path)
         self._add_tree_layers(path)

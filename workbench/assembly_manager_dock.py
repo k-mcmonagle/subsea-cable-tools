@@ -519,6 +519,8 @@ class AssemblyManagerPanel(QWidget):
 
     # ---------------------------------------------------- assembly actions --
     def _new_assembly(self):
+        if not getattr(self, "ensure_store_file", lambda: True)():
+            return
         name, ok = QInputDialog.getText(self, "New assembly", "Assembly name:")
         if not ok or not name.strip():
             return

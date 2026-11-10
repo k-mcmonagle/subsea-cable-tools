@@ -44,7 +44,7 @@ from qgis.core import (
 )
 from qgis.gui import QgsMapCanvas, QgsMapToolPan, QgsMessageBar
 from qgis.PyQt.QtCore import QCoreApplication, QObject, QPoint, QSettings, Qt, pyqtSignal
-from qgis.PyQt.QtWidgets import QInputDialog, QMainWindow, QMessageBox
+from qgis.PyQt.QtWidgets import QFileDialog, QInputDialog, QMainWindow, QMessageBox
 
 from ..planner import schema as planner_schema
 from ..planner.planner_dock import PlannerDock
@@ -151,6 +151,8 @@ class _Stubs:
                        for name in ("warning", "information", "question", "critical")}
         for name in self._boxes:
             setattr(QMessageBox, name, staticmethod(lambda *a, **k: 0))
+        self._get_save_file = QFileDialog.getSaveFileName
+        QFileDialog.getSaveFileName = staticmethod(lambda parent, title, suggested, *a, **k: (suggested, ""))
         self._get_text = QInputDialog.getText
         QInputDialog.getText = staticmethod(lambda *a, **k: (self.names.pop(0), True))
         self._folder_for = planner_schema.gpkg_folder_for
@@ -162,6 +164,7 @@ class _Stubs:
         for name, value in self._boxes.items():
             setattr(QMessageBox, name, value)
         QInputDialog.getText = self._get_text
+        QFileDialog.getSaveFileName = self._get_save_file
         planner_schema.gpkg_folder_for = self._folder_for
         return False
 
@@ -207,7 +210,7 @@ def test_planner_follows_project(folder: str) -> List[bool]:
         # As the QGIS application does: the canvas snaps with the project's settings.
         project.snappingConfigChanged.connect(canvas.snappingUtils().setConfig)
         a_qgs = os.path.join(folder, "a", "plan_a.qgs")
-        a_gpkg = os.path.join(folder, "a", "plan_a_planner.gpkg")
+        a_gpkg = os.path.join(folder, "a", "planner", "plan_a_planner.gpkg")
         os.makedirs(os.path.dirname(a_qgs))
         project.setFileName(a_qgs)
         project.setCrs(WGS84)
@@ -283,7 +286,7 @@ def test_planner_follows_project(folder: str) -> List[bool]:
             out.append(_result(
                 "New: work goes to the new project's file; project A's file is unchanged",
                 _content(a_gpkg) == a_before and _content(shared) == (["New plan"], 1, 1)
-                and _norm(os.path.dirname(shared)) == _norm(unsaved)
+                and _norm(os.path.dirname(shared)) == _norm(os.path.join(unsaved, "planner"))
                 and len(layers) == 2 and not any(_uses(layer, a_gpkg) for layer in layers)
                 and _norm(project_gpkg_path()) == _norm(shared)))
             b_qgs = os.path.join(folder, "b", "plan_b.qgs")

@@ -2,7 +2,7 @@
 """Span & Slack Analysis GeoPackage: scenarios, sampled profiles and result layers.
 
 One GeoPackage per QGIS project, by default in a ``span_analysis`` folder
-beside the project file (``<project>_span_analysis.gpkg``); the path is kept
+in the span_analysis subfolder (``<project>_span_analysis.gpkg``); the path is kept
 in the project's custom properties and can be changed (open another file,
 or start a new one). Unsaved projects use the plugin folder in the QGIS
 profile, as the Workbench and Burial Planner do.
@@ -55,24 +55,25 @@ RESULT_FIELDS = [("scenario", "str"), ("check", "str"), ("level", "str"), ("kp_f
 
 def project_gpkg_path(project: Optional[QgsProject] = None) -> Optional[str]:
     project = project or QgsProject.instance()
-    value, ok = project.readEntry(PROJECT_SCOPE, PROJECT_KEY_GPKG, "")
-    return value if ok and value else None
+    from ..project_storage import read_project_path
+
+    return read_project_path(project, PROJECT_KEY_GPKG, "span_analysis")
 
 
 def set_project_gpkg_path(path: str, project: Optional[QgsProject] = None) -> None:
     project = project or QgsProject.instance()
-    project.writeEntry(PROJECT_SCOPE, PROJECT_KEY_GPKG, path)
+    from ..project_storage import write_project_path
+
+    write_project_path(project, PROJECT_KEY_GPKG, path)
 
 
-def default_gpkg_path(project: Optional[QgsProject] = None) -> str:
+def default_gpkg_path(project: Optional[QgsProject] = None, prefer_existing: bool = True) -> str:
     """``<project folder>/span_analysis/<project>_span_analysis.gpkg``."""
     project = project or QgsProject.instance()
-    path = project.fileName()
-    if path:
-        stem = os.path.splitext(os.path.basename(path))[0]
-    else:
-        stem = sanitize_slug(project.title()) if project.title() else "project"
-    return os.path.join(gpkg_folder_for(path), FOLDER_NAME, f"{stem}_span_analysis.gpkg")
+    from ..project_storage import default_gpkg_path as storage_path
+
+    return storage_path(project.fileName(), project.title(), FOLDER_NAME, "span_analysis",
+                        gpkg_folder_for, sanitize_slug, prefer_existing)
 
 
 class SpanStore:

@@ -503,6 +503,7 @@ def test_raster_route_and_store() -> List[bool]:
     project = QgsProject.instance()
     project.addMapLayers([raster, line])
     gpkg = os.path.join(folder, "span_analysis", "test_span_analysis.gpkg")
+    span_store.SpanStore(gpkg).ensure_created()
     span_store.set_project_gpkg_path(gpkg)
     dialog = _make_dialog()
     try:
@@ -585,6 +586,7 @@ def test_follows_project() -> List[bool]:
     project = QgsProject.instance()
     gpkg_a = os.path.join(folder, "a", "span_analysis", "a_span_analysis.gpkg")
     gpkg_b = os.path.join(folder, "b", "span_analysis", "b_span_analysis.gpkg")
+    span_store.SpanStore(gpkg_a).ensure_created()
     span_store.set_project_gpkg_path(gpkg_a)
     near_path = sand_wave_raster(folder)
     line = QgsVectorLayer("LineString?crs=EPSG:4326", "route", "memory")
