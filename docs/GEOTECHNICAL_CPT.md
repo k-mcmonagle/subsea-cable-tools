@@ -104,6 +104,7 @@ Hover a name for the file and its warnings.
 
 | Action | What it does |
 |---|---|
+| **Sources…** | Locates moved AGS files or position/summary tables without replacing saved CPT readings or positions. |
 | **Edit…** | Changes an import's files, table, columns or register details. |
 | **Reload** | Re-reads the files with the same choices (the status line says when a file has changed). |
 | **Remove…** | Deletes the import from the project; the files are not touched. |
@@ -122,6 +123,14 @@ name each one with its import, for example `CPT01 [Rev 1 CPTs]`.
 
 Derived values are not stored: they are computed when shown, so changing a
 setting changes every plot at once.
+
+Original AGS and position/summary files are needed only for re-import. If a
+source is missing, saved readings and positions remain available. **Sources…**
+shows the full stored location and lets you repair individual links or find
+matching filenames in a chosen folder. **Save links** preserves the imported
+data and fingerprints; **Reload** is a separate action. Reload refuses a
+partial import when a file cannot be read, or when it would drop existing
+CPTs. Use **Edit…** to review intentional changes to the import.
 
 The locations layer is an ordinary layer. Identify it, label it, or register
 it under **Inputs** for a Risk Profile check, for example CPTs whose

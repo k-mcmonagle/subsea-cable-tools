@@ -40,6 +40,8 @@ class NumericProfilePanel(QWidget):
         for key, label, tip, callback in (
                 ("add", "Add…", "Define a dataset: measurements, KP ranges and colours.", self._add),
                 ("edit", "Edit…", "Change the dataset's measurements, KP ranges or colours.", self._edit),
+                ("sources", "Sources…", "Repair original-file and live placement links while retaining saved measurements.",
+                 self._sources),
                 ("reload", "Reload", "Re-read the measurements from their source with the saved choices.",
                  self._reload),
                 ("remove", "Remove…", "Delete the dataset and its measurements from this project.", self._remove),
@@ -188,7 +190,7 @@ class NumericProfilePanel(QWidget):
                 self.plot.set_numeric(numeric.ProfileIndex([], []), self.display_settings(None))
             return
         dataset = self.selected()
-        for key in ("edit", "reload", "remove", "check", "export"):
+        for key in ("edit", "sources", "reload", "remove", "check", "export"):
             self.buttons[key].setEnabled(dataset is not None)
         self.buttons["add"].setEnabled(bool(self.model.plan))
         self._load(dataset)
@@ -249,6 +251,13 @@ class NumericProfilePanel(QWidget):
 
     def _add(self):
         self._open_dialog(None)
+
+    def _sources(self):
+        from .source_links_dialog import open_sources
+        dataset = self.selected()
+        if dataset is not None:
+            open_sources(self.model, self, ("numeric", dataset["dataset_id"]))
+            self.refresh()
 
     def _edit(self):
         dataset = self.selected()
@@ -366,7 +375,7 @@ class NumericProfilePanel(QWidget):
         if dataset is None:
             return
         dialog = check_dialog(dataset, self.profiles, self.assignments, self.notes, self._bounds(),
-                              self._scope(), self, on_open=self.inspect_source)
+                              self._scope(), self, on_open=self.inspect_source, on_sources=self._sources)
         qt_exec(dialog)
 
     def plotted_cells(self):

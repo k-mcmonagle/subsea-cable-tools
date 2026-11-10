@@ -122,11 +122,13 @@ class CptImportDialog(QDialog):
     def __init__(self, model, campaign: Optional[Dict] = None, parent=None):
         super().__init__(parent)
         self.model = model
+        self._editing = campaign is not None
         self.campaign = dict(campaign or {})
         self.campaign.setdefault("campaign_id", schema.new_id())
         self.config = dict(self.campaign.get("config") or {})
         self._file_cache: Dict[str, tuple] = {}
-        self.paths: List[str] = [f.get("path") or "" for f in self.config.get("files") or []]
+        self.paths: List[str] = [cpt_register.file_path(f.get("path") or "")
+                                 for f in self.config.get("files") or []]
         self.grid: List[List[str]] = []
         self.headers: List[str] = []
         self.built: Optional[Dict] = None
@@ -370,7 +372,7 @@ class CptImportDialog(QDialog):
             self.table_crs.setCrs(QgsCoordinateReferenceSystem(positions["crs"]))
         if self.config.get("grid_crs"):
             self.grid_crs.setCrs(QgsCoordinateReferenceSystem(self.config["grid_crs"]))
-        self.table_path = positions.get("path") or ""
+        self.table_path = cpt_register.file_path(positions.get("path") or "")
         self.header_row.blockSignals(True)
         self.header_row.setValue(int(positions.get("header_row") or 1))
         self.header_row.blockSignals(False)
@@ -694,6 +696,11 @@ class CptImportDialog(QDialog):
         self._rebuild()
         if self.built is None or not self.built["cpts"]:
             QMessageBox.warning(self, self.windowTitle(), "No CPTs could be read from the chosen files.")
+            return
+        if self._editing and any(report.get("error") for report in self.built.get("reports", [])):
+            QMessageBox.warning(self, self.windowTitle(), "Some original files could not be read. "
+                                "Stored CPTs have been kept. Use Sources… to repair moved files, "
+                                "or explicitly remove files from this import before saving.")
             return
         if self.table_path and "id" not in self._columns():
             QMessageBox.warning(self, self.windowTitle(),

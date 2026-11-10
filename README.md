@@ -10,6 +10,8 @@ New project files suggest a subfolder beside the saved QGIS project: `burial_pla
 
 To reorganise an existing project, close QGIS, move the GeoPackages, then reopen the project. Keeping each filename and using the suggested subfolder allows automatic recovery of recognised files. For another folder or a renamed file, open the relevant tool and use **Plan file → Open existing plans** (Burial Planner), **File → Open existing Workbench**, or the tool's **Open** action. Matching broken layers are repaired in place, keeping their IDs and styles. If QGIS shows its unavailable-layer dialog for another folder, keep the unavailable layers so the tool can relink them. Save the QGIS project after relinking. A missing saved file is not replaced with a new empty database, and ambiguous matches require you to choose the file.
 
+Ground Model **Sources…** lists original measurement files and live placement layers. Locate a moved workbook, AGS file or layer and save its link while retaining imported CPT readings and numeric measurements. The numeric dataset's **Check…** window also opens Sources. Missing originals and investigations without KP ranges are reported separately.
+
 Move a Route Comments register's `<filename>_attachments` folder alongside its GeoPackage so its images remain available. For an unsaved QGIS project, file suggestions use a writable QGIS profile folder instead.
 
 ## Processing algorithms

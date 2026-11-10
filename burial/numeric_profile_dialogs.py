@@ -936,7 +936,7 @@ class DatasetDialog(QDialog):
 
 
 # -- checks and inspection -----------------------------------------------------------
-def check_dialog(dataset, profiles, assignments, notes, bounds, scope, parent, on_open=None):
+def check_dialog(dataset, profiles, assignments, notes, bounds, scope, parent, on_open=None, on_sources=None):
     rows, findings = numeric.check_dataset(profiles, assignments, bounds, scope)
     dialog = QDialog(parent)
     dialog.setWindowTitle(f"Check dataset — {dataset.get('name')}")
@@ -968,6 +968,15 @@ def check_dialog(dataset, profiles, assignments, notes, bounds, scope, parent, o
     export.clicked.connect(lambda: export_csv(dialog, f"{dataset.get('name')} check.csv", headers,
                                               dialog.table_rows))
     buttons.addWidget(export)
+    if on_sources is not None:
+        repair = QPushButton("Sources…")
+
+        def repair_sources():
+            dialog.accept()
+            on_sources()
+
+        repair.clicked.connect(repair_sources)
+        buttons.addWidget(repair)
     buttons.addStretch()
     close = QPushButton("Close")
     close.clicked.connect(dialog.accept)

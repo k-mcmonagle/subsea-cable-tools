@@ -213,6 +213,7 @@ class CptPanel(QWidget):
         for key, label, tip, callback in (
                 ("import", "Import AGS…", "Import CPTs from AGS 3 / AGS 4 files, optionally joined to a "
                  "position and summary table by CPT name.", self._import),
+                ("sources", "Sources…", "Locate moved original files while retaining the saved CPTs.", self._sources),
                 ("edit", "Edit…", "Change the files, the position table or the register details of the "
                  "selected import.", self._edit),
                 ("reload", "Reload", "Read the selected import's files again with the same choices.",
@@ -404,6 +405,7 @@ class CptPanel(QWidget):
         has = bool(cpts)
         for key in ("edit", "reload", "remove"):
             self.buttons[key].setEnabled(self.selected_campaign() is not None)
+        self.buttons["sources"].setEnabled(bool(self.register.campaigns))
         for key in ("logs", "section"):
             self.buttons[key].setEnabled(has)
         self.buttons["section"].setEnabled(has and bool(self.model.plan))
@@ -426,7 +428,10 @@ class CptPanel(QWidget):
         for campaign in self.register.campaigns:
             changed = cpt_register.changed_sources(campaign)
             if changed:
-                problems.append(f"{campaign.get('name')}: " + "; ".join(changed[:3]) + " — Reload")
+                missing = any("cannot be found" in note for note in changed)
+                action = (" — Sources… repairs original links; stored CPT readings and positions remain available"
+                          if missing else " — Reload to read the changed files")
+                problems.append(f"{campaign.get('name')}: " + "; ".join(changed[:3]) + action)
         if problems:
             text += " ⚠ " + "; ".join(problems[:4])
         self.status.setText(text)
@@ -531,6 +536,12 @@ class CptPanel(QWidget):
         self.highlight(cpt_id)
 
     # -- actions --------------------------------------------------------------------------
+    def _sources(self) -> None:
+        from .source_links_dialog import open_sources
+        campaign = self.selected_campaign()
+        open_sources(self.model, self, ("cpt", campaign["campaign_id"]) if campaign else None)
+        self.refresh()
+
     def _import(self) -> None:
         self._open_import(None)
 
@@ -570,8 +581,17 @@ class CptPanel(QWidget):
         except Exception as exc:  # noqa: BLE001 - unreadable workbooks raise zipfile/openpyxl errors
             QMessageBox.warning(self, "Reload CPTs", f"The import could not be read again: {exc}")
             return
-        if not built["cpts"]:
-            QMessageBox.warning(self, "Reload CPTs", "No CPTs could be read:\n" + "\n".join(built["notes"][:10]))
+        failures = [report for report in built.get("reports", []) if report.get("error")]
+        if failures or not built["cpts"]:
+            QMessageBox.warning(self, "Reload CPTs", "The original sources could not all be read. "
+                                "Stored CPTs have been kept. Use Sources… to repair their links.\n\n"
+                                + "\n".join(built["notes"][:10]))
+            return
+        previous_ids = {c["cpt_id"] for c in self.register.cpts if c.get("campaign_id") == campaign["campaign_id"]}
+        removed = previous_ids - {c["cpt_id"] for c in built["cpts"]}
+        if removed:
+            QMessageBox.warning(self, "Reload CPTs", f"This reload would remove {len(removed)} stored CPT(s). "
+                                "Stored CPTs have been kept. Use Edit… to review changed files or CPT names.")
             return
         before = len([c for c in self.register.cpts if c.get("campaign_id") == campaign["campaign_id"]])
         updated = dict(campaign, config=cpt_register.stamp_fingerprints(campaign.get("config") or {}),

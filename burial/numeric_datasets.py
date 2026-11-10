@@ -28,6 +28,7 @@ from qgis.core import QgsCsException, QgsProject, QgsVectorLayer
 
 from . import kp_table, map_layers, numeric_profiles as numeric
 from .plan_import import read_grid
+from .source_links import file_path
 
 PLACEMENT_KP_TABLE = "kp_table"
 PLACEMENT_POLYGONS = "polygons"
@@ -134,10 +135,15 @@ def read_source_grid(source: Dict, model=None) -> Tuple[List[List[str]], List[st
             raise ValueError(f"The layer '{source.get('layer_name') or '?'}' is not loaded "
                              "and its source cannot be opened.")
         return layer_grid(layer), []
-    path = source.get("path") or ""
+    path = file_path(source.get("path") or "")
     if not path or not os.path.exists(path):
         raise ValueError(f"The file {path or '(none)'} no longer exists.")
-    grid, sheets = read_grid(path, source.get("sheet") or None, max_rows=MAX_ROWS)
+    try:
+        grid, sheets = read_grid(path, source.get("sheet") or None, max_rows=MAX_ROWS)
+    except Exception as exc:
+        raise ValueError(f"The measurements file {path} could not be read: {exc}") from exc
+    if source.get("sheet") and sheets and source["sheet"] not in sheets:
+        raise ValueError(f"The worksheet '{source['sheet']}' is no longer in this workbook. Use Edit… to choose a sheet.")
     if len(grid) >= MAX_ROWS:
         raise ValueError("The table exceeds one million rows; split it.")
     return grid, sheets
@@ -160,7 +166,7 @@ def source_fingerprint(source: Dict, model=None) -> str:
         return "cpt:" + hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
     if source.get("kind") == "layer":
         return map_layers.layer_fingerprint(resolve_layer(source))
-    path = source.get("path") or ""
+    path = file_path(source.get("path") or "")
     try:
         stat = os.stat(path)
     except OSError:
@@ -224,7 +230,8 @@ def source_changed(dataset: Dict, model=None) -> Optional[str]:
         return ("the CPTs or the CPT settings have changed since this dataset was made — Reload to "
                 "use the new values")
     if not now:
-        return f"the measurements source ({source_label(source)}) cannot be found"
+        return (f"the original measurements source ({source_label(source)}) cannot be found; "
+                "saved measurements remain available — Sources… repairs the link")
     if now != recorded:
         return f"{source_label(source)} has changed since it was imported — Reload to use the new values"
     return None

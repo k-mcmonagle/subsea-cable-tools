@@ -122,6 +122,10 @@ class GroundTab(QWidget):
         self.horizons_button.setToolTip("Import and manage sub-bottom horizons and optional text annotations from DXF sections.")
         self.horizons_button.clicked.connect(self._manage_horizons)
         mode_row.addWidget(self.horizons_button)
+        self.sources_button = QPushButton("Sources…")
+        self.sources_button.setToolTip("Review and repair original files and live layers used by the Ground Model.")
+        self.sources_button.clicked.connect(self._source_links)
+        mode_row.addWidget(self.sources_button)
         self.horizon_status = QLabel()
         self.horizon_status.setWordWrap(True)
         mode_row.addWidget(self.horizon_status)
@@ -274,6 +278,11 @@ class GroundTab(QWidget):
             cpts_signal.connect(refresh_soon)
         self.refresh()
 
+    def _source_links(self):
+        from ..source_links_dialog import open_sources
+        open_sources(self.model, self)
+        self.refresh()
+
     def _display_visibility(self, index):
         if index not in (MODE_SOIL, MODE_NUMERIC, MODE_CPT):
             index = MODE_SOIL
@@ -304,6 +313,7 @@ class GroundTab(QWidget):
 
     # -- refresh ---------------------------------------------------------------
     def refresh(self) -> None:
+        self.sources_button.setEnabled(not getattr(self.model.store, "detached", False))
         self.numeric.refresh()
         self.cpts.refresh()
         mode = self.numeric.state.get("mode", 0)

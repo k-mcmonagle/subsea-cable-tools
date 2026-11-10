@@ -40,6 +40,7 @@ from ..geotech import positions as pos_mod
 from ..processing.cable_lay_parsers import WKT_KEY
 from ..qgis_compat import WKB_POINT
 from . import schema
+from .source_links import file_path
 from .plan_import import parse_delimited, read_grid
 
 MAX_TABLE_ROWS = 200002
@@ -48,7 +49,7 @@ MAX_TABLE_ROWS = 200002
 # -- sources ------------------------------------------------------------------------
 def file_fingerprint(path: str) -> str:
     try:
-        stat = os.stat(path)
+        stat = os.stat(file_path(path))
     except OSError:
         return ""
     return f"{int(stat.st_mtime)}:{stat.st_size}"
@@ -64,6 +65,7 @@ def read_files(paths: Sequence[str], ags3_pore: str = "u2") -> Tuple[List[Dict],
     tests: List[Dict] = []
     reports: List[Dict] = []
     for path in paths:
+        path = file_path(path)
         report = {"path": path, "file": os.path.basename(path), "version": "", "groups": "",
                   "tests": 0, "readings": 0, "error": "", "warnings": []}
         try:
@@ -86,6 +88,7 @@ def read_files(paths: Sequence[str], ags3_pore: str = "u2") -> Tuple[List[Dict],
 def read_table_grid(path: str, sheet: Optional[str] = None) -> Tuple[List[List[str]], List[str]]:
     """``(grid, sheets)`` of a CSV/XLSX table. A CSV that is not UTF-8 (an
     ANSI export with ° in its coordinates) is read as Windows-1252."""
+    path = file_path(path)
     try:
         return read_grid(path, sheet or None, max_rows=MAX_TABLE_ROWS)
     except UnicodeDecodeError:
@@ -96,10 +99,15 @@ def read_table_grid(path: str, sheet: Optional[str] = None) -> Tuple[List[List[s
 
 
 def read_positions_grid(positions: Dict) -> Tuple[List[List[str]], List[str]]:
-    path = positions.get("path") or ""
+    path = file_path(positions.get("path") or "")
     if not path or not os.path.exists(path):
         raise ValueError(f"The position table {path or '(none)'} no longer exists.")
-    grid, sheets = read_table_grid(path, positions.get("sheet") or None)
+    try:
+        grid, sheets = read_table_grid(path, positions.get("sheet") or None)
+    except Exception as exc:
+        raise ValueError(f"The position table {path} could not be read: {exc}") from exc
+    if positions.get("sheet") and sheets and positions["sheet"] not in sheets:
+        raise ValueError(f"The position worksheet '{positions['sheet']}' is no longer in this workbook.")
     if len(grid) >= MAX_TABLE_ROWS:
         raise ValueError("The position table exceeds 200 000 rows; split it.")
     return grid, sheets

@@ -773,6 +773,15 @@ class BurialStore:
             out[cpt_id] = _json(row.get("readings_json"), {})
         return out
 
+    def update_cpt_campaign_config(self, campaign_id: str, config: Dict) -> None:
+        """Repair source metadata without replacing saved CPTs or import timestamps."""
+        row = next((row for row in self.read_table(schema.TABLE_CPT_CAMPAIGN)
+                    if row.get("campaign_id") == campaign_id), None)
+        if row is None:
+            raise ValueError("The CPT import no longer exists.")
+        row["config_json"] = json.dumps(config, allow_nan=False)
+        self.upsert_rows(schema.TABLE_CPT_CAMPAIGN, [row])
+
     def save_cpt_campaign(self, campaign: Dict, cpts: Sequence[Dict],
                           readings: Dict[str, Dict]) -> str:
         """Insert or replace one CPT import and all of its CPTs (call inside

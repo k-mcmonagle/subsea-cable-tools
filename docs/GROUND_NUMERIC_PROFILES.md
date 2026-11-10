@@ -54,6 +54,19 @@ or layer changes afterwards, the status line says so, and **Reload** re-reads
 it with the same choices (a renamed column is reported rather than guessed).
 IDs are matched exactly, including case, spaces and leading zeros.
 
+**Sources…** (also available from **Check…**) lists the original measurement
+file or layer separately from the live KP-range, investigation-polygon and
+soil-constraint layers. A missing original workbook does not remove the saved
+measurements. Use **Locate file…** to select its new location, **Choose layer…**
+for a replacement live layer, or **Find missing files in folder…** to match
+moved files by filename. Review the changes, then **Save links**. Saved column
+and worksheet choices are checked; measurements, colour classes and IDs are
+retained. Use **Reload** separately to read changed measurements.
+
+Investigations without a KP range, mismatched investigation IDs and polygons
+that do not cross the route are placement findings. Repairing the original
+workbook link does not change those geometries or assign them to the route.
+
 ## 2. KP ranges
 
 Choose how investigations are placed along the route:
